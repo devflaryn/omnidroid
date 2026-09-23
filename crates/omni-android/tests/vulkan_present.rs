@@ -368,6 +368,8 @@ struct HostLog {
     query_pools: Vec<QueryPoolRequest>,
     /// Every query command: `("reset", pool, first, count)` or `("timestamp", pool, stage, query)`.
     query_commands: Vec<(&'static str, HostQueryPool, u32, u32)>,
+    /// Every `vkCmdDispatch`'s three group counts.
+    dispatches: Vec<[u32; 3]>,
 }
 
 /// The measured memory table of this machine, which the double reports so that the rewrite is
@@ -617,6 +619,7 @@ impl VulkanHost for StageFourHost {
                 | "vkDestroyFramebuffer"
                 | "vkCreateGraphicsPipelines"
                 | "vkCreateComputePipelines"
+                | "vkCmdDispatch"
                 | "vkDestroyPipeline"
                 | "vkCreateDescriptorSetLayout"
                 | "vkDestroyDescriptorSetLayout"
@@ -1105,6 +1108,11 @@ impl VulkanHost for StageFourHost {
                     .collect(),
             }),
         }
+    }
+
+    fn cmd_dispatch(&self, _buffer: HostCommandBuffer, x: u32, y: u32, z: u32) -> AbiResult<()> {
+        self.log().dispatches.push([x, y, z]);
+        Ok(())
     }
 
     /// The same scripted partial success as [`StageFourHost::create_graphics_pipelines`].
@@ -2023,6 +2031,34 @@ fn the_gpu_timers_commands_carry_their_pool_and_numbers() {
     );
     let text = f.refusal(name("vkCmdResetQueryPool"), &[command, command, 0, 2]).to_string();
     assert!(text.contains("VkQueryPool"), "a command buffer is not a pool: {text}");
+}
+
+/// **`vkCmdDispatch` carries its three group counts in order**, and a handle that is not a
+/// command buffer is refused rather than recorded into.
+#[test]
+fn a_dispatch_carries_its_three_group_counts_in_order() {
+    let _serial = serialized();
+    let up = up_to_a_device("dispatch");
+    let f = &up.f;
+    let name = |call: &str| f.resolve_device(up.get_proc, up.device, call);
+    let out = f.alloc(8);
+    let pool_info = f.command_pool_info(POOL_RESET_COMMAND_BUFFER, 0);
+    f.call(name("vkCreateCommandPool"), [up.device, pool_info, 0, out]).expect("command pool");
+    let command_pool = f.guest.read_u64(out as GuestAddr);
+    let buffers_at = f.alloc(8);
+    f.call(
+        name("vkAllocateCommandBuffers"),
+        [up.device, f.command_buffer_allocate_info(command_pool, 1), buffers_at, 0],
+    )
+    .expect("a command buffer");
+    let command = f.guest.read_u64(buffers_at as GuestAddr);
+    // The engine's own first dispatch, then one whose three counts all differ from it.
+    f.call(name("vkCmdDispatch"), [command, 5, 3, 1]).expect("dispatch");
+    f.call(name("vkCmdDispatch"), [command, 7, 11, 13]).expect("dispatch");
+    assert_eq!(up.host.log().dispatches, vec![[5, 3, 1], [7, 11, 13]]);
+    let text = f.refusal(name("vkCmdDispatch"), &[command_pool, 1, 1, 1]).to_string();
+    assert!(text.contains("vkCmdDispatch"), "a command pool is not a command buffer: {text}");
+    assert_eq!(up.host.log().dispatches.len(), 2, "the refused one recorded nothing");
 }
 
 /// **The two-call protocol, the stable handles, and what a destroyed swapchain does to them.**
@@ -4852,7 +4888,7 @@ fn a_descriptor_pool_takes_its_sets_and_a_swapchain_image_cannot_be_destroyed() 
     assert_eq!(f.vulkan().image_handles().len(), count, "the swapchain's images are untouched");
 }
 
-/// **A real driver builds the compute pipeline the guest describes.**
+/// **A real driver builds the compute pipeline the guest describes, and runs it.**
 ///
 /// The guest's create info, with its stage embedded, crosses the boundary, is rebuilt in the host's
 /// memory and handed to the machine's driver, which compiles the module's `GLCompute` entry point
@@ -4917,6 +4953,52 @@ fn a_real_driver_builds_the_compute_pipeline_the_guest_describes() {
     assert_ne!(pipeline, 0);
     assert_ne!(pipeline, 0x5A5A_5A5A_5A5A_5A5A, "a handle was written");
     assert_eq!(f.vulkan().pipeline_handles().len(), 1);
+
+    // **And dispatched on a real queue**, bound at the compute bind point with the engine's own
+    // first group counts. A lost device answers the idle wait -4.
+    let get_queue = f.resolve(entry_point, instance, "vkGetDeviceQueue");
+    let queue_at = f.alloc(8);
+    f.call(get_queue, [device, 0, 0, queue_at]).expect("a queue");
+    let queue = f.guest.read_u64(queue_at as GuestAddr);
+    let name = |call: &str| f.resolve_device(get_proc, device, call);
+    f.call(name("vkCreateCommandPool"), [device, f.command_pool_info(0, 0), 0, out])
+        .expect("a command pool");
+    let command_pool = f.guest.read_u64(out as GuestAddr);
+    let buffers_at = f.alloc(8);
+    f.call(
+        name("vkAllocateCommandBuffers"),
+        [device, f.command_buffer_allocate_info(command_pool, 1), buffers_at, 0],
+    )
+    .expect("a command buffer");
+    let command = f.guest.read_u64(buffers_at as GuestAddr);
+    assert_eq!(
+        f.call(name("vkBeginCommandBuffer"), [command, f.begin_info(0, 0), 0, 0]).expect("begin")
+            as i32,
+        VK_SUCCESS
+    );
+    // VK_PIPELINE_BIND_POINT_COMPUTE.
+    f.call(name("vkCmdBindPipeline"), [command, 1, pipeline, 0]).expect("bind");
+    f.call(name("vkCmdDispatch"), [command, 5, 3, 1]).expect("dispatch");
+    assert_eq!(
+        f.call(name("vkEndCommandBuffer"), [command, 0, 0, 0]).expect("end") as i32,
+        VK_SUCCESS
+    );
+    // One command buffer, no semaphores.
+    let commands = f.u64_array(&[command]);
+    let mut submit = vec![0u8; SUBMIT_INFO_BYTES];
+    submit[0..4].copy_from_slice(&STYPE_SUBMIT_INFO.to_le_bytes());
+    submit[40..44].copy_from_slice(&1u32.to_le_bytes());
+    submit[48..56].copy_from_slice(&commands.to_le_bytes());
+    let submit = f.bytes(&submit);
+    assert_eq!(
+        f.call(name("vkQueueSubmit"), [queue, 1, submit, 0]).expect("submit") as i32,
+        VK_SUCCESS
+    );
+    assert_eq!(
+        f.call(name("vkQueueWaitIdle"), [queue, 0, 0, 0]).expect("idle") as i32,
+        VK_SUCCESS,
+        "the dispatch ran to completion on the real queue"
+    );
 
     f.call(destroy, [device, pipeline, 0, 0]).expect("the pipeline is destroyed");
     assert!(f.vulkan().pipeline_handles().is_empty(), "and its handle is forgotten");

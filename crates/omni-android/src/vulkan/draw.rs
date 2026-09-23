@@ -1,4 +1,5 @@
-//! **The thirteen `vkCmd*` calls that turn a command buffer into a drawn frame.**
+//! **The thirteen `vkCmd*` calls that turn a command buffer into a drawn frame**, and
+//! `vkCmdDispatch`, the one that runs a compute pipeline.
 //!
 //! # These are the commands that record nothing when they go wrong
 //!
@@ -464,6 +465,24 @@ pub(super) fn cmd_draw_indexed(
         args[4] as u32 as i32,
         args[5] as u32,
     )?;
+    c.ret().void();
+    Ok(())
+}
+
+/// `void vkCmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCountX,
+/// uint32_t groupCountY, uint32_t groupCountZ)`
+///
+/// MEASURED: the renderer's first, once its compute pipelines exist, is `(buffer, 5, 3, 1)`.
+pub(super) fn cmd_dispatch(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCmdDispatch";
+    let host = vulkan.require_host(at)?;
+    let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    host.cmd_dispatch(buffer, args[1] as u32, args[2] as u32, args[3] as u32)?;
     c.ret().void();
     Ok(())
 }

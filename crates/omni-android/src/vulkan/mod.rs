@@ -3553,6 +3553,7 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkCmdSetViewport" => draw::cmd_set_viewport(c, &at, &vulkan, args),
         "vkCmdSetScissor" => draw::cmd_set_scissor(c, &at, &vulkan, args),
         "vkCmdDraw" => draw::cmd_draw(c, &at, &vulkan, args),
+        "vkCmdDispatch" => draw::cmd_dispatch(c, &at, &vulkan, args),
         "vkCmdDrawIndexed" => draw::cmd_draw_indexed(c, &at, &vulkan, args),
         "vkCmdCopyBuffer" => draw::cmd_copy_buffer(c, &at, &vulkan, args),
         "vkCmdCopyBufferToImage" => draw::cmd_copy_buffer_to_image(c, &at, &vulkan, args),

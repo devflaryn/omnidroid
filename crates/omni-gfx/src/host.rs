@@ -4733,6 +4733,14 @@ impl VulkanHost for GfxVulkanHost {
         Ok(())
     }
 
+    fn cmd_dispatch(&self, buffer: HostCommandBuffer, x: u32, y: u32, z: u32) -> AbiResult<()> {
+        let (device, handle) = self.command_parts(buffer, "VulkanHost::cmd_dispatch")?;
+        // SAFETY: the command buffer is live and recording, outside a render pass, with a compute
+        // pipeline bound -- which the driver enforces and reports.
+        unsafe { device.cmd_dispatch(handle, x, y, z) };
+        Ok(())
+    }
+
     fn cmd_draw_indexed(
         &self,
         buffer: HostCommandBuffer,

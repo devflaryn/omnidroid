@@ -3412,6 +3412,19 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkCmdDispatch`, forwarded: the three workgroup counts, in order.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `buffer` is not a token this host issued.
+    fn cmd_dispatch(&self, buffer: HostCommandBuffer, x: u32, y: u32, z: u32) -> AbiResult<()> {
+        let _ = (buffer, x, y, z);
+        Err(host_has_no(
+            "VulkanHost::cmd_dispatch",
+            "**nothing is dispatched**, and the compute pass's output is whatever the buffer held",
+        ))
+    }
+
     /// `vkCmdDrawIndexed`, forwarded. `vertex_offset` is signed, which is the one argument of the
     /// six that is.
     ///
