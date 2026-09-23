@@ -282,6 +282,11 @@ GATE_ACTIVITY = ["cargo", "test", "-p", "omni-android", "--release", "--test", "
 GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
                 "--no-fail-fast", "the_application_name"]
 
+# `libaaudio.so`: the module's unit tests (in the lib target) and `tests/aaudio.rs`, which drives it
+# from guest code through `dlopen`/`dlsym` and a guest data callback on a guest thread, into a
+# recording device. No APK and no audio hardware, so every row costs a build and not a run.
+AAUDIO = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "aaudio", "--no-fail-fast"]
+
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
 GATE_EXITS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
@@ -6997,6 +7002,117 @@ directory", ADAPTER_FILES,
         return Err(AbiError::JniRefused {
             function: symbol,""",
      ANDROID_LIB),
+
+    # libaaudio.so. The first is the one the whole module exists for: a started stream whose thread
+    # never calls the guest's callback still "runs", and nothing but the samples says otherwise.
+    ("aaudio-A1", "A", "the data-callback thread never calls the guest's callback",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """        while allowed >= burst_frames {""",
+     """        while allowed >= burst_frames * 1000 {""",
+     AAUDIO),
+    ("aaudio-A2", "A", "dlopen does not supply libaaudio.so -- FMOD's NOSOUND fallback again",
+     "crates/omni-android/src/bionic/dl.rs",
+     """    (crate::aaudio::SONAMES[0], crate::aaudio::ENTRY_POINT),""",
+     """    ("libnothing.so", crate::aaudio::ENTRY_POINT),""",
+     AAUDIO),
+    ("aaudio-A3", "A", "an AAudio name the library does not export is a NULL, not a refusal",
+     "crates/omni-android/src/bionic/dl.rs",
+     """        if audio && !exported && wanted.starts_with("AAudio") {""",
+     """        if false {""",
+     AAUDIO),
+    ("aaudio-A4", "A", "an input stream opens instead of answering UNAVAILABLE",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """    if builder.direction == consts::DIRECTION_INPUT {""",
+     """    if false {""",
+     AAUDIO),
+    ("aaudio-A5", "A", "an unspecified format becomes int16 rather than the host mix format's float",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """        consts::FORMAT_UNSPECIFIED | consts::FORMAT_PCM_FLOAT => Some(consts::FORMAT_PCM_FLOAT),
+        consts::FORMAT_PCM_I16 => Some(consts::FORMAT_PCM_I16),""",
+     """        consts::FORMAT_PCM_FLOAT => Some(consts::FORMAT_PCM_FLOAT),
+        consts::FORMAT_UNSPECIFIED | consts::FORMAT_PCM_I16 => Some(consts::FORMAT_PCM_I16),""",
+     AAUDIO),
+    ("aaudio-A6", "A", "int16 samples are scaled by 32767, so full scale is not -1.0",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """            .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)""",
+     """            .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0)""",
+     AAUDIO),
+
+    # Writable MAP_SHARED file mappings: the engine's `MappedFile` (libroblox.so link 0x2273210),
+    # which three threads of the first signed-in session died asking for. The mapping is a host
+    # view of a PAGE_READWRITE section over the guest's own descriptor, so "the write-back" is the
+    # view being shared at all: A2-A4 break that at the seam, A1 reverts the fix, A10 keeps the
+    # section alive past the munmap (the engine re-opens the file O_TRUNC right after). The file on
+    # disk is the detector throughout. MS_SYNC's own flush is NOT a row: the view is coherent with
+    # every reader without it (measured), so nothing a test can read distinguishes a skipped flush
+    # -- only durability across a power loss would, and the rows below pin what `sync` selects.
+    ("sharedmap-A1", "A", "a writable MAP_SHARED file mapping is refused again",
+     ADAPTER_GUESTMEM,
+     """        file_backed && prot == PROT_READ | PROT_WRITE && flags & MAP_TYPE == MAP_SHARED;""",
+     """        false && file_backed && prot == PROT_READ | PROT_WRITE && flags & MAP_TYPE == MAP_SHARED;""",
+     PROCFS),
+    ("sharedmap-A2", "A", "a shared file view is created copy-on-write, so stores never reach the file",
+     PLAT_VM_WINDOWS,
+     """        (PAGE_READWRITE, (size as u64).min(in_file) as usize)""",
+     """        (PAGE_WRITECOPY, (size as u64).min(in_file) as usize)""",
+     PROCFS),
+    ("sharedmap-A3", "A",
+     "a shared view is created with the protection asked for, so a later raise is copy-on-write",
+     PLAT_VM_WINDOWS,
+     """        (PAGE_READWRITE, (size as u64).min(in_file) as usize)""",
+     """        (if protection == Protection::ReadWrite { PAGE_READWRITE } else { view_protection(protection) }, (size as u64).min(in_file) as usize)""",
+     MEM),
+    ("sharedmap-A4", "A", "a shared view is not clipped to the file, so a partial last page fails",
+     PLAT_VM_WINDOWS,
+     """        (PAGE_READWRITE, (size as u64).min(in_file) as usize)""",
+     """        (PAGE_READWRITE, size)""",
+     PROCFS),
+    ("sharedmap-A5", "A", "the seam refuses a shared view ending inside the file's last page",
+     PLAT,
+     """    let limit = if file.is_shared() {""",
+     """    let limit = if false {""",
+     MEM),
+    ("sharedmap-A6", "A", "an O_RDONLY descriptor is shared anyway: a host refusal, not EACCES",
+     PLAT_FS,
+     """            Some(Entry::File { writable: false, guest, .. }) => Err(FsError::kinded(""",
+     """            Some(Entry::File { writable: false, guest, .. }) if false => Err(FsError::kinded(""",
+     PROCFS),
+    ("sharedmap-A7", "A", "msync never reports a hole inside the space as ENOMEM",
+     ADAPTER_GUESTMEM,
+     """            None => hole = true,""",
+     """            None => break,""",
+     PROCFS),
+    ("sharedmap-A8", "A", "GuestSpace::sync selects no view at all",
+     SPACE,
+     """                    if !matches!(entry.os, OsState::View { .. }) || !backing.is_shared() {""",
+     """                    if true {""",
+     MEM),
+    ("sharedmap-A10", "A", "the section outlives the munmap, so the engine's O_TRUNC re-open fails",
+     ADAPTER_GUESTMEM,
+     """    match space.map_file(&backing, offset, placement, len, Protection::ReadWrite) {""",
+     """    std::mem::forget(std::sync::Arc::clone(&backing));
+    match space.map_file(&backing, offset, placement, len, Protection::ReadWrite) {""",
+     PROCFS),
+    ("sharedmap-B1", "B", "GuestSpace::sync writes back private file views too",
+     SPACE,
+     """                    if !matches!(entry.os, OsState::View { .. }) || !backing.is_shared() {""",
+     """                    if !matches!(entry.os, OsState::View { .. }) {""",
+     MEM),
+    ("sharedmap-B2", "B", "a mapping ending inside the file's last page is refused as past the end",
+     ADAPTER_GUESTMEM,
+     """    let last_page_end = file_len.div_ceil(page).saturating_mul(page);""",
+     """    let last_page_end = file_len;""",
+     PROCFS),
+    ("sharedmap-B3", "B", "msync answers MS_INVALIDATE with EINVAL, which Linux accepts",
+     ADAPTER_GUESTMEM,
+     """    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0""",
+     """    if flags & !(MS_ASYNC | MS_SYNC) != 0""",
+     PROCFS),
+    ("sharedmap-B4", "B", "msync reports ENOMEM over a range that is mapped end to end",
+     ADAPTER_GUESTMEM,
+     """    let mut hole = from != at || to != end || from >= to;""",
+     """    let mut hole = true;""",
+     PROCFS),
 ]
 
 
