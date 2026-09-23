@@ -242,3 +242,183 @@ fn a_read_only_file_view_costs_almost_no_commit_charge() {
     drop(file);
     let _ = std::fs::remove_file(&path);
 }
+
+// ================================================================== `process_memory`
+//
+// The snapshot `/proc/self/statm` is answered from. Each field is shown to be **the quantity it is
+// named for** by making that quantity -- and only that one -- move: a reservation moves the
+// address space and nothing else, touching committed memory moves the private resident set,
+// reading a file view moves the shareable one. A field wired to the wrong counter moves on the
+// wrong line.
+
+/// Address space moves in allocation granules, and the Rust heap and the test harness reserve
+/// their own segments while a test runs; 16 MiB is far above that and far below the 4 GiB
+/// measured against it.
+const ADDRESS_TOLERANCE: u64 = 16 * MIB;
+
+fn memory() -> vm::ProcessMemory {
+    vm::process_memory().expect("read this process's memory")
+}
+
+/// **The snapshot's counters are the ones the single calls report**, and they sit inside each
+/// other the way a resident set sits inside an address space.
+#[test]
+fn process_memory_reports_the_counters_the_single_calls_do() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let ws_before = working_set();
+    let charge_before = charge();
+    let snapshot = memory();
+    let ws_after = working_set();
+    let charge_after = charge();
+    eprintln!(
+        "process memory: address space {}, resident {} (shareable {}), commit {}, \
+         code {:#x}..{:#x}",
+        mib(snapshot.address_space as i64),
+        mib(snapshot.resident as i64),
+        mib(snapshot.resident_shared as i64),
+        mib(snapshot.commit_charge as i64),
+        snapshot.executable_code.start,
+        snapshot.executable_code.end,
+    );
+    // The same counters as `process_working_set` and `process_commit_charge`, taken an instant
+    // apart with nothing allocating in between.
+    assert_close(delta(ws_before, snapshot.resident), 0, "resident against process_working_set");
+    assert_close(delta(ws_after, snapshot.resident), 0, "resident against process_working_set");
+    let against_charge = "commit against process_commit_charge";
+    assert_close(delta(charge_before, snapshot.commit_charge), 0, against_charge);
+    assert_close(delta(charge_after, snapshot.commit_charge), 0, against_charge);
+    // Parts of wholes.
+    assert!(snapshot.resident_shared <= snapshot.resident, "{snapshot:?}");
+    assert!(snapshot.resident <= snapshot.address_space, "{snapshot:?}");
+    assert!(snapshot.commit_charge <= snapshot.address_space, "{snapshot:?}");
+    // Every Windows process has image pages resident -- its own executable's and ntdll's at the
+    // least -- and an image page nothing has written is shareable. Zero would be a counter that
+    // was never read.
+    assert!(snapshot.resident_shared > 0, "no shareable page resident: {snapshot:?}");
+}
+
+/// **A reservation is address space and nothing else; touched private memory is resident and
+/// private; a read file view is resident and shareable.**
+#[test]
+fn process_memory_moves_each_field_with_the_quantity_it_names() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let region = 64 * MIB as usize;
+
+    // A reservation: address space, and no residency and no commit.
+    let before = memory();
+    let reservation =
+        vm::reserve(4 * 1024 * MIB as usize, vm::allocation_granularity()).expect("reserve 4 GiB");
+    let reserved = memory();
+    let space_delta = delta(before.address_space, reserved.address_space);
+    eprintln!("reserve 4 GiB: address space delta {}", mib(space_delta));
+    assert!(
+        (space_delta - (4 * 1024 * MIB) as i64).unsigned_abs() <= ADDRESS_TOLERANCE,
+        "a 4 GiB reservation moved the address space by {}",
+        mib(space_delta)
+    );
+    let reservation_commit = delta(before.commit_charge, reserved.commit_charge);
+    assert_close(reservation_commit, 0, "commit for a reservation");
+    assert!(
+        delta(before.resident, reserved.resident) < 8 * MIB as i64,
+        "a reservation made {} resident",
+        mib(delta(before.resident, reserved.resident))
+    );
+
+    // Committed and touched: resident, and private -- the shareable part does not move.
+    let ptr = reservation.offset_ptr(0, region).expect("in range");
+    // SAFETY: `ptr` covers the first 64 MiB of a live reservation this test owns.
+    unsafe { vm::commit(ptr, region, Protection::ReadWrite).expect("commit 64 MiB") };
+    // SAFETY: the whole range is committed read-write by the call above.
+    unsafe { std::ptr::write_bytes(ptr, 0xa5, region) };
+    let touched = memory();
+    eprintln!(
+        "commit and touch 64 MiB: resident delta {}, shareable delta {}, commit delta {}",
+        mib(delta(reserved.resident, touched.resident)),
+        mib(delta(reserved.resident_shared, touched.resident_shared)),
+        mib(delta(reserved.commit_charge, touched.commit_charge)),
+    );
+    assert!(
+        delta(reserved.resident, touched.resident) > 48 * MIB as i64,
+        "touching 64 MiB moved the resident set by only {}",
+        mib(delta(reserved.resident, touched.resident))
+    );
+    assert!(
+        delta(reserved.resident_shared, touched.resident_shared).unsigned_abs() < 8 * MIB,
+        "touching 64 MiB of private memory moved the shareable resident set by {}",
+        mib(delta(reserved.resident_shared, touched.resident_shared))
+    );
+    assert_close(
+        delta(reserved.commit_charge, touched.commit_charge),
+        64 * MIB as i64,
+        "commit for 64 MiB committed",
+    );
+    vm::release(reservation).expect("release");
+
+    // A file view, read: resident and shareable, and no commit.
+    let page = vm::page_size();
+    let span = 4096 * page; // 16 MiB
+    let dir = std::env::temp_dir().join("omnidroid-vm-tests");
+    std::fs::create_dir_all(&dir).expect("create fixture directory");
+    let path = dir.join(format!("process-memory-view-{}.bin", std::process::id()));
+    std::fs::write(&path, vec![0x5au8; span]).expect("write a 16 MiB fixture");
+    let file = vm::open_file_for_mapping(&path, omni_platform::vm::MapExecutability::NonExecutable)
+        .expect("open for mapping");
+    let view = vm::reserve_placeholder(span, vm::allocation_granularity()).expect("a placeholder");
+    // SAFETY: the reservation is one unreplaced placeholder of exactly `span` bytes.
+    unsafe { vm::map_file(&file, 0, span, view.as_ptr(), Protection::Read).expect("map it") };
+    let mapped = memory();
+    // SAFETY: the whole span is a live read-only view.
+    let sum: u64 = unsafe {
+        std::slice::from_raw_parts(view.as_ptr(), span).iter().map(|b| u64::from(*b)).sum()
+    };
+    assert_eq!(sum, 0x5a * span as u64, "the view did not contain the file's bytes");
+    let read = memory();
+    eprintln!(
+        "read a 16 MiB file view: resident delta {}, shareable delta {}, commit delta {}",
+        mib(delta(mapped.resident, read.resident)),
+        mib(delta(mapped.resident_shared, read.resident_shared)),
+        mib(delta(mapped.commit_charge, read.commit_charge)),
+    );
+    assert!(
+        delta(mapped.resident_shared, read.resident_shared) > 12 * MIB as i64,
+        "reading a 16 MiB file view moved the shareable resident set by only {}",
+        mib(delta(mapped.resident_shared, read.resident_shared))
+    );
+    assert_close(delta(mapped.commit_charge, read.commit_charge), 0, "commit for a read file view");
+    // SAFETY: the whole view is unmapped exactly once and nothing refers to it any more.
+    unsafe { vm::unmap_and_release(view.as_ptr(), span).expect("unmap and release") };
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A function of this test binary, whose address has to be inside its executable's code.
+#[inline(never)]
+fn a_function_of_this_executable() -> u32 {
+    std::hint::black_box(7)
+}
+
+/// A writable static of this test binary, whose address has to be outside its code.
+static A_STATIC_OF_THIS_EXECUTABLE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// **The code span is this executable's code: its functions are in it and its data is not.**
+///
+/// The second half is the over-correction's detector: a span taken from the whole image
+/// (`SizeOfImage`) rather than its executable sections would contain the static too.
+#[test]
+fn the_executable_code_span_holds_this_executables_code_and_not_its_data() {
+    let code = memory().executable_code;
+    let function = a_function_of_this_executable as usize;
+    let data = std::ptr::addr_of!(A_STATIC_OF_THIS_EXECUTABLE) as usize;
+    assert_eq!(a_function_of_this_executable(), 7);
+    A_STATIC_OF_THIS_EXECUTABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "code {:#x}..{:#x}, a function at {function:#x}, a static at {data:#x}",
+        code.start, code.end
+    );
+    assert!(code.start < code.end, "an empty code span: {code:?}");
+    assert!(code.contains(&function), "{function:#x} is not in the code span {code:x?}");
+    assert!(!code.contains(&data), "{data:#x}, a static, is in the code span {code:x?}");
+    // This process's own seam function is in it too: omni-platform is linked into the executable.
+    assert!(code.contains(&(vm::process_memory as usize)), "{code:x?}");
+}

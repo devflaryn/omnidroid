@@ -97,3 +97,7 @@ pub use omni_platform::vm::{MapExecutability, Protection};
 /// tests assert what an operation actually cost rather than assuming; working set is exposed beside
 /// it so the difference between *committed* and *touched* can be demonstrated rather than argued.
 pub use omni_platform::vm::{process_commit_charge, process_working_set};
+
+/// This process's memory as one snapshot -- the same two numbers as above and the three
+/// `/proc/self/statm` needs besides -- re-exported for the reason those two are.
+pub use omni_platform::vm::{process_memory, ProcessMemory};

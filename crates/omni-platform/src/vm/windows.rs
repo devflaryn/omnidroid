@@ -14,8 +14,10 @@
 //!
 //! Everything else (`VirtualAlloc`, `VirtualFree`, `VirtualProtect`, `VirtualQuery`,
 //! `CreateFileW`, `CreateFileMappingW`, `K32GetProcessMemoryInfo`, `GetSystemInfo`) is exported
-//! from `kernel32.dll` and is linked normally. As a consequence `reserve`, `commit`, `decommit`,
-//! `protect`, `release`, `process_commit_charge` and `process_working_set` all work even if the
+//! from `kernel32.dll` and is linked normally -- as are `GlobalMemoryStatusEx` and
+//! `GetModuleHandleW`, which `process_memory` adds. As a consequence `reserve`, `commit`,
+//! `decommit`, `protect`, `release`, `process_commit_charge`, `process_working_set` and
+//! `process_memory` all work even if the
 //! three dynamic symbols are unavailable; only the placeholder and file-mapping paths, and
 //! reservations aligned above 64 KB, depend on them.
 
@@ -31,7 +33,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetFileSizeEx, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
     MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_MAPPED,
@@ -42,8 +44,11 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    PROCESS_MEMORY_COUNTERS_EX2,
 };
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+use windows_sys::Win32::System::SystemInformation::{
+    GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::{MapExecutability, OsError, Protection, ReservationKind, VmError, VmResult};
@@ -783,6 +788,153 @@ pub(super) fn process_commit_charge() -> VmResult<u64> {
 
 pub(super) fn process_working_set() -> VmResult<u64> {
     Ok(memory_counters()?.WorkingSetSize as u64)
+}
+
+/// `PROCESS_MEMORY_COUNTERS_EX2` for [`process_memory`]: the `_EX` counters plus
+/// `PrivateWorkingSetSize`, which is what splits the working set into private and shareable.
+///
+/// A separate call from [`memory_counters`] rather than a widening of it: `process_commit_charge`
+/// and `process_working_set` are what every commit-charge test measures with, and they keep
+/// asking for exactly the structure they have always asked for.
+fn memory_counters_ex2() -> VmResult<PROCESS_MEMORY_COUNTERS_EX2> {
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: as `memory_counters`. `counters` is a live PROCESS_MEMORY_COUNTERS_EX2 whose `cb`
+    // states its real size, which is how the call is told to write the `_EX2` layout.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            std::ptr::addr_of_mut!(counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+            counters.cb,
+        )
+    };
+    if ok == 0 {
+        return Err(os("process memory counters (PROCESS_MEMORY_COUNTERS_EX2)", 0, 0));
+    }
+    Ok(counters)
+}
+
+/// How many bytes of address space this process has in use: `ullTotalVirtual - ullAvailVirtual`.
+fn address_space_in_use() -> VmResult<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `status` is a live MEMORYSTATUSEX whose `dwLength` states its real size, which the
+    // call requires before it writes anything.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 {
+        return Err(os("GlobalMemoryStatusEx", 0, 0));
+    }
+    Ok(status.ullTotalVirtual.saturating_sub(status.ullAvailVirtual))
+}
+
+/// `IMAGE_SCN_MEM_EXECUTE`: a section whose pages are mapped executable.
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+
+/// Where this process's executable image's code is: the span of its executable sections.
+///
+/// Read straight out of the image header, which the loader mapped at the module's base and which
+/// stays mapped for the life of the process. The offsets are the PE format's own and are spelled
+/// out rather than taken from `IMAGE_NT_HEADERS64`, because the structure `windows-sys` generates
+/// for a section header puts `VirtualSize` inside a union and the DOS header lives behind a
+/// feature this crate does not otherwise need.
+///
+/// Every offset read is checked against the header's own `SizeOfHeaders` before it is read, so a
+/// header that were not what the loader accepts is refused by name rather than read past.
+fn executable_code() -> VmResult<core::ops::Range<usize>> {
+    /// The DOS header's `e_magic`, `MZ`.
+    const DOS_MAGIC: u16 = 0x5A4D;
+    /// Where the DOS header keeps `e_lfanew`, the offset of the NT headers.
+    const E_LFANEW: usize = 0x3C;
+    /// `PE\0\0`.
+    const NT_SIGNATURE: u32 = 0x0000_4550;
+    /// `IMAGE_NT_OPTIONAL_HDR64_MAGIC`: PE32+, the only image a 64-bit process runs.
+    const PE32_PLUS: u16 = 0x020B;
+    /// A section header's size, and the offsets of the three fields read from one.
+    const SECTION_BYTES: usize = 40;
+    const SECTION_VIRTUAL_SIZE: usize = 8;
+    const SECTION_VIRTUAL_ADDRESS: usize = 12;
+    const SECTION_CHARACTERISTICS: usize = 36;
+    /// The smallest header any image has mapped: one page, whatever `SizeOfHeaders` says.
+    const FIRST_PAGE: usize = 4096;
+
+    // SAFETY: GetModuleHandleW(NULL) returns the base of the module the process was created from
+    // and takes no reference on it; that module is never unloaded.
+    let base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
+    if base == 0 {
+        return Err(os("GetModuleHandleW(NULL)", 0, 0));
+    }
+    let refuse = |reason: &'static str| VmError::ExecutableImage { base, reason };
+    // Only ever called with an offset checked against a mapped extent first (see each call).
+    // SAFETY (for each use): the image header is mapped readable from `base` for at least
+    // `limit` bytes, and every call below checks `at + width <= limit` before reading.
+    let read = |at: usize, width: usize, limit: usize| -> VmResult<u64> {
+        if at.checked_add(width).is_none_or(|end| end > limit) {
+            return Err(refuse("a header field lies past the end of the mapped header"));
+        }
+        let pointer = (base + at) as *const u8;
+        // SAFETY: see above; the bounds were checked on the line before.
+        let value = unsafe {
+            match width {
+                2 => u64::from(core::ptr::read_unaligned(pointer.cast::<u16>())),
+                4 => u64::from(core::ptr::read_unaligned(pointer.cast::<u32>())),
+                _ => unreachable!("only 16- and 32-bit header fields are read"),
+            }
+        };
+        Ok(value)
+    };
+
+    if read(0, 2, FIRST_PAGE)? != u64::from(DOS_MAGIC) {
+        return Err(refuse("the DOS header has no MZ signature"));
+    }
+    let nt = read(E_LFANEW, 4, FIRST_PAGE)? as usize;
+    if read(nt, 4, FIRST_PAGE)? != u64::from(NT_SIGNATURE) {
+        return Err(refuse("the NT headers have no PE signature"));
+    }
+    let sections = read(nt + 6, 2, FIRST_PAGE)? as usize;
+    let optional_size = read(nt + 20, 2, FIRST_PAGE)? as usize;
+    let optional = nt + 24;
+    if read(optional, 2, FIRST_PAGE)? != u64::from(PE32_PLUS) {
+        return Err(refuse("the optional header is not PE32+"));
+    }
+    let image_size = read(optional + 56, 4, FIRST_PAGE)? as usize;
+    let headers_size = (read(optional + 60, 4, FIRST_PAGE)? as usize).max(FIRST_PAGE);
+    let table = optional + optional_size;
+
+    let mut span: Option<(usize, usize)> = None;
+    for index in 0..sections {
+        let header = table + index * SECTION_BYTES;
+        let characteristics = read(header + SECTION_CHARACTERISTICS, 4, headers_size)? as u32;
+        if characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+            continue;
+        }
+        let start = read(header + SECTION_VIRTUAL_ADDRESS, 4, headers_size)? as usize;
+        let end = start + read(header + SECTION_VIRTUAL_SIZE, 4, headers_size)? as usize;
+        if end > image_size {
+            return Err(refuse("an executable section ends past SizeOfImage"));
+        }
+        span = Some(span.map_or((start, end), |(low, high)| (low.min(start), high.max(end))));
+    }
+    let (start, end) = span.ok_or_else(|| refuse("the image has no executable section"))?;
+    Ok(base + start..base + end)
+}
+
+pub(super) fn process_memory() -> VmResult<super::ProcessMemory> {
+    let counters = memory_counters_ex2()?;
+    let resident = counters.WorkingSetSize as u64;
+    Ok(super::ProcessMemory {
+        address_space: address_space_in_use()?,
+        resident,
+        // Saturating although the two come from one call: a counter the kernel maintains
+        // separately is not a thing to underflow on, and a shareable figure larger than the
+        // working set it is part of would be the one impossible answer.
+        resident_shared: resident.saturating_sub(counters.PrivateWorkingSetSize as u64),
+        commit_charge: counters.PrivateUsage as u64,
+        executable_code: executable_code()?,
+    })
 }
 
 // -------------------------------------------------------------------------------------------

@@ -79,6 +79,20 @@ pub enum VmError {
         platform: &'static str,
     },
 
+    /// This process's own executable image header could not be read as one.
+    ///
+    /// [`process_memory`](super::process_memory) reads the section table of the image the process
+    /// was started from, to report where its code is. The loader put that header there and it
+    /// stays mapped for the life of the process, so this names an image whose header is not what
+    /// the loader would have accepted -- never a transient failure.
+    #[error("this process's executable image at {base:#x} could not be read: {reason}")]
+    ExecutableImage {
+        /// Where the image is, as `GetModuleHandleW(NULL)` reported it.
+        base: usize,
+        /// Which part of the header was not what an image's header is.
+        reason: &'static str,
+    },
+
     /// A required OS entry point could not be resolved at runtime.
     ///
     /// `VirtualAlloc2`, `MapViewOfFile3` and `UnmapViewOfFile2` are exported from
@@ -370,7 +384,8 @@ impl VmError {
             | VmError::ViewPastEndOfFile { .. }
             | VmError::NotViewBase { .. }
             | VmError::ViewSizeMismatch { .. }
-            | VmError::ReleaseExtentMismatch { .. } => None,
+            | VmError::ReleaseExtentMismatch { .. }
+            | VmError::ExecutableImage { .. } => None,
         }
     }
 

@@ -194,6 +194,14 @@ pub(super) fn process_working_set() -> VmResult<u64> {
     unsupported("process_working_set")
 }
 
+/// Intended on Linux: the host's own `/proc/self/statm` (every field but `commit_charge`, which has
+/// no per-process equivalent -- see the module documentation) and `dl_iterate_phdr`'s first entry
+/// for the executable's `PF_X` span. On macOS: `task_info(TASK_VM_INFO)` and the main image's
+/// `__TEXT` segment. Neither has been measured, so neither is written.
+pub(super) fn process_memory() -> VmResult<super::ProcessMemory> {
+    unsupported("process_memory")
+}
+
 /// The unix stand-in for a pagefile-backed section.
 ///
 /// Unconstructible: [`create_shared_section`] never returns one.
