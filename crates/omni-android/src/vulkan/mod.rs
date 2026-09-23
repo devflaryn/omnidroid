@@ -188,7 +188,8 @@ pub use host::{
     SubpassRequest, SurfaceCreated, SwapchainRequest, VertexInputState, ViewportState, VulkanHost,
 };
 pub use descriptor::{
-    COPY_DESCRIPTOR_SET_BYTES, DESCRIPTOR_BUFFER_INFO_BYTES, DESCRIPTOR_IMAGE_INFO_BYTES,
+    DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES, DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES,
+    MAX_TEMPLATE_ENTRIES, STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO, COPY_DESCRIPTOR_SET_BYTES, DESCRIPTOR_BUFFER_INFO_BYTES, DESCRIPTOR_IMAGE_INFO_BYTES,
     DESCRIPTOR_POOL_CREATE_INFO_BYTES, DESCRIPTOR_POOL_SIZE_BYTES,
     DESCRIPTOR_SET_ALLOCATE_INFO_BYTES, DESCRIPTOR_SET_LAYOUT_BINDING_BYTES,
     DESCRIPTOR_SET_LAYOUT_CREATE_INFO_BYTES, MAX_DESCRIPTOR_BINDINGS, MAX_DESCRIPTOR_COPIES,
@@ -561,6 +562,11 @@ pub const MAX_DESCRIPTOR_SETS: usize = 16384;
 /// one, its GPU timer (`gpuTimeQueryPool`); four is room for a recreated renderer's.
 pub const MAX_QUERY_POOLS: usize = 4;
 
+/// How many `VkDescriptorUpdateTemplate` handles one [`Vulkan`] will hold at once. MEASURED: the
+/// engine makes them once its shaders are loaded, one per shader interface it updates that way --
+/// so as many as [`MAX_DESCRIPTOR_SET_LAYOUTS`].
+pub const MAX_DESCRIPTOR_UPDATE_TEMPLATES: usize = MAX_DESCRIPTOR_SET_LAYOUTS;
+
 /// The symbol [`Vulkan::bind_into`] declares the `VkDeviceMemory` registry under.
 pub const DEVICE_MEMORY_REGISTRY_SYMBOL: &str = "vulkan::device_memories";
 /// The symbol [`Vulkan::bind_into`] declares the `VkBuffer` registry under.
@@ -589,6 +595,8 @@ pub const DESCRIPTOR_POOL_REGISTRY_SYMBOL: &str = "vulkan::descriptor_pools";
 pub const DESCRIPTOR_SET_REGISTRY_SYMBOL: &str = "vulkan::descriptor_sets";
 /// The symbol [`Vulkan::bind_into`] declares the `VkQueryPool` registry under.
 pub const QUERY_POOL_REGISTRY_SYMBOL: &str = "vulkan::query_pools";
+/// The symbol [`Vulkan::bind_into`] declares the `VkDescriptorUpdateTemplate` registry under.
+pub const UPDATE_TEMPLATE_REGISTRY_SYMBOL: &str = "vulkan::descriptor_update_templates";
 
 /// The symbol [`Vulkan::bind_into`] declares the `VkPhysicalDevice` registry under.
 pub const PHYSICAL_DEVICE_REGISTRY_SYMBOL: &str = "vulkan::physical_devices";
@@ -673,7 +681,8 @@ pub const REGISTRY_BYTES: usize = MAX_INSTANCES * INSTANCE_SLOT_BYTES
         + MAX_DESCRIPTOR_SET_LAYOUTS
         + MAX_DESCRIPTOR_POOLS
         + MAX_DESCRIPTOR_SETS
-        + MAX_QUERY_POOLS)
+        + MAX_QUERY_POOLS
+        + MAX_DESCRIPTOR_UPDATE_TEMPLATES)
         * SLOT;
 
 /// The bytes of data area an embedding must pass to [`BoundaryBuilder::new`] for a boundary that
@@ -739,6 +748,8 @@ const DESCRIPTOR_POOL_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_5000; // "\0OMNVDP\0"
 const DESCRIPTOR_SET_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_5300; // "\0OMNVDS\0"
 /// What a `VkQueryPool` slot holds. Nothing reads it back.
 const QUERY_POOL_SLOT_MAGIC: u64 = 0x004F_4D4E_5651_5000; // "\0OMNVQP\0"
+/// What a `VkDescriptorUpdateTemplate` slot holds. Nothing reads it back.
+const UPDATE_TEMPLATE_SLOT_MAGIC: u64 = 0x004F_4D4E_5655_5400; // "\0OMNVUT\0"
 
 /// What `vkGetInstanceProcAddr` answered for one name.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1011,6 +1022,11 @@ struct State {
     descriptor_pools: Option<Handles<HostDescriptorPool>>,
     descriptor_sets: Option<Handles<HostDescriptorSet>>,
     query_pools: Option<Handles<HostQueryPool>>,
+    update_templates: Option<Handles<descriptor::TemplateId>>,
+    /// Each live template's entries, by [`descriptor::TemplateId`]: this layer's, not a host's.
+    templates: BTreeMap<u64, Vec<descriptor::TemplateEntry>>,
+    /// The next [`descriptor::TemplateId`] to hand out.
+    next_template: u64,
     /// The `GuestSpace` pages behind every **imported** `VkDeviceMemory`, by token.
     ///
     /// **The one piece of state in this file that owns address space.** A forwarded allocation has
@@ -1190,6 +1206,9 @@ impl Vulkan {
                 descriptor_pools: None,
                 descriptor_sets: None,
                 query_pools: None,
+                update_templates: None,
+                templates: BTreeMap::new(),
+                next_template: 0,
                 imports: BTreeMap::new(),
                 imported_bytes: 0,
                 imported_peak: 0,
@@ -1449,6 +1468,13 @@ impl Vulkan {
             MAX_QUERY_POOLS,
             "VkQueryPool",
             QUERY_POOL_SLOT_MAGIC,
+        )?);
+        state.update_templates = Some(carve(
+            builder,
+            UPDATE_TEMPLATE_REGISTRY_SYMBOL,
+            MAX_DESCRIPTOR_UPDATE_TEMPLATES,
+            "VkDescriptorUpdateTemplate",
+            UPDATE_TEMPLATE_SLOT_MAGIC,
         )?);
         Ok(BOUND_SYMBOLS)
     }
@@ -1917,7 +1943,8 @@ impl Vulkan {
              VkPipelineCache {}/{MAX_PIPELINE_CACHES}, \
              VkDescriptorSetLayout {}/{MAX_DESCRIPTOR_SET_LAYOUTS}, \
              VkDescriptorPool {}/{MAX_DESCRIPTOR_POOLS}, \
-             VkDescriptorSet {}/{MAX_DESCRIPTOR_SETS}, VkQueryPool {}/{MAX_QUERY_POOLS}\n",
+             VkDescriptorSet {}/{MAX_DESCRIPTOR_SETS}, VkQueryPool {}/{MAX_QUERY_POOLS}, \
+             VkDescriptorUpdateTemplate {}/{MAX_DESCRIPTOR_UPDATE_TEMPLATES}\n",
             state.device_memories.as_ref().map_or(0, Handles::live),
             state.buffers.as_ref().map_or(0, Handles::live),
             state.created_images.as_ref().map_or(0, Handles::live),
@@ -1932,6 +1959,7 @@ impl Vulkan {
             state.descriptor_pools.as_ref().map_or(0, Handles::live),
             state.descriptor_sets.as_ref().map_or(0, Handles::live),
             state.query_pools.as_ref().map_or(0, Handles::live),
+            state.update_templates.as_ref().map_or(0, Handles::live),
         ));
         out.push_str(&format!(
             "  guest memory imported for Vulkan: {} live import(s) holding {} byte(s), peak {} \
@@ -2495,6 +2523,56 @@ impl Vulkan {
         query_pools, HostQueryPool, "VkQueryPool", "vkCreateQueryPool",
         "it is *non*-dispatchable, and reading back another pool's timestamps is a GPU timer \
          measuring frames it did not bracket"
+    }
+
+    stage_five_family! {
+        /// The [`descriptor::TemplateId`] a guest `VkDescriptorUpdateTemplate` names, or a typed
+        /// refusal.
+        update_template_token, register_update_template_slot, forget_update_template_slot,
+        update_templates, descriptor::TemplateId, "VkDescriptorUpdateTemplate",
+        "vkCreateDescriptorUpdateTemplate",
+        "it is *non*-dispatchable, and an update through the wrong template reads the guest's \
+         data at another template's offsets"
+    }
+
+    /// Keep a template's entries and register a handle for them.
+    fn register_update_template(
+        &self,
+        at: &Site,
+        entries: Vec<descriptor::TemplateEntry>,
+    ) -> AbiResult<Registered> {
+        let id = {
+            let mut state = self.state.lock();
+            let id = state.next_template;
+            state.next_template += 1;
+            id
+        };
+        let registered = self.register_update_template_slot(at, descriptor::TemplateId(id))?;
+        self.state.lock().templates.insert(id, entries);
+        Ok(registered)
+    }
+
+    /// The entries of the template a guest handle names, or a typed refusal.
+    fn update_template_entries(
+        &self,
+        at: &Site,
+        call: &str,
+        handle: u64,
+    ) -> AbiResult<Vec<descriptor::TemplateEntry>> {
+        let id = self.update_template_token(at, call, handle)?;
+        Ok(self.state.lock().templates.get(&id.0).cloned().unwrap_or_default())
+    }
+
+    /// Forget a template: its handle and its entries.
+    fn forget_update_template(&self, handle: GuestAddr) {
+        let id = {
+            let state = self.state.lock();
+            state.update_templates.as_ref().and_then(|h| h.get(handle))
+        };
+        self.forget_update_template_slot(handle);
+        if let Some(id) = id {
+            self.state.lock().templates.remove(&id.0);
+        }
     }
 
     /// The image a guest `VkImage` names, **whichever of the two families it belongs to**.
@@ -3431,7 +3509,19 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkDestroyPipelineCache" => shader::destroy_pipeline_cache(c, &at, &vulkan, args),
         // The engine's own renderer: its GPU timer.
         "vkCreateQueryPool" => query::create_query_pool(c, &at, &vulkan, args),
+        // Its descriptor update templates, kept by this layer (see `descriptor`).
+        "vkCreateDescriptorUpdateTemplate" | "vkCreateDescriptorUpdateTemplateKHR" => {
+            descriptor::create_descriptor_update_template(c, &at, &vulkan, name.as_str(), args)
+        }
+        "vkUpdateDescriptorSetWithTemplate" | "vkUpdateDescriptorSetWithTemplateKHR" => {
+            descriptor::update_descriptor_set_with_template(c, &at, &vulkan, name.as_str(), args)
+        }
+        "vkDestroyDescriptorUpdateTemplate" | "vkDestroyDescriptorUpdateTemplateKHR" => {
+            descriptor::destroy_descriptor_update_template(c, &at, &vulkan, name.as_str(), args)
+        }
         "vkDestroyQueryPool" => query::destroy_query_pool(c, &at, &vulkan, args),
+        "vkCmdResetQueryPool" => query::cmd_reset_query_pool(c, &at, &vulkan, args),
+        "vkCmdWriteTimestamp" => query::cmd_write_timestamp(c, &at, &vulkan, args),
         "vkCreatePipelineLayout" => shader::create_pipeline_layout(c, &at, &vulkan, args),
         "vkDestroyPipelineLayout" => shader::destroy_pipeline_layout(c, &at, &vulkan, args),
         "vkCreateRenderPass" => shader::create_render_pass(c, &at, &vulkan, args),
@@ -3664,10 +3754,10 @@ mod tests {
             * SLOT;
         assert_eq!(stage_five, 64_420 * SLOT, "64,420 slots of {SLOT} bytes");
         // The engine's own renderer: its GPU timer's query pools.
-        let engine = MAX_QUERY_POOLS * SLOT;
-        assert_eq!(engine, 64);
+        let engine = (MAX_QUERY_POOLS + MAX_DESCRIPTOR_UPDATE_TEMPLATES) * SLOT;
+        assert_eq!(engine, 16_448);
         assert_eq!(REGISTRY_BYTES, 64 + 512 + stage_four + stage_five + engine);
-        assert_eq!(REGISTRY_BYTES, 1_265_472);
+        assert_eq!(REGISTRY_BYTES, 1_281_856);
 
         // **The old area, as the subtraction that says why it had to grow.** 4096 - 3648 left 448
         // bytes after stage 4, which is 28 slots — fewer than two per stage 5 family, and a
@@ -3686,7 +3776,7 @@ mod tests {
         assert_eq!(REQUIRED_DATA_BYTES, 2_097_152);
         assert_eq!(
             REQUIRED_DATA_BYTES - REGISTRY_BYTES,
-            831_680,
+            815_296,
             "what is left for everything else"
         );
     }

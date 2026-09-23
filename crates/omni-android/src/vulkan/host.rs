@@ -2939,6 +2939,45 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkCmdResetQueryPool`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_reset_query_pool(
+        &self,
+        buffer: HostCommandBuffer,
+        pool: HostQueryPool,
+        first: u32,
+        count: u32,
+    ) -> AbiResult<()> {
+        let _ = (buffer, pool, first, count);
+        Err(host_has_no(
+            "VulkanHost::cmd_reset_query_pool",
+            "the queries are not reset, and a timestamp read back from an unreset query is \
+             undefined",
+        ))
+    }
+
+    /// `vkCmdWriteTimestamp`, forwarded. `stage` is the guest's `VkPipelineStageFlagBits`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_write_timestamp(
+        &self,
+        buffer: HostCommandBuffer,
+        stage: u32,
+        pool: HostQueryPool,
+        query: u32,
+    ) -> AbiResult<()> {
+        let _ = (buffer, stage, pool, query);
+        Err(host_has_no(
+            "VulkanHost::cmd_write_timestamp",
+            "no timestamp is written, and the GPU timer would read back whatever the query held",
+        ))
+    }
+
     /// `vkDestroyQueryPool`, forwarded.
     ///
     /// # Errors

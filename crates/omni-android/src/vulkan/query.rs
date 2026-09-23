@@ -85,6 +85,46 @@ pub(super) fn create_query_pool(
     }
 }
 
+/// `void vkCmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+/// uint32_t firstQuery, uint32_t queryCount)`
+///
+/// MEASURED: the first command the engine records, `(pool, 0, 2)` -- the GPU timer's two
+/// timestamps, reset before a frame writes them.
+pub(super) fn cmd_reset_query_pool(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCmdResetQueryPool";
+    let host = vulkan.require_host(at)?;
+    let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    let pool = vulkan.query_pool_token(at, CALL, args[1])?;
+    host.cmd_reset_query_pool(buffer, pool, args[2] as u32, args[3] as u32)?;
+    c.ret().void();
+    Ok(())
+}
+
+/// `void vkCmdWriteTimestamp(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits
+/// pipelineStage, VkQueryPool queryPool, uint32_t query)`
+///
+/// The other half of a timestamp pool's use, and the only way one is written: the pool the engine
+/// created is `VK_QUERY_TYPE_TIMESTAMP`, which nothing but this command fills.
+pub(super) fn cmd_write_timestamp(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCmdWriteTimestamp";
+    let host = vulkan.require_host(at)?;
+    let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    let pool = vulkan.query_pool_token(at, CALL, args[2])?;
+    host.cmd_write_timestamp(buffer, args[1] as u32, pool, args[3] as u32)?;
+    c.ret().void();
+    Ok(())
+}
+
 /// `void vkDestroyQueryPool(VkDevice device, VkQueryPool queryPool,
 /// const VkAllocationCallbacks *pAllocator)`
 pub(super) fn destroy_query_pool(

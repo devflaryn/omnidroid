@@ -553,6 +553,241 @@ pub(super) fn update_descriptor_sets(
     Ok(())
 }
 
+// ---------------------------------------------------------------- descriptor update templates
+//
+// **Kept by this layer, never created on the host.** The specification defines
+// `vkUpdateDescriptorSetWithTemplate` as the writes its entries describe, applied to the data the
+// guest points at -- and that data holds **guest** handles, which have to be resolved one by one
+// anyway. So a template here is its entries, validated once at creation; an update reads each
+// descriptor out of `pData` through the same decoders `vkUpdateDescriptorSets` uses and hands the
+// host ordinary writes. MEASURED: the engine creates templates once its shaders are loaded.
+
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO`.
+pub const STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO: u32 = 1_000_085_000;
+
+/// `sizeof(VkDescriptorUpdateTemplateCreateInfo)`.
+///
+/// ```text
+/// VkStructureType                          sType;                       //  0
+/// const void                              *pNext;                       //  8
+/// VkDescriptorUpdateTemplateCreateFlags    flags;                       // 16
+/// uint32_t                                 descriptorUpdateEntryCount;  // 20
+/// const VkDescriptorUpdateTemplateEntry   *pDescriptorUpdateEntries;    // 24
+/// VkDescriptorUpdateTemplateType           templateType;                // 32  (then 4 of padding)
+/// VkDescriptorSetLayout                    descriptorSetLayout;         // 40
+/// VkPipelineBindPoint                      pipelineBindPoint;           // 48  (then 4 of padding)
+/// VkPipelineLayout                         pipelineLayout;              // 56
+/// uint32_t                                 set;                         // 64  (then 4 of padding)
+/// ```
+pub const DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES: usize = 72;
+
+/// `sizeof(VkDescriptorUpdateTemplateEntry)`: four `uint32_t`s, then `offset` and `stride` as
+/// `size_t` -- eight bytes on aarch64 LP64 and on x86-64 alike, so 32 on both.
+pub const DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES: usize = 32;
+
+/// How many entries one template may hold. An allocation bound: the count is a guest `uint32_t`.
+pub const MAX_TEMPLATE_ENTRIES: usize = 64;
+
+/// `VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET`.
+const TEMPLATE_TYPE_DESCRIPTOR_SET: u32 = 0;
+
+/// What a guest `VkDescriptorUpdateTemplate` names: an index into this layer's own table of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TemplateId(pub(super) u64);
+
+/// One `VkDescriptorUpdateTemplateEntry`: which descriptors it writes, and where in `pData` each
+/// one's info is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TemplateEntry {
+    binding: u32,
+    array_element: u32,
+    count: u32,
+    descriptor_type: u32,
+    offset: u64,
+    stride: u64,
+}
+
+/// `VkResult vkCreateDescriptorUpdateTemplate(VkDevice device,
+/// const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo, const VkAllocationCallbacks
+/// *pAllocator, VkDescriptorUpdateTemplate *pDescriptorUpdateTemplate)`, and its `KHR` alias.
+pub(super) fn create_descriptor_update_template(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    call: &str,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    refuse_allocator(vulkan, at, call, args[2])?;
+    let _device = vulkan.device_token(at, call, args[0])?;
+    let info_at = require_pointer(at, call, "pCreateInfo", args[1])?;
+    let out_at = require_pointer(at, call, "pDescriptorUpdateTemplate", args[3])?;
+    let info =
+        c.mem().read_bytes(info_at, DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES, c.blame(1))?;
+    check_header(
+        at,
+        call,
+        &info,
+        STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+        "VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO",
+        "the entry array and the template type would be read at offsets belonging to a \
+         different structure",
+        "a template `pNext` chain has no structure in core Vulkan to carry",
+    )?;
+    let word = |offset: usize| u32::from_le_bytes(info[offset..offset + 4].try_into().expect("four"));
+    let long = |offset: usize| u64::from_le_bytes(info[offset..offset + 8].try_into().expect("eight"));
+    let template_type = word(32);
+    if template_type != TEMPLATE_TYPE_DESCRIPTOR_SET {
+        return Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with `templateType = {template_type}`. \
+             This layer keeps descriptor-set templates (0); a push-descriptor template (1) is \
+             used by `vkCmdPushDescriptorSetWithTemplateKHR`, which is not implemented",
+            caller = at.caller
+        )));
+    }
+    // The specification requires a valid layout for a descriptor-set template, and resolving it
+    // is what says the guest is naming one this layer issued.
+    let _layout = vulkan.descriptor_set_layout_token(at, call, long(40))?;
+    let count = word(20) as usize;
+    if count == 0 || count > MAX_TEMPLATE_ENTRIES {
+        return Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with `descriptorUpdateEntryCount = \
+             {count}`; the specification requires at least one, and this layer reads at most \
+             {MAX_TEMPLATE_ENTRIES}",
+            caller = at.caller
+        )));
+    }
+    let entries_at = require_pointer(at, call, "pDescriptorUpdateEntries", long(24))?;
+    let raw = c.mem().read_bytes(entries_at, count * DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES, c.blame(1))?;
+    let mut entries = Vec::with_capacity(count);
+    for index in 0..count {
+        let entry = &raw[index * DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES..][..DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES];
+        let word = |offset: usize| u32::from_le_bytes(entry[offset..offset + 4].try_into().expect("four"));
+        let long = |offset: usize| u64::from_le_bytes(entry[offset..offset + 8].try_into().expect("eight"));
+        let descriptor_type = word(12);
+        let readable = matches!(
+            descriptor_type,
+            TYPE_SAMPLER
+                | TYPE_COMBINED_IMAGE_SAMPLER
+                | TYPE_SAMPLED_IMAGE
+                | TYPE_STORAGE_IMAGE
+                | TYPE_INPUT_ATTACHMENT
+                | TYPE_UNIFORM_BUFFER..=TYPE_STORAGE_BUFFER_DYNAMIC
+        );
+        if !readable {
+            return Err(at.refuse(format!(
+                "the guest called `{call}` from {caller:#x} with entry {index} of \
+                 `descriptorType = {descriptor_type}`. This layer reads image and buffer \
+                 descriptors out of a template's data; a texel buffer's `VkBufferView` has no \
+                 family here, and any other type's data is not one this layer knows the shape of",
+                caller = at.caller
+            )));
+        }
+        let descriptors = word(8) as usize;
+        if descriptors > MAX_DESCRIPTORS_PER_WRITE {
+            return Err(at.refuse(format!(
+                "the guest called `{call}` from {caller:#x} with entry {index} of \
+                 `descriptorCount = {descriptors}`, and this layer reads at most \
+                 {MAX_DESCRIPTORS_PER_WRITE}",
+                caller = at.caller
+            )));
+        }
+        entries.push(TemplateEntry {
+            binding: word(0),
+            array_element: word(4),
+            count: word(8),
+            descriptor_type,
+            offset: long(16),
+            stride: long(24),
+        });
+    }
+    let registered = vulkan.register_update_template(at, entries)?;
+    c.mem().write_bytes(registered.at, &registered.image, c.blame(3))?;
+    c.mem().write_u64(out_at, registered.at as u64, c.blame(3))?;
+    c.ret().i32(VK_SUCCESS);
+    Ok(())
+}
+
+/// `void vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet descriptorSet,
+/// VkDescriptorUpdateTemplate descriptorUpdateTemplate, const void *pData)`, and its `KHR` alias:
+/// each entry's descriptors read from `pData + offset + i * stride` and handed to the host as the
+/// writes they are.
+pub(super) fn update_descriptor_set_with_template(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    call: &str,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.device_token(at, call, args[0])?;
+    let set = vulkan.descriptor_set_token(at, call, args[1])?;
+    let entries = vulkan.update_template_entries(at, call, args[2])?;
+    let data = require_pointer(at, call, "pData", args[3])?;
+    let mut writes = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.count == 0 {
+            continue;
+        }
+        let mut images = Vec::new();
+        let mut buffers = Vec::new();
+        for element in 0..u64::from(entry.count) {
+            let offset = entry.stride.checked_mul(element).and_then(|step| step.checked_add(entry.offset));
+            let Some(at_offset) = offset.and_then(|offset| (data as u64).checked_add(offset)) else {
+                return Err(at.refuse(format!(
+                    "the guest called `{call}` from {caller:#x} with a template whose entry \
+                     {index} puts descriptor {element} past the end of the address space",
+                    caller = at.caller
+                )));
+            };
+            let info_at = guest_pointer(at, "pData", at_offset)?;
+            let bytes = c.mem().read_bytes(info_at, DESCRIPTOR_IMAGE_INFO_BYTES, c.blame(3))?;
+            let label = format!("pData[entry {index}, descriptor {element}]");
+            if matches!(entry.descriptor_type, TYPE_UNIFORM_BUFFER..=TYPE_STORAGE_BUFFER_DYNAMIC) {
+                buffers.push(buffer_descriptor(at, vulkan, call, &label, &bytes)?);
+            } else {
+                images.push(image_descriptor(at, vulkan, call, &label, entry.descriptor_type, &bytes)?);
+            }
+        }
+        let written = if buffers.is_empty() {
+            DescriptorWrites::Images(images)
+        } else {
+            DescriptorWrites::Buffers(buffers)
+        };
+        writes.push(DescriptorWrite {
+            set,
+            binding: entry.binding,
+            array_element: entry.array_element,
+            descriptor_type: entry.descriptor_type,
+            writes: written,
+        });
+    }
+    host.update_descriptor_sets(device, &writes, &[])?;
+    c.ret().void();
+    Ok(())
+}
+
+/// `void vkDestroyDescriptorUpdateTemplate(VkDevice device, VkDescriptorUpdateTemplate
+/// descriptorUpdateTemplate, const VkAllocationCallbacks *pAllocator)`, and its `KHR` alias.
+pub(super) fn destroy_descriptor_update_template(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    call: &str,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    refuse_allocator(vulkan, at, call, args[2])?;
+    let _device = vulkan.device_token(at, call, args[0])?;
+    if args[1] == 0 {
+        c.ret().void();
+        return Ok(());
+    }
+    let handle = guest_pointer(at, "descriptorUpdateTemplate", args[1])?;
+    let _ = vulkan.update_template_entries(at, call, args[1])?;
+    vulkan.forget_update_template(handle);
+    c.ret().void();
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------ small helpers
 
 /// Decode `pBindings`, whose one pointer is `pImmutableSamplers`.
@@ -774,7 +1009,26 @@ fn decode_image_infos(
 ) -> AbiResult<Vec<ImageDescriptor>> {
     let array_at = require_pointer(at, call, "pDescriptorWrites[..].pImageInfo", pointer)?;
     let bytes = c.mem().read_bytes(array_at, count * DESCRIPTOR_IMAGE_INFO_BYTES, c.blame(2))?;
-    // Which of the two handles is live is the type's business again: a bare `SAMPLER` descriptor
+    let mut out = Vec::with_capacity(count);
+    for entry_index in 0..count {
+        let entry = &bytes[entry_index * DESCRIPTOR_IMAGE_INFO_BYTES..][..DESCRIPTOR_IMAGE_INFO_BYTES];
+        let label = format!("pDescriptorWrites[{index}].pImageInfo[{entry_index}]");
+        out.push(image_descriptor(at, vulkan, call, &label, descriptor_type, entry)?);
+    }
+    Ok(out)
+}
+
+/// One `VkDescriptorImageInfo`, resolved: the sampler and view handles the type makes live, and
+/// the layout. `label` is where it was, for the refusals.
+fn image_descriptor(
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    call: &str,
+    label: &str,
+    descriptor_type: u32,
+    entry: &[u8],
+) -> AbiResult<ImageDescriptor> {
+    // Which of the two handles is live is the type's business: a bare `SAMPLER` descriptor
     // ignores `imageView`, and `SAMPLED_IMAGE`, `STORAGE_IMAGE` and `INPUT_ATTACHMENT` ignore
     // `sampler`. Resolving an ignored member would refuse a conforming guest that left it zero --
     // or worse, resolve a stale value it was entitled to leave there.
@@ -783,44 +1037,37 @@ fn decode_image_infos(
         descriptor_type,
         TYPE_COMBINED_IMAGE_SAMPLER | TYPE_SAMPLED_IMAGE | TYPE_STORAGE_IMAGE | TYPE_INPUT_ATTACHMENT
     );
-    let mut out = Vec::with_capacity(count);
-    for entry_index in 0..count {
-        let entry = &bytes[entry_index * DESCRIPTOR_IMAGE_INFO_BYTES..][..DESCRIPTOR_IMAGE_INFO_BYTES];
-        let sampler_handle = u64::from_le_bytes(entry[0..8].try_into().expect("eight"));
-        let view_handle = u64::from_le_bytes(entry[8..16].try_into().expect("eight"));
-        let layout = u32::from_le_bytes(entry[16..20].try_into().expect("four"));
-        let sampler = if wants_sampler && sampler_handle != 0 {
-            Some(vulkan.sampler_token(at, call, sampler_handle)?)
-        } else if wants_sampler {
-            return Err(at.refuse(format!(
-                "the guest called `{call}` from {caller:#x} with \
-                 `pDescriptorWrites[{index}].pImageInfo[{entry_index}].sampler = VK_NULL_HANDLE` \
-                 for a descriptor of type {descriptor_type}, which the specification requires to \
-                 have one unless the binding was created with an immutable sampler. This layer \
-                 cannot tell those apart without the set's layout, so it refuses rather than \
-                 writing a descriptor with no sampler -- which samples black",
-                caller = at.caller
-            )));
-        } else {
-            None
-        };
-        let view = if wants_view && view_handle != 0 {
-            Some(vulkan.image_view_token(at, call, view_handle)?)
-        } else if wants_view {
-            return Err(at.refuse(format!(
-                "the guest called `{call}` from {caller:#x} with \
-                 `pDescriptorWrites[{index}].pImageInfo[{entry_index}].imageView = \
-                 VK_NULL_HANDLE` for a descriptor of type {descriptor_type}, which the \
-                 specification requires to name a view. A descriptor with no view is one a draw \
-                 reads and gets nothing from",
-                caller = at.caller
-            )));
-        } else {
-            None
-        };
-        out.push((sampler, view, layout));
-    }
-    Ok(out)
+    let sampler_handle = u64::from_le_bytes(entry[0..8].try_into().expect("eight"));
+    let view_handle = u64::from_le_bytes(entry[8..16].try_into().expect("eight"));
+    let layout = u32::from_le_bytes(entry[16..20].try_into().expect("four"));
+    let sampler = if wants_sampler && sampler_handle != 0 {
+        Some(vulkan.sampler_token(at, call, sampler_handle)?)
+    } else if wants_sampler {
+        return Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with `{label}.sampler = VK_NULL_HANDLE` \
+             for a descriptor of type {descriptor_type}, which the specification requires to \
+             have one unless the binding was created with an immutable sampler. This layer \
+             cannot tell those apart without the set's layout, so it refuses rather than \
+             writing a descriptor with no sampler -- which samples black",
+            caller = at.caller
+        )));
+    } else {
+        None
+    };
+    let view = if wants_view && view_handle != 0 {
+        Some(vulkan.image_view_token(at, call, view_handle)?)
+    } else if wants_view {
+        return Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with `{label}.imageView = \
+             VK_NULL_HANDLE` for a descriptor of type {descriptor_type}, which the \
+             specification requires to name a view. A descriptor with no view is one a draw \
+             reads and gets nothing from",
+            caller = at.caller
+        )));
+    } else {
+        None
+    };
+    Ok((sampler, view, layout))
 }
 
 /// Decode one write's `pBufferInfo`.
@@ -839,23 +1086,34 @@ fn decode_buffer_infos(
     for entry_index in 0..count {
         let entry =
             &bytes[entry_index * DESCRIPTOR_BUFFER_INFO_BYTES..][..DESCRIPTOR_BUFFER_INFO_BYTES];
-        let handle = u64::from_le_bytes(entry[0..8].try_into().expect("eight"));
-        if handle == 0 {
-            return Err(at.refuse(format!(
-                "the guest called `{call}` from {caller:#x} with \
-                 `pDescriptorWrites[{index}].pBufferInfo[{entry_index}].buffer = \
-                 VK_NULL_HANDLE`, which the core specification does not permit. A buffer \
-                 descriptor with no buffer is one the shader reads from nowhere",
-                caller = at.caller
-            )));
-        }
-        out.push((
-            vulkan.buffer_token(at, call, handle)?,
-            u64::from_le_bytes(entry[8..16].try_into().expect("eight")),
-            u64::from_le_bytes(entry[16..24].try_into().expect("eight")),
-        ));
+        let label = format!("pDescriptorWrites[{index}].pBufferInfo[{entry_index}]");
+        out.push(buffer_descriptor(at, vulkan, call, &label, entry)?);
     }
     Ok(out)
+}
+
+/// One `VkDescriptorBufferInfo`, resolved. `label` is where it was, for the refusal.
+fn buffer_descriptor(
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    call: &str,
+    label: &str,
+    entry: &[u8],
+) -> AbiResult<(super::HostBuffer, u64, u64)> {
+    let handle = u64::from_le_bytes(entry[0..8].try_into().expect("eight"));
+    if handle == 0 {
+        return Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with `{label}.buffer = VK_NULL_HANDLE`, \
+             which the core specification does not permit. A buffer descriptor with no buffer \
+             is one the shader reads from nowhere",
+            caller = at.caller
+        )));
+    }
+    Ok((
+        vulkan.buffer_token(at, call, handle)?,
+        u64::from_le_bytes(entry[8..16].try_into().expect("eight")),
+        u64::from_le_bytes(entry[16..24].try_into().expect("eight")),
+    ))
 }
 
 /// Decode `pDescriptorCopies`.

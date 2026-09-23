@@ -62,6 +62,8 @@ use omni_android::vulkan::{
     HostImageRef, HostImageView, HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache,
     HostPipelineLayout, HostQueryPool, HostQueue, HostRenderPass, HostSampler, HostSemaphore,
     HostShaderModule, QueryPoolRequest, QUERY_POOL_CREATE_INFO_BYTES,
+    DescriptorWrites, DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES,
+    DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES, STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
     HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
     MemoryPlan, PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest,
     Presented, RenderPassRequest, RewriteSite, SubmitRequest, SurfaceCreated, SwapchainRequest,
@@ -336,6 +338,8 @@ struct HostLog {
     sampler_bodies: Vec<Vec<u8>>,
     /// Every `vkCreateQueryPool` request.
     query_pools: Vec<QueryPoolRequest>,
+    /// Every query command: `("reset", pool, first, count)` or `("timestamp", pool, stage, query)`.
+    query_commands: Vec<(&'static str, HostQueryPool, u32, u32)>,
 }
 
 /// The measured memory table of this machine, which the double reports so that the rewrite is
@@ -634,6 +638,11 @@ impl VulkanHost for StageFourHost {
                 | "vkDeviceWaitIdle"
                 | "vkCreateQueryPool"
                 | "vkDestroyQueryPool"
+                | "vkCmdResetQueryPool"
+                | "vkCmdWriteTimestamp"
+                | "vkCreateDescriptorUpdateTemplate"
+                | "vkUpdateDescriptorSetWithTemplate"
+                | "vkDestroyDescriptorUpdateTemplate"
         ))
     }
 
@@ -649,6 +658,28 @@ impl VulkanHost for StageFourHost {
 
     fn destroy_query_pool(&self, _pool: HostQueryPool) -> AbiResult<()> {
         self.note("vkDestroyQueryPool");
+        Ok(())
+    }
+
+    fn cmd_reset_query_pool(
+        &self,
+        _buffer: HostCommandBuffer,
+        pool: HostQueryPool,
+        first: u32,
+        count: u32,
+    ) -> AbiResult<()> {
+        self.log().query_commands.push(("reset", pool, first, count));
+        Ok(())
+    }
+
+    fn cmd_write_timestamp(
+        &self,
+        _buffer: HostCommandBuffer,
+        stage: u32,
+        pool: HostQueryPool,
+        query: u32,
+    ) -> AbiResult<()> {
+        self.log().query_commands.push(("timestamp", pool, stage, query));
         Ok(())
     }
 
@@ -1762,6 +1793,109 @@ fn the_swapchain_create_info_is_checked_field_by_field() {
 
 // ====================================================================== vkGetSwapchainImagesKHR
 
+/// **A descriptor update template is the writes its entries describe**: an update reads each
+/// descriptor out of the guest's data at `offset + i * stride`, resolves its handles, and reaches
+/// the host as ordinary writes -- two uniform-buffer descriptors and a sampler here. A destroyed
+/// template is no longer a handle, a push-descriptor template refuses, and so does a texel-buffer
+/// entry.
+#[test]
+fn a_descriptor_update_template_becomes_the_writes_it_describes() {
+    let _serial = serialized();
+    let m = up_to_memory("update-template");
+    let f = &m.up.f;
+    let device = m.up.device;
+    let name = |call: &str| f.resolve_device(m.up.get_proc, device, call);
+    let out = f.alloc(8);
+    f.call(name("vkCreateDescriptorSetLayout"), [device, f.descriptor_set_layout_info(), 0, out])
+        .expect("layout");
+    let set_layout = f.guest.read_u64(out as GuestAddr);
+    f.call(name("vkCreateDescriptorPool"), [device, f.descriptor_pool_info(), 0, out]).expect("pool");
+    let pool = f.guest.read_u64(out as GuestAddr);
+    let set_out = f.alloc(8);
+    f.call(
+        name("vkAllocateDescriptorSets"),
+        [device, f.descriptor_set_allocate_info(pool, set_layout), set_out, 0],
+    )
+    .expect("a set");
+    let set = f.guest.read_u64(set_out as GuestAddr);
+    f.call(name("vkCreateBuffer"), [device, f.buffer_info(256, 0x10), 0, out]).expect("a buffer");
+    let buffer = f.guest.read_u64(out as GuestAddr);
+    f.call(name("vkCreateSampler"), [device, f.sampler_info(), 0, out]).expect("a sampler");
+    let sampler = f.guest.read_u64(out as GuestAddr);
+
+    // Two entries: binding 0, two UNIFORM_BUFFER (6) descriptors at 8 and 48; binding 1, one
+    // SAMPLER (0) at 96.
+    let entry = |binding: u32, count: u32, kind: u32, offset: u64, stride: u64| -> Vec<u8> {
+        let mut bytes = vec![0u8; DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES];
+        bytes[0..4].copy_from_slice(&binding.to_le_bytes());
+        bytes[8..12].copy_from_slice(&count.to_le_bytes());
+        bytes[12..16].copy_from_slice(&kind.to_le_bytes());
+        bytes[16..24].copy_from_slice(&offset.to_le_bytes());
+        bytes[24..32].copy_from_slice(&stride.to_le_bytes());
+        bytes
+    };
+    let template_info = |entries: &[Vec<u8>], template_type: u32| -> u64 {
+        let array = f.bytes(&entries.concat());
+        let mut bytes = vec![0u8; DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES];
+        bytes[0..4].copy_from_slice(&STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO.to_le_bytes());
+        bytes[20..24].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        bytes[24..32].copy_from_slice(&array.to_le_bytes());
+        bytes[32..36].copy_from_slice(&template_type.to_le_bytes());
+        bytes[40..48].copy_from_slice(&set_layout.to_le_bytes());
+        f.bytes(&bytes)
+    };
+    let info = template_info(&[entry(0, 2, 6, 8, 40), entry(1, 1, 0, 96, 24)], 0);
+    assert_eq!(
+        f.call(name("vkCreateDescriptorUpdateTemplate"), [device, info, 0, out]).expect("create")
+            as i32,
+        VK_SUCCESS
+    );
+    let template = f.guest.read_u64(out as GuestAddr);
+
+    let mut data = vec![0u8; 128];
+    for (at, offset, range) in [(8usize, 16u64, 64u64), (48, 128, 32)] {
+        data[at..at + 8].copy_from_slice(&buffer.to_le_bytes());
+        data[at + 8..at + 16].copy_from_slice(&offset.to_le_bytes());
+        data[at + 16..at + 24].copy_from_slice(&range.to_le_bytes());
+    }
+    data[96..104].copy_from_slice(&sampler.to_le_bytes());
+    let data_at = f.bytes(&data);
+    let before = m.up.host.log().writes.len();
+    f.call(name("vkUpdateDescriptorSetWithTemplate"), [device, set, template, data_at])
+        .expect("the update");
+    let writes = m.up.host.log().writes[before..].to_vec();
+    assert_eq!(writes.len(), 2, "one write per entry");
+    assert_eq!((writes[0].binding, writes[0].descriptor_type), (0, 6));
+    match &writes[0].writes {
+        DescriptorWrites::Buffers(buffers) => {
+            let ranges: Vec<(u64, u64)> = buffers.iter().map(|(_, o, r)| (*o, *r)).collect();
+            assert_eq!(ranges, vec![(16, 64), (128, 32)], "each at offset + i * stride");
+        }
+        other => panic!("buffer descriptors, not {other:?}"),
+    }
+    assert_eq!((writes[1].binding, writes[1].descriptor_type), (1, 0));
+    match &writes[1].writes {
+        DescriptorWrites::Images(images) => {
+            assert_eq!(images.len(), 1);
+            assert!(images[0].0.is_some() && images[0].1.is_none(), "a bare sampler: {images:?}");
+        }
+        other => panic!("an image descriptor, not {other:?}"),
+    }
+
+    f.call(name("vkDestroyDescriptorUpdateTemplate"), [device, template, 0, 0]).expect("destroy");
+    let text = f
+        .refusal(name("vkUpdateDescriptorSetWithTemplate"), &[device, set, template, data_at])
+        .to_string();
+    assert!(text.contains("VkDescriptorUpdateTemplate"), "{text}");
+
+    let push = template_info(&[entry(0, 1, 6, 0, 24)], 1);
+    let text = f.refusal(name("vkCreateDescriptorUpdateTemplate"), &[device, push, 0, out]).to_string();
+    assert!(text.contains("templateType = 1"), "{text}");
+    let texel = template_info(&[entry(0, 1, 4, 0, 8)], 0);
+    let text = f.refusal(name("vkCreateDescriptorUpdateTemplate"), &[device, texel, 0, out]).to_string();
+    assert!(text.contains("descriptorType = 4"), "{text}");
+}
+
 /// **The engine's GPU timer: a timestamp query pool, created member by member and destroyed
 /// once** -- `gpuTimeQueryPool` (`0x2592d68`..`0x2592da0`). A second destroy of the same handle
 /// refuses, naming the family, and a `pNext` refuses by name.
@@ -1795,6 +1929,48 @@ fn a_query_pool_is_created_member_by_member_and_destroyed_once() {
     up.f.guest.write_u64(info as GuestAddr + 8, 0x1234);
     let text = up.f.refusal(create, &[up.device, info, 0, out]).to_string();
     assert!(text.contains("pNext"), "{text}");
+}
+
+/// **The GPU timer's commands reach the host with their pool and their numbers**: the engine's
+/// first recorded command is `vkCmdResetQueryPool(pool, 0, 2)`, and a timestamp pool is written by
+/// `vkCmdWriteTimestamp` and nothing else. A handle of another family where the pool goes refuses.
+#[test]
+fn the_gpu_timers_commands_carry_their_pool_and_numbers() {
+    let _serial = serialized();
+    let up = up_to_a_device("query-commands");
+    let f = &up.f;
+    let name = |call: &str| f.resolve_device(up.get_proc, up.device, call);
+    let info = f.alloc(QUERY_POOL_CREATE_INFO_BYTES);
+    f.guest.write_u64(info as GuestAddr, 11);
+    f.guest.write_u64(info as GuestAddr + 16, 2 << 32);
+    f.guest.write_u64(info as GuestAddr + 24, 2);
+    let out = f.alloc(8);
+    f.call(name("vkCreateQueryPool"), [up.device, info, 0, out]).expect("a pool");
+    let pool = f.guest.read_u64(out as GuestAddr);
+    let command = {
+        let pool_info = f.command_pool_info(POOL_RESET_COMMAND_BUFFER, 0);
+        f.call(name("vkCreateCommandPool"), [up.device, pool_info, 0, out]).expect("command pool");
+        let command_pool = f.guest.read_u64(out as GuestAddr);
+        let buffers_at = f.alloc(8);
+        f.call(
+            name("vkAllocateCommandBuffers"),
+            [up.device, f.command_buffer_allocate_info(command_pool, 1), buffers_at, 0],
+        )
+        .expect("a command buffer");
+        f.guest.read_u64(buffers_at as GuestAddr)
+    };
+    f.call(name("vkCmdResetQueryPool"), [command, pool, 0, 2]).expect("reset");
+    // VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT (0x2000), query 1.
+    f.call(name("vkCmdWriteTimestamp"), [command, 0x2000, pool, 1]).expect("timestamp");
+    let commands = up.host.log().query_commands.clone();
+    let host_pool = HostQueryPool::from_token(0);
+    assert_eq!(
+        commands,
+        vec![("reset", host_pool, 0, 2), ("timestamp", host_pool, 0x2000, 1)],
+        "each argument where it belongs"
+    );
+    let text = f.refusal(name("vkCmdResetQueryPool"), &[command, command, 0, 2]).to_string();
+    assert!(text.contains("VkQueryPool"), "a command buffer is not a pool: {text}");
 }
 
 /// **The two-call protocol, the stable handles, and what a destroyed swapchain does to them.**

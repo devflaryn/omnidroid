@@ -3835,6 +3835,50 @@ impl VulkanHost for GfxVulkanHost {
         }
     }
 
+    fn cmd_reset_query_pool(
+        &self,
+        buffer: HostCommandBuffer,
+        pool: HostQueryPool,
+        first: u32,
+        count: u32,
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_reset_query_pool";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let target = {
+            let table = self.locked_query_pools();
+            self.device_of(&table, pool.token(), "VkQueryPool", METHOD)?.1
+        };
+        // SAFETY: the command buffer is live and recording, outside a render pass, and the pool
+        // is live -- the driver enforces the rest and reports it.
+        unsafe { device.cmd_reset_query_pool(handle, target, first, count) };
+        Ok(())
+    }
+
+    fn cmd_write_timestamp(
+        &self,
+        buffer: HostCommandBuffer,
+        stage: u32,
+        pool: HostQueryPool,
+        query: u32,
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_write_timestamp";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let target = {
+            let table = self.locked_query_pools();
+            self.device_of(&table, pool.token(), "VkQueryPool", METHOD)?.1
+        };
+        // SAFETY: the command buffer is live and recording and the pool is live.
+        unsafe {
+            device.cmd_write_timestamp(
+                handle,
+                vk::PipelineStageFlags::from_raw(stage),
+                target,
+                query,
+            );
+        }
+        Ok(())
+    }
+
     fn destroy_query_pool(&self, pool: HostQueryPool) -> AbiResult<()> {
         const METHOD: &str = "VulkanHost::destroy_query_pool";
         let (device_index, handle) = {
@@ -6626,6 +6670,18 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<vk::QueryPoolCreateInfo<'_>>(),
             guest::QUERY_POOL_CREATE_INFO_BYTES
+        );
+        assert_eq!(
+            std::mem::size_of::<vk::DescriptorUpdateTemplateCreateInfo<'_>>(),
+            guest::DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES
+        );
+        assert_eq!(
+            std::mem::size_of::<vk::DescriptorUpdateTemplateEntry>(),
+            guest::DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES
+        );
+        assert_eq!(
+            vk::StructureType::DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO.as_raw(),
+            i32::try_from(guest::STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO).expect("an sType")
         );
         assert_eq!(
             vk::StructureType::QUERY_POOL_CREATE_INFO.as_raw(),
