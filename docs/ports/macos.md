@@ -46,6 +46,8 @@ non-Windows target the build asks CMake for the vendored copies explicitly
 | dynarmic arm64, `omni-cpu` | parity: 9 carried patches | see `docs/ports/macos-cpu.md`; `mac-cpu-` 25/25 |
 | **the gate** | **passes**, landing screen reached | below |
 | `webview` | **not ported** (structural `Unsupported`): WKWebView is the macOS equivalent | |
+| ELF loader on 16 KiB pages | relro sealed as bionic seals it; `libzstd-jni` (`p_align` 0x1000) refused by name | `loader_m1` 13, `loader_hostile` 25; `mac-elf-A1` 1/1 |
+| **the whole workspace** | `cargo test --workspace --release --no-fail-fast`: 162 suites, **2,054 passed, 1 failed** (the headless gate, below), 90 ignored | 2026-09-24, `port-macos` at `c4845e7` |
 
 ## The gate on macOS
 
@@ -60,8 +62,14 @@ on `port-macos`, 50-110 s each). MEASURED in those runs:
 * the network is real: client settings are fetched (`Flag::areFlagsLoaded` 1), `apis.roblox.com`
   answers 401/404 to an unsigned-in client, as it does to a device; nothing was signed in;
 * **no guest thread is killed** (`M5 teardown: 0 guest thread(s) still running, failures []`);
-* at the landing screen the engine presents **~59 fps** (291-299 presents per 5 s), which is the
-  engine's own 60 fps cap, not this host's limit.
+* at the landing screen the engine presents **~59 fps** (291-299 presents per 5 s) while it is
+  animating, which is the engine's own 60 fps cap, not this host's limit. Once the landing has
+  settled it draws **~1 fps** (+1 to +5 presents per 5 s) with no input -- the same "idle 1 fps"
+  HANDOFF records on Windows (frontier item 3), not a difference this port makes.
+
+Rerun after the relro fix (`47b0409`, which changes what the real `libroblox.so` load seals): exit
+0, Apple M1, `APP_READY(Landing)` at +17.9 s, 0 guest threads killed; `phys_footprint` peak 2,135
+MiB, 1,957-2,005 MiB at the landing (n = 1 run, 1 s samples).
 
 ![The engine's landing screen on macOS](macos-landing.png)
 
@@ -116,6 +124,24 @@ MEASURED with a probe and then pinned by `vm_footprint_macos`:
   Android's `mmap_min_addr` makes low addresses fault. No guest mapping is placed there: every guest
   address comes from an `omni-mem` reservation, and nothing in the workspace asks for a fixed low
   address (checked by search).
+
+## The ELF loader on 16 KiB pages
+
+* **Relro is sealed as bionic seals it**: `[page_start(p_vaddr), page_end(p_vaddr + p_memsz))`, the
+  end rounded **up** (`_phdr_table_set_gnu_relro_prot`, AOSP `linker_phdr.cpp`). The loader rounded
+  it down, which is identical wherever relro ends on a page boundary -- every library of this APK at
+  4 KiB -- and is not at 16 KiB: `libroblox.so`'s relro ends at `0x67d3000`, inside the 16 KiB page
+  holding `.got`/`.got.plt`, which stayed writable here. `.data` starts on the next 16 KiB page
+  (`0x67d67c0`), so sealing the whole page takes nothing writable away (`loader_m1` asserts both).
+  Row `mac-elf-A1` (round down again) is caught by three `loader_m1` tests.
+* **A library aligned below the host page is refused by name** (`AlignBelowPageSize`), as bionic
+  refuses it on a 16 KiB device. Of the APK's eleven, that is `libzstd-jni-1.5.7-6.so` (`p_align`
+  0x1000) and nothing else. The gate loads only `libroblox.so`, on every host (`dlopen` of any other
+  file is refused, `bionic/dl.rs`), so the run is unaffected; `libzstd-jni` is the Java side's zstd
+  binding, and the library into which, per `fs/path.rs`, a third party added a Luau executor. Loading it would need a copying
+  loader, as Android 16's page-size compatibility mode has; not built, because nothing here needs it.
+* Nothing in the APK is directly mappable from the zip at 16 KiB (the one PNG that is, at 4 KiB, is
+  4 KiB-aligned); libraries already go through the extraction cache on every host (D11).
 
 ## Guest faults (D4, D10)
 
