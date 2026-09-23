@@ -168,6 +168,8 @@ JNI_CLASSES = "crates/omni-android/src/jni/classes.rs"
 # M6 row 21: the scripted downcall table. The one string in it that decided whether the engine
 # could ever get its flags.
 JNI_SCRIPT = "crates/omni-android/src/jni/script.rs"
+# The instance: where a Java statement's store into a static lands (`Jni::put_static_object`).
+JNI_MOD = "crates/omni-android/src/jni/mod.rs"
 # M6: the startup gate itself. Two `jmid-` rows are anchored in it.
 GATE_ACTIVITY_FILE = "crates/omni-android/tests/gameactivity.rs"
 JNI_VALUES = "crates/omni-android/src/jni/values.rs"
@@ -5645,6 +5647,95 @@ directory", ADAPTER_FILES,
             return Some(found);
         }
         let declared = self.class(class)?;""",
+     ANDROID_LIB),
+
+    # ---- FMOD's `checkInit` and `supportsAAudio`: an answer that follows a step ------------------
+    #
+    # MEASURED, gate run 62: guest thread 6 died on `org/fmod/FMOD.checkInit()Z` (called from
+    # `0x4fc0284`, FMOD's first JNI call) and presents stopped. `checkInit` is `gContext != null`;
+    # `NativeHelper.Q` sets `gContext` with `FMOD.init(this.a)` at `0x0023`, between two of step 11's
+    # downcalls. So the answer is a function of whether that step ran -- which is exactly what a
+    # constant would stop being. The B rows are the constants that read as right.
+
+    # **The defect the gate found, put back**: the refusal that killed the render thread.
+    ("fmod-A1", "A", "FMOD.checkInit refuses again, as it did at gate run 62",
+     JNI_CLASSES,
+     """            s("checkInit", "()Z", Answer::StaticIsSet("gContext")),""",
+     """            s("checkInit", "()Z", Answer::Unanswered),""",
+     ANDROID_LIB),
+    ("fmod-A2", "A", "the script no longer performs FMOD.init at NativeHelper.Q's row",
+     JNI_SCRIPT,
+     """        java_before: &[FMOD_INIT],""",
+     """        java_before: &[],""",
+     ANDROID_LIB),
+    ("fmod-A3", "A", "run skips every row's Java statements",
+     JNI_SCRIPT,
+     """        if let Err(error) = perform(jni, step.java_before) {""",
+     """        if let Err(error) = perform(jni, &[]) {""",
+     ANDROID_LIB),
+    ("fmod-A4", "A", "the Java store anchors the object and never records it in the static",
+     JNI_MOD,
+     """            Some(anchor) => state.statics.insert(found, anchor),""",
+     """            Some(_anchor) => None,""",
+     ANDROID_LIB),
+    ("fmod-A5", "A", "a static read no longer consults what a Java statement assigned",
+     JNI_ENV,
+     """        Answer::Assigned => assigned(state, name, address, field, member),
+""",
+     """""",
+     ANDROID_LIB),
+
+    # **The device's answer, hard-coded.** True on every device that ran step 11 -- and true here
+    # whether or not anything ran it, which is the claim this layer must not make.
+    ("fmod-B1", "B", "FMOD.checkInit hard-coded to the device's `true`",
+     JNI_CLASSES,
+     """            s("checkInit", "()Z", Answer::StaticIsSet("gContext")),""",
+     """            s("checkInit", "()Z", Answer::Bool(true)),""",
+     ANDROID_LIB),
+    # **"There is no AAudio here, so say so" -- in the wrong place.** `supportsAAudio` is
+    # `SDK_INT >= 27`, true on the Android 13 this host presents; the absence of `libaaudio.so` is
+    # answered by `dlopen`, where it is a fact. `false` here would send FMOD down the
+    # `supportsLowLatency` branch on a claim about Android that is untrue.
+    ("fmod-B2", "B", "FMOD.supportsAAudio answers false because this host has no libaaudio.so",
+     JNI_CLASSES,
+     """                Answer::Bool(super::script::ANDROID_SDK_LEVEL >= FMOD_AAUDIO_MIN_SDK),""",
+     """                Answer::Bool(false),""",
+     ANDROID_LIB),
+    ("fmod-B3", "B", "a Java-assigned static takes any object, whatever its declared type",
+     JNI_MOD,
+     """            if !admits {""",
+     """            if false && !admits {""",
+     ANDROID_LIB),
+    # "As early as possible" -- FMOD.init claimed to have run at step 7, before the Java that runs
+    # it. Nothing observable breaks in a run; the claim about when is false.
+    ("fmod-B4", "B", "FMOD.init is also performed at the first scripted row, step 7",
+     JNI_SCRIPT,
+     """        class: "com/roblox/universalapp/linking/JNIBaseUrlProtocol",
+        member: "init",
+        descriptor: "(Landroid/content/Context;)V",
+        java_before: &[],""",
+     """        class: "com/roblox/universalapp/linking/JNIBaseUrlProtocol",
+        member: "init",
+        descriptor: "(Landroid/content/Context;)V",
+        java_before: &[FMOD_INIT],""",
+     ANDROID_LIB),
+    ("fmod-B5", "B", "checkInit answers whether gContext is declared rather than whether it is set",
+     JNI_ENV,
+     """            Ok(Value::Boolean(matches!(value, Value::Object(Some(_)))))""",
+     """            let _ = value;
+            Ok(Value::Boolean(true))""",
+     ANDROID_LIB),
+    # **A plausible number for a static the decoded path never reaches**: FMOD would size its mixer
+    # on a sample rate nothing measured. Only the OpenSL ES output asks for it (`0x4fbd438`).
+    ("fmod-B6", "B", "FMOD.getOutputSampleRate answered with a plausible 48000",
+     JNI_CLASSES,
+     """                Answer::Bool(super::script::ANDROID_SDK_LEVEL >= FMOD_AAUDIO_MIN_SDK),
+            ),
+        ],""",
+     """                Answer::Bool(super::script::ANDROID_SDK_LEVEL >= FMOD_AAUDIO_MIN_SDK),
+            ),
+            s("getOutputSampleRate", "()I", Answer::Int(48000)),
+        ],""",
      ANDROID_LIB),
 
     # ======================================= M6: the indefinite `ALooper_pollOnce`, and the fact
