@@ -51,14 +51,23 @@
 //! invented here would be a second copy of the driver's own validation, in the place least able
 //! to be right about it. What is checked is everything this layer is the only holder of: the
 //! window handle, the instance handle, the structure's `sType` and `pNext`, and the allocator.
+//!
+//! # And its end: `vkDestroySurfaceKHR`
+//!
+//! Measured rather than anticipated. Closing the app the way a device closes it (focus lost,
+//! `onPause`, `onSurfaceDestroyed`) sends the engine's render thread `APP_CMD_TERM_WINDOW`, and it
+//! answers by destroying its swapchain and then its surface. [`destroy_surface`] is that second
+//! call; until it existed, the call reached `instance::unimplemented`, the refusal killed the
+//! render thread, and the close hung.
 
 use std::sync::Arc;
 
+use crate::abi::ARG_REGISTERS;
 use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 
 use super::host::DriverAnswer;
-use super::instance::guest_pointer;
+use super::instance::{guest_pointer, refuse_allocator};
 use super::{Site, Vulkan};
 
 /// `VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR`.
@@ -247,6 +256,67 @@ fn resolve_window(at: &Site, window: u64) -> AbiResult<omni_platform::window::Ra
              owns the window, which is a statement about a window this layer never found"
         ))
     })
+}
+
+/// `void vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+/// const VkAllocationCallbacks *pAllocator)`
+///
+/// # Why it exists: measured
+///
+/// A gate run that closed the app as a device does measured the engine's render thread handling
+/// `APP_CMD_TERM_WINDOW` with `vkDestroySwapchainKHR` (once) and then this call, with
+/// `instance = x0`, `surface = x1` and `pAllocator = x2 = NULL`, through the thunk
+/// `vkGetInstanceProcAddr` handed out for it. Refusing it killed the render thread and hung the
+/// close.
+///
+/// # The shape is [`swapchain::destroy_swapchain`](super::swapchain)'s
+///
+/// The allocator is observed and a non-null one refused first, for `refuse_allocator`'s reason.
+/// The parent handle -- here the `VkInstance` -- is validated **before** the null check, because
+/// the specification requires it to be a valid handle even when there is nothing to destroy.
+/// `VK_NULL_HANDLE` is then the specified no-op, for the reason `destroy_swapchain` gives. A
+/// surface this layer did not issue, or one it has already taken back, is a refusal naming the
+/// handle -- a second destroy of the same surface lands there too, because the slot is freed only
+/// after the host has destroyed the driver's surface.
+///
+/// # The two rules this layer cannot see, and who checks them
+///
+/// The specification requires the surface to have been created from `instance`, and **every
+/// swapchain created over it to be destroyed first**. The guest-side registries record neither
+/// relationship: a surface slot holds only its token, and a swapchain slot does not say which
+/// surface it was made over. The host does record both -- it is what checks that an
+/// `oldSwapchain` belongs to the surface being created over -- so
+/// [`VulkanHost::destroy_surface`](super::VulkanHost::destroy_surface) is where each becomes a
+/// refusal naming both objects. A retired swapchain counts: `oldSwapchain` retires one without
+/// destroying it, and the guest still owes the destroy.
+pub(super) fn destroy_surface(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkDestroySurfaceKHR";
+    refuse_allocator(vulkan, at, CALL, args[2])?;
+    let host = vulkan.require_host(at)?;
+    let instance = vulkan.instance_token(at, CALL, args[0])?;
+
+    if args[1] == 0 {
+        // The specified no-op. See `swapchain::destroy_swapchain`'s documentation.
+        c.ret().void();
+        return Ok(());
+    }
+    let handle = guest_pointer(at, "surface", args[1])?;
+    let surface = vulkan.surface_token(at, CALL, args[1])?;
+
+    // **The driver's surface first, the guest's handle second**, as every destroy in this layer
+    // orders it: a host that refuses -- a live swapchain over the surface, or the wrong instance --
+    // leaves the handle naming a surface that still exists, so the guest can put right what the
+    // refusal names and destroy it again.
+    host.destroy_surface(instance, surface)?;
+    vulkan.forget_surface(handle);
+
+    c.ret().void();
+    Ok(())
 }
 
 #[cfg(test)]

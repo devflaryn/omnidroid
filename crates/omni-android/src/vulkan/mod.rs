@@ -395,10 +395,13 @@ pub const MAX_REWRITES: usize = 256;
 /// GPUs, and the one dropped might be the one the engine wanted.
 pub const MAX_PHYSICAL_DEVICES: usize = 8;
 
-/// How many `VkSurfaceKHR` handles one [`Vulkan`] will issue.
+/// How many `VkSurfaceKHR` handles one [`Vulkan`] will hold **at once**.
 ///
 /// A renderer needs one. Four leaves room for a loader that creates and recreates without the
-/// registry being what stops it — the shape [`MAX_INSTANCES`] has, for its reason.
+/// registry being what stops it — the shape [`MAX_INSTANCES`] has, for its reason. **At once**
+/// since `vkDestroySurfaceKHR` frees a slot: the Android lifecycle tears the surface down at every
+/// `onSurfaceDestroyed` and makes a new one at the next `onSurfaceCreated`, so a count of every
+/// surface ever made would refuse the fifth time the app came back to the foreground.
 pub const MAX_SURFACES: usize = 4;
 
 /// How many `VkDevice` handles one [`Vulkan`] will issue.
@@ -987,6 +990,7 @@ struct State {
     /// instance that was never bound into a boundary has no data area, and the refusal that
     /// produces names `Vulkan::bind_into` rather than panicking inside an import.
     physical_devices: Option<Handles<HostPhysicalDevice>>,
+    /// The one stage 3 family that supports removal: `vkDestroySurfaceKHR` frees a slot.
     surfaces: Option<Handles<HostSurface>>,
     devices: Option<Handles<HostDevice>>,
     queues: Option<Handles<HostQueue>>,
@@ -2813,6 +2817,19 @@ impl Vulkan {
         register(at, state.surfaces.as_mut(), "vkCreateAndroidSurfaceKHR", token, false)
     }
 
+    /// Free the slot a live `VkSurfaceKHR` handle names, once `vkDestroySurfaceKHR` has destroyed
+    /// the host's surface.
+    ///
+    /// **Safe to remove from because the family never deduplicates** — the condition
+    /// [`Handles::remove`](handles::Handles::remove) states. Answers whether a slot was freed, for
+    /// [`Vulkan::forget_swapchain`]'s reason and with its caveat: `false` means another guest
+    /// thread destroyed the same surface in between, which the specification already calls
+    /// undefined.
+    fn forget_surface(&self, handle: GuestAddr) -> bool {
+        let mut state = self.state.lock();
+        state.surfaces.as_mut().and_then(|h| h.remove(handle)).is_some()
+    }
+
     /// Put a device in the registry. Never deduplicated, for [`Vulkan::register_surface`]'s
     /// reason.
     fn register_device(&self, at: &Site, token: HostDevice) -> AbiResult<Registered> {
@@ -3445,6 +3462,9 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkEnumerateInstanceVersion" => instance::enumerate_instance_version(c, &at, args),
         // Stage 3: the substitution that creates an object rather than renaming a string.
         "vkCreateAndroidSurfaceKHR" => surface::create_android_surface(c, &at, &vulkan, args),
+        // And its end, which the engine's `APP_CMD_TERM_WINDOW` handler was measured calling
+        // right after `vkDestroySwapchainKHR`.
+        "vkDestroySurfaceKHR" => surface::destroy_surface(c, &at, &vulkan, args),
         // Stage 3: the queries a renderer makes in order to choose a device.
         "vkEnumeratePhysicalDevices" => {
             physical::enumerate_physical_devices(c, &at, &vulkan, args)

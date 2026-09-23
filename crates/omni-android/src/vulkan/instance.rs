@@ -771,7 +771,8 @@ pub(super) fn unimplemented(
              `vkGetInstanceProcAddr` handed out for it at {address:#x}. It was passed \
              {registers}. **This is stage 5**: `omni_android::vulkan` forwards the instance \
              bootstrap (`vkEnumerateInstanceExtensionProperties`, `vkCreateInstance`), the \
-             surface substitution (`vkCreateAndroidSurfaceKHR`), the ten queries a renderer \
+             surface substitution (`vkCreateAndroidSurfaceKHR`) and its end \
+             (`vkDestroySurfaceKHR`), the ten queries a renderer \
              makes in order to choose a physical device, `vkCreateDevice`, `vkGetDeviceQueue` and \
              `vkGetDeviceProcAddr`, the whole presentation spine -- the swapchain and its images, \
              image views, semaphores and fences, command pools and command buffers, \

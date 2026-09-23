@@ -1546,6 +1546,47 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkDestroySurfaceKHR`, forwarded: the end of the surface
+    /// [`VulkanHost::create_platform_surface`] made.
+    ///
+    /// # Why it exists: measured, not anticipated
+    ///
+    /// Stage 3 had no destructor in this trait because the guest had never called one. A gate run
+    /// that closed the app the way a device does (focus lost, `onPause`, `onSurfaceDestroyed`)
+    /// measured that it does: the engine's render thread answers `APP_CMD_TERM_WINDOW` by
+    /// destroying its swapchain and then its surface, `vkDestroySurfaceKHR(instance, surface,
+    /// NULL)`, through the thunk `vkGetInstanceProcAddr` handed out. The refusal that call used
+    /// to reach killed the render thread and hung the close.
+    ///
+    /// # What only an implementation can check, and must
+    ///
+    /// Two of the specification's rules for this call are about relationships the guest-side
+    /// registry does not record, and this host has no validation layers to catch either
+    /// (`docs/research/graphics-spike.md` §6):
+    ///
+    /// * the surface must have been created from `instance` -- an implementation keeps which
+    ///   instance each surface came from, for [`VulkanHost::surface_support`]'s pairing check;
+    /// * every `VkSwapchainKHR` created over the surface must already be destroyed -- **retired
+    ///   ones included**, because `oldSwapchain` retires a swapchain without destroying it.
+    ///
+    /// Each is a refusal **naming both objects**, not a destroy the driver may or may not survive.
+    /// Returns `AbiResult<()>` for [`VulkanHost::destroy_swapchain`]'s reason: the call returns
+    /// `void`, so there is no code a guest could disbelieve.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued -- a surface already
+    /// destroyed included -- when the surface belongs to another instance, or when a swapchain
+    /// over it is still live.
+    fn destroy_surface(&self, instance: HostInstance, surface: HostSurface) -> AbiResult<()> {
+        let _ = (instance, surface);
+        Err(host_has_no(
+            "VulkanHost::destroy_surface",
+            "the surface cannot be destroyed, and returning quietly would leave the driver's \
+             surface alive over a window the guest believes it has let go of",
+        ))
+    }
+
     /// `vkEnumeratePhysicalDevices`, forwarded, as tokens.
     ///
     /// **The order is the driver's and must not change between calls.** The guest enumerates
@@ -3652,6 +3693,13 @@ mod tests {
             .device_queue(HostDevice::from_token(0), 0, 0)
             .expect_err("nor a queue");
         assert_eq!(error.symbol(), Some("VulkanHost::device_queue"));
+
+        // The destructor too: a host that cannot destroy a surface says so, rather than letting
+        // the guest believe the window was let go of.
+        let error = host
+            .destroy_surface(HostInstance::from_token(0), HostSurface::from_token(0))
+            .expect_err("nor a surface destroyed");
+        assert_eq!(error.symbol(), Some("VulkanHost::destroy_surface"));
     }
 
     /// The two arms of [`DriverAnswer`] are not the same value, which is the whole of D22's point
