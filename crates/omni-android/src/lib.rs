@@ -46,6 +46,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod aaudio;
 pub mod abi;
 pub mod bionic;
 pub mod boundary;

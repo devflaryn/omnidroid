@@ -143,24 +143,34 @@ const HANDLE_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// See the module documentation for why there is a second kind at all.
 const PROVIDED_BASE: u64 = 1 << 32;
 
-/// The libraries this layer supplies itself, beyond the ones the guest's own file names.
+/// The libraries this layer supplies itself, beyond the ones the guest's own file names: each
+/// `soname`, and the export whose binding means the library is here.
 ///
-/// One family, and it is a `fn` rather than a `const` so that the list lives with the module that
-/// implements the library rather than being restated here.
-fn provided_libraries() -> &'static [&'static str] {
-    &crate::vulkan::LOADER_SONAMES
+/// Two families. The Vulkan loader's names and entry point live in [`crate::vulkan`] and
+/// `libaaudio.so`'s in [`crate::aaudio`], and are read from there rather than restated. **Append
+/// only**: a handle is an index into this table.
+const PROVIDED: [(&str, &str); 3] = [
+    (crate::vulkan::LOADER_SONAMES[0], crate::vulkan::LOADER_ENTRY_POINT),
+    (crate::vulkan::LOADER_SONAMES[1], crate::vulkan::LOADER_ENTRY_POINT),
+    (crate::aaudio::SONAMES[0], crate::aaudio::ENTRY_POINT),
+];
+
+/// The names of [`PROVIDED`], for a message.
+fn provided_libraries() -> Vec<&'static str> {
+    PROVIDED.iter().map(|(name, _)| *name).collect()
 }
 
 /// The index `dlopen` should issue for a provided library, or `None` if this runtime does not
 /// have it **bound**.
 ///
 /// The second half is what stops this being a handle nobody can honour: an embedding that never
-/// called [`Vulkan::bind_into`](crate::Vulkan::bind_into) has no `vkGetInstanceProcAddr` slot, so
-/// there is nothing a handle could be used to reach and NULL — the answer this function's absence
-/// produces — is the true one.
+/// called [`Vulkan::bind_into`](crate::Vulkan::bind_into) has no `vkGetInstanceProcAddr` slot, and
+/// one that never called [`AAudio::bind_into`](crate::aaudio::AAudio::bind_into) has no
+/// `AAudio_createStreamBuilder` slot, so there is nothing a handle could be used to reach and NULL
+/// — the answer this function's absence produces — is the true one.
 fn provided_index(boundary: &crate::Boundary, name: &str) -> Option<usize> {
-    let index = provided_libraries().iter().position(|candidate| *candidate == name)?;
-    boundary.lookup(None, crate::vulkan::LOADER_ENTRY_POINT).map(|_| index)
+    let index = PROVIDED.iter().position(|(candidate, _)| *candidate == name)?;
+    boundary.lookup(None, PROVIDED[index].1).map(|_| index)
 }
 
 /// The provided library a handle names, if it names one.
@@ -171,7 +181,7 @@ fn provided_library_of(handle: u64) -> Option<&'static str> {
     (handle & HANDLE_MASK)
         .checked_sub(PROVIDED_BASE)
         .and_then(|index| usize::try_from(index).ok())
-        .and_then(|index| provided_libraries().get(index).copied())
+        .and_then(|index| PROVIDED.get(index).map(|(name, _)| *name))
 }
 
 thread_local! {
@@ -316,7 +326,29 @@ pub(super) fn dlsym(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     // attribution, because no `DT_VERNEED` record exists to give it one — and the global scope
     // would answer for `memcpy`, which `libvulkan.so` does not export.
     if let Some(library) = provided_library_of(handle) {
-        if crate::vulkan::loader_exports(&wanted) {
+        // Each provided library answers from its own module's statement of what it exports.
+        let audio = crate::aaudio::SONAMES.contains(&library);
+        let exported = if audio {
+            crate::aaudio::exports(&wanted)
+        } else {
+            crate::vulkan::loader_exports(&wanted)
+        };
+        if audio && !exported && wanted.starts_with("AAudio") {
+            // **A refusal, not NULL**, for the Vulkan branch's reason below: a real
+            // `libaaudio.so` exports every `AAudio*` name, and FMOD treats a NULL from most of its
+            // lookups as "this output does not work" (`0x4fbf410` onwards).
+            return Err(AbiError::Refused {
+                symbol,
+                address,
+                why: format!(
+                    "the guest called `dlsym(\"{library}\", \"{wanted}\")`. This runtime's \
+                     libaaudio.so exports FMOD's own lookup list (`aaudio::EXPORTS`) and nothing \
+                     else, and a NULL for a name a real libaaudio.so exports would be a false \
+                     statement about the platform"
+                ),
+            });
+        }
+        if exported {
             match boundary.lookup(None, &wanted) {
                 Some(slot) => c.ret(|mut r| r.u64(slot.address as u64)),
                 None => {
@@ -332,7 +364,7 @@ pub(super) fn dlsym(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             }
             return Ok(());
         }
-        if wanted.starts_with("vk") {
+        if !audio && wanted.starts_with("vk") {
             // **A refusal, not NULL.** A real `libvulkan.so` exports the core entry points
             // directly as well as through `vkGetInstanceProcAddr`, so NULL here would be this
             // layer claiming the platform's Vulkan loader does not have `{wanted}` — and the

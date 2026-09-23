@@ -100,6 +100,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod audio;
 pub mod clock;
 pub mod fault;
 pub mod fs;

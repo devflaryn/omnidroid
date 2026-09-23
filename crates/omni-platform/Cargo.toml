@@ -49,4 +49,18 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # The audio seam (src/audio/windows.rs): WASAPI, which is COM. `windows-sys` carries no COM
+    # *methods*, so the four vtables are declared by hand there; these features are for everything
+    # else. `Win32_Media_Audio` is the enumerator's CLSID, `WAVEFORMATEX`/`WAVEFORMATEXTENSIBLE`
+    # and the `AUDCLNT_*` constants. `Win32_System_Com` is `CoInitializeEx`, `CoIncrementMTAUsage`
+    # (what lets the stream be driven from a thread other than the one that opened it),
+    # `CoCreateInstance`, and `CoTaskMemFree` for the mix format `GetMixFormat` allocates.
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    # The two spellings of "the mix format is float": `WAVE_FORMAT_IEEE_FLOAT` and the
+    # `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` an extensible format carries instead.
+    "Win32_Media_Multimedia",
+    # One constant, `WAVE_FORMAT_EXTENSIBLE` (and `KSDATAFORMAT_SUBTYPE_PCM`, for the unit test that
+    # proves a 32-bit extensible format is refused unless its subtype is float).
+    "Win32_Media_KernelStreaming",
 ] }
