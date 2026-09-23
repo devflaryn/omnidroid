@@ -329,13 +329,68 @@ struct Guest {
 }
 
 /// What this gate decides the device is. Every field is a decision; see `ndk::config`.
-fn device_configuration() -> DeviceConfiguration {
+/// The display the engine is told about, from two host facts -- the surface's pixels and the
+/// host's DPI -- so that every answer describing it (`Configuration`, `DisplayMetrics`,
+/// `AConfiguration`) agrees with every other.
+///
+/// **MEASURED why it has to be one model**: `DisplayMetrics` answered zeros while `Configuration`
+/// described a 411x731 dp phone and the surface was a 1280x720 window, and the renderer divided
+/// by the zero density: a light-grid texture sized from the infinity came out 0x0 and the engine's
+/// own `HardAssert (Invalid texture dimensions 0x0 on Vulkan)` fired.
+#[derive(Debug, Clone, Copy)]
+struct Display {
+    width_px: i32,
+    height_px: i32,
+    /// The host's DPI for the window: 96 at 100% scaling.
+    dpi: u32,
+}
+
+impl Display {
+    /// **No window, so no host display**: the surface constants at the host's own baseline scale,
+    /// 100% -- a decision this gate makes, stated here.
+    const HEADLESS: Display = Display { width_px: SURFACE_WIDTH, height_px: SURFACE_HEIGHT, dpi: 96 };
+
+    /// Android's `density`, 1.0 at 160 dpi, is the host's scale factor: Windows' logical inch is 96
+    /// pixels at 100% and Android's is 160 at density 1.0, so the same user scale is `dpi / 96`.
+    fn density(&self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
+
+    /// `densityDpi`, the same scale in Android's units.
+    fn density_dpi(&self) -> i32 {
+        (self.dpi * 160 / 96) as i32
+    }
+
+    fn width_dp(&self) -> i32 {
+        (self.width_px as f32 / self.density()) as i32
+    }
+
+    fn height_dp(&self) -> i32 {
+        (self.height_px as f32 / self.density()) as i32
+    }
+
+    /// Android's screen-size bucket, from the dp extent (`Configuration.screenLayout`'s rule).
+    fn screen_size(&self) -> ScreenSize {
+        let (long, short) = (self.width_dp().max(self.height_dp()), self.width_dp().min(self.height_dp()));
+        if long >= 960 && short >= 720 {
+            ScreenSize::ExtraLarge
+        } else if long >= 640 && short >= 480 {
+            ScreenSize::Large
+        } else if long >= 470 && short >= 320 {
+            ScreenSize::Normal
+        } else {
+            ScreenSize::Small
+        }
+    }
+}
+
+fn device_configuration(display: &Display) -> DeviceConfiguration {
     DeviceConfiguration {
         language: *b"en",
         country: *b"US",
-        screen_width_dp: 411,
-        screen_height_dp: 731,
-        screen_size: ScreenSize::Normal,
+        screen_width_dp: display.width_dp(),
+        screen_height_dp: display.height_dp(),
+        screen_size: display.screen_size(),
         nav_hidden: ACONFIGURATION_NAVHIDDEN_NO,
     }
 }
@@ -344,7 +399,7 @@ impl Guest {
     /// `graphics` is the host driver to bind Vulkan to, when [`GRAPHICS_GATE`] asked for one.
     /// `None` binds no Vulkan at all -- not an unhosted one, which would hand the engine a loader
     /// whose every call refuses -- so the default gate's `dlopen("libvulkan.so")` stays NULL.
-    fn load(graphics: Option<Arc<dyn VulkanHost>>) -> Self {
+    fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display) -> Self {
         let path = cached_main_lib();
         let bytes = main_lib_bytes();
         let backing =
@@ -404,7 +459,7 @@ impl Guest {
         let installed = jni.install_into(&builder).expect("install the JNI tables");
         assert_eq!(installed, JNI_SLOTS);
         script::declare_script_classes(&jni);
-        define_host_answers(&jni);
+        define_host_answers(&jni, &display);
 
         let root = Scratch::new("m5-gate");
         bionic.set_filesystem_root(&root.0).expect("a filesystem root");
@@ -453,7 +508,7 @@ impl Guest {
         bionic.set_thread_host(thread_host).expect("a thread host");
 
         ndk.set_asset_source(Arc::new(ApkAssets::open())).expect("the real APK's assets");
-        ndk.set_configuration(device_configuration());
+        ndk.set_configuration(device_configuration(&display));
 
         let shared = Arc::new(builder);
         let object = {
@@ -575,7 +630,7 @@ impl Guest {
 }
 
 /// **The decisions this host makes**, as against the ones the layer declares.
-fn define_host_answers(jni: &Jni) {
+fn define_host_answers(jni: &Jni, display: &Display) {
     // `LoggingProtocol.getProcessTimestamp()J`, as M4's gate decides it. D28 records that the
     // units are ASSUMED to be milliseconds since the Unix epoch.
     let epoch_millis = std::time::SystemTime::now()
@@ -594,18 +649,29 @@ fn define_host_answers(jni: &Jni) {
     // **The Java `Configuration` and the native `AConfiguration` answer the same question**, and a
     // host that decided one and left the other at its declared default would have the engine
     // reading two different screen widths from two places. Both are this gate's decision.
-    let decided = device_configuration();
+    let decided = device_configuration(display);
     for (field, value) in [
         ("screenWidthDp", decided.screen_width_dp),
         ("screenHeightDp", decided.screen_height_dp),
-        ("smallestScreenWidthDp", decided.screen_width_dp),
-        // 411 x 731 dp at 1080 x 1920 px is 2.625x, which is `DENSITY_DPI` 420 -- the density
-        // bucket a 1080p phone of that size reports. Derived from the two numbers above rather
-        // than chosen separately, so the three cannot disagree.
-        ("densityDpi", 420),
+        ("smallestScreenWidthDp", decided.screen_width_dp.min(decided.screen_height_dp)),
+        ("densityDpi", display.density_dpi()),
     ] {
         jni.define_field("android/content/res/Configuration", field, "I", false, Answer::Int(value))
             .unwrap_or_else(|error| panic!("`Configuration.{field}` is declared: {error}"));
+    }
+    // **`DisplayMetrics`, from the same display.** `xdpi`/`ydpi` are physical on a device; the host
+    // reports only its logical DPI, so they carry the same logical figure `densityDpi` does.
+    for (field, answer) in [
+        ("density", Answer::Float(display.density())),
+        ("xdpi", Answer::Float(display.density_dpi() as f32)),
+        ("ydpi", Answer::Float(display.density_dpi() as f32)),
+    ] {
+        jni.define_field("android/util/DisplayMetrics", field, "F", false, answer)
+            .unwrap_or_else(|error| panic!("`DisplayMetrics.{field}` is declared: {error}"));
+    }
+    for (field, value) in [("widthPixels", display.width_px), ("heightPixels", display.height_px)] {
+        jni.define_field("android/util/DisplayMetrics", field, "I", false, Answer::Int(value))
+            .unwrap_or_else(|error| panic!("`DisplayMetrics.{field}` is declared: {error}"));
     }
 }
 
@@ -815,7 +881,43 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
              loader to reach it through",
         ) as Arc<dyn VulkanHost>
     });
-    let guest = Guest::load(host);
+    // **The window first, under the graphics gate**, because the display the engine is told about
+    // is the window's -- its pixels and its host's DPI -- and the engine reads that before step 13.
+    let early_window = graphics.then(|| {
+        let opened = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
+            "Omnidroid - Roblox",
+            SURFACE_WIDTH as u32,
+            SURFACE_HEIGHT as u32,
+        ))
+        .unwrap_or_else(|err| panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"));
+        opened.show();
+        let mut opened = opened;
+        let _ = opened.poll_events().count();
+        opened
+    });
+    let display = match &early_window {
+        Some(opened) => {
+            let (width, height) = opened.client_size().expect("a shown window has a client area");
+            Display {
+                width_px: width as i32,
+                height_px: height as i32,
+                dpi: opened.dpi().expect("the host's DPI for the window"),
+            }
+        }
+        None => Display::HEADLESS,
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "DISPLAY: {}x{} px at {} DPI -> density {}, densityDpi {}, {}x{} dp",
+        display.width_px,
+        display.height_px,
+        display.dpi,
+        display.density(),
+        display.density_dpi(),
+        display.width_dp(),
+        display.height_dp()
+    );
+    let guest = Guest::load(host, display);
     let mut cpu = guest.thread();
     guest.boundary.start_census();
 
@@ -1328,15 +1430,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // size requested, because a desktop window's frame takes its share.
     let mut window: Option<omni_platform::window::Window> = None;
     let mut window_source: Option<Arc<HostWindowSource>> = None;
-    let (surface_width, surface_height) = if graphics {
-        let opened = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
-            "Omnidroid - Roblox",
-            SURFACE_WIDTH as u32,
-            SURFACE_HEIGHT as u32,
-        ))
-        .unwrap_or_else(|err| panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"));
-        opened.show();
-        let mut opened = opened;
+    let (surface_width, surface_height) = if let Some(mut opened) = early_window {
         let _ = opened.poll_events().count();
         let source = HostWindowSource::watching(&opened).expect("a source watching the window");
         let size = source.geometry().expect("a freshly shown window has pixels");
@@ -2284,6 +2378,14 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     .map(|path| String::from_utf8_lossy(path).into_owned())
                     .collect::<Vec<_>>()
             );
+        }
+        // **And every asset the engine asked the APK for**, whether it was there or not: the
+        // early report's census predates the renderer, which is where textures are read.
+        let _ = writeln!(std::io::stderr(), "POST-TEARDOWN NDK census: {:?}", guest.ndk.census());
+        for event in guest.ndk.events().iter().filter(|e| {
+            matches!(e.what, "openAsset" | "getBuffer" | "openFileDescriptor" | "read" | "close")
+        }) {
+            let _ = writeln!(std::io::stderr(), "  ASSET {} {}", event.what, event.detail);
         }
         let _ = writeln!(
             std::io::stderr(),

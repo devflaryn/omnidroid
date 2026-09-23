@@ -1237,11 +1237,14 @@ pub static DECLARED: &[ClassSpec] = &[
         tier: Tier::One,
         methods: NONE,
         fields: &[
-            f("density", "F", Answer::Float(0.0)),
-            f("widthPixels", "I", Answer::Int(0)),
-            f("heightPixels", "I", Answer::Int(0)),
-            f("xdpi", "F", Answer::Float(0.0)),
-            f("ydpi", "F", Answer::Float(0.0)),
+            // **Unanswered until an embedding defines them**: they describe the host's display, and
+            // the zeros these used to answer were a device with no pixels and no density -- which
+            // MEASURED, the renderer divided by (a 0x0 light-grid texture and its own HardAssert).
+            f("density", "F", Answer::Unanswered),
+            f("widthPixels", "I", Answer::Unanswered),
+            f("heightPixels", "I", Answer::Unanswered),
+            f("xdpi", "F", Answer::Unanswered),
+            f("ydpi", "F", Answer::Unanswered),
         ],
     },
     ClassSpec {
