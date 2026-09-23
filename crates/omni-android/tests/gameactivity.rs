@@ -720,6 +720,13 @@ impl Guest {
 
 /// **The decisions this host makes**, as against the ones the layer declares.
 fn define_host_answers(jni: &Jni, display: &Display) {
+    // **`Build.MANUFACTURER` is this host's maker**, as the firmware reports it: on a device it is
+    // the maker of the hardware the OS runs on, and here that hardware is this machine.
+    let maker = omni_platform::process::host_manufacturer()
+        .unwrap_or_else(|error| panic!("Build.MANUFACTURER needs the host's maker: {error}"));
+    let maker: &'static str = Box::leak(maker.into_boxed_str());
+    jni.define_field("android/os/Build", "MANUFACTURER", "Ljava/lang/String;", true, Answer::Text(maker))
+        .expect("Build.MANUFACTURER is declared");
     // `LoggingProtocol.getProcessTimestamp()J`, as M4's gate decides it. D28 records that the
     // units are ASSUMED to be milliseconds since the Unix epoch.
     let epoch_millis = std::time::SystemTime::now()
@@ -2716,6 +2723,19 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 out,
                 "  MISS {} {}.{} {}",
                 miss.function, miss.class, miss.member, miss.descriptor
+            );
+        }
+        let lookups = guest.jni.lookups();
+        let _ = writeln!(out, "POST-TEARDOWN JNI lookups (the last {}, oldest first):", lookups.len());
+        for lookup in &lookups {
+            let _ = writeln!(
+                out,
+                "  LOOKUP slot {} {} {} class {:#x}{}",
+                lookup.thread,
+                lookup.function,
+                lookup.what,
+                lookup.class,
+                if lookup.pending_before { " (an exception was already pending)" } else { "" }
             );
         }
         let _ = writeln!(out, "POST-TEARDOWN JNI census: {:?}", guest.jni.census());

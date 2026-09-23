@@ -187,6 +187,21 @@ pub fn current_thread_host_priority() -> ProcessResult<i32> {
     backend::current_thread_host_priority()
 }
 
+/// The host machine's manufacturer, as its firmware reports it.
+///
+/// **What `android.os.Build.MANUFACTURER` is on a device**: the maker of the hardware the OS
+/// runs on (`ro.product.manufacturer`, which the device's own build sets). On this host that is
+/// the machine's maker, which Windows copies at boot from the firmware's SMBIOS System
+/// Information structure into `HKLM\HARDWARE\DESCRIPTION\System\BIOS\SystemManufacturer`.
+///
+/// # Errors
+///
+/// [`ProcessError::Unsupported`] on Linux and macOS. [`ProcessError::LastError`] if the
+/// firmware record cannot be read, or reads empty.
+pub fn host_manufacturer() -> ProcessResult<String> {
+    backend::host_manufacturer()
+}
+
 /// Processor time this **process** has consumed, across every thread it has ever had.
 ///
 /// What `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` reports on Linux, and therefore what the

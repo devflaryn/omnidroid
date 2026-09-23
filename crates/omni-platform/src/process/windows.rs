@@ -14,6 +14,8 @@ use windows_sys::Win32::System::Threading::{
     THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
 };
 
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
 use super::{ProcessError, ProcessResult};
 
 /// `BCryptGenRandom(NULL, .., BCRYPT_USE_SYSTEM_PREFERRED_RNG)`.
@@ -94,6 +96,59 @@ pub(super) fn set_current_thread_nice(nice: i32) -> ProcessResult<()> {
         });
     }
     Ok(())
+}
+
+/// `RegGetValueW(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemManufacturer")`.
+pub(super) fn host_manufacturer() -> ProcessResult<String> {
+    let key: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\BIOS\0".encode_utf16().collect();
+    let value: Vec<u16> = "SystemManufacturer\0".encode_utf16().collect();
+    let failed = |code: u32| ProcessError::LastError {
+        operation: "host_manufacturer",
+        api: "RegGetValueW",
+        code,
+    };
+    let mut bytes: u32 = 0;
+    // SAFETY: both names are NUL-terminated UTF-16 that outlive the call; a null buffer with a
+    // valid size pointer is the documented size query.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if status != 0 {
+        return Err(failed(status));
+    }
+    let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+    let mut filled = bytes;
+    // SAFETY: `buffer` holds `filled` bytes, the size the query above answered.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            core::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut filled,
+        )
+    };
+    if status != 0 {
+        return Err(failed(status));
+    }
+    let units = (filled as usize / 2).min(buffer.len());
+    let text = String::from_utf16_lossy(&buffer[..units]);
+    let text = text.trim_end_matches('\0').trim();
+    if text.is_empty() {
+        // ERROR_INVALID_DATA: a record that exists and says nothing is not a manufacturer.
+        return Err(failed(13));
+    }
+    Ok(text.to_string())
 }
 
 /// `GetThreadPriority(GetCurrentThread())`.
@@ -205,6 +260,15 @@ mod nice_tests {
         ] {
             assert_eq!(priority_for_nice(nice), level, "nice {nice}");
         }
+    }
+
+    /// The firmware names a maker, and it is text rather than a padded buffer.
+    #[test]
+    fn the_host_names_its_manufacturer() {
+        let maker = host_manufacturer().expect("the firmware's SystemManufacturer");
+        assert!(!maker.is_empty());
+        assert!(!maker.contains('\0'), "{maker:?}");
+        assert_eq!(maker, maker.trim(), "{maker:?}");
     }
 
     /// Applied, and read back, on a thread of its own.

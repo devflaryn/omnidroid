@@ -22,5 +22,6 @@
 //!   whoever first needs it, not something to guess at here.
 
 pub(super) use super::unix::{
-    cpu_time, current_cpu, current_thread_host_priority, random_bytes, set_current_thread_nice,
+    cpu_time, current_cpu, current_thread_host_priority, host_manufacturer, random_bytes,
+    set_current_thread_nice,
 };

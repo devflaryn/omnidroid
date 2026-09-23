@@ -1293,6 +1293,20 @@ pub static DECLARED: &[ClassSpec] = &[
         ],
     },
     ClassSpec {
+        name: "android/os/Build",
+        tier: Tier::One,
+        // **Declared because every device has it.** MEASURED: two workers asked
+        // `FindClass("android/os/Build")`, got the null an undeclared class answers, and passed it
+        // to `GetStaticMethodID(.., "isDebuggerConnected", "()Z")` -- a null `jclass`, which ART
+        // aborts on. On a device the class is found and **the method is not** (it is
+        // `android.os.Debug`'s, not `Build`'s), so the lookup answers null with
+        // `NoSuchMethodError` pending, which the engine handles; declaring the class with no such
+        // method gives exactly that. FMOD reads `MANUFACTURER` from it (`0x4fc0118`): the
+        // hardware's maker, an embedding's to state, so it refuses until one does.
+        methods: NONE,
+        fields: &[sf("MANUFACTURER", "Ljava/lang/String;", Answer::Unanswered)],
+    },
+    ClassSpec {
         name: "android/os/Debug",
         tier: Tier::One,
         // MEASURED: a worker asks `Debug.isDebuggerConnected()` (the null-class death that named
@@ -1893,6 +1907,27 @@ mod tests {
             assert_eq!(seen & bit, 0, "{} repeats a bit", member.name);
             seen |= bit;
         }
+    }
+
+    /// **`android.os.Build` is found, as on every device, and has no `isDebuggerConnected`** -- so
+    /// the engine's lookup of that method on it answers null with `NoSuchMethodError`, which is
+    /// what a device answers -- and its `MANUFACTURER` refuses until an embedding states it.
+    #[test]
+    fn build_is_found_without_debuggers_method_and_its_maker_is_the_embeddings() {
+        let registry = Registry::with_declared();
+        let id = registry.find("android/os/Build").expect("declared, so FindClass answers it");
+        let build = registry.class(id).expect("just found");
+        assert!(
+            !build.methods.iter().any(|m| m.name == "isDebuggerConnected"),
+            "Debug's method, not Build's"
+        );
+        let maker = build
+            .fields
+            .iter()
+            .find(|f| f.name == "MANUFACTURER" && f.descriptor == "Ljava/lang/String;")
+            .expect("MANUFACTURER is declared");
+        assert!(maker.is_static);
+        assert_eq!(maker.answer, Answer::Unanswered, "the embedding's to state");
     }
 
     /// **`android.os.Debug.isDebuggerConnected()` is `false`**, declared on its class so that

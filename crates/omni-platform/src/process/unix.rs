@@ -83,6 +83,15 @@ pub(super) fn set_current_thread_nice(nice: i32) -> ProcessResult<()> {
     )
 }
 
+/// Intended: `/sys/class/dmi/id/sys_vendor` on Linux; the `IOPlatformExpertDevice`'s
+/// `manufacturer` property on macOS.
+pub(super) fn host_manufacturer() -> ProcessResult<String> {
+    unsupported(
+        "host_manufacturer",
+        "/sys/class/dmi/id/sys_vendor on Linux; IOPlatformExpertDevice's manufacturer on macOS",
+    )
+}
+
 /// Intended: `getpriority(PRIO_PROCESS, gettid())` on Linux; the thread's QoS class on macOS.
 pub(super) fn current_thread_host_priority() -> ProcessResult<i32> {
     unsupported(
