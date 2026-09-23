@@ -404,7 +404,8 @@ pub const MAX_PHYSICAL_DEVICES: usize = 8;
 /// surface ever made would refuse the fifth time the app came back to the foreground.
 pub const MAX_SURFACES: usize = 4;
 
-/// How many `VkDevice` handles one [`Vulkan`] will issue.
+/// How many `VkDevice` handles one [`Vulkan`] will hold at once. `vkDestroyDevice` frees a slot,
+/// for [`MAX_SURFACES`]' lifecycle reason: the engine tears its device down with its window.
 pub const MAX_DEVICES: usize = 4;
 
 /// How many `VkQueue` handles one [`Vulkan`] will issue.
@@ -990,9 +991,11 @@ struct State {
     /// instance that was never bound into a boundary has no data area, and the refusal that
     /// produces names `Vulkan::bind_into` rather than panicking inside an import.
     physical_devices: Option<Handles<HostPhysicalDevice>>,
-    /// The one stage 3 family that supports removal: `vkDestroySurfaceKHR` frees a slot.
+    /// Supports removal: `vkDestroySurfaceKHR` frees a slot.
     surfaces: Option<Handles<HostSurface>>,
+    /// Supports removal: `vkDestroyDevice` frees a slot.
     devices: Option<Handles<HostDevice>>,
+    /// Supports removal, driven by `vkDestroyDevice`: a device's queues go with it.
     queues: Option<Handles<HostQueue>>,
     /// Stage 4's seven, carved out of the same data area by the same call.
     ///
@@ -2837,6 +2840,25 @@ impl Vulkan {
         register(at, state.devices.as_mut(), "vkCreateDevice", token, false)
     }
 
+    /// Free the slot a live `VkDevice` handle names, once `vkDestroyDevice` has destroyed the
+    /// host's device. Safe to remove from because the family never deduplicates.
+    fn forget_device(&self, handle: GuestAddr) -> bool {
+        let mut state = self.state.lock();
+        state.devices.as_mut().and_then(|h| h.remove(handle)).is_some()
+    }
+
+    /// Drop the `VkQueue` handles of a device that has just been destroyed, and answer how many.
+    ///
+    /// [`Vulkan::forget_images_of`]'s argument: a queue's lifetime is its device's, and the guest
+    /// has no call that releases one. The queue family **deduplicates**, which
+    /// [`Handles::remove`](handles::Handles::remove) warns is unsound if a host recycles tokens;
+    /// a host never reuses a queue token, because a queue token names a queue of one device and a
+    /// destroyed device's tokens are never handed out again.
+    fn forget_queues_of(&self, keep: impl Fn(HostQueue) -> bool) -> usize {
+        let mut state = self.state.lock();
+        state.queues.as_mut().map_or(0, |h| h.retain(keep))
+    }
+
     /// Put a queue in the registry, or recover the handle it already has. **Deduplicated**, and
     /// [`HostQueue`] says what rests on that.
     fn register_queue(&self, at: &Site, token: HostQueue) -> AbiResult<Registered> {
@@ -3254,8 +3276,8 @@ pub(super) struct Registered {
 /// — `vkEnumeratePhysicalDevices`, `vkGetDeviceQueue` — and "each call makes a new object" —
 /// `vkCreateAndroidSurfaceKHR`, `vkCreateDevice`. It is a parameter rather than a property of the
 /// registry because it is a property of the **call**: the same `VkDevice` registry would
-/// deduplicate wrongly if a host ever reused a token for a destroyed device, and nothing destroys
-/// one today precisely because there is no `vkDestroyDevice` in [`VulkanHost`].
+/// deduplicate wrongly if a host ever reused a token for a destroyed device -- which
+/// `vkDestroyDevice` now makes possible, and which is why it never deduplicates.
 fn register<T: Copy + PartialEq>(
     at: &Site,
     registry: Option<&mut Handles<T>>,
@@ -3508,6 +3530,8 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkCreateDevice" => device::create_device(c, &at, &vulkan, args),
         "vkGetDeviceQueue" => device::get_device_queue(c, &at, &vulkan, args),
         "vkGetDeviceProcAddr" => device::get_device_proc_addr(c, &at, &vulkan, args),
+        // Measured on `APP_CMD_TERM_WINDOW`, after the pipeline cache is saved.
+        "vkDestroyDevice" => device::destroy_device(c, &at, &vulkan, args),
         // Stage 4: the presentation spine -- from the device the guest now holds to a frame on
         // the screen. Nothing past a clear: there is no render pass, no pipeline and no device
         // memory here, and a guest that asks for one reaches `instance::unimplemented` below,

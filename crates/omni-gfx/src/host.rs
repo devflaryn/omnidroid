@@ -16,18 +16,19 @@
 //!
 //! # Nothing here destroys anything on the guest's behalf, and that is what keeps [`Drop`] right
 //!
-//! There is **no `vkDestroyInstance` or `vkDestroyDevice`** in the trait, because the guest has
-//! never called one: the decoded bootstrap at guest `0x02595160` resolves two names, and stage 3
+//! There is **no `vkDestroyInstance`** in the trait, because the guest has never been measured
+//! calling it: the decoded bootstrap at guest `0x02595160` resolves two names, and stage 3
 //! implements the set a renderer needs in order to *reach* a device. A guest that calls a
-//! destructor gets a refusal naming the function from the thunk, which is the honest answer and
-//! is also what makes this file's tables exactly what this host made — nothing can have gone
-//! away behind their back.
+//! destructor this host lacks gets a refusal naming the function from the thunk, which is the
+//! honest answer and is also what makes this file's tables exactly what this host made — nothing
+//! can have gone away behind their back.
 //!
-//! `vkDestroySurfaceKHR` **is** in the trait, and for the same reason the other two are not: it
-//! was measured. The engine's render thread answers `APP_CMD_TERM_WINDOW` — the app closed the way
-//! a device closes it — by destroying its swapchain and then its surface, and the guest's own
-//! destroy goes through [`GfxVulkanHost::destroy_surface`], which removes the table entry it
-//! destroys.
+//! `vkDestroySurfaceKHR` and `vkDestroyDevice` **are** in the trait, and for the same reason
+//! `vkDestroyInstance` is not: they were measured. The engine's render thread answers
+//! `APP_CMD_TERM_WINDOW` — the app closed the way a device closes it — by destroying its swapchain
+//! and its surface, saving its pipeline cache, and destroying its device. The guest's own destroys
+//! go through [`GfxVulkanHost::destroy_surface`] and [`GfxVulkanHost::destroy_device`], which
+//! empty the table entries they destroy.
 //!
 //! So [`Drop`] destroys whatever is left, and it runs the whole tree in Vulkan's required order:
 //! devices (each waited on first), then surfaces, then instances. Queues are not destroyed and
@@ -158,10 +159,20 @@ pub struct GfxVulkanHost {
     /// makes the destroyed surface's token a refusal rather than a name for the next surface the
     /// Android lifecycle creates in that slot.
     surfaces: Mutex<Slab<SurfaceEntry>>,
-    /// Every logical device this host created, indexed by [`HostDevice`] token.
-    devices: Mutex<Vec<DeviceEntry>>,
-    /// Every queue this host has handed out, indexed by [`HostQueue`] token.
-    queues: Mutex<Vec<QueueEntry>>,
+    /// Every logical device this host created, indexed by [`HostDevice`] token, and `None` once
+    /// the guest has destroyed it.
+    ///
+    /// **Emptied, never removed from and never refilled**: `vkDestroyDevice` leaves the slot
+    /// `None`, and `vkCreateDevice` only ever appends. So a token is an index that names one device
+    /// for the life of this host, and a destroyed device's token -- and every stage 4 and 5
+    /// entry's `device` index -- is a refusal rather than a name for a later device. Not a
+    /// [`Slab`]: every child table stores this index, and a slot that is never reused needs no
+    /// generation to tell its occupants apart. A device is made once per window, so the growth is
+    /// one slot per foreground.
+    devices: Mutex<Vec<Option<DeviceEntry>>>,
+    /// Every queue this host has handed out, indexed by [`HostQueue`] token, and `None` once its
+    /// device is destroyed. Emptied and never refilled, for [`GfxVulkanHost::devices`]' reason.
+    queues: Mutex<Vec<Option<QueueEntry>>>,
 
     // ------------------------------------------------------------------------ stage 4
     //
@@ -355,10 +366,10 @@ struct SurfaceEntry {
 /// # Why stage 4 needed this and stage 3 did not
 ///
 /// Stage 3's tables are plain `Vec`s that are never removed from, because nothing it implemented
-/// destroys anything — there is no `vkDestroyInstance` or `vkDestroyDevice` in [`VulkanHost`]. A
-/// token was an index, and an index into a vector that only grows is stable forever. The
-/// exception is the surface table, which became one of these when `vkDestroySurfaceKHR` was
-/// measured.
+/// destroyed anything. A token was an index, and an index into a vector that only grows is stable
+/// forever. The surface table became one of these when `vkDestroySurfaceKHR` was measured; the
+/// device and queue tables, when `vkDestroyDevice` was, instead empty a slot and never refill it,
+/// because every child table stores a device's index ([`GfxVulkanHost::devices`]).
 ///
 /// Stage 4 is the first stage whose objects the guest genuinely destroys, once per frame in the
 /// case of a swapchain that follows a resize. Two ways of handling that are wrong and the
@@ -679,13 +690,14 @@ impl GfxVulkanHost {
 
     // ------------------------------------------------------------------- stage 3 internals
 
-    /// How many surfaces, devices and queues this host holds. Diagnostic (Global Constraint 6).
+    /// How many surfaces, devices and queues this host holds **live**. Diagnostic (Global
+    /// Constraint 6).
     #[must_use]
     pub fn objects(&self) -> (usize, usize, usize) {
         (
             self.surfaces.lock().unwrap_or_else(PoisonError::into_inner).len(),
-            self.devices.lock().unwrap_or_else(PoisonError::into_inner).len(),
-            self.queues.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            self.locked_devices().iter().flatten().count(),
+            self.locked_queues().iter().flatten().count(),
         )
     }
 
@@ -708,12 +720,22 @@ impl GfxVulkanHost {
         self.surfaces.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn locked_devices(&self) -> std::sync::MutexGuard<'_, Vec<DeviceEntry>> {
+    fn locked_devices(&self) -> std::sync::MutexGuard<'_, Vec<Option<DeviceEntry>>> {
         self.devices.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn locked_queues(&self) -> std::sync::MutexGuard<'_, Vec<QueueEntry>> {
+    fn locked_queues(&self) -> std::sync::MutexGuard<'_, Vec<Option<QueueEntry>>> {
         self.queues.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The live device a token or an index names. `None` for one never made **or destroyed**.
+    fn live_device(devices: &[Option<DeviceEntry>], index: usize) -> Option<&DeviceEntry> {
+        devices.get(index).and_then(Option::as_ref)
+    }
+
+    /// The live queue a token names. `None` for one never handed out or whose device is gone.
+    fn live_queue(queues: &[Option<QueueEntry>], token: HostQueue) -> Option<&QueueEntry> {
+        queues.get(usize::try_from(token.token()).unwrap_or(usize::MAX)).and_then(Option::as_ref)
     }
 
     /// A physical-device token as `(instance index, device index)`.
@@ -812,13 +834,14 @@ impl GfxVulkanHost {
     ) -> AbiResult<R> {
         let instances = self.locked();
         let devices = self.locked_devices();
-        let entry = devices
-            .get(usize::try_from(token.token()).unwrap_or(usize::MAX))
+        let index = usize::try_from(token.token()).unwrap_or(usize::MAX);
+        let entry = Self::live_device(&devices, index)
             .ok_or_else(|| {
                 refused(
                     "VulkanHost::with_device",
                     &format!(
-                        "{token:?} is not a device this host created -- it has created {}",
+                        "{token:?} is not a device this host holds -- it has created {}, and a \
+                         device the guest has destroyed lands here too",
                         devices.len()
                     ),
                 )
@@ -878,11 +901,12 @@ impl GfxVulkanHost {
         let (index, instance_index, physical, device, requested) = {
             let devices = self.locked_devices();
             let index = usize::try_from(token.token()).unwrap_or(usize::MAX);
-            let entry = devices.get(index).ok_or_else(|| {
+            let entry = Self::live_device(&devices, index).ok_or_else(|| {
                 refused(
                     "VulkanHost::device_parts",
                     &format!(
-                        "{token:?} is not a device this host created -- it has created {}",
+                        "{token:?} is not a device this host holds -- it has created {}, and a \
+                         device the guest has destroyed lands here too",
                         devices.len()
                     ),
                 )
@@ -917,13 +941,62 @@ impl GfxVulkanHost {
         })
     }
 
+    /// Every object still alive on device `index`, by kind, as tokens: what `vkDestroyDevice`
+    /// refuses over.
+    ///
+    /// Every table of driver objects this host makes **from a device**. Three families are left
+    /// out on purpose, because their parent frees them and their parent is in the list: command
+    /// buffers (their pool), descriptor sets (their pool), swapchain images (their swapchain).
+    ///
+    /// **One table at a time**: each guard is a temporary that ends with its statement. The caller
+    /// holds `devices`, which precedes every one of these in the lock order, and no path here
+    /// takes `devices` while holding any of them.
+    fn children_of(&self, index: usize) -> Vec<(&'static str, Vec<u64>)> {
+        fn owned<T>(table: &Slab<T>, index: usize, device: impl Fn(&T) -> usize) -> Vec<u64> {
+            table
+                .iter()
+                .filter(|(_, entry)| device(entry) == index)
+                .map(|(token, _)| token)
+                .collect()
+        }
+        let mut live = Vec::new();
+        let mut note = |kind: &'static str, tokens: Vec<u64>| {
+            if !tokens.is_empty() {
+                live.push((kind, tokens));
+            }
+        };
+        note("VkSwapchainKHR", owned(&self.locked_swapchains(), index, |e| e.device));
+        note("VkImageView", owned(&self.locked_views(), index, |e| e.device));
+        note("VkSemaphore", owned(&self.locked_semaphores(), index, |e| e.device));
+        note("VkFence", owned(&self.locked_fences(), index, |e| e.device));
+        note("VkCommandPool", owned(&self.locked_pools(), index, |e| e.device));
+        note("VkDeviceMemory", owned(&self.locked_memories(), index, |e| e.device));
+        note("VkBuffer", owned(&self.locked_vk_buffers(), index, |e| e.device));
+        note("VkImage", owned(&self.locked_created_images(), index, |e| e.device));
+        note("VkSampler", owned(&self.locked_samplers(), index, |e| e.device));
+        note("VkShaderModule", owned(&self.locked_modules(), index, |e| e.device));
+        note("VkPipelineLayout", owned(&self.locked_layouts(), index, |e| e.device));
+        note("VkRenderPass", owned(&self.locked_passes(), index, |e| e.device));
+        note("VkFramebuffer", owned(&self.locked_framebuffers(), index, |e| e.device));
+        note("VkPipeline", owned(&self.locked_pipelines(), index, |e| e.device));
+        note("VkPipelineCache", owned(&self.locked_caches(), index, |e| e.device));
+        note("VkQueryPool", owned(&self.locked_query_pools(), index, |e| e.device));
+        note("VkDescriptorSetLayout", owned(&self.locked_set_layouts(), index, |e| e.device));
+        note("VkDescriptorPool", owned(&self.locked_descriptor_pools(), index, |e| e.device));
+        live
+    }
+
     /// The `ash::Device` a device index names, cloned, with no lock held afterwards.
     fn device_at(&self, index: usize, method: &'static str) -> AbiResult<ash::Device> {
         let devices = self.locked_devices();
-        devices.get(index).map(|entry| entry.device.clone()).ok_or_else(|| {
+        Self::live_device(&devices, index).map(|entry| entry.device.clone()).ok_or_else(|| {
             refused(
                 method,
-                &format!("device #{index} is not one this host created -- it has {}", devices.len()),
+                &format!(
+                    "device #{index} is not one this host holds -- it has created {}, and a \
+                     device the guest has destroyed lands here too",
+                    devices.len()
+                ),
             )
         })
     }
@@ -2110,12 +2183,12 @@ impl VulkanHost for GfxVulkanHost {
             (Ok(device), physical) => {
                 let mut devices = self.locked_devices();
                 let token = devices.len() as u64;
-                devices.push(DeviceEntry {
+                devices.push(Some(DeviceEntry {
                     instance: instance_index,
                     physical,
                     device,
                     requested,
-                });
+                }));
                 Ok(DriverAnswer::Ok(HostDevice::from_token(token)))
             }
             (Err(result), _) => Ok(DriverAnswer::Failed(result.as_raw())),
@@ -2168,8 +2241,10 @@ impl VulkanHost for GfxVulkanHost {
         let mut queues = self.locked_queues();
         // **Deduplicated**, because one `(family, index)` pair is one queue and a renderer
         // compares two queue handles to decide whether its swapchain is `EXCLUSIVE`.
-        if let Some(position) = queues.iter().position(|entry| {
-            entry.device == device_index && entry.family == family && entry.index == index
+        if let Some(position) = queues.iter().position(|slot| {
+            slot.as_ref().is_some_and(|entry| {
+                entry.device == device_index && entry.family == family && entry.index == index
+            })
         }) {
             // **And the driver is held to its own contract.** `vkGetDeviceQueue` for one family
             // and index must produce the same `VkQueue` every time; if it did not, the handle the
@@ -2177,7 +2252,7 @@ impl VulkanHost for GfxVulkanHost {
             // every later comparison the renderer makes between its graphics and present queues
             // would be answering about the wrong pair. Nothing has ever seen this happen, which
             // is precisely why it is checked rather than assumed.
-            if queues[position].queue != queue {
+            if queues[position].as_ref().is_some_and(|entry| entry.queue != queue) {
                 return Err(refused(
                     "vkGetDeviceQueue",
                     &format!(
@@ -2188,7 +2263,7 @@ impl VulkanHost for GfxVulkanHost {
             return Ok(HostQueue::from_token(position as u64));
         }
         let token = queues.len() as u64;
-        queues.push(QueueEntry { device: device_index, family, index, queue });
+        queues.push(Some(QueueEntry { device: device_index, family, index, queue }));
         Ok(HostQueue::from_token(token))
     }
 
@@ -2211,6 +2286,83 @@ impl VulkanHost for GfxVulkanHost {
                 unsafe { instance.get_device_proc_addr(entry.device.handle(), name.as_ptr()) };
             found.is_some()
         })
+    }
+
+    /// `vkDestroyDevice`, after the check the specification requires and nothing on this machine
+    /// would otherwise make: **no object created from the device may still be alive**.
+    ///
+    /// # Why this host refuses rather than trusting the driver
+    ///
+    /// There are no validation layers here (`docs/research/graphics-spike.md` §6), and this
+    /// machine's NVIDIA driver was measured failing without a diagnostic when misused -- the
+    /// spike's swapchain misuse crashed it, and a short `vkGetPipelineCacheData` buffer corrupted
+    /// the heap.
+    /// So a device with live children is refused **naming each kind, with a count and a few
+    /// tokens** ([`GfxVulkanHost::children_of`]), and the device is left exactly as it was.
+    ///
+    /// # Held across the check and the removal
+    ///
+    /// `devices` is held from the check until the slot is emptied: every creation of a child looks
+    /// the device up in that table first, so none can be made in between. The slot is then `None`
+    /// for good -- [`GfxVulkanHost::devices`] says why a destroyed device's index is never
+    /// reused -- and so is every queue of the device, whose tokens are the answer. The driver is
+    /// called with no lock held. Nothing else here is per device: `cache_gate` is one lock for the
+    /// whole host, and the import probes are per physical device.
+    fn destroy_device(&self, device: HostDevice) -> AbiResult<Vec<HostQueue>> {
+        const CALL: &str = "vkDestroyDevice";
+        let index = usize::try_from(device.token()).unwrap_or(usize::MAX);
+        let (entry, gone) = {
+            let mut devices = self.locked_devices();
+            if Self::live_device(&devices, index).is_none() {
+                return Err(refused(
+                    CALL,
+                    &format!(
+                        "{device:?} is not a device this host holds -- it has created {}. A device \
+                         the guest has already destroyed lands here too, and a second \
+                         `vkDestroyDevice` of one device is a double free the driver is not \
+                         required to notice",
+                        devices.len()
+                    ),
+                ));
+            }
+            let live = self.children_of(index);
+            if !live.is_empty() {
+                return Err(refused(
+                    CALL,
+                    &format!(
+                        "{device:?} still has objects created from it: {}. The specification \
+                         requires every one to be destroyed before the device is, and there is no \
+                         validation layer on this machine to report the violation -- its NVIDIA \
+                         driver has been measured failing silently or corrupting the heap when \
+                         misused instead. So the device is left exactly as it was",
+                        describe_children(&live)
+                    ),
+                ));
+            }
+            let Some(entry) = devices.get_mut(index).and_then(Option::take) else {
+                // Checked live above, under this same lock.
+                return Err(refused(CALL, &format!("{device:?} vanished under its own lock")));
+            };
+            let mut queues = self.locked_queues();
+            let gone: Vec<HostQueue> = queues
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, slot)| slot.as_ref().is_some_and(|queue| queue.device == index))
+                .map(|(token, slot)| {
+                    *slot = None;
+                    HostQueue::from_token(token as u64)
+                })
+                .collect();
+            (entry, gone)
+        };
+        // SAFETY: the device is live and this host created it; the wait is what makes the destroy
+        // legal if the guest left work queued.
+        let _ = unsafe { entry.device.device_wait_idle() };
+        // SAFETY: no object created from the device survives -- checked above, under the lock that
+        // then emptied its slot, so no new one can have been made through this host -- its queues
+        // are idle, and `pAllocator` was `None` at creation.
+        unsafe { entry.device.destroy_device(None) };
+        Ok(gone)
     }
 
     // ------------------------------------------------------------------------ stage 4
@@ -3017,13 +3169,13 @@ impl VulkanHost for GfxVulkanHost {
     ) -> AbiResult<DriverAnswer<()>> {
         let (device_index, queue_handle) = {
             let queues = self.locked_queues();
-            let entry = queues
-                .get(usize::try_from(queue.token()).unwrap_or(usize::MAX))
+            let entry = Self::live_queue(&queues, queue)
                 .ok_or_else(|| {
                     refused(
                         "VulkanHost::queue_submit",
                         &format!(
-                            "{queue:?} is not a queue this host handed out -- it has handed out {}",
+                            "{queue:?} is not a live queue of this host -- it has handed out {}, \
+                             and a queue whose device was destroyed lands here too",
                             queues.len()
                         ),
                     )
@@ -3140,13 +3292,13 @@ impl VulkanHost for GfxVulkanHost {
     fn queue_present(&self, queue: HostQueue, present: &PresentRequest) -> AbiResult<Presented> {
         let (device_index, queue_handle) = {
             let queues = self.locked_queues();
-            let entry = queues
-                .get(usize::try_from(queue.token()).unwrap_or(usize::MAX))
+            let entry = Self::live_queue(&queues, queue)
                 .ok_or_else(|| {
                     refused(
                         "VulkanHost::queue_present",
                         &format!(
-                            "{queue:?} is not a queue this host handed out -- it has handed out {}",
+                            "{queue:?} is not a live queue of this host -- it has handed out {}, \
+                             and a queue whose device was destroyed lands here too",
                             queues.len()
                         ),
                     )
@@ -3234,13 +3386,13 @@ impl VulkanHost for GfxVulkanHost {
     fn queue_wait_idle(&self, queue: HostQueue) -> AbiResult<DriverAnswer<()>> {
         let (device_index, queue_handle) = {
             let queues = self.locked_queues();
-            let entry = queues
-                .get(usize::try_from(queue.token()).unwrap_or(usize::MAX))
+            let entry = Self::live_queue(&queues, queue)
                 .ok_or_else(|| {
                     refused(
                         "VulkanHost::queue_wait_idle",
                         &format!(
-                            "{queue:?} is not a queue this host handed out -- it has handed out {}",
+                            "{queue:?} is not a live queue of this host -- it has handed out {}, \
+                             and a queue whose device was destroyed lands here too",
                             queues.len()
                         ),
                     )
@@ -5934,6 +6086,20 @@ impl GfxVulkanHost {
 /// (`docs/research/graphics-spike.md` §6), and the guest can reach it with two handles it was
 /// legitimately given — exactly the shape `with_surface`'s instance check catches one stage
 /// earlier.
+/// Live children as a refusal can say them: each kind with its count and its first three tokens.
+fn describe_children(live: &[(&str, Vec<u64>)]) -> String {
+    live.iter()
+        .map(|(kind, tokens)| {
+            let shown: Vec<String> =
+                tokens.iter().take(3).map(|token| format!("#{token}")).collect();
+            let more = tokens.len().saturating_sub(3);
+            let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+            format!("{} `{kind}` ({}{more})", tokens.len(), shown.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn cross_device(family: &str, had: usize, asked: usize) -> AbiError {
     refused(
         "VulkanHost",
@@ -6032,7 +6198,7 @@ impl Drop for GfxVulkanHost {
         // this host has no validation layer to report (`docs/research/graphics-spike.md` §6).
         {
             let devices = self.locked_devices();
-            for entry in devices.iter() {
+            for entry in devices.iter().flatten() {
                 // SAFETY: the device is live and this host created it.
                 let _ = unsafe { entry.device.device_wait_idle() };
             }
@@ -6170,13 +6336,15 @@ impl Drop for GfxVulkanHost {
         }
         let _ = self.locked_images().drain();
 
+        // Only the devices the guest did not destroy itself: `vkDestroyDevice` empties the slot it
+        // destroys, so nothing here is destroyed twice.
         let devices = std::mem::take(&mut *self.locked_devices());
-        for entry in devices {
+        for entry in devices.into_iter().flatten() {
             // SAFETY: the device is live and this host created it. The wait is what makes the
             // destroy below legal if the guest ever submitted work through it.
             let _ = unsafe { entry.device.device_wait_idle() };
-            // SAFETY: every object made from this device has gone away with it -- nothing in this
-            // file creates one -- and `pAllocator` was `None` at creation.
+            // SAFETY: every object made from this device was destroyed above, and `pAllocator`
+            // was `None` at creation.
             unsafe { entry.device.destroy_device(None) };
         }
 

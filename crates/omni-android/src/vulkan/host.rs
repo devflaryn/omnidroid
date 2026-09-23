@@ -1939,6 +1939,40 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkDestroyDevice`, forwarded, **only once every child is gone**.
+    ///
+    /// Measured: the engine's render thread tears its whole device down on
+    /// `APP_CMD_TERM_WINDOW`, right after saving its pipeline cache.
+    ///
+    /// # Children first, and the implementation is the one that can see them
+    ///
+    /// The specification requires every object created from the device to have been destroyed
+    /// first. The guest-side registries do not record which device an object came from; an
+    /// implementation does -- it needs to, to destroy each one -- so it is the implementation that
+    /// refuses a device with live children, **naming each kind with a count and a few tokens**,
+    /// before the driver is asked. There are no validation layers on this machine, and a misused
+    /// NVIDIA driver is measured to fail silently or corrupt the heap rather than report.
+    ///
+    /// # The queues go with it
+    ///
+    /// A `VkQueue` is retrieved, never created, and the guest never destroys one. The answer is the
+    /// queue tokens that went with the device, so the shim can drop the guest's handles for them,
+    /// as `vkDestroySwapchainKHR` drops a swapchain's images. Returns no `VkResult`: the call
+    /// returns `void`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host holds -- a device already
+    /// destroyed included -- or when anything created from it is still alive.
+    fn destroy_device(&self, device: HostDevice) -> AbiResult<Vec<HostQueue>> {
+        let _ = device;
+        Err(host_has_no(
+            "VulkanHost::destroy_device",
+            "the device cannot be destroyed, and returning quietly would leave the driver's device \
+             and everything on it alive after the engine has let go of them",
+        ))
+    }
+
     // ------------------------------------------------------------------------ stage 4
 
     /// `vkCreateSwapchainKHR`, forwarded.
@@ -3737,6 +3771,9 @@ mod tests {
             .pipeline_cache_data(HostDevice::from_token(0), HostPipelineCache::from_token(0))
             .expect_err("nor a cache blob");
         assert_eq!(error.symbol(), Some("VulkanHost::pipeline_cache_data"));
+
+        let error = host.destroy_device(HostDevice::from_token(0)).expect_err("nor a device gone");
+        assert_eq!(error.symbol(), Some("VulkanHost::destroy_device"));
     }
 
     /// The two arms of [`DriverAnswer`] are not the same value, which is the whole of D22's point
