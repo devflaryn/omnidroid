@@ -917,6 +917,9 @@ impl Scratch {
     const CA_BUNDLE_IN_APK: &'static str = "ssl/cacert.pem";
     /// Where the engine opens it, measured rather than assumed. See [`Self::CA_BUNDLE_IN_APK`].
     const CA_BUNDLE_IN_GUEST: &'static str = "data/data/com.roblox.client/files/exe/cacert.pem";
+    /// Where the engine looks for `ClientAppSettings.json`, measured (the missing-paths list).
+    const CLIENT_APP_SETTINGS_DIRECTORY: &'static str =
+        "data/data/com.roblox.client/files/exe/ClientSettings";
 
     fn new(tag: &str) -> Scratch {
         let mut at = std::env::temp_dir();
@@ -960,6 +963,22 @@ impl Scratch {
         );
         std::fs::write(at.join(Self::CA_BUNDLE_IN_GUEST), &bundle)
             .expect("the certificate authorities, where the engine looks for them");
+        // **OMNI_CLIENT_APP_SETTINGS=<json>: a diagnostic, off by default.** The engine opens
+        // `ClientAppSettings.json` (MEASURED: in every run's missing-paths list) -- Roblox's own
+        // local flag-override file -- and a device without one is the default this gate keeps.
+        // Set, the JSON is written there verbatim, so a run can turn on an engine log channel
+        // (`{"FLogApplicationFrameRate": 12}`) and read the engine's own account of itself.
+        if let Some(json) = std::env::var_os("OMNI_CLIENT_APP_SETTINGS") {
+            let json = json.into_string().expect("OMNI_CLIENT_APP_SETTINGS is UTF-8 JSON");
+            std::fs::create_dir_all(at.join(Self::CLIENT_APP_SETTINGS_DIRECTORY))
+                .expect("the client-settings directory");
+            std::fs::write(
+                at.join(Self::CLIENT_APP_SETTINGS_DIRECTORY).join("ClientAppSettings.json"),
+                json.as_bytes(),
+            )
+            .expect("the client app settings, where the engine looks for them");
+            println!("CLIENT APP SETTINGS (OMNI_CLIENT_APP_SETTINGS): {json}");
+        }
         Scratch(at)
     }
 }
@@ -2525,6 +2544,61 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         };
     // (presents when the size was delivered, the size) for each resize, to check frames follow.
     let mut resizes: Vec<(u64, (u32, u32))> = Vec::new();
+    // **OMNI_LATE_INPUT=<s>[,<s>...]: a SYNTHETIC drag at each listed second of the session** --
+    // press at the centre, 30 moves 8 px apart every 50 ms (240 px over 1.5 s), release. Opt-in
+    // and said so, for the question `OMNI_INPUT_PROBE` cannot answer: that one lands before
+    // the Lua app has drawn anything, and this one lands on whatever screen the engine is
+    // showing by then, so the FRAMES lines around it say whether the engine redraws for it.
+    let mut late_input: Vec<(f32, omni_platform::window::WindowEvent)> =
+        match (&touch, std::env::var("OMNI_LATE_INPUT")) {
+            (Some(_), Ok(list)) => {
+                use omni_platform::window::{PointerButton, WindowEvent};
+                let (x, y) = (surface_width / 2, surface_height / 2);
+                let mut planned = Vec::new();
+                for second in list.split(',') {
+                    let at: f32 = second.trim().parse().unwrap_or_else(|_| {
+                        panic!("OMNI_LATE_INPUT={list:?}: {second:?} is not a second of the session")
+                    });
+                    planned.push((at, WindowEvent::PointerDown { button: PointerButton::Primary, x, y }));
+                    for step in 1..=30 {
+                        planned.push((
+                            at + 0.05 * step as f32,
+                            WindowEvent::PointerMoved { x: x - 8 * step, y },
+                        ));
+                    }
+                    planned.push((
+                        at + 1.55,
+                        WindowEvent::PointerUp { button: PointerButton::Primary, x: x - 240, y },
+                    ));
+                }
+                planned.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "LATE INPUT: a SYNTHETIC 240 px drag from ({x}, {y}) at +{list}s (OMNI_LATE_INPUT)"
+                );
+                planned
+            }
+            _ => Vec::new(),
+        };
+    // **OMNI_LATE_TAP=<s>@<x>,<y>[;...]: a SYNTHETIC tap** -- press, and release 100 ms later, at
+    // window pixel (x, y) -- for pressing one of the engine's own buttons where the screen shows
+    // it. Opt-in and said so, like the drag: a stimulus this gate invents, aimed by a person.
+    if let (Some(_), Ok(list)) = (&touch, std::env::var("OMNI_LATE_TAP")) {
+        use omni_platform::window::{PointerButton, WindowEvent};
+        for tap in list.split(';') {
+            let parsed = tap.split_once('@').and_then(|(at, place)| {
+                let (x, y) = place.split_once(',')?;
+                Some((at.trim().parse::<f32>().ok()?, x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?))
+            });
+            let (at, x, y) = parsed.unwrap_or_else(|| {
+                panic!("OMNI_LATE_TAP={list:?}: {tap:?} is not <second>@<x>,<y>")
+            });
+            late_input.push((at, WindowEvent::PointerDown { button: PointerButton::Primary, x, y }));
+            late_input.push((at + 0.1, WindowEvent::PointerUp { button: PointerButton::Primary, x, y }));
+        }
+        late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let _ = writeln!(std::io::stderr(), "LATE TAP: SYNTHETIC taps {list} (OMNI_LATE_TAP)");
+    }
     let mut resize_failure: Option<String> = None;
     // **OMNI_PROFILE=1**: `sample_profile` on its own thread for the whole session.
     let profiler = std::env::var_os("OMNI_PROFILE").is_some().then(|| {
@@ -2623,9 +2697,23 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         // window nobody pumps is one the OS marks as not responding, and a geometry nobody
         // samples goes stale at the first resize.
         if let (Some(open), Some(source)) = (window.as_mut(), window_source.as_ref()) {
+            let due = late_input
+                .iter()
+                .take_while(|(at, _)| settle.elapsed().as_secs_f32() >= *at)
+                .count();
+            let late: Vec<omni_platform::window::WindowEvent> =
+                late_input.drain(..due).map(|(_, event)| event).collect();
+            if late.iter().any(|event| matches!(event, omni_platform::window::WindowEvent::PointerDown { .. })) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "LATE INPUT: a SYNTHETIC press at +{:.1}s, {} presents so far",
+                    settle.elapsed().as_secs_f32(),
+                    presents()
+                );
+            }
             let events: Vec<omni_platform::window::WindowEvent> = match &touch {
                 Some(seam) if seam.surface_alive() => {
-                    input_probe.drain(..).chain(open.poll_events()).collect()
+                    input_probe.drain(..).chain(late).chain(open.poll_events()).collect()
                 }
                 _ => open.poll_events().collect(),
             };
