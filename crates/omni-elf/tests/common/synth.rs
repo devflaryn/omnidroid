@@ -22,7 +22,12 @@
 
 use std::path::{Path, PathBuf};
 
-pub const PAGE: u64 = 0x1000;
+/// The layout's page: the host's, because a `PT_LOAD` aligned below the host page cannot be mapped
+/// and is refused (`AlignBelowPageSize`) before any of the checks below could be reached. 4 KiB
+/// everywhere but Apple silicon, whose 16 KiB pages are also what 16 KiB Android devices use, and
+/// what the APK's own `libroblox.so` is aligned to. Every address past the first page below is
+/// derived from it, so on a 4 KiB host the library is byte-for-byte what it always was.
+pub const PAGE: u64 = if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 0x4000 } else { 0x1000 };
 
 // Program headers.
 pub const PHOFF: usize = 0x40;
@@ -58,23 +63,23 @@ pub const JMPREL_COUNT: usize = 2;
 pub const INIT_FN_0: u64 = 0x0900;
 pub const INIT_FN_1: u64 = 0x0908;
 
-pub const DYNAMIC: u64 = 0x1000;
-pub const INIT_ARRAY: u64 = 0x1100;
+pub const DYNAMIC: u64 = PAGE;
+pub const INIT_ARRAY: u64 = PAGE + 0x100;
 pub const INIT_ARRAY_COUNT: usize = 2;
-pub const GOT: u64 = 0x1200;
-pub const GOT_PLT: u64 = 0x1300;
+pub const GOT: u64 = PAGE + 0x200;
+pub const GOT_PLT: u64 = PAGE + 0x300;
 /// The address of the one defined data symbol, inside the writable segment.
-pub const LOCAL_DATA: u64 = 0x1400;
+pub const LOCAL_DATA: u64 = PAGE + 0x400;
 
 pub const TEXT_VADDR: u64 = 0x0000;
-pub const TEXT_FILESZ: u64 = 0x1000;
-pub const DATA_VADDR: u64 = 0x1000;
-pub const DATA_FILESZ: u64 = 0x1000;
+pub const TEXT_FILESZ: u64 = PAGE;
+pub const DATA_VADDR: u64 = PAGE;
+pub const DATA_FILESZ: u64 = PAGE;
 /// One page of file content plus one page of `.bss`.
-pub const DATA_MEMSZ: u64 = 0x2000;
-pub const RELRO_VADDR: u64 = 0x1000;
-pub const RELRO_MEMSZ: u64 = 0x1000;
-pub const FILE_LEN: usize = 0x2000;
+pub const DATA_MEMSZ: u64 = 2 * PAGE;
+pub const RELRO_VADDR: u64 = PAGE;
+pub const RELRO_MEMSZ: u64 = PAGE;
+pub const FILE_LEN: usize = 2 * PAGE as usize;
 
 /// Symbol indices.
 pub const SYM_IMPORTED_FUNC: u32 = 1;

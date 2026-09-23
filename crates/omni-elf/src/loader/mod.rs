@@ -988,10 +988,20 @@ fn relro_region(
         end: seg.vaddr_end(),
         memsz: seg.p_memsz,
     })?;
-    // bionic rounds both ends **down**: a page only partly covered by the relro segment also holds
-    // writable data, and sealing it would make that data read-only for good.
+    // bionic seals `[page_start(p_vaddr), page_end(p_vaddr + p_memsz))`: the start rounded down and
+    // the **end rounded up** -- "we're going to be over-protective here and put every page touched
+    // by the segment as read-only" (`_phdr_table_set_gnu_relro_prot`, bionic
+    // `linker/linker_phdr.cpp`, AOSP main, read 2026-09-24). An earlier version of this comment said
+    // both ends were rounded down; that reads the same wherever the relro end is page-aligned,
+    // which it is in every library of this APK at 4 KiB, and it is not at 16 KiB: `libroblox.so`'s
+    // relro ends at 0x67d3000, inside the 16 KiB page that holds `.got` and `.got.plt`, and
+    // rounding down left the whole GOT writable on a 16 KiB host where a device seals it.
     let start_page = plan::page_down(seg.p_vaddr, page);
-    let end_page = plan::page_down(end_vaddr, page);
+    let end_page = plan::page_up(end_vaddr, page).ok_or(LoadError::RelroOutsideImage {
+        vaddr: seg.p_vaddr,
+        end: end_vaddr,
+        memsz: seg.p_memsz,
+    })?;
     if end_page < start_page || !plan_covers(plan, start_page, end_page) {
         return Err(LoadError::RelroOutsideImage {
             vaddr: seg.p_vaddr,
