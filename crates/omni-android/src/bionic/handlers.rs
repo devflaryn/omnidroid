@@ -388,6 +388,13 @@ handlers! {
     fn strtod(nptr: ptr, endptr: ptr) -> f64 =
         |v| omni_bionic::numerics::strtod(&mut v, nptr, endptr);
 
+    /// `double atof(const char *s)` -- `strtod(s, NULL)`, C11 7.22.1.1.
+    ///
+    /// **A pure binding gap, again**: `omni_bionic::numerics::atof` has existed beside `strtod`
+    /// and nothing bound it. MEASURED: the engine's main thread (started at link `0x22076f8`)
+    /// died on it at `0x238bfc8` on the second launch of a kept data directory.
+    fn atof(s: ptr) -> f64 = |v| omni_bionic::numerics::atof(&mut v, s);
+
     /// `float strtof(const char *nptr, char **endptr)`
     fn strtof(nptr: ptr, endptr: ptr) -> f32 =
         |v| omni_bionic::numerics::strtof(&mut v, nptr, endptr);
@@ -1574,6 +1581,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("strtoull", strtoull),
     ("strtoull_l", strtoull_l),
     ("strtod", strtod),
+    // M6, the second launch of a kept data directory. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records it.
+    ("atof", atof),
     ("strtof", strtof),
     ("rand", rand),
     // M6's network run: the call that seeds the `rand` above it, which has been bound since
@@ -1831,6 +1841,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("unlink", files::unlink),
     ("mkdir", files::mkdir),
     ("rmdir", files::rmdir),
+    // M6, the second launch of a kept data directory: the engine's HTTP cache. Outside Task 1's
+    // 188; `BEYOND_THE_PREDICTION` records it.
+    ("utime", files::utime),
     ("opendir", files::opendir),
     ("readdir", files::readdir),
     ("closedir", files::closedir),
@@ -1854,6 +1867,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // M6: the worker in `initializeWithAppStarter`. Outside Task 1's 188; `BEYOND_THE_PREDICTION`
     // records how it was found.
     ("ferror", stdio::ferror),
+    // M6, the second launch of a kept data directory. Outside Task 1's 188;
+    // `BEYOND_THE_PREDICTION` records it.
+    ("clearerr", stdio::clearerr),
     ("fflush", stdio::fflush),
     ("fgets", stdio::fgets),
     ("fileno", stdio::fileno),

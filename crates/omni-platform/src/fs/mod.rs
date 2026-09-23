@@ -50,7 +50,7 @@
 //!
 //! # What is deliberately not on this seam
 //!
-//! * **No `symlink`, `link`, `readlink`, `chmod`, `chown` or `utime`.** None is in the 188
+//! * **No `symlink`, `link`, `readlink`, `chmod` or `chown`.** None is in the 188
 //!   statically-reachable imports, and the first two are what make [`path`]'s symlink rule
 //!   sufficient: the guest cannot create a link, so the set of links inside the root is fixed by
 //!   whoever populated it.
@@ -2747,6 +2747,43 @@ impl Filesystem {
         std::fs::remove_file(&host).map_err(|e| FsError::io(OP, &host, &e))
     }
 
+    /// `utime(2)`: set a **regular file's** access and modification times.
+    ///
+    /// Through `std::fs::File::set_times`, on the file opened for writing -- which is the access
+    /// that carries the right to change its attributes, on Windows as on POSIX. A directory is
+    /// refused by name rather than guessed at: its times need a handle this seam does not open,
+    /// and no run has asked for one. MEASURED reader: the engine's HTTP cache, on a second
+    /// launch of a kept data directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`resolve`](Self::resolve), [`FsError::Io`] for a file that cannot be opened for
+    /// writing or stamped, and [`FsErrorKind::Other`] for a directory.
+    pub fn set_times(
+        &self,
+        guest_path: &[u8],
+        accessed: std::time::SystemTime,
+        modified: std::time::SystemTime,
+    ) -> FsResult<()> {
+        const OP: &str = "utime";
+        let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
+        let metadata = std::fs::metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
+        if metadata.is_dir() {
+            return Err(FsError::kinded(
+                OP,
+                host.display().to_string(),
+                FsErrorKind::Other,
+                "a directory's times are not set by this seam -- no run has asked for one",
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&host)
+            .map_err(|e| FsError::io(OP, &host, &e))?;
+        file.set_times(std::fs::FileTimes::new().set_accessed(accessed).set_modified(modified))
+            .map_err(|e| FsError::io(OP, &host, &e))
+    }
+
     /// `mkdir(2)`. One directory, never the parents: POSIX's `mkdir` does not create a path.
     ///
     /// # Errors
@@ -3061,6 +3098,24 @@ mod tests {
 
     fn read_flags() -> OpenFlags {
         OpenFlags { read: true, ..OpenFlags::default() }
+    }
+
+    /// **`set_times` stamps the file's times**, read back from the host's own metadata; a
+    /// directory is refused and a missing file is `NotFound`.
+    #[test]
+    fn set_times_stamps_a_file_and_refuses_a_directory() {
+        let scratch = Scratch::new("settimes");
+        let fs = scratch.fs();
+        std::fs::write(scratch.0.join("f"), b"x").expect("a file");
+        std::fs::create_dir(scratch.0.join("d")).expect("a directory");
+        let at = |seconds: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        fs.set_times(b"/f", at(1_000_000_000), at(1_234_567_890)).expect("stamped");
+        let modified = std::fs::metadata(scratch.0.join("f")).and_then(|m| m.modified()).expect("mtime");
+        assert_eq!(modified, at(1_234_567_890));
+        let error = fs.set_times(b"/d", at(1), at(1)).expect_err("a directory");
+        assert_eq!(error.kind(), Some(FsErrorKind::Other), "{error}");
+        let error = fs.set_times(b"/missing", at(1), at(1)).expect_err("no such file");
+        assert_eq!(error.kind(), Some(FsErrorKind::NotFound), "{error}");
     }
 
     /// **A descriptor names the path it was opened by**, and only while it is held: two files

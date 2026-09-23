@@ -1554,6 +1554,56 @@ pub(super) fn mkdir(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int utime(const char *filename, const struct utimbuf *times)`
+///
+/// `struct utimbuf` on LP64 is `{ time_t actime; time_t modtime; }`, two 64-bit seconds; a null
+/// `times` means **now** for both, as POSIX says. Returns 0, or -1 with `errno`.
+///
+/// MEASURED reader: a guest worker (started at link `0x2217f04`) on the **second** launch of a
+/// kept data directory, under the engine's HTTP cache (`0x2313b04`) -- stamping a cached
+/// response it has just used, a path a fresh install never takes.
+pub(super) fn utime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (path, times) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let bytes = path_for(view.blaming(0), path, 0)?;
+        let (accessed, modified) = if times == 0 {
+            let now = std::time::SystemTime::now();
+            (now, now)
+        } else {
+            let raw = view.mem().read_bytes(
+                guest_address(&view, times)?,
+                16,
+                Blame::new(view.symbol(), view.address(), 1),
+            )?;
+            let seconds = |at: usize| i64::from_le_bytes(raw[at..at + 8].try_into().expect("eight bytes"));
+            let when = |seconds: i64| {
+                let magnitude = std::time::Duration::from_secs(seconds.unsigned_abs());
+                if seconds >= 0 {
+                    std::time::UNIX_EPOCH + magnitude
+                } else {
+                    std::time::UNIX_EPOCH - magnitude
+                }
+            };
+            (when(seconds(0)), when(seconds(8)))
+        };
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.set_times(&bytes, accessed, modified))? {
+            Settled::Done(()) => 0,
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `int rmdir(const char *pathname)`
 pub(super) fn rmdir(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     one_path(c, |fs, path| fs.rmdir(path))

@@ -286,6 +286,13 @@ pub const fn ferror(stream: &Stream) -> i32 {
     }
 }
 
+/// `void clearerr(FILE *stream)` -- C17 7.21.10.1: clear **both** indicators, end of file and
+/// error.
+pub fn clearerr(stream: &mut Stream) {
+    stream.eof = false;
+    stream.error = false;
+}
+
 /// `int fflush(FILE *stream)`
 ///
 /// # What a failure tells the guest, and where the number comes from
@@ -1036,6 +1043,16 @@ mod tests {
     use crate::memory::Fault;
     use crate::mock::MockMemory;
     use std::cell::RefCell;
+
+    /// `clearerr` clears **both** indicators and leaves the descriptor: one that cleared only
+    /// end of file (what a seek does) fails the error half.
+    #[test]
+    fn clearerr_clears_end_of_file_and_the_error_indicator() {
+        let mut stream = Stream { fd: 7, eof: true, error: true };
+        clearerr(&mut stream);
+        assert_eq!(stream, Stream::new(7));
+        assert_eq!((feof(&stream), ferror(&stream)), (0, 0));
+    }
 
     /// A descriptor table over byte vectors, with a read position per descriptor.
     ///

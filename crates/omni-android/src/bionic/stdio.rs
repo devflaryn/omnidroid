@@ -543,6 +543,21 @@ pub(super) fn ferror(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `void clearerr(FILE *stream)` -- both indicators cleared, in the host-side table `feof` and
+/// `ferror` read.
+///
+/// MEASURED reader: a guest worker (started at link `0x284d168`) on the **second** launch of a
+/// kept data directory, at `0x4ece754` -- a code path a fresh install never takes.
+pub(super) fn clearerr(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let file = c.args().next_u64()?;
+    with_stream(c, file, |_, _, stream| {
+        stdio::clearerr(stream);
+        Ok(())
+    })?;
+    c.ret().void();
+    Ok(())
+}
+
 /// `int fseeko(FILE *stream, off_t offset, int whence)`
 ///
 /// A seek on the stream's descriptor and **the end-of-file indicator cleared**, which C17

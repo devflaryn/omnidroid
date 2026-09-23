@@ -923,6 +923,24 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          never owed a run, because fork is unbound and nothing forks.",
     ),
     (
+        "atof",
+        "M6, the second launch of a kept data directory once clearerr and utime were bound: the \
+         engine's main thread (started at link 0x22076f8) died on it at 0x238bfc8. \
+         omni_bionic::numerics::atof had existed beside strtod, unbound.",
+    ),
+    (
+        "clearerr",
+        "M6, the second launch of a kept data directory (OMNI_DATA_DIR): a worker started at link \
+         0x284d168 died on it at 0x4ece754 -- \"the guest called the imported symbol `clearerr` \
+         through its thunk ..., and nothing in the compatibility layer implements it\". A fresh \
+         install never takes that path.",
+    ),
+    (
+        "utime",
+        "M6, the same second launch: a worker started at link 0x2217f04 died on it under the \
+         engine's HTTP cache (0x2313b04), stamping a cached response.",
+    ),
+    (
         "ferror",
         "M6, once the engine settings reached a live engine: the worker running \
          SingleSurfaceApp::initializeWithAppStarter died on it -- \"the guest called the imported \
@@ -1004,7 +1022,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 302, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 305, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1097,7 +1115,10 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`sem_init`, `sem_destroy`, `sem_wait` and `sem_post`, for 287**: FMOD's thread start on
     // the logged-out landing, onto `omni_bionic::sem`, which had never been bound.
     // **`setpriority`, for 288**: FMOD's thread trampoline, `PRIO_PROCESS` for the caller.
-    assert_eq!(Bionic::inline_symbols().count(), 288);
+    // **`clearerr` and `utime`, for 290**: the second launch of a kept data directory -- a
+    // worker's stream, and the engine's HTTP cache stamping a response. **`atof`, for 291**: the
+    // engine's main thread on the same second launch.
+    assert_eq!(Bionic::inline_symbols().count(), 291);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -1955,6 +1976,7 @@ fn setjmp_returns_zero_and_longjmp_still_refuses() {
 /// through `X0` and returns `S0`, and `round` is half away from zero.
 #[test]
 fn libm_single_and_double_precision_through_real_thunks() {
+    // (`atof` has its own test below: it takes a string, not a double.)
     let _guard = serialized();
     let f = fixture();
     let data = f.guest.data;
@@ -5767,6 +5789,104 @@ fn the_three_standard_streams_are_streams_over_the_descriptors_posix_reserves() 
 ///
 /// The end-of-file half is the one a plausible implementation misses: a seek that moved the
 /// descriptor and left `feof` sticky would read correctly and report end of file for ever after.
+/// **`atof` is `strtod(s, NULL)` through the guest's own call**, the double in `D0`: a whole
+/// number, and one whose parse stops at a trailing letter -- a binding that returned an integer
+/// register, or parsed nothing, fails a line.
+#[test]
+fn atof_parses_the_guests_string_into_d0() {
+    let _guard = serialized();
+    let f = fixture();
+    let data = f.guest.data;
+    let run = |text: &[u8]| {
+        let string = f.cstring(data + 0x200, text);
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(22, data as u64);
+        asm.mov(0, string as u64);
+        asm.bl(f.thunk("atof"));
+        asm.push(str_d(0, 22, 0));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        let mut cpu = f.guest.thread(&f.boundary);
+        f.run(&mut cpu, entry).expect("the run must complete");
+        f64::from_bits(f.guest.read_u64(data))
+    };
+    assert_eq!(run(b"  -12.5e1"), -125.0);
+    assert_eq!(run(b"3.25x"), 3.25);
+}
+
+/// **`clearerr` clears both indicators, through the guest's own call**: read to the end and fail
+/// a write, so `feof` and `ferror` are both 1, and after `clearerr` both are 0 -- a binding that
+/// cleared one, or none, fails a line.
+#[test]
+fn clearerr_clears_end_of_file_and_the_error_indicator_the_guest_reads() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("clearerr");
+    std::fs::write(scratch.path("c.txt"), b"ab").expect("a host file");
+    let path = f.cstring(f.guest.data + 0x100, b"/c.txt");
+    let mode = f.cstring(f.guest.data + 0x140, b"r");
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, mode as u64);
+    });
+    assert_ne!(stream, 0, "fopen returned NULL");
+    let buf = f.guest.data + 0x400;
+    let fgets = || {
+        value_of(&f, "fgets", |asm| {
+            asm.mov(0, buf as u64);
+            asm.mov(1, 64);
+            asm.mov(2, stream);
+        })
+    };
+    assert_eq!(fgets(), buf as u64);
+    assert_eq!(fgets(), 0, "end of file");
+    value_of(&f, "fputc", |asm| {
+        asm.mov(0, u64::from(b'x'));
+        asm.mov(1, stream);
+    });
+    assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 1);
+    assert_eq!(value_of(&f, "ferror", |asm| { asm.mov(0, stream); }) as i64, 1);
+    value_of(&f, "clearerr", |asm| { asm.mov(0, stream); });
+    assert_eq!(value_of(&f, "feof", |asm| { asm.mov(0, stream); }) as i64, 0, "end of file cleared");
+    assert_eq!(value_of(&f, "ferror", |asm| { asm.mov(0, stream); }) as i64, 0, "the error cleared");
+}
+
+/// **`utime` stamps the file the guest names**, read back from the host's metadata: the
+/// `utimbuf`'s `modtime` exactly, a null `times` as now, `-1` for a missing file, and a refusal
+/// for a directory.
+#[test]
+fn utime_stamps_the_file_from_the_guests_utimbuf() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("utime");
+    std::fs::write(scratch.path("u.txt"), b"u").expect("a host file");
+    std::fs::create_dir(scratch.path("d")).expect("a directory");
+    let path = f.cstring(f.guest.data + 0x100, b"/u.txt");
+    let times = f.guest.data + 0x400;
+    f.guest.write_u64(times, 1_000_000_000);
+    f.guest.write_u64(times + 8, 1_234_567_890);
+    let utime = |path: omni_cpu::GuestAddr, times: u64| {
+        value_of(&f, "utime", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, times);
+        }) as i64
+    };
+    let modified = || std::fs::metadata(scratch.path("u.txt")).and_then(|m| m.modified()).expect("mtime");
+    assert_eq!(utime(path, times as u64), 0);
+    assert_eq!(modified(), std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890));
+    assert_eq!(utime(path, 0), 0, "a null utimbuf is now");
+    let age = std::time::SystemTime::now().duration_since(modified()).unwrap_or_default();
+    assert!(age < std::time::Duration::from_secs(60), "stamped {age:?} ago");
+    let missing = f.cstring(f.guest.data + 0x140, b"/nope");
+    assert_eq!(utime(missing, 0), -1);
+    let dir = f.cstring(f.guest.data + 0x180, b"/d");
+    let error = refusal_of(&f, "utime", |asm| {
+        asm.mov(0, dir as u64);
+        asm.mov(1, 0);
+    });
+    assert!(error.to_string().contains("directory"), "{error}");
+}
+
 #[test]
 fn fseeko_moves_the_stream_and_clears_end_of_file_and_ftello_reports_it() {
     let _guard = serialized();
