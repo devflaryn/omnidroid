@@ -10114,10 +10114,12 @@ fn getaddrinfo_reports_the_bionic_eai_codes_and_not_the_hosts() {
 /// this file already make: a symbol that becomes implemented has to be **moved**, and what
 /// replaces it must be something that genuinely is not.
 ///
-/// `SO_LINGER` (option 13 at `SOL_SOCKET`) is what replaced it. It is a real option, it is
-/// imported-but-never-called territory, and nothing in `omni_platform::net::SocketOption` has a
-/// variant for it -- so the refusal it produces is the contract this test is about. The
-/// `SO_KEEPALIVE` end of the story is asserted by *calling* it, in
+/// `SO_LINGER` (option 13 at `SOL_SOCKET`) is what replaced it -- **and it happened again**:
+/// the engine's game-socket setup reached `SO_LINGER` and `9cf6e10` implemented it without moving
+/// this test, which went red the same way (2026-09-23). It now uses `SO_OOBINLINE` (option 10 at
+/// `SOL_SOCKET`): a real option with no variant in `omni_platform::net::SocketOption`, and DECODED
+/// as never passed -- none of `libroblox.so`'s 50 `setsockopt` call sites loads 10 at
+/// `SOL_SOCKET`. The `SO_KEEPALIVE` end of the story is asserted by *calling* it, in
 /// `the_keep_alive_timing_options_reach_the_socket_in_the_guests_numbering`.
 /// **`IP_MTU_DISCOVER` = `IP_PMTUDISC_DO` sets don't-fragment, as ngtcp2 asks**, and the modes
 /// with no host spelling -- or the other family's level -- are refused by name rather than
@@ -10170,13 +10172,13 @@ fn an_unimplemented_socket_option_is_refused_with_its_own_numbers() {
     let error = refusal_of(&f, "setsockopt", |asm| {
         asm.mov(0, fd as u64);
         asm.mov(1, 1); // SOL_SOCKET
-        asm.mov(2, 13); // SO_LINGER, which nothing implements
+        asm.mov(2, 10); // SO_OOBINLINE, which nothing implements and nothing calls
         asm.mov(3, value as u64);
         asm.mov(4, 4);
     });
     assert_eq!(error.symbol(), Some("setsockopt"), "{error:?}");
     let text = error.to_string();
-    assert!(text.contains("option 13"), "the number the guest passed: {text}");
+    assert!(text.contains("option 10"), "the number the guest passed: {text}");
     assert!(text.contains("level 1"), "and the level: {text}");
     assert!(text.contains("SO_RCVBUF"), "and what IS implemented: {text}");
     assert!(
