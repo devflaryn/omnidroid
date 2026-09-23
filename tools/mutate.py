@@ -179,6 +179,10 @@ JNI_INPUT = "crates/omni-android/src/jni/input.rs"
 # And `vk.g`, the hardware-key path, with the window seam's physical-key decode it depends on.
 JNI_KEYS = "crates/omni-android/src/jni/keys.rs"
 PLAT_WINDOW_WINDOWS = "crates/omni-platform/src/window/windows.rs"
+# `/proc/meminfo` and `/proc/self/statm`: the adapter's two generated files, the seam's generated
+# file kind they are served through, and the process-memory snapshot `statm` is read from.
+ADAPTER_PROCFS = "crates/omni-android/src/bionic/procfs.rs"
+PLAT_VM_WINDOWS = "crates/omni-platform/src/vm/windows.rs"
 
 
 # Commands, kept narrow so the whole run stays under a few minutes.
@@ -284,6 +288,16 @@ INPUT = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "input", "--n
 # `omni-platform`'s unit tests alone. `PLATFORM` names the whole package, whose live network and
 # window targets need a gate and a network; the window backend's key decode is tested in the lib.
 PLATFORM_LIB = ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast"]
+
+# The process-memory snapshot's own target: every field is pinned there by making its quantity
+# move, and nowhere else measures the host's counters. Its own binary because commit charge is
+# per-process (see that file's header).
+PROCESS_MEMORY = [
+    "cargo", "test", "-p", "omni-platform", "--test", "vm_commit_charge", "--no-fail-fast",
+]
+# The adapter's `/proc` files: `procfs`' unit tests (the exact bytes) and the guest-side tests in
+# `bionic` (the engine's own `__open_2` + `pread` + `sscanf`, and `sysinfo` in the same run).
+PROCFS = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "bionic", "--no-fail-fast"]
 
 # M6 groundwork: runtime texture transcoding (`omni-texture`). Zero dependencies and `#![no_std]`,
 # so its command builds in about a second.
@@ -6616,6 +6630,112 @@ directory", ADAPTER_FILES,
      """    let make = ((lparam >> 16) & 0xff) as u32;""",
      """    let make = ((lparam >> 16) & 0xffff) as u32;""",
      PLATFORM_LIB),
+
+    # ---- `/proc/meminfo` and `/proc/self/statm` ------------------------------------------------
+    # MEASURED: every gate run logged `Failed to open` for both, many times a second. The engine
+    # opens each once, keeps the descriptor and `pread`s it at 0 for every reading (`libroblox.so`
+    # `0x2282674`, `0x228296c`). meminfo is the embedding's budget -- `sysinfo`'s own numbers --
+    # and statm is this process as the host measures it; `bionic/procfs.rs` has the table.
+    ("procfs-A1", "A", "the two /proc files are not served, and the engine is told ENOENT again",
+     ADAPTER_MOD,
+     """        procfs::serve(&filesystem, Arc::clone(&self.memory_budget), self.space.page_size())""",
+     """        Ok::<(), omni_platform::fs::FsError>(())""",
+     PROCFS),
+
+    # The engine keeps the descriptor for the life of the run: a file generated once would give it
+    # one memory reading for ever.
+    ("procfs-A2", "A", "a read from offset 0 on a kept descriptor does not generate a new reading",
+     PLAT_FS,
+     """        if offset == 0 || self.snapshot.is_none() {""",
+     """        if self.snapshot.is_none() {""",
+     PLATFORM_LIB),
+
+    ("procfs-A3", "A", "MemFree ignores the commit charge and reports the whole budget free",
+     ADAPTER_PROCFS,
+     """        let free = kb(total.saturating_sub(charged));""",
+     """        let free = kb(total);""",
+     PROCFS),
+
+    # The number this project budgets against, in the field named for residency -- which D10
+    # measured differing from it by 1019 MB for one untouched gigabyte.
+    ("procfs-A4", "A", "statm's resident is the commit charge rather than the working set",
+     ADAPTER_PROCFS,
+     """            resident: pages(memory.resident),""",
+     """            resident: pages(memory.commit_charge),""",
+     PROCFS),
+
+    ("procfs-A5", "A", "statm's shared is the whole working set rather than its shareable part",
+     PLAT_VM_WINDOWS,
+     """        resident_shared: resident.saturating_sub(counters.PrivateWorkingSetSize as u64),""",
+     """        resident_shared: resident,""",
+     PROCESS_MEMORY),
+
+    ("procfs-A6", "A", "statm's size is the whole user address space rather than what is in use",
+     PLAT_VM_WINDOWS,
+     """    Ok(status.ullTotalVirtual.saturating_sub(status.ullAvailVirtual))""",
+     """    Ok(status.ullTotalVirtual)""",
+     PROCESS_MEMORY),
+
+    ("procfs-A7", "A", "meminfo loses Linux's 16-and-8 column layout",
+     ADAPTER_PROCFS,
+     """            let _ = writeln!(text, "{label:<16}{kb:>8} kB");""",
+     """            let _ = writeln!(text, "{label} {kb} kB");""",
+     PROCFS),
+
+    # A file that cannot be produced must be refused by the call that asked, naming why -- here,
+    # the missing budget -- not handed out as a descriptor whose reads then fail.
+    ("procfs-A8", "A", "a generated file that cannot be produced opens anyway, empty",
+     PLAT_FS,
+     """        let first = generate()?;""",
+     """        let first = generate().unwrap_or_default();""",
+     PLATFORM_LIB),
+
+    # **Over-correction: "true of this host"** read as the host's memory. `sysinfo` and
+    # `_SC_PHYS_PAGES` answer the embedding's budget, and this file must say what they say.
+    ("procfs-B1", "B", "MemTotal is a host-sized figure rather than the embedding's budget",
+     ADAPTER_PROCFS,
+     """    Ok(Meminfo::of(total, charged, page).render().into_bytes())""",
+     """    Ok(Meminfo::of(16 << 30, charged, page).render().into_bytes())""",
+     PROCFS),
+
+    # **Over-correction: always fresh.** Generating on every read splices two readings into one
+    # when the file is taken in pieces -- and the adapter's own `pread` takes it in pieces.
+    ("procfs-B2", "B", "every read generates afresh, so a reading in pieces is several readings",
+     PLAT_FS,
+     """        if offset == 0 || self.snapshot.is_none() {""",
+     """        if true {""",
+     PLATFORM_LIB),
+
+    # **Over-correction: permissive.** A /proc file is 0444 and an app is told EACCES for writing.
+    ("procfs-B3", "B", "a generated file can be opened for writing",
+     PLAT_FS,
+     """        if flags.write || flags.truncate {""",
+     """        if false {""",
+     PLATFORM_LIB),
+
+    # **Over-correction: by prefix.** Every /proc path answered by one generator, where a path
+    # nothing serves must stay ENOENT and be recorded as a miss.
+    ("procfs-B4", "B", "every /proc path is served by a generated file",
+     PLAT_FS,
+     """        let generate = Arc::clone(generated.0.get(&name)?);""",
+     """        let generate = Arc::clone(generated.0.get(&name).or_else(|| {
+            name.starts_with("/proc/").then(|| generated.0.values().next()).flatten()
+        })?);""",
+     PLATFORM_LIB),
+
+    ("procfs-B5", "B", "MemAvailable reports the whole budget as reclaimable",
+     ADAPTER_PROCFS,
+     """            mem_available: free,""",
+     """            mem_available: kb(total),""",
+     PROCFS),
+
+    # **Over-correction: the whole image as code.** Linux's `text` is the executable's `PF_X`
+    # span; the image's data is not code.
+    ("procfs-B6", "B", "statm's text spans the whole executable image, data included",
+     PLAT_VM_WINDOWS,
+     """        if characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {""",
+     """        if false && characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {""",
+     PROCESS_MEMORY),
 ]
 
 
