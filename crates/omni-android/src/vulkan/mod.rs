@@ -199,7 +199,7 @@ pub use descriptor::{
 };
 pub use draw::{
     BUFFER_COPY_BYTES, BUFFER_IMAGE_COPY_BYTES, CLEAR_VALUE_BYTES,
-    IMAGE_SUBRESOURCE_LAYERS_BYTES, MAX_BOUND_DESCRIPTOR_SETS, MAX_CLEAR_VALUES, MAX_COPY_REGIONS,
+    IMAGE_COPY_BYTES, IMAGE_SUBRESOURCE_LAYERS_BYTES, MAX_BOUND_DESCRIPTOR_SETS, MAX_CLEAR_VALUES, MAX_COPY_REGIONS,
     MAX_DYNAMIC_OFFSETS, MAX_PUSH_CONSTANT_BYTES, MAX_VERTEX_BUFFER_BINDINGS,
     RENDER_PASS_BEGIN_INFO_BYTES,
 };
@@ -3554,6 +3554,7 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkCmdSetScissor" => draw::cmd_set_scissor(c, &at, &vulkan, args),
         "vkCmdDraw" => draw::cmd_draw(c, &at, &vulkan, args),
         "vkCmdDispatch" => draw::cmd_dispatch(c, &at, &vulkan, args),
+        "vkCmdCopyImage" => draw::cmd_copy_image(c, &at, &vulkan, args),
         "vkCmdDrawIndexed" => draw::cmd_draw_indexed(c, &at, &vulkan, args),
         "vkCmdCopyBuffer" => draw::cmd_copy_buffer(c, &at, &vulkan, args),
         "vkCmdCopyBufferToImage" => draw::cmd_copy_buffer_to_image(c, &at, &vulkan, args),

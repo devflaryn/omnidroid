@@ -3486,6 +3486,28 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkCmdCopyImage`, forwarded. Either image may be of either family, and `regions` is the
+    /// guest's [`IMAGE_COPY_BYTES`](super::IMAGE_COPY_BYTES)-byte `VkImageCopy`s, whole.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_copy_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, source, source_layout, destination, destination_layout, regions);
+        Err(host_has_no(
+            "VulkanHost::cmd_copy_image",
+            "the destination image keeps whatever it held, and what samples it samples that",
+        ))
+    }
+
     /// `vkCmdPushConstants`, forwarded. `values` is the guest's bytes, copied.
     ///
     /// # Errors

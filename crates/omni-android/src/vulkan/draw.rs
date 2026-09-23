@@ -85,6 +85,10 @@ pub const BUFFER_IMAGE_COPY_BYTES: usize = 56;
 /// `sizeof(VkImageSubresourceLayers)`: `aspectMask`, `mipLevel`, `baseArrayLayer`, `layerCount`.
 pub const IMAGE_SUBRESOURCE_LAYERS_BYTES: usize = 16;
 
+/// `sizeof(VkImageCopy)`: `srcSubresource` 0, `srcOffset` 16, `dstSubresource` 28, `dstOffset`
+/// 44, `extent` 56 -- all four-byte members, so no padding anywhere.
+pub const IMAGE_COPY_BYTES: usize = 68;
+
 // ------------------------------------------------------------------------------ the bounds
 
 /// How many `VkClearValue`s one `vkCmdBeginRenderPass` reads. One per render-pass attachment.
@@ -540,6 +544,31 @@ pub(super) fn cmd_copy_buffer_to_image(
     Ok(())
 }
 
+/// `void vkCmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage,
+/// VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout,
+/// uint32_t regionCount, const VkImageCopy *pRegions)`
+///
+/// Seven parameters, all in registers. MEASURED: the renderer's first, after its first dispatch,
+/// copies one region from an image in `TRANSFER_SRC_OPTIMAL` to one in `TRANSFER_DST_OPTIMAL`.
+/// **Either image may be of either family**, as `vkCmdCopyBufferToImage`'s destination may.
+pub(super) fn cmd_copy_image(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCmdCopyImage";
+    let host = vulkan.require_host(at)?;
+    let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    let source = vulkan.image_ref_token(at, CALL, args[1])?;
+    let destination = vulkan.image_ref_token(at, CALL, args[3])?;
+    let regions =
+        read_regions(c, at, CALL, "pRegions", "VkImageCopy", IMAGE_COPY_BYTES, args[5], args[6], 6)?;
+    host.cmd_copy_image(buffer, source, args[2] as u32, destination, args[4] as u32, &regions)?;
+    c.ret().void();
+    Ok(())
+}
+
 /// `void vkCmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
 /// VkShaderStageFlags stageFlags, uint32_t offset, uint32_t size, const void *pValues)`
 pub(super) fn cmd_push_constants(
@@ -668,6 +697,8 @@ mod tests {
         assert_eq!(16 + IMAGE_SUBRESOURCE_LAYERS_BYTES, 32, "imageOffset starts here");
         assert_eq!(32 + 3 * 4, 44, "and imageExtent here");
         assert_eq!(BUFFER_IMAGE_COPY_BYTES, 44 + 3 * 4);
+        // Two subresources, two offsets and an extent, every member four bytes.
+        assert_eq!(IMAGE_COPY_BYTES, 2 * IMAGE_SUBRESOURCE_LAYERS_BYTES + 3 * 3 * 4);
     }
 
     /// **`vertexOffset` is signed and stays signed.** A `u32` widened to `i32` the wrong way

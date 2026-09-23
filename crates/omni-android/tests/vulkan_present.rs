@@ -62,7 +62,7 @@ use omni_android::vulkan::{
     HostDescriptorSetLayout, HostDevice, HostDeviceMemory, HostExtension, HostFence, HostImage,
     HostImageRef, HostImageView, HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache,
     HostPipelineLayout, HostQueryPool, HostQueue, HostRenderPass, HostSampler, HostSemaphore,
-    HostShaderModule, QueryPoolRequest, QUERY_POOL_CREATE_INFO_BYTES,
+    HostShaderModule, QueryPoolRequest, QUERY_POOL_CREATE_INFO_BYTES, IMAGE_COPY_BYTES,
     DescriptorWrites, DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES,
     DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES, STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
     HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
@@ -370,6 +370,8 @@ struct HostLog {
     query_commands: Vec<(&'static str, HostQueryPool, u32, u32)>,
     /// Every `vkCmdDispatch`'s three group counts.
     dispatches: Vec<[u32; 3]>,
+    /// Every `vkCmdCopyImage`: source and its layout, destination and its layout, the regions.
+    image_copies: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>)>,
 }
 
 /// The measured memory table of this machine, which the double reports so that the rewrite is
@@ -620,6 +622,7 @@ impl VulkanHost for StageFourHost {
                 | "vkCreateGraphicsPipelines"
                 | "vkCreateComputePipelines"
                 | "vkCmdDispatch"
+                | "vkCmdCopyImage"
                 | "vkDestroyPipeline"
                 | "vkCreateDescriptorSetLayout"
                 | "vkDestroyDescriptorSetLayout"
@@ -1112,6 +1115,25 @@ impl VulkanHost for StageFourHost {
 
     fn cmd_dispatch(&self, _buffer: HostCommandBuffer, x: u32, y: u32, z: u32) -> AbiResult<()> {
         self.log().dispatches.push([x, y, z]);
+        Ok(())
+    }
+
+    fn cmd_copy_image(
+        &self,
+        _buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        self.log().image_copies.push((
+            source,
+            source_layout,
+            destination,
+            destination_layout,
+            regions.to_vec(),
+        ));
         Ok(())
     }
 
@@ -2059,6 +2081,64 @@ fn a_dispatch_carries_its_three_group_counts_in_order() {
     let text = f.refusal(name("vkCmdDispatch"), &[command_pool, 1, 1, 1]).to_string();
     assert!(text.contains("vkCmdDispatch"), "a command pool is not a command buffer: {text}");
     assert_eq!(up.host.log().dispatches.len(), 2, "the refused one recorded nothing");
+}
+
+/// **`vkCmdCopyImage` carries each image with its own layout, in order, and the regions whole.**
+///
+/// The source is an image the guest created and the destination a swapchain image, so the two
+/// arrive as different families: a shim that swapped the images, or the layouts, is caught.
+#[test]
+fn an_image_copy_carries_each_image_with_its_own_layout() {
+    let _serial = serialized();
+    let up = up_to_a_device("copy-image");
+    let f = &up.f;
+    let name = |call: &str| f.resolve_device(up.get_proc, up.device, call);
+    let out = f.alloc(8);
+    let pool_info = f.command_pool_info(POOL_RESET_COMMAND_BUFFER, 0);
+    f.call(name("vkCreateCommandPool"), [up.device, pool_info, 0, out]).expect("command pool");
+    let command_pool = f.guest.read_u64(out as GuestAddr);
+    let buffers_at = f.alloc(8);
+    f.call(
+        name("vkAllocateCommandBuffers"),
+        [up.device, f.command_buffer_allocate_info(command_pool, 1), buffers_at, 0],
+    )
+    .expect("a command buffer");
+    let command = f.guest.read_u64(buffers_at as GuestAddr);
+
+    let info = f.image_info(8, 8, FORMAT_B8G8R8A8_UNORM, IMAGE_USAGE_TEXTURE);
+    f.call(name("vkCreateImage"), [up.device, info, 0, out]).expect("an image");
+    let created = f.guest.read_u64(out as GuestAddr);
+    let info = f.swapchain_info(up.surface, 2, FORMAT_B8G8R8A8_UNORM, 8, 8, SWAPCHAIN_USAGE, 1, 0);
+    f.call(name("vkCreateSwapchainKHR"), [up.device, info, 0, out]).expect("swapchain");
+    let swapchain = f.guest.read_u64(out as GuestAddr);
+    let count_at = f.alloc(8);
+    f.call(name("vkGetSwapchainImagesKHR"), [up.device, swapchain, count_at, 0]).expect("count");
+    let images_at = f.alloc(f.read_u32(count_at) as usize * 8);
+    f.call(name("vkGetSwapchainImagesKHR"), [up.device, swapchain, count_at, images_at])
+        .expect("images");
+    let presented = f.guest.read_u64(images_at as GuestAddr);
+
+    // One region, every one of its seventeen words different.
+    let region: Vec<u8> = (1u32..=17).flat_map(|word| (word * 0x0101).to_le_bytes()).collect();
+    assert_eq!(region.len(), IMAGE_COPY_BYTES);
+    let regions = f.bytes(&region);
+    // TRANSFER_SRC_OPTIMAL (6) and TRANSFER_DST_OPTIMAL (7), as the engine passes them.
+    f.call_n(name("vkCmdCopyImage"), &[command, created, 6, presented, 7, 1, regions])
+        .expect("the copy is recorded");
+    let copies = up.host.log().image_copies.clone();
+    assert_eq!(copies.len(), 1);
+    let (source, source_layout, destination, destination_layout, bytes) = &copies[0];
+    assert!(matches!(source, HostImageRef::Created(_)), "the source is the created one: {source:?}");
+    assert!(
+        matches!(destination, HostImageRef::Swapchain(_)),
+        "the destination is the swapchain's: {destination:?}"
+    );
+    assert_eq!((*source_layout, *destination_layout), (6, 7), "each layout with its own image");
+    assert_eq!(bytes, &region, "the region, whole");
+
+    let text = f.refusal(name("vkCmdCopyImage"), &[command, created, 6, presented, 7, 0, regions]);
+    assert!(text.to_string().contains("regionCount = 0"), "{text}");
+    assert_eq!(up.host.log().image_copies.len(), 1, "the refused one recorded nothing");
 }
 
 /// **The two-call protocol, the stable handles, and what a destroyed swapchain does to them.**

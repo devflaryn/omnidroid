@@ -4819,6 +4819,36 @@ impl VulkanHost for GfxVulkanHost {
         Ok(())
     }
 
+    fn cmd_copy_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_copy_image";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let source_handle = self.image_handle(source, "vkCmdCopyImage")?;
+        let destination_handle = self.image_handle(destination, "vkCmdCopyImage")?;
+        let built = flat_list(METHOD, regions, "VkImageCopy", image_copy_from_bytes)?;
+        // SAFETY: the command buffer is live and recording, both images are live, and each is in
+        // the layout the guest named -- its responsibility, which the driver reports if a barrier
+        // before it was wrong.
+        unsafe {
+            device.cmd_copy_image(
+                handle,
+                source_handle,
+                vk::ImageLayout::from_raw(source_layout as i32),
+                destination_handle,
+                vk::ImageLayout::from_raw(destination_layout as i32),
+                &built,
+            );
+        }
+        Ok(())
+    }
+
     fn cmd_push_constants(
         &self,
         buffer: HostCommandBuffer,
@@ -6551,6 +6581,7 @@ fn buffer_image_copies_from_bytes(
 flat_structure!(viewport_from_bytes, vk::Viewport, "VkViewport");
 flat_structure!(buffer_copy_from_bytes, vk::BufferCopy, "VkBufferCopy");
 flat_structure!(buffer_image_copy_from_bytes, vk::BufferImageCopy, "VkBufferImageCopy");
+flat_structure!(image_copy_from_bytes, vk::ImageCopy, "VkImageCopy");
 flat_structure!(
     blend_attachment_from_bytes,
     vk::PipelineColorBlendAttachmentState,
@@ -6831,6 +6862,7 @@ mod tests {
             std::mem::size_of::<vk::ComputePipelineCreateInfo<'_>>(),
             guest::COMPUTE_PIPELINE_CREATE_INFO_BYTES
         );
+        assert_eq!(std::mem::size_of::<vk::ImageCopy>(), guest::IMAGE_COPY_BYTES);
         assert_eq!(
             vk::StructureType::DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO.as_raw(),
             i32::try_from(guest::STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO).expect("an sType")
