@@ -71,6 +71,8 @@ mod windows;
 use windows as backend;
 
 #[cfg(unix)]
+// macOS has its own backend (`macos.rs`) and does not use the shared unix body.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod unix;
 
 #[cfg(target_os = "linux")]
@@ -321,7 +323,10 @@ mod tests {
     /// assertion is 2^-512, which is not a flake risk — this is not a randomness *quality* test
     /// and does not pretend to be one.
     #[test]
-    #[cfg_attr(not(target_os = "windows"), ignore = "no entropy backend on this target")]
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos")),
+        ignore = "no entropy backend on this target"
+    )]
     fn random_bytes_fills_the_whole_buffer_and_does_not_repeat() {
         let mut first = [0u8; 64];
         let mut second = [0u8; 64];
@@ -357,7 +362,10 @@ mod tests {
     /// burning one 100 ms wall interval for the discrimination. The busy-loop bound is the OS's
     /// accounting quantum rather than the elapsed time, because the charge arrives in ticks.
     #[test]
-    #[cfg_attr(not(target_os = "windows"), ignore = "no process-cpu-time backend on this target")]
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos")),
+        ignore = "no process-cpu-time backend on this target"
+    )]
     fn process_cpu_time_advances_with_work_and_outruns_the_wall_clock() {
         use std::time::Instant;
 
@@ -432,7 +440,10 @@ mod tests {
     #[test]
     fn process_cpu_time_is_answered_or_refused_by_name() {
         match cpu_time() {
-            Ok(_) => assert!(cfg!(target_os = "windows"), "only Windows has a cpu-time backend"),
+            Ok(_) => assert!(
+                cfg!(any(target_os = "windows", target_os = "macos")),
+                "only Windows and macOS have a cpu-time backend"
+            ),
             Err(error) => {
                 assert!(error.is_unsupported(), "{error}");
                 let text = error.to_string();
@@ -448,7 +459,10 @@ mod tests {
     #[test]
     fn the_current_cpu_is_answered_or_refused_by_name() {
         match current_cpu() {
-            Ok(_) => assert!(cfg!(target_os = "windows"), "only Windows has a cpu-id backend"),
+            Ok(_) => assert!(
+                cfg!(any(target_os = "windows", target_os = "macos")),
+                "only Windows and macOS have a cpu-id backend"
+            ),
             Err(error) => {
                 assert!(error.is_unsupported(), "{error}");
                 let text = error.to_string();

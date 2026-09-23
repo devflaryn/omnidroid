@@ -109,3 +109,60 @@ ROWS = [
             libc::PROT_READ | libc::PROT_WRITE,""",
      VM_TESTS),
 ]
+
+FS = "crates/omni-platform/src/fs/macos.rs"
+PROCESS = "crates/omni-platform/src/process/macos.rs"
+LIB_TESTS = ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast"]
+
+ROWS += [
+    ("mac-plat-C1", "A", "fallocate only moves the end of file, leaving a sparse tail",
+     FS,
+     """    // SAFETY: `store` is a live fstore_t the call reads and updates; the descriptor is `file`'s.
+    let mut rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };""",
+     """    let _ = &mut store;
+    let mut rc = 0;""",
+     LIB_TESTS),
+    ("mac-plat-C2", "A", "fallocate to a smaller end shrinks the file",
+     FS,
+     """    if end <= size {
+        return Ok(());
+    }""",
+     """    if end == size {
+        return Ok(());
+    }""",
+     LIB_TESTS),
+    ("mac-plat-C3", "A", "pread moves the descriptor offset (seek then read)",
+     FS,
+     """    file.read_at(buf, offset).map_err(|error| FsError::io("pread", "a descriptor", &error))""",
+     """    use std::io::{Read, Seek, SeekFrom};
+    let mut handle: &File = file;
+    handle.seek(SeekFrom::Start(offset)).map_err(|error| FsError::io("pread", "a descriptor", &error))?;
+    handle.read(buf).map_err(|error| FsError::io("pread", "a descriptor", &error))""",
+     LIB_TESTS),
+    ("mac-plat-C4", "A", "statvfs never reports a read-only volume",
+     FS,
+     """        read_only: stats.f_flags & libc::MNT_RDONLY as u32 != 0,""",
+     """        read_only: false,""",
+     LIB_TESTS),
+    ("mac-plat-C5", "A", "sched_getcpu answers a constant 0",
+     PROCESS,
+     """    u32::try_from(cpu).map_err(|_| ProcessError::Errno {""",
+     """    let cpu: libc::size_t = 0;
+    u32::try_from(cpu).map_err(|_| ProcessError::Errno {""",
+     LIB_TESTS),
+    ("mac-plat-C6", "A", "the audio band (nice -16) gets USER_INITIATED instead of USER_INTERACTIVE",
+     PROCESS,
+     """        i32::MIN..=-11 => QOS_CLASS_USER_INTERACTIVE,""",
+     """        i32::MIN..=-11 => QOS_CLASS_USER_INITIATED,""",
+     LIB_TESTS),
+    ("mac-plat-C7", "B", "nice 0 raises the thread above where it started",
+     PROCESS,
+     """        0 => QOS_CLASS_DEFAULT,""",
+     """        0 => QOS_CLASS_USER_INITIATED,""",
+     LIB_TESTS),
+    ("mac-plat-C8", "A", "process CPU time is read from the thread's clock, not the process's",
+     PROCESS,
+     """    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut now) } != 0 {""",
+     """    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) } != 0 {""",
+     LIB_TESTS),
+]
