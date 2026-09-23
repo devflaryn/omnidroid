@@ -255,9 +255,13 @@ define_class!(
         }
 
         /// The raw half first, then the translated half: `interpretKeyEvents:` hands the event
-        /// to the input method, which answers through `insertText:replacementRange:`. **Not while
-        /// Command is held**: Command+key is a shortcut, not typing -- the analogue of Windows'
-        /// `WM_SYSKEYDOWN`, which produces no `WM_CHAR`.
+        /// to the input method, which answers through `insertText:replacementRange:`.
+        ///
+        /// No guard for Command here, and that is measured rather than forgotten: AppKit's input
+        /// context inserts no text for a Command+key event (Command+A produces a `KeyDown` and no
+        /// `Text`, `tests/window_macos.rs`), which is the analogue of Windows' `WM_SYSKEYDOWN`
+        /// producing no `WM_CHAR`. A guard here was tried, and removing it changed nothing any
+        /// test could see (VERIFICATION entry 12).
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let kvk = event.keyCode();
@@ -266,9 +270,7 @@ define_class!(
                 scancode: keys::scancode_of(kvk),
                 repeat: event.isARepeat(),
             });
-            if !event.modifierFlags().contains(NSEventModifierFlags::Command) {
-                self.interpretKeyEvents(&NSArray::from_slice(&[event]));
-            }
+            self.interpretKeyEvents(&NSArray::from_slice(&[event]));
         }
 
         #[unsafe(method(keyUp:))]
@@ -408,6 +410,16 @@ define_class!(
 );
 
 /// `true` for a character a text box should receive: not a C0 control, not DEL (the seam's rule,
+/// `WindowEvent::Text`), and not in Apple's function-key range.
+///
+/// **Which input reaches this.** From the keyboard through AppKit's own input context, none of
+/// these arrive: keys that carry a control code are turned into commands (`doCommandBySelector:`)
+/// or dropped before `insertText:` (MEASURED: Return, Escape, Tab, Control+Q and F13 type nothing,
+/// `tests/window_macos.rs`). The filter is for the other callers of `insertText:replacementRange:`
+/// -- an input method or the Character Viewer hands over whatever string it has, and the test that
+/// pins this calls the method as they do.
+///
+/// Details of the rule: not a C0 control, not DEL (the seam's rule,
 /// `WindowEvent::Text`), and not in `U+F700..=U+F8FF`, which `NSEvent.h` reserves for the function
 /// keys ("Unicodes we reserve for function keys on the keyboard") -- keys pressed for their
 /// effect, already reported as `KeyDown`.

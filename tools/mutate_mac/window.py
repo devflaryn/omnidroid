@@ -43,9 +43,13 @@ ROWS = [
      """        0x3C => Some(0x0000_0002), // kVK_RightShift: NX_DEVICERSHIFTKEYMASK""",
      _WIN),
 
-    ("mac-win-A4", "A", "Command+key typed as text", _APPKIT,
-     """            if !event.modifierFlags().contains(NSEventModifierFlags::Command) {""",
-     """            if true || !event.modifierFlags().contains(NSEventModifierFlags::Command) {""",
+    # No row for Command+key: AppKit's input context inserts no text for it, so the guard that once
+    # stood in `keyDown:` was unreachable (its row came back NOT CAUGHT) and was deleted
+    # (VERIFICATION entry 12). The host fact stays asserted in the keys test.
+
+    ("mac-win-A22", "A", "the pump leaves a Command key-up to NSApplication, which drops it", _APPKIT,
+     """    if event.r#type() == NSEventType::KeyUp && event.modifierFlags().contains(NSEventModifierFlags::Command) {""",
+     """    if false && event.r#type() == NSEventType::KeyUp && event.modifierFlags().contains(NSEventModifierFlags::Command) {""",
      _WIN),
 
     ("mac-win-A5", "A", "control characters passed on as text", _APPKIT,

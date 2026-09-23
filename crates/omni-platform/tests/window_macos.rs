@@ -317,6 +317,54 @@ fn keys_carry_the_virtual_key_and_the_physical_set1_code_and_type_text() {
     }
 }
 
+/// **A key released while Command is held still comes up.** `-[NSApplication sendEvent:]` does not
+/// deliver such a key-up to the key window; the backend's pump sends it to its window itself. The
+/// events go through the application's queue (`postEvent:atStart:`), the path real input takes.
+#[test]
+#[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+fn a_key_released_with_command_held_is_reported_up() {
+    require_gate();
+    let mut window = open("omnidroid: command up", 320, 240);
+    window.show();
+    poll_until(&mut window, "the focus", |e| *e == WindowEvent::FocusChanged { focused: true });
+    let (ns_window, _) = handles(&window);
+    for down in [true, false] {
+        on_main(|| {
+            let number: isize = unsafe { msg_send![object(ns_window), windowNumber] };
+            let text = NSString::from_str("k");
+            let kind: usize = if down { 10 } else { 11 };
+            let event: Option<Retained<AnyObject>> = unsafe {
+                msg_send![class!(NSEvent), keyEventWithType: kind, location: NSPoint::new(0.0, 0.0),
+                    modifierFlags: (1_usize << 20), timestamp: 0.0_f64, windowNumber: number,
+                    context: core::ptr::null::<AnyObject>(), characters: &*text,
+                    charactersIgnoringModifiers: &*text, isARepeat: false, keyCode: 0x28_u16]
+            };
+            let app: Retained<AnyObject> = unsafe { msg_send![class!(NSApplication), sharedApplication] };
+            let _: () = unsafe { msg_send![&*app, postEvent: &*event.unwrap(), atStart: false] };
+        });
+    }
+    let seen = poll_until(&mut window, "the key-up", |e| matches!(e, WindowEvent::KeyUp { keycode: 0x28, .. }));
+    assert!(seen.contains(&WindowEvent::KeyDown { keycode: 0x28, scancode: 0x25, repeat: false }), "{seen:?}");
+}
+
+/// What an input method hands `insertText:replacementRange:` is filtered to text: called as
+/// `NSTextInputContext` calls it, with a string mixing characters, control codes and Apple's
+/// function-key range, only the characters come out, one event each.
+#[test]
+#[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+fn inserted_text_keeps_characters_and_drops_control_and_function_key_codes() {
+    require_gate();
+    let mut window = open("omnidroid: insert", 320, 240);
+    let (_, ns_view) = handles(&window);
+    on_main(|| {
+        let text = NSString::from_str("a\r\u{F700}é\t😀\u{7F}");
+        let range = objc2_foundation::NSRange::new(usize::MAX >> 1, 0); // NSNotFound
+        let _: () = unsafe { msg_send![object(ns_view), insertText: &*text, replacementRange: range] };
+    });
+    let text = |t: &str| WindowEvent::Text { text: t.to_owned() };
+    assert_eq!(drain(&mut window), vec![text("a"), text("é"), text("😀")]);
+}
+
 /// Modifiers arrive as `flagsChanged:`, and the device-dependent bit decides down or up per side.
 #[test]
 #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
