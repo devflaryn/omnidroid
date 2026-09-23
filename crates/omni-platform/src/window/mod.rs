@@ -67,6 +67,11 @@
 //! `omni-android`'s GameActivity input layer, where it can be checked against what the engine
 //! actually reads. A mapping invented here would be a table this crate cannot test against
 //! anything.
+//!
+//! It also carries the host's number for the **physical** key, raw for the same reason: the guest
+//! is handed a Linux input code for the key's position (`KeyEvent.getScanCode()`), and a layout's
+//! virtual-key code cannot be turned back into a position — the key that types `A` on AZERTY is
+//! the one QWERTY calls `Q`.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -206,6 +211,12 @@ pub enum WindowEvent {
         /// The host's own key number, untranslated — the Win32 virtual-key code on Windows. See
         /// this module's "Keycodes are raw on purpose".
         keycode: u32,
+        /// The host's own number for the **physical** key, untranslated: on Windows the set-1
+        /// make code from bits 16-23 of the message's `LPARAM`, with `0xE000` added when bit 24
+        /// marks an extended (`E0`-prefixed) key — so left Ctrl is `0x1D` and right Ctrl
+        /// `0xE01D`. Zero when the host did not say, which is what input injected with only a
+        /// virtual-key code carries.
+        scancode: u32,
         /// True when this is an auto-repeat rather than a fresh press. The guest's
         /// `AKEY_EVENT_ACTION_DOWN` carries a repeat count, so dropping this would lose
         /// information the guest has a field for.
@@ -215,6 +226,8 @@ pub enum WindowEvent {
     KeyUp {
         /// The host's own key number, untranslated.
         keycode: u32,
+        /// The physical key, as [`WindowEvent::KeyDown`] carries it.
+        scancode: u32,
     },
     /// The window gained or lost keyboard focus.
     ///
@@ -587,8 +600,8 @@ mod tests {
         let repeated = [
             WindowEvent::PointerDown { button: PointerButton::Primary, x: 0, y: 0 },
             WindowEvent::PointerUp { button: PointerButton::Primary, x: 0, y: 0 },
-            WindowEvent::KeyDown { keycode: 65, repeat: false },
-            WindowEvent::KeyUp { keycode: 65 },
+            WindowEvent::KeyDown { keycode: 65, scancode: 0x1E, repeat: false },
+            WindowEvent::KeyUp { keycode: 65, scancode: 0x1E },
             WindowEvent::CloseRequested,
             WindowEvent::FocusChanged { focused: true },
         ];

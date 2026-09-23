@@ -178,6 +178,34 @@ const fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
+/// The physical key a `WM_KEYDOWN`/`WM_KEYUP` names: the set-1 make code in bits 16-23 of its
+/// `LPARAM`, with `0xE000` added when bit 24 -- the extended-key flag -- is set. See
+/// [`WindowEvent::KeyDown`]'s `scancode`.
+///
+/// **The flag is not optional.** Left and right Ctrl share make code `0x1D`, and the arrow keys
+/// share theirs with the numeric keypad's 8/4/6/2; only bit 24 tells them apart.
+const fn scancode_of(lparam: LPARAM) -> u32 {
+    let make = ((lparam >> 16) & 0xff) as u32;
+    if (lparam >> 24) & 1 != 0 { 0xE000 | make } else { make }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `W` pressed, as Win32 packs it: a repeat count of 1 in bits 0-15, make code `0x11` in bits
+    /// 16-23; right Ctrl with the extended flag in bit 24; and a key-up's transition bits 30-31,
+    /// which must not leak into the code.
+    #[test]
+    fn the_scancode_is_the_make_code_and_the_extended_flag() {
+        assert_eq!(scancode_of(0x0011_0001), 0x11);
+        assert_eq!(scancode_of(0x011D_0001), 0xE01D);
+        assert_eq!(scancode_of(0x001D_0001), 0x1D, "left Ctrl is not right Ctrl");
+        assert_eq!(scancode_of(0x0148_0001), 0xE048, "the Up arrow, not keypad 8");
+        assert_eq!(scancode_of(0xC011_0001_u32 as i32 as LPARAM), 0x11, "a key-up's high bits");
+    }
+}
+
 /// The window procedure.
 ///
 /// Every arm is a translation into a [`WindowEvent`]; nothing here decides anything. Messages this
@@ -282,13 +310,17 @@ unsafe extern "system" fn wnd_proc(
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             push_event(&mut state.queue, WindowEvent::KeyDown {
                 keycode: wparam as u32,
+                scancode: scancode_of(lparam),
                 // Bit 30 of the `LPARAM` is the previous key state: set means the key was already
                 // down, i.e. this is an auto-repeat.
                 repeat: (lparam >> 30) & 1 != 0,
             });
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            push_event(&mut state.queue, WindowEvent::KeyUp { keycode: wparam as u32 });
+            push_event(&mut state.queue, WindowEvent::KeyUp {
+                keycode: wparam as u32,
+                scancode: scancode_of(lparam),
+            });
         }
         _ => {}
     }
