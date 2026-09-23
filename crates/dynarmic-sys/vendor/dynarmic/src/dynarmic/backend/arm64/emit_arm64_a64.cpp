@@ -32,8 +32,35 @@ oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond co
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
 
-void EmitA64Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
-    ASSERT_FALSE("Interpret should never be emitted.");
+// Omnidroid patch 0002: the x64 backend's `Interpret` terminal, on arm64. The pin had
+// `ASSERT_FALSE("Interpret should never be emitted.")` here, and the A64 frontend emits this
+// terminal for every word it cannot decode, so any unknown instruction terminated the process.
+// As on x64 (`A64EmitX64::EmitTerminalImpl(IR::Term::Interpret)`): store the PC, run the callback
+// under the host's floating-point control register, reload the guest's, and go back through the
+// dispatcher, which checks the halt flag and the cycle budget before looking up the next block.
+void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Interpret terminal, IR::LocationDescriptor, bool) {
+    if (ctx.conf.enable_cycle_counting) {
+        code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
+        code.SUB(X1, X1, Xticks);
+        EmitRelocation(code, ctx, LinkTarget::AddTicks);
+    }
+
+    code.MOV(X1, A64::LocationDescriptor{terminal.next}.PC());
+    code.STR(X1, Xstate, offsetof(A64JitState, pc));
+    code.MOV(X2, terminal.num_instructions);
+    code.LDR(Wscratch0, SP, offsetof(StackLayout, save_host_fpcr));
+    code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
+    EmitRelocation(code, ctx, LinkTarget::InterpreterFallback);
+    code.LDR(Wscratch0, Xstate, offsetof(A64JitState, fpcr));
+    code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
+
+    if (ctx.conf.enable_cycle_counting) {
+        EmitRelocation(code, ctx, LinkTarget::GetTicksRemaining);
+        code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
+        code.MOV(Xticks, X0);
+    }
+
+    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
 }
 
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {

@@ -33,6 +33,138 @@ same count, at the same `CNTFRQ_EL0` — which is what `omni-cpu`'s
 `cntvct_reads_the_same_clock_as_cntpct` asserts, from guest `MRS`
 instructions.
 
+### 0002 — arm64: the `Interpret` terminal calls the interpreter fallback
+
+`0002-arm64-interpret-terminal.patch`. **arm64 hosts only; the x64 backend is
+untouched.** The A64 frontend ends a block with `IR::Term::Interpret` in front
+of every word it cannot translate — the 231 commented-out decoder entries,
+including every LSE atomic, and every visitor that calls
+`InterpretThisInstruction()`. The x64 backend turns that terminal into a call to
+`UserCallbacks::InterpreterFallback`; the pin's arm64 backend had
+`ASSERT_FALSE("Interpret should never be emitted.")`
+(`emit_arm64_a64.cpp:36`), so on an arm64 host **the first undecodable guest
+word terminated the process**. MEASURED on Apple M1: `hostile.rs`'s fuzzer died
+at trial 2 with exactly that message, and `tests/interpret.rs` aborted with
+`SIGABRT` before the patch.
+
+The patch gives arm64 the x64 terminal, step for step: charge the cycles used
+so far (`AddTicks`), store the PC, install the **host's** `FPCR` (the x64
+terminal does `SwitchMxcsrOnExit`), call
+`InterpreterFallback(pc, num_instructions)` through a new prelude trampoline
+(`LinkTarget::InterpreterFallback`), reload the guest's `FPCR` from `JitState`
+(x64's `return_from_run_code[MXCSR_ALREADY_EXITED]` does
+`SwitchMxcsrOnEntry`), re-read the budget (`GetTicksRemaining`), and return to
+the dispatcher, which checks the halt flag and the budget before looking up the
+next block — the same loop x64's `ReturnFromRunCode(true)` enters.
+
+`tests/interpret.rs` asserts the contract from guest code: the preceding
+instructions are committed, the PC handed over is the unknown instruction's,
+`num_instructions` counts a merged run, a fallback that does not halt resumes at
+the PC it left, and the fallback runs under the host's `FPCR` while the guest's
+is back in force afterwards (a subnormal multiply under `FPCR.FZ`, both ways).
+
+### 0003 — arm64: scalar saturating add, subtract and doubling multiply-high
+
+`0003-arm64-scalar-saturation.patch`. **arm64 only.** `SignedSaturatedAdd8/16/32/64`,
+`SignedSaturatedSub*`, `UnsignedSaturatedAdd*`, `UnsignedSaturatedSub*` and
+`SignedSaturatedDoublingMultiplyReturnHigh16/32` were `ASSERT_FALSE("Unimplemented")`
+in `emit_arm64_saturation.cpp`, and the A64 frontend reaches all eighteen from
+`simd_scalar_three_same.cpp` (`SQADD`/`UQADD`/`SQSUB`/`UQSUB` scalar at every
+size — there is no size guard — and `SQDMULH` scalar at H and S, also from
+`simd_scalar_x_indexed_element.cpp`). One guest instruction was a terminated
+process; `tests/a64_saturation.rs` aborted with `SIGABRT` before the patch.
+
+Each is now the host's own scalar AdvSIMD instruction on the element's `B`/`H`/`S`/`D`
+register, which is the ARM ARM operation exactly (these are ARMv8.0 base
+instructions, present on every arm64 host) and sets the host's `FPSR.QC` on
+saturation. The FPSR manager is loaded first, exactly as the vector forms in
+`emit_arm64_vector_saturation.cpp` do, so the host `QC` is folded into the
+guest's `FPSR` at the next spill; the x64 backend ORs the same bit into
+`JitState::fpsr_qc`. `tests/a64_saturation.rs` checks every form at both bounds
+and in range, the cleared upper bits of `Vd`, and `QC` (set, clear, and sticky),
+against values worked from the ARM ARM pseudocode (`SatQ`, and
+`(2 * a * b) >> esize` for `SQDMULH`).
+
+### 0004 — arm64: half-precision arithmetic, and a fallback that dropped its result
+
+`0004-arm64-half-precision.patch`. **arm64 only.** Two defects in one family.
+
+**Unimplemented.** Every FP16 opcode the A64 frontend can emit and the arm64
+backend lacked was `ASSERT_FALSE("Unimplemented")`: scalar `FPAbs16`, `FPNeg16`,
+`FPMulAdd16`, `FPMulSub16`, `FPRoundInt16`, `FPRecipEstimate16`,
+`FPRecipExponent16`, `FPRSqrtEstimate16`, `FPRecipStepFused16`,
+`FPRSqrtStepFused16`, `FPHalfToFixed{S,U}{32,64}`, and vector `FPVectorEqual16`,
+`FPVectorMulAdd16`, `FPVectorNeg16`, `FPVectorRecipEstimate16`,
+`FPVectorRSqrtEstimate16`, `FPVectorRecipStepFused16`, `FPVectorRSqrtStepFused16`.
+They are reached by `FMADD`/`FMSUB`/`FNMADD`/`FNMSUB`, `FABS`, `FNEG`, `FRINT*`,
+`FRECPE`, `FRECPX`, `FRSQRTE`, `FRECPS`, `FRSQRTS`, `FCVT*`, `FCMEQ`, `FMLA`/`FMLS`
+at `ftype == 0b11` / `.4H`/`.8H` — `hostile.rs`'s fuzzer died on `FMSUB H` at
+trial 1002. The arithmetic ones now call dynarmic's own `FP::` routines, **the
+same ones the x64 backend calls for these opcodes** (x64 has no half-precision
+arithmetic), so both hosts produce the same bits and no host FEAT_FP16 is
+assumed; `FPAbs16`/`FPNeg16`/`FPVectorNeg16` are the sign-bit operations they
+are. Exceptions accumulate into the guest's `FPSR` after the FPSR manager is
+spilled.
+
+**A silent wrong answer.** `EmitTwoOpFallbackWithoutRegAlloc` saved and restored
+`ABI_CALLER_SAVE & ~(1ull << Qresult.index())` — which removes the
+*general-purpose* register with the result's number and keeps the result's `Q`
+register in the list, so the pop put the result register's old contents back
+over the computed value. It serves `FPVectorRoundInt16`, reached by
+`FRINT{N,M,P,Z,A,X,I}` (vector, half), which is **active** in the decoder.
+MEASURED before the patch: `FRINTN V0.8H, V1.8H` returned `[0, 0]`. The mask is
+now `~ToRegList(Qresult)`, and the new three- and four-operand helpers use the
+same.
+
+**Unreachable from A64, left as they are, with the evidence:**
+`FPHalfToFixedS16/U16` (only `FPToFixedS16/U16`, which only the A32 frontend
+calls, `A32/translate/impl/vfp.cpp:1073`); `FPVectorToSignedFixed16`,
+`FPVectorToUnsignedFixed16` (`FloatConvertToInteger` fixes esize at 32/64,
+`simd_two_register_misc.cpp:107`; `ConvertFloat` rejects `immh` 0001-0011,
+`simd_shift_by_immediate.cpp:197`; the half forms are `//INST` in `a64.inc`);
+and the `RoundingMode::ToOdd` arms of both `EmitToFixed` helpers (A64 passes a
+constant mode or `FPCR.RMode`, a 2-bit field that cannot hold `ToOdd` = 5; the
+only `ToOdd` in the A64 frontend is `FCVTXN`, which is not a to-fixed
+conversion).
+
+`tests/a64_fp16.rs`: every reachable form, with encodings checked against the
+LLVM assembler and values worked from IEEE binary16 and the ARM ARM (the 8-bit
+estimate tables, `FPRecpX`, fused single rounding shown by a lane whose exact
+result is a subnormal that a two-rounding implementation would flush to +0),
+plus FPSR `IOC`/`DZC`/`IXC` where the ARM ARM raises them.
+
+### 0005 — arm64: the SM4 substitution box
+
+`0005-arm64-sm4-sbox.patch`. **arm64 only.** `SM4E` and `SM4EKEY` (FEAT_SM4,
+active in `a64.inc`) translate to IR that looks bytes up through
+`SM4AccessSubstitutionBox`, which was `ASSERT_FALSE("Unimplemented")` in
+`emit_arm64_cryptography.cpp`; the first `SM4E` terminated the process
+(`tests/a64_sm4.rs` aborted before the patch). It now calls
+`Common::Crypto::SM4::AccessSubstitutionBox`, as the x64 backend does, through a
+lambda that takes the index as a `u64` and narrows it in C++ (Apple's arm64 ABI
+makes the *caller* extend sub-32-bit arguments, which generated code does not
+promise). `tests/a64_sm4.rs` runs the SM4 specification's own example — key
+schedule and 32 rounds through eight `SM4EKEY` and eight `SM4E` — and checks
+the ciphertext `681edf34 d206965e 86b3e94f 536e4246`.
+
+### 0006 — arm64: 64-bit unsigned max/min, which is how `CMHS`/`CMHI` compare
+
+`0006-arm64-unsigned-compare64.patch`. **arm64 only.** The IR has no 64-bit
+unsigned compare; `IREmitter::VectorGreaterEqualUnsigned` is
+`VectorEqual(VectorMaxUnsigned(a, b), a)` and `VectorGreaterUnsigned` is
+`NOT VectorEqual(VectorMinUnsigned(a, b), a)`. At `esize == 64` those are
+`VectorMaxU64`/`VectorMinU64`, `ASSERT_FALSE("Unimplemented")` on arm64, and
+`CMHS`/`CMHI` scalar (`D` only) and vector `.2D` are active decoder entries.
+FOUND by `hostile.rs`'s fuzzer at trial 158,510 (`CMHS D18, D23, D24`), in a
+300,000-trial run made after 0002-0005. AdvSIMD has no 64-bit `UMAX`/`UMIN`, so
+each selects per lane on `CMHI` with `BSL`. `tests/a64_compare.rs` checks
+both forms with operands a signed compare would order the other way.
+
+`VectorMaxS64`/`VectorMinS64` stay unimplemented: their only caller is
+`VectorMinMaxOperation` (`SMAX`/`SMIN`), which rejects `size == 0b11`
+(`simd_three_same.cpp:174`), and the signed compares are built from
+`VectorGreaterSigned`, not from max/min.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is
@@ -40,6 +172,15 @@ committed here alongside, so `git apply --check` against a fresh clone of the
 pin verifies that the tree is exactly upstream plus these patches. Touch
 `vendor/PIN.txt` afterwards; it is the only thing under `vendor/` that the build
 script tells Cargo to watch.
+
+`python3 crates/dynarmic-sys/tools/verify_patches.py` does that check without a
+network: the pristine tree is the one committed when the pin was vendored
+(`64034d4`), every patch is applied to it in order (`git apply --check` first),
+and the result must be the vendored tree **byte for byte** (in git object
+space, so eol attributes and ignored build outputs cannot confuse it); the
+vendored tree must also reverse-apply back to pristine. An edit made under
+`vendor/` without its patch fails the first half, which is the half a
+reconstruction from the tree itself could never catch.
 
 ## Known candidates, not yet applied
 

@@ -35,7 +35,7 @@
 //! test. [`the_configuration_that_makes_the_budget_work_is_in_effect`] pins the configuration
 //! instead, which is the part this crate controls.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

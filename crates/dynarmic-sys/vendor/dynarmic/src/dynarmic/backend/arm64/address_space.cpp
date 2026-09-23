@@ -260,6 +260,9 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         case LinkTarget::GetTicksRemaining:
             c.BL(prelude_info.get_ticks_remaining);
             break;
+        case LinkTarget::InterpreterFallback:
+            c.BL(prelude_info.interpreter_fallback);
+            break;
         default:
             ASSERT_FALSE("Invalid relocation target");
         }

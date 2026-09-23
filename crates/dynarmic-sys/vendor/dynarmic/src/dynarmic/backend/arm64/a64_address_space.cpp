@@ -397,6 +397,7 @@ void A64AddressSpace::EmitPrelude() {
     prelude_info.get_cntpct = EmitCallTrampoline<&A64::UserCallbacks::GetCNTPCT>(code, conf.callbacks);
     prelude_info.add_ticks = EmitCallTrampoline<&A64::UserCallbacks::AddTicks>(code, conf.callbacks);
     prelude_info.get_ticks_remaining = EmitCallTrampoline<&A64::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
+    prelude_info.interpreter_fallback = EmitCallTrampoline<&A64::UserCallbacks::InterpreterFallback>(code, conf.callbacks);
 
     oaknut::Label return_from_run_code, l_return_to_dispatcher;
 

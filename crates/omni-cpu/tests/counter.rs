@@ -14,7 +14,7 @@
 //! step budget and reported as `StepLimitReached`. Every symptom points somewhere other than the
 //! clock.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

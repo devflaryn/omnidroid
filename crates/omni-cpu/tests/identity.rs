@@ -3,7 +3,7 @@
 //! Gated on `x86_64`, because that is where the translating backend exists. On another host the
 //! tests skip **visibly** — they print why — rather than silently reporting success.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

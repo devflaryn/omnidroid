@@ -1,0 +1,196 @@
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_saturation.cpp b/src/dynarmic/backend/arm64/emit_arm64_saturation.cpp
+index 95b8b51..af3dfa9 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_saturation.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_saturation.cpp
+@@ -9,6 +9,7 @@
+ #include "dynarmic/backend/arm64/abi.h"
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+ #include "dynarmic/backend/arm64/emit_context.h"
++#include "dynarmic/backend/arm64/fpsr_manager.h"
+ #include "dynarmic/backend/arm64/reg_alloc.h"
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/microinstruction.h"
+@@ -126,148 +127,111 @@ void EmitIR<IR::Opcode::UnsignedSaturation>(oaknut::CodeGenerator& code, EmitCon
+     }
+ }
+ 
++// Omnidroid patch 0003: the A64 scalar saturating forms (SQADD, UQADD, SQSUB, UQSUB at B/H/S/D and
++// SQDMULH at H/S) were ASSERT_FALSE("Unimplemented") here, and the A64 frontend reaches every one of
++// them from simd_scalar_three_same.cpp. The host's own scalar AdvSIMD instruction is the ARM ARM
++// operation exactly, and it sets the host FPSR.QC on saturation; with the FPSR manager loaded (as the
++// vector forms in emit_arm64_vector_saturation.cpp do) that QC is folded into the guest's FPSR.
++template<size_t size, typename EmitFn>
++static void EmitSaturatedScalar(oaknut::CodeGenerator&, EmitContext& ctx, IR::Inst* inst, EmitFn emit) {
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    auto Vresult = ctx.reg_alloc.WriteVec<size>(inst);
++    auto Va = ctx.reg_alloc.ReadVec<size>(args[0]);
++    auto Vb = ctx.reg_alloc.ReadVec<size>(args[1]);
++    RegAlloc::Realize(Vresult, Va, Vb);
++    ctx.fpsr.Load();
++
++    emit(*Vresult, *Va, *Vb);
++}
++
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedAdd8>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<8>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedAdd16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<16>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedAdd32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<32>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedAdd64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedDoublingMultiplyReturnHigh16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<16>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQDMULH(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedDoublingMultiplyReturnHigh32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<32>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQDMULH(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedSub8>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<8>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQSUB(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedSub16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<16>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQSUB(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedSub32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<32>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQSUB(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::SignedSaturatedSub64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.SQSUB(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedAdd8>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<8>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedAdd16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<16>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedAdd32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<32>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedAdd64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQADD(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedSub8>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<8>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQSUB(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedSub16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<16>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQSUB(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedSub32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<32>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQSUB(Vresult, Va, Vb); });
+ }
+ 
+ template<>
+ void EmitIR<IR::Opcode::UnsignedSaturatedSub64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+-    (void)code;
+-    (void)ctx;
+-    (void)inst;
+-    ASSERT_FALSE("Unimplemented");
++    EmitSaturatedScalar<64>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UQSUB(Vresult, Va, Vb); });
+ }
+ 
+ }  // namespace Dynarmic::Backend::Arm64

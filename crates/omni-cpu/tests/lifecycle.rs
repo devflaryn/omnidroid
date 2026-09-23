@@ -19,7 +19,7 @@
 //!   reason it is pinned here and in `dynarmic-sys`'s
 //!   `a_halt_reason_is_read_and_cleared_by_the_dispatcher`.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

@@ -81,6 +81,8 @@ enum class LinkTarget {
     GetCNTPCT,
     AddTicks,
     GetTicksRemaining,
+    // Omnidroid patch 0002: the `Interpret` terminal's call to `UserCallbacks::InterpreterFallback`.
+    InterpreterFallback,
 };
 
 struct Relocation {

@@ -661,6 +661,7 @@ pub(crate) enum PendingExit {
 /// Not covered, and stated rather than implied: the x87 control word. Neither dynarmic nor Rust's
 /// `f32`/`f64` codegen uses x87 on x86-64, so there is nothing to switch; if that ever stops being
 /// true this is where it goes.
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod mxcsr {
     /// Read `MXCSR`.
     ///
@@ -709,6 +710,77 @@ pub(crate) mod mxcsr {
         }
     }
 }
+
+/// The AArch64 host's floating-point control register, which is what plays `MXCSR`'s part on an
+/// `aarch64` host, and the same guard over it.
+///
+/// # Why an arm64 host needs the same guard
+///
+/// dynarmic's arm64 prelude (`A64AddressSpace::EmitPrelude`, `a64_address_space.cpp`) saves the
+/// host's `FPCR` into `StackLayout::save_host_fpcr` and writes the **guest's** `FPCR` into the host
+/// register before it branches into translated code, and puts the host's back only in
+/// `return_from_run_code`. Its call trampolines (`EmitCallTrampoline`, same file) -- the path
+/// `CallSVC` takes, and therefore every inline thunk handler -- switch nothing. So a host callback
+/// runs with the guest's rounding mode, flush-to-zero (`FZ`, bit 24), default-NaN (`DN`, bit 25) and
+/// `FZ16` live in the real register, and Rust's `f32`/`f64` compile to the very instructions those
+/// bits govern. Same defect class as `MXCSR` on x86-64, same fix, same single place.
+///
+/// Named `mxcsr` for the rest of this module (below) so the dispatcher and the thunk path are one
+/// code path on both hosts; the value it carries is `FPCR` here, never an x86 word.
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod fpcr {
+    /// Read `FPCR`.
+    #[must_use]
+    pub(crate) fn read() -> u32 {
+        let out: u64;
+        // SAFETY: `FPCR` is readable at EL0 on every AArch64 implementation; `mrs` has no memory
+        // operand and no side effect.
+        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) out, options(nomem, nostack, preserves_flags)) };
+        // The architecturally defined bits are all in the low 32 (FEAT_AFP's `AH`/`FIZ`/`NEP` are
+        // bits 0-2); the upper half is RES0.
+        out as u32
+    }
+
+    /// Write `FPCR`.
+    pub(crate) fn write(value: u32) {
+        // SAFETY: as `read`. Every value written here was read out of `FPCR` in the first place, so
+        // no RES0 bit is set.
+        unsafe {
+            core::arch::asm!("msr fpcr, {}", in(reg) u64::from(value), options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    /// Installs the host's `FPCR` for the body of a host callback and puts the guest's back.
+    ///
+    /// Nothing is switched when the two words are already equal, which is the common case.
+    pub(crate) struct Guard {
+        guest: u32,
+        switched: bool,
+    }
+
+    impl Guard {
+        pub(crate) fn enter(host: u32) -> Self {
+            let guest = read();
+            let switched = guest != host;
+            if switched {
+                write(host);
+            }
+            Self { guest, switched }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.switched {
+                write(self.guest);
+            }
+        }
+    }
+}
+
+/// On an `aarch64` host the control word the guard switches is `FPCR`; see [`fpcr`].
+#[cfg(target_arch = "aarch64")]
+pub(crate) use fpcr as mxcsr;
 
 /// **A diagnostic, off by default**: start counting the guest instructions every context of
 /// every backend fetches for translation, and return the count so far. Translation is the only

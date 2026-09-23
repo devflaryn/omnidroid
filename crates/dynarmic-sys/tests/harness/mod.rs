@@ -61,6 +61,8 @@ pub struct Ctx {
     pub exceptions: Vec<(u64, u32)>,
     /// `(op, vaddr)` for every instruction-cache maintenance operation.
     pub icache: Vec<(u32, u64)>,
+    /// `(pc, num_insns)` for every `interpreter_fallback`, in order.
+    pub fallbacks: Vec<(u64, u64)>,
 
     /// Current callback nesting depth.
     pub depth: i32,
@@ -86,6 +88,14 @@ pub struct Ctx {
     pub reenter_step_result: Option<u32>,
     /// Test hook: halt with [`HALT_DONE`] from inside `call_svc`.
     pub halt_on_svc: bool,
+    /// Test hook: make `interpreter_fallback` behave as an interpreter that
+    /// executed its `num_insns` instructions as no-ops -- advance the guest PC
+    /// past them and do **not** halt -- so a test can see where execution goes
+    /// after the fallback returns.
+    pub fallback_skips: bool,
+    /// The `FPCR` the host thread held inside the last `interpreter_fallback`,
+    /// read on arm64 hosts only (0 elsewhere).
+    pub fallback_host_fpcr: u32,
     /// Test hook: ask for a zero-length code invalidation from inside
     /// `call_svc`, which is what a guest `IC IVAU` over an empty range does.
     pub zero_invalidate_on_svc: bool,
@@ -323,10 +333,22 @@ unsafe extern "C" fn cb_wx128(
     }
 }
 
-unsafe extern "C" fn cb_interpreter_fallback(ctx: *mut c_void, pc: u64, _n: u64) {
+unsafe extern "C" fn cb_interpreter_fallback(ctx: *mut c_void, pc: u64, n: u64) {
     // SAFETY: `ctx` is the harness context.
     unsafe {
         with(ctx, (), |c| {
+            c.fallbacks.push((pc, n));
+            #[cfg(target_arch = "aarch64")]
+            {
+                let fpcr: u64;
+                // SAFETY: `FPCR` is readable at EL0 and `mrs` touches no memory.
+                core::arch::asm!("mrs {}, fpcr", out(reg) fpcr, options(nomem, nostack));
+                c.fallback_host_fpcr = fpcr as u32;
+            }
+            if c.fallback_skips {
+                od_jit_set_pc(c.jit, pc + 4 * n);
+                return;
+            }
             // Nothing here can interpret A64, so refuse loudly rather than
             // silently skipping instructions: record it and stop.
             c.exceptions.push((pc, u32::MAX));
@@ -489,6 +511,7 @@ impl Vm {
             svc: Vec::new(),
             exceptions: Vec::new(),
             icache: Vec::new(),
+            fallbacks: Vec::new(),
             depth: 0,
             max_depth: 0,
             ticks_remaining: u64::MAX,
@@ -499,6 +522,8 @@ impl Vm {
             reenter_result: None,
             reenter_step_result: None,
             halt_on_svc: true,
+            fallback_skips: false,
+            fallback_host_fpcr: 0,
             zero_invalidate_on_svc: false,
         }));
 

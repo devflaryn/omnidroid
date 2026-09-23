@@ -52,7 +52,7 @@ mod context;
 mod cpu;
 mod error;
 mod exit;
-#[cfg(all(feature = "dynarmic", target_arch = "x86_64"))]
+#[cfg(all(feature = "dynarmic", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod dynarmic;
 mod fastmem;
 mod regs;

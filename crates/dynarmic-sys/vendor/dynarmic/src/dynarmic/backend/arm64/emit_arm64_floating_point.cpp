@@ -3,6 +3,10 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <initializer_list>
+
+#include <mcl/bit_cast.hpp>
+#include <mcl/type_traits/function_info.hpp>
 #include <oaknut/oaknut.hpp>
 
 #include "dynarmic/backend/arm64/a32_jitstate.h"
@@ -12,6 +16,9 @@
 #include "dynarmic/backend/arm64/fpsr_manager.h"
 #include "dynarmic/backend/arm64/reg_alloc.h"
 #include "dynarmic/common/fp/fpcr.h"
+#include "dynarmic/common/fp/fpsr.h"
+#include "dynarmic/common/fp/op.h"
+#include "dynarmic/common/fp/rounding_mode.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/opcodes.h"
@@ -183,12 +190,54 @@ static void EmitFromFixed(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Ins
     }
 }
 
+// Omnidroid patch 0004: half-precision scalar arithmetic. The pin had ASSERT_FALSE("Unimplemented")
+// for every FP16 opcode below, and the A64 frontend reaches all of them (FMADD/FMSUB/FNMADD/FNMSUB,
+// FABS, FNEG, FRINT*, FRECPE, FRECPX, FRSQRTE, FRECPS, FRSQRTS and FCVT* with ftype == 0b11).
+// They are computed by dynarmic's own FP:: routines -- the ones the x64 backend calls for every one
+// of these opcodes, since x64 has no half-precision arithmetic -- so both hosts give the same bits,
+// and no host FEAT_FP16 is assumed. `fn(operands..., immediates..., fpcr, fpsr&)` returns the result
+// zero-extended; FPSR exceptions are accumulated into the guest's FPSR directly, after
+// PrepareForCall has spilled the FPSR manager.
+template<typename Lambda>
+static void EmitFP16Fallback(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, size_t operand_count, std::initializer_list<u64> immediates, Lambda lambda) {
+    const auto fn = static_cast<mcl::equivalent_function_type<Lambda>*>(lambda);
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+
+    switch (operand_count) {
+    case 1:
+        ctx.reg_alloc.PrepareForCall(args[0]);
+        break;
+    case 2:
+        ctx.reg_alloc.PrepareForCall(args[0], args[1]);
+        break;
+    case 3:
+        ctx.reg_alloc.PrepareForCall(args[0], args[1], args[2]);
+        break;
+    default:
+        UNREACHABLE();
+    }
+
+    int next = static_cast<int>(operand_count);
+    for (const u64 imm : immediates) {
+        code.MOV(oaknut::XReg{next++}, imm);
+    }
+    code.MOV(oaknut::WReg{next++}, ctx.FPCR().Value());
+    code.ADD(oaknut::XReg{next++}, Xstate, ctx.conf.state_fpsr_offset);
+    code.MOV(Xscratch0, mcl::bit_cast<u64>(fn));
+    code.BLR(Xscratch0);
+
+    ctx.reg_alloc.DefineAsRegister(inst, X0);
+}
+
 template<>
 void EmitIR<IR::Opcode::FPAbs16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Wresult = ctx.reg_alloc.WriteW(inst);
+    auto Woperand = ctx.reg_alloc.ReadW(args[0]);
+    RegAlloc::Realize(Wresult, Woperand);
+
+    // FPAbs: clear the sign bit, nothing else -- no exception, NaNs untouched.
+    code.AND(Wresult, Woperand, 0x7FFF);
 }
 
 template<>
@@ -312,10 +361,9 @@ void EmitIR<IR::Opcode::FPMul64>(oaknut::CodeGenerator& code, EmitContext& ctx, 
 
 template<>
 void EmitIR<IR::Opcode::FPMulAdd16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitFP16Fallback(code, ctx, inst, 3, {}, [](u64 a, u64 b, u64 c, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return FP::FPMulAdd<u16>(static_cast<u16>(a), static_cast<u16>(b), static_cast<u16>(c), FP::FPCR{fpcr}, fpsr);
+    });
 }
 
 template<>
@@ -330,10 +378,9 @@ void EmitIR<IR::Opcode::FPMulAdd64>(oaknut::CodeGenerator& code, EmitContext& ct
 
 template<>
 void EmitIR<IR::Opcode::FPMulSub16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitFP16Fallback(code, ctx, inst, 3, {}, [](u64 a, u64 b, u64 c, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return FP::FPMulSub<u16>(static_cast<u16>(a), static_cast<u16>(b), static_cast<u16>(c), FP::FPCR{fpcr}, fpsr);
+    });
 }
 
 template<>
@@ -358,10 +405,14 @@ void EmitIR<IR::Opcode::FPMulX64>(oaknut::CodeGenerator& code, EmitContext& ctx,
 
 template<>
 void EmitIR<IR::Opcode::FPNeg16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Wresult = ctx.reg_alloc.WriteW(inst);
+    auto Woperand = ctx.reg_alloc.ReadW(args[0]);
+    RegAlloc::Realize(Wresult, Woperand);
+
+    // FPNeg: flip the sign bit, nothing else; the value is kept zero-extended.
+    code.EOR(Wresult, Woperand, 0x8000);
+    code.AND(Wresult, Wresult, 0xFFFF);
 }
 
 template<>
@@ -376,10 +427,9 @@ void EmitIR<IR::Opcode::FPNeg64>(oaknut::CodeGenerator& code, EmitContext& ctx, 
 
 template<>
 void EmitIR<IR::Opcode::FPRecipEstimate16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitFP16Fallback(code, ctx, inst, 1, {}, [](u64 a, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return FP::FPRecipEstimate<u16>(static_cast<u16>(a), FP::FPCR{fpcr}, fpsr);
+    });
 }
 
 template<>
@@ -394,10 +444,9 @@ void EmitIR<IR::Opcode::FPRecipEstimate64>(oaknut::CodeGenerator& code, EmitCont
 
 template<>
 void EmitIR<IR::Opcode::FPRecipExponent16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitFP16Fallback(code, ctx, inst, 1, {}, [](u64 a, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return FP::FPRecipExponent<u16>(static_cast<u16>(a), FP::FPCR{fpcr}, fpsr);
+    });
 }
 
 template<>
@@ -412,10 +461,9 @@ void EmitIR<IR::Opcode::FPRecipExponent64>(oaknut::CodeGenerator& code, EmitCont
 
 template<>
 void EmitIR<IR::Opcode::FPRecipStepFused16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitFP16Fallback(code, ctx, inst, 2, {}, [](u64 a, u64 b, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return FP::FPRecipStepFused<u16>(static_cast<u16>(a), static_cast<u16>(b), FP::FPCR{fpcr}, fpsr);
+    });
 }
 
 template<>
@@ -430,10 +478,11 @@ void EmitIR<IR::Opcode::FPRecipStepFused64>(oaknut::CodeGenerator& code, EmitCon
 
 template<>
 void EmitIR<IR::Opcode::FPRoundInt16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    const u64 rounding = inst->GetArg(1).GetU8();
+    const u64 exact = inst->GetArg(2).GetU1() ? 1 : 0;
+    EmitFP16Fallback(code, ctx, inst, 1, {rounding, exact}, [](u64 a, u64 rounding, u64 exact, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return static_cast<u16>(FP::FPRoundInt<u16>(static_cast<u16>(a), FP::FPCR{fpcr}, static_cast<FP::RoundingMode>(rounding), exact != 0, fpsr));
+    });
 }
 
 template<>
@@ -512,10 +561,9 @@ void EmitIR<IR::Opcode::FPRoundInt64>(oaknut::CodeGenerator& code, EmitContext& 
 
 template<>
 void EmitIR<IR::Opcode::FPRSqrtEstimate16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitFP16Fallback(code, ctx, inst, 1, {}, [](u64 a, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return FP::FPRSqrtEstimate<u16>(static_cast<u16>(a), FP::FPCR{fpcr}, fpsr);
+    });
 }
 
 template<>
@@ -530,10 +578,9 @@ void EmitIR<IR::Opcode::FPRSqrtEstimate64>(oaknut::CodeGenerator& code, EmitCont
 
 template<>
 void EmitIR<IR::Opcode::FPRSqrtStepFused16>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    EmitFP16Fallback(code, ctx, inst, 2, {}, [](u64 a, u64 b, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return FP::FPRSqrtStepFused<u16>(static_cast<u16>(a), static_cast<u16>(b), FP::FPCR{fpcr}, fpsr);
+    });
 }
 
 template<>
@@ -652,18 +699,20 @@ void EmitIR<IR::Opcode::FPHalfToFixedS16>(oaknut::CodeGenerator& code, EmitConte
 
 template<>
 void EmitIR<IR::Opcode::FPHalfToFixedS32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    const u64 fbits = inst->GetArg(1).GetU8();
+    const u64 rounding = inst->GetArg(2).GetU8();
+    EmitFP16Fallback(code, ctx, inst, 1, {fbits, rounding}, [](u64 a, u64 fbits, u64 rounding, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return static_cast<u32>(FP::FPToFixed<u16>(32, static_cast<u16>(a), static_cast<size_t>(fbits), false, FP::FPCR{fpcr}, static_cast<FP::RoundingMode>(rounding), fpsr));
+    });
 }
 
 template<>
 void EmitIR<IR::Opcode::FPHalfToFixedS64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    const u64 fbits = inst->GetArg(1).GetU8();
+    const u64 rounding = inst->GetArg(2).GetU8();
+    EmitFP16Fallback(code, ctx, inst, 1, {fbits, rounding}, [](u64 a, u64 fbits, u64 rounding, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return (FP::FPToFixed<u16>(64, static_cast<u16>(a), static_cast<size_t>(fbits), false, FP::FPCR{fpcr}, static_cast<FP::RoundingMode>(rounding), fpsr));
+    });
 }
 
 template<>
@@ -676,18 +725,20 @@ void EmitIR<IR::Opcode::FPHalfToFixedU16>(oaknut::CodeGenerator& code, EmitConte
 
 template<>
 void EmitIR<IR::Opcode::FPHalfToFixedU32>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    const u64 fbits = inst->GetArg(1).GetU8();
+    const u64 rounding = inst->GetArg(2).GetU8();
+    EmitFP16Fallback(code, ctx, inst, 1, {fbits, rounding}, [](u64 a, u64 fbits, u64 rounding, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return static_cast<u32>(FP::FPToFixed<u16>(32, static_cast<u16>(a), static_cast<size_t>(fbits), true, FP::FPCR{fpcr}, static_cast<FP::RoundingMode>(rounding), fpsr));
+    });
 }
 
 template<>
 void EmitIR<IR::Opcode::FPHalfToFixedU64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    const u64 fbits = inst->GetArg(1).GetU8();
+    const u64 rounding = inst->GetArg(2).GetU8();
+    EmitFP16Fallback(code, ctx, inst, 1, {fbits, rounding}, [](u64 a, u64 fbits, u64 rounding, u32 fpcr, FP::FPSR& fpsr) -> u64 {
+        return (FP::FPToFixed<u16>(64, static_cast<u16>(a), static_cast<size_t>(fbits), true, FP::FPCR{fpcr}, static_cast<FP::RoundingMode>(rounding), fpsr));
+    });
 }
 
 template<>

@@ -8,6 +8,11 @@ dynarmic/
     version    6.7.0 (2024-03-05)
     licence    ISC / 0BSD  (see dynarmic/LICENSE.txt)
     state      that revision plus ../patches/0001-a64-mrs-cntvct_el0.patch
+               and ../patches/0002-arm64-interpret-terminal.patch
+               and ../patches/0003-arm64-scalar-saturation.patch
+               and ../patches/0004-arm64-half-precision.patch
+               and ../patches/0005-arm64-sm4-sbox.patch
+               and ../patches/0006-arm64-unsigned-compare64.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
