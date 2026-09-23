@@ -65,7 +65,7 @@ M4 and the texture work ran in parallel successfully. What made it safe:
 | | |
 |---|---|
 | Current branch | **`bionic-threads`** (M3 task 3 work) |
-| Working tree | **clean**, nothing uncommitted (`.freebuff/` is untracked scratch) |
+| Working tree | **NOT clean on 2026-09-23 night**: four tested-but-unverified fixes -- see "UNCOMMITTED in the tree" under START HERE (`.claude/` is untracked scratch) |
 | HEAD | see `git log` |
 | Other branches | `android-abi` (M3 tasks 1-2), `bionic-pure` (the pure libc/libm subset), `cpu-execution` (M2), `foundation` (M0/M1), `main` (behind — holds only early docs) |
 | Remotes | **none configured** |
@@ -904,6 +904,109 @@ Read in this order:
 7. **`docs/briefs/`** -- two ready-to-launch subagent briefs for the current frontier
    (`webview2-seam.md`, `performance.md`).
 
+## 2026-09-23 night: A GAME WORLD LOADS AND RENDERS -- read this section first
+
+**Where it stands.** The owner signed in (Quick Sign-in), pressed Play on Pet Simulator 99 and
+the whole join ran on this layer: RakNet connected ("Connection accepted"), the lobby place loaded
+(`onGameLoaded: placeId:8737899170`), the experience teleported to its main world (place
+140403681187145), that server accepted, the main world loaded, and **the render thread drew it**:
+2-8 presents per 5 s, and the owner's clicks and drags reached the engine (play17, the scratchpad
+of session a4b3c2d9). No guest thread died on the whole path except one (below).
+
+**The owner's verdict: "way too slow -- I can barely move my camera"**, and **keyboard and mouse
+controls do not reach the game** (WASD, Tab, mouse camera). Those are the two top items of the
+frontier below. **The owner cannot switch away from the arm64-v8a APK** (the APK here ships only
+`lib/arm64-v8a`): the x86-64 Android build Sober uses is not an option, so performance work is
+ARM64-through-dynarmic only.
+
+### Fixed and committed this session (each mutation-verified, row prefix in brackets)
+
+`9e70608` fcntl F_GETFD/F_SETFD + FD_CLOEXEC recorded per descriptor [cloexec-, 12/12];
+`9cf6e10` SO_LINGER and SO_BROADCAST, Linux's every-socket semantics over Winsock's refusals
+[linger-, 7/7]; `7d17623` the unimplemented-option test moved to SO_OOBINLINE (it broke because
+`9cf6e10` was committed after running only filtered tests -- VERIFICATION entry 5 again); `0adabca`
+path-MTU discovery by mode over Windows' `IP_MTU_DISCOVER` (RakNet: PROBE then DONT on one
+socket; Windows refuses to mix `IP_DONTFRAGMENT` with it) and `getauxval(AT_SECURE)` = 0
+[pmtu-, atsecure-, 7/7]. Earlier the same day: `ebe115e`, `5d9699d`, `9cc04c3`, `f0cd023`,
+`b438c31`, `96f3c8d`, `dd5e634`, `fdb2f88` (see the join list further down).
+
+### UNCOMMITTED in the tree -- tested, NOT yet mutation-verified; finish these first
+
+The affected suites pass in full, run 2026-09-23 night with all four in the tree:
+`omni-android --test bionic` 241, `--lib` 340, `--test vulkan_present` 27 (9 ignored),
+`omni-bionic --test libm_tests` 22. The mutation rows are
+written in `tools/mutate.py` and **have not been run**. Run each prefix with the tree to itself,
+then commit each fix separately with explicit paths (bionic.rs and mutate.py hold hunks of
+several fixes -- stage by hunk or strip-and-restore, as `0adabca` was):
+
+1. **`sincos`** (`omni-bionic/src/libm.rs`, `handlers.rs`, `libm_tests.rs`, bionic.rs inventory
+   314 bound / 299 inline + a BEYOND_THE_PREDICTION entry). The in-game worker pool (link
+   `0x4fbcbc4`) died on it. Rows `sincos-` (3).
+2. **Capacity for a loaded world** (`bionic/mod.rs`, `addrinfo.rs`, `jni/mod.rs`, bionic.rs +
+   jni tests): `MAX_GUEST_THREADS` 64 -> 256 (pthread_create EAGAIN -> RBXCRASH "thread
+   constructor failed: Unknown error 11"), `MAX_GUEST_FILES` 16 -> 512 (hundreds of asset-cache
+   `errno=24` while ~60 descriptors were open), `MAX_JNI_THREADS` = `MAX_GUEST_THREADS` (a worker
+   pool, link `0x601021c`, died on the 64-env cap), the arena now 5 commit granules
+   (`ARENA_GRANULES`, the eager-commit cost stated). Rows `capacity-` (5).
+3. **`vkCmdCopyImageToBuffer`** (`vulkan/draw.rs`, `vulkan/host.rs`, `vulkan/mod.rs`,
+   `omni-gfx/src/host.rs`, `tests/vulkan_present.rs`): the render thread died on it on the main
+   world's first frame. **No mutation row yet** -- add one (e.g. swap image and buffer) and run it.
+4. **The gate** (`tests/gameactivity.rs`): a 16 GiB guest space with an 8 GiB commit ceiling
+   (`GUEST_SPACE_BYTES`, `GUEST_MAX_COMMITTED`; `MemTotal` follows) -- the world hit the 4 GiB /
+   3.5 GiB defaults (mimalloc's 1 GiB regions ENOMEM, low-memory warnings); and the FRAMES line now
+   prints "N descriptors open". Verified by the play runs, not by a row.
+
+### How the owner's builds were made (and must keep being made)
+
+* **Never build while the owner is in a session.** MEASURED: a cargo build during play exhausted
+  the host's commit (Windows error 1455, "paging file too small"), and two guest threads died in
+  the JIT (a C++ exception escaped `Jit::Run`). The host: 31.8 GB RAM, 51.8 GB commit limit, and
+  ~31 GB of it held by the owner's browsers and apps.
+* The play binary comes from the worktree **`../omnidroid-play`**, currently detached at `7d17623`
+  **with the uncommitted fixes applied as patches** (pmtu/atsecure -- now `0adabca` -- sincos, the
+  gate memory, capacity, the JNI cap, the copy). After committing, `git -C ../omnidroid-play
+  checkout -f --detach <new HEAD>` and rebuild: `OMNIDROID_DYNARMIC_BUILD_DIR='C:\odp-build'
+  CARGO_TARGET_DIR=<worktree>/target cargo test -p omni-android --release --test gameactivity
+  --no-run`; run the exe from the worktree's `crates/omni-android` with `OMNI_DATA_DIR=<fresh dir>
+  OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 OMNI_SESSION_SECONDS=315360000 <exe> --nocapture
+  --test-threads=1 initialize_native_code_returns_a_native_code_and_the_game_thread_starts`. A
+  running session locks the exe (LNK1104): close it first.
+* **Use a fresh `OMNI_DATA_DIR` each launch** (data-session-0923k, -l, -m were the last): a
+  force-quit data dir hits frontier item 4's inferred-crash death on the next launch.
+* **Network.** Roblox is ISP-blocked here. The owner used **GoodbyeDPI** (not a VPN) until the
+  last runs: under it both teleports' transport handshakes got NoResponse and `tr.rbxcdn.com`
+  never resolved. On a **real VPN** the same teleport connected in 1.4 s. Ask which is on before
+  debugging a network failure.
+* **Watch the log with a filter that flushes** (`awk '{...; fflush()}'`, not `cut`, which
+  buffers -- a death went unreported for minutes because of it).
+
+### The frontier, in order
+
+1. **Performance, ARM64 only** -- the owner's first ask ("I want it smooth"). In the world:
+   2-8 presents per 5 s. While the world loads: ~0 for 60+ s (in play13 the Lua main thread ran
+   heavy module loads -- `[SlowModule] PetItem 2815ms` -- while the render job presented nothing).
+   Measure first (`OMNI_WAIT_TRACE=<s>`, the omni-cpu code-fetch counters, `docs/briefs/performance.md`),
+   in the world, not on the menus: where a frame's time goes (translation, JIT execution, the
+   Vulkan forwarding, waits). Known levers already measured: the code cache (`fdb2f88`), the 1 ms
+   timer; the landing's idle 1 fps is still undecoded ("The frontier -- CURRENT", item 6).
+2. **Keyboard and mouse into the game, the way a device with a hardware keyboard gets them** --
+   not hardcoded actions. Roblox's Android client handles `KeyEvent`s itself (WASD, Space, Tab,
+   Esc...) and mouse `MotionEvent`s (source MOUSE: right-drag camera, wheel `AXIS_VSCROLL`).
+   Decode GameActivity's key path (`onKeyDown`/`onKeyUp` natives reading a `KeyEvent` over JNI:
+   keyCode, action, metaState, source, repeatCount, scanCode, unicodeChar...) and the mouse
+   motion path, then translate the host window's keys and mouse (omni-platform's window seam)
+   into them. Touch already works (`nativePassInput`).
+3. **One death left on the join**: at +335 s of play17, guest thread 2 (link `0x284d168`) stopped
+   on `UnsupportedInstruction` -- a raw `svc #0` at link `0x32462e0`. This layer has no path for a
+   guest's own supervisor calls (`omni-cpu/src/dynarmic/callbacks.rs` stops the thread there by
+   design); libroblox has 138 such sites. The game kept running without that thread. Not
+   investigated further in this session.
+4. Smaller, measured: the descriptor table is 1024 where Android gives an app 32768 (tied to the
+   poll backend's 1024-socket `select`, `MAX_OPEN_FILES <= MAX_POLL_SOCKETS`); `MAX_LOOPERS` is
+   16; `getViewportDisplaySize: Failed to find class 'DeviceUtils'` is benign (the class is in no
+   dex of this APK, so a device fails the same way); a private address
+   (`10.110.101.222:5052`) times out in every session and is harmless.
+
 ## Where the runtime actually is today
 
 The gate, and the switches it takes (every stimulus switch is opt-in and says so in the log):
@@ -924,7 +1027,7 @@ OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --releas
 ```
 
 **2026-09-23: a person signed in, reached Home, and pressed Play.** `tools\play.ps1` is how the
-person runs it (a 30-minute default session, storage kept in `%LOCALAPPDATA%\Omnidroid\data`,
+person runs it (until the window is closed, since `b66b943`; storage kept in `%LOCALAPPDATA%\Omnidroid\data`,
 `-Fresh` for a clean install). What the signed-in sessions (play2-play7 in that session's
 scratchpad) found, in order, and where each stands:
 
@@ -944,10 +1047,43 @@ scratchpad) found, in order, and where each stands:
   run is believed to follow from the `EMFILE`; unverified.
 * **`vkCmdResolveImage`** killed the render thread on the landing screen of the next client
   (`a27de7c`, fixed). The client after that ran 400 s with no death and closed cleanly.
-* **No game has been entered yet.** The person has not pressed Play since those two fixes.
+* **The second join (2026-09-23 evening, password sign-in with no captcha asked) reached the game
+  page, Play, and a black window**: `GUEST THREAD DIED at +340s: thread 2 (started at link
+  0x284d168): ... pthread_condattr_init ... nothing in the compatibility layer implements it`, and
+  no frame after it. It was not slowness. Fixed (`dd5e634`): `pthread_condattr_init`, `_setclock`,
+  `_destroy` bound -- the primitives were in `omni_bionic::cond`, tested, never wired (entry 16).
+* **Then one death per press of Play (2026-09-23 night), each fixed, each the next thing the join
+  reached**, every one on an engine TaskScheduler worker (start routine link `0x284d168`):
+  `pthread_attr_setschedparam` and `pthread_setschedparam` (`ebe115e`); `gethostname` (`5d9699d`,
+  "localhost", as AOSP's `init.rc` sets it); `SystemThemeProtocol.getSystemTheme` (`9cc04c3`, from
+  `uiMode`); `getaddrinfo` with an empty service (`f0cd023`, `EAI_SERVICE`) and with a null node
+  (`b438c31`, bionic's `explore_null`: the bind or loopback address); `fcntl(F_GETFD)`
+  (`9e70608`, `FD_CLOEXEC` recorded per descriptor -- all 17 of the engine's `fcntl` call sites
+  are DECODED to commands 1-4, so `fcntl` is done). Found reading waits on the way: the futex now
+  compares its word as `FUTEX_WAIT` does (`96f3c8d`), a lost-wake class.
+  **Watch next:** Windows IPv6 sockets default to `IPV6_V6ONLY` 1 where Android's is 0; the null
+  node answer lists `::` first, so an engine that binds `[::]` and sends to an IPv4-mapped address
+  would fail here and work on a device. Not seen yet; not changed without a measurement.
+* **Unbound imports the join may meet next** -- 206 of `libroblox.so`'s 565 imports appeared as no
+  string anywhere in `omni-android/src` (a crude audit, 2026-09-23). Most are GL/EGL (the engine
+  takes Vulkan) and `AMediaCodec_*`/`AMediaFormat_*` (video). The libc ones a join could plausibly
+  reach, less the two since bound: `pthread_key_delete`,
+  `pthread_exit`, `sendmmsg`, `writev`, `getpeername`, `getnameinfo`, `socketpair`, `pread64`,
+  `lseek`, `readlink`, `realpath`, `mremap`, `uname`, `tzset`/`localtime`, `vsscanf`, `strspn`,
+  `strncat`, `tolower`, `atol`, `bsearch`, `ldiv`, `difftime`, `sincos`, `erff`, `powl`,
+  `__memmove_chk`, `__strcpy_chk`, `__vsprintf_chk`, `__read_chk`, `__android_log_write`,
+  `sigaltstack`, `signal`. Only `strspn`, `strncat` and `bsearch` have `omni-bionic` primitives.
+* **Play binaries while other work is in the tree:** build them from a clean worktree of the
+  commit with a private target (`git worktree add --detach ../omnidroid-play <commit>`, hard-link
+  the APK in, `OMNIDROID_DYNARMIC_BUILD_DIR=C:\odp-build` because the worktree's path is too long
+  for MSVC, `CARGO_TARGET_DIR=<worktree>/target`), and run the exe from the worktree's
+  `crates/omni-android`. That keeps a subagent's half-finished edits out of the owner's session.
+  `tools\play.ps1` now runs until the window is closed by default (`b66b943`).
+* **The network:** Roblox is DNS-blocked here without the owner's VPN (frontier item 1).
 * **Audio works** (`b25559d`): `libaaudio.so` over WASAPI; FMOD's init no longer fails with 51.
-* **The frame rate is the person's main complaint** ("unstable and unusable"): 1-7 fps. See the
-  frontier's item 3.
+* **The frame rate is the person's main complaint** ("unstable and unusable"): 1-7 fps. The menus
+  are much faster since `fdb2f88` (a 32 MiB JIT code cache per guest thread: 13 to 60 fps while
+  dragging; the person: "noticeably faster on the menus"). See the frontier's item 3.
 * The gate prints **`GUEST THREAD DIED at +Ns`** the moment a thread dies (it used to say so only
   at teardown, and a dead render thread read as a frozen window). **PowerShell wraps redirected
   output at 120 columns** in `play.ps1` logs, so a grep pattern can be split across two lines.
@@ -1061,7 +1197,13 @@ What a run reaches, every time:
    one core is the game loop spinning on `ALooper_pollOnce(0)` + a mutex (DECODED at `0x2bcd648`;
    it draws nothing); the render thread waits 81% of its time on a condition variable; the 1 ms
    timer resolution (`1634316`) is **not yet measured**. Measure what each frame waits on before
-   changing anything.
+   changing anything. **Since then (`fdb2f88`):** the TaskScheduler workers were re-translating
+   ~290,000 guest instructions a second because dynarmic evacuates a thread's whole code cache when
+   under 1 MiB is free; a 32 MiB cache per guest thread took dragging from 13 to 60 fps (the gate's
+   `CODE_CACHE_BYTES`, `OMNI_JIT_CACHE_MB` overrides). The **settled** landing still draws 1 fps
+   idle and 5-6 dragging, with the workers ~96% idle -- not translation, not decoded; the engine's
+   own throttle is the suspect (item 6). `OMNI_WAIT_TRACE` and the omni-cpu code-fetch counters
+   (`ce8a2d8`) are the instruments.
 4. **A kept directory after an unclean end** (console closed, Ctrl+C, a hang the watchdog ended):
    no exit record, a session record saying `I`, and the next launch takes the engine's inferred-crash
    report and a worker dies on a null member (MemoryFault reading 0 at link `0x2383500`, gate109,
