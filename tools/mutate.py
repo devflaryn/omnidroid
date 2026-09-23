@@ -176,6 +176,9 @@ JNI_SLOTS = "crates/omni-android/src/jni/slots.rs"
 # §8 row 26: the Java side's touch listener, `vk.e.onTouch`, and the seam that feeds it the host
 # window's pointer.
 JNI_INPUT = "crates/omni-android/src/jni/input.rs"
+# And `vk.g`, the hardware-key path, with the window seam's physical-key decode it depends on.
+JNI_KEYS = "crates/omni-android/src/jni/keys.rs"
+PLAT_WINDOW_WINDOWS = "crates/omni-platform/src/window/windows.rs"
 
 
 # Commands, kept narrow so the whole run stays under a few minutes.
@@ -275,6 +278,10 @@ GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "g
 # hand-assembled stand-in for the native through real translated code and reads back the registers
 # it was called with. No APK and no engine, so every row costs a build and not a run.
 INPUT = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "input", "--no-fail-fast"]
+
+# `omni-platform`'s unit tests alone. `PLATFORM` names the whole package, whose live network and
+# window targets need a gate and a network; the window backend's key decode is tested in the lib.
+PLATFORM_LIB = ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast"]
 
 # M6 groundwork: runtime texture transcoding (`omni-texture`). Zero dependencies and `#![no_std]`,
 # so its command builds in about a second.
@@ -6320,6 +6327,107 @@ directory", ADAPTER_FILES,
      """        let width = (view.0 as f32 / scale) as i32;""",
      """        let width = (view.0 as f32 / scale).round() as i32;""",
      INPUT),
+
+    # ---- hardware keys, `vk.g` -> `nativePassKeyEvent` ---------------------------------------------
+    #
+    # **Every key one to the right.** The engine turns the scan code into a key through its own
+    # table (`0x6e6414`), so an off-by-one here is W typing E -- and no call fails.
+    ("keys-A1", "A", "the host make code is off by one from the Linux input code",
+     JNI_KEYS,
+     """            0x01..=0x53 | 0x56..=0x58 => Some(make as u16),""",
+     """            0x01..=0x53 | 0x56..=0x58 => Some(make as u16 + 1),""",
+     INPUT),
+
+    # **The extended flag ignored**: the Up arrow becomes keypad 8, right Ctrl becomes left.
+    ("keys-A2", "A", "an extended key is read as its unextended twin",
+     JNI_KEYS,
+     """    match scancode & !0xFF {""",
+     """    match scancode & !0xE0FF {""",
+     INPUT),
+
+    # **Pause read as Num Lock**: they share make code 0x45, and only the flag parts them.
+    ("keys-A3", "A", "Pause is sent as Num Lock",
+     JNI_KEYS,
+     """            0x45 => Some(119),""",
+     """            0x45 => Some(69),""",
+     INPUT),
+
+    # **The scan code in the key code's register.** `w4` is never read (`0x02baebdc`), so the engine
+    # would receive the Android key code as a scan code and ignore the real one.
+    ("keys-A4", "A", "the scan code and the key code trade registers",
+     JNI_KEYS,
+     """        int(call.scan_code),
+        int(call.key_code),""",
+     """        int(call.key_code),
+        int(call.scan_code),""",
+     INPUT),
+
+    # **Auto-repeat dropped.** `getRepeatCount() > 0` is the fourth argument; the engine reads it.
+    ("keys-A5", "A", "an auto-repeat is sent as a fresh press",
+     JNI_KEYS,
+     """        WindowEvent::KeyDown { scancode, repeat, .. } => (true, scancode, repeat),""",
+     """        WindowEvent::KeyDown { scancode, .. } => (true, scancode, false),""",
+     INPUT),
+
+    # **A release sent as a press**: every key held for ever.
+    ("keys-A6", "A", "a key-up is sent as a key-down",
+     JNI_KEYS,
+     """        WindowEvent::KeyUp { scancode, .. } => (false, scancode, false),""",
+     """        WindowEvent::KeyUp { scancode, .. } => (true, scancode, false),""",
+     INPUT),
+
+    # **No keyboard declared, keys sent anyway**: a Java side the engine's own `Configuration`
+    # contradicts.
+    ("keys-A7", "A", "the seam is built without a declared hardware keyboard",
+     JNI_KEYS,
+     """        if declared
+            != (""",
+     """        if false && declared
+            != (""",
+     INPUT),
+
+    # **BACK and the volume keys passed.** `vk.g.a` withholds them (`0x0006`-`0x000f`).
+    ("keys-A8", "A", "vk.g.a's withheld keys are passed",
+     JNI_KEYS,
+     """    !WITHHELD_KEY_CODES.contains(&key_code)""",
+     """    true""",
+     INPUT),
+
+    # **The window seam drops the extended flag**, one layer down from keys-A2: right Ctrl and left
+    # Ctrl arrive as the same key.
+    ("keys-A9", "A", "the window seam's scan code loses the extended flag",
+     PLAT_WINDOW_WINDOWS,
+     """    if (lparam >> 24) & 1 != 0 { 0xE000 | make } else { make }""",
+     """    make""",
+     PLATFORM_LIB),
+
+    # **Over-correction: every make code is its own input code.** 84 is no key, and 85's set-1 code
+    # is not 0x55; past the 88 the two numberings part.
+    ("keys-B1", "B", "every make code up to 0x7f is passed through as an input code",
+     JNI_KEYS,
+     """            0x01..=0x53 | 0x56..=0x58 => Some(make as u16),""",
+     """            0x01..=0x7F => Some(make as u16),""",
+     INPUT),
+
+    # **Over-correction: an unknown extended key falls back to its make code** -- a key the engine
+    # would receive as some other key.
+    ("keys-B2", "B", "an extended key outside the table falls back to its make code",
+     JNI_KEYS,
+     """        0xE000 => EXTENDED.iter().find(|(code, _)| *code == make).map(|&(_, evdev)| evdev),""",
+     """        0xE000 => EXTENDED
+            .iter()
+            .find(|(code, _)| *code == make)
+            .map(|&(_, evdev)| evdev)
+            .or(Some(make as u16)),""",
+     INPUT),
+
+    # **Over-correction: the whole upper half of LPARAM as the code** -- the key-up transition bits
+    # and the flag folded into the make code.
+    ("keys-B3", "B", "the window seam's make code takes more than bits 16-23",
+     PLAT_WINDOW_WINDOWS,
+     """    let make = ((lparam >> 16) & 0xff) as u32;""",
+     """    let make = ((lparam >> 16) & 0xffff) as u32;""",
+     PLATFORM_LIB),
 ]
 
 
