@@ -872,7 +872,7 @@ static CONFIGURATION: &[MemberSpec] = &[
     f("navigation", "I", Answer::Int(1)),
     f("navigationHidden", "I", Answer::Int(1)),
     f("screenLayout", "I", Answer::Int(0x24)),
-    f("uiMode", "I", Answer::Int(0x11)),
+    f("uiMode", "I", Answer::Int(UI_MODE)),
     f("screenWidthDp", "I", Answer::Int(0)),
     f("screenHeightDp", "I", Answer::Int(0)),
     f("smallestScreenWidthDp", "I", Answer::Int(0)),
@@ -962,6 +962,24 @@ const BUILD_FIELDS: &[MemberSpec] = &[
 pub const FMOD_AAUDIO_MIN_SDK: i32 = 27;
 
 // -------------------------------------------------------------------------- the table
+
+/// `Configuration.uiMode`: `UI_MODE_TYPE_NORMAL` (1) with `UI_MODE_NIGHT_NO` (`0x10`). One constant,
+/// because `SystemThemeProtocol.getSystemTheme()` reads the same field ([`system_theme_for`]) and
+/// the two answers must not disagree.
+pub const UI_MODE: i32 = 0x11;
+
+/// `SystemThemeProtocol.getSystemTheme()`'s body, DECODED from `classes2.dex`: the night-mode bits
+/// of `uiMode` (`& 0x30`) -- `UI_MODE_NIGHT_NO` (16) is `SYSTEM_LIGHT`, whose value is 3,
+/// `UI_MODE_NIGHT_YES` (32) is `SYSTEM_DARK`, 4, and anything else is `ERROR`, 0 (the enum
+/// `SystemThemeProtocol$b`'s constructor arguments).
+#[must_use]
+pub const fn system_theme_for(ui_mode: i32) -> i32 {
+    match ui_mode & 0x30 {
+        0x10 => 3,
+        0x20 => 4,
+        _ => 0,
+    }
+}
 
 /// Every class this layer declares, with what it answers for each member.
 ///
@@ -1903,10 +1921,20 @@ pub static DECLARED: &[ClassSpec] = &[
     // (`script::ANDROID_SDK_INT`, 33) it is true. `getSystemTheme()` beside it reads the night-mode
     // bits of the Context's `Configuration.uiMode` -- a fact about the host's theme -- and stays
     // unanswered until a run reaches it and a host seam supplies it.
+    //
+    // **`getSystemTheme()` is answered now (MEASURED 2026-09-23: a worker died on it on the Login
+    // screen, `CallStaticIntMethodV` refused).** `NativeHelper.h0` adds the protocol to
+    // `MainGameActivity`'s lifecycle unconditionally, so its `onCreate` has stored the activity in
+    // `SystemThemeProtocol.j` on a device, and the method reads that activity's
+    // `Configuration.uiMode` -- [`UI_MODE`], the same value this layer answers for the field.
+    // [`system_theme_for`] is its body.
     ClassSpec {
         name: "com/roblox/universalapp/systemtheme/SystemThemeProtocol",
         tier: Tier::Support,
-        methods: &[s("isSystemThemeAvailable", "()Z", Answer::Bool(true))],
+        methods: &[
+            s("isSystemThemeAvailable", "()Z", Answer::Bool(true)),
+            s("getSystemTheme", "()I", Answer::Int(system_theme_for(UI_MODE))),
+        ],
         fields: NONE,
     },
     // **MEASURED, M6's gate**: once the Lua app's renderer was being created, a worker died on
@@ -2312,5 +2340,27 @@ mod tests {
             registry.record_miss(Miss { member: index.to_string(), ..miss.clone() });
         }
         assert_eq!(registry.misses().len(), MAX_MISSES);
+    }
+
+    /// `getSystemTheme` answers from the same `uiMode` the field answers, by the decoded body.
+    #[test]
+    fn the_system_theme_is_the_night_bits_of_the_ui_mode_this_layer_answers() {
+        assert_eq!(system_theme_for(0x11), 3, "UI_MODE_NIGHT_NO is SYSTEM_LIGHT");
+        assert_eq!(system_theme_for(0x21), 4, "UI_MODE_NIGHT_YES is SYSTEM_DARK");
+        assert_eq!(system_theme_for(0x01), 0, "UI_MODE_NIGHT_UNDEFINED is ERROR");
+        let registry = Registry::with_declared();
+        let class = registry.find("com/roblox/universalapp/systemtheme/SystemThemeProtocol").expect("declared");
+        let method = registry.method(class, "getSystemTheme", "()I", true).expect("declared");
+        let configuration = registry.find("android/content/res/Configuration").expect("declared");
+        let field = registry.field(configuration, "uiMode", "I", false).expect("declared");
+        let ui_mode = match registry.field_member(field).map(|member| member.answer) {
+            Some(Answer::Int(value)) => value,
+            other => panic!("uiMode answers {other:?}"),
+        };
+        assert_eq!(
+            registry.member(method).map(|member| member.answer),
+            Some(Answer::Int(system_theme_for(ui_mode))),
+            "getSystemTheme must answer from the uiMode this layer answers"
+        );
     }
 }

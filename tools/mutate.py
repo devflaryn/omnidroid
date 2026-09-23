@@ -300,6 +300,7 @@ BIONIC_SCHED = ["cargo", "test", "-p", "omni-android", "--release", "--test", "b
                 "sched"]
 BIONIC_HOSTNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
                    "gethostname"]
+JNI_THEME = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "system_theme"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7230,6 +7231,19 @@ directory", ADAPTER_FILES,
     let fits""",
      """    let fits""",
      BIONIC_HOSTNAME),
+
+    # SystemThemeProtocol.getSystemTheme: a worker died on it unanswered on the Login screen
+    # (2026-09-23). Its answer is its decoded body over the uiMode this layer answers.
+    ("theme-A1", "A", "getSystemTheme reads the night mode from the wrong bits of uiMode",
+     "crates/omni-android/src/jni/classes.rs",
+     """    match ui_mode & 0x30 {""",
+     """    match ui_mode & 0x0f {""",
+     JNI_THEME),
+    ("theme-B1", "B", "getSystemTheme answered as a constant, not from the uiMode the field answers",
+     "crates/omni-android/src/jni/classes.rs",
+     """            s("getSystemTheme", "()I", Answer::Int(system_theme_for(UI_MODE))),""",
+     """            s("getSystemTheme", "()I", Answer::Int(4)),""",
+     JNI_THEME),
 ]
 
 
