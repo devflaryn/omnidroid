@@ -282,6 +282,11 @@ GATE_ACTIVITY = ["cargo", "test", "-p", "omni-android", "--release", "--test", "
 GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
                 "--no-fail-fast", "the_application_name"]
 
+# The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
+# a temporary directory -- no APK, no guest -- so it costs a build and not a run.
+GATE_EXITS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
+              "--no-fail-fast", "exit_records"]
+
 # The touch seam: `jni::input`'s unit tests (in the lib target) and `tests/input.rs`, which calls a
 # hand-assembled stand-in for the native through real translated code and reads back the registers
 # it was called with. No APK and no engine, so every row costs a build and not a run.
@@ -6952,6 +6957,46 @@ directory", ADAPTER_FILES,
      """    if code == omni_bionic::errno::consts::EINTR && omni_bionic::threads::Futex::interrupted(futex) {""",
      """    if false {""",
      ANDROID),
+
+    # How earlier runs ended, as the engine is handed them. The engine matches the reason TEXT
+    # (`jk.l2.b` cuts it out of `toString()`), so the constant's Java name is the tempting wrong one.
+    ("exits-A1", "A", "the reason is spelled as the constant, not as reasonCodeToString spells it",
+     JNI_MOD,
+     """            Self::REASON_USER_REQUESTED => Ok("USER REQUESTED"),""",
+     """            Self::REASON_USER_REQUESTED => Ok("USER_REQUESTED"),""",
+     ANDROID_LIB),
+    # The answer the list had before it had elements: every list empty again.
+    ("exits-A2", "A", "List.size() answers 0 whatever the receiver holds",
+     JNI_CLASSES,
+     """            m("size", "()I", Answer::ListSize),""",
+     """            m("size", "()I", Answer::Int(0)),""",
+     ANDROID_LIB),
+    # A null where Java throws: the engine would read a record that is not there.
+    ("exits-A3", "A", "List.get() past the end answers null instead of refusing",
+     JNI_ENV,
+     """                    match usize::try_from(index).ok().and_then(|at| elements.get(at)) {""",
+     """                    match usize::try_from(index).ok().and_then(|at| elements.get(at)).or(Some(&None)) {""",
+     ANDROID_LIB),
+    # Oldest first: the bound would then drop the newest run, the one the next launch asks about.
+    ("exits-A4", "A", "the gate's exit records are kept oldest first",
+     GATE_ACTIVITY_FILE,
+     """    let mut records = vec![exit];
+    records.extend(read_exit_records(root));""",
+     """    let mut records = read_exit_records(root);
+    records.push(exit);""",
+     GATE_EXITS),
+    # The plausible stub: an event nothing can deliver reported as delivered. The engine then never
+    # hears the app went to the background, and says so only at the next launch, as a crash.
+    ("lifecycle-A1", "A", "a process event whose export nothing resolves is reported as sent",
+     JNI_SCRIPT,
+     """    let Some(target) = resolve(&symbol) else {
+        return Err(AbiError::JniRefused {
+            function: symbol,""",
+     """    let Some(target) = resolve(&symbol) else {
+        return Ok(()); #[allow(unreachable_code)]
+        return Err(AbiError::JniRefused {
+            function: symbol,""",
+     ANDROID_LIB),
 ]
 
 
