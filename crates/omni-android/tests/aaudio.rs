@@ -6,7 +6,7 @@
 //! reach: `requestStart` creating a guest thread through the guest's own `pthread_create`, that
 //! thread calling the guest's callback into a guest buffer, and the samples arriving at the host.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

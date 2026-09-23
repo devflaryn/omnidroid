@@ -24,7 +24,7 @@
 //! own rule, learned twice: a test that early-returns when a fixture is missing passes without
 //! asserting anything, and both High findings of the adapter review were exactly that shape.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

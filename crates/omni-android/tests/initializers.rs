@@ -23,7 +23,7 @@
 //! When the APK is absent every test here **skips loudly** on the process's own stderr rather than
 //! passing quietly.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

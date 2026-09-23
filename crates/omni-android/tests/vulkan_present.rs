@@ -41,7 +41,7 @@
 //! and is not one this runtime can measure. That limit is stated rather than papered over — and it
 //! is a great deal more than `VkResult == 0`, which is what `VERIFICATION.md` entry 11 is about.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 
