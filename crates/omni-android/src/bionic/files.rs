@@ -117,7 +117,7 @@ const O_DIRECTORY: i32 = 0o200000;
 const O_NOFOLLOW: i32 = 0o400000;
 /// `O_NOATIME` — advisory.
 const O_NOATIME: i32 = 0o1000000;
-/// `O_CLOEXEC` — nothing here execs.
+/// `O_CLOEXEC` — recorded on the descriptor for `fcntl(F_GETFD)`; nothing here execs.
 const O_CLOEXEC: i32 = 0o2000000;
 /// `O_SYNC`, which includes `O_DSYNC` in its own bit pattern.
 const O_SYNC: i32 = 0o4010000;
@@ -569,7 +569,7 @@ fn transfer_buffer(
 /// * **Accepted with nothing to do**, each because what it asks for is already true here:
 ///   `O_NOCTTY` (no controlling terminal exists), `O_NONBLOCK` (a no-op on a regular file on
 ///   Linux too), `O_LARGEFILE` (always in effect on LP64), `O_NOFOLLOW` (no path component may
-///   be a symlink, which is stronger), `O_NOATIME` (advisory), `O_CLOEXEC` (nothing execs).
+///   be a symlink, which is stronger), `O_NOATIME` (advisory), `O_CLOEXEC` (nothing execs; recorded for `F_GETFD`).
 ///   Ignoring these is conforming rather than convenient — each one's *contract* is satisfied.
 /// * **Refused by name**: `O_SYNC` and `O_DSYNC` promise the data is durable when the write
 ///   returns, which this layer does not do; `O_DIRECT` promises the page cache is bypassed;
@@ -656,7 +656,7 @@ pub(super) fn open(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let parsed = parse_open_flags(&view, flags)?;
         let fs = filesystem(&view)?;
         match settle(&view, fs.open(&bytes, parsed))? {
-            Settled::Done(fd) => fd,
+            Settled::Done(fd) => record_close_on_exec(&view, fs, fd, flags & O_CLOEXEC != 0)?,
             Settled::Failed(errno) => {
                 view.set_errno(errno);
                 -1
@@ -665,6 +665,27 @@ pub(super) fn open(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     c.ret().i32(result);
     Ok(())
+}
+
+/// Record `O_CLOEXEC` (or its per-call spelling) on a descriptor just made, and hand the
+/// descriptor back. The flag is the descriptor's; see [`Filesystem::is_close_on_exec`].
+pub(super) fn record_close_on_exec(
+    view: &GuestView<'_>,
+    fs: &Filesystem,
+    fd: i32,
+    on: bool,
+) -> AbiResult<i32> {
+    if on {
+        if let Settled::Failed(errno) = settle(view, fs.set_close_on_exec(fd, true))? {
+            // The descriptor was made a moment ago under the same table; losing it here is
+            // this layer's defect, and it says so rather than returning a descriptor without
+            // the flag the caller asked for.
+            return Err(view.refusal(format!(
+                "descriptor {fd} was just created and then not found to record FD_CLOEXEC on                  (errno {errno})"
+            )));
+        }
+    }
+    Ok(fd)
 }
 
 /// `int __open_2(const char *pathname, int flags)`
@@ -693,7 +714,7 @@ pub(super) fn open_2(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let parsed = parse_open_flags(&view, flags)?;
         let fs = filesystem(&view)?;
         match settle(&view, fs.open(&bytes, parsed))? {
-            Settled::Done(fd) => fd,
+            Settled::Done(fd) => record_close_on_exec(&view, fs, fd, flags & O_CLOEXEC != 0)?,
             Settled::Failed(errno) => {
                 view.set_errno(errno);
                 -1
@@ -1907,6 +1928,13 @@ pub(super) fn ioctl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `F_GETFD`: read the descriptor's flags, of which Linux defines one, `FD_CLOEXEC`.
+const F_GETFD: i32 = 1;
+/// `F_SETFD`: set them. Linux keeps `arg & FD_CLOEXEC` and ignores the rest, there being no
+/// other descriptor flag to set.
+const F_SETFD: i32 = 2;
+/// `FD_CLOEXEC`, the one descriptor flag.
+const FD_CLOEXEC: i32 = 1;
 /// `F_GETFL`: read the descriptor's status flags. Linux `asm-generic/fcntl.h`.
 const F_GETFL: i32 = 3;
 /// `F_SETFL`: set the descriptor's status flags.
@@ -2007,9 +2035,10 @@ pub(super) fn pipe(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 /// `int fcntl(int fd, int cmd, ...)`
 ///
-/// **Two commands, and every other one refuses with the command named.** `F_GETFL` and `F_SETFL`
-/// are what §5.2 needs: the glue sets `O_NONBLOCK` on both ends of both pipes, and reads nothing
-/// back.
+/// **The commands this runtime has something true to answer, and every other one refuses with the
+/// command named.** `F_GETFL` and `F_SETFL` are what §5.2 needs: the glue sets `O_NONBLOCK` on both
+/// ends of both pipes, and reads nothing back. `F_GETFD`/`F_SETFD` read and write the descriptor's
+/// `FD_CLOEXEC`, recorded where the descriptor is made ([`record_close_on_exec`]).
 ///
 /// Variadic. It is a fourteenth variadic import rather than a correction to Task 2's count of
 /// thirteen, which was over the 188 — `fcntl` is outside them.
@@ -2042,6 +2071,27 @@ pub(super) fn fcntl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             return Ok(());
         }
         match command {
+            // **The close-on-exec flag, as the guest set it.** Inert here -- nothing execs -- but
+            // reported truthfully. MEASURED why: pressing Play on a game page, a TaskScheduler
+            // worker called `fcntl(64, F_GETFD)` and died on the refusal (2026-09-23).
+            F_GETFD => match settle(&view, fs.is_close_on_exec(fd))? {
+                Settled::Done(true) => FD_CLOEXEC,
+                Settled::Done(false) => 0,
+                Settled::Failed(errno) => {
+                    view.set_errno(errno);
+                    -1
+                }
+            },
+            F_SETFD => {
+                let on = argument as i32 & FD_CLOEXEC != 0;
+                match settle(&view, fs.set_close_on_exec(fd, on))? {
+                    Settled::Done(()) => 0,
+                    Settled::Failed(errno) => {
+                        view.set_errno(errno);
+                        -1
+                    }
+                }
+            }
             F_GETFL => match settle(&view, fs.is_nonblocking(fd))? {
                 Settled::Done(true) => O_NONBLOCK,
                 Settled::Done(false) => 0,
@@ -2083,10 +2133,10 @@ pub(super) fn fcntl(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 return Err(view.refusal(format!(
                     "the guest called `fcntl` with {} on fd {fd}. This layer implements F_GETFL, \
                      F_SETFL(O_NONBLOCK) -- what the GameActivity glue needs for its two pipes \
-                     (jni-surface.md §5.2) -- and the process-private record locks \
-                     F_GETLK/F_SETLK/F_SETLKW the engine's SQLite takes. Every other command asks \
-                     for something this runtime does not have: a second descriptor for one \
-                     description, a close-on-exec flag with nothing to exec, a signal owner, an \
+                     (jni-surface.md §5.2), F_GETFD/F_SETFD (FD_CLOEXEC, recorded and inert) \
+                     and the process-private record locks F_GETLK/F_SETLK/F_SETLKW the engine's \
+                     SQLite takes. Every other command asks for something this runtime does not \
+                     have: a second descriptor for one description, a signal owner, an \
                      open-file-description lock, or a pipe capacity this layer fixes at \
                      omni_platform::fs::PIPE_CAPACITY",
                     fcntl_command_name(other)

@@ -10720,11 +10720,11 @@ fn fcntl_round_trips_o_nonblock_and_refuses_every_other_command() {
     assert_eq!(f.guest.read_u64(out) as i64, -1);
     assert_eq!(f.guest.read_u64(out + 8), EBADF_NET, "EBADF is Linux's 9");
 
-    // **Every other command refuses, and the refusal names it.** `F_DUPFD` and `F_SETFD` are the
-    // two a guest is most likely to reach for, and `F_GETPIPE_SZ` is the one whose believable
-    // wrong answer -- this layer's own capacity -- would be a promise about a pipe the guest
-    // could then resize.
-    for (command, name) in [(0u64, "F_DUPFD"), (2, "F_SETFD"), (1032, "F_GETPIPE_SZ")] {
+    // **Every other command refuses, and the refusal names it.** `F_DUPFD` and `F_DUPFD_CLOEXEC`
+    // are the two a guest is most likely to reach for, and `F_GETPIPE_SZ` is the one whose
+    // believable wrong answer -- this layer's own capacity -- would be a promise about a pipe the
+    // guest could then resize. (`F_GETFD`/`F_SETFD` answer; see the close-on-exec test below.)
+    for (command, name) in [(0u64, "F_DUPFD"), (1030, "F_DUPFD_CLOEXEC"), (1032, "F_GETPIPE_SZ")] {
         let error = refusal_of(&f, "fcntl", |asm| {
             asm.mov(0, read_fd as u64);
             asm.mov(1, command);
@@ -10749,6 +10749,141 @@ fn fcntl_round_trips_o_nonblock_and_refuses_every_other_command() {
         asm.mov(2, 0o20000);
     });
     assert!(error.to_string().contains("O_ASYNC"), "{error}");
+}
+
+/// `F_GETFD`, `F_SETFD` and `FD_CLOEXEC`, Linux `asm-generic/fcntl.h`.
+const F_GETFD_GUEST: u64 = 1;
+const F_SETFD_GUEST: u64 = 2;
+const FD_CLOEXEC_GUEST: u64 = 1;
+/// `O_CLOEXEC`, which `SOCK_CLOEXEC`, `EFD_CLOEXEC`, `TFD_CLOEXEC` and `EPOLL_CLOEXEC` all are.
+const O_CLOEXEC_GUEST: u64 = 0o2_000_000;
+
+/// **`FD_CLOEXEC` is the descriptor's, as the guest set it.** `F_GETFD` reads back what `open`'s
+/// `O_CLOEXEC`, `fopen`'s `e`, `socket`'s `SOCK_CLOEXEC`, `eventfd`'s `EFD_CLOEXEC`,
+/// `timerfd_create`'s `TFD_CLOEXEC` and `epoll_create1`'s `EPOLL_CLOEXEC` recorded, and `0` for a
+/// descriptor made without it; `F_SETFD` sets and clears it, keeping only `FD_CLOEXEC` of its
+/// argument; and a number `close` frees starts without it when the next open reuses it. MEASURED
+/// why: pressing Play on a game page, a TaskScheduler worker called `fcntl(64, F_GETFD)` and died
+/// on the refusal (2026-09-23).
+#[test]
+fn fcntl_reads_and_writes_the_close_on_exec_flag_each_descriptor_was_made_with() {
+    let _guard = serialized();
+    let (f, _scratch) = networked("cloexec");
+    let get = |fd: i64| {
+        value_of(&f, "fcntl", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, F_GETFD_GUEST);
+            asm.mov(2, 0);
+        }) as i64
+    };
+    let set = |fd: i64, argument: u64| {
+        value_of(&f, "fcntl", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, F_SETFD_GUEST);
+            asm.mov(2, argument);
+        }) as i64
+    };
+    let path = f.cstring(f.guest.data + 0x100, b"/cloexec.txt");
+    let open = |flags: u64| {
+        value_of(&f, "open", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, flags);
+            asm.mov(2, 0o644);
+        }) as i64
+    };
+
+    // `open`: the flag is the descriptor's, not the file's.
+    let plain = open(O_RDWR | O_CREAT);
+    assert!(plain >= 3, "open returned {plain}");
+    assert_eq!(get(plain), 0, "open without O_CLOEXEC");
+    let cloexec = open(O_RDWR | O_CLOEXEC_GUEST);
+    assert_eq!(get(cloexec), FD_CLOEXEC_GUEST as i64, "open with O_CLOEXEC");
+    assert_eq!(get(plain), 0, "a second descriptor for the same file has its own flag");
+
+    // `F_SETFD` both ways, and only `FD_CLOEXEC` of its argument counts.
+    assert_eq!(set(cloexec, 0), 0);
+    assert_eq!(get(cloexec), 0, "F_SETFD(0) clears it");
+    assert_eq!(set(plain, 0b110), 0);
+    assert_eq!(get(plain), 0, "bits other than FD_CLOEXEC set nothing");
+    assert_eq!(set(plain, 0b111), 0);
+    assert_eq!(get(plain), FD_CLOEXEC_GUEST as i64, "F_SETFD(FD_CLOEXEC | junk) sets it");
+
+    // A closed number the next open reuses starts clean.
+    assert_eq!(value_of(&f, "close", |asm| { asm.mov(0, plain as u64); }) as i64, 0);
+    let reused = open(O_RDONLY);
+    assert_eq!(reused, plain, "the lowest free number comes back");
+    assert_eq!(get(reused), 0, "without the flag its last holder had");
+
+    // `__open_2`, FORTIFY's spelling of a two-argument `open`.
+    let fortified = value_of(&f, "__open_2", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, O_RDONLY | O_CLOEXEC_GUEST);
+    }) as i64;
+    assert!(fortified >= 3, "__open_2 returned {fortified}");
+    assert_eq!(get(fortified), FD_CLOEXEC_GUEST as i64, "__open_2 with O_CLOEXEC");
+
+    // `fopen`'s `e`, and a mode without it.
+    for (mode, want) in [(&b"re"[..], FD_CLOEXEC_GUEST as i64), (&b"r"[..], 0)] {
+        let mode_at = f.cstring(f.guest.data + 0x140, mode);
+        let stream = value_of(&f, "fopen", |asm| {
+            asm.mov(0, path as u64);
+            asm.mov(1, mode_at as u64);
+        });
+        assert_ne!(stream, 0, "fopen returned NULL");
+        let fd = value_of(&f, "fileno", |asm| { asm.mov(0, stream); }) as i64;
+        assert_eq!(get(fd), want, "fopen mode {:?}", String::from_utf8_lossy(mode));
+        assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64, 0);
+    }
+
+    // `socket`, `eventfd`, `timerfd_create`, `epoll_create1`: each with and without its flag.
+    for cloexec in [0, O_CLOEXEC_GUEST] {
+        let want = if cloexec == 0 { 0 } else { FD_CLOEXEC_GUEST as i64 };
+        let socket = value_of(&f, "socket", |asm| {
+            asm.mov(0, AF_INET);
+            asm.mov(1, 2 | cloexec); // SOCK_DGRAM
+            asm.mov(2, 0);
+        }) as i64;
+        assert!(socket >= 3, "socket returned {socket}");
+        assert_eq!(get(socket), want, "socket, SOCK_CLOEXEC {cloexec:#o}");
+        let event = value_of(&f, "eventfd", |asm| {
+            asm.mov(0, 0);
+            asm.mov(1, cloexec);
+        }) as i64;
+        assert!(event >= 3, "eventfd returned {event}");
+        assert_eq!(get(event), want, "eventfd, EFD_CLOEXEC {cloexec:#o}");
+        let timer = value_of(&f, "timerfd_create", |asm| {
+            asm.mov(0, 1); // CLOCK_MONOTONIC
+            asm.mov(1, cloexec);
+        }) as i64;
+        assert!(timer >= 3, "timerfd_create returned {timer}");
+        assert_eq!(get(timer), want, "timerfd_create, TFD_CLOEXEC {cloexec:#o}");
+        let epoll = value_of(&f, "epoll_create1", |asm| { asm.mov(0, cloexec); }) as i64;
+        assert!(epoll >= 3, "epoll_create1 returned {epoll}");
+        assert_eq!(get(epoll), want, "epoll_create1, EPOLL_CLOEXEC {cloexec:#o}");
+    }
+
+    // A pipe is made without it.
+    let (read_fd, write_fd) = pipe_through_guest(&f);
+    assert_eq!((get(read_fd as i64), get(write_fd as i64)), (0, 0), "pipe");
+
+    // A descriptor nobody opened is `EBADF` for both commands.
+    for command in [F_GETFD_GUEST, F_SETFD_GUEST] {
+        let out = f.guest.data + 0x400;
+        let entry = program(&f, |asm| {
+            asm.mov(0, 61);
+            asm.mov(1, command);
+            asm.mov(2, FD_CLOEXEC_GUEST);
+            asm.bl(f.thunk("fcntl"));
+            asm.mov(22, out as u64);
+            asm.push(str_imm(0, 22, 0));
+            asm.bl(f.thunk("__errno"));
+            asm.push(ldr_w(1, 0, 0));
+            asm.push(str_imm(1, 22, 8));
+        });
+        assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(f.guest.read_u64(out) as i64, -1, "command {command}");
+        assert_eq!(f.guest.read_u64(out + 8), EBADF_NET, "command {command}: EBADF");
+    }
 }
 
 /// **`pwrite` writes at an offset through real guest code and leaves the sequential offset alone.**

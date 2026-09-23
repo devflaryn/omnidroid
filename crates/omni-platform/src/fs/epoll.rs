@@ -36,8 +36,8 @@
 
 use std::collections::BTreeMap;
 
-/// `EPOLL_CLOEXEC`, which is `O_CLOEXEC`. Accepted and inert, as `EFD_CLOEXEC` is: there is no
-/// `exec` in this runtime for close-on-exec to act on.
+/// `EPOLL_CLOEXEC`, which is `O_CLOEXEC`. Recorded on the descriptor for `fcntl(F_GETFD)` and
+/// otherwise inert, as `EFD_CLOEXEC` is: there is no `exec` in this runtime for it to act on.
 pub const EPOLL_CLOEXEC: i32 = 0o2_000_000;
 
 /// One watched descriptor: what the guest asked about, and what it asked to be handed back.

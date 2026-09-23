@@ -111,7 +111,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -764,6 +764,10 @@ pub struct Filesystem {
 #[derive(Debug)]
 struct Table {
     open: BTreeMap<i32, Entry>,
+    /// The descriptors carrying `FD_CLOEXEC`. A property of the **descriptor**, not of what it
+    /// names, so it is kept beside the table rather than in an [`Entry`]; `close` takes a number
+    /// out, so a number the next open reuses starts without it, as on Linux.
+    close_on_exec: BTreeSet<i32>,
     dirs: BTreeMap<i32, DirStream>,
     next_dir: i32,
 }
@@ -810,6 +814,7 @@ impl Filesystem {
                     (STDOUT_FD, Entry::Standard(StdStream::Out)),
                     (STDERR_FD, Entry::Standard(StdStream::Err)),
                 ]),
+                close_on_exec: BTreeSet::new(),
                 dirs: BTreeMap::new(),
                 next_dir: 1,
             }),
@@ -1117,6 +1122,7 @@ impl Filesystem {
     /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold.
     pub fn close(&self, fd: i32) -> FsResult<()> {
         let mut table = self.table();
+        table.close_on_exec.remove(&fd);
         match table.open.remove(&fd) {
             // Dropping the entry closes the host handle. A close that the host itself fails is
             // not reportable through `Drop`, and POSIX already says the descriptor is gone
@@ -1198,9 +1204,9 @@ impl Filesystem {
     /// and this seam's rule everywhere else: accepting a flag it cannot honour would tell the
     /// guest it got a behaviour it did not.
     ///
-    /// `EFD_CLOEXEC` is accepted and inert — there is no `exec` in this runtime, so there is
-    /// nothing for close-on-exec to do, and refusing it would refuse the flag almost every real
-    /// caller sets.
+    /// `EFD_CLOEXEC` is recorded on the descriptor ([`Filesystem::is_close_on_exec`]) and is
+    /// otherwise inert — there is no `exec` in this runtime — and refusing it would refuse the
+    /// flag almost every real caller sets.
     ///
     /// # Errors
     ///
@@ -1240,6 +1246,9 @@ impl Filesystem {
         );
         let fd = table.lowest_free_fd();
         table.open.insert(fd, Entry::EventFd(counter));
+        if flags & eventfd::EFD_CLOEXEC != 0 {
+            table.close_on_exec.insert(fd);
+        }
         Ok(fd)
     }
 
@@ -1405,6 +1414,9 @@ impl Filesystem {
             timerfd::TimerFd::new(flags & timerfd::TFD_NONBLOCK != 0, Arc::clone(&self.gate));
         let fd = table.lowest_free_fd();
         table.open.insert(fd, Entry::TimerFd(timer));
+        if flags & timerfd::TFD_CLOEXEC != 0 {
+            table.close_on_exec.insert(fd);
+        }
         Ok(fd)
     }
 
@@ -1632,6 +1644,43 @@ impl Filesystem {
                 .nonblocking()),
             Some(_) => Ok(false),
         }
+    }
+
+    /// Whether `fd` carries `FD_CLOEXEC` -- `fcntl(F_GETFD)`.
+    ///
+    /// **Recorded and reported, and inert**: nothing in this runtime execs, so the flag changes
+    /// nothing a guest can observe except this answer -- which is why the answer has to be the
+    /// flag the guest set (by `O_CLOEXEC`, `SOCK_CLOEXEC`, `EFD_CLOEXEC`, `TFD_CLOEXEC`,
+    /// `EPOLL_CLOEXEC`, `fopen`'s `e`, or `F_SETFD`) rather than a constant.
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold.
+    pub fn is_close_on_exec(&self, fd: i32) -> FsResult<bool> {
+        let table = self.table();
+        if !table.open.contains_key(&fd) {
+            return Err(bad_fd("is_close_on_exec", fd));
+        }
+        Ok(table.close_on_exec.contains(&fd))
+    }
+
+    /// Set or clear `FD_CLOEXEC` on `fd` -- `fcntl(F_SETFD)`, and every call that creates a
+    /// descriptor with its own close-on-exec flag. See [`Filesystem::is_close_on_exec`].
+    ///
+    /// # Errors
+    ///
+    /// [`FsErrorKind::BadDescriptor`] for a descriptor this instance does not hold.
+    pub fn set_close_on_exec(&self, fd: i32, on: bool) -> FsResult<()> {
+        let mut table = self.table();
+        if !table.open.contains_key(&fd) {
+            return Err(bad_fd("set_close_on_exec", fd));
+        }
+        if on {
+            table.close_on_exec.insert(fd);
+        } else {
+            table.close_on_exec.remove(&fd);
+        }
+        Ok(())
     }
 
     /// Set or clear `O_NONBLOCK` on `fd`.

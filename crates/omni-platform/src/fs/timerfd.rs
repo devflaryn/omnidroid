@@ -42,7 +42,8 @@ use super::pipe::{ReadyGate, Readiness};
 pub const TFD_TIMER_ABSTIME: i32 = 1;
 /// `TFD_NONBLOCK`, which is `O_NONBLOCK`.
 pub const TFD_NONBLOCK: i32 = 0o4_000;
-/// `TFD_CLOEXEC`, which is `O_CLOEXEC`. Accepted and inert: there is no `exec` here.
+/// `TFD_CLOEXEC`, which is `O_CLOEXEC`. Recorded on the descriptor for `fcntl(F_GETFD)` and
+/// otherwise inert: there is no `exec` here.
 pub const TFD_CLOEXEC: i32 = 0o2_000_000;
 /// Every `timerfd_create` flag Linux defines.
 pub const KNOWN_FLAGS: i32 = TFD_NONBLOCK | TFD_CLOEXEC;

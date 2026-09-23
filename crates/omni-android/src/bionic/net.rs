@@ -1111,8 +1111,8 @@ const INDEFINITE_EPOLL_PASS: Duration = Duration::from_secs(3600);
 /// `int epoll_create1(int flags)`
 ///
 /// A new, empty interest list, as a descriptor from the one table (D30). `EPOLL_CLOEXEC` is
-/// accepted and inert -- there is no `exec` for it to act on -- and any other flag is `EINVAL`,
-/// which is the kernel's answer.
+/// recorded for `fcntl(F_GETFD)` and otherwise inert -- there is no `exec` for it to act on -- and
+/// any other flag is `EINVAL`, which is the kernel's answer.
 ///
 /// MEASURED reader: the engine's transport, `RbxTransport I/O backend chosen: sys`, at
 /// `libroblox.so` link `0x23cc788` with flags 0, on the client-settings success path. The guest
@@ -1128,7 +1128,9 @@ pub(super) fn epoll_create1(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         } else {
             let fs = filesystem(&view)?;
             match settle(&view, fs.epoll_create())? {
-                Settled::Done(fd) => fd,
+                Settled::Done(fd) => {
+                    super::files::record_close_on_exec(&view, fs, fd, flags & EPOLL_CLOEXEC != 0)?
+                }
                 Settled::Failed(errno) => {
                     view.set_errno(errno);
                     -1
@@ -2186,9 +2188,8 @@ pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         };
         // `SOCK_NONBLOCK` is honoured before the descriptor exists, which is the whole point of
         // its being a `socket(2)` flag rather than a later `fcntl`: there is no window in which
-        // the socket is blocking. `SOCK_CLOEXEC` is accepted and inert -- there is no `exec` in
-        // this runtime, so there is nothing for close-on-exec to do, and refusing it would refuse
-        // the flag almost every real caller sets.
+        // the socket is blocking. `SOCK_CLOEXEC` is recorded on the descriptor below and is
+        // otherwise inert -- there is no `exec` in this runtime -- and `fcntl(F_GETFD)` reports it.
         if flags & SOCK_NONBLOCK != 0 {
             if let Netted::Failed(errno) = settled(&view, socket.set_nonblocking(true))? {
                 view.set_errno(errno);
@@ -2197,7 +2198,9 @@ pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             }
         }
         match settle(&view, fs.attach_socket(socket))? {
-            Settled::Done(fd) => fd,
+            Settled::Done(fd) => {
+                super::files::record_close_on_exec(&view, fs, fd, flags & SOCK_CLOEXEC != 0)?
+            }
             Settled::Failed(errno) => {
                 view.set_errno(errno);
                 -1

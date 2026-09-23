@@ -305,6 +305,8 @@ BIONIC_GAI = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bio
               "getaddrinfo"]
 FUTEX_RUNTIME = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "bionic::runtime"]
 BIONIC_MUTEX_LIB = ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "mutex"]
+BIONIC_CLOEXEC = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+                  "close_on_exec"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7288,6 +7290,95 @@ directory", ADAPTER_FILES,
      """            None => &[platnet::IpFamily::V6, platnet::IpFamily::V4],""",
      """            None => &[platnet::IpFamily::V4, platnet::IpFamily::V6],""",
      BIONIC_GAI),
+
+    # FD_CLOEXEC, recorded where descriptors are made and read by fcntl(F_GETFD): what Play reached
+    # after the null node (2026-09-23).
+    ("cloexec-A1", "A", "record_close_on_exec records nothing: every creator's flag is lost",
+     "crates/omni-android/src/bionic/files.rs",
+     """    if on {
+        if let Settled::Failed(errno) = settle(view, fs.set_close_on_exec(fd, true))? {""",
+     """    if false {
+        if let Settled::Failed(errno) = settle(view, fs.set_close_on_exec(fd, true))? {""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A2", "A", "open drops O_CLOEXEC",
+     "crates/omni-android/src/bionic/files.rs",
+     """        let mut view = enter(c, &state);
+        let bytes = path_for(view.blaming(0), path, 0)?;
+        let parsed = parse_open_flags(&view, flags)?;
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.open(&bytes, parsed))? {
+            Settled::Done(fd) => record_close_on_exec(&view, fs, fd, flags & O_CLOEXEC != 0)?,""",
+     """        let mut view = enter(c, &state);
+        let bytes = path_for(view.blaming(0), path, 0)?;
+        let parsed = parse_open_flags(&view, flags)?;
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.open(&bytes, parsed))? {
+            Settled::Done(fd) => record_close_on_exec(&view, fs, fd, false)?,""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A3", "A", "__open_2 drops O_CLOEXEC",
+     "crates/omni-android/src/bionic/files.rs",
+     """        }
+        let bytes = path_for(view.blaming(0), path, 0)?;
+        let parsed = parse_open_flags(&view, flags)?;
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.open(&bytes, parsed))? {
+            Settled::Done(fd) => record_close_on_exec(&view, fs, fd, flags & O_CLOEXEC != 0)?,""",
+     """        }
+        let bytes = path_for(view.blaming(0), path, 0)?;
+        let parsed = parse_open_flags(&view, flags)?;
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.open(&bytes, parsed))? {
+            Settled::Done(fd) => record_close_on_exec(&view, fs, fd, false)?,""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A4", "A", "F_GETFD answers 0 for a descriptor that carries FD_CLOEXEC",
+     "crates/omni-android/src/bionic/files.rs",
+     """                Settled::Done(true) => FD_CLOEXEC,""",
+     """                Settled::Done(true) => 0,""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A5", "A", "fopen drops its mode's `e`",
+     "crates/omni-android/src/bionic/stdio.rs",
+     """            Ok(mode) => (open_flags(mode), mode.close_on_exec),""",
+     """            Ok(mode) => (open_flags(mode), false),""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A6", "A", "socket drops SOCK_CLOEXEC",
+     "crates/omni-android/src/bionic/net.rs",
+     """                super::files::record_close_on_exec(&view, fs, fd, flags & SOCK_CLOEXEC != 0)?""",
+     """                super::files::record_close_on_exec(&view, fs, fd, false)?""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A7", "A", "epoll_create1 drops EPOLL_CLOEXEC",
+     "crates/omni-android/src/bionic/net.rs",
+     """                    super::files::record_close_on_exec(&view, fs, fd, flags & EPOLL_CLOEXEC != 0)?""",
+     """                    super::files::record_close_on_exec(&view, fs, fd, false)?""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A8", "A", "eventfd drops EFD_CLOEXEC",
+     "crates/omni-platform/src/fs/mod.rs",
+     """        if flags & eventfd::EFD_CLOEXEC != 0 {""",
+     """        if false {""",
+     BIONIC_CLOEXEC),
+    ("cloexec-A9", "A", "timerfd_create drops TFD_CLOEXEC",
+     "crates/omni-platform/src/fs/mod.rs",
+     """        if flags & timerfd::TFD_CLOEXEC != 0 {""",
+     """        if false {""",
+     BIONIC_CLOEXEC),
+    ("cloexec-B1", "B", "close leaves the flag on the number, so the next open that reuses it inherits it",
+     "crates/omni-platform/src/fs/mod.rs",
+     """        table.close_on_exec.remove(&fd);
+        match table.open.remove(&fd) {""",
+     """        match table.open.remove(&fd) {""",
+     BIONIC_CLOEXEC),
+    ("cloexec-B2", "B", "F_SETFD(0) cannot clear the flag",
+     "crates/omni-platform/src/fs/mod.rs",
+     """        } else {
+            table.close_on_exec.remove(&fd);
+        }""",
+     """        } else {
+        }""",
+     BIONIC_CLOEXEC),
+    ("cloexec-B3", "B", "F_SETFD keeps any nonzero argument rather than only FD_CLOEXEC of it",
+     "crates/omni-android/src/bionic/files.rs",
+     """                let on = argument as i32 & FD_CLOEXEC != 0;""",
+     """                let on = argument != 0;""",
+     BIONIC_CLOEXEC),
 ]
 
 

@@ -387,8 +387,8 @@ pub(super) fn fopen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let mut view = enter(c, &state);
         let path_bytes = super::files::path_for(view.blaming(0), path, 0)?;
         let mode_bytes = mode_argument(view.blaming(1), mode, 1)?;
-        let flags = match omni_bionic::stdio::parse_mode(&mode_bytes) {
-            Ok(mode) => open_flags(mode),
+        let (flags, close_on_exec) = match omni_bionic::stdio::parse_mode(&mode_bytes) {
+            Ok(mode) => (open_flags(mode), mode.close_on_exec),
             Err(why) => {
                 view.set_errno(why.errno());
                 c.ret().u64(0);
@@ -397,7 +397,10 @@ pub(super) fn fopen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         };
         let fs = filesystem(&view)?;
         match super::files::settle(&view, fs.open(&path_bytes, flags))? {
-            super::files::Settled::Done(fd) => match state.bionic.open_stream(&view, fd)? {
+            super::files::Settled::Done(fd) => match state
+                .bionic
+                .open_stream(&view, super::files::record_close_on_exec(&view, fs, fd, close_on_exec)?)?
+            {
                 Some(pointer) => pointer as u64,
                 None => {
                     let _ = fs.close(fd);
