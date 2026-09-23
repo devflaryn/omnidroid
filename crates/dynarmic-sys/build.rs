@@ -296,10 +296,31 @@ fn configure(
         "-DDYNARMIC_ENABLE_NO_EXECUTE_SUPPORT={}",
         if want_w_xor_x() { "ON" } else { "OFF" }
     ));
-    c.arg(format!("-DCMAKE_C_COMPILER={}", cmake_path(compiler.path())));
+    c.arg(format!("-DCMAKE_C_COMPILER={}", cmake_path(&c_compiler_path(compiler))));
     c.arg(format!("-DCMAKE_CXX_COMPILER={}", cmake_path(compiler.path())));
 
     run(c, "CMake configure", build_dir);
+}
+
+/// The C compiler CMake is given. `cl.exe` compiles both languages, so on MSVC it is the C++
+/// compiler's own path, unchanged. A GNU-style driver is not: `g++` or `clang++` handed to CMake
+/// as `CMAKE_C_COMPILER` fails CMake's C compiler check ("The C compiler identification is
+/// unknown ... broken"), which is what a Linux build met first. There the matching C driver is
+/// asked of `cc` itself, so `CC` keeps working the way `CXX` does.
+fn c_compiler_path(cxx: &cc::Tool) -> PathBuf {
+    if cxx.is_like_msvc() {
+        return cxx.path().to_path_buf();
+    }
+    let mut b = cc::Build::new();
+    b.cpp(false);
+    match b.try_get_compiler() {
+        Ok(tool) => tool.path().to_path_buf(),
+        Err(e) => fail(&[
+            s("No C compiler was found (CMake needs one alongside the C++ compiler)."),
+            format!("cc reported: {e}"),
+            s("Install gcc or clang, or set the CC environment variable."),
+        ]),
+    }
 }
 
 fn build(cmake: &Path, compiler: &cc::Tool, build_dir: &Path) {
