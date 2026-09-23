@@ -3880,6 +3880,47 @@ impl VulkanHost for GfxVulkanHost {
         Ok(())
     }
 
+    fn get_query_pool_results(
+        &self,
+        device: HostDevice,
+        pool: HostQueryPool,
+        first: u32,
+        count: u32,
+        stride: u64,
+        flags: u32,
+        data: &mut [u8],
+    ) -> AbiResult<i32> {
+        const METHOD: &str = "VulkanHost::get_query_pool_results";
+        let parts = self.device_parts(device)?;
+        let (owner, handle) = {
+            let table = self.locked_query_pools();
+            self.device_of(&table, pool.token(), "VkQueryPool", METHOD)?
+        };
+        if owner != parts.index {
+            return Err(cross_device("VkQueryPool", owner, parts.index));
+        }
+        // The raw entry point rather than `ash::Device::get_query_pool_results`, which fixes the
+        // stride at `size_of::<T>()` and the count at the slice's length: the guest's stride and
+        // count are its own, and so is the availability value interleaved with each result.
+        //
+        // SAFETY: the device and pool are live and the pool is the device's own; `data` is
+        // `data.len()` writable bytes, and the shim sized it to the whole span the driver writes
+        // for these queries, flags and stride -- which is also the `dataSize` passed.
+        let result = unsafe {
+            (parts.device.fp_v1_0().get_query_pool_results)(
+                parts.device.handle(),
+                handle,
+                first,
+                count,
+                data.len(),
+                data.as_mut_ptr().cast(),
+                stride,
+                vk::QueryResultFlags::from_raw(flags),
+            )
+        };
+        Ok(result.as_raw())
+    }
+
     fn destroy_query_pool(&self, pool: HostQueryPool) -> AbiResult<()> {
         const METHOD: &str = "VulkanHost::destroy_query_pool";
         let (device_index, handle) = {

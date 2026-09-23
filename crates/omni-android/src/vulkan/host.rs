@@ -2997,6 +2997,32 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkGetQueryPoolResults`, forwarded. `data` arrives holding **the guest's own bytes**, sized
+    /// to exactly the span the driver writes; the host has the driver write into it and answers
+    /// the driver's `VkResult` verbatim -- `VK_NOT_READY` included, with the unavailable queries'
+    /// bytes left as they arrived.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    #[allow(clippy::too_many_arguments)]
+    fn get_query_pool_results(
+        &self,
+        device: HostDevice,
+        pool: HostQueryPool,
+        first: u32,
+        count: u32,
+        stride: u64,
+        flags: u32,
+        data: &mut [u8],
+    ) -> AbiResult<i32> {
+        let _ = (device, pool, first, count, stride, flags, data);
+        Err(host_has_no(
+            "VulkanHost::get_query_pool_results",
+            "no timestamp is read back, and the GPU timer would divide whatever the buffer held",
+        ))
+    }
+
     /// `vkDestroyQueryPool`, forwarded.
     ///
     /// # Errors

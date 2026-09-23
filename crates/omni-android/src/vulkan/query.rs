@@ -20,6 +20,29 @@ use super::instance::{guest_pointer, refuse_allocator, require_pointer};
 use super::resource::check_header;
 use super::{Site, Vulkan, VK_SUCCESS};
 
+/// `VK_QUERY_TYPE_OCCLUSION`: one value per query.
+const QUERY_TYPE_OCCLUSION: u32 = 0;
+/// `VK_QUERY_TYPE_PIPELINE_STATISTICS`: one value per statistic the pool was created with.
+const QUERY_TYPE_PIPELINE_STATISTICS: u32 = 1;
+/// `VK_QUERY_TYPE_TIMESTAMP`: one value per query.
+const QUERY_TYPE_TIMESTAMP: u32 = 2;
+
+/// `VK_QUERY_RESULT_64_BIT`.
+const RESULT_64_BIT: u32 = 0x1;
+/// `VK_QUERY_RESULT_WAIT_BIT`.
+const RESULT_WAIT_BIT: u32 = 0x2;
+/// `VK_QUERY_RESULT_WITH_AVAILABILITY_BIT`: one more value per query.
+const RESULT_WITH_AVAILABILITY_BIT: u32 = 0x4;
+/// `VK_QUERY_RESULT_PARTIAL_BIT`.
+const RESULT_PARTIAL_BIT: u32 = 0x8;
+
+/// How many bytes one `vkGetQueryPoolResults` may have the driver write.
+///
+/// An allocation bound: the span is `(queryCount - 1) * stride` plus one query's results, and
+/// `stride` is a guest `VkDeviceSize`. 4,096 timestamps with availability, 64-bit, packed. MEASURED,
+/// the engine's GPU timer reads 16 bytes.
+pub const MAX_QUERY_RESULT_BYTES: usize = 4096 * 16;
+
 /// `VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO`.
 pub const STYPE_QUERY_POOL_CREATE_INFO: u32 = 11;
 
@@ -77,6 +100,7 @@ pub(super) fn create_query_pool(
         }
         DriverAnswer::Ok(token) => {
             let registered = vulkan.register_query_pool(at, token)?;
+            vulkan.remember_query_pool_shape(token, request);
             c.mem().write_bytes(registered.at, &registered.image, c.blame(3))?;
             c.mem().write_u64(out_at, registered.at as u64, c.blame(3))?;
             c.ret().i32(VK_SUCCESS);
@@ -125,6 +149,122 @@ pub(super) fn cmd_write_timestamp(
     Ok(())
 }
 
+/// `VkResult vkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery,
+/// uint32_t queryCount, size_t dataSize, void *pData, VkDeviceSize stride,
+/// VkQueryResultFlags flags)`
+///
+/// MEASURED: the GPU timer reads its two timestamps as `(0, 2, 16, pData, 8,
+/// VK_QUERY_RESULT_64_BIT)` -- **without `WAIT`**, so the driver may answer `VK_NOT_READY` and
+/// write only the queries that are available. The ones it does not write keep what the guest's
+/// buffer held: so the host is handed a copy of **the guest's own bytes** to write into, and the
+/// copy goes back whole. A zeroed host buffer copied back would be a timestamp of 0 the guest
+/// never had.
+///
+/// With no validation layer, a `dataSize` too small for the results the driver writes is a driver
+/// write past the end of the host's buffer; so the span is computed here, from the pool's own
+/// query type -- kept since `vkCreateQueryPool` -- and the flags, and a `dataSize` short of it is
+/// refused by name.
+pub(super) fn get_query_pool_results(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkGetQueryPoolResults";
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.device_token(at, CALL, args[0])?;
+    let pool = vulkan.query_pool_token(at, CALL, args[1])?;
+    let Some(shape) = vulkan.query_pool_shape(pool) else {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} on a query pool this layer registered \
+             but kept no shape for, so the size of its results cannot be known",
+            caller = at.caller
+        )));
+    };
+    let (first, count) = (args[2] as u32, args[3] as u32);
+    let data_size = args[4];
+    let data_at = require_pointer(at, CALL, "pData", args[5])?;
+    let (stride, flags) = (args[6], args[7] as u32);
+
+    if u64::from(first) + u64::from(count) > u64::from(shape.query_count) {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} for queries {first}..{end} of a pool of \
+             {pool_count}, which the specification forbids",
+            caller = at.caller,
+            end = u64::from(first) + u64::from(count),
+            pool_count = shape.query_count
+        )));
+    }
+    let known = RESULT_64_BIT | RESULT_WAIT_BIT | RESULT_WITH_AVAILABILITY_BIT | RESULT_PARTIAL_BIT;
+    if flags & !known != 0 {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} with `flags = {flags:#x}`; the bits \
+             {unknown:#x} are not core Vulkan's, and one of them (`WITH_STATUS_BIT_KHR`) changes \
+             how many values each query writes",
+            caller = at.caller,
+            unknown = flags & !known
+        )));
+    }
+    let values: u64 = match shape.query_type {
+        QUERY_TYPE_OCCLUSION | QUERY_TYPE_TIMESTAMP => 1,
+        QUERY_TYPE_PIPELINE_STATISTICS => u64::from(shape.pipeline_statistics.count_ones()),
+        other => {
+            return Err(at.refuse(format!(
+                "the guest called `{CALL}` from {caller:#x} on a pool of `queryType = {other}`, \
+                 whose results this layer does not know the size of",
+                caller = at.caller
+            )))
+        }
+    };
+    let width: u64 = if flags & RESULT_64_BIT != 0 { 8 } else { 4 };
+    let availability = u64::from(flags & RESULT_WITH_AVAILABILITY_BIT != 0);
+    let per_query = (values + availability) * width;
+    if stride % width != 0 {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} with `stride = {stride}`, which is not a \
+             multiple of the {width}-byte values it asked for; the specification forbids it",
+            caller = at.caller
+        )));
+    }
+    let span = if count == 0 {
+        Some(0)
+    } else {
+        stride.checked_mul(u64::from(count - 1)).and_then(|lead| lead.checked_add(per_query))
+    };
+    let span = match span {
+        Some(span) if span <= MAX_QUERY_RESULT_BYTES as u64 => span as usize,
+        _ => {
+            return Err(at.refuse(format!(
+                "the guest called `{CALL}` from {caller:#x} for {count} queries at a stride of \
+                 {stride}, a span past the {MAX_QUERY_RESULT_BYTES} bytes this layer has the \
+                 driver write in one call (Global Constraint 11)",
+                caller = at.caller
+            )))
+        }
+    };
+    if data_size < span as u64 {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} with `dataSize = {data_size}`, and \
+             {count} queries of {per_query} bytes at a stride of {stride} need {span}. The driver \
+             would write past the end of the buffer, which with no validation layer here is a \
+             write into whatever follows it",
+            caller = at.caller
+        )));
+    }
+
+    let mut data = c.mem().read_bytes(data_at, span, c.blame(5))?;
+    let result = host.get_query_pool_results(device, pool, first, count, stride, flags, &mut data)?;
+    if result >= 0 {
+        // `VK_SUCCESS` or `VK_NOT_READY`: what the driver wrote, and the guest's own bytes where it
+        // wrote nothing.
+        c.mem().write_bytes(data_at, &data, c.blame(5))?;
+    } else {
+        vulkan.note_driver_result(CALL, result);
+    }
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `void vkDestroyQueryPool(VkDevice device, VkQueryPool queryPool,
 /// const VkAllocationCallbacks *pAllocator)`
 pub(super) fn destroy_query_pool(
@@ -145,6 +285,7 @@ pub(super) fn destroy_query_pool(
     let token = vulkan.query_pool_token(at, CALL, args[1])?;
     host.destroy_query_pool(token)?;
     vulkan.forget_query_pool(handle);
+    vulkan.forget_query_pool_shape(token);
     c.ret().void();
     Ok(())
 }

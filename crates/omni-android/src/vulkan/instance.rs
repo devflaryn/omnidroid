@@ -786,7 +786,7 @@ pub(super) fn unimplemented(
              the thirteen `vkCmd*` a textured draw records. All to a real host driver through \
              `VulkanHost`, and `vkCmdDispatch`, `vkCmdCopyImage` and `vkCmdBlitImage`. It \
              implements no other Vulkan command: **indirect \
-             dispatch, query results, events, sparse binding, buffer views, secondary command buffers and most \
+             dispatch, events, sparse binding, buffer views, secondary command buffers and most \
              `2`-suffixed variants are not here**, and which of them gets \
              built is decided by what the engine's census actually asks for rather than by a \
              header (D17). Nothing has been created, nothing has been destroyed, and no status \

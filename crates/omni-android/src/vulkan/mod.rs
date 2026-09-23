@@ -211,7 +211,7 @@ pub use resource::{
     BUFFER_CREATE_INFO_BYTES, IMAGE_CREATE_INFO_BYTES, MAX_RESOURCE_QUEUE_FAMILIES,
     SAMPLER_CREATE_INFO_BODY_BYTES, SAMPLER_CREATE_INFO_BYTES,
 };
-pub use query::{QUERY_POOL_CREATE_INFO_BYTES, STYPE_QUERY_POOL_CREATE_INFO};
+pub use query::{MAX_QUERY_RESULT_BYTES, QUERY_POOL_CREATE_INFO_BYTES, STYPE_QUERY_POOL_CREATE_INFO};
 pub use shader::{
     ATTACHMENT_DESCRIPTION_BYTES, ATTACHMENT_REFERENCE_BYTES, COLOR_BLEND_ATTACHMENT_BYTES,
     COLOR_BLEND_STATE_BYTES, COMPUTE_PIPELINE_CREATE_INFO_BYTES, DEPTH_STENCIL_STATE_BODY_BYTES,
@@ -1028,6 +1028,8 @@ struct State {
     templates: BTreeMap<u64, Vec<descriptor::TemplateEntry>>,
     /// The next [`descriptor::TemplateId`] to hand out.
     next_template: u64,
+    /// Each live query pool's create info, by host token: what one of its results is sized by.
+    query_shapes: BTreeMap<u64, QueryPoolRequest>,
     /// The `GuestSpace` pages behind every **imported** `VkDeviceMemory`, by token.
     ///
     /// **The one piece of state in this file that owns address space.** A forwarded allocation has
@@ -1210,6 +1212,7 @@ impl Vulkan {
                 update_templates: None,
                 templates: BTreeMap::new(),
                 next_template: 0,
+                query_shapes: BTreeMap::new(),
                 imports: BTreeMap::new(),
                 imported_bytes: 0,
                 imported_peak: 0,
@@ -2536,6 +2539,21 @@ impl Vulkan {
          data at another template's offsets"
     }
 
+    /// Keep what a query pool holds -- its type, count and statistics -- for reading its results.
+    fn remember_query_pool_shape(&self, pool: HostQueryPool, request: QueryPoolRequest) {
+        self.state.lock().query_shapes.insert(pool.token(), request);
+    }
+
+    /// What a live query pool holds, or `None` for one no create kept.
+    fn query_pool_shape(&self, pool: HostQueryPool) -> Option<QueryPoolRequest> {
+        self.state.lock().query_shapes.get(&pool.token()).copied()
+    }
+
+    /// Forget a destroyed query pool's shape.
+    fn forget_query_pool_shape(&self, pool: HostQueryPool) {
+        self.state.lock().query_shapes.remove(&pool.token());
+    }
+
     /// Keep a template's entries and register a handle for them.
     fn register_update_template(
         &self,
@@ -3523,6 +3541,7 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkDestroyQueryPool" => query::destroy_query_pool(c, &at, &vulkan, args),
         "vkCmdResetQueryPool" => query::cmd_reset_query_pool(c, &at, &vulkan, args),
         "vkCmdWriteTimestamp" => query::cmd_write_timestamp(c, &at, &vulkan, args),
+        "vkGetQueryPoolResults" => query::get_query_pool_results(c, &at, &vulkan, args),
         "vkCreatePipelineLayout" => shader::create_pipeline_layout(c, &at, &vulkan, args),
         "vkDestroyPipelineLayout" => shader::destroy_pipeline_layout(c, &at, &vulkan, args),
         "vkCreateRenderPass" => shader::create_render_pass(c, &at, &vulkan, args),

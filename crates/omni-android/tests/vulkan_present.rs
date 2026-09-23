@@ -92,7 +92,7 @@ use omni_android::vulkan::{
     SURFACE_CAPABILITIES_BYTES, SURFACE_FORMAT_BYTES, SWAPCHAIN_CREATE_INFO_BYTES,
     VERTEX_INPUT_ATTRIBUTE_BYTES, VERTEX_INPUT_BINDING_BYTES, VERTEX_INPUT_STATE_BYTES,
     VIEWPORT_STATE_BYTES, VK_ERROR_OUT_OF_DATE_KHR, VK_INCOMPLETE, VK_SUBOPTIMAL_KHR, VK_SUCCESS,
-    VK_TIMEOUT, VK_WHOLE_SIZE, WRITE_DESCRIPTOR_SET_BYTES,
+    VK_NOT_READY, VK_TIMEOUT, VK_WHOLE_SIZE, WRITE_DESCRIPTOR_SET_BYTES,
 };
 use omni_android::{AbiError, AbiResult, Boundary};
 use omni_cpu::{ExitReason, GuestAddr};
@@ -679,6 +679,7 @@ impl VulkanHost for StageFourHost {
                 | "vkDestroyQueryPool"
                 | "vkCmdResetQueryPool"
                 | "vkCmdWriteTimestamp"
+                | "vkGetQueryPoolResults"
                 | "vkCreateDescriptorUpdateTemplate"
                 | "vkUpdateDescriptorSetWithTemplate"
                 | "vkDestroyDescriptorUpdateTemplate"
@@ -693,6 +694,44 @@ impl VulkanHost for StageFourHost {
         let mut log = self.log();
         log.query_pools.push(*request);
         Ok(DriverAnswer::Ok(HostQueryPool::from_token(log.query_pools.len() as u64 - 1)))
+    }
+
+    /// **A driver's answer, from what was recorded**: a query is available when a
+    /// `vkCmdWriteTimestamp` wrote it, and its value is `0x1000 + query`. The unavailable ones are
+    /// left as they arrived and the answer is `VK_NOT_READY`, as a driver's is without `WAIT`.
+    fn get_query_pool_results(
+        &self,
+        _device: HostDevice,
+        pool: HostQueryPool,
+        first: u32,
+        count: u32,
+        stride: u64,
+        flags: u32,
+        data: &mut [u8],
+    ) -> AbiResult<i32> {
+        let written: Vec<u32> = self
+            .log()
+            .query_commands
+            .iter()
+            .filter(|(what, at, _, _)| *what == "timestamp" && *at == pool)
+            .map(|(_, _, _, query)| *query)
+            .collect();
+        let mut all = true;
+        for index in 0..count {
+            let query = first + index;
+            if !written.contains(&query) {
+                all = false;
+                continue;
+            }
+            let at = (u64::from(index) * stride) as usize;
+            let value = 0x1000 + u64::from(query);
+            if flags & 1 != 0 {
+                data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            } else {
+                data[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
+            }
+        }
+        Ok(if all { VK_SUCCESS } else { VK_NOT_READY })
     }
 
     fn destroy_query_pool(&self, _pool: HostQueryPool) -> AbiResult<()> {
@@ -2078,6 +2117,28 @@ fn the_gpu_timers_commands_carry_their_pool_and_numbers() {
     );
     let text = f.refusal(name("vkCmdResetQueryPool"), &[command, command, 0, 2]).to_string();
     assert!(text.contains("VkQueryPool"), "a command buffer is not a pool: {text}");
+
+    // **The read-back, as the engine makes it**: `(0, 2, 16, pData, 8, VK_QUERY_RESULT_64_BIT)`,
+    // no `WAIT`. Only query 1 has been written, so the driver's answer is `VK_NOT_READY`, query 1
+    // is its value and **query 0 is still the guest's own bytes** -- not a zero the host made up.
+    let get = name("vkGetQueryPoolResults");
+    let results = f.poisoned(16, 0x5A);
+    let answer = f.call_n(get, &[up.device, pool, 0, 2, 16, results, 8, 1]).expect("a read-back");
+    assert_eq!(answer as i32, VK_NOT_READY, "the driver's own code");
+    assert_eq!(f.guest.read_u64(results as GuestAddr), 0x5A5A_5A5A_5A5A_5A5A, "left as it was");
+    assert_eq!(f.guest.read_u64(results as GuestAddr + 8), 0x1001, "query 1's timestamp");
+    // Query 0 written too, and the same read-back is whole.
+    f.call(name("vkCmdWriteTimestamp"), [command, 0x2000, pool, 0]).expect("timestamp");
+    let answer = f.call_n(get, &[up.device, pool, 0, 2, 16, results, 8, 1]).expect("a read-back");
+    assert_eq!(answer as i32, VK_SUCCESS);
+    assert_eq!(f.guest.read_u64(results as GuestAddr), 0x1000, "query 0's timestamp");
+
+    // A buffer too small for what the driver would write is refused by name, and so is a range
+    // past the pool's two queries.
+    let text = f.refusal(get, &[up.device, pool, 0, 2, 8, results, 8, 1]).to_string();
+    assert!(text.contains("dataSize = 8"), "{text}");
+    let text = f.refusal(get, &[up.device, pool, 1, 2, 16, results, 8, 1]).to_string();
+    assert!(text.contains("pool of 2"), "{text}");
 }
 
 /// **`vkCmdDispatch` carries its three group counts in order**, and a handle that is not a
@@ -5118,9 +5179,26 @@ fn a_real_driver_builds_the_compute_pipeline_the_guest_describes() {
             as i32,
         VK_SUCCESS
     );
+    // **Timed as the engine times its frame**: a two-query timestamp pool, reset, written either
+    // side of the dispatch, and read back after the queue drains.
+    let mut pool_info = vec![0u8; QUERY_POOL_CREATE_INFO_BYTES];
+    pool_info[0..4].copy_from_slice(&11u32.to_le_bytes()); // QUERY_POOL_CREATE_INFO
+    pool_info[20..24].copy_from_slice(&2u32.to_le_bytes()); // VK_QUERY_TYPE_TIMESTAMP
+    pool_info[24..28].copy_from_slice(&2u32.to_le_bytes()); // queryCount
+    let pool_info = f.bytes(&pool_info);
+    assert_eq!(
+        f.call(name("vkCreateQueryPool"), [device, pool_info, 0, out]).expect("pool") as i32,
+        VK_SUCCESS
+    );
+    let timer = f.guest.read_u64(out as GuestAddr);
+    f.call(name("vkCmdResetQueryPool"), [command, timer, 0, 2]).expect("reset");
+    // VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, query 0.
+    f.call(name("vkCmdWriteTimestamp"), [command, 0x1, timer, 0]).expect("timestamp");
     // VK_PIPELINE_BIND_POINT_COMPUTE.
     f.call(name("vkCmdBindPipeline"), [command, 1, pipeline, 0]).expect("bind");
     f.call(name("vkCmdDispatch"), [command, 5, 3, 1]).expect("dispatch");
+    // VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query 1.
+    f.call(name("vkCmdWriteTimestamp"), [command, 0x2000, timer, 1]).expect("timestamp");
     assert_eq!(
         f.call(name("vkEndCommandBuffer"), [command, 0, 0, 0]).expect("end") as i32,
         VK_SUCCESS
@@ -5141,6 +5219,17 @@ fn a_real_driver_builds_the_compute_pipeline_the_guest_describes() {
         VK_SUCCESS,
         "the dispatch ran to completion on the real queue"
     );
+    // The engine's read-back, plus `WAIT`: 64-bit, two queries, a stride of eight.
+    let results = f.poisoned(16, 0x5A);
+    let answer = f
+        .call_n(name("vkGetQueryPoolResults"), &[device, timer, 0, 2, 16, results, 8, 0x1 | 0x2])
+        .expect("the read-back completes");
+    assert_eq!(answer as i32, VK_SUCCESS, "both timestamps are available after the idle wait");
+    let (start, end) =
+        (f.guest.read_u64(results as GuestAddr), f.guest.read_u64(results as GuestAddr + 8));
+    assert_ne!(start, 0x5A5A_5A5A_5A5A_5A5A, "the driver wrote the first");
+    assert!(end >= start, "and the GPU's clock ran forwards across the dispatch: {start} -> {end}");
+    f.call(name("vkDestroyQueryPool"), [device, timer, 0, 0]).expect("the pool is destroyed");
 
     f.call(destroy, [device, pipeline, 0, 0]).expect("the pipeline is destroyed");
     assert!(f.vulkan().pipeline_handles().is_empty(), "and its handle is forgotten");
