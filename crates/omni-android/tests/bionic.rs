@@ -6615,11 +6615,22 @@ fn proc_self_statm_is_this_process_in_pages_and_the_engines_sscanf_reads_it() {
     // SAFETY: the whole reservation is this test's and nothing else refers to it.
     unsafe { vm::commit(reservation.as_ptr(), region, vm::Protection::ReadWrite).expect("commit") };
     let (_, committed) = read_fields();
-    assert!(
-        (moved(&reserved, &committed, 5) - pages(64 * MIB)).abs() <= pages(8 * MIB),
-        "64 MiB committed moved data by {} pages",
-        moved(&reserved, &committed, 5)
-    );
+    if cfg!(target_os = "macos") {
+        // macOS has no commit charge: memory is charged when first touched, and `data` is that
+        // charge, phys_footprint (docs/ports/macos.md, "Virtual memory"). So committing moves it
+        // by nothing, and touching -- below -- moves it by the 64 MiB.
+        assert!(
+            moved(&reserved, &committed, 5).abs() <= pages(8 * MIB),
+            "64 MiB committed and untouched moved data by {} pages on a host that charges on touch",
+            moved(&reserved, &committed, 5)
+        );
+    } else {
+        assert!(
+            (moved(&reserved, &committed, 5) - pages(64 * MIB)).abs() <= pages(8 * MIB),
+            "64 MiB committed moved data by {} pages",
+            moved(&reserved, &committed, 5)
+        );
+    }
     assert!(
         moved(&reserved, &committed, 1).abs() < pages(16 * MIB),
         "64 MiB committed and untouched moved resident by {} pages",
@@ -6641,6 +6652,13 @@ fn proc_self_statm_is_this_process_in_pages_and_the_engines_sscanf_reads_it() {
         "touching 64 MiB of private memory moved shared by {} pages",
         moved(&committed, &touched, 2)
     );
+    if cfg!(target_os = "macos") {
+        assert!(
+            (moved(&committed, &touched, 5) - pages(64 * MIB)).abs() <= pages(8 * MIB),
+            "touching 64 MiB moved data (phys_footprint) by {} pages",
+            moved(&committed, &touched, 5)
+        );
+    }
 
     // The engine's own parse, through this layer's `sscanf`: "%zu %zu %zu" into three slots.
     let format = f.cstring(f.guest.data + 0x200, b"%zu %zu %zu");
@@ -11679,7 +11697,11 @@ fn ftruncate_sets_the_length_and_refuses_what_linux_refuses() {
 fn a_read_only_file_mapping_holds_the_files_bytes_and_zeros_past_its_end() {
     let _guard = serialized();
     let (f, scratch) = rooted("mmap-file");
-    let content: Vec<u8> = (0..5000u32).map(|n| (n * 7 % 251) as u8).collect();
+    // One host page and 904 bytes more: 5000 bytes where a page is 4 KiB, as this test always
+    // used; on a 16 KiB host the second mapping's page offset is still inside the file.
+    let page = f.guest.space.page_size();
+    let length = page + 904;
+    let content: Vec<u8> = (0..length as u32).map(|n| (n * 7 % 251) as u8).collect();
     std::fs::write(scratch.path("buffer.bin"), &content).expect("a host file");
     let rw = open_through_guest(&f, "/buffer.bin", O_RDWR);
     let map = |length: u64, prot: u64, flags: u64, fd: i32, offset: u64| {
@@ -11692,11 +11714,11 @@ fn a_read_only_file_mapping_holds_the_files_bytes_and_zeros_past_its_end() {
             asm.mov(5, offset);
         })
     };
-    let (at, _) = map(5000, 1, 0x4001, rw, 0);
+    let (at, _) = map(length as u64, 1, 0x4001, rw, 0);
     assert_ne!(at, u64::MAX, "MAP_FAILED");
     let at = at as omni_cpu::GuestAddr;
-    assert_eq!(read_guest(&f, at, 5000), content, "the file's bytes");
-    assert_eq!(read_guest(&f, at + 5000, 16), vec![0u8; 16], "zeros past the end of the file");
+    assert_eq!(read_guest(&f, at, length), content, "the file's bytes");
+    assert_eq!(read_guest(&f, at + length, 16), vec![0u8; 16], "zeros past the end of the file");
     // The protection is PROT_READ: a store faults rather than landing.
     let entry = program(&f, |asm| {
         asm.mov(9, at as u64);
@@ -11709,8 +11731,9 @@ fn a_read_only_file_mapping_holds_the_files_bytes_and_zeros_past_its_end() {
     }
 
     // An offset that is a page: the file from there.
-    let (second, _) = map(100, 1, 0x02, rw, 4096);
-    assert_eq!(read_guest(&f, second as omni_cpu::GuestAddr, 100), &content[4096..4196]);
+    let (second, _) = map(100, 1, 0x02, rw, page as u64);
+    assert_ne!(second, u64::MAX, "MAP_FAILED for a page-aligned offset");
+    assert_eq!(read_guest(&f, second as omni_cpu::GuestAddr, 100), &content[page..page + 100]);
     assert_eq!(map(100, 1, 0x02, rw, 100), (u64::MAX, 22), "a misaligned offset: EINVAL");
     let wo = open_through_guest(&f, "/buffer.bin", O_WRONLY);
     assert_eq!(map(100, 1, 0x01, wo, 0), (u64::MAX, 13), "not open for reading: EACCES");
@@ -11829,14 +11852,21 @@ fn a_shared_writable_file_mapping_writes_the_file_it_maps() {
     assert_eq!(call_with_errno(&f, "msync", &[at, n, 4]), (0, 0));
     assert_eq!(&std::fs::read(&host).expect("read")[8..16], &second.to_le_bytes());
 
-    // Shortening a mapped file is the one thing the host will not do, and it is a refusal naming
-    // the host's reason rather than an errno the guest would believe.
+    // Shortening a mapped file is the one thing the Windows host will not do, and it is a refusal
+    // naming the host's reason rather than an errno the guest would believe. macOS allows it, as
+    // Linux does (MEASURED: the call returns 0), so there the call is made to the length the file
+    // already has -- a real truncate the host accepts, which leaves the mapping's pages inside the
+    // file for the rest of this test.
     let other = open_through_guest(&f, tmp, O_RDWR);
-    let refusal = refusal_of(&f, "ftruncate", |asm| {
-        asm.mov(0, other as u64);
-        asm.mov(1, 0);
-    });
-    assert!(refusal.to_string().contains("1224"), "{refusal}");
+    if cfg!(target_os = "windows") {
+        let refusal = refusal_of(&f, "ftruncate", |asm| {
+            asm.mov(0, other as u64);
+            asm.mov(1, 0);
+        });
+        assert!(refusal.to_string().contains("1224"), "{refusal}");
+    } else {
+        assert_eq!(call_with_errno(&f, "ftruncate", &[other as u64, n]), (0, 0));
+    }
     assert_eq!(call_with_errno(&f, "close", &[other as u64]), (0, 0));
 
     // `close`, then `AtomicCacheWrite`'s rename: the file in place is `n` bytes of what was written.
@@ -11961,7 +11991,9 @@ fn msync_answers_what_linux_answers() {
     assert_eq!(call_with_errno(&f, "munmap", &[at + page, page]), (0, 0));
     assert_eq!(msync(at, 2 * page, 4), (-1, 12), "a range with a hole in it: ENOMEM");
     assert_eq!(msync(at, page, 4), (0, 0), "the mapped half alone");
-    assert_eq!(msync(0x1000, page, 4), (-1, 12), "outside the guest's space: ENOMEM");
+    // One page: page-aligned on every host (0x1000 is not, where a page is 16 KiB, and Linux's
+    // msync checks alignment first) and far below the guest's space.
+    assert_eq!(msync(page, page, 4), (-1, 12), "outside the guest's space: ENOMEM");
 }
 
 /// **`posix_fallocate` makes the file at least `offset + len` bytes long and never shorter, and
@@ -13254,11 +13286,11 @@ fn a_write_chk_from_a_half_mapped_buffer_puts_nothing_into_the_descriptor() {
     let (f, scratch) = rooted("m1-write");
     let (island, page) = island_with_a_cliff(&f);
     let io_block = omni_platform::fs::IO_BLOCK;
-    assert_eq!(
-        page, io_block,
-        "this test's arithmetic needs a page to be exactly one IO_BLOCK; on a host where it is \
-         not, the second chunk would still be inside the island and nothing would be tested"
-    );
+    // The source starts one block before the cliff: its first block is the island's last and its
+    // second is past the cliff, on any host page that is a whole number of blocks (on a 4 KiB host
+    // this is the island's start, as it always was).
+    assert_eq!(page % io_block, 0, "a host page is a whole number of IO_BLOCKs");
+    let island = island + page - io_block;
     let count = (io_block * 2) as u64;
 
     let fd = open_through_guest(&f, "/m1w", O_WRONLY | O_CREAT);
@@ -13453,12 +13485,13 @@ fn a_fread_into_a_half_mapped_buffer_consumes_nothing_from_the_descriptor() {
     let _guard = serialized();
     let (f, scratch) = rooted("m1-fread");
     let (island, page) = island_with_a_cliff(&f);
-    assert_eq!(
-        page,
-        omni_bionic::stdio::TRANSFER_CHUNK,
-        "this test's arithmetic needs a page to be exactly one TRANSFER_CHUNK; on a host where \
-         it is not, the second chunk would still be inside the island and nothing would be tested"
-    );
+    // The buffer starts one chunk before the cliff, so its first chunk is the island's last and
+    // its second is past the cliff -- on any host page that is a whole number of chunks. Where a
+    // page *is* one chunk (4 KiB hosts) this is the island's start, as this test always used.
+    let chunk = omni_bionic::stdio::TRANSFER_CHUNK;
+    assert_eq!(page % chunk, 0, "a host page is a whole number of TRANSFER_CHUNKs");
+    let island = island + page - chunk;
+    let page = chunk;
 
     // --- A pipe. The bytes it gives up cannot be recovered.
     let fs = f.bionic.filesystem().expect("a root");
@@ -13595,7 +13628,11 @@ fn an_fwrite_from_a_half_mapped_buffer_puts_nothing_into_the_descriptor() {
     let _guard = serialized();
     let (f, scratch) = rooted("m1-fwrite");
     let (island, page) = island_with_a_cliff(&f);
-    assert_eq!(page, omni_bionic::stdio::TRANSFER_CHUNK, "a page must be exactly one chunk here");
+    // One chunk before the cliff; see the `fread` detector above for why.
+    let chunk = omni_bionic::stdio::TRANSFER_CHUNK;
+    assert_eq!(page % chunk, 0, "a host page is a whole number of TRANSFER_CHUNKs");
+    let island = island + page - chunk;
+    let page = chunk;
 
     let path = f.cstring(f.guest.data + 0x100, b"/w");
     let mode = f.cstring(f.guest.data + 0x140, b"wb");
