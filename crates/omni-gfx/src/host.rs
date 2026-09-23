@@ -5345,6 +5345,36 @@ impl VulkanHost for GfxVulkanHost {
         Ok(())
     }
 
+    fn cmd_resolve_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_resolve_image";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let source_handle = self.image_handle(source, "vkCmdResolveImage")?;
+        let destination_handle = self.image_handle(destination, "vkCmdResolveImage")?;
+        let built = flat_list(METHOD, regions, "VkImageResolve", image_resolve_from_bytes)?;
+        // SAFETY: the command buffer is live and recording, both images are live and in the
+        // layouts the guest named, and the regions are the guest's own -- the driver reports a
+        // source that is not multisampled or formats that differ.
+        unsafe {
+            device.cmd_resolve_image(
+                handle,
+                source_handle,
+                vk::ImageLayout::from_raw(source_layout as i32),
+                destination_handle,
+                vk::ImageLayout::from_raw(destination_layout as i32),
+                &built,
+            );
+        }
+        Ok(())
+    }
+
     fn cmd_blit_image(
         &self,
         buffer: HostCommandBuffer,
@@ -7140,6 +7170,7 @@ flat_structure!(buffer_copy_from_bytes, vk::BufferCopy, "VkBufferCopy");
 flat_structure!(buffer_image_copy_from_bytes, vk::BufferImageCopy, "VkBufferImageCopy");
 flat_structure!(image_copy_from_bytes, vk::ImageCopy, "VkImageCopy");
 flat_structure!(image_blit_from_bytes, vk::ImageBlit, "VkImageBlit");
+flat_structure!(image_resolve_from_bytes, vk::ImageResolve, "VkImageResolve");
 flat_structure!(
     blend_attachment_from_bytes,
     vk::PipelineColorBlendAttachmentState,

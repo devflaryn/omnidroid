@@ -63,7 +63,7 @@ use omni_android::vulkan::{
     HostImageRef, HostImageView, HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache,
     HostPipelineLayout, HostQueryPool, HostQueue, HostRenderPass, HostSampler, HostSemaphore,
     HostShaderModule, QueryPoolRequest, QUERY_POOL_CREATE_INFO_BYTES, IMAGE_COPY_BYTES,
-    IMAGE_BLIT_BYTES, MAX_BARRIERS,
+    IMAGE_BLIT_BYTES, IMAGE_RESOLVE_BYTES, MAX_BARRIERS,
     DescriptorWrites, DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES,
     DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES, STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
     HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
@@ -398,6 +398,8 @@ struct HostLog {
     image_copies: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>)>,
     /// Every `vkCmdBlitImage`: as `image_copies`, then the filter.
     image_blits: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>, u32)>,
+    /// Every `vkCmdResolveImage`: as `image_copies`.
+    image_resolves: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>)>,
 }
 
 /// The measured memory table of this machine, which the double reports so that the rewrite is
@@ -741,6 +743,7 @@ impl VulkanHost for StageFourHost {
                 | "vkCreateComputePipelines"
                 | "vkCmdDispatch"
                 | "vkCmdCopyImage"
+                | "vkCmdResolveImage"
                 | "vkCmdBlitImage"
                 | "vkDestroyPipeline"
                 | "vkCreateDescriptorSetLayout"
@@ -1329,6 +1332,25 @@ impl VulkanHost for StageFourHost {
         regions: &[u8],
     ) -> AbiResult<()> {
         self.log().image_copies.push((
+            source,
+            source_layout,
+            destination,
+            destination_layout,
+            regions.to_vec(),
+        ));
+        Ok(())
+    }
+
+    fn cmd_resolve_image(
+        &self,
+        _buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        self.log().image_resolves.push((
             source,
             source_layout,
             destination,
@@ -2406,6 +2428,25 @@ fn an_image_copy_carries_each_image_with_its_own_layout() {
     assert!(matches!(source, HostImageRef::Created(_)), "{source:?}");
     assert!(matches!(destination, HostImageRef::Swapchain(_)), "{destination:?}");
     assert_eq!(*filter, 0, "NEAREST");
+
+    // **`vkCmdResolveImage`: `vkCmdCopyImage`'s shape**, a created (multisampled) image into the
+    // swapchain's, `COLOR_ATTACHMENT_OPTIMAL`-free layouts as the engine's own barriers leave
+    // them. The region arrives whole, each layout with its image; a zero count is refused.
+    let resolve: Vec<u8> = (1u32..=17).flat_map(|word| (word * 0x0305).to_le_bytes()).collect();
+    assert_eq!(resolve.len(), IMAGE_RESOLVE_BYTES);
+    let resolves = f.bytes(&resolve);
+    f.call_n(name("vkCmdResolveImage"), &[command, created, 6, presented, 7, 1, resolves])
+        .expect("the resolve is recorded");
+    let recorded = up.host.log().image_resolves.clone();
+    assert_eq!(recorded.len(), 1);
+    let (source, source_layout, destination, destination_layout, bytes) = &recorded[0];
+    assert!(matches!(source, HostImageRef::Created(_)), "{source:?}");
+    assert!(matches!(destination, HostImageRef::Swapchain(_)), "{destination:?}");
+    assert_eq!((*source_layout, *destination_layout), (6, 7), "each layout with its own image");
+    assert_eq!(bytes, &resolve, "the region, whole");
+    let text = f.refusal(name("vkCmdResolveImage"), &[command, created, 6, presented, 7, 0, resolves]);
+    assert!(text.to_string().contains("regionCount = 0"), "{text}");
+    assert_eq!(up.host.log().image_resolves.len(), 1, "the refused one recorded nothing");
 }
 
 /// **The two-call protocol, the stable handles, and what a destroyed swapchain does to them.**

@@ -89,6 +89,11 @@ pub const IMAGE_SUBRESOURCE_LAYERS_BYTES: usize = 16;
 /// 44, `extent` 56 -- all four-byte members, so no padding anywhere.
 pub const IMAGE_COPY_BYTES: usize = 68;
 
+/// `sizeof(VkImageResolve)`: the same five members at the same offsets as [`IMAGE_COPY_BYTES`]'s
+/// `VkImageCopy` -- `srcSubresource`, `srcOffset`, `dstSubresource`, `dstOffset`, `extent` -- which
+/// the specification defines them as.
+pub const IMAGE_RESOLVE_BYTES: usize = IMAGE_COPY_BYTES;
+
 /// `sizeof(VkImageBlit)`: `srcSubresource` 0, `srcOffsets[2]` 16, `dstSubresource` 40,
 /// `dstOffsets[2]` 56 -- two corners each, all four-byte members.
 pub const IMAGE_BLIT_BYTES: usize = 80;
@@ -569,6 +574,41 @@ pub(super) fn cmd_copy_image(
     let regions =
         read_regions(c, at, CALL, "pRegions", "VkImageCopy", IMAGE_COPY_BYTES, args[5], args[6], 6)?;
     host.cmd_copy_image(buffer, source, args[2] as u32, destination, args[4] as u32, &regions)?;
+    c.ret().void();
+    Ok(())
+}
+
+/// `void vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage,
+/// VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout,
+/// uint32_t regionCount, const VkImageResolve *pRegions)`
+///
+/// `vkCmdCopyImage`'s shape exactly: seven parameters in registers, either image of either
+/// family. MEASURED: the engine's render thread called it on the landing screen, in a session
+/// that had been running for 150 seconds -- a multisampled image resolved into a single-sample
+/// one -- and died on the refusal it used to be.
+pub(super) fn cmd_resolve_image(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCmdResolveImage";
+    let host = vulkan.require_host(at)?;
+    let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    let source = vulkan.image_ref_token(at, CALL, args[1])?;
+    let destination = vulkan.image_ref_token(at, CALL, args[3])?;
+    let regions = read_regions(
+        c,
+        at,
+        CALL,
+        "pRegions",
+        "VkImageResolve",
+        IMAGE_RESOLVE_BYTES,
+        args[5],
+        args[6],
+        6,
+    )?;
+    host.cmd_resolve_image(buffer, source, args[2] as u32, destination, args[4] as u32, &regions)?;
     c.ret().void();
     Ok(())
 }

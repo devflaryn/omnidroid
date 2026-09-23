@@ -3674,6 +3674,29 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkCmdResolveImage`, forwarded. As [`VulkanHost::cmd_copy_image`], with `regions` the
+    /// guest's [`IMAGE_RESOLVE_BYTES`](super::IMAGE_RESOLVE_BYTES)-byte `VkImageResolve`s: a
+    /// multisampled source resolved into a single-sample destination.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_resolve_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, source, source_layout, destination, destination_layout, regions);
+        Err(host_has_no(
+            "VulkanHost::cmd_resolve_image",
+            "the destination keeps whatever it held instead of the multisampled image's resolve",
+        ))
+    }
+
     /// `vkCmdBlitImage`, forwarded. As [`VulkanHost::cmd_copy_image`], with `regions` the
     /// guest's [`IMAGE_BLIT_BYTES`](super::IMAGE_BLIT_BYTES)-byte `VkImageBlit`s and `filter` its
     /// `VkFilter`. Source and destination may be the same image.
