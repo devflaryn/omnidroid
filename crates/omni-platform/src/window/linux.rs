@@ -638,6 +638,12 @@ impl Window {
 
     /// Whether the window's `WM_STATE` says `IconicState`, read from the server.
     fn read_iconic(&self) -> bool {
+        self.wm_state() == Some(ICONIC_STATE)
+    }
+
+    /// The state in the window's `WM_STATE` (ICCCM 4.1.3.1), read from the server: `None` while
+    /// no window manager has taken the window on, which is also what it is with no manager at all.
+    fn wm_state(&self) -> Option<c_long> {
         let xl = &self.libs.xlib;
         let (mut kind, mut format, mut count, mut after) = (0, 0, 0, 0);
         let mut data: *mut u8 = ptr::null_mut();
@@ -658,15 +664,12 @@ impl Window {
                 &raw mut after,
                 &raw mut data,
             );
-            let iconic = status == xlib::Success as c_int
-                && !data.is_null()
-                && format == 32
-                && count >= 1
-                && *data.cast::<c_long>() == ICONIC_STATE;
+            let state = (status == xlib::Success as c_int && !data.is_null() && format == 32 && count >= 1)
+                .then(|| *data.cast::<c_long>());
             if !data.is_null() {
                 (xl.XFree)(data.cast());
             }
-            iconic
+            state
         }
     }
 
@@ -1352,6 +1355,13 @@ impl Window {
                 ),
             ));
         }
+        // **A minimise supersedes an activation `show` has not yet asked for.** Asked for once the
+        // window is mapped, `_NET_ACTIVE_WINDOW` would reach the manager *after* this minimise
+        // and un-minimise the window -- MEASURED under xfwm4: a minimise straight after the first
+        // frame came back as focus lost, focus regained, and no iconic state at all.
+        // (xfwm4 does iconify a window it has not taken on yet, MEASURED: `XIconifyWindow`
+        // straight after `XMapRaised` leaves `WM_STATE` iconic, 3 of 3 runs.)
+        self.focus_on_map.set(false);
         let mut sent = 0;
         self.checked("set_minimized", "XIconifyWindow", |xl| {
             // SAFETY: a live display and window and their screen number.
