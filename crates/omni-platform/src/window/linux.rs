@@ -59,6 +59,13 @@
 //! window being unmapped, which also ends the server's grab. The pointer is warped back to where it
 //! was held when the capture ends, which is where the Windows backend's one-pixel clip leaves it.
 //!
+//! **Another client can lift the confinement without taking the grab**, MEASURED on this port's
+//! Xvfb: a second client's `XGrabPointer` with no `confine_to` fails with `AlreadyGrabbed` -- and
+//! the server has already released the holder's confinement by then (`ProcGrabPointer` confines to
+//! the root before it tries the grab), so the pointer leaves the window with the grab still held.
+//! Re-grabbing puts the confinement back, so [`Window::poll`] does that while a capture is held --
+//! the X11 form of the Windows backend re-applying a clip the system reset.
+//!
 //! **5. The physical key is reported as Windows reports it.** See [`keymap`].
 //!
 //! # Why X11 first
@@ -755,22 +762,31 @@ impl Window {
             unsafe { (xl.XNextEvent)(self.display, &raw mut event) };
             self.handle(&mut event);
         }
+        // A confinement another client lifted under a held capture is put back (point 4).
+        if self.captured.is_some() {
+            self.grab();
+        }
         sink.append(&mut self.queue);
     }
 
     /// Turn one X event into seam events.
     fn handle(&mut self, event: &mut xlib::XEvent) {
         let xl = &self.libs.xlib;
+        let kind = event.get_type();
+        // **The key as it arrived, before the input method sees it.** The built-in input method
+        // rewrites the event it consumes: the key that completes a compose sequence comes back
+        // from `XFilterEvent` with its keycode set to 0 (and is put back, as keycode 0, carrying
+        // the composed text). The key was still pressed, so the raw event is read from this copy.
+        // SAFETY: for a key event, `key` is the member; for anything else the copy is unused.
+        let arrived = unsafe { event.key };
         // Every event goes past the input method first: it may be composing, and its own protocol
         // messages arrive as ordinary events it must consume.
         // SAFETY: a live event; 0 is `None`, "the event's own window".
         let filtered = unsafe { (xl.XFilterEvent)(event, 0) } != 0;
-        let kind = event.get_type();
         match kind {
-            xlib::KeyPress => self.key_press(event, filtered),
+            xlib::KeyPress => self.key_press(arrived, event, filtered),
             xlib::KeyRelease => {
-                // SAFETY: the type says `key` is the member.
-                let key = unsafe { event.key };
+                let key = arrived;
                 if key.keycode != 0 {
                     self.set_key_down(key.keycode, false);
                     let (keycode, scancode) = self.key_numbers(&key);
@@ -863,19 +879,19 @@ impl Window {
 
     /// A key press: the raw [`WindowEvent::KeyDown`] always (an input method composing still
     /// had the key pressed), and the text it typed when the input method did not keep it.
-    fn key_press(&mut self, event: &mut xlib::XEvent, filtered: bool) {
-        // SAFETY: the caller matched `KeyPress`, so `key` is the member.
-        let mut key = unsafe { event.key };
+    fn key_press(&mut self, arrived: xlib::XKeyEvent, event: &mut xlib::XEvent, filtered: bool) {
         // Keycode 0 is an input method's committed text, put back as a key event: text, no key.
-        if key.keycode != 0 {
-            let repeat = self.is_key_down(key.keycode);
-            self.set_key_down(key.keycode, true);
-            let (keycode, scancode) = self.key_numbers(&key);
+        if arrived.keycode != 0 {
+            let repeat = self.is_key_down(arrived.keycode);
+            self.set_key_down(arrived.keycode, true);
+            let (keycode, scancode) = self.key_numbers(&arrived);
             push_event(&mut self.queue, WindowEvent::KeyDown { keycode, scancode, repeat });
         }
         if filtered {
             return;
         }
+        // SAFETY: the caller matched `KeyPress`, so `key` is the member.
+        let mut key = unsafe { event.key };
         let xl = &self.libs.xlib;
         let mut buffer = vec![0u8; 64];
         let (mut keysym, mut status) = (0, 0);
@@ -1134,10 +1150,23 @@ impl Window {
             unsafe { (xl.XWarpPointer)(self.display, 0, self.window, 0, 0, 0, 0, held.0, held.1) };
         }
         self.select_raw_motion(true)?;
-        // SAFETY: a live display, window and cursor; the window both receives the grab's events
-        // and confines the pointer.
-        let status = unsafe {
-            (xl.XGrabPointer)(
+        let status = self.grab();
+        if status != xlib::GrabSuccess {
+            let _ = self.select_raw_motion(false);
+            return Err(x11(OP, "XGrabPointer", format!("{} ({status})", grab_status_name(status))));
+        }
+        self.captured = Some(held);
+        self.devices.clear();
+        Ok(true)
+    }
+
+    /// `XGrabPointer` for a capture: this window receives the grab's events and confines the
+    /// pointer, and the cursor is the blank one. Called again from [`Window::poll`] while a capture
+    /// is held, because re-grabbing a grab this client holds re-applies its confinement.
+    fn grab(&self) -> c_int {
+        // SAFETY: a live display, window and cursor.
+        unsafe {
+            (self.libs.xlib.XGrabPointer)(
                 self.display,
                 self.window,
                 xlib::False,
@@ -1148,14 +1177,7 @@ impl Window {
                 self.blank_cursor,
                 xlib::CurrentTime,
             )
-        };
-        if status != xlib::GrabSuccess {
-            let _ = self.select_raw_motion(false);
-            return Err(x11(OP, "XGrabPointer", format!("{} ({status})", grab_status_name(status))));
         }
-        self.captured = Some(held);
-        self.devices.clear();
-        Ok(true)
     }
 
     /// **End a capture**, whatever ended it: the grab released, raw motion deselected, and -- when
