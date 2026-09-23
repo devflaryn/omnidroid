@@ -754,6 +754,25 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
     );
     // And a floor, so the ceiling cannot be met by a measurement that measured nothing: creating
     // eight jits has to move the counter.
+    //
+    // **Not on macOS**, where the counter is `phys_footprint`, charged when a page is touched, and a
+    // new jit touches little: dynarmic-sys patch 0009 stopped the prelude from invalidating -- and
+    // so faulting in -- the whole code cache. MEASURED there: 0.027 MiB per thread at creation
+    // (n = 8). What the floor guards against is an instrument that sees nothing, so on macOS the
+    // instrument is shown seeing 16 MiB being touched instead.
+    #[cfg(target_os = "macos")]
+    {
+        let before = omni_mem::process_commit_charge().expect("commit charge");
+        let touched = vec![1u8; 16 << 20];
+        std::hint::black_box(&touched);
+        let grew = omni_mem::process_commit_charge().expect("commit charge").saturating_sub(before);
+        assert!(
+            grew >= 15 << 20,
+            "touching 16 MiB moved the commit charge by {grew} bytes -- the measurement is not \
+             measuring what it claims"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     assert!(
         per_thread_created >= 1024 * 1024,
         "creating a guest thread moved the commit charge by {per_thread_created} bytes, which is \
