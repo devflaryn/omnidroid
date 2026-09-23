@@ -70,7 +70,7 @@ fn chain(blocks: usize) -> Vec<u32> {
     code
 }
 
-const BLOCKS: usize = 8192;
+const BLOCKS: usize = 32_768;
 
 fn chain_vm() -> Vm {
     // 64 MiB: the chain's code must fit without dynarmic clearing the cache part-way.
@@ -108,6 +108,35 @@ fn a_translated_block_costs_bytes_of_bookkeeping_not_kilobytes() {
         per_block < 700.0,
         "{per_block:.0} bytes of bookkeeping per block: the jit is keeping each block's emission \
          products (EmittedBlockInfo in map buckets) rather than the records read after emission"
+    );
+}
+
+#[test]
+fn clearing_the_cache_gives_its_bookkeeping_back() {
+    let _g = lock();
+    run_chain(&chain_vm());
+
+    let vm = chain_vm();
+    let created = heap_in_use();
+    run_chain(&vm);
+    let ran = heap_in_use();
+
+    // The clear is performed at the top of the next run; start that run at the final SVC, so one
+    // block is translated after it.
+    // SAFETY: `vm.raw()` is live and not executing.
+    unsafe { dynarmic_sys::od_jit_clear_cache(vm.raw()) };
+    vm.set_pc(CODE_BASE + 4 * (2 * BLOCKS as u64));
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE, "the SVC after the clear");
+    let cleared = heap_in_use();
+
+    let held = (ran as f64 - created as f64) / BLOCKS as f64;
+    let kept = (cleared as f64 - created as f64) / BLOCKS as f64;
+    eprintln!("per block: {held:.0} bytes held after running, {kept:.0} still held after a clear");
+    assert!(held > 20.0, "the run was measured holding something: {held:.0} bytes per block");
+    assert!(
+        kept < 16.0,
+        "{kept:.0} bytes per block are still held after the cache was cleared: the bookkeeping \
+         was emptied rather than given back"
     );
 }
 
@@ -193,4 +222,75 @@ fn a_host_fault_finds_its_own_patch_site_among_a_blocks_several() {
     assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
     assert_eq!([vm.reg(1), vm.reg(2), vm.reg(3), vm.reg(4)], [0x1111, 0x2222, 0x3333, 0x4444]);
     assert!(vm.stats().slow_path_reads >= 1, "the third load was served by the callbacks: {:?}", vm.stats());
+}
+
+/// `NOP` x `nops`, then `ADD X0, X0, #1 ; SVC`: one block covering `4 * (nops + 1)` bytes.
+fn straight_line(nops: usize) -> Vec<u32> {
+    let mut code = vec![a64::NOP; nops];
+    code.push(a64::add_imm(0, 0, 1));
+    code.push(a64::svc(0));
+    code
+}
+
+/// Translate `straight_line(nops)`, rewrite its `ADD` and invalidate only that word; the next run
+/// must run the new `ADD`. Returns how many instructions the retranslation fetched.
+fn rewrite_the_last_word(nops: usize) -> u64 {
+    let mut code = straight_line(nops);
+    let vm = Vm::new(code.clone(), VmOptions { code_cache_size: 32 << 20, ..VmOptions::default() });
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 1);
+
+    code[nops] = a64::add_imm(0, 0, 100);
+    vm.with_ctx(|c| c.code = code);
+    vm.reset_stats();
+    // SAFETY: `vm.raw()` is live and not executing.
+    unsafe { dynarmic_sys::od_jit_invalidate_range(vm.raw(), CODE_BASE + 4 * nops as u64, 4) };
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 1 + 100, "a {nops}-NOP block ran a stale translation of its last word");
+    vm.stats().read_code
+}
+
+#[test]
+fn a_write_to_any_page_a_block_came_from_invalidates_it() {
+    let _g = lock();
+    // Patch 0011 indexes a block by the 4 KiB guest pages it covers. 1,100 instructions cover two;
+    // the rewritten word is on the second.
+    let fetched = rewrite_the_last_word(1_100);
+    assert!(fetched > 1_024, "the whole two-page block was retranslated: {fetched} fetches");
+}
+
+#[test]
+fn a_block_wider_than_the_page_index_is_still_found() {
+    let _g = lock();
+    // More than 64 pages in one block goes to the list checked on every invalidation. That the
+    // block really is one block is shown by the retranslation fetching all of it.
+    const NOPS: usize = 70_000;
+    let fetched = rewrite_the_last_word(NOPS);
+    assert!(fetched > 64 * 1024, "the block spans more than 64 pages: {fetched} fetches");
+}
+
+#[test]
+fn an_invalidation_of_the_whole_address_space_reaches_every_block() {
+    let _g = lock();
+    // More pages asked about than have anything on them: the index is walked rather than the
+    // range. 16 GiB from 0x1000, which covers the harness's code. Every block must go --
+    // `omni-android` sends the whole guest space when a context's queue of
+    // other threads' invalidations overflows.
+    let mut code = vec![a64::add_imm(0, 0, 1), a64::b(4), a64::NOP, a64::NOP, a64::NOP, a64::add_imm(0, 0, 1), a64::svc(0)];
+    let vm = Vm::new(code.clone(), VmOptions::default());
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 2);
+
+    code[0] = a64::add_imm(0, 0, 10);
+    code[5] = a64::add_imm(0, 0, 100);
+    vm.with_ctx(|c| c.code = code);
+    // SAFETY: `vm.raw()` is live and not executing.
+    unsafe { dynarmic_sys::od_jit_invalidate_range(vm.raw(), 0x1000, 0x4_0000_0000) };
+    vm.set_reg(0, 0);
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 110, "both blocks were retranslated");
 }

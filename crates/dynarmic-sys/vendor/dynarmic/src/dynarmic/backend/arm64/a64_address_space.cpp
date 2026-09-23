@@ -5,6 +5,8 @@
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
 
+#include <limits>
+
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
 #include "dynarmic/backend/arm64/devirtualize.h"
@@ -498,7 +500,59 @@ IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
 }
 
 void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    // Omnidroid patch 0011: every location registered with a range that intersects one of
+    // `ranges` -- what `BlockRangeInformation::InvalidateRanges` returned.
+    tsl::robin_set<IR::LocationDescriptor> erase_locations;
+    for (const auto& interval : ranges) {
+        const u64 first = boost::icl::first(interval);
+        const u64 last = boost::icl::last(interval);
+        const auto consider = [&](u32 index) {
+            const GuestRange& range = guest_ranges[index];
+            if (range.first <= last && first <= range.last) {
+                erase_locations.insert(range.location);
+            }
+        };
+
+        for (const u32 index : wide_guest_ranges) {
+            consider(index);
+        }
+
+        const u64 first_page = first >> guest_page_bits;
+        const u64 last_page = last >> guest_page_bits;
+        if (last_page - first_page >= guest_range_pages.size()) {
+            // More pages asked about than have anything on them: walk what there is.
+            for (const auto& [page, indices] : guest_range_pages) {
+                if (page >= first_page && page <= last_page) {
+                    for (const u32 index : indices) {
+                        consider(index);
+                    }
+                }
+            }
+        } else {
+            for (u64 page = first_page;; ++page) {
+                if (const auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
+                    for (const u32 index : iter->second) {
+                        consider(index);
+                    }
+                }
+                if (page == last_page) {
+                    break;
+                }
+            }
+        }
+    }
+    InvalidateBasicBlocks(erase_locations);
+}
+
+void A64AddressSpace::ClearCache() {
+    AddressSpace::ClearCache();
+    // Omnidroid patch 0011: the pin's `A64AddressSpace` never cleared `block_ranges`. Every block
+    // is gone, so nothing registered before the clear can name a block that exists: a location
+    // translated again afterwards registers the range of its new translation, which is the range
+    // its code now depends on.
+    std::vector<GuestRange>{}.swap(guest_ranges);
+    guest_range_pages = {};
+    std::vector<u32>{}.swap(wide_guest_ranges);
 }
 
 void A64AddressSpace::EmitPrelude() {
@@ -762,8 +816,29 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
 void A64AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
     const A64::LocationDescriptor descriptor{block.Location()};
     const A64::LocationDescriptor end_location{block.EndLocation()};
-    const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
-    block_ranges.AddRange(range, descriptor);
+    // Omnidroid patch 0011: the pin's `closed(descriptor.PC(), end_location.PC() - 1)`, which is
+    // empty -- and was never returned -- when the block covers no bytes.
+    const u64 first = descriptor.PC();
+    const u64 last = end_location.PC() - 1;
+    if (last < first) {
+        return;
+    }
+    ASSERT(guest_ranges.size() < std::numeric_limits<u32>::max());
+    const u32 index = static_cast<u32>(guest_ranges.size());
+    guest_ranges.push_back(GuestRange{descriptor, first, last});
+
+    const u64 first_page = first >> guest_page_bits;
+    const u64 last_page = last >> guest_page_bits;
+    if (last_page - first_page >= max_indexed_pages) {
+        wide_guest_ranges.push_back(index);
+        return;
+    }
+    for (u64 page = first_page;; ++page) {
+        guest_range_pages[page].push_back(index);
+        if (page == last_page) {
+            break;
+        }
+    }
 }
 
 }  // namespace Dynarmic::Backend::Arm64

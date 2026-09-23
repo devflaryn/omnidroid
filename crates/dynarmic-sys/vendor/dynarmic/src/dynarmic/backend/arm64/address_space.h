@@ -42,7 +42,9 @@ public:
 
     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
 
-    void ClearCache();
+    // Omnidroid patch 0011: virtual, so that `Emit`'s own clear (when the cache is full) also clears
+    // what a derived address space keeps per block.
+    virtual void ClearCache();
 
     void DumpDisassembly() const;
 

@@ -5,8 +5,12 @@
 
 #pragma once
 
+#include <vector>
+
+#include <boost/icl/interval_set.hpp>
+#include <tsl/robin_map.h>
+
 #include "dynarmic/backend/arm64/address_space.h"
-#include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/interface/A64/config.h"
 
 namespace Dynarmic::Backend::Arm64 {
@@ -21,6 +25,8 @@ public:
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
+    void ClearCache() override;
+
 protected:
     friend class A64Core;
 
@@ -29,7 +35,24 @@ protected:
     void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) override;
 
     const A64::UserConfig conf;
-    BlockRangeInformation<u64> block_ranges;
+
+    // Omnidroid patch 0011: the guest bytes each emitted block was translated from, for
+    // `InvalidateCacheRanges`. The pin kept them in a `BlockRangeInformation` -- a boost::icl
+    // interval_map of std::sets, about 200 bytes per block, which `ClearCache` never cleared, so
+    // it grew for as long as the jit lived. One `GuestRange` per emitted block (24 bytes), indexed
+    // by the 4 KiB guest pages it covers; like the pin's, a range stays until `ClearCache`.
+    struct GuestRange {
+        IR::LocationDescriptor location;
+        u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
+        u64 last;
+    };
+    static constexpr unsigned guest_page_bits = 12;
+    /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
+    /// invalidation, instead of in every page it covers.
+    static constexpr u64 max_indexed_pages = 64;
+    std::vector<GuestRange> guest_ranges;
+    tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
+    std::vector<u32> wide_guest_ranges;
 };
 
 }  // namespace Dynarmic::Backend::Arm64

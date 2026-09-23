@@ -298,6 +298,42 @@ one that is rewritten and invalidated must each stop running its stale translati
 and a host fault at the third of a block's four patch sites must be served as the third
 (`FastmemCallback`'s binary search).
 
+### 0011 — arm64: the guest ranges of emitted blocks, compact and cleared with the cache
+
+`0011-arm64-guest-range-index.patch`. **arm64 only.** `A64AddressSpace` recorded the guest bytes each
+block was translated from in a `BlockRangeInformation<u64>` (`backend/block_range_information.cpp`,
+shared with x64 and not edited here): a boost::icl `interval_map` of `std::set<LocationDescriptor>`,
+in which overlapping blocks split each other's intervals and copy the sets. **And nothing cleared it**:
+`AddressSpace::ClearCache` did not know it existed, so it grew for the whole life of the jit, across
+every cache clear, and never dropped an invalidated block's range either (upstream's own
+`TODO: EFFICIENCY` in `InvalidateRanges`).
+
+MEASURED in the gate at +60 s (`heap(1)` with `MallocStackLogging=lite`, n = 1 run): 846,107 icl
+nodes (81 MB) and 874,315 set nodes (42 MB) -- 207 bytes per block, for the 594,083 blocks the jits
+held, after six cache clears the map had outlived.
+
+The patch keeps one 24-byte `GuestRange` per emitted block (location and the closed range the pin
+registered, `[PC, EndLocation.PC - 1]`, skipped when empty as the icl skipped it), indexed by the
+4 KiB guest pages it covers; a block covering more than 64 pages goes to a list checked on every
+invalidation instead. `InvalidateCacheRanges` returns every location registered with a range
+intersecting a requested one -- what `InvalidateRanges` returned -- looking the pages up, or walking
+the index when more pages are asked about than it has (the whole-guest-space invalidation
+`omni-android` sends when a context's cross-thread queue overflows). `ClearCache` is now virtual and
+`A64AddressSpace` clears the ranges with the cache, so `Emit`'s own clear of a full cache clears them
+too.
+
+**The one difference, stated exactly.** After a clear, a range that only a *pre-clear* translation of
+a location covered no longer invalidates that location's current translation. That translation was
+made after the clear from the guest bytes as they then were, and registered the range it read; a
+write elsewhere cannot make it stale. So what the guest executes is unchanged, and the pin's extra
+invalidation there -- a retranslation of code that had not changed -- is gone.
+
+`tests/bookkeeping.rs`, n = 32,768 blocks: **440 bytes per block with 0010 alone, 365 with 0011**;
+after `od_jit_clear_cache`, **128 bytes per block still held with 0010 alone, 0-1 with 0011** (the
+bound is 16). Three behaviour tests cover the index, and pass on the pin as well: a write to the
+second page of a two-page block, a write to the last word of a 70,001-instruction block (more than
+64 pages: the retranslation fetches all of it), and a 16 GiB invalidation reaching every block.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

@@ -290,4 +290,38 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
      """        const auto patch_entry = std::lower_bound(first, last, static_cast<u32>(offset),""",
      """        const auto patch_entry = std::lower_bound(first, first + 1, static_cast<u32>(offset),""",
      dyn("bookkeeping")),
+    # --- mac-mem: patch 0011, the guest-range index -----------------------------------------------
+    ("mac-mem-A3", "A", "0011: the A64 clear leaves the guest ranges behind (the pin's leak)",
+     ARM64 + "a64_address_space.cpp",
+     """    std::vector<GuestRange>{}.swap(guest_ranges);
+    guest_range_pages = {};
+    std::vector<u32>{}.swap(wide_guest_ranges);
+}""",
+     """}""",
+     dyn("bookkeeping")),
+    ("mac-mem-A4", "A", "0011: a block is indexed under its first page only",
+     ARM64 + "a64_address_space.cpp",
+     """        guest_range_pages[page].push_back(index);
+        if (page == last_page) {""",
+     """        guest_range_pages[page].push_back(index);
+        if (true) {""",
+     dyn("bookkeeping")),
+    ("mac-mem-A5", "A", "0011: blocks wider than the page index are never looked at",
+     ARM64 + "a64_address_space.cpp",
+     """        for (const u32 index : wide_guest_ranges) {
+            consider(index);
+        }""",
+     """""",
+     dyn("bookkeeping")),
+    ("mac-mem-A6", "A", "0011: the walk of the index for a large invalidation looks at its first page only",
+     ARM64 + "a64_address_space.cpp",
+     """                if (page >= first_page && page <= last_page) {""",
+     """                if (page == first_page) {""",
+     dyn("bookkeeping")),
+    ("mac-mem-B1", "B", "0011: every block on an invalidated page goes, whether or not its bytes were "
+     "written (the range test dropped)",
+     ARM64 + "a64_address_space.cpp",
+     """            if (range.first <= last && first <= range.last) {""",
+     """            if (true) {""",
+     dyn("a64_exec")),
 ]
