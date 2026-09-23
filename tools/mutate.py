@@ -2712,6 +2712,40 @@ directory", ADAPTER_FILES,
         Some(index)""",
      ANDROID),
 
+    # ---- FUTEX_WAIT's comparison and the bucket lock ---------------------------------------------
+    # MEASURED as a 180 s gate freeze, every thread blocked and the CPU flat. The comparison ran
+    # inside `parking_lot_core::park`'s `validate`, under the futex's bucket lock, and it read the
+    # word THROUGH THE ADDRESS SPACE, whose map lock is a `parking_lot::Mutex`. A contended mutex
+    # parks on its own address; when that shares the futex's bucket, or the table grows, the
+    # waiter blocks on a bucket it holds. The fix admits the word before the park and compares with
+    # one atomic load. A1 puts the admission back under the bucket lock. The detector runs its body
+    # in a child process, because the deadlock it provokes leaves a parking_lot bucket held for
+    # good, and in this process that would hang the rest of the suite instead of failing one test.
+    ("futexlock-A1", "A", "the futex word is admitted through the space inside validate again",
+     ADAPTER_RUNTIME,
+     """        admit()?;
+        // Step 2. SAFETY: `admit` returned `Ok`, which is this function's precondition for
+        // `word_holds`.
+        let still_expected = || unsafe { word_holds(addr, expected) };""",
+     """        // Step 2. SAFETY: `admit` returned `Ok`, which is this function's precondition for
+        // `word_holds`.
+        let still_expected = move || admit().is_ok() && unsafe { word_holds(addr, expected) };""",
+     ANDROID_LIB),
+
+    # The over-correction: "validate may not take locks, so compare BEFORE the park and park
+    # unconditionally." It reads as the same fix with less in the callback, and it reopens the
+    # lost-wake window FUTEX_WAIT exists to close: a word that changes between the comparison and
+    # the queue is slept on. The detector holds the word's bucket from a second park, so the change
+    # lands in exactly that window every time rather than when the scheduler allows it.
+    ("futexlock-B1", "B", "the futex word is compared before the park instead of under its lock",
+     ADAPTER_RUNTIME,
+     """        let still_expected = || unsafe { word_holds(addr, expected) };""",
+     """        if !unsafe { word_holds(addr, expected) } {
+            return Ok(WaitResult::WouldBlock);
+        }
+        let still_expected = || true;""",
+     ANDROID_LIB),
+
     # A thread that stopped without returning produced no `void *`. Reporting 0 with an untouched
     # `retval` is indistinguishable from a thread that returned NULL, which is the one answer the
     # guest cannot tell apart from success.
