@@ -185,6 +185,24 @@ fn session_length() -> std::time::Duration {
 /// How often the session prints its frame count.
 const FRAMES_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// **The JIT code cache each guest thread gets: 32 MiB**, not `DynarmicOptions`' 8 MiB.
+///
+/// dynarmic evacuates a thread's **whole** cache whenever less than 1 MiB of it is free
+/// (`a64_interface.cpp`, `GetBlock`), and everything that thread runs is then translated again.
+/// At 8 MiB the engine's TaskScheduler workers -- which each run every kind of job -- never fit:
+/// MEASURED on the landing screen with a drag every second (under a second client's load),
+/// 284,000-297,000 guest instructions re-translated per second, almost all of it by guest
+/// threads 2, 3, 16, 17 and 18, and 12.9-13.8 frames a second. At 32 MiB: 2,600-3,800 a second
+/// and 59.6 frames a second, the same as 64 and 128 MiB; less process CPU, too (1.6-1.7 cores
+/// against 2.2-2.3).
+///
+/// **What it costs**: dynarmic commits a cache as it fills (`EnsureMemoryCommitted`, 1 MiB at a
+/// time), so a thread pays for the code it runs, up to this. MEASURED peak private bytes 3.2-3.3
+/// GiB against 2.25 GiB at 8 MiB, and 3.76 GiB at 64 or 128 MiB. It is host memory, outside the
+/// guest's address space and its commit ceiling. A game runs more code than the landing screen,
+/// and no game has been measured.
+const CODE_CACHE_BYTES: u64 = 32 << 20;
+
 /// **Where each guest thread's time goes**, from the boundary's own per-thread records: every
 /// `PROFILE_EVERY` a thread is either in guest code (`crossings == exits`) or inside the handler
 /// its last crossing named. Sampled on its own host thread until `stop`, then summarised.
@@ -516,9 +534,23 @@ impl Guest {
         // the Lua app was starting, the engine's 33rd concurrent thread failed to get a TLS block
         // and a `boost::thread_resource_error` took down the thread that asked (RBXCRASH), while
         // bionic's arena had room for 64. Ids are recycled on exit, so this is concurrency.
+        // The code cache: [`CODE_CACHE_BYTES`] per guest thread, or `OMNI_JIT_CACHE_MB` (MiB) to
+        // measure another size -- said in the log when it is set.
+        let code_cache_size = match std::env::var("OMNI_JIT_CACHE_MB") {
+            Ok(mb) => {
+                let mb: u64 = mb.trim().parse().expect("OMNI_JIT_CACHE_MB is a number of MiB");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "JIT: a {mb} MiB code cache per guest thread (OMNI_JIT_CACHE_MB)"
+                );
+                mb << 20
+            }
+            Err(_) => CODE_CACHE_BYTES,
+        };
         let options = DynarmicOptions {
             max_threads: u32::try_from(omni_android::bionic::MAX_GUEST_THREADS)
                 .expect("the thread count fits"),
+            code_cache_size,
             ..DynarmicOptions::default()
         };
         let backend = Arc::new(
