@@ -52,6 +52,9 @@ pub enum ScriptArg {
     Null,
     /// A `jlong`.
     Long(i64),
+    /// The list of how earlier runs ended -- [`super::Jni::previous_exit_reasons`], built from
+    /// what the embedding recorded, and empty when it recorded nothing.
+    PreviousExitReasons,
 }
 
 /// One downcall in the scripted sequence.
@@ -505,7 +508,9 @@ pub static SEQUENCE: &[Downcall] = &[
         member: "nativeSetAppPreviousExitReasons",
         descriptor: "(Ljava/util/List;)V",
         java_before: &[],
-        args: &[ScriptArg::Object("java/util/List")],
+        // `jk.l2.a`: the exits the system recorded, as `ApplicationExitInfoCpp`s. The embedding
+        // records them (`Jni::set_previous_exits`); none is a fresh install's empty list.
+        args: &[ScriptArg::PreviousExitReasons],
     },
 ];
 
@@ -702,7 +707,76 @@ pub static SCRIPT_CLASSES: &[&str] = &[
     "com/roblox/engine/jni/NativeReportingInterface",
     "com/roblox/engine/jni/NativeSettingsInterface",
     "com/roblox/engine/jni/NativeGLInterface",
+    // `RobloxApplication.onCreate` registers one with `ProcessLifecycleOwner`; see
+    // [`process_lifecycle`].
+    "com/roblox/universalapp/applifecyclenativeadapter/JNIAppLifecycleNativeAdapter",
 ];
+
+/// A process lifecycle event, as androidx's `ProcessLifecycleOwner` dispatches it to the
+/// observers registered on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessEvent {
+    /// `ON_RESUME`: dispatched once the first activity has resumed.
+    Resume,
+    /// `ON_PAUSE`: dispatched `ProcessLifecycleOwner.TIMEOUT_MS` (700 ms) after the last activity
+    /// paused.
+    Pause,
+    /// `ON_STOP`: dispatched after that pause once the last activity has stopped.
+    Stop,
+}
+
+impl ProcessEvent {
+    /// The static native `JNIAppLifecycleNativeAdapter.g` calls for the event -- DECODED from
+    /// `classes2.dex`: its switch maps `ON_RESUME` to `setActive`, `ON_PAUSE` to `setInactive` and
+    /// `ON_STOP` to `setHidden`, and ignores the rest.
+    #[must_use]
+    pub fn native(self) -> &'static str {
+        match self {
+            ProcessEvent::Resume => "setActive",
+            ProcessEvent::Pause => "setInactive",
+            ProcessEvent::Stop => "setHidden",
+        }
+    }
+}
+
+/// **Deliver a process lifecycle event to the engine**, as the observer the app registers does.
+///
+/// `RobloxApplication.onCreate`, on the GameActivity path (`"GameActivity = ON. Return after
+/// loading native libs!"`), adds a `JNIAppLifecycleNativeAdapter` to
+/// `ProcessLifecycleOwner.get().getLifecycle()`; its `onStateChanged` (`g`) calls one of three
+/// static natives, exported by `libroblox.so`, with no arguments. MEASURED why the host must do
+/// this: a run that closed the app without it left the engine's session record saying the app never
+/// left the foreground, and the next launch judged that session a crash.
+///
+/// # Errors
+///
+/// [`AbiError::JniRefused`] naming the export when `resolve` does not know it, and whatever the
+/// call itself fails with.
+pub fn process_lifecycle(
+    jni: &Arc<Jni>,
+    boundary: &Arc<Boundary>,
+    cpu: &mut dyn GuestCpu,
+    resolve: &dyn Fn(&str) -> Option<GuestAddr>,
+    event: ProcessEvent,
+) -> AbiResult<()> {
+    const CLASS: &str = "com/roblox/universalapp/applifecyclenativeadapter/JNIAppLifecycleNativeAdapter";
+    let symbol = format!(
+        "Java_com_roblox_universalapp_applifecyclenativeadapter_JNIAppLifecycleNativeAdapter_{}",
+        event.native()
+    );
+    let Some(target) = resolve(&symbol) else {
+        return Err(AbiError::JniRefused {
+            function: symbol,
+            address: 0,
+            detail: "the app's process lifecycle observer calls this export, and nothing resolved it"
+                .to_string(),
+        });
+    };
+    let class = jni.class_reference(CLASS)?;
+    let args = [GuestArg::Pointer(jni.env_for(0)), GuestArg::Int(class)];
+    boundary.call_guest(cpu, &format!("ProcessLifecycleOwner {event:?} ({CLASS})"), target, &args, PER_DOWNCALL)?;
+    Ok(())
+}
 
 /// What one step did.
 #[derive(Debug)]
@@ -838,6 +912,7 @@ pub fn run(
                 ScriptArg::Object(class) => GuestArg::Int(jni.new_object(class)?),
                 ScriptArg::Null => GuestArg::Int(0),
                 ScriptArg::Long(value) => GuestArg::Int(*value as u64),
+                ScriptArg::PreviousExitReasons => GuestArg::Int(jni.previous_exit_reasons()?),
             });
         }
         let caller = format!("§8 step {} ({})", step.step, step.caller);
@@ -877,7 +952,7 @@ pub fn perform(jni: &Jni, statements: &[JavaStatement]) -> AbiResult<()> {
             // A statement stores an instance or `null` -- `JavaStatement::value` says so -- and
             // the store checks instance types against the field's. A `jlong` is no reference at
             // all, and no field the script assigns holds a string: refused, not converted.
-            ScriptArg::Text(_) | ScriptArg::Long(_) => {
+            ScriptArg::Text(_) | ScriptArg::Long(_) | ScriptArg::PreviousExitReasons => {
                 return Err(named(AbiError::JniRefused {
                     function: "script::perform".to_string(),
                     address: 0,
@@ -1102,6 +1177,36 @@ mod tests {
                 "after row {index} (`{}`), FMOD.init is at row {at}",
                 row.member
             );
+        }
+    }
+
+    /// An event whose export nothing resolves is refused, naming the export: the engine would
+    /// otherwise never hear it, and nothing downstream would say so.
+    #[test]
+    fn a_process_event_with_no_export_is_refused_by_name() {
+        let space = Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(Arc::clone(&space)).expect("a JNI instance");
+        declare_script_classes(&jni);
+        let boundary = crate::boundary::BoundaryBuilder::new(Arc::clone(&space), 1, 4096)
+            .expect("a thunk region")
+            .finish();
+        let backend = omni_cpu::dynarmic::DynarmicBackend::new(
+            Arc::clone(&space),
+            omni_cpu::dynarmic::DynarmicOptions::default(),
+        )
+        .expect("a backend");
+        let mut cpu = omni_cpu::GuestCpuBackend::create_guest_thread(&backend).expect("a thread");
+        for event in [ProcessEvent::Resume, ProcessEvent::Pause, ProcessEvent::Stop] {
+            match process_lifecycle(&jni, &boundary, cpu.as_mut(), &|_| None, event) {
+                Err(AbiError::JniRefused { function, .. }) => assert_eq!(
+                    function,
+                    format!(
+                        "Java_com_roblox_universalapp_applifecyclenativeadapter_JNIAppLifecycleNativeAdapter_{}",
+                        event.native()
+                    )
+                ),
+                other => panic!("{event:?} answered {other:?}"),
+            }
         }
     }
 

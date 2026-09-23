@@ -1367,6 +1367,71 @@ pub(super) fn static_instance(
 }
 
 /// An instance field: whatever was stored on the object, or the class's declared default.
+/// The elements of a `java.util.List` receiver: its `ArrayList` backing (`elementData`, the
+/// first `size`), or none for a list without one -- the empty list this layer hands out.
+fn list_elements(
+    state: &JniState,
+    name: &str,
+    address: GuestAddr,
+    class: ClassId,
+    member: &Member,
+    receiver: Option<ObjectId>,
+) -> AbiResult<Vec<Option<ObjectId>>> {
+    let Some(receiver) = receiver else {
+        return Err(AbiError::JniRefused {
+            function: name.to_string(),
+            address,
+            detail: format!(
+                "`{}.{}` is an instance method and this call has no receiver",
+                state.registry.class_name(class),
+                member.name
+            ),
+        });
+    };
+    let Some(Object::Instance { class: of, fields }) = state.handles.object_of(receiver) else {
+        return Err(AbiError::JniRefused {
+            function: name.to_string(),
+            address,
+            detail: "the receiver of a `java.util.List` method is not a list object".to_string(),
+        });
+    };
+    let size_field = state.registry.field(*of, "size", "I", false);
+    let data_field = state.registry.field(*of, "elementData", "[Ljava/lang/Object;", false);
+    let (Some(size_field), Some(data_field)) = (size_field, data_field) else {
+        return Ok(Vec::new());
+    };
+    let size = match fields.get(&size_field) {
+        None => return Ok(Vec::new()),
+        Some(Value::Int(size)) => usize::try_from(*size).unwrap_or(0),
+        Some(other) => {
+            return Err(AbiError::JniRefused {
+                function: name.to_string(),
+                address,
+                detail: format!("an ArrayList's size is {other:?}, not an int"),
+            })
+        }
+    };
+    let data = match fields.get(&data_field) {
+        Some(Value::Object(Some(data))) => *data,
+        _ if size == 0 => return Ok(Vec::new()),
+        other => {
+            return Err(AbiError::JniRefused {
+                function: name.to_string(),
+                address,
+                detail: format!("an ArrayList of {size} has no backing array ({other:?})"),
+            })
+        }
+    };
+    match state.handles.object_of(data) {
+        Some(Object::ObjectArray { elements, .. }) if elements.len() >= size => Ok(elements[..size].to_vec()),
+        _ => Err(AbiError::JniRefused {
+            function: name.to_string(),
+            address,
+            detail: format!("an ArrayList's backing array does not hold its {size} elements"),
+        }),
+    }
+}
+
 fn instance_field(
     state: &JniState,
     name: &str,
@@ -1769,6 +1834,48 @@ pub(super) fn evaluate(
             let object =
                 state.handles.create(name, address, Object::Instance { class, fields: stored })?;
             Ok(Value::Object(Some(object)))
+        }
+        Answer::ListSize | Answer::ListIsEmpty | Answer::ListGet | Answer::ListToArray => {
+            let elements = list_elements(state, name, address, class, member, receiver)?;
+            match member.answer {
+                Answer::ListSize => Ok(Value::Int(i32::try_from(elements.len()).unwrap_or(i32::MAX))),
+                Answer::ListIsEmpty => Ok(Value::Boolean(elements.is_empty())),
+                Answer::ListGet => {
+                    let index = match arguments.first() {
+                        Some(Value::Int(index)) => *index,
+                        other => {
+                            return Err(AbiError::JniRefused {
+                                function: name.to_string(),
+                                address,
+                                detail: format!("`List.get` takes an int and was called with {other:?}"),
+                            })
+                        }
+                    };
+                    match usize::try_from(index).ok().and_then(|at| elements.get(at)) {
+                        Some(element) => Ok(Value::Object(*element)),
+                        None => Err(AbiError::JniRefused {
+                            function: name.to_string(),
+                            address,
+                            detail: format!(
+                                "`List.get({index})` on a list of {} -- Java throws \
+                                 IndexOutOfBoundsException, which this layer does not raise",
+                                elements.len()
+                            ),
+                        }),
+                    }
+                }
+                _ => {
+                    let Some(element) = state.registry.find("java/lang/Object") else {
+                        return Err(AbiError::JniRefused {
+                            function: name.to_string(),
+                            address,
+                            detail: "`java/lang/Object` is not declared".to_string(),
+                        });
+                    };
+                    let object = state.handles.create(name, address, Object::ObjectArray { element, elements })?;
+                    Ok(Value::Object(Some(object)))
+                }
+            }
         }
         Answer::EmptyObjectArray => {
             let Some(element) = state.registry.find("java/lang/Object") else {
@@ -2508,6 +2615,79 @@ mod tests {
         let error = call_slot(&jni, &mem, "SetByteArrayRegion", &[array, 3, 3, buffer as u64])
             .expect_err("three bytes from index 3 of five");
         assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
+    }
+
+    /// Call `java.util.List.<member>` on `list` the way the engine does, through its declared answer.
+    fn call_list(jni: &Jni, list: u64, member: &str, descriptor: &str, arguments: &[Value]) -> AbiResult<Value> {
+        let mut state = jni.state();
+        let class = state.registry.find("java/util/List").expect("declared");
+        let method = state.registry.method(class, member, descriptor, false).expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        let receiver = state.handles.resolve_id("test", 0, list).expect("a live list");
+        evaluate(&mut state, "CallIntMethodV", 0, class, &member, Some(receiver), arguments)
+    }
+
+    /// **The exit list is what the embedding recorded, and the engine reads it as a device's**:
+    /// none recorded is the empty list (`size` 0, and `get(0)` refuses where Java throws); one
+    /// recorded is one `ApplicationExitInfoCpp` whose fields carry the record -- the reason text
+    /// `jk.l2.b` cuts out of `toString()`, `USER REQUESTED`, the pid the run had, the signal,
+    /// the importance. A list answering the old constant 0 fails the second half; one whose
+    /// element lacks the reason text fails the field reads.
+    #[test]
+    fn previous_exits_reach_the_engine_as_the_java_side_builds_them() {
+        let (jni, _mem) = slot_fixture();
+        let empty = jni.previous_exit_reasons().expect("an empty list");
+        assert_eq!(call_list(&jni, empty, "size", "()I", &[]).expect("size"), Value::Int(0));
+        assert!(call_list(&jni, empty, "get", "(I)Ljava/lang/Object;", &[Value::Int(0)]).is_err());
+
+        jni.set_previous_exits(vec![crate::jni::ExitRecord {
+            pid: 40204,
+            reason: crate::jni::ExitRecord::REASON_USER_REQUESTED,
+            status: crate::jni::ExitRecord::SIGKILL,
+            timestamp_ms: 1_790_139_658_000,
+            importance: crate::jni::ExitRecord::IMPORTANCE_CACHED,
+        }]);
+        let list = jni.previous_exit_reasons().expect("a list");
+        assert_eq!(call_list(&jni, list, "size", "()I", &[]).expect("size"), Value::Int(1));
+        assert_eq!(call_list(&jni, list, "isEmpty", "()Z", &[]).expect("isEmpty"), Value::Boolean(false));
+        let Value::Object(Some(exit)) =
+            call_list(&jni, list, "get", "(I)Ljava/lang/Object;", &[Value::Int(0)]).expect("get(0)")
+        else {
+            panic!("get(0) answers the record");
+        };
+        assert!(call_list(&jni, list, "get", "(I)Ljava/lang/Object;", &[Value::Int(1)]).is_err());
+        let state = jni.state();
+        let class = state.registry.find("com/roblox/engine/jni/model/ApplicationExitInfoCpp").expect("declared");
+        let read = |name: &str, descriptor: &str| {
+            let field = state.registry.field(class, name, descriptor, false).expect("declared");
+            instance_field(&state, "GetObjectField", 0, exit, field).expect("set")
+        };
+        let text = |value: Value| match value {
+            Value::Object(Some(id)) => match state.handles.object_of(id) {
+                Some(Object::String(text)) => text.to_string_lossy(),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text(read("mExitReason", "Ljava/lang/String;")), "USER REQUESTED");
+        assert_eq!(text(read("mExitSubreason", "Ljava/lang/String;")), "UNKNOWN");
+        assert_eq!(read("mPid", "I"), Value::Int(40204));
+        assert_eq!(read("mSignal", "I"), Value::Int(9));
+        assert_eq!(read("mTimestamp", "J"), Value::Long(1_790_139_658_000));
+        assert_eq!(read("mImportance", "I"), Value::Int(400));
+        drop(state);
+        let Value::Object(Some(array)) = call_list(&jni, list, "toArray", "()[Ljava/lang/Object;", &[]).expect("toArray")
+        else {
+            panic!("an array");
+        };
+        match jni.state().handles.object_of(array) {
+            Some(Object::ObjectArray { elements, .. }) => assert_eq!(elements, &vec![Some(exit)]),
+            other => panic!("{other:?}"),
+        }
+
+        let unknown = crate::jni::ExitRecord { reason: 3, ..crate::jni::ExitRecord {
+            pid: 1, reason: 0, status: 0, timestamp_ms: 0, importance: 0 } };
+        assert!(unknown.reason_name().is_err(), "a reason this layer does not name is refused");
     }
 
     /// A JNI instance and the guest memory its slots read, for calling a slot directly.

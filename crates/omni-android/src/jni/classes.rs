@@ -189,6 +189,17 @@ pub enum Answer {
     /// The Java side's keyboard is asked to **hide**: `()V`, reaching `fi.p0.a` on the UI thread.
     /// Recorded, and handed on as [`KeyboardRequest::Hide`](super::KeyboardRequest::Hide).
     HideKeyboard,
+    /// `List.size()`: the receiver's `java.util.ArrayList.size`, or 0 for a list with no
+    /// backing -- the empty `java.util.List` this layer hands out where a device hands an empty
+    /// one. The backing is what [`super::Jni::new_list`] builds.
+    ListSize,
+    /// `List.isEmpty()`: `size() == 0`, read as [`ListSize`](Answer::ListSize) reads it.
+    ListIsEmpty,
+    /// `List.get(int)`: the element at the index, from the receiver's `elementData`; an index
+    /// outside `0..size` refuses, where Java throws `IndexOutOfBoundsException`.
+    ListGet,
+    /// `List.toArray()`: a new `Object[]` of the elements, in order -- empty for an empty list.
+    ListToArray,
     /// An `Object[0]`.
     ///
     /// `List.toArray()` on the empty list this layer hands the engine. Correct rather than a
@@ -594,6 +605,10 @@ impl Registry {
             | Answer::StringBytes
             | Answer::IdentityHash
             | Answer::EmptyObjectArray
+            | Answer::ListSize
+            | Answer::ListIsEmpty
+            | Answer::ListGet
+            | Answer::ListToArray
             | Answer::Construct(_)
             | Answer::ShowKeyboard
             | Answer::HideKeyboard
@@ -677,6 +692,8 @@ pub struct ClassSpec {
 pub static EXTENDS: &[(&str, &str)] = &[
     ("com/roblox/client/startup/MainGameActivity", "com/google/androidgamesdk/GameActivity"),
     ("com/google/androidgamesdk/GameActivity", "android/content/Context"),
+    // An interface, stood in as the ancestor: what `List`'s methods resolve through.
+    ("java/util/ArrayList", "java/util/List"),
 ];
 
 /// An instance method.
@@ -1464,17 +1481,31 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "java/util/List",
         tier: Tier::One,
         methods: &[
-            // The empty list: `size()` is 0, `get(I)` is never reached from it, and `toArray()`
-            // really is an empty array. §8 step 11 hands one to
-            // `nativeSetAppPreviousExitReasons`, and a device with no recorded exits hands the
-            // same thing. M4's gate found `size` missing: the engine called it with a null
-            // `jmethodID` it had not checked.
-            m("size", "()I", Answer::Int(0)),
-            m("isEmpty", "()Z", Answer::Bool(true)),
-            m("get", "(I)Ljava/lang/Object;", Answer::Null),
-            m("toArray", "()[Ljava/lang/Object;", Answer::EmptyObjectArray),
+            // Read from the receiver: a `java.util.ArrayList` the host built
+            // ([`super::Jni::new_list`]) answers its elements, and the plain `java.util.List`
+            // this layer hands out elsewhere is empty -- `size()` 0, `toArray()` an empty array.
+            // §8 step 11 hands one to `nativeSetAppPreviousExitReasons`: the exits the host
+            // recorded, or an empty list when it recorded none, which is what a device with no
+            // recorded exits hands too. M4's gate found `size` missing: the engine called it
+            // with a null `jmethodID` it had not checked.
+            m("size", "()I", Answer::ListSize),
+            m("isEmpty", "()Z", Answer::ListIsEmpty),
+            m("get", "(I)Ljava/lang/Object;", Answer::ListGet),
+            m("toArray", "()[Ljava/lang/Object;", Answer::ListToArray),
         ],
         fields: NONE,
+    },
+    // `java.util.ArrayList`'s own two fields, as libcore declares them: the backing array and
+    // the count. The host builds one ([`super::Jni::new_list`]) wherever the Java side hands the
+    // engine a list it filled, and `java.util.List`'s methods read them.
+    ClassSpec {
+        name: "java/util/ArrayList",
+        tier: Tier::Support,
+        methods: NONE,
+        fields: &[
+            f("elementData", "[Ljava/lang/Object;", Answer::Unanswered),
+            f("size", "I", Answer::Unanswered),
+        ],
     },
     ClassSpec {
         name: "java/util/Map$Entry",

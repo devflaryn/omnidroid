@@ -562,6 +562,12 @@ impl Guest {
 
         let root = Scratch::new("m5-gate");
         bionic.set_filesystem_root(&root.0).expect("a filesystem root");
+        // **How earlier runs ended**, as the system hands `getHistoricalProcessExitReasons` on a
+        // device: what this host recorded in a kept root (`record_exit`), and nothing for a fresh
+        // one -- a fresh install's answer.
+        let exits = read_exit_records(&root.0);
+        let _ = writeln!(std::io::stderr(), "EXITS: {} earlier run(s) recorded as ended", exits.len());
+        jni.set_previous_exits(exits);
         bionic.set_memory_budget(GUEST_MEMORY_BUDGET);
         // **Which network this guest may reach — D30's replacement for Global Constraint 8.**
         //
@@ -879,6 +885,81 @@ fn remove_scratch_roots() {
     for root in roots {
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// Where this host keeps how earlier runs of the app ended: `/data/system/`, where a device's
+/// system server keeps its own (`procexitstore`), in the guest's root -- so a kept root
+/// (`OMNI_DATA_DIR`) carries it to the next run and a scratch one goes with the run.
+const EXIT_RECORDS: &str = "data/system/omnidroid-procexitstore";
+
+/// At most this many records, newest first -- the per-package bound a device keeps.
+const MAX_EXIT_RECORDS: usize = 16;
+
+/// The records `record_exit` wrote under `root`, newest first; none when there is no file.
+fn read_exit_records(root: &std::path::Path) -> Vec<omni_android::jni::ExitRecord> {
+    let Ok(text) = std::fs::read_to_string(root.join(EXIT_RECORDS)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let n: Vec<i64> = line
+                .split_whitespace()
+                .map(|word| word.parse().unwrap_or_else(|_| panic!("{EXIT_RECORDS}: {line:?} is not a record")))
+                .collect();
+            let [pid, reason, status, timestamp_ms, importance] = n[..] else {
+                panic!("{EXIT_RECORDS}: {line:?} is not five numbers");
+            };
+            omni_android::jni::ExitRecord {
+                pid: pid as i32,
+                reason: reason as i32,
+                status: status as i32,
+                timestamp_ms,
+                importance: importance as i32,
+            }
+        })
+        .collect()
+}
+
+/// Put `exit` first in the records under `root`, keeping [`MAX_EXIT_RECORDS`].
+fn record_exit(root: &std::path::Path, exit: omni_android::jni::ExitRecord) {
+    let mut records = vec![exit];
+    records.extend(read_exit_records(root));
+    records.truncate(MAX_EXIT_RECORDS);
+    let text: String = records
+        .iter()
+        .map(|r| format!("{} {} {} {} {}\n", r.pid, r.reason, r.status, r.timestamp_ms, r.importance))
+        .collect();
+    let path = root.join(EXIT_RECORDS);
+    std::fs::create_dir_all(path.parent().expect("a directory")).expect("the records' directory");
+    std::fs::write(&path, text).expect("the exit records");
+}
+
+/// **The records round-trip newest first and stay bounded**: a record written is read back
+/// exactly, a second goes in front of it, and the seventeenth pushes the oldest out.
+#[test]
+fn exit_records_round_trip_newest_first_and_stay_bounded() {
+    let dir = std::env::temp_dir().join(format!("omni-exit-records-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(read_exit_records(&dir).is_empty(), "no file is no record");
+    let exit = |pid: i32| omni_android::jni::ExitRecord {
+        pid,
+        reason: omni_android::jni::ExitRecord::REASON_USER_REQUESTED,
+        status: omni_android::jni::ExitRecord::SIGKILL,
+        timestamp_ms: 1_790_000_000_000 + i64::from(pid),
+        importance: omni_android::jni::ExitRecord::IMPORTANCE_CACHED,
+    };
+    record_exit(&dir, exit(1));
+    assert_eq!(read_exit_records(&dir), vec![exit(1)]);
+    record_exit(&dir, exit(2));
+    assert_eq!(read_exit_records(&dir), vec![exit(2), exit(1)]);
+    for pid in 3..=17 {
+        record_exit(&dir, exit(pid));
+    }
+    let kept = read_exit_records(&dir);
+    assert_eq!(kept.len(), MAX_EXIT_RECORDS);
+    assert_eq!((kept[0].pid, kept[15].pid), (17, 2), "the oldest went out");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The guest's root: a scratch directory removed with the run, or -- with `OMNI_DATA_DIR` --
@@ -2249,6 +2330,17 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             member.to_string(),
             result.map(|_| ()).map_err(|error| error.to_string()),
         ));
+        // The first activity resumed, so the process did: androidx's `ProcessLifecycleOwner`
+        // dispatches `ON_RESUME` from `onActivityPostResumed`, once `onResume` has returned, to
+        // the observer `RobloxApplication.onCreate` registered.
+        if member == "onResumeNative" && !failed {
+            let event = process_event(&guest, &mut cpu, script::ProcessEvent::Resume, "§8 rows");
+            let refused = event.is_err();
+            row_outcomes.push(("ProcessLifecycleOwner ON_RESUME".to_string(), event));
+            if refused {
+                break;
+            }
+        }
         if failed {
             // **Stop at the first failure, because the next row would not be evidence.** These
             // natives go through the glue's `android_app_set_activity_state`/`set_window`, which
@@ -2982,6 +3074,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // MEASURED why: runs ended by stopping threads left the engine's session unclosed, and the next
     // launch of a kept data directory (OMNI_DATA_DIR) took its inferred-crash path
     // (`InferredCrash`, link 0x23834e4) and died on a reporter this runtime does not set up.
+    //
+    // **Asserted, at the end with the others**: a close call that fails, and a close the engine
+    // never records as the app going to the background (below).
+    let mut close_failure: Option<String> = None;
     if window.is_some() && guest.bionic.live_guest_threads() > 0 {
         if let Some(seam) = touch.as_mut() {
             seam.set_surface_alive(false);
@@ -3023,12 +3119,37 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 bionic.stop_guest_threads();
             });
         }
+        let mut closed = true;
+        // `ProcessLifecycleOwner` sends `ON_PAUSE` `TIMEOUT_MS` (700 ms) after the last activity
+        // paused, from a message on the UI thread, so it runs between two of the calls below once
+        // that time has passed. `ON_STOP` follows `onStop` if the pause has been sent by then, and
+        // otherwise comes with the delayed pause, after it. (androidx.lifecycle
+        // `ProcessLifecycleOwner.activityPaused`/`activityStopped`/`dispatchStopIfNeeded`.)
+        const PROCESS_PAUSE_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        let mut paused_at: Option<std::time::Instant> = None;
+        let mut pause_sent = false;
+        let mut stopped = false;
         for (member, descriptor, tail) in [
             ("onWindowFocusChangedNative", "(JZ)V", vec![GuestArg::Int(0)]),
             ("onPauseNative", "(J)V", vec![]),
             ("onSurfaceDestroyedNative", "(J)V", vec![]),
             ("onStopNative", "(J)V", vec![]),
+            // The system tells a process its UI is hidden once no activity of it is visible:
+            // `onTrimMemory(TRIM_MEMORY_UI_HIDDEN)`, 20, which GameActivity passes on.
+            ("onTrimMemoryNative", "(JI)V", vec![GuestArg::Int(20)]),
         ] {
+            if paused_at.is_some_and(|at| at.elapsed() >= PROCESS_PAUSE_DELAY) && !pause_sent {
+                pause_sent = true;
+                let mut sent = process_event(&guest, &mut cpu, script::ProcessEvent::Pause, "CLOSE");
+                if stopped && sent.is_ok() {
+                    sent = process_event(&guest, &mut cpu, script::ProcessEvent::Stop, "CLOSE");
+                }
+                if let Err(error) = sent {
+                    close_failure = Some(error);
+                    closed = false;
+                    break;
+                }
+            }
             let target = native(member, descriptor);
             let mut args = vec![GuestArg::Pointer(guest.jni.env_for(0)), GuestArg::Int(thiz), GuestArg::Int(native_code)];
             args.extend(tail);
@@ -3046,11 +3167,98 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     Err(error) => format!("{error}"),
                 }
             );
-            if result.is_err() {
+            if let Err(error) = &result {
+                close_failure = Some(format!("{member}: {error}"));
+                closed = false;
                 break;
+            }
+            match member {
+                "onPauseNative" => paused_at = Some(std::time::Instant::now()),
+                "onStopNative" => {
+                    stopped = true;
+                    if pause_sent {
+                        if let Err(error) = process_event(&guest, &mut cpu, script::ProcessEvent::Stop, "CLOSE") {
+                            close_failure = Some(error);
+                            closed = false;
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if closed && !pause_sent {
+            if let Some(at) = paused_at {
+                std::thread::sleep(PROCESS_PAUSE_DELAY.saturating_sub(at.elapsed()));
+            }
+            if let Err(error) = process_event(&guest, &mut cpu, script::ProcessEvent::Pause, "CLOSE")
+                .and_then(|()| process_event(&guest, &mut cpu, script::ProcessEvent::Stop, "CLOSE"))
+            {
+                close_failure = Some(error);
+                closed = false;
             }
         }
         close_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        // **In the background until the engine has recorded it.** A device's backgrounded app
+        // keeps running until it is removed, and the engine writes its session record
+        // (`memProfStorage<pid>.json`) periodically, not on `onStop`. MEASURED why this waits:
+        // a run torn down 3 s after `onStop` left that record saying the session never left the
+        // foreground (`SessionHistory` `I`), and the next launch judged it a crash. Waiting for
+        // the engine's own write, capped, is the device's order of events.
+        //
+        // **And asserted**: the record must end with the app in the background. MEASURED, the
+        // letter that says so: `I` after each close without the process lifecycle events
+        // (gate108, gate109, and gate113 with them switched off) -- and gate108's next launch
+        // died in the engine's inferred-crash report (gate109) -- and `IB` after each close with
+        // them (gate110-112, gate114), whose next launches ran.
+        if closed {
+            let record = guest._root.0.join(format!(
+                "data/data/com.roblox.client/files/appData/LocalStorage/memProfStorage{}.json",
+                omni_platform::process::pid()
+            ));
+            let history = || {
+                std::fs::read_to_string(&record).ok().and_then(|text| {
+                    text.split("\"SessionHistory\":\"").nth(1).and_then(|rest| rest.split('"').next()).map(str::to_string)
+                })
+            };
+            let backgrounded = std::time::Instant::now();
+            while backgrounded.elapsed() < std::time::Duration::from_secs(60)
+                && !history().is_some_and(|letters| letters.ends_with('B'))
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            let history = history();
+            let _ = writeln!(
+                std::io::stderr(),
+                "CLOSE: in the background {:.1}s; the engine's session record says SessionHistory {history:?}",
+                backgrounded.elapsed().as_secs_f32()
+            );
+            if !history.as_deref().is_some_and(|letters| letters.ends_with('B')) {
+                close_failure = Some(format!(
+                    "60 s after the close, the engine's session record ({}) says SessionHistory \
+                     {history:?}, not an app in the background -- the next launch of a kept root \
+                     would judge this session a crash",
+                    record.display()
+                ));
+            }
+        }
+        // **The run ends here at a person's request**, closed the way a device closes an app --
+        // which is what Android records as `REASON_USER_REQUESTED` (the task removed, or force
+        // stop), ended with `SIGKILL` while `IMPORTANCE_CACHED`. Recorded only when every close
+        // call returned: a run that failed did not end that way, and the next launch is told
+        // nothing about it, so the engine infers a crash -- which is then the truth.
+        if closed {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+            record_exit(&guest._root.0, omni_android::jni::ExitRecord {
+                pid: i32::try_from(omni_platform::process::pid()).unwrap_or(0),
+                reason: omni_android::jni::ExitRecord::REASON_USER_REQUESTED,
+                status: omni_android::jni::ExitRecord::SIGKILL,
+                timestamp_ms: now,
+                importance: omni_android::jni::ExitRecord::IMPORTANCE_CACHED,
+            });
+        }
         // The game thread acts on each command after the glue has handed it over.
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
@@ -3371,6 +3579,13 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         "the window was resized and the engine stopped presenting: {}",
         frames_after_resize.as_deref().unwrap_or_default()
     );
+    // **And the close**, asserted the same way: each call a device makes returned, and the
+    // engine recorded the app going to the background.
+    assert!(
+        close_failure.is_none(),
+        "the app was not closed as a device closes it: {}",
+        close_failure.as_deref().unwrap_or_default()
+    );
 }
 
 /// The bytes **before** an address a refusal named as unreadable.
@@ -3391,6 +3606,40 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
 /// ended the process, and *none* of the per-row lines had been printed -- so the run said nothing
 /// about the rows that had already returned. `VERIFICATION.md` entry 4's shape: the measurement
 /// has to survive the failure it is measuring.
+/// **Send a process lifecycle event as the app's own observer does**, through
+/// [`script::process_lifecycle`], and say what happened -- the call, its result and any guest
+/// thread that died meanwhile.
+fn process_event(
+    guest: &Guest,
+    cpu: &mut DynarmicCpu,
+    event: script::ProcessEvent,
+    when: &str,
+) -> Result<(), String> {
+    let result = {
+        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+        let _jni = guest.jni.activate().expect("publish the JNI instance");
+        let _ndk = guest.ndk.activate();
+        script::process_lifecycle(
+            &guest.jni,
+            &guest.boundary,
+            cpu,
+            &|symbol| guest.exports.get(symbol).copied(),
+            event,
+        )
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "{when}: ProcessLifecycleOwner {event:?} -> JNIAppLifecycleNativeAdapter.{} -> {}",
+        event.native(),
+        match &result {
+            Ok(()) => "returned".to_string(),
+            Err(error) => format!("{error}"),
+        }
+    );
+    report_dead_guest_threads(guest, &format!("after ProcessLifecycleOwner {event:?}"));
+    result.map_err(|error| error.to_string())
+}
+
 fn drive_flag_rows(
     guest: &Guest,
     cpu: &mut DynarmicCpu,

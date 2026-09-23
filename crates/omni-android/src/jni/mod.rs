@@ -158,6 +158,65 @@ pub enum KeyboardRequest {
     Hide,
 }
 
+/// How one earlier run of the app ended, as Android's `ApplicationExitInfo` records it -- what
+/// `ActivityManager.getHistoricalProcessExitReasons` hands the Java side, which turns each into
+/// a `com.roblox.engine.jni.model.ApplicationExitInfoCpp` (`jk.l2.a`) for
+/// `nativeSetAppPreviousExitReasons`. **Recorded by the embedding**, which is what ended the
+/// run: a device's system server keeps these, and nothing here invents one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitRecord {
+    /// The process id the run had -- what the guest's `getpid` answered in it.
+    pub pid: i32,
+    /// `getReason()`: one of the `REASON_*` codes this layer names ([`ExitRecord::reason_name`]).
+    pub reason: i32,
+    /// `getStatus()`: the exit status, or the signal that ended the process.
+    pub status: i32,
+    /// `getTimestamp()`: when it ended, in milliseconds since the Unix epoch.
+    pub timestamp_ms: i64,
+    /// `getImportance()`: the process's importance when it ended.
+    pub importance: i32,
+}
+
+impl ExitRecord {
+    /// `ApplicationExitInfo.REASON_USER_REQUESTED`: "killed because of the user request, for
+    /// instance, user clicked the Force stop button ... or removed the task away from Recents".
+    pub const REASON_USER_REQUESTED: i32 = 10;
+    /// `SIGKILL`, the signal the system ends a process with on a user's request.
+    pub const SIGKILL: i32 = 9;
+    /// `RunningAppProcessInfo.IMPORTANCE_CACHED`: an app whose activity has stopped.
+    pub const IMPORTANCE_CACHED: i32 = 400;
+
+    /// `ApplicationExitInfo.reasonCodeToString(reason)` for the reasons this layer records --
+    /// the text `toString()` carries in parentheses, which is what `jk.l2.b` cuts out and the
+    /// engine matches (`"USER REQUESTED"` is in `libroblox.so`'s own strings).
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] for a reason this layer does not name: a record must not
+    /// reach the engine with a string it would not have on a device.
+    pub fn reason_name(&self) -> AbiResult<&'static str> {
+        match self.reason {
+            Self::REASON_USER_REQUESTED => Ok("USER REQUESTED"),
+            other => Err(AbiError::JniRefused {
+                function: "ExitRecord::reason_name".to_string(),
+                address: 0,
+                detail: format!("exit reason {other} is not one this layer records"),
+            }),
+        }
+    }
+}
+
+/// A value the host stores in a field it builds ([`Jni::new_object_with`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostValue {
+    /// An `int` field.
+    Int(i32),
+    /// A `long` field.
+    Long(i64),
+    /// A `String` field, or `null`.
+    Text(Option<String>),
+}
+
 /// One `RegisterNatives` binding the engine made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
@@ -204,6 +263,8 @@ pub(crate) struct JniState {
     pub(crate) statics: BTreeMap<classes::FieldId, u64>,
     /// Keyboard requests not yet taken by the embedding, oldest first.
     pub(crate) keyboard: Vec<KeyboardRequest>,
+    /// How earlier runs ended, most recent first. See [`Jni::set_previous_exits`].
+    pub(crate) previous_exits: Vec<ExitRecord>,
 }
 
 impl JniState {
@@ -343,6 +404,7 @@ impl Jni {
                 assigned: HashMap::new(),
                 statics: BTreeMap::new(),
                 keyboard: Vec::new(),
+                previous_exits: Vec::new(),
             }),
             pool: Mutex::new(pool),
             census: Mutex::new(BTreeMap::new()),
@@ -565,6 +627,130 @@ impl Jni {
     #[must_use]
     pub fn take_keyboard_requests(&self) -> Vec<KeyboardRequest> {
         std::mem::take(&mut self.state.lock().keyboard)
+    }
+
+    /// **The embedding's record of how earlier runs ended**, most recent first -- what the system
+    /// hands `getHistoricalProcessExitReasons` on a device. Empty until set, which is a fresh
+    /// install's answer: no run has ended yet.
+    pub fn set_previous_exits(&self, exits: Vec<ExitRecord>) {
+        self.state.lock().previous_exits = exits;
+    }
+
+    /// The `java.util.List` the Java side hands `nativeSetAppPreviousExitReasons` (`jk.l2.a`):
+    /// one `ApplicationExitInfoCpp` per recorded exit, built with its nine-argument
+    /// constructor's values -- pid, status, timestamp, the reason and subreason text cut out of
+    /// `ApplicationExitInfo.toString()`, no description, pss and rss 0 (not measured),
+    /// importance -- and an empty list when none is recorded.
+    ///
+    /// # Errors
+    ///
+    /// A record whose reason this layer does not name, and whatever building the objects
+    /// refuses for.
+    pub fn previous_exit_reasons(&self) -> AbiResult<u64> {
+        let exits = self.state.lock().previous_exits.clone();
+        let mut elements = Vec::with_capacity(exits.len());
+        for exit in &exits {
+            elements.push(self.new_object_with(
+                "com/roblox/engine/jni/model/ApplicationExitInfoCpp",
+                &[
+                    ("mPid", HostValue::Int(exit.pid)),
+                    ("mSignal", HostValue::Int(exit.status)),
+                    ("mTimestamp", HostValue::Long(exit.timestamp_ms)),
+                    ("mExitReason", HostValue::Text(Some(exit.reason_name()?.to_string()))),
+                    // `subreasonToString(SUBREASON_UNKNOWN)`: this host records no subreason.
+                    ("mExitSubreason", HostValue::Text(Some("UNKNOWN".to_string()))),
+                    ("mDescription", HostValue::Text(None)),
+                    ("mPss", HostValue::Long(0)),
+                    ("mRss", HostValue::Long(0)),
+                    ("mImportance", HostValue::Int(exit.importance)),
+                ],
+            )?);
+        }
+        self.new_list(&elements)
+    }
+
+    /// A `java.util.ArrayList` holding `elements` (handles this instance issued, or 0 for
+    /// `null`), in order -- what the Java side's `new ArrayList<>()` and `add` build. The
+    /// backing array and each element are **anchored by global references this instance
+    /// keeps**, as a Java collection keeps its elements alive; the host may delete its locals.
+    ///
+    /// # Errors
+    ///
+    /// A handle this instance did not issue, or a full reference table.
+    pub fn new_list(&self, elements: &[u64]) -> AbiResult<u64> {
+        const NAME: &str = "Jni::new_list";
+        let mut state = self.state.lock();
+        let mut ids = Vec::with_capacity(elements.len());
+        for handle in elements {
+            let id = state.handles.resolve_nullable(NAME, self.arena, *handle)?;
+            if let Some(id) = id {
+                state.handles.reference_to(NAME, self.arena, refs::RefKind::Global, id)?;
+            }
+            ids.push(id);
+        }
+        let (Some(object), Some(list)) = (state.registry.find("java/lang/Object"), state.registry.find("java/util/ArrayList")) else {
+            return Err(AbiError::JniRefused {
+                function: NAME.to_string(),
+                address: self.arena,
+                detail: "`java/lang/Object` and `java/util/ArrayList` must be declared".to_string(),
+            });
+        };
+        let count = i32::try_from(ids.len()).unwrap_or(i32::MAX);
+        let array = state.handles.create(NAME, self.arena, refs::Object::ObjectArray { element: object, elements: ids })?;
+        state.handles.reference_to(NAME, self.arena, refs::RefKind::Global, array)?;
+        let (Some(size), Some(data)) = (
+            state.registry.field(list, "size", "I", false),
+            state.registry.field(list, "elementData", "[Ljava/lang/Object;", false),
+        ) else {
+            return Err(AbiError::JniRefused {
+                function: NAME.to_string(),
+                address: self.arena,
+                detail: "`java/util/ArrayList` declares no `size` and `elementData`".to_string(),
+            });
+        };
+        let mut fields = BTreeMap::new();
+        fields.insert(size, values::Value::Int(count));
+        fields.insert(data, values::Value::Object(Some(array)));
+        state.handles.new_local(NAME, self.arena, refs::Object::Instance { class: list, fields })
+    }
+
+    /// An instance of `class` with the named instance fields set, as a constructor whose body
+    /// stores each argument would leave it. Each value must suit the field's declared type; a
+    /// `String` it holds is anchored by a global reference this instance keeps.
+    ///
+    /// # Errors
+    ///
+    /// An undeclared class, a field it does not declare with a matching type, or a full table.
+    pub fn new_object_with(&self, class: &str, values: &[(&str, HostValue)]) -> AbiResult<u64> {
+        const NAME: &str = "Jni::new_object_with";
+        let mut state = self.state.lock();
+        let refuse = |detail: String| AbiError::JniRefused { function: NAME.to_string(), address: self.arena, detail };
+        let Some(id) = state.registry.find(class) else {
+            return Err(refuse(format!("`{class}` is not declared")));
+        };
+        let mut fields = BTreeMap::new();
+        for (field, value) in values {
+            let descriptor = match value {
+                HostValue::Int(_) => "I",
+                HostValue::Long(_) => "J",
+                HostValue::Text(_) => "Ljava/lang/String;",
+            };
+            let Some(at) = state.registry.field(id, field, descriptor, false) else {
+                return Err(refuse(format!("`{class}` declares no instance field `{field}` of type {descriptor}")));
+            };
+            let stored = match value {
+                HostValue::Int(v) => values::Value::Int(*v),
+                HostValue::Long(v) => values::Value::Long(*v),
+                HostValue::Text(None) => values::Value::Object(None),
+                HostValue::Text(Some(text)) => {
+                    let string = state.handles.create(NAME, self.arena, refs::Object::String(values::JavaString::from_str(text)))?;
+                    state.handles.reference_to(NAME, self.arena, refs::RefKind::Global, string)?;
+                    values::Value::Object(Some(string))
+                }
+            };
+            fields.insert(at, stored);
+        }
+        state.handles.new_local(NAME, self.arena, refs::Object::Instance { class: id, fields })
     }
 
     /// Delete a local reference the host made -- a `String` it passed to a native, say.
