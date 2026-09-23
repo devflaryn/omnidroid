@@ -134,6 +134,7 @@ use crate::abi::ARG_REGISTERS;
 use crate::boundary::{BoundaryBuilder, ImportCall, ImportFn};
 use crate::error::{AbiError, AbiResult};
 
+pub mod chain;
 mod command;
 mod counted;
 pub mod descriptor;
@@ -150,9 +151,16 @@ pub mod rewrite;
 pub mod shader;
 pub mod surface;
 pub mod swapchain;
+pub mod query;
 mod sync;
 mod view;
 
+pub use chain::{
+    flat_structure, FlatStructure, CHAIN_HEADER_BYTES, FLAT_STRUCTURES, MAX_CHAIN_LINKS,
+    IMAGE_FORMAT_PROPERTIES_2_BYTES, PHYSICAL_DEVICE_FEATURES_2_BYTES,
+    PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_BYTES, STYPE_IMAGE_FORMAT_PROPERTIES_2,
+    STYPE_PHYSICAL_DEVICE_FEATURES_2, STYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+};
 pub use command::{
     COMMAND_BUFFER_ALLOCATE_INFO_BYTES, COMMAND_BUFFER_BEGIN_INFO_BYTES,
     COMMAND_POOL_CREATE_INFO_BYTES, IMAGE_MEMORY_BARRIER_BYTES, MAX_BARRIERS,
@@ -164,17 +172,19 @@ pub use device::{
 };
 pub use handles::HANDLE_SLOT_BYTES;
 pub use host::{
-    Acquired, ApplicationInfo, BufferRequest, ColorBlendState, DescriptorBinding, DescriptorCopy,
+    Acquired, ApplicationInfo, BufferRequest, ChainLink, ColorBlendState, DescriptorBinding, DescriptorCopy,
     DescriptorPoolRequest, DescriptorSetLayoutRequest, DescriptorWrite, DescriptorWrites,
     DeviceRequest, DriverAnswer, FramebufferRequest, GraphicsPipelineRequest, HostBuffer,
     HostCommandBuffer, HostCommandPool, HostCreatedImage, HostDescriptorPool, HostDescriptorSet,
     HostDescriptorSetLayout, HostDevice, HostDeviceMemory, HostExtension, HostFence,
     HostFramebuffer, HostImage, HostImageRef, HostImageView, HostInstance, HostPhysicalDevice,
-    HostPipeline, HostPipelineCache, HostPipelineLayout, HostQueue, HostRenderPass, HostSampler,
-    HostSemaphore, HostShaderModule, HostSurface, HostSwapchain, ImageBarrier, ImageRequest,
+    HostPipeline, HostPipelineCache, HostPipelineLayout, HostQueryPool, HostQueue, HostRenderPass,
+    HostSampler,
+    HostSemaphore, HostShaderModule, HostSurface, HostSwapchain, ImageBarrier, ImageFormatQuery,
+    ImageRequest,
     ImageViewRequest, InstanceRequest, MemoryAllocation, MemoryPlan, MultisampleState,
     PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest, Presented,
-    QueueRequest, RenderPassBegin, RenderPassRequest, ShaderStage, Specialization, SubmitRequest,
+    QueryPoolRequest, QueueRequest, RenderPassBegin, RenderPassRequest, ShaderStage, Specialization, SubmitRequest,
     SubpassRequest, SurfaceCreated, SwapchainRequest, VertexInputState, ViewportState, VulkanHost,
 };
 pub use descriptor::{
@@ -199,6 +209,7 @@ pub use resource::{
     BUFFER_CREATE_INFO_BYTES, IMAGE_CREATE_INFO_BYTES, MAX_RESOURCE_QUEUE_FAMILIES,
     SAMPLER_CREATE_INFO_BODY_BYTES, SAMPLER_CREATE_INFO_BYTES,
 };
+pub use query::{QUERY_POOL_CREATE_INFO_BYTES, STYPE_QUERY_POOL_CREATE_INFO};
 pub use shader::{
     ATTACHMENT_DESCRIPTION_BYTES, ATTACHMENT_REFERENCE_BYTES, COLOR_BLEND_ATTACHMENT_BYTES,
     COLOR_BLEND_STATE_BYTES, DEPTH_STENCIL_STATE_BODY_BYTES, DEPTH_STENCIL_STATE_BYTES,
@@ -231,7 +242,7 @@ pub use instance::{
     VK_INCOMPLETE, VK_SUCCESS,
 };
 pub use physical::{
-    PHYSICAL_DEVICE_FEATURES_BYTES, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES,
+    FORMAT_PROPERTIES_BYTES, IMAGE_FORMAT_PROPERTIES_BYTES, PHYSICAL_DEVICE_FEATURES_BYTES, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES,
     PHYSICAL_DEVICE_PROPERTIES_BYTES, PRESENT_MODE_BYTES, QUEUE_FAMILY_PROPERTIES_BYTES,
     SURFACE_CAPABILITIES_BYTES, SURFACE_FORMAT_BYTES,
 };
@@ -421,120 +432,134 @@ pub const MAX_SWAPCHAINS: usize = 8;
 /// Stage 4 issues `VkImage` handles from `vkGetSwapchainImagesKHR` and from nothing else.
 pub const MAX_IMAGES: usize = 32;
 
-/// How many `VkImageView` handles one [`Vulkan`] will hold at once. One per swapchain image, so
-/// the same bound as [`MAX_IMAGES`].
-pub const MAX_IMAGE_VIEWS: usize = 32;
+/// How many `VkImageView` handles one [`Vulkan`] will hold at once.
+///
+/// Stage 4 made one per swapchain image and sized this to match [`MAX_IMAGES`]; the engine's own
+/// renderer makes views of the images it creates as well -- MEASURED, five live before its first
+/// shader -- so the bound follows [`MAX_CREATED_IMAGES`] instead: every created image may carry
+/// a view.
+pub const MAX_IMAGE_VIEWS: usize = MAX_CREATED_IMAGES;
 
 /// How many `VkSemaphore` handles one [`Vulkan`] will hold at once.
 ///
 /// A frame loop needs an acquire semaphore per frame in flight and a render-finished semaphore per
 /// **swapchain image** — `omni_gfx::vulkan`'s module header records why that asymmetry is the one
-/// people get wrong — so a two-frame loop over an eight-image swapchain wants ten. Thirty-two is
-/// three times that.
-pub const MAX_SEMAPHORES: usize = 32;
+/// people get wrong — so a two-frame loop over an eight-image swapchain wants ten. A game engine
+/// adds its upload and compute queues' own; 1,024 is room for all of them, at 16 bytes a handle.
+pub const MAX_SEMAPHORES: usize = 1024;
 
 /// How many `VkFence` handles one [`Vulkan`] will hold at once. One per frame in flight, plus
-/// whatever an upload path uses; sixteen is well above both.
-pub const MAX_FENCES: usize = 16;
+/// whatever an upload path uses -- which in a streaming engine is one per transfer in flight.
+pub const MAX_FENCES: usize = 1024;
 
 /// How many `VkCommandPool` handles one [`Vulkan`] will hold at once.
 ///
 /// A pool is per thread per queue family, because `VkCommandPool` is externally synchronised and
-/// sharing one across threads is the mistake it exists to make visible. Eight covers a renderer
-/// with a handful of recording threads.
-pub const MAX_COMMAND_POOLS: usize = 8;
+/// sharing one across threads is the mistake it exists to make visible. A game engine records on
+/// every worker thread; 256 is room for its pool of workers several times over.
+pub const MAX_COMMAND_POOLS: usize = 256;
 
 /// How many `VkCommandBuffer` handles one [`Vulkan`] will hold at once.
 ///
 /// The largest of stage 4's bounds, because it is the family a renderer has most of: one per frame
-/// in flight per pass, and a deferred renderer has several passes. Sixty-four is far above what a
-/// clear and a present need and is the number the refusal names when it is reached.
-pub const MAX_COMMAND_BUFFERS: usize = 64;
+/// in flight per pass per recording thread, and secondary command buffers on top.
+pub const MAX_COMMAND_BUFFERS: usize = 4096;
 
 // ------------------------------------------------- stage 5's thirteen families, and their bounds
 //
 // **Every one of these is an allocation bound and none of them is a claim about Vulkan.** Reaching
 // one is a refusal naming the constant, because a registry that reused a live slot would silently
 // alias two objects and a registry that grew without bound would be a guest-controlled allocation.
-// They are also chosen **against `REGISTRY_BYTES`' budget** rather than in isolation — see that
-// constant, which stage 5 is what pushed past 4096.
+//
+// **Sized for a game renderer, since the engine's own renderer is what reaches them now.** Stage
+// 5 chose them for a textured triangle, against a 4 KiB-then-8 KiB data area, and MEASURED the
+// first time the engine loaded its shader pack: the seventeenth live `VkShaderModule` was refused.
+// A handle costs 16 bytes of data area, so the bounds are now the specification's own floors
+// where it sets one (`maxMemoryAllocationCount` >= 4096, `maxSamplerAllocationCount` >= 4000 --
+// an engine written for every Android device cannot count on more) and the engine's content
+// otherwise, and `REQUIRED_DATA_BYTES` carries them.
 
 /// How many `VkDeviceMemory` handles one [`Vulkan`] will hold at once.
 ///
 /// A renderer's allocation count is the one number here that scales with *content* rather than
 /// with the shape of the renderer: a device-local pool, a staging ring, and one allocation per
-/// texture that has not been sub-allocated. Thirty-two is well above a bring-up path and far below
-/// what a streaming engine would want — which is the honest state, because a suballocator is the
-/// engine's to write and a layer that raised this bound to hide its absence would be hiding it.
-pub const MAX_DEVICE_MEMORIES: usize = 32;
+/// texture that has not been sub-allocated. 4,096 is the specification's floor for
+/// `maxMemoryAllocationCount`, so no conformant device promises an engine fewer and an engine
+/// written for all of them cannot count on more.
+pub const MAX_DEVICE_MEMORIES: usize = 4096;
 
-/// How many `VkBuffer` handles one [`Vulkan`] will hold at once.
-pub const MAX_BUFFERS: usize = 32;
+/// How many `VkBuffer` handles one [`Vulkan`] will hold at once: vertex, index, uniform and
+/// staging buffers for a whole scene.
+pub const MAX_BUFFERS: usize = 16384;
 
 /// How many `VkImage` handles the guest **created** one [`Vulkan`] will hold at once.
 ///
 /// Separate from [`MAX_IMAGES`], which is the swapchain's, for the reason
 /// [`HostImageRef`](host::HostImageRef) gives: they are the same Vulkan type and different
 /// objects, and each family having its own range of the data area is what makes a `vkDestroyImage`
-/// of a swapchain image a typed refusal.
-pub const MAX_CREATED_IMAGES: usize = 32;
+/// of a swapchain image a typed refusal. A scene's textures, render targets and their mips'
+/// staging -- thousands in a game.
+pub const MAX_CREATED_IMAGES: usize = 8192;
 
 /// How many `VkSampler` handles one [`Vulkan`] will hold at once.
 ///
 /// Samplers are *shared*: a renderer makes a handful — linear-repeat, linear-clamp,
-/// nearest-repeat, a shadow comparison one — and binds them to hundreds of textures. Eight is
-/// above every arrangement this project has seen.
-pub const MAX_SAMPLERS: usize = 8;
+/// nearest-repeat, a shadow comparison one — and binds them to hundreds of textures. 4,000 is the
+/// specification's floor for `maxSamplerAllocationCount`, which no engine can exceed anywhere.
+pub const MAX_SAMPLERS: usize = 4000;
 
 /// How many `VkShaderModule` handles one [`Vulkan`] will hold at once.
 ///
 /// **Not a bound on how many shaders an engine has.** D8 records that Roblox ships 1,364 SPIR-V
 /// modules; what this bounds is how many are *live as modules at one time*, and a module is
 /// ordinarily destroyed immediately after the pipelines that use it are created — the
-/// specification explicitly permits it, and every engine does. Sixteen is a generous batch. An
-/// engine that kept all 1,364 alive would reach a refusal naming this constant, which is the
-/// finding rather than the failure.
-pub const MAX_SHADER_MODULES: usize = 16;
+/// specification explicitly permits it -- **and this engine does not**: MEASURED, it creates
+/// modules out of `shaders/shaders_vulkan_mobile.pack` and keeps them, and its seventeenth was
+/// refused when this bound was sixteen. 2,048 holds every one of the 1,364 at once with room.
+pub const MAX_SHADER_MODULES: usize = 2048;
 
 /// How many `VkPipelineLayout` handles one [`Vulkan`] will hold at once.
-pub const MAX_PIPELINE_LAYOUTS: usize = 16;
+pub const MAX_PIPELINE_LAYOUTS: usize = 1024;
 
 /// How many `VkRenderPass` handles one [`Vulkan`] will hold at once.
 ///
 /// One per distinct attachment arrangement — a forward pass, a shadow pass, a post pass — not one
-/// per frame.
-pub const MAX_RENDER_PASSES: usize = 8;
+/// per frame; an engine that builds them per format and sample count has dozens.
+pub const MAX_RENDER_PASSES: usize = 1024;
 
 /// How many `VkFramebuffer` handles one [`Vulkan`] will hold at once.
 ///
 /// **One per swapchain image per render pass**, which is why this is larger than
 /// [`MAX_RENDER_PASSES`]: a renderer rebuilds all of them on every resize, and two sets can be
-/// live at once while the old swapchain is retired.
-pub const MAX_FRAMEBUFFERS: usize = 16;
+/// live at once while the old swapchain is retired -- and off-screen targets have their own.
+pub const MAX_FRAMEBUFFERS: usize = 1024;
 
-/// How many `VkPipeline` handles one [`Vulkan`] will hold at once.
-pub const MAX_PIPELINES: usize = 16;
+/// How many `VkPipeline` handles one [`Vulkan`] will hold at once: one per shader pair per render
+/// state an engine has met, which is thousands.
+pub const MAX_PIPELINES: usize = 8192;
 
 /// How many `VkPipelineCache` handles one [`Vulkan`] will hold at once. A renderer has one.
 pub const MAX_PIPELINE_CACHES: usize = 4;
 
 /// How many `VkDescriptorSetLayout` handles one [`Vulkan`] will hold at once.
 ///
-/// The same number as [`MAX_SET_LAYOUTS`], deliberately: that is how many one pipeline layout may
-/// be built from, so a smaller registry would make a conforming pipeline layout unbuildable out of
-/// layouts this registry could not all hold at once.
-pub const MAX_DESCRIPTOR_SET_LAYOUTS: usize = MAX_SET_LAYOUTS;
+/// At least [`MAX_SET_LAYOUTS`], which is how many one pipeline layout may be built from; an engine
+/// has one per shader interface, so as many as [`MAX_PIPELINE_LAYOUTS`].
+pub const MAX_DESCRIPTOR_SET_LAYOUTS: usize = MAX_PIPELINE_LAYOUTS;
 
-/// How many `VkDescriptorPool` handles one [`Vulkan`] will hold at once.
-pub const MAX_DESCRIPTOR_POOLS: usize = 4;
+/// How many `VkDescriptorPool` handles one [`Vulkan`] will hold at once. An engine grows a pool
+/// chain as a scene needs more sets, per frame in flight.
+pub const MAX_DESCRIPTOR_POOLS: usize = 1024;
 
 /// How many `VkDescriptorSet` handles one [`Vulkan`] will hold at once.
 ///
 /// The largest of stage 5's bounds for [`MAX_COMMAND_BUFFERS`]' reason: it is the family a
-/// renderer has most of, one per material per frame in flight. Thirty-two is what fits the data
-/// area beside everything else, and the thirty-third is a refusal naming this constant — which is
-/// a real limit on how much a guest can draw and is stated rather than hidden.
-pub const MAX_DESCRIPTOR_SETS: usize = 32;
+/// renderer has most of, one per material per frame in flight -- a scene's worth.
+pub const MAX_DESCRIPTOR_SETS: usize = 16384;
+
+/// How many `VkQueryPool` handles one [`Vulkan`] will hold at once. MEASURED: the engine makes
+/// one, its GPU timer (`gpuTimeQueryPool`); four is room for a recreated renderer's.
+pub const MAX_QUERY_POOLS: usize = 4;
 
 /// The symbol [`Vulkan::bind_into`] declares the `VkDeviceMemory` registry under.
 pub const DEVICE_MEMORY_REGISTRY_SYMBOL: &str = "vulkan::device_memories";
@@ -562,6 +587,8 @@ pub const DESCRIPTOR_SET_LAYOUT_REGISTRY_SYMBOL: &str = "vulkan::descriptor_set_
 pub const DESCRIPTOR_POOL_REGISTRY_SYMBOL: &str = "vulkan::descriptor_pools";
 /// The symbol [`Vulkan::bind_into`] declares the `VkDescriptorSet` registry under.
 pub const DESCRIPTOR_SET_REGISTRY_SYMBOL: &str = "vulkan::descriptor_sets";
+/// The symbol [`Vulkan::bind_into`] declares the `VkQueryPool` registry under.
+pub const QUERY_POOL_REGISTRY_SYMBOL: &str = "vulkan::query_pools";
 
 /// The symbol [`Vulkan::bind_into`] declares the `VkPhysicalDevice` registry under.
 pub const PHYSICAL_DEVICE_REGISTRY_SYMBOL: &str = "vulkan::physical_devices";
@@ -614,6 +641,14 @@ pub const COMMAND_BUFFER_REGISTRY_SYMBOL: &str = "vulkan::command_buffers";
 /// [`the_registries_fit_the_data_area_every_embedding_passes`] is what fails if a future family
 /// pushes past the new number too.
 ///
+/// # And the engine's renderer is what made 8 KiB stop fitting
+///
+/// MEASURED: once the engine loaded its shader pack it kept its shader modules live, and the
+/// seventeenth was refused. Bounds sized for a textured triangle are not bounds for a game, so the
+/// families are now sized for one (see each `MAX_*`), about 81,000 slots -- 1.2 MiB -- and the data
+/// area is **2 MiB**. Every embedding takes it from [`REQUIRED_DATA_BYTES`], so none had to change;
+/// it is committed with the boundary, once, and nothing else grows with it.
+///
 /// [`BoundaryBuilder::new`]: crate::BoundaryBuilder::new
 /// [`the_registries_fit_the_data_area_every_embedding_passes`]:
 ///     #tests::the_registries_fit_the_data_area_every_embedding_passes
@@ -637,19 +672,20 @@ pub const REGISTRY_BYTES: usize = MAX_INSTANCES * INSTANCE_SLOT_BYTES
         + MAX_PIPELINE_CACHES
         + MAX_DESCRIPTOR_SET_LAYOUTS
         + MAX_DESCRIPTOR_POOLS
-        + MAX_DESCRIPTOR_SETS)
+        + MAX_DESCRIPTOR_SETS
+        + MAX_QUERY_POOLS)
         * SLOT;
 
 /// The bytes of data area an embedding must pass to [`BoundaryBuilder::new`] for a boundary that
 /// binds a [`Vulkan`].
 ///
 /// **Stated here so an embedding has one number to copy rather than a subtraction to do.** See
-/// [`REGISTRY_BYTES`] for why it is 8192 rather than the 4096 every boundary passed before stage
-/// 5, and what that change costs. The `ndk` and `jni` data symbols come out of the same area, so
+/// [`REGISTRY_BYTES`] for why it went from 4096 to 8192 for stage 5, and then to 2 MiB for the
+/// engine's own renderer, and what that costs. The `ndk` and `jni` data symbols come out of the same area, so
 /// the margin between the two constants is the whole budget for everything that is not Vulkan.
 ///
 /// [`BoundaryBuilder::new`]: crate::BoundaryBuilder::new
-pub const REQUIRED_DATA_BYTES: usize = 8192;
+pub const REQUIRED_DATA_BYTES: usize = 2 * 1024 * 1024;
 
 /// What a `VkPhysicalDevice` slot holds, for a reader of a memory dump. Nothing reads it back.
 const PHYSICAL_DEVICE_SLOT_MAGIC: u64 = 0x004F_4D4E_5650_4400; // "\0OMNVPD\0"
@@ -701,6 +737,8 @@ const DESCRIPTOR_SET_LAYOUT_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_4C00; // "\0OMNVD
 const DESCRIPTOR_POOL_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_5000; // "\0OMNVDP\0"
 /// What a `VkDescriptorSet` slot holds. Nothing reads it back.
 const DESCRIPTOR_SET_SLOT_MAGIC: u64 = 0x004F_4D4E_5644_5300; // "\0OMNVDS\0"
+/// What a `VkQueryPool` slot holds. Nothing reads it back.
+const QUERY_POOL_SLOT_MAGIC: u64 = 0x004F_4D4E_5651_5000; // "\0OMNVQP\0"
 
 /// What `vkGetInstanceProcAddr` answered for one name.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -972,6 +1010,7 @@ struct State {
     descriptor_set_layouts: Option<Handles<HostDescriptorSetLayout>>,
     descriptor_pools: Option<Handles<HostDescriptorPool>>,
     descriptor_sets: Option<Handles<HostDescriptorSet>>,
+    query_pools: Option<Handles<HostQueryPool>>,
     /// The `GuestSpace` pages behind every **imported** `VkDeviceMemory`, by token.
     ///
     /// **The one piece of state in this file that owns address space.** A forwarded allocation has
@@ -1150,6 +1189,7 @@ impl Vulkan {
                 descriptor_set_layouts: None,
                 descriptor_pools: None,
                 descriptor_sets: None,
+                query_pools: None,
                 imports: BTreeMap::new(),
                 imported_bytes: 0,
                 imported_peak: 0,
@@ -1402,6 +1442,13 @@ impl Vulkan {
             MAX_DESCRIPTOR_SETS,
             "VkDescriptorSet",
             DESCRIPTOR_SET_SLOT_MAGIC,
+        )?);
+        state.query_pools = Some(carve(
+            builder,
+            QUERY_POOL_REGISTRY_SYMBOL,
+            MAX_QUERY_POOLS,
+            "VkQueryPool",
+            QUERY_POOL_SLOT_MAGIC,
         )?);
         Ok(BOUND_SYMBOLS)
     }
@@ -1870,7 +1917,7 @@ impl Vulkan {
              VkPipelineCache {}/{MAX_PIPELINE_CACHES}, \
              VkDescriptorSetLayout {}/{MAX_DESCRIPTOR_SET_LAYOUTS}, \
              VkDescriptorPool {}/{MAX_DESCRIPTOR_POOLS}, \
-             VkDescriptorSet {}/{MAX_DESCRIPTOR_SETS}\n",
+             VkDescriptorSet {}/{MAX_DESCRIPTOR_SETS}, VkQueryPool {}/{MAX_QUERY_POOLS}\n",
             state.device_memories.as_ref().map_or(0, Handles::live),
             state.buffers.as_ref().map_or(0, Handles::live),
             state.created_images.as_ref().map_or(0, Handles::live),
@@ -1884,6 +1931,7 @@ impl Vulkan {
             state.descriptor_set_layouts.as_ref().map_or(0, Handles::live),
             state.descriptor_pools.as_ref().map_or(0, Handles::live),
             state.descriptor_sets.as_ref().map_or(0, Handles::live),
+            state.query_pools.as_ref().map_or(0, Handles::live),
         ));
         out.push_str(&format!(
             "  guest memory imported for Vulkan: {} live import(s) holding {} byte(s), peak {} \
@@ -2439,6 +2487,14 @@ impl Vulkan {
         "it is *non*-dispatchable, and it stops being valid when its **pool** is reset or \
          destroyed rather than when anything names it -- which is when this layer takes the \
          handle back, so a set used after its pool went lands here"
+    }
+
+    stage_five_family! {
+        /// The [`HostQueryPool`] a guest `VkQueryPool` names, or a typed refusal.
+        query_pool_token, register_query_pool, forget_query_pool,
+        query_pools, HostQueryPool, "VkQueryPool", "vkCreateQueryPool",
+        "it is *non*-dispatchable, and reading back another pool's timestamps is a GPU timer \
+         measuring frames it did not bracket"
     }
 
     /// The image a guest `VkImage` names, **whichever of the two families it belongs to**.
@@ -3281,6 +3337,20 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             physical::physical_device_properties(c, &at, &vulkan, args)
         }
         "vkGetPhysicalDeviceFeatures" => physical::physical_device_features(c, &at, &vulkan, args),
+        "vkGetPhysicalDeviceFormatProperties" => {
+            physical::physical_device_format_properties(c, &at, &vulkan, args)
+        }
+        "vkGetPhysicalDeviceImageFormatProperties" => {
+            physical::physical_device_image_format_properties(c, &at, &vulkan, args)
+        }
+        "vkGetPhysicalDeviceImageFormatProperties2"
+        | "vkGetPhysicalDeviceImageFormatProperties2KHR" => {
+            physical::physical_device_image_format_properties2(c, &at, &vulkan, name.as_str(), args)
+        }
+        // The engine's device bring-up: `KHR`, with flat structures chained (`chain`).
+        "vkGetPhysicalDeviceFeatures2" | "vkGetPhysicalDeviceFeatures2KHR" => {
+            physical::physical_device_features2(c, &at, &vulkan, name.as_str(), args)
+        }
         "vkGetPhysicalDeviceQueueFamilyProperties" => {
             physical::queue_family_properties(c, &at, &vulkan, args)
         }
@@ -3359,6 +3429,9 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkDestroyShaderModule" => shader::destroy_shader_module(c, &at, &vulkan, args),
         "vkCreatePipelineCache" => shader::create_pipeline_cache(c, &at, &vulkan, args),
         "vkDestroyPipelineCache" => shader::destroy_pipeline_cache(c, &at, &vulkan, args),
+        // The engine's own renderer: its GPU timer.
+        "vkCreateQueryPool" => query::create_query_pool(c, &at, &vulkan, args),
+        "vkDestroyQueryPool" => query::destroy_query_pool(c, &at, &vulkan, args),
         "vkCreatePipelineLayout" => shader::create_pipeline_layout(c, &at, &vulkan, args),
         "vkDestroyPipelineLayout" => shader::destroy_pipeline_layout(c, &at, &vulkan, args),
         "vkCreateRenderPass" => shader::create_render_pass(c, &at, &vulkan, args),
@@ -3573,7 +3646,7 @@ mod tests {
             + MAX_COMMAND_POOLS
             + MAX_COMMAND_BUFFERS)
             * SLOT;
-        assert_eq!(stage_four, 3072);
+        assert_eq!(stage_four, 14_632 * SLOT);
         // Stage 5's thirteen, which is what pushed the total past the old 4096.
         let stage_five = (MAX_DEVICE_MEMORIES
             + MAX_BUFFERS
@@ -3589,18 +3662,19 @@ mod tests {
             + MAX_DESCRIPTOR_POOLS
             + MAX_DESCRIPTOR_SETS)
             * SLOT;
-        assert_eq!(stage_five, 3712, "232 slots of {SLOT} bytes");
-        assert_eq!(REGISTRY_BYTES, 64 + 512 + stage_four + stage_five);
-        assert_eq!(REGISTRY_BYTES, 7360);
+        assert_eq!(stage_five, 64_420 * SLOT, "64,420 slots of {SLOT} bytes");
+        // The engine's own renderer: its GPU timer's query pools.
+        let engine = MAX_QUERY_POOLS * SLOT;
+        assert_eq!(engine, 64);
+        assert_eq!(REGISTRY_BYTES, 64 + 512 + stage_four + stage_five + engine);
+        assert_eq!(REGISTRY_BYTES, 1_265_472);
 
         // **The old area, as the subtraction that says why it had to grow.** 4096 - 3648 left 448
         // bytes after stage 4, which is 28 slots — fewer than two per stage 5 family, and a
         // registry with one slot refuses the second object of its kind. There is no arrangement
         // of thirteen families that fits, which is what makes `REQUIRED_DATA_BYTES` a change to
         // every embedding rather than a bound to squeeze.
-        assert_eq!(4096 - (64 + 512 + stage_four), 448, "what stage 4 left");
-        assert_eq!(448 / SLOT, 28, "slots, for thirteen new families");
-        assert!(stage_five > 448, "stage 5 does not fit the old area");
+        assert!(stage_five > 4096, "stage 5 alone does not fit the first area");
 
         // **The margin, as a subtraction rather than as `<`.** A comparison between two constants
         // is one the compiler folds away — clippy's `assertions_on_constants` names it — and the
@@ -3609,10 +3683,10 @@ mod tests {
         // everything else; raising a Vulkan bound past it means raising the data area every
         // embedding passes to `BoundaryBuilder::new` **again**, which is a change to those
         // embeddings and not to this constant.
-        assert_eq!(REQUIRED_DATA_BYTES, 8192);
+        assert_eq!(REQUIRED_DATA_BYTES, 2_097_152);
         assert_eq!(
             REQUIRED_DATA_BYTES - REGISTRY_BYTES,
-            832,
+            831_680,
             "what is left for everything else"
         );
     }

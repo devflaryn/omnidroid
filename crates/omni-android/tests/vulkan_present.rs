@@ -60,7 +60,8 @@ use omni_android::vulkan::{
     HostCommandPool, HostCreatedImage, HostDescriptorPool, HostDescriptorSet,
     HostDescriptorSetLayout, HostDevice, HostDeviceMemory, HostExtension, HostFence, HostImage,
     HostImageRef, HostImageView, HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache,
-    HostPipelineLayout, HostQueue, HostRenderPass, HostSampler, HostSemaphore, HostShaderModule,
+    HostPipelineLayout, HostQueryPool, HostQueue, HostRenderPass, HostSampler, HostSemaphore,
+    HostShaderModule, QueryPoolRequest, QUERY_POOL_CREATE_INFO_BYTES,
     HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
     MemoryPlan, PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest,
     Presented, RenderPassRequest, RewriteSite, SubmitRequest, SurfaceCreated, SwapchainRequest,
@@ -333,6 +334,8 @@ struct HostLog {
     writes: Vec<DescriptorWrite>,
     /// Every `vkCreateSampler`'s body bytes.
     sampler_bodies: Vec<Vec<u8>>,
+    /// Every `vkCreateQueryPool` request.
+    query_pools: Vec<QueryPoolRequest>,
 }
 
 /// The measured memory table of this machine, which the double reports so that the rewrite is
@@ -629,7 +632,24 @@ impl VulkanHost for StageFourHost {
                 | "vkQueuePresentKHR"
                 | "vkQueueWaitIdle"
                 | "vkDeviceWaitIdle"
+                | "vkCreateQueryPool"
+                | "vkDestroyQueryPool"
         ))
+    }
+
+    fn create_query_pool(
+        &self,
+        _device: HostDevice,
+        request: &QueryPoolRequest,
+    ) -> AbiResult<DriverAnswer<HostQueryPool>> {
+        let mut log = self.log();
+        log.query_pools.push(*request);
+        Ok(DriverAnswer::Ok(HostQueryPool::from_token(log.query_pools.len() as u64 - 1)))
+    }
+
+    fn destroy_query_pool(&self, _pool: HostQueryPool) -> AbiResult<()> {
+        self.note("vkDestroyQueryPool");
+        Ok(())
     }
 
     // ------------------------------------------------------------------------ stage 4
@@ -943,6 +963,11 @@ impl VulkanHost for StageFourHost {
 
     fn image_memory_requirements(&self, _image: HostCreatedImage) -> AbiResult<Vec<u8>> {
         Ok(requirements(4096, 256, 0b1_1111))
+    }
+
+    /// Different numbers from a created image's, so the family that answered is visible.
+    fn swapchain_image_memory_requirements(&self, _image: HostImage) -> AbiResult<Vec<u8>> {
+        Ok(requirements(8192, 1024, 0b10))
     }
 
     fn bind_buffer_memory(
@@ -1736,6 +1761,41 @@ fn the_swapchain_create_info_is_checked_field_by_field() {
 }
 
 // ====================================================================== vkGetSwapchainImagesKHR
+
+/// **The engine's GPU timer: a timestamp query pool, created member by member and destroyed
+/// once** -- `gpuTimeQueryPool` (`0x2592d68`..`0x2592da0`). A second destroy of the same handle
+/// refuses, naming the family, and a `pNext` refuses by name.
+#[test]
+fn a_query_pool_is_created_member_by_member_and_destroyed_once() {
+    let _serial = serialized();
+    let up = up_to_a_device("query-pool");
+    let create = up.f.resolve_device(up.get_proc, up.device, "vkCreateQueryPool");
+    let destroy = up.f.resolve_device(up.get_proc, up.device, "vkDestroyQueryPool");
+
+    let info = up.f.alloc(QUERY_POOL_CREATE_INFO_BYTES);
+    up.f.guest.write_u64(info as GuestAddr, 11);
+    up.f.guest.write_u64(info as GuestAddr + 8, 0);
+    // flags 0, VK_QUERY_TYPE_TIMESTAMP (2), 8 queries, no statistics.
+    up.f.guest.write_u64(info as GuestAddr + 16, 2 << 32);
+    up.f.guest.write_u64(info as GuestAddr + 24, 8);
+    let out = up.f.alloc(8);
+    assert_eq!(up.f.call(create, [up.device, info, 0, out]).expect("create") as i32, VK_SUCCESS);
+    let pool = up.f.guest.read_u64(out as GuestAddr);
+    assert_ne!(pool, 0);
+    assert_eq!(
+        up.host.log().query_pools,
+        vec![QueryPoolRequest { flags: 0, query_type: 2, query_count: 8, pipeline_statistics: 0 }]
+    );
+
+    up.f.call(destroy, [up.device, pool, 0, 0]).expect("destroy");
+    assert!(up.host.log().destroyed.iter().any(|name| name == "vkDestroyQueryPool"));
+    let text = up.f.refusal(destroy, &[up.device, pool, 0, 0]).to_string();
+    assert!(text.contains("VkQueryPool"), "a destroyed pool is no longer a handle: {text}");
+
+    up.f.guest.write_u64(info as GuestAddr + 8, 0x1234);
+    let text = up.f.refusal(create, &[up.device, info, 0, out]).to_string();
+    assert!(text.contains("pNext"), "{text}");
+}
 
 /// **The two-call protocol, the stable handles, and what a destroyed swapchain does to them.**
 ///
@@ -4428,6 +4488,15 @@ fn a_descriptor_pool_takes_its_sets_and_a_swapchain_image_cannot_be_destroyed() 
     let images_at = f.alloc(count * 8);
     f.call(get_images, [device, swapchain, count_at, images_at]).expect("images");
     let swapchain_image = f.guest.read_u64(images_at as GuestAddr);
+
+    // Asking what a swapchain image needs is allowed -- MEASURED, the engine does -- and it is
+    // the swapchain image's own answer, not a created image's.
+    let requirements_of = f.resolve_device(m.up.get_proc, device, "vkGetImageMemoryRequirements");
+    let needs_at = f.poisoned(24, 0x77);
+    f.call(requirements_of, [device, swapchain_image, needs_at, 0]).expect("its requirements");
+    assert_eq!(f.guest.read_u64(needs_at as GuestAddr), 8192, "the swapchain image's size");
+    assert_eq!(f.guest.read_u64(needs_at as GuestAddr + 8), 1024, "and alignment");
+    assert_eq!(f.read_u32(needs_at + 16), 0b10, "and memory types");
 
     let text = f.refusal(destroy_image, &[device, swapchain_image, 0, 0]).to_string();
     assert!(text.contains("VkImage (created)"), "the family it is not: {text}");

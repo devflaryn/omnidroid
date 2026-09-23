@@ -48,13 +48,16 @@ use omni_android::bionic::Bionic;
 use omni_android::jni::Jni;
 use omni_android::ndk::{HostWindowSource, Ndk, WindowSource, SURFACE_CLASS};
 use omni_android::vulkan::{
-    DeviceRequest, DriverAnswer, HostDevice, HostExtension, HostInstance, HostPhysicalDevice,
+    ChainLink, DeviceRequest, DriverAnswer, ImageFormatQuery, IMAGE_FORMAT_PROPERTIES_BYTES, HostDevice, HostExtension, HostInstance, HostPhysicalDevice,
     HostQueue, HostSurface, InstanceRequest, RewriteSite, SurfaceCreated, Vulkan, VulkanHost,
-    ANDROID_SURFACE_CREATE_INFO_BYTES, DEVICE_CREATE_INFO_BYTES, DEVICE_QUEUE_CREATE_INFO_BYTES,
+    ANDROID_SURFACE_CREATE_INFO_BYTES, DEVICE_CREATE_INFO_BYTES, FORMAT_PROPERTIES_BYTES, DEVICE_QUEUE_CREATE_INFO_BYTES,
     GUEST_SURFACE_EXTENSION, LOADER_ENTRY_POINT, LOADER_SONAMES,
     PHYSICAL_DEVICE_FEATURES_BYTES, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES,
     PHYSICAL_DEVICE_PROPERTIES_BYTES, QUEUE_FAMILY_PROPERTIES_BYTES, SURFACE_CAPABILITIES_BYTES,
     SURFACE_FORMAT_BYTES, STYPE_ANDROID_SURFACE_CREATE_INFO_KHR, VK_INCOMPLETE, VK_SUCCESS,
+    MAX_CHAIN_LINKS, PHYSICAL_DEVICE_FEATURES_2_BYTES, STYPE_PHYSICAL_DEVICE_FEATURES_2,
+    IMAGE_FORMAT_PROPERTIES_2_BYTES, PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_BYTES,
+    STYPE_IMAGE_FORMAT_PROPERTIES_2, STYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
 };
 use omni_android::{AbiError, AbiResult, Boundary};
 use omni_cpu::{ExitReason, GuestAddr};
@@ -106,6 +109,12 @@ struct HostLog {
     queues: Vec<(HostDevice, u32, u32)>,
     /// Every `(device, name)` `vkGetDeviceProcAddr` asked about.
     device_procs: Vec<(HostDevice, String)>,
+    /// Every `vkGetPhysicalDeviceFeatures2`: the entry point it was asked through, and the chain
+    /// as it arrived.
+    features2: Vec<(String, Vec<ChainLink>)>,
+    /// Every `vkGetPhysicalDeviceImageFormatProperties2`: its entry point, its question, and the
+    /// question's chain.
+    image_format2: Vec<(String, ImageFormatQuery, Vec<ChainLink>)>,
 }
 
 /// A [`VulkanHost`] whose answers the test chooses. **Not a driver, and not guest-facing.**
@@ -286,6 +295,91 @@ impl VulkanHost for StageThreeHost {
         bytes[0..4].copy_from_slice(&1u32.to_le_bytes()); // robustBufferAccess
         bytes[PHYSICAL_DEVICE_FEATURES_BYTES - 4..].copy_from_slice(&1u32.to_le_bytes());
         Ok(bytes)
+    }
+
+    /// The format's own number in all three members, plus 0, 1 and 2: a blob that says which
+    /// format it answers for, and which member is which.
+    fn physical_device_format_properties(
+        &self,
+        _device: HostPhysicalDevice,
+        format: i32,
+    ) -> AbiResult<Vec<u8>> {
+        Ok((0..3u32).flat_map(|k| (format as u32 + k).to_le_bytes()).collect())
+    }
+
+    /// Format 75 is supported, and its answer carries the five scalars back in the first five
+    /// words (and `maxResourceSize` 1 GiB), so a transposed pair is visible; every other format is
+    /// the driver's `VK_ERROR_FORMAT_NOT_SUPPORTED` (-11).
+    fn physical_device_image_format_properties(
+        &self,
+        _device: HostPhysicalDevice,
+        query: ImageFormatQuery,
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        if query.format != 75 {
+            return Ok(DriverAnswer::Failed(-11));
+        }
+        let words = [
+            query.format as u32,
+            query.image_type as u32,
+            query.tiling as u32,
+            query.usage,
+            query.flags,
+            0,
+        ];
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        bytes.extend_from_slice(&(1u64 << 30).to_le_bytes());
+        Ok(DriverAnswer::Ok(bytes))
+    }
+
+    /// Format 1000156002 is supported -- the five scalars come back in the first five words, as
+    /// above, and each answer-chain member is set to 1 -- and every other format is the driver's
+    /// `VK_ERROR_FORMAT_NOT_SUPPORTED`.
+    fn physical_device_image_format_properties2(
+        &self,
+        device: HostPhysicalDevice,
+        entry: &str,
+        query: ImageFormatQuery,
+        question: &[ChainLink],
+        answers: &mut [ChainLink],
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        self.log().image_format2.push((entry.to_string(), query, question.to_vec()));
+        if query.format != 1_000_156_002 {
+            return Ok(DriverAnswer::Failed(-11));
+        }
+        for link in answers.iter_mut() {
+            for member in link.body.chunks_mut(4) {
+                member.copy_from_slice(&1u32.to_le_bytes());
+            }
+        }
+        let words = [
+            query.format as u32,
+            query.image_type as u32,
+            query.tiling as u32,
+            query.usage,
+            query.flags,
+            0,
+        ];
+        let _ = device;
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        bytes.extend_from_slice(&(1u64 << 30).to_le_bytes());
+        Ok(DriverAnswer::Ok(bytes))
+    }
+
+    /// Every chained feature answered **supported**: a `VkBool32` 1 in each member, so a member
+    /// this layer failed to write back reads as the guest's own 0.
+    fn physical_device_features2(
+        &self,
+        device: HostPhysicalDevice,
+        entry: &str,
+        chain: &mut [ChainLink],
+    ) -> AbiResult<Vec<u8>> {
+        self.log().features2.push((entry.to_string(), chain.to_vec()));
+        for link in chain.iter_mut() {
+            for member in link.body.chunks_mut(4) {
+                member.copy_from_slice(&1u32.to_le_bytes());
+            }
+        }
+        self.physical_device_features(device)
     }
 
     fn queue_family_properties(&self, _device: HostPhysicalDevice) -> AbiResult<Vec<Vec<u8>>> {
@@ -534,6 +628,21 @@ impl Fixture {
             asm.mov(1, args[1]);
             asm.mov(2, args[2]);
             asm.mov(3, args[3]);
+            asm.push(blr(9));
+        });
+        let exit = self.run(program)?;
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+        Ok(self.guest.read_u64(self.guest.data))
+    }
+
+    /// Call `target` with `x0`-`x6` set: the seven-register calls, such as
+    /// `vkGetPhysicalDeviceImageFormatProperties`.
+    fn call7(&self, target: u64, args: [u64; 7]) -> Result<u64, AbiError> {
+        let program = self.program_branching(|asm| {
+            asm.mov(9, target);
+            for (register, value) in args.iter().enumerate() {
+                asm.mov(register as u32, *value);
+            }
             asm.push(blr(9));
         });
         let exit = self.run(program)?;
@@ -1197,6 +1306,16 @@ fn a_structure_query_writes_the_drivers_bytes_verbatim() {
         "the heap's VkDeviceSize, 8 bytes at offset 264"
     );
 
+    // Format properties: the format the guest named reached the host, in `w1`, and the three
+    // members came back in order. The upper half of `x1` is set to show it is not read.
+    let format_properties = f.resolve(entry_point, instance, "vkGetPhysicalDeviceFormatProperties");
+    let format_out = f.poisoned(FORMAT_PROPERTIES_BYTES, 0x11);
+    f.call(format_properties, [first, 0xFFFF_FFFF_0000_0053, format_out, 0]).expect("formats");
+    let bytes = f.read_bytes(format_out, FORMAT_PROPERTIES_BYTES);
+    let members: Vec<u32> =
+        bytes.chunks(4).map(|word| u32::from_le_bytes(word.try_into().expect("four"))).collect();
+    assert_eq!(members, vec![83, 84, 85], "format 83's linear, optimal and buffer features");
+
     // Features, whose 220th byte is the last VkBool32.
     let features_out = f.poisoned(PHYSICAL_DEVICE_FEATURES_BYTES, 0x11);
     f.call(features, [first, features_out, 0, 0]).expect("features");
@@ -1225,6 +1344,8 @@ fn a_null_output_pointer_refuses_for_every_single_structure_query() {
         ("vkGetPhysicalDeviceProperties", "pProperties"),
         ("vkGetPhysicalDeviceFeatures", "pFeatures"),
         ("vkGetPhysicalDeviceMemoryProperties", "pMemoryProperties"),
+        // Its output is the third argument; the NULL in `x1` is `VK_FORMAT_UNDEFINED`.
+        ("vkGetPhysicalDeviceFormatProperties", "pFormatProperties"),
     ] {
         let thunk = f.resolve(entry_point, instance, name);
         let text = f.refusal(thunk, [device, 0, 0, 0]).to_string();
@@ -1362,10 +1483,10 @@ fn vk_create_device_decodes_the_request_and_the_queues_deduplicate() {
     assert!(report.contains("deduplicated"), "{report}");
 }
 
-/// **`pEnabledFeatures` travels as its 220 bytes, and a `pNext` chain refuses naming what is
-/// usually in it.**
+/// **`pEnabledFeatures` travels as its 220 bytes, the engine's `pNext` chain as its members, and
+/// a chained structure this layer does not carry refuses naming its `sType` and address.**
 #[test]
-fn enabled_features_travel_verbatim_and_a_device_pnext_chain_refuses() {
+fn enabled_features_and_the_measured_chain_travel_verbatim_and_other_chains_refuse() {
     let _serial = serialized();
     let host = StageThreeHost::new();
     let f = fixture("features", Some(host.clone()));
@@ -1392,15 +1513,44 @@ fn enabled_features_travel_verbatim_and_a_device_pnext_chain_refuses() {
         "all 220 bytes, byte for byte"
     );
 
-    // A pNext chain: the refusal names the structures that actually go there, because this is the
-    // one stage 4 is most likely to have to answer.
-    let chain = f.alloc(64);
+    // The engine's chain (`0x2590794`..`0x25907f8`): extended dynamic state, then YCbCr, then
+    // multiview. It travels in that order, as member bytes, with no guest pointer in it.
+    let eds = f.alloc(24);
+    let ycbcr = f.alloc(24);
+    let multiview = f.alloc(32);
+    let link = |at: u64, s_type: u32, next: u64, members: &[u32]| {
+        f.guest.write_u64(at as GuestAddr, u64::from(s_type));
+        f.guest.write_u64(at as GuestAddr + 8, next);
+        for (k, member) in members.iter().enumerate() {
+            f.guest.write_u32(at as GuestAddr + 16 + 4 * k as GuestAddr, *member);
+        }
+    };
+    link(eds, 1_000_267_000, ycbcr, &[1]);
+    link(ycbcr, 1_000_156_004, multiview, &[1]);
+    link(multiview, 1_000_053_001, 0, &[1, 0, 1]);
     let chained = f.device_create_info(&[(0, &[1.0])], &[]);
-    f.guest.write_bytes(chained as GuestAddr + 8, &chain.to_le_bytes());
+    f.guest.write_bytes(chained as GuestAddr + 8, &eds.to_le_bytes());
+    assert_eq!(f.call(create, [physical, chained, 0, out]).expect("create") as i32, VK_SUCCESS);
+    let members = |values: &[u32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    assert_eq!(
+        host.log().devices.last().expect("a request").chain,
+        vec![
+            ChainLink { s_type: 1_000_267_000, body: members(&[1]) },
+            ChainLink { s_type: 1_000_156_004, body: members(&[1]) },
+            ChainLink { s_type: 1_000_053_001, body: members(&[1, 0, 1]) },
+        ],
+        "every structure, in the guest's order, members only"
+    );
+
+    // A structure this layer does not carry -- `VkPhysicalDeviceVulkan12Features` (51) -- refuses,
+    // naming its sType and where it is, rather than being dropped.
+    let chain = f.alloc(64);
+    f.guest.write_u32(chain as GuestAddr, 51);
+    link(multiview, 1_000_053_001, chain, &[1, 0, 1]);
     let text = f.refusal(create, [physical, chained, 0, out]).to_string();
     assert!(text.contains(&format!("{chain:#x}")), "{text}");
-    assert!(text.contains("VkPhysicalDeviceVulkan12Features"), "{text}");
-    assert!(text.contains("stage 4"), "{text}");
+    assert!(text.contains("`sType` 51"), "{text}");
+    assert!(text.contains("structure 3"), "and its place in the chain: {text}");
 
     // A wrong queue sType, which would make `pQueuePriorities` be read from the wrong offset.
     let bad = f.device_create_info(&[(0, &[1.0])], &[]);
@@ -1408,6 +1558,180 @@ fn enabled_features_travel_verbatim_and_a_device_pnext_chain_refuses() {
     f.guest.write_u32(queues_at as GuestAddr, 99);
     let text = f.refusal(create, [physical, bad, 0, out]).to_string();
     assert!(text.contains("DEVICE_QUEUE_CREATE_INFO"), "{text}");
+}
+
+/// **`vkGetPhysicalDeviceFeatures2KHR` writes the host's features and answers each chained
+/// structure in place -- members only.** The guest's `sType`s, `pNext`s and tail padding are never
+/// written, and the host is asked through the name the guest called. The engine's own shape: a
+/// YCbCr structure chained to an extended-dynamic-state one (`0x2590580`..`0x25905e8`).
+#[test]
+fn features2_answers_the_features_and_each_chained_structure_in_place() {
+    let _serial = serialized();
+    let host = StageThreeHost::new();
+    let f = fixture("features2", Some(host.clone()));
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let physical = f.physical_devices(entry_point, instance)[0];
+    let features2 = f.resolve(entry_point, instance, "vkGetPhysicalDeviceFeatures2KHR");
+
+    let head = f.alloc(PHYSICAL_DEVICE_FEATURES_2_BYTES);
+    let ycbcr = f.alloc(24);
+    let eds = f.alloc(24);
+    let header = |at: u64, s_type: u32, next: u64| {
+        f.guest.write_u64(at as GuestAddr, u64::from(s_type));
+        f.guest.write_u64(at as GuestAddr + 8, next);
+    };
+    header(head, STYPE_PHYSICAL_DEVICE_FEATURES_2, ycbcr);
+    header(ycbcr, 1_000_156_004, eds);
+    header(eds, 1_000_267_000, 0);
+    // The member 0, and a sentinel in the tail padding (20..24), which is nobody's to write.
+    for at in [ycbcr, eds] {
+        f.guest.write_u64(at as GuestAddr + 16, 0xEEEE_EEEE_0000_0000);
+    }
+
+    f.call(features2, [physical, head, 0, 0]).expect("the call");
+    assert_eq!(
+        f.guest.read_u64(head as GuestAddr + 16) as u32,
+        1,
+        "robustBufferAccess, the host's first member, at offset 16"
+    );
+    assert_eq!(
+        f.guest.read_u64(head as GuestAddr + 16 + PHYSICAL_DEVICE_FEATURES_BYTES as GuestAddr - 4)
+            as u32,
+        1,
+        "and its last"
+    );
+    assert_eq!(f.guest.read_u64(head as GuestAddr + 8), ycbcr, "the head's pNext, the guest's");
+    for (at, s_type, next) in [(ycbcr, 1_000_156_004u32, eds), (eds, 1_000_267_000, 0)] {
+        assert_eq!(f.guest.read_u64(at as GuestAddr), u64::from(s_type), "the guest's sType");
+        assert_eq!(f.guest.read_u64(at as GuestAddr + 8), next, "the guest's pNext");
+        assert_eq!(
+            f.guest.read_u64(at as GuestAddr + 16),
+            0xEEEE_EEEE_0000_0001,
+            "the host's answer in the member, the padding untouched"
+        );
+    }
+    let asked = host.log().features2.clone();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].0, "vkGetPhysicalDeviceFeatures2KHR", "the name the guest called");
+    assert_eq!(
+        asked[0].1.iter().map(|link| link.s_type).collect::<Vec<_>>(),
+        vec![1_000_156_004, 1_000_267_000],
+        "in the guest's order"
+    );
+
+    // A chained structure this layer does not carry: named, with its address.
+    let unknown = f.alloc(64);
+    header(unknown, 51, 0);
+    header(eds, 1_000_267_000, unknown);
+    let text = f.refusal(features2, [physical, head, 0, 0]).to_string();
+    assert!(text.contains("`sType` 51"), "{text}");
+    assert!(text.contains(&format!("{unknown:#x}")), "{text}");
+    // A chain that points back into itself ends at the bound rather than never.
+    header(eds, 1_000_267_000, ycbcr);
+    let text = f.refusal(features2, [physical, head, 0, 0]).to_string();
+    assert!(text.contains(&format!("longer than {MAX_CHAIN_LINKS}")), "{text}");
+    // The wrong structure at the head: its features would land on something else.
+    header(head, 1_000_059_001, 0);
+    let text = f.refusal(features2, [physical, head, 0, 0]).to_string();
+    assert!(text.contains("VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2"), "{text}");
+}
+
+/// **`vkGetPhysicalDeviceImageFormatProperties` carries seven registers' worth of question to the
+/// host and its answer back** -- or the driver's own `VK_ERROR_FORMAT_NOT_SUPPORTED`, with nothing
+/// written. The engine's first question, `(75, 3D, OPTIMAL, 0xd, 0)`, is the one asked here; the
+/// upper halves of the scalar registers are set to show only the `w` halves are read.
+#[test]
+fn image_format_properties_forwards_all_five_scalars_and_the_drivers_refusal() {
+    let _serial = serialized();
+    let f = fixture("imgfmt", Some(StageThreeHost::new()));
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let device = f.physical_devices(entry_point, instance)[0];
+    let query = f.resolve(entry_point, instance, "vkGetPhysicalDeviceImageFormatProperties");
+    let high = 0xAAAA_AAAA_0000_0000u64;
+
+    let out = f.poisoned(IMAGE_FORMAT_PROPERTIES_BYTES, 0x11);
+    let result = f.call7(query, [device, high | 75, high | 2, high, high | 0xd, high, out]);
+    assert_eq!(result.expect("the call") as i32, VK_SUCCESS);
+    let bytes = f.read_bytes(out, IMAGE_FORMAT_PROPERTIES_BYTES);
+    let words: Vec<u32> =
+        bytes[..24].chunks(4).map(|word| u32::from_le_bytes(word.try_into().expect("four"))).collect();
+    assert_eq!(words, vec![75, 2, 0, 0xd, 0, 0], "format, type, tiling, usage, flags, in order");
+    assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().expect("eight")), 1 << 30);
+
+    let untouched = f.poisoned(IMAGE_FORMAT_PROPERTIES_BYTES, 0x22);
+    let result = f.call7(query, [device, 76, 1, 0, 4, 0, untouched]);
+    assert_eq!(result.expect("the call") as i32, -11, "the driver's own answer");
+    assert_eq!(
+        f.read_bytes(untouched, IMAGE_FORMAT_PROPERTIES_BYTES),
+        vec![0x22; IMAGE_FORMAT_PROPERTIES_BYTES],
+        "and nothing written"
+    );
+
+    let error = f.call7(query, [device, 75, 2, 0, 0xd, 0, 0]).expect_err("a NULL output");
+    assert!(error.to_string().contains("pImageFormatProperties = NULL"), "{error}");
+}
+
+/// **`vkGetPhysicalDeviceImageFormatProperties2KHR`: the question's five members reach the host,
+/// the answer and its chained YCbCr structure come back in place, members only** -- the engine's
+/// own call, about format 1000156002 (`0x2590fb8`..`0x2591030`). An unsupported format is the
+/// driver's `VK_ERROR_FORMAT_NOT_SUPPORTED` with nothing written; a wrong `sType` refuses.
+#[test]
+fn image_format_properties2_carries_the_question_and_answers_its_chain_in_place() {
+    let _serial = serialized();
+    let host = StageThreeHost::new();
+    let f = fixture("imgfmt2", Some(host.clone()));
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let device = f.physical_devices(entry_point, instance)[0];
+    let query = f.resolve(entry_point, instance, "vkGetPhysicalDeviceImageFormatProperties2KHR");
+
+    let info = f.alloc(PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_BYTES);
+    let words = |at: u64, values: &[u32]| {
+        for (k, value) in values.iter().enumerate() {
+            f.guest.write_u32(at as GuestAddr + 4 * k as GuestAddr, *value);
+        }
+    };
+    let ask = |format: u32| {
+        f.guest.write_u64(info as GuestAddr, u64::from(STYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2));
+        f.guest.write_u64(info as GuestAddr + 8, 0);
+        words(info + 16, &[format, 1, 0, 4, 0]);
+    };
+    let answer = f.poisoned(IMAGE_FORMAT_PROPERTIES_2_BYTES, 0x33);
+    let ycbcr = f.alloc(24);
+    f.guest.write_u64(answer as GuestAddr, u64::from(STYPE_IMAGE_FORMAT_PROPERTIES_2));
+    f.guest.write_u64(answer as GuestAddr + 8, ycbcr);
+    f.guest.write_u64(ycbcr as GuestAddr, 1_000_156_005);
+    f.guest.write_u64(ycbcr as GuestAddr + 8, 0);
+    f.guest.write_u64(ycbcr as GuestAddr + 16, 0xEEEE_EEEE_0000_0000);
+
+    ask(1_000_156_002);
+    assert_eq!(f.call(query, [device, info, answer, 0]).expect("the call") as i32, VK_SUCCESS);
+    let bytes = f.read_bytes(answer + 16, 32);
+    let got: Vec<u32> =
+        bytes[..24].chunks(4).map(|word| u32::from_le_bytes(word.try_into().expect("four"))).collect();
+    assert_eq!(got, vec![1_000_156_002, 1, 0, 4, 0, 0], "the question's five members, in order");
+    assert_eq!(f.guest.read_u64(answer as GuestAddr + 8), ycbcr, "the guest's pNext");
+    assert_eq!(
+        f.guest.read_u64(ycbcr as GuestAddr + 16),
+        0xEEEE_EEEE_0000_0001,
+        "combinedImageSamplerDescriptorCount answered, the padding untouched"
+    );
+    let asked = host.log().image_format2.clone();
+    assert_eq!(asked[0].0, "vkGetPhysicalDeviceImageFormatProperties2KHR");
+    assert!(asked[0].2.is_empty(), "the engine hangs nothing from the question");
+
+    let untouched = f.poisoned(IMAGE_FORMAT_PROPERTIES_2_BYTES, 0x44);
+    f.guest.write_u64(untouched as GuestAddr, u64::from(STYPE_IMAGE_FORMAT_PROPERTIES_2));
+    f.guest.write_u64(untouched as GuestAddr + 8, 0);
+    ask(44);
+    assert_eq!(f.call(query, [device, info, untouched, 0]).expect("the call") as i32, -11);
+    assert_eq!(f.read_bytes(untouched + 16, 32), vec![0x44; 32], "nothing written");
+
+    f.guest.write_u64(info as GuestAddr, 1_000_059_003);
+    let text = f.refusal(query, [device, info, answer, 0]).to_string();
+    assert!(text.contains("PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2"), "{text}");
 }
 
 // ========================================================================= vkGetDeviceProcAddr

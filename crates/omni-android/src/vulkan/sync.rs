@@ -76,10 +76,11 @@ pub const FENCE_CREATE_INFO_BYTES: usize = 24;
 ///
 /// An allocation bound for [`MAX_ENABLED_NAMES`](super::MAX_ENABLED_NAMES)' reason: `fenceCount`
 /// is a guest `uint32_t` indexing an array of 64-bit handles, so honouring it unbounded is a
-/// guest-controlled host allocation of up to 32 GB. Thirty-two is above
+/// guest-controlled host allocation of up to 32 GB. It is twice
 /// [`MAX_FENCES`](super::MAX_FENCES), so a conforming guest cannot reach it — every fence it could
-/// name is one this layer issued, and there are at most half this many.
-pub const MAX_FENCES_PER_CALL: usize = 32;
+/// name is one this layer issued, and there are at most half this many. Defined as that relation,
+/// so the two cannot drift when the registry is resized.
+pub const MAX_FENCES_PER_CALL: usize = super::MAX_FENCES * 2;
 
 // ------------------------------------------------------------------------------- the handlers
 
@@ -432,12 +433,12 @@ mod tests {
     /// cannot reach it.
     #[test]
     fn no_conforming_guest_can_reach_the_per_call_fence_bound() {
-        assert_eq!(MAX_FENCES_PER_CALL, 32);
-        assert_eq!(super::super::MAX_FENCES, 16);
+        assert_eq!(MAX_FENCES_PER_CALL, 2048);
+        assert_eq!(super::super::MAX_FENCES, 1024);
         // Twice the registry's bound, stated as the arithmetic: a `>` between two constants is
         // folded away, and the relation is the thing worth saying.
         assert_eq!(MAX_FENCES_PER_CALL, super::super::MAX_FENCES * 2);
-        // The largest read the bound permits is a quarter of a page.
-        assert_eq!(MAX_FENCES_PER_CALL * 8, 256);
+        // The largest read the bound permits is four pages.
+        assert_eq!(MAX_FENCES_PER_CALL * 8, 16384);
     }
 }

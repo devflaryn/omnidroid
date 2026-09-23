@@ -41,6 +41,7 @@ use crate::abi::ARG_REGISTERS;
 use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 
+use super::chain;
 use super::host::{DeviceRequest, DriverAnswer, QueueRequest};
 use super::instance::{decode_names, guest_pointer};
 use super::physical::PHYSICAL_DEVICE_FEATURES_BYTES;
@@ -209,20 +210,15 @@ fn decode_device_create_info(
             caller = at.caller
         )));
     }
-    let next = u64_at(8);
-    if next != 0 {
-        return Err(at.refuse(format!(
-            "the guest called `vkCreateDevice` from {caller:#x} with \
-             `pCreateInfo->pNext = {next:#x}`. A device `pNext` chain is where Vulkan 1.1 and \
-             later put **enabled features** -- `VkPhysicalDeviceFeatures2`, \
-             `VkPhysicalDeviceVulkan12Features` and the rest -- so dropping it would create a \
-             device that silently lacks features the engine enabled, and every consequence would \
-             arrive later as a validation error on a command that used one. This layer does not \
-             know those layouts, so it refuses and names the address for the next run to decode. \
-             This is the refusal most likely to be the one stage 4 has to answer",
-            caller = at.caller
-        )));
-    }
+    // A device `pNext` chain is where Vulkan 1.1 and later put **enabled features**, so dropping
+    // one would create a device that silently lacks features the engine enabled. The flat
+    // structures a run has measured travel ([`chain`](super::chain)); anything else still refuses,
+    // naming its `sType` and address.
+    let chain: Vec<_> =
+        chain::read_chain(c, at, "vkCreateDevice", "pCreateInfo->pNext", u64_at(8), 1)?
+            .into_iter()
+            .map(|(_, link)| link)
+            .collect();
 
     let queues = decode_queue_requests(c, at, u32_at(20), u64_at(24))?;
     let layers = decode_names(c, at, "vkCreateDevice", "ppEnabledLayerNames", u32_at(32), u64_at(40))?;
@@ -230,7 +226,7 @@ fn decode_device_create_info(
         decode_names(c, at, "vkCreateDevice", "ppEnabledExtensionNames", u32_at(48), u64_at(56))?;
     let features = decode_features(c, at, u64_at(64))?;
 
-    Ok(DeviceRequest { flags: u32_at(16), queues, layers, extensions, features })
+    Ok(DeviceRequest { flags: u32_at(16), queues, layers, extensions, features, chain })
 }
 
 /// Decode `pQueueCreateInfos`, which is an array of structures rather than an array of pointers.

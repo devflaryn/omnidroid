@@ -50,8 +50,13 @@ use crate::abi::ARG_REGISTERS;
 use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 
+use super::chain::{
+    self, CHAIN_HEADER_BYTES, PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_BYTES,
+    STYPE_IMAGE_FORMAT_PROPERTIES_2, STYPE_PHYSICAL_DEVICE_FEATURES_2,
+    STYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+};
 use super::counted;
-use super::host::DriverAnswer;
+use super::host::{DriverAnswer, ImageFormatQuery};
 use super::instance::{extension_properties, guest_pointer, guest_string, EXTENSION_PROPERTIES_BYTES};
 use super::{Site, Vulkan, VK_SUCCESS};
 
@@ -79,6 +84,23 @@ pub const PHYSICAL_DEVICE_PROPERTIES_BYTES: usize = 824;
 
 /// `sizeof(VkPhysicalDeviceFeatures)`: 55 `VkBool32`s, no padding, alignment 4.
 pub const PHYSICAL_DEVICE_FEATURES_BYTES: usize = 220;
+
+/// `sizeof(VkFormatProperties)`: `linearTilingFeatures`, `optimalTilingFeatures` and
+/// `bufferFeatures`, three `VkFormatFeatureFlags`, no padding.
+pub const FORMAT_PROPERTIES_BYTES: usize = 12;
+
+/// `sizeof(VkImageFormatProperties)`.
+///
+/// ```text
+/// VkExtent3D          maxExtent;         //  0 (three uint32_t)
+/// uint32_t            maxMipLevels;      // 12
+/// uint32_t            maxArrayLayers;    // 16
+/// VkSampleCountFlags  sampleCounts;      // 20
+/// VkDeviceSize        maxResourceSize;   // 24
+/// ```
+///
+/// No padding: `maxResourceSize` lands on 24, already 8-aligned.
+pub const IMAGE_FORMAT_PROPERTIES_BYTES: usize = 32;
 
 /// `sizeof(VkQueueFamilyProperties)`.
 ///
@@ -238,6 +260,249 @@ pub(super) fn physical_device_features(
         },
         &bytes,
     )?;
+    c.ret().void();
+    Ok(())
+}
+
+/// `void vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format,
+/// VkFormatProperties *pFormatProperties)`
+///
+/// **MEASURED**: the engine's renderer, straight after its device is created, asking about format
+/// 83 first. The answer is the host driver's, unedited: which formats a device can sample, render
+/// to and read as vertex data is a fact about that device, and a renderer choosing texture formats
+/// from a list this layer had edited would be choosing for a device that is not there.
+pub(super) fn physical_device_format_properties(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkGetPhysicalDeviceFormatProperties";
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.physical_device_token(at, CALL, args[0])?;
+    // `VkFormat` is an enum, so a 32-bit `w1`; the upper half of `x1` is not the guest's.
+    let format = args[1] as u32 as i32;
+    let bytes = host.physical_device_format_properties(device, format)?;
+    write_structure(
+        c,
+        at,
+        &Structure {
+            call: CALL,
+            field: "pFormatProperties",
+            name: "VkFormatProperties",
+            expected: FORMAT_PROPERTIES_BYTES,
+            pointer: args[2],
+            argument: 2,
+        },
+        &bytes,
+    )?;
+    c.ret().void();
+    Ok(())
+}
+
+/// `VkResult vkGetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice,
+/// VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
+/// VkImageCreateFlags flags, VkImageFormatProperties *pImageFormatProperties)`
+///
+/// **MEASURED**: the engine's renderer after its format queries, asking about format 75 as a 3D
+/// optimal-tiling image for transfer, sampling and storage. Seven arguments, every one in a
+/// register (`x0`-`x6`); the five scalars are 32-bit, so only the `w` halves are the guest's.
+/// The driver's failure -- `VK_ERROR_FORMAT_NOT_SUPPORTED` above all -- is returned as it is,
+/// with nothing written, which is the specification's contract for an unsupported combination.
+pub(super) fn physical_device_image_format_properties(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkGetPhysicalDeviceImageFormatProperties";
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.physical_device_token(at, CALL, args[0])?;
+    let query = ImageFormatQuery {
+        format: args[1] as u32 as i32,
+        image_type: args[2] as u32 as i32,
+        tiling: args[3] as u32 as i32,
+        usage: args[4] as u32,
+        flags: args[5] as u32,
+    };
+    // The output is checked before the driver is asked, so a NULL is the guest's refusal and not
+    // a driver answer thrown away.
+    if guest_pointer(at, "pImageFormatProperties", args[6])? == 0 {
+        return Err(at.refuse(format!(
+            "the guest called `{CALL}` from {caller:#x} with `pImageFormatProperties = NULL`, \
+             which the specification requires to be a valid pointer",
+            caller = at.caller
+        )));
+    }
+    match host.physical_device_image_format_properties(device, query)? {
+        DriverAnswer::Failed(result) => {
+            vulkan.note_driver_result(CALL, result);
+            c.ret().i32(result);
+        }
+        DriverAnswer::Ok(bytes) => {
+            write_structure(
+                c,
+                at,
+                &Structure {
+                    call: CALL,
+                    field: "pImageFormatProperties",
+                    name: "VkImageFormatProperties",
+                    expected: IMAGE_FORMAT_PROPERTIES_BYTES,
+                    pointer: args[6],
+                    argument: 6,
+                },
+                &bytes,
+            )?;
+            c.ret().i32(VK_SUCCESS);
+        }
+    }
+    Ok(())
+}
+
+/// `VkResult vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
+/// const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
+/// VkImageFormatProperties2 *pImageFormatProperties)`, and its `KHR` alias -- `call` is the name
+/// the guest called through, and the host is asked through the same one.
+///
+/// **MEASURED**: the engine asks it about a three-plane YCbCr format once
+/// `vkGetPhysicalDeviceFormatProperties` has said the format can be sampled with linear
+/// filtering, chaining a `VkSamplerYcbcrConversionImageFormatProperties` to the answer. Both
+/// chains are carried ([`chain`](super::chain)); the driver's failure is returned with nothing
+/// written.
+pub(super) fn physical_device_image_format_properties2(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    call: &str,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.physical_device_token(at, call, args[0])?;
+    let info_at = guest_pointer(at, "pImageFormatInfo", args[1])?;
+    let answer_at = guest_pointer(at, "pImageFormatProperties", args[2])?;
+    for (name, pointer) in [("pImageFormatInfo", info_at), ("pImageFormatProperties", answer_at)] {
+        if pointer == 0 {
+            return Err(at.refuse(format!(
+                "the guest called `{call}` from {caller:#x} with `{name} = NULL`, which the \
+                 specification requires to be a valid pointer",
+                caller = at.caller
+            )));
+        }
+    }
+    let info = c.mem().read_bytes(info_at, PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_BYTES, c.blame(1))?;
+    let word = |offset: usize| u32::from_le_bytes(info[offset..offset + 4].try_into().expect("four"));
+    let answer = c.mem().read_bytes(answer_at, CHAIN_HEADER_BYTES, c.blame(2))?;
+    let answer_type = u32::from_le_bytes(answer[0..4].try_into().expect("four bytes"));
+    for (name, got, want, spelled) in [
+        ("pImageFormatInfo", word(0), STYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, "PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2"),
+        ("pImageFormatProperties", answer_type, STYPE_IMAGE_FORMAT_PROPERTIES_2, "IMAGE_FORMAT_PROPERTIES_2"),
+    ] {
+        if got != want {
+            return Err(at.refuse(format!(
+                "the guest called `{call}` from {caller:#x} with a `{name}` whose `sType` is \
+                 {got}, and `VK_STRUCTURE_TYPE_{spelled}` is {want}. Every member after it would \
+                 be read or written at offsets belonging to a different structure",
+                caller = at.caller
+            )));
+        }
+    }
+    let query = ImageFormatQuery {
+        format: word(16) as i32,
+        image_type: word(20) as i32,
+        tiling: word(24) as i32,
+        usage: word(28),
+        flags: word(32),
+    };
+    let info_next = u64::from_le_bytes(info[8..16].try_into().expect("eight bytes"));
+    let question: Vec<_> =
+        chain::read_chain(c, at, call, "pImageFormatInfo->pNext", info_next, 1)?
+            .into_iter()
+            .map(|(_, link)| link)
+            .collect();
+    let answer_next = u64::from_le_bytes(answer[8..16].try_into().expect("eight bytes"));
+    let links = chain::read_chain(c, at, call, "pImageFormatProperties->pNext", answer_next, 2)?;
+    let (addresses, mut answered): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    match host.physical_device_image_format_properties2(device, call, query, &question, &mut answered)? {
+        DriverAnswer::Failed(result) => {
+            vulkan.note_driver_result(call, result);
+            c.ret().i32(result);
+        }
+        DriverAnswer::Ok(bytes) => {
+            write_structure(
+                c,
+                at,
+                &Structure {
+                    call,
+                    field: "pImageFormatProperties",
+                    name: "VkImageFormatProperties",
+                    expected: IMAGE_FORMAT_PROPERTIES_BYTES,
+                    pointer: args[2] + CHAIN_HEADER_BYTES as u64,
+                    argument: 2,
+                },
+                &bytes,
+            )?;
+            chain::write_back(c, at, call, &addresses, &answered, 2)?;
+            c.ret().i32(VK_SUCCESS);
+        }
+    }
+    Ok(())
+}
+
+/// `void vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
+/// VkPhysicalDeviceFeatures2 *pFeatures)`, and its `KHR` alias -- `call` is the name the guest
+/// called through, and the host is asked through the same one.
+///
+/// **MEASURED**: the engine's device bring-up calls the `KHR` spelling twice, each time with one
+/// flat structure chained (see [`chain`](super::chain)). The `VkPhysicalDeviceFeatures` it heads
+/// is written at offset 16, and each chained structure's members are written back at its own
+/// address; the guest's `sType` and `pNext` values are never written.
+pub(super) fn physical_device_features2(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    call: &str,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    let host = vulkan.require_host(at)?;
+    let device = vulkan.physical_device_token(at, call, args[0])?;
+    let out = guest_pointer(at, "pFeatures", args[1])?;
+    if out == 0 {
+        return Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with `pFeatures = NULL`. The \
+             specification requires a valid `VkPhysicalDeviceFeatures2`, and it is this call's \
+             only output",
+            caller = at.caller
+        )));
+    }
+    let header = c.mem().read_bytes(out, CHAIN_HEADER_BYTES, c.blame(1))?;
+    let s_type = u32::from_le_bytes(header[0..4].try_into().expect("four bytes"));
+    if s_type != STYPE_PHYSICAL_DEVICE_FEATURES_2 {
+        return Err(at.refuse(format!(
+            "the guest called `{call}` from {caller:#x} with a `pFeatures` whose `sType` is \
+             {s_type}, and `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2` is \
+             {STYPE_PHYSICAL_DEVICE_FEATURES_2}. Its features would be written over whatever \
+             structure that is",
+            caller = at.caller
+        )));
+    }
+    let next = u64::from_le_bytes(header[8..16].try_into().expect("eight bytes"));
+    let links = chain::read_chain(c, at, call, "pFeatures->pNext", next, 1)?;
+    let (addresses, mut answered): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    let bytes = host.physical_device_features2(device, call, &mut answered)?;
+    write_structure(
+        c,
+        at,
+        &Structure {
+            call,
+            field: "pFeatures",
+            name: "VkPhysicalDeviceFeatures",
+            expected: PHYSICAL_DEVICE_FEATURES_BYTES,
+            pointer: args[1] + CHAIN_HEADER_BYTES as u64,
+            argument: 1,
+        },
+        &bytes,
+    )?;
+    chain::write_back(c, at, call, &addresses, &answered, 1)?;
     c.ret().void();
     Ok(())
 }

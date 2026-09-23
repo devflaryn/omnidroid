@@ -83,7 +83,7 @@ use crate::abi::ARG_REGISTERS;
 use crate::boundary::ImportCall;
 use crate::error::AbiResult;
 
-use super::host::{DriverAnswer, MemoryAllocation, MemoryPlan};
+use super::host::{DriverAnswer, HostImageRef, MemoryAllocation, MemoryPlan};
 use super::instance::{guest_pointer, refuse_allocator, require_pointer};
 use super::{Site, Vulkan, VK_SUCCESS};
 
@@ -474,6 +474,10 @@ pub(super) fn buffer_memory_requirements(
 
 /// `void vkGetImageMemoryRequirements(VkDevice device, VkImage image,
 /// VkMemoryRequirements *pMemoryRequirements)`
+///
+/// Of either family: an image the guest created, or one of a swapchain's -- the query is the one
+/// thing the specification lets a guest do with a swapchain image's memory. MEASURED: the engine
+/// asks it of its swapchain's images once the swapchain exists.
 pub(super) fn image_memory_requirements(
     c: &mut ImportCall<'_, '_>,
     at: &Site,
@@ -483,9 +487,18 @@ pub(super) fn image_memory_requirements(
     const CALL: &str = "vkGetImageMemoryRequirements";
     let host = vulkan.require_host(at)?;
     let _device = vulkan.device_token(at, CALL, args[0])?;
-    let image = vulkan.created_image_token(at, CALL, args[1])?;
+    let image = vulkan.image_ref_token(at, CALL, args[1])?;
     let out_at = require_pointer(at, CALL, "pMemoryRequirements", args[2])?;
-    let bytes = host.image_memory_requirements(image)?;
+    let bytes = match image {
+        HostImageRef::Created(image) => host.image_memory_requirements(image)?,
+        HostImageRef::Swapchain(image) => host.swapchain_image_memory_requirements(image)?,
+        HostImageRef::None => {
+            return Err(at.refuse(format!(
+                "the guest called `{CALL}` from {caller:#x} with `image = VK_NULL_HANDLE`",
+                caller = at.caller
+            )))
+        }
+    };
     write_requirements(c, at, CALL, &bytes, out_at, 2)?;
     c.ret().void();
     Ok(())

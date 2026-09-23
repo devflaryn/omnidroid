@@ -43,12 +43,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use ash::khr;
 use ash::vk;
 use omni_android::vulkan::{
-    Acquired, BufferRequest, DescriptorCopy, DescriptorPoolRequest, DescriptorSetLayoutRequest,
+    flat_structure, Acquired, BufferRequest, ChainLink, DescriptorCopy, ImageFormatQuery, DescriptorPoolRequest, DescriptorSetLayoutRequest,
     DescriptorWrite, DescriptorWrites, DeviceRequest, DriverAnswer, FramebufferRequest,
     GraphicsPipelineRequest, HostBuffer, HostCommandBuffer, HostCommandPool, HostCreatedImage,
     HostDescriptorPool, HostDescriptorSet, HostDescriptorSetLayout, HostDevice, HostDeviceMemory,
     HostExtension, HostFence, HostFramebuffer, HostImage, HostImageRef, HostImageView,
     HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache, HostPipelineLayout,
+    HostQueryPool, QueryPoolRequest,
     HostQueue, HostRenderPass, HostSampler, HostSemaphore, HostShaderModule, HostSurface,
     HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation, MemoryPlan,
     PipelineBarrier, PipelineLayoutRequest, PipelinesCreated, PresentRequest, Presented,
@@ -199,6 +200,8 @@ pub struct GfxVulkanHost {
     pipelines: Mutex<Slab<ObjectEntry<vk::Pipeline>>>,
     /// Every `VkPipelineCache` this host created.
     pipeline_caches: Mutex<Slab<ObjectEntry<vk::PipelineCache>>>,
+    /// Every `VkQueryPool` this host created.
+    query_pools: Mutex<Slab<ObjectEntry<vk::QueryPool>>>,
     /// Every `VkDescriptorSetLayout` this host created.
     descriptor_set_layouts: Mutex<Slab<ObjectEntry<vk::DescriptorSetLayout>>>,
     /// Every `VkDescriptorPool` this host created.
@@ -511,6 +514,7 @@ impl GfxVulkanHost {
             framebuffers: Mutex::new(Slab::new()),
             pipelines: Mutex::new(Slab::new()),
             pipeline_caches: Mutex::new(Slab::new()),
+            query_pools: Mutex::new(Slab::new()),
             descriptor_set_layouts: Mutex::new(Slab::new()),
             descriptor_pools: Mutex::new(Slab::new()),
             descriptor_sets: Mutex::new(Slab::new()),
@@ -1269,6 +1273,71 @@ unsafe fn pod_bytes<T>(value: &T) -> Vec<u8> {
     bytes.to_vec()
 }
 
+/// A guest `pNext` chain rebuilt in this host's memory.
+///
+/// Each structure gets its own zeroed buffer of `FlatStructure::size()` bytes: its `sType`
+/// written, the guest's member bytes copied in at 16, and its `pNext` pointing at the next buffer
+/// in the guest's order. The buffers are `Vec<u64>`s, so each is 8-aligned as `pNext` requires,
+/// and each is a heap block that does not move when the outer vector does -- the `pNext` values
+/// stay valid for exactly as long as the `HostChain` lives, which is the whole of the call it is
+/// built for. No guest address is ever written into one.
+struct HostChain {
+    buffers: Vec<Vec<u64>>,
+}
+
+impl HostChain {
+    /// Build the chain, refusing a structure the adapter should never have admitted.
+    fn new(call: &str, links: &[ChainLink]) -> AbiResult<Self> {
+        let mut buffers: Vec<Vec<u64>> = Vec::with_capacity(links.len());
+        for (index, link) in links.iter().enumerate() {
+            let known = flat_structure(link.s_type)
+                .filter(|known| known.member_bytes == link.body.len())
+                .ok_or_else(|| {
+                    refused(
+                        call,
+                        &format!(
+                            "chain structure {index} has `sType` {s_type} and {got} member \
+                             bytes, which is not a flat structure the adapter admits at that \
+                             length. The adapter and this host disagree about a layout, and \
+                             building it anyway would hand the driver a structure of the wrong \
+                             size",
+                            s_type = link.s_type,
+                            got = link.body.len()
+                        ),
+                    )
+                })?;
+            let mut bytes = vec![0u8; known.size()];
+            bytes[0..4].copy_from_slice(&link.s_type.to_le_bytes());
+            bytes[16..16 + link.body.len()].copy_from_slice(&link.body);
+            buffers.push(
+                bytes
+                    .chunks_exact(8)
+                    .map(|word| u64::from_le_bytes(word.try_into().expect("eight bytes")))
+                    .collect(),
+            );
+        }
+        for index in 1..buffers.len() {
+            let next = buffers[index].as_ptr() as u64;
+            buffers[index - 1][1] = next;
+        }
+        Ok(Self { buffers })
+    }
+
+    /// The first structure, for a `pNext`; null for an empty chain.
+    fn head(&mut self) -> *mut std::ffi::c_void {
+        self.buffers.first_mut().map_or(std::ptr::null_mut(), |first| first.as_mut_ptr().cast())
+    }
+
+    /// Copy each structure's members, as the driver left them, back into `links`.
+    fn answer_into(&self, links: &mut [ChainLink]) {
+        for (buffer, link) in self.buffers.iter().zip(links) {
+            let bytes: Vec<u8> = buffer.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let length = link.body.len();
+            link.body.copy_from_slice(&bytes[16..16 + length]);
+        }
+    }
+}
+
 /// A `VkPhysicalDeviceFeatures` from the bytes the guest wrote.
 ///
 /// The reverse of [`pod_bytes`], and the only direction in which guest-authored bytes become a
@@ -1554,6 +1623,147 @@ impl VulkanHost for GfxVulkanHost {
         })
     }
 
+    fn physical_device_format_properties(
+        &self,
+        device: HostPhysicalDevice,
+        format: i32,
+    ) -> AbiResult<Vec<u8>> {
+        self.with_physical(device, |instance, physical| {
+            // SAFETY: `physical` is a live device of `instance`; any `VkFormat` value is a valid
+            // argument, and one the driver does not know is answered with no features.
+            let properties = unsafe {
+                instance.get_physical_device_format_properties(physical, vk::Format::from_raw(format))
+            };
+            // SAFETY: `VkFormatProperties` is three `VkFormatFeatureFlags` with no padding, all
+            // written.
+            unsafe { pod_bytes(&properties) }
+        })
+    }
+
+    fn physical_device_image_format_properties(
+        &self,
+        device: HostPhysicalDevice,
+        query: ImageFormatQuery,
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        self.with_physical(device, |instance, physical| {
+            // SAFETY: `physical` is a live device of `instance`; every combination of the five
+            // scalars is a valid question, and an unsupported one is the driver's
+            // `VK_ERROR_FORMAT_NOT_SUPPORTED`.
+            let answer = unsafe {
+                instance.get_physical_device_image_format_properties(
+                    physical,
+                    vk::Format::from_raw(query.format),
+                    vk::ImageType::from_raw(query.image_type),
+                    vk::ImageTiling::from_raw(query.tiling),
+                    vk::ImageUsageFlags::from_raw(query.usage),
+                    vk::ImageCreateFlags::from_raw(query.flags),
+                )
+            };
+            match answer {
+                // SAFETY: `VkImageFormatProperties` has no padding (`maxResourceSize` is at 24)
+                // and the driver wrote every member.
+                Ok(properties) => DriverAnswer::Ok(unsafe { pod_bytes(&properties) }),
+                Err(result) => DriverAnswer::Failed(result.as_raw()),
+            }
+        })
+    }
+
+    fn physical_device_image_format_properties2(
+        &self,
+        device: HostPhysicalDevice,
+        entry: &str,
+        query: ImageFormatQuery,
+        question: &[ChainLink],
+        answers: &mut [ChainLink],
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        let name = CString::new(entry).map_err(|err| {
+            refused(entry, &format!("the entry point's name has an interior NUL ({err})"))
+        })?;
+        let mut asked = HostChain::new(entry, question)?;
+        let mut links = HostChain::new(entry, answers)?;
+        let answer = self.with_physical(device, |instance, physical| {
+            // SAFETY: `instance` is a live `VkInstance` this host created and `name` is a C string
+            // that outlives the call.
+            let found = unsafe { self.entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) };
+            let Some(found) = found else {
+                return Err(refused(
+                    entry,
+                    "the driver answers NULL for it on this instance -- the `KHR` spelling needs \
+                     `VK_KHR_get_physical_device_properties2` enabled, the core one a 1.1 \
+                     instance -- so there is nothing to forward the guest's call to",
+                ));
+            };
+            // SAFETY: both spellings share `PFN_vkGetPhysicalDeviceImageFormatProperties2`'s
+            // signature, and `found` is the driver's pointer for exactly the name asked.
+            let fp: vk::PFN_vkGetPhysicalDeviceImageFormatProperties2 =
+                unsafe { std::mem::transmute(found) };
+            let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+                .format(vk::Format::from_raw(query.format))
+                .ty(vk::ImageType::from_raw(query.image_type))
+                .tiling(vk::ImageTiling::from_raw(query.tiling))
+                .usage(vk::ImageUsageFlags::from_raw(query.usage))
+                .flags(vk::ImageCreateFlags::from_raw(query.flags));
+            info.p_next = asked.head().cast_const();
+            let mut properties =
+                vk::ImageFormatProperties2 { p_next: links.head(), ..Default::default() };
+            // SAFETY: `physical` is a live device of `instance`; `info`, `properties` and every
+            // buffer of both chains outlive the call; each chained structure is flat and sized
+            // from `ash`'s own definition. The driver writes `properties` and the answer chain's
+            // members, reads the question chain, and keeps no pointer.
+            let result = unsafe { fp(physical, &info, &mut properties) };
+            if result != vk::Result::SUCCESS {
+                return Ok(DriverAnswer::Failed(result.as_raw()));
+            }
+            // SAFETY: `VkImageFormatProperties` has no padding and the driver wrote every member.
+            Ok(DriverAnswer::Ok(unsafe { pod_bytes(&properties.image_format_properties) }))
+        })??;
+        if matches!(answer, DriverAnswer::Ok(_)) {
+            links.answer_into(answers);
+        }
+        Ok(answer)
+    }
+
+    fn physical_device_features2(
+        &self,
+        device: HostPhysicalDevice,
+        entry: &str,
+        chain: &mut [ChainLink],
+    ) -> AbiResult<Vec<u8>> {
+        let name = CString::new(entry).map_err(|err| {
+            refused(entry, &format!("the entry point's name has an interior NUL ({err})"))
+        })?;
+        let mut links = HostChain::new(entry, chain)?;
+        let features = self.with_physical(device, |instance, physical| {
+            // SAFETY: `instance` is a live `VkInstance` this host created and `name` is a C string
+            // that outlives the call.
+            let found = unsafe { self.entry.get_instance_proc_addr(instance.handle(), name.as_ptr()) };
+            let Some(found) = found else {
+                return Err(refused(
+                    entry,
+                    "the driver answers NULL for it on this instance -- the `KHR` spelling needs \
+                     `VK_KHR_get_physical_device_properties2` enabled, the core one a 1.1 \
+                     instance -- so there is nothing to forward the guest's call to",
+                ));
+            };
+            // SAFETY: `vkGetPhysicalDeviceFeatures2` and `vkGetPhysicalDeviceFeatures2KHR` share
+            // `PFN_vkGetPhysicalDeviceFeatures2`'s signature, and `found` is the driver's pointer
+            // for exactly the name asked.
+            let fp: vk::PFN_vkGetPhysicalDeviceFeatures2 = unsafe { std::mem::transmute(found) };
+            let mut features2 =
+                vk::PhysicalDeviceFeatures2 { p_next: links.head(), ..Default::default() };
+            // SAFETY: `physical` is a live device of `instance`; `features2` and every buffer of
+            // `links` outlive the call; each chained structure is one the physical device's
+            // extension list named (the guest chains it only then) and is sized from `ash`'s own
+            // definition (asserted in this file's tests). The driver writes the members and keeps
+            // no pointer.
+            unsafe { fp(physical, &mut features2) };
+            // SAFETY: `VkPhysicalDeviceFeatures` is 55 `VkBool32`s with no padding, all written.
+            Ok(unsafe { pod_bytes(&features2.features) })
+        })??;
+        links.answer_into(chain);
+        Ok(features)
+    }
+
     fn queue_family_properties(&self, device: HostPhysicalDevice) -> AbiResult<Vec<Vec<u8>>> {
         self.with_physical(device, |instance, physical| {
             // SAFETY: `physical` is a live device of `instance`.
@@ -1760,12 +1970,17 @@ impl VulkanHost for GfxVulkanHost {
         if let Some(features) = features.as_ref() {
             info = info.enabled_features(features);
         }
+        // Built here, owned until `create_device` returns: the guest's `pNext` chain, relinked in
+        // this host's memory.
+        let mut chain = HostChain::new("vkCreateDevice", &request.chain)?;
+        info.p_next = chain.head().cast_const();
 
         let created = self.with_physical(device, |instance, physical| {
             // SAFETY: `physical` is a live device of `instance`; every pointer reachable from
-            // `info` is into a local that outlives this call; `pNext` is null because
-            // `DeviceRequest` cannot carry a chain (the shim refuses one by name); `pAllocator` is
-            // `None` because a guest allocator is refused by name one layer up.
+            // `info` is into a local that outlives this call, `pNext` included -- it is `chain`'s
+            // first buffer or null, and each buffer is a flat structure sized from `ash`'s
+            // definition; `pAllocator` is `None` because a guest allocator is refused by name one
+            // layer up.
             (unsafe { instance.create_device(physical, &info, None) }, physical)
         })?;
         match created {
@@ -3141,6 +3356,32 @@ impl VulkanHost for GfxVulkanHost {
         Ok(requirements_bytes(&requirements))
     }
 
+    fn swapchain_image_memory_requirements(&self, image: HostImage) -> AbiResult<Vec<u8>> {
+        const METHOD: &str = "VulkanHost::swapchain_image_memory_requirements";
+        // The image table, then the swapchain table, each released before the next is taken --
+        // the order `swapchain_images` documents.
+        let (swapchain, handle) = {
+            let table = self.locked_images();
+            let entry = table.get(image.token()).ok_or_else(|| {
+                refused(
+                    METHOD,
+                    &format!(
+                        "{image:?} is not a swapchain image this host holds -- it holds {}. An \
+                         image whose swapchain has been destroyed lands here",
+                        table.len()
+                    ),
+                )
+            })?;
+            (entry.swapchain, entry.image)
+        };
+        let parts = self.swapchain_parts(HostSwapchain::from_token(swapchain))?;
+        let device = self.device_at(parts.device, METHOD)?;
+        // SAFETY: the image is a live image of a live swapchain of this device, and asking its
+        // requirements is valid -- only binding memory to it or destroying it is not.
+        let requirements = unsafe { device.get_image_memory_requirements(handle) };
+        Ok(requirements_bytes(&requirements))
+    }
+
     fn bind_buffer_memory(
         &self,
         buffer: HostBuffer,
@@ -3567,6 +3808,44 @@ impl VulkanHost for GfxVulkanHost {
         // SAFETY: the framebuffer is live and no render pass in flight still names it.
         unsafe { device.destroy_framebuffer(handle, None) };
         self.locked_framebuffers().remove(framebuffer.token());
+        Ok(())
+    }
+
+    fn create_query_pool(
+        &self,
+        device: HostDevice,
+        request: &QueryPoolRequest,
+    ) -> AbiResult<DriverAnswer<HostQueryPool>> {
+        let parts = self.device_parts(device)?;
+        let info = vk::QueryPoolCreateInfo::default()
+            .flags(vk::QueryPoolCreateFlags::from_raw(request.flags))
+            .query_type(vk::QueryType::from_raw(request.query_type as i32))
+            .query_count(request.query_count)
+            .pipeline_statistics(vk::QueryPipelineStatisticFlags::from_raw(
+                request.pipeline_statistics,
+            ));
+        // SAFETY: the device is live and `info` has no pointer beyond a null `pNext`.
+        match unsafe { parts.device.create_query_pool(&info, None) } {
+            Ok(pool) => {
+                let token =
+                    self.locked_query_pools().insert(ObjectEntry { device: parts.index, object: pool });
+                Ok(DriverAnswer::Ok(HostQueryPool::from_token(token)))
+            }
+            Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
+        }
+    }
+
+    fn destroy_query_pool(&self, pool: HostQueryPool) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::destroy_query_pool";
+        let (device_index, handle) = {
+            let table = self.locked_query_pools();
+            self.device_of(&table, pool.token(), "VkQueryPool", METHOD)?
+        };
+        let device = self.device_at(device_index, METHOD)?;
+        // SAFETY: the pool is live; a pool still referenced by a pending command buffer is the
+        // guest's to have waited for, as on a device.
+        unsafe { device.destroy_query_pool(handle, None) };
+        self.locked_query_pools().remove(pool.token());
         Ok(())
     }
 
@@ -4503,6 +4782,10 @@ impl GfxVulkanHost {
 
     fn locked_caches(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::PipelineCache>>> {
         self.pipeline_caches.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn locked_query_pools(&self) -> std::sync::MutexGuard<'_, Slab<ObjectEntry<vk::QueryPool>>> {
+        self.query_pools.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn locked_set_layouts(
@@ -6339,6 +6622,19 @@ mod tests {
         assert_eq!(std::mem::size_of::<vk::SurfaceFormatKHR>(), guest::SURFACE_FORMAT_BYTES);
         assert_eq!(std::mem::size_of::<vk::PresentModeKHR>(), guest::PRESENT_MODE_BYTES);
         assert_eq!(std::mem::size_of::<vk::ExtensionProperties>(), guest::EXTENSION_PROPERTIES_BYTES);
+        assert_eq!(std::mem::size_of::<vk::FormatProperties>(), guest::FORMAT_PROPERTIES_BYTES);
+        assert_eq!(
+            std::mem::size_of::<vk::QueryPoolCreateInfo<'_>>(),
+            guest::QUERY_POOL_CREATE_INFO_BYTES
+        );
+        assert_eq!(
+            vk::StructureType::QUERY_POOL_CREATE_INFO.as_raw(),
+            i32::try_from(guest::STYPE_QUERY_POOL_CREATE_INFO).expect("an sType")
+        );
+        assert_eq!(
+            std::mem::size_of::<vk::ImageFormatProperties>(),
+            guest::IMAGE_FORMAT_PROPERTIES_BYTES
+        );
         // The *input* structures the adapter decodes by hand, for the same reason.
         assert_eq!(std::mem::size_of::<vk::DeviceCreateInfo<'_>>(), guest::DEVICE_CREATE_INFO_BYTES);
         assert_eq!(
@@ -6352,6 +6648,58 @@ mod tests {
         assert_eq!(
             vk::StructureType::ANDROID_SURFACE_CREATE_INFO_KHR.as_raw(),
             i32::try_from(guest::STYPE_ANDROID_SURFACE_CREATE_INFO_KHR).expect("a VkStructureType")
+        );
+    }
+
+    /// **Every flat structure a `pNext` chain may carry is the size and `sType` `ash` says**, and
+    /// `VkPhysicalDeviceFeatures2` too: the adapter's table is a claim about `vk.xml`, and this is
+    /// where it is checked against the headers `ash` is generated from.
+    #[test]
+    fn the_flat_chain_structures_are_ashs_sizes_and_stypes() {
+        use omni_android::vulkan as guest;
+        use vk::StructureType as S;
+        for known in guest::FLAT_STRUCTURES {
+            let s_type = i32::try_from(known.s_type).expect("a VkStructureType");
+            let size = match S::from_raw(s_type) {
+                S::PHYSICAL_DEVICE_MULTIVIEW_FEATURES => {
+                    std::mem::size_of::<vk::PhysicalDeviceMultiviewFeatures<'_>>()
+                }
+                S::PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES => {
+                    std::mem::size_of::<vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'_>>()
+                }
+                S::PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT => {
+                    std::mem::size_of::<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT<'_>>()
+                }
+                S::SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES => {
+                    std::mem::size_of::<vk::SamplerYcbcrConversionImageFormatProperties<'_>>()
+                }
+                other => panic!("{} ({other:?}) has no `ash` structure named here", known.name),
+            };
+            assert_eq!(known.size(), size, "{}", known.name);
+        }
+        assert_eq!(
+            std::mem::size_of::<vk::PhysicalDeviceFeatures2<'_>>(),
+            guest::PHYSICAL_DEVICE_FEATURES_2_BYTES
+        );
+        assert_eq!(
+            S::PHYSICAL_DEVICE_FEATURES_2.as_raw(),
+            i32::try_from(guest::STYPE_PHYSICAL_DEVICE_FEATURES_2).expect("a VkStructureType")
+        );
+        assert_eq!(
+            std::mem::size_of::<vk::PhysicalDeviceImageFormatInfo2<'_>>(),
+            guest::PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_BYTES
+        );
+        assert_eq!(
+            std::mem::size_of::<vk::ImageFormatProperties2<'_>>(),
+            guest::IMAGE_FORMAT_PROPERTIES_2_BYTES
+        );
+        assert_eq!(
+            S::PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2.as_raw(),
+            i32::try_from(guest::STYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2).expect("an sType")
+        );
+        assert_eq!(
+            S::IMAGE_FORMAT_PROPERTIES_2.as_raw(),
+            i32::try_from(guest::STYPE_IMAGE_FORMAT_PROPERTIES_2).expect("an sType")
         );
     }
 

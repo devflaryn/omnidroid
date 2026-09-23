@@ -613,6 +613,43 @@ pub struct DeviceRequest {
     ///
     /// [`PHYSICAL_DEVICE_FEATURES_BYTES`]: super::PHYSICAL_DEVICE_FEATURES_BYTES
     pub features: Option<Vec<u8>>,
+    /// `pNext`, as the flat structures the guest chained, in its order -- empty for a null
+    /// `pNext`. Only [`FLAT_STRUCTURES`](super::FLAT_STRUCTURES) reach here; see
+    /// [`ChainLink`].
+    pub chain: Vec<ChainLink>,
+}
+
+/// The five scalars `vkGetPhysicalDeviceImageFormatProperties` asks about, named.
+///
+/// A struct rather than five parameters, for [`counted::Array`](super::counted)'s reason: they are
+/// all 32-bit and a positional call that transposed `tiling` and `image_type` would compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageFormatQuery {
+    /// `VkFormat`.
+    pub format: i32,
+    /// `VkImageType`.
+    pub image_type: i32,
+    /// `VkImageTiling`.
+    pub tiling: i32,
+    /// `VkImageUsageFlags`.
+    pub usage: u32,
+    /// `VkImageCreateFlags`.
+    pub flags: u32,
+}
+
+/// One structure of a guest `pNext` chain: its `sType` and the member bytes after `pNext`.
+///
+/// **No pointer.** The guest's `pNext` values are addresses in guest memory and never reach the
+/// driver: a host rebuilds the chain in its own memory, in this order, and links it itself. The
+/// members are bytes for [`DeviceRequest::features`]' reason -- every structure that can be here
+/// is flat (`VkBool32`s after `pNext`), so the guest's bytes are the driver's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChainLink {
+    /// The structure's `VkStructureType`.
+    pub s_type: u32,
+    /// Its members: [`FlatStructure::member_bytes`](super::FlatStructure::member_bytes) bytes,
+    /// starting at offset 16 and stopping before the tail padding.
+    pub body: Vec<u8>,
 }
 
 /// What a host's platform surface call produced.
@@ -728,6 +765,24 @@ host_token! {
 host_token! {
     /// One `VkPipelineCache` a host created. **Non-dispatchable.**
     HostPipelineCache
+}
+
+host_token! {
+    /// One `VkQueryPool` a host created. **Non-dispatchable.**
+    HostQueryPool
+}
+
+/// `VkQueryPoolCreateInfo`, decoded: every member after `pNext`, which is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryPoolRequest {
+    /// `flags`. Reserved; passed through.
+    pub flags: u32,
+    /// `queryType`: `VK_QUERY_TYPE_TIMESTAMP` (2) for the engine's GPU timer.
+    pub query_type: u32,
+    /// `queryCount`.
+    pub query_count: u32,
+    /// `pipelineStatistics`, meaningful only for `VK_QUERY_TYPE_PIPELINE_STATISTICS`.
+    pub pipeline_statistics: u32,
 }
 
 host_token! {
@@ -1523,6 +1578,105 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
             "there is no `VkPhysicalDeviceFeatures` to write, and an all-zero one is a device that \
              supports no optional feature -- which is a believable answer and therefore the worst \
              one",
+        ))
+    }
+
+    /// `vkGetPhysicalDeviceFormatProperties`, as its
+    /// [`FORMAT_PROPERTIES_BYTES`](super::FORMAT_PROPERTIES_BYTES) bytes.
+    ///
+    /// `format` is the guest's `VkFormat`, passed through: every value names the same format on
+    /// every platform, and one the driver does not know is answered with no features by the driver
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued.
+    fn physical_device_format_properties(
+        &self,
+        device: HostPhysicalDevice,
+        format: i32,
+    ) -> AbiResult<Vec<u8>> {
+        let _ = (device, format);
+        Err(host_has_no(
+            "VulkanHost::physical_device_format_properties",
+            "there is no `VkFormatProperties` to write, and zeroed features are a format the \
+             device cannot use at all -- the answer that quietly steers a renderer away from it",
+        ))
+    }
+
+    /// `vkGetPhysicalDeviceImageFormatProperties`: the driver's
+    /// [`IMAGE_FORMAT_PROPERTIES_BYTES`](super::IMAGE_FORMAT_PROPERTIES_BYTES) bytes, or its own
+    /// failure -- `VK_ERROR_FORMAT_NOT_SUPPORTED` is an answer about the device, not an error of
+    /// this layer's.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued.
+    fn physical_device_image_format_properties(
+        &self,
+        device: HostPhysicalDevice,
+        query: ImageFormatQuery,
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        let _ = (device, query);
+        Err(host_has_no(
+            "VulkanHost::physical_device_image_format_properties",
+            "there is no `VkImageFormatProperties` to write, and inventing \
+             `VK_ERROR_FORMAT_NOT_SUPPORTED` would steer a renderer away from a format the \
+             device may well support",
+        ))
+    }
+
+    /// `vkGetPhysicalDeviceImageFormatProperties2` (or its `KHR` alias, as `entry` names it): the
+    /// [`IMAGE_FORMAT_PROPERTIES_BYTES`](super::IMAGE_FORMAT_PROPERTIES_BYTES) bytes of the
+    /// `VkImageFormatProperties` it heads, with each structure of `answers` answered in place --
+    /// or the driver's own failure. `question` is the chain the guest hung from its
+    /// `VkPhysicalDeviceImageFormatInfo2`, which the driver reads and does not write.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued, or when the driver
+    /// has no such entry point.
+    fn physical_device_image_format_properties2(
+        &self,
+        device: HostPhysicalDevice,
+        entry: &str,
+        query: ImageFormatQuery,
+        question: &[ChainLink],
+        answers: &mut [ChainLink],
+    ) -> AbiResult<DriverAnswer<Vec<u8>>> {
+        let _ = (device, entry, query, question, answers);
+        Err(host_has_no(
+            "VulkanHost::physical_device_image_format_properties2",
+            "there is no `VkImageFormatProperties2` to write, and inventing \
+             `VK_ERROR_FORMAT_NOT_SUPPORTED` would steer a renderer away from a format the \
+             device may well support",
+        ))
+    }
+
+    /// `vkGetPhysicalDeviceFeatures2` (or its `KHR` alias, as `entry` names it): the
+    /// [`PHYSICAL_DEVICE_FEATURES_BYTES`](super::PHYSICAL_DEVICE_FEATURES_BYTES) bytes of the
+    /// `VkPhysicalDeviceFeatures` it heads, with each structure of `chain` answered **in place**.
+    ///
+    /// `entry` is the name the guest called through. The `KHR` spelling is valid on an instance
+    /// that enabled `VK_KHR_get_physical_device_properties2`, the core one on a 1.1 instance, and
+    /// forwarding the one the guest chose is what keeps the host inside what the guest asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued, or when the driver
+    /// has no such entry point.
+    fn physical_device_features2(
+        &self,
+        device: HostPhysicalDevice,
+        entry: &str,
+        chain: &mut [ChainLink],
+    ) -> AbiResult<Vec<u8>> {
+        let _ = (device, entry, chain);
+        Err(host_has_no(
+            "VulkanHost::physical_device_features2",
+            "there is no `VkPhysicalDeviceFeatures2` to write, and zeroed members would be a \
+             device that supports none of the features the guest chained -- believable, and so \
+             the worst answer",
         ))
     }
 
@@ -2497,6 +2651,25 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkGetImageMemoryRequirements` on a **swapchain's** image, forwarded.
+    ///
+    /// The specification forbids binding memory to a swapchain image and destroying one, and
+    /// neither is reachable here ([`HostImageRef`] keeps the families apart); it does not forbid
+    /// asking what one needs. MEASURED: the engine asks it of its swapchain's images once the
+    /// swapchain exists.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `image` is not a swapchain image this host holds.
+    fn swapchain_image_memory_requirements(&self, image: HostImage) -> AbiResult<Vec<u8>> {
+        let _ = image;
+        Err(host_has_no(
+            "VulkanHost::swapchain_image_memory_requirements",
+            "there is no size, no alignment and no `memoryTypeBits` for the swapchain's image, \
+             and the engine budgets its memory from them",
+        ))
+    }
+
     /// `vkBindBufferMemory`, forwarded.
     ///
     /// # Errors
@@ -2746,6 +2919,34 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
     fn destroy_framebuffer(&self, framebuffer: HostFramebuffer) -> AbiResult<()> {
         let _ = framebuffer;
         Err(host_has_no("VulkanHost::destroy_framebuffer", "the framebuffer cannot be destroyed"))
+    }
+
+    /// `vkCreateQueryPool`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `device` is not a token this host issued.
+    fn create_query_pool(
+        &self,
+        device: HostDevice,
+        request: &QueryPoolRequest,
+    ) -> AbiResult<DriverAnswer<HostQueryPool>> {
+        let _ = (device, request);
+        Err(host_has_no(
+            "VulkanHost::create_query_pool",
+            "there is no `VkQueryPool`, and a GPU timer reading back queries from nothing would \
+             report whatever its buffer held as the frame's GPU time",
+        ))
+    }
+
+    /// `vkDestroyQueryPool`, forwarded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `pool` is not a token this host issued.
+    fn destroy_query_pool(&self, pool: HostQueryPool) -> AbiResult<()> {
+        let _ = pool;
+        Err(host_has_no("VulkanHost::destroy_query_pool", "the query pool cannot be destroyed"))
     }
 
     /// `vkCreatePipelineCache`, forwarded. `initial_data` is `pInitialData`, copied, or empty.

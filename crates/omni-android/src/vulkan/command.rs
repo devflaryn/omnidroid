@@ -157,13 +157,13 @@ pub const BUFFER_MEMORY_BARRIER_BYTES: usize = 56;
 
 /// How many command buffers one `vkAllocateCommandBuffers` or `vkFreeCommandBuffers` may name.
 ///
-/// An allocation bound. `commandBufferCount` is a guest `uint32_t`; thirty-two is far above the
-/// one-per-frame-in-flight a renderer allocates in a batch, and it is **half**
+/// An allocation bound. `commandBufferCount` is a guest `uint32_t`, and this is **half**
 /// [`MAX_COMMAND_BUFFERS`](super::MAX_COMMAND_BUFFERS) so that a single call cannot fill the
 /// registry on its own — a guest that allocated its whole budget in one call would leave the next
 /// `vkAllocateCommandBuffers` refusing for a reason that looks like this bound rather than like
-/// the registry's.
-pub const MAX_COMMAND_BUFFERS_PER_CALL: usize = 32;
+/// the registry's. Defined as that relation, so the two cannot drift when the registry is resized
+/// (as it was for the engine's own renderer).
+pub const MAX_COMMAND_BUFFERS_PER_CALL: usize = super::MAX_COMMAND_BUFFERS / 2;
 
 /// How many barriers of one kind a single `vkCmdPipelineBarrier` may name.
 ///
@@ -886,17 +886,17 @@ mod tests {
     /// permits stays small. Stated as the numbers, for [`device`](super::super::device)'s reason.
     #[test]
     fn the_command_bounds_are_above_what_any_renderer_asks_for() {
-        assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL, 32);
+        assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL, 2048);
         // **Exactly half the registry**, stated as the arithmetic rather than as a comparison:
         // a `<` between two constants is a comparison the compiler folds away, which clippy's
         // `assertions_on_constants` names and is right about. What this states instead is the
         // relation -- one call cannot fill the registry on its own.
         assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL * 2, super::super::MAX_COMMAND_BUFFERS);
-        assert_eq!(super::super::MAX_COMMAND_BUFFERS, 64);
+        assert_eq!(super::super::MAX_COMMAND_BUFFERS, 4096);
         assert_eq!(MAX_BARRIERS, 32);
         assert_eq!(MAX_CLEAR_RANGES, 8);
         // The largest read each bound permits, in bytes -- all well under a page.
-        assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL * 8, 256);
+        assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL * 8, 16384, "four pages at most");
         assert_eq!(MAX_BARRIERS * IMAGE_MEMORY_BARRIER_BYTES, 2304);
         assert_eq!(MAX_CLEAR_RANGES * IMAGE_SUBRESOURCE_RANGE_BYTES, 160);
     }
