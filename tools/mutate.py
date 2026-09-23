@@ -7909,6 +7909,12 @@ directory", ADAPTER_FILES,
      INBOUND_JNI),
 ]
 
+# The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so
+# that the three ports' tables merge without editing each other's lines. Pure data (rule 3).
+from mutate_mac import ROWS as _MAC_ROWS  # noqa: E402
+
+MUTATIONS += _MAC_ROWS
+
 
 def read_exactly(path):
     """Read a file without touching its line endings.
