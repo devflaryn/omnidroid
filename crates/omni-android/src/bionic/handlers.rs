@@ -1049,6 +1049,89 @@ pub(super) fn pthread_attr_getstack(c: &mut ImportCall<'_, '_>) -> AbiResult<()>
     Ok(())
 }
 
+// ======================================================================== sem_*
+
+/// The `sem_*` family's answer: the primitive's `0`, or its `-1` with the `errno` it recorded
+/// written into the calling guest thread's `errno`.
+///
+/// **The family's own convention, and the classic trap**: `sem_*` returns `-1` and sets `errno`,
+/// where `pthread_*` returns the code. `omni_bionic::sem` records the code in
+/// [`omni_bionic::sem::last_errno`] rather than in a guest it cannot see; this is where it reaches
+/// the guest, so a `-1` never arrives with a stale `errno` beside it.
+fn sem_answer(
+    produced: Result<i32, omni_bionic::memory::Fault>,
+    view: &mut GuestView<'_>,
+) -> AbiResult<i32> {
+    let code = Lift::lift(produced, view)?;
+    if code == -1 {
+        view.set_errno(omni_bionic::sem::last_errno());
+    }
+    Ok(code)
+}
+
+/// `int sem_init(sem_t *sem, int pshared, unsigned int value)`
+///
+/// **A binding gap of the `pthread_mutex_trylock` kind, the fourth**: `omni_bionic::sem` has had
+/// `init`, `wait`, `post` and `destroy` since phase 3c, with `sem_wakeup` beside them, and nothing
+/// bound a symbol to any of them. MEASURED: the render thread died on `sem_init` the moment FMOD's
+/// `System::init` ran on the logged-out landing -- FMOD starts each of its threads through a
+/// trampoline that reports its start on a semaphore (`sem_wait` at link `0x4f45768`).
+pub(super) fn sem_init(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (sem, pshared, value) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()? as i32, a.next_u64()? as u32)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let code = {
+        let mut view = enter(c, &state);
+        let produced = omni_bionic::sem::init(&mut view, sem, pshared, value);
+        sem_answer(produced, &mut view)?
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
+/// `int sem_destroy(sem_t *sem)` -- `EBUSY` while a waiter is really queued.
+pub(super) fn sem_destroy(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let sem = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let code = {
+        let mut view = enter(c, &state);
+        let produced = omni_bionic::sem::destroy(&mut view, &state.bionic.futex, sem);
+        sem_answer(produced, &mut view)?
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
+/// `int sem_wait(sem_t *sem)` -- takes a token, or blocks the calling guest thread on the
+/// instance's futex until a `sem_post` gives one.
+pub(super) fn sem_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let sem = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let code = {
+        let mut view = enter(c, &state);
+        let produced = omni_bionic::sem::wait(&mut view, &state.bionic.futex, sem);
+        sem_answer(produced, &mut view)?
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
+/// `int sem_post(sem_t *sem)` -- gives a token, waking a waiter through the same futex
+/// `sem_wait` sleeps on.
+pub(super) fn sem_post(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let sem = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let code = {
+        let mut view = enter(c, &state);
+        let produced = omni_bionic::sem::post(&mut view, &state.bionic.futex, sem);
+        sem_answer(produced, &mut view)?
+    };
+    c.ret().i32(code);
+    Ok(())
+}
+
 /// `int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m)`
 ///
 /// Two phases, and the order is the atomicity: the calling thread registers on the cond's waiter
@@ -1521,6 +1604,11 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("round", round),
     ("nextafterf", nextafterf),
     ("erfcf", erfcf),
+    // semaphores, reached by FMOD's thread start
+    ("sem_init", sem_init),
+    ("sem_destroy", sem_destroy),
+    ("sem_wait", sem_wait),
+    ("sem_post", sem_post),
     ("ldexp", ldexp),
     ("sincosf", sincosf),
     // wide characters

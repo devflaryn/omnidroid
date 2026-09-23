@@ -562,6 +562,26 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          FreeBSD msun's s_erff.c, as bionic carries it, ported line for line.",
     ),
     (
+        "sem_init",
+        "M6, the render thread once FMOD's System::init ran on the logged-out landing: \"the guest \
+         called the imported symbol `sem_init` ... nothing in the compatibility layer implements \
+         it\". omni_bionic::sem::init, tested since phase 3c and never bound.",
+    ),
+    (
+        "sem_destroy",
+        "Bound with sem_init: FMOD's thread-start semaphore is initialised, waited on, posted and \
+         destroyed, and omni_bionic::sem has all four.",
+    ),
+    (
+        "sem_wait",
+        "Bound with sem_init: FMOD's creating thread waits at link 0x4f45768 for the new thread \
+         to report its start.",
+    ),
+    (
+        "sem_post",
+        "Bound with sem_init: the new FMOD thread's report.",
+    ),
+    (
         "ftell",
         "M6, the renderer's shader pack again, after fseek: \"the guest called the imported symbol \
          `ftell` ... nothing in the compatibility layer implements it\". bionic's ftell is ftello \
@@ -978,7 +998,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 297, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 301, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1068,7 +1088,9 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // 280**: the QUIC transport's receive side, once the device existed. **`fseek`, for 281**:
     // the renderer's shader pack, bound to `fseeko`, which it is on LP64. **`ftell`, for 282**:
     // the same stream, bound to `ftello`. **`erfcf`, for 283**: the renderer, `s_erff.c` ported.
-    assert_eq!(Bionic::inline_symbols().count(), 283);
+    // **`sem_init`, `sem_destroy`, `sem_wait` and `sem_post`, for 287**: FMOD's thread start on
+    // the logged-out landing, onto `omni_bionic::sem`, which had never been bound.
+    assert_eq!(Bionic::inline_symbols().count(), 287);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -2281,6 +2303,54 @@ fn sigfillset_fills_every_bit_of_the_guests_sigset() {
         0x1234_5678_9ABC_DEF0,
         "and nothing past sizeof(sigset_t), which is 8 on LP64"
     );
+}
+
+/// **`sem_*` through real thunks: a counted semaphore on bionic's one-word `sem_t`**, and the
+/// family's own convention on failure -- `-1` with `errno`, not the code returned.
+#[test]
+fn semaphores_count_on_the_guest_word_and_fail_with_minus_one_and_errno() {
+    let _guard = serialized();
+    let f = fixture();
+    let sem = f.guest.data + 0x400;
+    f.guest.write_u64(sem, u64::MAX);
+    let call = |symbol: &str, value: u64| {
+        value_of(&f, symbol, |asm| {
+            asm.mov(0, sem as u64);
+            asm.mov(1, 0);
+            asm.mov(2, value);
+        }) as i32
+    };
+    assert_eq!(call("sem_init", 2), 0);
+    assert_eq!(f.guest.read_u64(sem) as u32, 2, "the count is the word");
+    // Two tokens, two waits that do not block.
+    assert_eq!(call("sem_wait", 0), 0);
+    assert_eq!(call("sem_wait", 0), 0);
+    assert_eq!(f.guest.read_u64(sem) as u32 & 0x7FFF_FFFF, 0, "both taken");
+    assert_eq!(call("sem_post", 0), 0);
+    assert_eq!(f.guest.read_u64(sem) as u32 & 0x7FFF_FFFF, 1, "one given back");
+    assert_eq!(call("sem_wait", 0), 0, "and taken again");
+    assert_eq!(call("sem_destroy", 0), 0);
+
+    // A value past SEM_VALUE_MAX is -1 with EINVAL, read through `__errno` as the guest reads it.
+    let out = f.guest.data + 0x300;
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(0, sem as u64);
+    asm.mov(1, 0);
+    asm.mov(2, 0x8000_0000);
+    asm.bl(f.thunk("sem_init"));
+    asm.mov(22, out as u64);
+    asm.push(str_imm(0, 22, 0));
+    asm.bl(f.thunk("__errno"));
+    asm.push(ldr_w(1, 0, 0));
+    asm.push(str_imm(1, 22, 8));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    assert!(matches!(f.run(&mut cpu, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i32, -1, "sem_init past SEM_VALUE_MAX is -1");
+    assert_eq!(f.guest.read_u64(out + 8), 22, "with EINVAL in errno, not in the return");
 }
 
 /// A null `set` is bionic's own `-1` with `EINVAL`, read back through `__errno` the way the guest
