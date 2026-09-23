@@ -545,10 +545,15 @@ impl Guest {
     /// whose every call refuses -- so the default gate's `dlopen("libvulkan.so")` stays NULL.
     fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display) -> Self {
         let path = cached_main_lib();
-        let bytes = main_lib_bytes();
+        // **Read for this load, and freed when it returns** -- not through `main_lib_bytes`, whose
+        // static kept the whole file for the life of the process. Nothing the load produces borrows
+        // it (the loaded object and the export table own their data), and the guest runs from the
+        // file's mapping, not from these bytes. MEASURED on macOS: 104 MiB of `phys_footprint`
+        // (`MALLOC_LARGE`, one region) held through the whole session for a parse done at startup.
+        let bytes = std::fs::read(path).expect("read the cache entry");
         let backing =
             Backing::open(path, MapExecutability::Executable).expect("open the cache entry");
-        let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+        let elf = ElfImage::parse(&bytes).expect("parse libroblox.so");
         let space = Arc::new(
             GuestSpace::with_config(GuestSpaceConfig {
                 size: GUEST_SPACE_BYTES,
