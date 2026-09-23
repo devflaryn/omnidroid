@@ -94,9 +94,16 @@ pub const MAX_ASSET_MANAGERS: usize = 4;
 /// How many `AAsset`s one instance can hold open at once.
 ///
 /// Each costs its bytes in guest memory for as long as it is open, because `AAsset_getBuffer`
-/// hands the guest a pointer it dereferences. A thirty-third `AAssetManager_open` is a **null**,
-/// which is what a device answers when it cannot open an asset and what every caller branches on.
-pub const MAX_OPEN_ASSETS: usize = 32;
+/// hands the guest a pointer it dereferences. The one past the bound is a **null**, which is what
+/// a device answers when it cannot open an asset and what every caller branches on.
+///
+/// **An allocation bound, and 32 was not one a renderer fits under.** MEASURED: the engine's
+/// texture loaders open assets on many threads at once and hold them while they decode, and the
+/// thirty-third open was a NULL the engine logged as `stream == nullptr` -- its texture then came
+/// out 0x0 and the renderer's own `HardAssert (Invalid texture dimensions 0x0 on Vulkan)` fired. A
+/// device has no such ceiling there: a compressed asset is a heap buffer, and the descriptor limit
+/// is in the thousands. 1,024 costs 16 KiB of arena.
+pub const MAX_OPEN_ASSETS: usize = 1024;
 
 /// How many `AConfiguration`s one instance can hold.
 ///
@@ -260,7 +267,7 @@ impl Ndk {
             + MAX_CONFIGURATIONS
             + MAX_NATIVE_WINDOWS;
         let arena_bytes = (slots * SLOT_BYTES + page - 1) & !(page - 1);
-        // Eagerly committed: it is one page, and a handle is given to the guest on the first
+        // Eagerly committed: it is a few pages, and a handle is given to the guest on the first
         // `ALooper_prepare` there is, so nothing is saved by faulting it in.
         let arena = space.map_anonymous(
             Placement::Anywhere { align: page },

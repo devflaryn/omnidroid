@@ -1375,21 +1375,23 @@ fn the_open_asset_ceiling_answers_null() {
     });
     let name = f.guest.data + 0x80;
     f.guest.write_bytes(name, b"shaders/blit.vert\0");
-    for index in 0..MAX_OPEN_ASSETS {
-        let asset = f.value_of("AAssetManager_open", |asm| {
-            asm.mov(0, manager);
-            asm.mov(1, name as u64);
-            asm.mov(2, 3);
-        });
-        assert_ne!(asset, 0, "open {index} must succeed");
-    }
-    assert_eq!(f.ndk.live_assets(), MAX_OPEN_ASSETS);
-    let past = f.value_of("AAssetManager_open", |asm| {
+    // One program, run as many times as there are slots: a program per open would fill the
+    // harness's code region long before a renderer-sized ceiling.
+    let open = f.program_calling("AAssetManager_open", |asm| {
         asm.mov(0, manager);
         asm.mov(1, name as u64);
         asm.mov(2, 3);
     });
-    assert_eq!(past, 0, "the cap is a null, not a refusal");
+    let open_one = || {
+        let exit = f.run(open).expect("the run must complete");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+        f.guest.read_u64(f.guest.data)
+    };
+    for index in 0..MAX_OPEN_ASSETS {
+        assert_ne!(open_one(), 0, "open {index} must succeed");
+    }
+    assert_eq!(f.ndk.live_assets(), MAX_OPEN_ASSETS);
+    assert_eq!(open_one(), 0, "the cap is a null, not a refusal");
 }
 
 // =================================================================== AConfiguration
