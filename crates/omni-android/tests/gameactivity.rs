@@ -155,6 +155,22 @@ const LIFECYCLE_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
 /// early when no guest thread is left, because a dead thread will not produce more evidence.
 const POST_ROWS_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long the session after the rows runs: [`POST_ROWS_SETTLE`], or `OMNI_SESSION_SECONDS`.
+///
+/// The settle was sized for "did the engine act on the rows"; whether frames **continue**, and
+/// whether the window survives a resize, are questions about minutes, so a run can ask for them.
+fn session_length() -> std::time::Duration {
+    match std::env::var("OMNI_SESSION_SECONDS") {
+        Ok(text) => std::time::Duration::from_secs(text.trim().parse().unwrap_or_else(|_| {
+            panic!("OMNI_SESSION_SECONDS={text:?} is not a whole number of seconds")
+        })),
+        Err(_) => POST_ROWS_SETTLE,
+    }
+}
+
+/// How often the session prints its frame count.
+const FRAMES_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long the gate waits for the engine's own flag fetch to answer, before sending the window
 /// again.
 ///
@@ -2321,10 +2337,122 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // commands; what the engine does with them happens on the other thread, and a measurement
     // taken the instant the last one returns is a measurement of nothing — the same mistake
     // `report` made before `join_guest_threads` was added below it.
+    let session = session_length();
+    // **Frames, counted from the census**: every `vkQueuePresentKHR` the engine made, sampled on
+    // this thread every `FRAMES_EVERY`, so "frames continue" is a rate the run prints rather than
+    // a claim about one frame.
+    let presents = || {
+        guest
+            .vulkan
+            .as_ref()
+            .and_then(|vulkan| vulkan.call_counts().get("vkQueuePresentKHR").copied())
+            .unwrap_or(0)
+    };
+    let mut next_frames = std::time::Instant::now() + FRAMES_EVERY;
+    let mut last_presents = presents();
+    // **The size the engine was last told the surface has**, and the resizes to make if
+    // `OMNI_RESIZE_PROBE` asks: to 960x540 at 40% of the session and back at 70%. A size change
+    // from anywhere -- the probe, or a user dragging the frame -- is delivered as a device's
+    // `SurfaceView` delivers one: `onSurfaceChangedNative` with the new size, then
+    // `onContentRectChangedNative`, on this, the UI thread.
+    let mut told_size = (surface_width as u32, surface_height as u32);
+    let mut resize_probe: Vec<(f32, (u32, u32))> =
+        if window.is_some() && std::env::var_os("OMNI_RESIZE_PROBE").is_some() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "RESIZE PROBE: the window will be resized to 960x540 at 40% of the {}s session and \
+                 back to {surface_width}x{surface_height} at 70% (OMNI_RESIZE_PROBE)",
+                session.as_secs()
+            );
+            vec![(0.4, (960, 540)), (0.7, (surface_width as u32, surface_height as u32))]
+        } else {
+            Vec::new()
+        };
+    // (presents when the size was delivered, the size) for each resize, to check frames follow.
+    let mut resizes: Vec<(u64, (u32, u32))> = Vec::new();
+    let mut resize_failure: Option<String> = None;
     let settle = std::time::Instant::now();
-    while settle.elapsed() < POST_ROWS_SETTLE {
+    while settle.elapsed() < session {
         if guest.bionic.live_guest_threads() == 0 {
             break;
+        }
+        if std::time::Instant::now() >= next_frames {
+            next_frames += FRAMES_EVERY;
+            let now = presents();
+            let _ = writeln!(
+                std::io::stderr(),
+                "FRAMES: +{:.0}s into the session, {now} presents (+{} in the last {}s)",
+                settle.elapsed().as_secs_f32(),
+                now - last_presents,
+                FRAMES_EVERY.as_secs()
+            );
+            last_presents = now;
+        }
+        if let Some(open) = window.as_ref() {
+            let due = resize_probe
+                .first()
+                .is_some_and(|(at, _)| settle.elapsed().as_secs_f32() >= at * session.as_secs_f32());
+            if due {
+                let (_, (width, height)) = resize_probe.remove(0);
+                let _ = writeln!(std::io::stderr(), "RESIZE PROBE: the window to {width}x{height}");
+                if let Err(error) = open.set_client_size(width, height) {
+                    resize_failure = Some(format!("set_client_size({width}, {height}): {error}"));
+                }
+            }
+            if let Ok((width, height)) = open.client_size() {
+                if (width, height) != told_size && width > 0 && height > 0 && resize_failure.is_none() {
+                    for (member, descriptor, tail) in [
+                        (
+                            "onSurfaceChangedNative",
+                            "(JLandroid/view/Surface;III)V",
+                            vec![
+                                GuestArg::Int(surface),
+                                GuestArg::Int(1),
+                                GuestArg::Int(u64::from(width)),
+                                GuestArg::Int(u64::from(height)),
+                            ],
+                        ),
+                        (
+                            "onContentRectChangedNative",
+                            "(JIIII)V",
+                            vec![
+                                GuestArg::Int(0),
+                                GuestArg::Int(0),
+                                GuestArg::Int(u64::from(width)),
+                                GuestArg::Int(u64::from(height)),
+                            ],
+                        ),
+                    ] {
+                        let target = native(member, descriptor);
+                        let mut args = vec![
+                            GuestArg::Pointer(guest.jni.env_for(0)),
+                            GuestArg::Int(thiz),
+                            GuestArg::Int(native_code),
+                        ];
+                        args.extend(tail);
+                        let result = {
+                            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                            let _jni = guest.jni.activate().expect("publish the JNI instance");
+                            let _ndk = guest.ndk.activate();
+                            guest.boundary.call_guest(&mut cpu, member, target, &args, LIFECYCLE_BUDGET)
+                        };
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "RESIZE: {member} {width}x{height} -> {}",
+                            match &result {
+                                Ok(_) => "returned".to_string(),
+                                Err(error) => format!("{error}"),
+                            }
+                        );
+                        if let Err(error) = result {
+                            resize_failure = Some(format!("{member} {width}x{height}: {error}"));
+                            break;
+                        }
+                    }
+                    told_size = (width, height);
+                    resizes.push((presents(), (width, height)));
+                }
+            }
         }
         // The window's own thread is this one, so this is where it is pumped and sampled: a
         // window nobody pumps is one the OS marks as not responding, and a geometry nobody
@@ -2384,6 +2512,18 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // **After each resize, frames**: the engine has to have presented again since the size it
+    // was told changed, or the window survived the resize and the game did not.
+    let final_presents = presents();
+    let _ = writeln!(
+        std::io::stderr(),
+        "FRAMES: {final_presents} presents in all; resizes delivered {:?}",
+        resizes
+    );
+    let frames_after_resize = resizes
+        .iter()
+        .find(|(at, _)| final_presents <= *at)
+        .map(|(at, size)| format!("no present after the resize to {size:?} (at present {at})"));
     match &touch {
         Some(seam) => {
             let _ = writeln!(
@@ -2700,6 +2840,18 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         input_failure.is_none(),
         "§8 row 26: a window event did not reach the engine: {}",
         input_failure.as_deref().unwrap_or_default()
+    );
+    // **And a resize, asserted the same way**: the surface change reaching the engine, and the
+    // engine presenting again after it.
+    assert!(
+        resize_failure.is_none(),
+        "a window resize did not reach the engine: {}",
+        resize_failure.as_deref().unwrap_or_default()
+    );
+    assert!(
+        frames_after_resize.is_none(),
+        "the window was resized and the engine stopped presenting: {}",
+        frames_after_resize.as_deref().unwrap_or_default()
     );
 }
 
