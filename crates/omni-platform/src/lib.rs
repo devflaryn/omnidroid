@@ -45,6 +45,10 @@
 //!   structural on Linux and macOS, where the window type is literally uninhabited so that the
 //!   compiler discharges every operation but the one that refuses. M6's renderer is its only
 //!   consumer today; GameActivity's input callbacks are the other one it exists for.
+//! * [`webview`] — a top-level window with a real browser in it (Microsoft Edge WebView2 on
+//!   Windows, loaded without the SDK's loader DLL), on a thread the seam owns, driven by commands
+//!   and a **non-blocking** event drain. For the pages the guest opens in an Android `WebView`,
+//!   first the sign-in challenge. Structural on Linux and macOS.
 //!
 //! Threads and dynamic loading may arrive as sibling modules in later tasks.
 //! **Sockets did not, until M6, and the sentence that used to stand here is corrected rather than
@@ -108,4 +112,5 @@ pub mod log;
 pub mod net;
 pub mod process;
 pub mod vm;
+pub mod webview;
 pub mod window;
