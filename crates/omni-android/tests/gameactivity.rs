@@ -57,7 +57,9 @@ use omni_cpu::dynarmic::{DynarmicBackend, DynarmicCpu, DynarmicOptions};
 use omni_cpu::{GuestAddr, GuestCpu, RunLimit, XReg};
 use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
 use omni_elf::{ElfImage, LoadedObject};
-use omni_mem::{Backing, CommitPolicy, GuestSpace, MapExecutability, Placement, Protection};
+use omni_mem::{
+    Backing, CommitPolicy, GuestSpace, GuestSpaceConfig, MapExecutability, Placement, Protection,
+};
 use omni_platform::net::NetPolicy;
 
 const APK_NAME: &str = "Roblox-2.738.1397.apk";
@@ -109,17 +111,35 @@ const ON_LOAD_BUDGET: RunLimit = RunLimit::Instructions(200_000_000);
 /// comfortably below `i64::MAX`, which is D16's footgun: the emitted comparison is signed.
 const STEP_13_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
 
+/// The guest address space the gate reserves: 16 GiB. A reservation costs no commit charge
+/// whatever its size (D10), so this is not the number to economize on.
+///
+/// **It was `omni_mem`'s default 4 GiB, and a game outgrew it.** MEASURED (2026-09-23), the first
+/// joins to load a world (Pet Simulator 99): the engine reported 3.3-3.75 GB in use, mimalloc's
+/// 1 GiB region requests (`0x40010000` bytes) failed with ENOMEM again and again -- no 1 GiB run
+/// was left in a 4 GiB space -- and it fell back to 64 KiB pieces; its memory manager kept raising
+/// low-memory warnings and unloaded the Lua app. A device process has a 39- or 48-bit address
+/// space, so 4 GiB was this runtime's limit and not the guest's.
+const GUEST_SPACE_BYTES: usize = 16 << 30;
+
+/// The commit ceiling on that space: 8 GiB. `omni_mem::DEFAULT_MAX_COMMITTED`'s own doc says to
+/// scale the ceiling with the space rather than inherit the 3.5 GiB default; this is twice the
+/// ~3.75 GB a loaded world was measured using, the RAM of a common phone, and a quarter of this
+/// host's 31.8 GB. The per-request ceiling -- the one that refuses a tampered `p_memsz` -- keeps
+/// its default.
+const GUEST_MAX_COMMITTED: usize = 8 << 30;
+
 /// What the gate tells the guest its memory is -- `MemTotal`, `sysinfo.totalram`,
 /// `_SC_PHYS_PAGES`: **the commit ceiling this runtime enforces on the guest's space**
-/// (`omni_mem::DEFAULT_MAX_COMMITTED`, D15, 3.5 GiB inside the 4 GiB space the gate reserves with
-/// the default configuration). That is the memory the guest can actually have, which is what
-/// `MemTotal` means on a device; a larger figure would promise memory the ceiling refuses.
+/// ([`GUEST_MAX_COMMITTED`], 8 GiB inside the [`GUEST_SPACE_BYTES`] space). That is the memory the
+/// guest can actually have, which is what `MemTotal` means on a device; a larger figure would
+/// promise memory the ceiling refuses.
 ///
 /// It was 2 GiB, chosen as "an ordinary application heap limit" -- a per-app limit, which is not
 /// what `MemTotal` is. MEASURED why it matters: the engine sizes its device tier from it (its
 /// memory profile recorded `TotalOsMem` 2147483648 and a 16-48 MB texture-streaming budget), and
 /// raised its own low-memory warning 28 s into a landing-screen session.
-const GUEST_MEMORY_BUDGET: u64 = omni_mem::DEFAULT_MAX_COMMITTED as u64;
+const GUEST_MEMORY_BUDGET: u64 = GUEST_MAX_COMMITTED as u64;
 
 /// How long step 13 may take in **wall-clock** time before the watchdog ends the run.
 ///
@@ -528,7 +548,14 @@ impl Guest {
         let backing =
             Backing::open(path, MapExecutability::Executable).expect("open the cache entry");
         let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
-        let space = Arc::new(GuestSpace::new().expect("reserve a guest address space"));
+        let space = Arc::new(
+            GuestSpace::with_config(GuestSpaceConfig {
+                size: GUEST_SPACE_BYTES,
+                max_committed: GUEST_MAX_COMMITTED,
+                ..GuestSpaceConfig::default()
+            })
+            .expect("reserve a guest address space"),
+        );
 
         // **As many CPUs as bionic has thread blocks.** The backend's default is 32; MEASURED, once
         // the Lua app was starting, the engine's 33rd concurrent thread failed to get a TLS block
@@ -3062,13 +3089,22 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 last_fetches = fetched;
                 format!("; {delta} guest instructions translated")
             });
+            // The descriptor table's fill beside it: the join met `EMFILE` at the table's bound
+            // (2026-09-23), and whether the count climbs and stays (a leak) or peaks with loading
+            // (demand) is read off this line.
+            let descriptors = guest
+                .bionic
+                .filesystem()
+                .map(|fs| format!("; {} descriptors open", fs.open_count()))
+                .unwrap_or_default();
             let _ = writeln!(
                 std::io::stderr(),
-                "FRAMES: +{:.0}s into the session, {now} presents (+{} in the last {}s){}",
+                "FRAMES: +{:.0}s into the session, {now} presents (+{} in the last {}s){}{}",
                 settle.elapsed().as_secs_f32(),
                 now - last_presents,
                 FRAMES_EVERY.as_secs(),
-                translated.unwrap_or_default()
+                translated.unwrap_or_default(),
+                descriptors
             );
             last_presents = now;
         }
