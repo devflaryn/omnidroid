@@ -1789,6 +1789,23 @@ mod tests {
         assert_eq!(Registry::simple_answer(Answer::Int(7)), Some(Value::Int(7)));
     }
 
+    /// **The host's display is the embedding's to describe**: every `DisplayMetrics` field the
+    /// engine reads refuses until one defines it. MEASURED what the zeros they used to answer did:
+    /// the renderer divided by the density and sized a texture 0x0 from the infinity.
+    #[test]
+    fn the_display_metrics_are_unanswered_until_an_embedding_describes_the_display() {
+        let registry = Registry::with_declared();
+        let id = registry.find("android/util/DisplayMetrics").expect("declared");
+        let fields = &registry.class(id).expect("just found").fields;
+        for name in ["density", "widthPixels", "heightPixels", "xdpi", "ydpi"] {
+            let field = fields
+                .iter()
+                .find(|member| member.name == name)
+                .unwrap_or_else(|| panic!("DisplayMetrics.{name} is declared"));
+            assert_eq!(field.answer, Answer::Unanswered, "DisplayMetrics.{name}");
+        }
+    }
+
     /// A miss is recorded once per distinct lookup and the list is bounded, because a guest in a
     /// loop looking up a member that does not exist must not grow a host `Vec` without limit.
     #[test]
