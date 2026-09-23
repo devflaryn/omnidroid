@@ -179,19 +179,22 @@ fn exactly_one_entry_in_the_whole_apk_is_directly_mappable() {
         .collect();
 
     // One 1,447-byte PNG, by luck. This is the whole of D11's case: the predicate is implemented
-    // and does fire, and on this APK it fires for nothing anybody wants to map.
-    assert_eq!(
-        mappable,
-        vec!["res/drawable-mdpi-v4/notification_icon.png"],
-        "directly mappable entries"
-    );
+    // and does fire, and on this APK it fires for nothing anybody wants to map. On a 16 KiB host
+    // (Apple silicon) it fires for nothing at all: the PNG is 4 KiB-aligned and not 16 KiB-aligned.
+    let expected: Vec<&str> = if mapping_alignment() == 4096 {
+        vec!["res/drawable-mdpi-v4/notification_icon.png"]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(mappable, expected, "directly mappable entries");
 
     let png = apk
         .require_entry("res/drawable-mdpi-v4/notification_icon.png")
         .expect("the one mappable entry");
     assert!(png.is_stored());
     assert_eq!(png.payload_offset(), 5_042_176);
-    assert_eq!(png.payload_offset() % mapping_alignment(), 0);
+    assert_eq!(png.payload_offset() % 4096, 0);
+    assert_eq!(png.payload_offset() % mapping_alignment() == 0, mapping_alignment() == 4096);
     assert_eq!(png.uncompressed_size(), 1_447);
 }
 
