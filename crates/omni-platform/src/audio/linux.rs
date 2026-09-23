@@ -1040,4 +1040,90 @@ mod tests {
         println!("period {period} frames ({period_time:?}); five {timeout:?} waits took {took:?}");
         assert_eq!(output.recoveries(), Recoveries::default(), "a full buffer ran dry");
     }
+
+    /// The card named by `OMNI_AUDIO_HW_CARD`, opened **without the sound server** -- the path a
+    /// host with no PipeWire takes. `hw:` is the card as it is: a card that does not do float
+    /// (every HDA codec) refuses by name at `snd_pcm_hw_params_set_format`, the seam's "no
+    /// conversion here". `plughw:` is alsa-lib's own conversion layer over it, which is what such
+    /// a host's `"default"` is, and it must open at the preference and be consumed at its rate.
+    ///
+    /// Separately gated, because it needs the card free: a running sound server holds it
+    /// (`EBUSY`) until it suspends an idle sink, so the open is retried for up to ten seconds
+    /// while it is busy, and fails after that.
+    #[test]
+    #[ignore = "needs a card and no server using it: OMNI_AUDIO_LIVE_TESTS=1 OMNI_AUDIO_HW_CARD=<name> cargo test -- --ignored"]
+    fn hw_card_a_card_opened_without_the_server_refuses_float_by_name_or_plays_it() {
+        require_gate();
+        let card = std::env::var("OMNI_AUDIO_HW_CARD").unwrap_or_else(|_| {
+            panic!("run with --ignored but OMNI_AUDIO_HW_CARD is not set to a card name (aplay -L)")
+        });
+        let open_free = |name: &str| {
+            let device = std::ffi::CString::new(name).unwrap();
+            let request = Request { device: &device, ..Request::default_device(PREFERRED_RATE / 5) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match AudioOutput::open_with(request) {
+                    Err(AudioError::Alsa { api: "snd_pcm_open", errno, .. })
+                        if errno == libc::EBUSY && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    other => break other,
+                }
+            }
+        };
+
+        let raw = format!("hw:CARD={card},DEV=0");
+        match open_free(&raw) {
+            Err(AudioError::Alsa { api, errno, .. }) => {
+                assert_eq!(
+                    (api, errno),
+                    ("snd_pcm_hw_params_set_format(SND_PCM_FORMAT_FLOAT)", libc::EINVAL),
+                    "{raw}"
+                );
+                println!("{raw}: float refused at {api}, errno {errno}");
+            }
+            Ok(output) => println!("{raw}: the card takes float itself: {output:?}", output = output.format()),
+            Err(other) => panic!("{raw}: {other}"),
+        }
+
+        let plug = format!("plughw:CARD={card},DEV=0");
+        let mut output = open_free(&plug).unwrap_or_else(|e| panic!("{plug}: {e}"));
+        let format = output.format();
+        assert_eq!((format.sample_rate, format.channels), (PREFERRED_RATE, 2), "{plug}");
+        let channels = usize::from(format.channels);
+        let buffer = output.buffer_frames();
+        let mut written = 0u64;
+        let mut top_up = |output: &mut AudioOutput, written: &mut u64| {
+            let free = output.writable_frames("write").unwrap();
+            output.write(&vec![0.0; free as usize * channels], free).unwrap();
+            *written += u64::from(free);
+        };
+        top_up(&mut output, &mut written);
+        output.start().unwrap();
+        let started = Instant::now();
+        let consumed = |output: &AudioOutput, written: u64| {
+            written - u64::from(buffer - output.writable_frames("writable_frames").unwrap())
+        };
+        let mut feed = |output: &mut AudioOutput, written: &mut u64, until: Duration| {
+            while started.elapsed() < until {
+                output.wait_writable(Duration::from_millis(100)).unwrap();
+                top_up(output, written);
+            }
+        };
+        feed(&mut output, &mut written, Duration::from_millis(200));
+        let (from, from_at) = (consumed(&output, written), started.elapsed());
+        feed(&mut output, &mut written, Duration::from_millis(1_400));
+        let (to, to_at) = (consumed(&output, written), started.elapsed());
+        let per_second = (to - from) as f64 / (to_at - from_at).as_secs_f64();
+        println!(
+            "{plug}: {format:?}, buffer {buffer}, period {}; {per_second:.0} frames/s over {:?}; \
+             recoveries {:?}",
+            output.period_frames(),
+            to_at - from_at,
+            output.recoveries()
+        );
+        assert!((0.98..=1.02).contains(&(per_second / f64::from(PREFERRED_RATE))), "{per_second}");
+        assert_eq!(output.recoveries(), Recoveries::default());
+    }
 }
