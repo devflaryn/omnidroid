@@ -20,7 +20,7 @@
 //!    `SLICE_INSTRUCTIONS` the guest returns to the dispatcher. That is a real overhead and it
 //!    should be small.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

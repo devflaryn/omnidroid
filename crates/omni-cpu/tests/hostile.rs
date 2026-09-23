@@ -8,7 +8,7 @@
 //! Each test is one hostile shape. The assertion is always the same in spirit: the process is still
 //! here, the exit says what the guest did, and the context is still usable afterwards.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

@@ -36,7 +36,7 @@
 //! cargo test -p omni-cpu --release --test thunk -- --ignored --nocapture --test-threads=1
 //! ```
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 
@@ -182,6 +182,7 @@ fn plt_stub(stub_at: GuestAddr, got_slot: GuestAddr) -> Vec<u32> {
 fn nothing(_call: &mut ThunkCall<'_>) {}
 
 /// `LDMXCSR` from a `u32`.
+#[cfg(target_arch = "x86_64")]
 fn write_mxcsr(value: u32) {
     // SAFETY: SSE2 is baseline on x86-64 and this file is `cfg(target_arch = "x86_64")`. Every value
     // this is called with was read out of `MXCSR` or is one of its documented bits.
@@ -189,6 +190,7 @@ fn write_mxcsr(value: u32) {
 }
 
 /// `STMXCSR` into a `u32`. `_mm_getcsr` is deprecated in favour of exactly this.
+#[cfg(target_arch = "x86_64")]
 fn read_mxcsr() -> u32 {
     let mut out: u32 = 0;
     // SAFETY: SSE2 is baseline on x86-64 and this file is `cfg(target_arch = "x86_64")`.
@@ -196,6 +198,34 @@ fn read_mxcsr() -> u32 {
     unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut out, options(nostack)) };
     out
 }
+
+/// The bits of the host's floating-point control word that flush denormals: `MXCSR.FTZ` (bit 15)
+/// and `MXCSR.DAZ` (bit 6) on x86-64.
+#[cfg(target_arch = "x86_64")]
+const HOST_FLUSH_BITS: u32 = (1 << 15) | (1 << 6);
+
+/// On an `aarch64` host the control word the dispatcher's guard switches is `FPCR`, and there is
+/// one flush bit, `FPCR.FZ` (bit 24), which governs inputs and outputs alike -- the very bit the
+/// guest program below sets. `MSR FPCR` from a `u32`.
+#[cfg(target_arch = "aarch64")]
+fn write_mxcsr(value: u32) {
+    // SAFETY: `FPCR` is writable at EL0; every value this is called with was read out of `FPCR` or
+    // is `FPCR.FZ`, a defined bit.
+    unsafe { core::arch::asm!("msr fpcr, {}", in(reg) u64::from(value), options(nomem, nostack)) };
+}
+
+/// `MRS` of `FPCR`; see [`write_mxcsr`].
+#[cfg(target_arch = "aarch64")]
+fn read_mxcsr() -> u32 {
+    let out: u64;
+    // SAFETY: `FPCR` is readable at EL0 and `mrs` touches no memory.
+    unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) out, options(nomem, nostack)) };
+    out as u32
+}
+
+/// `FPCR.FZ`; see [`write_mxcsr`].
+#[cfg(target_arch = "aarch64")]
+const HOST_FLUSH_BITS: u32 = 1 << 24;
 
 /// A representative AAPCS64 marshal: read the eight integer argument registers, combine them so the
 /// optimizer cannot delete the reads, write the result register.
@@ -568,9 +598,7 @@ fn the_dispatcher_puts_the_host_mxcsr_under_a_handler_and_the_guest_s_back() {
     let guest = Guest::new();
     let thunk = guest.code + THUNK_AT;
     let host = read_mxcsr();
-    const FTZ: u32 = 1 << 15;
-    const DAZ: u32 = 1 << 6;
-    assert_eq!(host & (FTZ | DAZ), 0, "the host thread already had FTZ/DAZ set; this test is void");
+    assert_eq!(host & HOST_FLUSH_BITS, 0, "the host thread already had FTZ/DAZ set; this test is void");
 
     // The smallest positive double subnormal, and 1.0. Under `FPCR.FZ` the multiply flushes to +0;
     // without it the result is the subnormal itself.
@@ -875,7 +903,7 @@ fn what_the_mxcsr_guard_costs() {
 
     println!();
     println!("THE MXCSR GUARD — {ROUNDS} enter/exit pairs per sample, n = {N} samples");
-    for (label, guest_word) in [("words already equal (the common case)", host), ("words differ", host | (1 << 15) | (1 << 6))] {
+    for (label, guest_word) in [("words already equal (the common case)", host), ("words differ", host | HOST_FLUSH_BITS)] {
         let summary = Summary::of(
             (0..N)
                 .map(|_| {

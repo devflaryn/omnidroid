@@ -1,6 +1,6 @@
 //! D13: the bionic thread pointer, read by guest code exactly the way `libroblox.so` reads it.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

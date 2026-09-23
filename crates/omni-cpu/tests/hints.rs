@@ -28,7 +28,7 @@
 //! a pin that started forwarding the flag would take it to zero and the guest would still be
 //! correct, so a test asserting on it would fail for the right thing happening.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

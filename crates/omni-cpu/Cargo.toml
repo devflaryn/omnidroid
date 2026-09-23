@@ -23,7 +23,7 @@ parking_lot = { workspace = true }
 # whether a guest address is executable before fetching an instruction from it, and to own guest
 # demand paging (D10) through omni-mem's `DemandPager`.
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 # **Optional, and target-gated, so preflight ruling P1 still holds where it was aimed.** P1 put the
 # dynarmic FFI in its own crate so that `omni-cpu` — and therefore the `GuestCpu` trait — compiles
 # on a host with no C++ toolchain, which is what the ARM64-native path needs. That property is

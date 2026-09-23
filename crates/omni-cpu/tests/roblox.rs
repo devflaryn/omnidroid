@@ -20,7 +20,7 @@
 //! Gated on `x86_64`, because that is where the translating backend exists, and skipped loudly
 //! when the APK is absent.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

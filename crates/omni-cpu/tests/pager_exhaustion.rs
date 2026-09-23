@@ -17,7 +17,7 @@
 //! libtest runs them in parallel, so with the old capacity of 8 the ninth backend in a binary ran
 //! with no pager, intermittently, depending on scheduling.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 use std::sync::Arc;
 
