@@ -920,13 +920,14 @@ OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --releas
   OMNI_DATA_DIR=<dir>        keep the app's storage between runs (a signed-in session included)
 ```
 
-It passed with a real window on an RTX 4060 through gate89 (six tests, no guest thread killed,
-teardown with none left running). **Since the gate closes the app the way a device does** -- focus
-lost, `onPause`, the surface destroyed, `onStop`, with a close watchdog that names every thread and
-releases the glue if the close hangs -- **it is RED at the close**: the render thread's
-`APP_CMD_TERM_WINDOW` path reaches Vulkan calls no run had made before. `vkDestroySurfaceKHR` is
-implemented; `vkGetPipelineCacheData` (the engine saving its pipeline cache) was next when this was
-written -- check `git log` for it. What a run reaches, every time:
+It **passes** with a real window on an RTX 4060 (gate104): six tests, no guest thread killed,
+teardown with none left running -- **and it now closes the app the way a device does**: focus
+lost, `onPause`, the surface destroyed, `onStop`. The render thread's `APP_CMD_TERM_WINDOW`
+teardown runs to the end -- pipeline cache saved (`vkGetPipelineCacheData`), then swapchain,
+surface, device and instance destroyed, each only after its children -- and a close watchdog
+names every thread and releases the glue if a close ever hangs again. The memory the guest is told
+it has is the commit ceiling this runtime enforces, 3.5 GiB (it was 2 GiB, which put the engine in
+a low tier: a 16-48 MB texture budget, now 512 MB). What a run reaches, every time:
 
 * **The engine's landing screen, drawn by its own renderer, presented to the host window** -- the
   Roblox logo, Create Account / Sign In, the thumbnail collage (`landing_first.png` in the session
@@ -967,12 +968,17 @@ written -- check `git log` for it. What a run reaches, every time:
    whether Roblox then demands a captcha, which on Android is a `WebView` this runtime does not have,
    has **not been tried**. With `OMNI_DATA_DIR` the session should survive into the next run --
    **not yet verified**, because no run has signed in. **The second launch of a kept directory is
-   its own frontier**: it reached `clearerr`, `utime` and `atof` (all bound now), then the engine's
-   inferred-crash report for the previous session -- which a run ended by stopping threads leaves
-   unclosed -- calls through a reporter that is null here (`InferredCrash`, link `0x23834e4`). The
-   device-faithful close above is the fix being tried; if a cleanly closed session still infers a
-   crash, the reporter's owner (`x19` from `[sp, #0x28]` in the function at `0x2380a94`) is where
-   to look.
+   its own frontier**: it reached `clearerr`, `utime` and `atof` (all bound now); then, even after
+   a clean close, the engine judges the previous session a crash (`SessionResultV2: Crash`,
+   `Inferred-Uncategorized`) because the exit-reason list it is handed is empty
+   (`RBX_EMPTY_EXIT_REASON_LIST`), and its crash report calls through a reporter that is null here
+   (`InferredCrash`, link `0x23834e4`; `x19` from `[sp, #0x28]` in the function at `0x2380a94`).
+   DECODED: the list is `jk.l2.a` -- on SDK >= 30, `ActivityManager.getHistoricalProcessExitReasons`
+   mapped to `ApplicationExitInfoCpp` (reason, status, pid, timestamp, the reason/subreason strings
+   of `toString()`), handed to `nativeSetAppPreviousExitReasons` at step 11, where the script hands
+   an empty `java/util/List`. The honest fix is the host recording how each run ended (a person
+   closing the window is `REASON_USER_REQUESTED`) where the system would, and answering the next
+   launch with it -- **not done yet**. Why the reporter is null on this path is not decoded.
 2. **After sign-in, everything is new**: Home, joining a game (the RCC connection, RakNet over UDP),
    the 3D renderer, physics, audio output (FMOD's native side, AAudio/OpenSL ES through `dlopen`).
    The `NativeUserJavaInterface` answers are a fresh install's signed-out ones -- DECODED, but a
