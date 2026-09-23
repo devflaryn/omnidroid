@@ -572,10 +572,14 @@ impl Guest {
         // standing in for a device with exactly one. SQLite asks, through `geteuid`, whether it
         // is root; an app never is.
         bionic.set_app_uid(10_000).expect("an application uid");
-        // §5.2 step 2. The host has to *set* it or the SDK version field is empty.
-        bionic
-            .set_system_property("ro.build.version.sdk", SDK_VERSION)
-            .expect("the SDK version is a decision this gate makes");
+        // §5.2 step 2. The host has to *set* it or the SDK version field is empty. **Every
+        // property this gate decides is set from one list**, which `android.os.Build`'s fields
+        // are then derived from by `Build.java`'s own rule (`define_build_fields`).
+        for (name, value) in device_properties() {
+            bionic
+                .set_system_property(name, &value)
+                .expect("a system property is a decision this gate makes");
+        }
         // **A created guest thread carries all three instances, not just bionic.**
         // MEASURED by an earlier run of this gate: without the NDK instance the game thread
         // `GameActivity_onCreate` spawns died on its first `AConfiguration_new`, never set
@@ -719,14 +723,87 @@ impl Guest {
 }
 
 /// **The decisions this host makes**, as against the ones the layer declares.
-fn define_host_answers(jni: &Jni, display: &Display) {
-    // **`Build.MANUFACTURER` is this host's maker**, as the firmware reports it: on a device it is
-    // the maker of the hardware the OS runs on, and here that hardware is this machine.
+/// **The system properties this gate decides**, in one list: what `__system_property_get` answers
+/// and what `android.os.Build`'s fields are derived from.
+///
+/// * `ro.build.version.sdk`: [`SDK_VERSION`], §5.2 step 2.
+/// * `ro.product.manufacturer`: **this host's maker**, as its firmware reports it -- on a device it
+///   is the maker of the hardware the OS runs on, and here that hardware is this machine.
+/// * `ro.product.cpu.abilist64` (and `abilist`): `arm64-v8a`, the one ABI this runtime executes --
+///   the APK's own `lib/arm64-v8a`.
+///
+/// Every other `ro.*` property is **unset**, which `__system_property_get` answers as empty and
+/// `Build.java` as `"unknown"`: a device whose build left it unset says the same.
+fn device_properties() -> Vec<(&'static str, String)> {
     let maker = omni_platform::process::host_manufacturer()
-        .unwrap_or_else(|error| panic!("Build.MANUFACTURER needs the host's maker: {error}"));
-    let maker: &'static str = Box::leak(maker.into_boxed_str());
-    jni.define_field("android/os/Build", "MANUFACTURER", "Ljava/lang/String;", true, Answer::Text(maker))
-        .expect("Build.MANUFACTURER is declared");
+        .unwrap_or_else(|error| panic!("ro.product.manufacturer needs the host's maker: {error}"));
+    vec![
+        ("ro.build.version.sdk", SDK_VERSION.to_string()),
+        ("ro.product.manufacturer", maker),
+        ("ro.product.cpu.abilist", "arm64-v8a".to_string()),
+        ("ro.product.cpu.abilist64", "arm64-v8a".to_string()),
+    ]
+}
+
+/// `android.os.Build`'s string fields, derived from [`device_properties`] by Android 13's
+/// `Build.java`: each is `SystemProperties.get(<its property>, "unknown")`; `SERIAL` is
+/// `"unknown"` for every app since O; `CPU_ABI`/`CPU_ABI2` are the first two of
+/// `ro.product.cpu.abilist64` (`""` when there is no second); and `FINGERPRINT` is
+/// `ro.build.fingerprint`, or when unset, `deriveFingerprint()`'s composition of the others.
+fn define_build_fields(jni: &Jni) {
+    let properties: std::collections::BTreeMap<&str, String> = device_properties().into_iter().collect();
+    let get = |name: &str| properties.get(name).cloned().unwrap_or_else(|| "unknown".to_string());
+    let abis: Vec<String> = properties
+        .get("ro.product.cpu.abilist64")
+        .map(|list| list.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let fingerprint = properties.get("ro.build.fingerprint").cloned().unwrap_or_else(|| {
+        format!(
+            "{}/{}/{}:{}/{}/{}:{}/{}",
+            get("ro.product.brand"),
+            get("ro.product.name"),
+            get("ro.product.device"),
+            get("ro.build.version.release"),
+            get("ro.build.id"),
+            get("ro.build.version.incremental"),
+            get("ro.build.type"),
+            get("ro.build.tags")
+        )
+    });
+    let fields: Vec<(&str, String)> = vec![
+        ("ID", get("ro.build.id")),
+        ("DISPLAY", get("ro.build.display.id")),
+        ("PRODUCT", get("ro.product.name")),
+        ("DEVICE", get("ro.product.device")),
+        ("BOARD", get("ro.product.board")),
+        ("MANUFACTURER", get("ro.product.manufacturer")),
+        ("BRAND", get("ro.product.brand")),
+        ("MODEL", get("ro.product.model")),
+        ("BOOTLOADER", get("ro.bootloader")),
+        ("HARDWARE", get("ro.hardware")),
+        ("SKU", get("ro.boot.hardware.sku")),
+        ("ODM_SKU", get("ro.boot.product.hardware.sku")),
+        ("SOC_MANUFACTURER", get("ro.soc.manufacturer")),
+        ("SOC_MODEL", get("ro.soc.model")),
+        ("TYPE", get("ro.build.type")),
+        ("TAGS", get("ro.build.tags")),
+        ("USER", get("ro.build.user")),
+        ("HOST", get("ro.build.host")),
+        ("RADIO", get("gsm.version.baseband")),
+        ("SERIAL", "unknown".to_string()),
+        ("CPU_ABI", abis.first().cloned().unwrap_or_default()),
+        ("CPU_ABI2", abis.get(1).cloned().unwrap_or_default()),
+        ("FINGERPRINT", fingerprint),
+    ];
+    for (field, value) in fields {
+        let value: &'static str = Box::leak(value.into_boxed_str());
+        jni.define_field("android/os/Build", field, "Ljava/lang/String;", true, Answer::Text(value))
+            .unwrap_or_else(|error| panic!("Build.{field} is declared: {error}"));
+    }
+}
+
+fn define_host_answers(jni: &Jni, display: &Display) {
+    define_build_fields(jni);
     // `LoggingProtocol.getProcessTimestamp()J`, as M4's gate decides it. D28 records that the
     // units are ASSUMED to be milliseconds since the Unix epoch.
     let epoch_millis = std::time::SystemTime::now()

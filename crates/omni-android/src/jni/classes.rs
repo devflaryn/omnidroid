@@ -800,6 +800,33 @@ static CONFIGURATION: &[MemberSpec] = &[
     f("fontWeightAdjustment", "I", Answer::Int(0)),
 ];
 
+/// `android.os.Build`'s static `String` fields, as Android 13's `Build.java` declares them.
+const BUILD_FIELDS: &[MemberSpec] = &[
+    sf("BOARD", "Ljava/lang/String;", Answer::Unanswered),
+    sf("BOOTLOADER", "Ljava/lang/String;", Answer::Unanswered),
+    sf("BRAND", "Ljava/lang/String;", Answer::Unanswered),
+    sf("CPU_ABI", "Ljava/lang/String;", Answer::Unanswered),
+    sf("CPU_ABI2", "Ljava/lang/String;", Answer::Unanswered),
+    sf("DEVICE", "Ljava/lang/String;", Answer::Unanswered),
+    sf("DISPLAY", "Ljava/lang/String;", Answer::Unanswered),
+    sf("FINGERPRINT", "Ljava/lang/String;", Answer::Unanswered),
+    sf("HARDWARE", "Ljava/lang/String;", Answer::Unanswered),
+    sf("HOST", "Ljava/lang/String;", Answer::Unanswered),
+    sf("ID", "Ljava/lang/String;", Answer::Unanswered),
+    sf("MANUFACTURER", "Ljava/lang/String;", Answer::Unanswered),
+    sf("MODEL", "Ljava/lang/String;", Answer::Unanswered),
+    sf("ODM_SKU", "Ljava/lang/String;", Answer::Unanswered),
+    sf("PRODUCT", "Ljava/lang/String;", Answer::Unanswered),
+    sf("RADIO", "Ljava/lang/String;", Answer::Unanswered),
+    sf("SERIAL", "Ljava/lang/String;", Answer::Unanswered),
+    sf("SKU", "Ljava/lang/String;", Answer::Unanswered),
+    sf("SOC_MANUFACTURER", "Ljava/lang/String;", Answer::Unanswered),
+    sf("SOC_MODEL", "Ljava/lang/String;", Answer::Unanswered),
+    sf("TAGS", "Ljava/lang/String;", Answer::Unanswered),
+    sf("TYPE", "Ljava/lang/String;", Answer::Unanswered),
+    sf("USER", "Ljava/lang/String;", Answer::Unanswered),
+];
+
 /// The lowest `Build.VERSION.SDK_INT` at which `org.fmod.FMOD.supportsAAudio()` answers true.
 ///
 /// Read out of `classes2.dex`, where it is the method's whole body:
@@ -1301,10 +1328,15 @@ pub static DECLARED: &[ClassSpec] = &[
         // aborts on. On a device the class is found and **the method is not** (it is
         // `android.os.Debug`'s, not `Build`'s), so the lookup answers null with
         // `NoSuchMethodError` pending, which the engine handles; declaring the class with no such
-        // method gives exactly that. FMOD reads `MANUFACTURER` from it (`0x4fc0118`): the
-        // hardware's maker, an embedding's to state, so it refuses until one does.
+        // method gives exactly that.
+        //
+        // **Its string fields are the device's system properties**, which is what `Build.java`
+        // makes them -- `BOARD = getString("ro.product.board")` and so on, `"unknown"` when the
+        // property is unset -- so they are an embedding's to state, and refuse until one does.
+        // MEASURED: FMOD reads `MANUFACTURER` (`0x4fc0118`), and a worker gathering the device's
+        // identity read `BOARD` and died on the unchecked null of a field this list lacked.
         methods: NONE,
-        fields: &[sf("MANUFACTURER", "Ljava/lang/String;", Answer::Unanswered)],
+        fields: BUILD_FIELDS,
     },
     ClassSpec {
         name: "android/os/Build$VERSION",
@@ -1933,13 +1965,17 @@ mod tests {
             !build.methods.iter().any(|m| m.name == "isDebuggerConnected"),
             "Debug's method, not Build's"
         );
-        let maker = build
-            .fields
-            .iter()
-            .find(|f| f.name == "MANUFACTURER" && f.descriptor == "Ljava/lang/String;")
-            .expect("MANUFACTURER is declared");
-        assert!(maker.is_static);
-        assert_eq!(maker.answer, Answer::Unanswered, "the embedding's to state");
+        // Membership: the fields MEASURED read (`MANUFACTURER`, `BOARD`) and the ones the same
+        // identity gathering reads beside them, each the embedding's to state.
+        for name in ["MANUFACTURER", "BOARD", "BRAND", "MODEL", "DEVICE", "FINGERPRINT", "SERIAL"] {
+            let field = build
+                .fields
+                .iter()
+                .find(|f| f.name == name && f.descriptor == "Ljava/lang/String;")
+                .unwrap_or_else(|| panic!("Build.{name} is declared"));
+            assert!(field.is_static, "Build.{name}");
+            assert_eq!(field.answer, Answer::Unanswered, "Build.{name} is the embedding's to state");
+        }
     }
 
     /// **`Build.VERSION.SDK_INT` is the one SDK level** every other answer uses.
