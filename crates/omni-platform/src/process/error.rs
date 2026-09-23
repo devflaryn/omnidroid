@@ -102,4 +102,23 @@ impl ProcessError {
     pub fn is_unsupported(&self) -> bool {
         matches!(self, ProcessError::Unsupported { .. })
     }
+
+    /// True when a POSIX host refused the call for want of privilege: `EACCES` or `EPERM` in an
+    /// [`ProcessError::Errno`]. On Linux that is what `setpriority` answers an unprivileged
+    /// thread asking for a lower nice value (`RLIMIT_NICE` of 0 and no `CAP_SYS_NICE`), which is
+    /// also exactly what an Android device's kernel would answer the same request under the same
+    /// limit -- so a caller can pass the refusal on as the guest's own `errno` instead of treating
+    /// it as a defect. Never true of the Windows variants: nothing on Windows changes meaning.
+    #[must_use]
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(self, ProcessError::Errno { errno, .. }
+            if *errno == libc_errno::EACCES || *errno == libc_errno::EPERM)
+    }
+}
+
+/// The two POSIX permission errnos, spelled here so that this file stays free of a `cfg`: they
+/// are 13 and 1 on Linux (every architecture) and on macOS alike.
+mod libc_errno {
+    pub(super) const EPERM: i32 = 1;
+    pub(super) const EACCES: i32 = 13;
 }
