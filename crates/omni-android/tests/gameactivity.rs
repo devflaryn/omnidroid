@@ -105,8 +105,17 @@ const ON_LOAD_BUDGET: RunLimit = RunLimit::Instructions(200_000_000);
 /// comfortably below `i64::MAX`, which is D16's footgun: the emitted comparison is signed.
 const STEP_13_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
 
-/// What the gate tells the guest its memory budget is, for `sysinfo`.
-const GUEST_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+/// What the gate tells the guest its memory is -- `MemTotal`, `sysinfo.totalram`,
+/// `_SC_PHYS_PAGES`: **the commit ceiling this runtime enforces on the guest's space**
+/// (`omni_mem::DEFAULT_MAX_COMMITTED`, D15, 3.5 GiB inside the 4 GiB space the gate reserves with
+/// the default configuration). That is the memory the guest can actually have, which is what
+/// `MemTotal` means on a device; a larger figure would promise memory the ceiling refuses.
+///
+/// It was 2 GiB, chosen as "an ordinary application heap limit" -- a per-app limit, which is not
+/// what `MemTotal` is. MEASURED why it matters: the engine sizes its device tier from it (its
+/// memory profile recorded `TotalOsMem` 2147483648 and a 16-48 MB texture-streaming budget), and
+/// raised its own low-memory warning 28 s into a landing-screen session.
+const GUEST_MEMORY_BUDGET: u64 = omni_mem::DEFAULT_MAX_COMMITTED as u64;
 
 /// How long step 13 may take in **wall-clock** time before the watchdog ends the run.
 ///
