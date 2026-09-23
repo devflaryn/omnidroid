@@ -95,8 +95,9 @@ fn guest_x18_survives_a_long_compute_loop() {
     ];
     // A budget of twice the loop's 4 * ROUNDS instructions, so that a clobbered *counter* ends in
     // a failed assertion rather than a loop that never terminates. MEASURED: with host x18 put first
-    // in GPR_ORDER (a mutation), this loop did not finish in 600 s without the budget -- the
-    // allocator had given it x18, and the kernel had zeroed it.
+    // in GPR_ORDER (a mutation), this loop did not finish in 600 s without the budget -- consistent
+    // with a loop value allocated to x18 being cleared by the kernel; the registers were not
+    // captured.
     let vm = Vm::new(code, VmOptions { cycle_counting: true, ..VmOptions::default() });
     vm.set_reg(18, PATTERN);
     vm.set_reg(19, PATTERN);
