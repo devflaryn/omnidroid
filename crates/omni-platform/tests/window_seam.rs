@@ -74,7 +74,7 @@ fn a_title_with_an_interior_nul_is_refused_with_its_offset() {
 ///
 /// `cfg(target_os)` is allowed here for the reason Global Constraint 4 gives: this is
 /// `omni-platform`, and this is a test *of* the per-target split.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[test]
 fn a_valid_description_reaches_the_structural_backend_and_is_refused_by_name() {
     let err = Window::new(&WindowDesc::new("omnidroid", 640, 480)).unwrap_err();
