@@ -1798,6 +1798,57 @@ fn snprintf_takes_an_int_from_its_low_half_and_a_long_whole() {
     assert_eq!(produced, "256 5000000000 ab");
 }
 
+/// **`sscanf` through a real variadic call, on the renderer's own format**, writes exactly the
+/// pointers a device writes: the scanset's bytes and their NUL, and nothing else once `%lld`
+/// meets the empty `id=`. With an id, each value lands in its own width -- `%lld` all eight bytes,
+/// `%d` four, with the four after it untouched.
+#[test]
+fn sscanf_parses_the_renderers_thumbnail_query_through_a_real_variadic_call() {
+    let _guard = serialized();
+    let f = fixture();
+    let format = f.cstring(f.guest.data + 0x100, b"type=%[^&]&id=%lld&w=%d&h=%d");
+    let sscanf = f.thunk("sscanf");
+    let (kind, id, w, h) =
+        (f.guest.data + 0x400, f.guest.data + 0x480, f.guest.data + 0x490, f.guest.data + 0x4a0);
+    let run = |query: &[u8]| {
+        let input = f.cstring(f.guest.data + 0x200, query);
+        for slot in [kind, kind + 8, kind + 16, id, w, h] {
+            f.guest.write_u64(slot, 0x5A5A_5A5A_5A5A_5A5A);
+        }
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(22, f.guest.data as u64);
+        asm.mov(0, input as u64);
+        asm.mov(1, format as u64);
+        asm.mov(2, kind as u64);
+        asm.mov(3, id as u64);
+        asm.mov(4, w as u64);
+        asm.mov(5, h as u64);
+        asm.bl(sscanf);
+        asm.push(str_imm(0, 22, 0));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        let mut cpu = f.guest.thread(&f.boundary);
+        f.run(&mut cpu, entry).expect("the run must complete");
+        f.guest.read_u64(f.guest.data) as i32
+    };
+
+    // The query the renderer met first: no id.
+    assert_eq!(run(b"type=AvatarHeadShot&id=&w=48&h=48&filters=circular"), 1);
+    assert_eq!(f.read_cstring(kind), b"AvatarHeadShot");
+    for (name, slot) in [("id", id), ("w", w), ("h", h)] {
+        assert_eq!(f.guest.read_u64(slot), 0x5A5A_5A5A_5A5A_5A5A, "`{name}` was not written");
+    }
+
+    // And with one.
+    assert_eq!(run(b"type=Asset&id=5000000000&w=420&h=36"), 4);
+    assert_eq!(f.read_cstring(kind), b"Asset");
+    assert_eq!(f.guest.read_u64(id), 5_000_000_000, "%lld: all eight bytes");
+    assert_eq!(f.guest.read_u64(w), 0x5A5A_5A5A_0000_01A4, "%d: four bytes, the next four kept");
+    assert_eq!(f.guest.read_u64(h) as u32, 36);
+}
+
 /// **`__strchr_chk` is `strchr` within a budget**: a match or the NUL inside it answers as
 /// `strchr` would, and a budget that runs out first is the fortify failure, reported by name.
 #[test]
@@ -2186,11 +2237,11 @@ fn the_unservable_printf_family_refuses_with_the_missing_piece_named() {
     let f = fixture();
     // **`fprintf` and `vfprintf` are no longer here**, and the churn is the test working: phase
     // 3b built the stream layer they named as missing, the refusal text was corrected to say so,
-    // and M3's gate bound them onto it. Three are left, and each names something that still does
-    // not exist rather than something that does.
+    // and M3's gate bound them onto it. **Nor is `sscanf`**: M6's renderer reached it and
+    // `omni_bionic::scanf` answers it (`sscanf_parses_the_renderers_thumbnail_query_...`). Two are
+    // left, and each names something that still does not exist rather than something that does.
     for (symbol, needle) in [
         ("vasprintf", "allocator"),
-        ("sscanf", "scanf"),
         ("fscanf", "scanf"),
     ] {
         let error = refusal_of(&f, symbol, |asm| {
@@ -11075,7 +11126,6 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
         // `fprintf` and `vfprintf` are bound as of M3's gate -- phase 3b built the stream layer
         // they named as missing, and Task 4 bound the formatting onto it.
         "vasprintf",
-        "sscanf",
         "fscanf",
         // phase 2: the one guest-memory call whose guarantee cannot be met
         "mlock",
@@ -11098,7 +11148,9 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
     // conditional refusal and belongs on the other side of the line, exactly as `getauxval`'s and
     // `sched_getcpu`'s do. `the_network_group_answers_once_the_embedding_has_said_what_it_may
     // _reach` is where their new contract is asserted, and it is asserted by calling them.
-    assert_eq!(refusals.len(), 8);
+    // **Seven**: `sscanf` answers since M6's renderer reached it, and is asserted to in
+    // `sscanf_parses_the_renderers_thumbnail_query_through_a_real_variadic_call`.
+    assert_eq!(refusals.len(), 7);
     for symbol in refusals {
         let error = refusal_of(&f, symbol, |asm| {
             for register in 0..6 {
@@ -11183,7 +11235,8 @@ fn the_final_split_of_the_reachable_set_is_what_the_record_claims() {
     let bound = Bionic::bound_symbols().count() - BEYOND_THE_PREDICTION.len();
     assert_eq!(bound, 168);
     let answered = bound - refusals.len() - 3;
-    assert_eq!(answered, 157, "157 answer, 8 refuse by name, 3 report a termination");
+    // `sscanf` moved from the refusals to the answers when M6's renderer reached it.
+    assert_eq!(answered, 158, "158 answer, 7 refuse by name, 3 report a termination");
     assert_eq!(
         answered + refusals.len() + 3 + omni_android::bionic::DATA_OBJECTS.len()
             + omni_android::bionic::ABSENT_SYMBOLS.len(),

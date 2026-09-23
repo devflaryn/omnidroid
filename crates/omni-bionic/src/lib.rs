@@ -91,6 +91,7 @@ pub mod shared_mem;
 pub mod signal;
 pub mod printf;
 pub mod rwlock;
+pub mod scanf;
 pub mod sem;
 pub mod sort;
 pub mod stdio;

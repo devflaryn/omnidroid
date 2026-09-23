@@ -207,6 +207,8 @@ BIONIC = [
 ]
 CPU = ["cargo", "test", "-p", "omni-cpu", "--no-fail-fast"]
 PLATFORM = ["cargo", "test", "-p", "omni-platform", "--no-fail-fast"]
+# The scanf engine and its adapter: the engine's own cases, and a real variadic guest call.
+SCANF = ["cargo", "test", "-p", "omni-bionic", "--test", "scanf_tests", "--no-fail-fast"]
 # The demand pager is policy in `omni-mem` driven by execution in `omni-cpu`, so a mutation of it
 # has to run both: its unit tests live with the code and its behavioural tests live with the guest
 # that provokes the faults. A row scoped to one of the two reported a MISS that was a gap in the
@@ -3102,6 +3104,39 @@ directory", ADAPTER_FILES,
      """        .split(|c: char| c == '.' || STORED_AS_STAND_IN.contains(&c))""",
      """        .split(|c: char| c == '.')""",
      PLATFORM),
+    # scanf: the return rule, the prefixes, the scanset, and where each value is written.
+    ("scanf-A1", "A", "an input failure after a conversion answers EOF instead of the count",
+     "crates/omni-bionic/src/scanf.rs",
+     """        result: if conversions == 0 { EOF } else { assigned },""",
+     """        result: EOF,""",
+     SCANF),
+    ("scanf-A2", "A", "a negated scanset is read as a plain one",
+     "crates/omni-bionic/src/scanf.rs",
+     """    let negate = format.get(f) == Some(&b'^');""",
+     """    let negate = false && format.get(f) == Some(&b'^');""",
+     SCANF),
+    ("scanf-A3", "A", "%lld is stored in four bytes",
+     "crates/omni-bionic/src/scanf.rs",
+     """            Length::Long | Length::Wide => 8,""",
+     """            Length::Long => 8,
+            Length::Wide => 4,""",
+     SCANF),
+    ("scanf-B1", "B", "%n is counted as an assignment",
+     "crates/omni-bionic/src/scanf.rs",
+     """                stores.push(Store::Int { value: at as u64, size: length.int_size() });""",
+     """                stores.push(Store::Int { value: at as u64, size: length.int_size() });
+                assigned += 1;""",
+     SCANF),
+    ("scanf-B2", "B", "a bare 0x keeps its x instead of giving it back",
+     "crates/omni-bionic/src/scanf.rs",
+     """    if matches!(field.last(), Some(b'x' | b'X')) {""",
+     """    if false && matches!(field.last(), Some(b'x' | b'X')) {""",
+     SCANF),
+    ("sscanf-A1", "A", "a scanned string is written without its NUL",
+     "crates/omni-android/src/bionic/format.rs",
+     """                terminated.push(0);""",
+     """                let _ = &mut terminated;""",
+     ANDROID),
     ("vkcompute-B1", "B", "a NULL base pipeline is resolved as a handle",
      "crates/omni-android/src/vulkan/shader.rs",
      """            if u64_at(80) == 0 { None } else { Some(vulkan.pipeline_token(at, CALL, u64_at(80))?) };""",

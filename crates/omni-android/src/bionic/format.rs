@@ -415,15 +415,69 @@ pub(super) fn vasprintf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 /// `int sscanf(const char *s, const char *fmt, ...)`
 ///
-/// There is no scanning engine. `omni-bionic`'s `printf` module formats and does not parse, and
-/// the conversions `sscanf` needs are not the ones `strtol` and `strtod` provide.
+/// [`omni_bionic::scanf::scan`] -- bionic's `vfscanf` rules -- runs on the two strings, and each
+/// value it produced is written through the **next** variadic pointer: one per conversion that was
+/// reached and not suppressed, `%n` included, in order. A conversion past the failure consumed no
+/// argument, so its pointer is neither read nor written, as on a device. A conversion the engine
+/// does not implement is refused before any pointer is read.
+///
+/// MEASURED: the renderer's thumbnail cache, `sscanf(query, "type=%[^&]&id=%lld&w=%d&h=%d", ...)`.
 pub(super) fn sscanf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    refuse(
-        c,
-        "there is no scanf conversion engine: omni-bionic's printf module formats and does not \
-         parse, and every plausible partial answer would write a wrong value through the \
-         guest's output pointers",
-    )
+    let state = active(c.symbol(), c.address())?;
+    let (input, fmt, consumed, overflow) = {
+        let mut a = c.args();
+        let input = a.next_u64()?;
+        let fmt = a.next_u64()?;
+        (input, fmt, a.consumed(), a.overflow())
+    };
+    let mut source = c.varargs(consumed, overflow, 2);
+    let result = {
+        let view = enter(c, &state);
+        scan_into(&view, input, fmt, &mut source)?
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// Scan the guest's `input` against its `fmt`, and write every value through the pointer the
+/// variadic list holds for it.
+fn scan_into(
+    view: &GuestView<'_>,
+    input: u64,
+    fmt: u64,
+    source: &mut impl VaSource,
+) -> AbiResult<i32> {
+    let text = guest_cstr(view, input, 0)?;
+    let format = guest_cstr(view, fmt, 1)?;
+    let scanned = omni_bionic::scanf::scan(&text, &format).map_err(|unsupported| {
+        view.refusal(format!(
+            "the format asks for `{}`, which this layer's scanf engine does not implement: {}",
+            unsupported.conversion, unsupported.why
+        ))
+    })?;
+    for store in &scanned.stores {
+        let pointer = source.next_u64()?;
+        let at = usize::try_from(pointer)
+            .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))?;
+        let bytes = match store {
+            omni_bionic::scanf::Store::Int { value, size } => value.to_le_bytes()[..*size].to_vec(),
+            omni_bionic::scanf::Store::Str(bytes) => {
+                let mut terminated = bytes.clone();
+                terminated.push(0);
+                terminated
+            }
+            omni_bionic::scanf::Store::Chars(bytes) => bytes.clone(),
+        };
+        view.mem().write_bytes(at, &bytes, Blame::new(view.symbol(), view.address(), 2))?;
+    }
+    Ok(scanned.result)
+}
+
+/// A guest C string's bytes, without its NUL.
+fn guest_cstr(view: &GuestView<'_>, at: u64, argument: usize) -> AbiResult<Vec<u8>> {
+    let address = usize::try_from(at)
+        .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))?;
+    view.mem().cstr(address, Blame::new(view.symbol(), view.address(), argument))
 }
 
 /// `int fscanf(FILE *stream, const char *fmt, ...)` — no scanning engine *and* no `FILE *`.
