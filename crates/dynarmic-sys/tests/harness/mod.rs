@@ -91,6 +91,10 @@ pub struct Ctx {
     pub reenter_step_result: Option<u32>,
     /// Test hook: halt with [`HALT_DONE`] from inside `call_svc`.
     pub halt_on_svc: bool,
+    /// Test hook: `SVC #1` sleeps this long on the host thread and returns without halting (so the
+    /// guest carries on); 0 leaves `SVC #1` like any other. Forces host context switches in the
+    /// middle of guest execution.
+    pub sleep_on_svc1_us: u64,
     /// Test hook: make `interpreter_fallback` behave as an interpreter that
     /// executed its `num_insns` instructions as no-ops -- advance the guest PC
     /// past them and do **not** halt -- so a test can see where execution goes
@@ -368,6 +372,10 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
     unsafe {
         with(ctx, (), |c| {
             c.svc.push(swi);
+            if swi == 1 && c.sleep_on_svc1_us != 0 {
+                std::thread::sleep(std::time::Duration::from_micros(c.sleep_on_svc1_us));
+                return;
+            }
             let jit = c.jit;
             if c.reenter_on_svc {
                 // Deliberate violation: guest code has reached a callback, and
@@ -553,6 +561,7 @@ impl Vm {
             reenter_result: None,
             reenter_step_result: None,
             halt_on_svc: true,
+            sleep_on_svc1_us: 0,
             fallback_skips: false,
             fallback_host_fpcr: 0,
             zero_invalidate_on_svc: false,
