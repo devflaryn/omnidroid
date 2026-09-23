@@ -872,7 +872,9 @@ fn remove_scratch_roots() {
     }
 }
 
-struct Scratch(PathBuf);
+/// The guest's root: a scratch directory removed with the run, or -- with `OMNI_DATA_DIR` --
+/// a directory that outlives it (the `bool`, which says not to remove it).
+struct Scratch(PathBuf, bool);
 
 impl Scratch {
     /// The directories the engine canonicalises. M4's gate measured this list; see its copy.
@@ -925,6 +927,22 @@ impl Scratch {
     fn new(tag: &str) -> Scratch {
         let mut at = std::env::temp_dir();
         at.push(format!("omni-m5-gate-{tag}-{}", std::process::id()));
+        // **OMNI_DATA_DIR=<dir>: the guest's storage outlives the run**, as a device's does -- off by
+        // default, where every run is a fresh install. What the app writes there stays, **which
+        // includes a signed-in session**: the reason to set it is that a sign-in made by a person
+        // in one interactive run (Quick Sign-in needs their own signed-in device) is still there
+        // for the next run. Nothing here reads or writes the session; the engine does.
+        if let Some(kept) = std::env::var_os("OMNI_DATA_DIR") {
+            let at = PathBuf::from(kept);
+            std::fs::create_dir_all(&at).expect("the persistent data directory");
+            let _ = writeln!(
+                std::io::stderr(),
+                "DATA DIR: {} is kept between runs (OMNI_DATA_DIR): it holds whatever the app \
+                 stores, a signed-in session included",
+                at.display()
+            );
+            return Self::populate(at, true);
+        }
         let _ = std::fs::remove_dir_all(&at);
         std::fs::create_dir_all(&at).expect("a scratch directory");
         // **Registered so that the watchdog's `exit` can still remove it.**
@@ -939,6 +957,13 @@ impl Scratch {
         if let Ok(mut held) = LEAKED_ON_EXIT.lock() {
             held.push(at.clone());
         }
+        Self::populate(at, false)
+    }
+
+    /// Lay out what a device's package manager and the app's Java side put in place before the
+    /// engine starts: the directories, the APK at its device path, the certificate
+    /// authorities -- idempotently, so a kept root is refreshed rather than refused.
+    fn populate(at: PathBuf, keep: bool) -> Scratch {
         for directory in Self::DIRECTORIES {
             std::fs::create_dir_all(at.join(directory)).expect("an app directory");
         }
@@ -947,7 +972,10 @@ impl Scratch {
         // STORED in the APK, and a device answers with a descriptor on `base.apk` and the
         // entry's offset -- so the guest must be able to open the real bytes at that path. This
         // was an empty placeholder while only its existence was read.
-        std::fs::hard_link(apk_path(), at.join(GUEST_APK.trim_start_matches('/')))
+        let apk_at = at.join(GUEST_APK.trim_start_matches('/'));
+        // A kept root already has one, possibly of an older APK: replace it.
+        let _ = std::fs::remove_file(&apk_at);
+        std::fs::hard_link(apk_path(), &apk_at)
             .expect("the real APK linked into the guest's root at its device path");
         // The certificate authorities, out of the APK and into the path the engine opens. See
         // `CA_BUNDLE_IN_APK` for why this is the host's job and why the bytes are the APK's own.
@@ -980,13 +1008,15 @@ impl Scratch {
             .expect("the client app settings, where the engine looks for them");
             println!("CLIENT APP SETTINGS (OMNI_CLIENT_APP_SETTINGS): {json}");
         }
-        Scratch(at)
+        Scratch(at, keep)
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.1 {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -2919,6 +2949,90 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         None => {
             let _ = writeln!(std::io::stderr(), "VULKAN: not bound ({GRAPHICS_GATE} unset)");
         }
+    }
+
+    // ---- the app is closed, as a device closes it --------------------------------------------
+    //
+    // **A person leaving the app** is, from the UI thread and in this order:
+    // `onWindowFocusChanged(false)`, `onPause`, the surface destroyed (`MainGameActivity`'s
+    // `surfaceDestroyed` clears the touch listener's surface flag first, then `super`), `onStop`.
+    // The glue hands each to the game thread and waits for it to be taken. `terminateNativeCode`
+    // (`onDestroy`) is not sent: it waits for `android_main` to return.
+    //
+    // MEASURED why: runs ended by stopping threads left the engine's session unclosed, and the next
+    // launch of a kept data directory (OMNI_DATA_DIR) took its inferred-crash path
+    // (`InferredCrash`, link 0x23834e4) and died on a reporter this runtime does not set up.
+    if window.is_some() && guest.bionic.live_guest_threads() > 0 {
+        if let Some(seam) = touch.as_mut() {
+            seam.set_surface_alive(false);
+        }
+        // **A close that does not finish is reported, then released.** The glue waits for the
+        // game thread to take each command; if it never does, this says where every guest thread
+        // is and stops them, which ends the glue's wait (its predicate loop exhausts the call's
+        // budget) so the run ends with a report rather than a hang. MEASURED first: gate95 sat
+        // nine minutes in `onSurfaceDestroyedNative` after the engine logged `APP_CMD_TERM_WINDOW`.
+        let close_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let close_done = Arc::clone(&close_done);
+            let boundary = Arc::clone(&guest.boundary);
+            let bionic = Arc::clone(&guest.bionic);
+            let image_base = guest.object.base;
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while std::time::Instant::now() < deadline {
+                    if close_done.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let mut out = std::io::stderr();
+                let _ = writeln!(out, "CLOSE WATCHDOG: the close did not finish in 20 s; every guest thread:");
+                for report in boundary.threads() {
+                    let _ = writeln!(
+                        out,
+                        "  thread {:#x}: {} {:?}, call site link {:#x}, {} crossings / {} exits",
+                        report.guest_thread,
+                        if report.crossings > report.exits { "INSIDE" } else { "in guest code after" },
+                        report.symbol,
+                        report.caller.wrapping_sub(image_base),
+                        report.crossings,
+                        report.exits
+                    );
+                }
+                let _ = writeln!(out, "  parked: {:?}", bionic.parked());
+                bionic.stop_guest_threads();
+            });
+        }
+        for (member, descriptor, tail) in [
+            ("onWindowFocusChangedNative", "(JZ)V", vec![GuestArg::Int(0)]),
+            ("onPauseNative", "(J)V", vec![]),
+            ("onSurfaceDestroyedNative", "(J)V", vec![]),
+            ("onStopNative", "(J)V", vec![]),
+        ] {
+            let target = native(member, descriptor);
+            let mut args = vec![GuestArg::Pointer(guest.jni.env_for(0)), GuestArg::Int(thiz), GuestArg::Int(native_code)];
+            args.extend(tail);
+            let result = {
+                let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                let _jni = guest.jni.activate().expect("publish the JNI instance");
+                let _ndk = guest.ndk.activate();
+                guest.boundary.call_guest(&mut cpu, member, target, &args, LIFECYCLE_BUDGET)
+            };
+            let _ = writeln!(
+                std::io::stderr(),
+                "CLOSE: {member} -> {}",
+                match &result {
+                    Ok(_) => "returned".to_string(),
+                    Err(error) => format!("{error}"),
+                }
+            );
+            if result.is_err() {
+                break;
+            }
+        }
+        close_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The game thread acts on each command after the glue has handed it over.
+        std::thread::sleep(std::time::Duration::from_secs(3));
     }
 
     // ---- teardown, which is not a formality --------------------------------------------------
