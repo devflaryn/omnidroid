@@ -72,6 +72,11 @@
 //! is handed a Linux input code for the key's position (`KeyEvent.getScanCode()`), and a layout's
 //! virtual-key code cannot be turned back into a position — the key that types `A` on AZERTY is
 //! the one QWERTY calls `Q`.
+//!
+//! The one place the host's translation **is** wanted is typed text, and it arrives separately,
+//! as [`WindowEvent::Text`]: what a key *types* depends on the layout, on dead keys and on an IME,
+//! all of which the host has already resolved and none of which a table of key numbers could
+//! reproduce.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -160,7 +165,9 @@ impl fmt::Display for PointerButton {
 /// **negative or past the client extent**: a pointer that leaves the window while a button is held
 /// keeps reporting, because that is what a drag is, and clamping here would turn a drag that ran
 /// off the edge into one that stopped at it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// **Not `Copy`**, because [`WindowEvent::Text`] owns its string. `Clone` is the spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WindowEvent {
     /// The client area's size in physical pixels changed.
@@ -229,6 +236,42 @@ pub enum WindowEvent {
         /// The physical key, as [`WindowEvent::KeyDown`] carries it.
         scancode: u32,
     },
+    /// The user typed text: the character the host's keyboard layout — and its IME, when one is
+    /// composing — made of the keys that were pressed.
+    ///
+    /// **This is the translated half of typing, and [`WindowEvent::KeyDown`] is the raw half.**
+    /// `KeyDown` says which key went down and deliberately not what it means (see this module's
+    /// "Keycodes are raw on purpose"). A text box needs the opposite, and it cannot be computed
+    /// from key numbers outside the host: it depends on the layout (the key QWERTY calls `Q` types
+    /// `a` on AZERTY), on dead keys (`^` then `e` is one `ê`), on AltGr, and on an IME's
+    /// composition. On Windows this is `WM_CHAR`, which `TranslateMessage` derives from the key
+    /// messages through the thread's active layout, and which `DefWindowProcW`'s default IME
+    /// handling produces for a committed composition.
+    ///
+    /// **One press that types is two events, key first.** `TranslateMessage` posts the `WM_CHAR`
+    /// while its key message is being pumped, and Win32 retrieves posted messages ahead of the next
+    /// input message, so the `Text` lands after its own `KeyDown` and before the next key. A
+    /// consumer feeding a text box takes the `Text`; one feeding key presses takes the `KeyDown`;
+    /// none should act on both as the same keystroke.
+    ///
+    /// **Control characters are not text.** A code unit below `0x20`, or `0x7F`, produces no event:
+    /// Backspace (`0x08`), Tab (`0x09`), Enter (`0x0D`), Escape (`0x1B`), Ctrl+letter
+    /// (`0x01`-`0x1A`) and Ctrl+Backspace (`0x7F`) are keys pressed for their effect, and each has
+    /// already arrived as a [`WindowEvent::KeyDown`]. Passing them on as characters as well would
+    /// insert a stray control code into a text box *and* have the consumer act on the key.
+    ///
+    /// **A character outside the Basic Multilingual Plane is one event.** `WM_CHAR` carries one
+    /// UTF-16 code unit, so an emoji arrives as two messages, a high surrogate and then a low one.
+    /// The high half is held — per window, in the window's own state — until the low half arrives,
+    /// and the pair becomes one `Text`. A surrogate without its partner is dropped: it is not a
+    /// character and has no UTF-8 spelling.
+    ///
+    /// So `text` is exactly one character today. It is a `String` rather than a `char` so that a
+    /// backend handed a committed string in one piece need not split it.
+    Text {
+        /// What was typed: never empty, valid UTF-8, and free of the control codes above.
+        text: String,
+    },
     /// The window gained or lost keyboard focus.
     ///
     /// GameActivity's `onWindowFocusChanged` is what this feeds, and the engine uses it to pause;
@@ -251,8 +294,9 @@ pub enum WindowEvent {
 ///   Win32 already coalesces these *in its own queue*; once drained into ours they would
 ///   accumulate again between polls, and only the newest position is a position.
 ///
-/// Nothing else coalesces, and the distinction is the point: a button press, a key press and a
-/// close request are each individually meaningful, and collapsing a run of them would lose input.
+/// Nothing else coalesces, and the distinction is the point: a button press, a key press, a typed
+/// character and a close request are each individually meaningful, and collapsing a run of them
+/// would lose input — two [`WindowEvent::Text`]s in a row are the user typing two characters.
 /// Coalescing also only ever collapses an event with the one **immediately** before it, so a move
 /// that happened before a click still sits before that click in the queue and the order the user
 /// produced is preserved.
@@ -604,15 +648,41 @@ mod tests {
             WindowEvent::KeyUp { keycode: 65, scancode: 0x1E },
             WindowEvent::CloseRequested,
             WindowEvent::FocusChanged { focused: true },
+            WindowEvent::Text { text: "a".to_owned() },
         ];
-        for event in repeated {
-            push_event(&mut queue, event);
-            push_event(&mut queue, event);
+        for event in &repeated {
+            push_event(&mut queue, event.clone());
+            push_event(&mut queue, event.clone());
         }
         assert_eq!(queue.len(), repeated.len() * 2, "queue was {queue:?}");
-        for (pair, event) in queue.chunks_exact(2).zip(repeated) {
-            assert_eq!(pair, [event, event], "{event:?} was collapsed and must not be");
+        for (pair, event) in queue.chunks_exact(2).zip(&repeated) {
+            let both = [event.clone(), event.clone()];
+            assert_eq!(pair, both, "{event:?} was collapsed and must not be");
         }
+    }
+
+    /// Typing is a sequence, and the queue must hand it over as one: every character kept, in the
+    /// order typed, each after the key that typed it. Distinct characters, so that a queue which
+    /// kept the right *number* of events but reordered or replaced them still fails.
+    #[test]
+    fn typed_text_is_never_collapsed_and_keeps_its_place_among_keys() {
+        let text = |t: &str| WindowEvent::Text { text: t.to_owned() };
+        let sequence = [
+            WindowEvent::KeyDown { keycode: 0x48, scancode: 0x23, repeat: false },
+            text("h"),
+            WindowEvent::KeyUp { keycode: 0x48, scancode: 0x23 },
+            text("é"),
+            text("😀"),
+            text("é"),
+            WindowEvent::PointerMoved { x: 1, y: 1 },
+            text("ç"),
+            WindowEvent::PointerMoved { x: 2, y: 2 },
+        ];
+        let mut queue = Vec::new();
+        for event in &sequence {
+            push_event(&mut queue, event.clone());
+        }
+        assert_eq!(queue, sequence, "typed text was collapsed, dropped or moved");
     }
 
     /// A move separated from another move by anything at all is two moves. This is the property

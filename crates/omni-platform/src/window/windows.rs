@@ -42,8 +42,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SW_MINIMIZE, SW_RESTORE,
     SW_SHOWNORMAL, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN,
+    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     WNDCLASSW, WS_OVERLAPPEDWINDOW, XBUTTON1,
 };
@@ -76,6 +76,12 @@ struct WindowState {
     /// Bit `n` is set while the `n`-th [`PointerButton`] is held. Drives `SetCapture`; see this
     /// module's point 3.
     buttons_down: u32,
+    /// The first half of a surrogate pair, held until the `WM_CHAR` carrying the second half
+    /// arrives. See [`text_from_char`].
+    ///
+    /// Per window rather than per thread or per process: one thread may own several windows, and
+    /// a half character typed into one must not be completed by a `WM_CHAR` sent to another.
+    high_surrogate: Option<u16>,
 }
 
 /// Declare per-monitor DPI awareness, once per process, before any window exists.
@@ -187,6 +193,34 @@ const fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
 const fn scancode_of(lparam: LPARAM) -> u32 {
     let make = ((lparam >> 16) & 0xff) as u32;
     if (lparam >> 24) & 1 != 0 { 0xE000 | make } else { make }
+}
+
+/// What one `WM_CHAR` is: the text it completes, if any. See [`WindowEvent::Text`].
+///
+/// `unit` is the message's `WPARAM`, which for this window is one UTF-16 code unit; `pending` is
+/// the window's [`WindowState::high_surrogate`].
+///
+/// * A high surrogate is held in `pending` and produces nothing yet.
+/// * A low surrogate completes a held high one into one character. With none held it is dropped.
+/// * Anything else is a character on its own, and it discards a held high surrogate, whose
+///   partner is now never coming: half a pair is not a character and has no UTF-8 spelling. A
+///   second high surrogate likewise replaces the first.
+/// * A C0 control code or DEL is then dropped; see [`WindowEvent::Text`] for why those are keys
+///   rather than text.
+///
+/// Total over `u16`: no unit panics, and anything returned is one valid, non-control character.
+fn text_from_char(pending: &mut Option<u16>, unit: u16) -> Option<String> {
+    let character = match (pending.take(), unit) {
+        (_, 0xD800..=0xDBFF) => {
+            *pending = Some(unit);
+            return None;
+        }
+        (Some(high), 0xDC00..=0xDFFF) => char::decode_utf16([high, unit]).next()?.ok()?,
+        // A lone low surrogate is not a Unicode scalar value, so `from_u32` refuses it.
+        _ => char::from_u32(u32::from(unit))?,
+    };
+    let control = character < ' ' || character == '\u{7F}';
+    (!control).then(|| character.to_string())
 }
 
 /// The window procedure.
@@ -305,12 +339,24 @@ unsafe extern "system" fn wnd_proc(
                 scancode: scancode_of(lparam),
             });
         }
+        WM_CHAR => {
+            // One UTF-16 code unit in the low 16 bits of the `WPARAM`: the class is registered
+            // with `RegisterClassW` and pumped with `PeekMessageW`/`DispatchMessageW`, so Win32
+            // hands this window the Unicode spelling of the character. The repeat count in the
+            // `LPARAM` is ignored, as `WM_KEYDOWN`'s is: one message, at most one character.
+            if let Some(text) = text_from_char(&mut state.high_surrogate, wparam as u16) {
+                push_event(&mut state.queue, WindowEvent::Text { text });
+            }
+            // Processed, which `WM_CHAR`'s contract says to report with 0.
+            return 0;
+        }
         _ => {}
     }
 
-    // Everything above except `WM_CLOSE` still wants the default behaviour: `WM_SIZE` and the
-    // focus messages have real work behind them, and swallowing the key messages would break
-    // `Alt+F4` and the system menu.
+    // Everything above except `WM_CLOSE` and `WM_CHAR` still wants the default behaviour:
+    // `WM_SIZE` and the focus messages have real work behind them, and swallowing the key
+    // messages would break `Alt+F4` and the system menu. (`WM_SYSCHAR`, a character typed with
+    // Alt held, is not text and is not named above, so it reaches `DefWindowProcW` as before.)
     // SAFETY: forwarding the arguments unchanged.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
@@ -396,6 +442,7 @@ impl Window {
             queue: Vec::new(),
             last_size: (u32::MAX, u32::MAX),
             buttons_down: 0,
+            high_surrogate: None,
         }));
 
         // `super::validate` has already bounded both axes to 1..=65535, so neither cast can
@@ -529,11 +576,13 @@ impl Window {
             if got == 0 {
                 break;
             }
-            // SAFETY: `msg` was just filled by `PeekMessageW`. `TranslateMessage` only posts
-            // `WM_CHAR` for key messages — unused today, and the reason it is here is that a
-            // backend without it makes character input silently impossible rather than merely
-            // unimplemented. `DispatchMessageW` re-enters `wnd_proc`, which is why no reference
-            // into `*self.state` is held across this call.
+            // SAFETY: `msg` was just filled by `PeekMessageW`. `TranslateMessage` posts `WM_CHAR`
+            // for a key message that types something, through the thread's keyboard layout, and
+            // that `WM_CHAR` is what becomes a `WindowEvent::Text` — without this call typed text
+            // is silently impossible. It is retrieved by a later iteration of this loop, after
+            // the key message it came from has been dispatched, which is what puts the `Text`
+            // behind its `KeyDown`. `DispatchMessageW` re-enters `wnd_proc`, which is why no
+            // reference into `*self.state` is held across this call.
             unsafe {
                 TranslateMessage(&raw const msg);
                 DispatchMessageW(&raw const msg);
@@ -656,5 +705,106 @@ mod tests {
         assert_eq!(scancode_of(0x001D_0001), 0x1D, "left Ctrl is not right Ctrl");
         assert_eq!(scancode_of(0x0148_0001), 0xE048, "the Up arrow, not keypad 8");
         assert_eq!(scancode_of(0xC011_0001_u32 as i32 as LPARAM), 0x11, "a key-up's high bits");
+    }
+
+    /// Feed `units` through one window's worth of `WM_CHAR` state, keeping every answer — the
+    /// `None`s included, so that a test also pins *which* message produced the text.
+    fn feed(units: &[u16]) -> Vec<Option<String>> {
+        let mut pending = None;
+        units.iter().map(|&unit| text_from_char(&mut pending, unit)).collect()
+    }
+
+    /// A character in the Basic Multilingual Plane is its own text, ASCII or not: `a`, `é`
+    /// (U+00E9), `ç` (U+00E7), `水` (U+6C34).
+    #[test]
+    fn a_bmp_character_is_its_own_text() {
+        assert_eq!(feed(&[0x61]), [Some("a".to_owned())]);
+        assert_eq!(feed(&[0xE9]), [Some("é".to_owned())]);
+        assert_eq!(feed(&[0xE7]), [Some("ç".to_owned())]);
+        assert_eq!(feed(&[0x6C34]), [Some("水".to_owned())]);
+        assert_eq!(feed(&[0x20]), [Some(" ".to_owned())], "space is text, not a control code");
+        assert_eq!(feed(&[0x7E]), [Some("~".to_owned())], "the unit just below DEL");
+    }
+
+    /// U+1F600 arrives as two `WM_CHAR`s, `0xD83D` then `0xDE00`, and is **one** event, from the
+    /// second message.
+    #[test]
+    fn a_surrogate_pair_is_one_character_from_its_second_half() {
+        assert_eq!(feed(&[0xD83D, 0xDE00]), [None, Some("😀".to_owned())]);
+        // And the pair leaves nothing behind: the next character is on its own again.
+        assert_eq!(feed(&[0xD83D, 0xDE00, 0x61]), [
+            None,
+            Some("😀".to_owned()),
+            Some("a".to_owned())
+        ]);
+    }
+
+    /// A low surrogate with no high one before it is not a character, and there is nothing it
+    /// could be joined to.
+    #[test]
+    fn a_lone_low_surrogate_is_dropped() {
+        assert_eq!(feed(&[0xDE00]), [None]);
+        assert_eq!(feed(&[0xDC00, 0x61]), [None, Some("a".to_owned())]);
+        assert_eq!(feed(&[0xDFFF]), [None]);
+    }
+
+    /// A high surrogate whose next unit is not a low one is dropped, and the next unit is judged on
+    /// its own: a character is text, a control code is still nothing, and another high surrogate
+    /// starts a pair of its own.
+    #[test]
+    fn a_high_surrogate_without_its_partner_is_dropped_and_the_next_unit_stands_alone() {
+        assert_eq!(feed(&[0xD83D, 0x61]), [None, Some("a".to_owned())]);
+        assert_eq!(feed(&[0xD83D, 0x0D]), [None, None]);
+        assert_eq!(feed(&[0xD83D, 0xD83D, 0xDE00]), [None, None, Some("😀".to_owned())]);
+        // Held forever is also dropped: the stream just ends.
+        assert_eq!(feed(&[0xDBFF]), [None]);
+    }
+
+    /// Every C0 control code and DEL are keys, not text — Backspace, Tab, Enter, Escape and the
+    /// Ctrl+letter codes among them — and so is none of them after a held high surrogate.
+    #[test]
+    fn control_codes_and_del_are_not_text() {
+        for unit in (0x00..=0x1F).chain([0x7F]) {
+            assert_eq!(feed(&[unit]), [None], "unit {unit:#04x} must not be text");
+            assert_eq!(feed(&[0xD83D, unit]), [None, None], "unit {unit:#04x} after a high half");
+        }
+    }
+
+    /// **The window procedure's `WM_CHAR` arm, end to end**: posted characters come out of
+    /// [`Window::poll`] as [`WindowEvent::Text`] — a surrogate pair as one, a control code and a
+    /// lone low surrogate as none — and behind the key posted before them.
+    ///
+    /// Posted rather than typed, so it needs neither a keyboard nor a particular layout. The key
+    /// is the Left arrow because `TranslateMessage` makes no character of it, so the only
+    /// `WM_CHAR`s the window sees are the ones posted here. Gated like `tests/window_live.rs`, and
+    /// for the same reason: it creates a real window.
+    #[test]
+    #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+    fn posted_characters_come_out_as_text_behind_the_key_before_them() {
+        assert!(
+            std::env::var("OMNI_GFX_WINDOW_TESTS").is_ok_and(|v| v == "1"),
+            "run with --ignored but OMNI_GFX_WINDOW_TESTS is not 1; this creates a real window"
+        );
+        let mut window = Window::create(&WindowDesc::new("omnidroid: text", 320, 240)).unwrap();
+        // Left arrow: VK_LEFT, make code 0x4B with the extended flag, repeat count 1.
+        let mut posts: Vec<(u32, WPARAM, LPARAM)> = vec![(WM_KEYDOWN, 0x25, 0x014B_0001)];
+        for unit in [0xE9, 0x0D, 0xD83D, 0xDE00, 0xDC00, 0xE7] {
+            posts.push((WM_CHAR, unit, 1));
+        }
+        for (msg, wparam, lparam) in posts {
+            // SAFETY: a live window handle and a message with no pointer arguments.
+            let posted = unsafe { PostMessageW(window.hwnd, msg, wparam, lparam) };
+            assert_ne!(posted, 0, "PostMessageW({msg:#x}, {wparam:#x}) failed");
+        }
+
+        let mut events = Vec::new();
+        window.poll(&mut events);
+        events.retain(|e| matches!(e, WindowEvent::KeyDown { .. } | WindowEvent::Text { .. }));
+        assert_eq!(events, [
+            WindowEvent::KeyDown { keycode: 0x25, scancode: 0xE04B, repeat: false },
+            WindowEvent::Text { text: "é".to_owned() },
+            WindowEvent::Text { text: "😀".to_owned() },
+            WindowEvent::Text { text: "ç".to_owned() },
+        ]);
     }
 }
