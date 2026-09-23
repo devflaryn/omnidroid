@@ -161,8 +161,8 @@ ROWS = [
     # reverts non-blocking mode.
     ("lnx-audio-A12", "A", "the PCM is opened blocking, so a write with no room never returns",
      LINUX_RS,
-     """SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)""",
-     """SND_PCM_STREAM_PLAYBACK, 0)""",
+     """request.device.as_ptr(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)""",
+     """request.device.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0)""",
      AUDIO),
 
     ("lnx-audio-A13", "A", "a non-blocking write of 0 frames is not treated as no room (spins)",
