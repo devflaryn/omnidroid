@@ -57,12 +57,10 @@
 //!
 //! # Scope
 //!
-//! Implemented and measured on Windows. On Linux and macOS every entry point returns
-//! [`FaultError::Unsupported`], exactly as [`vm`](crate::vm) does, so a build
-//! for those targets fails at the first call rather than appearing to work. The POSIX shape is a
-//! `SIGSEGV` handler with `SA_SIGINFO` reading `si_addr`, which is a different enough mechanism —
-//! signal-safety rules, no equivalent of "continue execution" beyond returning from the handler,
-//! and per-thread alternate stacks — that guessing at it here would be worse than leaving it typed.
+//! Implemented and measured on Windows and on Linux x86-64 (`fault/linux.rs`: a `SIGSEGV`/`SIGBUS`
+//! handler that re-asserts first place over dynarmic's, see [`reassert_precedence`]). On macOS
+//! every entry point returns [`FaultError::Unsupported`], exactly as [`vm`](crate::vm) does, so a
+//! build for that target fails at the first call rather than appearing to work.
 
 use crate::vm::OsError;
 
@@ -71,9 +69,14 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as backend;
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod unsupported;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use unsupported as backend;
 
 /// What the faulting instruction was trying to do.
@@ -208,6 +211,33 @@ pub enum FaultError {
         /// The code the OS returned.
         source: OsError,
     },
+
+    /// A POSIX signal disposition could not be read or installed (Linux).
+    #[error("`sigaction({signal})` failed: {source}")]
+    Signal {
+        /// The signal, e.g. `"SIGSEGV"`.
+        signal: &'static str,
+        /// The `errno` it failed with.
+        source: OsError,
+    },
+
+    /// Something in this process keeps installing its own handler over this module's (Linux).
+    ///
+    /// A POSIX signal has one disposition, so first place is held by re-asserting it
+    /// ([`reassert_precedence`]), and each re-assertion remembers the handler it displaced so a
+    /// declined fault can be passed on. That record is bounded, because it is read inside the
+    /// handler where nothing may allocate; running out means a fight over the disposition that
+    /// this module would otherwise be losing silently.
+    #[error(
+        "the {signal} disposition has been displaced {displacements} times; guest faults would \
+         reach whoever displaced it first, ahead of Omnidroid's demand pager"
+    )]
+    PrecedenceContested {
+        /// The signal, e.g. `"SIGSEGV"`.
+        signal: &'static str,
+        /// How many dispositions have been recorded.
+        displacements: usize,
+    },
 }
 
 impl FaultError {
@@ -259,6 +289,32 @@ pub unsafe fn install(
     context: usize,
 ) -> FaultResult<FaultRegistration> {
     backend::install(handler, context)
+}
+
+/// Put Omnidroid's handler back in **first place** if anything has installed a fault handler over
+/// it since, so that a guest fault still reaches the demand pager before anyone else.
+///
+/// On Windows first place is structural -- a vectored handler runs before every frame-based one --
+/// and this is a no-op. On Linux a signal has one disposition and the last `sigaction` wins, and
+/// dynarmic installs its own `SIGSEGV` handler lazily, when the **first** jit is built: after the
+/// pager, in front of it, and it never passes a fault in its code cache on. So `omni-cpu` calls
+/// this straight after building a jit. It is idempotent and cheap (one `sigaction` query per signal
+/// when nothing has changed), and a no-op before anything has been installed. See
+/// `fault/linux.rs` for the chain it builds and the loop it avoids.
+///
+/// # Errors
+///
+/// [`FaultError::Signal`] if the disposition cannot be read or set, and
+/// [`FaultError::PrecedenceContested`] if something keeps displacing it.
+pub fn reassert_precedence() -> FaultResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        backend::reassert_precedence()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
 }
 
 /// Dispatch counters. See [`FaultStats`].
