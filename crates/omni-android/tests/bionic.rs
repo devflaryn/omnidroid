@@ -556,6 +556,12 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          which on NTFS reserves the clusters.",
     ),
     (
+        "erfcf",
+        "M6, the renderer once its descriptor update templates existed: \"the guest called the \
+         imported symbol `erfcf` ... nothing in the compatibility layer implements it\". \
+         FreeBSD msun's s_erff.c, as bionic carries it, ported line for line.",
+    ),
+    (
         "ftell",
         "M6, the renderer's shader pack again, after fseek: \"the guest called the imported symbol \
          `ftell` ... nothing in the compatibility layer implements it\". bionic's ftell is ftello \
@@ -972,7 +978,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 296, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 297, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1061,8 +1067,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // for 279**: a worker, once the engine was creating its Vulkan device. **`recvmmsg`, for
     // 280**: the QUIC transport's receive side, once the device existed. **`fseek`, for 281**:
     // the renderer's shader pack, bound to `fseeko`, which it is on LP64. **`ftell`, for 282**:
-    // the same stream, bound to `ftello`.
-    assert_eq!(Bionic::inline_symbols().count(), 282);
+    // the same stream, bound to `ftello`. **`erfcf`, for 283**: the renderer, `s_erff.c` ported.
+    assert_eq!(Bionic::inline_symbols().count(), 283);
     assert_eq!(Bionic::reentrant_symbols().count(), 14);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -1760,6 +1766,36 @@ fn snprintf_formats_integers_strings_and_doubles_from_a_real_variadic_call() {
     let produced = String::from_utf8(f.read_cstring(out)).expect("ASCII output");
     assert_eq!(produced, "[-7] omni 1.50 0xabc");
     assert_eq!(written, produced.len() as i64, "snprintf returns the length it wrote");
+}
+
+/// **`snprintf` through a real variadic call takes `%u` from the slot's low 32 bits and `%ld` from
+/// all 64** -- the upper half of an `int`'s register is the caller's garbage (MEASURED: the
+/// engine's `%u` log arguments), and a `long` past 2^31 is a `long`.
+#[test]
+fn snprintf_takes_an_int_from_its_low_half_and_a_long_whole() {
+    let _guard = serialized();
+    let f = fixture();
+    let out = f.guest.data + 0x300;
+    let fmt = f.cstring(f.guest.data + 0x100, b"%u %ld %x");
+    let snprintf = f.thunk("snprintf");
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(22, f.guest.data as u64);
+    asm.mov(0, out as u64);
+    asm.mov(1, 64);
+    asm.mov(2, fmt as u64);
+    asm.mov(3, 0x1D0_0000_0100); // %u: 256, with garbage above it
+    asm.mov(4, 5_000_000_000); // %ld
+    asm.mov(5, 0xDEAD_0000_00AB); // %x: 0xab
+    asm.bl(snprintf);
+    asm.push(str_imm(0, 22, 0));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+    let mut cpu = f.guest.thread(&f.boundary);
+    f.run(&mut cpu, entry).expect("the run must complete");
+    let produced = String::from_utf8(f.read_cstring(out)).expect("ASCII output");
+    assert_eq!(produced, "256 5000000000 ab");
 }
 
 /// **`__strchr_chk` is `strchr` within a budget**: a match or the NUL inside it answers as
@@ -8694,7 +8730,8 @@ fn recvmmsg_receives_one_datagram_per_entry_as_recvmsg_would() {
             f.guest.write_u64(iov + 24, 64);
             f.guest.write_bytes(entry, &[0u8; 64]);
             f.guest.write_u64(entry, (names + 16 * k) as u64);
-            f.guest.write_u64(entry + 8, 16);
+            // Room for a `sockaddr_in6`, so the 16 an IPv4 sender writes back is visible.
+            f.guest.write_u64(entry + 8, 28);
             f.guest.write_u64(entry + 16, iov as u64);
             f.guest.write_u64(entry + 24, 2);
             f.guest.write_u64(entry + 40, 99);
@@ -8726,7 +8763,7 @@ fn recvmmsg_receives_one_datagram_per_entry_as_recvmsg_would() {
         assert_eq!(read_guest(&f, buffer, head), &text[..head], "the first iovec {k}");
         assert_eq!(read_guest(&f, buffer + 0x80, text.len() - head), &text[head..], "the second {k}");
         assert_eq!(read_guest(&f, names + 16 * k, 16), sender_name, "msg_name {k}");
-        assert_eq!(f.guest.read_u64(entry + 8) as u32, 16, "msg_namelen {k}");
+        assert_eq!(f.guest.read_u64(entry + 8) as u32, 16, "msg_namelen {k}: the sender's length");
         assert_eq!(f.guest.read_u64(entry + 40), 0, "msg_controllen {k}");
         assert_eq!(f.guest.read_u64(entry + 48) as u32, 0, "msg_flags {k}");
     }

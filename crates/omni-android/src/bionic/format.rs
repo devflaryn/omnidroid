@@ -136,9 +136,10 @@ fn collect(
     for (index, kind) in kinds.iter().enumerate() {
         let argument = first_variadic + index;
         owned.push(match kind {
-            // A variadic `int` occupies a whole 64-bit slot and the caller is not required to
-            // clear the high half, so it is taken as 64 bits and narrowed here.
-            ArgKind::Int => Owned::Int(source.next_u64()? as u32 as i32 as i64),
+            // A variadic integer occupies a whole 64-bit slot and is taken whole: **whether it is
+            // an `int` or a `long` is the length modifier's to say**, and the core narrows by it.
+            // Narrowing here printed every `%ld` of a value past 2^31 wrong.
+            ArgKind::Int => Owned::Int(source.next_u64()? as i64),
             ArgKind::UInt => Owned::UInt(source.next_u64()?),
             ArgKind::Ptr => Owned::Ptr(source.next_u64()?),
             ArgKind::Double => Owned::Double(source.next_f64()?),

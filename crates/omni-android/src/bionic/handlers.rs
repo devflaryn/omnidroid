@@ -475,6 +475,8 @@ handlers! {
     fn atanf(x: f32) -> f32 = |v| omni_bionic::libm::atanf(&mut v, x);
     /// `cbrtf`
     fn cbrtf(x: f32) -> f32 = |v| omni_bionic::libm::cbrtf(&mut v, x);
+    /// `erfcf`: sets no `errno`, as bionic's does not.
+    fn erfcf(x: f32) -> f32 = |v| omni_bionic::libm::erfcf(x);
     /// `cos`
     fn cos(x: f64) -> f64 = |v| omni_bionic::libm::cos(&mut v, x);
     /// `cosh`
@@ -1518,6 +1520,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("frexpf", frexpf),
     ("round", round),
     ("nextafterf", nextafterf),
+    ("erfcf", erfcf),
     ("ldexp", ldexp),
     ("sincosf", sincosf),
     // wide characters
