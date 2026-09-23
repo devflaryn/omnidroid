@@ -308,6 +308,13 @@ fn keys_carry_the_virtual_key_and_the_physical_set1_code_and_type_text() {
     // Command held: a shortcut, not typing.
     send_key(ns_window, true, 0x00, "a", 1 << 20);
     assert_eq!(drain(&mut window), vec![WindowEvent::KeyDown { keycode: 0x00, scancode: 0x1E, repeat: false }]);
+    // Keys whose characters are control codes or Apple's function-key range: pressed for their
+    // effect, never text -- Control+Q (0x11), Escape, Tab, F13 (U+F710).
+    for (key, characters, flags) in [(0x0C_u16, "\u{11}", 1_u64 << 18), (0x35, "\u{1b}", 0), (0x30, "\t", 0), (0x69, "\u{F710}", 0)] {
+        send_key(ns_window, true, key, characters, flags);
+        let texts: Vec<WindowEvent> = drain(&mut window).into_iter().filter(|e| matches!(e, WindowEvent::Text { .. })).collect();
+        assert_eq!(texts, vec![], "kVK {key:#04x} typed {characters:?}");
+    }
 }
 
 /// Modifiers arrive as `flagsChanged:`, and the device-dependent bit decides down or up per side.
