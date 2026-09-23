@@ -431,6 +431,22 @@ impl Window {
         self.inner.client_size()
     }
 
+    /// The dots per inch the host's display scaling gives this window: 96 at 100%, 144 at 150%.
+    ///
+    /// **The host fact a guest's display density comes from.** It is the scale the user chose for
+    /// the monitor the window is on -- logical rather than physical, which is also what Android's
+    /// `densityDpi` is -- and it follows the window between monitors, because the process is
+    /// per-monitor DPI aware. MEASURED why it matters: with a display density of 0 the engine
+    /// divides by it and sizes a render target from the infinity.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::LastError`] if `GetDpiForWindow` answered 0; [`WindowError::Unsupported`] on
+    /// the structural backends.
+    pub fn dpi(&self) -> WindowResult<u32> {
+        self.inner.dpi()
+    }
+
     /// Resize the window so that its **client area** becomes `width` x `height` physical pixels.
     ///
     /// # Why this exists, given that the user resizes the window by dragging it

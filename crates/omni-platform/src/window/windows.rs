@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -552,6 +552,18 @@ impl Window {
             (rect.right - rect.left).unsigned_abs(),
             (rect.bottom - rect.top).unsigned_abs(),
         ))
+    }
+
+    /// `GetDpiForWindow`: the window's DPI under this process's per-monitor awareness.
+    pub(super) fn dpi(&self) -> WindowResult<u32> {
+        // SAFETY: reads only the window handle, which is live.
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        if dpi == 0 {
+            // SAFETY: no arguments, and `GetDpiForWindow` is the last call this thread made.
+            let code = unsafe { GetLastError() };
+            return Err(WindowError::LastError { operation: "dpi", api: "GetDpiForWindow", code });
+        }
+        Ok(dpi)
     }
 
     /// `ShowWindow(SW_MINIMIZE)` or `ShowWindow(SW_RESTORE)`.

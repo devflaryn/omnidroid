@@ -99,6 +99,11 @@ impl Window {
     }
 
     /// Unreachable, as [`Window::show`].
+    pub(super) fn dpi(&self) -> WindowResult<u32> {
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
     pub(super) fn set_client_size(
         &self,
         width: u32,

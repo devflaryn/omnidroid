@@ -90,6 +90,18 @@ fn poll_until(
     }
 }
 
+/// **A window reports the DPI the host's display scaling gives it** -- at least the 96 of 100%,
+/// Windows' floor -- which is where a guest's display density comes from. (Not a multiple of the
+/// 25% steps: custom scaling takes any percentage.)
+#[test]
+#[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+fn a_window_reports_its_displays_dpi() {
+    require_gate();
+    let window = Window::new(&WindowDesc::new("omnidroid: dpi", 320, 240)).unwrap();
+    let dpi = window.dpi().unwrap();
+    assert!(dpi >= 96, "the scaling floor is 100% = 96 DPI, not {dpi}");
+}
+
 #[test]
 #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
 fn a_new_window_reports_the_client_size_it_was_asked_for() {
