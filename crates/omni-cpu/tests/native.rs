@@ -490,3 +490,371 @@ fn a_thread_that_exits_gives_its_vcpu_back() {
     assert_eq!(during, before + 1, "the thread made one vCPU");
     assert_eq!(vm.live_vcpus(), before, "and its exit destroyed it");
 }
+
+// ------------------------------------------------------------------------------------- the M2 gate
+//
+// The same three real `libroblox.so` functions `tests/roblox.rs` runs on the translating backend,
+// with the same words asserted and the same predictions, derived from what the functions *mean*.
+// The constants and models are copied from there verbatim (a test file is not a module another
+// can import); the words are re-asserted against the loaded image here, so a drift in either copy
+// fails.
+
+use harness::roblox::{cached_main_lib, main_lib_bytes};
+use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
+use omni_elf::{ElfImage, LoadedObject};
+use omni_mem::{Backing, MapExecutability};
+
+const BASE64_SEXTET: u64 = 0x2c1_1e34;
+#[rustfmt::skip]
+const BASE64_SEXTET_WORDS: [u32; 26] = [
+    0x7100_ac3f, 0x5400_00a0, 0x7100_bc3f, 0x5400_00a1, 0x5280_07e0, 0xd65f_03c0,
+    0x5280_07c0, 0xd65f_03c0, 0x5101_0420, 0x7100_681f, 0x5400_0042, 0xd65f_03c0,
+    0x5101_8428, 0x7100_651f, 0x5400_0068, 0x5101_1c20, 0xd65f_03c0, 0x5100_c028,
+    0x7100_251f, 0x5400_0068, 0x1100_1020, 0xd65f_03c0, 0x7100_f43f, 0x1280_0028,
+    0x1a88_1500, 0xd65f_03c0,
+];
+const TIMEVAL_TO_MILLIS: u64 = 0x222_7844;
+#[rustfmt::skip]
+const TIMEVAL_TO_MILLIS_WORDS: [u32; 29] = [
+    0xd28a_7ec9, 0xcb02_0008, 0xf2b4_bc69, 0xf2d8_9369, 0xf2e0_0409, 0xeb09_011f,
+    0x5400_006d, 0x92f0_0000, 0xd65f_03c0, 0xd295_8149, 0xf2ab_4389, 0xf2c7_6c89,
+    0xf2ff_fbe9, 0xeb09_011f, 0x5400_006a, 0xd2f0_0000, 0xd65f_03c0, 0x4b03_0029,
+    0x5289_ba6a, 0x5280_7d0b, 0x110f_9d29, 0x72a2_0c4a, 0x9b0b_7d08, 0x9b2a_7d29,
+    0xd37f_fd2a, 0x9366_fd29, 0x0b0a_0129, 0x8b29_c100, 0xd65f_03c0,
+];
+const STACK_GUARD_LEAF: u64 = 0x287_2aac;
+#[rustfmt::skip]
+const STACK_GUARD_LEAF_WORDS: [u32; 15] = [
+    0xd100_83ff, 0xa901_7bfd, 0x9100_43fd, 0xd53b_d048, 0xf940_1509, 0xf900_07e9,
+    0xf940_1508, 0xf940_07e9, 0xeb09_011f, 0x5400_00a1, 0x52a0_0040, 0xa941_7bfd,
+    0x9100_83ff, 0xd65f_03c0, 0x94e9_8f3b,
+];
+const STACK_GUARD_LEAF_RESULT: u64 = 0x20000;
+const STACK_GUARD_RELOAD_OFFSET: usize = 6 * 4;
+/// The failure tail's `BL __stack_chk_fail`, word 14 of the leaf.
+const STACK_GUARD_FAIL_CALL_OFFSET: usize = 14 * 4;
+const REAL_LSE_ATOMIC: u64 = 0x2b9_e630;
+const REAL_LSE_ATOMIC_WORD: u32 = 0x88a0_7c41;
+const STACK_BYTES: usize = 256 * 1024;
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn predicted_sextet(c: u8) -> i32 {
+    if let Some(i) = BASE64_ALPHABET.iter().position(|&a| a == c) {
+        return i as i32;
+    }
+    if c == b'=' {
+        -1
+    } else {
+        -2
+    }
+}
+
+fn movz_movk_immediate(words: &[u32]) -> u64 {
+    let mut value = 0u64;
+    for (i, &w) in words.iter().enumerate() {
+        let want = if i == 0 { 0xD280_0000 } else { 0xF280_0000 };
+        assert_eq!(w & 0xFF80_0000, want, "word {i} is not the MOVZ/MOVK this decoding assumes");
+        value |= u64::from((w >> 5) & 0xFFFF) << (16 * ((w >> 21) & 0x3));
+    }
+    value
+}
+
+fn seconds_limit() -> i64 {
+    let w = &TIMEVAL_TO_MILLIS_WORDS;
+    let decoded = movz_movk_immediate(&[w[0], w[2], w[3], w[4]]) as i64;
+    assert_eq!(decoded, (i64::MAX - 1000) / 1000);
+    assert_eq!(movz_movk_immediate(&[w[9], w[10], w[11], w[12]]) as i64, -decoded);
+    decoded
+}
+
+fn predicted_millis(sec_a: i64, usec_a: i32, sec_b: i64, usec_b: i32) -> i64 {
+    let limit = seconds_limit();
+    let seconds = sec_a.wrapping_sub(sec_b);
+    if seconds > limit {
+        return i64::MAX;
+    }
+    if seconds < -limit {
+        return i64::MIN;
+    }
+    let micros = usec_a.wrapping_sub(usec_b).wrapping_add(999);
+    seconds.wrapping_mul(1000).wrapping_add(i64::from(micros / 1000))
+}
+
+/// The real library, loaded and relocated through the production path, in a guest space the native
+/// backend can attach (below 64 GiB, which the default placement gives on this host).
+struct NativeRoblox {
+    space: Arc<GuestSpace>,
+    backend: NativeBackend,
+    object: LoadedObject,
+    stack_top: GuestAddr,
+    sentinel: GuestAddr,
+    _backing: Arc<Backing>,
+}
+
+impl NativeRoblox {
+    /// `None` only when the APK is absent, which `cached_main_lib` reports loudly on stderr.
+    fn load() -> Option<Self> {
+        let path = cached_main_lib()?;
+        let bytes = main_lib_bytes()?;
+        let backing = Backing::open(path, MapExecutability::Executable).expect("open the cache entry");
+        let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let object = loader::load(
+            &space,
+            &backing,
+            &elf,
+            &ProviderRegistry::empty_provider(),
+            &LoaderConfig::default(),
+        )
+        .expect("libroblox.so must load");
+        let page = space.page_size();
+        let stack = space
+            .map_anonymous(Placement::Anywhere { align: page }, STACK_BYTES, Protection::ReadWrite, CommitPolicy::Lazy)
+            .expect("a guest stack");
+        // An executable page of zeroes: its first word is `UDF #0`, so the sentinel traps with
+        // nothing planted in it.
+        let sentinel = space
+            .map_anonymous(Placement::Anywhere { align: page }, page, Protection::ReadExecute, CommitPolicy::Eager)
+            .expect("a sentinel page");
+        let backend = NativeBackend::new(Arc::clone(&space), NativeOptions::default())
+            .unwrap_or_else(|e| panic!("the native backend over the loaded library: {e}"));
+        Some(Self {
+            space,
+            backend,
+            object,
+            stack_top: (stack + STACK_BYTES) & !0xF,
+            sentinel,
+            _backing: backing,
+        })
+    }
+
+    fn at(&self, vaddr: u64) -> GuestAddr {
+        self.object.base + vaddr as usize
+    }
+
+    fn thread(&self) -> NativeCpu {
+        let mut cpu = self.backend.create_thread_with_tls().expect("a guest thread");
+        cpu.set_return_sentinel(self.sentinel).expect("arm the sentinel");
+        self.rearm(&mut cpu);
+        cpu
+    }
+
+    fn rearm(&self, cpu: &mut NativeCpu) {
+        cpu.set_sp(self.stack_top);
+        cpu.set_x(x(30), self.sentinel as u64);
+    }
+
+    fn word_at(&self, address: GuestAddr) -> u32 {
+        let ptr = self.space.ptr(address, 4).expect("a host pointer");
+        // SAFETY: a mapped range of the loaded image; no guest is running.
+        unsafe { ptr.cast::<u32>().read_unaligned() }
+    }
+
+    fn read_u64(&self, address: GuestAddr) -> u64 {
+        let ptr = self.space.ptr(address, 8).expect("a host pointer");
+        // SAFETY: as `word_at`.
+        unsafe { ptr.cast::<u64>().read_unaligned() }
+    }
+
+    fn write_u64(&self, address: GuestAddr, value: u64) {
+        let ptr = self.space.ptr(address, 8).expect("a host pointer");
+        // SAFETY: as `word_at`.
+        unsafe { ptr.cast::<u64>().write_unaligned(value) }
+    }
+
+    fn unmapped(&self) -> GuestAddr {
+        self.space
+            .regions()
+            .into_iter()
+            .find(|r| r.is_free() && r.len >= self.space.page_size())
+            .map(|r| (r.start + r.len / 2) & !0xF)
+            .expect("some free address space")
+    }
+
+    fn assert_words(&self, vaddr: u64, expected: &[u32]) {
+        for (i, &want) in expected.iter().enumerate() {
+            assert_eq!(self.word_at(self.at(vaddr) + i * 4), want, "{vaddr:#x}+{:#x}", i * 4);
+        }
+    }
+
+    fn call(&self, cpu: &mut NativeCpu, entry: GuestAddr) -> ExitReason {
+        self.rearm(cpu);
+        cpu.run(entry, RunLimit::Unlimited).expect("the guest ran")
+    }
+}
+
+#[test]
+fn m2_gate_natively_a_real_roblox_function_computes_the_base64_alphabet() {
+    let _serial = serialized();
+    let Some(roblox) = NativeRoblox::load() else { return };
+    roblox.assert_words(BASE64_SEXTET, &BASE64_SEXTET_WORDS);
+    let entry = roblox.at(BASE64_SEXTET);
+    let mut cpu = roblox.thread();
+    for c in 0u8..=255 {
+        cpu.set_x(x(0), 0xDEAD_BEEF_DEAD_BEEF);
+        cpu.set_x(x(1), u64::from(c));
+        assert_eq!(roblox.call(&mut cpu, entry), ExitReason::Returned { pc: roblox.sentinel }, "{c:#04x}");
+        assert_eq!(cpu.x(x(0)), u64::from(predicted_sextet(c) as u32), "base64 value of {c:#04x}");
+    }
+    assert_eq!((0u8..=255).filter(|&c| predicted_sextet(c) >= 0).count(), 64);
+    assert_eq!(cpu.exit_counts().vector, 256, "one exit per call: the sentinel, and nothing else");
+}
+
+#[test]
+fn m2_gate_natively_a_real_roblox_function_converts_a_timeval_difference() {
+    let _serial = serialized();
+    let Some(roblox) = NativeRoblox::load() else { return };
+    roblox.assert_words(TIMEVAL_TO_MILLIS, &TIMEVAL_TO_MILLIS_WORDS);
+    let entry = roblox.at(TIMEVAL_TO_MILLIS);
+    let mut cpu = roblox.thread();
+    let limit = seconds_limit();
+    let vectors: [(i64, i32, i64, i32); 18] = [
+        (0, 0, 0, 0),
+        (5, 250_000, 3, 100_000),
+        (3, 0, 5, 0),
+        (0, 0, 0, 1),
+        (0, 1_000, 0, 0),
+        (0, 0, 0, 1_000),
+        (0, 0, 0, 2_000),
+        (0, 999, 0, 0),
+        (0, 1, 0, 0),
+        (1, 500_000, 0, 999_999),
+        (-4, 250_000, 7, -125_000),
+        (limit, 0, 0, 0),
+        (limit + 1, 0, 0, 0),
+        (-limit, 0, 0, 0),
+        (-limit - 1, 0, 0, 0),
+        (0, i32::MAX, 0, 0),
+        (0, i32::MIN, 0, 0),
+        (0, i32::MIN, 0, i32::MAX),
+    ];
+    for (sec_a, usec_a, sec_b, usec_b) in vectors {
+        cpu.set_x(x(0), sec_a as u64);
+        cpu.set_x(x(1), u64::from(usec_a as u32));
+        cpu.set_x(x(2), sec_b as u64);
+        cpu.set_x(x(3), u64::from(usec_b as u32));
+        assert_eq!(roblox.call(&mut cpu, entry), ExitReason::Returned { pc: roblox.sentinel });
+        assert_eq!(
+            cpu.x(x(0)) as i64,
+            predicted_millis(sec_a, usec_a, sec_b, usec_b),
+            "({sec_a}, {usec_a}) - ({sec_b}, {usec_b})"
+        );
+    }
+    assert_eq!(predicted_millis(limit + 1, 0, 0, 0), i64::MAX);
+    assert_eq!(predicted_millis(-limit - 1, 0, 0, 0), i64::MIN);
+}
+
+/// D13 on real engine code, in the three directions `tests/roblox.rs` checks -- the second without
+/// a breakpoint (this backend has none): the first, real call leaves its canary on the frame, the
+/// guard is changed, and the function is resumed at its second read of the guard with the frame it
+/// built.
+#[test]
+fn m2_gate_natively_real_guest_code_reads_the_thread_pointer_and_finds_the_stack_guard() {
+    let _serial = serialized();
+    let Some(roblox) = NativeRoblox::load() else { return };
+    roblox.assert_words(STACK_GUARD_LEAF, &STACK_GUARD_LEAF_WORDS);
+    let entry = roblox.at(STACK_GUARD_LEAF);
+
+    // One: the guard matches and the function returns its constant.
+    let mut cpu = roblox.thread();
+    let (tp, guard) = {
+        let tls = cpu.tls().expect("a TLS block");
+        (tls.thread_pointer(), tls.stack_guard())
+    };
+    assert_ne!(guard, 0);
+    assert_eq!(roblox.read_u64(tp + 0x28), guard);
+    assert_eq!(roblox.call(&mut cpu, entry), ExitReason::Returned { pc: roblox.sentinel });
+    assert_eq!(cpu.x(x(0)), STACK_GUARD_LEAF_RESULT);
+
+    // Two: the canary the real call stored is still on its (popped) frame at SP - 0x20 + 8.
+    let frame = roblox.stack_top - 0x20;
+    assert_eq!(roblox.read_u64(frame + 8), guard, "the real call stored the canary on its frame");
+    roblox.write_u64(tp + 0x28, !guard);
+    cpu.set_sp(frame);
+    cpu.set_x(x(8), tp as u64);
+    cpu.set_x(x(30), roblox.sentinel as u64);
+    let exit = cpu.run(entry + STACK_GUARD_RELOAD_OFFSET, RunLimit::Unlimited).expect("ran");
+    // The failure tail's BL goes through the PLT to an import bound to null (no provider): a jump
+    // to address 0, which is a typed fault -- and X30 says it came from the failure tail's BL.
+    assert_eq!(exit, ExitReason::MemoryFault { pc: 0, address: 0, access: AccessKind::Execute });
+    assert_eq!(
+        cpu.x(x(30)) as GuestAddr,
+        entry + STACK_GUARD_FAIL_CALL_OFFSET + 4,
+        "the guard changed under the function, so it must have called __stack_chk_fail"
+    );
+    roblox.write_u64(tp + 0x28, guard);
+
+    // Three: the thread pointer at nothing faults at exactly +0x28.
+    let mut cpu = roblox.thread();
+    let nowhere = roblox.unmapped();
+    cpu.set_tpidr_el0(nowhere);
+    assert_eq!(
+        roblox.call(&mut cpu, entry),
+        ExitReason::MemoryFault { pc: entry + 4 * 4, address: nowhere + 0x28, access: AccessKind::Read }
+    );
+}
+
+/// The real LSE atomic `tests/roblox.rs` reports as unimplemented on the translating backend is
+/// executed here -- the word itself, copied out of the loaded image and run with a known operand.
+#[test]
+fn m2_gate_natively_the_real_lse_atomic_dynarmic_cannot_run_executes() {
+    let _serial = serialized();
+    let Some(roblox) = NativeRoblox::load() else { return };
+    let word = roblox.word_at(roblox.at(REAL_LSE_ATOMIC));
+    assert_eq!(word, REAL_LSE_ATOMIC_WORD, "CAS W0, W1, [X2]");
+    let guest = Native::new();
+    let (mut cpu, sentinel) = guest.thread();
+    let entry = guest.load(&[word, ret(30)]);
+    guest.write_u64(guest.data, 0x1234);
+    cpu.set_x(x(0), 0x1234);
+    cpu.set_x(x(1), 0x5678);
+    cpu.set_x(x(2), guest.data as u64);
+    assert_eq!(run(&mut cpu, entry), ExitReason::Returned { pc: sentinel });
+    assert_eq!((cpu.x(x(0)), guest.read_u64(guest.data)), (0x1234, 0x5678));
+}
+
+#[test]
+fn m2_gate_natively_real_code_returning_into_nothing_is_a_typed_fault() {
+    let _serial = serialized();
+    let Some(roblox) = NativeRoblox::load() else { return };
+    let entry = roblox.at(BASE64_SEXTET);
+    let nowhere = roblox.unmapped() & !3;
+    let mut cpu = roblox.thread();
+    cpu.set_x(x(1), u64::from(b'Q'));
+    cpu.set_x(x(30), nowhere as u64);
+    let exit = cpu.run(entry, RunLimit::Unlimited).expect("a fault is an exit");
+    assert_eq!(exit, ExitReason::MemoryFault { pc: nowhere, address: nowhere, access: AccessKind::Execute });
+    assert_eq!(cpu.x(x(0)), u64::from(predicted_sextet(b'Q') as u32));
+}
+
+#[test]
+fn m2_gate_natively_execution_is_repeatable_across_threads_and_gives_vcpus_back() {
+    let _serial = serialized();
+    let Some(roblox) = NativeRoblox::load() else { return };
+    let roblox = Arc::new(roblox);
+    let vm = omni_platform::hypervisor::Vm::get().expect("the VM");
+    let vcpus = vm.live_vcpus();
+    let failures = vm.stage2_stats().failures;
+    let workers: Vec<_> = (0..8)
+        .map(|t| {
+            let roblox = Arc::clone(&roblox);
+            std::thread::spawn(move || {
+                let entry = roblox.at(BASE64_SEXTET);
+                let mut cpu = roblox.thread();
+                for i in 0..1_000 {
+                    let c = BASE64_ALPHABET[(i + t) % 64];
+                    cpu.set_x(x(1), u64::from(c));
+                    assert_eq!(roblox.call(&mut cpu, entry), ExitReason::Returned { pc: roblox.sentinel });
+                    assert_eq!(cpu.x(x(0)), u64::from(predicted_sextet(c) as u32), "thread {t} call {i}");
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("a worker");
+    }
+    assert_eq!(vm.live_vcpus(), vcpus, "eight threads came and went and left no vCPU behind");
+    assert_eq!(vm.stage2_stats().failures, failures);
+}
