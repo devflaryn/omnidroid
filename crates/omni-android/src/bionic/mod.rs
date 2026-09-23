@@ -106,12 +106,19 @@ pub use view::{
 
 /// How many guest threads one instance can give a block to.
 ///
-/// **A policy number, and stated as one.** This phase binds no thread lifecycle at all —
-/// `pthread_create` is a later phase — so the guest has exactly the threads the host started for
-/// it, which is a handful. 64 blocks cost [`ARENA_BYTES`] of address space and one commit
-/// granule, and a 65th thread is a refusal naming the symbol rather than a second thread
-/// writing the first one's `errno`.
-pub const MAX_GUEST_THREADS: usize = 64;
+/// **A policy number, and stated as one.** A thread past it is `pthread_create`'s `EAGAIN`, which
+/// is what a device answers at its own limit -- never a second thread writing the first one's
+/// `errno`. Each costs [`THREAD_BLOCK_BYTES`] of the eagerly-committed arena (see
+/// [`ARENA_GRANULES`]) and, in the backend, a lazily-committed TLS block and one exclusive-monitor
+/// slot.
+///
+/// **It was 64, from a phase that bound no thread lifecycle** and gave the guest a handful of
+/// threads. MEASURED what that cost (2026-09-23): the first joins to load a world ran past it --
+/// `RBXCRASH: UnhandledException (std::system_error thread constructor failed: Unknown error 11)`,
+/// `EAGAIN` from `pthread_create` turned into an exception nothing caught, then the crash handler's
+/// `raise(SIGTRAP)` and a hung session. A device's limit is the kernel's, in the thousands; 256 is
+/// four times what a loaded world was measured running past, at 848 bytes a block.
+pub const MAX_GUEST_THREADS: usize = 256;
 
 /// Bytes of the arena set aside for objects that outlive a call and belong to no thread.
 ///
@@ -128,7 +135,17 @@ pub const POOL_BYTES: usize = 4096;
 
 /// How many `FILE` objects one instance can hand out beyond the three standard streams.
 ///
-/// **A policy number, and it is the ONE that the commit granule chose rather than a preference.**
+/// **512, bounded by the descriptors behind them rather than by the arena.** Bionic allocates
+/// streams on demand, so on a device the only stream limit is the descriptor limit; this one
+/// stays below [`omni_platform::fs::MAX_OPEN_FILES`] (the `const _` under it), so the descriptor
+/// table is what answers first, as there. MEASURED why it moved (2026-09-23): a game join's asset
+/// caches -- `WriteOnlyBuffer` (`cache/wob`, `cache/http-wob`) and `FileCache`
+/// (`cache/rbx-storage`) -- failed to open files with `errno=24` over three hundred times in
+/// one session while the descriptor table held about sixty: the stream table was full at 16.
+///
+/// # What it was, and why
+///
+/// **16, a policy number the commit granule chose rather than a preference.**
 /// Each costs [`FILE_BYTES`] of the arena and one entry in the stream table, and the three
 /// standard streams do not come out of it — they live in `__sF`, which the boundary already
 /// placed. A `fopen` past this is `EMFILE`, which is what a real device reports when a process
@@ -140,14 +157,15 @@ pub const POOL_BYTES: usize = 4096;
 /// commit would silently have cost a **second** granule per instance and the comment justifying
 /// that exception to D10 ("never commit speculatively") would have been false. Nothing else would
 /// have noticed: the charge is real but small, and no test measured it. Sixteen slots gives
-/// 64 × 848 + 4096 + 16 × 152 + 16 × 280 = **65,280**. The relation is pinned by
-/// `the_arena_fits_in_one_commit_granule`, which compares against the constant rather than a
-/// literal, so a re-measured granule moves this with it.
+/// 64 × 848 + 4096 + 16 × 152 + 16 × 280 = **65,280**. The relation was pinned by
+/// `the_arena_fits_in_one_commit_granule`, now `the_arena_spans_the_granules_bionic_new_states`,
+/// which still compares against the constant rather than a literal, so a re-measured granule
+/// moves the stated cost with it.
 ///
-/// It is also smaller than [`omni_platform::fs::MAX_OPEN_FILES`] on purpose: a descriptor is
-/// cheaper than a stream, and a guest holding sixteen streams open during static initialisation
-/// is doing something this layer wants to hear about.
-pub const MAX_GUEST_FILES: usize = 16;
+/// It was also smaller than [`omni_platform::fs::MAX_OPEN_FILES`] on purpose, and still is: a
+/// descriptor is cheaper than a stream. The granule argument above no longer holds -- see
+/// [`ARENA_GRANULES`] for what the arena costs now and why it is still committed eagerly.
+pub const MAX_GUEST_FILES: usize = 512;
 
 /// How many directory streams one instance can hand out.
 ///
@@ -173,6 +191,20 @@ pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
     + POOL_BYTES
     + MAX_GUEST_FILES * FILE_BYTES
     + MAX_GUEST_DIRS * DIRENT_BYTES;
+
+/// The commit granules the arena is allowed to span: **5** (327,680 bytes at the measured 64 KiB
+/// granule), against the 303,488 bytes [`ARENA_BYTES`] comes to.
+///
+/// **What the eager commit costs, stated.** Until 2026-09-23 the arena fit one granule, so
+/// committing it eagerly cost exactly what lazy commit would and D10's "never commit
+/// speculatively" was not bent at all. At 256 threads and 512 streams it is five granules, so up
+/// to four are committed before anything uses them: **at most 256 KiB per instance**, against a
+/// guest that was measured using 3.3-3.75 GB. What eager still buys is unchanged -- the first
+/// `errno` write on a new thread, and the first `FILE` a stream hands out, cannot fail for a
+/// commit reason inside a handler, where there is no good way to retry. `the_arena_spans_the_
+/// granules_bionic_new_states` pins the bound, so a table added later has to move this number
+/// and this sentence with it.
+pub const ARENA_GRANULES: usize = 5;
 
 /// The longest a single guest `nanosleep` or `usleep` may block a host thread.
 ///
@@ -532,16 +564,16 @@ impl Bionic {
     /// [`AbiError::Memory`] if the arena could not be mapped.
     pub fn new(space: Arc<GuestSpace>) -> AbiResult<Arc<Self>> {
         // Eager rather than lazy, and the exception to D10's "never commit speculatively" is
-        // stated rather than assumed: the arena is [`ARENA_BYTES`], which is under one commit
-        // granule (`omni_mem::DEFAULT_COMMIT_GRANULE`, a figure D10 measured rather than chose),
-        // so lazy and eager cost exactly the same commit charge here. Eager
-        // buys that the first `errno` write on a new thread cannot fail for a commit reason
-        // inside a handler, where there is no good way to retry.
+        // stated rather than assumed: the arena is [`ARENA_BYTES`] within [`ARENA_GRANULES`]
+        // commit granules (`omni_mem::DEFAULT_COMMIT_GRANULE`, a figure D10 measured rather than
+        // chose), which costs at most four granules more than lazy commit would -- see
+        // [`ARENA_GRANULES`]. Eager buys that the first `errno` write on a new thread cannot fail
+        // for a commit reason inside a handler, where there is no good way to retry.
         //
-        // `the_arena_fits_in_one_commit_granule` asserts the "under one granule" half, because
-        // that is the part which stops being true when a phase adds a table. Phase 3b added two --
-        // the `FILE` objects and the `struct dirent` slots -- taking the arena from **58,368**
-        // bytes to **65,280**.
+        // `the_arena_spans_the_granules_bionic_new_states` asserts the bound, because that is the
+        // part which stops being true when a phase adds a table. Phase 3b added two -- the `FILE`
+        // objects and the `struct dirent` slots -- taking the arena from **58,368** bytes to
+        // **65,280**, one granule; 256 threads and 512 streams took it to **303,488** (2026-09-23).
         //
         // The number this comment used to give was "17 KiB", which was right when D20 wrote it
         // (64 blocks x 272 bytes = 17,408) and had been wrong since **phase 2**, which widened the
@@ -555,10 +587,9 @@ impl Bionic {
             CommitPolicy::Eager,
         )?;
         // **A second mapping, and it is not part of the arena on purpose.** `addrinfo`'s module
-        // documentation has the whole argument: the arena is 65,280 bytes of a 65,536-byte commit
-        // granule and `the_arena_fits_in_one_commit_granule` is what makes its eager commit free,
-        // so a slab worth having cannot go in it. An eager mapping commits its own length rather
-        // than a granule, so this costs `ADDRINFO_SLAB_BYTES` and leaves that invariant alone.
+        // documentation has the argument, which was made when the arena was one granule: an eager
+        // mapping commits its own length rather than a granule, so this costs
+        // `ADDRINFO_SLAB_BYTES` and leaves the arena's bound where [`ARENA_GRANULES`] puts it.
         //
         // Mapped here for the arena's reason, which is F9: `getaddrinfo` is an inline handler and
         // a handler may not map guest memory.
@@ -2161,9 +2192,8 @@ impl Drop for Bionic {
         // give it back is not reportable from `drop` and is not worth aborting over: the space
         // itself is about to go, and the commit charge goes with it.
         let _ = self.space.unmap(self.arena, ARENA_BYTES);
-        // The resolver slab is a second mapping for the reason `addrinfo` gives -- the arena is
-        // 65,280 bytes of a 65,536-byte commit granule and a slab worth having does not fit -- so
-        // it is given back separately. It has to be given back at all: a guest that resolved and
+        // The resolver slab is a second mapping for the reason `addrinfo` gives, so it is given
+        // back separately. It has to be given back at all: a guest that resolved and
         // never freed still holds nothing after this, because the mapping is gone with it.
         let _ = self.space.unmap(self.addrinfo.base(), ADDRINFO_SLAB_BYTES);
     }
@@ -2272,24 +2302,33 @@ static REENTRANT: &[(&str, ReentrantFn)] = handlers::REENTRANT;
 mod tests {
     use super::*;
 
-    /// The arena is one commit granule, which is what makes eagerly committing it free.
+    /// The arena spans no more than [`ARENA_GRANULES`] commit granules, which is the cost of
+    /// committing it eagerly that `Bionic::new` and [`ARENA_GRANULES`] state.
     ///
     /// **The assertion that stops being true quietly.** `Bionic::new` commits the whole arena
-    /// eagerly and justifies it by "lazy and eager cost the same when it is under one granule"
-    /// (D10 forbids committing speculatively otherwise). Phase 3b added two tables to it — the
-    /// `FILE` objects and the `struct dirent` slots — and a third would be the one that makes the
-    /// justification false without changing a line of the code that gives it.
+    /// eagerly and justifies the cost in so many granules (D10 forbids committing speculatively
+    /// otherwise). It was "one granule, so eager is free" until the thread and stream tables grew
+    /// for a loaded world (2026-09-23); a table added later is what would make the stated cost
+    /// false without changing a line of the code that gives it.
     #[test]
-    fn the_arena_fits_in_one_commit_granule() {
+    fn the_arena_spans_the_granules_bionic_new_states() {
         // **The granule is a MEASURED quantity and is referenced rather than restated.** D10 set
         // it by measurement (4 KiB measured *worse* than the VEH fault it rejected), and
         // `omni_mem::DEFAULT_COMMIT_GRANULE` is where that number lives. A literal here would be
         // a fourth copy of a figure this project's own rule says appears once.
         let granule = omni_mem::DEFAULT_COMMIT_GRANULE;
         assert!(
-            ARENA_BYTES <= granule,
-            "the arena is {ARENA_BYTES} bytes against a commit granule of {granule}: eagerly \
-             committing it is no longer free, and `Bionic::new`'s exception to D10 no longer holds"
+            ARENA_BYTES <= ARENA_GRANULES * granule,
+            "the arena is {ARENA_BYTES} bytes against {ARENA_GRANULES} commit granules of \
+             {granule}: eagerly committing it costs more than `Bionic::new` and ARENA_GRANULES say"
+        );
+        // And the bound is not slack: one granule fewer would not hold the arena, so the stated
+        // cost is the arena's and not a round number above it.
+        assert!(
+            ARENA_BYTES > (ARENA_GRANULES - 1) * granule,
+            "the arena is {ARENA_BYTES} bytes, which fits {} granules: ARENA_GRANULES overstates \
+             the eager commit",
+            ARENA_GRANULES - 1
         );
         // The two ceiling relations are compile-time assertions beside the constants they
         // relate, because both sides are constants; see `MAX_GUEST_DIRS` and the `const _` under

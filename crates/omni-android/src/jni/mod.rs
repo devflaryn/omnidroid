@@ -74,14 +74,18 @@ use pool::Pool;
 use refs::Handles;
 use values::Value;
 
-/// How many threads one instance can hand a `JNIEnv` to.
+/// How many threads one instance can hand a `JNIEnv` to: **as many as bionic has thread blocks**
+/// ([`MAX_GUEST_THREADS`](crate::bionic::MAX_GUEST_THREADS)), so the two ceilings cannot disagree.
 ///
-/// **A policy number.** Each costs eight bytes of the arena. The startup path uses one; the game
-/// thread `GameActivity_onCreate` spawns is the second, and the engine's worker pools are M8's
-/// problem. A thread past this gets a refusal naming the function rather than a second thread
-/// sharing the first one's `JNIEnv`, which is the shape that makes two threads share one pending
-/// exception.
-pub const MAX_JNI_THREADS: usize = 64;
+/// **A policy number.** Each costs eight bytes of the arena, which stays one page at 256 (257
+/// cells, 233 `JNIEnv` slots and 8 `JavaVM` slots: 3,984 bytes). A thread past this gets a refusal
+/// naming the function rather than a second thread sharing the first one's `JNIEnv`, which is the
+/// shape that makes two threads share one pending exception.
+///
+/// It was 64, set when "the engine's worker pools are M8's problem". MEASURED (2026-09-23): with
+/// bionic's thread table raised to 256 for a loaded world, the next join's worker pool (start
+/// routine link `0x601021c`) ran past 64 `JNIEnv`s and a dozen of its threads died on this refusal.
+pub const MAX_JNI_THREADS: usize = crate::bionic::MAX_GUEST_THREADS;
 
 /// How many lookups [`Jni::lookups`] keeps.
 pub const MAX_LOOKUPS: usize = 512;
@@ -1771,6 +1775,48 @@ mod tests {
         // Distinct per thread, which is what JNI requires and what keeps one thread's pending
         // exception out of another's.
         assert_ne!(jni.env_for(0), jni.env_for(1));
+    }
+
+    /// **A loaded world's threads each get an env of their own: 128 live at once**, twice the 64
+    /// this instance used to hold. MEASURED why: with bionic's thread table at 256, a join's worker
+    /// pool (start routine link `0x601021c`) ran past 64 `JNIEnv`s and its threads died on the
+    /// refusal (2026-09-23). The count is a literal on purpose: a test written against
+    /// [`MAX_JNI_THREADS`] alone would pass a revert to 64.
+    #[test]
+    fn a_loaded_worlds_threads_each_get_an_env_of_their_own() {
+        const AT_ONCE: usize = 128;
+        let jni = instance();
+        let ready = Arc::new(std::sync::Barrier::new(AT_ONCE + 1));
+        let done = Arc::new(std::sync::Barrier::new(AT_ONCE + 1));
+        let (tell, slots) = std::sync::mpsc::channel::<Option<usize>>();
+        let handles: Vec<_> = (0..AT_ONCE)
+            .map(|_| {
+                let (jni, ready, done) = (Arc::clone(&jni), Arc::clone(&ready), Arc::clone(&done));
+                let tell = tell.clone();
+                std::thread::spawn(move || {
+                    let published = jni.thread_instance().publish();
+                    let slot = published
+                        .as_ref()
+                        .ok()
+                        .and_then(|_| active_opt().map(|(_, index)| index));
+                    tell.send(slot).expect("sent");
+                    ready.wait();
+                    done.wait();
+                    drop(published);
+                })
+            })
+            .collect();
+        ready.wait();
+        done.wait();
+        for handle in handles {
+            handle.join().expect("each thread finishes");
+        }
+        drop(tell);
+        let slots: Vec<Option<usize>> = slots.iter().collect();
+        assert_eq!(slots.len(), AT_ONCE);
+        assert!(slots.iter().all(Option::is_some), "a live thread was refused an env: {slots:?}");
+        let distinct: std::collections::BTreeSet<_> = slots.iter().flatten().collect();
+        assert_eq!(distinct.len(), AT_ONCE, "{AT_ONCE} live threads, {AT_ONCE} distinct envs");
     }
 
     /// **A created guest thread's `JNIEnv` slot comes back when the thread ends**, and a new thread

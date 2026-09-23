@@ -26,11 +26,12 @@
 //!
 //! # Why it is its own mapping rather than a fifth arena table
 //!
-//! [`ARENA_BYTES`](super::ARENA_BYTES) is **65,280** bytes against `omni_mem`'s measured 65,536-byte
-//! commit granule, and `the_arena_fits_in_one_commit_granule` exists because that is what makes
-//! `Bionic::new`'s eager commit free — D10 forbids committing speculatively otherwise. There are
-//! 256 bytes spare, which is three `addrinfo` nodes, so a slab worth having cannot go in the
-//! arena without making that justification false.
+//! When this was written [`ARENA_BYTES`](super::ARENA_BYTES) was **65,280** bytes against
+//! `omni_mem`'s measured 65,536-byte commit granule, which is what made `Bionic::new`'s eager
+//! commit free -- D10 forbids committing speculatively otherwise -- and there were 256 bytes spare,
+//! three `addrinfo` nodes. The arena has since grown to five granules for a loaded world's threads
+//! and streams ([`ARENA_GRANULES`](super::ARENA_GRANULES) states that cost); the slab stays
+//! separate because its own length is all it needs to commit.
 //!
 //! An eagerly-committed mapping commits **its own length** rather than a granule
 //! (`omni_mem::DEFAULT_MAX_COMMIT_REQUEST` says so in as many words), so a separate

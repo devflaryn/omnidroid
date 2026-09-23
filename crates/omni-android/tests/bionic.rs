@@ -3069,6 +3069,46 @@ fn the_thread_arena_refuses_rather_than_sharing_a_block() {
     assert_eq!(bionic.attached(), MAX_GUEST_THREADS);
 }
 
+/// **A loaded world's threads fit: 128 at once, twice the 64 blocks the arena used to hold**, each
+/// with a block of its own. MEASURED why: the first joins to load a world ran past 64 --
+/// `RBXCRASH: UnhandledException (std::system_error thread constructor failed: Unknown error 11)`,
+/// `pthread_create`'s `EAGAIN` -- and the session hung behind the crash handler (2026-09-23). The
+/// count is a literal on purpose: a test written against `MAX_GUEST_THREADS` alone would pass a
+/// revert to 64.
+#[test]
+fn a_loaded_worlds_threads_each_get_a_block_of_their_own() {
+    const AT_ONCE: usize = 128;
+    let _guard = serialized();
+    let guest = Guest::new();
+    let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
+    let ready = Arc::new(std::sync::Barrier::new(AT_ONCE + 1));
+    let done = Arc::new(std::sync::Barrier::new(AT_ONCE + 1));
+    let blocks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    for _ in 0..AT_ONCE {
+        let bionic = Arc::clone(&bionic);
+        let (ready, done, blocks) = (Arc::clone(&ready), Arc::clone(&done), Arc::clone(&blocks));
+        handles.push(std::thread::spawn(move || {
+            let active = bionic.activate();
+            let id = active.is_ok().then(|| bionic.current_thread().expect("an identity").0);
+            blocks.lock().expect("the block list").push(id);
+            ready.wait();
+            done.wait();
+            drop(active);
+        }));
+    }
+    ready.wait();
+    assert_eq!(bionic.attached(), AT_ONCE, "every one of the {AT_ONCE} threads holds a block");
+    done.wait();
+    for handle in handles {
+        handle.join().expect("each thread finishes");
+    }
+    let blocks = blocks.lock().expect("the block list");
+    assert!(blocks.iter().all(Option::is_some), "a thread was refused a block: {blocks:?}");
+    let distinct: std::collections::BTreeSet<_> = blocks.iter().flatten().collect();
+    assert_eq!(distinct.len(), AT_ONCE, "{AT_ONCE} threads, {AT_ONCE} distinct pthread_t values");
+}
+
 /// Every attached thread gets its **own** block, and the blocks do not overlap. One `errno` slot
 /// shared between two threads is the failure this arena exists to prevent.
 #[test]
@@ -6906,6 +6946,71 @@ fn the_descriptor_and_stream_ceilings_report_emfile_rather_than_growing() {
         }),
         0
     );
+}
+
+/// **A loaded world's streams fit -- far more than the 16 the stream table used to hold, all at
+/// once -- and the table's own ceiling is still `EMFILE`**, at `MAX_GUEST_FILES`, below the
+/// descriptor table's. MEASURED why: a game join's asset caches (`WriteOnlyBuffer`, `FileCache`)
+/// failed to open files with `errno=24` over three hundred times in one session while about sixty
+/// descriptors were open (2026-09-23). The floor is a literal on purpose: a test written against
+/// the constant alone would pass a revert to 16.
+#[test]
+fn a_loaded_worlds_streams_fit_and_the_stream_ceiling_is_still_emfile() {
+    use omni_android::bionic::MAX_GUEST_FILES;
+    let _guard = serialized();
+    let (f, scratch) = rooted("stream-capacity");
+    std::fs::write(scratch.path("c"), b"x").expect("a file");
+    let path = f.cstring(f.guest.data + 0x100, b"/c");
+    let mode = f.cstring(f.guest.data + 0x140, b"r");
+    let out = f.guest.data + 0x400;
+    // `fopen`, answering (the stream, errno after a failure) from one guest program, assembled
+    // once and run for every stream: five hundred programs would not fit the code region.
+    let entry = program(&f, |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, mode as u64);
+        asm.bl(f.thunk("fopen"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    let fopen = || {
+        assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+        (f.guest.read_u64(out), f.guest.read_u64(out + 8))
+    };
+
+    let mut streams = Vec::new();
+    let errno = loop {
+        let (stream, errno) = fopen();
+        if stream == 0 {
+            break errno;
+        }
+        streams.push(stream);
+        assert!(streams.len() <= MAX_GUEST_FILES, "the stream ceiling never fired");
+    };
+    assert!(
+        streams.len() >= 256,
+        "a loaded world's caches ran past 16 streams at once; only {} opened",
+        streams.len()
+    );
+    assert_eq!(streams.len(), MAX_GUEST_FILES, "every slot is handed out, and no more");
+    assert_eq!(errno, 24, "the stream table's own ceiling is EMFILE, Linux's 24");
+    let distinct: std::collections::BTreeSet<u64> = streams.iter().copied().collect();
+    assert_eq!(distinct.len(), streams.len(), "each stream is its own FILE object");
+    let close = program(&f, |asm| {
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 16));
+        asm.bl(f.thunk("fclose"));
+        asm.push(str_imm(0, 22, 0));
+    });
+    for stream in streams {
+        f.guest.write_u64(out + 16, stream);
+        assert!(matches!(run_program(&f, close).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(f.guest.read_u64(out) as i32, 0, "fclose");
+    }
+    // And the slots come back: a stream opens again once they are closed.
+    assert_ne!(fopen().0, 0, "a closed stream's slot is reused");
 }
 
 // =================================================================== thread lifecycle (phase 3c)

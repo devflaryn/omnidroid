@@ -319,6 +319,14 @@ BIONIC_AUXV = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bi
                "getauxval"]
 LIBM_SINCOS = ["cargo", "test", "-p", "omni-bionic", "--release", "--test", "libm_tests", "--no-fail-fast",
                "sincos_"]
+# A loaded world's capacity: the thread and stream tables from guest-facing tests, the JNI env
+# table and the arena's stated granules from the lib's unit tests. No APK.
+CAPACITY_BIONIC = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+                   "a_loaded_worlds"]
+CAPACITY_JNI = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast",
+                "a_loaded_worlds"]
+CAPACITY_ARENA = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast",
+                  "the_arena_spans"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -1809,7 +1817,7 @@ MUTATIONS = [
 
     ("adapter-B3", "B", "the thread arena tightened below a thread count the runtime uses",
      ADAPTER_MOD,
-     """pub const MAX_GUEST_THREADS: usize = 64;""",
+     """pub const MAX_GUEST_THREADS: usize = 256;""",
      """pub const MAX_GUEST_THREADS: usize = 4;""",
      ANDROID),
 
@@ -7527,6 +7535,33 @@ directory", ADAPTER_FILES,
      """    let (s, c) = if x.is_infinite() {
         (f64::NAN, f64::NAN)""",
      LIBM_SINCOS),
+
+    # A loaded world's capacity (the first joins to load Pet Simulator 99's world, 2026-09-23).
+    ("capacity-A1", "A", "the thread table back to 64 blocks",
+     "crates/omni-android/src/bionic/mod.rs",
+     "pub const MAX_GUEST_THREADS: usize = 256;",
+     "pub const MAX_GUEST_THREADS: usize = 64;",
+     CAPACITY_BIONIC),
+    ("capacity-A2", "A", "the stream table back to 16 FILEs",
+     "crates/omni-android/src/bionic/mod.rs",
+     "pub const MAX_GUEST_FILES: usize = 512;",
+     "pub const MAX_GUEST_FILES: usize = 16;",
+     CAPACITY_BIONIC),
+    ("capacity-A3", "A", "the JNIEnv table back to 64, apart from bionic's thread table",
+     "crates/omni-android/src/jni/mod.rs",
+     "pub const MAX_JNI_THREADS: usize = crate::bionic::MAX_GUEST_THREADS;",
+     "pub const MAX_JNI_THREADS: usize = 64;",
+     CAPACITY_JNI),
+    ("capacity-A4", "A", "the arena's stated granules understate its eager commit",
+     "crates/omni-android/src/bionic/mod.rs",
+     "pub const ARENA_GRANULES: usize = 5;",
+     "pub const ARENA_GRANULES: usize = 4;",
+     CAPACITY_ARENA),
+    ("capacity-B1", "B", "the arena's stated granules overstate its eager commit",
+     "crates/omni-android/src/bionic/mod.rs",
+     "pub const ARENA_GRANULES: usize = 5;",
+     "pub const ARENA_GRANULES: usize = 6;",
+     CAPACITY_ARENA),
 
 ]
 
