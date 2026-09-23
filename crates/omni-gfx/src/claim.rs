@@ -71,6 +71,13 @@ impl WindowKey {
         WindowKey(hwnd as u64)
     }
 
+    /// The key for an AppKit window, which is its content view (`NSView *`): the object whose
+    /// `CAMetalLayer` a swapchain presents to, unique among live views in the process.
+    #[must_use]
+    pub const fn appkit(ns_view: isize) -> WindowKey {
+        WindowKey(ns_view as u64)
+    }
+
     /// The key as the number it is, for a diagnostic.
     #[must_use]
     pub const fn raw(self) -> u64 {

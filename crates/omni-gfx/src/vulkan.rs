@@ -46,6 +46,7 @@ use ash::vk;
 use omni_platform::window::RawWindow;
 
 use crate::claim;
+use crate::portability;
 use crate::error::{GfxError, GfxResult};
 use crate::image::Rgba8Image;
 use crate::select::{self, PresentMode};
@@ -121,6 +122,11 @@ pub struct DeviceReport {
     pub available_layers: Vec<String>,
     /// Whether `VK_LAYER_KHRONOS_validation` was found and enabled.
     pub validation_enabled: bool,
+    /// **What a portability implementation leaves out**, by the specification's feature names:
+    /// `None` for a device that is not one (every native driver), otherwise the
+    /// `VkPhysicalDevicePortabilitySubsetFeaturesKHR` members it reports false. Everything it
+    /// reports true is enabled on the device, and nothing else is.
+    pub portability_gaps: Option<Vec<&'static str>>,
 }
 
 /// One in-flight frame's own objects.
@@ -303,12 +309,9 @@ impl Renderer {
     /// Every one of those leaves nothing behind; see this module's `Base` for how, and for why it is worth a
     /// type rather than nine teardown paths nobody runs.
     pub fn new(window: RawWindow, extent: (u32, u32), config: RendererConfig) -> GfxResult<Self> {
-        // SAFETY: `Entry::load` dlopen's the Vulkan loader. It is unsafe because the library it
-        // finds is arbitrary host code; there is no way to make loading a driver safe, and this is
-        // the one call in this crate whose safety rests on the host being sane rather than on
-        // anything this code does.
-        let entry = unsafe { ash::Entry::load() }
-            .map_err(|err| GfxError::LoaderMissing { detail: err.to_string() })?;
+        // `Entry::load()` where the platform names no loader locations, which is the Windows
+        // behaviour unchanged; otherwise each location in turn. See `crate::portability`.
+        let entry = portability::load_entry().map_err(|detail| GfxError::LoaderMissing { detail })?;
 
         // **The window is claimed before anything is created on it**, so that a conflict with
         // `omni_gfx`'s other Vulkan stack -- or with the guest's -- is a named refusal rather than
@@ -318,7 +321,7 @@ impl Renderer {
             |claimed| GfxError::WindowInUse { owner: claimed.owner, window: claimed.window.raw() },
         )?;
 
-        let (instance, available_layers, validation_enabled) = create_instance(&entry)?;
+        let (instance, available_layers, validation_enabled, features2) = create_instance(&entry, window)?;
         let surface_fn = khr::surface::Instance::new(&entry, &instance);
         // From here on, every `?` unwinds through `Base::drop`.
         let mut base = Base { surface: vk::SurfaceKHR::null(), surface_fn, instance, entry };
@@ -326,17 +329,25 @@ impl Renderer {
 
         let PickedDevice { physical_device, graphics_family, present_family, name, device_type } =
             pick_physical_device(&base.instance, &base.surface_fn, base.surface)?;
-        let report = DeviceReport {
+        let mut report = DeviceReport {
             name,
             device_type,
             graphics_family,
             present_family,
             available_layers,
             validation_enabled,
+            portability_gaps: None,
         };
 
-        let device =
-            create_device(&base.instance, physical_device, graphics_family, present_family)?;
+        let (device, portability_gaps) = create_device(
+            &base.entry,
+            &base.instance,
+            physical_device,
+            graphics_family,
+            present_family,
+            features2,
+        )?;
+        report.portability_gaps = portability_gaps;
         // A pool per renderer, with `RESET_COMMAND_BUFFER` so that each frame's buffer is
         // re-recorded in place rather than freed and reallocated.
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -828,7 +839,17 @@ impl Renderer {
             return Err(GfxError::SurfaceCannotBeTransferDestination);
         }
 
-        let extent = select::clamp_extent(self.target_extent, &caps);
+        // **The window's own zero is authoritative.** The seam reports a minimised window as
+        // `Resized { 0, 0 }`, and on Win32 the surface agrees (`currentExtent` 0x0). MoltenVK does
+        // not: MEASURED on this project's macOS host, a miniaturised window's surface kept
+        // reporting its 640x480 `currentExtent`, and the renderer went on presenting to a window
+        // with no pixels on screen. Where both say zero this changes nothing.
+        let minimised = self.target_extent.0 == 0 || self.target_extent.1 == 0;
+        let extent = if minimised {
+            vk::Extent2D { width: 0, height: 0 }
+        } else {
+            select::clamp_extent(self.target_extent, &caps)
+        };
         if extent.width == 0 || extent.height == 0 {
             self.destroy_swapchain();
             self.swapchain_dirty = false;
@@ -1121,8 +1142,35 @@ unsafe fn barrier(
     }
 }
 
-/// Create the instance, enabling validation only if the host has it.
-fn create_instance(entry: &ash::Entry) -> GfxResult<(ash::Instance, Vec<String>, bool)> {
+/// The window-system-integration extension a window needs, with what its absence means.
+///
+/// **By the window, not by a `cfg`**: the renderer asks for the surface extension of the window it
+/// was handed, which is what keeps this crate free of `cfg(target_os)` -- and on Windows it is
+/// `VK_KHR_win32_surface`, exactly as before.
+fn platform_surface(window: RawWindow) -> GfxResult<(&'static CStr, &'static str, &'static str)> {
+    match window {
+        RawWindow::Win32 { .. } => Ok((
+            khr::win32_surface::NAME,
+            "VK_KHR_win32_surface",
+            "the Vulkan loader found a driver, but not one that can present to a Win32 window",
+        )),
+        RawWindow::AppKit { .. } => Ok((
+            ash::ext::metal_surface::NAME,
+            "VK_EXT_metal_surface",
+            "the Vulkan loader found a driver, but not one that can present to a CAMetalLayer \
+             (MoltenVK provides it)",
+        )),
+        other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
+    }
+}
+
+/// Create the instance, enabling validation only if the host has it, and portability enumeration
+/// only when the loader needs it (see `crate::portability`). Answers how the instance can read
+/// `VkPhysicalDeviceFeatures2`, which the device's portability subset (if any) needs.
+fn create_instance(
+    entry: &ash::Entry,
+    window: RawWindow,
+) -> GfxResult<(ash::Instance, Vec<String>, bool, portability::Features2)> {
     // SAFETY: both enumerations take no handles and write into `ash`-owned vectors.
     let (layer_props, extension_props) = unsafe {
         (
@@ -1151,17 +1199,14 @@ fn create_instance(entry: &ash::Entry) -> GfxResult<(ash::Instance, Vec<String>,
     // same line, where a mismatch is visible, instead of in a match that has to be read twice.
     // Both are refused by name and with what the absence means, because they mean different
     // things -- no driver at all, against a driver that is not a Windows one.
+    let platform = platform_surface(window)?;
     for (probe, name, why) in [
         (
             khr::surface::NAME,
             "VK_KHR_surface",
             "the Vulkan loader found no installable client driver that can present at all",
         ),
-        (
-            khr::win32_surface::NAME,
-            "VK_KHR_win32_surface",
-            "the Vulkan loader found a driver, but not one that can present to a Win32 window",
-        ),
+        platform,
     ] {
         // A `debug_assert!`, not an `if`: no input can make these disagree, because both are
         // literals on the same row. VERIFICATION entry 12 is the rule — a guard that nothing can
@@ -1184,19 +1229,36 @@ fn create_instance(entry: &ash::Entry) -> GfxResult<(ash::Instance, Vec<String>,
         // reports 1.4.325 (spike §3), which is compatible with a 1.0 request.
         .api_version(vk::make_api_version(0, 1, 0, 0));
 
-    let extensions = [khr::surface::NAME.as_ptr(), khr::win32_surface::NAME.as_ptr()];
+    let mut names: Vec<&'static CStr> = vec![khr::surface::NAME, platform.0];
+    let offered: Vec<&CStr> =
+        extension_props.iter().filter_map(|p| p.extension_name_as_c_str().ok()).collect();
     let layers = [VALIDATION_LAYER.as_ptr()];
-    let mut info = vk::InstanceCreateInfo::default()
-        .application_info(&app_info)
-        .enabled_extension_names(&extensions);
-    if validation_enabled {
-        info = info.enabled_layer_names(&layers);
+    let mut flags = vk::InstanceCreateFlags::empty();
+    loop {
+        let extensions: Vec<*const std::ffi::c_char> = names.iter().map(|name| name.as_ptr()).collect();
+        let mut info = vk::InstanceCreateInfo::default()
+            .flags(flags)
+            .application_info(&app_info)
+            .enabled_extension_names(&extensions);
+        if validation_enabled {
+            info = info.enabled_layer_names(&layers);
+        }
+        // SAFETY: every pointer in `info` is a `'static` C string or a local that outlives this
+        // call.
+        match unsafe { entry.create_instance(&info, None) } {
+            Ok(instance) => {
+                let features2 = portability::Features2::of(vk::API_VERSION_1_0, &names);
+                return Ok((instance, available_layers, validation_enabled, features2));
+            }
+            // **Once**: the retry asks for the enumeration extension, so a second failure is not
+            // retried again (`retry_with_portability` refuses a request that already has it).
+            Err(result) if portability::retry_with_portability(result, &offered, &names) => {
+                names.extend(portability::portability_additions(&offered, &names, vk::API_VERSION_1_0));
+                flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+            }
+            Err(result) => return Err(GfxError::vk("create", "vkCreateInstance")(result)),
+        }
     }
-
-    // SAFETY: every pointer in `info` is a `'static` C string or a local that outlives this call.
-    let instance = unsafe { entry.create_instance(&info, None) }
-        .map_err(GfxError::vk("create", "vkCreateInstance"))?;
-    Ok((instance, available_layers, validation_enabled))
 }
 
 /// Create the `VkSurfaceKHR` for a window.
@@ -1216,6 +1278,16 @@ fn create_surface(
             unsafe { win32.create_win32_surface(&info, None) }
                 .map_err(GfxError::vk("create", "vkCreateWin32SurfaceKHR"))
         }
+        RawWindow::AppKit { ca_metal_layer, .. } => {
+            let info = vk::MetalSurfaceCreateInfoEXT::default()
+                .layer(ca_metal_layer as *const vk::CAMetalLayer);
+            let metal = ash::ext::metal_surface::Instance::new(entry, instance);
+            // SAFETY: `ca_metal_layer` is the `CAMetalLayer` of a live
+            // `omni_platform::window::Window`, whose documentation requires it to outlive any
+            // surface made from it.
+            unsafe { metal.create_metal_surface(&info, None) }
+                .map_err(GfxError::vk("create", "vkCreateMetalSurfaceEXT"))
+        }
         // `RawWindow` is `#[non_exhaustive]`, so a Wayland or AppKit variant added to the seam
         // later lands here and refuses **naming itself**, rather than turning this `match` into
         // one that silently stopped being exhaustive.
@@ -1234,6 +1306,7 @@ fn create_surface(
 fn window_key(window: RawWindow) -> GfxResult<claim::WindowKey> {
     match window {
         RawWindow::Win32 { hwnd, .. } => Ok(claim::WindowKey::win32(hwnd)),
+        RawWindow::AppKit { ns_view, .. } => Ok(claim::WindowKey::appkit(ns_view)),
         other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
     }
 }
@@ -1352,13 +1425,17 @@ fn pick_physical_device(
     })
 }
 
-/// Create the logical device with one queue from each family it needs.
+/// Create the logical device with one queue from each family it needs -- and, on a portability
+/// implementation, with `VK_KHR_portability_subset` and exactly the subset features it supports
+/// (see `crate::portability`). Answers the subset's gaps for the report.
 fn create_device(
+    entry: &ash::Entry,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     graphics_family: u32,
     present_family: u32,
-) -> GfxResult<ash::Device> {
+    features2: portability::Features2,
+) -> GfxResult<(ash::Device, Option<Vec<&'static str>>)> {
     let priorities = [1.0f32];
     let mut queue_infos = vec![
         vk::DeviceQueueCreateInfo::default()
@@ -1375,14 +1452,24 @@ fn create_device(
                 .queue_priorities(&priorities),
         );
     }
-    let extensions = [khr::swapchain::NAME.as_ptr()];
-    let info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(&queue_infos)
-        .enabled_extension_names(&extensions);
-    // SAFETY: the physical device is live and every pointer in `info` outlives the call. No
-    // features are requested, so there is nothing to have got wrong there.
-    unsafe { instance.create_device(physical_device, &info, None) }
-        .map_err(GfxError::vk("create", "vkCreateDevice"))
+    // SAFETY: the physical device is live.
+    let offered = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .map_err(GfxError::vk("create", "vkEnumerateDeviceExtensionProperties"))?;
+    // SAFETY: live handles; `features2` is what `create_instance` said this instance can do.
+    let subset = unsafe { portability::Subset::of(entry, instance, physical_device, &offered, features2) };
+    let mut extensions = vec![khr::swapchain::NAME.as_ptr()];
+    let mut subset_features = subset.map(|subset| subset.features);
+    let mut info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_infos);
+    if let Some(features) = subset_features.as_mut() {
+        extensions.push(portability::SUBSET.as_ptr());
+        info = info.push_next(features);
+    }
+    info = info.enabled_extension_names(&extensions);
+    // SAFETY: the physical device is live and every pointer in `info` outlives the call. The only
+    // features requested are the subset's, read from this device.
+    let device = unsafe { instance.create_device(physical_device, &info, None) }
+        .map_err(GfxError::vk("create", "vkCreateDevice"))?;
+    Ok((device, subset.map(|subset| subset.gaps())))
 }
 
 /// Allocate the per-frame command buffers, semaphores and fences.
