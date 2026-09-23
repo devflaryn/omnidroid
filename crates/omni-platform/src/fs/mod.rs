@@ -2044,6 +2044,53 @@ impl Filesystem {
         }
     }
 
+    /// A duplicate of a regular file's host handle, for a **shared writable** `mmap` of it: the
+    /// handle [`vm::share_file_for_mapping`](crate::vm::share_file_for_mapping) builds the section
+    /// over, so that the mapping writes the very file the descriptor names.
+    ///
+    /// A duplicate, not the descriptor itself, because the mapping outlives the descriptor:
+    /// MEASURED, the engine's `MappedFile` (`libroblox.so` link `0x2273210`) closes its descriptor
+    /// on the instruction after `mmap` returns and goes on writing through the mapping.
+    ///
+    /// Linux's answers (`do_mmap`), in its order: no such descriptor is `EBADF`; a file not open
+    /// for reading is `EACCES`; and a `MAP_SHARED` mapping with `PROT_WRITE` of a file not open for
+    /// writing is `EACCES` too -- which is why a descriptor opened `O_RDONLY` fails here although
+    /// [`read_for_mapping`](Self::read_for_mapping) would take it. Anything that is not a regular
+    /// file is refused by name, as there.
+    ///
+    /// # Errors
+    ///
+    /// As above, and the host's own failure to duplicate the handle as it reports it.
+    pub fn share_for_mapping(&self, fd: i32) -> FsResult<File> {
+        const OP: &str = "mmap";
+        let table = self.table();
+        match table.open.get(&fd) {
+            None => Err(bad_fd(OP, fd)),
+            Some(Entry::File { readable: false, guest, .. }) => Err(FsError::kinded(
+                OP,
+                guest.clone(),
+                FsErrorKind::PermissionDenied,
+                "a file mapping of a descriptor not open for reading (EACCES)",
+            )),
+            Some(Entry::File { writable: false, guest, .. }) => Err(FsError::kinded(
+                OP,
+                guest.clone(),
+                FsErrorKind::PermissionDenied,
+                "a MAP_SHARED mapping with PROT_WRITE of a descriptor not open for writing \
+                 (EACCES)",
+            )),
+            Some(Entry::File { file, guest, .. }) => {
+                file.try_clone().map_err(|error| FsError::io(OP, guest, &error))
+            }
+            Some(_) => Err(FsError::refused(
+                OP,
+                format!("fd {fd}"),
+                "a mapping of a descriptor that is not a regular file: Linux maps some devices \
+                 and answers ENODEV for everything else, and no run has asked for either",
+            )),
+        }
+    }
+
     /// `fsync(2)`: push a regular file's data and metadata to the device.
     ///
     /// `File::sync_all`, portable `std` -- `FlushFileBuffers` on Windows, `fsync` on unix -- so no

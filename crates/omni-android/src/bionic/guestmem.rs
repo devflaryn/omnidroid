@@ -1,4 +1,5 @@
-//! `mmap`, `munmap`, `mprotect`, `madvise`, `mlock` — the guest's own view of its address space.
+//! `mmap`, `munmap`, `mprotect`, `madvise`, `mlock`, `msync` — the guest's own view of its
+//! address space.
 //!
 //! # This is the heap seam, and it is not `malloc`
 //!
@@ -26,6 +27,10 @@
 //! `dispatch_paths_are_what_f9_requires` in `tests/bionic.rs`, and pinned by mutation rows
 //! `guestmem-A1`/`B1`.
 //!
+//! `msync` is the sixth and is there for a reason of its own: it neither unmaps nor reprotects,
+//! but its `MS_SYNC` is disk I/O over a mapping the engine makes 100 MiB long, and the exit path
+//! is where a handler can block that long with no translating-backend frame live beneath it.
+//!
 //! The exit path is also the only one that can reach the CPU, which is what makes
 //! [`ReentrantCall::invalidate_code`](crate::ReentrantCall::invalidate_code) available — see
 //! [`invalidate`].
@@ -34,8 +39,9 @@
 //!
 //! Both exist here and confusing them is the whole risk:
 //!
-//! * A call this layer **cannot carry out correctly** — a file-backed `mmap`, `MAP_FIXED`, a
-//!   protection AArch64 can express and [`Protection`] cannot, `MADV_DONTNEED`, `mlock` — is
+//! * A call this layer **cannot carry out correctly** — a writable private or executable
+//!   file-backed `mmap`, `MAP_FIXED`, a protection AArch64 can express and [`Protection`] cannot,
+//!   `MADV_REMOVE`, `mlock` — is
 //!   [`AbiError::Refused`] naming the symbol, the guest address and the argument. `MAP_FAILED`
 //!   would be a *believable* answer: the guest's allocator handles it by trying something else,
 //!   and the real failure would surface as an allocation pattern nobody could explain.
@@ -46,7 +52,7 @@
 
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
-use omni_mem::{CommitPolicy, GuestAddr, MemError, Placement, Protection};
+use omni_mem::{Backing, CommitPolicy, GuestAddr, MemError, Placement, Protection};
 
 use crate::boundary::{ImportCall, ReentrantCall};
 use crate::error::{AbiError, AbiResult};
@@ -110,6 +116,13 @@ pub const MADV_DONTNEED: i32 = 4;
 pub const MADV_FREE: i32 = 8;
 /// `MADV_REMOVE`.
 pub const MADV_REMOVE: i32 = 9;
+
+/// `MS_ASYNC`.
+pub const MS_ASYNC: i32 = 1;
+/// `MS_INVALIDATE`.
+pub const MS_INVALIDATE: i32 = 2;
+/// `MS_SYNC`. DECODED: the one value the engine passes (`libroblox.so` link `0x6222e50`).
+pub const MS_SYNC: i32 = 4;
 
 /// The advices that are hints, and which a conforming implementation may ignore entirely.
 ///
@@ -256,8 +269,50 @@ impl Call {
 /// mapping on Linux shows writes made to the file after it was mapped, and this one does not.
 /// Nothing reachable writes a file it has mapped read-only (the buffer is read-only by
 /// construction); if something does, this is where it will be. Pages wholly past the end of the
-/// file read as zero rather than raising `SIGBUS`, and a writable or executable file mapping is
-/// refused by name.
+/// file read as zero rather than raising `SIGBUS`.
+///
+/// # A writable `MAP_SHARED` file mapping is a real view of the file
+///
+/// MEASURED: three engine threads in the first signed-in session died on this handler's refusal,
+/// each asking for `mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)` of a file under
+/// `files/` (`UniversalApp_cache.tmp.0`, `ota_rbxm_decompressed_cache/.../DataModelPatch_*.tmp.N`).
+/// DECODED, `libroblox.so` link addresses: the site is `MappedFile::open` at `0x2273210`, called
+/// from `RbxmFileManager`'s `OutputMappedFileWrapper` (vtable at `0x638e340`), and it is the
+/// **only** writable file mapping in the library -- the other fourteen `mmap` sites are anonymous
+/// or `PROT_READ`. What the engine does around it decides what this has to honour:
+///
+/// * `open(path, O_RDWR | O_CREAT | O_TRUNC, 0666)`, `posix_fallocate(fd, 0, len)`, the `mmap`,
+///   and **`close(fd)` on the next instruction** (`0x2273404`). So the mapping outlives its
+///   descriptor, and nothing ever reads or writes the file through one while it is mapped.
+/// * `len` is `0x6400000` (100 MiB) at first (`0x2d8b590`); the chunks are decompressed into a
+///   heap buffer; then `resize(n)` unmaps and **re-opens the path `O_TRUNC`**, fallocates `n`
+///   and maps `n` bytes (`0x6222d0c`) -- so `n` is any length, not a page multiple. It `memcpy`s
+///   the buffer in (`0x2275834`), `msync(ptr, n, MS_SYNC)` (`0x6222e30`), `munmap`s (`0x24b459c`),
+///   and only then renames the `.tmp` into place (`AtomicCacheWrite`, `0x2d850c0`). On a read
+///   failure it removes the `.tmp` *while still mapped* (`0x2d851c0`) and unmaps afterwards.
+///
+/// So the mapping is a host view of a `PAGE_READWRITE` section built over the guest's own
+/// descriptor (`Filesystem::share_for_mapping`, `Backing::share`), at the guest address like every
+/// other mapping. That is coherent with `read`/`write` through any other descriptor in both
+/// directions with no flush, costs no private commit charge however long it is, and needs no
+/// write-back at `munmap` or at teardown -- the host's file cache holds the writes, as Linux's page
+/// cache does. The rename and the remove-while-mapped both work on this host (measured). Linux's
+/// partial last page is honoured: the bytes past the end of the file read as zero and a store
+/// there never reaches it.
+///
+/// **What it cannot do, refused rather than approximated:**
+///
+/// * Shortening the file while it is mapped -- `ftruncate`, or an `open` with `O_TRUNC` -- is
+///   refused *by the host* (`ERROR_USER_MAPPED_FILE`, 1224), which the descriptor layer reports as
+///   a refusal naming it. Linux allows it and faults later accesses. The engine unmaps first.
+/// * A mapping reaching whole pages past the end of the file, and a mapping of an empty file.
+///   Linux maps both and raises `SIGBUS` on touching the pages; a host view cannot extend past its
+///   file without growing the file, which would be a write the guest never made.
+/// * A `PROT_READ` `MAP_SHARED` mapping of the same file is still the snapshot above and does not
+///   see this mapping's writes. Nothing decoded maps one file both ways.
+///
+/// A writable `MAP_PRIVATE` file mapping (copy-on-write) and an executable one are still refused
+/// by name: nothing in the library asks for either.
 pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let (addr, length, prot, flags, fd, offset) = {
         let mut a = c.args();
@@ -289,7 +344,10 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     // test here could see it: every one of them passes `-1`, which is what the manual page tells
     // applications to do and what nothing is obliged to do.
     let file_backed = flags & MAP_ANONYMOUS == 0;
-    if file_backed && prot != PROT_READ {
+    // The one writable file mapping there is: a view of the file itself (see `mmap`).
+    let shared_writable =
+        file_backed && prot == PROT_READ | PROT_WRITE && flags & MAP_TYPE == MAP_SHARED;
+    if file_backed && prot != PROT_READ && !shared_writable {
         // The file by name, which the descriptor's number alone does not give.
         let named = super::files::filesystem(&call.view())
             .ok()
@@ -297,9 +355,11 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             .map_or_else(|| "a descriptor no path names".to_string(), |path| format!("`{path}`"));
         return call.refuse(format!(
             "the guest asked for a file-backed mapping of fd {fd} ({named}) with prot {prot:#x}, \
-             flags {flags:#x}, offset {offset:#x}. A file mapping here is PROT_READ only, made as a \
-             snapshot of the file (see `mmap`): a writable MAP_SHARED mapping must carry its \
-             writes to the file, an executable one is code, and no run has asked for either"
+             flags {flags:#x}, offset {offset:#x}. A file mapping here is PROT_READ, made as a \
+             snapshot of the file, or PROT_READ|PROT_WRITE with MAP_SHARED, made as a view that \
+             writes the file (see `mmap`). A writable MAP_PRIVATE mapping is a copy-on-write copy \
+             of the file and an executable one is code; the one writable file mapping in \
+             libroblox.so is MAP_SHARED (link 0x22733f0), and no run has asked for either"
         ));
     }
     if flags & !KNOWN_MAP_FLAGS != 0 {
@@ -377,6 +437,9 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             c.ret(|mut r| r.u64(MAP_FAILED));
             return Ok(());
         }
+        if shared_writable {
+            return map_shared_file(c, &call, fd, offset as u64, len, placement);
+        }
         let fs = super::files::filesystem(&view)?;
         let mut host = vec![0u8; usize::try_from(length).unwrap_or(len).min(len)];
         let read = match super::files::settle(&view, fs.read_for_mapping(fd, &mut host, offset as u64))? {
@@ -421,6 +484,89 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             let mut view = call.view();
             fail(&mut view, errno_for(&error));
             c.ret(|mut r| r.u64(MAP_FAILED));
+        }
+    }
+    Ok(())
+}
+
+/// The writable `MAP_SHARED` half of [`mmap`]: a view of the very file `fd` names, placed as
+/// `placement` says. `offset` is page-aligned and `len` a page multiple by the time this runs.
+///
+/// Linux's failures stay failures (`EBADF`, `EACCES` for a descriptor not open for reading *or*
+/// not open for writing -- `do_mmap`'s rule for `MAP_SHARED` with `PROT_WRITE`), and what the host
+/// cannot express is refused by name; see [`mmap`] for which is which.
+fn map_shared_file(
+    c: &mut ReentrantCall<'_>,
+    call: &Call,
+    fd: i32,
+    offset: u64,
+    len: usize,
+    placement: Placement,
+) -> AbiResult<()> {
+    let space = call.mem.space();
+    let mut view = call.view();
+    let fs = super::files::filesystem(&view)?;
+    let name = fs.guest_path_of(fd).unwrap_or_else(|| format!("fd {fd}"));
+    let file = match super::files::settle(&view, fs.share_for_mapping(fd))? {
+        super::files::Settled::Done(file) => file,
+        super::files::Settled::Failed(errno) => {
+            fail(&mut view, errno);
+            c.ret(|mut r| r.u64(MAP_FAILED));
+            return Ok(());
+        }
+    };
+    // The file's length **now**, which is what the section will be: the engine `posix_fallocate`s
+    // exactly the length it then maps, so the mapping ends inside the file's last page.
+    let file_len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return call.refuse(format!(
+                "the length of `{name}` (fd {fd}) could not be read for a writable MAP_SHARED \
+                 mapping of it: {error}"
+            ))
+        }
+    };
+    let page = space.page_size() as u64;
+    let last_page_end = file_len.div_ceil(page).saturating_mul(page);
+    if offset.checked_add(len as u64).is_none_or(|end| end > last_page_end) {
+        return call.refuse(format!(
+            "the guest asked for a writable MAP_SHARED mapping of {len} bytes at offset \
+             {offset:#x} of `{name}` (fd {fd}), which is {file_len} bytes long, so the mapping \
+             reaches whole pages past the end of the file. Linux maps them and raises SIGBUS on \
+             touching one; a host view cannot extend past its file without growing the file, \
+             which would be a write the guest never made. DECODED: the engine's one writable file \
+             mapping maps exactly the length it has just posix_fallocate'd (libroblox.so link \
+             0x2273210)"
+        ));
+    }
+    let backing = match Backing::share(file, &name) {
+        Ok(backing) => backing,
+        Err(error) => {
+            return call.refuse(format!(
+                "`{name}` (fd {fd}) could not be made mappable as a writable MAP_SHARED file: \
+                 {error}"
+            ))
+        }
+    };
+    match space.map_file(&backing, offset, placement, len, Protection::ReadWrite) {
+        Ok(at) => {
+            // As for an anonymous mapping: the addresses may have held code before.
+            invalidate(c, at, len)?;
+            c.ret(|mut r| r.u64(at as u64));
+        }
+        // No room in the address space, or a MAP_FIXED_NOREPLACE collision: the answers an
+        // anonymous mapping gives for the same thing.
+        Err(error) if !matches!(error, MemError::Platform { .. }) => {
+            fail(&mut view, errno_for(&error));
+            c.ret(|mut r| r.u64(MAP_FAILED));
+        }
+        // The host refused the view itself. `errno_for` would call that ENOMEM, which is a
+        // believable answer for a failure nobody has identified.
+        Err(error) => {
+            return call.refuse(format!(
+                "a writable MAP_SHARED view of `{name}` (fd {fd}), {len} bytes at offset \
+                 {offset:#x}, could not be mapped: {error}"
+            ))
         }
     }
     Ok(())
@@ -537,7 +683,8 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 ///   the believable wrong answer the refusal existed to prevent.
 ///
 /// `MADV_REMOVE` stays refused: it is defined on shared, file-backed mappings as punching a hole
-/// in the **underlying object**, and nothing here has an underlying object to punch.
+/// in the **underlying object**. The writable `MAP_SHARED` views [`mmap`] makes are the only
+/// mappings here with one -- the guest's file -- and no run has asked to punch a hole in it.
 pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let (addr, length, advice) = {
         let mut a = c.args();
@@ -551,9 +698,11 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     if advice == MADV_REMOVE {
         return call.refuse(format!(
             "the guest asked for MADV_REMOVE over {length} bytes at {at:#x}. It is defined as \
-             punching a hole in the object *underlying* a shared mapping, and every mapping this \
-             layer gives the guest is private and anonymous, so there is no underlying object to \
-             punch. MADV_DONTNEED, which is what a private anonymous range wants, is carried out"
+             punching a hole in the object *underlying* a shared mapping. The only such mappings \
+             here are writable MAP_SHARED file views, where that object is the guest's file and \
+             no run has asked for a hole in it; every other guest mapping is private and \
+             anonymous, with no underlying object to punch. MADV_DONTNEED, which is what a \
+             private anonymous range wants, is carried out"
         ));
     }
 
@@ -669,6 +818,92 @@ pub(super) fn mlock(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
          failed mlock is ordinary on a real device, so the guest would record a refusal by policy \
          for a request nobody made"
     ))
+}
+
+/// `int msync(void *addr, size_t length, int flags)`
+///
+/// `mm/msync.c`, in its order: a flag outside `MS_ASYNC | MS_INVALIDATE | MS_SYNC`, a misaligned
+/// address, or `MS_ASYNC` with `MS_SYNC`, is `EINVAL`; a length that wraps when rounded up to a
+/// page is `ENOMEM`; a length of zero succeeds. Unmapped address space inside the range is
+/// **skipped and then reported** as `ENOMEM`, after the mapped parts have been written back.
+///
+/// # What each flag does here, and why it is what Linux does
+///
+/// * **`MS_SYNC`** writes every writable `MAP_SHARED` file view in the range back to its file and
+///   the file to the device ([`GuestSpace::sync`](omni_mem::GuestSpace::sync)), which is Linux's
+///   `vfs_fsync_range`. Anonymous memory and the `PROT_READ` snapshots have nothing of their own to
+///   write, and Linux skips them the same way: it syncs only a `VM_SHARED` mapping with a file.
+///   DECODED: this is the one flag the engine passes, from its `MappedFile` flush at
+///   `libroblox.so` link `0x6222e30`, with the length it has written rather than the mapping's.
+/// * **`MS_ASYNC` does nothing, and that is Linux's answer, not a shortcut.** Since 2.6.19 the
+///   kernel tracks dirty pages itself and `MS_ASYNC` only walks the range for `ENOMEM`. Here the
+///   host's file cache holds a shared view's writes and they are already visible to every reader
+///   of the file (measured), so there is equally nothing to start.
+/// * **`MS_INVALIDATE`** fails only on a locked mapping (`EBUSY`), and `mlock` is refused here,
+///   so it changes nothing either -- again Linux's own behaviour.
+///
+/// A host write-back failure is refused by name rather than answered `EIO`: nothing has
+/// identified it, and `EIO` is an answer guest code acts on.
+pub(super) fn msync(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
+    let (addr, length, flags) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_u64()?, a.next_i32()?)
+    };
+    let call = Call::begin(c)?;
+    let space = call.mem.space();
+    let page = space.page_size();
+    let at = usize::try_from(addr).unwrap_or(usize::MAX);
+
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || at % page != 0
+        || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
+    {
+        let mut view = call.view();
+        fail(&mut view, consts::EINVAL);
+        c.ret(|mut r| r.i32(-1));
+        return Ok(());
+    }
+    let Some((len, end)) =
+        pages(length, page).and_then(|len| at.checked_add(len).map(|end| (len, end)))
+    else {
+        let mut view = call.view();
+        fail(&mut view, consts::ENOMEM);
+        c.ret(|mut r| r.i32(-1));
+        return Ok(());
+    };
+    if len == 0 {
+        c.ret(|mut r| r.i32(0));
+        return Ok(());
+    }
+
+    // Every guest mapping is inside the space, so whatever of the range is outside it is a hole.
+    let from = at.max(space.base());
+    let to = end.min(space.end());
+    let mut hole = from != at || to != end || from >= to;
+    let mut cursor = from;
+    while !hole && cursor < to {
+        match space.region_at(cursor) {
+            Some(region) => cursor = region.end(),
+            None => hole = true,
+        }
+    }
+
+    if flags & MS_SYNC != 0 && from < to {
+        if let Err(error) = space.sync(from, to - from) {
+            return call.refuse(format!(
+                "msync(MS_SYNC) over {length} bytes at {at:#x}: the host could not write a shared \
+                 file mapping in the range back to its file: {error}"
+            ));
+        }
+    }
+    if hole {
+        let mut view = call.view();
+        fail(&mut view, consts::ENOMEM);
+        c.ret(|mut r| r.i32(-1));
+    } else {
+        c.ret(|mut r| r.i32(0));
+    }
+    Ok(())
 }
 
 // ================================================================== the allocator that is not here

@@ -22,8 +22,10 @@
 //! reservations aligned above 64 KB, depend on them.
 
 use std::ffi::c_void;
+use std::fs::File;
 use std::iter::once;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::IntoRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -31,11 +33,12 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, GENERIC_EXECUTE, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileSizeEx, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+    CreateFileW, FlushFileBuffers, GetFileSizeEx, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+    CreateFileMappingW, FlushViewOfFile, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
     MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_MAPPED,
     MEM_PRESERVE_PLACEHOLDER,
     MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
@@ -240,11 +243,13 @@ enum RegionFlavour {
     /// Private committed memory, from `commit` or `commit_placeholder`.
     Private,
     /// A view created with a protection that keeps writes private to this mapping:
-    /// `PAGE_READONLY`, `PAGE_WRITECOPY` or `PAGE_EXECUTE_READ`. Every view `map_file` can
-    /// currently produce is one of these.
+    /// `PAGE_READONLY`, `PAGE_WRITECOPY` or `PAGE_EXECUTE_READ`. Every view `map_file` makes of a
+    /// file from [`open_file_for_mapping`] is one of these.
     PrivateView,
     /// A view created `PAGE_READWRITE` or `PAGE_EXECUTE_READWRITE`, where writes are shared with
-    /// every other view of the same section.
+    /// every other view of the same section: the D12 arena's writable view, and every view
+    /// `map_file` makes of a file from [`share_file_for_mapping`] -- which is why those are always
+    /// created `PAGE_READWRITE` and protected down.
     SharedWritableView,
 }
 
@@ -954,6 +959,10 @@ pub struct MappableFile {
     len: u64,
     executability: MapExecutability,
     path: PathBuf,
+    /// Whether the section is `PAGE_READWRITE` over a file handle carrying `GENERIC_WRITE`, from
+    /// [`share_file_for_mapping`], so that a writable view carries its writes to the file rather
+    /// than privatising them. `false` for [`open_file_for_mapping`]'s read-only sections.
+    shared: bool,
 }
 
 // SAFETY: a Win32 HANDLE is process-wide, not thread-owned, and `MappableFile` only ever passes
@@ -974,6 +983,10 @@ impl MappableFile {
 
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(super) fn is_shared(&self) -> bool {
+        self.shared
     }
 }
 
@@ -1074,7 +1087,94 @@ pub(super) fn open_file_for_mapping(
         len,
         executability,
         path: path.to_path_buf(),
+        shared: false,
     })
+}
+
+/// A `PAGE_READWRITE` section over a file the caller already holds open for reading and writing.
+///
+/// The handle is the caller's own -- in practice a duplicate of a guest descriptor's -- rather
+/// than one this function opens by path, for two measured reasons (Windows 11 26200, a
+/// `PAGE_READWRITE` section over a share-everything handle, the view in a placeholder):
+///
+/// * **Access decides it, and it is the guest's access that must.** A `PAGE_READWRITE` section
+///   over a handle without `GENERIC_WRITE` fails with `ERROR_ACCESS_DENIED` (5), which is Linux's
+///   `EACCES` for a `MAP_SHARED` writable mapping of a descriptor not open `O_RDWR`. Opening a
+///   second handle by path would answer with *this* process's access to the file instead.
+/// * **It does not change who can open the file.** The section holds the file object, not a share
+///   mode: with the handle closed and a view live, another handle reads the view's writes with
+///   `ReadFile`, a `WriteFile` through it is visible in the view, and the file can be renamed and
+///   deleted -- all measured, and all what Linux does.
+///
+/// A maximum size of 0 makes the section exactly the file's length, **which is the point**: a
+/// `PAGE_READWRITE` section created larger than its file *extends the file*, and that would be a
+/// write the guest never made. See [`map_file`] for what that means for a file whose length is not
+/// a page multiple. An empty file cannot have a section at all (`ERROR_FILE_INVALID`, 1006,
+/// measured), which is [`VmError::EmptyFile`].
+pub(super) fn share_file_for_mapping(file: File, name: &Path) -> VmResult<MappableFile> {
+    let guard = HandleGuard(file.into_raw_handle() as HANDLE);
+    let shown = || name.display().to_string();
+
+    let mut len: i64 = 0;
+    // SAFETY: `guard.0` is a live file handle, owned by the guard, and `len` is a live i64 the
+    // call writes.
+    let ok = unsafe { GetFileSizeEx(guard.0, &mut len) };
+    if ok == 0 {
+        return Err(VmError::FileOpen {
+            path: shown(),
+            executability: MapExecutability::NonExecutable,
+            source: OsError(last_error()),
+        });
+    }
+    let len = len as u64;
+    if len == 0 {
+        return Err(VmError::EmptyFile { path: shown() });
+    }
+
+    // SAFETY: `guard.0` is a live file handle. A NULL security descriptor and name are the
+    // documented defaults, and a maximum size of 0 means "the size of the file", so the file's
+    // length is not changed by creating the section.
+    let section = unsafe {
+        CreateFileMappingW(guard.0, std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null())
+    };
+    if section.is_null() {
+        return Err(VmError::SectionCreate {
+            path: shown(),
+            len,
+            section_protection: "PAGE_READWRITE",
+            source: OsError(last_error()),
+        });
+    }
+
+    Ok(MappableFile {
+        file: guard.into_raw(),
+        section,
+        len,
+        executability: MapExecutability::NonExecutable,
+        path: name.to_path_buf(),
+        shared: true,
+    })
+}
+
+/// Write a shared view's dirty pages to its file, then the file's buffers to the device.
+///
+/// `FlushViewOfFile` is the view half: it writes the range's modified pages through to the file
+/// and does not wait for the device. `FlushFileBuffers` on the section's own file handle is the
+/// device half. Together they are Linux's `msync(MS_SYNC)`, which ends in `vfs_fsync_range`.
+pub(super) fn sync_view(file: &MappableFile, address: usize, size: usize) -> VmResult<()> {
+    // SAFETY: the caller's contract is that `[address, address + size)` lies inside a live view of
+    // `file`'s section. FlushViewOfFile only reads the page tables of that range.
+    let ok = unsafe { FlushViewOfFile(address as *const c_void, size) };
+    if ok == 0 {
+        return Err(os("sync_view", address, size));
+    }
+    // SAFETY: `file.file` is the live handle the section was created over, owned by `file` and
+    // closed only by its Drop.
+    let ok = unsafe { FlushFileBuffers(file.file) };
+    if ok == 0 {
+        return Err(os("sync_view", address, size));
+    }
+    Ok(())
 }
 
 pub(super) fn map_file(
@@ -1085,19 +1185,39 @@ pub(super) fn map_file(
     protection: Protection,
 ) -> VmResult<()> {
     let map3 = map_view_of_file3()?;
+    // **A shared file's view is always created `PAGE_READWRITE`**, whatever it is to end up as,
+    // and protected down afterwards. `region_flavour` classifies a view by the protection it was
+    // *created* with, so a shared view created `PAGE_READONLY` would be a `PrivateView` for the
+    // rest of its life, and a later `protect` to `ReadWrite` would make it `PAGE_WRITECOPY` --
+    // writes privatised, the file never changed, and nothing anywhere saying so.
+    //
+    // **And its size is the file's bytes, not the placeholder's**, when the view ends inside the
+    // file's last page. MEASURED on a 5000-byte file with an 8192-byte placeholder: a view size of
+    // 8192 fails with `ERROR_ACCESS_DENIED` (5), because it runs past the section; a view size of
+    // 5000 succeeds, fills the whole placeholder, reads the 3192 bytes past the end as zero, keeps
+    // a store there out of the file, and leaves the file 5000 bytes long. That is Linux's partial
+    // last page exactly. The seam has already refused a view reaching further than that page.
+    let (create_with, view_size) = if file.shared {
+        let in_file = file.len.saturating_sub(file_offset);
+        (PAGE_READWRITE, (size as u64).min(in_file) as usize)
+    } else {
+        (view_protection(protection), size)
+    };
     // SAFETY: `map3` is the resolved `MapViewOfFile3`, called with its documented signature and
     // no extended parameters. `file.section` is a live section object. The caller's contract is
-    // that `[address, address + size)` is exactly one unreplaced placeholder piece it owns; the
-    // return value is checked before anything is read through it.
+    // that `[address, address + size)` is exactly one unreplaced placeholder piece it owns; a
+    // `view_size` short of `size` ends inside the placeholder's last page, which the kernel rounds
+    // up to that page (measured above). The return value is checked before anything is read
+    // through it.
     let view = unsafe {
         map3(
             file.section,
             GetCurrentProcess(),
             address as *const c_void,
             file_offset,
-            size,
+            view_size,
             MEM_REPLACE_PLACEHOLDER,
-            view_protection(protection),
+            create_with,
             std::ptr::null_mut(),
             0,
         )
@@ -1130,6 +1250,18 @@ pub(super) fn map_file(
         view as usize, address,
         "MapViewOfFile3 into a placeholder must return the requested base"
     );
+    if file.shared && protection != Protection::ReadWrite {
+        // Down from `PAGE_READWRITE` to what was asked for. `protect` resolves it through the
+        // view's flavour, which is `SharedWritableView` now and for the life of the view, so a
+        // later raise back to `ReadWrite` stays shared -- measured: `PAGE_READONLY` then
+        // `PAGE_READWRITE` on such a view, and the next store reached the file.
+        if let Err(error) = protect(address, size, protection) {
+            // Never hand back a view more writable than was asked for. Unmapping preserves the
+            // placeholder, so the caller's map is still true of the range: it is a placeholder.
+            let _ = unmap(address, size);
+            return Err(error);
+        }
+    }
     Ok(())
 }
 

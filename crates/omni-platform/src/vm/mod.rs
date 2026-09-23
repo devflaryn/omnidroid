@@ -31,7 +31,9 @@
 //! decommit_to_placeholder(ptr, size) -> VmResult<()>
 //! protect(ptr, size, prot) -> VmResult<()>
 //! open_file_for_mapping(path, exec) -> VmResult<MappableFile>
+//! share_file_for_mapping(File, name) -> VmResult<MappableFile>
 //! map_file(&MappableFile, file_offset, size, ptr, prot) -> VmResult<()>
+//! sync_view(&MappableFile, ptr, size) -> VmResult<()>
 //! create_shared_section(size) -> VmResult<SharedSection>
 //! map_section(&SharedSection, offset, size, prot) -> VmResult<usize>
 //! unmap(ptr, size) -> VmResult<()>
@@ -411,6 +413,14 @@ impl MappableFile {
     pub fn path(&self) -> &Path {
         self.0.path()
     }
+
+    /// Whether a writable view of this file carries its writes **to the file** -- it came from
+    /// [`share_file_for_mapping`] -- rather than privatising them copy-on-write, as every view of
+    /// a file from [`open_file_for_mapping`] does.
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        self.0.is_shared()
+    }
 }
 
 impl fmt::Debug for MappableFile {
@@ -419,6 +429,7 @@ impl fmt::Debug for MappableFile {
             .field("path", &self.path())
             .field("len", &self.len())
             .field("executability", &self.executability())
+            .field("shared", &self.is_shared())
             .finish()
     }
 }
@@ -718,6 +729,55 @@ pub fn open_file_for_mapping(
     backend::open_file_for_mapping(path, executability).map(MappableFile)
 }
 
+/// Make a file the caller already holds open for reading **and writing** mappable as *shared*:
+/// a [`Protection::ReadWrite`] view of it writes the file, as Linux's `MAP_SHARED` does, instead
+/// of privatising its pages as every view of an [`open_file_for_mapping`] file does.
+///
+/// Takes the handle rather than a path, and takes ownership of it: the caller passes its own
+/// duplicate of the descriptor the guest mapped. That is what makes the access check the right
+/// one -- a handle without write access cannot back a shared writable section (Windows
+/// `ERROR_ACCESS_DENIED`, measured), which is Linux's `EACCES` for a `MAP_SHARED` writable mapping
+/// of a descriptor not open `O_RDWR` -- and it is why no path is opened here at all. `name` is
+/// only what diagnostics call the file.
+///
+/// The section is exactly the file's length and creating it does not change that length. The file
+/// stays coherent with every other handle to it while a view exists: a read through another
+/// handle sees a store through the view without any flush, and a write through another handle is
+/// visible in the view (measured, Windows 11 26200). **Shortening the file while a view exists is
+/// refused by the host** (`ERROR_USER_MAPPED_FILE`, 1224), where Linux allows it and faults later
+/// accesses; renaming and deleting it are not refused (measured).
+///
+/// # Errors
+///
+/// [`VmError::EmptyFile`] for a zero-length file, which cannot have a section;
+/// [`VmError::SectionCreate`] -- `ERROR_ACCESS_DENIED` (5) for a handle without write access;
+/// [`VmError::FileOpen`] if the file's length cannot be read.
+pub fn share_file_for_mapping(file: std::fs::File, name: &Path) -> VmResult<MappableFile> {
+    backend::share_file_for_mapping(file, name).map(MappableFile)
+}
+
+/// Push a shared view's writes to its file and the file to the device: `msync(MS_SYNC)`.
+///
+/// For a view of a [`share_file_for_mapping`] file only; a view of any other file has nothing of
+/// its own to write back, because its writable pages are private copies by construction.
+///
+/// # Errors
+///
+/// [`VmError::Os`] carrying the host's code if either half fails.
+///
+/// # Safety
+///
+/// The caller must have established, from a region map it owns, that `[ptr, ptr + size)` is a
+/// view of `file`. Nothing is dereferenced: the host inspects and writes back the range's pages,
+/// so if a concurrent unmap has changed the range since, the call fails or writes back whichever
+/// view is there now, and touches no memory either way.
+pub unsafe fn sync_view(file: &MappableFile, ptr: *mut u8, size: usize) -> VmResult<()> {
+    const OP: &str = "sync_view";
+    check_size(OP, size)?;
+    check_page_multiple(OP, "address", ptr as usize as u64)?;
+    backend::sync_view(&file.0, ptr as usize, size)
+}
+
 /// Map part of a file over an exact-size placeholder, at a chosen address.
 ///
 /// Both `ptr` and `file_offset` are 4 KB-granular. That is the whole point of the placeholder
@@ -735,9 +795,17 @@ pub fn open_file_for_mapping(
 /// | [`ReadWrite`](Protection::ReadWrite) | `PAGE_WRITECOPY` | private copy-on-write; **charged its full size at map time** |
 /// | [`None`](Protection::None) | — | rejected; map [`Read`](Protection::Read) then [`protect`] to `None` |
 ///
-/// `PAGE_READWRITE` is not reachable and is not offered: the file is opened without
+/// `PAGE_READWRITE` is not reachable for such a file and is not offered: it is opened without
 /// `GENERIC_WRITE`, so a writable *shared* view fails with `ERROR_ACCESS_DENIED` (5). Omnidroid
-/// never wants one — the extraction cache is immutable and shared between instances.
+/// never wants one of the extraction cache, which is immutable and shared between instances.
+///
+/// **A file from [`share_file_for_mapping`] is the other case**, and the table does not apply to
+/// it: every view is created `PAGE_READWRITE` -- shared, so a store reaches the file -- and
+/// protected down to `protection` afterwards, so that the view stays shared if it is raised again
+/// later. A view of such a file may also end **inside the file's last page** rather than at its
+/// last byte, which is Linux's rule: the bytes past the end read as zero and a store there never
+/// reaches the file (measured). A view reaching any further page past the end is still
+/// [`VmError::ViewPastEndOfFile`].
 ///
 /// A read-only or execute-read view of 4 MB measured 8–16 KB of commit charge (page tables only),
 /// and 16 concurrent 8 MB views of one file, every page touched, cost 0.254 MB of commit between
@@ -786,7 +854,15 @@ pub unsafe fn map_file(
         });
     }
     let end = file_offset.saturating_add(size as u64);
-    if end > file.len() {
+    // A shared file's view may end inside the file's last page; any other file's view must end at
+    // or before its last byte, as it always has.
+    let limit = if file.is_shared() {
+        let page = page_size() as u64;
+        file.len().div_ceil(page).saturating_mul(page)
+    } else {
+        file.len()
+    };
+    if end > limit {
         return Err(VmError::ViewPastEndOfFile {
             path: file.path().display().to_string(),
             file_offset,

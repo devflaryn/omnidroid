@@ -21,16 +21,20 @@ pub struct BackingId(pub u64);
 /// comes from the same extraction-cache entry — and because the guest address space must keep the
 /// backing alive for as long as any view of it exists.
 ///
-/// # There is one way to make one, deliberately
+/// # There are two ways to make one, and the second has a measured reason
 ///
-/// [`open`](Backing::open) and nothing else. A `from_mappable` constructor existed, justified by
-/// `omni-apk` opening extraction-cache entries itself and handing over the open handle — an
-/// arrangement that does not exist and never did: `omni-apk` produces *paths* to immutable
-/// content-addressed files and has no way to produce an
-/// [`MappableFile`](omni_platform::vm::MappableFile), which only `omni-platform` can mint. It had
-/// zero callers in the workspace. Dead public API justified by a fiction is worse than no API, and if
-/// something ever does need to adopt an already-open handle it is four lines to add back with a true
-/// reason attached.
+/// [`open`](Backing::open), by path, read-only: every library segment and every extraction-cache
+/// entry. A `from_mappable` constructor once existed beside it, justified by `omni-apk` opening
+/// extraction-cache entries itself and handing over the open handle — an arrangement that did not
+/// exist: `omni-apk` produces *paths* to immutable content-addressed files, and the constructor had
+/// zero callers. It was removed, with a note that adopting an already-open handle would come back
+/// when something had a true reason to.
+///
+/// [`share`](Backing::share) is that, and the reason is the guest's `MAP_SHARED` writable `mmap`.
+/// MEASURED: three engine threads in the first signed-in session died on its refusal, each mapping
+/// a cache file it had just created `O_RDWR | O_CREAT | O_TRUNC` and `posix_fallocate`d
+/// (`libroblox.so` link `0x2273210`). Such a mapping has to write *that* file, through *that*
+/// descriptor's access, so the handle is the guest's own rather than one opened by path here.
 ///
 /// # Executability is decided here, not at map time
 ///
@@ -56,6 +60,28 @@ impl Backing {
         let file = vm::open_file_for_mapping(path, executability)
             .map_err(platform("Backing::open", 0, 0))?;
         Ok(Arc::new(Self::from_file(file, path.display().to_string())))
+    }
+
+    /// Adopt a file the guest holds open for reading and writing, so that a
+    /// [`Protection::ReadWrite`](crate::Protection::ReadWrite) mapping of it **writes the file** --
+    /// Linux's `MAP_SHARED` -- rather than privatising its pages as a mapping of an
+    /// [`open`](Backing::open)ed file does.
+    ///
+    /// `file` is the caller's duplicate of the guest's descriptor and is consumed; `name` is what
+    /// the region map reports the mapping as, which for a guest file is its guest path. What the
+    /// host does and does not allow while such a mapping exists is on
+    /// [`share_file_for_mapping`](omni_platform::vm::share_file_for_mapping).
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Platform`](crate::MemError::Platform) wrapping
+    /// [`VmError::EmptyFile`](omni_platform::vm::VmError::EmptyFile) for a zero-length file, or
+    /// [`VmError::SectionCreate`](omni_platform::vm::VmError::SectionCreate) for a handle without
+    /// write access.
+    pub fn share(file: std::fs::File, name: &str) -> MemResult<Arc<Self>> {
+        let file = vm::share_file_for_mapping(file, Path::new(name))
+            .map_err(platform("Backing::share", 0, 0))?;
+        Ok(Arc::new(Self::from_file(file, name.to_string())))
     }
 
     fn from_file(file: MappableFile, name: String) -> Self {
@@ -97,6 +123,13 @@ impl Backing {
         self.file.executability()
     }
 
+    /// Whether a writable mapping of this file writes the file: it was made by
+    /// [`share`](Backing::share).
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        self.file.is_shared()
+    }
+
     pub(crate) fn file(&self) -> &MappableFile {
         &self.file
     }
@@ -109,6 +142,7 @@ impl core::fmt::Debug for Backing {
             .field("name", &self.name)
             .field("len", &self.len())
             .field("executability", &self.executability())
+            .field("shared", &self.is_shared())
             .finish()
     }
 }

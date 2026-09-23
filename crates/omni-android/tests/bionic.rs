@@ -972,6 +972,25 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          a negative length EINVAL, no descriptor EBADF, not a regular file open for writing \
          EINVAL.",
     ),
+    (
+        "msync",
+        "The first signed-in session, by DECODING the call that comes next: three guest threads \
+         died on `mmap` refusing a writable MAP_SHARED file mapping (fd 14, \
+         `files/UniversalApp_cache.tmp.0`, prot 0x3, flags 0x1, from link 0x22733f4), and the \
+         engine's MappedFile that asked for it flushes with msync(ptr, n, MS_SYNC) at link \
+         0x6222e68 -- the library's only msync call site -- before it unmaps and renames the \
+         file into place. Bound with the mapping it flushes, on the exit path beside it. The \
+         file's LAST section.",
+    ),
+    (
+        "recvmsg",
+        "The first signed-in session: a QUIC receiver thread died on it -- GuestThreadFailure { \
+         thread: 70, why: \"the guest called the imported symbol `recvmsg` through its thunk at \
+         0x22caec0efa0, and nothing in the compatibility layer implements it\" }, from link \
+         0x5b19ccc (one iovec, a 128-byte msg_name, a 1,064-byte control buffer). Served by the \
+         same receive_message recvmmsg has used since M6, so the two cannot disagree about a \
+         msghdr.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1022,7 +1041,7 @@ fn every_bound_symbol_is_in_the_reachable_set_and_is_bound_once() {
 #[test]
 fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
-    assert_eq!(symbols.len(), 305, "bound symbols: {symbols:?}");
+    assert_eq!(symbols.len(), 307, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1118,8 +1137,12 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`clearerr` and `utime`, for 290**: the second launch of a kept data directory -- a
     // worker's stream, and the engine's HTTP cache stamping a response. **`atof`, for 291**: the
     // engine's main thread on the same second launch.
-    assert_eq!(Bionic::inline_symbols().count(), 291);
-    assert_eq!(Bionic::reentrant_symbols().count(), 14);
+    // **`msync`, for 306 and the fifteenth re-entrant one**: the flush of the writable
+    // `MAP_SHARED` file mapping the first signed-in session died asking for, bound on the exit
+    // path beside `mmap` -- the first symbol added there since phase 3c.
+    // **`recvmsg`, for 307**: the same session's QUIC receiver, inline beside `recvmmsg`.
+    assert_eq!(Bionic::inline_symbols().count(), 292);
+    assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
     // null, which is what the guest's own null test expects. The identity below is what makes the
@@ -1315,7 +1338,9 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
 #[test]
 fn dispatch_paths_are_what_f9_requires() {
     let reentrant: std::collections::BTreeSet<&str> = Bionic::reentrant_symbols().collect();
-    for symbol in ["mmap", "munmap", "mprotect", "madvise", "mlock"] {
+    // `msync` does not change the address space, and is here because its `MS_SYNC` is disk I/O
+    // over up to 100 MiB, which is not something to do inside a translating-backend callback.
+    for symbol in ["mmap", "munmap", "mprotect", "madvise", "mlock", "msync"] {
         assert!(
             reentrant.contains(symbol),
             "`{symbol}` reaches GuestSpace and must be serviced on the exit path (F9)"
@@ -1376,7 +1401,8 @@ fn dispatch_paths_are_what_f9_requires() {
             "`{symbol}` needs the boundary's symbol table, which only the exit path can reach"
         );
     }
-    assert_eq!(reentrant.len(), 14, "nothing else belongs on the slow path: {reentrant:?}");
+    // Fifteen with `msync`, which is on the slow path for the reason given above it.
+    assert_eq!(reentrant.len(), 15, "nothing else belongs on the slow path: {reentrant:?}");
     let inline: std::collections::BTreeSet<&str> = Bionic::inline_symbols().collect();
     // `dlerror` stays on the fast path: it reads a thread-local string and needs no table.
     assert!(inline.contains("dlerror"), "`dlerror` has no reason to exit the run loop");
@@ -11180,7 +11206,8 @@ fn ftruncate_sets_the_length_and_refuses_what_linux_refuses() {
 /// -- the engine's `ReadOnlySharedBuffer` shape, `mmap(NULL, size, PROT_READ,
 /// MAP_SHARED | MAP_NORESERVE, fileno(f), 0)`, on a file still open for writing. Linux's refusals:
 /// a misaligned offset is `EINVAL`, a descriptor not open for reading `EACCES`, no descriptor
-/// `EBADF`; a writable file mapping refuses by name.
+/// `EBADF`; a writable *private* file mapping refuses by name (the writable shared one is a view
+/// of the file -- see `a_shared_writable_file_mapping_writes_the_file_it_maps`).
 #[test]
 fn a_read_only_file_mapping_holds_the_files_bytes_and_zeros_past_its_end() {
     let _guard = serialized();
@@ -11225,11 +11252,249 @@ fn a_read_only_file_mapping_holds_the_files_bytes_and_zeros_past_its_end() {
         asm.mov(0, 0);
         asm.mov(1, 100);
         asm.mov(2, 3);
-        asm.mov(3, 0x01);
+        asm.mov(3, 0x02);
         asm.mov(4, rw as u64);
         asm.mov(5, 0);
     });
-    assert!(error.to_string().contains("PROT_READ only"), "{error}");
+    assert!(error.to_string().contains("copy-on-write"), "{error}");
+    assert!(error.to_string().contains("/buffer.bin"), "the refusal names the file: {error}");
+}
+
+/// `mmap(NULL, length, prot, flags, fd, offset)` through a real thunk: `(value, errno)`.
+fn mmap_errno(f: &Fixture, length: u64, prot: u64, flags: u64, fd: i32, offset: u64) -> (u64, i32) {
+    value_and_errno(f, "mmap", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, length);
+        asm.mov(2, prot);
+        asm.mov(3, flags);
+        asm.mov(4, fd as u64);
+        asm.mov(5, offset);
+    })
+}
+
+/// One 64-bit guest store at `at`, from translated code -- which is how the engine's `memcpy`
+/// reaches a mapping: through the host page tables, with no handler in between.
+fn guest_store(f: &Fixture, at: u64, value: u64) {
+    let entry = program(f, |asm| {
+        asm.mov(9, at);
+        asm.mov(10, value);
+        asm.push(str_imm(10, 9, 0));
+    });
+    let exit = run_program(f, entry).expect("the store must run");
+    assert!(matches!(exit, ExitReason::Returned { .. }), "a store at {at:#x} did not land: {exit:?}");
+}
+
+/// One 32-bit guest store at `at`.
+fn guest_store_w(f: &Fixture, at: u64, value: u32) {
+    let entry = program(f, |asm| {
+        asm.mov(9, at);
+        asm.mov(10, u64::from(value));
+        asm.push(str_w(10, 9, 0));
+    });
+    let exit = run_program(f, entry).expect("the store must run");
+    assert!(matches!(exit, ExitReason::Returned { .. }), "a store at {at:#x} did not land: {exit:?}");
+}
+
+/// **The engine's `MappedFile`, step for step, and the file on disk is the evidence.**
+///
+/// DECODED from `libroblox.so` (link addresses): `open(tmp, O_RDWR | O_CREAT | O_TRUNC)`,
+/// `posix_fallocate`, `mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)` and `close(fd)`
+/// on the next instruction (`0x2273210`); `resize(n)` is `munmap` and the same again with `n`
+/// (`0x6222d0c`); then `memcpy` in, `msync(ptr, n, MS_SYNC)` (`0x6222e30`), `munmap`
+/// (`0x24b459c`), and a rename into place (`0x2d850c0`). The first signed-in session had three
+/// threads die on the `mmap`.
+///
+/// What would make this pass while the mapping did not write the file: nothing. A copy-on-write
+/// view (`PAGE_WRITECOPY`) or an anonymous copy leaves the file at the fallocated zeros, and the
+/// first assertion on `disk` says so. The re-`open` with `O_TRUNC` after the first `munmap` only
+/// succeeds if unmapping really released the section -- the host refuses to truncate a file a
+/// section still holds (`ERROR_USER_MAPPED_FILE`, 1224), which the `ftruncate` near the end shows
+/// is refused by name while the mapping is live.
+#[test]
+fn a_shared_writable_file_mapping_writes_the_file_it_maps() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("mmap-shared");
+    let tmp = "/cache.tmp.0";
+    let host = scratch.path("cache.tmp.0");
+
+    // `open(path)`: the first mapping, at the engine's up-front size (100 MiB there, 1 MiB here).
+    let fd = open_through_guest(&f, tmp, O_RDWR | O_CREAT | O_TRUNC);
+    assert!(fd >= 3, "open: {fd}");
+    let first_len: u64 = 1 << 20;
+    assert_eq!(call_with_errno(&f, "posix_fallocate", &[fd as u64, 0, first_len]), (0, 0));
+    let (big, errno) = mmap_errno(&f, first_len, 3, 0x01, fd, 0);
+    assert_ne!(big, u64::MAX, "MAP_FAILED, errno {errno}");
+    assert_eq!(call_with_errno(&f, "close", &[fd as u64]), (0, 0));
+
+    // `resize(n)`: unmap, re-open truncating, fallocate `n`, map `n`. `n` is what was
+    // decompressed, so not a page multiple.
+    assert_eq!(call_with_errno(&f, "munmap", &[big, first_len]), (0, 0));
+    let fd = open_through_guest(&f, tmp, O_RDWR | O_CREAT | O_TRUNC);
+    assert!(fd >= 3, "the re-open truncating must succeed once nothing maps the file: {fd}");
+    let n: u64 = 5000;
+    assert_eq!(call_with_errno(&f, "posix_fallocate", &[fd as u64, 0, n]), (0, 0));
+    let (at, errno) = mmap_errno(&f, n, 3, 0x01, fd, 0);
+    assert_ne!(at, u64::MAX, "MAP_FAILED, errno {errno}");
+    assert_eq!(at % f.guest.space.page_size() as u64, 0);
+    assert_eq!(call_with_errno(&f, "close", &[fd as u64]), (0, 0));
+
+    // `write`: the engine's memcpy, as stores. The file's first and last eight bytes, and eight
+    // bytes past its end, inside the mapping's last page.
+    let head = 0x1122_3344_5566_7788u64;
+    let tail = 0x99AA_BBCC_DDEE_FF00u64;
+    let beyond = 0x5A5A_5A5A_5A5A_5A5Au64;
+    guest_store(&f, at, head);
+    guest_store(&f, at + n - 8, tail);
+    guest_store(&f, at + n, beyond);
+
+    // No msync yet, and another reader of the file already sees the stores: the mapping *is*
+    // the file, as a Linux shared mapping is the page cache.
+    let disk = std::fs::read(&host).expect("read the host file");
+    assert_eq!(&disk[..8], &head.to_le_bytes(), "a store through a MAP_SHARED mapping is in the file");
+    assert_eq!(disk.len(), n as usize, "the mapping must not change the file's length");
+    assert_eq!(&disk[n as usize - 8..], &tail.to_le_bytes(), "the file's last bytes");
+    assert_eq!(&disk[8..16], &[0u8; 8], "untouched bytes are the fallocated zeros");
+    assert_eq!(read_u64_guest(&f, (at + n) as usize), beyond, "past the end stays in the page");
+
+    // `flush`: msync(MS_SYNC) with the length written, not the mapping's.
+    let second = 0x0F0E_0D0C_0B0A_0908u64;
+    guest_store(&f, at + 8, second);
+    assert_eq!(call_with_errno(&f, "msync", &[at, n, 4]), (0, 0));
+    assert_eq!(&std::fs::read(&host).expect("read")[8..16], &second.to_le_bytes());
+
+    // Shortening a mapped file is the one thing the host will not do, and it is a refusal naming
+    // the host's reason rather than an errno the guest would believe.
+    let other = open_through_guest(&f, tmp, O_RDWR);
+    let refusal = refusal_of(&f, "ftruncate", |asm| {
+        asm.mov(0, other as u64);
+        asm.mov(1, 0);
+    });
+    assert!(refusal.to_string().contains("1224"), "{refusal}");
+    assert_eq!(call_with_errno(&f, "close", &[other as u64]), (0, 0));
+
+    // `close`, then `AtomicCacheWrite`'s rename: the file in place is `n` bytes of what was written.
+    let third = 0x7766_5544_3322_1100u64;
+    guest_store(&f, at + 16, third);
+    assert_eq!(call_with_errno(&f, "munmap", &[at, n]), (0, 0));
+    let from = f.cstring(f.guest.data + 0x100, tmp.as_bytes());
+    let to = f.cstring(f.guest.data + 0x180, b"/cache");
+    assert_eq!(call_with_errno(&f, "rename", &[from as u64, to as u64]), (0, 0));
+    let disk = std::fs::read(scratch.path("cache")).expect("the renamed file");
+    assert_eq!(disk.len(), n as usize);
+    assert_eq!(&disk[..8], &head.to_le_bytes());
+    assert_eq!(&disk[8..16], &second.to_le_bytes());
+    assert_eq!(&disk[16..24], &third.to_le_bytes(), "a store after the msync, before the munmap");
+    assert_eq!(&disk[n as usize - 8..], &tail.to_le_bytes());
+}
+
+/// **An offset, and a length ending inside the file's last page**, checked against bytes the file
+/// held beforehand -- so a mapping of the wrong part of the file cannot pass -- and Linux's
+/// `MAP_FAILED` answers for a misaligned offset, a descriptor not open for reading *or* not open
+/// for writing (`do_mmap`: `MAP_SHARED` with `PROT_WRITE` needs `O_RDWR`), and no descriptor.
+#[test]
+fn a_shared_writable_mapping_honours_its_offset_and_the_files_last_page() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("mmap-shared-offset");
+    let page = f.guest.space.page_size();
+    let size = 3 * page + 100;
+    let content: Vec<u8> = (0..size).map(|n| (n * 13 % 251) as u8).collect();
+    std::fs::write(scratch.path("data.bin"), &content).expect("a host file");
+    let rw = open_through_guest(&f, "/data.bin", O_RDWR);
+
+    // From the second page to the end of the file: two pages and 100 bytes.
+    let length = size - page;
+    let (at, errno) = mmap_errno(&f, length as u64, 3, 0x01, rw, page as u64);
+    assert_ne!(at, u64::MAX, "MAP_FAILED, errno {errno}");
+    let base = at as usize;
+    assert_eq!(read_guest(&f, base, 16), &content[page..page + 16], "the file from the offset");
+    assert_eq!(read_guest(&f, base + length - 4, 4), &content[size - 4..], "to its last byte");
+    assert_eq!(read_guest(&f, base + length, 8), vec![0u8; 8], "and zeros past its end");
+
+    guest_store(&f, at, 0xDEAD_BEEF_0BAD_F00D);
+    guest_store_w(&f, at + length as u64 - 4, 0x0102_0304);
+    let disk = std::fs::read(scratch.path("data.bin")).expect("read the host file");
+    assert_eq!(disk.len(), size, "the length is the file's own");
+    assert_eq!(&disk[..page], &content[..page], "the page before the offset is untouched");
+    assert_eq!(&disk[page..page + 8], &0xDEAD_BEEF_0BAD_F00Du64.to_le_bytes());
+    assert_eq!(&disk[size - 4..], &0x0102_0304u32.to_le_bytes(), "the file's last four bytes");
+    assert_eq!(&disk[page + 8..size - 4], &content[page + 8..size - 4], "and nothing else");
+    assert_eq!(call_with_errno(&f, "munmap", &[at, length as u64]), (0, 0));
+
+    assert_eq!(mmap_errno(&f, 100, 3, 0x01, rw, 100), (u64::MAX, 22), "a misaligned offset: EINVAL");
+    let ro = open_through_guest(&f, "/data.bin", O_RDONLY);
+    assert_eq!(mmap_errno(&f, 100, 3, 0x01, ro, 0), (u64::MAX, 13), "not open for writing: EACCES");
+    let wo = open_through_guest(&f, "/data.bin", O_WRONLY);
+    assert_eq!(mmap_errno(&f, 100, 3, 0x01, wo, 0), (u64::MAX, 13), "not open for reading: EACCES");
+    assert_eq!(mmap_errno(&f, 100, 3, 0x01, 99, 0), (u64::MAX, 9), "no such descriptor: EBADF");
+    let disk = std::fs::read(scratch.path("data.bin")).expect("read the host file");
+    assert_eq!(disk.len(), size, "no failure touched the file");
+}
+
+/// **What a shared file mapping cannot express is still refused, by name**: whole pages past the
+/// end of the file (Linux maps them and raises `SIGBUS` on touching one), an empty file (the same,
+/// for every page), a writable `MAP_PRIVATE` mapping (copy-on-write of a file, which nothing
+/// decoded asks for) and an executable one.
+#[test]
+fn what_a_shared_file_mapping_cannot_express_is_still_refused_by_name() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("mmap-shared-refusals");
+    let page = f.guest.space.page_size() as u64;
+    std::fs::write(scratch.path("short.bin"), vec![7u8; page as usize + 100]).expect("a host file");
+    let rw = open_through_guest(&f, "/short.bin", O_RDWR);
+    let refuse = |length: u64, prot: u64, flags: u64, fd: i32| {
+        refusal_of(&f, "mmap", |asm| {
+            asm.mov(0, 0);
+            asm.mov(1, length);
+            asm.mov(2, prot);
+            asm.mov(3, flags);
+            asm.mov(4, fd as u64);
+            asm.mov(5, 0);
+        })
+        .to_string()
+    };
+
+    let past = refuse(3 * page, 3, 0x01, rw);
+    assert!(past.contains("past the end of the file"), "{past}");
+    assert!(past.contains("/short.bin"), "the refusal names the file: {past}");
+
+    let empty = open_through_guest(&f, "/empty.bin", O_RDWR | O_CREAT | O_TRUNC);
+    let nothing = refuse(page, 3, 0x01, empty);
+    assert!(nothing.contains("past the end of the file"), "{nothing}");
+
+    let private = refuse(page, 3, 0x02, rw);
+    assert!(private.contains("copy-on-write"), "{private}");
+    for prot in [5u64, 7] {
+        let exec = refuse(page, prot, 0x01, rw);
+        assert!(exec.contains("file-backed") && exec.contains("code"), "prot {prot:#x}: {exec}");
+    }
+    let disk = std::fs::read(scratch.path("short.bin")).expect("read the host file");
+    assert_eq!(disk, vec![7u8; page as usize + 100], "no refusal touched the file");
+}
+
+/// **`msync` answers Linux's errors in `mm/msync.c`'s order**, succeeds on memory with nothing of
+/// its own to write back, and reports a hole as `ENOMEM`.
+#[test]
+fn msync_answers_what_linux_answers() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let page = f.guest.space.page_size() as u64;
+    let at = guest_mmap(&f, 0, 2 * page, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX);
+    let msync = |addr: u64, len: u64, flags: u64| call_with_errno(&f, "msync", &[addr, len, flags]);
+
+    assert_eq!(msync(at, 2 * page, 4), (0, 0), "MS_SYNC over anonymous memory: nothing to write");
+    assert_eq!(msync(at, 100, 1), (0, 0), "MS_ASYNC, the length rounded up to a page");
+    assert_eq!(msync(at, 0, 4), (0, 0), "a length of zero");
+    assert_eq!(msync(at, page, 2), (0, 0), "MS_INVALIDATE, with nothing locked");
+    assert_eq!(msync(at, page, 8), (-1, 22), "an unknown flag: EINVAL");
+    assert_eq!(msync(at + 8, page, 4), (-1, 22), "a misaligned address: EINVAL");
+    assert_eq!(msync(at, page, 5), (-1, 22), "MS_ASYNC with MS_SYNC: EINVAL");
+    assert_eq!(msync(at, u64::MAX, 4), (-1, 12), "a length that wraps: ENOMEM");
+
+    assert_eq!(call_with_errno(&f, "munmap", &[at + page, page]), (0, 0));
+    assert_eq!(msync(at, 2 * page, 4), (-1, 12), "a range with a hole in it: ENOMEM");
+    assert_eq!(msync(at, page, 4), (0, 0), "the mapped half alone");
+    assert_eq!(msync(0x1000, page, 4), (-1, 12), "outside the guest's space: ENOMEM");
 }
 
 /// **`posix_fallocate` makes the file at least `offset + len` bytes long and never shorter, and

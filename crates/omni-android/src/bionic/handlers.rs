@@ -1952,6 +1952,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // M6: the engine's QUIC transport, once it was on Vulkan. Outside Task 1's 188;
     // `BEYOND_THE_PREDICTION` records it.
     ("sendmsg", net::sendmsg),
+    ("recvmsg", net::recvmsg),
     ("recvmmsg", net::recvmmsg),
     ("__sendto_chk", net::sendto_chk),
     ("recvfrom", net::recvfrom),
@@ -2003,6 +2004,9 @@ pub(super) static REENTRANT: &[(&str, ReentrantFn)] = &[
     ("mprotect", guestmem::mprotect),
     ("madvise", guestmem::madvise),
     ("mlock", guestmem::mlock),
+    // The engine's `MappedFile` flush, `MS_SYNC` over a shared file view: disk I/O over up to
+    // 100 MiB, done here where no translating-backend frame is live. `guestmem` has the decode.
+    ("msync", guestmem::msync),
     // ---- phase 3c: thread lifecycle. Re-entrant for both of F9's reasons at once: the start
     // routine is **guest code**, and `pthread_create` maps the new thread's stack, which reaches
     // `GuestSpace`. It is also the only handler that needs the boundary itself, to install the

@@ -200,6 +200,16 @@ pub enum Answer {
     ListGet,
     /// `List.toArray()`: a new `Object[]` of the elements, in order -- empty for an empty list.
     ListToArray,
+    /// `Context.getSharedPreferences(String name, int mode)`: a `SharedPreferencesImpl` bound to
+    /// the store `name`, kept by this instance ([`super::Jni::shared_preferences`]).
+    GetSharedPreferences,
+    /// `SharedPreferences.edit()`: an editor on the receiver's store.
+    PreferencesEdit,
+    /// `SharedPreferences$Editor.putString(String, String)`: recorded on the editor, which is
+    /// returned -- Android's editor returns itself.
+    EditorPutString,
+    /// `SharedPreferences$Editor.apply()`: the editor's writes, committed to its store.
+    EditorApply,
     /// An `Object[0]`.
     ///
     /// `List.toArray()` on the empty list this layer hands the engine. Correct rather than a
@@ -609,6 +619,10 @@ impl Registry {
             | Answer::ListIsEmpty
             | Answer::ListGet
             | Answer::ListToArray
+            | Answer::GetSharedPreferences
+            | Answer::PreferencesEdit
+            | Answer::EditorPutString
+            | Answer::EditorApply
             | Answer::Construct(_)
             | Answer::ShowKeyboard
             | Answer::HideKeyboard
@@ -694,6 +708,14 @@ pub static EXTENDS: &[(&str, &str)] = &[
     ("com/google/androidgamesdk/GameActivity", "android/content/Context"),
     // An interface, stood in as the ancestor: what `List`'s methods resolve through.
     ("java/util/ArrayList", "java/util/List"),
+    // `Application` is a `ContextWrapper`, so a `Context` method ID is good on one. MEASURED: the
+    // engine's app-update code looks `getSharedPreferences` up on `android/content/Context` and
+    // calls it on `ActivityThread.getApplication()`.
+    ("android/app/Application", "android/content/Context"),
+    // Android's own implementations of the two preference interfaces, stood in as their
+    // ancestors as `ArrayList` stands in for `List`.
+    ("android/app/SharedPreferencesImpl", "android/content/SharedPreferences"),
+    ("android/app/SharedPreferencesImpl$EditorImpl", "android/content/SharedPreferences$Editor"),
 ];
 
 /// An instance method.
@@ -1365,17 +1387,61 @@ pub static DECLARED: &[ClassSpec] = &[
     ClassSpec {
         name: "android/content/Context",
         tier: Tier::One,
-        methods: &[m(
-            "getResources",
-            "()Landroid/content/res/Resources;",
-            Answer::NewInstanceOf("android/content/res/Resources"),
-        )],
+        methods: &[
+            m(
+                "getResources",
+                "()Landroid/content/res/Resources;",
+                Answer::NewInstanceOf("android/content/res/Resources"),
+            ),
+            // DECODED, the engine's only use of preferences (its app-update code, `0x2d98960`
+            // onwards): `getSharedPreferences(name, mode).edit()`, `putString` for "channel",
+            // "supportsAndroidBinaries" and "moduleName", then `apply()` -- for the Java side to
+            // read at the next launch. `libroblox.so` references no getter at all, so nothing in
+            // this process reads a preference back; what is written is kept, and an embedding can
+            // read it ([`super::Jni::shared_preferences`]). MEASURED why it is here: unanswered, the
+            // lookup came back null and the engine's game thread died calling through it, right
+            // after the first sign-in -- no frame was drawn again.
+            m(
+                "getSharedPreferences",
+                "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+                Answer::GetSharedPreferences,
+            ),
+        ],
         fields: NONE,
     },
     ClassSpec {
         name: "android/app/Application",
         tier: Tier::Support,
         methods: &[m("getResources", "()Landroid/content/res/Resources;", Answer::Unanswered)],
+        fields: NONE,
+    },
+    // The preference interfaces and Android's implementations of them. The engine reaches the
+    // methods through `GetObjectClass` on what `getSharedPreferences` and `edit` returned (it
+    // names neither interface), so they are declared where the lookup walks to.
+    ClassSpec {
+        name: "android/content/SharedPreferences",
+        tier: Tier::Support,
+        methods: &[m("edit", "()Landroid/content/SharedPreferences$Editor;", Answer::PreferencesEdit)],
+        fields: NONE,
+    },
+    ClassSpec {
+        name: "android/content/SharedPreferences$Editor",
+        tier: Tier::Support,
+        methods: &[
+            m(
+                "putString",
+                "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;",
+                Answer::EditorPutString,
+            ),
+            m("apply", "()V", Answer::EditorApply),
+        ],
+        fields: NONE,
+    },
+    ClassSpec { name: "android/app/SharedPreferencesImpl", tier: Tier::Support, methods: NONE, fields: NONE },
+    ClassSpec {
+        name: "android/app/SharedPreferencesImpl$EditorImpl",
+        tier: Tier::Support,
+        methods: NONE,
         fields: NONE,
     },
     ClassSpec {
@@ -1675,16 +1741,21 @@ pub static DECLARED: &[ClassSpec] = &[
     // zero-initialised `.bss` with no static writer and absent from the empty settings document.
     // With both clear it goes straight to `supportsAAudio()` (`0x4fbc630`) and, when that is
     // true, returns output type `0x14`, whose plugin is "FMOD AAudio Output" (its description's
-    // type word at `+0xb8`, `0x21b588`). `supportsLowLatency` is called only on the paths those
-    // two flags or a `false` from `supportsAAudio` open, so it stays unanswered.
+    // type word at `+0xb8`, `0x21b588`). `FMOD_OS_Output_GetDefault` calls `supportsLowLatency`
+    // only on the paths those two flags or a `false` from `supportsAAudio` open -- **but the AAudio
+    // output's own init does too** (`0x4fbebf4`, just before it opens its stream at `0x4fbf74c`,
+    // keeping the answer at `+0x5cc`): MEASURED in gate117, the first run with `libaaudio.so`
+    // supplied, where the unanswered call killed the game thread. See its declaration below.
     //
-    // **The AAudio output needs `libaaudio.so`, and this runtime supplies none.** Its driver-info
-    // and init functions both start with `dlopen("libaaudio.so")` (`0x4fbf3dc`) and answer
-    // `FMOD_ERR_OUTPUT_INIT` (`0x33`) when it is NULL, before any other JNI call. `SystemI::init`
-    // returns that, and **Roblox is written for it**: at `0x2f04a90` `FmodManager` records
-    // `FmodInitError-<reason>`, calls `System::setOutput(FMOD_OUTPUTTYPE_NOSOUND)` (`0x2f04aa4`,
-    // type 2) and initialises again. That is the NOSOUND fallback a device without the library
-    // would get, and it is the honest one here: there is no audio output behind this layer.
+    // **The AAudio output needs `libaaudio.so`**, which this runtime supplies when an embedding
+    // binds [`crate::aaudio::AAudio`] -- the host's audio output behind FMOD's own `dlsym` list --
+    // and not otherwise. Its driver-info and init functions both start with
+    // `dlopen("libaaudio.so")` (`0x4fbf3dc`) and answer `FMOD_ERR_OUTPUT_INIT` (`0x33`) when it is
+    // NULL, before any other JNI call. `SystemI::init` returns that, and **Roblox is written for
+    // it**: at `0x2f04a90` `FmodManager` records `FmodInitError-<reason>`, calls
+    // `System::setOutput(FMOD_OUTPUTTYPE_NOSOUND)` (`0x2f04aa4`, type 2) and initialises again.
+    // That is the NOSOUND fallback a device without the library would get, and it is the honest
+    // one for an embedding with no audio output.
     ClassSpec {
         name: "org/fmod/FMOD",
         tier: Tier::Support,
@@ -1700,6 +1771,14 @@ pub static DECLARED: &[ClassSpec] = &[
                 "()Z",
                 Answer::Bool(super::script::ANDROID_SDK_LEVEL >= FMOD_AAUDIO_MIN_SDK),
             ),
+            // DECODED, its whole body: `0 < getOutputBlockSize() <= 1024 && lowLatencyFlag() &&
+            // !isBluetoothOn()`, where `lowLatencyFlag()` is
+            // `hasSystemFeature("android.hardware.audio.low_latency")`. That feature is a device's
+            // claim to meet the CDD's latency limits (section 5.6), and nothing has measured this
+            // runtime's audio path against them, so this device does not declare it -- and the
+            // conjunction is `false` whatever the block size and Bluetooth would have said. FMOD
+            // then buffers as it does on any device without the feature.
+            s("supportsLowLatency", "()Z", Answer::Bool(false)),
         ],
         fields: &[sf("gContext", "Landroid/content/Context;", Answer::Assigned)],
     },
@@ -2143,14 +2222,15 @@ mod tests {
         assert_eq!(Registry::simple_answer(Answer::Int(7)), Some(Value::Int(7)));
     }
 
-    /// **FMOD's Android statics: two decided, the rest refusing by name.**
+    /// **FMOD's Android statics: three decided, the rest refusing by name.**
     ///
     /// `supportsAAudio` is the dex's `SDK_INT >= 27` evaluated at the SDK this host presents, 33,
     /// so it is `true` -- a `false` "because this host has no `libaaudio.so`" would be a false
     /// statement about Android 13, and the absence is answered where it is a fact, by `dlopen`.
-    /// `checkInit` reads `gContext`, which is Java-assigned. Every other static is unreached on
-    /// the decoded path (see the declaration) and must still refuse: an invented sample rate or
-    /// block size here would be FMOD sizing its mixer on a number nothing measured.
+    /// `checkInit` reads `gContext`, which is Java-assigned. `supportsLowLatency` is `false`
+    /// because this device declares no `android.hardware.audio.low_latency` (see the declaration).
+    /// Every other static is unreached on the decoded path and must still refuse: an invented
+    /// sample rate or block size here would be FMOD sizing its mixer on a number nothing measured.
     #[test]
     fn fmod_answers_only_what_its_decoded_path_reaches() {
         let registry = Registry::with_declared();
@@ -2162,10 +2242,10 @@ mod tests {
         assert_eq!(super::super::script::ANDROID_SDK_LEVEL, 33, "the SDK every SDK_INT answer uses");
         assert_eq!(answer("supportsAAudio", "()Z"), Answer::Bool(true));
         assert_eq!(answer("checkInit", "()Z"), Answer::StaticIsSet("gContext"));
+        assert_eq!(answer("supportsLowLatency", "()Z"), Answer::Bool(false));
         let field = registry.field(id, "gContext", "Landroid/content/Context;", true).expect("declared");
         assert_eq!(registry.field_member(field).expect("a member").answer, Answer::Assigned);
         for (name, descriptor) in [
-            ("supportsLowLatency", "()Z"),
             ("getOutputSampleRate", "()I"),
             ("getOutputBlockSize", "()I"),
             ("getAssetManager", "()Landroid/content/res/AssetManager;"),

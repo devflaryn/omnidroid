@@ -1636,3 +1636,133 @@ fn an_access_may_not_straddle_from_one_mapping_into_another() {
     assert_eq!(refusal, omni_mem::Refusal::NotMapped);
     assert_tiles_the_space(&space);
 }
+
+// -------------------------------------------------------------------------------------------
+// Shared file views: the guest's writable MAP_SHARED
+// -------------------------------------------------------------------------------------------
+
+/// Open a test file for reading and writing, as the guest's own descriptor would be.
+fn read_write(file: &TempFile) -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file.path())
+        .expect("open the test file for reading and writing")
+}
+
+/// **A shared view writes its file, from the first store, through every protection it passes
+/// through, and through the emulated partial unmap** -- and the file keeps its own length.
+///
+/// Mapped `Read` first and raised to `ReadWrite` on purpose: that is the order in which a view
+/// created with the requested protection would silently become copy-on-write (its flavour is fixed
+/// at creation), so this is the detector for "created `PAGE_READWRITE` and protected down". The
+/// file's length is not a page multiple, which is the engine's case: it `posix_fallocate`s exactly
+/// the bytes it is about to write and maps that many.
+#[test]
+fn a_shared_view_writes_its_file_through_a_protect_and_a_partial_unmap() {
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let len = 3 * page + 100;
+    let file = TempFile::new("shared.bin", len, page);
+    let backing = Backing::share(read_write(&file), "/data/shared.bin").expect("share the file");
+    assert!(backing.is_shared());
+    let map_len = 4 * page;
+    let address = space
+        .map_file(&backing, 0, Placement::Anywhere { align: page }, map_len, Protection::Read)
+        .expect("a view ending inside the file's last page");
+    assert_eq!(space.stats().committed, 0, "a shared view is the file's pages, not commit");
+    space.protect(address, map_len, Protection::ReadWrite).expect("raise it");
+
+    // SAFETY: the whole view is mapped and now writable; `len` is inside its last page.
+    unsafe {
+        fill(address + 10, 1, 0xA1);
+        fill(address + len - 1, 1, 0xA2);
+        fill(address + len, 1, 0xA3);
+    }
+    let disk = std::fs::read(file.path()).expect("read the file back");
+    assert_eq!(disk.len(), len, "the view must not change the file's length");
+    assert_eq!(disk[10], 0xA1, "a store through a shared view must reach the file");
+    assert_eq!(disk[len - 1], 0xA2, "the file's last byte, from the view's last page");
+    assert_eq!(disk[11], file.byte_at(11), "an untouched byte is the file's own");
+    // SAFETY: the view's last page is mapped; past the file's end it is memory, not file.
+    unsafe {
+        assert_eq!(read(address + len), 0xA3, "the store past the end is held in the page");
+        assert_eq!(read(address + len + 1), 0, "and the rest of that page reads as zero");
+    }
+
+    assert_eq!(space.sync(address, map_len).expect("sync"), map_len, "the whole view is shared");
+
+    // Partial unmap: the head page goes, the survivors are mapped again from the same section.
+    space.unmap(address, page).expect("unmap the head page");
+    // SAFETY: the survivors are live and still writable.
+    unsafe {
+        assert_eq!(read(address + len - 1), 0xA2, "a survivor is still the file");
+        fill(address + page + 20, 1, 0xB1);
+    }
+    let disk = std::fs::read(file.path()).expect("read the file back");
+    assert_eq!(disk[page + 20], 0xB1, "a survivor of a partial unmap is still a shared view");
+    assert_eq!(disk[10], 0xA1, "the unmapped head's write stays in the file, as on Linux");
+    assert_tiles_the_space(&space);
+
+    // With every view gone and the last `Arc` dropped, the section is closed: the host allows the
+    // file to be shortened again, which it refuses while a section exists (1224).
+    space.unmap(address + page, map_len - page).expect("unmap the rest");
+    drop(backing);
+    read_write(&file).set_len(1).expect("shorten the file once nothing maps it");
+}
+
+/// `sync` writes back shared views and **only** shared views, and skips free space rather than
+/// refusing it: Linux's `msync` does both.
+#[test]
+fn sync_counts_only_shared_views_and_skips_holes() {
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let anonymous = space
+        .map_anonymous(
+            Placement::Anywhere { align: page },
+            2 * page,
+            Protection::ReadWrite,
+            CommitPolicy::Eager,
+        )
+        .expect("anonymous memory");
+    assert_eq!(space.sync(anonymous, 2 * page).expect("sync anonymous"), 0);
+
+    let (_private_file, private) = backing("private.bin", 2 * page, page, MapExecutability::NonExecutable);
+    let private_view = space
+        .map_file(&private, 0, Placement::Anywhere { align: page }, 2 * page, Protection::ReadWrite)
+        .expect("a private view");
+    assert_eq!(space.sync(private_view, 2 * page).expect("sync private"), 0);
+
+    let shared_file = TempFile::new("shared-sync.bin", 2 * page, page);
+    let shared = Backing::share(read_write(&shared_file), "/data/s.bin").expect("share");
+    let target = space.base() + 32 * MIB;
+    let shared_view = space
+        .map_file(&shared, 0, Placement::Fixed(target), page, Protection::ReadWrite)
+        .expect("a shared view");
+    // A range that starts on the shared page and runs into free space after it.
+    assert_eq!(space.sync(shared_view, 4 * page).expect("a hole is skipped"), page);
+}
+
+/// A handle without write access cannot back a shared view: the section is refused, which is
+/// Linux's `EACCES` for a `MAP_SHARED` writable mapping of a descriptor not open for writing.
+/// An empty file cannot have one at all.
+#[test]
+fn a_shared_backing_needs_write_access_and_a_non_empty_file() {
+    let page = omni_platform_page();
+    let file = TempFile::new("read-only.bin", page, page);
+    let read_only = std::fs::File::open(file.path()).expect("open read-only");
+    let error = Backing::share(read_only, "/data/ro.bin").expect_err("must refuse");
+    assert_eq!(
+        error.platform_error().and_then(|e| e.os_error()).map(|e| e.code()),
+        Some(5),
+        "ERROR_ACCESS_DENIED: {error}"
+    );
+
+    let empty = TempFile::new("empty.bin", 0, page);
+    let error = Backing::share(read_write(&empty), "/data/empty.bin").expect_err("must refuse");
+    assert!(error.to_string().contains("0 bytes long"), "{error}");
+}
+
+fn omni_platform_page() -> usize {
+    space(MIB).page_size()
+}

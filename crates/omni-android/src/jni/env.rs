@@ -1610,6 +1610,118 @@ fn refuse_slot_named(name: &str, address: GuestAddr) -> AbiError {
 }
 
 /// Evaluate a member's [`Answer`].
+/// `SharedPreferences`, as far as the guest uses it: see `Context.getSharedPreferences`'s
+/// declaration in `classes`. Object parameters arrive as raw handles (`Value::Long`), as in
+/// `ShowKeyboard`.
+fn preferences(
+    state: &mut JniState,
+    name: &str,
+    address: GuestAddr,
+    class: ClassId,
+    member: &Member,
+    receiver: Option<ObjectId>,
+    arguments: &[Value],
+) -> AbiResult<Value> {
+    use super::PreferencesObject;
+    let refuse = |state: &JniState, why: String| AbiError::JniRefused {
+        function: name.to_string(),
+        address,
+        detail: format!(
+            "`{}.{}{}`: {why}",
+            state.registry.class_name(class),
+            member.name,
+            member.descriptor
+        ),
+    };
+    let text = |state: &mut JniState, raw: i64, what: &str| -> AbiResult<String> {
+        if raw == 0 {
+            return Err(refuse(state, format!("the {what} is null, which Android throws on")));
+        }
+        let id = state.handles.resolve_id(name, address, raw as u64)?;
+        match state.handles.object_of(id) {
+            Some(Object::String(text)) => Ok(text.to_string_lossy()),
+            other => Err(refuse(state, format!("the {what} is {other:?}, not a String"))),
+        }
+    };
+    let this = |state: &JniState| -> AbiResult<(ObjectId, PreferencesObject)> {
+        let Some(receiver) = receiver else {
+            return Err(refuse(state, "called with no receiver".to_string()));
+        };
+        match state.preference_objects.get(&receiver) {
+            Some(object) => Ok((receiver, object.clone())),
+            None => Err(refuse(state, "the receiver is not a preferences object this layer made".to_string())),
+        }
+    };
+    match member.answer {
+        Answer::GetSharedPreferences => {
+            let [Value::Long(store), Value::Int(mode)] = arguments else {
+                return Err(refuse(state, format!("the arguments are {arguments:?}, not (String, int)")));
+            };
+            // `MODE_PRIVATE` (0), and `MODE_MULTI_PROCESS` (4), which is deprecated and changes
+            // nothing on the Android this layer presents. `MODE_WORLD_READABLE`/`WRITEABLE` throw
+            // `SecurityException` from API 24, and this layer raises no Java exceptions.
+            if !matches!(mode, 0 | 4) {
+                return Err(refuse(state, format!("mode {mode} throws SecurityException on API 24+")));
+            }
+            let store = text(state, *store, "name")?;
+            let Some(impl_class) = state.registry.find("android/app/SharedPreferencesImpl") else {
+                return Err(refuse(state, "`android/app/SharedPreferencesImpl` is not declared".to_string()));
+            };
+            let object = state.handles.create(
+                name,
+                address,
+                Object::Instance { class: impl_class, fields: std::collections::BTreeMap::new() },
+            )?;
+            state.preference_objects.insert(object, PreferencesObject::Store(store));
+            Ok(Value::Object(Some(object)))
+        }
+        Answer::PreferencesEdit => {
+            let (_, object) = this(state)?;
+            let PreferencesObject::Store(store) = object else {
+                return Err(refuse(state, "the receiver is an editor, not a SharedPreferences".to_string()));
+            };
+            let Some(editor_class) = state.registry.find("android/app/SharedPreferencesImpl$EditorImpl") else {
+                return Err(refuse(state, "`SharedPreferencesImpl$EditorImpl` is not declared".to_string()));
+            };
+            let editor = state.handles.create(
+                name,
+                address,
+                Object::Instance { class: editor_class, fields: std::collections::BTreeMap::new() },
+            )?;
+            state.preference_objects.insert(editor, PreferencesObject::Editor { store, pending: Vec::new() });
+            Ok(Value::Object(Some(editor)))
+        }
+        Answer::EditorPutString => {
+            let (editor, object) = this(state)?;
+            let [Value::Long(key), Value::Long(value)] = arguments else {
+                return Err(refuse(state, format!("the arguments are {arguments:?}, not (String, String)")));
+            };
+            let key = text(state, *key, "key")?;
+            // A null value is `remove(key)` on Android; the engine always passes a string.
+            let value = text(state, *value, "value")?;
+            match state.preference_objects.get_mut(&editor) {
+                Some(PreferencesObject::Editor { pending, .. }) => pending.push((key, value)),
+                _ => {
+                    let _ = object;
+                    return Err(refuse(state, "the receiver is not an editor".to_string()));
+                }
+            }
+            Ok(Value::Object(Some(editor)))
+        }
+        Answer::EditorApply => {
+            let (editor, _) = this(state)?;
+            let Some(PreferencesObject::Editor { store, pending }) = state.preference_objects.get_mut(&editor)
+            else {
+                return Err(refuse(state, "the receiver is not an editor".to_string()));
+            };
+            let (store, writes) = (store.clone(), std::mem::take(pending));
+            state.shared_preferences.entry(store).or_default().extend(writes);
+            Ok(Value::Void)
+        }
+        _ => unreachable!("preferences() is only called for the four preference answers"),
+    }
+}
+
 pub(super) fn evaluate(
     state: &mut JniState,
     name: &str,
@@ -1835,6 +1947,10 @@ pub(super) fn evaluate(
                 state.handles.create(name, address, Object::Instance { class, fields: stored })?;
             Ok(Value::Object(Some(object)))
         }
+        Answer::GetSharedPreferences
+        | Answer::PreferencesEdit
+        | Answer::EditorPutString
+        | Answer::EditorApply => preferences(state, name, address, class, member, receiver, arguments),
         Answer::ListSize | Answer::ListIsEmpty | Answer::ListGet | Answer::ListToArray => {
             let elements = list_elements(state, name, address, class, member, receiver)?;
             match member.answer {
@@ -2625,6 +2741,85 @@ mod tests {
         let member = state.registry.member(method).expect("a member").clone();
         let receiver = state.handles.resolve_id("test", 0, list).expect("a live list");
         evaluate(&mut state, "CallIntMethodV", 0, class, &member, Some(receiver), arguments)
+    }
+
+    /// Call `member` as looked up on `class`, on `receiver`, the way `Call*MethodV` does.
+    fn call_on(
+        jni: &Jni,
+        class: &str,
+        receiver: ObjectId,
+        member: &str,
+        descriptor: &str,
+        arguments: &[Value],
+    ) -> AbiResult<Value> {
+        let mut state = jni.state();
+        let class = state.registry.find(class).expect("declared");
+        let method = state.registry.method(class, member, descriptor, false).expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        evaluate(&mut state, "CallObjectMethodV", 0, class, &member, Some(receiver), arguments)
+    }
+
+    /// **The engine's one preferences write lands in the store it named**: `getSharedPreferences`
+    /// looked up on `Context` and called on the `Application`, `edit()` and two `putString`s
+    /// through the classes `GetObjectClass` answers, then `apply()`. Before `apply` nothing is in
+    /// the store; a second editor's writes join the first's; a world-readable mode, a null value
+    /// and a receiver that is not an editor are refused.
+    #[test]
+    fn the_engines_preferences_write_lands_in_the_named_store() {
+        let (jni, _mem) = slot_fixture();
+        let text = |value: &str| Value::Long(jni.new_string(value).expect("a string") as i64);
+        let application = {
+            let handle = jni.new_object("android/app/Application").expect("an Application");
+            jni.state().handles.resolve_id("test", 0, handle).expect("live")
+        };
+        let object = |value: Value| match value {
+            Value::Object(Some(id)) => id,
+            other => panic!("{other:?}"),
+        };
+        let prefs = object(
+            call_on(
+                &jni,
+                "android/content/Context",
+                application,
+                "getSharedPreferences",
+                "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+                &[text("app_update"), Value::Int(0)],
+            )
+            .expect("getSharedPreferences"),
+        );
+        let editor = object(
+            call_on(&jni, "android/app/SharedPreferencesImpl", prefs, "edit", "()Landroid/content/SharedPreferences$Editor;", &[])
+                .expect("edit"),
+        );
+        let put = "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;";
+        let editor_class = "android/app/SharedPreferencesImpl$EditorImpl";
+        let returned = call_on(&jni, editor_class, editor, "putString", put, &[text("channel"), text("production")])
+            .expect("putString");
+        assert_eq!(returned, Value::Object(Some(editor)), "the editor returns itself");
+        call_on(&jni, editor_class, editor, "putString", put, &[text("moduleName"), text("engine")]).expect("putString");
+        assert_eq!(jni.shared_preferences("app_update"), None, "nothing is in the store before apply");
+        assert_eq!(call_on(&jni, editor_class, editor, "apply", "()V", &[]).expect("apply"), Value::Void);
+        let second = object(
+            call_on(&jni, "android/app/SharedPreferencesImpl", prefs, "edit", "()Landroid/content/SharedPreferences$Editor;", &[])
+                .expect("edit"),
+        );
+        call_on(&jni, editor_class, second, "putString", put, &[text("channel"), text("beta")]).expect("putString");
+        call_on(&jni, editor_class, second, "apply", "()V", &[]).expect("apply");
+        let stored = jni.shared_preferences("app_update").expect("applied");
+        assert_eq!(stored.get("channel").map(String::as_str), Some("beta"), "a later apply overwrites");
+        assert_eq!(stored.get("moduleName").map(String::as_str), Some("engine"), "and keeps the rest");
+
+        assert!(call_on(
+            &jni,
+            "android/content/Context",
+            application,
+            "getSharedPreferences",
+            "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+            &[text("x"), Value::Int(1)],
+        )
+        .is_err(), "MODE_WORLD_READABLE throws on the Android this layer presents");
+        assert!(call_on(&jni, editor_class, editor, "putString", put, &[text("k"), Value::Long(0)]).is_err());
+        assert!(call_on(&jni, editor_class, application, "apply", "()V", &[]).is_err(), "not an editor");
     }
 
     /// **The exit list is what the embedding recorded, and the engine reads it as a device's**:

@@ -723,6 +723,8 @@ const SC_NPROCESSORS_CONF: i32 = 0x0060;
 const SC_NPROCESSORS_ONLN: i32 = 0x0061;
 /// bionic's `_SC_PHYS_PAGES`.
 const SC_PHYS_PAGES: i32 = 0x0062;
+/// bionic's `_SC_OPEN_MAX`.
+const SC_OPEN_MAX: i32 = 0x000b;
 
 /// What a `sysconf` name is believed to be, for the refusal's diagnostic half.
 ///
@@ -732,7 +734,7 @@ const SC_PHYS_PAGES: i32 = 0x0062;
 fn believed_sysconf_name(name: i32) -> Option<&'static str> {
     Some(match name {
         0x0006 => "_SC_CLK_TCK",
-        0x000b => "_SC_OPEN_MAX",
+        SC_OPEN_MAX => "_SC_OPEN_MAX",
         0x0026 => "_SC_IOV_MAX",
         SC_PAGESIZE => "_SC_PAGESIZE",
         SC_PAGE_SIZE => "_SC_PAGE_SIZE",
@@ -745,7 +747,8 @@ fn believed_sysconf_name(name: i32) -> Option<&'static str> {
 
 /// `long sysconf(int name)`
 ///
-/// Answers the page size and the processor count, and refuses everything else by name. See this
+/// Answers the page size, the processor count, the memory budget's pages and the descriptor
+/// ceiling, and refuses everything else by name. See this
 /// module's documentation for the evidence that licensed the four numbers, which is the guest's
 /// own call sites rather than a header.
 ///
@@ -758,6 +761,11 @@ pub(super) fn sysconf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let state = active(c.symbol(), c.address())?;
     let value: i64 = match name {
         SC_PAGESIZE | SC_PAGE_SIZE => state.bionic.space_page_size() as i64,
+        // **The descriptor table's own capacity**, which is this runtime's `RLIMIT_NOFILE`: past
+        // it `open`, `socket` and the rest answer `EMFILE` (`omni_platform::fs::MAX_OPEN_FILES`).
+        // Read from that constant, so the two cannot disagree. MEASURED why: once signed in, an
+        // engine worker asked and died on the refusal.
+        SC_OPEN_MAX => omni_platform::fs::MAX_OPEN_FILES as i64,
         SC_NPROCESSORS_CONF | SC_NPROCESSORS_ONLN => {
             // A failure here is reported, never substituted. `sysconf` answers `-1` without
             // setting `errno` for a name the implementation does not support, which a caller

@@ -3396,6 +3396,31 @@ pub(super) fn recvmmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     })
 }
 
+/// `ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)`
+///
+/// One message, received exactly as one entry of `recvmmsg` is ([`receive_message`], which has
+/// what is and is not reported): the same helper, so the two cannot disagree about a `msghdr`.
+/// MEASURED reader: once signed in, a QUIC receiver thread (`0x5b19ccc`: one `iovec`, a
+/// 128-byte `msg_name` and a 1,064-byte control buffer it then parses for IPv4/IPv6 ancillary
+/// data) died on the unbound symbol. It gets no control message, which is true: every option that
+/// would make Linux add one is refused by `setsockopt`.
+pub(super) fn recvmsg(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, msg, flags) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    transfer_result(c, &state, |view| {
+        let handle = match socket_for_transfer(view, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => return Ok(Netted::Failed(errno)),
+        };
+        check_message_flags(view, flags)?;
+        let nonblocking = locked(&handle).nonblocking();
+        receive_message(view, &handle, fd, msg, !nonblocking, flags & MSG_DONTWAIT != 0)
+    })
+}
+
 /// Receive one datagram into the `msghdr` at `msg`, as `recvmsg` does: scattered over its
 /// `iovec`s in order, its source written to `msg_name` (truncated to `msg_namelen`, which is then
 /// set to the full length -- `move_addr_to_user`), `msg_controllen` set to 0 and `msg_flags` to 0.

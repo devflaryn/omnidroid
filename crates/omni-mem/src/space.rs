@@ -628,8 +628,10 @@ impl GuestSpace {
                 os: OsState::View { view },
                 owner: Some(owner),
                 // A ReadWrite view is PAGE_WRITECOPY, so it can hold privatised content from its
-                // first write onwards.
-                ever_writable: protection.is_writable(),
+                // first write onwards. **Unless the backing is shared**: then every write is in
+                // the file already, a survivor mapped again from it gets that content back by
+                // construction, and there is nothing only a copy-on-write page holds.
+                ever_writable: protection.is_writable() && !backing.is_shared(),
             },
         );
         inner.validate();
@@ -742,6 +744,68 @@ impl GuestSpace {
         inner.validate();
         tracing::debug!(address = format_args!("{address:#x}"), len, "unmapped guest memory");
         Ok(())
+    }
+
+    /// Write every **shared** file view in `[address, address + len)` back to its file, and the
+    /// file to the device: the guest's `msync(MS_SYNC)`. Returns how many bytes of shared view the
+    /// range held, which is what was written back; anonymous memory and private file views have
+    /// nothing of their own to write and are skipped, as Linux skips them.
+    ///
+    /// Page-granular. **Free address space in the range is skipped too, not refused**, which is
+    /// `mm/msync.c`'s rule: it writes back the mapped parts and only then reports `ENOMEM` for the
+    /// hole. Whether there was one is the caller's to find out and report.
+    ///
+    /// # The flush runs with the map unlocked
+    ///
+    /// The views are found under the lock and written back after it is released, because a
+    /// write-back is disk I/O -- the engine syncs 100 MiB mappings -- and **every** bounds check of
+    /// every import handler and every pager fault takes this lock (see
+    /// [`map_lock_is_held`](GuestSpace::map_lock_is_held)). The backings are held by `Arc` across
+    /// the gap, so the section and its file handle cannot go away under the flush. A guest thread
+    /// that unmaps the range *during* its own `msync` is racing itself, as it would be on Linux;
+    /// here the flush then fails, or writes back whatever view has replaced it, and touches no
+    /// memory either way.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::ZeroSize`], [`MemError::Misaligned`], [`MemError::OutsideSpace`], or
+    /// [`MemError::Platform`] when the host's write-back fails.
+    pub fn sync(&self, address: GuestAddr, len: usize) -> MemResult<usize> {
+        const OP: &str = "sync";
+        let len = self.round_size(OP, len)?;
+        self.check_aligned(OP, "address", address)?;
+        self.check_range(OP, address, len)?;
+        let end = address + len;
+        let views: Vec<(GuestAddr, usize, Arc<Backing>)> = {
+            let inner = self.inner.lock();
+            inner
+                .map
+                .starts_overlapping(address, len)
+                .into_iter()
+                .filter_map(|start| {
+                    let entry = inner.map.get(start)?;
+                    let backing = entry.owner.as_ref()?.backing.as_ref()?;
+                    if !matches!(entry.os, OsState::View { .. }) || !backing.is_shared() {
+                        return None;
+                    }
+                    let from = start.max(address);
+                    let to = (start + entry.len).min(end);
+                    Some((from, to - from, Arc::clone(backing)))
+                })
+                .collect()
+        };
+        let mut synced = 0;
+        for (from, piece, backing) in views {
+            // SAFETY: the region map, which is the authority on what is at every guest address,
+            // said a moment ago that `[from, from + piece)` is a view of `backing`, and the `Arc`
+            // keeps that section alive. Nothing is dereferenced: the host call inspects and writes
+            // back the range's pages, and if a concurrent unmap has changed the range since, it
+            // fails or writes back whichever view is there now -- see this method's documentation.
+            unsafe { vm::sync_view(backing.file(), from as *mut u8, piece) }
+                .map_err(platform(OP, from, piece))?;
+            synced += piece;
+        }
+        Ok(synced)
     }
 
     /// Mark a committed range idle: the guest no longer needs its contents.
@@ -1408,10 +1472,17 @@ impl Inner {
                 }
             }
             let entry = self.map.get_mut(start).expect("entry vanished");
-            if protection.is_writable() && matches!(entry.os, OsState::View { .. }) {
+            let shared = entry
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.backing.as_ref())
+                .is_some_and(|backing| backing.is_shared());
+            if protection.is_writable() && matches!(entry.os, OsState::View { .. }) && !shared {
                 // From here on, this range may hold copy-on-write content that is not in the file,
                 // and `unmap` has to preserve it across the re-map a partial unmap requires. Sticky:
                 // lowering the protection again does not un-privatise a page that was written.
+                // A view of a shared backing is excluded for `map_file`'s reason: its writes are
+                // in the file, not in private pages.
                 entry.ever_writable = true;
             }
             if let Some(owner) = entry.owner.as_mut() {

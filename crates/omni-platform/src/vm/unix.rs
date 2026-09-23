@@ -140,9 +140,26 @@ pub(super) fn open_file_for_mapping(
     unsupported("open_file_for_mapping")
 }
 
+/// Intended: keep a duplicate of the caller's descriptor (`fcntl(F_DUPFD_CLOEXEC)`), with the
+/// file's length from `fstat`. There is no section object: the sharing is chosen per view, by
+/// `map_file` passing `MAP_SHARED` for a file made mappable here.
+pub(super) fn share_file_for_mapping(
+    _file: std::fs::File,
+    _name: &Path,
+) -> VmResult<MappableFile> {
+    unsupported("share_file_for_mapping")
+}
+
+/// Intended: `msync(ptr, size, MS_SYNC)`, which on Linux ends in `vfs_fsync_range` and so needs no
+/// separate device flush.
+pub(super) fn sync_view(_file: &MappableFile, _address: usize, _size: usize) -> VmResult<()> {
+    unsupported("sync_view")
+}
+
 /// Intended: `mmap(ptr, size, prot, MAP_PRIVATE | MAP_FIXED, fd, file_offset)`, with
 /// [`Protection::ReadWrite`] as `MAP_PRIVATE` (copy-on-write, matching the Windows
-/// `PAGE_WRITECOPY` view) rather than `MAP_SHARED`.
+/// `PAGE_WRITECOPY` view) rather than `MAP_SHARED` -- and `MAP_SHARED` for a file from
+/// [`share_file_for_mapping`].
 pub(super) fn map_file(
     _file: &MappableFile,
     _file_offset: u64,
@@ -256,6 +273,8 @@ pub struct MappableFile {
     len: u64,
     executability: MapExecutability,
     path: PathBuf,
+    /// Whether views are to be `MAP_SHARED`: set by [`share_file_for_mapping`].
+    shared: bool,
 }
 
 impl MappableFile {
@@ -269,6 +288,10 @@ impl MappableFile {
 
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(super) fn is_shared(&self) -> bool {
+        self.shared
     }
 }
 

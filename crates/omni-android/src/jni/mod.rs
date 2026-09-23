@@ -206,6 +206,20 @@ impl ExitRecord {
     }
 }
 
+/// What a preferences object this instance handed out stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreferencesObject {
+    /// A `SharedPreferencesImpl`: the store it names.
+    Store(String),
+    /// An editor on a store, and the writes not yet applied, in order.
+    Editor {
+        /// The store `apply` commits to.
+        store: String,
+        /// `putString`s since the last `apply`.
+        pending: Vec<(String, String)>,
+    },
+}
+
 /// A value the host stores in a field it builds ([`Jni::new_object_with`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostValue {
@@ -265,6 +279,13 @@ pub(crate) struct JniState {
     pub(crate) keyboard: Vec<KeyboardRequest>,
     /// How earlier runs ended, most recent first. See [`Jni::set_previous_exits`].
     pub(crate) previous_exits: Vec<ExitRecord>,
+    /// Every `SharedPreferences` store the guest has written, by name: key to value, as
+    /// `apply()` committed them. See [`Jni::shared_preferences`].
+    pub(crate) shared_preferences: BTreeMap<String, BTreeMap<String, String>>,
+    /// What each preferences object this instance handed out is. Keyed by [`refs::ObjectId`],
+    /// whose generation changes when a slot is reused, so a stale entry can never be read as a
+    /// new object's.
+    pub(crate) preference_objects: BTreeMap<refs::ObjectId, PreferencesObject>,
 }
 
 impl JniState {
@@ -405,6 +426,8 @@ impl Jni {
                 statics: BTreeMap::new(),
                 keyboard: Vec::new(),
                 previous_exits: Vec::new(),
+                shared_preferences: BTreeMap::new(),
+                preference_objects: BTreeMap::new(),
             }),
             pool: Mutex::new(pool),
             census: Mutex::new(BTreeMap::new()),
@@ -634,6 +657,14 @@ impl Jni {
     /// install's answer: no run has ended yet.
     pub fn set_previous_exits(&self, exits: Vec<ExitRecord>) {
         self.state.lock().previous_exits = exits;
+    }
+
+    /// **What the guest has written to the `SharedPreferences` store `name`**, as `apply()`
+    /// committed it; `None` for a store it never applied to. See `Context.getSharedPreferences`'s
+    /// declaration for what writes there and why nothing in the guest reads it back.
+    #[must_use]
+    pub fn shared_preferences(&self, name: &str) -> Option<BTreeMap<String, String>> {
+        self.state.lock().shared_preferences.get(name).cloned()
     }
 
     /// The `java.util.List` the Java side hands `nativeSetAppPreviousExitReasons` (`jk.l2.a`):
