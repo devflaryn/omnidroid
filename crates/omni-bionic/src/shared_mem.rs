@@ -90,6 +90,55 @@ impl GuestAtomic for SharedMockMemory {
 // [`SharedMockMemory`], whose CAS is atomic under its inner lock.
 // The cell mirror once planned for this was removed as redundant complexity.
 
+/// A futex that **compares its word**, as Linux's `FUTEX_WAIT` does and as the embedding's
+/// does: a word that differs from `expected` is `WouldBlock`, and each refusal is counted.
+///
+/// Over [`MockFutex`](crate::mock_threads::MockFutex)'s queue, so the comparison is not atomic
+/// with the park. What it is for is the count: a primitive that hands its wait the wrong word
+/// spins against a futex that compares, and shows up here as refusals by the hundred thousand.
+pub struct ComparingFutex {
+    mem: SharedMockMemory,
+    inner: crate::mock_threads::MockFutex,
+    refused: std::sync::atomic::AtomicU64,
+}
+
+impl ComparingFutex {
+    /// A comparing futex over `mem`'s words.
+    pub fn new(mem: SharedMockMemory) -> Self {
+        Self {
+            mem,
+            inner: crate::mock_threads::MockFutex::new(),
+            refused: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// How many waits found the word no longer holding `expected`.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::threads::Futex for ComparingFutex {
+    fn wait(
+        &self,
+        addr: u64,
+        expected: u32,
+        timeout: Option<core::time::Duration>,
+    ) -> crate::threads::WaitResult {
+        let mut word = [0u8; 4];
+        let held = self.mem.read(addr, &mut word).is_ok() && u32::from_le_bytes(word) == expected;
+        if !held {
+            self.refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return crate::threads::WaitResult::WouldBlock;
+        }
+        self.inner.wait(addr, expected, timeout)
+    }
+
+    fn wake(&self, addr: u64, count: u32) -> u32 {
+        self.inner.wake(addr, count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -748,4 +748,30 @@ mod tests {
         });
         assert_eq!(unlock(&mut mem.clone(), &MockFutex::new(), 0x1000).unwrap(), consts::EINVAL);
     }
+
+    /// **A blocked writer sleeps on a futex that compares its word**, and wakes when the readers
+    /// leave. A writer that handed its wait any word but the one it read -- the placeholder `0`
+    /// this loop used to pass, while readers hold the word at their count -- is refused every
+    /// pass by a futex that compares, and spins.
+    #[test]
+    fn a_blocked_writer_sleeps_on_a_futex_that_compares_its_word() {
+        let mem = SharedMockMemory::new({
+            let mut m = MockMemory::new();
+            m.map(0x1000, &[0u8; 56]);
+            m
+        });
+        let futex = std::sync::Arc::new(crate::shared_mem::ComparingFutex::new(mem.clone()));
+        assert_eq!(rdlock(&mut mem.clone(), &*futex, 0x1000).unwrap(), 0);
+        let writer = {
+            let (mem, futex) = (mem.clone(), futex.clone());
+            std::thread::spawn(move || {
+                let code = wrlock(&mut mem.clone(), &*futex, 0x1000).unwrap();
+                (code, unlock(&mut mem.clone(), &*futex, 0x1000).unwrap())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(unlock(&mut mem.clone(), &*futex, 0x1000).unwrap(), 0);
+        assert_eq!(writer.join().unwrap(), (0, 0), "the writer acquired and released");
+        assert!(futex.refused() < 100, "{} waits refused -- the writer spun", futex.refused());
+    }
 }

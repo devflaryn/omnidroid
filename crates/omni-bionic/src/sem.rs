@@ -597,4 +597,23 @@ mod tests {
         assert!(init(&mut m, u64::MAX, 0, 1).is_err());
         assert!(getvalue(&mut m, 0xdead_0000).is_err());
     }
+
+    /// **A `sem_wait` on zero sleeps on a futex that compares its word**, and returns when the
+    /// post lands. The word it hands the wait is the one it read with the waiter flag set; the
+    /// placeholder `0` it used to pass is never the word at that point, and a futex that compares
+    /// refuses it every pass: a spin.
+    #[test]
+    fn a_wait_on_zero_sleeps_on_a_futex_that_compares_its_word() {
+        let mem = placed();
+        assert_eq!(init(&mut mem.clone(), 0x1000, 0, 0).unwrap(), 0);
+        let futex = std::sync::Arc::new(crate::shared_mem::ComparingFutex::new(mem.clone()));
+        let waiter = {
+            let (mem, futex) = (mem.clone(), futex.clone());
+            std::thread::spawn(move || wait(&mut mem.clone(), &*futex, 0x1000).unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(post(&mut mem.clone(), &*futex, 0x1000).unwrap(), 0);
+        assert_eq!(waiter.join().unwrap(), 0, "the waiter took the posted token");
+        assert!(futex.refused() < 100, "{} waits refused -- the waiter spun", futex.refused());
+    }
 }

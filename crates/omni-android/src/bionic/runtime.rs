@@ -5,26 +5,21 @@
 //! a clock or know what a thread is. It states those needs as traits and this module is where
 //! they meet the host — which is why they are here and not there.
 //!
-//! # Why `expected` is ignored by the futex, and why that is not a shortcut
+//! # `expected` is compared, atomically with the park, as Linux's `FUTEX_WAIT` compares it
 //!
 //! Linux's `FUTEX_WAIT` compares `*addr` with `expected` **atomically with** the decision to
 //! block, which is what closes the window between a caller reading the word and sleeping on it.
-//! This futex does not perform that comparison, and the reason is measured rather than
-//! convenient: `omni-bionic`'s own callers do not all pass a meaningful `expected`.
-//! `mutex::lock` passes `LOCKED_WITH_WAITERS`, which is right, but `rwlock`'s reader and writer
-//! waits both pass **`0`** (`rwlock.rs:281` and `rwlock.rs:360`) while the word they are waiting
-//! on is, by construction, *not* zero — a rwlock with waiters is held. A futex that honoured
-//! `expected` would return [`WaitResult::WouldBlock`] to every rwlock waiter, and the caller's
-//! `continue` would turn blocking contention into a busy spin.
+//! [`Futex::wait`] states that contract, and this futex keeps it: the comparison is
+//! `parking_lot_core::park`'s `validate`, under the queue's bucket lock, as in
+//! [`AddressFutex::wait_compared`].
 //!
-//! So `expected` is ignored here exactly as `omni-bionic`'s own `MockFutex` ignores it, and the
-//! lost-wake window is closed the way that crate's callers already close it: every waiter holds
-//! its own protocol and re-checks its predicate after every return, and every `wake` is issued
-//! after the state change that the waiter will observe.
-//!
-//! **This is a finding about `omni-bionic`, recorded rather than patched**: the placeholder
-//! `expected` values belong to a reviewed crate with its own mutation harness, and changing them
-//! would change the meaning of `wait` for every caller at once.
+//! **It used to be ignored, and what that cost is measured.** The reason given was that
+//! `rwlock`'s waits passed a placeholder `0`; they, and `sem`'s, have since been changed to pass
+//! the word they read, and `mutex` and `once` always did. With the comparison skipped, an unlock
+//! that landed between a waiter marking the word and parking on it woke nobody, and the waiter
+//! slept out its self-heal slice -- **1,000 ms** in `mutex::lock`. MEASURED in the gate: a
+//! `pthread_mutex_lock` on the render thread that took 1000.1 ms, and a game-loop thread that
+//! takes and releases one mutex ~900,000 times a second makes that window easy to hit.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -91,17 +86,14 @@ impl AddressFutex {
     /// Park on the guest word at `addr` **only if it still holds `expected`**, checked atomically
     /// with the decision to block.
     ///
-    /// # This is the comparison the trait's `wait` deliberately does not make
+    /// # The comparison, with an `admit` step for a word nothing has checked yet
     ///
-    /// The module documentation explains why [`Futex::wait`] ignores its `expected`: some of
-    /// `omni-bionic`'s own callers pass a placeholder, and honouring it there would turn blocking
-    /// contention into a busy spin. That argument is about *those callers*. It says nothing about
-    /// a caller that has a real word and a real value to compare it against — and a **raw
-    /// `futex(FUTEX_WAIT)` from guest code is exactly that**: Linux's contract is that the kernel
-    /// compares `*uaddr` with `val` and returns `EAGAIN` without sleeping if they differ, and a
-    /// waiter that skipped the comparison would sleep through a wake that had already happened.
-    ///
-    /// So the capability is added here rather than by changing what `wait` means for everyone.
+    /// A **raw `futex(FUTEX_WAIT)` from guest code** names a word this layer has not touched:
+    /// Linux's contract is that the kernel compares `*uaddr` with `val` and returns `EAGAIN`
+    /// without sleeping if they differ, and a waiter that skipped the comparison would sleep
+    /// through a wake that had already happened. [`Futex::wait`] makes the same comparison for
+    /// `omni-bionic`'s primitives, whose words they have just read; this adds the step that
+    /// checks and commits a word first.
     ///
     /// # Why this closes the window, and where the comparison runs
     ///
@@ -393,9 +385,16 @@ impl Futex for AddressFutex {
     }
 
     fn wait(&self, addr: u64, expected: u32, timeout: Option<Duration>) -> WaitResult {
-        // See the module docs: the comparison is the caller's, because not every caller in
-        // `omni-bionic` passes a meaningful `expected`.
-        let _ = expected;
+        // **The comparison, when it can be made** (see the module docs). A word that is not
+        // four-byte aligned has no atomic load; no bionic primitive has one, and a guest that
+        // hands one in gets the old unconditional park rather than undefined behaviour.
+        let aligned = addr % 4 == 0;
+        // SAFETY: `word_holds` runs only when `aligned`. Every caller is an `omni-bionic`
+        // primitive that has just read or CAS'd this very word through the guest address space,
+        // which checks it mapped and commits it, and D4's identity mapping makes the guest
+        // address the host address. What can falsify that afterwards is the guest unmapping a
+        // lock another thread is waiting on, the race `wait_compared` documents.
+        let still_expected = || !aligned || unsafe { word_holds(addr, expected) };
         if self.stopped() {
             // The instance is shutting down. Every caller re-checks its predicate after
             // `WouldBlock` and loops, which is the spin `stop` documents as bounded by one run
@@ -414,25 +413,38 @@ impl Futex for AddressFutex {
         // `before_sleep` and `timed_out` do not panic and do not themselves park, and that
         // `before_sleep` is not called with the bucket lock held in a way that could deadlock.
         // The key here is a guest address, which no other parker in this process uses (see the
-        // type's documentation); all three callbacks are trivial closures that cannot panic and
-        // touch nothing; and `validate` returning `true` unconditionally is the documented
-        // "always park" configuration.
+        // type's documentation); `before_sleep` and `timed_out` are empty closures; and
+        // `validate` is `still_expected`: one atomic load and a comparison, which takes no lock
+        // and cannot panic.
         let result = unsafe {
             parking_lot_core::park(
                 addr as usize,
-                || true,
+                still_expected,
                 || {},
                 |_, _| {},
                 parking_lot_core::DEFAULT_PARK_TOKEN,
                 deadline,
             )
         };
+        // Under the wait trace: a slice slept to its end, and a wake the comparison saved.
+        match (&result, timeout) {
+            (parking_lot_core::ParkResult::TimedOut, Some(asked)) => crate::waits::record_timeout(
+                if asked >= Duration::from_millis(900) {
+                    "bionic primitive, a 1 s slice"
+                } else {
+                    "bionic primitive, a shorter slice"
+                },
+                asked,
+                deadline.map_or(asked, |at| asked + Instant::now().saturating_duration_since(at)),
+            ),
+            (parking_lot_core::ParkResult::Invalid, _) => crate::waits::count_refused(),
+            _ => {}
+        }
         match result {
             parking_lot_core::ParkResult::Unparked(_) => WaitResult::Woken,
             parking_lot_core::ParkResult::TimedOut => WaitResult::TimedOut,
-            // `Invalid` cannot happen with a `validate` that always returns `true`. Reported as
-            // `WouldBlock` rather than as `Woken` because every caller re-checks its predicate
-            // after `WouldBlock` and none of them treats it as progress.
+            // The word no longer held `expected`: `FUTEX_WAIT`'s `EAGAIN`. Every caller
+            // re-reads its word after it and none of them treats it as progress.
             parking_lot_core::ParkResult::Invalid => WaitResult::WouldBlock,
         }
     }
@@ -1056,5 +1068,91 @@ mod tests {
             parking_lot_core::ParkResult::Invalid,
             "the holder's own park refuses, which is how it gives the bucket back"
         );
+    }
+
+    /// **`Futex::wait` -- what `omni_bionic::mutex`, `sem`, `rwlock` and `once` sleep through --
+    /// compares its word as `FUTEX_WAIT` does**, and a word that no longer holds `expected` is
+    /// `WouldBlock` at once rather than a sleep to the timeout.
+    ///
+    /// That is the lost-wake window those primitives have: the waiter marks the word, the holder
+    /// releases it and wakes before the waiter has parked, and a futex that parks regardless
+    /// sleeps through a wake that has already happened. MEASURED in the gate before this: a
+    /// `pthread_mutex_lock` that took 1000.1 ms, `mutex::contend`'s whole self-heal slice.
+    #[test]
+    fn a_wait_on_a_word_that_no_longer_holds_expected_does_not_sleep() {
+        let futex = AddressFutex::new();
+        let word = AtomicU32::new(0);
+        let addr = word.as_ptr() as usize as u64;
+        let started = Instant::now();
+        // `2` is `LOCKED_WITH_WAITERS`, what a mutex waiter expects; the holder has released it.
+        let result = Futex::wait(&futex, addr, 2, Some(Duration::from_secs(2)));
+        assert_eq!(
+            result,
+            WaitResult::WouldBlock,
+            "the word is 0 and the waiter expected 2: TimedOut means it parked without comparing"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        // And a word that does hold it still sleeps, to the timeout.
+        word.store(2, Ordering::SeqCst);
+        let result = Futex::wait(&futex, addr, 2, Some(Duration::from_millis(50)));
+        assert_eq!(result, WaitResult::TimedOut, "a word that holds `expected` parks");
+    }
+
+    /// The comparison is made **under the bucket lock**, as [`AddressFutex::wait_compared`]'s is:
+    /// the same arrangement as the test above it, through [`Futex::wait`].
+    #[test]
+    fn a_futex_wait_compares_its_word_under_the_bucket_lock() {
+        let word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(2)));
+        let addr = word.as_ptr() as usize;
+        let pool: &'static [u8] = Box::leak(vec![0u8; 1 << 20].into_boxed_slice());
+        let holder_key = std::ptr::from_ref(sharing_a_bucket_with(addr, pool, |byte| {
+            std::ptr::from_ref(byte) as usize
+        })) as usize;
+        let futex: &'static AddressFutex = Box::leak(Box::new(AddressFutex::new()));
+
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            // SAFETY: as in the test above: a byte this test owns, a `validate` that uses only
+            // `std` channels and cannot panic, and two empty callbacks.
+            unsafe {
+                parking_lot_core::park(
+                    holder_key,
+                    || {
+                        holding_tx.send(()).ok();
+                        release_rx.recv_timeout(Duration::from_secs(10)).ok();
+                        false
+                    },
+                    || {},
+                    |_, _| {},
+                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                    None,
+                )
+            }
+        });
+        holding_rx.recv_timeout(Duration::from_secs(5)).expect("the holder is holding the bucket");
+
+        let waits_before = futex.activity().0;
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = Futex::wait(futex, addr as u64, 2, Some(Duration::from_secs(2)));
+            result_tx.send(result).ok();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while futex.activity().0 == waits_before {
+            assert!(Instant::now() < deadline, "the waiter never reached the park");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The holder of the mutex releases it while the waiter is on its way to the queue.
+        word.store(0, Ordering::SeqCst);
+        release_tx.send(()).expect("the holder is still waiting to be released");
+
+        let result = result_rx.recv_timeout(Duration::from_secs(10)).expect("the waiter returned");
+        assert_eq!(
+            result,
+            WaitResult::WouldBlock,
+            "the word was released before the waiter reached the queue; TimedOut is the lost wake"
+        );
+        assert_eq!(holder.join().expect("the holder"), parking_lot_core::ParkResult::Invalid);
     }
 }

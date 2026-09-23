@@ -304,4 +304,30 @@ mod tests {
         let err = once(&mut SharedMockMemory::new(mem), &futex, 0x9999_0000, || {}).unwrap_err();
         assert_eq!(err.addr(), 0x9999_0000);
     }
+
+    /// **A second caller sleeps on a futex that compares the control word** while the first runs
+    /// the routine: it hands the wait `IN_PROGRESS`, which is what the word holds until `DONE`.
+    #[test]
+    fn a_second_caller_sleeps_on_a_futex_that_compares_the_word() {
+        let mut base = MockMemory::new();
+        place(&mut base, 0x1000);
+        let mem = SharedMockMemory::new(base);
+        let futex = Arc::new(crate::shared_mem::ComparingFutex::new(mem.clone()));
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let first = {
+            let (mem, futex) = (mem.clone(), futex.clone());
+            std::thread::spawn(move || {
+                once(&mut mem.clone(), &*futex, 0x1000, || {
+                    running_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                })
+                .unwrap()
+            })
+        };
+        running_rx.recv().unwrap();
+        let second = once(&mut mem.clone(), &*futex, 0x1000, || panic!("ran twice")).unwrap();
+        assert_eq!(first.join().unwrap(), OnceOutcome::Ran);
+        assert_eq!(second, OnceOutcome::AlreadyDone);
+        assert!(futex.refused() < 100, "{} waits refused -- the caller spun", futex.refused());
+    }
 }

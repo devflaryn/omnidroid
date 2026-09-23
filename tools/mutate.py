@@ -303,6 +303,8 @@ BIONIC_HOSTNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test",
 JNI_THEME = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "system_theme"]
 BIONIC_GAI = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
               "getaddrinfo"]
+FUTEX_RUNTIME = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "bionic::runtime"]
+BIONIC_MUTEX_LIB = ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "mutex"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7260,6 +7262,20 @@ directory", ADAPTER_FILES,
      """            return Ok(if hints.flags & AI_NUMERICSERV != 0 { net::EAI_NONAME } else { EAI_SERVICE });""",
      """            return Ok(EAI_SERVICE);""",
      BIONIC_GAI),
+
+    # The futex compares its word, as FUTEX_WAIT does (the performance subagent, 2026-09-23): an
+    # unlock between a waiter marking the mutex and parking used to wake nobody, and the waiter
+    # slept out mutex::contend's 1,000 ms slice (MEASURED once on the render thread).
+    ("futexcmp-A1", "A", "AddressFutex::wait parks without comparing the word again",
+     "crates/omni-android/src/bionic/runtime.rs",
+     """        let still_expected = || !aligned || unsafe { word_holds(addr, expected) };""",
+     """        let still_expected = || { let _ = aligned; true };""",
+     FUTEX_RUNTIME),
+    ("futexcmp-B1", "B", "a RECURSIVE mutex waits on LOCKED_WITH_WAITERS, which its word never holds: a spin",
+     "crates/omni-bionic/src/mutex.rs",
+     """        let expected = if type_ != mutex_type::RECURSIVE && state == lock_state::LOCKED {""",
+     """        let expected = if state == lock_state::LOCKED || type_ == mutex_type::RECURSIVE {""",
+     BIONIC_MUTEX_LIB),
 ]
 
 

@@ -594,14 +594,24 @@ fn contend(
         {
             continue;
         }
-        // Expected value: LOCKED_WITH_WAITERS (the value WE just wrote). A wake
-        // targets the address; the futex compares against this expected value.
-        // NOTE: our MockFutex's value comparison is the caller's responsibility
-        // (it always blocks once called), so `expected` is protocol documentation
-        // here; the unlock's wake targets the address regardless of value, which
-        // matches Linux FUTEX_WAKE (it never compares values).
-        let expected = lock_state::LOCKED_WITH_WAITERS;
-        let _ = expected;
+        // Expected value: the word as this thread last saw or wrote it -- the
+        // LOCKED_WITH_WAITERS the CAS above just wrote over LOCKED, and otherwise
+        // the word read at the top of this pass. For RECURSIVE that is the hold
+        // COUNT, because that word never carries the waiter flag: passing
+        // LOCKED_WITH_WAITERS there would be a count of two, and a futex that
+        // compares (the embedding's does, as Linux's FUTEX_WAIT does) would turn
+        // every wait on a once-held recursive mutex into a spin.
+        // The comparison is what closes the window between the mark above and the
+        // park: an unlock that lands in it changes the word, so the wait returns
+        // WouldBlock instead of sleeping through a wake that has already happened.
+        // The unlock's wake targets the address regardless of value, which matches
+        // Linux FUTEX_WAKE (it never compares values). The MockFutex does not
+        // compare; the bounded slice below is the net for a futex that does not.
+        let expected = if type_ != mutex_type::RECURSIVE && state == lock_state::LOCKED {
+            lock_state::LOCKED_WITH_WAITERS
+        } else {
+            state
+        };
         let remaining = match deadline {
             Some(d) => d.saturating_duration_since(std::time::Instant::now()),
             None => Duration::MAX,
@@ -626,7 +636,7 @@ fn contend(
         if futex.interrupted() {
             return Ok(Err(consts::EINTR));
         }
-        match futex.wait(mutex_addr, lock_state::LOCKED_WITH_WAITERS, Some(bounded)) {
+        match futex.wait(mutex_addr, expected, Some(bounded)) {
             WaitResult::Woken => continue, // re-run the acquire protocol
             WaitResult::TimedOut => {
                 // One last chance: maybe the wake raced our deregistration.
@@ -1014,5 +1024,54 @@ mod tests {
 
     fn set_type(mem: &mut crate::shared_mem::SharedMockMemory, addr: u64, ty: i32) {
         mem.with_exclusive(|g| g.write(addr + 8, &ty.to_le_bytes()).unwrap());
+    }
+
+    /// One thread holds the mutex (once) for 150 ms while another locks it, over a futex that
+    /// compares: the second must **sleep**, then acquire when the first releases. Returns how
+    /// many of its waits the futex refused.
+    fn contended_over_a_comparing_futex(ty: i32) -> u64 {
+        let (mem, _, owners, threads) = setup(0x1000);
+        set_type(&mut mem.clone(), 0x1000, ty);
+        let futex = std::sync::Arc::new(crate::shared_mem::ComparingFutex::new(mem.clone()));
+        let owners = std::sync::Arc::new(owners);
+        let threads = std::sync::Arc::new(threads);
+        // Both roles on fresh host threads: `MockThreads` binds an identity per host thread, and
+        // a thread that outlives one registry would share its number with the next one's first.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let (mem, futex, owners, threads) =
+                (mem.clone(), futex.clone(), owners.clone(), threads.clone());
+            std::thread::spawn(move || {
+                let code = lock(&mut mem.clone(), &*futex, &owners, &*threads, 0x1000).unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                (code, unlock(&mut mem.clone(), &*futex, &owners, &*threads, 0x1000).unwrap())
+            })
+        };
+        held_rx.recv().unwrap();
+        let contender = {
+            let (mem, futex, owners, threads) =
+                (mem.clone(), futex.clone(), owners.clone(), threads.clone());
+            std::thread::spawn(move || {
+                let code = lock(&mut mem.clone(), &*futex, &owners, &*threads, 0x1000).unwrap();
+                (code, unlock(&mut mem.clone(), &*futex, &owners, &*threads, 0x1000).unwrap())
+            })
+        };
+        assert_eq!(holder.join().unwrap(), (0, 0), "the holder took and released it");
+        assert_eq!(contender.join().unwrap(), (0, 0), "the contender acquired and released");
+        futex.refused()
+    }
+
+    /// **A contended lock tells the futex the word it will sleep on**, for every type. A
+    /// recursive mutex's word is its hold count, which never carries the waiter flag, so
+    /// `LOCKED_WITH_WAITERS` there is a count of two -- and over a futex that compares, a wait on
+    /// a mutex held once was refused every pass: a spin, MEASURED here in the hundreds of
+    /// thousands of refusals in 150 ms before `contend` passed the count it read.
+    #[test]
+    fn a_contended_lock_sleeps_on_a_futex_that_compares_its_word() {
+        for ty in [mutex_type::NORMAL, mutex_type::ERRORCHECK, mutex_type::RECURSIVE] {
+            let refused = contended_over_a_comparing_futex(ty);
+            assert!(refused < 100, "type {ty}: {refused} waits refused -- the contender spun");
+        }
     }
 }
