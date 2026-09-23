@@ -20,7 +20,27 @@ use std::sync::Arc;
 
 use omni_cpu::dynarmic::{DynarmicBackend, DynarmicCpu, DynarmicOptions};
 use omni_cpu::{GuestAddr, GuestCpu};
-use omni_mem::{CommitPolicy, GuestSpace, Placement, Protection};
+use omni_mem::{CommitPolicy, GuestSpace, GuestSpaceConfig, Placement, Protection};
+
+/// A guest address space that tops out above the 64 GiB dynarmic's default
+/// `fastmem_address_space_bits = 36` covers -- the premise every identity-mapping test rests on
+/// ([`Guest::assert_high_addresses`]).
+///
+/// Where the host puts a default reservation decides it, and hosts differ: Windows placed a 4 GiB
+/// reservation around bit 40, while macOS (MEASURED, Apple M1) placed it at `0x3_0000_0000`, just
+/// above the 4 GiB `__PAGEZERO`, so its top was `0x3_FFFF_FFFF` and every identity test refused to
+/// run. When the default placement is already high it is kept, so a host that satisfied the premise
+/// is untouched; otherwise the reservation is asked for again aligned to 2^36, which puts its base
+/// -- and therefore its top -- at or above 64 GiB, because address 0 is never available.
+pub fn high_guest_space() -> GuestSpace {
+    let space = GuestSpace::new().expect("a guest address space");
+    if space.end() - 1 >= 1usize << 36 {
+        return space;
+    }
+    drop(space);
+    GuestSpace::with_config(GuestSpaceConfig { base_alignment: 1 << 36, ..GuestSpaceConfig::default() })
+        .expect("a guest address space aligned to 64 GiB")
+}
 
 /// Bytes of guest code region. Enough for the largest test program many times over.
 pub const CODE_BYTES: usize = 64 * 1024;
@@ -54,7 +74,7 @@ impl Guest {
     }
 
     pub fn with_options(options: DynarmicOptions) -> Self {
-        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let space = Arc::new(high_guest_space());
 
         let code = space
             .map_anonymous(

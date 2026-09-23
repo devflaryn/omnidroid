@@ -385,7 +385,20 @@ pub struct OdEffectiveConfig {
 /// emitted, and its high-water mark is a private member of `BlockOfCode` that `A64::Jit` does not
 /// expose; that term is bounded above by [`OdConfig::code_cache_size`] and measured from the
 /// outside in `omni-cpu`'s M2 gate.
+///
+/// **Per host architecture**, because the two backends are different code: the table above is a
+/// member of the *x64* emitter. The arm64 backend has no fast-dispatch table at all -- its
+/// `FastDispatchHint` terminal is a plain return to the dispatcher with a `TODO` in its place
+/// (`emit_arm64_a64.cpp`) -- and nothing else of a fixed large size, so on `aarch64` this is **0**
+/// and the per-jit cost is the code cache plus small objects. MEASURED on Apple M1 (n = 8 threads,
+/// one measurement, `omni-cpu`'s M2 gate): 8.010 MiB of `phys_footprint` per jit at creation with an
+/// 8 MiB code cache. `tests/pin_constants.rs` checks both halves against the vendored source.
+#[cfg(target_arch = "x86_64")]
 pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;
+
+/// See the `x86_64` definition: the arm64 backend holds no fixed-size per-jit table.
+#[cfg(target_arch = "aarch64")]
+pub const OD_FIXED_PER_JIT_BYTES: usize = 0;
 
 /// Callback-entry counters, maintained by the shim on the jit's own thread.
 #[repr(C)]
