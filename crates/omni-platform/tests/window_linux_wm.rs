@@ -52,6 +52,25 @@ impl Peer {
         peer
     }
 
+    /// `window`'s `WM_STATE` state as the server holds it now, read on this connection.
+    fn wm_state(&self, window: c_ulong) -> Option<c_long> {
+        let atom = self.atom("WM_STATE");
+        let (mut kind, mut format, mut count, mut after) = (0, 0, 0, 0);
+        let mut data: *mut u8 = std::ptr::null_mut();
+        // SAFETY: a live display and window id and writable out-parameters; `data` is freed.
+        unsafe {
+            (self.xl.XGetWindowProperty)(
+                self.display, window, atom, 0, 2, xlib::False, atom, &raw mut kind, &raw mut format,
+                &raw mut count, &raw mut after, &raw mut data,
+            );
+            let state = (!data.is_null() && format == 32 && count >= 1).then(|| *data.cast::<c_long>());
+            if !data.is_null() {
+                (self.xl.XFree)(data.cast());
+            }
+            state
+        }
+    }
+
     fn atom(&self, name: &str) -> xlib::Atom {
         let name = CString::new(name).unwrap();
         // SAFETY: a live display and a NUL-terminated name.
@@ -178,4 +197,28 @@ fn a_resize_under_the_manager_is_reported_and_the_server_agrees() {
     window.set_client_size(900, 700).unwrap();
     poll_until(&mut window, "the resize", |e| *e == WindowEvent::Resized { width: 900, height: 700 });
     assert_eq!(window.client_size().unwrap(), (900, 700));
+}
+
+/// **`client_size` says 0x0 at the moment the event stream does, not before.** The server's
+/// `WM_STATE` is iconic before this process has read the `PropertyNotify` that says so; a
+/// `client_size` that read the property live would answer 0x0 while the events -- which a
+/// renderer is fed from -- had not yet said so, and on Windows the two are one moment. So: iconic
+/// on the server (read on this file's own connection), still the full size until a poll has
+/// delivered `Resized { 0, 0 }`, and 0x0 from then on.
+#[test]
+#[ignore = "needs an X server with a window manager: OMNI_GFX_WINDOW_TESTS=1 DISPLAY=:93"]
+fn the_minimised_size_and_the_minimised_event_are_one_moment() {
+    let peer = Peer::open_with_a_manager();
+    let mut window = Window::new(&WindowDesc::new("omnidroid: wm one moment", 300, 200)).unwrap();
+    window.show();
+    poll_until(&mut window, "the focus", |e| *e == WindowEvent::FocusChanged { focused: true });
+    window.set_minimized(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while peer.wm_state(xid(&window)) != Some(3) {
+        assert!(Instant::now() < deadline, "the manager never iconified the window");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(window.client_size().unwrap(), (300, 200), "no event has said minimised yet");
+    poll_until(&mut window, "the minimised size", |e| *e == WindowEvent::Resized { width: 0, height: 0 });
+    assert_eq!(window.client_size().unwrap(), (0, 0));
 }

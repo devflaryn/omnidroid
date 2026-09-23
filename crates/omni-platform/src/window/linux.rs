@@ -1249,10 +1249,21 @@ impl Window {
         }
     }
 
-    /// The window's size, asked of the server, and 0x0 while `WM_STATE` says iconic.
+    /// The window's size, asked of the server, and 0x0 while iconic.
+    ///
+    /// **Iconic as of the last poll, not as of this call**, and that is deliberate. Read live, the
+    /// server's `WM_STATE` runs ahead of the event stream: the `PropertyNotify` that becomes the
+    /// seam's `Resized { 0, 0 }` is already sitting in this connection's queue, unread, when a
+    /// round trip here sees the new property -- MEASURED, `ndk_host_window`'s minimise test saw
+    /// the window report no pixels while the renderer, fed from the events, had not yet heard, and
+    /// still held a swapchain. On Windows the two are one moment (`WM_SIZE` is sent from inside
+    /// the minimise), and taking the state the events have delivered keeps them one moment here.
+    /// Nothing is lost by it: X sends a `PropertyNotify` for every change of a selected property,
+    /// so the state is only ever one poll behind, never wrong. The size itself is still asked of
+    /// the server, for the Windows backend's reason (a remembered size can stop being true).
     pub(super) fn client_size(&self) -> WindowResult<(u32, u32)> {
         let size = self.geometry("client_size")?;
-        Ok(if self.read_iconic() { (0, 0) } else { size })
+        Ok(if self.iconic { (0, 0) } else { size })
     }
 
     /// The display's DPI: `Xft.dpi` from the root window's resources when the desktop set it --

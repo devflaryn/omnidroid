@@ -236,6 +236,15 @@ ROWS = [
      """        let now = if self.iconic { (0, 0) } else { self.size };""",
      """        let now = self.size;""",
      WM),
+    # client_size's iconic read live from the server, ahead of the event stream: it says 0x0
+    # while the renderer, fed from events, has not heard (MEASURED as ndk_host_window's minimise
+    # test failing). The WM test reads the server's WM_STATE on its own connection and asserts the
+    # two agree, deterministically.
+    ("lnx-win-A25", "A", "client_size says minimised before the event stream has",
+     LINUX_RS,
+     """        Ok(if self.iconic { (0, 0) } else { size })""",
+     """        Ok(if self.read_iconic() { (0, 0) } else { size })""",
+     WM),
     ("lnx-win-A21", "A", "Xft.dpi ignored; the physical screen DPI always",
      LINUX_RS,
      """        if let Some(dpi) = self.resources().as_deref().and_then(decode::xft_dpi) {""",
