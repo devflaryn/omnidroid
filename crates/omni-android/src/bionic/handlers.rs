@@ -1779,6 +1779,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("snprintf", format::snprintf),
     ("vsnprintf", format::vsnprintf),
     ("__vsnprintf_chk", format::vsnprintf_chk),
+    // A game world (place 606849621, 2026-09-23): a TaskScheduler worker died on it unbound and
+    // the game froze. Outside Task 1's 188 (Tier C); `BEYOND_THE_PREDICTION` records it.
+    ("__vsprintf_chk", format::vsprintf_chk),
     ("fprintf", format::fprintf),
     ("vfprintf", format::vfprintf),
     ("vasprintf", format::vasprintf),

@@ -8,7 +8,7 @@
 //! | Form | Imports | What the host has to do |
 //! |---|---|---|
 //! | **true variadic**, `f(..., ...)` | `__android_log_print`, `fprintf`, `fscanf`, `open`, `prctl`, `snprintf`, `sscanf`, `syscall`, `syslog` | act as the callee: read the extra arguments straight out of `X`, `V` and the guest's stack — [`VarArgs`] |
-//! | **`va_list` consumer**, `f(..., va_list)` | `__vsnprintf_chk`, `vasprintf`, `vfprintf`, `vsnprintf` | walk a five-field record *guest code wrote*, which is untrusted input — [`GuestVaList`] |
+//! | **`va_list` consumer**, `f(..., va_list)` | `__vsnprintf_chk`, `__vsprintf_chk`, `vasprintf`, `vfprintf`, `vsnprintf` | walk a five-field record *guest code wrote*, which is untrusted input — [`GuestVaList`] |
 //!
 //! `printf` itself is **not** in the reachable set, and neither is `vsscanf`; `fprintf` and `sscanf`
 //! are. `__open_2` looks like a variadic and is not — it is the `_FORTIFY_SOURCE` helper bionic calls

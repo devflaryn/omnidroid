@@ -338,6 +338,10 @@ INBOUND_BIONIC = ["cargo", "test", "-p", "omni-android", "--release", "--test", 
                   "listen_and_accept"]
 INBOUND_JNI = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "public_ipv4"]
 
+# `__vsprintf_chk` (a game world, 2026-09-23): its two tests.
+VSPRINTF = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+            "vsprintf_chk"]
+
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
 GATE_EXITS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
@@ -7907,6 +7911,39 @@ directory", ADAPTER_FILES,
     }
     result""",
      INBOUND_JNI),
+    # `__vsprintf_chk`: a TaskScheduler worker died on it unbound in place 606849621 and the game
+    # froze (2026-09-23). bionic's fortify.cpp: vsnprintf into dest_len, then the check.
+    ("vsprintf-A1", "A", "__vsprintf_chk is left unbound",
+     "crates/omni-android/src/bionic/handlers.rs",
+     """    ("__vsprintf_chk", format::vsprintf_chk),
+""",
+     "",
+     VSPRINTF),
+    ("vsprintf-A2", "A", "a result that does not fit is not the fortify fatal",
+     "crates/omni-android/src/bionic/format.rs",
+     "        if claim > dest_len {",
+     "        if false && claim > dest_len {",
+     VSPRINTF),
+    ("vsprintf-A3", "A", "the claim leaves out the terminator",
+     "crates/omni-android/src/bionic/format.rs",
+     "let claim = u64::try_from(result).map_or(0, |result| result + 1);",
+     "let claim = u64::try_from(result).map_or(0, |result| result);",
+     VSPRINTF),
+    ("vsprintf-A4", "A", "nothing is written to the destination",
+     "crates/omni-android/src/bionic/format.rs",
+     "let result = write_truncated(&view, destination, dest_len, &text, 0)?;",
+     "let result = write_truncated(&view, destination, 0, &text, 0)?;",
+     VSPRINTF),
+    ("vsprintf-B1", "B", "a result of exactly dest_len - 1 characters is refused",
+     "crates/omni-android/src/bionic/format.rs",
+     "        if claim > dest_len {",
+     "        if claim >= dest_len {",
+     VSPRINTF),
+    ("vsprintf-B2", "B", "the write before the fatal is not truncated to dest_len",
+     "crates/omni-android/src/bionic/format.rs",
+     "let result = write_truncated(&view, destination, dest_len, &text, 0)?;",
+     "let result = write_truncated(&view, destination, u64::MAX, &text, 0)?;",
+     VSPRINTF),
 ]
 
 

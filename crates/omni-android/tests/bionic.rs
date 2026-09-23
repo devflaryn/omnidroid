@@ -1051,6 +1051,15 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          waits for its connection (not capped; ended by the teardown flag, bounded by \
          SO_RCVTIMEO); the new descriptor is blocking and not close-on-exec.",
     ),
+    (
+        "__vsprintf_chk",
+        "The owner's session in place 606849621 (2026-09-23): GUEST THREAD DIED at +760s, thread \
+         16 (started at link 0x284d168): the guest called the imported symbol `__vsprintf_chk` \
+         ... and nothing in the compatibility layer implements it; the game froze. Call site \
+         link 0x5848960, a 256-byte buffer, \
+         \"/sys/devices/system/cpu/cpufreq/stats/cpu%d/time_in_state\". The file's Tier C \
+         section. bionic's fortify.cpp: vsnprintf into dest_len, then __check_buffer_access.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1105,7 +1114,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // three pthread_condattr_*, pthread_attr_setschedparam, pthread_setschedparam, gethostname.
     // Then `sincos`, for 314: the in-game worker pool, once a join's data model began loading.
     // Then `listen` and `accept`, for 316: the MicroProfiler web server in a game world.
-    assert_eq!(symbols.len(), 316, "bound symbols: {symbols:?}");
+    // Then `__vsprintf_chk`, for 317: a TaskScheduler worker in place 606849621.
+    assert_eq!(symbols.len(), 317, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1210,7 +1220,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // run from an audit of unnamed imports, and `gethostname`, a signed-in worker's next death.
     // **`sincos`, inline, for 314**: the in-game worker pool of the first join to connect.
     // **`listen` and `accept`, inline, for 316**: the MicroProfiler web server's thread.
-    assert_eq!(Bionic::inline_symbols().count(), 301);
+    // **`__vsprintf_chk`, inline, for 317**: a worker formatting a cpufreq path in a game world.
+    assert_eq!(Bionic::inline_symbols().count(), 302);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -3034,6 +3045,110 @@ fn a_fortify_check_that_fires_is_reported_as_the_overflow_it_is() {
     let text = error.to_string();
     assert!(text.contains("FORTIFY"), "{text}");
     assert!(text.contains("64") && text.contains('8'), "both sizes must be named: {text}");
+}
+
+/// The format the dying call passed in place 606849621 (call site link `0x5848960`).
+const CPUFREQ_FORMAT: &[u8] = b"/sys/devices/system/cpu/cpufreq/stats/cpu%d/time_in_state";
+
+/// Call `__vsprintf_chk(out, 0, dest_len, CPUFREQ_FORMAT, ap)` with `ap` a `va_list` **the guest
+/// built** -- one `int` in the general-register save area, as a variadic `sprintf` wrapper's
+/// prologue leaves it -- and return the run's result with the call's return value stored at
+/// `data + 0` when it returned. The destination starts as `0xEE` bytes.
+fn call_vsprintf_chk(f: &Fixture, dest_len: u64, cpu: i32) -> (Result<(), AbiError>, omni_cpu::GuestAddr) {
+    let out = f.guest.data + 0x600;
+    f.guest.write_bytes(out, &[0xEE; 0x100]);
+    f.guest.write_u64(f.guest.data, 0xDEAD);
+    let fmt = f.cstring(f.guest.data + 0x080, CPUFREQ_FORMAT);
+    let gr_save = f.guest.data + 0x100;
+    let vr_save = f.guest.data + 0x200;
+    let va_list = f.guest.data + 0x300;
+    let overflow = f.guest.data + 0x400;
+
+    let thunk = f.thunk("__vsprintf_chk");
+    let entry = f.guest.next_entry();
+    let mut asm = Asm::at(entry);
+    asm.push(mov_reg(21, 30));
+    asm.mov(22, f.guest.data as u64);
+    asm.mov(9, u64::from(cpu as u32));
+    asm.push(str_imm(9, 22, 0x100)); // the %d, in X0's spill slot
+    asm.mov(9, overflow as u64);
+    asm.push(str_imm(9, 22, 0x300)); // __stack
+    asm.mov(9, (gr_save + 64) as u64);
+    asm.push(str_imm(9, 22, 0x308)); // __gr_top
+    asm.mov(9, (vr_save + 128) as u64);
+    asm.push(str_imm(9, 22, 0x310)); // __vr_top
+    asm.mov(9, u64::from((-64i32) as u32));
+    asm.push(str_w(9, 22, 0x318)); // __gr_offs
+    asm.mov(9, u64::from((-128i32) as u32));
+    asm.push(str_w(9, 22, 0x31C)); // __vr_offs
+    asm.mov(0, out as u64);
+    asm.mov(1, 0); // flags
+    asm.mov(2, dest_len);
+    asm.mov(3, fmt as u64);
+    asm.mov(4, va_list as u64);
+    asm.bl(thunk);
+    asm.push(str_imm(0, 22, 0));
+    asm.push(ret(21));
+    f.guest.load(asm.words());
+
+    let mut cpu = f.guest.thread(&f.boundary);
+    (f.run(&mut cpu, entry).map(|_| ()), out)
+}
+
+/// `__vsprintf_chk` into a buffer the result fits: the text, its NUL, and `vsprintf`'s return --
+/// and a result of exactly `dest_len - 1` characters fits (the check is `result + 1 > dest_len`).
+#[test]
+fn vsprintf_chk_formats_a_guest_va_list_into_a_buffer_it_fits() {
+    let _guard = serialized();
+    let f = fixture();
+    let expected = "/sys/devices/system/cpu/cpufreq/stats/cpu7/time_in_state";
+
+    let (result, out) = call_vsprintf_chk(&f, 256, 7);
+    result.expect("a result that fits returns");
+    assert_eq!(f.read_cstring(out), expected.as_bytes());
+    assert_eq!(f.guest.read_u64(f.guest.data) as i32, expected.len() as i32, "vsprintf's return");
+
+    // The boundary: `expected.len() + 1` bytes is exactly enough.
+    let (result, out) = call_vsprintf_chk(&f, expected.len() as u64 + 1, 7);
+    result.expect("a result of dest_len - 1 characters fits");
+    assert_eq!(f.read_cstring(out), expected.as_bytes());
+
+    // `SIZE_MAX`, the compiler's "no idea": formatted in full.
+    let (result, out) = call_vsprintf_chk(&f, u64::MAX, 12);
+    result.expect("SIZE_MAX bounds nothing");
+    assert_eq!(
+        f.read_cstring(out),
+        b"/sys/devices/system/cpu/cpufreq/stats/cpu12/time_in_state".as_slice()
+    );
+}
+
+/// A result that does not fit is bionic's `__fortify_fatal`, **after** `vsnprintf` has written the
+/// truncated prefix -- bionic's order -- and the refusal names both sizes the way bionic's
+/// message does.
+#[test]
+fn vsprintf_chk_that_overflows_is_the_fortify_fatal_after_the_truncated_write() {
+    let _guard = serialized();
+    let f = fixture();
+    // 56 characters, so bionic's claim is 57 bytes.
+    let length = "/sys/devices/system/cpu/cpufreq/stats/cpu3/time_in_state".len();
+    let (result, out) = call_vsprintf_chk(&f, 16, 3);
+    let error = result.expect_err("the result in 16 bytes is __fortify_fatal");
+    let text = error.to_string();
+    assert!(
+        text.contains(&format!("vsprintf: prevented {}-byte write into 16-byte buffer", length + 1)),
+        "bionic's __check_buffer_access message: {text}"
+    );
+    assert!(text.contains("__vsprintf_chk"), "the refusal names the symbol: {text}");
+    assert_eq!(f.read_cstring(out), b"/sys/devices/sy", "vsnprintf's truncated prefix, then the NUL");
+    assert_eq!(f.guest.read_u64(f.guest.data), 0xDEAD, "the call did not return");
+
+    // One short of fitting: `length` characters in `length` bytes leave no room for the NUL.
+    let (result, _) = call_vsprintf_chk(&f, length as u64, 3);
+    let text = result.expect_err("the terminator counts").to_string();
+    assert!(
+        text.contains(&format!("prevented {}-byte write into {length}-byte buffer", length + 1)),
+        "{text}"
+    );
 }
 
 // =================================================================== the arena's bound

@@ -342,6 +342,57 @@ pub(super) fn vsnprintf_chk(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int __vsprintf_chk(char *dest, int flags, size_t dest_len_from_compiler, const char *fmt,
+/// va_list ap)`
+///
+/// The FORTIFY form of `vsprintf`, which is what `sprintf` into a buffer of a size the compiler
+/// knows becomes. bionic's (`libc/bionic/fortify.cpp`), in its order:
+///
+/// ```c
+/// int result = vsnprintf(dest, dest_len_from_compiler == SIZE_MAX ? SSIZE_MAX : dest_len_from_compiler, format, va);
+/// __check_buffer_access("vsprintf", "write into", result + 1, dest_len_from_compiler);
+/// return result;
+/// ```
+///
+/// So the destination is written **first**, truncated to `dest_len` as `vsnprintf` truncates, and
+/// only then is a result that did not fit (`result + 1 > dest_len`) the `__fortify_fatal` it is on
+/// a device: `"vsprintf: prevented N-byte write into M-byte buffer"`, here a refusal naming both.
+/// `SIZE_MAX` ("the compiler could not tell") needs no mapping here: [`write_truncated`] bounds by
+/// the capacity alone, and the check cannot fire against it. `flags` is unused, as in bionic.
+///
+/// MEASURED (the owner's session in place 606849621, 2026-09-23): a TaskScheduler worker died at
+/// +760 s on this symbol unbound, call site link `0x5848960`, formatting
+/// `"/sys/devices/system/cpu/cpufreq/stats/cpu%d/time_in_state"` into a 256-byte buffer; the game
+/// froze behind it.
+pub(super) fn vsprintf_chk(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (destination, flags, dest_len, fmt, va_list) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_i32()?, a.next_u64()?, a.next_u64()?, a.next_u64()?)
+    };
+    let _ = flags;
+    let state = active(c.symbol(), c.address())?;
+    let written = {
+        let view = enter(c, &state);
+        let at = usize::try_from(va_list)
+            .map_err(|_| view.refusal("a guest pointer wider than the host's usize"))?;
+        let mut source =
+            GuestVaList::read(view.mem(), at, Blame::new(view.symbol(), view.address(), 4))?;
+        let text = render(&view, fmt, 3, &mut source)?;
+        let result = write_truncated(&view, destination, dest_len, &text, 0)?;
+        // `result + 1` as bionic computes it: an `int` widened to `size_t`.
+        let claim = u64::try_from(result).map_or(0, |result| result + 1);
+        if claim > dest_len {
+            return Err(view.refusal(format!(
+                "FORTIFY: vsprintf: prevented {claim}-byte write into {dest_len}-byte buffer -- \
+                 a buffer overflow in guest code, which bionic answers with __fortify_fatal"
+            )));
+        }
+        result
+    };
+    c.ret().i32(written);
+    Ok(())
+}
+
 /// Refuse a symbol this phase binds but cannot service, naming what is missing.
 ///
 /// Bound rather than left [`Unbound`](crate::Binding::Unbound) because `Unbound` says only "the
