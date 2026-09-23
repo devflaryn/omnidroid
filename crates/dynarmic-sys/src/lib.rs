@@ -359,6 +359,10 @@ pub struct OdEffectiveConfig {
     /// never does. The upstream switch for it crashes on this pin (see
     /// `build.rs`), so the contradiction stands and is reported here rather
     /// than left silent.
+    ///
+    /// **[`code_cache::W_XOR_X_PER_THREAD`] on an Apple arm64 host**: the cache is `MAP_JIT` and
+    /// every write is bracketed by `pthread_jit_write_protect_np`, so each thread sees it either
+    /// writable or executable, never both. That one is measured by `tests/wx.rs`, not echoed.
     pub code_cache_w_xor_x: i32,
     /// Address of the `TPIDR_EL0` slot baked into generated code; 0 means the
     /// guest cannot read it, which D13 says breaks every stack-protected
@@ -385,7 +389,33 @@ pub struct OdEffectiveConfig {
 /// emitted, and its high-water mark is a private member of `BlockOfCode` that `A64::Jit` does not
 /// expose; that term is bounded above by [`OdConfig::code_cache_size`] and measured from the
 /// outside in `omni-cpu`'s M2 gate.
+///
+/// **Per host architecture**, because the two backends are different code: the table above is a
+/// member of the *x64* emitter. The arm64 backend has no fast-dispatch table at all -- its
+/// `FastDispatchHint` terminal is a plain return to the dispatcher with a `TODO` in its place
+/// (`emit_arm64_a64.cpp`) -- and nothing else of a fixed large size, so on `aarch64` this is **0**
+/// and the per-jit cost is the code cache plus small objects. MEASURED on Apple M1 (n = 8 threads,
+/// one measurement, `omni-cpu`'s M2 gate): 8.010 MiB of `phys_footprint` per jit at creation with an
+/// 8 MiB code cache. `tests/pin_constants.rs` checks both halves against the vendored source.
+#[cfg(target_arch = "x86_64")]
 pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;
+
+/// See the `x86_64` definition: the arm64 backend holds no fixed-size per-jit table.
+#[cfg(target_arch = "aarch64")]
+pub const OD_FIXED_PER_JIT_BYTES: usize = 0;
+
+/// [`OdEffectiveConfig::code_cache_w_xor_x`] values, mirroring `OD_CODE_CACHE_*` in the header.
+pub mod code_cache {
+    /// Writable and executable at once, for every thread: x64's `PAGE_EXECUTE_READWRITE` cache.
+    pub const W_AND_X: i32 = 0;
+    /// Built with `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT`: pages flipped between RW and RX.
+    pub const W_XOR_X: i32 = 1;
+    /// Apple arm64: `MAP_JIT` pages, RWX in the VM map, each thread seeing them either RW- or R-X
+    /// as `pthread_jit_write_protect_np` last set *for that thread*. W^X holds for any one thread;
+    /// a thread with its write window open can write every `MAP_JIT` page while another thread
+    /// executes them. Measured, not echoed: `tests/wx.rs`.
+    pub const W_XOR_X_PER_THREAD: i32 = 2;
+}
 
 /// Callback-entry counters, maintained by the shim on the jit's own thread.
 #[repr(C)]
@@ -656,4 +686,13 @@ extern "C" {
     /// `jit` must be live, and this must be called from the thread that owns it — the counter is
     /// non-atomic and that thread is the only writer.
     pub fn od_jit_slow_path_total(jit: *mut c_void) -> u64;
+
+    /// arm64 hosts only: the host return address the most recent `SVC` callback was entered with
+    /// -- an address inside this jit's code cache, 0 before the first `SVC`. It exists so the code
+    /// cache's page protection can be measured (`tests/wx.rs`); nothing else locates the cache.
+    ///
+    /// # Safety
+    /// `jit` must be live; read on the jit's own thread.
+    #[cfg(target_arch = "aarch64")]
+    pub fn od_jit_last_svc_return_address(jit: *mut c_void) -> u64;
 }

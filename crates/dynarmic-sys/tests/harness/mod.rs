@@ -91,6 +91,19 @@ pub struct Ctx {
     pub reenter_step_result: Option<u32>,
     /// Test hook: halt with [`HALT_DONE`] from inside `call_svc`.
     pub halt_on_svc: bool,
+    /// Test hook: `SVC #1` sleeps this long on the host thread and returns without halting (so the
+    /// guest carries on); 0 leaves `SVC #1` like any other. Forces host context switches in the
+    /// middle of guest execution.
+    pub sleep_on_svc1_us: u64,
+    /// Test hook: `SVC #2` writes the byte already at this host address back to it, from inside
+    /// the callback -- i.e. on the guest's thread, in the middle of guest execution. 0 = off.
+    pub rewrite_byte_on_svc2: u64,
+    /// The host thread's `(TPIDR_EL0, TPIDRRO_EL0)` as read inside the most recent `SVC` callback,
+    /// on arm64 hosts; `(0, 0)` elsewhere.
+    pub host_thread_pointers_in_svc: (u64, u64),
+    /// Test hook: `SVC #3` stores this `(guest address, u64)` into guest memory from the host --
+    /// another observer's plain store, in the middle of the guest's code. `None` = off.
+    pub poke_on_svc3: Option<(u64, u64)>,
     /// Test hook: make `interpreter_fallback` behave as an interpreter that
     /// executed its `num_insns` instructions as no-ops -- advance the guest PC
     /// past them and do **not** halt -- so a test can see where execution goes
@@ -368,6 +381,32 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
     unsafe {
         with(ctx, (), |c| {
             c.svc.push(swi);
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (tp, tpro): (u64, u64);
+                // SAFETY: both registers are readable at EL0; `mrs` touches no memory.
+                core::arch::asm!("mrs {}, tpidr_el0", "mrs {}, tpidrro_el0", out(reg) tp, out(reg) tpro, options(nomem, nostack));
+                c.host_thread_pointers_in_svc = (tp, tpro);
+            }
+            if swi == 3 {
+                if let Some((addr, value)) = c.poke_on_svc3 {
+                    c.write_u64(addr, value);
+                    return;
+                }
+            }
+            if swi == 2 && c.rewrite_byte_on_svc2 != 0 {
+                let p = c.rewrite_byte_on_svc2 as *mut u8;
+                // The marker `tests/wx.rs` requires before it will count a death as this write's.
+                println!("REWRITING {:#x} FROM INSIDE GUEST EXECUTION", p as u64);
+                // SAFETY: deliberately a write the host may refuse; `tests/wx.rs` runs it in a
+                // child process whose death is the measurement. The byte written is the byte read.
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p));
+                return;
+            }
+            if swi == 1 && c.sleep_on_svc1_us != 0 {
+                std::thread::sleep(std::time::Duration::from_micros(c.sleep_on_svc1_us));
+                return;
+            }
             let jit = c.jit;
             if c.reenter_on_svc {
                 // Deliberate violation: guest code has reached a callback, and
@@ -553,6 +592,10 @@ impl Vm {
             reenter_result: None,
             reenter_step_result: None,
             halt_on_svc: true,
+            sleep_on_svc1_us: 0,
+            rewrite_byte_on_svc2: 0,
+            host_thread_pointers_in_svc: (0, 0),
+            poke_on_svc3: None,
             fallback_skips: false,
             fallback_host_fpcr: 0,
             zero_invalidate_on_svc: false,
@@ -759,6 +802,16 @@ impl Vm {
     /// Set `TPIDRRO_EL0`.
     pub fn set_tpidrro_el0(&mut self, v: u64) {
         *self.tpidrro = v;
+    }
+
+    /// The `TPIDR_EL0` slot's current value (what a guest `MSR TPIDR_EL0` wrote).
+    pub fn tpidr_el0(&self) -> u64 {
+        *self.tpidr
+    }
+
+    /// The `TPIDRRO_EL0` slot's current value.
+    pub fn tpidrro_el0(&self) -> u64 {
+        *self.tpidrro
     }
 
     /// Callback-entry counters.
