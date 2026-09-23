@@ -154,6 +154,153 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
     return target;
 }
 
+// Omnidroid patch 0007: the fallbacks of the inline exclusive accesses (emit_arm64_memory.cpp), in the
+// Wrapped* calling convention -- address in Xscratch0, value in Xscratch1 (Q0 for 128 bits), result in
+// Xscratch0 (Q0), every other caller-saved register preserved -- and through the global monitor
+// exactly as the Exclusive* trampolines above, so a fallback is the callback-only path, nothing less.
+// Values cross as u64 and are narrowed in C++: Apple's arm64 ABI has the *caller* extend sub-32-bit
+// arguments, which generated code does not promise.
+template<auto callback, typename T>
+static void* EmitWrappedExclusiveReadCallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr) -> u64 {
+        return conf.global_monitor->ReadAndMark<T>(conf.processor_id, vaddr, [&]() -> T {
+            return (conf.callbacks->*callback)(vaddr);
+        });
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.MOV(Xscratch0, X0);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
+static void* EmitWrappedExclusiveRead128CallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr) -> Vector {
+        return conf.global_monitor->ReadAndMark<Vector>(conf.processor_id, vaddr, [&]() -> Vector {
+            return conf.callbacks->MemoryRead128(vaddr);
+        });
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Q0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.FMOV(D0, X0);
+    code.FMOV(V0.D()[1], X1);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
+template<auto callback, typename T>
+static void* EmitWrappedExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr, u64 value) -> u64 {
+        return conf.global_monitor->DoExclusiveOperation<T>(conf.processor_id, vaddr,
+                                                            [&](T expected) -> bool {
+                                                                return (conf.callbacks->*callback)(vaddr, static_cast<T>(value), expected);
+                                                            })
+                 ? 0
+                 : 1;
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.MOV(X2, Xscratch1);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.MOV(Xscratch0, X0);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
+static void* EmitWrappedExclusiveWrite128CallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr, u64 value_lo, u64 value_hi) -> u64 {
+        const Vector value{value_lo, value_hi};
+        return conf.global_monitor->DoExclusiveOperation<Vector>(conf.processor_id, vaddr,
+                                                                 [&](Vector expected) -> bool {
+                                                                     return conf.callbacks->MemoryWriteExclusive128(vaddr, value, expected);
+                                                                 })
+                 ? 0
+                 : 1;
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.FMOV(X2, D0);
+    code.FMOV(X3, V0.D()[1]);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.MOV(Xscratch0, X0);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
 static void* EmitRead128CallTrampoline(oaknut::CodeGenerator& code, A64::UserCallbacks* this_) {
     using namespace oaknut::util;
 
@@ -398,6 +545,18 @@ void A64AddressSpace::EmitPrelude() {
     prelude_info.add_ticks = EmitCallTrampoline<&A64::UserCallbacks::AddTicks>(code, conf.callbacks);
     prelude_info.get_ticks_remaining = EmitCallTrampoline<&A64::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
     prelude_info.interpreter_fallback = EmitCallTrampoline<&A64::UserCallbacks::InterpreterFallback>(code, conf.callbacks);
+    if (conf.global_monitor) {
+        prelude_info.wrapped_exclusive_read_memory_8 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead8, u8>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_16 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead16, u16>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_32 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead32, u32>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_64 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead64, u64>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_128 = EmitWrappedExclusiveRead128CallTrampoline(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_8 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive8, u8>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_16 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive16, u16>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_32 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive32, u32>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_64 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive64, u64>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_128 = EmitWrappedExclusiveWrite128CallTrampoline(code, conf);
+    }
 
     oaknut::Label return_from_run_code, l_return_to_dispatcher;
 
@@ -569,6 +728,10 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .recompile_on_fastmem_failure = conf.recompile_on_fastmem_failure,
         .fastmem_address_space_bits = conf.fastmem_address_space_bits,
         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
+
+        .fastmem_exclusive_access = conf.fastmem_exclusive_access,
+        .global_monitor = conf.global_monitor,
+        .processor_id = conf.processor_id,
 
         .wall_clock_cntpct = conf.wall_clock_cntpct,
         .enable_cycle_counting = conf.enable_cycle_counting,

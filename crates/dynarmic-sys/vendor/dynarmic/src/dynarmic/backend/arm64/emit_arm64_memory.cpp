@@ -17,10 +17,13 @@
 #include "dynarmic/backend/arm64/fastmem.h"
 #include "dynarmic/backend/arm64/fpsr_manager.h"
 #include "dynarmic/backend/arm64/reg_alloc.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+#include "dynarmic/common/spin_lock_arm64.h"
 #include "dynarmic/ir/acc_type.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/opcodes.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 
 namespace Dynarmic::Backend::Arm64 {
 
@@ -627,6 +630,349 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
 
 }  // namespace
 
+// Omnidroid patch 0007: the inline (fastmem) exclusive accesses. The pin's arm64 backend accepted
+// `fastmem_exclusive_access` and ignored it: every LDXR/STXR went through the callback trampolines
+// (a slow-path read *and* an exclusive-write callback per pair), which the x64 backend avoids with
+// EmitExclusiveReadMemoryInline / EmitExclusiveWriteMemoryInline. These are those, on arm64, with
+// the same monitor protocol, so the inline and callback paths can serve different threads of one
+// monitor at once:
+//
+//   read:  lock; exclusive_state = 1; monitor.address[pid] = vaddr; value = [vaddr] (acquire);
+//          monitor.value[pid] = value; unlock
+//   write: lock; status = 1; if exclusive_state && monitor.address[pid] == vaddr:
+//              compare-and-swap [vaddr]: monitor.value[pid] -> value (status = 0 on success);
+//              clear every processor's reservation of vaddr;
+//          exclusive_state = 0; unlock
+//
+// The lock is the monitor's own SpinLock word, taken with the same sequence SpinLock::Lock runs.
+// The compare-and-swap is an acquire/release exclusive pair on the host (ARMv8.0; no LSE assumed),
+// retried until it succeeds or the value differs. A host fault on the guest address (a fastmem miss)
+// lands on a patch location whose fallback first releases the lock and then does the whole access
+// through the Wrapped* trampolines -- i.e. through the monitor and the user callbacks, exactly the
+// callback-only path -- and, with recompile_on_fastmem_failure, the block is rebuilt without the
+// inline path.
+
+namespace {
+
+void EmitMonitorLock(oaknut::CodeGenerator& code, EmitContext& ctx) {
+    code.MOV(Xscratch2, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(ctx.conf.global_monitor)));
+    EmitSpinLockLock(code, Xscratch2);
+}
+
+void EmitMonitorUnlock(oaknut::CodeGenerator& code, EmitContext& ctx) {
+    code.MOV(Xscratch2, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(ctx.conf.global_monitor)));
+    EmitSpinLockUnlock(code, Xscratch2);
+}
+
+LinkTarget WrappedExclusiveReadMemoryLinkTarget(size_t bitsize) {
+    switch (bitsize) {
+    case 8:
+        return LinkTarget::WrappedExclusiveReadMemory8;
+    case 16:
+        return LinkTarget::WrappedExclusiveReadMemory16;
+    case 32:
+        return LinkTarget::WrappedExclusiveReadMemory32;
+    case 64:
+        return LinkTarget::WrappedExclusiveReadMemory64;
+    case 128:
+        return LinkTarget::WrappedExclusiveReadMemory128;
+    }
+    UNREACHABLE();
+}
+
+LinkTarget WrappedExclusiveWriteMemoryLinkTarget(size_t bitsize) {
+    switch (bitsize) {
+    case 8:
+        return LinkTarget::WrappedExclusiveWriteMemory8;
+    case 16:
+        return LinkTarget::WrappedExclusiveWriteMemory16;
+    case 32:
+        return LinkTarget::WrappedExclusiveWriteMemory32;
+    case 64:
+        return LinkTarget::WrappedExclusiveWriteMemory64;
+    case 128:
+        return LinkTarget::WrappedExclusiveWriteMemory128;
+    }
+    UNREACHABLE();
+}
+
+// Xdest = host address of the guest access. Uses Xscratch0 (via FastmemEmitVAddrLookup).
+template<size_t bitsize>
+void EmitExclusiveHostAddress(oaknut::CodeGenerator& code, EmitContext& ctx, oaknut::XReg Xdest, oaknut::XReg Xaddr, const SharedLabel& fallback) {
+    const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
+    if (ShouldExt32(ctx)) {
+        code.ADD(Xdest, Xbase, Xoffset.toW(), oaknut::AddSubExt::UXTW);
+    } else {
+        code.ADD(Xdest, Xbase, Xoffset);
+    }
+}
+
+template<size_t bitsize>
+void FastmemEmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
+    auto Rvalue = [&] {
+        if constexpr (bitsize == 128) {
+            return ctx.reg_alloc.WriteQ(inst);
+        } else {
+            return ctx.reg_alloc.WriteReg<std::max<std::size_t>(bitsize, 32)>(inst);
+        }
+    }();
+    ctx.fpsr.Spill();
+    ctx.reg_alloc.SpillFlags();
+    RegAlloc::Realize(Xaddr, Rvalue);
+
+    SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
+
+    EmitMonitorLock(code, ctx);
+    code.MOV(Wscratch0, 1);
+    code.STRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
+    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+    code.STR(*Xaddr, Xscratch0);
+
+    EmitExclusiveHostAddress<bitsize>(code, ctx, Xscratch1, *Xaddr, fallback);
+    const CodePtr fastmem_location = EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xscratch1, XZR, true);
+
+    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+    switch (bitsize) {
+    case 8:
+        code.STRB(oaknut::WReg{Rvalue->index()}, Xscratch0);
+        break;
+    case 16:
+        code.STRH(oaknut::WReg{Rvalue->index()}, Xscratch0);
+        break;
+    case 32:
+        code.STR(oaknut::WReg{Rvalue->index()}, Xscratch0);
+        break;
+    case 64:
+        code.STR(oaknut::XReg{Rvalue->index()}, Xscratch0);
+        break;
+    case 128:
+        code.STR(oaknut::QReg{Rvalue->index()}, Xscratch0);
+        break;
+    }
+    EmitMonitorUnlock(code, ctx);
+
+    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, fallback, end, fastmem_location] {
+        ctx.ebi.fastmem_patch_info.emplace(
+            fastmem_location - ctx.ebi.entry_point,
+            FastmemPatchInfo{
+                .marker = marker,
+                .fc = FakeCall{
+                    .call_pc = mcl::bit_cast<u64>(code.xptr<void*>()),
+                },
+                .recompile = ctx.conf.recompile_on_fastmem_failure,
+            });
+
+        code.l(*fallback);
+        EmitMonitorUnlock(code, ctx);
+        code.MOV(Xscratch0, Xaddr);
+        EmitRelocation(code, ctx, WrappedExclusiveReadMemoryLinkTarget(bitsize));
+        if constexpr (bitsize == 128) {
+            code.MOV(Rvalue.B16(), Q0.B16());
+        } else {
+            code.MOV(Rvalue.toX(), Xscratch0);
+        }
+        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+        code.B(*end);
+    });
+
+    code.l(*end);
+}
+
+template<size_t bitsize>
+void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
+    auto Rvalue = [&] {
+        if constexpr (bitsize == 128) {
+            return ctx.reg_alloc.ReadQ(args[2]);
+        } else {
+            return ctx.reg_alloc.ReadReg<std::max<std::size_t>(bitsize, 32)>(args[2]);
+        }
+    }();
+    auto Wstatus = ctx.reg_alloc.WriteW(inst);
+    ctx.fpsr.Spill();
+    ctx.reg_alloc.SpillFlags();
+    RegAlloc::Realize(Xaddr, Rvalue, Wstatus);
+
+    SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
+    oaknut::Label no_reservation, retry, cas_failed, cas_done, clear_loop, clear_next;
+
+    // 128 bits needs four more general-purpose temporaries than Xscratch0-2 and Wstatus provide:
+    // borrow four that hold neither operand, on the stack for the length of the sequence.
+    std::array<oaknut::XReg, 4> borrowed{X0, X1, X2, X3};
+    if constexpr (bitsize == 128) {
+        size_t n = 0;
+        for (int i = 0; i < 16 && n < borrowed.size(); i++) {
+            if (i != Xaddr->index() && i != Wstatus->index()) {
+                borrowed[n++] = oaknut::XReg{i};
+            }
+        }
+    }
+    const auto borrow = [&] {
+        code.STP(borrowed[0], borrowed[1], SP, oaknut::PreIndexed{}, -32);
+        code.STP(borrowed[2], borrowed[3], SP, 16);
+    };
+    const auto give_back = [&] {
+        code.LDP(borrowed[2], borrowed[3], SP, 16);
+        code.LDP(borrowed[0], borrowed[1], SP, oaknut::PostIndexed{}, 32);
+    };
+
+    EmitMonitorLock(code, ctx);
+    code.MOV(*Wstatus, 1);
+    code.LDRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
+    code.CBZ(Wscratch0, no_reservation);
+    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+    code.LDR(Xscratch0, Xscratch0);
+    code.CMP(Xscratch0, *Xaddr);
+    code.B(NE, no_reservation);
+
+    // Xscratch2 = host address (the lock pointer is no longer needed; unlock reloads it).
+    EmitExclusiveHostAddress<bitsize>(code, ctx, Xscratch2, *Xaddr, fallback);
+    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+
+    CodePtr fastmem_location;
+    if constexpr (bitsize == 128) {
+        const auto [Xval_lo, Xval_hi, Xld_lo, Xld_hi] = borrowed;
+        borrow();
+        code.FMOV(Xval_lo, Rvalue->toD());
+        code.FMOV(Xval_hi, Rvalue->Delem()[1]);
+        code.LDP(Xscratch0, Xscratch1, Xscratch0);  // expected lo, hi
+        code.l(retry);
+        fastmem_location = code.xptr<CodePtr>();
+        code.LDAXP(Xld_lo, Xld_hi, Xscratch2);
+        code.CMP(Xld_lo, Xscratch0);
+        code.CCMP(Xld_hi, Xscratch1, 0, EQ);
+        code.B(NE, cas_failed);
+        code.STLXP(*Wstatus, Xval_lo, Xval_hi, Xscratch2);
+        code.CBNZ(*Wstatus, retry);
+        code.B(cas_done);
+        code.l(cas_failed);
+        code.CLREX();
+        code.MOV(*Wstatus, 1);
+        code.l(cas_done);
+        give_back();
+    } else {
+        switch (bitsize) {
+        case 8:
+            code.LDRB(Wscratch1, Xscratch0);
+            break;
+        case 16:
+            code.LDRH(Wscratch1, Xscratch0);
+            break;
+        case 32:
+            code.LDR(Wscratch1, Xscratch0);
+            break;
+        case 64:
+            code.LDR(Xscratch1, Xscratch0);
+            break;
+        }
+        code.l(retry);
+        fastmem_location = code.xptr<CodePtr>();
+        switch (bitsize) {
+        case 8:
+            code.LDAXRB(Wscratch0, Xscratch2);
+            code.CMP(Wscratch0, Wscratch1);
+            break;
+        case 16:
+            code.LDAXRH(Wscratch0, Xscratch2);
+            code.CMP(Wscratch0, Wscratch1);
+            break;
+        case 32:
+            code.LDAXR(Wscratch0, Xscratch2);
+            code.CMP(Wscratch0, Wscratch1);
+            break;
+        case 64:
+            code.LDAXR(Xscratch0, Xscratch2);
+            code.CMP(Xscratch0, Xscratch1);
+            break;
+        }
+        code.B(NE, cas_failed);
+        switch (bitsize) {
+        case 8:
+            code.STLXRB(*Wstatus, oaknut::WReg{Rvalue->index()}, Xscratch2);
+            break;
+        case 16:
+            code.STLXRH(*Wstatus, oaknut::WReg{Rvalue->index()}, Xscratch2);
+            break;
+        case 32:
+            code.STLXR(*Wstatus, oaknut::WReg{Rvalue->index()}, Xscratch2);
+            break;
+        case 64:
+            code.STLXR(*Wstatus, oaknut::XReg{Rvalue->index()}, Xscratch2);
+            break;
+        }
+        code.CBNZ(*Wstatus, retry);
+        code.B(cas_done);
+        code.l(cas_failed);
+        code.CLREX();
+        code.MOV(*Wstatus, 1);
+        code.l(cas_done);
+    }
+
+    // Whatever the compare-and-swap decided, the reservation is spent: clear every processor's
+    // reservation of this address (the monitor's CheckAndClear), this one's included.
+    {
+        const u64 first = mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(ctx.conf.global_monitor, 0));
+        const u64 count = GetExclusiveMonitorProcessorCount(ctx.conf.global_monitor);
+        code.MOV(Xscratch0, first);
+        code.MOV(Xscratch1, first + count * sizeof(VAddr));
+        code.l(clear_loop);
+        code.LDR(Xscratch2, Xscratch0);
+        code.CMP(Xscratch2, *Xaddr);
+        code.B(NE, clear_next);
+        code.MOV(Xscratch2, 0xDEAD'DEAD'DEAD'DEADull);
+        code.STR(Xscratch2, Xscratch0);
+        code.l(clear_next);
+        code.ADD(Xscratch0, Xscratch0, sizeof(VAddr));
+        code.CMP(Xscratch0, Xscratch1);
+        code.B(LO, clear_loop);
+    }
+
+    // A store-exclusive leaves the local monitor open whether or not it stored.
+    code.l(no_reservation);
+    code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
+    EmitMonitorUnlock(code, ctx);
+
+    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, Wstatus = *Wstatus, fallback, end, fastmem_location, borrowed] {
+        // The patch location is the load-acquire of the compare-and-swap. For 128 bits the borrowed
+        // registers are on the stack at that point and are given back first.
+        const u64 fault_entry = mcl::bit_cast<u64>(code.xptr<void*>());
+        if constexpr (bitsize == 128) {
+            code.LDP(borrowed[2], borrowed[3], SP, 16);
+            code.LDP(borrowed[0], borrowed[1], SP, oaknut::PostIndexed{}, 32);
+        }
+        ctx.ebi.fastmem_patch_info.emplace(
+            fastmem_location - ctx.ebi.entry_point,
+            FastmemPatchInfo{
+                .marker = marker,
+                .fc = FakeCall{
+                    .call_pc = fault_entry,
+                },
+                .recompile = ctx.conf.recompile_on_fastmem_failure,
+            });
+
+        code.l(*fallback);
+        EmitMonitorUnlock(code, ctx);
+        code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
+        code.MOV(Xscratch0, Xaddr);
+        if constexpr (bitsize == 128) {
+            code.MOV(Q0.B16(), Rvalue.B16());
+        } else {
+            code.MOV(Xscratch1, Rvalue.toX());
+        }
+        EmitRelocation(code, ctx, WrappedExclusiveWriteMemoryLinkTarget(bitsize));
+        code.MOV(Wstatus, Wscratch0);
+        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
+        code.B(*end);
+    });
+
+    code.l(*end);
+}
+
+}  // namespace
+
 template<size_t bitsize>
 void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
     if (const auto marker = ShouldFastmem(ctx, inst)) {
@@ -640,6 +986,13 @@ void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* ins
 
 template<size_t bitsize>
 void EmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    // Omnidroid patch 0007.
+    if (ctx.conf.fastmem_exclusive_access && ctx.conf.global_monitor) {
+        if (const auto marker = ShouldFastmem(ctx, inst)) {
+            FastmemEmitExclusiveReadMemory<bitsize>(code, ctx, inst, *marker);
+            return;
+        }
+    }
     CallbackOnlyEmitExclusiveReadMemory<bitsize>(code, ctx, inst);
 }
 
@@ -656,6 +1009,13 @@ void EmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* in
 
 template<size_t bitsize>
 void EmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+    // Omnidroid patch 0007.
+    if (ctx.conf.fastmem_exclusive_access && ctx.conf.global_monitor) {
+        if (const auto marker = ShouldFastmem(ctx, inst)) {
+            FastmemEmitExclusiveWriteMemory<bitsize>(code, ctx, inst, *marker);
+            return;
+        }
+    }
     CallbackOnlyEmitExclusiveWriteMemory<bitsize>(code, ctx, inst);
 }
 

@@ -13,6 +13,7 @@ dynarmic/
                and ../patches/0004-arm64-half-precision.patch
                and ../patches/0005-arm64-sm4-sbox.patch
                and ../patches/0006-arm64-unsigned-compare64.patch
+               and ../patches/0007-arm64-inline-exclusives.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

@@ -263,6 +263,36 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         case LinkTarget::InterpreterFallback:
             c.BL(prelude_info.interpreter_fallback);
             break;
+        case LinkTarget::WrappedExclusiveReadMemory8:
+            c.BL(prelude_info.wrapped_exclusive_read_memory_8);
+            break;
+        case LinkTarget::WrappedExclusiveReadMemory16:
+            c.BL(prelude_info.wrapped_exclusive_read_memory_16);
+            break;
+        case LinkTarget::WrappedExclusiveReadMemory32:
+            c.BL(prelude_info.wrapped_exclusive_read_memory_32);
+            break;
+        case LinkTarget::WrappedExclusiveReadMemory64:
+            c.BL(prelude_info.wrapped_exclusive_read_memory_64);
+            break;
+        case LinkTarget::WrappedExclusiveReadMemory128:
+            c.BL(prelude_info.wrapped_exclusive_read_memory_128);
+            break;
+        case LinkTarget::WrappedExclusiveWriteMemory8:
+            c.BL(prelude_info.wrapped_exclusive_write_memory_8);
+            break;
+        case LinkTarget::WrappedExclusiveWriteMemory16:
+            c.BL(prelude_info.wrapped_exclusive_write_memory_16);
+            break;
+        case LinkTarget::WrappedExclusiveWriteMemory32:
+            c.BL(prelude_info.wrapped_exclusive_write_memory_32);
+            break;
+        case LinkTarget::WrappedExclusiveWriteMemory64:
+            c.BL(prelude_info.wrapped_exclusive_write_memory_64);
+            break;
+        case LinkTarget::WrappedExclusiveWriteMemory128:
+            c.BL(prelude_info.wrapped_exclusive_write_memory_128);
+            break;
         default:
             ASSERT_FALSE("Invalid relocation target");
         }
