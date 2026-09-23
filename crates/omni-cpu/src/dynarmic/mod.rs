@@ -710,6 +710,27 @@ pub(crate) mod mxcsr {
     }
 }
 
+/// **A diagnostic, off by default**: start counting the guest instructions every context of
+/// every backend fetches for translation, and return the count so far. Translation is the only
+/// thing that fetches, so a count that keeps rising in a steady state is code being translated
+/// again -- a code cache that is too small for what a thread runs.
+pub fn count_code_fetches() -> u64 {
+    callbacks::COUNTING_CODE_FETCHES.store(true, std::sync::atomic::Ordering::Relaxed);
+    callbacks::CODE_FETCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`count_code_fetches`], by host thread: each thread's name and its count since counting began.
+pub fn code_fetches_by_thread() -> Vec<(String, u64)> {
+    callbacks::CODE_FETCHES_BY_THREAD.lock().map_or_else(
+        |_| Vec::new(),
+        |all| {
+            all.iter()
+                .map(|(name, count)| (name.clone(), count.load(std::sync::atomic::Ordering::Relaxed)))
+                .collect()
+        },
+    )
+}
+
 /// [`mxcsr::Guard`], for the benchmark that prices it.
 ///
 /// The guard itself stays crate-private — it is the dispatcher's business and nothing else should be

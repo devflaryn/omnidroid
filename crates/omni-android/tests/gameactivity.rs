@@ -1324,8 +1324,19 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // guest was written for Linux's high-resolution timers; at Windows' default ~15.6 ms tick
     // every short sleep and timed wait in its frame pipeline overslept by up to a tick (see
     // `omni_platform::clock::TimerResolution`).
-    let _timers = omni_platform::clock::TimerResolution::raise(std::time::Duration::from_millis(1))
-        .expect("a 1 ms timer resolution");
+    // `OMNI_TIMER_DEFAULT=1` leaves the host's default tick in place: an A/B for this guard.
+    let _timers = if std::env::var_os("OMNI_TIMER_DEFAULT").is_some() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "TIMERS: the host's default resolution, not 1 ms (OMNI_TIMER_DEFAULT)"
+        );
+        None
+    } else {
+        Some(
+            omni_platform::clock::TimerResolution::raise(std::time::Duration::from_millis(1))
+                .expect("a 1 ms timer resolution"),
+        )
+    };
     // **The socket record, off unless this run was asked for it.** See
     // `omni_platform::net::record` for what it can and cannot show -- the short version is that
     // the engine's TLS is its own, so what lands here is a `ClientHello` and then ciphertext, and
@@ -2990,6 +3001,24 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         };
         (stop, handle)
     });
+    // **OMNI_WAIT_TRACE=<s>: a diagnostic, off by default** -- from that second of the session,
+    // every handler is timed by guest thread, call site and object (`omni_android::waits`), and
+    // the totals are printed when the session ends.
+    let mut wait_trace: Option<(f32, Option<std::time::Instant>)> =
+        std::env::var("OMNI_WAIT_TRACE").ok().map(|at| {
+            let at = at.trim().parse::<f32>().unwrap_or_else(|_| panic!("OMNI_WAIT_TRACE={at:?} is not a second"));
+            let _ = writeln!(
+                std::io::stderr(),
+                "WAIT TRACE: ON from +{at}s of the session (OMNI_WAIT_TRACE): every handler is timed"
+            );
+            (at, None)
+        });
+    // Guest instructions fetched for translation so far, counted while the wait trace is asked for.
+    let mut last_fetches = if wait_trace.is_some() { omni_cpu::dynarmic::count_code_fetches() } else { 0 };
+    // Each host thread's translation count when the wait trace began.
+    let mut fetches_at_trace: Vec<(String, u64)> = Vec::new();
+    // (events, time, longest) the touch seam spent delivering while the wait trace was on.
+    let mut input_timing = (0u64, std::time::Duration::ZERO, std::time::Duration::ZERO);
     let settle = std::time::Instant::now();
     // **A person closing the window ends the session**, and the app is then closed as a device
     // closes it (below), rather than the run carrying on into a window that is gone.
@@ -3002,6 +3031,14 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     while settle.elapsed() < session {
         if guest.bionic.live_guest_threads() == 0 || close_requested {
             break;
+        }
+        if let Some((at, started @ None)) = wait_trace.as_mut() {
+            if settle.elapsed().as_secs_f32() >= *at {
+                omni_android::waits::enable();
+                *started = Some(std::time::Instant::now());
+                fetches_at_trace = omni_cpu::dynarmic::code_fetches_by_thread();
+                let _ = writeln!(std::io::stderr(), "WAIT TRACE: tracing from +{:.1}s, {} presents so far", settle.elapsed().as_secs_f32(), presents());
+            }
         }
         if std::time::Instant::now() >= next_frames {
             next_frames += FRAMES_EVERY;
@@ -3018,12 +3055,20 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             }
             deaths_reported = failures.len();
             let now = presents();
+            // Under the wait trace, how much guest code was translated in the window as well.
+            let translated = wait_trace.as_ref().map(|_| {
+                let fetched = omni_cpu::dynarmic::count_code_fetches();
+                let delta = fetched - last_fetches;
+                last_fetches = fetched;
+                format!("; {delta} guest instructions translated")
+            });
             let _ = writeln!(
                 std::io::stderr(),
-                "FRAMES: +{:.0}s into the session, {now} presents (+{} in the last {}s)",
+                "FRAMES: +{:.0}s into the session, {now} presents (+{} in the last {}s){}",
                 settle.elapsed().as_secs_f32(),
                 now - last_presents,
-                FRAMES_EVERY.as_secs()
+                FRAMES_EVERY.as_secs(),
+                translated.unwrap_or_default()
             );
             last_presents = now;
         }
@@ -3181,10 +3226,18 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     }
                 }
                 if let Some(seam) = touch.as_mut() {
-                    match view.clone().and_then(|view| {
+                    let delivering = std::time::Instant::now();
+                    let delivered = view.clone().and_then(|view| {
                         seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event, view)
                             .map_err(|error| format!("{event:?}: {error}"))
-                    }) {
+                    });
+                    if omni_android::waits::enabled() {
+                        let took = delivering.elapsed();
+                        input_timing.0 += 1;
+                        input_timing.1 += took;
+                        input_timing.2 = input_timing.2.max(took);
+                    }
+                    match delivered {
                         Ok(calls) => {
                             for call in calls.iter().filter(|call| call.state != STATE_MOVED) {
                                 let _ = writeln!(std::io::stderr(), "INPUT: nativePassInput {call:?}");
@@ -3273,6 +3326,50 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         let _ = writeln!(std::io::stderr(), "WEBVIEW PROBE: FAILED: {failure}");
     } else if webview_probe.is_some() {
         let _ = writeln!(std::io::stderr(), "WEBVIEW PROBE: {webview_signals} bridge call(s) reached the engine");
+    }
+    if let Some((_, Some(started))) = wait_trace {
+        let seconds = started.elapsed().as_secs_f64();
+        let boundary = &guest.boundary;
+        let name = |slot: u64| {
+            boundary
+                .symbol_at(slot as GuestAddr)
+                .map_or_else(|| format!("{slot:#x}"), str::to_string)
+        };
+        let report = omni_android::waits::report(seconds, guest.object.base as u64, 14, &name);
+        // **Which threads translate**, over the traced window: guest instructions fetched for
+        // translation by each host thread (a guest thread's host thread is named for it).
+        let mut translated: Vec<(String, u64)> = omni_cpu::dynarmic::code_fetches_by_thread()
+            .into_iter()
+            .map(|(thread, now)| {
+                let before = fetches_at_trace
+                    .iter()
+                    .find(|(name, _)| *name == thread)
+                    .map_or(0, |(_, count)| *count);
+                (thread, now - before)
+            })
+            .filter(|(_, delta)| *delta > 0)
+            .collect();
+        translated.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = translated.iter().map(|(_, delta)| delta).sum();
+        let _ = writeln!(
+            std::io::stderr(),
+            "TRANSLATED over the trace: {total} guest instructions ({:.0}/s), by thread: {}",
+            total as f64 / seconds.max(0.001),
+            translated
+                .iter()
+                .take(16)
+                .map(|(thread, delta)| format!("{thread}={delta}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "{report}{} presents in all; the touch seam took {:?} over {} window events (longest {:?})",
+            presents(),
+            input_timing.1,
+            input_timing.0,
+            input_timing.2
+        );
     }
     if let Some((stop, handle)) = profiler {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);

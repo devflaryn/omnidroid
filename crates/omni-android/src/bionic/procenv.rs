@@ -1383,6 +1383,9 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
     });
     let result = {
         let mut view = enter(c, &state);
+        if crate::waits::enabled() {
+            crate::waits::note_stack(&omni_bionic::unwind::frames(&view, c.frame(), caller as u64, 16));
+        }
         // Linux: `EINVAL` for an unaligned `uaddr`. The word is compared and woken on as a
         // 32-bit quantity, and an unaligned one has no atomic load on any target this runs on.
         if uaddr % 4 != 0 {
@@ -1420,6 +1423,7 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
                 let expected = val as u32;
                 let mem = view.mem();
                 let blame = Blame::new(view.symbol(), view.address(), 0);
+                let parked = std::time::Instant::now();
                 // The word is admitted, meaning checked and committed through the address space,
                 // **before** anything parks on it and **outside** the futex's bucket lock. That
                 // makes an unreadable word `EFAULT` rather than a thread asleep on an address
@@ -1446,6 +1450,9 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
                 match outcome {
                     omni_bionic::threads::WaitResult::Woken => 0,
                     omni_bionic::threads::WaitResult::TimedOut => {
+                        if let Some(asked) = wait {
+                            crate::waits::record_timeout("futex", asked, parked.elapsed());
+                        }
                         view.set_errno(omni_bionic::errno::consts::ETIMEDOUT);
                         -1
                     }

@@ -627,7 +627,9 @@ fn sleep_for(view: &GuestView<'_>, duration: Duration, asked: &str) -> AbiResult
              that had not done what it was asked"
         )));
     }
+    let slept = std::time::Instant::now();
     omni_platform::clock::sleep(duration);
+    crate::waits::record_timeout("sleep", duration, slept.elapsed());
     Ok(())
 }
 

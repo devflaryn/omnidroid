@@ -1293,6 +1293,19 @@ impl Boundary {
         // reached appears in the census. That one is the whole point: an import nobody predicted,
         // named by the guest having branched to it.
         self.count(slot, resume);
+        let timed = if crate::waits::enabled() {
+            crate::waits::begin(
+                &slot.symbol,
+                slot.address as u64,
+                resume as u64,
+                cpu.x(XReg::new(0).expect("X0 exists")),
+                cpu.x(XReg::new(1).expect("X1 exists")),
+                cpu.x(XReg::new(2).expect("X2 exists")),
+            )
+        } else {
+            None
+        };
+        let _timed = TimedGuard(timed);
         match slot.binding {
             Binding::Unbound => Err(AbiError::Unbound {
                 symbol: slot.symbol.clone(),
@@ -1404,8 +1417,23 @@ impl Boundary {
             call.defer_to_caller();
             return;
         };
+        let timed = if crate::waits::enabled() {
+            crate::waits::begin(
+                &slot.symbol,
+                slot.address as u64,
+                call.x(30),
+                call.x(0),
+                call.x(1),
+                call.x(2),
+            )
+        } else {
+            None
+        };
         let mut import = ImportCall { symbol: &slot.symbol, call, mem: &self.mem };
         let outcome = handler(&mut import);
+        if let Some(timed) = timed {
+            timed.end();
+        }
         // **Counted on the way out, whatever the handler answered.** `crossings` says a thread
         // reached a symbol; only the pair says whether it is still *in* it. A thread stopped with
         // `crossings == exits + 1` is blocked inside a handler -- on a host lock, or in a scan
@@ -1419,6 +1447,17 @@ impl Boundary {
             // plausible value, and there is none here.
             record_pending(error);
             import.call.defer_to_caller();
+        }
+    }
+}
+
+/// Ends a [`crate::waits`] timing on every exit path of [`Boundary::service_exit`].
+struct TimedGuard(Option<crate::waits::Timed>);
+
+impl Drop for TimedGuard {
+    fn drop(&mut self) {
+        if let Some(timed) = self.0.take() {
+            timed.end();
         }
     }
 }

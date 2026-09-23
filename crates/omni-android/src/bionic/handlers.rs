@@ -1205,6 +1205,7 @@ pub(super) fn pthread_cond_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let view = enter(c, &state);
         omni_bionic::unwind::frames(&view, frame, link, 24)
     };
+    crate::waits::note_stack(&stack);
     let _parked = state.bionic.park("pthread_cond_wait", state.thread, cond, mutex, stack);
     let code = {
         let mut view = enter(c, &state);
@@ -1342,7 +1343,9 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
         let view = enter(c, &state);
         omni_bionic::unwind::frames(&view, frame, link, 24)
     };
+    crate::waits::note_stack(&stack);
     let _parked = state.bionic.park("pthread_cond_timedwait", state.thread, cond, mutex, stack);
+    let waited = std::time::Instant::now();
     let code = {
         let mut view = enter(c, &state);
         let threads = CallThreads { table: &state.bionic.threads, me: state.thread };
@@ -1362,6 +1365,9 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
         let code = Lift::lift(produced, &view)?;
         shutdown_interrupted(&view, futex, code)?
     };
+    if code == omni_bionic::errno::consts::ETIMEDOUT {
+        crate::waits::record_timeout("pthread_cond_timedwait", budget, waited.elapsed());
+    }
     c.ret().i32(code);
     Ok(())
 }

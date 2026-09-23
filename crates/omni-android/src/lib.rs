@@ -57,6 +57,7 @@ pub mod ndk;
 pub mod region;
 pub mod varargs;
 pub mod vulkan;
+pub mod waits;
 
 pub use bionic::{Activation, Bionic};
 pub use jni::{Jni, JniActivation};

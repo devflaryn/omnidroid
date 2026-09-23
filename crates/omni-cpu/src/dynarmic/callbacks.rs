@@ -104,7 +104,38 @@ impl CpuCtx {
     }
 }
 
+/// Whether [`CODE_FETCHES`] counts. See [`super::count_code_fetches`].
+pub(super) static COUNTING_CODE_FETCHES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Instruction fetches for translation, by every context of every backend, while counting is on.
+pub(super) static CODE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`CODE_FETCHES`] by host thread, named as the thread is named.
+pub(super) static CODE_FETCHES_BY_THREAD: std::sync::Mutex<
+    Vec<(String, std::sync::Arc<std::sync::atomic::AtomicU64>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    static THREAD_FETCHES: std::cell::OnceCell<std::sync::Arc<std::sync::atomic::AtomicU64>> =
+        const { std::cell::OnceCell::new() };
+}
+
 unsafe extern "C" fn cb_read_code(ctx: *mut c_void, vaddr: u64, out: *mut u32) -> i32 {
+    if COUNTING_CODE_FETCHES.load(std::sync::atomic::Ordering::Relaxed) {
+        CODE_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        THREAD_FETCHES.with(|cell| {
+            cell.get_or_init(|| {
+                let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let name = std::thread::current().name().unwrap_or("unnamed").to_string();
+                if let Ok(mut all) = CODE_FETCHES_BY_THREAD.lock() {
+                    all.push((name, std::sync::Arc::clone(&counter)));
+                }
+                counter
+            })
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
     // SAFETY: `ctx` is this backend's context; `out` is dynarmic's own stack slot.
     unsafe {
         with(ctx, 0, |c| {
