@@ -133,6 +133,20 @@ estimate tables, `FPRecpX`, fused single rounding shown by a lane whose exact
 result is a subnormal that a two-rounding implementation would flush to +0),
 plus FPSR `IOC`/`DZC`/`IXC` where the ARM ARM raises them.
 
+### 0005 — arm64: the SM4 substitution box
+
+`0005-arm64-sm4-sbox.patch`. **arm64 only.** `SM4E` and `SM4EKEY` (FEAT_SM4,
+active in `a64.inc`) translate to IR that looks bytes up through
+`SM4AccessSubstitutionBox`, which was `ASSERT_FALSE("Unimplemented")` in
+`emit_arm64_cryptography.cpp`; the first `SM4E` terminated the process
+(`tests/a64_sm4.rs` aborted before the patch). It now calls
+`Common::Crypto::SM4::AccessSubstitutionBox`, as the x64 backend does, through a
+lambda that takes the index as a `u64` and narrows it in C++ (Apple's arm64 ABI
+makes the *caller* extend sub-32-bit arguments, which generated code does not
+promise). `tests/a64_sm4.rs` runs the SM4 specification's own example — key
+schedule and 32 rounds through eight `SM4EKEY` and eight `SM4E` — and checks
+the ciphertext `681edf34 d206965e 86b3e94f 536e4246`.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

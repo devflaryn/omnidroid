@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <mcl/bit_cast.hpp>
 #include <oaknut/oaknut.hpp>
 
 #include "dynarmic/backend/arm64/a32_jitstate.h"
@@ -10,6 +11,7 @@
 #include "dynarmic/backend/arm64/emit_arm64.h"
 #include "dynarmic/backend/arm64/emit_context.h"
 #include "dynarmic/backend/arm64/reg_alloc.h"
+#include "dynarmic/common/crypto/sm4.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/opcodes.h"
@@ -112,12 +114,22 @@ void EmitIR<IR::Opcode::AESMixColumns>(oaknut::CodeGenerator& code, EmitContext&
     code.AESMC(Qoutput->B16(), Qinput->B16());
 }
 
+// Omnidroid patch 0005: SM4E and SM4EKEY (FEAT_SM4) look bytes up through this opcode, and the pin
+// had ASSERT_FALSE("Unimplemented") here, so the first SM4E terminated the process. The x64 backend
+// calls Common::Crypto::SM4::AccessSubstitutionBox; so does this. The index is taken as a u64 and
+// narrowed in C++, because the call site cannot promise what is above bit 7 of the register.
 template<>
 void EmitIR<IR::Opcode::SM4AccessSubstitutionBox>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ctx.reg_alloc.PrepareForCall(args[0]);
+
+    u64 (*fn)(u64) = [](u64 index) -> u64 {
+        return Common::Crypto::SM4::AccessSubstitutionBox(static_cast<u8>(index));
+    };
+    code.MOV(Xscratch0, mcl::bit_cast<u64>(fn));
+    code.BLR(Xscratch0);
+
+    ctx.reg_alloc.DefineAsRegister(inst, X0);
 }
 
 template<>
