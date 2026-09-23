@@ -89,6 +89,10 @@ pub const IMAGE_SUBRESOURCE_LAYERS_BYTES: usize = 16;
 /// 44, `extent` 56 -- all four-byte members, so no padding anywhere.
 pub const IMAGE_COPY_BYTES: usize = 68;
 
+/// `sizeof(VkImageBlit)`: `srcSubresource` 0, `srcOffsets[2]` 16, `dstSubresource` 40,
+/// `dstOffsets[2]` 56 -- two corners each, all four-byte members.
+pub const IMAGE_BLIT_BYTES: usize = 80;
+
 // ------------------------------------------------------------------------------ the bounds
 
 /// How many `VkClearValue`s one `vkCmdBeginRenderPass` reads. One per render-pass attachment.
@@ -569,6 +573,40 @@ pub(super) fn cmd_copy_image(
     Ok(())
 }
 
+/// `void vkCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage,
+/// VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout,
+/// uint32_t regionCount, const VkImageBlit *pRegions, VkFilter filter)`
+///
+/// Eight parameters, the last in `x7`. MEASURED: after its first image copy the renderer blits
+/// one region of an image **into itself** -- the same handle as source and destination, the
+/// source in `TRANSFER_SRC_OPTIMAL` and the destination in `TRANSFER_DST_OPTIMAL`, with
+/// `VK_FILTER_LINEAR` -- which is how a mip chain is built one level from the one above it.
+pub(super) fn cmd_blit_image(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCmdBlitImage";
+    let host = vulkan.require_host(at)?;
+    let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    let source = vulkan.image_ref_token(at, CALL, args[1])?;
+    let destination = vulkan.image_ref_token(at, CALL, args[3])?;
+    let regions =
+        read_regions(c, at, CALL, "pRegions", "VkImageBlit", IMAGE_BLIT_BYTES, args[5], args[6], 6)?;
+    host.cmd_blit_image(
+        buffer,
+        source,
+        args[2] as u32,
+        destination,
+        args[4] as u32,
+        &regions,
+        args[7] as u32,
+    )?;
+    c.ret().void();
+    Ok(())
+}
+
 /// `void vkCmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
 /// VkShaderStageFlags stageFlags, uint32_t offset, uint32_t size, const void *pValues)`
 pub(super) fn cmd_push_constants(
@@ -699,6 +737,8 @@ mod tests {
         assert_eq!(BUFFER_IMAGE_COPY_BYTES, 44 + 3 * 4);
         // Two subresources, two offsets and an extent, every member four bytes.
         assert_eq!(IMAGE_COPY_BYTES, 2 * IMAGE_SUBRESOURCE_LAYERS_BYTES + 3 * 3 * 4);
+        // Two subresources and two pairs of `VkOffset3D` corners.
+        assert_eq!(IMAGE_BLIT_BYTES, 2 * IMAGE_SUBRESOURCE_LAYERS_BYTES + 2 * 2 * 3 * 4);
     }
 
     /// **`vertexOffset` is signed and stays signed.** A `u32` widened to `i32` the wrong way

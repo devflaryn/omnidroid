@@ -4849,6 +4849,38 @@ impl VulkanHost for GfxVulkanHost {
         Ok(())
     }
 
+    fn cmd_blit_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+        filter: u32,
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_blit_image";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let source_handle = self.image_handle(source, "vkCmdBlitImage")?;
+        let destination_handle = self.image_handle(destination, "vkCmdBlitImage")?;
+        let built = flat_list(METHOD, regions, "VkImageBlit", image_blit_from_bytes)?;
+        // SAFETY: the command buffer is live and recording, both images are live and in the
+        // layouts the guest named, and the regions are the guest's own -- the driver reports a
+        // format that cannot be blitted with this filter.
+        unsafe {
+            device.cmd_blit_image(
+                handle,
+                source_handle,
+                vk::ImageLayout::from_raw(source_layout as i32),
+                destination_handle,
+                vk::ImageLayout::from_raw(destination_layout as i32),
+                &built,
+                vk::Filter::from_raw(filter as i32),
+            );
+        }
+        Ok(())
+    }
+
     fn cmd_push_constants(
         &self,
         buffer: HostCommandBuffer,
@@ -6582,6 +6614,7 @@ flat_structure!(viewport_from_bytes, vk::Viewport, "VkViewport");
 flat_structure!(buffer_copy_from_bytes, vk::BufferCopy, "VkBufferCopy");
 flat_structure!(buffer_image_copy_from_bytes, vk::BufferImageCopy, "VkBufferImageCopy");
 flat_structure!(image_copy_from_bytes, vk::ImageCopy, "VkImageCopy");
+flat_structure!(image_blit_from_bytes, vk::ImageBlit, "VkImageBlit");
 flat_structure!(
     blend_attachment_from_bytes,
     vk::PipelineColorBlendAttachmentState,
@@ -6863,6 +6896,7 @@ mod tests {
             guest::COMPUTE_PIPELINE_CREATE_INFO_BYTES
         );
         assert_eq!(std::mem::size_of::<vk::ImageCopy>(), guest::IMAGE_COPY_BYTES);
+        assert_eq!(std::mem::size_of::<vk::ImageBlit>(), guest::IMAGE_BLIT_BYTES);
         assert_eq!(
             vk::StructureType::DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO.as_raw(),
             i32::try_from(guest::STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO).expect("an sType")

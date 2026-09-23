@@ -63,6 +63,7 @@ use omni_android::vulkan::{
     HostImageRef, HostImageView, HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache,
     HostPipelineLayout, HostQueryPool, HostQueue, HostRenderPass, HostSampler, HostSemaphore,
     HostShaderModule, QueryPoolRequest, QUERY_POOL_CREATE_INFO_BYTES, IMAGE_COPY_BYTES,
+    IMAGE_BLIT_BYTES,
     DescriptorWrites, DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES,
     DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES, STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
     HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
@@ -372,6 +373,8 @@ struct HostLog {
     dispatches: Vec<[u32; 3]>,
     /// Every `vkCmdCopyImage`: source and its layout, destination and its layout, the regions.
     image_copies: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>)>,
+    /// Every `vkCmdBlitImage`: as `image_copies`, then the filter.
+    image_blits: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>, u32)>,
 }
 
 /// The measured memory table of this machine, which the double reports so that the rewrite is
@@ -623,6 +626,7 @@ impl VulkanHost for StageFourHost {
                 | "vkCreateComputePipelines"
                 | "vkCmdDispatch"
                 | "vkCmdCopyImage"
+                | "vkCmdBlitImage"
                 | "vkDestroyPipeline"
                 | "vkCreateDescriptorSetLayout"
                 | "vkDestroyDescriptorSetLayout"
@@ -1133,6 +1137,27 @@ impl VulkanHost for StageFourHost {
             destination,
             destination_layout,
             regions.to_vec(),
+        ));
+        Ok(())
+    }
+
+    fn cmd_blit_image(
+        &self,
+        _buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+        filter: u32,
+    ) -> AbiResult<()> {
+        self.log().image_blits.push((
+            source,
+            source_layout,
+            destination,
+            destination_layout,
+            regions.to_vec(),
+            filter,
         ));
         Ok(())
     }
@@ -2139,6 +2164,27 @@ fn an_image_copy_carries_each_image_with_its_own_layout() {
     let text = f.refusal(name("vkCmdCopyImage"), &[command, created, 6, presented, 7, 0, regions]);
     assert!(text.to_string().contains("regionCount = 0"), "{text}");
     assert_eq!(up.host.log().image_copies.len(), 1, "the refused one recorded nothing");
+
+    // **`vkCmdBlitImage`: the engine's shape, an image into itself with LINEAR**, then a
+    // cross-family blit with NEAREST, so the filter in `x7` and each image's place both show.
+    let blit: Vec<u8> = (1u32..=20).flat_map(|word| (word * 0x0203).to_le_bytes()).collect();
+    assert_eq!(blit.len(), IMAGE_BLIT_BYTES);
+    let blits = f.bytes(&blit);
+    f.call_n(name("vkCmdBlitImage"), &[command, created, 6, created, 7, 1, blits, 1])
+        .expect("the mip blit is recorded");
+    f.call_n(name("vkCmdBlitImage"), &[command, created, 6, presented, 7, 1, blits, 0])
+        .expect("the cross-family blit is recorded");
+    let recorded = up.host.log().image_blits.clone();
+    assert_eq!(recorded.len(), 2);
+    let (source, source_layout, destination, destination_layout, bytes, filter) = &recorded[0];
+    assert_eq!(source, destination, "one image, source and destination: {source:?}");
+    assert!(matches!(source, HostImageRef::Created(_)), "{source:?}");
+    assert_eq!((*source_layout, *destination_layout, *filter), (6, 7, 1), "LINEAR, from x7");
+    assert_eq!(bytes, &blit, "the region, whole");
+    let (source, _, destination, _, _, filter) = &recorded[1];
+    assert!(matches!(source, HostImageRef::Created(_)), "{source:?}");
+    assert!(matches!(destination, HostImageRef::Swapchain(_)), "{destination:?}");
+    assert_eq!(*filter, 0, "NEAREST");
 }
 
 /// **The two-call protocol, the stable handles, and what a destroyed swapchain does to them.**

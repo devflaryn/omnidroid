@@ -3508,6 +3508,31 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkCmdBlitImage`, forwarded. As [`VulkanHost::cmd_copy_image`], with `regions` the
+    /// guest's [`IMAGE_BLIT_BYTES`](super::IMAGE_BLIT_BYTES)-byte `VkImageBlit`s and `filter` its
+    /// `VkFilter`. Source and destination may be the same image.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    #[allow(clippy::too_many_arguments)]
+    fn cmd_blit_image(
+        &self,
+        buffer: HostCommandBuffer,
+        source: HostImageRef,
+        source_layout: u32,
+        destination: HostImageRef,
+        destination_layout: u32,
+        regions: &[u8],
+        filter: u32,
+    ) -> AbiResult<()> {
+        let _ = (buffer, source, source_layout, destination, destination_layout, regions, filter);
+        Err(host_has_no(
+            "VulkanHost::cmd_blit_image",
+            "the destination keeps whatever it held -- for a mip chain, every level below the first",
+        ))
+    }
+
     /// `vkCmdPushConstants`, forwarded. `values` is the guest's bytes, copied.
     ///
     /// # Errors
