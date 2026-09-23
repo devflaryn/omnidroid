@@ -67,9 +67,87 @@ pub struct Downcall {
     pub member: &'static str,
     /// Its descriptor.
     pub descriptor: &'static str,
+    /// What the calling Java method does **before** this downcall that the engine can observe
+    /// later -- run by [`run`] ahead of the call, in order. Empty for almost every row.
+    pub java_before: &'static [JavaStatement],
     /// The arguments after `(JNIEnv*, jclass)`.
     pub args: &'static [ScriptArg],
 }
+
+/// A statement the app's Java code executes **between** two downcalls: `sput-object value,
+/// class->field:descriptor`.
+///
+/// # Why the script carries Java statements at all
+///
+/// Nothing crosses the boundary here, so [`Downcall`] alone could not say it -- but the engine
+/// reads the result back later through JNI, and the only honest source for what it reads is the
+/// step that wrote it. `org.fmod.FMOD.checkInit()` is `gContext != null`, and `gContext` is
+/// written by `FMOD.init(Context)`, which `NativeHelper.Q` calls between two of step 11's
+/// downcalls ([`FMOD_INIT`]). Answering `checkInit` with a constant `true` would claim that
+/// step had run whether or not it had; answering it from a field this statement writes makes the
+/// claim true by construction, and makes a host that skips step 11 get the `false` a device with
+/// no `FMOD.init` would.
+///
+/// The field must be declared [`Answer::Assigned`](super::classes::Answer::Assigned) --
+/// [`Jni::put_static_object`] refuses anything else -- so a statement cannot overwrite a value
+/// this layer answers some other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JavaStatement {
+    /// Where it is in the APK -- the calling method and the dex pc -- so it can be re-read.
+    pub site: &'static str,
+    /// The declaring class of the field, in JNI form.
+    pub class: &'static str,
+    /// The static field assigned.
+    pub field: &'static str,
+    /// Its type descriptor.
+    pub descriptor: &'static str,
+    /// What is stored: an [`ScriptArg::Object`] instance, or [`ScriptArg::Null`].
+    pub value: ScriptArg,
+}
+
+/// `org.fmod.FMOD.init(Context)`, where `NativeHelper.Q` calls it -- read out of `classes2.dex`:
+///
+/// ```text
+/// NativeHelper.Q(Context, NativeHelper):
+///   0004: invoke-static {v0}, NativeGLInterface.nativeSetAppPreviousExitReasons(List)
+///   0021: iget-object v5, v7, NativeHelper.a:MainGameActivity
+///   0023: invoke-static {v5}, Lorg/fmod/FMOD;->init(Landroid/content/Context;)V    <- no branch
+///   002d: invoke-static {}, bh.x0.U0()V              (nativeSetHttpClientProxy; not scripted)
+///   003a: invoke-static {v0}, NativeSettingsInterface.nativeSetPreferencesFile(String)
+///   00a6: invoke-static {v4}, NativeSettingsInterface.nativeSetExternalDirectory(String)
+/// FMOD.init(Context):
+///   0000: sput-object v2, Lorg/fmod/FMOD;->gContext:Landroid/content/Context;
+///   0002: if-eqz v2 -> return
+///   0004..000f: gContext.registerReceiver(gPluginBroadcastReceiver, HEADSET_PLUG filter)
+/// ```
+///
+/// So it is the statement before [`SEQUENCE`]'s `nativeSetPreferencesFile` row, the next
+/// scripted downcall in `Q`'s bytecode, and the value is `NativeHelper.a`: the
+/// `MainGameActivity` itself.
+///
+/// **`registerReceiver` is not modelled, and nothing is lost by that.** The receiver's only
+/// action is `FMOD$PluginBroadcastReceiver.onReceive` -> the native
+/// `OutputAAudioHeadphonesChanged`, on an `android.intent.action.HEADSET_PLUG` broadcast; this
+/// host delivers no broadcasts, so a registration nothing will ever call changes nothing the
+/// engine can observe.
+///
+/// `fi.e.E` calls `FMOD.init` again (`0x003f`, just before `nativeGameGlobalInit`) with its own
+/// `Context` argument. Not repeated here: by then `gContext` is already set, `checkInit` tests
+/// only for `null`, and which `Context` `E` is handed depends on which of its three callers ran
+/// (`ActivityNativeMain.P2`, `fi.a.F0`, `fi.e.r`), which this script does not decide.
+///
+/// **The order within step 11 is the script's, not `Q`'s**, and this statement does not change
+/// it: [`SEQUENCE`] runs `nativeSetExternalDirectory`, then `nativeSetPreferencesFile`, then
+/// `nativeSetAppPreviousExitReasons`, where `Q` runs them in the reverse order. None of the three
+/// reads `gContext`, so where among them the assignment lands is not observable to the engine.
+pub const FMOD_INIT: JavaStatement = JavaStatement {
+    site: "com/roblox/client/startup/NativeHelper.Q @0x0023: \
+           invoke-static FMOD.init(NativeHelper.a) -> org/fmod/FMOD.init @0x0000: sput-object gContext",
+    class: "org/fmod/FMOD",
+    field: "gContext",
+    descriptor: "Landroid/content/Context;",
+    value: ScriptArg::Object("com/roblox/client/startup/MainGameActivity"),
+};
 
 impl Downcall {
     /// The exported symbol this downcall calls.
@@ -121,6 +199,27 @@ pub const APP_VERSION: &str = "2.738.1397";
 /// on Vulkan -- `Mode 6 failed: Android version is too old to activate Vulkan` -- for EGL.
 /// 33 is Android 13.
 pub const ANDROID_SDK_INT: &str = "33";
+
+/// [`ANDROID_SDK_INT`] as the number `Build.VERSION.SDK_INT` is, for a Java method whose whole
+/// body compares against it (`FMOD.supportsAAudio`). Parsed from the one string at compile time,
+/// so the figure is still stated once and the two cannot disagree.
+pub const ANDROID_SDK_LEVEL: i32 = decimal(ANDROID_SDK_INT);
+
+/// The number a decimal string spells, at compile time. A character that is not a digit is a
+/// **build failure**, not a zero: an SDK level of 0 would read as "older than every API" and
+/// quietly flip every comparison made against it.
+const fn decimal(text: &str) -> i32 {
+    let bytes = text.as_bytes();
+    assert!(!bytes.is_empty(), "the SDK level is empty");
+    let mut value = 0i32;
+    let mut at = 0;
+    while at < bytes.len() {
+        assert!(bytes[at].is_ascii_digit(), "the SDK level is not a decimal number");
+        value = value * 10 + (bytes[at] - b'0') as i32;
+        at += 1;
+    }
+    value
+}
 
 /// What the host tells the engine this *application* is called.
 ///
@@ -181,6 +280,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/universalapp/linking/JNIBaseUrlProtocol",
         member: "init",
         descriptor: "(Landroid/content/Context;)V",
+        java_before: &[],
         args: &[ScriptArg::Object("android/app/Application")],
     },
     Downcall {
@@ -189,6 +289,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/universalapp/linking/JNIWebLoginProtocol",
         member: "init",
         descriptor: "(Landroid/content/Context;)V",
+        java_before: &[],
         args: &[ScriptArg::Object("android/app/Application")],
     },
     // ---- step 8: ActivitySplash.onCreate --------------------------------------------------
@@ -198,6 +299,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeReportingInterface",
         member: "initAppShellReporter",
         descriptor: "()V",
+        java_before: &[],
         args: &[],
     },
     // ---- step 9: the settings bootstrap, `bh.x0` -- 11 downcalls, all (String...)V --------
@@ -215,6 +317,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetCacheDirectory",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("/data/data/com.roblox.client/cache")],
     },
     Downcall {
@@ -223,6 +326,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetFilesDirectory",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("/data/data/com.roblox.client/files")],
     },
     Downcall {
@@ -231,6 +335,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeInitFastLog",
         descriptor: "()V",
+        java_before: &[],
         args: &[],
     },
     Downcall {
@@ -239,6 +344,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetRobloxVersion",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text(APP_VERSION)],
     },
     Downcall {
@@ -247,6 +353,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetRobloxChannel",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("")],
     },
     Downcall {
@@ -255,6 +362,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetBaseUrl",
         descriptor: "(Ljava/lang/String;Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("https://www.roblox.com"), ScriptArg::Text("roblox.com")],
     },
     Downcall {
@@ -263,6 +371,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetExceptionReasonFilename",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("/data/data/com.roblox.client/files/exitReason")],
     },
     Downcall {
@@ -271,6 +380,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetPlatformHeadersWithIdfa",
         descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        java_before: &[],
         // **Three device identifiers, and this host honestly has one of them.** The arguments
         // used to be `("Android", APP_VERSION, "")`, which was three guesses in a row and
         // nothing in the APK or the binary said any of them. What the downcall actually does,
@@ -304,6 +414,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetUserId",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("0")],
     },
     Downcall {
@@ -312,6 +423,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeOverrideChannelPlatformName",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text(CHANNEL_PLATFORM_NAME)],
     },
     Downcall {
@@ -320,6 +432,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeOverrideChannelPlatformName2",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text(CHANNEL_PLATFORM_NAME)],
     },
     // ---- step 10: MainGameActivity.b2 / .a2 -----------------------------------------------
@@ -329,6 +442,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/client/startup/MainGameActivity",
         member: "nativeSetAssetPath",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         // **A directory, not the apk file.** MEASURED: passing the apk path made the engine
         // throw `'/data/app/com.roblox.client/base.apk' is not a directory`.
         //
@@ -351,6 +465,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/client/startup/MainGameActivity",
         member: "nativePreloadFlagOverrides",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("")],
     },
     // ---- step 11: device info and the directories -----------------------------------------
@@ -360,6 +475,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetDeviceInfo",
         descriptor: "(Lcom/roblox/engine/jni/model/DeviceParams;)V",
+        java_before: &[],
         args: &[ScriptArg::Object("com/roblox/engine/jni/model/DeviceParams")],
     },
     Downcall {
@@ -368,6 +484,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetExternalDirectory",
         descriptor: "(Ljava/lang/String;)V",
+        java_before: &[],
         args: &[ScriptArg::Text("/storage/emulated/0/Android/data/com.roblox.client")],
     },
     Downcall {
@@ -376,6 +493,9 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeSettingsInterface",
         member: "nativeSetPreferencesFile",
         descriptor: "(Ljava/lang/String;)V",
+        // `Q` calls `FMOD.init(this.a)` at `0x0023`, before this downcall at `0x003a`: the
+        // statement that makes `FMOD.checkInit()` true. See `FMOD_INIT`.
+        java_before: &[FMOD_INIT],
         args: &[ScriptArg::Text("/data/data/com.roblox.client/shared_prefs/prefs.xml")],
     },
     Downcall {
@@ -384,6 +504,7 @@ pub static SEQUENCE: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeGLInterface",
         member: "nativeSetAppPreviousExitReasons",
         descriptor: "(Ljava/util/List;)V",
+        java_before: &[],
         args: &[ScriptArg::Object("java/util/List")],
     },
 ];
@@ -423,6 +544,7 @@ pub static ENGINE_SETTINGS: &[Downcall] = &[Downcall {
     class: "com/roblox/client/startup/MainGameActivity",
     member: "nativeAppBridgeSetInitParams",
     descriptor: "(Lcom/roblox/engine/jni/autovalue/InitParams;)V",
+    java_before: &[],
     args: &[ScriptArg::Object("com/roblox/engine/jni/autovalue/InitParams")],
 }];
 
@@ -532,6 +654,7 @@ pub static FLAGS_AND_START: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeGLInterface",
         member: "nativeInitClientSettings",
         descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+        java_before: &[],
         args: &[
             ScriptArg::Text(CLIENT_SETTINGS),
             // The second string is not on either branch of `0x02baf38c`'s first test. Empty
@@ -546,6 +669,7 @@ pub static FLAGS_AND_START: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeGLInterface",
         member: "nativePostClientSettingsLoadedInitialization3",
         descriptor: "(Ljava/util/List;)V",
+        java_before: &[],
         args: &[ScriptArg::Object("java/util/List")],
     },
     // ---- row 22: global init, then the app itself -------------------------------------------
@@ -555,6 +679,7 @@ pub static FLAGS_AND_START: &[Downcall] = &[
         class: "com/roblox/engine/jni/NativeGLInterface",
         member: "nativeGameGlobalInit",
         descriptor: "()V",
+        java_before: &[],
         args: &[],
     },
 ];
@@ -667,6 +792,21 @@ pub fn run(
     let mut outcomes = Vec::with_capacity(steps.len());
     for step in steps {
         let symbol = step.symbol();
+        // **The Java statements first, whether or not the export resolves**: on a device they
+        // run as the calling method reaches them, and a native that fails to link fails at its
+        // own call, after them. A statement that cannot be performed is this step's failure and
+        // the downcall is not made -- the Java method would have thrown before reaching it.
+        if let Err(error) = perform(jni, step.java_before) {
+            outcomes.push(StepOutcome {
+                step: step.step,
+                target: resolve(&symbol),
+                symbol,
+                result: Err(error),
+                returned: None,
+                last_segment_instructions: 0,
+            });
+            continue;
+        }
         let Some(target) = resolve(&symbol) else {
             outcomes.push(StepOutcome {
                 step: step.step,
@@ -712,6 +852,47 @@ pub fn run(
         });
     }
     Ok(outcomes)
+}
+
+/// Perform Java statements, in order, against `jni`.
+///
+/// What [`run`] does with each row's [`Downcall::java_before`]; public so that an embedding that
+/// drives its own sequence performs the same statements the same way.
+///
+/// # Errors
+///
+/// [`AbiError::JniRefused`] naming the statement's site when a value cannot be built or the store
+/// is refused -- an undeclared class or field, a field not declared
+/// [`Answer::Assigned`](super::classes::Answer::Assigned), a value its type does not admit.
+pub fn perform(jni: &Jni, statements: &[JavaStatement]) -> AbiResult<()> {
+    for statement in statements {
+        let named = |error: AbiError| AbiError::JniRefused {
+            function: "script::perform".to_string(),
+            address: 0,
+            detail: format!("the Java statement at {} could not be performed: {error}", statement.site),
+        };
+        let value = match statement.value {
+            ScriptArg::Object(class) => jni.new_object(class).map_err(named)?,
+            ScriptArg::Null => 0,
+            // A statement stores an instance or `null` -- `JavaStatement::value` says so -- and
+            // the store checks instance types against the field's. A `jlong` is no reference at
+            // all, and no field the script assigns holds a string: refused, not converted.
+            ScriptArg::Text(_) | ScriptArg::Long(_) => {
+                return Err(named(AbiError::JniRefused {
+                    function: "script::perform".to_string(),
+                    address: 0,
+                    detail: format!(
+                        "{:?} is not an instance or null, which is what a Java statement stores \
+                         into `{}.{}`",
+                        statement.value, statement.class, statement.field
+                    ),
+                }))
+            }
+        };
+        jni.put_static_object(statement.class, statement.field, statement.descriptor, value)
+            .map_err(named)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -816,6 +997,132 @@ mod tests {
                     );
                 }
             }
+            for statement in step.java_before {
+                assert!(declared.contains(&statement.class), "{}", statement.site);
+                if let ScriptArg::Object(class) = statement.value {
+                    assert!(declared.contains(&class), "{}", statement.site);
+                }
+            }
         }
+    }
+
+    /// `FMOD.checkInit()`, called the way the engine calls it.
+    fn check_init(jni: &Jni) -> bool {
+        let mut state = jni.state();
+        let class = state.registry.find("org/fmod/FMOD").expect("declared");
+        let method = state.registry.method(class, "checkInit", "()Z", true).expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        match super::super::env::evaluate(
+            &mut state,
+            "CallStaticBooleanMethodV",
+            0,
+            class,
+            &member,
+            None,
+            &[],
+        ) {
+            Ok(super::super::values::Value::Boolean(set)) => set,
+            other => panic!("checkInit answered {other:?}"),
+        }
+    }
+
+    /// The SDK level is the string, parsed -- not a second figure that could drift from it.
+    #[test]
+    fn the_sdk_level_is_the_sdk_string_as_a_number() {
+        assert_eq!(ANDROID_SDK_LEVEL, 33);
+        assert_eq!(ANDROID_SDK_LEVEL, ANDROID_SDK_INT.parse::<i32>().expect("a decimal"));
+        assert_eq!(decimal("27"), 27);
+        assert_eq!(decimal("0"), 0);
+    }
+
+    /// **`FMOD.init` is performed by exactly one row: the one whose Java method performs it.**
+    ///
+    /// `NativeHelper.Q` calls it at `0x0023` with `NativeHelper.a`, the `MainGameActivity`, and
+    /// the next scripted downcall in `Q` is `nativeSetPreferencesFile`. A table that dropped the
+    /// statement would leave `checkInit` false for the whole run -- the engine would then skip
+    /// FMOD's asset reader and take the no-Context branches of its output choice -- and one that
+    /// attached it to an earlier step would claim `FMOD.init` ran before the Java that runs it.
+    #[test]
+    fn fmod_init_is_performed_by_the_row_whose_java_performs_it_and_by_no_other() {
+        let rows: Vec<&Downcall> = SEQUENCE
+            .iter()
+            .chain(ENGINE_SETTINGS)
+            .chain(FLAGS_AND_START)
+            .filter(|row| !row.java_before.is_empty())
+            .collect();
+        assert_eq!(rows.len(), 1, "one row performs Java statements: {rows:?}");
+        let row = rows[0];
+        assert_eq!(
+            (row.step, row.caller, row.member),
+            (11, "com/roblox/client/startup/NativeHelper.Q", "nativeSetPreferencesFile")
+        );
+        assert_eq!(row.java_before, &[FMOD_INIT]);
+        assert_eq!(
+            (FMOD_INIT.class, FMOD_INIT.field, FMOD_INIT.descriptor),
+            ("org/fmod/FMOD", "gContext", "Landroid/content/Context;")
+        );
+        assert_eq!(FMOD_INIT.value, ScriptArg::Object("com/roblox/client/startup/MainGameActivity"));
+    }
+
+    /// **[`run`] performs a row's Java statements before its downcall, and only at that row** --
+    /// driven through `run` itself, one row at a time as the gate drives it, with an export
+    /// table that knows nothing, so no guest code runs and what is observed is the statement.
+    ///
+    /// `checkInit` is `false` through every row before the one that performs `FMOD.init`, and
+    /// `true` from it on. The statement is performed even though the export did not resolve:
+    /// on a device `FMOD.init` runs before the native is even looked up.
+    #[test]
+    fn run_performs_fmod_init_at_its_row_and_not_before() {
+        let space = Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(Arc::clone(&space)).expect("a JNI instance");
+        declare_script_classes(&jni);
+        let boundary = crate::boundary::BoundaryBuilder::new(Arc::clone(&space), 1, 4096)
+            .expect("a thunk region")
+            .finish();
+        let backend = omni_cpu::dynarmic::DynarmicBackend::new(
+            Arc::clone(&space),
+            omni_cpu::dynarmic::DynarmicOptions::default(),
+        )
+        .expect("a backend");
+        let mut cpu = omni_cpu::GuestCpuBackend::create_guest_thread(&backend).expect("a thread");
+
+        let at = SEQUENCE
+            .iter()
+            .position(|row| row.java_before.contains(&FMOD_INIT))
+            .expect("a row performs FMOD.init");
+        for (index, row) in SEQUENCE.iter().enumerate() {
+            let outcomes =
+                run(&jni, &boundary, cpu.as_mut(), &|_| None, std::slice::from_ref(row), 0)
+                    .expect("the arguments build");
+            assert_eq!(outcomes.len(), 1);
+            assert!(outcomes[0].target.is_none() && !outcomes[0].ok(), "{:?}", outcomes[0]);
+            assert_eq!(
+                check_init(&jni),
+                index >= at,
+                "after row {index} (`{}`), FMOD.init is at row {at}",
+                row.member
+            );
+        }
+    }
+
+    /// A statement that cannot be performed is its row's failure, and the downcall is not made:
+    /// the Java method would have thrown before reaching it.
+    #[test]
+    fn a_statement_that_cannot_be_performed_fails_its_row() {
+        let space = Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let wrong = JavaStatement { value: ScriptArg::Object("java/util/List"), ..FMOD_INIT };
+        let error = perform(&jni, &[wrong]).expect_err("a List is not a Context");
+        match error {
+            AbiError::JniRefused { detail, .. } => {
+                assert!(detail.contains("NativeHelper.Q"), "the site is named: {detail}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let long = JavaStatement { value: ScriptArg::Long(7), ..FMOD_INIT };
+        assert!(perform(&jni, &[long]).is_err(), "a jlong is not a reference");
+        assert!(!check_init(&jni), "nothing was stored");
+        perform(&jni, &[FMOD_INIT]).expect("the real statement");
+        assert!(check_init(&jni));
     }
 }

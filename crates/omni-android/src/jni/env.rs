@@ -518,13 +518,7 @@ fn env_call(
             let mut state = jni.state();
             let field = state.handles.decode_field(name, address, field)?;
             let member = field_member(&state, name, address, field)?.clone();
-            let value = if member.answer == Answer::StaticInstance {
-                static_instance(&mut state, name, address, field, &member)?
-            } else {
-                Registry::simple_answer(member.answer).ok_or_else(|| {
-                    unanswered(&state, name, address, field.class, &member)
-                })?
-            };
+            let value = static_field(&mut state, name, address, field, &member)?;
             field_return(&mut state, name, address, value)
         }
 
@@ -1174,6 +1168,64 @@ fn field_member<'a>(
     })
 }
 
+/// What a **static** field holds, read the one way every reader reads it.
+///
+/// `GetStaticObjectField`/`GetStaticIntField` answer through this, and so does
+/// [`Answer::StaticIsSet`], so a method that tests a field and a read of that field cannot
+/// disagree about it. [`Answer::StaticInstance`] is the object `<clinit>` made,
+/// [`Answer::Assigned`] is whatever a Java statement last stored (or `null`), and anything else is
+/// the declared constant -- or a refusal naming the field when there is none.
+pub(super) fn static_field(
+    state: &mut JniState,
+    name: &str,
+    address: GuestAddr,
+    field: FieldId,
+    member: &Member,
+) -> AbiResult<Value> {
+    match member.answer {
+        Answer::StaticInstance => static_instance(state, name, address, field, member),
+        Answer::Assigned => assigned(state, name, address, field, member),
+        other => Registry::simple_answer(other)
+            .ok_or_else(|| unanswered(state, name, address, field.class, member)),
+    }
+}
+
+/// [`Answer::Assigned`]: the object a Java statement stored in this static field, anchored in
+/// `JniState::statics`, or Java `null` when no statement has stored one.
+///
+/// # Errors
+///
+/// [`AbiError::JniRefused`] when the declaration is not a static object field -- a `null` for a
+/// primitive would be the plausible wrong answer -- or the read is a primitive getter, and
+/// whatever the handle table refuses.
+fn assigned(
+    state: &mut JniState,
+    name: &str,
+    address: GuestAddr,
+    field: FieldId,
+    member: &Member,
+) -> AbiResult<Value> {
+    let primitive_read = name.starts_with("GetStatic") && name != "GetStaticObjectField";
+    if !member.is_static || !member.descriptor.starts_with('L') || primitive_read {
+        return Err(AbiError::JniRefused {
+            function: name.to_string(),
+            address,
+            detail: format!(
+                "`{}.{}` ({}, {}) is declared as a static object field the Java side assigns, \
+                 which only a static field of an object type read as an object can be",
+                state.registry.class_name(field.class),
+                member.name,
+                member.descriptor,
+                if member.is_static { "static" } else { "not static" }
+            ),
+        });
+    }
+    match state.statics.get(&field) {
+        Some(&held) => Ok(Value::Object(Some(state.handles.resolve_id(name, address, held)?))),
+        None => Ok(Value::Object(None)),
+    }
+}
+
 /// [`Answer::StaticInstance`]: the one object the class's `<clinit>` stored in this field.
 ///
 /// Created on the first read and anchored by a global reference in [`JniState::statics`], so
@@ -1400,7 +1452,7 @@ fn refuse_slot_named(name: &str, address: GuestAddr) -> AbiError {
 }
 
 /// Evaluate a member's [`Answer`].
-fn evaluate(
+pub(super) fn evaluate(
     state: &mut JniState,
     name: &str,
     address: GuestAddr,
@@ -1568,18 +1620,45 @@ fn evaluate(
                 member.descriptor
             ),
         }),
+        Answer::StaticIsSet(field_name) => {
+            // The field is looked up on the method's own class, static and object-typed: that is
+            // the shape `sget-object <field>; if-eqz` has, and anything else is a declaration
+            // defect that must say so rather than answer.
+            let Some(index) = state.registry.class(class).and_then(|c| {
+                c.fields
+                    .iter()
+                    .position(|f| f.name == field_name && f.is_static && f.descriptor.starts_with('L'))
+            }) else {
+                return Err(AbiError::JniRefused {
+                    function: name.to_string(),
+                    address,
+                    detail: format!(
+                        "`{}.{}{}` tests the static object field `{field_name}`, which that class \
+                         does not declare",
+                        state.registry.class_name(class),
+                        member.name,
+                        member.descriptor
+                    ),
+                });
+            };
+            let field = FieldId { class, member: index as u16 };
+            let held = field_member(state, name, address, field)?.clone();
+            let value = static_field(state, name, address, field, &held)?;
+            Ok(Value::Boolean(matches!(value, Value::Object(Some(_)))))
+        }
         Answer::Unanswered => Err(unanswered(state, name, address, class, member)),
         // A field's answer reaching a method call is a declaration defect, and it says so
         // rather than falling into `simple_answer` and reading as "not decided".
-        Answer::StaticInstance => Err(AbiError::JniRefused {
+        Answer::StaticInstance | Answer::Assigned => Err(AbiError::JniRefused {
             function: name.to_string(),
             address,
             detail: format!(
-                "`{}.{}{}` is declared StaticInstance, which is an answer for a static field and \
-                 not for a call",
+                "`{}.{}{}` is declared {:?}, which is an answer for a static field and not for a \
+                 call",
                 state.registry.class_name(class),
                 member.name,
-                member.descriptor
+                member.descriptor,
+                member.answer
             ),
         }),
         simple => {
@@ -2056,6 +2135,107 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    const FMOD: &str = "org/fmod/FMOD";
+    const CONTEXT: &str = "Landroid/content/Context;";
+    const ACTIVITY: &str = "com/roblox/client/startup/MainGameActivity";
+
+    /// `FMOD.checkInit()`, called the way the engine calls it.
+    fn check_init(jni: &Jni) -> Value {
+        let mut state = jni.state();
+        let class = state.registry.find(FMOD).expect("declared");
+        let method = state.registry.method(class, "checkInit", "()Z", true).expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        evaluate(&mut state, "CallStaticBooleanMethodV", 0, class, &member, None, &[])
+            .expect("checkInit is answered")
+    }
+
+    /// `FMOD.gContext`, read the way `GetStaticObjectField` reads it.
+    fn g_context(jni: &Jni) -> Value {
+        let mut state = jni.state();
+        let class = state.registry.find(FMOD).expect("declared");
+        let field = state.registry.field(class, "gContext", CONTEXT, true).expect("declared");
+        let member = state.registry.field_member(field).expect("a member").clone();
+        static_field(&mut state, "GetStaticObjectField", 0, field, &member).expect("a read")
+    }
+
+    /// **`FMOD.checkInit()` is `gContext != null`, answered from what `gContext` holds.**
+    ///
+    /// The three wrong answers each fail a different line: a constant `true` (the device's answer
+    /// hard-coded) fails the first; the refusal the gate died on, or a store that is not kept,
+    /// fails the second; a field that is not anchored fails after the host's local goes; and a
+    /// check that asked whether the field is *declared* rather than *set* fails the first and the
+    /// last. The read and the test agree because they are one function.
+    #[test]
+    fn fmod_check_init_answers_whether_a_context_has_been_assigned() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        assert_eq!(check_init(&jni), Value::Boolean(false), "no FMOD.init has run: gContext is null");
+        assert_eq!(g_context(&jni), Value::Object(None));
+
+        let activity = jni.new_object(ACTIVITY).expect("an activity");
+        jni.put_static_object(FMOD, "gContext", CONTEXT, activity).expect("FMOD.init's store");
+        assert_eq!(check_init(&jni), Value::Boolean(true), "FMOD.init has run");
+        let expected = jni.state().handles.resolve_id("test", 0, activity).expect("live");
+        assert_eq!(g_context(&jni), Value::Object(Some(expected)), "the very object stored");
+
+        // The host's local goes; the static's anchor keeps the object, as a Java static would.
+        jni.state().handles.delete("DeleteLocalRef", 0, RefKind::Local, activity).expect("deleted");
+        assert_eq!(check_init(&jni), Value::Boolean(true));
+        assert_eq!(g_context(&jni), Value::Object(Some(expected)));
+
+        // `FMOD.close()`'s `sput-object null`, and the anchor it held is released with it.
+        let (references_before, objects_before, _) = jni.reference_stats();
+        jni.put_static_object(FMOD, "gContext", CONTEXT, 0).expect("cleared");
+        assert_eq!(check_init(&jni), Value::Boolean(false));
+        assert_eq!(g_context(&jni), Value::Object(None));
+        let (references_after, objects_after, _) = jni.reference_stats();
+        assert_eq!(references_after + 1, references_before, "the anchor is released, not leaked");
+        assert_eq!(objects_after + 1, objects_before, "and with it the last thing holding the object");
+    }
+
+    /// **A Java-assigned static takes what its type admits, and only a Java-assigned static can
+    /// be written.** A `java/util/List` in a `Context` field is a state the verifier would never
+    /// have let the app reach; `PlatformSystemDialogHandler.INSTANCE` is answered by its
+    /// `<clinit>` and must not be overwritten by a statement; an undeclared field is not there.
+    #[test]
+    fn a_java_assigned_static_takes_only_what_its_type_admits() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let list = jni.new_object("java/util/List").expect("a list");
+        let error = jni.put_static_object(FMOD, "gContext", CONTEXT, list).expect_err("a List");
+        assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
+        assert_eq!(check_init(&jni), Value::Boolean(false), "a refused store stores nothing");
+
+        let handler = jni.new_object(HANDLER).expect("a handler");
+        let own = format!("L{HANDLER};");
+        let error =
+            jni.put_static_object(HANDLER, "INSTANCE", &own, handler).expect_err("StaticInstance");
+        assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
+
+        let activity = jni.new_object(ACTIVITY).expect("an activity");
+        assert!(jni.put_static_object(FMOD, "gNoSuchField", CONTEXT, activity).is_err());
+        assert!(jni.put_static_object(FMOD, "gContext", "Ljava/lang/Object;", activity).is_err());
+        // And the declared chain is what admits the activity: `MainGameActivity` ->
+        // `GameActivity` -> `Context`.
+        jni.put_static_object(FMOD, "gContext", CONTEXT, activity).expect("an activity is a Context");
+    }
+
+    /// A primitive read of a Java-assigned object field is refused rather than answered with
+    /// the object's handle as an `int`.
+    #[test]
+    fn a_java_assigned_static_is_not_read_as_a_primitive() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let class = state.registry.find(FMOD).expect("declared");
+        let field = state.registry.field(class, "gContext", CONTEXT, true).expect("declared");
+        let member = state.registry.field_member(field).expect("a member").clone();
+        assert_eq!(member.answer, Answer::Assigned);
+        let error = static_field(&mut state, "GetStaticIntField", 0, field, &member)
+            .expect_err("an object field read as an int");
+        assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
     }
 
     /// One marshaller for both paths, and this is what says a `jlong` keeps all 64 bits where an

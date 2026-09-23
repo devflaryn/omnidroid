@@ -127,6 +127,24 @@ pub enum Answer {
     /// is read: this variant claims the class's own `<clinit>` stored a fresh instance of the
     /// class, and anywhere else that claim is false.
     StaticInstance,
+    /// A static object field **the app's own Java code assigns** with `sput-object`: Java `null`
+    /// until the scripted Java statement that assigns it has run
+    /// ([`super::script::JavaStatement`], through [`super::Jni::put_static_object`]), and the
+    /// object it stored from then on.
+    ///
+    /// Not [`StaticInstance`](Answer::StaticInstance), whose value the class's own `<clinit>`
+    /// makes on first read: this one is written by a statement the host executes at the point of
+    /// the startup sequence where the app's bytecode executes it, so what it answers is a
+    /// function of **which steps have run** -- which is the whole reason it exists. A constant
+    /// here would be claiming the step had run whether it had or not.
+    Assigned,
+    /// `static boolean m() { return <field> != null; }` -- a static method whose entire body tests
+    /// the named static object field of its own class, answered from what that field holds
+    /// **now**, read exactly as `GetStaticObjectField` would read it.
+    ///
+    /// `org.fmod.FMOD.checkInit()` is this and nothing else (`sget-object gContext; if-eqz`), so
+    /// its answer follows `FMOD.init(Context)` having run rather than being chosen.
+    StaticIsSet(&'static str),
     /// Construct an instance of **another** declared class and return it.
     ///
     /// What a factory getter is: `ActivityThread.currentApplication()`,
@@ -286,6 +304,17 @@ impl Registry {
             next = self.class(current).and_then(|declared| declared.superclass);
             Some(current)
         })
+    }
+
+    /// Whether `class` is `ancestor` or has it on its **declared** superclass chain -- Java's
+    /// assignability, as far as [`EXTENDS`] states it.
+    ///
+    /// What a store into a field checks before it lets an object in: a field typed
+    /// `Landroid/content/Context;` can hold a `MainGameActivity` because the chain says so, and a
+    /// `java/util/List` would be a value the Java verifier would never have let through.
+    #[must_use]
+    pub fn extends(&self, class: ClassId, ancestor: ClassId) -> bool {
+        self.ancestry(class).any(|at| at == ancestor)
     }
 
     /// Declare `spec`, or add to an existing class only the members it does not already have.
@@ -536,6 +565,8 @@ impl Registry {
             Answer::Field(_)
             | Answer::NewInstance
             | Answer::StaticInstance
+            | Answer::Assigned
+            | Answer::StaticIsSet(_)
             | Answer::NewInstanceOf(_)
             | Answer::ResolveClass
             | Answer::StringBytes
@@ -768,6 +799,20 @@ static CONFIGURATION: &[MemberSpec] = &[
     f("fontScale", "F", Answer::Float(1.0)),
     f("fontWeightAdjustment", "I", Answer::Int(0)),
 ];
+
+/// The lowest `Build.VERSION.SDK_INT` at which `org.fmod.FMOD.supportsAAudio()` answers true.
+///
+/// Read out of `classes2.dex`, where it is the method's whole body:
+///
+/// ```text
+/// FMOD.supportsAAudio()Z:
+///   0000: sget v0, Landroid/os/Build$VERSION;->SDK_INT:I
+///   0002: const/16 v1, #27
+///   0004: if-lt v0, v1, -> 0008
+///   0006: const/4 v0, #1 ; return v0
+///   0008: const/4 v0, #0 ; return v0
+/// ```
+pub const FMOD_AAUDIO_MIN_SDK: i32 = 27;
 
 // -------------------------------------------------------------------------- the table
 
@@ -1428,6 +1473,69 @@ pub static DECLARED: &[ClassSpec] = &[
         ],
         fields: NONE,
     },
+    // ---- FMOD's Android glue: whether the app has handed it a Context, and AAudio -----------
+    //
+    // **MEASURED, gate run 62**: after the logged-out landing screen reloaded its patch, guest
+    // thread 6 died on `CallStaticBooleanMethodV` of `checkInit()Z`, called from `0x4fc0284` --
+    // the first JNI call FMOD makes in the whole process. The chain is Roblox's
+    // `FmodManager::initializeOnce` (`0x2f0421c`) -> `FMOD::System_Create` (`0x2f04330` ->
+    // `0x4f47984`) -> the global init (`0x4f578c0`, first reference only) -> FMOD's Android OS
+    // init (`0x4fbc6c4`) -> `0x4fc0218`.
+    //
+    // **What `checkInit` is, from `classes2.dex`**: `sget-object gContext; if-eqz -> false;
+    // true`. `gContext` is written in exactly one place, `FMOD.init(Context)`'s first
+    // instruction (`sput-object v2, gContext`), and `<clinit>` does not touch it. The app calls
+    // `FMOD.init` **unconditionally** from `NativeHelper.Q` at `0x0023` -- with
+    // `NativeHelper.a`, the `MainGameActivity` -- and again from `fi.e.E` at `0x003f`, right
+    // before `nativeGameGlobalInit`. Both are methods the scripted startup already emulates
+    // (step 11's rows name `NativeHelper.Q`; row 22 names `fi.e.E`). So on a device the answer
+    // is `true` **because a step ran**, and this layer answers it the same way: `gContext` is
+    // [`Answer::Assigned`], written by the step-11 statement `script::FMOD_INIT`, and
+    // `checkInit` reads it. Before that step it answers `false`, as the Java would.
+    //
+    // **What FMOD does with the answer, decoded.** At `0x4fc0218`, `true` registers FMOD's
+    // `file:///android_asset/` reader and then `dlopen("libandroid.so", RTLD_LAZY)`
+    // (`0x4fc02cc`); only if that succeeds does it `dlsym` six `AAsset*` symbols and call
+    // `getAssetManager()` (`0x4fc0364`-`0x4fc0398`). This layer's `dlopen` answers NULL for a
+    // library outside the guest's own `DT_VERNEED` (`bionic::dl`), so the function returns
+    // `FMOD_ERR_FILE_NOTFOUND` (`0x12`) -- a result its caller `0x4fbc6f8` **discards** -- and
+    // `getAssetManager` is not reached. It stays unanswered.
+    //
+    // Then `System::init` -> `SystemI::init` (`0x4f62930`) picks an output with
+    // `FMOD_OS_Output_GetDefault` (`0x4fbc4fc`), which reads four FMOD override ints Roblox fills
+    // from FFlags (`0x2f11294` -> `0x4f3f148`, table `0x66acea8` -> `0x6cd5dc8 + 4*i`):
+    // index 0 `DebugFmodUseAndroidAudioTrack` and index 1 `DebugFmodUseAndroidOpenSl`, both
+    // zero-initialised `.bss` with no static writer and absent from the empty settings document.
+    // With both clear it goes straight to `supportsAAudio()` (`0x4fbc630`) and, when that is
+    // true, returns output type `0x14`, whose plugin is "FMOD AAudio Output" (its description's
+    // type word at `+0xb8`, `0x21b588`). `supportsLowLatency` is called only on the paths those
+    // two flags or a `false` from `supportsAAudio` open, so it stays unanswered.
+    //
+    // **The AAudio output needs `libaaudio.so`, and this runtime supplies none.** Its driver-info
+    // and init functions both start with `dlopen("libaaudio.so")` (`0x4fbf3dc`) and answer
+    // `FMOD_ERR_OUTPUT_INIT` (`0x33`) when it is NULL, before any other JNI call. `SystemI::init`
+    // returns that, and **Roblox is written for it**: at `0x2f04a90` `FmodManager` records
+    // `FmodInitError-<reason>`, calls `System::setOutput(FMOD_OUTPUTTYPE_NOSOUND)` (`0x2f04aa4`,
+    // type 2) and initialises again. That is the NOSOUND fallback a device without the library
+    // would get, and it is the honest one here: there is no audio output behind this layer.
+    ClassSpec {
+        name: "org/fmod/FMOD",
+        tier: Tier::Support,
+        methods: &[
+            s("checkInit", "()Z", Answer::StaticIsSet("gContext")),
+            // Its whole body compares `SDK_INT` with 27. The SDK this host presents is
+            // `script::ANDROID_SDK_INT`, the one figure every other `SDK_INT` answer reads, so
+            // the answer is computed from it rather than written down beside it. What makes the
+            // engine silent afterwards is `dlopen("libaaudio.so")` answering NULL -- a fact about
+            // this runtime -- not a `false` here, which would be a claim about Android 13.
+            s(
+                "supportsAAudio",
+                "()Z",
+                Answer::Bool(super::script::ANDROID_SDK_LEVEL >= FMOD_AAUDIO_MIN_SDK),
+            ),
+        ],
+        fields: &[sf("gContext", "Landroid/content/Context;", Answer::Assigned)],
+    },
     // ---- the exceptions a failed lookup leaves pending ------------------------------------
     ClassSpec {
         name: "java/lang/ClassNotFoundException",
@@ -1785,8 +1893,47 @@ mod tests {
         assert!(Registry::simple_answer(Answer::Native).is_none());
         assert!(Registry::simple_answer(Answer::Field("x")).is_none());
         assert!(Registry::simple_answer(Answer::NewInstance).is_none());
+        // Both are answers **from state**, and a constant for either would be the plausible
+        // wrong one: `checkInit` true whether or not `FMOD.init` ran.
+        assert!(Registry::simple_answer(Answer::Assigned).is_none());
+        assert!(Registry::simple_answer(Answer::StaticIsSet("gContext")).is_none());
         assert_eq!(Registry::simple_answer(Answer::Sink), Some(Value::Void));
         assert_eq!(Registry::simple_answer(Answer::Int(7)), Some(Value::Int(7)));
+    }
+
+    /// **FMOD's Android statics: two decided, the rest refusing by name.**
+    ///
+    /// `supportsAAudio` is the dex's `SDK_INT >= 27` evaluated at the SDK this host presents, 33,
+    /// so it is `true` -- a `false` "because this host has no `libaaudio.so`" would be a false
+    /// statement about Android 13, and the absence is answered where it is a fact, by `dlopen`.
+    /// `checkInit` reads `gContext`, which is Java-assigned. Every other static is unreached on
+    /// the decoded path (see the declaration) and must still refuse: an invented sample rate or
+    /// block size here would be FMOD sizing its mixer on a number nothing measured.
+    #[test]
+    fn fmod_answers_only_what_its_decoded_path_reaches() {
+        let registry = Registry::with_declared();
+        let id = registry.find("org/fmod/FMOD").expect("declared");
+        let answer = |name: &str, descriptor: &str| {
+            let method = registry.method(id, name, descriptor, true).expect("declared");
+            registry.member(method).expect("a member").answer
+        };
+        assert_eq!(super::super::script::ANDROID_SDK_LEVEL, 33, "the SDK every SDK_INT answer uses");
+        assert_eq!(answer("supportsAAudio", "()Z"), Answer::Bool(true));
+        assert_eq!(answer("checkInit", "()Z"), Answer::StaticIsSet("gContext"));
+        let field = registry.field(id, "gContext", "Landroid/content/Context;", true).expect("declared");
+        assert_eq!(registry.field_member(field).expect("a member").answer, Answer::Assigned);
+        for (name, descriptor) in [
+            ("supportsLowLatency", "()Z"),
+            ("getOutputSampleRate", "()I"),
+            ("getOutputBlockSize", "()I"),
+            ("getAssetManager", "()Landroid/content/res/AssetManager;"),
+            ("lowLatencyFlag", "()Z"),
+            ("proAudioFlag", "()Z"),
+            ("isBluetoothOn", "()Z"),
+            ("close", "()V"),
+        ] {
+            assert_eq!(answer(name, descriptor), Answer::Unanswered, "FMOD.{name}{descriptor}");
+        }
     }
 
     /// **The host's display is the embedding's to describe**: every `DisplayMetrics` field the
