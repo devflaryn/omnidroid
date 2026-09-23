@@ -80,6 +80,25 @@ use values::Value;
 /// exception.
 pub const MAX_JNI_THREADS: usize = 64;
 
+/// How many lookups [`Jni::lookups`] keeps.
+pub const MAX_LOOKUPS: usize = 512;
+
+/// One class or member lookup, for [`Jni::lookups`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassLookup {
+    /// The `JNIEnv` slot of the thread that asked.
+    pub thread: usize,
+    /// `FindClass`, `GetStaticMethodID`, ...
+    pub function: String,
+    /// The class name `FindClass` was given, or the member and descriptor a `Get*ID` asked for.
+    pub what: String,
+    /// `FindClass`: the class handle answered (0 for not found). `Get*ID`: the class handle it
+    /// was given.
+    pub class: u64,
+    /// Whether this thread already had an exception pending when the call arrived.
+    pub pending_before: bool,
+}
+
 /// How many upcalls one instance records before it stops recording.
 ///
 /// The record is the *measurement* of what the engine asked the Java side for, which is the
@@ -211,6 +230,9 @@ pub struct Jni {
     /// state lock re-entrant — which `parking_lot::Mutex` is not, and which would deadlock on the
     /// first `FindClass`.
     census: Mutex<BTreeMap<&'static str, u64>>,
+    /// The last [`MAX_LOOKUPS`] class and member lookups, oldest first. Its own lock, for
+    /// `census`'s reason: it is written with the state lock held.
+    lookups: Mutex<std::collections::VecDeque<ClassLookup>>,
     /// Thunk address to `JNINativeInterface` index, filled by [`Jni::install_into`].
     env_slots: Mutex<BTreeMap<GuestAddr, usize>>,
     /// Thunk address to `JNIInvokeInterface` index.
@@ -297,6 +319,7 @@ impl Jni {
             }),
             pool: Mutex::new(pool),
             census: Mutex::new(BTreeMap::new()),
+            lookups: Mutex::new(std::collections::VecDeque::new()),
             env_slots: Mutex::new(BTreeMap::new()),
             vm_slots: Mutex::new(BTreeMap::new()),
             installed: AtomicU64::new(0),
@@ -540,6 +563,24 @@ impl Jni {
     /// own lock.
     pub(crate) fn count(&self, function: &'static str) {
         *self.census.lock().entry(function).or_insert(0) += 1;
+    }
+
+    /// Record one class or member lookup, dropping the oldest past [`MAX_LOOKUPS`].
+    pub(crate) fn record_lookup(&self, lookup: ClassLookup) {
+        let mut lookups = self.lookups.lock();
+        if lookups.len() == MAX_LOOKUPS {
+            lookups.pop_front();
+        }
+        lookups.push_back(lookup);
+    }
+
+    /// The last [`MAX_LOOKUPS`] class and member lookups, oldest first: which thread asked
+    /// `FindClass` for what and got which class, and which class handle each `Get*ID` was
+    /// given. MEASURED why it exists: a worker died on `GetStaticMethodID` with a null class
+    /// that no recorded miss accounted for, and nothing said where the null had come from.
+    #[must_use]
+    pub fn lookups(&self) -> Vec<ClassLookup> {
+        self.lookups.lock().iter().cloned().collect()
     }
 
     /// The mutable state, for a handler.

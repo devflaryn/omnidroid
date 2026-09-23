@@ -295,12 +295,23 @@ fn env_call(
             let pointer = args.next_pointer()?;
             let text = read_cstr(mem, pointer, blame(1))?;
             let mut state = jni.state();
-            match state.registry.find(&text) {
+            let pending_before = state.threads.get(thread).is_some_and(|t| t.pending.is_some());
+            let found = state.registry.find(&text);
+            let record = |class: u64| super::ClassLookup {
+                thread,
+                function: name.to_string(),
+                what: text.clone(),
+                class,
+                pending_before,
+            };
+            match found {
                 Some(class) => {
                     let handle = state.handles.new_local(name, address, Object::Class(class))?;
+                    jni.record_lookup(record(handle));
                     Ok(JniReturn::Word(handle))
                 }
                 None => {
+                    jni.record_lookup(record(0));
                     // §3.1 Tier X: `DeviceUtils` and five `signalVideo*` methods have no
                     // declaring class in the whole APK, so `libroblox.so` gets null for them on a
                     // real device and tolerates it. Null with a pending
@@ -350,6 +361,13 @@ fn env_call(
             // lookup is worth more than finding it out at the call.
             Descriptor::parse(name, address, &descriptor)?;
             let mut state = jni.state();
+            jni.record_lookup(super::ClassLookup {
+                thread,
+                function: name.to_string(),
+                what: format!("{member}{descriptor}"),
+                class,
+                pending_before: state.threads.get(thread).is_some_and(|t| t.pending.is_some()),
+            });
             let class = class_handle(&state, name, address, class)
                 .map_err(|error| asked_for(error, &member, &descriptor))?;
             match state.registry.method(class, &member, &descriptor, is_static) {
