@@ -904,7 +904,54 @@ Read in this order:
 7. **`docs/briefs/`** -- two ready-to-launch subagent briefs for the current frontier
    (`webview2-seam.md`, `performance.md`).
 
-## 2026-09-23 late night: keyboard and mouse, the first freeze fixed, three machines -- read this first
+## 2026-09-24 Windows (`perf-windows`): the close, the relaunch, memory on demand -- read this first
+
+Full record, merge notes and every figure: **`docs/ports/windows.md`**. In short:
+
+* **Done and committed** (`ced3e1d`..`fa7e136`): `perf-world` reviewed and merged (4 fixes);
+  `__vsprintf_chk` (`vsprintf-` 6/6); a death that hangs the close now ends at once as
+  `REASON_CRASH_NATIVE` and the next launch of that directory runs (`crashclose-` 3/3, verified live
+  with `OMNI_INJECT_DEATH`); vendored dynarmic **patch 0002** (D32) -- a guest thread's fixed JIT cost
+  on demand: landing commit 3,157 → 2,105 MiB, working set 2,528 → 1,884 MiB, 24.56 → 4.47 MiB per
+  guest thread; `OMNI_IMPORT_CENSUS=off` for the census A/B. `inbound-` 10/10 (step 0).
+* **The sign-in**: a clean close keeps it; a crash does not (the engine persists the account session
+  on the way to the background; on a device the Java side also keeps its cookies, a Sink here --
+  credential storage, the owner's call, not built). **Sign in once, close at Home with the X, and
+  run everything from copies of that directory.**
+* **Performance was NOT measured in a world**: no signed-in directory existed and the owner was away
+  (the sign-in window stood 43 minutes). Nothing on the performance leads was changed without
+  in-world evidence; the landing shows none of them (one hot thread; `docs/ports/windows.md`).
+
+### The in-world protocol (needs the owner for the sign-in and the join; ~5 min per run)
+
+GoodbyeDPI (not a VPN) broke teleports on 09-23, so measure in **place 606849621**, which is joined
+directly (no teleport). Play binary: `../omnidroid-play` at `fa7e136`, already built. Script:
+`<scratchpad>/play.sh <data-dir-name> <log-name> [ENV=...]` (session until the window is closed).
+
+1. Master: `play.sh data-master-0924 master` -- the owner signs in (Quick Sign-in), waits for
+   Home, closes with the X. Check the log ends `SessionHistory "IB"`.
+2. Each measurement: copy the master to a fresh directory, `play.sh <copy> w<N> OMNI_PERF=5 [switch]`;
+   the owner joins 606849621, leaves the camera idle ~3 minutes, closes with the X. Read presents
+   per 5 s (FRAMES), `[SlowBenchmark]`/`[SlowModule]`, and the `PERF` blocks (per thread: jit / mon
+   / dyn / hnd shares, crossings, translation). n >= 2 per arm.
+3. Arms, one switch each against the default: `OMNI_IMPORT_CENSUS=off`,
+   `OMNI_JIT_EXCLUSIVE_MONITOR=value` (D31 decides on this), `OMNI_JIT_CACHE_MB=128` (load-phase
+   retranslation: -40% on the landing). Change the default only where a world shows the difference.
+
+### Still open, new tonight
+
+1. **In-world performance** (above) -- the goal's first item, unstarted for want of a session.
+2. **The `InferredCrash` reporter** (`+0xc8` null at `0x2383500`) kills one worker at +5 s after any
+   crash, and once on a fresh install; harmless to the run. Who sets it on a device: not decoded
+   (its setter is not among the handle getter's twelve callers).
+3. **Raw `svc #0`** (p1): `x8 = 56` (`openat`) of `"/proc/self/maps"` -- an integrity check reading
+   its own mappings; route guest SVCs through the syscall emulation, answering `-errno` in `x0`.
+4. **The headless gate's 1224**: Linux lets `O_TRUNC` shrink a file under a live shared mapping;
+   Windows refuses. A faithful fix is a logical EOF in the file seam.
+5. **Memory for ~10 instances**: ~2.0 GB commit per landing instance, linear. Next lever: sharing
+   translated code between threads (and instances).
+
+## 2026-09-23 late night: keyboard and mouse, the first freeze fixed, three machines
 
 **The owner's verdict after joining a world twice tonight: "painfully slow, 2-3 fps, nowhere near
 playable"; the aim is 120 fps, ARM64 only.** Performance is still the first item. Everything below
