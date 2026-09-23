@@ -317,6 +317,8 @@ PLAT_PMTU = ["cargo", "test", "-p", "omni-platform", "--release", "--test", "net
              "path_mtu"]
 BIONIC_AUXV = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
                "getauxval"]
+LIBM_SINCOS = ["cargo", "test", "-p", "omni-bionic", "--release", "--test", "libm_tests", "--no-fail-fast",
+               "sincos_"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7477,6 +7479,55 @@ directory", ADAPTER_FILES,
 """,
      """""",
      BIONIC_AUXV),
+
+    # sincos: the in-game worker pool of the first join to connect (2026-09-23).
+    ("sincos-A1", "A", "sincos writes the cosine where the sine goes",
+     "crates/omni-bionic/src/libm.rs",
+     """        (x.sin(), x.cos())
+    };
+    if sin_ptr != 0 {
+        ctx.write(sin_ptr, &s.to_le_bytes())?;
+    }
+    if cos_ptr != 0 {
+        ctx.write(cos_ptr, &c.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// `void sincosf""",
+     """        (x.cos(), x.sin())
+    };
+    if sin_ptr != 0 {
+        ctx.write(sin_ptr, &s.to_le_bytes())?;
+    }
+    if cos_ptr != 0 {
+        ctx.write(cos_ptr, &c.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// `void sincosf""",
+     LIBM_SINCOS),
+    ("sincos-A2", "A", "sincos writes single-precision results, four bytes each",
+     "crates/omni-bionic/src/libm.rs",
+     """        (f64::NAN, f64::NAN)
+    } else {
+        (x.sin(), x.cos())
+    };""",
+     """        (f64::NAN, f64::NAN)
+    } else {
+        ((x as f32).sin() as f64, (x as f32).cos() as f64)
+    };""",
+     LIBM_SINCOS),
+    ("sincos-B1", "B", "an infinite x sets no errno",
+     "crates/omni-bionic/src/libm.rs",
+     """    let (s, c) = if x.is_infinite() {
+        ctx.set_errno(EDOM);
+        (f64::NAN, f64::NAN)""",
+     """    let (s, c) = if x.is_infinite() {
+        (f64::NAN, f64::NAN)""",
+     LIBM_SINCOS),
+
 ]
 
 

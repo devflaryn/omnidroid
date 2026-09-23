@@ -545,6 +545,10 @@ handlers! {
     /// `void sincosf(float x, float *sin, float *cos)`
     fn sincosf(x: f32, sin_ptr: ptr, cos_ptr: ptr) -> void =
         |v| omni_bionic::libm::sincosf(&mut v, x, sin_ptr, cos_ptr);
+    /// `sincos`: the double-precision `sincosf`. MEASURED: the in-game worker pool died on it
+    /// as a join's data model began loading (2026-09-23).
+    fn sincos(x: f64, sin_ptr: ptr, cos_ptr: ptr) -> void =
+        |v| omni_bionic::libm::sincos(&mut v, x, sin_ptr, cos_ptr);
 
     // ---------------------------------------------------------- wide characters
 
@@ -1677,6 +1681,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("sem_post", sem_post),
     ("ldexp", ldexp),
     ("sincosf", sincosf),
+    ("sincos", sincos),
     // wide characters
     ("__ctype_get_mb_cur_max", ctype_get_mb_cur_max),
     ("mbtowc", mbtowc),

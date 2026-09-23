@@ -17,7 +17,7 @@ use omni_bionic::errno::consts::{EDOM, ERANGE};
 use omni_bionic::libm::{
     acos, acosf, asin, asinf, atan2, atan2f, atanf, cos, cosf, cosh, exp, expf, fmodf, frexp,
     atan, cbrt, exp2, exp2f, expm1, fmod, frexpf, hypotf, nextafterf, round, tan, tanh,
-    ilogb, ldexp, ldexpf, log, log10, log10f, log2, modf, modff, nan, pow, powf, sin, sincosf, sinf,
+    ilogb, ldexp, ldexpf, log, log10, log10f, log2, modf, modff, nan, pow, powf, sin, sincos, sincosf, sinf,
     sinh, sinhf, tanf, tanhf,
 };
 use omni_bionic::memory::{Fault, GuestMemory};
@@ -562,6 +562,49 @@ fn powf_mirrors_pow_semantics() {
     assert_eq!(powf(&mut c, 0.0, -1.0), f32::INFINITY);
     assert_eq!(c.errno(), ERANGE);
     assert!(within_1_ulp_f32(powf(&mut c, 2.0, 0.5), 2f32.powf(0.5)));
+}
+
+// ---------------------------------------------------------------- sincos
+
+/// **`sincos` writes `sin(x)` and `cos(x)`, bit for bit, as two eight-byte doubles** -- the
+/// values [`sin`] and [`cos`] answer, so the pair and the singles cannot disagree -- and ±inf is
+/// NaN twice with EDOM. MEASURED why: the in-game worker pool died on the unbound import as a
+/// join's data model began loading (2026-09-23).
+#[test]
+fn sincos_writes_sin_and_cos_bit_for_bit_as_doubles() {
+    for x in [0.0f64, -0.0, 0.5, -1.25, 3.0, 1.0e6, -7.5e-9, std::f64::consts::FRAC_PI_3] {
+        let mut c = ctx();
+        c.mem.map(0x6000, &[0xAAu8; 24]);
+        sincos(&mut c, x, 0x6000, 0x6008).unwrap();
+        let mut buf = [0u8; 24];
+        c.mem.read(0x6000, &mut buf).unwrap();
+        let s = f64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let cosv = f64::from_le_bytes(buf[8..16].try_into().unwrap());
+        assert_eq!(s.to_bits(), sin(&mut ctx(), x).to_bits(), "sin({x})");
+        assert_eq!(cosv.to_bits(), cos(&mut ctx(), x).to_bits(), "cos({x})");
+        assert_eq!(buf[16..], [0xAA; 8], "nothing past the second double is written");
+        assert_eq!(c.errno(), 0, "a finite x sets no errno");
+    }
+    // The sign of zero survives, which a pair computed as (sin, sqrt(1 - sin^2)) would not.
+    let mut c = ctx();
+    c.mem.map(0x6000, &[0u8; 16]);
+    sincos(&mut c, -0.0, 0x6000, 0x6008).unwrap();
+    let mut buf = [0u8; 16];
+    c.mem.read(0x6000, &mut buf).unwrap();
+    assert_eq!(f64::from_le_bytes(buf[0..8].try_into().unwrap()).to_bits(), (-0.0f64).to_bits());
+    // inf -> both NaN + EDOM.
+    for x in [f64::INFINITY, f64::NEG_INFINITY] {
+        let mut c = ctx();
+        c.mem.map(0x6000, &[0u8; 16]);
+        sincos(&mut c, x, 0x6000, 0x6008).unwrap();
+        assert_eq!(c.errno(), EDOM);
+        c.mem.read(0x6000, &mut buf).unwrap();
+        assert!(f64::from_le_bytes(buf[0..8].try_into().unwrap()).is_nan());
+        assert!(f64::from_le_bytes(buf[8..16].try_into().unwrap()).is_nan());
+    }
+    // Null pointers skip the write, as `sincosf` does here (see its test for the divergence).
+    let mut c = ctx();
+    sincos(&mut c, 1.0, 0, 0).unwrap();
 }
 
 // ---------------------------------------------------------------- sincosf

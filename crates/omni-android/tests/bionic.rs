@@ -1028,6 +1028,15 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          in the compatibility layer implements it. Answers Android's `localhost` (AOSP \
          init.rc: `hostname localhost`), or ENAMETOOLONG.",
     ),
+    (
+        "sincos",
+        "The first game join to connect (2026-09-23): RakNet's \"Connection accepted\", the \
+         replicator, the join snapshot, then GUEST THREAD DIED at +100s on five threads of the \
+         in-game worker pool (started at link 0x4fbcbc4): the guest called the imported symbol \
+         `sincos` ... and nothing in the compatibility layer implements it. \
+         `omni_bionic::libm::sincos`, the double-precision `sincosf`, each value bit for bit \
+         `sin`'s and `cos`'s.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1080,7 +1089,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     let symbols: Vec<&str> = Bionic::bound_symbols().collect();
     // 2026-09-23: 307 plus six, each in BEYOND_THE_PREDICTION with how it was found --
     // three pthread_condattr_*, pthread_attr_setschedparam, pthread_setschedparam, gethostname.
-    assert_eq!(symbols.len(), 313, "bound symbols: {symbols:?}");
+    // Then `sincos`, for 314: the in-game worker pool, once a join's data model began loading.
+    assert_eq!(symbols.len(), 314, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1183,7 +1193,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **Six more, all inline, for 313** (2026-09-23): the three `pthread_condattr_*` the first
     // game join died on, `pthread_attr_setschedparam` and `pthread_setschedparam` bound ahead of a
     // run from an audit of unnamed imports, and `gethostname`, a signed-in worker's next death.
-    assert_eq!(Bionic::inline_symbols().count(), 298);
+    // **`sincos`, inline, for 314**: the in-game worker pool of the first join to connect.
+    assert_eq!(Bionic::inline_symbols().count(), 299);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to

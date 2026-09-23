@@ -849,6 +849,33 @@ pub fn erfcf(x: f32) -> f32 {
     }
 }
 
+/// `void sincos(double x, double *sin_ptr, double *cos_ptr)` — the double-precision
+/// [`sincosf`]: both results written through guest memory (8 bytes each, little-endian) when the
+/// respective pointer is non-null, each the value [`sin`] and [`cos`] answer. ±inf → NaN + EDOM,
+/// once. **MEASURED reader**: the engine's in-game worker pool (start routine link `0x4fbcbc4`),
+/// five of whose threads died on the unbound import the moment a game join's data model began
+/// loading (2026-09-23).
+pub fn sincos(
+    ctx: &mut impl GuestContext,
+    x: f64,
+    sin_ptr: u64,
+    cos_ptr: u64,
+) -> Result<(), Fault> {
+    let (s, c) = if x.is_infinite() {
+        ctx.set_errno(EDOM);
+        (f64::NAN, f64::NAN)
+    } else {
+        (x.sin(), x.cos())
+    };
+    if sin_ptr != 0 {
+        ctx.write(sin_ptr, &s.to_le_bytes())?;
+    }
+    if cos_ptr != 0 {
+        ctx.write(cos_ptr, &c.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 /// `void sincosf(float x, float *sin_ptr, float *cos_ptr)` — GNU/bionic extension:
 /// computes both at once. Writes both results through guest memory (4 bytes each,
 /// little-endian) when the respective pointer is non-null. NaN propagation and the
