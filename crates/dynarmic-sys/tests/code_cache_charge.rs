@@ -4,8 +4,8 @@
 //! touches: `sys_icache_invalidate` over an untouched `MAP_JIT` range faults every page of it in.
 //! The pin invalidated the **whole** cache after emitting its prelude, so every jit -- one per guest
 //! thread -- was charged its full code cache at creation. Measured by `phys_footprint`, the memory
-//! the kernel charges this process for; one test in this binary, so nothing else allocates while
-//! it measures.
+//! the kernel charges this process for, which is process-wide: the tests here take `SERIAL`, so
+//! nothing else in this binary allocates or frees while one of them measures.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 mod harness;
@@ -13,6 +13,14 @@ mod harness;
 use harness::{a64, Vm, VmOptions, HALT_DONE};
 
 const MIB: f64 = 1024.0 * 1024.0;
+
+/// Held by every test for its whole run. Under the default parallel runner the instrument check's
+/// 16 MiB, freed while a jit was being measured, made the jit's own reading meaningless.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialized() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// `task_vm_info_data_t` up to `phys_footprint` (`<mach/task_info.h>`, `#pragma pack(4)`).
 #[repr(C, packed(4))]
@@ -47,6 +55,7 @@ fn footprint() -> f64 {
 /// The instrument first: touching memory must show up in it, or a zero below means nothing.
 #[test]
 fn the_footprint_reading_sees_memory_being_touched() {
+    let _serial = serialized();
     let before = footprint();
     let mut block = vec![0u8; 16 << 20];
     for page in block.chunks_mut(16384) {
@@ -59,6 +68,7 @@ fn the_footprint_reading_sees_memory_being_touched() {
 
 #[test]
 fn a_jit_is_charged_for_what_it_emits_not_for_its_cache() {
+    let _serial = serialized();
     // `add x0, x0, #1; svc #0` -- enough to make the jit translate and run something.
     let code = vec![a64::add_imm(0, 0, 1), a64::svc(0)];
     let options = VmOptions { code_cache_size: 32 << 20, ..VmOptions::default() };
