@@ -40,6 +40,7 @@ use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
 use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput};
+use omni_android::jni::text::TextInput;
 use omni_android::jni::{script, slots, Jni};
 use omni_android::ndk::assets::{AssetSource, ASSET_MANAGER_CLASS};
 use omni_android::ndk::{
@@ -1677,6 +1678,12 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             .unwrap_or_else(|error| panic!("§8 row 26: the touch seam could not be built: {error}"))
     });
     // And the keys, when a hardware keyboard was declared above.
+    // And the text field, `RbxKeyboard`: shown when the engine focuses a `TextBox`, and while it
+    // is open it takes the keys -- a device's focused `EditText` does. See `jni::text`.
+    let mut text_field: Option<TextInput> = window.as_ref().map(|_| {
+        TextInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied())
+            .unwrap_or_else(|error| panic!("the text seam could not be built: {error}"))
+    });
     let mut keyboard: Option<KeyInput> = hardware_keyboard.then(|| {
         KeyInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied())
             .unwrap_or_else(|error| panic!("the key seam could not be built: {error}"))
@@ -2599,6 +2606,35 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
         let _ = writeln!(std::io::stderr(), "LATE TAP: SYNTHETIC taps {list} (OMNI_LATE_TAP)");
     }
+    // **OMNI_LATE_TEXT=<s>@<text>[;...]: SYNTHETIC typing**, one `Text` event per character 50 ms
+    // apart from second `s`; `<enter>` as the text is one Enter key. For showing that typed
+    // text reaches a focused `TextBox` -- never a credential: the run's log keeps lengths only.
+    if let (Some(_), Ok(list)) = (&touch, std::env::var("OMNI_LATE_TEXT")) {
+        use omni_platform::window::WindowEvent;
+        for typed in list.split(';') {
+            let (at, text) = typed
+                .split_once('@')
+                .and_then(|(at, text)| Some((at.trim().parse::<f32>().ok()?, text)))
+                .unwrap_or_else(|| panic!("OMNI_LATE_TEXT: {typed:?} is not <second>@<text>"));
+            if text == "<enter>" {
+                late_input.push((at, WindowEvent::KeyDown { keycode: 0x0D, scancode: 0x1C, repeat: false }));
+                late_input.push((at + 0.05, WindowEvent::KeyUp { keycode: 0x0D, scancode: 0x1C }));
+            } else {
+                for (index, character) in text.chars().enumerate() {
+                    late_input.push((
+                        at + 0.05 * index as f32,
+                        WindowEvent::Text { text: character.to_string() },
+                    ));
+                }
+            }
+            let _ = writeln!(
+                std::io::stderr(),
+                "LATE TEXT: SYNTHETIC typing of {} at +{at}s (OMNI_LATE_TEXT)",
+                if text == "<enter>" { "Enter".to_string() } else { format!("{} chars", text.chars().count()) }
+            );
+        }
+        late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
     let mut resize_failure: Option<String> = None;
     // **OMNI_PROFILE=1**: `sample_profile` on its own thread for the whole session.
     let profiler = std::env::var_os("OMNI_PROFILE").is_some().then(|| {
@@ -2724,10 +2760,54 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             let view = open.client_size().map_err(|error| {
                 format!("the window's client size, which is the view `vk.e` divides: {error}")
             });
+            // **What the engine asked of the keyboard**, carried out here, on the UI thread, where
+            // the Java side's `runOnUiThread` puts it. Logged by length only: see `jni::text`.
+            if let Some(field) = text_field.as_mut() {
+                for request in guest.jni.take_keyboard_requests() {
+                    let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                    let _jni = guest.jni.activate().expect("publish the JNI instance");
+                    let _ndk = guest.ndk.activate();
+                    let shown = match &request {
+                        omni_android::jni::KeyboardRequest::Show { text_box, text, manual_focus_release } => format!(
+                            "show for text box {text_box:#x}, <{} chars>, manual focus release {manual_focus_release:?}",
+                            text.chars().count()
+                        ),
+                        omni_android::jni::KeyboardRequest::Hide => "hide".to_string(),
+                    };
+                    match field.apply(&guest.jni, &guest.boundary, &mut cpu, 0, &request) {
+                        Ok(calls) => {
+                            let made: Vec<String> = calls.iter().map(|call| call.redacted()).collect();
+                            let _ = writeln!(std::io::stderr(), "TEXT: keyboard {shown} -> {made:?}");
+                        }
+                        Err(error) => input_failure = Some(format!("keyboard {shown}: {error}")),
+                    }
+                }
+            }
             for event in &events {
                 let _bionic = guest.bionic.activate().expect("publish the bionic instance");
                 let _jni = guest.jni.activate().expect("publish the JNI instance");
                 let _ndk = guest.ndk.activate();
+                // An open text field takes the keys and the typed text, before the activity
+                // would pass keys to `nativePassKeyEvent`.
+                let for_field = matches!(
+                    event,
+                    omni_platform::window::WindowEvent::Text { .. }
+                        | omni_platform::window::WindowEvent::KeyDown { .. }
+                        | omni_platform::window::WindowEvent::KeyUp { .. }
+                ) && text_field.as_ref().is_some_and(TextInput::is_open);
+                if for_field && input_failure.is_none() {
+                    if let Some(field) = text_field.as_mut() {
+                        match field.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event) {
+                            Ok(calls) => {
+                                for call in calls {
+                                    let _ = writeln!(std::io::stderr(), "TEXT: {}", call.redacted());
+                                }
+                            }
+                            // Not `{event:?}`: a `Text` event is a character of what was typed.
+                            Err(error) => input_failure = Some(format!("the text field: {error}")),
+                        }
+                    }
+                }
                 if let Some(seam) = touch.as_mut() {
                     match view.clone().and_then(|view| {
                         seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event, view)
@@ -2741,7 +2821,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                         Err(error) => input_failure = Some(error),
                     }
                 }
-                let keyed = match (keyboard.as_mut(), input_failure.is_none()) {
+                let keyed = match (keyboard.as_mut(), input_failure.is_none() && !for_field) {
                     (Some(seam), true) => {
                         seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event)
                     }
@@ -3018,6 +3098,33 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         guest.bionic.live_guest_threads(),
         guest.bionic.guest_thread_failures()
     );
+    // **Which thread, and where**: a count says a thread did not stop, and a thread that did not
+    // stop produces no more evidence about itself. Its start routine names the code it runs, and
+    // the boundary's record says whether it is inside a handler (and which) or in guest code.
+    if !stopped {
+        let reports = guest.boundary.threads();
+        for summary in guest.bionic.guest_thread_list().iter().filter(|summary| summary.running) {
+            let where_ = reports.iter().find(|report| report.guest_thread == summary.id.0).map_or_else(
+                || "no crossing recorded".to_string(),
+                |report| {
+                    format!(
+                        "{} {:?}, call site link {:#x}, {} crossings / {} exits",
+                        if report.crossings > report.exits { "INSIDE" } else { "in guest code after" },
+                        report.symbol,
+                        report.caller.wrapping_sub(guest.object.base),
+                        report.crossings,
+                        report.exits
+                    )
+                },
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "  STILL RUNNING: thread {:#x} started at link {:#x}: {where_}",
+                summary.id.0,
+                summary.start_routine.wrapping_sub(guest.object.base)
+            );
+        }
+    }
     assert!(
         stopped,
         "the game thread did not stop within 60 s of being asked, so this address space cannot          be torn down: {} still running, parked {:?}",

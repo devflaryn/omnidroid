@@ -25,6 +25,7 @@
 //! | [`script`] | §8 steps 7-12, as an ordered list of downcalls a host can run |
 //! | [`input`] | §8 row 26: `vk.e.onTouch`, host pointer events to `nativePassInput` |
 //! | [`keys`] | `vk.g`, host keys to `nativePassKeyEvent`, for a declared hardware keyboard |
+//! | [`text`] | `RbxKeyboard`, host typing into the engine's focused `TextBox` |
 //!
 //! # Only what the engine uses, and the rest refuse by name
 //!
@@ -52,6 +53,7 @@ pub mod refs;
 pub mod script;
 pub mod slots;
 pub mod surface;
+pub mod text;
 pub mod values;
 
 use std::cell::RefCell;
@@ -134,6 +136,28 @@ pub struct CallRecord {
     pub args: Vec<String>,
 }
 
+/// What the engine asked of the Java side's keyboard, for the embedding to carry out on its UI
+/// thread. See [`text`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyboardRequest {
+    /// Show it for a text box.
+    Show {
+        /// The engine's text box, a native pointer the Java side keeps as a `long` and hands
+        /// back to every text native.
+        text_box: i64,
+        /// The box's text, decoded from the `byte[]` as the Java side decodes it:
+        /// `new String(bytes, UTF_8)`, malformed input replaced.
+        text: String,
+        /// `NativeTextBoxInfo.manualFocusRelease`, when the call's `boolean` asked for the
+        /// field to be laid out from the info and the info was not null -- the only case in
+        /// which `fi.p0.b` reaches `RbxKeyboard.setManualFocusRelease`. `None` leaves the
+        /// setting as it was, as the Java side does.
+        manual_focus_release: Option<bool>,
+    },
+    /// Hide it.
+    Hide,
+}
+
 /// One `RegisterNatives` binding the engine made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
@@ -178,6 +202,8 @@ pub(crate) struct JniState {
     /// reference this instance owns**, which is what keeps the object alive between reads (an
     /// object is freed with its last reference, and the guest is only ever handed locals).
     pub(crate) statics: BTreeMap<classes::FieldId, u64>,
+    /// Keyboard requests not yet taken by the embedding, oldest first.
+    pub(crate) keyboard: Vec<KeyboardRequest>,
 }
 
 impl JniState {
@@ -316,6 +342,7 @@ impl Jni {
                 described: Vec::new(),
                 assigned: HashMap::new(),
                 statics: BTreeMap::new(),
+                keyboard: Vec::new(),
             }),
             pool: Mutex::new(pool),
             census: Mutex::new(BTreeMap::new()),
@@ -530,6 +557,27 @@ impl Jni {
     #[must_use]
     pub fn calls_dropped(&self) -> u64 {
         self.state.lock().calls_dropped
+    }
+
+    /// The keyboard requests the engine has made since the last call, oldest first, for the
+    /// embedding to carry out on its UI thread -- which is where the Java side's
+    /// `runOnUiThread` puts them on a device. See [`text::TextInput::apply`].
+    #[must_use]
+    pub fn take_keyboard_requests(&self) -> Vec<KeyboardRequest> {
+        std::mem::take(&mut self.state.lock().keyboard)
+    }
+
+    /// Delete a local reference the host made -- a `String` it passed to a native, say.
+    ///
+    /// **What a Java caller never has to do, and a host does.** An argument a Java method
+    /// passes to a native is a Java object, not a local; the host's stand-in for it is a local
+    /// in a table with a fixed capacity, and one per keystroke would fill it.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniBadHandle`] for a handle that is not a live local of this instance.
+    pub fn delete_local(&self, handle: u64) -> AbiResult<()> {
+        self.state.lock().handles.delete("Jni::delete_local", self.arena, refs::RefKind::Local, handle)
     }
 
     /// Every `RegisterNatives` binding the engine has made.

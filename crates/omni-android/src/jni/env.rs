@@ -784,6 +784,33 @@ fn env_call(
             mem.write_bytes(buffer, &bytes, blame(4))?;
             Ok(JniReturn::Void)
         }
+        // **Outside the 59 §0 measured, and a run reached it**: gate85's thread 17 (started at
+        // link `0x284d168`) died on this slot's refusal once `NewByteArray` answered, right
+        // after `onTextBoxFocused` -- the text box's text going into the `byte[]` for
+        // `showKeyboard`. `len` bytes from `buffer` into the array from `start`, bounds checked
+        // first, as `SetLongArrayRegion`.
+        "SetByteArrayRegion" => {
+            let array = args.next_u64()?;
+            let start = args.next_i32()?;
+            let len = args.next_i32()?;
+            let buffer = args.next_pointer()?;
+            let mut state = jni.state();
+            let id = state.handles.resolve_id(name, address, array)?;
+            let existing = match state.handles.object_of(id) {
+                Some(Object::ByteArray(values)) => values.len(),
+                Some(other) => return Err(wrong_kind(name, address, other, "a byte[]")),
+                None => return Err(freed(name, address)),
+            };
+            region(name, address, existing, start, len)?;
+            let bytes = mem.read_bytes(buffer, len as usize, blame(4))?;
+            let Some(Object::ByteArray(values)) = state.handles.object_of_mut(id) else {
+                return Err(freed(name, address));
+            };
+            for (index, byte) in bytes.iter().enumerate() {
+                values[start as usize + index] = *byte as i8;
+            }
+            Ok(JniReturn::Void)
+        }
         "SetLongArrayRegion" => {
             let array = args.next_u64()?;
             let start = args.next_i32()?;
@@ -1632,6 +1659,117 @@ pub(super) fn evaluate(
                 ),
             }),
         },
+        Answer::ShowKeyboard => {
+            let refuse = |why: &str| AbiError::JniRefused {
+                function: name.to_string(),
+                address,
+                detail: format!(
+                    "`{}.{}{}`: {why}",
+                    state.registry.class_name(class),
+                    member.name,
+                    member.descriptor
+                ),
+            };
+            // `Value::Long` is how an object parameter arrives: the raw handle, resolved here
+            // (see `read_varargs`). MEASURED: gate86's first version matched resolved objects
+            // and refused a real array as null.
+            let [Value::Long(text_box), Value::Boolean(lay_out), Value::Long(bytes), Value::Long(info)] =
+                arguments
+            else {
+                return Err(refuse("the arguments are not (long, boolean, byte[], NativeTextBoxInfo)"));
+            };
+            // Kotlin's `checkNotNullParameter` (`gameActivity_showKeyboard`) and
+            // `new String(null, UTF_8)` (`showKeyboard`) both throw on a null array.
+            if *bytes == 0 {
+                return Err(refuse("the byte[] is null, which the Java side throws on"));
+            }
+            let bytes = state.handles.resolve_id(name, address, *bytes as u64)?;
+            let Some(Object::ByteArray(bytes)) = state.handles.object_of(bytes) else {
+                return Err(refuse("the third argument is not a byte[]"));
+            };
+            let raw: Vec<u8> = bytes.iter().map(|&byte| byte as u8).collect();
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let manual_focus_release = match (lay_out, *info) {
+                (true, info) if info != 0 => {
+                    let info = state.handles.resolve_id(name, address, info as u64)?;
+                    let info_class = state
+                        .registry
+                        .find("com/roblox/engine/jni/model/NativeTextBoxInfo")
+                        .ok_or_else(|| refuse("NativeTextBoxInfo is not declared"))?;
+                    let field = state
+                        .registry
+                        .field(info_class, "manualFocusRelease", "Z", false)
+                        .ok_or_else(|| refuse("NativeTextBoxInfo.manualFocusRelease is not declared"))?;
+                    match instance_field(state, name, address, info, field)? {
+                        Value::Boolean(manual) => Some(manual),
+                        _ => return Err(refuse("manualFocusRelease is not a boolean")),
+                    }
+                }
+                _ => None,
+            };
+            state.keyboard.push(super::KeyboardRequest::Show {
+                text_box: *text_box,
+                text,
+                manual_focus_release,
+            });
+            Ok(Value::Void)
+        }
+        Answer::HideKeyboard => {
+            state.keyboard.push(super::KeyboardRequest::Hide);
+            Ok(Value::Void)
+        }
+        Answer::Construct(fields) => {
+            if fields.len() != arguments.len() {
+                return Err(AbiError::JniRefused {
+                    function: name.to_string(),
+                    address,
+                    detail: format!(
+                        "`{}.{}{}` stores {} arguments into {} fields, and {} arrived",
+                        state.registry.class_name(class),
+                        member.name,
+                        member.descriptor,
+                        fields.len(),
+                        fields.len(),
+                        arguments.len()
+                    ),
+                });
+            }
+            let mut stored = std::collections::BTreeMap::new();
+            for ((field, descriptor), value) in fields.iter().zip(arguments) {
+                // An object parameter arrives as a raw handle, and storing the object behind it
+                // would need a reference this instance holds for the field's life. No declared
+                // constructor has one, so it refuses rather than keep an unheld object.
+                if descriptor.starts_with('L') || descriptor.starts_with('[') {
+                    return Err(AbiError::JniRefused {
+                        function: name.to_string(),
+                        address,
+                        detail: format!(
+                            "`{}.{}` stores an object into `{field}` ({descriptor}), which this \
+                             layer does not keep",
+                            state.registry.class_name(class),
+                            member.name
+                        ),
+                    });
+                }
+                let Some(id) = state.registry.field(class, field, descriptor, false) else {
+                    return Err(AbiError::JniRefused {
+                        function: name.to_string(),
+                        address,
+                        detail: format!(
+                            "`{}.{}` stores into `{field}` ({descriptor}), which is not declared",
+                            state.registry.class_name(class),
+                            member.name
+                        ),
+                    });
+                };
+                stored.insert(id, value.clone());
+            }
+            // `create` rather than `new_local`, as `NewInstance`: the return marshaller makes
+            // the reference.
+            let object =
+                state.handles.create(name, address, Object::Instance { class, fields: stored })?;
+            Ok(Value::Object(Some(object)))
+        }
         Answer::EmptyObjectArray => {
             let Some(element) = state.registry.find("java/lang/Object") else {
                 return Err(AbiError::JniRefused {
@@ -2062,6 +2200,7 @@ mod tests {
         "ReleaseIntArrayElements",
         "ReleaseFloatArrayElements",
         "GetByteArrayRegion",
+        "SetByteArrayRegion",
         "SetLongArrayRegion",
         "GetJavaVM",
         "NewDirectByteBuffer",
@@ -2226,6 +2365,148 @@ mod tests {
         }
         let negative = u64::from((-1i32) as u32);
         let error = call_slot(&jni, &mem, "NewByteArray", &[negative]).expect_err("negative");
+        assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
+    }
+
+    const TEXT_BOX_INFO: &str = "com/roblox/engine/jni/model/NativeTextBoxInfo";
+
+    /// `new NativeTextBoxInfo(...)` with `manualFocusRelease` as given, the rest distinct.
+    fn text_box_info(state: &mut JniState, manual: bool) -> ObjectId {
+        let class = state.registry.find(TEXT_BOX_INFO).expect("declared");
+        let init = state.registry.method(class, "<init>", "(FFFFFZIIIIIIZZZ)V", false).expect("declared");
+        let member = state.registry.member(init).expect("a member").clone();
+        let arguments = [
+            Value::Float(10.0),
+            Value::Float(20.0),
+            Value::Float(300.0),
+            Value::Float(40.0),
+            Value::Float(16.0),
+            Value::Boolean(false),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(0x00ff_ffff),
+            Value::Int(4),
+            Value::Int(5),
+            Value::Int(6),
+            Value::Boolean(manual),
+            Value::Boolean(true),
+            Value::Boolean(true),
+        ];
+        match evaluate(state, "NewObjectV", 0, class, &member, None, &arguments).expect("constructed") {
+            Value::Object(Some(object)) => object,
+            other => panic!("the constructor made {other:?}"),
+        }
+    }
+
+    /// **`NativeTextBoxInfo.<init>` keeps what it was given**, one argument per field, as its
+    /// fifteen `iput`s do: `manualFocusRelease` (argument 13) and `textColor` (argument 9) read
+    /// back as passed. `NewInstance`, which it was, drops them all and the reads refuse. A call
+    /// with the wrong number of arguments refuses rather than storing a prefix.
+    #[test]
+    fn a_text_box_info_keeps_its_constructor_arguments() {
+        let (jni, _mem) = slot_fixture();
+        let mut state = jni.state();
+        let info = text_box_info(&mut state, true);
+        let class = state.registry.find(TEXT_BOX_INFO).expect("declared");
+        let read = |state: &JniState, name: &str, descriptor: &str| {
+            let field = state.registry.field(class, name, descriptor, false).expect("declared");
+            instance_field(state, "GetBooleanField", 0, info, field).expect("stored")
+        };
+        assert_eq!(read(&state, "manualFocusRelease", "Z"), Value::Boolean(true));
+        assert_eq!(read(&state, "textColor", "I"), Value::Int(0x00ff_ffff));
+        assert_eq!(read(&state, "width", "F"), Value::Float(300.0));
+
+        let init = state.registry.method(class, "<init>", "(FFFFFZIIIIIIZZZ)V", false).expect("declared");
+        let member = state.registry.member(init).expect("a member").clone();
+        let error = evaluate(&mut state, "NewObjectV", 0, class, &member, None, &[Value::Float(1.0)])
+            .expect_err("one argument for fifteen fields");
+        assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
+    }
+
+    /// **`showKeyboard` hands the embedding what the Java side decodes**: the text box, the
+    /// `byte[]` as UTF-8 (`é` is two bytes and one character), and `manualFocusRelease` only
+    /// when the `boolean` asks for the field to be laid out from the info. A null `byte[]` is
+    /// what the Java side throws on, so it refuses. `hideKeyboard` is a `Hide`.
+    #[test]
+    fn show_keyboard_queues_the_decoded_request() {
+        let (jni, _mem) = slot_fixture();
+        {
+            let mut state = jni.state();
+            let info = text_box_info(&mut state, true);
+            let helper = state.registry.find("com/roblox/client/startup/NativeHelper").expect("declared");
+            let show = state
+                .registry
+                .method(helper, "gameActivity_showKeyboard", "(JZ[BLcom/roblox/engine/jni/model/NativeTextBoxInfo;)V", false)
+                .expect("declared");
+            let show = state.registry.member(show).expect("a member").clone();
+            let bytes: Vec<i8> = "h\u{e9}".bytes().map(|byte| byte as i8).collect();
+            // Raw handles, as `read_varargs` hands object parameters on: `Value::Long`.
+            let array = state.handles.new_local("NewByteArray", 0, Object::ByteArray(bytes)).expect("an array");
+            let info = state.handles.reference_to("NewObjectV", 0, RefKind::Local, info).expect("a local");
+            for lay_out in [true, false] {
+                let arguments = [
+                    Value::Long(0x7a_1000),
+                    Value::Boolean(lay_out),
+                    Value::Long(array as i64),
+                    Value::Long(info as i64),
+                ];
+                assert_eq!(
+                    evaluate(&mut state, "CallVoidMethodV", 0, helper, &show, None, &arguments).expect("answered"),
+                    Value::Void
+                );
+            }
+            let null_bytes = [Value::Long(1), Value::Boolean(false), Value::Long(0), Value::Long(0)];
+            let error = evaluate(&mut state, "CallVoidMethodV", 0, helper, &show, None, &null_bytes)
+                .expect_err("a null byte[]");
+            assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
+
+            let hide = state.registry.method(helper, "gameActivity_hideKeyboard", "()V", false).expect("declared");
+            let hide = state.registry.member(hide).expect("a member").clone();
+            evaluate(&mut state, "CallVoidMethodV", 0, helper, &hide, None, &[]).expect("answered");
+        }
+        assert_eq!(
+            jni.take_keyboard_requests(),
+            [
+                crate::jni::KeyboardRequest::Show {
+                    text_box: 0x7a_1000,
+                    text: "h\u{e9}".to_string(),
+                    manual_focus_release: Some(true),
+                },
+                crate::jni::KeyboardRequest::Show {
+                    text_box: 0x7a_1000,
+                    text: "h\u{e9}".to_string(),
+                    manual_focus_release: None,
+                },
+                crate::jni::KeyboardRequest::Hide,
+            ]
+        );
+        assert!(jni.take_keyboard_requests().is_empty(), "taken once");
+    }
+
+    /// **`SetByteArrayRegion` copies the guest's bytes into the array at `start`**, leaving the
+    /// rest as it was, and refuses a region past the end rather than writing a prefix. A
+    /// refusal of the slot fails the first `expect`; an off-by-one start fails the contents.
+    #[test]
+    fn set_byte_array_region_copies_the_guest_bytes_in() {
+        use omni_mem::{CommitPolicy, Placement, Protection};
+        let (jni, mem) = slot_fixture();
+        let page = mem.space().page_size();
+        let buffer = mem
+            .space()
+            .map_anonymous(Placement::Anywhere { align: page }, page, Protection::ReadWrite, CommitPolicy::Lazy)
+            .expect("a guest buffer");
+        mem.write_bytes(buffer, b"h\xc3\xa9", Blame::new("test", 0, 0)).expect("written");
+        let JniReturn::Word(array) = call_slot(&jni, &mem, "NewByteArray", &[5]).expect("an array") else {
+            panic!("a reference");
+        };
+        call_slot(&jni, &mem, "SetByteArrayRegion", &[array, 1, 3, buffer as u64])
+            .expect("SetByteArrayRegion is answered");
+        match jni.state().handles.object("test", 0, array).expect("live") {
+            Object::ByteArray(bytes) => assert_eq!(bytes, &vec![0, b'h' as i8, 0xc3_u8 as i8, 0xa9_u8 as i8, 0]),
+            other => panic!("{}", other.kind_name()),
+        }
+        let error = call_slot(&jni, &mem, "SetByteArrayRegion", &[array, 3, 3, buffer as u64])
+            .expect_err("three bytes from index 3 of five");
         assert!(matches!(error, AbiError::JniRefused { .. }), "{error:?}");
     }
 

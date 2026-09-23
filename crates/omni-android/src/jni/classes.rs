@@ -167,6 +167,28 @@ pub enum Answer {
     /// chosen to look like one: the same object answers the same number for its whole life,
     /// which is the entire contract.
     IdentityHash,
+    /// `<init>` whose body stores **each argument into one field**, in order: the named
+    /// `(field, descriptor)` pairs, one per parameter.
+    ///
+    /// What a Kotlin data class's primary constructor is -- `invoke-direct Object.<init>`,
+    /// then one `iput` per parameter -- and the reason it is a variant rather than
+    /// [`NewInstance`](Answer::NewInstance): that one keeps none of the arguments, so a Java
+    /// side that reads the object back (`RbxKeyboard.l` reads
+    /// `NativeTextBoxInfo.manualFocusRelease`) would be reading fields the engine set and
+    /// this layer dropped. The pairs are read out of the dex, not chosen.
+    Construct(&'static [(&'static str, &'static str)]),
+    /// The Java side's keyboard is asked to **show** for a text box: `(JZ[BLNativeTextBoxInfo;)V`.
+    ///
+    /// Recorded like [`Sink`](Answer::Sink), and handed to the embedding as a
+    /// [`KeyboardRequest::Show`](super::KeyboardRequest::Show) through
+    /// [`Jni::take_keyboard_requests`](super::Jni::take_keyboard_requests): on a device both
+    /// members that take it decode the bytes as UTF-8 and post the rest to the UI thread
+    /// (`runOnUiThread`), where `fi.p0.b` shows `RbxKeyboard`. The embedding is that UI
+    /// thread; see [`super::text`].
+    ShowKeyboard,
+    /// The Java side's keyboard is asked to **hide**: `()V`, reaching `fi.p0.a` on the UI thread.
+    /// Recorded, and handed on as [`KeyboardRequest::Hide`](super::KeyboardRequest::Hide).
+    HideKeyboard,
     /// An `Object[0]`.
     ///
     /// `List.toArray()` on the empty list this layer hands the engine. Correct rather than a
@@ -572,6 +594,9 @@ impl Registry {
             | Answer::StringBytes
             | Answer::IdentityHash
             | Answer::EmptyObjectArray
+            | Answer::Construct(_)
+            | Answer::ShowKeyboard
+            | Answer::HideKeyboard
             | Answer::Native
             | Answer::Unanswered => return None,
         })
@@ -800,6 +825,44 @@ static CONFIGURATION: &[MemberSpec] = &[
     f("fontWeightAdjustment", "I", Answer::Int(0)),
 ];
 
+/// `NativeTextBoxInfo`'s fields in its constructor's order, which is `<init>`'s `iput` order.
+pub const TEXT_BOX_INFO: &[(&str, &str)] = &[
+    ("x", "F"),
+    ("y", "F"),
+    ("width", "F"),
+    ("height", "F"),
+    ("fontSize", "F"),
+    ("multiline", "Z"),
+    ("xAlignment", "I"),
+    ("yAlignment", "I"),
+    ("textColor", "I"),
+    ("font", "I"),
+    ("textInputType", "I"),
+    ("returnKeyType", "I"),
+    ("manualFocusRelease", "Z"),
+    ("textWrapped", "Z"),
+    ("editable", "Z"),
+];
+
+/// `NativeTextBoxInfo`'s instance fields: set by its constructor, so an unset one refuses.
+const TEXT_BOX_INFO_FIELDS: &[MemberSpec] = &[
+    f("x", "F", Answer::Unanswered),
+    f("y", "F", Answer::Unanswered),
+    f("width", "F", Answer::Unanswered),
+    f("height", "F", Answer::Unanswered),
+    f("fontSize", "F", Answer::Unanswered),
+    f("multiline", "Z", Answer::Unanswered),
+    f("xAlignment", "I", Answer::Unanswered),
+    f("yAlignment", "I", Answer::Unanswered),
+    f("textColor", "I", Answer::Unanswered),
+    f("font", "I", Answer::Unanswered),
+    f("textInputType", "I", Answer::Unanswered),
+    f("returnKeyType", "I", Answer::Unanswered),
+    f("manualFocusRelease", "Z", Answer::Unanswered),
+    f("textWrapped", "Z", Answer::Unanswered),
+    f("editable", "Z", Answer::Unanswered),
+];
+
 /// `android.os.Build`'s static `String` fields, as Android 13's `Build.java` declares them.
 const BUILD_FIELDS: &[MemberSpec] = &[
     sf("BOARD", "Ljava/lang/String;", Answer::Unanswered),
@@ -990,7 +1053,7 @@ pub static DECLARED: &[ClassSpec] = &[
             ),
             s("getMobileAdvertisingId", "()V", Answer::Sink),
             s("getWebViewUserAgent", "()V", Answer::Sink),
-            s("hideKeyboard", "()V", Answer::Sink),
+            s("hideKeyboard", "()V", Answer::HideKeyboard),
             s("listenToMotionEvents", "(Ljava/lang/String;)V", Answer::Sink),
             s("onAppBridgeNotification", "(Ljava/lang/String;Ljava/lang/String;)V", Answer::Sink),
             s("onAppShellReloadNeeded", "()V", Answer::Sink),
@@ -1026,7 +1089,7 @@ pub static DECLARED: &[ClassSpec] = &[
             s(
                 "showKeyboard",
                 "(JZ[BLcom/roblox/engine/jni/model/NativeTextBoxInfo;)V",
-                Answer::Sink,
+                Answer::ShowKeyboard,
             ),
         ],
         fields: NONE,
@@ -1126,7 +1189,7 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "com/roblox/client/startup/NativeHelper",
         tier: Tier::One,
         methods: &[
-            m("gameActivity_hideKeyboard", "()V", Answer::Sink),
+            m("gameActivity_hideKeyboard", "()V", Answer::HideKeyboard),
             m("gameActivity_onAppReady", "(Ljava/lang/String;)V", Answer::Sink),
             m("gameActivity_onDidLogInReceived", "(Ljava/lang/String;)V", Answer::Sink),
             m("gameActivity_onDidLogOutReceived", "()V", Answer::Sink),
@@ -1155,7 +1218,7 @@ pub static DECLARED: &[ClassSpec] = &[
             m(
                 "gameActivity_showKeyboard",
                 "(JZ[BLcom/roblox/engine/jni/model/NativeTextBoxInfo;)V",
-                Answer::Sink,
+                Answer::ShowKeyboard,
             ),
         ],
         fields: NONE,
@@ -1173,8 +1236,12 @@ pub static DECLARED: &[ClassSpec] = &[
     ClassSpec {
         name: "com/roblox/engine/jni/model/NativeTextBoxInfo",
         tier: Tier::One,
-        methods: &[m("<init>", "(FFFFFZIIIIIIZZZ)V", Answer::NewInstance)],
-        fields: NONE,
+        // **DECODED from `classes2.dex`**: `<init>(FFFFFZIIIIIIZZZ)V` is `Object.<init>` and
+        // fifteen `iput`s, argument `n` into field `n` -- a Kotlin data class. The Java side
+        // reads it back: `fi.p0.b` passes it to `RbxKeyboard.l`, which takes
+        // `manualFocusRelease` (whether Enter keeps the text box focused) and `textColor`.
+        methods: &[m("<init>", "(FFFFFZIIIIIIZZZ)V", Answer::Construct(TEXT_BOX_INFO))],
+        fields: TEXT_BOX_INFO_FIELDS,
     },
     // ---- the four parameter objects, with the member lists read out of the dex -------------
     //
@@ -1759,6 +1826,22 @@ pub static DECLARED: &[ClassSpec] = &[
 
 #[cfg(test)]
 mod tests {
+    /// **`NativeTextBoxInfo`'s constructor and its fields agree**: one field per parameter, in
+    /// order, each declared with the parameter's own type -- so the `Construct` answer can
+    /// never store a value under a field of another type.
+    #[test]
+    fn the_text_box_info_constructor_matches_its_fields() {
+        let registry = Registry::with_declared();
+        let class = registry.find("com/roblox/engine/jni/model/NativeTextBoxInfo").expect("declared");
+        let parameters: Vec<String> =
+            "FFFFFZIIIIIIZZZ".chars().map(|tag| tag.to_string()).collect();
+        assert_eq!(TEXT_BOX_INFO.len(), parameters.len());
+        for ((name, descriptor), parameter) in TEXT_BOX_INFO.iter().zip(&parameters) {
+            assert_eq!(descriptor, parameter, "{name}");
+            assert!(registry.field(class, name, descriptor, false).is_some(), "{name} is declared");
+        }
+    }
+
     use super::*;
     use super::super::values::Descriptor;
     use std::collections::BTreeSet;
