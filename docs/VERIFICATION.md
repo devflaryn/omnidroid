@@ -5,13 +5,16 @@ because each one produced a **green suite that proved less than it claimed**, an
 person who wrote the test was the person who wrote the code — which is the blind spot that makes all
 of them possible.
 
-There are **sixteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
+There are **nineteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
 could not be written rather than by one that passed. Entry 13 arrived in M6 and is the only one
 found by reviewing a *copy* of the defect rather than the original. Entry 14 arrived in M6 and is
 the only one where a **test asserted the defect** and a comment supplied the reasoning that made
 it look right. Entries 15 and 16 arrived together, later in M6, and are the only pair where the
 *instruments* were wrong rather than the code: a diagnostic that had been switched off read exactly
 like a system that had stopped, and three guest threads died unremarked behind a green gate.
+Entries 17-19 arrived at the first presented frames, and all three are about **which thing a result
+was about**: a verdict printed before the process had finished, a test binary built from another
+worktree's source, and a window capture that could not see a swapchain.
 
 **This count has itself been wrong.** It said "fourteen" for as long as there were sixteen,
 because two entries were appended without it — which is the same defect as an `expect` whose
@@ -368,6 +371,67 @@ tested, unreachable and invisible.
 > the other from experience, something has to assert that every entry on the first side is on the
 > second — or, failing that, something has to make the first *encounter* loud.
 
+## 17. `test result: ok` is a line the process prints before it has finished
+
+`cargo test -p omni-android --release --test jni_startup` printed, for both of its tests, `ok`, and
+then `test result: ok. 2 passed; 0 failed` -- and then cargo reported the target **failed**:
+`process didn't exit successfully ... (exit code: 0xc0000005, STATUS_ACCESS_VIOLATION)`. Every
+time, not a flake. The test had returned while the engine's own worker threads, started by the
+scripted steps, were still running guest code; dropping the guest's address space under them was
+a host access violation during process exit, after the harness had already printed its verdict.
+
+The previous suite log in this project was summarised by grepping `test result` lines, and a
+summary built that way reports this target green: the line it counts is true, and it is not the
+last thing the process did. `--no-fail-fast` would have hidden it further, since the next target's
+lines follow straight on.
+
+> The unit of a test run is the **process**, and its exit code is the verdict. Teardown is part of
+> the test: a guest runtime that starts threads must stop and join them before its address space
+> goes -- the M5 gate always did, this test did not -- and a suite summary must count failed
+> targets, not only failed tests.
+
+## 18. A shared build directory runs the other tree's code
+
+Two agents worked in git worktrees beside the main checkout, and all three pointed
+`CARGO_TARGET_DIR` at one directory to save disk. Cargo gives a worktree's crates **the same
+artifact names** as the main checkout's, so each tree's build overwrote the other's test binaries.
+MEASURED, in one afternoon:
+
+* the main tree added a guest-side `sscanf` test, and `cargo test --test bionic` reported
+  `216 passed` -- a binary with **none** of the main tree's new tests, built from the worktree's
+  source;
+* the same filter then ran the main tree's test against a library that still **refused** `sscanf`,
+  and it failed with the old refusal text;
+* `omni_bionic::scanf` was reported as not existing, in the tree that had just added it.
+
+Every one of those was a real cargo verdict, and each was about code that was not the code under
+test. A pass would have looked exactly as trustworthy.
+
+> A test result is evidence about **a binary**. Before believing one, know that the binary holds
+> the code: list the tests (`-- --list`) and find yours, or build from a directory nobody else
+> writes. Parallel worktrees get **private** target directories -- never one shared with the main
+> tree -- and a run taken while the directory was shared is rerun, not reinterpreted.
+
+## 19. A capture that finds nothing is not evidence that nothing was drawn
+
+The engine's first real frames were presented through the host driver, and the census said so --
+seven `vkQueuePresentKHR` calls, 36 draws -- while every capture of the window came back as **one
+colour**: the window class's own background. `PrintWindow`, even with `PW_RENDERFULLCONTENT`,
+does not see a Vulkan swapchain's flip-model surface. It found the pixels GDI owns and reported
+them faithfully.
+
+The same run's census had a second blind spot: the call log keeps the first `MAX_RECORDS` calls
+in order, and a run whose render loop had started dropped 4,867 of them, so "did it present, and
+how often" had no answer at all until every call was also counted by name.
+
+The capture that did see the frame was a copy of the **composed screen** under the window's client
+area, taken only while the window was in the foreground (so nothing but its own pixels could be in
+the rectangle): 377 distinct colours on an 8-pixel grid -- the engine's own image.
+
+> An instrument that returns a default when it cannot see is indistinguishable from one that saw
+> the default. Before a capture, a count or a log is allowed to say "nothing", it has to be shown
+> seeing *something* on a case where the answer is known.
+
 # Process rules these produced
 
 1. **Commit in pieces.** Agents have been cut off mid-task by usage limits repeatedly; uncommitted
@@ -427,3 +491,8 @@ tested, unreachable and invisible.
    truncated the file once. Check your ids are free before adding — ones that look free have not been.
 6. **A figure enters `DECISIONS.md` only after someone other than its author reproduces it.** That
    rule has now caught seven wrong numbers.
+7. **Parallel agents work in worktrees with private target directories, on disjoint files named in
+   their brief.** Entry 18 is what a shared target directory costs. The split that has worked is
+   graphics (`src/vulkan`, `omni-gfx`, `src/ndk`, `tests/vulkan_*`) against everything else, two at
+   a time; each branch is reviewed as a diff and merged, and the merged tree is tested before the
+   merge is committed.

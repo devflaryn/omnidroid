@@ -886,11 +886,14 @@ These are in the M3 plan as Global Constraints. The three worth knowing before w
 Read in this order:
 
 1. **`docs/HANDOFF.md`** — this file.
-2. **`docs/VERIFICATION.md`** — **sixteen** documented ways verification has failed *in this
-   project*, each a real incident, plus the six process rules they produced. Entries 15 and 16 are
-   this session's and they are the two that cost the most: a diagnostic that was switched **off**
-   read exactly like a system that had stopped, and three guest threads died unremarked behind a
-   green gate. Read it before writing a test you intend to rely on, and before believing a number.
+2. **`docs/VERIFICATION.md`** — **nineteen** documented ways verification has failed *in this
+   project*, each a real incident, plus the seven process rules they produced. Entries 15 and 16
+   cost the most: a diagnostic that was switched **off** read exactly like a system that had
+   stopped, and three guest threads died unremarked behind a green gate. Entries 17-19 arrived with
+   the first presented frames and are about **which thing a result was about** -- a verdict printed
+   before the process finished, a test binary built from another worktree, a capture that could
+   not see a swapchain. Read it before writing a test you intend to rely on, and before believing a
+   number.
 3. **`docs/STATUS.md`** — the honest capability matrix. Nothing is claimed for Linux or macOS.
 4. **`docs/research/jni-surface.md` §8** — the 26-step startup contract, and **§8.1**, which ranks
    the failure modes in the order you will meet them.
@@ -900,193 +903,100 @@ Read in this order:
 
 ## Where the runtime actually is today
 
-`cargo test -p omni-android --release --test gameactivity` is the gate. It is **green** in about
-80 s, and `OMNI_M6_ROWS_21_22=1` drives §8 rows 21-22 as well.
-
-**The engine runs its own main loop.** Twelve guest threads, its own telemetry, its own HTTP stack
-over real sockets. §8 rows 7-22 are reached and return. What runs, every time, asserted:
-
-* all 3,594 initializers, `JNI_OnLoad`, §8 steps 7-12 at **21 of 21** scripted downcalls;
-* `initializeNativeCode` returns a `NativeCode *`, the game thread reaches `NativeEngine::GameLoop`;
-* §8 rows 17-20, the seven lifecycle/surface natives, and the engine answers by name
-  (`APP_CMD_INIT_WINDOW: hasWindow = true, hasFocus = true` through `APP_CMD_CONTENT_RECT_CHANGED`);
-* §8 row 21 **both downcalls** -- `nativeInitClientSettings` and
-  `nativePostClientSettingsLoadedInitialization3`, the call that blocked for three sessions;
-* §8 row 22 `nativeGameGlobalInit`;
-* **no guest thread is killed by this layer** -- that is an assertion now, and it is the one that
-  found four deaths nothing else would have reported.
-
-**Networking is real** (D30 withdrew Global Constraint 8). The guest's own OpenSSL resolves a name,
-connects, completes a TLS handshake against the real `clientsettingscdn.roblox.com`, verifies
-certificates against the bundle the APK ships, sends its request and reads the reply.
-
-**Graphics reaches a presented frame from guest code.** Loader, instance, surface on the real
-resizable window, physical device, device, queue, swapchain, command buffers, submit, present --
-and the presented pixels copied back and asserted. Every call from assembled ARM64 through guest
-thunks, against a real RTX 4060.
-
-## The settings fetch COMPLETES, and the gate is RED at the frontier
+The gate, and the switches it now takes:
 
 ```text
-settingsUrl: https://clientsettingscdn.roblox.com/v2/settings/application/GoogleAndroidApp
-[FLog::NativeDM] ... getFlags: success = true, payload's size = 1358053.
+OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --release --test gameactivity -- --nocapture --test-threads=1
+  OMNI_SESSION_SECONDS=90   the session after the rows (default 20 s)
+  OMNI_RESIZE_PROBE=1       resize the real window to 960x540 at 40% and back at 70%
+  OMNI_INPUT_PROBE=1        one synthetic press-drag-release at the centre, once the surface is alive
+  OMNI_HARDWARE_KEYBOARD=1  declare a QWERTY keyboard before step 13, then deliver the window's keys
+  OMNI_PROFILE=1            sample where every guest thread's time goes (in guest code / which handler)
 ```
 
-1,358,053 bytes over TLS from the real endpoint in **3.08 s**. The `HTTP 400` was **ours**:
-the gate asked for application name `android`, a value this project invented. The server says so
-(`{"errors":[{"code":1,"message":"The application name is invalid."}]}`), a direct probe settles it
-(`android` -> 400, `GoogleAndroidApp` -> 200), and the correct value is read out of the APK:
-`bh.x0.M` in `classes2.dex` is one instruction, `const-string v0, "GoogleAndroidApp"`.
+It is **RED at the frontier**, by design: it fails on any guest thread this layer kills. What a
+run reaches now, every time (gate61-64, a real window, an RTX 4060):
 
-A second instance of the same bug: **`nativeInitClientSettings`'s third argument is an application
-*name*, not a base URL.** We passed a URL and the engine built
-`.../settings-compressed/application/https:/clientsettings.roblox.com/...zst`.
+* **The engine's own renderer presents its own frames.** The census counts every call through a
+  Vulkan thunk by name: a 30 s session shows `vkQueuePresentKHR` 15, `vkAcquireNextImageKHR` 15,
+  `vkQueueSubmit` ~17, `vkCmdDraw` ~70 -- up to 12 presents in one 5 s window -- through compute
+  pipelines, dispatch, image copies and blits, query read-back and 135-barrier batches, all to the
+  host driver. **It is visible**: a copy of the composed screen under the window (taken only with
+  the window in the foreground) is the engine's image, 377 distinct colours on an 8 px grid -- a
+  blue sky-like field with dark bands and a flat grey panel. It is visibly blocky; the engine logs
+  `Using TM2 in MipPackStream mode`, so low streamed mips are the first suspect, **unconfirmed**.
+  `PrintWindow` cannot see this at all (VERIFICATION entry 19).
+* **The engine reaches its landing screen**: `onDataModelNotification: Received type(APP_READY, 10),
+  data(Landing)`. Then every authenticated call answers **401** and the app logs itself out
+  (`DID_LOG_OUT`) and reloads the logged-out landing. **Reaching a game needs a Roblox login. The
+  credential is the owner's to supply; nothing here may invent one.**
+* **Input reaches the engine.** The window's primary button is one finger through `vk.e.onTouch`'s
+  own rules to the exported `nativePassInput` (dp from the one display model, live from
+  `onSurfaceCreatedNative`); keys go through `vk.g` to `nativePassKeyEvent` when a keyboard is
+  declared. The probe's three calls return. Whether the engine visibly acts on them has not been
+  observed -- it needs frames that continue.
+* **A resize is delivered as a device delivers it** -- `onSurfaceChangedNative` with the new size,
+  then `onContentRectChangedNative`, on the UI thread, for any change of the client size (a user's
+  drag or the probe) -- and both return. Whether the engine presents *after* a resize has not been
+  observed: the render thread had already died. The gate asserts it once it can.
+* **The display is one model**: the window's client pixels and `Window::dpi` give `Configuration`,
+  `DisplayMetrics` and `AConfiguration` alike (density `dpi / 96`).
+* **Networking is real**: TLS to the real endpoints, the settings fetch, the QUIC transport both
+  ways (GSO, `recvmmsg`, path-MTU `EMSGSIZE`).
 
-**`ldexp` is why the download appeared to stall at 30%.** `omni_bionic::libm::ldexp` has existed
-since phase 1, sits directly beside `frexp` which *was* bound, and nothing called it. A thread died
-on it and the reader parked waiting for the thread that had died, so `recvfrom` froze. Two runs
-were spent measuring read sizes before that was clear -- entry 16 again, in the session that wrote
-entry 16. **Do not trust the ~1,629 bytes-per-read figure** recorded during that period: it was
-computed over a truncated transfer and has never been recomputed over a completed one.
+## The frontier -- CURRENT
 
-### The gate is RED, and it is the frontier
+1. **FMOD kills the render thread.** After the logout, the logged-out landing starts its sound
+   system on thread 6 and FMOD's native side asks Java `org/fmod/FMOD.checkInit()Z`, which this
+   layer has not answered -- so the thread dies and presents stop (~25 s into a session). Decoded:
+   `checkInit` is `gContext != null`, and the app's own Java calls `FMOD.init(context)` from
+   `NativeHelper.Q` and `fi.e.E`. Next come FMOD's other statics (sample rate, block size, low
+   latency, Bluetooth) and its native output (AAudio or OpenSL ES through `dlopen`). **An agent
+   branch was implementing this when this section was written** -- check `git log` for it before
+   starting it again.
+2. **Then frames continuing, measured.** Everything seen so far was under the engine's own
+   startup throttle (`setStartupThrottle: true` until ~20 s after rendering starts). `OMNI_PROFILE`
+   already says: the host thread pinned at a core is guest thread 0x5, the native glue's loop, at
+   **3.36 M boundary crossings/s** (`ALooper_pollOnce` with no timeout, 36.9 M polls a run, and a
+   mutex round trip each time); the render thread (0x6) is **59% in `pthread_cond_wait`** and 33%
+   in guest code -- waiting for work, not CPU-bound. Measure the steady-state rate on the landing
+   screen before optimising anything.
+3. **Then the resize, observed**: `OMNI_RESIZE_PROBE=1` with a session long enough for frames on
+   both sides of each resize; the gate fails if presents stop after one.
+4. **`/proc/meminfo` and `/proc/self/statm`** are read many times a second and missing (an agent
+   branch may already serve them -- check `git log`).
+5. **The one unexplained corruption**: gate42's MemoryFault in a libc++ `unordered_map` rehash at
+   link `0x21db208` -- a node overwritten with 32 bytes of `0xFF`. Seen once in ~20 runs. What was
+   ruled out, and the cheap diagnostic that would settle it (walk the engine allocator's page map
+   for the block at death), are in this section's source notes; treat it as live.
 
-`cargo test -p omni-android --release --test gameactivity` fails on **two guest-thread deaths in
-post-flags code that no run reached before**. Nothing has been widened to hide them:
-`WATCHDOG_SECONDS` is 180, `FLAG_FETCH_WAIT` is 30.
+**Two things will stop this short of a game, and only one is code:** the login above, and audio
+(FMOD), which the render thread cannot survive without an answer.
 
-1. **`GetStaticObjectField` refused**: `com/roblox/protocols/systemdialog/
-   PlatformSystemDialogHandler.INSTANCE` is on the measured JNI surface and this layer has not
-   decided what it answers. A `classes.rs` question -- §8 row 23 territory.
-2. **`MemoryFault { pc: 2399330234196, address: 2400510558208, access: Read }` on guest thread 22.**
-   A *second*, distinct death in the same run, and **not** a refusal. Uninvestigated.
+## What this session built, so it is not rebuilt
 
-Two more open threads from the same run:
+Vulkan: `Features2`/`ImageFormatProperties2` chains, format and image-format queries, query pools,
+`vkCmdResetQueryPool`/`vkCmdWriteTimestamp`/`vkGetQueryPoolResults` (the guest's own bytes are
+what unavailable queries keep), descriptor update templates, compute pipelines and
+`vkCmdDispatch` (live-tested on the NVIDIA queue), `vkCmdCopyImage`, `vkCmdBlitImage`, the barrier
+bound as a relation (135 measured), per-name call counts. bionic: `recvmmsg`, GSO `sendmsg`,
+`posix_fallocate`, read-only file `mmap`, `fseek`/`ftell`, `erfcf`, printf's integer widths,
+**`sscanf`** on a vfscanf-faithful engine. Filesystem: the eight characters Windows reserves are
+**stored as private-use stand-ins** (WSL's scheme), not refused -- the engine names its cache after
+URLs. NDK: open-asset ceiling 1,024, `AAsset_openFileDescriptor` on the real APK. Concurrency: the
+**futex park deadlock** (a `parking_lot` lock taken inside `park`'s `validate`) and a killed guest
+thread's stack kept mapped. Input and the display model, above. Gate: sessions, frames, resizes,
+the profiler.
 
-* **`nativeGameGlobalInit` (§8 row 22) does not return within 180 s.** The gate's post-fetch surface
-  re-delivery sits after it, so **whether the surface is finally accepted has never been observed.**
-  `continueAfterFlagsLoaded_` is reached only on the fetch's success path; the instrument is in
-  place and the run cannot reach it yet.
-* The `DynamicFastVariableReloader`'s `.zst` request aborts at **exactly `time:5012.3ms`** with a
-  now well-formed URL -- a 5 s client-side timeout, unexplained.
+## After the first frame -- the goal is not a frame
 
-## Stage 5 is built: a textured triangle drawn by guest code, four quadrants asserted
+The first frames are presented, and the goal says in as many words that this is not the end. The
+order is: **frames continuing** (FMOD first), then **input the engine acts on**, then **the game**
+(a login), then **optimisation** (measure with `OMNI_PROFILE` first -- this project has twice been
+wrong about what a spin was costing), then **survival** (a session of minutes, teardown, the commit
+ceiling D15).
 
-**The `wip(vk)` commit message on `dfb6395` is wrong** — it says the triangle test is not in the
-tree and to treat the modules as unverified. Both were true when it was written and neither is now.
-This section is the correction; do not redo that verification.
-
-```text
-memory types the driver reports: 5
-    importable set (vkGetMemoryHostPointerPropertiesEXT): 0xc
-    masked: memory type 4 "DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT" shown as "DEVICE_LOCAL"
-    added to the device: "VK_EXT_external_memory_host" (not requested by the guest)
-vkAllocateMemory -> vertex 48 B from type 2 (imported), texture 512 B from type 1 (forwarded)
-vkMapMemory      -> 0x198ac960000, inside GuestSpace [0x198ac4c0000, 0x199ac4c0000)
-vkCreateShaderModule -> two real SPIR-V modules, 151 and 113 words
-vkCreateGraphicsPipelines -> VkResult 0 ; vkCmdDraw(3,1,0,0) ; vkQueuePresentKHR -> VkResult 0
-read back 512x512 from the presented image:
-    top-left     (128,128) = [32, 96, 160, 255]    expected the texel [32, 96, 160, 255]
-    top-right    (384,128) = [16, 176, 64, 255]    expected the texel [16, 176, 64, 255]
-    bottom-left  (128,384) = [200, 48, 16, 255]    expected the texel [200, 48, 16, 255]
-    bottom-right (384,384) = [240, 224, 80, 255]   expected the texel [240, 224, 80, 255]
-```
-
-A 2x2 texture of four distinct colours, uploaded through a mapped staging buffer and
-`vkCmdCopyBufferToImage`, sampled by a fullscreen triangle. **Four quadrants rather than one
-colour**, because that catches three failures independently: no draw (the frame is the clear
-colour, which is none of the four), no upload (would need those four colours in those four places
-by coincidence), and a flipped or transposed UV mapping (a single-colour texture cannot see it).
-The SPIR-V is hand-assembled — there is no shader compiler on this machine — and the driver
-compiling it plus the pixels coming back are what check it.
-
-**The memory route is the measured one, and the invariant is enforced rather than assumed**: the
-shim compares the driver's `vkMapMemory` answer against the pointer it imported and **refuses if
-they differ**. Non-host-visible types forward ordinarily and refuse `vkMapMemory` by name, as the
-specification does.
-
-**Two Global Constraint 1 rewrites, both logged.** Memory types that are `HOST_VISIBLE` but not
-importable have those bits **cleared, not removed** — removing the entry would renumber every index
-the guest later passes to `vkAllocateMemory`. And `VK_EXT_external_memory_host` is **added to the
-device the guest asked for**, because the engine asks only for `VK_KHR_swapchain`: the device the
-guest receives is not the device it described, and the log says so.
-
-**`pNext` is refused everywhere the guest sends one**, and the refusal names the address — which
-turns "what does the engine actually send?" into a measurement. `vkAllocateMemory` is the sharpest
-case, because this layer *constructs* the one chain an allocation carries.
-
-`REQUIRED_DATA_BYTES` is now **8192** (`REGISTRY_BYTES` 7360). **There is no arrangement of
-thirteen handle families that fits 4096**, so the data area had to be raised; only the four Vulkan
-harnesses bind a `Vulkan` and the other embeddings stay at 4096.
-
-### Three things stage 5 left, worth knowing before touching it
-
-1. **`minImportedHostPointerAlignment` falls back to 64 KiB.** It lives in a struct chained onto
-   `vkGetPhysicalDeviceProperties2`, a Vulkan **1.1** entry point, and the instance is the
-   *guest's*, created at apiVersion 1.0 — so neither spelling resolves. The fallback is safe
-   (over-alignment satisfies the real 4096) but costs rounding: 48 B and 16 B allocations took
-   65,536 B each. Bounded at ~2 MiB against a 3,584 MiB ceiling. A throwaway 1.1 instance recovers
-   it.
-2. **`probe_importable` creates a throwaway `VkDevice`** per physical device. The tempting
-   shortcut — "host-visible and not device-local" — reproduces the measured `0xc` exactly, **and
-   that is precisely why it was not used**: a derivation that agrees with one measurement.
-3. **A deadlock was introduced and fixed, and how it was found is the lesson**: two
-   `locked_memories()` calls in one struct expression, where a temporary lives to the end of the
-   *statement* and `std::sync::Mutex` is not reentrant. Every assertion had already passed — it
-   hung in teardown.
-
-## What is between here and a real Roblox frame — CURRENT
-
-**Both of the things this section used to name are done.** The `HTTP 400` is fixed and the fetch
-completes; Vulkan stage 5 is built and verified to a textured triangle. What follows is the live
-list, and it is short because the gate names each item by failing on it.
-
-**1. The gate is RED on two guest-thread deaths**, both in post-flags code that no run reached
-before the settings fix:
-
-* `GetStaticObjectField` refused on `com/roblox/protocols/systemdialog/
-  PlatformSystemDialogHandler.INSTANCE` — a `classes.rs` question, §8 row 23 territory.
-* `MemoryFault { pc: 2399330234196, address: 2400510558208, access: Read }` on guest thread 22.
-  **Not a refusal**, uninvestigated, and the more interesting of the two.
-
-**2. `nativeGameGlobalInit` (§8 row 22) does not return within 180 s**, so the gate never delivers a
-window afterwards and **whether the engine ever accepts the surface has never been observed.** The
-instrument is in place — the `Flags-Not-Received` count either side of the post-fetch delivery — and
-it has never been reached. Establishing that verdict is the single most valuable next measurement,
-because everything downstream of it is graphics work that is already built and waiting.
-
-**3. Then the engine's own renderer.** Stages 1-5 cover the mechanism; what the engine actually
-calls, in what order, is recorded by `Vulkan::names()` the first run that gets there. Expect the
-census to name entry points stage 5 deliberately did not implement, and expect that list to be
-short — everything structural is there.
-
-**Do not re-investigate:** the settings fetch (it completes, 1,358,053 bytes in 3.08 s), TLS (it
-works, and the HTTP inside it is encrypted and not visible to any recorder), the Vulkan loader,
-instance, surface, device, swapchain, presentation or memory route (all live-verified against a
-real driver), or the `ALooper_pollOnce(-1)` question.
-
-## After the first frame — the goal is not a frame
-
-A single presented frame is **not** the finish line and the goal says so explicitly. The work does
-not stop there, and planning as though it does is how a runtime ends up with a screenshot instead of
-a game:
-
-* **Continuous frames.** One frame proves a path; frames continuing prove the path is stable under
-  the engine's own pacing, its swapchain recreation, and a resized window.
-* **Input.** §8 row 26: the engine's own path is
-  `NativeInputInterface.nativePassInput(IFFIII)` / `nativePassInputBatch([I[FIIII)` from the host's
-  pointer events — **not** necessarily `onTouchEventNative`. `omni_platform::window::WindowEvent`
-  already carries what the host delivers; nothing wires it to the guest yet.
-* **Reaching the game.** Login and joining a server are further network work on a seam that now
-  exists. D30 permits it.
-* **Optimisation, and it is not cosmetic.** The game thread spins `ALooper_pollOnce` ~230 M times
-  and `sched_yield` ~20 M times per run; it has been visible for several milestones and mattered
-  the moment a megabyte had to be downloaded past it. It will matter again when frames are being
-  produced. Measure before changing anything — this project has twice been wrong about what the
-  spin was costing.
-* **Survival.** The goal asks for long enough to prove it is interactive. Teardown, leak behaviour
-  and the commit ceiling (D15, which now covers texture uploads) all become real at that point.
-
+# History -- the sections below describe earlier frontiers, kept for the record
 
 ## The immediate blocker: the engine will not take the surface until the flags have arrived
 
