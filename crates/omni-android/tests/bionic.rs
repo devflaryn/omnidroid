@@ -13,7 +13,7 @@
 //! cargo test -p omni-android --test bionic --release
 //! ```
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

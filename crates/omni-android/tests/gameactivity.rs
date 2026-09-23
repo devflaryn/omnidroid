@@ -30,7 +30,7 @@
 //! When the APK is absent every test here **fails** rather than skipping: `VERIFICATION.md` entry
 //! 4, learned twice.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
