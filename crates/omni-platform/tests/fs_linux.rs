@@ -327,13 +327,12 @@ fn signal_storm(target: libc::pthread_t) -> (Arc<AtomicBool>, std::thread::JoinH
     let stop = Arc::new(AtomicBool::new(false));
     let handle = {
         let stop = Arc::clone(&stop);
-        // `pthread_t` is an integer on Linux; carried as one so the closure is `Send`.
-        let target = target as u64;
+        // `pthread_t` is an integer (`c_ulong`) on Linux, so the closure is `Send` as it is.
         std::thread::spawn(move || {
             let mut sent = 0;
             while !stop.load(Ordering::Relaxed) {
                 // SAFETY: the target thread outlives the storm: it stops it and joins it first.
-                unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR1) };
+                unsafe { libc::pthread_kill(target, libc::SIGUSR1) };
                 sent += 1;
                 std::thread::sleep(Duration::from_micros(50));
             }

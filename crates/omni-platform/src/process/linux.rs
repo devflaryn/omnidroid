@@ -450,8 +450,8 @@ pub(super) mod tests {
         if effective & (1 << CAP_SYS_NICE) != 0 {
             return -20;
         }
-        // SAFETY: `limit` is a live `rlimit` and `getrlimit` writes only it.
         let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: `limit` is a live `rlimit` and `getrlimit` writes only it.
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NICE, &raw mut limit) }, 0);
         20 - i32::try_from(limit.rlim_cur.min(40)).expect("at most 40")
     }
