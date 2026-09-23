@@ -166,3 +166,73 @@ ROWS += [
      """    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) } != 0 {""",
      LIB_TESTS),
 ]
+
+NET = "crates/omni-platform/src/net/macos.rs"
+NET_TESTS = [
+    "cargo", "test", "-p", "omni-platform",
+    "--test", "net_loopback", "--test", "net_macos", "--test", "net_seam", "--lib",
+    "--no-fail-fast",
+]
+
+ROWS += [
+    ("mac-plat-D1", "A", "sockets are created without SO_NOSIGPIPE, so a write to a dead peer "
+     "kills the process",
+     NET,
+     """    set_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1).map_err(|code| {
+        NetError::kinded(
+            operation,""",
+     """    set_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 0).map_err(|code| {
+        NetError::kinded(
+            operation,""",
+     NET_TESTS),
+    ("mac-plat-D2", "A", "accepted sockets are left without SO_NOSIGPIPE",
+     NET,
+     """    set_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1).map_err(|code| {
+        NetError::kinded(
+            "accept",""",
+     """    set_int(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 0).map_err(|code| {
+        NetError::kinded(
+            "accept",""",
+     NET_TESTS),
+    ("mac-plat-D3", "A", "a hung-up socket is not reported writable, so a refused connect never "
+     "settles",
+     NET,
+     """            writable: revents & libc::POLLOUT != 0 || (hangup && entry.interest.writable),""",
+     """            writable: revents & libc::POLLOUT != 0,""",
+     NET_TESTS),
+    ("mac-plat-D4", "A", "EINPROGRESS from a non-blocking connect is reported as a failure",
+     NET,
+     """        libc::EINPROGRESS | libc::EALREADY | libc::EINTR => Ok(ConnectProgress::InProgress),""",
+     """        libc::EALREADY | libc::EINTR => Ok(ConnectProgress::InProgress),""",
+     NET_TESTS),
+    ("mac-plat-D5", "A", "the v4 address is byte-swapped into sin_addr",
+     NET,
+     """                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(octets) },""",
+     """                sin_addr: libc::in_addr { s_addr: u32::from_be_bytes(octets) },""",
+     NET_TESTS),
+    ("mac-plat-D6", "A", "the keep-alive idle time uses Linux's option number (TCP_KEEPIDLE = 4)",
+     NET,
+     """    set(inner, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, value, "setsockopt(IPPROTO_TCP, TCP_KEEPALIVE)")""",
+     """    set(inner, libc::IPPROTO_TCP, 4, value, "setsockopt(IPPROTO_TCP, TCP_KEEPALIVE)")""",
+     NET_TESTS),
+    ("mac-plat-D7", "A", "a reused descriptor inherits the previous socket's path-MTU mode",
+     NET,
+     """    PathMtuRecord::born(fd);
+    if let Err(error) = prepare(fd, "socket", &what) {""",
+     """    if let Err(error) = prepare(fd, "socket", &what) {""",
+     NET_TESTS),
+    ("mac-plat-D8", "A", "an interface address listed on two interfaces is reported twice",
+     NET,
+     """                        let ip = std::net::IpAddr::from(v6.sin6_addr.s6_addr);
+                        if !addresses.contains(&ip) {
+                            addresses.push(ip);
+                        }""",
+     """                        let ip = std::net::IpAddr::from(v6.sin6_addr.s6_addr);
+                        addresses.push(ip);""",
+     NET_TESTS),
+    ("mac-plat-D9", "B", "a readiness wait of under a millisecond is rounded down to a spin",
+     NET,
+     """    let millis = timeout.as_micros().div_ceil(1000);""",
+     """    let millis = timeout.as_micros() / 1000;""",
+     NET_TESTS),
+]
