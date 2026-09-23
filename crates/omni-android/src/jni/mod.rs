@@ -406,8 +406,10 @@ impl Jni {
     /// instance. A handler that finds none refuses with [`AbiError::JniNotActive`] naming the
     /// function.
     ///
-    /// A thread keeps the same slot for the life of the instance, because the engine caches the
-    /// `JNIEnv*` it is given.
+    /// A thread keeps the same slot for **its own** life, because the engine caches the `JNIEnv*`
+    /// it is given -- in thread-local storage, which is where JNI says a `JNIEnv` belongs. A
+    /// created guest thread's slot is returned when the thread ends ([`JniThreadInstance`]), as
+    /// ART reclaims a detached thread's env, and a new thread is given the **lowest free** slot.
     ///
     /// # Errors
     ///
@@ -419,8 +421,12 @@ impl Jni {
             match state.assigned.get(&id) {
                 Some(index) => *index,
                 None => {
-                    let next = state.assigned.len();
-                    if next >= MAX_JNI_THREADS {
+                    // The lowest slot no live thread holds. Not `assigned.len()`: once a thread
+                    // has ended and returned its slot, the count of live threads is no longer the
+                    // next free index, and using it would hand a new thread a live thread's env.
+                    let taken: std::collections::HashSet<usize> =
+                        state.assigned.values().copied().collect();
+                    let Some(next) = (0..MAX_JNI_THREADS).find(|index| !taken.contains(index)) else {
                         return Err(AbiError::JniRefused {
                             function: "Jni::activate".to_string(),
                             address: self.arena,
@@ -431,7 +437,7 @@ impl Jni {
                                  exception"
                             ),
                         });
-                    }
+                    };
                     state.assigned.insert(id, next);
                     next
                 }
@@ -441,6 +447,22 @@ impl Jni {
             cell.borrow_mut().replace(ActiveJni { jni: Arc::clone(self), thread: index })
         });
         Ok(JniActivation { previous })
+    }
+
+    /// Return the slot host thread `id` holds, if it holds one, and clear it for the next thread:
+    /// not attached, no name, no pending exception.
+    ///
+    /// **Only for a thread that has ended.** [`JniThreadInstance`]'s guard calls it as a created
+    /// guest thread finishes, which is when ART reclaims a thread's `JNIEnv`. MEASURED why it has
+    /// to exist: the slots were never returned, the engine creates short-lived threads by the
+    /// dozen (one per name lookup, among others), and the 65th thread the instance had ever made
+    /// -- FMOD's, with 60-odd of the earlier ones long gone -- was refused an env, never started,
+    /// and left the render thread waiting on a semaphore for it for ever.
+    fn release_thread(&self, id: std::thread::ThreadId) {
+        let mut state = self.state.lock();
+        if let Some(index) = state.assigned.remove(&id) {
+            state.threads[index] = ThreadState::default();
+        }
     }
 
     /// Attach the calling thread without waiting for the engine to do it.
@@ -1229,7 +1251,29 @@ impl crate::bionic::ThreadLocalInstance for JniThreadInstance {
     }
 
     fn publish(&self) -> AbiResult<Box<dyn core::any::Any>> {
-        Ok(Box::new(self.0.activate()?))
+        let activation = self.0.activate()?;
+        Ok(Box::new(GuestThreadJni {
+            activation: Some(activation),
+            jni: Arc::clone(&self.0),
+            thread: std::thread::current().id(),
+        }))
+    }
+}
+
+/// What a created guest thread holds for its life: its activation, and on drop -- the thread's
+/// end -- the return of its `JNIEnv` slot ([`Jni::release_thread`]).
+struct GuestThreadJni {
+    activation: Option<JniActivation>,
+    jni: Arc<Jni>,
+    thread: std::thread::ThreadId,
+}
+
+impl Drop for GuestThreadJni {
+    fn drop(&mut self) {
+        // Un-publish first, then give the slot back: nothing on this thread can reach the env
+        // once the slot belongs to someone else.
+        drop(self.activation.take());
+        self.jni.release_thread(self.thread);
     }
 }
 
@@ -1278,6 +1322,72 @@ mod tests {
         // Distinct per thread, which is what JNI requires and what keeps one thread's pending
         // exception out of another's.
         assert_ne!(jni.env_for(0), jni.env_for(1));
+    }
+
+    /// **A created guest thread's `JNIEnv` slot comes back when the thread ends**, and a new thread
+    /// is given the lowest free one -- never a live thread's. MEASURED why: the 65th thread an
+    /// instance had ever made (FMOD's) was refused an env with most of the first 64 long gone.
+    #[test]
+    fn a_guest_threads_env_slot_is_returned_when_it_ends_and_never_given_to_a_live_thread() {
+        let jni = instance();
+        // The host's own thread holds slot 0 throughout, as the embedding's main thread does.
+        let _main = jni.activate().expect("the main thread's env");
+        let slot_of = |jni: &Arc<Jni>| -> (Box<dyn core::any::Any>, usize) {
+            let guard = jni.thread_instance().publish().expect("an env for the thread");
+            let (_, index) = active_opt().expect("published");
+            (guard, index)
+        };
+        // Many more threads than the cap, one after another: each is given an env.
+        for round in 0..(2 * MAX_JNI_THREADS) {
+            let jni = Arc::clone(&jni);
+            let slot = std::thread::spawn(move || {
+                let (guard, index) = slot_of(&jni);
+                jni.attach_current_thread(Some("worker")).expect("attached");
+                drop(guard);
+                index
+            })
+            .join()
+            .expect("the thread completes");
+            assert_ne!(slot, 0, "round {round}: never the main thread's slot");
+        }
+        // Two live threads; the one holding the lower slot attaches and ends; a third starts. It
+        // must be given the returned slot, cleared -- never the live one.
+        let live = |attach: bool| {
+            let jni = Arc::clone(&jni);
+            let (end, wait) = std::sync::mpsc::channel::<()>();
+            let (tell, slot) = std::sync::mpsc::channel::<usize>();
+            let handle = std::thread::spawn(move || {
+                let (guard, index) = slot_of(&jni);
+                if attach {
+                    jni.attach_current_thread(Some("ends first")).expect("attached");
+                }
+                tell.send(index).expect("sent");
+                let _ = wait.recv();
+                drop(guard);
+            });
+            (handle, end, slot.recv().expect("its slot"))
+        };
+        let (a, end_a, slot_a) = live(true);
+        let (b, end_b, slot_b) = live(false);
+        assert_ne!(slot_a, slot_b, "two live threads, two envs");
+        end_a.send(()).expect("told to end");
+        a.join().expect("a completes");
+        let (third, attached) = {
+            let jni = Arc::clone(&jni);
+            std::thread::spawn(move || {
+                let (guard, index) = slot_of(&jni);
+                let attached = jni.is_attached(index);
+                drop(guard);
+                (index, attached)
+            })
+            .join()
+            .expect("the third completes")
+        };
+        assert_ne!(third, slot_b, "a live thread's env is never handed to another thread");
+        assert_eq!(third, slot_a, "the lowest free slot: the one that was returned");
+        assert!(!attached, "and it arrives cleared, not still attached as the last owner left it");
+        end_b.send(()).expect("told to end");
+        b.join().expect("b completes");
     }
 
     /// Before `install_into`, every table entry is zero. A guest that reached a JNI function
