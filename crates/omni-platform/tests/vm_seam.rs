@@ -173,7 +173,7 @@ fn map_executability_is_readable_at_a_call_site() {
 /// On a platform whose backend is structural, every operation must fail with a typed error that
 /// says so. A build there is honestly broken rather than quietly wrong.
 #[test]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn structural_backends_report_unsupported() {
     let err = vm::reserve(vm::allocation_granularity(), vm::allocation_granularity()).unwrap_err();
     assert!(err.is_unsupported(), "expected Unsupported, got {err}");
