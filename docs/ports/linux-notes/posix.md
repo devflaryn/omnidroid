@@ -133,8 +133,9 @@ So the non-Windows `TimerResolution` arm's `Ok` is true on this host: no coarse 
   unit tests in `process/linux.rs`, `fs/linux.rs`, `net/linux.rs`.
 * `tools/lnx_rows/posix.py`: 41 rows (proc 8, fs 9, net 22, clock 2; 34 A, 7 B). Whole Linux
   table (with `lnx-build-A1`): first run **41/42 caught**, `lnx-net-A7` NOT CAUGHT (the EISCONN
-  finding above); after the test fix, `lnx-net-A7` caught, and the whole-table rerun is recorded
-  in the final report. Rows `lnx-fs-A7`/`A8`/`B1` mutate shared `fs/path.rs` and
+  finding above); after the test fix, the whole-table rerun on the committed tree is **42/42 caught**
+  (`pre-flight: 42/42 patterns match exactly once`, `7/7 commands pass on the unmutated tree`,
+  harness exit 0, `git diff --exit-code` clean afterwards). Rows `lnx-fs-A7`/`A8`/`B1` mutate shared `fs/path.rs` and
   `lnx-clock-*` shared `clock.rs`, temporarily, to prove the Linux tests detect them.
 * Not given rows, because nothing on this host can reach them: `GRND_NONBLOCK` (the CRNG is
   seeded), `EAGAIN` from `connect` treated as progress (needs ephemeral-port exhaustion), a
