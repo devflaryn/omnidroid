@@ -71,14 +71,16 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-#[cfg(target_os = "macos")]
+// The macOS backend reads and writes arm64 thread state and carries an arm64 trampoline, so it is
+// Apple silicon's. An x86-64 macOS build (an Intel Mac, or Rosetta 2) has no backend here.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use macos as backend;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", all(target_os = "macos", target_arch = "aarch64"))))]
 mod unsupported;
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", all(target_os = "macos", target_arch = "aarch64"))))]
 use unsupported as backend;
 
 /// What the faulting instruction was trying to do.

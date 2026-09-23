@@ -108,6 +108,28 @@ thread gets 1.01 ms, `pthread_cond_timedwait` 1.51 ms, and an `EVFILT_TIMER` wit
 answer to the same problem is `TimerResolution::raise` (1 ms); this host needs a different one --
 recorded for the performance work, not yet acted on.
 
+## A native CPU backend: first numbers *(in progress)*
+
+The guest ISA is this host's, so a backend that runs guest code natively under
+Hypervisor.framework (guest at EL0 in a VM whose stage-2 maps host memory at IPA == VA, keeping
+D4's identity mapping; `svc` and thunk calls trapping to the host) is the obvious candidate to
+replace translation. Two facts decide its shape, MEASURED with a C probe (`hv_vm_create`,
+`hv_vcpu_run` over a guest `hvc #0; b .-4` loop at EL1, binary ad-hoc signed with
+`com.apple.security.hypervisor`):
+
+| Quantity | Value |
+|---|---|
+| one VM exit + resume (`hvc` -> host -> `hv_vcpu_run`) | **708 ns** (best of 3 rounds, n = 200,000 each; 836, 729, 708) |
+| vCPUs per VM (`hv_vm_get_max_vcpu_count`) | **64** |
+
+Against D17's in-loop import dispatch (26.7-31.0 ns on the x64 host), an import that became a VM
+exit would cost ~25x more, and Windows measured the engine crossing the import boundary about
+1.3 million times a second (VERIFICATION entry 15, a startup phase on Windows) -- which at 708 ns is ~0.9 s of exits per second
+of guest time. And the engine runs up to 256 guest threads (`MAX_GUEST_THREADS`) against 64 vCPUs.
+So a hypervisor backend is only a win if the hot imports stop being exits (served in-guest) and
+guest threads are multiplexed onto vCPUs; whether the compute it buys back outweighs that is the
+number still to be measured, in the world, once parity holds.
+
 ## Merge notes
 
 Shared files this port edits, each minimal and additive, none changing Windows behaviour:
