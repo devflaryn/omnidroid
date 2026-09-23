@@ -94,7 +94,15 @@ pub fn destroy(
 // ---------------------------------------------------------------------------
 
 /// `sem_wait`: decrement or block. Returns -1/EINVAL for an unmapped/invalid
-/// sem, -1/EINTR if interrupted (never in this mock), 0 on success.
+/// sem, 0 on success, and -1/EINTR when there is no token and the futex is
+/// [`interrupted`](Futex::interrupted).
+///
+/// **`EINTR` is bionic's own answer**: its `sem_wait` returns `-1`/`EINTR` when the
+/// futex wait is interrupted, for every app targeting SDK 24 or later. MEASURED why
+/// it is needed here: at teardown the futex refuses every wait, and this loop --
+/// which runs in the host, inside the one import -- re-read the word and waited
+/// again, forever, so the thread never returned to the guest to be stopped (gate67:
+/// an FMOD thread in `sem_wait` outlived `join_guest_threads`).
 pub fn wait(
     mem: &mut (impl GuestMemory + GuestAtomic),
     futex: &impl Futex,
@@ -128,6 +136,14 @@ pub fn wait(
         // and the park below; one that ignores it is no worse off. `mutex` and `once` already pass
         // real values here -- only `rwlock` and this file passed a placeholder `0`, which the word
         // can never be at this point, because the waiter flag has just been set.
+        //
+        // No token, and a futex that will not block again: interrupted. A token is still
+        // taken above in preference, as a signal arriving after a post would not undo it.
+        // The waiter flag stays, as bionic leaves its count negative: this thread cannot
+        // know whether others are still blocked.
+        if futex.interrupted() {
+            return errno_result(mem, consts::EINTR);
+        }
         match futex.wait(sem_addr, word | sem_bits::WAITERS, Some(SELF_HEAL_SLICE)) {
             WaitResult::Woken => continue,
             WaitResult::TimedOut => continue,
@@ -383,6 +399,49 @@ mod tests {
     }
 
     /// timedwait times out with elapsed >= timeout (and clears the waiter flag).
+    /// A futex shut down the way `AddressFutex::stop` shuts one: it refuses every wait at once
+    /// and reports itself interrupted.
+    struct ShutDown;
+
+    impl Futex for ShutDown {
+        fn wait(&self, _addr: u64, _expected: u32, _timeout: Option<Duration>) -> WaitResult {
+            WaitResult::WouldBlock
+        }
+        fn wake(&self, _addr: u64, _count: u32) -> u32 {
+            0
+        }
+        fn interrupted(&self) -> bool {
+            true
+        }
+    }
+
+    /// **The detector for gate67's stranded thread.** With no token and an interrupted futex,
+    /// `sem_wait` returns `-1`/`EINTR`; without the check it loops in the host forever, which
+    /// the channel's deadline turns into a failure rather than a hung test.
+    #[test]
+    fn wait_on_an_interrupted_futex_returns_eintr() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut m = placed();
+            assert_eq!(init(&mut m, 0x1000, 0, 0).unwrap(), 0);
+            let _ = tx.send((wait(&mut m, &ShutDown, 0x1000).unwrap(), last_errno()));
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("sem_wait on an interrupted futex must return, not loop in the host");
+        assert_eq!(answer, (-1, consts::EINTR));
+    }
+
+    /// A token is taken in preference: interruption is only what a wait with nothing to take
+    /// answers.
+    #[test]
+    fn a_token_is_taken_even_when_the_futex_is_interrupted() {
+        let mut m = placed();
+        assert_eq!(init(&mut m, 0x1000, 0, 1).unwrap(), 0);
+        assert_eq!(wait(&mut m, &ShutDown, 0x1000).unwrap(), 0);
+        assert_eq!(getvalue(&mut m, 0x1000).unwrap(), 0);
+    }
+
     #[test]
     fn timedwait_times_out() {
         let mem = placed();

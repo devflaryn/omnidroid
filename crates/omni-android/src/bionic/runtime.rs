@@ -386,6 +386,12 @@ impl Drop for ParkedOn<'_> {
 }
 
 impl Futex for AddressFutex {
+    /// Interrupted exactly when [`stop`](AddressFutex::stop) has been called: from then on
+    /// `wait` refuses at once, and a primitive looping in the host must return to the guest.
+    fn interrupted(&self) -> bool {
+        self.stopped()
+    }
+
     fn wait(&self, addr: u64, expected: u32, timeout: Option<Duration>) -> WaitResult {
         // See the module docs: the comparison is the caller's, because not every caller in
         // `omni-bionic` passes a meaningful `expected`.

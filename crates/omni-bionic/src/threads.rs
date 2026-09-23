@@ -122,4 +122,19 @@ pub trait Futex {
 
     /// Wake up to `count` waiters on `addr`; returns the number woken.
     fn wake(&self, addr: u64, count: u32) -> u32;
+
+    /// Whether every wait on this futex is **interrupted for good**: the instance is shutting
+    /// down, and `wait` now returns at once rather than blocking.
+    ///
+    /// **What a caller that loops in host code needs and a guest does not.** A guest that spins
+    /// on a refused wait spends its run window and reaches the thread-runner's stop switch at
+    /// the end of it. A primitive that loops *here*, inside one import, never returns to the
+    /// guest, so no window ends and the switch is never read. Such a primitive asks this, and
+    /// returns what Linux returns for a wait a signal interrupted -- where the primitive has
+    /// one (`sem_wait`'s `EINTR`).
+    ///
+    /// `false` by default: a futex with no shutdown is never interrupted.
+    fn interrupted(&self) -> bool {
+        false
+    }
 }
