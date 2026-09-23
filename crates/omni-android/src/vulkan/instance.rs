@@ -198,6 +198,15 @@ impl Instances {
         self.index_of(at).and_then(|index| self.entries[index])
     }
 
+    /// Free the slot a live guest handle names, and answer what it held -- `vkDestroyInstance`.
+    ///
+    /// [`Handles::remove`](super::handles::Handles::remove)'s condition holds: instances are never
+    /// deduplicated, and a host never hands a destroyed instance's token out again.
+    pub(super) fn remove(&mut self, at: GuestAddr) -> Option<HostInstance> {
+        let index = self.index_of(at)?;
+        self.entries[index].take()
+    }
+
     /// Every live handle, with the address the guest holds for it.
     pub(super) fn iter(&self) -> impl Iterator<Item = (GuestAddr, HostInstance)> + '_ {
         self.entries
@@ -475,6 +484,61 @@ pub(super) fn create_instance(
             Ok(())
         }
     }
+}
+
+/// `void vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator)`
+///
+/// # Why it exists: measured
+///
+/// A gate run measured the engine's render thread calling it on `APP_CMD_TERM_WINDOW`, the last
+/// call of its teardown, after `vkDestroyDevice`, through the thunk `vkGetInstanceProcAddr` handed
+/// out, with `x0` its `VkInstance` and `pAllocator = NULL`. Refusing it killed the thread.
+///
+/// # The order every destroy here uses, and children first
+///
+/// The allocator is observed and a non-null one refused first; `VK_NULL_HANDLE` is then the
+/// specified no-op; an instance this layer did not issue, or one it has taken back, is a refusal
+/// naming the handle. The specification requires every `VkDevice` and `VkSurfaceKHR` made from
+/// the instance to be destroyed first. The guest-side registries do not record which instance a
+/// device or surface came from, and the host does, so
+/// [`VulkanHost::destroy_instance`](super::VulkanHost::destroy_instance) refuses a live one,
+/// naming it, and the instance is left exactly as it was. This layer creates no debug messenger:
+/// a `pNext` chain on `vkCreateInstance` is refused, and `vkCreateDebugUtilsMessengerEXT` is not
+/// forwarded.
+///
+/// # What goes with it
+///
+/// On success the instance's slot is freed, and so are the guest's `VkPhysicalDevice` handles
+/// the host says went with it: a physical device is enumerated, never destroyed, and its lifetime
+/// is its instance's. A later call with either handle is a refusal naming it --
+/// `vkGetInstanceProcAddr` on the stale instance included, because it looks the handle up in the
+/// same registry before it hands out anything. The thunks handed out earlier stay valid: they are
+/// bound to a name, not to an instance, and each one looks its handles up again when called.
+pub(super) fn destroy_instance(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkDestroyInstance";
+    refuse_allocator(vulkan, at, CALL, args[1])?;
+    let host = vulkan.require_host(at)?;
+    if args[0] == 0 {
+        // The specified no-op. See `swapchain::destroy_swapchain`'s documentation.
+        c.ret().void();
+        return Ok(());
+    }
+    let handle = guest_pointer(at, "instance", args[0])?;
+    let instance = vulkan.instance_token(at, CALL, args[0])?;
+
+    // **The driver's instance first, the guest's handles second**, as every destroy here orders
+    // it: a refusal for a live child leaves the handle naming an instance that still exists.
+    let physical = host.destroy_instance(instance)?;
+    vulkan.forget_instance(handle);
+    vulkan.forget_physical_devices_of(|device| !physical.contains(&device));
+
+    c.ret().void();
+    Ok(())
 }
 
 /// Decode `VkInstanceCreateInfo` out of guest memory, apply the substitution, and record it.
@@ -770,7 +834,8 @@ pub(super) fn unimplemented(
             "the guest called the Vulkan function `{name}` from {caller:#x}, through the thunk \
              `vkGetInstanceProcAddr` handed out for it at {address:#x}. It was passed \
              {registers}. **This is stage 5**: `omni_android::vulkan` forwards the instance \
-             bootstrap (`vkEnumerateInstanceExtensionProperties`, `vkCreateInstance`), the \
+             bootstrap (`vkEnumerateInstanceExtensionProperties`, `vkCreateInstance`) and its end \
+             (`vkDestroyInstance`), the \
              surface substitution (`vkCreateAndroidSurfaceKHR`) and its end \
              (`vkDestroySurfaceKHR`), the ten queries a renderer \
              makes in order to choose a physical device, `vkCreateDevice`, `vkGetDeviceQueue`, \

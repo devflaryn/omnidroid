@@ -1483,6 +1483,39 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
     /// `name` cannot be rendered as a C string.
     fn has_instance_proc(&self, instance: HostInstance, name: &str) -> AbiResult<bool>;
 
+    /// `vkDestroyInstance`, forwarded, **only once every child is gone**.
+    ///
+    /// Measured: the engine's render thread destroys its instance on `APP_CMD_TERM_WINDOW`, after
+    /// its device, and creates a new one when the window comes back.
+    ///
+    /// # Children first, and the implementation is the one that can see them
+    ///
+    /// The specification requires every `VkDevice` and `VkSurfaceKHR` made from the instance to be
+    /// destroyed first (and every debug messenger, which this layer never creates). The guest-side
+    /// registries do not record which instance a device or surface came from; an implementation
+    /// does, so it refuses an instance with live children, **naming each kind with a count and a
+    /// few tokens**, and leaves the instance exactly as it was.
+    ///
+    /// # The physical devices go with it
+    ///
+    /// A `VkPhysicalDevice` is enumerated, never created, and its lifetime is its instance's. The
+    /// answer is the physical-device tokens that went with the instance, so the shim can drop the
+    /// guest's handles for them, as `vkDestroyDevice` drops its queues'. An implementation must
+    /// never hand the instance's token out again. Returns no `VkResult`: the call returns `void`.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when `instance` is not a token this host holds -- an instance already
+    /// destroyed included -- or when a device or surface made from it is still alive.
+    fn destroy_instance(&self, instance: HostInstance) -> AbiResult<Vec<HostPhysicalDevice>> {
+        let _ = instance;
+        Err(host_has_no(
+            "VulkanHost::destroy_instance",
+            "the instance cannot be destroyed, and returning quietly would leave the driver's \
+             instance alive after the engine has let go of it",
+        ))
+    }
+
     // ------------------------------------------------------------------------ stage 3
 
     /// **The call the guest has no host counterpart for.** `vkCreateAndroidSurfaceKHR`, satisfied
@@ -3774,6 +3807,10 @@ mod tests {
 
         let error = host.destroy_device(HostDevice::from_token(0)).expect_err("nor a device gone");
         assert_eq!(error.symbol(), Some("VulkanHost::destroy_device"));
+
+        let error =
+            host.destroy_instance(HostInstance::from_token(0)).expect_err("nor an instance gone");
+        assert_eq!(error.symbol(), Some("VulkanHost::destroy_instance"));
     }
 
     /// The two arms of [`DriverAnswer`] are not the same value, which is the whole of D22's point

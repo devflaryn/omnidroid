@@ -136,7 +136,7 @@ impl RecordingHost {
             surface: "VK_KHR_win32_surface".to_string(),
             fail_create_with,
             driver_has: vec![
-                "vkDestroyInstance".to_string(),
+                "vkCreateDebugUtilsMessengerEXT".to_string(),
                 "vkEnumeratePhysicalDevices".to_string(),
                 "vkCreateWin32SurfaceKHR".to_string(),
             ],
@@ -842,9 +842,10 @@ fn a_loader_with_no_host_refuses_and_names_set_host() {
 
 /// **Calling a returned thunk for an unimplemented function refuses, names it, and quotes what
 /// was passed** -- the measurement stage 1 was built to produce, and still the one that says which
-/// Vulkan function the engine went to next. `vkDestroyInstance`, which the recording driver has
-/// and this layer does not yet serve, obtained the way the engine obtains everything past
-/// bootstrap: through a real instance, from the driver. (When it is served, pick another.)
+/// Vulkan function the engine went to next. `vkCreateDebugUtilsMessengerEXT`, which the recording
+/// driver has and this layer does not serve, obtained the way the engine obtains everything past
+/// bootstrap: through a real instance, from the driver. (When it is served, pick another --
+/// `vkDestroyInstance` was the one here until the engine was measured calling it.)
 #[test]
 fn calling_an_unimplemented_thunk_refuses_by_name_and_quotes_the_arguments() {
     let _serial = serialized();
@@ -856,10 +857,14 @@ fn calling_an_unimplemented_thunk_refuses_by_name_and_quotes_the_arguments() {
     let out = f.alloc(8);
     assert_eq!(f.call(create, [info, 0, out, 0]).expect("create") as i32, VK_SUCCESS);
     let instance = f.guest.read_u64(out as GuestAddr);
-    let dispatch = f.proc_addr(entry_point, instance, "vkDestroyInstance").expect("a lookup");
+    let dispatch =
+        f.proc_addr(entry_point, instance, "vkCreateDebugUtilsMessengerEXT").expect("a lookup");
     assert_ne!(dispatch, 0, "the recording driver has it");
     let text = f.refusal(dispatch, [0x1111, 0x2222, 0x3333, 0]).to_string();
-    assert!(text.contains("vkDestroyInstance"), "the refusal must name the function: {text}");
+    assert!(
+        text.contains("vkCreateDebugUtilsMessengerEXT"),
+        "the refusal must name the function: {text}"
+    );
     assert!(text.contains("x0=0x1111"), "and what the guest passed: {text}");
     assert!(text.contains("x1=0x2222"), "{text}");
     assert!(text.contains("x2=0x3333"), "{text}");
@@ -887,15 +892,16 @@ fn a_real_instance_resolves_through_the_driver_and_still_returns_guest_thunks() 
     let instance = f.guest.read_u64(out as GuestAddr);
 
     // A command the driver has: a **guest** thunk, inside this boundary's thunk region.
-    let destroy = f.proc_addr(entry_point, instance, "vkDestroyInstance").expect("a lookup");
-    assert_ne!(destroy, 0);
+    let messenger =
+        f.proc_addr(entry_point, instance, "vkCreateDebugUtilsMessengerEXT").expect("a lookup");
+    assert_ne!(messenger, 0);
     assert!(
-        f.boundary.symbol_at(destroy as GuestAddr).is_some(),
-        "{destroy:#x} must be a slot in this boundary's own thunk region and not a host address"
+        f.boundary.symbol_at(messenger as GuestAddr).is_some(),
+        "{messenger:#x} must be a slot in this boundary's own thunk region and not a host address"
     );
     assert_eq!(
-        f.vulkan().thunk_for("vkDestroyInstance"),
-        Some(destroy as GuestAddr),
+        f.vulkan().thunk_for("vkCreateDebugUtilsMessengerEXT"),
+        Some(messenger as GuestAddr),
         "and the host side of the map agrees with what the guest was handed"
     );
 
@@ -912,7 +918,7 @@ fn a_real_instance_resolves_through_the_driver_and_still_returns_guest_thunks() 
     assert!(
         answers
             .iter()
-            .any(|(name, answer)| *name == "vkDestroyInstance"
+            .any(|(name, answer)| *name == "vkCreateDebugUtilsMessengerEXT"
                 && matches!(answer, ProcAnswer::Thunk(_))),
         "{answers:?}"
     );
@@ -920,16 +926,16 @@ fn a_real_instance_resolves_through_the_driver_and_still_returns_guest_thunks() 
     assert_eq!(
         host.log().procs_asked,
         vec![
-            (HostInstance::from_token(0), "vkDestroyInstance".to_string()),
+            (HostInstance::from_token(0), "vkCreateDebugUtilsMessengerEXT".to_string()),
             (HostInstance::from_token(0), "vkCreateRayTracingPipelinesKHR".to_string()),
         ]
     );
 
-    // Calling the thunk it handed out still refuses by name: `vkDestroyInstance` is not one of
-    // the commands this layer implements, and the refusal says which stage it is and what that
-    // stage covers.
-    let text = f.refusal(destroy, [instance, 0, 0, 0]).to_string();
-    assert!(text.contains("vkDestroyInstance"), "{text}");
+    // Calling the thunk it handed out still refuses by name: `vkCreateDebugUtilsMessengerEXT` is
+    // not one of the commands this layer implements, and the refusal says which stage it is and
+    // what that stage covers.
+    let text = f.refusal(messenger, [instance, 0, 0, 0]).to_string();
+    assert!(text.contains("vkCreateDebugUtilsMessengerEXT"), "{text}");
     assert!(text.contains("stage 5"), "the refusal names the stage it is: {text}");
     assert!(text.contains("Nothing has been"), "{text}");
 }
@@ -951,15 +957,16 @@ fn a_handle_off_a_registry_slot_boundary_is_refused() {
     let instance = f.guest.read_u64(out as GuestAddr);
 
     for offset in [1u64, 4, 8, 15] {
-        let text = f.refusal(entry_point, [instance + offset, f.cstr("vkDestroyInstance"), 0, 0])
-            .to_string();
+        let name = f.cstr("vkCreateDebugUtilsMessengerEXT");
+        let text = f.refusal(entry_point, [instance + offset, name, 0, 0]).to_string();
         assert!(
             text.contains("not a `VkInstance` this layer issued"),
             "{offset} bytes past a handle must not name it: {text}"
         );
     }
     // And the real handle still works, so the test is not passing because everything refuses.
-    assert_ne!(f.proc_addr(entry_point, instance, "vkDestroyInstance").expect("a lookup"), 0);
+    let name = "vkCreateDebugUtilsMessengerEXT";
+    assert_ne!(f.proc_addr(entry_point, instance, name).expect("a lookup"), 0);
 }
 
 // ============================================================================ the live tests
