@@ -808,6 +808,20 @@ handlers! {
     /// `int pthread_cond_init(pthread_cond_t *c, const pthread_condattr_t *attr)`
     fn pthread_cond_init(c: ptr, attr: ptr) -> i32 = |v| omni_bionic::cond::init(&mut v, c, attr);
 
+    /// `int pthread_condattr_init(pthread_condattr_t *attr)`. MEASURED: the first game join
+    /// killed a guest thread here (2026-09-23), with `omni_bionic::cond::attr_init` already written
+    /// and tested and no line wiring it -- `VERIFICATION.md` entry 16's shape.
+    fn pthread_condattr_init(attr: ptr) -> i32 = |v| omni_bionic::cond::attr_init(&mut v, attr);
+
+    /// `int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock)`: `CLOCK_REALTIME`
+    /// or `CLOCK_MONOTONIC`, `EINVAL` otherwise; `pthread_cond_init` carries it into the cond,
+    /// where `pthread_cond_timedwait` reads it back.
+    fn pthread_condattr_setclock(attr: ptr, clock: i32) -> i32 =
+        |v| omni_bionic::cond::attr_setclock(&mut v, attr, clock);
+
+    /// `int pthread_condattr_destroy(pthread_condattr_t *attr)`
+    fn pthread_condattr_destroy(attr: ptr) -> i32 = |v| omni_bionic::cond::attr_destroy(&mut v, attr);
+
     // ---------------------------------------------------------- C++ runtime
 
     /// `int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle)`
@@ -1723,6 +1737,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("pthread_rwlock_unlock", pthread_rwlock_unlock),
     // pthread cond
     ("pthread_cond_init", pthread_cond_init),
+    ("pthread_condattr_init", pthread_condattr_init),
+    ("pthread_condattr_setclock", pthread_condattr_setclock),
+    ("pthread_condattr_destroy", pthread_condattr_destroy),
     ("pthread_cond_destroy", pthread_cond_destroy),
     ("pthread_cond_signal", pthread_cond_signal),
     ("pthread_cond_broadcast", pthread_cond_broadcast),

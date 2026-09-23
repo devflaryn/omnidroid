@@ -292,6 +292,10 @@ AAUDIO = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "aaudio", "-
 # machine and the answers are reached through `env::evaluate` -- so every row costs a build.
 WEBVIEW = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "jni::webview"]
 
+# The condattr bindings, from guest code: `tests/bionic.rs` filtered to the one test. No APK.
+BIONIC_CONDATTR = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+                   "condattr"]
+
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
 GATE_EXITS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
@@ -7175,6 +7179,19 @@ directory", ADAPTER_FILES,
      """{WEBKIT} (KHTML, like Gecko)  ROBLOX""",
      """{WEBKIT} (KHTML, like Gecko) ROBLOX""",
      WEBVIEW),
+
+    # pthread_condattr_*: the first game join killed a guest thread on `pthread_condattr_init`
+    # (2026-09-23), the primitives in omni_bionic::cond written and tested and never wired.
+    ("condattr-A1", "A", "pthread_condattr_init is unbound again",
+     "crates/omni-android/src/bionic/handlers.rs",
+     """    ("pthread_condattr_init", pthread_condattr_init),""",
+     """""",
+     BIONIC_CONDATTR),
+    ("condattr-B1", "B", "pthread_condattr_setclock answers 0 and writes nothing, so the clock is lost",
+     "crates/omni-android/src/bionic/handlers.rs",
+     """    ("pthread_condattr_setclock", pthread_condattr_setclock),""",
+     """    ("pthread_condattr_setclock", pthread_condattr_destroy),""",
+     BIONIC_CONDATTR),
 ]
 
 

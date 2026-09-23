@@ -13648,3 +13648,66 @@ fn trylock_takes_a_free_mutex_answers_ebusy_for_a_held_one_and_re_enters_a_recur
     let (waits, _) = f.bionic.futex().activity();
     assert_eq!(waits, 0, "a trylock must never enter the futex");
 }
+
+/// **`pthread_condattr_init`, `_setclock` and `_destroy` are bound, and the clock reaches the
+/// cond.** MEASURED why this test exists: the owner's first game join killed a guest thread on
+/// `pthread_condattr_init` (2026-09-23), while `omni_bionic::cond::attr_*` sat written and tested
+/// with no line wiring them to their symbols -- `docs/VERIFICATION.md` entry 16, again.
+///
+/// The clock is the part a binding could get wrong quietly: a `setclock` that returned 0 and wrote
+/// nothing would leave every monotonic cond on the realtime clock. So the cond made from the
+/// monotonic attr is compared with one made from no attr, byte for byte, and they must differ.
+/// A clock bionic does not accept (7) is `EINVAL` and leaves the attr as it was.
+#[test]
+fn condattr_is_bound_and_its_clock_reaches_the_cond() {
+    let _guard = serialized();
+    let f = fixture();
+    let attr = f.guest.data + 0x300;
+    let monotonic = f.guest.data + 0x200;
+    let default = f.guest.data + 0x240;
+    let out = f.guest.data + 0x400;
+    // `init` must write every byte: start from a pattern it has to overwrite.
+    f.guest.write_bytes(attr, &[0xAA; 8]);
+    f.guest.write_bytes(monotonic, &[0u8; 48]);
+    f.guest.write_bytes(default, &[0u8; 48]);
+
+    let entry = program(&f, |asm| {
+        asm.mov(23, out as u64);
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_condattr_init"));
+        asm.push(str_imm(0, 23, 0));
+        asm.mov(0, attr as u64);
+        asm.mov(1, 1); // CLOCK_MONOTONIC
+        asm.bl(f.thunk("pthread_condattr_setclock"));
+        asm.push(str_imm(0, 23, 8));
+        asm.mov(0, attr as u64);
+        asm.mov(1, 7); // CLOCK_BOOTTIME_ALARM: not one bionic takes
+        asm.bl(f.thunk("pthread_condattr_setclock"));
+        asm.push(str_imm(0, 23, 16));
+        asm.mov(0, monotonic as u64);
+        asm.mov(1, attr as u64);
+        asm.bl(f.thunk("pthread_cond_init"));
+        asm.push(str_imm(0, 23, 24));
+        asm.mov(0, default as u64);
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_cond_init"));
+        asm.push(str_imm(0, 23, 32));
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_condattr_destroy"));
+        asm.push(str_imm(0, 23, 40));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+
+    assert_eq!(read_u64_guest(&f, out) as u32, 0, "pthread_condattr_init");
+    assert_eq!(read_u64_guest(&f, out + 8) as u32, 0, "pthread_condattr_setclock(CLOCK_MONOTONIC)");
+    assert_eq!(read_u64_guest(&f, out + 16) as u32, 22, "pthread_condattr_setclock(7) is EINVAL");
+    assert_eq!(read_u64_guest(&f, out + 24) as u32, 0, "pthread_cond_init with the attr");
+    assert_eq!(read_u64_guest(&f, out + 32) as u32, 0, "pthread_cond_init with no attr");
+    assert_eq!(read_u64_guest(&f, out + 40) as u32, 0, "pthread_condattr_destroy");
+    assert_eq!(read_u32_guest(&f, attr), 0, "init cleared the flags word the pattern filled");
+    assert_ne!(
+        read_guest(&f, monotonic, 48),
+        read_guest(&f, default, 48),
+        "a cond made from a CLOCK_MONOTONIC attr is the default realtime cond: the clock was lost"
+    );
+}
