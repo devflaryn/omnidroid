@@ -98,10 +98,8 @@ ROWS = [
      """        if filtered {
             return;
         }
-        let xl = &self.libs.xlib;
-        let mut buffer = vec![0u8; 64];""",
-     """        let xl = &self.libs.xlib;
-        let mut buffer = vec![0u8; 64];""",
+        // SAFETY: the caller matched `KeyPress`, so `key` is the member.""",
+     """        // SAFETY: the caller matched `KeyPress`, so `key` is the member.""",
      LIVE),
     # The raw key read after the input method, which zeroes the keycode of the key that completes
     # a compose sequence: the `e` of `^ e` would never be reported as pressed.
