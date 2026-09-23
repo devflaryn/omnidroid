@@ -207,7 +207,11 @@ ROWS = [
                     self.request_focus();
                 }""",
      """                let _ = self.focus_on_map.take();""",
-     SHARED_LIVE),
+     # Not `SHARED_LIVE`: `window_live.rs` calls `show` twice, and the second call finds the
+     # window viewable and asks for the focus directly -- which is `show`'s other path and hides
+     # this one (the first run of this row reported NOT CAUGHT for exactly that reason). This
+     # file's tests show once and wait for the focus.
+     LIVE),
     # --- close, size, dpi ----------------------------------------------------------------------
     # WM_DELETE_WINDOW not advertised: a manager would kill the connection instead of asking.
     ("lnx-win-A18", "A", "WM_DELETE_WINDOW is not advertised in WM_PROTOCOLS",
