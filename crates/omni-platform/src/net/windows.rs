@@ -57,7 +57,7 @@ use std::time::Duration;
 use windows_sys::Win32::Networking::WinSock::{
     bind as ws_bind, connect as ws_connect, getsockopt, select as ws_select, setsockopt,
     socket as ws_socket, WSAGetLastError, WSAStartup, ADDRESS_FAMILY, AF_INET, AF_INET6, FD_SET,
-    IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPV6_DONTFRAG, IPV6_V6ONLY, IP_DONTFRAGMENT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, SOCKET_ERROR,
+    IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPV6_MTU_DISCOVER, IPV6_V6ONLY, IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_PMTUDISC_DONT, IP_PMTUDISC_NOT_SET, IP_PMTUDISC_PROBE, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, SOCKET_ERROR,
     LINGER, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SO_BROADCAST, SO_ERROR, SO_KEEPALIVE, SO_LINGER,
     SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPINTVL, TIMEVAL,
     WSADATA, WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
@@ -68,7 +68,7 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use super::{
     Buffer, ConnectProgress, Inner, Interest, IpFamily, NetError, NetErrorKind, NetResult,
-    PollEntry, Readiness, SocketAddress,
+    PathMtu, PollEntry, Readiness, SocketAddress,
 };
 
 /// How many sockets one of this backend's sets holds: its `FD_SETSIZE`.
@@ -624,14 +624,46 @@ pub(super) fn set_v6only(inner: &Inner, on: bool) -> NetResult<()> {
     )
 }
 
-/// `setsockopt(IPPROTO_IP, IP_DONTFRAGMENT)` or `setsockopt(IPPROTO_IPV6, IPV6_DONTFRAG)`, by the
-/// socket's family -- see [`SocketOption::DontFragment`](super::SocketOption::DontFragment).
-pub(super) fn set_dont_fragment(inner: &Inner, family: IpFamily, on: bool) -> NetResult<()> {
-    let (level, name, api) = match family {
-        IpFamily::V4 => (IPPROTO_IP, IP_DONTFRAGMENT, "setsockopt(IP_DONTFRAGMENT)"),
-        IpFamily::V6 => (IPPROTO_IPV6, IPV6_DONTFRAG, "setsockopt(IPV6_DONTFRAG)"),
+/// The level and option of path-MTU discovery for a family: `IP_MTU_DISCOVER` or
+/// `IPV6_MTU_DISCOVER`, both 71 in Winsock.
+fn path_mtu_option(family: IpFamily) -> (i32, i32, &'static str) {
+    match family {
+        IpFamily::V4 => (IPPROTO_IP, IP_MTU_DISCOVER, "IP_MTU_DISCOVER"),
+        IpFamily::V6 => (IPPROTO_IPV6, IPV6_MTU_DISCOVER, "IPV6_MTU_DISCOVER"),
+    }
+}
+
+/// `setsockopt(IP_MTU_DISCOVER | IPV6_MTU_DISCOVER)` by the socket's family, in Winsock's
+/// `PMTUD_STATE` numbering -- see
+/// [`SocketOption::PathMtuDiscovery`](super::SocketOption::PathMtuDiscovery). **The numbers are
+/// not Linux's** (`DO` is 1 here and 2 there, `DONT` 2 here and 0 there), which is why the seam
+/// takes a [`PathMtu`] and never a number.
+pub(super) fn set_path_mtu(inner: &Inner, family: IpFamily, mode: PathMtu) -> NetResult<()> {
+    let (level, name, api) = path_mtu_option(family);
+    let value = match mode {
+        PathMtu::Dont => IP_PMTUDISC_DONT,
+        PathMtu::Do => IP_PMTUDISC_DO,
+        PathMtu::Probe => IP_PMTUDISC_PROBE,
     };
-    set_i32(inner, level, name, i32::from(on), "setsockopt", api)
+    set_i32(inner, level, name, value, "setsockopt", api)
+}
+
+/// `getsockopt(IP_MTU_DISCOVER | IPV6_MTU_DISCOVER)`: `None` for `IP_PMTUDISC_NOT_SET`, the host's
+/// default before anything has set a mode.
+pub(super) fn path_mtu(inner: &Inner, family: IpFamily) -> NetResult<Option<PathMtu>> {
+    let (level, name, api) = path_mtu_option(family);
+    match get_i32(inner, level, name, "getsockopt", api)? {
+        IP_PMTUDISC_NOT_SET => Ok(None),
+        IP_PMTUDISC_DONT => Ok(Some(PathMtu::Dont)),
+        IP_PMTUDISC_DO => Ok(Some(PathMtu::Do)),
+        IP_PMTUDISC_PROBE => Ok(Some(PathMtu::Probe)),
+        other => Err(NetError::kinded(
+            "getsockopt",
+            api,
+            NetErrorKind::Other,
+            format!("the host reported path-MTU discovery mode {other}, which is none of NOT_SET, DO, DONT or PROBE"),
+        )),
+    }
 }
 
 /// `setsockopt(SOL_SOCKET, SO_LINGER)`: off, or on with a zero time -- the abortive close. The

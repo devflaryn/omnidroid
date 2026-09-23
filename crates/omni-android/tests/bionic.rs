@@ -4943,9 +4943,29 @@ fn getauxval_refuses_at_hwcap_until_a_host_makes_the_decision() {
     let page = value_of(&f, "getauxval", |asm| { asm.mov(0, 6); });
     assert_eq!(page, f.guest.space.page_size() as u64);
 
+    // `AT_SECURE` is a fact too: 0, nothing raised this process's privilege when it started.
+    // MEASURED reader: OpenSSL's `ossl_safe_getenv`, which died on the refusal as a game join
+    // connected (2026-09-23). A present key, so `errno` is left alone -- bionic's own start-up
+    // clears `errno`, asks for `AT_SECURE`, and aborts if `errno` changed.
+    let entry = program(&f, |asm| {
+        asm.bl(f.thunk("__errno"));
+        asm.mov(22, 77);
+        asm.push(str_w(22, 0, 0));
+        asm.mov(0, 23); // AT_SECURE
+        asm.bl(f.thunk("getauxval"));
+        asm.mov(22, f.guest.data as u64 + 0x400);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(f.guest.data + 0x400), 0, "AT_SECURE");
+    assert_eq!(f.guest.read_u64(f.guest.data + 0x408), 77, "errno untouched: the key is present");
+
     // Everything else refuses by number, rather than returning `getauxval`'s documented 0/ENOENT —
     // which a guest cannot tell apart from a key whose value really is zero.
-    for kind in [23u64 /* AT_SECURE */, 17 /* AT_CLKTCK */, 25 /* AT_RANDOM */, 9999] {
+    for kind in [17u64 /* AT_CLKTCK */, 25 /* AT_RANDOM */, 9999] {
         let error = refusal_of(&f, "getauxval", |asm| { asm.mov(0, kind); });
         assert!(error.to_string().contains(&kind.to_string()), "{error}");
     }
@@ -10121,11 +10141,12 @@ fn getaddrinfo_reports_the_bionic_eai_codes_and_not_the_hosts() {
 /// as never passed -- none of `libroblox.so`'s 50 `setsockopt` call sites loads 10 at
 /// `SOL_SOCKET`. The `SO_KEEPALIVE` end of the story is asserted by *calling* it, in
 /// `the_keep_alive_timing_options_reach_the_socket_in_the_guests_numbering`.
-/// **`IP_MTU_DISCOVER` = `IP_PMTUDISC_DO` sets don't-fragment, as ngtcp2 asks**, and the modes
-/// with no host spelling -- or the other family's level -- are refused by name rather than
-/// reported as a policy nothing applies.
+/// **`IP_MTU_DISCOVER` takes `DO` as ngtcp2 asks, and `PROBE` then `DONT` on one socket as
+/// RakNet's join asks** (`0x5019618`, `0x5019888`; the join's worker died on the `PROBE` refusal,
+/// 2026-09-23), each reaching the host as that mode; the modes with no host spelling, and the other
+/// family's level, are refused by name rather than reported as a policy nothing applies.
 #[test]
-fn path_mtu_discovery_do_is_dont_fragment_and_other_modes_refuse() {
+fn path_mtu_discovery_takes_dont_do_and_probe_and_refuses_the_rest() {
     let _guard = serialized();
     let (f, _root) = networked("setsockopt-pmtud");
     let fd = value_of(&f, "socket", |asm| {
@@ -10145,10 +10166,24 @@ fn path_mtu_discovery_do_is_dont_fragment_and_other_modes_refuse() {
             asm.mov(4, 4);
         }
     };
+    let mode_now = || {
+        let handle = f.bionic.filesystem().expect("a filesystem").socket_at(fd).expect("the socket");
+        let mut socket = handle.lock().expect("the socket's lock");
+        socket.get_option(omni_platform::net::SocketQuery::PathMtuDiscovery).expect("read back")
+    };
+    use omni_platform::net::{OptionValue, PathMtu};
     assert_eq!(value_of(&f, "setsockopt", set(0, 10, 2)) as i32, 0, "IP_PMTUDISC_DO");
+    assert_eq!(mode_now(), OptionValue::PathMtu(Some(PathMtu::Do)));
+    // RakNet's order on one socket: PROBE for the MTU probes, then DONT.
+    assert_eq!(value_of(&f, "setsockopt", set(0, 10, 3)) as i32, 0, "IP_PMTUDISC_PROBE");
+    assert_eq!(mode_now(), OptionValue::PathMtu(Some(PathMtu::Probe)));
     assert_eq!(value_of(&f, "setsockopt", set(0, 10, 0)) as i32, 0, "IP_PMTUDISC_DONT");
-    let error = refusal_of(&f, "setsockopt", set(0, 10, 1));
-    assert!(error.to_string().contains("IP_MTU_DISCOVER"), "WANT has no host spelling: {error}");
+    assert_eq!(mode_now(), OptionValue::PathMtu(Some(PathMtu::Dont)));
+    for (mode, name) in [(1, "WANT"), (4, "INTERFACE"), (5, "OMIT")] {
+        let error = refusal_of(&f, "setsockopt", set(0, 10, mode));
+        let text = error.to_string();
+        assert!(text.contains("IP_MTU_DISCOVER") && text.contains(name), "{name} has no host mode: {text}");
+    }
     let error = refusal_of(&f, "setsockopt", set(41, 23, 2));
     assert!(error.to_string().contains("IPV6_MTU_DISCOVER"), "the other family's level: {error}");
     // UDP_GRO is accepted on a datagram socket; UDP_SEGMENT (103) still refuses.

@@ -442,16 +442,21 @@ pub enum SocketOption {
     ///
     /// Refused by name on an IPv4 socket, where the option does not exist.
     V6Only(bool),
-    /// Whether the socket's datagrams carry **don't-fragment**, at the IP level of the socket's
-    /// own family: Linux's `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` set to `IP_PMTUDISC_DO` (`true`)
-    /// or `IP_PMTUDISC_DONT` (`false`), and Windows' `IP_DONTFRAGMENT`/`IPV6_DONTFRAG`.
+    /// Path-MTU discovery, at the IP level of the socket's own family: Linux's
+    /// `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER`, and **Windows' options of the same names** (71 at
+    /// either level), whose `PMTUD_STATE` modes are Linux's: `DO` sets don't-fragment and holds
+    /// sends to the path MTU, `DONT` never sets it, `PROBE` sets it and ignores the path MTU. See
+    /// [`PathMtu`]. Linux's `WANT`, `INTERFACE` and `OMIT` have no Windows mode and are refused by
+    /// name above this seam.
     ///
-    /// `DO` and the Windows option agree on what a caller can see: the bit is set, nothing is
-    /// fragmented locally, and a datagram larger than the path allows fails its send with
-    /// `EMSGSIZE`. Linux's other modes (`WANT`, `PROBE`, `INTERFACE`, `OMIT`) have no Windows
-    /// spelling and are not carried -- a caller asking for one is refused by name above this seam.
-    /// MEASURED reader: ngtcp2, the engine's QUIC transport, which needs DF for its path-MTU probing.
-    DontFragment(bool),
+    /// **Windows' `IP_DONTFRAGMENT` is not used, and must not be mixed in.** MEASURED on
+    /// 10.0.26200: once a socket has had either `IP_DONTFRAGMENT` or `IP_MTU_DISCOVER` set, setting
+    /// the other fails `WSAEINVAL`. This variant was `DontFragment(bool)` over `IP_DONTFRAGMENT`
+    /// until RakNet's join asked for `PROBE` and then `DONT` on one socket (2026-09-23); `DO` is
+    /// the same don't-fragment either way (`IP_DONTFRAGMENT` reads 1 after it, 0 after `DONT`).
+    /// MEASURED readers: ngtcp2, the engine's QUIC transport (`DO`), and RakNet's
+    /// "setsockopt don't frag" (`0x502a7c8`: `PROBE` for its MTU probes, then `DONT`).
+    PathMtuDiscovery(PathMtu),
     /// `SO_LINGER`: what `close` does with data still unsent. `None` is off -- the close returns
     /// at once and the stack sends what is queued in the background, the default -- and
     /// `Some(ZERO)` is the abortive close, a reset with the queue discarded.
@@ -477,6 +482,19 @@ pub enum SocketOption {
     /// stream one (`WSAENOPROTOOPT`, MEASURED). MEASURED reader: the same game-socket setup,
     /// which sets it on right after `SO_LINGER`.
     Broadcast(bool),
+}
+
+/// A path-MTU discovery mode: the ones Linux and Windows both have, by the same names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathMtu {
+    /// `IP_PMTUDISC_DONT`: never set don't-fragment; the stack fragments as it needs to.
+    Dont,
+    /// `IP_PMTUDISC_DO`: set don't-fragment and hold sends to the discovered path MTU -- one
+    /// larger fails with `EMSGSIZE`.
+    Do,
+    /// `IP_PMTUDISC_PROBE`: set don't-fragment and ignore the path MTU, so a datagram up to the
+    /// interface's MTU goes out -- what a caller probing the path's size needs.
+    Probe,
 }
 
 /// The options Linux accepts on a socket kind they do nothing to and Winsock refuses there: kept
@@ -546,6 +564,9 @@ pub enum SocketQuery {
     Linger,
     /// `SO_BROADCAST`. Answers [`OptionValue::Flag`].
     Broadcast,
+    /// `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` by the socket's family. Answers
+    /// [`OptionValue::PathMtu`].
+    PathMtuDiscovery,
 }
 
 /// What a [`SocketQuery`] answered.
@@ -571,6 +592,9 @@ pub enum OptionValue {
     Count(u32),
     /// The answer to [`SocketQuery::Linger`]: `None` when lingering is off.
     Linger(Option<Duration>),
+    /// The answer to [`SocketQuery::PathMtuDiscovery`]: `None` while the socket has the host's
+    /// default (Windows' `IP_PMTUDISC_NOT_SET`), which is none of the three modes.
+    PathMtu(Option<PathMtu>),
 }
 
 /// Which of the two buffer options a backend call is about.
@@ -1119,8 +1143,8 @@ impl Socket {
                 self.require_v6(OP)?;
                 backend::set_v6only(&self.inner, on)
             }
-            SocketOption::DontFragment(on) => {
-                backend::set_dont_fragment(&self.inner, self.family, on)
+            SocketOption::PathMtuDiscovery(mode) => {
+                backend::set_path_mtu(&self.inner, self.family, mode)
             }
             SocketOption::Linger(linger) => match &self.inner {
                 Inner::Tcp(_) => match linger {
@@ -1228,6 +1252,9 @@ impl Socket {
                 Inner::Udp(_) => backend::broadcast(&self.inner).map(OptionValue::Flag),
                 Inner::Tcp(_) => Ok(OptionValue::Flag(self.kept.broadcast)),
             },
+            SocketQuery::PathMtuDiscovery => {
+                backend::path_mtu(&self.inner, self.family).map(OptionValue::PathMtu)
+            }
         }
     }
 

@@ -311,6 +311,12 @@ BIONIC_LINGER = ["cargo", "test", "-p", "omni-android", "--release", "--test", "
                  "linger"]
 PLAT_LINGER = ["cargo", "test", "-p", "omni-platform", "--release", "--test", "net_loopback", "--no-fail-fast",
                "linger"]
+BIONIC_PMTU = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+               "path_mtu"]
+PLAT_PMTU = ["cargo", "test", "-p", "omni-platform", "--release", "--test", "net_loopback", "--no-fail-fast",
+             "path_mtu"]
+BIONIC_AUXV = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+               "getauxval"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7433,6 +7439,44 @@ directory", ADAPTER_FILES,
                     Ok(())
                 }""",
      PLAT_LINGER),
+
+    # Path-MTU discovery by mode, and AT_SECURE: what RakNet's join reached (2026-09-23).
+    ("pmtu-A1", "A", "IP_PMTUDISC_PROBE is refused again (the death)",
+     "crates/omni-android/src/bionic/net.rs",
+     """                    Some(IP_PMTUDISC_PROBE) => Some(SocketOption::PathMtuDiscovery(PathMtu::Probe)),""",
+     """                    Some(99) => Some(SocketOption::PathMtuDiscovery(PathMtu::Probe)),""",
+     BIONIC_PMTU),
+    ("pmtu-A2", "A", "PROBE reaches Windows as DO",
+     "crates/omni-platform/src/net/windows.rs",
+     """        PathMtu::Probe => IP_PMTUDISC_PROBE,""",
+     """        PathMtu::Probe => IP_PMTUDISC_DO,""",
+     PLAT_PMTU),
+    ("pmtu-B1", "B", "the guest's IP_PMTUDISC_DONT becomes DO",
+     "crates/omni-android/src/bionic/net.rs",
+     """                    Some(IP_PMTUDISC_DONT) => Some(SocketOption::PathMtuDiscovery(PathMtu::Dont)),""",
+     """                    Some(IP_PMTUDISC_DONT) => Some(SocketOption::PathMtuDiscovery(PathMtu::Do)),""",
+     BIONIC_PMTU),
+    ("pmtu-B2", "B", "the host's NOT_SET default reads back as DONT",
+     "crates/omni-platform/src/net/windows.rs",
+     """        IP_PMTUDISC_NOT_SET => Ok(None),""",
+     """        IP_PMTUDISC_NOT_SET => Ok(Some(PathMtu::Dont)),""",
+     PLAT_PMTU),
+    ("pmtu-B3", "B", "the other family's level is accepted and applied at the socket's own",
+     "crates/omni-android/src/bionic/net.rs",
+     """                    Some(mode) if !family_matches => {""",
+     """                    Some(mode) if false && !family_matches => {""",
+     BIONIC_PMTU),
+    ("atsecure-A1", "A", "AT_SECURE answers 1: a privileged-exec claim nothing made",
+     "crates/omni-android/src/bionic/procenv.rs",
+     """        AT_SECURE => 0,""",
+     """        AT_SECURE => 1,""",
+     BIONIC_AUXV),
+    ("atsecure-A2", "A", "AT_SECURE is refused again (the death)",
+     "crates/omni-android/src/bionic/procenv.rs",
+     """        AT_SECURE => 0,
+""",
+     """""",
+     BIONIC_AUXV),
 ]
 
 

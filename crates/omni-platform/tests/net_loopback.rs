@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use omni_platform::net::{
     poll, ConnectOutcome, ConnectProgress, Interest, IpFamily, NetError, NetErrorKind, NetPolicy,
-    OptionValue, PollEntry, Shutdown, Socket, SocketAddress, SocketKind, SocketOption,
+    OptionValue, PathMtu, PollEntry, Shutdown, Socket, SocketAddress, SocketKind, SocketOption,
     SocketQuery, MAX_POLL_SOCKETS,
 };
 
@@ -466,6 +466,26 @@ fn an_abortive_linger_resets_the_peer_where_the_default_close_ends_its_stream() 
             assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset, "{err}");
         } else {
             assert_eq!(read.expect("the default close"), 0, "end of file");
+        }
+    }
+}
+
+/// **Path-MTU discovery takes `DONT`, `DO` and `PROBE` in any order on one socket, and the host
+/// reads each back**, both families. MEASURED why: RakNet's join sets `PROBE` for its MTU probes
+/// and then `DONT` on the same socket (2026-09-23). Under the old mapping onto Windows'
+/// `IP_DONTFRAGMENT` `PROBE` had no spelling, and Windows refuses (`WSAEINVAL`, MEASURED) to mix
+/// `IP_DONTFRAGMENT` and `IP_MTU_DISCOVER` on one socket -- so every mode has to be the latter.
+#[test]
+fn path_mtu_discovery_takes_every_mode_in_any_order_on_one_socket() {
+    for family in [IpFamily::V4, IpFamily::V6] {
+        let mut datagram = socket(SocketKind::Datagram, family);
+        let mode = |s: &mut Socket| s.get_option(SocketQuery::PathMtuDiscovery).expect("read back");
+        assert_eq!(mode(&mut datagram), OptionValue::PathMtu(None), "{family}: the host's default");
+        for want in [PathMtu::Probe, PathMtu::Dont, PathMtu::Do, PathMtu::Probe, PathMtu::Dont] {
+            datagram
+                .set_option(SocketOption::PathMtuDiscovery(want))
+                .unwrap_or_else(|e| panic!("{family} {want:?}: {e}"));
+            assert_eq!(mode(&mut datagram), OptionValue::PathMtu(Some(want)), "{family}");
         }
     }
 }

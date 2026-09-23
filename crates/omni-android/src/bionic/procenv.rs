@@ -129,6 +129,9 @@ const AT_PAGESZ: u64 = 6;
 const AT_HWCAP: u64 = 16;
 /// `AT_HWCAP2`: the second word.
 const AT_HWCAP2: u64 = 26;
+/// `AT_SECURE`: whether the kernel ran this program in secure mode -- set when an exec changed
+/// its credentials (a setuid or setgid binary, or an LSM transition that asked for it).
+const AT_SECURE: u64 = 23;
 
 /// `HWCAP_ATOMICS`, bit 8 of `AT_HWCAP` on AArch64: the **LSE** atomic instructions.
 ///
@@ -608,7 +611,18 @@ pub(super) fn system_property_get(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// `AT_PAGESZ` is answered from the guest address space's own page size, which is the granularity
 /// its `mmap` really operates at. `AT_HWCAP` and `AT_HWCAP2` follow the instance's
 /// [`HwcapPolicy`] and **refuse under the default**; see the module documentation, which is where
-/// the open decision is written down. Every other `type` is refused by number.
+/// the open decision is written down. `AT_SECURE` is `0`, below. Every other `type` is refused by
+/// number.
+///
+/// **`AT_SECURE` is 0 because nothing raised this process's privilege when it started, which is
+/// true of this host.** The kernel sets it when an exec changes credentials -- a setuid or setgid
+/// binary -- and Windows has no such exec: this process runs with the credentials of whoever
+/// launched it. It is also what the guest's own kind of process sees: an app process is forked
+/// from the zygote and drops to the app's uid with `setuid(2)`, not by exec, so no exec gave it
+/// secure mode. MEASURED reader: OpenSSL's `ossl_safe_getenv` (`0x29faaa8`), which asks
+/// `OPENSSL_issetugid` (`0x2a1d478`: `getauxval(AT_SECURE) != 0`) before reading a variable; a
+/// worker died on the refusal as the game join connected (2026-09-23). With 0 it goes on to
+/// `getenv`, which answers only what the embedding supplied.
 ///
 /// `getauxval`'s documented answer for a type it does not have is `0` with `errno = ENOENT`, and
 /// that is exactly the answer not given here. `AT_SECURE` answered 0 means "not a privileged
@@ -620,6 +634,7 @@ pub(super) fn getauxval(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let state = active(c.symbol(), c.address())?;
     let value = match kind {
         AT_PAGESZ => state.bionic.space_page_size() as u64,
+        AT_SECURE => 0,
         AT_HWCAP | AT_HWCAP2 => match state.bionic.hwcap_policy() {
             HwcapPolicy::Undecided => {
                 return Err(refuse(
@@ -651,8 +666,8 @@ pub(super) fn getauxval(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 c,
                 format!(
                     "the guest asked for auxiliary vector entry {other}. This layer supplies \
-                     AT_PAGESZ ({AT_PAGESZ}), AT_HWCAP ({AT_HWCAP}) and AT_HWCAP2 ({AT_HWCAP2}) \
-                     and nothing else — there is no real auxv here, because there was no kernel \
+                     AT_PAGESZ ({AT_PAGESZ}), AT_SECURE ({AT_SECURE}), AT_HWCAP ({AT_HWCAP}) and \
+                     AT_HWCAP2 ({AT_HWCAP2}) and nothing else — there is no real auxv here, because there was no kernel \
                      exec to build one. `getauxval` answers an absent key with 0 and ENOENT, and \
                      that is precisely the answer withheld: a guest cannot tell a 0 that means \
                      \"absent\" from a 0 that means \"zero\""

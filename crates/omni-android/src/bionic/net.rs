@@ -160,7 +160,7 @@ use omni_platform::fs::{
 use omni_platform::net as platnet;
 use omni_platform::net::{
     ConnectOutcome, ConnectProgress, Interest, IpFamily, NetError, NetErrorKind, NetPolicy,
-    OptionValue, PollEntry, ResolveFailure, Shutdown, Socket, SocketAddress, SocketKind,
+    OptionValue, PathMtu, PollEntry, ResolveFailure, Shutdown, Socket, SocketAddress, SocketKind,
     SocketOption, SocketQuery,
 };
 
@@ -1645,9 +1645,11 @@ const IP_PMTUDISC_DONT: i32 = 0;
 const UDP_GRO: i32 = 104;
 /// Linux's `UDP_SEGMENT` (`linux/udp.h`): a send's GSO segment size, a `__u16`.
 const UDP_SEGMENT: i32 = 103;
-/// `IP_PMTUDISC_DO`: always set don't-fragment. `WANT` (1), `PROBE` (3), `INTERFACE` (4) and `OMIT`
-/// (5) have no Windows spelling and are refused -- see `SocketOption::DontFragment`.
+/// `IP_PMTUDISC_DO`: always set don't-fragment. `WANT` (1), `INTERFACE` (4) and `OMIT` (5) have no
+/// Windows mode and are refused -- see `SocketOption::PathMtuDiscovery`.
 const IP_PMTUDISC_DO: i32 = 2;
+/// `IP_PMTUDISC_PROBE`: set don't-fragment and ignore the path MTU.
+const IP_PMTUDISC_PROBE: i32 = 3;
 
 /// `SHUT_RD`, `SHUT_WR`, `SHUT_RDWR`.
 const SHUT_RD: i32 = 0;
@@ -2685,11 +2687,14 @@ pub(super) fn setsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 u32::try_from(count).ok().filter(|c| *c > 0).map(SocketOption::KeepAliveCount)
             }),
             (IPPROTO_IPV6, IPV6_V6ONLY) => int_option(4)?.map(|on| SocketOption::V6Only(on != 0)),
-            // **Path-MTU discovery, carried as the don't-fragment bit it controls.** MEASURED
-            // reader: ngtcp2, the engine's QUIC transport, setting `IP_PMTUDISC_DO` on IPv4 and
-            // `IPV6_MTU_DISCOVER` = `DO` on IPv6 by the socket's family. The level must be the
-            // socket's own family's: the host option is per family, and an IPv4-level option on
-            // an IPv6 socket (which Linux applies to mapped traffic) has no spelling there.
+            // **Path-MTU discovery, by mode: `DONT`, `DO` and `PROBE`**, which the host has under
+            // the same names (`omni_platform::net::PathMtu`). MEASURED readers: ngtcp2, the
+            // engine's QUIC transport, setting `DO` by the socket's family; and RakNet's game
+            // join, `PROBE` for its MTU probes and then `DONT` on the same socket (`0x5019618`,
+            // `0x5019888`), whose worker died on the `PROBE` refusal (2026-09-23). The level must
+            // be the socket's own family's: the host option is per family, and an IPv4-level
+            // option on an IPv6 socket (which Linux applies to mapped traffic) has no spelling
+            // there.
             // **`UDP_GRO` is accepted and never coalesces anything, which is Linux's own
             // behaviour whenever no aggregation happens.** GRO is opportunistic: with it on, a
             // Linux socket still delivers plain datagrams -- and no `UDP_GRO` control message --
@@ -2721,17 +2726,28 @@ pub(super) fn setsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 };
                 match int_option(4)? {
                     None => None,
-                    Some(mode) if !family_matches || (mode != IP_PMTUDISC_DO && mode != IP_PMTUDISC_DONT) => {
+                    Some(mode) if !family_matches => {
                         return Err(view.refusal(format!(
                             "the guest called setsockopt(fd {fd}, {}) with mode {mode} on a socket \
-                             of the other family, or with a mode other than IP_PMTUDISC_DO (2) or \
-                             IP_PMTUDISC_DONT (0). Only those two have a host spelling -- the \
-                             don't-fragment option of the socket's own family -- and accepting \
-                             another would report a path-MTU policy nothing applies",
+                             of the other family. The host's option is per family, and an \
+                             IPv4-level option on an IPv6 socket -- which Linux applies to mapped \
+                             traffic -- has no spelling there",
                             option_name(level, name)
                         )))
                     }
-                    Some(mode) => Some(SocketOption::DontFragment(mode == IP_PMTUDISC_DO)),
+                    Some(IP_PMTUDISC_DONT) => Some(SocketOption::PathMtuDiscovery(PathMtu::Dont)),
+                    Some(IP_PMTUDISC_DO) => Some(SocketOption::PathMtuDiscovery(PathMtu::Do)),
+                    Some(IP_PMTUDISC_PROBE) => Some(SocketOption::PathMtuDiscovery(PathMtu::Probe)),
+                    Some(mode) => {
+                        return Err(view.refusal(format!(
+                            "the guest called setsockopt(fd {fd}, {}) with mode {mode}. \
+                             IP_PMTUDISC_DONT (0), _DO (2) and _PROBE (3) are implemented -- the \
+                             host has the same three -- and WANT (1), INTERFACE (4) and OMIT (5) \
+                             have no host mode; accepting one would report a path-MTU policy \
+                             nothing applies",
+                            option_name(level, name)
+                        )))
+                    }
                 }
             }
             (SOL_SOCKET, SO_RCVBUF) => int_option(4)?.and_then(|bytes| {

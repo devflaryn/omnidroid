@@ -75,7 +75,7 @@ use std::time::Duration;
 
 use super::address::{IpFamily, SocketAddress};
 use super::error::{NetError, NetErrorKind, NetResult};
-use super::{Buffer, ConnectProgress, Inner, PollEntry};
+use super::{Buffer, ConnectProgress, Inner, PathMtu, PollEntry};
 
 /// The platform this backend was compiled for, for error messages.
 fn platform() -> &'static str {
@@ -302,11 +302,19 @@ pub(super) fn set_broadcast(inner: &Inner, on: bool) -> NetResult<()> {
     unsupported("setsockopt", "setsockopt(2) with SOL_SOCKET/SO_BROADCAST")
 }
 
-/// Intended: `setsockopt(2)` with `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` = `IP_PMTUDISC_DO` or
-/// `IP_PMTUDISC_DONT`, by family.
-pub(super) fn set_dont_fragment(inner: &Inner, family: IpFamily, on: bool) -> NetResult<()> {
-    let _ = (inner, family, on);
+/// Intended: `setsockopt(2)` with `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` = `IP_PMTUDISC_DONT`,
+/// `_DO` or `_PROBE` (0, 2, 3 -- Linux's numbers), by family.
+pub(super) fn set_path_mtu(inner: &Inner, family: IpFamily, mode: PathMtu) -> NetResult<()> {
+    let _ = (inner, family, mode);
     unsupported("setsockopt", "setsockopt(2) with IP_MTU_DISCOVER/IPV6_MTU_DISCOVER")
+}
+
+/// Intended: `getsockopt(2)` with `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER`, by family. Linux has no
+/// "not set": a fresh socket reads `IP_PMTUDISC_WANT` (1), which is none of the three [`PathMtu`]
+/// modes and would answer `None`.
+pub(super) fn path_mtu(inner: &Inner, family: IpFamily) -> NetResult<Option<PathMtu>> {
+    let _ = (inner, family);
+    unsupported("getsockopt", "getsockopt(2) with IP_MTU_DISCOVER/IPV6_MTU_DISCOVER")
 }
 
 /// Intended: `poll(2)`.
