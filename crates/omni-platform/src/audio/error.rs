@@ -104,6 +104,27 @@ pub enum AudioError {
         bits: u16,
     },
 
+    /// An ALSA call failed (the Linux backend, `src/audio/linux.rs`).
+    ///
+    /// Its own variant rather than [`AudioError::Os`], whose `code` is an `HRESULT` and prints as
+    /// one: ALSA reports a negative errno, and `0xffffffe0` is not how anyone searches for
+    /// `EPIPE`. `errno` is the positive value (`32` for `EPIPE`) and `description` is
+    /// `snd_strerror`'s text for it, which also covers ALSA's own codes above the errno range.
+    /// An xrun (`EPIPE`) or a suspend (`ESTRPIPE`) that the backend recovered from never becomes
+    /// this error -- it is counted instead -- so seeing one of those here means the recovery
+    /// itself failed, and `api` names the recovery call.
+    #[error("`{operation}`: {api} failed with errno {errno} ({description})")]
+    Alsa {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The ALSA entry point that failed, e.g. `"snd_pcm_writei"`.
+        api: &'static str,
+        /// The errno, positive.
+        errno: i32,
+        /// `snd_strerror`'s text for it.
+        description: String,
+    },
+
     /// A write was larger than the free space in the host buffer.
     ///
     /// **Nothing was written.** Writing the part that fits and dropping the rest would be a silent
