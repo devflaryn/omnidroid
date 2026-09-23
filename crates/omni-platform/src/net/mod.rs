@@ -34,6 +34,8 @@
 //! | [`resolve`] | `std::net::ToSocketAddrs` | **implemented** — portable `std`; see [`resolve`] for the one gap in its *classification* |
 //! | [`Socket::new`] | **backend**: `socket(2)` | **`Unsupported`**, naming `socket(2)` |
 //! | [`connect`](Socket::connect), [`bind`](Socket::bind) | **backend**: `connect(2)`, `bind(2)` | **`Unsupported`** |
+//! | [`listen`](Socket::listen), [`accept`](Socket::accept) | **backend**: `listen(2)`, `accept(2)`; `listen` asks [`NetPolicy::check_listen`] | **`Unsupported`** |
+//! | [`interface_addresses`] | **backend**: `GetAdaptersAddresses` on Windows | **`Unsupported`**, naming `getifaddrs(3)` |
 //! | `SO_ERROR`, `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_RCVBUF`, `SO_SNDBUF`, `IPV6_V6ONLY` | **backend**: `getsockopt`/`setsockopt` | **`Unsupported`** |
 //! | `SO_LINGER` on a stream, `SO_BROADCAST` on a datagram socket; each kept on the other kind | **backend**, and this crate's own record where Winsock refuses what Linux keeps | **`Unsupported`** |
 //! | the three keep-alive *timing* options | **backend**: `getsockopt`/`setsockopt`, **and the option numbers differ between hosts** — see [`SocketOption::KeepAliveIdle`] | **`Unsupported`** |
@@ -83,11 +85,14 @@
 //! `libroblox.so` imports about thirty network symbols. **Importing is not calling** (D17), and
 //! the rule that has held all session holds here: a primitive is built when a run has reached it,
 //! and `Bionic::guest_thread_failures()` now names anything missing on the first run that hits it.
-//! So this seam is a TCP and UDP **client** and nothing else:
+//! So this seam is a TCP and UDP **client**, and a TCP **listener** since a run reached one:
 //!
-//! * **No `listen`, `accept`, `accept4` or `socketpair`.** Nothing here can receive an incoming
-//!   connection. A caller gets no function to call: the refusal is the absence of a name rather
-//!   than a stub that fails, and the adapter above refuses the guest symbol by name.
+//! * **`listen` and `accept` exist since 2026-09-23**, when the engine's MicroProfiler web server
+//!   bound `0.0.0.0:1338`, called `listen` and died on it -- and a TaskScheduler worker beside it,
+//!   and the game froze. `listen` is the one socket call the policy is asked about for the local
+//!   end ([`NetPolicy::check_listen`]): it is what turns a bound socket into an inbound path.
+//! * **No `accept4` or `socketpair`.** Nothing has reached them (the MicroProfiler calls plain
+//!   `accept`); the adapter above refuses each guest symbol by name.
 //! * **No `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`.** Scatter/gather and control messages have
 //!   no portable `std` spelling and nothing has reached them. A guest that needs one is a guest
 //!   whose message the adapter must refuse by name — and the day that happens, the missing work is
@@ -675,6 +680,9 @@ pub struct Socket {
     pending_error: Option<NetErrorKind>,
     /// What this socket keeps of the options the host refuses on its kind. See [`Kept`].
     kept: Kept,
+    /// Whether [`listen`](Socket::listen) has succeeded on this socket. See
+    /// [`listening`](Socket::listening).
+    listening: bool,
     /// This socket's identity in [`record`], handed out at creation whether or not anything is
     /// recording.
     ///
@@ -712,6 +720,7 @@ impl Socket {
             named: false,
             pending_error: None,
             kept: Kept::default(),
+            listening: false,
             record: record::next_id(),
         })
     }
@@ -768,9 +777,9 @@ impl Socket {
     /// *destination* policy — which network this instance may reach — and a local address is not a
     /// destination. What a bind does open is an inbound path: a datagram socket bound to the
     /// wildcard address receives from anyone who can route to this host. That is a different
-    /// question from the one the policy answers, this seam has no `listen` and no `accept` so a
-    /// stream socket cannot accept anything regardless, and the limit is written down here rather
-    /// than left for somebody to assume the policy covers it.
+    /// question from the one the policy answers, and the limit is written down here rather than
+    /// left for somebody to assume the policy covers it. For a **stream** socket the inbound path
+    /// opens at [`listen`](Self::listen), and that is where the policy is asked.
     ///
     /// # Errors
     ///
@@ -782,6 +791,110 @@ impl Socket {
         backend::bind(&self.inner, address)?;
         self.named = true;
         Ok(())
+    }
+
+    /// Accept connections on a bound stream socket: `listen(2)`.
+    ///
+    /// **The one call the policy is asked about for the local end** ([`NetPolicy::check_listen`]),
+    /// with the address the host actually bound -- so a bind to port 0, or to the wildcard, is
+    /// judged on what it is. A socket that was never bound is bound by the host to the wildcard
+    /// address and an ephemeral port, as Linux does, and is judged as that.
+    ///
+    /// # Errors
+    ///
+    /// * [`NetError::Refused`] on a datagram socket: `EOPNOTSUPP` on a device, a caller's
+    ///   question the adapter answers before it gets here.
+    /// * [`NetError::Policy`] when the embedding has not admitted listening on that address.
+    /// * [`NetError::Io`] when the host refuses; [`NetError::Unsupported`] on Linux and macOS.
+    pub fn listen(&mut self, backlog: i32) -> NetResult<()> {
+        const OP: &str = "listen";
+        if self.kind != SocketKind::Stream {
+            return Err(NetError::refused(
+                OP,
+                self.describe(),
+                "listen is a stream-socket call; a datagram socket has no connections to accept \
+                 (a device answers EOPNOTSUPP, which the adapter owes the guest)",
+            ));
+        }
+        let local = self.bound_or_wildcard(OP)?;
+        self.policy.check_listen(OP, &local)?;
+        backend::listen(&self.inner, backlog)?;
+        self.named = true;
+        self.listening = true;
+        Ok(())
+    }
+
+    /// Whether this socket is listening: a [`listen`](Self::listen) on it has succeeded.
+    ///
+    /// **What a caller needs before waiting for a connection.** A listening socket is readable
+    /// when one is pending; a socket that is not listening never becomes readable that way, and
+    /// `accept` on it is an immediate `EINVAL` -- so a caller that waited for readability first
+    /// would wait for ever on a mistake the host answers at once.
+    #[must_use]
+    pub fn listening(&self) -> bool {
+        self.listening
+    }
+
+    /// Take one pending connection off a listening stream socket: `accept(2)`.
+    ///
+    /// **Blocks the calling thread** when this socket is blocking and nothing is pending, as the
+    /// host's call does; a caller that must stay interruptible waits for readability with
+    /// [`poll`] first (a listening socket is readable when a connection is pending). On a
+    /// non-blocking socket with nothing pending it is [`NetErrorKind::WouldBlock`].
+    ///
+    /// The new socket is **blocking**, whatever this one is: Linux's `accept` does not pass
+    /// `O_NONBLOCK` on (accept(2): "file status flags such as O_NONBLOCK ... are not inherited"),
+    /// where Winsock's accepted socket inherits the listener's mode -- so it is set here rather than
+    /// left as the host made it. It carries this socket's policy and family, and it is connected:
+    /// [`peer_address`](Self::peer_address) answers the peer this returns.
+    ///
+    /// # Errors
+    ///
+    /// * [`NetError::Refused`] on a datagram socket (`EOPNOTSUPP` on a device).
+    /// * [`NetError::Io`]: [`NetErrorKind::InvalidInput`] when this socket is not listening (Linux's
+    ///   `EINVAL`), [`NetErrorKind::WouldBlock`], or the host's own failure.
+    /// * [`NetError::Unsupported`] on Linux and macOS.
+    pub fn accept(&self) -> NetResult<(Socket, SocketAddress)> {
+        const OP: &str = "accept";
+        if self.kind != SocketKind::Stream {
+            return Err(NetError::refused(
+                OP,
+                self.describe(),
+                "accept is a stream-socket call; a datagram socket has no connections (a device \
+                 answers EOPNOTSUPP, which the adapter owes the guest)",
+            ));
+        }
+        let (stream, peer) = backend::accept(&self.inner)?;
+        stream.set_nonblocking(false).map_err(|error| NetError::io(OP, peer.to_string(), &error))?;
+        let accepted = Socket {
+            inner: Inner::Tcp(stream),
+            kind: SocketKind::Stream,
+            family: self.family,
+            nonblocking: false,
+            policy: Arc::clone(&self.policy),
+            connect: ConnectState::None,
+            named: true,
+            pending_error: None,
+            kept: Kept::default(),
+            listening: false,
+            record: record::next_id(),
+        };
+        Ok((accepted, peer))
+    }
+
+    /// The address a `listen` is judged on: the host's own report of the bound address, or -- for
+    /// a socket nothing has bound, which `listen` binds to the wildcard and an ephemeral port --
+    /// the wildcard address of this socket's family.
+    fn bound_or_wildcard(&self, operation: &'static str) -> NetResult<SocketAddress> {
+        if !self.named {
+            return Ok(SocketAddress::unspecified(self.family));
+        }
+        self.local_address().map_err(|error| match error {
+            NetError::Io { kind, detail, .. } => {
+                NetError::kinded(operation, self.describe(), kind, detail)
+            }
+            other => other,
+        })
     }
 
     /// Start connecting: `connect(2)`.
@@ -1473,6 +1586,26 @@ pub fn poll(entries: &mut [PollEntry<'_>], timeout: Duration) -> NetResult<usize
         ));
     }
     backend::poll(entries, timeout)
+}
+
+/// Every unicast address the host's network interfaces hold, interface by interface in the
+/// host's own order: the list `NetworkInterface.getNetworkInterfaces()` and then
+/// `getInetAddresses()` walk on a device.
+///
+/// **All of them, and nothing chosen**: loopback, link-local and IPv6 included, of interfaces up
+/// or down -- a Java `NetworkInterface` lists every interface with its configured addresses, and
+/// what a reader keeps is the reader's decision. The first reader is the Java side's
+/// `NetworkUtils.getPublicIPv4Addresseses` (DECODED in `omni_android::jni`), which drops loopback
+/// and anything written with a colon. MEASURED why it exists: the engine's MicroProfiler asked it
+/// for the addresses its web server can be reached on, and the TaskScheduler worker that asked
+/// died on the refusal, freezing the game (2026-09-23).
+///
+/// # Errors
+///
+/// [`NetError::Io`] when the host's enumeration fails, and [`NetError::Unsupported`] on Linux and
+/// macOS, naming `getifaddrs(3)`.
+pub fn interface_addresses() -> NetResult<Vec<std::net::IpAddr>> {
+    backend::interface_addresses()
 }
 
 #[cfg(test)]

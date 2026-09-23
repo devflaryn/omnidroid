@@ -45,8 +45,16 @@ windows-sys = { workspace = true, features = [
     # nothing has initialised Winsock fails with WSANOTINITIALISED, and this seam may well make
     # the first network call the runtime makes.
     "Win32_Networking_WinSock",
+    # `net::interface_addresses`: `GetAdaptersAddresses`, whose adapter structure is declared
+    # behind the NDIS feature as well (its interface-type and media fields are NDIS types).
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
+    # Raw input (`RegisterRawInputDevices`, `GetRawInputData`): the window seam's pointer capture,
+    # whose motion is the mouse's own counts. Named although `Win32_UI_Input_KeyboardAndMouse`
+    # implies it, so that the dependency is stated where it is used.
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     # The audio seam (src/audio/windows.rs): WASAPI, which is COM. `windows-sys` carries no COM

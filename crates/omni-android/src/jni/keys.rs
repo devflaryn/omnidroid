@@ -57,6 +57,24 @@
 //! engine reads its configuration**, and [`KeyInput::new`] refuses until it has: a Java side that
 //! passed keys while the engine's `Configuration` said there was no keyboard would be a device
 //! that does not exist.
+//!
+//! **Whose statement it is, measured statically:** the engine's own reads of those two fields land
+//! only in AGDK's copy of the configuration (`gConfiguration` at `0x68376a8`, written by
+//! `0x285c920`-`0x285c96c`), which nothing else in `libroblox.so` references. The engine learns of
+//! a keyboard from its keys: `UserInputService`'s `LastInputType` setter (around `0x4779700`) turns
+//! `KeyboardEnabled` and `MouseEnabled` on for a `Keyboard` input before it fires
+//! `LastInputTypeChanged` (see [`super::mouse`]). So the declaration is `vk.g`'s gate, and the
+//! first key is the engine's.
+//!
+//! # Keys held when the focus leaves
+//!
+//! Windows sends no key-up to a window that no longer has the focus, so a key held through an
+//! `Alt+Tab` would stay down in the engine for good -- a character that never stops walking.
+//! Android does not let that happen: when the focus leaves a window, its `InputDispatcher`
+//! synthesises a cancelling `ACTION_UP` (`FLAG_CANCELED`) for every key still down, and
+//! `MainGameActivity.onKeyUp` hands it to `vk.g.f` like any other release. [`KeyInput`] does the
+//! same: it keeps the keys it has passed down, and a [`WindowEvent::FocusChanged`] to unfocused
+//! releases each of them, repeat `false` (a cancel carries a repeat count of 0).
 
 use std::sync::Arc;
 
@@ -369,9 +387,12 @@ pub struct KeyInput {
     target: GuestAddr,
     /// One `jclass` for [`KEY_CLASS`], taken once, for the reason `TouchInput`'s is.
     class: u64,
+    /// The keys passed down and not yet up, oldest first, one entry per physical key.
+    held: Vec<PassKeyEvent>,
     delivered: u64,
     unmapped: u64,
     withheld: u64,
+    cancelled: u64,
 }
 
 impl KeyInput {
@@ -423,17 +444,28 @@ impl KeyInput {
                 .map(|_| ())
         })?;
         let class = jni.class_reference(KEY_CLASS)?;
-        Ok(Self { target, class, delivered: 0, unmapped: 0, withheld: 0 })
+        Ok(Self {
+            target,
+            class,
+            held: Vec::new(),
+            delivered: 0,
+            unmapped: 0,
+            withheld: 0,
+            cancelled: 0,
+        })
     }
 
-    /// Deliver one host window event, with `thread`'s `JNIEnv` on `cpu`: the call made, if the
-    /// event was a key the engine is passed. Anything else is counted or ignored.
+    /// Deliver one host window event, with `thread`'s `JNIEnv` on `cpu`: the calls made -- one
+    /// for a key the engine is passed, one release per held key when the window loses the focus
+    /// (see this module's "Keys held when the focus leaves"), none otherwise. Anything else is
+    /// counted or ignored.
     ///
     /// **The caller holds the activations**, as for `TouchInput::deliver`.
     ///
     /// # Errors
     ///
-    /// The guest's own failure when the call does not return.
+    /// The guest's own failure when a call does not return. The event's remaining calls are not
+    /// made.
     pub fn deliver(
         &mut self,
         jni: &Jni,
@@ -441,30 +473,58 @@ impl KeyInput {
         cpu: &mut dyn GuestCpu,
         thread: usize,
         event: &WindowEvent,
-    ) -> AbiResult<Option<PassKeyEvent>> {
-        match translate(event) {
-            None => Ok(None),
-            Some(KeyOutcome::Unmapped(_)) => {
+    ) -> AbiResult<Vec<PassKeyEvent>> {
+        let calls = match (event, translate(event)) {
+            (WindowEvent::FocusChanged { focused: false }, _) => {
+                let released: Vec<PassKeyEvent> = self
+                    .held
+                    .iter()
+                    .map(|key| PassKeyEvent { down: false, repeat: false, ..*key })
+                    .collect();
+                self.cancelled += released.len() as u64;
+                released
+            }
+            (_, Some(KeyOutcome::Unmapped(_))) => {
                 self.unmapped += 1;
-                Ok(None)
+                Vec::new()
             }
-            Some(KeyOutcome::Withheld(_)) => {
+            (_, Some(KeyOutcome::Withheld(_))) => {
                 self.withheld += 1;
-                Ok(None)
+                Vec::new()
             }
-            Some(KeyOutcome::Pass(call)) => {
-                let args = pass_key_event_args(jni.env_for(thread), self.class, &call);
-                boundary.call_guest(
-                    cpu,
-                    "NativeGLInterface.nativePassKeyEvent (vk.g)",
-                    self.target,
-                    &args,
-                    super::input::PER_EVENT,
-                )?;
-                self.delivered += 1;
-                Ok(Some(call))
+            (_, Some(KeyOutcome::Pass(call))) => vec![call],
+            (_, None) => Vec::new(),
+        };
+        for call in &calls {
+            let args = pass_key_event_args(jni.env_for(thread), self.class, call);
+            boundary.call_guest(
+                cpu,
+                "NativeGLInterface.nativePassKeyEvent (vk.g)",
+                self.target,
+                &args,
+                super::input::PER_EVENT,
+            )?;
+            self.delivered += 1;
+            // Held from any down -- a repeat whose press came before the focus did included --
+            // until its up.
+            self.held.retain(|key| key.scan_code != call.scan_code);
+            if call.down {
+                self.held.push(*call);
             }
         }
+        Ok(calls)
+    }
+
+    /// The keys passed down and not up since, oldest first.
+    #[must_use]
+    pub fn held(&self) -> &[PassKeyEvent] {
+        &self.held
+    }
+
+    /// How many releases a lost focus has sent for keys that were held.
+    #[must_use]
+    pub fn cancelled(&self) -> u64 {
+        self.cancelled
     }
 
     /// How many `nativePassKeyEvent` calls returned.

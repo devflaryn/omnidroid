@@ -981,6 +981,52 @@ pub const fn system_theme_for(ui_mode: i32) -> i32 {
     }
 }
 
+/// The class and static method [`public_ipv4_addresses`] answers.
+pub const NETWORK_UTILS: &str = "com/roblox/engine/jni/util/NetworkUtils";
+
+/// `NetworkUtils.getPublicIPv4Addresseses()Ljava/lang/String;`, the method name as the dex spells
+/// it (sic).
+pub const GET_PUBLIC_IPV4_ADDRESSES: &str = "getPublicIPv4Addresseses";
+
+/// `NetworkUtils.getPublicIPv4Addresseses()`'s body, DECODED from `classes2.dex`, over the
+/// addresses `NetworkInterface.getNetworkInterfaces()` and then each interface's
+/// `getInetAddresses()` list, in that order:
+///
+/// ```text
+/// for each interface, for each InetAddress a:
+///     if a.isLoopbackAddress(): continue                       (0x0032)
+///     s = a.getHostAddress()
+///     if s.indexOf(':') >= 0: continue                         (0x003e, 58 is ':')
+///     result = result + s + " : "                              (0x0044-0x0057)
+/// return result                                                ("" when there is none)
+/// ```
+///
+/// So the IPv4 addresses that are not loopback, each followed by `" : "` -- a trailing separator
+/// included, as the Java leaves it. An exception on the way returns `""` (`0x0059`-`0x0072`), and
+/// that is [`omni_platform::net::interface_addresses`] failing, which the embedding decides about.
+/// `getHostAddress` of an `Inet4Address` is the dotted quad without leading zeros, which is what
+/// `Ipv4Addr`'s `Display` writes; every IPv6 form contains a colon and is dropped either way.
+///
+/// MEASURED reader (the owner's session, 2026-09-23): the engine's MicroProfiler, which shows the
+/// addresses its web server can be reached on. The TaskScheduler worker that asked died on the
+/// refusal this used to be, and the game froze.
+#[must_use]
+pub fn public_ipv4_addresses(addresses: &[std::net::IpAddr]) -> String {
+    let mut result = String::new();
+    for address in addresses {
+        if address.is_loopback() {
+            continue;
+        }
+        let text = address.to_string();
+        if text.contains(':') {
+            continue;
+        }
+        result.push_str(&text);
+        result.push_str(" : ");
+    }
+    result
+}
+
 /// Every class this layer declares, with what it answers for each member.
 ///
 /// Ordered as `jni-surface.md` §3.1 ranks them: Tier 0 first, then the Tier 1 classes the three
@@ -2266,6 +2312,32 @@ mod tests {
         assert!(Registry::simple_answer(Answer::StaticIsSet("gContext")).is_none());
         assert_eq!(Registry::simple_answer(Answer::Sink), Some(Value::Void));
         assert_eq!(Registry::simple_answer(Answer::Int(7)), Some(Value::Int(7)));
+    }
+
+    /// **`getPublicIPv4Addresseses`, the Java body over an interface list**: loopback of either
+    /// family dropped, IPv6 dropped (link-local, global, and the IPv4-mapped form, whose text has
+    /// colons), the rest in order with `" : "` after each -- the trailing one included -- and
+    /// `""` for none.
+    #[test]
+    fn public_ipv4_addresses_is_the_java_body() {
+        let parse = |list: &[&str]| -> Vec<std::net::IpAddr> {
+            list.iter().map(|s| s.parse().expect("an address literal")).collect()
+        };
+        let host = parse(&[
+            "127.0.0.1",
+            "::1",
+            "10.20.30.40",
+            "fe80::1",
+            "192.168.1.7",
+            "2001:db8::5",
+            "::ffff:1.2.3.4",
+            "127.8.9.10",
+            "172.16.0.1",
+        ]);
+        assert_eq!(public_ipv4_addresses(&host), "10.20.30.40 : 192.168.1.7 : 172.16.0.1 : ");
+        assert_eq!(public_ipv4_addresses(&parse(&["127.0.0.1", "::1"])), "");
+        assert_eq!(public_ipv4_addresses(&[]), "");
+        assert_eq!(public_ipv4_addresses(&parse(&["8.8.8.8"])), "8.8.8.8 : ");
     }
 
     /// **FMOD's Android statics: three decided, the rest refusing by name.**

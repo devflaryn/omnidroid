@@ -35,9 +35,9 @@
 //!   about `struct stat`, for the same reason.
 
 pub(super) use super::unix::{
-    bind, broadcast, buffer_bytes, create_datagram, create_stream, keep_alive, keep_alive_count,
-    keep_alive_idle, keep_alive_interval, kind_from_raw, linger, path_mtu, poll, reuse_address,
-    set_broadcast, set_buffer_bytes, set_keep_alive, set_keep_alive_count, set_keep_alive_idle,
-    set_keep_alive_interval, set_linger, set_path_mtu, set_reuse_address, set_v6only,
-    socket_error, start_connect, v6only,
+    accept, bind, broadcast, buffer_bytes, create_datagram, create_stream, interface_addresses,
+    keep_alive, keep_alive_count, keep_alive_idle, keep_alive_interval, kind_from_raw, linger,
+    listen, path_mtu, poll, reuse_address, set_broadcast, set_buffer_bytes, set_keep_alive,
+    set_keep_alive_count, set_keep_alive_idle, set_keep_alive_interval, set_linger, set_path_mtu,
+    set_reuse_address, set_v6only, socket_error, start_connect, v6only,
 };

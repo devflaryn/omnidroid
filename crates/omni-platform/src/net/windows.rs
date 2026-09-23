@@ -54,8 +54,14 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, NO_ERROR};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    IP_ADAPTER_ADDRESSES_LH,
+};
 use windows_sys::Win32::Networking::WinSock::{
-    bind as ws_bind, connect as ws_connect, getsockopt, select as ws_select, setsockopt,
+    accept as ws_accept, bind as ws_bind, connect as ws_connect, getsockopt, listen as ws_listen,
+    select as ws_select, setsockopt, AF_UNSPEC,
     socket as ws_socket, WSAGetLastError, WSAStartup, ADDRESS_FAMILY, AF_INET, AF_INET6, FD_SET,
     IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPV6_MTU_DISCOVER, IPV6_V6ONLY, IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_PMTUDISC_DONT, IP_PMTUDISC_NOT_SET, IP_PMTUDISC_PROBE, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, SOCKET_ERROR,
     LINGER, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SO_BROADCAST, SO_ERROR, SO_KEEPALIVE, SO_LINGER,
@@ -302,6 +308,133 @@ pub(super) fn bind(inner: &Inner, address: &SocketAddress) -> NetResult<()> {
         return Err(wsa_error("bind", address.to_string(), "bind"));
     }
     Ok(())
+}
+
+/// `listen(2)`.
+pub(super) fn listen(inner: &Inner, backlog: i32) -> NetResult<()> {
+    // SAFETY: a live socket and a by-value integer; no memory crosses.
+    let rc = unsafe { ws_listen(raw(inner), backlog) };
+    if rc == SOCKET_ERROR {
+        return Err(wsa_error("listen", format!("backlog {backlog}"), "listen"));
+    }
+    Ok(())
+}
+
+/// `accept(2)`, adopted into a [`TcpStream`], with the peer's address.
+///
+/// The peer is read back through `std` (`getpeername`) rather than out of `accept`'s own
+/// `sockaddr` argument: one conversion from `SOCKADDR` to [`SocketAddress`] in this crate is
+/// `std`'s, and a second hand-written one would be a second place for a byte-order mistake.
+/// `WSAEINVAL` -- `accept` on a socket that is not listening -- classifies as
+/// [`NetErrorKind::InvalidInput`], which is Linux's `EINVAL` for the same call.
+pub(super) fn accept(inner: &Inner) -> NetResult<(TcpStream, SocketAddress)> {
+    // SAFETY: a live socket; the two out-parameters are null, which `accept` documents as "do
+    // not return the address", so nothing is written through them.
+    let handle =
+        unsafe { ws_accept(raw(inner), core::ptr::null_mut(), core::ptr::null_mut()) };
+    if handle == INVALID_SOCKET {
+        return Err(wsa_error("accept", "a listening socket", "accept"));
+    }
+    // SAFETY: `handle` is a live socket `accept` just created and nothing else holds, so the
+    // `TcpStream` owns it and closes it on drop -- including on the error path below.
+    let stream = unsafe { TcpStream::from_raw_socket(handle as std::os::windows::raw::SOCKET) };
+    let peer = stream
+        .peer_addr()
+        .map_err(|error| NetError::io("accept", "the accepted connection", &error))?;
+    Ok((stream, SocketAddress::from_std(peer)))
+}
+
+/// Every unicast address of every adapter, in the order `GetAdaptersAddresses` lists them.
+///
+/// Anycast, multicast and DNS-server lists are skipped by flag: none is an address the host
+/// *holds*. `AF_UNSPEC` asks for both families, and adapters that are down are listed with
+/// whatever addresses they still carry, as a Java `NetworkInterface` would list them.
+pub(super) fn interface_addresses() -> NetResult<Vec<std::net::IpAddr>> {
+    const FLAGS: u32 = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    // Microsoft's own guidance for this call: start at 15 KB and grow to what it asks for, a few
+    // times, because the adapter set can change between the two calls.
+    let mut size: u32 = 15 * 1024;
+    for _ in 0..4 {
+        // `u64` words, so the buffer is aligned for the pointer-bearing structures it receives.
+        let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+        // SAFETY: `buffer` is writable for `size` bytes (it is at least that long and 8-aligned),
+        // `size` says so, and the reserved argument is null as documented.
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_UNSPEC),
+                FLAGS,
+                core::ptr::null(),
+                buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+                &mut size,
+            )
+        };
+        match rc {
+            NO_ERROR => {
+                // SAFETY: on success the buffer holds a linked list of adapters whose pointers all
+                // point inside it, and it outlives the walk.
+                return Ok(unsafe { walk_adapters(buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()) });
+            }
+            ERROR_NO_DATA => return Ok(Vec::new()),
+            ERROR_BUFFER_OVERFLOW => continue,
+            other => {
+                return Err(NetError::io(
+                    "interface_addresses",
+                    "the host's adapters",
+                    &std::io::Error::from_raw_os_error(other as i32),
+                ))
+            }
+        }
+    }
+    Err(NetError::kinded(
+        "interface_addresses",
+        "the host's adapters",
+        NetErrorKind::Other,
+        "GetAdaptersAddresses asked for a larger buffer four times running",
+    ))
+}
+
+/// Walk `GetAdaptersAddresses`' list: every adapter, every unicast address, IPv4 and IPv6.
+///
+/// # Safety
+///
+/// `first` is the head of a list `GetAdaptersAddresses` filled, alive for the whole call.
+unsafe fn walk_adapters(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<std::net::IpAddr> {
+    let mut addresses = Vec::new();
+    let mut adapter = first;
+    while !adapter.is_null() {
+        // SAFETY: a non-null node of the list the caller vouches for.
+        let node = unsafe { &*adapter };
+        let mut unicast = node.FirstUnicastAddress;
+        while !unicast.is_null() {
+            // SAFETY: as above, one of this adapter's unicast entries.
+            let entry = unsafe { &*unicast };
+            let sockaddr = entry.Address.lpSockaddr;
+            let length = entry.Address.iSockaddrLength as usize;
+            if !sockaddr.is_null() {
+                // SAFETY: `lpSockaddr` points at `iSockaddrLength` bytes of a `sockaddr` whose
+                // family field comes first; each arm reads only when the length covers it.
+                let family = unsafe { (*sockaddr).sa_family };
+                if family == AF_INET && length >= core::mem::size_of::<SOCKADDR_IN>() {
+                    // SAFETY: an `AF_INET` sockaddr of at least `sockaddr_in`'s size.
+                    let v4 = unsafe { &*sockaddr.cast::<SOCKADDR_IN>() };
+                    // SAFETY: every view of the `in_addr` union is plain bytes.
+                    let word = unsafe { v4.sin_addr.S_un.S_addr };
+                    // `S_addr` is the address bytes in written order viewed as one word, so the
+                    // native-endian bytes are the octets (the inverse of `sockaddr` above).
+                    addresses.push(std::net::IpAddr::from(word.to_ne_bytes()));
+                } else if family == AF_INET6 && length >= core::mem::size_of::<SOCKADDR_IN6>() {
+                    // SAFETY: an `AF_INET6` sockaddr of at least `sockaddr_in6`'s size.
+                    let v6 = unsafe { &*sockaddr.cast::<SOCKADDR_IN6>() };
+                    // SAFETY: every view of the `in6_addr` union is plain bytes.
+                    let octets = unsafe { v6.sin6_addr.u.Byte };
+                    addresses.push(std::net::IpAddr::from(octets));
+                }
+            }
+            unicast = entry.Next;
+        }
+        adapter = node.Next;
+    }
+    addresses
 }
 
 /// `connect(2)`, with the non-blocking case as the normal one.

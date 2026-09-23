@@ -810,3 +810,121 @@ fn dropping_a_socket_closes_it_and_the_peer_sees_the_close() {
     peer.read_to_end(&mut drained).expect("the peer reads to end of file after we dropped");
     assert!(drained.is_empty());
 }
+
+// ================================================================== listen, accept
+
+/// A stream socket listening on loopback, bound to an ephemeral port.
+fn listener_on(family: IpFamily, policy: Arc<NetPolicy>) -> (Socket, SocketAddress) {
+    let mut listener = Socket::new(SocketKind::Stream, family, policy).expect("a stream socket");
+    listener.set_nonblocking(true).expect("non-blocking mode");
+    listener.bind(&SocketAddress::loopback(family, 0)).expect("bind loopback:0");
+    listener.listen(8).expect("listen on loopback under a loopback policy");
+    let local = listener.local_address().expect("the bound address");
+    assert_ne!(local.port(), 0, "listen on an ephemeral port gives it a number");
+    (listener, local)
+}
+
+/// **A connection is accepted, carries data both ways, and the accepted socket is BLOCKING
+/// although the listener is not** -- Linux's accept(2) does not pass `O_NONBLOCK` on, where
+/// Winsock's accepted socket inherits it. MEASURED why listen/accept exist at all: the engine's
+/// MicroProfiler web server bound `0.0.0.0:1338` and died on an unbound `listen` (2026-09-23).
+#[test]
+fn a_listener_accepts_a_connection_and_the_accepted_socket_is_blocking() {
+    for family in [IpFamily::V4, IpFamily::V6] {
+        let (listener, local) = listener_on(family, loopback_policy());
+        match listener.accept() {
+            Err(error) => assert_eq!(error.kind(), Some(NetErrorKind::WouldBlock), "{error}"),
+            Ok(_) => panic!("{family}: accepted with nobody connecting"),
+        }
+        let mut client = HostStream::connect(local.to_std()).expect("connect to the listener");
+        wait_until(&listener, Interest::READABLE, "a pending connection", |r| r.readable);
+        let (accepted, peer) = listener.accept().expect("the pending connection");
+        assert_eq!(peer.to_std(), client.local_addr().expect("the client's end"), "{family}");
+        assert_eq!(accepted.peer_address().expect("peer").to_std(), peer.to_std());
+        assert_eq!(accepted.family(), family);
+        assert_eq!(accepted.kind(), SocketKind::Stream);
+        assert!(!accepted.nonblocking(), "{family}: the accepted socket reports blocking");
+
+        // Blocking in fact, not just in its flag: with a 150 ms receive timeout and nothing sent,
+        // a blocking recv waits the timeout out, where a non-blocking one returns at once.
+        let mut accepted = accepted;
+        accepted
+            .set_option(SocketOption::ReceiveTimeout(Some(Duration::from_millis(150))))
+            .expect("SO_RCVTIMEO");
+        let started = Instant::now();
+        let mut buf = [0u8; 16];
+        let empty = accepted.recv(&mut buf);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "{family}: recv returned after {:?} ({empty:?}); the accepted socket is non-blocking",
+            started.elapsed()
+        );
+        accepted.set_option(SocketOption::ReceiveTimeout(None)).expect("no timeout");
+
+        client.write_all(b"hello").expect("the client sends");
+        let mut got = [0u8; 5];
+        let mut read = 0;
+        while read < 5 {
+            read += accepted.recv(&mut got[read..]).expect("the accepted socket receives");
+        }
+        assert_eq!(&got, b"hello");
+        assert_eq!(accepted.send(b"world").expect("the accepted socket sends"), 5);
+        let mut back = [0u8; 5];
+        client.read_exact(&mut back).expect("the client receives");
+        assert_eq!(&back, b"world");
+    }
+}
+
+/// **`listen` asks the policy about the address the socket is bound to**, and refuses by policy
+/// before the host is asked; an unbound socket is judged as the wildcard address `listen` would
+/// bind it to.
+#[test]
+fn listen_is_asked_of_the_policy_with_the_bound_address() {
+    let is_policy = |result: Result<(), NetError>| matches!(result, Err(NetError::Policy { .. }));
+    // Loopback-only: a wildcard bind may not listen, and neither may an unbound socket.
+    let mut wildcard = Socket::new(SocketKind::Stream, IpFamily::V4, loopback_policy()).expect("socket");
+    wildcard.bind(&SocketAddress::unspecified(IpFamily::V4)).expect("bind 0.0.0.0:0");
+    assert!(is_policy(wildcard.listen(8)), "a wildcard listener under a loopback-only policy");
+    let mut unbound = Socket::new(SocketKind::Stream, IpFamily::V4, loopback_policy()).expect("socket");
+    assert!(is_policy(unbound.listen(8)), "an unbound socket is judged as the wildcard");
+    // A closed policy refuses even loopback, and `allow_listen` alone admits it.
+    let closed = Arc::new(NetPolicy::closed());
+    let mut refused = Socket::new(SocketKind::Stream, IpFamily::V4, closed).expect("socket");
+    refused.bind(&SocketAddress::loopback(IpFamily::V4, 0)).expect("bind loopback:0");
+    let refusal = refused.listen(8).expect_err("a closed policy refuses listening");
+    assert!(matches!(refusal, NetError::Policy { .. }), "{refusal:?}");
+    assert!(refusal.to_string().contains("127.0.0.1"), "{refusal}");
+    let (_listener, local) = listener_on(IpFamily::V4, Arc::new(NetPolicy::closed().allow_listen()));
+    assert!(local.is_loopback());
+}
+
+/// `accept` on a stream socket that is not listening is Linux's `EINVAL`, and both calls on a
+/// datagram socket are refused for the adapter to answer `EOPNOTSUPP`.
+#[test]
+fn accept_needs_a_listener_and_neither_call_takes_a_datagram_socket() {
+    let mut idle = Socket::new(SocketKind::Stream, IpFamily::V4, loopback_policy()).expect("socket");
+    idle.bind(&SocketAddress::loopback(IpFamily::V4, 0)).expect("bind loopback:0");
+    let not_listening = idle.accept().expect_err("accept without listen");
+    assert_eq!(not_listening.kind(), Some(NetErrorKind::InvalidInput), "{not_listening}");
+    let mut datagram = socket(SocketKind::Datagram, IpFamily::V4);
+    datagram.bind(&SocketAddress::loopback(IpFamily::V4, 0)).expect("bind loopback:0");
+    assert!(matches!(datagram.listen(8), Err(NetError::Refused { .. })));
+    assert!(matches!(datagram.accept(), Err(NetError::Refused { .. })));
+}
+
+/// **The host's interface addresses include loopback and the address a route would use** -- the
+/// second is an independent oracle: a UDP `connect` sends nothing and makes the host choose the
+/// local address it would route from (TEST-NET-1, RFC 5737, reaches nobody). MEASURED reader: the
+/// Java side's `NetworkUtils.getPublicIPv4Addresseses`, whose refusal froze the game (2026-09-23).
+#[test]
+fn the_hosts_interface_addresses_include_loopback_and_the_routed_address() {
+    let addresses = omni_platform::net::interface_addresses().expect("the host's adapters");
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().expect("literal");
+    assert!(addresses.contains(&loopback), "{addresses:?}");
+    let probe = HostDatagram::bind("0.0.0.0:0").expect("a UDP socket");
+    probe.connect("192.0.2.1:9").expect("a route to TEST-NET-1 (this host has a network)");
+    let routed = probe.local_addr().expect("the routed local address").ip();
+    assert!(addresses.contains(&routed), "{routed} is not among {addresses:?}");
+    let distinct: std::collections::BTreeSet<_> = addresses.iter().collect();
+    assert_eq!(distinct.len(), addresses.len(), "no address is listed twice: {addresses:?}");
+}

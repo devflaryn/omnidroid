@@ -20,6 +20,9 @@
 //! Window::set_client_size(&self, width, height, operation) -> WindowResult<()>
 //! Window::set_minimized(&self, minimized: bool) -> WindowResult<()>
 //! Window::request_close(&self) -> WindowResult<()>
+//! Window::set_pointer_capture(&mut self, captured: bool) -> WindowResult<bool>
+//! Window::has_pointer_capture(&self) -> bool
+//! Window::wait(&self, timeout: Duration) -> bool
 //! Window::raw(&self) -> RawWindow
 //! ```
 //!
@@ -77,8 +80,27 @@
 //! as [`WindowEvent::Text`]: what a key *types* depends on the layout, on dead keys and on an IME,
 //! all of which the host has already resolved and none of which a table of key numbers could
 //! reproduce.
+//!
+//! # The mouse, whole: hover, every button, the wheel, and a captured pointer
+//!
+//! The pointer is reported as a mouse reports it, not as a finger: every move whether or not a
+//! button is held ([`WindowEvent::PointerMoved`]), all five buttons, and the wheel
+//! ([`WindowEvent::Wheel`], in the host's own units). What a consumer makes of that -- a finger on
+//! a touch screen, or a mouse -- is its decision, not this seam's.
+//!
+//! **Pointer capture** is the other half of a mouse, and the one a game needs for mouse-look: the
+//! cursor disappears and stays where it is, and what arrives instead is the device's own motion,
+//! **relative and unaccelerated** ([`WindowEvent::PointerMotion`]), which keeps coming at a screen
+//! edge where a cursor would stop. [`Window::set_pointer_capture`] asks for it and gives it back;
+//! it is only granted to a window with the keyboard focus, and **losing the focus ends it**, which
+//! is reported ([`WindowEvent::PointerCaptureLost`]) so a consumer does not go on believing it
+//! holds a capture nobody gave it. While it is held the absolute [`WindowEvent::PointerMoved`] is
+//! not reported at all: the cursor is not moving, and a position that does not move is not motion.
+//! This is the contract Android's `View.requestPointerCapture` offers an app, which is why it has
+//! this shape.
 
 use core::fmt;
+use core::time::Duration;
 use core::marker::PhantomData;
 
 mod error;
@@ -280,6 +302,47 @@ pub enum WindowEvent {
         /// True when the window now has focus.
         focused: bool,
     },
+    /// The mouse wheel turned, or tilted: `WM_MOUSEWHEEL` and `WM_MOUSEHWHEEL` on Windows.
+    ///
+    /// **In the host's own units, untranslated**, for the reason key numbers are: on Windows one
+    /// notch of a wheel is `WHEEL_DELTA`, 120, and a high-resolution wheel or a touchpad reports
+    /// fractions of it. What a notch *is* to a guest is the guest contract's business.
+    ///
+    /// Signs are the host's: `dy` is positive when the wheel is rolled **away from the user**, and
+    /// `dx` is positive when it is tilted **to the right**. One of the two is zero, because the
+    /// host reports the two axes as separate messages.
+    ///
+    /// Never coalesced: two notches are two events, and summing them would be a decision about the
+    /// guest's scroll that this seam has no business making.
+    Wheel {
+        /// Client-relative x of the pointer, in physical pixels.
+        x: i32,
+        /// Client-relative y of the pointer, in physical pixels.
+        y: i32,
+        /// Horizontal wheel movement, positive to the right, in host units (120 a notch).
+        dx: i32,
+        /// Vertical wheel movement, positive away from the user, in host units (120 a notch).
+        dy: i32,
+    },
+    /// **Relative motion of the pointing device while the pointer is captured** (see
+    /// [`Window::set_pointer_capture`]): the device's own counts, **not accelerated**, and not
+    /// bounded by any screen edge. On Windows this is raw input (`WM_INPUT`).
+    ///
+    /// Only reported while the capture is held. A run of them is **summed** into one (see this
+    /// module's `push_event`): unlike a position, each one is a distance, and keeping only the
+    /// newest would lose all the others.
+    PointerMotion {
+        /// Rightward motion, in device counts.
+        dx: i32,
+        /// Downward motion, in device counts.
+        dy: i32,
+    },
+    /// **The host ended a pointer capture this window held** -- on Windows, because the window
+    /// lost the keyboard focus. The cursor is visible and free again, and
+    /// [`Window::has_pointer_capture`] now answers `false`.
+    ///
+    /// Not reported for a capture the caller released itself: that caller already knows.
+    PointerCaptureLost,
 }
 
 /// Append `event` to `queue`, collapsing a run of the events for which only the newest matters.
@@ -300,7 +363,20 @@ pub enum WindowEvent {
 /// Coalescing also only ever collapses an event with the one **immediately** before it, so a move
 /// that happened before a click still sits before that click in the queue and the order the user
 /// produced is preserved.
+///
+/// **[`WindowEvent::PointerMotion`] is summed, not replaced.** It is a distance, not a position: a
+/// raw-input mouse reports up to 8,000 of them a second, and the newest of a run is one sample of
+/// the motion while the sum is all of it. Saturating, because the counts are the device's and a run
+/// long enough to overflow an `i32` is still better answered with the largest distance than a
+/// wrapped one (VERIFICATION entry 3).
 fn push_event(queue: &mut Vec<WindowEvent>, event: WindowEvent) {
+    if let (Some(WindowEvent::PointerMotion { dx: sum_x, dy: sum_y }), WindowEvent::PointerMotion { dx, dy }) =
+        (queue.last_mut(), &event)
+    {
+        *sum_x = sum_x.saturating_add(*dx);
+        *sum_y = sum_y.saturating_add(*dy);
+        return;
+    }
     let collapses = matches!(
         (queue.last(), &event),
         (Some(WindowEvent::Resized { .. }), WindowEvent::Resized { .. })
@@ -577,6 +653,51 @@ impl Window {
         self.inner.request_close()
     }
 
+    /// **Capture the pointer, or give it back** -- Android's `View.requestPointerCapture` and
+    /// `releasePointerCapture`, which is the contract this has.
+    ///
+    /// While the capture is held the cursor is hidden and held where it was, and the device's own
+    /// relative motion arrives as [`WindowEvent::PointerMotion`] in place of
+    /// [`WindowEvent::PointerMoved`]; buttons and the wheel are reported as before. Giving it back
+    /// shows the cursor where it was when the capture began.
+    ///
+    /// **Only a window with the keyboard focus is granted one**, and the answer says which
+    /// happened: `Ok(true)` when the capture is now held, `Ok(false)` when a request was declined
+    /// because the window does not have the focus -- which is not an error, because Android ignores
+    /// such a request the same way and the caller asks again later. Asking for the state already in
+    /// force does nothing. **Losing the focus ends a capture** and reports
+    /// [`WindowEvent::PointerCaptureLost`].
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::LastError`] if the host refused a step of it (registering for raw input,
+    /// confining the cursor); nothing is left half-captured. [`WindowError::Unsupported`] on the
+    /// structural backends.
+    pub fn set_pointer_capture(&mut self, captured: bool) -> WindowResult<bool> {
+        self.inner.set_pointer_capture(captured)
+    }
+
+    /// Whether this window holds the pointer capture now.
+    #[must_use]
+    pub fn has_pointer_capture(&self) -> bool {
+        self.inner.has_pointer_capture()
+    }
+
+    /// **Wait until something happens, or until `timeout` has passed**: `true` when there is input
+    /// or another message for this window to drain, `false` on the timeout.
+    ///
+    /// The frame loop's alternative to a fixed sleep: a loop that sleeps 100 ms between polls
+    /// hands every key and click to the guest up to 100 ms late, and one that polls without
+    /// sleeping spins a core. Nothing is drained here -- [`Window::poll_events`] still does that --
+    /// so a `true` is followed by a poll, and a message that turns out to produce no event (a
+    /// repaint) costs one empty poll.
+    ///
+    /// It returns at once when events are already queued, including ones a message sent during
+    /// the last poll produced.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.inner.wait(timeout)
+    }
+
     /// The native handle, for a graphics backend to build a surface on.
     ///
     /// Valid for as long as this `Window` is. A surface outliving its window is undefined
@@ -683,6 +804,40 @@ mod tests {
             push_event(&mut queue, event.clone());
         }
         assert_eq!(queue, sequence, "typed text was collapsed, dropped or moved");
+    }
+
+    /// **Relative motion is summed**, because each one is a distance: a run of five becomes their
+    /// total, and one separated by anything else starts a new run. A wheel notch is never
+    /// coalesced -- two notches are two events -- and neither is a lost capture.
+    #[test]
+    fn relative_motion_is_summed_and_wheel_notches_are_kept() {
+        let mut queue = Vec::new();
+        for (dx, dy) in [(3, -1), (4, 0), (-10, 7), (1, 1), (2, 2)] {
+            push_event(&mut queue, WindowEvent::PointerMotion { dx, dy });
+        }
+        push_event(&mut queue, WindowEvent::PointerDown { button: PointerButton::Primary, x: 0, y: 0 });
+        push_event(&mut queue, WindowEvent::PointerMotion { dx: 5, dy: 6 });
+        let notch = WindowEvent::Wheel { x: 1, y: 2, dx: 0, dy: 120 };
+        push_event(&mut queue, notch.clone());
+        push_event(&mut queue, notch.clone());
+        push_event(&mut queue, WindowEvent::PointerCaptureLost);
+        push_event(&mut queue, WindowEvent::PointerCaptureLost);
+        assert_eq!(
+            queue,
+            vec![
+                WindowEvent::PointerMotion { dx: 0, dy: 9 },
+                WindowEvent::PointerDown { button: PointerButton::Primary, x: 0, y: 0 },
+                WindowEvent::PointerMotion { dx: 5, dy: 6 },
+                notch.clone(),
+                notch,
+                WindowEvent::PointerCaptureLost,
+                WindowEvent::PointerCaptureLost,
+            ]
+        );
+        // Saturating, not wrapping: a sum that would overflow is the largest distance.
+        let mut queue = vec![WindowEvent::PointerMotion { dx: i32::MAX - 1, dy: i32::MIN + 1 }];
+        push_event(&mut queue, WindowEvent::PointerMotion { dx: 5, dy: -5 });
+        assert_eq!(queue, vec![WindowEvent::PointerMotion { dx: i32::MAX, dy: i32::MIN }]);
     }
 
     /// A move separated from another move by anything at all is two moves. This is the property

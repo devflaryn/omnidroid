@@ -27,25 +27,48 @@
 //! leave the window believing a button is still down forever.
 //!
 //! **4. The requested client size is *measured*, not predicted.** See [`Window::create`].
+//!
+//! **5. A pointer capture is three things, and all three are undone together.** Android's
+//! `requestPointerCapture` hides the pointer, holds it where it is, and hands the app the device's
+//! relative motion. Here that is: the cursor clipped to the **one pixel** it is on
+//! (`ClipCursor`), so it cannot drift and reappears exactly there; `SetCursor(NULL)` from
+//! `WM_SETCURSOR` over the client area; and **raw input** (`RegisterRawInputDevices`, then
+//! `WM_INPUT`), whose mouse motion is the device's counts before the pointer ballistics -- and
+//! keeps arriving with the cursor pinned, which is the point. Clipping is process-wide and survives
+//! this window, so every way out -- a release, the focus leaving (`WM_KILLFOCUS`, reported as
+//! [`WindowEvent::PointerCaptureLost`]), the window being dropped -- goes through
+//! `end_capture`, which undoes all three. A clip the system resets under a held capture
+//! (a secure desktop, `Ctrl+Alt+Del`) is put back at the next [`Window::poll`].
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_REMOVE, RIM_TYPEMOUSE,
+    RegisterRawInputDevices,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, GetWindowRect, IDC_ARROW, LoadCursorW, MSG,
-    PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, SW_MINIMIZE, SW_RESTORE,
-    SW_SHOWNORMAL, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW, XBUTTON1,
+    CREATESTRUCTW, CW_USEDEFAULT, ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, HTCLIENT, IDC_ARROW, LoadCursorW, MSG, MWMO_INPUTAVAILABLE,
+    MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
+    RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SW_MINIMIZE,
+    SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_CAPTURECHANGED, WM_CHAR,
+    WM_CLOSE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, XBUTTON1,
 };
 
 use super::{
@@ -82,6 +105,142 @@ struct WindowState {
     /// Per window rather than per thread or per process: one thread may own several windows, and
     /// a half character typed into one must not be completed by a `WM_CHAR` sent to another.
     high_surrogate: Option<u16>,
+    /// The screen point the cursor is held at while this window has the pointer captured, and
+    /// `None` while it does not. See this module's point 5.
+    captured: Option<POINT>,
+    /// The last position an **absolute** raw-input device reported, in screen pixels, so that its
+    /// next report can be turned into motion. See [`raw_motion`].
+    last_absolute: Option<(i32, i32)>,
+}
+
+/// The mouse on the generic-desktop usage page: what [`start_capture`] registers raw input for.
+const RAW_MOUSE: (u16, u16) = (0x01, 0x02);
+
+/// Register this window for the mouse's raw input (`register`), or unregister the process from it.
+fn register_raw_mouse(hwnd: HWND, register: bool) -> Result<(), u32> {
+    let device = RAWINPUTDEVICE {
+        usUsagePage: RAW_MOUSE.0,
+        usUsage: RAW_MOUSE.1,
+        // No `RIDEV_INPUTSINK`: raw input only while this window is in the foreground, which is the
+        // only time a capture is held. No `RIDEV_NOLEGACY`: the buttons still arrive as the
+        // ordinary messages, with the positions every other button carries.
+        dwFlags: if register { 0 } else { RIDEV_REMOVE },
+        // `RIDEV_REMOVE` requires a null target.
+        hwndTarget: if register { hwnd } else { core::ptr::null_mut() },
+    };
+    // SAFETY: one fully-initialised `RAWINPUTDEVICE`, its size, and a count of one.
+    let ok = unsafe {
+        RegisterRawInputDevices(&raw const device, 1, size_of::<RAWINPUTDEVICE>() as u32)
+    };
+    if ok == 0 {
+        // SAFETY: no arguments, and `RegisterRawInputDevices` is the last call this thread made.
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(())
+}
+
+/// Confine the cursor to the one pixel at `at`, which pins it there.
+fn clip_to(at: POINT) -> Result<(), u32> {
+    let rect = RECT { left: at.x, top: at.y, right: at.x + 1, bottom: at.y + 1 };
+    // SAFETY: a live `RECT` read for the duration of the call.
+    if unsafe { ClipCursor(&raw const rect) } == 0 {
+        // SAFETY: no arguments, and `ClipCursor` is the last call this thread made.
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(())
+}
+
+/// **End a capture**, whatever ended it: the clip lifted, raw input unregistered, the state
+/// cleared. The cursor's visibility comes back by itself -- it is hidden only from `WM_SETCURSOR`
+/// while `captured` is set.
+///
+/// Best effort, because every caller is already on its way out of the capture and has nothing
+/// better to do with a refusal: an unlifted clip would be the one lasting harm, and `ClipCursor`
+/// with a null rectangle is documented to succeed.
+fn end_capture(state: &mut WindowState) {
+    if state.captured.take().is_none() {
+        return;
+    }
+    state.last_absolute = None;
+    // SAFETY: a null rectangle lifts the clip; no memory is read.
+    unsafe { ClipCursor(core::ptr::null()) };
+    let _ = register_raw_mouse(core::ptr::null_mut(), false);
+}
+
+/// **Raw mouse motion as a distance**, from one `RAWMOUSE`'s flags and `lLastX`/`lLastY`.
+///
+/// * **Relative** (`MOUSE_MOVE_RELATIVE`, the flag clear) -- every mouse: the two values *are* the
+///   motion, in device counts, before Windows' pointer ballistics.
+/// * **Absolute** (`MOUSE_MOVE_ABSOLUTE`) -- a pen tablet, a remote-desktop or streaming client:
+///   the two values are a position normalised to `0..=65535` across `extent` (the virtual desktop
+///   when `MOUSE_VIRTUAL_DESKTOP` is set, the primary monitor otherwise), so motion is the
+///   difference from the last one, in screen pixels. The first absolute report has nothing to
+///   differ from and is no motion.
+///
+/// Total: an extent of zero or less is treated as one pixel, and the arithmetic is 64-bit.
+fn raw_motion(
+    flags: u16,
+    x: i32,
+    y: i32,
+    last_absolute: &mut Option<(i32, i32)>,
+    extent: (i32, i32),
+) -> (i32, i32) {
+    if flags & MOUSE_MOVE_ABSOLUTE == 0 {
+        *last_absolute = None;
+        return (x, y);
+    }
+    let to_pixels = |value: i32, span: i32| (i64::from(value) * i64::from(span.max(1)) / 65535) as i32;
+    let now = (to_pixels(x, extent.0), to_pixels(y, extent.1));
+    match last_absolute.replace(now) {
+        Some((was_x, was_y)) => (now.0.saturating_sub(was_x), now.1.saturating_sub(was_y)),
+        None => (0, 0),
+    }
+}
+
+/// Read the `WM_INPUT` whose handle is `lparam`: the mouse motion it carries, or `None` for
+/// something that is not a mouse or could not be read.
+fn read_raw_motion(lparam: LPARAM, last_absolute: &mut Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let mut raw = RAWINPUT::default();
+    let mut size = size_of::<RAWINPUT>() as u32;
+    // SAFETY: `raw` is a `RAWINPUT`, `size` says how large it is, and the handle is the one this
+    // message carries, valid until the message is passed to `DefWindowProcW`. A mouse report is
+    // exactly `RAWINPUTHEADER` plus `RAWMOUSE`, which a `RAWINPUT` holds.
+    let copied = unsafe {
+        GetRawInputData(
+            lparam as HRAWINPUT,
+            RID_INPUT,
+            (&raw mut raw).cast(),
+            &raw mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        )
+    };
+    if copied == u32::MAX || copied == 0 || raw.header.dwType != RIM_TYPEMOUSE {
+        return None;
+    }
+    // SAFETY: `dwType` is `RIM_TYPEMOUSE`, so `mouse` is the union member the call wrote.
+    let mouse = unsafe { raw.data.mouse };
+    let extent = if mouse.usFlags & MOUSE_VIRTUAL_DESKTOP != 0 {
+        // SAFETY: by-value index constants.
+        unsafe { (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) }
+    } else {
+        // SAFETY: as above.
+        unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+    };
+    Some(raw_motion(mouse.usFlags, mouse.lLastX, mouse.lLastY, last_absolute, extent))
+}
+
+/// The signed wheel distance in the high word of a `WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL`'s `WPARAM`.
+///
+/// **Signed**, and that is the whole of it: a notch towards the user is `-120`, which read as
+/// unsigned is 65,416.
+const fn wheel_delta(wparam: WPARAM) -> i32 {
+    ((wparam >> 16) & 0xffff) as u16 as i16 as i32
+}
+
+/// `(dx, dy)` of a wheel message: `WM_MOUSEHWHEEL` is the horizontal axis, `WM_MOUSEWHEEL` the
+/// vertical.
+const fn wheel_motion(msg: u32, delta: i32) -> (i32, i32) {
+    if msg == WM_MOUSEHWHEEL { (delta, 0) } else { (0, delta) }
 }
 
 /// Declare per-monitor DPI awareness, once per process, before any window exists.
@@ -290,13 +449,58 @@ unsafe extern "system" fn wnd_proc(
             return 0;
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
+            // A capture ends with the focus (this module's point 5), and is reported before the
+            // focus change, so a consumer handling the focus loss already knows the pointer is
+            // free.
+            if msg == WM_KILLFOCUS && state.captured.is_some() {
+                end_capture(state);
+                push_event(&mut state.queue, WindowEvent::PointerCaptureLost);
+            }
             push_event(&mut state.queue, WindowEvent::FocusChanged {
                 focused: msg == WM_SETFOCUS,
             });
         }
         WM_MOUSEMOVE => {
+            // Not while captured: the cursor is pinned, and what moves is `WM_INPUT`'s.
+            if state.captured.is_none() {
+                let (x, y) = mouse_xy(lparam);
+                push_event(&mut state.queue, WindowEvent::PointerMoved { x, y });
+            }
+        }
+        WM_SETCURSOR => {
+            // Hidden over the client area while captured; the class's arrow everywhere else, and
+            // over the client area otherwise, from `DefWindowProcW`.
+            if state.captured.is_some() && (lparam & 0xffff) as u32 == HTCLIENT {
+                // SAFETY: a null cursor hides it; no memory is read.
+                unsafe { SetCursor(core::ptr::null_mut()) };
+                // `TRUE`: handled, so `DefWindowProcW` does not set the arrow back.
+                return 1;
+            }
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let delta = wheel_delta(wparam);
+            // The position is in **screen** coordinates for these two, unlike every other mouse
+            // message, and signed for the same reason as `mouse_xy`'s.
             let (x, y) = mouse_xy(lparam);
-            push_event(&mut state.queue, WindowEvent::PointerMoved { x, y });
+            let mut at = POINT { x, y };
+            // SAFETY: a live window handle and a `POINT` written in place.
+            unsafe { ScreenToClient(hwnd, &raw mut at) };
+            let (dx, dy) = wheel_motion(msg, delta);
+            push_event(&mut state.queue, WindowEvent::Wheel { x: at.x, y: at.y, dx, dy });
+            // Processed, which both messages' contract says to report with 0.
+            return 0;
+        }
+        WM_INPUT => {
+            // Only while captured; otherwise raw input is not registered and this does not arrive
+            // -- except for one already queued when a capture ended, which is dropped here.
+            if state.captured.is_some() {
+                if let Some((dx, dy)) = read_raw_motion(lparam, &mut state.last_absolute) {
+                    if (dx, dy) != (0, 0) {
+                        push_event(&mut state.queue, WindowEvent::PointerMotion { dx, dy });
+                    }
+                }
+            }
+            // Falls through: `DefWindowProcW` must see a `WM_INPUT` to release its data.
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
             let button = button_of(msg, wparam);
@@ -443,6 +647,8 @@ impl Window {
             last_size: (u32::MAX, u32::MAX),
             buttons_down: 0,
             high_surrogate: None,
+            captured: None,
+            last_absolute: None,
         }));
 
         // `super::validate` has already bounded both axes to 1..=65535, so neither cast can
@@ -591,7 +797,109 @@ impl Window {
         // SAFETY: `self.state` is live for as long as `self` is, and the pump above has returned,
         // so the window procedure is not running and holds no reference into it.
         let state = unsafe { &mut *self.state };
+        // A clip the system lifted under a held capture is put back (point 5). Only while this
+        // window has the focus: without it the capture has already ended, from `WM_KILLFOCUS`.
+        // SAFETY: no arguments.
+        if let (Some(at), true) = (state.captured, unsafe { GetFocus() } == self.hwnd) {
+            let _ = clip_to(at);
+        }
         sink.append(&mut state.queue);
+    }
+
+    /// See [`super::Window::set_pointer_capture`] and this module's point 5.
+    pub(super) fn set_pointer_capture(&mut self, captured: bool) -> WindowResult<bool> {
+        // SAFETY: as in `poll`: live for as long as `self`, and the window procedure is not
+        // running -- nothing below sends this window a message.
+        let state = unsafe { &mut *self.state };
+        if !captured {
+            if state.captured.is_some() {
+                end_capture(state);
+                // Visible again at once, where it was held, rather than at the next move.
+                // SAFETY: a system cursor, as `window_class` loads it.
+                unsafe { SetCursor(LoadCursorW(core::ptr::null_mut(), IDC_ARROW)) };
+            }
+            return Ok(false);
+        }
+        if state.captured.is_some() {
+            return Ok(true);
+        }
+        // SAFETY: no arguments.
+        if unsafe { GetFocus() } != self.hwnd {
+            return Ok(false);
+        }
+        let failed = |api: &'static str, code: u32| WindowError::LastError {
+            operation: "set_pointer_capture",
+            api,
+            code,
+        };
+        // **Where the cursor is held: where it is, inside the client area.** A request can come
+        // while the cursor is outside it -- a button held since a press inside, with `SetCapture`
+        // still reporting -- and a cursor held outside the window would be hidden nowhere.
+        let mut client = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: writes a `RECT`; the handle is live.
+        if unsafe { GetClientRect(self.hwnd, &raw mut client) } == 0 || client.right <= 0 || client.bottom <= 0 {
+            // A minimised window has no client area to hold the cursor in.
+            return Ok(false);
+        }
+        let mut origin = POINT { x: 0, y: 0 };
+        // SAFETY: a live window handle and a `POINT` written in place.
+        unsafe { ClientToScreen(self.hwnd, &raw mut origin) };
+        let mut at = POINT { x: 0, y: 0 };
+        // SAFETY: writes a `POINT`.
+        if unsafe { GetCursorPos(&raw mut at) } == 0 {
+            // SAFETY: no arguments, and `GetCursorPos` is the last call this thread made.
+            return Err(failed("GetCursorPos", unsafe { GetLastError() }));
+        }
+        let held = POINT {
+            x: at.x.clamp(origin.x, origin.x + client.right - 1),
+            y: at.y.clamp(origin.y, origin.y + client.bottom - 1),
+        };
+        if (held.x, held.y) != (at.x, at.y) {
+            // SAFETY: by-value coordinates.
+            unsafe { SetCursorPos(held.x, held.y) };
+        }
+        register_raw_mouse(self.hwnd, true).map_err(|code| failed("RegisterRawInputDevices", code))?;
+        if let Err(code) = clip_to(held) {
+            let _ = register_raw_mouse(self.hwnd, false);
+            return Err(failed("ClipCursor", code));
+        }
+        state.captured = Some(held);
+        state.last_absolute = None;
+        // Hidden at once; `WM_SETCURSOR` keeps it hidden.
+        // SAFETY: a null cursor hides it.
+        unsafe { SetCursor(core::ptr::null_mut()) };
+        Ok(true)
+    }
+
+    /// Whether the capture is held.
+    pub(super) fn has_pointer_capture(&self) -> bool {
+        // SAFETY: live for as long as `self`; a read.
+        unsafe { (*self.state).captured.is_some() }
+    }
+
+    /// `MsgWaitForMultipleObjectsEx` on no handles: wake for any input or message for this thread.
+    ///
+    /// **`MWMO_INPUTAVAILABLE` is load-bearing.** Without it the wait wakes only for input that
+    /// arrived *since the last* `PeekMessageW`, so a message a previous pump looked at and left
+    /// would put the thread to sleep on a non-empty queue for the whole timeout.
+    pub(super) fn wait(&self, timeout: Duration) -> bool {
+        // SAFETY: live for as long as `self`; a read.
+        if !unsafe { &*self.state }.queue.is_empty() {
+            return true;
+        }
+        // `INFINITE` is `u32::MAX`; a finite request never becomes it.
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1).min(u32::MAX - 1);
+        // SAFETY: no handles, so a null array with a count of zero.
+        let woke = unsafe {
+            MsgWaitForMultipleObjectsEx(0, core::ptr::null(), millis, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+        };
+        if woke == WAIT_FAILED {
+            // Documented only for bad handles, of which there are none. A spin would be the cost
+            // of trusting that, so a failed wait still waits.
+            std::thread::sleep(timeout);
+            return false;
+        }
+        woke == WAIT_OBJECT_0
     }
 
     /// `GetClientRect`, which reports the drawable area in physical pixels.
@@ -682,6 +990,10 @@ impl Drop for Window {
     /// from inside `Drop`, which is a use-after-free with no failure mode anyone would debug in
     /// under an hour.
     fn drop(&mut self) {
+        // A held capture first: the clip is process-wide and would outlive the window, pinning the
+        // cursor to a pixel nothing owns (point 5).
+        // SAFETY: live until reclaimed below; the window procedure is not running.
+        end_capture(unsafe { &mut *self.state });
         // SAFETY: a live window handle, destroyed from the thread that created it — which is the
         // only thread that can hold a `Window`, because it is `!Send`.
         unsafe { DestroyWindow(self.hwnd) };
@@ -705,6 +1017,192 @@ mod tests {
         assert_eq!(scancode_of(0x001D_0001), 0x1D, "left Ctrl is not right Ctrl");
         assert_eq!(scancode_of(0x0148_0001), 0xE048, "the Up arrow, not keypad 8");
         assert_eq!(scancode_of(0xC011_0001_u32 as i32 as LPARAM), 0x11, "a key-up's high bits");
+    }
+
+    /// A notch away from the user is `+120` in the high word, towards is `-120` -- which, read
+    /// unsigned, would be 65,416 -- and the low word (the button and modifier state) is not part of
+    /// it.
+    #[test]
+    fn the_wheel_delta_is_the_signed_high_word() {
+        assert_eq!(wheel_delta(0x0078_0000), 120);
+        assert_eq!(wheel_delta(0xFF88_0000), -120, "a notch towards the user");
+        assert_eq!(wheel_delta(0xFF88_0008), -120, "MK_CONTROL in the low word is not the delta");
+        assert_eq!(wheel_delta(0x0001_0000), 1, "a high-resolution wheel's fraction of a notch");
+        assert_eq!(wheel_delta(0x8000_0000), -32768);
+        // And each message is its own axis.
+        assert_eq!(wheel_motion(WM_MOUSEWHEEL, -120), (0, -120));
+        assert_eq!(wheel_motion(WM_MOUSEHWHEEL, 120), (120, 0));
+    }
+
+    /// **Relative raw input is the motion itself; absolute is a difference of positions**, scaled
+    /// from `0..=65535` to the extent, with no motion for the first.
+    #[test]
+    fn raw_motion_is_relative_counts_or_the_difference_of_absolute_positions() {
+        let mut last = None;
+        assert_eq!(raw_motion(0, 7, -3, &mut last, (1920, 1080)), (7, -3));
+        assert_eq!(last, None);
+        // Absolute across a 1920x1080 primary: the first report is a position, not a motion.
+        assert_eq!(raw_motion(MOUSE_MOVE_ABSOLUTE, 32768, 32768, &mut last, (1920, 1080)), (0, 0));
+        assert_eq!(last, Some((960, 540)));
+        assert_eq!(raw_motion(MOUSE_MOVE_ABSOLUTE, 65535, 0, &mut last, (1920, 1080)), (960, -540));
+        assert_eq!(last, Some((1920, 0)));
+        // A relative report between two absolute ones forgets the last position.
+        assert_eq!(raw_motion(0, 1, 1, &mut last, (1920, 1080)), (1, 1));
+        assert_eq!(raw_motion(MOUSE_MOVE_ABSOLUTE, 0, 0, &mut last, (1920, 1080)), (0, 0));
+        // A degenerate extent is one pixel, not a division by zero.
+        let mut last = None;
+        raw_motion(MOUSE_MOVE_ABSOLUTE | MOUSE_VIRTUAL_DESKTOP, 100, 100, &mut last, (0, -5));
+        assert_eq!(last, Some((0, 0)));
+    }
+
+    /// **The wheel, through the window procedure**: posted `WM_MOUSEWHEEL` and `WM_MOUSEHWHEEL`
+    /// come out as [`WindowEvent::Wheel`] on their own axis, signed, at the pointer's position
+    /// converted from the **screen** coordinates the two messages carry to the client's.
+    #[test]
+    #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+    fn posted_wheel_messages_come_out_as_wheel_events_in_client_coordinates() {
+        assert!(
+            std::env::var("OMNI_GFX_WINDOW_TESTS").is_ok_and(|v| v == "1"),
+            "run with --ignored but OMNI_GFX_WINDOW_TESTS is not 1; this creates a real window"
+        );
+        let mut window = Window::create(&WindowDesc::new("omnidroid: wheel", 320, 240)).unwrap();
+        let mut origin = POINT { x: 0, y: 0 };
+        // SAFETY: a live window handle and a `POINT` written in place.
+        unsafe { ClientToScreen(window.hwnd, &raw mut origin) };
+        let screen = |x: i32, y: i32| -> LPARAM {
+            let (x, y) = (origin.x + x, origin.y + y);
+            ((y as u16 as u32) << 16 | x as u16 as u32) as i32 as LPARAM
+        };
+        let notch_away: WPARAM = 120 << 16;
+        let notch_towards: WPARAM = (0xFF88 << 16) | 0x0008;
+        for (msg, wparam, lparam) in [
+            (WM_MOUSEWHEEL, notch_away, screen(10, 20)),
+            (WM_MOUSEWHEEL, notch_towards, screen(30, 40)),
+            (WM_MOUSEHWHEEL, notch_away, screen(-5, 7)),
+        ] {
+            // SAFETY: a live window handle and a message with no pointer arguments.
+            assert_ne!(unsafe { PostMessageW(window.hwnd, msg, wparam, lparam) }, 0, "{msg:#x}");
+        }
+        let mut events = Vec::new();
+        window.poll(&mut events);
+        events.retain(|e| matches!(e, WindowEvent::Wheel { .. }));
+        assert_eq!(events, [
+            WindowEvent::Wheel { x: 10, y: 20, dx: 0, dy: 120 },
+            WindowEvent::Wheel { x: 30, y: 40, dx: 0, dy: -120 },
+            WindowEvent::Wheel { x: -5, y: 7, dx: 120, dy: 0 },
+        ]);
+    }
+
+    /// **`wait` sleeps until something arrives, and no longer**: with nothing queued it returns
+    /// `false` after the timeout and not before; with a message posted it returns `true` at once,
+    /// and the message is still there for the poll.
+    #[test]
+    #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+    fn wait_returns_when_a_message_arrives_and_times_out_without_one() {
+        use std::time::{Duration, Instant};
+        assert!(
+            std::env::var("OMNI_GFX_WINDOW_TESTS").is_ok_and(|v| v == "1"),
+            "run with --ignored but OMNI_GFX_WINDOW_TESTS is not 1; this creates a real window"
+        );
+        let mut window = Window::create(&WindowDesc::new("omnidroid: wait", 320, 240)).unwrap();
+        let mut drained = Vec::new();
+        window.poll(&mut drained);
+        let started = Instant::now();
+        assert!(!window.wait(Duration::from_millis(60)), "nothing was queued");
+        assert!(started.elapsed() >= Duration::from_millis(50), "returned early: {:?}", started.elapsed());
+        // SAFETY: a live window handle and a message with no pointer arguments.
+        assert_ne!(unsafe { PostMessageW(window.hwnd, WM_CHAR, 0x61, 1) }, 0);
+        let started = Instant::now();
+        assert!(window.wait(Duration::from_secs(5)), "a message was posted");
+        assert!(started.elapsed() < Duration::from_secs(1), "slept past it: {:?}", started.elapsed());
+        drained.clear();
+        window.poll(&mut drained);
+        assert_eq!(drained, [WindowEvent::Text { text: "a".to_owned() }]);
+    }
+
+    /// **A capture pins the cursor to one pixel of the client area and gives it back**: requested
+    /// on an unfocused window it is declined and nothing is clipped; granted on the focused one,
+    /// the clip is the one pixel under the cursor; released, the clip is what it was before; and
+    /// the focus leaving (`WM_KILLFOCUS` sent to the window procedure) ends it and says so.
+    ///
+    /// It takes the foreground, and briefly the cursor, which is why it is gated.
+    #[test]
+    #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+    fn a_capture_pins_the_cursor_and_the_focus_leaving_ends_it() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetClipCursor, SendMessageW, SetForegroundWindow,
+        };
+        assert!(
+            std::env::var("OMNI_GFX_WINDOW_TESTS").is_ok_and(|v| v == "1"),
+            "run with --ignored but OMNI_GFX_WINDOW_TESTS is not 1; this creates a real window"
+        );
+        let clip = || {
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: writes a `RECT`.
+            assert_ne!(unsafe { GetClipCursor(&raw mut rect) }, 0);
+            (rect.left, rect.top, rect.right, rect.bottom)
+        };
+        let before = clip();
+
+        // Never shown, so never focused: declined, and nothing clipped.
+        let mut hidden = Window::create(&WindowDesc::new("omnidroid: unfocused", 320, 240)).unwrap();
+        assert!(!hidden.set_pointer_capture(true).unwrap(), "declined without the focus");
+        assert!(!hidden.has_pointer_capture());
+        assert_eq!(clip(), before);
+        drop(hidden);
+
+        let mut window = Window::create(&WindowDesc::new("omnidroid: capture", 320, 240)).unwrap();
+        window.show();
+        // SAFETY: live window handle.
+        unsafe {
+            SetForegroundWindow(window.hwnd);
+            SetFocus(window.hwnd);
+        }
+        let mut drained = Vec::new();
+        window.poll(&mut drained);
+        // SAFETY: no arguments.
+        let focused = unsafe { GetFocus() };
+        assert_eq!(
+            focused,
+            window.hwnd,
+            "the test window could not take the focus (another window holds the foreground)"
+        );
+        assert!(window.set_pointer_capture(true).unwrap(), "granted with the focus");
+        assert!(window.has_pointer_capture());
+        let (left, top, right, bottom) = clip();
+        assert_eq!((right - left, bottom - top), (1, 1), "pinned to one pixel");
+        let mut origin = POINT { x: 0, y: 0 };
+        // SAFETY: a live window handle and a `POINT` written in place.
+        unsafe { ClientToScreen(window.hwnd, &raw mut origin) };
+        let (width, height) = window.client_size().unwrap();
+        assert!(
+            (origin.x..origin.x + width as i32).contains(&left)
+                && (origin.y..origin.y + height as i32).contains(&top),
+            "the pixel ({left}, {top}) is inside the client area at {origin:?}, {width}x{height}",
+            origin = (origin.x, origin.y)
+        );
+        // Asking again is a no-op; releasing gives the clip back.
+        assert!(window.set_pointer_capture(true).unwrap());
+        assert!(!window.set_pointer_capture(false).unwrap());
+        assert!(!window.has_pointer_capture());
+        assert_eq!(clip(), before);
+
+        // Captured again, then the focus leaves: ended, reported, and unclipped.
+        assert!(window.set_pointer_capture(true).unwrap());
+        window.poll(&mut drained);
+        drained.clear();
+        // SAFETY: a live window handle; `WM_KILLFOCUS` carries a window handle, null here.
+        unsafe { SendMessageW(window.hwnd, WM_KILLFOCUS, 0, 0) };
+        window.poll(&mut drained);
+        assert!(!window.has_pointer_capture());
+        assert_eq!(clip(), before);
+        let lost = drained.iter().position(|e| *e == WindowEvent::PointerCaptureLost);
+        let unfocused = drained.iter().position(|e| *e == WindowEvent::FocusChanged { focused: false });
+        assert!(
+            matches!((lost, unfocused), (Some(a), Some(b)) if a < b),
+            "the capture's end is reported, before the focus change: {drained:?}"
+        );
     }
 
     /// Feed `units` through one window's worth of `WM_CHAR` state, keeping every answer — the

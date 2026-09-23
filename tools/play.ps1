@@ -19,15 +19,31 @@
 # own Quick Sign-in: click Sign In, then Quick Sign-in, and enter the code it shows on a device that
 # is already signed in (Roblox app: More > Quick Sign In). A username and password typed into the
 # window also reach the app's fields.
+#
+# **The keyboard and the mouse are this computer's** (OMNI_KEYBOARD_MOUSE=1): the app is told it has
+# a hardware keyboard, and the mouse is a mouse -- hover, both buttons, the wheel, and a captured
+# pointer while the game locks the mouse (shift-lock, first person; the cursor disappears then, and
+# comes back when the game lets go or the window loses the focus). So WASD, Space, Tab and Esc, the
+# right-drag camera and the wheel zoom are the game's own, as on a device with a keyboard and mouse.
+#   powershell -ExecutionPolicy Bypass -File tools\play.ps1 -Phone      # a touch screen instead: the
+#                                                                        # mouse is a finger, no keyboard
 param(
     [int]$Minutes = 0,
     [switch]$Fresh,
+    [switch]$Phone,
     [string]$DataDir = (Join-Path $env:LOCALAPPDATA "Omnidroid\data")
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 $env:OMNI_M6_ROWS_21_22 = "1"
 $env:OMNI_GFX_WINDOW_TESTS = "1"
+if ($Phone) {
+    Remove-Item Env:\OMNI_KEYBOARD_MOUSE -ErrorAction SilentlyContinue
+    Write-Host "Omnidroid: the phone configuration -- the mouse is a finger, and there is no keyboard"
+} else {
+    $env:OMNI_KEYBOARD_MOUSE = "1"
+    Write-Host "Omnidroid: this computer's keyboard and mouse (OMNI_KEYBOARD_MOUSE=1)"
+}
 # 0: until the window is closed -- ten years is the gate's way of saying no limit.
 $seconds = if ($Minutes -gt 0) { $Minutes * 60 } else { 315360000 }
 $length = if ($Minutes -gt 0) { "a $Minutes-minute session" } else { "a session until the window is closed" }

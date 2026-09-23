@@ -83,6 +83,9 @@ pub struct NetPolicy {
     host_suffixes: BTreeSet<String>,
     /// Destination ports a connect or a sendto may use, for anything that is not loopback.
     ports: BTreeSet<u16>,
+    /// A socket bound to any address may `listen`. Set only by [`NetPolicy::allow_listen`] (and
+    /// implied by [`NetPolicy::unrestricted`]); see [`NetPolicy::check_listen`].
+    listen: bool,
 }
 
 impl NetPolicy {
@@ -107,7 +110,9 @@ impl NetPolicy {
         NetPolicy { loopback: true, ..NetPolicy::default() }
     }
 
-    /// Every destination, every port, every name.
+    /// Every destination, every port, every name -- and `listen` on any address
+    /// ([`check_listen`](Self::check_listen)), since a policy called unrestricted that still
+    /// refused one socket call would be a second meaning of the word.
     ///
     /// **Named so that it cannot be reached by accident.** There is no `NetPolicy::new()` that
     /// happens to be this, no builder that becomes this once enough rules are added, and no flag
@@ -166,6 +171,25 @@ impl NetPolicy {
         self
     }
 
+    /// Allow a socket bound to **any** address to `listen`, and so to `accept` connections from
+    /// whoever can route to this host.
+    ///
+    /// **The inbound gate, and a separate decision from every destination gate above.** A bind
+    /// is not policy-checked (a local address is not a destination), but `listen` is what turns a
+    /// bound stream socket into an inbound path, so it is the call this asks about. Without this
+    /// rule a socket may still listen when it is bound to a **loopback** address and
+    /// [`allow_loopback`](Self::allow_loopback) is set: nothing off this machine can reach it,
+    /// which is the same sentence that gate says about destinations.
+    ///
+    /// **What it does not decide:** which peers may connect. That is the host firewall's question
+    /// and not this layer's -- on Windows the first `listen` on a non-loopback address is the
+    /// moment the firewall asks the person at the machine.
+    #[must_use]
+    pub fn allow_listen(mut self) -> NetPolicy {
+        self.listen = true;
+        self
+    }
+
     /// Whether this policy admits nothing at all.
     ///
     /// Diagnostic: an embedding can assert it before a run, and a refusal message uses it to say
@@ -173,7 +197,7 @@ impl NetPolicy {
     /// which are different problems for whoever is reading the log.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        !self.unrestricted && !self.loopback && self.ports.is_empty()
+        !self.unrestricted && !self.loopback && self.ports.is_empty() && !self.listen
     }
 
     /// The rules, rendered for a refusal message.
@@ -196,6 +220,9 @@ impl NetPolicy {
         if !self.host_suffixes.is_empty() {
             let hosts: Vec<&str> = self.host_suffixes.iter().map(String::as_str).collect();
             parts.push(format!("names under {}", hosts.join(", ")));
+        }
+        if self.listen {
+            parts.push("listening on any address".to_owned());
         }
         parts.join("; ")
     }
@@ -242,6 +269,36 @@ impl NetPolicy {
                 address.port(),
                 self.describe()
             ),
+        ))
+    }
+
+    /// May a socket bound to `local` listen?
+    ///
+    /// Asked by `listen` with the address the socket is actually bound to -- what the host
+    /// reports, not what the guest asked for, so a bind to port 0 is judged on the address it was
+    /// given. Admitted under [`unrestricted`](Self::unrestricted) or
+    /// [`allow_listen`](Self::allow_listen), and on a loopback address under
+    /// [`allow_loopback`](Self::allow_loopback) alone.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Policy`] naming the local address and what the policy currently admits.
+    pub fn check_listen(&self, operation: &'static str, local: &SocketAddress) -> NetResult<()> {
+        if self.unrestricted || self.listen || (self.loopback && local.is_loopback()) {
+            return Ok(());
+        }
+        let why = if local.is_loopback() {
+            "the socket is bound to a loopback address and this instance's policy allows neither \
+             loopback nor listening"
+        } else {
+            "a socket bound to an address other machines can reach may listen only when the \
+             embedding has said so (`NetPolicy::allow_listen`); a loopback-bound one needs \
+             `allow_loopback`"
+        };
+        Err(NetError::policy(
+            operation,
+            local.to_string(),
+            format!("{why}. It allows: {}", self.describe()),
         ))
     }
 
@@ -472,5 +529,48 @@ mod tests {
         assert!(policy
             .check_address("sendto", &SocketAddress::V4 { address: [1, 1, 1, 1], port: 49_155 })
             .is_err());
+    }
+
+    /// **Who may listen where**, every cell of it. MEASURED why the gate exists: the engine's
+    /// MicroProfiler web server binds `0.0.0.0:1338` and listens (2026-09-23, the owner's session),
+    /// which is an inbound path from anyone who can route to this host.
+    #[test]
+    fn listening_is_its_own_decision_and_loopback_needs_only_the_loopback_gate() {
+        let any = SocketAddress::V4 { address: [0, 0, 0, 0], port: 1338 };
+        let lan = SocketAddress::V4 { address: [192, 168, 1, 5], port: 1338 };
+        let local = SocketAddress::loopback(IpFamily::V4, 1338);
+        let local6 = SocketAddress::loopback(IpFamily::V6, 1338);
+        let cases: [(&str, NetPolicy, [bool; 4]); 6] = [
+            ("closed", NetPolicy::closed(), [false, false, false, false]),
+            ("loopback only", NetPolicy::loopback_only(), [false, false, true, true]),
+            (
+                "every destination port",
+                NetPolicy::closed().allow_port_range(0, 65_535),
+                [false, false, false, false],
+            ),
+            ("allow_listen", NetPolicy::closed().allow_listen(), [true, true, true, true]),
+            ("unrestricted", NetPolicy::unrestricted(), [true, true, true, true]),
+            (
+                "loopback and listen",
+                NetPolicy::loopback_only().allow_listen(),
+                [true, true, true, true],
+            ),
+        ];
+        for (name, policy, expected) in cases {
+            for (address, want) in [&any, &lan, &local, &local6].into_iter().zip(expected) {
+                let got = policy.check_listen("listen", address);
+                assert_eq!(got.is_ok(), want, "{name}, listening on {address}: {got:?}");
+                if let Err(error) = got {
+                    assert!(matches!(error, NetError::Policy { .. }), "{error:?}");
+                    assert!(error.to_string().contains(&address.to_string()), "{error}");
+                }
+            }
+        }
+        // Listening is not a destination: `allow_listen` opens nothing outbound.
+        let listen_only = NetPolicy::closed().allow_listen();
+        assert!(!listen_only.is_closed());
+        assert!(listen_only.describe().contains("listening on any address"));
+        assert!(listen_only.check_address("connect", &lan).is_err());
+        assert!(listen_only.check_host("getaddrinfo", "example.com", 443).is_err());
     }
 }

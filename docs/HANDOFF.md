@@ -65,7 +65,7 @@ M4 and the texture work ran in parallel successfully. What made it safe:
 | | |
 |---|---|
 | Current branch | **`bionic-threads`** (M3 task 3 work) |
-| Working tree | **NOT clean on 2026-09-23 night**: four tested-but-unverified fixes -- see "UNCOMMITTED in the tree" under START HERE (`.claude/` is untracked scratch) |
+| Working tree | 2026-09-23 late night: the four fixes are committed; branch `base-0923-night` holds the rest -- see START HERE (`.claude/` is untracked scratch) |
 | HEAD | see `git log` |
 | Other branches | `android-abi` (M3 tasks 1-2), `bionic-pure` (the pure libc/libm subset), `cpu-execution` (M2), `foundation` (M0/M1), `main` (behind — holds only early docs) |
 | Remotes | **none configured** |
@@ -904,7 +904,148 @@ Read in this order:
 7. **`docs/briefs/`** -- two ready-to-launch subagent briefs for the current frontier
    (`webview2-seam.md`, `performance.md`).
 
-## 2026-09-23 night: A GAME WORLD LOADS AND RENDERS -- read this section first
+## 2026-09-23 late night: keyboard and mouse, the first freeze fixed, three machines -- read this first
+
+**The owner's verdict after joining a world twice tonight: "painfully slow, 2-3 fps, nowhere near
+playable"; the aim is 120 fps, ARM64 only.** Performance is still the first item. Everything below
+is MEASURED from this session's runs (scratchpad of session 50cf03b2: `play/p1.log`, `play/p2.log`,
+`suite-*.log`, `input-agent/`) unless it says otherwise.
+
+### Where the source is
+
+On `bionic-threads`, in order: `1f946d9` sincos, `23530d1` capacity (256 threads / 512 streams /
+JNIEnv per thread), `c6187b8` vkCmdCopyImageToBuffer, `caab859` the gate's 16 GiB space with an
+8 GiB commit ceiling, `23dd867` the two briefs (`docs/briefs/performance.md` rewritten for the
+world, `docs/briefs/input.md`). Each was mutation-verified with the tree to itself: sincos- 3/3,
+capacity- 5/5 (the rows the last handoff said existed did not -- they were written tonight),
+readback- 4/4, adapter-B3 re-anchored 1/1.
+
+**Branch `base-0923-night`** (one commit on `23dd867`, **the common base all three machines start
+from**) adds, NOT yet on `bionic-threads` because it is not fully verified by this project's rules:
+the input subagent's keyboard and mouse (its rows mouse- 22/22 and kbd- 3/3 caught in its own
+worktree), the `listen`/`accept` + `NetworkUtils` freeze fix (rows `inbound-` A1-A9, B1 written and
+pre-flighted, **not yet run**), and this handoff. With it, `cargo test -p omni-platform -p
+omni-android -p omni-gfx --release --no-fail-fast` passes every target (bionic 242/242 after the
+descriptor inventory learned `accept`; the headless gameactivity test passed this time). What
+remains before it goes onto `bionic-threads`: run `python tools/mutate.py --only inbound-` with
+the tree to yourself, then split it into its two commits (input, inbound) or merge it as one.
+
+**Branch `perf-world` (`9b3e5a2`) is UNREVIEWED work in progress** of the performance subagent,
+based on `23dd867`: instruments (`OMNI_PERF*`, `omni_platform::sampler`, translation counters),
+an `ExclusiveMonitor` option, a lost-update stress test. Default behaviour unchanged. Not merged.
+
+### What the two sessions showed
+
+* **p1** (`23dd867`, `OMNI_HARDWARE_KEYBOARD=1`): signed in, lobby (+338 s), teleport, main world
+  (+466 s) at 0-10 presents per 5 s. 20 asset downloads timed out at 60 s with partial bytes (p1
+  only; play17 had 0). Keys reached `nativePassKeyEvent` in the world (Tab, D held, Esc). **At
+  +635 s the game froze for good**: the engine's MicroProfiler web server (thread start link
+  `0x61f1580`; blocking socket, `0.0.0.0:1338`, `listen(fd, 8)` result ignored, then
+  `accept(fd, NULL, NULL)` in a loop) died on unbound `listen`, and a TaskScheduler worker died on
+  JNI `NetworkUtils.getPublicIPv4Addresseses`. FIXED in `base-0923-night` (below).
+* **p2** (keyboard/mouse + the freeze fix, `OMNI_KEYBOARD_MOUSE=1`): sign-in, Home and the menus
+  by mouse (2,048 moves, 50 buttons, 52 wheel notches, all returned). **Pet Simulator 99's
+  teleport to its main world failed 4 of 4 with `NoResponse`** from the world server
+  (`128.116.55.33`, `128.116.51.33`; the lobby on the same IPs connected in ~1 s) on ProtonVPN --
+  p1 the same night connected (in 33 s). Believed network (the VPN exit), not proven. Then the
+  owner joined place 606849621: **a TaskScheduler worker died at +760 s on unbound
+  `__vsprintf_chk`, the game froze, the server dropped the client (reason 266)** -- the next fix.
+* **Every freeze so far is one worker death with everything behind it**, and the close then hangs:
+  `onSurfaceDestroyedNative` spins its whole 2e9-instruction budget, `onStop` never runs, and
+  **the sign-in is not kept** (twice tonight). Until that is fixed each session needs a new
+  sign-in. Frontier item 5 of the previous section (name who holds each lock) is now urgent.
+
+### Built tonight (on `base-0923-night`)
+
+* **Keyboard and mouse** (`jni/mouse.rs`, `jni/keys.rs`, the window seam; decode in the module
+  docs): a mouse's press/move/release go to `vk.e.onTouch`'s mouse branch, hover/scroll/button
+  events to `vk.e$e.onGenericMotion`, captured motion to `vk.e$d.onCapturedPointer`;
+  `nativePassMouseMove(x, y, dx, dy)` in dp, `nativePassMouseButton` at the last move's position
+  with `getActionButton() - 1`, `nativePassMouseWheel` (vertical axis only). The engine locks the
+  pointer only for `LockCenter` (shift-lock, first person), and learns a keyboard and mouse exist
+  from events, not from `Configuration`. Window seam: `Wheel`, raw `PointerMotion` (`WM_INPUT`),
+  pointer capture (hide, pin, raw input; released on focus loss), `wait(timeout)`. Held keys and
+  buttons are released on focus loss. **`OMNI_KEYBOARD_MOUSE=1`** turns it on (`tools/play.ps1`
+  defaults to it; `-Phone` for the old touch configuration; the gate's default stays the phone).
+  Verified on the landing screen (a mouse click on Sign In -> `APP_READY(Login)`) and the menus in
+  p2; **never yet verified in a world** (WASD walking, right-drag camera, wheel zoom, shift-lock).
+* **`listen`/`accept`** in the net seam and bionic, with an inbound policy rule
+  (`NetPolicy::allow_listen`, `check_listen` asked with the bound address; loopback under
+  `allow_loopback`; `unrestricted` admits it). A blocking `accept` waits for its connection without
+  the 60 s cap -- sliced, ended by the teardown flag, bounded by `SO_RCVTIMEO` -- because
+  refusing after a minute would kill a correct thread. The accepted socket is blocking and not
+  close-on-exec (Linux semantics; Winsock would inherit). `accept4` stays unbound (nothing calls it).
+* **`NetworkUtils.getPublicIPv4Addresseses`**: the Java body transcribed
+  (`jni::classes::public_ipv4_addresses`: skip loopback, skip anything with ':', append
+  `addr + " : "`) over `omni_platform::net::interface_addresses()` (GetAdaptersAddresses), defined
+  by the gate at startup.
+
+### Still open, in order
+
+1. **Performance** -- see `docs/briefs/performance.md` and branch `perf-world`. Benchmarks so far
+   (not the world): the global exclusive monitor serializes all guest atomics (~2 M/s process-wide
+   with 8 threads) and **`23530d1` made each atomic ~2x slower** by sizing it for 256 threads
+   (57 -> 131 ns); a value-compare monitor is 12.8 ns and passes a lost-update stress test.
+   Indirect returns go through dynarmic's C++ block lookup: 125 ns per call+return at 262k blocks
+   vs 25 with return prediction (which needs a vendored patch to stay budget-stoppable -- a
+   decision record). The gate's per-symbol import census stays on all session: 238-280 ns per
+   crossing with 8 threads vs 35-46 off. Nothing measured in a world yet.
+2. **`__vsprintf_chk`** (the p2 death). Then whatever the next join reaches.
+3. **A worker death freezes the game and hangs the close** (above).
+4. **Raw `svc #0`** kills a TaskScheduler worker on every place load (+340 s and +490 s in p1): the
+   site (`0x32462e0`) is inside heavily obfuscated code (flattened control flow, computed syscall
+   number in `x8`). The faithful fix is generic -- route a guest's raw SVC through the same Linux
+   syscall emulation the `syscall()` import uses -- and answer truthfully.
+5. **Server kick, reason 304, "Roblox has detected missing or corrupted files"** (play17, +914 s,
+   ~225 s into the world). The test APK is re-signed ("Gloop") and modified; a stock APK is the
+   discriminating test. Not worked on: an integrity verdict is not something to work around.
+6. **The PS99 teleport `NoResponse`** under ProtonVPN (p2). Try another exit first.
+7. **The headless gate** (`--test gameactivity` without `OMNI_GFX_WINDOW_TESTS`) failed 3 of 3 here
+   at `a5443f3` and after: `open` of `LocalStorage/memProfStorage<pid>.json` refused with Windows
+   1224 (a re-open truncating a file with a live shared mapping; Linux allows it), and
+   `eglGetDisplay` (headless answers `dlopen("libvulkan.so")` NULL, the engine falls back to GLES,
+   EGL is unbound -- a device with neither does not exist, so this is a gate design question).
+   The input subagent's reruns passed it -- timing-dependent; treat as live.
+8. **16 mutation rows are stale at `a5443f3`** (android-mem-A1, boundary-A11/A12, adapter-A5,
+   guestmem-A3/A10, fs-A3, fallocate-B1, mmapfile-B2, threads-B2, dl-A5, pipe-B3, looper-B2,
+   confine-A3/A4, fmod-B6): re-anchor them before the next full-table run.
+
+### Decisions the owner was given tonight
+
+* **Login.** The owner asked for the old "bootstrap" that plants a `.ROBLOSECURITY` cookie into the
+  app. **Declined, and not to be built**: this project does not handle account credentials. The
+  supported path is the app's own persistence -- the owner signs in once, the window is closed
+  with its X so `onStop` runs, and later runs start from a *copy* of that data directory. That
+  works only once item 3 is fixed.
+* **Swapping in a newer Roblox APK is not drop-in.** The gate names the APK file and asserts
+  exactly 3,594 initializers; the Java side's behaviour this layer transcribes was decoded from
+  this version's obfuscated dex (`vk.e`, `vk.g`... change every release); a newer engine will
+  reach unbound imports and JNI members. Exported native entry points tend to be stable. Each
+  update is a porting job, and Roblox forces updates. The next APK should be stock and a single
+  arm64-v8a APK (the Play Store ships splits, which this runtime does not read).
+
+### Three machines, one source (from `base-0923-night`)
+
+The owner is continuing on three machines at once, each with its own Claude session and prompt:
+**Windows** (this PC) for performance; **macOS** (`berat@192.168.0.24`, Apple M1, 16 GB RAM,
+**~12 GB disk free**, macOS 26.5; Rust present, no cmake/Homebrew/Vulkan) to port the runtime;
+**Linux** (`berat@192.168.0.38`, Ubuntu 26.04, Intel i5-4460, 7 GB RAM, **NVIDIA Quadro 4000 --
+Fermi, no Vulkan driver exists for it**, so Mesa lavapipe; no toolchain installed). A copy of this
+folder (source, `.git` with every branch, and the APK; no `target/`) is on each Desktop as
+`omnidroid`. Each
+works on its own branch from `base-0923-night` -- `perf-windows`, `port-macos`, `port-linux` --
+and the three are merged into one source afterwards; the ownership rules that keep that merge
+mechanical are in each machine's prompt.
+
+**The owner's cross-platform requirement, for all three:** memory and CPU strictly on demand --
+no fixed reservation the way a VM takes one, no reliance on a page file. The scenario: boot peaks
+near 4 GB and settles near 800 MB; a machine with 8 GB and a nearly full disk must run ~10
+instances if they are started one at a time. What the runtime releases after boot (decommit /
+`madvise(MADV_DONTNEED)`), shares between instances (the library's file-backed pages already are:
+~104 MiB), and never commits speculatively (D10) decides that; the guest's own heap decides the
+rest, and every figure needs a measurement.
+
+## 2026-09-23 night: A GAME WORLD LOADS AND RENDERS -- the section before this one
 
 **Where it stands.** The owner signed in (Quick Sign-in), pressed Play on Pet Simulator 99 and
 the whole join ran on this layer: RakNet connected ("Connection accepted"), the lobby place loaded

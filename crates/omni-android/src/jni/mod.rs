@@ -48,6 +48,7 @@ pub mod classes;
 pub mod env;
 pub mod input;
 pub mod keys;
+pub mod mouse;
 pub mod pool;
 pub mod refs;
 pub mod script;

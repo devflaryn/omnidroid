@@ -330,6 +330,13 @@ CAPACITY_ARENA = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "
 # `vkCmdCopyImageToBuffer`: the guest-side handler, through the recording host double.
 VULKAN_READBACK = ["cargo", "test", "-p", "omni-android", "--release", "--test", "vulkan_present",
                    "--no-fail-fast", "an_image_copy_carries"]
+# Inbound sockets (`listen`, `accept`) and the host's interface addresses: the seam and the policy
+# from their own tests, the guest's calls from `tests/bionic.rs`, the Java body from the lib.
+INBOUND_PLAT = ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--test", "net_loopback",
+                "--no-fail-fast"]
+INBOUND_BIONIC = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+                  "listen_and_accept"]
+INBOUND_JNI = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "public_ipv4"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7612,6 +7619,294 @@ directory", ADAPTER_FILES,
     )?;
     host.cmd_copy_image_to_buffer(""",
      VULKAN_READBACK),
+
+    # ---- keyboard and mouse: `jni::mouse` (vk.e's mouse half), `jni::keys` focus loss, and the
+    # window seam's wheel and raw motion. Rows `mouse-*` and `kbd-*`. Each one is a decoded fact a
+    # wrong constant would break; the detectors are `jni::mouse`'s tests, `tests/input.rs`'s probes
+    # (real translated code, the registers each native reads) and the window seam's unit tests.
+    #
+    # **Positions in pixels where the engine reads dp.** `vk.e.y` divides by `q()` (`0x006a`); at
+    # this host's density of 1.0 no run could see it. The detectors are at 1.5.
+    ("mouse-A1", "A", "a mouse move reaches the engine in pixels instead of dp",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                let x = event.x / self.density;
+                let y = event.y / self.density;""",
+     """                let x = event.x;
+                let y = event.y;""",
+     INPUT),
+
+    # **The motion as the position.** `dx = x - m` (`0x007c`): the camera turns on dx/dy.
+    ("mouse-A2", "A", "a move's motion is its position rather than its difference from the last",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                let (dx, dy) = (x - self.m, y - self.n);""",
+     """                let (dx, dy) = (x, y);""",
+     INPUT),
+
+    # **`getActionButton()` without the `- 1`** (`0x0025`): left would be the engine's right.
+    ("mouse-A3", "A", "the button is the action button rather than the action button less one",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                button: event.action_button - 1,""",
+     """                button: event.action_button,""",
+     INPUT),
+
+    # **A press at the event's position.** `y` presses at `m`/`n`, the last move (`0x001d`), which a
+    # captured press (position 0, 0) shows.
+    ("mouse-A4", "A", "a press is sent at the event's position rather than the last move's",
+     "crates/omni-android/src/jni/mouse.rs",
+     """            MouseAction::ButtonPress | MouseAction::ButtonRelease => calls.push(MouseCall::Button {
+                x: self.m,
+                y: self.n,""",
+     """            MouseAction::ButtonPress | MouseAction::ButtonRelease => calls.push(MouseCall::Button {
+                x: event.x / self.density,
+                y: event.y / self.density,""",
+     INPUT),
+
+    # **The wheel's position not clamped at zero** (`0x0048`-`0x0057`, `cmpl-float`/`if-lez`).
+    ("mouse-A5", "A", "the wheel is sent at a negative position",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                let positive = |v: f32| if v > 0.0 { v } else { 0.0 };""",
+     """                let positive = |v: f32| v;""",
+     INPUT),
+
+    # **The host's wheel units as notches.** `AXIS_VSCROLL` is one per notch; Windows' is 120.
+    ("mouse-A6", "A", "a wheel notch reaches the engine as 120 notches",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                scroll.vscroll = dy as f32 / WHEEL_DELTA;""",
+     """                scroll.vscroll = dy as f32;""",
+     INPUT),
+
+    # **The lock's request inverted** (`vk.e$e` `0x00b0`-`0x00c3`): locked and not captured asks.
+    ("mouse-A7", "A", "a locked engine is not given the pointer capture",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                if locked()? && !has_capture {""",
+     """                if locked()? && has_capture {""",
+     INPUT),
+
+    # **The release inverted** (`vk.e$d` `0x0000`-`0x0014`): unlocked and captured gives it back.
+    ("mouse-A8", "A", "an unlocked engine keeps the pointer captured",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                if !locked()? && has_capture {""",
+     """                if !locked()? && !has_capture {""",
+     INPUT),
+
+    # **The captured position not accumulated** -- `AndroidMouseLockButtonFix` taken as on, where
+    # its compiled default is off (`di/a.<init>` `0x0c14`).
+    ("mouse-A9", "A", "a captured move does not accumulate the position",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                self.m += dx;
+                self.n += dy;""",
+     """                let _ = (dx, dy);""",
+     INPUT),
+
+    # **Relative motion in counts where the engine reads dp** (`vk.e.z` `0x001a`, `0x0025`).
+    ("mouse-A10", "A", "a captured move reaches the engine in counts instead of dp",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                let dx = event.relative.0 / self.density;
+                let dy = event.relative.1 / self.density;""",
+     """                let dx = event.relative.0;
+                let dy = event.relative.1;""",
+     INPUT),
+
+    # **A press without its move**: the engine is told the click happened where the pointer last
+    # was -- what a synthetic tap aimed at a button would do.
+    ("mouse-A11", "A", "a press that arrives without its move is not moved there first",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                if !captured {
+                    self.move_to(x, y, &mut out);
+                }
+                self.press(bit, captured, &mut out);""",
+     """                self.press(bit, captured, &mut out);""",
+     INPUT),
+
+    # **The middle button "repaired"**: `TERTIARY` is 4, so the Java side sends 3, which the engine
+    # makes `None` (`0x2e4d3ac`). Sending 2 would be a device that does not exist.
+    ("mouse-A12", "A", "the middle button is sent as MouseButton3",
+     "crates/omni-android/src/jni/mouse.rs",
+     """        PointerButton::Middle => BUTTON_TERTIARY,""",
+     """        PointerButton::Middle => 3,""",
+     INPUT),
+
+    # **Down and the button in each other's registers** (`w2`, `w3`; `0x02bbbd94`, `0x02bbbd98`).
+    ("mouse-A13", "A", "the button's down flag and index trade registers",
+     "crates/omni-android/src/jni/mouse.rs",
+     """            GuestArg::Int(u64::from(down)),
+            GuestArg::Int(i64::from(button) as u64),""",
+     """            GuestArg::Int(i64::from(button) as u64),
+            GuestArg::Int(u64::from(down)),""",
+     INPUT),
+
+    # **The position and the motion in each other's registers** (`s0`/`s1` x, y; `s2`/`s3` dx, dy).
+    ("mouse-A14", "A", "a move's position and motion trade registers",
+     "crates/omni-android/src/jni/mouse.rs",
+     """            GuestArg::Float(x),
+            GuestArg::Float(y),
+            GuestArg::Float(dx),
+            GuestArg::Float(dy),""",
+     """            GuestArg::Float(dx),
+            GuestArg::Float(dy),
+            GuestArg::Float(x),
+            GuestArg::Float(y),""",
+     INPUT),
+
+    # **Held buttons kept through a lost focus**: a right button the engine holds for ever is a
+    # camera that never stops turning.
+    ("mouse-A15", "A", "losing the focus releases only the back and forward buttons",
+     "crates/omni-android/src/jni/mouse.rs",
+     """                for bit in [BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY, BUTTON_BACK, BUTTON_FORWARD] {""",
+     """                for bit in [BUTTON_BACK, BUTTON_FORWARD] {""",
+     INPUT),
+
+    # **A capture the window lost, believed held**: the listener would never ask again.
+    ("mouse-A16", "A", "a lost pointer capture is not taken as lost",
+     "crates/omni-android/src/jni/mouse.rs",
+     """        if matches!(event, WindowEvent::PointerCaptureLost) {
+            self.captured = false;
+        }""",
+     """        let _ = matches!(event, WindowEvent::PointerCaptureLost);""",
+     INPUT),
+
+    # **A captured press routed as a generic one**: it would ask the engine for a capture the view
+    # already holds instead of reaching `vk.e.z`.
+    ("mouse-A17", "A", "a captured event is routed to the generic-motion listener",
+     "crates/omni-android/src/jni/mouse.rs",
+     """        let route = if captured {
+            Route::Captured
+        } else if matches!(action, MouseAction::Down | MouseAction::Move | MouseAction::Up) {""",
+     """        let route = if captured {
+            Route::Generic
+        } else if matches!(action, MouseAction::Down | MouseAction::Move | MouseAction::Up) {""",
+     INPUT),
+
+    # **The wheel's sign lost**: `WM_MOUSEWHEEL`'s high word is signed, so a notch towards the user
+    # read unsigned is 65,416.
+    ("mouse-B1", "A", "the wheel delta is read unsigned",
+     "crates/omni-platform/src/window/windows.rs",
+     """    ((wparam >> 16) & 0xffff) as u16 as i16 as i32""",
+     """    ((wparam >> 16) & 0xffff) as u16 as i32""",
+     ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast", "window::"]),
+
+    # **Absolute raw input taken as relative**: a remote-desktop mouse would teleport the camera.
+    ("mouse-B2", "A", "absolute raw input is taken as relative motion",
+     "crates/omni-platform/src/window/windows.rs",
+     """    if flags & MOUSE_MOVE_ABSOLUTE == 0 {""",
+     """    if flags & MOUSE_MOVE_ABSOLUTE != 0 {""",
+     ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast", "window::"]),
+
+    # **The first absolute report taken as motion from the origin.**
+    ("mouse-B3", "A", "the first absolute raw report is motion from the corner",
+     "crates/omni-platform/src/window/windows.rs",
+     """        None => (0, 0),""",
+     """        None => now,""",
+     ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast", "window::"]),
+
+    # **Relative motion replaced, not summed**, when a run of it is coalesced: every sample but the
+    # last between two polls lost.
+    ("mouse-B4", "A", "coalesced relative motion keeps only the newest sample",
+     "crates/omni-platform/src/window/mod.rs",
+     """        *sum_x = sum_x.saturating_add(*dx);
+        *sum_y = sum_y.saturating_add(*dy);""",
+     """        *sum_x = *dx;
+        *sum_y = *dy;""",
+     ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast", "window::"]),
+
+    # **The two wheel messages' axes swapped.**
+    ("mouse-B5", "A", "the vertical wheel is reported as the horizontal one",
+     "crates/omni-platform/src/window/windows.rs",
+     """    if msg == WM_MOUSEHWHEEL { (delta, 0) } else { (0, delta) }""",
+     """    if msg == WM_MOUSEWHEEL { (delta, 0) } else { (0, delta) }""",
+     ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast", "window::"]),
+
+    # **Keys held through a lost focus are not released**: Windows sends no key-up to a window
+    # without the focus, and Android's dispatcher cancels every held key when the focus leaves.
+    ("kbd-A1", "A", "losing the focus releases no held key",
+     "crates/omni-android/src/jni/keys.rs",
+     """            (WindowEvent::FocusChanged { focused: false }, _) => {""",
+     """            (WindowEvent::FocusChanged { focused: true }, _) => {""",
+     INPUT),
+
+    # **A released key still held**: released again at the next focus loss, and an auto-repeat
+    # held twice.
+    ("kbd-A2", "A", "a key that came up is still believed held",
+     "crates/omni-android/src/jni/keys.rs",
+     """            self.held.retain(|key| key.scan_code != call.scan_code);""",
+     """            self.held.retain(|_| true);""",
+     INPUT),
+
+    # **A cancel carrying the last press's repeat flag**: a cancel's repeat count is 0.
+    ("kbd-A3", "A", "a cancelling release is sent as an auto-repeat",
+     "crates/omni-android/src/jni/keys.rs",
+     """                    .map(|key| PassKeyEvent { down: false, repeat: false, ..*key })""",
+     """                    .map(|key| PassKeyEvent { down: false, ..*key })""",
+     INPUT),
+    # Inbound sockets and NetworkUtils: the MicroProfiler web server that froze a game world
+    # (2026-09-23). Two rows are deliberately absent -- dropping `accept`'s not-listening shortcut
+    # and its SO_RCVTIMEO deadline -- because the tests that catch them would HANG, not fail.
+    ("inbound-A1", "A", "a loopback-only policy admits listening on any address",
+     "crates/omni-platform/src/net/policy.rs",
+     "if self.unrestricted || self.listen || (self.loopback && local.is_loopback()) {",
+     "if self.unrestricted || self.listen || self.loopback {",
+     INBOUND_PLAT),
+    ("inbound-A2", "A", "listen skips the policy",
+     "crates/omni-platform/src/net/mod.rs",
+     """        self.policy.check_listen(OP, &local)?;
+""",
+     "",
+     INBOUND_PLAT),
+    ("inbound-A3", "A", "an unbound socket is judged as loopback rather than the wildcard",
+     "crates/omni-platform/src/net/mod.rs",
+     "            return Ok(SocketAddress::unspecified(self.family));",
+     "            return Ok(SocketAddress::loopback(self.family, 0));",
+     INBOUND_PLAT),
+    ("inbound-A4", "A", "the accepted socket keeps Winsock's inherited non-blocking mode",
+     "crates/omni-platform/src/net/mod.rs",
+     """        stream.set_nonblocking(false).map_err(|error| NetError::io(OP, peer.to_string(), &error))?;
+""",
+     "",
+     INBOUND_PLAT),
+    ("inbound-A5", "A", "the host's IPv4 addresses are skipped",
+     "crates/omni-platform/src/net/windows.rs",
+     "if family == AF_INET && length >= core::mem::size_of::<SOCKADDR_IN>() {",
+     "if false && family == AF_INET && length >= core::mem::size_of::<SOCKADDR_IN>() {",
+     INBOUND_PLAT),
+    ("inbound-A6", "A", "listen on a datagram socket reaches the seam instead of EOPNOTSUPP",
+     "crates/omni-android/src/bionic/net.rs",
+     "        if socket.kind() == SocketKind::Stream {\n            match settled(&view, socket.listen(backlog))? {",
+     "        if true {\n            match settled(&view, socket.listen(backlog))? {",
+     INBOUND_BIONIC),
+    ("inbound-A7", "A", "accept writes no peer address",
+     "crates/omni-android/src/bionic/net.rs",
+     """                    write_peer(&view, addr, addrlen, &peer)?;
+                    new_fd""",
+     """                    new_fd""",
+     INBOUND_BIONIC),
+    ("inbound-A8", "A", "getPublicIPv4Addresseses keeps loopback",
+     "crates/omni-android/src/jni/classes.rs",
+     """        if address.is_loopback() {
+            continue;
+        }
+        let text = address.to_string();""",
+     """        let text = address.to_string();""",
+     INBOUND_JNI),
+    ("inbound-A9", "A", "getPublicIPv4Addresseses keeps IPv6",
+     "crates/omni-android/src/jni/classes.rs",
+     """        if text.contains(':') {
+            continue;
+        }""",
+     "",
+     INBOUND_JNI),
+    ("inbound-B1", "B", "getPublicIPv4Addresseses drops the trailing separator Java leaves",
+     "crates/omni-android/src/jni/classes.rs",
+     """        result.push_str(&text);
+        result.push_str(" : ");
+    }
+    result""",
+     """        if !result.is_empty() {
+            result.push_str(" : ");
+        }
+        result.push_str(&text);
+    }
+    result""",
+     INBOUND_JNI),
 ]
 
 

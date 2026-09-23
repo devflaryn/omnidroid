@@ -41,6 +41,7 @@ use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
 use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput};
+use omni_android::jni::mouse::{MouseCall, MouseInput};
 use omni_android::jni::text::TextInput;
 use omni_android::jni::webview::{
     user_agent, BrowserEvent, BrowserHost, BrowserRequest, BrowserWindow, UserAgentFacts, WebViewProtocol,
@@ -919,6 +920,25 @@ fn define_host_answers(jni: &Jni, display: &Display) {
     )
     .expect("LoggingProtocol.getProcessTimestamp is declared");
 
+    // **`NetworkUtils.getPublicIPv4Addresseses()`: this host's own addresses**, through the Java
+    // body `omni_android::jni::classes::public_ipv4_addresses` transcribes. MEASURED why
+    // (2026-09-23): the engine's MicroProfiler asked for them in a game world, the worker that
+    // asked died on the refusal, and the game froze. Measured once, here; a device answers at
+    // call time, so an address that changes during a session (a VPN reconnecting) is not seen.
+    let addresses = omni_platform::net::interface_addresses()
+        .unwrap_or_else(|error| panic!("the host's interface addresses: {error}"));
+    let ipv4: &'static str = Box::leak(
+        omni_android::jni::classes::public_ipv4_addresses(&addresses).into_boxed_str(),
+    );
+    jni.define_method(
+        omni_android::jni::classes::NETWORK_UTILS,
+        omni_android::jni::classes::GET_PUBLIC_IPV4_ADDRESSES,
+        "()Ljava/lang/String;",
+        true,
+        Answer::Text(ipv4),
+    )
+    .expect("NetworkUtils.getPublicIPv4Addresseses is declared");
+
     // **The Java `Configuration` and the native `AConfiguration` answer the same question**, and a
     // host that decided one and left the other at its declared default would have the engine
     // reading two different screen widths from two places. Both are this gate's decision.
@@ -1432,12 +1452,29 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // `Configuration.keyboard` says QWERTY to the engine and to `vk.g` alike -- see
     // `omni_android::jni::keys`. Opt-in because the engine acts on it and the layer's default
     // device is a phone's, which the rest of this gate has been measured against.
-    let hardware_keyboard = graphics && std::env::var_os("OMNI_HARDWARE_KEYBOARD").is_some();
+    //
+    // **OMNI_KEYBOARD_MOUSE=1: this host's keyboard AND mouse** -- the play configuration
+    // (`tools/play.ps1`). The keyboard is declared as above, and the window's pointer is a mouse
+    // (`omni_android::jni::mouse`: hover, every button, the wheel, pointer capture for a locked
+    // mouse) rather than a finger; a host with no touch screen sends nothing to the touch path.
+    // Opt-in for this gate, whose measured default -- every stimulus switch included -- is the
+    // phone's: touch, and no keyboard.
+    let keyboard_mouse = graphics && std::env::var_os("OMNI_KEYBOARD_MOUSE").is_some();
+    let hardware_keyboard =
+        graphics && (keyboard_mouse || std::env::var_os("OMNI_HARDWARE_KEYBOARD").is_some());
     if hardware_keyboard {
         declare_hardware_keyboard(&guest.jni).expect("Configuration's keyboard fields are declared");
         let _ = writeln!(
             std::io::stderr(),
-            "INPUT: a hardware QWERTY keyboard is declared to the engine (OMNI_HARDWARE_KEYBOARD)"
+            "INPUT: a hardware QWERTY keyboard is declared to the engine ({})",
+            if keyboard_mouse { "OMNI_KEYBOARD_MOUSE" } else { "OMNI_HARDWARE_KEYBOARD" }
+        );
+    }
+    if keyboard_mouse {
+        let _ = writeln!(
+            std::io::stderr(),
+            "INPUT: the window's pointer is a MOUSE, not a finger (OMNI_KEYBOARD_MOUSE): hover, \
+             all buttons, the wheel and pointer capture reach the engine's mouse natives"
         );
     }
     let mut cpu = guest.thread();
@@ -2003,6 +2040,12 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     let mut keyboard: Option<KeyInput> = hardware_keyboard.then(|| {
         KeyInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied())
             .unwrap_or_else(|error| panic!("the key seam could not be built: {error}"))
+    });
+    // And the mouse, in the keyboard-and-mouse configuration: then the window's pointer events go
+    // here and not to `touch`, which stays only as the record of whether the surface is alive.
+    let mut mouse: Option<MouseInput> = (keyboard_mouse && window.is_some()).then(|| {
+        MouseInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied(), display.density())
+            .unwrap_or_else(|error| panic!("the mouse seam could not be built: {error}"))
     });
     let mut input_failure: Option<String> = None;
     // **OMNI_INPUT_PROBE=1: one SYNTHETIC press-drag-release**, through the same seam, at the
@@ -3017,6 +3060,87 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
     }
+    // **OMNI_LATE_KEYS=<s>@<make>[:<ms>][;...]: SYNTHETIC key presses** -- the physical key with
+    // set-1 make code `make` (hex; `e0` in front for an extended key: `11` is W, `0f` Tab, `e048`
+    // Up) down at second `s` and up `ms` later (default 100). The keys go where the host's keys go
+    // (a declared keyboard's `nativePassKeyEvent`, or an open text field), and nothing types: no
+    // `Text` event is made. Opt-in and said so, like every stimulus here.
+    if let (Some(_), Ok(list)) = (&touch, std::env::var("OMNI_LATE_KEYS")) {
+        use omni_platform::window::WindowEvent;
+        for press in list.split(';') {
+            let parsed = press.split_once('@').and_then(|(at, key)| {
+                let (make, hold) = key.split_once(':').unwrap_or((key, "100"));
+                Some((
+                    at.trim().parse::<f32>().ok()?,
+                    u32::from_str_radix(make.trim(), 16).ok()?,
+                    hold.trim().parse::<u32>().ok()?,
+                ))
+            });
+            let (at, scancode, hold) = parsed.unwrap_or_else(|| {
+                panic!("OMNI_LATE_KEYS={list:?}: {press:?} is not <second>@<make-hex>[:<ms>]")
+            });
+            late_input.push((at, WindowEvent::KeyDown { keycode: 0, scancode, repeat: false }));
+            late_input.push((at + hold as f32 / 1000.0, WindowEvent::KeyUp { keycode: 0, scancode }));
+        }
+        late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let _ = writeln!(std::io::stderr(), "LATE KEYS: SYNTHETIC key presses {list} (OMNI_LATE_KEYS)");
+    }
+    // **OMNI_LATE_WHEEL=<s>@<x>,<y>,<notches>[;...]: SYNTHETIC wheel notches** at window pixel
+    // (x, y) -- a move there, then one notch every 50 ms, positive away from the user.
+    if let (Some(_), Ok(list)) = (&touch, std::env::var("OMNI_LATE_WHEEL")) {
+        use omni_platform::window::WindowEvent;
+        for turn in list.split(';') {
+            let parsed = turn.split_once('@').and_then(|(at, rest)| {
+                let mut parts = rest.split(',').map(|part| part.trim().parse::<i32>().ok());
+                Some((at.trim().parse::<f32>().ok()?, parts.next()??, parts.next()??, parts.next()??))
+            });
+            let (at, x, y, notches) = parsed.unwrap_or_else(|| {
+                panic!("OMNI_LATE_WHEEL={list:?}: {turn:?} is not <second>@<x>,<y>,<notches>")
+            });
+            late_input.push((at, WindowEvent::PointerMoved { x, y }));
+            for notch in 0..notches.unsigned_abs() {
+                late_input.push((
+                    at + 0.05 * (notch + 1) as f32,
+                    WindowEvent::Wheel { x, y, dx: 0, dy: 120 * notches.signum() },
+                ));
+            }
+        }
+        late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let _ = writeln!(std::io::stderr(), "LATE WHEEL: SYNTHETIC wheel notches {list} (OMNI_LATE_WHEEL)");
+    }
+    // **OMNI_LATE_DRAG=<s>@<button>,<x>,<y>,<dx>,<dy>[;...]: a SYNTHETIC drag with any button**
+    // (`left`, `right`, `middle`) -- a move to (x, y), the press, 20 moves over one second to
+    // (x+dx, y+dy), the release. For the right-drag camera; `OMNI_LATE_INPUT` is the primary's.
+    if let (Some(_), Ok(list)) = (&touch, std::env::var("OMNI_LATE_DRAG")) {
+        use omni_platform::window::{PointerButton, WindowEvent};
+        for drag in list.split(';') {
+            let parsed = drag.split_once('@').and_then(|(at, rest)| {
+                let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+                let button = match *parts.first()? {
+                    "left" => PointerButton::Primary,
+                    "right" => PointerButton::Secondary,
+                    "middle" => PointerButton::Middle,
+                    _ => return None,
+                };
+                let number = |index: usize| parts.get(index)?.parse::<i32>().ok();
+                Some((at.trim().parse::<f32>().ok()?, button, number(1)?, number(2)?, number(3)?, number(4)?))
+            });
+            let (at, button, x, y, dx, dy) = parsed.unwrap_or_else(|| {
+                panic!("OMNI_LATE_DRAG={list:?}: {drag:?} is not <second>@<left|right|middle>,<x>,<y>,<dx>,<dy>")
+            });
+            late_input.push((at, WindowEvent::PointerMoved { x, y }));
+            late_input.push((at + 0.02, WindowEvent::PointerDown { button, x, y }));
+            for step in 1..=20 {
+                late_input.push((
+                    at + 0.02 + 0.05 * step as f32,
+                    WindowEvent::PointerMoved { x: x + dx * step / 20, y: y + dy * step / 20 },
+                ));
+            }
+            late_input.push((at + 1.1, WindowEvent::PointerUp { button, x: x + dx, y: y + dy }));
+        }
+        late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let _ = writeln!(std::io::stderr(), "LATE DRAG: SYNTHETIC drags {list} (OMNI_LATE_DRAG)");
+    }
     let mut resize_failure: Option<String> = None;
     // **OMNI_PROFILE=1**: `sample_profile` on its own thread for the whole session.
     let profiler = std::env::var_os("OMNI_PROFILE").is_some().then(|| {
@@ -3055,10 +3179,23 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // sat in front of it -- MEASURED, the first signed-in sessions: the render thread died on a
     // refused JNI lookup and the window simply stopped changing.
     let mut deaths_reported = guest.bionic.guest_thread_failures().len();
+    // **How often this loop turns.** The phone configuration keeps the measured 100 ms sleep. With
+    // a keyboard and mouse the loop instead waits on the window for up to that long and turns as
+    // soon as input arrives -- a key's press and release are otherwise handed over up to 100 ms
+    // late and in one batch -- but no more than once per `INPUT_TURN`, the ~60 Hz at which a
+    // device's `Choreographer` hands a view its batched motion.
+    const IDLE_TURN: std::time::Duration = std::time::Duration::from_millis(100);
+    const INPUT_TURN: std::time::Duration = std::time::Duration::from_millis(16);
+    // How many times the loop turned, for the report: the cost of turning on input.
+    let mut turns = 0u64;
+    // The last pointer-capture outcome logged, `(asked for, held)`.
+    let mut capture_said: Option<(bool, bool)> = None;
     while settle.elapsed() < session {
         if guest.bionic.live_guest_threads() == 0 || close_requested {
             break;
         }
+        let turn_started = std::time::Instant::now();
+        turns += 1;
         if let Some((at, started @ None)) = wait_trace.as_mut() {
             if settle.elapsed().as_secs_f32() >= *at {
                 omni_android::waits::enable();
@@ -3261,7 +3398,49 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                         }
                     }
                 }
-                if let Some(seam) = touch.as_mut() {
+                if let Some(seam) = mouse.as_mut() {
+                    // **The keyboard-and-mouse configuration: the pointer is a mouse.** Every event
+                    // goes through `jni::mouse`; a capture the listener asks for or gives back is
+                    // applied to the window, and what the window did is told back.
+                    if input_failure.is_none() {
+                        match seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event) {
+                            Ok(delivery) => {
+                                for call in delivery.calls.iter().filter(|call| !matches!(call, MouseCall::Move { .. })) {
+                                    let _ = writeln!(std::io::stderr(), "INPUT: mouse {call:?}");
+                                }
+                                if let Some(wanted) = delivery.capture {
+                                    match open.set_pointer_capture(wanted) {
+                                        Ok(held) => {
+                                            seam.set_pointer_capture(held);
+                                            // Said when the outcome changes: a request the window
+                                            // declines (no focus) is repeated on every hover.
+                                            if capture_said != Some((wanted, held)) {
+                                                capture_said = Some((wanted, held));
+                                                let _ = writeln!(
+                                                    std::io::stderr(),
+                                                    "INPUT: pointer capture {} by vk.e at +{:.1}s -> the window {}",
+                                                    if wanted { "requested" } else { "released" },
+                                                    settle.elapsed().as_secs_f32(),
+                                                    if held { "holds it" } else { "does not hold it (no focus)" }
+                                                );
+                                            }
+                                        }
+                                        Err(error) => input_failure = Some(format!("pointer capture: {error}")),
+                                    }
+                                }
+                                if matches!(event, omni_platform::window::WindowEvent::PointerCaptureLost) {
+                                    capture_said = None;
+                                    let _ = writeln!(
+                                        std::io::stderr(),
+                                        "INPUT: pointer capture lost with the focus at +{:.1}s",
+                                        settle.elapsed().as_secs_f32()
+                                    );
+                                }
+                            }
+                            Err(error) => input_failure = Some(format!("{event:?}: {error}")),
+                        }
+                    }
+                } else if let Some(seam) = touch.as_mut() {
                     let delivering = std::time::Instant::now();
                     let delivered = view.clone().and_then(|view| {
                         seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event, view)
@@ -3286,13 +3465,14 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     (Some(seam), true) => {
                         seam.deliver(&guest.jni, &guest.boundary, &mut cpu, 0, event)
                     }
-                    _ => Ok(None),
+                    _ => Ok(Vec::new()),
                 };
                 match keyed {
-                    Ok(Some(call)) => {
-                        let _ = writeln!(std::io::stderr(), "INPUT: nativePassKeyEvent {call:?}");
+                    Ok(calls) => {
+                        for call in calls {
+                            let _ = writeln!(std::io::stderr(), "INPUT: nativePassKeyEvent {call:?}");
+                        }
                     }
-                    Ok(None) => {}
                     Err(error) => input_failure = Some(format!("{event:?}: {error}")),
                 }
                 if let Some(error) = &input_failure {
@@ -3300,6 +3480,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     report_dead_guest_threads(&guest, "after a failed input delivery");
                     touch = None;
                     keyboard = None;
+                    mouse = None;
+                    // A capture held for a mouse that is gone would pin the cursor for the rest
+                    // of the session.
+                    let _ = open.set_pointer_capture(false);
                     break;
                 }
             }
@@ -3345,7 +3529,23 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        match window.as_ref() {
+            Some(open) if keyboard_mouse => {
+                let spent = turn_started.elapsed();
+                if spent < INPUT_TURN {
+                    std::thread::sleep(INPUT_TURN - spent);
+                }
+                open.wait(IDLE_TURN.saturating_sub(turn_started.elapsed()));
+            }
+            _ => std::thread::sleep(IDLE_TURN),
+        }
+    }
+    // A capture still held when the session ends is given back before the app is closed, so the
+    // cursor is not pinned through the close.
+    if let Some(open) = window.as_mut() {
+        if open.has_pointer_capture() {
+            let _ = open.set_pointer_capture(false);
+        }
     }
     // The page's window, if one is up, closes with the session.
     drop(web_view);
@@ -3463,6 +3663,32 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             seam.delivered(),
             seam.unmapped(),
             seam.withheld()
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "INPUT: {} key release(s) sent for keys held when the window lost the focus",
+            seam.cancelled()
+        );
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "INPUT: the UI loop turned {turns} time(s) in {:.0}s ({})",
+        settle.elapsed().as_secs_f32(),
+        if keyboard_mouse { "waiting on the window, at most every 16 ms" } else { "every 100 ms" }
+    );
+    if let Some(seam) = &mouse {
+        let counts = seam.counts();
+        let _ = writeln!(
+            std::io::stderr(),
+            "INPUT: mouse -- {} nativePassMouseMove, {} nativePassMouseButton, {} nativePassMouseWheel \
+             call(s) returned; the engine answered 'locked at the centre' {} time(s); vk.e asked for \
+             the pointer capture {} time(s) and gave it back {} time(s)",
+            counts.moves,
+            counts.buttons,
+            counts.wheels,
+            counts.locked,
+            counts.capture_requests,
+            counts.capture_releases
         );
     }
     // **What the engine asked the Vulkan loader for, in order** -- the census the stage tests
@@ -4990,6 +5216,156 @@ fn the_touch_native_reads_the_registers_the_seam_writes() {
             "{what} ({word:#010x}) is not before the handler call: {handed_on:08x?}"
         );
     }
+}
+
+/// **The mouse natives read the registers `jni::mouse` writes, and mean what it says they mean**,
+/// out of the real binary (`jni::mouse`'s module documentation has the decoding):
+///
+/// * `nativePassMouseMove` (`0x02bbbcf4`) parks `s0`-`s3` and hands them on in the same order --
+///   x, y, dx, dy;
+/// * `nativePassMouseButton` (`0x02bbbd78`) hands on x and y truncated to int (`fcvtzs` from `s0`,
+///   `s1`), the button from `w3` and the down flag from `w2`; its handler maps the button through
+///   a table bounded at 2 that holds the masks **1, 2, 4** -- so 0, 1, 2 are MouseButton1, 2, 3,
+///   and the 3 the Java side sends for the middle button is past it;
+/// * `nativePassMouseWheel` (`0x02bbbe00`) stores x and y from `s0`/`s1` and the delta from `s2`,
+///   scaled;
+/// * `nativeGetMainWindowIsMouseLockedCenter` (`0x02bbbca0`) answers the low bit of a handler
+///   that compares the lock state with **1** (`LockCenter`) and nothing else.
+///
+/// Matched as exact instruction words, encoded from their fields. Needs the ELF and not a run.
+#[test]
+fn the_mouse_natives_read_the_registers_the_seam_writes() {
+    use omni_android::jni::mouse::{
+        MOUSE_LOCKED_CENTER_SYMBOL, PASS_MOUSE_BUTTON_SYMBOL, PASS_MOUSE_MOVE_SYMBOL,
+        PASS_MOUSE_WHEEL_SYMBOL,
+    };
+    let _serial = serialized();
+    let bytes = main_lib_bytes();
+    let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+    let symbols = elf.exported_symbols().expect("read .dynsym");
+    let words_at = |vaddr: u64, count: usize| -> Vec<u32> {
+        let offset = elf.vaddr_to_offset(vaddr).expect("in a load segment");
+        bytes[offset..offset + 4 * count]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+            .collect()
+    };
+    let native = |name: &str| -> (u64, Vec<u32>) {
+        let symbol = symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("libroblox.so does not export `{name}`"));
+        (symbol.sym.st_value, words_at(symbol.sym.st_value, symbol.sym.st_size as usize / 4))
+    };
+    let is_bl = |word: &u32| word & 0xFC00_0000 == 0x9400_0000;
+    // The instructions before the native's first call, and those between it and the second.
+    let split = |words: &[u32]| -> (Vec<u32>, Vec<u32>, usize) {
+        let first = words.iter().position(is_bl).expect("the native calls the input singleton");
+        let second = first + 1 + words[first + 1..].iter().position(is_bl).expect("and the handler");
+        (words[..first].to_vec(), words[first + 1..second].to_vec(), second)
+    };
+    let target = |at: u64, word: u32| -> u64 {
+        let displacement = ((word & 0x03FF_FFFF) << 6) as i32 >> 6;
+        (at as i64 + 4 * i64::from(displacement)) as u64
+    };
+    let fmov_s = |rd: u32, rn: u32| 0x1E20_4000 | (rn << 5) | rd;
+    let mov_w = |rd: u32, rm: u32| 0x2A00_03E0 | (rm << 16) | rd;
+    let fcvtzs_w_s = |rd: u32, rn: u32| 0x1E38_0000 | (rn << 5) | rd;
+    let require = |name: &str, part: &str, words: &[u32], what: &str, word: u32| {
+        assert!(words.contains(&word), "{name}: {what} ({word:#010x}) is not in its {part}: {words:08x?}");
+    };
+
+    let (_, words) = native(PASS_MOUSE_MOVE_SYMBOL);
+    let (parked, handed_on, _) = split(&words);
+    for (what, word) in [
+        ("x is read from s0", fmov_s(11, 0)),
+        ("y is read from s1", fmov_s(10, 1)),
+        ("dx is read from s2", fmov_s(9, 2)),
+        ("dy is read from s3", fmov_s(8, 3)),
+    ] {
+        require(PASS_MOUSE_MOVE_SYMBOL, "prologue", &parked, what, word);
+    }
+    for (what, word) in [
+        ("x is handed on in s0", fmov_s(0, 11)),
+        ("y is handed on in s1", fmov_s(1, 10)),
+        ("dx is handed on in s2", fmov_s(2, 9)),
+        ("dy is handed on in s3", fmov_s(3, 8)),
+    ] {
+        require(PASS_MOUSE_MOVE_SYMBOL, "hand-off", &handed_on, what, word);
+    }
+
+    let (start, words) = native(PASS_MOUSE_BUTTON_SYMBOL);
+    let (parked, handed_on, second) = split(&words);
+    for (what, word) in [
+        ("x is read from s0", fmov_s(9, 0)),
+        ("y is read from s1", fmov_s(8, 1)),
+        ("down is read from w2", mov_w(20, 2)),
+        ("the button is read from w3", mov_w(19, 3)),
+    ] {
+        require(PASS_MOUSE_BUTTON_SYMBOL, "prologue", &parked, what, word);
+    }
+    for (what, word) in [
+        ("x is handed on, truncated, in w1", fcvtzs_w_s(1, 9)),
+        ("y is handed on, truncated, in w2", fcvtzs_w_s(2, 8)),
+        ("the button is handed on in w3", mov_w(3, 19)),
+        // `cset w4, ne` after `tst w20, #0xff`: down as a bool.
+        ("down is handed on in w4", 0x1A9F_07E4),
+    ] {
+        require(PASS_MOUSE_BUTTON_SYMBOL, "hand-off", &handed_on, what, word);
+    }
+    // The handler is a shim that branches to the body; the body maps the button through its table.
+    let shim_at = target(start + 4 * second as u64, words[second]);
+    let shim = words_at(shim_at, 8);
+    let branch = shim
+        .iter()
+        .position(|word| word & 0xFC00_0000 == 0x1400_0000)
+        .expect("the handler branches to its body");
+    let body_at = target(shim_at + 4 * branch as u64, shim[branch]);
+    let body = words_at(body_at, 0x140);
+    // `ldr w8, [x8, w28, uxtw #2]`: a load from a table of words indexed by the button.
+    let lookup = body
+        .iter()
+        .position(|&word| word == 0xB87C_5908)
+        .expect("the body indexes a table of words by the button (w28)");
+    assert!(
+        body[lookup.saturating_sub(6)..lookup].contains(&0x7100_0B9F),
+        "the table is bounded at 2 (`cmp w28, #2`) before it is read: {:08x?}",
+        &body[lookup.saturating_sub(6)..lookup]
+    );
+    let (adrp, add) = (body[lookup - 2], body[lookup - 1]);
+    assert_eq!(adrp & 0x9F00_0000, 0x9000_0000, "the table is addressed with adrp: {adrp:#010x}");
+    assert_eq!(add & 0xFFC0_0000, 0x9100_0000, "and its add: {add:#010x}");
+    let pages = ((((adrp >> 5) & 0x7FFFF) << 2 | ((adrp >> 29) & 3)) << 11) as i32 >> 11;
+    let page = ((body_at + 4 * (lookup as u64 - 2)) & !0xFFF) as i64 + (i64::from(pages) << 12);
+    let table_at = page as u64 + u64::from((add >> 10) & 0xFFF);
+    assert_eq!(
+        words_at(table_at, 3),
+        [1, 2, 4],
+        "the button masks at {table_at:#x}: 0 is MouseButton1 (1), 1 is MouseButton2 (2), 2 is \
+         MouseButton3 (4) -- and the middle button's 3 is past the table"
+    );
+
+    let (_, words) = native(PASS_MOUSE_WHEEL_SYMBOL);
+    for (what, word) in [
+        // `stp s0, s1, [sp]`: x and y, side by side, at the bottom of the event it builds.
+        ("x and y are stored from s0 and s1", 0x2D00_07E0),
+        // `fmul s2, s3, s2`: the delta, from s2, scaled.
+        ("the delta is read from s2 and scaled", 0x1E22_0862),
+        // `str s2, [sp, #8]`: after x and y.
+        ("the scaled delta is stored after them", 0xBD00_0BE2),
+    ] {
+        require(PASS_MOUSE_WHEEL_SYMBOL, "body", &words, what, word);
+    }
+
+    let (start, words) = native(MOUSE_LOCKED_CENTER_SYMBOL);
+    let (_, _, second) = split(&words);
+    require(MOUSE_LOCKED_CENTER_SYMBOL, "body", &words[second..], "the answer is the low bit (`and w0, w0, #1`)", 0x1200_0000);
+    let handler = words_at(target(start + 4 * second as u64, words[second]), 24);
+    let compare = handler
+        .iter()
+        .position(|&word| word == 0x7100_051F)
+        .expect("the handler compares the lock state with 1 (`cmp w8, #1`)");
+    assert_eq!(handler[compare + 1], 0x1A9F_17F3, "and answers equality (`cset w19, eq`): locked at the centre only");
 }
 
 /// **A host key reaches the USB HID usage the engine expects for it**, through the engine's own

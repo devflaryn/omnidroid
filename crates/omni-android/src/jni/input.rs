@@ -76,8 +76,11 @@
 //!   `vk.h`, `vk.i` -> pinch, rotate, pan) are Android framework timing and slop rules, not
 //!   Roblox's. The long-press id they would set starts at `-1` (`vk.e$g.<init>`), so the move path
 //!   never sends one here. **Missing, not faked**: nothing calls `nativePassTapGesture`.
-//! * Mouse-source events (`getSource() & 8194`) take `vk.e.y`, not this path. The host presents
-//!   its pointer as a finger -- see [`HostFinger`].
+//! * Mouse-source events (`getSource() & 8194`) take `vk.e.y`, not this path: decoded and
+//!   transcribed in [`super::mouse`]. This module is the **phone configuration**, where the host
+//!   presents its pointer as a finger -- see [`HostFinger`]; an embedding whose host has a mouse
+//!   uses [`super::mouse::MouseInput`] instead, and a device with no touch screen sends nothing
+//!   here.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -367,7 +370,8 @@ impl TouchListener {
     }
 }
 
-/// **The host's pointer as one finger** -- this embedding's decision, and the whole of it.
+/// **The host's pointer as one finger** -- this embedding's decision for the phone configuration,
+/// and the whole of it. With a mouse declared, [`super::mouse`] is the pointer instead.
 ///
 /// A mobile Roblox build is played by touch: an on-screen thumbstick, a jump button, and a drag to
 /// turn the camera. The host has a mouse. So the **primary button is contact**: pressing it puts
@@ -456,7 +460,7 @@ pub fn pass_input_args(env: GuestAddr, class: u64, call: &PassInput) -> [GuestAr
 /// Declare [`INPUT_CLASS`], memberless, if it is not declared yet -- the same shape as
 /// [`super::script::declare_script_classes`]: a class a static native is called on, which the
 /// host needs a `jclass` for and nothing looks members up on.
-fn declare_input_class(jni: &Jni) -> AbiResult<()> {
+pub(super) fn declare_input_class(jni: &Jni) -> AbiResult<()> {
     jni.with_registry(|registry| {
         if registry.find(INPUT_CLASS).is_some() {
             return Ok(());

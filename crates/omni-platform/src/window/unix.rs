@@ -126,6 +126,23 @@ impl Window {
     }
 
     /// Unreachable, as [`Window::show`].
+    pub(super) fn set_pointer_capture(&mut self, captured: bool) -> WindowResult<bool> {
+        let _ = captured;
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
+    pub(super) fn has_pointer_capture(&self) -> bool {
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
+    pub(super) fn wait(&self, timeout: core::time::Duration) -> bool {
+        let _ = timeout;
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
     pub(super) fn raw(&self) -> RawWindow {
         match *self {}
     }

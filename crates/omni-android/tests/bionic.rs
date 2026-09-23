@@ -1037,6 +1037,20 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          `omni_bionic::libm::sincos`, the double-precision `sincosf`, each value bit for bit \
          `sin`'s and `cos`'s.",
     ),
+    (
+        "listen",
+        "The owner's session in a game world (2026-09-23): the engine's MicroProfiler web server \
+         (thread start link 0x61f1580) bound 0.0.0.0:1338 and GUEST THREAD DIED at +635s on \
+         `listen` unbound; a TaskScheduler worker died beside it and the game froze. Asks \
+         NetPolicy::check_listen about the bound address, then the host's listen(2).",
+    ),
+    (
+        "accept",
+        "Bound beside `listen` from the same decode, before a run reached it: the web server's \
+         next call is accept(fd, NULL, NULL) (0x61f0efc, again at 0x61f12ac). A blocking accept \
+         waits for its connection (not capped; ended by the teardown flag, bounded by \
+         SO_RCVTIMEO); the new descriptor is blocking and not close-on-exec.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1090,7 +1104,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // 2026-09-23: 307 plus six, each in BEYOND_THE_PREDICTION with how it was found --
     // three pthread_condattr_*, pthread_attr_setschedparam, pthread_setschedparam, gethostname.
     // Then `sincos`, for 314: the in-game worker pool, once a join's data model began loading.
-    assert_eq!(symbols.len(), 314, "bound symbols: {symbols:?}");
+    // Then `listen` and `accept`, for 316: the MicroProfiler web server in a game world.
+    assert_eq!(symbols.len(), 316, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1194,7 +1209,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // game join died on, `pthread_attr_setschedparam` and `pthread_setschedparam` bound ahead of a
     // run from an audit of unnamed imports, and `gethostname`, a signed-in worker's next death.
     // **`sincos`, inline, for 314**: the in-game worker pool of the first join to connect.
-    assert_eq!(Bionic::inline_symbols().count(), 299);
+    // **`listen` and `accept`, inline, for 316**: the MicroProfiler web server's thread.
+    assert_eq!(Bionic::inline_symbols().count(), 301);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -10574,9 +10590,14 @@ fn every_symbol_that_produces_a_descriptor_has_had_its_readiness_decided() {
     ];
     let present: Vec<&str> =
         descriptor_makers.iter().copied().filter(|s| bound.contains(s)).collect();
+    // `accept` (2026-09-23) hands out the kind `socket` does -- `Filesystem::attach_socket` -- so
+    // its readiness is the socket arm's, a real host `select`; and the listening socket it takes
+    // from is readable when a connection is pending, which is what `accept`'s own wait polls
+    // (`listen_and_accept_serve_a_connection_from_guest_code` waits on exactly that).
     assert_eq!(
         present,
         vec![
+            "accept",
             "epoll_create1",
             "eventfd",
             "open",
@@ -14429,4 +14450,134 @@ fn getaddrinfo_with_a_null_node_answers_the_bind_or_loopback_address() {
     let head = read_u64_guest(&f, res);
     let _ = value_of(&f, "freeaddrinfo", |asm| { asm.mov(0, head); });
     assert_eq!(f.bionic.addrinfo_slab().live(), 0, "every list was handed back");
+}
+
+/// `sockaddr_in` for `127.0.0.1` or `0.0.0.0` and a port, as the guest lays it out.
+fn sockaddr_in(address: [u8; 4], port: u16) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..2].copy_from_slice(&2u16.to_le_bytes()); // sin_family = AF_INET
+    bytes[2..4].copy_from_slice(&port.to_be_bytes());
+    bytes[4..8].copy_from_slice(&address);
+    bytes
+}
+
+/// A guest stream socket bound to `127.0.0.1:0` and listening, and the port the host chose.
+fn guest_listener(f: &Fixture, type_flags: u64) -> (i32, u16) {
+    let (fd, errno) = call_with_errno(f, "socket", &[AF_INET, 1 | type_flags, 6]);
+    assert!(fd >= 3, "socket: {fd}, errno {errno}");
+    let at = f.guest.data + 0x100;
+    f.guest.write_bytes(at, &sockaddr_in([127, 0, 0, 1], 0));
+    assert_eq!(call_with_errno(f, "bind", &[fd as u64, at as u64, 16]), (0, 0), "bind");
+    assert_eq!(call_with_errno(f, "listen", &[fd as u64, 8]), (0, 0), "listen(fd, 8)");
+    let (out, len) = (f.guest.data + 0x140, f.guest.data + 0x160);
+    f.guest.write_bytes(len, &16u32.to_le_bytes());
+    assert_eq!(call_with_errno(f, "getsockname", &[fd as u64, out as u64, len as u64]), (0, 0));
+    let bytes = read_guest(f, out, 4);
+    (fd as i32, u16::from_be_bytes([bytes[2], bytes[3]]))
+}
+
+/// **The engine's MicroProfiler web server, from guest code**: a blocking `socket(AF_INET,
+/// SOCK_STREAM, IPPROTO_TCP)`, `bind`, `listen(fd, 8)`, then `accept` -- with the address
+/// written back, and with `NULL, NULL` as the engine passes (`0x61f0efc`). MEASURED why: that
+/// thread died on an unbound `listen` in the owner's session and the game froze with it
+/// (2026-09-23). The accepted descriptor carries data, is blocking even under a non-blocking
+/// listener (accept(2) does not inherit `O_NONBLOCK`), and a blocking `accept` waits for its
+/// connection rather than for a cap.
+#[test]
+fn listen_and_accept_serve_a_connection_from_guest_code() {
+    use std::io::{Read, Write};
+    let _guard = serialized();
+    let (f, _root) = networked("listen-accept");
+    let (listener, port) = guest_listener(&f, 0);
+    assert_ne!(port, 0, "the host chose a port");
+
+    // `accept(fd, &addr, &len)` with a client connected: a new descriptor, and the client's end.
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let (out, len) = (f.guest.data + 0x200, f.guest.data + 0x240);
+    f.guest.write_bytes(out, &[0xAA; 16]);
+    f.guest.write_bytes(len, &16u32.to_le_bytes());
+    let (accepted, errno) = call_with_errno(&f, "accept", &[listener as u64, out as u64, len as u64]);
+    assert!(accepted >= 3 && accepted != i64::from(listener), "accept: {accepted}, errno {errno}");
+    assert_eq!(read_u32_guest(&f, len), 16, "sizeof(struct sockaddr_in)");
+    let peer = read_guest(&f, out, 8);
+    assert_eq!(&peer[0..2], &[2, 0], "AF_INET");
+    assert_eq!(&peer[4..8], &[127, 0, 0, 1]);
+    let client_port = client.local_addr().expect("the client's end").port();
+    assert_eq!(u16::from_be_bytes([peer[2], peer[3]]), client_port, "the peer is the client");
+
+    // It carries the request and the response.
+    client.write_all(b"GET").expect("the client sends");
+    let buf = f.guest.data + 0x280;
+    let (got, errno) = call_with_errno(&f, "recvfrom", &[accepted as u64, buf as u64, 3, 0, 0, 0]);
+    assert_eq!((got, errno), (3, 0), "recvfrom on the accepted descriptor");
+    assert_eq!(read_guest(&f, buf, 3), b"GET");
+    f.guest.write_bytes(buf, b"200");
+    assert_eq!(call_with_errno(&f, "sendto", &[accepted as u64, buf as u64, 3, 0, 0, 0]).0, 3);
+    let mut back = [0u8; 3];
+    client.read_exact(&mut back).expect("the client receives");
+    assert_eq!(&back, b"200");
+
+    // **A blocking accept waits for its connection, not for a cap**: a client that arrives 300 ms
+    // later is accepted, with `NULL, NULL` as the engine passes them.
+    let later = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("the late client")
+    });
+    let started = std::time::Instant::now();
+    let (second, errno) = call_with_errno(&f, "accept", &[listener as u64, 0, 0]);
+    assert!(second >= 3, "a blocking accept that waited: {second}, errno {errno}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(250), "it waited for the client");
+    let _late = later.join().expect("the late client connected");
+
+    // `SO_RCVTIMEO` bounds a blocking accept as on Linux: EAGAIN when it runs out.
+    let timeval = f.guest.data + 0x2C0;
+    f.guest.write_u64(timeval, 0);
+    f.guest.write_u64(timeval + 8, 200_000); // 200 ms
+    assert_eq!(
+        call_with_errno(&f, "setsockopt", &[listener as u64, 1, 20, timeval as u64, 16]),
+        (0, 0),
+        "SO_RCVTIMEO"
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(call_with_errno(&f, "accept", &[listener as u64, 0, 0]), (-1, 11), "EAGAIN");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(150), "it waited the timeout");
+
+    // A non-blocking listener: EAGAIN at once with nothing pending; the accepted socket is
+    // blocking all the same (F_GETFL has no O_NONBLOCK).
+    let (quick, quick_port) = guest_listener(&f, 0o4000); // SOCK_NONBLOCK
+    assert_eq!(call_with_errno(&f, "accept", &[quick as u64, 0, 0]), (-1, 11), "EAGAIN");
+    let _client = std::net::TcpStream::connect(("127.0.0.1", quick_port)).expect("connect");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let fresh = loop {
+        let (fd, errno) = call_with_errno(&f, "accept", &[quick as u64, 0, 0]);
+        if fd >= 0 {
+            break fd;
+        }
+        assert_eq!(errno, 11, "only EAGAIN while the connection is on its way");
+        assert!(std::time::Instant::now() < deadline, "the connection never arrived");
+    };
+    let (flags, _) = call_with_errno(&f, "fcntl", &[fresh as u64, 3, 0]); // F_GETFL
+    assert_eq!(flags & 0o4000, 0, "the accepted socket is blocking: flags {flags:#o}");
+
+    // A stream socket that is not listening is EINVAL; a datagram socket is EOPNOTSUPP (95).
+    let (idle, _) = call_with_errno(&f, "socket", &[AF_INET, 1, 0]);
+    let at = f.guest.data + 0x100;
+    f.guest.write_bytes(at, &sockaddr_in([127, 0, 0, 1], 0));
+    assert_eq!(call_with_errno(&f, "bind", &[idle as u64, at as u64, 16]), (0, 0));
+    assert_eq!(call_with_errno(&f, "accept", &[idle as u64, 0, 0]), (-1, 22), "EINVAL");
+    let (datagram, _) = call_with_errno(&f, "socket", &[AF_INET, 2, 0]);
+    assert_eq!(call_with_errno(&f, "listen", &[datagram as u64, 8]), (-1, 95), "EOPNOTSUPP");
+    assert_eq!(call_with_errno(&f, "accept", &[datagram as u64, 0, 0]), (-1, 95), "EOPNOTSUPP");
+
+    // **The policy is asked at listen, about the bound address**: this file's policy is
+    // loopback-only, so the engine's own `0.0.0.0` bind may not listen, and the refusal says why.
+    let (wide, _) = call_with_errno(&f, "socket", &[AF_INET, 1, 6]);
+    f.guest.write_bytes(at, &sockaddr_in([0, 0, 0, 0], 0));
+    assert_eq!(call_with_errno(&f, "bind", &[wide as u64, at as u64, 16]), (0, 0));
+    let error = refusal_of(&f, "listen", |asm| {
+        asm.mov(0, wide as u64);
+        asm.mov(1, 8);
+    });
+    let text = error.to_string();
+    assert!(text.contains("allow_listen") && text.contains("0.0.0.0"), "{text}");
 }

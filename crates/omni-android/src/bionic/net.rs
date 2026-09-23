@@ -1718,6 +1718,9 @@ const EMSGSIZE: i32 = 90;
 const ENOPROTOOPT: i32 = 92;
 /// `ENOTSOCK`: the descriptor is open and is not a socket.
 const ENOTSOCK: i32 = 88;
+/// `EOPNOTSUPP`: `listen` or `accept` on a socket type that has no connections -- a datagram
+/// socket. 95 in the asm-generic numbering, where it is the same number as `ENOTSUP`.
+const EOPNOTSUPP: i32 = 95;
 /// `EADDRINUSE`.
 const EADDRINUSE: i32 = 98;
 /// `EADDRNOTAVAIL`.
@@ -2331,8 +2334,8 @@ pub(super) fn connect(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 ///
 /// **Not policy-checked, and that is the seam's decision rather than an omission here.**
 /// `NetPolicy` is a *destination* policy and a local address is not a destination; what a bind
-/// does open is an inbound path, which is a different question, and this layer has no `listen` and
-/// no `accept` so a stream socket cannot accept anything regardless.
+/// does open is an inbound path, which is a different question -- asked at [`listen`], where a
+/// stream socket's inbound path actually opens.
 pub(super) fn bind(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (fd, addr, addrlen) = {
         let mut a = c.args();
@@ -2433,6 +2436,173 @@ pub(super) fn getsockname(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     c.ret().i32(result);
     Ok(())
+}
+
+/// `int listen(int sockfd, int backlog)`
+///
+/// **MEASURED (the owner's session, 2026-09-23):** the engine's MicroProfiler web server -- a
+/// thread of its own, start routine link `0x61f1580` -- makes a blocking `socket(AF_INET,
+/// SOCK_STREAM, IPPROTO_TCP)`, binds `0.0.0.0` on the first free port of 1338-1358, logs "Web
+/// server started on port N", calls `listen(fd, 8)` without reading its result (`0x61f0eec`), and
+/// then loops on `accept(fd, NULL, NULL)` (`0x61f0efc`, `0x61f12ac`). It died on this symbol
+/// unbound, a TaskScheduler worker died beside it, and the game froze.
+///
+/// The policy is asked here, with the address the socket is bound to
+/// ([`NetPolicy::check_listen`]): `listen` is what turns a bound stream socket into an inbound
+/// path. A refusal names the rule, for [`settled`]'s reason. On a datagram socket the answer is
+/// Linux's `EOPNOTSUPP`.
+pub(super) fn listen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, backlog) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let mut socket = locked(&handle);
+        if socket.kind() == SocketKind::Stream {
+            match settled(&view, socket.listen(backlog))? {
+                Netted::Done(()) => 0,
+                Netted::Failed(errno) => {
+                    view.set_errno(errno);
+                    -1
+                }
+            }
+        } else {
+            view.set_errno(EOPNOTSUPP);
+            -1
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`
+///
+/// The connection comes back as a new descriptor that is **blocking and not close-on-exec**,
+/// whatever the listener is (accept(2): those flags are not inherited; `accept4` is the call that
+/// sets them, and it is not bound -- the MicroProfiler, the one reader, calls this). The peer is
+/// written through `addr`/`addrlen` by [`write_peer`]'s rule; a null `addr` asks for nothing.
+///
+/// # A blocking accept waits for a connection, however long that is
+///
+/// That is what `accept` is for: the MicroProfiler's thread sits here until a browser connects,
+/// which on a device may be never. So this is **not** capped at [`MAX_SLEEP_SECONDS`] as a
+/// guest-chosen sleep is -- a refusal after a minute would kill a thread that is behaving
+/// correctly. What the cap exists to prevent, a host thread nothing can end, is prevented as
+/// `poll` and `select` prevent it for a socket: the wait re-tests every [`MIXED_WAIT_SLICE`], ends
+/// the moment a connection is pending, and ends by name when the runtime stops its guest threads
+/// ([`stop_requested`]). A receive timeout (`SO_RCVTIMEO`) bounds it as Linux's `accept` honours
+/// one: `EAGAIN` when it runs out.
+///
+/// The host's own `accept` is made only when a connection is pending, **under the socket's lock
+/// with a zero-length poll just before it**, so a second guest thread that took the connection
+/// first leaves this one waiting rather than blocked inside the host call holding the lock.
+pub(super) fn accept(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, addr, addrlen) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?, a.next_u64()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let handle = match socket_of(&view, fs, fd)? {
+            Netted::Done(handle) => handle,
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                c.ret().i32(-1);
+                return Ok(());
+            }
+        };
+        let (kind, timeout) = {
+            let mut socket = locked(&handle);
+            let timeout = match socket.get_option(SocketQuery::ReceiveTimeout) {
+                Ok(OptionValue::Timeout(timeout)) => timeout,
+                _ => None,
+            };
+            (socket.kind(), timeout)
+        };
+        if kind != SocketKind::Stream {
+            view.set_errno(EOPNOTSUPP);
+            c.ret().i32(-1);
+            return Ok(());
+        }
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let accepted = loop {
+            {
+                let socket = locked(&handle);
+                // Not listening: the host's `accept` answers `EINVAL` at once, as Linux's does,
+                // and waiting for a readability that cannot come would hang on the mistake.
+                if socket.nonblocking() || !socket.listening() || readable_now(&socket) {
+                    break Some(socket.accept());
+                }
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break None;
+            }
+            stop_requested(c, &state)?;
+            let slice = deadline.map_or(MIXED_WAIT_SLICE, |deadline| {
+                deadline.saturating_duration_since(Instant::now()).min(MIXED_WAIT_SLICE)
+            });
+            wait_readable_for(&handle, slice);
+        };
+        let Some(accepted) = accepted else {
+            // `SO_RCVTIMEO` ran out with nothing pending: Linux's accept answers `EAGAIN`.
+            view.set_errno(consts::EAGAIN);
+            c.ret().i32(-1);
+            return Ok(());
+        };
+        match settled(&view, accepted)? {
+            Netted::Done((socket, peer)) => match settle(&view, fs.attach_socket(socket))? {
+                Settled::Done(new_fd) => {
+                    super::files::record_close_on_exec(&view, fs, new_fd, false)?;
+                    write_peer(&view, addr, addrlen, &peer)?;
+                    new_fd
+                }
+                Settled::Failed(errno) => {
+                    view.set_errno(errno);
+                    -1
+                }
+            },
+            Netted::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// Whether a locked socket is readable this instant: a zero-length poll, and a failed poll read
+/// as readable for [`await_socket`]'s reason -- the call that follows produces the host's own
+/// failure.
+fn readable_now(socket: &Socket) -> bool {
+    let mut entries = [PollEntry::new(socket, Interest::READABLE)];
+    match platnet::poll(&mut entries, Duration::ZERO) {
+        Ok(_) => {
+            let readiness = entries[0].readiness();
+            readiness.readable || readiness.error || readiness.hangup
+        }
+        Err(_) => true,
+    }
+}
+
+/// Sleep until the socket is readable or `slice` has passed, holding its lock for the one poll.
+fn wait_readable_for(handle: &std::sync::Mutex<Socket>, slice: Duration) {
+    let socket = locked(handle);
+    let mut entries = [PollEntry::new(&socket, Interest::READABLE)];
+    let _ = platnet::poll(&mut entries, slice);
 }
 
 /// `int shutdown(int sockfd, int how)`

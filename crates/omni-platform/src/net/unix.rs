@@ -126,6 +126,24 @@ pub(super) fn bind(inner: &Inner, address: &SocketAddress) -> NetResult<()> {
     unsupported("bind", "bind(2)")
 }
 
+/// Intended: `listen(2)`.
+pub(super) fn listen(inner: &Inner, backlog: i32) -> NetResult<()> {
+    let _ = (inner, backlog);
+    unsupported("listen", "listen(2)")
+}
+
+/// Intended: `accept(2)`, adopting the new descriptor into a `TcpStream` and reading the peer
+/// with `getpeername`.
+pub(super) fn accept(inner: &Inner) -> NetResult<(TcpStream, SocketAddress)> {
+    let _ = inner;
+    unsupported("accept", "accept(2)")
+}
+
+/// Intended: `getifaddrs(3)`, every `AF_INET` and `AF_INET6` entry in its order.
+pub(super) fn interface_addresses() -> NetResult<Vec<std::net::IpAddr>> {
+    unsupported("interface_addresses", "getifaddrs(3)")
+}
+
 /// Intended: `connect(2)` on a non-blocking descriptor.
 ///
 /// The decision in it, and it is the one that decides whether this seam works at all:

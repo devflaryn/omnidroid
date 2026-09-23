@@ -1971,14 +1971,21 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // replaced the refusal is not an open socket but `Bionic::set_network_policy`: an instance
     // whose embedding has not named a network creates no socket at all and says so by name.
     //
-    // `listen`, `accept`, `accept4`, `socketpair`, `epoll_*`, `sendmsg`/`recvmsg` and the `mmsg`
-    // forms are imported by `libroblox.so` and are deliberately **not here**: none has a
-    // primitive in `omni_platform::net` and no run has reached one (D17 -- importing is not
-    // calling). Each stays `Binding::Unbound`, whose call names the symbol and the guest address,
-    // and `guest_thread_failures()` now reports the first run that hits one by name.
+    // `accept4`, `socketpair`, `sendmmsg` and `getpeername` are imported by `libroblox.so` and
+    // are deliberately **not here**: no run has reached one (D17 -- importing is not calling).
+    // Each stays `Binding::Unbound`, whose call names the symbol and the guest address, and
+    // `guest_thread_failures()` reports the first run that hits one by name. (This comment used
+    // to list `listen`, `accept`, `epoll_*` and `sendmsg`/`recvmsg` too; each was bound when a
+    // run reached it.)
     ("socket", net::socket),
     ("connect", net::connect),
     ("bind", net::bind),
+    // The owner's session, 2026-09-23: the MicroProfiler web server's thread died on an unbound
+    // `listen`, and the game froze with it. `accept` is bound beside it from the same decode --
+    // the thread's next call (`0x61f0efc`), which the first run past `listen` would reach.
+    // Outside Task 1's 188; `BEYOND_THE_PREDICTION` records both.
+    ("listen", net::listen),
+    ("accept", net::accept),
     ("shutdown", net::shutdown),
     // M6's network run, one refusal after the keep-alive options: the settings-fetch thread asks
     // its connected socket which local end it was given. Outside Task 1's 188 and recorded in
