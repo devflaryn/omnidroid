@@ -1863,7 +1863,23 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // keeps the counts when the flag is cleared, so a stopped census is indistinguishable from a
     // stalled guest at the call site. Three sessions of work were spent on a deadlock that the
     // un-gated `Boundary::crossings` said, in one reading, was a guest running flat out.
-    guest.boundary.start_census();
+    //
+    // **`OMNI_IMPORT_CENSUS=off`, a measurement switch**, leaves it off for the session instead:
+    // the census costs every crossing on every thread a shared-counter increment and two stores to
+    // one process-wide pair of words (238-280 ns per crossing with 8 threads against 35-46 off, a
+    // benchmark), and whether that matters in a world is what the switch is for. Frames are
+    // counted by the Vulkan layer, not the census, so the FRAMES line is unaffected; every census
+    // reading after this point -- the watchdogs' per-thread INSIDE lines included -- is frozen, and
+    // says so here (`docs/VERIFICATION.md` entry 15).
+    if std::env::var("OMNI_IMPORT_CENSUS").is_ok_and(|value| value.trim() == "off") {
+        let _ = writeln!(
+            std::io::stderr(),
+            "CENSUS: OFF for the session (OMNI_IMPORT_CENSUS=off) -- a measurement; per-symbol counts \
+             and every thread's last-crossing record stop here"
+        );
+    } else {
+        guest.boundary.start_census();
+    }
 
     let handle = handle.unwrap_or_else(|error| {
         panic!("§8 step 13: initializeNativeCode did not return. {error}")
