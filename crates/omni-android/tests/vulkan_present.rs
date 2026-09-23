@@ -63,7 +63,7 @@ use omni_android::vulkan::{
     HostImageRef, HostImageView, HostInstance, HostPhysicalDevice, HostPipeline, HostPipelineCache,
     HostPipelineLayout, HostQueryPool, HostQueue, HostRenderPass, HostSampler, HostSemaphore,
     HostShaderModule, QueryPoolRequest, QUERY_POOL_CREATE_INFO_BYTES, IMAGE_COPY_BYTES,
-    IMAGE_BLIT_BYTES,
+    IMAGE_BLIT_BYTES, MAX_BARRIERS,
     DescriptorWrites, DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_BYTES,
     DESCRIPTOR_UPDATE_TEMPLATE_ENTRY_BYTES, STYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
     HostSurface, HostSwapchain, ImageRequest, ImageViewRequest, InstanceRequest, MemoryAllocation,
@@ -2475,6 +2475,22 @@ fn the_barriers_stacked_arguments_are_read_and_a_buffer_barrier_refuses() {
     assert!(matches!(entry.image, HostImageRef::Swapchain(_)), "the image is a token");
     assert_eq!(entry.subresource_range.len(), IMAGE_SUBRESOURCE_RANGE_BYTES);
     drop(log);
+
+    // **The engine's own batch**, MEASURED: 135 image barriers in one call, every one of which
+    // reaches the host -- and one past the bound is refused by its count, not truncated to it.
+    let batch: Vec<u8> = (0..135).flat_map(|_| image_barrier.clone()).collect();
+    let batch_at = up.f.bytes(&batch);
+    let stages = [u64::from(STAGE_TOP_OF_PIPE), u64::from(STAGE_TRANSFER)];
+    up.f.call_n(barrier, &[command, stages[0], stages[1], 0, 0, 0, 0, 0, 135, batch_at])
+        .expect("the engine's batch records");
+    assert_eq!(up.host.log().barriers[1].image_barriers.len(), 135, "all of it");
+    let past = (MAX_BARRIERS + 1) as u64;
+    let text = up
+        .f
+        .refusal(barrier, &[command, stages[0], stages[1], 0, 0, 0, 0, 0, past, batch_at])
+        .to_string();
+    assert!(text.contains(&format!("imageMemoryBarrierCount = {past}")), "{text}");
+    assert_eq!(up.host.log().barriers.len(), 2, "the refused one recorded nothing");
 
     // **A buffer memory barrier still refuses, and the reason changed in stage 5.** Stage 4
     // refused because there was no `VkBuffer` registry to resolve the handle through; there is

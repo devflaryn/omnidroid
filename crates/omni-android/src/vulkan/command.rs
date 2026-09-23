@@ -167,10 +167,12 @@ pub const MAX_COMMAND_BUFFERS_PER_CALL: usize = super::MAX_COMMAND_BUFFERS / 2;
 
 /// How many barriers of one kind a single `vkCmdPipelineBarrier` may name.
 ///
-/// An allocation bound. Thirty-two image barriers in one call is already an unusual renderer —
-/// a deferred pass transitioning every G-buffer attachment at once is a handful — and each is 72
-/// bytes, so the largest read this permits is 2,304 bytes.
-pub const MAX_BARRIERS: usize = 32;
+/// An allocation bound, **defined as a relation**: half of every image the guest can create,
+/// transitioned in one call. MEASURED why 32 was not one: the engine's renderer names 135 image
+/// barriers in a single call -- a frame's render targets and textures moved at once -- and the 32
+/// this used to be refused it. Each image barrier is 72 bytes, so the largest read this permits
+/// is 72 pages.
+pub const MAX_BARRIERS: usize = super::MAX_CREATED_IMAGES / 2;
 
 /// How many `VkImageSubresourceRange`s one `vkCmdClearColorImage` may name.
 ///
@@ -811,8 +813,8 @@ fn bounded(at: &Site, call: &str, field: &str, count: u32) -> AbiResult<usize> {
             "the guest called `{call}` from {caller:#x} with `{field} = {count}`, and this layer \
              reads at most {MAX_BARRIERS}. The count is a guest `uint32_t` indexing an array of \
              structures, so honouring it unbounded would be a guest-controlled host allocation \
-             (Global Constraint 11). Thirty-two barriers of one kind in one call is already more \
-             than any renderer this project has seen",
+             (Global Constraint 11). The bound is half of every image the guest can create; \
+             MEASURED, the engine's renderer names 135 in one call",
             caller = at.caller
         )));
     }
@@ -893,11 +895,12 @@ mod tests {
         // relation -- one call cannot fill the registry on its own.
         assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL * 2, super::super::MAX_COMMAND_BUFFERS);
         assert_eq!(super::super::MAX_COMMAND_BUFFERS, 4096);
-        assert_eq!(MAX_BARRIERS, 32);
+        assert_eq!(MAX_BARRIERS, 4096);
+        assert_eq!(MAX_BARRIERS * 2, super::super::MAX_CREATED_IMAGES);
         assert_eq!(MAX_CLEAR_RANGES, 8);
-        // The largest read each bound permits, in bytes -- all well under a page.
+        // The largest read each bound permits, in bytes.
         assert_eq!(MAX_COMMAND_BUFFERS_PER_CALL * 8, 16384, "four pages at most");
-        assert_eq!(MAX_BARRIERS * IMAGE_MEMORY_BARRIER_BYTES, 2304);
+        assert_eq!(MAX_BARRIERS * IMAGE_MEMORY_BARRIER_BYTES, 72 * 4096, "72 pages at most");
         assert_eq!(MAX_CLEAR_RANGES * IMAGE_SUBRESOURCE_RANGE_BYTES, 160);
     }
 }
