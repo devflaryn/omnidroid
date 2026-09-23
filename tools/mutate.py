@@ -2746,6 +2746,32 @@ directory", ADAPTER_FILES,
         let still_expected = || true;""",
      ANDROID_LIB),
 
+    # ---- a guest thread's stack outlives a death this layer caused ------------------------------
+    # MEASURED in M6: a worker sampling a table of per-thread records read one on the stack of a
+    # thread this layer had killed, found it unmapped, and died of a MemoryFault filed as a failure
+    # of its own. bionic frees a stack only after its thread EXITED, and Linux cannot stop one
+    # thread mid-function. So only a thread that returned with its destructors run gives its stack
+    # back. A1 unmaps every stack again. A2 forgets that teardown skips the destructors.
+    ("threadstack-A1", "A", "a killed or stopped guest thread's stack is unmapped under its siblings",
+     ADAPTER_THREADS,
+     """    let given_back = if exited { bionic.space_ref().unmap(base, len) } else { Ok(()) };""",
+     """    let given_back = if true || exited { bionic.space_ref().unmap(base, len) } else { Ok(()) };""",
+     ANDROID),
+
+    ("threadstack-A2", "A", "a thread returning during teardown gives back a stack its skipped destructors left pointed into",
+     ADAPTER_THREADS,
+     """    let exited = matches!(state, GuestThreadState::Returned(_)) && !bionic.guest_threads_stopping();""",
+     """    let exited = matches!(state, GuestThreadState::Returned(_));""",
+     ANDROID),
+
+    # The over-correction: never give a stack back. It passes every "keeps its stack" test and
+    # leaks about a megabyte of address space for every thread the engine creates and joins.
+    ("threadstack-B1", "B", "no guest thread ever gives its stack back",
+     ADAPTER_THREADS,
+     """    let given_back = if exited { bionic.space_ref().unmap(base, len) } else { Ok(()) };""",
+     """    let given_back = if false && exited { bionic.space_ref().unmap(base, len) } else { Ok(()) };""",
+     ANDROID),
+
     # A thread that stopped without returning produced no `void *`. Reporting 0 with an untouched
     # `retval` is indistinguishable from a thread that returned NULL, which is the one answer the
     # guest cannot tell apart from success.
