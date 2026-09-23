@@ -5,7 +5,7 @@ because each one produced a **green suite that proved less than it claimed**, an
 person who wrote the test was the person who wrote the code — which is the blind spot that makes all
 of them possible.
 
-There are **nineteen** of them. Entry 12 arrived in M5 and is the only one found by a test that
+There are **twenty-one** of them. Entry 12 arrived in M5 and is the only one found by a test that
 could not be written rather than by one that passed. Entry 13 arrived in M6 and is the only one
 found by reviewing a *copy* of the defect rather than the original. Entry 14 arrived in M6 and is
 the only one where a **test asserted the defect** and a comment supplied the reasoning that made
@@ -431,6 +431,33 @@ the rectangle): 377 distinct colours on an 8-pixel grid -- the engine's own imag
 > An instrument that returns a default when it cannot see is indistinguishable from one that saw
 > the default. Before a capture, a count or a log is allowed to say "nothing", it has to be shown
 > seeing *something* on a case where the answer is known.
+
+## 20. A test that builds its own input tests a caller that does not exist
+
+`showKeyboard`'s answer was written with a unit test that handed it the call's arguments as the
+answer expected to receive them: the `byte[]` and the `NativeTextBoxInfo` as resolved objects. The
+test passed, the mutation checks passed, and the first live run refused a real array as **null**.
+`read_varargs` -- the only thing that ever calls an answer -- hands object parameters on as **raw
+handles** (`Value::Long`), for the consumer to resolve, and says so in a comment three hundred lines
+away. The answer matched the shape the test built and not the shape the caller sends.
+
+The corrected test passes handles made the way the guest makes them (`new_local`, `reference_to`),
+and against the first version it fails exactly as the live run did.
+
+> A unit's input has to come from the thing that really calls it, or be built by the same code. A
+> test that constructs a convenient representation proves the unit handles that representation --
+> which nobody sends.
+
+## 21. A stimulus aimed at a screen is only as good as the capture it was aimed from
+
+Taps were aimed at the landing screen's Sign In button from a capture: `(640, 397)`. They navigated
+in some runs and did nothing in others, with identical events delivered each time. The captures
+explained it at once: the runs that worked had been through the resize probe, and **without a
+resize the whole layout sits 30 px higher** -- Sign In spans y 342-391, so y 397 was just below it.
+Nothing was wrong with input; the target had moved.
+
+> Aim a synthetic tap from a capture of the same configuration it will land in, and capture after
+> it. "The engine ignored the tap" and "the tap missed" look the same in every log.
 
 # Process rules these produced
 
