@@ -35,6 +35,7 @@
 //! | [`Socket::new`] | **backend**: `socket(2)` | **`Unsupported`**, naming `socket(2)` |
 //! | [`connect`](Socket::connect), [`bind`](Socket::bind) | **backend**: `connect(2)`, `bind(2)` | **`Unsupported`** |
 //! | `SO_ERROR`, `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_RCVBUF`, `SO_SNDBUF`, `IPV6_V6ONLY` | **backend**: `getsockopt`/`setsockopt` | **`Unsupported`** |
+//! | `SO_LINGER` on a stream, `SO_BROADCAST` on a datagram socket; each kept on the other kind | **backend**, and this crate's own record where Winsock refuses what Linux keeps | **`Unsupported`** |
 //! | the three keep-alive *timing* options | **backend**: `getsockopt`/`setsockopt`, **and the option numbers differ between hosts** — see [`SocketOption::KeepAliveIdle`] | **`Unsupported`** |
 //! | [`poll`] — readiness | **backend**: `select` on Windows | **`Unsupported`**, naming `poll(2)` |
 //!
@@ -172,7 +173,7 @@ pub const MAX_POLL_SOCKETS: usize = 1024;
 pub const IMPLEMENTED_OPTIONS: &str =
     "SO_ERROR (read-only), SO_REUSEADDR, SO_KEEPALIVE, TCP_NODELAY, SO_RCVBUF, SO_SNDBUF,      SO_RCVTIMEO, \
      SO_SNDTIMEO, IPV6_V6ONLY, TCP_KEEPIDLE (Windows spells it TCP_KEEPALIVE), TCP_KEEPINTVL, \
-     TCP_KEEPCNT";
+     TCP_KEEPCNT, SO_LINGER (off, or on with a zero timeout, on a stream socket), SO_BROADCAST";
 
 /// Which protocol a socket speaks.
 ///
@@ -451,6 +452,42 @@ pub enum SocketOption {
     /// spelling and are not carried -- a caller asking for one is refused by name above this seam.
     /// MEASURED reader: ngtcp2, the engine's QUIC transport, which needs DF for its path-MTU probing.
     DontFragment(bool),
+    /// `SO_LINGER`: what `close` does with data still unsent. `None` is off -- the close returns
+    /// at once and the stack sends what is queued in the background, the default -- and
+    /// `Some(ZERO)` is the abortive close, a reset with the queue discarded.
+    ///
+    /// **On a stream socket it is the host's**, `SO_LINGER` with Winsock's `LINGER`. `Some` with a
+    /// nonzero time is **refused by name**: Linux's `close` then blocks up to that long even on a
+    /// non-blocking socket, where Winsock's `closesocket` on a non-blocking socket fails with
+    /// `WSAEWOULDBLOCK` and leaves the socket open -- and this crate's close is a drop that
+    /// cannot retry, so accepting it would leak the socket. Implementing it means making the
+    /// socket blocking before that drop; nothing has asked.
+    ///
+    /// **On a datagram socket it is kept here and acts on nothing, which is Linux's own
+    /// behaviour.** Linux accepts `SO_LINGER` on every socket and UDP's close ignores it (there is
+    /// no unsent data a datagram socket's close could wait for); Winsock refuses it on one
+    /// (`WSAENOPROTOOPT`, MEASURED on 10.0.26200). Refusing where Linux accepts would fail a
+    /// caller a device serves -- MEASURED: the engine's game-socket setup (`0x502aa70`) sets it
+    /// off on its UDP socket and its worker died on the refusal (2026-09-23).
+    Linger(Option<Duration>),
+    /// `SO_BROADCAST`: whether sends to a broadcast address are allowed.
+    ///
+    /// **On a datagram socket it is the host's**; on a stream socket it is kept here and acts on
+    /// nothing, as on Linux, which accepts it on every socket, where Winsock refuses it on a
+    /// stream one (`WSAENOPROTOOPT`, MEASURED). MEASURED reader: the same game-socket setup,
+    /// which sets it on right after `SO_LINGER`.
+    Broadcast(bool),
+}
+
+/// The options Linux accepts on a socket kind they do nothing to and Winsock refuses there: kept
+/// here so that the socket reports what was set, which is all Linux does with them. See
+/// [`SocketOption::Linger`] and [`SocketOption::Broadcast`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Kept {
+    /// `SO_LINGER` on a datagram socket.
+    linger: Option<Duration>,
+    /// `SO_BROADCAST` on a stream socket.
+    broadcast: bool,
 }
 
 /// An option to read back from a socket.
@@ -504,6 +541,11 @@ pub enum SocketQuery {
     SendTimeout,
     /// `IPV6_V6ONLY`.
     V6Only,
+    /// `SO_LINGER`. Answers [`OptionValue::Linger`]; see [`SocketOption::Linger`] for where the
+    /// answer comes from on each socket kind.
+    Linger,
+    /// `SO_BROADCAST`. Answers [`OptionValue::Flag`].
+    Broadcast,
 }
 
 /// What a [`SocketQuery`] answered.
@@ -527,6 +569,8 @@ pub enum OptionValue {
     Interval(Duration),
     /// A count of things, which is neither a size in bytes nor a duration.
     Count(u32),
+    /// The answer to [`SocketQuery::Linger`]: `None` when lingering is off.
+    Linger(Option<Duration>),
 }
 
 /// Which of the two buffer options a backend call is about.
@@ -605,6 +649,8 @@ pub struct Socket {
     /// keeps the *count* right: the error is readable exactly once, by whoever asks first, which
     /// is what a device does.
     pending_error: Option<NetErrorKind>,
+    /// What this socket keeps of the options the host refuses on its kind. See [`Kept`].
+    kept: Kept,
     /// This socket's identity in [`record`], handed out at creation whether or not anything is
     /// recording.
     ///
@@ -641,6 +687,7 @@ impl Socket {
             connect: ConnectState::None,
             named: false,
             pending_error: None,
+            kept: Kept::default(),
             record: record::next_id(),
         })
     }
@@ -1075,6 +1122,34 @@ impl Socket {
             SocketOption::DontFragment(on) => {
                 backend::set_dont_fragment(&self.inner, self.family, on)
             }
+            SocketOption::Linger(linger) => match &self.inner {
+                Inner::Tcp(_) => match linger {
+                    None => backend::set_linger(&self.inner, false),
+                    Some(time) if time.is_zero() => backend::set_linger(&self.inner, true),
+                    Some(time) => Err(NetError::refused(
+                        OP,
+                        self.describe(),
+                        format!(
+                            "SO_LINGER on with {time:?} asks close to block until the unsent data \
+                             is gone or that time is up, even on a non-blocking socket; Winsock's \
+                             closesocket on a non-blocking socket fails WSAEWOULDBLOCK instead and \
+                             leaves the socket open, and this seam's close cannot retry. Off, and \
+                             on with a zero time (the abortive close), are implemented"
+                        ),
+                    )),
+                },
+                Inner::Udp(_) => {
+                    self.kept.linger = linger;
+                    Ok(())
+                }
+            },
+            SocketOption::Broadcast(on) => match &self.inner {
+                Inner::Udp(_) => backend::set_broadcast(&self.inner, on),
+                Inner::Tcp(_) => {
+                    self.kept.broadcast = on;
+                    Ok(())
+                }
+            },
         }
     }
 
@@ -1143,6 +1218,16 @@ impl Socket {
                 self.require_v6(OP)?;
                 backend::v6only(&self.inner).map(OptionValue::Flag)
             }
+            SocketQuery::Linger => match &self.inner {
+                Inner::Tcp(_) => backend::linger(&self.inner).map(|seconds| {
+                    OptionValue::Linger(seconds.map(|s| Duration::from_secs(u64::from(s))))
+                }),
+                Inner::Udp(_) => Ok(OptionValue::Linger(self.kept.linger)),
+            },
+            SocketQuery::Broadcast => match &self.inner {
+                Inner::Udp(_) => backend::broadcast(&self.inner).map(OptionValue::Flag),
+                Inner::Tcp(_) => Ok(OptionValue::Flag(self.kept.broadcast)),
+            },
         }
     }
 
@@ -1481,6 +1566,10 @@ mod tests {
             "TCP_KEEPALIVE",
             "TCP_KEEPINTVL",
             "TCP_KEEPCNT",
+            // Moved from the list below when the engine's game-socket setup reached them
+            // (2026-09-23), the move that list exists to force.
+            "SO_LINGER",
+            "SO_BROADCAST",
         ] {
             assert!(
                 IMPLEMENTED_OPTIONS.contains(spelling),
@@ -1497,7 +1586,7 @@ mod tests {
         // Linux's `TCP_KEEPINTVL` is 5 too. A pass-through implementation would set it while
         // believing it had set the probe interval. Nothing here implements it, and nothing
         // should advertise it.
-        for absent in ["SO_LINGER", "SO_BROADCAST", "IP_TTL", "SO_OOBINLINE", "TCP_MAXRT"] {
+        for absent in ["SO_TIMESTAMP", "IP_TTL", "SO_OOBINLINE", "TCP_MAXRT"] {
             assert!(
                 !IMPLEMENTED_OPTIONS.contains(absent),
                 "{absent} is advertised as implemented and is not"

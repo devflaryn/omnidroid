@@ -58,8 +58,8 @@ use windows_sys::Win32::Networking::WinSock::{
     bind as ws_bind, connect as ws_connect, getsockopt, select as ws_select, setsockopt,
     socket as ws_socket, WSAGetLastError, WSAStartup, ADDRESS_FAMILY, AF_INET, AF_INET6, FD_SET,
     IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP, IPV6_DONTFRAG, IPV6_V6ONLY, IP_DONTFRAGMENT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, SOCKET_ERROR,
-    SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SO_ERROR, SO_KEEPALIVE, SO_RCVBUF, SO_REUSEADDR,
-    SO_SNDBUF, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPINTVL, TIMEVAL,
+    LINGER, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SO_BROADCAST, SO_ERROR, SO_KEEPALIVE, SO_LINGER,
+    SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPINTVL, TIMEVAL,
     WSADATA, WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
     WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR,
     WSAEINVAL, WSAEISCONN, WSAEMSGSIZE, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN,
@@ -632,6 +632,69 @@ pub(super) fn set_dont_fragment(inner: &Inner, family: IpFamily, on: bool) -> Ne
         IpFamily::V6 => (IPPROTO_IPV6, IPV6_DONTFRAG, "setsockopt(IPV6_DONTFRAG)"),
     };
     set_i32(inner, level, name, i32::from(on), "setsockopt", api)
+}
+
+/// `setsockopt(SOL_SOCKET, SO_LINGER)`: off, or on with a zero time -- the abortive close. The
+/// only two [`crate::net::Socket`] passes; see [`SocketOption::Linger`](super::SocketOption::Linger)
+/// for why a nonzero time is not.
+///
+/// Winsock's `LINGER` is two `u_short`s where Linux's `struct linger` is two `int`s; the guest's
+/// layout is the adapter's business and never reaches here.
+pub(super) fn set_linger(inner: &Inner, on: bool) -> NetResult<()> {
+    let value = LINGER { l_onoff: u16::from(on), l_linger: 0 };
+    // SAFETY: `value` is a live local that outlives the call and the length is its own size,
+    // which is the `LINGER` Winsock documents for SO_LINGER.
+    let rc = unsafe {
+        setsockopt(
+            raw(inner),
+            SOL_SOCKET,
+            SO_LINGER,
+            core::ptr::addr_of!(value).cast::<u8>(),
+            core::mem::size_of::<LINGER>() as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        return Err(wsa_error("setsockopt", "SO_LINGER", "setsockopt(SO_LINGER)"));
+    }
+    Ok(())
+}
+
+/// `getsockopt(SOL_SOCKET, SO_LINGER)`: `None` when off, else the linger time in seconds.
+pub(super) fn linger(inner: &Inner) -> NetResult<Option<u16>> {
+    let mut value = LINGER { l_onoff: 0, l_linger: 0 };
+    let mut len = core::mem::size_of::<LINGER>() as i32;
+    // SAFETY: `value` and `len` are live locals that outlive the call; `len` is `value`'s size.
+    let rc = unsafe {
+        getsockopt(
+            raw(inner),
+            SOL_SOCKET,
+            SO_LINGER,
+            core::ptr::addr_of_mut!(value).cast::<u8>(),
+            &mut len,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        return Err(wsa_error("getsockopt", "SO_LINGER", "getsockopt(SO_LINGER)"));
+    }
+    Ok((value.l_onoff != 0).then_some(value.l_linger))
+}
+
+/// `getsockopt(SOL_SOCKET, SO_BROADCAST)`.
+pub(super) fn broadcast(inner: &Inner) -> NetResult<bool> {
+    let value = get_i32(inner, SOL_SOCKET, SO_BROADCAST, "getsockopt", "getsockopt(SO_BROADCAST)")?;
+    Ok(value != 0)
+}
+
+/// `setsockopt(SOL_SOCKET, SO_BROADCAST)`.
+pub(super) fn set_broadcast(inner: &Inner, on: bool) -> NetResult<()> {
+    set_i32(
+        inner,
+        SOL_SOCKET,
+        SO_BROADCAST,
+        i32::from(on),
+        "setsockopt",
+        "setsockopt(SO_BROADCAST)",
+    )
 }
 
 /// Add a socket to a set. The caller has already bounded the count.

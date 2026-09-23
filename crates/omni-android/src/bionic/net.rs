@@ -1591,6 +1591,13 @@ const SO_ERROR: i32 = 4;
 const SO_SNDBUF: i32 = 7;
 /// `SO_RCVBUF`.
 const SO_RCVBUF: i32 = 8;
+/// `SO_BROADCAST`.
+const SO_BROADCAST: i32 = 6;
+/// `SO_LINGER`, which takes a `struct linger { int l_onoff; int l_linger; }` -- [`LINGER_BYTES`].
+const SO_LINGER: i32 = 13;
+/// `sizeof(struct linger)` on arm64: two `int`s. Winsock's is two `u_short`s, which is why the
+/// guest's struct is read here and never handed to the host.
+const LINGER_BYTES: usize = 8;
 /// `SO_RCVTIMEO`. Linux arm64 numbers the `_OLD` form 20, which is what a 64-bit userspace uses.
 const SO_RCVTIMEO: i32 = 20;
 /// `SO_SNDTIMEO`.
@@ -2488,6 +2495,8 @@ fn option_name(level: i32, name: i32) -> String {
         (SOL_SOCKET, SO_RCVBUF) => "SO_RCVBUF".to_owned(),
         (SOL_SOCKET, SO_RCVTIMEO) => "SO_RCVTIMEO".to_owned(),
         (SOL_SOCKET, SO_SNDTIMEO) => "SO_SNDTIMEO".to_owned(),
+        (SOL_SOCKET, SO_BROADCAST) => "SO_BROADCAST".to_owned(),
+        (SOL_SOCKET, SO_LINGER) => "SO_LINGER".to_owned(),
         (IPPROTO_TCP, TCP_NODELAY) => "TCP_NODELAY".to_owned(),
         (IPPROTO_TCP, TCP_KEEPIDLE) => "TCP_KEEPIDLE".to_owned(),
         (IPPROTO_TCP, TCP_KEEPINTVL) => "TCP_KEEPINTVL".to_owned(),
@@ -2613,6 +2622,44 @@ pub(super) fn setsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         };
         let option = match (level, name) {
             (SOL_SOCKET, SO_REUSEADDR) => int_option(4)?.map(|on| SocketOption::ReuseAddress(on != 0)),
+            // MEASURED reader of both: the engine's game-socket setup (`0x502aa70`), which on its
+            // UDP socket sets FD_CLOEXEC, SO_RCVBUF, SO_LINGER off, SO_SNDBUF, IPV6_V6ONLY on an
+            // IPv6 one, then SO_BROADCAST on; its worker died on the SO_LINGER refusal
+            // (2026-09-23). Each is accepted on every socket kind, as Linux accepts it; see
+            // `SocketOption::Linger`/`Broadcast` for the kind the host refuses it on.
+            (SOL_SOCKET, SO_BROADCAST) => int_option(4)?.map(|on| SocketOption::Broadcast(on != 0)),
+            (SOL_SOCKET, SO_LINGER) => {
+                if given < LINGER_BYTES {
+                    None
+                } else {
+                    let raw = view.mem().read_bytes(at, LINGER_BYTES, Blame::new(view.symbol(), view.address(), 3))?;
+                    let on = i32::from_le_bytes(raw[..4].try_into().expect("four bytes")) != 0;
+                    let seconds = i32::from_le_bytes(raw[4..].try_into().expect("four bytes"));
+                    if !on {
+                        // Off: Linux ignores `l_linger` then.
+                        Some(SocketOption::Linger(None))
+                    } else if seconds != 0
+                        && locked(&handle).kind() == omni_platform::net::SocketKind::Stream
+                    {
+                        return Err(view.refusal(format!(
+                            "the guest called setsockopt(fd {fd}, SO_LINGER at SOL_SOCKET) on a \
+                             stream socket with l_onoff {on} and l_linger {seconds}: a close that \
+                             blocks until the unsent data is gone or {seconds} s are up, even on a \
+                             non-blocking socket. Winsock's closesocket on a non-blocking socket \
+                             fails WSAEWOULDBLOCK instead and leaves the socket open, and this \
+                             layer's close cannot retry it. Off, and on with l_linger 0 (the \
+                             abortive close), are implemented",
+                            on = i32::from(on)
+                        )));
+                    } else {
+                        // A negative `l_linger` is Linux's "forever": it widens the `int` to an
+                        // `unsigned long` and caps it at the scheduler's largest timeout.
+                        Some(SocketOption::Linger(Some(
+                            u64::try_from(seconds).map_or(Duration::MAX, Duration::from_secs),
+                        )))
+                    }
+                }
+            }
             // The boolean only. `omni_platform::net::SocketOption::KeepAlive` documents what is
             // deliberately not carried with it -- the idle interval, which has no portable
             // spelling and which this layer therefore does not pretend to set.
@@ -2803,6 +2850,7 @@ pub(super) fn getsockopt(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             (IPPROTO_TCP, TCP_KEEPINTVL) => SocketQuery::KeepAliveInterval,
             (IPPROTO_TCP, TCP_KEEPCNT) => SocketQuery::KeepAliveCount,
             (IPPROTO_IPV6, IPV6_V6ONLY) => SocketQuery::V6Only,
+            (SOL_SOCKET, SO_BROADCAST) => SocketQuery::Broadcast,
             _ => {
                 return Err(view.refusal(format!(
                     "the guest called getsockopt(fd {fd}, {}) into a {given}-byte buffer. {}",

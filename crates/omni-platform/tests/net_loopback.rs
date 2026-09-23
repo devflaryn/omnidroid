@@ -397,6 +397,79 @@ fn the_options_a_client_sets_take_effect_and_read_back() {
     assert_eq!(six.get_option(SocketQuery::V6Only).unwrap(), OptionValue::Flag(false));
 }
 
+/// **`SO_LINGER` and `SO_BROADCAST` are accepted on every socket kind, as Linux accepts them**:
+/// the host's on the kind it serves each on, kept and read back on the kind Winsock refuses it on
+/// (MEASURED on 10.0.26200: `WSAENOPROTOOPT` for `SO_LINGER` on UDP and `SO_BROADCAST` on TCP).
+/// MEASURED why: the engine's game-socket setup sets `SO_LINGER` off and `SO_BROADCAST` on on its
+/// UDP socket, and died on the first (2026-09-23).
+#[test]
+fn linger_and_broadcast_are_accepted_on_every_socket_kind_as_linux_accepts_them() {
+    for family in [IpFamily::V4, IpFamily::V6] {
+        // Stream: SO_LINGER is the host's -- off, or on with a zero time.
+        let mut stream = socket(SocketKind::Stream, family);
+        let linger = |s: &mut Socket| s.get_option(SocketQuery::Linger).expect("SO_LINGER");
+        assert_eq!(linger(&mut stream), OptionValue::Linger(None), "off by default");
+        stream.set_option(SocketOption::Linger(Some(Duration::ZERO))).expect("the abortive close");
+        assert_eq!(linger(&mut stream), OptionValue::Linger(Some(Duration::ZERO)));
+        stream.set_option(SocketOption::Linger(None)).expect("off again");
+        assert_eq!(linger(&mut stream), OptionValue::Linger(None));
+        let err = stream.set_option(SocketOption::Linger(Some(Duration::from_secs(5)))).unwrap_err();
+        assert!(matches!(err, NetError::Refused { .. }), "{err}");
+        assert!(err.to_string().contains("SO_LINGER"), "{err}");
+        assert_eq!(linger(&mut stream), OptionValue::Linger(None), "a refused set changes nothing");
+
+        // Stream: SO_BROADCAST is kept.
+        let broadcast = |s: &mut Socket| s.get_option(SocketQuery::Broadcast).expect("SO_BROADCAST");
+        assert_eq!(broadcast(&mut stream), OptionValue::Flag(false));
+        stream.set_option(SocketOption::Broadcast(true)).expect("kept, as Linux keeps it");
+        assert_eq!(broadcast(&mut stream), OptionValue::Flag(true));
+        stream.set_option(SocketOption::Broadcast(false)).expect("and cleared");
+        assert_eq!(broadcast(&mut stream), OptionValue::Flag(false));
+
+        // Datagram: SO_BROADCAST is the host's, SO_LINGER is kept -- any time, as Linux keeps it.
+        let mut datagram = socket(SocketKind::Datagram, family);
+        assert_eq!(broadcast(&mut datagram), OptionValue::Flag(false));
+        datagram.set_option(SocketOption::Broadcast(true)).expect("SO_BROADCAST on");
+        assert_eq!(broadcast(&mut datagram), OptionValue::Flag(true));
+        datagram.set_option(SocketOption::Broadcast(false)).expect("SO_BROADCAST off");
+        assert_eq!(broadcast(&mut datagram), OptionValue::Flag(false));
+        assert_eq!(linger(&mut datagram), OptionValue::Linger(None));
+        datagram.set_option(SocketOption::Linger(None)).expect("off, the engine's call");
+        datagram.set_option(SocketOption::Linger(Some(Duration::from_secs(5)))).expect("kept");
+        assert_eq!(linger(&mut datagram), OptionValue::Linger(Some(Duration::from_secs(5))));
+        datagram.set_option(SocketOption::Linger(None)).expect("off again");
+        assert_eq!(linger(&mut datagram), OptionValue::Linger(None));
+    }
+}
+
+/// **The host's `SO_LINGER` takes effect**: with it on and a zero time, closing a connected stream
+/// resets the peer, where the default close ends the peer's stream. A seam that kept the option
+/// instead of setting it would read back the same and fail only here.
+#[test]
+fn an_abortive_linger_resets_the_peer_where_the_default_close_ends_its_stream() {
+    for abortive in [false, true] {
+        let (listener, address) = listening(IpFamily::V4);
+        let mut client = socket(SocketKind::Stream, IpFamily::V4);
+        let _ = client.connect(&address).expect("connect");
+        wait_until(&client, Interest::WRITABLE, "the connect to settle", |r| r.writable || r.error);
+        assert_eq!(client.connect_result().expect("result"), ConnectOutcome::Connected);
+        let mut peer: HostStream = listener.accept().expect("accept").0;
+        peer.set_read_timeout(Some(DEADLINE)).expect("a bounded read");
+        if abortive {
+            client.set_option(SocketOption::Linger(Some(Duration::ZERO))).expect("SO_LINGER {1, 0}");
+        }
+        drop(client);
+        let mut buf = [0_u8; 8];
+        let read = peer.read(&mut buf);
+        if abortive {
+            let err = read.expect_err("an abortive close is a reset, not end of file");
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset, "{err}");
+        } else {
+            assert_eq!(read.expect("the default close"), 0, "end of file");
+        }
+    }
+}
+
 /// An option that is not defined on this socket is refused by name rather than accepted.
 ///
 /// Rule 1's shape: a caller told its `setsockopt` succeeded believes the option took effect. Each

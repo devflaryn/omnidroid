@@ -35,8 +35,9 @@
 //!   point 2 is explicit about not wanting.
 
 pub(super) use super::unix::{
-    bind, buffer_bytes, create_datagram, create_stream, keep_alive, keep_alive_count,
-    keep_alive_idle, keep_alive_interval, kind_from_raw, poll, reuse_address, set_buffer_bytes,
-    set_dont_fragment, set_keep_alive, set_keep_alive_count, set_keep_alive_idle,
-    set_keep_alive_interval, set_reuse_address, set_v6only, socket_error, start_connect, v6only,
+    bind, broadcast, buffer_bytes, create_datagram, create_stream, keep_alive, keep_alive_count,
+    keep_alive_idle, keep_alive_interval, kind_from_raw, linger, poll, reuse_address,
+    set_broadcast, set_buffer_bytes, set_dont_fragment, set_keep_alive, set_keep_alive_count,
+    set_keep_alive_idle, set_keep_alive_interval, set_linger, set_reuse_address, set_v6only,
+    socket_error, start_connect, v6only,
 };

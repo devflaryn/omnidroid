@@ -10886,6 +10886,122 @@ fn fcntl_reads_and_writes_the_close_on_exec_flag_each_descriptor_was_made_with()
     }
 }
 
+/// `struct linger { int l_onoff; int l_linger; }`, as the guest lays it out.
+fn linger_bytes(on: i32, seconds: i32) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&on.to_le_bytes());
+    bytes[4..].copy_from_slice(&seconds.to_le_bytes());
+    bytes
+}
+
+/// **The engine's game-socket setup, call for call, answers 0 as on a device** (`0x502aa70`): on a
+/// UDP socket `fcntl(F_SETFD, flags | FD_CLOEXEC)`, `SO_RCVBUF`, `SO_LINGER` off with an 8-byte
+/// `struct linger`, `SO_SNDBUF`, `IPV6_V6ONLY` on an IPv6 one, `SO_BROADCAST` on. And the edges:
+/// a short `SO_LINGER` is `EINVAL`; on a stream socket off and `{1, 0}` reach the host and a
+/// nonzero time refuses by name; on a datagram one any value is kept, as Linux keeps it; and
+/// `SO_BROADCAST` reads back on both kinds. MEASURED why: pressing Play, a TaskScheduler worker
+/// died on `setsockopt(fd 38, option 13 at SOL_SOCKET)` with an 8-byte value (2026-09-23).
+#[test]
+fn setsockopt_takes_the_game_sockets_linger_and_broadcast_as_a_device_does() {
+    let _guard = serialized();
+    let (f, _root) = networked("linger");
+    let value = f.guest.data + 0x200;
+    let length = f.guest.data + 0x240;
+    let out = f.guest.data + 0x400;
+    // `setsockopt`, answering (return value, errno after a failure) from one guest program.
+    let setsockopt = |fd: i64, level: u64, name: u64, bytes: &[u8]| -> (i64, u64) {
+        f.guest.write_bytes(value, bytes);
+        let entry = program(&f, |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, level);
+            asm.mov(2, name);
+            asm.mov(3, value as u64);
+            asm.mov(4, bytes.len() as u64);
+            asm.bl(f.thunk("setsockopt"));
+            asm.mov(22, out as u64);
+            asm.push(str_imm(0, 22, 0));
+            asm.bl(f.thunk("__errno"));
+            asm.push(ldr_w(1, 0, 0));
+            asm.push(str_imm(1, 22, 8));
+        });
+        assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+        // `errno` is meaningful only after a failure: a success leaves whatever was there.
+        let answer = f.guest.read_u64(out) as i32 as i64;
+        (answer, if answer == -1 { f.guest.read_u64(out + 8) } else { 0 })
+    };
+    let broadcast_of = |fd: i64| {
+        f.guest.write_bytes(length, &4u32.to_le_bytes());
+        let answer = value_of(&f, "getsockopt", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, 1); // SOL_SOCKET
+            asm.mov(2, 6); // SO_BROADCAST
+            asm.mov(3, value as u64);
+            asm.mov(4, length as u64);
+        }) as i32;
+        assert_eq!(answer, 0, "getsockopt(SO_BROADCAST)");
+        read_u32_guest(&f, value)
+    };
+    let socket = |family: u64, kind: u64| {
+        let fd = value_of(&f, "socket", |asm| {
+            asm.mov(0, family);
+            asm.mov(1, kind);
+            asm.mov(2, 0);
+        }) as i32 as i64;
+        assert!(fd >= 3, "socket returned {fd}");
+        fd
+    };
+
+    for family in [AF_INET, AF_INET6] {
+        let fd = socket(family, 2); // SOCK_DGRAM
+        let flags = value_of(&f, "fcntl", |asm| {
+            asm.mov(0, fd as u64);
+            asm.mov(1, F_GETFD_GUEST);
+            asm.mov(2, 0);
+        });
+        assert_eq!(
+            value_of(&f, "fcntl", |asm| {
+                asm.mov(0, fd as u64);
+                asm.mov(1, F_SETFD_GUEST);
+                asm.mov(2, flags | FD_CLOEXEC_GUEST);
+            }) as i32,
+            0
+        );
+        assert_eq!(setsockopt(fd, 1, 8, &(256 * 1024i32).to_le_bytes()), (0, 0), "SO_RCVBUF");
+        assert_eq!(setsockopt(fd, 1, 13, &linger_bytes(0, 0)), (0, 0), "SO_LINGER off");
+        assert_eq!(setsockopt(fd, 1, 7, &(16 * 1024i32).to_le_bytes()), (0, 0), "SO_SNDBUF");
+        if family == AF_INET6 {
+            assert_eq!(setsockopt(fd, 41, 26, &0i32.to_le_bytes()), (0, 0), "IPV6_V6ONLY");
+        }
+        assert_eq!(setsockopt(fd, 1, 6, &1i32.to_le_bytes()), (0, 0), "SO_BROADCAST on");
+        assert_eq!(broadcast_of(fd), 1, "and it reads back");
+        assert_eq!(setsockopt(fd, 1, 6, &0i32.to_le_bytes()), (0, 0), "SO_BROADCAST off");
+        assert_eq!(broadcast_of(fd), 0);
+
+        // Kept on a datagram socket whatever the time, as Linux keeps it.
+        assert_eq!(setsockopt(fd, 1, 13, &linger_bytes(1, 5)), (0, 0), "SO_LINGER {{1, 5}} on UDP");
+        // A `struct linger` needs eight bytes.
+        assert_eq!(setsockopt(fd, 1, 13, &0i32.to_le_bytes()), (-1, EINVAL_NET), "a 4-byte SO_LINGER");
+    }
+
+    let stream = socket(AF_INET, 1); // SOCK_STREAM
+    assert_eq!(setsockopt(stream, 1, 13, &linger_bytes(0, 0)), (0, 0), "SO_LINGER off on TCP");
+    assert_eq!(setsockopt(stream, 1, 13, &linger_bytes(1, 0)), (0, 0), "the abortive close");
+    assert_eq!(setsockopt(stream, 1, 13, &linger_bytes(0, 9)), (0, 0), "off ignores l_linger");
+    assert_eq!(setsockopt(stream, 1, 6, &1i32.to_le_bytes()), (0, 0), "SO_BROADCAST on TCP, kept");
+    assert_eq!(broadcast_of(stream), 1);
+    f.guest.write_bytes(value, &linger_bytes(1, 5));
+    let error = refusal_of(&f, "setsockopt", |asm| {
+        asm.mov(0, stream as u64);
+        asm.mov(1, 1);
+        asm.mov(2, 13);
+        asm.mov(3, value as u64);
+        asm.mov(4, 8);
+    });
+    assert_eq!(error.symbol(), Some("setsockopt"));
+    let text = error.to_string();
+    assert!(text.contains("SO_LINGER") && text.contains("WSAEWOULDBLOCK"), "{text}");
+}
+
 /// **`pwrite` writes at an offset through real guest code and leaves the sequential offset alone.**
 ///
 /// Asserted on the bytes the host file ends up holding, which is the only place the two defects

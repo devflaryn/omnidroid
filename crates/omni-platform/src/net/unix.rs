@@ -278,6 +278,30 @@ pub(super) fn set_v6only(inner: &Inner, on: bool) -> NetResult<()> {
     unsupported("setsockopt", "setsockopt(2) with IPPROTO_IPV6/IPV6_V6ONLY")
 }
 
+/// Intended: `setsockopt(SOL_SOCKET, SO_LINGER)` with `struct linger { on, 0 }`.
+pub(super) fn set_linger(inner: &Inner, on: bool) -> NetResult<()> {
+    let _ = (inner, on);
+    unsupported("setsockopt", "setsockopt(2) with SOL_SOCKET/SO_LINGER")
+}
+
+/// Intended: `getsockopt(SOL_SOCKET, SO_LINGER)`.
+pub(super) fn linger(inner: &Inner) -> NetResult<Option<u16>> {
+    let _ = inner;
+    unsupported("getsockopt", "getsockopt(2) with SOL_SOCKET/SO_LINGER")
+}
+
+/// Intended: `getsockopt(SOL_SOCKET, SO_BROADCAST)`.
+pub(super) fn broadcast(inner: &Inner) -> NetResult<bool> {
+    let _ = inner;
+    unsupported("getsockopt", "getsockopt(2) with SOL_SOCKET/SO_BROADCAST")
+}
+
+/// Intended: `setsockopt(SOL_SOCKET, SO_BROADCAST)`.
+pub(super) fn set_broadcast(inner: &Inner, on: bool) -> NetResult<()> {
+    let _ = (inner, on);
+    unsupported("setsockopt", "setsockopt(2) with SOL_SOCKET/SO_BROADCAST")
+}
+
 /// Intended: `setsockopt(2)` with `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` = `IP_PMTUDISC_DO` or
 /// `IP_PMTUDISC_DONT`, by family.
 pub(super) fn set_dont_fragment(inner: &Inner, family: IpFamily, on: bool) -> NetResult<()> {

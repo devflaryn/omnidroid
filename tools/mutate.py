@@ -307,6 +307,10 @@ FUTEX_RUNTIME = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "-
 BIONIC_MUTEX_LIB = ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "mutex"]
 BIONIC_CLOEXEC = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
                   "close_on_exec"]
+BIONIC_LINGER = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
+                 "linger"]
+PLAT_LINGER = ["cargo", "test", "-p", "omni-platform", "--release", "--test", "net_loopback", "--no-fail-fast",
+               "linger"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7379,6 +7383,56 @@ directory", ADAPTER_FILES,
      """                let on = argument as i32 & FD_CLOEXEC != 0;""",
      """                let on = argument != 0;""",
      BIONIC_CLOEXEC),
+
+    # SO_LINGER and SO_BROADCAST: the engine's game-socket setup, what Play reached after F_GETFD
+    # (2026-09-23).
+    ("linger-A1", "A", "a datagram socket's SO_LINGER goes to the host, which refuses it (the death)",
+     "crates/omni-platform/src/net/mod.rs",
+     """                Inner::Udp(_) => {
+                    self.kept.linger = linger;
+                    Ok(())
+                }""",
+     """                Inner::Udp(_) => backend::set_linger(&self.inner, linger.is_some()),""",
+     BIONIC_LINGER),
+    ("linger-A2", "A", "a stream socket's SO_BROADCAST goes to the host, which refuses it",
+     "crates/omni-platform/src/net/mod.rs",
+     """                Inner::Tcp(_) => {
+                    self.kept.broadcast = on;
+                    Ok(())
+                }""",
+     """                Inner::Tcp(_) => backend::set_broadcast(&self.inner, on),""",
+     BIONIC_LINGER),
+    ("linger-A3", "A", "a short struct linger is read past its optlen instead of EINVAL",
+     "crates/omni-android/src/bionic/net.rs",
+     """                if given < LINGER_BYTES {""",
+     """                if given < 4 {""",
+     BIONIC_LINGER),
+    ("linger-A4", "A", "a nonzero linger on a stream socket reaches the platform and answers ENOPROTOOPT, not a refusal",
+     "crates/omni-android/src/bionic/net.rs",
+     """                    } else if seconds != 0
+                        && locked(&handle).kind() == omni_platform::net::SocketKind::Stream""",
+     """                    } else if false""",
+     BIONIC_LINGER),
+    ("linger-B1", "B", "l_onoff read inverted: off is on and on is off",
+     "crates/omni-android/src/bionic/net.rs",
+     """                    if !on {
+                        // Off: Linux ignores `l_linger` then.""",
+     """                    if on {
+                        // Off: Linux ignores `l_linger` then.""",
+     BIONIC_LINGER),
+    ("linger-B2", "B", "the abortive close sets linger off on the host",
+     "crates/omni-platform/src/net/mod.rs",
+     """                    Some(time) if time.is_zero() => backend::set_linger(&self.inner, true),""",
+     """                    Some(time) if time.is_zero() => backend::set_linger(&self.inner, false),""",
+     PLAT_LINGER),
+    ("linger-B3", "B", "a datagram socket's SO_BROADCAST is kept instead of set on the host",
+     "crates/omni-platform/src/net/mod.rs",
+     """                Inner::Udp(_) => backend::set_broadcast(&self.inner, on),""",
+     """                Inner::Udp(_) => {
+                    self.kept.broadcast = on;
+                    Ok(())
+                }""",
+     PLAT_LINGER),
 ]
 
 
