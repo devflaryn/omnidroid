@@ -170,14 +170,14 @@ pub fn reentrant_slot(call: &mut ReentrantCall<'_>) -> AbiResult<()> {
     Ok(())
 }
 
-/// The two `JavaVM` slots the engine uses, and refusals for the other six.
+/// The three `JavaVM` slots the engine uses, and refusals for the other five.
 ///
 /// # Errors
 ///
-/// [`AbiError::JniRefused`] for `DestroyJavaVM`, `DetachCurrentThread`,
-/// `AttachCurrentThreadAsDaemon` and the three reserved slots. §2.2: the first two are **never
-/// called** by this engine, so a refusal there is a report that something changed rather than a
-/// gap.
+/// [`AbiError::JniRefused`] for `DestroyJavaVM`, `AttachCurrentThreadAsDaemon` and the three
+/// reserved slots. §2.2 measured the engine's startup calling only `GetEnv` and
+/// `AttachCurrentThread`; `DetachCurrentThread` is answered since the first game join, where
+/// FMOD's threads call it on their way out (see its arm).
 pub fn vm_slot(call: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let address = call.address();
     let Some((jni, thread)) = super::active_opt() else {
@@ -246,15 +246,31 @@ pub fn vm_slot(call: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 mem.write_u64(out, jni.env_for(thread) as u64, Blame::new(name, address, 1))?;
                 JniReturn::Int(JNI_OK)
             }
+            // `DetachCurrentThread(vm)`. MEASURED: on the first game join, two of FMOD's threads
+            // (started at link `0x4fbcbc4`, its thread trampoline) called it on their way out and
+            // died on the refusal it used to be. It undoes `AttachCurrentThread`: the thread is no
+            // longer attached (so `GetEnv` answers `JNI_EDETACHED` again), its name and pending
+            // exception go with the attachment, and its `JNIEnv` slot is given back at the
+            // thread's end as before. ART answers `JNI_ERR` for a thread that is not attached.
+            "DetachCurrentThread" => {
+                jni.count(name);
+                if jni.is_attached(thread) {
+                    jni.detach_thread(thread);
+                    JniReturn::Int(JNI_OK)
+                } else {
+                    JniReturn::Int(slots::JNI_ERR)
+                }
+            }
             _ => {
                 return Err(AbiError::JniRefused {
                     function: format!("JavaVM::{name}"),
                     address,
                     detail: format!(
-                        "`{name}` is one of the six JavaVM slots `libroblox.so` never \
-                         dereferences (jni-surface.md §2.2 measured 2 of 8 over 5 call sites), so \
-                         it has no implementation here; a call to it means the engine's behaviour \
-                         has changed and is reported rather than guessed at"
+                        "`{name}` is one of the five JavaVM slots no run of `libroblox.so` has \
+                         called (jni-surface.md §2.2 measured 2 of 8 over 5 call sites; \
+                         `DetachCurrentThread` was the third, at the first game join), so it has \
+                         no implementation here; a call to it means the engine's behaviour has \
+                         changed and is reported rather than guessed at"
                     ),
                 })
             }

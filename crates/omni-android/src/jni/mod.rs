@@ -938,6 +938,15 @@ impl Jni {
     }
 
     /// Mark a thread attached and keep the name `JavaVMAttachArgs` carried.
+    /// Undo [`Jni::attach_thread`]: `DetachCurrentThread`.
+    pub(crate) fn detach_thread(&self, thread: usize) {
+        let mut state = self.state.lock();
+        let slot = &mut state.threads[thread];
+        slot.attached = false;
+        slot.name = None;
+        slot.pending = None;
+    }
+
     pub(crate) fn attach_thread(&self, thread: usize, name: Option<String>) {
         let mut state = self.state.lock();
         state.threads[thread].attached = true;
@@ -1749,6 +1758,21 @@ mod tests {
         assert_eq!(env, jni.env_for(0));
         assert!(jni.is_attached(0));
         assert_eq!(jni.thread_names()[0].as_deref(), Some("main"));
+    }
+
+    /// `DetachCurrentThread` undoes the attach: the thread reads as detached again (what `GetEnv`
+    /// answers `JNI_EDETACHED` from), the attachment's name goes with it, and it can attach again.
+    #[test]
+    fn a_detached_thread_is_detached_and_can_attach_again() {
+        let jni = instance();
+        let _a = jni.activate().expect("activated");
+        jni.attach_current_thread(Some("FMOD mixer")).expect("attached");
+        jni.detach_thread(0);
+        assert!(!jni.is_attached(0), "detached");
+        assert_eq!(jni.thread_names()[0], None, "the name belonged to the attachment");
+        jni.attach_current_thread(Some("again")).expect("attached again");
+        assert!(jni.is_attached(0));
+        assert_eq!(jni.thread_names()[0].as_deref(), Some("again"));
     }
 
     /// The whole declared surface, as a membership check on the registry the instance builds.

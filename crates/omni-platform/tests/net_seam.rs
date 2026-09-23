@@ -176,7 +176,11 @@ fn the_error_kinds_do_not_render_the_same_way_as_one_another() {
 /// The poll limit is a number the public API states, not one a caller discovers by overflowing it.
 #[test]
 fn the_poll_limit_is_public_and_is_the_size_of_the_set_it_protects() {
-    assert_eq!(MAX_POLL_SOCKETS, 64, "FD_SETSIZE on the one tested host");
+    assert_eq!(MAX_POLL_SOCKETS, 1024, "the Windows backend's own FD_SETSIZE");
+    assert!(
+        MAX_POLL_SOCKETS >= omni_platform::fs::MAX_OPEN_FILES,
+        "every descriptor a guest can hold fits in one poll"
+    );
 }
 
 /// A policy is shareable, which is how one instance's rules reach every socket it makes.

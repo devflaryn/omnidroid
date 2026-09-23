@@ -154,14 +154,15 @@ use std::time::Duration;
 /// How many sockets one [`poll`] call may name.
 ///
 /// **A limit of the Windows readiness backend, stated rather than hidden.** `select` there takes
-/// an `FD_SET` whose array is `FD_SETSIZE` entries long, and `FD_SETSIZE` is 64. A set larger than
-/// this is **refused by name** rather than silently truncated, because a truncated poll answers
-/// "nothing is ready" about descriptors it never looked at — which is a wrong answer a caller
-/// cannot distinguish from a timeout.
+/// an `fd_set` whose array is the caller's `FD_SETSIZE` long; Winsock's default is 64, and the
+/// backend declares its own set of 1024 -- the descriptor ceiling ([`crate::fs::MAX_OPEN_FILES`]),
+/// so no guest can build a larger one. A set larger than this is **refused by name** rather than
+/// silently truncated, because a truncated poll answers "nothing is ready" about descriptors it
+/// never looked at — which is a wrong answer a caller cannot distinguish from a timeout.
 ///
 /// `WSAPoll` would lift the limit and is deliberately not used; see [`poll`] for the measured
 /// reason, which is a documented defect in `WSAPoll` rather than a preference.
-pub const MAX_POLL_SOCKETS: usize = 64;
+pub const MAX_POLL_SOCKETS: usize = 1024;
 
 /// The socket options this seam implements, for the message an unimplemented one produces.
 ///

@@ -71,12 +71,32 @@ use super::{
     PollEntry, Readiness, SocketAddress,
 };
 
-/// How many sockets an `FD_SET` holds: `FD_SETSIZE`.
+/// How many sockets one of this backend's sets holds: its `FD_SETSIZE`.
 ///
-/// Mirrored from `windows_sys`'s `FD_SETSIZE` as a `usize` so that the array literals below and
-/// [`crate::net::MAX_POLL_SOCKETS`] are visibly the same number, and asserted equal to it in this
-/// file's tests — a limit that drifted from the array it describes would overflow the array.
-const FD_SET_CAPACITY: usize = 64;
+/// **Not `windows_sys`'s 64.** Winsock's `FD_SETSIZE` is a compile-time choice of the caller --
+/// Microsoft's `select` documentation says the default of 64 "can be modified by defining
+/// `FD_SETSIZE` to another value" -- because `select` reads `fd_count` sockets from whatever array
+/// follows it. So this backend declares [`WideFdSet`], Winsock's own `fd_set` layout with this many
+/// entries, and passes it where an `FD_SET` pointer is asked for. 1024 is the descriptor ceiling
+/// (`crate::fs::MAX_OPEN_FILES`), so a guest cannot build a set larger than one call takes.
+/// [`crate::net::MAX_POLL_SOCKETS`] is asserted equal to it in this file's tests.
+const FD_SET_CAPACITY: usize = 1024;
+
+/// Winsock's `fd_set` -- `{ u_int fd_count; SOCKET fd_array[FD_SETSIZE]; }` -- with
+/// [`FD_SET_CAPACITY`] entries. `#[repr(C)]` and the same two fields in the same order, so its
+/// prefix is `FD_SET`'s: this file's tests pin the two offsets against `windows_sys`'s struct.
+#[repr(C)]
+struct WideFdSet {
+    fd_count: u32,
+    fd_array: [SOCKET; FD_SET_CAPACITY],
+}
+
+impl WideFdSet {
+    /// The pointer `select` takes. See [`WideFdSet`] for why the cast is the documented use.
+    fn as_fd_set(&mut self) -> *mut FD_SET {
+        (self as *mut WideFdSet).cast::<FD_SET>()
+    }
+}
 
 /// Initialise Winsock once for this process.
 ///
@@ -614,8 +634,8 @@ pub(super) fn set_dont_fragment(inner: &Inner, family: IpFamily, on: bool) -> Ne
     set_i32(inner, level, name, i32::from(on), "setsockopt", api)
 }
 
-/// Add a socket to an `FD_SET`. The caller has already bounded the count.
-fn push(set: &mut FD_SET, socket: SOCKET) {
+/// Add a socket to a set. The caller has already bounded the count.
+fn push(set: &mut WideFdSet, socket: SOCKET) {
     let at = set.fd_count as usize;
     debug_assert!(at < FD_SET_CAPACITY, "the caller bounds the set at MAX_POLL_SOCKETS");
     set.fd_array[at] = socket;
@@ -625,14 +645,15 @@ fn push(set: &mut FD_SET, socket: SOCKET) {
 /// Is a socket in the set `select` left behind?
 ///
 /// `select` rewrites each set in place to hold only the sockets that are ready, so membership
-/// *after* the call is the answer. Scanning is fine at this size: `FD_SETSIZE` is 64.
-fn contains(set: &FD_SET, socket: SOCKET) -> bool {
+/// *after* the call is the answer. A linear scan per polled socket: quadratic in the set's size,
+/// which at the sizes a guest polls (a handful, MEASURED) is nothing.
+fn contains(set: &WideFdSet, socket: SOCKET) -> bool {
     set.fd_array[..set.fd_count as usize].contains(&socket)
 }
 
-/// An empty `FD_SET`.
-fn empty_set() -> FD_SET {
-    FD_SET { fd_count: 0, fd_array: [0; FD_SET_CAPACITY] }
+/// An empty set.
+fn empty_set() -> WideFdSet {
+    WideFdSet { fd_count: 0, fd_array: [0; FD_SET_CAPACITY] }
 }
 
 /// Readiness over a set of sockets, with a caller-supplied bound: `select(2)`.
@@ -667,17 +688,12 @@ pub(super) fn poll(entries: &mut [PollEntry<'_>], timeout: Duration) -> NetResul
     // BSD, where it is the highest descriptor plus one. Zero is what every Winsock example passes.
     let seconds = i32::try_from(timeout.as_secs()).unwrap_or(i32::MAX);
     let wait = TIMEVAL { tv_sec: seconds, tv_usec: timeout.subsec_micros() as i32 };
-    // SAFETY: the three sets and the timeout are live locals that outlive the call. `select`
-    // reads `fd_count` from each set and rewrites it in place with the ready subset, which is why
-    // they are passed by mutable pointer and read back below rather than reused.
+    // SAFETY: the three sets and the timeout are live locals that outlive the call. Each set is
+    // `fd_set`'s layout with `FD_SET_CAPACITY` entries (see `WideFdSet`), and `select` reads
+    // `fd_count` entries -- never more than `push` wrote -- and rewrites the set in place with the
+    // ready subset, which is why they are passed by mutable pointer and read back below.
     let rc = unsafe {
-        ws_select(
-            0,
-            core::ptr::addr_of_mut!(read),
-            core::ptr::addr_of_mut!(write),
-            core::ptr::addr_of_mut!(except),
-            &wait,
-        )
+        ws_select(0, read.as_fd_set(), write.as_fd_set(), except.as_fd_set(), &wait)
     };
     if rc == SOCKET_ERROR {
         return Err(wsa_error("poll", format!("{} sockets", entries.len()), "select"));
@@ -704,18 +720,21 @@ pub(super) fn poll(entries: &mut [PollEntry<'_>], timeout: Duration) -> NetResul
 mod tests {
     use super::*;
 
-    /// The array literals in this file are exactly `FD_SETSIZE` long, and the seam's public limit
-    /// is the same number.
+    /// The wide set is Winsock's `fd_set` with a longer array -- the same two fields at the same
+    /// offsets, which is all `select` relies on -- and the seam's public limit is its size.
     ///
-    /// **A relation between two constants, not a literal** (VERIFICATION entry 6's remedy): if
-    /// `windows-sys` ever reported a different `FD_SETSIZE`, [`push`] would write past the end of
-    /// an array whose length came from here, and nothing else in this crate would notice.
+    /// **Relations, not literals** (VERIFICATION entry 6's remedy): a set whose `fd_array` sat at
+    /// a different offset from `FD_SET`'s would have `select` read sockets out of the padding, and
+    /// a public limit larger than the array would let [`push`] write past its end.
     #[test]
-    fn the_fd_set_capacity_is_the_hosts_and_the_public_limit_agrees_with_it() {
+    fn the_wide_set_is_an_fd_set_and_the_public_limit_is_its_size() {
         assert_eq!(
-            FD_SET_CAPACITY,
-            windows_sys::Win32::Networking::WinSock::FD_SETSIZE as usize,
-            "the array literals in this file are sized from FD_SET_CAPACITY"
+            core::mem::offset_of!(WideFdSet, fd_count),
+            core::mem::offset_of!(FD_SET, fd_count)
+        );
+        assert_eq!(
+            core::mem::offset_of!(WideFdSet, fd_array),
+            core::mem::offset_of!(FD_SET, fd_array)
         );
         assert_eq!(
             crate::net::MAX_POLL_SOCKETS,
@@ -723,6 +742,7 @@ mod tests {
             "the refusal in net::poll must be the size of the set it protects"
         );
         assert_eq!(empty_set().fd_array.len(), FD_SET_CAPACITY);
+        assert!(FD_SET_CAPACITY > windows_sys::Win32::Networking::WinSock::FD_SETSIZE as usize);
     }
 
     /// The Winsock numbers this backend has to tell apart do not collapse into one kind.

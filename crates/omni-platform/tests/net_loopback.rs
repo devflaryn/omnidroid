@@ -511,6 +511,43 @@ fn poll_names_the_socket_that_has_something_and_not_the_one_that_does_not() {
     assert!(!readiness.error, "and nothing is wrong with it");
 }
 
+/// **A socket past Winsock's default 64 is looked at**: a hundred bound sockets, one datagram to
+/// the ninety-first, and exactly that one is readable.
+///
+/// The detector for the backend's wide set. A set cut back to Winsock's default would answer
+/// "nothing ready" -- a timeout -- about the one socket that is, and the limit test below cannot
+/// tell, because it asserts only that an idle set answers zero.
+#[test]
+fn a_socket_beyond_the_default_fd_setsize_is_seen() {
+    const SOCKETS: usize = 100;
+    const WOKEN: usize = 90;
+    let sockets: Vec<Socket> = (0..SOCKETS)
+        .map(|_| {
+            let mut socket = socket(SocketKind::Datagram, IpFamily::V4);
+            socket.bind(&SocketAddress::loopback(IpFamily::V4, 0)).expect("bind");
+            socket
+        })
+        .collect();
+    let target = sockets[WOKEN].local_address().expect("its address");
+    let sender = HostDatagram::bind("127.0.0.1:0").expect("a host datagram socket");
+    sender.send_to(b"wake", target.to_std()).expect("send");
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let mut entries: Vec<PollEntry<'_>> =
+            sockets.iter().map(|s| PollEntry::new(s, Interest::READABLE)).collect();
+        let ready = poll(&mut entries, Duration::from_millis(50)).expect("poll");
+        let readable: Vec<usize> =
+            (0..SOCKETS).filter(|&i| entries[i].readiness().readable).collect();
+        if !readable.is_empty() {
+            assert_eq!(readable, vec![WOKEN], "only the socket that was sent to");
+            assert_eq!(ready, 1);
+            break;
+        }
+        assert!(Instant::now() < deadline, "the datagram to socket {WOKEN} was never seen");
+    }
+}
+
 /// A set larger than the backend can express is refused by name, not truncated.
 ///
 /// A truncated poll answers "not ready" about sockets it never looked at, and the caller cannot

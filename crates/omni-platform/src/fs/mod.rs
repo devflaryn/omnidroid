@@ -132,14 +132,20 @@ pub const STDOUT_FD: i32 = 1;
 /// `STDERR_FILENO`.
 pub const STDERR_FD: i32 = 2;
 
-/// How many descriptors one guest instance may hold open at once.
+/// How many descriptors one guest instance may hold open at once -- its `RLIMIT_NOFILE`.
 ///
 /// **A policy number, and stated as one.** A guest that leaks descriptors in a loop would
 /// otherwise hold as many host handles as it liked, and several instances share one host process.
 /// Past this, [`Filesystem::open`] reports [`FsErrorKind::TooManyOpenFiles`], which becomes the
 /// guest's `EMFILE` — the answer a real device gives when it hits `RLIMIT_NOFILE`, and one every
 /// correct caller already has a branch for.
-pub const MAX_OPEN_FILES: usize = 64;
+///
+/// **1024, Linux's usual soft limit** -- the figure `bionic::net`'s `poll` bound already names as
+/// that limit, and no more than the `FD_SETSIZE` a `select` caller can address. It was 64, and
+/// MEASURED what that cost: on the first game join the engine had its caches, its HTTP
+/// connections and its QUIC sockets open at once, its next `socket` answered `EMFILE`, and the
+/// join's request to `gamejoin.roblox.com` failed as Roblox's "Http error" 529.
+pub const MAX_OPEN_FILES: usize = 1024;
 
 /// How many distinct missing paths [`Filesystem::open_misses`] keeps.
 ///
