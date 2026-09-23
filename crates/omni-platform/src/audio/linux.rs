@@ -38,8 +38,14 @@
 //!
 //! # What `open` does, in order
 //!
-//! 1. `snd_pcm_open("default", SND_PCM_STREAM_PLAYBACK, 0)` -- blocking mode, so `snd_pcm_writei`
-//!    of frames that fit returns having written all of them.
+//! 1. `snd_pcm_open("default", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)`. **Non-blocking**, so
+//!    that no ALSA call here can wait for ever: a blocking `snd_pcm_writei` into a full buffer
+//!    that nothing drains (a stream not started, a device that stopped) never returns, and the
+//!    thread it takes is the guest's audio thread. MEASURED as a hang of over half an hour (ended by killing the test binary) under mutation row
+//!    `lnx-audio-A1`, before this was changed. Where `snd_pcm_writei` finds no room (it answers
+//!    `-EAGAIN`, or -- MEASURED on a prepared stream -- a count of 0), `write` waits for room with
+//!    `snd_pcm_wait` for at most [`write_wait`] and then fails naming `snd_pcm_writei` with
+//!    `EAGAIN`, the errno non-blocking ALSA uses for "no room", whichever of the two it saw.
 //! 2. hw params: `RW_INTERLEAVED`, `FLOAT_LE` (the only sample shape the seam writes; refused by
 //!    the host means [`AudioError::Alsa`] naming `snd_pcm_hw_params_set_format`), channels and rate
 //!    *near* the preference, then the rate again **exactly** so that a rate that is not a whole
@@ -121,6 +127,8 @@ type Sframes = c_long;
 
 /// `SND_PCM_STREAM_PLAYBACK`.
 const SND_PCM_STREAM_PLAYBACK: c_int = 0;
+/// `SND_PCM_NONBLOCK`, a `snd_pcm_open` mode bit.
+const SND_PCM_NONBLOCK: c_int = 0x0000_0001;
 /// `SND_PCM_ACCESS_RW_INTERLEAVED`.
 const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
 /// `SND_PCM_FORMAT_FLOAT_LE`.
@@ -294,6 +302,16 @@ const PERIODS_PER_SECOND: u32 = 100;
 
 /// How long a suspended PCM is given to resume while `snd_pcm_resume` answers `-EAGAIN`.
 const RESUME_WAIT: Duration = Duration::from_secs(1);
+
+/// How long `write` waits for room the device has not made, when `snd_pcm_writei` answers
+/// `-EAGAIN`: the time the whole buffer takes to play, and 100 ms more. The caller has already
+/// checked that the frames fit, so any wait here is ALSA's position moving between two calls; a
+/// device that does not make room in a whole buffer's time is not draining at all, and the write
+/// fails naming `snd_pcm_writei` and `EAGAIN` rather than blocking the thread for ever.
+fn write_wait(buffer_frames: u32, rate: u32) -> Duration {
+    Duration::from_secs_f64(f64::from(buffer_frames) / f64::from(rate.max(1)))
+        + Duration::from_millis(100)
+}
 
 /// A timeout as `snd_pcm_wait` milliseconds: **rounded up**, so that a wait asked for in
 /// microseconds does not become a zero-length poll, and capped at `c_int::MAX`, so that no finite
@@ -512,7 +530,7 @@ impl AudioOutput {
         let mut raw = ptr::null_mut();
         // SAFETY: an out-pointer and a NUL-terminated name, both live for the call.
         let code = unsafe {
-            snd_pcm_open(&mut raw, request.device.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0)
+            snd_pcm_open(&mut raw, request.device.as_ptr(), SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)
         };
         if code < 0 {
             return Err(open_error(code));
@@ -742,6 +760,7 @@ impl AudioOutput {
         );
         let mut done = 0usize;
         let frames = frames as usize;
+        let mut deadline: Option<Instant> = None;
         while done < frames {
             let rest = &samples[done * channels..];
             // SAFETY: a live PCM; `rest` is `(frames - done) * channels` initialised `f32`s, which
@@ -750,15 +769,33 @@ impl AudioOutput {
             let wrote = unsafe {
                 snd_pcm_writei(self.pcm.raw(), rest.as_ptr().cast(), (frames - done) as Uframes)
             };
+            let code = c_int::try_from(wrote).unwrap_or(c_int::MIN);
+            // No room right now: `-EAGAIN`, or -- MEASURED on a prepared stream, through both
+            // PipeWire's plugin and `plughw` -- a count of 0. Wait for room, bounded; see
+            // `write_wait`.
+            if code == -libc::EAGAIN || wrote == 0 {
+                let until = *deadline.get_or_insert_with(|| {
+                    Instant::now() + write_wait(self.buffer_frames, self.format.sample_rate)
+                });
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(alsa_error("write", "snd_pcm_writei", -libc::EAGAIN));
+                }
+                // SAFETY: a live PCM and a non-negative timeout.
+                let waited = unsafe { snd_pcm_wait(self.pcm.raw(), wait_millis(left)) };
+                if waited < 0 {
+                    self.recover("write", "snd_pcm_wait", waited)?;
+                }
+                continue;
+            }
             if wrote < 0 {
                 // The device ran dry (or slept) partway: what was already written has played, and
                 // the rest goes into the recovered, empty buffer.
-                self.recover("write", "snd_pcm_writei", c_int::try_from(wrote).unwrap_or(c_int::MIN))?;
+                self.recover("write", "snd_pcm_writei", code)?;
                 continue;
             }
-            // A blocking `snd_pcm_writei` of a non-zero count returns it whole or reports an error
-            // (alsa-lib `snd_pcm_write_areas` returns `xfer > 0 ? xfer : err`), so progress is
-            // at least one frame here and the loop ends.
+            // Non-blocking, `snd_pcm_writei` writes what fits and says how much, so each pass
+            // either progresses by at least a frame or takes one of the bounded branches above.
             done += usize::try_from(wrote).unwrap_or(0);
         }
         if self.running && self.pcm.state() == SND_PCM_STATE_PREPARED {
@@ -1041,6 +1078,40 @@ mod tests {
         assert_eq!(output.recoveries(), Recoveries::default(), "a full buffer ran dry");
     }
 
+    /// A write the device has no room for -- a full buffer, not started, so nothing will ever make
+    /// room -- fails naming `snd_pcm_writei` and `EAGAIN` once [`write_wait`] has passed, and does
+    /// not take the thread for ever. `mod.rs` refuses such a write before it reaches the backend
+    /// ([`AudioError::TooManyFrames`]), so this calls the backend directly: it is the backstop for
+    /// the moment ALSA's position and `snd_pcm_writei` disagree. The write runs on a thread of its
+    /// own and is waited for with a deadline, so that a write that does block fails this test
+    /// instead of hanging the run.
+    #[test]
+    #[ignore = "needs an audio output device: OMNI_AUDIO_LIVE_TESTS=1 cargo test -- --ignored"]
+    fn a_write_with_no_room_fails_by_name_instead_of_blocking() {
+        require_gate();
+        let mut output = AudioOutput::open(4_800).unwrap();
+        let channels = usize::from(output.format().channels);
+        let free = output.writable_frames("write").unwrap();
+        output.write(&vec![0.0; free as usize * channels], free).unwrap();
+        let bound = write_wait(output.buffer_frames(), output.format().sample_rate);
+        let period = output.period_frames();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let asked = Instant::now();
+            let result = output.write(&vec![0.0; period as usize * channels], period);
+            let _ = tx.send((result, asked.elapsed()));
+        });
+        let (result, took) = rx
+            .recv_timeout(bound * 4)
+            .unwrap_or_else(|_| panic!("a write with no room had not returned after {:?}", bound * 4));
+        println!("a {period}-frame write into a full, unstarted buffer: {result:?} after {took:?} (bound {bound:?})");
+        assert!(
+            matches!(result, Err(AudioError::Alsa { api: "snd_pcm_writei", errno, .. }) if errno == libc::EAGAIN),
+            "{result:?}"
+        );
+        assert!(took >= bound.mul_f32(0.9) && took < bound * 2, "took {took:?} for a bound of {bound:?}");
+    }
+
     /// The card named by `OMNI_AUDIO_HW_CARD`, opened **without the sound server** -- the path a
     /// host with no PipeWire takes. `hw:` is the card as it is: a card that does not do float
     /// (every HDA codec) refuses by name at `snd_pcm_hw_params_set_format`, the seam's "no
@@ -1125,5 +1196,20 @@ mod tests {
         );
         assert!((0.98..=1.02).contains(&(per_second / f64::from(PREFERRED_RATE))), "{per_second}");
         assert_eq!(output.recoveries(), Recoveries::default());
+        drop(output);
+
+        // Started with nothing queued. The kernel refuses `snd_pcm_start` on an empty playback
+        // stream (`-EPIPE`, `snd_pcm_pre_start`) -- PipeWire's plugin does not, which is why this
+        // is checked here, on the card -- so `start` must defer it to the first write.
+        let mut output = open_free(&plug).unwrap_or_else(|e| panic!("{plug}: {e}"));
+        output.start().unwrap_or_else(|e| panic!("{plug}: an empty start: {e}"));
+        let free = output.writable_frames("write").unwrap();
+        output.write(&vec![0.0; free as usize * channels], free).unwrap();
+        let written = Instant::now();
+        while output.writable_frames("writable_frames").unwrap() == 0 {
+            assert!(written.elapsed() < Duration::from_millis(500), "{plug}: the first write did not start it");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(output.recoveries(), Recoveries::default(), "{plug}: an empty start is not an xrun");
     }
 }

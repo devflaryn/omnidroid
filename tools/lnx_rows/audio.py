@@ -30,6 +30,12 @@ _SCRIPT = "; ".join([
 ])
 AUDIO = with_env({"OMNI_AUDIO_LIVE_TESTS": "1"}, ["sh", "-c", _SCRIPT])
 
+# The card opened without the sound server (`hw_card_*` in linux.rs). The card name is this
+# development host's (`aplay -L`: HDA Intel PCH); the test retries while the server still holds it.
+HW_CARD = with_env({"OMNI_AUDIO_LIVE_TESTS": "1", "OMNI_AUDIO_HW_CARD": "PCH"},
+                   ["cargo", "test", "-p", "omni-platform", "--release", "--no-fail-fast", "--lib",
+                    "audio::linux::tests::hw_card", "--", "--ignored"])
+
 ROWS = [
     ("lnx-audio-A1", "A", "writable_frames ignores snd_pcm_avail and answers the whole buffer",
      LINUX_RS,
@@ -128,7 +134,7 @@ ROWS = [
      LINUX_RS,
      """            SND_PCM_STATE_PREPARED if self.writable_frames("start")? < self.buffer_frames => {""",
      """            SND_PCM_STATE_PREPARED => {""",
-     AUDIO),
+     HW_CARD),
 
     ("lnx-audio-B4", "B", "writable_frames keeps a period of headroom back from the caller",
      LINUX_RS,
@@ -148,5 +154,20 @@ ROWS = [
      LINUX_RS,
      """        if resumed < 0 {""",
      """        if resumed <= 0 {""",
+     AUDIO),
+
+    # MEASURED before the fix: in blocking mode, lnx-audio-A1 hung the harness in
+    # a `snd_pcm_writei` into a full, unstarted buffer (1963 s, ended by killing the binary). The row
+    # reverts non-blocking mode.
+    ("lnx-audio-A12", "A", "the PCM is opened blocking, so a write with no room never returns",
+     LINUX_RS,
+     """SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)""",
+     """SND_PCM_STREAM_PLAYBACK, 0)""",
+     AUDIO),
+
+    ("lnx-audio-A13", "A", "a non-blocking write of 0 frames is not treated as no room (spins)",
+     LINUX_RS,
+     """            if code == -libc::EAGAIN || wrote == 0 {""",
+     """            if code == -libc::EAGAIN {""",
      AUDIO),
 ]
