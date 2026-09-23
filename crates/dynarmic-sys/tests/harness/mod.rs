@@ -95,6 +95,9 @@ pub struct Ctx {
     /// guest carries on); 0 leaves `SVC #1` like any other. Forces host context switches in the
     /// middle of guest execution.
     pub sleep_on_svc1_us: u64,
+    /// Test hook: `SVC #2` writes the byte already at this host address back to it, from inside
+    /// the callback -- i.e. on the guest's thread, in the middle of guest execution. 0 = off.
+    pub rewrite_byte_on_svc2: u64,
     /// Test hook: make `interpreter_fallback` behave as an interpreter that
     /// executed its `num_insns` instructions as no-ops -- advance the guest PC
     /// past them and do **not** halt -- so a test can see where execution goes
@@ -372,6 +375,13 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
     unsafe {
         with(ctx, (), |c| {
             c.svc.push(swi);
+            if swi == 2 && c.rewrite_byte_on_svc2 != 0 {
+                let p = c.rewrite_byte_on_svc2 as *mut u8;
+                // SAFETY: deliberately a write the host may refuse; `tests/wx.rs` runs it in a
+                // child process whose death is the measurement. The byte written is the byte read.
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p));
+                return;
+            }
             if swi == 1 && c.sleep_on_svc1_us != 0 {
                 std::thread::sleep(std::time::Duration::from_micros(c.sleep_on_svc1_us));
                 return;
@@ -562,6 +572,7 @@ impl Vm {
             reenter_step_result: None,
             halt_on_svc: true,
             sleep_on_svc1_us: 0,
+            rewrite_byte_on_svc2: 0,
             fallback_skips: false,
             fallback_host_fpcr: 0,
             zero_invalidate_on_svc: false,

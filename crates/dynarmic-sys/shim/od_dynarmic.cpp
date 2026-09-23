@@ -81,6 +81,9 @@ public:
     od_callbacks cb{};
     void* ctx = nullptr;
     od_stats stats{};
+#if defined(__aarch64__)
+    u64 last_svc_return = 0;
+#endif
 
     std::optional<u32> MemoryReadCode(u64 vaddr) override {
         stats.read_code++;
@@ -181,6 +184,13 @@ public:
         cb.interpreter_fallback(ctx, pc, static_cast<u64>(n));
     }
     void CallSVC(u32 swi) override {
+#if defined(__aarch64__)
+        /* The arm64 backend's call trampolines reach this override with a plain `BR`, so the
+         * link register still holds the return address into the translated block: an address
+         * inside the code cache, which is what the W^X measurement needs and nothing else
+         * exposes. */
+        last_svc_return = reinterpret_cast<u64>(__builtin_return_address(0));
+#endif
         stats.svc_calls++;
         cb.call_svc(ctx, swi);
     }
@@ -506,9 +516,15 @@ void od_jit_effective_config(void* p, od_effective_config* out) {
     out->optimizations = static_cast<uint32_t>(uc.optimizations);
     out->unsafe_optimizations = uc.unsafe_optimizations ? 1u : 0u;
 #if defined(OD_DYNARMIC_W_XOR_X) && OD_DYNARMIC_W_XOR_X
-    out->code_cache_w_xor_x = 1;
+    out->code_cache_w_xor_x = OD_CODE_CACHE_W_XOR_X;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    /* oaknut's CodeBlock maps the cache `MAP_JIT` (RWX in the VM map) and the arm64 backend
+     * brackets every write with `pthread_jit_write_protect_np`, which switches the *calling
+     * thread's* view between RW- and R-X in hardware. Not echoed from a flag: `tests/wx.rs`
+     * measures it. */
+    out->code_cache_w_xor_x = OD_CODE_CACHE_W_XOR_X_PER_THREAD;
 #else
-    out->code_cache_w_xor_x = 0;
+    out->code_cache_w_xor_x = OD_CODE_CACHE_W_AND_X;
 #endif
     out->tpidr_el0_ptr = reinterpret_cast<uint64_t>(uc.tpidr_el0);
     out->tpidrro_el0_ptr = reinterpret_cast<uint64_t>(uc.tpidrro_el0);
@@ -521,6 +537,12 @@ void od_jit_stats(void* p, od_stats* out) {
 void od_jit_reset_stats(void* p) {
     as_jit(p)->callbacks.stats = od_stats{};
 }
+
+#if defined(__aarch64__)
+uint64_t od_jit_last_svc_return_address(void* p) {
+    return as_jit(p)->callbacks.last_svc_return;
+}
+#endif
 
 uint64_t od_jit_slow_path_total(void* p) {
     return as_jit(p)->callbacks.stats.slow_path_total;

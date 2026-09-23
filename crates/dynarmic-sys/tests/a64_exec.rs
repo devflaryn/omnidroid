@@ -559,6 +559,9 @@ fn invalidating_a_range_spares_the_translations_outside_it() {
     );
 }
 
+/// x64 only: the arm64 backend's cache is `MAP_JIT` and per-thread W^X on Apple hosts, which
+/// `tests/wx.rs` measures.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn the_code_cache_is_writable_and_executable_at_once() {
     // This asserts something Omnidroid does not want, on purpose.
