@@ -920,14 +920,29 @@ OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --releas
   OMNI_DATA_DIR=<dir>        keep the app's storage between runs (a signed-in session included)
 ```
 
-It **passes** with a real window on an RTX 4060 (gate104): six tests, no guest thread killed,
-teardown with none left running -- **and it now closes the app the way a device does**: focus
-lost, `onPause`, the surface destroyed, `onStop`. The render thread's `APP_CMD_TERM_WINDOW`
-teardown runs to the end -- pipeline cache saved (`vkGetPipelineCacheData`), then swapchain,
-surface, device and instance destroyed, each only after its children -- and a close watchdog
-names every thread and releases the glue if a close ever hangs again. The memory the guest is told
-it has is the commit ceiling this runtime enforces, 3.5 GiB (it was 2 GiB, which put the engine in
-a low tier: a 16-48 MB texture budget, now 512 MB). What a run reaches, every time:
+It **passes** with a real window on an RTX 4060 (gate114): seven tests, no guest thread killed,
+teardown with none left running -- **and it closes the app the way a device does**: focus lost,
+`onPause`, the surface destroyed, `onStop`, `onTrimMemory(UI_HIDDEN)`, and the process lifecycle
+events the app's own observer turns into `setInactive`/`setHidden` (below). The render thread's
+`APP_CMD_TERM_WINDOW` teardown runs to the end -- pipeline cache saved (`vkGetPipelineCacheData`),
+then swapchain, surface, device and instance destroyed, each only after its children -- and a
+close watchdog names every thread and releases the glue if a close ever hangs again. **The close
+is asserted**: every call returned, and the engine's own session record says the app went to the
+background (`SessionHistory` ending in `B`). The memory the guest is told it has is the commit
+ceiling this runtime enforces, 3.5 GiB (it was 2 GiB, which put the engine in a low tier: a
+16-48 MB texture budget, now 512 MB).
+
+**A kept install launches again** (gate110-112: a first launch and two more of one
+`OMNI_DATA_DIR`, 7/7 each). Two things a device hands the engine were missing. How the last run
+ended: the gate records a run it closed as `REASON_USER_REQUESTED` in the kept root, and step 11
+hands it to `nativeSetAppPreviousExitReasons` as the `ApplicationExitInfoCpp` list the Java side
+builds. And the process lifecycle: `RobloxApplication.onCreate` registers a
+`JNIAppLifecycleNativeAdapter` with `ProcessLifecycleOwner` (`ON_RESUME` -> `setActive`,
+`ON_PAUSE` -> `setInactive` 700 ms after the pause, `ON_STOP` -> `setHidden`); without them the
+session record stayed `I` and the next launch died in the engine's inferred-crash report
+(gate109).
+
+What a run reaches, every time:
 
 * **The engine's landing screen, drawn by its own renderer, presented to the host window** -- the
   Roblox logo, Create Account / Sign In, the thumbnail collage (`landing_first.png` in the session
@@ -966,27 +981,30 @@ a low tier: a 16-48 MB texture budget, now 512 MB). What a run reaches, every ti
    -- click Sign In, then Quick Sign-in, and enter the code on a device already signed in (Roblox
    app: More > Quick Sign In). Username and password typed in the window also reach the engine now;
    whether Roblox then demands a captcha, which on Android is a `WebView` this runtime does not have,
-   has **not been tried**. With `OMNI_DATA_DIR` the session should survive into the next run --
-   **not yet verified**, because no run has signed in. **The second launch of a kept directory is
-   its own frontier**: it reached `clearerr`, `utime` and `atof` (all bound now); then, even after
-   a clean close, the engine judges the previous session a crash (`SessionResultV2: Crash`,
-   `Inferred-Uncategorized`) because the exit-reason list it is handed is empty
-   (`RBX_EMPTY_EXIT_REASON_LIST`), and its crash report calls through a reporter that is null here
-   (`InferredCrash`, link `0x23834e4`; `x19` from `[sp, #0x28]` in the function at `0x2380a94`).
-   DECODED: the list is `jk.l2.a` -- on SDK >= 30, `ActivityManager.getHistoricalProcessExitReasons`
-   mapped to `ApplicationExitInfoCpp` (reason, status, pid, timestamp, the reason/subreason strings
-   of `toString()`), handed to `nativeSetAppPreviousExitReasons` at step 11, where the script hands
-   an empty `java/util/List`. The honest fix is the host recording how each run ended (a person
-   closing the window is `REASON_USER_REQUESTED`) where the system would, and answering the next
-   launch with it -- **not done yet**. Why the reporter is null on this path is not decoded.
+   has **not been tried**. `tools\play.ps1` keeps the app's storage by default, so a sign-in
+   should survive into the next run -- **not yet verified**, because no run has signed in; the
+   second launch of a kept directory itself works now (above). **What still poisons a kept
+   directory**: a run that ends without the close (console closed, Ctrl+C, a crash) leaves no
+   exit record and a session record saying `I`, and the next launch then takes the engine's
+   inferred-crash report and dies on a null member (gate109's shape: MemoryFault reading 0 at
+   link `0x2383500`). DECODED so far: the member is `+0xc8` of the engine's `InferredCrash`
+   object (constructor `0x2269244`, which zeroes it; reached only through the handle getter
+   `0x22690c4`, twelve callers, holder `0x6a6b880`); the report is taken only while the fast flag
+   `PerformanceControlCrashMetricAlgorithmType2` (`0x6ed98e0`) is non-zero, as it was in gate109
+   (whether by default or from the server's settings is not decoded); no store to `+0xc8` was found near any caller. On a device something sets it
+   -- or every Android install would die the same way -- and what that is is **not decoded**.
+   Until then, `play.ps1 -Fresh` is the way out.
 2. **After sign-in, everything is new**: Home, joining a game (the RCC connection, RakNet over UDP),
    the 3D renderer, physics, audio output (FMOD's native side, AAudio/OpenSL ES through `dlopen`).
    The `NativeUserJavaInterface` answers are a fresh install's signed-out ones -- DECODED, but a
    signed-in engine may ask the Java side things those answers contradict. Expect refusals; each
    names itself.
 3. **The idle 1 Hz**: decode why before optimising (see above).
-4. **Background speckle**: white streaks in the blurred backdrop behind the Quick Sign-in dialog
-   (`g89_screen_130.png`) -- a rendering defect, unexamined.
+4. ~~Background speckle~~ -- **not a rendering defect; resolved**. The white streaks behind the
+   Quick Sign-in dialog were the capture's: GDI+ `Graphics.CopyFromScreen` into a 32-bit bitmap
+   turns every pixel of exactly RGB(13,11,12) transparent, and the dark backdrop has a few hundred.
+   A GPU read-back of the presented frame has alpha 255 everywhere and the true colour in those
+   pixels. Capture with `BitBlt` + `Image.FromHbitmap` (or read back the swapchain) instead.
 5. **The one unexplained corruption**: gate42's MemoryFault in a libc++ `unordered_map` rehash at
    link `0x21db208` -- 32 bytes of `0xFF`, seen once in ~20 runs, not since. Treat it as live.
 
@@ -1002,6 +1020,23 @@ past the join); `setpriority`; JNI slots released with their thread; `/proc/memi
 Platform: `WindowEvent::Text` from `WM_CHAR`; `host_manufacturer`; `Filesystem::guest_path_of` (a
 refused writable file mapping names its file). Gate: the switches above; every thread still running
 at a failed teardown is named with its start routine and where it is.
+
+Then, for the second launch: `jni::ExitRecord`, `Jni::set_previous_exits`/`previous_exit_reasons`
+(the `ApplicationExitInfoCpp` list), `Jni::new_list`/`new_object_with`, `java.util.List` answered
+from a host-built `ArrayList`; `script::process_lifecycle` (`ProcessEvent`); in the gate, the exit
+records in `data/system/` of the kept root and the asserted close (`close_failure`).
+
+**Decoded and deliberately not sent**, so nobody re-derives them:
+* `JNIActivityLifecycleCallbacks` (registered unconditionally in `RobloxApplication.onCreate`, so a
+  device does call it for `MainGameActivity`): its seven `Post*`/`SaveInstanceState` natives are a
+  bare `ret`, and the other twelve feed one handler (`0x21f15a4`) that timestamps each transition --
+  startup telemetry. Sending it would be faithful and changes nothing a run has shown to matter.
+* `nativePassCurrentDisplayRefreshRate`/`nativePassSupportedRefreshRates`: only
+  `MainScreenController` (`fi.r0`) calls them, and only `ActivityNativeMain` creates one --
+  **not** `MainGameActivity`, so a device on the GameActivity path never sends them either; the
+  engine's `PerformanceControlDisplaySupportedRefreshRates` `Empty` is that path's truth. (A
+  window-seam refresh-rate query was written and removed for this reason; the patch is in the
+  session scratchpad.)
 
 ## After the first frame -- the goal is not a frame
 
