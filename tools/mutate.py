@@ -327,6 +327,9 @@ CAPACITY_JNI = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--
                 "a_loaded_worlds"]
 CAPACITY_ARENA = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast",
                   "the_arena_spans"]
+# `vkCmdCopyImageToBuffer`: the guest-side handler, through the recording host double.
+VULKAN_READBACK = ["cargo", "test", "-p", "omni-android", "--release", "--test", "vulkan_present",
+                   "--no-fail-fast", "an_image_copy_carries"]
 
 # The same target, filtered to the test of the exit records the gate keeps in a kept root. Files in
 # a temporary directory -- no APK, no guest -- so it costs a build and not a run.
@@ -7563,6 +7566,52 @@ directory", ADAPTER_FILES,
      "pub const ARENA_GRANULES: usize = 6;",
      CAPACITY_ARENA),
 
+    # vkCmdCopyImageToBuffer: the render thread's read-back on a loaded world's first frame.
+    ("readback-A1", "A", "vkCmdCopyImageToBuffer falls back to the refusal",
+     "crates/omni-android/src/vulkan/mod.rs",
+     """        "vkCmdCopyImageToBuffer" => draw::cmd_copy_image_to_buffer(c, &at, &vulkan, args),
+""",
+     "",
+     VULKAN_READBACK),
+    ("readback-A2", "A", "the image and the buffer swapped",
+     "crates/omni-android/src/vulkan/draw.rs",
+     """    let image = vulkan.image_ref_token(at, CALL, args[1])?;
+    let destination = vulkan.buffer_token(at, CALL, args[3])?;
+    let regions = read_regions(
+        c,
+        at,
+        CALL,
+        "pRegions",
+        "VkBufferImageCopy",""",
+     """    let image = vulkan.image_ref_token(at, CALL, args[3])?;
+    let destination = vulkan.buffer_token(at, CALL, args[1])?;
+    let regions = read_regions(
+        c,
+        at,
+        CALL,
+        "pRegions",
+        "VkBufferImageCopy",""",
+     VULKAN_READBACK),
+    ("readback-A3", "A", "the layout read from the wrong register",
+     "crates/omni-android/src/vulkan/draw.rs",
+     "host.cmd_copy_image_to_buffer(buffer, image, args[2] as u32, destination, &regions)?;",
+     "host.cmd_copy_image_to_buffer(buffer, image, args[4] as u32, destination, &regions)?;",
+     VULKAN_READBACK),
+    ("readback-B1", "B", "the region count taken as one rather than the guest's",
+     "crates/omni-android/src/vulkan/draw.rs",
+     """        BUFFER_IMAGE_COPY_BYTES,
+        args[4],
+        args[5],
+        5,
+    )?;
+    host.cmd_copy_image_to_buffer(""",
+     """        BUFFER_IMAGE_COPY_BYTES,
+        1,
+        args[5],
+        5,
+    )?;
+    host.cmd_copy_image_to_buffer(""",
+     VULKAN_READBACK),
 ]
 
 

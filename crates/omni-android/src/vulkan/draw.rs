@@ -553,6 +553,42 @@ pub(super) fn cmd_copy_buffer_to_image(
     Ok(())
 }
 
+/// `void vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
+/// VkImageLayout srcImageLayout, VkBuffer dstBuffer, uint32_t regionCount,
+/// const VkBufferImageCopy *pRegions)`
+///
+/// **`vkCmdCopyBufferToImage` turned round**: the same `VkBufferImageCopy` regions, an image of
+/// either family as the source and a buffer as the destination -- a read of rendered pixels back
+/// into memory. MEASURED: the engine's render thread called it on the first frame of a loaded
+/// game world (the main world of a Pet Simulator 99 join, 2026-09-23) and died on the refusal it
+/// used to be, with `x2` = 6 (`TRANSFER_SRC_OPTIMAL`) and one region.
+pub(super) fn cmd_copy_image_to_buffer(
+    c: &mut ImportCall<'_, '_>,
+    at: &Site,
+    vulkan: &Arc<Vulkan>,
+    args: [u64; ARG_REGISTERS as usize],
+) -> AbiResult<()> {
+    const CALL: &str = "vkCmdCopyImageToBuffer";
+    let host = vulkan.require_host(at)?;
+    let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    let image = vulkan.image_ref_token(at, CALL, args[1])?;
+    let destination = vulkan.buffer_token(at, CALL, args[3])?;
+    let regions = read_regions(
+        c,
+        at,
+        CALL,
+        "pRegions",
+        "VkBufferImageCopy",
+        BUFFER_IMAGE_COPY_BYTES,
+        args[4],
+        args[5],
+        5,
+    )?;
+    host.cmd_copy_image_to_buffer(buffer, image, args[2] as u32, destination, &regions)?;
+    c.ret().void();
+    Ok(())
+}
+
 /// `void vkCmdCopyImage(VkCommandBuffer commandBuffer, VkImage srcImage,
 /// VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout,
 /// uint32_t regionCount, const VkImageCopy *pRegions)`

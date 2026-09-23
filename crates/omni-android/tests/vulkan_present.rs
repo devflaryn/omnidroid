@@ -400,6 +400,8 @@ struct HostLog {
     image_blits: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>, u32)>,
     /// Every `vkCmdResolveImage`: as `image_copies`.
     image_resolves: Vec<(HostImageRef, u32, HostImageRef, u32, Vec<u8>)>,
+    /// Every `vkCmdCopyImageToBuffer`: the image, its layout, the buffer, the regions' bytes.
+    image_to_buffer: Vec<(HostImageRef, u32, HostBuffer, Vec<u8>)>,
 }
 
 /// The measured memory table of this machine, which the double reports so that the rewrite is
@@ -744,6 +746,7 @@ impl VulkanHost for StageFourHost {
                 | "vkCmdDispatch"
                 | "vkCmdCopyImage"
                 | "vkCmdResolveImage"
+                | "vkCmdCopyImageToBuffer"
                 | "vkCmdBlitImage"
                 | "vkDestroyPipeline"
                 | "vkCreateDescriptorSetLayout"
@@ -1338,6 +1341,18 @@ impl VulkanHost for StageFourHost {
             destination_layout,
             regions.to_vec(),
         ));
+        Ok(())
+    }
+
+    fn cmd_copy_image_to_buffer(
+        &self,
+        _buffer: HostCommandBuffer,
+        image: HostImageRef,
+        layout: u32,
+        destination: HostBuffer,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        self.log().image_to_buffer.push((image, layout, destination, regions.to_vec()));
         Ok(())
     }
 
@@ -2447,6 +2462,32 @@ fn an_image_copy_carries_each_image_with_its_own_layout() {
     let text = f.refusal(name("vkCmdResolveImage"), &[command, created, 6, presented, 7, 0, resolves]);
     assert!(text.to_string().contains("regionCount = 0"), "{text}");
     assert_eq!(up.host.log().image_resolves.len(), 1, "the refused one recorded nothing");
+
+    // **`vkCmdCopyImageToBuffer`: `vkCmdCopyBufferToImage` turned round**, the engine's first
+    // in-world frame's read-back (MEASURED, 2026-09-23: `x2` = 6, one region). From a created
+    // image and from a swapchain image, each into the buffer the guest named, the layout with its
+    // image and the region whole; a zero count is refused.
+    f.call(name("vkCreateBuffer"), [up.device, f.buffer_info(256, 0x2), 0, out]).expect("a buffer");
+    let readback = f.guest.read_u64(out as GuestAddr);
+    let copy: Vec<u8> = (1u32..=14).flat_map(|word| (word * 0x0407).to_le_bytes()).collect();
+    assert_eq!(copy.len(), BUFFER_IMAGE_COPY_BYTES);
+    let copies = f.bytes(&copy);
+    f.call_n(name("vkCmdCopyImageToBuffer"), &[command, created, 6, readback, 1, copies])
+        .expect("the read-back is recorded");
+    f.call_n(name("vkCmdCopyImageToBuffer"), &[command, presented, 6, readback, 1, copies])
+        .expect("the swapchain read-back is recorded");
+    let recorded = up.host.log().image_to_buffer.clone();
+    assert_eq!(recorded.len(), 2);
+    let (image, layout, destination, bytes) = &recorded[0];
+    assert!(matches!(image, HostImageRef::Created(_)), "{image:?}");
+    assert_eq!(*layout, 6, "TRANSFER_SRC_OPTIMAL, from x2");
+    assert_eq!(bytes, &copy, "the region, whole");
+    let (image, _, second_destination, _) = &recorded[1];
+    assert!(matches!(image, HostImageRef::Swapchain(_)), "{image:?}");
+    assert_eq!(destination, second_destination, "one buffer, the one the guest named both times");
+    let text = f.refusal(name("vkCmdCopyImageToBuffer"), &[command, created, 6, readback, 0, copies]);
+    assert!(text.to_string().contains("regionCount = 0"), "{text}");
+    assert_eq!(up.host.log().image_to_buffer.len(), 2, "the refused one recorded nothing");
 }
 
 /// **The two-call protocol, the stable handles, and what a destroyed swapchain does to them.**

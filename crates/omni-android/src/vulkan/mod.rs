@@ -3668,6 +3668,7 @@ fn proc_slot(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         "vkCmdDrawIndexed" => draw::cmd_draw_indexed(c, &at, &vulkan, args),
         "vkCmdCopyBuffer" => draw::cmd_copy_buffer(c, &at, &vulkan, args),
         "vkCmdCopyBufferToImage" => draw::cmd_copy_buffer_to_image(c, &at, &vulkan, args),
+        "vkCmdCopyImageToBuffer" => draw::cmd_copy_image_to_buffer(c, &at, &vulkan, args),
         "vkCmdPushConstants" => draw::cmd_push_constants(c, &at, &vulkan, args),
         // Everything else. **Still the measurement**: the refusal names the Vulkan function and
         // quotes `x0`-`x7`, and `Vulkan::names()` is the ordered list that says what to build

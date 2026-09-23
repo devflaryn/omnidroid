@@ -5315,6 +5315,37 @@ impl VulkanHost for GfxVulkanHost {
         Ok(())
     }
 
+    fn cmd_copy_image_to_buffer(
+        &self,
+        buffer: HostCommandBuffer,
+        image: HostImageRef,
+        layout: u32,
+        destination: HostBuffer,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        const METHOD: &str = "VulkanHost::cmd_copy_image_to_buffer";
+        let (device, handle) = self.command_parts(buffer, METHOD)?;
+        let source = self.image_handle(image, "vkCmdCopyImageToBuffer")?;
+        let destination_handle = {
+            let table = self.locked_vk_buffers();
+            self.device_of(&table, destination.token(), "VkBuffer", METHOD)?.1
+        };
+        let built = buffer_image_copies_from_bytes(METHOD, regions)?;
+        // SAFETY: the command buffer is live and recording, the image and buffer are live, and
+        // the image is in the layout the guest named -- which is its responsibility and which the
+        // driver reports if the barrier before it was wrong.
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                handle,
+                source,
+                vk::ImageLayout::from_raw(layout as i32),
+                destination_handle,
+                &built,
+            );
+        }
+        Ok(())
+    }
+
     fn cmd_copy_image(
         &self,
         buffer: HostCommandBuffer,

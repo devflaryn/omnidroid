@@ -3652,6 +3652,29 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
         ))
     }
 
+    /// `vkCmdCopyImageToBuffer`, forwarded: `vkCmdCopyBufferToImage` turned round. The image
+    /// may be of either family, and `regions` is the flat bytes,
+    /// [`BUFFER_IMAGE_COPY_BYTES`](super::BUFFER_IMAGE_COPY_BYTES) per entry.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when a token is not one this host issued.
+    fn cmd_copy_image_to_buffer(
+        &self,
+        buffer: HostCommandBuffer,
+        image: HostImageRef,
+        layout: u32,
+        destination: HostBuffer,
+        regions: &[u8],
+    ) -> AbiResult<()> {
+        let _ = (buffer, image, layout, destination, regions);
+        Err(host_has_no(
+            "VulkanHost::cmd_copy_image_to_buffer",
+            "the pixels are never read back, and whatever reads the buffer reads what was there \
+             before",
+        ))
+    }
+
     /// `vkCmdCopyImage`, forwarded. Either image may be of either family, and `regions` is the
     /// guest's [`IMAGE_COPY_BYTES`](super::IMAGE_COPY_BYTES)-byte `VkImageCopy`s, whole.
     ///
