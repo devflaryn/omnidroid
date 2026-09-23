@@ -901,6 +901,8 @@ Read in this order:
 5. **`docs/DECISIONS.md`** — **D29** (M5 and the NDK surface) and **D28** (M4) first, then D27
    (textures — M6's scope), D26 (`AT_HWCAP`), D24, D23, D19, D16, D13, D7.
 6. **`docs/ARCHITECTURE.md`** §§1, 2, 5, 6.
+7. **`docs/briefs/`** -- two ready-to-launch subagent briefs for the current frontier
+   (`webview2-seam.md`, `performance.md`).
 
 ## Where the runtime actually is today
 
@@ -919,6 +921,38 @@ OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --releas
   OMNI_CLIENT_APP_SETTINGS=<json>  Roblox's own ClientAppSettings.json, for turning on an engine log
   OMNI_DATA_DIR=<dir>        keep the app's storage between runs (a signed-in session included)
 ```
+
+**2026-09-23: a person signed in, reached Home, and pressed Play.** `tools\play.ps1` is how the
+person runs it (a 30-minute default session, storage kept in `%LOCALAPPDATA%\Omnidroid\data`,
+`-Fresh` for a clean install). What the signed-in sessions (play2-play7 in that session's
+scratchpad) found, in order, and where each stands:
+
+* **Sign-in works through Quick Sign-in** (DID_LOG_IN, then Home). The first two accounts were
+  **moderated by Roblox** (every signed-in call `403 "User is moderated"`), which no runtime change
+  can alter; a fresh account worked. **Password sign-in gets a captcha** (`"Challenge is required to
+  authorize the request"` -> `ChallengeHybridWebView` -> `Load generic challenge failed` 70 s later),
+  because this runtime has **no web view** -- the frontier's item 2.
+* **Signing in killed six guest threads**, all fixed and committed (`8ac8b64`):
+  `Context.getSharedPreferences` (the render thread -- the window froze), writable `MAP_SHARED` file
+  mappings (three threads; now real host file views), `recvmsg`, `sysconf(_SC_OPEN_MAX)`.
+* **The first game join** (the loading screen showed) failed with Roblox's "Http error 529": the
+  descriptor ceiling was 64 and `socket()` answered `EMFILE`, so the request to
+  `gamejoin.roblox.com/v1/join-game` never got a socket. Fixed (`bc3fe21`: 1024 descriptors, a
+  1024-socket Windows `select` set), with `JavaVM::DetachCurrentThread` (two FMOD threads died on it
+  holding a lock, and everything behind the lock hung). A QUIC thread's `raise(SIGTRAP)` in that
+  run is believed to follow from the `EMFILE`; unverified.
+* **`vkCmdResolveImage`** killed the render thread on the landing screen of the next client
+  (`a27de7c`, fixed). The client after that ran 400 s with no death and closed cleanly.
+* **No game has been entered yet.** The person has not pressed Play since those two fixes.
+* **Audio works** (`b25559d`): `libaaudio.so` over WASAPI; FMOD's init no longer fails with 51.
+* **The frame rate is the person's main complaint** ("unstable and unusable"): 1-7 fps. See the
+  frontier's item 3.
+* The gate prints **`GUEST THREAD DIED at +Ns`** the moment a thread dies (it used to say so only
+  at teardown, and a dead render thread read as a frozen window). **PowerShell wraps redirected
+  output at 120 columns** in `play.ps1` logs, so a grep pattern can be split across two lines.
+* Earlier data directories the person used are set aside, not deleted:
+  `%LOCALAPPDATA%\Omnidroid\data-moderated-account-*`, `data-frozen-session-*`,
+  `data-join-attempt-*`, `data-resolve-freeze-*`.
 
 It **passes** with a real window on an RTX 4060 (gate114): seven tests, no guest thread killed,
 teardown with none left running -- **and it closes the app the way a device does**: focus lost,
@@ -974,47 +1008,75 @@ What a run reaches, every time:
 
 ## The frontier -- CURRENT
 
-1. **A signed-in account is the owner's to provide, and now it can be.** Every game needs one; no
-   credential may be invented. The route that needs no password typed into this runtime is **Quick
-   Sign-in**: run the gate interactively with a long session and a kept data directory --
-
-   ```text
-   OMNI_DATA_DIR=<dir> OMNI_SESSION_SECONDS=900 OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --release --test gameactivity -- --nocapture --test-threads=1
-   ```
-
-   -- click Sign In, then Quick Sign-in, and enter the code on a device already signed in (Roblox
-   app: More > Quick Sign In). Username and password typed in the window also reach the engine now;
-   whether Roblox then demands a captcha, which on Android is a `WebView` this runtime does not have,
-   has **not been tried**. `tools\play.ps1` keeps the app's storage by default, so a sign-in
-   should survive into the next run -- **not yet verified**, because no run has signed in; the
-   second launch of a kept directory itself works now (above). **What still poisons a kept
-   directory**: a run that ends without the close (console closed, Ctrl+C, a crash) leaves no
-   exit record and a session record saying `I`, and the next launch then takes the engine's
-   inferred-crash report and dies on a null member (gate109's shape: MemoryFault reading 0 at
-   link `0x2383500`). DECODED so far: the member is `+0xc8` of the engine's `InferredCrash`
-   object (constructor `0x2269244`, which zeroes it; reached only through the handle getter
-   `0x22690c4`, twelve callers, holder `0x6a6b880`); the report is taken only while the fast flag
-   `PerformanceControlCrashMetricAlgorithmType2` (`0x6ed98e0`) is non-zero, as it was in gate109
-   (whether by default or from the server's settings is not decoded); no store to `+0xc8` was found near any caller. On a device something sets it
-   -- or every Android install would die the same way -- and what that is is **not decoded**.
-   Until then, `play.ps1 -Fresh` is the way out.
-2. **After sign-in, everything is new**: Home, joining a game (the RCC connection, RakNet over UDP),
-   the 3D renderer, physics, audio output (FMOD's native side, AAudio/OpenSL ES through `dlopen`).
-   The `NativeUserJavaInterface` answers are a fresh install's signed-out ones -- DECODED, but a
-   signed-in engine may ask the Java side things those answers contradict. Expect refusals; each
-   names itself.
-3. **The idle 1 Hz**: decode why before optimising (see above). The engine's own account of its
-   frame pacing (`[FLog::ApplicationFrameRate] ... target: {} ms (user cap, requested, display
-   cap) ... scheduler throttling`) exists, but **no FLog channel has been turned on yet**:
-   `OMNI_CLIENT_APP_SETTINGS` gets its file read and logged, and 12, 1030, "1030" and 65535 all
+1. **The person's next test: enter a game -- without the VPN.** Every death the signed-in
+   sessions found is fixed. The person turned the VPN off (it was only there to get past Roblox's
+   bot flagging) and wants to test the first sign-in without it once the web view exists, since a
+   captcha is then solvable in the runtime itself. Relaunch `tools\play.ps1` (`-Fresh` while
+   item 4 stands), sign in (Quick Sign-in, or password + the captcha once item 2 lands), open a
+   game, Play, and watch the log for `GUEST THREAD DIED`. Everything after the join -- the RCC
+   connection over UDP, the 3D renderer, physics -- has never run here; expect refusals, each
+   naming itself.
+2. **The web view (the person asked for it; captchas at sign-in and sometimes at game join).**
+   DECODED so far (`classes2.dex` and `libroblox.so`):
+   * `com.roblox.protocols.webview.WebViewProtocol` is Java that talks to the engine's **message
+     bus**. Its constructor calls `MessageBus.p(protocolName, isAvailableId, handler)` (a request
+     handler) and `MessageBus.t(messageId, Callback)` three times: `openWindow`, `mutateWindow`,
+     `closeWindow` (each id is `MessageBus.getMessageId(protocolName, <id>)`; the names come from
+     the static natives `WebViewProtocol.getProtocolName/getOpenWindowId/...`, all exported).
+   * The Java `MessageBus` is a thin shell over **instance natives** (all exported,
+     `Java_com_roblox_universalapp_messagebus_MessageBus_*`): `doSubscribeRaw(String messageId,
+     RawCallback cb, boolean) -> Connection`, `setRequestHandlerRaw(String protocol, String method,
+     RequestHandlerRaw h)`, `publishRaw(String id, String json)`, `getMessageId`, and more. The
+     engine calls back **`RawCallback.run(String json)`** for a message and
+     **`RequestHandlerRaw.run(String json) -> String`** for a request (see `MessageBus$a`/`$b`).
+     `Connection` holds a native pointer (`long a`) with `isConnected(J)Z`/`deleteSharedPtr(J)V`.
+   * `openWindow`'s handler (`WebViewProtocol$b`) reads from the JSON: the URL (log "Attempted to
+     open WebView window with no URL" when absent), title, search params (an object) and search
+     type, show-domain-as-title, window type, is-visible, hide-header, back-button -- each key name
+     from a native (`getUrlKey`, `getTitleKey`, ...) -- and hands them to `vl.b.a(url, title, ...)`,
+     the UI that opens `com.roblox.client.hybrid.RBHybridWebView`.
+   * The page's way back: `cl.d.d(Context)` calls `WebView.addJavascriptInterface(obj, name)`
+     (**object class, name and methods not yet decoded**); `jk.a0.a/f` -> `WebViewProtocol.u(msg)`
+     -> the static native **`signalJavascriptCallback(String)`**, which is how the challenge result
+     reaches the engine. **Where the real app constructs `WebViewProtocol`** (and so when the
+     subscriptions are made) is not yet decoded: `jk.a0` holds one (field `e`),
+     `ActivityNativeMain$a` too.
+   * **The plan:** (a) the host seam, `omni_platform::webview` over WebView2 --
+     `docs/briefs/webview2-seam.md`, ready to hand a subagent; (b) the Android side in
+     `crates/omni-android` (the JNI layer): host-backed `RawCallback`/`RequestHandlerRaw` objects
+     (a new `Answer` whose `run` goes to a Rust closure), registered through the engine's own
+     `doSubscribeRaw`/`setRequestHandlerRaw` at the point the real app does, answering
+     `isAvailable`, opening a `WebView` on `openWindow`, closing on `closeWindow`, publishing
+     `handleWindowClose` when the person closes it, and a JavaScript shim (the seam's
+     `init_script`) that defines the page's Android interface object and forwards its calls
+     through `window.chrome.webview.postMessage` to `signalJavascriptCallback`.
+3. **Performance -- 1 to 7 frames per second, the person's main complaint.** Measured state and a
+   ready brief in **`docs/briefs/performance.md`**. In short: CPU is not saturated (2.3-2.4 cores);
+   one core is the game loop spinning on `ALooper_pollOnce(0)` + a mutex (DECODED at `0x2bcd648`;
+   it draws nothing); the render thread waits 81% of its time on a condition variable; the 1 ms
+   timer resolution (`1634316`) is **not yet measured**. Measure what each frame waits on before
+   changing anything.
+4. **A kept directory after an unclean end** (console closed, Ctrl+C, a hang the watchdog ended):
+   no exit record, a session record saying `I`, and the next launch takes the engine's inferred-crash
+   report and a worker dies on a null member (MemoryFault reading 0 at link `0x2383500`, gate109,
+   gate124). DECODED so far: the member is `+0xc8` of the engine's `InferredCrash` object
+   (constructor `0x2269244` zeroes it; handle getter `0x22690c4`, twelve callers, holder
+   `0x6a6b880`); the report runs only while the fast flag
+   `PerformanceControlCrashMetricAlgorithmType2` (`0x6ed98e0`) is non-zero; the call comes from a
+   listener loop at `0x2251590`. What sets it on a device is **not decoded**. Also MEASURED: a
+   sign-in from a session killed before `onStop` is **not kept** (the next launch logged out) --
+   the engine persists it on the way to the background. Until fixed, `play.ps1 -Fresh`.
+5. **A thread that dies holding a lock hangs everything behind it**, including the close (the
+   watchdog then shows threads INSIDE `pthread_mutex_lock` at `0x2b53a78`). The cure has always been
+   the death's own cause, but the watchdog should say who holds each lock: `Bionic::mutex_owner`
+   exists and is not printed.
+6. **The idle 1 Hz** and the engine's frame-pacing log (`[FLog::ApplicationFrameRate]`): no FLog
+   channel has been turned on yet -- `OMNI_CLIENT_APP_SETTINGS` with 12, 1030, "1030" and 65535 all
    printed nothing (gate115-116). The log site's check is DECODED (`0x61c96a4`: the flag's low byte
    >= 6 and a bit of `0xfc00`); how a settings value becomes those bits is not.
-4. ~~Background speckle~~ -- **not a rendering defect; resolved**. The white streaks behind the
-   Quick Sign-in dialog were the capture's: GDI+ `Graphics.CopyFromScreen` into a 32-bit bitmap
-   turns every pixel of exactly RGB(13,11,12) transparent, and the dark backdrop has a few hundred.
-   A GPU read-back of the presented frame has alpha 255 everywhere and the true colour in those
-   pixels. Capture with `BitBlt` + `Image.FromHbitmap` (or read back the swapchain) instead.
-5. **The one unexplained corruption**: gate42's MemoryFault in a libc++ `unordered_map` rehash at
+7. **`tools/mutate.py --only aaudio-` has not been run** (six rows, added with the audio work; two
+   of their mutations were checked by hand and caught). Run it with the tree to itself.
+8. **The one unexplained corruption**: gate42's MemoryFault in a libc++ `unordered_map` rehash at
    link `0x21db208` -- 32 bytes of `0xFF`, seen once in ~20 runs, not since. Treat it as live.
 
 ## What this session built, so it is not rebuilt
@@ -1034,6 +1096,15 @@ Then, for the second launch: `jni::ExitRecord`, `Jni::set_previous_exits`/`previ
 (the `ApplicationExitInfoCpp` list), `Jni::new_list`/`new_object_with`, `java.util.List` answered
 from a host-built `ArrayList`; `script::process_lifecycle` (`ProcessEvent`); in the gate, the exit
 records in `data/system/` of the kept root and the asserted close (`close_failure`).
+
+Then, 2026-09-23 afternoon (commits `b25559d`..`1159291`): **audio** -- `omni_platform::audio`
+(WASAPI, hand-written COM vtables) and `omni_android::aaudio` (`libaaudio.so` as FMOD dlsyms it; the
+data callback on a guest thread started through the guest's own `pthread_create`);
+`FMOD.supportsLowLatency` (false: the feature is not declared); `Context.getSharedPreferences` and
+its editor (`Jni::shared_preferences`); writable `MAP_SHARED` file mappings as real host views, and
+`msync`; `recvmsg`; `sysconf(_SC_OPEN_MAX)`; 1024 descriptors and a 1024-socket `select` set;
+`JavaVM::DetachCurrentThread`; `vkCmdResolveImage`; `omni_platform::clock::TimerResolution`; in the
+gate, audio bound with the window, live `GUEST THREAD DIED` lines and 1 ms timers.
 
 **Decoded and deliberately not sent**, so nobody re-derives them:
 * `JNIActivityLifecycleCallbacks` (registered unconditionally in `RobloxApplication.onCreate`, so a
