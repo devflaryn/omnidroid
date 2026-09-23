@@ -233,6 +233,21 @@ and the inline exclusive pair and doubleword pair of 0007. The A32 twin in
 `emit_arm64_a32.cpp` has the same instruction; A32 is not built here, so it is
 left alone.
 
+### 0009 — arm64: the prelude invalidates what it wrote, not the whole code cache
+
+`0009-arm64-invalidate-only-the-prelude.patch`. **arm64 only.**
+`A64AddressSpace::EmitPrelude` ended with `mem.invalidate_all()`, the cache-maintenance loop over
+**every page of the code cache**. On macOS that is `sys_icache_invalidate`, and cache maintenance on
+an untouched page faults it in: MEASURED with a C probe, a 32 MiB `MAP_JIT` mapping costs +0.00 MiB
+of `phys_footprint` untouched and **+32.03 MiB** after one `sys_icache_invalidate` over it. So every
+jit -- one per guest thread -- paid its whole code cache in memory at creation, whatever it later
+emitted: 39 jits x 32 MiB at the landing screen, about 1.2 GiB of a 3.2 GiB footprint (footprint(1),
+`MallocStackLogging` stacks ending in `AddressSpace::AddressSpace`). Only the prelude has been
+written at that point; every block emitted later is invalidated on its own in `AddressSpace::Emit`.
+`tests/code_cache_charge.rs` creates a jit with a 32 MiB cache and requires it to cost less than
+2 MiB, and still to run translated code. The A32 twin (`a32_address_space.cpp`) has the same call;
+A32 is not built here.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

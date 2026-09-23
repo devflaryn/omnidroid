@@ -270,4 +270,10 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
         return space;
     }""",
      cpu("identity")),
+    ("mac-cpu-C1", "A", "the prelude invalidates the whole code cache, charging every page of "
+     "every jit's cache at creation (patch 0009 reverted)",
+     ARM64 + "a64_address_space.cpp",
+     """    mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);""",
+     """    mem.invalidate_all();""",
+     dyn("code_cache_charge")),
 ]

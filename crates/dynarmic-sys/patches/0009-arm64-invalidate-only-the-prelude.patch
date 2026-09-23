@@ -1,0 +1,18 @@
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+index cd7a6a2..a8d1969 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -698,7 +698,12 @@ void A64AddressSpace::EmitPrelude() {
+ 
+     prelude_info.end_of_prelude = code.offset();
+ 
+-    mem.invalidate_all();
++    // Omnidroid patch 0009: invalidate the prelude that was written, not the whole code cache.
++    // `invalidate_all` runs the cache-maintenance loop over every page of the cache, and on macOS
++    // (`sys_icache_invalidate`) that faults each untouched page in: a 32 MiB `MAP_JIT` cache went
++    // from 0.00 to 32.03 MiB of phys_footprint from this one call (measured), per jit, per guest
++    // thread. Everything emitted later is invalidated block by block (`AddressSpace::Emit`).
++    mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);
+     ProtectCodeMemory();
+ }
+ 
