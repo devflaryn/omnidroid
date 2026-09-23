@@ -215,6 +215,10 @@ pub(super) fn listen(inner: &Inner, backlog: i32) -> NetResult<()> {
 /// | `EINPROGRESS` (non-blocking, handshake running) | `WSAEWOULDBLOCK` | `InProgress` |
 /// | `EALREADY` (a second call while it runs) | `WSAEALREADY` | `InProgress` |
 /// | `EISCONN` (a call once it has finished) | `WSAEISCONN` | `Connected` |
+///
+/// (MEASURED on Linux 7.0: the *first* call after a non-blocking connect has finished answers `0`
+/// -- the kernel reports the completion once -- and only later calls answer `EISCONN`. Both are
+/// `Connected`, so the difference never reaches a caller.)
 /// | anything else, `EAGAIN` included | anything else | the error, classified |
 ///
 /// **`EINPROGRESS` is success**, and the line that says so is the one that decides whether this

@@ -1060,8 +1060,8 @@ fn a_stream_shut_in_both_directions_reports_hangup_and_one_direction_does_not() 
 ///
 /// The SYN is dropped by filling a listener's accept queue: `listen(0)` admits one connection
 /// that nobody accepts, and Linux drops the next SYN while the queue is full, so that connect sits
-/// in `SYN_SENT`. A connect that has **finished** answers `EISCONN` to a second call, which is
-/// `Connected`.
+/// in `SYN_SENT`. A connect that has **finished** answers 0 to the next call and `EISCONN` to the
+/// one after, both `Connected`.
 #[test]
 fn a_second_connect_while_the_first_is_pending_is_in_progress_and_after_it_is_connected() {
     let mut listener = Socket::new(SocketKind::Stream, IpFamily::V4, loopback_policy()).expect("s");
@@ -1073,11 +1073,17 @@ fn a_second_connect_while_the_first_is_pending_is_in_progress_and_after_it_is_co
     let _ = first.connect(&address).expect("the one the queue admits");
     wait_until(&first, Interest::WRITABLE, "the first connect", |r| r.writable || r.error);
     assert_eq!(first.connect_result().expect("result"), ConnectOutcome::Connected);
-    assert_eq!(
-        first.connect(&address).expect("again, once connected"),
-        ConnectProgress::Connected,
-        "EISCONN is Connected"
-    );
+    // MEASURED on this kernel: the first `connect` after a non-blocking one has completed
+    // answers **0** -- it reports the completion (`inet_stream_connect` returns the socket's
+    // pending error, zero, once) -- and only the next one answers `EISCONN`. So two calls, both
+    // `Connected`, and the second is the `EISCONN` row.
+    for call in ["the completion (0)", "EISCONN"] {
+        assert_eq!(
+            first.connect(&address).expect("again, once connected"),
+            ConnectProgress::Connected,
+            "{call} is Connected"
+        );
+    }
 
     let mut second = socket(SocketKind::Stream, IpFamily::V4);
     assert_eq!(
