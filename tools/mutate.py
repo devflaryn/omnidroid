@@ -243,6 +243,13 @@ ANDROID = [
 # task 2. Its detector is the unit test on `clocks::capped`, which is why that predicate is a
 # function rather than an inline comparison.
 ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
+
+# The Vulkan layer's own targets: every `vulkan/` row is detected by these and nothing else. Added
+# with the first rows for it (M6, the engine's device bring-up).
+VULKAN = [
+    "cargo", "test", "-p", "omni-android", "--test", "vulkan_device", "--test", "vulkan_instance",
+    "--test", "vulkan_loader", "--test", "vulkan_present", "--no-fail-fast",
+]
 # `libm_tests` alone: the math primitives' own target, which `BIONIC` does not name.
 BIONIC_LIBM = ["cargo", "test", "-p", "omni-bionic", "--test", "libm_tests", "--no-fail-fast"]
 
@@ -2821,6 +2828,177 @@ directory", ADAPTER_FILES,
      """        if len < 16 || len > controllen - offset as u64 {""",
      """        if len < 16 {""",
      ANDROID),
+    # `posix_fallocate`: a file shortened by a call that promises only to grow it, a zero length
+    # answered as success, and a read-only descriptor allocated through.
+    ("fallocate-A1", "A", "posix_fallocate shortens a file whose range ends inside it", PLAT_FS_WINDOWS,
+     """    if end > size {""",
+     """    if end != size {""",
+     ANDROID),
+    ("fallocate-A2", "A", "a zero length is not EINVAL", ADAPTER_FILES,
+     """        if offset < 0 || len <= 0 {
+            consts::EINVAL""",
+     """        if offset < 0 || len < 0 {
+            consts::EINVAL""",
+     ANDROID),
+    ("fallocate-B1", "B", "a read-only descriptor is allocated through", PLAT_FS,
+     """            Some(Entry::File { writable: false, .. }) => {
+                refuse(FsErrorKind::BadDescriptor, "not open for writing (EBADF)")""",
+     """            Some(Entry::File { writable: false, readable: false, .. }) => {
+                refuse(FsErrorKind::BadDescriptor, "not open for writing (EBADF)")""",
+     ANDROID),
+    # `recvmmsg`: a batch that reads as received -- no length, no sender -- or a batch that fails
+    # whole because its second datagram had not arrived.
+    ("recvmmsg-A1", "A", "msg_len is not written", ADAPTER_NET,
+     """                    view.mem().write_u32(guest_address(view, entry + 56)?, length as u32, blame)?;""",
+     """                    let _ = (entry, length, blame);""",
+     ANDROID),
+    ("recvmmsg-A2", "A", "msg_namelen is left as the caller's room", ADAPTER_NET,
+     """        view.mem().write_u32(at + 8, len as u32, blame)?;""",
+     """        let _ = len;""",
+     ANDROID),
+    ("recvmmsg-B1", "B", "a failure after the first message fails the whole batch", ADAPTER_NET,
+     """                Netted::Failed(_) => break,""",
+     """                Netted::Failed(errno) => return Ok(Netted::Failed(errno)),""",
+     ANDROID),
+    # An oversized datagram's WSAEMSGSIZE: without the raw-code fallback it reaches the guest as an
+    # unclassified refusal, and ngtcp2's path-MTU discovery dies on what it would have handled.
+    ("msgsize-A1", "A", "a raw code std cannot classify is left Other", "crates/omni-platform/src/net/error.rs",
+     """                error.raw_os_error().map_or(NetErrorKind::Other, super::backend::kind_from_raw)""",
+     """                error.raw_os_error().map_or(NetErrorKind::Other, |_| NetErrorKind::Other)""",
+     PLATFORM),
+    # Image format properties: a transposed pair of the five scalars answers a different question
+    # with the right shape; a driver failure written over the guest's buffer is a plausible answer.
+    ("imgfmt-A1", "A", "tiling and image type are transposed on the way to the host", "crates/omni-android/src/vulkan/physical.rs",
+     """        image_type: args[2] as u32 as i32,
+        tiling: args[3] as u32 as i32,""",
+     """        image_type: args[3] as u32 as i32,
+        tiling: args[2] as u32 as i32,""",
+     VULKAN),
+    ("imgfmt-B1", "B", "a driver failure is written over the guest's buffer", "crates/omni-android/src/vulkan/physical.rs",
+     """    match host.physical_device_image_format_properties(device, query)? {
+        DriverAnswer::Failed(result) => {
+            vulkan.note_driver_result(CALL, result);
+            c.ret().i32(result);
+        }
+        DriverAnswer::Ok(bytes) => {""",
+     """    match host.physical_device_image_format_properties(device, query)? {
+        DriverAnswer::Failed(result) => {
+            vulkan.note_driver_result(CALL, result);
+            c.mem().write_bytes(guest_pointer(at, "p", args[6])?, &[0u8; IMAGE_FORMAT_PROPERTIES_BYTES], c.blame(6))?;
+            c.ret().i32(result);
+        }
+        DriverAnswer::Ok(bytes) => {""",
+     VULKAN),
+    # The format a query names is `w1`; read from `x2` it asks about the image type's number.
+    ("vkformat-A1", "A", "the format is read from the wrong register", "crates/omni-android/src/vulkan/physical.rs",
+     """    let format = args[1] as u32 as i32;
+    let bytes = host.physical_device_format_properties(device, format)?;""",
+     """    let format = args[2] as u32 as i32;
+    let bytes = host.physical_device_format_properties(device, format)?;""",
+     VULKAN),
+    # pNext chains: members written over the guest's own header, or a device created without the
+    # features its chain enabled -- both look like success to the call that did it.
+    ("vkchain-A1", "A", "a chained structure's answer is written over its sType and pNext", "crates/omni-android/src/vulkan/chain.rs",
+     """        c.mem().write_bytes(*link_at + CHAIN_HEADER_BYTES as GuestAddr, &link.body, c.blame(argument))?;""",
+     """        c.mem().write_bytes(*link_at, &link.body, c.blame(argument))?;""",
+     VULKAN),
+    ("vkchain-A2", "A", "vkCreateDevice drops the guest's chain", "crates/omni-android/src/vulkan/device.rs",
+     """    Ok(DeviceRequest { flags: u32_at(16), queues, layers, extensions, features, chain })""",
+     """    let _ = chain;
+    Ok(DeviceRequest { flags: u32_at(16), queues, layers, extensions, features, chain: Vec::new() })""",
+     VULKAN),
+    # A read-only file mapping: the file's bytes are the whole point, and a mapping left writable
+    # is one the guest can corrupt believing it cannot.
+    ("mmapfile-A1", "A", "a file mapping is not filled from the file", "crates/omni-android/src/bionic/guestmem.rs",
+     """        call.mem.write_bytes(at, &host[..read], blame)?;""",
+     """        let _ = (&host, read, blame);""",
+     ANDROID),
+    ("mmapfile-B1", "B", "a PROT_READ file mapping is left writable", "crates/omni-android/src/bionic/guestmem.rs",
+     """        if let Err(error) = space.protect(at, len, Protection::Read) {""",
+     """        if let Err(error) = space.protect(at, len, Protection::ReadWrite) {""",
+     ANDROID),
+    # **A kept, measured MISS**, for sockcfg-A3's reason: with the arm gone, the read goes to the
+    # host, and Windows refuses reading a handle opened write-only with ERROR_ACCESS_DENIED -- which
+    # this seam maps to the same EACCES. No test on this host can separate the check from the host's
+    # own refusal; the arm is what keeps Linux's order (EACCES before any read) on a host that would
+    # not refuse.
+    ("mmapfile-B2", "B", "a descriptor not open for reading is mapped", PLAT_FS,
+     """            Some(Entry::File { readable: false, guest, .. }) => Err(FsError::kinded(
+                OP,
+                guest.clone(),
+                FsErrorKind::PermissionDenied,
+                "a file mapping of a descriptor not open for reading (EACCES)",""",
+     """            Some(Entry::File { readable: false, writable: false, guest, .. }) => Err(FsError::kinded(
+                OP,
+                guest.clone(),
+                FsErrorKind::PermissionDenied,
+                "a file mapping of a descriptor not open for reading (EACCES)",""",
+     ANDROID),
+    # Query pools: a request with two members transposed creates a pool of the wrong size or
+    # type; a destroy that does not forget leaves a handle that still names a destroyed pool.
+    ("vkquery-A1", "A", "queryType and queryCount are transposed", "crates/omni-android/src/vulkan/query.rs",
+     """        query_type: word(20),
+        query_count: word(24),""",
+     """        query_type: word(24),
+        query_count: word(20),""",
+     VULKAN),
+    ("vkquery-B1", "B", "a destroyed query pool stays registered", "crates/omni-android/src/vulkan/query.rs",
+     """    vulkan.forget_query_pool(handle);""",
+     """    let _ = handle;""",
+     VULKAN),
+    # AAsset_openFileDescriptor: -1 is the device's answer for a compressed asset; a stored one
+    # answered -1 too would hide a descriptor the engine was owed.
+    ("assetfd-B1", "B", "a stored asset is answered -1 as if compressed", "crates/omni-android/src/ndk/assets.rs",
+     """        Some(AssetPlacement::NotInAnyFile) => {
+            let mut state = ndk.state.lock();""",
+     """        Some(AssetPlacement::NotInAnyFile | AssetPlacement::StoredInPackage { .. }) => {
+            let mut state = ndk.state.lock();""",
+     ANDROID),
+    # Descriptor update templates: a stride ignored reads every descriptor from the first one's
+    # place; a destroyed template left registered updates through entries that are gone.
+    ("vktemplate-A1", "A", "a template's stride is ignored", "crates/omni-android/src/vulkan/descriptor.rs",
+     """            let offset = entry.stride.checked_mul(element).and_then(|step| step.checked_add(entry.offset));""",
+     """            let offset = entry.stride.checked_mul(0).and_then(|step| step.checked_add(entry.offset + 0 * element));""",
+     VULKAN),
+    ("vktemplate-B1", "B", "a destroyed template stays registered", "crates/omni-android/src/vulkan/descriptor.rs",
+     """    vulkan.forget_update_template(handle);""",
+     """    let _ = handle;""",
+     VULKAN),
+    # erfcf: one coefficient transposed is a function that is right at every exact special value
+    # and wrong everywhere in between.
+    ("erfcf-A1", "A", "erfcf's first interval loses a coefficient", LIBM,
+     """        let r = pp0 + z * (pp1 + z * pp2);
+        let s = one + z * (qq1 + z * (qq2 + z * qq3));
+        let y = r / s;
+        if hx < 0x3e80_0000 {""",
+     """        let r = pp0 + z * (pp1 + z * pp1);
+        let s = one + z * (qq1 + z * (qq2 + z * qq3));
+        let y = r / s;
+        if hx < 0x3e80_0000 {""",
+     BIONIC_LIBM),
+    # The timer's commands: the stage and the pool swapped put a handle where a bit mask goes.
+    ("vkquery-A2", "A", "vkCmdWriteTimestamp's stage and query are swapped", "crates/omni-android/src/vulkan/query.rs",
+     """    host.cmd_write_timestamp(buffer, args[1] as u32, pool, args[3] as u32)?;""",
+     """    host.cmd_write_timestamp(buffer, args[3] as u32, pool, args[1] as u32)?;""",
+     VULKAN),
+    # Integer widths in printf: an unmodified %u read whole prints the caller's garbage; a %ld
+    # narrowed to 32 bits prints a different number. Both look like numbers.
+    ("printfw-A1", "A", "an unmodified %u takes the whole slot", BIONIC_PRINTF,
+     """        "hh" => raw as u8 as u64,
+        "h" => raw as u16 as u64,
+        "" => raw as u32 as u64,""",
+     """        "hh" => raw as u8 as u64,
+        "h" => raw as u16 as u64,""",
+     BIONIC),
+    ("printfw-A2", "A", "%ld is narrowed to 32 bits", "crates/omni-android/src/bionic/format.rs",
+     """            ArgKind::Int => Owned::Int(source.next_u64()? as i64),""",
+     """            ArgKind::Int => Owned::Int(source.next_u64()? as u32 as i32 as i64),""",
+     ANDROID),
+    # The display: a density of zero is a number the engine divides by, not a refusal.
+    ("dispmetrics-A1", "A", "DisplayMetrics.density answers 0 again", JNI_CLASSES,
+     """            f("density", "F", Answer::Unanswered),""",
+     """            f("density", "F", Answer::Float(0.0)),""",
+     ANDROID_LIB),
     ("deathctx-A3", "A", "the stack snapshot starts one word above SP", ADAPTER_THREADS,
      """    for at in (sp..sp.saturating_add(DEATH_STACK_BYTES)).step_by(8) {""",
      """    for at in (sp + 8..sp.saturating_add(DEATH_STACK_BYTES)).step_by(8) {""",
