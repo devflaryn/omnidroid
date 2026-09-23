@@ -54,6 +54,23 @@ pub enum WindowError {
         code: u32,
     },
 
+    /// An X11 call failed: the X server could not be reached, refused a request (a protocol error,
+    /// quoted with its code, request and resource), or cannot do what was asked.
+    ///
+    /// Its own variant rather than [`WindowError::LastError`], whose number is a `GetLastError`
+    /// code: an X error is a protocol error code *and* the request it answered, and the refusals
+    /// that are not protocol errors at all (no `$DISPLAY`, no window manager to iconify through)
+    /// have no number, only a reason.
+    #[error("`{operation}`: {api} failed: {detail}")]
+    X11 {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The Xlib entry point that failed.
+        api: &'static str,
+        /// What the server said, or why the call could not be made.
+        detail: String,
+    },
+
     /// The requested client size is not one a window can have.
     ///
     /// Zero is rejected because a zero-extent swapchain is invalid in Vulkan and a zero-extent
