@@ -888,6 +888,98 @@ impl Jni {
         Ok(())
     }
 
+    /// Execute `sput-object value, class->field:descriptor` for a static field the app's own Java
+    /// code assigns -- one declared [`classes::Answer::Assigned`] -- as the scripted startup does
+    /// where the app's bytecode does ([`script::JavaStatement`]).
+    ///
+    /// `value` is a handle this instance issued, or `0` for Java `null`, which clears the field.
+    /// **The stored object is anchored by a global reference this instance keeps**, as a class's
+    /// static keeps its referent alive, and a later store releases the anchor it replaces -- so
+    /// the host's own local may be deleted afterwards and the field still names the object.
+    ///
+    /// **Assignability is checked**, against the declared superclass chain: a field typed
+    /// `Landroid/content/Context;` takes a `MainGameActivity` and refuses a `java/util/List`. The
+    /// Java verifier would never have let the second through, so storing it would be this layer
+    /// inventing a state the app cannot reach.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] when the class or the static field is not declared, when the field
+    /// is not declared `Assigned` (a field the host does not model as Java-written must not be
+    /// written by it), or when the value is not an instance of a class the field's type admits;
+    /// [`AbiError::JniBadHandle`] for a handle this instance did not issue.
+    pub fn put_static_object(
+        &self,
+        class: &str,
+        field: &str,
+        descriptor: &str,
+        value: u64,
+    ) -> AbiResult<()> {
+        const NAME: &str = "Jni::put_static_object";
+        let mut state = self.state.lock();
+        let refuse = |detail: String| AbiError::JniRefused {
+            function: NAME.to_string(),
+            address: self.arena,
+            detail,
+        };
+        let Some(id) = state.registry.find(class) else {
+            return Err(refuse(format!("`{class}` is not declared")));
+        };
+        let Some(found) = state.registry.field(id, field, descriptor, true) else {
+            return Err(refuse(format!("`{class}` declares no static field `{field}` of type `{descriptor}`")));
+        };
+        let answer = state.registry.field_member(found).map(|member| member.answer);
+        if answer != Some(classes::Answer::Assigned) {
+            return Err(refuse(format!(
+                "`{class}.{field}` is declared {answer:?}, not as a static the Java side assigns, \
+                 so a Java statement storing into it would be writing state this layer answers \
+                 some other way"
+            )));
+        }
+        let held = if value == 0 {
+            None
+        } else {
+            let object = state.handles.resolve_id(NAME, self.arena, value)?;
+            let wanted = descriptor
+                .strip_prefix('L')
+                .and_then(|rest| rest.strip_suffix(';'))
+                .and_then(|name| state.registry.find(name));
+            let admits = match (state.handles.object_of(object), wanted) {
+                (Some(refs::Object::Instance { class: of, .. }), Some(wanted)) => {
+                    state.registry.extends(*of, wanted)
+                }
+                _ => false,
+            };
+            if !admits {
+                let got = state
+                    .handles
+                    .object_of(object)
+                    .map_or_else(|| "a freed object".to_string(), |held| render(&state, held));
+                return Err(refuse(format!(
+                    "`{class}.{field}` is typed `{descriptor}` and the value is {got}, which that \
+                     type does not admit on the declared superclass chain"
+                )));
+            }
+            Some(object)
+        };
+        // The new anchor first, then the old one released: a store of the object the field
+        // already holds must not free it in between.
+        let anchor = match held {
+            Some(object) => {
+                Some(state.handles.reference_to(NAME, self.arena, refs::RefKind::Global, object)?)
+            }
+            None => None,
+        };
+        let replaced = match anchor {
+            Some(anchor) => state.statics.insert(found, anchor),
+            None => state.statics.remove(&found),
+        };
+        if let Some(old) = replaced {
+            state.handles.delete(NAME, self.arena, refs::RefKind::Global, old)?;
+        }
+        Ok(())
+    }
+
     /// A **local reference to the `jclass`** of a declared class.
     ///
     /// What a `static` native method's second argument is: JNI hands a static native
