@@ -2943,6 +2943,9 @@ mod tests {
         let unknown = crate::jni::ExitRecord { reason: 3, ..crate::jni::ExitRecord {
             pid: 1, reason: 0, status: 0, timestamp_ms: 0, importance: 0 } };
         assert!(unknown.reason_name().is_err(), "a reason this layer does not name is refused");
+        // `reasonCodeToString(REASON_CRASH_NATIVE)`, which the engine matches whole.
+        let native = crate::jni::ExitRecord { reason: crate::jni::ExitRecord::REASON_CRASH_NATIVE, ..unknown };
+        assert_eq!(native.reason_name().expect("named"), "APP CRASH(NATIVE)");
     }
 
     /// A JNI instance and the guest memory its slots read, for calling a slot directly.

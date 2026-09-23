@@ -7944,6 +7944,28 @@ directory", ADAPTER_FILES,
      "let result = write_truncated(&view, destination, dest_len, &text, 0)?;",
      "let result = write_truncated(&view, destination, u64::MAX, &text, 0)?;",
      VSPRINTF),
+    # A death recorded as the native crash it is (2026-09-24). What only a live run can see -- the
+    # watchdog's halt of the UI thread's call, and the record site -- was verified by the injected
+    # runs I1/I2 (docs/ports/windows.md), not by a row.
+    ("crashclose-A1", "A", "a native crash is handed to the engine under another reason's name",
+     "crates/omni-android/src/jni/mod.rs",
+     'Self::REASON_CRASH_NATIVE => Ok("APP CRASH(NATIVE)"),',
+     'Self::REASON_CRASH_NATIVE => Ok("CRASH_NATIVE"),',
+     ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "previous_exits"]),
+    ("crashclose-A2", "A", "a fault this layer caught is recorded as an abort",
+     "crates/omni-android/tests/gameactivity.rs",
+     """    if why.starts_with("MemoryFault") {
+        omni_android::jni::ExitRecord::SIGSEGV""",
+     """    if why.starts_with("MemoryFault") {
+        omni_android::jni::ExitRecord::SIGABRT""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity", "--no-fail-fast",
+      "a_death_is_recorded"]),
+    ("crashclose-A3", "A", "an unexecutable instruction is recorded as an abort",
+     "crates/omni-android/tests/gameactivity.rs",
+     """    } else if why.starts_with("UnsupportedInstruction") {""",
+     """    } else if why.starts_with("UnsupportedInstructionX") {""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity", "--no-fail-fast",
+      "a_death_is_recorded"]),
 ]
 
 

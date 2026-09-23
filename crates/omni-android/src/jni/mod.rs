@@ -211,6 +211,17 @@ impl ExitRecord {
     pub const SIGKILL: i32 = 9;
     /// `RunningAppProcessInfo.IMPORTANCE_CACHED`: an app whose activity has stopped.
     pub const IMPORTANCE_CACHED: i32 = 400;
+    /// `ApplicationExitInfo.REASON_CRASH_NATIVE`: "the application process died due to a native
+    /// crash" -- a fatal signal in any of its threads. `status` is then the signal.
+    pub const REASON_CRASH_NATIVE: i32 = 5;
+    /// `SIGABRT`: what `abort()` raises -- bionic's `__fortify_fatal`, and `async_safe_fatal`.
+    pub const SIGABRT: i32 = 6;
+    /// `SIGSEGV`: a load or store the kernel could not satisfy.
+    pub const SIGSEGV: i32 = 11;
+    /// `SIGILL`: an instruction the processor would not execute.
+    pub const SIGILL: i32 = 4;
+    /// `RunningAppProcessInfo.IMPORTANCE_FOREGROUND`: an app whose activity is on screen.
+    pub const IMPORTANCE_FOREGROUND: i32 = 100;
 
     /// `ApplicationExitInfo.reasonCodeToString(reason)` for the reasons this layer records --
     /// the text `toString()` carries in parentheses, which is what `jk.l2.b` cuts out and the
@@ -223,6 +234,10 @@ impl ExitRecord {
     pub fn reason_name(&self) -> AbiResult<&'static str> {
         match self.reason {
             Self::REASON_USER_REQUESTED => Ok("USER REQUESTED"),
+            // `reasonCodeToString(REASON_CRASH_NATIVE)`. `jk.l2.b` cuts from `reason=` to the
+            // first `") "`, so the inner parenthesis survives, and the engine matches the whole
+            // string (`"APP CRASH(NATIVE)"` is in `libroblox.so`'s own strings).
+            Self::REASON_CRASH_NATIVE => Ok("APP CRASH(NATIVE)"),
             other => Err(AbiError::JniRefused {
                 function: "ExitRecord::reason_name".to_string(),
                 address: 0,

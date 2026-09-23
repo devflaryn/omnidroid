@@ -426,6 +426,7 @@ impl BoundaryBuilder {
             thread_records: parking_lot::Mutex::new(Vec::new()),
         });
         crate::perf::register_boundary(&boundary);
+        arm_injected_death();
         boundary
     }
 }
@@ -1359,6 +1360,13 @@ impl Boundary {
             None
         };
         let _timed = TimedGuard(timed);
+        if let Some(refusal) = injected_death(&slot.symbol, slot.address) {
+            if matches!(slot.binding, Binding::Reentrant(_)) {
+                // The pair `count` opened, closed as the re-entrant arm below closes it.
+                self.mark_exit();
+            }
+            return Err(refusal);
+        }
         match slot.binding {
             Binding::Unbound => Err(AbiError::Unbound {
                 symbol: slot.symbol.clone(),
@@ -1483,7 +1491,10 @@ impl Boundary {
             None
         };
         let mut import = ImportCall { symbol: &slot.symbol, call, mem: &self.mem };
-        let outcome = handler(&mut import);
+        let outcome = match injected_death(&slot.symbol, slot.address) {
+            Some(refusal) => Err(refusal),
+            None => handler(&mut import),
+        };
         if let Some(timed) = timed {
             timed.end();
         }
@@ -1502,6 +1513,80 @@ impl Boundary {
             import.call.defer_to_caller();
         }
     }
+}
+
+/// `OMNI_INJECT_DEATH=<symbol>@<seconds>`: **SYNTHETIC** -- the first inline call to `<symbol>`
+/// made `<seconds>` or more after the first boundary of the process was built is refused, once,
+/// so the thread that made it dies the way a guest thread this layer cannot serve dies.
+///
+/// A test instrument for what a death does to the rest of the app -- the frozen frame, the close
+/// that cannot finish, the exit record the next launch is handed -- because the deaths that showed
+/// it in a person's session are either fixed (`__vsprintf_chk`) or intermittent (the inferred-crash
+/// report, 2 of 5 relaunches). Announced on stderr when it is read and when it fires, and its
+/// refusal says SYNTHETIC in its own text (`docs/VERIFICATION.md` entry 15). Checked on both
+/// dispatch paths -- inline, and the exit path re-entrant symbols such as `ALooper_pollOnce` take.
+/// One relaxed load per crossing when unset.
+struct InjectedDeath {
+    symbol: String,
+    after: std::time::Duration,
+    since: std::time::Instant,
+}
+
+static INJECT_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static INJECT: std::sync::OnceLock<Option<InjectedDeath>> = std::sync::OnceLock::new();
+
+/// Read `OMNI_INJECT_DEATH` once per process; called when a boundary is built.
+fn arm_injected_death() {
+    INJECT.get_or_init(|| {
+        let text = std::env::var("OMNI_INJECT_DEATH").ok()?;
+        let (symbol, seconds) = text.rsplit_once('@').unwrap_or_else(|| {
+            panic!("OMNI_INJECT_DEATH={text:?} is not <symbol>@<seconds>")
+        });
+        let seconds: f64 = seconds
+            .trim()
+            .parse()
+            .ok()
+            .filter(|s: &f64| s.is_finite() && *s >= 0.0)
+            .unwrap_or_else(|| panic!("OMNI_INJECT_DEATH={text:?}: {seconds:?} is not a number of seconds"));
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "INJECT: SYNTHETIC (OMNI_INJECT_DEATH) -- the first call to `{symbol}` after +{seconds}s \
+             will be refused, once, to stand in for a guest thread's death"
+        );
+        INJECT_ARMED.store(true, Ordering::Relaxed);
+        Some(InjectedDeath {
+            symbol: symbol.trim().to_string(),
+            after: std::time::Duration::from_secs_f64(seconds),
+            since: std::time::Instant::now(),
+        })
+    });
+}
+
+/// The refusal `OMNI_INJECT_DEATH` asked for, if this call is the one; disarms itself.
+#[inline]
+fn injected_death(symbol: &str, address: GuestAddr) -> Option<AbiError> {
+    if !INJECT_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let inject = INJECT.get()?.as_ref()?;
+    if inject.symbol != symbol || inject.since.elapsed() < inject.after {
+        return None;
+    }
+    if !INJECT_ARMED.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    let at = inject.since.elapsed().as_secs_f32();
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "INJECT: refusing `{symbol}` at +{at:.1}s (SYNTHETIC)");
+    Some(AbiError::Refused {
+        symbol: symbol.to_string(),
+        address,
+        why: format!(
+            "SYNTHETIC (OMNI_INJECT_DEATH): refused on purpose at +{at:.1}s to stand in for a guest \
+             thread's death -- not a defect of this call"
+        ),
+    })
 }
 
 /// Ends a [`crate::waits`] timing on every exit path of [`Boundary::service_exit`].

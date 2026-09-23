@@ -1156,6 +1156,37 @@ fn exit_records_round_trip_newest_first_and_stay_bounded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **The signal a device's kernel would have ended the process with**, for a guest thread this
+/// layer stopped -- what `ApplicationExitInfo.getStatus()` carries for `REASON_CRASH_NATIVE`.
+///
+/// A fault this layer caught is the `SIGSEGV` the load or store would have raised; an
+/// instruction it would not execute is `SIGILL`; everything else is a refusal by this layer, whose
+/// nearest device equivalent is bionic's own `abort()` (`__fortify_fatal`, `async_safe_fatal`):
+/// `SIGABRT`. Read from the failure's own text, whose first word is the `ExitReason` variant
+/// when the thread stopped on one (`GuestThreadState::Failed` carries only that text).
+fn death_signal(why: &str) -> i32 {
+    if why.starts_with("MemoryFault") {
+        omni_android::jni::ExitRecord::SIGSEGV
+    } else if why.starts_with("UnsupportedInstruction") {
+        omni_android::jni::ExitRecord::SIGILL
+    } else {
+        omni_android::jni::ExitRecord::SIGABRT
+    }
+}
+
+/// The three shapes a death's text takes, each from a real run (2026-09-23 p1/p2, 2026-09-24).
+#[test]
+fn a_death_is_recorded_with_the_signal_a_device_would_have_raised() {
+    use omni_android::jni::ExitRecord;
+    assert_eq!(death_signal("MemoryFault { pc: 2169978762496, address: 0, access: Read }"), ExitRecord::SIGSEGV);
+    assert_eq!(death_signal("UnsupportedInstruction { pc: 2371533628128, encoding: 3556769793 }"), ExitRecord::SIGILL);
+    assert_eq!(
+        death_signal("the guest called the imported symbol `__vsprintf_chk` through its thunk at 0x20c9aa39eb0, and nothing in the compatibility layer implements it"),
+        ExitRecord::SIGABRT
+    );
+    assert_eq!((ExitRecord::SIGSEGV, ExitRecord::SIGILL, ExitRecord::SIGABRT), (11, 4, 6), "Linux arm64 numbers");
+}
+
 /// The guest's root: a scratch directory removed with the run, or -- with `OMNI_DATA_DIR` --
 /// a directory that outlives it (the `bool`, which says not to remove it).
 struct Scratch(PathBuf, bool);
@@ -3742,12 +3773,20 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         // is and stops them, which ends the glue's wait (its predicate loop exhausts the call's
         // budget) so the run ends with a report rather than a hang. MEASURED first: gate95 sat
         // nine minutes in `onSurfaceDestroyedNative` after the engine logged `APP_CMD_TERM_WINDOW`.
+        //
+        // **And the UI thread's own call is halted with them.** Stopping the guest threads makes
+        // every `pthread_cond_wait` return at once, so the glue's predicate loop then *spins* --
+        // MEASURED 2026-09-23 p1, p2 and 2026-09-24 relaunch-a: `onSurfaceDestroyedNative` ran its
+        // whole 2e9-instruction budget after every close that hung behind a dead worker. Halting
+        // the context ends the call where it is, which is all the spin was waiting for.
         let close_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ui_halt = cpu.halt_handle();
         {
             let close_done = Arc::clone(&close_done);
             let boundary = Arc::clone(&guest.boundary);
             let bionic = Arc::clone(&guest.bionic);
             let image_base = guest.object.base;
+            let ui_halt = ui_halt.clone();
             std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
                 while std::time::Instant::now() < deadline {
@@ -3772,6 +3811,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 }
                 let _ = writeln!(out, "  parked: {:?}", bionic.parked());
                 bionic.stop_guest_threads();
+                ui_halt.request();
             });
         }
         let mut closed = true;
@@ -3854,6 +3894,45 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             }
         }
         close_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The halt was for the close's call, and nothing after it must inherit it.
+        ui_halt.clear();
+        // **A close that could not finish behind a dead guest thread is a crashed process**, and
+        // is recorded as the one a device's system server would have recorded: on a device the
+        // thread's fatal signal ended the whole process when it happened, and the next launch is
+        // told `REASON_CRASH_NATIVE`. Told nothing, the engine infers a crash and dies in its own
+        // report -- MEASURED 2026-09-24: the same frozen data directory relaunched with no record
+        // (relaunch-a) presented **0** frames and hung its close; with this record (relaunch-b)
+        // it reached Landing at 300 presents per 5 s and closed cleanly.
+        //
+        // **Only when the close could not finish**: a death the app ran on past (relaunch-b's
+        // own, a worker at +5 s) still gets the device's close, `onStop` included -- recording
+        // those as crashes would make every later launch another inferred crash, and the engine
+        // persists the sign-in on the way to the background.
+        if !closed {
+            let deaths = guest.bionic.guest_thread_failures();
+            if let Some(first) = deaths.first() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX));
+                let signal = death_signal(&first.why);
+                record_exit(&guest._root.0, omni_android::jni::ExitRecord {
+                    pid: i32::try_from(omni_platform::process::pid()).unwrap_or(0),
+                    reason: omni_android::jni::ExitRecord::REASON_CRASH_NATIVE,
+                    status: signal,
+                    timestamp_ms: now,
+                    importance: omni_android::jni::ExitRecord::IMPORTANCE_FOREGROUND,
+                });
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "CLOSE: could not finish behind {} dead guest thread(s); recorded as REASON_CRASH_NATIVE \
+                     (signal {signal}) for the next launch -- the first: thread {} (started at link {:#x}): {}",
+                    deaths.len(),
+                    first.thread,
+                    first.start_routine.wrapping_sub(guest.object.base),
+                    first.why
+                );
+            }
+        }
         // **In the background until the engine has recorded it.** A device's backgrounded app
         // keeps running until it is removed, and the engine writes its session record
         // (`memProfStorage<pid>.json`) periodically, not on `onStop`. MEASURED why this waits:
