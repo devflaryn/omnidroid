@@ -1276,7 +1276,8 @@ struct FutexArgs {
 /// that had already happened, which is the lost-wake class this project has already measured once
 /// at 1.0104 s (`VERIFICATION.md` entry 11). [`AddressFutex::wait_compared`] performs it inside
 /// `parking_lot_core`'s `validate` callback, under the queue's bucket lock, which is the same
-/// place the kernel performs it.
+/// place the kernel performs it. There it is one atomic load of a word admitted **before** the
+/// park, because `validate` may not take the address space's lock.
 ///
 /// This is **not** the `expected` that `Futex::wait` ignores — see `runtime`'s module docs for why
 /// that one is ignored and why this one is not the same question.
@@ -1358,19 +1359,29 @@ fn futex(c: &mut ImportCall<'_, '_>, args: FutexArgs) -> AbiResult<()> {
                 let expected = val as u32;
                 let mem = view.mem();
                 let blame = Blame::new(view.symbol(), view.address(), 0);
-                // The word must be readable **before** anything parks on it, so that an
-                // unreadable one is `EFAULT` rather than a thread asleep on an address nothing
-                // will ever wake.
-                if mem.read_u32(word, blame).is_err() {
+                // The word is admitted, meaning checked and committed through the address space,
+                // **before** anything parks on it and **outside** the futex's bucket lock. That
+                // makes an unreadable word `EFAULT` rather than a thread asleep on an address
+                // nothing will ever wake. It is also the only place the space lock may be
+                // taken: see `AddressFutex::wait_compared` for the deadlock that reading it
+                // inside the comparison caused.
+                //
+                // SAFETY: `admit` is `checked_ptr` over exactly the four bytes compared, for
+                // reading, and `uaddr % 4 == 0` was established above. That is
+                // `wait_compared`'s precondition.
+                let outcome = unsafe {
+                    state.bionic.futex().wait_compared(
+                        uaddr,
+                        expected,
+                        || mem.checked_ptr(word, 4, false, blame).map(|_| ()),
+                        wait,
+                    )
+                };
+                let Ok(outcome) = outcome else {
                     view.set_errno(EFAULT);
                     c.ret().i32(-1);
                     return Ok(());
-                }
-                let outcome = state.bionic.futex().wait_compared(
-                    uaddr,
-                    || mem.read_u32(word, blame).is_ok_and(|current| current == expected),
-                    wait,
-                );
+                };
                 match outcome {
                     omni_bionic::threads::WaitResult::Woken => 0,
                     omni_bionic::threads::WaitResult::TimedOut => {

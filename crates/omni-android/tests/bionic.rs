@@ -6537,6 +6537,239 @@ fn a_dead_threads_record_keeps_its_registers_and_the_top_of_its_stack() {
     );
 }
 
+/// Assemble a start routine's prologue that **puts a per-thread record on the thread's own stack
+/// and publishes its address at `published`**, the way the engine registers a profiler log carved
+/// out of a worker's stack in a global table.
+///
+/// `SP` is moved down first. At entry it is the top of the mapping, which is one past its end, so
+/// publishing it unmoved would name the next region rather than this stack.
+fn publish_a_record_on_the_stack(asm: &mut Asm, published: omni_cpu::GuestAddr, record: u64) {
+    asm.push(sub_imm(31, 31, 32));
+    asm.mov(9, record);
+    asm.push(str_imm(9, 31, 0));
+    asm.push(add_imm(9, 31, 0));
+    asm.mov(10, published as u64);
+    asm.push(str_imm(9, 10, 0));
+}
+
+/// The guest address a thread published with [`publish_a_record_on_the_stack`], once it has.
+fn published_record(f: &Fixture, published: omni_cpu::GuestAddr) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let at = f.guest.read_u64(published);
+        if at != 0 {
+            return usize::try_from(at).expect("a guest address");
+        }
+        assert!(std::time::Instant::now() < deadline, "the thread never published its record");
+        std::thread::yield_now();
+    }
+}
+
+/// **A thread this layer kills keeps its stack, because other threads still point into it.**
+///
+/// bionic frees a thread's stack only after the thread has *exited*: at exit for a detached
+/// thread, at `pthread_join` for a joinable one. It never frees one while the thread is stopped in
+/// the middle of a function, because Linux has no way to do that to one thread. A fatal fault takes
+/// the whole process, and bionic has no `pthread_cancel`. This runtime can, whenever a handler
+/// refuses or the guest faults, and it used to unmap the stack as it did.
+///
+/// MEASURED in M6 (see `fseeko` above): a second worker, sampling a 128-entry table of per-thread
+/// records, read one just under a page top "whose memory was gone, because this layer had killed
+/// its thread and unmapped that stack", and died of a `MemoryFault` that was filed as a failure
+/// of its own. One refusal became two deaths, and the second one named the wrong cause. Worse,
+/// the range could be mapped again for something else, and then the stale pointer would read and
+/// write someone else's live memory without faulting at all.
+#[test]
+fn a_thread_that_dies_keeps_its_stack_for_the_threads_still_pointing_into_it() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let published = f.guest.data + 0x900;
+    f.guest.write_u64(published, 0);
+    const RECORD: u64 = 0x10c0_0000_0000_5ac4;
+    let start = start_routine(&f, |asm| {
+        publish_a_record_on_the_stack(asm, published, RECORD);
+        asm.mov(10, f.guest.unmapped as u64);
+        asm.push(br(10));
+    });
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+    });
+    // The join returns only after the runner has finished with the thread, so whatever the runner
+    // does with the stack has been done by the time this is checked.
+    assert!(run_program(&f, entry).is_err(), "the join refuses a thread that died");
+    let failures = f.bionic.guest_thread_failures();
+    assert_eq!(failures.len(), 1, "exactly the one thread that jumped to nowhere: {failures:?}");
+
+    let record = published_record(&f, published);
+    assert!(
+        f.guest.space.region_at(record).is_some_and(|r| !r.is_free()),
+        "the dead thread's stack at {record:#x} was unmapped under the threads that still point \
+         into it"
+    );
+    assert_eq!(f.guest.read_u64(record), RECORD, "and it still holds what the thread left there");
+}
+
+/// **A thread stopped at a run-window boundary keeps its stack too.**
+///
+/// Stopping is the other way this layer ends a thread in the middle of a function, and it happens
+/// to every thread at once during teardown. The first thread to reach a window boundary used to
+/// unmap its stack while its siblings were still inside their last windows. A sibling that then
+/// read a record on it died of a `MemoryFault`, and `drive` files an `Ok(MemoryFault)` as a failure
+/// even while stopping. That is right for a real fault, and it was not a real fault.
+#[test]
+fn a_thread_stopped_at_a_window_boundary_keeps_its_stack() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    f.bionic
+        .set_thread_host(ThreadHost::new(backend).with_limit(2).with_step_window(1_000))
+        .expect("a thread host");
+    let out = f.guest.data + 0x800;
+    let published = f.guest.data + 0x900;
+    let gate = f.guest.data + 0x908;
+    f.guest.write_u64(published, 0);
+    f.guest.write_u64(gate, 0);
+    let _gates = OpenOnDrop { space: Arc::clone(&f.guest.space), gates: vec![gate] };
+    const RECORD: u64 = 0x10c0_0000_0000_5709;
+    let start = start_routine(&f, |asm| {
+        publish_a_record_on_the_stack(asm, published, RECORD);
+        asm.mov(9, gate as u64);
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(10, 9, 0));
+        asm.push(subs_imm(10, 10, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.push(add_imm(31, 31, 32));
+    });
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    let record = published_record(&f, published);
+
+    f.bionic.stop_guest_threads();
+    assert!(
+        f.bionic.join_guest_threads(std::time::Duration::from_secs(10)),
+        "the stop switch stops a spinning thread at its next window boundary"
+    );
+    assert_eq!(
+        f.bionic.guest_thread_state(f.guest.read_u64(out)),
+        Some(omni_android::bionic::GuestThreadState::Stopped),
+        "the case under test is a thread that was stopped, not one that returned"
+    );
+    assert!(
+        f.guest.space.region_at(record).is_some_and(|r| !r.is_free()),
+        "the stopped thread's stack at {record:#x} was unmapped while siblings may still be in \
+         their last window"
+    );
+    assert_eq!(f.guest.read_u64(record), RECORD);
+}
+
+/// **A thread that returns while the instance is stopping keeps its stack, because its
+/// destructors did not run.**
+///
+/// The subtler half. A thread that returns during teardown is a normal return, but
+/// `run_exit_destructors` skips every destructor once the instance is stopping. So the
+/// `thread_local` destructor that would have removed its record from a global table never ran,
+/// and the record is exactly as dangling as a killed thread's. Giving a stack back is right only
+/// when the thread exited the way bionic's exit does: it returned *and* its destructors ran.
+///
+/// The step window is set far past anything the test can reach, so the stop switch (read only
+/// between windows) cannot stop the thread first. Opening its gate after the switch is thrown
+/// makes it return inside its window, which is the case under test and not a race.
+#[test]
+fn a_thread_that_returns_while_the_instance_stops_keeps_its_stack() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    f.bionic
+        .set_thread_host(ThreadHost::new(backend).with_limit(2).with_step_window(1 << 40))
+        .expect("a thread host");
+    let out = f.guest.data + 0x800;
+    let published = f.guest.data + 0x900;
+    let gate = f.guest.data + 0x908;
+    f.guest.write_u64(published, 0);
+    f.guest.write_u64(gate, 0);
+    let _gates = OpenOnDrop { space: Arc::clone(&f.guest.space), gates: vec![gate] };
+    const RECORD: u64 = 0x10c0_0000_0000_7e7d;
+    let start = start_routine(&f, |asm| {
+        publish_a_record_on_the_stack(asm, published, RECORD);
+        asm.mov(9, gate as u64);
+        let loop_at = asm.pc();
+        asm.push(ldr_imm(10, 9, 0));
+        asm.push(subs_imm(10, 10, 0));
+        let here = asm.pc();
+        asm.push(b_cond(0, ((loop_at as i64 - here as i64) / 4) as i32));
+        asm.push(add_imm(31, 31, 32));
+        asm.mov(0, 0x7e7d);
+    });
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    let record = published_record(&f, published);
+
+    f.bionic.stop_guest_threads();
+    poke(&f.guest.space, gate, 1);
+    assert!(
+        f.bionic.join_guest_threads(std::time::Duration::from_secs(10)),
+        "the opened gate lets the thread return"
+    );
+    assert_eq!(
+        f.bionic.guest_thread_state(f.guest.read_u64(out)),
+        Some(omni_android::bionic::GuestThreadState::Returned(0x7e7d)),
+        "the case under test is a thread that returned during teardown, not one that was stopped"
+    );
+    assert!(
+        f.guest.space.region_at(record).is_some_and(|r| !r.is_free()),
+        "the stack at {record:#x} of a thread whose destructors were skipped was unmapped"
+    );
+    assert_eq!(f.guest.read_u64(record), RECORD);
+}
+
+/// **A thread that returns, with its destructors run, gives its stack back**, which is the
+/// other side of the three tests above and what bionic's own exit and join do.
+///
+/// Without it, "never unmap a stack" would pass all three and leak about a megabyte of address
+/// space for every thread the engine ever creates and joins.
+#[test]
+fn a_thread_that_returns_gives_its_stack_back() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let published = f.guest.data + 0x900;
+    f.guest.write_u64(published, 0);
+    let start = start_routine(&f, |asm| {
+        publish_a_record_on_the_stack(asm, published, 0x10c0_0000_0000_900d);
+        asm.push(add_imm(31, 31, 32));
+        asm.mov(0, 0);
+    });
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 16));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 16), 0, "pthread_join succeeded");
+    assert!(f.bionic.guest_thread_failures().is_empty(), "{:?}", f.bionic.guest_thread_failures());
+
+    let record = published_record(&f, published);
+    assert!(
+        f.guest.space.region_at(record).is_none_or(|r| r.is_free()),
+        "a joined thread that returned and ran its destructors must give its stack at \
+         {record:#x} back"
+    );
+}
+
 /// **A thread's destructors run when it returns, before its joiner is released, in bionic's
 /// order**: the `__cxa_thread_atexit_impl` handler (a C++ `thread_local`'s destructor) first, then
 /// the `pthread_key` destructor, each handed its own value.

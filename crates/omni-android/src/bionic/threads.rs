@@ -970,11 +970,30 @@ fn run_guest_thread(spawn: Spawn) {
     // that is being kept structural, not a window that is being closed.
     THIS_THREADS_STACK.with(|cell| cell.set(None));
     let (base, len) = stack;
+    // **Given back only by a thread that exited the way bionic's exit does**: it returned, and
+    // its destructors ran. bionic frees a stack at exit (detached) or at join (joinable), never
+    // while its thread is stopped in the middle of a function. Linux cannot do that to one
+    // thread: a fatal fault takes the whole process, and bionic has no `pthread_cancel`. This
+    // layer can, by refusal, fault or stop. Other threads may still hold pointers into such a
+    // stack, for example a per-thread record the engine registers in a global table, which the
+    // skipped `thread_local` destructor would have removed. Unmapping it turned one death into
+    // several. MEASURED in M6: a worker sampling that table died of a `MemoryFault` on a record
+    // "whose memory was gone, because this layer had killed its thread and unmapped that stack",
+    // filed as a failure of its own. Worse, a range mapped again later would be read through the
+    // stale pointer silently.
+    //
+    // So a thread that failed or was stopped keeps its stack, and so does one that returned
+    // while the instance is stopping, because `run_exit_destructors` skips every destructor then.
+    // The mapping goes when the address space does. During teardown, that is the next thing the
+    // embedding releases. In a live instance it costs about one stack per thread this layer
+    // killed, each of which is already a recorded failure.
+    let exited = matches!(state, GuestThreadState::Returned(_)) && !bionic.guest_threads_stopping();
+    let given_back = if exited { bionic.space_ref().unmap(base, len) } else { Ok(()) };
     // **Recorded rather than swallowed.** A stack that cannot be given back leaks its address
     // space and its commit charge for the life of the instance, and the thread that leaked it is
     // the only thing that knows. It does not change how the thread ended -- it returned or it did
     // not -- so it is reported beside the outcome rather than instead of it.
-    if let Err(error) = bionic.space_ref().unmap(base, len) {
+    if let Err(error) = given_back {
         bionic.record_thread_failure(GuestThreadFailure {
             thread: slot.id.0,
             start_routine: entry,
