@@ -765,6 +765,90 @@ pub fn powf(ctx: &mut impl GuestContext, x: f32, y: f32) -> f32 {
     r
 }
 
+/// `float erfcf(float x)` -- the complementary error function, `1 - erf(x)`.
+///
+/// **Bionic's own algorithm, line for line**: FreeBSD msun's `s_erff.c` as bionic carries it at
+/// android-13.0.0_r1 (`libm/upstream-freebsd/lib/msun/src/s_erff.c`) -- the same rational
+/// approximations over the same intervals, the constants taken from the source's own hex
+/// comments (each of which its decimal literal rounds to), and its two `expf` calls through the
+/// host's `exp`, as [`expf`] is. **It sets no `errno`**, because bionic's does not: a result that
+/// underflows (`x >= 11`) is `tiny * tiny`, a zero that raises the underflow flag and nothing else.
+/// MEASURED reader: the renderer, once its descriptor update templates were made.
+pub fn erfcf(x: f32) -> f32 {
+    let tiny: f32 = 1e-30;
+    let (half, one, two) = (0.5f32, 1.0f32, 2.0f32);
+    let c = f32::from_bits;
+    let erx = c(0x3f57_bb00);
+    let (pp0, pp1, pp2) = (c(0x3e03_75d4), c(0xbeac_0c2d), c(0xbaf4_22f4));
+    let (qq1, qq2, qq3) = (c(0x3e9f_e8f9), c(0x3cb1_0140), c(0xbb02_5311));
+    let (pa0, pa1, pa2, pa3) = (c(0x3674_f993), c(0x3ed4_8935), c(0xbe56_6bd5), c(0x3db1_b34b));
+    let (qa1, qa2, qa3) = (c(0x3efd_ba2b), c(0x3ebe_1449), c(0x3d20_c267));
+    let (ra0, ra1, ra2, ra3) = (c(0xbc21_e64c), c(0xbf0b_2d32), c(0xbfd5_8a4d), c(0xbf31_09b2));
+    let (sa1, sa2, sa3) = (c(0x408f_8bcd), c(0x4083_74ab), c(0x3f0d_c974));
+    let (rb0, rb1, rb2) = (c(0xbc21_a0ae), c(0xbf0c_4cfe), c(0xbfeb_ab07));
+    let (sb1, sb2, sb3) = (c(0x409b_e1ea), c(0x4043_305e), c(0xbf43_0bec));
+
+    let hx = x.to_bits() as i32;
+    let ix = hx & 0x7fff_ffff;
+    if ix >= 0x7f80_0000 {
+        // erfcf(nan) = nan; erfcf(+inf) = 0, erfcf(-inf) = 2.
+        return (((hx as u32) >> 31) << 1) as f32 + one / x;
+    }
+    if ix < 0x3f58_0000 {
+        // |x| < 0.84375
+        if ix < 0x3380_0000 {
+            // |x| < 2**-24
+            return one - x;
+        }
+        let z = x * x;
+        let r = pp0 + z * (pp1 + z * pp2);
+        let s = one + z * (qq1 + z * (qq2 + z * qq3));
+        let y = r / s;
+        if hx < 0x3e80_0000 {
+            // x < 1/4
+            return one - (x + x * y);
+        }
+        let mut r = x * y;
+        r += x - half;
+        return half - r;
+    }
+    if ix < 0x3fa0_0000 {
+        // 0.84375 <= |x| < 1.25
+        let s = x.abs() - one;
+        let p = pa0 + s * (pa1 + s * (pa2 + s * pa3));
+        let q = one + s * (qa1 + s * (qa2 + s * qa3));
+        if hx >= 0 {
+            let z = one - erx;
+            return z - p / q;
+        }
+        let z = erx + p / q;
+        return one + z;
+    }
+    if ix < 0x4130_0000 {
+        // |x| < 11
+        let x_abs = x.abs();
+        let s = one / (x_abs * x_abs);
+        let (r, s_) = if ix < 0x4036_db8c {
+            // |x| < 2.85715 ~ 1/.35
+            (ra0 + s * (ra1 + s * (ra2 + s * ra3)), one + s * (sa1 + s * (sa2 + s * sa3)))
+        } else {
+            if hx < 0 && ix >= 0x40a0_0000 {
+                // x < -5
+                return two - tiny;
+            }
+            (rb0 + s * (rb1 + s * rb2), one + s * (sb1 + s * (sb2 + s * sb3)))
+        };
+        let z = f32::from_bits((hx as u32) & 0xffff_e000);
+        let r = (-z * z - 0.5625).exp() * ((z - x_abs) * (z + x_abs) + r / s_).exp();
+        return if hx > 0 { r / x_abs } else { two - r / x_abs };
+    }
+    if hx > 0 {
+        tiny * tiny
+    } else {
+        two - tiny
+    }
+}
+
 /// `void sincosf(float x, float *sin_ptr, float *cos_ptr)` — GNU/bionic extension:
 /// computes both at once. Writes both results through guest memory (4 bytes each,
 /// little-endian) when the respective pointer is non-null. NaN propagation and the

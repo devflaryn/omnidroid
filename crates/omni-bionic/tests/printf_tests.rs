@@ -385,19 +385,20 @@ fn a_hostile_width_is_refused_rather_than_allocated() {
         format(&huge, &[FormatArg::Int(1)], &mut String::new()),
         Err(FormatError::FieldTooWide { conversion: 'd', .. })
     ));
-    // The `*` form: the width is an argument, so the format string looks harmless.
+    // The `*` form: the width is an argument, so the format string looks harmless. It is an
+    // `int`, so the most hostile value it can carry is `INT_MAX` -- still far past the cap.
     assert!(matches!(
-        format("%*d", &[FormatArg::Int(i64::MAX), FormatArg::Int(1)], &mut String::new()),
+        format("%*d", &[FormatArg::Int(i64::from(i32::MAX)), FormatArg::Int(1)], &mut String::new()),
         Err(FormatError::FieldTooWide { conversion: 'd', .. })
     ));
     // A negative `*` width is left-justification with the magnitude, which is the same hazard.
     assert!(matches!(
-        format("%*d", &[FormatArg::Int(i64::MIN + 1), FormatArg::Int(1)], &mut String::new()),
+        format("%*d", &[FormatArg::Int(i64::from(i32::MIN + 1)), FormatArg::Int(1)], &mut String::new()),
         Err(FormatError::FieldTooWide { conversion: 'd', .. })
     ));
     // Precision, too: `%.*f` builds that many digits.
     assert!(matches!(
-        format("%.*f", &[FormatArg::Int(i64::MAX), FormatArg::Double(1.0)], &mut String::new()),
+        format("%.*f", &[FormatArg::Int(i64::from(i32::MAX)), FormatArg::Double(1.0)], &mut String::new()),
         Err(FormatError::FieldTooWide { conversion: 'f', .. })
     ));
     // And nothing was written on the way to the refusal.
@@ -865,7 +866,7 @@ fn a_hostile_width_without_a_budget_is_still_refused() {
     }
     // The `*` form too: the format string alone looks harmless.
     assert!(matches!(
-        format("%*d", &[FormatArg::Int(i64::MAX), FormatArg::Int(1)], &mut String::new()),
+        format("%*d", &[FormatArg::Int(i64::from(i32::MAX)), FormatArg::Int(1)], &mut String::new()),
         Err(FormatError::FieldTooWide { conversion: 'd', .. })
     ));
     // And under a budget the same `*` width is honoured, because the padding is counted.
@@ -884,4 +885,21 @@ fn a_zero_budget_writes_nothing_and_still_counts() {
     assert_eq!(produced.kept, 0);
     assert_eq!(produced.full, 10, "abc and 10");
     assert!(produced.truncated());
+}
+
+/// **An integer's width is its length modifier's, not its slot's.** With no modifier the argument
+/// is an `int`/`unsigned int` and only the slot's low 32 bits are the caller's -- MEASURED, the
+/// engine's own `%u` arguments arrive with garbage upper halves -- while `l`, `ll` and `z` take all
+/// 64. The same for a `*` width, which is an `int`.
+#[test]
+fn an_integers_width_is_its_length_modifiers() {
+    let garbage = 0x1D0_0000_0000_u64;
+    assert_eq!(fmt("%u", &[FormatArg::UInt(garbage | 256)]), "256");
+    assert_eq!(fmt("%x", &[FormatArg::UInt(garbage | 0xab)]), "ab");
+    assert_eq!(fmt("%d", &[FormatArg::Int((garbage | 0xFFFF_FFFB) as i64)]), "-5");
+    assert_eq!(fmt("%lu", &[FormatArg::UInt(garbage | 256)]), (garbage | 256).to_string());
+    assert_eq!(fmt("%ld", &[FormatArg::Int(5_000_000_000)]), "5000000000");
+    assert_eq!(fmt("%lld", &[FormatArg::Int(-5_000_000_000)]), "-5000000000");
+    assert_eq!(fmt("%zu", &[FormatArg::UInt(5_000_000_000)]), "5000000000");
+    assert_eq!(fmt("[%*d]", &[FormatArg::Int((garbage | 4) as i64), FormatArg::Int(7)]), "[   7]");
 }

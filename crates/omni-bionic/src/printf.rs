@@ -282,12 +282,13 @@ pub fn format_bounded(
         let width: Option<usize> = match parsed.width {
             Count::Absent => None,
             Count::Fixed(n) => Some(n),
+            // A `*` is an `int`: only the low 32 bits of its slot are the caller's (see `as_int`).
             Count::Star => match next_arg(args, &mut arg_idx)? {
-                FormatArg::Int(n) if *n >= 0 => Some(*n as usize),
+                FormatArg::Int(n) if *n as i32 >= 0 => Some(*n as i32 as usize),
                 FormatArg::Int(n) => {
                     // Negative width: left-justify with magnitude (C behaviour).
                     flags.left = true;
-                    Some(n.unsigned_abs() as usize)
+                    Some((*n as i32).unsigned_abs() as usize)
                 }
                 _ => return Err(FormatError::MalformedFormat("'*' width needs an int")),
             },
@@ -296,7 +297,7 @@ pub fn format_bounded(
             Count::Absent => None,
             Count::Fixed(n) => Some(n),
             Count::Star => match next_arg(args, &mut arg_idx)? {
-                FormatArg::Int(n) if *n >= 0 => Some(*n as usize),
+                FormatArg::Int(n) if *n as i32 >= 0 => Some(*n as i32 as usize),
                 FormatArg::Int(_) => None, // negative precision = omitted
                 _ => return Err(FormatError::MalformedFormat("'*' precision needs an int")),
             },
@@ -748,10 +749,12 @@ fn next_arg<'a>(args: &'a [FormatArg<'a>], idx: &mut usize) -> Result<&'a Format
 }
 
 /// Coerce an argument to the signed integer the conversion needs, then apply the
-/// length modifier's truncation exactly as C does: the *argument* is `int`-width (the
-/// modifier only tells printf how many bits to print). `hh` prints the value converted
-/// to `signed char`, `h` to `short`; wider modifiers (`l ll z j t`) print the full 64-bit
-/// value on LP64.
+/// length modifier exactly as C does. With no modifier -- and with `hh` and `h`, whose argument
+/// was promoted to one -- the argument **is an `int`**, and only the low 32 bits of its 8-byte
+/// slot are the caller's: AAPCS64 leaves the upper half of a variadic `int`'s slot undefined, and
+/// MEASURED, the engine stores its `%u` arguments with a 32-bit `str w8, [sp]` over whatever the
+/// slot held. `hh` then prints the value converted to `signed char`, `h` to `short`; the wide
+/// modifiers (`l ll z j t`) take the whole 64-bit slot on LP64.
 fn as_int(arg: &FormatArg, spec: char, length: &str) -> Result<i64, FormatError> {
     let raw = match arg {
         FormatArg::Int(n) => *n,
@@ -762,11 +765,13 @@ fn as_int(arg: &FormatArg, spec: char, length: &str) -> Result<i64, FormatError>
     Ok(match length {
         "hh" => raw as i8 as i64,
         "h" => raw as i16 as i64,
+        "" => raw as i32 as i64,
         _ => raw,
     })
 }
 
-/// Unsigned form of [`as_int`]: `hh` prints `raw as u8`, `h` prints `raw as u16`.
+/// Unsigned form of [`as_int`]: `hh` prints `raw as u8`, `h` prints `raw as u16`, no modifier
+/// prints the `unsigned int` in the slot's low 32 bits.
 fn as_uint(arg: &FormatArg, _spec: char, length: &str) -> Result<u64, FormatError> {
     let raw = match arg {
         FormatArg::Int(n) => *n as u64,
@@ -777,6 +782,7 @@ fn as_uint(arg: &FormatArg, _spec: char, length: &str) -> Result<u64, FormatErro
     Ok(match length {
         "hh" => raw as u8 as u64,
         "h" => raw as u16 as u64,
+        "" => raw as u32 as u64,
         _ => raw,
     })
 }

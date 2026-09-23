@@ -603,6 +603,45 @@ fn sincosf_writes_both_results_to_guest_memory() {
     assert!(within_1_ulp_f32(cosv, 0.5f32.cos()));
 }
 
+/// **`erfcf` is bionic's `s_erff.c`**: within 1 ULP of the true value across all four of its
+/// intervals and both signs, its exact special values (`erfcf(0) = 1`, `2` below -5, `+0` from 11
+/// up, `0`/`2` at the infinities, NaN in, NaN out), and no `errno` ever -- including where the
+/// result underflows.
+#[test]
+fn erfcf_is_bionics_s_erff_and_sets_no_errno() {
+    use omni_bionic::libm::erfcf;
+    let ulps = |got: f32, want: f64| {
+        let want = want as f32;
+        (got.to_bits() as i64 - want.to_bits() as i64).abs()
+    };
+    // (x, erfc(x) to double precision **at the f32 input** -- `0.8f32` is not 0.8): one point in
+    // each of the four intervals, both signs.
+    for (x, want) in [
+        (0.25f32, 0.723_673_609_831_763_1f64),
+        (0.5, 0.479_500_122_186_953_4),
+        (0.8, 0.257_899_028_199_556_3),
+        (1.0, 0.157_299_207_050_285_1),
+        (-1.0, 1.842_700_792_949_715),
+        (1.2, 0.089_686_009_022_393_47),
+        (1.5, 0.033_894_853_524_689_274),
+        (2.0, 0.004_677_734_981_047_265),
+        (3.0, 2.209_049_699_858_544e-5),
+        (4.0, 1.541_725_790_028_001_7e-8),
+        (6.0, 2.151_973_671_249_891_3e-17),
+        (9.0, 4.137_031_746_513_81e-37),
+        (-3.0, 1.999_977_909_503_001_2),
+    ] {
+        assert!(ulps(erfcf(x), want) <= 1, "erfcf({x}) = {} vs {want}", erfcf(x));
+    }
+    assert_eq!(erfcf(0.0).to_bits(), 1.0f32.to_bits(), "erfc(0) = 1 exactly");
+    assert_eq!(erfcf(1e-8).to_bits(), 1.0f32.to_bits(), "|x| < 2**-24: one - x");
+    assert_eq!(erfcf(-5.5).to_bits(), 2.0f32.to_bits(), "x < -5: two - tiny");
+    assert_eq!(erfcf(11.0).to_bits(), 0.0f32.to_bits(), "x >= 11: tiny * tiny, a positive zero");
+    assert_eq!(erfcf(f32::INFINITY).to_bits(), 0.0f32.to_bits());
+    assert_eq!(erfcf(f32::NEG_INFINITY).to_bits(), 2.0f32.to_bits());
+    assert!(erfcf(f32::NAN).is_nan());
+}
+
 #[test]
 fn remaining_libm_forms_smoke_and_edges() {
     // The f32/niche forms not covered above: same contract, spot-checked.
