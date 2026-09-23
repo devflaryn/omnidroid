@@ -797,7 +797,8 @@ mod tests {
             assert!(finger.translate(&WindowEvent::PointerDown { button, x: 5, y: 5 }).is_empty());
             assert!(finger.translate(&WindowEvent::PointerUp { button, x: 5, y: 5 }).is_empty());
         }
-        assert!(finger.translate(&WindowEvent::KeyDown { keycode: 0x41, repeat: false }).is_empty());
+        let key = WindowEvent::KeyDown { keycode: 0x41, scancode: 0x1E, repeat: false };
+        assert!(finger.translate(&key).is_empty());
 
         let down = finger.translate(&WindowEvent::PointerDown {
             button: PointerButton::Primary,
