@@ -117,10 +117,25 @@ pub(super) fn copy_host_string(
     if text == 0 {
         return Ok(0);
     }
+    copy_bytes(gles, c, call, host_bytes(text), name)
+}
+
+/// The bytes of a non-NULL host string.
+fn host_bytes(text: u64) -> Vec<u8> {
     // SAFETY: a non-NULL `glGetString`/`glGetStringi`/`eglQueryString` result is a static,
     // NUL-terminated string the host owns (ES 3.2 section 20.2, EGL 1.5 section 3.3), read here at
     // once on the thread that asked.
-    let bytes = unsafe { CStr::from_ptr(text as usize as *const core::ffi::c_char) }.to_bytes().to_vec();
+    unsafe { CStr::from_ptr(text as usize as *const core::ffi::c_char) }.to_bytes().to_vec()
+}
+
+/// Copy `bytes` into the guest string pool (interned) and answer the guest address.
+fn copy_bytes(
+    gles: &Gles,
+    c: &ImportCall<'_, '_>,
+    call: &Call,
+    bytes: Vec<u8>,
+    name: u32,
+) -> AbiResult<u64> {
     let mut state = gles.state();
     let pool = &mut state.strings;
     if let Some(&at) = pool.interned.get(&bytes) {
@@ -175,11 +190,96 @@ fn note_string(gles: &Gles, call: &Call, name: u32, bytes: &[u8]) {
     gles.note(call.name, format!("{name:#x}: the host's {shown}, copied into guest memory"));
 }
 
-/// `const GLubyte *glGetString(GLenum name)`, `glGetStringi(GLenum name, GLuint index)`
+/// `GL_EXTENSIONS`.
+pub const EXTENSIONS: u32 = 0x1F03;
+/// `GL_NUM_EXTENSIONS`.
+pub const NUM_EXTENSIONS: u32 = 0x821D;
+
+fn note_withheld(gles: &Gles, call: &Call, extension: &str) {
+    if let Some((_, _, why)) = super::WITHHELD.iter().find(|(name, _, _)| *name == extension) {
+        gles.note(call.name, format!("{extension} withheld from the guest's extension list: {why}"));
+    }
+}
+
+/// `const GLubyte *glGetString(GLenum name)`: the host's text, in guest memory -- with the
+/// [`WITHHELD`](super::WITHHELD) extensions removed from `GL_EXTENSIONS`.
 pub(super) fn get_string(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    let name = call.lanes[0] as u32;
     let text = gles.forward_value(call)?;
-    let at = copy_host_string(gles, c, call, text, call.lanes[0] as u32)?;
+    let at = if name == EXTENSIONS && text != 0 {
+        let host = String::from_utf8_lossy(&host_bytes(text)).into_owned();
+        let kept: Vec<&str> = host
+            .split_ascii_whitespace()
+            .filter(|extension| {
+                let withheld = super::is_withheld_extension(extension);
+                if withheld {
+                    note_withheld(gles, call, extension);
+                }
+                !withheld
+            })
+            .collect();
+        copy_bytes(gles, c, call, kept.join(" ").into_bytes(), name)?
+    } else {
+        copy_host_string(gles, c, call, text, name)?
+    };
     c.ret().u64(at);
+    Ok(())
+}
+
+/// The host's extension indices the guest sees, in order: every `glGetStringi(GL_EXTENSIONS, i)`
+/// that is not [`WITHHELD`](super::WITHHELD). `None` when the host answers no count (no context).
+fn visible_extensions(gles: &Gles, call: &Call) -> AbiResult<Option<Vec<u64>>> {
+    let mut count: i32 = -1;
+    gles.host_call(call, "glGetIntegerv", &[u64::from(NUM_EXTENSIONS), &mut count as *mut i32 as u64])?;
+    if count < 0 {
+        return Ok(None);
+    }
+    let mut visible = Vec::with_capacity(count as usize);
+    for index in 0..count as u64 {
+        let text = gles.host_call(call, "glGetStringi", &[u64::from(EXTENSIONS), index])?;
+        if text == 0 {
+            return Ok(None);
+        }
+        let extension = String::from_utf8_lossy(&host_bytes(text)).into_owned();
+        if super::is_withheld_extension(&extension) {
+            note_withheld(gles, call, &extension);
+        } else {
+            visible.push(index);
+        }
+    }
+    Ok(Some(visible))
+}
+
+/// `const GLubyte *glGetStringi(GLenum name, GLuint index)`: for `GL_EXTENSIONS`, the guest's
+/// index counts only the extensions it is shown.
+pub(super) fn get_string_i(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    let name = call.lanes[0] as u32;
+    let mut lanes = call.lanes;
+    if name == EXTENSIONS {
+        if let Some(visible) = visible_extensions(gles, call)? {
+            // Past the guest's end: an index past the host's end too, so the host raises
+            // GL_INVALID_VALUE and answers NULL, as it would have.
+            lanes[1] = visible.get(call.lanes[1] as u32 as usize).copied().unwrap_or(u64::from(u32::MAX));
+        }
+    }
+    let text = gles.host_call(call, call.name, &lanes[..2])?;
+    let at = copy_host_string(gles, c, call, text, name)?;
+    c.ret().u64(at);
+    Ok(())
+}
+
+/// `void glGetIntegerv(GLenum pname, GLint *data)`: forwarded; `GL_NUM_EXTENSIONS` counts only
+/// the extensions the guest is shown.
+pub(super) fn get_integerv(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    if call.lanes[0] as u32 != NUM_EXTENSIONS || call.lanes[1] == 0 {
+        return gles.forward(c, call);
+    }
+    gles.forward(c, call)?;
+    if let Some(visible) = visible_extensions(gles, call)? {
+        let at = GuestAddr::try_from(call.lanes[1])
+            .map_err(|_| call.refuse(format!("{:#x} is not an address", call.lanes[1])))?;
+        c.mem().write_u32(at, visible.len() as u32, c.blame(1))?;
+    }
     Ok(())
 }
 

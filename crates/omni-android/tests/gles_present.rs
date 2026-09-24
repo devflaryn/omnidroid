@@ -55,6 +55,8 @@ const EGL_VERSION: u64 = 0x3054;
 const GL_VENDOR: u64 = 0x1F00;
 const GL_RENDERER: u64 = 0x1F01;
 const GL_VERSION: u64 = 0x1F02;
+const GL_EXTENSIONS: u64 = 0x1F03;
+const GL_NUM_EXTENSIONS: u64 = 0x821D;
 const GL_COLOR_BUFFER_BIT: u64 = 0x4000;
 const GL_COLOR_CLEAR_VALUE: u64 = 0x0C22;
 const GL_RGBA: u64 = 0x1908;
@@ -715,5 +717,40 @@ fn get_proc_address_answers_null_for_what_the_host_lacks() {
     assert_eq!(ask("glNotACommandOfAnyRegistry"), 0);
     let requests = f.gles.requests();
     assert!(requests.iter().any(|r| r.name == missing));
+
+    // A withheld extension: gone from both extension lists, which still agree with each other and
+    // with GL_NUM_EXTENSIONS, and its entry point is NULL -- whatever the host has.
+    assert_eq!(ask("glBufferStorageEXT"), 0, "GL_EXT_buffer_storage is withheld");
+    let listed: Vec<String> = f
+        .guest_string(f.gl("glGetString", &[GL_EXTENSIONS]))
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert!(!listed.iter().any(|e| e == "GL_EXT_buffer_storage"));
+    let count = f.alloc(4);
+    f.gl("glGetIntegerv", &[GL_NUM_EXTENSIONS, count]);
+    let count = f.read_i32(count);
+    let started = std::time::Instant::now();
+    let indexed: Vec<String> =
+        (0..count as u64).map(|i| f.guest_string(f.gl("glGetStringi", &[GL_EXTENSIONS, i]))).collect();
+    eprintln!("GLES: {count} glGetStringi calls took {:?}", started.elapsed());
+    // The same set: ES 3.2 section 22.2 does not require the two forms to list in the same order.
+    let (mut a, mut b) = (indexed.clone(), listed.clone());
+    a.sort();
+    b.sort();
+    let only_indexed: Vec<&String> = a.iter().filter(|e| !b.contains(e)).collect();
+    let only_listed: Vec<&String> = b.iter().filter(|e| !a.contains(e)).collect();
+    assert_eq!(a, b, "glGetStringi and glGetString list the same extensions: only indexed {only_indexed:?}, only listed {only_listed:?}");
+    assert_eq!(f.gl("glGetStringi", &[GL_EXTENSIONS, count as u64]), 0, "one past the end is NULL");
+    assert_eq!(f.gl("glGetError", &[]) as u32, 0x0501, "and GL_INVALID_VALUE, as the host raises");
+    let (_, host_list) = f.host_string(GL_EXTENSIONS);
+    let host_has = host_list.split_ascii_whitespace().any(|e| e == "GL_EXT_buffer_storage");
+    eprintln!("GLES: the host {} GL_EXT_buffer_storage; the guest is shown {count} extensions", if host_has { "has" } else { "lacks" });
+    if host_has {
+        assert!(
+            f.gles.substitutions().iter().any(|s| s.what.contains("GL_EXT_buffer_storage withheld")),
+            "a withholding is recorded"
+        );
+    }
     f.tear_down(display, surface, context);
 }

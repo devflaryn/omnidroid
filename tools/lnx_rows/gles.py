@@ -118,8 +118,8 @@ ROWS = [
     # eglGetProcAddress answering a thunk for a name the host lacks or no registry has.
     ("lnx-gles-B3", "B", "eglGetProcAddress answers non-NULL for a name the host lacks",
      EGL_RS,
-     """        ProcAnswer::NullFromHost | ProcAnswer::NullNotInRegistry => 0,""",
-     """        ProcAnswer::NullFromHost | ProcAnswer::NullNotInRegistry => call.address as u64,""",
+     """        ProcAnswer::NullFromHost | ProcAnswer::NullNotInRegistry | ProcAnswer::NullWithheld => 0,""",
+     """        ProcAnswer::NullFromHost | ProcAnswer::NullNotInRegistry | ProcAnswer::NullWithheld => call.address as u64,""",
      LIVE),
     # The Android-only config attribute passed through to a desktop EGL, which rejects the whole
     # request with EGL_BAD_ATTRIBUTE.
@@ -147,6 +147,18 @@ ROWS = [
      """    if r as u32 == 0xFFFF_FFFF {
         gles.note_present();
     }""",
+     LIVE),
+    # The withheld extension shown after all: the engine then asks for coherent mappings.
+    ("lnx-gles-A11", "A", "GL_EXT_buffer_storage is not withheld from glGetString",
+     GL_RS,
+     """                let withheld = super::is_withheld_extension(extension);""",
+     """                let withheld = super::is_withheld_extension(extension) && false;""",
+     LIVE),
+    # glGetStringi's index not remapped past a withheld extension: the two lists disagree.
+    ("lnx-gles-A12", "A", "glGetStringi indexes the host's list, withheld entries included",
+     GL_RS,
+     """            lanes[1] = visible.get(call.lanes[1] as u32 as usize).copied().unwrap_or(u64::from(u32::MAX));""",
+     """            let _ = &visible;""",
      LIVE),
     # --- the Windows door ---------------------------------------------------------------------------
     # A Win32 window treated as an X11 one: the refusal that names ANGLE is gone.

@@ -94,6 +94,34 @@ pub const MAX_RECORDS: usize = 512;
 /// The most arguments any GLES or EGL command takes (15, `glTexSubImage3DOES`-sized ones) plus one.
 pub const MAX_ARGS: usize = 16;
 
+/// Extensions the host may have and this layer **withholds** from the guest: removed from
+/// `glGetString(GL_EXTENSIONS)`, from `glGetStringi`'s list and `GL_NUM_EXTENSIONS`, and their
+/// entry points answered NULL by `eglGetProcAddress`. Each removal is a recorded substitution.
+///
+/// **`GL_EXT_buffer_storage`, MEASURED as the reason for the list**: advertised by Mesa 26.0.8, the
+/// engine used it for `glMapBufferRange(access = 0xc2)` -- `WRITE | PERSISTENT | COHERENT` -- on its
+/// render thread. A coherent mapping's writes must reach the driver with no call at all; this layer
+/// can give the guest only a guest-memory shadow of a driver mapping (see [`gl`]), so the extension
+/// is one it cannot provide. Withheld, the engine's own path without it is taken, exactly as on a
+/// device whose driver lacks it.
+pub const WITHHELD: &[(&str, &[&str], &str)] = &[(
+    "GL_EXT_buffer_storage",
+    &["glBufferStorageEXT"],
+    "a persistent/coherent mapping cannot be a guest-memory shadow",
+)];
+
+/// Whether `name` is an entry point of a [`WITHHELD`] extension.
+#[must_use]
+pub fn is_withheld_command(name: &str) -> bool {
+    WITHHELD.iter().any(|(_, commands, _)| commands.contains(&name))
+}
+
+/// Whether `extension` is [`WITHHELD`].
+#[must_use]
+pub fn is_withheld_extension(extension: &str) -> bool {
+    WITHHELD.iter().any(|(name, _, _)| *name == extension)
+}
+
 /// Whether a registry origin is a **core** version -- the names a real `libGLESv2.so`/`libEGL.so`
 /// exports and the guest can import directly.
 #[must_use]
@@ -140,6 +168,9 @@ pub enum ProcAnswer {
     /// NULL: neither the `gles2` nor the EGL registry has a command of that name, so there is no
     /// prototype to call it with and no GLES implementation can have it.
     NullNotInRegistry,
+    /// NULL: the command belongs to an extension this layer **withholds** ([`WITHHELD`]) -- the host
+    /// has it, and this layer cannot honour it for the guest.
+    NullWithheld,
 }
 
 /// One `eglGetProcAddress` call, as the census records it.
@@ -435,6 +466,7 @@ impl Gles {
                     ProcAnswer::Thunk(_) => r.name.clone(),
                     ProcAnswer::NullFromHost => format!("{} -> NULL (host)", r.name),
                     ProcAnswer::NullNotInRegistry => format!("{} -> NULL (not a GLES/EGL command)", r.name),
+                    ProcAnswer::NullWithheld => format!("{} -> NULL (withheld)", r.name),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -578,6 +610,7 @@ impl Gles {
     fn resolve(&self, call: &Call, name: &str) -> AbiResult<ProcAnswer> {
         let table = self.table.get().ok_or_else(|| call.refuse(unbound()))?;
         let answer = match signature(name) {
+            _ if is_withheld_command(name) => ProcAnswer::NullWithheld,
             None => ProcAnswer::NullNotInRegistry,
             Some(signature) => {
                 let known = self.state.lock().by_name.get(signature.name).copied();
@@ -684,7 +717,9 @@ fn special_for(name: &str) -> Option<SpecialFn> {
         "eglCreateNativeClientBufferANDROID" | "eglGetNativeClientBufferANDROID" => {
             egl::refuse_native
         }
-        "glGetString" | "glGetStringi" => gl::get_string,
+        "glGetString" => gl::get_string,
+        "glGetStringi" => gl::get_string_i,
+        "glGetIntegerv" => gl::get_integerv,
         "glMapBufferRange" | "glMapBufferRangeEXT" => gl::map_buffer_range,
         "glMapBufferOES" => gl::map_buffer_oes,
         "glUnmapBuffer" | "glUnmapBufferOES" => gl::unmap_buffer,

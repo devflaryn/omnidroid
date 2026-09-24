@@ -168,7 +168,7 @@ pub(super) fn get_proc_address(
     let answer = gles.resolve(call, &name)?;
     c.ret().u64(match answer {
         ProcAnswer::Thunk(address) => address as u64,
-        ProcAnswer::NullFromHost | ProcAnswer::NullNotInRegistry => 0,
+        ProcAnswer::NullFromHost | ProcAnswer::NullNotInRegistry | ProcAnswer::NullWithheld => 0,
     });
     Ok(())
 }
