@@ -55,6 +55,9 @@ pub enum ScriptArg {
     /// The list of how earlier runs ended -- [`super::Jni::previous_exit_reasons`], built from
     /// what the embedding recorded, and empty when it recorded nothing.
     PreviousExitReasons,
+    /// `CookieManager.getCookie(url)` against the app's cookie store -- [`super::Jni::cookie_header`]
+    /// -- as a `java.lang.String`: `""` when it holds none, which is what `bh.x0.S0` passes then.
+    CookiesFor(&'static str),
 }
 
 /// One downcall in the scripted sequence.
@@ -420,6 +423,20 @@ pub static SEQUENCE: &[Downcall] = &[
         java_before: &[],
         args: &[ScriptArg::Text("0")],
     },
+    // **The app's cookies, handed to the engine** -- `bh.x0.W0` calls `S0` at `0x0061`, right
+    // after `nativeSetUserId`: `nativeSetMultipleCookies(g(), fl.j.b(g()) ?: "")`, `g()` being
+    // `"https://" + host`, the same URL `nativeSetBaseUrl` is given, and `fl.j.b` the app's cookie
+    // store. Missing until 2026-09-24, and it is why a sign-in never survived a restart. See
+    // `super::cookies`.
+    Downcall {
+        step: 9,
+        caller: "bh/x0.W0 -> bh/x0.S0",
+        class: "com/roblox/engine/jni/NativeSettingsInterface",
+        member: "nativeSetMultipleCookies",
+        descriptor: "(Ljava/lang/String;Ljava/lang/String;)V",
+        java_before: &[],
+        args: &[ScriptArg::Text("https://www.roblox.com"), ScriptArg::CookiesFor("https://www.roblox.com")],
+    },
     Downcall {
         step: 9,
         caller: "bh/x0.W0",
@@ -500,6 +517,22 @@ pub static SEQUENCE: &[Downcall] = &[
         // statement that makes `FMOD.checkInit()` true. See `FMOD_INIT`.
         java_before: &[FMOD_INIT],
         args: &[ScriptArg::Text("/data/data/com.roblox.client/shared_prefs/prefs.xml")],
+    },
+    // **Where the engine's cookies go** -- `Q` calls `jk.k0.w(Context)` at `0x0046`, which first
+    // touches `CookieProtocol.a()`: its class initialiser constructs the `CookieProtocol`, whose
+    // constructor hands a new `CookieProtocol$OnSetCookieHandlerImpl` to `tm.b.a` -> this native.
+    // The one INSTANCE native in the sequence: its `thiz` (the `JNICookieProtocol` singleton) is
+    // passed as the class reference, which is safe because the body (`0x230a9f4`) never reads
+    // `x1` -- it keeps only the handler, `x2`. Missing until 2026-09-24: no handler, so every
+    // cookie the engine set went nowhere. See `super::cookies`.
+    Downcall {
+        step: 11,
+        caller: "com/roblox/client/startup/NativeHelper.Q -> jk/k0.w -> CookieProtocol.<init> -> tm/b.a",
+        class: "com/roblox/universalapp/cookie/JNICookieProtocol",
+        member: "updateOnSetCookieHandler",
+        descriptor: "(Lcom/roblox/universalapp/cookie/JNICookieProtocol$OnSetCookieHandler;)V",
+        java_before: &[],
+        args: &[ScriptArg::Object("com/roblox/universalapp/cookie/CookieProtocol$OnSetCookieHandlerImpl")],
     },
     Downcall {
         step: 11,
@@ -710,7 +743,26 @@ pub static SCRIPT_CLASSES: &[&str] = &[
     // `RobloxApplication.onCreate` registers one with `ProcessLifecycleOwner`; see
     // [`process_lifecycle`].
     "com/roblox/universalapp/applifecyclenativeadapter/JNIAppLifecycleNativeAdapter",
+    // `NativeHelper.Q`'s cookie handler registration: an instance native whose `thiz` the engine
+    // never reads (see its row), so the class stands in for the singleton.
+    "com/roblox/universalapp/cookie/JNICookieProtocol",
 ];
+
+/// The guest value one scripted argument becomes, made the way the Java side makes it.
+///
+/// # Errors
+///
+/// Whatever building the object refuses for.
+pub fn guest_argument(jni: &Jni, argument: &ScriptArg) -> AbiResult<GuestArg> {
+    Ok(match argument {
+        ScriptArg::Text(text) => GuestArg::Int(jni.new_string(text)?),
+        ScriptArg::Object(class) => GuestArg::Int(jni.new_object(class)?),
+        ScriptArg::Null => GuestArg::Int(0),
+        ScriptArg::Long(value) => GuestArg::Int(*value as u64),
+        ScriptArg::PreviousExitReasons => GuestArg::Int(jni.previous_exit_reasons()?),
+        ScriptArg::CookiesFor(url) => GuestArg::Int(jni.new_string(&jni.cookie_header(url))?),
+    })
+}
 
 /// A process lifecycle event, as androidx's `ProcessLifecycleOwner` dispatches it to the
 /// observers registered on it.
@@ -907,13 +959,7 @@ pub fn run(
             GuestArg::Int(jni.class_reference(step.class)?),
         ];
         for argument in step.args {
-            args.push(match argument {
-                ScriptArg::Text(text) => GuestArg::Int(jni.new_string(text)?),
-                ScriptArg::Object(class) => GuestArg::Int(jni.new_object(class)?),
-                ScriptArg::Null => GuestArg::Int(0),
-                ScriptArg::Long(value) => GuestArg::Int(*value as u64),
-                ScriptArg::PreviousExitReasons => GuestArg::Int(jni.previous_exit_reasons()?),
-            });
+            args.push(guest_argument(jni, argument)?);
         }
         let caller = format!("§8 step {} ({})", step.step, step.caller);
         let result = boundary.call_guest(cpu, &caller, target, &args, PER_DOWNCALL);
@@ -952,7 +998,7 @@ pub fn perform(jni: &Jni, statements: &[JavaStatement]) -> AbiResult<()> {
             // A statement stores an instance or `null` -- `JavaStatement::value` says so -- and
             // the store checks instance types against the field's. A `jlong` is no reference at
             // all, and no field the script assigns holds a string: refused, not converted.
-            ScriptArg::Text(_) | ScriptArg::Long(_) | ScriptArg::PreviousExitReasons => {
+            ScriptArg::Text(_) | ScriptArg::Long(_) | ScriptArg::PreviousExitReasons | ScriptArg::CookiesFor(_) => {
                 return Err(named(AbiError::JniRefused {
                     function: "script::perform".to_string(),
                     address: 0,
@@ -1017,12 +1063,12 @@ mod tests {
         let count = |step: u8| SEQUENCE.iter().filter(|d| d.step == step).count();
         assert_eq!(count(7), 2, "JNIBaseUrlProtocol.init and JNIWebLoginProtocol.init");
         assert_eq!(count(8), 1, "NativeReportingInterface.initAppShellReporter");
-        assert_eq!(count(9), 11, "§8 step 9: `11 downcalls, all (String…)V`");
+        assert_eq!(count(9), 12, "§8 step 9: the 11 `(String…)V` downcalls and `nativeSetMultipleCookies`");
         assert_eq!(count(10), 2, "nativeSetAssetPath and nativePreloadFlagOverrides");
-        assert_eq!(count(11), 4, "nativeSetDeviceInfo, External, Preferences, ExitReasons");
+        assert_eq!(count(11), 5, "nativeSetDeviceInfo, External, Preferences, the cookie handler, ExitReasons");
         // Step 12 is not here: the engine drops it before step 13 (see `ENGINE_SETTINGS`).
         assert_eq!(count(12), 0, "nativeAppBridgeSetInitParams waits for the engine");
-        assert_eq!(SEQUENCE.len(), 20);
+        assert_eq!(SEQUENCE.len(), 22);
         assert_eq!(ENGINE_SETTINGS.len(), 1);
         assert_eq!(ENGINE_SETTINGS[0].member, "nativeAppBridgeSetInitParams");
         // In order: a script that ran step 12 before step 9 would be a different script.
@@ -1045,8 +1091,9 @@ mod tests {
                 "{} takes {parameters}",
                 step.member
             );
+            // Strings the Java side builds: literals, and the one it reads out of its cookie store.
             for argument in step.args {
-                assert!(matches!(argument, ScriptArg::Text(_)), "{}", step.member);
+                assert!(matches!(argument, ScriptArg::Text(_) | ScriptArg::CookiesFor(_)), "{}", step.member);
             }
         }
     }
@@ -1178,6 +1225,33 @@ mod tests {
                 row.member
             );
         }
+    }
+
+    /// **`nativeSetMultipleCookies` is handed what the app's cookie store answers for its URL** --
+    /// the startup half of `super::super::cookies` -- and `""` when it holds nothing, as
+    /// `bh.x0.S0` passes then.
+    #[test]
+    fn the_startup_cookie_argument_is_the_stores_answer_for_its_url() {
+        let space = Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(Arc::clone(&space)).expect("a JNI instance");
+        let row = SEQUENCE.iter().find(|row| row.member == "nativeSetMultipleCookies").expect("the row");
+        let [ScriptArg::Text(url), cookies @ ScriptArg::CookiesFor(for_url)] = row.args else {
+            panic!("(url, the store's cookies for it): {:?}", row.args);
+        };
+        assert_eq!(url, for_url, "the same URL twice, as `S0` passes `g()` twice");
+        let text = |argument: GuestArg| match argument {
+            GuestArg::Int(handle) => jni.string_of(handle).expect("a handle").expect("a string"),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text(guest_argument(&jni, cookies).expect("built")), "", "an empty store");
+        let dir = std::env::temp_dir().join(format!("omni-script-cookies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("omnidroid-cookies");
+        std::fs::create_dir_all(&dir).expect("a directory");
+        std::fs::write(&file, "omnidroid-cookies v1\nA\t1\troblox.com\t0\t/\t-\t1\t1\n").expect("a store");
+        jni.set_cookie_store(&file).expect("the store");
+        assert_eq!(text(guest_argument(&jni, cookies).expect("built")), "A=1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An event whose export nothing resolves is refused, naming the export: the engine would

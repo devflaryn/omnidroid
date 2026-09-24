@@ -45,6 +45,7 @@
 //! *silently*. Reaching step 13 without a looper would produce exactly that.
 
 pub mod classes;
+pub mod cookies;
 pub mod env;
 pub mod input;
 pub mod keys;
@@ -323,6 +324,9 @@ pub(crate) struct JniState {
     /// Every `SharedPreferences` store the guest has written, by name: key to value, as
     /// `apply()` committed them. See [`Jni::shared_preferences`].
     pub(crate) shared_preferences: BTreeMap<String, BTreeMap<String, String>>,
+    /// The app's cookie store (`CookieManager`'s): what the engine pushed through `onSetCookie`
+    /// and gets back through `nativeSetMultipleCookies`. See [`Jni::set_cookie_store`].
+    pub(crate) cookies: cookies::CookieJar,
     /// What each preferences object this instance handed out is. Keyed by [`refs::ObjectId`],
     /// whose generation changes when a slot is reused, so a stale entry can never be read as a
     /// new object's.
@@ -473,6 +477,7 @@ impl Jni {
                 keyboard: Vec::new(),
                 previous_exits: Vec::new(),
                 shared_preferences: BTreeMap::new(),
+                cookies: cookies::CookieJar::new(),
                 preference_objects: BTreeMap::new(),
                 host_callbacks: BTreeMap::new(),
                 host_calls: Vec::new(),
@@ -811,6 +816,37 @@ impl Jni {
     /// install's answer: no run has ended yet.
     pub fn set_previous_exits(&self, exits: Vec<ExitRecord>) {
         self.state.lock().previous_exits = exits;
+    }
+
+    /// **Keep the app's cookie store in `file`**, as Android's WebView keeps it in the app's own
+    /// data directory: what is there is loaded now, and every cookie the engine hands the Java side
+    /// is written back at once. Without a file the store lives in memory, which is a first launch
+    /// on a device whose storage is then wiped.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] for a file that exists and cannot be read as a store.
+    pub fn set_cookie_store(&self, file: &std::path::Path) -> AbiResult<()> {
+        let jar = cookies::CookieJar::with_file(file).map_err(|detail| AbiError::JniRefused {
+            function: "Jni::set_cookie_store".to_string(),
+            address: 0,
+            detail,
+        })?;
+        self.state.lock().cookies = jar;
+        Ok(())
+    }
+
+    /// `CookieManager.getCookie(url)` against the store, now -- the string the Java side hands the
+    /// engine at startup. Never logged by this layer.
+    #[must_use]
+    pub fn cookie_header(&self, url: &str) -> String {
+        self.state.lock().cookies.get(url, cookies_now_ms())
+    }
+
+    /// How many cookies the store holds -- a count, never a value.
+    #[must_use]
+    pub fn cookie_count(&self) -> usize {
+        self.state.lock().cookies.len()
     }
 
     /// **What the guest has written to the `SharedPreferences` store `name`**, as `apply()`
@@ -1758,6 +1794,14 @@ impl Jni {
     pub fn thread_instance(self: &Arc<Self>) -> Arc<dyn crate::bionic::ThreadLocalInstance> {
         Arc::new(JniThreadInstance(Arc::clone(self)))
     }
+}
+
+/// The wall clock in milliseconds since the Unix epoch, for cookie expiry: `Expires` is a calendar
+/// date, and this host's clock is the one a device's `CookieManager` would read.
+pub(crate) fn cookies_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

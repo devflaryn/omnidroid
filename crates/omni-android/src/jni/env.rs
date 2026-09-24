@@ -1738,6 +1738,73 @@ fn preferences(
     }
 }
 
+/// The two cookie answers (`super::cookies` has the decode): `onSetCookie(String[], String url)`
+/// stores each `Set-Cookie` string for `url`, and the static `CookieProtocol.setCookie(url, cookie)`
+/// stores one. **Applied synchronously**, where the Java body posts each to the main thread: the
+/// same order, and nothing the engine can observe between. A cookie the store refuses is refused
+/// by name here, never by value.
+fn cookie_call(
+    state: &mut JniState,
+    name: &str,
+    address: GuestAddr,
+    class: ClassId,
+    member: &Member,
+    arguments: &[Value],
+) -> AbiResult<Value> {
+    let refuse = |state: &JniState, why: String| AbiError::JniRefused {
+        function: name.to_string(),
+        address,
+        detail: format!("`{}.{}{}`: {why}", state.registry.class_name(class), member.name, member.descriptor),
+    };
+    let text = |state: &mut JniState, raw: i64, what: &str| -> AbiResult<String> {
+        if raw == 0 {
+            return Err(refuse(state, format!("the {what} is null, which the Java body throws on")));
+        }
+        let id = state.handles.resolve_id(name, address, raw as u64)?;
+        match state.handles.object_of(id) {
+            Some(Object::String(text)) => Ok(text.to_string_lossy()),
+            other => Err(refuse(state, format!("the {what} is {}, not a String", other.map_or("freed", Object::kind_name)))),
+        }
+    };
+    let (url, cookies) = match (member.answer, arguments) {
+        (Answer::OnSetCookie, [Value::Long(array), Value::Long(url)]) => {
+            let url = text(state, *url, "url")?;
+            if *array == 0 {
+                return Err(refuse(state, "the cookie array is null, which the Java body throws on".to_string()));
+            }
+            let id = state.handles.resolve_id(name, address, *array as u64)?;
+            let elements = match state.handles.object_of(id) {
+                Some(Object::ObjectArray { elements, .. }) => elements.clone(),
+                other => {
+                    return Err(refuse(state, format!("the cookies are {}, not a String[]", other.map_or("freed", Object::kind_name))))
+                }
+            };
+            let mut cookies = Vec::with_capacity(elements.len());
+            for element in elements {
+                let Some(element) = element else {
+                    return Err(refuse(state, "a cookie in the array is null".to_string()));
+                };
+                cookies.push(match state.handles.object_of(element) {
+                    Some(Object::String(text)) => text.to_string_lossy(),
+                    other => return Err(refuse(state, format!("a cookie is {}, not a String", other.map_or("freed", Object::kind_name)))),
+                });
+            }
+            (url, cookies)
+        }
+        (Answer::CookieProtocolSetCookie, [Value::Long(url), Value::Long(cookie)]) => {
+            let url = text(state, *url, "url")?;
+            let cookie = text(state, *cookie, "cookie")?;
+            (url, vec![cookie])
+        }
+        _ => return Err(refuse(state, format!("the arguments are {arguments:?}"))),
+    };
+    let now = super::cookies_now_ms();
+    for cookie in &cookies {
+        state.cookies.set(&url, cookie, now).map_err(|why| refuse(state, why.to_string()))?;
+    }
+    Ok(Value::Void)
+}
+
 pub(super) fn evaluate(
     state: &mut JniState,
     name: &str,
@@ -2011,6 +2078,9 @@ pub(super) fn evaluate(
         | Answer::PreferencesEdit
         | Answer::EditorPutString
         | Answer::EditorApply => preferences(state, name, address, class, member, receiver, arguments),
+        Answer::OnSetCookie | Answer::CookieProtocolSetCookie => {
+            cookie_call(state, name, address, class, member, arguments)
+        }
         Answer::ListSize | Answer::ListIsEmpty | Answer::ListGet | Answer::ListToArray => {
             let elements = list_elements(state, name, address, class, member, receiver)?;
             match member.answer {
@@ -2817,6 +2887,53 @@ mod tests {
         let method = state.registry.method(class, member, descriptor, false).expect("declared");
         let member = state.registry.member(method).expect("a member").clone();
         evaluate(&mut state, "CallObjectMethodV", 0, class, &member, Some(receiver), arguments)
+    }
+
+    /// **The engine's cookies reach the app's store, and come back out as the startup string.**
+    /// The `String[]` is built through the slots the engine builds it with (`NewObjectArray`,
+    /// `SetObjectArrayElement`) and handed to `onSetCookie` on the handler object the script
+    /// registers -- the shape the engine sends (`VERIFICATION.md` entry 20). A second instance
+    /// reading the same file is the relaunch. A null array and a non-http URL are refused.
+    #[test]
+    fn the_engines_cookies_are_stored_and_handed_back_at_the_next_launch() {
+        let (jni, mem) = slot_fixture();
+        let dir = std::env::temp_dir().join(format!("omni-jni-cookies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("app_webview").join("omnidroid-cookies");
+        jni.set_cookie_store(&file).expect("an empty store");
+        let string_class = jni.class_reference("java/lang/String").expect("String");
+        let cookies = ["SESSION=abc; domain=.roblox.com; path=/; secure; HttpOnly", "Tracker=1; path=/"];
+        let JniReturn::Word(array) =
+            call_slot(&jni, &mem, "NewObjectArray", &[cookies.len() as u64, string_class, 0])
+                .expect("NewObjectArray")
+        else {
+            panic!("NewObjectArray answers a reference");
+        };
+        for (index, cookie) in cookies.iter().enumerate() {
+            let element = jni.new_string(cookie).expect("a string");
+            call_slot(&jni, &mem, "SetObjectArrayElement", &[array, index as u64, element])
+                .expect("SetObjectArrayElement");
+        }
+        let handler_class = "com/roblox/universalapp/cookie/CookieProtocol$OnSetCookieHandlerImpl";
+        let handler = jni.new_object(handler_class).expect("the handler");
+        let handler = jni.state().handles.resolve_id("test", 0, handler).expect("live");
+        let url = Value::Long(jni.new_string("https://www.roblox.com").expect("a string") as i64);
+        let descriptor = "([Ljava/lang/String;Ljava/lang/String;)V";
+        let returned = call_on(&jni, handler_class, handler, "onSetCookie", descriptor, &[Value::Long(array as i64), url.clone()])
+            .expect("onSetCookie");
+        assert_eq!(returned, Value::Void);
+        assert_eq!(jni.cookie_header("https://www.roblox.com"), "SESSION=abc; Tracker=1");
+        assert_eq!(jni.cookie_header("https://apis.roblox.com"), "SESSION=abc", "a domain cookie, not the host-only one");
+
+        // The relaunch: a new instance over the same file.
+        let (again, _) = slot_fixture();
+        again.set_cookie_store(&file).expect("the kept store");
+        assert_eq!(again.cookie_header("https://www.roblox.com"), "SESSION=abc; Tracker=1");
+
+        assert!(call_on(&jni, handler_class, handler, "onSetCookie", descriptor, &[Value::Long(0), url]).is_err());
+        let ftp = Value::Long(jni.new_string("ftp://www.roblox.com").expect("a string") as i64);
+        assert!(call_on(&jni, handler_class, handler, "onSetCookie", descriptor, &[Value::Long(array as i64), ftp]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **The engine's one preferences write lands in the store it named**: `getSharedPreferences`

@@ -40,10 +40,25 @@ which fails on HANDOFF open item 7's two unchanged causes (Windows 1224 re-openi
   records, the same directory reaches Landing and closes cleanly (relaunch-b) -- **but logged
   out**: the account session is not persisted mid-session in a form a relaunch uses. On a device
   the Java side keeps the engine's cookies (`onSetCookie` is a Sink here); that is credential
-  storage, the owner's decision, **not built**. A clean close is what keeps a sign-in: sign in,
-  close at Home with the X, and run from copies of that directory.
+  storage, the owner's decision. **Later measured: a clean close does NOT keep it either** -- the
+  engine's session cookie only ever lived on the Java side. The owner then decided the runtime may
+  keep the app's own cookies: `jni::cookies` (see "The sign-in" below).
 * The `InferredCrash` null member also killed a worker at +5 s on a **fresh** install once (1 of 3
   concurrent instances) -- it is not only a post-crash path. Harmless to the run; open.
+
+## The sign-in: the app's cookie store (the owner's decision, 2026-09-24)
+
+DECODED from `classes2.dex`: the engine pushes its cookies to Java through a handler it is given
+by `JNICookieProtocol.updateOnSetCookieHandler` (called from `NativeHelper.Q` via `jk.k0.w` ->
+`CookieProtocol.<init>`); the Java side stores each in WebView's `CookieManager`; at the next start
+`bh.x0.W0` -> `S0` hands them back with `nativeSetMultipleCookies("https://www.roblox.com", …)`.
+None of that existed here. Now: `jni::cookies` (RFC 6265 storage/retrieval, persisted at
+`app_webview/omnidroid-cookies` in the app's data directory, written on every change, values never
+logged), the handler's `onSetCookie` and the static `CookieProtocol.setCookie` answered into it,
+and both script rows added (`updateOnSetCookieHandler` is the sequence's one instance native; its
+`thiz` is never read -- `0x230a9f4`). MEASURED: a logged-out landing run stored the engine's two
+cookies (`RBXEventTrackerV2`, `GuestData`) and the next launch of the same directory loaded both
+and handed them back. Rows `cookie-`.
 
 ## Step 4: memory (MEASURED, logged-out landing, +100 s, ~45 guest JITs)
 
@@ -116,5 +131,11 @@ shared code are additive except where marked:
   `0xD4000001` (`SVC #0`) instead of returning it -- a backend that reports a guest SVC some other
   way needs the same arm; bound 318 / inline 303 after `atol`. `tools/mutate.py`: rows `vsprintf-`,
   `crashclose-`, `svc-`, `atol-` inserted before the terminator.
-* The gate (`tests/gameactivity.rs`): the close watchdog halts the UI context, a hung close behind
+* **`omni-android::jni`**: new `cookies` module; `Answer::OnSetCookie` and
+  `Answer::CookieProtocolSetCookie` (new enum variants -- an exhaustive `match` on `Answer`
+  elsewhere needs them); `Jni::set_cookie_store`, `cookie_header`, `cookie_count`;
+  `script::ScriptArg::CookiesFor`, `script::guest_argument`; two new `SEQUENCE` rows (20 -> 22) and
+  `JNICookieProtocol` in `SCRIPT_CLASSES`. The `java/lang/String.onSetCookie` sink is gone.
+  Pure Rust, no OS calls: it ports as is.
+* The gate (`tests/gameactivity.rs`): `COOKIE_STORE` handed to `Jni::set_cookie_store`; the close watchdog halts the UI context, a hung close behind
   a death records `REASON_CRASH_NATIVE`, `OMNI_IMPORT_CENSUS=off`. No OS names added.

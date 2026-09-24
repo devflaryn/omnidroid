@@ -647,6 +647,16 @@ impl Guest {
         let exits = read_exit_records(&root.0);
         let _ = writeln!(std::io::stderr(), "EXITS: {} earlier run(s) recorded as ended", exits.len());
         jni.set_previous_exits(exits);
+        // **The app's cookie store, where a device's WebView keeps it**: in the app's own data
+        // directory, so a kept root (`OMNI_DATA_DIR`) keeps the engine's session cookie the way a
+        // phone does, whatever way the last run ended, and a scratch root starts with none.
+        // `omni_android::jni::cookies` has the decode. Counted, never printed.
+        jni.set_cookie_store(&root.0.join(COOKIE_STORE)).expect("the app's cookie store");
+        let _ = writeln!(
+            std::io::stderr(),
+            "COOKIES: the app's cookie store holds {} cookie(s) at launch",
+            jni.cookie_count()
+        );
         bionic.set_memory_budget(GUEST_MEMORY_BUDGET);
         // **Which network this guest may reach — D30's replacement for Global Constraint 8.**
         //
@@ -1085,6 +1095,10 @@ fn remove_scratch_roots() {
 /// system server keeps its own (`procexitstore`), in the guest's root -- so a kept root
 /// (`OMNI_DATA_DIR`) carries it to the next run and a scratch one goes with the run.
 const EXIT_RECORDS: &str = "data/system/omnidroid-procexitstore";
+
+/// Where the app's cookie store is kept in the guest's root: beside where Android's WebView keeps
+/// its own (`app_webview/Default/Cookies`), in this layer's format.
+const COOKIE_STORE: &str = "data/data/com.roblox.client/app_webview/omnidroid-cookies";
 
 /// At most this many records, newest first -- the per-package bound a device keeps.
 const MAX_EXIT_RECORDS: usize = 16;

@@ -914,10 +914,17 @@ Full record, merge notes and every figure: **`docs/ports/windows.md`**. In short
   with `OMNI_INJECT_DEATH`); vendored dynarmic **patch 0002** (D32) -- a guest thread's fixed JIT cost
   on demand: landing commit 3,157 → 2,105 MiB, working set 2,528 → 1,884 MiB, 24.56 → 4.47 MiB per
   guest thread; `OMNI_IMPORT_CENSUS=off` for the census A/B. `inbound-` 10/10 (step 0).
-* **The sign-in**: a clean close keeps it; a crash does not (the engine persists the account session
-  on the way to the background; on a device the Java side also keeps its cookies, a Sink here --
-  credential storage, the owner's call, not built). **Sign in once, close at Home with the X, and
-  run everything from copies of that directory.**
+* **The sign-in now survives a restart** (the owner decided, 2026-09-24, that the runtime may store
+  the app's own cookies as a device does). MEASURED first: even a perfectly clean close (`"IAB"`,
+  `USER REQUESTED`) relaunched LOGGED OUT -- `cachedUserId` known, every authenticated call `401` --
+  because on a device the engine's session cookie lives on the Java side (`onSetCookie` ->
+  WebView's `CookieManager`, handed back at startup through `nativeSetMultipleCookies`) and here
+  that half did not exist: `onSetCookie` was a sink on `java/lang/String`, the handler was never
+  registered, the startup call never made. The earlier note that "the engine persists it on the way
+  to the background" was wrong. Now `jni::cookies` is the store (in the app's own
+  `app_webview/`), the script registers the handler and makes the startup call; verified live (a
+  second launch received the first's cookies; values never logged). **Sign in once with the new
+  build and every later launch of that directory, or a copy of it, starts signed in.**
 * **Performance was NOT measured in a world**: the first sign-in window stood 43 minutes unused; at
   the second the owner joined 606849621 directly and the world died loading (raw `svc`, then
   `atol` -- both fixed in `c6e7c0d`). Nothing on the performance leads was changed without

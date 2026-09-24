@@ -210,6 +210,12 @@ pub enum Answer {
     EditorPutString,
     /// `SharedPreferences$Editor.apply()`: the editor's writes, committed to its store.
     EditorApply,
+    /// `CookieProtocol$OnSetCookieHandlerImpl.onSetCookie(String[] cookies, String url)`: each
+    /// `Set-Cookie` string into the app's cookie store, as the Java body's
+    /// `CookieManager.setCookie(url, cookie)` does. See [`super::cookies`].
+    OnSetCookie,
+    /// `CookieProtocol.setCookie(String url, String cookie)` (static): one cookie into the store.
+    CookieProtocolSetCookie,
     /// An `Object[0]`.
     ///
     /// `List.toArray()` on the empty list this layer hands the engine. Correct rather than a
@@ -639,6 +645,8 @@ impl Registry {
             | Answer::PreferencesEdit
             | Answer::EditorPutString
             | Answer::EditorApply
+            | Answer::OnSetCookie
+            | Answer::CookieProtocolSetCookie
             | Answer::Construct(_)
             | Answer::ShowKeyboard
             | Answer::HideKeyboard
@@ -1122,8 +1130,23 @@ pub static DECLARED: &[ClassSpec] = &[
         tier: Tier::Zero,
         methods: &[
             m("getBytes", "(Ljava/lang/String;)[B", Answer::StringBytes),
-            m("onSetCookie", "([Ljava/lang/String;Ljava/lang/String;)V", Answer::Sink),
         ],
+        fields: NONE,
+    },
+    // **The app's cookie path** (`super::cookies` has the decode). `onSetCookie` used to be a sink
+    // declared on `java/lang/String`, so the engine's session cookie went nowhere and every
+    // relaunch came up logged out; the handler the engine calls is this class, which the script
+    // registers with `JNICookieProtocol.updateOnSetCookieHandler` as `NativeHelper.Q` does.
+    ClassSpec {
+        name: "com/roblox/universalapp/cookie/CookieProtocol$OnSetCookieHandlerImpl",
+        tier: Tier::One,
+        methods: &[m("onSetCookie", "([Ljava/lang/String;Ljava/lang/String;)V", Answer::OnSetCookie)],
+        fields: NONE,
+    },
+    ClassSpec {
+        name: "com/roblox/universalapp/cookie/CookieProtocol",
+        tier: Tier::One,
+        methods: &[s("setCookie", "(Ljava/lang/String;Ljava/lang/String;)V", Answer::CookieProtocolSetCookie)],
         fields: NONE,
     },
     // **The engine fetches its own `Context`** (§3.1): it does not wait to be handed one, so
