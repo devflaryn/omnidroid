@@ -66,7 +66,8 @@ and the tests actually use** of it:
 **The gate** (with no desktop session, start an X server first and say so):
 
 ```sh
-Xvfb :99 -screen 0 1920x1080x24 &  export DISPLAY=:99      # or the desktop's own DISPLAY
+LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe Xvfb :99 -screen 0 1920x1080x24 -extension GLX &
+export DISPLAY=:99      # or the desktop's own DISPLAY (see the OpenGL ES section on this GPU)
 OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 OMNI_KEYBOARD_MOUSE=1 \
   cargo test -p omni-android --release --test gameactivity -- --nocapture --test-threads=1 \
   initialize_native_code_returns_a_native_code_and_the_game_thread_starts
@@ -175,6 +176,37 @@ the whole run, because the renderer test saw the defect only when its first fram
 | `lnx-win`, `lnx-gfx` | 30 + 2 | 32/32 |
 | `lnx-audio` | 18 | 18/18 (a 19th row, blocking-mode open, was NOT CAUGHT and removed: non-blocking mode could not be shown necessary) |
 | `lnx-integ` (integration fixes: FMOD's nice, the relro verdict, Mutter's restore) | 7 | 7/7 |
+
+## The OpenGL ES fallback (added after the port; `docs/ports/linux-notes/gles.md`)
+
+The engine refuses a software Vulkan device by its own rule (measured with the network working:
+`Vulkan: Device llvmpipe ... is emulated, skipping`, `Mode 6 failed: Unable to pick Vulkan
+device`) and falls back to OpenGL ES, whose first call used to kill its render thread. The engine's
+`libEGL.so`/`libGLESv2.so` are now real: `crates/omni-android/src/gles/` (OS-free) forwards every
+ES 2.0-3.2 and EGL command to the host's EGL through a `GlesHost` seam, with each command's exact
+signature from the Khronos registries (`tools/gen_gles_signatures.py`: one typed `extern "C"`
+caller per shape, so a Windows host gets the Microsoft x64 convention for free).
+`crates/omni-gfx/src/gles.rs` is the host: X11 -> Mesa via `EGL_PLATFORM_X11_KHR`; Win32 is a typed
+refusal naming ANGLE (D3D11), with the exact steps for the Windows and macOS hosts in the notes.
+
+* **The engine renders through it** (gate, Xvfb, llvmpipe -- CPU, not representative): EGL context
+  and `OpenGL ES 3.2 Mesa`, 1477 shaders loaded, 179 presents in a 120 s session, **exit 0, no guest
+  thread killed**; a capture of the window is the Roblox landing screen (5,790 distinct colours on
+  an 8 px grid).
+* **Substitutions, recorded:** `GL_EXT_buffer_storage` is withheld (the engine asked for a
+  persistent coherent mapping, which a guest-memory shadow cannot honour; it then logged
+  `Persistent 0` and ran); `EGL_RECORDABLE_ANDROID`/`EGL_FRAMEBUFFER_TARGET_ANDROID` are dropped when
+  the host lacks them (Mesa rejects both).
+* **The GPU on this host:** the Quadro 4000 has hardware OpenGL ES 3.1 through nouveau (`NVC0`,
+  Mesa 26.0.8; no Vulkan exists for Fermi). The guest-driven GLES tests passed 6/6 on it on the
+  owner's display. **Then the GPU wedged**: a plain `Xvfb` opened the nouveau render node itself
+  (its GLX loads a Mesa driver), Fermi faulted (`fifo: fault ... [PGRAPH] ... channel ...
+  [Xvfb] ... killed`), and the owner's Xwayland ended up waiting on a GPU fence that never
+  signals; it needs a reboot. So the engine was **not yet** run on the GPU. On this host, start
+  every Xvfb away from the GPU:
+  `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe Xvfb :99 -screen 0 1920x1080x24 -extension GLX`.
+* 35 terrain shaders fail Mesa's strict GLSL ES compiler (the engine's source, unchanged); rows
+  `lnx-gles` 16/16 caught.
 
 ## Numbers
 
