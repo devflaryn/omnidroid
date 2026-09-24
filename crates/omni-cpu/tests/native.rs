@@ -1544,3 +1544,36 @@ impl DynarmicOver {
         cpu
     }
 }
+
+/// **A reproduction, not a test: running it aborts the process.** The dynarmic survey that died
+/// (docs/ports/macos-hvf.md 4.7), replayed exactly: every `.eh_frame` function in order on the
+/// translating backend's own harness, with the survey's arguments, a fresh context every 512 and the
+/// buffers refilled every 256, up to and including `libroblox.so + 0x224822c`. **Alone, that function
+/// is an ordinary typed fault on both backends** (MEASURED: `MemoryFault { address: 0x51, access:
+/// Read }`), so the abort depends on what the functions before it left behind -- in the jit or in
+/// guest memory. Kept `#[ignore]`d for the CPU workstream.
+#[test]
+#[ignore = "aborts the whole test process on dynarmic: the finding in docs/ports/macos-hvf.md 4.7"]
+fn repro_dynarmic_aborts_during_the_survey_at_libroblox_0x224822c() {
+    let _serial = serialized();
+    const LAST: u64 = 0x224_822c;
+    let Some(dynarmic) = harness::roblox::Roblox::load() else { return };
+    let elf = ElfImage::parse(main_lib_bytes().expect("bytes")).expect("parse");
+    let functions = elf.eh_frame_functions().expect("eh_frame").expect("an .eh_frame_hdr");
+    let buffers = dynarmic
+        .space
+        .map_anonymous(Placement::Anywhere { align: dynarmic.space.page_size() }, 2 * ARG_BUFFER, Protection::ReadWrite, CommitPolicy::Eager)
+        .expect("argument buffers");
+    let mut cpu = dynarmic.thread();
+    for (i, function) in functions.iter().enumerate() {
+        if i % 512 == 0 {
+            cpu = dynarmic.thread();
+        }
+        set_buffer_args(&mut cpu, &dynarmic.space, buffers, dynarmic.stack_top, dynarmic.sentinel, i % 256 == 0);
+        let exit = cpu.run(dynarmic.object.base + function.start as usize, RunLimit::Instructions(5_000_000));
+        if function.start == LAST {
+            println!("reached {LAST:#x} after {i} functions: {exit:?} -- the process did not abort this time");
+            return;
+        }
+    }
+}
