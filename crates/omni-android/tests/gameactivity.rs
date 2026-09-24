@@ -767,6 +767,18 @@ impl Guest {
         // phone does, whatever way the last run ended, and a scratch root starts with none.
         // `omni_android::jni::cookies` has the decode. Counted, never printed.
         jni.set_cookie_store(&root.0.join(COOKIE_STORE)).expect("the app's cookie store");
+        // **OMNI_COOKIE: a sign-in the owner supplies** (`omnidroid play --cookie`): the account's
+        // `.ROBLOSECURITY` value, stored as the server sets it, before the startup call hands the
+        // store to the engine -- so the app starts signed in as that account, exactly as it does
+        // with a cookie a previous run kept. It replaces a kept one of the same name. Never printed.
+        if let Some(value) = std::env::var("OMNI_COOKIE").ok().filter(|v| !v.is_empty()) {
+            jni.set_cookie(
+                "https://www.roblox.com",
+                &format!(".ROBLOSECURITY={value}; domain=.roblox.com; path=/; secure; HttpOnly"),
+            )
+            .expect("the account cookie (OMNI_COOKIE)");
+            let _ = writeln!(std::io::stderr(), "COOKIES: the account cookie from OMNI_COOKIE is in the store");
+        }
         // The version the app was installed as: the chosen APK's own manifest, not a constant.
         jni.set_app_version(chosen_apk().manifest.version_name.clone());
         let _ = writeln!(

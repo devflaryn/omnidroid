@@ -866,6 +866,22 @@ impl Jni {
         self.state.lock().cookies.get(url, cookies_now_ms())
     }
 
+    /// `CookieManager.setCookie(url, value)` from the embedding rather than the engine: store one
+    /// `Set-Cookie` string for `url` now, written back to the store's file at once. Called before
+    /// the startup script, it is in the string `nativeSetMultipleCookies` hands the engine -- a
+    /// sign-in the owner supplies (`omnidroid play --cookie`). Never logged by this layer.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] for a string the store refuses (the reason names the cookie only).
+    pub fn set_cookie(&self, url: &str, set_cookie: &str) -> AbiResult<()> {
+        self.state.lock().cookies.set(url, set_cookie, cookies_now_ms()).map_err(|why| AbiError::JniRefused {
+            function: "Jni::set_cookie".to_string(),
+            address: 0,
+            detail: why.to_string(),
+        })
+    }
+
     /// How many cookies the store holds -- a count, never a value.
     #[must_use]
     pub fn cookie_count(&self) -> usize {
