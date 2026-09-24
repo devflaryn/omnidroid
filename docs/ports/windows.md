@@ -16,6 +16,7 @@ runs and scripts are in the session scratchpad (`0b762c51-…/scratchpad/runs`, 
 | `83cfa6e` | a death that hangs the close ends as `REASON_CRASH_NATIVE`; the watchdog halts the UI thread's call; `OMNI_INJECT_DEATH`; rows `crashclose-` 3/3 |
 | `c18e0eb` | vendored dynarmic patch 0002 (D32): per-thread fixed JIT cost on demand |
 | `fa7e136` | `OMNI_IMPORT_CENSUS=off`, the in-world A/B switch for the census |
+| `c6e7c0d` | a guest's raw `SVC #0` answered by the syscall emulation (kernel convention: `-errno` in `x0`, `errno` untouched; `openat` → `open`); `atol`. The two deaths of the owner's first join of 606849621. Rows `svc-` 5/5, `atol-` 2/2 |
 
 Mutation: `inbound-` 10/10 (step 0, never run before), `vsprintf-` 6/6, `crashclose-` 3/3, each
 with the tree to itself. Patch 0002's two halves were proven by hand-applied regressions (the
@@ -56,8 +57,14 @@ which fails on HANDOFF open item 7's two unchanged causes (Windows 1224 re-openi
   front per code cache (least-used caches touched 3,200 KiB). The **32 MiB-per-thread JIT cache**
   now costs address space (1.4 GB reserved for 45 threads) and commit only for code kept: 5 MiB for
   an idle thread, up to 32 for a busy one.
-* **Instances started one by one** (3 on this PC, `multi.sh`): each adds **~2.0-2.1 GB commit and
-  ~1.75 GB RAM**, linearly -- no sharing beyond the library image. ~10 on 8 GB needs ~0.8 GB each.
+* **Instances started one by one** (3 on this PC, `multi.sh`, a separate fresh data directory
+  each): each adds **~2.0-2.2 GB commit and ~1.6 GB RAM**, linearly -- no sharing beyond the
+  library image. ~10 on 8 GB needs ~0.8 GB each. (A first attempt ran all three on ONE data
+  directory -- a script quoting bug, `…\Omnidroid$D` -- and is discarded; the same bug put the
+  memory A/B pair and the retranslation runs on one kept, logged-out directory, run back to back,
+  which leaves those comparisons like for like but not "fresh". In the re-run one instance lost its
+  game thread at +5 s to a `MemoryFault` at `0x21db02c`, the libc++ hash-map code of HANDOFF item 8
+  -- a second sighting of that one, 1 in ~15 runs tonight -- so the figure is instances 2 and 3.)
   What remains per instance: the guest's own ~1.1 GB (its heap granules, stacks and blocks, pages
   it touched -- the 64 KiB granule rules out pager over-commit), ~0.4 GB of images, ~0.5 GB of
   translated code, duplicated per thread and per instance. The next lever is sharing translated
@@ -68,8 +75,11 @@ which fails on HANDOFF open item 7's two unchanged causes (Windows 1224 re-openi
 
 ## Step 3: performance -- NOT YET MEASURED IN A WORLD
 
-No in-world run was possible: the owner's sign-in window stood open 43 minutes (01:26) with no
-sign-in, then was closed cleanly. On the landing: census on/off and global/value-compare monitor
+The first sign-in window stood open 43 minutes (to 01:26) with no sign-in and was closed cleanly.
+The second was signed in at ~02:41 and the owner joined 606849621 straight away: the world never
+finished loading (0-1 presents per 5 s for the 80 s from the join to the deaths) before a worker
+died on the raw `svc` (+1570 s) and another on `atol` (+1595 s) and it froze -- both fixed in
+`c6e7c0d`. So no in-world frame-rate figure exists yet. On the landing: census on/off and global/value-compare monitor
 make no measurable difference (the one hot thread is the game loop's `ALooper_pollOnce` spin at
 ~92 M guest insn/s, 4.1 M crossings/s, `mon` 0%). The benchmark leads (census contention, the
 monitor at 256 slots, return prediction) need a world with many busy workers to judge, and nothing
@@ -102,6 +112,9 @@ shared code are additive except where marked:
   `SIGABRT`, `SIGSEGV`, `SIGILL`, `IMPORTANCE_FOREGROUND` and names reason 5; `Vulkan::slot_names`;
   bionic binds `__vsprintf_chk` (bound 317, inline 302 -- the counts in `tests/bionic.rs` are pinned
   and will conflict textually with any other branch that binds a symbol); `OMNI_INJECT_DEATH` in
-  `boundary.rs`. `tools/mutate.py`: rows `vsprintf-`, `crashclose-` inserted before the terminator.
+  `boundary.rs`; the run loop now services `ExitReason::UnsupportedInstruction` with encoding
+  `0xD4000001` (`SVC #0`) instead of returning it -- a backend that reports a guest SVC some other
+  way needs the same arm; bound 318 / inline 303 after `atol`. `tools/mutate.py`: rows `vsprintf-`,
+  `crashclose-`, `svc-`, `atol-` inserted before the terminator.
 * The gate (`tests/gameactivity.rs`): the close watchdog halts the UI context, a hung close behind
   a death records `REASON_CRASH_NATIVE`, `OMNI_IMPORT_CENSUS=off`. No OS names added.

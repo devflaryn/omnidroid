@@ -918,14 +918,15 @@ Full record, merge notes and every figure: **`docs/ports/windows.md`**. In short
   on the way to the background; on a device the Java side also keeps its cookies, a Sink here --
   credential storage, the owner's call, not built). **Sign in once, close at Home with the X, and
   run everything from copies of that directory.**
-* **Performance was NOT measured in a world**: no signed-in directory existed and the owner was away
-  (the sign-in window stood 43 minutes). Nothing on the performance leads was changed without
+* **Performance was NOT measured in a world**: the first sign-in window stood 43 minutes unused; at
+  the second the owner joined 606849621 directly and the world died loading (raw `svc`, then
+  `atol` -- both fixed in `c6e7c0d`). Nothing on the performance leads was changed without
   in-world evidence; the landing shows none of them (one hot thread; `docs/ports/windows.md`).
 
 ### The in-world protocol (needs the owner for the sign-in and the join; ~5 min per run)
 
 GoodbyeDPI (not a VPN) broke teleports on 09-23, so measure in **place 606849621**, which is joined
-directly (no teleport). Play binary: `../omnidroid-play` at `fa7e136`, already built. Script:
+directly (no teleport). Play binary: `../omnidroid-play` at `c6e7c0d`, already built. Script:
 `<scratchpad>/play.sh <data-dir-name> <log-name> [ENV=...]` (session until the window is closed).
 
 1. Master: `play.sh data-master-0924 master` -- the owner signs in (Quick Sign-in), waits for
@@ -944,8 +945,9 @@ directly (no teleport). Play binary: `../omnidroid-play` at `fa7e136`, already b
 2. **The `InferredCrash` reporter** (`+0xc8` null at `0x2383500`) kills one worker at +5 s after any
    crash, and once on a fresh install; harmless to the run. Who sets it on a device: not decoded
    (its setter is not among the handle getter's twelve callers).
-3. **Raw `svc #0`** (p1): `x8 = 56` (`openat`) of `"/proc/self/maps"` -- an integrity check reading
-   its own mappings; route guest SVCs through the syscall emulation, answering `-errno` in `x0`.
+3. ~~Raw `svc #0`~~ **done in `c6e7c0d`** (with `atol`): the owner's first join of 606849621 died on
+   both. The integrity check's `openat("/proc/self/maps")` now gets `-ENOENT` (no `/proc` here);
+   what the engine does with that answer is not yet observed.
 4. **The headless gate's 1224**: Linux lets `O_TRUNC` shrink a file under a live shared mapping;
    Windows refuses. A faithful fix is a logical EOF in the file seam.
 5. **Memory for ~10 instances**: ~2.0 GB commit per landing instance, linear. Next lever: sharing
