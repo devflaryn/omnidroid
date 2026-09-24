@@ -61,9 +61,10 @@ pub enum ScriptArg {
     /// -- as a `java.lang.String`: `""` when it holds none, which is what `bh.x0.S0` passes then.
     CookiesFor(&'static str),
     /// The cold-start deep-link URL, as `ActivityProtocolLaunch.onCreate` hands
-    /// `intent.getDataString()` to the two `maybeHandleColdStartProtocolLaunch` natives:
-    /// Java `null` on a normal launch (the app goes Home), or the join URL built from the
-    /// placeId in `OMNI_JOIN_PLACE` (or a full URL in `OMNI_DEEPLINK`) when one is set.
+    /// `intent.getDataString()` to the two `maybeHandleColdStartProtocolLaunch` natives: the join
+    /// URL built from the placeId in `OMNI_JOIN_PLACE` (or a full URL in `OMNI_DEEPLINK`). With
+    /// neither, [`run`] skips the downcalls that take it, as a launcher start never creates
+    /// `ActivityProtocolLaunch`.
     DeepLinkUrl,
 }
 
@@ -304,7 +305,8 @@ pub static SEQUENCE: &[Downcall] = &[
     // On a device this activity runs after RobloxApplication.onCreate and before ActivitySplash
     // (step 8). Its cold/root branch calls, in order, JNIBaseUrlProtocol then JNIWebLoginProtocol
     // `maybeHandleColdStartProtocolLaunch(intent.getDataString())`. That string is `null` on a
-    // normal launcher start and the deep-link URI when launched from one; the natives parse it and
+    // normal launcher start -- where this activity is never created, so `run` skips both -- and the
+    // deep-link URI when launched from one; the natives parse it and
     // set the state `NativeGLInterface.isColdStartDeeplinkToGame()` reads later to join a place
     // rather than go Home. Both take only a String -- no Activity/Intent/Uri object is needed. The
     // boolean result only tells the device whether to restart prefetch; the placeId lives in native
@@ -972,6 +974,13 @@ pub fn run(
 ) -> AbiResult<Vec<StepOutcome>> {
     let mut outcomes = Vec::with_capacity(steps.len());
     for step in steps {
+        // **`ActivityProtocolLaunch` runs only when the app is opened from a link.** A launcher
+        // start goes straight to `ActivitySplash`, so with no deep link its two downcalls are not
+        // made -- rather than handing the natives a Java `null`, which they pass to
+        // `GetStringUTFChars` unchecked.
+        if step.args.iter().any(|arg| matches!(arg, ScriptArg::DeepLinkUrl)) && join_deeplink().is_none() {
+            continue;
+        }
         let symbol = step.symbol();
         // **The Java statements first, whether or not the export resolves**: on a device they
         // run as the calling method reaches them, and a native that fails to link fails at its
@@ -1276,8 +1285,13 @@ mod tests {
             let outcomes =
                 run(&jni, &boundary, cpu.as_mut(), &|_| None, std::slice::from_ref(row), 0)
                     .expect("the arguments build");
-            assert_eq!(outcomes.len(), 1);
-            assert!(outcomes[0].target.is_none() && !outcomes[0].ok(), "{:?}", outcomes[0]);
+            // With no deep link, `ActivityProtocolLaunch`'s rows are not made at all.
+            let skipped =
+                row.args.iter().any(|arg| matches!(arg, ScriptArg::DeepLinkUrl)) && join_deeplink().is_none();
+            assert_eq!(outcomes.len(), usize::from(!skipped), "row {index} (`{}`)", row.member);
+            if let Some(outcome) = outcomes.first() {
+                assert!(outcome.target.is_none() && !outcome.ok(), "{outcome:?}");
+            }
             assert_eq!(
                 check_init(&jni),
                 index >= at,
