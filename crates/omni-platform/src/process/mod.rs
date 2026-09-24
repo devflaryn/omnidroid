@@ -231,6 +231,38 @@ pub fn cpu_time() -> ProcessResult<Duration> {
     backend::cpu_time()
 }
 
+/// Where this host keeps an application's data for its user: the directory a launcher keeps the
+/// app's storage in between runs (a signed-in session included).
+///
+/// Each host's own convention: `%LOCALAPPDATA%\Omnidroid\data` on Windows,
+/// `~/Library/Application Support/Omnidroid/data` on macOS -- the two `tools/play.ps1` and
+/// `tools/play.sh` used, so storage kept by either is found again -- and
+/// `$XDG_DATA_HOME/omnidroid/data` (default `~/.local/share/omnidroid/data`) on Linux and other
+/// unixes. `None` when the variable the convention reads is not set.
+#[must_use]
+pub fn app_data_dir() -> Option<std::path::PathBuf> {
+    let from = |var: &str| std::env::var_os(var).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    #[cfg(target_os = "windows")]
+    {
+        from("LOCALAPPDATA").map(|base| base.join("Omnidroid").join("data"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        from("HOME").map(|home| home.join("Library/Application Support/Omnidroid/data"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        from("XDG_DATA_HOME")
+            .or_else(|| from("HOME").map(|home| home.join(".local/share")))
+            .map(|base| base.join("omnidroid").join("data"))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = from;
+        None
+    }
+}
+
 /// The most descriptors this process may hold open, after raising the soft limit once as far as
 /// the host allows. Idempotent and cheap after the first call; the filesystem and network seams
 /// call it before they open anything, so no caller has to remember to.

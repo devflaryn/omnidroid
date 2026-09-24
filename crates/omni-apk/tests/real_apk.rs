@@ -435,6 +435,18 @@ fn the_manifest_is_returned_as_undecoded_binary_xml() {
     );
 }
 
+/// The fixture says what it is: the root element's identity, decoded from its own manifest rather
+/// than from its file name.
+#[test]
+fn the_manifest_declares_the_package_and_version_the_file_is_named_for() {
+    let Some(apk) = fixture() else { return };
+    let manifest = omni_apk::AppManifest::parse(&apk.read_manifest().expect("read"))
+        .expect("decode the root element");
+    assert_eq!(manifest.package, "com.roblox.client");
+    assert_eq!(manifest.version_name, "2.738.1397");
+    assert!(manifest.version_code > 0, "{manifest:?}");
+}
+
 #[test]
 fn stored_assets_and_dex_files_are_where_the_analysis_says() {
     let Some(apk) = fixture() else { return };

@@ -169,6 +169,12 @@ impl Guest {
         // `::` in it, so the two name spaces cannot collide — but they must be installed before
         // `finish`, because a `Boundary` is immutable.
         let jni = Jni::new(Arc::clone(&space)).expect("a JNI instance");
+        // The version the fixture was installed as: its own manifest's, as any embedding does.
+        jni.set_app_version(
+            omni_apk::manifest_of(&repo_root().join(APK_NAME))
+                .expect("the fixture's manifest")
+                .version_name,
+        );
         let installed = jni.install_into(&builder).expect("install the JNI tables");
         assert_eq!(installed, JNI_SLOTS);
         script::declare_script_classes(&jni);

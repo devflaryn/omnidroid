@@ -15,8 +15,11 @@
 //!   certificate, and nothing here reports on them. The supplied test APK is signed by a
 //!   non-Roblox key (D6); this crate neither knows nor cares. Anything that needs to trust an APK's
 //!   provenance must verify it somewhere else.
-//! * **No binary XML decoding.** [`Apk::read_manifest`] hands back the raw AXML bytes of
-//!   `AndroidManifest.xml`. Decoding them is somebody else's format.
+//! * **No binary XML decoding, but for the manifest's identity.** [`Apk::read_manifest`] hands back
+//!   the raw AXML bytes of `AndroidManifest.xml`. [`AppManifest`] reads exactly three attributes of
+//!   its root element -- `package`, `versionName`, `versionCode` -- because a run *chooses* an APK
+//!   by them ([`choose_apk`]) and tells the engine the version it was installed as. Everything else
+//!   in the manifest, and every resource reference, is still somebody else's format.
 //! * **No mapping.** The cache returns a *path*. On Windows a file that will ever be mapped
 //!   executable must be opened `GENERIC_READ | GENERIC_EXECUTE` and sectioned `PAGE_EXECUTE_READ`
 //!   from the very start, because a view of a read-only section can never be made executable
@@ -58,8 +61,13 @@
 
 mod apk;
 mod cache;
+mod choose;
 mod error;
+mod manifest;
 mod zip;
+
+pub use crate::choose::{choose_apk, manifest_of, ChosenApk, APK_ENV};
+pub use crate::manifest::AppManifest;
 
 pub use crate::apk::{
     Apk, NativeLibrary, ANDROID_MANIFEST_ENTRY, ASSETS_PREFIX, LIB_PREFIX,

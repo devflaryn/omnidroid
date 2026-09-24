@@ -1294,8 +1294,8 @@ pub(super) fn static_field(
     match member.answer {
         Answer::StaticInstance => static_instance(state, name, address, field, member),
         Answer::Assigned => assigned(state, name, address, field, member),
-        other => Registry::simple_answer(other)
-            .ok_or_else(|| unanswered(state, name, address, field.class, member)),
+        other => recorded_answer(state, other)
+            .unwrap_or_else(|| Err(unanswered(state, name, address, field.class, member))),
     }
 }
 
@@ -1461,8 +1461,20 @@ fn instance_field(
         }
     }
     let member = field_member(state, name, address, field)?;
-    Registry::simple_answer(member.answer)
-        .ok_or_else(|| unanswered(state, name, address, field.class, member))
+    recorded_answer(state, member.answer)
+        .unwrap_or_else(|| Err(unanswered(state, name, address, field.class, member)))
+}
+
+/// [`Registry::simple_answer`], and the answers that need nothing but what this instance
+/// recorded -- so a method, an instance field and a static field that answer the same thing
+/// answer it the same way. `None` for an answer neither decides.
+fn recorded_answer(state: &JniState, answer: Answer) -> Option<AbiResult<Value>> {
+    match answer {
+        Answer::AppVersion => {
+            Some(state.app_version.clone().map(Value::Text).ok_or_else(super::app_version_unset))
+        }
+        other => Registry::simple_answer(other).map(Ok),
+    }
 }
 
 fn unanswered(
@@ -2220,8 +2232,8 @@ pub(super) fn evaluate(
         }),
         simple => {
             let _ = arguments;
-            Registry::simple_answer(simple)
-                .ok_or_else(|| unanswered(state, name, address, class, member))
+            recorded_answer(state, simple)
+                .unwrap_or_else(|| Err(unanswered(state, name, address, class, member)))
         }
     }
 }

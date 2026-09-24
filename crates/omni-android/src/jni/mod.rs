@@ -321,6 +321,8 @@ pub(crate) struct JniState {
     pub(crate) keyboard: Vec<KeyboardRequest>,
     /// How earlier runs ended, most recent first. See [`Jni::set_previous_exits`].
     pub(crate) previous_exits: Vec<ExitRecord>,
+    /// The installed APK's `versionName`. See [`Jni::set_app_version`].
+    pub(crate) app_version: Option<String>,
     /// Every `SharedPreferences` store the guest has written, by name: key to value, as
     /// `apply()` committed them. See [`Jni::shared_preferences`].
     pub(crate) shared_preferences: BTreeMap<String, BTreeMap<String, String>>,
@@ -476,6 +478,7 @@ impl Jni {
                 statics: BTreeMap::new(),
                 keyboard: Vec::new(),
                 previous_exits: Vec::new(),
+                app_version: None,
                 shared_preferences: BTreeMap::new(),
                 cookies: cookies::CookieJar::new(),
                 preference_objects: BTreeMap::new(),
@@ -816,6 +819,26 @@ impl Jni {
     /// install's answer: no run has ended yet.
     pub fn set_previous_exits(&self, exits: Vec<ExitRecord>) {
         self.state.lock().previous_exits = exits;
+    }
+
+    /// **The version the app was installed as**: the APK's own `android:versionName`
+    /// (`omni_apk::AppManifest`), which a device's `PackageInfo.versionName` answers and the app
+    /// reports as its version everywhere -- `DeviceParams.appVersion`, the session reporter, the
+    /// startup script, the web view's user agent.
+    ///
+    /// **Not a constant of this crate**: the APK is chosen at run time, so its version is too. Until
+    /// set, every member that answers it refuses, naming this call, rather than inventing one.
+    pub fn set_app_version(&self, version: impl Into<String>) {
+        self.state.lock().app_version = Some(version.into());
+    }
+
+    /// The version [`set_app_version`](Self::set_app_version) recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] if the embedding never set it.
+    pub fn app_version(&self) -> AbiResult<String> {
+        self.state.lock().app_version.clone().ok_or_else(app_version_unset)
     }
 
     /// **Keep the app's cookie store in `file`**, as Android's WebView keeps it in the app's own
@@ -1802,6 +1825,18 @@ pub(crate) fn cookies_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// The refusal for a member that answers the app's version before the embedding said which APK it
+/// installed. See [`Jni::set_app_version`].
+pub(crate) fn app_version_unset() -> AbiError {
+    AbiError::JniRefused {
+        function: "Jni::app_version".to_string(),
+        address: 0,
+        detail: "the app's version is the installed APK's `versionName`, and the embedding never \
+                 said which APK it installed (`Jni::set_app_version`)"
+            .to_string(),
+    }
 }
 
 #[cfg(test)]

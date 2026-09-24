@@ -1,0 +1,21 @@
+[package]
+name = "omnidroid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "The launcher: run an APK in a real window on Windows, macOS or Linux -- `omnidroid play --apk <path>`."
+
+# A launcher, and only that: which APK (omni-apk), where the app's storage lives (omni-platform),
+# and then the gate's own run. No OS crate and no `cfg(target_os)` here (Global Constraint 4) --
+# what differs per host is answered by omni-platform.
+[dependencies]
+omni-apk = { workspace = true }
+omni-platform = { workspace = true }
+
+[[bin]]
+name = "omnidroid"
+path = "src/main.rs"

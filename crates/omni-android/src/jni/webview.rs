@@ -529,6 +529,8 @@ pub fn bridge_script() -> String {
 /// The device facts the app's user agent is built from (`el.g.a`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserAgentFacts {
+    /// The installed APK's `versionName` (`PackageInfo.versionName`), the `Roblox/<version>` part.
+    pub app_version: String,
     /// `ActivityManager.MemoryInfo.totalMem / 1048576` (`nl.a.c`).
     pub total_memory_mb: i32,
     /// `Display.getSize` (`nl.a.j`): the app's display area in pixels.
@@ -571,7 +573,7 @@ pub fn user_agent(facts: &UserAgentFacts) -> String {
     const WEBKIT: &str = "AppleWebKit/537.36";
     const DISTRIBUTION: &str = "GlobalDist";
     const STORE: &str = "GooglePlayStore";
-    let version = super::script::APP_VERSION;
+    let version = &facts.app_version;
     // `el.i.h`: VR first, then `k` (phone: `bh.x0.p0()` is `!k`), then TV, else tablet.
     let kind = if !facts.tablet {
         "Phone"
@@ -1383,6 +1385,7 @@ mod tests {
     #[test]
     fn the_user_agent_is_the_apps_format_over_the_facts() {
         let facts = UserAgentFacts {
+            app_version: "2.739.691".to_string(),
             total_memory_mb: 3584,
             display_size: (1920, 1080),
             dpi: (144, 145),

@@ -46,6 +46,8 @@ pub const PER_DOWNCALL: RunLimit = RunLimit::Instructions(200_000_000);
 pub enum ScriptArg {
     /// A `java.lang.String` built from this text.
     Text(&'static str),
+    /// The installed APK's `versionName`, as a `java.lang.String` -- [`super::Jni::app_version`].
+    AppVersion,
     /// A fresh instance of this declared class.
     Object(&'static str),
     /// Java `null`, which several of these genuinely are before a user signs in.
@@ -187,12 +189,6 @@ pub fn mangle(class: &str, member: &str) -> String {
     }
     format!("Java_{}_{}", escape(class), escape(member))
 }
-
-/// The value the host tells the engine the app version is.
-///
-/// The APK's own: `Roblox-2.739.691.apk` (was `Roblox-2.738.1397.apk` until 2026-09-24). Stated as a constant so that the one place it appears
-/// is this one — three drifted duplicates of a figure have already appeared in this project.
-pub const APP_VERSION: &str = "2.739.691";
 
 /// `Build.VERSION.SDK_INT` of the Android this host presents, as the decimal string the APK sends.
 ///
@@ -351,7 +347,7 @@ pub static SEQUENCE: &[Downcall] = &[
         member: "nativeSetRobloxVersion",
         descriptor: "(Ljava/lang/String;)V",
         java_before: &[],
-        args: &[ScriptArg::Text(APP_VERSION)],
+        args: &[ScriptArg::AppVersion],
     },
     Downcall {
         step: 9,
@@ -388,7 +384,7 @@ pub static SEQUENCE: &[Downcall] = &[
         descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
         java_before: &[],
         // **Three device identifiers, and this host honestly has one of them.** The arguments
-        // used to be `("Android", APP_VERSION, "")`, which was three guesses in a row and
+        // used to be `("Android", <app version>, "")`, which was three guesses in a row and
         // nothing in the APK or the binary said any of them. What the downcall actually does,
         // decoded at `0x02229ecc`: it converts its three `jstring`s and inserts four entries into
         // a map — `mdid` and `idfv` both from the **first** (`0x02229f54`, `0x02229fb4`), `asid`
@@ -651,7 +647,8 @@ pub const CLIENT_SETTINGS: &str = r#"{"applicationSettings":{}}"#;
 ///
 /// `bh.x0.M` is the one-instruction accessor that returns `"GoogleAndroidApp"`, so the third
 /// argument is the same value [`CHANNEL_PLATFORM_NAME`] holds, and this is an alias rather than a
-/// second copy — `APP_VERSION`'s doc records what three drifted duplicates of one figure cost.
+/// second copy: three drifted duplicates of one figure have already cost this project (the app
+/// version was one, until it was read from the installed APK -- `Jni::set_app_version`).
 pub const CLIENT_SETTINGS_APPLICATION: &str = CHANNEL_PLATFORM_NAME;
 
 /// `nativeSetAssetPath`'s argument: the Java side's unpacked-assets directory. See its row in
@@ -756,6 +753,7 @@ pub static SCRIPT_CLASSES: &[&str] = &[
 pub fn guest_argument(jni: &Jni, argument: &ScriptArg) -> AbiResult<GuestArg> {
     Ok(match argument {
         ScriptArg::Text(text) => GuestArg::Int(jni.new_string(text)?),
+        ScriptArg::AppVersion => GuestArg::Int(jni.new_string(&jni.app_version()?)?),
         ScriptArg::Object(class) => GuestArg::Int(jni.new_object(class)?),
         ScriptArg::Null => GuestArg::Int(0),
         ScriptArg::Long(value) => GuestArg::Int(*value as u64),
@@ -998,7 +996,11 @@ pub fn perform(jni: &Jni, statements: &[JavaStatement]) -> AbiResult<()> {
             // A statement stores an instance or `null` -- `JavaStatement::value` says so -- and
             // the store checks instance types against the field's. A `jlong` is no reference at
             // all, and no field the script assigns holds a string: refused, not converted.
-            ScriptArg::Text(_) | ScriptArg::Long(_) | ScriptArg::PreviousExitReasons | ScriptArg::CookiesFor(_) => {
+            ScriptArg::Text(_)
+            | ScriptArg::AppVersion
+            | ScriptArg::Long(_)
+            | ScriptArg::PreviousExitReasons
+            | ScriptArg::CookiesFor(_) => {
                 return Err(named(AbiError::JniRefused {
                     function: "script::perform".to_string(),
                     address: 0,
@@ -1093,7 +1095,7 @@ mod tests {
             );
             // Strings the Java side builds: literals, and the one it reads out of its cookie store.
             for argument in step.args {
-                assert!(matches!(argument, ScriptArg::Text(_) | ScriptArg::CookiesFor(_)), "{}", step.member);
+                assert!(matches!(argument, ScriptArg::Text(_) | ScriptArg::AppVersion | ScriptArg::CookiesFor(_)), "{}", step.member);
             }
         }
     }

@@ -367,6 +367,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnidroid"
+version = "0.1.0"
+dependencies = [
+ "omni-apk",
+ "omni-platform",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1251,6 +1251,18 @@ several fixes -- stage by hunk or strip-and-restore, as `0adabca` was):
 
 ## Where the runtime actually is today
 
+**Running it, on any of the three hosts (2026-09-24, after the three-machine merge):**
+`cargo run --release -p omnidroid -- play [--apk <path>] [--minutes N] [--fresh] [--phone]`, or
+`tools/play.ps1` / `tools/play.sh`, which now forward to it. **The APK is chosen, not built in**:
+`--apk`, else `OMNI_APK`, else the newest `*.apk` in the repository root by `versionCode`
+(`omni_apk::choose_apk`; `omnidroid which` prints the choice). The version the engine is told is
+that APK's own `versionName`, read from its manifest (`Jni::set_app_version`) -- there is no
+`APP_VERSION` constant any more. The M5 gate follows the same choice. The golden-data tests
+(`omni-elf`, `omni-apk`, M3/M4) stay pinned to `Roblox-2.738.1397.apk` on purpose: they assert
+exact facts about that build. One thing still tracks one APK: `jni/surface.rs`, generated offline
+from a `classes.dex` (`crates/omni-android/tools/gen_dex_surface.py`) -- a new APK that calls a Java member it does not
+list is refused by name, and the surface is regenerated from that APK.
+
 The gate, and the switches it takes (every stimulus switch is opt-in and says so in the log):
 
 ```text

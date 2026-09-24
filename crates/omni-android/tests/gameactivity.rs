@@ -64,7 +64,30 @@ use omni_mem::{
 };
 use omni_platform::net::NetPolicy;
 
-const APK_NAME: &str = "Roblox-2.739.691.apk";
+/// **The APK this gate runs is chosen, not named here**: `OMNI_APK` if set, else the newest APK
+/// (by `versionCode`) in the repository root -- `omni_apk::choose_apk`. So an update is a new file
+/// next to the old one, or `OMNI_APK=<path>`, and no code names a version. The line this prints
+/// says which APK ran and why.
+fn chosen_apk() -> &'static omni_apk::ChosenApk {
+    static CHOSEN: OnceLock<omni_apk::ChosenApk> = OnceLock::new();
+    CHOSEN.get_or_init(|| {
+        let chosen = omni_apk::choose_apk(None, &repo_root()).unwrap_or_else(|error| {
+            panic!(
+                "M5's gate needs an APK to run and has none: {error}. It is not skippable: this \
+                 test is the milestone's evidence, and a skipped test still reports `ok`."
+            )
+        });
+        eprintln!(
+            "APK: {} -- {} {} (versionCode {}), chosen by {}",
+            chosen.path.display(),
+            chosen.manifest.package,
+            chosen.manifest.version_name,
+            chosen.manifest.version_code,
+            chosen.chosen_by
+        );
+        chosen
+    })
+}
 
 /// The switch every live-GPU test in this crate already uses, and the one that decides whether
 /// this gate gives the engine **a real window and a real Vulkan driver**.
@@ -78,7 +101,7 @@ const GRAPHICS_GATE: &str = "OMNI_GFX_WINDOW_TESTS";
 const MAIN_LIB: &str = "libroblox.so";
 
 /// `DT_INIT_ARRAY` entries in 2.738.1397's `libroblox.so`, the figure M3's and M4's gates assert
-/// against that fixture. This gate runs whatever APK [`APK_NAME`] names (2.739.691 has 3,610), so it
+/// against that fixture. This gate runs whatever APK [`chosen_apk`] chose (2.739.691 has 3,610), so it
 /// asserts that **every** entry the loaded library declares ran, and only reports this one.
 const INITIALIZERS_2_738: usize = 3_594;
 
@@ -381,7 +404,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn apk_path() -> PathBuf {
-    repo_root().join(APK_NAME)
+    chosen_apk().path.clone()
 }
 
 fn cached_main_lib() -> &'static Path {
@@ -390,7 +413,7 @@ fn cached_main_lib() -> &'static Path {
         let at = apk_path();
         assert!(
             at.is_file(),
-            "M5's gate needs {APK_NAME}, which is not at {}. It is not skippable: this test is \
+            "M5's gate needs {}, which is not a file. It is not skippable: this test is \
              the milestone's evidence, and a skipped test still reports `ok`.",
             at.display()
         );
@@ -744,6 +767,8 @@ impl Guest {
         // phone does, whatever way the last run ended, and a scratch root starts with none.
         // `omni_android::jni::cookies` has the decode. Counted, never printed.
         jni.set_cookie_store(&root.0.join(COOKIE_STORE)).expect("the app's cookie store");
+        // The version the app was installed as: the chosen APK's own manifest, not a constant.
+        jni.set_app_version(chosen_apk().manifest.version_name.clone());
         let _ = writeln!(
             std::io::stderr(),
             "COOKIES: the app's cookie store holds {} cookie(s) at launch",
@@ -1118,6 +1143,7 @@ fn user_agent_facts(display: &Display) -> UserAgentFacts {
     };
     let density = display.density();
     UserAgentFacts {
+        app_version: chosen_apk().manifest.version_name.clone(),
         total_memory_mb: (GUEST_MEMORY_BUDGET / (1024 * 1024)) as i32,
         display_size: (display.width_px, display.height_px),
         dpi: (display.density_dpi(), display.density_dpi()),
@@ -5387,9 +5413,8 @@ fn the_application_name_the_script_sends_is_the_one_the_apk_hands_the_engine() {
     assert!(!dexes.is_empty(), "the APK has no dex at all, so this test is measuring nothing");
     // `bh.x0.M` is the application name and `bh.x0.d1` is the version string, and both are
     // one-instruction accessors in the same class. The version is checked alongside because it
-    // costs one more call and because `APP_VERSION`'s own doc says three drifted duplicates of
-    // that figure have already appeared in this project — a constant taken from a file *name* is
-    // exactly the kind that drifts.
+    // costs one more call, and because it is the proof that the version the host answers -- the
+    // manifest's `versionName`, read by `omni_apk` -- is the one the APK's own Java side knows.
     let read = |method: &str| -> Option<(String, String)> {
         dexes.iter().find_map(|name| {
             let bytes = apk.read_named(name).expect("read a dex out of the APK");
@@ -5417,13 +5442,13 @@ fn the_application_name_the_script_sends_is_the_one_the_apk_hands_the_engine() {
     let (dex_name, version) = read("d1").unwrap_or_else(|| {
         panic!("`bh.x0.d1` was not readable in any of the APK's {} dex files", dexes.len())
     });
+    let manifest = omni_apk::manifest_of(&apk_path()).expect("the chosen APK's manifest");
     assert_eq!(
-        version,
-        script::APP_VERSION,
-        "{dex_name} says `bh.x0.d1` returns {version:?} and the script tells the engine it is \
-         {:?}. That value reaches nativeSetRobloxVersion and the platform headers, and the APK's \
-         own Java side is the thing that knows it",
-        script::APP_VERSION
+        version, manifest.version_name,
+        "{dex_name} says `bh.x0.d1` returns {version:?}, and the manifest's versionName -- what the \
+         host tells the engine -- is {:?}. That value reaches nativeSetRobloxVersion and the \
+         platform headers, and the APK's own Java side is the thing that knows it",
+        manifest.version_name
     );
 }
 
@@ -5681,16 +5706,26 @@ fn the_mouse_natives_read_the_registers_the_seam_writes() {
          MouseButton3 (4) -- and the middle button's 3 is past the table"
     );
 
+    // **The registers, not the frame.** What the seam relies on is which registers the native reads
+    // -- x and y from s0 and s1, the delta from s2 -- and those are the AAPCS64 argument order, fixed
+    // by the Java signature. Where the native then parks them on its stack is the compiler's
+    // choice: 2.738.1397 stored x and y at `[sp]` (`0x2d0007e0`), 2.739.691 at `[sp, #8]`
+    // (`0x2d0107e0`). So each check is an instruction *form* -- the offset and base-register fields
+    // masked out -- and the APK can change without this test naming a version.
     let (_, words) = native(PASS_MOUSE_WHEEL_SYMBOL);
-    for (what, word) in [
-        // `stp s0, s1, [sp]`: x and y, side by side, at the bottom of the event it builds.
-        ("x and y are stored from s0 and s1", 0x2D00_07E0),
-        // `fmul s2, s3, s2`: the delta, from s2, scaled.
-        ("the delta is read from s2 and scaled", 0x1E22_0862),
-        // `str s2, [sp, #8]`: after x and y.
-        ("the scaled delta is stored after them", 0xBD00_0BE2),
+    for (what, mask, form) in [
+        // `stp s0, s1, [<base>, #<any>]` (signed offset, pre- or post-index): Rt = s0, Rt2 = s1.
+        ("x and y are stored from s0 and s1", 0xFE40_7C1Fu32, 0x2C00_0400u32),
+        // `fmul s<d>, s<n>, s2`: the delta, from s2, scaled.
+        ("the delta is read from s2 and scaled", 0xFFFF_FC00, 0x1E22_0800),
+        // `str s2, [<base>, #<any>]` (unsigned offset): the scaled delta stored with them.
+        ("the scaled delta is stored from s2", 0xFFC0_001F, 0xBD00_0002),
     ] {
-        require(PASS_MOUSE_WHEEL_SYMBOL, "body", &words, what, word);
+        assert!(
+            words.iter().any(|word| word & mask == form),
+            "{PASS_MOUSE_WHEEL_SYMBOL}: {what} (form {form:#010x} under mask {mask:#010x}) is not \
+             in its body: {words:08x?}"
+        );
     }
 
     let (start, words) = native(MOUSE_LOCKED_CENTER_SYMBOL);

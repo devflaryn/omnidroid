@@ -416,6 +416,20 @@ pub enum ApkError {
         #[source]
         source: std::io::Error,
     },
+
+    /// `AndroidManifest.xml`'s root element could not be read for the app's identity.
+    #[error("AndroidManifest.xml: {detail}")]
+    Manifest {
+        /// What was missing or malformed.
+        detail: String,
+    },
+
+    /// No APK could be chosen to run, or the one named could not be used.
+    #[error("{detail}")]
+    Choice {
+        /// What was asked for, what was found, and why each candidate was passed over.
+        detail: String,
+    },
 }
 
 impl ApkError {

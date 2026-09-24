@@ -105,6 +105,9 @@ pub enum Answer {
     Double(f64),
     /// A `java.lang.String` the host defines.
     Text(&'static str),
+    /// The installed APK's `versionName`, as a `java.lang.String`: what the embedding recorded with
+    /// [`super::Jni::set_app_version`], refused by name when it recorded nothing.
+    AppVersion,
     /// A reference the host defines as Java `null`.
     ///
     /// Distinct from [`Unanswered`](Answer::Unanswered): this is the host *choosing* null, which
@@ -627,7 +630,8 @@ impl Registry {
             Answer::Double(value) => Value::Double(value),
             Answer::Text(text) => Value::Text(text.to_string()),
             Answer::Null => Value::Object(None),
-            Answer::Field(_)
+            Answer::AppVersion
+            | Answer::Field(_)
             | Answer::NewInstance
             | Answer::StaticInstance
             | Answer::Assigned
@@ -1283,7 +1287,7 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "com/roblox/engine/jni/reporter/SessionReporterJavaInterface",
         tier: Tier::One,
         methods: &[
-            s("getAppVersion", "()Ljava/lang/String;", Answer::Text(super::script::APP_VERSION)),
+            s("getAppVersion", "()Ljava/lang/String;", Answer::AppVersion),
             s("getFilesDir", "()Ljava/lang/String;", Answer::Text("/data/data/com.roblox.client/files")),
             s("getLastLoggedInUser", "()Ljava/lang/String;", Answer::Text("")),
             s("getLastLoggedInUserId", "()Ljava/lang/String;", Answer::Text("")),
@@ -1401,7 +1405,7 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: &[m("<init>", "()V", Answer::NewInstance)],
         fields: &[
             f("appBuildVariant", "Ljava/lang/String;", Answer::Text("release")),
-            f("appVersion", "Ljava/lang/String;", Answer::Text(super::script::APP_VERSION)),
+            f("appVersion", "Ljava/lang/String;", Answer::AppVersion),
             f("cpu64Bit", "Z", Answer::Bool(true)),
             f("deviceName", "Ljava/lang/String;", Answer::Text("Omnidroid")),
             f("deviceSku", "Ljava/lang/String;", Answer::Text("omnidroid")),
@@ -1417,7 +1421,7 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: &[m("<init>", "()V", Answer::NewInstance)],
         fields: &[
             f("appBuildVariant", "Ljava/lang/String;", Answer::Text("release")),
-            f("appVersion", "Ljava/lang/String;", Answer::Text(super::script::APP_VERSION)),
+            f("appVersion", "Ljava/lang/String;", Answer::AppVersion),
             f("country", "Ljava/lang/String;", Answer::Text("US")),
             f("cpu64Bit", "Z", Answer::Bool(true)),
             f("deviceName", "Ljava/lang/String;", Answer::Text("Omnidroid")),
