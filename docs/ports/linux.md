@@ -202,7 +202,13 @@ refusal naming ANGLE (D3D11), with the exact steps for the Windows and macOS hos
   owner's display. **Then the GPU wedged**: a plain `Xvfb` opened the nouveau render node itself
   (its GLX loads a Mesa driver), Fermi faulted (`fifo: fault ... [PGRAPH] ... channel ...
   [Xvfb] ... killed`), and the owner's Xwayland ended up waiting on a GPU fence that never
-  signals; it needs a reboot. So the engine was **not yet** run on the GPU. On this host, start
+  signals; it needed a reboot. **After the reboot, the engine on the GPU** (owner's display, VPN
+  on, the app the only GPU client, n = 1 run): `GL Renderer: NVC0`, `GL Version: OpenGL ES 3.1
+  Mesa 26.0.8`, flags fetched, `APP_READY` Landing, and the landing screen on screen (a window
+  capture: 5,837 distinct colours on an 8 px grid; Create Account / Sign In). First frame at
+  +15 s; 30-38 presents per 5 s while the screen animates (6-7.5/s), 3 per 5 s once idle -- a
+  real GPU, but Fermi at boot clocks (nouveau cannot reclock it) behind translated guest code on
+  4 cores; no kernel fault in that run. On this host, start
   every Xvfb away from the GPU:
   `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe Xvfb :99 -screen 0 1920x1080x24 -extension GLX`.
 * 35 terrain shaders fail Mesa's strict GLSL ES compiler (the engine's source, unchanged); rows
