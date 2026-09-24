@@ -11832,11 +11832,20 @@ fn a_shared_writable_file_mapping_writes_the_file_it_maps() {
     // Shortening a mapped file is the one thing the host will not do, and it is a refusal naming
     // the host's reason rather than an errno the guest would believe.
     let other = open_through_guest(&f, tmp, O_RDWR);
-    let refusal = refusal_of(&f, "ftruncate", |asm| {
-        asm.mov(0, other as u64);
-        asm.mov(1, 0);
-    });
-    assert!(refusal.to_string().contains("1224"), "{refusal}");
+    #[cfg(windows)]
+    {
+        let refusal = refusal_of(&f, "ftruncate", |asm| {
+            asm.mov(0, other as u64);
+            asm.mov(1, 0);
+        });
+        assert!(refusal.to_string().contains("1224"), "{refusal}");
+    }
+    // A unix host has no such limit -- Linux, like the device, truncates a file a shared mapping
+    // still holds -- so there is no refusal to see. Setting the length it already has is
+    // answered 0 and leaves the mapping and the file intact for the rest of the test (shortening
+    // it here would leave the stores below past the end of the file: SIGBUS, on a device too).
+    #[cfg(unix)]
+    assert_eq!(call_with_errno(&f, "ftruncate", &[other as u64, n]), (0, 0));
     assert_eq!(call_with_errno(&f, "close", &[other as u64]), (0, 0));
 
     // `close`, then `AtomicCacheWrite`'s rename: the file in place is `n` bytes of what was written.

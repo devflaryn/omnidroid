@@ -1259,8 +1259,28 @@ impl Scratch {
         let apk_at = at.join(GUEST_APK.trim_start_matches('/'));
         // A kept root already has one, possibly of an older APK: replace it.
         let _ = std::fs::remove_file(&apk_at);
-        std::fs::hard_link(apk_path(), &apk_at)
-            .expect("the real APK linked into the guest's root at its device path");
+        match std::fs::hard_link(apk_path(), &apk_at) {
+            Ok(()) => {}
+            // A root on another filesystem than the checkout cannot hold a hard link: on Ubuntu
+            // (26.04 measured) `std::env::temp_dir()` is `/tmp`, a tmpfs, while the APK is on the
+            // checkout's disk -- `EXDEV`, os error 18. The bytes are copied instead, and said, since
+            // on a tmpfs that copy is ~160 MB of RAM; OMNI_DATA_DIR or TMPDIR on the checkout's
+            // filesystem avoids it.
+            Err(error) if cfg!(unix) && error.kind() == std::io::ErrorKind::CrossesDevices => {
+                let copied = std::fs::copy(apk_path(), &apk_at)
+                    .expect("the real APK copied into the guest's root at its device path");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "APK: {} is on another filesystem than the checkout ({error}); COPIED {copied} \
+                     bytes rather than hard-linked -- set OMNI_DATA_DIR or TMPDIR on the checkout's \
+                     filesystem to avoid the copy",
+                    at.display()
+                );
+            }
+            Err(error) => {
+                panic!("the real APK linked into the guest's root at its device path: {error:?}")
+            }
+        }
         // The certificate authorities, out of the APK and into the path the engine opens. See
         // `CA_BUNDLE_IN_APK` for why this is the host's job and why the bytes are the APK's own.
         let apk = omni_apk::Apk::open(apk_path()).expect("the real APK");
