@@ -148,8 +148,13 @@ fn the_runtime_version_answers_without_a_window() {
     let version = WebView::runtime_version().expect("an installed WebView2 runtime");
     println!("WebView2 runtime {version}");
     let parts: Vec<u32> = version.split('.').map(|p| p.parse().expect("numeric")).collect();
-    assert_eq!(parts.len(), 4, "{version}");
-    assert!(parts[0] >= 86, "{version} is older than the loader's minimum");
+    if cfg!(target_os = "macos") {
+        // WebKit's `CFBundleVersion`: `21624.2.5.11.8` on the development host, Safari 26's WebKit.
+        assert!(parts.len() >= 3 && parts[0] >= 600, "{version} is not a WebKit build number");
+    } else {
+        assert_eq!(parts.len(), 4, "{version}");
+        assert!(parts[0] >= 86, "{version} is older than the loader's minimum");
+    }
 }
 
 /// The first event is `Ready`, then the navigation starts and completes, and the page's

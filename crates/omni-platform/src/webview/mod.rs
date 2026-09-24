@@ -121,10 +121,16 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod unix;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use unix as backend;
+
+// macOS: `WKWebView` on the window seam's AppKit thread (webview/macos.rs).
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as backend;
 
 /// The largest client extent accepted in either axis: `WM_SIZE` reports the client size in two
 /// 16-bit halves, the window seam's `MAX_EXTENT` reasoning.

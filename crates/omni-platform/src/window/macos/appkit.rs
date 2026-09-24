@@ -50,7 +50,7 @@ pub(super) fn started() -> bool {
 ///
 /// `Regular` rather than `Accessory` because a window that cannot become key cannot receive
 /// keystrokes, and the window this seam makes is the application's whole interface.
-fn start_application(mtm: MainThreadMarker) {
+pub(crate) fn start_application(mtm: MainThreadMarker) {
     if started() {
         return;
     }

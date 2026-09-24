@@ -128,6 +128,9 @@ use linux as backend;
 mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
+/// The AppKit thread, for the web view seam's macOS backend (`webview::macos`).
+#[cfg(target_os = "macos")]
+pub(crate) use macos::appkit_thread;
 
 /// The macOS backend's physical-key table, re-exported **only** so that
 /// `tests/window_keys_macos.rs` can check it key by key against its one consumer,

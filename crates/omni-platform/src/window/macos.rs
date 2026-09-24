@@ -44,6 +44,13 @@ mod main_thread;
 
 use main_thread::{on_main, Status};
 
+/// The AppKit thread this module owns, for the one other seam that needs it: the web view
+/// (`crate::webview`'s macOS backend), whose `WKWebView` is main-thread-only exactly as a window is.
+pub(crate) mod appkit_thread {
+    pub(crate) use super::appkit::start_application;
+    pub(crate) use super::main_thread::{on_main, status, Status};
+}
+
 /// The queue between the AppKit thread, which fills it, and the proxy's thread, which drains it.
 pub(super) struct Shared {
     events: Mutex<Vec<WindowEvent>>,

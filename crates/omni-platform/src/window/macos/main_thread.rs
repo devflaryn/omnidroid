@@ -483,9 +483,9 @@ pub(super) fn stop_run_loop() {
 /// libdispatch -- and resumed here, on the caller's thread.
 ///
 /// The caller must have seen [`status`] answer [`Status::Serving`]: with no AppKit thread the main
-/// queue is never drained and this would wait for ever. `super::Window::create` is the one gate,
-/// and every other entry point needs a `Window`.
-pub(super) fn on_main<R, F: FnOnce(MainThreadMarker) -> R>(work: F) -> R {
+/// queue is never drained and this would wait for ever. `super::Window::create` and the web view
+/// seam's `open` are the gates, and every other entry point needs what they made.
+pub(crate) fn on_main<R, F: FnOnce(MainThreadMarker) -> R>(work: F) -> R {
     if let Some(mtm) = MainThreadMarker::new() {
         return work(mtm);
     }
