@@ -228,6 +228,7 @@ name = "omni-gfx"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "libloading",
  "omni-android",
  "omni-platform",
  "omni-texture",
