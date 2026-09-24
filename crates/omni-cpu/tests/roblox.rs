@@ -812,7 +812,21 @@ const MAX_OTHER_PER_JIT_BYTES: u64 = 2 * 1024 * 1024;
 /// is the detector for both halves of the patch, each MEASURED by hand-applying it (2026-09-24):
 /// the table allocated again, 20.48 MiB; the 16 MiB prelude commit back, 8.49 MiB (capped at this
 /// test's 8 MiB cache). The 32 MiB this was before 0017 could see neither.
+///
+/// **On Linux the counter charges the whole code cache at once**, so there it is 10 MiB. The
+/// counter there is `Committed_AS` (`omni_platform::vm::process_commit_charge`), which the kernel
+/// charges for a private writable mapping when it is *made*; dynarmic's cache is one such `mmap`,
+/// and its `EnsureMemoryCommitted` -- the step 0017 trims -- is a Windows mechanism with nothing to
+/// do on a host with no reserve/commit split. MEASURED on the Linux x86-64 host after the merge:
+/// 8.364 MiB per thread at creation, 8.410 after translating, i.e. the 8 MiB cache plus the same
+/// residue. So the prelude half of 0017 is unobservable there, and 10 MiB (the cache plus
+/// [`MAX_OTHER_PER_JIT_BYTES`]) keeps the half that is: the 16 MiB table allocated again would read
+/// 24 MiB. macOS's counter (`phys_footprint`) counts touched pages, as Windows' does commits, and
+/// is held to 6 MiB.
+#[cfg(not(target_os = "linux"))]
 const MAX_THREAD_COMMIT_BYTES: u64 = 6 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_THREAD_COMMIT_BYTES: u64 = 8 * 1024 * 1024 + MAX_OTHER_PER_JIT_BYTES;
 
 /// The per-slice callback invariant, on real engine code: armed, and clean across a whole sweep.
 #[test]

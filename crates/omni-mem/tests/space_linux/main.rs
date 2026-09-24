@@ -1599,13 +1599,17 @@ fn a_scan_of_an_unreadable_address_refuses_with_the_rule_that_said_no() {
     );
 }
 
-/// **...but it may not straddle out of its mapping.**
+/// **...and it may straddle into an adjacent mapping, as it may on Linux.**
 ///
-/// The over-correction a span fix invites: letting the walk run past the end of the mapping into
-/// whatever happens to be next. Two mappings placed adjacently are still two mappings, and an access
-/// that crosses from one into the other is a refusal, not a long access.
+/// This test used to assert the opposite -- "two mappings placed adjacently are still two mappings,
+/// and an access that crosses from one into the other is a refusal". Linux does not check accesses
+/// per mapping, and the real engine proved it: Roblox 2.739.691's `init_array[188]` `memset`s 256
+/// bytes across the seam between its last file-backed page and the `.bss` mapped after it, and the
+/// old rule stopped the engine there. What still refuses is free space, and a neighbour whose
+/// protection forbids the access. A lazily-committed neighbour is committed, and the extent reported
+/// stays inside the first mapping.
 #[test]
-fn an_access_may_not_straddle_from_one_mapping_into_another() {
+fn an_access_may_straddle_from_one_mapping_into_an_adjacent_one() {
     let space = space(64 * MIB);
     let granule = space.commit_granule();
     let first = space
@@ -1629,14 +1633,29 @@ fn an_access_may_not_straddle_from_one_mapping_into_another() {
     assert_eq!(second, first + granule, "the two mappings must be adjacent");
 
     space.ensure_committed(first, 1).expect("commit the first");
-    space.ensure_committed(second, 1).expect("commit the second");
 
-    // Inside either one: fine.
-    omni_mem::admit(&space, second, 8, omni_mem::FaultAccess::Read).expect("inside the second");
+    // Inside the first: fine.
+    omni_mem::admit(&space, first, 8, omni_mem::FaultAccess::Write).expect("inside the first");
 
-    // Across the seam between them: refused, even though both are mapped, committed and readable.
-    let refusal = omni_mem::admit(&space, second - 8, 16, omni_mem::FaultAccess::Read)
-        .expect_err("an access crossing from one mapping into another must be refused");
+    // Across the seam, into a neighbour that is mapped but not yet committed: admitted, and the
+    // neighbour's granule is committed by the same call.
+    let admitted = omni_mem::admit(&space, second - 8, 16, omni_mem::FaultAccess::Write)
+        .expect("an access crossing into an adjacent, writable mapping is an ordinary access");
+    assert!(admitted.committed >= granule, "the neighbour's granule was committed ({})", admitted.committed);
+    assert!(space.region_at(second).expect("the second mapping").is_committed());
+    assert_eq!(admitted.end, second, "the extent reported stops where the first mapping stops");
+    // SAFETY: both granules are committed read-write and belong to this test's space.
+    unsafe { core::ptr::write_bytes(space.ptr(second - 8, 16).expect("host pointer"), 0xA5, 16) };
+
+    // A neighbour whose protection forbids the access still refuses it.
+    space.protect(second, granule, Protection::Read).expect("drop the second to read-only");
+    let refusal = omni_mem::admit(&space, second - 8, 16, omni_mem::FaultAccess::Write)
+        .expect_err("a write reaching a read-only neighbour");
+    assert_eq!(refusal, omni_mem::Refusal::Protection);
+
+    // And free space past the second still ends any access.
+    let refusal = omni_mem::admit(&space, second + granule - 8, 16, omni_mem::FaultAccess::Read)
+        .expect_err("an access running into free space");
     assert_eq!(refusal, omni_mem::Refusal::NotMapped);
     assert_tiles_the_space(&space);
 }

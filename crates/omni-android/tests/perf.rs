@@ -69,6 +69,19 @@ fn registers_until_stopped() -> Vec<u32> {
 
 #[test]
 fn the_sampler_puts_monitor_contention_at_the_monitor_and_register_code_in_the_jit() {
+    // **By what the host can do, not by its architecture.** This file is x86-64 only because the
+    // guest programs are dynarmic's; the sampler behind them is a separate question, and only the
+    // Windows backend has one (`omni_platform::sampler`). An x86-64 Linux host has dynarmic and no
+    // sampler, so there the seam's typed refusal is what is asserted -- the structural-backend
+    // rule -- rather than a thread handle the host cannot give.
+    if let Err(error) = omni_platform::sampler::HostThread::current() {
+        assert!(
+            matches!(error, omni_platform::sampler::SamplerError::Unsupported { .. }),
+            "a host without a sampler must say so by name: {error:?}"
+        );
+        eprintln!("no sampler on this host: {error}");
+        return;
+    }
     omni_android::perf::keep_thread_records();
     let guest = Guest::new();
     let exclusive = guest.load(&exclusive_until_stopped());
