@@ -239,6 +239,19 @@ function is now a typed write fault and the dynarmic survey runs all 245,117 fun
 without an abort. Tests: `dynarmic-sys/tests/host_fault.rs` (both widths, read-only data of the test
 binary) and `omni-cpu/tests/exclusive_store_fault.rs` (the two real functions); row `mac-cpu-E1`.
 
+## Mutation rows (`python3 tools/mutate.py --only mac-`, the merged tree)
+
+**130 of 131 caught** (2026-09-24, `port-macos` after every merge; pre-flight 131/131 patterns match
+once, 31/31 commands pass unmutated; the tree was clean afterwards and `vendor/PIN.txt` touched
+again). The one row not caught is **`mac-cpu-A15`** (patch 0008 reverted: the memory-abort check
+loads the u32 halt word with a 64-bit `LDAR`), and it is not a hole in a test but an equivalent
+mutant *on this layout*. The M1 implements FEAT_LSE2, so an unaligned `LDAR` faults only when it
+crosses a 16-byte boundary; patches 0010/0011 changed `A64AddressSpace`'s size, which moved
+`halt_reason` in `Jit::Impl` to 4 mod 16, where the 64-bit load completes (reading 4 neighbouring
+bytes that `TST` masks off). Shown by hand, not assumed: the same mutation with a pad of 8 bytes
+before `halt_reason` (the word at 12 mod 16) aborts `host_fault`; with 0, 4 or 12 bytes it passes.
+0008 stays: the load is wrong at any offset and fatal at one the layout can move to.
+
 ## Still open, with the consequence
 
 * **Ten instances on 8 GB is not demonstrated** (four on this 16 GB Mac, 3.2 GB together). The next
