@@ -136,47 +136,79 @@ pub fn admit(
     // refused. Every existing fixture is `CommitPolicy::Eager`, which is one entry that is never
     // split, which is why nothing saw it.
     //
-    // The walk stops at the mapping, not at the entry: crossing into a *different* mapping is a real
-    // refusal, and so is crossing free space.
+    // **An access may also span mappings, provided every byte is mapped and permits it.** Linux
+    // checks an access page by page, not mapping by mapping: a `memset` that runs from a library's
+    // last file-backed page into the anonymous `.bss` mapped straight after it is an ordinary
+    // write on a device. MEASURED: Roblox 2.739.691's `init_array[188]` (link `0x1df98b0`) does
+    // exactly that -- 256 bytes at link `0x68b8fd8`, across the seam at `0x68b9000` between the
+    // third `PT_LOAD`'s tail page and its `.bss` -- and this check used to refuse it as
+    // `NotMapped`, which stopped the whole engine before its first frame. Crossing **free space**
+    // is still a refusal, and every entry the access touches still has to pass rules 1-3 itself.
     let anonymous = matches!(region.kind, RegionKind::Anonymous);
     let mut covered_end = region.end();
+    // Where the run of entries belonging to the *first* mapping ends. That, not `covered_end`, is
+    // what `Admitted::end` reports: `omni-cpu`'s fetch cache treats `[start, end)` as one extent,
+    // and it has never been told that an extent can change mapping in the middle.
+    let mut first_mapping_end: Option<GuestAddr> = None;
     let mut fully_committed = region.is_committed();
+    // Lazily-committed entries of *other* mappings the access reaches into, for rule 4 --
+    // `ensure_committed` clips to one mapping, so each needs its own call.
+    let mut other_owed: Vec<(GuestAddr, usize)> = Vec::new();
     admits_region(&region, address, access_end.min(covered_end) - address, access)?;
 
     while covered_end < access_end {
         let Some(next) = space.region_at(covered_end) else {
             return Err(Refusal::NotMapped);
         };
-        // Contiguous, and the same mapping. `mapping` is `None` for free space, so a `None == None`
-        // comparison must not be allowed to pass for two unrelated holes.
-        if next.start != covered_end || next.mapping.is_none() || next.mapping != region.mapping {
+        // Contiguous, and mapped. `mapping` is `None` for free space.
+        if next.start != covered_end || next.mapping.is_none() {
             return Err(Refusal::NotMapped);
         }
-        admits_region(&next, covered_end, access_end.min(next.end()) - covered_end, access)?;
+        let piece = access_end.min(next.end()) - covered_end;
+        admits_region(&next, covered_end, piece, access)?;
+        if next.mapping != region.mapping {
+            first_mapping_end.get_or_insert(covered_end);
+            if matches!(next.kind, RegionKind::Anonymous) && !next.is_committed() {
+                other_owed.push((covered_end, piece));
+            }
+        }
         fully_committed &= next.is_committed();
         covered_end = next.end();
     }
 
     // Rule 4.
-    let committed = if anonymous && !fully_committed {
+    let committed = if !fully_committed {
         // One byte would do for a fault, but the CPU callback knows the real length and a commit
         // that covered only the first byte of a straddling access would fault again immediately.
         // `ensure_committed` expands outwards to whole granules and clips to the mapping, and
-        // `commit_range` already walks entries, so a straddling commit is one call.
-        match space.ensure_committed(address, len.max(1)) {
-            Ok(bytes) => bytes,
-            Err(_) => return Err(Refusal::Commit),
+        // `commit_range` already walks entries, so a straddling commit inside one mapping is one
+        // call; each other anonymous mapping the access reaches is one more.
+        let mut bytes = 0;
+        if anonymous {
+            let own = first_mapping_end.unwrap_or(access_end).min(access_end) - address;
+            match space.ensure_committed(address, own.max(1)) {
+                Ok(n) => bytes += n,
+                Err(_) => return Err(Refusal::Commit),
+            }
         }
+        for (at, piece) in other_owed {
+            match space.ensure_committed(at, piece) {
+                Ok(n) => bytes += n,
+                Err(_) => return Err(Refusal::Commit),
+            }
+        }
+        bytes
     } else {
         0
     };
 
     Ok(Admitted {
         start: region.start,
-        // The end of the last entry needed to cover the access, which for an access inside one entry
-        // is that entry's end exactly as before. `fully_committed` is the AND over those entries, so
-        // `omni-cpu`'s fetch cache keeps its contract: it only trusts `end` when that flag is set.
-        end: covered_end,
+        // The end of the last entry needed to cover the access **within the first mapping**, which
+        // for an access inside one entry is that entry's end exactly as before. `fully_committed`
+        // is the AND over every entry the access touched, so `omni-cpu`'s fetch cache keeps its
+        // contract: it only trusts `end` when that flag is set.
+        end: first_mapping_end.unwrap_or(covered_end),
         committed,
         fully_committed,
         anonymous,
