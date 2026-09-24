@@ -11,12 +11,25 @@ policy acts on. It is read with `proc_pid_rusage(RUSAGE_INFO_V4)`, the same ledg
 missed.
 
 macOS only. Reads another process's usage, which a process may do for its own user's processes.
+
+    python3 tools/footprint_mac.py --launch 4 --stagger 90 --session 330 --out DIR
+
+starts the gate that many times, one after another (each with its own fresh `OMNI_DATA_DIR`, its
+own log and window), samples every instance's footprint and the system's compressor, swap and
+`kern.memorystatus_level` every 2 s into `DIR/samples.csv`, and writes each instance's exit code and
+whether it reached the landing screen to `DIR/meta.txt`. `docs/ports/macos-memory.md` has what it
+measured.
 """
 
 import argparse
 import ctypes
+import glob
+import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 RUSAGE_INFO_V4 = 4
@@ -83,6 +96,87 @@ def newest_matching(name):
     return int(out.split()[0]) if out.split() else None
 
 
+GATE_TEST = "initialize_native_code_returns_a_native_code_and_the_game_thread_starts"
+
+
+def system_memory():
+    """The compressor, free pages, swap and the kernel's free-memory level, in MiB and percent."""
+    text = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(re.search(r"page size of (\d+)", text).group(1))
+
+    def pages(name):
+        found = re.search(name + r":\s+(\d+)", text)
+        return int(found.group(1)) * page / MIB if found else float("nan")
+
+    swap = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
+    used = re.search(r"used = ([\d.]+)M", swap)
+    level = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True,
+                           text=True).stdout.strip()
+    return {
+        "compressor_mib": pages("Pages occupied by compressor"),
+        "compressed_mib": pages("Pages stored in compressor"),
+        "free_mib": pages("Pages free"),
+        "swap_used_mib": float(used.group(1)) if used else float("nan"),
+        "free_level_pct": int(level) if level.isdigit() else -1,
+    }
+
+
+def launch(args):
+    """Start `args.launch` gates `args.stagger` seconds apart and sample them all until they exit."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    binary = args.binary or max(
+        (p for p in glob.glob(root + "/target/release/deps/gameactivity-*") if not p.endswith(".d")),
+        key=os.path.getmtime)
+    os.makedirs(args.out, exist_ok=True)
+    meta = open(os.path.join(args.out, "meta.txt"), "w")
+    meta.write(f"binary {binary}\nn {args.launch} stagger {args.stagger} session {args.session}\n")
+    meta.write(f"system at start: {system_memory()}\n")
+    procs, dirs, rows = [], [], []
+    start = time.time()
+    next_start = start
+    while True:
+        now = time.time()
+        if len(procs) < args.launch and now >= next_start:
+            data = tempfile.mkdtemp(prefix=f"omni-footprint-{len(procs)}-")
+            dirs.append(data)
+            env = dict(os.environ, OMNI_M6_ROWS_21_22="1", OMNI_GFX_WINDOW_TESTS="1",
+                       OMNI_KEYBOARD_MOUSE="1", OMNI_SESSION_SECONDS=str(args.session),
+                       OMNI_DATA_DIR=data)
+            log = open(os.path.join(args.out, f"gate{len(procs)}.log"), "w")
+            proc = subprocess.Popen([binary, "--nocapture", "--test-threads=1", GATE_TEST],
+                                    cwd=os.path.join(root, "crates", "omni-android"), env=env,
+                                    stdout=log, stderr=subprocess.STDOUT)
+            procs.append((proc, now - start, log))
+            next_start = now + args.stagger
+        footprints = []
+        for proc, _, _ in procs:
+            info = sample(proc.pid) if proc.poll() is None else None
+            footprints.append(info.ri_phys_footprint / MIB if info else 0.0)
+        rows.append((now - start, footprints, system_memory()))
+        if len(procs) == args.launch and all(p.poll() is not None for p, _, _ in procs):
+            break
+        time.sleep(2)
+    with open(os.path.join(args.out, "samples.csv"), "w") as out:
+        out.write("t," + ",".join(f"fp{i}" for i in range(args.launch)) +
+                  ",total,compressor_mib,compressed_mib,free_mib,swap_used_mib,free_level_pct\n")
+        for at, footprints, system in rows:
+            footprints = footprints + [0.0] * (args.launch - len(footprints))
+            out.write(f"{at:.1f}," + ",".join(f"{v:.1f}" for v in footprints) +
+                      f",{sum(footprints):.1f},{system['compressor_mib']:.1f},"
+                      f"{system['compressed_mib']:.1f},{system['free_mib']:.1f},"
+                      f"{system['swap_used_mib']:.1f},{system['free_level_pct']}\n")
+    for index, (proc, started, log) in enumerate(procs):
+        log.close()
+        text = open(os.path.join(args.out, f"gate{index}.log"), errors="replace").read()
+        meta.write(f"instance {index}: started +{started:.0f}s pid {proc.pid} exit {proc.returncode} "
+                   f"landing_lines {text.count('data(Landing)')}\n")
+    meta.close()
+    for data in dirs:
+        shutil.rmtree(data, ignore_errors=True)
+    print(open(os.path.join(args.out, "meta.txt")).read())
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pid", type=int)
@@ -90,7 +184,14 @@ def main():
     parser.add_argument("--every", type=float, default=1.0)
     parser.add_argument("--seconds", type=float, default=0.0, help="0: until the process exits")
     parser.add_argument("--csv")
+    parser.add_argument("--launch", type=int, help="start this many gates, one after another")
+    parser.add_argument("--stagger", type=float, default=90.0)
+    parser.add_argument("--session", type=int, default=330)
+    parser.add_argument("--out", default="footprint-instances")
+    parser.add_argument("--binary", help="the gate binary (default: the newest gameactivity-*)")
     args = parser.parse_args()
+    if args.launch:
+        return launch(args)
     pid = args.pid
     if pid is None and args.match:
         deadline = time.time() + 120
