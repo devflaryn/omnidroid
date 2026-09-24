@@ -365,6 +365,36 @@ per block still held without the patch, 1 with it**; the chain then runs again, 
 Rows mac-mem-A7 (reverted) and mac-mem-B2 (every invalidation clears: `a64_exec`'s test that a
 small invalidation spares the other translations must fail).
 
+### 0013 — arm64: the bookkeeping's large arrays are pages of their own
+
+`0013-arm64-page-backed-bookkeeping.patch`. **arm64 only.** A new header,
+`backend/arm64/page_backed_allocator.h`: `PageBackedAllocator<T>` maps an array of at least 256 KiB
+anonymously (`mmap`) and unmaps it when it is freed; a smaller one uses `operator new` as before. The
+containers of 0010-0011 -- `block_entries`, the three record vectors, `link_heads`, `guest_ranges` and
+the page index -- allocate through it.
+
+**Why.** Those containers grow by doubling and `ClearCache` gives them back whole, so their large
+arrays are allocated and freed many times over a jit's life -- and a large array freed through the
+C++ heap is the host allocator's to keep, dirty and charged to the process.
+
+`tests/bookkeeping.rs` measures `phys_footprint` around a clear of 32,768 blocks' bookkeeping
+(11.4 MiB, counted as the zones' bytes in use plus the allocator's mapped bytes, which the shim
+reports through a new `od_page_backed_bytes()`; the footprint instrument is first shown seeing 16 MiB
+touched): **the clear took 9.06 MiB off the footprint with the patch, 0.00 MiB with no array
+page-backed** (the threshold set out of reach, n = 2), and the bound is three quarters of what was
+held. Row mac-mem-A8 is that mutation.
+
+**In the gate** (+60 s): `MALLOC_LARGE` in use went from 85-113 MiB (n = 3, after 0012) to no
+in-use region at all (n = 3) -- the arrays are now mappings, charged for the pages written rather than for a
+vector's spare capacity -- and the landing-screen footprint from 876-892 MiB (n = 3) to 811-841 MiB
+(n = 4). **A correction, recorded because it was nearly carried as the reason for this patch:** at
+the landing screen `vmmap` also shows 46-63 MiB of dirty `MALLOC_LARGE (empty)` regions -- freed
+large blocks the allocator keeps -- and their sizes (3-14 MiB) suggested these arrays. With the patch
+they are still there (55-61 MiB, n = 3), so they are someone else's; they are not attributed here.
+
+`od_page_backed_bytes()` is additive in the shim (`od_dynarmic.h`): no struct or existing signature
+changes, so `OD_DYNARMIC_ABI_VERSION` stands; it answers 0 where the arm64 backend is not built.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

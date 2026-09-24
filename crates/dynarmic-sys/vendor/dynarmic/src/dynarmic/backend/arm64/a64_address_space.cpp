@@ -561,7 +561,7 @@ void A64AddressSpace::ClearCache() {
     // is gone, so nothing registered before the clear can name a block that exists: a location
     // translated again afterwards registers the range of its new translation, which is the range
     // its code now depends on.
-    std::vector<GuestRange>{}.swap(guest_ranges);
+    decltype(guest_ranges){}.swap(guest_ranges);
     guest_range_pages = {};
     std::vector<u32>{}.swap(wide_guest_ranges);
 }

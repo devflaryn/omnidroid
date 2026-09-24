@@ -32,14 +32,47 @@ struct MallocStatistics {
 
 extern "C" {
     fn malloc_zone_statistics(zone: *mut core::ffi::c_void, stats: *mut MallocStatistics);
+    /// The shim's count of what patch 0013's allocator has mapped (`od_dynarmic.h`).
+    fn od_page_backed_bytes() -> u64;
 }
 
-/// Bytes the allocator has handed out and not had back, over every zone.
+/// Bytes the allocator has handed out and not had back, over every zone, plus what the backend's
+/// bookkeeping holds in pages of its own (patch 0013), which the zones do not see.
 fn heap_in_use() -> usize {
     let mut stats = MallocStatistics::default();
     // SAFETY: a null zone asks for the sum over all zones; `stats` is writable.
     unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
-    stats.size_in_use
+    // SAFETY: no arguments; reads an atomic counter.
+    stats.size_in_use + unsafe { od_page_backed_bytes() } as usize
+}
+
+/// `task_vm_info_data_t` up to `phys_footprint` (`<mach/task_info.h>`, `#pragma pack(4)`), as in
+/// `code_cache_charge.rs`.
+#[repr(C, packed(4))]
+#[derive(Default)]
+struct TaskVmInfo {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    counters: [u64; 14],
+    phys_footprint: u64,
+}
+
+extern "C" {
+    static mach_task_self_: u32;
+    fn task_info(task: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+}
+
+/// What the kernel charges this process: `phys_footprint`.
+fn footprint() -> usize {
+    let mut info = TaskVmInfo::default();
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+    // SAFETY: `info` is writable for `count` words; TASK_VM_INFO is flavor 22.
+    let kr = unsafe { task_info(mach_task_self_, 22, std::ptr::addr_of_mut!(info).cast(), &mut count) };
+    assert_eq!(kr, 0, "task_info(TASK_VM_INFO)");
+    info.phys_footprint as usize
 }
 
 fn lock() -> std::sync::MutexGuard<'static, ()> {
@@ -56,6 +89,20 @@ fn the_heap_reading_sees_an_allocation() {
     let grew = heap_in_use() as f64 - before as f64;
     // Not exactly 16 MiB: the test harness's own threads allocate and free around this one.
     assert!(grew >= (15 << 20) as f64, "a 16 MiB allocation moved the reading by only {grew} bytes");
+}
+
+/// The second instrument: touching memory must move the footprint.
+#[test]
+fn the_footprint_reading_sees_memory_being_touched() {
+    let _g = lock();
+    let before = footprint();
+    let mut block = vec![0u8; 16 << 20];
+    for page in block.chunks_mut(16384) {
+        page[0] = 1;
+    }
+    std::hint::black_box(&block);
+    let grew = footprint() as f64 - before as f64;
+    assert!(grew >= (15 << 20) as f64, "touching 16 MiB moved the footprint by only {grew} bytes");
 }
 
 /// `blocks` blocks of `LDR X3, [X2] ; B .+4` -- one fastmem patch site and one link each -- and an
@@ -328,4 +375,39 @@ fn an_invalidation_that_leaves_no_block_standing_gives_their_bookkeeping_back() 
     vm.reset_stats();
     run_chain(&vm);
     assert!(vm.stats().read_code >= 2 * BLOCKS as u64, "the chain was translated again");
+}
+
+#[test]
+fn a_cleared_caches_bookkeeping_goes_back_to_the_kernel() {
+    let _g = lock();
+    // Patch 0013. `ClearCache` gives its arrays back (0010-0012); this is about where they go. Freed
+    // through the C++ heap, a large array is the host allocator's to keep, and the kernel goes on
+    // charging the process for it. So the measure here is `phys_footprint`, around a clear.
+    run_chain(&chain_vm());
+
+    let vm = chain_vm();
+    let created = heap_in_use();
+    run_chain(&vm);
+    let held = heap_in_use() - created;
+    let charged = footprint();
+
+    // SAFETY: `vm.raw()` is live and not executing.
+    unsafe { dynarmic_sys::od_jit_clear_cache(vm.raw()) };
+    vm.set_pc(CODE_BASE + 4 * (2 * BLOCKS as u64));
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE, "the SVC after the clear");
+    let returned = charged as f64 - footprint() as f64;
+
+    eprintln!(
+        "bookkeeping held {:.2} MiB for {BLOCKS} blocks; the clear took {:.2} MiB off the footprint",
+        held as f64 / 1048576.0,
+        returned / 1048576.0
+    );
+    assert!(held > 4 << 20, "the chain's bookkeeping was measured: {held} bytes");
+    assert!(
+        returned >= 0.75 * held as f64,
+        "the clear gave the kernel back {:.2} MiB of the {:.2} MiB the bookkeeping held: the rest is \
+         still charged to the process",
+        returned / 1048576.0,
+        held as f64 / 1048576.0
+    );
 }

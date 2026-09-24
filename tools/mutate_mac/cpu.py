@@ -293,7 +293,7 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
     # --- mac-mem: patch 0011, the guest-range index -----------------------------------------------
     ("mac-mem-A3", "A", "0011: the A64 clear leaves the guest ranges behind (the pin's leak)",
      ARM64 + "a64_address_space.cpp",
-     """    std::vector<GuestRange>{}.swap(guest_ranges);
+     """    decltype(guest_ranges){}.swap(guest_ranges);
     guest_range_pages = {};
     std::vector<u32>{}.swap(wide_guest_ranges);
 }""",
@@ -339,4 +339,11 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
     }""",
      """    ClearCache();""",
      dyn("a64_exec")),
+    # --- mac-mem: patch 0013, the bookkeeping's large arrays are pages of their own ----------------
+    ("mac-mem-A8", "A", "0013 reverted in effect: no array is large enough to be page-backed, so every "
+     "freed one goes back to the C++ heap",
+     ARM64 + "page_backed_allocator.h",
+     """    static constexpr std::size_t threshold = 256 * 1024;""",
+     """    static constexpr std::size_t threshold = ~std::size_t{0};""",
+     dyn("bookkeeping")),
 ]

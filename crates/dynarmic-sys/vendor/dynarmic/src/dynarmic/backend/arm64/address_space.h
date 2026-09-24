@@ -17,6 +17,7 @@
 
 #include "dynarmic/backend/arm64/emit_arm64.h"
 #include "dynarmic/backend/arm64/fastmem.h"
+#include "dynarmic/backend/arm64/page_backed_allocator.h"
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/location_descriptor.h"
@@ -79,7 +80,13 @@ protected:
 
     // A IR::LocationDescriptor will have one current CodePtr.
     // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.
-    tsl::robin_map<IR::LocationDescriptor, CodePtr> block_entries;
+    // Omnidroid patch 0013: this and the records below allocate through `PageBackedAllocator`.
+    template<typename K, typename V>
+    using PageBackedMap = tsl::robin_map<K, V, std::hash<K>, std::equal_to<K>, PageBackedAllocator<std::pair<K, V>>>;
+    template<typename T>
+    using PageBackedVector = std::vector<T, PageBackedAllocator<T>>;
+
+    PageBackedMap<IR::LocationDescriptor, CodePtr> block_entries;
 
     // Omnidroid patch 0010: what is kept of each emitted block, compactly.
     //
@@ -118,12 +125,12 @@ protected:
     };
     static constexpr u32 no_link = ~u32{0};
 
-    std::vector<BlockRecord> block_records;
-    std::vector<FastmemRecord> fastmem_records;  ///< Grouped by block, ascending `offset` within a block.
-    std::vector<LinkRecord> link_records;
+    PageBackedVector<BlockRecord> block_records;
+    PageBackedVector<FastmemRecord> fastmem_records;  ///< Grouped by block, ascending `offset` within a block.
+    PageBackedVector<LinkRecord> link_records;
     /// The newest `LinkRecord` for each link target. A block's records for one target are adjacent
     /// in the chain.
-    tsl::robin_map<IR::LocationDescriptor, u32> link_heads;
+    PageBackedMap<IR::LocationDescriptor, u32> link_heads;
 
     u32 RecordBlock(IR::LocationDescriptor location, const EmittedBlockInfo& block_info);
     const BlockRecord* FindBlockRecord(CodePtr host_pc) const;

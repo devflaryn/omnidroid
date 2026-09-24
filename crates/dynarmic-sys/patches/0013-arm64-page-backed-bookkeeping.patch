@@ -1,0 +1,179 @@
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+index c18189c..8c2021a 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -561,7 +561,7 @@ void A64AddressSpace::ClearCache() {
+     // is gone, so nothing registered before the clear can name a block that exists: a location
+     // translated again afterwards registers the range of its new translation, which is the range
+     // its code now depends on.
+-    std::vector<GuestRange>{}.swap(guest_ranges);
++    decltype(guest_ranges){}.swap(guest_ranges);
+     guest_range_pages = {};
+     std::vector<u32>{}.swap(wide_guest_ranges);
+ }
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.h b/src/dynarmic/backend/arm64/a64_address_space.h
+index f70fa79..cd63f6c 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.h
++++ b/src/dynarmic/backend/arm64/a64_address_space.h
+@@ -50,8 +50,8 @@ protected:
+     /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
+     /// invalidation, instead of in every page it covers.
+     static constexpr u64 max_indexed_pages = 64;
+-    std::vector<GuestRange> guest_ranges;
+-    tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
++    PageBackedVector<GuestRange> guest_ranges;
++    PageBackedMap<u64, std::vector<u32>> guest_range_pages;
+     std::vector<u32> wide_guest_ranges;
+ };
+ 
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 4edaaa3..3dba02b 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -102,9 +102,9 @@ void AddressSpace::ClearCache() {
+     // Omnidroid patch 0010: given back rather than cleared (`clear()` keeps a robin_map's buckets
+     // and a vector's capacity), so a cleared cache holds no memory for the blocks it no longer has.
+     block_entries = {};
+-    std::vector<BlockRecord>{}.swap(block_records);
+-    std::vector<FastmemRecord>{}.swap(fastmem_records);
+-    std::vector<LinkRecord>{}.swap(link_records);
++    decltype(block_records){}.swap(block_records);
++    decltype(fastmem_records){}.swap(fastmem_records);
++    decltype(link_records){}.swap(link_records);
+     link_heads = {};
+     code.set_offset(prelude_info.end_of_prelude);
+ }
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 8217abd..f39bdae 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -17,6 +17,7 @@
+ 
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+ #include "dynarmic/backend/arm64/fastmem.h"
++#include "dynarmic/backend/arm64/page_backed_allocator.h"
+ #include "dynarmic/interface/halt_reason.h"
+ #include "dynarmic/ir/basic_block.h"
+ #include "dynarmic/ir/location_descriptor.h"
+@@ -79,7 +80,13 @@ protected:
+ 
+     // A IR::LocationDescriptor will have one current CodePtr.
+     // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.
+-    tsl::robin_map<IR::LocationDescriptor, CodePtr> block_entries;
++    // Omnidroid patch 0013: this and the records below allocate through `PageBackedAllocator`.
++    template<typename K, typename V>
++    using PageBackedMap = tsl::robin_map<K, V, std::hash<K>, std::equal_to<K>, PageBackedAllocator<std::pair<K, V>>>;
++    template<typename T>
++    using PageBackedVector = std::vector<T, PageBackedAllocator<T>>;
++
++    PageBackedMap<IR::LocationDescriptor, CodePtr> block_entries;
+ 
+     // Omnidroid patch 0010: what is kept of each emitted block, compactly.
+     //
+@@ -118,12 +125,12 @@ protected:
+     };
+     static constexpr u32 no_link = ~u32{0};
+ 
+-    std::vector<BlockRecord> block_records;
+-    std::vector<FastmemRecord> fastmem_records;  ///< Grouped by block, ascending `offset` within a block.
+-    std::vector<LinkRecord> link_records;
++    PageBackedVector<BlockRecord> block_records;
++    PageBackedVector<FastmemRecord> fastmem_records;  ///< Grouped by block, ascending `offset` within a block.
++    PageBackedVector<LinkRecord> link_records;
+     /// The newest `LinkRecord` for each link target. A block's records for one target are adjacent
+     /// in the chain.
+-    tsl::robin_map<IR::LocationDescriptor, u32> link_heads;
++    PageBackedMap<IR::LocationDescriptor, u32> link_heads;
+ 
+     u32 RecordBlock(IR::LocationDescriptor location, const EmittedBlockInfo& block_info);
+     const BlockRecord* FindBlockRecord(CodePtr host_pc) const;
+diff --git a/src/dynarmic/backend/arm64/page_backed_allocator.h b/src/dynarmic/backend/arm64/page_backed_allocator.h
+new file mode 100644
+index 0000000..30b82b6
+--- /dev/null
++++ b/src/dynarmic/backend/arm64/page_backed_allocator.h
+@@ -0,0 +1,84 @@
++/* Omnidroid patch 0013, carried against dynarmic (see crates/dynarmic-sys/patches/README.md).
++ * SPDX-License-Identifier: 0BSD
++ */
++
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <new>
++
++#if defined(__APPLE__) || defined(__unix__)
++#    include <sys/mman.h>
++#    include <unistd.h>
++#    define DYNARMIC_PAGE_BACKED_ALLOCATOR_MMAP 1
++#endif
++
++namespace Dynarmic::Backend::Arm64 {
++
++/// Bytes currently mapped by every `PageBackedAllocator`, for measurement (`od_page_backed_bytes`):
++/// what these arrays hold is no longer in the C++ heap's statistics.
++inline std::atomic<std::size_t> page_backed_bytes{0};
++
++/// An allocator for the address space's per-block bookkeeping that takes large arrays straight from
++/// the kernel and gives them straight back.
++///
++/// The bookkeeping grows by doubling and is given back whole by `ClearCache`, so its large arrays
++/// are allocated and freed many times over a jit's life. Through the C++ heap a freed large array is
++/// the host allocator's to keep, dirty and charged to the process: MEASURED on macOS
++/// (`tests/bookkeeping.rs`, n = 2), a clear of 11.4 MiB of bookkeeping took 0.00 MiB off
++/// `phys_footprint` through the heap and 9.06 MiB with this allocator. An array of at least
++/// `threshold` bytes is an anonymous mapping here -- charged for the pages that are touched, not for
++/// a vector's spare capacity -- and freeing it unmaps it; a smaller one uses `operator new` as
++/// before.
++template<typename T>
++struct PageBackedAllocator {
++    using value_type = T;
++    static constexpr std::size_t threshold = 256 * 1024;
++
++    PageBackedAllocator() noexcept = default;
++    template<typename U>
++    PageBackedAllocator(const PageBackedAllocator<U>&) noexcept {}
++
++    T* allocate(std::size_t n) {
++        const std::size_t bytes = n * sizeof(T);
++#ifdef DYNARMIC_PAGE_BACKED_ALLOCATOR_MMAP
++        if (bytes >= threshold) {
++            void* p = mmap(nullptr, RoundUp(bytes), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++            if (p == MAP_FAILED) {
++                throw std::bad_alloc{};
++            }
++            page_backed_bytes.fetch_add(RoundUp(bytes), std::memory_order_relaxed);
++            return static_cast<T*>(p);
++        }
++#endif
++        return static_cast<T*>(::operator new(bytes, std::align_val_t{alignof(T)}));
++    }
++
++    void deallocate(T* p, std::size_t n) noexcept {
++        const std::size_t bytes = n * sizeof(T);
++#ifdef DYNARMIC_PAGE_BACKED_ALLOCATOR_MMAP
++        if (bytes >= threshold) {
++            munmap(p, RoundUp(bytes));
++            page_backed_bytes.fetch_sub(RoundUp(bytes), std::memory_order_relaxed);
++            return;
++        }
++#endif
++        ::operator delete(p, std::align_val_t{alignof(T)});
++    }
++
++    template<typename U>
++    bool operator==(const PageBackedAllocator<U>&) const noexcept { return true; }
++    template<typename U>
++    bool operator!=(const PageBackedAllocator<U>&) const noexcept { return false; }
++
++private:
++#ifdef DYNARMIC_PAGE_BACKED_ALLOCATOR_MMAP
++    static std::size_t RoundUp(std::size_t bytes) {
++        const std::size_t page = static_cast<std::size_t>(getpagesize());
++        return (bytes + page - 1) / page * page;
++    }
++#endif
++};
++
++}  // namespace Dynarmic::Backend::Arm64

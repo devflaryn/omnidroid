@@ -102,9 +102,9 @@ void AddressSpace::ClearCache() {
     // Omnidroid patch 0010: given back rather than cleared (`clear()` keeps a robin_map's buckets
     // and a vector's capacity), so a cleared cache holds no memory for the blocks it no longer has.
     block_entries = {};
-    std::vector<BlockRecord>{}.swap(block_records);
-    std::vector<FastmemRecord>{}.swap(fastmem_records);
-    std::vector<LinkRecord>{}.swap(link_records);
+    decltype(block_records){}.swap(block_records);
+    decltype(fastmem_records){}.swap(fastmem_records);
+    decltype(link_records){}.swap(link_records);
     link_heads = {};
     code.set_offset(prelude_info.end_of_prelude);
 }

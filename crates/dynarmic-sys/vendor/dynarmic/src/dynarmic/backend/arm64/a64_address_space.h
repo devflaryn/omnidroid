@@ -50,8 +50,8 @@ protected:
     /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
     /// invalidation, instead of in every page it covers.
     static constexpr u64 max_indexed_pages = 64;
-    std::vector<GuestRange> guest_ranges;
-    tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
+    PageBackedVector<GuestRange> guest_ranges;
+    PageBackedMap<u64, std::vector<u32>> guest_range_pages;
     std::vector<u32> wide_guest_ranges;
 };
 

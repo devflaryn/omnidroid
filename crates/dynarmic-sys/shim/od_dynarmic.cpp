@@ -18,6 +18,9 @@
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/interface/optimization_flags.h"
+#if defined(__aarch64__)
+#    include "dynarmic/backend/arm64/page_backed_allocator.h"
+#endif
 
 namespace {
 
@@ -546,6 +549,14 @@ uint64_t od_jit_last_svc_return_address(void* p) {
 
 uint64_t od_jit_slow_path_total(void* p) {
     return as_jit(p)->callbacks.stats.slow_path_total;
+}
+
+uint64_t od_page_backed_bytes(void) {
+#if defined(__aarch64__)
+    return static_cast<uint64_t>(Dynarmic::Backend::Arm64::page_backed_bytes.load(std::memory_order_relaxed));
+#else
+    return 0;
+#endif
 }
 
 }  // extern "C"
