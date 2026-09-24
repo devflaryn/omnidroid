@@ -820,6 +820,24 @@ fn believed_sysconf_name(name: i32) -> Option<&'static str> {
 /// the same source `getauxval(AT_PAGESZ)` answers from — so the two cannot disagree, which they
 /// could if this had its own constant. bionic implements `sysconf(_SC_PAGESIZE)` as
 /// `getauxval(AT_PAGESZ)` for exactly that reason.
+/// The processor count the guest is told: the host's, or fewer when `OMNI_GUEST_CPUS=<n>` asks
+/// for a device with `n` cores (never more than the host has).
+///
+/// **A device property, like the screen's size.** The engine sizes its TaskScheduler from this
+/// answer (`TaskScheduler: 16` on a 24-thread host; a phone reports 8), and every worker it starts
+/// here is a guest thread with its own code cache that translates what it runs. The switch is
+/// read once and said on stderr.
+fn guest_cpu_count(host: usize) -> usize {
+    static CHOSEN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let chosen = CHOSEN.get_or_init(|| {
+        let asked = std::env::var("OMNI_GUEST_CPUS").ok()?.trim().parse::<usize>().ok()?;
+        let n = asked.clamp(1, host);
+        eprintln!("CPUS: the guest is told {n} processor(s) (OMNI_GUEST_CPUS={asked}; the host has {host})");
+        Some(n)
+    });
+    chosen.unwrap_or(host)
+}
+
 pub(super) fn sysconf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let name = c.args().next_i32()?;
     let state = active(c.symbol(), c.address())?;
@@ -837,7 +855,7 @@ pub(super) fn sysconf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             // M7 was this exact substitution one layer down.
             match omni_platform::process::cpu_count() {
                 Ok(count) => {
-                    let n = count.get();
+                    let n = guest_cpu_count(count.get());
                     let Ok(narrowed) = i64::try_from(n) else {
                         return Err(refuse(
                             c,
