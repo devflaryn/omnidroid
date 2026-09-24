@@ -906,6 +906,26 @@ Read in this order:
 
 ## 2026-09-24 Windows (`perf-windows`): the close, the relaunch, memory on demand -- read this first
 
+**Read this first of all: the owner's APK now fails Roblox's integrity check** ("Roblox detected
+missing or corrupted files. Please uninstall and reinstall Roblox from an official app store"),
+most likely because it is out of date. The owner will update it (2026-09-25 morning) and asked
+for **no more real-game tests until then**. Everything after `c6e7c0d` below was therefore measured
+on the landing and in benchmarks, **not in a world**. The first thing to do with the updated APK is
+re-take the one in-world profile (606849621, `OMNI_PERF=5`, idle camera) to measure the three
+changes together -- and before that, re-check `docs/research/jni-surface.md` §8 against the new
+`libroblox.so` (link addresses such as `0x230a9f4` will have moved).
+
+**The launch at the tip, confirmed** (`05efab2`, play worktree, fresh data directory, logged out,
+150 s, n = 1): Landing (`APP_READY`) at +28 s, then a steady 300 presents per 5 s to the end, no
+guest thread died, a clean close (`SessionHistory "IB"`), gate passed. Log:
+`<scratchpad>/runs/launch-05efab2.log`.
+
+**When a checkout changes vendored dynarmic C++, touch `crates/dynarmic-sys/vendor/PIN.txt`**
+before building. The build script watches only that file, so a worktree moved to a commit with a
+new patch otherwise links the OLD dynarmic. With 0003 that is the unsafe combination: the RSB left
+on in `INTERRUPTIBLE` with an unchecked handler. After building, run `the_stoppability_matrix`
+in that worktree: its `return` cells prove the patch is in.
+
 Full record, merge notes and every figure: **`docs/ports/windows.md`**. In short:
 
 * **Done and committed** (`ced3e1d`..`fa7e136`): `perf-world` reviewed and merged (4 fixes);
@@ -925,15 +945,25 @@ Full record, merge notes and every figure: **`docs/ports/windows.md`**. In short
   `app_webview/`), the script registers the handler and makes the startup call; verified live (a
   second launch received the first's cookies; values never logged). **Sign in once with the new
   build and every later launch of that directory, or a copy of it, starts signed in.**
-* **Performance was NOT measured in a world**: the first sign-in window stood 43 minutes unused; at
-  the second the owner joined 606849621 directly and the world died loading (raw `svc`, then
-  `atol` -- both fixed in `c6e7c0d`). Nothing on the performance leads was changed without
-  in-world evidence; the landing shows none of them (one hot thread; `docs/ports/windows.md`).
+* **One in-world profile, three changes from it** (606849621, n = 1, idle camera, ~12 fps, signed
+  in; `docs/ports/windows.md`, "Step 3"):
+  - `208c4c8`: the engine's allocator mapping, discarding and unmapping DATA broadcast ~240 code
+    invalidations a second to every thread, overflowing their 64-entry queues into whole-cache
+    wipes. Only ranges that were executable now invalidate: landing re-translation -75%.
+  - `bae4b92`: busiest workers spent 3-8.5% of samples at the global exclusive monitor. D31 is now
+    decided for value-compare (131 → 12.8 ns per guest atomic).
+  - Vendored **patch 0003** (D33): a return-stack-buffer hit checks the budget and the halt flag,
+    so `INTERRUPTIBLE` keeps the RSB (`0xFFF9` → `0xFFFB`): 132.0 → 24.1 ns per call and return at
+    262,144 blocks. Matrix 27 → 39 cells; both checks proven by hand mutation; upstream suite
+    unchanged.
+  Still open from the profile: the game loop's `ALooper_pollOnce` + mutex spin, and the ~12 fps.
 
 ### The in-world protocol (needs the owner for the sign-in and the join; ~5 min per run)
 
 GoodbyeDPI (not a VPN) broke teleports on 09-23, so measure in **place 606849621**, which is joined
-directly (no teleport). Play binary: `../omnidroid-play` at `c6e7c0d`, already built. Script:
+directly (no teleport). Play binary: `../omnidroid-play` at `05efab2` (detached), built with
+`OMNIDROID_DYNARMIC_BUILD_DIR='C:\odp-build'` (that build directory belongs to the play worktree;
+the main worktree must not use it). Script:
 `<scratchpad>/play.sh <data-dir-name> <log-name> [ENV=...]` (session until the window is closed).
 
 1. Master: `play.sh data-master-0924 master` -- the owner signs in (Quick Sign-in), waits for
@@ -943,12 +973,17 @@ directly (no teleport). Play binary: `../omnidroid-play` at `c6e7c0d`, already b
    per 5 s (FRAMES), `[SlowBenchmark]`/`[SlowModule]`, and the `PERF` blocks (per thread: jit / mon
    / dyn / hnd shares, crossings, translation). n >= 2 per arm.
 3. Arms, one switch each against the default: `OMNI_IMPORT_CENSUS=off`,
-   `OMNI_JIT_EXCLUSIVE_MONITOR=value` (D31 decides on this), `OMNI_JIT_CACHE_MB=128` (load-phase
-   retranslation: -40% on the landing). Change the default only where a world shows the difference.
+   `OMNI_JIT_EXCLUSIVE_MONITOR=global` (value-compare is now the default, D31),
+   `OMNI_JIT_CACHE_MB=128` (load-phase retranslation: -40% on the landing). Change a default only
+   where a world shows the difference.
+4. A signed-in master exists: `%LOCALAPPDATA%\Omnidroid\data-master-0924c` (and a `-KEEP` copy).
+   It holds the owner's session cookie -- never copy it anywhere but the owner's machine. It may not
+   survive the APK update; if the app asks for a sign-in, step 1 again.
 
 ### Still open, new tonight
 
-1. **In-world performance** (above) -- the goal's first item, unstarted for want of a session.
+1. **In-world performance** -- one profile taken, three changes made from it, none yet measured in
+   a world (above). Blocked on the owner's APK update.
 2. **The `InferredCrash` reporter** (`+0xc8` null at `0x2383500`) kills one worker at +5 s after any
    crash, and once on a fresh install; harmless to the run. Who sets it on a device: not decoded
    (its setter is not among the handle getter's twelve callers).

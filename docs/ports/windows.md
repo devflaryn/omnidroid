@@ -17,6 +17,11 @@ runs and scripts are in the session scratchpad (`0b762c51-…/scratchpad/runs`, 
 | `c18e0eb` | vendored dynarmic patch 0002 (D32): per-thread fixed JIT cost on demand |
 | `fa7e136` | `OMNI_IMPORT_CENSUS=off`, the in-world A/B switch for the census |
 | `c6e7c0d` | a guest's raw `SVC #0` answered by the syscall emulation (kernel convention: `-errno` in `x0`, `errno` untouched; `openat` → `open`); `atol`. The two deaths of the owner's first join of 606849621. Rows `svc-` 5/5, `atol-` 2/2 |
+| `56be27a` | docs: the first in-world join; the multi-instance measurement re-run with a data directory each |
+| `e2eba84` | the app's cookie store (`jni::cookies`) -- a sign-in survives a restart, as on a phone. Rows `cookie-` 6/6 |
+| `208c4c8` | translated code is invalidated only for ranges that were executable: -75% re-translation on the landing. Rows `inval-` 5/5 |
+| `bae4b92` | D31 decided: guest exclusives default to value-compare, not the global monitor. Row `monitor-A1` 1/1 |
+| `05efab2` | vendored dynarmic patch 0003 (D33): a return-stack-buffer hit checks the budget and the halt flag, so `INTERRUPTIBLE` keeps the RSB -- 132 → 24 ns per call and return at 262,144 blocks. Row `rsb-A1` 1/1 |
 
 Mutation: `inbound-` 10/10 (step 0, never run before), `vsprintf-` 6/6, `crashclose-` 3/3, each
 with the tree to itself. Patch 0002's two halves were proven by hand-applied regressions (the
@@ -88,7 +93,24 @@ and handed them back. Rows `cookie-`.
   blocks retranslated over +10..+40 s) for +340 MiB commit and no earlier Landing. **Default kept
   at 32**; `OMNI_JIT_CACHE_MB` is the in-world A/B.
 
-## Step 3: performance -- NOT YET MEASURED IN A WORLD
+## Step 3: performance
+
+**One in-world profile exists** (606849621, n = 1, idle camera, ~12 fps, 2026-09-24, signed in).
+Three causes were found in it and changed; **none of the three changes was measured in a world**,
+because the owner's APK then began failing Roblox's integrity check ("missing or corrupted files")
+and the owner asked for no more real-game runs until it is updated. What was measured instead:
+
+| change | the in-world evidence for it | measured after (not in a world) |
+|---|---|---|
+| `208c4c8`: invalidate only executable ranges | ~240 code invalidations/s reached every thread; 64-entry queues overflowed into whole-cache wipes; threads 9-33% in the translator | landing: re-translated blocks 387,688 → 96,833 (-75%), invalidations applied -87% |
+| `bae4b92`: value-compare exclusives (D31) | busiest workers 3-8.5% of samples at the global monitor | benchmark 131 → 12.8 ns per guest atomic; landing passes |
+| patch 0003: the RSB kept (D33) | (from the benchmark, not the profile) every `RET` was a dispatcher lookup | benchmark 132.0 → 24.1 ns per call and return at 262,144 blocks |
+
+Still open from the profile: the game loop's `ALooper_pollOnce` + mutex spin (thread g5), and the
+~12 fps itself. The owner's next session should re-take the same profile on the updated APK
+(`OMNI_PERF=1`, the same place) to measure the three together.
+
+### Before the profile (kept for the record)
 
 The first sign-in window stood open 43 minutes (to 01:26) with no sign-in and was closed cleanly.
 The second was signed in at ~02:41 and the owner joined 606849621 straight away: the world never
@@ -122,6 +144,17 @@ shared code are additive except where marked:
   dynarmic's arm64 backend, which this patch does not touch and which was **not examined** for the
   same per-thread costs; measure it there before assuming either way.
   `OD_FIXED_PER_JIT_BYTES` keeps its value; its meaning is now "when FastDispatch is on".
+  **Vendored patch 0003** changes `a64_emit_x64.cpp` (x64 backend only) and, **not additively**,
+  the value of `optimization::INTERRUPTIBLE`: `0xFFF9` → `0xFFFB` (it keeps `ReturnStackBuffer`).
+  An **arm64 host** builds dynarmic's arm64 backend, which this patch does not touch and whose
+  return-stack-buffer handling was **not examined**: run `the_stoppability_matrix` there -- its
+  `return` and `indirect-call` cells fail if that backend's handler does not check -- and keep
+  clearing `RETURN_STACK_BUFFER` on that target until they pass.
+* **`omni-cpu`** (later): `DynarmicOptions::default()` selects `ExclusiveMonitor::ValueCompare`
+  (D31); `OMNI_JIT_EXCLUSIVE_MONITOR=global` restores the old default.
+* **`omni-mem`** (later): `GuestSpace::any_executable(at, len)` (new, additive). `bionic::guestmem`
+  now invalidates only ranges that were executable before `munmap`/`mprotect`/`madvise`, and
+  `mmap` only for executable mappings.
 * **`omni-mem`**: `process_pager_totals()` (new).
 * **`omni-android`**: `perf` module (new); `jni::ExitRecord` gained `REASON_CRASH_NATIVE`,
   `SIGABRT`, `SIGSEGV`, `SIGILL`, `IMPORTANCE_FOREGROUND` and names reason 5; `Vulkan::slot_names`;
