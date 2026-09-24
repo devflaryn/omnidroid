@@ -59,8 +59,6 @@
 //! already record, and the same discipline applies: the derivation is written out field by field
 //! so it can be checked against a header rather than re-derived from memory.
 
-use std::time::{Duration, Instant};
-
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
 use omni_mem::GuestAddr;
@@ -75,7 +73,7 @@ use crate::error::AbiResult;
 use crate::mem::Blame;
 
 use super::view::GuestView;
-use super::{active, enter, MAX_SLEEP_SECONDS};
+use super::{active, enter, STOP_SLICE};
 
 // ================================================================== the guest's constants
 //
@@ -1017,29 +1015,20 @@ fn read_into_guest(
 /// The wait a **blocking** descriptor owes when the seam says the call would block.
 ///
 /// `omni-platform`'s pipe never waits and never decides how long a guest may block — that is this
-/// layer's policy, and it is the same policy `poll`, `select` and `nanosleep` already apply:
-/// bounded by [`MAX_SLEEP_SECONDS`], and a refusal by name rather than a clamp when the bound is
-/// reached. D16's runaway-guest defence is built from step budgets that a sleeping thread does not
-/// consume, so an unbounded blocking `read` on a pipe nobody writes to is a permanent hang of a
-/// host thread.
+/// layer's policy, and it is the one `poll`, `select`, `nanosleep` and a blocking socket apply:
+/// **as long as a device would** -- here, until the descriptor is ready -- in parks of at most
+/// [`STOP_SLICE`], with the stop switch read between them.
+///
+/// **It used to give up after [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) and refuse**, for
+/// D16's reason: a sleeping thread executes no guest instructions, so no step budget can end one,
+/// and a blocking `read` on a pipe nobody writes to would be a host thread nothing could stop. A
+/// refusal ends the guest thread, though, and a writer that is slow is not a guest defect. What
+/// answers D16 now is [`Bionic::stop_guest_threads`](super::Bionic::stop_guest_threads): a
+/// thread waiting here is ended by teardown within one park, by name, and by nothing else.
 ///
 /// **Non-blocking is the common case on the startup path and costs nothing**: §5.2 sets
-/// `O_NONBLOCK` on both ends of both of the glue's pipes, so this type's deadline is never even
-/// computed there.
-/// When a blocking transfer gives up, as an instant.
-///
-/// **A function rather than an expression inside [`BlockingWait::wait`]**, and for the reason the
-/// mutation harness records for `clocks::capped`: a row that removes this bound makes the
-/// end-to-end test **hang** rather than fail, so the detector has to be a unit test on the bound
-/// itself, and a unit test needs something to call.
-fn blocking_deadline() -> Instant {
-    Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS)
-}
-
+/// `O_NONBLOCK` on both ends of both of the glue's pipes, so this type never waits there.
 struct BlockingWait {
-    /// Set on the first wait, so the bound is over the whole call rather than per retry — a
-    /// per-retry bound is no bound at all when the retries are unbounded.
-    deadline: Option<Instant>,
     /// The readiness generation as it was **before** the attempt that is about to be made.
     ///
     /// This is the whole of why the wait cannot lose a wakeup. A write that lands between the
@@ -1052,7 +1041,7 @@ struct BlockingWait {
 
 impl BlockingWait {
     fn new() -> BlockingWait {
-        BlockingWait { deadline: None, seen: 0 }
+        BlockingWait { seen: 0 }
     }
 
     /// Record the generation before an attempt. Called on every pass of the transfer loop.
@@ -1065,22 +1054,24 @@ impl BlockingWait {
         errno == consts::EAGAIN && fs.is_nonblocking(fd).is_ok_and(|nonblocking| !nonblocking)
     }
 
-    /// Wait for the descriptor's readiness to change, or refuse by name at the cap.
+    /// Wait one park for the descriptor's readiness to change, or refuse by name if the runtime
+    /// is stopping.
+    ///
+    /// **After the attempt, not before it**: the caller tried the transfer and the seam said it
+    /// would block, so a descriptor that was ready has already been answered, stopping or not.
     fn wait(&mut self, view: &GuestView<'_>, fs: &Filesystem, fd: i32) -> AbiResult<()> {
-        let deadline = *self.deadline.get_or_insert_with(blocking_deadline);
-        let now = Instant::now();
-        if now >= deadline {
+        if view.active.bionic.guest_threads_stopping() {
             return Err(view.refusal(format!(
-                "a blocking `{}` on fd {fd} waited {MAX_SLEEP_SECONDS} seconds and the \
-                 descriptor never became ready. This layer caps a guest-chosen wait at that -- \
-                 the same cap `nanosleep`, `poll` and `select` name, and for the same reason: a \
-                 sleeping thread executes no guest instructions, so no step budget can end one. \
-                 Returning a short count or EAGAIN instead would report to a blocking descriptor \
-                 something only a non-blocking one can be told",
+                "a blocking `{}` on fd {fd} was waiting for the descriptor to become ready when \
+                 this runtime asked its guest threads to stop. It never became ready, so there is \
+                 no value to return that would be true: a short count or EAGAIN would tell a \
+                 blocking descriptor something only a non-blocking one can be told, and \
+                 -1/EINTR would name a signal that was never delivered because this runtime has \
+                 no signal delivery",
                 view.symbol()
             )));
         }
-        fs.wait_for_readiness(self.seen, deadline - now);
+        fs.wait_for_readiness(self.seen, STOP_SLICE);
         Ok(())
     }
 }
@@ -2587,24 +2578,12 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// **A blocking transfer gives up within a minute**, asserted against a literal.
-    ///
-    /// The detector for removing the bound, and it has to be a unit test: an end-to-end test of
-    /// an unbounded blocking `read` on a pipe nobody writes to **hangs**, and a hang is not a
-    /// failing test — it is a run that never ends, which is what M3 task 2 already paid for
-    /// twice. The comparison is against a literal rather than against `MAX_SLEEP_SECONDS`, so
-    /// the test does not assert its own definition (review finding M2).
-    #[test]
-    fn a_blocking_transfer_gives_up_within_a_minute() {
-        let deadline = blocking_deadline();
-        let bound = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            bound <= Duration::from_secs(60) && bound > Duration::from_secs(1),
-            "a blocking read or write waits {bound:?}, which is outside the cap this layer \
-             documents. A sleeping thread executes no guest instructions, so D16's step budgets \
-             cannot end one"
-        );
-    }
+    // `a_blocking_transfer_gives_up_within_a_minute` stood here, the detector for the minute a
+    // blocking transfer used to be refused after. There is no such minute now: the transfer waits
+    // as a device does, and what ends it is the stop switch. The detector for that is end to end
+    // -- `tests/bionic.rs`, `long_waits_on_guest_threads_end_when_the_runtime_stops` -- because a
+    // stop-switch test that fails *joins with a timeout* on a guest thread rather than hanging
+    // the suite, which is what forced the old one to be a unit test.
 
     /// The three structures are the sizes the guest's headers say, and their fields land where
     /// the tables above claim.

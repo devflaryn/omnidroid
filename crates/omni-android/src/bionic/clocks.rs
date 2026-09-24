@@ -46,17 +46,24 @@
 //! — it counts time spent suspended and the host's monotonic clock does not — so it is refused
 //! rather than aliased.
 //!
-//! # Sleeping is capped, and that is a hostile-input defence rather than a semantics change
+//! # Sleeping is sliced, and the stop switch is what ends a long one
 //!
 //! `nanosleep` and `usleep` block a host thread from inside a dispatch, and the duration is a
-//! number the guest chose. `nanosleep({INT64_MAX, 0})` is a permanent hang of that thread, with no
-//! watchdog above it — D16's runaway-guest defence is built from *step budgets* and a sleeping
-//! thread is not executing steps. So a request longer than
-//! [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) is refused by name, with the requested
-//! duration and the cap both in the message.
+//! number the guest chose. `nanosleep({INT64_MAX, 0})` is a host thread asleep for ever, and no
+//! watchdog above it can help — D16's runaway-guest defence is built from *step budgets* and a
+//! sleeping thread is not executing steps.
 //!
-//! A cap rather than a clamp, deliberately: clamping would return 0 after sleeping for a minute,
-//! and the guest would believe it had slept for a year.
+//! **That used to be answered with a cap**: a request past
+//! [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) was refused, and the refusal killed the guest
+//! thread. It is answered now by [`sleep_until`]: the sleep is carried out in host parks of at
+//! most [`STOP_SLICE`], [`Bionic::guest_threads_stopping`] is read between them, and a sleep the
+//! runtime ends is refused by name — which the thread runner files as the thread stopping, not as
+//! a failure. The guest's `0` comes only at the real deadline. A deadline past the host clock's
+//! range is an untimed sleep that only the stop switch ends, which is what `{INT64_MAX, 0}` means
+//! on a device too.
+//!
+//! Neither a clamp nor an early `0`, deliberately: either would return success from a call that
+//! had not slept as long as it was asked, and the guest would believe it had.
 //!
 //! # `-1` with `errno` versus a refusal
 //!
@@ -71,7 +78,7 @@
 //! because a guest that ignores `clock_gettime`'s return — which almost all code does — would
 //! carry an unwritten `struct timespec` forward with no indication anything had happened.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
@@ -83,7 +90,7 @@ use crate::error::AbiResult;
 use crate::mem::Blame;
 
 use super::view::GuestView;
-use super::{active, enter, MAX_SLEEP_SECONDS};
+use super::{active, enter, Bionic, STOP_SLICE};
 
 // ------------------------------------------------------------------ the guest's constants
 //
@@ -602,33 +609,69 @@ fn requested(seconds: i64, nanos: i64) -> Result<Duration, i32> {
     Ok(Duration::new(seconds as u64, nanos as u32))
 }
 
-/// Whether a requested sleep is past [`MAX_SLEEP_SECONDS`] and must be refused.
+/// The next host park of a sleep that ends at `deadline`, or `None` once it has ended.
 ///
-/// A predicate of its own rather than an inline comparison, so that it can be asserted **without
-/// sleeping**. A test for "an over-long sleep is refused" that got the answer wrong would hang for
-/// as long as the guest asked, which is not a failure mode a suite can recover from — so the
-/// decision is checked here as arithmetic and end to end in `tests/bionic.rs` with a value the cap
-/// really does refuse.
-fn capped(duration: Duration) -> bool {
-    duration.as_secs() > MAX_SLEEP_SECONDS
+/// `None` for the deadline is an **untimed** sleep — one whose deadline is past the host clock's
+/// range — and it parks a slice at a time for as long as it lasts.
+///
+/// A function of its own, so that the slicing can be asserted **without sleeping**: that every
+/// park is at most [`STOP_SLICE`], and that a sleep shorter than a slice is **one** park of its
+/// whole length, which is what keeps a short sleep exactly as precise as it was before slicing.
+fn next_park(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    match deadline {
+        None => Some(STOP_SLICE),
+        Some(deadline) => {
+            let left = deadline.checked_duration_since(now).filter(|left| !left.is_zero())?;
+            Some(left.min(STOP_SLICE))
+        }
+    }
 }
 
-/// Sleep, or refuse a duration past the cap.
+/// How a [`sleep_until`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Slept {
+    /// The deadline arrived.
+    Elapsed,
+    /// The runtime asked its guest threads to stop before it did.
+    Stopped,
+}
+
+/// Sleep until `deadline` (`None`: until stopped), one park of at most [`STOP_SLICE`] at a time,
+/// reading the stop switch before each.
 ///
-/// Returns the errno to report, or an error if the request is refused. See the module
-/// documentation: the cap is a hostile-input defence, and a clamp would be a lie.
+/// **Below the deadline test, not above it**, the order `ALooper_pollOnce` measured: a sleep whose
+/// deadline has arrived has finished, and it reports that whether or not the runtime is stopping.
+/// So a zero-length sleep never reads the switch at all.
+pub(super) fn sleep_until(bionic: &Bionic, deadline: Option<Instant>) -> Slept {
+    loop {
+        let Some(park) = next_park(deadline, Instant::now()) else {
+            return Slept::Elapsed;
+        };
+        if bionic.guest_threads_stopping() {
+            return Slept::Stopped;
+        }
+        omni_platform::clock::sleep(park);
+    }
+}
+
+/// Sleep for `duration`, or refuse by name if the runtime stops this thread first.
+///
+/// See the module documentation: the sleep is carried out however long it is, and the stop
+/// switch is what ends one nobody should wait out.
 fn sleep_for(view: &GuestView<'_>, duration: Duration, asked: &str) -> AbiResult<()> {
-    if capped(duration) {
+    let slept = Instant::now();
+    // Past the host clock's range is an untimed sleep, not a panic and not a refusal.
+    let deadline = slept.checked_add(duration);
+    if sleep_until(&view.active.bionic, deadline) == Slept::Stopped {
         return Err(view.refusal(format!(
-            "the guest asked to sleep for {asked}, and this layer caps a single sleep at \
-             {MAX_SLEEP_SECONDS} seconds. A sleeping thread executes no guest instructions, so \
-             D16's step-budget watchdog cannot end it and the host thread would be blocked for as \
-             long as the guest said. Clamping the sleep instead would return success from a call \
-             that had not done what it was asked"
+            "`{}` was sleeping (it asked for {asked}) when this runtime asked its guest threads \
+             to stop. The sleep had not finished, so there is no value to return that would be \
+             true: 0 would report a sleep that did not happen, and -1/EINTR with the time left \
+             would name a signal that was never delivered, because this runtime has no signal \
+             delivery",
+            view.symbol()
         )));
     }
-    let slept = std::time::Instant::now();
-    omni_platform::clock::sleep(duration);
     crate::waits::record_timeout("sleep", duration, slept.elapsed());
     Ok(())
 }
@@ -636,8 +679,9 @@ fn sleep_for(view: &GuestView<'_>, duration: Duration, asked: &str) -> AbiResult
 /// `int nanosleep(const struct timespec *req, struct timespec *rem)`
 ///
 /// `rem` is the remaining time when a sleep is cut short by a signal. Nothing here delivers
-/// signals to the guest, so every sleep that starts runs to completion and `rem` is written as
-/// zero — a fact about this runtime, not a placeholder. A `rem` the caller did not supply is
+/// signals to the guest, so every sleep that returns ran to completion and `rem` is written as
+/// zero — a fact about this runtime, not a placeholder. (A sleep the runtime's stop switch ends
+/// does not return at all; it is refused, see [`sleep_for`].) A `rem` the caller did not supply is
 /// skipped rather than faulted on: null is how a caller says it does not want it.
 pub(super) fn nanosleep(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (req, rem) = {
@@ -673,8 +717,8 @@ pub(super) fn nanosleep(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 ///
 /// `useconds_t` is `unsigned int` — **32 bits**, not 64 — so only the low half of `X0` is the
 /// argument and the high half is whatever the caller left there. Reading all 64 bits would turn a
-/// dirty register into a multi-century sleep request, which the cap would then refuse: a correct
-/// call refused because of a register nobody was required to clear.
+/// dirty register into a multi-century sleep: a correct 100 µs call that never returns, because of
+/// a register nobody was required to clear.
 ///
 /// bionic's `usleep` has no `EINVAL` for a value at or above one million — it converts and calls
 /// `nanosleep` — so neither does this.
@@ -818,29 +862,38 @@ mod tests {
         assert_eq!(requested(0, NANOS_PER_SECOND - 1), Ok(Duration::new(0, 999_999_999)));
         assert_eq!(requested(0, 0), Ok(Duration::ZERO));
         assert_eq!(requested(2, 500), Ok(Duration::new(2, 500)));
-        // i64::MAX seconds is well-formed and is what the *cap* exists to refuse, not this check.
+        // i64::MAX seconds is well-formed: it is an untimed sleep, which only the stop switch ends.
         assert_eq!(requested(i64::MAX, 0), Ok(Duration::new(i64::MAX as u64, 0)));
     }
 
-    /// The sleep cap, asserted as arithmetic rather than by sleeping.
+    /// **A sleep is parked in slices no longer than `STOP_SLICE`, and a short one is one park.**
     ///
-    /// **This is the detector for the cap**, and it is a unit test on purpose: the end-to-end form
-    /// of "an over-long sleep is refused" cannot fail safely, because a version that did not
-    /// refuse would sleep for the `i64::MAX` seconds the test asked for and hang the suite rather
-    /// than failing it. Here the same decision is a pure function over a `Duration`.
+    /// Asserted as arithmetic rather than by sleeping, because the end-to-end form of "a long
+    /// sleep parks in slices" is a sleep of minutes. `tests/bionic.rs` has the end-to-end half:
+    /// long sleeps on guest threads, ended by the stop switch within seconds.
     #[test]
-    fn the_sleep_cap_refuses_past_a_minute_and_admits_everything_under_it() {
-        assert_eq!(MAX_SLEEP_SECONDS, 60);
-        assert!(!capped(Duration::ZERO));
-        assert!(!capped(Duration::from_millis(10)), "an ordinary sleep must not be refused");
-        assert!(!capped(Duration::from_millis(1)));
-        assert!(!capped(Duration::from_secs(MAX_SLEEP_SECONDS)), "the cap is inclusive");
-        assert!(
-            !capped(Duration::new(MAX_SLEEP_SECONDS, 999_999_999)),
-            "and it is whole seconds, so the last nanosecond of the last second is still in"
+    fn a_sleep_parks_in_slices_and_a_short_one_is_a_single_park() {
+        assert_eq!(STOP_SLICE, Duration::from_secs(1), "the slice the reasoning above assumes");
+        let now = Instant::now();
+        let at = |d: Duration| Some(now + d);
+        // A sleep no longer than a slice is **one** park of exactly its length, so its precision
+        // is what it was before slicing.
+        assert_eq!(next_park(at(Duration::from_millis(10)), now), Some(Duration::from_millis(10)));
+        assert_eq!(next_park(at(Duration::from_micros(100)), now), Some(Duration::from_micros(100)));
+        assert_eq!(next_park(at(STOP_SLICE), now), Some(STOP_SLICE));
+        // A longer one parks a slice at a time, and its last park ends at the deadline.
+        assert_eq!(next_park(at(Duration::from_secs(3600)), now), Some(STOP_SLICE));
+        assert_eq!(
+            next_park(at(Duration::from_secs(3600)), now + Duration::from_millis(3_599_250)),
+            Some(Duration::from_millis(750))
         );
-        assert!(capped(Duration::from_secs(MAX_SLEEP_SECONDS + 1)));
-        assert!(capped(Duration::new(i64::MAX as u64, 0)), "the case this exists for");
+        // At or past the deadline, nothing is left: a zero-length sleep does not park.
+        assert_eq!(next_park(at(Duration::ZERO), now), None);
+        assert_eq!(next_park(Some(now), now + Duration::from_secs(1)), None);
+        // An untimed sleep -- a deadline past the host clock -- parks a slice at a time for ever.
+        // (Whether `{INT64_MAX, 0}` is past the clock is the host's business: Windows' `Instant`
+        // holds it, Linux's does not. Either way it is sliced, and only the stop switch ends it.)
+        assert_eq!(next_park(None, now), Some(STOP_SLICE));
     }
 
     /// A `struct timespec` and a `struct timeval` are both two 8-byte fields on LP64.

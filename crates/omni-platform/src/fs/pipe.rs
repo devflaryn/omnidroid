@@ -23,8 +23,8 @@
 //! pipe reports [`FsErrorKind::WouldBlock`] exactly as a non-blocking one does, and the *caller*
 //! decides what to do about it. That is deliberate: D16's runaway-guest defence is built from step
 //! budgets that a sleeping thread does not consume, so "how long may a guest block" is a policy
-//! the adapter owns — it already owns it for `poll`, `select` and `nanosleep`, each capped by
-//! `MAX_SLEEP_SECONDS` with an unbounded wait refused by name.
+//! the adapter owns — it already owns it for `poll`, `select` and `nanosleep`, each carried out in
+//! bounded parks with the adapter's stop switch read between them.
 //!
 //! What this module provides instead is [`ReadyGate`], a generation counter the caller can wait on
 //! with a deadline of its own choosing. There is no API here that can block forever.

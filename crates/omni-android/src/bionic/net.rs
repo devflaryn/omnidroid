@@ -107,17 +107,22 @@
 //!
 //! An *infinite* wait is a permanent hang of a host thread whenever nothing arrives, and D16's
 //! runaway-guest defence is built from step budgets that a sleeping thread does not consume. So
-//! `poll(fds, n, -1)` and `select(.., NULL)` with nothing ready are **refused by name**, with the
-//! same argument [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) makes for `nanosleep` — and a
-//! finite timeout past that cap is refused rather than clamped, because a clamp returns `0` from a
-//! call that waited a minute when it was asked to wait a year.
+//! `poll(fds, n, -1)` and `select(.., NULL)` with nothing ready are **refused by name**.
 //!
 //! **That refusal has now outlived two of its own reasons and is kept by a third.** It rested
 //! first on "none of the descriptors it named can ever become ready", which a pipe made false, and
 //! then on "nothing outside this process can make one ready", which a socket makes false. What is
 //! left is the step-budget argument alone, which is the half that was always load-bearing: a host
 //! thread parked for ever on a socket nobody writes to is exactly as unrecoverable as one parked
-//! on a regular file. A blocking transfer is bounded the same way, by the same number.
+//! on a regular file.
+//!
+//! **A finite timeout is carried out however long it is**, and so is a blocking transfer. Both
+//! used to be refused past [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS), and a refusal kills
+//! the guest thread -- which on the real engine killed a correct worker. What answers the
+//! step-budget argument for them instead is the **stop switch**: every wait here parks for at most
+//! [`STOP_SLICE`] at a time and reads [`Bionic::guest_threads_stopping`](super::Bionic) between
+//! parks ([`stop_requested`], [`await_socket`]), so a thread in a long wait is ended by teardown
+//! within a second, by name, and the guest's own answer is given only at the real deadline.
 //!
 //! # The `-1`/`errno` versus refusal split, as the rest of the adapter draws it
 //!
@@ -171,7 +176,8 @@ use crate::mem::Blame;
 use super::addrinfo;
 use super::files::{filesystem, settle, Settled};
 use super::view::GuestView;
-use super::{active, enter, Active, MAX_SLEEP_SECONDS};
+use super::clocks::{sleep_until, Slept};
+use super::{active, enter, Active, STOP_SLICE};
 
 // ================================================================== the guest's constants
 //
@@ -366,19 +372,17 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         (a.next_u64()?, a.next_u64()?, a.next_i32()?)
     };
     let state = active(c.symbol(), c.address())?;
-    // The second half of the pair is **whether anything this call named can become ready**,
-    // which is what decides whether the wait is a sleep or a wait for an event. See
-    // [`bounded_wait`].
-    let (first, can_change) = {
+    let first = {
         let mut view = enter(c, &state);
         if nfds > MAX_POLL_FDS {
             // Linux's own answer for an `nfds` past the process's descriptor limit.
             view.set_errno(consts::EINVAL);
-            (Some(-1), false)
+            Some(-1)
         } else {
             // `nfds` is bounded above, so this cannot overflow.
             let bytes = nfds as usize * POLLFD_BYTES;
-            let (ready, watch) = if bytes == 0 {
+            // The watch is not needed here: a wait re-tests, and each test makes a fresh one.
+            let (ready, _watch) = if bytes == 0 {
                 // A zero-length array is legal and `fds` may be anything, null included — POSIX
                 // says so, and it is the idiom for "sleep for `timeout` milliseconds". Nothing is
                 // read, and in particular the descriptor table is not consulted, so a `poll` used
@@ -387,7 +391,7 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             } else {
                 poll_entries(&view, fds, bytes)?
             };
-            (if ready > 0 { Some(ready) } else { None }, watch.can_change())
+            if ready > 0 { Some(ready) } else { None }
         }
     };
     let value = match first {
@@ -397,7 +401,7 @@ pub(super) fn poll(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             // refusal arrives instead of a sleep rather than after one.
             let duration =
                 if timeout < 0 { None } else { Some(Duration::from_millis(timeout as u64)) };
-            let budget = bounded_wait(c, duration, can_change)?;
+            let budget = bounded_wait(c, duration)?;
             let bytes = nfds as usize * POLLFD_BYTES;
             wait_until_ready(c, &state, budget, |view| {
                 if bytes == 0 {
@@ -481,16 +485,23 @@ impl Watch {
 ///
 /// The three cases, and the middle one is the whole of the mixed-set problem:
 ///
-/// * **No socket.** The readiness gate is waited on for the whole remaining budget, exactly as
-///   before sockets existed. `seen` was read *before* the descriptors were tested, so a pipe write
-///   that landed in between raises the generation past it and the wait returns at once.
+/// * **No socket.** The readiness gate is waited on, exactly as before sockets existed. `seen`
+///   was read *before* the descriptors were tested, so a pipe write that landed in between raises
+///   the generation past it and the wait returns at once.
 /// * **Sockets and something on the gate.** No call waits on both, so the socket side is given
 ///   [`MIXED_WAIT_SLICE`] and the loop re-tests everything after it. Nothing is lost — the gate
 ///   generation is re-read on the next pass and a change that landed during the slice is still
 ///   there — but an in-process wakeup can be **late** by up to one slice, which is why the slice
 ///   is small and why it is a constant with a reason attached rather than a number.
-/// * **Sockets only.** The whole remaining budget goes into one `omni_platform::net::poll`, which
-///   wakes exactly when the kernel says so and costs nothing while it waits.
+/// * **Sockets only.** The remaining budget goes into one `omni_platform::net::poll`, which wakes
+///   exactly when the kernel says so and costs nothing while it waits.
+///
+/// **Every one of the three parks for at most [`STOP_SLICE`]**, whatever the guest asked for.
+/// Nothing but the budget running out or an event ends a park, and the stop switch is read only
+/// between parks ([`wait_until_ready`], `select`), so a park of the whole budget would hold
+/// teardown for as long as the guest said. That was true of the sockets-only case, whose parks
+/// were `MAX_SLEEP_SECONDS` long -- and the engine's I/O thread idles in `epoll_wait(-1)` over
+/// nothing but sockets, so stopping it could take a minute.
 ///
 /// The socket handles are locked in **ascending descriptor order**, so two guest threads waiting
 /// on overlapping sets cannot take two locks in opposite orders. They are all held for the
@@ -510,6 +521,8 @@ fn wait_a_slice(
         Some(at) => remaining.min(at.saturating_sub(omni_platform::clock::monotonic_now())),
         None => remaining,
     };
+    // **No park past a slice**, so the caller reads the stop switch at least that often.
+    let remaining = remaining.min(STOP_SLICE);
     if watch.sockets.is_empty() {
         fs.wait_for_readiness(seen, remaining);
         return Ok(());
@@ -526,15 +539,9 @@ fn wait_a_slice(
         fs.wait_for_readiness(seen, remaining);
         return Ok(());
     }
-    // **Every individual host park stays under the cap**, which is what lets `bounded_wait`
-    // honour a longer total: a mixed set is re-tested every `MIXED_WAIT_SLICE` so the in-process
-    // half is not late, and a sockets-only set parks for at most `MAX_SLEEP_SECONDS` at a time,
-    // so the sum the guest asked for is made of parks no longer than the ones `nanosleep` allows.
-    let slice = if watch.gate {
-        remaining.min(MIXED_WAIT_SLICE)
-    } else {
-        remaining.min(Duration::from_secs(MAX_SLEEP_SECONDS))
-    };
+    // A mixed set is re-tested every `MIXED_WAIT_SLICE`, so the in-process half is not late; a
+    // sockets-only set parks for what is left of the slice above.
+    let slice = if watch.gate { remaining.min(MIXED_WAIT_SLICE) } else { remaining };
     let guards: Vec<std::sync::MutexGuard<'_, Socket>> =
         held.iter().map(|(handle, _)| locked(handle)).collect();
     let mut entries: Vec<PollEntry<'_>> = guards
@@ -566,22 +573,24 @@ fn wait_a_slice(
 /// host's `select` when the pipe write lands. [`wait_a_slice`] is where that is answered.
 ///
 /// An instance with **no filesystem** has no descriptors at all, so nothing can ever become ready
-/// and the wait degenerates to a sleep. That is a real branch, not a fallback: `poll(NULL, 0, 50)`
-/// as a sleep is legal on an instance that has no filesystem root.
+/// and the wait degenerates to a sleep -- sliced and stop-checked exactly as `nanosleep`'s is. That
+/// is a real branch, not a fallback: `poll(NULL, 0, 50)` as a sleep is legal on an instance that
+/// has no filesystem root.
+///
+/// A budget whose deadline is past the host clock's range is an **untimed** wait: it ends when
+/// something is ready or when the runtime stops, never with a timeout nobody reached.
 fn wait_until_ready(
     c: &ImportCall<'_, '_>,
     state: &Active,
     budget: Duration,
     mut test: impl FnMut(&GuestView<'_>) -> AbiResult<(i32, Watch)>,
 ) -> AbiResult<i32> {
-    let Some(deadline) = Instant::now().checked_add(budget) else {
-        // `bounded_wait` caps the budget well below anything that could do this, so this is a
-        // refusal for something that cannot happen rather than a clamp that hides it.
-        return Err(refuse(c, format!("a wait of {budget:?} is past this host's clock")));
-    };
+    let deadline = Instant::now().checked_add(budget);
     let Some(fs) = state.bionic.filesystem() else {
-        omni_platform::clock::sleep(budget);
-        return Ok(0);
+        return match sleep_until(&state.bionic, deadline) {
+            Slept::Elapsed => Ok(0),
+            Slept::Stopped => stop_requested(c, state).map(|()| 0),
+        };
     };
     loop {
         let seen = fs.ready_generation();
@@ -593,11 +602,13 @@ fn wait_until_ready(
             return Ok(ready);
         }
         let now = Instant::now();
-        if now >= deadline {
-            return Ok(0);
-        }
+        let remaining = match deadline {
+            Some(deadline) if now >= deadline => return Ok(0),
+            Some(deadline) => deadline - now,
+            None => STOP_SLICE,
+        };
         stop_requested(c, state)?;
-        wait_a_slice(c, fs, &watch, seen, deadline - now)?;
+        wait_a_slice(c, fs, &watch, seen, remaining)?;
     }
 }
 
@@ -760,9 +771,8 @@ fn select_outcome(
     // **What the guest asked about, kept**, because a wait re-tests the same question and the
     // sets are about to be overwritten with the answer.
     let asked: [Set; 3] = [sets[0].copy(), sets[1].copy(), sets[2].copy()];
-    // The watch is kept rather than discarded: it says whether the descriptors this call named
-    // can become ready, which is what `bounded_wait` below turns the cap on. See there.
-    let first_watch = answer_sets(view, &asked, &mut sets, nfds);
+    // The watch is not needed yet: a wait re-tests, and each test makes a fresh one.
+    let _watch = answer_sets(view, &asked, &mut sets, nfds);
     let ready = ready_bits(&sets, nfds);
     if ready > 0 {
         for set in &sets {
@@ -794,18 +804,19 @@ fn select_outcome(
             view.set_errno(consts::EINVAL);
             return Ok(-1);
         }
-        // Neither field can overflow the sum: `tv_usec` is bounded by a million and `tv_sec` by
-        // the cap `bounded_wait` applies next.
+        // The sum cannot overflow: `tv_usec` is bounded by a million, `tv_sec` is a non-negative
+        // `i64`, and a `Duration` holds `u64::MAX` seconds.
         Some(Duration::from_secs(seconds as u64) + Duration::from_micros(micros as u64))
     };
     // Refused before anything is written, for the same reason.
-    let wait = bounded_wait(c, duration, first_watch.can_change())?;
+    let wait = bounded_wait(c, duration)?;
     // **The wait re-asks the question every time the readiness gate rises**, against `asked`
     // rather than against the sets in guest memory, which are about to be overwritten. Before a
     // pipe existed this was a plain sleep, because nothing could change during it.
-    let Some(deadline) = Instant::now().checked_add(wait) else {
-        return Err(refuse(c, format!("a wait of {wait:?} is past this host's clock")));
-    };
+    //
+    // A `timeval` past the host clock's range is an untimed wait, ended by an event or the stop
+    // switch: `None` here.
+    let deadline = Instant::now().checked_add(wait);
     loop {
         // Read before the descriptors are tested. The other order loses a wakeup that lands in
         // between — `VERIFICATION.md` entry 11, measured at 1.0104 s.
@@ -819,22 +830,23 @@ fn select_outcome(
             return Ok(ready);
         }
         let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
+        let remaining = match deadline {
+            Some(deadline) if now >= deadline => break,
+            Some(deadline) => deadline - now,
+            None => STOP_SLICE,
+        };
         stop_requested(c, view.active)?;
         match (seen, view.active.bionic.filesystem()) {
             // **The same alternating wait `poll` makes**, and through the same function, so the
             // two calls cannot drift apart about which side of a mixed set they sleep on.
             (Some(seen), Some(fs)) => {
-                wait_a_slice(c, fs, &watch, seen, deadline - now)?;
+                wait_a_slice(c, fs, &watch, seen, remaining)?;
             }
             // No filesystem means no descriptors at all, so nothing can change and the wait is
-            // the sleep it always was. A `select` used purely as a sleep does not need a
-            // filesystem root.
+            // the sleep it always was -- a slice at a time, so the stop switch above is read
+            // between them. A `select` used purely as a sleep does not need a filesystem root.
             _ => {
-                omni_platform::clock::sleep(deadline - now);
-                break;
+                omni_platform::clock::sleep(remaining.min(STOP_SLICE));
             }
         }
     }
@@ -998,74 +1010,50 @@ impl Set {
     }
 }
 
-/// The bound both calls apply to a wait with nothing that can end it.
+/// The bound `poll` and `select` apply to their timeout: `None` is "wait indefinitely" and is
+/// refused; a finite timeout is carried out however long it is.
 ///
-/// `None` is "wait indefinitely" and is refused.
+/// # There used to be a 60-second cap here, and what it was for is answered elsewhere now
 ///
-/// # The 60-second cap applies to a wait nothing can end, and to nothing else
+/// A finite wait past [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) was refused, at first for
+/// every set and then -- after the engine's HTTP stack asked `poll` for **69.001 s** over the
+/// client-settings socket and the refusal killed the thread carrying that connection -- only for
+/// a set in which nothing can become ready ([`Watch::can_change`]). Its argument was D16's: a
+/// sleeping thread executes no guest instructions, so no step budget can end one.
 ///
-/// **This is `VERIFICATION.md` entry 13's shape, found in this module's own refusal text.** The
-/// message that cap produces has always said *"with nothing that can become ready"*, and that
-/// sentence was true when it was written -- every descriptor in this runtime was a file, a
-/// directory or a standard stream, all `Readiness::ALWAYS`, so a `poll` that was not already
-/// satisfied was a sleep with a timer on it. A pipe made it half-false and a socket made it
-/// false: a `poll` over a socket is a wait for the network, and it ends when the peer speaks.
+/// That argument is now answered by the stop switch rather than by a refusal, for every set:
+/// [`wait_until_ready`] and `select` park for at most [`STOP_SLICE`] at a time
+/// ([`wait_a_slice`]) and read [`stop_requested`] between parks, so a thread in a long wait --
+/// over a socket, a pipe, or nothing at all -- is ended by teardown within a second, by name, and
+/// otherwise gets the guest's own answer at the guest's own deadline. A refusal *kills* a thread
+/// that asked for something correct; a stop ends one the runtime no longer wants.
 ///
-/// MEASURED, and this is what made the sentence worth re-reading: the engine's HTTP stack asks
-/// `poll` for **69.001 s** over the client-settings socket. The cap refused it, the refusal
-/// killed the guest thread carrying that connection, and the fetch came back on another thread
-/// as `fetch flag exception: HttpError: Unknown` -- a network failure this layer had caused and
-/// then attributed to the network.
-///
-/// So the cap now turns on [`Watch::can_change`]:
-///
-/// * **Nothing in the set can become ready.** The wait is a sleep, `nanosleep`'s argument applies
-///   unchanged -- a sleeping thread executes no guest instructions, so no step budget can end one
-///   (D16) -- and a finite wait past [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) is refused
-///   rather than clamped, because clamping would return 0 from a call that waited a minute when
-///   it was asked to wait longer.
-/// * **Something in the set can become ready.** The guest's own timeout is honoured. What makes
-///   that safe is not a judgement about how long is reasonable: it is that [`wait_until_ready`]
-///   is a **loop of bounded slices** that re-tests the whole set on every pass, and
-///   [`wait_a_slice`] caps each host call at [`MAX_SLEEP_SECONDS`] as well -- so the cap still
-///   governs every individual park, and what has been lifted is only the bound on the *sum* of
-///   parks, which the guest asked for and which ends the moment the descriptor is ready.
-///
-/// **What would falsify this**: a run in which a guest thread sits in `poll` past the gate's
-/// watchdog over a set that can never become ready. That would mean a descriptor whose
-/// `readiness_source` says its readiness can change when it cannot, which is a defect there
-/// rather than in this cap.
-fn bounded_wait(
-    c: &ImportCall<'_, '_>,
-    duration: Option<Duration>,
-    can_change: bool,
-) -> AbiResult<Duration> {
+/// **The indefinite refusal is kept, deliberately, and is a different policy.** A finite wait has
+/// a true answer at its deadline. `poll(fds, n, -1)` over a set nothing can make ready has none:
+/// on a device the thread never wakes, and a refusal is what makes that visible in
+/// `guest_thread_failures` rather than a thread that silently never returns.
+fn bounded_wait(c: &ImportCall<'_, '_>, duration: Option<Duration>) -> AbiResult<Duration> {
     let Some(duration) = duration else {
         return Err(refuse(
             c,
             format!(
-                "the guest asked `{}` to wait indefinitely, and this layer has no unbounded \n                 wait. The reason this refusal used to give -- that none of the descriptors \n                 it named can ever become ready, because every descriptor here was a file, \n                 a directory or a standard stream and `socket` and `eventfd` were refused \n                 by name -- has now outlived itself twice: a pipe made a descriptor whose \n                 readiness is state, and M6 made a socket, whose readiness is the network. \n                 What is left is the half that was always load-bearing: a host thread \n                 parked for ever on a socket nobody writes to is exactly as unrecoverable \n                 as one parked on a regular file, and D16's runaway-guest defence is built \n                 from step budgets that a sleeping thread does not consume. Returning 0 \n                 instead would report a timeout to a call that was given none",
+                "the guest asked `{}` to wait indefinitely, and this layer has no unbounded \
+                 wait. The reason this refusal used to give -- that none of the descriptors \
+                 it named can ever become ready, because every descriptor here was a file, \
+                 a directory or a standard stream and `socket` and `eventfd` were refused \
+                 by name -- has now outlived itself twice: a pipe made a descriptor whose \
+                 readiness is state, and M6 made a socket, whose readiness is the network. \
+                 What is left is the half that was always load-bearing: a host thread \
+                 parked for ever on a socket nobody writes to is exactly as unrecoverable \
+                 as one parked on a regular file, and D16's runaway-guest defence is built \
+                 from step budgets that a sleeping thread does not consume. Returning 0 \
+                 instead would report a timeout to a call that was given none",
                 c.symbol()
             ),
         ));
     };
-    if !can_change && duration.as_secs() > MAX_SLEEP_SECONDS {
-        return Err(refuse(
-            c,
-            format!(
-                "the guest asked `{}` to wait {duration:?} with nothing that can become ready, \
-                 and this layer caps a guest-chosen wait at {MAX_SLEEP_SECONDS} seconds -- the \
-                 same cap `nanosleep` and `usleep` name, and for the same reason: a sleeping \
-                 thread executes no guest instructions, so no step budget can end one. Clamping \
-                 to the cap was rejected, because it would return 0 from a call that waited a \
-                 minute when it was asked to wait {duration:?}. Note what this refusal is \
-                 NOT about: a set naming a socket or a pipe is a wait for an event, and its \
-                 timeout is honoured in full because the wait re-tests every slice and ends the \
-                 moment the descriptor is ready",
-                c.symbol()
-            ),
-        ));
-    }
+    // A finite wait is carried out however long it is: sliced, and ended early only by the stop
+    // switch. See above for the cap that used to stand here.
     Ok(duration)
 }
 
@@ -1103,9 +1091,9 @@ const EP_MAX_EVENTS: i32 = i32::MAX / EPOLL_EVENT_BYTES as i32;
 /// How long one pass of an **indefinite** `epoll_wait` may wait before it is renewed.
 ///
 /// Not a timeout the guest sees: [`epoll_wait`] loops until something is ready. It exists because
-/// [`wait_until_ready`] takes a deadline, and every individual park inside it is already capped
-/// (see [`wait_a_slice`]) and re-checks the stop switch, so the length only decides how often the
-/// deadline is renewed.
+/// [`wait_until_ready`] takes a deadline, and every individual park inside it is at most
+/// [`STOP_SLICE`] (see [`wait_a_slice`]) and re-checks the stop switch, so the length only decides
+/// how often the deadline is renewed.
 const INDEFINITE_EPOLL_PASS: Duration = Duration::from_secs(3600);
 
 /// `int epoll_create1(int flags)`
@@ -1286,9 +1274,8 @@ pub(super) fn epoll_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             }
         }
     } else {
-        let budget =
-            bounded_wait(c, Some(Duration::from_millis(timeout as u64)), watch.can_change())?;
-        wait_until_ready(c, &state, budget, test)?
+        // A finite timeout is carried out however long it is -- see `bounded_wait` for why.
+        wait_until_ready(c, &state, Duration::from_millis(timeout as u64), test)?
     };
     c.ret().i32(value);
     Ok(())
@@ -1923,27 +1910,38 @@ fn wants_nonblocking(nonblocking: bool, flags: i32) -> bool {
     nonblocking || flags & MSG_DONTWAIT != 0
 }
 
-/// Wait until a blocking socket is ready for `interest`, or say that the cap ran out.
+/// Wait until a blocking socket is ready for `interest`: `Ok(true)` when it is, `Ok(false)` when
+/// `deadline` -- the socket's own `SO_RCVTIMEO` or `SO_SNDTIMEO`, see [`socket_deadline`] --
+/// arrives first, and a refusal naming the shutdown when the runtime stops this thread first.
 ///
-/// **The bound is the same one `nanosleep`, `poll` and a blocking pipe transfer name**, and for
-/// the same reason: a sleeping thread executes no guest instructions, so D16's step budgets cannot
-/// end one. A device would wait for ever here; this layer waits [`MAX_SLEEP_SECONDS`] and then
-/// refuses by name, which is what `files::BlockingWait` does for a pipe.
+/// **A device waits for ever here, and so does this layer**, until the socket is ready or its own
+/// timeout runs out. It used to give up after [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS) and
+/// refuse, for D16's reason -- a sleeping thread executes no guest instructions, so no step budget
+/// can end one -- and a refusal kills the guest thread, which is the wrong answer to a peer that
+/// is slow to speak. What answers D16 now is the stop switch, read after every slice: teardown ends
+/// this wait within [`MIXED_WAIT_SLICE`], by name, and nothing else does.
 ///
 /// The socket lock is held for one slice at a time and released between them, so a `poll` on
 /// another guest thread — which takes the descriptor table's lock and then this one — is delayed
 /// by at most a slice rather than by the whole wait.
 fn await_socket(
+    view: &GuestView<'_>,
+    fd: i32,
     handle: &std::sync::Mutex<Socket>,
     interest: Interest,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> AbiResult<bool> {
     loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(false);
-        }
-        let slice = (deadline - now).min(MIXED_WAIT_SLICE);
+        let slice = match deadline {
+            None => MIXED_WAIT_SLICE,
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(false);
+                }
+                (deadline - now).min(MIXED_WAIT_SLICE)
+            }
+        };
         let readiness = {
             let socket = locked(handle);
             let mut entries = [PollEntry::new(&socket, interest)];
@@ -1962,7 +1960,29 @@ fn await_socket(
         {
             return Ok(true);
         }
+        // **After the readiness test, not before it**: a socket that is ready is answered even
+        // while the runtime stops, because that answer is true. Only a wait that would go on is
+        // ended.
+        if view.active.bionic.guest_threads_stopping() {
+            return Err(stopped_waiting(view, fd));
+        }
     }
+}
+
+/// When a blocking transfer on this socket gives up: now plus its own `SO_RCVTIMEO` or
+/// `SO_SNDTIMEO` (`query` says which), or `None` -- never -- when it has none.
+///
+/// **Honoured because a device honours it**: Linux's `recv` and `send` on a blocking socket whose
+/// timeout runs out answer `-1`/`EAGAIN`, and a guest that set one has a branch for that. A
+/// timeout past the host clock's range is no deadline at all, not a panic. A socket whose option
+/// cannot be read is treated as having none -- the wait is then ended by readiness or the stop
+/// switch, which are both true answers.
+fn socket_deadline(handle: &std::sync::Mutex<Socket>, query: SocketQuery) -> Option<Instant> {
+    let timeout = match locked(handle).get_option(query) {
+        Ok(OptionValue::Timeout(timeout)) => timeout,
+        _ => None,
+    };
+    timeout.and_then(|timeout| Instant::now().checked_add(timeout))
 }
 
 /// Whether a socket is ready for `interest` at this instant: one zero-length poll, and a failed
@@ -1985,9 +2005,9 @@ fn ready_now(handle: &std::sync::Mutex<Socket>, interest: Interest) -> bool {
 
 /// End a wait that this runtime is tearing down, by name.
 ///
-/// **The other half of lifting the cap on a wait that can end early.** `bounded_wait` now lets
-/// `poll` and `select` wait as long as the guest asked when the set contains a socket or a pipe,
-/// and a 69-second wait that nothing can interrupt holds teardown for 69 seconds --
+/// **The other half of lifting the cap.** `bounded_wait` lets `poll` and `select` wait as long as
+/// the guest asked -- first for a set containing a socket or a pipe, now for any set -- and a
+/// 69-second wait that nothing can interrupt holds teardown for 69 seconds --
 /// `Bionic::stop_guest_threads` is read *between run windows*, and a thread asleep in this loop
 /// never ends one. MEASURED, on the run that lifted the cap: no guest thread was killed and
 /// `join_guest_threads` then timed out with one still running, which is the same gap
@@ -2015,15 +2035,17 @@ fn stop_requested(c: &ImportCall<'_, '_>, state: &Active) -> AbiResult<()> {
     ))
 }
 
-/// The refusal a blocking socket call produces when it reaches the cap.
-fn waited_out(view: &GuestView<'_>, fd: i32) -> AbiError {
+/// The refusal a blocking socket call produces when the runtime stops it mid-wait.
+///
+/// [`stop_requested`]'s argument, for a transfer rather than a descriptor set.
+fn stopped_waiting(view: &GuestView<'_>, fd: i32) -> AbiError {
     view.refusal(format!(
-        "a blocking `{}` on socket fd {fd} waited {MAX_SLEEP_SECONDS} seconds and the socket \
-         never became ready. This layer caps a guest-chosen wait at that -- the same cap \
-         `nanosleep`, `poll` and a blocking pipe transfer name, and for the same reason: a \
-         sleeping thread executes no guest instructions, so no step budget can end one. Returning \
-         EAGAIN or a short count instead would report to a blocking socket something only a \
-         non-blocking one can be told",
+        "a blocking `{}` on socket fd {fd} was waiting for the socket to become ready when this \
+         runtime asked its guest threads to stop. The socket never became ready and no timeout of \
+         its own had run out, so there is no value to return that would be true: EAGAIN or a \
+         short count would tell a blocking socket something only a non-blocking one, or one \
+         whose timeout expired, can be told, and -1/EINTR would name a signal that was never \
+         delivered because this runtime has no signal delivery",
         view.symbol()
     ))
 }
@@ -2230,8 +2252,15 @@ pub(super) fn socket(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// sets `O_NONBLOCK`, calls this, gets `-1`/`EINPROGRESS`, waits for writability with `poll`, and
 /// reads `SO_ERROR`. Every step of that is implemented here and in `getsockopt`.
 ///
-/// On a **blocking** socket the wait is done here instead, bounded by [`MAX_SLEEP_SECONDS`] for
-/// D16's reason, and the answer is `0` or the connect's own errno — which is what a device gives.
+/// On a **blocking** socket the wait is done here instead, until the handshake settles, and the
+/// answer is `0` or the connect's own errno — which is what a device gives. The host's own
+/// handshake timeout is what bounds it, as on a device; the stop switch ends it early
+/// ([`await_socket`]). It used to give up after [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS)
+/// and refuse, which a slow handshake does not deserve.
+///
+/// `SO_SNDTIMEO` is **not** honoured here, although Linux bounds a blocking connect by it
+/// (answering `EINPROGRESS`): nothing has asked, and `EINPROGRESS` from a blocking socket is a
+/// branch a guest is least likely to have tested. The host's handshake timeout ends the wait.
 ///
 /// The policy is consulted **before any packet leaves the machine**, inside
 /// `omni_platform::net::Socket::connect`, and a destination outside it is a refusal naming the
@@ -2286,10 +2315,10 @@ pub(super) fn connect(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
                 // writable-or-in-error when the handshake settles, which is the only correct
                 // thing to wait for: `SO_ERROR` reads zero while it is still in flight, so
                 // reading it alone cannot tell success from *not yet*.
-                let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
-                if !await_socket(&handle, Interest::WRITABLE, deadline)? {
-                    return Err(waited_out(&view, fd));
-                }
+                //
+                // With no deadline the wait returns only once the socket is ready, or refuses when
+                // the runtime stops; there is no `false` to handle.
+                await_socket(&view, fd, &handle, Interest::WRITABLE, None)?;
                 match settled(&view, locked(&handle).connect_result())? {
                     Netted::Done(ConnectOutcome::Connected) => 0,
                     Netted::Done(ConnectOutcome::Failed(kind)) => {
@@ -2496,9 +2525,11 @@ pub(super) fn listen(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// # A blocking accept waits for a connection, however long that is
 ///
 /// That is what `accept` is for: the MicroProfiler's thread sits here until a browser connects,
-/// which on a device may be never. So this is **not** capped at [`MAX_SLEEP_SECONDS`] as a
-/// guest-chosen sleep is -- a refusal after a minute would kill a thread that is behaving
-/// correctly. What the cap exists to prevent, a host thread nothing can end, is prevented as
+/// which on a device may be never. So this was never capped at
+/// [`MAX_SLEEP_SECONDS`](super::MAX_SLEEP_SECONDS), even when guest-chosen sleeps were -- a
+/// refusal after a minute would kill a thread that is behaving correctly -- and it was the first
+/// wait here to take the shape they all have now. What the cap existed to prevent, a host thread
+/// nothing can end, is prevented as
 /// `poll` and `select` prevent it for a socket: the wait re-tests every [`MIXED_WAIT_SLICE`], ends
 /// the moment a connection is pending, and ends by name when the runtime stops its guest threads
 /// ([`stop_requested`]). A receive timeout (`SO_RCVTIMEO`) bounds it as Linux's `accept` honours
@@ -2537,7 +2568,9 @@ pub(super) fn accept(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             c.ret().i32(-1);
             return Ok(());
         }
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        // A timeout past the host clock's range is no deadline, not a panic: `socket_deadline`'s
+        // rule.
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         let accepted = loop {
             {
                 let socket = locked(&handle);
@@ -3192,9 +3225,10 @@ fn socket_recv(
 
     let nonblocking = locked(handle).nonblocking();
     if !wants_nonblocking(nonblocking, flags) {
-        let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
-        if !await_socket(handle, Interest::READABLE, deadline)? {
-            return Err(waited_out(view, fd));
+        // Until the socket is readable or its own `SO_RCVTIMEO` runs out: Linux's `EAGAIN`.
+        let deadline = socket_deadline(handle, SocketQuery::ReceiveTimeout);
+        if !await_socket(view, fd, handle, Interest::READABLE, deadline)? {
+            return Ok(Netted::Failed(consts::EAGAIN));
         }
     }
     let mut host = vec![0u8; want];
@@ -3287,9 +3321,11 @@ fn send_bytes(
 ) -> AbiResult<Netted<i64>> {
     let nonblocking = locked(handle).nonblocking();
     if !wants_nonblocking(nonblocking, flags) {
-        let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
-        if !await_socket(handle, Interest::WRITABLE, deadline)? {
-            return Err(waited_out(view, fd));
+        // Until the socket is writable or its own `SO_SNDTIMEO` runs out with nothing sent:
+        // Linux's `EAGAIN`.
+        let deadline = socket_deadline(handle, SocketQuery::SendTimeout);
+        if !await_socket(view, fd, handle, Interest::WRITABLE, deadline)? {
+            return Ok(Netted::Failed(consts::EAGAIN));
         }
     }
     let outcome = {
@@ -3723,9 +3759,10 @@ fn receive_message(
             return Ok(Netted::Failed(consts::EAGAIN));
         }
     } else if blocking {
-        let deadline = Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS);
-        if !await_socket(handle, Interest::READABLE, deadline)? {
-            return Err(waited_out(view, fd));
+        // `socket_recv`'s wait: until readable, or `EAGAIN` when its own `SO_RCVTIMEO` runs out.
+        let deadline = socket_deadline(handle, SocketQuery::ReceiveTimeout);
+        if !await_socket(view, fd, handle, Interest::READABLE, deadline)? {
+            return Ok(Netted::Failed(consts::EAGAIN));
         }
     }
     let mut host = vec![0u8; total];

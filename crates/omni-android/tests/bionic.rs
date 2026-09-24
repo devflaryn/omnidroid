@@ -4879,17 +4879,134 @@ fn gmtime_answers_into_per_thread_storage_that_strerror_does_not_share() {
     assert_eq!(f.read_cstring(message), before, "and the message survived the gmtime");
 }
 
-/// **A sleep really sleeps, a malformed request is `EINVAL`, and a request past the cap refuses.**
+// ------------------------------------------------------------------ long waits and the stop switch
+//
+// A guest wait of any length is carried out in host parks, with the stop switch read between
+// them; the switch, not a cap, is what ends one nobody should wait out. These are the helpers the
+// tests of that use. They never *sleep* to find out where a thread is: the boundary's census says
+// which handler each host thread is inside (`VERIFICATION.md` entry 6).
+
+/// How many host threads `boundary` shows inside `symbol`'s handler right now.
 ///
-/// The cap is the hostile-input half: a sleeping thread executes no guest instructions, so D16's
-/// step-budget watchdog cannot end one, and `nanosleep({INT64_MAX, 0})` would be a permanent hang
-/// of the host thread that serviced it.
+/// With the census on, a thread record whose crossings are one past its exits is inside a handler,
+/// and its slot names which. Meaningful only after `Boundary::start_census`, and only for records
+/// created after it -- which is every record in a test that starts the census before it runs
+/// anything.
+fn inside(boundary: &Boundary, symbol: &str) -> usize {
+    boundary
+        .threads()
+        .iter()
+        .filter(|record| {
+            record.symbol.as_deref() == Some(symbol) && record.crossings == record.exits + 1
+        })
+        .count()
+}
+
+/// Wait, bounded, until at least `n` threads are inside each named handler. `false` if they never
+/// all were, or if `give_up` says the thing being waited for has already finished.
+fn await_inside(
+    boundary: &Boundary,
+    want: &[(&str, usize)],
+    give_up: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if want.iter().all(|(symbol, n)| inside(boundary, symbol) >= *n) {
+            return true;
+        }
+        if give_up.load(std::sync::atomic::Ordering::Acquire) || std::time::Instant::now() >= deadline
+        {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// **Run a one-call program on this thread, and throw the stop switch from another once the call
+/// is seen inside its handler.** Returns the call's result and, if the switch was thrown, how long
+/// after it the call came back.
+///
+/// The call is expected to be a wait that nothing but the switch ends, so a test asserts the
+/// result is a refusal *naming the stop* -- which is what distinguishes "the wait was carried out
+/// until the runtime ended it" from "the wait was refused before it began", the old cap. The
+/// switch is thrown only once the thread is inside the handler, so a call refused up front is
+/// seen as that and not as a stop.
+///
+/// **Only for a wait whose length is bounded** (a minute or so): if the stop check were missing,
+/// the call would return at its own deadline and the test fails then, rather than hanging.
+fn run_until_stopped(
+    f: &Fixture,
+    symbol: &'static str,
+    setup: impl FnOnce(&mut Asm),
+) -> (Result<ExitReason, AbiError>, Option<std::time::Duration>) {
+    f.boundary.start_census();
+    let entry = call_one(f, symbol, setup);
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopper = {
+        let (bionic, boundary, finished) =
+            (Arc::clone(&f.bionic), Arc::clone(&f.boundary), Arc::clone(&finished));
+        std::thread::spawn(move || {
+            if !await_inside(&boundary, &[(symbol, 1)], &finished) {
+                return None;
+            }
+            let at = std::time::Instant::now();
+            bionic.stop_guest_threads();
+            Some(at)
+        })
+    };
+    let mut cpu = f.guest.thread(&f.boundary);
+    let result = f.run(&mut cpu, entry);
+    let returned = std::time::Instant::now();
+    finished.store(true, std::sync::atomic::Ordering::Release);
+    let stopped = stopper.join().expect("the stopping thread");
+    (result, stopped.map(|at| returned.saturating_duration_since(at)))
+}
+
+/// [`run_until_stopped`], asserting the call was ended by the stop switch -- promptly, and by a
+/// refusal that names the stop -- and returning the refusal's text.
+fn ended_by_the_stop(f: &Fixture, symbol: &'static str, setup: impl FnOnce(&mut Asm)) -> String {
+    let (result, after) = run_until_stopped(f, symbol, setup);
+    let after = after.unwrap_or_else(|| {
+        panic!(
+            "`{symbol}` was never seen waiting: it finished first, with {result:?} -- a long wait \
+             refused or cut short before it began"
+        )
+    });
+    let error = match result {
+        Err(error) => error,
+        Ok(exit) => panic!(
+            "`{symbol}` returned ({exit:?}, X0 = {:#x}) {after:?} after the stop switch was thrown; \
+             a wait the runtime ended has no true value to return",
+            f.guest.read_u64(f.guest.data)
+        ),
+    };
+    let text = error.to_string();
+    assert_eq!(error.symbol(), Some(symbol), "{text}");
+    assert!(
+        text.contains("asked its guest threads to stop"),
+        "the refusal must name the stop that ended the wait, not a cap: {text}"
+    );
+    assert!(
+        after < std::time::Duration::from_secs(10),
+        "`{symbol}` took {after:?} to notice the stop switch; a park is at most a second"
+    );
+    text
+}
+
+/// **A sleep really sleeps and a malformed request is `EINVAL`** -- and a long one is carried out
+/// until the runtime's stop switch ends it, rather than refused.
+///
+/// The long arm used to be "a request past the cap refuses". The cap is gone because a refusal
+/// kills the guest thread, which on the real engine killed a correct worker; what stops a sleep
+/// nobody should wait out is now the switch, and a sleep it ends is refused **naming the stop**.
+/// 90 s is past the old 60 s cap and short enough that a build without the stop check fails at
+/// its own deadline instead of hanging.
 ///
 /// The duration assertion is **one-sided**, which is the only side `nanosleep` and Windows' ~15.6 ms
 /// timer tick between them guarantee. n = 1: a lower bound on a sleep is not a rare event and does
 /// not need a sample — every run either slept or did not.
 #[test]
-fn nanosleep_sleeps_reports_einval_and_refuses_a_request_past_the_cap() {
+fn nanosleep_sleeps_reports_einval_and_a_long_sleep_is_ended_only_by_the_stop_switch() {
     let _guard = serialized();
     let f = fixture();
     let req = f.guest.data + 0x200;
@@ -4914,6 +5031,22 @@ fn nanosleep_sleeps_reports_einval_and_refuses_a_request_past_the_cap() {
     assert_eq!(f.guest.read_u64(rem), 0, "no signals are delivered, so nothing remains");
     assert_eq!(f.guest.read_u64(rem + 8), 0);
 
+    // 1.5 s: longer than one park, so it is carried out in two, and still returns 0 -- at its
+    // deadline, not at a slice boundary.
+    f.guest.write_u64(req, 1);
+    f.guest.write_u64(req + 8, 500_000_000);
+    let before = std::time::Instant::now();
+    let code = value_of(&f, "nanosleep", |asm| {
+        asm.mov(0, req as u64);
+        asm.mov(1, 0);
+    });
+    let elapsed = before.elapsed();
+    assert_eq!(code as i64 as i32, 0);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1_500),
+        "a 1.5 s nanosleep returned after {elapsed:?}: a sliced sleep answered at a slice boundary"
+    );
+
     // POSIX's validity rule, at both edges. `-1` with `errno` is the C library's own answer to a
     // malformed request and is a contract rather than a stub.
     for (seconds, nanos) in [(0u64, 1_000_000_000u64), (0, (-1i64) as u64), ((-1i64) as u64, 0)] {
@@ -4926,41 +5059,58 @@ fn nanosleep_sleeps_reports_einval_and_refuses_a_request_past_the_cap() {
         assert_eq!(code as i64 as i32, -1, "{seconds}s + {nanos}ns must be EINVAL");
     }
 
-    // Past the cap: refused by name, with both numbers in the message.
-    f.guest.write_u64(req, i64::MAX as u64);
+    // Past the old cap: carried out, and ended by the stop switch. **Last**, because the switch
+    // does not reset.
+    f.guest.write_u64(req, 90);
     f.guest.write_u64(req + 8, 0);
-    let error = refusal_of(&f, "nanosleep", |asm| {
+    let text = ended_by_the_stop(&f, "nanosleep", |asm| {
         asm.mov(0, req as u64);
-        asm.mov(1, 0);
+        asm.mov(1, rem as u64);
     });
-    assert_eq!(error.symbol(), Some("nanosleep"));
-    let text = error.to_string();
-    assert!(text.contains("60"), "the refusal must name the cap: {text}");
-    assert!(text.contains(&i64::MAX.to_string()), "and what was asked for: {text}");
+    assert!(text.contains("90 s"), "and what was asked for: {text}");
 }
 
 /// **`usleep` takes only the low 32 bits of `X0`**, because `useconds_t` is `unsigned int`.
 ///
-/// The structural assertion, and the reason it is structural rather than timed: AAPCS64 does not
-/// require a caller to clear the high half of a register holding a 32-bit argument, so a handler
-/// that read all 64 bits would turn a perfectly ordinary 100 µs sleep into a request for 584,000
-/// years — which the cap would then *refuse*. So the test is "a correct call is not refused", and
-/// it fails loudly against the wrong read rather than hanging.
+/// The structural assertion: AAPCS64 does not require a caller to clear the high half of a
+/// register holding a 32-bit argument, so a handler that read all 64 bits would turn a perfectly
+/// ordinary 100 µs sleep into a sleep of 584,000 years. **That would hang rather than fail**, so a
+/// watchdog throws the stop switch if the call has not returned in ten seconds, and the sleep then
+/// ends in a refusal the assertion reports.
 #[test]
 fn usleep_reads_only_the_low_thirty_two_bits_of_its_argument() {
     let _guard = serialized();
     let f = fixture();
-    let code = value_of(&f, "usleep", |asm| {
+    let watchdog = {
+        let bionic = Arc::clone(&f.bionic);
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            if finished.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                bionic.stop_guest_threads();
+            }
+        });
+        (done, thread)
+    };
+    let entry = call_one(&f, "usleep", |asm| {
         asm.mov(0, 0xFFFF_FFFF_0000_0064);
     });
-    assert_eq!(code as i64 as i32, 0, "100 us with a dirty high half must still be 100 us");
+    let mut cpu = f.guest.thread(&f.boundary);
+    let result = f.run(&mut cpu, entry);
+    let _ = watchdog.0.send(());
+    watchdog.1.join().expect("the watchdog");
+    assert!(
+        matches!(result, Ok(ExitReason::Returned { .. })),
+        "100 us with a dirty high half must still be 100 us, and return: {result:?}"
+    );
+    assert_eq!(f.guest.read_u64(f.guest.data) as i64 as i32, 0);
 
-    // And the cap still applies to a value that really is large: 0xFFFF_FFFF us is 4,294 s.
-    let error = refusal_of(&f, "usleep", |asm| {
-        asm.mov(0, 0xFFFF_FFFF);
+    // And a value past the old cap -- 90 s, bounded so that a build without the stop check fails
+    // at its deadline rather than hanging -- is carried out, not refused, until the stop switch
+    // ends it.
+    let text = ended_by_the_stop(&f, "usleep", |asm| {
+        asm.mov(0, 90_000_000);
     });
-    assert_eq!(error.symbol(), Some("usleep"));
-    assert!(error.to_string().contains("60"), "{error}");
+    assert!(text.contains("90000000 us"), "and what was asked for: {text}");
 }
 
 // ------------------------------------------------------------------ process and environment
@@ -9376,14 +9526,20 @@ fn poll_with_nothing_ready_sleeps_for_its_timeout_and_returns_zero() {
     assert_eq!(revents_of(&f, at, 1), 0);
 }
 
-/// **An unbounded wait and an over-long one are refused by name, and a bounded one is not.**
+/// **An unbounded wait with nothing that can end it is refused by name; a bounded one is carried
+/// out however long it is, and only the stop switch ends it early.**
 ///
-/// All three arms, because a refusal that was widened to cover the third would stop a correct
-/// guest and a refusal that was narrowed to cover neither would hang the run. The refusal text
-/// has to name why nothing can become ready, since that is the fact a reader three thousand
+/// All three arms, because a refusal that was widened to cover the bounded ones would stop a
+/// correct guest and a refusal that was narrowed to cover none would hang the run. The refusal
+/// text has to name why nothing can become ready, since that is the fact a reader three thousand
 /// initializers deep needs.
+///
+/// The long arm was "61 seconds, one past the cap, is refused". The cap is gone: a refusal kills
+/// the guest thread, and a finite wait has a true answer at its deadline. This instance has no
+/// filesystem, so it is the degenerate sleep branch of `wait_until_ready`, sliced and
+/// stop-checked like `nanosleep`.
 #[test]
-fn poll_refuses_a_wait_that_nothing_can_end() {
+fn poll_refuses_an_unbounded_wait_and_carries_out_a_long_one() {
     let _guard = serialized();
     let f = fixture();
 
@@ -9397,22 +9553,21 @@ fn poll_refuses_a_wait_that_nothing_can_end() {
     assert!(text.contains("indefinitely"), "{text}");
     assert!(text.contains("socket"), "the refusal must say why nothing can become ready: {text}");
 
-    // 61 seconds, one past the cap.
-    let error = refusal_of(&f, "poll", |asm| {
-        asm.mov(0, 0);
-        asm.mov(1, 0);
-        asm.mov(2, 61_000);
-    });
-    assert_eq!(error.symbol(), Some("poll"));
-    assert!(error.to_string().contains("60 seconds"), "{error}");
-
-    // And the arm that must not be refused: a wait inside the cap.
+    // The arm that must not be refused: a short wait, carried out, and a timeout at its end.
     let returned = value_of(&f, "poll", |asm| {
         asm.mov(0, 0);
         asm.mov(1, 0);
         asm.mov(2, 1);
     });
-    assert_eq!(returned as i64, 0, "a wait inside the cap is carried out, not refused");
+    assert_eq!(returned as i64, 0, "a short wait is carried out, not refused");
+
+    // 61 seconds, one past the old cap: carried out until the stop switch ends it. Last, because
+    // the switch does not reset.
+    ended_by_the_stop(&f, "poll", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 61_000);
+    });
 }
 
 /// A hostile `nfds` is `EINVAL` rather than a request to read 147 exabytes of guest memory.
@@ -9665,21 +9820,7 @@ fn select_with_a_hostile_timeval_is_einval_and_a_null_timeout_is_refused() {
         assert_eq!(f.guest.read_u64(out + 8), EINVAL_NET, "timeval {{{seconds}, {micros}}}");
     }
 
-    // A `tv_sec` past the cap is a refusal rather than an errno: it is well formed and this layer
-    // is declining to carry it out.
-    f.guest.write_u64(tv, 61);
-    f.guest.write_u64(tv + 8, 0);
-    let error = refusal_of(&f, "select", |asm| {
-        asm.mov(0, 0);
-        asm.mov(1, 0);
-        asm.mov(2, 0);
-        asm.mov(3, 0);
-        asm.mov(4, tv as u64);
-    });
-    assert_eq!(error.symbol(), Some("select"));
-    assert!(error.to_string().contains("60 seconds"), "{error}");
-
-    // And a null timeout is the unbounded wait.
+    // A null timeout is the unbounded wait, refused by name.
     let error = refusal_of(&f, "select", |asm| {
         asm.mov(0, 0);
         asm.mov(1, 0);
@@ -9689,14 +9830,28 @@ fn select_with_a_hostile_timeval_is_einval_and_a_null_timeout_is_refused() {
     });
     assert_eq!(error.symbol(), Some("select"));
     assert!(error.to_string().contains("indefinitely"), "{error}");
+
+    // A `tv_sec` past the old cap is well formed and is carried out -- it used to be refused --
+    // until the stop switch ends it. No filesystem, so this is `select`'s own sleep branch, sliced
+    // so that the switch is read between parks. Last, because the switch does not reset.
+    f.guest.write_u64(tv, 61);
+    f.guest.write_u64(tv + 8, 0);
+    ended_by_the_stop(&f, "select", |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+        asm.mov(4, tv as u64);
+    });
 }
 
 /// **A failed `select` leaves the guest's sets exactly as it found them.**
 ///
 /// POSIX: "on failure, the objects pointed to by the readfds, writefds, and errorfds arguments
 /// are not modified". The three ways this call fails after it has already read the sets are a
-/// malformed `struct timeval`, a `timeout` pointer that is not readable, and a wait past the cap
-/// — and in every one of them a guest that retries the call has to still have its sets.
+/// malformed `struct timeval`, a `timeout` pointer that is not readable, and a wait the runtime's
+/// stop switch ends — and in every one of them a guest that retries the call has to still have
+/// its sets.
 ///
 /// **This is a defect the first version of the module had**, found by re-reading it rather than
 /// by a failing test: the sets were zeroed and written back *before* the timeout was read, so a
@@ -9760,17 +9915,7 @@ fn a_failed_select_does_not_modify_the_guests_sets() {
     assert!(matches!(error, AbiError::BadPointer { .. }), "{error:?}");
     assert_eq!(read_guest(&f, exceptfds, 8), bits[..8], "a refused select modified the set");
 
-    // A wait past the cap: a refusal naming the cap, and the set untouched.
-    f.guest.write_u64(tv, 61);
-    f.guest.write_u64(tv + 8, 0);
-    let (result, _, _) = run(&|asm| {
-        asm.mov(4, tv as u64);
-    });
-    let error = result.expect_err("a wait past the cap");
-    assert!(error.to_string().contains("60 seconds"), "{error}");
-    assert_eq!(read_guest(&f, exceptfds, 8), bits[..8], "a refused select modified the set");
-
-    // And the arm that must still zero it: a wait inside the cap, carried out.
+    // The arm that must still zero it: a short wait, carried out, that really timed out.
     f.guest.write_u64(tv, 0);
     f.guest.write_u64(tv + 8, 1_000);
     let (result, returned, _) = run(&|asm| {
@@ -9783,6 +9928,23 @@ fn a_failed_select_does_not_modify_the_guests_sets() {
         vec![0u8; 8],
         "a select that really timed out must zero the sets"
     );
+
+    // A long wait the stop switch ends: a refusal naming the stop, and the set untouched -- it did
+    // not time out, so zeroing it would report a timeout that did not happen. This instance has a
+    // filesystem, so the wait is `wait_a_slice`'s gate branch, parked a slice at a time. Last,
+    // because the switch does not reset.
+    f.guest.write_bytes(exceptfds, &bits);
+    f.guest.write_u64(tv, 61);
+    f.guest.write_u64(tv + 8, 0);
+    let text = ended_by_the_stop(&f, "select", |asm| {
+        asm.mov(0, 8);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, exceptfds as u64);
+        asm.mov(4, tv as u64);
+    });
+    assert!(text.contains("descriptor set"), "{text}");
+    assert_eq!(read_guest(&f, exceptfds, 8), bits[..8], "a stopped select modified the set");
 }
 
 // =========================================== M6: eventfd, which jni-surface.md row 21 reaches
@@ -15578,4 +15740,393 @@ fn listen_and_accept_serve_a_connection_from_guest_code() {
     });
     let text = error.to_string();
     assert!(text.contains("allow_listen") && text.contains("0.0.0.0"), "{text}");
+}
+
+// =========================================== long waits on guest threads, and the stop switch
+
+/// A guest UDP socket bound to `127.0.0.1:0`, through real guest code: nobody knows its port, so
+/// nothing will ever make it readable. `blocking` leaves it as `socket` made it.
+fn silent_udp_socket(f: &Fixture) -> i32 {
+    let (fd, errno) = call_with_errno(f, "socket", &[AF_INET, 2, 0]); // SOCK_DGRAM
+    assert!(fd >= 3, "socket: {fd}, errno {errno}");
+    let at = f.guest.data + 0x100;
+    f.guest.write_bytes(at, &sockaddr_in([127, 0, 0, 1], 0));
+    assert_eq!(call_with_errno(f, "bind", &[fd as u64, at as u64, 16]), (0, 0), "bind");
+    fd as i32
+}
+
+/// **Every kind of long guest wait is carried out, and every one is ended by the stop switch
+/// within seconds** -- on guest threads, which is where the engine makes them.
+///
+/// MEASURED as the reason (the gate, in a world, 2026-09-24): teardown's `join_guest_threads`
+/// timed out after 60 s with a thread "INSIDE poll", because a `poll` over sockets alone parked in
+/// one host call for up to `MAX_SLEEP_SECONDS` and the stop switch is read only between parks.
+/// And before that, the join worker's ~120 s wait was *refused* past the old cap, which killed it.
+/// So each thread below asks for a wait past the old cap -- or for none at all -- and the test
+/// asserts three things:
+///
+/// * **none of them is refused before the stop**: `guest_thread_failures` is empty, and a thread
+///   stopped by teardown is filed as stopped, not failed;
+/// * **none of them returns** a value: every call-returned flag is still zero, because a wait the
+///   runtime ended has no true value to report;
+/// * **all of them stop promptly**: `join_guest_threads` succeeds inside its 20 s. A park of a
+///   minute -- or an hour, or `nanosleep(INT64_MAX)` in one host sleep -- fails that bound, and
+///   so does a wait with no stop check at all, as a *failed join* rather than a hung suite, which
+///   is why this runs on guest threads.
+///
+/// The threads are seen inside their handlers through the boundary's census before the switch is
+/// thrown, never by sleeping a guessed interval (`VERIFICATION.md` entry 6).
+#[test]
+fn long_waits_on_guest_threads_end_when_the_runtime_stops() {
+    let _guard = serialized();
+    let (f, _root) = networked("long-waits-stop");
+    let backend: Arc<dyn omni_cpu::GuestCpuBackend> = Arc::clone(&f.guest.backend) as _;
+    f.bionic.set_thread_host(ThreadHost::new(backend).with_limit(16)).expect("a thread host");
+
+    // What the waits are on. The pipe's write end stays open, so its empty read end is a wait for
+    // a writer rather than an end of file; the sockets are bound where nobody will send.
+    let (read_fd, _write_fd) = pipe_through_guest(&f);
+    let polled = silent_udp_socket(&f);
+    let received = silent_udp_socket(&f);
+    let watched = silent_udp_socket(&f);
+    let (epfd, errno) = call_with_errno(&f, "epoll_create1", &[0]);
+    assert!(epfd >= 3, "epoll_create1: {epfd}, errno {errno}");
+    let event = f.guest.data + 0x300;
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&EPOLLIN_GUEST.to_le_bytes());
+    f.guest.write_bytes(event, &bytes);
+    assert_eq!(
+        call_with_errno(&f, "epoll_ctl", &[epfd as u64, 1, watched as u64, event as u64]),
+        (0, 0),
+        "EPOLL_CTL_ADD"
+    );
+
+    let base = f.guest.data + 0x1000;
+    let (hour, forever, timeval, pollfd_at, buffer, events, flags, out) =
+        (base, base + 0x10, base + 0x20, base + 0x40, base + 0x80, base + 0x100, base + 0x200, base + 0x300);
+    f.guest.write_u64(hour, 3600);
+    f.guest.write_u64(hour + 8, 0);
+    // `{INT64_MAX, 0}`: past the host clock on Linux, so an untimed sleep there; on Windows a
+    // sleep of 292 billion years. Either way only the switch ends it.
+    f.guest.write_u64(forever, i64::MAX as u64);
+    f.guest.write_u64(forever + 8, 0);
+    f.guest.write_u64(timeval, 3600);
+    f.guest.write_u64(timeval + 8, 0);
+    f.guest.write_bytes(pollfd_at, &pollfd(polled, 0x001)); // POLLIN
+
+    // Each wait, as a start routine that calls it and then sets its own flag -- which only a
+    // call that *returned* reaches.
+    type Setup<'a> = Box<dyn Fn(&mut Asm) + 'a>;
+    let waits: Vec<(&'static str, Setup<'_>)> = vec![
+        ("nanosleep", Box::new(|asm: &mut Asm| {
+            asm.mov(0, hour as u64);
+            asm.mov(1, 0);
+        })),
+        ("nanosleep", Box::new(|asm: &mut Asm| {
+            asm.mov(0, forever as u64);
+            asm.mov(1, 0);
+        })),
+        ("usleep", Box::new(|asm: &mut Asm| {
+            asm.mov(0, 0xFFFF_FFFF);
+        })),
+        // Nothing to poll, on an instance with a filesystem: `wait_a_slice`'s gate branch.
+        ("poll", Box::new(|asm: &mut Asm| {
+            asm.mov(0, 0);
+            asm.mov(1, 0);
+            asm.mov(2, i32::MAX as u64);
+        })),
+        // A socket nobody writes to: the sockets-only branch, the live failure above.
+        ("poll", Box::new(|asm: &mut Asm| {
+            asm.mov(0, pollfd_at as u64);
+            asm.mov(1, 1);
+            asm.mov(2, 120_000);
+        })),
+        ("select", Box::new(|asm: &mut Asm| {
+            asm.mov(0, 0);
+            asm.mov(1, 0);
+            asm.mov(2, 0);
+            asm.mov(3, 0);
+            asm.mov(4, timeval as u64);
+        })),
+        // The engine's I/O thread's idle: `epoll_wait(-1)` over sockets alone.
+        ("epoll_wait", Box::new(|asm: &mut Asm| {
+            asm.mov(0, epfd as u64);
+            asm.mov(1, events as u64);
+            asm.mov(2, 1);
+            asm.mov(3, u64::MAX); // -1
+        })),
+        // Blocking transfers with no timeout of their own: a socket and a pipe.
+        ("recvfrom", Box::new(|asm: &mut Asm| {
+            asm.mov(0, received as u64);
+            asm.mov(1, buffer as u64);
+            asm.mov(2, 16);
+            asm.mov(3, 0);
+            asm.mov(4, 0);
+            asm.mov(5, 0);
+        })),
+        ("read", Box::new(|asm: &mut Asm| {
+            asm.mov(0, read_fd as u64);
+            asm.mov(1, buffer as u64 + 0x40);
+            asm.mov(2, 8);
+        })),
+    ];
+    let starts: Vec<omni_cpu::GuestAddr> = waits
+        .iter()
+        .enumerate()
+        .map(|(index, (symbol, setup))| {
+            let flag = flags + 8 * index;
+            f.guest.write_u64(flag, 0);
+            let entry = f.guest.next_entry();
+            let mut asm = Asm::at(entry);
+            asm.push(mov_reg(21, 30));
+            setup(&mut asm);
+            asm.bl(f.thunk(symbol));
+            asm.mov(9, flag as u64);
+            asm.mov(10, 1);
+            asm.push(str_imm(10, 9, 0));
+            asm.mov(0, 0);
+            asm.push(ret(21));
+            f.guest.load(asm.words());
+            entry
+        })
+        .collect();
+    // Every program is assembled before any guest thread runs: `Guest::load` reprotects the whole
+    // code region, and doing that under a running guest thread faults it.
+    let create = program(&f, |asm| {
+        for (index, start) in starts.iter().enumerate() {
+            create_call(&f, asm, out + 16 * index, 0, *start, 0);
+        }
+    });
+
+    f.boundary.start_census();
+    assert!(matches!(run_program(&f, create).expect("the creates complete"), ExitReason::Returned { .. }));
+    for index in 0..waits.len() {
+        assert_eq!(f.guest.read_u64(out + 16 * index + 8), 0, "pthread_create #{index}");
+    }
+    let mut want: Vec<(&str, usize)> = Vec::new();
+    for (symbol, _) in &waits {
+        match want.iter_mut().find(|(seen, _)| *seen == *symbol) {
+            Some((_, n)) => *n += 1,
+            None => want.push((*symbol, 1)),
+        }
+    }
+    let never = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        await_inside(&f.boundary, &want, &never),
+        "not every thread was seen waiting in 30 s: wanted {want:?}; failures {:?}; returned {:?}",
+        f.bionic.guest_thread_failures(),
+        (0..waits.len()).map(|i| f.guest.read_u64(flags + 8 * i)).collect::<Vec<_>>()
+    );
+
+    let stopped = std::time::Instant::now();
+    f.bionic.stop_guest_threads();
+    let joined = f.bionic.join_guest_threads(std::time::Duration::from_secs(20));
+    let took = stopped.elapsed();
+    let still: Vec<String> = f
+        .boundary
+        .threads()
+        .iter()
+        .filter(|record| record.crossings == record.exits + 1)
+        .filter_map(|record| record.symbol.clone())
+        .collect();
+    assert!(
+        joined,
+        "the stop switch did not end every long wait in 20 s; still inside: {still:?}. A park \
+         longer than that, or a wait that never reads the switch, holds teardown"
+    );
+    assert!(
+        f.bionic.guest_thread_failures().is_empty(),
+        "a long wait was refused rather than carried out: {:?}",
+        f.bionic.guest_thread_failures()
+    );
+    for (index, (symbol, _)) in waits.iter().enumerate() {
+        assert_eq!(
+            f.guest.read_u64(flags + 8 * index),
+            0,
+            "`{symbol}` (#{index}) returned: a wait the runtime ended has no true value to return"
+        );
+    }
+    // Reported, not asserted past the join's own bound: how long teardown took is a figure, and
+    // its bound is the 20 s above.
+    eprintln!("long waits on {} guest threads stopped in {took:?}", waits.len());
+}
+
+/// **A blocking receive waits for data however long that takes, honours `SO_RCVTIMEO` as Linux
+/// does, and is ended by the stop switch -- by name -- when neither arrives.**
+///
+/// It used to be refused after `MAX_SLEEP_SECONDS`, which killed the guest thread for a peer that
+/// was slow to speak. `SO_RCVTIMEO` was not honoured at all then; a caller that set one to learn
+/// "nothing yet" by `EAGAIN` got the refusal instead.
+///
+/// **Nothing here can hang.** Each timeout arm has a rescuer: if the call has not come back in ten
+/// seconds, a host socket sends it a datagram, so a build that ignores the timeout fails with a
+/// byte count where `EAGAIN` was required. The stopped arm's own `SO_RCVTIMEO` is 50 s, so a build
+/// without the stop check fails at that deadline -- `EAGAIN` where a refusal was required.
+#[test]
+fn a_blocking_receive_honours_its_timeout_and_is_ended_by_the_stop_switch() {
+    let _guard = serialized();
+    let (f, _root) = networked("recv-timeout-stop");
+    let fd = silent_udp_socket(&f);
+    let buffer = f.guest.data + 0x200;
+    let timeval = f.guest.data + 0x2C0;
+    let set_timeout = |seconds: u64, micros: u64| {
+        f.guest.write_u64(timeval, seconds);
+        f.guest.write_u64(timeval + 8, micros);
+        assert_eq!(
+            call_with_errno(&f, "setsockopt", &[fd as u64, 1, 20, timeval as u64, 16]),
+            (0, 0),
+            "SO_RCVTIMEO"
+        );
+    };
+    let address = {
+        let (out, len) = (f.guest.data + 0x140, f.guest.data + 0x160);
+        f.guest.write_bytes(len, &16u32.to_le_bytes());
+        assert_eq!(call_with_errno(&f, "getsockname", &[fd as u64, out as u64, len as u64]), (0, 0));
+        let bytes = read_guest(&f, out, 4);
+        std::net::SocketAddr::from(([127, 0, 0, 1], u16::from_be_bytes([bytes[2], bytes[3]])))
+    };
+    let sender = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").expect("a host sender"));
+    // Run `call` with a rescuer standing by: a datagram in ten seconds unless it came back first.
+    let rescued = |call: &dyn Fn() -> (i64, u64)| {
+        let (done, waiting) = std::sync::mpsc::channel::<()>();
+        let rescuer = {
+            let sender = Arc::clone(&sender);
+            std::thread::spawn(move || {
+                if waiting.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                    let _ = sender.send_to(b"late", address);
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let result = call();
+        let took = started.elapsed();
+        let _ = done.send(());
+        rescuer.join().expect("the rescuer");
+        (result, took)
+    };
+
+    // 200 ms: `recvfrom` and `recvmsg` both answer EAGAIN once it runs out, and not before.
+    set_timeout(0, 200_000);
+    let (result, took) =
+        rescued(&|| call_with_errno(&f, "recvfrom", &[fd as u64, buffer as u64, 16, 0, 0, 0]));
+    assert_eq!(result, (-1, 11), "EAGAIN from recvfrom when SO_RCVTIMEO runs out");
+    assert!(took >= std::time::Duration::from_millis(150), "it waited the timeout: {took:?}");
+    let (iov, msg) = (f.guest.data + 0x300, f.guest.data + 0x340);
+    f.guest.write_u64(iov, buffer as u64);
+    f.guest.write_u64(iov + 8, 16);
+    let mut header = [0u8; 56];
+    header[16..24].copy_from_slice(&(iov as u64).to_le_bytes()); // msg_iov
+    header[24..32].copy_from_slice(&1u64.to_le_bytes()); // msg_iovlen
+    f.guest.write_bytes(msg, &header);
+    let (result, took) = rescued(&|| call_with_errno(&f, "recvmsg", &[fd as u64, msg as u64, 0]));
+    assert_eq!(result, (-1, 11), "EAGAIN from recvmsg when SO_RCVTIMEO runs out");
+    assert!(took >= std::time::Duration::from_millis(150), "it waited the timeout: {took:?}");
+
+    // Data that arrives is received, timeout or not.
+    sender.send_to(b"ping", address).expect("a datagram to the guest");
+    assert_eq!(
+        call_with_errno(&f, "recvfrom", &[fd as u64, buffer as u64, 16, 0, 0, 0]),
+        (4, 0),
+        "a datagram that arrived"
+    );
+    assert_eq!(read_guest(&f, buffer, 4), b"ping");
+
+    // Nothing arrives and the timeout is far off: the wait goes on until the stop switch ends it.
+    set_timeout(50, 0);
+    let text = ended_by_the_stop(&f, "recvfrom", |asm| {
+        asm.mov(0, fd as u64);
+        asm.mov(1, buffer as u64);
+        asm.mov(2, 16);
+        asm.mov(3, 0);
+        asm.mov(4, 0);
+        asm.mov(5, 0);
+    });
+    assert!(text.contains(&format!("socket fd {fd}")), "{text}");
+}
+
+/// **A blocking send whose socket has no room honours `SO_SNDTIMEO` as Linux does**: `EAGAIN` once
+/// it runs out with nothing sent, and not before.
+///
+/// It used to be refused after `MAX_SLEEP_SECONDS` instead, whatever the socket's own timeout
+/// said. The room is used up by a peer that never reads: the guest's end is made non-blocking and
+/// filled until the host says `EAGAIN`, then made blocking again for the timed send.
+///
+/// **Nothing here can hang**: if the timed send has not come back in ten seconds, a rescuer drains
+/// the peer, and a build that ignores the timeout fails with a byte count where `EAGAIN` was
+/// required.
+#[test]
+fn a_blocking_send_honours_its_timeout() {
+    use std::io::Read;
+    let _guard = serialized();
+    let (f, _root) = networked("send-timeout");
+    let (listener, port) = guest_listener(&f, 0);
+    let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let (accepted, errno) = call_with_errno(&f, "accept", &[listener as u64, 0, 0]);
+    assert!(accepted >= 3, "accept: {accepted}, errno {errno}");
+    let fd = accepted as u64;
+
+    // One program, run as often as it takes: `sendto(fd, chunk, 16 KiB, 0, NULL, 0)`, its result
+    // and errno stored. Assembled once because the code region is 64 KiB.
+    let (chunk, out) = (f.guest.data + 0x4000, f.guest.data + 0x3F00);
+    let send = program(&f, |asm| {
+        asm.bl(f.thunk("__errno"));
+        asm.mov(9, 0);
+        asm.push(str_w(9, 0, 0));
+        for (register, value) in [fd, chunk as u64, 0x4000, 0, 0, 0].iter().enumerate() {
+            asm.mov(register as u32, *value);
+        }
+        asm.bl(f.thunk("sendto"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    let sent = || {
+        assert!(matches!(run_program(&f, send).expect("completes"), ExitReason::Returned { .. }));
+        (f.guest.read_u64(out) as i64, f.guest.read_u64(out + 8))
+    };
+
+    // Fill the room while non-blocking: F_SETFL (4) with O_NONBLOCK.
+    assert_eq!(call_with_errno(&f, "fcntl", &[fd, 4, 0o4000]), (0, 0), "F_SETFL O_NONBLOCK");
+    let mut filled = 0i64;
+    let full = loop {
+        match sent() {
+            (count, 0) if count > 0 => filled += count,
+            (-1, 11) => break true,
+            other => panic!("filling the send buffer: {other:?} after {filled} bytes"),
+        }
+        if filled > 256 << 20 {
+            break false;
+        }
+    };
+    assert!(full, "256 MiB went into a socket nobody reads without EAGAIN");
+
+    // Blocking again, with a 200 ms send timeout: SO_SNDTIMEO (21).
+    assert_eq!(call_with_errno(&f, "fcntl", &[fd, 4, 0]), (0, 0), "F_SETFL blocking");
+    let timeval = f.guest.data + 0x2C0;
+    f.guest.write_u64(timeval, 0);
+    f.guest.write_u64(timeval + 8, 200_000);
+    assert_eq!(
+        call_with_errno(&f, "setsockopt", &[fd, 1, 21, timeval as u64, 16]),
+        (0, 0),
+        "SO_SNDTIMEO"
+    );
+    let (done, waiting) = std::sync::mpsc::channel::<()>();
+    let rescuer = std::thread::spawn(move || {
+        let mut client = client;
+        if waiting.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+            client.set_read_timeout(Some(std::time::Duration::from_millis(200))).expect("a timeout");
+            let mut sink = vec![0u8; 1 << 20];
+            while matches!(client.read(&mut sink), Ok(n) if n > 0) {}
+        }
+        client
+    });
+    let started = std::time::Instant::now();
+    let result = sent();
+    let took = started.elapsed();
+    let _ = done.send(());
+    let _client = rescuer.join().expect("the rescuer");
+    assert_eq!(result, (-1, 11), "EAGAIN from a blocking send when SO_SNDTIMEO runs out");
+    assert!(took >= std::time::Duration::from_millis(150), "it waited the timeout: {took:?}");
 }

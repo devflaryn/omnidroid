@@ -207,17 +207,39 @@ pub const ARENA_BYTES: usize = MAX_GUEST_THREADS * THREAD_BLOCK_BYTES
 /// and this sentence with it.
 pub const ARENA_GRANULES: usize = 5;
 
-/// The longest a single guest `nanosleep` or `usleep` may block a host thread.
+/// The longest a **single host park** inside a guest wait may last -- not a bound on how long the
+/// guest may ask to wait.
 ///
-/// **A policy number, and a hostile-input defence rather than a semantics change.** The duration
-/// is a value the guest chose, and a sleeping thread executes no guest instructions — so D16's
-/// runaway-guest defence, which is built from short step budgets, cannot end one. `nanosleep({
-/// INT64_MAX, 0 })` is otherwise a permanent hang of that host thread.
+/// **It used to be that bound, and that is what it cost.** A `nanosleep`, `poll`, `select`,
+/// `ALooper_pollOnce` or `pthread_cond_timedwait` asking for longer than this was refused, and a
+/// blocking socket or pipe transfer was refused after waiting this long. A refusal ends the guest
+/// thread that made the call. MEASURED on the real engine: it killed the game's join worker, whose
+/// `pthread_cond_timedwait` asks for about 120 s -- a correct request, killed by a number chosen
+/// as "far longer than anything the initializers want".
 ///
-/// Sixty seconds is far longer than anything the 3,594 initializers can legitimately want and far
-/// shorter than a hang. A request past it is a refusal naming both numbers, never a clamp: a clamp
-/// would return success from a call that slept for a minute when it was asked for a year.
+/// The reason for the cap was real and is still answered, differently. A sleeping thread executes
+/// no guest instructions, so D16's step budgets cannot end one, and `nanosleep({INT64_MAX, 0})`
+/// would have been a host thread nothing could stop. What ends such a wait now is the **stop
+/// switch** ([`Bionic::stop_guest_threads`]): a long guest wait is carried out as a series of host
+/// parks, none longer than this and most no longer than [`STOP_SLICE`], with the switch read between
+/// them. The guest's own answer -- `0`, a timeout, `ETIMEDOUT`, the data -- is given only at the
+/// real deadline or the real event, never at a slice boundary; a wait the switch ends is refused
+/// by name, which the thread runner files as the thread stopping rather than as a failure. A
+/// deadline past the host clock's range is an untimed wait, ended by the event or the switch.
 pub const MAX_SLEEP_SECONDS: u64 = 60;
+
+/// The longest a guest wait parks a host thread before it reads the stop switch again, when
+/// nothing else would wake it sooner.
+///
+/// **Chosen for teardown, not for precision.** `join_guest_threads` is given seconds, not minutes,
+/// and a thread asleep in a park is deaf to the switch until the park ends; one second is a
+/// relaxed load per second per waiting thread, which is nothing. Precision is unaffected: the
+/// last park of a wait ends exactly at its deadline, so a wait no longer than this is one host
+/// park, as it always was.
+pub const STOP_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
+
+// A slice longer than the longest park would make the park bound a lie.
+const _: () = assert!(STOP_SLICE.as_secs() <= MAX_SLEEP_SECONDS);
 
 /// How many raw `futex` syscalls [`Bionic::futex_calls`] keeps.
 ///

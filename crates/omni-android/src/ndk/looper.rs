@@ -26,8 +26,11 @@
 //! not bionic gets a refusal naming both rather than a looper that watches nothing.
 //!
 //! That also means the wait is the same wait `poll` performs — `omni-platform`'s readiness gate,
-//! with the generation read **before** the descriptors are tested — and, for a *bounded* poll,
-//! the same bound: [`MAX_SLEEP_SECONDS`](crate::bionic::MAX_SLEEP_SECONDS).
+//! with the generation read **before** the descriptors are tested — and a *bounded* poll is
+//! carried out however long it asks for, in parks of [`WAIT_SLICE`] with the stop switch read
+//! between them, as `poll`'s is. (It used to be refused past
+//! [`MAX_SLEEP_SECONDS`](crate::bionic::MAX_SLEEP_SECONDS), which is now only the longest a
+//! single park may be.)
 //!
 //! # The indefinite `pollOnce`, and the fact it is decided on
 //!
@@ -734,7 +737,8 @@ enum Bound {
     /// `pollOnce(timeoutMillis >= 0)`: this instant, and then [`ALOOPER_POLL_TIMEOUT`].
     Until(Instant),
     /// `pollOnce(-1)`, allowed because a live wake source was measured. See this module's
-    /// documentation for what is checked and why the check is a fact rather than a policy.
+    /// documentation for what is checked and why the check is a fact rather than a policy. Also a
+    /// timeout whose deadline is past the host clock's range, which is untimed in fact.
     Indefinite,
     /// `pollOnce(0)` inside a spin, with the idle wait on: this instant, and then
     /// [`ALOOPER_POLL_TIMEOUT`] -- which is also the answer a stopping runtime gets. See this
@@ -852,26 +856,18 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         }
         Bound::Indefinite
     } else {
+        // **Carried out however long it is.** A timeout past `MAX_SLEEP_SECONDS` used to be
+        // refused, and a refusal ends the guest thread; the loop below already parks a
+        // `WAIT_SLICE` at a time and reads the stop switch between parks, so a long wait is
+        // ended by teardown rather than by a number, and POLL_TIMEOUT comes only at the deadline.
         let budget = Duration::from_millis(timeout_millis as u64);
-        if budget.as_secs() > crate::bionic::MAX_SLEEP_SECONDS {
-            return Err(refuse_reentrant(
-                c,
-                format!(
-                    "the guest asked `ALooper_pollOnce` to wait {budget:?}, and this layer caps \
-                     a guest-chosen wait at {} seconds -- the same cap `nanosleep`, `poll` and \
-                     `select` name. Clamping to the cap was rejected: it would return a timeout \
-                     from a call that waited a minute when it was asked to wait longer",
-                    crate::bionic::MAX_SLEEP_SECONDS
-                ),
-            ));
+        // Past the host clock's range is an untimed wait -- which a 31-bit count of milliseconds
+        // never is on a real host, and which would be the indefinite arm's loop without its
+        // wake-source check: that check exists for a caller that asked for no timeout at all.
+        match Instant::now().checked_add(budget) {
+            Some(deadline) => Bound::Until(deadline),
+            None => Bound::Indefinite,
         }
-        let Some(deadline) = Instant::now().checked_add(budget) else {
-            return Err(refuse_reentrant(
-                c,
-                format!("a wait of {budget:?} is past this host's clock"),
-            ));
-        };
-        Bound::Until(deadline)
     };
 
     // **The idle wait, which only a zero-timeout poll can take**, and only with the embedding's

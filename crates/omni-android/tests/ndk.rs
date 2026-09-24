@@ -828,6 +828,77 @@ fn a_poll_once_with_a_timeout_waits_for_a_writer() {
     );
 }
 
+/// **A `pollOnce` timeout past a minute is carried out, and the stop switch is what ends it.**
+///
+/// It used to be refused past `MAX_SLEEP_SECONDS`, and a refusal ends the guest thread -- the
+/// game thread, for this call. The loop already parks a `WAIT_SLICE` at a time and reads the stop
+/// switch between parks, so the refusal bought nothing but the death. 61 s is past the old cap and
+/// short enough that a build without the stop check fails at its own deadline (with
+/// POLL_TIMEOUT where a refusal was required) instead of hanging.
+///
+/// The switch is thrown once the census shows this thread inside `ALooper_pollOnce`, never after
+/// a guessed interval (`VERIFICATION.md` entry 6).
+#[test]
+fn a_poll_once_past_a_minute_waits_until_the_stop_switch_ends_it() {
+    let _guard = serialized();
+    let f = fixture("poll-long-stop");
+    let looper = f.prepare();
+    let (read_fd, _write_fd) = f.pipe();
+    assert_eq!(f.add_fd(looper, read_fd, 4, ALOOPER_EVENT_INPUT, 0, 0), 1);
+
+    f.boundary.start_census();
+    let entry = f.program_calling("ALooper_pollOnce", |asm| {
+        asm.mov(0, 61_000);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+    });
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopper = {
+        let (bionic, boundary, finished) =
+            (Arc::clone(&f.bionic), Arc::clone(&f.boundary), Arc::clone(&finished));
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let inside = boundary.threads().iter().any(|record| {
+                    record.symbol.as_deref() == Some("ALooper_pollOnce")
+                        && record.crossings == record.exits + 1
+                });
+                if inside {
+                    let at = std::time::Instant::now();
+                    bionic.stop_guest_threads();
+                    return Some(at);
+                }
+                if finished.load(std::sync::atomic::Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline
+                {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    let result = f.run(entry);
+    let returned = std::time::Instant::now();
+    finished.store(true, std::sync::atomic::Ordering::Release);
+    let stopped = stopper.join().expect("the stopping thread");
+
+    let stopped = stopped.unwrap_or_else(|| {
+        panic!("the poll was never seen waiting: it finished first, with {result:?}")
+    });
+    let error = match result {
+        Err(error) => error,
+        Ok(exit) => panic!(
+            "`ALooper_pollOnce(61000)` returned ({exit:?}, {}) after the stop switch was thrown",
+            f.guest.read_u64(f.guest.data) as i32
+        ),
+    };
+    let text = error.to_string();
+    assert!(text.contains("asked its guest threads to stop"), "a stop, not a cap: {text}");
+    let after = returned.saturating_duration_since(stopped);
+    assert!(after < std::time::Duration::from_secs(10), "the stop took {after:?} to be noticed");
+}
+
 // =================================================================== the idle wait
 //
 // `NativeEngine::GameLoop` spins on `pollOnce(0)` with nothing between its polls for as long as
