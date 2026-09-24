@@ -3907,3 +3907,48 @@ The comment in `dynarmic/mod.rs` said a wild guest address "faults instead of al
 page". It is true for the row above where it is true and silent about the row where it is not —
 `VERIFICATION.md` entry 13's shape exactly, in the file whose behaviour it describes. Corrected in
 place there, under **"What fastmem does not check"**, rather than deleted.
+
+## D31 — A native CPU backend on Apple silicon: measured, not the default; adopt when hot imports stop being VM exits
+
+**Recorded by the macOS port (branch `port-macos`), 2026-09-24. Status: not adopted.** The owner's
+instruction for the port: "after parity, measure a native backend (e.g. Hypervisor.framework, guest
+at EL0, trapping SVC) behind `GuestCpu`. Adopt it only with numbers and a DECISIONS record." This is
+that record. The evidence, every figure with its n and method, is `docs/ports/macos-hvf.md`;
+the numbers the decision turns on are repeated here.
+
+**Built.** `omni-cpu`'s `native` module (`native-hvf` feature, off by default, arm64 only) behind
+`GuestCpu`: the guest at EL0 under Hypervisor.framework, stage 2 at IPA == VA (D4's identity kept),
+a stage-2 mirror of host protection fed from `vm/macos.rs`, demand paging through
+`omni_mem::admit`, thunks and the sentinel on `BRK` pages. It runs the M2 gate (real `libroblox.so`,
+same words, same predictions) and M3's 3,594 initializers natively. The macOS gate itself has not
+run on it (condition 3 below).
+
+**Measured on an M1, release:**
+
+| | dynarmic | native |
+|---|---|---|
+| one import crossing | 23.7 ns inline, 37.6 via exit | **1,614 ns** |
+| real engine compute (33 functions, 69.7 M instructions) | 1.32 G insn/s | **7.55 G insn/s (5.7x)** |
+| 3,594 initializers, cold (n = 8) | 2,417 ms | **795 ms** |
+| memory per guest thread | ~33 MB at the landing screen | **79 KiB** |
+
+At the landing screen (dynarmic, the real gate) the threads doing work cross the import boundary
+0.40-0.52 M times a second: natively 0.64-0.84 of a core in VM exits, the order of the compute the
+backend saves there. A short guest call is 26x slower.
+
+**Decision: dynarmic stays the only backend any gate or run uses.** Revisit when all of these hold,
+measured on the gate: (1) the hot imports (`pthread_getspecific`, `__errno`, `clock_gettime`, the
+`mem*`/`str*` family, uncontended mutexes -- ~90% of the crossings) are served in guest code, under
+50k VM exits/s at the landing screen; (2) no runtime path passes a counted budget to a backend that
+cannot count; (3) the macOS gate passes natively, with every path that hands the guest a host pointer
+closed first (the backend confines the guest, so what D4 amendment 1 recommends becomes required);
+(4) more than 64 guest threads are handled (64 vCPUs per VM; the engine may make 256); (5) the
+shipping binary carries `com.apple.security.hypervisor` and each instance is its own process.
+
+**What moves it.** In-guest import service measured under the bar favours adopting: the memory win
+alone goes straight at the owner's per-instance target. The memory workstream cutting dynarmic's
+per-thread bookkeeping removes the largest win. Break-even is ~2 us of guest code between host calls.
+
+**Found on the way, fixed:** the native backend's survey of all 245,117 functions made dynarmic's
+arm64 backend abort the process (Global Constraint 11) -- the store half of patch 0007's inline
+store-exclusive was not a fastmem patch location. Patch 0014.

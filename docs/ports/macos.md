@@ -43,7 +43,8 @@ non-Windows target the build asks CMake for the vendored copies explicitly
 | `fault` | implemented | `fault_macos` 10, `fault_teardown_race` 2; `mac-fault-*` 9/9 |
 | `clock` | portable `std`; timer resolution is a no-op here (see "Timers") | |
 | `window` (AppKit), `audio` (Core Audio), gfx surface (MoltenVK) | implemented | see `docs/ports/macos-window.md`; `mac-win-` 22/22, `mac-gfx-` 9/9 |
-| dynarmic arm64, `omni-cpu` | parity: 9 carried patches | see `docs/ports/macos-cpu.md`; `mac-cpu-` 25/25 |
+| dynarmic arm64, `omni-cpu` | parity: carried patches 0002-0009 and 0014 (the store-exclusive fault, below) | see `docs/ports/macos-cpu.md`; `mac-cpu-` 25/25 + `mac-cpu-E1` |
+| native backend (Hypervisor.framework) | built, measured, **not adopted** (D31) | `macos-hvf.md`; `mac-hvf-` 26/26 |
 | **the gate** | **passes**, landing screen reached | below |
 | `webview` | **not ported** (structural `Unsupported`): WKWebView is the macOS equivalent | |
 | ELF loader on 16 KiB pages | relro sealed as bionic seals it; `libzstd-jni` (`p_align` 0x1000) refused by name | `loader_m1` 13, `loader_hostile` 25; `mac-elf-A1` 1/1 |
@@ -173,30 +174,38 @@ thread gets 1.01 ms, `pthread_cond_timedwait` 1.51 ms, and an `EVFILT_TIMER` wit
 answer to the same problem is `TimerResolution::raise` (1 ms); this host needs a different one --
 recorded for the performance work, not yet acted on.
 
-## A native CPU backend: first numbers *(in progress)*
+## A native CPU backend (Hypervisor.framework): measured, not adopted -- D31
 
-The guest ISA is this host's, so a backend that runs guest code natively under
-Hypervisor.framework (guest at EL0 in a VM whose stage-2 maps host memory at IPA == VA, keeping
-D4's identity mapping; `svc` and thunk calls trapping to the host) is the obvious candidate to
-replace translation. Two facts decide its shape, MEASURED with a C probe (`hv_vm_create`,
-`hv_vcpu_run` over a guest `hvc #0; b .-4` loop at EL1, binary ad-hoc signed with
-`com.apple.security.hypervisor`):
+The guest ISA is this host's, so the port built a native backend behind `GuestCpu`
+(`omni-cpu`'s `native-hvf`, off by default): the guest at EL0 under Hypervisor.framework, stage 2
+at IPA == VA so D4's identity mapping holds, a stage-2 mirror of host protection fed from
+`vm/macos.rs`, demand paging through `omni_mem::admit`. It runs the M2 gate on the real
+`libroblox.so` and all 3,594 initializers. Everything, with n and method, is in
+[`macos-hvf.md`](macos-hvf.md); the decision is **D31** in `docs/DECISIONS.md`. The numbers it turns
+on (M1, release):
 
-| Quantity | Value |
-|---|---|
-| one VM exit + resume (`hvc` -> host -> `hv_vcpu_run`) | **708 ns** (best of 3 rounds, n = 200,000 each; 836, 729, 708) |
-| vCPUs per VM (`hv_vm_get_max_vcpu_count`) | **64** |
+| | dynarmic | native |
+|---|---|---|
+| one import crossing | 23.7 ns inline | **1,614 ns** (VM exit + full register save) |
+| real engine compute | 1.32 G insn/s | **7.55 G insn/s** |
+| 3,594 initializers, cold (n = 8) | 2,417 ms | **795 ms** |
+| memory per guest thread | ~33 MB at the landing screen | **79 KiB** |
 
-Against D17's in-loop import dispatch (26.7-31.0 ns on the x64 host), an import that became a VM
-exit would cost ~25x more, and Windows measured the engine crossing the import boundary about
-1.3 million times a second (VERIFICATION entry 15, a startup phase on Windows) -- which at 708 ns is ~0.9 s of exits per second
-of guest time. And the engine runs up to 256 guest threads (`MAX_GUEST_THREADS`) against 64 vCPUs.
-So a hypervisor backend is only a win if the hot imports stop being exits (served in-guest) and
-guest threads are multiplexed onto vCPUs; whether the compute it buys back outweighs that is the
-number still to be measured, in the world, once parity holds.
+At the landing screen the working threads cross the import boundary 0.40-0.52 M times a second,
+which natively is 0.64-0.84 of a core in exits -- about what the faster code saves there. **Not
+adopted**: dynarmic is the backend every gate runs on. D31 lists the conditions (hot imports served
+in the guest, under 50k exits/s; no counted budgets for a backend that cannot count; the gate
+passing natively; more than 64 threads; the hypervisor entitlement).
 
-> **Measured in full on branch `mac-hvf`**, with a prototype behind `GuestCpu` that runs the M2 and
-> M3 gates natively and a D31 draft: see [`macos-hvf.md`](macos-hvf.md).
+**Found on the way: dynarmic arm64 killed the process on a guest store-exclusive to read-only
+memory** (Global Constraint 11). The native backend's survey of all 245,117 engine functions reached
+it at `libroblox.so + 0x224822c`; delta debugging reduced it to two functions, the outlined
+`__aarch64_swp8_rel` swapping through a pointer into sealed `.data.rel.ro`. Patch 0007's inline
+store-exclusive registered only its load as a fastmem patch location, so the store's write fault
+reached dynarmic's handler unrecorded and it aborted. **Patch 0014** registers the store too; the
+function is now a typed write fault and the dynarmic survey runs all 245,117 functions (41 s, n = 1)
+without an abort. Tests: `dynarmic-sys/tests/host_fault.rs` (both widths, read-only data of the test
+binary) and `omni-cpu/tests/exclusive_store_fault.rs` (the two real functions); row `mac-cpu-E1`.
 
 ## Merge notes
 
