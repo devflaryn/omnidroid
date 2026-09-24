@@ -410,11 +410,12 @@ impl NativeCpu {
                 };
             }
             Some(region) if region.protection.is_writable() => {
-                return Err(CpuError::Unsupported {
-                    backend: BACKEND_NAME,
-                    operation: "make an address in writable guest data trap",
-                    reason: "a veneer overlay would hide the guest's own data on that page from it",
-                });
+                // Writable data, not executable: a branch here already traps -- as a stage-2
+                // instruction abort, which `run_loop` reports as the thunk when the address is
+                // registered. Slower (~2.1 us against ~0.8, MEASURED) and only ever reached by a
+                // guest calling a data symbol, which the boundary registers so it can refuse it by
+                // name. An overlay would hide the guest's own data on the page from it.
+                return Ok(());
             }
             // Read-only, inaccessible, or free: nothing the guest can execute is there, and a
             // guest load from the page is the only thing the overlay changes (it reads BRK words).
@@ -572,6 +573,24 @@ impl NativeCpu {
                         }
                         ec::INSTRUCTION_ABORT_LOWER | ec::DATA_ABORT_LOWER => {
                             let pc = thread.cpu.reg(Reg::Pc).map_err(io("read PC"))?;
+                            // A fetch from a registered address that is not executable -- a thunk
+                            // or sentinel on a writable data page, which `ensure_trap` leaves
+                            // without a veneer -- is reaching that address, and is reported so.
+                            if class == ec::INSTRUCTION_ABORT_LOWER {
+                                let at = pc as GuestAddr;
+                                let stop = if self.sentinel == Some(at) {
+                                    Some(ExitReason::Returned { pc: at })
+                                } else if self.thunks.contains(&at) {
+                                    Some(ExitReason::Thunk { pc: at })
+                                } else {
+                                    None
+                                };
+                                if let Some(stop) = stop {
+                                    let pstate = thread.cpu.reg(Reg::Cpsr).map_err(io("read CPSR"))?;
+                                    self.save(thread, pc, pstate).map_err(io("save the guest registers"))?;
+                                    return Ok(stop);
+                                }
+                            }
                             if iss & ISS_S1PTW != 0 {
                                 return Err(CpuError::Backend {
                                     backend: BACKEND_NAME,

@@ -266,16 +266,23 @@ fn a_thunk_stops_at_its_address_and_resumes_where_the_host_sends_it() {
 }
 
 #[test]
-fn a_thunk_in_executable_code_or_writable_data_is_refused_rather_than_overlaid() {
+fn a_thunk_in_executable_code_is_refused_and_one_in_writable_data_traps_without_a_veneer() {
     let _serial = serialized();
     let guest = Native::new();
     let (mut cpu, _) = guest.thread();
     let entry = guest.load(&[movz(0, 1, 0), ret(30)]);
     let code = cpu.add_thunk(entry);
     assert!(matches!(code, Err(CpuError::Unsupported { .. })), "real code: {code:?}");
-    let data = cpu.add_thunk(guest.data + 64);
-    assert!(matches!(data, Err(CpuError::Unsupported { .. })), "writable data: {data:?}");
-    assert_eq!(guest.backend.veneer_pages(), 0, "and nothing was overlaid");
+    // A data symbol the boundary registers so a guest *calling* it is refused by name: a branch
+    // there is an instruction abort, reported as the thunk -- and the page keeps its data.
+    let data = guest.data + 64;
+    guest.write_u64(data, 0x1122_3344);
+    cpu.add_thunk(data).expect("a thunk on writable data");
+    assert_eq!(guest.backend.veneer_pages(), 0, "nothing was overlaid");
+    let call = guest.load_at(512, &[blr(9), ret(30)]);
+    cpu.set_x(x(9), data as u64);
+    assert_eq!(run(&mut cpu, call), ExitReason::Thunk { pc: data });
+    assert_eq!(guest.read_u64(data), 0x1122_3344, "the guest's data is still its data");
 }
 
 #[test]
