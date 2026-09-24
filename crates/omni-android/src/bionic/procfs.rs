@@ -89,11 +89,13 @@
 //! machine with no page cache. Neither number is invented; they are answers about two different things,
 //! and this layer has no page cache of the guest's to put in `Cached`.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use omni_mem::ProcessMemory;
-use omni_platform::fs::{Filesystem, FsError, FsResult, Generator};
+use omni_mem::{GuestSpace, ProcessMemory, Protection, RegionKind};
+use omni_platform::fs::{Filesystem, FinalLink, FsError, FsResult, Generator};
 use parking_lot::Mutex;
 
 /// The one `/proc/meminfo` there is.
@@ -121,6 +123,161 @@ pub(super) fn serve(
     fs.serve_generated(MEMINFO.as_bytes(), meminfo)?;
     let statm: Arc<Generator> = Arc::new(move || generate_statm(page));
     fs.serve_generated(STATM.as_bytes(), statm)
+}
+
+/// This process's memory map, by the name the engine opens it with.
+pub(super) const MAPS: &str = "/proc/self/maps";
+
+/// What `/proc/self/maps` is generated from: the guest's own address space, the labels it gave
+/// its anonymous mappings, and what `stat` would say about each mapped file.
+pub(super) struct MapsSource {
+    /// The guest address space. `/proc/self` is the guest's process, and its memory is this space
+    /// -- not the host process around it, whose Windows mappings no guest could name.
+    pub(super) space: Arc<GuestSpace>,
+    /// `prctl(PR_SET_VMA_ANON_NAME)` labels by `(address, length)` (`Bionic::vma_names`).
+    pub(super) names: Arc<Mutex<BTreeMap<(u64, u64), String>>>,
+    /// The instance root, so a mapped file's inode is the one `stat` of its path reports.
+    pub(super) root: PathBuf,
+    /// The `st_dev` every file on the root reports.
+    pub(super) device: u64,
+}
+
+/// Serve `/proc/self/maps` from `fs`, regenerated on every open as a device's is.
+///
+/// # Errors
+///
+/// As `Filesystem::serve_generated`.
+pub(super) fn serve_maps(fs: &Filesystem, source: MapsSource) -> FsResult<()> {
+    let maps: Arc<Generator> = Arc::new(move || generate_maps(&source));
+    fs.serve_generated(MAPS.as_bytes(), maps)
+}
+
+/// `/proc/self/maps`, as Linux's `show_map_vma` prints it.
+///
+/// One line per mapping: `start-end perms offset major:minor inode`, then -- when the mapping has a
+/// name -- padding to column 73 and the name. A line without a name keeps the trailing space
+/// `show_map_vma` leaves, exactly as a device's does. The permission column's fourth character is
+/// `s` for a `MAP_SHARED` file mapping and `p` for everything else.
+///
+/// * **A file mapping** is named by its guest path, and its device and inode are what `stat` of
+///   that path answers (`st_dev` of the root; `st_ino` from the resolved host path), so a reader
+///   that cross-checks the two sees one file.
+/// * **An anonymous mapping** with a `prctl(PR_SET_VMA_ANON_NAME)` label is split at the label's
+///   bounds, as the kernel splits the VMA, and the labelled part reads `[anon:<label>]`.
+///
+/// Refused, naming the mapping, if a file mapping's name is not a guest path: that is a host path
+/// leaking through a backing that was never given its guest name, and printing it would hand the
+/// guest a Windows path no device has.
+fn generate_maps(source: &MapsSource) -> FsResult<Vec<u8>> {
+    let names = source.names.lock().clone();
+    let (major, minor) = dev_numbers(source.device);
+    let mut out = String::new();
+    for region in source.space.mapped_regions() {
+        let perms = |shared: bool| -> [u8; 4] {
+            let (r, w, x) = match region.protection {
+                Protection::None => (b'-', b'-', b'-'),
+                Protection::Read => (b'r', b'-', b'-'),
+                Protection::ReadWrite => (b'r', b'w', b'-'),
+                Protection::ReadExecute => (b'r', b'-', b'x'),
+            };
+            [r, w, x, if shared { b's' } else { b'p' }]
+        };
+        match &region.kind {
+            RegionKind::File { name, file_offset, shared, .. } => {
+                if !name.starts_with('/') {
+                    return Err(refused(
+                        MAPS,
+                        format!(
+                            "the mapping at {:#x}-{:#x} is named `{name}`, which is not a guest \
+                             path: the backing was opened under its host path and never given the \
+                             path a device would show (`Backing::open_named`)",
+                            region.start,
+                            region.end()
+                        ),
+                    ));
+                }
+                let inode = omni_platform::fs::path::resolve_lexically("maps", name.as_bytes())
+                    .and_then(|resolved| {
+                        omni_platform::fs::path::locate(
+                            "maps",
+                            &source.root,
+                            &resolved,
+                            FinalLink::Refuse,
+                        )
+                    })
+                    .map(|host| omni_platform::fs::identity(&host))
+                    .unwrap_or(0);
+                push_line(
+                    &mut out,
+                    region.start as u64,
+                    region.end() as u64,
+                    perms(*shared),
+                    *file_offset,
+                    (major, minor, inode),
+                    Some(name),
+                );
+            }
+            RegionKind::Anonymous => {
+                let (start, end) = (region.start as u64, region.end() as u64);
+                let mut cursor = start;
+                for (&(at, len), label) in &names {
+                    let (from, to) = (at.max(cursor), at.saturating_add(len).min(end));
+                    if from >= to {
+                        continue;
+                    }
+                    if from > cursor {
+                        push_line(&mut out, cursor, from, perms(false), 0, (0, 0, 0), None);
+                    }
+                    let shown = format!("[anon:{label}]");
+                    push_line(&mut out, from, to, perms(false), 0, (0, 0, 0), Some(&shown));
+                    cursor = to;
+                }
+                if cursor < end {
+                    push_line(&mut out, cursor, end, perms(false), 0, (0, 0, 0), None);
+                }
+            }
+            RegionKind::Free => {}
+        }
+    }
+    Ok(out.into_bytes())
+}
+
+/// One `show_map_vma` line. `ids` is `(major, minor, inode)`.
+fn push_line(
+    out: &mut String,
+    start: u64,
+    end: u64,
+    perms: [u8; 4],
+    offset: u64,
+    ids: (u32, u32, u64),
+    name: Option<&str>,
+) {
+    let line_start = out.len();
+    let perms = std::str::from_utf8(&perms).expect("four ASCII bytes");
+    let _ = write!(out, "{start:08x}-{end:08x} {perms} {offset:08x} {:02x}:{:02x} {} ", ids.0, ids.1, ids.2);
+    if let Some(name) = name {
+        // `seq_setwidth(m, 25 + sizeof(void *) * 6 - 1)` then `seq_pad(m, ' ')`: pad the line to
+        // 72 columns and put one more space, so the name starts at column 73 when it fits.
+        let width = out.len() - line_start;
+        if width < MAPS_NAME_COLUMN - 1 {
+            out.extend(std::iter::repeat_n(' ', MAPS_NAME_COLUMN - 1 - width));
+        }
+        out.push(' ');
+        out.push_str(name);
+    }
+    out.push('\n');
+}
+
+/// Where `show_map_vma` starts a mapping's name on a 64-bit kernel: `25 + sizeof(void *) * 6`.
+const MAPS_NAME_COLUMN: usize = 25 + 8 * 6;
+
+/// The major and minor numbers of a user-space `st_dev`, as glibc's and bionic's `major()` and
+/// `minor()` decode it -- the inverse of the kernel's `new_encode_dev`, so the column a reader
+/// parses agrees with the `st_dev` it gets from `stat`.
+fn dev_numbers(device: u64) -> (u32, u32) {
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & !0xfff);
+    let minor = (device & 0xff) | ((device >> 12) & !0xff);
+    (major as u32, minor as u32)
 }
 
 fn refused(path: &str, why: impl Into<String>) -> FsError {
@@ -350,5 +507,121 @@ mod tests {
         assert_eq!((fields.lib, fields.dt), (0, 0), "Linux has printed 0 for both since 2.6");
         // 4 GiB, 200 MiB, 30 MiB, 159 pages of code, 150 MiB, in 4 KiB pages.
         assert_eq!(fields.render(), "1048576 51200 7680 159 0 38400 0\n");
+    }
+
+    /// **A kernel's exact bytes**: a transcription of a real `/proc/self/maps` line with a name
+    /// (`show_map_vma` pads to column 73) and of one without (which keeps the trailing space).
+    #[test]
+    fn a_maps_line_is_show_map_vma_to_the_column() {
+        let mut out = String::new();
+        push_line(
+            &mut out,
+            0x55d0_d3a3_7000,
+            0x55d0_d3a3_9000,
+            *b"r--p",
+            0,
+            (8, 1, 1_835_060),
+            Some("/usr/bin/cat"),
+        );
+        push_line(&mut out, 0x55d0_d3a3_9000, 0x55d0_d3a3_a000, *b"rw-p", 0, (0, 0, 0), None);
+        assert_eq!(
+            out,
+            "55d0d3a37000-55d0d3a39000 r--p 00000000 08:01 1835060                    /usr/bin/cat\n\
+             55d0d3a39000-55d0d3a3a000 rw-p 00000000 00:00 0 \n"
+        );
+        assert_eq!(out.find("/usr").unwrap(), MAPS_NAME_COLUMN, "the name starts at column 73");
+    }
+
+    /// `major`/`minor` invert `new_encode_dev`, so the column agrees with `stat`'s `st_dev`.
+    #[test]
+    fn the_device_column_is_major_and_minor_of_st_dev() {
+        // new_encode_dev(MKDEV(0xfd, 0x05)) = 0xfd05; a large minor spills above bit 20.
+        assert_eq!(dev_numbers(0xfd05), (0xfd, 0x05));
+        assert_eq!(dev_numbers((0x1_2345 & 0xff) | (0x103 << 8) | ((0x1_2345 & !0xff) << 12)), (0x103, 0x1_2345));
+    }
+
+    /// The whole file, generated from a real guest space: the anonymous mapping split around its
+    /// `prctl` label, a file mapping under its guest name with `stat`'s device and inode, and a
+    /// file mapping still named by a host path refused rather than printed.
+    #[test]
+    fn maps_is_the_guest_space_with_labels_and_guest_paths() {
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let page = space.page_size();
+        let granule = space.commit_granule();
+        let anon = space
+            .map_anonymous(
+                omni_mem::Placement::Anywhere { align: granule },
+                granule,
+                Protection::ReadWrite,
+                omni_mem::CommitPolicy::Lazy,
+            )
+            .expect("an anonymous mapping");
+
+        let root = std::env::temp_dir().join(format!("omni-maps-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("data")).expect("a root");
+        let host = root.join("data").join("lib.so");
+        std::fs::write(&host, vec![0x5a; granule]).expect("a file to map");
+        let root = std::fs::canonicalize(&root).expect("canonical root");
+        let backing = omni_mem::Backing::open_named(
+            &root.join("data").join("lib.so"),
+            omni_mem::MapExecutability::NonExecutable,
+            "/data/lib.so",
+        )
+        .expect("a backing under its guest name");
+        let file = space
+            .map_file(&backing, 0, omni_mem::Placement::Anywhere { align: granule }, granule, Protection::Read)
+            .expect("a file mapping");
+
+        let names = Arc::new(Mutex::new(BTreeMap::new()));
+        names.lock().insert(((anon + page) as u64, page as u64), "thing".to_string());
+        let device = 0xfd05;
+        let source = MapsSource { space: Arc::clone(&space), names, root: root.clone(), device };
+        let text = String::from_utf8(generate_maps(&source).expect("maps")).expect("ASCII");
+        let lines: Vec<&str> = text.lines().collect();
+
+        let anon_lines: Vec<&&str> =
+            lines.iter().filter(|l| l.starts_with(&format!("{anon:08x}-"))).collect();
+        assert_eq!(anon_lines.len(), 1, "the unlabelled head of the mapping: {text}");
+        assert_eq!(
+            *anon_lines[0],
+            format!("{anon:08x}-{:08x} rw-p 00000000 00:00 0 ", anon + page)
+        );
+        let labelled = lines
+            .iter()
+            .find(|l| l.starts_with(&format!("{:08x}-{:08x} rw-p", anon + page, anon + 2 * page)))
+            .expect("the labelled page, split out");
+        assert!(labelled.ends_with(" [anon:thing]"), "{labelled}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(&format!("{:08x}-{:08x} rw-p", anon + 2 * page, anon + granule))),
+            "the unlabelled tail: {text}"
+        );
+
+        let inode = omni_platform::fs::identity(&root.join("data").join("lib.so"));
+        let file_line = lines
+            .iter()
+            .find(|l| l.starts_with(&format!("{file:08x}-")))
+            .expect("the file mapping");
+        assert_eq!(
+            file_line.split_whitespace().collect::<Vec<_>>(),
+            vec![
+                format!("{file:08x}-{:08x}", file + granule).as_str(),
+                "r--p",
+                "00000000",
+                "fd:05",
+                inode.to_string().as_str(),
+                "/data/lib.so"
+            ]
+        );
+
+        // A host-named backing is refused, naming what it is.
+        let leaked = omni_mem::Backing::open(&host, omni_mem::MapExecutability::NonExecutable)
+            .expect("a host-named backing");
+        space
+            .map_file(&leaked, 0, omni_mem::Placement::Anywhere { align: granule }, granule, Protection::Read)
+            .expect("a second file mapping");
+        let error = generate_maps(&source).expect_err("a host path must not reach the guest");
+        assert!(error.to_string().contains("not a guest path"), "{error}");
+        drop(space);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

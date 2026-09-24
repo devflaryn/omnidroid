@@ -424,6 +424,7 @@ impl BoundaryBuilder {
             last_call: AtomicUsize::new(0),
             last_caller: AtomicUsize::new(0),
             thread_records: parking_lot::Mutex::new(Vec::new()),
+            svc_trace: AtomicBool::new(false),
         });
         crate::perf::register_boundary(&boundary);
         arm_injected_death();
@@ -692,9 +693,21 @@ pub struct Boundary {
     last_caller: AtomicUsize,
     /// One record per host thread that has ever crossed. See [`Boundary::threads`].
     thread_records: parking_lot::Mutex<Vec<Arc<ThreadCrossing>>>,
+    /// Whether every raw `svc #0` is printed. See [`Boundary::set_syscall_trace`].
+    svc_trace: AtomicBool,
 }
 
 impl Boundary {
+    /// Print every raw `svc #0` the guest makes -- number, first three arguments, result, the
+    /// path of an `openat`, and where it came from -- to stderr as it is answered.
+    ///
+    /// A diagnostic for code that goes to the kernel without libc, which is what integrity checks
+    /// do (MEASURED: an `openat` of `/proc/self/maps` by `svc`). Those calls reach no import, so
+    /// the census cannot see them.
+    pub fn set_syscall_trace(&self, on: bool) {
+        self.svc_trace.store(on, Ordering::Relaxed);
+    }
+
     /// Guest memory, checked.
     #[must_use]
     pub fn mem(&self) -> &GuestMem {
@@ -1494,6 +1507,28 @@ impl Boundary {
             answer as i64
         };
         self.mem.write_u32(errno_at, saved, blame)?;
+        if self.svc_trace.load(Ordering::Relaxed) {
+            use std::io::Write as _;
+            let path = if number == SYS_OPENAT {
+                let at_path = cpu.x(reg(1)) as GuestAddr;
+                let bytes = self
+                    .mem
+                    .read_bytes(at_path, 256, Blame::new("openat", at, 1))
+                    .or_else(|_| self.mem.read_bytes(at_path, 64, Blame::new("openat", at, 1)))
+                    .unwrap_or_default();
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                format!(" \"{}\"", String::from_utf8_lossy(&bytes[..end]))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                std::io::stderr(),
+                "SVC {number} at {at:#x} (x0 {:#x}, x1 {:#x}, x2 {:#x}){path} -> {result}",
+                cpu.x(reg(0)),
+                cpu.x(reg(1)),
+                cpu.x(reg(2)),
+            );
+        }
         cpu.set_x(reg(0), result as u64);
         Ok(())
     }

@@ -1043,8 +1043,8 @@ const ANON_VMA_NAME_MAX: usize = 80;
 ///
 /// So this layer can honour the whole contract by keeping the label
 /// ([`Bionic::vma_names`](super::Bionic::vma_names)) — which is not a plausible zero but the
-/// thing itself, stored where a host debugging a guest can read it. What is *not* modelled is
-/// `/proc`, and no guest can tell, because there is no `/proc` for it to look in.
+/// thing itself, stored where a host debugging a guest can read it, and printed as `[anon:<label>]`
+/// in the guest's `/proc/self/maps` (`procfs::MAPS`), which is where a device shows it.
 ///
 /// The guest-visible error cases are kept: a sub-option other than `PR_SET_VMA_ANON_NAME`, a name
 /// longer than the kernel's `ANON_VMA_NAME_MAX_LEN`, and an unreadable name pointer are `EINVAL`

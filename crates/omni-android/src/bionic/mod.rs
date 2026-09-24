@@ -321,7 +321,10 @@ pub struct Bionic {
     /// beside the range in `/proc/self/maps` and nothing reads it back through `prctl`; here it is
     /// readable by the host instead, which is the same information in the only place there is to
     /// put it. See `procenv::prctl`.
-    vma_names: Mutex<BTreeMap<(u64, u64), String>>,
+    ///
+    /// Shared (`Arc`) with the generator that now answers `/proc/self/maps`, which prints them as a
+    /// device does.
+    vma_names: Arc<Mutex<BTreeMap<(u64, u64), String>>>,
     /// The `rand` sequence's state. Process-wide, as C says it is.
     rand: AtomicU32,
     /// The bump allocator for [`POOL_BYTES`], and what has been handed out of it.
@@ -626,7 +629,7 @@ impl Bionic {
             conds: CondWaiters::new(),
             names: NameRegistry::new(),
             atexit: AtexitRegistry::new(),
-            vma_names: Mutex::new(BTreeMap::new()),
+            vma_names: Arc::new(Mutex::new(BTreeMap::new())),
             memory_budget: Arc::new(Mutex::new(None)),
             signal_masks: Mutex::new(BTreeMap::new()),
             // Seeded as C's `rand` is before any `srand`: the standard says the sequence is as
@@ -996,6 +999,22 @@ impl Bionic {
                 why: error.to_string(),
             })?;
         let device = omni_platform::fs::identity(filesystem.root());
+        // `/proc/self/maps`: the guest's own address space, which on a device is how code finds
+        // what is mapped where -- and what an integrity check opens (with a raw `svc`, MEASURED).
+        procfs::serve_maps(
+            &filesystem,
+            procfs::MapsSource {
+                space: Arc::clone(&self.space),
+                names: Arc::clone(&self.vma_names),
+                root: filesystem.root().to_path_buf(),
+                device,
+            },
+        )
+        .map_err(|error| AbiError::Refused {
+            symbol: "open".to_string(),
+            address: self.arena,
+            why: error.to_string(),
+        })?;
         if self.fs.set(filesystem).is_err() {
             return Err(AbiError::Refused {
                 symbol: "open".to_string(),
@@ -1553,6 +1572,16 @@ impl Bionic {
         omni_bionic::threads::Clock::now_monotonic(&self.clock)
     }
 
+    /// Label an anonymous mapping as the platform itself would, before the guest runs.
+    ///
+    /// What Android's linker does for each segment's `.bss` pages
+    /// (`prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, .., ".bss")` in `linker_phdr.cpp`), so a host
+    /// that loads the guest's libraries itself can leave the same labels behind. Shown in
+    /// `/proc/self/maps` as `[anon:<name>]`, exactly as a label the guest set.
+    pub fn name_anonymous_mapping(&self, address: u64, len: u64, name: &str) {
+        self.set_vma_name(address, len, Some(name.to_string()));
+    }
+
     /// Record the label the guest attached to one of its anonymous mappings.
     ///
     /// `None` clears it, which is what a null name pointer means to the kernel.
@@ -1571,7 +1600,7 @@ impl Bionic {
     /// Every label the guest has attached to one of its anonymous mappings, by `(address, len)`.
     ///
     /// The readable half of `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ..)`. A device puts these in
-    /// `/proc/self/maps`; there is no `/proc` here, so this is where they are.
+    /// `/proc/self/maps`, and so does this runtime's (`procfs::MAPS`); this is the host's view of them.
     #[must_use]
     pub fn vma_names(&self) -> Vec<((u64, u64), String)> {
         self.vma_names.lock().iter().map(|(k, v)| (*k, v.clone())).collect()
