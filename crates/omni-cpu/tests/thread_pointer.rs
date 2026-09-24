@@ -1,6 +1,6 @@
 //! D13: the bionic thread pointer, read by guest code exactly the way `libroblox.so` reads it.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 
@@ -212,7 +212,7 @@ fn the_per_thread_tls_cost_is_one_page() {
     );
     for cpu in &threads {
         // One derived term: the TLS page. The 16 MiB `FastDispatchEntry` table is allocated only
-        // when `FastDispatch` is on (patch 0002, D32), and these contexts run with it off (D16).
+        // when `FastDispatch` is on (patch 0017, D32), and these contexts run with it off (D16).
         assert_eq!(cpu.cost().private_committed, omni_cpu::TLS_BLOCK_BYTES);
         assert_eq!(
             cpu.cost().shared_committed,

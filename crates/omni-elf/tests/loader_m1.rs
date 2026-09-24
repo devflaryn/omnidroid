@@ -131,13 +131,26 @@ fn every_pt_load_lands_at_base_plus_p_vaddr() {
     );
 
     // The holes between segments stay owned and inaccessible, as bionic leaves them PROT_NONE.
-    let hole = object.base + 0x67d3000;
-    assert!(object.range_at(hole).is_none(), "the gap before .data is not part of any segment");
-    assert_eq!(
-        f.space.region_at(hole).map(|r| r.protection),
-        Some(Protection::None),
-        "the gap is still owned by this process and inaccessible"
-    );
+    // Segment 2 (relro) ends at 0x67d3000 and .data begins at 0x67d67c0. With 4 KiB pages whole
+    // pages lie between them; with 16 KiB pages there are none -- the library was linked so that
+    // .data starts in the 16 KiB page after relro's last one -- and the two segments are adjacent.
+    let hole_start = 0x67d3000usize.next_multiple_of(page as usize);
+    let data_page = 0x67d67c0usize & !(page as usize - 1);
+    if hole_start < data_page {
+        let hole = object.base + hole_start;
+        assert!(object.range_at(hole).is_none(), "the gap before .data is not part of any segment");
+        assert_eq!(
+            f.space.region_at(hole).map(|r| r.protection),
+            Some(Protection::None),
+            "the gap is still owned by this process and inaccessible"
+        );
+    } else {
+        assert!(
+            object.range_at(object.base + data_page).is_some(),
+            "no whole page lies between relro and .data at this page size, so .data's first page \
+             follows relro's last"
+        );
+    }
 
     // dl_iterate_phdr state: PT_PHDR sits at p_vaddr 0x40 inside the text segment.
     let info = object.dl_phdr_info();
@@ -313,9 +326,11 @@ fn the_bss_tail_of_the_last_file_page_is_zeroed_without_disturbing_file_pages() 
             "PT_LOAD {index}: {len} bytes of .bss tail at {file_end:#x} must be zero"
         );
         // ...and the file held something else there, so the assertion means something.
+        // Clamped to the file: with 16 KiB pages the last one can reach past the file's end.
         let from = (seg.p_offset + seg.p_filesz) as usize;
+        let to = (from + len).min(f.elf.data().len());
         assert!(
-            f.elf.data()[from..from + len].iter().any(|&b| b != 0),
+            f.elf.data()[from..to].iter().any(|&b| b != 0),
             "PT_LOAD {index}: the file already held zeroes in that tail"
         );
 
@@ -588,11 +603,18 @@ fn relro_covers_5205568_bytes_and_is_read_only_afterwards() {
     assert_eq!(relro.memsz, RELRO_BYTES, "PT_GNU_RELRO coverage");
     assert_eq!(relro.vaddr, RELRO_VADDR);
     assert!(relro.sealed);
-    // bionic rounds both ends **down**, so the sealed span is the whole pages the segment touches:
-    // 448 bytes below p_vaddr belong to the same page and are sealed with it.
-    assert_eq!(relro.start, object.base + (RELRO_VADDR as usize & !(page - 1)));
-    assert_eq!(relro.end, object.base + (RELRO_VADDR + RELRO_BYTES) as usize);
-    assert_eq!(relro.sealed_bytes(), 5_206_016);
+    // bionic rounds the start down and the end **up** (`page_end`, `linker_phdr.cpp`), so the
+    // sealed span is every page the segment touches: at 4 KiB, 448 bytes below p_vaddr share its
+    // first page and the end is already a page boundary (5,206,016 bytes); at 16 KiB the end rounds
+    // up over .got and .got.plt's page as well.
+    let start = RELRO_VADDR as usize & !(page - 1);
+    let end = ((RELRO_VADDR + RELRO_BYTES) as usize).next_multiple_of(page);
+    assert_eq!(relro.start, object.base + start);
+    assert_eq!(relro.end, object.base + end);
+    assert_eq!(relro.sealed_bytes(), end - start);
+    if page == 4096 {
+        assert_eq!(relro.sealed_bytes(), 5_206_016);
+    }
     eprintln!(
         "PT_GNU_RELRO: p_memsz {} bytes, sealed {} bytes ({} pages), head {} bytes below p_vaddr",
         relro.memsz,
@@ -662,11 +684,19 @@ fn writing_to_sealed_relro_faults() {
         Some(NO_FAULT),
         "the child wrote into PT_GNU_RELRO after sealing: relro is not actually read-only"
     );
+    #[cfg(target_os = "windows")]
     assert_eq!(
         code,
         Some(ACCESS_VIOLATION),
         "expected STATUS_ACCESS_VIOLATION ({ACCESS_VIOLATION:#x}), got {code:?}"
     );
+    // On macOS a store to a read-only page is a signal, not an exit status: SIGBUS (10).
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let _ = ACCESS_VIOLATION;
+        assert!(matches!(status.signal(), Some(10 | 11)), "expected SIGBUS or SIGSEGV, got {status:?}");
+    }
 }
 
 // -------------------------------------------------------------------------------------------------

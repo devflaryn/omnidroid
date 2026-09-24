@@ -13,7 +13,7 @@ upstream rather than about us; that figure has **not** been re-measured with
 (`-DDYNARMIC_FRONTENDS=A64`, Release, MSVC 2022, `dynarmic_tests.exe` with no
 filter): **All tests passed (201,698 assertions in 84 test cases)** with 0001
 alone (built from a clean checkout of `83cfa6e`) **and the identical figure with
-0001 + 0002, and with 0001 + 0002 + 0003**. The older 202,200/123 was a build that also had the A32 frontend;
+0001 + 0017, and with 0001 + 0017 + 0018**. The older 202,200/123 was a build that also had the A32 frontend;
 it is not comparable and was not re-run.
 
 ## Applied
@@ -40,9 +40,420 @@ same count, at the same `CNTFRQ_EL0` — which is what `omni-cpu`'s
 `cntvct_reads_the_same_clock_as_cntpct` asserts, from guest `MRS`
 instructions.
 
-### 0002 — a guest thread's fixed cost: the fast-dispatch table and the prelude commit
+### 0002 — arm64: the `Interpret` terminal calls the interpreter fallback
 
-`0002-per-thread-fixed-cost-fast-dispatch-and-prelude-commit.patch`, D32. Two
+`0002-arm64-interpret-terminal.patch`. **arm64 hosts only; the x64 backend is
+untouched.** The A64 frontend ends a block with `IR::Term::Interpret` in front
+of every word it cannot translate — the 231 commented-out decoder entries,
+including every LSE atomic, and every visitor that calls
+`InterpretThisInstruction()`. The x64 backend turns that terminal into a call to
+`UserCallbacks::InterpreterFallback`; the pin's arm64 backend had
+`ASSERT_FALSE("Interpret should never be emitted.")`
+(`emit_arm64_a64.cpp:36`), so on an arm64 host **the first undecodable guest
+word terminated the process**. MEASURED on Apple M1: `hostile.rs`'s fuzzer died
+at trial 2 with exactly that message, and `tests/interpret.rs` aborted with
+`SIGABRT` before the patch.
+
+The patch gives arm64 the x64 terminal, step for step: charge the cycles used
+so far (`AddTicks`), store the PC, install the **host's** `FPCR` (the x64
+terminal does `SwitchMxcsrOnExit`), call
+`InterpreterFallback(pc, num_instructions)` through a new prelude trampoline
+(`LinkTarget::InterpreterFallback`), reload the guest's `FPCR` from `JitState`
+(x64's `return_from_run_code[MXCSR_ALREADY_EXITED]` does
+`SwitchMxcsrOnEntry`), re-read the budget (`GetTicksRemaining`), and return to
+the dispatcher, which checks the halt flag and the budget before looking up the
+next block — the same loop x64's `ReturnFromRunCode(true)` enters.
+
+`tests/interpret.rs` asserts the contract from guest code: the preceding
+instructions are committed, the PC handed over is the unknown instruction's,
+`num_instructions` counts a merged run, a fallback that does not halt resumes at
+the PC it left, and the fallback runs under the host's `FPCR` while the guest's
+is back in force afterwards (a subnormal multiply under `FPCR.FZ`, both ways).
+
+### 0003 — arm64: scalar saturating add, subtract and doubling multiply-high
+
+`0003-arm64-scalar-saturation.patch`. **arm64 only.** `SignedSaturatedAdd8/16/32/64`,
+`SignedSaturatedSub*`, `UnsignedSaturatedAdd*`, `UnsignedSaturatedSub*` and
+`SignedSaturatedDoublingMultiplyReturnHigh16/32` were `ASSERT_FALSE("Unimplemented")`
+in `emit_arm64_saturation.cpp`, and the A64 frontend reaches all eighteen from
+`simd_scalar_three_same.cpp` (`SQADD`/`UQADD`/`SQSUB`/`UQSUB` scalar at every
+size — there is no size guard — and `SQDMULH` scalar at H and S, also from
+`simd_scalar_x_indexed_element.cpp`). One guest instruction was a terminated
+process; `tests/a64_saturation.rs` aborted with `SIGABRT` before the patch.
+
+Each is now the host's own scalar AdvSIMD instruction on the element's `B`/`H`/`S`/`D`
+register, which is the ARM ARM operation exactly (these are ARMv8.0 base
+instructions, present on every arm64 host) and sets the host's `FPSR.QC` on
+saturation. The FPSR manager is loaded first, exactly as the vector forms in
+`emit_arm64_vector_saturation.cpp` do, so the host `QC` is folded into the
+guest's `FPSR` at the next spill; the x64 backend ORs the same bit into
+`JitState::fpsr_qc`. `tests/a64_saturation.rs` checks every form at both bounds
+and in range, the cleared upper bits of `Vd`, and `QC` (set, clear, and sticky),
+against values worked from the ARM ARM pseudocode (`SatQ`, and
+`(2 * a * b) >> esize` for `SQDMULH`).
+
+### 0004 — arm64: half-precision arithmetic, and a fallback that dropped its result
+
+`0004-arm64-half-precision.patch`. **arm64 only.** Two defects in one family.
+
+**Unimplemented.** Every FP16 opcode the A64 frontend can emit and the arm64
+backend lacked was `ASSERT_FALSE("Unimplemented")`: scalar `FPAbs16`, `FPNeg16`,
+`FPMulAdd16`, `FPMulSub16`, `FPRoundInt16`, `FPRecipEstimate16`,
+`FPRecipExponent16`, `FPRSqrtEstimate16`, `FPRecipStepFused16`,
+`FPRSqrtStepFused16`, `FPHalfToFixed{S,U}{32,64}`, and vector `FPVectorEqual16`,
+`FPVectorMulAdd16`, `FPVectorNeg16`, `FPVectorRecipEstimate16`,
+`FPVectorRSqrtEstimate16`, `FPVectorRecipStepFused16`, `FPVectorRSqrtStepFused16`.
+They are reached by `FMADD`/`FMSUB`/`FNMADD`/`FNMSUB`, `FABS`, `FNEG`, `FRINT*`,
+`FRECPE`, `FRECPX`, `FRSQRTE`, `FRECPS`, `FRSQRTS`, `FCVT*`, `FCMEQ`, `FMLA`/`FMLS`
+at `ftype == 0b11` / `.4H`/`.8H` — `hostile.rs`'s fuzzer died on `FMSUB H` at
+trial 1002. The arithmetic ones now call dynarmic's own `FP::` routines, **the
+same ones the x64 backend calls for these opcodes** (x64 has no half-precision
+arithmetic), so both hosts produce the same bits and no host FEAT_FP16 is
+assumed; `FPAbs16`/`FPNeg16`/`FPVectorNeg16` are the sign-bit operations they
+are. Exceptions accumulate into the guest's `FPSR` after the FPSR manager is
+spilled.
+
+**A silent wrong answer.** `EmitTwoOpFallbackWithoutRegAlloc` saved and restored
+`ABI_CALLER_SAVE & ~(1ull << Qresult.index())` — which removes the
+*general-purpose* register with the result's number and keeps the result's `Q`
+register in the list, so the pop put the result register's old contents back
+over the computed value. It serves `FPVectorRoundInt16`, reached by
+`FRINT{N,M,P,Z,A,X,I}` (vector, half), which is **active** in the decoder.
+MEASURED before the patch: `FRINTN V0.8H, V1.8H` returned `[0, 0]`. The mask is
+now `~ToRegList(Qresult)`, and the new three- and four-operand helpers use the
+same.
+
+**Unreachable from A64, left as they are, with the evidence:**
+`FPHalfToFixedS16/U16` (only `FPToFixedS16/U16`, which only the A32 frontend
+calls, `A32/translate/impl/vfp.cpp:1073`); `FPVectorToSignedFixed16`,
+`FPVectorToUnsignedFixed16` (`FloatConvertToInteger` fixes esize at 32/64,
+`simd_two_register_misc.cpp:107`; `ConvertFloat` rejects `immh` 0001-0011,
+`simd_shift_by_immediate.cpp:197`; the half forms are `//INST` in `a64.inc`);
+and the `RoundingMode::ToOdd` arms of both `EmitToFixed` helpers (A64 passes a
+constant mode or `FPCR.RMode`, a 2-bit field that cannot hold `ToOdd` = 5; the
+only `ToOdd` in the A64 frontend is `FCVTXN`, which is not a to-fixed
+conversion).
+
+`tests/a64_fp16.rs`: every reachable form, with encodings checked against the
+LLVM assembler and values worked from IEEE binary16 and the ARM ARM (the 8-bit
+estimate tables, `FPRecpX`, fused single rounding shown by a lane whose exact
+result is a subnormal that a two-rounding implementation would flush to +0),
+plus FPSR `IOC`/`DZC`/`IXC` where the ARM ARM raises them.
+
+### 0005 — arm64: the SM4 substitution box
+
+`0005-arm64-sm4-sbox.patch`. **arm64 only.** `SM4E` and `SM4EKEY` (FEAT_SM4,
+active in `a64.inc`) translate to IR that looks bytes up through
+`SM4AccessSubstitutionBox`, which was `ASSERT_FALSE("Unimplemented")` in
+`emit_arm64_cryptography.cpp`; the first `SM4E` terminated the process
+(`tests/a64_sm4.rs` aborted before the patch). It now calls
+`Common::Crypto::SM4::AccessSubstitutionBox`, as the x64 backend does, through a
+lambda that takes the index as a `u64` and narrows it in C++ (Apple's arm64 ABI
+makes the *caller* extend sub-32-bit arguments, which generated code does not
+promise). `tests/a64_sm4.rs` runs the SM4 specification's own example — key
+schedule and 32 rounds through eight `SM4EKEY` and eight `SM4E` — and checks
+the ciphertext `681edf34 d206965e 86b3e94f 536e4246`.
+
+### 0006 — arm64: 64-bit unsigned max/min, which is how `CMHS`/`CMHI` compare
+
+`0006-arm64-unsigned-compare64.patch`. **arm64 only.** The IR has no 64-bit
+unsigned compare; `IREmitter::VectorGreaterEqualUnsigned` is
+`VectorEqual(VectorMaxUnsigned(a, b), a)` and `VectorGreaterUnsigned` is
+`NOT VectorEqual(VectorMinUnsigned(a, b), a)`. At `esize == 64` those are
+`VectorMaxU64`/`VectorMinU64`, `ASSERT_FALSE("Unimplemented")` on arm64, and
+`CMHS`/`CMHI` scalar (`D` only) and vector `.2D` are active decoder entries.
+FOUND by `hostile.rs`'s fuzzer at trial 158,510 (`CMHS D18, D23, D24`), in a
+300,000-trial run made after 0002-0005. AdvSIMD has no 64-bit `UMAX`/`UMIN`, so
+each selects per lane on `CMHI` with `BSL`. `tests/a64_compare.rs` checks
+both forms with operands a signed compare would order the other way.
+
+`VectorMaxS64`/`VectorMinS64` stay unimplemented: their only caller is
+`VectorMinMaxOperation` (`SMAX`/`SMIN`), which rejects `size == 0b11`
+(`simd_three_same.cpp:174`), and the signed compares are built from
+`VectorGreaterSigned`, not from max/min.
+
+### 0007 — arm64: `fastmem_exclusive_access` is honoured (inline `LDXR`/`STXR`)
+
+`0007-arm64-inline-exclusives.patch`. **arm64 only.** Root cause of
+`a64_exec::atomic_load_exclusive_store_exclusive` failing on the arm64 host:
+the backend accepted `fastmem_exclusive_access` and ignored it —
+`EmitExclusiveReadMemory`/`EmitExclusiveWriteMemory` called the callback-only
+versions unconditionally, and `EmitConfig` never carried the flag. Every
+exclusive pair therefore cost a slow-path read plus an exclusive-write callback
+(MEASURED: `slow_path_total == 2` where x64 gives 0), which is also exactly
+what `omni-cpu`'s per-slice invariant refuses as `DegradedMemoryPath` — so on
+arm64 the first `LDXR`/`STXR` in a slice would have stopped the guest.
+
+The patch is the x64 backend's inline protocol (`EmitExclusiveReadMemoryInline`,
+`EmitExclusiveWriteMemoryInline`) on arm64, against the **same** monitor
+fields and the same `SpinLock` word, so inline and callback threads of one
+monitor interoperate:
+
+* read: lock; `exclusive_state = 1`; `address[pid] = vaddr`; load-acquire
+  through fastmem; `value[pid] = value`; unlock.
+* write: lock; `status = 1`; if the state is set and `address[pid] == vaddr`,
+  compare-and-swap `value[pid] -> value` at the host address with an
+  `LDAXR`/`STLXR` loop (`LDAXP`/`STLXP` for 128 bits; ARMv8.0, no LSE assumed),
+  then clear every processor's reservation of the address (the monitor's
+  `CheckAndClear`, this one's included); `exclusive_state = 0` either way (a
+  store-exclusive always leaves the local monitor open); unlock.
+* a fastmem miss — out of the fastmem range, or a host fault at the patched
+  load — goes to a fallback that **releases the lock first** and then does the
+  whole access through new `Wrapped*` trampolines that call the monitor exactly
+  as the callback-only path does; `recompile_on_fastmem_failure` rebuilds the
+  block without the inline path.
+
+`EmitConfig` gains `fastmem_exclusive_access`, `global_monitor`, `processor_id`.
+128-bit stores borrow four general-purpose registers on the stack for the length
+of the sequence (the arm64 register allocator has no scratch-register request);
+the host-fault entry gives them back before falling into the fallback.
+The monitor accessors come from `backend/x64/exclusive_monitor_friend.h`, which
+is backend-neutral. **dynarmic's exception handler is untouched.**
+
+`tests/exclusive.rs`: every width and the pair form, inline, with
+`slow_path_total == 0`; the failure cases (no reservation, `CLREX`, a spent
+reservation, another address) on both paths; the fallback through a
+fastmem-range miss, served by the callbacks with the same answers; and four
+threads on one monitor and one arena doing 50,000 `LDAXR`/`STLXR` increments
+each, all inline and inline mixed with callback threads — no lost update.
+
+### 0008 — arm64: the memory-abort check reads the halt word as the 32 bits it is
+
+`0008-arm64-halt-word-is-32-bit.patch`. **arm64 only.**
+`EmitA64CheckMemoryAbort` — emitted on the fallback of every fastmem access
+when `check_halt_on_memory_access` is set, which `omni-cpu` sets — loaded the
+halt word with `LDAR Xscratch0, [Xhalt]`, a **64-bit** load-acquire, from
+`A64::Jit::Impl::halt_reason`, a `u32` at a 4-byte-aligned address. A
+load-acquire must be naturally aligned, so the check itself took an alignment
+fault inside translated code; dynarmic's handler found no fastmem patch at that
+PC and terminated the process (`Segfault wasn't at a fastmem patch location!`).
+So on arm64 **every guest access to unmapped memory killed the process instead
+of becoming a typed fault** — the first fastmem miss faulted correctly, was
+redirected to the fallback, served, and then the abort check faulted.
+
+MEASURED before the patch, with dynarmic's handler alone (no Omnidroid fault
+handler installed): fault 1 at the patched `LDR`, redirected; fault 2 at
+`c8dfff70` (`LDAR X16, [X27]`) with `X27 = 0x…1ac`. `tests/host_fault.rs`
+(identity fastmem, `check_halt_on_memory_access`, guest address `0x2000` in
+`__PAGEZERO`) aborted before the patch and passes after, for a load, a store,
+and the inline exclusive pair and doubleword pair of 0007. The A32 twin in
+`emit_arm64_a32.cpp` has the same instruction; A32 is not built here, so it is
+left alone.
+
+### 0009 — arm64: the prelude invalidates what it wrote, not the whole code cache
+
+`0009-arm64-invalidate-only-the-prelude.patch`. **arm64 only.**
+`A64AddressSpace::EmitPrelude` ended with `mem.invalidate_all()`, the cache-maintenance loop over
+**every page of the code cache**. On macOS that is `sys_icache_invalidate`, and cache maintenance on
+an untouched page faults it in: MEASURED with a C probe, a 32 MiB `MAP_JIT` mapping costs +0.00 MiB
+of `phys_footprint` untouched and **+32.03 MiB** after one `sys_icache_invalidate` over it. So every
+jit -- one per guest thread -- paid its whole code cache in memory at creation, whatever it later
+emitted: 39 jits x 32 MiB at the landing screen, about 1.2 GiB of a 3.2 GiB footprint (footprint(1),
+`MallocStackLogging` stacks ending in `AddressSpace::AddressSpace`). Only the prelude has been
+written at that point; every block emitted later is invalidated on its own in `AddressSpace::Emit`.
+`tests/code_cache_charge.rs` creates a jit with a 32 MiB cache and requires it to cost less than
+2 MiB, and still to run translated code. The A32 twin (`a32_address_space.cpp`) has the same call;
+A32 is not built here.
+
+### 0010 — arm64: keep what is read of an emitted block, in flat records
+
+`0010-arm64-compact-block-records.patch`. **arm64 only; no change to what is emitted or when.**
+`AddressSpace` kept, for every block it emitted: the block's whole `EmittedBlockInfo` (a vector and
+two robin_maps, 200 bytes) **inline in the buckets** of `block_infos`, a robin_map keyed by entry
+point at a load factor of at most 0.5; a `std::map` node for the reverse lookup; and, for every link
+target, a robin_set of referring entry points in the buckets of `block_references` (96 bytes each,
+and `RelinkForDescriptor`'s `operator[]` made one for every emitted block's own location). Each
+block's fastmem patch sites were a robin_map of their own -- a separate allocation per block.
+
+**MEASURED** in the macOS gate (census built into a scratch build of the pin, counters per jit, read
+at +30/45/60/75/85 s, n = 1 run; bucket and element sizes from `sizeof` on the vendored headers):
+at +60 s, **593,699 blocks over 39 jits** (88,163 in the largest, 616 in the smallest), 2,099 bytes of
+bookkeeping per block before malloc rounding -- `block_infos` buckets 890, `block_references`
+buckets 484 + sets 46, fastmem maps 281, `relocations` vectors 134, per-block link maps 102 + 20,
+`block_entries` 78, reverse map 64 -- 1.19 GiB in all, which `heap(1)` and `footprint(1)` confirm
+(`MALLOC_LARGE` 912 MB, `MALLOC_SMALL` 649 MB). The engine's heavy threads each hold 20-125 thousand
+blocks of the same code.
+
+What is read after a block is emitted is only its entry point, location and size, its fastmem patch
+sites (`FastmemCallback`), and where it links to each target (`RelinkForDescriptor`);
+`relocations` is consumed by `Link` at emission and never read again. The patch keeps exactly that:
+
+* `block_records`: entry point, location, size, first patch site -- 24 bytes, **appended in
+  ascending entry-point order**, because emission only moves forward until `ClearCache` (asserted).
+  A binary search replaces `reverse_block_entries` and `block_infos` (`ReverseGetLocation`,
+  `ReverseGetEntryPoint`, `FastmemCallback`).
+* `fastmem_records`: one per patch site, 24 bytes, grouped by block and sorted by offset, so the
+  handler finds the site by binary search within the block -- the same key the per-block map had.
+  `FakeCall::call_pc` is kept as an offset from the entry point (it is inside the block; asserted).
+* `link_records` + `link_heads`: one 24-byte record per block relocation, chained per target from
+  the newest; a block's records for one target are adjacent in the chain, so `RelinkForDescriptor`
+  patches each referring block's links to that target and invalidates that block once, as before.
+
+Nothing is dropped earlier than before: an invalidated block keeps its records until `ClearCache`,
+exactly as it kept its `block_infos` and `block_references` entries -- `FastmemCallback` can be
+entered from a block that has just been invalidated (the recompile path does that to itself), and
+`RelinkForDescriptor` keeps patching stale blocks' links, as it did. `ClearCache` now **gives the
+memory back** (`= {}` / swap) where `clear()` kept a robin_map's buckets and a vector's capacity.
+The emitters are untouched: `EmittedBlockInfo` is still their product, and is freed after `Emit`.
+
+`tests/bookkeeping.rs` measures bytes in use by the allocator (`malloc_zone_statistics`, every zone;
+it first shows the reading sees a 16 MiB allocation) around the translation of 8,192 blocks with one
+patch site and one link each: **1,785 bytes per block on the pin, 457 with the patch** (n = 8,192
+blocks, of which 147 is the pin's `block_ranges`, which 0011 addresses); the bound is 700. It also
+covers the two lookups the records replace, both of which pass on the pin too: three blocks linked to
+one that is rewritten and invalidated must each stop running its stale translation (the chain walk),
+and a host fault at the third of a block's four patch sites must be served as the third
+(`FastmemCallback`'s binary search).
+
+### 0011 — arm64: the guest ranges of emitted blocks, compact and cleared with the cache
+
+`0011-arm64-guest-range-index.patch`. **arm64 only.** `A64AddressSpace` recorded the guest bytes each
+block was translated from in a `BlockRangeInformation<u64>` (`backend/block_range_information.cpp`,
+shared with x64 and not edited here): a boost::icl `interval_map` of `std::set<LocationDescriptor>`,
+in which overlapping blocks split each other's intervals and copy the sets. **And nothing cleared it**:
+`AddressSpace::ClearCache` did not know it existed, so it grew for the whole life of the jit, across
+every cache clear, and never dropped an invalidated block's range either (upstream's own
+`TODO: EFFICIENCY` in `InvalidateRanges`).
+
+MEASURED in the gate at +60 s (`heap(1)` with `MallocStackLogging=lite`, n = 1 run): 846,107 icl
+nodes (81 MB) and 874,315 set nodes (42 MB) -- 207 bytes per block, for the 594,083 blocks the jits
+held, after six cache clears the map had outlived.
+
+The patch keeps one 24-byte `GuestRange` per emitted block (location and the closed range the pin
+registered, `[PC, EndLocation.PC - 1]`, skipped when empty as the icl skipped it), indexed by the
+4 KiB guest pages it covers; a block covering more than 64 pages goes to a list checked on every
+invalidation instead. `InvalidateCacheRanges` returns every location registered with a range
+intersecting a requested one -- what `InvalidateRanges` returned -- looking the pages up, or walking
+the index when more pages are asked about than it has (the whole-guest-space invalidation
+`omni-android` sends when a context's cross-thread queue overflows). `ClearCache` is now virtual and
+`A64AddressSpace` clears the ranges with the cache, so `Emit`'s own clear of a full cache clears them
+too.
+
+**The one difference, stated exactly.** After a clear, a range that only a *pre-clear* translation of
+a location covered no longer invalidates that location's current translation. That translation was
+made after the clear from the guest bytes as they then were, and registered the range it read; a
+write elsewhere cannot make it stale. So what the guest executes is unchanged, and the pin's extra
+invalidation there -- a retranslation of code that had not changed -- is gone.
+
+`tests/bookkeeping.rs`, n = 32,768 blocks: **440 bytes per block with 0010 alone, 365 with 0011**;
+after `od_jit_clear_cache`, **128 bytes per block still held with 0010 alone, 0-1 with 0011** (the
+bound is 16). Three behaviour tests cover the index, and pass on the pin as well: a write to the
+second page of a two-page block, a write to the last word of a 70,001-instruction block (more than
+64 pages: the retranslation fetches all of it), and a 16 GiB invalidation reaching every block.
+
+### 0012 — arm64: an invalidation that leaves no block standing is a clear
+
+`0012-arm64-an-invalidation-that-leaves-nothing-is-a-clear.patch`. **arm64 only.** After
+`InvalidateCacheRanges`, if no block is left in `block_entries`, `A64AddressSpace` calls
+`ClearCache`.
+
+**Why it matters here, MEASURED** (census build of the pin, gate, n = 1 run): at +85 s the jits held
+835,605 block records of which **451,075 were invalidated blocks** -- 1,045,686 of 1,581,230 blocks
+emitted since start had been invalidated. Almost all of it came from one request: a 16 GiB range
+`[0x7000000000, 0x73ffffffff]`, the whole guest space, found up to 78,357 blocks at a time. That is
+`omni-android`'s cross-thread code invalidation (`boundary.rs`, `CodeWatch::broadcast`): every
+guest `munmap`/`mprotect`/`MADV_DONTNEED` is queued for every other live context, and a context
+that has not crossed the boundary for 64 of them has its queue collapse to "the whole address
+space". Invalidated blocks keep their records and their code until the cache is cleared, so each
+such jit held a dead copy of its whole translation and kept emitting above it until the cache filled.
+
+**Why it is the same thing the guest could see.** `InvalidateCacheRanges` runs only from
+`Jit::Impl::PerformRequestedCacheInvalidation`, before or after `RunCode` -- never with generated
+code on the stack. The return stack buffer is on `RunCode`'s frame and rebuilt at every entry, and
+every link to an invalidated location was pointed back at the dispatcher when it was invalidated
+(`RelinkForDescriptor(descriptor, nullptr)`). So when nothing is left in `block_entries`, no
+invalidated block can run again, and `ClearCache` -- what `Jit::ClearCache` (the guest's
+`IC IALLU`) does at the same point -- gives back exactly what cannot be used: the records and the
+cache space. The fastmem recompile path, which invalidates from inside generated code, calls
+`InvalidateBasicBlocks` directly and is not affected.
+
+`tests/bookkeeping.rs`, n = 32,768 blocks: after invalidating every block between runs, **364 bytes
+per block still held without the patch, 1 with it**; the chain then runs again, retranslated.
+Rows mac-mem-A7 (reverted) and mac-mem-B2 (every invalidation clears: `a64_exec`'s test that a
+small invalidation spares the other translations must fail).
+
+### 0013 — arm64: the bookkeeping's large arrays are pages of their own
+
+`0013-arm64-page-backed-bookkeeping.patch`. **arm64 only.** A new header,
+`backend/arm64/page_backed_allocator.h`: `PageBackedAllocator<T>` maps an array of at least 256 KiB
+anonymously (`mmap`) and unmaps it when it is freed; a smaller one uses `operator new` as before. The
+containers of 0010-0011 -- `block_entries`, the three record vectors, `link_heads`, `guest_ranges` and
+the page index -- allocate through it.
+
+**Why.** Those containers grow by doubling and `ClearCache` gives them back whole, so their large
+arrays are allocated and freed many times over a jit's life -- and a large array freed through the
+C++ heap is the host allocator's to keep, dirty and charged to the process.
+
+`tests/bookkeeping.rs` measures `phys_footprint` around a clear of 32,768 blocks' bookkeeping
+(11.4 MiB, counted as the zones' bytes in use plus the allocator's mapped bytes, which the shim
+reports through a new `od_page_backed_bytes()`; the footprint instrument is first shown seeing 16 MiB
+touched): **the clear took 9.06 MiB off the footprint with the patch, 0.00 MiB with no array
+page-backed** (the threshold set out of reach, n = 2), and the bound is three quarters of what was
+held. Row mac-mem-A8 is that mutation.
+
+**In the gate** (+60 s): `MALLOC_LARGE` in use went from 85-113 MiB (n = 3, after 0012) to no
+in-use region at all (n = 3) -- the arrays are now mappings, charged for the pages written rather than for a
+vector's spare capacity -- and the landing-screen footprint from 876-892 MiB (n = 3) to 811-841 MiB
+(n = 4). **A correction, recorded because it was nearly carried as the reason for this patch:** at
+the landing screen `vmmap` also shows 46-63 MiB of dirty `MALLOC_LARGE (empty)` regions -- freed
+large blocks the allocator keeps -- and their sizes (3-14 MiB) suggested these arrays. With the patch
+they are still there (55-61 MiB, n = 3), so they are someone else's; they are not attributed here.
+
+`od_page_backed_bytes()` is additive in the shim (`od_dynarmic.h`): no struct or existing signature
+changes, so `OD_DYNARMIC_ABI_VERSION` stands; it answers 0 where the arm64 backend is not built.
+
+### 0014 — arm64: the store-exclusive is a fastmem patch location too
+
+`0014-arm64-the-store-exclusive-is-a-patch-location-too.patch`. **arm64 only**, a defect in 0007.
+0007's inline store-exclusive is a compare-and-swap -- a load-acquire exclusive, then a
+store-release exclusive -- and it registered only the **load** as a fastmem patch location. A page
+the host lets the load read but not the store write (read-only: the guest's sealed relro) faults at
+the store, at a host PC dynarmic has no record of, and its handler aborts the whole process
+("Segfault wasn't at a fastmem patch location!"). Found by the native-backend workstream's survey of
+all 245,117 `.eh_frame` functions of `libroblox.so` (docs/ports/macos-hvf.md 4.7), reduced here to
+two functions: `0x2247264` leaves a pointer into `.data.rel.ro` where `0x224822c` hands it to the
+outlined `__aarch64_swp8_rel` (`LDXR` at `0x2b9e87c`, `STLXR` at `0x2b9e880`). The store-release is now registered
+with the same fault entry as the load (the lock is held and, for 128 bits, the borrowed registers
+are on the stack at both). x64 is unaffected: its inline compare-and-swap is one `LOCK CMPXCHG`,
+which is its patch location. `tests/host_fault.rs` stores exclusively to the test binary's own
+read-only data (both widths); `omni-cpu`'s `exclusive_store_fault.rs` runs the two real functions;
+the full survey then runs all 245,117 functions on dynarmic without an abort (MEASURED once, 41 s).
+
+### 0015 — arm64: an invalidation walks only the chunks that hold translated code
+
+`0015-arm64-invalidate-only-chunks-with-code.patch`. **arm64 only**, on top of 0011. `omni-android`
+hands every guest `mmap`, `munmap`, `mprotect` and `MADV_DONTNEED` range to **every** guest thread's
+jit, because any of them could have held translated code; almost none did. 0011's page index
+answered a range with one hash lookup per 4 KiB page whenever the range had fewer pages than the
+index, on every thread. MEASURED in a game on the macOS host (`sample`, 5 s, n = 1): two guest
+threads spent 64-69% of their time in `A64AddressSpace::InvalidateCacheRanges` -- 4,018 samples,
+more than a core -- while the render thread waited on the game thread half the time. The patch
+keeps the set of 2 MiB chunks that hold indexed pages (cleared with the cache) and walks, page by
+page, only the chunks a range touches that are in it; a range with no code in it costs one set
+lookup per 2 MiB, or a walk of the set when that is shorter. Nothing else changes: the same blocks
+are found and invalidated. `od_invalidation_page_probes()` (shim, measurement only) counts page
+lookups; `tests/invalidation_probes.rs`: 256 pages of data probed **256** pages before, **0** after,
+and two code pages probe 2. Rows `mac-cpu-I1` (filter off) and `mac-cpu-I2` (chunks not recorded).
+
+### 0016 — arm64: a location translated again keeps one range, not one per translation
+
+`0016-arm64-a-translated-again-location-keeps-one-range.patch`. **arm64 only**, a defect in 0011,
+found by measuring 0015 in a game. 0011's page index appended a `GuestRange` every time a block was
+translated and dropped none until a cache clear, which never comes while any block survives (the
+rest of `libroblox.so` stays translated). The pin's `BlockRangeInformation` kept a *set* of
+locations per interval, so a location translated again collapsed into its old entry; 0011's lists
+did not. Code the engine invalidates and translates again, over and over, therefore piled up dead
+entries that every later invalidation of those pages checked: MEASURED in a game with 0015 applied
+(`sample`, 5 s, n = 1), three guest threads at **97-98%** of their time in
+`InvalidateCacheRanges`. A range is now marked dead when its block is invalidated, and dead ranges
+are dropped from each page list an invalidation walks (and a page whose list empties is dropped).
+`tests/invalidation_probes.rs`: 200 invalidate-and-translate cycles of one page, then one
+invalidation checks **201** ranges before and **1** after (`od_invalidation_ranges_checked`,
+measurement only). Row `mac-cpu-I3`.
+
+### 0017 — x64: a guest thread's fixed cost: the fast-dispatch table and the prelude commit
+
+`0017-per-thread-fixed-cost-fast-dispatch-and-prelude-commit.patch`, D32. Two
 changes, both to what every `A64::Jit` costs before it has translated anything:
 
 1. **The fast-dispatch table is allocated only when `FastDispatch` is on**
@@ -66,9 +477,9 @@ same scenario (`memrun.sh` in the 2026-09-24 session scratchpad): process commit
 MiB committed; fast-dispatch tables 44 × 16 MiB → none. Upstream suite: identical
 before and after (above).
 
-### 0003 — a return-stack-buffer hit checks the budget and the halt flag
+### 0018 — x64: a return-stack-buffer hit checks the budget and the halt flag
 
-`0003-rsb-hit-checks-budget-and-halt.patch`, D33. Candidate 2a below, for the
+`0018-rsb-hit-checks-budget-and-halt.patch`, D33. Candidate 2a below, for the
 `PopRSBHint` handler only. After a hit is confirmed (the location descriptor
 computed from the guest PC in `JitState` matches the top entry) and before the
 `jmp` to the predicted block, the handler now compares `cycles_remaining` with
@@ -101,6 +512,15 @@ pin verifies that the tree is exactly upstream plus these patches. Touch
 `vendor/PIN.txt` afterwards; it is the only thing under `vendor/` that the build
 script tells Cargo to watch.
 
+`python3 crates/dynarmic-sys/tools/verify_patches.py` does that check without a
+network: the pristine tree is the one committed when the pin was vendored
+(`64034d4`), every patch is applied to it in order (`git apply --check` first),
+and the result must be the vendored tree **byte for byte** (in git object
+space, so eol attributes and ignored build outputs cannot confuse it); the
+vendored tree must also reverse-apply back to pristine. An edit made under
+`vendor/` without its patch fails the first half, which is the half a
+reconstruction from the tree itself could never catch.
+
 ## Known candidates, not yet applied
 
 ### 1. `hook_hint_instructions` is never plumbed into the A64 frontend
@@ -114,7 +534,7 @@ code that depends on the new behaviour.
 ### 2. Terminals that check the cycle counter and the halt flag exclusively
 
 All measured by `the_stoppability_matrix` in `tests/hostile.rs`, 27 cells
-before 0003 (39 now).
+before 0018 (39 now).
 **A configuration that stops every runaway guest does exist** — `0x0000_FFF8`,
 which is `ALL_SAFE` without `BlockLinking`, `ReturnStackBuffer` or
 `FastDispatch` — because it routes every terminal through `ReturnFromRunCode`
@@ -132,7 +552,7 @@ guest `BR`/`RET` loop whose target stays in the return-stack buffer or the
 fast-dispatch cache cannot be stopped at all. One `BR` costs a host thread
 permanently.
 
-**`PopRSBHint`: patched (0003).** `FastDispatchHint`: still unchecked.
+**`PopRSBHint`: patched (0018).** `FastDispatchHint`: still unchecked.
 
 Worked around by configuration first, not a patch:
 `dynarmic_sys::optimization::INTERRUPTIBLE` cleared `ReturnStackBuffer` and
@@ -299,7 +719,7 @@ whether it is read already exist, so the change is the allocation and the null c
 control flow. Worth **16 MiB per guest thread, about 512 MiB at 32 threads**, and more in working set
 than in commit charge because the constructor writes it.
 
-**Applied as 0002 (2026-09-24)**, after the suite run this paragraph asked for -- see "Applied"
+**Applied as 0017 (2026-09-24)**, after the suite run this paragraph asked for -- see "Applied"
 above. The paragraph that follows is the reasoning as it stood before:
 
 **Not applied.** It changes a hot structure's indirection on the path that *is* enabled upstream, so

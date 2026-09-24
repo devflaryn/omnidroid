@@ -10,7 +10,7 @@
 //! | Configuration | Direct-branch loop | Indirect-branch loop | Cost |
 //! |---|---|---|---|
 //! | `ALL_SAFE`, cycle counting | budget stops it | **nothing stops it** | baseline |
-//! | `INTERRUPTIBLE` (`0xFFF9`; `0xFFFB` since patch 0003, D33), cycle counting | budget stops it | budget stops it | ~3.9 ns per indirect transfer (n = 31): **1.00x** on code with no indirect branches, 4.56x-4.71x on indirect-saturated code |
+//! | `INTERRUPTIBLE` (`0xFFF9`; `0xFFFB` since patch 0018, D33), cycle counting | budget stops it | budget stops it | ~3.9 ns per indirect transfer (n = 31): **1.00x** on code with no indirect branches, 4.56x-4.71x on indirect-saturated code |
 //! | `BlockLinking` off (`0xFFF8`) | both escapes work on both | both escapes work on both | **7.08x-7.43x** across D16's three workloads (n = 31) |
 //!
 //! **`INTERRUPTIBLE` with block linking left on** (D16's `0xFFF9`). The third row buys a second
@@ -35,7 +35,7 @@
 //! test. [`the_configuration_that_makes_the_budget_work_is_in_effect`] pins the configuration
 //! instead, which is the part this crate controls.
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 
@@ -158,8 +158,9 @@ fn the_configuration_that_makes_the_budget_work_is_in_effect() {
     assert_eq!(config.enable_cycle_counting, 1, "no counting means no budget to expire");
 
     // `INTERRUPTIBLE` is `ALL_SAFE` without the flag whose terminal handler checks neither the cycle
-    // counter nor the halt flag. The return stack buffer's handler checks both since vendored
-    // patch 0003 (D33), so it stays on -- it is what keeps a `RET` off the dispatcher.
+    // counter nor the halt flag. On x64 the return stack buffer's handler checks both since vendored
+    // patch 0018 (D33), so it stays on -- it is what keeps a `RET` off the dispatcher. arm64 has no
+    // such patch.
     const RETURN_STACK_BUFFER: u32 = 0x02;
     const FAST_DISPATCH: u32 = 0x04;
     const BLOCK_LINKING: u32 = 0x01;
@@ -169,10 +170,17 @@ fn the_configuration_that_makes_the_budget_work_is_in_effect() {
         "the fast-dispatch terminal handler jumps straight from block to block checking nothing, \
          which is what makes an indirect-branch loop unstoppable"
     );
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(
+        config.optimizations & RETURN_STACK_BUFFER,
+        0,
+        "arm64: the return stack buffer is OFF -- patch 0018 is x64-only, and the arm64 `PopRSBHint`          checks neither the budget nor the halt flag"
+    );
+    #[cfg(target_arch = "x86_64")]
     assert_ne!(
         config.optimizations & RETURN_STACK_BUFFER,
         0,
-        "the return stack buffer stays ON: patch 0003 made its hit path check the budget and the \
+        "the return stack buffer stays ON: patch 0018 made its hit path check the budget and the \
          halt flag, and without it every guest `RET` is a dispatcher lookup (132 vs 24 ns per call \
          and return at 262,144 blocks, D33)"
     );

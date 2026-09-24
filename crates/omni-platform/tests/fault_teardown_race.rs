@@ -28,7 +28,7 @@
 //! Every figure this test prints carries its `n` (Global Constraint 12): rounds, threads per round,
 //! pages per thread, and the faults actually served.
 
-#![cfg(target_os = "windows")]
+#![cfg(any(target_os = "windows", all(target_os = "macos", target_arch = "aarch64")))]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -244,6 +244,17 @@ fn tearing_a_handler_down_under_load_never_lets_a_dispatch_outlive_the_release()
             })
         };
 
+        // On macOS a fault is two Mach round trips (~40 us, measured in `fault_macos.rs`), so a
+        // teardown issued the instant the workers are spawned lands before their first fault and the
+        // primary is never entered -- this test then measures nothing, and says so. Wait (bounded)
+        // until the primary has served one fault, so the teardown lands in the middle of the load
+        // the way it does on Windows. Windows' timing is left exactly as it was.
+        if cfg!(target_os = "macos") {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while primary.entered.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+        }
         // Tear the primary down *now*, with the workers mid-flight and the churner competing for the
         // slot it is about to free. Nothing is synchronised: the race is the input.
         drop(primary_reg);

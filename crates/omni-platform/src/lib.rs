@@ -108,6 +108,8 @@ pub mod audio;
 pub mod clock;
 pub mod fault;
 pub mod fs;
+#[cfg(feature = "hypervisor")]
+pub mod hypervisor;
 pub mod log;
 pub mod net;
 pub mod process;

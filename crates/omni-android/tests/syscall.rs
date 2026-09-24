@@ -18,7 +18,7 @@
 //! how long something took, and the one test that needs two threads to interleave waits for the
 //! witness rather than sleeping a duration chosen to be "long enough".
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

@@ -189,7 +189,7 @@ pub struct DynarmicOptions {
     pub max_threads: u32,
     /// Whether to clear the optimization flag whose terminal handler checks neither the cycle
     /// counter nor the halt flag -- `FastDispatch`; it was two, with `ReturnStackBuffer`, until
-    /// vendored patch 0003 gave the return-stack-buffer handler both checks (D33).
+    /// vendored patch 0018 gave the return-stack-buffer handler both checks (D33).
     ///
     /// **Default `true`, and that is a deliberate trade.** Task 2 measured a guest `BR X30`
     /// branching to itself to be stoppable by *nothing* under the default flags — not a budget, not
@@ -819,6 +819,7 @@ pub(crate) enum PendingExit {
 /// Not covered, and stated rather than implied: the x87 control word. Neither dynarmic nor Rust's
 /// `f32`/`f64` codegen uses x87 on x86-64, so there is nothing to switch; if that ever stops being
 /// true this is where it goes.
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod mxcsr {
     /// Read `MXCSR`.
     ///
@@ -867,6 +868,77 @@ pub(crate) mod mxcsr {
         }
     }
 }
+
+/// The AArch64 host's floating-point control register, which is what plays `MXCSR`'s part on an
+/// `aarch64` host, and the same guard over it.
+///
+/// # Why an arm64 host needs the same guard
+///
+/// dynarmic's arm64 prelude (`A64AddressSpace::EmitPrelude`, `a64_address_space.cpp`) saves the
+/// host's `FPCR` into `StackLayout::save_host_fpcr` and writes the **guest's** `FPCR` into the host
+/// register before it branches into translated code, and puts the host's back only in
+/// `return_from_run_code`. Its call trampolines (`EmitCallTrampoline`, same file) -- the path
+/// `CallSVC` takes, and therefore every inline thunk handler -- switch nothing. So a host callback
+/// runs with the guest's rounding mode, flush-to-zero (`FZ`, bit 24), default-NaN (`DN`, bit 25) and
+/// `FZ16` live in the real register, and Rust's `f32`/`f64` compile to the very instructions those
+/// bits govern. Same defect class as `MXCSR` on x86-64, same fix, same single place.
+///
+/// Named `mxcsr` for the rest of this module (below) so the dispatcher and the thunk path are one
+/// code path on both hosts; the value it carries is `FPCR` here, never an x86 word.
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod fpcr {
+    /// Read `FPCR`.
+    #[must_use]
+    pub(crate) fn read() -> u32 {
+        let out: u64;
+        // SAFETY: `FPCR` is readable at EL0 on every AArch64 implementation; `mrs` has no memory
+        // operand and no side effect.
+        unsafe { core::arch::asm!("mrs {}, fpcr", out(reg) out, options(nomem, nostack, preserves_flags)) };
+        // The architecturally defined bits are all in the low 32 (FEAT_AFP's `AH`/`FIZ`/`NEP` are
+        // bits 0-2); the upper half is RES0.
+        out as u32
+    }
+
+    /// Write `FPCR`.
+    pub(crate) fn write(value: u32) {
+        // SAFETY: as `read`. Every value written here was read out of `FPCR` in the first place, so
+        // no RES0 bit is set.
+        unsafe {
+            core::arch::asm!("msr fpcr, {}", in(reg) u64::from(value), options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    /// Installs the host's `FPCR` for the body of a host callback and puts the guest's back.
+    ///
+    /// Nothing is switched when the two words are already equal, which is the common case.
+    pub(crate) struct Guard {
+        guest: u32,
+        switched: bool,
+    }
+
+    impl Guard {
+        pub(crate) fn enter(host: u32) -> Self {
+            let guest = read();
+            let switched = guest != host;
+            if switched {
+                write(host);
+            }
+            Self { guest, switched }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.switched {
+                write(self.guest);
+            }
+        }
+    }
+}
+
+/// On an `aarch64` host the control word the guard switches is `FPCR`; see [`fpcr`].
+#[cfg(target_arch = "aarch64")]
+pub(crate) use fpcr as mxcsr;
 
 /// **A diagnostic, off by default**: start counting the guest instructions every context of
 /// every backend fetches for translation, and return the count so far. Translation is the only
@@ -1247,7 +1319,7 @@ impl DynarmicCpu {
             shared,
             cost: ContextCost {
                 // The guest's TLS block, plus the fast-dispatch table **when the optimization that
-                // reads it is on** -- patch 0002 allocates it only then (D32). Both are derived
+                // reads it is on** -- patch 0017 allocates it only then (D32). Both are derived
                 // rather than measured: the first is one page by construction, the second is
                 // `sizeof(FastDispatchEntry) * fast_dispatch_table_size` from the pin, checked
                 // against the vendored source by `dynarmic-sys`'s `pin_constants` test. The code
@@ -1724,7 +1796,7 @@ impl GuestCpu for DynarmicCpu {
     /// `CheckHalt` into `PopRSBHint`, whose handler computes the location descriptor from the PC in
     /// `JitState` — the one the callback wrote — and compares it with the top return-stack-buffer
     /// entry. A hit jumps to that entry's block, which is therefore the written PC's block (the
-    /// `SVC` pushed its own PC + 4, so a callback that leaves the PC alone hits; since patch 0003,
+    /// `SVC` pushed its own PC + 4, so a callback that leaves the PC alone hits; since patch 0018,
     /// D33, a hit also checks the halt flag and the budget). A miss, with `FastDispatch` cleared —
     /// `optimization::INTERRUPTIBLE`, which this backend sets by default (D16) — emits
     /// `ReturnFromRunCode`. And `ReturnFromRunCode` is **not** a return to the caller: it is the top
@@ -1804,12 +1876,12 @@ impl GuestCpu for DynarmicCpu {
     /// * the guest's bionic TLS block — one page, by construction;
     /// * [`OD_FIXED_PER_JIT_BYTES`], the 16 MiB `FastDispatchEntry` table, **only when the
     ///   `FastDispatch` optimization is on** -- which this backend leaves off (D16). Upstream holds
-    ///   it by value and writes it in every jit; patch 0002 allocates it only when it is read
+    ///   it by value and writes it in every jit; patch 0017 allocates it only when it is read
     ///   (D32). `dynarmic-sys`'s `pin_constants` test reads both factors and the guard back out of
     ///   the vendored source, so a re-pin cannot move them silently.
     ///
     /// **The missing term is dynarmic's code cache**, which on Windows commits incrementally as code
-    /// is emitted (`BlockOfCode::EnsureMemoryCommitted`: 2 MiB for the prelude since patch 0002,
+    /// is emitted (`BlockOfCode::EnsureMemoryCommitted`: 2 MiB for the prelude since patch 0017,
     /// 16 MiB before it, then 1 MiB ahead of each block), so the figure that matters is a high-water
     /// mark. It is a private member of `BlockOfCode` that `A64::Jit` does not expose, and reading it
     /// would mean patching the vendored pin. It is **bounded above** by

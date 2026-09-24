@@ -30,7 +30,7 @@
 //! When the APK is absent every test here **fails** rather than skipping: `VERIFICATION.md` entry
 //! 4, learned twice.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -406,6 +406,53 @@ fn cached_main_lib() -> &'static Path {
     })
 }
 
+/// A file's bytes in pages of their own, given back to the host when dropped.
+///
+/// **Not a `Vec`**: a freed heap allocation is the host allocator's to keep. MEASURED on macOS
+/// (`vmmap`, n = 3 gate runs): with the file read into a `Vec` that was dropped after the load, the
+/// 104.1 MiB buffer was still there at the landing screen in one run of three, as a dirty
+/// `MALLOC_LARGE (empty)` region -- charged to `phys_footprint` exactly as before. A reservation
+/// that is released is unmapped.
+struct LoadBytes {
+    reservation: Option<omni_platform::vm::Reservation>,
+    len: usize,
+}
+
+impl LoadBytes {
+    fn read(path: &Path) -> Self {
+        use std::io::Read;
+        use omni_platform::vm;
+        let mut file = std::fs::File::open(path).expect("open the cache entry");
+        let len = usize::try_from(file.metadata().expect("the cache entry's length").len())
+            .expect("the cache entry fits in memory");
+        let size = len.div_ceil(vm::page_size()).max(1) * vm::page_size();
+        let reservation =
+            vm::reserve(size, vm::allocation_granularity()).expect("reserve the load buffer");
+        // SAFETY: `[as_ptr, as_ptr + size)` is exactly the reservation just made, and nothing else
+        // uses it.
+        unsafe { vm::commit(reservation.as_ptr(), size, vm::Protection::ReadWrite) }
+            .expect("commit the load buffer");
+        // SAFETY: committed read-write above, `len <= size`, and only this value refers to it.
+        let buffer = unsafe { std::slice::from_raw_parts_mut(reservation.as_ptr(), len) };
+        file.read_exact(buffer).expect("read the cache entry");
+        Self { reservation: Some(reservation), len }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        let reservation = self.reservation.as_ref().expect("live until dropped");
+        // SAFETY: committed and filled by `read`, and not released before `self` is dropped.
+        unsafe { std::slice::from_raw_parts(reservation.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for LoadBytes {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            omni_platform::vm::release(reservation).expect("release the load buffer");
+        }
+    }
+}
+
 fn main_lib_bytes() -> &'static [u8] {
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     BYTES.get_or_init(|| std::fs::read(cached_main_lib()).expect("read the cache entry"))
@@ -561,7 +608,13 @@ impl Guest {
     /// whose every call refuses -- so the default gate's `dlopen("libvulkan.so")` stays NULL.
     fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display) -> Self {
         let path = cached_main_lib();
-        let bytes = main_lib_bytes();
+        // **Read for this load, and given back when it returns** -- not through `main_lib_bytes`,
+        // whose static kept the whole file for the life of the process. Nothing the load produces
+        // borrows it (the loaded object and the export table own their data), and the guest runs
+        // from the file's mapping, not from these bytes. MEASURED on macOS: 104 MiB of
+        // `phys_footprint` (`MALLOC_LARGE`, one region) held through the whole session for a parse
+        // done at startup. See [`LoadBytes`] for why these are pages of their own.
+        let bytes = LoadBytes::read(path);
         // The root first, so the library can be mapped from where a device keeps it (`GUEST_LIB`).
         let root = Scratch::new("m5-gate");
         let lib_at = root.0.join(GUEST_LIB.trim_start_matches('/'));
@@ -574,7 +627,7 @@ impl Guest {
         }
         let backing = Backing::open_named(&lib_at, MapExecutability::Executable, GUEST_LIB)
             .expect("open libroblox.so where the guest sees it");
-        let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+        let elf = ElfImage::parse(bytes.bytes()).expect("parse libroblox.so");
         let space = Arc::new(
             GuestSpace::with_config(GuestSpaceConfig {
                 size: GUEST_SPACE_BYTES,
@@ -3313,6 +3366,32 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     let mut turns = 0u64;
     // The last pointer-capture outcome logged, `(asked for, held)`.
     let mut capture_said: Option<(bool, bool)> = None;
+    // **OMNI_CROSSING_RATE=1: a measurement, off by default.** Every `FRAMES_EVERY`, the import
+    // crossings the census counted in the window -- inline and exit path together, which is every
+    // call a native backend would turn into a VM exit -- how many of them took the exit path, how
+    // many guest threads crossed, and the busiest symbols and threads. It only reads the census the
+    // gate already keeps on, so the guest runs exactly as it does without it. For
+    // `docs/ports/macos-hvf.md`: the rate an exit's cost is multiplied by.
+    let crossing_rate = std::env::var_os("OMNI_CROSSING_RATE").is_some();
+    let census_now = || -> std::collections::BTreeMap<String, u64> {
+        guest
+            .boundary
+            .census()
+            .map(|census| census.into_iter().map(|(symbol, n)| (symbol.to_string(), n)).collect())
+            .unwrap_or_default()
+    };
+    let threads_now = || -> std::collections::BTreeMap<u64, u64> {
+        // Summed per guest thread: a guest thread id can have more than one host-thread record.
+        let mut per_thread = std::collections::BTreeMap::new();
+        for record in guest.boundary.threads() {
+            *per_thread.entry(record.guest_thread).or_insert(0u64) += record.crossings;
+        }
+        per_thread
+    };
+    let mut rate_census = if crossing_rate { census_now() } else { Default::default() };
+    let mut rate_threads = if crossing_rate { threads_now() } else { Default::default() };
+    let mut rate_exits = guest.boundary.crossings().exits;
+    let mut rate_at = std::time::Instant::now();
     while settle.elapsed() < session {
         if guest.bionic.live_guest_threads() == 0 || close_requested {
             break;
@@ -3367,6 +3446,43 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 descriptors
             );
             last_presents = now;
+            if crossing_rate {
+                let census = census_now();
+                let threads = threads_now();
+                let exits = guest.boundary.crossings().exits;
+                let seconds = rate_at.elapsed().as_secs_f64().max(1e-3);
+                let mut symbols: Vec<(&str, u64)> = census
+                    .iter()
+                    .map(|(symbol, n)| (symbol.as_str(), n.saturating_sub(rate_census.get(symbol).copied().unwrap_or(0))))
+                    .filter(|(_, delta)| *delta > 0)
+                    .collect();
+                symbols.sort_by(|a, b| b.1.cmp(&a.1));
+                let mut busiest: Vec<(u64, u64)> = threads
+                    .iter()
+                    .map(|(thread, n)| (*thread, n.saturating_sub(rate_threads.get(thread).copied().unwrap_or(0))))
+                    .filter(|(_, delta)| *delta > 0)
+                    .collect();
+                busiest.sort_by(|a, b| b.1.cmp(&a.1));
+                let total: u64 = symbols.iter().map(|(_, delta)| delta).sum();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "CROSSING RATE: +{:.0}s: {total} crossings in {seconds:.2} s = {:.0}/s, {} on the \
+                     exit path ({:.0}/s), {} of {} live guest threads crossed; busiest threads \
+                     (id, crossings): {:?}; top symbols: {:?}",
+                    settle.elapsed().as_secs_f32(),
+                    total as f64 / seconds,
+                    exits.saturating_sub(rate_exits),
+                    exits.saturating_sub(rate_exits) as f64 / seconds,
+                    busiest.len(),
+                    guest.bionic.live_guest_threads(),
+                    &busiest[..busiest.len().min(6)],
+                    &symbols[..symbols.len().min(12)]
+                );
+                rate_census = census;
+                rate_threads = threads;
+                rate_exits = exits;
+                rate_at = std::time::Instant::now();
+            }
         }
         if let Some(open) = window.as_ref() {
             let due = resize_probe

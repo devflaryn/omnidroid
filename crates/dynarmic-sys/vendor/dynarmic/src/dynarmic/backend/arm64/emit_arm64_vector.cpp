@@ -885,12 +885,20 @@ void EmitIR<IR::Opcode::VectorMaxU32>(oaknut::CodeGenerator& code, EmitContext& 
     EmitThreeOpArranged<32>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UMAX(Vresult, Va, Vb); });
 }
 
+// Omnidroid patch 0006: the IR builds 64-bit unsigned compares from min/max (CMHS from
+// VectorMaxUnsigned, CMHI from VectorMinUnsigned), so CMHS/CMHI D and .2D reach this, and the pin
+// had ASSERT_FALSE("Unimplemented"). AdvSIMD has no UMAX/UMIN for 64-bit lanes: select per lane on
+// CMHI (a > b, unsigned).
 template<>
 void EmitIR<IR::Opcode::VectorMaxU64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Qresult = ctx.reg_alloc.WriteQ(inst);
+    auto Qa = ctx.reg_alloc.ReadQ(args[0]);
+    auto Qb = ctx.reg_alloc.ReadQ(args[1]);
+    RegAlloc::Realize(Qresult, Qa, Qb);
+
+    code.CMHI(Qresult->D2(), Qa->D2(), Qb->D2());
+    code.BSL(Qresult->B16(), Qa->B16(), Qb->B16());
 }
 
 template<>
@@ -931,12 +939,20 @@ void EmitIR<IR::Opcode::VectorMinU32>(oaknut::CodeGenerator& code, EmitContext& 
     EmitThreeOpArranged<32>(code, ctx, inst, [&](auto Vresult, auto Va, auto Vb) { code.UMIN(Vresult, Va, Vb); });
 }
 
+// Omnidroid patch 0006: the IR builds 64-bit unsigned compares from min/max (CMHS from
+// VectorMaxUnsigned, CMHI from VectorMinUnsigned), so CMHS/CMHI D and .2D reach this, and the pin
+// had ASSERT_FALSE("Unimplemented"). AdvSIMD has no UMAX/UMIN for 64-bit lanes: select per lane on
+// CMHI (a > b, unsigned).
 template<>
 void EmitIR<IR::Opcode::VectorMinU64>(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
-    (void)code;
-    (void)ctx;
-    (void)inst;
-    ASSERT_FALSE("Unimplemented");
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    auto Qresult = ctx.reg_alloc.WriteQ(inst);
+    auto Qa = ctx.reg_alloc.ReadQ(args[0]);
+    auto Qb = ctx.reg_alloc.ReadQ(args[1]);
+    RegAlloc::Realize(Qresult, Qa, Qb);
+
+    code.CMHI(Qresult->D2(), Qa->D2(), Qb->D2());
+    code.BSL(Qresult->B16(), Qb->B16(), Qa->B16());
 }
 
 template<>

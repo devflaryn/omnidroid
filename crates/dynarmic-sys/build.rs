@@ -237,6 +237,26 @@ fn find_compiler() -> cc::Tool {
     })
 }
 
+/// The C compiler CMake is given. `cl.exe` compiles both languages, so on MSVC it is the C++
+/// compiler's own path, exactly as before. Anywhere else the C++ driver (`c++`, `clang++`) is
+/// refused as a C compiler by CMake's own check (`CMAKE_C_COMPILER is set to a C++ compiler`,
+/// measured on macOS with Apple clang 16), so the matching C driver is asked of `cc` instead.
+fn c_compiler_for(cxx: &cc::Tool) -> PathBuf {
+    if cxx.is_like_msvc() {
+        return cxx.path().to_path_buf();
+    }
+    let mut b = cc::Build::new();
+    b.cpp(false);
+    match b.try_get_compiler() {
+        Ok(tool) => tool.path().to_path_buf(),
+        Err(e) => fail(&[
+            s("No C compiler was found (dynarmic's externals include C sources)."),
+            format!("cc reported: {e}"),
+            s("Install clang or gcc, or set the CC environment variable."),
+        ]),
+    }
+}
+
 fn cmake_cmd(cmake: &Path, compiler: &cc::Tool) -> Command {
     let mut c = Command::new(cmake);
     // cl.exe is useless without INCLUDE/LIB/PATH pointing at the matching
@@ -277,6 +297,15 @@ fn configure(
     c.arg(format!("-DBOOST_ROOT={}", cmake_path(boost_include)));
     c.arg(format!("-DBoost_INCLUDE_DIR={}", cmake_path(boost_include)));
     c.arg(format!("-DBoost_DIR={}", cmake_path(boost_cmake_dir)));
+    // Every external dynarmic uses is vendored, and the build is meant to use those copies. Its
+    // CMake prefers an installed package when one exists (`find_package(fmt 9 CONFIG)` and so
+    // on), and on a macOS host with Homebrew it found `/opt/homebrew/lib/cmake/fmt` (MEASURED),
+    // built no `libfmt.a` of its own and left the link to a system library the pin never named.
+    // The upstream switch makes it take the vendored tree. Not passed for Windows targets, whose
+    // configure line is left exactly as it was measured.
+    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os != "windows") {
+        c.arg("-DDYNARMIC_USE_BUNDLED_EXTERNALS=ON");
+    }
     c.arg("-DDYNARMIC_TESTS=OFF");
     c.arg("-DBUILD_TESTING=OFF");
     c.arg("-DDYNARMIC_FRONTENDS=A64");
@@ -296,7 +325,7 @@ fn configure(
         "-DDYNARMIC_ENABLE_NO_EXECUTE_SUPPORT={}",
         if want_w_xor_x() { "ON" } else { "OFF" }
     ));
-    c.arg(format!("-DCMAKE_C_COMPILER={}", cmake_path(compiler.path())));
+    c.arg(format!("-DCMAKE_C_COMPILER={}", cmake_path(&c_compiler_for(compiler))));
     c.arg(format!("-DCMAKE_CXX_COMPILER={}", cmake_path(compiler.path())));
 
     run(c, "CMake configure", build_dir);
@@ -347,6 +376,11 @@ fn emit_link_directives(build_dir: &Path) {
         ("externals/zydis", "Zydis"),
         ("externals/zydis/zycore", "Zycore"),
     ];
+    // Zydis (and Zycore under it) is the x86-64 backend's disassembler: dynarmic's
+    // `externals/CMakeLists.txt` adds it only when `x86_64` is in `ARCHITECTURE`. The arm64
+    // backend's assembler, oaknut, is an INTERFACE (header-only) library with nothing to link.
+    let x86_64 = env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "x86_64");
+    let libs = libs.into_iter().filter(|(_, lib)| x86_64 || !lib.starts_with("Zy"));
     for (dir, lib) in libs {
         let base = build_dir.join(dir);
         let found = [base.clone(), base.join("Release")]

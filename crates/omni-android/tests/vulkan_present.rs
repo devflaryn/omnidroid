@@ -13,7 +13,8 @@
 //! [`VulkanHost`] and never for anything the guest can see. Its job is to be a driver whose
 //! answers the test chose, because these properties cannot be asserted against a real one:
 //!
-//! * that `VK_SUBOPTIMAL_KHR` reaches the guest **and** `pImageIndex` is written, while
+//! * that `VK_SUBOPTIMAL_KHR` from acquire reaches the guest as Android's `VK_SUCCESS` **and**
+//!   `pImageIndex` is written, while
 //!   `VK_ERROR_OUT_OF_DATE_KHR` and `VK_TIMEOUT` reach the guest and `pImageIndex` is **not** —
 //!   no real driver can be made to produce those three on demand;
 //! * that `vkQueuePresentKHR`'s `pResults` is filled per swapchain rather than from the aggregate;
@@ -41,7 +42,7 @@
 //! and is not one this runtime can measure. That limit is stated rather than papered over — and it
 //! is a great deal more than `VkResult == 0`, which is what `VERIFICATION.md` entry 11 is about.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 
@@ -2939,8 +2940,11 @@ fn an_instance_is_destroyed_once_after_its_children_and_a_second_one_can_be_made
 /// be made to produce `VK_TIMEOUT`, `VK_SUBOPTIMAL_KHR` and `VK_ERROR_OUT_OF_DATE_KHR` on demand.
 /// What it establishes:
 ///
-/// * all four codes reach the guest's `X0` **verbatim** — not clamped, not normalised to
-///   `VK_SUCCESS`, and not turned into a swapchain recreation this layer decided on;
+/// * three codes reach the guest's `X0` **verbatim** — not clamped, not normalised to `VK_SUCCESS`,
+///   and not turned into a swapchain recreation this layer decided on -- and `VK_SUBOPTIMAL_KHR` is
+///   answered as `VK_SUCCESS`, because Android's swapchain never returns it from acquire (the
+///   module header of `vulkan/swapchain.rs` quotes AOSP), and on MoltenVK it killed the render
+///   thread on the first window resize;
 /// * `pImageIndex` is written for `VK_SUCCESS` and `VK_SUBOPTIMAL_KHR`, because both produce an
 ///   image, and is **left untouched** for `VK_TIMEOUT` and `VK_ERROR_OUT_OF_DATE_KHR` — which the
 ///   poisoned buffer is what proves. Writing a zero there would hand the guest image 0, a real
@@ -2980,7 +2984,7 @@ fn the_acquire_codes_reach_the_guest_verbatim_and_only_two_write_an_index() {
     let poison_word = u64::from_le_bytes([POISON; 8]);
     for (expected, index) in [
         (VK_SUCCESS, Some(2u32)),
-        (VK_SUBOPTIMAL_KHR, Some(1)),
+        (VK_SUCCESS, Some(1)),
         (VK_TIMEOUT, None),
         (VK_ERROR_OUT_OF_DATE_KHR, None),
     ] {
@@ -2991,7 +2995,7 @@ fn the_acquire_codes_reach_the_guest_verbatim_and_only_two_write_an_index() {
             .expect("the call completes whatever the driver said");
         assert_eq!(
             result as i32, expected,
-            "the driver's {expected} must reach the guest unchanged, and {result} did"
+            "the guest must be answered {expected}, and {result} was"
         );
         match index {
             Some(index) => assert_eq!(up.f.read_u32(index_at), index),
@@ -5285,8 +5289,12 @@ fn a_host_visible_allocation_is_imported_from_guest_pages_and_a_device_local_one
     assert_eq!(imported.size, 4096, "the guest's own allocationSize travels unrounded");
     assert_eq!(imported.memory_type_index, 2);
     let pointer = imported.host_pointer.expect("a host-visible type is imported");
+    // Rounded up to the import alignment, which is never below the host page: 4096 here, and one
+    // 16 KiB page on Apple silicon, where the pages the guest is handed are 16 KiB.
+    let page = m.up.f.guest.space.page_size() as u64;
     assert_eq!(
-        imported.import_length, 4096,
+        imported.import_length,
+        4096u64.next_multiple_of(page.max(4096)),
         "and the length the driver is given is the size rounded up to the alignment"
     );
 
@@ -5312,10 +5320,10 @@ fn a_host_visible_allocation_is_imported_from_guest_pages_and_a_device_local_one
     assert_eq!(forwarded.import_length, 0);
 
     // The commit charge is exactly the imported allocation's, which is what D15's ceiling now
-    // covers.
+    // covers: the pages mapped for the import, one host page of them.
     let (live, peak) = m.up.f.vulkan().imported_bytes();
-    assert_eq!(live, 4096, "only the imported one is guest commit charge");
-    assert_eq!(peak, 4096);
+    assert_eq!(live as u64, imported.import_length, "only the imported one is guest commit charge");
+    assert_eq!(peak as u64, imported.import_length);
 
     // ---------------------------------------------------- `vkMapMemory` answers for one and not
     // the other.
@@ -5367,7 +5375,11 @@ fn a_host_visible_allocation_is_imported_from_guest_pages_and_a_device_local_one
     // Freeing the imported one gives the guest pages back.
     let free = m.up.f.resolve_device(m.up.get_proc, m.up.device, "vkFreeMemory");
     m.up.f.call(free, [m.up.device, imported_handle, 0, 0]).expect("free");
-    assert_eq!(m.up.f.vulkan().imported_bytes(), (0, 4096), "live falls, the peak does not");
+    assert_eq!(
+        m.up.f.vulkan().imported_bytes(),
+        (0, imported.import_length as usize),
+        "live falls, the peak does not"
+    );
     assert_eq!(m.up.f.vulkan().leaked_import_bytes(), 0);
 }
 

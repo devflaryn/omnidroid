@@ -1,0 +1,95 @@
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+index d4fe9a9..e924f91 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -397,6 +397,7 @@ void A64AddressSpace::EmitPrelude() {
+     prelude_info.get_cntpct = EmitCallTrampoline<&A64::UserCallbacks::GetCNTPCT>(code, conf.callbacks);
+     prelude_info.add_ticks = EmitCallTrampoline<&A64::UserCallbacks::AddTicks>(code, conf.callbacks);
+     prelude_info.get_ticks_remaining = EmitCallTrampoline<&A64::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
++    prelude_info.interpreter_fallback = EmitCallTrampoline<&A64::UserCallbacks::InterpreterFallback>(code, conf.callbacks);
+ 
+     oaknut::Label return_from_run_code, l_return_to_dispatcher;
+ 
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae77..78c8998 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -260,6 +260,9 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+         case LinkTarget::GetTicksRemaining:
+             c.BL(prelude_info.get_ticks_remaining);
+             break;
++        case LinkTarget::InterpreterFallback:
++            c.BL(prelude_info.interpreter_fallback);
++            break;
+         default:
+             ASSERT_FALSE("Invalid relocation target");
+         }
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 835566b..0da08e7 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -132,6 +132,9 @@ protected:
+         void* get_cntpct;
+         void* add_ticks;
+         void* get_ticks_remaining;
++
++        // Omnidroid patch 0002.
++        void* interpreter_fallback;
+     } prelude_info;
+ };
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index 58ccb0e..7f8e0dd 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -81,6 +81,8 @@ enum class LinkTarget {
+     GetCNTPCT,
+     AddTicks,
+     GetTicksRemaining,
++    // Omnidroid patch 0002: the `Interpret` terminal's call to `UserCallbacks::InterpreterFallback`.
++    InterpreterFallback,
+ };
+ 
+ struct Relocation {
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a64.cpp b/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+index 5152a54..e12e1cb 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+@@ -32,8 +32,35 @@ oaknut::Label EmitA64Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond co
+ 
+ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+ 
+-void EmitA64Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
+-    ASSERT_FALSE("Interpret should never be emitted.");
++// Omnidroid patch 0002: the x64 backend's `Interpret` terminal, on arm64. The pin had
++// `ASSERT_FALSE("Interpret should never be emitted.")` here, and the A64 frontend emits this
++// terminal for every word it cannot decode, so any unknown instruction terminated the process.
++// As on x64 (`A64EmitX64::EmitTerminalImpl(IR::Term::Interpret)`): store the PC, run the callback
++// under the host's floating-point control register, reload the guest's, and go back through the
++// dispatcher, which checks the halt flag and the cycle budget before looking up the next block.
++void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Interpret terminal, IR::LocationDescriptor, bool) {
++    if (ctx.conf.enable_cycle_counting) {
++        code.LDR(X1, SP, offsetof(StackLayout, cycles_to_run));
++        code.SUB(X1, X1, Xticks);
++        EmitRelocation(code, ctx, LinkTarget::AddTicks);
++    }
++
++    code.MOV(X1, A64::LocationDescriptor{terminal.next}.PC());
++    code.STR(X1, Xstate, offsetof(A64JitState, pc));
++    code.MOV(X2, terminal.num_instructions);
++    code.LDR(Wscratch0, SP, offsetof(StackLayout, save_host_fpcr));
++    code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++    EmitRelocation(code, ctx, LinkTarget::InterpreterFallback);
++    code.LDR(Wscratch0, Xstate, offsetof(A64JitState, fpcr));
++    code.MSR(oaknut::SystemReg::FPCR, Xscratch0);
++
++    if (ctx.conf.enable_cycle_counting) {
++        EmitRelocation(code, ctx, LinkTarget::GetTicksRemaining);
++        code.STR(X0, SP, offsetof(StackLayout, cycles_to_run));
++        code.MOV(Xticks, X0);
++    }
++
++    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+ }
+ 
+ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {

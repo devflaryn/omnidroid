@@ -45,7 +45,7 @@
 //!   `Vulkan::entry_calls()` is charged on a line nothing can truncate, and
 //!   `requests().len() + requests_dropped()` is the log's own account of itself.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

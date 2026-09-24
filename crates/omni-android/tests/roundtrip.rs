@@ -12,7 +12,7 @@
 //! cargo test -p omni-android --release
 //! ```
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

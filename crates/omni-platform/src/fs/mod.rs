@@ -99,6 +99,8 @@ mod windows;
 use windows as backend;
 
 #[cfg(unix)]
+// macOS has its own backend (`macos.rs`) and does not use the shared unix body.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 mod unix;
 
 #[cfg(target_os = "linux")]

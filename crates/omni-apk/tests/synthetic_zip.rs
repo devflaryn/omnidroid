@@ -342,10 +342,12 @@ fn stored_and_deflated_entries_round_trip() {
 /// is directly mappable, and the predicate says so.
 #[test]
 fn a_page_aligned_stored_entry_is_directly_mappable() {
-    // The first local header is 30 bytes + a 7-byte name, so 4096 - 37 bytes of extra field puts
-    // the payload at exactly 4096.
+    // The first local header is 30 bytes + a 7-byte name, so a host page - 37 bytes of extra field
+    // puts the payload at exactly one host page: 4096, or 16,384 on a 16 KiB host, where 4096 is
+    // not mappable.
     let name = "aligned";
-    let padding = u16::try_from(4096 - 30 - name.len()).expect("padding fits in u16");
+    let page = mapping_alignment();
+    let padding = u16::try_from(page as usize - 30 - name.len()).expect("padding fits in u16");
     let payload = b"page-aligned payload".repeat(64);
     let zip = TempZip::new(
         "aligned",
@@ -357,7 +359,7 @@ fn a_page_aligned_stored_entry_is_directly_mappable() {
     let apk = zip.open().expect("the synthetic zip must open");
 
     let entry = apk.require_entry(name).expect("the aligned entry");
-    assert_eq!(entry.payload_offset(), 4096, "payload offset");
+    assert_eq!(entry.payload_offset(), page, "payload offset");
     assert_eq!(entry.local_extra_len(), padding);
     assert!(entry.is_stored());
     assert!(entry.is_payload_aligned(mapping_alignment()));
@@ -366,13 +368,13 @@ fn a_page_aligned_stored_entry_is_directly_mappable() {
         entry.is_directly_mappable(),
         "a STORED, page-aligned entry is the whole reason the predicate exists"
     );
-    assert_eq!(entry.payload_alignment(), 4096);
+    assert_eq!(entry.payload_alignment(), page);
 
     // And its map window is degenerate, because there is nothing to skip.
     let window = entry
         .stored_map_window(mapping_alignment())
         .expect("a STORED entry has a window");
-    assert_eq!(window.file_offset, 4096);
+    assert_eq!(window.file_offset, page);
     assert_eq!(window.payload_delta, 0);
     assert_eq!(window.len, payload.len() as u64);
 
@@ -386,7 +388,7 @@ fn a_page_aligned_stored_entry_is_directly_mappable() {
     );
     let apk = zip.open().expect("the synthetic zip must open");
     let entry = apk.require_entry(name).expect("the aligned entry");
-    assert_eq!(entry.payload_offset(), 4096);
+    assert_eq!(entry.payload_offset(), page);
     assert!(entry.is_payload_aligned(mapping_alignment()));
     assert!(
         !entry.is_directly_mappable(),

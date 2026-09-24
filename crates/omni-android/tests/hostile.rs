@@ -19,7 +19,7 @@
 //! function, a thunk reached by a tail call with a wild link register, a callback entered with a
 //! misaligned stack pointer, a callback that faults, and a guest that spins through the exit path.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

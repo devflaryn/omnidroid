@@ -14,7 +14,7 @@
 //! everything, which is what Global Constraint 1 is about — and here zero is the very value the
 //! milestone's worst failure mode is made of.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

@@ -59,6 +59,20 @@ pub enum ProcessError {
         code: u32,
     },
 
+    /// A POSIX call that reports through `errno` (or returns an `errno` value, as the `pthread_*`
+    /// calls do) failed. A third number space, and a variant of its own for the reason
+    /// [`LastError`](ProcessError::LastError) gives: `EPERM` is 1 and so is Win32's
+    /// `ERROR_INVALID_FUNCTION`.
+    #[error("`{operation}`: {api} failed with errno {code}")]
+    Errno {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The OS entry point that failed.
+        api: &'static str,
+        /// The `errno` value.
+        code: i32,
+    },
+
     /// A quantity the standard library reports, which it could not determine.
     ///
     /// **Not a catch-all**, and the distinction from the two Windows variants above is the point:

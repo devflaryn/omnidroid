@@ -131,7 +131,7 @@ impl Roblox {
             Backing::open(path, MapExecutability::Executable).expect("open the cache entry");
         let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
 
-        let space = Arc::new(GuestSpace::new().expect("reserve a guest address space"));
+        let space = Arc::new(super::high_guest_space());
         let object = loader::load(
             &space,
             &backing,

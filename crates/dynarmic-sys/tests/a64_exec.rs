@@ -418,8 +418,9 @@ fn effective_config_reports_what_was_asked_for() {
 
     // The flag whose terminal handler checks neither the cycle counter nor the
     // halt flag must be assertable, because with it on a runaway guest cannot
-    // be stopped at all (see `tests/hostile.rs`). `ReturnStackBuffer` stays on:
-    // patch 0003 gave its handler both checks.
+    // be stopped at all (see `tests/hostile.rs`). On x64 `ReturnStackBuffer`
+    // stays on: patch 0018 gave its handler both checks. arm64 has no such
+    // patch, so there it is cleared too.
     let vm = Vm::new(
         vec![a64::svc(0)],
         VmOptions {
@@ -428,7 +429,10 @@ fn effective_config_reports_what_was_asked_for() {
         },
     );
     let cfg = vm.effective_config();
+    #[cfg(target_arch = "x86_64")]
     assert_ne!(cfg.optimizations & optimization::RETURN_STACK_BUFFER, 0);
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(cfg.optimizations & optimization::RETURN_STACK_BUFFER, 0);
     assert_eq!(cfg.optimizations & optimization::FAST_DISPATCH, 0);
     assert_ne!(cfg.optimizations & optimization::BLOCK_LINKING, 0);
 
@@ -560,6 +564,9 @@ fn invalidating_a_range_spares_the_translations_outside_it() {
     );
 }
 
+/// x64 only: the arm64 backend's cache is `MAP_JIT` and per-thread W^X on Apple hosts, which
+/// `tests/wx.rs` measures.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn the_code_cache_is_writable_and_executable_at_once() {
     // This asserts something Omnidroid does not want, on purpose.

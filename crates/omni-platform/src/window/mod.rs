@@ -115,7 +115,8 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-#[cfg(unix)]
+// Linux's structural body. macOS has its own backend and does not compile this one.
+#[cfg(all(unix, not(target_os = "macos")))]
 mod unix;
 
 #[cfg(target_os = "linux")]
@@ -127,6 +128,41 @@ use linux as backend;
 mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
+/// The AppKit thread, for the web view seam's macOS backend (`webview::macos`).
+#[cfg(target_os = "macos")]
+pub(crate) use macos::appkit_thread;
+
+/// The macOS backend's physical-key table, re-exported **only** so that
+/// `tests/window_keys_macos.rs` can check it key by key against its one consumer,
+/// `omni_android::jni::keys::evdev_code` (which this crate cannot depend on). Not API: nothing
+/// outside this crate's tests may name it, and only this crate may write `cfg(target_os)` to.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use macos::keys as macos_keys;
+
+/// **Where the Vulkan loader may be found on this host, in the order to try it** -- for
+/// `omni-gfx`, which loads Vulkan at run time and may not write `cfg(target_os)` to know where.
+///
+/// **Empty means "the platform default"**: `ash::Entry::load()`'s own search, unchanged. That is
+/// the answer on Windows (`vulkan-1.dll`, which the Vulkan runtime installs where the loader's
+/// search finds it) and on Linux (`libvulkan.so.1`). macOS is the host where the default is not
+/// enough: MEASURED, `dlopen("libvulkan.dylib")` does not search Homebrew's `/opt/homebrew/lib`,
+/// so a machine with the loader installed fails to find it. See the macOS backend's
+/// `VULKAN_LOADER_CANDIDATES` for the list and the measurements behind each entry.
+///
+/// These are **candidates**, not claims: the caller tries them in order and reports every one it
+/// tried when none loads.
+#[must_use]
+pub fn vulkan_loader_candidates() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        macos::VULKAN_LOADER_CANDIDATES
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        &[]
+    }
+}
 
 /// The largest client extent this seam will accept in either axis.
 ///
@@ -414,6 +450,18 @@ pub enum RawWindow {
         /// The `HINSTANCE` the window class was registered with, as an integer.
         hinstance: isize,
     },
+    /// An AppKit window. `VkMetalSurfaceCreateInfoEXT` wants only the layer; the window and the
+    /// view are carried for identity and diagnostics. All three are live for as long as the
+    /// `Window` is, and belong to the AppKit (main) thread: `CAMetalLayer` is safe to present to
+    /// from any thread, and nothing else here should be touched off it.
+    AppKit {
+        /// The `NSWindow *`, as an integer.
+        ns_window: isize,
+        /// The `NSView *` that is the window's content view, as an integer.
+        ns_view: isize,
+        /// The `CAMetalLayer *` backing that view, as an integer.
+        ca_metal_layer: isize,
+    },
 }
 
 impl RawWindow {
@@ -425,6 +473,7 @@ impl RawWindow {
     pub const fn system_name(self) -> &'static str {
         match self {
             RawWindow::Win32 { .. } => "win32",
+            RawWindow::AppKit { .. } => "appkit",
         }
     }
 }

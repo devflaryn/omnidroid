@@ -3969,12 +3969,12 @@ correctness evidence above; `the_runtime_default_is_value_compare` pins it (row 
 **What would reverse it**: a lost update or a hang in a run under value-compare that
 `OMNI_JIT_EXCLUSIVE_MONITOR=global` does not show.
 
-## D32 — A guest thread's fixed JIT cost is paid on demand: vendored patch 0002
+## D32 — A guest thread's fixed JIT cost is paid on demand: vendored patch 0017
 
 **Decided 2026-09-24 (Windows session, the owner's memory requirement: "strictly on demand -- no
 fixed reservation, no page-file reliance", D10).** A change to the vendored dynarmic tree, so a
 decision rather than a side effect (D5). The patch and its measurements are in
-`crates/dynarmic-sys/patches/README.md` under 0002.
+`crates/dynarmic-sys/patches/README.md` under 0017.
 
 ### What every guest thread paid before any translation (MEASURED, a live logged-out landing, 44-45 guest threads)
 
@@ -3999,11 +3999,11 @@ it costs in commit is now what the thread has translated plus 1 MiB.
 * Landing at +100 s, same scenario, n = 1 each: commit 3,157 → 2,105 MiB, working set 2,528 →
   1,884 MiB, both runs passing the gate.
 * dynarmic's own suite in the runtime's configuration (A64 frontend, Release): 201,698 assertions
-  in 84 cases pass with 0001 alone and with 0001 + 0002. The suite runs with upstream's default
+  in 84 cases pass with 0001 alone and with 0001 + 0017. The suite runs with upstream's default
   optimizations, FastDispatch **on**, so it exercises the path that still allocates the table;
   every omni-cpu and omni-android suite exercises it off.
 * `dynarmic-sys/tests/pin_constants.rs` now pins the patched declaration and the allocation's
-  guard, so a re-pin that drops 0002 fails by name.
+  guard, so a re-pin that drops 0017 fails by name.
 
 ### What it costs if wrong
 
@@ -4012,11 +4012,11 @@ constructor -- every test would show it at once, not rarely. If FastDispatch is 
 (D16 forbids it while it makes a guest loop unstoppable), the table is allocated exactly as
 upstream does.
 
-## D33 — `INTERRUPTIBLE` keeps the return stack buffer: vendored patch 0003
+## D33 — `INTERRUPTIBLE` keeps the return stack buffer: vendored patch 0018
 
 **Decided 2026-09-24 (Windows session; the owner asked for optimizations that need no in-world
 test).** A change to the vendored dynarmic tree (D5) and to D16's flag set. Patch and figures:
-`crates/dynarmic-sys/patches/README.md` under 0003.
+`crates/dynarmic-sys/patches/README.md` under 0018.
 
 ### Why
 
@@ -4027,7 +4027,7 @@ probe. It is cheap while the block map is small and not once it is large. MEASUR
 (`omni-cpu/tests/bench.rs::the_cost_of_a_call_and_return_as_the_block_map_grows`, one `BL` + `RET`
 to a distinct function, median of 5, release):
 
-| call sites (blocks) | `INTERRUPTIBLE` 0xFFF9 | `INTERRUPTIBLE` 0xFFFB (0003) | `ALL_SAFE` |
+| call sites (blocks) | `INTERRUPTIBLE` 0xFFF9 | `INTERRUPTIBLE` 0xFFFB (0018) | `ALL_SAFE` |
 |---|---|---|---|
 | 64 (128) | 5.96 ns | 2.35 ns | 2.06–2.37 ns |
 | 1,024 (2,048) | 23.09 ns | 10.47 ns | 9.99–10.48 ns |
@@ -4063,7 +4063,7 @@ stays gated on `interruptible`.
   - without the budget check, `indirect-call:0000FFFF:budget` wedges.
   They are not `mutate.py` rows because the build script watches only `vendor/PIN.txt`.
   `rsb-A1` (INTERRUPTIBLE clearing the RSB again) is a row, and it is caught.
-* dynarmic's own suite: 201,698 assertions in 84 cases pass with 0001 + 0002 + 0003.
+* dynarmic's own suite: 201,698 assertions in 84 cases pass with 0001 + 0017 + 0018.
 * Whole suites, release: dynarmic-sys, omni-cpu, omni-mem and omni-platform pass. omni-android
   passes except the **headless** `gameactivity` gate, which fails on HANDOFF item 7's two known
   causes (Windows 1224 on `memProfStorage`, and `eglGetDisplay`). Two tests had asserted
@@ -4076,3 +4076,58 @@ two matrix detectors fail if it stops doing so. If `cycles_remaining` were read 
 offset, the budget would be misread on every hit. `indirect-call:0000FFFF:budget` expects exactly
 `0` remaining, so it would fail. No in-world measurement was taken: the owner's APK now fails
 Roblox's integrity check, and the owner asked for no further real-game tests until it is updated.
+
+### Amendment 1 (2026-09-24, the three-machine merge): x64 only
+
+The patch is in the x64 backend. The arm64 backend's `PopRSBHint` has no equivalent, and the macOS
+port MEASURED a `RET` loop served by the return-stack buffer as unstoppable by any mechanism under
+`0xFFFF` (`tests/hostile.rs`, `return-ring`). So `INTERRUPTIBLE` is per-architecture:
+`0x0000_FFFB` on x86_64 (Windows, Linux), `0x0000_FFF9` on aarch64 (macOS), until the patch is
+ported to `emit_arm64_a64.cpp` and the arm64 matrix re-measured. The patch was 0003 on the Windows
+branch; the merged series numbers it 0018 (and 0002 as 0017), after the macOS branch's arm64
+0002-0016.
+
+## D34 — A native CPU backend on Apple silicon: measured, not the default; adopt when hot imports stop being VM exits
+
+**Recorded by the macOS port (branch `port-macos`), 2026-09-24. Status: not adopted.** The owner's
+instruction for the port: "after parity, measure a native backend (e.g. Hypervisor.framework, guest
+at EL0, trapping SVC) behind `GuestCpu`. Adopt it only with numbers and a DECISIONS record." This is
+that record. The evidence, every figure with its n and method, is `docs/ports/macos-hvf.md`;
+the numbers the decision turns on are repeated here.
+
+**Built.** `omni-cpu`'s `native` module (`native-hvf` feature, off by default, arm64 only) behind
+`GuestCpu`: the guest at EL0 under Hypervisor.framework, stage 2 at IPA == VA (D4's identity kept),
+a stage-2 mirror of host protection fed from `vm/macos.rs`, demand paging through
+`omni_mem::admit`, thunks and the sentinel on `BRK` pages. It runs the M2 gate (real `libroblox.so`,
+same words, same predictions) and M3's 3,594 initializers natively. The macOS gate itself has not
+run on it (condition 3 below).
+
+**Measured on an M1, release:**
+
+| | dynarmic | native |
+|---|---|---|
+| one import crossing | 23.7 ns inline, 37.6 via exit | **1,614 ns** |
+| real engine compute (33 functions, 69.7 M instructions) | 1.32 G insn/s | **7.55 G insn/s (5.7x)** |
+| 3,594 initializers, cold (n = 8) | 2,417 ms | **795 ms** |
+| memory per guest thread | ~33 MB at the landing screen | **79 KiB** |
+
+At the landing screen (dynarmic, the real gate) the threads doing work cross the import boundary
+0.40-0.52 M times a second: natively 0.64-0.84 of a core in VM exits, the order of the compute the
+backend saves there. A short guest call is 26x slower.
+
+**Decision: dynarmic stays the only backend any gate or run uses.** Revisit when all of these hold,
+measured on the gate: (1) the hot imports (`pthread_getspecific`, `__errno`, `clock_gettime`, the
+`mem*`/`str*` family, uncontended mutexes -- ~90% of the crossings) are served in guest code, under
+50k VM exits/s at the landing screen; (2) no runtime path passes a counted budget to a backend that
+cannot count; (3) the macOS gate passes natively, with every path that hands the guest a host pointer
+closed first (the backend confines the guest, so what D4 amendment 1 recommends becomes required);
+(4) more than 64 guest threads are handled (64 vCPUs per VM; the engine may make 256); (5) the
+shipping binary carries `com.apple.security.hypervisor` and each instance is its own process.
+
+**What moves it.** In-guest import service measured under the bar favours adopting: the memory win
+alone goes straight at the owner's per-instance target. The memory workstream cutting dynarmic's
+per-thread bookkeeping removes the largest win. Break-even is ~2 us of guest code between host calls.
+
+**Found on the way, fixed:** the native backend's survey of all 245,117 functions made dynarmic's
+arm64 backend abort the process (Global Constraint 11) -- the store half of patch 0007's inline
+store-exclusive was not a fastmem patch location. Patch 0014.

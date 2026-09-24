@@ -34,6 +34,10 @@ enum class Cond;
 enum class Opcode;
 }  // namespace Dynarmic::IR
 
+namespace Dynarmic {
+class ExclusiveMonitor;
+}  // namespace Dynarmic
+
 namespace Dynarmic::Backend::Arm64 {
 
 struct EmitContext;
@@ -81,6 +85,21 @@ enum class LinkTarget {
     GetCNTPCT,
     AddTicks,
     GetTicksRemaining,
+    // Omnidroid patch 0002: the `Interpret` terminal's call to `UserCallbacks::InterpreterFallback`.
+    InterpreterFallback,
+    // Omnidroid patch 0007: the fallbacks of the inline (fastmem) exclusive accesses. They take the
+    // address in Xscratch0 (and the value in Xscratch1, or Q0 for 128 bits), preserve every other
+    // caller-saved register, and go through the global monitor exactly as the callback-only path does.
+    WrappedExclusiveReadMemory8,
+    WrappedExclusiveReadMemory16,
+    WrappedExclusiveReadMemory32,
+    WrappedExclusiveReadMemory64,
+    WrappedExclusiveReadMemory128,
+    WrappedExclusiveWriteMemory8,
+    WrappedExclusiveWriteMemory16,
+    WrappedExclusiveWriteMemory32,
+    WrappedExclusiveWriteMemory64,
+    WrappedExclusiveWriteMemory128,
 };
 
 struct Relocation {
@@ -136,6 +155,12 @@ struct EmitConfig {
     bool recompile_on_fastmem_failure;
     size_t fastmem_address_space_bits;
     bool silently_mirror_fastmem;
+
+    // Omnidroid patch 0007: what the inline exclusive accesses need. `fastmem_exclusive_access` was
+    // accepted by the A64 UserConfig and ignored by this backend.
+    bool fastmem_exclusive_access;
+    ExclusiveMonitor* global_monitor;
+    size_t processor_id;
 
     // Timing
     bool wall_clock_cntpct;

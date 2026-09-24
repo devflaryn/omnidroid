@@ -64,7 +64,7 @@ protected:
     static_assert(sizeof(FastDispatchEntry) == 0x10);
     static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
     static constexpr size_t fast_dispatch_table_size = 0x100000;
-    // Omnidroid patch 0002: allocated only when FastDispatch is enabled. As a by-value member it
+    // Omnidroid patch 0017: allocated only when FastDispatch is enabled. As a by-value member it
     // was 16 MiB constructed (and written: the entries have a non-zero initializer) in every Jit.
     std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;
     void ClearFastDispatchTable();

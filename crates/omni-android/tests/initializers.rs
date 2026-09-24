@@ -23,7 +23,7 @@
 //! When the APK is absent every test here **skips loudly** on the process's own stderr rather than
 //! passing quietly.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -683,7 +683,22 @@ const IMAGE_POINTERS_WRITTEN: usize = 92_431;
 /// which this project has been bitten by: a flaky test does not only cost a red run, it can make
 /// a mutation row look detected when nothing detected it. So it is a floor, and the exact half of
 /// the evidence lives in [`IMAGE_POINTERS_WRITTEN`] and in [`WROTE`].
+///
+/// **The count depends on where the guest's address space sits**, and this floor is the one for a
+/// space above 2^40, where Windows puts it. MEASURED on macOS (arm64, the same run moved by a
+/// reservation hint and nothing else): 131,991 for a space based anywhere from 4 GiB to
+/// 0xff_0000_0000, 133,136 at 0x100_0000_0000 (2^40), and **133,269 at 0x1b7_0000_0000** -- Windows'
+/// own figure, at an address in the range Windows' allocations show in its logs. The x86-64
+/// backend under Rosetta 2 gives the same 131,991 at macOS's default placement, so it is the
+/// placement and not the CPU backend. macOS places the space at 0x3_0000_0000, below 2^40 as an
+/// Android device's 39-bit user address space would; [`OTHER_WORDS_WRITTEN_AT_LEAST_BELOW_2_40`]
+/// is the floor there.
 const OTHER_WORDS_WRITTEN_AT_LEAST: usize = 133_000;
+
+/// [`OTHER_WORDS_WRITTEN_AT_LEAST`] for a guest space below 2^40: 131,991 measured in each of seven
+/// placements from 4 GiB to 0xff_0000_0000 (n = 1 each, plus four runs at the default 0x3_0000_0000,
+/// which gave 131,991 or 131,992), with the same margin below it the Windows floor has.
+const OTHER_WORDS_WRITTEN_AT_LEAST_BELOW_2_40: usize = 131_700;
 
 /// Count the words of the writable image that went from zero to something.
 fn written(before: &[(GuestAddr, Vec<u8>)], after: &[(GuestAddr, Vec<u8>)], span: &std::ops::Range<GuestAddr>) -> (usize, usize) {
@@ -798,9 +813,16 @@ fn the_milestone_gate_all_3594_initializers_run_in_order() {
         pointers, IMAGE_POINTERS_WRITTEN,
         "the writable image did not gain the image pointers a completed initializer run gives it"
     );
+    let floor = if guest.space.base() >= 1 << 40 {
+        OTHER_WORDS_WRITTEN_AT_LEAST
+    } else {
+        OTHER_WORDS_WRITTEN_AT_LEAST_BELOW_2_40
+    };
     assert!(
-        others >= OTHER_WORDS_WRITTEN_AT_LEAST,
-        "only {others} words became something other than an image pointer, against a floor of          {OTHER_WORDS_WRITTEN_AT_LEAST}"
+        others >= floor,
+        "only {others} words became something other than an image pointer, against a floor of \
+         {floor} for a guest space based at {:#x}",
+        guest.space.base()
     );
 
     let crossings = guest.boundary.crossings();

@@ -19,8 +19,8 @@
 //!
 //! # This file is compiled only where a backend exists
 //!
-//! `#![cfg(target_os = "windows")]`, matching `vm_windows.rs`. The Linux and macOS backends are
-//! structural — every call returns `Unsupported` naming the POSIX call it intends to make — so
+//! `#![cfg(any(target_os = "windows", target_os = "macos"))]`: the two hosts with a backend. The
+//! Linux backend is structural — every call returns `Unsupported` naming the POSIX call it intends to make — so
 //! `Socket::new` cannot produce a socket there and none of these tests has anything to assert.
 //! Compiling them into an empty file on those targets is the honest state: the seam has not been
 //! implemented there, and a test that "passed" by asserting the refusal would be asserting the
@@ -31,7 +31,7 @@
 //! [`NetPolicy::loopback_only`], which is the whole point of the seam being a policy rather than
 //! an open socket: this file cannot accidentally reach the internet even if a test were written
 //! wrongly, because the policy would refuse the address before any packet left.
-#![cfg(target_os = "windows")]
+#![cfg(any(target_os = "windows", target_os = "macos"))]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream as HostStream, UdpSocket as HostDatagram};
@@ -184,10 +184,14 @@ fn a_refused_connect_is_reported_rather_than_left_pending_for_ever() {
     // and it is here so that a host which starts clearing is *noticed* instead of quietly
     // changing what the guest sees. The seam is correct either way: the pending slot exists so
     // that a host which does clear cannot lose the error to a host-side `connect_result`.
+    //
+    // **macOS clears it, as documented** (MEASURED: the second read answers no error), so each
+    // host's measured behaviour is asserted for that host.
+    let second = if cfg!(target_os = "windows") { Some(failed) } else { None };
     assert_eq!(
         client.get_option(SocketQuery::Error).expect("SO_ERROR again"),
-        OptionValue::Error(Some(failed)),
-        "Winsock did not clear SO_ERROR on read for a refused connect"
+        OptionValue::Error(second),
+        "the host's second SO_ERROR read (Winsock does not clear it; macOS does)"
     );
 }
 

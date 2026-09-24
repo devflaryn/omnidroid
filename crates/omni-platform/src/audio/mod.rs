@@ -93,10 +93,16 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-#[cfg(unix)]
+// Linux's structural body. macOS has its own backend (Core Audio) and does not compile this one.
+#[cfg(all(unix, not(target_os = "macos")))]
 mod unix;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use unix as backend;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as backend;
 
 /// The shape of the samples an output takes: always interleaved `f32`.
 ///

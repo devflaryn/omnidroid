@@ -14,17 +14,17 @@ runs and scripts are in the session scratchpad (`0b762c51-…/scratchpad/runs`, 
 | `a5e35c8` | the review's four fixes: D31 written (cited, never existed); no guest-thread panic in `perf_record`; saturating Vulkan count deltas; two string literals that had lost their `\` continuations; `tests/perf.rs` gated on `target_arch` only |
 | `cdf1334` | `__vsprintf_chk` bound (bionic `fortify.cpp` order: `vsnprintf`, then `__check_buffer_access`); rows `vsprintf-` 6/6 |
 | `83cfa6e` | a death that hangs the close ends as `REASON_CRASH_NATIVE`; the watchdog halts the UI thread's call; `OMNI_INJECT_DEATH`; rows `crashclose-` 3/3 |
-| `c18e0eb` | vendored dynarmic patch 0002 (D32): per-thread fixed JIT cost on demand |
+| `c18e0eb` | vendored dynarmic patch 0017 (D32): per-thread fixed JIT cost on demand |
 | `fa7e136` | `OMNI_IMPORT_CENSUS=off`, the in-world A/B switch for the census |
 | `c6e7c0d` | a guest's raw `SVC #0` answered by the syscall emulation (kernel convention: `-errno` in `x0`, `errno` untouched; `openat` → `open`); `atol`. The two deaths of the owner's first join of 606849621. Rows `svc-` 5/5, `atol-` 2/2 |
 | `56be27a` | docs: the first in-world join; the multi-instance measurement re-run with a data directory each |
 | `e2eba84` | the app's cookie store (`jni::cookies`) -- a sign-in survives a restart, as on a phone. Rows `cookie-` 6/6 |
 | `208c4c8` | translated code is invalidated only for ranges that were executable: -75% re-translation on the landing. Rows `inval-` 5/5 |
 | `bae4b92` | D31 decided: guest exclusives default to value-compare, not the global monitor. Row `monitor-A1` 1/1 |
-| `05efab2` | vendored dynarmic patch 0003 (D33): a return-stack-buffer hit checks the budget and the halt flag, so `INTERRUPTIBLE` keeps the RSB -- 132 → 24 ns per call and return at 262,144 blocks. Row `rsb-A1` 1/1 |
+| `05efab2` | vendored dynarmic patch 0018 (D33): a return-stack-buffer hit checks the budget and the halt flag, so `INTERRUPTIBLE` keeps the RSB -- 132 → 24 ns per call and return at 262,144 blocks. Row `rsb-A1` 1/1 |
 
 Mutation: `inbound-` 10/10 (step 0, never run before), `vsprintf-` 6/6, `crashclose-` 3/3, each
-with the tree to itself. Patch 0002's two halves were proven by hand-applied regressions (the
+with the tree to itself. Patch 0017's two halves were proven by hand-applied regressions (the
 harness cannot rebuild vendored C++): both detected, tree restored byte-identical (sha1).
 Whole affected suites (release): everything passes except the **headless** `gameactivity` gate,
 which fails on HANDOFF open item 7's two unchanged causes (Windows 1224 re-opening
@@ -70,7 +70,7 @@ and handed them back. Rows `cookie-`.
 | | commit | working set |
 |---|---|---|
 | `83cfa6e` | 3,157 MiB | 2,528 MiB |
-| `c18e0eb` (patch 0002) | **2,105 MiB** | **1,884 MiB** |
+| `c18e0eb` (patch 0017) | **2,105 MiB** | **1,884 MiB** |
 
 * Per guest thread (omni-cpu's own test, n = 8): **24.56 → 4.47 MiB**. Before: a 16 MiB
   fast-dispatch table (constructed and written; FastDispatch is off, D16) and 18 MiB committed up
@@ -126,7 +126,7 @@ and the owner asked for no more real-game runs until it is updated. What was mea
 |---|---|---|
 | `208c4c8`: invalidate only executable ranges | ~240 code invalidations/s reached every thread; 64-entry queues overflowed into whole-cache wipes; threads 9-33% in the translator | landing: re-translated blocks 387,688 → 96,833 (-75%), invalidations applied -87% |
 | `bae4b92`: value-compare exclusives (D31) | busiest workers 3-8.5% of samples at the global monitor | benchmark 131 → 12.8 ns per guest atomic; landing passes |
-| patch 0003: the RSB kept (D33) | (from the benchmark, not the profile) every `RET` was a dispatcher lookup | benchmark 132.0 → 24.1 ns per call and return at 262,144 blocks |
+| patch 0018: the RSB kept (D33) | (from the benchmark, not the profile) every `RET` was a dispatcher lookup | benchmark 132.0 → 24.1 ns per call and return at 262,144 blocks |
 
 Still open from the profile: the ~12 fps itself. The game loop's spin (thread g5) is closed as
 the engine's own design:
@@ -173,12 +173,12 @@ shared code are additive except where marked:
   will not compile; every in-tree construction uses `Default`. `DynarmicBackend::new` now reads
   `OMNI_JIT_*` switches (`with_environment`), each announced.
 * **`dynarmic-sys`**: `OdMonitorLayout`, `od_monitor_layout_of`, `optimization::UNSAFE_IGNORE_GLOBAL_MONITOR`
-  (shim ABI additions). **Vendored patch 0002** changes `a64_emit_x64.{h,cpp}` and
+  (shim ABI additions). **Vendored patch 0017** changes `a64_emit_x64.{h,cpp}` and
   `block_of_code.cpp` -- files of the **x64 backend only**. An arm64 host (the M1) builds
   dynarmic's arm64 backend, which this patch does not touch and which was **not examined** for the
   same per-thread costs; measure it there before assuming either way.
   `OD_FIXED_PER_JIT_BYTES` keeps its value; its meaning is now "when FastDispatch is on".
-  **Vendored patch 0003** changes `a64_emit_x64.cpp` (x64 backend only) and, **not additively**,
+  **Vendored patch 0018** changes `a64_emit_x64.cpp` (x64 backend only) and, **not additively**,
   the value of `optimization::INTERRUPTIBLE`: `0xFFF9` → `0xFFFB` (it keeps `ReturnStackBuffer`).
   An **arm64 host** builds dynarmic's arm64 backend, which this patch does not touch and whose
   return-stack-buffer handling was **not examined**: run `the_stoppability_matrix` there -- its

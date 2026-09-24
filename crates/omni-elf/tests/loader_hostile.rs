@@ -89,7 +89,7 @@ fn the_pristine_synthetic_library_loads_and_relocates() {
     .expect("the pristine synthetic library must load");
 
     assert_eq!(object.soname.as_deref(), Some("libsynth.so"));
-    assert_eq!(object.span(), 0x3000);
+    assert_eq!(object.span(), 3 * synth::PAGE as usize);
     assert_eq!(object.phdr, object.base + synth::PHOFF);
     assert_eq!(object.phnum, synth::PHNUM as u16);
 
@@ -137,9 +137,9 @@ fn the_pristine_synthetic_library_loads_and_relocates() {
 
     // Relro seals the writable segment's first page, and `.bss` stays writable.
     let relro = object.relro.expect("PT_GNU_RELRO");
-    assert_eq!(relro.sealed_bytes(), 0x1000);
+    assert_eq!(relro.sealed_bytes(), synth::PAGE as usize);
     assert_eq!(object.range_at(object.base + synth::DYNAMIC as usize).map(|r| r.rest), Some(Protection::Read));
-    assert_eq!(object.range_at(object.base + 0x2000).map(|r| r.rest), Some(Protection::ReadWrite));
+    assert_eq!(object.range_at(object.base + 2 * synth::PAGE as usize).map(|r| r.rest), Some(Protection::ReadWrite));
 
     object.unload(&space).expect("unload");
 }
@@ -154,13 +154,14 @@ fn two_pt_loads_claiming_one_page_are_refused() {
     // and `LoadImage` accepts overlapping segments by design — it counts their union — so this can
     // only be caught where the mapping is planned.
     let err = refuse("PT_LOAD ranges overlap", |b| {
-        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_FILESZ, 0x2000);
-        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_MEMSZ, 0x2000);
+        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_FILESZ, 2 * synth::PAGE);
+        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_MEMSZ, 2 * synth::PAGE);
     });
     assert!(
         matches!(
             err,
-            LoadError::SegmentsOverlap { first: 1, first_end: 0x2000, second: 2, second_start: 0x1000, .. }
+            LoadError::SegmentsOverlap { first: 1, first_end, second: 2, second_start, .. }
+                if first_end == 2 * synth::PAGE && second_start == synth::PAGE
         ),
         "expected SegmentsOverlap, got {err}"
     );
@@ -172,7 +173,7 @@ fn a_p_vaddr_that_overflows_when_biased_is_refused() {
     // the top of the address space. `p_vaddr + p_memsz` overflows, which the parser catches before
     // the loader can bias it.
     let err = refuse("p_vaddr near u64::MAX", |b| {
-        synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_VADDR, u64::MAX & !0xfff);
+        synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_VADDR, u64::MAX & !(synth::PAGE - 1));
     });
     assert!(
         matches!(
@@ -250,7 +251,7 @@ fn a_segment_whose_offset_and_vaddr_disagree_modulo_the_page_size_is_refused() {
     // claiming a p_vaddr that no page-aligned file offset can serve.
     let err = refuse("p_vaddr not congruent with p_offset", |b| {
         synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_ALIGN, 1);
-        synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_VADDR, 0x1800);
+        synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_VADDR, synth::PAGE + synth::PAGE / 2);
     });
     assert!(
         matches!(err, LoadError::SegmentOffsetNotCongruent { index: 2, .. }),
@@ -261,7 +262,7 @@ fn a_segment_whose_offset_and_vaddr_disagree_modulo_the_page_size_is_refused() {
     // start before its own beginning.
     let err = refuse("p_offset below the page bias", |b| {
         synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_ALIGN, 1);
-        synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_VADDR, 0x1800);
+        synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_VADDR, synth::PAGE + synth::PAGE / 2);
         synth::put_u64(b, synth::phdr(synth::PH_LOAD_DATA) + synth::P_OFFSET, 0x400);
     });
     assert!(
@@ -273,7 +274,7 @@ fn a_segment_whose_offset_and_vaddr_disagree_modulo_the_page_size_is_refused() {
 #[test]
 fn a_truncated_file_is_refused() {
     let mut bytes = synth::build();
-    bytes.truncate(0x1800);
+    bytes.truncate((synth::PAGE + synth::PAGE / 2) as usize);
     let file = synth::SynthFile::new("truncated", bytes);
     let err = attempt_file("truncated file", &file).expect_err("a truncated library must be refused");
     assert!(
@@ -290,8 +291,8 @@ fn program_headers_outside_every_pt_load_are_refused() {
         synth::put_u32(b, synth::phdr(synth::PH_PHDR) + synth::P_TYPE, 0); // PT_NULL
         synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_OFFSET, 0x100);
         synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_VADDR, 0x100);
-        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_FILESZ, 0xf00);
-        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_MEMSZ, 0xf00);
+        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_FILESZ, synth::PAGE - 0x100);
+        synth::put_u64(b, synth::phdr(synth::PH_LOAD_TEXT) + synth::P_MEMSZ, synth::PAGE - 0x100);
     });
     assert!(
         matches!(err, LoadError::ProgramHeadersNotMapped { phoff: 0x40, .. }),
@@ -306,10 +307,10 @@ fn program_headers_outside_every_pt_load_are_refused() {
 #[test]
 fn a_relocation_target_outside_every_pt_load_is_refused() {
     let err = refuse("relocation target past the image", |b| {
-        synth::put_u64(b, synth::rela(synth::RELA_GOT_0), 0x4000);
+        synth::put_u64(b, synth::rela(synth::RELA_GOT_0), 4 * synth::PAGE);
     });
     assert!(
-        matches!(err, LoadError::RelocationTargetUnmapped { r_offset: 0x4000, .. }),
+        matches!(err, LoadError::RelocationTargetUnmapped { r_offset, .. } if r_offset == 4 * synth::PAGE),
         "expected RelocationTargetUnmapped, got {err}"
     );
 
@@ -328,7 +329,7 @@ fn a_relocation_straddling_the_end_of_its_mapped_range_is_refused() {
     // Four bytes before the end of `.bss`: the eight-byte store would run off the end of the image.
     // A loader that clipped the window instead of refusing would write four bytes into nothing.
     let err = refuse("relocation straddles the image end", |b| {
-        synth::put_u64(b, synth::rela(synth::RELA_GOT_0), 0x2ffc);
+        synth::put_u64(b, synth::rela(synth::RELA_GOT_0), 3 * synth::PAGE - 4);
     });
     assert!(
         matches!(err, LoadError::RelocationTargetSpansRanges { target: _, end: _, .. }),
@@ -453,10 +454,10 @@ fn a_pt_gnu_relro_that_does_not_lie_inside_the_image_is_refused() {
     );
 
     let err = refuse("relro outside the image", |b| {
-        synth::put_u64(b, synth::phdr(synth::PH_RELRO) + synth::P_VADDR, 0x9000);
+        synth::put_u64(b, synth::phdr(synth::PH_RELRO) + synth::P_VADDR, 9 * synth::PAGE);
     });
     assert!(
-        matches!(err, LoadError::RelroOutsideImage { vaddr: 0x9000, .. }),
+        matches!(err, LoadError::RelroOutsideImage { vaddr, .. } if vaddr == 9 * synth::PAGE),
         "expected RelroOutsideImage, got {err}"
     );
 
@@ -474,7 +475,7 @@ fn an_init_array_entry_outside_the_image_is_refused() {
     // attacker-chosen jump target. Note the entry is produced by a *relocation*, so this is a
     // forged addend rather than a forged pointer.
     let err = refuse("init_array entry outside the image", |b| {
-        synth::put_u64(b, synth::rela(synth::RELA_INIT_0) + 16, 0x9000);
+        synth::put_u64(b, synth::rela(synth::RELA_INIT_0) + 16, 9 * synth::PAGE);
     });
     assert!(
         matches!(
@@ -716,6 +717,7 @@ fn every_library_in_the_apk_loads() {
     let mut tail_copies = 0usize;
     let mut worst_anonymous = 0usize;
     let mut worst_piece = (0usize, String::new());
+    let mut below_host_page: Vec<String> = Vec::new();
     eprintln!("\n{:<40} {:>10} {:>8} {:>8} {:>7}", "library", "relocs", "imports", "init", "span");
     for name in common::libraries().expect("the APK is present").keys() {
         let path = common::cached_library(name).expect("in the cache");
@@ -723,6 +725,31 @@ fn every_library_in_the_apk_loads() {
         let space = GuestSpace::new().expect("space");
         let backing = Backing::open(&path, MapExecutability::Executable).expect("open");
         let elf = ElfImage::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // A library aligned below the host page cannot be mapped at its alignment, and is refused
+        // by name -- as bionic refuses it on a 16 KiB-page device. None of the eleven is on a 4 KiB
+        // host; on a 16 KiB one (Apple silicon) `libzstd-jni` is, with `p_align` 0x1000.
+        let host_page = f_page(&space) as u64;
+        if let Some(align) = elf.load_segments().map(|s| s.p_align).find(|&a| a > 1 && a < host_page) {
+            let outcome = loader::load(
+                &space,
+                &backing,
+                &elf,
+                &ProviderRegistry::empty_provider(),
+                &LoaderConfig::default(),
+            );
+            match outcome {
+                Err(LoadError::AlignBelowPageSize { align: named, page_size, .. }) => {
+                    assert_eq!((named, page_size as u64), (align, host_page), "{name}");
+                }
+                Err(e) => panic!("{name}: expected AlignBelowPageSize, got {e}"),
+                Ok(_) => panic!("{name}: p_align {align:#x} on a {host_page:#x} host loaded"),
+            }
+            eprintln!("{name:<40} refused: p_align {align:#x} is below the host page {host_page:#x}");
+            below_host_page.push(name.clone());
+            assert_eq!(space.stats().mapped, 0, "{name}: a mapping survived the refusal");
+            space.close().expect("close");
+            continue;
+        }
         let object = loader::load(
             &space,
             &backing,
@@ -768,6 +795,11 @@ fn every_library_in_the_apk_loads() {
          accounted for, {tail_copies} needed a private final page"
     );
     assert!(total_relocations > 568_806, "the main library alone has 568,806");
+    // Which libraries a host refuses is the host's page size and nothing else: none on 4 KiB pages,
+    // exactly the one 4 KiB-aligned library on 16 KiB pages (docs/ports/macos.md).
+    let expected: &[&str] =
+        if omni_platform::vm::page_size() > 0x1000 { &["libzstd-jni-1.5.7-6.so"] } else { &[] };
+    assert_eq!(below_host_page, expected, "the libraries refused for p_align below the host page");
     // The largest single anonymous piece any real library asks for. This is the quantity
     // `GuestSpaceConfig::max_commit_request` is bracketed against on the legitimate side — one eager
     // commit call asks for exactly this — so it is asserted here rather than quoted in a doc comment
@@ -881,7 +913,7 @@ fn the_guest_spaces_commit_ceiling_refuses_a_gigabyte_of_bss_on_its_own() {
             // The whole tampered `.bss` in one call: `p_memsz` of 0x4000_0000 less the one page of
             // the segment that is file-backed. One call, one gigabyte — which is the shape, not the
             // size, that the per-request ceiling exists to catch.
-            assert_eq!(*requested, 0x4000_0000 - 0x1000, "the whole tampered .bss, in one call");
+            assert_eq!(*requested, 0x4000_0000 - synth::PAGE as usize, "the whole tampered .bss, in one call");
             assert_eq!(*limit, omni_mem::DEFAULT_MAX_COMMIT_REQUEST);
             assert!(
                 err.to_string().contains(&omni_mem::DEFAULT_MAX_COMMIT_REQUEST.to_string()),
@@ -946,12 +978,12 @@ fn a_backing_that_is_not_the_parsed_file_is_refused() {
     for (label, edit) in [
         (
             "backing one page longer than the parsed image",
-            Box::new(|b: &mut Vec<u8>| b.extend_from_slice(&[0u8; 0x1000]))
+            Box::new(|b: &mut Vec<u8>| b.extend_from_slice(&[0u8; synth::PAGE as usize]))
                 as Box<dyn FnOnce(&mut Vec<u8>)>,
         ),
         (
             "backing truncated below the parsed image",
-            Box::new(|b: &mut Vec<u8>| b.truncate(0x1000)),
+            Box::new(|b: &mut Vec<u8>| b.truncate(synth::PAGE as usize)),
         ),
     ] {
         let other = synth::SynthFile::tampered(label, edit);

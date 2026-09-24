@@ -243,6 +243,66 @@ pub const fn mrs_tpidr_el0(rt: u32) -> u32 {
     0xD53B_D040 | rt
 }
 
+/// `MSR FPCR, Xt` — system register move, `op0=3 op1=3 CRn=4 CRm=4 op2=0`:
+/// `1101010100 0 1 1 011 0100 0100 000 Rt:5`.
+pub const fn msr_fpcr(rt: u32) -> u32 {
+    0xD51B_4400 | rt
+}
+
+/// `MRS Xt, FPCR` — as [`msr_fpcr`] with `L=1`.
+pub const fn mrs_fpcr(rt: u32) -> u32 {
+    0xD53B_4400 | rt
+}
+
+/// `MRS Xt, FPSR` — `op2=1` of the `FPCR` encoding.
+pub const fn mrs_fpsr(rt: u32) -> u32 {
+    0xD53B_4420 | rt
+}
+
+/// `MSR FPSR, Xt`.
+pub const fn msr_fpsr(rt: u32) -> u32 {
+    0xD51B_4420 | rt
+}
+
+/// `LDADD Xs, Xt, [Xn]` — an ARMv8.1 LSE atomic, `size=11 111 0 00 A=0 R=0 1 Rs:5 o3=0 opc=000 00
+/// Rn:5 Rt:5`. **Not in the pin's A64 decoder** (`decoder/a64.inc` has the line commented out), so
+/// the frontend translates it as `InterpretThisInstruction()`: it is the canonical way to reach the
+/// `Interpret` terminal.
+pub const fn ldadd_x(rs: u32, rt: u32, rn: u32) -> u32 {
+    0xF820_0000 | (rs << 16) | (rn << 5) | rt
+}
+
+/// AdvSIMD scalar three-same, `01 U 11110 size:2 1 Rm:5 opcode:5 1 Rn:5 Rd:5`. `size` is the element
+/// size (0 = B, 1 = H, 2 = S, 3 = D).
+pub const fn simd_scalar_three_same(u: u32, size: u32, opcode: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    0x5E20_0400 | (u << 29) | (size << 22) | (rm << 16) | (opcode << 11) | (rn << 5) | rd
+}
+
+/// `SQADD <V>d, <V>n, <V>m` (scalar) — three-same `U=0 opcode=00001`.
+pub const fn sqadd_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(0, size, 0b00001, rd, rn, rm)
+}
+
+/// `UQADD <V>d, <V>n, <V>m` (scalar) — `U=1 opcode=00001`.
+pub const fn uqadd_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(1, size, 0b00001, rd, rn, rm)
+}
+
+/// `SQSUB <V>d, <V>n, <V>m` (scalar) — `U=0 opcode=00101`.
+pub const fn sqsub_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(0, size, 0b00101, rd, rn, rm)
+}
+
+/// `UQSUB <V>d, <V>n, <V>m` (scalar) — `U=1 opcode=00101`.
+pub const fn uqsub_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(1, size, 0b00101, rd, rn, rm)
+}
+
+/// `SQDMULH <V>d, <V>n, <V>m` (scalar) — `U=0 opcode=10110`; `size` 1 (H) or 2 (S) only.
+pub const fn sqdmulh_scalar(size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    simd_scalar_three_same(0, size, 0b10110, rd, rn, rm)
+}
+
 /// `SVC #imm16` — `11010100 000 imm16:16 000 01`.
 pub const fn svc(imm16: u16) -> u32 {
     0xD400_0001 | ((imm16 as u32) << 5)

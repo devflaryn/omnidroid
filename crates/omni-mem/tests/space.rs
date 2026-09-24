@@ -8,7 +8,7 @@
 //! Windows-only, because `omni-platform`'s Linux and macOS backends are structural and every
 //! operation on them returns a typed `Unsupported` error. A test here would assert nothing about
 //! those targets that `config.rs` does not already assert.
-#![cfg(target_os = "windows")]
+#![cfg(any(target_os = "windows", target_os = "macos"))]
 
 mod common;
 
@@ -131,7 +131,8 @@ fn a_fixed_mapping_over_an_occupied_range_fails_with_the_conflict() {
     // Outside the space is a different error, and names the space.
     let error = space
         .map_anonymous(
-            Placement::Fixed(space.end() - 4 * KIB),
+            // One page short of the end, so the address itself is valid on any host page size.
+            Placement::Fixed(space.end() - omni_platform_page()),
             64 * KIB,
             Protection::ReadWrite,
             CommitPolicy::Lazy,
@@ -173,7 +174,9 @@ fn placement_honours_an_arbitrary_alignment_and_does_not_assume_a_page() {
 #[test]
 fn a_hint_is_honoured_when_free_and_ignored_when_not() {
     let space = space(64 * MIB);
-    let wanted = space.base() + 8 * MIB;
+    // A 64 KiB-aligned hint: the space's base is aligned to the host's allocation granularity,
+    // which is 64 KiB on Windows but one 16 KiB page on macOS.
+    let wanted = (space.base() + 8 * MIB).next_multiple_of(64 * KIB);
     let first = space
         .map_anonymous(
             Placement::Hint { address: wanted, align: 64 * KIB },
@@ -413,7 +416,8 @@ fn the_space_reports_what_it_cannot_place() {
         .expect_err("a full space cannot place anything");
     match error {
         MemError::NoSpace { len, free, largest, .. } => {
-            assert_eq!(len, 4 * KIB);
+            // The request, rounded up to the host page.
+            assert_eq!(len, (4 * KIB).next_multiple_of(omni_platform_page()));
             assert_eq!(free, 0);
             assert_eq!(largest, 0);
         }
@@ -1772,9 +1776,11 @@ fn a_shared_backing_needs_write_access_and_a_non_empty_file() {
     let file = TempFile::new("read-only.bin", page, page);
     let read_only = std::fs::File::open(file.path()).expect("open read-only");
     let error = Backing::share(read_only, "/data/ro.bin").expect_err("must refuse");
+    // ERROR_ACCESS_DENIED on Windows; EACCES on macOS, where the refusal is the backend's own.
+    let access_denied = if cfg!(target_os = "windows") { 5 } else { 13 };
     assert_eq!(
         error.platform_error().and_then(|e| e.os_error()).map(|e| e.code()),
-        Some(5),
+        Some(access_denied),
         "ERROR_ACCESS_DENIED: {error}"
     );
 

@@ -758,15 +758,22 @@ enum Shape {
     Indirect,
     /// `BL` to a `RET`, then `B` back to the `BL` -- a call and a return,
     /// forever. The `RET` is a `PopRSBHint` terminal that *hits* the return
-    /// stack buffer every time, which is the handler Omnidroid patch 0003
+    /// stack buffer every time, which is the handler Omnidroid patch 0018
     /// teaches to check the budget and the halt flag.
     Return,
     /// `BLR` to a `RET`, then `BR` back to the `BLR`: the same call and
     /// return with no direct branch anywhere, so under `ALL_SAFE` the `RET`'s
     /// handler is the only terminal on the loop that checks anything. This is
-    /// the shape that isolates patch 0003's *budget* check, which `Return`
+    /// the shape that isolates patch 0018's *budget* check, which `Return`
     /// cannot: its `B` already checks the budget.
     IndirectCall,
+    /// `RET` to itself, served by the return-stack buffer: eight `BL`s first fill every RSB slot
+    /// with the `RET` block's own entry, then the `RET` returns to itself, popping a matching slot
+    /// each time around the ring. It leaves through `PopRSBHint`, which `Indirect` (a `BR`, i.e.
+    /// `FastDispatchHint`) never reaches -- and on the arm64 backend `FastDispatchHint` is a plain
+    /// return to the dispatcher, so without this shape the arm64 table would say nothing about the
+    /// RSB at all. Not x64's `Return` (patch 0018's detector): that one is a `BL`/`B` loop.
+    ReturnRing,
 }
 
 impl Shape {
@@ -789,6 +796,23 @@ impl Shape {
             // NOP                               D503201F
             // RET                               D65F03C0
             Self::IndirectCall => vec![a64::blr(1), a64::br(2), a64::NOP, a64::ret(30)],
+            // 0: NOP ; 1: NOP
+            // 2: BL   +2  (to 4)                94000002   X30 = addr(3), pushes RSB(3)
+            // 3: RET                            D65F03C0   the runaway: returns to itself
+            // 4: SUBS X0, X0, #1                F1000400
+            // 5: B.NE -3  (to 2)                54FFFFA1
+            // 6: B    -3  (to 3)                17FFFFFD
+            // Entered at 3 with X30 = addr(4) and X0 = 16, so block 3 is translated first and
+            // every push afterwards links to it.
+            Self::ReturnRing => vec![
+                a64::NOP,
+                a64::NOP,
+                a64::bl(2),
+                a64::ret(30),
+                a64::subs_imm(0, 0, 1),
+                a64::b_cond(a64::cond::NE, -3),
+                a64::b(-3),
+            ],
         }
     }
 }
@@ -855,6 +879,11 @@ fn runaway_case(shape: Shape, optimizations: u32, escape: Escape) {
         vm.set_reg(2, CODE_BASE);
     }
     vm.start(escape.budget());
+    if shape == Shape::ReturnRing {
+        vm.set_pc(CODE_BASE + 3 * 4);
+        vm.set_reg(30, CODE_BASE + 4 * 4);
+        vm.set_reg(0, 16);
+    }
 
     if escape.halts() {
         let jit = vm.raw() as usize;
@@ -904,6 +933,7 @@ fn runaway_case_from_env() -> (Shape, u32, Escape) {
         "indirect" => Shape::Indirect,
         "return" => Shape::Return,
         "indirect-call" => Shape::IndirectCall,
+        "return-ring" => Shape::ReturnRing,
         other => panic!("unknown shape {other}"),
     };
     let optimizations = u32::from_str_radix(parts.next().unwrap(), 16).unwrap();
@@ -987,7 +1017,7 @@ fn the_stoppability_matrix() {
     //    handlers (`GenTerminalHandlers`, `a64_emit_x64.cpp:169`) compute a
     //    location descriptor and jump, reading neither. Clearing
     //    `ReturnStackBuffer` and `FastDispatch` sends them to
-    //    `ReturnFromRunCode` instead. Omnidroid patch 0003 makes the RSB
+    //    `ReturnFromRunCode` instead. Omnidroid patch 0018 makes the RSB
     //    *hit* check both, as `ReturnFromRunCode` does, so `INTERRUPTIBLE`
     //    keeps `ReturnStackBuffer` and clears only `FastDispatch`
     //    (`0x0000_FFFB`); the `return` cells below are its detector.
@@ -1009,7 +1039,8 @@ fn the_stoppability_matrix() {
     // honoured?** A `false` there does not mean arming both is worse than
     // arming either alone -- it means the halt contributes nothing, and the
     // budget is then the only thing that could have stopped this guest.
-    let cases: [(&str, bool); 39] = [
+    #[cfg(target_arch = "x86_64")]
+    let cases: &[(&str, bool)] = &[
         // Direct branches, `ALL_SAFE` and `INTERRUPTIBLE`: identical, because
         // neither clears `BlockLinking`. Cycle counting picks which single
         // escape exists, and with it on the halt is not honoured.
@@ -1049,7 +1080,7 @@ fn the_stoppability_matrix() {
         ("indirect:0000FFF8:halt+budget", true),
         // A call and a return. The direct `B` back to the call is a
         // `LinkBlock` and checks one mechanism; the `RET` hits the return
-        // stack buffer, whose handler -- since patch 0003 -- checks both, as
+        // stack buffer, whose handler -- since patch 0018 -- checks both, as
         // `ReturnFromRunCode` does. So `halt+budget` stops under both flag
         // sets; without the patch it would wedge, as the direct cells do.
         ("return:0000FFFF:budget", true),
@@ -1060,7 +1091,7 @@ fn the_stoppability_matrix() {
         ("return:0000FFFB:halt+budget", true),
         // The same call and return through `BLR` and `BR`. Under `ALL_SAFE`
         // those two are unchecked fast-dispatch hints, so the `RET` alone
-        // decides every cell -- each of patch 0003's two checks has a cell
+        // decides every cell -- each of patch 0018's two checks has a cell
         // that wedges without it. Under `INTERRUPTIBLE` they go to the
         // dispatcher, which checks both regardless.
         ("indirect-call:0000FFFF:budget", true),
@@ -1070,8 +1101,74 @@ fn the_stoppability_matrix() {
         ("indirect-call:0000FFFB:halt", true),
         ("indirect-call:0000FFFB:halt+budget", true),
     ];
+
+    // **The arm64 backend's table, MEASURED on Apple M1** (each cell in its own process), with a
+    // fourth shape. Its terminals (`emit_arm64_a64.cpp`) are not the x64 ones:
+    //
+    //  * `LinkBlock` behaves as on x64 -- with `BlockLinking` it compares `Xticks` when cycle
+    //    counting is on and the halt word when it is off, one or the other; without it, it returns to
+    //    the dispatcher.
+    //  * `FastDispatchHint` (the terminal of `BR`/`BLR`) is **not implemented** on arm64: it is a
+    //    plain return to the dispatcher with a `TODO`. So the `indirect` (`BR`) loop is stoppable in
+    //    every cell here, where on x64 it is stoppable in none under `0xFFFF`.
+    //  * `PopRSBHint` (the terminal of `RET`) *is* implemented, and like x64's it compares the
+    //    return-stack buffer entry and branches straight to the cached block, checking neither the
+    //    budget nor the halt word. The `return-ring` shape keeps every RSB slot pointing at itself, and is
+    //    **unstoppable under `0xFFFF` by any mechanism**. Clearing `ReturnStackBuffer`
+    //    (`INTERRUPTIBLE`, `0xFFF9`, which `omni-cpu` uses) sends it to the dispatcher.
+    //  * The dispatcher (`return_to_dispatcher` in `A64AddressSpace::EmitPrelude`) checks the halt
+    //    word, then the budget when cycle counting is on -- both, as x64's `ReturnFromRunCode`.
+    //
+    // So D16's conclusions hold on arm64 for the flag set Omnidroid runs: under `0xFFF9` with cycle
+    // counting every shape stops at its budget, and only the direct-branch loops ignore a
+    // cross-thread halt while the budget has not expired -- a watchdog built from short budget
+    // windows works; one built on halt alone does not. `0xFFF8` stops everything, both ways.
+    #[cfg(target_arch = "aarch64")]
+    let cases: &[(&str, bool)] = &[
+        ("direct-empty:0000FFFF:budget", true),
+        ("direct-empty:0000FFFF:halt", true),
+        ("direct-empty:0000FFFF:halt+budget", false),
+        ("direct-empty:0000FFF9:budget", true),
+        ("direct-empty:0000FFF9:halt", true),
+        ("direct-empty:0000FFF9:halt+budget", false),
+        ("direct-body:0000FFFF:budget", true),
+        ("direct-body:0000FFFF:halt", true),
+        ("direct-body:0000FFFF:halt+budget", false),
+        ("direct-body:0000FFF9:budget", true),
+        ("direct-body:0000FFF9:halt", true),
+        ("direct-body:0000FFF9:halt+budget", false),
+        // `BR`: FastDispatchHint is a dispatcher return on arm64, so everything stops.
+        ("indirect:0000FFFF:budget", true),
+        ("indirect:0000FFFF:halt", true),
+        ("indirect:0000FFFF:halt+budget", true),
+        ("indirect:0000FFF9:budget", true),
+        ("indirect:0000FFF9:halt", true),
+        ("indirect:0000FFF9:halt+budget", true),
+        // `RET` through the return-stack buffer: nothing stops it until the RSB is off.
+        ("return-ring:0000FFFF:budget", false),
+        ("return-ring:0000FFFF:halt", false),
+        ("return-ring:0000FFFF:halt+budget", false),
+        ("return-ring:0000FFF9:budget", true),
+        ("return-ring:0000FFF9:halt", true),
+        ("return-ring:0000FFF9:halt+budget", true),
+        ("direct-empty:0000FFF8:budget", true),
+        ("direct-empty:0000FFF8:halt", true),
+        ("direct-empty:0000FFF8:halt+budget", true),
+        ("direct-body:0000FFF8:budget", true),
+        ("direct-body:0000FFF8:halt", true),
+        ("direct-body:0000FFF8:halt+budget", true),
+        ("indirect:0000FFF8:budget", true),
+        ("indirect:0000FFF8:halt", true),
+        ("indirect:0000FFF8:halt+budget", true),
+        ("return-ring:0000FFF8:budget", true),
+        ("return-ring:0000FFF8:halt", true),
+        ("return-ring:0000FFF8:halt+budget", true),
+    ];
     assert_eq!(optimization::ALL_SAFE, 0x0000_FFFF);
+    #[cfg(target_arch = "x86_64")]
     assert_eq!(optimization::INTERRUPTIBLE, 0x0000_FFFB);
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(optimization::INTERRUPTIBLE, 0x0000_FFF9);
 
     if is_child() {
         let (shape, optimizations, escape) = runaway_case_from_env();
@@ -1080,7 +1177,7 @@ fn the_stoppability_matrix() {
     }
 
     let mut wrong = Vec::new();
-    for (spec, expected_stopped) in cases {
+    for &(spec, expected_stopped) in cases {
         let mut child = spawn_child_with("the_stoppability_matrix", &[("OD_RUNAWAY_CASE", spec)]);
         let st = wait_up_to(&mut child, 60).expect("the child never exited at all");
         // Only two exit codes are answers. Anything else -- a panic from the

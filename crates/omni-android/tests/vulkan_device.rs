@@ -35,7 +35,7 @@
 //! no frame, and this file makes no claim about a pixel. `tests/ndk_host_window.rs` is where real
 //! frames reach a real window, through `omni-gfx`'s own renderer rather than through the guest.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

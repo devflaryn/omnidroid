@@ -51,6 +51,9 @@ pub struct Ctx {
     pub code: Vec<u32>,
     /// Guest data arena. `u64` rather than `u8` so the base is 8-aligned.
     pub mem: Vec<u64>,
+    /// Where the guest data arena really is: `mem`'s buffer, or a buffer shared with other `Vm`s
+    /// ([`VmOptions::shared_arena`]), `MEM_SIZE + MEM_GUARD` bytes either way.
+    pub arena: *mut u64,
     /// The jit this context belongs to, filled in after `od_jit_new`. Callbacks
     /// need it to halt execution, which is the only way out of a panic.
     pub jit: *mut c_void,
@@ -61,6 +64,8 @@ pub struct Ctx {
     pub exceptions: Vec<(u64, u32)>,
     /// `(op, vaddr)` for every instruction-cache maintenance operation.
     pub icache: Vec<(u32, u64)>,
+    /// `(pc, num_insns)` for every `interpreter_fallback`, in order.
+    pub fallbacks: Vec<(u64, u64)>,
 
     /// Current callback nesting depth.
     pub depth: i32,
@@ -86,6 +91,27 @@ pub struct Ctx {
     pub reenter_step_result: Option<u32>,
     /// Test hook: halt with [`HALT_DONE`] from inside `call_svc`.
     pub halt_on_svc: bool,
+    /// Test hook: `SVC #1` sleeps this long on the host thread and returns without halting (so the
+    /// guest carries on); 0 leaves `SVC #1` like any other. Forces host context switches in the
+    /// middle of guest execution.
+    pub sleep_on_svc1_us: u64,
+    /// Test hook: `SVC #2` writes the byte already at this host address back to it, from inside
+    /// the callback -- i.e. on the guest's thread, in the middle of guest execution. 0 = off.
+    pub rewrite_byte_on_svc2: u64,
+    /// The host thread's `(TPIDR_EL0, TPIDRRO_EL0)` as read inside the most recent `SVC` callback,
+    /// on arm64 hosts; `(0, 0)` elsewhere.
+    pub host_thread_pointers_in_svc: (u64, u64),
+    /// Test hook: `SVC #3` stores this `(guest address, u64)` into guest memory from the host --
+    /// another observer's plain store, in the middle of the guest's code. `None` = off.
+    pub poke_on_svc3: Option<(u64, u64)>,
+    /// Test hook: make `interpreter_fallback` behave as an interpreter that
+    /// executed its `num_insns` instructions as no-ops -- advance the guest PC
+    /// past them and do **not** halt -- so a test can see where execution goes
+    /// after the fallback returns.
+    pub fallback_skips: bool,
+    /// The `FPCR` the host thread held inside the last `interpreter_fallback`,
+    /// read on arm64 hosts only (0 elsewhere).
+    pub fallback_host_fpcr: u32,
     /// Test hook: ask for a zero-length code invalidation from inside
     /// `call_svc`, which is what a guest `IC IVAU` over an empty range does.
     pub zero_invalidate_on_svc: bool,
@@ -102,12 +128,12 @@ impl Ctx {
 
     /// Guest data arena as bytes, for tests that want to seed or check memory.
     pub fn bytes(&mut self) -> &mut [u8] {
-        let len = self.mem.len() * 8;
-        // SAFETY: `mem` is a live `Vec<u64>`; `[u64]` and `[u8]` have the same
-        // provenance and `u8` has weaker alignment, so reinterpreting the
-        // buffer as bytes is in bounds for `len` bytes. The borrow of `self`
-        // keeps the vector alive and unaliased for the returned slice.
-        unsafe { std::slice::from_raw_parts_mut(self.mem.as_mut_ptr().cast::<u8>(), len) }
+        let len = MEM_SIZE + MEM_GUARD;
+        // SAFETY: `arena` is `mem`'s live buffer or a shared one of the same size that outlives
+        // every `Vm` using it; `u8` has weaker alignment than `u64`, so reinterpreting the buffer
+        // as bytes is in bounds for `len` bytes. A shared arena is only ever used by tests whose
+        // concurrent accesses to it all happen under the exclusive monitor's lock.
+        unsafe { std::slice::from_raw_parts_mut(self.arena.cast::<u8>(), len) }
     }
 
     /// Read a little-endian `u64` from guest address `addr`.
@@ -126,7 +152,7 @@ impl Ctx {
 
     /// Host address the guest arena is mapped at.
     fn fastmem_base(&self) -> u64 {
-        self.mem.as_ptr() as u64
+        self.arena as u64
     }
 }
 
@@ -323,10 +349,22 @@ unsafe extern "C" fn cb_wx128(
     }
 }
 
-unsafe extern "C" fn cb_interpreter_fallback(ctx: *mut c_void, pc: u64, _n: u64) {
+unsafe extern "C" fn cb_interpreter_fallback(ctx: *mut c_void, pc: u64, n: u64) {
     // SAFETY: `ctx` is the harness context.
     unsafe {
         with(ctx, (), |c| {
+            c.fallbacks.push((pc, n));
+            #[cfg(target_arch = "aarch64")]
+            {
+                let fpcr: u64;
+                // SAFETY: `FPCR` is readable at EL0 and `mrs` touches no memory.
+                core::arch::asm!("mrs {}, fpcr", out(reg) fpcr, options(nomem, nostack));
+                c.fallback_host_fpcr = fpcr as u32;
+            }
+            if c.fallback_skips {
+                od_jit_set_pc(c.jit, pc + 4 * n);
+                return;
+            }
             // Nothing here can interpret A64, so refuse loudly rather than
             // silently skipping instructions: record it and stop.
             c.exceptions.push((pc, u32::MAX));
@@ -343,6 +381,32 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
     unsafe {
         with(ctx, (), |c| {
             c.svc.push(swi);
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (tp, tpro): (u64, u64);
+                // SAFETY: both registers are readable at EL0; `mrs` touches no memory.
+                core::arch::asm!("mrs {}, tpidr_el0", "mrs {}, tpidrro_el0", out(reg) tp, out(reg) tpro, options(nomem, nostack));
+                c.host_thread_pointers_in_svc = (tp, tpro);
+            }
+            if swi == 3 {
+                if let Some((addr, value)) = c.poke_on_svc3 {
+                    c.write_u64(addr, value);
+                    return;
+                }
+            }
+            if swi == 2 && c.rewrite_byte_on_svc2 != 0 {
+                let p = c.rewrite_byte_on_svc2 as *mut u8;
+                // The marker `tests/wx.rs` requires before it will count a death as this write's.
+                println!("REWRITING {:#x} FROM INSIDE GUEST EXECUTION", p as u64);
+                // SAFETY: deliberately a write the host may refuse; `tests/wx.rs` runs it in a
+                // child process whose death is the measurement. The byte written is the byte read.
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p));
+                return;
+            }
+            if swi == 1 && c.sleep_on_svc1_us != 0 {
+                std::thread::sleep(std::time::Duration::from_micros(c.sleep_on_svc1_us));
+                return;
+            }
             let jit = c.jit;
             if c.reenter_on_svc {
                 // Deliberate violation: guest code has reached a callback, and
@@ -446,6 +510,23 @@ pub struct VmOptions {
     pub code_cache_size: u64,
     /// `OdConfig::optimizations`.
     pub optimizations: u32,
+    /// An `od_monitor_new` handle shared with other `Vm`s (as `usize`, so options stay `Send`);
+    /// 0 gives this `Vm` a monitor of its own when [`VmOptions::monitor`] is set.
+    pub shared_monitor: usize,
+    /// `OdConfig::processor_id`: this `Vm`'s index into a shared monitor.
+    pub processor_id: u32,
+    /// A guest data arena shared with other `Vm`s (`MEM_SIZE + MEM_GUARD` bytes, 8-aligned, as
+    /// `usize`); 0 uses this `Vm`'s own.
+    pub shared_arena: usize,
+    /// `silently_mirror_fastmem`. Off, a guest address past `MEM_BITS` misses fastmem and goes to
+    /// the callbacks (which mask it into the arena).
+    pub mirror: bool,
+    /// Identity fastmem, as `omni-cpu` configures it (D4): base 0, 64 address bits, so a guest
+    /// address *is* the host address and an unmapped one takes a real host fault, which dynarmic's
+    /// fastmem handler turns into the callback path (which masks it into the arena).
+    pub identity: bool,
+    /// `check_halt_on_memory_access`, which `omni-cpu` sets.
+    pub check_halt_on_memory_access: bool,
 }
 
 impl Default for VmOptions {
@@ -462,6 +543,12 @@ impl Default for VmOptions {
             // memory problem of its own.
             code_cache_size: 8 << 20,
             optimizations: optimization::ALL_SAFE,
+            shared_monitor: 0,
+            processor_id: 0,
+            shared_arena: 0,
+            mirror: true,
+            identity: false,
+            check_halt_on_memory_access: false,
         }
     }
 }
@@ -476,19 +563,25 @@ pub struct Vm {
     tpidr: Box<u64>,
     tpidrro: Box<u64>,
     monitor: *mut c_void,
+    /// Whether `Drop` frees `monitor` (not when it is shared).
+    owns_monitor: bool,
 }
 
 impl Vm {
     /// Build a guest running `code` at [`CODE_BASE`].
     pub fn new(code: Vec<u32>, opts: VmOptions) -> Self {
+        let mut mem = vec![0u64; (MEM_SIZE + MEM_GUARD) / 8];
+        let arena = if opts.shared_arena != 0 { opts.shared_arena as *mut u64 } else { mem.as_mut_ptr() };
         let ctx = Box::new(UnsafeCell::new(Ctx {
             code_base: CODE_BASE,
             code,
-            mem: vec![0u64; (MEM_SIZE + MEM_GUARD) / 8],
+            mem,
+            arena,
             jit: std::ptr::null_mut(),
             svc: Vec::new(),
             exceptions: Vec::new(),
             icache: Vec::new(),
+            fallbacks: Vec::new(),
             depth: 0,
             max_depth: 0,
             ticks_remaining: u64::MAX,
@@ -499,12 +592,21 @@ impl Vm {
             reenter_result: None,
             reenter_step_result: None,
             halt_on_svc: true,
+            sleep_on_svc1_us: 0,
+            rewrite_byte_on_svc2: 0,
+            host_thread_pointers_in_svc: (0, 0),
+            poke_on_svc3: None,
+            fallback_skips: false,
+            fallback_host_fpcr: 0,
             zero_invalidate_on_svc: false,
         }));
 
         let mut tpidr = Box::new(0u64);
         let tpidrro = Box::new(0u64);
-        let monitor = if opts.monitor {
+        let owns_monitor = opts.monitor && opts.shared_monitor == 0;
+        let monitor = if opts.shared_monitor != 0 {
+            opts.shared_monitor as *mut c_void
+        } else if opts.monitor {
             // SAFETY: freed exactly once in `Drop`, after the jit that uses it.
             unsafe { od_monitor_new(1) }
         } else {
@@ -522,15 +624,15 @@ impl Vm {
             tpidr_el0: &mut *tpidr,
             tpidrro_el0: &*tpidrro,
             fastmem_enabled: i32::from(opts.fastmem),
-            fastmem_pointer: fastmem_base,
-            fastmem_address_space_bits: MEM_BITS,
+            fastmem_pointer: if opts.identity { 0 } else { fastmem_base },
+            fastmem_address_space_bits: if opts.identity { 64 } else { MEM_BITS },
             // Masks the guest address into the arena, so a wild guest address
             // wraps instead of reading off the end of the allocation.
-            silently_mirror_fastmem: 1,
+            silently_mirror_fastmem: i32::from(opts.mirror),
             recompile_on_fastmem_failure: 1,
             fastmem_exclusive_access: i32::from(opts.fastmem_exclusive),
             monitor,
-            processor_id: 0,
+            processor_id: opts.processor_id,
             code_cache_size: opts.code_cache_size,
             cntfrq_el0: 0,
             ctr_el0: 0,
@@ -539,7 +641,7 @@ impl Vm {
             wall_clock_cntpct: 0,
             hook_hint_instructions: i32::from(opts.hook_hints),
             define_unpredictable_behaviour: 0,
-            check_halt_on_memory_access: 0,
+            check_halt_on_memory_access: i32::from(opts.check_halt_on_memory_access),
             unsafe_optimizations: 0,
             optimizations: opts.optimizations,
         };
@@ -556,7 +658,7 @@ impl Vm {
             (*ctx.get()).jit = jit;
         }
 
-        Self { jit, ctx, tpidr, tpidrro, monitor }
+        Self { jit, ctx, tpidr, tpidrro, monitor, owns_monitor }
     }
 
     /// The raw jit handle, for tests that call the C ABI directly.
@@ -702,6 +804,16 @@ impl Vm {
         *self.tpidrro = v;
     }
 
+    /// The `TPIDR_EL0` slot's current value (what a guest `MSR TPIDR_EL0` wrote).
+    pub fn tpidr_el0(&self) -> u64 {
+        *self.tpidr
+    }
+
+    /// The `TPIDRRO_EL0` slot's current value.
+    pub fn tpidrro_el0(&self) -> u64 {
+        *self.tpidrro
+    }
+
     /// Callback-entry counters.
     pub fn stats(&self) -> OdStats {
         let mut s = OdStats::default();
@@ -741,7 +853,7 @@ impl Drop for Vm {
         // because the jit holds a pointer to it.
         unsafe {
             od_jit_free(self.jit);
-            if !self.monitor.is_null() {
+            if self.owns_monitor && !self.monitor.is_null() {
                 od_monitor_free(self.monitor);
             }
         }

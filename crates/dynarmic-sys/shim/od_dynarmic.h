@@ -256,11 +256,26 @@ typedef struct od_effective_config {
      * every byte of generated guest code is writable and executable at once,
      * which is what D12 says Omnidroid never does. The upstream switch for it
      * crashes; see `build.rs`. Reported rather than assumed so the
-     * contradiction is a checked fact and flips loudly when it changes. */
-    int code_cache_w_xor_x;
+     * contradiction is a checked fact and flips loudly when it changes.
+     *
+     * **2 on an Apple arm64 host** (`OD_CODE_CACHE_W_XOR_X_PER_THREAD`): not a
+     * build flag there but the platform's mechanism, which the arm64 backend
+     * uses on every write, and which `tests/wx.rs` measures by writing to the
+     * cache and dying. */
+    int code_cache_w_xor_x;  /* one of OD_CODE_CACHE_* below */
     uint64_t tpidr_el0_ptr;
     uint64_t tpidrro_el0_ptr;
 } od_effective_config;
+
+/* `od_effective_config::code_cache_w_xor_x`. */
+/* The code cache is writable and executable at once, for every thread (x64: PAGE_EXECUTE_READWRITE). */
+#define OD_CODE_CACHE_W_AND_X 0
+/* Built with DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT: the pages are flipped RW <-> RX. */
+#define OD_CODE_CACHE_W_XOR_X 1
+/* Apple arm64: MAP_JIT pages, RWX in the VM map, but each thread sees them either RW- or R-X, set
+ * per thread by pthread_jit_write_protect_np. W^X holds for any one thread; one thread's write
+ * window is open on every MAP_JIT page while another thread executes them. */
+#define OD_CODE_CACHE_W_XOR_X_PER_THREAD 2
 
 /* Callback-entry counters. Plain `uint64_t`, incremented on the thread that
  * owns the jit, so they cost one non-atomic increment. Task 3 asserts
@@ -368,6 +383,22 @@ void od_jit_invalidate_range(void* jit, uint64_t addr, uint64_t len);
 void od_jit_clear_cache(void* jit);
 void od_jit_clear_exclusive(void* jit);
 
+/* Bytes the arm64 backend's per-block bookkeeping holds in pages of its own
+ * (patch 0013's `PageBackedAllocator`), over every jit in the process -- the
+ * part of that bookkeeping the C heap's statistics no longer see. 0 on a host
+ * whose backend does not use it. For measurement only. */
+uint64_t od_page_backed_bytes(void);
+
+/* Pages of the arm64 backend's guest-range index that `InvalidateCacheRanges`
+ * has looked up, over every jit in the process (patch 0015). 0 on a host whose
+ * backend does not have the index. For measurement only. */
+uint64_t od_invalidation_page_probes(void);
+
+/* Guest ranges the arm64 backend's `InvalidateCacheRanges` has checked, over
+ * every jit in the process (patch 0016). 0 where the backend has no such index.
+ * For measurement only. */
+uint64_t od_invalidation_ranges_checked(void);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);
@@ -382,6 +413,13 @@ void od_jit_reset_stats(void* jit);
  * and it is only affordable if reading the counter is a load. Non-atomic, and
  * read on the jit's own thread, which is the only thread that writes it. */
 uint64_t od_jit_slow_path_total(void* jit);
+
+#if defined(__aarch64__)
+/* arm64 hosts only: the host return address the most recent `SVC` callback was entered with,
+ * i.e. an address inside this jit's code cache (0 before the first SVC). For measuring the code
+ * cache's protection, which nothing else can locate. */
+uint64_t od_jit_last_svc_return_address(void* jit);
+#endif
 
 #ifdef __cplusplus
 }  /* extern "C" */

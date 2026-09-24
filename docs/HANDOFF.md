@@ -922,7 +922,7 @@ guest thread died, a clean close (`SessionHistory "IB"`), gate passed. Log:
 
 **When a checkout changes vendored dynarmic C++, touch `crates/dynarmic-sys/vendor/PIN.txt`**
 before building. The build script watches only that file, so a worktree moved to a commit with a
-new patch otherwise links the OLD dynarmic. With 0003 that is the unsafe combination: the RSB left
+new patch otherwise links the OLD dynarmic. With 0018 that is the unsafe combination: the RSB left
 on in `INTERRUPTIBLE` with an unchecked handler. After building, run `the_stoppability_matrix`
 in that worktree: its `return` cells prove the patch is in.
 
@@ -931,7 +931,7 @@ Full record, merge notes and every figure: **`docs/ports/windows.md`**. In short
 * **Done and committed** (`ced3e1d`..`fa7e136`): `perf-world` reviewed and merged (4 fixes);
   `__vsprintf_chk` (`vsprintf-` 6/6); a death that hangs the close now ends at once as
   `REASON_CRASH_NATIVE` and the next launch of that directory runs (`crashclose-` 3/3, verified live
-  with `OMNI_INJECT_DEATH`); vendored dynarmic **patch 0002** (D32) -- a guest thread's fixed JIT cost
+  with `OMNI_INJECT_DEATH`); vendored dynarmic **patch 0017** (D32) -- a guest thread's fixed JIT cost
   on demand: landing commit 3,157 → 2,105 MiB, working set 2,528 → 1,884 MiB, 24.56 → 4.47 MiB per
   guest thread; `OMNI_IMPORT_CENSUS=off` for the census A/B. `inbound-` 10/10 (step 0).
 * **The sign-in now survives a restart** (the owner decided, 2026-09-24, that the runtime may store
@@ -952,7 +952,7 @@ Full record, merge notes and every figure: **`docs/ports/windows.md`**. In short
     wipes. Only ranges that were executable now invalidate: landing re-translation -75%.
   - `bae4b92`: busiest workers spent 3-8.5% of samples at the global exclusive monitor. D31 is now
     decided for value-compare (131 → 12.8 ns per guest atomic).
-  - Vendored **patch 0003** (D33): a return-stack-buffer hit checks the budget and the halt flag,
+  - Vendored **patch 0018** (D33): a return-stack-buffer hit checks the budget and the halt flag,
     so `INTERRUPTIBLE` keeps the RSB (`0xFFF9` → `0xFFFB`): 132.0 → 24.1 ns per call and return at
     262,144 blocks. Matrix 27 → 39 cells; both checks proven by hand mutation; upstream suite
     unchanged.

@@ -5,7 +5,7 @@
 //! pass just as happily if the executable view were not executable or if the pages were silently
 //! privatised — and privatisation is exactly the failure mode D12 and Task 1 both warn about, since
 //! it produces no error anywhere.
-#![cfg(target_os = "windows")]
+#![cfg(any(target_os = "windows", target_os = "macos"))]
 
 mod common;
 
@@ -164,11 +164,23 @@ fn the_executable_view_is_not_writable() {
         "the child wrote through the executable view without faulting: the arena's executable view \
          is writable, which breaks the W^X guarantee"
     );
+    #[cfg(target_os = "windows")]
     assert_eq!(
         code,
         Some(ACCESS_VIOLATION),
         "expected the child to die of STATUS_ACCESS_VIOLATION ({ACCESS_VIOLATION:#x}), got {code:?}"
     );
+    // On macOS a store to a page with no write permission is a signal, not an exit code: SIGBUS
+    // (10) for a present page whose protection forbids it, SIGSEGV (11) for one that is absent.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let _ = ACCESS_VIOLATION;
+        assert!(
+            matches!(status.signal(), Some(10 | 11)),
+            "expected the child to die of SIGBUS or SIGSEGV, got {status:?}"
+        );
+    }
 }
 
 #[test]

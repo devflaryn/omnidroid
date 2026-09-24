@@ -60,6 +60,16 @@ pub enum WebViewError {
         code: i32,
     },
 
+    /// macOS: the web view needs the AppKit thread the window seam hands the main thread to, and
+    /// there is none (`why` is the window seam's own account of it).
+    #[error("`{operation}`: no AppKit main thread for a web view: {why}")]
+    MainThreadUnavailable {
+        /// The operation refused.
+        operation: &'static str,
+        /// Why the main thread is not serving AppKit.
+        why: &'static str,
+    },
+
     /// The web view's window has closed — by [`close`](super::WebView::close), or by the person
     /// closing it — so there is nothing left to send the command to.
     #[error("`{operation}`: the web view's window has closed")]

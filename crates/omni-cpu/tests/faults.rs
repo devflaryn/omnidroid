@@ -1,6 +1,6 @@
 //! Guest faults: a typed exit instead of a host crash, and Omnidroid owning guest paging (D10).
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

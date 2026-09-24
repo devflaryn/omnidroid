@@ -16,7 +16,7 @@
 //! It is a separate target rather than a case in `tests/bionic.rs` so that it cannot share a
 //! process with 112 other tests that map and unmap guest memory.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 mod harness;
 

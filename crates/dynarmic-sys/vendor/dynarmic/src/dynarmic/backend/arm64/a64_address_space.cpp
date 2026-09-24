@@ -5,6 +5,8 @@
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
 
+#include <limits>
+
 #include "dynarmic/backend/arm64/a64_jitstate.h"
 #include "dynarmic/backend/arm64/abi.h"
 #include "dynarmic/backend/arm64/devirtualize.h"
@@ -144,6 +146,153 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
     code.LDR(X0, l_this);
     code.LDR(Xscratch0, l_addr);
     code.BR(Xscratch0);
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
+// Omnidroid patch 0007: the fallbacks of the inline exclusive accesses (emit_arm64_memory.cpp), in the
+// Wrapped* calling convention -- address in Xscratch0, value in Xscratch1 (Q0 for 128 bits), result in
+// Xscratch0 (Q0), every other caller-saved register preserved -- and through the global monitor
+// exactly as the Exclusive* trampolines above, so a fallback is the callback-only path, nothing less.
+// Values cross as u64 and are narrowed in C++: Apple's arm64 ABI has the *caller* extend sub-32-bit
+// arguments, which generated code does not promise.
+template<auto callback, typename T>
+static void* EmitWrappedExclusiveReadCallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr) -> u64 {
+        return conf.global_monitor->ReadAndMark<T>(conf.processor_id, vaddr, [&]() -> T {
+            return (conf.callbacks->*callback)(vaddr);
+        });
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.MOV(Xscratch0, X0);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
+static void* EmitWrappedExclusiveRead128CallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr) -> Vector {
+        return conf.global_monitor->ReadAndMark<Vector>(conf.processor_id, vaddr, [&]() -> Vector {
+            return conf.callbacks->MemoryRead128(vaddr);
+        });
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Q0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.FMOV(D0, X0);
+    code.FMOV(V0.D()[1], X1);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
+template<auto callback, typename T>
+static void* EmitWrappedExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr, u64 value) -> u64 {
+        return conf.global_monitor->DoExclusiveOperation<T>(conf.processor_id, vaddr,
+                                                            [&](T expected) -> bool {
+                                                                return (conf.callbacks->*callback)(vaddr, static_cast<T>(value), expected);
+                                                            })
+                 ? 0
+                 : 1;
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.MOV(X2, Xscratch1);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.MOV(Xscratch0, X0);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
+
+    code.align(8);
+    code.l(l_this);
+    code.dx(mcl::bit_cast<u64>(&conf));
+    code.l(l_addr);
+    code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+
+    return target;
+}
+
+static void* EmitWrappedExclusiveWrite128CallTrampoline(oaknut::CodeGenerator& code, const A64::UserConfig& conf) {
+    using namespace oaknut::util;
+
+    oaknut::Label l_addr, l_this;
+
+    auto fn = [](const A64::UserConfig& conf, A64::VAddr vaddr, u64 value_lo, u64 value_hi) -> u64 {
+        const Vector value{value_lo, value_hi};
+        return conf.global_monitor->DoExclusiveOperation<Vector>(conf.processor_id, vaddr,
+                                                                 [&](Vector expected) -> bool {
+                                                                     return conf.callbacks->MemoryWriteExclusive128(vaddr, value, expected);
+                                                                 })
+                 ? 0
+                 : 1;
+    };
+
+    constexpr u64 save_regs = ABI_CALLER_SAVE & ~ToRegList(Xscratch0);
+
+    void* target = code.xptr<void*>();
+    ABI_PushRegisters(code, save_regs, 0);
+    code.LDR(X0, l_this);
+    code.MOV(X1, Xscratch0);
+    code.FMOV(X2, D0);
+    code.FMOV(X3, V0.D()[1]);
+    code.LDR(Xscratch0, l_addr);
+    code.BLR(Xscratch0);
+    code.MOV(Xscratch0, X0);
+    ABI_PopRegisters(code, save_regs, 0);
+    code.RET();
 
     code.align(8);
     code.l(l_this);
@@ -351,7 +500,114 @@ IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
 }
 
 void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    // Omnidroid patch 0011: every location registered with a range that intersects one of
+    // `ranges` -- what `BlockRangeInformation::InvalidateRanges` returned.
+    tsl::robin_set<IR::LocationDescriptor> erase_locations;
+    for (const auto& interval : ranges) {
+        const u64 first = boost::icl::first(interval);
+        const u64 last = boost::icl::last(interval);
+        const auto consider = [&](u32 index) {
+            invalidation_ranges_checked.fetch_add(1, std::memory_order_relaxed);
+            GuestRange& range = guest_ranges[index];
+            if (!range.dead && range.first <= last && first <= range.last) {
+                erase_locations.insert(range.location);
+                range.dead = true;  // patch 0016
+            }
+        };
+        // Patch 0016: consider every index of one page's list, then drop the dead ones from it.
+        // Answers whether the list is now empty, so that the caller can drop the page.
+        const auto consider_list = [&](std::vector<u32>& indices) {
+            for (const u32 index : indices) {
+                consider(index);
+            }
+            std::erase_if(indices, [&](u32 index) { return guest_ranges[index].dead; });
+            return indices.empty();
+        };
+
+        for (const u32 index : wide_guest_ranges) {
+            consider(index);
+        }
+        std::erase_if(wide_guest_ranges, [&](u32 index) { return guest_ranges[index].dead; });
+
+        const u64 first_page = first >> guest_page_bits;
+        const u64 last_page = last >> guest_page_bits;
+        // Omnidroid patch 0015: only the chunks that hold translated pages are walked, page by page;
+        // `probes` counts the page lookups for `od_invalidation_page_probes`.
+        u64 probes = 0;
+        const auto walk_pages = [&](u64 from_page, u64 to_page) {
+            for (u64 page = from_page;; ++page) {
+                ++probes;
+                if (auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
+                    if (consider_list(iter.value())) {
+                        guest_range_pages.erase(iter);
+                    }
+                }
+                if (page == to_page) {
+                    break;
+                }
+            }
+        };
+        constexpr unsigned chunk_shift = guest_chunk_bits - guest_page_bits;
+        const auto walk_chunk = [&](u64 chunk) {
+            const u64 chunk_first = chunk << chunk_shift;
+            const u64 chunk_last = chunk_first + ((u64{1} << chunk_shift) - 1);
+            walk_pages(std::max(first_page, chunk_first), std::min(last_page, chunk_last));
+        };
+        const u64 first_chunk = first_page >> chunk_shift;
+        const u64 last_chunk = last_page >> chunk_shift;
+        if (last_page - first_page >= guest_range_pages.size()) {
+            // More pages asked about than have anything on them: walk what there is.
+            for (auto iter = guest_range_pages.begin(); iter != guest_range_pages.end();) {
+                ++probes;
+                const u64 page = iter->first;
+                if (page >= first_page && page <= last_page && consider_list(iter.value())) {
+                    iter = guest_range_pages.erase(iter);
+                } else {
+                    ++iter;
+                }
+            }
+        } else if (last_chunk - first_chunk >= guest_range_chunks.size()) {
+            for (const u64 chunk : guest_range_chunks) {
+                if (chunk >= first_chunk && chunk <= last_chunk) {
+                    walk_chunk(chunk);
+                }
+            }
+        } else {
+            for (u64 chunk = first_chunk;; ++chunk) {
+                if (guest_range_chunks.contains(chunk)) {
+                    walk_chunk(chunk);
+                }
+                if (chunk == last_chunk) {
+                    break;
+                }
+            }
+        }
+        invalidation_page_probes.fetch_add(probes, std::memory_order_relaxed);
+    }
+    InvalidateBasicBlocks(erase_locations);
+
+    // Omnidroid patch 0012: an invalidation that has left no block standing is a clear. This runs
+    // only from `Jit::Impl::PerformRequestedCacheInvalidation`, before or after `RunCode` -- never
+    // with generated code on the stack -- so no invalidated block can still be executing (the
+    // return stack buffer is rebuilt on every entry), and nothing links to one: every link to an
+    // invalidated location was pointed back at the dispatcher. What the invalidated blocks still
+    // hold -- their records, and their code in the cache -- can never be used again, which is
+    // what `ClearCache` gives back. The pin kept both until the cache filled.
+    if (block_entries.empty()) {
+        ClearCache();
+    }
+}
+
+void A64AddressSpace::ClearCache() {
+    AddressSpace::ClearCache();
+    // Omnidroid patch 0011: the pin's `A64AddressSpace` never cleared `block_ranges`. Every block
+    // is gone, so nothing registered before the clear can name a block that exists: a location
+    // translated again afterwards registers the range of its new translation, which is the range
+    // its code now depends on.
+    decltype(guest_ranges){}.swap(guest_ranges);
+    guest_range_pages = {};
+    std::vector<u32>{}.swap(wide_guest_ranges);
+    decltype(guest_range_chunks){}.swap(guest_range_chunks);  // patch 0015
 }
 
 void A64AddressSpace::EmitPrelude() {
@@ -397,6 +653,19 @@ void A64AddressSpace::EmitPrelude() {
     prelude_info.get_cntpct = EmitCallTrampoline<&A64::UserCallbacks::GetCNTPCT>(code, conf.callbacks);
     prelude_info.add_ticks = EmitCallTrampoline<&A64::UserCallbacks::AddTicks>(code, conf.callbacks);
     prelude_info.get_ticks_remaining = EmitCallTrampoline<&A64::UserCallbacks::GetTicksRemaining>(code, conf.callbacks);
+    prelude_info.interpreter_fallback = EmitCallTrampoline<&A64::UserCallbacks::InterpreterFallback>(code, conf.callbacks);
+    if (conf.global_monitor) {
+        prelude_info.wrapped_exclusive_read_memory_8 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead8, u8>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_16 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead16, u16>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_32 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead32, u32>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_64 = EmitWrappedExclusiveReadCallTrampoline<&A64::UserCallbacks::MemoryRead64, u64>(code, conf);
+        prelude_info.wrapped_exclusive_read_memory_128 = EmitWrappedExclusiveRead128CallTrampoline(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_8 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive8, u8>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_16 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive16, u16>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_32 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive32, u32>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_64 = EmitWrappedExclusiveWriteCallTrampoline<&A64::UserCallbacks::MemoryWriteExclusive64, u64>(code, conf);
+        prelude_info.wrapped_exclusive_write_memory_128 = EmitWrappedExclusiveWrite128CallTrampoline(code, conf);
+    }
 
     oaknut::Label return_from_run_code, l_return_to_dispatcher;
 
@@ -538,7 +807,12 @@ void A64AddressSpace::EmitPrelude() {
 
     prelude_info.end_of_prelude = code.offset();
 
-    mem.invalidate_all();
+    // Omnidroid patch 0009: invalidate the prelude that was written, not the whole code cache.
+    // `invalidate_all` runs the cache-maintenance loop over every page of the cache, and on macOS
+    // (`sys_icache_invalidate`) that faults each untouched page in: a 32 MiB `MAP_JIT` cache went
+    // from 0.00 to 32.03 MiB of phys_footprint from this one call (measured), per jit, per guest
+    // thread. Everything emitted later is invalidated block by block (`AddressSpace::Emit`).
+    mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);
     ProtectCodeMemory();
 }
 
@@ -569,6 +843,10 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .fastmem_address_space_bits = conf.fastmem_address_space_bits,
         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
 
+        .fastmem_exclusive_access = conf.fastmem_exclusive_access,
+        .global_monitor = conf.global_monitor,
+        .processor_id = conf.processor_id,
+
         .wall_clock_cntpct = conf.wall_clock_cntpct,
         .enable_cycle_counting = conf.enable_cycle_counting,
 
@@ -593,8 +871,30 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
 void A64AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
     const A64::LocationDescriptor descriptor{block.Location()};
     const A64::LocationDescriptor end_location{block.EndLocation()};
-    const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
-    block_ranges.AddRange(range, descriptor);
+    // Omnidroid patch 0011: the pin's `closed(descriptor.PC(), end_location.PC() - 1)`, which is
+    // empty -- and was never returned -- when the block covers no bytes.
+    const u64 first = descriptor.PC();
+    const u64 last = end_location.PC() - 1;
+    if (last < first) {
+        return;
+    }
+    ASSERT(guest_ranges.size() < std::numeric_limits<u32>::max());
+    const u32 index = static_cast<u32>(guest_ranges.size());
+    guest_ranges.push_back(GuestRange{descriptor, first, last});
+
+    const u64 first_page = first >> guest_page_bits;
+    const u64 last_page = last >> guest_page_bits;
+    if (last_page - first_page >= max_indexed_pages) {
+        wide_guest_ranges.push_back(index);
+        return;
+    }
+    for (u64 page = first_page;; ++page) {
+        guest_range_pages[page].push_back(index);
+        guest_range_chunks.insert(page >> (guest_chunk_bits - guest_page_bits));  // patch 0015
+        if (page == last_page) {
+            break;
+        }
+    }
 }
 
 }  // namespace Dynarmic::Backend::Arm64

@@ -90,6 +90,31 @@ pub enum WindowError {
         /// The index of the first NUL in the title, in `char` positions.
         at: usize,
     },
+
+    /// **There is no thread AppKit can run on.** macOS only: AppKit is main-thread-only, and the
+    /// backend hands the main thread to it before `main` runs -- unless it declined to, for the
+    /// reason `why` names (see `window/macos/main_thread.rs`). Refused rather than attempted,
+    /// because a window created off the main thread throws and one waiting for an unserved main
+    /// thread would hang.
+    #[error("`{operation}`: no window can be created because the main thread is not serving AppKit: {why}")]
+    MainThreadUnavailable {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// Why the main thread was not handed to AppKit.
+        why: &'static str,
+    },
+
+    /// An AppKit or CoreGraphics call refused. macOS only; `detail` is what the host said
+    /// (a `CGError`, or what was missing), since these APIs have no single error code space.
+    #[error("`{operation}`: {api} failed: {detail}")]
+    AppKit {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The host entry point that failed.
+        api: &'static str,
+        /// What went wrong, as the host reported it.
+        detail: String,
+    },
 }
 
 impl WindowError {

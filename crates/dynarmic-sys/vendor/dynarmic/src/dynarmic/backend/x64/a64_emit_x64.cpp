@@ -199,7 +199,7 @@ void A64EmitX64::GenTerminalHandlers() {
         code.jne(code.GetReturnFromRunCodeAddress());
     }
     code.mov(rax, qword[r15 + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
-    // Omnidroid patch 0003: a return-stack-buffer hit checks what `ReturnFromRunCode` checks --
+    // Omnidroid patch 0018: a return-stack-buffer hit checks what `ReturnFromRunCode` checks --
     // the cycle budget when cycle counting is on, and the halt flag -- and on either leaves
     // through it (the guest PC is already stored), so a guest loop through `RET` can be stopped
     // and `ReturnStackBuffer` can stay on.
