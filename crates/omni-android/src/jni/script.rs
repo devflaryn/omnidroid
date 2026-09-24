@@ -60,6 +60,11 @@ pub enum ScriptArg {
     /// `CookieManager.getCookie(url)` against the app's cookie store -- [`super::Jni::cookie_header`]
     /// -- as a `java.lang.String`: `""` when it holds none, which is what `bh.x0.S0` passes then.
     CookiesFor(&'static str),
+    /// The cold-start deep-link URL, as `ActivityProtocolLaunch.onCreate` hands
+    /// `intent.getDataString()` to the two `maybeHandleColdStartProtocolLaunch` natives:
+    /// Java `null` on a normal launch (the app goes Home), or the join URL built from the
+    /// placeId in `OMNI_JOIN_PLACE` (or a full URL in `OMNI_DEEPLINK`) when one is set.
+    DeepLinkUrl,
 }
 
 /// One downcall in the scripted sequence.
@@ -293,6 +298,34 @@ pub static SEQUENCE: &[Downcall] = &[
         descriptor: "(Landroid/content/Context;)V",
         java_before: &[],
         args: &[ScriptArg::Object("android/app/Application")],
+    },
+    // ---- step 7b: ActivityProtocolLaunch.onCreate (cold, root) -- hand the deep link to native.
+    //
+    // On a device this activity runs after RobloxApplication.onCreate and before ActivitySplash
+    // (step 8). Its cold/root branch calls, in order, JNIBaseUrlProtocol then JNIWebLoginProtocol
+    // `maybeHandleColdStartProtocolLaunch(intent.getDataString())`. That string is `null` on a
+    // normal launcher start and the deep-link URI when launched from one; the natives parse it and
+    // set the state `NativeGLInterface.isColdStartDeeplinkToGame()` reads later to join a place
+    // rather than go Home. Both take only a String -- no Activity/Intent/Uri object is needed. The
+    // boolean result only tells the device whether to restart prefetch; the placeId lives in native
+    // state regardless, so `run` records the result and moves on. See `ScriptArg::DeepLinkUrl`.
+    Downcall {
+        step: 7,
+        caller: "com/roblox/client/ActivityProtocolLaunch.onCreate",
+        class: "com/roblox/universalapp/linking/JNIBaseUrlProtocol",
+        member: "maybeHandleColdStartProtocolLaunch",
+        descriptor: "(Ljava/lang/String;)Z",
+        java_before: &[],
+        args: &[ScriptArg::DeepLinkUrl],
+    },
+    Downcall {
+        step: 7,
+        caller: "com/roblox/client/ActivityProtocolLaunch.onCreate",
+        class: "com/roblox/universalapp/linking/JNIWebLoginProtocol",
+        member: "maybeHandleColdStartProtocolLaunch",
+        descriptor: "(Ljava/lang/String;)Z",
+        java_before: &[],
+        args: &[ScriptArg::DeepLinkUrl],
     },
     // ---- step 8: ActivitySplash.onCreate --------------------------------------------------
     Downcall {
@@ -759,7 +792,31 @@ pub fn guest_argument(jni: &Jni, argument: &ScriptArg) -> AbiResult<GuestArg> {
         ScriptArg::Long(value) => GuestArg::Int(*value as u64),
         ScriptArg::PreviousExitReasons => GuestArg::Int(jni.previous_exit_reasons()?),
         ScriptArg::CookiesFor(url) => GuestArg::Int(jni.new_string(&jni.cookie_header(url))?),
+        ScriptArg::DeepLinkUrl => match join_deeplink() {
+            Some(url) => GuestArg::Int(jni.new_string(&url)?),
+            None => GuestArg::Int(0), // Java null: a normal launch, as a device passes on cold start
+        },
     })
+}
+
+/// The cold-start deep-link URL to hand `maybeHandleColdStartProtocolLaunch`, or `None` (Java
+/// `null`) for a normal launch. `OMNI_DEEPLINK` overrides the whole URL; otherwise a non-empty
+/// `OMNI_JOIN_PLACE` builds the app's own canonical join URL -- the form `PinShortcutHandler`
+/// emits. Read at run time, so one gate binary serves both Home and join.
+pub fn join_deeplink() -> Option<String> {
+    if let Ok(url) = std::env::var("OMNI_DEEPLINK") {
+        let url = url.trim();
+        if !url.is_empty() {
+            return Some(url.to_string());
+        }
+    }
+    match std::env::var("OMNI_JOIN_PLACE") {
+        Ok(place) if !place.trim().is_empty() => Some(format!(
+            "roblox://experiences/start?placeId={}&joinAttemptOrigin=PinnedShortcut",
+            place.trim()
+        )),
+        _ => None,
+    }
 }
 
 /// A process lifecycle event, as androidx's `ProcessLifecycleOwner` dispatches it to the
@@ -1000,7 +1057,8 @@ pub fn perform(jni: &Jni, statements: &[JavaStatement]) -> AbiResult<()> {
             | ScriptArg::AppVersion
             | ScriptArg::Long(_)
             | ScriptArg::PreviousExitReasons
-            | ScriptArg::CookiesFor(_) => {
+            | ScriptArg::CookiesFor(_)
+            | ScriptArg::DeepLinkUrl => {
                 return Err(named(AbiError::JniRefused {
                     function: "script::perform".to_string(),
                     address: 0,
@@ -1063,14 +1121,14 @@ mod tests {
     #[test]
     fn the_sequence_has_the_shape_section_8_states() {
         let count = |step: u8| SEQUENCE.iter().filter(|d| d.step == step).count();
-        assert_eq!(count(7), 2, "JNIBaseUrlProtocol.init and JNIWebLoginProtocol.init");
+        assert_eq!(count(7), 4, "the two protocol init calls plus the two cold-start deep-link calls");
         assert_eq!(count(8), 1, "NativeReportingInterface.initAppShellReporter");
         assert_eq!(count(9), 12, "§8 step 9: the 11 `(String…)V` downcalls and `nativeSetMultipleCookies`");
         assert_eq!(count(10), 2, "nativeSetAssetPath and nativePreloadFlagOverrides");
         assert_eq!(count(11), 5, "nativeSetDeviceInfo, External, Preferences, the cookie handler, ExitReasons");
         // Step 12 is not here: the engine drops it before step 13 (see `ENGINE_SETTINGS`).
         assert_eq!(count(12), 0, "nativeAppBridgeSetInitParams waits for the engine");
-        assert_eq!(SEQUENCE.len(), 22);
+        assert_eq!(SEQUENCE.len(), 24);
         assert_eq!(ENGINE_SETTINGS.len(), 1);
         assert_eq!(ENGINE_SETTINGS[0].member, "nativeAppBridgeSetInitParams");
         // In order: a script that ran step 12 before step 9 would be a different script.

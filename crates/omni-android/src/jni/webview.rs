@@ -88,6 +88,9 @@ pub const MEMSTORAGE_CLASS: &str = "com/roblox/engine/jni/memstorage/MemStorage"
 /// What `MemStorage.bind` returns, constructed by the engine with `<init>(J)V`.
 pub const MEMSTORAGE_CONNECTION_CLASS: &str = "com/roblox/engine/jni/memstorage/Connection";
 
+/// The linking-protocol class whose static getters name the "detect URL" MessageBus channel.
+pub const LINKING_PROTOCOL_CLASS: &str = "com/roblox/universalapp/linking/JNILinkingProtocol";
+
 /// `fh.c$a`, bound to `BrowserService.OpenBrowserWindow`.
 const OPEN_BROWSER_CALLBACK: &str = "fh/c$a";
 /// `fh.c$b`, bound to `BrowserService.CloseBrowserWindow`.
@@ -1117,6 +1120,87 @@ impl Caller<'_> {
 
 /// The JSON the Java side reads and writes, as Android's `org.json` does it -- only as far as
 /// these messages need.
+/// Publish the cold-start deep-link URL to the engine, the way the app's own `qm.e.e` does: build
+/// `{ getUrlKey(): url }` and `MessageBus.publishRaw(getDetectURLId(), json)`. The engine parses
+/// the placeId out of `url` natively and sets the state
+/// `NativeGLInterface.isColdStartDeeplinkToGame()` reads, so a cold start joins that place instead
+/// of going Home. `url` is the app's own scheme, e.g.
+/// `roblox://experiences/start?placeId=<N>&joinAttemptOrigin=PinnedShortcut`.
+///
+/// This is the join analogue of the `WEBVIEW PROBE` publish: the same `publishRaw` native and a
+/// fresh `MessageBus` wrapper, which reaches the engine's one global bus. The two step-7
+/// `maybeHandleColdStartProtocolLaunch` calls are base-URL/web-login only and do NOT drive a join;
+/// this publish is what does.
+///
+/// # Errors
+///
+/// A getter or `publishRaw` that does not resolve, returns null, or leaves an exception pending.
+pub fn publish_detect_url(
+    jni: &Jni,
+    boundary: &Arc<Boundary>,
+    cpu: &mut dyn GuestCpu,
+    thread: usize,
+    resolve: &dyn Fn(&str) -> Option<GuestAddr>,
+    url: &str,
+) -> AbiResult<()> {
+    let find = |symbol: &str| {
+        resolve(symbol).ok_or_else(|| AbiError::JniRefused {
+            function: symbol.to_string(),
+            address: 0,
+            detail: format!(
+                "`{symbol}` is exported by libroblox.so on a device and nothing resolved it here, \
+                 so the cold-start deep link cannot be delivered"
+            ),
+        })
+    };
+    // MessageBus, and the linking-protocol class the two getters are static on.
+    declare_classes(jni)?;
+    jni.with_registry(|registry| {
+        if registry.find(LINKING_PROTOCOL_CLASS).is_none() {
+            registry.declare(&ClassSpec {
+                name: LINKING_PROTOCOL_CLASS,
+                tier: Tier::Support,
+                methods: &[],
+                fields: &[],
+            })?;
+        }
+        Ok::<(), AbiError>(())
+    })?;
+    let caller = Caller { jni, boundary, thread };
+    let linking_class = jni.class_reference(LINKING_PROTOCOL_CLASS)?;
+    let getter = |cpu: &mut dyn GuestCpu, name: &str| -> AbiResult<String> {
+        let symbol = format!("Java_com_roblox_universalapp_linking_JNILinkingProtocol_{name}");
+        let returned = caller.call(
+            cpu,
+            &format!("JNILinkingProtocol.{name}"),
+            find(&symbol)?,
+            vec![GuestArg::Pointer(jni.env_for(thread)), GuestArg::Int(linking_class)],
+        )?;
+        caller.string(returned, &format!("JNILinkingProtocol.{name}"))
+    };
+    let detect_url_id = getter(cpu, "getDetectURLId")?;
+    let url_key = getter(cpu, "getUrlKey")?;
+    // The JSON `qm.e.e` builds: { <urlKey>: <url> } (no `dlicSeed`; that field starts null).
+    let payload = format!("{{{}:{}}}", json::quote(&url_key), json::quote(url));
+    let bus = jni.promote_to_global(jni.new_object(MESSAGE_BUS_CLASS)?)?;
+    let publish = find(symbols::PUBLISH_RAW)?;
+    caller.with_strings(
+        cpu,
+        "MessageBus.publishRaw (cold-start detectURL)",
+        publish,
+        &[&detect_url_id, &payload],
+        |strings| {
+            vec![
+                GuestArg::Pointer(jni.env_for(thread)),
+                GuestArg::Int(bus),
+                GuestArg::Int(strings[0]),
+                GuestArg::Int(strings[1]),
+            ]
+        },
+    )?;
+    Ok(())
+}
+
 pub mod json {
     /// A parsed value. Members keep their order; a repeated key's **last** value wins, as
     /// `JSONObject.put` overwrites.

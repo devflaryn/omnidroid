@@ -4,6 +4,7 @@
 //! cargo run --release -p omnidroid -- play                      # the newest APK in the repository root
 //! cargo run --release -p omnidroid -- play --apk Roblox-2.739.691.apk
 //! cargo run --release -p omnidroid -- play --minutes 90 --fresh --phone
+//! cargo run --release -p omnidroid -- play --place 8737899170     # sign-in kept, then join the place
 //! cargo run --release -p omnidroid -- which [--apk <path>]      # say which APK would run, and exit
 //! ```
 //!
@@ -22,6 +23,10 @@
 //!   Ctrl+C, a crash -- is judged a crash by the engine at the next launch; after one, run once
 //!   with `--fresh`.
 //! * **Keyboard and mouse are this computer's** unless `--phone`, which makes the mouse a finger.
+//! * **`--place <id>` joins that place** once the app's own saved sign-in has reached Home
+//!   (`OMNI_JOIN_PLACE`, `--join-delay` seconds in, default 20): the gate calls
+//!   `nativeAppBridgeV2StartGameWithParam` as the app's Play button does. It needs a signed-in data
+//!   directory -- with `--fresh` there is no session to join with.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -32,10 +37,13 @@ const SESSION_TEST: &str = "initialize_native_code_returns_a_native_code_and_the
 const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 
 const USAGE: &str = "\
-usage: omnidroid play  [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
+usage: omnidroid play  [--apk <path>] [--place <id>] [--join-delay <s>] [--minutes <n>]
+                       [--fresh] [--phone] [--data-dir <dir>]
        omnidroid which [--apk <path>]
 
   --apk <path>      the APK to run (else OMNI_APK, else the newest *.apk in the repository root)
+  --place <id>      join this place once the saved sign-in reaches Home (OMNI_JOIN_PLACE)
+  --join-delay <s>  seconds after start before joining (default 20; OMNI_JOIN_DELAY)
   --minutes <n>     end the session after n minutes (default: when the window is closed)
   --fresh           a fresh install; the kept storage is left as it is
   --phone           a touch screen: the mouse is a finger, and there is no keyboard
@@ -43,6 +51,8 @@ usage: omnidroid play  [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--dat
 
 struct Options {
     apk: Option<PathBuf>,
+    place: Option<u64>,
+    join_delay: Option<f32>,
     minutes: u64,
     fresh: bool,
     phone: bool,
@@ -77,7 +87,15 @@ fn main() -> ExitCode {
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
-    let mut options = Options { apk: None, minutes: 0, fresh: false, phone: false, data_dir: None };
+    let mut options = Options {
+        apk: None,
+        place: None,
+        join_delay: None,
+        minutes: 0,
+        fresh: false,
+        phone: false,
+        data_dir: None,
+    };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -86,6 +104,24 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
                 let text = value("--minutes")?;
                 options.minutes =
                     text.parse().map_err(|_| format!("--minutes wants a whole number, not `{text}`"))?;
+            }
+            "--place" => {
+                let text = value("--place")?;
+                let place: u64 =
+                    text.parse().map_err(|_| format!("--place wants a numeric placeId, not `{text}`"))?;
+                if place == 0 {
+                    return Err("--place wants a placeId above 0".to_string());
+                }
+                options.place = Some(place);
+            }
+            "--join-delay" => {
+                let text = value("--join-delay")?;
+                options.join_delay = Some(
+                    text.parse()
+                        .ok()
+                        .filter(|s: &f32| s.is_finite() && *s >= 0.0)
+                        .ok_or_else(|| format!("--join-delay wants seconds, not `{text}`"))?,
+                );
             }
             "--fresh" => options.fresh = true,
             "--phone" => options.phone = true,
@@ -134,6 +170,13 @@ fn which(options: &Options) -> ExitCode {
 }
 
 fn play(options: &Options) -> ExitCode {
+    if options.place.is_some() && options.fresh {
+        eprintln!(
+            "omnidroid: --place joins with the saved sign-in, and --fresh starts without one; \
+             drop --fresh (sign in once first) to join"
+        );
+        return ExitCode::from(2);
+    }
     let apk = match chosen(options) {
         Ok(apk) => apk,
         Err(code) => return code,
@@ -182,6 +225,16 @@ fn play(options: &Options) -> ExitCode {
         }
         run.env("OMNI_DATA_DIR", &dir);
         println!("Omnidroid: {length}; the app's storage is kept in {}", dir.display());
+    }
+    if let Some(place) = options.place {
+        run.env("OMNI_JOIN_PLACE", place.to_string());
+        if let Some(delay) = options.join_delay {
+            run.env("OMNI_JOIN_DELAY", delay.to_string());
+        }
+        println!(
+            "Omnidroid: joining place {place} {}s after start, once the saved sign-in is at Home",
+            options.join_delay.unwrap_or(20.0)
+        );
     }
     println!("Sign in with Quick Sign-in (Sign In > Quick Sign-in), then enter the code on a signed-in device.");
     println!("End the session by closing the window.");

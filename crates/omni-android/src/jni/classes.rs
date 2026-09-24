@@ -1959,6 +1959,50 @@ pub static DECLARED: &[ClassSpec] = &[
             f("platformParams", "Lcom/roblox/engine/jni/model/PlatformParams;", Answer::Null),
         ],
     },
+    // ---- direct game join: what `nativeAppBridgeV2StartGameWithParam` reads (fi.h0.C) --------
+    //
+    // Mirrors `StartAppParams`: the engine reads the params through its accessor helper
+    // (GetObjectClass, GetMethodID, Call). `surface()`/`platformParams()` answer what the host
+    // stored; `placeId()`/`userId()`/`username()` answer the seeded fields; the rest are the
+    // empty/zero defaults a plain placeId join leaves. Seeded with `new_object_with`
+    // (placeId/userId/username) + `set_object_field` (surface/platformParams).
+    ClassSpec {
+        name: "com/roblox/engine/jni/autovalue/StartGameParams",
+        tier: Tier::One,
+        methods: &[
+            m("surface", "()Landroid/view/Surface;", Answer::Field("surface")),
+            m("platformParams", "()Lcom/roblox/engine/jni/model/PlatformParams;", Answer::Field("platformParams")),
+            m("deviceParams", "()Lcom/roblox/engine/jni/model/DeviceParams;", Answer::Null),
+            m("placeId", "()J", Answer::Field("placeId")),
+            m("userId", "()J", Answer::Field("userId")),
+            m("accessCode", "()Ljava/lang/String;", Answer::Text("")),
+            m("linkCode", "()Ljava/lang/String;", Answer::Text("")),
+            m("gameId", "()Ljava/lang/String;", Answer::Text("")),
+            m("isUnder13", "()Z", Answer::Bool(false)),
+            m("username", "()Ljava/lang/String;", Answer::Field("username")),
+            m("conversationId", "()J", Answer::Long(0)),
+            m("reservedServerAccessCode", "()Ljava/lang/String;", Answer::Text("")),
+            m("callId", "()Ljava/lang/String;", Answer::Text("")),
+            m("joinRequestType", "()I", Answer::Int(0)),
+            m("referralPage", "()Ljava/lang/String;", Answer::Text("")),
+            m("launchData", "()Ljava/lang/String;", Answer::Text("")),
+            m("joinAttemptId", "()Ljava/lang/String;", Answer::Text("")),
+            m("joinAttemptOrigin", "()Ljava/lang/String;", Answer::Text("PinnedShortcut")),
+            m("isoContext", "()Ljava/lang/String;", Answer::Text("")),
+            m("referredByPlayerId", "()J", Answer::Long(0)),
+            m("vrContext", "()Landroid/app/Activity;", Answer::Null),
+            m("gameJoinContext", "()Ljava/lang/String;", Answer::Text("")),
+            m("eventId", "()Ljava/lang/String;", Answer::Text("")),
+            m("gameIdToExclude", "()Ljava/lang/String;", Answer::Text("")),
+        ],
+        fields: &[
+            f("surface", "Landroid/view/Surface;", Answer::Null),
+            f("platformParams", "Lcom/roblox/engine/jni/model/PlatformParams;", Answer::Null),
+            f("placeId", "J", Answer::Long(0)),
+            f("userId", "J", Answer::Long(0)),
+            f("username", "Ljava/lang/String;", Answer::Null),
+        ],
+    },
     // ---- the platform dialog handler the settings success path registers -----------------
     //
     // **MEASURED, M6's gate, 2 of 2 runs**: the thread carrying the client-settings fetch logged

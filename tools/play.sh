@@ -5,6 +5,7 @@
 #
 #   tools/play.sh                          # the newest APK in the repository root
 #   tools/play.sh --apk ~/apks/Roblox-2.740.1.apk
+#   tools/play.sh --place 8737899170       # join that place once the saved sign-in is at Home
 #   tools/play.sh --minutes 90
 #   tools/play.sh --fresh                  # a fresh install
 #   tools/play.sh --phone                  # a touch screen instead: the mouse is a finger, no keyboard
@@ -18,7 +19,7 @@
 # from a fresh Mac"); Linux, docs/ports/linux.md.
 set -eu
 case "${1:-}" in
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
 esac
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 # No `cd`: an --apk or --data-dir given relative to where you are stays relative to it.

@@ -1255,7 +1255,11 @@ several fixes -- stage by hunk or strip-and-restore, as `0adabca` was):
 `cargo run --release -p omnidroid -- play [--apk <path>] [--minutes N] [--fresh] [--phone]`, or
 `tools/play.ps1` / `tools/play.sh`, which now forward to it. **The APK is chosen, not built in**:
 `--apk`, else `OMNI_APK`, else the newest `*.apk` in the repository root by `versionCode`
-(`omni_apk::choose_apk`; `omnidroid which` prints the choice). The version the engine is told is
+(`omni_apk::choose_apk`; `omnidroid which` prints the choice). `--place <id>` (`OMNI_JOIN_PLACE`,
+`--join-delay`/`OMNI_JOIN_DELAY`, default 20 s) joins a place once the saved sign-in is at Home, by
+calling `nativeAppBridgeV2StartGameWithParam` with the `StartGameParams` the app's Play button
+builds; it was uncommitted in `../omnidroid-play` until the merge and is plain JNI, so it is the
+same on every host. The version the engine is told is
 that APK's own `versionName`, read from its manifest (`Jni::set_app_version`) -- there is no
 `APP_VERSION` constant any more. The M5 gate follows the same choice. The golden-data tests
 (`omni-elf`, `omni-apk`, M3/M4) stay pinned to `Roblox-2.738.1397.apk` on purpose: they assert

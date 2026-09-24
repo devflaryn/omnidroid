@@ -3413,6 +3413,28 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // (events, time, longest) the touch seam spent delivering while the wait trace was on.
     let mut input_timing = (0u64, std::time::Duration::ZERO, std::time::Duration::ZERO);
     let settle = std::time::Instant::now();
+    // **OMNI_JOIN_PLACE: auto-join a place once the app is up.** After login reaches Home
+    // (authenticated), build the StartGameParams the app's own `fi.h0.C` builds and call
+    // `nativeAppBridgeV2StartGameWithParam` -- the direct game-start the "play" button uses.
+    // Fired once, OMNI_JOIN_DELAY seconds in (default 20). OMNI_USER_ID/OMNI_USERNAME name the
+    // signed-in player the params carry (the engine is already authenticated by the cookie).
+    let join_place: Option<i64> = std::env::var("OMNI_JOIN_PLACE")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&p| p > 0);
+    let join_user_id: i64 = std::env::var("OMNI_USER_ID")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let join_username: String = std::env::var("OMNI_USERNAME").unwrap_or_default();
+    let join_delay = std::env::var("OMNI_JOIN_DELAY")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(20.0);
+    let mut join_done = join_place.is_none();
+    if let Some(place) = join_place {
+        let _ = writeln!(std::io::stderr(), "JOIN: will start place {place} (user {join_user_id} {join_username:?}) at +{join_delay}s (OMNI_JOIN_PLACE)");
+    }
     // **A person closing the window ends the session**, and the app is then closed as a device
     // closes it (below), rather than the run carrying on into a window that is gone.
     let mut close_requested = false;
@@ -3464,6 +3486,62 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         let turn_started = std::time::Instant::now();
         turns += 1;
+        if !join_done && settle.elapsed().as_secs_f32() >= join_delay {
+            join_done = true;
+            if let Some(place) = join_place {
+                let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                let _jni = guest.jni.activate().expect("publish the JNI instance");
+                let _ndk = guest.ndk.activate();
+                let started = (|| -> Result<i64, String> {
+                    let params = guest
+                        .jni
+                        .new_object_with(
+                            "com/roblox/engine/jni/autovalue/StartGameParams",
+                            &[
+                                ("placeId", omni_android::jni::HostValue::Long(place)),
+                                ("userId", omni_android::jni::HostValue::Long(join_user_id)),
+                                (
+                                    "username",
+                                    omni_android::jni::HostValue::Text(
+                                        if join_username.is_empty() { None } else { Some(join_username.clone()) },
+                                    ),
+                                ),
+                            ],
+                        )
+                        .map_err(|e| format!("StartGameParams: {e}"))?;
+                    let platform = guest
+                        .jni
+                        .new_object("com/roblox/engine/jni/model/PlatformParams")
+                        .map_err(|e| format!("PlatformParams: {e}"))?;
+                    guest.jni.set_object_field(params, "surface", surface).map_err(|e| format!("set surface: {e}"))?;
+                    guest.jni.set_object_field(params, "platformParams", platform).map_err(|e| format!("set platformParams: {e}"))?;
+                    let sym = "Java_com_roblox_engine_jni_NativeGLInterface_nativeAppBridgeV2StartGameWithParam";
+                    let target = guest.exports.get(sym).copied().ok_or_else(|| format!("{sym} not exported"))?;
+                    let cls = guest
+                        .jni
+                        .class_reference("com/roblox/engine/jni/NativeGLInterface")
+                        .map_err(|e| format!("NativeGLInterface class: {e}"))?;
+                    let args = vec![
+                        GuestArg::Pointer(guest.jni.env_for(0)),
+                        GuestArg::Int(cls),
+                        GuestArg::Int(params),
+                    ];
+                    let returned = guest
+                        .boundary
+                        .call_guest(&mut cpu, "nativeAppBridgeV2StartGameWithParam", target, &args, LIFECYCLE_BUDGET)
+                        .map_err(|e| format!("call: {e}"))?;
+                    Ok(returned.x0 as i64)
+                })();
+                match started {
+                    Ok(code) => {
+                        let _ = writeln!(std::io::stderr(), "JOIN: nativeAppBridgeV2StartGameWithParam(place={place}) returned {code} at +{:.1}s", settle.elapsed().as_secs_f32());
+                    }
+                    Err(error) => {
+                        let _ = writeln!(std::io::stderr(), "JOIN: start failed: {error}");
+                    }
+                }
+            }
+        }
         if let Some((at, started @ None)) = wait_trace.as_mut() {
             if settle.elapsed().as_secs_f32() >= *at {
                 omni_android::waits::enable();
