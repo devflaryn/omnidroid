@@ -403,12 +403,25 @@ fn measure_the_initializer_run() {
         Ok("dynarmic") => false,
         other => panic!("set OMNI_INIT_BACKEND=native or dynarmic (got {other:?})"),
     };
+    // `phys_footprint` on this host: what the kernel charges the process (dirty private,
+    // compressed, swapped). Read around the load and around the run.
+    let footprint = || omni_platform::vm::process_commit_charge().expect("phys_footprint") as f64 / 1048576.0;
+    let at_start = footprint();
     let guest = Guest::load(native);
     guest.boundary.start_census();
     let mut cpu = guest.thread();
+    let loaded = footprint();
     let run = run_initializers(&guest, &mut *cpu);
     assert!(run.stopped.is_none(), "{}", run.stopped.unwrap_or_default());
     assert_eq!(run.completed.len(), INITIALIZERS);
+    let ran = footprint();
+    eprintln!(
+        "\nFOOTPRINT {}: load + first context {:+.1} MiB, the run {:+.1} MiB, total {:.1} MiB",
+        if native { "native" } else { "dynarmic" },
+        loaded - at_start,
+        ran - loaded,
+        ran
+    );
     let main_thread = guest.boundary.threads().iter().map(|t| t.crossings).max().unwrap_or(0);
     eprintln!(
         "\nINITIALIZERS {}: {:.1} ms, {} guest instructions counted, {} crossings in all ({} on the busiest thread), {} on the exit path",
