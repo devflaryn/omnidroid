@@ -753,11 +753,26 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
         MAX_THREAD_COMMIT_BYTES as f64 / 1048576.0
     );
     // And a floor, so the ceiling cannot be met by a measurement that measured nothing: creating
-    // eight jits has to move the counter. On macOS the counter is `phys_footprint`, which charges a
-    // page when it is first touched rather than when it is committed, and since patch 0009 a new
-    // jit touches its code cache only where it writes the prelude: the floor there is that one
-    // host page per jit (measured 0.027 and 0.029 MiB/jit in two runs of n = 8, M1), not the
-    // megabyte a commit-charge host moves.
+    // eight jits has to move the counter.
+    //
+    // On macOS the counter is `phys_footprint`, charged when a page is touched, and a new jit
+    // touches little: dynarmic-sys patch 0009 stopped the prelude from invalidating -- and so
+    // faulting in -- the whole code cache. MEASURED there: 0.027 and 0.029 MiB per thread at
+    // creation (two runs, n = 8 each). So on macOS the floor is the one host page a jit writes its
+    // prelude into, and the instrument is shown seeing 16 MiB being touched, so that a floor met
+    // is not a counter that sees nothing.
+    #[cfg(target_os = "macos")]
+    {
+        let before = omni_mem::process_commit_charge().expect("commit charge");
+        let touched = vec![1u8; 16 << 20];
+        std::hint::black_box(&touched);
+        let grew = omni_mem::process_commit_charge().expect("commit charge").saturating_sub(before);
+        assert!(
+            grew >= 15 << 20,
+            "touching 16 MiB moved the commit charge by {grew} bytes -- the measurement is not \
+             measuring what it claims"
+        );
+    }
     let floor = if cfg!(target_os = "macos") { omni_platform::vm::page_size() as u64 } else { 1024 * 1024 };
     assert!(
         per_thread_created >= floor,

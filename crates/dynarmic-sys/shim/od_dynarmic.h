@@ -367,6 +367,12 @@ void od_jit_invalidate_range(void* jit, uint64_t addr, uint64_t len);
 void od_jit_clear_cache(void* jit);
 void od_jit_clear_exclusive(void* jit);
 
+/* Bytes the arm64 backend's per-block bookkeeping holds in pages of its own
+ * (patch 0013's `PageBackedAllocator`), over every jit in the process -- the
+ * part of that bookkeeping the C heap's statistics no longer see. 0 on a host
+ * whose backend does not use it. For measurement only. */
+uint64_t od_page_backed_bytes(void);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);

@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <algorithm>
 #include <cstdio>
+#include <limits>
 
 #include <mcl/bit_cast.hpp>
 
@@ -42,20 +44,27 @@ CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
     return nullptr;
 }
 
+// Omnidroid patch 0010: the last block whose entry point is at or below `host_pc` -- what
+// `reverse_block_entries.upper_bound(host_pc)` followed by a decrement found.
+const AddressSpace::BlockRecord* AddressSpace::FindBlockRecord(CodePtr host_pc) const {
+    const auto iter = std::upper_bound(block_records.begin(), block_records.end(), host_pc,
+                                       [](CodePtr pc, const BlockRecord& record) { return pc < record.entry_point; });
+    if (iter == block_records.begin()) {
+        return nullptr;
+    }
+    return &*std::prev(iter);
+}
+
 std::optional<IR::LocationDescriptor> AddressSpace::ReverseGetLocation(CodePtr host_pc) {
-    if (auto iter = reverse_block_entries.upper_bound(host_pc); iter != reverse_block_entries.begin()) {
-        // upper_bound locates the first value greater than host_pc, so we need to decrement
-        --iter;
-        return iter->second;
+    if (const BlockRecord* record = FindBlockRecord(host_pc)) {
+        return record->location;
     }
     return std::nullopt;
 }
 
 CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
-    if (auto iter = reverse_block_entries.upper_bound(host_pc); iter != reverse_block_entries.begin()) {
-        // upper_bound locates the first value greater than host_pc, so we need to decrement
-        --iter;
-        return iter->first;
+    if (const BlockRecord* record = FindBlockRecord(host_pc)) {
+        return record->entry_point;
     }
     return nullptr;
 }
@@ -90,10 +99,13 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
 }
 
 void AddressSpace::ClearCache() {
-    block_entries.clear();
-    reverse_block_entries.clear();
-    block_infos.clear();
-    block_references.clear();
+    // Omnidroid patch 0010: given back rather than cleared (`clear()` keeps a robin_map's buckets
+    // and a vector's capacity), so a cleared cache holds no memory for the blocks it no longer has.
+    block_entries = {};
+    decltype(block_records){}.swap(block_records);
+    decltype(fastmem_records){}.swap(fastmem_records);
+    decltype(link_records){}.swap(link_records);
+    link_heads = {};
     code.set_offset(prelude_info.end_of_prelude);
 }
 
@@ -117,10 +129,9 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
     EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
 
     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
-    ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
-    ASSERT(block_infos.insert({block_info.entry_point, block_info}).second);
+    const u32 block_index = RecordBlock(block.Location(), block_info);
 
-    Link(block_info);
+    Link(block_info, block_index);
     RelinkForDescriptor(block.Location(), block_info.entry_point);
 
     mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
@@ -131,7 +142,44 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
     return block_info;
 }
 
-void AddressSpace::Link(EmittedBlockInfo& block_info) {
+// Omnidroid patch 0010: keep what is read after emission, and only that. See `BlockRecord`.
+u32 AddressSpace::RecordBlock(IR::LocationDescriptor location, const EmittedBlockInfo& block_info) {
+    // The pin asserted that the entry point was new to `reverse_block_entries` and `block_infos`.
+    // Emission only moves forward until `ClearCache`, so it is also above every recorded one,
+    // which is what the binary searches rely on.
+    ASSERT(block_records.empty() || block_records.back().entry_point < block_info.entry_point);
+    ASSERT(block_records.size() < no_link && block_info.size <= std::numeric_limits<u32>::max());
+    ASSERT(fastmem_records.size() + block_info.fastmem_patch_info.size() <= std::numeric_limits<u32>::max());
+
+    const u32 block_index = static_cast<u32>(block_records.size());
+    block_records.push_back(BlockRecord{
+        .entry_point = block_info.entry_point,
+        .location = location,
+        .size = static_cast<u32>(block_info.size),
+        .fastmem_begin = static_cast<u32>(fastmem_records.size()),
+    });
+
+    const size_t first = fastmem_records.size();
+    for (const auto& [offset, info] : block_info.fastmem_patch_info) {
+        const std::ptrdiff_t fc_offset = mcl::bit_cast<CodePtr>(info.fc.call_pc) - block_info.entry_point;
+        ASSERT(offset >= 0 && offset <= std::numeric_limits<u32>::max());
+        ASSERT(fc_offset >= 0 && fc_offset <= std::numeric_limits<u32>::max());
+        fastmem_records.push_back(FastmemRecord{
+            .marker_location = std::get<0>(info.marker),
+            .offset = static_cast<u32>(offset),
+            .fc_offset = static_cast<u32>(fc_offset),
+            .marker_index = std::get<1>(info.marker),
+            .recompile = info.recompile,
+        });
+    }
+    // `fastmem_patch_info` is keyed by offset, so the offsets are distinct.
+    std::sort(fastmem_records.begin() + first, fastmem_records.end(),
+              [](const FastmemRecord& a, const FastmemRecord& b) { return a.offset < b.offset; });
+
+    return block_index;
+}
+
+void AddressSpace::Link(const EmittedBlockInfo& block_info, u32 block_index) {
     using namespace oaknut;
     using namespace oaknut::util;
 
@@ -298,52 +346,85 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         }
     }
 
-    for (auto [target_descriptor, list] : block_info.block_relocations) {
-        block_references[target_descriptor].insert(block_info.entry_point);
+    for (const auto& [target_descriptor, list] : block_info.block_relocations) {
+        // Omnidroid patch 0010: `block_references[target_descriptor].insert(entry_point)`, as a
+        // chain through `link_records` from `link_heads`. This block's records for this target are
+        // pushed together, so they stay adjacent in the chain.
+        auto head = link_heads.find(target_descriptor);
+        u32 next = head == link_heads.end() ? no_link : head->second;
+        for (const BlockRelocation& relocation : list) {
+            ASSERT(link_records.size() < no_link);
+            ASSERT(relocation.code_offset >= 0 && relocation.code_offset <= std::numeric_limits<u32>::max());
+            const u32 index = static_cast<u32>(link_records.size());
+            link_records.push_back(LinkRecord{
+                .target = target_descriptor,
+                .block = block_index,
+                .offset = static_cast<u32>(relocation.code_offset),
+                .next = next,
+                .type = relocation.type,
+            });
+            next = index;
+        }
+        if (!list.empty()) {
+            link_heads.insert_or_assign(target_descriptor, next);
+        }
         LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
     }
 }
 
 void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list) {
+    for (const BlockRelocation& block_relocation : block_relocations_list) {
+        LinkBlockLink(entry_point, target_ptr, block_relocation);
+    }
+}
+
+void AddressSpace::LinkBlockLink(const CodePtr entry_point, const CodePtr target_ptr, BlockRelocation block_relocation) {
     using namespace oaknut;
     using namespace oaknut::util;
 
-    for (auto [ptr_offset, type] : block_relocations_list) {
-        CodeGenerator c{mem.ptr(), mem.ptr()};
-        c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
+    const auto [ptr_offset, type] = block_relocation;
+    CodeGenerator c{mem.ptr(), mem.ptr()};
+    c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
 
-        switch (type) {
-        case BlockRelocationType::Branch:
-            if (target_ptr) {
-                c.B((void*)target_ptr);
-            } else {
-                c.NOP();
-            }
-            break;
-        case BlockRelocationType::MoveToScratch1:
-            if (target_ptr) {
-                c.ADRL(Xscratch1, (void*)target_ptr);
-            } else {
-                c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
-            }
-            break;
-        default:
-            ASSERT_FALSE("Invalid BlockRelocationType");
+    switch (type) {
+    case BlockRelocationType::Branch:
+        if (target_ptr) {
+            c.B((void*)target_ptr);
+        } else {
+            c.NOP();
         }
+        break;
+    case BlockRelocationType::MoveToScratch1:
+        if (target_ptr) {
+            c.ADRL(Xscratch1, (void*)target_ptr);
+        } else {
+            c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
+        }
+        break;
+    default:
+        ASSERT_FALSE("Invalid BlockRelocationType");
     }
 }
 
 void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
-    for (auto code_ptr : block_references[target_descriptor]) {
-        if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
-            const EmittedBlockInfo& block_info = block_iter->second;
+    // Omnidroid patch 0010: every block that links to `target_descriptor` -- the pin's
+    // `block_references[target_descriptor]` -- relinks its links to it and is invalidated once.
+    const auto head = link_heads.find(target_descriptor);
+    if (head == link_heads.end()) {
+        return;
+    }
+    u32 index = head->second;
+    while (index != no_link) {
+        const u32 block_index = link_records[index].block;
+        const BlockRecord& block = block_records[block_index];
+        do {
+            const LinkRecord& link = link_records[index];
+            ASSERT(link.target == target_descriptor);
+            LinkBlockLink(block.entry_point, target_ptr, BlockRelocation{link.offset, link.type});
+            index = link.next;
+        } while (index != no_link && link_records[index].block == block_index);
 
-            if (auto relocation_iter = block_info.block_relocations.find(target_descriptor); relocation_iter != block_info.block_relocations.end()) {
-                LinkBlockLinks(block_info.entry_point, target_ptr, relocation_iter->second);
-            }
-
-            mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
-        }
+        mem.invalidate(reinterpret_cast<u32*>(block.entry_point), block.size);
     }
 }
 
@@ -351,25 +432,33 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
     {
         const auto host_ptr = mcl::bit_cast<CodePtr>(host_pc);
 
-        const auto entry_point = ReverseGetEntryPoint(host_ptr);
-        if (!entry_point) {
+        // Omnidroid patch 0010: the block record at or below `host_pc`, then its patch sites by
+        // binary search on the offset -- the pin's reverse map, `block_infos` and the block's
+        // `fastmem_patch_info`.
+        const BlockRecord* block = FindBlockRecord(host_ptr);
+        if (!block) {
             goto fail;
         }
 
-        const auto block_info = block_infos.find(entry_point);
-        if (block_info == block_infos.end()) {
+        const std::ptrdiff_t offset = host_ptr - block->entry_point;
+        if (offset > std::numeric_limits<u32>::max()) {
             goto fail;
         }
 
-        const auto patch_entry = block_info->second.fastmem_patch_info.find(host_ptr - entry_point);
-        if (patch_entry == block_info->second.fastmem_patch_info.end()) {
+        const auto first = fastmem_records.begin() + block->fastmem_begin;
+        const auto last = block == &block_records.back()
+                            ? fastmem_records.end()
+                            : fastmem_records.begin() + (block + 1)->fastmem_begin;
+        const auto patch_entry = std::lower_bound(first, last, static_cast<u32>(offset),
+                                                  [](const FastmemRecord& record, u32 value) { return record.offset < value; });
+        if (patch_entry == last || patch_entry->offset != static_cast<u32>(offset)) {
             goto fail;
         }
 
-        const auto fc = patch_entry->second.fc;
+        const auto fc = FakeCall{.call_pc = mcl::bit_cast<u64>(block->entry_point + patch_entry->fc_offset)};
 
-        if (patch_entry->second.recompile) {
-            const auto marker = patch_entry->second.marker;
+        if (patch_entry->recompile) {
+            const DoNotFastmemMarker marker{patch_entry->marker_location, patch_entry->marker_index};
             fastmem_manager.MarkDoNotFastmem(marker);
             InvalidateBasicBlocks({std::get<0>(marker)});
         }

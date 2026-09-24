@@ -398,6 +398,53 @@ fn cached_main_lib() -> &'static Path {
     })
 }
 
+/// A file's bytes in pages of their own, given back to the host when dropped.
+///
+/// **Not a `Vec`**: a freed heap allocation is the host allocator's to keep. MEASURED on macOS
+/// (`vmmap`, n = 3 gate runs): with the file read into a `Vec` that was dropped after the load, the
+/// 104.1 MiB buffer was still there at the landing screen in one run of three, as a dirty
+/// `MALLOC_LARGE (empty)` region -- charged to `phys_footprint` exactly as before. A reservation
+/// that is released is unmapped.
+struct LoadBytes {
+    reservation: Option<omni_platform::vm::Reservation>,
+    len: usize,
+}
+
+impl LoadBytes {
+    fn read(path: &Path) -> Self {
+        use std::io::Read;
+        use omni_platform::vm;
+        let mut file = std::fs::File::open(path).expect("open the cache entry");
+        let len = usize::try_from(file.metadata().expect("the cache entry's length").len())
+            .expect("the cache entry fits in memory");
+        let size = len.div_ceil(vm::page_size()).max(1) * vm::page_size();
+        let reservation =
+            vm::reserve(size, vm::allocation_granularity()).expect("reserve the load buffer");
+        // SAFETY: `[as_ptr, as_ptr + size)` is exactly the reservation just made, and nothing else
+        // uses it.
+        unsafe { vm::commit(reservation.as_ptr(), size, vm::Protection::ReadWrite) }
+            .expect("commit the load buffer");
+        // SAFETY: committed read-write above, `len <= size`, and only this value refers to it.
+        let buffer = unsafe { std::slice::from_raw_parts_mut(reservation.as_ptr(), len) };
+        file.read_exact(buffer).expect("read the cache entry");
+        Self { reservation: Some(reservation), len }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        let reservation = self.reservation.as_ref().expect("live until dropped");
+        // SAFETY: committed and filled by `read`, and not released before `self` is dropped.
+        unsafe { std::slice::from_raw_parts(reservation.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for LoadBytes {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            omni_platform::vm::release(reservation).expect("release the load buffer");
+        }
+    }
+}
+
 fn main_lib_bytes() -> &'static [u8] {
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     BYTES.get_or_init(|| std::fs::read(cached_main_lib()).expect("read the cache entry"))
@@ -545,10 +592,16 @@ impl Guest {
     /// whose every call refuses -- so the default gate's `dlopen("libvulkan.so")` stays NULL.
     fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display) -> Self {
         let path = cached_main_lib();
-        let bytes = main_lib_bytes();
+        // **Read for this load, and given back when it returns** -- not through `main_lib_bytes`,
+        // whose static kept the whole file for the life of the process. Nothing the load produces
+        // borrows it (the loaded object and the export table own their data), and the guest runs
+        // from the file's mapping, not from these bytes. MEASURED on macOS: 104 MiB of
+        // `phys_footprint` (`MALLOC_LARGE`, one region) held through the whole session for a parse
+        // done at startup. See [`LoadBytes`] for why these are pages of their own.
+        let bytes = LoadBytes::read(path);
         let backing =
             Backing::open(path, MapExecutability::Executable).expect("open the cache entry");
-        let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+        let elf = ElfImage::parse(bytes.bytes()).expect("parse libroblox.so");
         let space = Arc::new(
             GuestSpace::with_config(GuestSpaceConfig {
                 size: GUEST_SPACE_BYTES,

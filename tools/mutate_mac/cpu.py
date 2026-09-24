@@ -460,4 +460,74 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
             let _ = halt;
         }""",
      HVF_INIT_GATE),
+    # --- mac-mem: patch 0010, the compact block records --------------------------------------------
+    ("mac-mem-A1", "A", "0010: relinking stops at the first block that links to the target, so the "
+     "others keep branching to a stale translation",
+     ARM64 + "address_space.cpp",
+     """    u32 index = head->second;
+    while (index != no_link) {""",
+     """    u32 index = head->second;
+    if (index != no_link) {""",
+     dyn("bookkeeping")),
+    ("mac-mem-A2", "A", "0010: the fastmem handler looks only at a block's first patch site",
+     ARM64 + "address_space.cpp",
+     """        const auto patch_entry = std::lower_bound(first, last, static_cast<u32>(offset),""",
+     """        const auto patch_entry = std::lower_bound(first, first + 1, static_cast<u32>(offset),""",
+     dyn("bookkeeping")),
+    # --- mac-mem: patch 0011, the guest-range index -----------------------------------------------
+    ("mac-mem-A3", "A", "0011: the A64 clear leaves the guest ranges behind (the pin's leak)",
+     ARM64 + "a64_address_space.cpp",
+     """    decltype(guest_ranges){}.swap(guest_ranges);
+    guest_range_pages = {};
+    std::vector<u32>{}.swap(wide_guest_ranges);
+}""",
+     """}""",
+     dyn("bookkeeping")),
+    ("mac-mem-A4", "A", "0011: a block is indexed under its first page only",
+     ARM64 + "a64_address_space.cpp",
+     """        guest_range_pages[page].push_back(index);
+        if (page == last_page) {""",
+     """        guest_range_pages[page].push_back(index);
+        if (true) {""",
+     dyn("bookkeeping")),
+    ("mac-mem-A5", "A", "0011: blocks wider than the page index are never looked at",
+     ARM64 + "a64_address_space.cpp",
+     """        for (const u32 index : wide_guest_ranges) {
+            consider(index);
+        }""",
+     """""",
+     dyn("bookkeeping")),
+    ("mac-mem-A6", "A", "0011: the walk of the index for a large invalidation looks at its first page only",
+     ARM64 + "a64_address_space.cpp",
+     """                if (page >= first_page && page <= last_page) {""",
+     """                if (page == first_page) {""",
+     dyn("bookkeeping")),
+    ("mac-mem-B1", "B", "0011: every block on an invalidated page goes, whether or not its bytes were "
+     "written (the range test dropped)",
+     ARM64 + "a64_address_space.cpp",
+     """            if (range.first <= last && first <= range.last) {""",
+     """            if (true) {""",
+     dyn("a64_exec")),
+    # --- mac-mem: patch 0012, an invalidation that leaves nothing standing is a clear ---------------
+    ("mac-mem-A7", "A", "0012 reverted: a jit whose blocks were all invalidated keeps their records and code",
+     ARM64 + "a64_address_space.cpp",
+     """    if (block_entries.empty()) {
+        ClearCache();
+    }""",
+     """""",
+     dyn("bookkeeping")),
+    ("mac-mem-B2", "B", "0012 over-reaches: every range invalidation clears the whole cache",
+     ARM64 + "a64_address_space.cpp",
+     """    if (block_entries.empty()) {
+        ClearCache();
+    }""",
+     """    ClearCache();""",
+     dyn("a64_exec")),
+    # --- mac-mem: patch 0013, the bookkeeping's large arrays are pages of their own ----------------
+    ("mac-mem-A8", "A", "0013 reverted in effect: no array is large enough to be page-backed, so every "
+     "freed one goes back to the C++ heap",
+     ARM64 + "page_backed_allocator.h",
+     """    static constexpr std::size_t threshold = 256 * 1024;""",
+     """    static constexpr std::size_t threshold = ~std::size_t{0};""",
+     dyn("bookkeeping")),
 ]

@@ -1,0 +1,174 @@
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+index a8d1969..df64eaf 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include "dynarmic/backend/arm64/a64_address_space.h"
+ 
++#include <limits>
++
+ #include "dynarmic/backend/arm64/a64_jitstate.h"
+ #include "dynarmic/backend/arm64/abi.h"
+ #include "dynarmic/backend/arm64/devirtualize.h"
+@@ -498,7 +500,59 @@ IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+ }
+ 
+ void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
+-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
++    // Omnidroid patch 0011: every location registered with a range that intersects one of
++    // `ranges` -- what `BlockRangeInformation::InvalidateRanges` returned.
++    tsl::robin_set<IR::LocationDescriptor> erase_locations;
++    for (const auto& interval : ranges) {
++        const u64 first = boost::icl::first(interval);
++        const u64 last = boost::icl::last(interval);
++        const auto consider = [&](u32 index) {
++            const GuestRange& range = guest_ranges[index];
++            if (range.first <= last && first <= range.last) {
++                erase_locations.insert(range.location);
++            }
++        };
++
++        for (const u32 index : wide_guest_ranges) {
++            consider(index);
++        }
++
++        const u64 first_page = first >> guest_page_bits;
++        const u64 last_page = last >> guest_page_bits;
++        if (last_page - first_page >= guest_range_pages.size()) {
++            // More pages asked about than have anything on them: walk what there is.
++            for (const auto& [page, indices] : guest_range_pages) {
++                if (page >= first_page && page <= last_page) {
++                    for (const u32 index : indices) {
++                        consider(index);
++                    }
++                }
++            }
++        } else {
++            for (u64 page = first_page;; ++page) {
++                if (const auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
++                    for (const u32 index : iter->second) {
++                        consider(index);
++                    }
++                }
++                if (page == last_page) {
++                    break;
++                }
++            }
++        }
++    }
++    InvalidateBasicBlocks(erase_locations);
++}
++
++void A64AddressSpace::ClearCache() {
++    AddressSpace::ClearCache();
++    // Omnidroid patch 0011: the pin's `A64AddressSpace` never cleared `block_ranges`. Every block
++    // is gone, so nothing registered before the clear can name a block that exists: a location
++    // translated again afterwards registers the range of its new translation, which is the range
++    // its code now depends on.
++    std::vector<GuestRange>{}.swap(guest_ranges);
++    guest_range_pages = {};
++    std::vector<u32>{}.swap(wide_guest_ranges);
+ }
+ 
+ void A64AddressSpace::EmitPrelude() {
+@@ -762,8 +816,29 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
+ void A64AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo&) {
+     const A64::LocationDescriptor descriptor{block.Location()};
+     const A64::LocationDescriptor end_location{block.EndLocation()};
+-    const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
+-    block_ranges.AddRange(range, descriptor);
++    // Omnidroid patch 0011: the pin's `closed(descriptor.PC(), end_location.PC() - 1)`, which is
++    // empty -- and was never returned -- when the block covers no bytes.
++    const u64 first = descriptor.PC();
++    const u64 last = end_location.PC() - 1;
++    if (last < first) {
++        return;
++    }
++    ASSERT(guest_ranges.size() < std::numeric_limits<u32>::max());
++    const u32 index = static_cast<u32>(guest_ranges.size());
++    guest_ranges.push_back(GuestRange{descriptor, first, last});
++
++    const u64 first_page = first >> guest_page_bits;
++    const u64 last_page = last >> guest_page_bits;
++    if (last_page - first_page >= max_indexed_pages) {
++        wide_guest_ranges.push_back(index);
++        return;
++    }
++    for (u64 page = first_page;; ++page) {
++        guest_range_pages[page].push_back(index);
++        if (page == last_page) {
++            break;
++        }
++    }
+ }
+ 
+ }  // namespace Dynarmic::Backend::Arm64
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.h b/src/dynarmic/backend/arm64/a64_address_space.h
+index 86eae4d..f70fa79 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.h
++++ b/src/dynarmic/backend/arm64/a64_address_space.h
+@@ -5,8 +5,12 @@
+ 
+ #pragma once
+ 
++#include <vector>
++
++#include <boost/icl/interval_set.hpp>
++#include <tsl/robin_map.h>
++
+ #include "dynarmic/backend/arm64/address_space.h"
+-#include "dynarmic/backend/block_range_information.h"
+ #include "dynarmic/interface/A64/config.h"
+ 
+ namespace Dynarmic::Backend::Arm64 {
+@@ -21,6 +25,8 @@ public:
+ 
+     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+ 
++    void ClearCache() override;
++
+ protected:
+     friend class A64Core;
+ 
+@@ -29,7 +35,24 @@ protected:
+     void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) override;
+ 
+     const A64::UserConfig conf;
+-    BlockRangeInformation<u64> block_ranges;
++
++    // Omnidroid patch 0011: the guest bytes each emitted block was translated from, for
++    // `InvalidateCacheRanges`. The pin kept them in a `BlockRangeInformation` -- a boost::icl
++    // interval_map of std::sets, about 200 bytes per block, which `ClearCache` never cleared, so
++    // it grew for as long as the jit lived. One `GuestRange` per emitted block (24 bytes), indexed
++    // by the 4 KiB guest pages it covers; like the pin's, a range stays until `ClearCache`.
++    struct GuestRange {
++        IR::LocationDescriptor location;
++        u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
++        u64 last;
++    };
++    static constexpr unsigned guest_page_bits = 12;
++    /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
++    /// invalidation, instead of in every page it covers.
++    static constexpr u64 max_indexed_pages = 64;
++    std::vector<GuestRange> guest_ranges;
++    tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
++    std::vector<u32> wide_guest_ranges;
+ };
+ 
+ }  // namespace Dynarmic::Backend::Arm64
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 1381936..8217abd 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -42,7 +42,9 @@ public:
+ 
+     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
+ 
+-    void ClearCache();
++    // Omnidroid patch 0011: virtual, so that `Emit`'s own clear (when the cache is full) also clears
++    // what a derived address space keeps per block.
++    virtual void ClearCache();
+ 
+     void DumpDisassembly() const;
+ 

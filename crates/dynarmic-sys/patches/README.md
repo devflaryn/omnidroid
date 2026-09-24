@@ -248,6 +248,153 @@ written at that point; every block emitted later is invalidated on its own in `A
 2 MiB, and still to run translated code. The A32 twin (`a32_address_space.cpp`) has the same call;
 A32 is not built here.
 
+### 0010 — arm64: keep what is read of an emitted block, in flat records
+
+`0010-arm64-compact-block-records.patch`. **arm64 only; no change to what is emitted or when.**
+`AddressSpace` kept, for every block it emitted: the block's whole `EmittedBlockInfo` (a vector and
+two robin_maps, 200 bytes) **inline in the buckets** of `block_infos`, a robin_map keyed by entry
+point at a load factor of at most 0.5; a `std::map` node for the reverse lookup; and, for every link
+target, a robin_set of referring entry points in the buckets of `block_references` (96 bytes each,
+and `RelinkForDescriptor`'s `operator[]` made one for every emitted block's own location). Each
+block's fastmem patch sites were a robin_map of their own -- a separate allocation per block.
+
+**MEASURED** in the macOS gate (census built into a scratch build of the pin, counters per jit, read
+at +30/45/60/75/85 s, n = 1 run; bucket and element sizes from `sizeof` on the vendored headers):
+at +60 s, **593,699 blocks over 39 jits** (88,163 in the largest, 616 in the smallest), 2,099 bytes of
+bookkeeping per block before malloc rounding -- `block_infos` buckets 890, `block_references`
+buckets 484 + sets 46, fastmem maps 281, `relocations` vectors 134, per-block link maps 102 + 20,
+`block_entries` 78, reverse map 64 -- 1.19 GiB in all, which `heap(1)` and `footprint(1)` confirm
+(`MALLOC_LARGE` 912 MB, `MALLOC_SMALL` 649 MB). The engine's heavy threads each hold 20-125 thousand
+blocks of the same code.
+
+What is read after a block is emitted is only its entry point, location and size, its fastmem patch
+sites (`FastmemCallback`), and where it links to each target (`RelinkForDescriptor`);
+`relocations` is consumed by `Link` at emission and never read again. The patch keeps exactly that:
+
+* `block_records`: entry point, location, size, first patch site -- 24 bytes, **appended in
+  ascending entry-point order**, because emission only moves forward until `ClearCache` (asserted).
+  A binary search replaces `reverse_block_entries` and `block_infos` (`ReverseGetLocation`,
+  `ReverseGetEntryPoint`, `FastmemCallback`).
+* `fastmem_records`: one per patch site, 24 bytes, grouped by block and sorted by offset, so the
+  handler finds the site by binary search within the block -- the same key the per-block map had.
+  `FakeCall::call_pc` is kept as an offset from the entry point (it is inside the block; asserted).
+* `link_records` + `link_heads`: one 24-byte record per block relocation, chained per target from
+  the newest; a block's records for one target are adjacent in the chain, so `RelinkForDescriptor`
+  patches each referring block's links to that target and invalidates that block once, as before.
+
+Nothing is dropped earlier than before: an invalidated block keeps its records until `ClearCache`,
+exactly as it kept its `block_infos` and `block_references` entries -- `FastmemCallback` can be
+entered from a block that has just been invalidated (the recompile path does that to itself), and
+`RelinkForDescriptor` keeps patching stale blocks' links, as it did. `ClearCache` now **gives the
+memory back** (`= {}` / swap) where `clear()` kept a robin_map's buckets and a vector's capacity.
+The emitters are untouched: `EmittedBlockInfo` is still their product, and is freed after `Emit`.
+
+`tests/bookkeeping.rs` measures bytes in use by the allocator (`malloc_zone_statistics`, every zone;
+it first shows the reading sees a 16 MiB allocation) around the translation of 8,192 blocks with one
+patch site and one link each: **1,785 bytes per block on the pin, 457 with the patch** (n = 8,192
+blocks, of which 147 is the pin's `block_ranges`, which 0011 addresses); the bound is 700. It also
+covers the two lookups the records replace, both of which pass on the pin too: three blocks linked to
+one that is rewritten and invalidated must each stop running its stale translation (the chain walk),
+and a host fault at the third of a block's four patch sites must be served as the third
+(`FastmemCallback`'s binary search).
+
+### 0011 — arm64: the guest ranges of emitted blocks, compact and cleared with the cache
+
+`0011-arm64-guest-range-index.patch`. **arm64 only.** `A64AddressSpace` recorded the guest bytes each
+block was translated from in a `BlockRangeInformation<u64>` (`backend/block_range_information.cpp`,
+shared with x64 and not edited here): a boost::icl `interval_map` of `std::set<LocationDescriptor>`,
+in which overlapping blocks split each other's intervals and copy the sets. **And nothing cleared it**:
+`AddressSpace::ClearCache` did not know it existed, so it grew for the whole life of the jit, across
+every cache clear, and never dropped an invalidated block's range either (upstream's own
+`TODO: EFFICIENCY` in `InvalidateRanges`).
+
+MEASURED in the gate at +60 s (`heap(1)` with `MallocStackLogging=lite`, n = 1 run): 846,107 icl
+nodes (81 MB) and 874,315 set nodes (42 MB) -- 207 bytes per block, for the 594,083 blocks the jits
+held, after six cache clears the map had outlived.
+
+The patch keeps one 24-byte `GuestRange` per emitted block (location and the closed range the pin
+registered, `[PC, EndLocation.PC - 1]`, skipped when empty as the icl skipped it), indexed by the
+4 KiB guest pages it covers; a block covering more than 64 pages goes to a list checked on every
+invalidation instead. `InvalidateCacheRanges` returns every location registered with a range
+intersecting a requested one -- what `InvalidateRanges` returned -- looking the pages up, or walking
+the index when more pages are asked about than it has (the whole-guest-space invalidation
+`omni-android` sends when a context's cross-thread queue overflows). `ClearCache` is now virtual and
+`A64AddressSpace` clears the ranges with the cache, so `Emit`'s own clear of a full cache clears them
+too.
+
+**The one difference, stated exactly.** After a clear, a range that only a *pre-clear* translation of
+a location covered no longer invalidates that location's current translation. That translation was
+made after the clear from the guest bytes as they then were, and registered the range it read; a
+write elsewhere cannot make it stale. So what the guest executes is unchanged, and the pin's extra
+invalidation there -- a retranslation of code that had not changed -- is gone.
+
+`tests/bookkeeping.rs`, n = 32,768 blocks: **440 bytes per block with 0010 alone, 365 with 0011**;
+after `od_jit_clear_cache`, **128 bytes per block still held with 0010 alone, 0-1 with 0011** (the
+bound is 16). Three behaviour tests cover the index, and pass on the pin as well: a write to the
+second page of a two-page block, a write to the last word of a 70,001-instruction block (more than
+64 pages: the retranslation fetches all of it), and a 16 GiB invalidation reaching every block.
+
+### 0012 — arm64: an invalidation that leaves no block standing is a clear
+
+`0012-arm64-an-invalidation-that-leaves-nothing-is-a-clear.patch`. **arm64 only.** After
+`InvalidateCacheRanges`, if no block is left in `block_entries`, `A64AddressSpace` calls
+`ClearCache`.
+
+**Why it matters here, MEASURED** (census build of the pin, gate, n = 1 run): at +85 s the jits held
+835,605 block records of which **451,075 were invalidated blocks** -- 1,045,686 of 1,581,230 blocks
+emitted since start had been invalidated. Almost all of it came from one request: a 16 GiB range
+`[0x7000000000, 0x73ffffffff]`, the whole guest space, found up to 78,357 blocks at a time. That is
+`omni-android`'s cross-thread code invalidation (`boundary.rs`, `CodeWatch::broadcast`): every
+guest `munmap`/`mprotect`/`MADV_DONTNEED` is queued for every other live context, and a context
+that has not crossed the boundary for 64 of them has its queue collapse to "the whole address
+space". Invalidated blocks keep their records and their code until the cache is cleared, so each
+such jit held a dead copy of its whole translation and kept emitting above it until the cache filled.
+
+**Why it is the same thing the guest could see.** `InvalidateCacheRanges` runs only from
+`Jit::Impl::PerformRequestedCacheInvalidation`, before or after `RunCode` -- never with generated
+code on the stack. The return stack buffer is on `RunCode`'s frame and rebuilt at every entry, and
+every link to an invalidated location was pointed back at the dispatcher when it was invalidated
+(`RelinkForDescriptor(descriptor, nullptr)`). So when nothing is left in `block_entries`, no
+invalidated block can run again, and `ClearCache` -- what `Jit::ClearCache` (the guest's
+`IC IALLU`) does at the same point -- gives back exactly what cannot be used: the records and the
+cache space. The fastmem recompile path, which invalidates from inside generated code, calls
+`InvalidateBasicBlocks` directly and is not affected.
+
+`tests/bookkeeping.rs`, n = 32,768 blocks: after invalidating every block between runs, **364 bytes
+per block still held without the patch, 1 with it**; the chain then runs again, retranslated.
+Rows mac-mem-A7 (reverted) and mac-mem-B2 (every invalidation clears: `a64_exec`'s test that a
+small invalidation spares the other translations must fail).
+
+### 0013 — arm64: the bookkeeping's large arrays are pages of their own
+
+`0013-arm64-page-backed-bookkeeping.patch`. **arm64 only.** A new header,
+`backend/arm64/page_backed_allocator.h`: `PageBackedAllocator<T>` maps an array of at least 256 KiB
+anonymously (`mmap`) and unmaps it when it is freed; a smaller one uses `operator new` as before. The
+containers of 0010-0011 -- `block_entries`, the three record vectors, `link_heads`, `guest_ranges` and
+the page index -- allocate through it.
+
+**Why.** Those containers grow by doubling and `ClearCache` gives them back whole, so their large
+arrays are allocated and freed many times over a jit's life -- and a large array freed through the
+C++ heap is the host allocator's to keep, dirty and charged to the process.
+
+`tests/bookkeeping.rs` measures `phys_footprint` around a clear of 32,768 blocks' bookkeeping
+(11.4 MiB, counted as the zones' bytes in use plus the allocator's mapped bytes, which the shim
+reports through a new `od_page_backed_bytes()`; the footprint instrument is first shown seeing 16 MiB
+touched): **the clear took 9.06 MiB off the footprint with the patch, 0.00 MiB with no array
+page-backed** (the threshold set out of reach, n = 2), and the bound is three quarters of what was
+held. Row mac-mem-A8 is that mutation.
+
+**In the gate** (+60 s): `MALLOC_LARGE` in use went from 85-113 MiB (n = 3, after 0012) to no
+in-use region at all (n = 3) -- the arrays are now mappings, charged for the pages written rather than for a
+vector's spare capacity -- and the landing-screen footprint from 876-892 MiB (n = 3) to 811-841 MiB
+(n = 4). **A correction, recorded because it was nearly carried as the reason for this patch:** at
+the landing screen `vmmap` also shows 46-63 MiB of dirty `MALLOC_LARGE (empty)` regions -- freed
+large blocks the allocator keeps -- and their sizes (3-14 MiB) suggested these arrays. With the patch
+they are still there (55-61 MiB, n = 3), so they are someone else's; they are not attributed here.
+
+`od_page_backed_bytes()` is additive in the shim (`od_dynarmic.h`): no struct or existing signature
+changes, so `OD_DYNARMIC_ABI_VERSION` stands; it answers 0 where the arm64 backend is not built.
+
 ### 0014 — arm64: the store-exclusive is a fastmem patch location too
 
 `0014-arm64-the-store-exclusive-is-a-patch-location-too.patch`. **arm64 only**, a defect in 0007.
