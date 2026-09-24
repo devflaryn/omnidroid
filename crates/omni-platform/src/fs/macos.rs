@@ -25,6 +25,9 @@ use std::path::Path;
 use super::error::{FsError, FsErrorKind, FsResult};
 use super::VolumeStats;
 
+// macOS shortens a mapped file as Linux does, so the end of file is the host's own; see `unix.rs`.
+pub(super) use super::unix::{logical_len, logical_len_at, open, settle, truncate, write};
+
 /// `pread(2)`: one call, short reads reported, the descriptor's offset untouched.
 pub(super) fn pread(file: &File, buf: &mut [u8], offset: u64) -> FsResult<usize> {
     file.read_at(buf, offset).map_err(|error| FsError::io("pread", "a descriptor", &error))

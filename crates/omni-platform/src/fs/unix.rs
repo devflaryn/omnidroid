@@ -63,6 +63,46 @@ pub(super) fn pwrite(file: &File, buf: &[u8], offset: u64) -> FsResult<usize> {
     file.write_at(buf, offset).map_err(|error| FsError::io("pwrite", "a descriptor", &error))
 }
 
+// ---------------------------------------------------------------- the end of file
+//
+// Linux and macOS shorten a file whatever maps it, so the logical end of file the Windows backend
+// keeps for a file the host would not shorten (see `windows.rs`) has no counterpart here: these
+// are the host's own calls, and no file ever has a logical end.
+
+/// `ftruncate(2)` and `open`'s `O_TRUNC`: the host's own, which shortens a mapped file.
+pub(super) fn truncate(file: &File, len: u64) -> std::io::Result<()> {
+    file.set_len(len)
+}
+
+/// `open(2)`: the host's own, `O_TRUNC` included.
+pub(super) fn open(
+    options: &std::fs::OpenOptions,
+    host: &Path,
+    _truncating: bool,
+) -> std::io::Result<File> {
+    options.open(host)
+}
+
+/// No file here has a logical end of file.
+pub(super) fn logical_len(_file: &File) -> Option<u64> {
+    None
+}
+
+/// No file here has a logical end of file.
+pub(super) fn logical_len_at(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// `write(2)`: the host's own, which honours `O_APPEND` itself.
+pub(super) fn write(file: &File, buf: &[u8], _append: bool) -> std::io::Result<usize> {
+    use std::io::Write;
+    let mut handle: &File = file;
+    handle.write(buf)
+}
+
+/// Nothing to settle at `close`: the host shortened the file when it was asked.
+pub(super) fn settle(_file: &File) {}
+
 /// Structural on macOS: Linux's is in [`linux`](super::linux), `fallocate(2)` mode 0 through
 /// `libc::posix_fallocate`, which macOS does not have.
 ///

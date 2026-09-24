@@ -97,6 +97,10 @@ pub use timerfd::{TimerFd, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME};
 mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
+/// For the mapping seam: a section of a file closed, which may let the host apply a logical end
+/// of file (see `windows.rs`).
+#[cfg(target_os = "windows")]
+pub(crate) use windows::section_closed;
 
 #[cfg(unix)]
 // macOS has its own backend (`macos.rs`) and does not use the shared unix body.
@@ -345,6 +349,9 @@ enum Entry {
         file: File,
         readable: bool,
         writable: bool,
+        /// `O_APPEND`: every write lands at the end of file -- which, for a file with a logical
+        /// end (see `windows.rs`), is not where the host's own append would put it.
+        append: bool,
         host: PathBuf,
         guest: String,
     },
@@ -1149,8 +1156,16 @@ impl Filesystem {
                 .create_new(flags.create && flags.exclusive)
                 .truncate(flags.truncate && flags.write)
                 .append(flags.append && flags.write);
-            let file = options.open(&host).map_err(|e| FsError::io(OP, &host, &e))?;
-            Entry::File { file, readable: flags.read, writable: flags.write, host, guest: shown }
+            let file = backend::open(&options, &host, flags.truncate && flags.write)
+                .map_err(|e| FsError::io(OP, &host, &e))?;
+            Entry::File {
+                file,
+                readable: flags.read,
+                writable: flags.write,
+                append: flags.append && flags.write,
+                host,
+                guest: shown,
+            }
         };
         table.open.insert(fd, entry);
         Ok(fd)
@@ -1168,7 +1183,12 @@ impl Filesystem {
             // Dropping the entry closes the host handle. A close that the host itself fails is
             // not reportable through `Drop`, and POSIX already says the descriptor is gone
             // whatever `close` returned.
-            Some(_) => {
+            Some(entry) => {
+                // A file shortened while mapped is shortened on the host once nothing maps it;
+                // a close is one of the moments that can be (see `windows.rs`).
+                if let Entry::File { file, .. } = &entry {
+                    backend::settle(file);
+                }
                 // **And it leaves every interest list** -- see [`epoll`] for why a number reused
                 // by the next `open` must not inherit a watch on the object this one named.
                 for entry in table.open.values_mut() {
@@ -1984,6 +2004,17 @@ impl Filesystem {
                     ));
                 }
                 let guest = guest.clone();
+                // A read ends at the end of file, and a logical one is where it is.
+                let buf = match backend::logical_len(file) {
+                    Some(eof) => {
+                        use std::io::Seek;
+                        let at = file.stream_position().map_err(|e| FsError::io(OP, &guest, &e))?;
+                        let left = usize::try_from(eof.saturating_sub(at)).unwrap_or(usize::MAX);
+                        let take = buf.len().min(left);
+                        &mut buf[..take]
+                    }
+                    None => buf,
+                };
                 file.read(buf).map_err(|e| FsError::io(OP, &guest, &e))
             }
         }
@@ -2079,6 +2110,14 @@ impl Filesystem {
                     ));
                 }
                 let guest = guest.clone();
+                let buf = match backend::logical_len(file) {
+                    Some(eof) => {
+                        let left = usize::try_from(eof.saturating_sub(offset)).unwrap_or(usize::MAX);
+                        let take = buf.len().min(left);
+                        &mut buf[..take]
+                    }
+                    None => buf,
+                };
                 backend::pread(file, buf, offset).map_err(|error| match error {
                     FsError::Io { kind, detail, .. } => FsError::Io {
                         operation: OP,
@@ -2115,6 +2154,15 @@ impl Filesystem {
                 "a file mapping of a descriptor not open for reading (EACCES)",
             )),
             Some(Entry::File { file, guest, .. }) => {
+                // The bytes past a logical end of file are not the file's.
+                let buf = match backend::logical_len(file) {
+                    Some(eof) => {
+                        let left = usize::try_from(eof.saturating_sub(offset)).unwrap_or(usize::MAX);
+                        let take = buf.len().min(left);
+                        &mut buf[..take]
+                    }
+                    None => buf,
+                };
                 let mut filled = 0usize;
                 while filled < buf.len() {
                     let read = backend::pread(file, &mut buf[filled..], offset + filled as u64)
@@ -2248,7 +2296,7 @@ impl Filesystem {
         match table.open.get(&fd) {
             None => Err(bad_fd(OP, fd)),
             Some(Entry::File { file, writable: true, guest, .. }) => {
-                file.set_len(length).map_err(|error| FsError::io(OP, guest, &error))
+                backend::truncate(file, length).map_err(|error| FsError::io(OP, guest, &error))
             }
             Some(_) => Err(FsError::kinded(
                 OP,
@@ -2369,8 +2417,11 @@ impl Filesystem {
                     0 => 0,
                     1 => i64::try_from(handle.stream_position().map_err(io)?)
                         .map_err(|_| invalid("the current offset does not fit an off_t"))?,
-                    2 => i64::try_from(file.metadata().map_err(io)?.len())
-                        .map_err(|_| invalid("the file's size does not fit an off_t"))?,
+                    2 => i64::try_from(match backend::logical_len(file) {
+                        Some(eof) => eof,
+                        None => file.metadata().map_err(io)?.len(),
+                    })
+                    .map_err(|_| invalid("the file's size does not fit an off_t"))?,
                     _ => return Err(invalid("whence is none of SEEK_SET, SEEK_CUR and SEEK_END")),
                 };
                 let target = base
@@ -2543,7 +2594,7 @@ impl Filesystem {
                  keeps the NetError kind — see this seam's `read` for why performing it here \
                  would flatten ECONNRESET and EPIPE onto the same answer",
             )),
-            Some(Entry::File { file, writable, guest, .. }) => {
+            Some(Entry::File { file, writable, append, guest, .. }) => {
                 if !*writable {
                     return Err(FsError::kinded(
                         OP,
@@ -2553,7 +2604,7 @@ impl Filesystem {
                     ));
                 }
                 let guest = guest.clone();
-                file.write(buf).map_err(|e| FsError::io(OP, &guest, &e))
+                backend::write(file, buf, *append).map_err(|e| FsError::io(OP, &guest, &e))
             }
         }
     }
@@ -2612,7 +2663,7 @@ impl Filesystem {
         }
         let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
         let metadata = std::fs::metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
-        Ok(describe(&host, &metadata))
+        Ok(with_logical_len(describe(&host, &metadata), &host))
     }
 
     /// `lstat(2)`: describe what a path names **without** following a final symlink.
@@ -2641,7 +2692,7 @@ impl Filesystem {
         }
         let host = self.resolve(OP, guest_path, FinalLink::Describe)?;
         let metadata = std::fs::symlink_metadata(&host).map_err(|e| FsError::io(OP, &host, &e))?;
-        Ok(describe(&host, &metadata))
+        Ok(with_logical_len(describe(&host, &metadata), &host))
     }
 
     /// `fstat(2)`: describe what a descriptor is open on.
@@ -2762,7 +2813,11 @@ impl Filesystem {
             }
             Some(Entry::File { file, host, .. }) => {
                 let metadata = file.metadata().map_err(|e| FsError::io(OP, host, &e))?;
-                Ok(describe(host, &metadata))
+                let mut stat = describe(host, &metadata);
+                if let Some(eof) = backend::logical_len(file) {
+                    stat.size = eof;
+                }
+                Ok(stat)
             }
         }
     }
@@ -3196,6 +3251,16 @@ fn describe(host: &Path, metadata: &std::fs::Metadata) -> FileStat {
         created: since_epoch(metadata.created().ok()),
         identity: identity(host),
     }
+}
+
+/// `stat` of a regular file that has a logical end of file (see `windows.rs`) reports that end.
+fn with_logical_len(mut stat: FileStat, host: &Path) -> FileStat {
+    if stat.kind == FileKind::Regular {
+        if let Some(eof) = backend::logical_len_at(host) {
+            stat.size = eof;
+        }
+    }
+    stat
 }
 
 /// A host timestamp as a duration since the Unix epoch.

@@ -997,6 +997,15 @@ impl Drop for MappableFile {
         // keeps the section and the file alive until the last view is unmapped.
         unsafe {
             CloseHandle(self.section);
+        }
+        // **The section first, then the file seam told.** A section alone -- no view -- stops the
+        // host shortening its file (MEASURED, `fs/windows.rs`), and a region map drops a backing
+        // only after unmapping its last view, so this may be the moment a file the guest
+        // shortened while it was mapped can be shortened on the host. `self.file` is still open
+        // for the file seam to identify the file by.
+        crate::fs::section_closed(self.file);
+        // SAFETY: as above.
+        unsafe {
             CloseHandle(self.file);
         }
     }

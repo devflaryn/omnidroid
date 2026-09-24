@@ -316,11 +316,16 @@ impl Call {
 /// partial last page is honoured: the bytes past the end of the file read as zero and a store
 /// there never reaches it.
 ///
+/// Shortening the file while it is mapped -- `ftruncate`, or an `open` with `O_TRUNC` -- is what
+/// Linux does and what the Windows host refuses (`ERROR_USER_MAPPED_FILE`, 1224). MEASURED, the
+/// engine does it: `memProfStorage<pid>.json` is re-opened `O_TRUNC` while an earlier mapping of it
+/// is live, and the refusal killed a TaskScheduler worker. So the file seam answers it as Linux
+/// does, keeping a logical end of file until the last view goes (`omni-platform`'s
+/// `fs/windows.rs`); the one difference is that the view's pages past that end read zeros where
+/// Linux raises `SIGBUS` on a whole page, which no correct program touches.
+///
 /// **What it cannot do, refused rather than approximated:**
 ///
-/// * Shortening the file while it is mapped -- `ftruncate`, or an `open` with `O_TRUNC` -- is
-///   refused *by the host* (`ERROR_USER_MAPPED_FILE`, 1224), which the descriptor layer reports as
-///   a refusal naming it. Linux allows it and faults later accesses. The engine unmaps first.
 /// * A mapping reaching whole pages past the end of the file, and a mapping of an empty file.
 ///   Linux maps both and raises `SIGBUS` on touching the pages; a host view cannot extend past its
 ///   file without growing the file, which would be a write the guest never made.

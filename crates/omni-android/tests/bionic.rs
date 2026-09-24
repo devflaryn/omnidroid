@@ -12350,10 +12350,12 @@ fn guest_store_w(f: &Fixture, at: u64, value: u32) {
 ///
 /// What would make this pass while the mapping did not write the file: nothing. A copy-on-write
 /// view (`PAGE_WRITECOPY`) or an anonymous copy leaves the file at the fallocated zeros, and the
-/// first assertion on `disk` says so. The re-`open` with `O_TRUNC` after the first `munmap` only
-/// succeeds if unmapping really released the section -- the host refuses to truncate a file a
-/// section still holds (`ERROR_USER_MAPPED_FILE`, 1224), which the `ftruncate` near the end shows
-/// is refused by name while the mapping is live.
+/// first assertion on `disk` says so. The re-`open` with `O_TRUNC` after the first `munmap`
+/// shortens the host file at once only if unmapping really released the section -- a Windows
+/// host will not shorten a file a section still holds (`ERROR_USER_MAPPED_FILE`, 1224) and keeps
+/// a logical end instead, which would leave the host file 1 MiB long and fail the length
+/// assertion on `disk`. The `ftruncate` near the end shortens the file while it *is* mapped, as
+/// Linux does.
 #[test]
 fn a_shared_writable_file_mapping_writes_the_file_it_maps() {
     let _guard = serialized();
@@ -12406,24 +12408,19 @@ fn a_shared_writable_file_mapping_writes_the_file_it_maps() {
     assert_eq!(call_with_errno(&f, "msync", &[at, n, 4]), (0, 0));
     assert_eq!(&std::fs::read(&host).expect("read")[8..16], &second.to_le_bytes());
 
-    // Shortening a mapped file is the one thing the Windows host will not do, and it is a refusal
-    // naming the host's reason rather than an errno the guest would believe. macOS allows it, as
-    // Linux does (MEASURED: the call returns 0), so there the call is made to the length the file
-    // already has -- a real truncate the host accepts, which leaves the mapping's pages inside the
-    // file for the rest of this test.
+    // Shortening a mapped file is answered as Linux answers it, on every host: 0, and the file is
+    // shorter. The Windows host refuses the call itself (`ERROR_USER_MAPPED_FILE`, 1224), and the
+    // file seam keeps a logical end of file until nothing maps the file (`fs/windows.rs`). Eight
+    // bytes off and back: the file still reaches into the mapping's last page, so every page of
+    // it stays valid for the rest of this test, as on Linux.
     let other = open_through_guest(&f, tmp, O_RDWR);
-    if cfg!(target_os = "windows") {
-        let refusal = refusal_of(&f, "ftruncate", |asm| {
-            asm.mov(0, other as u64);
-            asm.mov(1, 0);
-        });
-        assert!(refusal.to_string().contains("1224"), "{refusal}");
-    } else {
-        // A unix host has no such limit -- Linux and macOS, like the device, truncate a file
-        // a shared mapping still holds. Setting the length it already has is answered 0 and
-        // leaves the mapping and the file intact for the rest of the test.
-        assert_eq!(call_with_errno(&f, "ftruncate", &[other as u64, n]), (0, 0));
-    }
+    let stat = f.guest.data + 0x600;
+    assert_eq!(call_with_errno(&f, "ftruncate", &[other as u64, n - 8]), (0, 0));
+    assert_eq!(call_with_errno(&f, "fstat", &[other as u64, stat as u64]), (0, 0));
+    assert_eq!(read_u64_guest(&f, stat + 48), n - 8, "st_size: the file is shorter while mapped");
+    assert_eq!(call_with_errno(&f, "ftruncate", &[other as u64, n]), (0, 0));
+    assert_eq!(call_with_errno(&f, "fstat", &[other as u64, stat as u64]), (0, 0));
+    assert_eq!(read_u64_guest(&f, stat + 48), n, "and as long again");
     assert_eq!(call_with_errno(&f, "close", &[other as u64]), (0, 0));
 
     // `close`, then `AtomicCacheWrite`'s rename: the file in place is `n` bytes of what was written.
@@ -12438,8 +12435,106 @@ fn a_shared_writable_file_mapping_writes_the_file_it_maps() {
     assert_eq!(&disk[..8], &head.to_le_bytes());
     assert_eq!(&disk[8..16], &second.to_le_bytes());
     assert_eq!(&disk[16..24], &third.to_le_bytes(), "a store after the msync, before the munmap");
-    assert_eq!(&disk[n as usize - 8..], &tail.to_le_bytes());
+    assert_eq!(&disk[n as usize - 8..], &[0u8; 8], "the eight bytes cut off came back as zeros");
 }
+
+/// **A file a `MAP_SHARED` mapping still holds is re-opened `O_TRUNC` as Linux does it**, and every
+/// size the guest can see is the truncated one.
+///
+/// MEASURED on Windows (2026-09-25, the engine on its real server flags): a TaskScheduler worker
+/// died five seconds into the session on `open` of `files/appData/LocalStorage/
+/// memProfStorage<pid>.json`, refused with host error 1224 (`ERROR_USER_MAPPED_FILE`): the engine
+/// re-opens the file with `O_TRUNC` while an earlier `MAP_SHARED` mapping of it is still live.
+/// Linux (and so the device) shortens the file; the Windows host refuses to shorten a mapped file
+/// at all, so the file seam keeps a logical end of file until nothing maps it
+/// (`omni-platform`'s `fs/windows.rs`).
+///
+/// The sequence: open and write, map `MAP_SHARED`, open again `O_TRUNC` (succeeds), write new
+/// content, `fstat`/`stat`, read it back through both descriptors and the mapping, append through
+/// an `O_APPEND` descriptor, `munmap`, close -- and then the host file's real length is the one
+/// the guest was told, with exactly the bytes it wrote.
+#[test]
+fn a_file_a_shared_mapping_holds_is_reopened_truncating_as_linux_does() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("mmap-shared-trunc");
+    let path = "/memProfStorage18980.json";
+    let host = scratch.path("memProfStorage18980.json");
+    let stat = f.guest.data + 0x600;
+    let source = f.guest.data + 0x1000;
+    let sink = f.guest.data + 0x2000;
+    let st_size = |fd: i32| {
+        assert_eq!(call_with_errno(&f, "fstat", &[fd as u64, stat as u64]), (0, 0), "fstat");
+        read_u64_guest(&f, stat + 48)
+    };
+    let write = |fd: i32, bytes: &[u8]| {
+        f.guest.write_bytes(source, bytes);
+        call_with_errno(&f, "write", &[fd as u64, source as u64, bytes.len() as u64])
+    };
+
+    // Open and write the first report, and map it.
+    let old: Vec<u8> = (0..3000u32).map(|n| b'a' + (n % 26) as u8).collect();
+    let first = open_through_guest(&f, path, O_RDWR | O_CREAT | O_TRUNC);
+    assert!(first >= 3, "open: {first}");
+    assert_eq!(write(first, &old), (3000, 0));
+    let (at, errno) = mmap_errno(&f, 3000, 3, 0x01, first, 0);
+    assert_ne!(at, u64::MAX, "MAP_FAILED, errno {errno}");
+    assert_eq!(read_guest(&f, at as usize, 16), &old[..16], "the mapping is the file");
+
+    // The re-open that died: `O_TRUNC` while the mapping is live.
+    let second = open_through_guest(&f, path, O_RDWR | O_CREAT | O_TRUNC);
+    assert!(second >= 3, "O_TRUNC of a file a shared mapping holds must open, as on Linux: {second}");
+    assert_eq!(st_size(second), 0, "fstat: truncated");
+    assert_eq!(st_size(first), 0, "the other descriptor's fstat too");
+    let named = f.cstring(f.guest.data + 0x100, path.as_bytes());
+    assert_eq!(call_with_errno(&f, "stat", &[named as u64, stat as u64]), (0, 0));
+    assert_eq!(read_u64_guest(&f, stat + 48), 0, "stat: truncated");
+    assert_eq!(
+        call_with_errno(&f, "read", &[first as u64, sink as u64, 64]),
+        (0, 0),
+        "the first descriptor, at offset 3000, is past the end of file"
+    );
+
+    // The new report.
+    let new = b"{\"memProfStorage\":[1,2,3]}";
+    let len = new.len() as u64;
+    assert_eq!(write(second, new), (len as i64, 0));
+    assert_eq!(st_size(second), len, "fstat: what was written");
+    assert_eq!(call_with_errno(&f, "stat", &[named as u64, stat as u64]), (0, 0));
+    assert_eq!(read_u64_guest(&f, stat + 48), len, "stat: what was written");
+    assert_eq!(
+        call_with_errno(&f, "pread", &[second as u64, sink as u64, 4096, 0]),
+        (len as i64, 0),
+        "pread ends at the end of file, not at the 3000 bytes the host still holds"
+    );
+    assert_eq!(read_guest(&f, sink, new.len()), new);
+    assert_eq!(read_guest(&f, at as usize, new.len()), new, "the mapping shows the new bytes");
+
+    // `O_APPEND` appends at the end the guest was told of.
+    let tail = open_through_guest(&f, path, O_WRONLY | O_APPEND_GUEST);
+    assert!(tail >= 3, "open O_APPEND: {tail}");
+    assert_eq!(write(tail, b"\n"), (1, 0));
+    assert_eq!(st_size(first), len + 1);
+    assert_eq!(
+        call_with_errno(&f, "pread", &[first as u64, sink as u64, 4096, 0]),
+        (len as i64 + 1, 0)
+    );
+    assert_eq!(read_guest(&f, sink, new.len() + 1), [&new[..], b"\n"].concat());
+
+    // Unmapped and closed: the host file is exactly what the guest was told it is.
+    assert_eq!(call_with_errno(&f, "munmap", &[at, 3000]), (0, 0));
+    assert_eq!(
+        std::fs::metadata(&host).expect("the host file").len(),
+        len + 1,
+        "once nothing maps the file, the host's length is the guest's"
+    );
+    for fd in [first, second, tail] {
+        assert_eq!(call_with_errno(&f, "close", &[fd as u64]), (0, 0));
+    }
+    assert_eq!(std::fs::read(&host).expect("read"), [&new[..], b"\n"].concat());
+}
+
+/// The guest's `O_APPEND`.
+const O_APPEND_GUEST: u64 = 0o2000;
 
 /// **An offset, and a length ending inside the file's last page**, checked against bytes the file
 /// held beforehand -- so a mapping of the wrong part of the file cannot pass -- and Linux's

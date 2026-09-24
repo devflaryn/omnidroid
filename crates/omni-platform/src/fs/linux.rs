@@ -37,7 +37,9 @@ use std::os::fd::AsRawFd;
 
 use super::error::{FsError, FsResult};
 
-pub(super) use super::unix::{pread, pwrite, volume_stats};
+pub(super) use super::unix::{
+    logical_len, logical_len_at, open, pread, pwrite, settle, truncate, volume_stats, write,
+};
 
 /// `posix_fallocate(fd, 0, end)`: the bytes `0..end` of the file allocated, so that no write
 /// into the range the guest named can fail for space; the file extended to `end` when it is
