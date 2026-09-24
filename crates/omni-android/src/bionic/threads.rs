@@ -1057,12 +1057,18 @@ fn run_exit_destructors(
             )));
             return;
         };
+        // Counted where the backend can count; see `drive` for the backend that cannot.
+        let budget = if cpu.capabilities().counted_step_limit {
+            EXIT_DESTRUCTOR_BUDGET
+        } else {
+            RunLimit::Unlimited
+        };
         if let Err(error) = boundary.call_guest(
             cpu,
             "a guest thread's exit destructor",
             target,
             &[GuestArg::Int(value)],
-            EXIT_DESTRUCTOR_BUDGET,
+            budget,
         ) {
             *death = stack_at_death(boundary, cpu, cpu.pc());
             failure = Some(GuestThreadState::Failed(format!(
@@ -1084,11 +1090,19 @@ fn drive(
 ) -> GuestThreadState {
     let sentinel = boundary.sentinel();
     let mut pc = entry;
+    // **A backend that cannot count guest instructions** -- the native one, `omni-cpu`'s
+    // `native-hvf` -- refuses a counted window with `CpuError::Unsupported`, which would kill every
+    // thread it is given. Its thread runs unbounded instead and is stopped through its `HaltHandle`,
+    // which `Bionic::stop_guest_threads` requests (the backend honours it within one watchdog
+    // tick). A counting backend takes exactly the path it always did.
+    let counted = cpu.capabilities().counted_step_limit;
+    let limit = if counted { RunLimit::Instructions(window) } else { RunLimit::Unlimited };
+    let _halt = (!counted).then(|| bionic.watch_uncounted_halt(cpu.halt_handle()));
     loop {
         if bionic.guest_threads_stopping() {
             return GuestThreadState::Stopped;
         }
-        match boundary.run(cpu, pc, RunLimit::Instructions(window)) {
+        match boundary.run(cpu, pc, limit) {
             // The start routine's own `RET` lands on the sentinel, which is how a call into guest
             // code finishes. `X0` is its `void *`.
             Ok(ExitReason::Returned { pc: at }) if at == sentinel => {
