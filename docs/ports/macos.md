@@ -195,6 +195,9 @@ So a hypervisor backend is only a win if the hot imports stop being exits (serve
 guest threads are multiplexed onto vCPUs; whether the compute it buys back outweighs that is the
 number still to be measured, in the world, once parity holds.
 
+> **Measured in full on branch `mac-hvf`**, with a prototype behind `GuestCpu` that runs the M2 and
+> M3 gates natively and a D31 draft: see [`macos-hvf.md`](macos-hvf.md).
+
 ## Merge notes
 
 Shared files this port edits, each minimal and additive, none changing Windows behaviour:

@@ -12,6 +12,13 @@ description = "OS primitives for Omnidroid. The only crate permitted to use cfg(
 [dependencies]
 thiserror = { workspace = true }
 
+[features]
+# `hypervisor`: the Hypervisor.framework seam (src/hypervisor), and the stage-2 mirror's hook in
+# vm/macos.rs. Off by default: only `omni-cpu`'s `native-hvf` turns it on, so a default build neither
+# links the framework nor carries the hook. Implemented on macOS on Apple silicon; elsewhere every
+# entry point refuses by name.
+hypervisor = []
+
 # Structural unix backends only need sysconf(_SC_PAGESIZE); see src/vm/unix.rs.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

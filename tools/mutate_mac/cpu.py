@@ -39,6 +39,34 @@ def cpu(*tests):
             "-- --test-threads=1"]
 
 
+
+# The native backend's rows (`mac-hvf-*`, docs/ports/macos-hvf.md). Every command runs its test binary
+# through `tools/hvf_run.sh`, which signs it with `com.apple.security.hypervisor`; without that the
+# suites fail at `hv_vm_create` (HV_DENIED), which the pre-flight would report as a failing command.
+HVF_PLATFORM = "crates/omni-platform/src/hypervisor/macos.rs"
+HVF_VM = "crates/omni-platform/src/vm/macos.rs"
+HVF_CPU = "crates/omni-cpu/src/native/mod.rs"
+HVF_SYSTEM = "crates/omni-cpu/src/native/system.rs"
+HVF_THREADS = "crates/omni-android/src/bionic/threads.rs"
+HVF_BIONIC = "crates/omni-android/src/bionic/mod.rs"
+
+
+def hvf(package, feature, target, only=""):
+    """A signed `cargo test` of one target with the native backend's feature on."""
+    return ["sh", "-c",
+            "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=$PWD/tools/hvf_run.sh CARGO_BUILD_JOBS=4 "
+            f"cargo test -p {package} --release --features {feature} --test {target} "
+            f"--no-fail-fast -- --test-threads=1 {only}"]
+
+
+HVF_PLAT_TESTS = hvf("omni-platform", "hypervisor", "hypervisor_macos")
+HVF_CPU_TESTS = hvf("omni-cpu", "native-hvf", "native")
+HVF_INIT_GATE = hvf("omni-android", "native-hvf", "native_initializers")
+# The translating backend's own runaway-thread test: the B row below must not touch dynarmic.
+BIONIC_RUNAWAY = ["sh", "-c",
+                  "CARGO_BUILD_JOBS=4 cargo test -p omni-android --release --test bionic "
+                  "--no-fail-fast -- --test-threads=1 a_runaway_guest_thread_stops_at_a_window_boundary"]
+
 ROWS = [
     # --- 0002: the Interpret terminal -------------------------------------------------------------
     ("mac-cpu-A1", "A", "0002 reverted: the Interpret terminal asserts instead of calling the fallback",
@@ -276,4 +304,160 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
      """    mem.invalidate(mem.ptr(), prelude_info.end_of_prelude);""",
      """    mem.invalidate_all();""",
      dyn("code_cache_charge")),
+    # --- the native backend (Hypervisor.framework), docs/ports/macos-hvf.md ----------------------
+    ("mac-hvf-P1", "A", "stage-2 update maps without unmapping first: a replaced object is not re-bound",
+     HVF_PLATFORM,
+     """        let result = unmap(from, to - from).and_then(|()| {""",
+     """        let result = Ok(()).and_then(|()| {""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P2", "A", "a PROT_NONE host page is mapped readable at stage 2",
+     HVF_PLATFORM,
+     """    let mut flags = 0;
+    if prot & libc::PROT_READ != 0 {""",
+     """    let mut flags = HV_MEMORY_READ;
+    if prot & libc::PROT_READ != 0 {""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P3", "A", "vm/macos.rs's mprotect is not mirrored: a commit or protect never reaches stage 2",
+     HVF_VM,
+     """        return Err(errno());
+    }
+    mirrored(address, size, protection);
+    Ok(())""",
+     """        return Err(errno());
+    }
+    Ok(())""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P4", "A", "the decommit primitive (fresh MAP_FIXED) is not mirrored: the guest keeps the old pages",
+     HVF_VM,
+     """    debug_assert_eq!(mapped as usize, address, "MAP_FIXED returns the requested base");
+    mirrored(address, size, libc::PROT_NONE);""",
+     """    debug_assert_eq!(mapped as usize, address, "MAP_FIXED returns the requested base");""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P5", "A", "detach leaves the range mapped at stage 2",
+     HVF_PLATFORM,
+     """        mirror.overlays.remove(&key);
+    }
+    let _ = unmap(base, len);""",
+     """        mirror.overlays.remove(&key);
+    }""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P6", "A", "a host change to an overlaid page overwrites the overlay",
+     HVF_PLATFORM,
+     """    for (&overlay, _) in mirror.overlays.range(start as u64..end as u64) {""",
+     """    for (&overlay, _) in mirror.overlays.range(0..0) {""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P7", "A", "the vCPU limit is not checked: the 65th is the framework's error, not VcpuLimit",
+     HVF_PLATFORM,
+     """    if live >= max {""",
+     """    if false && live >= max {""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P8", "A", "Q registers written byte-reversed through the asm trampoline",
+     HVF_PLATFORM,
+     """    let bytes = value.to_le_bytes();""",
+     """    let bytes = value.to_be_bytes();""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-P9", "A", "attach does not check the IPA size",
+     HVF_PLATFORM,
+     """    if limits.ipa_bits == 0 || (end as u64) > (1u64 << limits.ipa_bits) {""",
+     """    if limits.ipa_bits == 0 {""",
+     HVF_PLAT_TESTS),
+    ("mac-hvf-C1", "A", "TPIDR_EL0 is not saved back: a guest MSR to it is lost",
+     HVF_CPU,
+     """        self.regs.tpidr_el0 = cpu.sys_reg(SysReg::TpidrEl0)?;""",
+     """        let _ = cpu.sys_reg(SysReg::TpidrEl0)?;""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C2", "A", "a register set between runs on the same thread is not loaded",
+     HVF_CPU,
+     """            if full || self.dirty.x & (1 << i) != 0 {""",
+     """            if full {""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C3", "A", "the vector file is not saved at an exit",
+     HVF_CPU,
+     """        for i in 0..32u8 {
+            self.regs.v[i as usize] = cpu.simd(i)?;
+        }""",
+     """        for i in 0..0u8 {
+            self.regs.v[i as usize] = cpu.simd(i)?;
+        }""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C4", "A", "a stage-2 abort is never paged in: every lazy first touch is a fault",
+     HVF_CPU,
+     """        omni_mem::admit(&self.shared.space, address, 1, access).is_ok()""",
+     """        omni_mem::admit(&self.shared.space, address, 1, access).is_ok() && false""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C5", "B", "the demand-paging answer skips the policy: any address in the space is admitted",
+     HVF_CPU,
+     """        omni_mem::admit(&self.shared.space, address, 1, access).is_ok()""",
+     """        { let _ = access; self.shared.space.ensure_committed(address & !(self.shared.space.page_size() - 1), 1).is_ok() }""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C6", "A", "a registered thunk's BRK is not recognised as the thunk",
+     HVF_CPU,
+     """        if traps_at_address && self.thunks.contains(&at) {""",
+     """        if false && traps_at_address && self.thunks.contains(&at) {""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C7", "A", "a thunk on a writable data page is not reported when the fetch aborts",
+     HVF_CPU,
+     """                                } else if self.thunks.contains(&at) {
+                                    Some(ExitReason::Thunk { pc: at })""",
+     """                                } else if false {
+                                    Some(ExitReason::Thunk { pc: at })""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C8", "A", "a counted run is not refused: it runs unbounded",
+     HVF_CPU,
+     """        if limit.instructions().is_some() {""",
+     """        if false && limit.instructions().is_some() {""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C9", "A", "WnR read backwards: a refused store is a read",
+     HVF_CPU,
+     """                            } else if iss & ISS_WNR != 0 {
+                                AccessKind::Write""",
+     """                            } else if iss & ISS_WNR == 0 {
+                                AccessKind::Write""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C10", "A", "the trapped CNTPCT_EL0 returns zero",
+     HVF_CPU,
+     """                            let value = hv::counter_now().wrapping_sub(thread.vtimer_offset);""",
+     """                            let value = 0u64;""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C11", "A", "an EL1-vector exit saves the vCPU's own PC (the vector) rather than ELR_EL1",
+     HVF_CPU,
+     """        if traps_at_address && self.sentinel == Some(at) {
+            self.save(thread, elr, spsr)""",
+     """        if traps_at_address && self.sentinel == Some(at) {
+            self.save(thread, cpu.reg(Reg::Pc).unwrap_or(0), spsr)""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C12", "A", "a veneer BRK at an unregistered address is reported as the guest's own BRK",
+     HVF_CPU,
+     """            ec::BRK64 if (iss & 0xFFFF) as u32 == 0xF00D && self.is_veneer(at) => {""",
+     """            ec::BRK64 if false => {""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C13", "A", "the veneer page is overlaid on a page of real code",
+     HVF_CPU,
+     """            Some(region) if region.protection.is_executable() => {""",
+     """            Some(region) if false && region.protection.is_executable() => {""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-C14", "A", "EL1 is configured without FP/SIMD enabled at EL0",
+     HVF_SYSTEM,
+     """const CPACR_EL1: u64 = 3 << 20;""",
+     """const CPACR_EL1: u64 = 0;""",
+     HVF_CPU_TESTS),
+    ("mac-hvf-A1", "A", "guest threads on a backend that cannot count are given counted windows",
+     HVF_THREADS,
+     """    let limit = if counted { RunLimit::Instructions(window) } else { RunLimit::Unlimited };""",
+     """    let limit = RunLimit::Instructions(window);""",
+     HVF_INIT_GATE),
+    ("mac-hvf-A2", "B", "guest threads on a counting backend run unbounded, losing their window boundaries",
+     HVF_THREADS,
+     """    let limit = if counted { RunLimit::Instructions(window) } else { RunLimit::Unlimited };""",
+     """    let limit = if false { RunLimit::Instructions(window) } else { RunLimit::Unlimited };""",
+     BIONIC_RUNAWAY),
+    ("mac-hvf-A3", "A", "stop_guest_threads does not halt a thread that has no run windows",
+     HVF_BIONIC,
+     """        for halt in self.uncounted_halts.lock().values() {
+            halt.request();
+        }""",
+     """        for halt in self.uncounted_halts.lock().values() {
+            let _ = halt;
+        }""",
+     HVF_INIT_GATE),
 ]

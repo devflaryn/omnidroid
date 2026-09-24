@@ -55,6 +55,8 @@ mod exit;
 #[cfg(all(feature = "dynarmic", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod dynarmic;
 mod fastmem;
+#[cfg(all(feature = "native-hvf", target_arch = "aarch64"))]
+pub mod native;
 mod regs;
 pub mod run;
 mod thunk;

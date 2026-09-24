@@ -52,6 +52,12 @@ parking_lot = { workspace = true }
 # was a lost wake.
 parking_lot_core = { workspace = true }
 
+[features]
+# The native backend (`omni-cpu`'s `native-hvf`: Hypervisor.framework, arm64 macOS), for this
+# crate's test targets that measure it (`tests/native_initializers.rs`). Off by default; nothing in
+# this crate's own code names a backend.
+native-hvf = ["omni-cpu/native-hvf"]
+
 [dev-dependencies]
 # The translating backend, **for test targets only**. The boundary's assertions are about real
 # translated ARM64 code branching into a real thunk region; a mock would assert facts about the

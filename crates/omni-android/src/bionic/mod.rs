@@ -419,6 +419,11 @@ pub struct Bionic {
     /// D16's shape: a watchdog over a guest that never returns is built from short budget
     /// windows, because the halt flag is checked at terminals a counted budget makes exclusive.
     threads_stopping: AtomicBool,
+    /// The halt handles of running guest threads whose backend **cannot count** instructions, so
+    /// has no run windows to read `threads_stopping` between (the native backend). Empty on a
+    /// counting backend. See `threads::drive`.
+    uncounted_halts: Mutex<BTreeMap<u64, omni_cpu::HaltHandle>>,
+    next_uncounted_halt: AtomicU64,
     /// Every **raw** `futex` syscall the guest has made, with the guest thread that made it.
     ///
     /// See [`Bionic::futex_calls`].
@@ -656,6 +661,8 @@ impl Bionic {
             threads_done: Condvar::new(),
             thread_failures: Mutex::new(Vec::new()),
             threads_stopping: AtomicBool::new(false),
+            uncounted_halts: Mutex::new(BTreeMap::new()),
+            next_uncounted_halt: AtomicU64::new(0),
             futex_calls: Mutex::new(Vec::new()),
             futex_calls_dropped: AtomicU64::new(0),
             parked: Mutex::new(Vec::new()),
@@ -1759,6 +1766,12 @@ impl Bionic {
     /// down.
     pub fn stop_guest_threads(&self) {
         self.threads_stopping.store(true, Ordering::Release);
+        // **And halt every thread running on a backend that cannot count**, which has no window
+        // boundary at which to read the switch above (see `threads::drive`). Nothing is
+        // registered here on a counting backend.
+        for halt in self.uncounted_halts.lock().values() {
+            halt.request();
+        }
         // **And wake everything parked on a futex**, which the switch above cannot reach: it is
         // read between run windows, and a parked thread never ends one. See `AddressFutex::stop`
         // for the measurement that made this necessary -- implementing the raw `futex` syscall is
@@ -1877,6 +1890,20 @@ impl Bionic {
     #[must_use]
     pub fn futex_calls_dropped(&self) -> u64 {
         self.futex_calls_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Register a running guest thread's halt handle for [`stop_guest_threads`] to request, for as
+    /// long as the returned guard lives. Only for a backend that cannot count; see `threads::drive`.
+    ///
+    /// [`stop_guest_threads`]: Bionic::stop_guest_threads
+    pub(crate) fn watch_uncounted_halt(&self, halt: omni_cpu::HaltHandle) -> UncountedHalt<'_> {
+        let id = self.next_uncounted_halt.fetch_add(1, Ordering::Relaxed);
+        if self.guest_threads_stopping() {
+            // Registered after the stop was asked for: honour it now rather than never.
+            halt.request();
+        }
+        self.uncounted_halts.lock().insert(id, halt);
+        UncountedHalt { bionic: self, id }
     }
 
     /// Whether [`stop_guest_threads`](Bionic::stop_guest_threads) has been called.
@@ -2406,5 +2433,18 @@ mod tests {
             dir >= bionic.dirents_base() && dir + DIRENT_BYTES <= arena + ARENA_BYTES,
             "a dirent slot at {dir:#x} is outside the dirent table"
         );
+    }
+}
+
+/// Keeps a guest thread's halt handle registered with its instance. See
+/// [`Bionic::watch_uncounted_halt`].
+pub(crate) struct UncountedHalt<'a> {
+    bionic: &'a Bionic,
+    id: u64,
+}
+
+impl Drop for UncountedHalt<'_> {
+    fn drop(&mut self) {
+        self.bionic.uncounted_halts.lock().remove(&self.id);
     }
 }
