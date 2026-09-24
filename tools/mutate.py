@@ -8073,6 +8073,12 @@ directory", ADAPTER_FILES,
      """    invalidate(c, at, len)?;
     match space.protect(at, len, protection) {""",
      ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "a_range_one_guest_thread_unmaps"]),
+    # D31 decided (2026-09-24): the exclusive monitor defaults to value-compare.
+    ("monitor-A1", "A", "the runtime defaults to the global exclusive monitor again",
+     "crates/omni-cpu/src/dynarmic/mod.rs",
+     "            exclusive_monitor: ExclusiveMonitor::ValueCompare,",
+     "            exclusive_monitor: ExclusiveMonitor::Global,",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--test", "exclusive", "--no-fail-fast"]),
 ]
 
 

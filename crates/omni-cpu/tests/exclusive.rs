@@ -272,3 +272,14 @@ fn aba_across_another_threads_exclusive_store_is_the_one_difference() {
         "value-compare, ABA"
     );
 }
+
+/// **The runtime's default is value-compare -- D31, decided.** A pinned decision rather than a
+/// discovery: flipping the default back is a decision to record, and this is what makes it a
+/// visible one. The evidence is D31's (a game world's workers at the global monitor 3-8.5% of their
+/// samples; a tenth of the cost per atomic), and the correctness evidence is the rest of this file.
+#[test]
+fn the_runtime_default_is_value_compare() {
+    let options = omni_cpu::dynarmic::DynarmicOptions::default();
+    assert_eq!(options.exclusive_monitor, ExclusiveMonitor::ValueCompare);
+    assert!(options.unsafe_optimizations(), "dynarmic's gate for the flag has to be open with it");
+}

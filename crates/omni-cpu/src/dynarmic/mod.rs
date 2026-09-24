@@ -244,7 +244,11 @@ impl Default for DynarmicOptions {
             interruptible: true,
             check_halt_on_memory_access: true,
             assert_callback_free_slices: true,
-            exclusive_monitor: ExclusiveMonitor::Global,
+            // D31, decided 2026-09-24: a game world's busy workers spent 3-8.5% of their samples
+            // at the global monitor (one process-wide lock plus a 256-slot inline scan per store);
+            // value-compare costs a tenth per atomic and scales. `OMNI_JIT_EXCLUSIVE_MONITOR=global`
+            // is the way back, announced.
+            exclusive_monitor: ExclusiveMonitor::ValueCompare,
             optimizations_override: None,
         }
     }

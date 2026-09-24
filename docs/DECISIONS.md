@@ -3910,10 +3910,9 @@ place there, under **"What fastmem does not check"**, rather than deleted.
 
 ## D31 — How guest exclusives are made atomic: dynarmic's global monitor, or value-compare
 
-**Status: OPEN. The runtime stays on dynarmic's global monitor (`ExclusiveMonitor::Global`, the
-default); `ExclusiveMonitor::ValueCompare` exists, is tested, and is selected only by
-`OMNI_JIT_EXCLUSIVE_MONITOR=value`, which announces itself.** This record says what has been
-measured and what would decide it. It is not a vendored change: `Unsafe_IgnoreGlobalMonitor` is
+**Status: DECIDED 2026-09-24 -- value-compare is the default (`ExclusiveMonitor::ValueCompare`);
+`OMNI_JIT_EXCLUSIVE_MONITOR=global` is the way back, announced.** It was OPEN until a world was
+measured (below, "What decided it"); this record keeps what was measured before. It is not a vendored change: `Unsafe_IgnoreGlobalMonitor` is
 dynarmic's own optimization flag, opened through its own `unsafe_optimizations` gate.
 
 ### What the two arms are
@@ -3954,6 +3953,21 @@ difference is invisible: a retry loop that succeeds on an unchanged value is the
 A world measurement: the `mon` share `OMNI_PERF`'s sampler reports on the busy threads, and
 presents per 5 s with each arm, same scenario, n stated. If the monitor is not where a world's
 time goes, the default stays. Recorded here when measured.
+
+### What decided it (2026-09-24)
+
+**MEASURED in a game world** (place 606849621, the owner's session, n = 1, idle camera, ~12 fps,
+the global monitor): the busiest TaskScheduler workers spent **3-8.5% of their sampled time at the
+monitor** (g229 8.5%, g160 8.3%, g230 6.6%, g161 6.3%, g2/g3 ~5%); the game loop 0%. Not the
+bottleneck of a frame, and not nothing: a cost paid on every guest atomic of every worker, which
+the benchmark prices at 131 ns under the 256-slot global monitor against 12.8 ns. The owner then
+asked for no more real-game runs, so the **value-compare arm was not measured in a world**: what
+was measured is the landing (gate passes, `exclusive monitors value-compare (2048 slots)`, no
+guest thread died) and the whole omni-cpu/omni-android suites, including this record's stress
+test under both arms. The decision rests on the per-atomic cost, the world share, and the
+correctness evidence above; `the_runtime_default_is_value_compare` pins it (row `monitor-A1`).
+**What would reverse it**: a lost update or a hang in a run under value-compare that
+`OMNI_JIT_EXCLUSIVE_MONITOR=global` does not show.
 
 ## D32 — A guest thread's fixed JIT cost is paid on demand: vendored patch 0002
 
