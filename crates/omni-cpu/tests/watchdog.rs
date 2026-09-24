@@ -174,7 +174,8 @@ fn the_configuration_that_makes_the_budget_work_is_in_effect() {
     assert_eq!(
         config.optimizations & RETURN_STACK_BUFFER,
         0,
-        "arm64: the return stack buffer is OFF -- patch 0018 is x64-only, and the arm64 `PopRSBHint`          checks neither the budget nor the halt flag"
+        "arm64: the return stack buffer is OFF -- patch 0018 is x64-only, and the arm64 `PopRSBHint` \
+         checks neither the budget nor the halt flag"
     );
     #[cfg(target_arch = "x86_64")]
     assert_ne!(
