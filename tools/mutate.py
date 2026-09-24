@@ -8400,6 +8400,124 @@ directory", ADAPTER_FILES,
      """            if true || truncating {
                 forget(&file)?;""",
      ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+
+    # ---- admitcache: `admit` and `region_at` answered from a per-thread cache -------------------
+    # The profile put the region map's lock at 28-35% of the busy threads' own-code samples, so a
+    # hit now takes no lock (`omni-mem/src/cache.rs`). The whole soundness argument is "every
+    # change to the map bumps the generation first", so A1-A6 each drop ONE bump -- by taking the
+    # raw lock instead of `write()` -- and must be caught by the test for that kind of change.
+    #
+    # There is deliberately no row for `map_anonymous` or `map_file` skipping the bump, and that is
+    # a finding, not an omission: a map may only land on FREE space (`require_free`), free space is
+    # never remembered, and `make_exact_placeholder` with `require_free` touches only free entries,
+    # so no remembered entry can be made untrue by a map. The bump is kept there because "every
+    # write section bumps" is the rule that makes the rest checkable; a row for it would MISS, and
+    # a row that cannot fail is worse than no row (VERIFICATION.md entry 12).
+    ("admitcache-A1", "A", "protect does not bump the generation, so a cached RW entry admits a write",
+     SPACE,
+     """        let mut inner = self.write();
+        inner.require_mapped(OP, address, len)?;""",
+     """        let mut inner = self.inner.lock();
+        inner.require_mapped(OP, address, len)?;""",
+     MEM),
+    ("admitcache-A2", "A", "unmap does not bump the generation, so an unmapped address is admitted",
+     SPACE,
+     """        let mut inner = self.write();
+        inner.unmap_range(OP, address, len)?;""",
+     """        let mut inner = self.inner.lock();
+        inner.unmap_range(OP, address, len)?;""",
+     MEM),
+    ("admitcache-A3", "A", "a commit does not bump, so region_at reports a committed granule as owed",
+     SPACE,
+     """        let mut inner = self.write();
+        let committed = inner.commit_range(OP, address, len)?;""",
+     """        let mut inner = self.inner.lock();
+        let committed = inner.commit_range(OP, address, len)?;""",
+     MEM),
+    ("admitcache-A4", "A", "an idle mark does not bump, so the extent from before its split is reported",
+     SPACE,
+     """        let mut inner = self.write();
+        let marked = inner.mark_idle(address, len);""",
+     """        let mut inner = self.inner.lock();
+        let marked = inner.mark_idle(address, len);""",
+     MEM),
+    ("admitcache-A5", "A", "reclaim does not bump, so decommitted memory is answered `committed`",
+     SPACE,
+     """        let mut inner = self.write();
+        let reclaimed = inner.reclaim()?;""",
+     """        let mut inner = self.inner.lock();
+        let reclaimed = inner.reclaim()?;""",
+     MEM),
+    ("admitcache-A6", "A", "no write section bumps at all", SPACE,
+     """        let inner = self.inner.lock();
+        self.generation.bump();
+        inner""",
+     """        let inner = self.inner.lock();
+        inner""",
+     MEM),
+    ("admitcache-A7", "A", "a slot is used whatever generation it was filled at",
+     "crates/omni-mem/src/cache.rs",
+     """                && key.generation == current
+""",
+     """                && (key.generation == current || current != 0)
+""",
+     MEM),
+    ("admitcache-A8", "A", "a slot answers for any space whose addresses it covers",
+     "crates/omni-mem/src/cache.rs",
+     """            if key.space == generation.id
+                && key.generation == current""",
+     """            if key.space != 0
+                && key.generation == current""",
+     MEM),
+    ("admitcache-A9", "A", "the fast path skips rule 2, so a straddling access is answered from one entry",
+     ACCESS,
+     """    if access_end > hit.end() {
+        return None;
+    }""",
+     """    if false && access_end > hit.end() {
+        return None;
+    }""",
+     MEM),
+    ("admitcache-A10", "A", "the fast path skips rule 3, so a cached read-only entry admits a write",
+     ACCESS,
+     """    if !permits(hit.protection, access) {
+        return None;
+    }""",
+     """    if false && !permits(hit.protection, access) {
+        return None;
+    }""",
+     MEM),
+    ("admitcache-A11", "A", "the fast path skips rule 4, so a cached entry still owed a commit is not committed",
+     ACCESS,
+     """    if hit.anonymous && !hit.is_committed() {
+        return None;
+    }""",
+     """    if false && hit.anonymous && !hit.is_committed() {
+        return None;
+    }""",
+     MEM),
+    # B: the cache still correct, and no longer doing the one thing it exists for.
+    ("admitcache-B1", "B", "admit never answers from the cache: correct, and back on the lock",
+     ACCESS,
+     """        space.remembered(address).and_then(|hit| admitted_from(&hit, address, len, access))""",
+     """        space.remembered(address).filter(|_| false).and_then(|hit| admitted_from(&hit, address, len, access))""",
+     MEM),
+    ("admitcache-B2", "B", "region_at never answers from the cache: correct, and back on the lock",
+     SPACE,
+     """        if let Some(region) = self.remembered(address).and_then(|hit| hit.anonymous_region()) {""",
+     """        if let Some(region) = self.remembered(address).filter(|_| false).and_then(|hit| hit.anonymous_region()) {""",
+     MEM),
+    ("admitcache-B3", "B", "reads bump the generation too, so every lookup invalidates every cache",
+     SPACE,
+     """    fn read(&self) -> MapRead<'_> {
+        MapRead(self.inner.lock())
+    }""",
+     """    fn read(&self) -> MapRead<'_> {
+        let inner = self.inner.lock();
+        self.generation.bump();
+        MapRead(inner)
+    }""",
+     MEM),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

@@ -57,6 +57,7 @@ pub mod access;
 mod arena;
 mod backing;
 mod budget;
+mod cache;
 mod entry;
 mod error;
 mod pager;

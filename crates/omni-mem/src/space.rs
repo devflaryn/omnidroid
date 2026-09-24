@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use omni_platform::vm::{self, Protection, Reservation};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::backing::Backing;
+use crate::cache::{self, Generation};
 use crate::entry::{Entry, EntryMap, Owner, OsState, ViewId};
 use crate::error::{platform, MemError, MemResult};
 use crate::region::RegionInfo;
@@ -290,13 +291,35 @@ pub struct SpaceStats {
 ///
 /// `Send + Sync`. The region map is behind one lock, held only for the duration of a single
 /// operation. Guest loads and stores do not go through here at all — they are ordinary memory
-/// accesses — so this lock is not on the guest's hot path; only guest `mmap`-family calls are.
+/// accesses. **Guest pointer checks do**: every import handler's bounds check and `omni-cpu`'s
+/// instruction fetch ask [`crate::admit`], which asks [`region_at`](GuestSpace::region_at). Those
+/// are answered from a per-thread cache with no lock and no shared write while the map has not
+/// changed; `crate::cache` has the measurement that made that necessary and the ordering argument
+/// that makes it exact. Every path that takes the lock to change the map goes through
+/// `GuestSpace::write`, which is what tells the cache.
 pub struct GuestSpace {
     base: GuestAddr,
     len: usize,
     page: usize,
     granule: usize,
     inner: Mutex<Inner>,
+    /// Bumped by every write section, under the lock and before the write; read without the lock
+    /// by `crate::cache` to decide whether a remembered entry is still true.
+    generation: Generation,
+}
+
+/// The map lock, held for reading only.
+///
+/// Only `Deref`, deliberately: the per-thread cache is only sound if every change to the map bumps
+/// [`GuestSpace::generation`], and the way to make "every" true is for a path that did not bump to be
+/// unable to change anything. Such a path does not compile.
+struct MapRead<'a>(MutexGuard<'a, Inner>);
+
+impl core::ops::Deref for MapRead<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
 }
 
 struct Inner {
@@ -428,7 +451,24 @@ impl GuestSpace {
                 max_committed: config.max_committed,
                 max_commit_request: config.max_commit_request,
             }),
+            generation: Generation::new(),
         })
+    }
+
+    /// Take the map lock to **change** the map, telling every thread's cache first.
+    ///
+    /// The bump is made with the lock held and before the caller has touched anything, and it is
+    /// made whether or not the caller then changes anything: a spurious bump costs one refill per
+    /// thread, and a missing one is a stale answer. See `crate::cache` for why this is the order.
+    fn write(&self) -> MutexGuard<'_, Inner> {
+        let inner = self.inner.lock();
+        self.generation.bump();
+        inner
+    }
+
+    /// Take the map lock to **read** the map. See [`MapRead`].
+    fn read(&self) -> MapRead<'_> {
+        MapRead(self.inner.lock())
     }
 
     /// Base address of the guest address space.
@@ -514,7 +554,7 @@ impl GuestSpace {
     ) -> MemResult<GuestAddr> {
         const OP: &str = "map_anonymous";
         let size = self.round_size(OP, size)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         let address = self.place(&mut inner, OP, placement, size)?;
         inner.make_exact_placeholder(OP, address, size, true)?;
 
@@ -605,7 +645,7 @@ impl GuestSpace {
                 required: self.page as u64,
             });
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         let address = self.place(&mut inner, OP, placement, size)?;
         inner.make_exact_placeholder(OP, address, size, true)?;
 
@@ -670,7 +710,7 @@ impl GuestSpace {
             return Err(MemError::ZeroSize { operation: OP });
         }
         self.check_range(OP, address, len)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         let committed = inner.commit_range(OP, address, len)?;
         inner.validate();
         Ok(committed)
@@ -704,7 +744,7 @@ impl GuestSpace {
         let len = self.round_size(OP, len)?;
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         inner.require_mapped(OP, address, len)?;
         inner.protect_range(OP, address, len, protection)?;
         inner.validate();
@@ -739,7 +779,7 @@ impl GuestSpace {
         let len = self.round_size(OP, len)?;
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         inner.unmap_range(OP, address, len)?;
         inner.validate();
         tracing::debug!(address = format_args!("{address:#x}"), len, "unmapped guest memory");
@@ -758,8 +798,8 @@ impl GuestSpace {
     /// # The flush runs with the map unlocked
     ///
     /// The views are found under the lock and written back after it is released, because a
-    /// write-back is disk I/O -- the engine syncs 100 MiB mappings -- and **every** bounds check of
-    /// every import handler and every pager fault takes this lock (see
+    /// write-back is disk I/O -- the engine syncs 100 MiB mappings -- and any bounds check of any
+    /// import handler that misses its thread's cache, and every pager fault, takes this lock (see
     /// [`map_lock_is_held`](GuestSpace::map_lock_is_held)). The backings are held by `Arc` across
     /// the gap, so the section and its file handle cannot go away under the flush. A guest thread
     /// that unmaps the range *during* its own `msync` is racing itself, as it would be on Linux;
@@ -777,7 +817,7 @@ impl GuestSpace {
         self.check_range(OP, address, len)?;
         let end = address + len;
         let views: Vec<(GuestAddr, usize, Arc<Backing>)> = {
-            let inner = self.inner.lock();
+            let inner = self.read();
             inner
                 .map
                 .starts_overlapping(address, len)
@@ -824,7 +864,7 @@ impl GuestSpace {
         let len = self.round_size(OP, len)?;
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         let marked = inner.mark_idle(address, len);
         inner.validate();
         Ok(marked)
@@ -849,7 +889,7 @@ impl GuestSpace {
     ///
     /// [`MemError::Platform`] if a decommit or a coalesce fails.
     pub fn reclaim_idle(&self) -> MemResult<Reclaimed> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         let reclaimed = inner.reclaim()?;
         inner.validate();
         tracing::debug!(
@@ -869,26 +909,55 @@ impl GuestSpace {
     /// line the guest would expect to read.
     #[must_use]
     pub fn regions(&self) -> Vec<RegionInfo> {
-        self.inner.lock().regions(true)
+        self.read().regions(true)
     }
 
     /// Every *mapped* region, in address order: [`regions`](GuestSpace::regions) without the free
     /// ranges. This is the `/proc/self/maps` shape.
     #[must_use]
     pub fn mapped_regions(&self) -> Vec<RegionInfo> {
-        self.inner.lock().regions(false)
+        self.read().regions(false)
     }
 
     /// The region containing an address, if it is mapped.
+    ///
+    /// Answered from this thread's cache when the map has not changed since this thread last looked
+    /// at an **anonymous** entry covering `address` -- with no lock and nothing written that another
+    /// thread reads -- and otherwise under the lock, which refills the cache. Either way the answer
+    /// is the one a locked lookup at the current generation returns, field for field; `crate::cache`
+    /// has the argument. A file-backed region always takes the lock, because rebuilding its
+    /// [`RegionKind::File`](crate::RegionKind::File) would mean cloning the file's name, and that
+    /// clone is a write to a reference count every thread shares.
     #[must_use]
     pub fn region_at(&self, address: GuestAddr) -> Option<RegionInfo> {
-        let inner = self.inner.lock();
-        let start = inner.map.entry_start(address)?;
-        let entry = inner.map.get(start)?;
-        if entry.is_free() {
-            return None;
+        if let Some(region) = self.remembered(address).and_then(|hit| hit.anonymous_region()) {
+            cache::answered(cache::Answered::Region);
+            return Some(region);
         }
-        Some(RegionInfo::from_entry(start, entry))
+        self.region_at_locked(address)
+    }
+
+    /// [`region_at`](GuestSpace::region_at) under the lock, remembering what it found.
+    fn region_at_locked(&self, address: GuestAddr) -> Option<RegionInfo> {
+        let (at, region) = {
+            let inner = self.read();
+            let start = inner.map.entry_start(address)?;
+            let entry = inner.map.get(start)?;
+            if entry.is_free() {
+                return None;
+            }
+            // Read under the same lock as the entry: the tag says which map this came from.
+            (self.generation.locked(), RegionInfo::from_entry(start, entry))
+        };
+        cache::remember(&self.generation, at, &region);
+        Some(region)
+    }
+
+    /// The entry covering `address`, if this thread remembers it and the map has not changed since.
+    /// No lock. A miss says nothing about the address; ask [`region_at`](GuestSpace::region_at).
+    #[inline]
+    pub(crate) fn remembered(&self, address: GuestAddr) -> Option<cache::Remembered> {
+        cache::lookup(&self.generation, address)
     }
 
     /// Whether any page of `[at, at + len)` is mapped executable right now.
@@ -899,7 +968,7 @@ impl GuestSpace {
     /// an unmap, reprotect or discard over a range with none has nothing to invalidate.
     #[must_use]
     pub fn any_executable(&self, at: GuestAddr, len: usize) -> bool {
-        let inner = self.inner.lock();
+        let inner = self.read();
         let end = at.saturating_add(len);
         let mut cursor = at;
         while cursor < end {
@@ -921,11 +990,13 @@ impl GuestSpace {
     ///
     /// # Why a space needs this and a caller cannot get it any other way
     ///
-    /// One `Mutex` guards the whole map, and **every** guest memory check goes through it:
+    /// One `Mutex` guards the whole map, and **every** guest memory check can end up in it:
     /// `region_at` is on the path of every bounds check in every import handler, and the pager
-    /// takes it to commit a page on a fault. So a thread that holds it while blocked stops the
-    /// entire runtime, and from outside that looks exactly like the guest having stopped — the
-    /// import census freezes, no guest instructions are executed, and nothing names a lock.
+    /// takes it to commit a page on a fault. Most checks are answered from a per-thread cache
+    /// without it (`crate::cache`), but any check that misses -- which is every check on every
+    /// thread after any change to the map -- waits for it. So a thread that holds it while blocked
+    /// stops the entire runtime, and from outside that looks exactly like the guest having stopped
+    /// — the import census freezes, no guest instructions are executed, and nothing names a lock.
     ///
     /// A **fault handler holds it without ever crossing the boundary**, which is what makes this
     /// invisible to the crossing records: the pager is not an import, so a thread inside it is
@@ -942,7 +1013,7 @@ impl GuestSpace {
     /// What the space currently holds.
     #[must_use]
     pub fn stats(&self) -> SpaceStats {
-        self.inner.lock().stats()
+        self.read().stats()
     }
 
     /// Tear the space down, reporting any failure.
@@ -956,7 +1027,7 @@ impl GuestSpace {
     /// [`MemError::Platform`] if any teardown step fails. The space is left as consistent as
     /// possible and the remaining steps are still attempted.
     pub fn close(self) -> MemResult<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         inner.release_all()
     }
 
@@ -1086,7 +1157,7 @@ impl core::fmt::Debug for GuestSpace {
 
 impl Drop for GuestSpace {
     fn drop(&mut self) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.write();
         if let Err(error) = inner.release_all() {
             // Teardown failing means address space or commit charge has leaked for the life of the
             // process, which is exactly the kind of thing that must not be silent.

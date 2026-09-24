@@ -36,6 +36,18 @@
 //! the length, because dynarmic hands it over, so it checks it — and the two are the same rule
 //! applied to the information each side actually has.
 //!
+//! # Most answers take no lock
+//!
+//! [`admit`] is on the path of every import handler's pointer check and of `omni-cpu`'s instruction
+//! fetch, and taking the region map's lock for each one was the largest cost in this workspace's own
+//! code (`crate::cache` has the profile). So an access wholly inside one entry this thread has looked
+//! at since the map last changed, that the entry's protection permits, and that leaves rule 4
+//! nothing to commit, is answered from the thread's cache: no lock, and nothing written that another
+//! thread reads. The answer is the one the rules below give, not a second implementation of them --
+//! see `admitted_from` for why each field is what the locked walk would return. Everything else --
+//! an access that crosses an entry, a refusal, a granule still owed a commit -- takes the walk below
+//! exactly as before, and the walk refills the cache.
+//!
 //! # What is deliberately *not* here
 //!
 //! The guest address-space extent. `omni-cpu` checks `GuestAddressSpace::contains` before calling,
@@ -45,6 +57,7 @@
 
 use omni_platform::fault::FaultAccess;
 
+use crate::cache::{self, Remembered};
 use crate::space::{GuestAddr, GuestSpace};
 use crate::{Protection, RegionInfo, RegionKind};
 
@@ -113,6 +126,14 @@ pub fn admit(
     len: usize,
     access: FaultAccess,
 ) -> Result<Admitted, Refusal> {
+    // The common case, with no lock: see the module documentation and `admitted_from`.
+    if let Some(admitted) =
+        space.remembered(address).and_then(|hit| admitted_from(&hit, address, len, access))
+    {
+        cache::answered(cache::Answered::Admit);
+        return Ok(admitted);
+    }
+
     // Rule 1, first half: something has to be there at all.
     let Some(region) = space.region_at(address) else {
         return Err(Refusal::NotMapped);
@@ -213,6 +234,66 @@ pub fn admit(
         fully_committed,
         anonymous,
     })
+}
+
+/// What [`admit`] returns for `[address, address + len)`, when one remembered entry is enough to
+/// know it -- and `None` whenever it is not, which sends the caller to the locked walk.
+///
+/// `hit` is the entry containing `address` exactly as a locked `region_at` would return it at the
+/// current generation (`crate::cache`), so the question is only whether the walk in [`admit`] would
+/// look at anything else. It would not, when all three of these hold, and each is checked with the
+/// walk's own arithmetic:
+///
+/// * **The access ends inside this entry** (`address + max(len, 1) <= end`). Then `covered_end`
+///   already reaches `access_end`, the loop over further entries does not run, `first_mapping_end`
+///   stays `None`, and the walk reports `end` as this entry's end. An access that reaches the next
+///   entry -- a straddled granule boundary, the seam into `.bss`, free space -- is `None` here.
+/// * **The protection permits it**, so [`admits_region`] would pass: it is not free (a free entry is
+///   never remembered), the extent is the first point, and this is the third. A refusal is `None`
+///   here rather than answered: refusals are reported and rare, and the walk words them.
+/// * **Rule 4 has nothing to do.** The walk commits only when the entry is not committed end to end
+///   *and* is anonymous. An anonymous entry still owed a commit is `None` here, so the commit is
+///   made by the walk, under the lock, as it always was. A file-backed entry is never "committed"
+///   (its pages cost no commit charge), so the walk takes its `!fully_committed` branch, commits
+///   nothing for it, and returns `committed: 0` -- which is what this returns.
+///
+/// So `committed` is always 0, `fully_committed` is the entry's own [`RegionInfo::is_committed`], and
+/// `anonymous` is its kind: the three values the walk computes from this one entry.
+#[inline]
+fn admitted_from(
+    hit: &Remembered,
+    address: GuestAddr,
+    len: usize,
+    access: FaultAccess,
+) -> Option<Admitted> {
+    let access_end = address.checked_add(len.max(1))?;
+    if access_end > hit.end() {
+        return None;
+    }
+    if !permits(hit.protection, access) {
+        return None;
+    }
+    if hit.anonymous && !hit.is_committed() {
+        return None;
+    }
+    Some(Admitted {
+        start: hit.start,
+        end: hit.end(),
+        committed: 0,
+        fully_committed: hit.is_committed(),
+        anonymous: hit.anonymous,
+    })
+}
+
+/// How many answers this thread's [`admit`] and [`GuestSpace::region_at`] have given from the
+/// per-thread cache rather than under the region map's lock: `(admit, region_at)`.
+///
+/// A diagnostic, and the witness that the fast paths are taken at all -- a fast path that silently
+/// stopped being taken would still give every right answer. Per thread, over every space.
+#[doc(hidden)]
+#[must_use]
+pub fn cache_answers() -> (u64, u64) {
+    cache::answers()
 }
 
 /// How far a **byte-wise scan** may run from `address` without leaving the mapping it starts in.
