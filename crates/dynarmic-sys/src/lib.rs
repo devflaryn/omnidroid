@@ -295,8 +295,9 @@ pub mod optimization {
     /// Emitted blocks jump directly to a successor whose PC is known at
     /// translation time. The cycle counter *is* checked on this path.
     pub const BLOCK_LINKING: u32 = 0x0000_0001;
-    /// Return-address prediction. Its terminal handler checks nothing; see
-    /// [`super::OdConfig::optimizations`].
+    /// Return-address prediction. Upstream's terminal handler checks nothing; **patch 0003**
+    /// (`patches/`) makes a hit check the cycle budget and the halt flag as
+    /// `ReturnFromRunCode` does, which is what lets [`INTERRUPTIBLE`] keep it.
     pub const RETURN_STACK_BUFFER: u32 = 0x0000_0002;
     /// Two-tier dispatch with an MRU cache. Its terminal handler checks
     /// nothing either.
@@ -311,10 +312,12 @@ pub mod optimization {
     pub const NONE: u32 = 0;
     /// Every safe optimization; dynarmic's own default.
     pub const ALL_SAFE: u32 = 0x0000_FFFF;
-    /// `ALL_SAFE` without the two flags whose terminal handlers skip the cycle
-    /// and halt checks. This is the configuration in which a runaway guest can
-    /// still be stopped.
-    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !(RETURN_STACK_BUFFER | FAST_DISPATCH);
+    /// `ALL_SAFE` without the one flag whose terminal handler skips the cycle and
+    /// halt checks: [`FAST_DISPATCH`]. The configuration in which a runaway guest
+    /// can still be stopped. It cleared [`RETURN_STACK_BUFFER`] too until patch
+    /// 0003 gave that handler the checks (`0x0000_FFF9` then, `0x0000_FFFB` now):
+    /// MEASURED 132.0 -> 24.1 ns per call+return at 262,144 blocks (D33).
+    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;
     /// dynarmic's `Unsafe_IgnoreGlobalMonitor`: exclusive loads and stores no longer take the
     /// monitor's process-wide spin lock, and an exclusive store no longer clears every other
     /// processor's matching reservation. What remains is a per-processor reservation (address and

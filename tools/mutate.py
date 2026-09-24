@@ -8079,6 +8079,14 @@ directory", ADAPTER_FILES,
      "            exclusive_monitor: ExclusiveMonitor::ValueCompare,",
      "            exclusive_monitor: ExclusiveMonitor::Global,",
      ["cargo", "test", "-p", "omni-cpu", "--release", "--test", "exclusive", "--no-fail-fast"]),
+    # D33 / patch 0003. The patch's own two checks (the RSB hit's budget and halt) are C++ in the
+    # vendored tree, which the build script does not watch -- only `vendor/PIN.txt` -- so they were
+    # hand-mutated and recorded in D33 rather than carried as rows here.
+    ("rsb-A1", "A", "INTERRUPTIBLE clears the return stack buffer again",
+     "crates/dynarmic-sys/src/lib.rs",
+     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;",
+     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !(RETURN_STACK_BUFFER | FAST_DISPATCH);",
+     ["cargo", "test", "-p", "dynarmic-sys", "--release", "--test", "a64_exec", "--no-fail-fast"]),
 ]
 
 

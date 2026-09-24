@@ -10,7 +10,7 @@
 //! | Configuration | Direct-branch loop | Indirect-branch loop | Cost |
 //! |---|---|---|---|
 //! | `ALL_SAFE`, cycle counting | budget stops it | **nothing stops it** | baseline |
-//! | `INTERRUPTIBLE` (`0xFFF9`), cycle counting | budget stops it | budget stops it | ~3.9 ns per indirect transfer (n = 31): **1.00x** on code with no indirect branches, 4.56x-4.71x on indirect-saturated code |
+//! | `INTERRUPTIBLE` (`0xFFF9`; `0xFFFB` since patch 0003, D33), cycle counting | budget stops it | budget stops it | ~3.9 ns per indirect transfer (n = 31): **1.00x** on code with no indirect branches, 4.56x-4.71x on indirect-saturated code |
 //! | `BlockLinking` off (`0xFFF8`) | both escapes work on both | both escapes work on both | **7.08x-7.43x** across D16's three workloads (n = 31) |
 //!
 //! **`INTERRUPTIBLE` with block linking left on** (D16's `0xFFF9`). The third row buys a second
@@ -157,16 +157,24 @@ fn the_configuration_that_makes_the_budget_work_is_in_effect() {
 
     assert_eq!(config.enable_cycle_counting, 1, "no counting means no budget to expire");
 
-    // `INTERRUPTIBLE` is `ALL_SAFE` without the two flags whose terminal handlers check neither the
-    // cycle counter nor the halt flag.
+    // `INTERRUPTIBLE` is `ALL_SAFE` without the flag whose terminal handler checks neither the cycle
+    // counter nor the halt flag. The return stack buffer's handler checks both since vendored
+    // patch 0003 (D33), so it stays on -- it is what keeps a `RET` off the dispatcher.
     const RETURN_STACK_BUFFER: u32 = 0x02;
     const FAST_DISPATCH: u32 = 0x04;
     const BLOCK_LINKING: u32 = 0x01;
     assert_eq!(
-        config.optimizations & (RETURN_STACK_BUFFER | FAST_DISPATCH),
+        config.optimizations & FAST_DISPATCH,
         0,
-        "the return-stack-buffer and fast-dispatch terminal handlers jump straight from block to \
-         block checking nothing, which is what makes an indirect-branch loop unstoppable"
+        "the fast-dispatch terminal handler jumps straight from block to block checking nothing, \
+         which is what makes an indirect-branch loop unstoppable"
+    );
+    assert_ne!(
+        config.optimizations & RETURN_STACK_BUFFER,
+        0,
+        "the return stack buffer stays ON: patch 0003 made its hit path check the budget and the \
+         halt flag, and without it every guest `RET` is a dispatcher lookup (132 vs 24 ns per call \
+         and return at 262,144 blocks, D33)"
     );
     assert_ne!(
         config.optimizations & BLOCK_LINKING,

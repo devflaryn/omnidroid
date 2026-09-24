@@ -416,9 +416,10 @@ fn effective_config_reports_what_was_asked_for() {
     assert_eq!(cfg.optimizations, optimization::ALL_SAFE);
     assert_eq!(cfg.unsafe_optimizations, 0);
 
-    // The two flags whose terminal handlers check neither the cycle counter nor
-    // the halt flag must be assertable, because with them on a runaway guest
-    // cannot be stopped at all (see `tests/hostile.rs`).
+    // The flag whose terminal handler checks neither the cycle counter nor the
+    // halt flag must be assertable, because with it on a runaway guest cannot
+    // be stopped at all (see `tests/hostile.rs`). `ReturnStackBuffer` stays on:
+    // patch 0003 gave its handler both checks.
     let vm = Vm::new(
         vec![a64::svc(0)],
         VmOptions {
@@ -427,7 +428,7 @@ fn effective_config_reports_what_was_asked_for() {
         },
     );
     let cfg = vm.effective_config();
-    assert_eq!(cfg.optimizations & optimization::RETURN_STACK_BUFFER, 0);
+    assert_ne!(cfg.optimizations & optimization::RETURN_STACK_BUFFER, 0);
     assert_eq!(cfg.optimizations & optimization::FAST_DISPATCH, 0);
     assert_ne!(cfg.optimizations & optimization::BLOCK_LINKING, 0);
 

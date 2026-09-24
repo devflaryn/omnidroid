@@ -187,8 +187,9 @@ pub struct DynarmicOptions {
     /// How many guest threads this backend will be asked for. Sizes the exclusive monitor and the
     /// TLS arena.
     pub max_threads: u32,
-    /// Whether to clear the two optimization flags whose terminal handlers check neither the cycle
-    /// counter nor the halt flag.
+    /// Whether to clear the optimization flag whose terminal handler checks neither the cycle
+    /// counter nor the halt flag -- `FastDispatch`; it was two, with `ReturnStackBuffer`, until
+    /// vendored patch 0003 gave the return-stack-buffer handler both checks (D33).
     ///
     /// **Default `true`, and that is a deliberate trade.** Task 2 measured a guest `BR X30`
     /// branching to itself to be stoppable by *nothing* under the default flags — not a budget, not
@@ -1420,9 +1421,8 @@ impl GuestCpu for DynarmicCpu {
             asynchronous_halt: self.shared.options.interruptible,
             breakpoints: true,
             // See `add_inline_thunk`: the `SVC` terminal's `CheckHalt{PopRSBHint}` is what makes it
-            // possible, and `INTERRUPTIBLE` is what makes `PopRSBHint` reach the dispatcher rather
-            // than a return-stack-buffer guess. With the flag cleared the resume would be to
-            // whatever the RSB predicted, which is not the address the handler wrote.
+            // possible. `PopRSBHint` is keyed on the PC the handler wrote, so the resume is that
+            // address either way; the flag gates it because the path is only tested under it.
             inline_thunks: self.shared.options.interruptible,
         }
     }
@@ -1721,7 +1721,11 @@ impl GuestCpu for DynarmicCpu {
     /// Because a thunk is a planted `SVC` (`STOP_SVC`, this module's own constant) and `SVC`'s
     /// terminal in dynarmic's A64
     /// frontend is `CheckHalt{PopRSBHint}`. A callback that does **not** raise a halt falls through
-    /// `CheckHalt` into `PopRSBHint`, which with `ReturnStackBuffer` cleared —
+    /// `CheckHalt` into `PopRSBHint`, whose handler computes the location descriptor from the PC in
+    /// `JitState` — the one the callback wrote — and compares it with the top return-stack-buffer
+    /// entry. A hit jumps to that entry's block, which is therefore the written PC's block (the
+    /// `SVC` pushed its own PC + 4, so a callback that leaves the PC alone hits; since patch 0003,
+    /// D33, a hit also checks the halt flag and the budget). A miss, with `FastDispatch` cleared —
     /// `optimization::INTERRUPTIBLE`, which this backend sets by default (D16) — emits
     /// `ReturnFromRunCode`. And `ReturnFromRunCode` is **not** a return to the caller: it is the top
     /// of the emitted dispatcher loop (`block_of_code.cpp`, `GenRunCode`), which re-reads
@@ -1741,18 +1745,18 @@ impl GuestCpu for DynarmicCpu {
         handler: ThunkFn,
         context: ThunkContext,
     ) -> CpuResult<()> {
-        // **Refused rather than registered when the flag is clear**, because the resume would be a
-        // return-stack-buffer prediction rather than the address the handler wrote: the guest would
-        // carry on somewhere plausible with a register file the handler had already changed. That is
-        // Global Constraint 1's failure shape exactly, so the capability is checked here and not only
-        // advertised.
+        // **Refused rather than registered when the flag is clear.** This was first reasoned as "the
+        // resume would be a return-stack-buffer prediction"; it is not -- both the RSB and the
+        // fast-dispatch lookup are keyed on the PC the handler wrote (D33). What remains is that the
+        // thunk path is only exercised under `INTERRUPTIBLE`, and under the default flags a guest's
+        // indirect branches check no halt flag, so the configuration is refused, not assumed.
         if !self.shared.options.interruptible {
             return Err(CpuError::Unsupported {
                 backend: BACKEND_NAME,
                 operation: "dispatch a thunk inside the run loop",
-                reason: "`DynarmicOptions::interruptible` is false, so `PopRSBHint` does not reach \
-                         the emitted dispatcher and the guest would not resume at the address the \
-                         handler wrote",
+                reason: "`DynarmicOptions::interruptible` is false: the in-loop thunk path is only \
+                         tested under `optimization::INTERRUPTIBLE`, and under the default flags a \
+                         guest's fast-dispatched branches check no halt flag",
             });
         }
         self.with_ctx(|ctx| ctx.inline_thunks.insert(address, (handler, context)));

@@ -1,0 +1,21 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index fe60979..6337646 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -199,6 +199,16 @@ void A64EmitX64::GenTerminalHandlers() {
+         code.jne(code.GetReturnFromRunCodeAddress());
+     }
+     code.mov(rax, qword[r15 + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
++    // Omnidroid patch 0003: a return-stack-buffer hit checks what `ReturnFromRunCode` checks --
++    // the cycle budget when cycle counting is on, and the halt flag -- and on either leaves
++    // through it (the guest PC is already stored), so a guest loop through `RET` can be stopped
++    // and `ReturnStackBuffer` can stay on.
++    if (conf.enable_cycle_counting) {
++        code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
++        code.jng(code.GetReturnFromRunCodeAddress());
++    }
++    code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
++    code.jne(code.GetReturnFromRunCodeAddress());
+     code.jmp(rax);
+     PerfMapRegister(terminal_handler_pop_rsb_hint, code.getCurr(), "a64_terminal_handler_pop_rsb_hint");
+ 

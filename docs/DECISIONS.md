@@ -4011,3 +4011,68 @@ A prelude longer than 2 MiB would write past the committed range and fault in th
 constructor -- every test would show it at once, not rarely. If FastDispatch is ever turned on
 (D16 forbids it while it makes a guest loop unstoppable), the table is allocated exactly as
 upstream does.
+
+## D33 — `INTERRUPTIBLE` keeps the return stack buffer: vendored patch 0003
+
+**Decided 2026-09-24 (Windows session; the owner asked for optimizations that need no in-world
+test).** A change to the vendored dynarmic tree (D5) and to D16's flag set. Patch and figures:
+`crates/dynarmic-sys/patches/README.md` under 0003.
+
+### Why
+
+D16 cleared `ReturnStackBuffer` and `FastDispatch` because neither terminal handler checks the
+cycle budget or the halt flag, so one guest `BR`/`RET` loop could hold a host thread forever. The
+price was that **every guest `RET` went to the dispatcher**, whose `LookupBlock` is a hash-map
+probe. It is cheap while the block map is small and not once it is large. MEASURED
+(`omni-cpu/tests/bench.rs::the_cost_of_a_call_and_return_as_the_block_map_grows`, one `BL` + `RET`
+to a distinct function, median of 5, release):
+
+| call sites (blocks) | `INTERRUPTIBLE` 0xFFF9 | `INTERRUPTIBLE` 0xFFFB (0003) | `ALL_SAFE` |
+|---|---|---|---|
+| 64 (128) | 5.96 ns | 2.35 ns | 2.06–2.37 ns |
+| 1,024 (2,048) | 23.09 ns | 10.47 ns | 9.99–10.48 ns |
+| 16,384 (32,768) | 41.52 ns | 17.08 ns | 15.94–16.58 ns |
+| 131,072 (262,144) | 132.02 ns | 22.59 ns (24.07 in the first run after) | 24.30–26.29 ns |
+
+The patched column is one run, taken on an idle machine after the suites. The `ALL_SAFE` column
+spans the runs before and after. The patch does not affect it, so its spread is run-to-run noise.
+`INTERRUPTIBLE` now costs the same as `ALL_SAFE` on calls and returns.
+
+### The change
+
+The `PopRSBHint` handler, on a confirmed hit and before jumping to the predicted block, compares
+`cycles_remaining` with 0 when cycle counting is on, and `halt_reason` with 0. On either it leaves
+through `ReturnFromRunCode`, the path D16 relied on, which checks both again. The guest PC is
+already stored, so the exit is exact. `INTERRUPTIBLE` becomes `ALL_SAFE & !FastDispatch`
+(`0x0000_FFFB`). `FastDispatchHint` stays unchecked and stays off.
+
+A hit is a **verified** prediction: the handler compares the location descriptor computed from the
+PC in `JitState` with the stored one. So a runtime callback that rewrites the PC (an in-loop thunk,
+`omni-cpu`'s `add_inline_thunk`) resumes at the PC it wrote, hit or miss. The comments that said
+the RSB would resume "wherever it predicted" were wrong and are corrected. The in-loop thunk path
+stays gated on `interruptible`.
+
+### Evidence
+
+* `the_stoppability_matrix` grows from 27 to 39 cells. `return` (`BL`; `B` back; `RET`) and
+  `indirect-call` (`BLR` to a `RET`; `BR` back) stop in every cell under both `ALL_SAFE` and
+  `INTERRUPTIBLE`.
+* Hand mutations of the vendored C++, restored afterwards and checked by SHA-1:
+  - without the halt check, `return:0000FFFF:halt+budget` and `return:0000FFFB:halt+budget`
+    wedge;
+  - without the budget check, `indirect-call:0000FFFF:budget` wedges.
+  They are not `mutate.py` rows because the build script watches only `vendor/PIN.txt`.
+  `rsb-A1` (INTERRUPTIBLE clearing the RSB again) is a row, and it is caught.
+* dynarmic's own suite: 201,698 assertions in 84 cases pass with 0001 + 0002 + 0003.
+* Whole suites, release: dynarmic-sys, omni-cpu, omni-mem and omni-platform pass. omni-android
+  passes except the **headless** `gameactivity` gate, which fails on HANDOFF item 7's two known
+  causes (Windows 1224 on `memProfStorage`, and `eglGetDisplay`). Two tests had asserted
+  the RSB off (omni-cpu `watchdog.rs`, dynarmic-sys `a64_exec.rs`); both now assert it on.
+
+### What it costs if wrong
+
+A guest whose only loop is RSB hits keeps being stoppable only as long as the hit path checks; the
+two matrix detectors fail if it stops doing so. If `cycles_remaining` were read at the wrong stack
+offset, the budget would be misread on every hit. `indirect-call:0000FFFF:budget` expects exactly
+`0` remaining, so it would fail. No in-world measurement was taken: the owner's APK now fails
+Roblox's integrity check, and the owner asked for no further real-game tests until it is updated.

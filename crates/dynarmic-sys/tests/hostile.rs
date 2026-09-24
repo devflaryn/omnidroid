@@ -756,6 +756,17 @@ enum Shape {
     DirectBody,
     /// `BR X30` with `X30` pointing at itself.
     Indirect,
+    /// `BL` to a `RET`, then `B` back to the `BL` -- a call and a return,
+    /// forever. The `RET` is a `PopRSBHint` terminal that *hits* the return
+    /// stack buffer every time, which is the handler Omnidroid patch 0003
+    /// teaches to check the budget and the halt flag.
+    Return,
+    /// `BLR` to a `RET`, then `BR` back to the `BLR`: the same call and
+    /// return with no direct branch anywhere, so under `ALL_SAFE` the `RET`'s
+    /// handler is the only terminal on the loop that checks anything. This is
+    /// the shape that isolates patch 0003's *budget* check, which `Return`
+    /// cannot: its `B` already checks the budget.
+    IndirectCall,
 }
 
 impl Shape {
@@ -768,6 +779,16 @@ impl Shape {
             Self::DirectBody => vec![a64::add_imm(0, 0, 1), a64::b(-1)],
             // BR X30                            D61F03C0
             Self::Indirect => vec![a64::br(30)],
+            // BL +3  (to the RET)               94000003
+            // B  -1  (back to the BL)           17FFFFFF
+            // NOP                               D503201F
+            // RET                               D65F03C0
+            Self::Return => vec![a64::bl(3), a64::b(-1), a64::NOP, a64::ret(30)],
+            // BLR X1  (X1 = the RET)            D63F0020
+            // BR  X2  (X2 = the BLR)            D61F0040
+            // NOP                               D503201F
+            // RET                               D65F03C0
+            Self::IndirectCall => vec![a64::blr(1), a64::br(2), a64::NOP, a64::ret(30)],
         }
     }
 }
@@ -829,6 +850,10 @@ fn runaway_case(shape: Shape, optimizations: u32, escape: Escape) {
     if shape == Shape::Indirect {
         vm.set_reg(30, CODE_BASE);
     }
+    if shape == Shape::IndirectCall {
+        vm.set_reg(1, CODE_BASE + 0xC);
+        vm.set_reg(2, CODE_BASE);
+    }
     vm.start(escape.budget());
 
     if escape.halts() {
@@ -877,6 +902,8 @@ fn runaway_case_from_env() -> (Shape, u32, Escape) {
         "direct-empty" => Shape::DirectEmpty,
         "direct-body" => Shape::DirectBody,
         "indirect" => Shape::Indirect,
+        "return" => Shape::Return,
+        "indirect-call" => Shape::IndirectCall,
         other => panic!("unknown shape {other}"),
     };
     let optimizations = u32::from_str_radix(parts.next().unwrap(), 16).unwrap();
@@ -960,7 +987,10 @@ fn the_stoppability_matrix() {
     //    handlers (`GenTerminalHandlers`, `a64_emit_x64.cpp:169`) compute a
     //    location descriptor and jump, reading neither. Clearing
     //    `ReturnStackBuffer` and `FastDispatch` sends them to
-    //    `ReturnFromRunCode` instead.
+    //    `ReturnFromRunCode` instead. Omnidroid patch 0003 makes the RSB
+    //    *hit* check both, as `ReturnFromRunCode` does, so `INTERRUPTIBLE`
+    //    keeps `ReturnStackBuffer` and clears only `FastDispatch`
+    //    (`0x0000_FFFB`); the `return` cells below are its detector.
     //
     // `ReturnFromRunCode` (`block_of_code.cpp:362`) is the one path that checks
     // everything: `halt_reason` unconditionally, then `cycles_remaining` when
@@ -979,31 +1009,31 @@ fn the_stoppability_matrix() {
     // honoured?** A `false` there does not mean arming both is worse than
     // arming either alone -- it means the halt contributes nothing, and the
     // budget is then the only thing that could have stopped this guest.
-    let cases: [(&str, bool); 27] = [
+    let cases: [(&str, bool); 39] = [
         // Direct branches, `ALL_SAFE` and `INTERRUPTIBLE`: identical, because
         // neither clears `BlockLinking`. Cycle counting picks which single
         // escape exists, and with it on the halt is not honoured.
         ("direct-empty:0000FFFF:budget", true),
         ("direct-empty:0000FFFF:halt", true),
         ("direct-empty:0000FFFF:halt+budget", false),
-        ("direct-empty:0000FFF9:budget", true),
-        ("direct-empty:0000FFF9:halt", true),
-        ("direct-empty:0000FFF9:halt+budget", false),
+        ("direct-empty:0000FFFB:budget", true),
+        ("direct-empty:0000FFFB:halt", true),
+        ("direct-empty:0000FFFB:halt+budget", false),
         ("direct-body:0000FFFF:budget", true),
         ("direct-body:0000FFFF:halt", true),
         ("direct-body:0000FFFF:halt+budget", false),
-        ("direct-body:0000FFF9:budget", true),
-        ("direct-body:0000FFF9:halt", true),
-        ("direct-body:0000FFF9:halt+budget", false),
+        ("direct-body:0000FFFB:budget", true),
+        ("direct-body:0000FFFB:halt", true),
+        ("direct-body:0000FFFB:halt+budget", false),
         // Indirect branches. Nothing works under the defaults; everything works
         // once the two unchecked handlers are out of the way, including the
         // both-armed combination, because their fallback is the dispatcher.
         ("indirect:0000FFFF:budget", false),
         ("indirect:0000FFFF:halt", false),
         ("indirect:0000FFFF:halt+budget", false),
-        ("indirect:0000FFF9:budget", true),
-        ("indirect:0000FFF9:halt", true),
-        ("indirect:0000FFF9:halt+budget", true),
+        ("indirect:0000FFFB:budget", true),
+        ("indirect:0000FFFB:halt", true),
+        ("indirect:0000FFFB:halt+budget", true),
         // `BlockLinking` cleared as well. Every terminal now falls back to
         // `ReturnFromRunCode`, which checks the halt flag unconditionally and
         // the cycle counter when it is enabled -- so every cell stops,
@@ -1017,9 +1047,31 @@ fn the_stoppability_matrix() {
         ("indirect:0000FFF8:budget", true),
         ("indirect:0000FFF8:halt", true),
         ("indirect:0000FFF8:halt+budget", true),
+        // A call and a return. The direct `B` back to the call is a
+        // `LinkBlock` and checks one mechanism; the `RET` hits the return
+        // stack buffer, whose handler -- since patch 0003 -- checks both, as
+        // `ReturnFromRunCode` does. So `halt+budget` stops under both flag
+        // sets; without the patch it would wedge, as the direct cells do.
+        ("return:0000FFFF:budget", true),
+        ("return:0000FFFF:halt", true),
+        ("return:0000FFFF:halt+budget", true),
+        ("return:0000FFFB:budget", true),
+        ("return:0000FFFB:halt", true),
+        ("return:0000FFFB:halt+budget", true),
+        // The same call and return through `BLR` and `BR`. Under `ALL_SAFE`
+        // those two are unchecked fast-dispatch hints, so the `RET` alone
+        // decides every cell -- each of patch 0003's two checks has a cell
+        // that wedges without it. Under `INTERRUPTIBLE` they go to the
+        // dispatcher, which checks both regardless.
+        ("indirect-call:0000FFFF:budget", true),
+        ("indirect-call:0000FFFF:halt", true),
+        ("indirect-call:0000FFFF:halt+budget", true),
+        ("indirect-call:0000FFFB:budget", true),
+        ("indirect-call:0000FFFB:halt", true),
+        ("indirect-call:0000FFFB:halt+budget", true),
     ];
     assert_eq!(optimization::ALL_SAFE, 0x0000_FFFF);
-    assert_eq!(optimization::INTERRUPTIBLE, 0x0000_FFF9);
+    assert_eq!(optimization::INTERRUPTIBLE, 0x0000_FFFB);
 
     if is_child() {
         let (shape, optimizations, escape) = runaway_case_from_env();

@@ -13,7 +13,7 @@ upstream rather than about us; that figure has **not** been re-measured with
 (`-DDYNARMIC_FRONTENDS=A64`, Release, MSVC 2022, `dynarmic_tests.exe` with no
 filter): **All tests passed (201,698 assertions in 84 test cases)** with 0001
 alone (built from a clean checkout of `83cfa6e`) **and the identical figure with
-0001 + 0002**. The older 202,200/123 was a build that also had the A32 frontend;
+0001 + 0002, and with 0001 + 0002 + 0003**. The older 202,200/123 was a build that also had the A32 frontend;
 it is not comparable and was not re-run.
 
 ## Applied
@@ -66,6 +66,33 @@ same scenario (`memrun.sh` in the 2026-09-24 session scratchpad): process commit
 MiB committed; fast-dispatch tables 44 × 16 MiB → none. Upstream suite: identical
 before and after (above).
 
+### 0003 — a return-stack-buffer hit checks the budget and the halt flag
+
+`0003-rsb-hit-checks-budget-and-halt.patch`, D33. Candidate 2a below, for the
+`PopRSBHint` handler only. After a hit is confirmed (the location descriptor
+computed from the guest PC in `JitState` matches the top entry) and before the
+`jmp` to the predicted block, the handler now compares `cycles_remaining` with
+0 when cycle counting is on, then `halt_reason` with 0, and on either leaves
+through `ReturnFromRunCode` — which checks both again and returns or
+dispatches. The guest PC is already in `JitState` at that point, so leaving is
+exact. Four emitted instructions on the hit path (two without cycle counting);
+the miss path is unchanged.
+
+So `optimization::INTERRUPTIBLE` is now `ALL_SAFE & !FastDispatch`
+(`0x0000_FFFB`) rather than also clearing `ReturnStackBuffer` (`0x0000_FFF9`).
+
+**MEASURED** (`omni-cpu/tests/bench.rs::the_cost_of_a_call_and_return_as_the_block_map_grows`,
+one `BL` + `RET` to a distinct function, median of 5, release): at 262,144
+blocks, **132.0 ns → 24.1 ns** per
+call and return under `INTERRUPTIBLE`, against 24–26 ns under `ALL_SAFE`; at
+128 blocks, 5.96 → 2.35 ns. Without the RSB every `RET` went to the dispatcher,
+whose `LookupBlock` is a hash-map probe that misses cache once the map is big.
+
+**Detector**: `the_stoppability_matrix`, 39 cells. `return:*:halt+budget`
+wedges without the halt check; `indirect-call:0000FFFF:budget` wedges without
+the budget check. Both removed by hand and observed (D33); `tools/mutate.py`
+cannot carry them, since the build script watches only `vendor/PIN.txt`.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is
@@ -86,7 +113,8 @@ code that depends on the new behaviour.
 
 ### 2. Terminals that check the cycle counter and the halt flag exclusively
 
-All measured by `the_stoppability_matrix` in `tests/hostile.rs`, 27 cells.
+All measured by `the_stoppability_matrix` in `tests/hostile.rs`, 27 cells
+before 0003 (39 now).
 **A configuration that stops every runaway guest does exist** — `0x0000_FFF8`,
 which is `ALL_SAFE` without `BlockLinking`, `ReturnStackBuffer` or
 `FastDispatch` — because it routes every terminal through `ReturnFromRunCode`
@@ -104,9 +132,11 @@ guest `BR`/`RET` loop whose target stays in the return-stack buffer or the
 fast-dispatch cache cannot be stopped at all. One `BR` costs a host thread
 permanently.
 
-Worked around by configuration, not a patch:
-`dynarmic_sys::optimization::INTERRUPTIBLE` clears `ReturnStackBuffer` and
-`FastDispatch`, sending both terminals through `ReturnFromRunCode`, which
+**`PopRSBHint`: patched (0003).** `FastDispatchHint`: still unchecked.
+
+Worked around by configuration first, not a patch:
+`dynarmic_sys::optimization::INTERRUPTIBLE` cleared `ReturnStackBuffer` and
+`FastDispatch` (it now clears only the latter), sending both terminals through `ReturnFromRunCode`, which
 returns to the dispatcher, which checks both. Measured cost: **about 3.9 ns per
 indirect transfer**, which is nothing for a guest with no indirect branches and
 5.0x for one where half the instructions are indirect transfers (n=31, release).
