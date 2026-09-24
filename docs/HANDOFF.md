@@ -5,6 +5,25 @@ snapshot, not a history. The durable sources of truth are `docs/ARCHITECTURE.md`
 `docs/DECISIONS.md`, `docs/STATUS.md`, **`docs/VERIFICATION.md`**, the M3 plan and ledger, and git
 history.
 
+## 2026-09-24 night: the performance goal -- read this first
+
+The current goal is **`docs/briefs/goal-performance.md`**: make the app fast, stable and
+lightweight on Windows, macOS and Linux, measured in PS99 (place 8737899170) with the world
+loaded -- ~120 fps Windows, 60+ macOS, ~10+ Linux, 30-minute stability, RAM/CPU on demand. It has
+the three hosts, how to build, run, measure and screenshot on each, the network and account rules,
+the log markers, and the three known blockers.
+
+State at `6d7f2b2` (all three checkouts identical and clean):
+
+* `omnidroid play --cookie <file>` signs in as an account (per-account storage, a rotated cookie
+  kept); `omnidroid login` signs in in omnidroid's own Chromium and keeps the cookie.
+* A launch without `--place` works again (`06d6fb3`).
+* **The join dies silently** in most runs: a worker's 120 s `pthread_cond_timedwait` is refused by
+  the 60 s cap and the thread is killed (6 of 8 runs; the two that survived loaded the world).
+  First item of the brief.
+* Roblox ends a session whose cookie is used through an exit in another country than the
+  account's (all accounts here are TR; use `loc=TR` exits only).
+
 ## Read `docs/VERIFICATION.md` before writing a test you intend to rely on
 
 New, and the least reconstructible thing here. **Thirteen documented ways verification has failed
