@@ -62,6 +62,26 @@ impl Backing {
         Ok(Arc::new(Self::from_file(file, path.display().to_string())))
     }
 
+    /// [`open`](Backing::open), reported under `name` instead of the host path.
+    ///
+    /// `name` is what the region map -- and so the guest's `/proc/self/maps` and `dl_iterate_phdr`
+    /// -- calls the mapping. A host that has placed a file where a device keeps it (a library under
+    /// `/data/app/...`) names it by that guest path, because the host path is a Windows path the
+    /// guest could never open.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Backing::open).
+    pub fn open_named(
+        path: &Path,
+        executability: MapExecutability,
+        name: &str,
+    ) -> MemResult<Arc<Self>> {
+        let file = vm::open_file_for_mapping(path, executability)
+            .map_err(platform("Backing::open_named", 0, 0))?;
+        Ok(Arc::new(Self::from_file(file, name.to_string())))
+    }
+
     /// Adopt a file the guest holds open for reading and writing, so that a
     /// [`Protection::ReadWrite`](crate::Protection::ReadWrite) mapping of it **writes the file** --
     /// Linux's `MAP_SHARED` -- rather than privatising its pages as a mapping of an

@@ -24,6 +24,9 @@ pub enum RegionKind {
         name: Arc<str>,
         /// File offset of the start of this region, which is the fourth column.
         file_offset: u64,
+        /// Whether the mapping writes the file (`MAP_SHARED`): the `s` rather than the `p` in the
+        /// permission column.
+        shared: bool,
     },
 }
 
@@ -100,6 +103,7 @@ impl RegionInfo {
                         backing: backing.id(),
                         name: Arc::clone(backing.name()),
                         file_offset: owner.offset_at(start),
+                        shared: backing.is_shared(),
                     },
                     (None, _) => RegionKind::Anonymous,
                 };
