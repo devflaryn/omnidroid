@@ -89,6 +89,28 @@ and handed them back. Rows `cookie-`.
   it touched -- the 64 KiB granule rules out pager over-commit), ~0.4 GB of images, ~0.5 GB of
   translated code, duplicated per thread and per instance. The next lever is sharing translated
   code (a large dynarmic change, not started).
+* **Re-measured at `05efab2`** (landing, logged out, +100 s, n = 1 per question). The "guest's own
+  ~1.1 GB" above is **not supported** by a per-allocation breakdown, and one reclaim idea is ruled
+  out:
+  - **Memory the guest `MADV_FREE`d that stays committed: 0 MiB** at every 5 s sample. Measured
+    with a temporary `GuestSpace::idle_bytes` on the PERF line, which was then removed. mimalloc here
+    runs `purge_decommits=1` (its own log), so it purges with `MADV_DONTNEED`, which already
+    decommits. A reclaim-idle policy would win nothing.
+  - Process: 2.07 GiB commit, 1.77 GiB working set. Code caches: 48, 0.41-0.46 GiB. The guest
+    space's granules number about 7,100 allocations. Guest pointers in the log start at about
+    `0x20ff2…`, so the space's base is not printed and an exact guest/host split is not claimed.
+  - **Outside the guest space**, all fully resident:
+    - ten blocks of 28.1 MiB, which is 2560 x 1440 x 8 bytes;
+    - fourteen of 15.8 MiB, which is 1920 x 1080 x 8 bytes;
+    - one of 104 MiB.
+
+    That is about 0.6 GiB in all. This host's displays are 2560 x 1440 (the RTX 4060) and a
+    1920 x 1080 Parsec virtual display. The Vulkan layer is not their source: host-visible guest
+    memory is imported from the guest space, device-local memory is forwarded to the driver, and
+    presenting uses a real swapchain. Driver-side buffers for the two displays are the likely
+    owner, possibly cross-adapter presenting to the virtual display. **UNVERIFIED.** Next: repeat
+    with the Parsec display disabled, or trace the `VirtualAlloc` callers. Scripts:
+    `memsplit.py` and `memrun2.sh`; logs: `runs/mem-idle.log` and `runs/mem-split*.log`.
 * Code-cache size: 128 MiB instead of 32 cuts load-phase retranslation 40% (251,904 → 150,933
   blocks retranslated over +10..+40 s) for +340 MiB commit and no earlier Landing. **Default kept
   at 32**; `OMNI_JIT_CACHE_MB` is the in-world A/B.
