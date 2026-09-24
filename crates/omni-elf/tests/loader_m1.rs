@@ -689,6 +689,7 @@ fn writing_to_sealed_relro_faults() {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::os::unix::process::ExitStatusExt;
+        let _ = ACCESS_VIOLATION;
         assert_eq!(status.signal(), Some(11), "expected the child to die of SIGSEGV, got {status:?}");
         return;
     }
