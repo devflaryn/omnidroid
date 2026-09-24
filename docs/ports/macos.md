@@ -209,23 +209,65 @@ binary) and `omni-cpu/tests/exclusive_store_fault.rs` (the two real functions); 
 
 ## Merge notes
 
-Shared files this port edits, each minimal and additive, none changing Windows behaviour:
+Every edit this branch makes to a file that also compiles on Windows or Linux, in one place. The
+workstream notes (`macos-cpu.md`, `macos-window.md`, `macos-memory.md`, `macos-hvf.md`) carry the
+reasoning; this is the list a merge needs. **Windows behaviour is unchanged** except where a row
+says otherwise, and each such row says what changes and why.
 
-| File | Edit |
-|---|---|
-| `crates/dynarmic-sys/build.rs` | C compiler for CMake off MSVC; `DYNARMIC_USE_BUNDLED_EXTERNALS=ON` off Windows; no Zydis/Zycore link off x86-64 |
-| `.gitignore` | dynarmic's mig output under `vendor/dynarmic/src/dynarmic/backend/*/mig/` |
-| `tools/mutate.py` | one line appending `tools/mutate_mac` rows |
-| `crates/omni-platform/src/{vm,fs,net,process}/mod.rs` | `#[cfg_attr(target_os = "macos", allow(dead_code))]` on `mod unix` |
-| `crates/omni-platform/src/fault/mod.rs` | a `macos` backend arm; `unsupported` for neither Windows nor macOS |
-| `crates/omni-platform/src/process/error.rs` | `ProcessError::Errno` variant (errno-reporting calls) |
-| `crates/omni-platform/src/process/mod.rs` | seam tests that said "only Windows answers" include macOS |
-| `crates/omni-platform/tests/vm_seam.rs` | the structural-backend test excludes macOS |
-| `crates/omni-platform/tests/net_loopback.rs` | runs on macOS; the second `SO_ERROR` read asserted per host |
-| `crates/omni-platform/tests/fault_teardown_race.rs` | runs on macOS; waits until the primary is entered before the teardown, on macOS only |
-| `crates/omni-mem/tests/{space,arena,config,windows_only}.rs` | run on macOS; 4 KiB / 64 KiB-base / Windows-code expectations ask the host |
+### Changes a Windows build sees
 
-**Linux port:** `fs/unix.rs`, `net/unix.rs`, `process/unix.rs`, `vm/unix.rs` are not used on macOS
-any more (macOS has its own `macos.rs` bodies); the only change near them is the `allow(dead_code)`
-attribute on their `mod` lines. `process/unix.rs`'s note that macOS has no `sched_getcpu` is
-outdated: `pthread_cpu_number_np` (macOS 11+) is what `process/macos.rs` uses.
+| File | Edit | Windows |
+|---|---|---|
+| `crates/omni-elf/src/loader/mod.rs` | `relro_region` rounds relro's **end up** (bionic's `page_end`), not down | the same pages for this APK: every library's relro ends 4 KiB-aligned (checked, all 11). A library whose relro ends mid-page now gets that page sealed, as bionic seals it |
+| `crates/omni-gfx/src/vulkan.rs`, `host.rs` | loader through `portability::load_entry`; the instance retry with portability enumeration fires only after `VK_ERROR_INCOMPATIBLE_DRIVER`; one extra `vkEnumerateDeviceExtensionProperties` before `vkCreateDevice`; a zero-size `Resized` skips the swapchain rebuild | same loader, same instance request; the extra enumeration is a query |
+| `crates/dynarmic-sys/build.rs` | a C compiler for CMake off MSVC; `DYNARMIC_USE_BUNDLED_EXTERNALS=ON` off Windows; Zydis/Zycore linked only on x86-64 | MSVC path untouched |
+| `crates/dynarmic-sys/shim/od_dynarmic.{h,cpp}`, `src/lib.rs` | `OD_CODE_CACHE_*` constants (0 and 1 as before), the Apple-arm64 W^X branch, `od_jit_last_svc_return_address` under `__aarch64__` only; `OD_FIXED_PER_JIT_BYTES` per architecture | x86-64 values and ABI version unchanged; no struct layout changed |
+| `crates/dynarmic-sys/vendor/` + `patches/0002-0009` | eight fixes to dynarmic's **arm64** backend | not compiled for x86-64 targets (one `#include` of an x64 header from arm64 code) |
+| `crates/omni-cpu/{Cargo.toml,src/lib.rs,src/dynarmic/mod.rs}` | `dynarmic` for `any(x86_64, aarch64)`; `mxcsr` is x86-64-only with an FPCR twin re-exported under the same name on aarch64 | body unchanged on x86-64 |
+| `crates/omni-platform/src/window/{mod,error}.rs`, `audio/{mod,error}.rs` | `RawWindow::AppKit`, `vulkan_loader_candidates()` (empty off macOS), additive error variants; `mod unix` gated `not(macos)` | additive; nothing matches these enums exhaustively (checked) |
+| `crates/omni-platform/src/fault/mod.rs` | a `macos` backend arm (`all(macos, aarch64)`) | Windows arm unchanged |
+| `crates/omni-platform/src/process/{mod,error}.rs` | `ProcessError::Errno`; seam tests that said "only Windows answers" include macOS | additive |
+| `crates/omni-platform/src/{vm,fs,net}/mod.rs` | `#[cfg_attr(target_os = "macos", allow(dead_code))]` on `mod unix` | none |
+| `crates/omni-platform/Cargo.toml` | `[target.'cfg(target_os = "macos")'.dependencies]` (objc2 family, named features) and dev-dependencies | none |
+| `crates/omni-gfx/src/{lib,claim}.rs`, `portability.rs` (new) | `mod portability`; `WindowKey::appkit` | additive |
+| `.gitignore`, `tools/mutate.py` | mig output dirs; one line appending `tools/mutate_mac` rows | none |
+| `crates/omni-android/src/bionic/{mod,threads}.rs` | a guest thread on a backend that **cannot count** instructions runs unbounded and is stopped through its `HaltHandle` (a registry `stop_guest_threads` requests); exit destructors likewise | none: dynarmic reports `counted_step_limit: true`, so it takes exactly the old path; the registry stays empty |
+| `crates/omni-platform/{Cargo.toml,src/lib.rs}`, `src/vm/macos.rs` | a `hypervisor` feature and its `mod` line; `vm/macos.rs` calls `mirrored()` after each map/protect/unmap | off by default; `mirrored` is empty without the feature |
+| `crates/omni-cpu/{Cargo.toml,src/lib.rs}`, `crates/omni-android/Cargo.toml` | an aarch64-only optional `omni-platform` dependency and the `native-hvf` feature; `mod native` under it | off by default, arm64 only |
+| `crates/omni-android/tests/gameactivity.rs` | `OMNI_CROSSING_RATE=1` prints the import crossings per second | off by default, read-only |
+| `docs/DECISIONS.md` | **D31** appended (the native backend: measured, not adopted) | a record |
+| `crates/dynarmic-sys/vendor/` patch **0014** | the arm64 inline store-exclusive's store is a fastmem patch location | arm64 only |
+
+### Test files: expectations that now ask the host
+
+Each keeps its Windows value exactly and derives the macOS one from the host (16 KiB pages,
+`phys_footprint` instead of commit charge, signals instead of exception codes):
+
+* `omni-elf`: `tests/common/synth.rs` lays the synthetic library out on the host page (identical
+  bytes at 4 KiB); `loader_hostile.rs` derives each address from it and expects exactly
+  `libzstd-jni` (the one `p_align 0x1000` library) refused with `AlignBelowPageSize` on 16 KiB;
+  `loader_m1.rs` host-page relro expectations.
+* `omni-apk`: `real_apk.rs` (nothing is directly mappable at 16 KiB), `synthetic_zip.rs` (the aligned
+  entry is padded to one host page).
+* `omni-android`: all 17 suites `any(x86_64, aarch64)`; `bionic.rs` (buffers straddling a host page,
+  `msync`/`ftruncate`/`statm` on this host); `initializers.rs` (the non-pointer-word floor follows
+  guest-space placement, which is what it measured); `vulkan_present.rs` (an import is rounded to a
+  host page).
+* `omni-cpu`: crate cfgs name both architectures; `thunk.rs` MXCSR/FPCR twins; `harness` re-asks for
+  a high guest space only when the default is below 64 GiB; `roblox.rs` per-thread floor is one host
+  page where the counter charges on touch.
+* `omni-mem`: `space`, `arena`, `config`, `windows_only` run on macOS with host-aware values.
+* `omni-platform`: `vm_seam`, `window_seam` structural tests exclude macOS; `net_loopback` asserts the
+  second `SO_ERROR` read per host; `fault_teardown_race` waits until the primary is entered, on
+  macOS only.
+* `omni-gfx`: `renderer_live` asserts the layer report equals the loader's own enumeration (this
+  host has no implicit layers).
+* `dynarmic-sys`: `a64_exec`'s RWX test is x86-64-only (unchanged); `hostile.rs` keeps the 27 x86-64
+  cells and has an arm64 table.
+
+### For the Linux port
+
+`fs/unix.rs`, `net/unix.rs`, `process/unix.rs`, `vm/unix.rs`, `window/unix.rs`, `audio/unix.rs` are no
+longer compiled into macOS builds' backends (macOS has its own `macos.rs` bodies); the only edits near
+them are `cfg` lines on their `mod` statements. `process/unix.rs`'s note that macOS has no
+`sched_getcpu` is outdated: `pthread_cpu_number_np` (macOS 11+) is what `process/macos.rs` uses.
