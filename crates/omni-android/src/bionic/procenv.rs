@@ -1789,6 +1789,9 @@ pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             a.next_u64()?,
         )
     };
+    // A number in `crate::sysroute::ROUTES` never arrives here: the boundary answers it through
+    // the import with the same ABI, from libc's `syscall()` and from a raw `SVC` alike. What does
+    // arrive is what that table leaves out -- the calls emulated below, and the refusal.
     if number == SYS_RT_SIGPROCMASK {
         return rt_sigprocmask(c, (a1 as i64, a2, a3, a4));
     }

@@ -1873,6 +1873,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("getcwd", files::getcwd),
     ("stat", files::stat),
     ("fstat", files::fstat),
+    // Raw syscall 62's handler (2026-09-25): the boundary answers a guest's `SVC #0` through
+    // the import with the same ABI. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records it.
+    ("lseek", files::lseek),
     ("lstat", files::lstat),
     ("statvfs", files::statvfs),
     ("rename", files::rename),

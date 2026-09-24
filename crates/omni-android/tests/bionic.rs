@@ -1076,6 +1076,15 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          LAST section. bionic (libc/stdio/stdio.cpp): unlink, and rmdir when that fails with \
          EISDIR.",
     ),
+    (
+        "lseek",
+        "Raw syscall 62's handler (2026-09-25): the boundary answers a guest's own SVC #0 through \
+         the import with the same ABI, and a TaskScheduler worker (start link 0x2869934) was \
+         walking a file by raw syscalls -- openat, fstatfs, then read, the death that found \
+         this. Not itself measured yet; bound so the scan's seek has a handler rather than an \
+         Unbound. bionic on LP64: lseek is __NR_lseek. Never referenced from the Tier C \
+         closure.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1133,7 +1142,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // Then `__vsprintf_chk`, for 317: a TaskScheduler worker in place 606849621.
     // Then `atol`, for 318: the next worker death in the same place, 2026-09-24.
     // Then `remove`, for 319: a thread's death on a second launch of kept storage (Linux).
-    assert_eq!(symbols.len(), 319, "bound symbols: {symbols:?}");
+    // Then `lseek`, for 320: raw syscall 62's handler, beside the worker's raw file scan.
+    assert_eq!(symbols.len(), 320, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1241,7 +1251,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`__vsprintf_chk`, inline, for 317**: a worker formatting a cpufreq path in a game world.
     // **`atol`, inline, for 318**: `strtol(s, NULL, 10)`, which on LP64 is `atoll`.
     // **`remove`, inline, for 319**: bionic's `unlink`, then `rmdir` on `EISDIR`.
-    assert_eq!(Bionic::inline_symbols().count(), 304);
+    // **`lseek`, inline, for 320**: `Filesystem::seek`, for raw syscall 62.
+    assert_eq!(Bionic::inline_symbols().count(), 305);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -11970,6 +11981,166 @@ fn a_raw_svc_this_layer_cannot_answer_is_refused_by_number() {
     let relative = f.cstring(f.guest.data + 0x100, b"relative.txt");
     let error = svc_with_errno(&f, 56, &[5, relative as u64, 0, 0]).expect_err("dirfd 5");
     assert!(error.to_string().contains("relative to descriptor 5"), "{error}");
+}
+
+/// `AT_FDCWD`, as the kernel's `*at` calls spell "the working directory".
+const AT_FDCWD_GUEST: u64 = (-100i64) as u64;
+/// `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`.
+const AT_SYMLINK_NOFOLLOW_GUEST: u64 = 0x100;
+const AT_EMPTY_PATH_GUEST: u64 = 0x1000;
+/// `FIONBIO`, the one `ioctl` request answered.
+const FIONBIO_GUEST: u64 = 0x5421;
+
+/// **A raw file scan -- `openat`, then `read`, `lseek`, `pread64`, `fstat`, `newfstatat`,
+/// `faccessat`, `fcntl`, `ioctl`, `write`, `pwrite64`, `close` -- is answered by the imports with
+/// the same ABI**, each with its success value in `x0`, and each failure as `-errno` in `x0` with
+/// the guest's `errno` untouched. MEASURED need: after `fstatfs` was answered, the same
+/// TaskScheduler worker (start link `0x2869934`) died on raw syscall 63 (2026-09-25).
+#[test]
+fn a_raw_svc_file_scan_is_answered_by_the_imports_with_the_same_abi() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("rawsvc-files");
+    std::fs::write(scratch.path("scan.bin"), b"0123456789").expect("a file");
+    let path = f.cstring(f.guest.data + 0x100, b"/scan.bin") as u64;
+    let missing = f.cstring(f.guest.data + 0x180, b"/absent.bin") as u64;
+    let buf = f.guest.data + 0x800;
+    let svc = |number: u64, args: &[u64]| svc_with_errno(&f, number, args).expect("answered");
+    let ok = |value: i64| (value, ERRNO_MARK);
+    let failed = |errno: i64| (-errno, ERRNO_MARK);
+
+    // openat (56), then read (63) from the start.
+    let (fd, errno) = svc(56, &[AT_FDCWD_GUEST, path, O_RDONLY, 0]);
+    assert!(fd >= 3 && errno == ERRNO_MARK, "openat: {fd} {errno}");
+    let fd = fd as u64;
+    assert_eq!(svc(63, &[fd, buf as u64, 4]), ok(4), "read");
+    assert_eq!(read_guest(&f, buf, 4), b"0123".to_vec());
+    assert_eq!(svc(63, &[999, buf as u64, 4]), failed(9), "read: -EBADF");
+    // lseek (62): SEEK_SET moves the offset read continues from; an unknown whence is -EINVAL.
+    assert_eq!(svc(62, &[fd, 8, 0]), ok(8), "lseek SEEK_SET");
+    assert_eq!(svc(63, &[fd, buf as u64, 4]), ok(2), "read after the seek: the last two bytes");
+    assert_eq!(read_guest(&f, buf, 2), b"89".to_vec());
+    assert_eq!(svc(62, &[fd, 0, 2]), ok(10), "lseek SEEK_END is the size");
+    assert_eq!(svc(62, &[fd, 0, 7]), failed(22), "lseek: -EINVAL for whence 7");
+    // pread64 (67): at an offset, not moving the descriptor's.
+    assert_eq!(svc(67, &[fd, buf as u64, 3, 2]), ok(3), "pread64");
+    assert_eq!(read_guest(&f, buf, 3), b"234".to_vec());
+    assert_eq!(svc(67, &[fd, buf as u64, 3, u64::MAX]), failed(22), "pread64: -EINVAL offset");
+    // fstat (80) and newfstatat (79): the size at st_size's offset 48.
+    assert_eq!(svc(80, &[fd, buf as u64]), ok(0), "fstat");
+    assert_eq!(read_u64_guest(&f, buf + 48), 10, "fstat's st_size");
+    assert_eq!(svc(80, &[999, buf as u64]), failed(9), "fstat: -EBADF");
+    f.guest.write_u64(buf + 48, 0);
+    assert_eq!(svc(79, &[AT_FDCWD_GUEST, path, buf as u64, 0]), ok(0), "newfstatat");
+    assert_eq!(read_u64_guest(&f, buf + 48), 10, "newfstatat's st_size");
+    assert_eq!(
+        svc(79, &[AT_FDCWD_GUEST, path, buf as u64, AT_SYMLINK_NOFOLLOW_GUEST]),
+        ok(0),
+        "newfstatat(AT_SYMLINK_NOFOLLOW) is lstat"
+    );
+    assert_eq!(svc(79, &[AT_FDCWD_GUEST, missing, buf as u64, 0]), failed(2), "-ENOENT");
+    assert_eq!(svc(79, &[5, path, buf as u64, 0]), ok(0), "an absolute path ignores dirfd");
+    // faccessat (48): F_OK.
+    assert_eq!(svc(48, &[AT_FDCWD_GUEST, path, 0]), ok(0), "faccessat");
+    assert_eq!(svc(48, &[AT_FDCWD_GUEST, missing, 0]), failed(2), "faccessat: -ENOENT");
+    // fcntl (25): F_GETFD on a descriptor opened without O_CLOEXEC.
+    assert_eq!(svc(25, &[fd, 1, 0]), ok(0), "fcntl(F_GETFD)");
+    assert_eq!(svc(25, &[999, 1, 0]), failed(9), "fcntl: -EBADF");
+    // close (57): once, then -EBADF.
+    assert_eq!(svc(57, &[fd]), ok(0), "close");
+    assert_eq!(svc(57, &[fd]), failed(9), "close twice: -EBADF");
+
+    // write (64) and pwrite64 (68) on a descriptor opened for writing, checked on the host.
+    let (rw, _) = svc(56, &[AT_FDCWD_GUEST, path, O_RDWR, 0]);
+    assert!(rw >= 3, "openat O_RDWR: {rw}");
+    f.guest.write_bytes(buf, b"ab");
+    assert_eq!(svc(64, &[rw as u64, buf as u64, 2]), ok(2), "write");
+    assert_eq!(svc(64, &[999, buf as u64, 2]), failed(9), "write: -EBADF");
+    f.guest.write_bytes(buf, b"Z");
+    assert_eq!(svc(68, &[rw as u64, buf as u64, 1, 5]), ok(1), "pwrite64");
+    assert_eq!(svc(68, &[999, buf as u64, 1, 5]), failed(9), "pwrite64: -EBADF");
+    assert_eq!(svc(57, &[rw as u64]), ok(0));
+    assert_eq!(std::fs::read(scratch.path("scan.bin")).expect("the file"), b"ab234Z6789");
+
+    // ioctl (29): FIONBIO on a pipe end.
+    let (read_end, _write_end) = pipe_through_guest(&f);
+    f.guest.write_u64(buf, 1);
+    assert_eq!(svc(29, &[read_end as u64, FIONBIO_GUEST, buf as u64]), ok(0), "ioctl(FIONBIO)");
+    assert_eq!(svc(29, &[999, FIONBIO_GUEST, buf as u64]), failed(9), "ioctl: -EBADF");
+
+    // The `*at` rule and the flags newfstatat cannot answer are refused by name, not guessed.
+    let relative = f.cstring(f.guest.data + 0x200, b"scan.bin") as u64;
+    let error = svc_with_errno(&f, 79, &[5, relative, buf as u64, 0]).expect_err("dirfd 5");
+    assert!(error.to_string().contains("newfstatat relative to descriptor 5"), "{error}");
+    let error = svc_with_errno(&f, 48, &[5, relative, 0]).expect_err("dirfd 5");
+    assert!(error.to_string().contains("faccessat relative to descriptor 5"), "{error}");
+    let error = svc_with_errno(&f, 79, &[AT_FDCWD_GUEST, path, buf as u64, AT_EMPTY_PATH_GUEST])
+        .expect_err("AT_EMPTY_PATH");
+    assert!(error.to_string().contains("AT_EMPTY_PATH"), "{error}");
+    // A number no import answers still reaches `syscall()` and is refused by number and name.
+    let error = svc_with_errno(&f, 78, &[AT_FDCWD_GUEST, path, buf as u64, 16]).expect_err("78");
+    assert!(error.to_string().contains("readlinkat"), "{error}");
+}
+
+/// **The process and memory calls a raw-syscall wrapper makes** -- `getpid`, `sched_yield`,
+/// `clock_gettime`, `nanosleep`, and the four exit-path guest-memory calls -- through `SVC #0`,
+/// and **the same routes through libc's `syscall()`**, which answers in the import's convention
+/// (`-1` and `errno`) from the same handlers. `mmap` through either door is the exit-path handler
+/// the thunk reaches, not an emulation of it.
+#[test]
+fn raw_svc_process_and_memory_calls_and_libc_syscall_share_the_routes() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("rawsvc-memory");
+    let buf = f.guest.data + 0x800;
+    let svc = |number: u64, args: &[u64]| svc_with_errno(&f, number, args).expect("answered");
+    let ok = |value: i64| (value, ERRNO_MARK);
+    let failed = |errno: i64| (-errno, ERRNO_MARK);
+
+    assert_eq!(svc(172, &[]), ok(i64::from(std::process::id())), "getpid is the host's");
+    assert_eq!(svc(124, &[]), ok(0), "sched_yield");
+    f.guest.write_bytes(buf, &[0xA5; 16]);
+    assert_eq!(svc(113, &[1, buf as u64]), ok(0), "clock_gettime(CLOCK_MONOTONIC)");
+    assert!(read_u64_guest(&f, buf + 8) < 1_000_000_000, "tv_nsec was written, in range");
+    f.guest.write_u64(buf, 0);
+    f.guest.write_u64(buf + 8, 1000);
+    assert_eq!(svc(101, &[buf as u64, 0]), ok(0), "nanosleep(1 us)");
+    f.guest.write_u64(buf + 8, 1_000_000_000);
+    assert_eq!(svc(101, &[buf as u64, 0]), failed(22), "nanosleep: -EINVAL tv_nsec");
+
+    // mmap (222) / mprotect (226) / madvise (233) / munmap (215).
+    let (map, errno) = svc(222, &[0, 4 * 4096, PROT_RW, MAP_ANON_PRIVATE, u64::MAX, 0]);
+    assert!(map > 0 && map % 4096 == 0 && errno == ERRNO_MARK, "mmap: {map:#x} {errno}");
+    let map = map as u64;
+    assert_eq!(svc(222, &[0, 0, PROT_RW, MAP_ANON_PRIVATE, u64::MAX, 0]), failed(22), "mmap len 0");
+    f.guest.write_u64(map as omni_cpu::GuestAddr, 0x1234);
+    assert_eq!(read_u64_guest(&f, map as omni_cpu::GuestAddr), 0x1234, "the mapping is writable");
+    assert_eq!(svc(226, &[map, 4096, PROT_READ]), ok(0), "mprotect");
+    assert_eq!(svc(226, &[map + 1, 4096, PROT_READ]), failed(22), "mprotect: -EINVAL unaligned");
+    assert_eq!(svc(233, &[map + 4096, 4096, MADV_DONTNEED]), ok(0), "madvise(DONTNEED)");
+    assert_eq!(svc(233, &[map, 4096, 9999]), failed(22), "madvise: -EINVAL advice");
+    assert_eq!(svc(215, &[map + 1, 4096]), failed(22), "munmap: -EINVAL unaligned");
+    assert_eq!(svc(215, &[map, 4 * 4096]), ok(0), "munmap");
+
+    // The libc door: the same routes, the import's convention.
+    let (mapped, errno) =
+        call_with_errno(&f, "syscall", &[222, 0, 4096, PROT_RW, MAP_ANON_PRIVATE, u64::MAX, 0]);
+    assert!(mapped > 0 && mapped % 4096 == 0 && errno == 0, "syscall(mmap): {mapped:#x} {errno}");
+    assert_eq!(call_with_errno(&f, "syscall", &[215, mapped as u64, 4096]), (0, 0));
+    assert_eq!(call_with_errno(&f, "syscall", &[215, 1, 4096]), (-1, 22), "-1 and EINVAL");
+    assert_eq!(call_with_errno(&f, "syscall", &[63, 999, buf as u64, 1]), (-1, 9), "-1 and EBADF");
+    assert_eq!(
+        call_with_errno(&f, "syscall", &[172]),
+        (i64::from(std::process::id()), 0),
+        "syscall(getpid)"
+    );
+    let relative = f.cstring(f.guest.data + 0x200, b"x") as u64;
+    let error = refusal_of(&f, "syscall", |asm| {
+        asm.mov(0, 79);
+        asm.mov(1, 5);
+        asm.mov(2, relative);
+        asm.mov(3, buf as u64);
+        asm.mov(4, 0);
+    });
+    assert!(error.to_string().contains("newfstatat relative to descriptor 5"), "{error}");
 }
 
 /// `EPOLLIN`, `EPOLLOUT`, `EPOLLHUP` and `EPOLLET`, as the guest spells them.

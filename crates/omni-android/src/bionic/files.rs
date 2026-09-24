@@ -1139,6 +1139,39 @@ pub(super) fn pread(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `off_t lseek(int fd, off_t offset, int whence)`
+///
+/// `Filesystem::seek`, which `fseeko` already answers through: `EINVAL` for an unknown `whence`
+/// or a position that would be negative, `ESPIPE` for a pipe or a socket, `EBADF` for no such
+/// descriptor. Bound for raw syscall 62, which the boundary answers through this import: a
+/// TaskScheduler worker's raw-`SVC` file sequence reached `openat`, `fstatfs` and then `read`
+/// (2026-09-25), and a scan that reads a file by offset seeks it.
+pub(super) fn lseek(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (fd, offset, whence) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()? as i64, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        match settle(&view, fs.seek(fd, offset, whence))? {
+            Settled::Done(position) => i64::try_from(position).map_err(|_| {
+                view.refusal(format!(
+                    "lseek({fd}) reached position {position}, past the largest off_t; Linux \
+                     answers EOVERFLOW, which no guest file here can be large enough to need"
+                ))
+            })?,
+            Settled::Failed(errno) => {
+                view.set_errno(errno);
+                -1
+            }
+        }
+    };
+    c.ret().u64(result as u64);
+    Ok(())
+}
+
 /// `int ftruncate(int fd, off_t length)`
 ///
 /// `Filesystem::ftruncate`, with the one check that belongs on this side of the seam: a negative

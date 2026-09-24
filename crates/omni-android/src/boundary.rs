@@ -1314,7 +1314,7 @@ impl Boundary {
                 // `svc #0` (`x8 = 56`, openat of "/proc/self/maps") on every Pet Simulator 99
                 // place load (p1, 2026-09-23) and in place 606849621 (2026-09-24).
                 ExitReason::UnsupportedInstruction { pc: at, encoding: SVC_0 } => {
-                    self.service_raw_syscall(cpu, at)?;
+                    self.service_raw_syscall(cpu, at, depth)?;
                     if let Some(error) = take_pending() {
                         return Err(error);
                     }
@@ -1404,6 +1404,31 @@ impl Boundary {
             }
             return Err(refusal);
         }
+        // libc's `syscall(number, ...)` with a number the route table answers: the same import
+        // a raw `SVC` with that number reaches, over the same arguments one register later, and
+        // its answer in the import's convention -- which is libc `syscall()`'s own. The in-loop
+        // path defers these here, so an exit-path target is reachable from both doors.
+        if slot.symbol == "syscall" {
+            if let Some(route) = crate::sysroute::route(cpu.x(XReg::new(0).expect("X0 exists"))) {
+                let kernel: [u64; 6] =
+                    core::array::from_fn(|n| cpu.x(XReg::new(n as u8 + 1).expect("X1-X6 exist")));
+                let resolved = match crate::sysroute::resolve(route, &kernel, &self.mem, slot.address)? {
+                    Ok(resolved) => resolved,
+                    Err(why) => {
+                        return Err(AbiError::Refused {
+                            symbol: slot.symbol.clone(),
+                            address: slot.address,
+                            why,
+                        })
+                    }
+                };
+                let answer = self.call_routed(resolved, 1, cpu, slot.address, depth);
+                // The pair `count` opened for `syscall` itself; the routed import closes its own.
+                self.mark_exit();
+                cpu.set_x(XReg::new(0).expect("X0 exists"), answer?);
+                return Ok(resume);
+            }
+        }
         match slot.binding {
             Binding::Unbound => Err(AbiError::Unbound {
                 symbol: slot.symbol.clone(),
@@ -1454,40 +1479,42 @@ impl Boundary {
 
     /// Answer a guest `SVC #0` in the kernel's convention, through the imports that implement it.
     ///
-    /// A raw syscall is the same request a libc wrapper would have made, in different registers:
-    /// `openat(AT_FDCWD or an absolute path, path, flags, mode)` is `open(path, flags, mode)`, and
-    /// everything else is `syscall(number, a0, ..., a5)`, whose emulation already answers the
-    /// numbers this runtime can (`bionic::procenv::syscall`) and refuses the rest **by number and
-    /// name** -- so a raw syscall nothing implements still stops its thread, but with a named
-    /// refusal instead of an `UnsupportedInstruction`. The handler runs over a register view that
-    /// presents the kernel's registers in the import's order and keeps every write except `x0`
-    /// from the guest (the kernel preserves them). What differs is the error convention: an import
-    /// answers `-1` and sets `errno`, the kernel answers `-errno` in `x0` and **leaves `errno`
-    /// alone**, so the guest's `errno` is read before, the call's own `errno` turned into the
-    /// result, and the guest's value put back.
-    fn service_raw_syscall(self: &Arc<Self>, cpu: &mut dyn GuestCpu, at: GuestAddr) -> AbiResult<()> {
+    /// A raw syscall is the same request a libc wrapper would have made, in different registers.
+    /// A number in [`crate::sysroute::ROUTES`] -- `openat` at `AT_FDCWD` is `open`, `read` is
+    /// `read`, `mmap` is `mmap`, each entry with why the two ABIs are one -- is answered by that
+    /// import's handler; everything else is `syscall(number, a0, ..., a5)`, whose emulation
+    /// answers the numbers it models itself (`bionic::procenv::syscall`) and refuses the rest **by
+    /// number and name** -- so a raw syscall nothing implements still stops its thread, but with a
+    /// named refusal instead of an `UnsupportedInstruction`. The handler runs over a register view
+    /// that presents the kernel's registers in the import's order and keeps every write except
+    /// `x0` from the guest (the kernel preserves them). What differs is the error convention: an
+    /// import answers `-1` and sets `errno`, the kernel answers `-errno` in `x0` and **leaves
+    /// `errno` alone**, so the guest's `errno` is read before, the call's own `errno` turned into
+    /// the result, and the guest's value put back.
+    ///
+    /// Serviced after the run loop has exited, which is what lets a route reach an **exit-path**
+    /// handler -- the guest-memory calls `mmap`, `munmap`, `mprotect` and `madvise` -- exactly as a
+    /// call to that import through its thunk would.
+    fn service_raw_syscall(
+        self: &Arc<Self>,
+        cpu: &mut dyn GuestCpu,
+        at: GuestAddr,
+        depth: usize,
+    ) -> AbiResult<()> {
         let reg = |n: u8| XReg::new(n).expect("X0-X30 exist");
         let number = cpu.x(reg(8));
+        let kernel: [u64; 6] = core::array::from_fn(|n| cpu.x(reg(n as u8)));
         let refuse = |why: String| AbiError::Refused {
             symbol: format!("svc #0 (syscall {number})"),
             address: at,
             why,
         };
-        let (symbol, map): (&str, &[u32]) = if number == SYS_OPENAT {
-            let dirfd = cpu.x(reg(0)) as u32 as i32;
-            let path = cpu.x(reg(1)) as GuestAddr;
-            let blame = Blame::new("openat", at, 1);
-            let absolute = self.mem.read_bytes(path, 1, blame)?.first() == Some(&b'/');
-            if dirfd != AT_FDCWD && !absolute {
-                return Err(refuse(format!(
-                    "a raw openat relative to descriptor {dirfd}: this layer's `open` resolves \
-                     against the working directory only, and answering for another directory \
-                     would open the wrong file"
-                )));
-            }
-            ("open", &[1, 2, 3])
-        } else {
-            ("syscall", &[8, 0, 1, 2, 3, 4, 5])
+        let routed = match crate::sysroute::route(number) {
+            Some(route) => match crate::sysroute::resolve(route, &kernel, &self.mem, at)? {
+                Ok(resolved) => Some((route, resolved)),
+                Err(why) => return Err(refuse(why)),
+            },
+            None => None,
         };
         let errno_at = {
             let mut regs = RemapRegs { cpu: &mut *cpu, map: &[], ret: None };
@@ -1496,10 +1523,13 @@ impl Boundary {
         };
         let blame = Blame::new("errno", at, 0);
         let saved = self.mem.read_u32(errno_at, blame)?;
-        let answer = {
-            let mut regs = RemapRegs { cpu: &mut *cpu, map, ret: None };
-            self.call_inline(symbol, &mut regs, at)?;
-            regs.ret.ok_or_else(|| refuse(format!("`{symbol}` answered nothing")))?
+        let answer = match routed {
+            Some((_, resolved)) => self.call_routed(resolved, 0, cpu, at, depth)?,
+            None => {
+                let mut regs = RemapRegs { cpu: &mut *cpu, map: &[8, 0, 1, 2, 3, 4, 5], ret: None };
+                self.call_inline("syscall", &mut regs, at)?;
+                regs.ret.ok_or_else(|| refuse("`syscall` answered nothing".to_string()))?
+            }
         };
         let result = if answer as i64 == -1 {
             -i64::from(self.mem.read_u32(errno_at, blame)?)
@@ -1509,28 +1539,94 @@ impl Boundary {
         self.mem.write_u32(errno_at, saved, blame)?;
         if self.svc_trace.load(Ordering::Relaxed) {
             use std::io::Write as _;
-            let path = if number == SYS_OPENAT {
-                let at_path = cpu.x(reg(1)) as GuestAddr;
-                let bytes = self
-                    .mem
-                    .read_bytes(at_path, 256, Blame::new("openat", at, 1))
-                    .or_else(|_| self.mem.read_bytes(at_path, 64, Blame::new("openat", at, 1)))
-                    .unwrap_or_default();
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                format!(" \"{}\"", String::from_utf8_lossy(&bytes[..end]))
-            } else {
-                String::new()
+            let path = match routed.and_then(|(route, _)| route.dirfd_path) {
+                Some((_, path)) => {
+                    let at_path = kernel[usize::from(path)] as GuestAddr;
+                    let blame = Blame::new("svc path", at, 1);
+                    let bytes = self
+                        .mem
+                        .read_bytes(at_path, 256, blame)
+                        .or_else(|_| self.mem.read_bytes(at_path, 64, blame))
+                        .unwrap_or_default();
+                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                    format!(" \"{}\"", String::from_utf8_lossy(&bytes[..end]))
+                }
+                None => String::new(),
             };
+            let name = routed.map_or("", |(route, _)| route.name);
             let _ = writeln!(
                 std::io::stderr(),
-                "SVC {number} at {at:#x} (x0 {:#x}, x1 {:#x}, x2 {:#x}){path} -> {result}",
-                cpu.x(reg(0)),
-                cpu.x(reg(1)),
-                cpu.x(reg(2)),
+                "SVC {number} {name} at {at:#x} (x0 {:#x}, x1 {:#x}, x2 {:#x}){path} -> {result}",
+                kernel[0],
+                kernel[1],
+                kernel[2],
             );
         }
         cpu.set_x(reg(0), result as u64);
         Ok(())
+    }
+
+    /// Answer a routed syscall through its import and return what the import put in `x0`, in the
+    /// import's own convention.
+    ///
+    /// `base` is the register kernel argument 0 is in: `x0` for a raw `SVC`, `x1` for libc's
+    /// `syscall(number, ...)`. An inline handler runs over a [`RemapRegs`] view, whose writes do
+    /// not reach the guest; an exit-path one is handed the same view's arguments as its snapshot
+    /// and writes its result into `x0` itself, which the caller then overwrites with the answer --
+    /// converted for a raw `SVC`, as it stands for `syscall()`.
+    fn call_routed(
+        self: &Arc<Self>,
+        resolved: crate::sysroute::Resolved,
+        base: u32,
+        cpu: &mut dyn GuestCpu,
+        at: GuestAddr,
+        depth: usize,
+    ) -> AbiResult<u64> {
+        let mut map = [0u32; 6];
+        for (slot, &arg) in map.iter_mut().zip(resolved.args) {
+            *slot = base + u32::from(arg);
+        }
+        let map = &map[..resolved.args.len()];
+        let symbol = resolved.symbol;
+        let slot = self.slot_named(symbol).ok_or_else(|| AbiError::Unbound {
+            symbol: symbol.to_string(),
+            address: at,
+        })?;
+        match slot.binding {
+            Binding::Inline(_) => {
+                let mut regs = RemapRegs { cpu: &mut *cpu, map, ret: None };
+                self.call_inline(symbol, &mut regs, at)?;
+                regs.ret.ok_or_else(|| AbiError::Refused {
+                    symbol: symbol.to_string(),
+                    address: at,
+                    why: "a routed syscall's import answered nothing".to_string(),
+                })
+            }
+            Binding::Reentrant(handler) => {
+                let args = {
+                    let mut regs = RemapRegs { cpu: &mut *cpu, map, ret: None };
+                    let call = ThunkCall::new(&mut regs, slot.address, ThunkContext::default());
+                    ArgRegs::capture(&call)
+                };
+                self.count(slot, at);
+                let mut reentrant = ReentrantCall {
+                    symbol: &slot.symbol,
+                    address: slot.address,
+                    boundary: self,
+                    cpu: &mut *cpu,
+                    args,
+                    depth,
+                };
+                let outcome = handler(&mut reentrant);
+                self.mark_exit();
+                outcome?;
+                Ok(cpu.x(XReg::new(0).expect("X0 exists")))
+            }
+            Binding::Unbound | Binding::Data => Err(AbiError::Unbound {
+                symbol: symbol.to_string(),
+                address: at,
+            }),
+        }
     }
 
     /// Run the inline handler bound to `symbol` over `regs`, charged to the census as that import.
@@ -1613,6 +1709,14 @@ impl Boundary {
             call.defer_to_caller();
             return;
         };
+        // A `syscall()` whose number the route table answers is serviced on the exit path, where
+        // every routed import -- the exit-path guest-memory ones included -- can be reached. Before
+        // `count`, because `service_exit` counts it. Rare: the engine's own `syscall()` sites are
+        // futex, gettid and the like, which stay here.
+        if slot.symbol == "syscall" && crate::sysroute::route(call.x(0)).is_some() {
+            call.defer_to_caller();
+            return;
+        }
         self.count(slot, call.x(30) as GuestAddr);
         let Binding::Inline(handler) = slot.binding else {
             call.defer_to_caller();
@@ -2437,10 +2541,6 @@ impl ThunkRegs for CpuRegs<'_> {
 
 /// `SVC #0`'s encoding: `1101 0100 000 imm16=0 00001`.
 const SVC_0: u32 = 0xD400_0001;
-/// arm64 `__NR_openat`.
-const SYS_OPENAT: u64 = 56;
-/// `AT_FDCWD`: "relative to the working directory".
-const AT_FDCWD: i32 = -100;
 
 /// The kernel's registers presented in an import's argument order, for
 /// [`Boundary::service_raw_syscall`]: argument `i` is read from `X{map[i]}`, an argument past the

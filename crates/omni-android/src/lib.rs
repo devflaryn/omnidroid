@@ -57,6 +57,7 @@ pub mod mem;
 pub mod ndk;
 pub mod perf;
 pub mod region;
+mod sysroute;
 pub mod varargs;
 pub mod vulkan;
 pub mod waits;
