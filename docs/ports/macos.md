@@ -67,7 +67,7 @@ non-Windows target the build asks CMake for the vendored copies explicitly
 | memory | boot peak **862-1,122 MiB**, steady **811-841 MiB** at the landing screen; ten instances on 8 GB **not shown** (4 of 4 on this 16 GB Mac) | below; `macos-memory.md`; `mac-mem-` 10/10 |
 | `webview` | **not ported** (structural `Unsupported`): WKWebView is the macOS equivalent | |
 | ELF loader on 16 KiB pages | relro sealed as bionic seals it; `libzstd-jni` (`p_align` 0x1000) refused by name | `loader_m1` 13, `loader_hostile` 25; `mac-elf-A1` 1/1 |
-| **the whole workspace** | `cargo test --workspace --release --no-fail-fast`: 162 suites, **2,054 passed, 1 failed** (the headless gate, below), 90 ignored | 2026-09-24, `port-macos` at `c4845e7` |
+| **the whole workspace** | `cargo test --workspace --release --no-fail-fast`: 167 suites, **2,069 passed, 1 failed** (the headless gate's `eglGetDisplay`, as on Windows), 90 ignored | 2026-09-24, `port-macos` at `0e7d5c0` (every workstream merged) |
 
 ## The gate on macOS
 
