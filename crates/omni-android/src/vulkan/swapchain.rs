@@ -72,9 +72,21 @@
 //! | code | what it means | what this layer does |
 //! |---|---|---|
 //! | `VK_SUCCESS` (0) | an image was acquired, or the frame was presented | forwards it |
-//! | [`VK_SUBOPTIMAL_KHR`] (1000001003) | it worked, **and** the swapchain no longer matches the surface | forwards it, **and writes `pImageIndex`** — it is a success code |
+//! | [`VK_SUBOPTIMAL_KHR`] (1000001003) | it worked, **and** the swapchain no longer matches the surface | at **present**: forwards it. At **acquire**: answers `VK_SUCCESS` and writes `pImageIndex` (below) |
 //! | [`VK_ERROR_OUT_OF_DATE_KHR`] (-1000001004) | the swapchain cannot be used at all | forwards it, and writes nothing |
 //! | [`VK_TIMEOUT`] (2), [`VK_NOT_READY`] (1) | no image yet, and this is not an error | forwards it, and writes nothing |
+//!
+//! **Except `VK_SUBOPTIMAL_KHR` from acquire, which the guest is told is `VK_SUCCESS`**, because that
+//! is what the guest's own platform answers: Android's swapchain never returns it from
+//! `vkAcquireNextImageKHR` -- "Android will only return VK_SUBOPTIMAL_KHR for vkQueuePresentKHR, and
+//! only when the window's transform/rotation changes. Extent changes will not cause
+//! VK_SUBOPTIMAL_KHR" (AOSP `frameworks/native/vulkan/libvulkan/swapchain.cpp`, `QueuePresentKHR`,
+//! main, read 2026-09-24); the window scales the buffers (`NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW`)
+//! and the app learns of the new size from `APP_CMD_WINDOW_RESIZED`. MEASURED on MoltenVK: the first
+//! acquire after a window resize answers `VK_SUBOPTIMAL_KHR` (NVIDIA on Windows answers `VK_SUCCESS`
+//! there), the engine logs it as a `VULKAN ERROR` and records its next barrier on image handle 0,
+//! and the refusal of that handle killed the render thread. The image the driver acquired is valid
+//! either way, and the driver's own code is still recorded in `Vulkan::driver_failures()`.
 //!
 //! **This layer does not recreate the swapchain on the guest's behalf**, and that is the single
 //! most important sentence in this file. The engine owns its swapchain: it chose the format, the
@@ -508,8 +520,11 @@ pub(super) fn acquire_next_image(
     if let Some(index) = acquired.image_index {
         c.mem().write_u32(index_at, index, c.blame(5))?;
     }
-    // **Verbatim.** Not clamped, not translated, and not turned into a swapchain recreation.
-    c.ret().i32(acquired.result);
+    // **Verbatim, but for the one code Android never gives here** (module header): not clamped, not
+    // turned into a swapchain recreation, and `VK_SUBOPTIMAL_KHR` answered as the `VK_SUCCESS` an
+    // Android swapchain would have given for the same image.
+    let answer = if acquired.result == VK_SUBOPTIMAL_KHR { VK_SUCCESS } else { acquired.result };
+    c.ret().i32(answer);
     Ok(())
 }
 

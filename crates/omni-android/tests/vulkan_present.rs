@@ -13,7 +13,8 @@
 //! [`VulkanHost`] and never for anything the guest can see. Its job is to be a driver whose
 //! answers the test chose, because these properties cannot be asserted against a real one:
 //!
-//! * that `VK_SUBOPTIMAL_KHR` reaches the guest **and** `pImageIndex` is written, while
+//! * that `VK_SUBOPTIMAL_KHR` from acquire reaches the guest as Android's `VK_SUCCESS` **and**
+//!   `pImageIndex` is written, while
 //!   `VK_ERROR_OUT_OF_DATE_KHR` and `VK_TIMEOUT` reach the guest and `pImageIndex` is **not** —
 //!   no real driver can be made to produce those three on demand;
 //! * that `vkQueuePresentKHR`'s `pResults` is filled per swapchain rather than from the aggregate;
@@ -2939,8 +2940,11 @@ fn an_instance_is_destroyed_once_after_its_children_and_a_second_one_can_be_made
 /// be made to produce `VK_TIMEOUT`, `VK_SUBOPTIMAL_KHR` and `VK_ERROR_OUT_OF_DATE_KHR` on demand.
 /// What it establishes:
 ///
-/// * all four codes reach the guest's `X0` **verbatim** — not clamped, not normalised to
-///   `VK_SUCCESS`, and not turned into a swapchain recreation this layer decided on;
+/// * three codes reach the guest's `X0` **verbatim** — not clamped, not normalised to `VK_SUCCESS`,
+///   and not turned into a swapchain recreation this layer decided on -- and `VK_SUBOPTIMAL_KHR` is
+///   answered as `VK_SUCCESS`, because Android's swapchain never returns it from acquire (the
+///   module header of `vulkan/swapchain.rs` quotes AOSP), and on MoltenVK it killed the render
+///   thread on the first window resize;
 /// * `pImageIndex` is written for `VK_SUCCESS` and `VK_SUBOPTIMAL_KHR`, because both produce an
 ///   image, and is **left untouched** for `VK_TIMEOUT` and `VK_ERROR_OUT_OF_DATE_KHR` — which the
 ///   poisoned buffer is what proves. Writing a zero there would hand the guest image 0, a real
@@ -2980,7 +2984,7 @@ fn the_acquire_codes_reach_the_guest_verbatim_and_only_two_write_an_index() {
     let poison_word = u64::from_le_bytes([POISON; 8]);
     for (expected, index) in [
         (VK_SUCCESS, Some(2u32)),
-        (VK_SUBOPTIMAL_KHR, Some(1)),
+        (VK_SUCCESS, Some(1)),
         (VK_TIMEOUT, None),
         (VK_ERROR_OUT_OF_DATE_KHR, None),
     ] {
@@ -2991,7 +2995,7 @@ fn the_acquire_codes_reach_the_guest_verbatim_and_only_two_write_an_index() {
             .expect("the call completes whatever the driver said");
         assert_eq!(
             result as i32, expected,
-            "the driver's {expected} must reach the guest unchanged, and {result} did"
+            "the guest must be answered {expected}, and {result} was"
         );
         match index {
             Some(index) => assert_eq!(up.f.read_u32(index_at), index),

@@ -12,6 +12,6 @@ Row shape, as in `mutate.py`: (id, direction, description, file, old, new, comma
 the macOS host; `python3 tools/mutate.py --only mac-` runs exactly these rows.
 """
 
-from . import cpu, elf, exclusive, fault, gfx, platform, window
+from . import android, cpu, elf, exclusive, fault, gfx, platform, window
 
-ROWS = cpu.ROWS + platform.ROWS + fault.ROWS + window.ROWS + gfx.ROWS + elf.ROWS + exclusive.ROWS
+ROWS = cpu.ROWS + platform.ROWS + fault.ROWS + window.ROWS + gfx.ROWS + elf.ROWS + exclusive.ROWS + android.ROWS
