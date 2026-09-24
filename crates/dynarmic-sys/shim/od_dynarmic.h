@@ -373,6 +373,11 @@ void od_jit_clear_exclusive(void* jit);
  * whose backend does not use it. For measurement only. */
 uint64_t od_page_backed_bytes(void);
 
+/* Pages of the arm64 backend's guest-range index that `InvalidateCacheRanges`
+ * has looked up, over every jit in the process (patch 0015). 0 on a host whose
+ * backend does not have the index. For measurement only. */
+uint64_t od_invalidation_page_probes(void);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);

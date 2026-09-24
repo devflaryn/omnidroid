@@ -9,6 +9,7 @@
 
 #include <boost/icl/interval_set.hpp>
 #include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
 
 #include "dynarmic/backend/arm64/address_space.h"
 #include "dynarmic/interface/A64/config.h"
@@ -53,6 +54,12 @@ protected:
     PageBackedVector<GuestRange> guest_ranges;
     PageBackedMap<u64, std::vector<u32>> guest_range_pages;
     std::vector<u32> wide_guest_ranges;
+    // Omnidroid patch 0015: the 2 MiB chunks that hold at least one page of `guest_range_pages`.
+    // An invalidation walks only the pages of the chunks it touches that are in this set, so a
+    // range with no translated code in it -- a heap `munmap` -- costs a few set lookups instead of
+    // one lookup per 4 KiB page, on every guest thread it is broadcast to.
+    static constexpr unsigned guest_chunk_bits = 21;
+    tsl::robin_set<u64> guest_range_chunks;
 };
 
 }  // namespace Dynarmic::Backend::Arm64

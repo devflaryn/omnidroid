@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <new>
 
 #if defined(__APPLE__) || defined(__unix__)
@@ -19,6 +20,12 @@ namespace Dynarmic::Backend::Arm64 {
 /// Bytes currently mapped by every `PageBackedAllocator`, for measurement (`od_page_backed_bytes`):
 /// what these arrays hold is no longer in the C++ heap's statistics.
 inline std::atomic<std::size_t> page_backed_bytes{0};
+
+/// Omnidroid patch 0015: pages of `A64AddressSpace`'s guest-range index looked up by
+/// `InvalidateCacheRanges`, over every jit in the process, for measurement
+/// (`od_invalidation_page_probes`). Here rather than in `a64_address_space.h` because the shim
+/// includes this header and cannot include that one.
+inline std::atomic<std::uint64_t> invalidation_page_probes{0};
 
 /// An allocator for the address space's per-block bookkeeping that takes large arrays straight from
 /// the kernel and gives them straight back.

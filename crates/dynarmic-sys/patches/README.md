@@ -412,6 +412,22 @@ which is its patch location. `tests/host_fault.rs` stores exclusively to the tes
 read-only data (both widths); `omni-cpu`'s `exclusive_store_fault.rs` runs the two real functions;
 the full survey then runs all 245,117 functions on dynarmic without an abort (MEASURED once, 41 s).
 
+### 0015 — arm64: an invalidation walks only the chunks that hold translated code
+
+`0015-arm64-invalidate-only-chunks-with-code.patch`. **arm64 only**, on top of 0011. `omni-android`
+hands every guest `mmap`, `munmap`, `mprotect` and `MADV_DONTNEED` range to **every** guest thread's
+jit, because any of them could have held translated code; almost none did. 0011's page index
+answered a range with one hash lookup per 4 KiB page whenever the range had fewer pages than the
+index, on every thread. MEASURED in a game on the macOS host (`sample`, 5 s, n = 1): two guest
+threads spent 64-69% of their time in `A64AddressSpace::InvalidateCacheRanges` -- 4,018 samples,
+more than a core -- while the render thread waited on the game thread half the time. The patch
+keeps the set of 2 MiB chunks that hold indexed pages (cleared with the cache) and walks, page by
+page, only the chunks a range touches that are in it; a range with no code in it costs one set
+lookup per 2 MiB, or a walk of the set when that is shorter. Nothing else changes: the same blocks
+are found and invalidated. `od_invalidation_page_probes()` (shim, measurement only) counts page
+lookups; `tests/invalidation_probes.rs`: 256 pages of data probed **256** pages before, **0** after,
+and two code pages probe 2. Rows `mac-cpu-I1` (filter off) and `mac-cpu-I2` (chunks not recorded).
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

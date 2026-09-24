@@ -519,27 +519,57 @@ void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>&
 
         const u64 first_page = first >> guest_page_bits;
         const u64 last_page = last >> guest_page_bits;
+        // Omnidroid patch 0015: only the chunks that hold translated pages are walked, page by page;
+        // `probes` counts the page lookups for `od_invalidation_page_probes`.
+        u64 probes = 0;
+        const auto walk_pages = [&](u64 from_page, u64 to_page) {
+            for (u64 page = from_page;; ++page) {
+                ++probes;
+                if (const auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
+                    for (const u32 index : iter->second) {
+                        consider(index);
+                    }
+                }
+                if (page == to_page) {
+                    break;
+                }
+            }
+        };
+        constexpr unsigned chunk_shift = guest_chunk_bits - guest_page_bits;
+        const auto walk_chunk = [&](u64 chunk) {
+            const u64 chunk_first = chunk << chunk_shift;
+            const u64 chunk_last = chunk_first + ((u64{1} << chunk_shift) - 1);
+            walk_pages(std::max(first_page, chunk_first), std::min(last_page, chunk_last));
+        };
+        const u64 first_chunk = first_page >> chunk_shift;
+        const u64 last_chunk = last_page >> chunk_shift;
         if (last_page - first_page >= guest_range_pages.size()) {
             // More pages asked about than have anything on them: walk what there is.
             for (const auto& [page, indices] : guest_range_pages) {
+                ++probes;
                 if (page >= first_page && page <= last_page) {
                     for (const u32 index : indices) {
                         consider(index);
                     }
                 }
             }
-        } else {
-            for (u64 page = first_page;; ++page) {
-                if (const auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
-                    for (const u32 index : iter->second) {
-                        consider(index);
-                    }
+        } else if (last_chunk - first_chunk >= guest_range_chunks.size()) {
+            for (const u64 chunk : guest_range_chunks) {
+                if (chunk >= first_chunk && chunk <= last_chunk) {
+                    walk_chunk(chunk);
                 }
-                if (page == last_page) {
+            }
+        } else {
+            for (u64 chunk = first_chunk;; ++chunk) {
+                if (guest_range_chunks.contains(chunk)) {
+                    walk_chunk(chunk);
+                }
+                if (chunk == last_chunk) {
                     break;
                 }
             }
         }
+        invalidation_page_probes.fetch_add(probes, std::memory_order_relaxed);
     }
     InvalidateBasicBlocks(erase_locations);
 
@@ -564,6 +594,7 @@ void A64AddressSpace::ClearCache() {
     decltype(guest_ranges){}.swap(guest_ranges);
     guest_range_pages = {};
     std::vector<u32>{}.swap(wide_guest_ranges);
+    decltype(guest_range_chunks){}.swap(guest_range_chunks);  // patch 0015
 }
 
 void A64AddressSpace::EmitPrelude() {
@@ -846,6 +877,7 @@ void A64AddressSpace::RegisterNewBasicBlock(const IR::Block& block, const Emitte
     }
     for (u64 page = first_page;; ++page) {
         guest_range_pages[page].push_back(index);
+        guest_range_chunks.insert(page >> (guest_chunk_bits - guest_page_bits));  // patch 0015
         if (page == last_page) {
             break;
         }
