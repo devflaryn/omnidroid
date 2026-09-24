@@ -190,9 +190,9 @@ pub fn mangle(class: &str, member: &str) -> String {
 
 /// The value the host tells the engine the app version is.
 ///
-/// The APK's own: `Roblox-2.738.1397.apk`. Stated as a constant so that the one place it appears
+/// The APK's own: `Roblox-2.739.691.apk` (was `Roblox-2.738.1397.apk` until 2026-09-24). Stated as a constant so that the one place it appears
 /// is this one — three drifted duplicates of a figure have already appeared in this project.
-pub const APP_VERSION: &str = "2.738.1397";
+pub const APP_VERSION: &str = "2.739.691";
 
 /// `Build.VERSION.SDK_INT` of the Android this host presents, as the decimal string the APK sends.
 ///

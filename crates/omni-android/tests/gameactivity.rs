@@ -63,7 +63,7 @@ use omni_mem::{
 };
 use omni_platform::net::NetPolicy;
 
-const APK_NAME: &str = "Roblox-2.738.1397.apk";
+const APK_NAME: &str = "Roblox-2.739.691.apk";
 
 /// The switch every live-GPU test in this crate already uses, and the one that decides whether
 /// this gate gives the engine **a real window and a real Vulkan driver**.

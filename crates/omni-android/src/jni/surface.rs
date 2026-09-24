@@ -1,7 +1,7 @@
 //! The Java surface, **generated from the APK's dex files**.
 //!
 //! ```text
-//! python crates/omni-android/tools/gen_dex_surface.py Roblox-2.738.1397.apk \
+//! python crates/omni-android/tools/gen_dex_surface.py Roblox-2.739.691.apk \
 //!     > crates/omni-android/src/jni/surface.rs
 //! ```
 //!

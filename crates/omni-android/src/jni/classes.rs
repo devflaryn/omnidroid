@@ -1283,7 +1283,7 @@ pub static DECLARED: &[ClassSpec] = &[
         name: "com/roblox/engine/jni/reporter/SessionReporterJavaInterface",
         tier: Tier::One,
         methods: &[
-            s("getAppVersion", "()Ljava/lang/String;", Answer::Text("2.738.1397")),
+            s("getAppVersion", "()Ljava/lang/String;", Answer::Text(super::script::APP_VERSION)),
             s("getFilesDir", "()Ljava/lang/String;", Answer::Text("/data/data/com.roblox.client/files")),
             s("getLastLoggedInUser", "()Ljava/lang/String;", Answer::Text("")),
             s("getLastLoggedInUserId", "()Ljava/lang/String;", Answer::Text("")),
@@ -1401,7 +1401,7 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: &[m("<init>", "()V", Answer::NewInstance)],
         fields: &[
             f("appBuildVariant", "Ljava/lang/String;", Answer::Text("release")),
-            f("appVersion", "Ljava/lang/String;", Answer::Text("2.738.1397")),
+            f("appVersion", "Ljava/lang/String;", Answer::Text(super::script::APP_VERSION)),
             f("cpu64Bit", "Z", Answer::Bool(true)),
             f("deviceName", "Ljava/lang/String;", Answer::Text("Omnidroid")),
             f("deviceSku", "Ljava/lang/String;", Answer::Text("omnidroid")),
@@ -1417,7 +1417,7 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: &[m("<init>", "()V", Answer::NewInstance)],
         fields: &[
             f("appBuildVariant", "Ljava/lang/String;", Answer::Text("release")),
-            f("appVersion", "Ljava/lang/String;", Answer::Text("2.738.1397")),
+            f("appVersion", "Ljava/lang/String;", Answer::Text(super::script::APP_VERSION)),
             f("country", "Ljava/lang/String;", Answer::Text("US")),
             f("cpu64Bit", "Z", Answer::Bool(true)),
             f("deviceName", "Ljava/lang/String;", Answer::Text("Omnidroid")),

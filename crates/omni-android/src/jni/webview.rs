@@ -1397,8 +1397,8 @@ mod tests {
         assert_eq!(
             user_agent(&facts),
             "Mozilla/5.0 (3584MB; 1920x1080; 144x145; 1280x720; Micro-Star unknown; 13) AppleWebKit/537.36 \
-             (KHTML, like Gecko)  ROBLOX Android App 2.738.1397 Phone Hybrid()  GooglePlayStore \
-             RobloxApp/2.738.1397 (GlobalDist; GooglePlayStore)"
+             (KHTML, like Gecko)  ROBLOX Android App 2.739.691 Phone Hybrid()  GooglePlayStore \
+             RobloxApp/2.739.691 (GlobalDist; GooglePlayStore)"
         );
         let tablet = UserAgentFacts { tablet: true, chrome_os: true, ..facts.clone() };
         let agent = user_agent(&tablet);
