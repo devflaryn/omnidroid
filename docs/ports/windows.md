@@ -106,8 +106,20 @@ and the owner asked for no more real-game runs until it is updated. What was mea
 | `bae4b92`: value-compare exclusives (D31) | busiest workers 3-8.5% of samples at the global monitor | benchmark 131 → 12.8 ns per guest atomic; landing passes |
 | patch 0003: the RSB kept (D33) | (from the benchmark, not the profile) every `RET` was a dispatcher lookup | benchmark 132.0 → 24.1 ns per call and return at 262,144 blocks |
 
-Still open from the profile: the game loop's `ALooper_pollOnce` + mutex spin (thread g5), and the
-~12 fps itself. The owner's next session should re-take the same profile on the updated APK
+Still open from the profile: the ~12 fps itself. The game loop's spin (thread g5) is closed as
+the engine's own design:
+
+DECODED since, so no longer open: the game loop's spin is **the engine's own design**, not a
+runtime fault. While the window is active, `NativeEngine::GameLoop` (`0x2bcd5d0`) calls
+`ALooper_pollOnce((flag8 && flag9 ? flag_a : 0) - 1)`, which is `pollOnce(0)`. It then calls
+`0x2bd1cf0`, which only locks the mutex at `this+0x14` (`pthread_mutex_lock`, via `0x2b53a68`),
+acts if the state at `this+0x10` is 3, 5 or 9, and unlocks (`0x2b53abc`). Nothing on that path
+blocks, so a phone runs the same spin and pays one core for it. MEASURED on the landing at
+`05efab2`: g5 97% of a core, 3.5 M crossings/s, the handlers `pthread_mutex_unlock` 26%,
+`ALooper_pollOnce` 25% and `pthread_mutex_lock` 20%. On this 24-thread host that is one core
+and not the frame-rate limit. Making the handlers cheaper would only make it spin faster, so
+nothing is changed. Rendering and the frame's work are on other threads (g6, the workers).
+ The owner's next session should re-take the same profile on the updated APK
 (`OMNI_PERF=1`, the same place) to measure the three together.
 
 ### Before the profile (kept for the record)
