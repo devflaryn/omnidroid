@@ -385,6 +385,20 @@ fn the_milestone_gate_natively_all_3594_initializers_run_in_order() {
         guest.boundary.crossings(),
         guest.bionic.guest_thread_records()
     );
+    // The guest thread the initializers started is still running, unbounded (a backend that
+    // cannot count has no run windows), and still crossing the boundary. Stopping the instance
+    // must stop it anyway -- through its `HaltHandle`, which is what `threads::drive` registers.
+    let crossing = guest.boundary.threads().iter().map(|t| t.crossings).sum::<u64>();
+    std::thread::sleep(Duration::from_millis(100));
+    let still_crossing = guest.boundary.threads().iter().map(|t| t.crossings).sum::<u64>();
+    assert!(still_crossing > crossing, "the started thread is live and running guest code, or this stop proves nothing");
+    let asked = Instant::now();
+    guest.bionic.stop_guest_threads();
+    assert!(
+        guest.bionic.join_guest_threads(Duration::from_secs(10)),
+        "a native guest thread did not stop within 10 s of stop_guest_threads"
+    );
+    eprintln!("  the started guest thread stopped {:?} after it was asked", asked.elapsed());
 }
 
 /// **The cold initializer run, timed**: what a startup pays. One instance per process, because
