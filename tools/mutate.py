@@ -8663,6 +8663,39 @@ directory", ADAPTER_FILES,
      "            records.retain(|record| Arc::strong_count(record) > 1);",
      "            records.retain(|record| Arc::strong_count(record) > 2);",
      ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+
+    # ---- the device-attestation "quote": NativeQuoteInterface (prefix `quote-`) -----------------
+    # The live gate's one JNI miss was `ClassLoader.findClass com/roblox/engine/jni/
+    # NativeQuoteInterface`, a class the engine names by a string it builds at runtime -- so the
+    # generated surface cannot carry it and it is declared by hand. Detectors: the three unit tests
+    # in `jni::env::tests` (`class_loader_find_class_resolves_native_quote_interface`,
+    # `request_response_answers_a_device_that_cannot_attest`,
+    # `a_wrong_length_quote_challenge_is_refused_naming_it`).
+    ("quote-A1", "A", "the NativeQuoteInterface class is undeclared, so findClass misses it again",
+     JNI_CLASSES,
+     """        name: "com/roblox/engine/jni/NativeQuoteInterface",""",
+     """        name: "com/roblox/engine/jni/NativeQuoteInterfaceX",""",
+     ANDROID_LIB),
+    ("quote-A2", "A", "requestResponse goes back to unanswered, so the engine's call refuses",
+     JNI_CLASSES,
+     """            s("requestResponse", "([B)[B", Answer::QuoteResponse),""",
+     """            s("requestResponse", "([B)[B", Answer::Unanswered),""",
+     ANDROID_LIB),
+    ("quote-A3", "A", "the error response drops its 0x01 marker byte, so it no longer reads as one",
+     JNI_ENV,
+     """            let mut blob: Vec<i8> = vec![0x01, 0x00];""",
+     """            let mut blob: Vec<i8> = vec![0x00, 0x00];""",
+     ANDROID_LIB),
+    ("quote-A4", "A", "the challenge-length check is dropped, so a wrong-length challenge is answered",
+     JNI_ENV,
+     """            if length != 32 {""",
+     """            if false {""",
+     ANDROID_LIB),
+    ("quote-B1", "B", "the length check over-rejects, refusing the exact 32-byte challenge it must answer",
+     JNI_ENV,
+     """            if length != 32 {""",
+     """            if length <= 32 {""",
+     ANDROID_LIB),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

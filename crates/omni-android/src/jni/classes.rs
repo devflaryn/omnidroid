@@ -1,8 +1,8 @@
-//! The class registry: the 104 classes and 409 members, as a table of what the host answers.
+//! The class registry: the 105 classes and 414 members, as a table of what the host answers.
 //!
 //! # Why this is not a JVM, stated where it will be read
 //!
-//! D7 says no JVM, no ART, no dex interpreter, and 104 classes with 409 members looks at a glance
+//! D7 says no JVM, no ART, no dex interpreter, and 105 classes with 414 members looks at a glance
 //! like the thing D7 forbids. It is not, and the reason is structural rather than a matter of
 //! degree. `jni-surface.md` §6 searched for every mechanism that would force dex execution and
 //! found **all of them absent**: no `java/lang/reflect/*`, no `Class.forName`, no
@@ -256,6 +256,46 @@ pub enum Answer {
     /// all host-defined — but `RegisterNatives` records function pointers and a later milestone
     /// will call one.
     Native,
+    /// `com/roblox/engine/jni/NativeQuoteInterface.requestResponse([B)[B` (static): the device's
+    /// hardware key-attestation "quote", which this runtime cannot mint — so this returns what a
+    /// **device that cannot attest** returns, decoded from `classes2.dex`, not guessed.
+    ///
+    /// # What the engine does (decoded from `libroblox.so` 2.739.691)
+    ///
+    /// One flattened, string-obfuscated function (`0x3298230`) builds the class name at runtime —
+    /// which is why `"com/roblox/engine/jni/NativeQuoteInterface"` is in **no** `.rodata` literal
+    /// and the generated [`super::surface`] cannot carry it, so it is declared here by hand. It
+    /// resolves the class through the cached app `ClassLoader` (`resolveClass`, `0x227917c`, the
+    /// [`ResolveClass`](Answer::ResolveClass) path), then `GetStaticMethodID(cls, <built
+    /// "requestResponse">, "([B)[B")` (the descriptor **is** a literal, `0x24aa01`, referenced at
+    /// `0x329e02c`), then `CallStaticObjectMethod(cls, mid, challenge)` with a 32-byte challenge
+    /// byte array. It does not null-check the result (`jni-surface.md` §8.1's third failure mode),
+    /// so a missed `findClass` here was the live gate's one JNI miss.
+    ///
+    /// # What the Java does (decoded from `classes2.dex`)
+    ///
+    /// `requestResponse(byte[] c)`: if `c.length != 32` it throws `IOException("challenge length
+    /// is wrong")`; otherwise it opens `KeyStore.getInstance("AndroidKeyStore")`, generates an EC
+    /// `KeyGenParameterSpec` with an attestation challenge (StrongBox first, then without), and
+    /// returns the native quote `lIIIIlIIIIlllIII()[B` — **all inside one `catch (Throwable)`**
+    /// whose handler returns a `ByteBuffer` of `[0x01, 0x00]` followed by
+    /// `UTF_8(throwable.toString())`.
+    ///
+    /// # Why this is the faithful answer, not a fabricated one
+    ///
+    /// A genuine attestation quote is a function of a TEE this host does not have, so minting one
+    /// would be Global Constraint 1's believable wrong answer. But the Java's own `catch` path is
+    /// the exact, decoded answer a device **without** a working `AndroidKeyStore` returns, and this
+    /// runtime is precisely that device: `KeyStore.getInstance("AndroidKeyStore")` finds no
+    /// provider, so `java.security.KeyStore.getInstance` throws `KeyStoreException: AndroidKeyStore
+    /// not found` — the platform's own defined `toString()` for a missing provider, not a value
+    /// chosen to look like one. So this returns `[0x01, 0x00] ++ UTF_8("java.security.KeyStore\
+    /// Exception: AndroidKeyStore not found")`, which is what the engine (and the server it sends
+    /// it to) is already written to handle for such a device. A challenge whose length is not 32
+    /// is the one path the Java leaves uncaught; there is no thread to raise a pending exception on
+    /// from here, so it refuses by name — a shape the real engine never produces (the challenge is
+    /// always a 32-byte nonce).
+    QuoteResponse,
 }
 
 /// One declared member.
@@ -603,7 +643,7 @@ impl Registry {
     pub fn record_miss(&mut self, miss: Miss) {
         // Bounded, because a guest in a loop looking up a member that does not exist would
         // otherwise grow this without limit. The bound is generous: the whole declared surface is
-        // 409 members, so a thousand distinct misses is already a different problem.
+        // 414 members, so a thousand distinct misses is already a different problem.
         if self.misses.len() < MAX_MISSES && !self.misses.contains(&miss) {
             self.misses.push(miss);
         }
@@ -657,6 +697,7 @@ impl Registry {
             | Answer::HostCallback
             | Answer::HostRequest
             | Answer::Native
+            | Answer::QuoteResponse
             | Answer::Unanswered => return None,
         })
     }
@@ -2095,6 +2136,41 @@ pub static DECLARED: &[ClassSpec] = &[
             "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;",
             Answer::StaticInstance,
         )],
+    },
+    // ---- device attestation ("quote"): a class the generator cannot see -----------------------
+    //
+    // **MEASURED (live gate, Windows, in-world Pet Simulator 99, once the engine ran on its real
+    // server flags):** the game thread's one JNI miss was `ClassLoader.findClass
+    // com/roblox/engine/jni/NativeQuoteInterface`. The class is `classes2.dex`'s (VERIFIED, its
+    // only `NativeQuote` string) but its name is **built at runtime by the obfuscated anti-tamper
+    // function** (`libroblox.so 0x3298230`), so it is in **no** `.rodata` literal and
+    // `gen_dex_surface.py`'s "literal ∩ dex" cannot carry it. Declared here by hand, which is the
+    // mechanism the module docs describe for exactly this: `extend_with` never overrides it.
+    //
+    // The engine resolves the class, takes `GetStaticMethodID("requestResponse", "([B)[B")` and
+    // `CallStaticObjectMethod`s it with a 32-byte challenge, without null-checking (§8.1's third
+    // failure mode). The members and their answers are read from `classes2.dex`; the whole decode
+    // and why the answer is faithful rather than fabricated is on [`Answer::QuoteResponse`].
+    ClassSpec {
+        name: "com/roblox/engine/jni/NativeQuoteInterface",
+        tier: Tier::Support,
+        methods: &[
+            m("<init>", "()V", Answer::NewInstance),
+            // The two static Java helpers `requestResponse` calls into: build a
+            // `KeyGenParameterSpec$Builder` and `generateKeyPair`. Only the app's own Java code
+            // reaches them, never the engine directly, and this runtime has no Android Keystore to
+            // run their bodies against -- so they are declared (a device has them) and refuse by
+            // name if ever reached, rather than being invented.
+            s("a", "(Ljava/lang/Object;)V", Answer::Unanswered),
+            s("b", "(Ljava/lang/String;I[BZ)Ljava/lang/Object;", Answer::Unanswered),
+            // The native quote source (`static native ()[B`). Declared so the engine's own
+            // `RegisterNatives` binds it rather than recording a miss; the transcribed
+            // `requestResponse` returns on the no-keystore path before it would be reached, so its
+            // guest body is never entered here.
+            s("lIIIIlIIIIlllIII", "()[B", Answer::Native),
+            s("requestResponse", "([B)[B", Answer::QuoteResponse),
+        ],
+        fields: NONE,
     },
 ];
 

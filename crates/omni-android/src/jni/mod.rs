@@ -19,7 +19,7 @@
 //! | [`slots`] | the 233 + 8 function-table entries, in `jni.h` order — the specification |
 //! | [`refs`] | handles, and why a `jobject` the guest hands back is checked |
 //! | [`values`] | Java strings, modified UTF-8, and the descriptor grammar |
-//! | [`classes`] | the class registry, and why 409 members is not a JVM |
+//! | [`classes`] | the class registry, and why 414 members is not a JVM |
 //! | [`pool`] | pinned guest buffers for `GetStringUTFChars` and the array families |
 //! | [`mod@env`] | the `JNIEnv` handlers, and the refusal every unimplemented slot gets |
 //! | [`script`] | §8 steps 7-12, as an ordered list of downcalls a host can run |
@@ -1289,7 +1289,7 @@ impl Jni {
 
     /// **Decide what a member answers**, replacing whatever the table declared.
     ///
-    /// This is the facility D7's argument rests on, made explicit: 90% of the 409-member surface
+    /// This is the facility D7's argument rests on, made explicit: 90% of the 414-member surface
     /// is Roblox's own thin Kotlin shell *whose behaviour Omnidroid gets to define*, and this is
     /// where an embedding defines it. [`classes::Answer::Unanswered`] is the table's way of
     /// saying "the layer does not know and will refuse"; this is the host's way of saying it

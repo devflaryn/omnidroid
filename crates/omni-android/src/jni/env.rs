@@ -55,6 +55,13 @@ use super::{Jni, JniState, Registration, ATTACH_ARGS_NAME_OFFSET};
 /// fail. Generous, because a registered native may do real work.
 const NATIVE_METHOD_BUDGET: RunLimit = RunLimit::Instructions(200_000_000);
 
+/// The `Throwable.toString()` `NativeQuoteInterface.requestResponse` catches on a runtime with no
+/// `AndroidKeyStore` provider, packed into its error response after `[0x01, 0x00]`. See
+/// [`Answer::QuoteResponse`](super::classes::Answer::QuoteResponse): `java.security.KeyStore.\
+/// getInstance("AndroidKeyStore")` is the first thing the method's `try` does, and the JCA's own
+/// message for a type no provider supplies is `"<type> not found"`.
+const QUOTE_NO_KEYSTORE: &str = "java.security.KeyStoreException: AndroidKeyStore not found";
+
 /// What a JNI function returns, before it is put in a register.
 ///
 /// One type so that the inline path and the exit path share **one** marshaller. Two would be how
@@ -1915,6 +1922,53 @@ pub(super) fn evaluate(
             )?;
             Ok(Value::Object(Some(object)))
         }
+        Answer::QuoteResponse => {
+            // `NativeQuoteInterface.requestResponse([B)[B` (static). The full decode and the
+            // reason this is the faithful answer rather than a fabricated quote are on
+            // `Answer::QuoteResponse`.
+            let refuse = |detail: String| AbiError::JniRefused {
+                function: name.to_string(),
+                address,
+                detail: format!(
+                    "`{}.{}{}`: {detail}",
+                    state.registry.class_name(class),
+                    member.name,
+                    member.descriptor
+                ),
+            };
+            let [Value::Long(challenge)] = arguments else {
+                return Err(refuse(format!("the arguments are {arguments:?}, not a single byte[]")));
+            };
+            // Kotlin passes the challenge as a non-null 32-byte nonce; a null array is the shape
+            // the Java's own `array-length` would throw a NullPointerException on.
+            if *challenge == 0 {
+                return Err(refuse("the challenge byte[] is null".to_string()));
+            }
+            let id = state.handles.resolve_id(name, address, *challenge as u64)?;
+            let length = match state.handles.object_of(id) {
+                Some(Object::ByteArray(bytes)) => bytes.len(),
+                Some(other) => return Err(wrong_kind(name, address, other, "a byte[]")),
+                None => return Err(freed(name, address)),
+            };
+            // The Java: `if (c.length != 32) throw new IOException("challenge length is wrong")`.
+            // That is the one branch it leaves uncaught, and there is no thread here to raise a
+            // pending exception on -- so it refuses by name. The real engine never reaches it.
+            if length != 32 {
+                return Err(refuse(format!(
+                    "the challenge is {length} bytes, not 32 -- the Java throws \
+                     IOException(\"challenge length is wrong\") here"
+                )));
+            }
+            // The `catch (Throwable)` path, transcribed: this runtime has no `AndroidKeyStore`
+            // provider, so `KeyStore.getInstance(\"AndroidKeyStore\")` throws
+            // `java.security.KeyStoreException: AndroidKeyStore not found` -- the platform's own
+            // message for a missing provider -- and the handler returns `[0x01, 0x00]` followed by
+            // that throwable's UTF-8 `toString()`.
+            let mut blob: Vec<i8> = vec![0x01, 0x00];
+            blob.extend(QUOTE_NO_KEYSTORE.bytes().map(|byte| byte as i8));
+            let object = state.handles.create(name, address, Object::ByteArray(blob))?;
+            Ok(Value::Object(Some(object)))
+        }
         Answer::IdentityHash => match arguments.first() {
             // `Value::Long` is how an object parameter arrives: the raw handle, resolved here.
             Some(Value::Long(0)) => Ok(Value::Int(0)),
@@ -3222,6 +3276,108 @@ mod tests {
 
     /// One marshaller for both paths, and this is what says a `jlong` keeps all 64 bits where an
     /// `i32` return would sign-extend 32.
+    const QUOTE: &str = "com/roblox/engine/jni/NativeQuoteInterface";
+
+    /// **The live gate's one JNI miss is gone: the app `ClassLoader.findClass` resolves
+    /// `NativeQuoteInterface`.** The engine builds the name at runtime, so the generated surface
+    /// cannot carry it; the hand declaration is what makes the resolver answer a class rather than
+    /// null-with-a-miss. Both the direct `find` and the `ResolveClass` path a real `findClass`
+    /// takes are checked, and the miss list stays empty.
+    #[test]
+    fn class_loader_find_class_resolves_native_quote_interface() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        assert!(state.registry.find(QUOTE).is_some(), "declared, so FindClass answers it");
+
+        // The engine's own shape: it caches the app loader and asks it by dotted name.
+        let loader = state.registry.find("java/lang/ClassLoader").expect("declared");
+        let method = state
+            .registry
+            .method(loader, "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", false)
+            .expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        assert_eq!(member.answer, Answer::ResolveClass);
+        let name = state
+            .handles
+            .new_local("test", 0, Object::String(JavaString::from_str("com.roblox.engine.jni.NativeQuoteInterface")))
+            .expect("a String");
+        let got = evaluate(&mut state, "CallObjectMethodV", 0, loader, &member, None, &[
+            Value::Long(name as i64),
+        ])
+        .expect("resolved");
+        match got {
+            Value::Object(Some(id)) => match state.handles.object_of(id) {
+                Some(Object::Class(class)) => assert_eq!(*class, state.registry.find(QUOTE).unwrap()),
+                other => panic!("a jclass, not {other:?}"),
+            },
+            other => panic!("a resolved class, not {other:?}"),
+        }
+        assert!(state.registry.misses().is_empty(), "no miss for a class the host declares");
+    }
+
+    /// **`requestResponse` answers what a device with no `AndroidKeyStore` returns**, decoded from
+    /// `classes2.dex`: `[0x01, 0x00]` then the UTF-8 of the caught `KeyStoreException`. Not a
+    /// minted attestation quote -- this host has no TEE, and the Java's own `catch` path is the
+    /// faithful answer. The lookup succeeds (a real `jmethodID`, no null id reaching the call) and
+    /// nothing is missed.
+    #[test]
+    fn request_response_answers_a_device_that_cannot_attest() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let class = state.registry.find(QUOTE).expect("declared");
+        let method = state
+            .registry
+            .method(class, "requestResponse", "([B)[B", true)
+            .expect("declared, so GetStaticMethodID is a real id");
+        let member = state.registry.member(method).expect("a member").clone();
+        assert_eq!(member.answer, Answer::QuoteResponse);
+
+        let challenge = state
+            .handles
+            .new_local("test", 0, Object::ByteArray(vec![7i8; 32]))
+            .expect("a 32-byte challenge");
+        let got = evaluate(&mut state, "CallStaticObjectMethodV", 0, class, &member, None, &[
+            Value::Long(challenge as i64),
+        ])
+        .expect("answered");
+        let Value::Object(Some(id)) = got else { panic!("a byte[], not {got:?}") };
+        let bytes = match state.handles.object_of(id) {
+            Some(Object::ByteArray(bytes)) => bytes.iter().map(|&b| b as u8).collect::<Vec<u8>>(),
+            other => panic!("a byte[], not {other:?}"),
+        };
+        let mut expected = vec![0x01u8, 0x00];
+        expected.extend_from_slice(QUOTE_NO_KEYSTORE.as_bytes());
+        assert_eq!(bytes, expected, "the device's error response, byte for byte");
+        assert!(state.registry.misses().is_empty(), "the call was answered, not missed");
+    }
+
+    /// The one branch the Java leaves uncaught -- a challenge whose length is not 32 -- refuses by
+    /// name here (there is no thread to raise its `IOException` on), and the message names the
+    /// length so a mutation that drops the check is visible.
+    #[test]
+    fn a_wrong_length_quote_challenge_is_refused_naming_it() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let class = state.registry.find(QUOTE).expect("declared");
+        let method = state.registry.method(class, "requestResponse", "([B)[B", true).expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        let short = state.handles.new_local("test", 0, Object::ByteArray(vec![0i8; 16])).expect("16 bytes");
+        let error = evaluate(&mut state, "CallStaticObjectMethodV", 0, class, &member, None, &[
+            Value::Long(short as i64),
+        ])
+        .expect_err("a 16-byte challenge is not 32");
+        match error {
+            AbiError::JniRefused { detail, .. } => {
+                assert!(detail.contains("16 bytes, not 32"), "{detail}");
+                assert!(detail.contains("challenge length is wrong"), "{detail}");
+            }
+            other => panic!("a refusal naming the length, not {other:?}"),
+        }
+    }
+
     #[test]
     fn a_long_return_keeps_every_bit() {
         assert_eq!(JniReturn::Long(i64::MIN), JniReturn::Long(i64::MIN));
