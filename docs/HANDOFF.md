@@ -5,7 +5,75 @@ snapshot, not a history. The durable sources of truth are `docs/ARCHITECTURE.md`
 `docs/DECISIONS.md`, `docs/STATUS.md`, **`docs/VERIFICATION.md`**, the M3 plan and ledger, and git
 history.
 
-## 2026-09-24 night: the performance goal -- read this first
+## 2026-09-25: the performance goal in progress -- read this first
+
+Brief: `docs/briefs/goal-performance.md`. Everything below is MEASURED in PS99 (place 8737899170)
+with `omnidroid play --cookie ... --place 8737899170`, logs in the session scratchpad
+(`2583edad-…/scratchpad/runs/`), unless it says otherwise.
+
+**Blockers fixed so far** (each committed with a test and mutation rows):
+
+| commit | what |
+|---|---|
+| `622fb8b` | a long `pthread_cond_timedwait` is waited on in slices, not refused -- the join worker's ~120 s wait no longer kills it; the join starts on every run since (w1-w5, m1, l1) |
+| `e72c642` | `remove` (bionic: unlink, then rmdir on EISDIR) |
+| `e6b7769` | `MADV_FREE` carried out at once: a mark left behind let a later `MADV_DONTNEED` anywhere decommit reused heap pages (heap corruption; found under an OpenSSL MemoryFault) |
+| `010e677` | raw syscalls 43/44 (`statfs`/`fstatfs`): a TaskScheduler worker died on 44 in every world |
+| `53391a1` | row 21 hands the engine the Java side's settings document (`GoogleAndroidApp`, fetched with the system `curl`, cached in the app's storage) and the exit list -- the engine used to run on compiled-in flag defaults, which a device never does; that is what left `InferredCrash+0xc8` null (decoded: `0x228fc00` sets it only when `FIntPerformanceControlCrashMetricAlgorithmType2` is non-zero at init) |
+
+**Baseline in the world, Windows** (idle camera, signed in, the world settles ~2 min after
+`onGameLoaded`; fps = presents per 5 s / 5):
+
+| run | commit | join call -> `onGameLoaded` | settled fps (median of 5 s windows, +300..+450 s) | private / working set |
+|---|---|---|---|---|
+| w1 | `622fb8b` | 39 s | ~30 (17-37) | 4.4 / 3.9 GiB |
+| w3 | `53391a1` (real flags) | 37 s | 30.2 (14-39) | 4.5 / 4.1 GiB |
+| w6 | `677c41b` (+ lock-free admit) | 34 s | 38.4 (11-43) | 4.7 / 4.2 GiB |
+| w7 | `5a80626` (+ fast dispatch, census) | 26 s | **48.2** (5-53) | 4.7 / 4.2 GiB |
+| w9 | `dfdcff2`, `OMNI_GUEST_CPUS=8` | 23 s | 49.2 (13-55) | **3.9 / 3.5 GiB** |
+| w10 | `dfdcff2` (file trace on) | 28 s | 39.8 (+250..+330 s) | 4.8 / 4.3 GiB |
+
+(join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
+windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
+spread is wide.) Luau's own load benchmark fell with the same changes: `[SlowBenchmark] Types`
+3,850 -> 3,721 -> 2,846 ms and `GUILoader` 1,650 -> 1,480 -> 961 ms (w3, w6, w7).
+
+macOS m1 (`622fb8b`): join -> loaded 144 s, 0 presents for ~200 s after the load, then ~9.5 fps.
+Luau's own load benchmarks (`[SlowBenchmark]`) on the Mac are 1.6-3.7x Windows'.
+macOS m2 (`57cc1a3`): join -> loaded 131 s, settled 9.0 fps (6.6-9.8), 2.8 GiB private. **m3, the
+same build with `OMNI_JIT_EXCLUSIVE_MONITOR=global`: join -> loaded 35 s, settled 30.6 fps
+(25.6-32.0)**, GUILoader 5,871 -> 1,597 ms -- the arm64 monitor finding (#3a below), confirmed.
+
+Linux l1 (`53391a1`, GLES on the Quadro's NVC0 -- the engine refuses lavapipe as emulated): join ->
+loaded 110 s, settled **~1 fps** (4-6 presents per 5 s), 2.3 of 4 cores busy but only ~100 M guest
+insn/s (Windows: ~1,160 M on 3 cores), `[SlowBenchmark] Types` 10.3 s (Windows 3.85 s). The close
+did not reach the background within 60 s (`SessionHistory None`). No sampler exists off Windows,
+so no per-thread profile yet (being ported); `perf` needs `perf_event_paranoid` < 4 (it is 4).
+
+**The bottleneck list, ranked by measured cost** (Windows in-world profile w4, `OMNI_PERF=5`,
+`OMNI_PERF_DUMP`, symbolized with a debug-info build; shares are of the samples outside translated
+code on the render thread g6, whose per-frame work plus the TaskScheduler workers' is the frame):
+
+| # | bottleneck | measured | state |
+|---|---|---|---|
+| 1 | `GuestSpace`'s one map mutex: `region_at`/`entry_start`/`admit` on every guest-memory access a handler makes, contended (`lock_slow`) | 28-35% of g6's non-JIT samples; ~25% across all threads | **fixed** `5a4d5c4` (per-thread cache + generation; bench 8 threads 1,770 -> 12.4 ns per admit); w6 30 -> 38 fps |
+| 2 | dynarmic's dispatcher lookup (`GetBasicBlock`) on every indirect branch that misses the RSB (FastDispatch off, D16) | 25% of g6's non-JIT samples, 12% across all threads | **fixed** `f9ea397` (patches 0019/0020, D35: fast dispatch and the arm64 RSB keep the budget/halt checks); with #3, w7 38 -> 48 fps, `GetBasicBlock` 12% -> 2.7% |
+| 3 | the import census: shared per-slot counters and global `last_call` stores on every crossing | 8-9% | **fixed** `5a80626` (per-thread records; 8 threads, one import: 518-614 -> 60-64 ns per crossing) |
+| 3a | **macOS: the arm64 backend ignores value-compare** (patch 0007's inline exclusives take the global monitor's spin lock and scan 2,048 slots on every guest atomic) | 1,306 ns per atomic vs 9.4 ns honoured; the lock saturates at ~770 k atomics/s and caps the process at ~400 M insn/s | fix in progress (patch 0021); interim A/B `OMNI_JIT_EXCLUSIVE_MONITOR=global` (186 ns) |
+| 4 | translation (per-thread code caches; each thread translates what it runs) | ~30% of dynarmic's own samples; 200+ kinsn/s for ~2 min after load | open |
+| 5 | per-crossing path (`bionic::active`, trampoline, `cb_call_svc`, `pthread_getspecific`) | ~15% together | open |
+| 6 | the frame chain: render thread waits 60% in `pthread_cond_wait` for workers; workers wake each other through futex waits of 1-16 ms mean | `OMNI_PERF_WAITS` (w5) | open -- lowers with 1-5 |
+| 7 | the game loop's `ALooper_pollOnce(0)` + mutex spin (engine design): one core, 2.8 M crossings/s, and the main contender of #1 and #3 | 96% of a core | open -- cheaper with 1, 3 |
+| 8 | memory: 4.4 GiB private in the world at default graphics | | open |
+
+**Deaths still open:** Windows `open(O_TRUNC)` on `memProfStorage<pid>.json` under a live mapping
+(error 1224, a worker at +5 s; logical EOF in progress); raw syscall 63 (`read`) from the engine's
+raw-SVC wrapper (a worker at +90 s; routing the file syscalls in progress); an intermittent OpenSSL
+MemoryFault (`impls` = -1 in `ossl_method_store_do_all`, thread 30, 1 of 5 runs, possibly the
+`MADV_FREE` corruption above); a `poll` over sockets parks 60 s per slice and holds teardown (the
+gate then fails; in progress).
+
+## 2026-09-24 night: the performance goal -- the state it started from
 
 The current goal is **`docs/briefs/goal-performance.md`**: make the app fast, stable and
 lightweight on Windows, macOS and Linux, measured in PS99 (place 8737899170) with the world
