@@ -369,7 +369,7 @@ impl Gles {
     /// Publish this instance to the calling thread until the guard is dropped.
     #[must_use]
     pub fn activate(self: &Arc<Self>) -> GlesActivation {
-        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(Arc::clone(self)));
+        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(std::rc::Rc::new(Arc::clone(self))));
         GlesActivation { previous }
     }
 
@@ -818,12 +818,12 @@ fn dispatch(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 
 thread_local! {
     // The `Gles` published to one thread, for `Gles`'s own documented reason.
-    static ACTIVE: RefCell<Option<Arc<Gles>>> = const { RefCell::new(None) };
+    static ACTIVE: RefCell<Option<std::rc::Rc<Arc<Gles>>>> = const { RefCell::new(None) };
 }
 
 /// Restores the previously published instance when dropped.
 pub struct GlesActivation {
-    previous: Option<Arc<Gles>>,
+    previous: Option<std::rc::Rc<Arc<Gles>>>,
 }
 
 impl Drop for GlesActivation {
@@ -839,7 +839,7 @@ impl core::fmt::Debug for GlesActivation {
 }
 
 /// The instance published to this thread, or a refusal naming the call.
-pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<Arc<Gles>> {
+pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<std::rc::Rc<Arc<Gles>>> {
     ACTIVE.with(|cell| cell.borrow().clone()).ok_or_else(|| AbiError::Refused {
         symbol: symbol.to_string(),
         address,

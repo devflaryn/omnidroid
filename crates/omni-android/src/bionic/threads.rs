@@ -524,7 +524,7 @@ impl core::fmt::Display for GuestThreadFailure {
 struct Call {
     symbol: String,
     address: GuestAddr,
-    state: Active,
+    state: std::rc::Rc<Active>,
     mem: GuestMem,
 }
 

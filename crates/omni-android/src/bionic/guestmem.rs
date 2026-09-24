@@ -240,7 +240,7 @@ fn pages(len: u64, page: usize) -> Option<usize> {
 struct Call {
     symbol: String,
     address: GuestAddr,
-    state: Active,
+    state: std::rc::Rc<Active>,
     mem: crate::mem::GuestMem,
 }
 

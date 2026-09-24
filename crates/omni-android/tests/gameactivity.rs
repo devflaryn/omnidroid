@@ -2096,9 +2096,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // un-gated `Boundary::crossings` said, in one reading, was a guest running flat out.
     //
     // **`OMNI_IMPORT_CENSUS=off`, a measurement switch**, leaves it off for the session instead:
-    // the census costs every crossing on every thread a shared-counter increment and two stores to
-    // one process-wide pair of words (238-280 ns per crossing with 8 threads against 35-46 off, a
-    // benchmark), and whether that matters in a world is what the switch is for. Frames are
+    // the census costs every crossing a few stores into the crossing thread's own record and a
+    // counter read -- 10-18 ns more than with it off, on 1 thread or 8 (`tests/perf.rs`; while
+    // the counts were shared words every core wrote it was 238-614 ns with 8 threads against
+    // 35-50 off) -- and whether that matters in a world is what the switch is for. Frames are
     // counted by the Vulkan layer, not the census, so the FRAMES line is unaffected; every census
     // reading after this point -- the watchdogs' per-thread INSIDE lines included -- is frozen, and
     // says so here (`docs/VERIFICATION.md` entry 15).

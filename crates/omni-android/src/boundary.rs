@@ -140,20 +140,74 @@ pub struct Slot {
     ///
     /// [`SymbolRequest::library`]: omni_elf::loader::SymbolRequest::library
     pub library: Option<String>,
-    /// How many times the guest has branched here **while the census was on**. See
-    /// [`Boundary::start_census`].
-    calls: AtomicU64,
+    /// Its position in address order, which is where every thread's census counter for it is. See
+    /// [`Boundary::census`]: the counts are per thread, so a slot does not hold one.
+    index: usize,
 }
 
-impl Slot {
-    /// How many times the guest has called this symbol since the census was started.
-    ///
-    /// Zero when the census has never been on, which is not the same statement as "never called" —
-    /// [`Boundary::census`] is what tells the two apart, because it refuses to report at all
-    /// unless the census was running.
-    #[must_use]
-    pub fn calls(&self) -> u64 {
-        self.calls.load(Ordering::Relaxed)
+/// A frozen boundary's slots: in address order, found by address in O(1) on the crossing path.
+///
+/// Every crossing looks its slot up by thunk address, and a `BTreeMap` of the ~600 imports a
+/// loaded `libroblox.so` has is a walk of several nodes to do it. Function slots are allocated
+/// one [`SLOT_BYTES`](crate::region::SLOT_BYTES) stride apart from the start of the function
+/// area, so the slot a call names is an array index. The map is kept for everything else --
+/// data objects, and the "which object is this address inside" question `slot_at` asks.
+struct SlotTable {
+    /// Every slot, in address order; a slot's `index` is its position here.
+    list: Vec<Slot>,
+    /// Address to position, for data slots and ordered queries.
+    by_address: BTreeMap<GuestAddr, usize>,
+    /// Function slot `n` (at `functions_start + n * SLOT_BYTES`) to position, or `u32::MAX`.
+    functions: Box<[u32]>,
+    functions_start: GuestAddr,
+}
+
+impl SlotTable {
+    fn new(slots: BTreeMap<GuestAddr, Slot>, functions_start: GuestAddr) -> Self {
+        let stride = crate::region::SLOT_BYTES;
+        let mut list: Vec<Slot> = slots.into_values().collect();
+        let mut by_address = BTreeMap::new();
+        let mut functions = Vec::new();
+        for (index, slot) in list.iter_mut().enumerate() {
+            slot.index = index;
+            by_address.insert(slot.address, index);
+            let offset = slot.address.wrapping_sub(functions_start);
+            if !matches!(slot.binding, Binding::Data) && offset % stride == 0 {
+                let n = offset / stride;
+                if n >= functions.len() {
+                    functions.resize(n + 1, u32::MAX);
+                }
+                functions[n] = u32::try_from(index).expect("fewer than 2^32 slots");
+            }
+        }
+        Self { list, by_address, functions: functions.into_boxed_slice(), functions_start }
+    }
+
+    /// The slot at exactly `address`.
+    #[inline]
+    fn get(&self, address: &GuestAddr) -> Option<&Slot> {
+        let offset = address.wrapping_sub(self.functions_start);
+        if offset % crate::region::SLOT_BYTES == 0 {
+            if let Some(&index) = self.functions.get(offset / crate::region::SLOT_BYTES) {
+                if index != u32::MAX {
+                    return self.list.get(index as usize);
+                }
+            }
+        }
+        self.by_address.get(address).and_then(|&index| self.list.get(index))
+    }
+
+    /// The last slot at or below `address`.
+    fn at_or_below(&self, address: GuestAddr) -> Option<&Slot> {
+        self.by_address.range(..=address).next_back().and_then(|(_, &index)| self.list.get(index))
+    }
+
+    fn values(&self) -> core::slice::Iter<'_, Slot> {
+        self.list.iter()
+    }
+
+    fn len(&self) -> usize {
+        self.list.len()
     }
 }
 
@@ -260,7 +314,7 @@ impl BoundaryBuilder {
                 address,
                 binding: Binding::Unbound,
                 library: None,
-                calls: AtomicU64::new(0),
+                index: 0,
             },
         );
         Ok(address)
@@ -292,7 +346,7 @@ impl BoundaryBuilder {
                     address,
                     binding: Binding::Data,
                     library: None,
-                    calls: AtomicU64::new(0),
+                    index: 0,
                 },
             );
         Ok(address)
@@ -411,18 +465,19 @@ impl BoundaryBuilder {
     #[must_use]
     pub fn finish(self) -> Arc<Boundary> {
         let inner = self.inner.into_inner();
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let slots = SlotTable::new(inner.slots, inner.region.functions_start());
         let boundary = Arc::new(Boundary {
             mem: GuestMem::new(self.space),
             region: inner.region,
-            slots: inner.slots,
+            slots,
             by_name: inner.by_name,
             sentinel: inner.sentinel,
             exit_crossings: inner.exit_crossings,
             crossings: Mutex::new(Crossings::default()),
             code_watch: CodeWatch::default(),
             census: AtomicBool::new(false),
-            last_call: AtomicUsize::new(0),
-            last_caller: AtomicUsize::new(0),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             thread_records: parking_lot::Mutex::new(Vec::new()),
             svc_trace: AtomicBool::new(false),
         });
@@ -677,7 +732,7 @@ impl Drop for ContextRegistration {
 pub struct Boundary {
     mem: GuestMem,
     region: ThunkRegion,
-    slots: BTreeMap<GuestAddr, Slot>,
+    slots: SlotTable,
     by_name: BTreeMap<String, GuestAddr>,
     sentinel: GuestAddr,
     exit_crossings: u64,
@@ -686,12 +741,13 @@ pub struct Boundary {
     code_watch: CodeWatch,
     /// Whether every crossing counts itself. See [`Boundary::start_census`].
     census: AtomicBool,
-    /// The address of the slot the most recent crossing was for. See [`Boundary::last_call`].
-    last_call: AtomicUsize,
-    /// The guest address the most recent crossing will return to. See
-    /// [`Boundary::last_caller`].
-    last_caller: AtomicUsize,
+    /// Which boundary a thread's crossing record belongs to. Unique for the process rather than
+    /// the address of the `Boundary`, which a later boundary can be given once this one is gone.
+    id: u64,
     /// One record per host thread that has ever crossed. See [`Boundary::threads`].
+    ///
+    /// **Everything the census knows is in these**, and nothing in the `Boundary` itself is
+    /// written by a crossing: see [`Boundary::start_census`].
     thread_records: parking_lot::Mutex<Vec<Arc<ThreadCrossing>>>,
     /// Whether every raw `svc #0` is printed. See [`Boundary::set_syscall_trace`].
     svc_trace: AtomicBool,
@@ -799,6 +855,19 @@ impl Boundary {
     /// it. A timing run and a census run are then two different runs, which is the honest
     /// arrangement: a figure measured with the census on is a figure about the census.
     ///
+    /// # Why every count lives with the thread that made it
+    ///
+    /// The census used to be one counter per symbol and two process-wide "last call" words, and
+    /// every crossing on every thread wrote them. That is a cache line every core writes: MEASURED
+    /// with eight threads crossing one inline import, **518-614 ns a crossing with the census on
+    /// against 48-50 off** (`tests/perf.rs`), and the gate keeps it on for a whole world session
+    /// of ~60 threads and ~5 M crossings a second. So a crossing now writes only its own thread's
+    /// record ([`Boundary::threads`]): a counter per slot, the slot, the caller, a
+    /// [`ticks`](omni_platform::clock::ticks) reading, and the thread's totals, each with a plain
+    /// store because nothing else writes them. The readers -- [`census`](Boundary::census),
+    /// [`last_call`](Boundary::last_call), [`last_caller`](Boundary::last_caller) -- are reports,
+    /// a few a second at most, and they sum or compare the records when asked.
+    ///
     /// Counts are **not** reset — a host that wants a delta takes a [`census`](Boundary::census)
     /// before and after — so starting it twice resumes rather than restarts.
     pub fn start_census(&self) {
@@ -815,21 +884,32 @@ impl Boundary {
     /// `None` when the census has never been started, because "no symbol was called" and "nobody
     /// was counting" are different statements and a caller that could not tell them apart would
     /// report an empty census as a finding.
+    ///
+    /// The sum over every thread's record, taken when asked: a thread that has ended keeps its
+    /// record here, so its calls are counted as they always were.
     #[must_use]
     pub fn census(&self) -> Option<BTreeMap<&str, u64>> {
+        let mut totals = vec![0u64; self.slots.len()];
+        for record in self.thread_records.lock().iter() {
+            for (total, calls) in totals.iter_mut().zip(record.calls.iter()) {
+                *total = total.wrapping_add(calls.load(Ordering::Relaxed));
+            }
+        }
         if !self.census.load(Ordering::Relaxed) {
             // Started at least once leaves a count behind; never started leaves every slot at
             // zero. Distinguished by the flag being *currently* off with nothing counted, which
             // is why `stop_census` does not clear the counts.
-            if self.slots.values().all(|slot| slot.calls() == 0) {
+            if totals.iter().all(|&calls| calls == 0) {
                 return None;
             }
         }
         Some(
             self.slots
                 .values()
-                .filter(|slot| slot.calls() > 0)
-                .map(|slot| (slot.symbol.as_str(), slot.calls()))
+                .filter_map(|slot| {
+                    let calls = totals[slot.index];
+                    (calls > 0).then_some((slot.symbol.as_str(), calls))
+                })
                 .collect(),
         )
     }
@@ -851,51 +931,91 @@ impl Boundary {
     /// expires and nothing on its own thread will report again; another thread reading this is
     /// what says which import it went into. Recorded only under the census, for the reason
     /// [`start_census`](Boundary::start_census) gives about the 33 ns path.
+    ///
+    /// The most recent crossing **by any thread**: answered from the thread records, as the one
+    /// whose [`ticks`](omni_platform::clock::ticks) reading is latest. Nothing process-wide is
+    /// written per crossing to keep it -- see [`start_census`](Boundary::start_census).
     #[must_use]
     pub fn last_call(&self) -> Option<&Slot> {
-        let address = self.last_call.load(Ordering::Relaxed);
-        if address == 0 {
-            return None;
-        }
-        self.slots.get(&address)
+        let (slot, _) = self.latest_crossing()?;
+        self.slots.get(&slot)
+    }
+
+    /// The slot and caller of the latest crossing across every thread record, if any thread has
+    /// crossed under the census.
+    fn latest_crossing(&self) -> Option<(GuestAddr, GuestAddr)> {
+        self.thread_records
+            .lock()
+            .iter()
+            .filter(|record| record.slot.load(Ordering::Relaxed) != 0)
+            .max_by_key(|record| record.when.load(Ordering::Relaxed))
+            .map(|record| {
+                (record.slot.load(Ordering::Relaxed), record.caller.load(Ordering::Relaxed))
+            })
     }
 
     /// Charge one crossing to a slot, if a host asked for the census.
     #[inline]
     fn count(&self, slot: &Slot, caller: GuestAddr) {
         if self.census.load(Ordering::Relaxed) {
-            slot.calls.fetch_add(1, Ordering::Relaxed);
-            self.last_call.store(slot.address, Ordering::Relaxed);
-            self.last_caller.store(caller, Ordering::Relaxed);
-            self.mark_thread(slot.address, caller);
+            self.mark_thread(slot, caller);
         }
     }
 
-    /// Record this crossing against **the calling host thread**.
+    /// Record this crossing against **the calling host thread**, and only there.
     ///
     /// The thread-local is registered with the boundary the first time a thread crosses, and the
-    /// hot path after that is one TLS read and three relaxed stores — no lock, because a lock
-    /// here is a lock on every import and this runtime makes tens of millions of them.
+    /// hot path after that is one TLS read and stores into this thread's own record — no lock,
+    /// because a lock here is a lock on every import and this runtime makes tens of millions of
+    /// them, and no write to anything another thread writes. See
+    /// [`start_census`](Boundary::start_census) for what that costs when it is not so.
     #[inline]
-    fn mark_thread(&self, slot: GuestAddr, caller: GuestAddr) {
-        CROSSING.with(|cell| {
-            let record = cell.get_or_init(|| self.new_record());
-            record.slot.store(slot, Ordering::Relaxed);
+    fn mark_thread(&self, slot: &Slot, caller: GuestAddr) {
+        let when = omni_platform::clock::ticks();
+        // The guest thread id, so a report can be matched against `Bionic::parked`,
+        // `futex_calls` and `guest_thread_list` by **name** rather than by counting rows --
+        // which is how this stall was misread twice. Infallible: a host-initiated call before
+        // `activate` has no instance, and that is ordinary rather than an error.
+        let guest_thread = crate::bionic::current_guest_thread();
+        self.with_record(|record| {
+            if let Some(calls) = record.calls.get(slot.index) {
+                bump(calls);
+            }
+            record.slot.store(slot.address, Ordering::Relaxed);
             record.caller.store(caller, Ordering::Relaxed);
-            record.depth.fetch_add(1, Ordering::Relaxed);
-            // The guest thread id, so a report can be matched against `Bionic::parked`,
-            // `futex_calls` and `guest_thread_list` by **name** rather than by counting rows --
-            // which is how this stall was misread twice. Infallible: a host-initiated call before
-            // `activate` has no instance, and that is ordinary rather than an error.
-            if let Some(thread) = crate::bionic::current_guest_thread() {
+            record.when.store(when, Ordering::Relaxed);
+            bump(&record.depth);
+            if let Some(thread) = guest_thread {
                 record.guest_thread.store(thread.0, Ordering::Relaxed);
             }
         });
     }
 
+    /// Run `f` over this thread's record **for this boundary**, registering one the first time.
+    ///
+    /// Keyed by [`Boundary::id`] because a record's counters are indexed by this boundary's slots:
+    /// a thread that crosses two boundaries -- a test making one after another -- has a record in
+    /// each, and neither is charged the other's calls.
+    #[inline]
+    fn with_record<R>(&self, f: impl FnOnce(&Arc<ThreadCrossing>) -> R) -> R {
+        CROSSING.with(|cell| {
+            if let Some(record) = cell.borrow().iter().find(|record| record.owner == self.id) {
+                return f(record);
+            }
+            let record = self.new_record();
+            let mut records = cell.borrow_mut();
+            // A boundary that is gone has dropped its list, so this thread holds the only
+            // reference to its record and nothing can read it again.
+            records.retain(|record| Arc::strong_count(record) > 1);
+            records.push(Arc::clone(&record));
+            drop(records);
+            f(&record)
+        })
+    }
+
     /// This host thread's record, registered with this boundary the first time it is asked for.
     fn new_record(&self) -> Arc<ThreadCrossing> {
-        let record = Arc::new(ThreadCrossing::default());
+        let record = Arc::new(ThreadCrossing::new(self.id, self.slots.len()));
         self.thread_records.lock().push(Arc::clone(&record));
         record
     }
@@ -916,7 +1036,7 @@ impl Boundary {
     /// the first time. Only called while `OMNI_PERF` is on, so a run without it creates records
     /// exactly where it always did (a crossing under the census).
     fn perf_record(&self) -> Arc<ThreadCrossing> {
-        let record = CROSSING.with(|cell| Arc::clone(cell.get_or_init(|| self.new_record())));
+        let record = self.with_record(Arc::clone);
         // A diagnostic must not end the guest thread it watches: a handle that cannot be opened
         // (or a host with no sampler) leaves this thread unsampled -- `perf` skips a record with
         // no handle -- and says so once.
@@ -947,9 +1067,10 @@ impl Boundary {
     #[inline]
     fn mark_exit(&self) {
         if self.census.load(Ordering::Relaxed) {
+            // Found, never created: a thread with no record made no crossing to pair this with.
             CROSSING.with(|cell| {
-                if let Some(record) = cell.get() {
-                    record.exits.fetch_add(1, Ordering::Relaxed);
+                if let Some(record) = cell.borrow().iter().find(|record| record.owner == self.id) {
+                    bump(&record.exits);
                 }
             });
         }
@@ -1008,10 +1129,11 @@ impl Boundary {
     /// any handler runs, and it is a diagnostic rather than control flow.
     ///
     /// Recorded only under the census, for the reason [`start_census`](Boundary::start_census)
-    /// gives about the 33 ns path.
+    /// gives about the 33 ns path. The same crossing [`last_call`](Boundary::last_call) names,
+    /// read from the same thread record.
     #[must_use]
     pub fn last_caller(&self) -> GuestAddr {
-        self.last_caller.load(Ordering::Relaxed)
+        self.latest_crossing().map_or(0, |(_, caller)| caller)
     }
 
     /// The token an inline thunk is registered with: this boundary's own address.
@@ -1667,9 +1789,7 @@ impl Boundary {
         if self.region.holds_data(address) {
             if let Some(slot) = self
                 .slots
-                .range(..=address)
-                .next_back()
-                .map(|(_, slot)| slot)
+                .at_or_below(address)
                 .filter(|slot| matches!(slot.binding, Binding::Data))
             {
                 return Err(AbiError::DataSymbolCalled {
@@ -1928,18 +2048,39 @@ fn exit_name(exit: &ExitReason) -> &'static str {
     }
 }
 
-/// One host thread's most recent crossing, as the boundary records it.
+/// One host thread's crossings of one boundary: its most recent one, its totals, and its share of
+/// the census.
 ///
-/// Three relaxed atomics rather than a lock, because this is written on every import.
-#[derive(Debug, Default)]
+/// Relaxed atomics rather than a lock, because this is written on every import -- and **written
+/// only by its own thread**, which is what lets every counter here be a load and a store rather
+/// than a locked increment ([`bump`]), and what keeps the line out of every other core's cache
+/// until a report reads it.
+#[derive(Debug)]
 pub(crate) struct ThreadCrossing {
+    /// The [`Boundary::id`] this record belongs to.
+    owner: u64,
     slot: AtomicUsize,
     caller: AtomicUsize,
+    /// [`omni_platform::clock::ticks`] at the most recent crossing, which is how
+    /// [`Boundary::last_call`] finds the latest crossing across threads.
+    when: AtomicU64,
     depth: AtomicU64,
     exits: AtomicU64,
     guest_thread: AtomicU64,
+    /// This thread's calls to each slot, indexed by the slot's position in address order.
+    calls: Box<[AtomicU64]>,
     /// What `crate::perf` reads, written only while it is on. See [`ThreadPerf`].
     pub(crate) perf: ThreadPerf,
+}
+
+/// Add one to a counter **only its own thread writes**.
+///
+/// A load and a store rather than `fetch_add`: with one writer nothing can come between them, and
+/// a locked increment costs the hot path a read-for-ownership even of a line no other core has.
+/// Readers on other threads see the old value or the new one, as they would either way.
+#[inline]
+fn bump(counter: &AtomicU64) {
+    counter.store(counter.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 }
 
 /// One host thread's running totals for `crate::perf`'s interval reporter.
@@ -1970,6 +2111,20 @@ pub(crate) struct CrossingState {
 }
 
 impl ThreadCrossing {
+    fn new(owner: u64, slots: usize) -> Self {
+        Self {
+            owner,
+            slot: AtomicUsize::new(0),
+            caller: AtomicUsize::new(0),
+            when: AtomicU64::new(0),
+            depth: AtomicU64::new(0),
+            exits: AtomicU64::new(0),
+            guest_thread: AtomicU64::new(0),
+            calls: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            perf: ThreadPerf::default(),
+        }
+    }
+
     pub(crate) fn state(&self) -> CrossingState {
         CrossingState {
             slot: self.slot.load(Ordering::Relaxed),
@@ -2011,12 +2166,10 @@ pub struct ThreadCrossingReport {
 }
 
 thread_local! {
-    /// This thread's crossing record, created on its first crossing and registered with the
-    /// boundary then. `OnceCell` rather than `RefCell`: it is written once and read on every
-    /// import, and the registration must happen exactly once per thread.
-    static CROSSING: std::cell::OnceCell<Arc<ThreadCrossing>> = const {
-        std::cell::OnceCell::new()
-    };
+    /// This thread's crossing records, one per boundary it has crossed, each created on its first
+    /// crossing of that boundary and registered with it then. Almost always one: a list because
+    /// a record's census counters are indexed by its own boundary's slots.
+    static CROSSING: RefCell<Vec<Arc<ThreadCrossing>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A guest call being serviced **inside** the run loop.

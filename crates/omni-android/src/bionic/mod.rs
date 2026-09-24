@@ -56,6 +56,7 @@ mod threads;
 mod view;
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -1388,7 +1389,7 @@ impl Bionic {
             )?;
         }
         let active = Active { bionic: Arc::clone(self), thread: slot.id, block: slot.block };
-        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(active));
+        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(Rc::new(active)));
         Ok(Activation { previous })
     }
 
@@ -1739,7 +1740,7 @@ impl Bionic {
     /// parent wrote is the one this thread's `pthread_self()` will return.
     pub(crate) fn activate_slot(self: &Arc<Self>, slot: ThreadSlot) -> Activation {
         let active = Active { bionic: Arc::clone(self), thread: slot.id, block: slot.block };
-        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(active));
+        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(Rc::new(active)));
         Activation { previous }
     }
 
@@ -2270,13 +2271,14 @@ pub struct Active {
 thread_local! {
     // The instance this thread's guest code belongs to. A `RefCell<Option<..>>` rather than a
     // raw pointer, because the whole reason this is not a `static` is that the lifetime is a
-    // caller's and not the program's.
-    static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) };
+    // caller's and not the program's. An `Rc` around it so that `active` can hand out a
+    // reference whose count is this thread's own: see `active`.
+    static ACTIVE: RefCell<Option<Rc<Active>>> = const { RefCell::new(None) };
 }
 
 /// Restores the previously published instance when dropped.
 pub struct Activation {
-    previous: Option<Active>,
+    previous: Option<Rc<Active>>,
 }
 
 impl Drop for Activation {
@@ -2293,10 +2295,6 @@ impl core::fmt::Debug for Activation {
     }
 }
 
-/// The instance published to this thread, or a typed refusal naming the symbol.
-///
-/// Cloned out rather than borrowed: the borrow would have to be held across a handler that can
-/// re-enter guest code and arrive back here, and an `Arc` clone is one relaxed increment.
 /// The guest thread id published on **this** host thread, or `None` if no instance is active.
 ///
 /// **Infallible where [`active`] refuses**, which is the whole of why it exists: it is read on
@@ -2312,7 +2310,18 @@ pub(crate) fn current_guest_thread() -> Option<GuestThreadId> {
     ACTIVE.with(|cell| cell.borrow().as_ref().map(|active| active.thread))
 }
 
-pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<Active> {
+/// The instance published to this thread, or a typed refusal naming the symbol.
+///
+/// Cloned out rather than borrowed: the borrow would have to be held across a handler that can
+/// re-enter guest code and arrive back here.
+///
+/// **An `Rc`, not a clone of the `Active`**, and that is a measured difference. Cloning the
+/// `Active` clones its `Arc<Bionic>`, and that count is one word every guest thread increments and
+/// decrements on every bionic call -- a cache line all of them write. MEASURED (`tests/perf.rs`,
+/// eight threads calling `pthread_self`): ~340-410 ns a call with the `Arc` clone against the
+/// ~40 ns one thread pays. The `Rc`'s count is this thread's alone. A handler that needs the
+/// `Active` itself -- to hand to a thread it starts -- clones it, which is the rare path.
+pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<Rc<Active>> {
     ACTIVE.with(|cell| cell.borrow().clone()).ok_or_else(|| AbiError::BionicNotActive {
         symbol: symbol.to_string(),
         address,

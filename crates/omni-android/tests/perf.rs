@@ -158,9 +158,11 @@ fn noop(c: &mut omni_android::ImportCall<'_, '_>) -> omni_android::AbiResult<()>
 
 /// **What an import crossing costs with the census on and off, on one thread and on eight** --
 /// H5 of the world performance work (`docs/research/perf-world.md`). The census, which the gate
-/// keeps on for the whole session, charges every crossing to a per-symbol counter shared by every
-/// thread and to two process-wide "last call" words; with many threads crossing, those are cache
-/// lines every core writes.
+/// keeps on for the whole session, used to charge every crossing to a per-symbol counter shared
+/// by every thread and to two process-wide "last call" words -- cache lines every core writes
+/// (MEASURED here: 518-614 ns a crossing with eight threads on one symbol, against 48-50 with the
+/// census off). It now writes only the crossing thread's own record (`Boundary::start_census`),
+/// and this is the measurement that says whether that holds.
 ///
 /// `cargo test -p omni-android --release --test perf -- --ignored --nocapture`
 #[test]
@@ -245,6 +247,91 @@ fn the_cost_of_an_import_crossing_with_the_census_on_and_off() {
                 median.as_secs_f64() * 1e9 / EACH as f64
             );
         }
+    }
+    boundary.stop_census();
+}
+
+/// **The same measurement through a real bionic import**, `pthread_self`, on one thread and on
+/// eight calling it at once. The noop above crosses the boundary and nothing else; a bionic
+/// handler also finds its instance (`bionic::active`) on every call, which is the rest of what a
+/// world's ~5 M crossings a second pay.
+///
+/// `cargo test -p omni-android --release --test perf -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_a_bionic_import_crossing_with_the_census_on_and_off() {
+    use omni_android::bionic::Bionic;
+    use std::sync::Barrier;
+    const EACH: u64 = 2_000_000;
+    const ROUNDS: usize = 6;
+    let guest = Guest::new();
+    let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
+    bionic.set_log_to_stderr(false);
+    let builder = guest.boundary(256);
+    bionic.bind_into(&builder).expect("bind every handler");
+    let boundary = builder.finish();
+    let thunk = boundary.slot_named("pthread_self").expect("pthread_self is bound").address;
+    let entry = {
+        let at = guest.next_entry();
+        let mut asm = harness::Asm::at(at);
+        asm.push(mov_reg(20, 30));
+        let top = asm.pc();
+        asm.bl(thunk);
+        asm.push(subs_imm(1, 1, 1));
+        let here = asm.pc();
+        asm.push(b_cond(1, (top as i64 - here as i64) as i32 / 4));
+        asm.push(mov_reg(30, 20));
+        asm.push(ret(30));
+        guest.load(asm.words())
+    };
+    println!("
+== one bionic import crossing (pthread_self), ns per crossing per thread (median of 5) ==");
+    for threads in [1usize, 8] {
+        // Workers live for both census states, so each attaches to the instance once.
+        let barrier = Barrier::new(threads + 1);
+        // `Guest` is not `Sync`; the loop touches no stack, so every thread may share its top.
+        let (stack_top, sentinel) = (guest.stack_top, boundary.sentinel());
+        let cpus: Vec<_> = (0..threads).map(|_| guest.thread(&boundary)).collect();
+        std::thread::scope(|scope| {
+            for mut cpu in cpus {
+                let (bionic, boundary, barrier) = (&bionic, &boundary, &barrier);
+                scope.spawn(move || {
+                    let _active = bionic.activate().expect("a thread block");
+                    for _ in 0..2 * ROUNDS {
+                        cpu.set_sp(stack_top);
+                        cpu.set_x(x(30), sentinel as u64);
+                        cpu.set_x(x(1), EACH);
+                        barrier.wait();
+                        boundary.run(&mut cpu, entry, RunLimit::Unlimited).expect("runs");
+                        barrier.wait();
+                    }
+                });
+            }
+            for census in [false, true] {
+                if census {
+                    boundary.start_census();
+                } else {
+                    boundary.stop_census();
+                }
+                let mut samples = Vec::new();
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    let t = std::time::Instant::now();
+                    barrier.wait();
+                    if round > 0 {
+                        samples.push(t.elapsed());
+                    }
+                }
+                samples.sort();
+                let median = samples[samples.len() / 2];
+                println!(
+                    "  {:22}, census {:3} : {:6.1} ns per crossing per thread",
+                    format!("{threads} thread(s)"),
+                    if census { "on" } else { "off" },
+                    median.as_secs_f64() * 1e9 / EACH as f64
+                );
+            }
+        });
     }
     boundary.stop_census();
 }

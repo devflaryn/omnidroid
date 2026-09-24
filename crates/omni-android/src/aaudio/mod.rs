@@ -392,7 +392,7 @@ impl AAudio {
     /// Publish this instance to the calling thread until the guard is dropped.
     #[must_use]
     pub fn activate(self: &Arc<Self>) -> AAudioActivation {
-        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(Arc::clone(self)));
+        let previous = ACTIVE.with(|cell| cell.borrow_mut().replace(std::rc::Rc::new(Arc::clone(self))));
         AAudioActivation { previous }
     }
 
@@ -462,12 +462,12 @@ impl State {
 }
 
 thread_local! {
-    static ACTIVE: std::cell::RefCell<Option<Arc<AAudio>>> = const { std::cell::RefCell::new(None) };
+    static ACTIVE: std::cell::RefCell<Option<std::rc::Rc<Arc<AAudio>>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Restores the previously published instance when dropped.
 pub struct AAudioActivation {
-    previous: Option<Arc<AAudio>>,
+    previous: Option<std::rc::Rc<Arc<AAudio>>>,
 }
 
 impl Drop for AAudioActivation {
@@ -495,7 +495,7 @@ impl crate::bionic::ThreadLocalInstance for AAudioThreadInstance {
     }
 }
 
-fn active(c: &ReentrantCall<'_>) -> AbiResult<Arc<AAudio>> {
+fn active(c: &ReentrantCall<'_>) -> AbiResult<std::rc::Rc<Arc<AAudio>>> {
     ACTIVE.with(|cell| cell.borrow().clone()).ok_or_else(|| AbiError::Refused {
         symbol: c.symbol().to_string(),
         address: c.address(),
@@ -1026,7 +1026,7 @@ fn wait_for_state_change(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     };
     let audio = active(c)?;
     with_stream(c, &audio, handle, |_| ())?;
-    let bionic = crate::bionic::active(c.symbol(), c.address())?.bionic;
+    let bionic = Arc::clone(&crate::bionic::active(c.symbol(), c.address())?.bionic);
     let deadline = Instant::now() + Duration::from_nanos(timeout);
     let mut state = audio.state.lock();
     let slot = state.slot_of(handle);
@@ -1074,7 +1074,7 @@ fn allowed_frames(buffer_size: i32, buffer_frames: u32, writable: u32) -> u32 {
 fn data_thread(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let handle = c.args().next_u64()?;
     let audio = active(c)?;
-    let bionic = crate::bionic::active(c.symbol(), c.address())?.bionic;
+    let bionic = Arc::clone(&crate::bionic::active(c.symbol(), c.address())?.bionic);
     let found = {
         let mut state = audio.state.lock();
         let slot = state.slot_of(handle).filter(|&slot| slot >= MAX_BUILDERS);

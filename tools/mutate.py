@@ -8600,6 +8600,69 @@ directory", ADAPTER_FILES,
      "        if dirfd != AT_FDCWD && !absolute {",
      "        if dirfd != AT_FDCWD {",
      ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "raw_svc"]),
+
+    # ---- the import census, kept per thread (no shared write per crossing) ----------------------
+    # Detector: `tests/census.rs`, calls on several threads whose number and order are known.
+    ("census-A1", "A", "a crossing is no longer charged to its symbol in the thread's record",
+     BOUNDARY,
+     """            if let Some(calls) = record.calls.get(slot.index) {
+                bump(calls);
+            }""",
+     """            if let Some(calls) = record.calls.get(slot.index) {
+                let _ = calls;
+            }""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-A2", "A", "a finished thread's calls drop out of the census",
+     BOUNDARY,
+     "        for record in self.thread_records.lock().iter() {",
+     "        for record in self.thread_records.lock().iter().filter(|record| Arc::strong_count(record) > 1) {",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-A3", "A", "last_call answers the earliest crossing instead of the latest",
+     BOUNDARY,
+     "            .max_by_key(|record| record.when.load(Ordering::Relaxed))",
+     "            .min_by_key(|record| record.when.load(Ordering::Relaxed))",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-A4", "A", "last_call answers the newest thread's crossing rather than the latest one",
+     BOUNDARY,
+     "            .max_by_key(|record| record.when.load(Ordering::Relaxed))",
+     "            .last()",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-A5", "A", "a crossing is charged to whichever boundary the thread crossed first",
+     BOUNDARY,
+     """            if let Some(record) = cell.borrow().iter().find(|record| record.owner == self.id) {
+                return f(record);""",
+     """            if let Some(record) = cell.borrow().iter().find(|_| true) {
+                return f(record);""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-A6", "A", "a handler's return is paired against another boundary's record",
+     BOUNDARY,
+     """                if let Some(record) = cell.borrow().iter().find(|record| record.owner == self.id) {
+                    bump(&record.exits);""",
+     """                if let Some(record) = cell.borrow().iter().find(|_| true) {
+                    bump(&record.exits);""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-A7", "A", "the ordering counter is a constant, so every crossing ties with every other",
+     "crates/omni-platform/src/clock.rs",
+     "        unsafe { core::arch::x86_64::_rdtsc() }",
+     "        1",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-A8", "A", "the O(1) slot lookup answers for an address inside a slot, not only at its start",
+     BOUNDARY,
+     "        if offset % crate::region::SLOT_BYTES == 0 {",
+     "        if offset % crate::region::SLOT_BYTES < crate::region::SLOT_BYTES {",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "hostile"]),
+    ("census-B1", "B", "the census counts while it is switched off",
+     BOUNDARY,
+     """        if self.census.load(Ordering::Relaxed) {
+            self.mark_thread(slot, caller);""",
+     """        if true {
+            self.mark_thread(slot, caller);""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
+    ("census-B2", "B", "a thread forgets its record for a boundary that is still alive",
+     BOUNDARY,
+     "            records.retain(|record| Arc::strong_count(record) > 1);",
+     "            records.retain(|record| Arc::strong_count(record) > 2);",
+     ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast", "--test", "census"]),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

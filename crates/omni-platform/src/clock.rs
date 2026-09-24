@@ -81,6 +81,45 @@ pub fn realtime_now() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO)
 }
 
+/// **A counter for putting events on different threads in order** -- not a clock.
+///
+/// The processor's own counter where there is one to read without the OS: `RDTSC` on x86-64,
+/// `CNTVCT_EL0` on arm64 (readable from user mode on Linux and macOS). Both are the one counter
+/// every core reads, so a larger reading on one thread was taken after a smaller one on another
+/// -- to within the hardware's synchronisation, which is far finer than anything that orders by
+/// it here. Anywhere else, nanoseconds of [`monotonic_now`], which is the same statement at a
+/// higher price.
+///
+/// **What it is for:** a hot path that has to say *when* it did something, cheaply and without
+/// writing anything another core reads (MEASURED on Windows: shared "last crossing" words and a
+/// shared per-symbol counter, written by eight threads, cost 518-614 ns a crossing against 48-50
+/// without). It is not free either: ~9 ns a read on the machine that measured that, which is most
+/// of what the census costs a crossing now. **What it is not:** a duration. The unit is the
+/// counter's and is not stated; only the order of two readings means anything.
+#[inline]
+#[must_use]
+pub fn ticks() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `RDTSC` reads a counter; it touches no memory and every x86-64 processor has it.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let value: u64;
+        // SAFETY: reads the virtual counter register, which the OS leaves readable from EL0 on
+        // every arm64 host this runs on; no memory, stack or flags are touched.
+        unsafe {
+            core::arch::asm!("mrs {}, cntvct_el0", out(reg) value, options(nomem, nostack, preserves_flags));
+        }
+        value
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        u64::try_from(monotonic_now().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
 /// **A request to the host for a finer timer tick, for this process, held until dropped.**
 ///
 /// The module documentation records the gap this closes: on Windows every sleep and every timed
@@ -181,6 +220,35 @@ pub fn sleep(duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ticks` orders events across threads: a reading taken after another thread's reading was
+    /// published is not smaller than it, and one thread's readings never go backwards.
+    ///
+    /// Structural rather than timed, like the test below it. What it catches is a counter that is
+    /// per core or per thread -- a thread-local sequence, say -- which orders nothing across
+    /// threads, and a fallback that reads a fresh epoch each call.
+    #[test]
+    fn ticks_put_events_on_different_threads_in_order() {
+        let mut previous = ticks();
+        for i in 0..100_000 {
+            let now = ticks();
+            assert!(now >= previous, "read {i} went backwards: {previous} -> {now}");
+            previous = now;
+        }
+        for _ in 0..200 {
+            // Both directions: a fresh thread's first reading must not be smaller than what this
+            // thread read before starting it, and this thread's next one must not be smaller than
+            // the fresh thread's.
+            let before = ticks();
+            let theirs = std::thread::spawn(ticks).join().expect("a reading");
+            let after = ticks();
+            assert!(
+                before <= theirs && theirs <= after,
+                "readings taken in order across threads came back out of order: {before}, {theirs}, {after}"
+            );
+        }
+        assert!(ticks() > 0, "a counter that reads zero orders nothing");
+    }
 
     /// Monotonic over a tight read loop, and the epoch is shared rather than re-read.
     ///

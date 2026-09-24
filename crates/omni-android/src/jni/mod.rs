@@ -639,7 +639,7 @@ impl Jni {
             }
         };
         let previous = ACTIVE.with(|cell| {
-            cell.borrow_mut().replace(ActiveJni { jni: Arc::clone(self), thread: index })
+            cell.borrow_mut().replace(ActiveJni { jni: std::rc::Rc::new(Arc::clone(self)), thread: index })
         });
         Ok(JniActivation { previous })
     }
@@ -1747,9 +1747,13 @@ fn render_value(state: &JniState, value: &Value) -> String {
 }
 
 /// The instance published to one thread, and which `JNIEnv` slot it has.
+///
+/// The `Arc` behind an `Rc` so that handing it to a handler -- every JNI call does -- counts on
+/// this thread's own word rather than on the `Arc`'s, which every thread calling JNI shares. See
+/// `bionic::active`, where the difference was measured.
 #[derive(Clone)]
 struct ActiveJni {
-    jni: Arc<Jni>,
+    jni: std::rc::Rc<Arc<Jni>>,
     thread: usize,
 }
 
@@ -1779,7 +1783,10 @@ impl core::fmt::Debug for JniActivation {
 }
 
 /// The instance published to this thread, or a typed refusal naming the JNI function.
-pub(crate) fn active(function: &str, address: GuestAddr) -> AbiResult<(Arc<Jni>, usize)> {
+pub(crate) fn active(
+    function: &str,
+    address: GuestAddr,
+) -> AbiResult<(std::rc::Rc<Arc<Jni>>, usize)> {
     active_opt()
         .ok_or_else(|| AbiError::JniNotActive { function: function.to_string(), address })
 }
@@ -1789,13 +1796,15 @@ pub(crate) fn active(function: &str, address: GuestAddr) -> AbiResult<(Arc<Jni>,
 /// A handler on the ≈33 ns path calls this and formats the refusal only if it is `None`, so the
 /// path that works allocates nothing — the same reasoning
 /// [`Boundary::start_census`](crate::Boundary::start_census) applies to its own counter.
-pub(crate) fn active_opt() -> Option<(Arc<Jni>, usize)> {
+pub(crate) fn active_opt() -> Option<(std::rc::Rc<Arc<Jni>>, usize)> {
     ACTIVE.with(|cell| cell.borrow().clone()).map(|active| (active.jni, active.thread))
 }
 
-/// This thread's `JNIEnv` slot, or a refusal.
+/// This thread's `JNIEnv` slot, or a refusal. Reads the slot in place: nothing is cloned.
 fn current_thread(function: &str, address: GuestAddr) -> AbiResult<usize> {
-    active(function, address).map(|(_, index)| index)
+    ACTIVE
+        .with(|cell| cell.borrow().as_ref().map(|active| active.thread))
+        .ok_or_else(|| AbiError::JniNotActive { function: function.to_string(), address })
 }
 
 /// A [`Jni`] as something a **created guest thread** carries.

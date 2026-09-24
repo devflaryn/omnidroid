@@ -502,7 +502,7 @@ impl Ndk {
     #[must_use]
     pub fn activate(self: &Arc<Self>) -> NdkActivation {
         let previous =
-            ACTIVE.with(|cell| cell.borrow_mut().replace(ActiveNdk { ndk: Arc::clone(self) }));
+            ACTIVE.with(|cell| cell.borrow_mut().replace(ActiveNdk { ndk: std::rc::Rc::new(Arc::clone(self)) }));
         NdkActivation { previous }
     }
 
@@ -649,7 +649,7 @@ thread_local! {
 /// The instance published to one thread.
 #[derive(Clone)]
 struct ActiveNdk {
-    ndk: Arc<Ndk>,
+    ndk: std::rc::Rc<Arc<Ndk>>,
 }
 
 /// Restores the previously published instance when dropped.
@@ -672,7 +672,7 @@ impl core::fmt::Debug for NdkActivation {
 }
 
 /// The instance published to this thread, or a typed refusal naming the NDK function.
-pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<Arc<Ndk>> {
+pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<std::rc::Rc<Arc<Ndk>>> {
     ACTIVE.with(|cell| cell.borrow().clone()).map(|active| active.ndk).ok_or_else(|| {
         AbiError::NdkNotActive { symbol: symbol.to_string(), address }
     })

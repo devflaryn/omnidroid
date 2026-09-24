@@ -1509,7 +1509,7 @@ impl Vulkan {
     #[must_use]
     pub fn activate(self: &Arc<Self>) -> VulkanActivation {
         let previous = ACTIVE
-            .with(|cell| cell.borrow_mut().replace(ActiveVulkan { vulkan: Arc::clone(self) }));
+            .with(|cell| cell.borrow_mut().replace(ActiveVulkan { vulkan: std::rc::Rc::new(Arc::clone(self)) }));
         VulkanActivation { previous }
     }
 
@@ -3697,7 +3697,7 @@ thread_local! {
 
 #[derive(Clone)]
 struct ActiveVulkan {
-    vulkan: Arc<Vulkan>,
+    vulkan: std::rc::Rc<Arc<Vulkan>>,
 }
 
 /// Restores the previously published instance when dropped.
@@ -3720,7 +3720,7 @@ impl core::fmt::Debug for VulkanActivation {
 }
 
 /// The instance published to this thread, or a typed refusal naming the Vulkan call.
-pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<Arc<Vulkan>> {
+pub(crate) fn active(symbol: &str, address: GuestAddr) -> AbiResult<std::rc::Rc<Arc<Vulkan>>> {
     ACTIVE.with(|cell| cell.borrow().clone()).map(|active| active.vulkan).ok_or_else(|| {
         AbiError::Refused {
             symbol: symbol.to_string(),
