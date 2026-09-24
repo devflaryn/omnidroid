@@ -162,7 +162,10 @@ patterns and 25/25 commands passing on the clean tree; `git diff --exit-code` cl
 the limit raised it could not reach a refusal (a new test lowers its own limit to 0 in a child:
 8/8 `lnx-proc` caught with the limit at 40); `lnx-win-A24` -- caught 3/3 alone and missed once in
 the whole run, because the renderer test saw the defect only when its first frame beat the
-`MapNotify` (a new window test minimises with nothing pumped in between: caught 2/2). FINAL_TABLE
+`MapNotify` (a new window test minimises with nothing pumped in between: caught 2/2).
+
+**Then the whole table again, on the final tree** (same conditions; pre-flight 122/122 patterns,
+25/25 commands): **122/122 caught**, harness exit 0, tree clean afterwards.
 
 | area | rows | tally (each area's own run) |
 |---|---|---|
