@@ -1349,10 +1349,19 @@ impl Window {
     pub(super) fn set_minimized(&self, minimized: bool) -> WindowResult<()> {
         let (display, window, screen) = (self.display, self.window, self.screen);
         if !minimized {
-            return self.checked("set_minimized", "XMapRaised", |xl| {
+            self.checked("set_minimized", "XMapRaised", |xl| {
                 // SAFETY: a live display and window.
                 unsafe { (xl.XMapRaised)(display, window) };
-            });
+            })?;
+            // **And ask the manager, which is what restores it under EWMH.** ICCCM 4.1.4's map is
+            // not enough everywhere: MEASURED under GNOME's Mutter (Xwayland), a map leaves an
+            // iconic window `Iconic` and only `_NET_ACTIVE_WINDOW` makes it `Normal` -- the
+            // activation Windows' `SW_RESTORE` includes. xfwm4 restores on either.
+            // `tests/window_linux_ewmh.rs` is that measurement as a test.
+            if self.window_manager_running() {
+                self.request_focus();
+            }
+            return Ok(());
         }
         if !self.window_manager_running() {
             return Err(x11(

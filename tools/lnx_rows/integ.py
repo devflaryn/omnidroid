@@ -7,6 +7,10 @@ PROCENV = "crates/omni-android/src/bionic/procenv.rs"
 PROCESS_ERROR = "crates/omni-platform/src/process/error.rs"
 LOADER_M1 = "crates/omni-elf/tests/loader_m1.rs"
 
+WINDOW_LINUX = "crates/omni-platform/src/window/linux.rs"
+EWMH = ["env", "OMNI_GFX_WINDOW_TESTS=1", "cargo", "test", "-p", "omni-platform", "--release",
+        "--no-fail-fast", "--test", "window_linux_ewmh", "--", "--ignored", "--test-threads=1"]
+
 PROCENV_LINUX = ["cargo", "test", "-p", "omni-android", "--release", "--no-fail-fast",
                  "--test", "procenv_linux"]
 RELRO = ["cargo", "test", "-p", "omni-elf", "--release", "--no-fail-fast", "--test", "loader_m1",
@@ -62,4 +66,15 @@ ROWS = [
      """            seal_relro: true,""",
      """            seal_relro: false,""",
      RELRO),
+    # Restoring a minimised window: GNOME's Mutter restores an X11 client only through
+    # _NET_ACTIVE_WINDOW (measured with xclock/xprop on the owner's Xwayland); a map alone leaves it
+    # Iconic. The test runs its own Xvfb and a manager with exactly those measured rules.
+    ("lnx-integ-A6", "A", "restore only maps the window (Mutter leaves it iconic)",
+     WINDOW_LINUX,
+     """            if self.window_manager_running() {
+                self.request_focus();
+            }
+            return Ok(());""",
+     """            return Ok(());""",
+     EWMH),
 ]
