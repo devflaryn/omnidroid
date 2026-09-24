@@ -183,7 +183,8 @@ pub const NOP: u32 = 0xD503_201F;
 ///
 /// The shape the real loader produces, and **not** free: four more guest instructions, and the block
 /// leaves through `BR` — an *indirect* terminal, which under `optimization::INTERRUPTIBLE` is a
-/// dispatcher round trip rather than a linked jump. Included because the boundary has to work through
+/// fast-dispatch table probe on x64 (D35) and a dispatcher round trip on arm64, rather than a linked
+/// jump. Included because the boundary has to work through
 /// it, not only through a direct `BL`.
 pub fn plt_stub(stub_at: GuestAddr, got_slot: GuestAddr) -> Vec<u32> {
     let page_delta = ((got_slot & !0xFFF) as i64 - (stub_at & !0xFFF) as i64) / 0x1000;

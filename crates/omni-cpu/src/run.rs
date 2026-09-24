@@ -9,8 +9,8 @@
 //! | Guest shape | step budget alone | cross-thread halt alone | both armed |
 //! |---|---|---|---|
 //! | direct branch (`B .`, `ADD; B -1`) | stops it | stops it | **neither stops it** |
-//! | indirect branch (`BR X30` → self), default flags | no | no | no |
-//! | indirect branch, `INTERRUPTIBLE` | stops it | stops it | stops it |
+//! | indirect branch (`BR X30` → self), upstream's default flags | no | no | no |
+//! | indirect branch, `INTERRUPTIBLE` (and, since vendored patch 0019, `ALL_SAFE` on x64: D35) | stops it | stops it | stops it |
 //!
 //! The direct-branch row is the one that matters, and the cause is visible in the emitted code.
 //! `A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock)` emits **one** check, chosen by

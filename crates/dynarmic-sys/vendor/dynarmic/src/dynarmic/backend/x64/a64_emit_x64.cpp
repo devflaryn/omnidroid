@@ -217,6 +217,19 @@ void A64EmitX64::GenTerminalHandlers() {
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
+        // Omnidroid patch 0019: what patch 0018 does for a return-stack-buffer hit, for every
+        // transfer this handler serves -- a `BR`/`BLR`, and a `RET` that missed the buffer. Before
+        // the table is probed, compare the cycle budget (when cycle counting is on) and the halt
+        // flag with 0, and on either leave through `ReturnFromRunCode` (the guest PC is already
+        // stored). Both the hit and the miss (`LookupBlock`) paths start here, and neither changes
+        // the budget, so a guest loop through this handler can be stopped and FastDispatch can
+        // stay on.
+        if (conf.enable_cycle_counting) {
+            code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+            code.jng(code.GetReturnFromRunCodeAddress());
+        }
+        code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+        code.jne(code.GetReturnFromRunCodeAddress());
         code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table->data()));
         code.mov(rbp, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {

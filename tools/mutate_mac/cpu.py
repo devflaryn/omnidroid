@@ -530,4 +530,26 @@ pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;""",
      """    static constexpr std::size_t threshold = 256 * 1024;""",
      """    static constexpr std::size_t threshold = ~std::size_t{0};""",
      dyn("bookkeeping")),
+    # --- mac-cpu: patch 0020, the return-stack buffer's hit checks the budget and the halt word (D35)
+    ("mac-cpu-R1", "A", "aarch64 INTERRUPTIBLE clears the return stack buffer again (D33's 0xFFF9)",
+     SYS_LIB,
+     """    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;""",
+     """    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH & !RETURN_STACK_BUFFER;""",
+     dyn("a64_exec")),
+    ("mac-cpu-R2", "A", "0020's halt check removed: a RET loop served by the RSB ignores a halt",
+     ARM64 + "a64_address_space.cpp",
+     """        code.LDAR(Wscratch0, Xhalt);
+        code.CBNZ(Wscratch0, miss);
+        code.BR(Xscratch1);""",
+     """        code.BR(Xscratch1);""",
+     dyn("hostile")),
+    ("mac-cpu-R3", "A", "0020's budget check removed: a RET loop served by the RSB ignores its budget",
+     ARM64 + "a64_address_space.cpp",
+     """        if (conf.enable_cycle_counting) {
+            code.CMP(Xticks, 0);
+            code.B(LE, miss);
+        }
+        code.LDAR(Wscratch0, Xhalt);""",
+     """        code.LDAR(Wscratch0, Xhalt);""",
+     dyn("hostile")),
 ]

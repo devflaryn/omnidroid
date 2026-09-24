@@ -749,6 +749,50 @@ void A64AddressSpace::EmitPrelude() {
         code.BR(X19);
     }
 
+    // Omnidroid patch 0020: the `PopRSBHint` terminal's handler. Upstream emitted this hit test
+    // inline in every block that ends in `RET` (about 15 instructions) and branched to the predicted
+    // block checking neither the budget nor the halt word, so a guest loop through `RET` could not
+    // be stopped. It is x64's patch 0018 here: a hit compares `Xticks` with 0 when cycle counting is
+    // on and the halt word with 0, and on either -- as on a miss -- falls through into the
+    // dispatcher below, which checks both again (the guest PC is already stored). One copy in the
+    // prelude, as x64's `terminal_handler_pop_rsb_hint` is, because the inline copies cost more in
+    // code footprint than the dispatcher they save once a thread's code outgrows the host's caches
+    // (D35).
+    prelude_info.pop_rsb_hint = nullptr;
+    if (conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+        oaknut::Label miss;
+
+        prelude_info.pop_rsb_hint = code.xptr<void*>();
+
+        code.MOV(Wscratch0, A64::LocationDescriptor::fpcr_mask);
+        code.LDR(W0, Xstate, offsetof(A64JitState, fpcr));
+        code.LDR(X1, Xstate, offsetof(A64JitState, pc));
+        code.AND(W0, W0, Wscratch0);
+        code.AND(X1, X1, A64::LocationDescriptor::pc_mask);
+        code.LSL(X0, X0, A64::LocationDescriptor::fpcr_shift);
+        code.ORR(X0, X0, X1);
+
+        code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
+        code.AND(Wscratch2, Wscratch2, RSBIndexMask);
+        code.ADD(X2, SP, Xscratch2);
+        code.SUB(Wscratch2, Wscratch2, sizeof(RSBEntry));
+        code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
+
+        code.LDP(Xscratch0, Xscratch1, X2, offsetof(StackLayout, rsb));
+
+        code.CMP(X0, Xscratch0);
+        code.B(NE, miss);
+        if (conf.enable_cycle_counting) {
+            code.CMP(Xticks, 0);
+            code.B(LE, miss);
+        }
+        code.LDAR(Wscratch0, Xhalt);
+        code.CBNZ(Wscratch0, miss);
+        code.BR(Xscratch1);
+
+        code.l(miss);
+    }
+
     prelude_info.return_to_dispatcher = code.xptr<void*>();
     {
         oaknut::Label l_this, l_addr;

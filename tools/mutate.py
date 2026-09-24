@@ -8101,12 +8101,38 @@ directory", ADAPTER_FILES,
      ["cargo", "test", "-p", "omni-cpu", "--release", "--test", "exclusive", "--no-fail-fast"]),
     # D33 / patch 0018. The patch's own two checks (the RSB hit's budget and halt) are C++ in the
     # vendored tree, which the build script does not watch -- only `vendor/PIN.txt` -- so they were
-    # hand-mutated and recorded in D33 rather than carried as rows here.
+    # hand-mutated and recorded in D33 rather than carried as rows here. Since D35 the x86_64
+    # `INTERRUPTIBLE` is `ALL_SAFE`, which is the line this row now mutates.
     ("rsb-A1", "A", "INTERRUPTIBLE clears the return stack buffer again",
      "crates/dynarmic-sys/src/lib.rs",
-     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;",
-     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !(RETURN_STACK_BUFFER | FAST_DISPATCH);",
+     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE;",
+     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !RETURN_STACK_BUFFER;",
      ["cargo", "test", "-p", "dynarmic-sys", "--release", "--test", "a64_exec", "--no-fail-fast"]),
+    # D35 / patches 0019 (x64 fast dispatch: checked, 64 KiB) and 0020 (arm64 RSB: checked). Their
+    # C++ checks were hand-mutated and recorded in D35, for the reason above: a row here would leave
+    # the mutated library in `target/` for the rows after it. These are the Rust-level halves.
+    ("fastdispatch-A1", "A", "x64 INTERRUPTIBLE clears FastDispatch again (D33's 0xFFFB)",
+     "crates/dynarmic-sys/src/lib.rs",
+     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE;",
+     "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;",
+     ["cargo", "test", "-p", "dynarmic-sys", "--release", "--test", "a64_exec", "--no-fail-fast"]),
+    ("fastdispatch-A2", "A", "the per-jit table constant is upstream's 16 MiB again",
+     "crates/dynarmic-sys/src/lib.rs",
+     "pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x1000;",
+     "pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;",
+     ["cargo", "test", "-p", "dynarmic-sys", "--release", "--test", "pin_constants", "--no-fail-fast"]),
+    ("fastdispatch-A3", "A", "a guest thread's cost() leaves out the fast-dispatch table it now has",
+     "crates/omni-cpu/src/dynarmic/mod.rs",
+     """                    if options.optimizations() & dynarmic_sys::optimization::FAST_DISPATCH != 0 {
+                        OD_FIXED_PER_JIT_BYTES""",
+     """                    if options.optimizations() & dynarmic_sys::optimization::FAST_DISPATCH != 0 {
+                        0""",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--test", "thread_pointer", "--no-fail-fast"]),
+    ("fastdispatch-A4", "A", "the runtime's own flag set drops FastDispatch (the watchdog pin)",
+     "crates/omni-cpu/src/dynarmic/mod.rs",
+     "            None if self.interruptible => optimization::INTERRUPTIBLE,",
+     "            None if self.interruptible => optimization::INTERRUPTIBLE & !optimization::FAST_DISPATCH,",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--test", "watchdog", "--no-fail-fast"]),
     # `remove`, bionic's (libc/stdio/stdio.cpp): unlink, and rmdir only when that fails with
     # EISDIR. A guest thread died on it unbound on the second launch of kept storage (Linux).
     ("remove-A1", "A", "remove is left unbound",

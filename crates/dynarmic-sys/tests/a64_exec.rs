@@ -416,11 +416,13 @@ fn effective_config_reports_what_was_asked_for() {
     assert_eq!(cfg.optimizations, optimization::ALL_SAFE);
     assert_eq!(cfg.unsafe_optimizations, 0);
 
-    // The flag whose terminal handler checks neither the cycle counter nor the
-    // halt flag must be assertable, because with it on a runaway guest cannot
-    // be stopped at all (see `tests/hostile.rs`). On x64 `ReturnStackBuffer`
-    // stays on: patch 0018 gave its handler both checks. arm64 has no such
-    // patch, so there it is cleared too.
+    // The flags whose upstream terminal handlers check neither the cycle
+    // counter nor the halt flag must be assertable, because with such a
+    // handler on a runaway guest cannot be stopped at all (see
+    // `tests/hostile.rs`). `ReturnStackBuffer` stays on everywhere: patch 0018
+    // (x64) and 0020 (arm64) gave its handler both checks. `FastDispatch` is
+    // on on x64, where patch 0019 gave its handler both checks, and off on
+    // arm64, which does not implement it (D35).
     let vm = Vm::new(
         vec![a64::svc(0)],
         VmOptions {
@@ -429,10 +431,10 @@ fn effective_config_reports_what_was_asked_for() {
         },
     );
     let cfg = vm.effective_config();
-    #[cfg(target_arch = "x86_64")]
     assert_ne!(cfg.optimizations & optimization::RETURN_STACK_BUFFER, 0);
+    #[cfg(target_arch = "x86_64")]
+    assert_ne!(cfg.optimizations & optimization::FAST_DISPATCH, 0);
     #[cfg(target_arch = "aarch64")]
-    assert_eq!(cfg.optimizations & optimization::RETURN_STACK_BUFFER, 0);
     assert_eq!(cfg.optimizations & optimization::FAST_DISPATCH, 0);
     assert_ne!(cfg.optimizations & optimization::BLOCK_LINKING, 0);
 
@@ -562,6 +564,66 @@ fn invalidating_a_range_spares_the_translations_outside_it() {
         "invalidating 8 bytes retranslated as much as a cold start \
          ({after} fetches against {first}): the range was ignored"
     );
+}
+
+#[test]
+fn an_invalidated_translation_is_not_served_from_the_fast_dispatch_table() {
+    // Patch 0019 (D35) turned `FastDispatch` on under x64's `INTERRUPTIBLE`: a `BR` is served from
+    // a per-thread table of translations (guest location -> host code) in emitted code, without
+    // the dispatcher. A translation that is invalidated -- by a range, which is what
+    // `od_jit_invalidate_range` and `omni-cpu`'s `invalidate_code` ask for, or by a whole-cache
+    // clear -- has to leave that table too, or the next `BR` to it runs the old code. dynarmic
+    // clears the entry in `A64EmitX64::Unpatch` and the table in `ClearFastDispatchTable`; this
+    // is what says both still run on our invalidation paths. (On arm64 the table does not exist
+    // and this checks invalidation through the dispatcher.)
+    //
+    // 0: BR   X1  (X1 = index 2)            D61F0020
+    // 1: NOP                                D503201F
+    // 2: MOVZ X0, #1   -- rewritten to #2   D2800020
+    // 3: SVC  #0                            D4000001
+    let code = assemble(&[
+        (a64::br(1), 0xD61F_0020),
+        (a64::NOP, 0xD503_201F),
+        (a64::movz(0, 1, 0), 0xD280_0020),
+        (a64::svc(0), 0xD400_0001),
+    ]);
+    #[cfg(target_arch = "x86_64")]
+    assert_ne!(optimization::INTERRUPTIBLE & optimization::FAST_DISPATCH, 0);
+
+    for clear in [false, true] {
+        let vm = Vm::new(
+            code.clone(),
+            VmOptions {
+                optimizations: optimization::INTERRUPTIBLE,
+                ..VmOptions::default()
+            },
+        );
+        let run = || {
+            vm.set_reg(0, 0);
+            vm.set_reg(1, CODE_BASE + 8);
+            vm.start(100_000);
+            assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+            vm.reg(0)
+        };
+        // The first `BR` misses the table and fills it; the second is served from it.
+        assert_eq!(run(), 1);
+        assert_eq!(run(), 1);
+
+        vm.with_ctx(|c| c.code[2] = a64::movz(0, 2, 0));
+        if clear {
+            // SAFETY: `vm.raw()` is live and not executing.
+            unsafe { dynarmic_sys::od_jit_clear_cache(vm.raw()) };
+        } else {
+            // SAFETY: as above.
+            unsafe { dynarmic_sys::od_jit_invalidate_range(vm.raw(), CODE_BASE + 8, 4) };
+        }
+        assert_eq!(
+            run(),
+            2,
+            "after {} the BR still ran the old translation of the rewritten word",
+            if clear { "a cache clear" } else { "an invalidation of its range" }
+        );
+    }
 }
 
 /// x64 only: the arm64 backend's cache is `MAP_JIT` and per-thread W^X on Apple hosts, which

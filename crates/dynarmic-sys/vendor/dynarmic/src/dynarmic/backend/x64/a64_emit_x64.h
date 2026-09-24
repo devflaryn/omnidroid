@@ -62,8 +62,12 @@ protected:
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
-    static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
-    static constexpr size_t fast_dispatch_table_size = 0x100000;
+    // Omnidroid patch 0019: 4,096 entries (64 KiB), not 1,048,576 (16 MiB). The table is per
+    // guest thread and FastDispatch is now on (the handler checks the budget and the halt flag),
+    // so its size is paid by every thread; a miss costs what the dispatcher costs anyway (D35).
+    static constexpr u64 fast_dispatch_table_mask = 0xFFF0;
+    static constexpr size_t fast_dispatch_table_size = 0x1000;
+    static_assert(fast_dispatch_table_mask == (fast_dispatch_table_size - 1) * sizeof(FastDispatchEntry));
     // Omnidroid patch 0017: allocated only when FastDispatch is enabled. As a by-value member it
     // was 16 MiB constructed (and written: the entries have a non-zero initializer) in every Jit.
     std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;

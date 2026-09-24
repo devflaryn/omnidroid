@@ -4087,6 +4087,12 @@ ported to `emit_arm64_a64.cpp` and the arm64 matrix re-measured. The patch was 0
 branch; the merged series numbers it 0018 (and 0002 as 0017), after the macOS branch's arm64
 0002-0016.
 
+### Amendment 2 (2026-09-25): both halves done, D35
+
+Patch 0020 ports the check to arm64 (out of line, in the prelude) and patch 0019 gives
+`FastDispatchHint` the same checks on x64. `INTERRUPTIBLE` is now `0x0000_FFFF` on x86_64 and
+`0x0000_FFFB` on aarch64. D35 has the evidence.
+
 ## D34 — A native CPU backend on Apple silicon: measured, not the default; adopt when hot imports stop being VM exits
 
 **Recorded by the macOS port (branch `port-macos`), 2026-09-24. Status: not adopted.** The owner's
@@ -4131,3 +4137,120 @@ per-thread bookkeeping removes the largest win. Break-even is ~2 us of guest cod
 **Found on the way, fixed:** the native backend's survey of all 245,117 functions made dynarmic's
 arm64 backend abort the process (Global Constraint 11) -- the store half of patch 0007's inline
 store-exclusive was not a fastmem patch location. Patch 0014.
+
+## D35 — `INTERRUPTIBLE` keeps fast dispatch on x64 and the return-stack buffer on arm64: vendored patches 0019 and 0020
+
+**Decided 2026-09-25 (Windows session, arm64 measured on the M1 over ssh; the owner's performance
+brief).** A change to the vendored dynarmic tree (D5) and to D16/D33's flag set. Patches and figures:
+`crates/dynarmic-sys/patches/README.md` under 0019 and 0020.
+
+### Why
+
+MEASURED in-world on Windows (PS99, sampling profiler with symbols): `EmitX64::GetBasicBlock`, the
+dispatcher's block lookup, was ~12% of all samples outside translated code and ~25% on the render
+thread. Under D33's `0xFFFB` every `BR`/`BLR` -- Luau's interpreter dispatch, C++ virtual calls --
+and every `RET` that misses the 8-entry return-stack buffer went back to the dispatcher, because
+the fast-dispatch handler checked neither the budget nor the halt flag (D16) and so stayed off. On
+arm64 `INTERRUPTIBLE` also cleared the return-stack buffer, because its `PopRSBHint` was unchecked
+(D33 amendment 1).
+
+### The change
+
+* **0019, x64.** The fast-dispatch handler, right after its `rsb_cache_miss` entry and before the
+  table probe, compares `cycles_remaining` with 0 (cycle counting on) and `halt_reason` with 0, and
+  on either leaves through `ReturnFromRunCode` -- 0018's argument: the guest PC is already in
+  `JitState`, and `ReturnFromRunCode` checks both again. One site covers the table hit and the
+  miss's `LookupBlock`, because both start there and neither charges cycles; it is the
+  dispatcher's own order (check, look up, jump), so a halt raised during a lookup is seen at the
+  next indirect transfer exactly as the dispatcher would see it. The site is after `rsb_cache_miss`
+  so that a `RET` that missed the buffer is checked too.
+* **The table is 4,096 entries, 64 KiB**, not upstream's 16 MiB. Patch 0017 allocates it only when
+  `FastDispatch` is on; it is now on in every x64 guest thread, and written at construction, so
+  **64 KiB of commit and working set per guest thread** (3.75 MiB at 60 threads, 16 MiB at 256).
+  MEASURED per thread with real Roblox code (`roblox.rs`, n = 8): 4.47 MiB (D32) -> **4.538 MiB**.
+  Size, MEASURED (`the_cost_of_an_indirect_branch_through_a_table`: 2^12 and 2^14 three runs
+  each, 2^10, 2^16 and 2^20 one): 2^12 is as fast as 2^14 and 2^16 within run-to-run noise at every
+  target count measured, with one exception that did not repeat (one 2^14 run at 16,384 targets,
+  21.6 ns against 35.9 in the other 2^14 run at that size and 34.3-36.1 for 2^12); at 16,384-65,536 targets they all fall back to
+  the dispatcher's cost, and only
+  upstream's 2^20 helps there (28.7 against ~40 ns) -- for 16 MiB a thread, which 0017 took out.
+* **Invalidation** is dynarmic's and runs on every path Omnidroid uses: a range
+  (`od_jit_invalidate_range`, i.e. `omni-cpu`'s `invalidate_code`, the thunk, sentinel and
+  breakpoint words, `omni-android`'s cross-thread queue) reaches `InvalidateBasicBlocks` ->
+  `A64EmitX64::Unpatch`, which clears that location's entry; a clear (`od_jit_clear_cache`, and
+  `GetBlock`'s evacuation of a full cache) reaches `ClearFastDispatchTable`. New test:
+  `a64_exec.rs`'s `an_invalidated_translation_is_not_served_from_the_fast_dispatch_table`.
+* **0020, arm64.** The arm64 backend has no fast dispatch (`FastDispatchHint` is a dispatcher
+  return with a `TODO`), so there is nothing to check there. Its `PopRSBHint` gets 0018's checks
+  (`Xticks`, the halt word), **moved out of line** into one prelude handler that falls into the
+  dispatcher on a miss or a failed check. Out of line because the inline hit test was the arm64
+  RSB's whole problem at scale -- MEASURED, 262,144 blocks: no RSB 24.6 ns per call, upstream's
+  inline RSB 43.7, inline + checks 47.4, **out of line 20.2**.
+* **`INTERRUPTIBLE`**: `0x0000_FFFF` (= `ALL_SAFE`) on x86_64; `0x0000_FFFB` on aarch64, where
+  `FastDispatch` stays clear -- it buys nothing on that backend, and a re-pin that implements it must
+  not turn an unchecked handler on unseen (`pin_constants.rs` also fails if one appears).
+
+### Evidence
+
+* **`the_stoppability_matrix`**: x64 39 -> **57 cells**, arm64 36 -> **45**, all passing under the
+  new flags on both hosts. New shape `return-miss` (a `RET` that always misses the buffer); x64 gains
+  `return-ring`. `indirect:0000FFFF:*` -- a `BR` loop served by the fast-dispatch table -- was
+  `false` in all three cells and is `true` now; arm64's `return-ring:0000FFFF:*` likewise.
+* **Hand mutations of the vendored C++**, each rebuilt (PIN touched), run, restored, and the file's
+  SHA-1 checked identical afterwards (x64 `a64_emit_x64.cpp` e8c44976, arm64 `a64_address_space.cpp`
+  21e7bab9):
+
+  | mutation | what failed |
+  |---|---|
+  | 0019 budget check removed | `indirect:FFFF:budget`, `return-miss:FFFF:budget` wedge |
+  | 0019 halt check removed | `indirect:FFFF:{halt,halt+budget}`, `return-miss:FFFF:{halt,halt+budget}` wedge |
+  | 0019 checks moved above `rsb_cache_miss` | `return-miss:FFFF:*` wedge (3) |
+  | 0018 budget check removed | `return-ring:{FFFF,FFFB}:budget` wedge |
+  | 0018 halt check removed | `return:{FFFF,FFFB}:halt+budget`, `return-ring:{FFFF,FFFB}:{halt,halt+budget}` wedge |
+  | `Unpatch` no longer clears the entry | the invalidation test, range half |
+  | `ClearCache` no longer clears the table | the invalidation test, clear half |
+  | 0020 budget check removed (M1) | `return-ring:{FFFF,FFFB}:budget` wedge |
+  | 0020 halt check removed (M1) | `return-ring:{FFFF,FFFB}:{halt,halt+budget}` wedge |
+
+  The two arm64 ones are also rows `mac-cpu-R2`/`R3` (caught), as `mac-` rows already mutate the
+  vendored tree; the x64 ones are not `mutate.py` rows because a row that rebuilds dynarmic leaves the
+  mutated library in `target/` for the rows after it. Rust-level rows, all caught: `rsb-A1` (now on
+  the `ALL_SAFE` line), `fastdispatch-A1` (x64 `INTERRUPTIBLE` back to `0xFFFB`), `-A2` (the table
+  constant back to 16 MiB), `-A3` (`cost()` leaves the table out), `-A4` (the runtime's own mask drops
+  `FastDispatch`), `mac-cpu-R1` (aarch64 back to `0xFFF9`).
+* **dynarmic's own suite** (A64 frontend, Release): Windows/MSVC 201,698 assertions in 84 cases pass
+  with 0001-0020 (upstream's default flags, so the checked handler and the 64 KiB table);
+  M1/AppleClang 201,698 in 83 cases -- the first recorded arm64 run.
+* **Whole suites, release**, both hosts: `dynarmic-sys` and `omni-cpu` pass, `omni-cpu` also with the
+  real APK (M2 gate; per-thread cost under its ceiling).
+* **Benchmarks** (`omni-cpu/tests/bench.rs`, ns, median of 5; the Windows host was shared with a live
+  session, so its figures carry a few ns of noise). Before = the old `INTERRUPTIBLE`'s column, after =
+  the new one's, same run (neither code path is touched by the other flag set's patch):
+
+  | x64 | before `0xFFFB` | after `0xFFFF` |
+  |---|---|---|
+  | `BR` table, 16 / 256 / 4,096 targets | 17.7 / 20.7 / 26.0 | **9.9 / 10.1 / 14.8** |
+  | `BR` table, 16,384 / 65,536 targets | 37.8 / 44.4 | 36.1 / 43.0 |
+  | `BLR`+`RET`, 16 / 256 / 4,096 targets | 21.0 / 20.0 / 27.5 | **10.8 / 11.2 / 16.0** |
+  | `BLR`+`RET`, 16,384 / 65,536 targets | 32.8 / 39.8 | 33.4 / 39.6 |
+  | `BL`+`RET`, 128 / 2,048 / 32,768 / 131,072 / 262,144 blocks | 2.63 / 11.7 / 21.9 / 23.0 / 27.3 | 2.72 / 10.6 / 21.4 / 22.8 / 26.3 |
+
+  | arm64 (M1) | before `0xFFF9` | after `0xFFFB` |
+  |---|---|---|
+  | `BL`+`RET`, 128 / 2,048 / 32,768 / 131,072 / 262,144 blocks | 3.79 / 4.55 / 13.8 / 15.6 / 24.6 | **3.45 / 3.73 / 11.7 / 12.6 / 20.2** |
+  | `BLR`+`RET`, 16 / 256 / 4,096 / 16,384 / 65,536 targets | 19.4 / 19.6 / 19.5 / 24.1 / 26.4 | **15.5 / 14.2 / 16.0 / 19.2 / 22.2** |
+  | `BR` table, any size | 13.0-20.9 | the same (no fast dispatch on arm64) |
+
+  Upstream's unchecked 16 MiB table (`0xFFFF` before 0019, an earlier and noisier run) measured
+  11.5 / 14.2 / 25.0 / 71.8 ns for the `BR` table at 16 / 256 / 4,096 / 65,536 targets: the checks
+  cost nothing measurable. The dispatcher alone (`0xFFF9`) is 5.8-139 ns per x64 call and return as
+  the block map grows -- the figure D33 removed for `RET`s and this removes for the rest.
+
+### What it costs if wrong
+
+A fast-dispatch loop is stoppable only while the handler checks; the `indirect` and `return-miss`
+cells fail if it stops. A stale table entry would run the old translation of rewritten guest code
+-- a wrong answer, not a slow one; the invalidation test covers both paths. A thread whose hot
+indirect targets far exceed 4,096 pays the dispatcher's cost on the misses, which is what it paid
+before. No in-world measurement was taken (this task's rule: never run the live app); the profile
+above is the reason, not the result, and the next in-world profile says how much of the 12-25% went.

@@ -202,6 +202,9 @@ protected:
         void* wrapped_exclusive_write_memory_32;
         void* wrapped_exclusive_write_memory_64;
         void* wrapped_exclusive_write_memory_128;
+
+        // Omnidroid patch 0020: the `PopRSBHint` terminal's handler, once, in the prelude.
+        void* pop_rsb_hint;
     } prelude_info;
 };
 

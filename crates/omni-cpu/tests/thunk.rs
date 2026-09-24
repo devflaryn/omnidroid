@@ -163,8 +163,8 @@ fn call_loop(calls: u64, program_at: usize, target: Option<usize>) -> Vec<u32> {
 ///
 /// Built by hand because it is the shape the real loader produces, and it is **not** free: the guest
 /// spends four more instructions and, decisively, leaves the block through `BR` — an *indirect*
-/// terminal, which under `optimization::INTERRUPTIBLE` is a dispatcher round trip rather than a
-/// linked jump. A `BL` straight into the thunk region leaves through `LinkBlock` instead. That is
+/// terminal, which under `optimization::INTERRUPTIBLE` is a fast-dispatch table probe on x64 (D35)
+/// and a dispatcher round trip on arm64, rather than a linked jump. A `BL` straight into the thunk region leaves through `LinkBlock` instead. That is
 /// what these cells measure, and it decides whether the runtime keeps the stub in the loop or binds
 /// the call sites past it.
 fn plt_stub(stub_at: GuestAddr, got_slot: GuestAddr) -> Vec<u32> {

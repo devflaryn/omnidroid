@@ -12,11 +12,13 @@ fn vendored(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/dynarmic").join(relative)
 }
 
-/// The 16 MiB `FastDispatchEntry` table, **allocated only when `FastDispatch` is on** -- patch 0017.
-/// Upstream held it by value in every `A64EmitX64`, the dominant term in a guest thread's cost
-/// whether or not the optimization that uses it was enabled.
+/// The `FastDispatchEntry` table, **allocated only when `FastDispatch` is on** -- patch 0017 -- and
+/// **64 KiB** -- patch 0019. Upstream held 16 MiB of it by value in every `A64EmitX64`, the dominant
+/// term in a guest thread's cost whether or not the optimization that uses it was enabled; since
+/// 0019 `INTERRUPTIBLE` turns the optimization on on x64, so every guest thread pays the table and
+/// its size is the per-thread figure D35 states.
 #[test]
-fn the_fast_dispatch_table_is_sixteen_mebibytes_and_allocated_only_when_it_is_used() {
+fn the_fast_dispatch_table_is_sixty_four_kibibytes_and_allocated_only_when_it_is_used() {
     let header = vendored("src/dynarmic/backend/x64/a64_emit_x64.h");
     let Ok(text) = std::fs::read_to_string(&header) else {
         // The vendored tree is present in every build that compiles this crate at all, so its
@@ -31,9 +33,14 @@ fn the_fast_dispatch_table_is_sixteen_mebibytes_and_allocated_only_when_it_is_us
          first factor is no longer established by the source it came from"
     );
     assert!(
-        has("static constexpr size_t fast_dispatch_table_size = 0x100000;"),
-        "the pin no longer declares fast_dispatch_table_size = 0x100000, so \
+        has("static constexpr size_t fast_dispatch_table_size = 0x1000;"),
+        "the pin no longer declares fast_dispatch_table_size = 0x1000 (patch 0019), so \
          OD_FIXED_PER_JIT_BYTES's second factor has moved"
+    );
+    assert!(
+        has("static constexpr u64 fast_dispatch_table_mask = 0xFFF0;"),
+        "the emitted probe masks the hash with fast_dispatch_table_mask; it must index exactly \
+         fast_dispatch_table_size entries of 0x10 bytes (patch 0019 static_asserts it too)"
     );
     assert!(
         has("std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;"),
@@ -58,10 +65,10 @@ fn the_fast_dispatch_table_is_sixteen_mebibytes_and_allocated_only_when_it_is_us
     {
         assert_eq!(
             dynarmic_sys::OD_FIXED_PER_JIT_BYTES,
-            0x10 * 0x10_0000,
-            "16 MiB: 0x10 bytes per entry times 0x100000 entries"
+            0x10 * 0x1000,
+            "64 KiB: 0x10 bytes per entry times 0x1000 entries"
         );
-        assert_eq!(dynarmic_sys::OD_FIXED_PER_JIT_BYTES, 16 * 1024 * 1024);
+        assert_eq!(dynarmic_sys::OD_FIXED_PER_JIT_BYTES, 64 * 1024);
     }
 }
 

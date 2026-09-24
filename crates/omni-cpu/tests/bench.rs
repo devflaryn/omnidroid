@@ -321,9 +321,10 @@ fn the_commit_charge_of_a_guest_thread() {
     }
     println!(
         "  If those figures do not track the cache size, the per-thread cost is not the cache. \
-         `A64EmitX64` holds a `std::array<FastDispatchEntry, 0x100000>` -- a flat 16 MiB per jit, \
-         allocated and zeroed in the constructor whether or not the FastDispatch optimization is \
-         enabled, and this backend disables it.
+         Upstream `A64EmitX64` holds a `std::array<FastDispatchEntry, 0x100000>` -- a flat 16 MiB \
+         per jit, allocated and written in the constructor whether or not the FastDispatch \
+         optimization is enabled. Patch 0017 allocates it only when it is (D32); patch 0019 makes \
+         it 64 KiB and x64's INTERRUPTIBLE turns it on (D35).
 "
     );
 }
@@ -575,11 +576,12 @@ const fn bl_rel(offset_insns: i64) -> u32 {
     0x9400_0000 | ((offset_insns as u32) & 0x03FF_FFFF)
 }
 
-/// **What a guest call and return cost as the number of distinct blocks grows**, under the flag set
-/// the runtime uses (`INTERRUPTIBLE`: every `RET` returns to the dispatcher, which calls
-/// `GetCurrentBlockThunk` and looks the next block up in a `tsl::robin_map`) and under dynarmic's
-/// default (`ALL_SAFE`: a return-stack buffer predicts the `RET`, and a fast-dispatch table serves
-/// the misses from emitted code). H2 of the world performance work.
+/// **What a guest call and return cost as the number of distinct blocks grows**, under three flag
+/// sets, named by mask so the table means the same thing whatever `INTERRUPTIBLE` is: `0xFFF9`
+/// (D16: every `RET` returns to the dispatcher, which looks the next block up in a hash map),
+/// `0xFFFB` (D33: a return-stack buffer predicts the `RET`) and `0xFFFF` (`ALL_SAFE`: the same,
+/// and on x64 a fast-dispatch table serves the buffer's misses from emitted code). H2 of the world
+/// performance work.
 ///
 /// The guest is `K` call sites, each a `BL` to its own two-instruction function (`add; ret`), in a
 /// loop: `2K` blocks, one direct transfer and one indirect transfer per call. `K` runs from a
@@ -592,12 +594,16 @@ fn the_cost_of_a_call_and_return_as_the_block_map_grows() {
     use omni_mem::{CommitPolicy, GuestSpace, Placement, Protection};
     let _serial = serialized();
     const SAMPLES: usize = 5;
-    println!("\n== one BL + RET to a distinct function, ns per call (median of {SAMPLES}) ==");
-    for k in [64usize, 1024, 16_384, 131_072] {
+    println!(
+        "\n== one BL + RET to a distinct function, ns per call (median of {SAMPLES}); \
+         INTERRUPTIBLE is {:#06X} here ==",
+        DynarmicOptions::default().optimizations() & 0xFFFF
+    );
+    for k in [64usize, 1024, 16_384, 65_536, 131_072] {
         let calls_per_round: u64 = 4_000_000;
         let loops = (calls_per_round / k as u64).max(1);
         let mut row = Vec::new();
-        for (label, interruptible) in [("INTERRUPTIBLE", true), ("ALL_SAFE", false)] {
+        for (label, mask) in [("0xFFF9", 0x0000_FFF9u32), ("0xFFFB", 0x0000_FFFB), ("0xFFFF", 0x0000_FFFF)] {
             let space = std::sync::Arc::new(GuestSpace::new().expect("a guest space"));
             let bytes = (k * 4 + 64 + k * 8 + 0xFFFF) & !0xFFFF;
             let code = space
@@ -633,7 +639,11 @@ fn the_cost_of_a_call_and_return_as_the_block_map_grows() {
             space.protect(code, bytes, Protection::ReadExecute).expect("executable");
             let backend = DynarmicBackend::new(
                 std::sync::Arc::clone(&space),
-                DynarmicOptions { code_cache_size: 128 << 20, interruptible, ..Default::default() },
+                DynarmicOptions {
+                    code_cache_size: 128 << 20,
+                    optimizations_override: Some(mask),
+                    ..Default::default()
+                },
             )
             .expect("a backend");
             let mut cpu = backend.create_thread_with_tls().expect("a context");
@@ -655,5 +665,140 @@ fn the_cost_of_a_call_and_return_as_the_block_map_grows() {
             row.push(format!("{label} {ns:6.2}"));
         }
         println!("  {:>7} call sites ({:>7} blocks): {}", k, 2 * k, row.join(" | "));
+    }
+}
+
+/// `BLR Xn` -- `1101011 0001 11111 000000 Rn 00000`.
+const fn blr_reg(rn: u32) -> u32 {
+    0xD63F_0000 | (rn << 5)
+}
+
+/// **What an indirect branch costs as the number of distinct targets grows**: the shape of Luau's
+/// interpreter dispatch (`BR` through a table of handlers, each ending in a direct branch back) and
+/// of a C++ virtual call (`BLR` through a table of functions, each ending in `RET`). This is the
+/// terminal D35 is about: `FastDispatchHint`, which with `FastDispatch` cleared is a return to the
+/// dispatcher and a `LookupBlock` (`EmitX64::GetBasicBlock`, a `robin_map` probe) on every
+/// transfer, and with it on a probe of the per-thread fast-dispatch table in emitted code.
+///
+/// The guest walks a stream of `S = max(K, 4096)` handler addresses, each of the `K` handlers
+/// appearing `S / K` times in a shuffled order, then an end handler that rewinds the stream: one
+/// indirect transfer and two blocks per step. Columns are flag sets: `0xFFF9` is D16's
+/// `INTERRUPTIBLE` (no return-stack buffer, no fast dispatch), `0xFFFB` D33's, `0xFFFF` is
+/// `ALL_SAFE` (and, since patch 0019, x86_64's `INTERRUPTIBLE`).
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_an_indirect_branch_through_a_table() {
+    use omni_cpu::dynarmic::DynarmicBackend;
+    use omni_mem::{CommitPolicy, GuestSpace, Placement, Protection};
+    let _serial = serialized();
+    const SAMPLES: usize = 5;
+    println!("\n== one indirect transfer through a table of K targets, ns per transfer (median of {SAMPLES}) ==");
+    for call in [false, true] {
+        let shape = if call { "BLR to a function that RETs" } else { "BR to a handler that B's back" };
+        println!("  {shape}:");
+        for k in [16usize, 256, 4096, 16_384, 65_536] {
+            let s = k.max(4096);
+            let transfers_per_round: u64 = 4_000_000;
+            let loops = (transfers_per_round / (s as u64 + 1)).max(1);
+            let mut row = Vec::new();
+            for (label, mask) in [("0xFFF9", 0x0000_FFF9u32), ("0xFFFB", 0x0000_FFFB), ("0xFFFF", 0x0000_FFFF)] {
+                let space = std::sync::Arc::new(GuestSpace::new().expect("a guest space"));
+                const HANDLERS_AT: usize = 10; // words
+                let code_bytes = ((HANDLERS_AT + 2 * k) * 4 + 64 + 0xFFFF) & !0xFFFF;
+                let code = space
+                    .map_anonymous(
+                        Placement::Anywhere { align: space.page_size() },
+                        code_bytes,
+                        Protection::ReadWrite,
+                        CommitPolicy::Eager,
+                    )
+                    .expect("a code region");
+                let data_bytes = ((s + 1) * 8 + 0xFFFF) & !0xFFFF;
+                let data = space
+                    .map_anonymous(
+                        Placement::Anywhere { align: space.page_size() },
+                        data_bytes,
+                        Protection::ReadWrite,
+                        CommitPolicy::Eager,
+                    )
+                    .expect("a data region");
+                // 0: mov x20, x30
+                // 1: top: ldr x4, [x10, x11] ; 2: add x11, x11, #8 ; 3: br x4 | blr x4
+                // 4: b top (after a BLR returns)
+                // 5: end: movz x11, #0 ; 6: subs x9, x9, #1 ; 7: b.ne top ; 8: mov x30, x20 ; 9: ret
+                // 10 + 2i: add x2, x2, #1 ; b top | ret
+                let mut program = vec![
+                    mov_reg(20, 30),
+                    ldr_reg(4, 10, 11),
+                    add_imm(11, 11, 8),
+                    if call { blr_reg(4) } else { br(4) },
+                    b(1 - 4),
+                    movz(11, 0, 0),
+                    subs_imm(9, 9, 1),
+                    b_cond(1, 1 - 7),
+                    mov_reg(30, 20),
+                    ret(30),
+                ];
+                assert_eq!(program.len(), HANDLERS_AT);
+                for _ in 0..k {
+                    program.push(add_imm(2, 2, 1));
+                    let here = program.len() as i32;
+                    program.push(if call { ret(30) } else { b(1 - here) });
+                }
+                let ptr = space.ptr(code, program.len() * 4).expect("a host pointer");
+                // SAFETY: `ptr` is a committed, writable range of exactly this length in this space.
+                unsafe { core::ptr::copy_nonoverlapping(program.as_ptr(), ptr.cast::<u32>(), program.len()) };
+                space.protect(code, code_bytes, Protection::ReadExecute).expect("executable");
+
+                // Each handler S / K times, shuffled (xorshift64, fixed seed), then the end handler.
+                let mut order: Vec<usize> = (0..s).map(|j| j % k).collect();
+                let mut state = 0x9E37_79B9_7F4A_7C15u64;
+                for i in (1..order.len()).rev() {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    order.swap(i, (state % (i as u64 + 1)) as usize);
+                }
+                let mut stream: Vec<u64> =
+                    order.iter().map(|&i| (code + (HANDLERS_AT + 2 * i) * 4) as u64).collect();
+                stream.push((code + 5 * 4) as u64);
+                let dptr = space.ptr(data, stream.len() * 8).expect("a host pointer");
+                // SAFETY: as above, for the data region.
+                unsafe { core::ptr::copy_nonoverlapping(stream.as_ptr(), dptr.cast::<u64>(), stream.len()) };
+
+                let backend = DynarmicBackend::new(
+                    std::sync::Arc::clone(&space),
+                    DynarmicOptions {
+                        code_cache_size: 128 << 20,
+                        optimizations_override: Some(mask),
+                        ..Default::default()
+                    },
+                )
+                .expect("a backend");
+                let mut cpu = backend.create_thread_with_tls().expect("a context");
+                let sentinel = code + code_bytes - 4;
+                cpu.set_return_sentinel(sentinel).expect("sentinel");
+                let mut samples = Vec::new();
+                for round in 0..=SAMPLES {
+                    cpu.set_x(x(30), sentinel as u64);
+                    cpu.set_x(x(9), loops);
+                    cpu.set_x(x(10), data as u64);
+                    cpu.set_x(x(11), 0);
+                    cpu.set_x(x(2), 0);
+                    let t = Instant::now();
+                    let exit = cpu.run(code, RunLimit::Unlimited).expect("runs");
+                    let elapsed = t.elapsed();
+                    assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+                    assert_eq!(cpu.x(x(2)), loops * s as u64, "every handler ran");
+                    if round > 0 {
+                        samples.push(elapsed);
+                    }
+                }
+                let summary = Summary::of(samples);
+                let ns = summary.median.as_secs_f64() * 1e9 / (loops * (s as u64 + 1)) as f64;
+                row.push(format!("{label} {ns:6.2}"));
+            }
+            println!("    {k:>6} targets: {}", row.join(" | "));
+        }
     }
 }

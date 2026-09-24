@@ -187,16 +187,19 @@ pub struct DynarmicOptions {
     /// How many guest threads this backend will be asked for. Sizes the exclusive monitor and the
     /// TLS arena.
     pub max_threads: u32,
-    /// Whether to clear the optimization flag whose terminal handler checks neither the cycle
-    /// counter nor the halt flag -- `FastDispatch`; it was two, with `ReturnStackBuffer`, until
-    /// vendored patch 0018 gave the return-stack-buffer handler both checks (D33).
+    /// Whether to run under `optimization::INTERRUPTIBLE`: `ALL_SAFE` without the optimization
+    /// flags whose terminal handlers check neither the cycle counter nor the halt flag.
     ///
     /// **Default `true`, and that is a deliberate trade.** Task 2 measured a guest `BR X30`
-    /// branching to itself to be stoppable by *nothing* under the default flags — not a budget, not
-    /// a halt — and `optimization::INTERRUPTIBLE` fixes it. The cost is about **3.9 ns per indirect
-    /// transfer** (n = 31 per configuration): nothing at all on a guest with no indirect branches,
-    /// up to roughly 5x on an indirect-saturated one. Roblox's real branch mix is reported in the
-    /// Task 3 report.
+    /// branching to itself to be stoppable by *nothing* under upstream's default flags — not a
+    /// budget, not a halt — and `INTERRUPTIBLE` fixed it by clearing `ReturnStackBuffer` and
+    /// `FastDispatch` (D16), at about **3.9 ns per indirect transfer**. Vendored patches since gave
+    /// those handlers both checks -- 0018 the return-stack buffer's on x64 (D33), 0019 the
+    /// fast-dispatch handler's and 0020 the return-stack buffer's on arm64 (D35) -- so on x64
+    /// `INTERRUPTIBLE` is now `ALL_SAFE` itself, and on arm64 `ALL_SAFE` less `FastDispatch`, which
+    /// that backend does not implement. The flag is kept because it is what this backend
+    /// *promises* (`capabilities().asynchronous_halt`, the in-loop thunk path), and what it selects
+    /// is `dynarmic-sys`'s to say per architecture.
     ///
     /// Availability beats throughput here because the failure modes are not comparable: an
     /// unstoppable guest thread is a denial of service on the host from untrusted input (Global
@@ -1340,7 +1343,8 @@ impl DynarmicCpu {
             shared,
             cost: ContextCost {
                 // The guest's TLS block, plus the fast-dispatch table **when the optimization that
-                // reads it is on** -- patch 0017 allocates it only then (D32). Both are derived
+                // reads it is on** -- patch 0017 allocates it only then (D32), and on x64 it is on
+                // under `INTERRUPTIBLE` since patch 0019, at 64 KiB (D35). Both are derived
                 // rather than measured: the first is one page by construction, the second is
                 // `sizeof(FastDispatchEntry) * fast_dispatch_table_size` from the pin, checked
                 // against the vendored source by `dynarmic-sys`'s `pin_constants` test. The code
@@ -1818,9 +1822,12 @@ impl GuestCpu for DynarmicCpu {
     /// `JitState` — the one the callback wrote — and compares it with the top return-stack-buffer
     /// entry. A hit jumps to that entry's block, which is therefore the written PC's block (the
     /// `SVC` pushed its own PC + 4, so a callback that leaves the PC alone hits; since patch 0018,
-    /// D33, a hit also checks the halt flag and the budget). A miss, with `FastDispatch` cleared —
-    /// `optimization::INTERRUPTIBLE`, which this backend sets by default (D16) — emits
-    /// `ReturnFromRunCode`. And `ReturnFromRunCode` is **not** a return to the caller: it is the top
+    /// D33, a hit also checks the halt flag and the budget). A miss, with `FastDispatch` on (x64
+    /// under `optimization::INTERRUPTIBLE` since patch 0019, D35), continues into the fast-dispatch
+    /// handler, which checks both, then probes its table with the same descriptor -- a hit is the
+    /// written PC's block again, a miss is `LookupBlock` of the written PC. With `FastDispatch`
+    /// cleared (arm64, which does not implement it) a miss emits `ReturnFromRunCode`. And
+    /// `ReturnFromRunCode` is **not** a return to the caller: it is the top
     /// of the emitted dispatcher loop (`block_of_code.cpp`, `GenRunCode`), which re-reads
     /// `halt_reason` and `cycles_remaining`, calls `LookupBlock` and jumps straight to the next
     /// block. So writing the guest `PC` from inside the callback and returning quietly resumes the
@@ -1841,15 +1848,16 @@ impl GuestCpu for DynarmicCpu {
         // **Refused rather than registered when the flag is clear.** This was first reasoned as "the
         // resume would be a return-stack-buffer prediction"; it is not -- both the RSB and the
         // fast-dispatch lookup are keyed on the PC the handler wrote (D33). What remains is that the
-        // thunk path is only exercised under `INTERRUPTIBLE`, and under the default flags a guest's
-        // indirect branches check no halt flag, so the configuration is refused, not assumed.
+        // thunk path is only exercised under `INTERRUPTIBLE`, whose flag set is the one whose
+        // indirect-branch handlers are measured to check the halt flag (D35), so the configuration
+        // is refused, not assumed.
         if !self.shared.options.interruptible {
             return Err(CpuError::Unsupported {
                 backend: BACKEND_NAME,
                 operation: "dispatch a thunk inside the run loop",
                 reason: "`DynarmicOptions::interruptible` is false: the in-loop thunk path is only \
-                         tested under `optimization::INTERRUPTIBLE`, and under the default flags a \
-                         guest's fast-dispatched branches check no halt flag",
+                         tested under `optimization::INTERRUPTIBLE`, the flag set whose \
+                         indirect-branch handlers are measured to check the halt flag",
             });
         }
         self.with_ctx(|ctx| ctx.inline_thunks.insert(address, (handler, context)));
@@ -1895,11 +1903,12 @@ impl GuestCpu for DynarmicCpu {
     /// what the guest has done:
     ///
     /// * the guest's bionic TLS block — one page, by construction;
-    /// * [`OD_FIXED_PER_JIT_BYTES`], the 16 MiB `FastDispatchEntry` table, **only when the
-    ///   `FastDispatch` optimization is on** -- which this backend leaves off (D16). Upstream holds
-    ///   it by value and writes it in every jit; patch 0017 allocates it only when it is read
-    ///   (D32). `dynarmic-sys`'s `pin_constants` test reads both factors and the guard back out of
-    ///   the vendored source, so a re-pin cannot move them silently.
+    /// * [`OD_FIXED_PER_JIT_BYTES`], the `FastDispatchEntry` table, **only when the
+    ///   `FastDispatch` optimization is on** -- on x64 under `INTERRUPTIBLE` since patch 0019, at
+    ///   64 KiB (D35); never on arm64, which has no table. Upstream holds 16 MiB of it by value and
+    ///   writes it in every jit; patch 0017 allocates it only when it is read (D32).
+    ///   `dynarmic-sys`'s `pin_constants` test reads both factors and the guard back out of the
+    ///   vendored source, so a re-pin cannot move them silently.
     ///
     /// **The missing term is dynarmic's code cache**, which on Windows commits incrementally as code
     /// is emitted (`BlockOfCode::EnsureMemoryCommitted`: 2 MiB for the prelude since patch 0017,
@@ -1912,7 +1921,8 @@ impl GuestCpu for DynarmicCpu {
     ///
     /// Measured against this: **24.5 MiB** per guest thread at the 8 MiB default cache (n = 8
     /// threads, serialized), of which this reports 16.004 MiB. D5's 20-35 MiB band was measured
-    /// against the 128 MiB default.
+    /// against the 128 MiB default. Since patch 0017 it measures 4.47 MiB (D32); patch 0019 adds
+    /// the 64 KiB table on x64 (D35).
     fn cost(&self) -> ContextCost {
         self.cost
     }

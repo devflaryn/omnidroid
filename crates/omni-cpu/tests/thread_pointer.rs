@@ -211,9 +211,17 @@ fn the_per_thread_tls_cost_is_one_page() {
         "n = {THREADS} threads: each block is exactly one page of commit charge"
     );
     for cpu in &threads {
-        // One derived term: the TLS page. The 16 MiB `FastDispatchEntry` table is allocated only
-        // when `FastDispatch` is on (patch 0017, D32), and these contexts run with it off (D16).
-        assert_eq!(cpu.cost().private_committed, omni_cpu::TLS_BLOCK_BYTES);
+        // Two derived terms: the TLS page, and the `FastDispatchEntry` table, which is allocated
+        // only when `FastDispatch` is on (patch 0017, D32) -- on x64 since patch 0019 made its
+        // handler checked, 64 KiB (D35); on arm64, which has no table, never.
+        let table = if cpu.effective_config().optimizations & dynarmic_sys::optimization::FAST_DISPATCH != 0 {
+            dynarmic_sys::OD_FIXED_PER_JIT_BYTES
+        } else {
+            0
+        };
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(table, 64 * 1024, "x64 runs with FastDispatch on, and the table is 64 KiB");
+        assert_eq!(cpu.cost().private_committed, omni_cpu::TLS_BLOCK_BYTES + table);
         assert_eq!(
             cpu.cost().shared_committed,
             0,

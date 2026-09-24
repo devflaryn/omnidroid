@@ -311,6 +311,9 @@ void AddressSpace::Link(const EmittedBlockInfo& block_info, u32 block_index) {
         case LinkTarget::InterpreterFallback:
             c.BL(prelude_info.interpreter_fallback);
             break;
+        case LinkTarget::PopRSBHint:
+            c.B(prelude_info.pop_rsb_hint);
+            break;
         case LinkTarget::WrappedExclusiveReadMemory8:
             c.BL(prelude_info.wrapped_exclusive_read_memory_8);
             break;

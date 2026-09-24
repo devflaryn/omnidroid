@@ -1,0 +1,136 @@
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+index a45f0ab..cc7b3c6 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -749,6 +749,50 @@ void A64AddressSpace::EmitPrelude() {
+         code.BR(X19);
+     }
+ 
++    // Omnidroid patch 0020: the `PopRSBHint` terminal's handler. Upstream emitted this hit test
++    // inline in every block that ends in `RET` (about 15 instructions) and branched to the predicted
++    // block checking neither the budget nor the halt word, so a guest loop through `RET` could not
++    // be stopped. It is x64's patch 0018 here: a hit compares `Xticks` with 0 when cycle counting is
++    // on and the halt word with 0, and on either -- as on a miss -- falls through into the
++    // dispatcher below, which checks both again (the guest PC is already stored). One copy in the
++    // prelude, as x64's `terminal_handler_pop_rsb_hint` is, because the inline copies cost more in
++    // code footprint than the dispatcher they save once a thread's code outgrows the host's caches
++    // (D35).
++    prelude_info.pop_rsb_hint = nullptr;
++    if (conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
++        oaknut::Label miss;
++
++        prelude_info.pop_rsb_hint = code.xptr<void*>();
++
++        code.MOV(Wscratch0, A64::LocationDescriptor::fpcr_mask);
++        code.LDR(W0, Xstate, offsetof(A64JitState, fpcr));
++        code.LDR(X1, Xstate, offsetof(A64JitState, pc));
++        code.AND(W0, W0, Wscratch0);
++        code.AND(X1, X1, A64::LocationDescriptor::pc_mask);
++        code.LSL(X0, X0, A64::LocationDescriptor::fpcr_shift);
++        code.ORR(X0, X0, X1);
++
++        code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
++        code.AND(Wscratch2, Wscratch2, RSBIndexMask);
++        code.ADD(X2, SP, Xscratch2);
++        code.SUB(Wscratch2, Wscratch2, sizeof(RSBEntry));
++        code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
++
++        code.LDP(Xscratch0, Xscratch1, X2, offsetof(StackLayout, rsb));
++
++        code.CMP(X0, Xscratch0);
++        code.B(NE, miss);
++        if (conf.enable_cycle_counting) {
++            code.CMP(Xticks, 0);
++            code.B(LE, miss);
++        }
++        code.LDAR(Wscratch0, Xhalt);
++        code.CBNZ(Wscratch0, miss);
++        code.BR(Xscratch1);
++
++        code.l(miss);
++    }
++
+     prelude_info.return_to_dispatcher = code.xptr<void*>();
+     {
+         oaknut::Label l_this, l_addr;
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 3dba02b..554172a 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -311,6 +311,9 @@ void AddressSpace::Link(const EmittedBlockInfo& block_info, u32 block_index) {
+         case LinkTarget::InterpreterFallback:
+             c.BL(prelude_info.interpreter_fallback);
+             break;
++        case LinkTarget::PopRSBHint:
++            c.B(prelude_info.pop_rsb_hint);
++            break;
+         case LinkTarget::WrappedExclusiveReadMemory8:
+             c.BL(prelude_info.wrapped_exclusive_read_memory_8);
+             break;
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index f39bdae..761d540 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -202,6 +202,9 @@ protected:
+         void* wrapped_exclusive_write_memory_32;
+         void* wrapped_exclusive_write_memory_64;
+         void* wrapped_exclusive_write_memory_128;
++
++        // Omnidroid patch 0020: the `PopRSBHint` terminal's handler, once, in the prelude.
++        void* pop_rsb_hint;
+     } prelude_info;
+ };
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index b31559b..f20fcbb 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -100,6 +100,9 @@ enum class LinkTarget {
+     WrappedExclusiveWriteMemory32,
+     WrappedExclusiveWriteMemory64,
+     WrappedExclusiveWriteMemory128,
++    // Omnidroid patch 0020: the `PopRSBHint` terminal branches to one handler in the prelude, which
++    // checks the budget and the halt word on a hit, instead of carrying the hit test inline.
++    PopRSBHint,
+ };
+ 
+ struct Relocation {
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a64.cpp b/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+index 2964d51..a938147 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a64.cpp
+@@ -100,29 +100,11 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
+ 
+ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+     if (ctx.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
+-        oaknut::Label fail;
+-
+-        code.MOV(Wscratch0, A64::LocationDescriptor::fpcr_mask);
+-        code.LDR(W0, Xstate, offsetof(A64JitState, fpcr));
+-        code.LDR(X1, Xstate, offsetof(A64JitState, pc));
+-        code.AND(W0, W0, Wscratch0);
+-        code.AND(X1, X1, A64::LocationDescriptor::pc_mask);
+-        code.LSL(X0, X0, A64::LocationDescriptor::fpcr_shift);
+-        code.ORR(X0, X0, X1);
+-
+-        code.LDR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
+-        code.AND(Wscratch2, Wscratch2, RSBIndexMask);
+-        code.ADD(X2, SP, Xscratch2);
+-        code.SUB(Wscratch2, Wscratch2, sizeof(RSBEntry));
+-        code.STR(Wscratch2, SP, offsetof(StackLayout, rsb_ptr));
+-
+-        code.LDP(Xscratch0, Xscratch1, X2, offsetof(StackLayout, rsb));
+-
+-        code.CMP(X0, Xscratch0);
+-        code.B(NE, fail);
+-        code.BR(Xscratch1);
+-
+-        code.l(fail);
++        // Omnidroid patch 0020: the hit test is one handler in the prelude
++        // (`A64AddressSpace::EmitPrelude`, `pop_rsb_hint`), which checks the budget and the halt
++        // word on a hit and falls into the dispatcher on a miss. It was inline here, unchecked.
++        EmitRelocation(code, ctx, LinkTarget::PopRSBHint);
++        return;
+     }
+ 
+     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);

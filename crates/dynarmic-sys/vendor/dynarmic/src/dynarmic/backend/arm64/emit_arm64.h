@@ -100,6 +100,9 @@ enum class LinkTarget {
     WrappedExclusiveWriteMemory32,
     WrappedExclusiveWriteMemory64,
     WrappedExclusiveWriteMemory128,
+    // Omnidroid patch 0020: the `PopRSBHint` terminal branches to one handler in the prelude, which
+    // checks the budget and the halt word on a hit, instead of carrying the hit test inline.
+    PopRSBHint,
 };
 
 struct Relocation {

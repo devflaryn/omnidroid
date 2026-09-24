@@ -279,14 +279,14 @@ pub struct OdConfig {
     /// dynarmic's `OptimizationFlag` bitmask, used verbatim.
     /// [`optimization::ALL_SAFE`] is the normal value.
     ///
-    /// Exposed rather than hard-coded because two of these flags decide whether
+    /// Exposed rather than hard-coded because two of these flags decided whether
     /// guest code can wedge the host thread:
     /// [`optimization::RETURN_STACK_BUFFER`] and [`optimization::FAST_DISPATCH`]
     /// emit terminal handlers that jump from one translated block straight to
-    /// the next, checking **neither** the cycle counter nor the halt flag. A
-    /// guest `BR`/`RET` loop that stays inside either cache therefore ignores a
-    /// step budget *and* ignores [`od_jit_halt`] from another thread. Clearing
-    /// both flags restores both escapes, at a cost in throughput.
+    /// the next, and upstream's check **neither** the cycle counter nor the halt
+    /// flag. Patches 0018-0020 add both checks to every such handler this pin
+    /// emits (D33, D35); `tests/hostile.rs`'s `the_stoppability_matrix` is what
+    /// says they are still there.
     pub optimizations: u32,
 }
 
@@ -296,11 +296,14 @@ pub mod optimization {
     /// translation time. The cycle counter *is* checked on this path.
     pub const BLOCK_LINKING: u32 = 0x0000_0001;
     /// Return-address prediction. Upstream's terminal handler checks nothing; **patch 0018**
-    /// (`patches/`, x64 only) makes a hit check the cycle budget and the halt flag as
-    /// `ReturnFromRunCode` does, which is what lets [`INTERRUPTIBLE`] keep it on x64.
+    /// (x64) and **patch 0020** (arm64) make a hit check the cycle budget and the halt flag as the
+    /// dispatcher does, which is what lets [`INTERRUPTIBLE`] keep it on both (D33, D35).
     pub const RETURN_STACK_BUFFER: u32 = 0x0000_0002;
-    /// Two-tier dispatch with an MRU cache. Its terminal handler checks
-    /// nothing either.
+    /// A per-thread table from a guest location to its translation, probed in emitted code by
+    /// every `BR`/`BLR` and every `RET` that misses the return-stack buffer, instead of a return to
+    /// the dispatcher. x64 only (the arm64 backend's `FastDispatchHint` is a dispatcher return).
+    /// Upstream's handler checks nothing; **patch 0019** makes it check the cycle budget and the
+    /// halt flag before the probe, and shrinks the table to 4,096 entries (64 KiB) (D35).
     pub const FAST_DISPATCH: u32 = 0x0000_0004;
     /// IR optimization: drop redundant guest-register reads and writes.
     pub const GET_SET_ELIMINATION: u32 = 0x0000_0008;
@@ -314,20 +317,22 @@ pub mod optimization {
     pub const ALL_SAFE: u32 = 0x0000_FFFF;
     /// `ALL_SAFE` without the flags whose terminal handlers skip the cycle and
     /// halt checks. The configuration in which a runaway guest can still be
-    /// stopped. On x64 that is only [`FAST_DISPATCH`]: it cleared
-    /// [`RETURN_STACK_BUFFER`] too until patch 0018 gave that handler the checks
-    /// (`0x0000_FFF9` then, `0x0000_FFFB` now): MEASURED 132.0 -> 24.1 ns per
-    /// call+return at 262,144 blocks (D33).
+    /// stopped. On x64 that is now **none**: `0x0000_FFF9` (D16) cleared
+    /// [`RETURN_STACK_BUFFER`] and [`FAST_DISPATCH`]; patch 0018 gave the first
+    /// handler the checks (`0x0000_FFFB`, D33) and patch 0019 the second, so
+    /// `INTERRUPTIBLE` is `ALL_SAFE` (D35). `tests/hostile.rs`'s
+    /// `the_stoppability_matrix` is the detector for both handlers.
     #[cfg(not(target_arch = "aarch64"))]
-    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;
+    pub const INTERRUPTIBLE: u32 = ALL_SAFE;
     /// `ALL_SAFE` without the flags whose terminal handlers skip the cycle and
-    /// halt checks. On arm64 that is [`FAST_DISPATCH`] **and**
-    /// [`RETURN_STACK_BUFFER`]: patch 0018 is x64-only, and the arm64 backend's
-    /// `PopRSBHint` still branches to the cached block checking neither -- a
-    /// `RET` loop is unstoppable under `0xFFFF` (MEASURED on M1,
-    /// `tests/hostile.rs`, `return-ring`). `0x0000_FFF9` until 0018 is ported.
+    /// halt checks. On arm64 the return-stack buffer's handler checks both since
+    /// patch 0020 (`0x0000_FFF9` before: a `RET` loop was MEASURED unstoppable
+    /// under `0xFFFF` on M1, `return-ring`). [`FAST_DISPATCH`] stays clear: the
+    /// arm64 backend does not implement it (its `FastDispatchHint` is a
+    /// dispatcher return), so the flag buys nothing there, and a re-pin that
+    /// implements it must not turn an unchecked handler on unseen (D35).
     #[cfg(target_arch = "aarch64")]
-    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH & !RETURN_STACK_BUFFER;
+    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;
     /// dynarmic's `Unsafe_IgnoreGlobalMonitor`: exclusive loads and stores no longer take the
     /// monitor's process-wide spin lock, and an exclusive store no longer clears every other
     /// processor's matching reservation. What remains is a per-processor reservation (address and
@@ -416,11 +421,12 @@ pub struct OdEffectiveConfig {
 /// whatever the code cache size and whatever the guest does -- and nothing when it is not.
 ///
 /// `A64EmitX64`'s fast-dispatch table is `sizeof(FastDispatchEntry) == 0x10` times
-/// `fast_dispatch_table_size == 0x100000`: a flat **16 MiB**, written in full on construction (the
-/// entries carry a non-zero initialiser). Upstream holds it by value, so every jit paid it whether
-/// or not the optimization was on; **patch 0017** (`patches/`, D32) allocates it only when it is,
-/// and Omnidroid runs with it off (D16). MEASURED on the landing, 45 guest threads: 704 MiB of
-/// commit and working set, gone.
+/// `fast_dispatch_table_size`, written in full on construction (the entries carry a non-zero
+/// initialiser). Upstream's is 0x100000 entries, a flat **16 MiB**, held by value, so every jit
+/// paid it whether or not the optimization was on; **patch 0017** (`patches/`, D32) allocates it
+/// only when it is (MEASURED on the landing, 45 guest threads: 704 MiB of commit and working set,
+/// gone), and **patch 0019** (D35) shrinks it to 0x1000 entries, **64 KiB**, because
+/// `optimization::INTERRUPTIBLE` now turns the optimization on in every guest thread.
 ///
 /// It is a constant rather than a call because it is a property of the *pin*, not of a live jit:
 /// there is no accessor for it and adding one would mean patching the vendored tree. What keeps it
@@ -440,7 +446,7 @@ pub struct OdEffectiveConfig {
 /// one measurement, `omni-cpu`'s M2 gate): 8.010 MiB of `phys_footprint` per jit at creation with an
 /// 8 MiB code cache. `tests/pin_constants.rs` checks both halves against the vendored source.
 #[cfg(target_arch = "x86_64")]
-pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x10_0000;
+pub const OD_FIXED_PER_JIT_BYTES: usize = 0x10 * 0x1000;
 
 /// See the `x86_64` definition: the arm64 backend holds no fixed-size per-jit table.
 #[cfg(target_arch = "aarch64")]
