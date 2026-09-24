@@ -273,6 +273,10 @@ pub struct Renderer {
     /// Set when something observed that the swapchain no longer matches the surface -- a resize
     /// event, or a `VK_SUBOPTIMAL_KHR` from acquire or present.
     swapchain_dirty: bool,
+    /// Whether a zero-pixel [`notify_resized`](Renderer::notify_resized) means *no swapchain*
+    /// even when the surface states an extent of its own, as [`zero_size_is_the_windows`] decides
+    /// for this window's system.
+    zero_size_is_the_windows: bool,
 
     frames_presented: u64,
     swapchain_generations: u64,
@@ -402,6 +406,7 @@ impl Renderer {
             present_mode: select::present_mode(config.present_mode, &modes),
             target_extent: extent,
             swapchain_dirty: false,
+            zero_size_is_the_windows: zero_size_is_the_windows(window),
             frames_presented: 0,
             swapchain_generations: 0,
             dev,
@@ -839,12 +844,8 @@ impl Renderer {
             return Err(GfxError::SurfaceCannotBeTransferDestination);
         }
 
-        // **The window's own zero is authoritative.** The seam reports a minimised window as
-        // `Resized { 0, 0 }`, and on Win32 the surface agrees (`currentExtent` 0x0). MoltenVK does
-        // not: MEASURED on this project's macOS host, a miniaturised window's surface kept
-        // reporting its 640x480 `currentExtent`, and the renderer went on presenting to a window
-        // with no pixels on screen. Where both say zero this changes nothing.
-        let minimised = self.target_extent.0 == 0 || self.target_extent.1 == 0;
+        let minimised = self.zero_size_is_the_windows
+            && (self.target_extent.0 == 0 || self.target_extent.1 == 0);
         let extent = if minimised {
             vk::Extent2D { width: 0, height: 0 }
         } else {
@@ -1160,6 +1161,12 @@ fn platform_surface(window: RawWindow) -> GfxResult<(&'static CStr, &'static str
             "the Vulkan loader found a driver, but not one that can present to a CAMetalLayer \
              (MoltenVK provides it)",
         )),
+        RawWindow::Xlib { .. } => Ok((
+            khr::xlib_surface::NAME,
+            "VK_KHR_xlib_surface",
+            "the Vulkan loader found a driver, but not one that can present to an X11 window \
+             through Xlib",
+        )),
         other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
     }
 }
@@ -1288,11 +1295,39 @@ fn create_surface(
             unsafe { metal.create_metal_surface(&info, None) }
                 .map_err(GfxError::vk("create", "vkCreateMetalSurfaceEXT"))
         }
+        RawWindow::Xlib { display, window } => {
+            let info = vk::XlibSurfaceCreateInfoKHR::default()
+                .dpy(display as *mut vk::Display)
+                .window(window as vk::Window);
+            let xlib = khr::xlib_surface::Instance::new(entry, instance);
+            // SAFETY: `display` and `window` came from a live `omni_platform::window::Window`,
+            // whose documentation requires it to outlive any surface made from it, and the
+            // instance was created with `VK_KHR_xlib_surface` by `platform_extension`'s same arm.
+            unsafe { xlib.create_xlib_surface(&info, None) }
+                .map_err(GfxError::vk("create", "vkCreateXlibSurfaceKHR"))
+        }
         // `RawWindow` is `#[non_exhaustive]`, so a Wayland or AppKit variant added to the seam
         // later lands here and refuses **naming itself**, rather than turning this `match` into
         // one that silently stopped being exhaustive.
         other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
     }
+}
+
+/// Whether, on `window`'s system, the window's own zero-pixel size is the only sign that it has
+/// no pixels -- so that the renderer must hold no swapchain even though the surface still states
+/// an extent.
+///
+/// **Win32: no**, and nothing changes there: a minimised window's surface reports a
+/// `currentExtent` of 0x0 itself, which [`select::clamp_extent`] already returns. **Xlib: yes**,
+/// MEASURED: an iconified X window keeps its geometry -- the server has no notion of minimised,
+/// only the window manager's `WM_STATE` does (see `omni_platform`'s Linux backend) -- and Mesa's
+/// X11 surface reports that geometry as `currentExtent` (640x480 for a 640x480 window iconified
+/// under xfwm4, with lavapipe). Without this the renderer went on presenting to an unmapped window,
+/// 14,863 frames in the ten seconds `renderer_live`'s minimise test waited. **AppKit: yes**,
+/// MEASURED on this project's macOS host: MoltenVK kept reporting a miniaturised window's 640x480
+/// `currentExtent`, and the renderer went on presenting to a window with no pixels on screen.
+const fn zero_size_is_the_windows(window: RawWindow) -> bool {
+    matches!(window, RawWindow::Xlib { .. } | RawWindow::AppKit { .. })
 }
 
 /// The [`claim::WindowKey`] for a window, or a refusal naming the system it belongs to.
@@ -1307,6 +1342,7 @@ fn window_key(window: RawWindow) -> GfxResult<claim::WindowKey> {
     match window {
         RawWindow::Win32 { hwnd, .. } => Ok(claim::WindowKey::win32(hwnd)),
         RawWindow::AppKit { ns_view, .. } => Ok(claim::WindowKey::appkit(ns_view)),
+        RawWindow::Xlib { window, .. } => Ok(claim::WindowKey::xlib(window)),
         other => Err(GfxError::UnsupportedWindowSystem { system: other.system_name() }),
     }
 }

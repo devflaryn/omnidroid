@@ -224,8 +224,8 @@ impl DemandPager {
     ///
     /// # Errors
     ///
-    /// [`FaultError::Unsupported`] on a target with no vectored-handler implementation (Linux,
-    /// macOS), [`FaultError::HandlerTableFull`], or [`FaultError::Os`].
+    /// [`FaultError::Unsupported`] on a target with no fault-handler implementation (macOS),
+    /// [`FaultError::HandlerTableFull`], or [`FaultError::Os`] / [`FaultError::Signal`].
     pub fn install(space: Arc<GuestSpace>) -> Result<Self, FaultError> {
         let inner = Box::new(PagerInner {
             base: space.base(),
@@ -263,6 +263,23 @@ impl DemandPager {
         //   bounded per *address*, which two addresses in one granule defeated.
         let registration = unsafe { fault::install(handle_fault, context)? };
         Ok(Self { registration, inner })
+    }
+
+    /// Make sure this process's guest-fault handler still runs **before** any fault handler that
+    /// was installed after the pager was.
+    ///
+    /// A no-op where first place is structural (Windows: a vectored handler precedes every
+    /// frame-based one). On Linux a signal has one disposition and the last installer wins, and
+    /// dynarmic installs its own `SIGSEGV` handler when the first jit is built -- after the pager,
+    /// in front of it -- so the CPU backend calls this after building a jit. See
+    /// [`omni_platform::fault::reassert_precedence`].
+    ///
+    /// # Errors
+    ///
+    /// What `reassert_precedence` refuses with: the disposition could not be read or set, or
+    /// something keeps displacing it.
+    pub fn reassert_precedence() -> Result<(), FaultError> {
+        fault::reassert_precedence()
     }
 
     /// What this pager has done. See [`PagerStats`].

@@ -51,6 +51,7 @@ pub mod abi;
 pub mod bionic;
 pub mod boundary;
 pub mod error;
+pub mod gles;
 pub mod jni;
 pub mod mem;
 pub mod ndk;

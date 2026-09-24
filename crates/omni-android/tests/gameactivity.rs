@@ -52,6 +52,7 @@ use omni_android::ndk::{
     DeviceConfiguration, HostWindowSource, Ndk, ScreenSize, WindowGeometry, WindowSource,
     ACONFIGURATION_NAVHIDDEN_NO, SURFACE_CLASS,
 };
+use omni_android::gles::{Gles, GlesHost};
 use omni_android::vulkan::{Vulkan, VulkanHost};
 use omni_android::{Boundary, BoundaryBuilder, GuestArg};
 use omni_cpu::dynarmic::{DynarmicBackend, DynarmicCpu, DynarmicOptions};
@@ -524,6 +525,9 @@ struct Guest {
     ndk: Arc<Ndk>,
     /// Bound only under [`GRAPHICS_GATE`]; see [`Guest::load`].
     vulkan: Option<Arc<Vulkan>>,
+    /// `libEGL.so`/`libGLESv2.so` over the host's EGL, bound with Vulkan: the engine's own fallback
+    /// when it refuses the Vulkan device (`omni_android::gles`).
+    gles: Option<Arc<Gles>>,
     /// `libaaudio.so` over the host's default output, bound with the window for the same reason.
     audio: Option<Arc<AAudio>>,
     boundary: Arc<Boundary>,
@@ -678,7 +682,9 @@ impl Guest {
         let with_audio = graphics.is_some();
         let (vulkan_slots, data_bytes) = if graphics.is_some() {
             (
-                omni_android::vulkan::BOUND_SYMBOLS + omni_android::aaudio::BOUND_SYMBOLS,
+                omni_android::vulkan::BOUND_SYMBOLS
+                    + omni_android::aaudio::BOUND_SYMBOLS
+                    + omni_android::gles::bound_symbol_count(),
                 omni_android::vulkan::REQUIRED_DATA_BYTES + omni_android::aaudio::REQUIRED_DATA_BYTES,
             )
         } else {
@@ -697,6 +703,14 @@ impl Guest {
             vulkan.bind_into(&builder).expect("bind the Vulkan loader");
             vulkan.set_host(host);
             vulkan
+        });
+        // **And EGL/GLES over the host's EGL, with the window** -- chosen by the window's system when
+        // the engine's first EGL call reaches the host.
+        let gles = with_audio.then(|| {
+            let gles = Gles::new(Arc::clone(&space));
+            gles.bind_into(&builder).expect("bind libEGL.so and libGLESv2.so");
+            gles.set_host(omni_gfx::GfxGlesHost::new() as Arc<dyn GlesHost>);
+            gles
         });
         let audio = with_audio.then(|| {
             let audio = AAudio::new(Arc::new(PlatformOutput));
@@ -780,6 +794,9 @@ impl Guest {
         // guest thread it spawned, not on the one the gate calls from.
         if let Some(vulkan) = &vulkan {
             thread_host = thread_host.with_instance(vulkan.thread_instance());
+        }
+        if let Some(gles) = &gles {
+            thread_host = thread_host.with_instance(gles.thread_instance());
         }
         // **And AAudio**: FMOD opens its output on the engine's game thread, and the data callback
         // runs on a thread the library itself starts.
@@ -881,6 +898,7 @@ impl Guest {
             jni,
             ndk,
             vulkan,
+            gles,
             audio,
             boundary,
             object,
@@ -1410,8 +1428,28 @@ impl Scratch {
         let apk_at = at.join(GUEST_APK.trim_start_matches('/'));
         // A kept root already has one, possibly of an older APK: replace it.
         let _ = std::fs::remove_file(&apk_at);
-        std::fs::hard_link(apk_path(), &apk_at)
-            .expect("the real APK linked into the guest's root at its device path");
+        match std::fs::hard_link(apk_path(), &apk_at) {
+            Ok(()) => {}
+            // A root on another filesystem than the checkout cannot hold a hard link: on Ubuntu
+            // (26.04 measured) `std::env::temp_dir()` is `/tmp`, a tmpfs, while the APK is on the
+            // checkout's disk -- `EXDEV`, os error 18. The bytes are copied instead, and said, since
+            // on a tmpfs that copy is ~160 MB of RAM; OMNI_DATA_DIR or TMPDIR on the checkout's
+            // filesystem avoids it.
+            Err(error) if cfg!(unix) && error.kind() == std::io::ErrorKind::CrossesDevices => {
+                let copied = std::fs::copy(apk_path(), &apk_at)
+                    .expect("the real APK copied into the guest's root at its device path");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "APK: {} is on another filesystem than the checkout ({error}); COPIED {copied} \
+                     bytes rather than hard-linked -- set OMNI_DATA_DIR or TMPDIR on the checkout's \
+                     filesystem to avoid the copy",
+                    at.display()
+                );
+            }
+            Err(error) => {
+                panic!("the real APK linked into the guest's root at its device path: {error:?}")
+            }
+        }
         // The certificate authorities, out of the APK and into the path the engine opens. See
         // `CA_BUNDLE_IN_APK` for why this is the host's job and why the bytes are the APK's own.
         let apk = omni_apk::Apk::open(apk_path()).expect("the real APK");
@@ -3129,6 +3167,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             .as_ref()
             .and_then(|vulkan| vulkan.call_counts().get("vkQueuePresentKHR").copied())
             .unwrap_or(0)
+            // And every eglSwapBuffers the host answered EGL_TRUE, when the engine fell back to GLES.
+            + guest.gles.as_ref().map_or(0, |gles| gles.presents())
     };
     let mut next_frames = std::time::Instant::now() + FRAMES_EVERY;
     let mut last_presents = presents();
@@ -3945,6 +3985,15 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         None => {
             let _ = writeln!(std::io::stderr(), "VULKAN: not bound ({GRAPHICS_GATE} unset)");
+        }
+    }
+    // **And the EGL/GLES census**, the same way.
+    match &guest.gles {
+        Some(gles) => {
+            let _ = writeln!(std::io::stderr(), "{}", gles.report());
+        }
+        None => {
+            let _ = writeln!(std::io::stderr(), "GLES: not bound ({GRAPHICS_GATE} unset)");
         }
     }
     // **And what FMOD asked `libaaudio.so` for**, the same way.

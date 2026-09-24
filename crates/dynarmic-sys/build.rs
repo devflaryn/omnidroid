@@ -240,7 +240,8 @@ fn find_compiler() -> cc::Tool {
 /// The C compiler CMake is given. `cl.exe` compiles both languages, so on MSVC it is the C++
 /// compiler's own path, exactly as before. Anywhere else the C++ driver (`c++`, `clang++`) is
 /// refused as a C compiler by CMake's own check (`CMAKE_C_COMPILER is set to a C++ compiler`,
-/// measured on macOS with Apple clang 16), so the matching C driver is asked of `cc` instead.
+/// measured on macOS with Apple clang 16; on Linux `g++` fails CMake's C compiler check the same
+/// way), so the matching C driver is asked of `cc` instead, and `CC` keeps working as `CXX` does.
 fn c_compiler_for(cxx: &cc::Tool) -> PathBuf {
     if cxx.is_like_msvc() {
         return cxx.path().to_path_buf();

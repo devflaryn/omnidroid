@@ -93,16 +93,25 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-// Linux's structural body. macOS has its own backend (Core Audio) and does not compile this one.
-#[cfg(all(unix, not(target_os = "macos")))]
+// A unix that is neither macOS (Core Audio) nor Linux (ALSA): the structural body.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 mod unix;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 use unix as backend;
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as backend;
+/// How often the Linux backend has recovered the stream rather than failed. See
+/// [`AudioOutput::recoveries`].
+#[cfg(target_os = "linux")]
+pub use linux::Recoveries;
 
 /// The shape of the samples an output takes: always interleaved `f32`.
 ///
@@ -265,6 +274,17 @@ impl AudioOutput {
     /// [`AudioError::Os`] if the host refused.
     pub fn stop(&mut self) -> AudioResult<()> {
         self.inner.stop()
+    }
+
+    /// **Linux only**: how many underruns (`-EPIPE`) and suspends (`-ESTRPIPE`) ALSA reported and
+    /// the backend recovered from, since `open`. Recovered rather than returned, so that a
+    /// stream keeps playing as it does on Windows -- and counted, so that recovering is never the
+    /// same as hiding. WASAPI's shared mode has no equivalent count, which is why this is not
+    /// part of the portable surface.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn recoveries(&self) -> Recoveries {
+        self.inner.recoveries()
     }
 }
 

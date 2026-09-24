@@ -61,6 +61,7 @@
 
 pub mod claim;
 pub mod error;
+pub mod gles;
 pub mod host;
 pub mod image;
 mod portability;
@@ -69,6 +70,7 @@ pub mod vulkan;
 
 pub use crate::claim::{claim_window, WindowClaim, WindowClaimed, WindowKey};
 pub use crate::error::{GfxError, GfxResult, VkError};
+pub use crate::gles::GfxGlesHost;
 pub use crate::host::{GfxVulkanHost, PresentedImage};
 pub use crate::image::Rgba8Image;
 pub use crate::select::PresentMode;

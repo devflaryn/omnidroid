@@ -152,7 +152,7 @@ fn a_bad_arena_configuration_is_rejected() {
 
 /// On a platform whose `omni-platform` backend is structural, creating a guest address space must
 /// fail with a typed error that says so.
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 #[test]
 fn an_unimplemented_backend_fails_honestly_rather_than_appearing_to_work() {
     let error = GuestSpace::new().expect_err("a structural backend cannot reserve anything");

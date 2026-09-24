@@ -59,3 +59,9 @@ thiserror = { workspace = true }
 # ABI. The constraint's purpose is that the five-target build stays `cfg`-free, and `ash` is
 # `cfg`-free at every call site here.
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
+
+# The host's EGL and GLES, loaded at **run time** by `src/gles.rs` -- the same crate, version and
+# Global Constraint 4 exception `ash`'s `loaded` feature already brings in (see above), named
+# directly because GLES has no loader crate of its own: which libraries to open is chosen by the
+# guest window's `RawWindow` variant, not by a `cfg`.
+libloading = "0.8"

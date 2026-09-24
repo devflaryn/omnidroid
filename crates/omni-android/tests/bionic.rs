@@ -12140,6 +12140,9 @@ fn a_shared_writable_file_mapping_writes_the_file_it_maps() {
         });
         assert!(refusal.to_string().contains("1224"), "{refusal}");
     } else {
+        // A unix host has no such limit -- Linux and macOS, like the device, truncate a file
+        // a shared mapping still holds. Setting the length it already has is answered 0 and
+        // leaves the mapping and the file intact for the rest of the test.
         assert_eq!(call_with_errno(&f, "ftruncate", &[other as u64, n]), (0, 0));
     }
     assert_eq!(call_with_errno(&f, "close", &[other as u64]), (0, 0));

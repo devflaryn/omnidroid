@@ -294,6 +294,17 @@ pub(super) fn setpriority(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     }
     let nice = prio.clamp(-20, 19);
     if let Err(error) = omni_platform::process::set_current_thread_nice(nice) {
+        // A host that withholds the privilege (a Linux user with `RLIMIT_NICE` 0 and no
+        // `CAP_SYS_NICE`, asked for a negative nice) answers `EACCES`, which is what a kernel
+        // under that limit answers a device's app too: the guest gets it as its own `errno`, and
+        // the thread lives. Anything else the host says is still a refusal by name.
+        if error.is_permission_denied() {
+            let mut view = enter(c, &state);
+            view.set_errno(omni_bionic::errno::consts::EACCES);
+            drop(view);
+            c.ret().i32(-1);
+            return Ok(());
+        }
         return Err(refuse(c, format!("the host did not apply nice {nice} to this thread: {error}")));
     }
     c.ret().i32(0);

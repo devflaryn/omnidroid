@@ -1,10 +1,11 @@
-//! Unix backend for the audio seam, shared by Linux and macOS.
+//! Unix backend for the audio seam: every unix target except Linux, which has its own ALSA
+//! backend in `linux.rs` (so this module is not compiled there).
 //!
 //! # Status: structural, not implemented
 //!
 //! **Nothing in this module has ever been run.** [`AudioOutput::open`] returns
-//! [`AudioError::Unsupported`] naming the platform API it intends to reach for, so a Linux or macOS
-//! build fails at the first stream rather than appearing to play.
+//! [`AudioError::Unsupported`] naming the platform API it intends to reach for, so a macOS build
+//! fails at the first stream rather than appearing to play.
 //!
 //! `AudioOutput` here is an **uninhabited** type, for the reason
 //! [`window::unix`](crate::window) gives at length: `open` is the only way to get one and it
@@ -13,7 +14,8 @@
 //!
 //! # What implementing this involves
 //!
-//! * **Linux** has more than one candidate API and the choice is a runtime one. PipeWire, the
+//! * **Linux** is implemented, in `linux.rs`, on ALSA; this paragraph is the reasoning it started
+//!   from. Linux has more than one candidate API and the choice is a runtime one. PipeWire, the
 //!   sound server on most current desktops, also serves PulseAudio's protocol, so PulseAudio's
 //!   asynchronous `pa_stream` API — the one with a "how much can I write" question,
 //!   `pa_stream_writable_size`, and so the one that fits this seam's

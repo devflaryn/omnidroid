@@ -52,13 +52,13 @@ pub(super) fn current_cpu() -> ProcessResult<u32> {
         return Err(ProcessError::Errno {
             operation: "current_cpu",
             api: "pthread_cpu_number_np",
-            code,
+            errno: code,
         });
     }
     u32::try_from(cpu).map_err(|_| ProcessError::Errno {
         operation: "current_cpu",
         api: "pthread_cpu_number_np",
-        code: libc::EOVERFLOW,
+        errno: libc::EOVERFLOW,
     })
 }
 
@@ -92,7 +92,7 @@ pub(super) fn set_current_thread_nice(nice: i32) -> ProcessResult<()> {
         return Err(ProcessError::Errno {
             operation: "set_current_thread_nice",
             api: "pthread_set_qos_class_self_np",
-            code,
+            errno: code,
         });
     }
     Ok(())
@@ -148,7 +148,7 @@ pub(super) fn host_manufacturer() -> ProcessResult<String> {
     let failed = |api: &'static str| ProcessError::Errno {
         operation: "host_manufacturer",
         api,
-        code: libc::ENOENT,
+        errno: libc::ENOENT,
     };
     // SAFETY: the name is a NUL-terminated literal; IOServiceMatching returns a +1 dictionary that
     // IOServiceGetMatchingService consumes.
@@ -210,7 +210,7 @@ pub(super) fn cpu_time() -> ProcessResult<Duration> {
         return Err(ProcessError::Errno {
             operation: "cpu_time",
             api: "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)",
-            code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
         });
     }
     Ok(Duration::new(now.tv_sec as u64, now.tv_nsec as u32))
