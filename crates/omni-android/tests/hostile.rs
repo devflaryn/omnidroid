@@ -162,6 +162,10 @@ fn a_string_the_guest_never_terminated_is_refused_at_the_end_of_its_region() {
 
 /// **The guest lies about a length.** A pointer to eight valid bytes with a claimed length of 64 KiB:
 /// the range must be refused *whole*, not truncated to what fits.
+///
+/// The eight bytes are the last of a readable mapping with **free space** after it, found in the
+/// region map: running on into an *adjacent* mapping is admitted, as Linux admits it
+/// (`omni_mem::admit`, 8e0dc34), and the harness places its mappings `Anywhere`.
 #[test]
 fn a_length_the_guest_lied_about_is_refused_whole() {
     let _guard = serialized();
@@ -170,7 +174,17 @@ fn a_length_the_guest_lied_about_is_refused_whole() {
     let thunk = builder.bind_inline("memcpy", copy).expect("bind");
     let boundary = builder.finish();
 
-    let src = guest.data + harness::DATA_BYTES - 8;
+    let src = guest
+        .space
+        .regions()
+        .windows(2)
+        .find(|pair| {
+            !pair[0].is_free()
+                && pair[0].protection != omni_mem::Protection::None
+                && pair[1].is_free()
+        })
+        .map(|pair| pair[0].end() - 8)
+        .expect("a readable mapping with free space after it");
     let dst = guest.data;
     let error = call_with(&guest, &boundary, thunk, &[dst as u64, src as u64, 65536])
         .expect_err("a length running off the end of the mapping must be refused");

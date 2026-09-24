@@ -385,17 +385,29 @@ mod tests {
     }
 
     /// The length is the guest's claim, and a read that starts inside a mapping and runs off its end
-    /// must be refused whole rather than truncated to what fits.
+    /// **into free space** must be refused whole rather than truncated to what fits.
+    ///
+    /// Into free space, because running into an *adjacent mapping* is admitted, as Linux admits it
+    /// (`omni_mem::admit`, 8e0dc34) -- and the fixture's two pages are placed `Anywhere`, so they
+    /// may well be adjacent. The edge is found in the region map rather than assumed.
     #[test]
     fn a_length_that_runs_off_the_end_of_the_mapping_is_refused_not_clipped() {
         let f = fixture();
+        let edge = f
+            .mem
+            .space()
+            .regions()
+            .windows(2)
+            .find(|pair| !pair[0].is_free() && pair[1].is_free())
+            .map(|pair| pair[0].end())
+            .expect("a mapping with free space after it");
         let error = f
             .mem
-            .read_bytes(f.rw + f.len - 8, 16, blame())
+            .read_bytes(edge - 8, 16, blame())
             .expect_err("a read straddling the end of the mapping must be refused");
         assert!(matches!(error, AbiError::BadPointer { len: 16, .. }), "{error:?}");
         // And the eight that do fit still work, so the refusal is about the range and not the page.
-        assert_eq!(f.mem.read_bytes(f.rw + f.len - 8, 8, blame()).expect("read").len(), 8);
+        assert_eq!(f.mem.read_bytes(edge - 8, 8, blame()).expect("read").len(), 8);
     }
 
     /// A guest that hands its own `.rodata` over as an output buffer gets a typed refusal, and the
