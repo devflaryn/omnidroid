@@ -672,11 +672,20 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
 /// `int madvise(void *addr, size_t length, int advice)`
 ///
-/// **`MADV_FREE` and `MADV_DONTNEED` differ in *when*, and that is the whole content of this
-/// handler.** `MADV_FREE` says the kernel may drop the pages and that a later read sees either
-/// the old contents or zeroes, which is [`advise_idle`](omni_mem::GuestSpace::advise_idle) alone.
-/// `MADV_DONTNEED` is stronger: on private anonymous memory a later read is *guaranteed* to be
-/// zero, immediately.
+/// **`MADV_FREE` is carried out at once, exactly as `MADV_DONTNEED` is.** `MADV_DONTNEED`
+/// guarantees that a later read of private anonymous memory is zero, immediately. `MADV_FREE`
+/// lets the kernel drop the pages **until the guest writes to them again**: a page written after
+/// the call is never freed (Linux `mm/madvise.c`: the lazy-free mark is lost when the page is
+/// dirtied). Dropping them at once is one of the outcomes that contract allows -- the kernel may
+/// free them the moment the call returns -- and it is the only one this layer can carry out
+/// correctly without watching every write.
+///
+/// **It used to be [`advise_idle`](omni_mem::GuestSpace::advise_idle) alone, and that was a heap
+/// corruption.** The idle mark was never cleared by a later write, and every later
+/// `MADV_DONTNEED` -- from any thread, over any range -- runs the space-wide
+/// [`reclaim_idle`](omni_mem::GuestSpace::reclaim_idle), which then decommitted memory the guest
+/// had since reused: an allocator frees with `MADV_FREE` and reuses the same pages simply by
+/// writing to them. Found reading a MemoryFault on an OpenSSL heap object in PS99 (2026-09-24).
 ///
 /// # `MADV_DONTNEED` was refused and is now carried out — and the earlier reasoning was wrong
 ///
@@ -696,10 +705,9 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 ///
 /// # Two things a reader needs to know
 ///
-/// * **`reclaim_idle` is space-wide.** It decommits every granule any earlier `MADV_FREE` marked,
-///   not only this call's range. `MADV_FREE`'s contract permits the pages to be dropped at any
-///   time, so that is correct; what it costs is that one `MADV_DONTNEED` makes every outstanding
-///   `MADV_FREE` take effect at once.
+/// * **`reclaim_idle` is space-wide**, so this handler never leaves a range marked idle past its
+///   own return: a mark left behind would be decommitted by the next call, whatever the guest had
+///   written there in between.
 /// * **A partial range is refused rather than half-done.** `advise_idle` reports how many bytes
 ///   it marked, and an entry it could not split stays in use. Returning `0` after marking less
 ///   than the whole range would promise zeroes this layer had not delivered, which is precisely
@@ -729,7 +737,8 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         ));
     }
 
-    if advice == MADV_DONTNEED {
+    if advice == MADV_DONTNEED || advice == MADV_FREE {
+        let name = if advice == MADV_FREE { "MADV_FREE" } else { "MADV_DONTNEED" };
         let Some(len) = pages(length, page).filter(|&n| n != 0 && at % page == 0) else {
             let mut view = call.view();
             fail(&mut view, consts::EINVAL);
@@ -780,24 +789,6 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             c.invalidate_code(at, len)?;
         }
         c.ret(|mut r| r.i32(0));
-        return Ok(());
-    }
-
-    if advice == MADV_FREE {
-        let Some(len) = pages(length, page).filter(|&n| n != 0 && at % page == 0) else {
-            let mut view = call.view();
-            fail(&mut view, consts::EINVAL);
-            c.ret(|mut r| r.i32(-1));
-            return Ok(());
-        };
-        match space.advise_idle(at, len) {
-            Ok(_) => c.ret(|mut r| r.i32(0)),
-            Err(error) => {
-                let mut view = call.view();
-                fail(&mut view, errno_for(&error));
-                c.ret(|mut r| r.i32(-1));
-            }
-        }
         return Ok(());
     }
 

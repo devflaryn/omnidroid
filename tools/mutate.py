@@ -4410,6 +4410,19 @@ directory", ADAPTER_FILES,
         if let Err(error) = space.reclaim_idle() {""",
      ANDROID),
 
+    # `MADV_FREE` back to a mark alone: the range stays idle past the call, so the next
+    # `MADV_DONTNEED` anywhere decommits what the guest wrote there since -- the heap corruption
+    # found under an OpenSSL MemoryFault in PS99 (2026-09-24).
+    ("madvfree-A1", "A", "MADV_FREE leaves its range marked idle for a later reclaim to wipe",
+     ADAPTER_GUESTMEM,
+     """        if let Err(error) = space.reclaim_idle() {""",
+     """        if advice == MADV_FREE {
+            c.ret(|mut r| r.i32(0));
+            return Ok(());
+        }
+        if let Err(error) = space.reclaim_idle() {""",
+     ANDROID),
+
     # ---- B: the over-corrections -----------------------------------------------------------
 
     # Every JNI slot on the exit path. It reads as safer -- a handler that *may* call guest code

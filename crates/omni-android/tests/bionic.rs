@@ -4127,6 +4127,61 @@ fn map_fixed_noreplace_is_honoured_and_refuses_an_occupied_address() {
     assert_eq!(misaligned, u64::MAX);
 }
 
+/// **A page written after `MADV_FREE` keeps what was written**, whatever `madvise` runs later.
+///
+/// Linux drops a lazily-freed page only while it is clean: the guest's next write cancels the
+/// free. This layer used to mark the range idle and leave the mark in place, so the next
+/// `MADV_DONTNEED` anywhere -- which reclaims every idle range in the space -- decommitted memory
+/// an allocator had freed with `MADV_FREE` and then reused by writing to it. Found reading a
+/// MemoryFault on an OpenSSL heap object in PS99 (2026-09-24).
+#[test]
+fn a_write_after_madv_free_survives_a_later_madv_dontneed_elsewhere() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    let freed = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    let other = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(freed, u64::MAX);
+    assert_ne!(other, u64::MAX);
+    let store = |at: u64, value: u64| {
+        let entry = program(&f, |asm| {
+            asm.mov(9, at);
+            asm.mov(10, value);
+            asm.push(str_imm(10, 9, 0));
+        });
+        run_program(&f, entry).expect("writable");
+    };
+    let load = |at: u64| -> u64 {
+        let entry = program(&f, |asm| {
+            asm.mov(9, at);
+            asm.push(ldr_imm(10, 9, 0));
+            asm.mov(11, f.guest.data as u64);
+            asm.push(str_imm(10, 11, 0));
+        });
+        run_program(&f, entry).expect("readable");
+        f.guest.read_u64(f.guest.data)
+    };
+    store(freed, 0x1111_1111_1111_1111);
+    store(other, 0x2222_2222_2222_2222);
+    let advise = |at: u64, advice: u64| {
+        value_of(&f, "madvise", |asm| {
+            asm.mov(0, at);
+            asm.mov(1, length);
+            asm.mov(2, advice);
+        }) as i64 as i32
+    };
+    assert_eq!(advise(freed, 8), 0, "MADV_FREE");
+    // The allocator reuses the page by writing to it -- no call in between.
+    store(freed, 0x3333_3333_3333_3333);
+    assert_eq!(advise(other, 4), 0, "MADV_DONTNEED over a different range");
+    assert_eq!(load(other), 0, "MADV_DONTNEED's own range reads zero");
+    assert_eq!(
+        load(freed),
+        0x3333_3333_3333_3333,
+        "the write after MADV_FREE must survive: Linux never frees a page dirtied after the call"
+    );
+}
+
 /// **The guarantee, asserted by reading the bytes back through guest code.**
 ///
 /// `MADV_FREE` promises "the old contents or zeroes", which `advise_idle` alone gives.
