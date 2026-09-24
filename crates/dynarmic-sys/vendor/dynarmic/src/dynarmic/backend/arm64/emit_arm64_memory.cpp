@@ -833,6 +833,9 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
     code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
 
     CodePtr fastmem_location;
+    // Omnidroid patch 0014: the store-release faults too. A page the host lets the load-acquire read
+    // but not the store write (read-only: a sealed relro page) faults *here*, not at the load.
+    CodePtr store_location;
     if constexpr (bitsize == 128) {
         const auto [Xval_lo, Xval_hi, Xld_lo, Xld_hi] = borrowed;
         borrow();
@@ -845,6 +848,7 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
         code.CMP(Xld_lo, Xscratch0);
         code.CCMP(Xld_hi, Xscratch1, 0, EQ);
         code.B(NE, cas_failed);
+        store_location = code.xptr<CodePtr>();
         code.STLXP(*Wstatus, Xval_lo, Xval_hi, Xscratch2);
         code.CBNZ(*Wstatus, retry);
         code.B(cas_done);
@@ -889,6 +893,7 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
             break;
         }
         code.B(NE, cas_failed);
+        store_location = code.xptr<CodePtr>();
         switch (bitsize) {
         case 8:
             code.STLXRB(*Wstatus, oaknut::WReg{Rvalue->index()}, Xscratch2);
@@ -935,7 +940,7 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
     code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
     EmitMonitorUnlock(code, ctx);
 
-    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, Wstatus = *Wstatus, fallback, end, fastmem_location, borrowed] {
+    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Rvalue = *Rvalue, Wstatus = *Wstatus, fallback, end, fastmem_location, store_location, borrowed] {
         // The patch location is the load-acquire of the compare-and-swap. For 128 bits the borrowed
         // registers are on the stack at that point and are given back first.
         const u64 fault_entry = mcl::bit_cast<u64>(code.xptr<void*>());
@@ -945,6 +950,17 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
         }
         ctx.ebi.fastmem_patch_info.emplace(
             fastmem_location - ctx.ebi.entry_point,
+            FastmemPatchInfo{
+                .marker = marker,
+                .fc = FakeCall{
+                    .call_pc = fault_entry,
+                },
+                .recompile = ctx.conf.recompile_on_fastmem_failure,
+            });
+        // Patch 0014: the store-release, with the same entry -- at it the lock is held and, for 128
+        // bits, the borrowed registers are on the stack, exactly as at the load-acquire.
+        ctx.ebi.fastmem_patch_info.emplace(
+            store_location - ctx.ebi.entry_point,
             FastmemPatchInfo{
                 .marker = marker,
                 .fc = FakeCall{

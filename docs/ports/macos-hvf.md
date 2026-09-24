@@ -323,6 +323,12 @@ initializer run above is the same fact at scale (+23.5 MiB against +99.8).
   (`repro_dynarmic_aborts_during_the_survey_at_libroblox_0x224822c`, `#[ignore]`d, aborts the
   binary), while that function **alone** is an ordinary typed `MemoryFault { address: 0x51 }` on
   both backends -- so what breaks is left behind by the functions before it.
+  **Fixed on `port-macos` (patch 0014, orchestrator):** delta debugging reduced it to two
+  functions -- `0x2247264` leaves a pointer into `.data.rel.ro`, `0x224822c` swaps through it with
+  the outlined `__aarch64_swp8_rel` -- and the store-release of patch 0007's inline store-exclusive
+  was not a fastmem patch location. With 0014 the function is a typed write fault and the dynarmic
+  survey runs all 245,117 functions without an abort (`omni-cpu/tests/exclusive_store_fault.rs`,
+  row `mac-cpu-E1`).
 * **Stage 2 maps only the attached guest space**, so a guest pointer to the Rust heap, a driver
   mapping or the code cache is a typed `MemoryFault` (`every_bad_access_is_a_typed_fault...` reads a
   real host heap pointer). D4 amendment 1's "identity fastmem does not confine the guest" does not
@@ -452,4 +458,4 @@ guest filesystem refuses symlinks, so the render thread died (MEASURED, first ga
   spinning for ever and hang the harness. The halt test itself (`a_runaway_guest_is_halted...`) runs.
 * **The boundary takes `crossings.lock()` on every exit-path crossing**, a process-wide lock that on
   this backend is on *every* import; contention across threads is unmeasured.
-* **dynarmic aborted the process on `libroblox.so + 0x224822c`** (4.7) -- for the CPU workstream.
+* ~~**dynarmic aborted the process on `libroblox.so + 0x224822c`**~~ (4.7) -- fixed by patch 0014.

@@ -248,6 +248,23 @@ written at that point; every block emitted later is invalidated on its own in `A
 2 MiB, and still to run translated code. The A32 twin (`a32_address_space.cpp`) has the same call;
 A32 is not built here.
 
+### 0014 — arm64: the store-exclusive is a fastmem patch location too
+
+`0014-arm64-the-store-exclusive-is-a-patch-location-too.patch`. **arm64 only**, a defect in 0007.
+0007's inline store-exclusive is a compare-and-swap -- a load-acquire exclusive, then a
+store-release exclusive -- and it registered only the **load** as a fastmem patch location. A page
+the host lets the load read but not the store write (read-only: the guest's sealed relro) faults at
+the store, at a host PC dynarmic has no record of, and its handler aborts the whole process
+("Segfault wasn't at a fastmem patch location!"). Found by the native-backend workstream's survey of
+all 245,117 `.eh_frame` functions of `libroblox.so` (docs/ports/macos-hvf.md 4.7), reduced here to
+two functions: `0x2247264` leaves a pointer into `.data.rel.ro` where `0x224822c` hands it to the
+outlined `__aarch64_swp8_rel` (`LDXR` at `0x2b9e87c`, `STLXR` at `0x2b9e880`). The store-release is now registered
+with the same fault entry as the load (the lock is held and, for 128 bits, the borrowed registers
+are on the stack at both). x64 is unaffected: its inline compare-and-swap is one `LOCK CMPXCHG`,
+which is its patch location. `tests/host_fault.rs` stores exclusively to the test binary's own
+read-only data (both widths); `omni-cpu`'s `exclusive_store_fault.rs` runs the two real functions;
+the full survey then runs all 245,117 functions on dynarmic without an abort (MEASURED once, 41 s).
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

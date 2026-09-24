@@ -1545,15 +1545,16 @@ impl DynarmicOver {
     }
 }
 
-/// **A reproduction, not a test: running it aborts the process.** The dynarmic survey that died
+/// **A reproduction of what patch 0014 fixed** (`tests/exclusive_store_fault.rs` is its test): before
+/// it, running this aborted the process. The dynarmic survey that died
 /// (docs/ports/macos-hvf.md 4.7), replayed exactly: every `.eh_frame` function in order on the
 /// translating backend's own harness, with the survey's arguments, a fresh context every 512 and the
 /// buffers refilled every 256, up to and including `libroblox.so + 0x224822c`. **Alone, that function
 /// is an ordinary typed fault on both backends** (MEASURED: `MemoryFault { address: 0x51, access:
-/// Read }`), so the abort depends on what the functions before it left behind -- in the jit or in
-/// guest memory. Kept `#[ignore]`d for the CPU workstream.
+/// Read }`), so the abort depended on what the functions before it left behind: in guest memory, a
+/// pointer into `.data.rel.ro` that `0x224822c` swaps through (patch 0014's README entry).
 #[test]
-#[ignore = "aborts the whole test process on dynarmic: the finding in docs/ports/macos-hvf.md 4.7"]
+#[ignore = "replays 24,647 functions; aborted the process before dynarmic patch 0014 (docs/ports/macos-hvf.md 4.7)"]
 fn repro_dynarmic_aborts_during_the_survey_at_libroblox_0x224822c() {
     let _serial = serialized();
     const LAST: u64 = 0x224_822c;
