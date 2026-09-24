@@ -804,6 +804,7 @@ impl Filesystem {
     /// cannot exist, and every call would report `ENOENT` — a plausible answer that says nothing
     /// about the real mistake.
     pub fn new(root: impl AsRef<Path>) -> FsResult<Filesystem> {
+        crate::process::raise_descriptor_limit();
         let given = root.as_ref();
         let canonical = std::fs::canonicalize(given).map_err(|error| {
             FsError::refused(

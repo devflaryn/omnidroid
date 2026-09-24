@@ -708,6 +708,7 @@ impl Socket {
     /// [`NetError::Unsupported`] on Linux and macOS, naming `socket(2)`, and [`NetError::Io`] when
     /// the host refuses.
     pub fn new(kind: SocketKind, family: IpFamily, policy: Arc<NetPolicy>) -> NetResult<Socket> {
+        crate::process::raise_descriptor_limit();
         let inner = match kind {
             SocketKind::Stream => Inner::Tcp(backend::create_stream(family)?),
             SocketKind::Datagram => Inner::Udp(backend::create_datagram(family)?),

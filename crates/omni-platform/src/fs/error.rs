@@ -127,6 +127,18 @@ impl FsErrorKind {
     #[must_use]
     pub fn classify(error: &std::io::Error) -> FsErrorKind {
         use std::io::ErrorKind as K;
+        // The host's own descriptor ceiling has no stable `ErrorKind`, so it is named by its code:
+        // `EMFILE`/`ENFILE` on unix, `ERROR_TOO_MANY_OPEN_FILES` on Windows. Either way the guest's
+        // answer is `EMFILE`, as it is for this crate's own ceiling, not an unclassified error.
+        #[cfg(unix)]
+        let host_ceiling = [libc::EMFILE, libc::ENFILE];
+        #[cfg(windows)]
+        let host_ceiling = [4];
+        #[cfg(not(any(unix, windows)))]
+        let host_ceiling: [i32; 0] = [];
+        if error.raw_os_error().is_some_and(|code| host_ceiling.contains(&code)) {
+            return FsErrorKind::TooManyOpenFiles;
+        }
         match error.kind() {
             K::NotFound => FsErrorKind::NotFound,
             K::PermissionDenied => FsErrorKind::PermissionDenied,

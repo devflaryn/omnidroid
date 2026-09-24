@@ -27,6 +27,10 @@ pub enum RegionKind {
         /// Whether the mapping writes the file (`MAP_SHARED`): the `s` rather than the `p` in the
         /// permission column.
         shared: bool,
+        /// Whether `name` is a guest path rather than a host one: see
+        /// [`Backing::is_guest_named`](crate::Backing::is_guest_named). A host path must never
+        /// reach the guest, and on a unix host its shape does not tell the two apart.
+        guest_named: bool,
     },
 }
 
@@ -104,6 +108,7 @@ impl RegionInfo {
                         name: Arc::clone(backing.name()),
                         file_offset: owner.offset_at(start),
                         shared: backing.is_shared(),
+                        guest_named: backing.is_guest_named(),
                     },
                     (None, _) => RegionKind::Anonymous,
                 };

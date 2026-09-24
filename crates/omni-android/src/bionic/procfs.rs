@@ -183,8 +183,10 @@ fn generate_maps(source: &MapsSource) -> FsResult<Vec<u8>> {
             [r, w, x, if shared { b's' } else { b'p' }]
         };
         match &region.kind {
-            RegionKind::File { name, file_offset, shared, .. } => {
-                if !name.starts_with('/') {
+            RegionKind::File { name, file_offset, shared, guest_named, .. } => {
+                // By the backing's record, not the name's shape: a host path is `C:\...` on
+                // Windows but starts with `/` on macOS and Linux, just as a guest path does.
+                if !guest_named || !name.starts_with('/') {
                     return Err(refused(
                         MAPS,
                         format!(

@@ -46,6 +46,7 @@ pub struct Backing {
     id: BackingId,
     file: MappableFile,
     name: Arc<str>,
+    guest_named: bool,
 }
 
 impl Backing {
@@ -59,7 +60,7 @@ impl Backing {
     pub fn open(path: &Path, executability: MapExecutability) -> MemResult<Arc<Self>> {
         let file = vm::open_file_for_mapping(path, executability)
             .map_err(platform("Backing::open", 0, 0))?;
-        Ok(Arc::new(Self::from_file(file, path.display().to_string())))
+        Ok(Arc::new(Self::from_file(file, path.display().to_string(), false)))
     }
 
     /// [`open`](Backing::open), reported under `name` instead of the host path.
@@ -79,7 +80,7 @@ impl Backing {
     ) -> MemResult<Arc<Self>> {
         let file = vm::open_file_for_mapping(path, executability)
             .map_err(platform("Backing::open_named", 0, 0))?;
-        Ok(Arc::new(Self::from_file(file, name.to_string())))
+        Ok(Arc::new(Self::from_file(file, name.to_string(), true)))
     }
 
     /// Adopt a file the guest holds open for reading and writing, so that a
@@ -101,15 +102,16 @@ impl Backing {
     pub fn share(file: std::fs::File, name: &str) -> MemResult<Arc<Self>> {
         let file = vm::share_file_for_mapping(file, Path::new(name))
             .map_err(platform("Backing::share", 0, 0))?;
-        Ok(Arc::new(Self::from_file(file, name.to_string())))
+        Ok(Arc::new(Self::from_file(file, name.to_string(), true)))
     }
 
-    fn from_file(file: MappableFile, name: String) -> Self {
+    fn from_file(file: MappableFile, name: String, guest_named: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
             id: BackingId(NEXT.fetch_add(1, Ordering::Relaxed)),
             file,
             name: Arc::from(name.as_str()),
+            guest_named,
         }
     }
 
@@ -123,6 +125,15 @@ impl Backing {
     #[must_use]
     pub fn name(&self) -> &Arc<str> {
         &self.name
+    }
+
+    /// Whether [`name`](Backing::name) is a path the guest gave or would see
+    /// ([`open_named`](Backing::open_named), [`share`](Backing::share)) rather than the host path
+    /// [`open`](Backing::open) records. **Recorded, not inferred from the name**: on macOS and Linux
+    /// a host path starts with `/` exactly as a guest path does.
+    #[must_use]
+    pub fn is_guest_named(&self) -> bool {
+        self.guest_named
     }
 
     /// Length of the file in bytes.

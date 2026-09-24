@@ -449,8 +449,9 @@ fn a_file_maps_at_a_fixed_address_and_reads_back_its_own_contents() {
 
     let region = space.region_at(target).expect("mapped");
     match &region.kind {
-        RegionKind::File { backing: id, file_offset, name, shared } => {
+        RegionKind::File { backing: id, file_offset, name, shared, guest_named } => {
             assert!(!shared, "an opened file is a private mapping");
+            assert!(!guest_named, "`Backing::open` records the host path, not a guest one");
             assert_eq!(*id, backing.id());
             assert_eq!(*file_offset, 64 * KIB as u64);
             assert!(name.ends_with("segment.bin"), "{name}");

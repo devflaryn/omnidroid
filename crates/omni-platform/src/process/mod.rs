@@ -231,6 +231,50 @@ pub fn cpu_time() -> ProcessResult<Duration> {
     backend::cpu_time()
 }
 
+/// The most descriptors this process may hold open, after raising the soft limit once as far as
+/// the host allows. Idempotent and cheap after the first call; the filesystem and network seams
+/// call it before they open anything, so no caller has to remember to.
+///
+/// **Why, per host.** Each instance's guest may hold [`crate::fs::MAX_OPEN_FILES`] (1024)
+/// descriptors, plus the runtime's own. macOS starts a process at a soft `RLIMIT_NOFILE` of **256**
+/// (the hard limit is unlimited), so there the host ran out first and the guest was answered a host
+/// error instead of its own ceiling's `EMFILE` -- MEASURED: `a_guest_that_leaks_descriptors_is_stopped_with_emfile`
+/// and the `net_loopback` suite failing with errno 24 on an M1. Linux commonly starts at 1024 soft
+/// against a much larger hard limit: the same trade. macOS refuses `RLIM_INFINITY` as a soft limit,
+/// so it is capped at `OPEN_MAX` (10240) there. Windows has no such per-process table: `None`.
+pub fn raise_descriptor_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: `limit` is a live `rlimit` the call writes.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+                return None;
+            }
+            #[cfg(target_os = "macos")]
+            let wanted = limit.rlim_max.min(10_240);
+            // Linux refuses a soft limit above `fs.nr_open` (1,048,576 by default), and a hard
+            // limit may be `RLIM_INFINITY`.
+            #[cfg(not(target_os = "macos"))]
+            let wanted = limit.rlim_max.min(1 << 20);
+            if wanted > limit.rlim_cur {
+                let raised = libc::rlimit { rlim_cur: wanted, rlim_max: limit.rlim_max };
+                // SAFETY: `raised` is a live `rlimit`; a soft limit at or under the hard one is
+                // always permitted.
+                if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } == 0 {
+                    limit.rlim_cur = wanted;
+                }
+            }
+            Some(u64::from(limit.rlim_cur))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
