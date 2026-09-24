@@ -3802,6 +3802,12 @@ fn a_hostile_dl_argument_is_described_rather_than_crashing() {
 
 /// `PROT_READ | PROT_WRITE`.
 const PROT_RW: u64 = 3;
+/// `PROT_READ | PROT_EXEC`.
+const PROT_RX: u64 = 5;
+/// `PROT_READ`.
+const PROT_READ: u64 = 1;
+/// `MADV_DONTNEED`.
+const MADV_DONTNEED: u64 = 4;
 /// `MAP_PRIVATE | MAP_ANONYMOUS`.
 const MAP_ANON_PRIVATE: u64 = 0x22;
 
@@ -8379,7 +8385,31 @@ fn a_range_one_guest_thread_unmaps_reaches_another_threads_context() {
     let entry = program(&f, |asm| {
         create_call(&f, asm, out, 0, start, 0);
     });
+    // An EXECUTABLE range: the only kind a translation can exist for, so the only kind whose
+    // unmapping has to reach every context (`bionic::guestmem::executable_within`).
     let mapped = program(&f, |asm| {
+        asm.mov(0, 0);
+        asm.mov(1, 0x1_0000);
+        asm.mov(2, PROT_RX);
+        asm.mov(3, MAP_ANON_PRIVATE);
+        asm.mov(4, u64::MAX);
+        asm.mov(5, 0);
+        asm.bl(f.thunk("mmap"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 64));
+    });
+    // The unmap on its own, so what it queues is not confused with what the mapping queued.
+    let unmapped = program(&f, |asm| {
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 64));
+        asm.mov(1, 0x1_0000);
+        asm.bl(f.thunk("munmap"));
+        asm.push(str_imm(0, 22, 72));
+    });
+    // And a DATA range, mapped, discarded and unmapped the way an allocator does it -- which must
+    // queue nothing for anyone: MEASURED in a game world, the allocator's traffic alone overflowed
+    // sleeping threads' queues and each overflow discarded a whole code cache.
+    let data = program(&f, |asm| {
         asm.mov(0, 0);
         asm.mov(1, 0x1_0000);
         asm.mov(2, PROT_RW);
@@ -8388,10 +8418,19 @@ fn a_range_one_guest_thread_unmaps_reaches_another_threads_context() {
         asm.mov(5, 0);
         asm.bl(f.thunk("mmap"));
         asm.mov(22, out as u64);
-        asm.push(str_imm(0, 22, 64));
+        asm.push(str_imm(0, 22, 80));
+        asm.push(ldr_imm(0, 22, 80));
+        asm.mov(1, 0x1_0000);
+        asm.mov(2, MADV_DONTNEED);
+        asm.bl(f.thunk("madvise"));
+        asm.push(ldr_imm(0, 22, 80));
+        asm.mov(1, 0x1_0000);
+        asm.mov(2, PROT_READ);
+        asm.bl(f.thunk("mprotect"));
+        asm.push(ldr_imm(0, 22, 80));
         asm.mov(1, 0x1_0000);
         asm.bl(f.thunk("munmap"));
-        asm.push(str_imm(0, 22, 72));
+        asm.push(str_imm(0, 22, 88));
     });
     let join = program(&f, |asm| {
         asm.mov(22, out as u64);
@@ -8412,10 +8451,28 @@ fn a_range_one_guest_thread_unmaps_reaches_another_threads_context() {
     let before = f.boundary.code_invalidations();
     assert_eq!(before.applied, 0, "nothing has been unmapped yet");
 
-    // Now this thread maps and unmaps a range, through the guest's own `mmap`/`munmap`.
+    // The data range first: mapped, discarded, reprotected, unmapped -- and nothing queued.
+    assert!(matches!(run_program(&f, data).expect("completes"), ExitReason::Returned { .. }));
+    assert_ne!(f.guest.read_u64(out + 80), u64::MAX, "the data mapping succeeded");
+    assert_eq!(f.guest.read_u64(out + 88), 0, "and its unmapping did");
+    assert_eq!(
+        f.boundary.code_invalidations(),
+        before,
+        "a range with no executable page cannot hold a translation, so nothing is queued"
+    );
+
+    // Now this thread maps and unmaps an executable range, through the guest's own
+    // `mmap`/`munmap` -- and the UNMAP must queue it for the other context by itself.
     assert!(matches!(run_program(&f, mapped).expect("completes"), ExitReason::Returned { .. }));
     assert_ne!(f.guest.read_u64(out + 64), u64::MAX, "the mapping succeeded");
+    let mapped_only = f.boundary.code_invalidations().queued;
+    assert!(matches!(run_program(&f, unmapped).expect("completes"), ExitReason::Returned { .. }));
     assert_eq!(f.guest.read_u64(out + 72), 0, "and the unmapping did");
+    assert!(
+        f.boundary.code_invalidations().queued > mapped_only,
+        "unmapping executable memory must queue it for every other context: {:?}",
+        f.boundary.code_invalidations()
+    );
 
     // The other context picks it up at its next run-window boundary.
     while f.boundary.code_invalidations().applied == 0 {

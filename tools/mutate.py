@@ -8036,6 +8036,43 @@ directory", ADAPTER_FILES,
      "            .filter(|(_, c)| !c.secure || url.secure)",
      "",
      ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "cookie"]),
+    # Code invalidation only for ranges with an executable page (2026-09-24): the allocator's
+    # data traffic overflowed sleeping threads' queues and each overflow discarded a whole cache.
+    ("inval-A1", "A", "an executable range one thread unmaps is no longer invalidated anywhere",
+     "crates/omni-android/src/bionic/guestmem.rs",
+     "    space.any_executable(at, len)",
+     "    let _ = (space, at, len); false",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "a_range_one_guest_thread_unmaps"]),
+    ("inval-A2", "A", "the executable test reads a data page as executable",
+     "crates/omni-mem/src/space.rs",
+     "            if RegionInfo::from_entry(start, entry).protection == Protection::ReadExecute {",
+     "            if RegionInfo::from_entry(start, entry).protection != Protection::None {",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "a_range_one_guest_thread_unmaps"]),
+    ("inval-B1", "B", "a data munmap is broadcast to every thread again",
+     "crates/omni-android/src/bionic/guestmem.rs",
+     """    if executable_within(space, at, len) {
+        invalidate(c, at, len)?;
+    }
+    match space.unmap(at, len) {""",
+     """    invalidate(c, at, len)?;
+    match space.unmap(at, len) {""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "a_range_one_guest_thread_unmaps"]),
+    ("inval-B2", "B", "a data madvise(DONTNEED) is broadcast to every thread again",
+     "crates/omni-android/src/bionic/guestmem.rs",
+     """        if executable_within(space, at, len) {
+            c.invalidate_code(at, len)?;
+        }""",
+     """        c.invalidate_code(at, len)?;""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "a_range_one_guest_thread_unmaps"]),
+    ("inval-B3", "B", "a data mprotect is broadcast to every thread again",
+     "crates/omni-android/src/bionic/guestmem.rs",
+     """    if executable_within(space, at, len) {
+        invalidate(c, at, len)?;
+    }
+    match space.protect(at, len, protection) {""",
+     """    invalidate(c, at, len)?;
+    match space.protect(at, len, protection) {""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "a_range_one_guest_thread_unmaps"]),
 ]
 
 

@@ -891,6 +891,32 @@ impl GuestSpace {
         Some(RegionInfo::from_entry(start, entry))
     }
 
+    /// Whether any page of `[at, at + len)` is mapped executable right now.
+    ///
+    /// One walk over the map's own entries, free ranges included, so a large hole costs one step
+    /// rather than one per page. A range running past the space answers for the part inside it.
+    /// What it is for: a translating backend can only hold translations of executable pages, so
+    /// an unmap, reprotect or discard over a range with none has nothing to invalidate.
+    #[must_use]
+    pub fn any_executable(&self, at: GuestAddr, len: usize) -> bool {
+        let inner = self.inner.lock();
+        let end = at.saturating_add(len);
+        let mut cursor = at;
+        while cursor < end {
+            let Some(start) = inner.map.entry_start(cursor) else { return false };
+            let Some(entry) = inner.map.get(start) else { return false };
+            if RegionInfo::from_entry(start, entry).protection == Protection::ReadExecute {
+                return true;
+            }
+            let next = start.saturating_add(entry.len);
+            if next <= cursor {
+                return false;
+            }
+            cursor = next;
+        }
+        false
+    }
+
     /// Whether the region map's lock is held **right now**, by anyone.
     ///
     /// # Why a space needs this and a caller cannot get it any other way

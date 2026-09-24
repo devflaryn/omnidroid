@@ -206,6 +206,22 @@ fn invalidate(c: &mut ReentrantCall<'_>, address: GuestAddr, len: usize) -> AbiR
     c.invalidate_code(address, len)
 }
 
+/// Whether any page of `[at, at + len)` is executable right now.
+///
+/// **What decides whether a change needs to invalidate at all.** A translation can only exist for
+/// guest code fetched from an executable page (the backend refuses to fetch anywhere else), and
+/// every way a page stops being executable -- `munmap`, `mprotect`, `madvise(MADV_DONTNEED)` --
+/// asks this *before* the change and invalidates when it is true. So a change over a range with
+/// no executable page cannot discard anything in any context, and a fresh mapping (which only
+/// ever lands on free addresses: `Placement::Fixed` is `MAP_FIXED_NOREPLACE`) cannot cover a live
+/// translation. MEASURED why it matters (a game world, 2026-09-24): the engine's allocator
+/// `madvise`s and maps data constantly -- ~240 ranges per second queued to every guest thread --
+/// and a thread asleep for more than 64 of them overflows its queue and discards its **whole**
+/// code cache on waking (`CodeWatch`), which is re-translation the world paid for continuously.
+fn executable_within(space: &omni_mem::GuestSpace, at: GuestAddr, len: usize) -> bool {
+    space.any_executable(at, len)
+}
+
 /// Round a length up to the guest's page size, as every one of these calls does.
 ///
 /// Checked rather than saturating: a length near `usize::MAX` rounded up would wrap to a *small*
@@ -466,18 +482,20 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             c.ret(|mut r| r.u64(MAP_FAILED));
             return Ok(());
         }
-        invalidate(c, at, len)?;
+        // A fresh, read-only mapping on free addresses: nothing to invalidate
+        // (`executable_within` has the argument).
         c.ret(|mut r| r.u64(at as u64));
         return Ok(());
     }
 
     match space.map_anonymous(placement, len, protection, CommitPolicy::Lazy) {
         Ok(at) => {
-            // A fresh mapping cannot hold code the backend has translated — the address range was
-            // free — but it can *reuse* addresses a previous mapping held, and those translations
-            // are still cached. Invalidating on the way in is the cheaper half of the pair: the
-            // range is about to be written by the guest anyway.
-            invalidate(c, at, len)?;
+            // A fresh mapping lands on free addresses, and whatever code those addresses held
+            // before was invalidated when it stopped being executable (`executable_within`). The
+            // one kept: a new *executable* mapping -- rare, code loading -- as belt and braces.
+            if protection == Protection::ReadExecute {
+                invalidate(c, at, len)?;
+            }
             c.ret(|mut r| r.u64(at as u64));
         }
         Err(error) => {
@@ -550,8 +568,7 @@ fn map_shared_file(
     };
     match space.map_file(&backing, offset, placement, len, Protection::ReadWrite) {
         Ok(at) => {
-            // As for an anonymous mapping: the addresses may have held code before.
-            invalidate(c, at, len)?;
+            // A fresh, writable data mapping on free addresses: nothing to invalidate.
             c.ret(|mut r| r.u64(at as u64));
         }
         // No room in the address space, or a MAP_FIXED_NOREPLACE collision: the answers an
@@ -594,7 +611,9 @@ pub(super) fn munmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     // **Before the unmap, not after.** Once the range is gone `GuestRange` still describes it, but
     // the window between the unmap and the invalidate is a window in which another guest thread
     // could execute a translation of memory this process no longer owns.
-    invalidate(c, at, len)?;
+    if executable_within(space, at, len) {
+        invalidate(c, at, len)?;
+    }
     match space.unmap(at, len) {
         Ok(()) => c.ret(|mut r| r.i32(0)),
         Err(error) => {
@@ -635,7 +654,11 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         return Ok(());
     };
 
-    invalidate(c, at, len)?;
+    // What the range is BEFORE the change decides it: leaving execute discards translations,
+    // and entering it has none to discard (the pages were not executable, so nothing was fetched).
+    if executable_within(space, at, len) {
+        invalidate(c, at, len)?;
+    }
     match space.protect(at, len, protection) {
         Ok(()) => c.ret(|mut r| r.i32(0)),
         Err(error) => {
@@ -753,7 +776,9 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         // The bytes at those addresses are gone, so any translation covering them is stale. The
         // same argument `munmap` and `mprotect` make, and part of why all five of these are on
         // the exit path at all (finding F9).
-        c.invalidate_code(at, len)?;
+        if executable_within(space, at, len) {
+            c.invalidate_code(at, len)?;
+        }
         c.ret(|mut r| r.i32(0));
         return Ok(());
     }

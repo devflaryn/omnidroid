@@ -400,6 +400,9 @@ struct Process {
     pager: (u64, u64),
     counters: sampler::ProcessCounters,
     sampler_cpu: Duration,
+    /// Cross-thread code invalidations (`Boundary::code_invalidations`): ranges queued, applied,
+    /// and queues that overflowed -- each overflow a whole code cache discarded.
+    code: crate::boundary::CodeInvalidations,
 }
 
 fn vk_counts(vulkans: &[Arc<Vulkan>]) -> BTreeMap<String, u64> {
@@ -412,8 +415,9 @@ fn vk_counts(vulkans: &[Arc<Vulkan>]) -> BTreeMap<String, u64> {
     all
 }
 
-fn snapshot_process(vulkans: &[Arc<Vulkan>], me: Option<&sampler::HostThread>) -> Process {
+fn snapshot_process(boundary: &Boundary, vulkans: &[Arc<Vulkan>], me: Option<&sampler::HostThread>) -> Process {
     Process {
+        code: boundary.code_invalidations(),
         at: Instant::now(),
         cpu: omni_platform::process::cpu_time().unwrap_or_default(),
         vk: vk_counts(vulkans),
@@ -505,7 +509,7 @@ fn reporter(config: &Config) {
             continue;
         }
         next_report += config.interval;
-        let now = snapshot_process(&vulkans, me.as_ref());
+        let now = snapshot_process(&boundary, &vulkans, me.as_ref());
         if let Some(before) = prev.as_ref() {
             report(
                 config,
@@ -715,11 +719,17 @@ fn report(
     rows.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
 
     let (faults, committed) = (now.pager.0 - before.pager.0, now.pager.1 - before.pager.1);
+    let code = (
+        now.code.queued.saturating_sub(before.code.queued),
+        now.code.applied.saturating_sub(before.code.applied),
+        now.code.overflows.saturating_sub(before.code.overflows),
+    );
     let mut out = String::new();
     out.push_str(&format!(
         "PERF +{t:.0}s ({dt:.1}s): presents +{} | cores {:.2} | guest {:.0} Minsn/s, translated {:.1} \
          kinsn/s, crossings {:.2} M/s{} | live guest threads {} | pager +{faults} faults +{} MiB | \
-         page faults {:.0}/s, private {:.2} GiB, working set {:.2} GiB | sampler cpu {:.1}%\n",
+         page faults {:.0}/s, private {:.2} GiB, working set {:.2} GiB | code invalidations \
+         +{} queued +{} applied +{} whole-cache | sampler cpu {:.1}%\n",
         vk_delta("vkQueuePresentKHR"),
         now.cpu.saturating_sub(before.cpu).as_secs_f64() / dt,
         all_instructions as f64 / dt / 1e6,
@@ -731,6 +741,9 @@ fn report(
         now.counters.page_faults.wrapping_sub(before.counters.page_faults) as f64 / dt,
         gib(now.counters.private_bytes),
         gib(now.counters.working_set),
+        code.0,
+        code.1,
+        code.2,
         100.0 * now.sampler_cpu.saturating_sub(before.sampler_cpu).as_secs_f64() / dt,
     ));
     for row in rows.iter().filter(|r| r.cpu >= 0.03).take(14) {
