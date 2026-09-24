@@ -759,6 +759,21 @@ pub struct Filesystem {
     gate: Arc<ReadyGate>,
     /// The paths this instance serves from a generator. See [`Filesystem::serve_generated`].
     generated: Mutex<GeneratedFiles>,
+    /// Where each path operation is reported, once an embedding asks. See [`Filesystem::set_trace`].
+    trace: Trace,
+}
+
+/// Where [`Filesystem::set_trace`] sends one line per path operation.
+pub type TraceSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The trace sink, set at most once.
+#[derive(Default)]
+struct Trace(std::sync::OnceLock<TraceSink>);
+
+impl core::fmt::Debug for Trace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(if self.0.get().is_some() { "Trace(on)" } else { "Trace(off)" })
+    }
 }
 
 #[derive(Debug)]
@@ -808,6 +823,7 @@ impl Filesystem {
         Ok(Filesystem {
             root: canonical,
             misses: Mutex::new(Vec::new()),
+            trace: Trace::default(),
             table: Mutex::new(Table {
                 open: BTreeMap::from([
                     (STDIN_FD, Entry::Standard(StdStream::In)),
@@ -1001,6 +1017,7 @@ impl Filesystem {
     /// instance already holds [`MAX_OPEN_FILES`].
     pub fn open(&self, guest_path: &[u8], flags: OpenFlags) -> FsResult<i32> {
         let outcome = self.open_inner(guest_path, flags);
+        self.traced("open", guest_path, &outcome);
         if outcome.is_err() {
             let mut misses = self.misses.lock().expect("the miss list is not poisoned");
             // Bounded, and **keeping the oldest**: the first thing a guest could not find is what
@@ -1011,6 +1028,27 @@ impl Filesystem {
             }
         }
         outcome
+    }
+
+    /// Report every path operation -- `open`, `stat`, `lstat`, `access`, `opendir` -- to `sink`,
+    /// one line each: the operation, the guest path and what it answered.
+    ///
+    /// **A diagnostic an embedding switches on, not a log this seam keeps.** [`open_misses`]
+    /// (Filesystem::open_misses) records what was *not* found; this says what was asked for and in
+    /// what order, including what *was* found, which is the half a check that probes for files
+    /// (and fails on one it expected) needs. Set once; a second call is ignored.
+    pub fn set_trace(&self, sink: TraceSink) {
+        let _ = self.trace.0.set(sink);
+    }
+
+    fn traced<T: core::fmt::Debug>(&self, operation: &str, guest_path: &[u8], outcome: &FsResult<T>) {
+        if let Some(sink) = self.trace.0.get() {
+            let answer = match outcome {
+                Ok(value) => format!("ok {value:?}"),
+                Err(error) => format!("ERR {error}"),
+            };
+            sink(&format!("FILE {operation} {} -> {answer}", path::display(guest_path)));
+        }
     }
 
     /// Guest paths this instance was asked to open and could not, oldest first, deduplicated.
@@ -2556,6 +2594,12 @@ impl Filesystem {
     ///
     /// As [`resolve`](Self::resolve), plus [`FsError::Io`] for a host failure.
     pub fn stat(&self, guest_path: &[u8]) -> FsResult<FileStat> {
+        let outcome = self.stat_inner(guest_path);
+        self.traced("stat", guest_path, &outcome);
+        outcome
+    }
+
+    fn stat_inner(&self, guest_path: &[u8]) -> FsResult<FileStat> {
         const OP: &str = "stat";
         if let Some(device) = device_for(guest_path) {
             return Ok(device_stat(device));
@@ -2577,6 +2621,12 @@ impl Filesystem {
     ///
     /// As [`stat`](Self::stat).
     pub fn lstat(&self, guest_path: &[u8]) -> FsResult<FileStat> {
+        let outcome = self.lstat_inner(guest_path);
+        self.traced("lstat", guest_path, &outcome);
+        outcome
+    }
+
+    fn lstat_inner(&self, guest_path: &[u8]) -> FsResult<FileStat> {
         const OP: &str = "lstat";
         if let Some(device) = device_for(guest_path) {
             // A device node is not a symbolic link, so `lstat` and `stat` agree about it.
@@ -2733,6 +2783,12 @@ impl Filesystem {
     /// [`FsErrorKind::NotFound`] when the path does not exist and [`FsErrorKind::PermissionDenied`]
     /// when the probe was refused — which is `access`'s own contract.
     pub fn access(&self, guest_path: &[u8], check: AccessCheck) -> FsResult<()> {
+        let outcome = self.access_inner(guest_path, check);
+        self.traced("access", guest_path, &outcome);
+        outcome
+    }
+
+    fn access_inner(&self, guest_path: &[u8], check: AccessCheck) -> FsResult<()> {
         const OP: &str = "access";
         // A generated file exists and is readable, and is not writable: `0444`, as `open` says.
         if let Some((name, _)) = self.generated_for(guest_path) {
@@ -2942,6 +2998,12 @@ impl Filesystem {
     /// As [`resolve`](Self::resolve), plus [`FsError::Io`] and [`FsError::Refused`] for a
     /// directory too large or holding a name that cannot be represented.
     pub fn opendir(&self, guest_path: &[u8]) -> FsResult<i32> {
+        let outcome = self.opendir_inner(guest_path);
+        self.traced("opendir", guest_path, &outcome);
+        outcome
+    }
+
+    fn opendir_inner(&self, guest_path: &[u8]) -> FsResult<i32> {
         const OP: &str = "opendir";
         let host = self.resolve(OP, guest_path, FinalLink::Refuse)?;
         let shown = path::resolve_lexically(OP, guest_path)?.guest_path();
