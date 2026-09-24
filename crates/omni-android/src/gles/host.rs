@@ -57,8 +57,10 @@ impl HostProc {
         (address != 0).then_some(Self(address))
     }
 
-    /// The address, for the typed caller only.
-    pub(crate) fn address(self) -> usize {
+    /// The host address. For the typed callers, and for a host's or a test's own direct call;
+    /// **never** a value to hand to the guest (see the module documentation).
+    #[must_use]
+    pub fn address(self) -> usize {
         self.0
     }
 }
@@ -86,8 +88,8 @@ pub struct DisplayOpened {
 pub struct SurfaceMade {
     /// The host `EGLSurface`, or `0` (`EGL_NO_SURFACE`) when the **host EGL** refused. A refusal by
     /// the host EGL is an answer the guest is entitled to, and the error code is the host's
-    /// `eglGetError`, which the guest's own `eglGetError` then reads -- [`DriverAnswer`]'s argument
-    /// (crate::vulkan::DriverAnswer), carried by EGL's own error channel.
+    /// `eglGetError`, which the guest's own `eglGetError` then reads --
+    /// [`DriverAnswer`](crate::vulkan::DriverAnswer)'s argument, carried by EGL's own error channel.
     pub surface: u64,
     /// The host call, for the census: e.g. `eglCreatePlatformWindowSurface(Window 0x...)`.
     pub host_call: String,
