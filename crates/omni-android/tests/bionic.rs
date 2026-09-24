@@ -6064,6 +6064,187 @@ fn statvfs_fills_the_guests_structure_with_the_hosts_numbers() {
     assert!(field(10) > 0, "f_namemax");
 }
 
+/// `syscall(SYS_statfs)` and `syscall(SYS_fstatfs)`, the arm64 numbers.
+const SYS_STATFS: u64 = 43;
+const SYS_FSTATFS: u64 = 44;
+/// `EXT4_SUPER_MAGIC`, `PROC_SUPER_MAGIC`, `PIPEFS_MAGIC`, `SOCKFS_MAGIC`, `ANON_INODE_FS_MAGIC`
+/// and `ST_VALID`, spelled again from `<linux/magic.h>` and `<sys/statvfs.h>` so the test compares
+/// against a second copy rather than the handler's own.
+const EXT4_MAGIC: u64 = 0xEF53;
+const PROC_MAGIC: u64 = 0x9FA0;
+const PIPEFS_MAGIC: u64 = 0x5049_5045;
+const SOCKFS_MAGIC: u64 = 0x534F_434B;
+const ANON_INODE_MAGIC: u64 = 0x0904_1934;
+const ST_VALID: u64 = 0x20;
+/// Bytes of the kernel's arm64 `struct statfs`.
+const STATFS_BYTES: usize = 120;
+/// A byte no field of a real answer is made of, so "wrote nothing" is visible.
+const POISON: u8 = 0xA5;
+
+/// The fifteen words of a `struct statfs` at `at`.
+fn statfs_words(f: &Fixture, at: omni_cpu::GuestAddr) -> Vec<u64> {
+    (0..STATFS_BYTES / 8).map(|index| read_u64_guest(f, at + index * 8)).collect()
+}
+
+/// **`statfs` (43) and `fstatfs` (44) describe the volume in the kernel's `struct statfs`, and
+/// agree with `statvfs` on every field the two share.** MEASURED need: a TaskScheduler worker died
+/// on raw syscall 44 in the Pet Simulator 99 world (2026-09-24).
+///
+/// `statvfs` is the comparison because it is the *other* layout of the same host answer: a word
+/// written at `statvfs`'s offset instead of the kernel's reads as a different field there. The free
+/// counts are held to their relations rather than compared, because another process can write to
+/// this disk between the two calls.
+#[test]
+fn statfs_and_fstatfs_through_syscall_describe_the_volume_as_statvfs_does() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("statfs");
+    std::fs::write(scratch.path("file.bin"), b"volume").expect("a file");
+    let path = f.cstring(f.guest.data + 0x100, b"/file.bin");
+    let by_path = f.guest.data + 0x800;
+    let by_fd = f.guest.data + 0x900;
+    let vfs = f.guest.data + 0xA00;
+
+    f.guest.write_bytes(by_path, &[POISON; STATFS_BYTES]);
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_STATFS, path as u64, by_path as u64]), (0, 0));
+    assert_eq!(call_with_errno(&f, "statvfs", &[path as u64, vfs as u64]), (0, 0));
+    let s = statfs_words(&f, by_path);
+    let v = |index: usize| read_u64_guest(&f, vfs + index * 8);
+    assert_eq!(s[0], EXT4_MAGIC, "f_type: an app's data volume is ext4");
+    assert!(s[1] > 0 && s[1].is_power_of_two(), "f_bsize {}", s[1]);
+    assert_eq!(s[1], v(0), "f_bsize is statvfs's f_bsize");
+    assert_eq!(s[2], v(2), "f_blocks is statvfs's f_blocks");
+    assert!(s[2] > 0 && s[3] <= s[2] && s[4] <= s[3], "blocks {} free {} avail {}", s[2], s[3], s[4]);
+    assert_eq!((s[5], s[6]), (0, 0), "f_files and f_ffree, zero as statvfs reports them");
+    assert_eq!(s[7], v(8), "f_fsid is statvfs's f_fsid, val[0] low");
+    assert_eq!(s[8], v(10), "f_namelen is statvfs's f_namemax");
+    assert_eq!(s[9], v(1), "f_frsize, after f_namelen, is statvfs's f_frsize");
+    assert_eq!(s[10], ST_VALID | v(9), "f_flags is statvfs's f_flag plus ST_VALID");
+    assert_eq!(&s[11..], &[0, 0, 0, 0], "f_spare is written, and zero");
+
+    // The same answer through a descriptor on the file, and on a directory.
+    let fd = open_through_guest(&f, "/file.bin", O_RDONLY);
+    assert!(fd >= 3, "open: {fd}");
+    let dir = open_through_guest(&f, "/", O_RDONLY | O_DIRECTORY);
+    assert!(dir >= 3, "open(O_DIRECTORY): {dir}");
+    for descriptor in [fd, dir] {
+        f.guest.write_bytes(by_fd, &[POISON; STATFS_BYTES]);
+        assert_eq!(
+            call_with_errno(&f, "syscall", &[SYS_FSTATFS, descriptor as u64, by_fd as u64]),
+            (0, 0),
+            "fstatfs({descriptor})"
+        );
+        let d = statfs_words(&f, by_fd);
+        for index in [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] {
+            assert_eq!(d[index], s[index], "word {index} of fstatfs({descriptor}) and statfs");
+        }
+    }
+    // `syscall` is variadic and the descriptor an `int`: the register's upper half is not part of
+    // it, as the kernel's `unsigned int fd` says.
+    let dirty = (fd as u64) | 0xDEAD_BEEF_0000_0000;
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_FSTATFS, dirty, by_fd as u64]), (0, 0));
+
+    // A descriptor that is not open is EBADF, and the buffer is not touched.
+    f.guest.write_bytes(by_fd, &[POISON; STATFS_BYTES]);
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_FSTATFS, 999, by_fd as u64]), (-1, 9), "EBADF");
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_FSTATFS, u64::MAX, by_fd as u64]), (-1, 9));
+    assert_eq!(read_guest(&f, by_fd, STATFS_BYTES), vec![POISON; STATFS_BYTES], "EBADF wrote");
+    // A path that is not there is ENOENT, and the buffer is not touched.
+    let missing = f.cstring(f.guest.data + 0x180, b"/nope");
+    assert_eq!(
+        call_with_errno(&f, "syscall", &[SYS_STATFS, missing as u64, by_fd as u64]),
+        (-1, 2),
+        "ENOENT"
+    );
+    assert_eq!(read_guest(&f, by_fd, STATFS_BYTES), vec![POISON; STATFS_BYTES], "ENOENT wrote");
+
+    // A file unlinked while open: Linux still answers through the descriptor, fstatfs has no
+    // ENOENT, and this layer finds the volume by path -- so it refuses, naming the file.
+    let doomed_path = scratch.path("doomed.bin");
+    std::fs::write(&doomed_path, b"x").expect("a file");
+    let doomed = open_through_guest(&f, "/doomed.bin", O_RDONLY);
+    assert!(doomed >= 3, "open: {doomed}");
+    std::fs::remove_file(&doomed_path).expect("unlink while open");
+    let error = refusal_of(&f, "syscall", |asm| {
+        asm.mov(0, SYS_FSTATFS);
+        asm.mov(1, doomed as u64);
+        asm.mov(2, by_fd as u64);
+    });
+    assert!(error.to_string().contains("/doomed.bin"), "{error}");
+}
+
+/// **`/proc` and the kernel-internal filesystems answer their own magic**, through the libc
+/// `syscall` and through a raw `SVC #0`: a generated `/proc` file is `PROC_SUPER_MAGIC`, a pipe
+/// `PIPEFS_MAGIC`, a socket `SOCKFS_MAGIC`, an epoll descriptor `ANON_INODE_FS_MAGIC` -- each with
+/// the page size as its block size and nothing to count. What has no true answer, a standard
+/// stream, is refused by name.
+#[test]
+fn fstatfs_answers_proc_and_the_kernels_pseudo_filesystems_and_refuses_a_standard_stream() {
+    let _guard = serialized();
+    let (f, _scratch) = networked("statfs-pseudo");
+    // `/proc/meminfo`'s generator reports the embedding's budget, and opening it needs one.
+    f.bionic.set_memory_budget(1 << 30);
+    let page = f.bionic.space_page_size() as u64;
+    let buf = f.guest.data + 0x800;
+    let pseudo = |magic: u64, how: &str| {
+        let s = statfs_words(&f, buf);
+        assert_eq!(s[0], magic, "{how}: f_type {:#x}", s[0]);
+        assert_eq!((s[1], s[9]), (page, page), "{how}: f_bsize and f_frsize are the page size");
+        assert!(s[2..8].iter().all(|w| *w == 0), "{how}: no counts, no fsid: {s:x?}");
+        assert_eq!(s[8], 255, "{how}: f_namelen is NAME_MAX");
+        assert_eq!(s[10] & ST_VALID, ST_VALID, "{how}: f_flags");
+    };
+
+    // `/proc` by path and by descriptor; a `/proc` path nothing serves is ENOENT.
+    let meminfo = f.cstring(f.guest.data + 0x100, b"/proc/meminfo");
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_STATFS, meminfo as u64, buf as u64]), (0, 0));
+    pseudo(PROC_MAGIC, "statfs(/proc/meminfo)");
+    let fd = open_through_guest(&f, "/proc/meminfo", O_RDONLY);
+    assert!(fd >= 3, "open(/proc/meminfo): {fd}");
+    f.guest.write_bytes(buf, &[POISON; STATFS_BYTES]);
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_FSTATFS, fd as u64, buf as u64]), (0, 0));
+    pseudo(PROC_MAGIC, "fstatfs(/proc/meminfo)");
+    let nothing = f.cstring(f.guest.data + 0x100, b"/proc/self/nothing-here");
+    assert_eq!(
+        call_with_errno(&f, "syscall", &[SYS_STATFS, nothing as u64, buf as u64]),
+        (-1, 2),
+        "a /proc path nothing serves is ENOENT, not procfs"
+    );
+
+    // A pipe, through a raw SVC: the kernel's convention, errno untouched.
+    let (read_end, _write_end) = pipe_through_guest(&f);
+    f.guest.write_bytes(buf, &[POISON; STATFS_BYTES]);
+    assert_eq!(
+        svc_with_errno(&f, SYS_FSTATFS, &[read_end as u64, buf as u64]).expect("svc fstatfs"),
+        (0, ERRNO_MARK)
+    );
+    pseudo(PIPEFS_MAGIC, "fstatfs(pipe)");
+    // A socket and an epoll descriptor, through the import.
+    let (socket, errno) = call_with_errno(&f, "socket", &[AF_INET, 1, 0]);
+    assert!(socket >= 3, "socket: {socket} errno {errno}");
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_FSTATFS, socket as u64, buf as u64]), (0, 0));
+    pseudo(SOCKFS_MAGIC, "fstatfs(socket)");
+    let (epfd, errno) = call_with_errno(&f, "epoll_create1", &[0]);
+    assert!(epfd >= 3, "epoll_create1: {epfd} errno {errno}");
+    assert_eq!(call_with_errno(&f, "syscall", &[SYS_FSTATFS, epfd as u64, buf as u64]), (0, 0));
+    pseudo(ANON_INODE_MAGIC, "fstatfs(epoll)");
+
+    // The raw SVC's error convention: -errno in x0, errno untouched.
+    assert_eq!(
+        svc_with_errno(&f, SYS_FSTATFS, &[999, buf as u64]).expect("svc fstatfs"),
+        (-9, ERRNO_MARK),
+        "-EBADF"
+    );
+    assert_eq!(
+        svc_with_errno(&f, SYS_STATFS, &[nothing as u64, buf as u64]).expect("svc statfs"),
+        (-2, ERRNO_MARK),
+        "-ENOENT"
+    );
+
+    // A standard stream has no Android filesystem to report: refused, and named.
+    let error = svc_with_errno(&f, SYS_FSTATFS, &[0, buf as u64]).expect_err("stdin");
+    assert!(error.to_string().contains("standard stream"), "{error}");
+}
+
 /// A directory walk: `opendir`, `readdir` to the end, `closedir`.
 ///
 /// `.` and `..` come first and every entry appears exactly once. The `DIR *` and the returned

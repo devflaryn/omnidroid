@@ -3,7 +3,9 @@
 //!
 //! `open`, `__open_2`, `close`, `read`, `pread`, `__write_chk`, `access`, `stat`, `fstat`,
 //! `lstat`, `statvfs`, `rename`, `unlink`, `mkdir`, `rmdir`, `opendir`, `readdir`, `closedir`.
-//! Bionic's `FILE *` layer sits on top of these and is in [`super::stdio`].
+//! Bionic's `FILE *` layer sits on top of these and is in [`super::stdio`]. The kernel's `statfs`
+//! and `fstatfs`, which the engine issues as raw syscalls rather than imports, are answered here
+//! too (see [`statfs`] and [`fstatfs`]) and reached through `procenv`'s `syscall`.
 //!
 //! # Where the answers come from, and what refuses
 //!
@@ -64,7 +66,7 @@ use omni_bionic::errno::consts;
 use omni_mem::GuestAddr;
 use omni_platform::fs::{
     AccessCheck, DirEntryInfo, FileKind, FileStat, Filesystem, FsErrorKind, FsResult,
-    OpenFlags, RecordLock, VolumeStats, IO_BLOCK,
+    OpenFlags, ReadinessSource, RecordLock, VolumeStats, IO_BLOCK,
 };
 
 use crate::abi::Args;
@@ -352,6 +354,150 @@ fn encode_statvfs(stats: &VolumeStats) -> [u8; STATVFS_BYTES] {
         out[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
     }
     out
+}
+
+// ================================================================== `struct statfs`
+
+/// Bytes of the **kernel's** arm64 `struct statfs`, which raw syscalls 43 (`statfs`) and 44
+/// (`fstatfs`) write.
+///
+/// **From Linux's `include/uapi/asm-generic/statfs.h`, recalled rather than read — there is no
+/// kernel tree on this machine.** arm64 has no `asm/statfs.h` override, and on a 64-bit target
+/// `__statfs_word` is `__kernel_long_t`, so every word is eight bytes:
+///
+/// | offset | bytes | field |
+/// |---|---|---|
+/// | 0 | 8 | `f_type` |
+/// | 8 | 8 | `f_bsize` |
+/// | 16 | 8 | `f_blocks` |
+/// | 24 | 8 | `f_bfree` |
+/// | 32 | 8 | `f_bavail` |
+/// | 40 | 8 | `f_files` |
+/// | 48 | 8 | `f_ffree` |
+/// | 56 | 8 | `__kernel_fsid_t f_fsid` (`int val[2]`) |
+/// | 64 | 8 | `f_namelen` |
+/// | 72 | 8 | `f_frsize` |
+/// | 80 | 8 | `f_flags` |
+/// | 88 | 32 | `f_spare[4]` |
+/// | **120** | | end |
+///
+/// bionic's LP64 `struct statfs` (`__STATFS64_BODY` in `<sys/statfs.h>`) is the same twelve
+/// fields in the same order with `uint64_t`/`fsblkcnt_t`/`fsfilcnt_t` words, which is what makes
+/// the offsets forced once the order is right. `f_frsize` sitting **after** `f_namelen` is the
+/// field most easily put in `statvfs`'s place instead.
+pub const STATFS_BYTES: usize = 120;
+
+/// `EXT4_SUPER_MAGIC`, the `f_type` answered for every volume under the root.
+///
+/// **A choice between two true answers, made for the installed base.** An app's data directory
+/// is ext4 (`0xEF53`) on most devices shipped to date and f2fs (`0xF2F52010`) on many newer ones;
+/// the host's NTFS is neither and has no Linux magic a guest would recognise. ext4 is the value
+/// code that branches on `f_type` is most likely to have been written against — the usual reason
+/// to ask is to tell a local disk from FUSE, NFS or a network share, and both candidates answer
+/// "local disk" to that question identically. External storage's `Android/data` is bind-mounted
+/// from the lower filesystem on Android 11+, so the same answer holds there.
+const EXT4_SUPER_MAGIC: u64 = 0xEF53;
+/// `PROC_SUPER_MAGIC`: a descriptor on, or a path to, a file this layer generates under `/proc`.
+const PROC_SUPER_MAGIC: u64 = 0x9FA0;
+/// `PIPEFS_MAGIC` (`"PIPE"`).
+const PIPEFS_MAGIC: u64 = 0x5049_5045;
+/// `SOCKFS_MAGIC` (`"SOCK"`).
+const SOCKFS_MAGIC: u64 = 0x534F_434B;
+/// `ANON_INODE_FS_MAGIC`, which eventfd, epoll and timerfd descriptors all live on.
+const ANON_INODE_FS_MAGIC: u64 = 0x0904_1934;
+/// `ST_VALID`: the kernel sets it in every `statfs` answer to say `f_flags` means something.
+/// bionic's `statvfs` strips it, which is why [`encode_statvfs`] never writes it.
+const ST_VALID: u64 = 0x0020;
+/// `ST_RELATIME`, from `/proc`'s default mount (Android's init passes no atime flag, and the
+/// kernel then defaults a new mount to `relatime`).
+const ST_RELATIME: u64 = 0x1000;
+/// `NAME_MAX`, which `simple_statfs` puts in a pseudo filesystem's `f_namelen`.
+const PSEUDO_NAME_MAX: u64 = 255;
+
+/// The eleven meaningful words of a `struct statfs`, before encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatfsAnswer {
+    kind: u64,
+    block_size: u64,
+    blocks: u64,
+    blocks_free: u64,
+    blocks_available: u64,
+    files: u64,
+    files_free: u64,
+    fsid: u64,
+    name_max: u64,
+    fragment_size: u64,
+    flags: u64,
+}
+
+impl StatfsAnswer {
+    /// A volume under the root: the host's own numbers, as [`encode_statvfs`] reports them.
+    ///
+    /// The inode counts are zero for [`encode_statvfs`]'s reason, and `f_flags` is that call's
+    /// `ST_RDONLY` plus the `ST_VALID` the kernel always adds — so `statvfs` and `statfs` on one
+    /// path agree on every field they share, as bionic's `statvfs` (a wrapper over `statfs`)
+    /// makes them agree on a device.
+    fn volume(stats: &VolumeStats) -> Self {
+        Self {
+            kind: EXT4_SUPER_MAGIC,
+            block_size: stats.block_size,
+            blocks: stats.blocks,
+            blocks_free: stats.blocks_free,
+            blocks_available: stats.blocks_available,
+            files: 0,
+            files_free: 0,
+            fsid: stats.filesystem_id,
+            name_max: stats.name_max,
+            fragment_size: stats.block_size,
+            flags: ST_VALID | if stats.read_only { ST_RDONLY } else { 0 },
+        }
+    }
+
+    /// A kernel pseudo filesystem, answered as the kernel's `simple_statfs` answers it:
+    /// `f_bsize` (and so `f_frsize`) is the page size, `f_namelen` is `NAME_MAX`, and every count
+    /// and the fsid are zero — which is not a gap here, because there is no volume behind a pipe,
+    /// a socket or `/proc` for a count to be of.
+    fn pseudo(kind: u64, page_size: u64, flags: u64) -> Self {
+        Self {
+            kind,
+            block_size: page_size,
+            blocks: 0,
+            blocks_free: 0,
+            blocks_available: 0,
+            files: 0,
+            files_free: 0,
+            fsid: 0,
+            name_max: PSEUDO_NAME_MAX,
+            fragment_size: page_size,
+            flags,
+        }
+    }
+
+    /// Encode into the kernel's layout; see [`STATFS_BYTES`].
+    ///
+    /// `f_fsid` is the 64-bit identifier split little-end first into `val[0]` and `val[1]`, which
+    /// is ext4's `u64_to_fsid` and is also how bionic's `statvfs` rebuilds its `unsigned long`
+    /// from the two ints — so the two calls report one identifier.
+    fn encode(&self) -> [u8; STATFS_BYTES] {
+        let mut out = [0u8; STATFS_BYTES];
+        let words = [
+            self.kind,
+            self.block_size,
+            self.blocks,
+            self.blocks_free,
+            self.blocks_available,
+            self.files,
+            self.files_free,
+            self.fsid,
+            self.name_max,
+            self.fragment_size,
+            self.flags,
+        ];
+        for (index, value) in words.iter().enumerate() {
+            out[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
 }
 
 // ================================================================== `struct dirent`
@@ -1488,6 +1634,152 @@ pub(super) fn statvfs(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// Whether a guest path names something under `/proc`, after lexical resolution.
+fn under_proc(fs: &Filesystem, guest_path: &[u8]) -> bool {
+    fs.guest_path("statfs", guest_path)
+        .is_ok_and(|path| path == "/proc" || path.starts_with("/proc/"))
+}
+
+/// What `statfs` answers for a path: `/proc`'s pseudo filesystem for a file this layer generates
+/// there, the host volume's numbers for everything else.
+///
+/// **`/proc` is decided by the path, and existence by `stat`.** Every file under `/proc` here is
+/// one [`Filesystem::serve_generated`] produces and none is under the root, so asking the host
+/// volume about one would answer `ENOENT` for a file `open` serves. `stat` is the call that already
+/// knows which `/proc` paths exist, and its failure is this call's failure.
+fn statfs_of_path(
+    view: &GuestView<'_>,
+    fs: &Filesystem,
+    guest_path: &[u8],
+) -> AbiResult<Settled<StatfsAnswer>> {
+    if under_proc(fs, guest_path) {
+        let page = view.active.bionic.space_page_size() as u64;
+        return Ok(match settle(view, fs.stat(guest_path))? {
+            Settled::Done(_) => {
+                Settled::Done(StatfsAnswer::pseudo(PROC_SUPER_MAGIC, page, ST_VALID | ST_RELATIME))
+            }
+            Settled::Failed(errno) => Settled::Failed(errno),
+        });
+    }
+    Ok(match settle(view, fs.statvfs(guest_path))? {
+        Settled::Done(stats) => Settled::Done(StatfsAnswer::volume(&stats)),
+        Settled::Failed(errno) => Settled::Failed(errno),
+    })
+}
+
+/// Write a settled `statfs` answer or set its `errno`, returning the import's `0` or `-1`.
+fn finish_statfs(
+    view: &mut GuestView<'_>,
+    answer: Settled<StatfsAnswer>,
+    buf: u64,
+) -> AbiResult<i32> {
+    Ok(match answer {
+        Settled::Done(answer) => {
+            write_struct(view.blaming(2), buf, &answer.encode(), 2)?;
+            0
+        }
+        Settled::Failed(errno) => {
+            view.set_errno(errno);
+            -1
+        }
+    })
+}
+
+/// `int statfs(const char *path, struct statfs *buf)`, reached as `syscall(43, path, buf)` or a
+/// raw `SVC #0` with `x8 = 43`.
+///
+/// **Not a bound import**: no library of either APK imports `statfs`, `fstatfs`, `statfs64` or
+/// `fstatvfs` (their `.dynsym`s, read 2026-09-24). The engine asks the kernel directly, so this is
+/// reached only through [`super::procenv`]'s `syscall`, in the import convention (`-1` and
+/// `errno`); the raw-`SVC` path converts that to `-errno` itself. Argument numbers in a refusal
+/// are `syscall`'s: 0 is the syscall number, 1 the path, 2 the buffer.
+///
+/// The error split is [`statvfs`]'s: a path that is not there is `ENOENT`, a null path or an
+/// unwritable buffer is a refusal naming the argument.
+pub(super) fn statfs(c: &mut ImportCall<'_, '_>, path: u64, buf: u64) -> AbiResult<()> {
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let bytes = path_for(view.blaming(1), path, 1)?;
+        let fs = filesystem(&view)?;
+        let answer = statfs_of_path(&view, fs, &bytes)?;
+        finish_statfs(&mut view, answer, buf)?
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
+/// `int fstatfs(int fd, struct statfs *buf)`, reached as `syscall(44, fd, buf)` or a raw `SVC #0`
+/// with `x8 = 44`. MEASURED need: a TaskScheduler worker (start link `0x2869934`) died on the
+/// refusal of raw syscall 44 in the Pet Simulator 99 world (2026-09-24).
+///
+/// # What each descriptor kind answers
+///
+/// * **Not open → `EBADF`**, the kernel's answer. The kernel takes the descriptor as an
+///   `unsigned int`, so only its low 32 bits are the descriptor.
+/// * **A file, a directory or a generated `/proc` file → what [`statfs`] answers for the path it
+///   was opened by.** Every one of these was opened by a guest path and none moves, so the path
+///   is the volume. The one way that can fail is a file unlinked while open, which Linux still
+///   answers for and which here has no path left to ask about. `fstatfs` has no `ENOENT` to give
+///   — an open descriptor is on *some* filesystem — so that is refused by name rather than
+///   reported as an error the call cannot produce.
+/// * **A pipe → `PIPEFS_MAGIC`, a socket → `SOCKFS_MAGIC`, an eventfd, epoll or timerfd →
+///   `ANON_INODE_FS_MAGIC`**, each with `simple_statfs`'s shape (see
+///   [`StatfsAnswer::pseudo`]). These are what Linux answers, and they are answered rather than
+///   refused because every field is a constant of the kernel's rather than a property of a device:
+///   those three filesystems are kernel-internal mounts with no size, no inodes to count, no fsid
+///   and no mount options, so `f_flags` is `ST_VALID` alone. **ASSUMED from `fs/statfs.c` and
+///   `fs/libfs.c` as recalled, not measured on a device.**
+/// * **A standard stream or a character device (`/dev/null`, `/dev/urandom`) → refused by name.**
+///   On a device those live on `/dev`'s tmpfs, whose block counts are a share of the device's RAM
+///   this layer does not model, and the host's standard streams are not files on any Android
+///   filesystem at all. No run has reached either.
+pub(super) fn fstatfs(c: &mut ImportCall<'_, '_>, fd: u64, buf: u64) -> AbiResult<()> {
+    // `unsigned int fd`, as the kernel declares it: the upper half of the register is not part of
+    // the descriptor.
+    let fd = fd as u32 as i32;
+    let state = active(c.symbol(), c.address())?;
+    let result = {
+        let mut view = enter(c, &state);
+        let fs = filesystem(&view)?;
+        let page = view.active.bionic.space_page_size() as u64;
+        let answer = if !fs.is_open(fd) {
+            Settled::Failed(consts::EBADF)
+        } else if fs.pipe_end(fd).is_some() {
+            Settled::Done(StatfsAnswer::pseudo(PIPEFS_MAGIC, page, ST_VALID))
+        } else if fs.is_socket(fd) {
+            Settled::Done(StatfsAnswer::pseudo(SOCKFS_MAGIC, page, ST_VALID))
+        } else if fs.is_epoll(fd)
+            || fs.eventfd_value(fd).is_some()
+            || fs.readiness_source(fd) == Some(ReadinessSource::Timer)
+        {
+            Settled::Done(StatfsAnswer::pseudo(ANON_INODE_FS_MAGIC, page, ST_VALID))
+        } else if let Some(guest) = fs.guest_path_of(fd) {
+            match statfs_of_path(&view, fs, guest.as_bytes())? {
+                Settled::Failed(errno) if errno == consts::ENOENT => {
+                    return Err(view.refusal(format!(
+                        "fstatfs on descriptor {fd}, opened as `{guest}`, which is no longer \
+                         there. Linux answers for an unlinked file's volume through the open \
+                         descriptor; this layer finds the volume by the path, and fstatfs has no \
+                         ENOENT to report instead"
+                    )));
+                }
+                settled => settled,
+            }
+        } else {
+            return Err(view.refusal(format!(
+                "fstatfs on descriptor {fd}, a standard stream or a character device. On a device \
+                 those are on /dev's tmpfs, whose block counts are a share of the device's RAM \
+                 that this layer does not model, and a host standard stream is on no Android \
+                 filesystem at all; every f_type available is a guess"
+            )));
+        };
+        finish_statfs(&mut view, answer, buf)?
+    };
+    c.ret().i32(result);
+    Ok(())
+}
+
 // ================================================================== the namespace
 
 /// The shared body of the one-path namespace calls.
@@ -2381,6 +2673,51 @@ mod tests {
         let read_only = VolumeStats { read_only: true, ..stats };
         let bytes = encode_statvfs(&read_only);
         assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), ST_RDONLY);
+    }
+
+    /// `statfs` is the kernel's asm-generic layout, not `statvfs`'s: `f_type` first, the fsid as
+    /// two ints at 56, and `f_frsize` **after** `f_namelen`. Literal offsets, every word distinct,
+    /// so a swapped pair cannot pass.
+    #[test]
+    fn statfs_is_the_kernels_layout_with_ext4_and_st_valid() {
+        assert_eq!(STATFS_BYTES, 120, "asm-generic/statfs.h with 64-bit words");
+        assert_eq!(EXT4_SUPER_MAGIC, 0xEF53);
+        assert_eq!(PROC_SUPER_MAGIC, 0x9FA0);
+        assert_eq!(PIPEFS_MAGIC.to_be_bytes()[4..], *b"PIPE");
+        assert_eq!(SOCKFS_MAGIC.to_be_bytes()[4..], *b"SOCK");
+        assert_eq!(ANON_INODE_FS_MAGIC, 0x0904_1934);
+        assert_eq!((ST_VALID, ST_RELATIME), (0x20, 0x1000));
+        let stats = VolumeStats {
+            block_size: 4096,
+            blocks: 1_000_000,
+            blocks_free: 400_000,
+            blocks_available: 300_000,
+            name_max: 254,
+            filesystem_id: 0x1122_3344_5566_7788,
+            read_only: false,
+        };
+        let bytes = StatfsAnswer::volume(&stats).encode();
+        let at = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let at32 = |offset: usize| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(at(0), 0xEF53, "f_type");
+        assert_eq!(at(8), 4096, "f_bsize");
+        assert_eq!(at(16), 1_000_000, "f_blocks");
+        assert_eq!(at(24), 400_000, "f_bfree");
+        assert_eq!(at(32), 300_000, "f_bavail");
+        assert_eq!((at(40), at(48)), (0, 0), "f_files and f_ffree, as statvfs reports them");
+        assert_eq!((at32(56), at32(60)), (0x5566_7788, 0x1122_3344), "f_fsid.val[0], val[1]");
+        assert_eq!(at(64), 254, "f_namelen");
+        assert_eq!(at(72), 4096, "f_frsize");
+        assert_eq!(at(80), ST_VALID, "f_flags");
+        assert!(bytes[88..].iter().all(|b| *b == 0), "f_spare");
+        let bytes = StatfsAnswer::volume(&VolumeStats { read_only: true, ..stats }).encode();
+        assert_eq!(u64::from_le_bytes(bytes[80..88].try_into().unwrap()), ST_VALID | ST_RDONLY);
+
+        let bytes = StatfsAnswer::pseudo(PIPEFS_MAGIC, 16384, ST_VALID).encode();
+        let at = |offset: usize| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        assert_eq!((at(0), at(8), at(72)), (PIPEFS_MAGIC, 16384, 16384), "type, bsize, frsize");
+        assert_eq!((at(64), at(80)), (255, ST_VALID), "namelen, flags");
+        assert!((16..64).step_by(8).all(|o| at(o) == 0), "no counts and no fsid");
     }
 
     /// A `struct dirent` carries its name NUL-terminated, with the type byte at 18.

@@ -1154,19 +1154,37 @@ fn read_vma_name(view: &GuestView<'_>, name: u64) -> Result<Option<String>, i32>
 /// The asm-generic numbering, which is what arm64 Linux uses. Diagnostic only; nothing branches on
 /// it. `gettid` (178) is listed because a raw `syscall(SYS_gettid)` is the usual way Android code
 /// gets a thread id and is the likeliest of these to arrive first.
+///
+/// `statfs` (43) and `fstatfs` (44) are answered now, and were added after `fstatfs` refused with
+/// no name at all (2026-09-24); the file-descriptor neighbours added with them are the numbers a
+/// raw-syscall wrapper that reached one of those is likeliest to reach next.
 fn syscall_name(number: i64) -> Option<&'static str> {
     Some(match number {
+        17 => "getcwd",
+        25 => "fcntl",
+        29 => "ioctl",
+        43 => "statfs",
+        44 => "fstatfs",
+        46 => "ftruncate",
+        48 => "faccessat",
         56 => "openat",
         57 => "close",
+        61 => "getdents64",
+        62 => "lseek",
         63 => "read",
         64 => "write",
         78 => "readlinkat",
+        79 => "newfstatat",
+        80 => "fstat",
         98 => "futex",
         113 => "clock_gettime",
         115 => "clock_nanosleep",
         122 => "sched_setaffinity",
         124 => "sched_yield",
+        131 => "tgkill",
+        134 => "rt_sigaction",
         135 => "rt_sigprocmask",
+        160 => "uname",
         167 => "prctl",
         172 => "getpid",
         178 => "gettid",
@@ -1182,6 +1200,10 @@ fn syscall_name(number: i64) -> Option<&'static str> {
 
 /// `gettid`, in the asm-generic numbering arm64 Linux uses.
 const SYS_GETTID: i64 = 178;
+/// `statfs`, in the asm-generic numbering arm64 Linux uses.
+const SYS_STATFS: i64 = 43;
+/// `fstatfs`, in the asm-generic numbering arm64 Linux uses.
+const SYS_FSTATFS: i64 = 44;
 /// `rt_sigprocmask`, in the asm-generic numbering arm64 Linux uses.
 const SYS_RT_SIGPROCMASK: i64 = 135;
 /// `sizeof(sigset_t)` as the kernel's `rt_sigprocmask` requires it, and as D24 records it.
@@ -1776,6 +1798,14 @@ pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     if number == SYS_GETRANDOM {
         return getrandom(c, a1, a2, a3);
     }
+    // The volume a path or a descriptor is on, answered by the file layer that owns both. MEASURED
+    // need for 44: a TaskScheduler worker died on it in the Pet Simulator 99 world (2026-09-24).
+    if number == SYS_STATFS {
+        return super::files::statfs(c, a1, a2);
+    }
+    if number == SYS_FSTATFS {
+        return super::files::fstatfs(c, a1, a2);
+    }
     if number == SYS_GETTID {
         // **`gettid` is a thread identity, and this runtime has one.**
         //
@@ -1875,6 +1905,8 @@ mod tests {
         assert!(prctl_option_name(0x5356_4d41).is_some_and(|n| n.starts_with("PR_SET_VMA")));
         assert_eq!(prctl_option_name(9999), None);
         assert_eq!(syscall_name(178), Some("gettid"));
+        assert_eq!(syscall_name(SYS_STATFS), Some("statfs"));
+        assert_eq!(syscall_name(SYS_FSTATFS), Some("fstatfs"));
         assert_eq!(syscall_name(-1), None);
         assert_eq!(syscall_name(100_000), None);
     }
