@@ -4360,10 +4360,25 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 "data/data/com.roblox.client/files/appData/LocalStorage/memProfStorage{}.json",
                 omni_platform::process::pid()
             ));
+            // **The file, or the engine's own log line when the file is gone.** MEASURED
+            // (w7-w10, 2026-09-25, in the world): the engine logs `[FLog::SessionTransitionFSM]
+            // Session history: IASPB` on the close and the record file no longer exists on the
+            // host afterwards -- the engine removes it, now that `remove` is served (it used to
+            // kill the thread that tried). The line is the same record, in the engine's words.
             let history = || {
-                std::fs::read_to_string(&record).ok().and_then(|text| {
-                    text.split("\"SessionHistory\":\"").nth(1).and_then(|rest| rest.split('"').next()).map(str::to_string)
-                })
+                std::fs::read_to_string(&record)
+                    .ok()
+                    .and_then(|text| {
+                        text.split("\"SessionHistory\":\"").nth(1).and_then(|rest| rest.split('"').next()).map(str::to_string)
+                    })
+                    .or_else(|| {
+                        guest.bionic.log_records().iter().rev().find_map(|r| {
+                            r.message
+                                .split("Session history: ")
+                                .nth(1)
+                                .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+                        })
+                    })
             };
             let backgrounded = std::time::Instant::now();
             while backgrounded.elapsed() < std::time::Duration::from_secs(60)
@@ -4378,6 +4393,28 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 backgrounded.elapsed().as_secs_f32()
             );
             if !history.as_deref().is_some_and(|letters| letters.ends_with('B')) {
+                // What the host sees of the record, so a failure here says whether the file is
+                // missing, unreadable or without the key -- never its contents.
+                let seen = match std::fs::read(&record) {
+                    Ok(bytes) => format!(
+                        "{} bytes, {} of them zero, key present: {}",
+                        bytes.len(),
+                        bytes.iter().filter(|&&b| b == 0).count(),
+                        bytes.windows(16).any(|w| w == b"\"SessionHistory\"")
+                    ),
+                    Err(error) => format!("unreadable: {error}"),
+                };
+                let listing: Vec<String> = record
+                    .parent()
+                    .and_then(|dir| std::fs::read_dir(dir).ok())
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .map(|e| format!("{} ({} bytes)", e.file_name().to_string_lossy(), e.metadata().map_or(0, |m| m.len())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ = writeln!(std::io::stderr(), "CLOSE: the record on the host: {seen}; its directory: {listing:?}");
                 close_failure = Some(format!(
                     "60 s after the close, the engine's session record ({}) says SessionHistory \
                      {history:?}, not an app in the background -- the next launch of a kept root \
