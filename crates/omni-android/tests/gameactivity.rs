@@ -416,6 +416,14 @@ fn main_lib_bytes() -> &'static [u8] {
 /// Where the package's own APK is, as the guest sees it: a device's `base.apk`.
 const GUEST_APK: &str = "/data/app/com.roblox.client/base.apk";
 
+/// Where the package manager puts `libroblox.so` on a device: beside `base.apk`, in `lib/arm64/`.
+///
+/// The APK stores it **compressed** (deflate), so a device's installer extracts it there and the
+/// linker maps it from there -- which is the path `/proc/self/maps` and `dl_iterate_phdr` then
+/// name. The gate places the same bytes at the same guest path and maps the library from it, so
+/// the guest sees one consistent file where a device has it (and not a Windows cache path).
+const GUEST_LIB: &str = "/data/app/com.roblox.client/lib/arm64/libroblox.so";
+
 /// The engine's own assets, out of the real APK.
 ///
 /// **The real thing rather than a table**, because what `AAssetManager_open` is asked for is one
@@ -554,8 +562,18 @@ impl Guest {
     fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display) -> Self {
         let path = cached_main_lib();
         let bytes = main_lib_bytes();
-        let backing =
-            Backing::open(path, MapExecutability::Executable).expect("open the cache entry");
+        // The root first, so the library can be mapped from where a device keeps it (`GUEST_LIB`).
+        let root = Scratch::new("m5-gate");
+        let lib_at = root.0.join(GUEST_LIB.trim_start_matches('/'));
+        std::fs::create_dir_all(lib_at.parent().expect("a directory")).expect("lib/arm64");
+        // A kept root may hold another version's: replace it. A hard link costs nothing; a copy
+        // is the fallback where the cache is on another volume.
+        let _ = std::fs::remove_file(&lib_at);
+        if std::fs::hard_link(path, &lib_at).is_err() {
+            std::fs::copy(path, &lib_at).expect("libroblox.so into the guest's lib/arm64");
+        }
+        let backing = Backing::open_named(&lib_at, MapExecutability::Executable, GUEST_LIB)
+            .expect("open libroblox.so where the guest sees it");
         let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
         let space = Arc::new(
             GuestSpace::with_config(GuestSpaceConfig {
@@ -647,7 +665,6 @@ impl Guest {
         script::declare_script_classes(&jni);
         define_host_answers(&jni, &display);
 
-        let root = Scratch::new("m5-gate");
         bionic.set_filesystem_root(&root.0).expect("a filesystem root");
         // **How earlier runs ended**, as the system hands `getHistoricalProcessExitReasons` on a
         // device: what this host recorded in a kept root (`record_exit`), and nothing for a fresh
@@ -733,6 +750,34 @@ impl Guest {
         let boundary = builder.finish();
 
         bionic.register_image(&object.dl_phdr_info()).expect("register the loaded image");
+        // **`.bss`, labelled as Android's linker labels it**: each PT_LOAD's whole pages past its
+        // file image, `prctl(PR_SET_VMA_ANON_NAME, ".bss")` in `linker_phdr.cpp`. What
+        // `/proc/self/maps` then shows as `[anon:.bss]`.
+        for segment in elf.load_segments() {
+            let page = space.page_size() as u64;
+            let file_end = (segment.p_vaddr + segment.p_filesz).div_ceil(page) * page;
+            let mem_end = (segment.p_vaddr + segment.p_memsz).div_ceil(page) * page;
+            if mem_end > file_end {
+                bionic.name_anonymous_mapping(
+                    object.base as u64 + file_end,
+                    mem_end - file_end,
+                    ".bss",
+                );
+            }
+        }
+        // **OMNI_FILE_TRACE=1**: every path the guest probes (`open`, `stat`, `lstat`, `access`,
+        // `opendir`) with its answer, and every raw `svc #0` with its number, arguments, result
+        // and -- for an `openat` -- its path. For finding what a check that goes looking for files
+        // looked for; off by default, because it is a line per call.
+        if std::env::var("OMNI_FILE_TRACE").is_ok_and(|v| v == "1") {
+            let _ = writeln!(std::io::stderr(), "TRACE: files and raw syscalls (OMNI_FILE_TRACE)");
+            if let Some(fs) = bionic.filesystem() {
+                fs.set_trace(Arc::new(|line: &str| {
+                    let _ = writeln!(std::io::stderr(), "{line}");
+                }));
+            }
+            boundary.set_syscall_trace(true);
+        }
 
         let exports = elf
             .exported_symbols()
