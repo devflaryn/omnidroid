@@ -76,8 +76,10 @@ const APK_NAME: &str = "Roblox-2.739.691.apk";
 const GRAPHICS_GATE: &str = "OMNI_GFX_WINDOW_TESTS";
 const MAIN_LIB: &str = "libroblox.so";
 
-/// `DT_INIT_ARRAY` entries in `libroblox.so`. The same exact figure M3's and M4's gates assert.
-const INITIALIZERS: usize = 3_594;
+/// `DT_INIT_ARRAY` entries in 2.738.1397's `libroblox.so`, the figure M3's and M4's gates assert
+/// against that fixture. This gate runs whatever APK [`APK_NAME`] names (2.739.691 has 3,610), so it
+/// asserts that **every** entry the loaded library declares ran, and only reports this one.
+const INITIALIZERS_2_738: usize = 3_594;
 
 /// The class of the activity `initializeNativeCode` is called on.
 ///
@@ -324,6 +326,9 @@ const FLAG_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The spin lock `nativeInitClientSettings` blocks on, as an offset from the load base.
 ///
+/// **A 2.738.1397 link address**: under any other APK this prints an unrelated word of the image,
+/// and nothing depends on it.
+///
 /// **A temporary probe, not a contract.** MEASURED: with the hint handling in place, §8 row 21
 /// spends its whole 200,000,000-instruction budget at guest `0x021eba20` -- the `yield` of a
 /// three-instruction spin (`ldr w8,[x26,#0xa30]; cbz; yield; b`) whose acquire is
@@ -334,6 +339,9 @@ const FLAG_FETCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const SPIN_LOCK_OFFSET: usize = 0x06dd_0a30;
 
 /// Where `Flag::areFlagsLoaded()`'s byte lives, as an offset from `libroblox.so`'s load base.
+///
+/// **A 2.738.1397 link address**, like [`SPIN_LOCK_OFFSET`]: a diagnostic read only, meaningless
+/// under another APK until re-decoded.
 ///
 /// **Decoded, and the decoding is what makes it one address rather than a guess.** A scan of
 /// every `ADRP`+`STRB`/`LDRB` pair in `.text` that resolves to `0x072739d4` finds **one** store
@@ -1533,7 +1541,16 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         image_word(&guest, SPIN_LOCK_OFFSET + 4, "the count at 0x06dd0a34")
     );
     let completed = guest.run_initializers(&mut cpu);
-    assert_eq!(completed, INITIALIZERS, "M5 starts where M4's gate starts");
+    assert_eq!(
+        completed,
+        guest.object.init_array.len(),
+        "M5 starts where M4's gate starts: every initializer the library declares"
+    );
+    let _ = writeln!(
+        std::io::stderr(),
+        "INITIALIZERS: {completed} of {} returned (2.738.1397 had {INITIALIZERS_2_738})",
+        guest.object.init_array.len()
+    );
     let _ = writeln!(
         std::io::stderr(),
         "after the initializers: spin lock {}, count {}",
