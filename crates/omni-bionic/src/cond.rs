@@ -389,6 +389,16 @@ pub fn wait_begin(
     Ok(())
 }
 
+/// The longest one host park inside a timed [`wait_end`] lasts before it re-reads its mark and
+/// the stop switch: sixty seconds, the embedding's per-park bound (`MAX_SLEEP_SECONDS` in
+/// `omni-android`).
+///
+/// **A slice, not a cap.** A guest deadline further out than this is waited on in full, in
+/// slices, and answered `ETIMEDOUT` only when it has really passed. MEASURED on the real engine
+/// (2.739.691, 2026-09-24): the join worker started at link `0x22d457c` waits about 120 s on a
+/// cond; refusing that wait killed the thread and the join silently never started (6 of 8 runs).
+pub const WAIT_SLICE: Duration = Duration::from_secs(60);
+
 thread_local! {
     /// The calling thread's registered cond entries (cond_addr -> entry).
     /// Invariant: at most one live registration per (thread, cond) — a thread
@@ -425,7 +435,12 @@ pub fn wait_end(
         .ok_or(crate::memory::Fault(cond_addr))?; // no live registration
 
     // Sleep until marked or timed out, on the thread's OWN entry.
-    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+    //
+    // **A deadline past the host clock's range is no deadline.** The guest chooses the timeout
+    // (an absolute `timespec` can name any year), and `Instant + Duration` panics on overflow;
+    // a wait that cannot end before the clock itself runs out is waited on as an untimed one,
+    // which is what it is. The stop switch below ends it as it ends every other wait.
+    let deadline = timeout.and_then(|t| std::time::Instant::now().checked_add(t));
     let mut signalled = false;
     {
         let guard = entry.mutex.lock().unwrap();
@@ -450,7 +465,12 @@ pub fn wait_end(
                     if now >= d {
                         break;
                     }
-                    let (g, _) = entry.condvar.wait_timeout(guard, d - now).unwrap();
+                    // **In slices of at most [`WAIT_SLICE`]**, so every host park is bounded
+                    // whatever the guest asked for: the loop re-reads the mark and the stop
+                    // switch after each one and waits again until the real deadline. Only the
+                    // real deadline answers ETIMEDOUT.
+                    let (g, _) =
+                        entry.condvar.wait_timeout(guard, (d - now).min(WAIT_SLICE)).unwrap();
                     guard = g;
                 }
                 None => {

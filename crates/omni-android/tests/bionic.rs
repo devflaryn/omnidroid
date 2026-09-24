@@ -13249,39 +13249,177 @@ fn an_out_of_range_tv_nsec_is_einval() {
     }
 }
 
-/// **An absolute deadline further out than the layer's cap is refused by name**, the same cap
-/// `nanosleep`, `poll`, `select` and `ALooper_pollOnce` state.
-///
-/// The number is derived from the clock rather than written down, so the test cannot drift from
-/// the cap: `MAX_SLEEP_SECONDS` past now is inside it and twice that is not.
-#[test]
-fn an_absolute_deadline_past_the_cap_is_refused_and_names_the_cap() {
-    let _guard = serialized();
-    let f = fixture();
-    let cond = f.guest.data + 0x300;
-    let mutex = f.guest.data + 0x400;
-    let abstime = f.guest.data + 0x500;
-    f.guest.write_bytes(cond, &[0u8; 48]);
-    f.guest.write_bytes(mutex, &[0u8; 40]);
-    let now = omni_platform::clock::realtime_now().as_secs();
-    f.guest.write_u64(abstime, now + 2 * omni_android::bionic::MAX_SLEEP_SECONDS);
-    f.guest.write_u64(abstime + 8, 0);
-
-    let error = refusal_of(&f, "pthread_cond_timedwait", |asm| {
+/// Assemble a guest thread that locks `mutex`, says it is there, waits on `cond` until the
+/// absolute deadline at `abstime`, stores what the wait returned at `result`, unlocks and returns;
+/// and the program that creates it. Returns `(waiter, create)`.
+fn timedwait_programs(
+    f: &Fixture,
+    cond: usize,
+    mutex: usize,
+    abstime: usize,
+    entered: usize,
+    result: usize,
+    handle: usize,
+) -> (usize, usize) {
+    let waiter = {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_lock"));
+        asm.mov(9, entered as u64);
+        asm.mov(10, 1);
+        asm.push(str_imm(10, 9, 0));
         asm.mov(0, cond as u64);
         asm.mov(1, mutex as u64);
         asm.mov(2, abstime as u64);
-    });
-    let text = error.to_string();
-    assert!(text.contains("pthread_cond_timedwait"), "{text}");
-    assert!(
-        text.contains(&format!("{} seconds", omni_android::bionic::MAX_SLEEP_SECONDS)),
-        "the refusal must name the cap it applied: {text}"
-    );
-    assert!(text.contains("CLOCK_REALTIME"), "and the clock it measured against: {text}");
+        asm.bl(f.thunk("pthread_cond_timedwait"));
+        asm.mov(9, result as u64);
+        asm.push(str_imm(0, 9, 0));
+        asm.mov(0, mutex as u64);
+        asm.bl(f.thunk("pthread_mutex_unlock"));
+        asm.mov(0, 0);
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        entry
+    };
+    let create = {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, cond as u64);
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_cond_init"));
+        asm.mov(0, mutex as u64);
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_mutex_init"));
+        asm.mov(0, handle as u64);
+        asm.mov(1, 0);
+        asm.mov(2, waiter as u64);
+        asm.mov(3, 0);
+        asm.bl(f.thunk("pthread_create"));
+        asm.mov(22, f.guest.data as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        entry
+    };
+    (waiter, create)
 }
 
+/// Run `create` and wait (bounded) until a guest thread is parked in `pthread_cond_timedwait`.
+fn start_a_long_timedwait(f: &Fixture, create: usize, entered: usize) {
+    {
+        let _active = f.bionic.activate().expect("a thread block");
+        let exit = run_program(f, create).expect("the create completes");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    }
+    assert_eq!(f.guest.read_u64(f.guest.data), 0, "pthread_create must succeed");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let observed = loop {
+        let parked = f.bionic.parked();
+        if !parked.is_empty() {
+            break parked;
+        }
+        assert!(
+            f.bionic.guest_thread_failures().is_empty(),
+            "the waiter died instead of waiting: {:?}",
+            f.bionic.guest_thread_failures()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no thread parked in 30 seconds; the waiter reported entering: {}",
+            f.guest.read_u64(entered)
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(observed.len(), 1, "{observed:?}");
+    assert_eq!(observed[0].symbol, "pthread_cond_timedwait");
+}
 
+/// **An absolute deadline further out than `MAX_SLEEP_SECONDS` is waited on, not refused**, and a
+/// signal ends it with 0.
+///
+/// MEASURED on the real engine (2.739.691, 2026-09-24): the join worker started at link
+/// `0x22d457c` waits ~120 s on a cond. This layer refused any deadline past its 60 s cap, the
+/// refusal killed the worker, and the join silently never started in 6 of 8 runs. The deadline
+/// here is twice the cap, derived from the constant so it cannot drift from it.
+#[test]
+fn an_absolute_deadline_past_the_park_bound_is_waited_on_and_a_signal_ends_it() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let (cond, mutex, abstime) = (f.guest.data + 0x400, f.guest.data + 0x480, f.guest.data + 0x4c0);
+    let (handle, entered, result) =
+        (f.guest.data + 0x500, f.guest.data + 0x508, f.guest.data + 0x510);
+    f.guest.write_u64(entered, 0);
+    f.guest.write_u64(result, 0xdead);
+    let now = omni_platform::clock::realtime_now().as_secs();
+    f.guest.write_u64(abstime, now + 2 * omni_android::bionic::MAX_SLEEP_SECONDS);
+    f.guest.write_u64(abstime + 8, 0);
+    let (_waiter, create) = timedwait_programs(&f, cond, mutex, abstime, entered, result, handle);
+    let release = {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(0, cond as u64);
+        asm.bl(f.thunk("pthread_cond_broadcast"));
+        asm.mov(22, handle as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.mov(22, f.guest.data as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.push(ret(21));
+        f.guest.load(asm.words());
+        entry
+    };
+
+    start_a_long_timedwait(&f, create, entered);
+    let released = std::time::Instant::now();
+    {
+        let _active = f.bionic.activate().expect("a thread block");
+        let exit = run_program(&f, release).expect("the broadcast and join complete");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    }
+    assert_eq!(f.guest.read_u64(f.guest.data), 0, "pthread_join must succeed");
+    assert_eq!(f.guest.read_u64(result) as u32, 0, "a signalled wait returns 0, not ETIMEDOUT");
+    assert!(
+        released.elapsed() < std::time::Duration::from_secs(10),
+        "the signal ended the wait, not a slice or the deadline: {:?}",
+        released.elapsed()
+    );
+    assert!(f.bionic.guest_thread_failures().is_empty(), "{:?}", f.bionic.guest_thread_failures());
+}
+
+/// **A long timed cond wait does not hold teardown**: `stop_guest_threads` ends it, and the
+/// thread finishes, well inside one slice.
+///
+/// The other half of lifting the cap: what the cap protected was a host thread parked where D16's
+/// step budgets cannot reach it. The cond registry's stop wakes every waiter, so a deadline two
+/// slices out is no longer a reason to refuse.
+#[test]
+fn a_long_timed_cond_wait_is_ended_by_the_stop_switch() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let (cond, mutex, abstime) = (f.guest.data + 0x400, f.guest.data + 0x480, f.guest.data + 0x4c0);
+    let (handle, entered, result) =
+        (f.guest.data + 0x500, f.guest.data + 0x508, f.guest.data + 0x510);
+    f.guest.write_u64(entered, 0);
+    let now = omni_platform::clock::realtime_now().as_secs();
+    f.guest.write_u64(abstime, now + 2 * omni_android::bionic::MAX_SLEEP_SECONDS);
+    f.guest.write_u64(abstime + 8, 0);
+    let (_waiter, create) = timedwait_programs(&f, cond, mutex, abstime, entered, result, handle);
+
+    start_a_long_timedwait(&f, create, entered);
+    let stopped = std::time::Instant::now();
+    f.bionic.stop_guest_threads();
+    assert!(
+        f.bionic.join_guest_threads(std::time::Duration::from_secs(20)),
+        "the waiter must finish once asked to stop; still parked: {:?}",
+        f.bionic.parked()
+    );
+    assert!(stopped.elapsed() < std::time::Duration::from_secs(20), "{:?}", stopped.elapsed());
+}
 
 /// **A guest thread blocked in `pthread_cond_wait` is visible from outside while it is blocked.**
 ///

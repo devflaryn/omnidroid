@@ -1335,24 +1335,15 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
     // deadline already gone is a zero wait, which `wait_end` turns into a release, a relock and
     // ETIMEDOUT. `seconds` below zero lands here too, through the `unwrap_or(0)` above.
     let budget = absolute.saturating_sub(now);
-    if budget.as_secs() > super::MAX_SLEEP_SECONDS {
-        return Err(AbiError::Refused {
-            symbol: c.symbol().to_string(),
-            address: c.address(),
-            why: format!(
-                "the guest asked `pthread_cond_timedwait` to wait {budget:?} -- an absolute \
-                 deadline of {seconds}.{nanos:09} on {} -- and this layer caps a guest-chosen \
-                 wait at {} seconds, the same cap `nanosleep`, `poll`, `select` \
-                 and `ALooper_pollOnce` name. Clamping was rejected for their reason: returning \
-                 ETIMEDOUT at the cap reports a deadline that has not passed",
-                match clock {
-                    omni_bionic::cond::clock_id::CLOCK_MONOTONIC => "CLOCK_MONOTONIC",
-                    _ => "CLOCK_REALTIME",
-                },
-                super::MAX_SLEEP_SECONDS
-            ),
-        });
-    }
+    // **No cap on the deadline: a long one is waited on in slices.** This used to refuse any
+    // deadline more than `MAX_SLEEP_SECONDS` out, and the refusal killed the thread. MEASURED on
+    // the real engine (2.739.691, 2026-09-24): about 5 s after the join call, the worker started
+    // at link `0x22d457c` waits ~120 s here, and in 6 of 8 runs its death meant the join never
+    // started -- the loading screen stayed for ever. What the cap protected is kept without it:
+    // `cond::wait_end` parks for at most `cond::WAIT_SLICE` at a time and re-reads its mark and
+    // the stop switch between slices, and `Bionic::stop_guest_threads` wakes every cond waiter,
+    // so a long wait never holds teardown. ETIMEDOUT is answered only at the real deadline --
+    // the reason clamping was rejected still stands.
 
     // **Read before anything runs, and only ever printed.** `X29`/`X30` are the guest's own,
     // so the walk defends itself rather than trusting them; see `omni_bionic::unwind::frames`.

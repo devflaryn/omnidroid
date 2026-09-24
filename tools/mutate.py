@@ -6058,16 +6058,23 @@ directory", ADAPTER_FILES,
      """    if false {""",
      ANDROID),
 
-    # The cap removed, so a guest-chosen absolute deadline is waited out in full.
-    #
-    # **This row fails slowly and that is inherent**: the detector asks for twice the cap, so the
-    # mutated handler waits the ~120 s it was given and then answers ETIMEDOUT where a refusal was
-    # expected. It is a bounded failure rather than `pipe-B2`'s hang -- an absolute deadline is
-    # finite by construction -- but it is worth knowing before reading the elapsed column.
-    ("timedwait-A3", "A", "the guest-chosen wait cap removed, so a deadline is waited out in full",
+    # The refusal put back: a deadline past `MAX_SLEEP_SECONDS` refused, which killed the real
+    # engine's join worker (link `0x22d457c`, a ~120 s wait) and left the join never started.
+    # Detected by `an_absolute_deadline_past_the_park_bound_is_waited_on_and_a_signal_ends_it`:
+    # the waiter dies instead of parking.
+    ("timedwait-A3", "A", "a deadline past the park bound is refused again, killing the waiter",
      ADAPTER_HANDLERS,
-     """    if budget.as_secs() > super::MAX_SLEEP_SECONDS {""",
-     """    if false {""",
+     """    let budget = absolute.saturating_sub(now);
+""",
+     """    let budget = absolute.saturating_sub(now);
+    if budget.as_secs() > super::MAX_SLEEP_SECONDS {
+        return Err(AbiError::Refused {
+            symbol: c.symbol().to_string(),
+            address: c.address(),
+            why: "capped".to_string(),
+        });
+    }
+""",
      ANDROID),
 
     # There is deliberately **no row for the clock selection** -- reading `now` from the monotonic
