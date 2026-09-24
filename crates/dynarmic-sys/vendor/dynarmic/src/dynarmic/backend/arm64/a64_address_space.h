@@ -46,6 +46,10 @@ protected:
         IR::LocationDescriptor location;
         u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
         u64 last;
+        /// Omnidroid patch 0016: its block has been invalidated. A dead range matches nothing and
+        /// is dropped from every page list an invalidation walks, so a location translated again
+        /// and again leaves one live range, not one per translation.
+        bool dead = false;
     };
     static constexpr unsigned guest_page_bits = 12;
     /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every

@@ -559,6 +559,14 @@ uint64_t od_invalidation_page_probes(void) {
 #endif
 }
 
+uint64_t od_invalidation_ranges_checked(void) {
+#if defined(__aarch64__)
+    return static_cast<uint64_t>(Dynarmic::Backend::Arm64::invalidation_ranges_checked.load(std::memory_order_relaxed));
+#else
+    return 0;
+#endif
+}
+
 uint64_t od_page_backed_bytes(void) {
 #if defined(__aarch64__)
     return static_cast<uint64_t>(Dynarmic::Backend::Arm64::page_backed_bytes.load(std::memory_order_relaxed));

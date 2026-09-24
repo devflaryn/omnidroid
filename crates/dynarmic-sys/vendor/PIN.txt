@@ -22,6 +22,7 @@ dynarmic/
                and ../patches/0013-arm64-page-backed-bookkeeping.patch
                and ../patches/0014-arm64-the-store-exclusive-is-a-patch-location-too.patch
                and ../patches/0015-arm64-invalidate-only-chunks-with-code.patch
+               and ../patches/0016-arm64-a-translated-again-location-keeps-one-range.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

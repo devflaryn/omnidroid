@@ -27,6 +27,10 @@ inline std::atomic<std::size_t> page_backed_bytes{0};
 /// includes this header and cannot include that one.
 inline std::atomic<std::uint64_t> invalidation_page_probes{0};
 
+/// Omnidroid patch 0016: guest ranges `InvalidateCacheRanges` has checked against a range, over every
+/// jit in the process, for measurement (`od_invalidation_ranges_checked`).
+inline std::atomic<std::uint64_t> invalidation_ranges_checked{0};
+
 /// An allocator for the address space's per-block bookkeeping that takes large arrays straight from
 /// the kernel and gives them straight back.
 ///

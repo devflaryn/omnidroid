@@ -22,4 +22,10 @@ ROWS = [
      """        guest_range_chunks.insert(page >> (guest_chunk_bits - guest_page_bits));  // patch 0015""",
      """        (void)page;  // patch 0015 mutated""",
      TESTS),
+    ("mac-cpu-I3", "A", "an invalidated range is not marked dead (patch 0016 off): every "
+     "re-translation of a location leaves one more range for every later invalidation to check",
+     ASPACE,
+     """                range.dead = true;  // patch 0016""",
+     """                (void)range;  // patch 0016 mutated""",
+     TESTS),
 ]

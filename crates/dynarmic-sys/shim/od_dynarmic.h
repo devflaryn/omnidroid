@@ -378,6 +378,11 @@ uint64_t od_page_backed_bytes(void);
  * backend does not have the index. For measurement only. */
 uint64_t od_invalidation_page_probes(void);
 
+/* Guest ranges the arm64 backend's `InvalidateCacheRanges` has checked, over
+ * every jit in the process (patch 0016). 0 where the backend has no such index.
+ * For measurement only. */
+uint64_t od_invalidation_ranges_checked(void);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);

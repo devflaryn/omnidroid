@@ -67,3 +67,38 @@ fn a_range_with_no_translated_code_in_it_is_not_walked_page_by_page() {
     println!("probes: {inside} for two code pages, {data} for 256 pages of data");
     assert!(data <= 1, "an invalidation of 256 pages with no code in them probed {data} pages");
 }
+
+extern "C" {
+    fn od_invalidation_ranges_checked() -> u64;
+}
+
+/// **Re-translating a location does not leave its old range behind** (patch 0016).
+///
+/// A long-lived block (page 0) that never goes away keeps the cache from ever being cleared, and a
+/// block on page 1 is invalidated and translated again, over and over -- the shape of code the
+/// engine keeps invalidating while the rest of `libroblox.so` stays translated. 0011 appended a
+/// range for every translation of page 1's block and dropped none until a cache clear, so every
+/// invalidation of page 1 checked one more range than the last: after `CYCLES` cycles, `CYCLES`.
+#[test]
+fn a_location_translated_again_leaves_no_old_range_behind() {
+    const CYCLES: u64 = 200;
+    // Page 0: B to page 1. Page 1: SVC.
+    let mut code = vec![a64::NOP; WORDS_PER_PAGE + 1];
+    code[0] = a64::b(WORDS_PER_PAGE as i32);
+    code[WORDS_PER_PAGE] = a64::svc(0);
+    let vm = Vm::new(code, VmOptions { code_cache_size: 16 << 20, ..VmOptions::default() });
+    run(&vm);
+    for _ in 0..CYCLES {
+        // Only page 1: page 0's block stays, so nothing ever clears the cache.
+        let _ = probes_for(&vm, CODE_BASE + PAGE, PAGE);
+    }
+    // SAFETY: no arguments; reads an atomic counter.
+    let before = unsafe { od_invalidation_ranges_checked() };
+    let _ = probes_for(&vm, CODE_BASE + PAGE, PAGE);
+    // SAFETY: as above.
+    let after = unsafe { od_invalidation_ranges_checked() };
+    let checked = after - before;
+    println!("after {CYCLES} re-translations, one invalidation of the page checked {checked} ranges");
+    assert!(checked >= 1, "the instrument: an invalidation of a translated page checks its range");
+    assert!(checked <= 4, "one invalidation of one re-translated page checked {checked} ranges");
+}

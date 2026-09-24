@@ -428,6 +428,22 @@ are found and invalidated. `od_invalidation_page_probes()` (shim, measurement on
 lookups; `tests/invalidation_probes.rs`: 256 pages of data probed **256** pages before, **0** after,
 and two code pages probe 2. Rows `mac-cpu-I1` (filter off) and `mac-cpu-I2` (chunks not recorded).
 
+### 0016 — arm64: a location translated again keeps one range, not one per translation
+
+`0016-arm64-a-translated-again-location-keeps-one-range.patch`. **arm64 only**, a defect in 0011,
+found by measuring 0015 in a game. 0011's page index appended a `GuestRange` every time a block was
+translated and dropped none until a cache clear, which never comes while any block survives (the
+rest of `libroblox.so` stays translated). The pin's `BlockRangeInformation` kept a *set* of
+locations per interval, so a location translated again collapsed into its old entry; 0011's lists
+did not. Code the engine invalidates and translates again, over and over, therefore piled up dead
+entries that every later invalidation of those pages checked: MEASURED in a game with 0015 applied
+(`sample`, 5 s, n = 1), three guest threads at **97-98%** of their time in
+`InvalidateCacheRanges`. A range is now marked dead when its block is invalidated, and dead ranges
+are dropped from each page list an invalidation walks (and a page whose list empties is dropped).
+`tests/invalidation_probes.rs`: 200 invalidate-and-translate cycles of one page, then one
+invalidation checks **201** ranges before and **1** after (`od_invalidation_ranges_checked`,
+measurement only). Row `mac-cpu-I3`.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

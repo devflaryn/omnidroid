@@ -507,15 +507,27 @@ void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>&
         const u64 first = boost::icl::first(interval);
         const u64 last = boost::icl::last(interval);
         const auto consider = [&](u32 index) {
-            const GuestRange& range = guest_ranges[index];
-            if (range.first <= last && first <= range.last) {
+            invalidation_ranges_checked.fetch_add(1, std::memory_order_relaxed);
+            GuestRange& range = guest_ranges[index];
+            if (!range.dead && range.first <= last && first <= range.last) {
                 erase_locations.insert(range.location);
+                range.dead = true;  // patch 0016
             }
+        };
+        // Patch 0016: consider every index of one page's list, then drop the dead ones from it.
+        // Answers whether the list is now empty, so that the caller can drop the page.
+        const auto consider_list = [&](std::vector<u32>& indices) {
+            for (const u32 index : indices) {
+                consider(index);
+            }
+            std::erase_if(indices, [&](u32 index) { return guest_ranges[index].dead; });
+            return indices.empty();
         };
 
         for (const u32 index : wide_guest_ranges) {
             consider(index);
         }
+        std::erase_if(wide_guest_ranges, [&](u32 index) { return guest_ranges[index].dead; });
 
         const u64 first_page = first >> guest_page_bits;
         const u64 last_page = last >> guest_page_bits;
@@ -525,9 +537,9 @@ void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>&
         const auto walk_pages = [&](u64 from_page, u64 to_page) {
             for (u64 page = from_page;; ++page) {
                 ++probes;
-                if (const auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
-                    for (const u32 index : iter->second) {
-                        consider(index);
+                if (auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
+                    if (consider_list(iter.value())) {
+                        guest_range_pages.erase(iter);
                     }
                 }
                 if (page == to_page) {
@@ -545,12 +557,13 @@ void A64AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u64>&
         const u64 last_chunk = last_page >> chunk_shift;
         if (last_page - first_page >= guest_range_pages.size()) {
             // More pages asked about than have anything on them: walk what there is.
-            for (const auto& [page, indices] : guest_range_pages) {
+            for (auto iter = guest_range_pages.begin(); iter != guest_range_pages.end();) {
                 ++probes;
-                if (page >= first_page && page <= last_page) {
-                    for (const u32 index : indices) {
-                        consider(index);
-                    }
+                const u64 page = iter->first;
+                if (page >= first_page && page <= last_page && consider_list(iter.value())) {
+                    iter = guest_range_pages.erase(iter);
+                } else {
+                    ++iter;
                 }
             }
         } else if (last_chunk - first_chunk >= guest_range_chunks.size()) {
