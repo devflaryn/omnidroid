@@ -5,8 +5,6 @@ Branch `port-macos`, from `base-0923-night` (`ce10eb8`). Host: Apple M1, 16 GB, 
 1.4.357. **Everything below marked MEASURED was run on that machine**; every figure carries its n
 and method. Nothing here is claimed for Intel Macs.
 
-> This document is being written as the port proceeds. Sections marked *(in progress)* are not yet
-> verified; the status table is the honest state.
 
 ## Build from a fresh Mac
 
@@ -22,23 +20,43 @@ brew install cmake ninja molten-vk vulkan-loader
 # 3. The APK beside the source, as on every host.
 cp Roblox-2.738.1397.apk ~/Desktop/omnidroid/
 
-# 4. Build and run the platform suites.
+# 4. Build and run everything (the first build compiles dynarmic with CMake: a few minutes).
 cd ~/Desktop/omnidroid
-cargo test -p omni-platform -p omni-mem --release
+cargo test --workspace --release --no-fail-fast
+
+# 5. The gate: a window, MoltenVK, the engine's landing screen. The window-server capture test also
+#    needs Screen Recording permission for the terminal (System Settings > Privacy & Security).
+OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 OMNI_KEYBOARD_MOUSE=1 cargo test -p omni-android \
+  --release --test gameactivity -- --nocapture --test-threads=1 \
+  initialize_native_code_returns_a_native_code_and_the_game_thread_starts
+
+# 6. Play: the same run with a long session, the storage kept (tools/play.sh --help).
+tools/play.sh
+
+# Optional: memory from outside the process, while a run is going.
+python3 tools/footprint_mac.py --match '[d]eps/gameactivity'
+
+# Optional: the native backend (D31, not the default). Its test binaries must be signed with the
+# hypervisor entitlement, which tools/hvf_run.sh does as the cargo runner.
+CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=$PWD/tools/hvf_run.sh \
+  cargo test -p omni-cpu --release --features native-hvf --test native -- --test-threads=1
 ```
+
+The APK must be a regular file or a hard link, not a symbolic link: the gate hard-links it into the
+guest's root, and the guest filesystem refuses a link to a symlink (MEASURED in two worktrees).
 
 The dynarmic build needs nothing else: its Boost subset and every external are vendored, and on a
 non-Windows target the build asks CMake for the vendored copies explicitly
 (`DYNARMIC_USE_BUNDLED_EXTERNALS=ON`), because with Homebrew present CMake otherwise finds
 `/opt/homebrew/lib/cmake/fmt` and links a library the pin never named (MEASURED).
 
-## Status *(in progress)*
+## Status
 
 | Seam / piece | State on macOS | Evidence |
 |---|---|---|
 | `vm` | implemented | `vm_macos` 17, `vm_footprint_macos` 1, `omni-mem` space 41 + arena 9; `mac-plat-A*/B*` 11/11 |
 | `fs` (`pread`, `pwrite`, `fallocate`, `statvfs`) | implemented | lib tests; `mac-plat-C1..C4` |
-| `process` | implemented | lib tests; `mac-plat-C5..C8` |
+| `process`, threads | implemented: entropy, current CPU (`pthread_cpu_number_np`), thread priority as QoS classes, CPU time | lib tests; `mac-plat-C5..C8` |
 | `net` | implemented | `net_loopback` 27, `net_macos` 4, `net_seam` 11; `mac-plat-D*` 9/9 |
 | `fault` | implemented | `fault_macos` 10, `fault_teardown_race` 2; `mac-fault-*` 9/9 |
 | `clock` | portable `std`; timer resolution is a no-op here (see "Timers") | |
@@ -46,6 +64,7 @@ non-Windows target the build asks CMake for the vendored copies explicitly
 | dynarmic arm64, `omni-cpu` | parity: carried patches 0002-0009 and 0014 (the store-exclusive fault, below) | see `docs/ports/macos-cpu.md`; `mac-cpu-` 25/25 + `mac-cpu-E1` |
 | native backend (Hypervisor.framework) | built, measured, **not adopted** (D31) | `macos-hvf.md`; `mac-hvf-` 26/26 |
 | **the gate** | **passes**, landing screen reached | below |
+| memory | boot peak **862-1,122 MiB**, steady **811-841 MiB** at the landing screen; ten instances on 8 GB **not shown** (4 of 4 on this 16 GB Mac) | below; `macos-memory.md`; `mac-mem-` 10/10 |
 | `webview` | **not ported** (structural `Unsupported`): WKWebView is the macOS equivalent | |
 | ELF loader on 16 KiB pages | relro sealed as bionic seals it; `libzstd-jni` (`p_align` 0x1000) refused by name | `loader_m1` 13, `loader_hostile` 25; `mac-elf-A1` 1/1 |
 | **the whole workspace** | `cargo test --workspace --release --no-fail-fast`: 162 suites, **2,054 passed, 1 failed** (the headless gate, below), 90 ignored | 2026-09-24, `port-macos` at `c4845e7` |
@@ -77,22 +96,35 @@ MiB, 1,957-2,005 MiB at the landing (n = 1 run, 1 s samples).
 Headless (`OMNI_GFX_WINDOW_TESTS` unset) the engine falls back to GLES and a thread dies on unbound
 `eglGetDisplay`: the same failure HANDOFF records for Windows ("still open", item 7).
 
-### Memory in the gate (MEASURED, `tools/footprint_mac.py`, 1 s samples)
+### Memory in the gate (MEASURED, `tools/footprint_mac.py`, 1 s samples of `phys_footprint`)
 
-| | before patch 0009 | after |
-|---|---|---|
-| boot peak (`ri_lifetime_max_phys_footprint`) | 3,260 MiB | **2,587 MiB** |
-| at the landing screen (60 s) | ~3,210 MiB | **~2,055 MiB** |
-| after teardown | 952 MiB | 1,046 MiB |
+| | before patch 0009 (n = 1) | + patch 0009 (`ef65a2d`) | + patches 0010-0013, load buffer released (`mac-mem`) |
+|---|---|---|---|
+| boot peak (`ri_lifetime_max_phys_footprint`) | 3,260 MiB | 2,492-2,878 MiB (n = 3) | **1,045-1,122 MiB** (n = 4); **862 MiB** on the merged tree (n = 1) |
+| steady at the landing screen (+60 s) | ~3,210 MiB | 2,420-2,698 MiB, still climbing (n = 3) | **811-841 MiB**, flat (n = 4); **824-826 MiB** on the merged tree (n = 1) |
 
-`footprint(1)` at the landing screen, after 0009: `MALLOC_LARGE` 876 MB, untagged `VM_ALLOCATE`
-554 MB, `MALLOC_SMALL` 518 MB, graphics ~90 MB. `MallocStackLogging` attributes the malloc
-categories to **dynarmic's per-jit bookkeeping** -- the block map with `EmittedBlockInfo` inline in
-its buckets (527 MB over 39 jits), the block-reference map (326 MB), per-block fastmem patch maps
-(228 MB), interval maps and copies -- about 33 MB per guest thread, each thread holding its own
-translation of the same code. That is D5's risk 2 ("per-thread memory conflicts with the memory
-goal"), measured on the real engine. The owner's target (~800 MB steady, ten instances on 8 GB) is
-**not met** yet; see "Still open".
+Against the owner's targets: **boot ~4 GB -- met** (under 1.2 GiB); **steady ~800 MB -- met to
+within ~5%**. Nothing is reserved with backing: the guest space is a 16 GiB `PROT_NONE` reservation
+charged only for touched pages, freed guest memory is decommitted (a fresh `MAP_FIXED` mapping, which
+is how macOS gives pages back and reads zero afterwards), and read-only file pages -- the libraries,
+the APK's assets -- are the file cache's, shared, and charge nothing (the VM table below). Swap was
+not moved by any run.
+
+What the per-instance footprint is now, by size (`vmmap`, +60 s): the guest's own memory ~325 MiB
+(the engine's; the floor for an instance), dynarmic code caches 169-184 MiB (one translation per guest
+thread), host heap ~135 MiB (unattributed), graphics ~85 MiB, dynarmic bookkeeping ~100 MiB (it was
+1.19 GiB: 2,099 bytes per translated block and never cleared -- root causes and patches in
+[`macos-memory.md`](macos-memory.md)).
+
+**Ten instances on 8 GB: not shown.** Measured on this 16 GB Mac (`footprint_mac.py --launch`, 90 s
+apart, other apps open): **4 of 4** instances reached the landing screen and exited 0, 750-860 MiB
+each, 3,171 MiB together; free memory went 62% -> 35%, macOS compressed ~4 GB (other processes'
+pages too), swap never moved. Ten at ~800 MiB is the whole of an 8 GB machine, so it depends on
+compression that was not exercised here; CPU was the tighter limit (with 3-4 instances booting, one
+settings fetch took 55 s). In two earlier multi-instance runs (before 0013) an instance failed on
+the network (`SslConnectFail`, refused DNS) within a second of another starting -- not investigated.
+The deeper cut, one translation cache shared by a process's threads, is scoped in `macos-memory.md`
+and not built.
 
 ## Virtual memory (D10 on this host)
 
@@ -206,6 +238,27 @@ reached dynarmic's handler unrecorded and it aborted. **Patch 0014** registers t
 function is now a typed write fault and the dynarmic survey runs all 245,117 functions (41 s, n = 1)
 without an abort. Tests: `dynarmic-sys/tests/host_fault.rs` (both widths, read-only data of the test
 binary) and `omni-cpu/tests/exclusive_store_fault.rs` (the two real functions); row `mac-cpu-E1`.
+
+## Still open, with the consequence
+
+* **Ten instances on 8 GB is not demonstrated** (four on this 16 GB Mac, 3.2 GB together). The next
+  cut is one translation cache per process instead of per guest thread (`macos-memory.md`), and
+  omni-android forwarding only executable ranges to the jits (it sends every guest `munmap`/`mprotect`
+  to every thread, which 0012 made cheap in memory but not in CPU).
+* **120 fps is not measured.** The landing screen presents at the engine's own 60 fps cap while it
+  animates and ~1 fps once settled (as on Windows); a game world needs a signed-in session, which this
+  port does not create. The native backend's compute is 5.7x dynarmic's, but its crossings cost more
+  than that saves at the landing screen (D31).
+* **Timer leeway**: a 1 ms sleep takes 1.49 ms here ("Timers"); nothing acts on it yet.
+* **Headless `eglGetDisplay`** kills a guest thread when no window is asked for -- the same on
+  Windows (HANDOFF "still open" 7).
+* **Window seam** (`macos-window.md`): captured pointer motion is accelerated (the raw-delta reader,
+  `IOHIDManager`, is not built); the physical wheel's sign under natural scrolling is documented,
+  not measured; the portability subset has no validation-layer detector on this host.
+* **`webview`** is not ported (WKWebView would be its body); anything that opens a web view gets the
+  seam's typed `Unsupported` refusal.
+* **`libzstd-jni`** (`p_align` 0x1000) cannot load on a 16 KiB host without a copying loader; nothing
+  in the gate loads it.
 
 ## Merge notes
 
