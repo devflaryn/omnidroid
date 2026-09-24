@@ -251,11 +251,11 @@ ANDROID = [
     "--no-fail-fast",
 ]
 
-# The adapter's **library** targets only, with no guest in sight. One row needs this and says why:
-# removing the sleep cap makes the end-to-end test sleep for the `i64::MAX` seconds it asked for,
-# which HANGS rather than fails -- the failure mode this module's docstring already records from M3
-# task 2. Its detector is the unit test on `clocks::capped`, which is why that predicate is a
-# function rather than an inline comparison.
+# The adapter's **library** targets only, with no guest in sight, for a row whose detector is a unit
+# test. It was written for `clocks-A5`, whose end-to-end form HUNG rather than failed -- the failure
+# mode this module's docstring records from M3 task 2 -- when the sleep was capped. The sleep is
+# sliced and stop-checked now, and its detectors run guest threads that a missing stop check leaves
+# un-joinable (a failed join, not a hang), so `clocks-A5` uses `ANDROID`.
 ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
 
 # The looper's idle wait (`looperidle-*`): `tests/ndk.rs` filtered to its `looper_idle_*` tests.
@@ -2249,15 +2249,20 @@ MUTATIONS = [
      """    if false {""",
      ANDROID),
 
-    # **Scoped to the library target on purpose.** Removing the cap makes the end-to-end test sleep
-    # for the i64::MAX seconds it asks for, which hangs rather than fails -- the failure mode this
-    # harness's own docstring records from M3 task 2. The detector is the unit test on `capped`,
-    # which is why that predicate is a function.
-    ("clocks-A5", "A", "the sleep cap is not applied, so a guest can block a host thread forever",
+    # **Re-anchored when the cap went (2026-09-24).** This row was "the sleep cap is not applied";
+    # the cap is gone, because a refusal kills the guest thread and killed the engine's join
+    # worker. What now keeps a guest from blocking a host thread for ever is the stop switch read
+    # between parks, so that is what this removes. It does not hang: the detector,
+    # `long_waits_on_guest_threads_end_when_the_runtime_stops`, sleeps on guest threads and fails
+    # when `join_guest_threads(20 s)` does; the test-thread sleeps are 90 s at most, so the row is
+    # slow (about that long) rather than endless.
+    ("clocks-A5", "A", "a sleep never reads the stop switch, so a guest can block a host thread forever",
      ADAPTER_CLOCKS,
-     """    duration.as_secs() > MAX_SLEEP_SECONDS""",
-     """    false && duration.as_secs() > MAX_SLEEP_SECONDS""",
-     ANDROID_LIB),
+     """        if bionic.guest_threads_stopping() {
+            return Slept::Stopped;""",
+     """        if false {
+            return Slept::Stopped;""",
+     ANDROID),
 
     ("clocks-A6", "A", "usleep reads all 64 bits of X0 although useconds_t is 32", ADAPTER_CLOCKS,
      """    let micros = u64::from(c.args().next_u64()? as u32);""",
@@ -2304,12 +2309,37 @@ MUTATIONS = [
                 let at = view.tm_address();""",
      ANDROID),
 
-    # The over-correction: the cap applied to the sub-second part, so an ordinary 10 ms sleep is
-    # refused. A bound that refuses correct input is as wrong as no bound.
-    ("clocks-B1", "B", "the sleep cap is applied to the nanoseconds, refusing a 10 ms sleep",
+    # The over-correction, and since 2026-09-24 it is the old behaviour: a sleep past a minute
+    # refused. It reads as a hostile-input defence and it kills a guest thread that asked for
+    # something correct -- the stop switch is what ends a sleep nobody should wait out. (This row
+    # was the cap applied to the nanoseconds; there is no cap to misapply now.)
+    ("clocks-B1", "B", "the minute cap is back: a sleep past sixty seconds is refused",
      ADAPTER_CLOCKS,
-     """    duration.as_secs() > MAX_SLEEP_SECONDS""",
-     """    u64::from(duration.subsec_nanos()) > MAX_SLEEP_SECONDS""",
+     """    let deadline = slept.checked_add(duration);""",
+     """    if duration.as_secs() > 60 {
+        return Err(view.refusal("a sleep past the old cap".to_string()));
+    }
+    let deadline = slept.checked_add(duration);""",
+     ANDROID),
+
+    # The slicing removed: a long sleep is one host park of its whole length, so the stop switch is
+    # read once, before it, and teardown waits out whatever the guest asked for. Caught by the unit
+    # test on `next_park` and by the hour-long sleep in the guest-thread test, which then cannot be
+    # joined in 20 s.
+    ("clocks-A11", "A", "a long sleep is one host park, so the stop switch cannot end it",
+     ADAPTER_CLOCKS,
+     """            Some(left.min(STOP_SLICE))""",
+     """            Some(left)""",
+     ANDROID),
+
+    # An untimed sleep -- a deadline past the host clock, `nanosleep({INT64_MAX, 0})` on Linux --
+    # answered at once, as a sleep that finished. It reads as harmless and it reports 0 for a sleep
+    # that did not happen. Caught by the unit test: on Windows `Instant` holds that deadline, so
+    # the end-to-end case is a timed sleep there and cannot see this.
+    ("clocks-A12", "A", "an untimed sleep returns at once, reporting a sleep that did not happen",
+     ADAPTER_CLOCKS,
+     """        None => Some(STOP_SLICE),""",
+     """        None => None,""",
      ANDROID),
 
     # ---- process and environment -----------------------------------------------------------------
@@ -3666,14 +3696,19 @@ directory", ADAPTER_FILES,
     # The cap on a wait applied to every wait, so a `poll` with a thirty-millisecond timeout is
     # refused. A guest polling with a short timeout is the ordinary case, and refusing it stops a
     # correct guest over a bound that exists for a hostile one.
-    # **Re-anchored in M6's network phase**, when the cap stopped being unconditional: a set that
-    # can become ready now waits as long as the guest asked (see `Watch::can_change` and
-    # `sockcfg-B2`). The row's meaning is unchanged -- it refuses every bounded wait -- and the
-    # `!can_change &&` is dropped along with the comparison, which is what makes it do that.
-    ("net-B1", "B", "every bounded wait is refused, not only one past the cap",
+    # **Re-anchored in M6's network phase**, when the cap stopped being unconditional, and again
+    # on 2026-09-24, when it went: `bounded_wait` refuses only an indefinite wait and returns every
+    # finite one. The row's meaning is unchanged -- it refuses every bounded wait -- and is
+    # inserted before that return.
+    ("net-B1", "B", "every bounded wait is refused",
      ADAPTER_NET,
-     """    if !can_change && duration.as_secs() > MAX_SLEEP_SECONDS {""",
-     """    if duration.as_millis() > 0 {""",
+     """    // switch. See above for the cap that used to stand here.
+    Ok(duration)""",
+     """    // switch. See above for the cap that used to stand here.
+    if duration.as_millis() > 0 {
+        return Err(refuse(c, "every bounded wait refused".to_string()));
+    }
+    Ok(duration)""",
      ANDROID),
 
     # `nfds == FD_SETSIZE` is the last legal value: an `fd_set` holds descriptors 0..FD_SETSIZE, so
@@ -4632,26 +4667,31 @@ directory", ADAPTER_FILES,
      """            Entry::Pipe(_) => Readiness::ALWAYS,""",
      PLATFORM),
 
-    # The blocking bound removed. It reads as more POSIX-faithful -- a blocking read really does
-    # wait indefinitely on a device -- and it is a permanent hang of a host thread, which D16's
-    # step budgets cannot end because a sleeping thread executes no guest instructions.
-    #
-    # **Its detector is a unit test on the bound**, not an end-to-end one: an unbounded blocking
-    # read on a pipe nobody writes to does not fail, it never returns. Same precedent, and same
-    # reason, as the `clocks::capped` row.
-    ("pipe-B2", "B", "a blocking transfer waits for ever, as a device does",
+    # **Re-anchored when the bound went (2026-09-24).** A blocking transfer does wait for ever now,
+    # as on a device -- the minute it used to be refused after killed a guest thread for a writer
+    # that was slow. What must not go with it is the stop switch: without it the wait is a host
+    # thread nothing can end, which is D16's objection, and this row is that. Detected end to end
+    # by a pipe `read` on a guest thread that `join_guest_threads(20 s)` then cannot join -- a
+    # failed join, not a hang, which is why the old unit test on the bound is gone.
+    ("pipe-B2", "B", "a blocking transfer waits for ever and the stop switch cannot end it",
      ADAPTER_FILES,
-     """    Instant::now() + Duration::from_secs(MAX_SLEEP_SECONDS)""",
-     """    Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)""",
-     ANDROID_LIB),
+     """        if view.active.bionic.guest_threads_stopping() {""",
+     """        if false {""",
+     ANDROID),
 
     # `F_GETFL` reporting an access mode as well. It reads as more complete -- a real `F_GETFL`
     # does return one -- and this seam does not record which mode a descriptor was opened for, so
     # the value would be a guess the guest branches on.
+    #
+    # STALE PATTERN REPAIRED (2026-09-24): `F_GETFD` gained an arm of the same shape one match
+    # above, so the one-line pattern matched twice and the pre-flight refused every `pipe` run. The
+    # `F_GETFL` line above it is carried as context; the row's intent is unchanged.
     ("pipe-B3", "B", "F_GETFL invents an access mode",
      ADAPTER_FILES,
-     """                Settled::Done(false) => 0,""",
-     """                Settled::Done(false) => O_ACCMODE,""",
+     """                Settled::Done(true) => O_NONBLOCK,
+                Settled::Done(false) => 0,""",
+     """                Settled::Done(true) => O_NONBLOCK,
+                Settled::Done(false) => O_ACCMODE,""",
      ANDROID),
 
     # Reading the write end answered as end of file instead of `EBADF`. It reads as the gentler
@@ -6555,12 +6595,12 @@ directory", ADAPTER_FILES,
      """    if false {""",
      PLATFORM),
 
-    # The predicate the wait cap turns on, which is the other half of this session's work. A
-    # `can_change` that answers false puts the 60-second bound back on a `poll` over a socket, and
-    # that refuses the 69.001s wait the engine's HTTP stack asks for over the settings socket --
-    # killing the thread carrying the connection. Anchored on the predicate rather than on
-    # `bounded_wait`'s condition because the predicate has a unit test and the condition needs an
-    # `ImportCall`, which is the same reasoning `clocks::capped` is a function for.
+    # The predicate the wait cap turned on. **The cap is gone (2026-09-24)**, so a `can_change`
+    # that answers false no longer refuses the 69.001 s `poll` the engine's HTTP stack asks for
+    # over the settings socket; what it still decides is `epoll_wait(-1)`, which is refused over a
+    # list in which nothing can become ready -- the engine's I/O thread idles there over sockets.
+    # Anchored on the predicate because the predicate has a unit test and the call site needs an
+    # `ImportCall`.
     ("sockcfg-B2", "B", "a set naming a socket reports that nothing in it can become ready",
      ADAPTER_NET,
      """    fn can_change(&self) -> bool {
@@ -9170,6 +9210,113 @@ directory", ADAPTER_FILES,
      """            if bound.is_zero() || bound > MAX_LOOPER_IDLE {""",
      """            if bound > MAX_LOOPER_IDLE {""",
      LOOPER_IDLE),
+    # ======================================= the stop switch, and waits carried out in full
+    #
+    # 2026-09-24. A long guest wait used to be refused past `MAX_SLEEP_SECONDS`, which killed the
+    # guest thread -- on the real engine, the join worker. It is carried out now, in host parks of
+    # at most `STOP_SLICE`, with the stop switch read between parks. These rows are the parks and
+    # the switch; `clocks-A5`, `clocks-A11`, `clocks-A12`, `clocks-B1`, `net-B1` and `pipe-B2` are
+    # the rest. Every detector that could otherwise hang is either a guest thread whose join fails
+    # or a test-thread wait bounded at 90 s, so a MISS here is a MISS and not a hung run.
+
+    # The park clamp removed from `wait_a_slice`: a sockets-only `poll` parks for its whole
+    # remaining budget in one host call, and the no-socket branch waits on the gate for all of it.
+    # MEASURED as the live failure: `join_guest_threads` timed out after 60 s with a thread
+    # "INSIDE poll". Caught by the guest-thread test's poll over a silent socket and its
+    # `epoll_wait(-1)`, which then cannot be joined in 20 s.
+    ("stop-A1", "A", "a poll parks for its whole budget, so teardown waits it out",
+     ADAPTER_NET,
+     """    let remaining = remaining.min(STOP_SLICE);""",
+     """    let remaining = remaining;""",
+     ANDROID),
+
+    # A `poll` on an instance with no filesystem -- a plain sleep -- answering 0 when the stop
+    # switch ends it: a timeout that did not happen.
+    ("stop-A2", "A", "a descriptor-less poll ended by the stop switch reports a timeout",
+     ADAPTER_NET,
+     """            Slept::Stopped => stop_requested(c, state).map(|()| 0),""",
+     """            Slept::Stopped => Ok(0),""",
+     ANDROID),
+
+    # `select` with no filesystem sleeping its whole remaining budget in one park. The stop switch
+    # is then read only after it, so the 61 s `select` in the hostile-timeval test comes back at
+    # its deadline with 0 instead of a refusal naming the stop. Slow by construction (61 s).
+    ("stop-A3", "A", "a descriptor-less select sleeps its whole budget in one park",
+     ADAPTER_NET,
+     """                omni_platform::clock::sleep(remaining.min(STOP_SLICE));""",
+     """                omni_platform::clock::sleep(remaining);""",
+     ANDROID),
+
+    # A blocking socket call that never reads the stop switch: a receive on a socket nobody
+    # writes to, with no timeout, is a host thread nothing can end.
+    ("stop-A4", "A", "a blocking socket call never reads the stop switch",
+     ADAPTER_NET,
+     """        if view.active.bionic.guest_threads_stopping() {
+            return Err(stopped_waiting(view, fd));""",
+     """        if false {
+            return Err(stopped_waiting(view, fd));""",
+     ANDROID),
+
+    # `SO_RCVTIMEO` ignored by `recv`/`recvfrom`: a caller that set one to learn "nothing yet" by
+    # EAGAIN waits until the runtime stops instead. Caught by the receive test's rescuer, which
+    # sends a datagram after ten seconds so the call returns a count where EAGAIN was required.
+    ("stop-A5", "A", "a blocking receive ignores SO_RCVTIMEO",
+     ADAPTER_NET,
+     """        // Until the socket is readable or its own `SO_RCVTIMEO` runs out: Linux's `EAGAIN`.
+        let deadline = socket_deadline(handle, SocketQuery::ReceiveTimeout);""",
+     """        // Until the socket is readable or its own `SO_RCVTIMEO` runs out: Linux's `EAGAIN`.
+        let deadline = None;""",
+     ANDROID),
+
+    # `SO_SNDTIMEO` ignored by `send`/`sendto`/`sendmsg`: a full socket's send waits until the peer
+    # reads. Caught by the send test's rescuer, which drains the peer after ten seconds.
+    ("stop-A6", "A", "a blocking send ignores SO_SNDTIMEO",
+     ADAPTER_NET,
+     """        let deadline = socket_deadline(handle, SocketQuery::SendTimeout);""",
+     """        let deadline = None;""",
+     ANDROID),
+
+    # `recvmsg`'s own copy of the wait ignoring `SO_RCVTIMEO` -- a separate function from
+    # `socket_recv`, so a separate row.
+    ("stop-A7", "A", "a blocking recvmsg ignores SO_RCVTIMEO",
+     ADAPTER_NET,
+     """        // `socket_recv`'s wait: until readable, or `EAGAIN` when its own `SO_RCVTIMEO` runs out.
+        let deadline = socket_deadline(handle, SocketQuery::ReceiveTimeout);""",
+     """        // `socket_recv`'s wait: until readable, or `EAGAIN` when its own `SO_RCVTIMEO` runs out.
+        let deadline = None;""",
+     ANDROID),
+
+    # A blocking pipe transfer parking for an hour at a time: the stop switch is read, but only
+    # between parks, and the guest-thread test's pipe `read` then cannot be joined in 20 s.
+    ("stop-A8", "A", "a blocking pipe transfer parks an hour at a time",
+     ADAPTER_FILES,
+     """        fs.wait_for_readiness(self.seen, STOP_SLICE);""",
+     """        fs.wait_for_readiness(self.seen, std::time::Duration::from_secs(3600));""",
+     ANDROID),
+
+    # The old cap back on `poll` and `select`: a finite wait past a minute refused. It reads as a
+    # hostile-input defence and it is the refusal that killed a correct guest thread.
+    ("stop-B1", "B", "the minute cap is back on poll and select",
+     ADAPTER_NET,
+     """    // switch. See above for the cap that used to stand here.
+    Ok(duration)""",
+     """    // switch. See above for the cap that used to stand here.
+    if duration.as_secs() > 60 {
+        return Err(refuse(c, "a wait past the old cap".to_string()));
+    }
+    Ok(duration)""",
+     ANDROID),
+
+    # The old cap back on `ALooper_pollOnce`. Its wait was already sliced and stop-checked, so the
+    # refusal bought nothing but the death of the game thread.
+    ("stop-B2", "B", "the minute cap is back on ALooper_pollOnce",
+     NDK_LOOPER,
+     """        let budget = Duration::from_millis(timeout_millis as u64);""",
+     """        let budget = Duration::from_millis(timeout_millis as u64);
+        if budget.as_secs() > 60 {
+            return Err(refuse_reentrant(c, "a wait past the old cap".to_string()));
+        }""",
+     ANDROID),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so
