@@ -14,7 +14,11 @@ from _common import HOME, with_env  # noqa: E402
 # The dynarmic CMake tree the rows that rebuild dynarmic use. Separate from the everyday one so
 # that a row which breaks CMake's configure cannot leave the tree every other build uses
 # half-reconfigured.
-MUTATION_DYNARMIC_DIR = os.path.join(HOME, "odb", "dynarmic-mut")
+# Per checkout, as `~/odb/cargo-locked`'s everyday tree is: CMake refuses a cache made from another
+# source directory, and a worktree's `vendor/dynarmic` is another directory (MEASURED: a run from
+# the main checkout after one from a worktree failed its pre-flight on exactly that).
+_CHECKOUT = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+MUTATION_DYNARMIC_DIR = os.path.join(HOME, "odb", f"dynarmic-mut-{_CHECKOUT}")
 
 DYNARMIC_BUILD_RS = "crates/dynarmic-sys/build.rs"
 
