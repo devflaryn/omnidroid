@@ -25,7 +25,10 @@ VULKAN_RS = "crates/omni-gfx/src/vulkan.rs"
 LIVE_ENV = {"OMNI_GFX_WINDOW_TESTS": "1", "DISPLAY": ":92"}
 WM_ENV = {"OMNI_GFX_WINDOW_TESTS": "1", "DISPLAY": ":93"}
 # omni-android builds dynarmic; point it at this worktree's own CMake tree, as `cargo-locked` does.
-DYNARMIC_ENV = {"OMNIDROID_DYNARMIC_BUILD_DIR": os.path.join(HOME, "odb", "dyn-gfx")}
+# The checkout's own dynarmic tree, the one `~/odb/cargo-locked` uses (`dyn-<checkout>`): CMake
+# refuses a cache made from another checkout's source directory.
+_CHECKOUT = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+DYNARMIC_ENV = {"OMNIDROID_DYNARMIC_BUILD_DIR": os.path.join(HOME, "odb", f"dyn-{_CHECKOUT}")}
 
 UNIT = ["cargo", "test", "-p", "omni-platform", "--release", "--no-fail-fast", "--lib", "window"]
 LIVE = with_env(LIVE_ENV, ["cargo", "test", "-p", "omni-platform", "--release", "--no-fail-fast",
