@@ -184,6 +184,8 @@ pub(crate) struct ThreadVcpu {
     pub(crate) loaded: u64,
     /// `CNTVCT_EL0 = counter - offset`.
     pub(crate) vtimer_offset: u64,
+    /// Whether the watchdog tick is armed and unmasked on this vCPU.
+    pub(crate) watchdog_armed: bool,
 }
 
 thread_local! {
@@ -228,7 +230,7 @@ pub(crate) fn with_thread_vcpu<R>(f: impl FnOnce(&mut ThreadVcpu) -> CpuResult<R
             })?;
             configure(&mut cpu).map_err(hv_err("configure the vCPU's EL1"))?;
             let vtimer_offset = cpu.vtimer_offset().map_err(hv_err("read the vtimer offset"))?;
-            *slot = Some(ThreadVcpu { cpu, loaded: 0, vtimer_offset });
+            *slot = Some(ThreadVcpu { cpu, loaded: 0, vtimer_offset, watchdog_armed: false });
         }
         let Some(thread) = slot.as_mut() else {
             unreachable!("filled just above")

@@ -858,3 +858,682 @@ fn m2_gate_natively_execution_is_repeatable_across_threads_and_gives_vcpus_back(
     assert_eq!(vm.live_vcpus(), vcpus, "eight threads came and went and left no vCPU behind");
     assert_eq!(vm.stage2_stats().failures, failures);
 }
+
+// ----------------------------------------------------------------------------------- measurements
+//
+// `#[ignore]`d: they print figures for docs/ports/macos-hvf.md rather than assert behaviour. Run
+// them in release, serialized, on an otherwise idle machine:
+//
+//   CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=$PWD/tools/hvf_run.sh cargo test -p omni-cpu --release \
+//       --features native-hvf --test native -- --ignored --nocapture --test-threads=1 measure_
+
+fn median(samples: &mut [f64]) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+fn thunk_program() -> [u32; 5] {
+    // Keep the caller's return address; loop x1 times: call the thunk through x9; return.
+    [mov_reg(19, 30), blr(9), subs_imm(1, 1, 1), b_cond(1, -2), br(19)]
+}
+
+fn increment_x0(call: &mut omni_cpu::ThunkCall<'_>) {
+    let x0 = call.x(0);
+    call.set_x(0, x0 + 1);
+}
+
+/// **The cost of one import crossing**, each backend's own way: the native backend's VM exit (every
+/// crossing), dynarmic's exit to the caller (D17 design A), and dynarmic's dispatch inside the run
+/// loop (design B, what the runtime uses on dynarmic). Same guest program, same host work (X0 += 1
+/// and resume at X30), n = 100,000 crossings per round, 7 rounds, median and minimum.
+#[test]
+#[ignore = "measurement"]
+fn measure_thunk_crossing_cost() {
+    let _serial = serialized();
+    const N: u64 = 100_000;
+    const ROUNDS: usize = 7;
+
+    let native = Native::new();
+    let (mut cpu, sentinel) = native.thread();
+    let thunk = native.thunks + 64;
+    cpu.add_thunk(thunk).expect("a thunk");
+    let entry = native.load(&thunk_program());
+    let mut native_ns = Vec::new();
+    for _ in 0..ROUNDS {
+        cpu.set_x(x(0), 0);
+        cpu.set_x(x(1), N);
+        cpu.set_x(x(9), thunk as u64);
+        cpu.set_x(x(30), sentinel as u64);
+        let started = Instant::now();
+        let mut exit = run(&mut cpu, entry);
+        while let ExitReason::Thunk { .. } = exit {
+            let x0 = cpu.x(x(0));
+            cpu.set_x(x(0), x0 + 1);
+            let lr = cpu.x(x(30)) as GuestAddr;
+            exit = run(&mut cpu, lr);
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+        assert_eq!(cpu.x(x(0)), N, "every crossing was serviced");
+        native_ns.push(elapsed.as_nanos() as f64 / N as f64);
+    }
+
+    // A run that is nothing but one entry and one exit: `RET` to the sentinel.
+    let ret_only = native.load_at(256, &[ret(30)]);
+    let mut empty_ns = Vec::new();
+    for _ in 0..ROUNDS {
+        let started = Instant::now();
+        for _ in 0..N {
+            cpu.set_x(x(30), sentinel as u64);
+            let _ = run(&mut cpu, ret_only);
+        }
+        empty_ns.push(started.elapsed().as_nanos() as f64 / N as f64);
+    }
+
+    let guest = harness::Guest::new();
+    let (mut dcpu, dsentinel) = guest.thread();
+    let dthunk = guest.data + 0x100;
+    dcpu.add_thunk(dthunk).expect("a dynarmic thunk");
+    let dentry = guest.load(&thunk_program());
+    let mut exit_ns = Vec::new();
+    for _ in 0..ROUNDS {
+        dcpu.set_x(x(0), 0);
+        dcpu.set_x(x(1), N);
+        dcpu.set_x(x(9), dthunk as u64);
+        dcpu.set_x(x(30), dsentinel as u64);
+        let started = Instant::now();
+        let mut exit = dcpu.run(dentry, RunLimit::Unlimited).expect("ran");
+        while let ExitReason::Thunk { .. } = exit {
+            let x0 = dcpu.x(x(0));
+            dcpu.set_x(x(0), x0 + 1);
+            let lr = dcpu.x(x(30)) as GuestAddr;
+            exit = dcpu.run(lr, RunLimit::Unlimited).expect("ran");
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(exit, ExitReason::Returned { pc: dsentinel });
+        assert_eq!(dcpu.x(x(0)), N);
+        exit_ns.push(elapsed.as_nanos() as f64 / N as f64);
+    }
+    dcpu.remove_thunk(dthunk).expect("remove");
+    dcpu.add_inline_thunk(dthunk, increment_x0, Default::default()).expect("inline");
+    let mut inline_ns = Vec::new();
+    for _ in 0..ROUNDS {
+        dcpu.set_x(x(0), 0);
+        dcpu.set_x(x(1), N);
+        dcpu.set_x(x(30), dsentinel as u64);
+        let started = Instant::now();
+        let exit = dcpu.run(dentry, RunLimit::Unlimited).expect("ran");
+        let elapsed = started.elapsed();
+        assert_eq!(exit, ExitReason::Returned { pc: dsentinel });
+        assert_eq!(dcpu.x(x(0)), N);
+        inline_ns.push(elapsed.as_nanos() as f64 / N as f64);
+    }
+    // The backend's own share of a crossing: one full save and one full load of the register file.
+    let mut save_ns = Vec::new();
+    let mut load_ns = Vec::new();
+    for _ in 0..ROUNDS {
+        let (save, load) = cpu.measure_register_transfer(N as u32).expect("measure");
+        save_ns.push(save.as_nanos() as f64 / N as f64);
+        load_ns.push(load.as_nanos() as f64 / N as f64);
+    }
+    let min = |v: &[f64]| v.iter().copied().fold(f64::MAX, f64::min);
+    println!("\n== one import crossing (n = {N} per round, {ROUNDS} rounds; median [min]) ==");
+    for (name, samples) in [
+        ("native: VM exit per crossing", &mut native_ns),
+        ("native: a run that only returns", &mut empty_ns),
+        ("  of which: save all registers (63 + 6 calls)", &mut save_ns),
+        ("  of which: load all registers (full)", &mut load_ns),
+        ("dynarmic: exit to the caller (design A)", &mut exit_ns),
+        ("dynarmic: inline dispatch (design B, in use)", &mut inline_ns),
+    ] {
+        let m = min(samples);
+        println!("  {name:<46} {:8.1} ns  [{m:.1}]", median(samples));
+    }
+}
+
+/// **The cost of a demand-paged first touch**: a guest store to each of `GRANULES` untouched
+/// granules of a lazily committed mapping, against the same loop over the same, now committed,
+/// granules. Native: a stage-2 abort, `admit`, `mprotect`, the mirror's remap, the retry. Dynarmic:
+/// a host fault, the Mach exception handler, the pager, `mprotect`, the retry.
+#[test]
+#[ignore = "measurement"]
+fn measure_demand_paging_fault_cost() {
+    let _serial = serialized();
+    const GRANULES: usize = 1024;
+    const ROUNDS: usize = 5;
+    let program = [str_imm(1, 0, 0), add_reg(0, 0, 2), subs_imm(3, 3, 1), b_cond(1, -3), ret(30)];
+
+    fn one_round(
+        space: &GuestSpace,
+        cpu: &mut dyn GuestCpu,
+        entry: GuestAddr,
+        sentinel: GuestAddr,
+    ) -> (f64, f64) {
+        let granule = space.commit_granule();
+        let len = GRANULES * granule;
+        let lazy = space
+            .map_anonymous(Placement::Anywhere { align: granule }, len, Protection::ReadWrite, CommitPolicy::Lazy)
+            .expect("a lazy mapping");
+        let time = |cpu: &mut dyn GuestCpu| {
+            cpu.set_x(x(0), lazy as u64);
+            cpu.set_x(x(1), 1);
+            cpu.set_x(x(2), granule as u64);
+            cpu.set_x(x(3), GRANULES as u64);
+            cpu.set_x(x(30), sentinel as u64);
+            let started = Instant::now();
+            let exit = cpu.run(entry, RunLimit::Unlimited).expect("ran");
+            assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+            started.elapsed().as_nanos() as f64
+        };
+        let first = time(cpu);
+        let again = time(cpu);
+        space.unmap(lazy, len).expect("unmap");
+        ((first - again) / GRANULES as f64, again / GRANULES as f64)
+    }
+
+    let native = Native::new();
+    let (mut cpu, sentinel) = native.thread();
+    let entry = native.load(&program);
+    let before = cpu.exit_counts().demand_faults;
+    let mut n_fault = Vec::new();
+    let mut n_touch = Vec::new();
+    for _ in 0..ROUNDS {
+        let (fault, touch) = one_round(&native.space, &mut cpu, entry, sentinel);
+        n_fault.push(fault);
+        n_touch.push(touch);
+    }
+    assert_eq!(
+        cpu.exit_counts().demand_faults - before,
+        (ROUNDS * GRANULES) as u64,
+        "one stage-2 fault per granule, and none on the committed pass"
+    );
+
+    let guest = harness::Guest::new();
+    let (mut dcpu, dsentinel) = guest.thread();
+    let dentry = guest.load(&program);
+    let mut d_fault = Vec::new();
+    let mut d_touch = Vec::new();
+    for _ in 0..ROUNDS {
+        let (fault, touch) = one_round(&guest.space, &mut dcpu, dentry, dsentinel);
+        d_fault.push(fault);
+        d_touch.push(touch);
+    }
+    println!(
+        "\n== a demand-paged first touch ({GRANULES} granules of {} KiB per round, {ROUNDS} rounds, median) ==",
+        native.space.commit_granule() / 1024
+    );
+    println!("  native   (stage-2 abort, admit, mirror remap): {:8.2} us per granule (committed-touch loop: {:.3} us)", median(&mut n_fault) / 1e3, median(&mut n_touch) / 1e3);
+    println!("  dynarmic (host fault, Mach handler, pager)   : {:8.2} us per granule (committed-touch loop: {:.3} us)", median(&mut d_fault) / 1e3, median(&mut d_touch) / 1e3);
+}
+
+/// **Memory per guest thread**: `phys_footprint` (`process_commit_charge` on this host) with N
+/// host threads parked, each having created a context and run one tiny guest function on it, minus
+/// the same N threads parked having done nothing guest-related. N = 32.
+#[test]
+#[ignore = "measurement"]
+fn measure_memory_per_guest_thread() {
+    let _serial = serialized();
+    const THREADS: usize = 32;
+    fn footprint() -> f64 {
+        omni_platform::vm::process_commit_charge().expect("phys_footprint") as f64
+    }
+    fn parked<F>(work: F) -> f64
+    where
+        F: Fn() -> Box<dyn std::any::Any> + Send + Sync + 'static,
+    {
+        let work = Arc::new(work);
+        let ready = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let release = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let before = footprint();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (work, ready, release) = (Arc::clone(&work), Arc::clone(&ready), Arc::clone(&release));
+                std::thread::spawn(move || {
+                    let held = work();
+                    ready.wait();
+                    release.wait();
+                    drop(held);
+                })
+            })
+            .collect();
+        ready.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        let during = footprint();
+        release.wait();
+        for handle in handles {
+            handle.join().expect("a parked thread");
+        }
+        (during - before) / THREADS as f64
+    }
+
+    let baseline = parked(|| Box::new(()));
+    let native = Arc::new(Native::new());
+    let n = Arc::clone(&native);
+    let entry = native.load(&[movz(0, 1, 0), ret(30)]);
+    let native_per = parked(move || {
+        let (mut cpu, sentinel) = n.thread();
+        assert_eq!(run(&mut cpu, entry), ExitReason::Returned { pc: sentinel });
+        Box::new(SendCpu(cpu))
+    });
+    let guest = Arc::new(harness::Guest::new());
+    let g = Arc::clone(&guest);
+    let dentry = guest.load(&[movz(0, 1, 0), ret(30)]);
+    let dynarmic_per = parked(move || {
+        let (mut cpu, sentinel) = g.thread();
+        assert_eq!(cpu.run(dentry, RunLimit::Unlimited).expect("ran"), ExitReason::Returned { pc: sentinel });
+        Box::new(SendCpu(cpu))
+    });
+    println!("\n== memory per guest thread (phys_footprint, {THREADS} parked threads, one tiny call each) ==");
+    println!("  a parked thread alone        : {:8.1} KiB", baseline / 1024.0);
+    println!("  native (context + its vCPU) : {:8.1} KiB more", (native_per - baseline) / 1024.0);
+    println!("  dynarmic (context + its jit): {:8.1} KiB more", (dynarmic_per - baseline) / 1024.0);
+}
+
+/// A context held by a parked thread in `measure_memory_per_guest_thread`.
+struct SendCpu<T>(#[allow(dead_code)] T);
+
+/// **Guest instructions per second on real `libroblox.so` code, both backends.**
+///
+/// Nothing counts native instructions, so the count comes from dynarmic (`last_run_instructions`)
+/// and the time from each backend. The work is identical: the same functions, the same argument
+/// pattern, the same (deterministic, register-and-stack-only) code, and the result registers are
+/// compared between the two as a check that the same work was done.
+///
+/// The functions are every runnable leaf the scan grades (`omni_elf::leaf`), called with every
+/// argument register holding `ARG`: a loop over a count argument runs long, most leaves return at
+/// once. Reported twice: per call over **all** leaves (what an engine full of short calls sees --
+/// the per-`run` cost dominates) and over only the leaves that ran at least `LONG` instructions
+/// (compute in guest code, where the entry/exit is amortised).
+#[test]
+#[ignore = "measurement"]
+fn measure_real_function_throughput_native_vs_dynarmic() {
+    let _serial = serialized();
+    const ARG: u64 = 1 << 20;
+    const LONG: u64 = 10_000;
+    const BUDGET: u64 = 50_000_000;
+    let Some(dynarmic) = harness::roblox::Roblox::load() else { return };
+    let Some(native) = NativeRoblox::load() else { return };
+    let bytes = main_lib_bytes().expect("the library bytes");
+    let elf = ElfImage::parse(bytes).expect("parse");
+    let leaves = omni_elf::leaf::find_leaves(&elf).expect("scan");
+
+    let mut dcpu = dynarmic.thread();
+    let mut ncpu = native.thread();
+    // Pass 1, dynarmic: which leaves return, and how many instructions each executes.
+    let mut runs: Vec<(u64, u64, u64)> = Vec::new(); // (vaddr, instructions, x0)
+    for leaf in &leaves {
+        let vaddr = leaf.bounds.start;
+        for r in 0..8u8 {
+            dcpu.set_x(x(r), ARG);
+        }
+        dynarmic.rearm(&mut dcpu);
+        let entry = dynarmic.object.base + vaddr as usize;
+        if let Ok(ExitReason::Returned { .. }) = dcpu.run(entry, RunLimit::Instructions(BUDGET)) {
+            runs.push((vaddr, dcpu.last_run_instructions(), dcpu.x(x(0))));
+        }
+    }
+    // Pass 2, native: the same calls must return with the same X0.
+    let mut agree = 0usize;
+    let mut kept = Vec::new();
+    for &(vaddr, instructions, x0) in &runs {
+        for r in 0..8u8 {
+            ncpu.set_x(x(r), ARG);
+        }
+        let exit = native.call(&mut ncpu, native.at(vaddr));
+        if exit == (ExitReason::Returned { pc: native.sentinel }) && ncpu.x(x(0)) == x0 {
+            agree += 1;
+            kept.push((vaddr, instructions));
+        }
+    }
+    println!(
+        "\n== real libroblox.so leaves: {} graded runnable, {} return on dynarmic with every argument = {ARG:#x}, {agree} return with the same X0 natively ==",
+        leaves.len(),
+        runs.len()
+    );
+
+    fn time_all<C: GuestCpu>(
+        cpu: &mut C,
+        base: GuestAddr,
+        set: &[(u64, u64)],
+        stack_top: GuestAddr,
+        sentinel: GuestAddr,
+        limit: RunLimit,
+    ) -> f64 {
+        let started = Instant::now();
+        for &(vaddr, _) in set {
+            for r in 0..8u8 {
+                cpu.set_x(x(r), ARG);
+            }
+            cpu.set_sp(stack_top);
+            cpu.set_x(x(30), sentinel as u64);
+            let _ = cpu.run(base + vaddr as usize, limit);
+        }
+        started.elapsed().as_secs_f64()
+    }
+    let long: Vec<(u64, u64)> = kept.iter().copied().filter(|&(_, n)| n >= LONG).collect();
+    for (name, set) in [("all returning leaves", &kept), ("leaves of >= 10,000 instructions", &long)] {
+        if set.is_empty() {
+            println!("  {name}: none");
+            continue;
+        }
+        let instructions: u64 = set.iter().map(|&(_, n)| n).sum();
+        let mut d = Vec::new();
+        let mut n = Vec::new();
+        for round in 0..8 {
+            let dt = time_all(&mut dcpu, dynarmic.object.base, set, dynarmic.stack_top, dynarmic.sentinel, RunLimit::Instructions(BUDGET));
+            let nt = time_all(&mut ncpu, native.object.base, set, native.stack_top, native.sentinel, RunLimit::Unlimited);
+            if round > 0 {
+                // The first round translates (dynarmic) and faults pages in (both): warm only.
+                d.push(dt);
+                n.push(nt);
+            }
+        }
+        let (dm, nm) = (median(&mut d), median(&mut n));
+        println!(
+            "  {name}: {} calls, {instructions} guest instructions per pass (dynarmic's count), 7 warm passes, median",
+            set.len()
+        );
+        println!(
+            "    dynarmic: {:9.3} ms  {:9.1} M insn/s  {:8.1} ns per call",
+            dm * 1e3,
+            instructions as f64 / dm / 1e6,
+            dm * 1e9 / set.len() as f64
+        );
+        println!(
+            "    native  : {:9.3} ms  {:9.1} M insn/s  {:8.1} ns per call   ({:.2}x dynarmic's time)",
+            nm * 1e3,
+            instructions as f64 / nm / 1e6,
+            nm * 1e9 / set.len() as f64,
+            nm / dm
+        );
+    }
+    let mut top = long.clone();
+    top.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    println!("  longest: {:?}", top.iter().take(8).map(|&(v, n)| format!("{v:#x}:{n}")).collect::<Vec<_>>());
+}
+
+/// Bytes of each of the two argument buffers `measure_compute_throughput_on_real_functions` hands
+/// real functions.
+const ARG_BUFFER: usize = 1 << 20;
+
+/// Point X0 and X2 at the two buffers (refilled with a fixed pattern), X1 and X3 at their length,
+/// X4-X7 at small counts, and re-arm SP and X30: a call shape that an engine routine taking
+/// `(pointer, length, pointer, length, ...)` can run to completion on.
+fn set_buffer_args(cpu: &mut dyn GuestCpu, space: &GuestSpace, buffers: GuestAddr, stack_top: GuestAddr, sentinel: GuestAddr, refill: bool) {
+    if refill {
+        let ptr = space.ptr(buffers, 2 * ARG_BUFFER).expect("the buffers");
+        for i in 0..(2 * ARG_BUFFER / 8) {
+            // SAFETY: inside the committed buffers; no guest is running.
+            unsafe { ptr.cast::<u64>().add(i).write((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1) };
+        }
+    }
+    cpu.set_x(x(0), buffers as u64);
+    cpu.set_x(x(1), ARG_BUFFER as u64);
+    cpu.set_x(x(2), (buffers + ARG_BUFFER) as u64);
+    cpu.set_x(x(3), ARG_BUFFER as u64);
+    for r in 4..8u8 {
+        cpu.set_x(x(r), 64);
+    }
+    cpu.set_sp(stack_top);
+    cpu.set_x(x(30), sentinel as u64);
+}
+
+fn buffer_digest(space: &GuestSpace, buffers: GuestAddr) -> u64 {
+    let ptr = space.ptr(buffers, 2 * ARG_BUFFER).expect("the buffers");
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for i in 0..(2 * ARG_BUFFER / 8) {
+        // SAFETY: as `set_buffer_args`.
+        let v = unsafe { ptr.cast::<u64>().add(i).read() };
+        h = (h ^ v).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// **Compute throughput on real engine code**: functions out of all 245,117 `.eh_frame` names
+/// that, handed two 1 MiB buffers, run at least `LONG` guest instructions on dynarmic and return --
+/// loops over memory in real engine code (the survey finds them; nothing is chosen by hand). Each is
+/// then timed warm on both backends from identical buffers, and kept only if both leave the same
+/// X0 and the same buffer contents. Instruction counts are dynarmic's.
+#[test]
+#[ignore = "measurement"]
+fn measure_compute_throughput_on_real_functions() {
+    let _serial = serialized();
+    const LONG: u64 = 200_000;
+    const BUDGET: u64 = 5_000_000;
+    const WANT: usize = 40;
+    let survey_limit = Duration::from_secs(
+        std::env::var("OMNI_SURVEY_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(120),
+    );
+    let Some(native) = NativeRoblox::load() else { return };
+    // **Both backends over one guest space**: the same loaded library, the same buffers, the same
+    // stack, so a function whose result depends on an address (a hash of a pointer, a pointer
+    // stored into a buffer) gives the same answer on both, and a disagreement is a disagreement.
+    let dynarmic = DynarmicOver::new(&native);
+    let elf = ElfImage::parse(main_lib_bytes().expect("bytes")).expect("parse");
+    let functions = elf.eh_frame_functions().expect("eh_frame").expect("an .eh_frame_hdr");
+    let nbuf = native
+        .space
+        .map_anonymous(Placement::Anywhere { align: native.space.page_size() }, 2 * ARG_BUFFER, Protection::ReadWrite, CommitPolicy::Eager)
+        .expect("argument buffers");
+    let dbuf = nbuf;
+
+    // Survey **natively**: it is the backend that survives every function (a guest fault is an
+    // exit), and it is ~100x faster at running an unknown function once than translating it.
+    // MEASURED while writing this: surveyed on dynarmic, `libroblox.so + 0x224822c` aborted the
+    // whole test process ("Segfault happened within JITted code ... wasn't at a fastmem patch
+    // location"), which is recorded in docs/ports/macos-hvf.md. A runaway is halted by a watchdog
+    // after `RUNAWAY`; a function that returns after running at least `LONG_NATIVE` is a candidate,
+    // and dynarmic then counts its instructions.
+    const RUNAWAY: Duration = Duration::from_millis(20);
+    const LONG_NATIVE: Duration = Duration::from_micros(40);
+    let started = Instant::now();
+    let mut ncpu = native.thread();
+    let deadline = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let epoch = Instant::now();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The context is replaced every 512 functions, so the watchdog reads whichever handle is
+    // current rather than keeping the first one.
+    let current_halt = Arc::new(std::sync::Mutex::new(ncpu.halt_handle()));
+    let watchdog = {
+        let (deadline, stop, halt) = (Arc::clone(&deadline), Arc::clone(&stop), Arc::clone(&current_halt));
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if (epoch.elapsed().as_micros() as u64) > deadline.load(std::sync::atomic::Ordering::Relaxed) {
+                    halt.lock().expect("the current handle").request();
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let (mut surveyed, mut returned, mut faulted, mut halted, mut refused) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut long_natively: Vec<u64> = Vec::new();
+    for (i, function) in functions.iter().enumerate() {
+        if started.elapsed() > survey_limit {
+            break;
+        }
+        if i % 512 == 0 {
+            ncpu = native.thread();
+            *current_halt.lock().expect("the current handle") = ncpu.halt_handle();
+        }
+        if let Ok(only) = std::env::var("OMNI_SURVEY_ONLY") {
+            if format!("{:#x}", function.start) != only {
+                continue;
+            }
+        }
+        set_buffer_args(&mut ncpu, &native.space, nbuf, native.stack_top, native.sentinel, i % 256 == 0);
+        surveyed += 1;
+        ncpu.halt_handle().clear();
+        if std::env::var_os("OMNI_SURVEY_TRACE").is_some() {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "SURVEY {:#x}", function.start);
+        }
+        let t = Instant::now();
+        deadline.store(epoch.elapsed().as_micros() as u64 + RUNAWAY.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let exit = ncpu.run(native.object.base + function.start as usize, RunLimit::Unlimited);
+        deadline.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        let took = t.elapsed();
+        match exit {
+            Ok(ExitReason::Returned { .. }) => {
+                returned += 1;
+                if took >= LONG_NATIVE {
+                    long_natively.push(function.start);
+                }
+            }
+            Ok(ExitReason::Halted { .. }) => halted += 1,
+            Ok(_) => faulted += 1,
+            Err(_) => refused += 1,
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watchdog.join().expect("watchdog");
+    println!(
+        "\n== compute on real libroblox.so functions: natively surveyed {surveyed} of {} in {:.1} s: {returned} returned, {faulted} stopped with a typed exit, {halted} halted after {RUNAWAY:?}, {refused} refused; {} returned after >= {LONG_NATIVE:?} ==",
+        functions.len(),
+        started.elapsed().as_secs_f64(),
+        long_natively.len()
+    );
+    // Count the long ones on dynarmic.
+    let mut candidates: Vec<(u64, u64)> = Vec::new();
+    for &vaddr in &long_natively {
+        if candidates.len() >= WANT {
+            break;
+        }
+        let mut dcpu = dynarmic.thread();
+        set_buffer_args(&mut dcpu, &dynarmic.space, dbuf, dynarmic.stack_top, dynarmic.sentinel, true);
+        if let Ok(ExitReason::Returned { .. }) = dcpu.run(dynarmic.object.base + vaddr as usize, RunLimit::Instructions(BUDGET)) {
+            if dcpu.last_run_instructions() >= LONG {
+                candidates.push((vaddr, dcpu.last_run_instructions()));
+            }
+        }
+    }
+    println!("  {} of those ran >= {LONG} instructions on dynarmic and returned", candidates.len());
+
+    // Measure each candidate from identical buffers on both backends.
+    let mut ncpu = native.thread();
+    let _ = ncpu.halt_handle().clear();
+    let mut rows = Vec::new();
+    for &(vaddr, _) in &candidates {
+        let mut d = Vec::new();
+        let mut n = Vec::new();
+        let mut outcome = None;
+        for round in 0..4 {
+            let mut dcpu = dynarmic.thread();
+            set_buffer_args(&mut dcpu, &dynarmic.space, dbuf, dynarmic.stack_top, dynarmic.sentinel, true);
+            let t = Instant::now();
+            let dexit = dcpu.run(dynarmic.object.base + vaddr as usize, RunLimit::Instructions(BUDGET));
+            let dt = t.elapsed().as_secs_f64();
+            let instructions = dcpu.last_run_instructions();
+            let dresult = (dcpu.x(x(0)), buffer_digest(&dynarmic.space, dbuf));
+            set_buffer_args(&mut ncpu, &native.space, nbuf, native.stack_top, native.sentinel, true);
+            // A native run cannot be counted; a watchdog halts one that outlives dynarmic's by far.
+            let halt = ncpu.halt_handle();
+            let limit = Duration::from_secs_f64((dt * 50.0).max(0.05));
+            let watchdog = std::thread::spawn(move || {
+                std::thread::sleep(limit);
+                halt.request();
+            });
+            let t = Instant::now();
+            let nexit = ncpu.run(native.object.base + vaddr as usize, RunLimit::Unlimited);
+            let nt = t.elapsed().as_secs_f64();
+            watchdog.join().expect("watchdog");
+            ncpu.halt_handle().clear();
+            let nresult = (ncpu.x(x(0)), buffer_digest(&native.space, nbuf));
+            let same = matches!(dexit, Ok(ExitReason::Returned { .. }))
+                && matches!(nexit, Ok(ExitReason::Returned { .. }))
+                && dresult == nresult;
+            if !same {
+                outcome = Some(format!("{dexit:?} / {nexit:?}, results equal: {}", dresult == nresult));
+                break;
+            }
+            // Round 0 on dynarmic is cold (a fresh context translates); warm rounds reuse nothing
+            // either -- each is a fresh context -- so dynarmic is measured cold here. See below.
+            if round > 0 {
+                d.push(dt);
+                n.push(nt);
+            }
+            outcome = Some(format!("{instructions}"));
+        }
+        rows.push((vaddr, outcome.unwrap_or_default(), d, n));
+    }
+    // Warm dynarmic: one context, each function run twice, the second timed.
+    let mut total_insns = 0u64;
+    let (mut total_d_cold, mut total_d_warm, mut total_n) = (0.0, 0.0, 0.0);
+    let mut dcpu = dynarmic.thread();
+    let mut agreed = 0usize;
+    for (vaddr, outcome, d, n) in &mut rows {
+        let Ok(instructions) = outcome.parse::<u64>() else {
+            println!("  {vaddr:#x}: excluded: {outcome}");
+            continue;
+        };
+        let mut warm = Vec::new();
+        for round in 0..4 {
+            set_buffer_args(&mut dcpu, &dynarmic.space, dbuf, dynarmic.stack_top, dynarmic.sentinel, true);
+            let t = Instant::now();
+            let _ = dcpu.run(dynarmic.object.base + *vaddr as usize, RunLimit::Instructions(BUDGET));
+            if round > 0 {
+                warm.push(t.elapsed().as_secs_f64());
+            }
+        }
+        let (dc, dw, nn) = (median(d), median(&mut warm), median(n));
+        agreed += 1;
+        total_insns += instructions;
+        total_d_cold += dc;
+        total_d_warm += dw;
+        total_n += nn;
+        println!(
+            "  {vaddr:#09x}: {instructions:>8} insns  dynarmic warm {:8.1} M/s (cold {:7.1})  native {:8.1} M/s  native/dynarmic-warm speed {:5.2}x",
+            instructions as f64 / dw / 1e6,
+            instructions as f64 / dc / 1e6,
+            instructions as f64 / nn / 1e6,
+            dw / nn
+        );
+    }
+    if agreed > 0 {
+        println!(
+            "  ALL {agreed} functions ({total_insns} instructions, median of 3 runs each): dynarmic warm {:.1} M insn/s, dynarmic cold {:.1}, native {:.1}; native is {:.2}x dynarmic warm",
+            total_insns as f64 / total_d_warm / 1e6,
+            total_insns as f64 / total_d_cold / 1e6,
+            total_insns as f64 / total_n / 1e6,
+            total_d_warm / total_n
+        );
+    }
+}
+
+/// dynarmic over the native fixture's own guest space, for comparisons that must share addresses.
+struct DynarmicOver {
+    backend: omni_cpu::dynarmic::DynarmicBackend,
+    space: Arc<GuestSpace>,
+    object: ObjectBase,
+    stack_top: GuestAddr,
+    sentinel: GuestAddr,
+}
+
+/// Just the load bias, which is all `DynarmicOver`'s callers read of the loaded object.
+struct ObjectBase {
+    base: GuestAddr,
+}
+
+impl DynarmicOver {
+    fn new(native: &NativeRoblox) -> Self {
+        let backend = omni_cpu::dynarmic::DynarmicBackend::new(
+            Arc::clone(&native.space),
+            omni_cpu::dynarmic::DynarmicOptions::default(),
+        )
+        .expect("dynarmic over the same space");
+        Self {
+            backend,
+            space: Arc::clone(&native.space),
+            object: ObjectBase { base: native.object.base },
+            stack_top: native.stack_top,
+            sentinel: native.sentinel,
+        }
+    }
+
+    fn thread(&self) -> omni_cpu::dynarmic::DynarmicCpu {
+        let mut cpu = self.backend.create_thread_with_tls().expect("a dynarmic thread");
+        cpu.set_return_sentinel(self.sentinel).expect("arm the sentinel");
+        cpu.set_sp(self.stack_top);
+        cpu.set_x(x(30), self.sentinel as u64);
+        cpu
+    }
+}

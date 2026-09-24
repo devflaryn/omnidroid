@@ -521,19 +521,28 @@ impl NativeCpu {
     }
 
     /// Arm the watchdog: the vtimer fires one tick from now.
+    ///
+    /// The timer is the thread's vCPU's, not the context's, so it is armed when the thread has none
+    /// running -- on its first run and after each tick -- rather than on every `run`: a tick that
+    /// fires while the vCPU is idle between runs is simply the first exit of the next one. Every
+    /// crossing is a `run`, so this is three framework calls fewer per crossing.
     fn arm(&self, thread: &mut system::ThreadVcpu) -> Result<(), hv::HvError> {
         let deadline = hv::counter_now()
             .wrapping_sub(thread.vtimer_offset)
             .wrapping_add(system::ticks(self.shared.options.watchdog_tick));
         thread.cpu.set_sys_reg(SysReg::CntvCvalEl0, deadline)?;
         thread.cpu.set_sys_reg(SysReg::CntvCtlEl0, 1)?;
-        thread.cpu.set_vtimer_mask(false)
+        thread.cpu.set_vtimer_mask(false)?;
+        thread.watchdog_armed = true;
+        Ok(())
     }
 
     fn run_loop(&mut self, thread: &mut system::ThreadVcpu) -> CpuResult<ExitReason> {
         let io = |operation| hv_err(operation);
         self.load(thread).map_err(io("load the guest registers"))?;
-        self.arm(thread).map_err(io("arm the watchdog"))?;
+        if !thread.watchdog_armed {
+            self.arm(thread).map_err(io("arm the watchdog"))?;
+        }
         let mut refaults = 0u32;
         let mut last_fault = None;
         loop {
@@ -541,6 +550,10 @@ impl NativeCpu {
             match exit {
                 VcpuExit::VtimerActivated | VcpuExit::Canceled => {
                     self.exits.vtimer += 1;
+                    if exit == VcpuExit::VtimerActivated {
+                        // The framework masks the timer on this exit; it stays masked until armed.
+                        thread.watchdog_armed = false;
+                    }
                     if self.halt.is_requested() {
                         let pc = thread.cpu.reg(Reg::Pc).map_err(io("read PC"))?;
                         let pstate = thread.cpu.reg(Reg::Cpsr).map_err(io("read CPSR"))?;
@@ -770,6 +783,34 @@ impl NativeCpu {
                     ),
                 })
             }
+        })
+    }
+
+    /// **For the measurement in `tests/native.rs` only**: time `rounds` full register saves and
+    /// `rounds` full loads between this context and the calling thread's vCPU, the two halves of
+    /// every crossing's cost that are this backend's rather than the hypervisor's.
+    ///
+    /// # Errors
+    ///
+    /// As [`GuestCpu::run`] when the vCPU cannot be created or accessed.
+    #[doc(hidden)]
+    pub fn measure_register_transfer(&mut self, rounds: u32) -> CpuResult<(Duration, Duration)> {
+        with_thread_vcpu(|thread| {
+            let io = |operation| hv_err(operation);
+            // Loads first, so the vCPU holds this context's registers and every save below writes
+            // back exactly what was loaded.
+            let started = std::time::Instant::now();
+            for _ in 0..rounds.max(1) {
+                thread.loaded = 0;
+                self.load(thread).map_err(io("load"))?;
+            }
+            let loading = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                let (pc, nzcv) = (self.regs.pc, self.regs.nzcv);
+                self.save(thread, pc, nzcv).map_err(io("save"))?;
+            }
+            Ok((started.elapsed(), loading))
         })
     }
 
