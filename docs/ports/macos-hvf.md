@@ -161,12 +161,295 @@ The guest's own cache maintenance at EL0 (`SCTLR_EL1.UCI`) runs natively.
 
 ## 3. What was built
 
-*(filled in below as it is built)*
+Three layers, each where `ARCHITECTURE.md` §§2 and 6 put it. Everything is behind features that are
+off by default; a default build, and every Windows build, compiles exactly what it did.
+
+| Layer | Where | What |
+|---|---|---|
+| OS seam | `omni-platform/src/hypervisor/{mod,macos,unsupported}.rs`, feature `hypervisor` | `Vm` (one per process, limits read from the host), `Attachment` (the stage-2 mirror), overlays, private mappings, a thread-bound `Vcpu`; `HV_DENIED` is `HvError::Denied` naming the entitlement; every other host is `Unsupported` |
+| the mirror's hook | `omni-platform/src/vm/macos.rs` | `mirrored(address, size, prot)` after every `mmap(MAP_FIXED)`, `mprotect` and `munmap` the macOS vm backend makes; nothing without the feature, one atomic load with it and nothing attached |
+| CPU backend | `omni-cpu/src/native/{mod,system}.rs`, feature `native-hvf`, `aarch64` | `NativeBackend` / `NativeCpu` behind `GuestCpu` |
+| runtime | `omni-android/src/bionic/{threads,mod}.rs` | a guest thread on a backend that cannot count runs unbounded and is stopped through its `HaltHandle` |
+| signing | `tools/hvf_run.sh`, `tools/hvf.entitlements` | the cargo runner that ad-hoc signs a test binary with `com.apple.security.hypervisor` |
+
+**As built, against the design above** -- three changes, each found by running real code:
+
+1. **A thunk on a writable data page is not refused.** The boundary registers its eighteen data
+   symbols as thunks so that a guest *calling* one is refused by name. Such a page is not
+   executable, so a branch there is already a stage-2 instruction abort; the run loop reports it as
+   the registered thunk. Slower (~2.1 us) and only reached by a guest calling a data symbol; no
+   veneer hides the page's data. Found installing the real boundary.
+2. **The watchdog is armed per thread vCPU, not per run** (three framework calls fewer per crossing):
+   on the vCPU's first run and after every tick; a tick that fires while the vCPU is idle is the next
+   run's first exit.
+3. **Registered addresses are classified before the paging policy** on a stage-2 instruction abort,
+   so a thunk on a non-executable page is a `Thunk`, not a `MemoryFault`.
+
+Behaviour, stated per trait method: `run` refuses `RunLimit::Instructions` (`Unsupported`);
+`last_run_instructions` is 0; `add_inline_thunk`, `add_breakpoint` refuse; `add_thunk` /
+`set_return_sentinel` overlay a `BRK #0xF00D` page on a read-only or free page, accept an executable
+page whose word already traps (`UDF`/`BRK`) or a writable data page (fetch abort), and refuse real
+code; `invalidate_code` is `sys_icache_invalidate` over the host-readable executable part;
+`cost` is the TLS block plus the register file (the vCPU is the thread's, measured below).
+Guest `svc`, undefined words and trapped system registers are `UnsupportedInstruction` naming the
+word; `CNTPCT_EL0` (which traps to EL2 here) is emulated from the same counter as `CNTVCT_EL0`;
+`WFI` yields the host thread and continues, as dynarmic's hint arm does.
+
+### Evidence
+
+| Suite | Count | Run |
+|---|---|---|
+| `omni-platform/tests/hypervisor_macos.rs` | 7 | limits; every register incl. all 32 Q registers byte-exact; an EL1 `hvc`; **stage 2 follows host protect, decommit and detach** (fact 2, fixed); overlays; IPA/alignment refusals; the vCPU limit as `VcpuLimit` |
+| `omni-cpu/tests/native.rs`, seam | 16 | capabilities and refusals; a loop, flags and untouched registers; D13 both ways; the vector file; a thunk and a branch into a slot's middle; a data-page thunk; six bad accesses incl. a **host heap pointer** and a VA at 64 GiB; demand paging charged per granule; `svc`/`UDF`/`ID_AA64ISAR0`; `WFI` and both counters; a real `CAS`; a runaway halted within a tick; a context across threads and two per thread; rewritten code; a thread's exit gives its vCPU back |
+| `omni-cpu/tests/native.rs`, **the M2 gate** | 6 | the same three real `libroblox.so` functions and predictions as `tests/roblox.rs`: 256 base64 values, 18 timeval vectors, the stack guard in three directions (the second without a breakpoint), the real `CAS` word dynarmic refuses executing, a return into nothing, 8 threads x 1,000 calls |
+| `omni-android/tests/native_initializers.rs`, **M3's gate** | 1 | **all 3,594 initializers in order**, the eight pinned words, **exactly 92,431 image pointers** written (the translating run's figure), and the guest thread they start stopped through its `HaltHandle` |
+| `mac-hvf-*` mutation rows | see below | |
+
+The translating backend's gates are untouched: `initializers` passes (dynarmic), and the macOS gate
+(`gameactivity`, dynarmic) passed twice with the crossing-rate report on. It also failed twice, for
+reasons that are not this branch's: once because this worktree's APK was a symlink (the merge
+notes), and once when the engine stalled before `APP_READY(Landing)` and never reached Vulkan (0
+entry points resolved; the game thread did not stop in 60 s) -- the network-dependent stall the
+gate has shown before; that run is excluded from 4.2.
 
 ## 4. Measurements
 
-*(filled in below)*
+All on the M1 above, release builds, test binaries signed by `tools/hvf_run.sh`. "Median [min]".
+
+### 4.1 One import crossing -- the number the decision turns on
+
+`measure_thunk_crossing_cost`: a guest loop calling a thunk through `BLR`, the host adding 1 to X0
+and resuming at X30, n = 100,000 crossings per round, 7 rounds, same program on both backends.
+
+| | ns per crossing |
+|---|---|
+| native: a VM exit per crossing (every import) | **1,614 [1,554]** (before the per-thread watchdog: 1,648 [1,630]) |
+| of which: saving the register file (31 X, 32 Q, SP, FPCR/FPSR, TPIDR: 67 framework calls) | 638 [568] |
+| of which: loading it in full (on a thread switch; a crossing loads only what the host changed) | 556 [510] |
+| floor: `svc` -> EL1 -> `hvc` -> host -> resume, C probe, no register file | 786-790 |
+| dynarmic: exit to the caller (D17 design A) | 37.6 [36.9] |
+| dynarmic: inline dispatch (design B, what the runtime uses) | **23.7 [22.8]** |
+
+**A native crossing costs 68x dynarmic's inline dispatch.** Over half of it is the hypervisor's
+own exit; the register save is the backend's and is kept eager on purpose: a `GuestCpu` is `Send`,
+a vCPU is bound to its thread, and a context whose registers were left in one thread's vCPU could not
+be read from another.
+
+### 4.2 The crossing rate at the landing screen (dynarmic, the real gate)
+
+`OMNI_CROSSING_RATE=1` (this branch; off by default, read-only) on the macOS gate command,
+`OMNI_SESSION_SECONDS=60`, 5 s windows; "steady" is +25..+55 s, after `APP_READY(Landing)`.
+Two runs reached the landing screen (a third stalled before it on the network and is excluded).
+
+| run | all crossings | guest thread 5 | every other thread | exit path |
+|---|---|---|---|---|
+| A (landing; presents erratic, window not in front) | 1.52 M/s | 1.12 M/s | **0.40 M/s** | 0.31-0.44 M/s |
+| B (landing; ~60 fps; `OMNI_PROFILE=1`) | 3.97 M/s | 3.44 M/s | **0.52 M/s** | 1.16-1.19 M/s |
+
+* **Guest thread 5 is a poll loop**: `ALooper_pollOnce`, `pthread_mutex_lock`, `pthread_mutex_unlock`
+  in equal numbers (1.15 M/s each in run B), 17% of its samples in guest code, 83% in those three
+  handlers (`OMNI_PROFILE`, 2 ms). It is a spin: it uses a core whatever a crossing costs, and its
+  rate is simply how fast the host lets it go round.
+* **Every other thread together crosses 0.40-0.52 M/s**, and without the looper's calls the hottest
+  imports are (per second, steady, run A / run B): `pthread_getspecific` 203k / 264k, `clock_gettime`
+  39k / 85k, `memcpy` 29k / 34k, `memset` 14k / 24k, `strcmp` 20k / -, `pthread_mutex_lock` and
+  `_unlock` 15k / 19k each, `__errno` 8k / 12k, `memcmp`, `strlen`, `memmove`, `pthread_once`.
+* **Multiplied out**: 0.40-0.52 M/s x 1.61 us = **0.64-0.84 of a core in VM exits** for the threads
+  doing the work, against ~0.01 on dynarmic (23.7 ns inline). The busiest working threads cross
+  75-155k/s each (render 108k/s at 13% in guest code: natively its guest code would shrink to ~2% of
+  a core and its exits grow to ~17%).
+
+### 4.3 Guest code speed on real engine code
+
+| workload | dynarmic | native | |
+|---|---|---|---|
+| **compute**: 33 real functions, 69.7 M instructions (see method) | warm **1,320** M insn/s (cold 1,121) | **7,553** M insn/s | **5.7x** faster (per function 1.7-83x, most 2-7x) |
+| the 870 runnable leaves, one call each (avg 9.3 instructions) | 62.7 ns per call | 1,639 ns per call | **26x slower**: per-call cost dominates |
+| a two-instruction loop, 4 G instructions (C probe) | 4,873 M/s (CPU workstream) | 5,935 M/s | = the host's own 5,934 |
+
+Method for the compute row (`measure_compute_throughput_on_real_functions`): **all 245,117**
+`.eh_frame` functions were run natively once with X0/X2 pointing at two 1 MiB buffers, X1/X3 their
+length and X4-X7 = 64 (5.4 s; 31,290 returned, 213,614 stopped with a typed exit, 213 halted after
+20 ms, 0 refused); the 82 that returned after >= 40 us were run on dynarmic **over the same guest
+space** (same library, buffers, stack) to count their instructions; the 33 with >= 200,000 that
+returned were timed warm on both (median of 3, buffers refilled identically) and kept only when both
+backends left the same X0 and the same buffer contents -- all 33 did.
+
+### 4.4 Startup: the 3,594 initializers
+
+`measure_the_initializer_run`, one instance per process (an instance is never released, and its
+started thread slowed a second instance 1.4-1.9x, MEASURED), alternating, n = 8 each:
+
+| | cold run | guest instructions | crossings on the initializer thread | `phys_footprint` added by the run (n = 3) |
+|---|---|---|---|---|
+| dynarmic | **2,417 ms** median (2,284-2,666) | 91,570,432 (counted) | 457,831 (all inline) | **+99.8 MiB** |
+| native | **795 ms** median (761-852) | (not countable) | 457,831 (all VM exits) | **+23.5 MiB** |
+
+**3.0x faster, and 76 MiB less.** Derived, not measured: 457,831 exits x ~1.6 us is ~0.73 s of
+native's 0.80 s -- the native startup is almost entirely crossing cost, and dynarmic's almost
+entirely translation.
+
+### 4.5 A demand-paged first touch
+
+`measure_demand_paging_fault_cost`: a store into each of 1,024 untouched 64 KiB granules, minus the
+same loop over them committed, 5 rounds, median:
+
+| native (stage-2 abort, `admit`, the mirror's remap, retry) | **6.37 us** per granule |
+|---|---|
+| dynarmic (host fault, Mach exception handler, pager, retry) | **24.77 us** per granule |
+
+### 4.6 Memory per guest thread
+
+`measure_memory_per_guest_thread`: `phys_footprint` with 32 parked threads that each created a
+context and ran one tiny function, minus 32 parked threads that did nothing guest-related.
+
+| | per thread |
+|---|---|
+| native (context + the thread's vCPU) | **78.6 KiB** |
+| dynarmic (context + jit), one tiny function | 47.0 KiB |
+| dynarmic at the landing screen (docs/ports/macos.md, `MallocStackLogging`) | **~33 MB** (per-jit block maps, fastmem patch maps; each thread's own translation) |
+
+The native figure does not grow with the code a thread runs, because nothing is translated; the
+initializer run above is the same fact at scale (+23.5 MiB against +99.8).
+
+### 4.7 Robustness and isolation (not a speed, and not optional)
+
+* **The survey above ran all 245,117 real functions natively with garbage-shaped arguments; the
+  process survived every one.** Surveying on dynarmic first, `libroblox.so + 0x224822c` **aborted
+  the whole test process** (`dynarmic: Segfault happened within JITted code ... wasn't at a fastmem
+  patch location`, SIGABRT) -- a Global Constraint 11 violation on the translating arm64 path,
+  reported here for the CPU workstream. **Deterministic, and state-dependent**: replaying the
+  survey's sequence aborts at the same function and host PC offset every time
+  (`repro_dynarmic_aborts_during_the_survey_at_libroblox_0x224822c`, `#[ignore]`d, aborts the
+  binary), while that function **alone** is an ordinary typed `MemoryFault { address: 0x51 }` on
+  both backends -- so what breaks is left behind by the functions before it.
+* **Stage 2 maps only the attached guest space**, so a guest pointer to the Rust heap, a driver
+  mapping or the code cache is a typed `MemoryFault` (`every_bad_access_is_a_typed_fault...` reads a
+  real host heap pointer). D4 amendment 1's "identity fastmem does not confine the guest" does not
+  hold for this backend. The flip side is a condition below: anything that hands the guest a host
+  pointer outside `GuestSpace` stops working.
+* LSE atomics, FP16, `FJCVTZS` and the rest of dynarmic's 231 unimplemented decoder entries (D5)
+  simply execute; exclusives and ordering are the hardware's own, shared with the host's atomics.
+
+### 4.8 Limits found
+
+* **Guest-physical space is 36 bits (64 GiB) on the M1**, default and maximum. With IPA == VA a
+  guest space must lie below 64 GiB: the default placement does (`0x3_0000_0000`), the dynarmic
+  harness's deliberately high space does not, and in one process the fifth 16 GiB space was placed
+  above it and refused -- by name.
+* **64 vCPUs per VM, one VM per process**; one vCPU per host thread that has run guest code (39 at
+  the landing screen fit). `hv_vcpu_create` 9.3 us, `hv_vcpu_destroy` 4.3 us (n = 200).
+* `hv_vm_map` binds the object present at the time; host protection is ignored (section 1). The
+  mirror handles both, but every `mmap`/`mprotect` in an attached range costs an extra
+  `hv_vm_unmap` + `hv_vm_map` (0.8 us for 16 KiB, 1.6 us for 64 MiB untouched).
+
+## D31 (draft) — A native CPU backend under Hypervisor.framework: not the default now; adopt when hot imports stop being VM exits
+
+**Status: draft, for the owner.** Nothing here changes the default backend; `native-hvf` is off by
+default and dynarmic remains the backend every gate runs on.
+
+**What the numbers say.** On this M1 the native backend runs real engine compute **5.7x** faster
+than dynarmic's warm translated code (7.55 against 1.32 G insn/s, 33 real functions), starts the
+3,594 initializers **3.0x** faster (795 against 2,417 ms), pays **76 MiB less** for doing so, costs
+**79 KiB per guest thread** that does not grow with the code it runs (dynarmic: ~33 MB per thread at
+the landing screen, its own translation), resolves a demand-paged first
+touch **3.9x** cheaper, survived all 245,117 real functions where dynarmic aborted the process on
+one, and confines the guest to its own space. Against that, **one import crossing costs 1.61 us --
+68x dynarmic's 23.7 ns inline dispatch** -- and at the landing screen the threads doing real work
+cross **0.40-0.52 M times a second**, which natively is **0.64-0.84 of a core in VM exits**, of the
+same order as the guest compute the backend saves there. A short guest call is 26x slower.
+
+**Decision (draft): do not adopt as the default now. Adopt when these hold, measured on the gate:**
+
+1. **The hot imports are served in the guest.** `pthread_getspecific` (the largest single rate),
+   `__errno`, `clock_gettime` (from `CNTVCT_EL0`, which the guest reads natively), `memcpy`, `memset`,
+   `memmove`, `memcmp`, `strlen`, `strcmp`, and the uncontended paths of `pthread_mutex_lock`/`unlock`
+   (atomics in guest code; exit only on contention). Together these are ~90% of the working
+   threads' 0.40-0.52 M/s (4.2); the bar is **< 50k VM exits/s at the landing screen**
+   (< 0.1 of a core). The looper's `ALooper_pollOnce` stays an exit and its loop stays a spin.
+2. **Nothing in the runtime passes a counted budget to a backend that cannot count.** Done here
+   for guest threads and their exit destructors; still counted in JNI native methods, input,
+   AAudio callbacks, script downcalls and the lifecycle (`RunLimit::Instructions` in
+   `jni/env.rs`, `jni/input.rs`, `jni/script.rs`, `aaudio/mod.rs`, `bionic/threads.rs` windows'
+   callers). The native backend bounds them with its `HaltHandle` (a vtimer tick, 1 ms).
+3. **The macOS gate passes natively** (graphics, network, no thread killed), with the host-pointer
+   paths closed first: the backend confines the guest, so a `vkMapMemory` or callback pointer
+   outside `GuestSpace` that works on dynarmic faults here (D4 amendment 1's recommendation to keep
+   such memory inside the guest space becomes a requirement).
+4. **More than 64 guest threads is handled**: one VM per process allows 64 vCPUs and the engine
+   may make 256. Release a thread's vCPU while it blocks in a handler (9.3 + 4.3 us per release and
+   re-acquire, measured), or keep the refusal and measure that the engine never exceeds it.
+5. The shipping binary is signed with `com.apple.security.hypervisor`, and each instance is its own
+   process (IPA == VA needs its space below 64 GiB; one VM per process).
+
+**What would change the answer.**
+
+* *Towards adopting sooner*: condition 1 measured below the bar -- then the memory, startup and
+  robustness wins stand with little left against them. The memory win goes straight at the owner's
+  per-instance target: the ~1.3 GB of per-thread translation state dynarmic holds at the landing
+  screen (39 threads x ~33 MB) does not exist natively. (The native landing-screen footprint itself
+  is not measured: condition 3.)
+* *Towards not adopting*: the other workstream bringing dynarmic's per-thread memory down to a few
+  MB (shared code cache / bookkeeping) removes the largest win; if in-guest import service proves
+  impractical (the handlers are Rust; serving them in guest code means a second implementation of
+  each in ARM64, which must agree with the first), the crossing cost stays, and native is a net
+  loss for any thread whose guest code runs less than **~2 us between host calls** (break-even: the
+  1.59 us a crossing adds against the 82% of guest time the 5.7x saves). At the landing screen the
+  render thread runs ~1.2 us of guest code per crossing (13% of a core over 108k crossings/s).
+* *Unmeasured and able to move it*: gameplay (not the landing screen) -- more compute per crossing
+  favours native; the vCPU register save (0.6 us of every exit) could be halved by trapping FP/SIMD
+  lazily (`CPACR_EL1`), at the cost of one extra exit in each run that uses them.
+
+### Mutation rows
+
+`python3 tools/mutate.py --only mac-hvf-`: **26/26 caught** -- 9 on the hypervisor seam and the vm
+hook (each caught by `hypervisor_macos`), 14 on the backend (by `native`, the M2 gate among them),
+3 on the runtime (two by the native M3 gate, and the B row -- dynarmic's guest threads losing their
+windows -- by `bionic`'s `a_runaway_guest_thread_stops_at_a_window_boundary`). Pre-flight: 26/26
+patterns unique, 4/4 commands pass unmutated; `git diff --exit-code crates tools` clean after.
 
 ## Merge notes
 
-*(filled in below)*
+Shared files this workstream edits, each minimal and additive; nothing changes for Windows (every
+edit is behind a feature that is off by default, or in the macOS vm backend):
+
+| File | Edit |
+|---|---|
+| `crates/omni-platform/Cargo.toml` | `[features] hypervisor = []` |
+| `crates/omni-platform/src/lib.rs` | `#[cfg(feature = "hypervisor")] pub mod hypervisor;` |
+| `crates/omni-platform/src/vm/macos.rs` | `mirrored(address, size, prot)` after the five mapping changes (`fresh_reserved`, `mprotect`, `map_file`'s `mmap`, `unmap_and_release`, `release`) and the ten-line helper; compiles to nothing without the feature |
+| `crates/omni-cpu/Cargo.toml` | `aarch64`-only optional `omni-platform` with `hypervisor`; feature `native-hvf` |
+| `crates/omni-cpu/src/lib.rs` | `#[cfg(all(feature = "native-hvf", target_arch = "aarch64"))] pub mod native;` |
+| `crates/omni-android/Cargo.toml` | `[features] native-hvf = ["omni-cpu/native-hvf"]` (test targets only) |
+| `crates/omni-android/src/bionic/threads.rs` | `drive` and the exit destructors run unbounded, with the halt registered, **only** when `counted_step_limit` is false |
+| `crates/omni-android/src/bionic/mod.rs` | the `uncounted_halts` registry and `UncountedHalt` guard; `stop_guest_threads` requests them (empty on dynarmic) |
+| `crates/omni-android/tests/gameactivity.rs` | `OMNI_CROSSING_RATE=1` report in the frames block (off by default, read-only) |
+| `tools/mutate_mac/cpu.py` | the `mac-hvf-*` rows and their command helpers |
+| `docs/ports/macos.md` | one line under "A native CPU backend: first numbers" pointing here |
+
+New files: `crates/omni-platform/src/hypervisor/{mod,macos,unsupported}.rs`,
+`crates/omni-platform/tests/hypervisor_macos.rs`, `crates/omni-cpu/src/native/{mod,system}.rs`,
+`crates/omni-cpu/tests/native.rs`, `crates/omni-android/tests/native_initializers.rs`,
+`tools/hvf_run.sh`, `tools/hvf.entitlements`, this file.
+
+Not code: this worktree's APK is a **hard link**, not the symlink it was set up with -- the gate
+hard-links the APK into the guest's root as `base.apk`, a hard link of a symlink is a symlink, and the
+guest filesystem refuses symlinks, so the render thread died (MEASURED, first gate run here).
+
+## Open, and what each costs
+
+* **The macOS gate has not run natively** (condition 2 and 3). Consequence: no native landing-screen
+  figure for frames, memory or CPU; the D31 estimate multiplies measured costs by measured rates.
+* **No in-guest import service** (condition 1). Consequence: every import is a 1.6 us exit.
+* **No M:N vCPUs**: the 65th guest thread that runs code is refused (`Unsupported` naming the limit).
+* **No breakpoints, no planted traps in guest code**: `add_breakpoint` and a thunk inside real code
+  are refused by name.
+* **A guest load from a veneered page reads `BRK` words** rather than the zeroes or fault it would
+  get; only the boundary's function area is veneered, and nothing loads from it on a working path.
+* **The thread-exit destructor path on a non-counting backend has no mutation-proven test**: nothing
+  in the native suites makes a guest thread return with destructors registered.
+* **The watchdog's re-arming has no mutation row**: a surviving mutation would leave the halt test
+  spinning for ever and hang the harness. The halt test itself (`a_runaway_guest_is_halted...`) runs.
+* **The boundary takes `crossings.lock()` on every exit-path crossing**, a process-wide lock that on
+  this backend is on *every* import; contention across threads is unmeasured.
+* **dynarmic aborted the process on `libroblox.so + 0x224822c`** (4.7) -- for the CPU workstream.
