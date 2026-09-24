@@ -1068,6 +1068,14 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          file's LAST section. bionic: strtol(s, NULL, 10), and long is 64 bits on LP64, so it \
          is atoll.",
     ),
+    (
+        "remove",
+        "The second launch of an account's kept storage, on Linux: a guest thread died on it \
+         unbound -- the guest called the imported symbol `remove` through its thunk and nothing \
+         in the compatibility layer implemented it -- and the session hung behind it. The file's \
+         LAST section. bionic (libc/stdio/stdio.cpp): unlink, and rmdir when that fails with \
+         EISDIR.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1124,7 +1132,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // Then `listen` and `accept`, for 316: the MicroProfiler web server in a game world.
     // Then `__vsprintf_chk`, for 317: a TaskScheduler worker in place 606849621.
     // Then `atol`, for 318: the next worker death in the same place, 2026-09-24.
-    assert_eq!(symbols.len(), 318, "bound symbols: {symbols:?}");
+    // Then `remove`, for 319: a thread's death on a second launch of kept storage (Linux).
+    assert_eq!(symbols.len(), 319, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1231,7 +1240,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`listen` and `accept`, inline, for 316**: the MicroProfiler web server's thread.
     // **`__vsprintf_chk`, inline, for 317**: a worker formatting a cpufreq path in a game world.
     // **`atol`, inline, for 318**: `strtol(s, NULL, 10)`, which on LP64 is `atoll`.
-    assert_eq!(Bionic::inline_symbols().count(), 303);
+    // **`remove`, inline, for 319**: bionic's `unlink`, then `rmdir` on `EISDIR`.
+    assert_eq!(Bionic::inline_symbols().count(), 304);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -5758,7 +5768,9 @@ fn a_guest_with_no_filesystem_root_refuses_every_path_call_by_name() {
     let _guard = serialized();
     let f = fixture();
     let path = f.cstring(f.guest.data + 0x100, b"/data/anything");
-    for symbol in ["open", "stat", "lstat", "access", "unlink", "rmdir", "opendir", "statvfs"] {
+    for symbol in
+        ["open", "stat", "lstat", "access", "unlink", "rmdir", "remove", "opendir", "statvfs"]
+    {
         let error = refusal_of(&f, symbol, |asm| {
             asm.mov(0, path as u64);
             asm.mov(1, 0);
@@ -6912,6 +6924,36 @@ fn the_namespace_calls_keep_posixs_distinctions_from_guest_code() {
     assert!(error.to_string().contains("X_OK"), "{error}");
 }
 
+/// **`remove` is bionic's (`libc/stdio/stdio.cpp`), through the guest's own call**: `unlink`,
+/// and `rmdir` only when that fails with `EISDIR`. So a file is unlinked, an empty directory is
+/// removed, a missing path is `-1` with `ENOENT` (2), and a directory that still has an entry is
+/// `-1` with `rmdir`'s `ENOTEMPTY` (39) and stays -- each read back from the host. A binding
+/// that only unlinked fails the directory line; one that removed a tree fails the last.
+///
+/// Only the return is asserted on success: C17 7.21.4.1 and POSIX leave `errno` unspecified after
+/// a call that succeeds, and bionic's own `remove` leaves `unlink`'s `EISDIR` in it after removing
+/// a directory.
+#[test]
+fn remove_unlinks_a_file_and_removes_an_empty_directory_from_guest_code() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("remove");
+    std::fs::write(scratch.path("f.txt"), b"f").expect("a host file");
+    std::fs::create_dir(scratch.path("empty")).expect("an empty directory");
+    std::fs::create_dir(scratch.path("full")).expect("a directory");
+    std::fs::write(scratch.path("full/x"), b"x").expect("an entry in it");
+    let remove = |guest: &[u8]| {
+        let path = f.cstring(f.guest.data + 0x100, guest);
+        call_with_errno(&f, "remove", &[path as u64])
+    };
+    assert_eq!(remove(b"/f.txt").0, 0, "a file");
+    assert!(!scratch.path("f.txt").exists(), "the file is gone");
+    assert_eq!(remove(b"/empty").0, 0, "an empty directory");
+    assert!(!scratch.path("empty").exists(), "the empty directory is gone");
+    assert_eq!(remove(b"/nope"), (-1, 2), "a missing path is ENOENT");
+    assert_eq!(remove(b"/full"), (-1, 39), "a directory with an entry is rmdir's ENOTEMPTY");
+    assert!(scratch.path("full/x").is_file(), "the directory and its entry stay");
+}
+
 /// **`__open_2` refuses `O_CREAT` by name, and the refused `open` flags refuse by name.**
 ///
 /// Each of these is a promise this layer cannot keep, and each has a believable wrong answer
@@ -7012,6 +7054,7 @@ fn hostile_arguments_to_the_file_group_are_typed_errors_and_not_panics() {
         ("unlink", &[0]),
         ("mkdir", &[unmapped, 0o755]),
         ("rmdir", &[0]),
+        ("remove", &[unmapped]),
         ("opendir", &[0]),
         ("rename", &[0, 0]),
         // Destinations that cannot be written.

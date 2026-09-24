@@ -1879,6 +1879,9 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("unlink", files::unlink),
     ("mkdir", files::mkdir),
     ("rmdir", files::rmdir),
+    // The second launch of an account's kept storage, on Linux: a guest thread died on it
+    // unbound and the session hung. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records it.
+    ("remove", files::remove),
     // M6, the second launch of a kept data directory: the engine's HTTP cache. Outside Task 1's
     // 188; `BEYOND_THE_PREDICTION` records it.
     ("utime", files::utime),

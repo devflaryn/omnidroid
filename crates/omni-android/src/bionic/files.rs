@@ -1630,6 +1630,31 @@ pub(super) fn rmdir(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     one_path(c, |fs, path| fs.rmdir(path))
 }
 
+/// `int remove(const char *pathname)`
+///
+/// bionic's own, in `libc/stdio/stdio.cpp` -- not the lstat-then-choose of the BSD `remove.c`:
+///
+/// ```c
+/// if (unlink(path) != -1) return 0;
+/// if (errno != EISDIR) return -1;
+/// return rmdir(path);
+/// ```
+///
+/// So a file (or a link, which `unlink` never follows) is unlinked, an empty directory is
+/// removed, and every other failure is `unlink`'s `errno`, a missing path's `ENOENT` among them;
+/// a non-empty directory is `rmdir`'s `ENOTEMPTY`. Returns 0, or -1 with `errno`. One
+/// difference, in what C17 7.21.4.1 leaves unspecified: after a directory is removed, bionic's
+/// `errno` still holds `unlink`'s `EISDIR`, and this leaves it as it was.
+///
+/// MEASURED need: a guest thread died on it unbound on the second launch of an account's kept
+/// storage (Linux), and the session hung behind it.
+pub(super) fn remove(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    one_path(c, |fs, path| match fs.unlink(path) {
+        Err(error) if error.kind() == Some(FsErrorKind::IsADirectory) => fs.rmdir(path),
+        unlinked => unlinked,
+    })
+}
+
 // ================================================================== directories
 
 /// `DIR *opendir(const char *name)`

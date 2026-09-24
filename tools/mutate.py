@@ -8094,6 +8094,24 @@ directory", ADAPTER_FILES,
      "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !FAST_DISPATCH;",
      "    pub const INTERRUPTIBLE: u32 = ALL_SAFE & !(RETURN_STACK_BUFFER | FAST_DISPATCH);",
      ["cargo", "test", "-p", "dynarmic-sys", "--release", "--test", "a64_exec", "--no-fail-fast"]),
+    # `remove`, bionic's (libc/stdio/stdio.cpp): unlink, and rmdir only when that fails with
+    # EISDIR. A guest thread died on it unbound on the second launch of kept storage (Linux).
+    ("remove-A1", "A", "remove is left unbound",
+     "crates/omni-android/src/bionic/handlers.rs",
+     """    ("remove", files::remove),
+""",
+     "",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "remove"]),
+    ("remove-A2", "A", "remove is unlink alone, so a directory is never removed",
+     "crates/omni-android/src/bionic/files.rs",
+     "        Err(error) if error.kind() == Some(FsErrorKind::IsADirectory) => fs.rmdir(path),",
+     "        Err(error) if error.kind() == Some(FsErrorKind::NotADirectory) => fs.rmdir(path),",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "remove"]),
+    ("remove-A3", "A", "a directory rmdir refuses reports unlink's EISDIR, not rmdir's ENOTEMPTY",
+     "crates/omni-android/src/bionic/files.rs",
+     "        Err(error) if error.kind() == Some(FsErrorKind::IsADirectory) => fs.rmdir(path),",
+     "        Err(error) if error.kind() == Some(FsErrorKind::IsADirectory) => fs.rmdir(path).map_err(|_| error),",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "remove"]),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so
