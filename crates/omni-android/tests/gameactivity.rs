@@ -1262,6 +1262,32 @@ const EXIT_RECORDS: &str = "data/system/omnidroid-procexitstore";
 /// its own (`app_webview/Default/Cookies`), in this layer's format.
 const COOKIE_STORE: &str = "data/data/com.roblox.client/app_webview/omnidroid-cookies";
 
+/// Where the client-settings document a fetch answered is kept in the guest's root: the app's
+/// files directory, in this layer's format (the body verbatim) rather than the Java side's own
+/// zstd flag cache -- so a kept root (`OMNI_DATA_DIR`) has it when a later run's fetch fails.
+const CLIENT_SETTINGS_CACHE: &str = "data/data/com.roblox.client/files/omnidroid-clientsettings.json";
+
+/// **The Java side's settings request, made by the system `curl`** (Windows 10+, macOS and
+/// Ubuntu ship one): an HTTPS GET of `url` with no cookie and no other state, bounded at 15 s,
+/// answering the body or why there is none. The embedding's, not the guest's: on a device this
+/// is OkHttp in the app's Java code, which nothing here executes (D7).
+fn fetch_with_curl(url: &str) -> Result<String, String> {
+    let output = std::process::Command::new("curl")
+        .args(["-sS", "--fail", "--proto", "=https", "--connect-timeout", "10", "--max-time", "15", "--compressed"])
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("`curl` could not be run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "curl {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|_| "the body is not UTF-8".to_string())
+}
+
 /// At most this many records, newest first -- the per-package bound a device keeps.
 const MAX_EXIT_RECORDS: usize = 16;
 
@@ -2777,6 +2803,16 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // said what it is. This is the roadmap extended from measured runtime behaviour, which is
     // what the goal asks for when the roadmap and the runtime disagree.
     let settings_outcomes = if attempt_flags {
+        // **The document is the Java side's fetch** (`omni_android::jni::settings` has the dex):
+        // made here, just before the row that hands it over, and kept in the app's files
+        // directory for a run whose fetch fails. One line says where it came from.
+        let settings = omni_android::jni::settings::ClientSettings::load(
+            &omni_android::jni::settings::settings_url(),
+            &guest._root.0.join(CLIENT_SETTINGS_CACHE),
+            fetch_with_curl,
+        );
+        let _ = writeln!(std::io::stderr(), "{settings}");
+        guest.jni.set_client_settings(settings.document);
         drive_flag_rows(&guest, &mut cpu, &script::FLAGS_AND_START[..1])
     } else {
         Vec::new()

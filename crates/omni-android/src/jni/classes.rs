@@ -1847,7 +1847,8 @@ pub static DECLARED: &[ClassSpec] = &[
     // `FMOD_OS_Output_GetDefault` (`0x4fbc4fc`), which reads four FMOD override ints Roblox fills
     // from FFlags (`0x2f11294` -> `0x4f3f148`, table `0x66acea8` -> `0x6cd5dc8 + 4*i`):
     // index 0 `DebugFmodUseAndroidAudioTrack` and index 1 `DebugFmodUseAndroidOpenSl`, both
-    // zero-initialised `.bss` with no static writer and absent from the empty settings document.
+    // zero-initialised `.bss` with no static writer and absent from the settings document (the
+    // empty one, and the live `GoogleAndroidApp` one of 2026-09-24).
     // With both clear it goes straight to `supportsAAudio()` (`0x4fbc630`) and, when that is
     // true, returns output type `0x14`, whose plugin is "FMOD AAudio Output" (its description's
     // type word at `+0xb8`, `0x21b588`). `FMOD_OS_Output_GetDefault` calls `supportsLowLatency`

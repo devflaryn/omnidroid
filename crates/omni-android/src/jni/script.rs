@@ -57,6 +57,9 @@ pub enum ScriptArg {
     /// The list of how earlier runs ended -- [`super::Jni::previous_exit_reasons`], built from
     /// what the embedding recorded, and empty when it recorded nothing.
     PreviousExitReasons,
+    /// The client-settings document the Java side fetched -- [`super::Jni::client_settings`], as
+    /// a `java.lang.String`. See [`CLIENT_SETTINGS`].
+    ClientSettings,
     /// `CookieManager.getCookie(url)` against the app's cookie store -- [`super::Jni::cookie_header`]
     /// -- as a `java.lang.String`: `""` when it holds none, which is what `bh.x0.S0` passes then.
     CookiesFor(&'static str),
@@ -617,9 +620,11 @@ pub static ENGINE_SETTINGS: &[Downcall] = &[Downcall {
     args: &[ScriptArg::Object("com/roblox/engine/jni/autovalue/InitParams")],
 }];
 
-/// What the host hands `nativeInitClientSettings` as the client-settings document.
+/// The empty client-settings document: what `nativeInitClientSettings` is handed **only when the
+/// embedding has neither a fetched document nor a kept copy** ([`super::settings`]), and the log
+/// says so. It is not what a device does then.
 ///
-/// # This argument is the whole of why row 21 can happen offline, and it was decoded
+/// # The first argument is the document, and a device fetches it
 ///
 /// `Java_..._nativeInitClientSettings` (guest `0x022265fc`) converts its three `jstring`s and
 /// calls `0x02baf38c(json, "", arg2, arg3)`. That function **branches on whether the first string
@@ -634,13 +639,22 @@ pub static ENGINE_SETTINGS: &[Downcall] = &[Downcall {
 ///
 /// The empty branch goes to `0x04ecae88("ClientAppSettings", ..)` with the third string, which is
 /// an HTTP fetch of `clientsettings.roblox.com`; the non-empty branch parses the document the
-/// caller supplied and needs no network at all. On a device the Java side fetches it and passes
-/// it here, so **supplying it is what the Java side does**, not a way around the fetch.
+/// caller supplied. On a device the caller, `fi.e$f.a`, passes the **body** of the Java side's
+/// own fetch of `clientsettingscdn.roblox.com/v2/settings/application/GoogleAndroidApp`, and makes
+/// no downcall at all when that body is null or empty (it returns 1, and `fi.e$f.b` then skips
+/// `nativePostClientSettingsLoadedInitialization3`) -- [`super::settings`] has the dex. The
+/// `...Signed` variant, taken when `ci.i.G5()`, adds the `X-Signature-Ed25519` header value; this
+/// host makes the unsigned call.
 ///
-/// `applicationSettings` is empty because this host has no settings document to be honest about.
-/// Every flag then takes the value it was compiled with, which is a state the engine is written
-/// for — it is what a device gets for any flag the response omits. Inventing flag values here
-/// would be choosing engine behaviour by guess; an empty map chooses nothing.
+/// # Why the empty document is only a fallback now
+///
+/// It was chosen when this host had no network: every flag then keeps the value it was compiled
+/// with. MEASURED, that is not a state the engine is written to start in: flags a device has from
+/// the start take their live values only later in such a run, after code that ran at
+/// initialisation has read the defaults. `FIntPerformanceControlCrashMetricAlgorithmType2`
+/// is 0 when `InferredCrash::initialize` (`0x228fc00`) runs, so it never sets its member at
+/// `+0xc8`; the flag is `4` by the time the inferred-crash report reads that member, and a worker
+/// dies on the null (`MemoryFault` at `0x23a03ec`).
 pub const CLIENT_SETTINGS: &str = r#"{"applicationSettings":{}}"#;
 
 /// `nativeInitClientSettings`'s **third argument, which is an application name and not a URL**.
@@ -726,9 +740,11 @@ pub static FLAGS_AND_START: &[Downcall] = &[
         descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
         java_before: &[],
         args: &[
-            ScriptArg::Text(CLIENT_SETTINGS),
-            // The second string is not on either branch of `0x02baf38c`'s first test. Empty
-            // rather than invented: the host has nothing to put here that it measured.
+            ScriptArg::ClientSettings,
+            // The second string is not on either branch of `0x02baf38c`'s first test. On a device
+            // it is the override payload (`fi.e$f.a` @`0x0015`: `fk.a.a()`, or
+            // `startup.a.o()` when `xh.b.a()`), not decoded here. Empty rather than invented: the
+            // host has nothing to put here that it measured.
             ScriptArg::Text(""),
             ScriptArg::Text(CLIENT_SETTINGS_APPLICATION),
         ],
@@ -740,7 +756,11 @@ pub static FLAGS_AND_START: &[Downcall] = &[
         member: "nativePostClientSettingsLoadedInitialization3",
         descriptor: "(Ljava/util/List;)V",
         java_before: &[],
-        args: &[ScriptArg::Object("java/util/List")],
+        // `fi.e$f.b` @`0x000a`: `jk.l2.a(context)`, the same `ApplicationExitInfoCpp` list
+        // `NativeHelper.Q` hands `nativeSetAppPreviousExitReasons` -- and `0x226dbec` reads it as
+        // one (`size`, `get`, `mPid`..`mImportance`). A bare `java/util/List`, `size()` 0, told
+        // the engine no earlier run had ended whatever the embedding recorded.
+        args: &[ScriptArg::PreviousExitReasons],
     },
     // ---- row 22: global init, then the app itself -------------------------------------------
     Downcall {
@@ -793,6 +813,7 @@ pub fn guest_argument(jni: &Jni, argument: &ScriptArg) -> AbiResult<GuestArg> {
         ScriptArg::Null => GuestArg::Int(0),
         ScriptArg::Long(value) => GuestArg::Int(*value as u64),
         ScriptArg::PreviousExitReasons => GuestArg::Int(jni.previous_exit_reasons()?),
+        ScriptArg::ClientSettings => GuestArg::Int(jni.new_string(&jni.client_settings()?)?),
         ScriptArg::CookiesFor(url) => GuestArg::Int(jni.new_string(&jni.cookie_header(url))?),
         ScriptArg::DeepLinkUrl => match join_deeplink() {
             Some(url) => GuestArg::Int(jni.new_string(&url)?),
@@ -1066,6 +1087,7 @@ pub fn perform(jni: &Jni, statements: &[JavaStatement]) -> AbiResult<()> {
             | ScriptArg::AppVersion
             | ScriptArg::Long(_)
             | ScriptArg::PreviousExitReasons
+            | ScriptArg::ClientSettings
             | ScriptArg::CookiesFor(_)
             | ScriptArg::DeepLinkUrl => {
                 return Err(named(AbiError::JniRefused {
@@ -1326,6 +1348,43 @@ mod tests {
         jni.set_cookie_store(&file).expect("the store");
         assert_eq!(text(guest_argument(&jni, cookies).expect("built")), "A=1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Row 21 hands `nativeInitClientSettings` the document the embedding set** -- the body the
+    /// Java side fetched -- and refuses, naming the setter, when it set none: whether the engine
+    /// runs on real flags or on none is the embedding's choice and its log line's.
+    #[test]
+    fn settings_row_21_hands_the_engine_the_document_the_embedding_set() {
+        let space = Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(Arc::clone(&space)).expect("a JNI instance");
+        let row = FLAGS_AND_START.iter().find(|row| row.member == "nativeInitClientSettings").expect("row 21");
+        assert_eq!(
+            row.args,
+            &[ScriptArg::ClientSettings, ScriptArg::Text(""), ScriptArg::Text(CLIENT_SETTINGS_APPLICATION)]
+        );
+        match guest_argument(&jni, &row.args[0]) {
+            Err(AbiError::JniRefused { function, .. }) => assert_eq!(function, "Jni::client_settings"),
+            other => panic!("unset must be refused: {other:?}"),
+        }
+        let document = r#"{"applicationSettings":{"FIntPerformanceControlCrashMetricAlgorithmType2":"4"}}"#;
+        jni.set_client_settings(document);
+        let GuestArg::Int(handle) = guest_argument(&jni, &row.args[0]).expect("built") else {
+            panic!("a string handle");
+        };
+        assert_eq!(jni.string_of(handle).expect("a handle").as_deref(), Some(document));
+    }
+
+    /// **Row 21's second downcall is handed the exit list**, as `fi.e$f.b` hands it `jk.l2.a` --
+    /// the same list `nativeSetAppPreviousExitReasons` gets, not an empty `java.util.List`.
+    #[test]
+    fn settings_post_initialization_is_handed_the_previous_exit_list() {
+        let post = FLAGS_AND_START
+            .iter()
+            .find(|row| row.member == "nativePostClientSettingsLoadedInitialization3")
+            .expect("row 21's second downcall");
+        let exits = SEQUENCE.iter().find(|row| row.member == "nativeSetAppPreviousExitReasons").expect("step 11");
+        assert_eq!(post.args, &[ScriptArg::PreviousExitReasons]);
+        assert_eq!(post.args, exits.args, "the same list both natives are handed");
     }
 
     /// An event whose export nothing resolves is refused, naming the export: the engine would

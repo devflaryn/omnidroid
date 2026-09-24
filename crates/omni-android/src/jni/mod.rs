@@ -53,6 +53,7 @@ pub mod mouse;
 pub mod pool;
 pub mod refs;
 pub mod script;
+pub mod settings;
 pub mod slots;
 pub mod surface;
 pub mod text;
@@ -323,6 +324,8 @@ pub(crate) struct JniState {
     pub(crate) previous_exits: Vec<ExitRecord>,
     /// The installed APK's `versionName`. See [`Jni::set_app_version`].
     pub(crate) app_version: Option<String>,
+    /// The client-settings document. See [`Jni::set_client_settings`].
+    pub(crate) client_settings: Option<String>,
     /// Every `SharedPreferences` store the guest has written, by name: key to value, as
     /// `apply()` committed them. See [`Jni::shared_preferences`].
     pub(crate) shared_preferences: BTreeMap<String, BTreeMap<String, String>>,
@@ -479,6 +482,7 @@ impl Jni {
                 keyboard: Vec::new(),
                 previous_exits: Vec::new(),
                 app_version: None,
+                client_settings: None,
                 shared_preferences: BTreeMap::new(),
                 cookies: cookies::CookieJar::new(),
                 preference_objects: BTreeMap::new(),
@@ -839,6 +843,29 @@ impl Jni {
     /// [`AbiError::JniRefused`] if the embedding never set it.
     pub fn app_version(&self) -> AbiResult<String> {
         self.state.lock().app_version.clone().ok_or_else(app_version_unset)
+    }
+
+    /// **The client-settings document the Java side fetched**, which `nativeInitClientSettings`
+    /// is handed as its first argument -- [`settings::ClientSettings::load`] chooses it, the
+    /// embedding sets it. Never logged by this layer.
+    pub fn set_client_settings(&self, document: impl Into<String>) {
+        self.state.lock().client_settings = Some(document.into());
+    }
+
+    /// The document [`set_client_settings`](Self::set_client_settings) recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::JniRefused`] if the embedding never set it: whether the engine gets the real
+    /// flags or none is the embedding's choice to make and to log, not this layer's to default.
+    pub fn client_settings(&self) -> AbiResult<String> {
+        self.state.lock().client_settings.clone().ok_or_else(|| AbiError::JniRefused {
+            function: "Jni::client_settings".to_string(),
+            address: 0,
+            detail: "the client-settings document is the one the Java side fetched, and the \
+                     embedding never said which (`Jni::set_client_settings`)"
+                .to_string(),
+        })
     }
 
     /// **Keep the app's cookie store in `file`**, as Android's WebView keeps it in the app's own
