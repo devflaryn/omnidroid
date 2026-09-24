@@ -52,6 +52,7 @@ use omni_android::ndk::{
     DeviceConfiguration, HostWindowSource, Ndk, ScreenSize, WindowGeometry, WindowSource,
     ACONFIGURATION_NAVHIDDEN_NO, SURFACE_CLASS,
 };
+use omni_android::gles::{Gles, GlesHost};
 use omni_android::vulkan::{Vulkan, VulkanHost};
 use omni_android::{Boundary, BoundaryBuilder, GuestArg};
 use omni_cpu::dynarmic::{DynarmicBackend, DynarmicCpu, DynarmicOptions};
@@ -461,6 +462,9 @@ struct Guest {
     ndk: Arc<Ndk>,
     /// Bound only under [`GRAPHICS_GATE`]; see [`Guest::load`].
     vulkan: Option<Arc<Vulkan>>,
+    /// `libEGL.so`/`libGLESv2.so` over the host's EGL, bound with Vulkan: the engine's own fallback
+    /// when it refuses the Vulkan device (`omni_android::gles`).
+    gles: Option<Arc<Gles>>,
     /// `libaaudio.so` over the host's default output, bound with the window for the same reason.
     audio: Option<Arc<AAudio>>,
     boundary: Arc<Boundary>,
@@ -599,7 +603,9 @@ impl Guest {
         let with_audio = graphics.is_some();
         let (vulkan_slots, data_bytes) = if graphics.is_some() {
             (
-                omni_android::vulkan::BOUND_SYMBOLS + omni_android::aaudio::BOUND_SYMBOLS,
+                omni_android::vulkan::BOUND_SYMBOLS
+                    + omni_android::aaudio::BOUND_SYMBOLS
+                    + omni_android::gles::bound_symbol_count(),
                 omni_android::vulkan::REQUIRED_DATA_BYTES + omni_android::aaudio::REQUIRED_DATA_BYTES,
             )
         } else {
@@ -618,6 +624,14 @@ impl Guest {
             vulkan.bind_into(&builder).expect("bind the Vulkan loader");
             vulkan.set_host(host);
             vulkan
+        });
+        // **And EGL/GLES over the host's EGL, with the window** -- chosen by the window's system when
+        // the engine's first EGL call reaches the host.
+        let gles = with_audio.then(|| {
+            let gles = Gles::new(Arc::clone(&space));
+            gles.bind_into(&builder).expect("bind libEGL.so and libGLESv2.so");
+            gles.set_host(omni_gfx::GfxGlesHost::new() as Arc<dyn GlesHost>);
+            gles
         });
         let audio = with_audio.then(|| {
             let audio = AAudio::new(Arc::new(PlatformOutput));
@@ -693,6 +707,9 @@ impl Guest {
         if let Some(vulkan) = &vulkan {
             thread_host = thread_host.with_instance(vulkan.thread_instance());
         }
+        if let Some(gles) = &gles {
+            thread_host = thread_host.with_instance(gles.thread_instance());
+        }
         // **And AAudio**: FMOD opens its output on the engine's game thread, and the data callback
         // runs on a thread the library itself starts.
         if let Some(audio) = &audio {
@@ -765,6 +782,7 @@ impl Guest {
             jni,
             ndk,
             vulkan,
+            gles,
             audio,
             boundary,
             object,
@@ -2973,6 +2991,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             .as_ref()
             .and_then(|vulkan| vulkan.call_counts().get("vkQueuePresentKHR").copied())
             .unwrap_or(0)
+            // And every eglSwapBuffers the host answered EGL_TRUE, when the engine fell back to GLES.
+            + guest.gles.as_ref().map_or(0, |gles| gles.presents())
     };
     let mut next_frames = std::time::Instant::now() + FRAMES_EVERY;
     let mut last_presents = presents();
@@ -3726,6 +3746,15 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         None => {
             let _ = writeln!(std::io::stderr(), "VULKAN: not bound ({GRAPHICS_GATE} unset)");
+        }
+    }
+    // **And the EGL/GLES census**, the same way.
+    match &guest.gles {
+        Some(gles) => {
+            let _ = writeln!(std::io::stderr(), "{}", gles.report());
+        }
+        None => {
+            let _ = writeln!(std::io::stderr(), "GLES: not bound ({GRAPHICS_GATE} unset)");
         }
     }
     // **And what FMOD asked `libaaudio.so` for**, the same way.
