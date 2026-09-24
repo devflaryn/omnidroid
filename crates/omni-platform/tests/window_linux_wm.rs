@@ -222,3 +222,34 @@ fn the_minimised_size_and_the_minimised_event_are_one_moment() {
     poll_until(&mut window, "the minimised size", |e| *e == WindowEvent::Resized { width: 0, height: 0 });
     assert_eq!(window.client_size().unwrap(), (0, 0));
 }
+
+/// **A minimise straight after `show` stays a minimise** -- with **no event pumped between the
+/// two**, so the window's `MapNotify` is always processed after the minimise was asked for. That
+/// ordering is what `show`'s deferred activation (`_NET_ACTIVE_WINDOW` on `MapNotify`) must not
+/// undo; MEASURED under xfwm4 before the fix, it came back as focus lost, focus regained and no
+/// iconic state. `renderer_linux_wm.rs` saw the same defect only when its first frame happened
+/// to be presented before the `MapNotify` was pumped -- a detector that depended on timing
+/// (VERIFICATION entry 6; mutation row lnx-win-A24 went NOT CAUGHT once in a whole-table run).
+#[test]
+#[ignore = "needs an X server with a window manager: OMNI_GFX_WINDOW_TESTS=1 DISPLAY=:93"]
+fn a_minimise_straight_after_show_is_not_undone_by_the_activation_show_deferred() {
+    let peer = Peer::open_with_a_manager();
+    let mut window = Window::new(&WindowDesc::new("omnidroid: wm minimise after show", 420, 320)).unwrap();
+    let _ = window.poll_events().count();
+    window.show();
+    window.set_minimized(true).unwrap();
+    let seen = poll_until(&mut window, "the minimised size", |e| *e == WindowEvent::Resized { width: 0, height: 0 });
+    // Give a deferred activation every chance to arrive and undo it: 1 s of pumping.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut after = Vec::new();
+    while Instant::now() < deadline {
+        after.extend(window.poll_events());
+        window.wait(Duration::from_millis(20));
+    }
+    assert_eq!(peer.wm_state(xid(&window)), Some(3), "still IconicState; before: {seen:?}, after: {after:?}");
+    assert_eq!(window.client_size().unwrap(), (0, 0), "after: {after:?}");
+    assert!(
+        !after.iter().any(|e| matches!(e, WindowEvent::Resized { width, .. } if *width > 0)),
+        "nothing restored it: {after:?}"
+    );
+}

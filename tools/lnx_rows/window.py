@@ -261,7 +261,10 @@ ROWS = [
      """        // straight after `XMapRaised` leaves `WM_STATE` iconic, 3 of 3 runs.)
         self.focus_on_map.set(false);""",
      """        // straight after `XMapRaised` leaves `WM_STATE` iconic, 3 of 3 runs.)""",
-     RENDER_WM),
+     # WM, not RENDER_WM: the renderer's test caught this only when its first frame came before
+     # the MapNotify was pumped (NOT CAUGHT once in a whole-table run, caught 3/3 alone).
+     # window_linux_wm's minimise-straight-after-show test pumps nothing in between.
+     WM),
     # --- the surface ---------------------------------------------------------------------------
     # The instance given VK_KHR_xcb_surface for an Xlib window: vkCreateXlibSurfaceKHR is then a
     # function the instance never loaded.
