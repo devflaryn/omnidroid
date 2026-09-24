@@ -466,6 +466,45 @@ pub(super) mod tests {
         nice
     }
 
+    /// **A forbidden raise is refused on every host, not only on one whose limit forbids it.**
+    ///
+    /// The test above computes the floor from the process's own limit, so on a host that grants
+    /// `RLIMIT_NICE` 40 (what Android's `init.rc` sets, and what this port recommends) nothing is
+    /// forbidden and its refusal half never runs -- MEASURED: rows `lnx-proc-A5` and `-B1` went
+    /// NOT CAUGHT in a whole-table run made with the limit at 40. So this one re-runs itself in a
+    /// child process that first lowers its own `RLIMIT_NICE` to 0 (lowering needs no privilege,
+    /// and a child keeps it from every other test), then asks for FMOD's -16.
+    #[test]
+    fn a_forbidden_raise_is_refused_whatever_this_hosts_limit() {
+        const CHILD: &str = "OMNI_LNX_NICE_REFUSAL_CHILD";
+        const NAME: &str = "process::linux::tests::a_forbidden_raise_is_refused_whatever_this_hosts_limit";
+        if std::env::var_os(CHILD).is_some() {
+            let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: a live `rlimit`; lowering a limit needs no privilege.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NICE, &raw const zero) }, 0);
+            assert!(nice_floor() > -16, "this process holds CAP_SYS_NICE: nothing can be forbidden");
+            let before = current_thread_host_priority().expect("getpriority");
+            let code = match set_current_thread_nice(-16) {
+                Ok(()) => 3,
+                Err(ProcessError::Errno { errno: libc::EACCES, .. })
+                    if current_thread_host_priority().expect("read") == before => 0,
+                Err(_) => 4,
+            };
+            std::process::exit(code);
+        }
+        let status = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .status()
+            .expect("run the child");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "with RLIMIT_NICE 0, nice -16 must be the kernel's EACCES and change nothing \
+             (3: reported as success; 4: another error); got {status:?}"
+        );
+    }
+
     /// **A nice value lands on the calling thread and on no other, and a raise this process may
     /// not make is the host's `EACCES`, not a success.**
     ///
