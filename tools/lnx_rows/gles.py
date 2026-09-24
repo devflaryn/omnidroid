@@ -78,9 +78,11 @@ ROWS = [
     # strlen/strstr imports refuse it.
     ("lnx-gles-A5", "A", "glGetString returns the host's pointer",
      GL_RS,
-     """    let at = copy_host_string(gles, c, call, text, call.lanes[0] as u32)?;
+     """        copy_host_string(gles, c, call, text, name)?
+    };
     c.ret().u64(at);""",
-     """    let at = copy_host_string(gles, c, call, text, call.lanes[0] as u32)?;
+     """        copy_host_string(gles, c, call, text, name)?
+    };
     let _ = at;
     c.ret().u64(text);""",
      LIVE),
