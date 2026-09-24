@@ -8279,6 +8279,127 @@ directory", ADAPTER_FILES,
      "const MAX_DEPTH: usize = 64;",
      "const MAX_DEPTH: usize = 2;",
      ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "settings"]),
+    # The logical end of file (2026-09-25): Windows refuses to shorten a file a section holds
+    # (`ERROR_USER_MAPPED_FILE`, 1224) and Linux shortens it; the engine re-opens
+    # `memProfStorage<pid>.json` `O_TRUNC` under a live `MAP_SHARED` mapping, and the refusal killed
+    # a TaskScheduler worker. `fs/windows.rs` keeps the end the guest was told until the last
+    # section of the file goes. Windows-only rows: the unix backends have no logical end.
+    ("logeof-A1", "A", "an O_TRUNC open of a mapped file is refused by the host again",
+     PLAT_FS_WINDOWS,
+     "        Err(error) if truncating && is_user_mapped(&error) => {",
+     "        Err(error) if false && truncating && is_user_mapped(&error) => {",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+    ("logeof-A2", "A", "an ftruncate shortening a mapped file is refused by the host again",
+     PLAT_FS_WINDOWS,
+     """        Err(error) if is_user_mapped(&error) => {
+            let own = reopen(file)?;""",
+     """        Err(error) if false && is_user_mapped(&error) => {
+            let own = reopen(file)?;""",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A3", "A", "fstat reports the host's size, not the logical end",
+     PLAT_FS,
+     """                if let Some(eof) = backend::logical_len(file) {
+                    stat.size = eof;
+                }
+                Ok(stat)""",
+     """                Ok(stat)""",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A4", "A", "stat and lstat by path report the host's size",
+     PLAT_FS,
+     "        if let Some(eof) = backend::logical_len_at(host) {",
+     "        if let Some(eof) = None::<u64> {",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+    ("logeof-A5", "A", "read runs on past the logical end into the host's bytes",
+     PLAT_FS,
+     """                // A read ends at the end of file, and a logical one is where it is.
+                let buf = match backend::logical_len(file) {""",
+     """                // A read ends at the end of file, and a logical one is where it is.
+                let buf = match None::<u64> {""",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A6", "A", "pread runs on past the logical end into the host's bytes",
+     PLAT_FS,
+     """                let guest = guest.clone();
+                let buf = match backend::logical_len(file) {""",
+     """                let guest = guest.clone();
+                let buf = match None::<u64> {""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+    ("logeof-A7", "A", "a snapshot for a read-only mapping takes bytes past the logical end",
+     PLAT_FS,
+     """                // The bytes past a logical end of file are not the file's.
+                let buf = match backend::logical_len(file) {""",
+     """                // The bytes past a logical end of file are not the file's.
+                let buf = match None::<u64> {""",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A8", "A", "lseek SEEK_END counts from the host's size",
+     PLAT_FS,
+     "                    2 => i64::try_from(match backend::logical_len(file) {",
+     "                    2 => i64::try_from(match None::<u64> {",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A9", "A", "an O_APPEND write goes to the host's end, past the logical one",
+     PLAT_FS,
+     "                backend::write(file, buf, *append).map_err(|e| FsError::io(OP, &guest, &e))",
+     "                backend::write(file, buf, false && *append).map_err(|e| FsError::io(OP, &guest, &e))",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+    ("logeof-A10", "A", "a write past the logical end leaves the gap's stale bytes in the file",
+     PLAT_FS_WINDOWS,
+     """        if start > self.eof {
+            let physical = self.physical()?;""",
+     """        if false && start > self.eof {
+            let physical = self.physical()?;""",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A11", "A", "the bytes cut off by a refused shortening are not zeroed",
+     PLAT_FS_WINDOWS,
+     "            zero(&own, len, physical)?;",
+     "            let _ = physical;",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A12", "A", "the host never shortens the file when the last section goes",
+     PLAT_VM_WINDOWS,
+     "        crate::fs::section_closed(self.file);",
+     "        let _ = crate::fs::section_closed;",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+    ("logeof-A13", "A", "a close no longer applies a logical end the host would now take",
+     PLAT_FS,
+     "                    backend::settle(file);",
+     "                    let _ = file;",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-A14", "A", "a write past the logical end does not move it",
+     PLAT_FS_WINDOWS,
+     "        self.eof = self.eof.max(end);",
+     "        let _ = end;",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+    ("logeof-B1", "B", "the file seam is told before the section closes, while it still blocks",
+     PLAT_VM_WINDOWS,
+     """        unsafe {
+            CloseHandle(self.section);
+        }
+        // **The section first, then the file seam told.** A section alone -- no view -- stops the
+        // host shortening its file (MEASURED, `fs/windows.rs`), and a region map drops a backing
+        // only after unmapping its last view, so this may be the moment a file the guest
+        // shortened while it was mapped can be shortened on the host. `self.file` is still open
+        // for the file seam to identify the file by.
+        crate::fs::section_closed(self.file);""",
+     """        crate::fs::section_closed(self.file);
+        unsafe {
+            CloseHandle(self.section);
+        }""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
+    ("logeof-B2", "B", "a record is dropped as soon as anything is written, not when it catches up",
+     PLAT_FS_WINDOWS,
+     "            if record.eof >= record.physical()? {",
+     "            if record.eof >= 0 * record.physical()? {",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-B3", "B", "a shortening zeroes the whole file rather than the part cut off",
+     PLAT_FS_WINDOWS,
+     "            zero(&self.file, len, self.eof.min(physical))?;",
+     "            zero(&self.file, 0, self.eof.min(physical))?;",
+     ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast", "logical_end"]),
+    ("logeof-B4", "B", "any open forgets a logical end, not only one the host truncated",
+     PLAT_FS_WINDOWS,
+     """            if truncating {
+                forget(&file)?;""",
+     """            if true || truncating {
+                forget(&file)?;""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "shared"]),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so
