@@ -773,13 +773,13 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         while cursor < at + len {
             let Some(region) = space.region_at(cursor) else {
                 return call.refuse(format!(
-                    "MADV_DONTNEED over {len} bytes at {at:#x} reaches unmapped address \
-                     {cursor:#x}, so the range it guarantees zeroes for is not all mapped"
+                    "{name} over {len} bytes at {at:#x} reaches unmapped address \
+                     {cursor:#x}, so the range it releases is not all mapped"
                 ));
             };
             if region.committed != 0 {
                 return call.refuse(format!(
-                    "MADV_DONTNEED over {len} bytes at {at:#x} left {} committed bytes at {:#x}, \
+                    "{name} over {len} bytes at {at:#x} left {} committed bytes at {:#x}, \
                      so a later read there would return the old contents rather than the zeroes \
                      the call guarantees. Reporting success would be the believable wrong answer",
                     region.committed, region.start
