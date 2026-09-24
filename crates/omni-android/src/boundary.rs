@@ -1293,6 +1293,30 @@ impl Boundary {
                     *RUN_LOOP_LAST_EXIT.lock() = "StepLimitReached";
                     return Ok(ExitReason::StepLimitReached { pc: at, executed: spent })
                 }
+                // **A guest's own supervisor call.** `SVC #0` is how arm64 Linux code enters the
+                // kernel without libc -- `x8` the number, `x0`-`x5` the arguments, the result or
+                // `-errno` back in `x0`, every other register preserved. Serviced by the same
+                // emulation the `syscall()` import has, so one table answers both doors; see
+                // [`Boundary::service_raw_syscall`]. MEASURED need: a TaskScheduler worker died on
+                // `svc #0` (`x8 = 56`, openat of "/proc/self/maps") on every Pet Simulator 99
+                // place load (p1, 2026-09-23) and in place 606849621 (2026-09-24).
+                ExitReason::UnsupportedInstruction { pc: at, encoding: SVC_0 } => {
+                    self.service_raw_syscall(cpu, at)?;
+                    if let Some(error) = take_pending() {
+                        return Err(error);
+                    }
+                    let resume = at.wrapping_add(4);
+                    if let RunLimit::Instructions(allowance) = remaining {
+                        let left = allowance.saturating_sub(cpu.last_run_instructions());
+                        if left == 0 {
+                            return Ok(ExitReason::StepLimitReached { pc: resume, executed: spent });
+                        }
+                        remaining = RunLimit::Instructions(left);
+                    }
+                    crossings += 1;
+                    pc = resume;
+                    continue;
+                }
                 other => {
                     *RUN_LOOP_LAST_EXIT.lock() = exit_name(&other);
                     return Ok(other);
@@ -1413,6 +1437,87 @@ impl Boundary {
                 Ok(resume)
             }
         }
+    }
+
+    /// Answer a guest `SVC #0` in the kernel's convention, through the imports that implement it.
+    ///
+    /// A raw syscall is the same request a libc wrapper would have made, in different registers:
+    /// `openat(AT_FDCWD or an absolute path, path, flags, mode)` is `open(path, flags, mode)`, and
+    /// everything else is `syscall(number, a0, ..., a5)`, whose emulation already answers the
+    /// numbers this runtime can (`bionic::procenv::syscall`) and refuses the rest **by number and
+    /// name** -- so a raw syscall nothing implements still stops its thread, but with a named
+    /// refusal instead of an `UnsupportedInstruction`. The handler runs over a register view that
+    /// presents the kernel's registers in the import's order and keeps every write except `x0`
+    /// from the guest (the kernel preserves them). What differs is the error convention: an import
+    /// answers `-1` and sets `errno`, the kernel answers `-errno` in `x0` and **leaves `errno`
+    /// alone**, so the guest's `errno` is read before, the call's own `errno` turned into the
+    /// result, and the guest's value put back.
+    fn service_raw_syscall(self: &Arc<Self>, cpu: &mut dyn GuestCpu, at: GuestAddr) -> AbiResult<()> {
+        let reg = |n: u8| XReg::new(n).expect("X0-X30 exist");
+        let number = cpu.x(reg(8));
+        let refuse = |why: String| AbiError::Refused {
+            symbol: format!("svc #0 (syscall {number})"),
+            address: at,
+            why,
+        };
+        let (symbol, map): (&str, &[u32]) = if number == SYS_OPENAT {
+            let dirfd = cpu.x(reg(0)) as u32 as i32;
+            let path = cpu.x(reg(1)) as GuestAddr;
+            let blame = Blame::new("openat", at, 1);
+            let absolute = self.mem.read_bytes(path, 1, blame)?.first() == Some(&b'/');
+            if dirfd != AT_FDCWD && !absolute {
+                return Err(refuse(format!(
+                    "a raw openat relative to descriptor {dirfd}: this layer's `open` resolves \
+                     against the working directory only, and answering for another directory \
+                     would open the wrong file"
+                )));
+            }
+            ("open", &[1, 2, 3])
+        } else {
+            ("syscall", &[8, 0, 1, 2, 3, 4, 5])
+        };
+        let errno_at = {
+            let mut regs = RemapRegs { cpu: &mut *cpu, map: &[], ret: None };
+            self.call_inline("__errno", &mut regs, at)?;
+            regs.ret.ok_or_else(|| refuse("`__errno` answered nothing".to_string()))? as GuestAddr
+        };
+        let blame = Blame::new("errno", at, 0);
+        let saved = self.mem.read_u32(errno_at, blame)?;
+        let answer = {
+            let mut regs = RemapRegs { cpu: &mut *cpu, map, ret: None };
+            self.call_inline(symbol, &mut regs, at)?;
+            regs.ret.ok_or_else(|| refuse(format!("`{symbol}` answered nothing")))?
+        };
+        let result = if answer as i64 == -1 {
+            -i64::from(self.mem.read_u32(errno_at, blame)?)
+        } else {
+            answer as i64
+        };
+        self.mem.write_u32(errno_at, saved, blame)?;
+        cpu.set_x(reg(0), result as u64);
+        Ok(())
+    }
+
+    /// Run the inline handler bound to `symbol` over `regs`, charged to the census as that import.
+    fn call_inline(&self, symbol: &str, regs: &mut dyn ThunkRegs, at: GuestAddr) -> AbiResult<()> {
+        let slot = self.slot_named(symbol).ok_or_else(|| AbiError::Unbound {
+            symbol: symbol.to_string(),
+            address: at,
+        })?;
+        let Binding::Inline(handler) = slot.binding else {
+            return Err(AbiError::Refused {
+                symbol: symbol.to_string(),
+                address: at,
+                why: "a raw syscall is answered through an inline import, and this one is not"
+                    .to_string(),
+            });
+        };
+        self.count(slot, at as GuestAddr);
+        let mut call = ThunkCall::new(regs, slot.address, ThunkContext::default());
+        let mut import = ImportCall { symbol: &slot.symbol, call: &mut call, mem: &self.mem };
+        let outcome = handler(&mut import);
+        self.mark_exit();
+        outcome
     }
 
     /// The slot at a guest address, or the typed error that says why there is not one.
@@ -2293,6 +2398,48 @@ impl ThunkRegs for CpuRegs<'_> {
     fn set_sp(&mut self, value: GuestAddr) {
         self.cpu.set_sp(value);
     }
+}
+
+/// `SVC #0`'s encoding: `1101 0100 000 imm16=0 00001`.
+const SVC_0: u32 = 0xD400_0001;
+/// arm64 `__NR_openat`.
+const SYS_OPENAT: u64 = 56;
+/// `AT_FDCWD`: "relative to the working directory".
+const AT_FDCWD: i32 = -100;
+
+/// The kernel's registers presented in an import's argument order, for
+/// [`Boundary::service_raw_syscall`]: argument `i` is read from `X{map[i]}`, an argument past the
+/// map reads 0, and `X8` upward read through. **Writes do not reach the guest** except as the
+/// captured `X0` -- the kernel preserves every register but the result, and the caller writes that
+/// itself once it has converted the error convention.
+struct RemapRegs<'a> {
+    cpu: &'a mut dyn GuestCpu,
+    map: &'a [u32],
+    ret: Option<u64>,
+}
+
+impl ThunkRegs for RemapRegs<'_> {
+    fn x(&self, index: u32) -> u64 {
+        let source = match self.map.get(index as usize) {
+            Some(&register) => register,
+            None if index < 8 => return 0,
+            None => index,
+        };
+        u8::try_from(source).ok().and_then(|n| XReg::new(n).ok()).map_or(0, |reg| self.cpu.x(reg))
+    }
+    fn set_x(&mut self, index: u32, value: u64) {
+        if index == 0 {
+            self.ret = Some(value);
+        }
+    }
+    fn v(&self, index: u32) -> u128 {
+        u8::try_from(index).ok().and_then(|n| VReg::new(n).ok()).map_or(0, |reg| self.cpu.v(reg))
+    }
+    fn set_v(&mut self, _index: u32, _value: u128) {}
+    fn sp(&self) -> GuestAddr {
+        self.cpu.sp()
+    }
+    fn set_sp(&mut self, _value: GuestAddr) {}
 }
 
 /// [`RetSink`] over a `&mut dyn GuestCpu`.

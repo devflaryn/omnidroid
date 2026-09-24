@@ -350,6 +350,11 @@ handlers! {
     /// `long long atoll(const char *s)`
     fn atoll(s: ptr) -> u64 = |v| omni_bionic::numerics::atoll(&mut v, s).map(|n| n as u64);
 
+    /// `long atol(const char *s)` -- bionic's is `strtol(s, NULL, 10)`, and `long` is 64 bits on
+    /// the guest, so it is `atoll` exactly. MEASURED need: a TaskScheduler worker died on it unbound
+    /// in place 606849621 (2026-09-24), and the world froze.
+    fn atol(s: ptr) -> u64 = |v| omni_bionic::numerics::atoll(&mut v, s).map(|n| n as u64);
+
     /// `long strtol(const char *nptr, char **endptr, int base)` — **`long` is 64 bits** on the
     /// guest, whatever it is on the host.
     fn strtol(nptr: ptr, endptr: ptr, base: i32) -> u64 =
@@ -1607,6 +1612,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // numbers
     ("atoi", atoi),
     ("atoll", atoll),
+    ("atol", atol),
     ("strtol", strtol),
     ("strtoll", strtoll),
     ("strtoul", strtoul),

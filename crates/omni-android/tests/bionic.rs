@@ -1060,6 +1060,14 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          \"/sys/devices/system/cpu/cpufreq/stats/cpu%d/time_in_state\". The file's Tier C \
          section. bionic's fortify.cpp: vsnprintf into dest_len, then __check_buffer_access.",
     ),
+    (
+        "atol",
+        "The owner's session in place 606849621 (2026-09-24): GUEST THREAD DIED at +1595s, a \
+         TaskScheduler worker (started at link 0x284d168): the guest called the imported symbol \
+         `atol` ... and nothing in the compatibility layer implements it; the world froze. The \
+         file's LAST section. bionic: strtol(s, NULL, 10), and long is 64 bits on LP64, so it \
+         is atoll.",
+    ),
 ];
 
 /// Every symbol bound here is an import of `libroblox.so`, no symbol is bound twice, and anything
@@ -1115,7 +1123,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // Then `sincos`, for 314: the in-game worker pool, once a join's data model began loading.
     // Then `listen` and `accept`, for 316: the MicroProfiler web server in a game world.
     // Then `__vsprintf_chk`, for 317: a TaskScheduler worker in place 606849621.
-    assert_eq!(symbols.len(), 317, "bound symbols: {symbols:?}");
+    // Then `atol`, for 318: the next worker death in the same place, 2026-09-24.
+    assert_eq!(symbols.len(), 318, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1221,7 +1230,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`sincos`, inline, for 314**: the in-game worker pool of the first join to connect.
     // **`listen` and `accept`, inline, for 316**: the MicroProfiler web server's thread.
     // **`__vsprintf_chk`, inline, for 317**: a worker formatting a cpufreq path in a game world.
-    assert_eq!(Bionic::inline_symbols().count(), 302);
+    // **`atol`, inline, for 318**: `strtol(s, NULL, 10)`, which on LP64 is `atoll`.
+    assert_eq!(Bionic::inline_symbols().count(), 303);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -11513,6 +11523,99 @@ fn call_with_errno(f: &Fixture, symbol: &str, args: &[u64]) -> (i64, u64) {
     });
     assert!(matches!(run_program(f, entry).expect("completes"), ExitReason::Returned { .. }));
     (f.guest.read_u64(out) as i64, f.guest.read_u64(out + 8))
+}
+
+/// **`atol` is `strtol(s, NULL, 10)` with a 64-bit `long`** (bionic; LP64): leading space and a
+/// sign are taken, parsing stops at the first non-digit, and a value past 32 bits survives -- the
+/// difference from `atoi`, whose `int` would truncate it. A worker died on it unbound in a world.
+#[test]
+fn atol_is_strtol_base_ten_with_a_sixty_four_bit_long() {
+    let _guard = serialized();
+    let f = fixture();
+    let text = f.cstring(f.guest.data + 0x100, b"  -8589934597xyz");
+    let (value, _) = call_with_errno(&f, "atol", &[text as u64]);
+    assert_eq!(value, -8_589_934_597, "a long, not an int's truncation");
+    let text = f.cstring(f.guest.data + 0x100, b"+42");
+    assert_eq!(call_with_errno(&f, "atol", &[text as u64]).0, 42);
+    let text = f.cstring(f.guest.data + 0x100, b"0x10");
+    assert_eq!(call_with_errno(&f, "atol", &[text as u64]).0, 0, "base 10: the x ends it");
+}
+
+/// `SVC #0`, the arm64 Linux kernel entry.
+const SVC_0: u32 = 0xD400_0001;
+/// A value the guest's `errno` holds before each raw syscall, which a raw syscall must not touch.
+const ERRNO_MARK: u64 = 77;
+
+/// One guest `SVC #0` with `x8 = number` and `x0..` = `args`, through real translated code:
+/// `(x0 as i64, errno)` afterwards, with `errno` set to [`ERRNO_MARK`] first.
+fn svc_with_errno(f: &Fixture, number: u64, args: &[u64]) -> Result<(i64, u64), AbiError> {
+    let out = f.guest.data + 0x400;
+    let entry = program(f, |asm| {
+        asm.bl(f.thunk("__errno"));
+        asm.mov(9, ERRNO_MARK);
+        asm.push(str_w(9, 0, 0));
+        for (register, value) in args.iter().enumerate() {
+            asm.mov(register as u32, *value);
+        }
+        asm.mov(8, number);
+        asm.push(SVC_0);
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.bl(f.thunk("__errno"));
+        asm.push(ldr_w(1, 0, 0));
+        asm.push(str_imm(1, 22, 8));
+    });
+    run_program(f, entry)?;
+    Ok((f.guest.read_u64(out) as i64, f.guest.read_u64(out + 8)))
+}
+
+/// **A guest's own `SVC #0` is answered in the kernel's convention, by the emulation the
+/// `syscall()` import has**: the result or `-errno` in `x0`, and the guest's `errno` untouched --
+/// the libc convention (`-1` and `errno`) would be the wrong answer to code that never went
+/// through libc. MEASURED need: a TaskScheduler worker died on `svc #0` on every Pet Simulator 99
+/// place load and in place 606849621.
+#[test]
+fn a_raw_svc_is_answered_in_the_kernels_convention_and_leaves_errno_alone() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("svc");
+    // gettid (178): a positive id, errno untouched.
+    let (tid, errno) = svc_with_errno(&f, 178, &[]).expect("gettid is emulated");
+    assert!(tid > 0, "a thread id: {tid}");
+    assert_eq!(errno, ERRNO_MARK, "a raw syscall does not write errno");
+    // futex (98) FUTEX_WAIT on a word that does not hold the value: -EAGAIN in x0, errno untouched.
+    let word = f.guest.data + 0x600;
+    f.guest.write_u64(word, 5);
+    let (answer, errno) = svc_with_errno(&f, 98, &[word as u64, 0, 4, 0]).expect("futex is emulated");
+    assert_eq!(answer, -11, "-EAGAIN, the kernel's error convention");
+    assert_eq!(errno, ERRNO_MARK, "the error is in x0, not in errno");
+    // openat (56) at AT_FDCWD: the file layer's `open`. A missing file is -ENOENT ...
+    let missing = f.cstring(f.guest.data + 0x100, b"/proc/self/nothing-here");
+    let (answer, errno) = svc_with_errno(&f, 56, &[(-100i64) as u64, missing as u64, 0, 0])
+        .expect("openat is the file layer's open");
+    assert_eq!((answer, errno), (-2, ERRNO_MARK), "-ENOENT, errno untouched");
+    // ... and a present one is a descriptor that `read` serves.
+    std::fs::write(scratch.0.join("present.txt"), b"raw").expect("a file");
+    let present = f.cstring(f.guest.data + 0x100, b"/present.txt");
+    let (fd, _) = svc_with_errno(&f, 56, &[(-100i64) as u64, present as u64, 0, 0]).expect("openat");
+    assert!(fd >= 0, "a descriptor: {fd}");
+    let buffer = f.guest.data + 0x700;
+    let (read, _) = call_with_errno(&f, "read", &[fd as u64, buffer as u64, 16]);
+    assert_eq!((read, read_guest(&f, buffer, 3)), (3, b"raw".to_vec()));
+}
+
+/// What the emulation cannot answer still stops the thread -- **by name and number**, where it
+/// used to be an anonymous `UnsupportedInstruction`.
+#[test]
+fn a_raw_svc_this_layer_cannot_answer_is_refused_by_number() {
+    let _guard = serialized();
+    let (f, _scratch) = rooted("svc-refused");
+    let error = svc_with_errno(&f, 999, &[]).expect_err("syscall 999 is not emulated");
+    assert!(error.to_string().contains("999"), "the number is named: {error}");
+    // openat relative to a descriptor other than AT_FDCWD: refused rather than resolved against
+    // the wrong directory.
+    let relative = f.cstring(f.guest.data + 0x100, b"relative.txt");
+    let error = svc_with_errno(&f, 56, &[5, relative as u64, 0, 0]).expect_err("dirfd 5");
+    assert!(error.to_string().contains("relative to descriptor 5"), "{error}");
 }
 
 /// `EPOLLIN`, `EPOLLOUT`, `EPOLLHUP` and `EPOLLET`, as the guest spells them.
