@@ -7,8 +7,12 @@
 //! with no exclusive access at all. The sampler must put the first two mostly at the monitor and
 //! the third in translated code and nowhere near the monitor. If `mon` never lit up here, a world
 //! reading of `mon 0%` would mean nothing.
+//!
+//! On macOS (arm64) `mon` is not recognised (its heuristic reads x86-64 encodings), so there the
+//! contending threads are asserted to be in translated code -- which still shows the sampler
+//! finding a code cache, the thing a world's `jit` share depends on.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(any(target_arch = "x86_64", all(target_os = "macos", target_arch = "aarch64")))]
 
 mod harness;
 
@@ -69,18 +73,11 @@ fn registers_until_stopped() -> Vec<u32> {
 
 #[test]
 fn the_sampler_puts_monitor_contention_at_the_monitor_and_register_code_in_the_jit() {
-    // **By what the host can do, not by its architecture.** This file is x86-64 only because the
-    // guest programs are dynarmic's; the sampler behind them is a separate question, and only the
-    // Windows backend has one (`omni_platform::sampler`). An x86-64 Linux host has dynarmic and no
-    // sampler, so there the seam's typed refusal is what is asserted -- the structural-backend
-    // rule -- rather than a thread handle the host cannot give.
+    // Every host this file builds for has a sampler (`omni_platform::sampler`: Windows, Linux
+    // x86-64, macOS arm64); one that could not open a thread would leave every row empty, so it
+    // fails here by name rather than passing on nothing.
     if let Err(error) = omni_platform::sampler::HostThread::current() {
-        assert!(
-            matches!(error, omni_platform::sampler::SamplerError::Unsupported { .. }),
-            "a host without a sampler must say so by name: {error:?}"
-        );
-        eprintln!("no sampler on this host: {error}");
-        return;
+        panic!("this host's sampler cannot open a thread: {error}");
     }
     omni_android::perf::keep_thread_records();
     let guest = Guest::new();
@@ -115,7 +112,14 @@ fn the_sampler_puts_monitor_contention_at_the_monitor_and_register_code_in_the_j
             std::thread::yield_now();
         }
         std::thread::sleep(Duration::from_millis(100));
+        // The sampler's own cost: this thread's CPU over the profile, as the PERF block reports it.
+        let me = omni_platform::sampler::HostThread::current().expect("a handle to this thread");
+        let (cpu_before, wall) = (me.cpu_time().expect("its CPU"), std::time::Instant::now());
         let profiles = omni_android::perf::profile(&boundary, Duration::from_millis(800), 200);
+        let share = me.cpu_time().expect("its CPU").saturating_sub(cpu_before).as_secs_f64()
+            / wall.elapsed().as_secs_f64();
+        println!("sampler cpu {:.2}% at 200 Hz over 3 busy threads", 100.0 * share);
+        assert!(share < 0.10, "the sampler used {:.1}% of a core", 100.0 * share);
         guest.write_u64(stop, 1);
         for handle in handles {
             handle.join().expect("a guest thread panicked");
@@ -133,11 +137,19 @@ fn the_sampler_puts_monitor_contention_at_the_monitor_and_register_code_in_the_j
             let ran = p.ticks - p.idle;
             println!("contending thread {id}: {p:?}");
             assert!(ran > 50, "thread {id} was sampled only {ran} times: {p:?}");
+            #[cfg(target_arch = "x86_64")]
             assert!(
                 p.monitor * 2 >= ran,
                 "a thread contending on the global monitor was put at the monitor in only {} of {ran} \
                  samples: {p:?}",
                 p.monitor
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            assert!(
+                p.jit * 2 >= ran,
+                "a thread running an exclusive-increment loop was in translated code in only {} of \
+                 {ran} samples: {p:?}",
+                p.jit
             );
             assert_eq!(p.handler, 0, "no handler was ever entered: {p:?}");
         }

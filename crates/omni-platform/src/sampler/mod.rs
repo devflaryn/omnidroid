@@ -17,11 +17,21 @@
 //! path. Everything else in this module ([`memory_kind`], [`modules`], ...) may allocate and must
 //! be called with no thread suspended, which is automatic because no suspension outlives `sample`.
 //!
+//! On Linux nothing is suspended: the target is sent a signal and answers from its own handler
+//! (`linux.rs`), so it is "stopped" only while that handler runs, and the rule holds trivially.
+//!
 //! # Five targets
 //!
-//! Windows is implemented. Linux and macOS return [`SamplerError::Unsupported`] naming the
-//! intended mechanism -- a `SIGPROF`-style signal delivered with `pthread_kill` and read from the
-//! handler's `ucontext_t` on Linux, `thread_suspend` + `thread_get_state` on macOS -- because a
+//! * **Windows** (`windows.rs`): `SuspendThread` / `GetThreadContext` / `ResumeThread`,
+//!   `QueryThreadCycleTime`, `VirtualQuery`, the PSAPI module list.
+//! * **Linux x86-64** (`linux.rs`): a real-time signal (`SIGRTMIN + 7`) queued to the thread with
+//!   `rt_tgsigqueueinfo`, whose handler reads the interrupted `ucontext_t`; the thread's CPU-time
+//!   clock; `/proc/self/maps`.
+//! * **macOS arm64** (`macos.rs`): `thread_suspend` / `thread_get_state` / `thread_resume` on the
+//!   thread's Mach port; `thread_info` time and run state; dyld's image list, `dladdr` and
+//!   `mach_vm_region`.
+//!
+//! Any other target returns [`SamplerError::Unsupported`] naming the intended mechanism, because a
 //! sampler that reported nothing would read as a thread doing nothing.
 
 use std::time::Duration;
@@ -35,9 +45,27 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod linux;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use linux as backend;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod macos;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use macos as backend;
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 mod unsupported;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(
+    target_os = "windows",
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 use unsupported as backend;
 
 /// How many code bytes [`HostThread::sample`] reads **before** the instruction pointer.
@@ -85,7 +113,9 @@ pub enum MemoryKind {
         base: usize,
     },
     /// Private memory that is executable and writable at once -- on this runtime, only a JIT code
-    /// cache (dynarmic commits its cache `PAGE_EXECUTE_READWRITE`; D12's recorded exception).
+    /// cache (dynarmic commits its cache `PAGE_EXECUTE_READWRITE`; D12's recorded exception). On
+    /// Linux and macOS: anonymous private memory that is executable (dynarmic's cache is `rwxp` on
+    /// Linux and a `MAP_JIT` `rwx` region on macOS), writable or not.
     PrivateWritableExecutable {
         /// The reservation's allocation base, one per code cache.
         base: usize,
@@ -112,7 +142,8 @@ pub struct ProcessCounters {
     pub page_faults: u64,
     /// Bytes of physical memory in the working set.
     pub working_set: u64,
-    /// Bytes of private commit (what the commit limit is charged).
+    /// Bytes of private commit (what the commit limit is charged): on Linux the `VM_ACCOUNT` total,
+    /// on macOS `phys_footprint` -- the vm seam's [`process_commit_charge`](crate::vm::process_commit_charge).
     pub private_bytes: u64,
 }
 
@@ -121,8 +152,9 @@ impl HostThread {
     ///
     /// # Errors
     ///
-    /// [`SamplerError::LastError`] if the handle could not be opened, or
-    /// [`SamplerError::Unsupported`] off Windows.
+    /// [`SamplerError::LastError`] if the handle could not be opened (Windows);
+    /// [`SamplerError::Errno`] on Linux if the sampling signal is already taken;
+    /// [`SamplerError::Unsupported`] on a target with no backend.
     pub fn current() -> SamplerResult<Self> {
         Ok(Self { inner: backend::Thread::current()? })
     }
@@ -137,7 +169,8 @@ impl HostThread {
     ///
     /// Charged in scheduler ticks on Windows (15.625 ms by default, finer while a timer resolution
     /// is raised), so a difference over a few seconds is meaningful and one over a few
-    /// milliseconds is not.
+    /// milliseconds is not. Nanoseconds on Linux; on macOS charged at context switches and timer
+    /// ticks, in microseconds.
     ///
     /// # Errors
     ///
@@ -150,6 +183,11 @@ impl HostThread {
     /// runs, at the resolution of the time-stamp counter -- which is what makes it the right test
     /// for "did this thread run since I last looked", where [`cpu_time`](Self::cpu_time)'s tick
     /// charging is too coarse. Not a frequency: the counter runs at a constant rate.
+    ///
+    /// On Linux it is the thread's CPU-time clock in nanoseconds; on macOS the charged time in
+    /// nanoseconds plus the number of reads that found the thread running (see `macos.rs`: the
+    /// charged time of a running thread lags by up to a scheduler tick). Only its movement means
+    /// anything.
     ///
     /// # Errors
     ///
@@ -165,7 +203,9 @@ impl HostThread {
     ///
     /// [`SamplerError::SampledItself`] for the calling thread, which would never resume;
     /// [`SamplerError::LastError`] if the suspend or the context read failed (the thread has
-    /// exited, typically). The thread is resumed on every path that suspended it.
+    /// exited, typically) -- [`SamplerError::Errno`] (`ESRCH`) on Linux, [`SamplerError::Kern`] on
+    /// macOS; [`SamplerError::NotAnswered`] on Linux for a thread that did not run its handler in
+    /// time. The thread is resumed on every path that suspended it.
     pub fn sample(&self, code: &mut [u8; CODE_BEFORE + CODE_AFTER]) -> SamplerResult<ThreadSample> {
         self.inner.sample(code)
     }
@@ -176,7 +216,8 @@ impl HostThread {
 ///
 /// # Errors
 ///
-/// [`SamplerError::Unsupported`] off Windows.
+/// [`SamplerError::Unsupported`] on a target with no backend; on Linux, [`SamplerError::Errno`] if
+/// `/proc/self/maps` cannot be read.
 pub fn memory_kind(address: usize) -> SamplerResult<MemoryKind> {
     backend::memory_kind(address)
 }
@@ -208,6 +249,16 @@ pub fn process_counters() -> SamplerResult<ProcessCounters> {
 /// [`SamplerError::LastError`] if the processor sets could not be read.
 pub fn efficiency_classes() -> SamplerResult<Vec<u8>> {
     backend::efficiency_classes()
+}
+
+/// Every sampler test in this crate's unit-test binary takes this, so that the Linux backend's
+/// process-wide request state is observed by one test at a time.
+#[cfg(test)]
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

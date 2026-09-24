@@ -12,7 +12,7 @@
 //! | switch | what it adds | cost when on |
 //! |---|---|---|
 //! | `OMNI_PERF=<seconds>` | one `PERF` block per interval: presents, cores, guest instructions run and translated, crossings, the pager, the process's memory, and a line per busy guest thread | a relaxed store or two per run segment (a million-instruction window or an exit-path crossing) on each guest thread |
-//! | `OMNI_PERF_SAMPLE=<hz>` (default 100; `0` off) | per thread, what share of wall time its instruction pointer was in translated code, the exclusive monitor, dynarmic's own code (translation, block lookup), a handler (by symbol), the kernel or the graphics driver | one `QueryThreadCycleTime` per thread per tick, and for a thread that ran since the last tick a suspend / read / resume (tens of microseconds). The block reports the sampler's own CPU |
+//! | `OMNI_PERF_SAMPLE=<hz>` (default 100; `0` off) | per thread, what share of wall time its instruction pointer was in translated code, the exclusive monitor, dynarmic's own code (translation, block lookup), a handler (by symbol), the kernel or the graphics driver | one `QueryThreadCycleTime` per thread per tick (Linux: a thread CPU-clock read; macOS: `thread_info`), and for a thread that ran since the last tick a suspend / read / resume (Linux: a signal the thread answers) -- tens of microseconds. The block reports the sampler's own CPU |
 //! | `OMNI_PERF_DUMP=<file>` | every sampled address inside this executable, per interval and thread, for offline symbolization (dynarmic's translation versus its block lookup, and which handler functions) | a file write per interval |
 //! | `OMNI_PERF_WAITS=1` | turns on [`crate::waits`] and prints, per busy thread, where its handler time went and who woke it | two clock reads and a table update per crossing -- **a real perturbation**; do not take a frame-rate baseline with it on |
 //!
@@ -38,8 +38,19 @@
 //! * `hnd` -- the boundary says the thread is inside a handler (needs the census, which the gate
 //!   keeps on; the block says when it is off), split by where the handler was: in this executable,
 //!   the kernel, or the driver;
-//! * `os`, `drv`, `oth` -- the kernel (`ntdll`, `kernelbase`, `kernel32`), the graphics driver and
-//!   loader (`nv*`, `vulkan-1`), anything else, while not in a handler.
+//! * `os`, `drv`, `oth` -- the kernel (`ntdll`, `kernelbase`, `kernel32`; glibc, the loader and the
+//!   vDSO on Linux; `libsystem_*` and dyld on macOS), the graphics driver and loader (`nv*`,
+//!   `vulkan-1`; the Vulkan loader, Mesa, GL, DRM, LLVM on Linux; MoltenVK, Metal, AGX on macOS),
+//!   anything else, while not in a handler.
+//!
+//! # Per host
+//!
+//! The sampler behind the shares is `omni_platform::sampler`: suspend / read / resume on Windows
+//! and macOS, a real-time signal the thread answers from its own handler on Linux (so there a
+//! sampled thread blocked in `poll`/`epoll_wait` sees an `EINTR`; see that backend). `mon` is
+//! recognised from x86-64 encodings only, so on macOS (arm64) monitor time is counted as `jit`.
+//! "Did it run" is the thread's cycle count on Windows, its CPU-time clock on Linux, and charged
+//! time plus run state on macOS.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -325,7 +336,7 @@ struct Modules {
 
 impl Modules {
     fn load() -> Self {
-        let here = reporter as usize;
+        let here = reporter as *const () as usize;
         let mut all: Vec<(Module, ModuleKind)> = sampler::modules()
             .unwrap_or_default()
             .into_iter()
@@ -333,9 +344,9 @@ impl Modules {
                 let name = m.name.to_ascii_lowercase();
                 let kind = if here >= m.base && here < m.base + m.size {
                     ModuleKind::Exe
-                } else if name == "ntdll.dll" || name == "kernelbase.dll" || name == "kernel32.dll" {
+                } else if is_os_module(&name) {
                     ModuleKind::Os
-                } else if name.starts_with("nv") || name.starts_with("vulkan") {
+                } else if is_driver_module(&name) {
                     ModuleKind::Driver
                 } else {
                     ModuleKind::Other
@@ -353,6 +364,42 @@ impl Modules {
         let (m, kind) = self.all.get(at.checked_sub(1)?)?;
         (address < m.base + m.size).then_some(*kind)
     }
+}
+
+/// The operating system's own libraries, by (lower-case) module name: where a thread blocked in the
+/// kernel is sampled (its system-call stub) and where the host's heap and synchronisation live.
+/// One list for every host -- the names cannot collide -- so this crate names no platform.
+fn is_os_module(name: &str) -> bool {
+    matches!(
+        name,
+        // Windows
+        "ntdll.dll" | "kernelbase.dll" | "kernel32.dll"
+        // Linux (glibc, the loader, the vDSO the kernel maps)
+        | "libc.so.6" | "ld-linux-x86-64.so.2" | "[vdso]" | "libpthread.so.0" | "librt.so.1" | "libdl.so.2"
+        // macOS
+        | "libdyld.dylib" | "dyld"
+    ) || name.starts_with("libsystem_")
+}
+
+/// The graphics driver and its loader, by (lower-case) module name.
+fn is_driver_module(name: &str) -> bool {
+    // Windows: NVIDIA's `nv*` and the Vulkan loader.
+    name.starts_with("nv")
+        || name.starts_with("vulkan")
+        // Linux: the Vulkan loader and Mesa's drivers, GL, DRM, LLVM, NVIDIA's libraries.
+        || name.starts_with("libvulkan")
+        || name.starts_with("libnvidia")
+        || name.starts_with("libgl")
+        || name.starts_with("libegl")
+        || name.starts_with("libdrm")
+        || name.starts_with("libllvm")
+        || name.starts_with("libgallium")
+        || name.ends_with("_dri.so")
+        // macOS: MoltenVK, Metal and the GPU's own bundles.
+        || name.starts_with("libmoltenvk")
+        || name.starts_with("metal")
+        || name.starts_with("agx")
+        || name.starts_with("iogpu")
 }
 
 /// Whether the code bytes around a sampled instruction pointer contain a 64-bit immediate that is
@@ -904,5 +951,29 @@ mod tests {
         // Outside the bytes that were actually read, it does not count.
         assert!(!near_monitor(&code, at + 1, code.len(), &monitors));
         assert!(!near_monitor(&code, 0, code.len(), &[]));
+    }
+
+    #[test]
+    fn each_hosts_system_and_driver_libraries_are_named() {
+        for os in ["ntdll.dll", "libc.so.6", "ld-linux-x86-64.so.2", "[vdso]", "libsystem_kernel.dylib", "dyld"] {
+            assert!(is_os_module(os) && !is_driver_module(os), "{os}");
+        }
+        for driver in [
+            "nvoglv64.dll",
+            "vulkan-1.dll",
+            "libvulkan.so.1",
+            "libvulkan_intel_hasvk.so",
+            "libnvidia-glcore.so.550.54",
+            "libgallium-24.2.so",
+            "libllvm.so.19.1",
+            "libmoltenvk.dylib",
+            "metal",
+            "agxmetalg13x",
+        ] {
+            assert!(is_driver_module(driver) && !is_os_module(driver), "{driver}");
+        }
+        for other in ["libx11.so.6", "libstdc++.so.6", "user32.dll", "appkit"] {
+            assert!(!is_os_module(other) && !is_driver_module(other), "{other}");
+        }
     }
 }

@@ -1,6 +1,7 @@
-//! Linux and macOS backend for the sampler seam: **structural only**. Every entry point refuses,
-//! naming the mechanism an implementation would use, so a sampler built here reports that it cannot
-//! see rather than reporting threads that do nothing.
+//! The sampler seam on a target with no backend (anything but Windows, Linux x86-64 and macOS
+//! arm64): **structural only**. Every entry point refuses, naming the mechanism an implementation
+//! would use, so a sampler built here reports that it cannot see rather than reporting threads that
+//! do nothing.
 
 use std::time::Duration;
 
