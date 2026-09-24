@@ -27,6 +27,7 @@ dynarmic/
                and ../patches/0018-rsb-hit-checks-budget-and-halt.patch
                and ../patches/0019-fast-dispatch-checks-budget-and-halt.patch
                and ../patches/0020-arm64-rsb-hit-checks-budget-and-halt.patch
+               and ../patches/0021-arm64-value-compare-honours-ignore-global-monitor.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

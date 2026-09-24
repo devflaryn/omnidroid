@@ -336,8 +336,11 @@ pub mod optimization {
     /// dynarmic's `Unsafe_IgnoreGlobalMonitor`: exclusive loads and stores no longer take the
     /// monitor's process-wide spin lock, and an exclusive store no longer clears every other
     /// processor's matching reservation. What remains is a per-processor reservation (address and
-    /// value) and a host `lock cmpxchg` of the reserved value on the store. **Honoured only when
-    /// [`super::OdConfig::unsafe_optimizations`] is non-zero**, which is dynarmic's own guard.
+    /// value) and a compare-and-swap of the reserved value on the store (a host `lock cmpxchg` on
+    /// x64, an `LDAXR`/`STLXR` loop on arm64). **Honoured only when
+    /// [`super::OdConfig::unsafe_optimizations`] is non-zero**, which is dynarmic's own guard. The
+    /// x64 backend always honoured it; the arm64 backend's inline exclusives (patch 0007) ignored it
+    /// -- lock and scan regardless -- until **patch 0021** (D31 amendment 1).
     pub const UNSAFE_IGNORE_GLOBAL_MONITOR: u32 = 0x0010_0000;
 }
 

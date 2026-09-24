@@ -642,7 +642,9 @@ impl Vm {
             hook_hint_instructions: i32::from(opts.hook_hints),
             define_unpredictable_behaviour: 0,
             check_halt_on_memory_access: i32::from(opts.check_halt_on_memory_access),
-            unsafe_optimizations: 0,
+            // dynarmic's own gate: an unsafe flag in the mask is honoured only with this open, so a
+            // test that asks for one (`UNSAFE_IGNORE_GLOBAL_MONITOR`) gets it, and no other does.
+            unsafe_optimizations: i32::from(opts.optimizations & !optimization::ALL_SAFE != 0),
             optimizations: opts.optimizations,
         };
 

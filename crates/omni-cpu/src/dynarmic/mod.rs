@@ -146,9 +146,12 @@ const HALT_OURS: u32 =
 /// How guest exclusive loads and stores (`LDXR`/`STXR`, `LDAXP`/`STLXP` and the rest) are made
 /// atomic across guest threads.
 ///
-/// Both arms perform every exclusive store as **one host `lock cmpxchg`** (`cmpxchg16b` for a
-/// pair) against the value the thread's own exclusive load read, so both are value-compare at the
-/// memory word. They differ in what surrounds it -- `docs/DECISIONS.md` (D31) has the argument and
+/// Both arms perform every exclusive store as **one host compare-and-swap** (`lock cmpxchg`, and
+/// `cmpxchg16b` for a pair, on x64; an `LDAXR`/`STLXR` loop, `LDAXP`/`STLXP` for a pair, on arm64)
+/// against the value the thread's own exclusive load read, so both are value-compare at the
+/// memory word. On arm64 `ValueCompare` has meant what it says only since vendored patch 0021: the
+/// backend's inline path ignored dynarmic's flag before, and took the lock and scanned regardless
+/// (D31 amendment 1). They differ in what surrounds it -- `docs/DECISIONS.md` (D31) has the argument and
 /// `tests/exclusive.rs` the lost-update stress test and the one behaviour that differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExclusiveMonitor {

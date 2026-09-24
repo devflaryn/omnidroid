@@ -18,7 +18,7 @@ mod harness;
 
 use dynarmic_sys::*;
 use harness::a64;
-use harness::{Vm, VmOptions, HALT_DONE, MEM_GUARD, MEM_SIZE};
+use harness::{Vm, VmOptions, CODE_BASE, HALT_DONE, MEM_GUARD, MEM_SIZE};
 
 /// `LDXR{B,H,,} Rt, [Xn]` by `size` (0 = byte ... 3 = doubleword).
 const fn ldxr(size: u32, rt: u32, rn: u32) -> u32 {
@@ -56,6 +56,16 @@ fn inline() -> VmOptions {
     VmOptions { fastmem_exclusive: true, ..VmOptions::default() }
 }
 
+/// The inline path under `UNSAFE_IGNORE_GLOBAL_MONITOR` -- `omni-cpu`'s default
+/// (`ExclusiveMonitor::ValueCompare`, D31). The x64 backend has always honoured the flag; the arm64
+/// backend does since patch 0021.
+fn value_compare() -> VmOptions {
+    VmOptions {
+        optimizations: optimization::ALL_SAFE | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
+        ..inline()
+    }
+}
+
 /// Runs `code` (ending in `SVC #0`) with `X4 = ADDR` and `seed` at `ADDR`.
 fn run(code: Vec<u32>, opts: VmOptions, seed: [u64; 2], regs: &[(u32, u64)]) -> Vm {
     let vm = Vm::new(code, opts);
@@ -91,37 +101,40 @@ fn the_encoders_match_the_llvm_assembler() {
 #[test]
 fn every_width_loads_stores_and_stays_off_the_callback_path() {
     // LDXR Rt1,[X4] ; STXR W2, X5, [X4] ; SVC -- memory holds the seed, X5 the new value.
-    for (size, mask) in [(0u32, 0xFFu64), (1, 0xFFFF), (2, 0xFFFF_FFFF), (3, u64::MAX)] {
-        let seed = 0x8877_6655_4433_2211u64;
-        let new = 0x0123_4567_89AB_CDEFu64;
-        let vm = run(vec![ldxr(size, 1, 4), stxr(size, 2, 5, 4), a64::svc(0)], inline(), [seed, 0], &[(5, new)]);
-        assert_eq!(vm.reg(1), seed & mask, "size {size}: LDXR read the low bytes, zero-extended");
-        assert_eq!(vm.reg(2), 0, "size {size}: STXR succeeded");
-        let expect = (seed & !mask) | (new & mask);
-        assert_eq!(vm.with_ctx(|c| c.read_u64(ADDR)), expect, "size {size}: STXR wrote only its bytes");
-        assert_eq!(vm.stats().slow_path_total, 0, "size {size}: {:?}", vm.stats());
+    for (label, opts) in [("global", inline()), ("value-compare", value_compare())] {
+        for (size, mask) in [(0u32, 0xFFu64), (1, 0xFFFF), (2, 0xFFFF_FFFF), (3, u64::MAX)] {
+            let seed = 0x8877_6655_4433_2211u64;
+            let new = 0x0123_4567_89AB_CDEFu64;
+            let vm = run(vec![ldxr(size, 1, 4), stxr(size, 2, 5, 4), a64::svc(0)], opts, [seed, 0], &[(5, new)]);
+            assert_eq!(vm.reg(1), seed & mask, "{label} size {size}: LDXR read the low bytes, zero-extended");
+            assert_eq!(vm.reg(2), 0, "{label} size {size}: STXR succeeded");
+            let expect = (seed & !mask) | (new & mask);
+            assert_eq!(vm.with_ctx(|c| c.read_u64(ADDR)), expect, "{label} size {size}: STXR wrote only its bytes");
+            assert_eq!(vm.stats().slow_path_total, 0, "{label} size {size}: {:?}", vm.stats());
+        }
     }
 }
 
 #[test]
 fn a_pair_of_doublewords_is_exclusive_too() {
     // LDXP X1, X3, [X4] ; STXP W2, X5, X6, [X4] ; SVC
-    let vm = run(
-        vec![ldxp(1, 3, 4), stxp(2, 5, 6, 4), a64::svc(0)],
-        inline(),
-        [0x1111, 0x2222],
-        &[(5, 0xAAAA), (6, 0xBBBB)],
-    );
-    assert_eq!((vm.reg(1), vm.reg(3)), (0x1111, 0x2222), "LDXP read both halves");
-    assert_eq!(vm.reg(2), 0, "STXP succeeded");
-    assert_eq!(vm.with_ctx(|c| (c.read_u64(ADDR), c.read_u64(ADDR + 8))), (0xAAAA, 0xBBBB));
-    assert_eq!(vm.stats().slow_path_total, 0, "{:?}", vm.stats());
+    for (label, opts) in [("global", inline()), ("value-compare", value_compare())] {
+        let vm = run(
+            vec![ldxp(1, 3, 4), stxp(2, 5, 6, 4), a64::svc(0)],
+            opts,
+            [0x1111, 0x2222],
+            &[(5, 0xAAAA), (6, 0xBBBB)],
+        );
+        assert_eq!((vm.reg(1), vm.reg(3)), (0x1111, 0x2222), "{label}: LDXP read both halves");
+        assert_eq!(vm.reg(2), 0, "{label}: STXP succeeded");
+        assert_eq!(vm.with_ctx(|c| (c.read_u64(ADDR), c.read_u64(ADDR + 8))), (0xAAAA, 0xBBBB), "{label}");
+        assert_eq!(vm.stats().slow_path_total, 0, "{label}: {:?}", vm.stats());
+    }
 }
 
 #[test]
 fn a_store_exclusive_without_a_reservation_fails_and_writes_nothing() {
-    for opts in [inline(), VmOptions::default()] {
-        let label = if opts.fastmem_exclusive { "inline" } else { "callbacks" };
+    for (label, opts) in [("inline", inline()), ("value-compare", value_compare()), ("callbacks", VmOptions::default())] {
         // No LDXR at all.
         let vm = run(vec![stxr(3, 2, 5, 4), a64::svc(0)], opts, [7, 0], &[(5, 9)]);
         assert_eq!(vm.reg(2), 1, "{label}: no reservation, so STXR fails");
@@ -192,8 +205,8 @@ fn another_observer_s_store_between_the_pair_makes_the_store_exclusive_fail() {
     // so the store-exclusive must fail and write nothing. The "other observer" is the host, storing
     // from inside `SVC #3` between the LDXR and the STXR.
     // LDXR X1, [X4] ; SVC #3 ; STXR W2, X5, [X4] ; SVC #0
-    for opts in [inline(), VmOptions::default()] {
-        let label = if opts.fastmem_exclusive { "inline" } else { "callbacks" };
+    // Under value-compare the store fails because the word no longer holds the reserved value.
+    for (label, opts) in [("inline", inline()), ("value-compare", value_compare()), ("callbacks", VmOptions::default())] {
         let vm = Vm::new(vec![ldxr(3, 1, 4), a64::svc(3), stxr(3, 2, 5, 4), a64::svc(0)], opts);
         vm.with_ctx(|c| {
             c.write_u64(ADDR, 7);
@@ -251,10 +264,163 @@ fn a_successful_store_exclusive_clears_another_processor_s_reservation_of_the_ad
     }
 }
 
+/// **The one behaviour value-compare gives up** (D31), on the backend itself. A reserves ADDR; B
+/// reserves it and stores the *same* value; then A's store-exclusive. Under the global monitor B's
+/// store cleared A's reservation (the scan) and A fails; under `UNSAFE_IGNORE_GLOBAL_MONITOR` there
+/// is no scan, the word still holds what A read, and A succeeds. `omni-cpu`'s
+/// `aba_across_another_threads_exclusive_store_is_the_one_difference` is the same fact through the
+/// runtime. Before patch 0021 the arm64 backend scanned regardless, and A failed under both.
+///
+/// A holds its reservation across B by **single-stepping** its `LDXR`, not by an `SVC` between the
+/// pair as the previous test does: the x64 backend clears the local monitor at every `SVC`
+/// (`EmitA64CallSupervisor`: "the kernel would have to execute ERET"), so there A's store fails
+/// after an `SVC` whatever B did, and the difference could not be seen.
+#[test]
+fn under_value_compare_another_processor_s_same_value_store_leaves_the_reservation() {
+    // A: LDXR X1, [X4] ; STXR W2, X1, [X4] ; SVC #0
+    // B: LDXR X1, [X4] ; STXR W2, X1, [X4] ; SVC #0
+    let pair = vec![ldxr(3, 1, 4), stxr(3, 2, 1, 4), a64::svc(0)];
+    for (label, base, expected) in [("global", inline(), 1u64), ("value-compare", value_compare(), 0)] {
+        for inline_a in [true, false] {
+            // SAFETY: freed below, after both jits are dropped.
+            let monitor = unsafe { od_monitor_new(2) } as usize;
+            let arena: &'static mut [u64] = Box::leak(vec![0u64; (MEM_SIZE + MEM_GUARD) / 8].into_boxed_slice());
+            let arena = arena.as_mut_ptr() as usize;
+            let shared = |pid: u32, fastmem_exclusive: bool| VmOptions {
+                fastmem_exclusive,
+                shared_monitor: monitor,
+                processor_id: pid,
+                shared_arena: arena,
+                ..base
+            };
+            {
+                let a = Vm::new(pair.clone(), shared(0, inline_a));
+                let b = Vm::new(pair.clone(), shared(1, true));
+                a.with_ctx(|c| c.write_u64(ADDR, 0x42));
+                for vm in [&a, &b] {
+                    vm.set_reg(4, ADDR);
+                    vm.start(1_000_000);
+                }
+                a.step();
+                assert_eq!((a.pc(), a.reg(1)), (CODE_BASE + 4, 0x42), "{label}: A reserved, one step");
+                assert_eq!(b.run_to_completion(64) & HALT_DONE, HALT_DONE, "{label}: B reserved and stored");
+                assert_eq!(b.reg(2), 0, "{label}: B's store-exclusive succeeded");
+                assert_eq!(a.run_to_completion(64) & HALT_DONE, HALT_DONE, "{label}: A tried to store");
+                assert_eq!(
+                    a.reg(2),
+                    expected,
+                    "{label}: A's store-exclusive after B's same-value store (A inline: {inline_a})"
+                );
+                assert_eq!(a.with_ctx(|c| c.read_u64(ADDR)), 0x42, "{label}");
+            }
+            // SAFETY: both jits using it are dropped.
+            unsafe { od_monitor_free(monitor as *mut std::ffi::c_void) };
+        }
+    }
+}
+
+/// **Under `UNSAFE_IGNORE_GLOBAL_MONITOR` the inline exclusives neither take nor release the
+/// monitor's spin lock** -- the x64 backend's behaviour, and the arm64 backend's since patch 0021.
+///
+/// The test holds the lock word itself (`od_monitor_layout_of`; dynarmic's `SpinLock` is a 32-bit
+/// word, 1 while held) and runs `LDXR`/`STXR`/`LDXP`/`STXP` inline:
+///
+/// * **control, global monitor**: the program must *not* finish while the lock is held -- so this
+///   test can see a lock being taken -- and must finish once it is released, leaving it free;
+/// * **value-compare**: the program must finish while the lock is held, with the right answers and
+///   no callback, and the word must still read 1 afterwards: a thread that never took the lock
+///   must not release it (that would let two callback-path threads into the monitor at once).
+///
+/// MEASURED on the M1 before the patch: every value-compare exclusive took the lock and every
+/// store-exclusive scanned all of the monitor's slots under it (D31 amendment).
+#[test]
+fn value_compare_inline_exclusives_neither_take_nor_release_the_monitor_lock() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Leaked rather than freed: if the value-compare half fails, its thread is left spinning on the
+    // lock word, and the monitor must outlive it.
+    // SAFETY: `od_monitor_new` has no preconditions; the handle is never freed.
+    let monitor = unsafe { od_monitor_new(2) } as usize;
+    assert_ne!(monitor, 0);
+    let mut layout = OdMonitorLayout::default();
+    // SAFETY: a live monitor and a valid out pointer.
+    unsafe { od_monitor_layout_of(monitor as *mut std::ffi::c_void, &mut layout) };
+    // SAFETY: the lock word is the monitor's `SpinLock` storage, a naturally aligned 32-bit word
+    // that lives as long as the (leaked) monitor; generated code accesses it only atomically.
+    let lock: &'static AtomicU32 = unsafe { &*(layout.lock as *const AtomicU32) };
+    assert_eq!(lock.load(Ordering::Acquire), 0, "a new monitor's lock is free");
+
+    // LDXR X1, [X4] ; STXR W2, X5, [X4] ; LDXP X7, X8, [X4] ; STXP W9, X5, X5, [X4] ; SVC #0
+    let program = vec![ldxr(3, 1, 4), stxr(3, 2, 5, 4), ldxp(7, 8, 4), stxp(9, 5, 5, 4), a64::svc(0)];
+    let spawn = |pid: u32, opts: VmOptions| {
+        let (done, finished) = mpsc::channel();
+        let program = program.clone();
+        let thread = std::thread::spawn(move || {
+            let vm = Vm::new(program, VmOptions { shared_monitor: monitor, processor_id: pid, ..opts });
+            vm.with_ctx(|c| c.write_u64(ADDR, 0x77));
+            vm.set_reg(4, ADDR);
+            vm.set_reg(5, 0x99);
+            vm.start(1_000_000);
+            let hr = vm.run_to_completion(64);
+            let _ = done.send(());
+            let memory = vm.with_ctx(|c| (c.read_u64(ADDR), c.read_u64(ADDR + 8)));
+            (hr, [vm.reg(1), vm.reg(2), vm.reg(9)], memory, vm.stats().slow_path_total)
+        });
+        (finished, thread)
+    };
+    let check = |label: &str, (hr, regs, memory, slow): (u32, [u64; 3], (u64, u64), u64)| {
+        assert_eq!(hr & HALT_DONE, HALT_DONE, "{label}: the guest did not reach its SVC: {hr:#010X}");
+        assert_eq!(regs, [0x77, 0, 0], "{label}: LDXR read memory, STXR and STXP succeeded");
+        assert_eq!(memory, (0x99, 0x99), "{label}");
+        assert_eq!(slow, 0, "{label}: every access stayed inline");
+    };
+
+    // Control: the global monitor waits for the lock.
+    lock.store(1, Ordering::Release);
+    let (finished, thread) = spawn(0, inline());
+    assert_eq!(
+        finished.recv_timeout(Duration::from_millis(300)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "global monitor: the inline exclusives ran while another holder had the lock, so this test \
+         cannot see a lock being taken"
+    );
+    lock.store(0, Ordering::Release);
+    finished.recv_timeout(Duration::from_secs(30)).expect("global monitor: released, the program finishes");
+    check("global", thread.join().expect("the global-monitor thread"));
+    assert_eq!(lock.load(Ordering::Acquire), 0, "global monitor: the lock is free again");
+
+    // Value-compare: runs straight through a held lock, and leaves it held.
+    lock.store(1, Ordering::Release);
+    let (finished, thread) = spawn(1, value_compare());
+    if finished.recv_timeout(Duration::from_secs(30)).is_err() {
+        // The thread is left spinning (it may have taken the lock for itself, so releasing it here
+        // could not make it finish); the process ends it.
+        panic!(
+            "value-compare: the inline exclusives waited on the monitor lock for 30 s -- \
+             Unsafe_IgnoreGlobalMonitor is not honoured (patch 0021)"
+        );
+    }
+    let outcome = thread.join().expect("the value-compare thread");
+    assert_eq!(
+        lock.load(Ordering::Acquire),
+        1,
+        "value-compare: the inline exclusives released a lock they never took"
+    );
+    lock.store(0, Ordering::Release);
+    check("value-compare", outcome);
+}
+
 /// `THREADS` guest threads on one monitor and one arena, each adding 1 to one doubleword
 /// `ITERATIONS` times with the canonical retry loop. Any lost update -- two threads' `STXR` both
 /// succeeding against the same old value -- shows as a short total.
-fn contended_counter(modes: &[bool]) {
+///
+/// `optimizations` is `ALL_SAFE`, or that plus `UNSAFE_IGNORE_GLOBAL_MONITOR` for value-compare.
+/// Value-compare runs only all-inline: this harness's exclusive-write callbacks compare and write
+/// non-atomically, relying on the monitor lock that value-compare's inline threads do not take (the
+/// runtime's callbacks, `omni-cpu`'s `callbacks.rs`, are a `compare_exchange`).
+fn contended_counter(modes: &[bool], optimizations: u32) {
     const ITERATIONS: u64 = 50_000;
     // retry: LDAXR X1, [X4] ; ADD X1, X1, #1 ; STLXR W2, X1, [X4] ; CBNZ W2, retry ;
     //        SUBS X5, X5, #1 ; B.NE retry ; SVC #0
@@ -289,6 +455,7 @@ fn contended_counter(modes: &[bool]) {
                         processor_id: i as u32,
                         shared_arena: arena,
                         cycle_counting: false,
+                        optimizations,
                         ..VmOptions::default()
                     },
                 );
@@ -320,10 +487,17 @@ fn contended_counter(modes: &[bool]) {
 
 #[test]
 fn four_inline_threads_never_lose_an_update() {
-    contended_counter(&[true, true, true, true]);
+    contended_counter(&[true, true, true, true], optimization::ALL_SAFE);
 }
 
 #[test]
 fn inline_and_callback_threads_share_one_monitor_without_losing_an_update() {
-    contended_counter(&[true, false, true, false]);
+    contended_counter(&[true, false, true, false], optimization::ALL_SAFE);
+}
+
+/// Patch 0021: with no lock and no scan, only the compare-and-swap of the reserved value keeps an
+/// increment from being lost -- which it does, because a counter never returns to an old value.
+#[test]
+fn four_inline_threads_never_lose_an_update_under_value_compare() {
+    contended_counter(&[true, true, true, true], optimization::ALL_SAFE | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR);
 }

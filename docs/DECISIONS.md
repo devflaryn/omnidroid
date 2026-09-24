@@ -3911,9 +3911,11 @@ place there, under **"What fastmem does not check"**, rather than deleted.
 ## D31 — How guest exclusives are made atomic: dynarmic's global monitor, or value-compare
 
 **Status: DECIDED 2026-09-24 -- value-compare is the default (`ExclusiveMonitor::ValueCompare`);
-`OMNI_JIT_EXCLUSIVE_MONITOR=global` is the way back, announced.** It was OPEN until a world was
-measured (below, "What decided it"); this record keeps what was measured before. It is not a vendored change: `Unsafe_IgnoreGlobalMonitor` is
-dynarmic's own optimization flag, opened through its own `unsafe_optimizations` gate.
+`OMNI_JIT_EXCLUSIVE_MONITOR=global` is the way back, announced.** On arm64 the flag was ignored
+until vendored patch 0021 (amendment 1, below). It was OPEN until a world was
+measured (below, "What decided it"); this record keeps what was measured before. It was not a vendored change: `Unsafe_IgnoreGlobalMonitor` is
+dynarmic's own optimization flag, opened through its own `unsafe_optimizations` gate (amendment 1
+adds one, because the arm64 backend did not read that flag).
 
 ### What the two arms are
 
@@ -3968,6 +3970,70 @@ test under both arms. The decision rests on the per-atomic cost, the world share
 correctness evidence above; `the_runtime_default_is_value_compare` pins it (row `monitor-A1`).
 **What would reverse it**: a lost update or a hang in a run under value-compare that
 `OMNI_JIT_EXCLUSIVE_MONITOR=global` does not show.
+
+### Amendment 1 (2026-09-25): value-compare is now honoured on arm64 as on x64 -- vendored patch 0021
+
+**What was wrong.** Everything above was measured on x64. On arm64 the flag this decision turns on,
+`Unsafe_IgnoreGlobalMonitor`, did nothing: patch 0007 gave the arm64 backend x64's inline exclusive
+protocol but not the three early returns x64 wraps it in (`EmitExclusiveLock`,
+`EmitExclusiveUnlock`, `EmitExclusiveTestAndClear` in `emit_x64_memory.h`). So on the macOS host the
+default arm was the global monitor under another name -- every guest `LDXR`/`STXR` under the
+process-wide spin lock, every store-exclusive walking all 2,048 slots (256 threads x stride 8) under
+it. MEASURED by the investigation on the M1 that found it: in a world the lock saturates at ~766k
+atomics/s and caps the whole process near 400 M guest instructions/s. `tests/exclusive.rs` was
+`cfg(x86_64)`, so nothing ran the one test that could see it.
+
+**The change.** Patch 0021 puts x64's three early returns into `emit_arm64_memory.cpp`: under the
+flag, no lock is taken or released (the fastmem fallbacks' unlocks included) and a store-exclusive
+clears no other processor's reservation. Each processor's own reservation check and the
+`LDAXR`/`STLXR` compare-and-swap of the reserved value stay. The global arm emits exactly what it did.
+x64 is untouched (the file is not compiled there). The decision itself does not change -- it is now
+true on both hosts.
+
+**Evidence** (M1 over ssh, a separate worktree of this commit; Windows for the x64 side):
+
+* **Benchmark**, `the_cost_of_a_guest_atomic_increment`, value-compare row (256 threads), ns per
+  increment, median of 7, release; pin = the same worktree with 0021 reverse-applied:
+
+  | | 1 thread | 8 threads, private words | 8 threads, one shared word |
+  |---|---|---|---|
+  | M1, pin + 0001-0020 | 1,306.9 | 1,943.5 | 1,963.7 |
+  | M1, + 0021 | **9.5** | **3.2** | **42.4** |
+  | x64 (Windows, this commit; the patch is not built there) | 12.6 | 2.6 | 32.0 |
+
+  The x64 figures match the table above (12.8 / 2.4 / 46.1) within run-to-run noise; the M1's global
+  rows are the same with and without the patch (256 slots, 1 thread: 186.0 both).
+* **The 3,594 initializers** (`omni-android`'s `the_cost_of_an_initializer_run`, n = 5 instances,
+  one guest thread): cold 2,181-2,192 ms on the pin, 2,149-2,160 ms with 0021 (~1.5%). A
+  single-threaded startup is not where the lock cost; the world is (above).
+* **Detectors.** `omni-cpu/tests/exclusive.rs` now runs on aarch64 too. On the pin its
+  `aba_across_another_threads_exclusive_store_is_the_one_difference` FAILS (value-compare answers
+  the global monitor's `(1, 40)`), and so do two new `dynarmic-sys` tests:
+  `value_compare_inline_exclusives_neither_take_nor_release_the_monitor_lock` (the test holds the
+  monitor's lock word; the global arm must wait for it, value-compare must run through it and leave
+  it held -- on the pin it waited the full 30 s) and
+  `under_value_compare_another_processor_s_same_value_store_leaves_the_reservation` (both arms,
+  the reservation held across the other processor by single-stepping). With 0021 all pass, as does
+  a new value-compare lost-update stress (four inline threads) and value-compare rows added to the
+  width, pair, failure-case and other-observer tests; both files pass on x64 unchanged.
+* **Hand mutations of the vendored C++**, as rows `mac-cpu-V1..V3` (`tools/mutate_mac/exclusive.py`),
+  run on the M1, file SHA-1 identical afterwards (`17c2c7ba`):
+
+  | mutation | what failed |
+  |---|---|
+  | V1: 0021's lock check removed (lock taken, and never released) | the lock test (waits on the held lock) |
+  | V2: 0021's unlock check removed (a lock it never took is released) | the lock test (the word reads 0) |
+  | V3: 0021's scan check removed | the same-value test and `omni-cpu`'s ABA test |
+
+  3/3 caught. No Rust-level row: the patch has no Rust logic -- only the test's `cfg`, which removed
+  would make the detectors not run rather than fail.
+* **dynarmic's own suite** on the M1 with 0001-0021: 201,698 assertions in 83 cases pass (upstream's
+  safe flags, i.e. the unchanged global arm).
+* **Whole suites, release**: `dynarmic-sys` and `omni-cpu` pass on the M1 (286 passed, 0 failed,
+  with the real APK present) and on Windows (280 passed, 0 failed). `verify_patches.py`: pin + 21
+  patches.
+* Not measured: a world on the M1 under the patch (this task's rule: never run the live app), so the
+  ~400 M instructions/s cap is gone by the benchmark's argument, not yet by a world's figure.
 
 ## D32 — A guest thread's fixed JIT cost is paid on demand: vendored patch 0017
 

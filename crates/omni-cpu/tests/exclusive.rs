@@ -18,8 +18,13 @@
 //!    the first context's store-exclusive (the other processor's exclusive store cleared its
 //!    reservation); value-compare lets it succeed, because the word holds the reserved value. Both
 //!    fail when the value really changed, and both succeed when nothing happened.
+//!
+//! **Both hosts.** Until patch 0021 this file was x86_64-only, and on arm64 part 3 failed: the arm64
+//! backend ignored `Unsafe_IgnoreGlobalMonitor`, so "value-compare" there was the global monitor
+//! under another name -- every exclusive under the process-wide lock, every store-exclusive
+//! scanning all 2,048 slots. The ABA case is the detector for that (D31 amendment 1).
 
-#![cfg(all(target_arch = "x86_64", feature = "dynarmic"))]
+#![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
 mod harness;
 

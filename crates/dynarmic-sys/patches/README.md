@@ -20,7 +20,11 @@ it is not comparable and was not re-run.
 `-DDYNARMIC_WARNINGS_AS_ERRORS=OFF` because 0007's inline store-exclusive has a
 lambda capture clang flags as unused): **All tests passed (201,698 assertions in
 83 test cases)** with 0001-0020, 2026-09-25 -- the first recorded run of the
-suite on that backend, so there is no earlier arm64 figure to compare with.
+suite on that backend, so there is no earlier arm64 figure to compare with --
+**and the identical figure with 0001-0021** (2026-09-25; the suite runs
+upstream's safe flags only, so it exercises 0021's global arm, whose emitted code
+is unchanged). 0021 is arm64-only and not compiled on x64, so the MSVC figure
+stands for it without a rerun.
 
 ## Applied
 
@@ -581,6 +585,63 @@ compact-map probe since 0010, 24.6 ns here against x64's 140). Out of line:
 which all wedged before. Rows `mac-cpu-R2` (halt check) and `mac-cpu-R3` (budget
 check) remove them and are caught; `mac-cpu-R1` puts `INTERRUPTIBLE` back to
 `0xFFF9`.
+
+### 0021 — arm64: the inline exclusives honour `Unsafe_IgnoreGlobalMonitor` (value-compare)
+
+`0021-arm64-value-compare-honours-ignore-global-monitor.patch`, D31 amendment 1. **arm64 only.**
+0007 gave arm64 x64's inline exclusive protocol but not x64's switch around it: the x64 backend's
+`EmitExclusiveLock`, `EmitExclusiveUnlock` and `EmitExclusiveTestAndClear`
+(`emit_x64_memory.h`) each return early under `Unsafe_IgnoreGlobalMonitor`, and 0007's
+`EmitMonitorLock`, `EmitMonitorUnlock` and reservation-clearing loop did not look at it. So on arm64
+`omni-cpu`'s default, `ExclusiveMonitor::ValueCompare` (D31), was the global monitor under another
+name: every guest `LDXR`/`STXR` took the process-wide spin lock, and every store-exclusive walked all
+2,048 slots of the monitor (256 threads x stride 8) under it.
+
+The patch is x64's three early returns, in the same three places: under the flag the inline
+accesses neither take nor release the lock (the fastmem fallbacks' unlocks included -- they release
+only what the inline path took), and a store-exclusive clears no other processor's reservation.
+Each processor's own reservation check (`exclusive_state`, `address[pid] == vaddr`) and the
+`LDAXR`/`STLXR` compare-and-swap of the reserved value are unchanged. Without the flag (the global
+monitor, `OMNI_JIT_EXCLUSIVE_MONITOR=global`) nothing emitted changes.
+
+**MEASURED** on the M1 (`omni-cpu/tests/bench.rs::the_cost_of_a_guest_atomic_increment`,
+value-compare row, ns per `LDAXR`/`ADD`/`STLXR`/`CBNZ` increment, median of 7, release, same
+worktree with 0021 reverse-applied for the pin column):
+
+| value-compare, 256 threads | 1 thread | 8 threads, private words | 8 threads, one shared word |
+|---|---|---|---|
+| pin + 0001-0020 | 1,306.9 | 1,943.5 | 1,963.7 |
+| + 0021 | **9.5** | **3.2** | **42.4** |
+| x64 (Windows, for comparison; unchanged by 0021) | 12.6 | 2.6 | 32.0 |
+
+The global rows of the same runs are unchanged (256 slots: 186.0 / 623.2 / 634.1 with 0021, 186.0 /
+606.8 / 650.1 without). The 3,594-initializer run (`omni-android`'s `the_cost_of_an_initializer_run`,
+one guest thread, n = 5): cold 2,181-2,192 ms without, 2,149-2,160 ms with -- it barely uses
+atomics; the patch is for the threaded world, where the lock was measured saturating (D31
+amendment 1).
+
+**Detectors.** `omni-cpu`'s `tests/exclusive.rs` now runs on aarch64 as well; its
+`aba_across_another_threads_exclusive_store_is_the_one_difference` FAILS on the pin + 0001-0020
+(MEASURED: the value-compare ABA case answers the global monitor's `(1, 40)`) and passes with 0021.
+`dynarmic-sys`'s `tests/exclusive.rs` gains, on both backends:
+`value_compare_inline_exclusives_neither_take_nor_release_the_monitor_lock` (the test holds the
+monitor's lock word itself; the global arm must wait for it, the value-compare arm must run through
+it and leave it held), `under_value_compare_another_processor_s_same_value_store_leaves_the_reservation`
+(both arms, the reservation held by single-stepping -- see below), a value-compare lost-update
+stress (four inline threads), and value-compare rows in the width, pair, failure-case and
+other-observer tests. Rows `mac-cpu-V1` (lock check removed), `mac-cpu-V2` (unlock check removed),
+`mac-cpu-V3` (scan check removed): **3/3 caught** on the M1 -- V1 and V2 by the lock test (V1 waits on
+the held lock; V2 leaves it released), V3 by the same-value test and `omni-cpu`'s ABA test -- and the
+file's SHA-1 was identical afterwards (`17c2c7ba`). On the pin (0021 reverse-applied) the lock test,
+the same-value test and the ABA test all fail, and nothing else in the two files does.
+
+**Found on the way, not changed:** the x64 backend clears the local monitor at every `SVC`
+(`EmitA64CallSupervisor`, "the kernel would have to execute ERET"), so on x64
+`a_successful_store_exclusive_clears_another_processor_s_reservation_of_the_address`, which holds
+A's reservation across an `SVC`, would pass with no scan at all. MEASURED on Windows: the first
+draft of the same-value test had that shape, and under value-compare -- where x64 emits no scan --
+A's store still failed. The test as committed holds the reservation by single-stepping A's `LDXR`
+and asserts both arms, so the scan is pinned on both hosts.
 
 ## How a patch is carried
 

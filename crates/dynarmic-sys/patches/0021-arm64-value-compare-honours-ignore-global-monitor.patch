@@ -1,0 +1,51 @@
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+index e4f2487..1fae884 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+@@ -651,15 +651,34 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+ // through the Wrapped* trampolines -- i.e. through the monitor and the user callbacks, exactly the
+ // callback-only path -- and, with recompile_on_fastmem_failure, the block is rebuilt without the
+ // inline path.
++//
++// Omnidroid patch 0021: Unsafe_IgnoreGlobalMonitor is honoured here as the x64 backend honours it
++// (EmitExclusiveLock, EmitExclusiveUnlock and EmitExclusiveTestAndClear in emit_x64_memory.h each
++// return early under it). Under the flag the inline accesses neither take nor release the monitor's
++// lock -- the fallbacks included, since they only release what the inline path took -- and a
++// store-exclusive does not clear other processors' reservations. What remains is each processor's
++// own reservation (exclusive_state, address[pid], value[pid]) and the compare-and-swap of the
++// reserved value: value-compare, x64's semantics. Without it every exclusive access on arm64 took the
++// process-wide lock and every store-exclusive scanned every slot of the monitor under it.
+ 
+ namespace {
+ 
++bool IgnoresGlobalMonitor(EmitContext& ctx) {
++    return ctx.conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
++}
++
+ void EmitMonitorLock(oaknut::CodeGenerator& code, EmitContext& ctx) {
++    if (IgnoresGlobalMonitor(ctx)) {
++        return;
++    }
+     code.MOV(Xscratch2, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(ctx.conf.global_monitor)));
+     EmitSpinLockLock(code, Xscratch2);
+ }
+ 
+ void EmitMonitorUnlock(oaknut::CodeGenerator& code, EmitContext& ctx) {
++    if (IgnoresGlobalMonitor(ctx)) {
++        return;
++    }
+     code.MOV(Xscratch2, mcl::bit_cast<u64>(GetExclusiveMonitorLockPointer(ctx.conf.global_monitor)));
+     EmitSpinLockUnlock(code, Xscratch2);
+ }
+@@ -917,8 +936,9 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
+     }
+ 
+     // Whatever the compare-and-swap decided, the reservation is spent: clear every processor's
+-    // reservation of this address (the monitor's CheckAndClear), this one's included.
+-    {
++    // reservation of this address (the monitor's CheckAndClear), this one's included. Patch 0021:
++    // not under Unsafe_IgnoreGlobalMonitor, where no processor clears another's reservation.
++    if (!IgnoresGlobalMonitor(ctx)) {
+         const u64 first = mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(ctx.conf.global_monitor, 0));
+         const u64 count = GetExclusiveMonitorProcessorCount(ctx.conf.global_monitor);
+         code.MOV(Xscratch0, first);
