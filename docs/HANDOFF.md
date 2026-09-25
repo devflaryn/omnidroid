@@ -1483,6 +1483,15 @@ an `ExclusiveMonitor` option, a lost-update stress test. Default behaviour uncha
    `eglGetDisplay` (headless answers `dlopen("libvulkan.so")` NULL, the engine falls back to GLES,
    EGL is unbound -- a device with neither does not exist, so this is a gate design question).
    The input subagent's reruns passed it -- timing-dependent; treat as live.
+   **The `eglGetDisplay` half is fixed (2026-09-25, `fix(gate): the headless gate's libEGL has no
+   driver`).** Decoded: not timing but the network. The engine drops the headless window at
+   `APP_CMD_INIT_WINDOW` (`Flags-Not-Received`), and picks it up once its *own* flag fetch
+   answers (`continueAfterFlagsLoaded_` -> the Lua app -> `SurfaceController` -> `Mode 6 failed`
+   -> GLES); where Roblox is unreachable (no VPN: `TlsVerificationFail`) the fetch fails and the
+   gate "passed". Headless now binds EGL with no driver (`Gles::set_driverless`, AOSP libEGL's
+   answers): the engine logs `Mode 4 failed: Error creating context: eglGetDisplay 300c`,
+   `RenderView is NULL`, runs on to `APP_READY` Landing, no thread dies. The headless gate passes
+   on Windows and Linux (the Mac not re-run: live runs there).
 8. **16 mutation rows are stale at `a5443f3`** (android-mem-A1, boundary-A11/A12, adapter-A5,
    guestmem-A3/A10, fs-A3, fallocate-B1, mmapfile-B2, threads-B2, dl-A5, pipe-B3, looper-B2,
    confine-A3/A4, fmod-B6): re-anchor them before the next full-table run.

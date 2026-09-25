@@ -94,7 +94,8 @@ MiB, 1,957-2,005 MiB at the landing (n = 1 run, 1 s samples).
 ![The engine's landing screen on macOS](macos-landing.png)
 
 Headless (`OMNI_GFX_WINDOW_TESTS` unset) the engine falls back to GLES and a thread dies on unbound
-`eglGetDisplay`: the same failure HANDOFF records for Windows ("still open", item 7).
+`eglGetDisplay`: the same failure HANDOFF records for Windows ("still open", item 7; fixed
+2026-09-25, see "Still open, with the consequence").
 
 ### Memory in the gate (MEASURED, `tools/footprint_mac.py`, 1 s samples of `phys_footprint`)
 
@@ -263,8 +264,9 @@ before `halt_reason` (the word at 12 mod 16) aborts `host_fault`; with 0, 4 or 1
   port does not create. The native backend's compute is 5.7x dynarmic's, but its crossings cost more
   than that saves at the landing screen (D34).
 * **Timer leeway**: a 1 ms sleep takes 1.49 ms here ("Timers"); nothing acts on it yet.
-* **Headless `eglGetDisplay`** kills a guest thread when no window is asked for -- the same on
-  Windows (HANDOFF "still open" 7).
+* ~~**Headless `eglGetDisplay`** kills a guest thread when no window is asked for -- the same on
+  Windows (HANDOFF "still open" 7).~~ Fixed 2026-09-25 (headless EGL has no driver,
+  `Gles::set_driverless`; HANDOFF item 7 has the decode). Not yet re-run on this Mac.
 * **Window seam** (`macos-window.md`): captured pointer motion is accelerated (the raw-delta reader,
   `IOHIDManager`, is not built); the physical wheel's sign under natural scrolling is documented,
   not measured; the portability subset has no validation-layer detector on this host.
