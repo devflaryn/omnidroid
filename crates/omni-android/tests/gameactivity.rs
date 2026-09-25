@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use omni_android::aaudio::{AAudio, PlatformOutput};
 use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
+use omni_android::jni::cursor::CursorController;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
 use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput};
 use omni_android::jni::lifecycle::{Call as LifecycleCall, Policy, Reaction, WindowLifecycle};
@@ -2700,6 +2701,11 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         MouseInput::new(&guest.jni, &|symbol| guest.exports.get(symbol).copied(), display.density())
             .unwrap_or_else(|error| panic!("the mouse seam could not be built: {error}"))
     });
+    // **The host's cursor follows the engine** (`omni_android::jni::cursor`), with every mouse:
+    // hidden while the engine draws its own over its view, held while the engine holds its own
+    // still (its lock state, read every turn, or `vk.e`'s pointer capture), given back whenever the
+    // window does not have the focus or is minimised.
+    let mut cursor: Option<CursorController> = mouse.as_ref().map(|_| CursorController::new());
     let mut input_failure: Option<String> = None;
     // **OMNI_INPUT_PROBE=1: one SYNTHETIC press-drag-release**, through the same seam, at the
     // centre of the view -- so a run nobody touches can still show that the engine's own
@@ -4266,6 +4272,9 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 close_requested = true;
             }
             for event in &events {
+                if let Some(cursor) = cursor.as_mut() {
+                    cursor.observe(event);
+                }
                 // **The window's state first**, in the order the host reported it among the input.
                 let reaction = lifecycle.as_mut().and_then(|life| life.event(event, std::time::Instant::now()));
                 if let Some(reaction) = reaction {
@@ -4319,9 +4328,29 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                                     let _ = writeln!(std::io::stderr(), "INPUT: mouse {call:?}");
                                 }
                                 if let Some(wanted) = delivery.capture {
-                                    match open.set_pointer_capture(wanted) {
-                                        Ok(held) => {
-                                            seam.set_pointer_capture(held);
+                                    // **Through the cursor's rule**, which holds the window's
+                                    // capture for `vk.e` and for the engine's own lock alike: a
+                                    // release by `vk.e` lets the cursor go only if the engine does
+                                    // not still hold it (`LockCurrentPosition`).
+                                    let controller = cursor.as_mut().expect("a cursor with every mouse");
+                                    controller.set_view_captured(wanted);
+                                    if !wanted {
+                                        seam.set_pointer_capture(false);
+                                    }
+                                    match controller.apply(open, std::time::Instant::now()) {
+                                        Ok(said) => {
+                                            if let Some(line) = said {
+                                                let _ = writeln!(
+                                                    std::io::stderr(),
+                                                    "INPUT: {line} at +{:.1}s",
+                                                    settle.elapsed().as_secs_f32()
+                                                );
+                                            }
+                                            let held = open.has_pointer_capture();
+                                            if wanted {
+                                                seam.set_pointer_capture(held);
+                                            }
+                                            seam.set_host_hold(held && !seam.has_pointer_capture());
                                             // Said when the outcome changes: a request the window
                                             // declines (no focus) is repeated on every hover.
                                             if capture_said != Some((wanted, held)) {
@@ -4331,7 +4360,12 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                                                     "INPUT: pointer capture {} by vk.e at +{:.1}s -> the window {}",
                                                     if wanted { "requested" } else { "released" },
                                                     settle.elapsed().as_secs_f32(),
-                                                    if held { "holds it" } else { "does not hold it (no focus)" }
+                                                    match (wanted, held) {
+                                                        (true, true) => "holds it",
+                                                        (true, false) => "does not hold it (no focus)",
+                                                        (false, false) => "let it go",
+                                                        (false, true) => "still holds it for the engine's own lock",
+                                                    }
                                                 );
                                             }
                                         }
@@ -4391,9 +4425,13 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     touch = None;
                     keyboard = None;
                     mouse = None;
-                    // A capture held for a mouse that is gone would pin the cursor for the rest
-                    // of the session.
+                    // A capture held -- or a cursor hidden -- for a mouse that is gone would pin or
+                    // hide the cursor for the rest of the session.
+                    if let Some(controller) = cursor.as_mut() {
+                        controller.give_back(open);
+                    }
                     let _ = open.set_pointer_capture(false);
+                    let _ = open.set_cursor_hidden(false);
                     break;
                 }
             }
@@ -4412,6 +4450,30 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             }
             for reaction in due {
                 told(&mut cpu, &mut touch, &reaction, &mut lifecycle, &mut window_failure, &mut resizes, &mut renewals);
+            }
+            // **The host's cursor, every turn** (`jni::cursor`): the engine's lock state read from
+            // its memory, whether it has drawn into its view yet, and the window set to match --
+            // which is also what takes the cursor back after the focus returns.
+            if let (Some(controller), Some(seam)) = (cursor.as_mut(), mouse.as_mut()) {
+                controller.set_lock(seam.engine_lock(&guest.jni));
+                controller.set_draws_own_cursor(presents() > 0);
+                match controller.apply(open, now) {
+                    Ok(said) => {
+                        if let Some(line) = said {
+                            let _ = writeln!(std::io::stderr(), "INPUT: {line} at +{:.1}s", settle.elapsed().as_secs_f32());
+                        }
+                        seam.set_host_hold(open.has_pointer_capture() && !seam.has_pointer_capture());
+                    }
+                    Err(error) => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "INPUT: the host cursor could not follow the engine, and is given back for the rest of the \
+                             session: {error}"
+                        );
+                        seam.set_host_hold(false);
+                        cursor = None;
+                    }
+                }
             }
         }
         // **The Java side's web view, on this thread** -- the UI thread, where its callbacks'
@@ -4466,12 +4528,16 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             _ => std::thread::sleep(IDLE_TURN),
         }
     }
-    // A capture still held when the session ends is given back before the app is closed, so the
-    // cursor is not pinned through the close.
+    // A capture still held -- or a cursor still hidden -- when the session ends is given back
+    // before the app is closed, so the cursor is neither pinned nor invisible through the close.
     if let Some(open) = window.as_mut() {
+        if let Some(controller) = cursor.as_mut() {
+            controller.give_back(open);
+        }
         if open.has_pointer_capture() {
             let _ = open.set_pointer_capture(false);
         }
+        let _ = open.set_cursor_hidden(false);
     }
     // The page's window, if one is up, closes with the session.
     drop(web_view);
@@ -4626,6 +4692,26 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             counts.locked,
             counts.capture_requests,
             counts.capture_releases
+        );
+        let lock = match seam.lock_location() {
+            Ok(Some(at)) => format!("read from {at}"),
+            Ok(None) => "never located (no mouse event was delivered)".to_string(),
+            Err(why) => format!("NOT located, so only vk.e's capture held the cursor: {why}"),
+        };
+        let counts = cursor.as_ref().map(CursorController::counts).unwrap_or_default();
+        let _ = writeln!(
+            std::io::stderr(),
+            "INPUT: host cursor -- hidden {} time(s) and shown {} time(s); held {} time(s) and let go {} \
+             time(s); the engine's lock state {} ({} read(s)), seen to become LockCenter {} time(s) and \
+             LockCurrentPosition {} time(s)",
+            counts.hides,
+            counts.shows,
+            counts.holds,
+            counts.releases,
+            lock,
+            counts.lock_reads,
+            counts.lock_center,
+            counts.lock_current_position
         );
     }
     // **What the engine asked the Vulkan loader for, in order** -- the census the stage tests
@@ -6437,6 +6523,94 @@ fn the_mouse_natives_read_the_registers_the_seam_writes() {
         .position(|&word| word == 0x7100_051F)
         .expect("the handler compares the lock state with 1 (`cmp w8, #1`)");
     assert_eq!(handler[compare + 1], 0x1A9F_17F3, "and answers equality (`cset w19, eq`): locked at the centre only");
+}
+
+/// **The engine's mouse-lock state is where `jni::cursor` reads it, and holds the three values it
+/// says**, out of the real binary:
+///
+/// * `LockLocation::decode` -- what the mouse seam runs on the loaded library -- finds, in
+///   `nativeGetMainWindowIsMouseLockedCenter`, the getter it calls first, and the handler's two
+///   loads before `cmp wN, #1`: `[[singleton + 0xb00] + 0x88]` in 2.739.691;
+/// * every store to that word anywhere in the library (`ldr xA, [xB, #0xb00]`, then within eight
+///   instructions `str wC, [xA, #0x88]`) stores **0, 1 or 2**, and all three are stored -- the
+///   `Default`, `LockCenter` and `LockCurrentPosition` of `jni::cursor::LockState` (0x274c4dc's
+///   writes in 2.739.691). A build that grew a fourth value, or moved the word, fails here by name.
+///
+/// Needs the ELF and not a run.
+#[test]
+fn the_mouse_lock_state_is_found_in_the_loaded_library() {
+    use omni_android::jni::cursor::LockLocation;
+    use omni_android::jni::mouse::MOUSE_LOCKED_CENTER_SYMBOL;
+    let _serial = serialized();
+    let bytes = main_lib_bytes();
+    let elf = ElfImage::parse(bytes).expect("parse libroblox.so");
+    let words_at = |vaddr: usize, count: usize| -> Option<Vec<u32>> {
+        let offset = elf.vaddr_to_offset(vaddr as u64)?;
+        Some(
+            bytes.get(offset..offset + 4 * count)?
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+                .collect(),
+        )
+    };
+    let native = elf
+        .exported_symbols()
+        .expect("read .dynsym")
+        .into_iter()
+        .find(|symbol| symbol.name == MOUSE_LOCKED_CENTER_SYMBOL)
+        .unwrap_or_else(|| panic!("libroblox.so does not export `{MOUSE_LOCKED_CENTER_SYMBOL}`"));
+    let location = LockLocation::decode(&words_at, native.sym.st_value as usize)
+        .unwrap_or_else(|why| panic!("the lock state is not where jni::cursor looks: {why}"));
+    assert_eq!(
+        (location.window_offset, location.state_offset),
+        (0xb00, 0x88),
+        "the main window's input state and its lock word, as 2.739.691 has them: {location:?}"
+    );
+
+    // Every store to `[[x + window] + state]`, and the value each stores.
+    let (window_imm, state_imm) = ((location.window_offset / 8) as u32, (location.state_offset / 4) as u32);
+    let mut stored = std::collections::BTreeMap::<u32, Vec<u64>>::new();
+    for segment in elf.load_segments().filter(|segment| segment.p_flags.bits() & 1 != 0) {
+        let start = segment.p_offset as usize;
+        let code: Vec<u32> = bytes[start..start + segment.p_filesz as usize]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+            .collect();
+        for (index, &word) in code.iter().enumerate() {
+            // `ldr xA, [xB, #window]`
+            if word & 0xFFFF_FC00 != 0xF940_0000 | (window_imm << 10) {
+                continue;
+            }
+            let pointer = word & 31;
+            for (step, &later) in code.iter().enumerate().skip(index + 1).take(8) {
+                // `str wC, [xA, #state]`
+                if later & 0xFFFF_FC00 != 0xB900_0000 | (state_imm << 10) || (later >> 5) & 31 != pointer {
+                    continue;
+                }
+                let value_reg = later & 31;
+                let value = if value_reg == 31 {
+                    Some(0) // wzr
+                } else {
+                    // The nearest `mov wC, #imm` (`movz`) before the store.
+                    code[index.saturating_sub(4)..step]
+                        .iter()
+                        .rev()
+                        .find(|&&w| w & 0xFFE0_001F == 0x5280_0000 | value_reg)
+                        .map(|&w| (w >> 5) & 0xFFFF)
+                };
+                let at = segment.p_vaddr + 4 * step as u64;
+                let value = value.unwrap_or_else(|| panic!("the store at {at:#x} stores w{value_reg}, set nowhere near"));
+                stored.entry(value).or_default().push(at);
+                break;
+            }
+        }
+    }
+    let values: Vec<u32> = stored.keys().copied().collect();
+    assert_eq!(
+        values,
+        [0, 1, 2],
+        "the engine stores exactly Default, LockCenter and LockCurrentPosition in the lock word: {stored:x?}"
+    );
 }
 
 /// **A host key reaches the USB HID usage the engine expects for it**, through the engine's own
