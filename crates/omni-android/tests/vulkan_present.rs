@@ -3005,6 +3005,13 @@ fn the_acquire_codes_reach_the_guest_verbatim_and_only_two_write_an_index() {
                 "{expected} writes no image index, so the guest's own variable is untouched"
             ),
         }
+        // **The out-of-date count moves for that code and no other** -- not for the suboptimal
+        // acquire before it, which a working swapchain answers after every resize on MoltenVK.
+        assert_eq!(
+            up.f.vulkan().out_of_date_answers(),
+            u64::from(expected == VK_ERROR_OUT_OF_DATE_KHR),
+            "the out-of-date count after an acquire answered {expected}"
+        );
     }
 
     // The two resize codes are in the driver-result log, because a run that "worked but looked

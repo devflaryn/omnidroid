@@ -54,7 +54,7 @@ use omni_android::vulkan::{
     GUEST_SURFACE_EXTENSION, LOADER_ENTRY_POINT, LOADER_SONAMES,
     PHYSICAL_DEVICE_FEATURES_BYTES, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES,
     PHYSICAL_DEVICE_PROPERTIES_BYTES, QUEUE_FAMILY_PROPERTIES_BYTES, SURFACE_CAPABILITIES_BYTES,
-    SURFACE_FORMAT_BYTES, STYPE_ANDROID_SURFACE_CREATE_INFO_KHR, VK_INCOMPLETE, VK_SUCCESS,
+    SURFACE_FORMAT_BYTES, STYPE_ANDROID_SURFACE_CREATE_INFO_KHR, VK_ERROR_SURFACE_LOST_KHR, VK_INCOMPLETE, VK_SUCCESS,
     MAX_CHAIN_LINKS, PHYSICAL_DEVICE_FEATURES_2_BYTES, STYPE_PHYSICAL_DEVICE_FEATURES_2,
     IMAGE_FORMAT_PROPERTIES_2_BYTES, PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2_BYTES,
     STYPE_IMAGE_FORMAT_PROPERTIES_2, STYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
@@ -888,6 +888,60 @@ fn a_surface_is_created_over_the_host_window_and_the_substitution_is_recorded() 
     assert!(report.contains("satisfied on this host's win32 window by"), "{report}");
     assert!(report.contains("vkCreateWin32SurfaceKHR"), "{report}");
     assert!(report.contains("VkSurfaceKHR handles issued: 1"), "{report}");
+}
+
+/// **A withheld surface answers its capabilities `VK_ERROR_SURFACE_LOST_KHR`, and writes nothing**
+/// -- for as long as it is withheld, or for exactly one query when one rebuild is asked for -- and
+/// the driver's answer comes back after. What `jni::lifecycle` uses to stop a minimised instance
+/// drawing and to have the engine rebuild its swapchain (`Vulkan::set_surface_withheld` has the
+/// decode): a withhold that leaked into the next query would destroy the framebuffer the rebuild
+/// just made, and one that never ended would leave the instance drawing nothing after its restore.
+#[test]
+fn a_withheld_surface_answers_surface_lost_and_the_drivers_answer_comes_back() {
+    let _serial = serialized();
+    let f = fixture("withheld", Some(StageThreeHost::new()));
+    f.ndk.set_window_source(a_source_with_a_handle() as Arc<dyn WindowSource>);
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let create = f.resolve(entry_point, instance, "vkCreateAndroidSurfaceKHR");
+    let capabilities = f.resolve(entry_point, instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    let info = f.android_surface_info(f.a_native_window());
+    let out = f.alloc(8);
+    assert_eq!(f.call(create, [instance, info, 0, out]).expect("surface") as i32, VK_SUCCESS);
+    let surface = f.guest.read_u64(out as GuestAddr);
+    let device = f.physical_devices(entry_point, instance)[0];
+
+    const POISON: u8 = 0x5A;
+    let ask = || -> (i32, Vec<u8>) {
+        let at = f.poisoned(SURFACE_CAPABILITIES_BYTES, POISON);
+        let result = f.call(capabilities, [device, surface, at, 0]).expect("the call completes") as i32;
+        (result, f.read_bytes(at, SURFACE_CAPABILITIES_BYTES))
+    };
+    let answered = |(result, bytes): (i32, Vec<u8>)| {
+        assert_eq!(result, VK_SUCCESS);
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().expect("four")), 1024, "the driver's extent");
+    };
+    let withheld = |(result, bytes): (i32, Vec<u8>)| {
+        assert_eq!(result, VK_ERROR_SURFACE_LOST_KHR);
+        assert!(bytes.iter().all(|&b| b == POISON), "a withheld answer writes nothing");
+    };
+
+    answered(ask());
+    f.vulkan().set_surface_withheld(true);
+    withheld(ask());
+    withheld(ask());
+    f.vulkan().set_surface_withheld(false);
+    answered(ask());
+    f.vulkan().withhold_surface_once();
+    withheld(ask());
+    answered(ask());
+    answered(ask());
+    assert_eq!(f.vulkan().withheld_answers(), 3);
+    assert!(
+        f.vulkan().driver_failures().is_empty(),
+        "a withheld answer is this layer's, not the driver's: {:?}",
+        f.vulkan().driver_failures()
+    );
 }
 
 /// **`vkGetInstanceProcAddr("vkCreateAndroidSurfaceKHR")` answers a thunk the driver said it did

@@ -126,6 +126,10 @@ pub const QUEUE_FAMILY_PROPERTIES_BYTES: usize = 24;
 /// `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`.
 pub const PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES: usize = 520;
 
+/// `VK_ERROR_SURFACE_LOST_KHR`: `VK_KHR_surface`'s first code (extension 1, base `-1000000000`).
+/// What a capabilities query answers while `Vulkan::set_surface_withheld` holds.
+pub const VK_ERROR_SURFACE_LOST_KHR: i32 = -1_000_000_000;
+
 /// `sizeof(VkSurfaceCapabilitiesKHR)`: thirteen `uint32_t`-sized members, no padding.
 pub const SURFACE_CAPABILITIES_BYTES: usize = 52;
 
@@ -720,6 +724,12 @@ pub(super) fn surface_capabilities(
     let host = vulkan.require_host(at)?;
     let device = vulkan.physical_device_token(at, CALL, args[0])?;
     let surface = vulkan.surface_token(at, CALL, args[1])?;
+    // The embedding's window has no pixels (or asked for one rebuild): Android's answer for a
+    // surface without a window, and the driver is not asked. See `Vulkan::set_surface_withheld`.
+    if vulkan.take_surface_withheld() {
+        c.ret().i32(VK_ERROR_SURFACE_LOST_KHR);
+        return Ok(());
+    }
     match host.surface_capabilities(device, surface)? {
         DriverAnswer::Failed(result) => {
             vulkan.note_driver_result(CALL, result);

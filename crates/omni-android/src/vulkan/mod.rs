@@ -246,7 +246,7 @@ pub use instance::{
 pub use physical::{
     FORMAT_PROPERTIES_BYTES, IMAGE_FORMAT_PROPERTIES_BYTES, PHYSICAL_DEVICE_FEATURES_BYTES, PHYSICAL_DEVICE_MEMORY_PROPERTIES_BYTES,
     PHYSICAL_DEVICE_PROPERTIES_BYTES, PRESENT_MODE_BYTES, QUEUE_FAMILY_PROPERTIES_BYTES,
-    SURFACE_CAPABILITIES_BYTES, SURFACE_FORMAT_BYTES,
+    SURFACE_CAPABILITIES_BYTES, SURFACE_FORMAT_BYTES, VK_ERROR_SURFACE_LOST_KHR,
 };
 pub use rewrite::{Rewrite, RewriteSite, Substitution};
 pub use surface::{ANDROID_SURFACE_CREATE_INFO_BYTES, STYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
@@ -1086,6 +1086,16 @@ struct State {
     first_allocator_call: Option<String>,
     /// Every failing `VkResult` a driver answered with, in order, with the call that got it.
     driver_results: Vec<(String, i32)>,
+    /// How many times the driver answered `VK_ERROR_OUT_OF_DATE_KHR`, from any call: **not**
+    /// bounded, unlike `driver_results`, because it is what an embedding watches to tell a
+    /// swapchain that went out of date and stayed so (see [`Vulkan::out_of_date_answers`]).
+    out_of_date_answers: u64,
+    /// Whether the surface's capabilities are withheld: see [`Vulkan::set_surface_withheld`].
+    surface_withheld: bool,
+    /// One capabilities query to withhold: see [`Vulkan::withhold_surface_once`].
+    withhold_once: bool,
+    /// How many capabilities queries were answered withheld, without asking the driver.
+    withheld_answers: u64,
 }
 
 impl core::fmt::Debug for Vulkan {
@@ -1240,6 +1250,10 @@ impl Vulkan {
                 first_allocator: None,
                 first_allocator_call: None,
                 driver_results: Vec::new(),
+                out_of_date_answers: 0,
+                surface_withheld: false,
+                withhold_once: false,
+                withheld_answers: 0,
             }),
         });
         crate::perf::register_vulkan(&vulkan);
@@ -1821,6 +1835,67 @@ impl Vulkan {
     #[must_use]
     pub fn driver_failures(&self) -> Vec<(String, i32)> {
         self.state.lock().driver_results.clone()
+    }
+
+    /// **How many times the driver has answered `VK_ERROR_OUT_OF_DATE_KHR`**, to
+    /// `vkAcquireNextImageKHR`, `vkQueuePresentKHR` or anything else, over the whole run. The
+    /// code reaches the guest unchanged (the `swapchain` module's header); this is the host's own
+    /// count of it, which [`driver_failures`](Self::driver_failures) cannot be once its bounded
+    /// record is full.
+    ///
+    /// What an embedding watches for a swapchain that went out of date **and stayed so**: MEASURED
+    /// on Windows (w26, 2026-09-25), after one out-of-date present the engine acquired ~2,400
+    /// more times over two minutes, each answered out of date, and never presented again. Android
+    /// has no such state -- its window system tells an app its surface changed through the
+    /// activity -- so the fix is the embedding's: `jni::lifecycle`.
+    #[must_use]
+    pub fn out_of_date_answers(&self) -> u64 {
+        self.state.lock().out_of_date_answers
+    }
+
+    /// **While `withheld`, every `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` answers
+    /// `VK_ERROR_SURFACE_LOST_KHR` without asking the driver** -- what Android's own loader answers
+    /// for a surface whose window is gone (AOSP `swapchain.cpp`, a `DEAD_OBJECT` from the window).
+    /// For an embedding whose window has no pixels: a minimised one.
+    ///
+    /// DECODED on 2.739 why this, and not the driver's own answer, is what a minimised window
+    /// should give the engine. Every frame, the engine's swapchain check (`0x2790a34`) asks the
+    /// capabilities; **a failed query destroys the main framebuffer** (`0x2790b0c`, logging
+    /// `Vulkan: destroying window frame buffer` once), and with no framebuffer `beginFrame`
+    /// (`0x27de770`) returns nothing and the frame skips recording, acquire, `vkQueueSubmit` and
+    /// present (`0x27da27c`) -- the game ticks on and draws nothing. The driver's own answer for a
+    /// minimised Win32 window is a 0x0 extent, which the check returns on (`0x2790b64`) with the
+    /// framebuffer kept, so every frame is still recorded and submitted: to an image when the
+    /// acquire works, to the fallback framebuffer (`dev+0x810`) when it answers out of date. **And
+    /// the first query answered again rebuilds the swapchain** -- a null framebuffer is one of the
+    /// check's three rebuild conditions -- so a restore needs nothing else.
+    pub fn set_surface_withheld(&self, withheld: bool) {
+        self.state.lock().surface_withheld = withheld;
+    }
+
+    /// **The next capabilities query answers `VK_ERROR_SURFACE_LOST_KHR`, and the ones after it
+    /// the driver's answer**: the engine destroys its framebuffer on the first and rebuilds its
+    /// swapchain on the second (see [`Vulkan::set_surface_withheld`]) -- its own rebuild, with the
+    /// out-of-date swapchain as `oldSwapchain`, and no pause. For a swapchain the driver calls out
+    /// of date at a size the engine already has, which nothing in the engine rebuilds.
+    pub fn withhold_surface_once(&self) {
+        self.state.lock().withhold_once = true;
+    }
+
+    /// Whether the next capabilities query is to be withheld, consuming a one-shot request.
+    pub(crate) fn take_surface_withheld(&self) -> bool {
+        let mut state = self.state.lock();
+        let withheld = state.surface_withheld || core::mem::take(&mut state.withhold_once);
+        if withheld {
+            state.withheld_answers += 1;
+        }
+        withheld
+    }
+
+    /// How many capabilities queries were answered withheld.
+    #[must_use]
+    pub fn withheld_answers(&self) -> u64 {
+        self.state.lock().withheld_answers
     }
 
     /// Everything this instance recorded, as lines a gate can print.
@@ -3007,6 +3082,9 @@ impl Vulkan {
     /// Record a failing `VkResult` a driver answered with. Bounded, like every other log here.
     fn note_driver_result(&self, call: &str, result: i32) {
         let mut state = self.state.lock();
+        if result == swapchain::VK_ERROR_OUT_OF_DATE_KHR {
+            state.out_of_date_answers += 1;
+        }
         if state.driver_results.len() < MAX_RECORDS {
             state.driver_results.push((call.to_string(), result));
         }
