@@ -259,7 +259,12 @@ pub fn getvalue(
     sem_addr: u64,
 ) -> Result<i32, crate::memory::Fault> {
     check_addr(sem_addr)?;
-    let word = read_word(mem, sem_addr)?;
+    // ACQUIRE, unlike the peeks in `wait`/`post` (each re-checked by the CAS that
+    // follows it): this value is the whole answer, and a guest that polls
+    // `sem_getvalue` until it sees a post may read what the poster stored before
+    // posting. `post`'s CAS is the release it pairs with. Found by audit after
+    // macOS run m9, with the mutex and once publications.
+    let word = mem.load_u32_acquire(sem_addr)?;
     Ok((word & sem_bits::VALUE_MASK) as i32)
 }
 
@@ -284,6 +289,9 @@ fn clear_waiters_flag(
     }
 }
 
+/// A plain read of the sem word: a peek that the `cas_u32` after it re-checks. Every change of
+/// the word is a CAS (at least acquire and release, see [`GuestAtomic`]), so a stale peek costs a
+/// failed CAS and a retry; only [`getvalue`], whose read is the answer, loads with acquire.
 fn read_word(mem: &impl GuestMemory, addr: u64) -> Result<u32, crate::memory::Fault> {
     let mut b = [0u8; 4];
     mem.read(addr, &mut b)?;
@@ -615,5 +623,31 @@ mod tests {
         assert_eq!(post(&mut mem.clone(), &*futex, 0x1000).unwrap(), 0);
         assert_eq!(waiter.join().unwrap(), 0, "the waiter took the posted token");
         assert!(futex.refused() < 100, "{} waits refused -- the waiter spun", futex.refused());
+    }
+
+    /// **Every change of the sem word is a CAS, and `sem_getvalue` reads it with acquire.** The
+    /// CAS is the release a poster's data rides on; `getvalue` is the one read whose value is the
+    /// answer rather than a peek a CAS re-checks, so it is the one that must acquire. Pinned by
+    /// primitive, because the mock orders every access and cannot show the difference (the audit
+    /// after macOS run m9).
+    #[test]
+    fn the_sem_word_changes_only_by_cas_and_getvalue_acquires_it() {
+        use crate::shared_mem::{RecordingMemory, WordAccess};
+        let mut m = RecordingMemory::new(placed(), 0x1000);
+        assert_eq!(init(&mut m, 0x1000, 0, 0).unwrap(), 0);
+        m.clear(); // `init` is a plain store of a sem nobody else can see yet
+        let futex = MockFutex::new();
+        assert_eq!(post(&mut m, &futex, 0x1000).unwrap(), 0);
+        assert_eq!(post(&mut m, &futex, 0x1000).unwrap(), 0);
+        assert_eq!(trywait(&mut m, 0x1000).unwrap(), 0);
+        assert_eq!(wait(&mut m, &futex, 0x1000).unwrap(), 0);
+        assert_eq!(post(&mut m, &futex, 0x1000).unwrap(), 0);
+        assert_eq!(getvalue(&mut m, 0x1000).unwrap(), 1);
+        let log = m.log();
+        assert!(
+            !log.iter().any(|a| matches!(a, WordAccess::Write(_) | WordAccess::StoreRelease(_))),
+            "the sem word changed other than by CAS: {log:?}"
+        );
+        assert_eq!(log.last(), Some(&WordAccess::LoadAcquire(1)), "getvalue: {log:?}");
     }
 }

@@ -60,10 +60,12 @@ pub fn once<F: FnMut()>(
     check_addr(once_addr)?;
 
     loop {
-        // Read the control word.
-        let mut word = [0u8; 4];
-        mem.read(once_addr, &mut word)?;
-        let current = u32::from_le_bytes(word);
+        // Read the control word, with ACQUIRE ordering: DONE is the one value a caller
+        // returns on without a CAS, and returning is a promise that the routine's stores
+        // are visible (a C++ static initialiser's object, a `pthread_key_create`'s key).
+        // A plain read made no such promise on an arm64 host: it could see DONE and still
+        // read the object stale. Found by audit after macOS run m9.
+        let current = mem.load_u32_acquire(once_addr)?;
 
         match current {
             state::DONE => return Ok(OnceOutcome::AlreadyDone),
@@ -82,9 +84,9 @@ pub fn once<F: FnMut()>(
                         WaitResult::TimedOut => {}
                         WaitResult::WouldBlock => {}
                     }
-                    let mut word = [0u8; 4];
-                    mem.read(once_addr, &mut word)?;
-                    match u32::from_le_bytes(word) {
+                    // Acquire, as the read at the top: this is where a loser learns
+                    // the routine finished, and returns on it.
+                    match mem.load_u32_acquire(once_addr)? {
                         state::DONE => return Ok(OnceOutcome::AlreadyDone),
                         // Still in progress (or raced back through a re-init):
                         // sleep again.
@@ -99,8 +101,12 @@ pub fn once<F: FnMut()>(
                 if mem.cas_u32(once_addr, state::NEVER, state::IN_PROGRESS)? {
                     // We won: run the routine.
                     run_init();
-                    // Publish DONE, then wake every waiter on the word.
-                    mem.write(once_addr, &state::DONE.to_le_bytes())?;
+                    // Publish DONE, then wake every waiter on the word. A RELEASE
+                    // store, paired with the acquire loads above: every store the
+                    // routine made is visible to a caller that sees DONE. It was a
+                    // plain `write`, which an arm64 host may make visible before the
+                    // routine's own stores (found by audit after macOS run m9).
+                    mem.store_u32_release(once_addr, state::DONE)?;
                     futex.wake(once_addr, u32::MAX);
                     return Ok(OnceOutcome::Ran);
                 }
@@ -329,5 +335,68 @@ mod tests {
         assert_eq!(first.join().unwrap(), OnceOutcome::Ran);
         assert_eq!(second, OnceOutcome::AlreadyDone);
         assert!(futex.refused() < 100, "{} waits refused -- the caller spun", futex.refused());
+    }
+
+    /// **DONE is published with a release store and observed with an acquire load**, on the
+    /// winner's path, a later caller's, and a loser's that waited on the word.
+    ///
+    /// The mock's host lock orders every access, so a plain `write` of DONE and a plain `read` of
+    /// it pass every behavioural test here -- and did, until an audit after macOS run m9 found
+    /// that on an arm64 host a caller could see DONE and still read the initialised object stale.
+    /// This pins the primitives, so a regression to either plain access fails.
+    #[test]
+    fn done_is_released_by_the_winner_and_acquired_by_everyone_else() {
+        use crate::shared_mem::{RecordingMemory, WordAccess};
+        let mem = RecordingMemory::new(smem(0x1000), 0x1000);
+        let futex = Arc::new(MockFutex::new());
+
+        // The winner, and a loser that finds IN_PROGRESS and waits for DONE.
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let winner = {
+            let (mem, futex) = (mem.clone(), futex.clone());
+            std::thread::spawn(move || {
+                once(&mut mem.clone(), &*futex, 0x1000, || {
+                    running_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap()
+            })
+        };
+        running_rx.recv().unwrap();
+        let loser = {
+            let (mem, futex) = (mem.clone(), futex.clone());
+            std::thread::spawn(move || once(&mut mem.clone(), &*futex, 0x1000, || panic!("ran twice")).unwrap())
+        };
+        // Let the loser reach the word and see IN_PROGRESS before the routine ends.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !mem.log().contains(&WordAccess::LoadAcquire(state::IN_PROGRESS)) {
+            assert!(std::time::Instant::now() < deadline, "the loser never read the word");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(winner.join().unwrap(), OnceOutcome::Ran);
+        assert_eq!(loser.join().unwrap(), OnceOutcome::AlreadyDone);
+        // And a caller that arrives after, on the fast path.
+        assert_eq!(
+            once(&mut mem.clone(), &*futex, 0x1000, || panic!("ran twice")).unwrap(),
+            OnceOutcome::AlreadyDone
+        );
+
+        let log = mem.log();
+        assert!(
+            !log.iter().any(|a| matches!(a, WordAccess::Read | WordAccess::Write(_))),
+            "the control word was touched by a plain access: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|a| **a == WordAccess::StoreRelease(state::DONE)).count(),
+            1,
+            "DONE is published once, with a release store: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|a| **a == WordAccess::LoadAcquire(state::DONE)).count(),
+            2,
+            "both the waiting loser and the late caller acquire DONE: {log:?}"
+        );
     }
 }
