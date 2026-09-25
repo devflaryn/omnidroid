@@ -988,7 +988,7 @@ pub(super) fn sysinfo(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     // Saturating on purpose: the process charge includes this instance's own mappings and
     // anything else in the process, so a host that set a budget smaller than what is already
     // taken gets `freeram = 0` rather than an underflow that wraps to sixteen exabytes.
-    let free = omni_mem::process_commit_charge()
+    let free = super::procfs::recent_commit_charge()
         .ok()
         .map_or(total, |charged| total.saturating_sub(charged));
     let uptime = state.bionic.uptime().as_secs();

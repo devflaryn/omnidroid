@@ -286,6 +286,62 @@ fn refused(path: &str, why: impl Into<String>) -> FsError {
     FsError::Refused { operation: "generate", path: path.to_string(), why: why.into() }
 }
 
+/// How long a **slow** reading of this process's memory counters is served again before the
+/// host is asked anew: **500 ms** (see [`recent`]).
+///
+/// **A snapshot, as the kernel's own answers are.** `/proc/meminfo`, `/proc/self/statm` and
+/// `sysinfo` describe a moment, and a guest that polls them sees numbers that moved since. What
+/// this bounds is the host's cost. MEASURED on the Linux host (i5-4460, in the Pet Simulator 99
+/// world, 2026-09-25): the commit charge there is the `VM_ACCOUNT` total parsed out of the whole
+/// of `/proc/self/smaps` -- thousands of mappings, a page-table walk in the kernel per mapping --
+/// and the engine's memory monitor polls these files from its workers, which then spent 40-50% of
+/// their time inside `pread`/`fopen`/`sysinfo` with the samples in the kernel. On Windows and
+/// macOS the same question is one cheap call, and the cache changes nothing there but the cost.
+pub(super) const MEMORY_READING_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// This process's commit charge; a slow host reading is reused for [`MEMORY_READING_TTL`].
+pub(super) fn recent_commit_charge() -> omni_platform::vm::VmResult<u64> {
+    static LAST: Mutex<Option<Reading<u64>>> = Mutex::new(None);
+    recent(&LAST, omni_mem::process_commit_charge)
+}
+
+/// One host reading: when it was taken, what it said, and what taking it cost.
+#[derive(Clone)]
+struct Reading<T> {
+    at: std::time::Instant,
+    value: T,
+    cost: std::time::Duration,
+}
+
+/// A host reading reused only when **taking it was itself slow** (over [`SLOW_READING`]) and it
+/// is younger than [`MEMORY_READING_TTL`]. Where the host answers in microseconds -- Windows,
+/// macOS, a small process on Linux -- every call reads afresh, exactly as before, so a guest
+/// that commits and reads back sees the change at once, as it does on a kernel.
+fn recent<T: Clone>(
+    last: &Mutex<Option<Reading<T>>>,
+    read: impl FnOnce() -> omni_platform::vm::VmResult<T>,
+) -> omni_platform::vm::VmResult<T> {
+    let mut last = last.lock();
+    if let Some(reading) = last.as_ref() {
+        if reading.cost > SLOW_READING && reading.at.elapsed() < MEMORY_READING_TTL {
+            return Ok(reading.value.clone());
+        }
+    }
+    let started = std::time::Instant::now();
+    let value = read()?;
+    *last = Some(Reading { at: std::time::Instant::now(), value: value.clone(), cost: started.elapsed() });
+    Ok(value)
+}
+
+/// What counts as a slow host reading: 1 ms.
+const SLOW_READING: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// This process's memory counters; a slow host reading is reused for [`MEMORY_READING_TTL`].
+fn recent_process_memory() -> omni_platform::vm::VmResult<ProcessMemory> {
+    static LAST: Mutex<Option<Reading<ProcessMemory>>> = Mutex::new(None);
+    recent(&LAST, omni_mem::process_memory)
+}
+
 fn generate_meminfo(budget: &Mutex<Option<u64>>, page: u64) -> FsResult<Vec<u8>> {
     // Copied out rather than held: the lock is the embedding's setter's too, and nothing below
     // needs it.
@@ -300,7 +356,7 @@ fn generate_meminfo(budget: &Mutex<Option<u64>>, page: u64) -> FsResult<Vec<u8>>
              Bionic::set_memory_budget",
         ));
     };
-    let charged = omni_mem::process_commit_charge().map_err(|error| {
+    let charged = recent_commit_charge().map_err(|error| {
         refused(
             MEMINFO,
             format!(
@@ -314,7 +370,7 @@ fn generate_meminfo(budget: &Mutex<Option<u64>>, page: u64) -> FsResult<Vec<u8>>
 }
 
 fn generate_statm(page: u64) -> FsResult<Vec<u8>> {
-    let memory = omni_mem::process_memory().map_err(|error| {
+    let memory = recent_process_memory().map_err(|error| {
         refused(
             STATM,
             format!("this process's memory counters could not be read: {error}"),
@@ -428,6 +484,36 @@ impl Statm {
 
 #[cfg(test)]
 mod tests {
+    /// A slow host reading is reused inside its lifetime; a fast one is taken afresh every time,
+    /// so where the host is cheap a guest sees a change at once, as it does on a kernel.
+    #[test]
+    fn only_a_slow_memory_reading_is_reused() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let fast: Mutex<Option<Reading<u64>>> = Mutex::new(None);
+        for n in 0..3u64 {
+            let got = recent(&fast, || {
+                calls.set(calls.get() + 1);
+                Ok(n)
+            })
+            .unwrap();
+            assert_eq!(got, n, "a fast reading is never served again");
+        }
+        assert_eq!(calls.get(), 3);
+        let slow: Mutex<Option<Reading<u64>>> = Mutex::new(None);
+        calls.set(0);
+        for _ in 0..3 {
+            let got = recent(&slow, || {
+                calls.set(calls.get() + 1);
+                std::thread::sleep(SLOW_READING * 3);
+                Ok(u64::from(calls.get()))
+            })
+            .unwrap();
+            assert_eq!(got, 1, "a slow reading is served again inside its lifetime");
+        }
+        assert_eq!(calls.get(), 1, "the host was asked once");
+    }
+
     use super::*;
 
     const PAGE: u64 = 4096;

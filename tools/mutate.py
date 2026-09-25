@@ -4448,6 +4448,21 @@ directory", ADAPTER_FILES,
         if let Err(error) = space.reclaim_idle() {""",
      ANDROID),
 
+    # A slow memory reading taken afresh on every call: the Linux world's workers then spent
+    # 40-50% in /proc and sysinfo reads parsing /proc/self/smaps (2026-09-25).
+    ("memread-A1", "A", "a slow host memory reading is never reused",
+     "crates/omni-android/src/bionic/procfs.rs",
+     """        if reading.cost > SLOW_READING && reading.at.elapsed() < MEMORY_READING_TTL {""",
+     """        if false && reading.cost > SLOW_READING && reading.at.elapsed() < MEMORY_READING_TTL {""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "only_a_slow_memory_reading"]),
+    # The over-correction: every reading reused, so a guest's commit is not seen at once where
+    # the host could answer it cheaply.
+    ("memread-B1", "B", "a fast host memory reading is reused too",
+     "crates/omni-android/src/bionic/procfs.rs",
+     """        if reading.cost > SLOW_READING && reading.at.elapsed() < MEMORY_READING_TTL {""",
+     """        if reading.at.elapsed() < MEMORY_READING_TTL {""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "only_a_slow_memory_reading"]),
+
     # ---- B: the over-corrections -----------------------------------------------------------
 
     # Every JNI slot on the exit path. It reads as safer -- a handler that *may* call guest code
