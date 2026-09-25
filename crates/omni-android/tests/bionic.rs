@@ -2535,6 +2535,192 @@ fn printf_and_puts_write_through_the_stream_stdout_names() {
     assert_eq!(answered as i64 as i32, i32::from(b'\n'));
 }
 
+/// One handler that writes a guest structure, for [`every_struct_a_handler_writes_is_exactly_its_abi_size`].
+struct StructWrite {
+    /// The call, for the failure message.
+    what: &'static str,
+    /// `sizeof` the structure on LP64 bionic, from the NDK's headers -- not from this layer.
+    size: usize,
+    /// Whether the handler writes every byte of it (a zeroed tail included), so a prefix-only
+    /// write is caught too. False for the structures a handler legitimately fills in part.
+    whole: bool,
+}
+
+/// **Every structure a handler writes into guest memory is written at exactly its ABI size**:
+/// not one byte before it and not one past it, and -- where the handler owns the whole
+/// structure -- all of it.
+///
+/// Why this exists: the in-world runs w1 and w13 died on heap words reading all ones, and the
+/// classic source of that is a host answer written over a guest buffer with the wrong `sizeof`
+/// (a 128-byte `stat` into a 104-byte one, an all-ones `RLIM_INFINITY` pair into a short
+/// `rlimit`, a glibc-sized `sigset_t`). Each structure here is placed between 64-byte guards of
+/// `0xA5`, pre-filled with `0xA5`, and the call is made through its thunk; then the guards must be
+/// untouched, and a `whole` structure must have lost every run of the pattern at its tail.
+/// Sizes are the NDK's (LP64): `struct stat` 128, `struct statvfs` 112, `struct sysinfo` 112,
+/// `struct mallinfo` 80, `struct tm` 56, `struct itimerspec` 32, `timespec`/`timeval` 16,
+/// `pthread_attr_t` 56, `pthread_mutex_t` 40, `pthread_cond_t` 48, `pthread_rwlock_t` 56,
+/// `sigset_t` 8, `int[2]` 8, `time_t` 8, `int` 4 and `struct sched_param` 4.
+#[test]
+fn every_struct_a_handler_writes_is_exactly_its_abi_size() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("structs");
+    std::fs::write(scratch.path("file.txt"), b"eleven byte").expect("a host file");
+    f.bionic.set_memory_budget(1 << 30);
+    const GUARD: usize = 64;
+    const FILL: u8 = 0xA5;
+    let path = f.cstring(f.guest.data + 0x100, b"file.txt") as u64;
+    let dot = f.cstring(f.guest.data + 0x140, b".") as u64;
+    let seconds = f.guest.data + 0x180;
+    f.guest.write_u64(seconds, 1_700_000_000);
+    let zero_spec = f.guest.data + 0x1C0;
+    f.guest.write_bytes(zero_spec, &[0u8; 32]);
+    let fd = value_of(&f, "open", |asm| {
+        asm.mov(0, path);
+        asm.mov(1, 0);
+    });
+    assert!((fd as i64) >= 0, "open answered {}", fd as i64);
+    let timer = value_of(&f, "timerfd_create", |asm| {
+        asm.mov(0, 1); // CLOCK_MONOTONIC
+        asm.mov(1, 0);
+    });
+    assert!((timer as i64) >= 0, "timerfd_create answered {}", timer as i64);
+    let me = value_of(&f, "pthread_self", |_| {});
+    let policy = f.guest.data + 0x200;
+
+    // Each case: the symbol, the struct, and the registers -- `at` is where the struct is.
+    let mut next = f.guest.data + 0x1000;
+    let mut check = |symbol: &str, write: StructWrite, setup: &dyn Fn(&mut Asm, u64)| {
+        let at = next + GUARD;
+        next += (GUARD * 2 + write.size + 15) & !15;
+        f.guest.write_bytes(at - GUARD, &vec![FILL; GUARD * 2 + write.size]);
+        let answered = value_of(&f, symbol, |asm| setup(asm, at as u64));
+        let before = read_guest(&f, at - GUARD, GUARD);
+        let after = read_guest(&f, at + write.size, GUARD);
+        assert!(
+            before.iter().all(|&b| b == FILL),
+            "{}: wrote before its {}-byte structure (answered {:#x}): {before:02x?}",
+            write.what, write.size, answered
+        );
+        assert!(
+            after.iter().all(|&b| b == FILL),
+            "{}: wrote past its {}-byte structure (answered {:#x}): {after:02x?}",
+            write.what, write.size, answered
+        );
+        let inside = read_guest(&f, at, write.size);
+        assert!(
+            inside.iter().any(|&b| b != FILL),
+            "{}: wrote nothing into its structure (answered {:#x})",
+            write.what, answered
+        );
+        if write.whole {
+            let tail = &inside[write.size.saturating_sub(4)..];
+            assert!(
+                tail.iter().any(|&b| b != FILL),
+                "{}: left the end of its {}-byte structure unwritten: {inside:02x?}",
+                write.what, write.size
+            );
+        }
+    };
+
+    check("stat", StructWrite { what: "stat", size: 128, whole: true }, &|asm, at| {
+        asm.mov(0, path);
+        asm.mov(1, at);
+    });
+    check("lstat", StructWrite { what: "lstat", size: 128, whole: true }, &|asm, at| {
+        asm.mov(0, path);
+        asm.mov(1, at);
+    });
+    check("fstat", StructWrite { what: "fstat", size: 128, whole: true }, &|asm, at| {
+        asm.mov(0, fd);
+        asm.mov(1, at);
+    });
+    check("statvfs", StructWrite { what: "statvfs", size: 112, whole: true }, &|asm, at| {
+        asm.mov(0, dot);
+        asm.mov(1, at);
+    });
+    check("sysinfo", StructWrite { what: "sysinfo", size: 112, whole: true }, &|asm, at| {
+        asm.mov(0, at);
+    });
+    check("mallinfo", StructWrite { what: "mallinfo (through X8)", size: 80, whole: true }, &|asm, at| {
+        asm.mov(8, at);
+    });
+    check("gmtime_r", StructWrite { what: "gmtime_r", size: 56, whole: true }, &|asm, at| {
+        asm.mov(0, seconds as u64);
+        asm.mov(1, at);
+    });
+    check("localtime_r", StructWrite { what: "localtime_r", size: 56, whole: true }, &|asm, at| {
+        asm.mov(0, seconds as u64);
+        asm.mov(1, at);
+    });
+    check(
+        "timerfd_settime",
+        StructWrite { what: "timerfd_settime's old_value", size: 32, whole: true },
+        &|asm, at| {
+            asm.mov(0, timer);
+            asm.mov(1, 0);
+            asm.mov(2, zero_spec as u64);
+            asm.mov(3, at);
+        },
+    );
+    check("clock_gettime", StructWrite { what: "clock_gettime", size: 16, whole: true }, &|asm, at| {
+        asm.mov(0, 1);
+        asm.mov(1, at);
+    });
+    check("gettimeofday", StructWrite { what: "gettimeofday", size: 16, whole: true }, &|asm, at| {
+        asm.mov(0, at);
+        asm.mov(1, 0);
+    });
+    check("time", StructWrite { what: "time", size: 8, whole: true }, &|asm, at| {
+        asm.mov(0, at);
+    });
+    check("pipe", StructWrite { what: "pipe", size: 8, whole: true }, &|asm, at| {
+        asm.mov(0, at);
+    });
+    check("sigfillset", StructWrite { what: "sigfillset", size: 8, whole: true }, &|asm, at| {
+        asm.mov(0, at);
+    });
+    check(
+        "pthread_attr_init",
+        StructWrite { what: "pthread_attr_init", size: 56, whole: false },
+        &|asm, at| {
+            asm.mov(0, at);
+        },
+    );
+    check(
+        "pthread_mutex_init",
+        StructWrite { what: "pthread_mutex_init", size: 40, whole: true },
+        &|asm, at| {
+            asm.mov(0, at);
+            asm.mov(1, 0);
+        },
+    );
+    check(
+        "pthread_cond_init",
+        StructWrite { what: "pthread_cond_init", size: 48, whole: false },
+        &|asm, at| {
+            asm.mov(0, at);
+            asm.mov(1, 0);
+        },
+    );
+    check(
+        "pthread_rwlock_init",
+        StructWrite { what: "pthread_rwlock_init", size: 56, whole: true },
+        &|asm, at| {
+            asm.mov(0, at);
+            asm.mov(1, 0);
+        },
+    );
+    check(
+        "pthread_getschedparam",
+        StructWrite { what: "pthread_getschedparam's sched_param", size: 4, whole: true },
+        &|asm, at| {
+            asm.mov(0, me);
+            asm.mov(1, policy as u64);
+            asm.mov(2, at);
+        },
+    );
+}
+
 /// The five printf-family symbols that are *bound* but cannot be serviced refuse by name, and the
 /// reason says which missing piece. `Unbound` would have said only "not implemented".
 #[test]
