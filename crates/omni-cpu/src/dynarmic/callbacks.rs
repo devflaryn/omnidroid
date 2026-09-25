@@ -302,14 +302,23 @@ exclusive_cb!(cb_wx16, u16, AtomicU16, 2);
 exclusive_cb!(cb_wx32, u32, AtomicU32, 4);
 exclusive_cb!(cb_wx64, u64, AtomicU64, 8);
 
-/// 128-bit store-exclusive.
+/// 128-bit store-exclusive: `STXP`/`STLXP` of two X registers, as one 16-byte compare-and-swap.
 ///
-/// **Not atomic**, and that is stated rather than hidden: stable Rust has no 128-bit
-/// compare-and-swap, and `CMPXCHG16B` — which D2 guarantees is present — is not reachable without
-/// inline assembly, which Global Constraint 4 keeps out of this crate. The guest sees a
-/// compare-and-swap that is correct single-threaded and racy across guest threads sharing a
-/// 16-byte object. `fastmem_exclusive_access` means the inline path handles the real cases; this is
-/// the fallback, and the gap is recorded in the Task 3 report rather than papered over.
+/// **It was a compare and two plain stores**, stated as a gap: "correct single-threaded and racy
+/// across guest threads sharing a 16-byte object". The race is not a torn value, it is a **lost
+/// update**, and the engine's code is exactly the shape it breaks. `libroblox.so` loads its
+/// tagged-pointer lock-free heads with `LDXP`/`STXP` writing back the value it read (link
+/// `0x2392c30`, `0x24dd730`, `0x4e21aa0`, `0x5360aac`, `0x63557f8`) and swaps them with the
+/// `__aarch64_cas16` fallback loops (`0x4e12340`, `0x535d390`). A write-back that lands after
+/// another thread's pop restores the old head: the node it popped is popped again, and one block
+/// has two owners -- a heap corruption with nothing in any handler to show for it. dynarmic
+/// reaches this callback for an exclusive whose fastmem access faulted once
+/// (`recompile_on_exclusive_fastmem_failure` keeps that instruction here for good), so it is
+/// rare, and the inline path it stands in for is a real `lock cmpxchg16b`. This is now the same.
+///
+/// `CMPXCHG16B` is D2's baseline and is reached through `core::arch`, not inline assembly
+/// (Global Constraint 4). On an arm64 host there is no 128-bit compare-and-swap in `core::arch`,
+/// so that build keeps the compare-and-two-stores and its gap, stated here rather than hidden.
 unsafe extern "C" fn cb_wx128(
     ctx: *mut c_void,
     vaddr: u64,
@@ -319,22 +328,59 @@ unsafe extern "C" fn cb_wx128(
     // SAFETY: `ctx` is this backend's context; both arrays are two readable `u64`.
     unsafe {
         with(ctx, 0, |c| {
-            let (vlo, vhi) = (*value, *value.add(1));
-            let (elo, ehi) = (*expected, *expected.add(1));
+            let new = [*value, *value.add(1)];
+            let old = [*expected, *expected.add(1)];
             let Some(ptr) = c.data_ptr(vaddr, 16, Protection::ReadWrite) else {
                 return 0;
             };
             // SAFETY: `data_ptr` checked all sixteen bytes and that they are writable.
-            let lo = ptr.cast::<u64>().read_unaligned();
-            let hi = ptr.add(8).cast::<u64>().read_unaligned();
-            if lo != elo || hi != ehi {
-                return 0;
-            }
-            ptr.cast::<u64>().write_unaligned(vlo);
-            ptr.add(8).cast::<u64>().write_unaligned(vhi);
-            1
+            i32::from(compare_exchange_16(ptr, old, new))
         })
     }
+}
+
+/// Swap `new` into the sixteen bytes at `ptr` iff they hold `old` (each as `[low, high]`),
+/// atomically with respect to every other atomic access to them. `false` also for a `ptr` that
+/// is not 16-byte aligned: an exclusive pair must be aligned to its whole size, and failing the
+/// store is a legal outcome the guest's retry loop already handles.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads and writes of sixteen bytes.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn compare_exchange_16(ptr: *mut u8, old: [u64; 2], new: [u64; 2]) -> bool {
+    #[target_feature(enable = "cmpxchg16b")]
+    unsafe fn cmpxchg16b(dst: *mut u128, old: u128, new: u128) -> u128 {
+        // SAFETY: the caller's contract, plus the alignment checked below.
+        unsafe { core::arch::x86_64::cmpxchg16b(dst, old, new, Ordering::SeqCst, Ordering::SeqCst) }
+    }
+    if ptr as usize % 16 != 0 {
+        return false;
+    }
+    let old = u128::from(old[0]) | (u128::from(old[1]) << 64);
+    let new = u128::from(new[0]) | (u128::from(new[1]) << 64);
+    // SAFETY: D2 makes CMPXCHG16B part of every host this runs on; `ptr` is valid and aligned.
+    unsafe { cmpxchg16b(ptr.cast::<u128>(), old, new) == old }
+}
+
+/// The arm64-host form: **not atomic** (see [`cb_wx128`]).
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads and writes of sixteen bytes.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn compare_exchange_16(ptr: *mut u8, old: [u64; 2], new: [u64; 2]) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let lo = ptr.cast::<u64>().read_unaligned();
+        let hi = ptr.add(8).cast::<u64>().read_unaligned();
+        if [lo, hi] != old {
+            return false;
+        }
+        ptr.cast::<u64>().write_unaligned(new[0]);
+        ptr.add(8).cast::<u64>().write_unaligned(new[1]);
+    }
+    true
 }
 
 /// 231 of dynarmic's 874 A64 decoder entries are unimplemented (D5) and arrive here.
@@ -653,5 +699,66 @@ mod tests {
         // And they are different instructions, which the address-based dispatch relies on only for
         // clarity — but a typo that made them equal would make every breakpoint a thunk.
         assert_ne!(STOP_SVC, BREAKPOINT_BRK);
+    }
+
+    /// A sixteen-byte word, aligned as an exclusive pair must be.
+    #[repr(C, align(16))]
+    struct Pair([u64; 2]);
+
+    /// **The 128-bit store-exclusive loses no update between threads** -- the property the
+    /// engine's tagged-pointer heads (`LDXP`/`STXP` write-back, `__aarch64_cas16`) rely on.
+    ///
+    /// Four threads each add one to both halves of one pair, 50,000 times, through
+    /// [`compare_exchange_16`] in a read-then-swap retry loop. Every swap that succeeds must have
+    /// been made against the value that was there, so the halves end equal and at exactly
+    /// 200,000. A compare followed by two plain stores -- what this was -- lets two threads both
+    /// succeed from one value, and the count comes up short.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_sixteen_byte_store_exclusive_loses_no_update_between_threads() {
+        const THREADS: u64 = 4;
+        const EACH: u64 = 50_000;
+        let pair = Box::new(Pair([0, 0]));
+        let at = std::ptr::addr_of!(pair.0) as usize;
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(move || {
+                    let ptr = at as *mut u8;
+                    for _ in 0..EACH {
+                        loop {
+                            // SAFETY: `ptr` is the live, aligned pair above; a torn read only
+                            // fails the swap, which retries.
+                            let seen = unsafe {
+                                [
+                                    ptr.cast::<u64>().read_volatile(),
+                                    ptr.add(8).cast::<u64>().read_volatile(),
+                                ]
+                            };
+                            // SAFETY: as above.
+                            if unsafe { compare_exchange_16(ptr, seen, [seen[0] + 1, seen[1] + 1]) } {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(pair.0, [THREADS * EACH; 2], "every successful swap was against the live value");
+    }
+
+    /// A pair that is not 16-byte aligned is a failed store, never a split one.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_misaligned_sixteen_byte_store_exclusive_fails_and_writes_nothing() {
+        let mut words = Pair([0; 2]);
+        let mut bytes = [0u8; 32];
+        let ptr = std::ptr::addr_of_mut!(words.0).cast::<u8>();
+        // SAFETY: `ptr` is valid for sixteen bytes.
+        assert!(unsafe { compare_exchange_16(ptr, [0, 0], [7, 7]) }, "aligned: swapped");
+        assert_eq!(words.0, [7, 7]);
+        let odd = bytes.as_mut_ptr().wrapping_add(if bytes.as_ptr() as usize % 16 == 8 { 0 } else { 8 });
+        // SAFETY: `odd` is inside `bytes` with sixteen bytes after it.
+        assert!(!unsafe { compare_exchange_16(odd, [0, 0], [9, 9]) }, "misaligned: refused");
+        assert_eq!(bytes, [0u8; 32], "and nothing was written");
     }
 }
