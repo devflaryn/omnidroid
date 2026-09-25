@@ -2190,6 +2190,36 @@ pub static DECLARED: &[ClassSpec] = &[
     // `PlatformSystemDialogHandler` above, read from `classes2.dex`: `<clinit>` is `new-instance;
     // invoke-direct <init>()V; sput-object INSTANCE` -- a Kotlin `object`.
     //
+    // **The app-rating prompt (JNI audit)**: Lua's `AppRatingPromptService` reaches
+    // `AndroidAppRatingPromptProtocol` (vtable `0x647c1e8`: `+0x10` `0x3614ec0`, `+0x18`
+    // `0x3614fa0`), which the `AppRatingPromptProtocolCore` subsystem creates unconditionally;
+    // the app shell asks after a game is left. From `classes2.dex`: `isAppRatingPromptAvailable`
+    // is `return true`; `showAppRatingPrompt` logs, then reads the static `WeakReference b`, which
+    // only `onCreate(LifecycleOwner)` fills with the activity -- a lifecycle registration no
+    // scripted statement here makes -- so it is null and the method returns having shown
+    // nothing: the Play in-app review sheet this host could not draw anyway.
+    ClassSpec {
+        name: "com/roblox/universalapp/appratingprompt/AppRatingPromptHandler",
+        tier: Tier::Support,
+        methods: &[
+            s("isAppRatingPromptAvailable", "()Z", Answer::Bool(true)),
+            s("showAppRatingPrompt", "()V", Answer::Sink),
+        ],
+        fields: NONE,
+    },
+    // **`GmaSdkAvailability.isInstalled()Z` (JNI audit)**: `platformIsGmaSdkInstalled`
+    // (`0x2f5dbf8`, the `DefaultNativeAdsProtocol`'s `+0x18`, which `StartupController::
+    // initProtocols` creates) -- the ads eligibility question. The Java is
+    // `Class.forName("com.roblox.client.gmasdk.GmaSdkController")` inside a `runCatching`:
+    // that class is the on-demand `gmasdk` module and is in none of this APK's four dex files
+    // (only its `kotlin_module` marker is), so `ClassNotFoundException` and **false** -- the
+    // answer of every install of this APK without the module, this one included.
+    ClassSpec {
+        name: "com/roblox/client/ads/GmaSdkAvailability",
+        tier: Tier::Support,
+        methods: &[s("isInstalled", "()Z", Answer::Bool(false))],
+        fields: NONE,
+    },
     // **`ExperienceSession.shouldDisableExperienceIdleTimer()Z` (static)**: found by the JNI
     // audit (docs/research/jni-audit-2.739.md), not yet by a death. `nativeActivity_onStop`
     // (`0x2bf27ac`) calls it through `0x2bfb430` whenever the app is stopped inside an

@@ -297,7 +297,7 @@ GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "g
 # APK's dex and check the registry's answer against it (`facial_age_estimation_is_available_...`,
 # `the_idle_timer_question_...`). Dex reads only, so a build and not a run.
 GATE_DEXSHAPE = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
-                 "--no-fail-fast", "the_idle_timer"]
+                 "--no-fail-fast", "--", "the_idle_timer", "dex_shape"]
 
 # `libaaudio.so`: the module's unit tests (in the lib target) and `tests/aaudio.rs`, which drives it
 # from guest code through `dlopen`/`dlsym` and a guest data callback on a guest thread, into a
@@ -9148,6 +9148,24 @@ directory", ADAPTER_FILES,
      """        methods: &[m("<init>", "(J)V", Answer::Construct(&[("nativeRef", "J")]))],""",
      """        methods: &[m("<init>", "(J)V", Answer::NewInstance)],""",
      ANDROID_LIB),
+
+    # The rating prompt: `return true` and a show that acts only through the activity onCreate
+    # stores; the ads SDK: a Class.forName of a module this APK does not carry.
+    ("jniaudit-A5", "A", "isAppRatingPromptAvailable goes back to unanswered, so the app shell's ask kills its thread",
+     JNI_CLASSES,
+     """            s("isAppRatingPromptAvailable", "()Z", Answer::Bool(true)),""",
+     """            s("isAppRatingPromptAvailable", "()Z", Answer::Unanswered),""",
+     GATE_DEXSHAPE),
+    ("jniaudit-B3", "B", "the rating prompt answers unavailable because this host cannot draw it -- the Java says true",
+     JNI_CLASSES,
+     """            s("isAppRatingPromptAvailable", "()Z", Answer::Bool(true)),""",
+     """            s("isAppRatingPromptAvailable", "()Z", Answer::Bool(false)),""",
+     GATE_DEXSHAPE),
+    ("jniaudit-A6", "A", "GmaSdkAvailability.isInstalled answers true for a module no dex carries",
+     JNI_CLASSES,
+     """        methods: &[s("isInstalled", "()Z", Answer::Bool(false))],""",
+     """        methods: &[s("isInstalled", "()Z", Answer::Bool(true))],""",
+     GATE_DEXSHAPE),
 
     # ---- pthread_key values without a shared lock (prefix `tlsfast-`) ---------------------------
     # MEASURED in-world: `pthread_getspecific` at 1.4-1.9 M calls/s on one worker and ~4% of all

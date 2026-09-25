@@ -6392,6 +6392,57 @@ fn the_idle_timer_question_is_the_three_states_this_runtime_never_enters() {
     assert_eq!(registry.member(method).expect("a member").answer, Answer::Bool(false));
 }
 
+/// **The rating prompt and the ads-SDK question answer as the APK's own Java does** on a
+/// runtime without the `gmasdk` module and with no activity stored: `isAppRatingPromptAvailable`
+/// is `return true`; `showAppRatingPrompt` acts only through the `WeakReference b` that
+/// `onCreate` fills; `isInstalled` asks `Class.forName` for a class no dex of the APK declares.
+#[test]
+fn dex_shape_the_rating_prompt_and_the_ads_sdk_answer_as_the_apk() {
+    use omni_android::jni::classes::{Answer, Registry};
+    const RATING: &str = "Lcom/roblox/universalapp/appratingprompt/AppRatingPromptHandler;";
+    const GMA: &str = "Lcom/roblox/client/ads/GmaSdkAvailability;";
+    let (dex_name, _, units) = apk_method_code(RATING, "isAppRatingPromptAvailable");
+    assert_eq!(units, [0x1012, 0x000f], "{dex_name}: isAppRatingPromptAvailable is no longer `return true`");
+    let (dex_name, bytes, units) = apk_method_code(RATING, "showAppRatingPrompt");
+    let reads: Vec<(String, String)> = units
+        .windows(2)
+        .filter(|pair| pair[0] & 0xff == 0x62)
+        .filter_map(|pair| dex::field_ref(&bytes, u32::from(pair[1])))
+        .collect();
+    assert!(
+        reads.contains(&(RATING.to_string(), "b".to_string())),
+        "{dex_name}: showAppRatingPrompt no longer acts through the activity onCreate stores: {reads:?}"
+    );
+    let (dex_name, _, units) = apk_method_code(GMA, "isInstalled");
+    let gma = "com.roblox.client.gmasdk.GmaSdkController";
+    let found = dex::only_const_string(
+        &omni_apk::Apk::open(apk_path()).expect("the APK").read_named(&dex_name).expect("the dex"),
+        GMA,
+        "isInstalled",
+    );
+    assert_eq!(found.as_deref(), Some(gma), "{dex_name}: isInstalled asks for another class ({units:04x?})");
+    let apk = omni_apk::Apk::open(apk_path()).expect("the APK");
+    let wanted = format!("L{};", gma.replace('.', "/"));
+    for entry in apk.entries().iter().filter(|entry| entry.name().ends_with(".dex")) {
+        let bytes = apk.read_named(entry.name()).expect("a dex");
+        assert!(
+            !bytes.windows(wanted.len()).any(|window| window == wanted.as_bytes()),
+            "{} names {wanted}: the gmasdk module is in this APK, so isInstalled is not false",
+            entry.name()
+        );
+    }
+
+    let registry = Registry::with_declared();
+    let answer = |class: &str, name: &str, descriptor: &str| {
+        let id = registry.find(&class[1..class.len() - 1]).expect("declared");
+        let method = registry.method(id, name, descriptor, true).expect("declared");
+        registry.member(method).expect("a member").answer
+    };
+    assert_eq!(answer(RATING, "isAppRatingPromptAvailable", "()Z"), Answer::Bool(true));
+    assert_eq!(answer(RATING, "showAppRatingPrompt", "()V"), Answer::Sink);
+    assert_eq!(answer(GMA, "isInstalled", "()Z"), Answer::Bool(false));
+}
+
 /// §8 row 23's three lookups all resolve from the **one** `jclass` the engine derives from the
 /// activity it was handed, and each resolves at the class that really declares it.
 ///
