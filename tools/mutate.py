@@ -4498,6 +4498,14 @@ directory", ADAPTER_FILES,
      """        if reading.at.elapsed() < MEMORY_READING_TTL {""",
      ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "only_a_slow_memory_reading"]),
 
+    # A sleep that fits in one park refused by a stopping runtime although it finishes on its
+    # own: a guest's 1 ms usleep during teardown was answered with a refusal (2026-09-25).
+    ("stop-A9", "A", "a one-slice sleep is refused by the stop switch instead of carried out",
+     "crates/omni-android/src/bionic/clocks.rs",
+     """        if end.saturating_duration_since(now) <= STOP_SLICE {""",
+     """        if false && end.saturating_duration_since(now) <= STOP_SLICE {""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "ndk", "--no-fail-fast", "looper_idle_a_stopping"]),
+
     # ---- B: the over-corrections -----------------------------------------------------------
 
     # Every JNI slot on the exit path. It reads as safer -- a handler that *may* call guest code

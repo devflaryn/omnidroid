@@ -643,6 +643,19 @@ pub(super) enum Slept {
 /// deadline has arrived has finished, and it reports that whether or not the runtime is stopping.
 /// So a zero-length sleep never reads the switch at all.
 pub(super) fn sleep_until(bionic: &Bionic, deadline: Option<Instant>) -> Slept {
+    // **A sleep that fits in one park is carried out as one host sleep**, whatever the stop
+    // switch says: it ends on its own within a slice, so there is nothing for the switch to cut
+    // short, and it returns the truth (the sleep happened). The switch is read before every park
+    // of a longer one.
+    if let Some(end) = deadline {
+        let now = Instant::now();
+        if end.saturating_duration_since(now) <= STOP_SLICE {
+            if let Some(park) = next_park(deadline, now) {
+                omni_platform::clock::sleep(park);
+            }
+            return Slept::Elapsed;
+        }
+    }
     loop {
         let Some(park) = next_park(deadline, Instant::now()) else {
             return Slept::Elapsed;
