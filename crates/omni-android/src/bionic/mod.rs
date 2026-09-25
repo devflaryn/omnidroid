@@ -1769,11 +1769,6 @@ impl Bionic {
         &self.threads
     }
 
-    /// The guest address space, so a thread can give its stack back.
-    pub(crate) fn space_ref(&self) -> &Arc<GuestSpace> {
-        &self.space
-    }
-
     /// Publish this instance to the calling thread **on a slot that was reserved for it**.
     ///
     /// The half of [`activate`](Bionic::activate) a created guest thread uses: its identity and
@@ -2032,6 +2027,7 @@ impl Bionic {
                 detached,
                 handle: None,
                 start_routine,
+                stack: None,
             },
         );
     }
@@ -2062,17 +2058,66 @@ impl Bionic {
     ///
     /// A **detached** thread is removed here instead: nobody will join it, so keeping the record
     /// would be a leak a guest could drive in a loop.
-    pub(crate) fn finish_guest_thread(&self, id: GuestThreadId, state: GuestThreadState) {
-        {
+    ///
+    /// `stack` is the mapping of a thread that returned. What comes back is the range the caller
+    /// must give back **now** -- a detached thread's, as bionic's `pthread_exit` unmaps it -- or
+    /// `None` when it was parked on the record for the `pthread_join` that reaps it.
+    pub(crate) fn finish_guest_thread(
+        &self,
+        id: GuestThreadId,
+        state: GuestThreadState,
+        stack: Option<(GuestAddr, usize)>,
+    ) -> Option<(GuestAddr, usize)> {
+        let now = {
             let mut guard = self.guest_threads.lock();
             let detached = guard.records.get(&id).is_some_and(|record| record.detached);
             if detached {
                 guard.records.remove(&id);
+                stack
             } else if let Some(record) = guard.records.get_mut(&id) {
                 record.state = state;
+                record.stack = stack;
+                None
+            } else {
+                stack
             }
-        }
+        };
         self.threads_done.notify_all();
+        now
+    }
+
+    /// Unmap a finished thread's stack, recording a failure rather than swallowing one.
+    ///
+    /// **Recorded rather than swallowed.** A stack that cannot be given back leaks its address
+    /// space and its commit charge for the life of the instance, and the thread that leaked it is
+    /// the only thing that knows. It does not change how the thread ended, so it is reported
+    /// beside the outcome rather than instead of it.
+    pub(crate) fn give_back_stack(
+        &self,
+        id: GuestThreadId,
+        start_routine: GuestAddr,
+        (base, len): (GuestAddr, usize),
+    ) {
+        if let Err(error) = self.space.unmap(base, len) {
+            self.record_thread_failure(GuestThreadFailure {
+                thread: id.0,
+                start_routine,
+                why: format!(
+                    "the guest thread's stack at {base:#x} ({len} bytes) could not be unmapped, \
+                     so its address space and commit charge are leaked for the life of this \
+                     instance: {error}"
+                ),
+                stack: Vec::new(),
+                context: threads::DeathContext::default(),
+            });
+        }
+    }
+
+    /// Whether a finished, not yet joined thread still holds its stack: the mapping bionic keeps
+    /// for `pthread_join`. For a test that has to see the range stay mapped until the join.
+    #[must_use]
+    pub fn joinable_stack(&self, thread: u64) -> Option<(GuestAddr, usize)> {
+        self.guest_threads.lock().records.get(&GuestThreadId(thread)).and_then(|record| record.stack)
     }
 
     /// `pthread_join`'s whole decision, under one lock.
@@ -2130,11 +2175,16 @@ impl Bionic {
         let handle = record.handle;
         let state = record.state;
         let start_routine = record.start_routine;
+        let stack = record.stack;
         drop(guard);
         // Reap the host thread. It has already recorded its state, so this returns as soon as it
         // finishes unwinding its own frame.
         if let Some(handle) = handle {
             let _ = handle.join();
+        }
+        // bionic's `pthread_join` frees the joinable thread's mapping here, not its exit.
+        if let Some(stack) = stack {
+            self.give_back_stack(target, start_routine, stack);
         }
         match state {
             GuestThreadState::Returned(value) => Ok(JoinOutcome::Returned(value)),
@@ -2179,6 +2229,10 @@ impl Bionic {
             drop(guard);
             if let Some(handle) = record.handle {
                 let _ = handle.join();
+            }
+            // Nobody will join it now, so its kept stack goes with the record.
+            if let Some(stack) = record.stack {
+                self.give_back_stack(id, record.start_routine, stack);
             }
             return 0;
         }

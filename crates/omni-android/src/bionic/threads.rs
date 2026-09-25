@@ -365,6 +365,14 @@ pub(super) struct ThreadRecord {
     pub(super) handle: Option<std::thread::JoinHandle<()>>,
     /// The start routine, for a diagnostic that has to say which thread.
     pub(super) start_routine: GuestAddr,
+    /// The stack of a **joinable** thread that has returned: `(base, len)` of the whole mapping,
+    /// guard included, given back by the `pthread_join` (or late `pthread_detach`) that reaps it.
+    ///
+    /// bionic's `pthread_exit` unmaps a thread's stack itself only when the thread is detached;
+    /// a joinable thread's mapping "is left for the pthread_join caller to clean up". Unmapping it
+    /// at exit instead let the next `mmap` -- the engine's allocator taking a segment -- land on
+    /// an address range other threads could still legitimately hold pointers into until the join.
+    pub(super) stack: Option<(GuestAddr, usize)>,
 }
 
 /// Where a running guest thread's stack is, as the call that mapped it measured it.
@@ -987,23 +995,17 @@ fn run_guest_thread(spawn: Spawn) {
     // The mapping goes when the address space does. During teardown, that is the next thing the
     // embedding releases. In a live instance it costs about one stack per thread this layer
     // killed, each of which is already a recorded failure.
+    //
+    // **And a thread that returned gives it back when bionic does, which depends on whether it is
+    // joinable.** bionic's `pthread_exit` unmaps the stack itself only for a *detached* thread; a
+    // joinable one's mapping stays until `pthread_join` reaps it. So the range goes to
+    // [`Bionic::finish_guest_thread`], which unmaps it here when the record says detached -- that
+    // decision is taken under the same lock `pthread_detach` takes, so a detach racing this exit
+    // cannot leave the stack with nobody to free it -- and otherwise parks it on the record for
+    // the join. Unmapping every returned stack here was a divergence with a heap-shaped failure:
+    // the engine's allocator maps its segments with `mmap`, which may be handed exactly this
+    // range while a thread that has not yet joined still holds a pointer into it.
     let exited = matches!(state, GuestThreadState::Returned(_)) && !bionic.guest_threads_stopping();
-    let given_back = if exited { bionic.space_ref().unmap(base, len) } else { Ok(()) };
-    // **Recorded rather than swallowed.** A stack that cannot be given back leaks its address
-    // space and its commit charge for the life of the instance, and the thread that leaked it is
-    // the only thing that knows. It does not change how the thread ended -- it returned or it did
-    // not -- so it is reported beside the outcome rather than instead of it.
-    if let Err(error) = given_back {
-        bionic.record_thread_failure(GuestThreadFailure {
-            thread: slot.id.0,
-            start_routine: entry,
-            why: format!(
-                "the guest thread's stack at {base:#x} ({len} bytes) could not be unmapped, so                  its address space and commit charge are leaked for the life of this instance:                  {error}"
-            ),
-            stack: Vec::new(),
-            context: DeathContext::default(),
-        });
-    }
     let _ = bionic.threads_table().detach_current();
     drop(cpu);
 
@@ -1016,7 +1018,10 @@ fn run_guest_thread(spawn: Spawn) {
             context: death.1,
         });
     }
-    bionic.finish_guest_thread(slot.id, state);
+    let stack = exited.then_some((base, len));
+    if let Some(detached) = bionic.finish_guest_thread(slot.id, state, stack) {
+        bionic.give_back_stack(slot.id, entry, detached);
+    }
 }
 
 /// Guest instructions one thread-exit destructor is allowed: counted, for D16's reason, and far

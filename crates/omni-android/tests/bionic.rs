@@ -8326,6 +8326,156 @@ fn a_thread_that_returns_gives_its_stack_back() {
     );
 }
 
+/// Wait until the guest thread whose `pthread_t` is at `out` has an ending recorded.
+fn wait_until_finished(f: &Fixture, out: omni_cpu::GuestAddr) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let thread = f.guest.read_u64(out);
+        if thread != 0
+            && f.bionic
+                .guest_thread_state(thread)
+                .is_some_and(|state| !matches!(state, omni_android::bionic::GuestThreadState::Running))
+        {
+            return thread;
+        }
+        assert!(std::time::Instant::now() < deadline, "the thread never finished");
+        std::thread::yield_now();
+    }
+}
+
+/// **A joinable thread that has returned keeps its stack until `pthread_join` reaps it**, as
+/// bionic's does: its `pthread_exit` unmaps the stack itself only for a *detached* thread, and
+/// leaves a joinable one's mapping "for the pthread_join caller to clean up".
+///
+/// The divergence this pins was heap-shaped. This layer used to unmap every returned thread's
+/// stack at exit, so the very next guest `mmap` -- the engine's allocator taking a segment -- could
+/// be handed that range while the thread was still unjoined, and anything still pointing into the
+/// old stack would then read and write live heap without faulting (the in-world runs w1 and w13
+/// died on heap blocks that read as all ones). Here the thread publishes a record on its stack and
+/// returns; nobody joins it; the range must still be mapped and still hold the record. Then the
+/// join gives it back.
+#[test]
+fn a_joinable_thread_keeps_its_stack_until_the_join() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let published = f.guest.data + 0x900;
+    f.guest.write_u64(out, 0);
+    f.guest.write_u64(published, 0);
+    const RECORD: u64 = 0x10c0_0000_0000_101e;
+    let start = start_routine(&f, |asm| {
+        publish_a_record_on_the_stack(asm, published, RECORD);
+        asm.push(add_imm(31, 31, 32));
+        asm.mov(0, 0x101e);
+    });
+    let create = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+    });
+    assert!(matches!(run_program(&f, create).expect("completes"), ExitReason::Returned { .. }));
+    let thread = wait_until_finished(&f, out);
+    assert_eq!(
+        f.bionic.guest_thread_state(thread),
+        Some(omni_android::bionic::GuestThreadState::Returned(0x101e)),
+        "the case under test is a thread that returned and ran its destructors"
+    );
+    let record = published_record(&f, published);
+    assert!(
+        f.guest.space.region_at(record).is_some_and(|r| !r.is_free()),
+        "the unjoined thread's stack at {record:#x} was given back before pthread_join"
+    );
+    assert_eq!(f.guest.read_u64(record), RECORD, "and it still holds what the thread left there");
+    assert!(f.bionic.joinable_stack(thread).is_some(), "the record holds the stack for the join");
+
+    let join = program(&f, |asm| {
+        asm.mov(0, thread);
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 16));
+    });
+    assert!(matches!(run_program(&f, join).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 16), 0, "pthread_join succeeded");
+    assert!(
+        f.guest.space.region_at(record).is_none_or(|r| r.is_free()),
+        "the join must give the stack at {record:#x} back"
+    );
+    assert!(f.bionic.guest_thread_failures().is_empty(), "{:?}", f.bionic.guest_thread_failures());
+}
+
+/// **A joinable thread detached after it returned gives its kept stack back at the detach**, the
+/// other way its record is reaped: nobody can join it any more, so nothing else ever would.
+#[test]
+fn a_finished_thread_detached_late_gives_its_stack_back() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let published = f.guest.data + 0x900;
+    f.guest.write_u64(out, 0);
+    f.guest.write_u64(published, 0);
+    let start = start_routine(&f, |asm| {
+        publish_a_record_on_the_stack(asm, published, 0x10c0_0000_0000_de7a);
+        asm.push(add_imm(31, 31, 32));
+        asm.mov(0, 0);
+    });
+    let create = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+    });
+    assert!(matches!(run_program(&f, create).expect("completes"), ExitReason::Returned { .. }));
+    let thread = wait_until_finished(&f, out);
+    let record = published_record(&f, published);
+    assert!(f.guest.space.region_at(record).is_some_and(|r| !r.is_free()), "kept until reaped");
+
+    let detach = program(&f, |asm| {
+        asm.mov(0, thread);
+        asm.bl(f.thunk("pthread_detach"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 16));
+    });
+    assert!(matches!(run_program(&f, detach).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out + 16), 0, "pthread_detach succeeded");
+    assert!(
+        f.guest.space.region_at(record).is_none_or(|r| r.is_free()),
+        "the late detach must give the stack at {record:#x} back"
+    );
+}
+
+/// **A detached thread gives its stack back at its own exit**, as bionic's `pthread_exit` does
+/// for one: nothing will ever join it. Created detached through its attribute object, so the
+/// record is detached before the thread can run.
+#[test]
+fn a_detached_thread_gives_its_stack_back_when_it_returns() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    let attr = f.guest.data + 0xB00;
+    let published = f.guest.data + 0x900;
+    f.guest.write_u64(out, 0);
+    f.guest.write_u64(published, 0);
+    let start = start_routine(&f, |asm| {
+        publish_a_record_on_the_stack(asm, published, 0x10c0_0000_0000_de7d);
+        asm.push(add_imm(31, 31, 32));
+        asm.mov(0, 0);
+    });
+    let create = program(&f, |asm| {
+        asm.mov(0, attr as u64);
+        asm.bl(f.thunk("pthread_attr_init"));
+        asm.mov(0, attr as u64);
+        asm.mov(1, 1); // PTHREAD_CREATE_DETACHED
+        asm.bl(f.thunk("pthread_attr_setdetachstate"));
+        create_call(&f, asm, out, attr as u64, start, 0);
+    });
+    assert!(matches!(run_program(&f, create).expect("completes"), ExitReason::Returned { .. }));
+    let record = published_record(&f, published);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while f.guest.space.region_at(record).is_some_and(|r| !r.is_free()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached thread's stack at {record:#x} was never given back"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// **A thread's destructors run when it returns, before its joiner is released, in bionic's
 /// order**: the `__cxa_thread_atexit_impl` handler (a C++ `thread_local`'s destructor) first, then
 /// the `pthread_key` destructor, each handed its own value.
