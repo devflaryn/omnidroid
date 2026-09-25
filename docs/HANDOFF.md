@@ -230,6 +230,48 @@ the withheld surface query). None changes behaviour with its switch unset. Teste
 omni-platform; gameactivity's unit tests) and Linux x86-64 in a temporary clone (the census, the
 labels, the report, the pacer); **no session was run**.
 
+## 2026-09-25: the host cursor follows the engine (`jni::cursor`; live check pending)
+
+The owner saw two cursors racing -- the host's and the one Roblox draws, at the game's lower frame
+rate -- and asked that the host cursor follow **the engine's own signals, no button rules**. Decoded
+(2.739.691; `jni::cursor`'s module docs have every address): the app hides the system pointer over
+the engine's surface unconditionally (`RBXSurfaceView.onResolvePointerIcon` -> `TYPE_NULL`); the
+engine draws its own cursor in software (MouseService, `Render/Pass2d/SoftwareCursor`); and it
+holds its cursor still in two states of one word, `[[input + 0xb00] + 0x88]`: **1 `LockCenter`**
+(shift-lock, first person; `vk.e` captures) and **2 `LockCurrentPosition`** (the right-drag camera;
+a device captures nothing there). Built, `OMNI_KEYBOARD_MOUSE` only:
+
+* hidden over the client area while the engine has drawn into its view, on all three hosts
+  (`WM_SETCURSOR`, `XDefineCursor` of a blank cursor, a cursor rect), **only while the window has
+  the focus**;
+* held -- the window's pointer capture: invisible, still, raw motion -- while the lock word is 1 or
+  2 (read from the engine's memory every UI turn) or `vk.e` holds Android's capture; in state 2 the
+  raw motion moves the pointer the Java side reports, so `vk.e.y`'s `dx`/`dy` still turn the camera,
+  unclamped at the view's edge;
+* given back (shown, not held) whenever the window lacks the focus or is minimised, re-taken when
+  the focus returns if the engine still wants it, and at a failed delivery and the session's end.
+
+Logged as `INPUT: host cursor ...` lines (at most one a second) and a `host cursor --` line in the
+end-of-run INPUT summary. **Tested**: the rule's full table and a scripted session (unit), the
+decoder and the lock word's three stored values on the real library, the window seams on Windows
+(gated, 6/6 x3) and Linux (Xvfb, 15/15 x3); **macOS type-checked only** (the Mac was offline).
+
+**The owner's live check** (`omnidroid play`, a place with a free camera):
+1. Hover over the world: **one** cursor, Roblox's; the log says `host cursor hidden -- the engine
+   draws its own over its view`.
+2. Hold the right button and drag: the camera turns, and neither cursor moves; release: the Roblox
+   cursor is where the drag began and moves again (`held -- ... (LockCurrentPosition)`, then
+   `let go`). Drag far, past the window's edge: the camera keeps turning.
+3. Shift-lock (or zoom into first person): the cursor is locked at the centre and the camera follows
+   the mouse (`held`, and `pointer capture requested by vk.e -> the window holds it`); turn it off:
+   the cursor comes back.
+4. Open a menu (Esc, the backpack): Roblox's cursor moves over it; the host's stays hidden.
+5. Alt+Tab away in each of the states above: the desktop cursor is visible and free at once
+   (`shown -- the window lost the focus`); Alt+Tab back: hidden (and held again in shift-lock).
+6. Minimise and restore: the cursor is free while minimised and follows the rule again after.
+7. At the end, the summary's `host cursor --` counts are non-zero and the lock state says where it
+   was read from; `LockCurrentPosition` should count once per right-drag.
+
 ## 2026-09-25: the performance goal in progress -- read this first
 
 Brief: `docs/briefs/goal-performance.md`. Everything below is MEASURED in PS99 (place 8737899170)
@@ -325,9 +367,9 @@ gate passed; the shared code cache plateaued at 245-249 MiB with **0 regions ret
 **w31** (same build) froze at +155 s when the owner clicked the in-game **"unlock chat"** button:
 the engine called `FacialAgeEstimationProtocol.isAvailable()Z`, which is not transcribed, the refusal
 killed the job worker -- item 17 (a faithful transcription plus an audit of every JNI method the
-engine can reach from its menus, in progress). Also in progress at the owner's request: the host
-cursor follows the engine's own pointer signals (hidden while Roblox draws its cursor; captured and
-still while the engine holds it -- no button heuristics).
+engine can reach from its menus, in progress). At the owner's request, the host cursor now follows
+the engine's own pointer signals (hidden while Roblox draws its cursor; captured and still while the
+engine holds it -- no button heuristics): see "the host cursor follows the engine" above.
 
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
