@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 3;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 4;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -557,7 +557,8 @@ pub struct OdCodeCacheStats {
     pub generation: u64,
     /// Regions the buffer is cut into after the prelude.
     pub regions_total: u64,
-    /// Region retirements so far (a region is retired when it is full).
+    /// Region retirements so far: the oldest live region evicted to make room, and full regions a
+    /// clear emptied.
     pub regions_retired: u64,
     /// Retired regions given back to the OS so far.
     pub regions_reclaimed: u64,
@@ -572,6 +573,21 @@ pub struct OdCodeCacheStats {
     pub committed_bytes: u64,
     /// Jits attached now.
     pub attached: u64,
+    /// Patch 0028 (ABI 4): the oldest live region retired to make room for another.
+    pub regions_evicted: u64,
+    /// Blocks those evictions forgot.
+    pub blocks_evicted: u64,
+    /// Blocks emitted again at a location the latest eviction forgot: how much of what it forgot
+    /// was still in use.
+    pub blocks_reemitted: u64,
+    /// Nanoseconds spent evicting, holding the cache's lock.
+    pub evict_ns: u64,
+    /// The longest single eviction, in nanoseconds.
+    pub evict_max_ns: u64,
+    /// Regions whose blocks are live now, the one being filled included.
+    pub regions_live: u64,
+    /// How many may be (`live_bytes` in regions).
+    pub regions_live_max: u64,
 }
 
 /// What one of a shared code cache's per-block tables holds on the C heap (vendored patch 0024),
@@ -674,13 +690,15 @@ extern "C" {
     /// `docs/research/shared-jit-cache.md`). `template_config` is a config as a jit of the space
     /// would pass it: every field that shapes emitted code is taken from it. `total_bytes` is
     /// address space (8 MiB..2 GiB) committed as code is emitted, cut into regions of
-    /// `region_bytes` (at least 8 MiB, at least two). Null on an arm64 host, where the backend has
-    /// no shared cache, and for a refused configuration.
+    /// `region_bytes` (at least 8 MiB, at least two) filled one at a time. At most `live_bytes` of
+    /// regions keep their blocks (0: all but one; at least one region): past that the oldest region
+    /// is retired, its blocks alone forgotten, and given back (vendored patch 0028). Null on an
+    /// arm64 host, where the backend has no shared cache, and for a refused configuration.
     ///
     /// # Safety
     /// `template_config` must be a valid `OdConfig`; its `callbacks` pointer is read during the
     /// call. The cache must be freed with [`od_code_cache_free`] after every jit attached to it.
-    pub fn od_code_cache_new(template_config: *const OdConfig, total_bytes: u64, region_bytes: u64) -> *mut c_void;
+    pub fn od_code_cache_new(template_config: *const OdConfig, total_bytes: u64, region_bytes: u64, live_bytes: u64) -> *mut c_void;
 
     /// Free a cache from [`od_code_cache_new`]. Null is accepted.
     ///

@@ -181,8 +181,16 @@ pub enum ExclusiveMonitor {
 const VALUE_COMPARE_SLOT_STRIDE: u32 = 8;
 
 /// The address space a shared code cache reserves by default: 1 GiB, committed as code is emitted
-/// (D38). Regions are a quarter of it.
+/// (D38). Only [`SHARED_CODE_LIVE_BYTES`] of it holds live code; the rest is room for regions to
+/// move into while a retired one waits to be given back.
 pub const SHARED_CODE_CACHE_BYTES: u64 = 1 << 30;
+/// A shared cache's region: the unit it fills, and retires oldest first (vendored patch 0028, D38
+/// amendment 3). Small, so that a retirement forgets little and is quick.
+pub const SHARED_CODE_REGION_BYTES: u64 = 16 << 20;
+/// The code a shared cache keeps live by default: past it, the oldest region is retired and its
+/// blocks translated again if they are still run. A game world emits ~245 MiB in its first minutes,
+/// mostly run once (w27-w30); D38 amendment 3.
+pub const SHARED_CODE_LIVE_BYTES: u64 = 128 << 20;
 /// The smallest shared cache `OMNI_JIT_SHARED_CACHE_MB` may ask for: two 8 MiB regions and the
 /// prelude.
 pub const SHARED_CODE_CACHE_MIN_BYTES: u64 = 64 << 20;
@@ -266,6 +274,13 @@ pub struct DynarmicOptions {
     /// Bytes of address space the shared cache reserves, committed as code is emitted.
     /// [`SHARED_CODE_CACHE_BYTES`] by default; `OMNI_JIT_SHARED_CACHE_MB` sets it.
     pub shared_code_cache_bytes: u64,
+    /// The shared cache's region size (at least 8 MiB, at least two regions in the cache).
+    /// [`SHARED_CODE_REGION_BYTES`] by default; `OMNI_JIT_SHARED_CACHE_REGION_MB` sets it.
+    pub shared_code_region_bytes: u64,
+    /// The code the shared cache keeps live, rounded down to whole regions (at least one; at most
+    /// all but one). [`SHARED_CODE_LIVE_BYTES`] by default; `OMNI_JIT_SHARED_CACHE_LIVE_MB` sets
+    /// it. Committed code stays within this and a region (the one retired, until it is given back).
+    pub shared_code_live_bytes: u64,
 }
 
 impl Default for DynarmicOptions {
@@ -292,6 +307,8 @@ impl Default for DynarmicOptions {
             // `OMNI_JIT_SHARED_CACHE=0` is the way back, announced.
             shared_code_cache: cfg!(target_arch = "x86_64"),
             shared_code_cache_bytes: SHARED_CODE_CACHE_BYTES,
+            shared_code_region_bytes: SHARED_CODE_REGION_BYTES,
+            shared_code_live_bytes: SHARED_CODE_LIVE_BYTES,
         }
     }
 }
@@ -417,6 +434,31 @@ impl DynarmicOptions {
             );
             self.shared_code_cache_bytes = bytes;
             say(&format!("a {mb} MiB shared code cache (OMNI_JIT_SHARED_CACHE_MB)"));
+        }
+        let mib = |name: &str, value: &str| -> u64 {
+            value
+                .trim()
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("{name}={value:?} is not a number of MiB"))
+                << 20
+        };
+        if let Ok(value) = std::env::var("OMNI_JIT_SHARED_CACHE_REGION_MB") {
+            let bytes = mib("OMNI_JIT_SHARED_CACHE_REGION_MB", &value);
+            assert!(
+                bytes >= 8 << 20 && bytes.saturating_mul(3) <= self.shared_code_cache_bytes,
+                "OMNI_JIT_SHARED_CACHE_REGION_MB={value} must be at least 8 and leave the cache room for three"
+            );
+            self.shared_code_region_bytes = bytes;
+            say(&format!("{} MiB shared code cache regions (OMNI_JIT_SHARED_CACHE_REGION_MB)", bytes >> 20));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_SHARED_CACHE_LIVE_MB") {
+            let bytes = mib("OMNI_JIT_SHARED_CACHE_LIVE_MB", &value);
+            assert!(bytes > 0, "OMNI_JIT_SHARED_CACHE_LIVE_MB={value} must be more than 0");
+            self.shared_code_live_bytes = bytes;
+            say(&format!(
+                "{} MiB of live code in the shared cache, oldest region retired past it (OMNI_JIT_SHARED_CACHE_LIVE_MB)",
+                bytes >> 20
+            ));
         }
         self
     }
@@ -789,12 +831,16 @@ impl DynarmicBackend {
                 0,
                 Overrides::default(),
             );
-            // Four regions: a retirement forgets every block, so a region must hold the whole
-            // working set with room to spare (D38 amendment 1).
-            let region = options.shared_code_cache_bytes / 4;
+            // D38 amendment 3 (vendored patch 0028): regions are filled one at a time and a full
+            // one stays live; past `shared_code_live_bytes` the oldest is retired, and only its
+            // blocks are translated again. (Before it, a full region forgot every block, so regions
+            // were a quarter of the cache, to hold the whole working set -- amendment 1.)
+            let region = options.shared_code_region_bytes.min(options.shared_code_cache_bytes / 3).max(8 << 20);
             // SAFETY: `template` is a valid config; its pointers are not kept past the call. The
             // cache is freed in `CodeCache::drop`, after every jit on it.
-            let cache = unsafe { od_code_cache_new(&template, options.shared_code_cache_bytes, region) };
+            let cache = unsafe {
+                od_code_cache_new(&template, options.shared_code_cache_bytes, region, options.shared_code_live_bytes)
+            };
             if !cache.is_null() {
                 let (mut address, mut value) = (0u32, 0u32);
                 // SAFETY: two writable `u32`s.
@@ -876,6 +922,11 @@ impl DynarmicBackend {
                     invalidations: s.invalidations,
                     blocks_invalidated: s.blocks_invalidated,
                     regions_retired: s.regions_retired,
+                    regions_evicted: s.regions_evicted,
+                    blocks_evicted: s.blocks_evicted,
+                    blocks_reemitted: s.blocks_reemitted,
+                    evict_max_ns: s.evict_max_ns,
+                    regions_live: s.regions_live,
                     regions_reclaimed: s.regions_reclaimed,
                     regions_pinned: s.regions_pinned,
                     parked_redirected: s.parked_redirected,

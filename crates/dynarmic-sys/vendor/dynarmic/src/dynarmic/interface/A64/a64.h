@@ -144,8 +144,12 @@ private:
  * failure flags are forced off: a shared block is never recompiled from inside a fault handler.
  *
  * `total_bytes` is address space, committed as code is emitted; after the prelude it is divided
- * into regions of `region_bytes`. A full region is retired and its memory given back once no
- * thread can still be executing it (every attached Jit has left or re-entered Run since).
+ * into regions of `region_bytes`, filled one at a time. Patch 0028: a full region stays live -- its
+ * blocks are still run and linked to -- and the next free one is filled. At most `live_bytes` of
+ * regions are live (0: all but one); when filling another would exceed that, the oldest live region
+ * is retired: its blocks alone are forgotten (a thread that needs one translates it again, into the
+ * newest region), and its memory is given back once no thread can still be executing it (every
+ * attached Jit has left or re-entered Run since). A retirement forgets at most one region's blocks.
  *
  * Translation is serialized by one lock; execution takes none. Invalidation (a Jit's
  * InvalidateCacheRange/ClearCache, or the calls below) applies to every Jit: each stops using a
@@ -153,7 +157,7 @@ private:
  */
 class SharedCodeCache final {
 public:
-    SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes);
+    SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes, std::size_t live_bytes = 0);
     ~SharedCodeCache();
 
     SharedCodeCache(const SharedCodeCache&) = delete;
@@ -171,7 +175,14 @@ public:
         std::uint64_t blocks_invalidated = 0;    ///< blocks those requests dropped
         std::uint64_t generation = 0;            ///< bumped by every request that dropped a block
         std::uint64_t regions_total = 0;
-        std::uint64_t regions_retired = 0;       ///< region retirements so far
+        std::uint64_t regions_retired = 0;       ///< region retirements so far (evictions, and full regions a ClearCache emptied)
+        std::uint64_t regions_evicted = 0;       ///< of those, the oldest live region retired to make room (patch 0028)
+        std::uint64_t blocks_evicted = 0;        ///< blocks those evictions forgot
+        std::uint64_t blocks_reemitted = 0;      ///< blocks emitted again at a location the latest eviction forgot
+        std::uint64_t evict_ns = 0;              ///< time spent evicting, holding the lock
+        std::uint64_t evict_max_ns = 0;          ///< the longest single eviction
+        std::uint64_t regions_live = 0;          ///< regions whose blocks are live now (the one being filled included)
+        std::uint64_t regions_live_max = 0;      ///< how many may be
         std::uint64_t regions_reclaimed = 0;     ///< retired regions given back so far
         std::uint64_t regions_pinned = 0;        ///< retired regions a running thread still holds
         std::uint64_t parked_redirected = 0;     ///< threads parked in an SVC whose resume was moved out of a retiring region

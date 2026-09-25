@@ -1,5 +1,6 @@
-"""Hand mutations of vendored patch 0022 (D38), each rebuilt and run against its detector, then
-restored and the file's SHA-1 checked.
+"""Hand mutations of vendored patches 0022 and 0028 (D38), each rebuilt and run against its detector,
+then restored and the file's SHA-1 checked. S1-S13 are 0022's; S14-S19 are 0028's (a full region is
+not a flush; the oldest region is retired, and only its blocks forgotten).
 
 Not rows of `tools/mutate.py`: a row that rebuilds dynarmic leaves the mutated library in the build
 directory for the rows after it (D35). This rebuilds the restored tree at the end instead.
@@ -42,11 +43,11 @@ MUTATIONS = {
         code.mov(result, qword[result]);
     } else if (conf.tpidr_el0) {""", SC + ['--', 'each_jit_reads_its_own_thread_pointer']),
     'S3': ('an invalidated target\'s link slots are not unlinked', EMITBASE,
-           """        const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : link.unlinked;""",
-           """        if (!target_code_ptr) {
-            continue;
-        }
-        const u64 value = reinterpret_cast<u64>(target_code_ptr);""", SC + ['--', 'a_link_to_an_invalidated_block']),
+           """            const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : LinkUnlinkedOf(link);""",
+           """            if (!target_code_ptr) {
+                continue;
+            }
+            const u64 value = reinterpret_cast<u64>(target_code_ptr);""", SC + ['--', 'a_link_to_an_invalidated_block']),
     'S4': ('a translation made outside the lock is published whatever was invalidated meanwhile', IFACE,
            """    const u64 now = invalidation_serial.load(std::memory_order_relaxed);
     if (now == serial) {
@@ -65,7 +66,7 @@ MUTATIONS = {
            """            if (!site_ref.compare_exchange_strong(site, resume, std::memory_order_seq_cst)) {""",
            """            if (true) {""", SC + ['--', 'threads_parked_all_over']),
     'S7': ('retiring a region does not halt the other threads', IFACE,
-           """            if (other != &thread) {
+           """            if (other != thread) {
                 Atomic::Or(&other->jit_state->halt_reason, static_cast<u32>(HaltReason::CacheInvalidation));
             }""",
            """            (void)other;""", SC + ['--', 'a_thread_parked_in_a_callback']),
@@ -100,6 +101,39 @@ MUTATIONS = {
     'S13': ('the dispatcher does not consult the thread table before the lock (every lookup locks)', IFACE,
             """            void* const table = fast_dispatch_table.get();""",
             """            void* const table = nullptr;""", SC + ['--', 'a_thread_finds_what_it_has_looked_up']),
+    'S14': ('a full region forgets every block (0022\'s flush), not the oldest region\'s', IFACE,
+            """    while (LiveRegions() + 1 > live_limit && EvictOldest(thread)) {
+    }""",
+            """    ForgetEverything(thread);""", SC + ['--', 'a_full_region_is_not_a_flush']),
+    'S15': ('the newest full region is evicted, not the oldest', IFACE,
+            """        if (r.state == Region::State::Full && (oldest == nullptr || r.sequence < oldest->sequence)) {""",
+            """        if (r.state == Region::State::Full && (oldest == nullptr || r.sequence > oldest->sequence)) {""",
+            SC + ['--', 'a_full_region_is_not_a_flush']),
+    'S16': ('an eviction forgets a location whose newer translation is in another region', EMIT,
+            """        if (entry < b || entry >= e) {
+            continue;  // invalidated and emitted again into a newer region: that block stays""",
+            """        if (false) {
+            continue;  // invalidated and emitted again into a newer region: that block stays""",
+            SC + ['--', 'a_block_translated_again_elsewhere']),
+    'S17': ('an evicted block\'s incoming links are not undone', EMIT,
+            """        Unpatch(location);
+        ForgetOutgoingSlots(it->second.first_link);
+        block_descriptors.erase(it);
+        forgotten.push_back(location.Value());""",
+            """        ForgetOutgoingSlots(it->second.first_link);
+        block_descriptors.erase(it);
+        forgotten.push_back(location.Value());""", SC + ['--', 'a_block_translated_again_elsewhere']),
+    'S18': ('an eviction drops the guest ranges of the live regions too', IFACE,
+            """    emitter.TrimGuestRanges(end_range);""",
+            """    emitter.TrimGuestRanges(emitter.NextRangeSerial());""", SC + ['--', 'a_block_translated_again_elsewhere']),
+    'S19': ('a clear does not give back the full regions it emptied', IFACE,
+            """    for (Region& r : regions) {
+        if (r.state == Region::State::Full) {
+            Retire(r, thread);
+        }
+    }
+    TryReclaimRetired();""",
+            """    TryReclaimRetired();""", SC + ['--', 'a_full_region_is_not_a_flush']),
 }
 
 

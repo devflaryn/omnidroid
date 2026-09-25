@@ -474,7 +474,7 @@ void od_jit_free(void* p) {
     delete self;
 }
 
-void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, uint64_t region_bytes) {
+void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, uint64_t region_bytes, uint64_t live_bytes) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     if (!config_acceptable(template_config)) {
         return nullptr;
@@ -487,7 +487,8 @@ void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, 
     try {
         self = new OdCodeCache{};
         A64::UserConfig uc = user_config_of(template_config, &self->template_callbacks);
-        self->cache = new A64::SharedCodeCache{uc, static_cast<std::size_t>(total_bytes), static_cast<std::size_t>(region_bytes)};
+        self->cache = new A64::SharedCodeCache{uc, static_cast<std::size_t>(total_bytes), static_cast<std::size_t>(region_bytes),
+                                               static_cast<std::size_t>(live_bytes)};
         return self;
     } catch (...) {
         delete self;
@@ -497,6 +498,7 @@ void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, 
     (void)template_config;
     (void)total_bytes;
     (void)region_bytes;
+    (void)live_bytes;
     return nullptr;
 #endif
 }
@@ -575,6 +577,13 @@ void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
     out->reclaim_attempts = s.reclaim_attempts;
     out->committed_bytes = s.committed_bytes;
     out->attached = s.attached;
+    out->regions_evicted = s.regions_evicted;
+    out->blocks_evicted = s.blocks_evicted;
+    out->blocks_reemitted = s.blocks_reemitted;
+    out->evict_ns = s.evict_ns;
+    out->evict_max_ns = s.evict_max_ns;
+    out->regions_live = s.regions_live;
+    out->regions_live_max = s.regions_live_max;
 #else
     (void)p;
 #endif

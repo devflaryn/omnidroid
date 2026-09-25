@@ -833,13 +833,19 @@ fn report(
         let (a, b) = (&now.jit_cache, &before.jit_cache);
         let d = |x: u64, y: u64| x.saturating_sub(y);
         out.push_str(&format!(
-            "PERF jit cache: +{} blocks (+{} KiB), retired +{} reclaimed +{} (held {}), parked moved +{}, \
+            "PERF jit cache: +{} blocks (+{} KiB), retired +{} reclaimed +{} (held {}), evicted +{} \
+             forgetting +{} blocks, +{} translated again (max {:.1} ms), live {} regions, parked moved +{}, \
              invalidations +{} dropping +{} blocks, locked lookups {:.1} k/s, committed {} MiB\n",
             d(a.blocks_emitted, b.blocks_emitted),
             d(a.code_bytes_emitted, b.code_bytes_emitted) >> 10,
             d(a.regions_retired, b.regions_retired),
             d(a.regions_reclaimed, b.regions_reclaimed),
             a.regions_pinned,
+            d(a.regions_evicted, b.regions_evicted),
+            d(a.blocks_evicted, b.blocks_evicted),
+            d(a.blocks_reemitted, b.blocks_reemitted),
+            a.evict_max_ns as f64 / 1e6,
+            a.regions_live,
             d(a.parked_redirected, b.parked_redirected),
             d(a.invalidations, b.invalidations),
             d(a.blocks_invalidated, b.blocks_invalidated),

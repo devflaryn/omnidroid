@@ -164,6 +164,12 @@ public:
     /// Shared code cache only: store every link slot's unlinked value, so nothing reaches the
     /// blocks the maps are about to forget through a link.
     void UnlinkAllSlots();
+    /// Omnidroid patch 0028, shared code cache only: the serial the next link record will have.
+    u32 NextLinkSerial() const { return link_base + static_cast<u32>(link_records.size()); }
+    /// Drop the records below serial `base`, every one of them dead (its block forgotten): the
+    /// records of a region given back. Records a block whose emission threw left behind are
+    /// forgotten first.
+    void TrimLinkRecords(u32 base);
 
 protected:
     /// Shared code cache only: a link slot the block being emitted references `rip`-relatively
@@ -203,7 +209,14 @@ protected:
         u32 prev;      ///< the previous one, NO_LINK at the head
     };
     static_assert(sizeof(LinkRecord) == 24);
+    /// Omnidroid patch 0028: indexed by serial -- record `i` is `link_records[i - link_base]` --
+    /// so that the records of a region given back, which are the oldest, can be dropped from the
+    /// front without renumbering the rest (every index a record, a block or `link_heads` holds is
+    /// a serial). `LinkAt` is the access.
     std::vector<LinkRecord> link_records;
+    u32 link_base = 0;
+    LinkRecord& LinkAt(u32 serial) { return link_records[serial - link_base]; }
+    const LinkRecord& LinkAt(u32 serial) const { return link_records[serial - link_base]; }
     /// Target location -> the newest record linking to it. A target with no live record has none.
     tsl::robin_map<u64, u32> link_heads;
     /// Read only when a block is emitted or dropped, never on a lookup, so fuller than the maps'

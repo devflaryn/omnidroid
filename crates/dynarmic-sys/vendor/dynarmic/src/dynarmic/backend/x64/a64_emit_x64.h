@@ -67,6 +67,17 @@ public:
     /// guest ranges. The code stays where it is (threads may be running it), and so do its
     /// fastmem records (patch 0025: its region's), which a thread faulting in that code still needs.
     size_t ForgetAllBlocks();
+    /// Omnidroid patch 0028: forget the blocks whose code is in `[begin, end)` -- a region being
+    /// given back, oldest first -- as an invalidation would (their links in and out undone), and
+    /// append their locations to `forgotten`. The candidates are the blocks registered with guest
+    /// range serials `[first_range, end_range)`: the ones emitted while that region was being
+    /// filled. A location emitted again elsewhere since keeps its newer block.
+    size_t ForgetRegionBlocks(const void* begin, const void* end, u32 first_range, u32 end_range, std::vector<u64>& forgotten);
+    /// Patch 0028: the serial of the next guest range registered -- one per emitted block.
+    u32 NextRangeSerial() const { return range_base + static_cast<u32>(guest_ranges.size()); }
+    /// Patch 0028: drop the guest ranges below serial `base` (with their page-index entries):
+    /// every one names a block forgotten with the region it was emitted into.
+    void TrimGuestRanges(u32 base);
     /// Drop the fastmem records of faulting sites in `[begin, end)`: that memory is being given
     /// back and nothing can execute it any more (patch 0025: the region's records, whole).
     void PurgeFastmemPatchInfo(const void* begin, const void* end);
@@ -118,6 +129,11 @@ protected:
     // did before patch 0011. One `GuestRange` per emitted block (24 bytes), indexed by the 4 KiB
     // guest pages it covers; as with the pin's, a range stays until the cache is cleared (or, in a
     // shared cache, until every block is forgotten).
+    //
+    // Patch 0028: every emitted block has one, in emission order -- an empty range too, kept out of
+    // the index -- so a shared cache finds the blocks of a region it gives back among the ranges
+    // registered while it filled that region, and drops those ranges (the oldest) from the front.
+    // Indices are serials: range `i` is `guest_ranges[i - range_base]`.
     struct GuestRange {
         IR::LocationDescriptor location;
         u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
@@ -128,6 +144,8 @@ protected:
     /// invalidation, instead of in every page it covers.
     static constexpr u64 max_indexed_pages = 64;
     std::vector<GuestRange> guest_ranges;
+    u32 range_base = 0;
+    const GuestRange& RangeAt(u32 serial) const { return guest_ranges[serial - range_base]; }
     tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
     std::vector<u32> wide_guest_ranges;
     void AddGuestRange(IR::LocationDescriptor location, u64 first, u64 last);

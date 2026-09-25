@@ -207,7 +207,7 @@ fn every_fastmem_site_of_a_block_in_a_shared_cache_serves_its_own_fault() {
     let monitor = unsafe { od_monitor_new(1) };
     assert!(!monitor.is_null());
     let opts = VmOptions { shared_monitor: monitor as usize, ..identity() };
-    let cache = Vm::new_code_cache(&opts, monitor, std::ptr::null_mut(), TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES);
+    let cache = Vm::new_code_cache(&opts, monitor, std::ptr::null_mut(), TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES, 0);
     assert!(!cache.is_null(), "od_code_cache_new refused the configuration");
     let vm = Vm::new(four_sites_program(), VmOptions { shared_cache: cache as usize, ..opts });
     assert_eq!(vm.code_cache(), cache, "the jit runs from the shared cache");

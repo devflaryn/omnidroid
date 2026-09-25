@@ -117,8 +117,20 @@ pub struct CodeCacheCounters {
     pub invalidations: u64,
     /// Blocks those requests dropped.
     pub blocks_invalidated: u64,
-    /// Regions retired: each forgets every block, which the threads then translate again.
+    /// Regions retired: the oldest live region evicted to make room (its blocks forgotten, and
+    /// translated again if still run), and full regions a clear emptied.
     pub regions_retired: u64,
+    /// Of those, evictions (vendored patch 0028).
+    pub regions_evicted: u64,
+    /// Blocks the evictions forgot.
+    pub blocks_evicted: u64,
+    /// Blocks translated again at a location the latest eviction (of that cache) forgot: what an
+    /// eviction cost in translation.
+    pub blocks_reemitted: u64,
+    /// The longest single eviction, in nanoseconds (the largest over the caches).
+    pub evict_max_ns: u64,
+    /// Regions whose blocks are live now.
+    pub regions_live: u64,
     /// Retired regions given back.
     pub regions_reclaimed: u64,
     /// Retired regions still held by a thread running code it entered before the retirement.
@@ -196,6 +208,11 @@ fn sum_code_caches(tables: bool) -> CodeCacheCounters {
             sum.invalidations += c.invalidations;
             sum.blocks_invalidated += c.blocks_invalidated;
             sum.regions_retired += c.regions_retired;
+            sum.regions_evicted += c.regions_evicted;
+            sum.blocks_evicted += c.blocks_evicted;
+            sum.blocks_reemitted += c.blocks_reemitted;
+            sum.evict_max_ns = sum.evict_max_ns.max(c.evict_max_ns);
+            sum.regions_live += c.regions_live;
             sum.regions_reclaimed += c.regions_reclaimed;
             sum.regions_pinned += c.regions_pinned;
             sum.parked_redirected += c.parked_redirected;

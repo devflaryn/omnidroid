@@ -132,7 +132,7 @@ impl Shared {
             shared_monitor: monitor as usize,
             ..VmOptions::default()
         };
-        let cache = Vm::new_code_cache(&opts, monitor, arena, 256 << 20, 64 << 20);
+        let cache = Vm::new_code_cache(&opts, monitor, arena, 256 << 20, 64 << 20, 0);
         assert!(!cache.is_null(), "od_code_cache_new refused the configuration");
         let vm = Vm::new(code, VmOptions { shared_cache: cache as usize, ..opts });
         Self { vm: Some(vm), cache, monitor }
@@ -410,7 +410,7 @@ fn a_region_given_back_takes_its_fastmem_records_with_it() {
     // SAFETY: freed below, after the jit.
     let monitor = unsafe { od_monitor_new(1) };
     let opts = VmOptions { shared_arena: arena as usize, shared_monitor: monitor as usize, ..VmOptions::default() };
-    let cache = Vm::new_code_cache(&opts, monitor, arena, 40 << 20, 8 << 20);
+    let cache = Vm::new_code_cache(&opts, monitor, arena, 40 << 20, 8 << 20, 0);
     assert!(!cache.is_null());
     let shared = Shared { vm: Some(Vm::new(units(UNITS), VmOptions { shared_cache: cache as usize, ..opts })), cache, monitor };
     for _ in 0..4 {

@@ -1,0 +1,670 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 3e6296f..db7914c 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "dynarmic/backend/x64/a64_emit_x64.h"
+ 
++#include <algorithm>
+ #include <limits>
+ 
+ #include <fmt/format.h>
+@@ -217,12 +218,14 @@ size_t A64EmitX64::ForgetAllBlocks() {
+ }
+ 
+ void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 last) {
++    // Patch 0028: recorded even when empty (a region's blocks are found through their ranges),
++    // but only a range covering bytes is indexed -- and so ever returned, as the pin's were.
++    ASSERT(NextRangeSerial() < std::numeric_limits<u32>::max());
++    const u32 index = NextRangeSerial();
++    guest_ranges.push_back(GuestRange{location, first, last});
+     if (last < first) {
+         return;
+     }
+-    ASSERT(guest_ranges.size() < std::numeric_limits<u32>::max());
+-    const u32 index = static_cast<u32>(guest_ranges.size());
+-    guest_ranges.push_back(GuestRange{location, first, last});
+ 
+     const u64 first_page = first >> guest_page_bits;
+     const u64 last_page = last >> guest_page_bits;
+@@ -244,7 +247,7 @@ tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boo
+         const u64 first = boost::icl::first(interval);
+         const u64 last = boost::icl::last(interval);
+         const auto consider = [&](u32 index) {
+-            const GuestRange& range = guest_ranges[index];
++            const GuestRange& range = RangeAt(index);
+             if (range.first <= last && first <= range.last) {
+                 locations.insert(range.location);
+             }
+@@ -283,10 +286,72 @@ tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boo
+ 
+ void A64EmitX64::ClearGuestRanges() {
+     std::vector<GuestRange>{}.swap(guest_ranges);
++    range_base = 0;  // patch 0028
+     guest_range_pages = {};
+     std::vector<u32>{}.swap(wide_guest_ranges);
+ }
+ 
++size_t A64EmitX64::ForgetRegionBlocks(const void* begin, const void* end, u32 first_range, u32 end_range, std::vector<u64>& forgotten) {
++    ASSERT(shared_code);
++    ASSERT(first_range >= range_base && first_range <= end_range && end_range <= NextRangeSerial());
++    const u8* const b = static_cast<const u8*>(begin);
++    const u8* const e = static_cast<const u8*>(end);
++    code.EnableWriting();
++    SCOPE_EXIT {
++        code.DisableWriting();
++    };
++    size_t dropped = 0;
++    for (u32 serial = first_range; serial != end_range; serial++) {
++        const IR::LocationDescriptor location = RangeAt(serial).location;
++        const auto it = block_descriptors.find(location);
++        if (it == block_descriptors.end()) {
++            continue;  // invalidated since, or listed twice (invalidated and emitted again here)
++        }
++        const u8* const entry = reinterpret_cast<const u8*>(it->second.entrypoint);
++        if (entry < b || entry >= e) {
++            continue;  // invalidated and emitted again into a newer region: that block stays
++        }
++        Unpatch(location);
++        ForgetOutgoingSlots(it->second.first_link);
++        block_descriptors.erase(it);
++        forgotten.push_back(location.Value());
++        dropped++;
++    }
++    return dropped;
++}
++
++void A64EmitX64::TrimGuestRanges(u32 base) {
++    ASSERT(base >= range_base && base <= NextRangeSerial());
++    if (base == range_base) {
++        return;
++    }
++    // Each page's list and the wide list are ascending (appended in emission order since the
++    // ranges were last cleared): what goes is a prefix of each.
++    const auto drop_below = [base](std::vector<u32>& indices) {
++        indices.erase(indices.begin(), std::lower_bound(indices.begin(), indices.end(), base));
++    };
++    for (auto it = guest_range_pages.begin(); it != guest_range_pages.end();) {
++        std::vector<u32>& indices = it.value();
++        if (!indices.empty() && indices.front() < base) {
++            drop_below(indices);
++            if (indices.empty()) {
++                it = guest_range_pages.erase(it);
++                continue;
++            }
++            if (indices.capacity() > 2 * indices.size() + 16) {
++                indices.shrink_to_fit();
++            }
++        }
++        ++it;
++    }
++    drop_below(wide_guest_ranges);
++    guest_ranges.erase(guest_ranges.begin(), guest_ranges.begin() + (base - range_base));
++    range_base = base;
++    if (guest_ranges.capacity() > 2 * guest_ranges.size() + 4096) {
++        guest_ranges.shrink_to_fit();
++    }
++}
++
+ void A64EmitX64::PurgeFastmemPatchInfo(const void* begin, const void* end) {
+     // Patch 0025: a shared cache's sites are records of the region, given back with it.
+     PurgeFastmemSites(begin, end);
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index 601a59a..41e6bfd 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -67,6 +67,17 @@ public:
+     /// guest ranges. The code stays where it is (threads may be running it), and so do its
+     /// fastmem records (patch 0025: its region's), which a thread faulting in that code still needs.
+     size_t ForgetAllBlocks();
++    /// Omnidroid patch 0028: forget the blocks whose code is in `[begin, end)` -- a region being
++    /// given back, oldest first -- as an invalidation would (their links in and out undone), and
++    /// append their locations to `forgotten`. The candidates are the blocks registered with guest
++    /// range serials `[first_range, end_range)`: the ones emitted while that region was being
++    /// filled. A location emitted again elsewhere since keeps its newer block.
++    size_t ForgetRegionBlocks(const void* begin, const void* end, u32 first_range, u32 end_range, std::vector<u64>& forgotten);
++    /// Patch 0028: the serial of the next guest range registered -- one per emitted block.
++    u32 NextRangeSerial() const { return range_base + static_cast<u32>(guest_ranges.size()); }
++    /// Patch 0028: drop the guest ranges below serial `base` (with their page-index entries):
++    /// every one names a block forgotten with the region it was emitted into.
++    void TrimGuestRanges(u32 base);
+     /// Drop the fastmem records of faulting sites in `[begin, end)`: that memory is being given
+     /// back and nothing can execute it any more (patch 0025: the region's records, whole).
+     void PurgeFastmemPatchInfo(const void* begin, const void* end);
+@@ -118,6 +129,11 @@ protected:
+     // did before patch 0011. One `GuestRange` per emitted block (24 bytes), indexed by the 4 KiB
+     // guest pages it covers; as with the pin's, a range stays until the cache is cleared (or, in a
+     // shared cache, until every block is forgotten).
++    //
++    // Patch 0028: every emitted block has one, in emission order -- an empty range too, kept out of
++    // the index -- so a shared cache finds the blocks of a region it gives back among the ranges
++    // registered while it filled that region, and drops those ranges (the oldest) from the front.
++    // Indices are serials: range `i` is `guest_ranges[i - range_base]`.
+     struct GuestRange {
+         IR::LocationDescriptor location;
+         u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
+@@ -128,6 +144,8 @@ protected:
+     /// invalidation, instead of in every page it covers.
+     static constexpr u64 max_indexed_pages = 64;
+     std::vector<GuestRange> guest_ranges;
++    u32 range_base = 0;
++    const GuestRange& RangeAt(u32 serial) const { return guest_ranges[serial - range_base]; }
+     tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
+     std::vector<u32> wide_guest_ranges;
+     void AddGuestRange(IR::LocationDescriptor location, u64 first, u64 last);
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index fb805a8..aad0fb3 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -208,18 +208,27 @@ bool EmitsTheSameCode(const UserConfig& t, const UserConfig& c) {
+ }  // namespace
+ 
+ struct SharedCodeCache::Impl final {
+-    Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes);
++    Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes, size_t live_bytes);
+     ~Impl();
+ 
+     /// A span of the buffer after the prelude, filled from `begin` (blocks and their link slots).
++    /// Patch 0028: Current (being filled) -> Full (still live) -> Retired (its blocks forgotten,
++    /// waiting for no thread to hold it) -> Free.
+     struct Region {
+         u8* begin = nullptr;
+         u8* end = nullptr;
+         u8* code_committed_end = nullptr;
+         enum class State { Free,
+                            Current,
++                           Full,
+                            Retired } state = State::Free;
+         u64 retired_epoch = 0;
++        /// Patch 0028: when it started being filled (live regions are retired in this order), and
++        /// the emitter's link-record and guest-range serials then: the records and ranges of the
++        /// blocks emitted into it run from these to the next live region's.
++        u64 sequence = 0;
++        u32 first_link = 0;
++        u32 first_range = 0;
+     };
+ 
+     const UserConfig conf;
+@@ -233,6 +242,9 @@ struct SharedCodeCache::Impl final {
+     std::vector<Region> regions;
+     static constexpr size_t NO_REGION = std::numeric_limits<size_t>::max();
+     size_t current = NO_REGION;
++    /// Patch 0028: how many regions may be live (Current or Full) at once.
++    size_t live_limit = 0;
++    u64 next_sequence = 0;
+     std::atomic<u64> generation{0};
+     std::atomic<u64> epoch{0};
+     /// Regions retired and not yet given back; when non-zero, a thread leaving Run tries.
+@@ -250,6 +262,16 @@ struct SharedCodeCache::Impl final {
+     u64 blocks_invalidated = 0;
+     u64 regions_retired = 0;
+     u64 regions_reclaimed = 0;
++    // Patch 0028.
++    u64 regions_evicted = 0;
++    u64 blocks_evicted = 0;
++    u64 blocks_reemitted = 0;
++    u64 evict_ns = 0;
++    u64 evict_max_ns = 0;
++    /// The locations the latest eviction forgot, for `blocks_reemitted`: how much of a retired
++    /// region was still in use shows as its blocks being translated again.
++    tsl::robin_set<u64> last_evicted;
++    std::vector<u64> evicted_scratch;
+     u64 translations_redone = 0;
+     u64 parked_redirected = 0;  // parked threads sent to svc_resume_retired
+     u64 reclaim_attempts = 0;
+@@ -298,7 +320,18 @@ struct SharedCodeCache::Impl final {
+ private:
+     void EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held);
+     void StartRegion(size_t index);
+-    void RetireCurrentRegion(SharedThreadState& thread);
++    /// Patch 0028: the current region is full; it stays live, and the oldest live regions are
++    /// retired until starting another keeps within `live_limit`.
++    void FillCurrentRegion(SharedThreadState* thread);
++    /// Patch 0028: forget the blocks of the oldest Full region and retire it. False if none.
++    bool EvictOldest(SharedThreadState* thread);
++    /// Mark `region` retired at a new epoch, and ask every other attached thread to leave
++    /// generated code; `thread`, if given, is the caller's, in the dispatcher.
++    void Retire(Region& region, SharedThreadState* thread);
++    /// Forget every block and retire every Full region (they hold none now): ClearCache, and the
++    /// emitter's serials running out.
++    void ForgetEverything(SharedThreadState* thread);
++    size_t LiveRegions() const;
+     void TryReclaimRetired();
+     bool TryReclaim(Region& region);
+ };
+@@ -717,7 +750,7 @@ private:
+ 
+ // ------------------------------------------------------------------------------------------------
+ 
+-SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes)
++SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes, size_t live_bytes)
+         : conf(SharedTemplate(template_conf, total_bytes))
+         , block_of_code(GenSharedRunCodeCallbacks(conf.callbacks, conf), JitStateInfo{layout}, total_bytes, GenRCP(conf))
+         , emitter(block_of_code, conf, nullptr, true)
+@@ -736,6 +769,10 @@ SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes,
+         region.end = at + region_bytes;
+         regions.push_back(region);
+     }
++    // Patch 0028: all but one region may be live by default -- the spare is what the next region
++    // is started in while the one just retired waits for its last holder.
++    const size_t most = regions.size() - 1;
++    live_limit = live_bytes == 0 ? most : std::clamp<size_t>(live_bytes / region_bytes, 1, most);
+     StartRegion(0);
+ }
+ 
+@@ -870,6 +907,9 @@ CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserC
+     emit_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+     blocks_emitted++;
+     code_bytes_emitted += descriptor.size;
++    if (!last_evicted.empty() && last_evicted.erase(location.Value()) != 0) {
++        blocks_reemitted++;
++    }
+     return descriptor.entrypoint;
+ }
+ 
+@@ -902,22 +942,55 @@ void SharedCodeCache::Impl::Invalidate(bool entire, const boost::icl::interval_s
+     }
+     recent_invalidations.push_back(RecentInvalidation{serial, entire, entire ? boost::icl::interval_set<u64>{} : ranges});
+     invalidation_serial.store(serial, std::memory_order_release);
+-    const size_t dropped = entire ? emitter.ForgetAllBlocks() : emitter.InvalidateCacheRangesCounted(ranges);
++    if (entire) {
++        ForgetEverything(nullptr);
++        return;
++    }
++    const size_t dropped = emitter.InvalidateCacheRangesCounted(ranges);
+     if (dropped != 0) {
+         blocks_invalidated += dropped;
+         generation.fetch_add(1, std::memory_order_seq_cst);
+     }
+ }
+ 
++void SharedCodeCache::Impl::ForgetEverything(SharedThreadState* thread) {
++    blocks_invalidated += emitter.ForgetAllBlocks();
++    generation.fetch_add(1, std::memory_order_seq_cst);
++    last_evicted = {};
++    // Patch 0028: the emitter's serials start again from 0; the region being filled goes on from
++    // there, and the full ones, whose blocks are all forgotten, are given back.
++    if (current != NO_REGION) {
++        regions[current].first_link = 0;
++        regions[current].first_range = 0;
++    }
++    for (Region& r : regions) {
++        if (r.state == Region::State::Full) {
++            Retire(r, thread);
++        }
++    }
++    TryReclaimRetired();
++}
++
+ void SharedCodeCache::Impl::StartRegion(size_t index) {
+     Region& r = regions[index];
+     r.code_committed_end = r.begin;
+     r.state = Region::State::Current;
++    r.sequence = next_sequence++;
++    r.first_link = emitter.NextLinkSerial();    // patch 0028
++    r.first_range = emitter.NextRangeSerial();  // patch 0028
+     current = index;
+     block_of_code.SetCodePtr(r.begin);
+     emitter.BeginFastmemSites(r.begin, r.end);  // patch 0025
+ }
+ 
++size_t SharedCodeCache::Impl::LiveRegions() const {
++    size_t live = 0;
++    for (const Region& r : regions) {
++        live += r.state == Region::State::Current || r.state == Region::State::Full;
++    }
++    return live;
++}
++
+ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held) {
+     for (;;) {
+         if (current != NO_REGION) {
+@@ -931,7 +1004,7 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
+                 }
+                 return;
+             }
+-            RetireCurrentRegion(thread);
++            FillCurrentRegion(&thread);
+         }
+         TryReclaimRetired();
+         for (size_t i = 0; i < regions.size(); i++) {
+@@ -943,10 +1016,20 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
+         if (current != NO_REGION) {
+             continue;
+         }
+-        // Every region is retired and something still holds each one: a thread executing code
+-        // it entered before the retirement. Every attached thread has been asked to halt, and a
+-        // thread outside generated code does not hold a region, so this ends -- but not with the
+-        // lock held, which a running thread may need to reach its halt check.
++        // No region is free: the rest are live, or retired and still held. With nothing retired,
++        // make room by retiring the oldest live one; with something retired, wait for it rather
++        // than retire more.
++        bool any_retired = false;
++        for (const Region& r : regions) {
++            any_retired |= r.state == Region::State::Retired;
++        }
++        if (!any_retired && EvictOldest(&thread)) {
++            continue;
++        }
++        // Every region still retired is held by a thread executing code it entered before the
++        // retirement. Every attached thread has been asked to halt, and a thread outside
++        // generated code does not hold a region, so this ends -- but not with the lock held,
++        // which a running thread may need to reach its halt check.
+         held.unlock();
+         Sync(thread);  // in the dispatcher: holds no region, so it must not pin one while it waits
+         std::this_thread::yield();
+@@ -954,16 +1037,73 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
+     }
+ }
+ 
+-void SharedCodeCache::Impl::RetireCurrentRegion(SharedThreadState& thread) {
+-    Region& r = regions[current];
+-    const size_t dropped = emitter.ForgetAllBlocks();
+-    blocks_invalidated += dropped;
++void SharedCodeCache::Impl::FillCurrentRegion(SharedThreadState* thread) {
++    regions[current].state = Region::State::Full;
++    current = NO_REGION;
++    // The emitter's link and range serials are 32 bits and, with blocks forgotten a region at a
++    // time, never start again by themselves: long before they would run out (some billions of
++    // blocks), they are started again by forgetting every block.
++    constexpr u32 SERIALS_RUNNING_OUT = 0xC000'0000;
++    if (emitter.NextLinkSerial() >= SERIALS_RUNNING_OUT || emitter.NextRangeSerial() >= SERIALS_RUNNING_OUT) {
++        ForgetEverything(thread);
++        return;
++    }
++    // The region about to be started counts as live.
++    while (LiveRegions() + 1 > live_limit && EvictOldest(thread)) {
++    }
++}
++
++bool SharedCodeCache::Impl::EvictOldest(SharedThreadState* thread) {
++    Region* oldest = nullptr;
++    for (Region& r : regions) {
++        if (r.state == Region::State::Full && (oldest == nullptr || r.sequence < oldest->sequence)) {
++            oldest = &r;
++        }
++    }
++    if (oldest == nullptr) {
++        return false;
++    }
++    // Its blocks were emitted -- their records and ranges made -- from its first serials up to the
++    // next live region's (the next oldest, or the current one), or up to now if there is none.
++    const Region* next = nullptr;
++    for (const Region& r : regions) {
++        if ((r.state == Region::State::Full || r.state == Region::State::Current) && r.sequence > oldest->sequence
++            && (next == nullptr || r.sequence < next->sequence)) {
++            next = &r;
++        }
++    }
++    const u32 end_link = next ? next->first_link : emitter.NextLinkSerial();
++    const u32 end_range = next ? next->first_range : emitter.NextRangeSerial();
++
++    const auto t0 = std::chrono::steady_clock::now();
++    evicted_scratch.clear();
++    const size_t dropped = emitter.ForgetRegionBlocks(oldest->begin, oldest->end, oldest->first_range, end_range, evicted_scratch);
++    // Every record and range below the next live region's serials is dead now: the blocks they
++    // named were this region's, an older region's, or invalidated.
++    emitter.TrimLinkRecords(end_link);
++    emitter.TrimGuestRanges(end_range);
++    last_evicted = {};
++    last_evicted.insert(evicted_scratch.begin(), evicted_scratch.end());
++    if (evicted_scratch.capacity() > 2 * evicted_scratch.size() + 4096) {
++        std::vector<u64>{}.swap(evicted_scratch);
++    }
++    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++    evict_ns += ns;
++    evict_max_ns = std::max(evict_max_ns, ns);
++    blocks_evicted += dropped;
++    regions_evicted++;
+     generation.fetch_add(1, std::memory_order_seq_cst);
++    Retire(*oldest, thread);
++    return true;
++}
++
++void SharedCodeCache::Impl::Retire(Region& r, SharedThreadState* thread) {
++    // Its blocks are forgotten and the generation bumped (by the caller) before the epoch, so a
++    // thread that publishes the new epoch then reads a generation that empties its tables.
+     r.retired_epoch = epoch.fetch_add(1, std::memory_order_seq_cst) + 1;
+     r.state = Region::State::Retired;
+     regions_retired++;
+     retired_now.fetch_add(1, std::memory_order_relaxed);
+-    current = NO_REGION;
+ 
+     // Ask every thread to leave generated code, so the region is released sooner -- and so that a
+     // thread parked in a callback leaves through its block's halt test as soon as it returns,
+@@ -971,15 +1111,17 @@ void SharedCodeCache::Impl::RetireCurrentRegion(SharedThreadState& thread) {
+     {
+         std::lock_guard guard{attach_lock};
+         for (SharedThreadState* other : attached) {
+-            if (other != &thread) {
++            if (other != thread) {
+                 Atomic::Or(&other->jit_state->halt_reason, static_cast<u32>(HaltReason::CacheInvalidation));
+             }
+         }
+     }
+ 
+-    // This thread is in the dispatcher's lookup or at Run's entry: its stack holds nothing of the
+-    // region but its RSB and table might, so it catches up now and holds no region any more.
+-    Sync(thread);
++    // A thread in the dispatcher's lookup or at Run's entry: its stack holds nothing of the region
++    // but its RSB and table might, so it catches up now and holds no region any more.
++    if (thread) {
++        Sync(*thread);
++    }
+ }
+ 
+ void SharedCodeCache::Impl::TryReclaimRetired() {
+@@ -1076,6 +1218,13 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
+     s.regions_total = regions.size();
+     s.regions_retired = regions_retired;
+     s.regions_reclaimed = regions_reclaimed;
++    s.regions_evicted = regions_evicted;
++    s.blocks_evicted = blocks_evicted;
++    s.blocks_reemitted = blocks_reemitted;
++    s.evict_ns = evict_ns;
++    s.evict_max_ns = evict_max_ns;
++    s.regions_live = LiveRegions();
++    s.regions_live_max = live_limit;
+     // The prelude's commit, up to where the regions start (Windows; 0 where pages come on first
+     // touch), then each region's code, unless it has been given back.
+     u64 committed = std::min<u64>(block_of_code.PreludeCommittedBytes(),
+@@ -1103,8 +1252,8 @@ SharedCodeCache::Tables SharedCodeCache::Impl::GetTables() const {
+     return emitter.Census();
+ }
+ 
+-SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes)
+-        : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes)) {}
++SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes, std::size_t live_bytes)
++        : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes, live_bytes)) {}
+ 
+ SharedCodeCache::~SharedCodeCache() = default;
+ 
+diff --git a/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/backend/x64/emit_x64.cpp
+index 7900329..682a36b 100644
+--- a/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -379,8 +379,8 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
+         if (head == link_heads.end()) {
+             return;
+         }
+-        for (u32 i = head->second; i != NO_LINK; i = link_records[i].next) {
+-            const LinkRecord& link = link_records[i];
++        for (u32 i = head->second; i != NO_LINK; i = LinkAt(i).next) {
++            const LinkRecord& link = LinkAt(i);
+             const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : LinkUnlinkedOf(link);
+             std::atomic_ref<u64>{*LinkSlotOf(link)}.store(value, std::memory_order_release);
+         }
+@@ -439,9 +439,10 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
+         ASSERT(address >= reinterpret_cast<u64>(base) && offset < LAST_LINK_OF_BLOCK);
+         return static_cast<u32>(offset);
+     };
+-    ASSERT(link_records.size() + pending_slots.size() < NO_LINK);
++    // Patch 0028: serials, which a shared cache that never forgets every block keeps counting.
++    ASSERT(static_cast<u64>(NextLinkSerial()) + pending_slots.size() < NO_LINK);
+     code.align(8);
+-    pending_first_link = static_cast<u32>(link_records.size());
++    pending_first_link = NextLinkSerial();
+     for (PendingSlot& pending : pending_slots) {
+         code.L(*pending.label);
+         u64* const slot = code.getCurr<u64*>();
+@@ -452,13 +453,13 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
+         // block becomes reachable through the block map or another slot, both written after this.
+         *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(iter->second.entrypoint) : unlinked;
+         // Patch 0025: the newest record heads its target's list.
+-        const u32 index = static_cast<u32>(link_records.size());
++        const u32 index = NextLinkSerial();
+         const u64 target = pending.target.Value();
+         LinkRecord record{target, offset_of(reinterpret_cast<u64>(slot)), offset_of(unlinked), NO_LINK, NO_LINK};
+         const auto [head, fresh] = link_heads.try_emplace(target, index);
+         if (!fresh) {
+             record.next = head->second;
+-            link_records[head->second].prev = index;
++            LinkAt(head->second).prev = index;
+             head.value() = index;
+         }
+         link_records.push_back(record);
+@@ -472,19 +473,20 @@ void EmitX64::ForgetOutgoingSlots(u32 first_link) {
+         return;
+     }
+     for (u32 i = first_link;; i++) {
+-        LinkRecord& link = link_records[i];
++        LinkRecord& link = LinkAt(i);
+         // A thread still running the dropped block leaves it for the dispatcher at this link.
+         std::atomic_ref<u64>{*LinkSlotOf(link)}.store(LinkUnlinkedOf(link), std::memory_order_release);
+-        // Out of its target's list; the record itself stays, dead, until the maps are emptied.
++        // Out of its target's list; the record itself stays, dead, until the maps are emptied or
++        // (patch 0028) the records of its region are dropped.
+         if (link.prev != NO_LINK) {
+-            link_records[link.prev].next = link.next;
++            LinkAt(link.prev).next = link.next;
+         } else if (link.next != NO_LINK) {
+             link_heads[link.target] = link.next;
+         } else {
+             link_heads.erase(link.target);
+         }
+         if (link.next != NO_LINK) {
+-            link_records[link.next].prev = link.prev;
++            LinkAt(link.next).prev = link.prev;
+         }
+         link.next = link.prev = NO_LINK;
+         if (link.slot & LAST_LINK_OF_BLOCK) {
+@@ -502,6 +504,34 @@ void EmitX64::UnlinkAllSlots() {
+     }
+ }
+ 
++void EmitX64::TrimLinkRecords(u32 base) {
++    ASSERT(shared_code);
++    if (pending_first_link != NO_LINK) {
++        ForgetOutgoingSlots(std::exchange(pending_first_link, NO_LINK));
++    }
++    ASSERT(base >= link_base && base <= NextLinkSerial());
++    const size_t dropped = base - link_base;
++    if (dropped == 0) {
++        return;
++    }
++#ifndef NDEBUG
++    for (size_t i = 0; i < dropped; i++) {
++        // Dead: out of every target's list (a record at a list's head has no `prev` either, so
++        // the head map is what tells).
++        const LinkRecord& link = link_records[i];
++        ASSERT(link.next == NO_LINK && link.prev == NO_LINK);
++        const auto head = link_heads.find(link.target);
++        ASSERT(head == link_heads.end() || head->second != link_base + i);
++    }
++#endif
++    link_records.erase(link_records.begin(), link_records.begin() + dropped);
++    link_base = base;
++    // Given back once it is mostly empty, not kept at the high-water mark.
++    if (link_records.capacity() > 2 * link_records.size() + 4096) {
++        link_records.shrink_to_fit();
++    }
++}
++
+ void EmitX64::BeginFastmemSites(const void* begin, const void* end) {
+     ASSERT(shared_code);
+     const u8* const b = static_cast<const u8*>(begin);
+@@ -603,6 +633,7 @@ void EmitX64::ClearCache() {
+     // Omnidroid patch 0025: given back, not kept at capacity -- the records of every block the
+     // cache held, which it forgets whole only when a region is retired or the cache cleared.
+     std::vector<LinkRecord>{}.swap(link_records);
++    link_base = 0;  // patch 0028
+     link_heads = {};
+     UseLoadFactor(link_heads, LINK_HEADS_LOAD_FACTOR);
+     pending_first_link = NO_LINK;
+diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
+index 7f2feac..bea1c1a 100644
+--- a/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/backend/x64/emit_x64.h
+@@ -164,6 +164,12 @@ public:
+     /// Shared code cache only: store every link slot's unlinked value, so nothing reaches the
+     /// blocks the maps are about to forget through a link.
+     void UnlinkAllSlots();
++    /// Omnidroid patch 0028, shared code cache only: the serial the next link record will have.
++    u32 NextLinkSerial() const { return link_base + static_cast<u32>(link_records.size()); }
++    /// Drop the records below serial `base`, every one of them dead (its block forgotten): the
++    /// records of a region given back. Records a block whose emission threw left behind are
++    /// forgotten first.
++    void TrimLinkRecords(u32 base);
+ 
+ protected:
+     /// Shared code cache only: a link slot the block being emitted references `rip`-relatively
+@@ -203,7 +209,14 @@ protected:
+         u32 prev;      ///< the previous one, NO_LINK at the head
+     };
+     static_assert(sizeof(LinkRecord) == 24);
++    /// Omnidroid patch 0028: indexed by serial -- record `i` is `link_records[i - link_base]` --
++    /// so that the records of a region given back, which are the oldest, can be dropped from the
++    /// front without renumbering the rest (every index a record, a block or `link_heads` holds is
++    /// a serial). `LinkAt` is the access.
+     std::vector<LinkRecord> link_records;
++    u32 link_base = 0;
++    LinkRecord& LinkAt(u32 serial) { return link_records[serial - link_base]; }
++    const LinkRecord& LinkAt(u32 serial) const { return link_records[serial - link_base]; }
+     /// Target location -> the newest record linking to it. A target with no live record has none.
+     tsl::robin_map<u64, u32> link_heads;
+     /// Read only when a block is emitted or dropped, never on a lookup, so fuller than the maps'
+diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+index 9fbfba3..7f0ebae 100644
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -144,8 +144,12 @@ private:
+  * failure flags are forced off: a shared block is never recompiled from inside a fault handler.
+  *
+  * `total_bytes` is address space, committed as code is emitted; after the prelude it is divided
+- * into regions of `region_bytes`. A full region is retired and its memory given back once no
+- * thread can still be executing it (every attached Jit has left or re-entered Run since).
++ * into regions of `region_bytes`, filled one at a time. Patch 0028: a full region stays live -- its
++ * blocks are still run and linked to -- and the next free one is filled. At most `live_bytes` of
++ * regions are live (0: all but one); when filling another would exceed that, the oldest live region
++ * is retired: its blocks alone are forgotten (a thread that needs one translates it again, into the
++ * newest region), and its memory is given back once no thread can still be executing it (every
++ * attached Jit has left or re-entered Run since). A retirement forgets at most one region's blocks.
+  *
+  * Translation is serialized by one lock; execution takes none. Invalidation (a Jit's
+  * InvalidateCacheRange/ClearCache, or the calls below) applies to every Jit: each stops using a
+@@ -153,7 +157,7 @@ private:
+  */
+ class SharedCodeCache final {
+ public:
+-    SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes);
++    SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes, std::size_t live_bytes = 0);
+     ~SharedCodeCache();
+ 
+     SharedCodeCache(const SharedCodeCache&) = delete;
+@@ -171,7 +175,14 @@ public:
+         std::uint64_t blocks_invalidated = 0;    ///< blocks those requests dropped
+         std::uint64_t generation = 0;            ///< bumped by every request that dropped a block
+         std::uint64_t regions_total = 0;
+-        std::uint64_t regions_retired = 0;       ///< region retirements so far
++        std::uint64_t regions_retired = 0;       ///< region retirements so far (evictions, and full regions a ClearCache emptied)
++        std::uint64_t regions_evicted = 0;       ///< of those, the oldest live region retired to make room (patch 0028)
++        std::uint64_t blocks_evicted = 0;        ///< blocks those evictions forgot
++        std::uint64_t blocks_reemitted = 0;      ///< blocks emitted again at a location the latest eviction forgot
++        std::uint64_t evict_ns = 0;              ///< time spent evicting, holding the lock
++        std::uint64_t evict_max_ns = 0;          ///< the longest single eviction
++        std::uint64_t regions_live = 0;          ///< regions whose blocks are live now (the one being filled included)
++        std::uint64_t regions_live_max = 0;      ///< how many may be
+         std::uint64_t regions_reclaimed = 0;     ///< retired regions given back so far
+         std::uint64_t regions_pinned = 0;        ///< retired regions a running thread still holds
+         std::uint64_t parked_redirected = 0;     ///< threads parked in an SVC whose resume was moved out of a retiring region

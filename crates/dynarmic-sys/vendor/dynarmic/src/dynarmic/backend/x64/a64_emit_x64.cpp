@@ -5,6 +5,7 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <algorithm>
 #include <limits>
 
 #include <fmt/format.h>
@@ -217,12 +218,14 @@ size_t A64EmitX64::ForgetAllBlocks() {
 }
 
 void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 last) {
+    // Patch 0028: recorded even when empty (a region's blocks are found through their ranges),
+    // but only a range covering bytes is indexed -- and so ever returned, as the pin's were.
+    ASSERT(NextRangeSerial() < std::numeric_limits<u32>::max());
+    const u32 index = NextRangeSerial();
+    guest_ranges.push_back(GuestRange{location, first, last});
     if (last < first) {
         return;
     }
-    ASSERT(guest_ranges.size() < std::numeric_limits<u32>::max());
-    const u32 index = static_cast<u32>(guest_ranges.size());
-    guest_ranges.push_back(GuestRange{location, first, last});
 
     const u64 first_page = first >> guest_page_bits;
     const u64 last_page = last >> guest_page_bits;
@@ -244,7 +247,7 @@ tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boo
         const u64 first = boost::icl::first(interval);
         const u64 last = boost::icl::last(interval);
         const auto consider = [&](u32 index) {
-            const GuestRange& range = guest_ranges[index];
+            const GuestRange& range = RangeAt(index);
             if (range.first <= last && first <= range.last) {
                 locations.insert(range.location);
             }
@@ -283,8 +286,70 @@ tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boo
 
 void A64EmitX64::ClearGuestRanges() {
     std::vector<GuestRange>{}.swap(guest_ranges);
+    range_base = 0;  // patch 0028
     guest_range_pages = {};
     std::vector<u32>{}.swap(wide_guest_ranges);
+}
+
+size_t A64EmitX64::ForgetRegionBlocks(const void* begin, const void* end, u32 first_range, u32 end_range, std::vector<u64>& forgotten) {
+    ASSERT(shared_code);
+    ASSERT(first_range >= range_base && first_range <= end_range && end_range <= NextRangeSerial());
+    const u8* const b = static_cast<const u8*>(begin);
+    const u8* const e = static_cast<const u8*>(end);
+    code.EnableWriting();
+    SCOPE_EXIT {
+        code.DisableWriting();
+    };
+    size_t dropped = 0;
+    for (u32 serial = first_range; serial != end_range; serial++) {
+        const IR::LocationDescriptor location = RangeAt(serial).location;
+        const auto it = block_descriptors.find(location);
+        if (it == block_descriptors.end()) {
+            continue;  // invalidated since, or listed twice (invalidated and emitted again here)
+        }
+        const u8* const entry = reinterpret_cast<const u8*>(it->second.entrypoint);
+        if (entry < b || entry >= e) {
+            continue;  // invalidated and emitted again into a newer region: that block stays
+        }
+        Unpatch(location);
+        ForgetOutgoingSlots(it->second.first_link);
+        block_descriptors.erase(it);
+        forgotten.push_back(location.Value());
+        dropped++;
+    }
+    return dropped;
+}
+
+void A64EmitX64::TrimGuestRanges(u32 base) {
+    ASSERT(base >= range_base && base <= NextRangeSerial());
+    if (base == range_base) {
+        return;
+    }
+    // Each page's list and the wide list are ascending (appended in emission order since the
+    // ranges were last cleared): what goes is a prefix of each.
+    const auto drop_below = [base](std::vector<u32>& indices) {
+        indices.erase(indices.begin(), std::lower_bound(indices.begin(), indices.end(), base));
+    };
+    for (auto it = guest_range_pages.begin(); it != guest_range_pages.end();) {
+        std::vector<u32>& indices = it.value();
+        if (!indices.empty() && indices.front() < base) {
+            drop_below(indices);
+            if (indices.empty()) {
+                it = guest_range_pages.erase(it);
+                continue;
+            }
+            if (indices.capacity() > 2 * indices.size() + 16) {
+                indices.shrink_to_fit();
+            }
+        }
+        ++it;
+    }
+    drop_below(wide_guest_ranges);
+    guest_ranges.erase(guest_ranges.begin(), guest_ranges.begin() + (base - range_base));
+    range_base = base;
+    if (guest_ranges.capacity() > 2 * guest_ranges.size() + 4096) {
+        guest_ranges.shrink_to_fit();
+    }
 }
 
 void A64EmitX64::PurgeFastmemPatchInfo(const void* begin, const void* end) {

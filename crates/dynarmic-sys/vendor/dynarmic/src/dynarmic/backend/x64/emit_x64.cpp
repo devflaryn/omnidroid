@@ -379,8 +379,8 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
         if (head == link_heads.end()) {
             return;
         }
-        for (u32 i = head->second; i != NO_LINK; i = link_records[i].next) {
-            const LinkRecord& link = link_records[i];
+        for (u32 i = head->second; i != NO_LINK; i = LinkAt(i).next) {
+            const LinkRecord& link = LinkAt(i);
             const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : LinkUnlinkedOf(link);
             std::atomic_ref<u64>{*LinkSlotOf(link)}.store(value, std::memory_order_release);
         }
@@ -439,9 +439,10 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
         ASSERT(address >= reinterpret_cast<u64>(base) && offset < LAST_LINK_OF_BLOCK);
         return static_cast<u32>(offset);
     };
-    ASSERT(link_records.size() + pending_slots.size() < NO_LINK);
+    // Patch 0028: serials, which a shared cache that never forgets every block keeps counting.
+    ASSERT(static_cast<u64>(NextLinkSerial()) + pending_slots.size() < NO_LINK);
     code.align(8);
-    pending_first_link = static_cast<u32>(link_records.size());
+    pending_first_link = NextLinkSerial();
     for (PendingSlot& pending : pending_slots) {
         code.L(*pending.label);
         u64* const slot = code.getCurr<u64*>();
@@ -452,13 +453,13 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
         // block becomes reachable through the block map or another slot, both written after this.
         *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(iter->second.entrypoint) : unlinked;
         // Patch 0025: the newest record heads its target's list.
-        const u32 index = static_cast<u32>(link_records.size());
+        const u32 index = NextLinkSerial();
         const u64 target = pending.target.Value();
         LinkRecord record{target, offset_of(reinterpret_cast<u64>(slot)), offset_of(unlinked), NO_LINK, NO_LINK};
         const auto [head, fresh] = link_heads.try_emplace(target, index);
         if (!fresh) {
             record.next = head->second;
-            link_records[head->second].prev = index;
+            LinkAt(head->second).prev = index;
             head.value() = index;
         }
         link_records.push_back(record);
@@ -472,19 +473,20 @@ void EmitX64::ForgetOutgoingSlots(u32 first_link) {
         return;
     }
     for (u32 i = first_link;; i++) {
-        LinkRecord& link = link_records[i];
+        LinkRecord& link = LinkAt(i);
         // A thread still running the dropped block leaves it for the dispatcher at this link.
         std::atomic_ref<u64>{*LinkSlotOf(link)}.store(LinkUnlinkedOf(link), std::memory_order_release);
-        // Out of its target's list; the record itself stays, dead, until the maps are emptied.
+        // Out of its target's list; the record itself stays, dead, until the maps are emptied or
+        // (patch 0028) the records of its region are dropped.
         if (link.prev != NO_LINK) {
-            link_records[link.prev].next = link.next;
+            LinkAt(link.prev).next = link.next;
         } else if (link.next != NO_LINK) {
             link_heads[link.target] = link.next;
         } else {
             link_heads.erase(link.target);
         }
         if (link.next != NO_LINK) {
-            link_records[link.next].prev = link.prev;
+            LinkAt(link.next).prev = link.prev;
         }
         link.next = link.prev = NO_LINK;
         if (link.slot & LAST_LINK_OF_BLOCK) {
@@ -499,6 +501,34 @@ void EmitX64::UnlinkAllSlots() {
     // name is given back).
     for (const LinkRecord& link : link_records) {
         std::atomic_ref<u64>{*LinkSlotOf(link)}.store(LinkUnlinkedOf(link), std::memory_order_release);
+    }
+}
+
+void EmitX64::TrimLinkRecords(u32 base) {
+    ASSERT(shared_code);
+    if (pending_first_link != NO_LINK) {
+        ForgetOutgoingSlots(std::exchange(pending_first_link, NO_LINK));
+    }
+    ASSERT(base >= link_base && base <= NextLinkSerial());
+    const size_t dropped = base - link_base;
+    if (dropped == 0) {
+        return;
+    }
+#ifndef NDEBUG
+    for (size_t i = 0; i < dropped; i++) {
+        // Dead: out of every target's list (a record at a list's head has no `prev` either, so
+        // the head map is what tells).
+        const LinkRecord& link = link_records[i];
+        ASSERT(link.next == NO_LINK && link.prev == NO_LINK);
+        const auto head = link_heads.find(link.target);
+        ASSERT(head == link_heads.end() || head->second != link_base + i);
+    }
+#endif
+    link_records.erase(link_records.begin(), link_records.begin() + dropped);
+    link_base = base;
+    // Given back once it is mostly empty, not kept at the high-water mark.
+    if (link_records.capacity() > 2 * link_records.size() + 4096) {
+        link_records.shrink_to_fit();
     }
 }
 
@@ -603,6 +633,7 @@ void EmitX64::ClearCache() {
     // Omnidroid patch 0025: given back, not kept at capacity -- the records of every block the
     // cache held, which it forgets whole only when a region is retired or the cache cleared.
     std::vector<LinkRecord>{}.swap(link_records);
+    link_base = 0;  // patch 0028
     link_heads = {};
     UseLoadFactor(link_heads, LINK_HEADS_LOAD_FACTOR);
     pending_first_link = NO_LINK;

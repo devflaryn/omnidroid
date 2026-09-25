@@ -7,8 +7,10 @@
 //! fast-dispatch table -- is the running thread's and not the translating thread's; that an
 //! invalidation made through one jit reaches every jit by its next run, including through the
 //! return-stack buffer and the fast-dispatch table; that code keeps being right while another
-//! thread rewrites and invalidates it; and that full regions are retired and given back while
-//! threads run -- even while one of them is parked inside a callback.
+//! thread rewrites and invalidates it; that full regions are retired and given back while
+//! threads run -- even while one of them is parked inside a callback; and (patch 0028) that a full
+//! region is not a flush: it stays live, and past the live limit the oldest region alone is
+//! retired, so only what it held is translated again.
 //!
 //! x86-64 only: the arm64 backend has no shared cache (`od_code_cache_new` returns null there).
 #![cfg(target_arch = "x86_64")]
@@ -53,14 +55,21 @@ unsafe impl Send for Space {}
 unsafe impl Sync for Space {}
 
 impl Space {
+    /// A space whose cache keeps one region live: every region that fills is retired (patch 0028's
+    /// oldest-first eviction with nothing older), the cadence most tests here were written for.
     fn new(opts: VmOptions, processors: u64, cache_bytes: u64, region_bytes: u64, code: &[u32]) -> Arc<Self> {
+        Self::with_live(opts, processors, cache_bytes, region_bytes, region_bytes, code)
+    }
+
+    /// A space whose cache keeps `live_bytes` of regions live (0: all but one).
+    fn with_live(opts: VmOptions, processors: u64, cache_bytes: u64, region_bytes: u64, live_bytes: u64, code: &[u32]) -> Arc<Self> {
         let arena: &'static mut [u64] = Box::leak(vec![0u64; (MEM_SIZE + MEM_GUARD) / 8].into_boxed_slice());
         let arena = arena.as_mut_ptr();
         // SAFETY: freed in `Drop`, after every jit using it.
         let monitor = unsafe { od_monitor_new(processors) };
         assert!(!monitor.is_null());
         let opts = VmOptions { shared_arena: arena as usize, shared_monitor: monitor as usize, ..opts };
-        let cache = Vm::new_code_cache(&opts, monitor, arena, cache_bytes, region_bytes);
+        let cache = Vm::new_code_cache(&opts, monitor, arena, cache_bytes, region_bytes, live_bytes);
         assert!(!cache.is_null(), "od_code_cache_new refused the configuration");
         let code = Arc::new(code.iter().map(|&w| AtomicU32::new(w)).collect::<Vec<_>>());
         Arc::new(Self { arena: arena as usize, monitor: monitor as usize, cache: cache as usize, code, opts })
@@ -987,5 +996,337 @@ fn the_cost_of_a_run_on_eight_threads() {
             .collect();
         let ns: Vec<f64> = handles.into_iter().map(|h| h.join().expect("t")).collect();
         println!("shared {shared}: ns per run per thread {ns:.0?}");
+    }
+}
+
+/// The program of the eviction tests: a working set `W` (a chain of `hot` blocks) at `CODE_BASE`,
+/// then `segments` cold chains of `cold` blocks each, every one translated once. Returns the program
+/// and the word index of each cold segment.
+fn working_set_and_cold_code(hot: usize, segments: usize, cold: usize) -> (Vec<u32>, Vec<usize>) {
+    let mut program = chain(hot);
+    let mut at = Vec::with_capacity(segments);
+    for _ in 0..segments {
+        at.push(program.len());
+        program.extend(chain(cold));
+    }
+    (program, at)
+}
+
+/// Run the chain at word `at` on `vm` from the start, and check it counted `blocks`.
+fn run_chain(vm: &Vm, at: usize, blocks: usize) {
+    vm.start(u64::MAX >> 2);
+    vm.set_pc(CODE_BASE + 4 * at as u64);
+    vm.set_reg(0, 0);
+    assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), blocks as u64, "the chain at word {at}");
+}
+
+/// **A full region is not a flush; the oldest region goes first, and only what it held is
+/// translated again** (patch 0028). Before it, a region that filled forgot every block of the cache
+/// and every thread translated its working set again (a 30-minute session in a world would have
+/// done that each time a 256 MiB region filled). A working set `W` is translated first, then cold
+/// code fills region after region, `W` run again after each cold segment:
+///
+/// 1. While regions are free, a fill moves on to the next one and forgets nothing: `W` is never
+///    translated again and nothing is retired (the flush translated all of `W` at the first fill).
+/// 2. At the live limit the oldest region -- the one `W` was translated into -- is retired, and it
+///    alone: at most a region's blocks forgotten, and `W` (all of it was there) translated again,
+///    once, into the newest region; the re-translations counted are `W`'s.
+/// 3. From then on `W` is translated again only when the region it went into has become the oldest,
+///    at most once per `live - 1` fills: cold code, not the working set, is what is evicted.
+/// 4. Committed code stays within the live limit and a region.
+#[test]
+fn a_full_region_is_not_a_flush_and_the_oldest_region_goes_first() {
+    const HOT: usize = 3_000;
+    const COLD: usize = 25_000;
+    const SEGMENTS: usize = 56;
+    const REGION: u64 = 8 << 20;
+    const LIVE: u64 = 4 * REGION;
+    let (program, cold_at) = working_set_and_cold_code(HOT, SEGMENTS, COLD);
+    let space = Space::with_live(VmOptions { cycle_counting: true, ..VmOptions::default() }, 1, 96 << 20, REGION, LIVE, &program);
+    let vm = space.vm(0, true);
+    let start = space.stats();
+    assert_eq!(start.regions_live_max, LIVE / REGION, "{start:?}");
+    assert!(start.regions_total > start.regions_live_max, "{start:?}");
+
+    run_chain(&vm, 0, HOT);
+    let w_blocks = space.stats().blocks_emitted - start.blocks_emitted;
+    assert!(w_blocks as usize >= HOT, "{w_blocks}");
+    let bytes_per_block = (space.stats().code_bytes_emitted / w_blocks).max(1);
+    let blocks_per_region = REGION / bytes_per_block;
+
+    let mut w_translated_again = 0u64; // runs of W that translated anything
+    let mut fills_without_eviction = 0u64;
+    let mut max_committed = 0u64;
+    let mut evictions_seen = 0u64;
+    for (k, &at) in cold_at.iter().enumerate() {
+        let before = space.stats();
+        run_chain(&vm, at, COLD);
+        let mid = space.stats();
+        run_chain(&vm, 0, HOT);
+        let after = space.stats();
+        max_committed = max_committed.max(after.committed_bytes);
+        let w_emitted = after.blocks_emitted - mid.blocks_emitted;
+        let evicted_now = after.regions_evicted - before.regions_evicted;
+        if mid.regions_live > before.regions_live && evicted_now == 0 {
+            fills_without_eviction += 1;
+        }
+        if after.regions_evicted == 0 {
+            // (1) Regions filled with room to spare: nothing forgotten, nothing retired.
+            assert_eq!(w_emitted, 0, "segment {k}: a fill with free regions translated W again: {after:?}");
+            assert_eq!(after.regions_retired, 0, "{after:?}");
+            continue;
+        }
+        if evicted_now > 0 {
+            evictions_seen += evicted_now;
+            // (2) One region's blocks at most.
+            let forgot = after.blocks_evicted - before.blocks_evicted;
+            assert!(
+                forgot <= evicted_now * (blocks_per_region + blocks_per_region / 10),
+                "segment {k}: an eviction forgot {forgot} blocks, a region holds about {blocks_per_region}: {after:?}"
+            );
+        }
+        if w_emitted != 0 {
+            // W is contiguous, in one region: translated again whole, or not at all.
+            assert_eq!(w_emitted, w_blocks, "segment {k}: {after:?}");
+            assert_eq!(
+                after.blocks_reemitted - mid.blocks_reemitted,
+                w_blocks,
+                "segment {k}: counted as blocks the eviction forgot: {after:?}"
+            );
+            w_translated_again += 1;
+        }
+    }
+    let end = space.stats();
+    println!(
+        "W {w_blocks} blocks ({bytes_per_block} B each, ~{blocks_per_region} a region); translated again {w_translated_again} times; \
+         {fills_without_eviction} fills without an eviction; committed at most {} MiB; evict max {} us; {end:?}",
+        max_committed >> 20,
+        end.evict_max_ns / 1000
+    );
+    assert!(fills_without_eviction >= LIVE / REGION - 1, "the first fills moved on without evicting: {end:?}");
+    assert!(end.regions_evicted >= 2 * (LIVE / REGION), "the test evicted region after region: {end:?}");
+    assert_eq!(evictions_seen, end.regions_evicted, "{end:?}");
+    // (3) The flush translated W again at every fill; eviction does it once per `live - 1` fills.
+    assert!(w_translated_again >= 1, "W's region was evicted and W translated again: {end:?}");
+    assert!(
+        w_translated_again <= 1 + end.regions_evicted / (LIVE / REGION - 1),
+        "W translated again {w_translated_again} times over {} evictions: {end:?}",
+        end.regions_evicted
+    );
+    // (4) The live regions, one retired and not yet given back, and the prelude.
+    assert!(max_committed <= LIVE + REGION + (4 << 20), "committed {max_committed}: {end:?}");
+    assert_eq!(end.regions_live, LIVE / REGION, "{end:?}");
+
+    // A clear forgets every block: the full regions, holding none now, are given back at once
+    // (no jit is running), and only the region being filled stays.
+    // SAFETY: the cache is live and its one jit is not executing.
+    unsafe { od_code_cache_clear(space.cache as *mut c_void) };
+    let cleared = space.stats();
+    assert_eq!((cleared.regions_live, cleared.regions_pinned), (1, 0), "{cleared:?}");
+    assert!(cleared.committed_bytes <= REGION + (4 << 20), "{cleared:?}");
+    run_chain(&vm, 0, HOT);
+}
+
+/// **A block translated again elsewhere survives its old region's eviction, and nothing links into
+/// an evicted region** (patch 0028). Block `k` of the working set is rewritten and invalidated after
+/// its region has filled, so its new translation goes into a newer region -- and links to the next
+/// block, still in the old one. Evicting the old region must forget the rest of the working set but
+/// not the new block `k`, and must undo the new block's link into the old region (following it would
+/// run code that is being given back). A range invalidation after the evictions still finds the
+/// working set's blocks through the guest-range index the evictions trimmed.
+#[test]
+fn a_block_translated_again_elsewhere_survives_its_old_region_s_eviction() {
+    const HOT: usize = 2_000;
+    const COLD: usize = 25_000;
+    const SEGMENTS: usize = 40;
+    const REGION: u64 = 8 << 20;
+    const LIVE: u64 = 2 * REGION;
+    const K: usize = 700;
+    let (program, cold_at) = working_set_and_cold_code(HOT, SEGMENTS, COLD);
+    let space = Space::with_live(VmOptions { cycle_counting: true, ..VmOptions::default() }, 1, 64 << 20, REGION, LIVE, &program);
+    let vm = space.vm(0, true);
+    run_chain(&vm, 0, HOT);
+    let w_blocks = space.stats().blocks_emitted;
+
+    // Fill W's region with cold code, so the cache moves on to the next one.
+    let mut next = 0;
+    while space.stats().regions_live < 2 {
+        run_chain(&vm, cold_at[next], COLD);
+        next += 1;
+    }
+    assert_eq!(space.stats().regions_evicted, 0);
+    // Block K counts 2 now; its new translation goes into the region being filled.
+    space.rewrite(2 * K, a64::add_imm(0, 0, 2));
+    space.invalidate(2 * K);
+    let before = space.stats();
+    vm.start(u64::MAX >> 2);
+    vm.set_pc(CODE_BASE);
+    vm.set_reg(0, 0);
+    assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), HOT as u64 + 1);
+    assert_eq!(space.stats().blocks_emitted - before.blocks_emitted, 1, "only block K was translated again");
+
+    // Evict W's old region.
+    while space.stats().regions_evicted == 0 {
+        run_chain(&vm, cold_at[next], COLD);
+        next += 1;
+    }
+    let evicted = space.stats();
+    vm.start(u64::MAX >> 2);
+    vm.set_pc(CODE_BASE);
+    vm.set_reg(0, 0);
+    assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+    let after = space.stats();
+    assert_eq!(vm.reg(0), HOT as u64 + 1, "W ran whole, through block K's link to the old region undone");
+    assert_eq!(
+        after.blocks_emitted - evicted.blocks_emitted,
+        w_blocks - 1,
+        "all of W was translated again but block K, whose newer translation stayed: {after:?}"
+    );
+
+    // More evictions (each trimming the ranges and link records), W run again after each, then an
+    // invalidation of W's last word: the trimmed index still finds that block, and only it.
+    let target = after.regions_evicted + 3;
+    while space.stats().regions_evicted < target {
+        run_chain(&vm, cold_at[next], COLD);
+        next += 1;
+        vm.start(u64::MAX >> 2);
+        vm.set_pc(CODE_BASE);
+        vm.set_reg(0, 0);
+        assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+        assert_eq!(vm.reg(0), HOT as u64 + 1);
+    }
+    let before = space.stats();
+    space.rewrite(2 * (HOT - 1), a64::add_imm(0, 0, 5));
+    space.invalidate(2 * (HOT - 1));
+    vm.start(u64::MAX >> 2);
+    vm.set_pc(CODE_BASE);
+    vm.set_reg(0, 0);
+    assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+    let last = space.stats();
+    assert_eq!(vm.reg(0), HOT as u64 + 1 + 4, "the invalidation reached W's last block: {last:?}");
+    assert_eq!(
+        (last.blocks_invalidated - before.blocks_invalidated, last.blocks_emitted - before.blocks_emitted),
+        (1, 1),
+        "that block, and only it, was dropped and translated again: {last:?}"
+    );
+    println!("{last:?}");
+}
+
+/// **Evictions under running threads.** Four threads run the working set over and over while a
+/// fifth streams cold code through a cache whose live limit it passes many times: every run of the
+/// working set must count right, the working set must be translated again only when its region has
+/// been evicted (not at every fill), and every retired region must be given back.
+#[test]
+fn threads_keep_their_working_set_while_another_streams_cold_code_through_the_cache() {
+    const HOT: usize = 2_000;
+    const COLD: usize = 25_000;
+    const SEGMENTS: usize = 48;
+    const REGION: u64 = 8 << 20;
+    const LIVE: u64 = 3 * REGION;
+    const RUNNERS: u32 = 4;
+    let (program, cold_at) = working_set_and_cold_code(HOT, SEGMENTS, COLD);
+    let space = Space::with_live(
+        VmOptions { cycle_counting: true, ..VmOptions::default() },
+        u64::from(RUNNERS) + 1,
+        64 << 20,
+        REGION,
+        LIVE,
+        &program,
+    );
+    let q = space.vm(RUNNERS, true);
+    run_chain(&q, 0, HOT);
+    let w_blocks = space.stats().blocks_emitted;
+    let stop = Arc::new(AtomicBool::new(false));
+    let runners: Vec<_> = (0..RUNNERS)
+        .map(|i| {
+            let space = Arc::clone(&space);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let vm = space.vm(i, true);
+                let mut runs = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    run_chain(&vm, 0, HOT);
+                    runs += 1;
+                }
+                runs
+            })
+        })
+        .collect();
+    let mut cold_blocks = 0u64;
+    for &at in &cold_at {
+        // Each segment is translated once, by Q (a chain of `COLD` blocks and its `SVC`'s);
+        // whatever else is emitted meanwhile is the working set, translated again.
+        run_chain(&q, at, COLD);
+        cold_blocks += COLD as u64 + 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let runs: Vec<u64> = runners.into_iter().map(|h| h.join().expect("runner")).collect();
+    // The last retirement is given back once every runner has left its run: by a thread leaving a
+    // run (at most every 10 ms) or the next emission.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        run_chain(&q, 0, HOT);
+        if space.stats().regions_pinned == 0 || Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let end = space.stats();
+    let w_again = end.blocks_emitted - w_blocks - cold_blocks;
+    println!("runs {runs:?}, W {w_blocks} blocks translated again {w_again}, {end:?}");
+    assert!(runs.iter().all(|&r| r > 10), "the runners ran throughout: {runs:?}");
+    assert!(end.regions_evicted >= 6, "the cold code passed the live limit many times: {end:?}");
+    // W is translated again when its region is evicted: once per `live - 1` fills at most, plus
+    // the pass that finds it evicted when the test ends. The flush did it at every fill.
+    let bound = w_blocks * (2 + end.regions_evicted / (LIVE / REGION - 1));
+    assert!(w_again <= bound, "W translated again {w_again} blocks, bound {bound}: {end:?}");
+    assert_eq!(end.regions_pinned, 0, "every retired region was given back: {end:?}");
+}
+
+/// Measurement: what an eviction costs, holding the cache's lock, on blocks of the engine's shape
+/// (`LDR ; STR ; B.cond` then `B`, as `shared_bookkeeping.rs` builds them: fastmem sites and link
+/// slots in every block). One thread translates a chain far longer than the live limit, once. Rows:
+/// 16 MiB regions with 128 MiB live (the runtime's default), with 32 MiB live (what depends on the
+/// live size), 8 MiB regions with 128 MiB live, and one 128 MiB region live -- every block of a full
+/// region forgotten at once, as patch 0022's flush did (through the eviction's path, not its own).
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_an_eviction() {
+    const UNITS: usize = 600_000;
+    let mut program = Vec::with_capacity(UNITS * 4 + 1);
+    for _ in 0..UNITS {
+        program.push(a64::ldr_imm(3, 2, 0));
+        program.push(a64::str_imm(3, 2, 8));
+        program.push(a64::b_cond(a64::cond::EQ, 2));
+        program.push(a64::b(1));
+    }
+    program.push(a64::svc(0));
+    let rows = [(16u64 << 20, 128u64 << 20), (16 << 20, 32 << 20), (8 << 20, 128 << 20), (128 << 20, 128 << 20)];
+    for (region, live) in rows {
+        let space = Space::with_live(VmOptions { cycle_counting: true, ..VmOptions::default() }, 1, 512 << 20, region, live, &program);
+        let vm = space.vm(0, true);
+        vm.start(u64::MAX >> 2);
+        vm.set_pc(CODE_BASE);
+        let t = Instant::now();
+        assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+        let wall = t.elapsed();
+        let s = space.stats();
+        println!(
+            "region {} MiB, live {} MiB: {} blocks ({} B each), {} evictions forgetting {} blocks, {:.2} ms each on \
+             average, longest {:.2} ms; emission {:.2} us a block; committed {} MiB; {:.1} s",
+            region >> 20,
+            live >> 20,
+            s.blocks_emitted,
+            s.code_bytes_emitted / s.blocks_emitted.max(1),
+            s.regions_evicted,
+            s.blocks_evicted,
+            s.evict_ns as f64 / s.regions_evicted.max(1) as f64 / 1e6,
+            s.evict_max_ns as f64 / 1e6,
+            s.emit_ns as f64 / s.blocks_emitted.max(1) as f64 / 1e3,
+            s.committed_bytes >> 20,
+            wall.as_secs_f64()
+        );
     }
 }

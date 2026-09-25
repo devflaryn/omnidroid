@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 3u
+#define OD_DYNARMIC_ABI_VERSION 4u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -360,9 +360,13 @@ void od_jit_free(void* jit);
  *
  * `total_bytes` is address space (8 MiB..2 GiB), committed as code is
  * emitted; after the prelude it is cut into regions of `region_bytes`
- * (>= 8 MiB, at least two). The cache must outlive every jit attached to it.
+ * (>= 8 MiB, at least two), filled one at a time. At most `live_bytes` of
+ * regions keep their blocks (0: all regions but one; at least one region);
+ * past that the oldest region is retired -- its blocks alone forgotten, to be
+ * translated again if they are still needed -- and given back (patch 0028).
+ * The cache must outlive every jit attached to it.
  * ------------------------------------------------------------------------ */
-void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, uint64_t region_bytes);
+void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, uint64_t region_bytes, uint64_t live_bytes);
 void od_code_cache_free(void* cache);
 /* As `od_jit_new`, on `cache`. `config->code_cache_size` is ignored. */
 void* od_jit_new_shared(const od_config* config, void* cache);
@@ -381,13 +385,21 @@ typedef struct od_code_cache_stats {
     uint64_t blocks_invalidated;  /* blocks they dropped */
     uint64_t generation;          /* bumped by each request that dropped a block */
     uint64_t regions_total;
-    uint64_t regions_retired;
+    uint64_t regions_retired;     /* evicted, or emptied by a clear */
     uint64_t regions_reclaimed;
     uint64_t regions_pinned;      /* retired and not yet given back */
     uint64_t parked_redirected;   /* parked threads whose resume was moved out of a retiring region */
     uint64_t reclaim_attempts;    /* passes over the retired regions */
     uint64_t committed_bytes;     /* committed now (Windows); what was made available elsewhere */
     uint64_t attached;            /* jits attached now */
+    /* Patch 0028 (ABI 4). */
+    uint64_t regions_evicted;     /* the oldest live region retired to make room */
+    uint64_t blocks_evicted;      /* blocks those evictions forgot */
+    uint64_t blocks_reemitted;    /* blocks emitted again at a location the latest eviction forgot */
+    uint64_t evict_ns;            /* nanoseconds evicting, holding the lock */
+    uint64_t evict_max_ns;        /* the longest single eviction */
+    uint64_t regions_live;        /* regions whose blocks are live now */
+    uint64_t regions_live_max;    /* how many may be */
 } od_code_cache_stats;
 void od_code_cache_stats_of(void* cache, od_code_cache_stats* out);
 

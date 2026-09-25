@@ -743,7 +743,7 @@ impl Vm {
         let own_cache = if opts.shared_cache == 0 && every_vm_on_a_shared_cache() {
             // SAFETY: `cfg` is a valid config; the cache is freed in `Drop` after the jit.
             let cache = unsafe {
-                od_code_cache_new(&cfg, TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES)
+                od_code_cache_new(&cfg, TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES, 0)
             };
             assert!(!cache.is_null(), "od_code_cache_new refused this Vm's configuration");
             cache
@@ -776,13 +776,21 @@ impl Vm {
 
     /// A shared code cache for `Vm`s built with `opts` (plus `shared_cache` set to it): the
     /// template is the configuration such a `Vm` passes, with `monitor` and the arena's address as
-    /// the `Vm`s will have them. Free it with `od_code_cache_free` after every `Vm` on it.
-    pub fn new_code_cache(opts: &VmOptions, monitor: *mut c_void, arena: *mut u64, bytes: u64, region_bytes: u64) -> *mut c_void {
+    /// the `Vm`s will have them. `live_bytes` as `od_code_cache_new` takes it. Free it with
+    /// `od_code_cache_free` after every `Vm` on it.
+    pub fn new_code_cache(
+        opts: &VmOptions,
+        monitor: *mut c_void,
+        arena: *mut u64,
+        bytes: u64,
+        region_bytes: u64,
+        live_bytes: u64,
+    ) -> *mut c_void {
         let mut tpidr = 0u64;
         let tpidrro = 0u64;
         let cfg = config_for(opts, std::ptr::null_mut(), &mut tpidr, &tpidrro, monitor, arena as u64);
         // SAFETY: `cfg` is valid for the call; the template's pointers are not kept.
-        unsafe { od_code_cache_new(&cfg, bytes, region_bytes) }
+        unsafe { od_code_cache_new(&cfg, bytes, region_bytes, live_bytes) }
     }
 
     /// The shared code cache this `Vm` runs from, or null.

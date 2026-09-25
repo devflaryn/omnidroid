@@ -208,18 +208,27 @@ bool EmitsTheSameCode(const UserConfig& t, const UserConfig& c) {
 }  // namespace
 
 struct SharedCodeCache::Impl final {
-    Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes);
+    Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes, size_t live_bytes);
     ~Impl();
 
     /// A span of the buffer after the prelude, filled from `begin` (blocks and their link slots).
+    /// Patch 0028: Current (being filled) -> Full (still live) -> Retired (its blocks forgotten,
+    /// waiting for no thread to hold it) -> Free.
     struct Region {
         u8* begin = nullptr;
         u8* end = nullptr;
         u8* code_committed_end = nullptr;
         enum class State { Free,
                            Current,
+                           Full,
                            Retired } state = State::Free;
         u64 retired_epoch = 0;
+        /// Patch 0028: when it started being filled (live regions are retired in this order), and
+        /// the emitter's link-record and guest-range serials then: the records and ranges of the
+        /// blocks emitted into it run from these to the next live region's.
+        u64 sequence = 0;
+        u32 first_link = 0;
+        u32 first_range = 0;
     };
 
     const UserConfig conf;
@@ -233,6 +242,9 @@ struct SharedCodeCache::Impl final {
     std::vector<Region> regions;
     static constexpr size_t NO_REGION = std::numeric_limits<size_t>::max();
     size_t current = NO_REGION;
+    /// Patch 0028: how many regions may be live (Current or Full) at once.
+    size_t live_limit = 0;
+    u64 next_sequence = 0;
     std::atomic<u64> generation{0};
     std::atomic<u64> epoch{0};
     /// Regions retired and not yet given back; when non-zero, a thread leaving Run tries.
@@ -250,6 +262,16 @@ struct SharedCodeCache::Impl final {
     u64 blocks_invalidated = 0;
     u64 regions_retired = 0;
     u64 regions_reclaimed = 0;
+    // Patch 0028.
+    u64 regions_evicted = 0;
+    u64 blocks_evicted = 0;
+    u64 blocks_reemitted = 0;
+    u64 evict_ns = 0;
+    u64 evict_max_ns = 0;
+    /// The locations the latest eviction forgot, for `blocks_reemitted`: how much of a retired
+    /// region was still in use shows as its blocks being translated again.
+    tsl::robin_set<u64> last_evicted;
+    std::vector<u64> evicted_scratch;
     u64 translations_redone = 0;
     u64 parked_redirected = 0;  // parked threads sent to svc_resume_retired
     u64 reclaim_attempts = 0;
@@ -298,7 +320,18 @@ struct SharedCodeCache::Impl final {
 private:
     void EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held);
     void StartRegion(size_t index);
-    void RetireCurrentRegion(SharedThreadState& thread);
+    /// Patch 0028: the current region is full; it stays live, and the oldest live regions are
+    /// retired until starting another keeps within `live_limit`.
+    void FillCurrentRegion(SharedThreadState* thread);
+    /// Patch 0028: forget the blocks of the oldest Full region and retire it. False if none.
+    bool EvictOldest(SharedThreadState* thread);
+    /// Mark `region` retired at a new epoch, and ask every other attached thread to leave
+    /// generated code; `thread`, if given, is the caller's, in the dispatcher.
+    void Retire(Region& region, SharedThreadState* thread);
+    /// Forget every block and retire every Full region (they hold none now): ClearCache, and the
+    /// emitter's serials running out.
+    void ForgetEverything(SharedThreadState* thread);
+    size_t LiveRegions() const;
     void TryReclaimRetired();
     bool TryReclaim(Region& region);
 };
@@ -717,7 +750,7 @@ private:
 
 // ------------------------------------------------------------------------------------------------
 
-SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes)
+SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes, size_t live_bytes)
         : conf(SharedTemplate(template_conf, total_bytes))
         , block_of_code(GenSharedRunCodeCallbacks(conf.callbacks, conf), JitStateInfo{layout}, total_bytes, GenRCP(conf))
         , emitter(block_of_code, conf, nullptr, true)
@@ -736,6 +769,10 @@ SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes,
         region.end = at + region_bytes;
         regions.push_back(region);
     }
+    // Patch 0028: all but one region may be live by default -- the spare is what the next region
+    // is started in while the one just retired waits for its last holder.
+    const size_t most = regions.size() - 1;
+    live_limit = live_bytes == 0 ? most : std::clamp<size_t>(live_bytes / region_bytes, 1, most);
     StartRegion(0);
 }
 
@@ -870,6 +907,9 @@ CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserC
     emit_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     blocks_emitted++;
     code_bytes_emitted += descriptor.size;
+    if (!last_evicted.empty() && last_evicted.erase(location.Value()) != 0) {
+        blocks_reemitted++;
+    }
     return descriptor.entrypoint;
 }
 
@@ -902,20 +942,53 @@ void SharedCodeCache::Impl::Invalidate(bool entire, const boost::icl::interval_s
     }
     recent_invalidations.push_back(RecentInvalidation{serial, entire, entire ? boost::icl::interval_set<u64>{} : ranges});
     invalidation_serial.store(serial, std::memory_order_release);
-    const size_t dropped = entire ? emitter.ForgetAllBlocks() : emitter.InvalidateCacheRangesCounted(ranges);
+    if (entire) {
+        ForgetEverything(nullptr);
+        return;
+    }
+    const size_t dropped = emitter.InvalidateCacheRangesCounted(ranges);
     if (dropped != 0) {
         blocks_invalidated += dropped;
         generation.fetch_add(1, std::memory_order_seq_cst);
     }
 }
 
+void SharedCodeCache::Impl::ForgetEverything(SharedThreadState* thread) {
+    blocks_invalidated += emitter.ForgetAllBlocks();
+    generation.fetch_add(1, std::memory_order_seq_cst);
+    last_evicted = {};
+    // Patch 0028: the emitter's serials start again from 0; the region being filled goes on from
+    // there, and the full ones, whose blocks are all forgotten, are given back.
+    if (current != NO_REGION) {
+        regions[current].first_link = 0;
+        regions[current].first_range = 0;
+    }
+    for (Region& r : regions) {
+        if (r.state == Region::State::Full) {
+            Retire(r, thread);
+        }
+    }
+    TryReclaimRetired();
+}
+
 void SharedCodeCache::Impl::StartRegion(size_t index) {
     Region& r = regions[index];
     r.code_committed_end = r.begin;
     r.state = Region::State::Current;
+    r.sequence = next_sequence++;
+    r.first_link = emitter.NextLinkSerial();    // patch 0028
+    r.first_range = emitter.NextRangeSerial();  // patch 0028
     current = index;
     block_of_code.SetCodePtr(r.begin);
     emitter.BeginFastmemSites(r.begin, r.end);  // patch 0025
+}
+
+size_t SharedCodeCache::Impl::LiveRegions() const {
+    size_t live = 0;
+    for (const Region& r : regions) {
+        live += r.state == Region::State::Current || r.state == Region::State::Full;
+    }
+    return live;
 }
 
 void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held) {
@@ -931,7 +1004,7 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
                 }
                 return;
             }
-            RetireCurrentRegion(thread);
+            FillCurrentRegion(&thread);
         }
         TryReclaimRetired();
         for (size_t i = 0; i < regions.size(); i++) {
@@ -943,10 +1016,20 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
         if (current != NO_REGION) {
             continue;
         }
-        // Every region is retired and something still holds each one: a thread executing code
-        // it entered before the retirement. Every attached thread has been asked to halt, and a
-        // thread outside generated code does not hold a region, so this ends -- but not with the
-        // lock held, which a running thread may need to reach its halt check.
+        // No region is free: the rest are live, or retired and still held. With nothing retired,
+        // make room by retiring the oldest live one; with something retired, wait for it rather
+        // than retire more.
+        bool any_retired = false;
+        for (const Region& r : regions) {
+            any_retired |= r.state == Region::State::Retired;
+        }
+        if (!any_retired && EvictOldest(&thread)) {
+            continue;
+        }
+        // Every region still retired is held by a thread executing code it entered before the
+        // retirement. Every attached thread has been asked to halt, and a thread outside
+        // generated code does not hold a region, so this ends -- but not with the lock held,
+        // which a running thread may need to reach its halt check.
         held.unlock();
         Sync(thread);  // in the dispatcher: holds no region, so it must not pin one while it waits
         std::this_thread::yield();
@@ -954,16 +1037,73 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
     }
 }
 
-void SharedCodeCache::Impl::RetireCurrentRegion(SharedThreadState& thread) {
-    Region& r = regions[current];
-    const size_t dropped = emitter.ForgetAllBlocks();
-    blocks_invalidated += dropped;
+void SharedCodeCache::Impl::FillCurrentRegion(SharedThreadState* thread) {
+    regions[current].state = Region::State::Full;
+    current = NO_REGION;
+    // The emitter's link and range serials are 32 bits and, with blocks forgotten a region at a
+    // time, never start again by themselves: long before they would run out (some billions of
+    // blocks), they are started again by forgetting every block.
+    constexpr u32 SERIALS_RUNNING_OUT = 0xC000'0000;
+    if (emitter.NextLinkSerial() >= SERIALS_RUNNING_OUT || emitter.NextRangeSerial() >= SERIALS_RUNNING_OUT) {
+        ForgetEverything(thread);
+        return;
+    }
+    // The region about to be started counts as live.
+    while (LiveRegions() + 1 > live_limit && EvictOldest(thread)) {
+    }
+}
+
+bool SharedCodeCache::Impl::EvictOldest(SharedThreadState* thread) {
+    Region* oldest = nullptr;
+    for (Region& r : regions) {
+        if (r.state == Region::State::Full && (oldest == nullptr || r.sequence < oldest->sequence)) {
+            oldest = &r;
+        }
+    }
+    if (oldest == nullptr) {
+        return false;
+    }
+    // Its blocks were emitted -- their records and ranges made -- from its first serials up to the
+    // next live region's (the next oldest, or the current one), or up to now if there is none.
+    const Region* next = nullptr;
+    for (const Region& r : regions) {
+        if ((r.state == Region::State::Full || r.state == Region::State::Current) && r.sequence > oldest->sequence
+            && (next == nullptr || r.sequence < next->sequence)) {
+            next = &r;
+        }
+    }
+    const u32 end_link = next ? next->first_link : emitter.NextLinkSerial();
+    const u32 end_range = next ? next->first_range : emitter.NextRangeSerial();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    evicted_scratch.clear();
+    const size_t dropped = emitter.ForgetRegionBlocks(oldest->begin, oldest->end, oldest->first_range, end_range, evicted_scratch);
+    // Every record and range below the next live region's serials is dead now: the blocks they
+    // named were this region's, an older region's, or invalidated.
+    emitter.TrimLinkRecords(end_link);
+    emitter.TrimGuestRanges(end_range);
+    last_evicted = {};
+    last_evicted.insert(evicted_scratch.begin(), evicted_scratch.end());
+    if (evicted_scratch.capacity() > 2 * evicted_scratch.size() + 4096) {
+        std::vector<u64>{}.swap(evicted_scratch);
+    }
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    evict_ns += ns;
+    evict_max_ns = std::max(evict_max_ns, ns);
+    blocks_evicted += dropped;
+    regions_evicted++;
     generation.fetch_add(1, std::memory_order_seq_cst);
+    Retire(*oldest, thread);
+    return true;
+}
+
+void SharedCodeCache::Impl::Retire(Region& r, SharedThreadState* thread) {
+    // Its blocks are forgotten and the generation bumped (by the caller) before the epoch, so a
+    // thread that publishes the new epoch then reads a generation that empties its tables.
     r.retired_epoch = epoch.fetch_add(1, std::memory_order_seq_cst) + 1;
     r.state = Region::State::Retired;
     regions_retired++;
     retired_now.fetch_add(1, std::memory_order_relaxed);
-    current = NO_REGION;
 
     // Ask every thread to leave generated code, so the region is released sooner -- and so that a
     // thread parked in a callback leaves through its block's halt test as soon as it returns,
@@ -971,15 +1111,17 @@ void SharedCodeCache::Impl::RetireCurrentRegion(SharedThreadState& thread) {
     {
         std::lock_guard guard{attach_lock};
         for (SharedThreadState* other : attached) {
-            if (other != &thread) {
+            if (other != thread) {
                 Atomic::Or(&other->jit_state->halt_reason, static_cast<u32>(HaltReason::CacheInvalidation));
             }
         }
     }
 
-    // This thread is in the dispatcher's lookup or at Run's entry: its stack holds nothing of the
-    // region but its RSB and table might, so it catches up now and holds no region any more.
-    Sync(thread);
+    // A thread in the dispatcher's lookup or at Run's entry: its stack holds nothing of the region
+    // but its RSB and table might, so it catches up now and holds no region any more.
+    if (thread) {
+        Sync(*thread);
+    }
 }
 
 void SharedCodeCache::Impl::TryReclaimRetired() {
@@ -1076,6 +1218,13 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
     s.regions_total = regions.size();
     s.regions_retired = regions_retired;
     s.regions_reclaimed = regions_reclaimed;
+    s.regions_evicted = regions_evicted;
+    s.blocks_evicted = blocks_evicted;
+    s.blocks_reemitted = blocks_reemitted;
+    s.evict_ns = evict_ns;
+    s.evict_max_ns = evict_max_ns;
+    s.regions_live = LiveRegions();
+    s.regions_live_max = live_limit;
     // The prelude's commit, up to where the regions start (Windows; 0 where pages come on first
     // touch), then each region's code, unless it has been given back.
     u64 committed = std::min<u64>(block_of_code.PreludeCommittedBytes(),
@@ -1103,8 +1252,8 @@ SharedCodeCache::Tables SharedCodeCache::Impl::GetTables() const {
     return emitter.Census();
 }
 
-SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes)
-        : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes)) {}
+SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes, std::size_t live_bytes)
+        : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes, live_bytes)) {}
 
 SharedCodeCache::~SharedCodeCache() = default;
 

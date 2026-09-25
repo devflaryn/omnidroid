@@ -16,7 +16,9 @@ alone (built from a clean checkout of `83cfa6e`) **and the identical figure with
 0001 + 0017, with 0001 + 0017 + 0018, with 0001-0020** (2026-09-25) **and with 0001-0022**
 (2026-09-25; the suite runs the per-thread path, which 0022 leaves as it was) **and with 0001-0022
 plus 0024-0027** (2026-09-25; 0026 replaces the per-thread path's guest-range bookkeeping, which the
-suite's invalidation tests exercise; 0023 is on another branch). The older 202,200/123 was a build that also had the A32 frontend;
+suite's invalidation tests exercise; 0023 is on another branch). **Not re-run with 0028**: its one
+change to the per-thread path is that a block covering no guest bytes now has a guest-range record
+(kept out of the page index, so never returned). The older 202,200/123 was a build that also had the A32 frontend;
 it is not comparable and was not re-run.
 
 **On the arm64 backend** (Apple M1, same configuration, AppleClang, Ninja, with
@@ -820,6 +822,70 @@ the noise. (A first try at 0.8 measured the same, 48.6-51.0, and failed `omni-cp
 0025's note.) The cold translation bench beside it (emission writes the tables) is 6.1 us per block
 with 0025-0027 against 7.1 on 0024's maps. Bookkeeping per block (the same file's test): **289 ->
 225 bytes**; the bound is 260.
+
+### 0028 — x64 shared cache: a full region is not a flush; the oldest region is retired, alone
+
+`0028-x64-a-full-region-is-not-a-flush-the-oldest-region-is-retired.patch`. **x64, shared caches
+only** (a Jit's own cache sees one change: a block covering no guest bytes gets a `GuestRange`
+record too, kept out of the page index). D38 amendment 3.
+
+**Before it** a region that filled was retired by forgetting every block of the cache
+(`ForgetAllBlocks`): every thread then translated its whole working set again. The regions were a
+quarter of the cache (256 MiB) so that this would be rare; a game world emits ~245 MiB in its first
+minutes and then ~0.4 MiB a minute (w27-w30's `PERF jit cache:` lines), so a 30-minute session would
+have met it, and every instance kept ~245 MiB of code committed.
+
+**Now** (`A64::SharedCodeCache(template, total, region, live_bytes)`; the shim's
+`od_code_cache_new` takes `live_bytes`, `OD_DYNARMIC_ABI_VERSION` 4):
+
+* A full region becomes **Full**: its blocks stay in the map, linked and run. The next free region
+  is started.
+* At most `live_bytes` of regions are live (Current or Full; 0 = all but one, at least one). Starting
+  another past that **evicts the oldest** (regions carry a sequence number): `ForgetRegionBlocks`
+  walks the guest ranges registered while that region was being filled -- 0026's records, now one per
+  emitted block in emission order, empty ranges included -- and forgets each block whose entry point
+  is in the region, as an invalidation does (incoming links undone through 0025's lists, its own
+  slots unlinked and taken out of theirs). A location emitted again since into a newer region keeps
+  that block. Then the region is retired as before: generation and epoch bumped, every other thread
+  asked to halt, given back when no thread holds it (the parked-thread redirect of 0022 unchanged).
+* Regions are filled and evicted in order, so once the oldest is evicted every link record and guest
+  range older than the next live region's first is dead: `TrimLinkRecords` / `TrimGuestRanges` drop
+  them from the front. Their indices -- in `BlockDescriptor::first_link`, the records' lists,
+  `link_heads`, the page index -- are **serials** (`LinkAt(i)` is `link_records[i - link_base]`,
+  likewise `RangeAt`), so nothing is renumbered; the page lists and the wide list lose a prefix each.
+  The serials are 32 bits: past 3/4 of that (billions of blocks) the cache forgets every block once
+  and they start again.
+* With nothing free and nothing retired (a live limit of all regions), the oldest region is evicted
+  on the spot; with a retired region not yet given back, the emitting thread waits for it, as before.
+* `ClearCache` forgets every block, as before, and now retires the Full regions it emptied.
+* Stats: `regions_evicted`, `blocks_evicted`, `blocks_reemitted` (blocks emitted at a location the
+  latest eviction forgot -- what it cost in translation), `evict_ns`, `evict_max_ns`,
+  `regions_live`, `regions_live_max`.
+
+**MEASURED** (`tests/shared_cache.rs::the_cost_of_an_eviction`, ignored; Windows, release, one thread
+translating 1,200,001 blocks of the engine's shape -- a load, a store, a conditional branch; a branch
+-- 135 bytes each): forgetting a region holds the lock for a time set by the region, not by the live
+code: **16 MiB regions, 128 MiB live: 18.4 ms per eviction (longest 19.3)**; 16 MiB with 32 MiB live
+16.9 (22.2); 8 MiB with 128 MiB live 11.6 (16.9); one 128 MiB region live -- every block of a full
+region forgotten, as 0022 did -- 148 ms for 917,505 blocks (that is this patch's path, not 0022's
+`ForgetAllBlocks`; 0022's cost was the retranslation that followed). About 170 ns a block forgotten;
+the world's blocks average 361 bytes (w30: 188,669 KiB in 535,066 blocks), about 46,000 to a 16 MiB
+region.
+
+**Detectors** (`tests/shared_cache.rs`): `a_full_region_is_not_a_flush_and_the_oldest_region_goes_first`
+(a 3,001-block working set run after each of 56 cold segments of 25,000 blocks, 8 MiB regions, 32
+MiB live: while regions are free a fill translates nothing again and retires nothing; each eviction
+forgets at most a region's blocks; the working set is translated again 4 times over 14 evictions,
+where the flush would have done it at all 17 fills; committed code at most 30 MiB; a clear gives the
+full regions back), `a_block_translated_again_elsewhere_survives_its_old_region_s_eviction` (a block
+invalidated and translated into a newer region, linking back into the old one, survives the old
+region's eviction and its link there is undone; after more evictions an invalidation still finds
+the working set's last block through the trimmed index, and only it), and
+`threads_keep_their_working_set_while_another_streams_cold_code_through_the_cache` (four threads run
+a 2,001-block working set ~1.5 million times while a fifth streams 1.2 million cold blocks through a
+24 MiB live limit: 13 evictions, the working set translated again 5 times, every run right, every
+retired region given back). The tests written for 0022's cadence (`Space::new`) keep one region live,
+so that each fill still retires one.
 
 ## How a patch is carried
 
