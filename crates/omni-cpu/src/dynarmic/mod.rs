@@ -181,7 +181,7 @@ pub enum ExclusiveMonitor {
 const VALUE_COMPARE_SLOT_STRIDE: u32 = 8;
 
 /// The address space a shared code cache reserves by default: 1 GiB, committed as code is emitted
-/// (D38). Regions are an eighth of it.
+/// (D38). Regions are a quarter of it.
 pub const SHARED_CODE_CACHE_BYTES: u64 = 1 << 30;
 /// The smallest shared cache `OMNI_JIT_SHARED_CACHE_MB` may ask for: two 8 MiB regions and the
 /// prelude.
@@ -783,7 +783,9 @@ impl DynarmicBackend {
                 0,
                 Overrides::default(),
             );
-            let region = options.shared_code_cache_bytes / 8;
+            // Four regions: a retirement forgets every block, so a region must hold the whole
+            // working set with room to spare (D38 amendment 1).
+            let region = options.shared_code_cache_bytes / 4;
             // SAFETY: `template` is a valid config; its pointers are not kept past the call. The
             // cache is freed in `CodeCache::drop`, after every jit on it.
             let cache = unsafe { od_code_cache_new(&template, options.shared_code_cache_bytes, region) };
@@ -820,7 +822,8 @@ impl DynarmicBackend {
             global: options.exclusive_monitor == ExclusiveMonitor::Global,
         });
 
-        Ok(Self {
+        let has_code_cache = code_cache.is_some();
+        let backend = Self {
             shared: Arc::new(Shared {
                 space,
                 extent,
@@ -835,7 +838,32 @@ impl DynarmicBackend {
                 next_processor: AtomicU32::new(0),
                 ids_released_early: AtomicU64::new(0),
             }),
-        })
+        };
+        if has_code_cache {
+            // D38: what `OMNI_PERF` prints about the cache, for as long as the backend lives.
+            let shared = Arc::downgrade(&backend.shared);
+            crate::stats::register_code_cache(Box::new(move || {
+                let shared = shared.upgrade()?;
+                let cache = shared.code_cache.as_ref()?;
+                let mut s = OdCodeCacheStats::default();
+                // SAFETY: the cache lives as long as `shared`, held here; `s` is writable.
+                unsafe { od_code_cache_stats_of(cache.0, &mut s) };
+                Some(crate::stats::CodeCacheCounters {
+                    caches: 1,
+                    blocks_emitted: s.blocks_emitted,
+                    code_bytes_emitted: s.code_bytes_emitted,
+                    invalidations: s.invalidations,
+                    blocks_invalidated: s.blocks_invalidated,
+                    regions_retired: s.regions_retired,
+                    regions_reclaimed: s.regions_reclaimed,
+                    regions_pinned: s.regions_pinned,
+                    parked_redirected: s.parked_redirected,
+                    locked_lookups: s.locked_lookups,
+                    committed_bytes: s.committed_bytes,
+                })
+            }));
+        }
+        Ok(backend)
     }
 
     /// Processor ids that were handed back while a jit still referenced their monitor entry.

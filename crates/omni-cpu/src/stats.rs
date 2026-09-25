@@ -103,6 +103,68 @@ pub fn jit_state_monitor_offsets() -> Option<(u32, u32)> {
     *JIT_STATE_MONITOR_OFFSETS.lock()
 }
 
+/// What a shared code cache (D38) has done, summed over the caches alive in the process: what an
+/// `OMNI_PERF` line prints, so a cache that keeps translating the same code shows why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CodeCacheCounters {
+    /// Shared caches alive.
+    pub caches: u64,
+    /// Blocks translated into them.
+    pub blocks_emitted: u64,
+    /// Host code bytes those blocks took.
+    pub code_bytes_emitted: u64,
+    /// Invalidation requests applied.
+    pub invalidations: u64,
+    /// Blocks those requests dropped.
+    pub blocks_invalidated: u64,
+    /// Regions retired: each forgets every block, which the threads then translate again.
+    pub regions_retired: u64,
+    /// Retired regions given back.
+    pub regions_reclaimed: u64,
+    /// Retired regions still held by a thread running code it entered before the retirement.
+    pub regions_pinned: u64,
+    /// Parked threads moved out of a retiring region.
+    pub parked_redirected: u64,
+    /// Dispatcher lookups a thread's own table could not answer.
+    pub locked_lookups: u64,
+    /// Bytes committed now.
+    pub committed_bytes: u64,
+}
+
+type CodeCacheReader = Box<dyn Fn() -> Option<CodeCacheCounters> + Send + Sync>;
+static CODE_CACHES: Mutex<Vec<CodeCacheReader>> = Mutex::new(Vec::new());
+
+/// Record a shared code cache's counters; `read` answers `None` once the cache is gone, and is
+/// dropped then.
+pub fn register_code_cache(read: CodeCacheReader) {
+    CODE_CACHES.lock().push(read);
+}
+
+/// Every live shared code cache's counters, summed (`caches` 0 when there is none).
+#[must_use]
+pub fn code_caches() -> CodeCacheCounters {
+    let mut all = CODE_CACHES.lock();
+    let mut sum = CodeCacheCounters::default();
+    all.retain(|read| match read() {
+        Some(c) => {
+            sum.caches += 1;
+            sum.blocks_emitted += c.blocks_emitted;
+            sum.code_bytes_emitted += c.code_bytes_emitted;
+            sum.invalidations += c.invalidations;
+            sum.blocks_invalidated += c.blocks_invalidated;
+            sum.regions_retired += c.regions_retired;
+            sum.regions_reclaimed += c.regions_reclaimed;
+            sum.regions_pinned += c.regions_pinned;
+            sum.parked_redirected += c.parked_redirected;
+            sum.locked_lookups += c.locked_lookups;
+            sum.committed_bytes += c.committed_bytes;
+            true
+        }
+        None => false,
+    });
+    sum
+}
+
 static TRACK_RETRANSLATION: AtomicBool = AtomicBool::new(false);
 
 /// Start counting, per context, translations of block starts that context had translated before

@@ -476,6 +476,8 @@ struct Process {
     /// Cross-thread code invalidations (`Boundary::code_invalidations`): ranges queued, applied,
     /// and queues that overflowed -- each overflow a whole code cache discarded.
     code: crate::boundary::CodeInvalidations,
+    /// The shared code caches (D38), when the process has one.
+    jit_cache: omni_cpu::stats::CodeCacheCounters,
 }
 
 fn vk_counts(vulkans: &[Arc<Vulkan>]) -> BTreeMap<String, u64> {
@@ -491,6 +493,7 @@ fn vk_counts(vulkans: &[Arc<Vulkan>]) -> BTreeMap<String, u64> {
 fn snapshot_process(boundary: &Boundary, vulkans: &[Arc<Vulkan>], me: Option<&sampler::HostThread>) -> Process {
     Process {
         code: boundary.code_invalidations(),
+        jit_cache: omni_cpu::stats::code_caches(),
         at: Instant::now(),
         cpu: omni_platform::process::cpu_time().unwrap_or_default(),
         vk: vk_counts(vulkans),
@@ -823,6 +826,27 @@ fn report(
         code.2,
         100.0 * now.sampler_cpu.saturating_sub(before.sampler_cpu).as_secs_f64() / dt,
     ));
+    if now.jit_cache.caches > 0 {
+        // D38 amendment 1: what a shared code cache did this interval. A cache that keeps
+        // translating the same code shows here as blocks emitted with regions retired, or with
+        // blocks dropped by invalidations.
+        let (a, b) = (&now.jit_cache, &before.jit_cache);
+        let d = |x: u64, y: u64| x.saturating_sub(y);
+        out.push_str(&format!(
+            "PERF jit cache: +{} blocks (+{} KiB), retired +{} reclaimed +{} (held {}), parked moved +{}, \
+             invalidations +{} dropping +{} blocks, locked lookups {:.1} k/s, committed {} MiB\n",
+            d(a.blocks_emitted, b.blocks_emitted),
+            d(a.code_bytes_emitted, b.code_bytes_emitted) >> 10,
+            d(a.regions_retired, b.regions_retired),
+            d(a.regions_reclaimed, b.regions_reclaimed),
+            a.regions_pinned,
+            d(a.parked_redirected, b.parked_redirected),
+            d(a.invalidations, b.invalidations),
+            d(a.blocks_invalidated, b.blocks_invalidated),
+            d(a.locked_lookups, b.locked_lookups) as f64 / dt / 1e3,
+            a.committed_bytes >> 20,
+        ));
+    }
     for row in rows.iter().filter(|r| r.cpu >= 0.03).take(14) {
         let pct = |n: u64| 100.0 * n as f64 / row.ticks.max(1) as f64;
         let c = &row.classes;
