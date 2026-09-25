@@ -427,6 +427,14 @@ the default live limit is 256 MiB (`db56a5f`, D38 amendment 4). **w36** (30 min,
 initializer gate's flake (a pinned word 6 vs 5 / 92,432 vs 92,431 image pointers) is decided: the
 test's, per-thread caches show both too -- see "Found on the way" above.
 
+**m13** (Mac, `7a56fdb`, RSB off) never reached `onGameLoaded`: the Mac lost its network ~18 min
+into the day's run window (unreachable 13:41 to ~23:30, no reboot) -- no in-world data. Still owed
+on the Mac: the RSB discriminator run, and patch 0023's verification (`arm64-clear-audit`:
+`b6cab48`, `66c7b8b` -- the unpatched build must fail the new test, the `mac-cpu-C` mutation rows,
+the full arm64 suites) before it merges; the Mac freezes (m7, m9, m11) wait on it. **Linux**: the
+GPU is the limit, not the GLES layer (`9e7b027`, row 18) -- 13.6-14.0 fps in-world on a quiet
+desktop, 6.8-7.8 while another GPU client (a GNOME Remote Desktop session) shares the Fermi card.
+
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
 spread is wide.) Luau's own load benchmark fell with the same changes: `[SlowBenchmark] Types`
