@@ -400,6 +400,19 @@ engine can reach from its menus, in progress). At the owner's request, the host 
 the engine's own pointer signals (hidden while Roblox draws its cursor; captured and still while the
 engine holds it -- no button heuristics): see "the host cursor follows the engine" above.
 
+**w33** (15 min, `8959848`, the cursor work): clean, 41.9 fps (the owner's local LLM was loading on
+the GPU -- fps not comparable). The owner: "really cool"; three bugs found (cursor not hidden over an
+unfocused window; right-drag sometimes stuck -- the held pointer's reported position drifted off the
+view so the release landed outside it; a flash at let-go), fixed in `738b538`, `ed2aae7`. **w34**
+(20 min, `458c92e`, + the JNI audit fixes): clean, 49.2 fps, 2.62 GiB, 28 right-drag holds and 28
+let-gos, no stuck button. **w35** (30 min, `2caefcf`, patch 0028 at a 128 MiB live limit): clean,
+2.45 GiB (committed code 121 MiB), but PS99's settled world kept evicting (31 PERF lines, 12-50k
+blocks translated again each) and ran ~60 s at 0-18 fps around +1310-1370 s with no window event ->
+the default live limit is 256 MiB (`db56a5f`, D38 amendment 4); **w36** re-measures it. Open: the
+initializer gate (`initializers.rs`) fails ~1 run in 10 under the shared cache on Windows and Linux
+(a pinned word 6 vs 5 / 92,432 vs 92,431 image pointers), also on `a1ef0c5`, never with per-thread
+caches -- timing-dependent pins or a real race, not yet decided.
+
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
 spread is wide.) Luau's own load benchmark fell with the same changes: `[SlowBenchmark] Types`
