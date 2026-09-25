@@ -61,6 +61,7 @@ use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
 use omni_elf::{ElfImage, LoadedObject};
 use omni_mem::{
     Backing, CommitPolicy, GuestSpace, GuestSpaceConfig, MapExecutability, Placement, Protection,
+    DEFAULT_MAX_COMMIT_REQUEST,
 };
 use omni_platform::net::NetPolicy;
 
@@ -149,24 +150,150 @@ const STEP_13_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
 /// space, so 4 GiB was this runtime's limit and not the guest's.
 const GUEST_SPACE_BYTES: usize = 16 << 30;
 
-/// The commit ceiling on that space: 8 GiB. `omni_mem::DEFAULT_MAX_COMMITTED`'s own doc says to
-/// scale the ceiling with the space rather than inherit the 3.5 GiB default; this is twice the
-/// ~3.75 GB a loaded world was measured using, the RAM of a common phone, and a quarter of this
-/// host's 31.8 GB. The per-request ceiling -- the one that refuses a tampered `p_memsz` -- keeps
-/// its default.
-const GUEST_MAX_COMMITTED: usize = 8 << 30;
+/// The most RAM the device is given by default: 8 GiB, the RAM of a common phone and twice the
+/// ~3.75 GB a loaded world was measured using. See [`DeviceMemory`].
+const DEVICE_MEMORY_CAP: u64 = 8 << 30;
 
-/// What the gate tells the guest its memory is -- `MemTotal`, `sysinfo.totalram`,
-/// `_SC_PHYS_PAGES`: **the commit ceiling this runtime enforces on the guest's space**
-/// ([`GUEST_MAX_COMMITTED`], 8 GiB inside the [`GUEST_SPACE_BYTES`] space). That is the memory the
-/// guest can actually have, which is what `MemTotal` means on a device; a larger figure would
-/// promise memory the ceiling refuses.
+/// The share of the host's physical memory the device is given by default, in percent. The rest
+/// is the host's: its desktop, this runtime's own heap and JIT caches (which sit outside the
+/// guest's ceiling), and the file cache the guest's mapped library and assets are read through.
+const DEVICE_MEMORY_SHARE_PERCENT: u64 = 60;
+
+/// The variable that states the device's RAM outright, in MiB, instead of the default rule.
+const DEVICE_MEMORY_VARIABLE: &str = "OMNI_GUEST_MEMORY_MB";
+
+/// **The device's RAM: one number, derived from the host, that the commit ceiling and every
+/// report to the guest are made from** (D36).
 ///
-/// It was 2 GiB, chosen as "an ordinary application heap limit" -- a per-app limit, which is not
-/// what `MemTotal` is. MEASURED why it matters: the engine sizes its device tier from it (its
-/// memory profile recorded `TotalOsMem` 2147483648 and a 16-48 MB texture-streaming budget), and
-/// raised its own low-memory warning 28 s into a landing-screen session.
-const GUEST_MEMORY_BUDGET: u64 = GUEST_MAX_COMMITTED as u64;
+/// It is both of the things two constants used to be, and they have to be one number:
+///
+/// * **The commit ceiling on the guest's space** ([`guest_space_config`]).
+///   `omni_mem::DEFAULT_MAX_COMMITTED`'s own doc says to scale the ceiling with the space rather
+///   than inherit the 3.5 GiB default. The per-request ceiling -- the one that refuses a tampered
+///   `p_memsz` -- keeps its default.
+/// * **What the guest is told its memory is** -- `MemTotal`, `sysinfo.totalram`, `_SC_PHYS_PAGES`
+///   (`Bionic::set_memory_budget`) and `ActivityManager.MemoryInfo.totalMem` (the web view's
+///   [`user_agent_facts`]). That is the memory the guest can actually have, which is what `MemTotal`
+///   means on a device; a larger figure would promise memory the ceiling refuses.
+///
+/// **The figure is `OMNI_GUEST_MEMORY_MB` if that is set, else [`DEVICE_MEMORY_SHARE_PERCENT`] of
+/// the host's physical memory rounded down to a whole GiB, at most [`DEVICE_MEMORY_CAP`] and at
+/// least 1 GiB** ([`default_device_memory`]). It was 8 GiB on every host, and MEASURED on the Linux
+/// host (7.2 GiB of RAM, the desktop holding ~2.2 GiB), in the Pet Simulator 99 world: the process
+/// reached 4.6 GiB private with 3.3 GiB resident -- swapped, at ~1 fps, its render and IO threads in
+/// the kernel. The engine sizes its caches and its tier from `MemTotal`; a device whose RAM exceeds
+/// what the host can give is not a faithful device.
+///
+/// Before that it was 2 GiB, chosen as "an ordinary application heap limit" -- a per-app limit,
+/// which is not what `MemTotal` is. MEASURED why it matters: the engine sizes its device tier from
+/// it (its memory profile recorded `TotalOsMem` 2147483648 and a 16-48 MB texture-streaming
+/// budget), and raised its own low-memory warning 28 s into a landing-screen session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceMemory {
+    /// Bytes: a whole number of MiB, so a whole number of pages on every host.
+    bytes: u64,
+    /// Why it is this figure, for the `MEMORY:` line.
+    why: String,
+}
+
+impl DeviceMemory {
+    /// The figure in MiB: `ActivityManager.MemoryInfo.totalMem / 1048576`.
+    fn mebibytes(&self) -> u64 {
+        self.bytes >> 20
+    }
+}
+
+/// The default rule: [`DEVICE_MEMORY_SHARE_PERCENT`] of `host_physical`, rounded **down** to a
+/// whole GiB, no more than [`DEVICE_MEMORY_CAP`], no less than 1 GiB -- the smallest whole-GiB
+/// device, for a host too small to run the engine at all. A 31.8 GB Windows host and a 16 GiB M1
+/// are 8 GiB devices; the 7.2 GiB Linux host is a 4 GiB one.
+fn default_device_memory(host_physical: u64) -> u64 {
+    const GIB: u64 = 1 << 30;
+    let share = host_physical.saturating_mul(DEVICE_MEMORY_SHARE_PERCENT) / 100;
+    (share / GIB * GIB).clamp(GIB, DEVICE_MEMORY_CAP)
+}
+
+/// `OMNI_GUEST_MEMORY_MB`'s value, in bytes: a whole number of MiB, no less than the per-request
+/// commit ceiling (a total below one request is a space `omni_mem` refuses to build) and no more
+/// than the [`GUEST_SPACE_BYTES`] reserved for the guest (a device cannot have more RAM than its
+/// address space holds).
+fn requested_device_memory(text: &str) -> Result<u64, String> {
+    let least = (DEFAULT_MAX_COMMIT_REQUEST >> 20) as u64;
+    let most = (GUEST_SPACE_BYTES >> 20) as u64;
+    let mib: u64 = text.trim().parse().map_err(|_| {
+        format!("{DEVICE_MEMORY_VARIABLE}={text:?} is not a whole number of MiB")
+    })?;
+    if !(least..=most).contains(&mib) {
+        return Err(format!(
+            "{DEVICE_MEMORY_VARIABLE}={mib} is outside {least}..={most} MiB: the per-request commit \
+             ceiling to the {most} MiB address space reserved for the guest"
+        ));
+    }
+    Ok(mib << 20)
+}
+
+/// `OMNI_GUEST_MEMORY_MB`, when it is set to anything but blanks (a script that exports it empty
+/// has not stated a device).
+fn stated_device_memory() -> Option<String> {
+    std::env::var(DEVICE_MEMORY_VARIABLE).ok().filter(|text| !text.trim().is_empty())
+}
+
+/// **The device's RAM for this process, decided once and said once**, on stderr:
+/// `MEMORY: the guest is a <n> MiB device (<why>)`.
+fn device_memory() -> &'static DeviceMemory {
+    static DECIDED: OnceLock<DeviceMemory> = OnceLock::new();
+    DECIDED.get_or_init(|| {
+        let host = omni_platform::vm::physical_memory();
+        let host_text = match &host {
+            Ok(bytes) => format!("the host has {} MiB of physical memory", bytes >> 20),
+            Err(error) => format!("the host's physical memory is unknown: {error}"),
+        };
+        let memory = match stated_device_memory() {
+            Some(text) => DeviceMemory {
+                bytes: requested_device_memory(&text).unwrap_or_else(|error| panic!("{error}")),
+                why: format!("{DEVICE_MEMORY_VARIABLE}; {host_text}"),
+            },
+            None => {
+                let physical = host.unwrap_or_else(|error| {
+                    panic!(
+                        "the device's RAM is derived from the host's physical memory, which could \
+                         not be read ({error}); set {DEVICE_MEMORY_VARIABLE} to state it"
+                    )
+                });
+                let bytes = default_device_memory(physical);
+                let share = physical.saturating_mul(DEVICE_MEMORY_SHARE_PERCENT) / 100;
+                let rule = if share >= DEVICE_MEMORY_CAP {
+                    format!(
+                        "{DEVICE_MEMORY_SHARE_PERCENT}% of it is more than the {} GiB cap",
+                        DEVICE_MEMORY_CAP >> 30
+                    )
+                } else if share < 1 << 30 {
+                    format!("{DEVICE_MEMORY_SHARE_PERCENT}% of it is less than the 1 GiB floor")
+                } else {
+                    format!("{DEVICE_MEMORY_SHARE_PERCENT}% of it, rounded down to a whole GiB")
+                };
+                DeviceMemory { bytes, why: format!("{host_text}; {rule}") }
+            }
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "MEMORY: the guest is a {} MiB device ({})",
+            memory.mebibytes(),
+            memory.why
+        );
+        memory
+    })
+}
+
+/// The guest's space: [`GUEST_SPACE_BYTES`] reserved, and **the device's RAM as its commit
+/// ceiling** -- the same number the guest is told it has.
+fn guest_space_config(memory: &DeviceMemory) -> GuestSpaceConfig {
+    GuestSpaceConfig {
+        size: GUEST_SPACE_BYTES,
+        max_committed: usize::try_from(memory.bytes).expect("the device's RAM fits the host's usize"),
+        ..GuestSpaceConfig::default()
+    }
+}
 
 /// How long step 13 may take in **wall-clock** time before the watchdog ends the run.
 ///
@@ -655,13 +782,11 @@ impl Guest {
         let backing = Backing::open_named(&lib_at, MapExecutability::Executable, GUEST_LIB)
             .expect("open libroblox.so where the guest sees it");
         let elf = ElfImage::parse(bytes.bytes()).expect("parse libroblox.so");
+        // **The device's RAM**, decided once per process and said on stderr: the space's commit
+        // ceiling and, below, what the guest is told it has.
+        let memory = device_memory();
         let space = Arc::new(
-            GuestSpace::with_config(GuestSpaceConfig {
-                size: GUEST_SPACE_BYTES,
-                max_committed: GUEST_MAX_COMMITTED,
-                ..GuestSpaceConfig::default()
-            })
-            .expect("reserve a guest address space"),
+            GuestSpace::with_config(guest_space_config(memory)).expect("reserve a guest address space"),
         );
 
         // **As many CPUs as bionic has thread blocks.** The backend's default is 32; MEASURED, once
@@ -786,7 +911,7 @@ impl Guest {
             "COOKIES: the app's cookie store holds {} cookie(s) at launch",
             jni.cookie_count()
         );
-        bionic.set_memory_budget(GUEST_MEMORY_BUDGET);
+        bionic.set_memory_budget(memory.bytes);
         // **Which network this guest may reach — D30's replacement for Global Constraint 8.**
         //
         // The `EAI_NONAME` diagnostic that used to stand here is gone, with the two `Bionic`
@@ -1140,7 +1265,7 @@ fn define_host_answers(jni: &Jni, display: &Display) {
 }
 
 /// **The facts the app's web view user agent is built from**, from the same decisions the engine
-/// is given: the memory [`GUEST_MEMORY_BUDGET`] (`MemTotal`), the display `DisplayMetrics` answers
+/// is given: the device's RAM, [`device_memory`] (`MemTotal`), the display `DisplayMetrics` answers
 /// (its pixels stand for `Display.getSize` too: one figure, the app's area), its DPI (`xdpi`/`ydpi`
 /// carry `densityDpi`, see [`define_host_answers`]), `Build.MANUFACTURER`/`MODEL`/
 /// `VERSION.RELEASE` by `Build.java`'s rule over [`device_properties`] (`"unknown"` when unset),
@@ -1156,7 +1281,7 @@ fn user_agent_facts(display: &Display) -> UserAgentFacts {
     let density = display.density();
     UserAgentFacts {
         app_version: chosen_apk().manifest.version_name.clone(),
-        total_memory_mb: (GUEST_MEMORY_BUDGET / (1024 * 1024)) as i32,
+        total_memory_mb: i32::try_from(device_memory().mebibytes()).expect("the device's RAM in MiB fits an int"),
         display_size: (display.width_px, display.height_px),
         dpi: (display.density_dpi(), display.density_dpi()),
         display_dp: ((display.width_px as f32 / density) as i32, (display.height_px as f32 / density) as i32),
@@ -1387,6 +1512,88 @@ fn a_death_is_recorded_with_the_signal_a_device_would_have_raised() {
         ExitRecord::SIGABRT
     );
     assert_eq!((ExitRecord::SIGSEGV, ExitRecord::SIGILL, ExitRecord::SIGABRT), (11, 4, 6), "Linux arm64 numbers");
+}
+
+/// **The default device RAM, on the three hosts this runs on and at the rule's edges** (D36). The
+/// three hosts' figures are what `vm::physical_memory` read on each (2026-09-25): Windows
+/// `ullTotalPhys`, the M1's `hw.memsize`, the Linux host's `MemTotal` (7,543,472 kB).
+#[test]
+fn the_device_has_sixty_percent_of_the_hosts_memory_in_whole_gib_and_at_most_8() {
+    const GIB: u64 = 1 << 30;
+    for (host, device, which) in [
+        (34_187_423_744, 8 * GIB, "the Windows host, 31.8 GiB: 19.1 GiB is over the cap"),
+        (17_179_869_184, 8 * GIB, "the M1, 16 GiB: 9.6 GiB is over the cap"),
+        (7_543_472 * 1024, 4 * GIB, "the Linux host, 7.2 GiB: 4.32 GiB rounds down"),
+        (8 * GIB, 4 * GIB, "an 8 GiB host: 4.8 GiB rounds down, not up"),
+        (13 * GIB + GIB / 3, 7 * GIB, "13.33 GiB: just under 8 GiB is still 7"),
+        (13 * GIB + GIB / 3 + 1024, 8 * GIB, "just over 13.33 GiB: exactly 8"),
+        (14 * GIB, 8 * GIB, "14 GiB: 8.4 GiB is capped"),
+        (2 * GIB, GIB, "2 GiB: 1.2 GiB rounds down to 1"),
+        (GIB, GIB, "1 GiB: 0.6 GiB is below the 1 GiB floor"),
+        (1024 * GIB, 8 * GIB, "1 TiB: capped"),
+    ] {
+        assert_eq!(default_device_memory(host), device, "{which}");
+    }
+}
+
+/// `OMNI_GUEST_MEMORY_MB` states the device's RAM in whole MiB, inside what the guest's space can
+/// hold, and anything else is refused by name rather than guessed at.
+#[test]
+fn a_stated_device_memory_is_whole_mib_within_the_guest_space() {
+    assert_eq!(requested_device_memory("3072"), Ok(3 << 30));
+    assert_eq!(requested_device_memory(" 6144\n"), Ok(6 << 30));
+    assert_eq!(requested_device_memory("128"), Ok(128 << 20), "one request's ceiling is the least");
+    assert_eq!(requested_device_memory("16384"), Ok(16 << 30), "the whole space is the most");
+    for refused in ["0", "127", "16385", "4 GiB", "-1", "", "1e3"] {
+        let error = requested_device_memory(refused).expect_err(refused);
+        assert!(error.contains(DEVICE_MEMORY_VARIABLE), "{refused:?}: {error}");
+    }
+}
+
+/// **The figure this process runs with is the rule's, on this host**: `OMNI_GUEST_MEMORY_MB` when it
+/// is set, the default rule over `vm::physical_memory` when it is not -- and asking twice is one
+/// decision (the `MEMORY:` line it prints, once, is in this test's output).
+#[test]
+fn the_device_memory_this_process_uses_is_the_rules_for_this_host() {
+    let expected = match stated_device_memory() {
+        Some(text) => requested_device_memory(&text).expect("a valid OMNI_GUEST_MEMORY_MB"),
+        None => default_device_memory(omni_platform::vm::physical_memory().expect("physical memory")),
+    };
+    let decided = device_memory();
+    assert_eq!(decided.bytes, expected, "{decided:?}");
+    assert!(std::ptr::eq(decided, device_memory()), "decided once");
+}
+
+/// **The commit ceiling and what the guest is told are one number** (D36): the space built from a
+/// device's RAM refuses the first granule past it and takes everything up to it, and the MiB the
+/// guest is told is the same figure. A 128 MiB device so that the test commits little.
+#[test]
+fn the_commit_ceiling_is_the_ram_the_device_is_said_to_have() {
+    let memory = DeviceMemory {
+        bytes: requested_device_memory("128").expect("128 MiB"),
+        why: "a test".to_string(),
+    };
+    let config = guest_space_config(&memory);
+    assert_eq!(config.size, GUEST_SPACE_BYTES, "the reservation is not the device's RAM");
+    assert_eq!(config.max_committed as u64, memory.bytes);
+    assert_eq!(memory.mebibytes() << 20, memory.bytes, "totalMem in MiB is the same figure");
+
+    let space = GuestSpace::with_config(config).expect("a space with the device's RAM as its ceiling");
+    let page = space.page_size();
+    let at = space
+        .map_anonymous(
+            Placement::Anywhere { align: page },
+            2 * memory.bytes as usize,
+            Protection::ReadWrite,
+            CommitPolicy::Lazy,
+        )
+        .expect("a lazy mapping twice the device's RAM costs nothing");
+    space.ensure_committed(at, memory.bytes as usize).expect("the whole of the device's RAM");
+    let past = space.ensure_committed(at + memory.bytes as usize, space.commit_granule());
+    assert!(
+        matches!(past, Err(omni_mem::MemError::CommitCeiling { .. })),
+        "a granule past the device's RAM: {past:?}"
+    );
 }
 
 /// The guest's root: a scratch directory removed with the run, or -- with `OMNI_DATA_DIR` --

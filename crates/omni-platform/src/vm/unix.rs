@@ -219,6 +219,13 @@ pub(super) fn process_memory() -> VmResult<super::ProcessMemory> {
     unsupported("process_memory")
 }
 
+/// Intended: `sysinfo(2)`'s `totalram * mem_unit` on Linux, `sysctlbyname("hw.memsize")` on macOS
+/// -- neither is POSIX (`sysconf(_SC_PHYS_PAGES)` is not either, and on Linux it is `sysinfo`
+/// underneath). Both are written, in the backends that measured them.
+pub(super) fn physical_memory() -> VmResult<u64> {
+    unsupported("physical_memory")
+}
+
 /// The unix stand-in for a pagefile-backed section.
 ///
 /// Unconstructible: [`create_shared_section`] never returns one.

@@ -4320,3 +4320,78 @@ cells fail if it stops. A stale table entry would run the old translation of rew
 indirect targets far exceed 4,096 pays the dispatcher's cost on the misses, which is what it paid
 before. No in-world measurement was taken (this task's rule: never run the live app); the profile
 above is the reason, not the result, and the next in-world profile says how much of the 12-25% went.
+
+## D36 — The device's RAM is derived from the host: 60% of physical memory in whole GiB, at most 8 GiB
+
+**Decided 2026-09-25 (Windows session, built and tested on all three hosts; the owner's
+performance brief).** A decision of the embedding (`tests/gameactivity.rs`, which `omnidroid play`
+runs), not of the compatibility layer: `Bionic::set_memory_budget` has no default precisely so that
+an embedding states this number.
+
+### What
+
+The guest is told one figure for its RAM -- `MemTotal` in `/proc/meminfo`, `sysinfo.totalram`,
+`sysconf(_SC_PHYS_PAGES)`, `ActivityManager.MemoryInfo.totalMem` -- and the same figure is the
+commit ceiling (`max_committed`) on its address space. That was already one number (8 GiB, two
+constants, one defined as the other); it is still one number, but no longer a constant:
+
+* `OMNI_GUEST_MEMORY_MB=<n>` if set: `n` MiB, 128..=16384 (one commit request's ceiling up to the
+  16 GiB space; anything else is refused by name);
+* otherwise **60% of the host's physical memory, rounded down to a whole GiB, at most 8 GiB and at
+  least 1 GiB**.
+
+Physical memory is a new seam call, `omni_platform::vm::physical_memory()`: Windows
+`GlobalMemoryStatusEx().ullTotalPhys`, Linux `sysinfo(2)` `totalram * mem_unit`, macOS
+`sysctlbyname("hw.memsize")`. The run says which, once, at startup:
+`MEMORY: the guest is a <n> MiB device (<why>)`. The 16 GiB reservation (`GUEST_SPACE_BYTES`) is
+unchanged: address space is free (D10).
+
+### Why
+
+MEASURED on the Linux host (7.2 GiB of RAM, the desktop holding ~2.2 GiB), in the Pet Simulator 99
+world, with the fixed 8 GiB: the process reached **4.6 GiB private with 3.3 GiB resident** -- it was
+being swapped, and the world ran at ~1 fps with the render and IO threads in the kernel. The engine
+sizes its caches and its device tier from `MemTotal`; told it had 8 GiB, it used memory the host did
+not have. A device whose RAM exceeds what the host can give is not a faithful device.
+
+60% leaves the rest to what is not the guest's and still has to be resident: the host's desktop,
+this runtime's own heap and JIT code caches (outside the guest's ceiling -- `CODE_CACHE_BYTES`
+records the process's peak private bytes at 2.25 GiB with 8 MiB caches per thread and 3.2-3.3 GiB
+with 32 MiB), and the file cache the mapped `libroblox.so` and the
+assets are read through. Whole GiB because devices come in whole GiB; down, because up is the
+direction that swaps. 8 GiB stays the cap: the RAM of a common phone and twice the ~3.75 GB a loaded
+world was measured using (2026-09-23, recorded at `GUEST_SPACE_BYTES`).
+
+**It trades nothing in correctness.** A 4 GiB device is a real device -- a common one -- and the
+engine picks its own tier from the RAM it is told, as it does on every phone; nothing here chooses a
+tier for it. The figure the guest reads and the ceiling it runs under stay one number, so the guest
+is never promised memory the ceiling would refuse.
+
+### Measurements (2026-09-25, `vm::physical_memory` on each host)
+
+| host | physical memory | 60% | device |
+|---|---|---|---|
+| Windows 11 (32 GB installed) | 34,187,423,744 B (31.8 GiB) | 19.1 GiB | **8 GiB** (cap) |
+| M1, macOS | 17,179,869,184 B (16 GiB) | 9.6 GiB | **8 GiB** (cap) |
+| Linux x86-64 | 7,543,472 kB (7.2 GiB) | 4.32 GiB | **4 GiB** |
+
+Each backend's unit test checks the call against another source on that host: Windows
+`K32GetPerformanceInfo`'s `PhysicalTotal x PageSize` (equal) and `GetPhysicallyInstalledSystemMemory`
+(not exceeded); Linux `/proc/meminfo` `MemTotal` (equal); macOS `sysctl -n hw.memsize` (equal). The
+rule's own tests (`gameactivity.rs`, no APK, no network): the three hosts and the edges above
+(13.33 GiB is 7, a byte over it is 8, 1 GiB floors at 1); `OMNI_GUEST_MEMORY_MB`'s range; and a
+space built from a 128 MiB device commits exactly 128 MiB and refuses the next granule with
+`CommitCeiling`, with `totalMem` in MiB the same figure. Mutation rows `devmem-*` (Windows),
+`lnx-devmem-*`, `mac-devmem-*`.
+
+**Not measured in a world** (this task's rule: never run the live app). The Linux figure above is the
+reason, not the result; the next in-world run on that host says whether a 4 GiB device stays
+resident.
+
+### What it costs if wrong
+
+If 60% is too generous on some host, the guest pages as before, only later -- `OMNI_GUEST_MEMORY_MB`
+states a smaller device without a rebuild. If it is too mean, the engine picks a lower tier than the
+host could carry: lower-resolution textures and a smaller streaming budget, not a wrong answer; the
+same variable states a larger device. A host from which physical memory cannot be read fails the run
+at startup, naming the variable, rather than inventing a figure.

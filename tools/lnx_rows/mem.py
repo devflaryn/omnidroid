@@ -203,3 +203,16 @@ ROWS = [
     let _ = &default;""",
      CHAIN_TESTS),
 ]
+
+# D36: `vm::physical_memory` on Linux, which the embedding derives the device's RAM from. Detector:
+# its unit test, against `/proc/meminfo`'s `MemTotal`.
+PHYSICAL_UNIT = ["cargo", "test", "-p", "omni-platform", "--release", "--no-fail-fast", "--lib",
+                 "physical_memory"]
+
+ROWS += [
+    ("lnx-devmem-A1", "A", "physical memory is the RAM that is free, not the RAM the host has",
+     VM_LINUX,
+     "    Ok(u64::from(info.totalram).saturating_mul(u64::from(info.mem_unit.max(1))))",
+     "    Ok(u64::from(info.freeram).saturating_mul(u64::from(info.mem_unit.max(1))))",
+     PHYSICAL_UNIT),
+]

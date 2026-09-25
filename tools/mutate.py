@@ -347,6 +347,14 @@ VSPRINTF = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bioni
 GATE_EXITS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
               "--no-fail-fast", "exit_records"]
 
+# The same target, filtered to the device-RAM rule's three tests (D36): the rule, the stated
+# override, and the space whose ceiling is the device's RAM. No APK, no guest, no network.
+GATE_DEVMEM = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
+               "--no-fail-fast", "device"]
+# `vm::physical_memory`'s own unit test in the Windows backend.
+PLATFORM_PHYSICAL = ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "--no-fail-fast",
+                     "physical_memory"]
+
 # The touch seam: `jni::input`'s unit tests (in the lib target) and `tests/input.rs`, which calls a
 # hand-assembled stand-in for the native through real translated code and reads back the registers
 # it was called with. No APK and no engine, so every row costs a build and not a run.
@@ -8772,6 +8780,56 @@ directory", ADAPTER_FILES,
      "const CACHE_ENTRIES: usize = 4;",
      "const CACHE_ENTRIES: usize = 1;",
      ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    # ---- the device's RAM, derived from the host (D36; prefix `devmem-`) -----------------------
+    # Detectors: the three rule tests in `tests/gameactivity.rs` (filter `device`: no APK, no
+    # guest run, no network), and the Windows backend's unit test for `vm::physical_memory`. The
+    # two call sites that hand the figure to the guest (`set_memory_budget`, `total_memory_mb`) are
+    # not rowed: nothing short of a guest run reads them back.
+    ("devmem-A1", "A", "the device is given all of the host's memory, not 60%",
+     GATE_ACTIVITY_FILE,
+     "const DEVICE_MEMORY_SHARE_PERCENT: u64 = 60;",
+     "const DEVICE_MEMORY_SHARE_PERCENT: u64 = 100;",
+     GATE_DEVMEM),
+    ("devmem-A2", "A", "the device is 8 GiB on every host again",
+     GATE_ACTIVITY_FILE,
+     "    let share = host_physical.saturating_mul(DEVICE_MEMORY_SHARE_PERCENT) / 100;",
+     "    let share = DEVICE_MEMORY_CAP;",
+     GATE_DEVMEM),
+    ("devmem-A3", "A", "the 8 GiB cap is dropped, so a large host makes a larger device",
+     GATE_ACTIVITY_FILE,
+     "    (share / GIB * GIB).clamp(GIB, DEVICE_MEMORY_CAP)",
+     "    (share / GIB * GIB).max(GIB)",
+     GATE_DEVMEM),
+    ("devmem-A4", "A", "the share rounds up to a whole GiB, the direction that swaps",
+     GATE_ACTIVITY_FILE,
+     "    (share / GIB * GIB).clamp(GIB, DEVICE_MEMORY_CAP)",
+     "    (share.div_ceil(GIB) * GIB).clamp(GIB, DEVICE_MEMORY_CAP)",
+     GATE_DEVMEM),
+    ("devmem-A5", "A", "the commit ceiling is a constant again, not the RAM the guest is told",
+     GATE_ACTIVITY_FILE,
+     """        max_committed: usize::try_from(memory.bytes).expect("the device's RAM fits the host's usize"),""",
+     """        max_committed: 8 << 30,""",
+     GATE_DEVMEM),
+    ("devmem-A6", "A", "Windows' physical memory is what is free, not what the host has",
+     PLAT_VM_WINDOWS,
+     "    Ok(memory_status()?.ullTotalPhys)",
+     "    Ok(memory_status()?.ullAvailPhys)",
+     PLATFORM_PHYSICAL),
+    ("devmem-B1", "B", "the 1 GiB floor is dropped, so a small host makes a 0-byte device",
+     GATE_ACTIVITY_FILE,
+     "    (share / GIB * GIB).clamp(GIB, DEVICE_MEMORY_CAP)",
+     "    (share / GIB * GIB).min(DEVICE_MEMORY_CAP)",
+     GATE_DEVMEM),
+    ("devmem-B2", "B", "a stated device larger than the guest's address space is accepted",
+     GATE_ACTIVITY_FILE,
+     "    if !(least..=most).contains(&mib) {",
+     "    if mib < least {",
+     GATE_DEVMEM),
+    ("devmem-B3", "B", "a stated device of exactly one commit request is refused",
+     GATE_ACTIVITY_FILE,
+     "    let least = (DEFAULT_MAX_COMMIT_REQUEST >> 20) as u64;",
+     "    let least = (DEFAULT_MAX_COMMIT_REQUEST >> 20) as u64 + 1;",
+     GATE_DEVMEM),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

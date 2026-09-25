@@ -42,6 +42,7 @@
 //! process_commit_charge() -> VmResult<u64>
 //! process_working_set() -> VmResult<u64>
 //! process_memory() -> VmResult<ProcessMemory>
+//! physical_memory() -> VmResult<u64>
 //! ```
 //!
 //! Backends work in `usize` addresses rather than raw pointers, so that the descriptor types in
@@ -1191,6 +1192,26 @@ pub struct ProcessMemory {
 /// [`VmError::Unsupported`] on Linux and macOS.
 pub fn process_memory() -> VmResult<ProcessMemory> {
     backend::process_memory()
+}
+
+/// The host's physical memory, in bytes: the RAM the operating system manages.
+///
+/// **The machine's, not this process's**, and not what is free: a number that does not move while
+/// the process runs. It is what an embedding derives a guest's device RAM from (D36), so that a
+/// guest is never told it has more memory than the host can give it -- the engine sizes its caches
+/// from what it is told, and a promise the host cannot keep is paid for in paging.
+///
+/// | host | call | what it counts |
+/// |---|---|---|
+/// | Windows | `GlobalMemoryStatusEx().ullTotalPhys` | memory the OS manages: installed RAM less firmware and device reservations (31.8 GB on a 32 GB machine) |
+/// | Linux | `sysinfo(2)`: `totalram * mem_unit` | the kernel's `totalram_pages`, the number `/proc/meminfo` prints as `MemTotal` |
+/// | macOS | `sysctlbyname("hw.memsize")` | installed RAM, the number `sysctl hw.memsize` prints |
+///
+/// # Errors
+///
+/// [`VmError::Os`] if the OS refuses to report it, carrying its code.
+pub fn physical_memory() -> VmResult<u64> {
+    backend::physical_memory()
 }
 
 // ---------------------------------------------------------------------------------------------

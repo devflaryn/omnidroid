@@ -236,3 +236,15 @@ ROWS += [
      """    let millis = timeout.as_micros() / 1000;""",
      NET_TESTS),
 ]
+
+# D36: `vm::physical_memory` on macOS, which the embedding derives the device's RAM from. Detector:
+# its unit test, against `sysctl -n hw.memsize`.
+PHYSICAL_UNIT = ["cargo", "test", "-p", "omni-platform", "--lib", "--no-fail-fast", "physical_memory"]
+
+ROWS += [
+    ("mac-devmem-A1", "A", "physical memory is read from hw.usermem, the RAM not wired down",
+     VM,
+     """            c"hw.memsize".as_ptr(),""",
+     """            c"hw.usermem".as_ptr(),""",
+     PHYSICAL_UNIT),
+]

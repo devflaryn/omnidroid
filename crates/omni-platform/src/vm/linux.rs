@@ -971,6 +971,19 @@ pub(super) fn process_memory() -> VmResult<super::ProcessMemory> {
     })
 }
 
+/// `sysinfo(2)`'s `totalram`, in units of `mem_unit` bytes: the kernel's `totalram_pages()`, the
+/// same count `/proc/meminfo` prints as `MemTotal` (both are `si_meminfo` underneath). Usable RAM:
+/// installed RAM less what firmware reserves and what the kernel's own image occupies.
+pub(super) fn physical_memory() -> VmResult<u64> {
+    // SAFETY: `libc::sysinfo` is plain data that the call fills in; all-zero is a valid value.
+    let mut info: libc::sysinfo = unsafe { core::mem::zeroed() };
+    // SAFETY: `info` is live and correctly sized; sysinfo writes only into it.
+    if unsafe { libc::sysinfo(&mut info) } != 0 {
+        return Err(os("sysinfo", 0, 0, posix::errno()));
+    }
+    Ok(u64::from(info.totalram).saturating_mul(u64::from(info.mem_unit.max(1))))
+}
+
 // -------------------------------------------------------------------------------------------
 // Unit tests of the ledger's decisions, which the public seam reaches only through the kernel
 // -------------------------------------------------------------------------------------------
@@ -1001,6 +1014,21 @@ mod tests {
         retag(&mut map, 0x1800, 0x1000, Kind::Placeholder);
         let covered: usize = map.values().map(|p| p.len).sum();
         assert_eq!(covered, 0x4000, "retag must neither lose nor invent bytes: {map:?}");
+    }
+
+    /// The host's physical memory is `/proc/meminfo`'s `MemTotal`, to the byte: one kernel count,
+    /// read through `sysinfo(2)` and printed by the file (`si_meminfo` fills both).
+    #[test]
+    fn physical_memory_is_what_proc_meminfo_calls_mem_total() {
+        let total = physical_memory().expect("sysinfo");
+        let meminfo = std::fs::read_to_string("/proc/meminfo").expect("/proc/meminfo");
+        let kib: u64 = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect("a MemTotal line");
+        assert_eq!(total, kib * 1024, "sysinfo totalram * mem_unit against MemTotal");
+        assert!((1u64 << 30..=16u64 << 40).contains(&total), "{total} bytes");
     }
 
     #[test]

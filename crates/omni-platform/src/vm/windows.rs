@@ -16,8 +16,8 @@
 //! `CreateFileW`, `CreateFileMappingW`, `K32GetProcessMemoryInfo`, `GetSystemInfo`) is exported
 //! from `kernel32.dll` and is linked normally -- as are `GlobalMemoryStatusEx` and
 //! `GetModuleHandleW`, which `process_memory` adds. As a consequence `reserve`, `commit`,
-//! `decommit`, `protect`, `release`, `process_commit_charge`, `process_working_set` and
-//! `process_memory` all work even if the
+//! `decommit`, `protect`, `release`, `process_commit_charge`, `process_working_set`,
+//! `process_memory` and `physical_memory` all work even if the
 //! three dynamic symbols are unavailable; only the placeholder and file-mapping paths, and
 //! reservations aligned above 64 KB, depend on them.
 
@@ -821,8 +821,8 @@ fn memory_counters_ex2() -> VmResult<PROCESS_MEMORY_COUNTERS_EX2> {
     Ok(counters)
 }
 
-/// How many bytes of address space this process has in use: `ullTotalVirtual - ullAvailVirtual`.
-fn address_space_in_use() -> VmResult<u64> {
+/// One `GlobalMemoryStatusEx` snapshot.
+fn memory_status() -> VmResult<MEMORYSTATUSEX> {
     let mut status = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
@@ -833,7 +833,20 @@ fn address_space_in_use() -> VmResult<u64> {
     if ok == 0 {
         return Err(os("GlobalMemoryStatusEx", 0, 0));
     }
+    Ok(status)
+}
+
+/// How many bytes of address space this process has in use: `ullTotalVirtual - ullAvailVirtual`.
+fn address_space_in_use() -> VmResult<u64> {
+    let status = memory_status()?;
     Ok(status.ullTotalVirtual.saturating_sub(status.ullAvailVirtual))
+}
+
+/// `ullTotalPhys`: "the amount of actual physical memory", which is the RAM the memory manager
+/// has -- installed RAM less what firmware and devices reserve (MEASURED on the development host:
+/// 31.8 GB of a 32 GB machine).
+pub(super) fn physical_memory() -> VmResult<u64> {
+    Ok(memory_status()?.ullTotalPhys)
 }
 
 /// `IMAGE_SCN_MEM_EXECUTE`: a section whose pages are mapped executable.
@@ -1452,6 +1465,36 @@ mod tests {
 
     /// `PAGE_EXECUTE_WRITECOPY`, referenced only to assert that nothing ever resolves to it.
     const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+    /// The host's physical memory is `ullTotalPhys`, and two other ways of asking agree with it:
+    /// the performance counters' `PhysicalTotal` pages -- the memory manager's own page count,
+    /// through another call -- exactly, and the firmware's installed RAM, which it cannot exceed.
+    #[test]
+    fn physical_memory_is_the_memory_managers_page_count_and_no_more_than_is_installed() {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetPerformanceInfo, PERFORMANCE_INFORMATION,
+        };
+        use windows_sys::Win32::System::SystemInformation::GetPhysicallyInstalledSystemMemory;
+
+        let total = physical_memory().expect("GlobalMemoryStatusEx");
+        let mut info = PERFORMANCE_INFORMATION {
+            cb: std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `info` is live and its `cb` states its real size.
+        assert_ne!(unsafe { K32GetPerformanceInfo(&mut info, info.cb) }, 0, "K32GetPerformanceInfo");
+        assert_eq!(
+            total,
+            info.PhysicalTotal as u64 * info.PageSize as u64,
+            "ullTotalPhys against PERFORMANCE_INFORMATION's PhysicalTotal x PageSize"
+        );
+        let mut installed_kib = 0u64;
+        // SAFETY: the out-parameter is a live u64.
+        assert_ne!(unsafe { GetPhysicallyInstalledSystemMemory(&mut installed_kib) }, 0);
+        assert!(total <= installed_kib * 1024, "{total} managed > {installed_kib} KiB installed");
+        // A sane range: more than a phone's smallest RAM, less than any workstation's largest.
+        assert!((1u64 << 30..=16u64 << 40).contains(&total), "{total} bytes");
+    }
 
     /// A region we cannot describe is treated as private, so that the OS gets to reject a bad
     /// address instead of this module guessing at it.

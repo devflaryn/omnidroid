@@ -856,6 +856,31 @@ pub(super) fn process_memory() -> VmResult<super::ProcessMemory> {
     })
 }
 
+/// `sysctlbyname("hw.memsize")`: installed RAM, a 64-bit byte count (`hw.physmem` is the 32-bit
+/// one, and saturates). The number `sysctl hw.memsize` prints.
+pub(super) fn physical_memory() -> VmResult<u64> {
+    let mut bytes = 0u64;
+    let mut len = core::mem::size_of::<u64>();
+    // SAFETY: the name is a NUL-terminated literal; `bytes` and `len` are live and `len` states
+    // the size of `bytes`, which is all sysctlbyname writes; no new value is passed.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast::<libc::c_void>(),
+            &mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(os("sysctlbyname(hw.memsize)", 0, 0));
+    }
+    if len != core::mem::size_of::<u64>() {
+        return Err(refused("sysctlbyname(hw.memsize)", 0, len, libc::EINVAL));
+    }
+    Ok(bytes)
+}
+
 /// A file opened for mapping. macOS has no section object: sharing and executability are chosen
 /// per `mmap`, so this is the descriptor plus what the seam decided about it at open time.
 pub struct MappableFile {
@@ -1019,6 +1044,19 @@ mod tests {
         }
         release(base, 8 * page, ReservationKind::Placeholder).expect("release");
         assert!(release(base, 8 * page, ReservationKind::Placeholder).is_err(), "double release");
+    }
+
+    /// The host's physical memory is what `sysctl -n hw.memsize` prints, to the byte.
+    #[test]
+    fn physical_memory_is_what_sysctl_hw_memsize_prints() {
+        let total = physical_memory().expect("sysctlbyname(hw.memsize)");
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .expect("run /usr/sbin/sysctl");
+        let printed: u64 = String::from_utf8_lossy(&output.stdout).trim().parse().expect("a byte count");
+        assert_eq!(total, printed);
+        assert!((1u64 << 30..=16u64 << 40).contains(&total), "{total} bytes");
     }
 
     #[test]
