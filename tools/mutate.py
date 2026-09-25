@@ -8830,6 +8830,145 @@ directory", ADAPTER_FILES,
      "    let least = (DEFAULT_MAX_COMMIT_REQUEST >> 20) as u64;",
      "    let least = (DEFAULT_MAX_COMMIT_REQUEST >> 20) as u64 + 1;",
      GATE_DEVMEM),
+    # ---- contention on the import hot paths (prefix `contend-`) --------------------------------
+    # The in-world profile (2026-09-25) named three process-wide serialisation points or O(n)
+    # walks: `cb_call_svc`'s BTreeMap lookup (now `dynarmic::inline_table`, an array window),
+    # `omni_bionic::mutex::OwnerTable` (one lock, now 64 shards) and `AddressFutex` (one parked
+    # table scanned on every wake, one counter every thread wrote; now shards, an occupancy array
+    # and striped counters). Detectors: `inline_table`'s unit tests and `tests/thunk.rs`;
+    # `mutex::tests::owner_checks_hold_for_mutexes_in_every_shard` and the mutex suite;
+    # `bionic::runtime::tests` (stop across shards, the stop/record interleaving, near misses on
+    # both sides of a block, striped counters).
+    ("contend-A1", "A", "a removed inline thunk stays in the window: remove does not mark it stale",
+     "crates/omni-cpu/src/dynarmic/inline_table.rs",
+     """        let had = self.map.remove(address).is_some();
+        self.stale = true;
+        had""",
+     """        let had = self.map.remove(address).is_some();
+        had""",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--lib", "--test", "thunk", "--no-fail-fast"]),
+    ("contend-A2", "A", "an inline thunk added after a lookup is not in the window: insert does not mark it stale",
+     "crates/omni-cpu/src/dynarmic/inline_table.rs",
+     """        self.map.insert(address, (handler, context));
+        self.stale = true;""",
+     """        self.map.insert(address, (handler, context));""",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--lib", "--test", "thunk", "--no-fail-fast"]),
+    ("contend-A3", "A", "a site inside a slot answers for the slot: no stride check and no identity check",
+     "crates/omni-cpu/src/dynarmic/inline_table.rs",
+     """        if offset & ((1 << self.shift) - 1) == 0 {
+            if let Some(&position) = self.window.get(offset >> self.shift) {
+                if position == EMPTY {
+                    return None;
+                }
+                if let Some(&(address, handler, context)) = self.list.get(position as usize) {
+                    if address == site {""",
+     """        if true {
+            if let Some(&position) = self.window.get(offset >> self.shift) {
+                if position == EMPTY {
+                    return None;
+                }
+                if let Some(&(_address, handler, context)) = self.list.get(position as usize) {
+                    if true {""",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--lib", "--test", "thunk", "--no-fail-fast"]),
+    ("contend-A4", "A", "a thunk past the window is not looked for in the map",
+     "crates/omni-cpu/src/dynarmic/inline_table.rs",
+     """                }
+            }
+        }
+        self.map.get(&site).copied()""",
+     """                }
+            }
+        }
+        None""",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--lib", "--test", "thunk", "--no-fail-fast"]),
+    ("contend-B1", "B", "the window is unbounded: a far thunk makes it as long as the distance",
+     "crates/omni-cpu/src/dynarmic/inline_table.rs",
+     """        let slots = ((last - base) >> shift).saturating_add(1).min(WINDOW_SLOTS);""",
+     """        let slots = ((last - base) >> shift).saturating_add(1);""",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--lib", "--no-fail-fast", "inline_table"]),
+    ("contend-B2", "B", "the stride is the region's sixteen bytes, assumed rather than derived",
+     "crates/omni-cpu/src/dynarmic/inline_table.rs",
+     """        let shift = if common == 0 { 0 } else { common.trailing_zeros() };""",
+     """        let shift = if common == 0 { 0 } else { 4 };""",
+     ["cargo", "test", "-p", "omni-cpu", "--release", "--lib", "--no-fail-fast", "inline_table"]),
+    ("contend-A5", "A", "the owner check reads a shard the lock never wrote",
+     BIONIC_MUTEX,
+     """        self.shard(addr).lock().unwrap().get(&addr).copied()""",
+     """        self.shard(addr ^ 8).lock().unwrap().get(&addr).copied()""",
+     # Filtered to the one test that asks `get` before it relocks: every other ERRORCHECK test
+     # relocks first, and a relock whose owner check misses contends on a mutex its own thread
+     # holds -- a hang, not a failure, under the mock futex's bounded slices.
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "owner_checks_hold"]),
+    ("contend-A6", "A", "an unlock clears another shard, so the released mutex keeps its owner",
+     BIONIC_MUTEX,
+     """        self.shard(addr).lock().unwrap().remove(&addr).is_some()""",
+     """        self.shard(addr ^ 8).lock().unwrap().remove(&addr).is_some()""",
+     BIONIC_MUTEX_LIB),
+    ("contend-B3", "B", "every mutex lands in one shard: correct, and one lock again",
+     BIONIC_MUTEX,
+     """    ((addr >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - OWNER_SHARDS.trailing_zeros())) as usize""",
+     """    ((addr >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 63) as usize * 0""",
+     BIONIC_MUTEX_LIB),
+    ("contend-A7", "A", "stop wakes only the first shard's waiters",
+     ADAPTER_RUNTIME,
+     """        for shard in self.parked.iter() {
+            let addresses: Vec<u64> = shard.0.lock().keys().copied().collect();""",
+     """        for shard in self.parked.iter().take(1) {
+            let addresses: Vec<u64> = shard.0.lock().keys().copied().collect();""",
+     FUTEX_RUNTIME),
+    ("contend-A8", "A", "Futex::wait does not re-read the stop flag under the bucket lock: a late waiter sleeps",
+     ADAPTER_RUNTIME,
+     """            return WaitResult::WouldBlock;
+        }
+        // See `stop`: re-read under the bucket lock, so a stop that began after the check above
+        // cannot leave this thread asleep.
+        let validate = || !self.stopped() && still_expected();""",
+     """            return WaitResult::WouldBlock;
+        }
+        // See `stop`: re-read under the bucket lock, so a stop that began after the check above
+        // cannot leave this thread asleep.
+        let validate = || still_expected();""",
+     FUTEX_RUNTIME),
+    ("contend-A9", "A", "wait_compared does not re-read the stop flag under the bucket lock: a late raw waiter sleeps",
+     ADAPTER_RUNTIME,
+     """            return Ok(WaitResult::WouldBlock);
+        }
+        // See `stop`: re-read under the bucket lock, so a stop that began after the check above
+        // cannot leave this thread asleep.
+        let validate = || !self.stopped() && still_expected();""",
+     """            return Ok(WaitResult::WouldBlock);
+        }
+        // See `stop`: re-read under the bucket lock, so a stop that began after the check above
+        // cannot leave this thread asleep.
+        let validate = || still_expected();""",
+     FUTEX_RUNTIME),
+    ("contend-A10", "A", "the near-miss check reads only the low block, missing a waiter across the boundary",
+     ADAPTER_RUNTIME,
+     """        self.occupancy[block_slot(low)].load(Ordering::Relaxed) != 0
+            || self.occupancy[block_slot(high)].load(Ordering::Relaxed) != 0""",
+     """        let _ = high;
+        self.occupancy[block_slot(low)].load(Ordering::Relaxed) != 0""",
+     FUTEX_RUNTIME),
+    ("contend-A11", "A", "a park is never counted in the occupancy, so no near miss is ever seen",
+     ADAPTER_RUNTIME,
+     """        self.occupancy[slot].fetch_add(1, Ordering::Relaxed);
+        ParkedOn { futex: self, addr, slot }""",
+     """        ParkedOn { futex: self, addr, slot }""",
+     FUTEX_RUNTIME),
+    ("contend-A12", "A", "activity sums one stripe, so other threads' waits and wakes vanish",
+     ADAPTER_RUNTIME,
+     """        self.stripes.iter().fold((0, 0), |(waits, wakes), stripe| {""",
+     """        self.stripes.iter().take(1).fold((0, 0), |(waits, wakes), stripe| {""",
+     FUTEX_RUNTIME),
+    ("contend-B4", "B", "the near-miss check is taken off the wake path altogether",
+     ADAPTER_RUNTIME,
+     """        if self.may_be_near_a_waiter(addr) {
+            self.record_near_misses(addr);
+        }""",
+     """        if false && self.may_be_near_a_waiter(addr) {
+            self.record_near_misses(addr);
+        }""",
+     FUTEX_RUNTIME),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

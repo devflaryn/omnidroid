@@ -189,6 +189,17 @@ mod tests {
     }
 
     #[test]
+    fn a_thunk_added_into_an_empty_window_entry_is_found() {
+        let mut table = InlineThunks::default();
+        for (n, site) in [0x3000, 0x3010, 0x3040].into_iter().enumerate() {
+            table.insert(site, one, ThunkContext(n));
+        }
+        assert_eq!(context_at(&mut table, 0x3020), None, "an empty entry on the stride");
+        table.insert(0x3020, two, ThunkContext(7));
+        assert_eq!(context_at(&mut table, 0x3020), Some(7), "the window was rebuilt");
+    }
+
+    #[test]
     fn thunks_off_a_common_stride_are_all_found() {
         let mut table = InlineThunks::default();
         let sites = [0x4000, 0x4004, 0x4010, 0x4024];
