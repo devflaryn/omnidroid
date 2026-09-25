@@ -75,7 +75,8 @@ fn each_owner_row_reports_what_was_committed_and_touched_under_its_label() {
         assert_eq!((gles.2, gles.3), (0.5, 0.5), "{text}");
         // The host side is there, and the test binary's own stacks and heap are in it.
         let stacks = row(&text, "host", "host thread stacks");
-        assert!(stacks.4 >= 1 && stacks.2 > 0.0, "{text}");
+        // Mapped rather than resident: a test thread's stack is tens of KiB, 0.0 at one decimal.
+        assert!(stacks.4 >= 1 && stacks.0 > 0.0, "{text}");
         let other = row(&text, "host", "other private");
         assert!(other.1 > 0.0, "{text}");
         let images = row(&text, "host", "images");

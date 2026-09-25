@@ -17,7 +17,7 @@
 //! | committed | `MEM_COMMIT` regions (`PrivateUsage` counts the `MEM_PRIVATE` ones) | the VMA's size when it carries `VM_ACCOUNT` (`ac`) -- what `Committed_AS` is charged | -- |
 //! | resident | one `K32QueryWorkingSet`, binned by address | the VMA's `Rss`, private = `Private_Clean + Private_Dirty` | -- |
 //! | a range's residency | the same working-set snapshot | `/proc/self/pagemap`: present (bit 63), and not file/shared-anon (bit 61) for private | -- |
-//! | thread stacks | an allocation holding a `PAGE_GUARD` page | `[stack]`, or a writable anonymous VMA directly above a `PROT_NONE` one of at most 64 KiB (glibc's guard) | -- |
+//! | thread stacks | an allocation holding a `PAGE_GUARD` page | `[stack]`; the VMA holding a blocked thread's stack pointer (`/proc/self/task/*/syscall`) or the caller's own; or, older glibc, a writable anonymous VMA directly above a `PROT_NONE` one of at most 64 KiB | -- |
 //!
 //! **A measurement call, never on a hot path.** A walk costs a `VirtualQuery` per region (tens of
 //! thousands in a guest's placeholder-split space: tens of milliseconds) and a working-set copy
@@ -88,7 +88,8 @@ pub struct HostRegion {
     /// differ); on Linux the region's own start.
     pub allocation_base: usize,
     /// The file an image or a mapped view comes from -- its last path component -- when the OS
-    /// names one.
+    /// names one; on Linux also an anonymous mapping's own name (`[heap]`, `[stack]`,
+    /// `[anon:<name>]`) and the kernel's (`[vdso]`).
     pub name: Option<String>,
     /// How much of it is resident, when the OS could say.
     pub residency: Option<Residency>,
@@ -143,6 +144,8 @@ impl core::fmt::Debug for ResidentSet {
 /// Resident pages as a sorted list, each with whether it is shareable: the shape a working-set
 /// snapshot comes in. Pure, so the binning is tested on every host.
 #[derive(Debug, Default)]
+// Built on Windows, where the working set arrives as a page list; its unit test runs everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct PageList {
     /// Page addresses, sorted ascending.
     pages: Vec<usize>,
@@ -151,6 +154,7 @@ pub(crate) struct PageList {
     page: usize,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 impl PageList {
     /// Build from `(page address, shareable)` pairs in any order.
     pub(crate) fn new(mut entries: Vec<(usize, bool)>, page: usize) -> Self {
@@ -468,6 +472,31 @@ mod os {
         rest.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap_or(0) * 1024
     }
 
+    /// The stack pointer of every thread of this process that is blocked (`/proc/self/task/*/syscall`
+    /// ends `<sp> <pc>` unless it says `running`), and the caller's own -- a local's address.
+    ///
+    /// **Why a thread's stack is found by its stack pointer**: nothing in `smaps` marks a thread
+    /// stack. The main thread's is `[stack]`, and glibc used to leave a `PROT_NONE` guard VMA under
+    /// each thread stack, but MEASURED on the Linux port host (7.0, 2026-09-25) the guard is no
+    /// longer a VMA of its own, so a thread stack is a plain `rw-p` anonymous VMA. A running
+    /// thread's pointer is not readable: that thread's stack counts as other private memory.
+    fn stack_pointers() -> Vec<usize> {
+        let local = 0u8;
+        let mut out = vec![core::ptr::addr_of!(local) as usize];
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return out };
+        for task in tasks.filter_map(Result::ok) {
+            let Ok(text) = std::fs::read_to_string(task.path().join("syscall")) else { continue };
+            let fields: Vec<&str> = text.split_whitespace().collect();
+            if fields.len() >= 3 {
+                let sp = fields[fields.len() - 2].trim_start_matches("0x");
+                if let Ok(sp) = usize::from_str_radix(sp, 16) {
+                    out.push(sp);
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn process_regions() -> VmResult<Vec<HostRegion>> {
         let text =
             std::fs::read_to_string("/proc/self/smaps").map_err(|e| io("/proc/self/smaps", &e))?;
@@ -476,16 +505,27 @@ mod os {
         let mut private_bytes = 0u64;
         for line in text.lines() {
             if let Some((start, end, perms, path)) = header(line) {
-                let named = !path.is_empty() && !path.starts_with('[') && !path.starts_with("anon_inode:");
-                let kind = if !named {
+                // Anonymous: no path, the heap, the main stack, or a named anonymous mapping
+                // (`[anon:<name>]`, whose name is kept). The kernel's own `[vdso]`, `[vvar]` and
+                // `[vsyscall]` are code and data it maps into every process: images.
+                let anonymous = path.is_empty()
+                    || path == "[heap]"
+                    || path == "[stack]"
+                    || path.starts_with("[anon:")
+                    || path.starts_with("anon_inode:");
+                let kind = if anonymous {
                     HostRegionKind::Private
-                } else if path.contains(".so") || exe.as_deref() == Some(path) {
+                } else if path.starts_with('[') || path.contains(".so") || exe.as_deref() == Some(path) {
                     HostRegionKind::Image
                 } else {
                     HostRegionKind::Mapped
                 };
-                let name = named.then(|| path.rsplit('/').next().unwrap_or(path).to_string());
+                let name =
+                    (!path.is_empty()).then(|| path.rsplit('/').next().unwrap_or(path).to_string());
                 let writable = perms.as_bytes()[1] == b'w';
+                // Older glibc's shape, where it still holds: a writable anonymous VMA directly
+                // above a small `PROT_NONE` one. The stack pointers below are the rule that works
+                // on the port host.
                 let stack = path == "[stack]"
                     || (kind == HostRegionKind::Private
                         && writable
@@ -526,12 +566,18 @@ mod os {
                         r.private = private_bytes;
                     }
                 }
-                "VmFlags" => {
-                    if rest.split_whitespace().any(|flag| flag == "ac") {
-                        region.committed = region.len as u64;
-                    }
+                "VmFlags" if rest.split_whitespace().any(|flag| flag == "ac") => {
+                    region.committed = region.len as u64;
                 }
                 _ => {}
+            }
+        }
+        for sp in stack_pointers() {
+            let at = out.partition_point(|r| r.end() <= sp);
+            if let Some(region) = out.get_mut(at) {
+                if region.start <= sp && region.kind == HostRegionKind::Private && region.writable {
+                    region.stack = true;
+                }
             }
         }
         Ok(out)

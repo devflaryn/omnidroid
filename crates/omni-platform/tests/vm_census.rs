@@ -27,19 +27,33 @@ fn a_committed_block_is_one_private_allocation_and_only_its_touched_pages_are_re
     assert!(!ours.is_empty(), "no region covers the block at {start:#x}");
     for region in &ours {
         assert_eq!(region.kind, HostRegionKind::Private, "{region:?}");
-        assert!(region.writable && !region.executable && !region.stack, "{region:?}");
+        assert!(region.writable && !region.executable, "{region:?}");
     }
     let committed: u64 = ours.iter().map(|r| r.committed).sum();
-    assert_eq!(committed, size as u64, "the whole block is committed: {ours:?}");
+    if cfg!(windows) {
+        // One allocation is its own regions, and nothing else is in them.
+        assert_eq!(committed, size as u64, "the whole block is committed: {ours:?}");
+        assert!(ours.iter().all(|r| !r.stack), "{ours:?}");
+    } else {
+        // Linux merges adjacent anonymous VMAs with the same flags -- MEASURED: the block came
+        // back inside one VMA with a neighbouring thread's stack -- so its VMA can be larger.
+        assert!(committed >= size as u64, "the whole block is committed: {ours:?}");
+        assert!(ours.iter().all(|r| r.start <= start + size && r.end() >= start), "{ours:?}");
+    }
 
     let resident = vm::resident_set().expect("a resident set").in_range(start, size).expect("in range");
     assert_eq!(resident.resident, touched as u64, "exactly the touched pages are resident");
     assert_eq!(resident.private, resident.resident, "anonymous pages are private");
     assert_eq!(resident.shareable(), 0);
-    // The region's own figure agrees with the range query.
+    // The region's own figure agrees with the range query -- exactly where the regions are the
+    // block's alone, and as a floor where Linux merged a neighbour into them.
     let by_region: u64 =
         ours.iter().map(|r| r.residency.expect("a residency").resident).sum();
-    assert_eq!(by_region, touched as u64, "{ours:?}");
+    if cfg!(windows) {
+        assert_eq!(by_region, touched as u64, "{ours:?}");
+    } else {
+        assert!(by_region >= touched as u64, "{ours:?}");
+    }
 
     vm::release(reservation).expect("release");
 }
@@ -54,7 +68,7 @@ fn this_threads_stack_is_marked_a_stack_and_the_executable_an_image() {
     assert!(stack.stack, "the region holding a local is not marked a stack: {stack:?}");
     assert_eq!(stack.kind, HostRegionKind::Private);
 
-    let code = this_threads_stack_is_marked_a_stack_and_the_executable_an_image as usize;
+    let code = this_threads_stack_is_marked_a_stack_and_the_executable_an_image as *const () as usize;
     let image = regions.iter().find(|r| r.start <= code && code < r.end()).expect("the code's region");
     assert_eq!(image.kind, HostRegionKind::Image, "{image:?}");
     assert!(image.executable, "{image:?}");
