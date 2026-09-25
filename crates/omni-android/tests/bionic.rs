@@ -4676,6 +4676,103 @@ fn madvise_over_one_4k_page_zeroes_it_and_keeps_every_other_page_on_any_host() {
     assert_eq!(load(at + SMALL), 0x77);
 }
 
+/// **The engine's allocator's own OS calls, with its own arguments, through the guest's imports.**
+///
+/// DECODED (`libroblox.so` 2.739.691): the heap is mimalloc v3 inside the library, and this is its
+/// whole OS layer -- `mmap(NULL, n, prot, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)`
+/// (`0x1db9770`, `0x4022` once it believes in overcommit), the over-allocate-and-trim fallback for
+/// an unaligned answer (two `munmap`s, `0x1db93b4`), commit as `mprotect(PROT_READ|PROT_WRITE)`
+/// (`0x62ca18c`), purge as `madvise(MADV_DONTNEED)` after which it touches the pages again with no
+/// other call (`0x229de64`), `MADV_FREE` when purging by reset (`0x229d98c`), `MADV_HUGEPAGE`
+/// (`0x1db9928`), and `munmap`. Every step answers what Linux answers, and the aligned middle keeps
+/// every byte through all of it; `tests/heap_pattern.rs` in `omni-mem` runs the same calls from
+/// eight threads at once.
+#[test]
+fn the_engines_heap_os_sequence_is_answered_as_linux_answers_it() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    const MAP_NORESERVE: u64 = 0x4000;
+    let page = f.guest.space.page_size() as u64;
+    let call = |symbol: &str, args: &[u64]| -> i64 {
+        value_of(&f, symbol, |asm| {
+            for (register, &value) in args.iter().enumerate() {
+                asm.mov(register as u32, value);
+            }
+        }) as i64
+    };
+    let store = |address: u64, value: u64| {
+        let entry = program(&f, |asm| {
+            asm.mov(9, address);
+            asm.mov(10, value);
+            asm.push(str_imm(10, 9, 0));
+        });
+        run_program(&f, entry).expect("writable");
+    };
+    let load = |address: u64| -> u64 {
+        let entry = program(&f, |asm| {
+            asm.mov(9, address);
+            asm.push(ldr_imm(10, 9, 0));
+            asm.mov(11, f.guest.data as u64);
+            asm.push(str_imm(10, 11, 0));
+        });
+        run_program(&f, entry).expect("readable");
+        f.guest.read_u64(f.guest.data)
+    };
+
+    // Over-allocate for a 1 MiB alignment, reserved (PROT_NONE, as with commit off), and trim.
+    let align = 1024 * 1024u64;
+    let len = 16 * page;
+    let over = len + align;
+    let flags = MAP_ANON_PRIVATE | MAP_NORESERVE;
+    let p = call("mmap", &[0, over, 0, flags, u64::MAX, 0]) as u64;
+    assert_ne!(p, u64::MAX, "mmap(PROT_NONE, MAP_NORESERVE)");
+    let aligned = p.next_multiple_of(align);
+    let (head, tail) = (aligned - p, over - (aligned - p) - len);
+    if head > 0 {
+        assert_eq!(call("munmap", &[p, head]), 0, "trim the head");
+    }
+    if tail > 0 {
+        assert_eq!(call("munmap", &[aligned + len, tail]), 0, "trim the tail");
+    }
+    // Commit, name it, write it.
+    assert_eq!(call("mprotect", &[aligned, len, PROT_RW]), 0, "commit");
+    assert_eq!(call("madvise", &[aligned, len, 14]), 0, "MADV_HUGEPAGE is a hint");
+    let word = |i: u64| 0xC0DE_0000_0000_0000 | i;
+    for i in 0..len / page {
+        store(aligned + i * page, word(i));
+        store(aligned + (i + 1) * page - 8, word(i));
+    }
+    // Purge the middle half, rounded in to pages, and touch it again with no call in between.
+    let (from, n) = (aligned + 4 * page, 8 * page);
+    assert_eq!(call("madvise", &[from, n, 4]), 0, "MADV_DONTNEED");
+    for i in 0..len / page {
+        let purged = (4..12).contains(&i);
+        let expected = if purged { 0 } else { word(i) };
+        assert_eq!(load(aligned + i * page), expected, "page {i} after the purge");
+        assert_eq!(load(aligned + (i + 1) * page - 8), expected, "page {i}'s end after the purge");
+    }
+    store(from, 0x1234);
+    assert_eq!(load(from), 0x1234, "a purged page is used again by writing to it");
+    // Reset instead of decommit: MADV_FREE, then reuse the same way.
+    assert_eq!(call("madvise", &[aligned, page, 8]), 0, "MADV_FREE");
+    store(aligned, 0x5678);
+    assert_eq!(load(aligned), 0x5678);
+    assert_eq!(load(aligned + page), word(1), "MADV_FREE reached past its range");
+    // No access and back keeps the contents, as on Linux.
+    assert_eq!(call("mprotect", &[aligned, len, 0]), 0, "PROT_NONE");
+    assert_eq!(call("mprotect", &[aligned, len, PROT_RW]), 0, "and back");
+    assert_eq!(load(aligned + page), word(1), "the contents survive PROT_NONE");
+    assert_eq!(load(aligned + 15 * page), word(15));
+    // The trimmed head and tail really are gone: a fixed mapping over each is free to land.
+    if head > 0 {
+        let at = call("mmap", &[p, head, PROT_RW, MAP_ANON_PRIVATE | 0x10_0000, u64::MAX, 0]);
+        assert_eq!(at as u64, p, "the trimmed head is free again");
+        assert_eq!(call("munmap", &[p, head]), 0);
+    }
+    assert_eq!(load(aligned + 15 * page), word(15), "the middle is untouched by its neighbours");
+    assert_eq!(call("munmap", &[aligned, len]), 0, "munmap");
+}
+
 
 /// `mlock` is refused, and the refusal says why `-1`/`ENOMEM` was rejected — it is the most
 /// tempting wrong answer in the group, because a failing `mlock` is ordinary on a real device.
