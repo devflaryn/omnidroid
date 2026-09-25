@@ -364,7 +364,7 @@ Now regions are 16 MiB and a full one stays live; past 128 MiB of live code the 
 is retired (cold startup code, mostly) and only what is still run from it is translated again.
 Committed code per instance: 242-247 MiB -> at most ~150, ~130 expected. **Live check pending**
 (D38 amendment 3 says what to look for; `OMNI_JIT_SHARED_CACHE_LIVE_MB=256` is the fallback).
-**Found on the way, and decided (`2fa8f0b`, VERIFICATION entry 22): the M3 initializer gate's
+**Found on the way, and decided (`61ab27e`, VERIFICATION entry 22): the M3 initializer gate's
 flake was the test's, not the shared cache's, and not bionic's.** Its two signatures had two causes,
 and **both occur with per-thread caches too**:
 * *a pinned word 6 instead of 5*: `0x067d_67d0` is an emulated-TLS index (compiler-rt numbers

@@ -4699,7 +4699,7 @@ word at `p_vaddr 0x67d67d0` 6 instead of 5); the gate alone, n = 30, 0 against 1
 Windows 3/12 and 1/24 here, 1/12 on `a1ef0c5` (92,432 image pointers instead of 92,431), per thread
 0/12. The initializers start guest threads; the shared cache changes how soon they run, and two of
 the words the gate pins depend on that. Not this change's; recorded as its own item (the gate should
-not pin a scheduling-dependent word). **Decided since** (`2fa8f0b`, VERIFICATION entry 22): the 6 is
+not pin a scheduling-dependent word). **Decided since** (`61ab27e`, VERIFICATION entry 22): the 6 is
 a thread race in the engine's emulated TLS and the extra pointer a number the image was placed
 around -- both the test's, both also seen with per-thread caches; the gate no longer pins the word
 and counts image pointers across two placements.
