@@ -1233,7 +1233,7 @@ pub(super) fn pthread_cond_wait(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let produced = omni_bionic::cond::with_owners(Arc::clone(&owners), || {
             omni_bionic::cond::with_registry(&threads, || {
                 omni_bionic::cond::wait_begin(
-                    &mut view, &owners, &threads, conds, cond, mutex,
+                    &mut view, futex, &owners, &threads, conds, cond, mutex,
                 )?;
                 omni_bionic::cond::wait_end(
                     &threads, conds, cond, mutex, &mut view, futex, None,
@@ -1363,7 +1363,7 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
         let produced = omni_bionic::cond::with_owners(Arc::clone(&owners), || {
             omni_bionic::cond::with_registry(&threads, || {
                 omni_bionic::cond::wait_begin(
-                    &mut view, &owners, &threads, conds, cond, mutex,
+                    &mut view, futex, &owners, &threads, conds, cond, mutex,
                 )?;
                 omni_bionic::cond::wait_end(
                     &threads, conds, cond, mutex, &mut view, futex, Some(budget),

@@ -177,7 +177,7 @@ fn stress_producer_consumer_no_lost_or_duplicated_items() {
                         if rd32(&m, 0x1408) < SLOTS as u32 {
                             break;
                         }
-                        cond::wait_begin(&mut m, &owners, &*threads, &waiters, 0x1100, 0x1000)
+                        cond::wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1100, 0x1000)
                             .unwrap();
                         let r = cond::wait_end(
                             &*threads, &waiters, 0x1100, 0x1000, &mut m, &*futex,
@@ -214,7 +214,7 @@ fn stress_producer_consumer_no_lost_or_duplicated_items() {
                         if rd32(&m, 0x1408) > 0 {
                             break;
                         }
-                        cond::wait_begin(&mut m, &owners, &*threads, &waiters, 0x1200, 0x1000)
+                        cond::wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1200, 0x1000)
                             .unwrap();
                         let r = cond::wait_end(
                             &*threads, &waiters, 0x1200, 0x1000, &mut m, &*futex,

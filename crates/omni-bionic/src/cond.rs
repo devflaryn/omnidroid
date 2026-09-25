@@ -368,12 +368,24 @@ pub fn destroy(
 /// waiter list, THEN release the mutex. The order is the atomicity: any signal
 /// delivered after registration is already addressed to this thread.
 ///
-/// `futex` parameter is accepted for interface symmetry with the other
-/// primitives and future adapter use; the release path needs no futex (the
-/// mutex's own unlock performs its wake).
+/// `futex` is the one the mutex's waiters park on: the release is an ordinary
+/// `pthread_mutex_unlock`, and its wake is what hands the mutex to a thread
+/// blocked in `pthread_mutex_lock`.
+///
+/// **It used to be a futex that wakes nobody**, on the reasoning that "the
+/// mutex's own unlock performs its wake" -- but the unlock was handed that
+/// futex, so its wake went nowhere. A thread parked in `pthread_mutex_lock` on
+/// the cond's mutex then slept out its whole self-heal slice (1,000 ms in
+/// `mutex::contend`) unless some other unlock of the same mutex woke it. That is
+/// the producer/consumer shape exactly: the consumer holds the mutex while it
+/// checks its predicate, the producer blocks locking it to set the predicate, and
+/// the consumer's `pthread_cond_wait` releases it without waking the producer --
+/// which the consumer is itself waiting for. Found by audit after macOS run m9;
+/// it stalls every host, x86 included.
 #[allow(clippy::too_many_arguments)]
 pub fn wait_begin(
     mem: &mut (impl GuestMemory + GuestAtomic),
+    futex: &impl crate::threads::Futex,
     owners: &crate::mutex::OwnerTable,
     threads: &impl crate::threads::ThreadRegistry,
     waiters: &CondWaiters,
@@ -384,8 +396,9 @@ pub fn wait_begin(
     let entry = waiters.register(cond_addr);
     REGISTERED.with(|c| c.borrow_mut().insert(cond_addr, entry));
     // Now release the mutex: from here on, other threads may lock it and
-    // signal; our entry is already queued.
-    crate::mutex::unlock(mem, &NopFutex, owners, threads, mutex_addr)?;
+    // signal; our entry is already queued. The unlock only ever wakes, never
+    // waits, so handing it the real futex cannot block this call.
+    crate::mutex::unlock(mem, futex, owners, threads, mutex_addr)?;
     Ok(())
 }
 
@@ -520,19 +533,6 @@ fn check_range(addr: u64, len: u64) -> Result<(), crate::memory::Fault> {
     match addr.checked_add(len - 1) {
         Some(_) => Ok(()),
         None => Err(crate::memory::Fault(addr)),
-    }
-}
-
-/// A futex that never blocks — the mutex release in `wait_begin` must not
-/// itself block (it never does; its wake is best-effort).
-struct NopFutex;
-
-impl crate::threads::Futex for NopFutex {
-    fn wait(&self, _addr: u64, _expected: u32, _timeout: Option<Duration>) -> crate::threads::WaitResult {
-        crate::threads::WaitResult::Woken
-    }
-    fn wake(&self, _addr: u64, _count: u32) -> u32 {
-        0
     }
 }
 
@@ -677,7 +677,7 @@ mod tests {
                     let mut pred = false;
                     let mut rounds = 0;
                     while !pred {
-                        wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                        wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
                         let r = wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, None).unwrap();
                         assert_eq!(r, 0);
                         rounds += 1;
@@ -781,7 +781,7 @@ mod tests {
                     // The predicate at 0x3000 is never written, so this loop only ever ends
                     // because the registry was stopped.
                     loop {
-                        wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                        wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
                         let r =
                             wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, None)
                                 .unwrap();
@@ -817,7 +817,7 @@ mod tests {
         let mut m = mem.clone();
         with_owners(owners.clone(), || with_registry(&*threads, || {
             assert_eq!(crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
-            wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+            wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
             let start = std::time::Instant::now();
             let r = wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, Some(Duration::from_millis(150))).unwrap();
             let elapsed = start.elapsed();
@@ -841,7 +841,7 @@ mod tests {
                 let mut m = mem.clone();
                 with_owners(owners.clone(), || with_registry(&*threads, || {
                     assert_eq!(crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
-                    wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                    wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
                     std::thread::sleep(Duration::from_millis(200));
                     let start = std::time::Instant::now();
                     let r = wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, Some(Duration::from_millis(2_000))).unwrap();
@@ -881,7 +881,7 @@ mod tests {
                 let mut m = mem.clone();
                 with_owners(owners.clone(), || with_registry(&*threads, || {
                     assert_eq!(crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
-                    wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                    wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
                     let r = wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, Some(Duration::from_secs(10))).unwrap();
                     assert_eq!(r, 0, "every waiter must be woken by the broadcast");
                     assert_eq!(crate::mutex::unlock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
@@ -913,7 +913,7 @@ mod tests {
                 let mut m = mem.clone();
                 with_owners(owners.clone(), || with_registry(&*threads, || {
                     assert_eq!(crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
-                    wait_begin(&mut m, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                    wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
                     // A HANG GUARD, deliberately far longer than the observation window below.
                     // It was 400 ms, which raced the test: a waiter's clock starts here, but the
                     // main thread only begins observing after polling all four registrations at
@@ -1001,5 +1001,101 @@ mod tests {
         mem.map(0x4000, &[0u8; 8]);
         mem.write(0x4004, &99u32.to_le_bytes()).unwrap();
         assert_eq!(init(&mut mem, 0x1000, 0x4000).unwrap(), consts::EINVAL);
+    }
+
+    /// A futex that records the addresses it was asked to wake, and wakes nobody.
+    #[derive(Default)]
+    struct WakeLog(std::sync::Mutex<Vec<u64>>);
+
+    impl crate::threads::Futex for WakeLog {
+        fn wait(&self, _: u64, _: u32, _: Option<Duration>) -> crate::threads::WaitResult {
+            crate::threads::WaitResult::Woken
+        }
+        fn wake(&self, addr: u64, _count: u32) -> u32 {
+            self.0.lock().unwrap().push(addr);
+            0
+        }
+    }
+
+    /// **The mutex release inside `pthread_cond_wait` wakes the mutex's waiters**, through the
+    /// futex it was handed -- for a NORMAL mutex (whose unlock is a CAS) and an ERRORCHECK one
+    /// (whose unlock is a release store). It used to go through a futex that woke nobody.
+    #[test]
+    fn wait_begin_releases_the_mutex_through_the_futex_it_is_given() {
+        for ty in [crate::mutex::mutex_type::NORMAL, crate::mutex::mutex_type::ERRORCHECK] {
+            let (mem, _, owners, threads, waiters, _clock) = fixture();
+            mem.with_exclusive(|g| g.write(0x2000 + 8, &ty.to_le_bytes()).unwrap());
+            let futex = WakeLog::default();
+            let mut m = mem.clone();
+            with_owners(owners.clone(), || {
+                with_registry(&*threads, || {
+                    assert_eq!(crate::mutex::lock(&mut m, &futex, &owners, &*threads, 0x2000).unwrap(), 0);
+                    wait_begin(&mut m, &futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                })
+            });
+            assert_eq!(*futex.0.lock().unwrap(), [0x2000], "type {ty}: the release woke no one");
+            // Leave no registration behind for the next type on this thread.
+            let entry = REGISTERED.with(|c| c.borrow_mut().remove(&0x1000)).expect("registered");
+            waiters.deregister(0x1000, &entry);
+        }
+    }
+
+    /// **The symptom, end to end: a thread blocked locking the cond's mutex is handed it when the
+    /// holder enters `pthread_cond_wait`, not a self-heal slice later.** The producer/consumer
+    /// shape: the consumer holds the mutex, the producer blocks locking it, the consumer waits on
+    /// the cond. With the release's wake going nowhere, the producer slept out `contend`'s whole
+    /// 1,000 ms slice before it could even set the predicate the consumer was waiting for.
+    #[test]
+    fn a_thread_blocked_on_the_mutex_gets_it_when_the_holder_waits_on_the_cond() {
+        let (mem, futex, owners, threads, waiters, _clock) = fixture();
+        let mut m = mem.clone();
+        with_owners(owners.clone(), || {
+            with_registry(&*threads, || {
+                assert_eq!(crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
+            })
+        });
+        // The producer: take the mutex, signal the consumer, give the mutex back.
+        let producer = {
+            let (mem, futex, owners, threads, waiters) =
+                (mem.clone(), futex.clone(), owners.clone(), threads.clone(), waiters.clone());
+            std::thread::spawn(move || {
+                let mut m = mem.clone();
+                assert_eq!(crate::mutex::lock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
+                let acquired = std::time::Instant::now();
+                assert_eq!(signal(&waiters, 0x1000).unwrap(), 0);
+                assert_eq!(crate::mutex::unlock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap(), 0);
+                acquired
+            })
+        };
+        // Wait until the producer is really asleep on the mutex, not merely about to be.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while futex.total_waiters() == 0 {
+            assert!(std::time::Instant::now() < deadline, "the producer never blocked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The mock counts a waiter a moment before it queues its wake slot; let it finish.
+        std::thread::sleep(Duration::from_millis(20));
+        // The consumer waits for the producer's signal. Nothing else unlocks the mutex while it
+        // does, so the release inside the wait is the producer's only way in -- the case that
+        // stalls. (A wait that returned at once and unlocked would wake the producer itself, and
+        // hide it.)
+        let released = std::time::Instant::now();
+        with_owners(owners.clone(), || {
+            with_registry(&*threads, || {
+                wait_begin(&mut m, &*futex, &owners, &*threads, &waiters, 0x1000, 0x2000).unwrap();
+                let signalled =
+                    wait_end(&*threads, &waiters, 0x1000, 0x2000, &mut m, &*futex, Some(Duration::from_secs(5)))
+                        .unwrap();
+                assert_eq!(signalled, 0, "the producer's signal reached the consumer");
+                crate::mutex::unlock(&mut m, &*futex, &owners, &*threads, 0x2000).unwrap();
+            })
+        });
+        let acquired = producer.join().unwrap();
+        let waited = acquired.saturating_duration_since(released);
+        assert!(
+            waited < Duration::from_millis(500),
+            "the blocked thread got the mutex {waited:?} after the cond wait released it: the \
+             release's wake went nowhere and it slept out its slice"
+        );
     }
 }
