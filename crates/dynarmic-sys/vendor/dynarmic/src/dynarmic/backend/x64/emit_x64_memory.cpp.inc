@@ -27,6 +27,13 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
 }
 
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+    // Omnidroid patch 0022: in a shared code cache another thread may be emitting (inserting into
+    // fastmem_patch_info) while this one faults, so the lookup takes the cache's lock, shared. The
+    // faulting thread cannot already hold it: generated code never runs inside a lookup.
+    std::shared_lock<std::shared_mutex> lock;
+    if (shared_lock) {
+        lock = std::shared_lock<std::shared_mutex>{*shared_lock};
+    }
     const auto iter = fastmem_patch_info.find(rip_);
 
     if (iter == fastmem_patch_info.end()) {
@@ -43,6 +50,9 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
     };
 
     if (iter->second.recompile) {
+        // A shared cache's template forces the recompile flags off: recompiling here would rewrite
+        // code every thread runs, from inside a fault handler.
+        ASSERT(!shared_code);
         const auto marker = iter->second.marker;
         do_not_fastmem.insert(marker);
         InvalidateBasicBlocks({std::get<0>(marker)});
@@ -71,7 +81,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             if (ordered) {
                 code.mfence();
             }
-            Devirtualize<callback>(conf.callbacks).EmitCall(code);
+            UserCallback<callback>().EmitCall(code);
             code.ZeroExtendFrom(bitsize, code.ABI_RETURN);
         }
         EmitCheckMemoryAbort(ctx, inst);
@@ -154,7 +164,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             code.CallFunction(memory_write_128);
         } else {
             ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
-            Devirtualize<callback>(conf.callbacks).EmitCall(code);
+            UserCallback<callback>().EmitCall(code);
         }
         if (ordered) {
             code.mfence();
@@ -231,7 +241,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(inst, {}, args[1]);
 
         code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        EmitLoadConfPointer(code.ABI_PARAM1);
         if (ordered) {
             code.mfence();
         }
@@ -249,7 +259,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.HostCall(nullptr);
 
         code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        EmitLoadConfPointer(code.ABI_PARAM1);
         ctx.reg_alloc.AllocStackSpace(16 + ABI_SHADOW_SPACE);
         code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
         if (ordered) {
@@ -291,7 +301,7 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     code.cmp(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
     code.je(end);
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
-    code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+    EmitLoadConfPointer(code.ABI_PARAM1);
     if constexpr (bitsize != 128) {
         using T = mcl::unsigned_integer_of_size<bitsize>;
 
@@ -359,7 +369,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    EmitLoadExclusiveAddressPointer(tmp);
     code.mov(qword[tmp], vaddr);
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);
@@ -393,7 +403,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
         code.call(wrapped_fn);
     }
 
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    EmitLoadExclusiveValuePointer(tmp);
     EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
 
     EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
@@ -440,17 +450,17 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
 
     SharedLabel end = GenSharedLabel();
 
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+    EmitLoadExclusiveAddressPointer(tmp);
     code.mov(status, u32(1));
     code.cmp(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
     code.je(*end, code.T_NEAR);
     code.cmp(qword[tmp], vaddr);
     code.jne(*end, code.T_NEAR);
 
-    EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax);
+    EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax, SkipOwnMonitorSlot());
 
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
-    code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    EmitLoadExclusiveValuePointer(tmp);
 
     if constexpr (bitsize == 128) {
         code.mov(rax, qword[tmp + 0]);

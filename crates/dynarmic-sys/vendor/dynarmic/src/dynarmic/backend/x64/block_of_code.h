@@ -152,6 +152,18 @@ public:
     void SetCodePtr(CodePtr code_ptr);
     void EnsurePatchLocationSize(CodePtr begin, size_t size);
 
+    /// Omnidroid patch 0022: commit `[begin, begin + size)` of this block's reservation for code
+    /// (Windows commits on demand; elsewhere pages arrive on first touch and this does nothing).
+    void CommitRange(const void* begin, size_t size);
+    /// Omnidroid patch 0022: give `[begin, begin + size)` back to the OS. Its contents are gone;
+    /// nothing may execute it until it is committed and written again.
+    void DecommitRange(const void* begin, size_t size);
+    /// Omnidroid patch 0022: the first byte past this block's reservation.
+    const u8* GetCodeEnd() const { return getCode() + maxSize_; }
+    /// Omnidroid patch 0022: bytes committed at the start of the reservation (the prelude's,
+    /// through EnsureMemoryCommitted); 0 where the OS commits on first touch.
+    size_t PreludeCommittedBytes() const;
+
     // ABI registers
 #ifdef _WIN32
     static const Xbyak::Reg64 ABI_RETURN;

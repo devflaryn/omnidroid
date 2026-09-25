@@ -95,6 +95,8 @@ pub struct Ctx {
     /// guest carries on); 0 leaves `SVC #1` like any other. Forces host context switches in the
     /// middle of guest execution.
     pub sleep_on_svc1_us: u64,
+    /// How many `SVC #1`s return at once before the sleeping ones start.
+    pub sleep_on_svc1_skip: usize,
     /// Test hook: `SVC #2` writes the byte already at this host address back to it, from inside
     /// the callback -- i.e. on the guest's thread, in the middle of guest execution. 0 = off.
     pub rewrite_byte_on_svc2: u64,
@@ -115,6 +117,26 @@ pub struct Ctx {
     /// Test hook: ask for a zero-length code invalidation from inside
     /// `call_svc`, which is what a guest `IC IVAU` over an empty range does.
     pub zero_invalidate_on_svc: bool,
+    /// A guest program several `Vm`s share and another thread may rewrite while they run: the
+    /// address of `shared_code_len` `AtomicU32` words at [`CODE_BASE`], or 0 to use `code`.
+    pub shared_code: usize,
+    /// Words at `shared_code`.
+    pub shared_code_len: usize,
+    /// Test hook: a [`FetchPause`] (as `usize`, 0 = off). A fetch of its address reads the word,
+    /// then waits there until released -- so a test can change the code while a translation made
+    /// from the old word is in progress.
+    pub pause_fetch: usize,
+}
+
+/// See [`Ctx::pause_fetch`].
+#[derive(Default)]
+pub struct FetchPause {
+    /// The guest address whose fetch pauses.
+    pub address: std::sync::atomic::AtomicU64,
+    /// Set by the fetch once it has read the word and is waiting.
+    pub paused: std::sync::atomic::AtomicBool,
+    /// Set by the test to let the fetch return (the word it read before pausing).
+    pub release: std::sync::atomic::AtomicBool,
 }
 
 impl Ctx {
@@ -123,6 +145,16 @@ impl Ctx {
             return None;
         }
         let idx = ((vaddr - self.code_base) / 4) as usize;
+        if self.shared_code != 0 {
+            if idx >= self.shared_code_len {
+                return None;
+            }
+            // SAFETY: `shared_code` is `shared_code_len` live `AtomicU32`s that outlive this `Vm`.
+            let words = unsafe {
+                std::slice::from_raw_parts(self.shared_code as *const std::sync::atomic::AtomicU32, self.shared_code_len)
+            };
+            return Some(words[idx].load(std::sync::atomic::Ordering::SeqCst));
+        }
         self.code.get(idx).copied()
     }
 
@@ -221,6 +253,17 @@ unsafe extern "C" fn cb_read_code(ctx: *mut c_void, vaddr: u64, out: *mut u32) -
     unsafe {
         with(ctx, 0, |c| match c.code_word(vaddr) {
             Some(w) => {
+                if c.pause_fetch != 0 {
+                    // SAFETY: a live `FetchPause` the test owns for the `Vm`'s life.
+                    let pause = &*(c.pause_fetch as *const FetchPause);
+                    use std::sync::atomic::Ordering::SeqCst;
+                    if pause.address.load(SeqCst) == vaddr && !pause.release.load(SeqCst) {
+                        pause.paused.store(true, SeqCst);
+                        while !pause.release.load(SeqCst) {
+                            std::thread::yield_now();
+                        }
+                    }
+                }
                 *out = w;
                 1
             }
@@ -404,7 +447,10 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
                 return;
             }
             if swi == 1 && c.sleep_on_svc1_us != 0 {
-                std::thread::sleep(std::time::Duration::from_micros(c.sleep_on_svc1_us));
+                // The first `sleep_on_svc1_skip` of them return at once.
+                if c.svc.iter().filter(|&&s| s == 1).count() > c.sleep_on_svc1_skip {
+                    std::thread::sleep(std::time::Duration::from_micros(c.sleep_on_svc1_us));
+                }
                 return;
             }
             let jit = c.jit;
@@ -527,6 +573,11 @@ pub struct VmOptions {
     pub identity: bool,
     /// `check_halt_on_memory_access`, which `omni-cpu` sets.
     pub check_halt_on_memory_access: bool,
+    /// A shared code cache (vendored patch 0022, [`Vm::new_code_cache`]) to translate into and run
+    /// from, as `usize`; 0 gives this `Vm` a cache of its own -- or, under
+    /// `OD_TEST_SHARED_CACHE=1`, a shared cache of its own, so that every test in the suite runs
+    /// the shared-cache emission.
+    pub shared_cache: usize,
 }
 
 impl Default for VmOptions {
@@ -549,9 +600,64 @@ impl Default for VmOptions {
             mirror: true,
             identity: false,
             check_halt_on_memory_access: false,
+            shared_cache: 0,
         }
     }
 }
+
+/// Whether `OD_TEST_SHARED_CACHE=1` asks every `Vm` without a cache of its choosing to run on a
+/// shared code cache of its own. The suite run this way is the shared-cache emission under every
+/// existing test.
+pub fn every_vm_on_a_shared_cache() -> bool {
+    std::env::var("OD_TEST_SHARED_CACHE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// The `OdConfig` a `Vm` with `opts` builds, for pointers the caller supplies.
+#[allow(clippy::too_many_arguments)]
+pub fn config_for(
+    opts: &VmOptions,
+    ctx: *mut c_void,
+    tpidr: *mut u64,
+    tpidrro: *const u64,
+    monitor: *mut c_void,
+    fastmem_base: u64,
+) -> OdConfig {
+    OdConfig {
+        abi_version: OD_DYNARMIC_ABI_VERSION,
+        callbacks: &CALLBACKS,
+        ctx,
+        tpidr_el0: tpidr,
+        tpidrro_el0: tpidrro,
+        fastmem_enabled: i32::from(opts.fastmem),
+        fastmem_pointer: if opts.identity { 0 } else { fastmem_base },
+        fastmem_address_space_bits: if opts.identity { 64 } else { MEM_BITS },
+        // Masks the guest address into the arena, so a wild guest address
+        // wraps instead of reading off the end of the allocation.
+        silently_mirror_fastmem: i32::from(opts.mirror),
+        recompile_on_fastmem_failure: 1,
+        fastmem_exclusive_access: i32::from(opts.fastmem_exclusive),
+        monitor,
+        processor_id: opts.processor_id,
+        code_cache_size: opts.code_cache_size,
+        cntfrq_el0: 0,
+        ctr_el0: 0,
+        dczid_el0: 4,
+        enable_cycle_counting: i32::from(opts.cycle_counting),
+        wall_clock_cntpct: 0,
+        hook_hint_instructions: i32::from(opts.hook_hints),
+        define_unpredictable_behaviour: 0,
+        check_halt_on_memory_access: i32::from(opts.check_halt_on_memory_access),
+        // dynarmic's own gate: an unsafe flag in the mask is honoured only with this open, so a
+        // test that asks for one (`UNSAFE_IGNORE_GLOBAL_MONITOR`) gets it, and no other does.
+        unsafe_optimizations: i32::from(opts.optimizations & !optimization::ALL_SAFE != 0),
+        optimizations: opts.optimizations,
+    }
+}
+
+/// The address space a test's shared cache reserves, and its regions.
+pub const TEST_SHARED_CACHE_BYTES: u64 = 64 << 20;
+/// Regions of [`TEST_SHARED_CACHE_BYTES`].
+pub const TEST_SHARED_REGION_BYTES: u64 = 16 << 20;
 
 /// One guest thread: a jit, its context and the pointers dynarmic bakes into
 /// generated code.
@@ -565,6 +671,8 @@ pub struct Vm {
     monitor: *mut c_void,
     /// Whether `Drop` frees `monitor` (not when it is shared).
     owns_monitor: bool,
+    /// A shared code cache this `Vm` made for itself (`OD_TEST_SHARED_CACHE`), freed after the jit.
+    own_cache: *mut c_void,
 }
 
 impl Vm {
@@ -593,12 +701,16 @@ impl Vm {
             reenter_step_result: None,
             halt_on_svc: true,
             sleep_on_svc1_us: 0,
+            sleep_on_svc1_skip: 0,
             rewrite_byte_on_svc2: 0,
             host_thread_pointers_in_svc: (0, 0),
             poke_on_svc3: None,
             fallback_skips: false,
             fallback_host_fpcr: 0,
             zero_invalidate_on_svc: false,
+            shared_code: 0,
+            shared_code_len: 0,
+            pause_fetch: 0,
         }));
 
         let mut tpidr = Box::new(0u64);
@@ -617,42 +729,41 @@ impl Vm {
         // SAFETY: the box is live and not otherwise borrowed here.
         let fastmem_base = unsafe { (*ctx.get()).fastmem_base() };
 
-        let cfg = OdConfig {
-            abi_version: OD_DYNARMIC_ABI_VERSION,
-            callbacks: &CALLBACKS,
-            ctx: ctx.get().cast::<c_void>(),
-            tpidr_el0: &mut *tpidr,
-            tpidrro_el0: &*tpidrro,
-            fastmem_enabled: i32::from(opts.fastmem),
-            fastmem_pointer: if opts.identity { 0 } else { fastmem_base },
-            fastmem_address_space_bits: if opts.identity { 64 } else { MEM_BITS },
-            // Masks the guest address into the arena, so a wild guest address
-            // wraps instead of reading off the end of the allocation.
-            silently_mirror_fastmem: i32::from(opts.mirror),
-            recompile_on_fastmem_failure: 1,
-            fastmem_exclusive_access: i32::from(opts.fastmem_exclusive),
+        let cfg = config_for(
+            &opts,
+            ctx.get().cast::<c_void>(),
+            &mut *tpidr,
+            &*tpidrro,
             monitor,
-            processor_id: opts.processor_id,
-            code_cache_size: opts.code_cache_size,
-            cntfrq_el0: 0,
-            ctr_el0: 0,
-            dczid_el0: 4,
-            enable_cycle_counting: i32::from(opts.cycle_counting),
-            wall_clock_cntpct: 0,
-            hook_hint_instructions: i32::from(opts.hook_hints),
-            define_unpredictable_behaviour: 0,
-            check_halt_on_memory_access: i32::from(opts.check_halt_on_memory_access),
-            // dynarmic's own gate: an unsafe flag in the mask is honoured only with this open, so a
-            // test that asks for one (`UNSAFE_IGNORE_GLOBAL_MONITOR`) gets it, and no other does.
-            unsafe_optimizations: i32::from(opts.optimizations & !optimization::ALL_SAFE != 0),
-            optimizations: opts.optimizations,
+            fastmem_base,
+        );
+
+        // A shared code cache: the one the options name, or -- under `OD_TEST_SHARED_CACHE=1` --
+        // one of this `Vm`'s own, built from this very configuration.
+        let own_cache = if opts.shared_cache == 0 && every_vm_on_a_shared_cache() {
+            // SAFETY: `cfg` is a valid config; the cache is freed in `Drop` after the jit.
+            let cache = unsafe {
+                od_code_cache_new(&cfg, TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES)
+            };
+            assert!(!cache.is_null(), "od_code_cache_new refused this Vm's configuration");
+            cache
+        } else {
+            std::ptr::null_mut()
         };
+        let cache = if opts.shared_cache != 0 { opts.shared_cache as *mut c_void } else { own_cache };
 
         // SAFETY: `cfg` is fully initialised; `callbacks` is a `'static`
         // constant; `ctx`, `tpidr`, `tpidrro` and `monitor` are all owned by
         // the `Vm` being built and are dropped only in `Drop`, after
-        // `od_jit_free`. dynarmic copies `cfg` and keeps the pointers.
-        let jit = unsafe { od_jit_new(&cfg) };
+        // `od_jit_free`. dynarmic copies `cfg` and keeps the pointers. A shared
+        // cache outlives the jit (the caller's, or `own_cache`, freed in `Drop`).
+        let jit = unsafe {
+            if cache.is_null() {
+                od_jit_new(&cfg)
+            } else {
+                od_jit_new_shared(&cfg, cache)
+            }
+        };
         assert!(!jit.is_null(), "od_jit_new rejected the configuration");
 
         // SAFETY: nothing is executing yet, so no callback can hold a `&mut`.
@@ -660,7 +771,24 @@ impl Vm {
             (*ctx.get()).jit = jit;
         }
 
-        Self { jit, ctx, tpidr, tpidrro, monitor, owns_monitor }
+        Self { jit, ctx, tpidr, tpidrro, monitor, owns_monitor, own_cache }
+    }
+
+    /// A shared code cache for `Vm`s built with `opts` (plus `shared_cache` set to it): the
+    /// template is the configuration such a `Vm` passes, with `monitor` and the arena's address as
+    /// the `Vm`s will have them. Free it with `od_code_cache_free` after every `Vm` on it.
+    pub fn new_code_cache(opts: &VmOptions, monitor: *mut c_void, arena: *mut u64, bytes: u64, region_bytes: u64) -> *mut c_void {
+        let mut tpidr = 0u64;
+        let tpidrro = 0u64;
+        let cfg = config_for(opts, std::ptr::null_mut(), &mut tpidr, &tpidrro, monitor, arena as u64);
+        // SAFETY: `cfg` is valid for the call; the template's pointers are not kept.
+        unsafe { od_code_cache_new(&cfg, bytes, region_bytes) }
+    }
+
+    /// The shared code cache this `Vm` runs from, or null.
+    pub fn code_cache(&self) -> *mut c_void {
+        // SAFETY: `self.jit` is live.
+        unsafe { od_jit_code_cache(self.jit) }
     }
 
     /// The raw jit handle, for tests that call the C ABI directly.
@@ -855,6 +983,9 @@ impl Drop for Vm {
         // because the jit holds a pointer to it.
         unsafe {
             od_jit_free(self.jit);
+            if !self.own_cache.is_null() {
+                od_code_cache_free(self.own_cache);
+            }
             if self.owns_monitor && !self.monitor.is_null() {
                 od_monitor_free(self.monitor);
             }

@@ -643,6 +643,64 @@ draft of the same-value test had that shape, and under value-compare -- where x6
 A's store still failed. The test as committed holds the reservation by single-stepping A's `LDXR`
 and asserts both arms, so the scan is pinned on both hosts.
 
+### 0022 — x64: one code cache shared by every jit of a guest address space (opt-in)
+
+`0022-shared-code-cache.patch`, D38, design `docs/research/shared-jit-cache.md`. **x64 only, and
+nothing changes unless a jit is given a cache**: every change is under `if (shared_code)` (or the
+`A64::SharedCodeCache` it belongs to), and a jit without one emits byte for byte what it did --
+the only difference it sees is eight `u64` fields appended to `A64JitState` (no offset moves) and
+upstream's two `BlockOfCode`/`A64EmitX64` members held behind a pointer.
+
+`A64::SharedCodeCache` (interface `a64.h`, implementation in `a64_interface.cpp`) owns one
+`BlockOfCode` -- prelude, constant pool, code -- and one `A64EmitX64` -- block map, link table,
+guest ranges, fastmem table -- built from a template `UserConfig`. A `Jit` whose
+`UserConfig::shared_code_cache` is set owns neither; it keeps its `JitState`, its 64 KiB
+fast-dispatch table and its pending invalidations, and attaches only if every field that shapes
+code equals the template's (the constructor throws otherwise; the shim returns null).
+
+* **Per-thread values out of the code.** Everything a block or the prelude embedded per jit is
+  read from `JitState` (`r15`) instead: the callbacks' `this` (`ArgCallback::FromJitState`,
+  `DevirtualizeFromJitState`), the dispatcher's lookup argument, `&conf` for the non-inline
+  exclusives, the thread's two monitor slots, the TPIDR boxes, the fast-dispatch table. The global
+  monitor's store scan includes the storing processor's own slot, as `ExclusiveMonitor::CheckAndClear`
+  does.
+* **Shared code is never rewritten.** A link (`LinkBlock`, `LinkBlockFast`) jumps through an
+  8-byte slot, and the RSB push loads its code pointer from one; linking and unlinking are one
+  aligned store. A block's slots are emitted right after it; a dropped block's slots are unlinked
+  and taken out of their targets' records.
+* **Translation is serialized, execution is not.** One `shared_mutex`: dispatcher lookups take it
+  shared -- after the thread's own fast-dispatch table, which the dispatcher now consults first --
+  and emission exclusive. The frontend and IR passes run outside the lock; a location another
+  thread is translating is waited for (spin, then a condition), not translated twice; a
+  translation overtaken by an invalidation of its range is made again under the lock.
+* **Invalidation** applies to the shared maps at once when the requesting jit is not executing
+  (else queued with a halt, as upstream), and bumps a generation that each jit compares at `Run`
+  entry and at every dispatcher lookup, emptying its RSB and fast-dispatch table when it moved.
+  In shared code the fast-dispatch handler writes a missed entry whole *after* the lookup, since
+  the lookup now reads the same table (found by measuring: written first, as upstream does, the
+  lookup could return another location's code pointer).
+* **Memory** is regions after the prelude, committed as code is emitted. A full region is retired
+  (its slots unlinked, the maps emptied, every other thread halted) and given back
+  (`MEM_DECOMMIT` / `MADV_DONTNEED`) once each attached thread is outside `RunCode` or entered it
+  since -- epochs published at `Run` entry and at every lookup. A thread parked in an `SVC`
+  callback publishes its return site (`JitState::od_callback_return`); after an asymmetric barrier
+  (`FlushProcessWriteBuffers`, `membarrier`) the reclaimer keeps only the pages around it.
+* Fault handling: the recompile-on-fastmem-failure flags are forced off for a shared cache (a
+  declined fault reaches the fallback callback every time, as the handler routes it anyway); the
+  handler's `fastmem_patch_info` lookup takes the lock shared.
+
+**MEASURED** (Windows, release, `omni-cpu/tests/roblox.rs::the_cost_of_eight_threads_meeting_the_same_real_roblox_code`
+and `dynarmic-sys/tests/shared_cache.rs`; D38 has the tables): eight threads each running the 870
+real Roblox leaves cold translate them once between them instead of eight times (fetched guest
+instructions 50,904 -> 6,363), commit +53 -> +1.6..5.5 MiB, and a warm call costs the same; when
+all eight meet every new block at the same moment on an otherwise idle 24-thread host the
+serialized emission makes the cold pass slower in wall time (see D38).
+
+**Detectors** (`tests/shared_cache.rs`, 15 tests and one measurement; the whole `dynarmic-sys` suite also runs with
+`OD_TEST_SHARED_CACHE=1`, every `Vm` on a cache of its own). Hand mutations of the vendored C++,
+each rebuilt, run and restored with the file's SHA-1 checked (`tools/mutate_0022.py`): 13 rows,
+13 caught -- see D38.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

@@ -57,8 +57,22 @@ fn the_fast_dispatch_table_is_sixty_four_kibibytes_and_allocated_only_when_it_is
         .expect("patch 0017 allocates the table in A64EmitX64's constructor");
     assert_eq!(
         lines[allocation - 1],
+        "if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {",
+        "the allocation is guarded by the optimization that reads the table -- and, since patch \
+         0022, made by the emitter only for a jit with its own code cache"
+    );
+    // Patch 0022: a jit on a shared code cache owns its table, allocated under the same guard.
+    let interface = std::fs::read_to_string(vendored("src/dynarmic/backend/x64/a64_interface.cpp"))
+        .expect("read a64_interface.cpp");
+    let interface: Vec<&str> = interface.lines().map(str::trim).collect();
+    let per_thread = interface
+        .iter()
+        .position(|l| l.starts_with("fast_dispatch_table = std::make_unique<u8[]>(A64EmitX64::FastDispatchTableBytes());"))
+        .expect("patch 0022 allocates a shared-cache jit's own table in Jit::Impl");
+    assert_eq!(
+        interface[per_thread - 1],
         "if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {",
-        "the allocation is guarded by the optimization that reads the table, and by nothing else"
+        "a shared-cache jit's table is guarded by the optimization that reads it"
     );
 
     #[cfg(target_arch = "x86_64")]

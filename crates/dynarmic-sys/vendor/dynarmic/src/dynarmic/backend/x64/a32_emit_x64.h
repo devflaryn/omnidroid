@@ -14,6 +14,7 @@
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a32_jitstate.h"
+#include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/frontend/A32/a32_location_descriptor.h"
 #include "dynarmic/interface/A32/a32.h"
@@ -55,6 +56,15 @@ public:
     void InvalidateCacheRanges(const boost::icl::interval_set<u32>& ranges);
 
 protected:
+    // Omnidroid patch 0022: what emit_x64_memory.cpp.inc asks of an emitter, answered for the A32
+    // frontend, which has no shared code cache: every value is the immediate it always was.
+    template<auto mfp>
+    ArgCallback UserCallback() const { return Devirtualize<mfp>(conf.callbacks); }
+    void EmitLoadConfPointer(Xbyak::Reg64 reg) { code.mov(reg, reinterpret_cast<u64>(&conf)); }
+    void EmitLoadExclusiveAddressPointer(Xbyak::Reg64 reg);
+    void EmitLoadExclusiveValuePointer(Xbyak::Reg64 reg);
+    bool SkipOwnMonitorSlot() const { return true; }
+
     const A32::UserConfig conf;
     A32::Jit* jit_interface;
     BlockRangeInformation<u32> block_ranges;

@@ -20,6 +20,8 @@ class ExclusiveMonitor;
 namespace Dynarmic {
 namespace A64 {
 
+class SharedCodeCache;
+
 using VAddr = std::uint64_t;
 
 using Vector = std::array<std::uint64_t, 2>;
@@ -288,6 +290,15 @@ struct UserConfig {
     // Minimum size is about 8MiB. Maximum size is about 128MiB (arm64 host) or 2GiB (x64 host).
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     size_t code_cache_size = 128 * 1024 * 1024;  // bytes
+
+    /// Omnidroid patch 0022 (x64 backend only). When set, this Jit owns no code cache: it
+    /// translates into and runs from `shared_code_cache`, which every Jit of one guest address
+    /// space may share, so a block translated by one thread is executed by all. `code_cache_size`
+    /// is then ignored. Every field that shapes emitted code must equal the cache's template
+    /// configuration (see SharedCodeCache); only `callbacks`, `processor_id` and the TPIDR
+    /// pointers may differ, and those are read from the running thread's JitState. The cache
+    /// must outlive the Jit.
+    SharedCodeCache* shared_code_cache = nullptr;
 
     /// Internal use only
     bool very_verbose_debugging_output = false;

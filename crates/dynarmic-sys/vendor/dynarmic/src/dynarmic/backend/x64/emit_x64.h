@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -122,11 +123,20 @@ protected:
     virtual void EmitTerminalImpl(IR::Term::CheckHalt terminal, IR::LocationDescriptor initial_location, bool is_single_step) = 0;
 
     // Patching
+    /// Omnidroid patch 0022: in a shared code cache a link site never has its code rewritten; it
+    /// jumps (or loads its RSB code pointer) through an 8-byte slot, and linking or unlinking is
+    /// one aligned store to the slot. `unlinked` is what the slot holds while the target has no
+    /// translation.
+    struct LinkSlot {
+        u64* slot;
+        u64 unlinked;
+    };
     struct PatchInformation {
         std::vector<CodePtr> jg;
         std::vector<CodePtr> jz;
         std::vector<CodePtr> jmp;
         std::vector<CodePtr> mov_rcx;
+        std::vector<LinkSlot> slots;  // patch 0022, shared code cache only
     };
     void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     virtual void Unpatch(const IR::LocationDescriptor& target_desc);
@@ -140,6 +150,42 @@ protected:
     ExceptionHandler exception_handler;
     tsl::robin_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
     tsl::robin_map<IR::LocationDescriptor, PatchInformation> patch_information;
+
+public:
+    // Omnidroid patch 0022: this emitter writes into a code cache several Jits share
+    // (A64::SharedCodeCache). Set once, before the prelude is generated, and never changed.
+    bool shared_code = false;
+    /// Shared code cache only: the cache's lock, which a fault handler reading the emitter's
+    /// tables takes shared.
+    std::shared_mutex* shared_lock = nullptr;
+    /// Shared code cache only: store every link slot's unlinked value, so nothing reaches the
+    /// blocks the maps are about to forget through a link.
+    void UnlinkAllSlots();
+
+protected:
+    /// Shared code cache only: a link slot the block being emitted references `rip`-relatively
+    /// through `label`, emitted -- 8 aligned bytes -- after the block's code by EmitPendingSlots,
+    /// next to the code that reads it. Its unlinked value is `unlinked`, or the address `tail` is
+    /// bound to when it is set.
+    struct PendingSlot {
+        std::shared_ptr<Xbyak::Label> label;
+        IR::LocationDescriptor target;
+        u64 unlinked;
+        std::shared_ptr<Xbyak::Label> tail;
+    };
+    std::vector<PendingSlot> pending_slots;
+    /// A new slot for a link to `target`, to be emitted with the block.
+    Xbyak::Label& NewLinkSlot(const IR::LocationDescriptor& target, u64 unlinked, std::shared_ptr<Xbyak::Label> tail = nullptr);
+    /// Emit the pending slots of the block at `location`, each holding its target's entry point if
+    /// it has one and its unlinked value otherwise, and record them so that emitting or
+    /// invalidating a target updates them.
+    void EmitPendingSlots(const IR::LocationDescriptor& location);
+    /// Shared code cache only: each block's own slots, by target, so that dropping the block
+    /// takes them out of its targets' records -- which would otherwise grow by one slot per
+    /// translation of every block linking to a target, for as long as the region lives.
+    tsl::robin_map<IR::LocationDescriptor, std::vector<std::pair<IR::LocationDescriptor, u64*>>> outgoing_slots;
+    /// Shared code cache only: unlink and forget the slots of the dropped block at `location`.
+    void ForgetOutgoingSlots(const IR::LocationDescriptor& location);
 };
 
 }  // namespace Dynarmic::Backend::X64

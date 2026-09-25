@@ -13,6 +13,7 @@
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
+#include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -39,7 +40,10 @@ struct A64EmitContext final : public EmitContext {
 
 class A64EmitX64 final : public EmitX64 {
 public:
-    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface);
+    /// `shared` (Omnidroid patch 0022): the code goes into a cache several Jits share, so every
+    /// per-thread value is read from JitState at run time and links go through slots; set up
+    /// `shared_lock` before emitting any block.
+    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface, bool shared = false);
     ~A64EmitX64() override;
 
     /**
@@ -52,7 +56,49 @@ public:
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
+    // Omnidroid patch 0022, shared code cache only (the caller holds the cache's lock exclusively).
+    /// InvalidateCacheRanges, returning how many blocks it dropped.
+    size_t InvalidateCacheRangesCounted(const boost::icl::interval_set<u64>& ranges);
+    /// Forget every block: unlink every slot and empty the block map, the link table and the
+    /// guest ranges. The code stays where it is (threads may be running it), and so does
+    /// `fastmem_patch_info`, which a thread faulting in that code still needs.
+    size_t ForgetAllBlocks();
+    /// Drop the fastmem records of faulting sites in `[begin, end)`: that memory is being given
+    /// back and nothing can execute it any more.
+    void PurgeFastmemPatchInfo(const void* begin, const void* end);
+    /// Bytes of one thread's fast-dispatch table, and resetting one (each thread of a shared
+    /// cache owns its table; the handler finds it through JitState::od_fast_dispatch_table).
+    static size_t FastDispatchTableBytes();
+    static void ResetFastDispatchTable(void* table);
+    /// The code `table` (one thread's) holds for `descriptor`, or null -- the probe the emitted
+    /// fast-dispatch handler makes, callable from the dispatcher's lookup so that a thread finds
+    /// what it has already looked up without the cache's lock.
+    CodePtr ProbeFastDispatchTable(void* table, u64 descriptor) const;
+    /// Record `code` for `descriptor` in `table`, as the emitted handler does on a miss.
+    void FillFastDispatchTable(void* table, u64 descriptor, CodePtr code) const;
+
 protected:
+    /// Patch 0022: a callback of the thread's UserCallbacks -- an immediate `this` in a Jit with
+    /// its own cache, `this` read from JitState in a shared one.
+    template<auto mfp>
+    ArgCallback UserCallback() const {
+        if (shared_code) {
+            return DevirtualizeFromJitState<mfp>(conf.callbacks, offsetof(A64JitState, od_callbacks));
+        }
+        return Devirtualize<mfp>(conf.callbacks);
+    }
+    /// Patch 0022: `reg = &conf` of the running thread.
+    void EmitLoadConfPointer(Xbyak::Reg64 reg);
+    /// Patch 0022: `reg` = the running thread's reservation-address / reserved-value slot.
+    void EmitLoadExclusiveAddressPointer(Xbyak::Reg64 reg);
+    void EmitLoadExclusiveValuePointer(Xbyak::Reg64 reg);
+    /// Patch 0022: whether the global monitor's reservation scan may skip the storing
+    /// processor's own slot, which is only known at emit time in a Jit with its own cache.
+    bool SkipOwnMonitorSlot() const { return !shared_code; }
+    /// Patch 0022: `jmp [slot]` to `target`, with the slot's unlinked value -- set the guest PC and
+    /// enter the dispatcher -- emitted right after it.
+    void EmitSlotJump(const IR::LocationDescriptor& target);
+
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
     BlockRangeInformation<u64> block_ranges;
@@ -86,6 +132,8 @@ protected:
     const void* terminal_handler_pop_rsb_hint;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+    /// Patch 0022: the same hash, for a table given as the second argument (a thread's own).
+    FastDispatchEntry& (*fast_dispatch_table_lookup_in)(u64, void*) = nullptr;
     void GenTerminalHandlers();
 
     // Microinstruction emitters

@@ -49,9 +49,12 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
     return fpcr_controlled ? Location().FPCR() : Location().FPCR().ASIMDStandardValue();
 }
 
-A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
+A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface, bool shared)
         : EmitX64(code), conf(conf), jit_interface{jit_interface} {
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+    // Omnidroid patch 0022: before the prelude, which is shared too when this is.
+    shared_code = shared;
+    // In a shared cache each thread owns its table (JitState::od_fast_dispatch_table).
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {
         fast_dispatch_table = std::make_unique<std::array<FastDispatchEntry, fast_dispatch_table_size>>();
     }
     GenMemory128Accessors();
@@ -76,6 +79,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     SCOPE_EXIT {
         code.DisableWriting();
     };
+    // Omnidroid patch 0022: nothing is left over from an emission that threw.
+    pending_slots.clear();
 
     const std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
@@ -140,6 +145,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         deferred_emit();
     }
     code.int3();
+    if (shared_code) {
+        // Omnidroid patch 0022: the block's link slots, right after its code.
+        EmitPendingSlots(block.Location());
+    }
 
     const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
 
@@ -164,8 +173,69 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {
         fast_dispatch_table->fill({});
+    }
+}
+
+size_t A64EmitX64::InvalidateCacheRangesCounted(const boost::icl::interval_set<u64>& ranges) {
+    const auto locations = block_ranges.InvalidateRanges(ranges);
+    size_t dropped = 0;
+    for (const auto& location : locations) {
+        dropped += block_descriptors.count(location);
+    }
+    InvalidateBasicBlocks(locations);
+    return dropped;
+}
+
+size_t A64EmitX64::ForgetAllBlocks() {
+    ASSERT(shared_code);
+    const size_t dropped = block_descriptors.size();
+    UnlinkAllSlots();
+    EmitX64::ClearCache();
+    block_ranges.ClearCache();
+    return dropped;
+}
+
+void A64EmitX64::PurgeFastmemPatchInfo(const void* begin, const void* end) {
+    const u64 lo = reinterpret_cast<u64>(begin);
+    const u64 hi = reinterpret_cast<u64>(end);
+    for (auto it = fastmem_patch_info.begin(); it != fastmem_patch_info.end();) {
+        if (it->first >= lo && it->first < hi) {
+            it = fastmem_patch_info.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+CodePtr A64EmitX64::ProbeFastDispatchTable(void* table, u64 descriptor) const {
+    const FastDispatchEntry& entry = fast_dispatch_table_lookup_in(descriptor, table);
+    return entry.location_descriptor == descriptor ? entry.code_ptr : nullptr;
+}
+
+void A64EmitX64::FillFastDispatchTable(void* table, u64 descriptor, CodePtr code_ptr) const {
+    FastDispatchEntry& entry = fast_dispatch_table_lookup_in(descriptor, table);
+    entry.location_descriptor = descriptor;
+    entry.code_ptr = code_ptr;
+}
+
+size_t A64EmitX64::FastDispatchTableBytes() {
+    return sizeof(FastDispatchEntry) * fast_dispatch_table_size;
+}
+
+void A64EmitX64::ResetFastDispatchTable(void* table) {
+    auto* entries = static_cast<FastDispatchEntry*>(table);
+    for (size_t i = 0; i < fast_dispatch_table_size; i++) {
+        entries[i] = FastDispatchEntry{};
+    }
+}
+
+void A64EmitX64::EmitLoadConfPointer(Xbyak::Reg64 reg) {
+    if (shared_code) {
+        code.mov(reg, qword[r15 + offsetof(A64JitState, od_conf)]);
+    } else {
+        code.mov(reg, reinterpret_cast<u64>(&conf));
     }
 }
 
@@ -230,7 +300,12 @@ void A64EmitX64::GenTerminalHandlers() {
         }
         code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
         code.jne(code.GetReturnFromRunCodeAddress());
-        code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table->data()));
+        if (shared_code) {
+            // Omnidroid patch 0022: the running thread's own table.
+            code.mov(r12, qword[r15 + offsetof(A64JitState, od_fast_dispatch_table)]);
+        } else {
+            code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table->data()));
+        }
         code.mov(rbp, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(rbp, r12);
@@ -241,11 +316,37 @@ void A64EmitX64::GenTerminalHandlers() {
         code.jne(fast_dispatch_cache_miss);
         code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
         code.L(fast_dispatch_cache_miss);
-        code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
-        code.LookupBlock();
-        code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
+        if (shared_code) {
+            // Omnidroid patch 0022: the lookup consults this same table (the dispatcher probes the
+            // running thread's own before taking the cache's lock), so the entry must not name this
+            // location while it still holds another location's code pointer: it is written whole
+            // after the lookup. rbx and rbp are callee-saved, so they survive the call.
+            code.LookupBlock();
+            code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
+            code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+        } else {
+            code.mov(qword[rbp + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+            code.LookupBlock();
+            code.mov(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)], rax);
+        }
         code.jmp(rax);
         PerfMapRegister(terminal_handler_fast_dispatch_hint, code.getCurr(), "a64_terminal_handler_fast_dispatch_hint");
+
+        if (shared_code) {
+            // Omnidroid patch 0022: no C++-callable lookup into "the" table -- there is one per
+            // thread, each reset by its owner (Unpatch does not reach into them) -- but one into a
+            // table the caller names, for the dispatcher's lookup to consult the running thread's.
+            code.align();
+            fast_dispatch_table_lookup_in = code.getCurr<FastDispatchEntry& (*)(u64, void*)>();
+            if (code.HasHostFeature(HostFeature::SSE42)) {
+                code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
+            }
+            code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
+            code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
+            code.ret();
+            PerfMapRegister(fast_dispatch_table_lookup_in, code.getCurr(), "a64_fast_dispatch_table_lookup_in");
+            return;
+        }
 
         code.align();
         fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
@@ -507,9 +608,23 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[0].IsImmediate());
     const u32 imm = args[0].GetImmediateU32();
-    Devirtualize<&A64::UserCallbacks::CallSVC>(conf.callbacks).EmitCall(code, [&](RegList param) {
-        code.mov(param[0], imm);
-    });
+    if (shared_code) {
+        // Omnidroid patch 0022: publish where this call returns to while it is in progress. An
+        // SVC callback can park its thread for a long time (an import that waits); what it will
+        // execute of this block on return is only the tail below, up to the halt test.
+        Xbyak::Label returned;
+        code.lea(rax, ptr[rip + returned]);
+        code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], rax);
+        UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
+            code.mov(param[0], imm);
+        });
+        code.L(returned);
+        code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], 0);
+    } else {
+        UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
+            code.mov(param[0], imm);
+        });
+    }
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
     code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
 }
@@ -520,7 +635,7 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[0].IsImmediate() && args[1].IsImmediate());
     const u64 pc = args[0].GetImmediateU64();
     const u64 exception = args[1].GetImmediateU64();
-    Devirtualize<&A64::UserCallbacks::ExceptionRaised>(conf.callbacks).EmitCall(code, [&](RegList param) {
+    UserCallback<&A64::UserCallbacks::ExceptionRaised>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], pc);
         code.mov(param[1], exception);
     });
@@ -529,13 +644,13 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
-    Devirtualize<&A64::UserCallbacks::DataCacheOperationRaised>(conf.callbacks).EmitCall(code);
+    UserCallback<&A64::UserCallbacks::DataCacheOperationRaised>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64InstructionCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, {}, args[0], args[1]);
-    Devirtualize<&A64::UserCallbacks::InstructionCacheOperationRaised>(conf.callbacks).EmitCall(code);
+    UserCallback<&A64::UserCallbacks::InstructionCacheOperationRaised>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
@@ -553,7 +668,7 @@ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, I
     }
 
     ctx.reg_alloc.HostCall(nullptr);
-    Devirtualize<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>(conf.callbacks).EmitCall(code);
+    UserCallback<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
@@ -567,7 +682,7 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();
     }
-    Devirtualize<&A64::UserCallbacks::GetCNTPCT>(conf.callbacks).EmitCall(code);
+    UserCallback<&A64::UserCallbacks::GetCNTPCT>().EmitCall(code);
 }
 
 void A64EmitX64::EmitA64GetCTR(A64EmitContext& ctx, IR::Inst* inst) {
@@ -584,7 +699,11 @@ void A64EmitX64::EmitA64GetDCZID(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidr_el0) {
+    if (shared_code) {
+        // Omnidroid patch 0022: the running thread's box.
+        code.mov(result, qword[r15 + offsetof(A64JitState, od_tpidr_el0)]);
+        code.mov(result, qword[result]);
+    } else if (conf.tpidr_el0) {
         code.mov(result, u64(conf.tpidr_el0));
         code.mov(result, qword[result]);
     } else {
@@ -595,7 +714,10 @@ void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64GetTPIDRRO(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidrro_el0) {
+    if (shared_code) {
+        code.mov(result, qword[r15 + offsetof(A64JitState, od_tpidrro_el0)]);
+        code.mov(result, qword[result]);
+    } else if (conf.tpidrro_el0) {
         code.mov(result, u64(conf.tpidrro_el0));
         code.mov(result, qword[result]);
     } else {
@@ -608,7 +730,10 @@ void A64EmitX64::EmitA64SetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(args[0]);
     const Xbyak::Reg64 addr = ctx.reg_alloc.ScratchGpr();
-    if (conf.tpidr_el0) {
+    if (shared_code) {
+        code.mov(addr, qword[r15 + offsetof(A64JitState, od_tpidr_el0)]);
+        code.mov(qword[addr], value);
+    } else if (conf.tpidr_el0) {
         code.mov(addr, u64(conf.tpidr_el0));
         code.mov(qword[addr], value);
     }
@@ -623,7 +748,7 @@ std::string A64EmitX64::LocationDescriptorToFriendlyName(const IR::LocationDescr
 
 void A64EmitX64::EmitTerminalImpl(IR::Term::Interpret terminal, IR::LocationDescriptor, bool) {
     code.SwitchMxcsrOnExit();
-    Devirtualize<&A64::UserCallbacks::InterpreterFallback>(conf.callbacks).EmitCall(code, [&](RegList param) {
+    UserCallback<&A64::UserCallbacks::InterpreterFallback>().EmitCall(code, [&](RegList param) {
         code.mov(param[0], A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], param[0]);
         code.mov(param[1].cvt32(), terminal.num_instructions);
@@ -640,6 +765,27 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
         code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
         code.ReturnFromRunCode();
+        return;
+    }
+
+    if (shared_code) {
+        // Omnidroid patch 0022: upstream's check, then a jump through the target's slot rather
+        // than a `jg` that is rewritten when the target appears or goes. Same outcomes: linked,
+        // straight to the target; unlinked, the dispatcher; budget spent (or halt raised, without
+        // cycle counting), leave Run with the PC stored.
+        Xbyak::Label exit;
+        if (conf.enable_cycle_counting) {
+            code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+            code.jng(exit, code.T_NEAR);
+        } else {
+            code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+            code.jne(exit, code.T_NEAR);
+        }
+        EmitSlotJump(terminal.next);
+        code.L(exit);
+        code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
+        code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+        code.ForceReturnFromRunCode();
         return;
     }
 
@@ -673,6 +819,11 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
         code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
         code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
         code.ReturnFromRunCode();
+        return;
+    }
+
+    if (shared_code) {
+        EmitSlotJump(terminal.next);  // Omnidroid patch 0022
         return;
     }
 
@@ -777,9 +928,21 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
     code.EnsurePatchLocationSize(patch_location, 10);
 }
 
+void A64EmitX64::EmitSlotJump(const IR::LocationDescriptor& target) {
+    ASSERT(shared_code);
+    // Unlinked, the slot holds the code right after the jump: set the PC, enter the dispatcher.
+    auto tail = std::make_shared<Xbyak::Label>();
+    Xbyak::Label& slot = NewLinkSlot(target, 0, tail);
+    code.jmp(qword[rip + slot]);
+    code.L(*tail);
+    code.mov(rax, A64::LocationDescriptor{target}.PC());
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    code.jmp(code.GetReturnFromRunCodeAddress());
+}
+
 void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
     EmitX64::Unpatch(location);
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {
         code.DisableWriting();
         (*fast_dispatch_table_lookup)(location.Value()) = {};
         code.EnableWriting();

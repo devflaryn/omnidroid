@@ -529,6 +529,41 @@ void* BlockOfCode::AllocateFromCodeSpace(size_t alloc_size) {
     return ret;
 }
 
+void BlockOfCode::CommitRange([[maybe_unused]] const void* begin, [[maybe_unused]] size_t size) {
+#ifdef _WIN32
+    if (size == 0) {
+        return;
+    }
+#    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+    const DWORD protection = PAGE_READWRITE;
+#    else
+    const DWORD protection = PAGE_EXECUTE_READWRITE;
+#    endif
+    if (VirtualAlloc(const_cast<void*>(begin), size, MEM_COMMIT, protection) == nullptr) {
+        throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
+    }
+#endif
+}
+
+void BlockOfCode::DecommitRange(const void* begin, size_t size) {
+    if (size == 0) {
+        return;
+    }
+#ifdef _WIN32
+    VirtualFree(const_cast<void*>(begin), size, MEM_DECOMMIT);
+#else
+    madvise(const_cast<void*>(begin), size, MADV_DONTNEED);
+#endif
+}
+
+size_t BlockOfCode::PreludeCommittedBytes() const {
+#ifdef _WIN32
+    return committed_size;
+#else
+    return 0;
+#endif
+}
+
 void BlockOfCode::SetCodePtr(CodePtr code_ptr) {
     // The "size" defines where top_, the insertion point, is.
     size_t required_size = reinterpret_cast<const u8*>(code_ptr) - getCode();

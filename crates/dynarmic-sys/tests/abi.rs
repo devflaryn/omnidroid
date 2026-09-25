@@ -33,6 +33,16 @@ fn struct_layouts_match_the_c_header() {
     );
     assert_eq!(l.stats_size as usize, size_of::<OdStats>(), "od_stats size");
     assert_eq!(l.stats_align as usize, align_of::<OdStats>(), "od_stats align");
+    assert_eq!(
+        l.code_cache_stats_size as usize,
+        size_of::<OdCodeCacheStats>(),
+        "od_code_cache_stats size"
+    );
+    assert_eq!(
+        l.code_cache_stats_align as usize,
+        align_of::<OdCodeCacheStats>(),
+        "od_code_cache_stats align"
+    );
 }
 
 #[test]

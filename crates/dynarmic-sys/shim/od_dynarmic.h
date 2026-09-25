@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 1u
+#define OD_DYNARMIC_ABI_VERSION 2u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -310,6 +310,8 @@ typedef struct od_abi_layout {
     uint32_t effective_config_align;
     uint32_t stats_size;
     uint32_t stats_align;
+    uint32_t code_cache_stats_size;
+    uint32_t code_cache_stats_align;
 } od_abi_layout;
 
 uint32_t od_dynarmic_abi_version(void);
@@ -339,6 +341,63 @@ void od_monitor_layout_of(void* monitor, od_monitor_layout* out);
  * `code_cache_size` fails). Never throws, never aborts. */
 void* od_jit_new(const od_config* config);
 void od_jit_free(void* jit);
+
+/* ---------------------------------------------------------------------------
+ * One code cache shared by every jit of a guest address space (vendored patch
+ * 0022, docs/research/shared-jit-cache.md). x64 hosts only: on an arm64 host
+ * `od_code_cache_new` returns null and every jit keeps a cache of its own.
+ *
+ * `template_config` is an `od_config` as a jit of this space would pass it;
+ * every field that shapes emitted code is taken from it and must be equal in
+ * every jit attached (`od_jit_new_shared` returns null otherwise). `ctx` and
+ * the TPIDR pointers are not kept (the TPIDR pointers only need to be non-null
+ * iff the jits' are). The recompile-on-fastmem-failure behaviour is off for a
+ * shared cache, whatever the config says: a declined fault still reaches the
+ * callbacks, on every occurrence, and the block is not recompiled for every
+ * thread from inside a fault handler.
+ *
+ * `total_bytes` is address space (8 MiB..2 GiB), committed as code is
+ * emitted; after the prelude it is cut into regions of `region_bytes`
+ * (>= 8 MiB, at least two). The cache must outlive every jit attached to it.
+ * ------------------------------------------------------------------------ */
+void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, uint64_t region_bytes);
+void od_code_cache_free(void* cache);
+/* As `od_jit_new`, on `cache`. `config->code_cache_size` is ignored. */
+void* od_jit_new_shared(const od_config* config, void* cache);
+/* The cache a jit runs from, or null for a jit with its own. */
+void* od_jit_code_cache(void* jit);
+
+typedef struct od_code_cache_stats {
+    uint64_t blocks_emitted;      /* blocks translated into this cache, by any jit */
+    uint64_t code_bytes_emitted;  /* host code bytes of those blocks */
+    uint64_t translations_raced;  /* misses another jit had translated meanwhile */
+    uint64_t translations_redone; /* translations redone: the code changed while they were made */
+    uint64_t translate_ns;        /* nanoseconds translating (frontend, IR passes), outside the lock */
+    uint64_t emit_ns;             /* nanoseconds emitting host code, holding the lock */
+    uint64_t locked_lookups;      /* dispatcher lookups a jit's own table could not answer */
+    uint64_t invalidations;       /* invalidation requests applied */
+    uint64_t blocks_invalidated;  /* blocks they dropped */
+    uint64_t generation;          /* bumped by each request that dropped a block */
+    uint64_t regions_total;
+    uint64_t regions_retired;
+    uint64_t regions_reclaimed;
+    uint64_t regions_pinned;      /* retired and not yet given back */
+    uint64_t committed_bytes;     /* committed now (Windows); what was made available elsewhere */
+    uint64_t attached;            /* jits attached now */
+} od_code_cache_stats;
+void od_code_cache_stats_of(void* cache, od_code_cache_stats* out);
+
+/* Invalidate for every jit of the cache, now. Not from inside a callback of a
+ * jit on this cache: use `od_jit_invalidate_range` there (it is queued and the
+ * jit halts, as for a jit with its own cache). Same clamping as that call. */
+void od_code_cache_invalidate_range(void* cache, uint64_t addr, uint64_t len);
+void od_code_cache_clear(void* cache);
+
+/* Where a jit's JitState keeps its two exclusive-monitor slot pointers, which code in a shared
+ * cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot addresses
+ * as immediates. For a sampler that recognises monitor code by what it reads. 0 and 0 on an
+ * arm64 host. */
+void od_shared_monitor_slot_offsets(uint32_t* address_offset, uint32_t* value_offset);
 
 /* Run until halted. Returns a bitwise-or of `OD_HALT_*`. */
 uint32_t od_jit_run(void* jit);
@@ -372,6 +431,12 @@ uint32_t od_jit_get_fpsr(void* jit);
 void od_jit_set_fpsr(void* jit, uint32_t value);
 
 /* Discard translations covering [addr, addr+len).
+ *
+ * On a jit attached to a shared code cache, this discards them for every jit
+ * of the cache: at once when this jit is not executing, and -- from inside one
+ * of its callbacks -- queued with a halt, then applied when the run returns.
+ * Every other jit stops using a discarded translation no later than its next
+ * run (and at its next dispatcher entry).
  *
  * `len == 0` is a no-op, and an `addr + len` overflow is clamped to the end of
  * the address space. dynarmic builds a closed interval from `addr + len - 1`

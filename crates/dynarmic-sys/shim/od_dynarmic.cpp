@@ -21,6 +21,9 @@
 /* Internal to dynarmic's x64 backend, and read-only here: the addresses the
  * backend itself bakes into emitted exclusive-access code. */
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+#    include "dynarmic/backend/x64/a64_jitstate.h"
+#endif
 #if defined(__aarch64__)
 #    include "dynarmic/backend/arm64/page_backed_allocator.h"
 #endif
@@ -215,13 +218,28 @@ public:
     u64 GetCNTPCT() override { return cb.get_cntpct(ctx); }
 };
 
+struct OdCodeCache;
+
 struct OdJit {
     ShimCallbacks callbacks;
     /* Kept so `od_jit_effective_config` reports what dynarmic holds rather than
      * what the caller asked for. */
     A64::UserConfig conf{};
     A64::Jit* jit = nullptr;
+    /* The shared code cache this jit runs from (patch 0022), or null. */
+    OdCodeCache* cache = nullptr;
 };
+
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+/* A shared code cache, and the callbacks object its template names: never called, only the
+ * class every attached jit's callbacks have (patch 0022 resolves callback addresses from it). */
+struct OdCodeCache {
+    ShimCallbacks template_callbacks;
+    A64::SharedCodeCache* cache = nullptr;
+};
+#else
+struct OdCodeCache {};
+#endif
 
 inline OdJit* as_jit(void* p) { return static_cast<OdJit*>(p); }
 
@@ -244,6 +262,65 @@ bool callbacks_complete(const od_callbacks* c) {
         && c->get_ticks_remaining;
 }
 
+/* The checks `od_jit_new` has always made, shared with the shared-cache entry points. */
+bool config_acceptable(const od_config* config) {
+    if (config == nullptr || config->abi_version != OD_DYNARMIC_ABI_VERSION) {
+        return false;
+    }
+    if (config->callbacks == nullptr || !callbacks_complete(config->callbacks)) {
+        return false;
+    }
+    if (config->fastmem_enabled
+        && (config->fastmem_address_space_bits < 12 || config->fastmem_address_space_bits > 64)) {
+        return false;
+    }
+    if (config->monitor != nullptr) {
+        const auto* mon = static_cast<const ExclusiveMonitor*>(config->monitor);
+        if (static_cast<std::size_t>(config->processor_id) >= mon->GetProcessorCount()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* `od_config` to dynarmic's `UserConfig`, exactly as `od_jit_new` has always built it. */
+A64::UserConfig user_config_of(const od_config* config, A64::UserCallbacks* callbacks) {
+    A64::UserConfig uc{};
+    uc.callbacks = callbacks;
+    uc.processor_id = static_cast<std::size_t>(config->processor_id);
+    uc.global_monitor = static_cast<ExclusiveMonitor*>(config->monitor);
+    uc.optimizations = static_cast<Dynarmic::OptimizationFlag>(config->optimizations);
+    uc.unsafe_optimizations = config->unsafe_optimizations != 0;
+    uc.hook_data_cache_operations = false;
+    uc.hook_isb = false;
+    uc.hook_hint_instructions = config->hook_hint_instructions != 0;
+    uc.cntfrq_el0 = config->cntfrq_el0 != 0 ? config->cntfrq_el0 : 600000000u;
+    if (config->ctr_el0 != 0) {
+        uc.ctr_el0 = config->ctr_el0;
+    }
+    uc.dczid_el0 = config->dczid_el0;
+    uc.tpidr_el0 = config->tpidr_el0;
+    uc.tpidrro_el0 = config->tpidrro_el0;
+    uc.page_table = nullptr;
+    if (config->fastmem_enabled) {
+        uc.fastmem_pointer = static_cast<std::uintptr_t>(config->fastmem_pointer);
+        uc.fastmem_address_space_bits = static_cast<std::size_t>(config->fastmem_address_space_bits);
+        uc.silently_mirror_fastmem = config->silently_mirror_fastmem != 0;
+        uc.recompile_on_fastmem_failure = config->recompile_on_fastmem_failure != 0;
+        uc.fastmem_exclusive_access = config->fastmem_exclusive_access != 0;
+    } else {
+        uc.fastmem_pointer = std::nullopt;
+    }
+    uc.define_unpredictable_behaviour = config->define_unpredictable_behaviour != 0;
+    uc.check_halt_on_memory_access = config->check_halt_on_memory_access != 0;
+    uc.enable_cycle_counting = config->enable_cycle_counting != 0;
+    uc.wall_clock_cntpct = config->wall_clock_cntpct != 0;
+    if (config->code_cache_size != 0) {
+        uc.code_cache_size = static_cast<std::size_t>(config->code_cache_size);
+    }
+    return uc;
+}
+
 }  // namespace
 
 extern "C" {
@@ -259,6 +336,8 @@ void od_dynarmic_abi_layout(od_abi_layout* out) {
     out->effective_config_align = static_cast<uint32_t>(alignof(od_effective_config));
     out->stats_size = static_cast<uint32_t>(sizeof(od_stats));
     out->stats_align = static_cast<uint32_t>(alignof(od_stats));
+    out->code_cache_stats_size = static_cast<uint32_t>(sizeof(od_code_cache_stats));
+    out->code_cache_stats_align = static_cast<uint32_t>(alignof(od_code_cache_stats));
 }
 
 void* od_monitor_new(uint64_t processor_count) {
@@ -391,6 +470,149 @@ void od_jit_free(void* p) {
     OdJit* self = as_jit(p);
     delete self->jit;
     delete self;
+}
+
+void* od_code_cache_new(const od_config* template_config, uint64_t total_bytes, uint64_t region_bytes) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (!config_acceptable(template_config)) {
+        return nullptr;
+    }
+    /* The x64 backend's reach: every block jumps to the prelude with a rel32. */
+    if (total_bytes < (8ull << 20) || total_bytes > (2ull << 30) || region_bytes < (8ull << 20)) {
+        return nullptr;
+    }
+    OdCodeCache* self = nullptr;
+    try {
+        self = new OdCodeCache{};
+        A64::UserConfig uc = user_config_of(template_config, &self->template_callbacks);
+        self->cache = new A64::SharedCodeCache{uc, static_cast<std::size_t>(total_bytes), static_cast<std::size_t>(region_bytes)};
+        return self;
+    } catch (...) {
+        delete self;
+        return nullptr;
+    }
+#else
+    (void)template_config;
+    (void)total_bytes;
+    (void)region_bytes;
+    return nullptr;
+#endif
+}
+
+void od_code_cache_free(void* p) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p == nullptr) {
+        return;
+    }
+    auto* self = static_cast<OdCodeCache*>(p);
+    delete self->cache;
+    delete self;
+#else
+    (void)p;
+#endif
+}
+
+void* od_jit_new_shared(const od_config* config, void* cache) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (cache == nullptr || !config_acceptable(config)) {
+        return nullptr;
+    }
+    OdJit* self = nullptr;
+    try {
+        self = new OdJit{};
+        self->callbacks.cb = *config->callbacks;
+        self->callbacks.ctx = config->ctx;
+        A64::UserConfig uc = user_config_of(config, &self->callbacks);
+        /* A shared block is not recompiled from a fault handler (see the header). */
+        uc.recompile_on_fastmem_failure = false;
+        uc.recompile_on_exclusive_fastmem_failure = false;
+        uc.shared_code_cache = static_cast<OdCodeCache*>(cache)->cache;
+        self->conf = uc;
+        self->cache = static_cast<OdCodeCache*>(cache);
+        /* Throws std::invalid_argument when this config shapes code differently from the
+         * cache's template; caught below as every other construction failure is. */
+        self->jit = new A64::Jit{uc};
+        return self;
+    } catch (...) {
+        delete self;
+        return nullptr;
+    }
+#else
+    (void)config;
+    (void)cache;
+    return nullptr;
+#endif
+}
+
+void* od_jit_code_cache(void* p) {
+    return as_jit(p)->cache;
+}
+
+void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
+    *out = od_code_cache_stats{};
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p == nullptr) {
+        return;
+    }
+    const auto s = static_cast<OdCodeCache*>(p)->cache->GetStats();
+    out->blocks_emitted = s.blocks_emitted;
+    out->code_bytes_emitted = s.code_bytes_emitted;
+    out->translations_raced = s.translations_raced;
+    out->translations_redone = s.translations_redone;
+    out->translate_ns = s.translate_ns;
+    out->emit_ns = s.emit_ns;
+    out->locked_lookups = s.locked_lookups;
+    out->invalidations = s.invalidations;
+    out->blocks_invalidated = s.blocks_invalidated;
+    out->generation = s.generation;
+    out->regions_total = s.regions_total;
+    out->regions_retired = s.regions_retired;
+    out->regions_reclaimed = s.regions_reclaimed;
+    out->regions_pinned = s.regions_pinned;
+    out->committed_bytes = s.committed_bytes;
+    out->attached = s.attached;
+#else
+    (void)p;
+#endif
+}
+
+void od_code_cache_invalidate_range(void* p, uint64_t addr, uint64_t len) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p == nullptr || len == 0) {
+        return;
+    }
+    /* The clamp `od_jit_invalidate_range` documents. */
+    const uint64_t room = std::numeric_limits<uint64_t>::max() - addr;
+    if (len - 1 > room) {
+        len = room + 1;
+    }
+    static_cast<OdCodeCache*>(p)->cache->InvalidateCacheRange(addr, static_cast<std::size_t>(len));
+#else
+    (void)p;
+    (void)addr;
+    (void)len;
+#endif
+}
+
+void od_shared_monitor_slot_offsets(uint32_t* address_offset, uint32_t* value_offset) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    using Dynarmic::Backend::X64::A64JitState;
+    *address_offset = static_cast<uint32_t>(offsetof(A64JitState, od_exclusive_address));
+    *value_offset = static_cast<uint32_t>(offsetof(A64JitState, od_exclusive_value));
+#else
+    *address_offset = 0;
+    *value_offset = 0;
+#endif
+}
+
+void od_code_cache_clear(void* p) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr) {
+        static_cast<OdCodeCache*>(p)->cache->ClearCache();
+    }
+#else
+    (void)p;
+#endif
 }
 
 uint32_t od_jit_run(void* p) {

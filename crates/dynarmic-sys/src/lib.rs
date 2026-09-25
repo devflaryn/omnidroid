@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 1;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 2;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -516,6 +516,53 @@ pub struct OdAbiLayout {
     pub stats_size: u32,
     /// `alignof(od_stats)`.
     pub stats_align: u32,
+    /// `sizeof(od_code_cache_stats)`.
+    pub code_cache_stats_size: u32,
+    /// `alignof(od_code_cache_stats)`.
+    pub code_cache_stats_align: u32,
+}
+
+/// What a shared code cache (vendored patch 0022, [`od_code_cache_new`]) has done, from
+/// [`od_code_cache_stats_of`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OdCodeCacheStats {
+    /// Blocks translated and emitted into the cache, by any jit.
+    pub blocks_emitted: u64,
+    /// Host code bytes of those blocks.
+    pub code_bytes_emitted: u64,
+    /// Misses another jit had translated by the time this one held the lock.
+    pub translations_raced: u64,
+    /// Translations made again under the lock, because an invalidation touched their code while
+    /// they were being made outside it.
+    pub translations_redone: u64,
+    /// Nanoseconds spent translating (the frontend and the IR passes), outside the lock, summed
+    /// over the threads that did it.
+    pub translate_ns: u64,
+    /// Nanoseconds spent emitting host code, holding the lock.
+    pub emit_ns: u64,
+    /// Dispatcher lookups a jit's own fast-dispatch table could not answer, which took the
+    /// cache's lock.
+    pub locked_lookups: u64,
+    /// Invalidation requests applied.
+    pub invalidations: u64,
+    /// Blocks those requests dropped.
+    pub blocks_invalidated: u64,
+    /// Bumped by each request that dropped a block; a jit catches its return-stack buffer and
+    /// fast-dispatch table up with it at its next run or dispatcher entry.
+    pub generation: u64,
+    /// Regions the buffer is cut into after the prelude.
+    pub regions_total: u64,
+    /// Region retirements so far (a region is retired when it is full).
+    pub regions_retired: u64,
+    /// Retired regions given back to the OS so far.
+    pub regions_reclaimed: u64,
+    /// Regions retired and not given back yet.
+    pub regions_pinned: u64,
+    /// Bytes committed now (Windows); where pages come on first touch, what was made available.
+    pub committed_bytes: u64,
+    /// Jits attached now.
+    pub attached: u64,
 }
 
 extern "C" {
@@ -564,9 +611,70 @@ extern "C" {
     /// Destroy a jit. Null is accepted.
     ///
     /// # Safety
-    /// `jit` must come from [`od_jit_new`], must not be executing, and must not
-    /// be freed twice.
+    /// `jit` must come from [`od_jit_new`] or [`od_jit_new_shared`], must not be executing, and
+    /// must not be freed twice.
     pub fn od_jit_free(jit: *mut c_void);
+
+    /// Create a code cache every jit of one guest address space can share (vendored patch 0022,
+    /// `docs/research/shared-jit-cache.md`). `template_config` is a config as a jit of the space
+    /// would pass it: every field that shapes emitted code is taken from it. `total_bytes` is
+    /// address space (8 MiB..2 GiB) committed as code is emitted, cut into regions of
+    /// `region_bytes` (at least 8 MiB, at least two). Null on an arm64 host, where the backend has
+    /// no shared cache, and for a refused configuration.
+    ///
+    /// # Safety
+    /// `template_config` must be a valid `OdConfig`; its `callbacks` pointer is read during the
+    /// call. The cache must be freed with [`od_code_cache_free`] after every jit attached to it.
+    pub fn od_code_cache_new(template_config: *const OdConfig, total_bytes: u64, region_bytes: u64) -> *mut c_void;
+
+    /// Free a cache from [`od_code_cache_new`]. Null is accepted.
+    ///
+    /// # Safety
+    /// No jit attached to it may still exist.
+    pub fn od_code_cache_free(cache: *mut c_void);
+
+    /// As [`od_jit_new`], but translating into and running from `cache`. Null if `config` shapes
+    /// code differently from the cache's template, or for anything `od_jit_new` refuses.
+    /// `config.code_cache_size` is ignored, and recompiling on a fastmem failure is off.
+    ///
+    /// # Safety
+    /// As [`od_jit_new`]; `cache` must come from [`od_code_cache_new`] and outlive the jit.
+    pub fn od_jit_new_shared(config: *const OdConfig, cache: *mut c_void) -> *mut c_void;
+
+    /// The shared cache `jit` runs from, or null for a jit with its own.
+    ///
+    /// # Safety
+    /// `jit` must be live.
+    pub fn od_jit_code_cache(jit: *mut c_void) -> *mut c_void;
+
+    /// Read a shared cache's counters.
+    ///
+    /// # Safety
+    /// `cache` must be live (or null, which zeroes `out`); `out` must be writable.
+    pub fn od_code_cache_stats_of(cache: *mut c_void, out: *mut OdCodeCacheStats);
+
+    /// Invalidate `[addr, addr + len)` for every jit of the cache, now. Clamped as
+    /// [`od_jit_invalidate_range`] is.
+    ///
+    /// # Safety
+    /// `cache` must be live, and this must not be called from inside a callback of a jit attached
+    /// to it (use [`od_jit_invalidate_range`] there).
+    pub fn od_code_cache_invalidate_range(cache: *mut c_void, addr: u64, len: u64);
+
+    /// Drop every translation of the cache, now. Same restriction.
+    ///
+    /// # Safety
+    /// As [`od_code_cache_invalidate_range`].
+    pub fn od_code_cache_clear(cache: *mut c_void);
+
+    /// Where a jit's `JitState` keeps the two exclusive-monitor slot pointers that code in a shared
+    /// cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot
+    /// addresses as immediates -- for a sampler that recognises monitor code by what it reads.
+    /// `(0, 0)` on an arm64 host.
+    ///
+    /// # Safety
+    /// Both pointers must be writable.
+    pub fn od_shared_monitor_slot_offsets(address_offset: *mut u32, value_offset: *mut u32);
 
     /// Run guest code until halted. Returns a bitwise-or of `OD_HALT_*`,
     /// [`OD_HALT_SHIM_REENTERED`] if called from inside a callback, or

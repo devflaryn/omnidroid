@@ -5,6 +5,8 @@
 
 #include "dynarmic/backend/x64/emit_x64.h"
 
+#include <algorithm>
+#include <atomic>
 #include <iterator>
 
 #include <mcl/assert.hpp>
@@ -88,8 +90,15 @@ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, I
 
     code.mov(loc_desc_reg, target.Value());
 
-    patch_information[target].mov_rcx.push_back(code.getCurr());
-    EmitPatchMovRcx(target_code_ptr);
+    if (shared_code) {
+        // Omnidroid patch 0022: the code pointer comes from a slot, never from a rewritten
+        // immediate. Unlinked, it is the dispatcher -- what upstream's patch site holds then.
+        Xbyak::Label& slot = NewLinkSlot(target, reinterpret_cast<u64>(code.GetReturnFromRunCodeAddress()));
+        code.mov(rcx, qword[rip + slot]);
+    } else {
+        patch_information[target].mov_rcx.push_back(code.getCurr());
+        EmitPatchMovRcx(target_code_ptr);
+    }
 
     code.mov(qword[r15 + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_location_descriptors], loc_desc_reg);
     code.mov(qword[r15 + index_reg * 8 + code.GetJitStateInfo().offsetof_rsb_codeptrs], rcx);
@@ -379,6 +388,70 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
     }
 
     code.SetCodePtr(save_code_ptr);
+
+    // Omnidroid patch 0022: a shared cache's links. One aligned 8-byte store each: a thread
+    // loading the slot sees the old target or the new one, and both are code.
+    for (const LinkSlot& link : patch_info.slots) {
+        const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : link.unlinked;
+        std::atomic_ref<u64>{*link.slot}.store(value, std::memory_order_release);
+    }
+}
+
+Xbyak::Label& EmitX64::NewLinkSlot(const IR::LocationDescriptor& target, u64 unlinked, std::shared_ptr<Xbyak::Label> tail) {
+    ASSERT(shared_code);
+    pending_slots.push_back(PendingSlot{std::make_shared<Xbyak::Label>(), target, unlinked, std::move(tail)});
+    return *pending_slots.back().label;
+}
+
+void EmitX64::EmitPendingSlots(const IR::LocationDescriptor& location) {
+    if (pending_slots.empty()) {
+        return;
+    }
+    auto& own = outgoing_slots[location];
+    code.align(8);
+    for (PendingSlot& pending : pending_slots) {
+        code.L(*pending.label);
+        u64* const slot = code.getCurr<u64*>();
+        code.dq(0);
+        const u64 unlinked = pending.tail ? reinterpret_cast<u64>(pending.tail->getAddress()) : pending.unlinked;
+        const auto iter = block_descriptors.find(pending.target);
+        // Not yet published: no thread has been given this block, so a plain store is enough. The
+        // block becomes reachable through the block map or another slot, both written after this.
+        *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(iter->second.entrypoint) : unlinked;
+        patch_information[pending.target].slots.push_back(LinkSlot{slot, unlinked});
+        own.emplace_back(pending.target, slot);
+    }
+    pending_slots.clear();
+}
+
+void EmitX64::ForgetOutgoingSlots(const IR::LocationDescriptor& location) {
+    const auto own = outgoing_slots.find(location);
+    if (own == outgoing_slots.end()) {
+        return;
+    }
+    for (const auto& [target, slot] : own->second) {
+        const auto info = patch_information.find(target);
+        if (info == patch_information.end()) {
+            continue;
+        }
+        auto& slots = info.value().slots;
+        const auto at = std::find_if(slots.begin(), slots.end(), [slot = slot](const LinkSlot& l) { return l.slot == slot; });
+        if (at != slots.end()) {
+            // A thread still running the dropped block leaves it for the dispatcher at this link.
+            std::atomic_ref<u64>{*at->slot}.store(at->unlinked, std::memory_order_release);
+            *at = slots.back();
+            slots.pop_back();
+        }
+    }
+    outgoing_slots.erase(own);
+}
+
+void EmitX64::UnlinkAllSlots() {
+    for (auto& [target, info] : patch_information) {
+        for (const LinkSlot& link : info.slots) {
+            std::atomic_ref<u64>{*link.slot}.store(link.unlinked, std::memory_order_release);
+        }
+    }
 }
 
 void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
@@ -390,6 +463,7 @@ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
 void EmitX64::ClearCache() {
     block_descriptors.clear();
     patch_information.clear();
+    outgoing_slots.clear();
 
     PerfMapClear();
 }
@@ -407,6 +481,9 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
         }
 
         Unpatch(descriptor);
+        if (shared_code) {
+            ForgetOutgoingSlots(descriptor);  // Omnidroid patch 0022
+        }
 
         block_descriptors.erase(it);
     }

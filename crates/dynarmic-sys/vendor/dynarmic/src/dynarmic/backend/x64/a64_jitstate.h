@@ -73,6 +73,22 @@ struct A64JitState {
         const u64 pc_u64 = pc & A64::LocationDescriptor::pc_mask;
         return pc_u64 | fpcr_u64;
     }
+
+    // Omnidroid patch 0022: what code emitted into a shared code cache (A64::SharedCodeCache)
+    // reads per thread at run time instead of baking in as an immediate. At the end of the
+    // struct so that no other offset moves; zero and unread in a Jit with its own cache.
+    u64 od_callbacks = 0;            ///< A64::UserCallbacks*: `this` of every callback
+    u64 od_conf = 0;                 ///< const A64::UserConfig*: the non-inline exclusives' argument
+    u64 od_lookup_arg = 0;           ///< the Jit::Impl* the dispatcher's LookupBlock is called with
+    u64 od_exclusive_address = 0;    ///< this processor's reservation-address slot in the monitor
+    u64 od_exclusive_value = 0;      ///< this processor's reserved-value slot in the monitor
+    u64 od_tpidr_el0 = 0;            ///< u64*: TPIDR_EL0
+    u64 od_tpidrro_el0 = 0;          ///< const u64*: TPIDRRO_EL0
+    u64 od_fast_dispatch_table = 0;  ///< this thread's fast-dispatch table
+    /// Where this thread returns into generated code from the SVC callback it is inside, or 0
+    /// (written by the SVC call sequence itself). A thread parked in a callback holds only the few
+    /// bytes after that site of a retired region, so the region can be reused around them.
+    u64 od_callback_return = 0;
 };
 
 #ifdef _MSC_VER

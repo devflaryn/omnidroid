@@ -358,8 +358,12 @@ void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64
     EmitSpinLockUnlock(code, pointer, tmp);
 }
 
+// Omnidroid patch 0022: `skip_own_slot` false scans the storing processor's own slot too, as
+// dynarmic's own ExclusiveMonitor::CheckAndClear does -- code emitted into a shared cache does not
+// know at emit time which processor will run it. The own slot matched `vaddr` (it was checked just
+// before), and nothing reads it again before that processor's next exclusive load rewrites it.
 template<typename UserConfig>
-void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 vaddr, Xbyak::Reg64 pointer, Xbyak::Reg64 tmp) {
+void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 vaddr, Xbyak::Reg64 pointer, Xbyak::Reg64 tmp, bool skip_own_slot = true) {
     if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
         return;
     }
@@ -367,7 +371,7 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
     code.mov(tmp, 0xDEAD'DEAD'DEAD'DEAD);
     const size_t processor_count = GetExclusiveMonitorProcessorCount(conf.global_monitor);
     for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
-        if (processor_index == conf.processor_id) {
+        if (skip_own_slot && processor_index == conf.processor_id) {
             continue;
         }
         Xbyak::Label ok;

@@ -133,5 +133,61 @@ private:
     std::unique_ptr<Impl> impl;
 };
 
+/**
+ * Omnidroid patch 0022 (x64 backend only): one code cache -- prelude, translated blocks, block
+ * map -- shared by every Jit of one guest address space (UserConfig::shared_code_cache), so a
+ * block translated by one thread is executed by all of them.
+ *
+ * `template_config` supplies every field that shapes emitted code; `callbacks` must point at an
+ * object of the same class as every attached Jit's callbacks (it is never called), and the
+ * TPIDR pointers only need to be non-null iff the attached Jits' are. The recompile-on-fastmem-
+ * failure flags are forced off: a shared block is never recompiled from inside a fault handler.
+ *
+ * `total_bytes` is address space, committed as code is emitted; after the prelude it is divided
+ * into regions of `region_bytes`. A full region is retired and its memory given back once no
+ * thread can still be executing it (every attached Jit has left or re-entered Run since).
+ *
+ * Translation is serialized by one lock; execution takes none. Invalidation (a Jit's
+ * InvalidateCacheRange/ClearCache, or the calls below) applies to every Jit: each stops using a
+ * dropped translation no later than its next Run.
+ */
+class SharedCodeCache final {
+public:
+    SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes);
+    ~SharedCodeCache();
+
+    SharedCodeCache(const SharedCodeCache&) = delete;
+    SharedCodeCache& operator=(const SharedCodeCache&) = delete;
+
+    struct Stats {
+        std::uint64_t blocks_emitted = 0;        ///< blocks translated and emitted into this cache
+        std::uint64_t code_bytes_emitted = 0;    ///< host code bytes of those blocks
+        std::uint64_t translations_raced = 0;    ///< misses another thread had emitted meanwhile
+        std::uint64_t translations_redone = 0;   ///< translations redone because the code changed meanwhile
+        std::uint64_t translate_ns = 0;          ///< time translating (frontend and IR passes), outside the lock
+        std::uint64_t emit_ns = 0;               ///< time emitting host code, holding the lock
+        std::uint64_t locked_lookups = 0;        ///< dispatcher lookups its threads' own tables could not answer
+        std::uint64_t invalidations = 0;         ///< invalidation requests applied
+        std::uint64_t blocks_invalidated = 0;    ///< blocks those requests dropped
+        std::uint64_t generation = 0;            ///< bumped by every request that dropped a block
+        std::uint64_t regions_total = 0;
+        std::uint64_t regions_retired = 0;       ///< region retirements so far
+        std::uint64_t regions_reclaimed = 0;     ///< retired regions given back so far
+        std::uint64_t regions_pinned = 0;        ///< retired regions a running thread still holds
+        std::uint64_t committed_bytes = 0;       ///< code-cache bytes committed now, prelude included
+        std::uint64_t attached = 0;              ///< Jits attached now
+    };
+    Stats GetStats() const;
+
+    /// Invalidate [start, start + length) for every attached Jit, now. Must not be called from
+    /// inside a callback of a Jit attached to this cache (use Jit::InvalidateCacheRange there).
+    void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);
+    /// Drop every translation, now. Same restriction.
+    void ClearCache();
+
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
 }  // namespace A64
 }  // namespace Dynarmic

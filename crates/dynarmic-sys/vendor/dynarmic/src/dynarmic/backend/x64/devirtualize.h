@@ -8,6 +8,7 @@
 #include <cstring>
 #include <utility>
 
+#include <mcl/assert.hpp>
 #include <mcl/bit_cast.hpp>
 #include <mcl/stdint.hpp>
 #include <mcl/type_traits/function_info.hpp>
@@ -75,6 +76,17 @@ ArgCallback Devirtualize(mcl::class_type<decltype(mfp)>* this_) {
 #else
     return DevirtualizeGeneric<mfp>(this_);
 #endif
+}
+
+/// Omnidroid patch 0022: the callback `mfp` resolves to for `template_this`, with `this` read at
+/// call time from `[r15 + jit_state_offset]` -- the running thread's own callbacks object, which
+/// must be of the same class (the function address is resolved once, from `template_this`). The
+/// `this` adjustment must be zero, since what JitState holds is the unadjusted pointer.
+template<auto mfp>
+ArgCallback DevirtualizeFromJitState(mcl::class_type<decltype(mfp)>* template_this, size_t jit_state_offset) {
+    const ArgCallback resolved = Devirtualize<mfp>(template_this);
+    ASSERT(resolved.Arg() == reinterpret_cast<u64>(template_this));
+    return resolved.WithArgFromJitState(jit_state_offset);
 }
 
 }  // namespace Backend::X64
