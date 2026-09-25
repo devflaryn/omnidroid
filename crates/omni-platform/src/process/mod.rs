@@ -263,6 +263,41 @@ pub fn app_data_dir() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Whether the host environment variable `name` is set, **without allocating**.
+///
+/// For the one caller that cannot use `std::env`: a global allocator deciding, at its first
+/// allocation, whether to count (`omni_android::memreport::CountingAllocator`). `std::env::var_os`
+/// allocates the value it returns, and an allocator that allocates to decide how to allocate
+/// recurses. `GetEnvironmentVariableA` with no buffer answers the length the value needs (0 when
+/// the variable is absent); `getenv(3)` answers a pointer or NULL. Neither reaches the Rust
+/// allocator. The **host's** environment, read for this runtime's own configuration -- never
+/// handed to the guest (see "The environment is not on this seam" above).
+#[must_use]
+pub fn env_is_set_raw(name: &core::ffi::CStr) -> bool {
+    #[cfg(windows)]
+    {
+        // SAFETY: `name` is NUL-terminated; a null buffer of size 0 asks only for the length.
+        unsafe {
+            windows_sys::Win32::System::Environment::GetEnvironmentVariableA(
+                name.as_ptr().cast(),
+                core::ptr::null_mut(),
+                0,
+            ) != 0
+        }
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `name` is NUL-terminated; getenv reads the environment and returns a pointer
+        // into it or NULL, and nothing here dereferences it.
+        unsafe { !libc::getenv(name.as_ptr()).is_null() }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 /// The most descriptors this process may hold open, after raising the soft limit once as far as
 /// the host allows. Idempotent and cheap after the first call; the filesystem and network seams
 /// call it before they open anything, so no caller has to remember to.

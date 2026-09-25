@@ -43,6 +43,9 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
+    # `process::env_is_set_raw`: `GetEnvironmentVariableA`, which a global allocator can call where
+    # `std::env` (which allocates) cannot be.
+    "Win32_System_Environment",
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",

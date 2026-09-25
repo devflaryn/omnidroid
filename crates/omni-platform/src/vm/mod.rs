@@ -90,8 +90,10 @@
 use core::fmt;
 use std::path::Path;
 
+mod census;
 mod error;
 
+pub use census::{HeapTotals, HostRegion, HostRegionKind, Residency, ResidentSet};
 pub use error::{OsError, VmError, VmResult};
 
 // The backend modules are **private**. Everything a caller may use is re-exported from this module
@@ -1212,6 +1214,41 @@ pub fn process_memory() -> VmResult<ProcessMemory> {
 /// [`VmError::Os`] if the OS refuses to report it, carrying its code.
 pub fn physical_memory() -> VmResult<u64> {
     backend::physical_memory()
+}
+
+/// Every region of this process's address space the OS has -- reserved, committed or mapped --
+/// with what kind of memory it is, how much is committed, how much is resident, and whether it is a
+/// thread's stack. The census a memory report attributes by address; `vm/census.rs` has the table
+/// of what each field is on each host.
+///
+/// **Not a delegation to `backend`, deliberately**: the three bodies live side by side in
+/// `vm/census.rs`, because they share one pure core (the page list) and none of them touches the
+/// backend's own state. A measurement call: tens of milliseconds, never on a hot path.
+///
+/// # Errors
+///
+/// [`VmError::Os`] if the OS refuses the walk; [`VmError::Unsupported`] on macOS.
+pub fn process_regions() -> VmResult<Vec<HostRegion>> {
+    census::process_regions()
+}
+
+/// A snapshot of which of this process's pages are resident, for asking about any range --
+/// finer than an OS region. See [`ResidentSet::in_range`].
+///
+/// # Errors
+///
+/// [`VmError::Os`] if the OS refuses; [`VmError::Unsupported`] on macOS.
+pub fn resident_set() -> VmResult<ResidentSet> {
+    census::resident_set()
+}
+
+/// What this process's C heaps hold. See [`HeapTotals`].
+///
+/// # Errors
+///
+/// [`VmError::Os`] if the OS refuses; [`VmError::Unsupported`] on macOS.
+pub fn heap_totals() -> VmResult<HeapTotals> {
+    census::heap_totals()
 }
 
 // ---------------------------------------------------------------------------------------------
