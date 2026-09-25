@@ -8279,6 +8279,78 @@ fn a_dead_threads_record_keeps_its_registers_and_the_top_of_its_stack() {
     );
 }
 
+/// **A thread killed by a refused import names its caller: `X30`, then the frame walk, as link
+/// addresses on the record's one line.**
+///
+/// MEASURED need: m9 (2026-09-25) printed `raise` refusing `raise(5)` on a TaskScheduler worker,
+/// and the line printed when it died named the thunk and nothing else -- which says `raise`, not
+/// the engine path that raised. Here the start routine calls a function that builds a frame
+/// record and raises `SIGTRAP`, the shape of the engine's `RBXCRASH`. A record that lost `X30`, a
+/// walk that skipped the frame record or kept `X30` in it twice, or a line that printed an
+/// address inside the image as an absolute one, each fail here.
+#[test]
+fn a_refused_imports_death_names_its_caller_and_the_frames_above_it() {
+    let _guard = serialized();
+    let f = fixture_with_threads(4);
+    let out = f.guest.data + 0x800;
+    // `STP X29, X30, [SP, #-16]!` then `MOV X29, SP`, from the encoders the harness has.
+    let frame = |asm: &mut Asm| {
+        asm.push(sub_imm(31, 31, 16));
+        asm.push(str_imm(29, 31, 0));
+        asm.push(str_imm(30, 31, 8));
+        asm.push(add_imm(29, 31, 0));
+    };
+    let mut raised_from: omni_cpu::GuestAddr = 0;
+    let crash = start_routine(&f, |asm| {
+        frame(asm);
+        asm.mov(0, 5); // SIGTRAP, which is what `RBXCRASH` raises
+        asm.bl(f.thunk("raise"));
+        raised_from = asm.pc();
+    });
+    let mut called_from: omni_cpu::GuestAddr = 0;
+    let start = start_routine(&f, |asm| {
+        frame(asm);
+        asm.bl(crash);
+        called_from = asm.pc();
+    });
+    let entry = program(&f, |asm| {
+        create_call(&f, asm, out, 0, start, 0);
+        asm.mov(22, out as u64);
+        asm.push(ldr_imm(0, 22, 0));
+        asm.mov(1, 0);
+        asm.bl(f.thunk("pthread_join"));
+    });
+    assert!(run_program(&f, entry).is_err(), "the join refuses a thread that died");
+
+    let failures = f.bionic.guest_thread_failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let failure = &failures[0];
+    assert!(failure.why.contains("`raise`"), "the refusal is the death: {}", failure.why);
+    assert_eq!(
+        failure.link_register(),
+        Some(raised_from as u64),
+        "X30 is the return address of the BL into `raise`, which no thunk touches"
+    );
+    // The frame the crashing function built names the start routine's call, and the start
+    // routine's own frame names the sentinel the runner put in X30; its saved X29 is the thread's
+    // initial zero, which ends the walk.
+    assert_eq!(
+        failure.frame_walk(),
+        &[called_from as u64, f.boundary.sentinel() as u64][..],
+        "the X29 chain, innermost first, without X30 in it again: {:?}",
+        failure.stack
+    );
+
+    // The one line, with the code region standing in for the library.
+    let image = f.guest.code..f.guest.code + harness::CODE_BYTES;
+    let line = failure.located(f.guest.code, image);
+    let expected_lr = format!("lr link {:#x}", raised_from - f.guest.code);
+    assert!(line.contains(&expected_lr), "`{expected_lr}` in: {line}");
+    let expected_walk = format!("frames [link {:#x}, abs ", called_from - f.guest.code);
+    assert!(line.contains(&expected_walk), "`{expected_walk}` in: {line}");
+    assert!(line.starts_with("pc abs "), "the thunk is outside the image and says so: {line}");
+}
+
 /// Assemble a start routine's prologue that **puts a per-thread record on the thread's own stack
 /// and publishes its address at `published`**, the way the engine registers a profiler log carved
 /// out of a worker's stack in a global table.

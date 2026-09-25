@@ -526,6 +526,71 @@ impl core::fmt::Display for GuestThreadFailure {
     }
 }
 
+/// Frames of the walk [`GuestThreadFailure::located`] names: enough to reach the engine path
+/// that asked, and few enough for the one line a run prints the moment a thread dies.
+pub const LOCATED_FRAMES: usize = 8;
+
+impl GuestThreadFailure {
+    /// `X30` at death, or `None` when the thread never ran guest code or it was zero.
+    ///
+    /// **For a refused import this is the guest's caller**: a thunk does not touch `X30`, so it
+    /// is still the return address of the `BL` into the import's PLT stub, while `PC` is the
+    /// thunk's own address and names only the symbol. MEASURED need: m9 (2026-09-25) printed
+    /// `raise` refusing `raise(5)` on a TaskScheduler worker and nothing about who raised it,
+    /// and the answer (`0x62f6428`, the engine's `RBXCRASH`, called from `0x24b6924`) was in
+    /// this record only.
+    #[must_use]
+    pub fn link_register(&self) -> Option<u64> {
+        self.context.registers.get(30).copied().filter(|&lr| lr != 0)
+    }
+
+    /// The frame-pointer walk alone: [`stack`](Self::stack) after `PC` and `X30`, one return
+    /// address per frame record on the `X29` chain, innermost first.
+    ///
+    /// Bounded, and ended at a null, misaligned, unreadable or non-ascending frame pointer, by
+    /// [`omni_bionic::unwind::frames`], which built it. `X30` is left out by value rather than by
+    /// position: `frames` puts it first only when it is non-zero.
+    #[must_use]
+    pub fn frame_walk(&self) -> &[u64] {
+        let after_pc = self.stack.get(1..).unwrap_or(&[]);
+        match self.link_register() {
+            Some(lr) if after_pc.first() == Some(&lr) => &after_pc[1..],
+            _ => after_pc,
+        }
+    }
+
+    /// Where this thread died, in one line: `PC`, `X30` and the first [`LOCATED_FRAMES`] of the
+    /// [walk](Self::frame_walk), each one inside `image` as a link address (`address - base`,
+    /// which is how the binary names it) and every other one as `abs`.
+    ///
+    /// **Before `why` on the line that prints it, not after.** A refusal's `why` is a paragraph,
+    /// and a log line that is cut, or a reader who stops at the first sentence, would lose the
+    /// one part of the record that says which engine path asked.
+    #[must_use]
+    pub fn located(&self, base: GuestAddr, image: core::ops::Range<GuestAddr>) -> String {
+        // `checked_sub` as well as `contains`: an `image` that starts below `base` is a caller's
+        // mistake, and it must print as `abs` rather than as a wrapped link address.
+        let name = |at: u64| {
+            match usize::try_from(at).ok().filter(|address| image.contains(address)) {
+                Some(address) => match address.checked_sub(base) {
+                    Some(link) => format!("link {link:#x}"),
+                    None => format!("abs {at:#x}"),
+                },
+                None => format!("abs {at:#x}"),
+            }
+        };
+        let Some(&pc) = self.stack.first() else {
+            return "no guest code ran".to_string();
+        };
+        let lr = self.link_register().map_or_else(|| "none".to_string(), name);
+        let walk = self.frame_walk();
+        let shown: Vec<String> = walk.iter().take(LOCATED_FRAMES).map(|&at| name(at)).collect();
+        let more = walk.len().saturating_sub(LOCATED_FRAMES);
+        let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+        format!("pc {}, lr {lr}, frames [{}]{more}", name(pc), shown.join(", "))
+    }
+}
+
 // ------------------------------------------------------------------ one call's state
 
 /// The symbol, the address and the instance, resolved once per call.

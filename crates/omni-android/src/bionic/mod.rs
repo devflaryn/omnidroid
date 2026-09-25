@@ -97,7 +97,8 @@ pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, T
 pub use threads::{
     DeathContext, FutexCall, GuestThreadFailure, GuestThreadState, GuestThreadSummary, ThreadHost,
     ThreadLocalInstance,
-    DEFAULT_GUEST_STACK_BYTES, GUEST_THREAD_STEP_WINDOW, MIN_GUEST_STACK_BYTES, SCHED_OTHER,
+    DEFAULT_GUEST_STACK_BYTES, GUEST_THREAD_STEP_WINDOW, LOCATED_FRAMES, MIN_GUEST_STACK_BYTES,
+    SCHED_OTHER,
 };
 pub use view::{
     GuestView, DL_INFO_OFFSET, DL_INFO_SLOTS, DL_PHDR_INFO_BYTES, ERRNO_OFFSET, SCRATCH_BYTES,

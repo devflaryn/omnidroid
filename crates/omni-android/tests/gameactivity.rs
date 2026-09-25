@@ -3836,13 +3836,17 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         if std::time::Instant::now() >= next_frames {
             next_frames += FRAMES_EVERY;
             let failures = guest.bionic.guest_thread_failures();
+            // Where it died goes on this line, before `why`: it is the only line printed when the
+            // thread dies, and a run that froze behind it (m9, 2026-09-25) printed the stack only
+            // at the close, half an hour later.
             for failure in failures.iter().skip(deaths_reported) {
                 let _ = writeln!(
                     std::io::stderr(),
-                    "GUEST THREAD DIED at +{:.0}s: thread {} (started at link {:#x}): {}",
+                    "GUEST THREAD DIED at +{:.0}s: thread {} (started at link {:#x}) at {}: {}",
                     settle.elapsed().as_secs_f32(),
                     failure.thread,
                     failure.start_routine.wrapping_sub(guest.object.base),
+                    failure.located(guest.object.base, guest.object.start..guest.object.end),
                     failure.why
                 );
             }
@@ -4569,10 +4573,12 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 let _ = writeln!(
                     std::io::stderr(),
                     "CLOSE: could not finish behind {} dead guest thread(s); recorded as REASON_CRASH_NATIVE \
-                     (signal {signal}) for the next launch -- the first: thread {} (started at link {:#x}): {}",
+                     (signal {signal}) for the next launch -- the first: thread {} (started at link {:#x}) \
+                     at {}: {}",
                     deaths.len(),
                     first.thread,
                     first.start_routine.wrapping_sub(guest.object.base),
+                    first.located(guest.object.base, guest.object.start..guest.object.end),
                     first.why
                 );
             }
@@ -4930,9 +4936,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         dead.len(),
         dead.iter()
             .map(|failure| format!(
-                "  thread {} started at link {:#x}: {}",
+                "  thread {} started at link {:#x}, at {}: {}",
                 failure.thread,
                 failure.start_routine.wrapping_sub(guest.object.base),
+                failure.located(guest.object.base, guest.object.start..guest.object.end),
                 failure.why
             ))
             .collect::<Vec<_>>()
