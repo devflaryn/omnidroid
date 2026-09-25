@@ -53,7 +53,8 @@
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
 use omni_mem::{
-    split_at_pages, Backing, CommitPolicy, GuestAddr, MemError, Placement, Protection, SMALL_PAGE,
+    split_at_pages, Backing, CommitPolicy, GuestAddr, MapLabel, MemError, Placement, Protection,
+    SMALL_PAGE,
 };
 
 use crate::boundary::{ImportCall, ReentrantCall};
@@ -351,6 +352,9 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let call = Call::begin(c)?;
     let space = call.mem.space();
     let page = space.page_size();
+    // Who asked, for a memory report (`crate::memreport`): the guest's call site, so the report
+    // can say which code in the engine holds the memory it maps.
+    let site = c.caller() as u64;
 
     // **A file-backed mapping is one without `MAP_ANONYMOUS`, and `fd` says nothing.**
     //
@@ -461,6 +465,7 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             return Ok(());
         }
         if shared_writable {
+            let _label = omni_mem::label_scope(MapLabel::at(crate::memreport::ENGINE_SHARED_FILE, site));
             return map_shared_file(c, &call, fd, offset as u64, len, placement);
         }
         let fs = super::files::filesystem(&view)?;
@@ -473,6 +478,9 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 return Ok(());
             }
         };
+        // A private copy of the file's bytes, where a device would share the page cache: its
+        // own owner in a memory report, because that difference is a cost only this layer has.
+        let _label = omni_mem::label_scope(MapLabel::at(crate::memreport::ENGINE_FILE_COPY, site));
         let at = match space.map_anonymous(placement, len, Protection::ReadWrite, CommitPolicy::Eager) {
             Ok(at) => at,
             Err(error) => {
@@ -495,6 +503,7 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         return Ok(());
     }
 
+    let _label = omni_mem::label_scope(MapLabel::at(crate::memreport::ENGINE_MMAP, site));
     match space.map_anonymous(placement, len, protection, CommitPolicy::Lazy) {
         Ok(at) => {
             // A fresh mapping lands on free addresses, and whatever code those addresses held

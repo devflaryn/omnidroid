@@ -523,6 +523,7 @@ fn asset_get_buffer(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
     let page = ndk.space.page_size();
     let span = (bytes.len() + page - 1) & !(page - 1);
+    let _label = omni_mem::label_scope(omni_mem::MapLabel::new(crate::memreport::ASSET_BUFFERS));
     let mapped = ndk
         .space
         .map_anonymous(

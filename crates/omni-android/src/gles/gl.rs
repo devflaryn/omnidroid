@@ -465,6 +465,7 @@ fn take_shadow(gles: &Gles, call: &Call, length: usize) -> AbiResult<Shadow> {
         .ok_or_else(|| refuse("no power of two holds that length".to_string()))?;
     // Eager: a shadow is written end to end by the guest or by this layer as soon as it is handed
     // out, and it is kept, so a lazy one would only move the commit into a fault per granule.
+    let _label = omni_mem::label_scope(omni_mem::MapLabel::new(crate::memreport::GLES_SHADOWS));
     let at = space
         .map_anonymous(
             Placement::Anywhere { align: space.page_size() },

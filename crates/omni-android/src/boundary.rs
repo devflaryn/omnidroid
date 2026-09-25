@@ -482,6 +482,7 @@ impl BoundaryBuilder {
             svc_trace: AtomicBool::new(false),
         });
         crate::perf::register_boundary(&boundary);
+        crate::memreport::register_boundary(&boundary);
         arm_injected_death();
         boundary
     }
@@ -2288,6 +2289,13 @@ impl ReentrantCall<'_> {
     #[must_use]
     pub fn mem(&self) -> &GuestMem {
         &self.boundary.mem
+    }
+
+    /// The guest address this call will return to, `X30`, as [`ImportCall::caller`] -- and with
+    /// its standing: a guest value, read for a diagnostic, never for control flow.
+    #[must_use]
+    pub fn caller(&self) -> GuestAddr {
+        self.cpu.x(omni_cpu::XReg::LR) as GuestAddr
     }
 
     /// Name this call and an argument.

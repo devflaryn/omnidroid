@@ -807,6 +807,7 @@ pub(super) fn pthread_create(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     // 7. The stack mapping. Lazily committed, so a thread that uses a page of its stack costs a
     //    page (D10), and the guard dropped to PROT_NONE afterwards.
     let space = call.mem.space();
+    let _label = omni_mem::label_scope(omni_mem::MapLabel::new(crate::memreport::GUEST_THREAD_STACKS));
     let Ok(stack_base) = space.map_anonymous(
         Placement::Anywhere { align: page },
         total,

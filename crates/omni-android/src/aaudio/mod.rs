@@ -723,6 +723,7 @@ fn open_stream(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
     let bytes = (capacity as usize) * usize::from(channels) * sample_bytes(format);
     let page = c.mem().space().page_size();
     let length = bytes.div_ceil(page).max(1) * page;
+    let _label = omni_mem::label_scope(omni_mem::MapLabel::new(crate::memreport::AAUDIO_BUFFERS));
     let Ok(base) = c.mem().space().map_anonymous(
         Placement::Anywhere { align: page },
         length,

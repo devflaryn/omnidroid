@@ -612,6 +612,7 @@ fn map_guest_pages(
             ))
         })?;
 
+    let _label = omni_mem::label_scope(omni_mem::MapLabel::new(crate::memreport::VULKAN_HOST_VISIBLE));
     space.map_anonymous(Placement::Anywhere { align }, length, Protection::ReadWrite, CommitPolicy::Eager)
         .map(|address| (address, length))
         .map_err(|error| {

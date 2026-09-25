@@ -66,6 +66,11 @@ use omni_mem::{
 };
 use omni_platform::net::NetPolicy;
 
+/// **This runtime's Rust heap, counted when `OMNI_MEM_REPORT` asks** (`omni_android::memreport`):
+/// `System` plus one relaxed load when it does not.
+#[global_allocator]
+static ALLOCATOR: omni_android::memreport::CountingAllocator = omni_android::memreport::CountingAllocator;
+
 /// **The APK this gate runs is chosen, not named here**: `OMNI_APK` if set, else the newest APK
 /// (by `versionCode`) in the repository root -- `omni_apk::choose_apk`. So an update is a new file
 /// next to the old one, or `OMNI_APK=<path>`, and no code names a version. The line this prints
@@ -1017,6 +1022,8 @@ impl Guest {
         let object = {
             let mut providers = ProviderRegistry::new();
             providers.register(ProviderHandle(Arc::clone(&shared)));
+            // Whose these mappings are, for `OMNI_MEM_REPORT`.
+            let _label = omni_mem::label_scope(omni_mem::MapLabel::new(omni_android::memreport::LIBRARY));
             loader::load(&space, &backing, &elf, &providers, &LoaderConfig::default())
                 .expect("libroblox.so must load with a thunk boundary")
         };
@@ -1025,6 +1032,12 @@ impl Guest {
         let boundary = builder.finish();
 
         bionic.register_image(&object.dl_phdr_info()).expect("register the loaded image");
+        // `OMNI_MEM_REPORT` names the engine's call sites inside it as link addresses, and prints
+        // the engine's own count from where the app's storage keeps it.
+        omni_android::memreport::register_image(MAIN_LIB, object.base, object.span());
+        omni_android::memreport::register_engine_profile_dir(
+            root.0.join("data/data/com.roblox.client/files/appData/LocalStorage"),
+        );
         // **`.bss`, labelled as Android's linker labels it**: each PT_LOAD's whole pages past its
         // file image, `prctl(PR_SET_VMA_ANON_NAME, ".bss")` in `linker_phdr.cpp`. What
         // `/proc/self/maps` then shows as `[anon:.bss]`.
@@ -1065,14 +1078,17 @@ impl Guest {
             .collect();
 
         let page = space.page_size();
-        let stack_base = space
-            .map_anonymous(
+        let stack_base = {
+            let _label =
+                omni_mem::label_scope(omni_mem::MapLabel::new(omni_android::memreport::GUEST_THREAD_STACKS));
+            space.map_anonymous(
                 Placement::Anywhere { align: page },
                 STACK_BYTES,
                 Protection::ReadWrite,
                 CommitPolicy::Lazy,
             )
-            .expect("a guest stack");
+            .expect("a guest stack")
+        };
         let stack_top = (stack_base + STACK_BYTES) & !0xF;
 
         let argv_block = space
