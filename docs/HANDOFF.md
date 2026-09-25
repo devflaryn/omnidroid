@@ -55,9 +55,43 @@ rate to 2-20 fps for several seconds (w20: `OMNI_LATE_INPUT` drags; translation 
 over its workers, and every worker translates it again into its own cache while the frame waits.
 Four workers instead of eight is far worse (w21: 3 fps before any input). **The structural fix is
 one translation cache shared by all guest threads** -- the largest item left, also the lever for
-memory, load time and Linux. **Built (2026-09-25, D38), behind `OMNI_JIT_SHARED_CACHE=1`, off by
-default until the controller's in-world A/B** (w20's drag script with and without the switch, on
-Windows and Linux; D38 says what decides it). x64 only; the Mac keeps per-thread caches.
+memory, load time and Linux. **Built (D38) and now the default on x64 hosts (D38 amendment 2).**
+The A/B (w20's drag script, `OMNI_PERF=1`, 7 min each; input window +300..+359 s):
+
+| run | cache | during input: median / min fps, seconds < 20 fps | translation peak | settled fps | private |
+|---|---|---|---|---|---|
+| w21 | per-thread (`8e67e7a`, agent builds running) | 34.5 / 1, 24 s | 372 kinsn/s | 23.2 | 4.19 GiB |
+| w22 | shared (`8e67e7a`) | 43.0 / 37, **0 s** -- the owner: "way smoother" | 3.3 | 46.8 | **2.72 GiB** |
+| w24 | shared (`8e67e7a`) | **thrash**: 120-240 kinsn/s for 6 min, `os` 75-85% on every thread, ~0.4 fps | 287 | 0.4 | 2.55 GiB |
+| w25 | per-thread (`284004c`) | 42.0 / 1, 15 s -- the owner: input "a really high fps drop" | 318 | 40.5 | 4.08 GiB |
+| w27 | shared (`d30b583`, thrash fixed `2e99278`) | 47.0 / 38, **0 s** | 15.8 | 48.0 | 3.24 GiB |
+| w28 | per-thread (`d30b583`) | 40.0 / 2, 14 s | 326 | 49.0 | 4.07 GiB |
+| w29 | shared (`d30b583`) | 53.0 / 42, **0 s** | 15.7 | 51.8 | 3.19 GiB |
+
+w24's thrash (D38 amendment 1): threads parked in imports held return addresses inside retired
+regions, the reclaimer kept holes around them, regions came back fragmented or not at all, and every
+retirement forgot every block; fixed by moving parked threads out through a shared stub. The
+`PERF jit cache:` line now shows it: w27/w29 retired 0 regions all session. x64 only; the Mac keeps
+per-thread caches (its backend needs its own design). `OMNI_JIT_SHARED_CACHE=0` is the way back.
+
+**The owner's two products (stated 2026-09-25) -- they set the priorities from here:**
+(A) 3-4 instances at once on a good PC, high quality, high fps (gaming); (B) 30-35 instances at
+once on the same PC, lowest quality, capped fps acceptable -- only per-instance RAM and CPU matter.
+One instance is ~2.7-4.2 GiB private and ~2 cores today, so (B) needs roughly a 4x memory cut and a
+frame cap of our own (the engine's `FramerateCap` needs a server flag that is off). A breakdown
+switch, `OMNI_FPS_CAP`, and a ranked sharing plan (library pages, translations across processes, a
+lower reported device RAM, audio off) are being built; see "Multi-instance" when it lands. Every
+instance is its own process with its own window, input and storage; the shared code cache is per
+process (1 GiB of *reserved address space*, committed as code is emitted -- ~240 MiB in w27).
+Window behaviour for many instances (`beef41a`, `8cc3f91`): **an unfocused or minimised instance
+keeps playing** (desktop Roblox's behaviour); a minimised one draws nothing (our Vulkan layer
+answers the per-frame surface query with `VK_ERROR_SURFACE_LOST_KHR`, so the engine drops its
+framebuffer and skips recording, submit and present) and rebuilds its swapchain on restore;
+Android's pause-in-background is opt-in (`OMNI_PAUSE_IN_BACKGROUND=1`, `OMNI_FOLLOW_FOCUS=1`).
+That fixed **w26's freeze** (30 min, `5920038`: 45.6 fps median until +1470 s, then the host
+swapchain went `VK_ERROR_OUT_OF_DATE_KHR` after a window change and the engine -- which rebuilds only
+on a changed extent, a lost framebuffer or a new window -- retried acquire ~2,400 times; decoded at
+`0x2790a34`). A 2 s out-of-date safety net renews the surface if no window event explains it.
 
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
@@ -87,7 +121,21 @@ walk): **median 55.8 fps** (22-60.8, +300..+1900 s, n = 321), 2.9 GiB private fl
 join -> loaded 20 s, clean close -- **but two threads lost at +490 s** to a transient DNS failure:
 the host resolver answered `EAI_NONAME` for `clientsettingscdn.roblox.com`, the unix seam cannot
 classify an `EAI_*` (std drops the code), refused, and the `pthread_join`ing thread died with it;
-the engine itself retried and carried on (item 12).
+the engine itself retried and carried on (item 12; fixed `284004c`, a unix `getaddrinfo` backend).
+**m11, 30 minutes** (`7a56fdb`: + release/acquire sync words, the cond-wait wake, the 16 KiB
+`madvise` fix): 46.6 fps median, 2.8 GiB -- **died at +1325 s** on the job-kernel worker, a
+MemoryFault reading address 5 at `0x2214e18`. Decoded (registers): **not heap corruption** -- the
+thread executed `bl memmove` (`0x1dc1dd8`, in libc++'s `std::string` constructor) and control
+arrived in the *translation of a different function* (`0x2214c50`, a {fmt} number formatter) with
+`memmove`'s arguments (`x2 = 5` = the length of "135MB"); `x16`/`x17` show the PLT stub never ran.
+Real hardware cannot produce that: the arm64 JIT transferred to stale code. One arm64-only defect of
+that kind is proven by reading (a mid-run `ClearCache` when a thread's 8 MiB cache fills leaves the
+return-stack buffer pointing into reused memory; x64 resets it) -- the fix (patch 0023, an audit of
+every host-code pointer that can survive a mid-run clear) is in progress (item 11).
+**m12** (`7a56fdb`, `OMNI_JIT_EXCLUSIVE_MONITOR=global`): **30 minutes clean**, 39.0 fps median,
+2.8 GiB, 3.0 cores, gate passed. **m13** (default monitor, `OMNI_JIT_OPTIMIZATIONS=0xFFF9` = RSB
+off): running. w23 (Windows x64, `8e67e7a`, died at +120 s reading `-1+8` in a flag-registry hash
+node during the "Dynamic Flag Reloader" job) is a different signature and stays open (item 10).
 
 Linux l1 (`53391a1`, GLES on the Quadro's NVC0 -- the engine refuses lavapipe as emulated): join ->
 loaded 110 s, settled **~1 fps** (4-6 presents per 5 s), 2.3 of 4 cores busy but only ~100 M guest
@@ -121,7 +169,7 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 2 | dynarmic's dispatcher lookup (`GetBasicBlock`) on every indirect branch that misses the RSB (FastDispatch off, D16) | 25% of g6's non-JIT samples, 12% across all threads | **fixed** `f9ea397` (patches 0019/0020, D35: fast dispatch and the arm64 RSB keep the budget/halt checks); with #3, w7 38 -> 48 fps, `GetBasicBlock` 12% -> 2.7% |
 | 3 | the import census: shared per-slot counters and global `last_call` stores on every crossing | 8-9% | **fixed** `5a80626` (per-thread records; 8 threads, one import: 518-614 -> 60-64 ns per crossing) |
 | 3a | **macOS: the arm64 backend ignores value-compare** (patch 0007's inline exclusives take the global monitor's spin lock and scan 2,048 slots on every guest atomic) | 1,306 ns per atomic vs 9.4 ns honoured; the lock saturates at ~770 k atomics/s and caps the process at ~400 M insn/s | fix in progress (patch 0021); interim A/B `OMNI_JIT_EXCLUSIVE_MONITOR=global` (186 ns) |
-| 4 | translation (per-thread code caches; each thread translates what it runs) | w17: 53% of dynarmic's own samples; a busy worker still 56k insn/s at +300 s; on Linux `dyn` 32-36% of the workers | **built, off by default, awaiting the in-world A/B**: `OMNI_JIT_SHARED_CACHE=1` (vendored patch 0022, x64; D38): 8 threads on real Roblox code translate 1/8 as much, 4.5 -> 0.06 MiB per thread; Linux cold burst 63 -> 43 ms, Windows 22 -> 31 ms (serialized emission). A/B protocol in D38 |
+| 4 | translation (per-thread code caches; each thread translates what it runs) -- **the owner's input stalls** | w17: 53% of dynarmic's own samples; w20/w25/w28: 14-24 s under 20 fps per minute of input | **fixed on x64** (patch 0022 + `2e99278`, default since D38 amendment 2): w27/w29 0 s under 20 fps, peak translation 326 -> 16 kinsn/s, 4.1 -> 3.2 GiB. **Open on arm64 (Mac)** |
 | 5 | per-crossing path (`bionic::active`, trampoline, `cb_call_svc`, `pthread_getspecific`) | ~15% together | **fixed in part**: `bionic::active` without a shared refcount (`5a80626`), `cb_call_svc` by array index (`bb8c00a`), `pthread_getspecific` lock-free (`13cbc42`: 8 threads 1,500 -> 69-105 ns) |
 | 5a | `AddressFutex` (global parked table, near-miss scan per wake) and `OwnerTable` (one global mutex per lock/unlock) | wake 8.5% of handler samples; owner set/clear ~6% | **fixed** `b3e15d7`, `7fc1b1e` (futex wake 8 threads 523-1,725 -> 18 ns; mutex pairs on 8 mutexes 5.9 -> 0.3 us) |
 | 5b | `madvise`'s whole-map reclaim walk (after `e6b7769`) | 16% of handler samples (w17) | **fixed** `fb01278` (range walk) |
@@ -132,8 +180,12 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 8 | memory: 4.4-4.8 GiB private in the world at default graphics (Windows); Linux swapped at 4.6 GiB on a 7 GB host | | **in part**: the device's RAM follows the host (`23f00e8`, D36: Linux a 4 GiB device, 3.76 GiB private); `OMNI_GUEST_CPUS=8` -0.7 GiB (w9, a switch) |
 | 9 | **a ~60 fps limiter**: no 5 s window above ~59 fps even with `FramerateCap` 240 | w14-w16 | being decoded (the display rate a device on this path never sends -> the engine's frame-time table starts at 60 Hz) |
 | 10 | **intermittent "-1 pointer" heap corruption** (OpenSSL `impls`, w1; a `shared_ptr` control block, w13) -- 2 in ~16 runs, one froze the world | | being hunted; `printf` unbound (a thread died on it in w13) |
-| 11 | **macOS: the DataModel write-lock tracker's "lock theft" assert** (m9; m7's early worker death is the same thread kind) -- the lock owner is a fiber identity read through emutls (`0x3105578` -> `0x286c08c`); the engine's atomics run on LL/SC (the gate declines `HWCAP_ATOMICS`) and fibers park on `syscall(98)` | froze m9 at +185 s | suspects, ranked: the arm64 exclusive monitor; the sync primitives' plain stores (the ERRORCHECK/RECURSIVE unlock and `pthread_once`'s DONE publish with a plain byte copy -- no release ordering, harmless on x86, a race on the arm64 host; **audit and fix in progress**); a stale TLS/futex answer. A/B planned: patch 0021 vs `OMNI_JIT_EXCLUSIVE_MONITOR=global` |
-| 12 | **unix `getaddrinfo` cannot classify a resolver failure** (std's unix path drops `EAI_*`) -- a DNS blip kills the resolving thread and its joiner | m10: 2 threads at +490 s | **fix in progress**: `libc::getaddrinfo` in a unix backend, as `net::resolver`'s header said |
+| 11 | **macOS: the DataModel write-lock tracker's "lock theft" assert** (m9; m7's early worker death is the same thread kind) -- the lock owner is a fiber identity read through emutls (`0x3105578` -> `0x286c08c`); the engine's atomics run on LL/SC (the gate declines `HWCAP_ATOMICS`) and fibers park on `syscall(98)` | froze m9 at +185 s; m7, m11 the same worker | **m11 decoded as a control transfer into stale translated code (above)**: the arm64 JIT's mid-run cache clear is the lead, patch 0023 in progress; m12 (global monitor) ran 30 min clean, m13 (RSB off) running. Earlier suspects, ranked: the arm64 exclusive monitor; the sync primitives' plain stores (the ERRORCHECK/RECURSIVE unlock and `pthread_once`'s DONE publish with a plain byte copy -- no release ordering, harmless on x86, a race on the arm64 host; **audit and fix in progress**); a stale TLS/futex answer. A/B planned: patch 0021 vs `OMNI_JIT_EXCLUSIVE_MONITOR=global` |
+| 12 | **unix `getaddrinfo` cannot classify a resolver failure** (std's unix path drops `EAI_*`) -- a DNS blip kills the resolving thread and its joiner | m10: 2 threads at +490 s | **fixed** `284004c` (`libc::getaddrinfo` in a unix backend; EAI_NONAME/AGAIN/FAIL returned as bionic's numbers) |
+| 13 | **`pthread_cond_wait` released its mutex without waking its waiters** (a `NopFutex`): a thread blocked on the mutex slept its whole 1 s self-heal slice -- the engine's producer/consumer shape, every host | stress test 6.1 -> 3.0 s; a blocked producer got the mutex 993 ms late | **fixed** `c624460`; with it the ERRORCHECK/RECURSIVE unlocks and `pthread_once` publish with release/acquire (`62dcc34`, `724cb00`) -- plain byte copies before, a race on the arm64 host |
+| 14 | **macOS 16 KiB host pages: `madvise(DONTNEED/FREE)` on a 4 KiB guest range** was refused with EINVAL when not 16 KiB-aligned, and a 16 KiB-aligned 4 KiB range was rounded up -- **zeroing the 12 KiB after it** (a guest probe confirmed) | every sub-16K purge on the Mac | **fixed** `7a56fdb` (`GuestSpace::discard`, 4 KiB-granular: whole host pages decommitted, partial ones zeroed in place). mimalloc's own OS calls audited clean on all hosts (`d30b583`) |
+| 15 | **a host window change froze the picture** (w26: `VK_ERROR_OUT_OF_DATE_KHR` forever) | w26 at +1470 s | **fixed** `5c967f2`..`8cc3f91` (above) -- live check pending |
+| 16 | **full disk on Windows** stopped a build mid-A/B (worktree `target/`s of finished agents, ~40 GB) | | cleaned 2026-09-25; agents' build dirs must be removed when they finish |
 
 **Deaths still open:** Windows `open(O_TRUNC)` on `memProfStorage<pid>.json` under a live mapping
 (error 1224, a worker at +5 s; logical EOF in progress); raw syscall 63 (`read`) from the engine's
