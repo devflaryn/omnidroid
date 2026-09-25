@@ -15,9 +15,36 @@
 //! * `key_delete(key)`: release the slot. Values already set by threads are
 //!   simply abandoned (bionic's behaviour: no cross-thread notification).
 //! * `getspecific`/`setspecific`: per-thread values, default NULL. A key that
-//!   was deleted yields a DEFINED result: getspecific returns NULL,
-//!   setspecific stores into the (now reusable) slot — identical to bionic,
-//!   where a deleted key's slot can be reallocated by the next key_create.
+//!   was deleted yields a DEFINED result: getspecific returns NULL and
+//!   setspecific is refused with EINVAL. Its slot can be reallocated by a later
+//!   key_create, as in bionic, and the new key starts NULL on every thread.
+//!
+//! ## Why a read takes no lock (and writes nothing another thread reads)
+//!
+//! MEASURED (Pet Simulator 99 in-world, `OMNI_PERF`): `pthread_getspecific` runs
+//! 1.4-1.9 M times a second on one busy worker, and when every thread's values
+//! lived in one `HashMap` behind one mutex, `getspecific` was ~4% of all non-JIT
+//! samples and 2-12% of those threads' wall time — ~60 threads taking one lock
+//! and hashing to read a word each owns alone.
+//!
+//! So the table is split by who writes it, the way bionic's is:
+//!
+//! * **Key slots** ([`TlsRegistry::generations`]): one generation per slot, 0 for
+//!   a free one, as atomics. Only `key_create`/`key_delete` write them, under the
+//!   registry's lock; everything else only loads them. A generation is never
+//!   reused, so a key deleted and re-created in the same slot is a different key.
+//! * **A guest thread's values** ([`ThreadValues`]): 128 `(generation, value)`
+//!   pairs, written only by that thread. A value is visible only while its pair's
+//!   generation equals the slot's — which is how a deleted key reads NULL and a
+//!   re-created one does not see the old values, with nothing swept at delete.
+//!
+//! The values are keyed by **guest** thread id in a map that is locked only to
+//! find a thread's block the first time; after that the calling host thread keeps
+//! it in a small thread-local cache keyed by (registry, guest thread). A read is
+//! then the slot's generation, the cache's first entry, and the pair. Keying by
+//! guest id rather than by host thread keeps the old semantics exactly when a
+//! host thread runs more than one guest identity, or one guest identity is
+//! served from another host thread (a sweep, a host-initiated call).
 //!
 //! ## Destructors at thread exit (the adapter invokes; this crate only orders)
 //!
@@ -40,8 +67,10 @@
 
 use crate::errno::consts;
 use crate::threads::GuestThreadId;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Mutex as HostMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as HostMutex};
 
 /// Bionic's per-process key table size on LP64.
 /// VERIFIED: bionic `pthread_internal.h` (`__pthread_keys` is
@@ -67,17 +96,115 @@ struct KeySlot {
 
 /// The per-process TLS registry. Shared across all guest threads (the adapter
 /// constructs one and hands out references).
-#[derive(Default)]
 pub struct TlsRegistry {
+    /// This registry's identity in every host thread's [`CACHE`], unique for the
+    /// life of the process. **Not its address**: a dropped registry's address is
+    /// the next one's, and a cache that matched on it would hand the new registry
+    /// the old one's values.
+    id: u64,
+    /// Each slot's generation, 0 when the slot is free: the only part of the key
+    /// table a `getspecific`/`setspecific` reads. A mirror of `inner.keys`, written
+    /// under `inner`'s lock by `key_create`/`key_delete` and nowhere else, so on
+    /// the hot path these lines are only ever read. Boxed and aligned so no field
+    /// of whatever embeds the registry shares their cache lines.
+    generations: Box<SlotGenerations>,
+    /// Key table bookkeeping and `__cxa_thread_atexit` registrations: all rare.
     inner: HostMutex<TlsInner>,
+    /// Every guest thread's values, by guest thread id. Locked only to find a
+    /// thread's block when the calling host thread has not cached it (the first
+    /// call, or after the thread's exit sweep retired it) — never per access.
+    threads: HostMutex<HashMap<GuestThreadId, Arc<ThreadValues>>>,
+    /// How many accesses had to take `threads`' lock. Diagnostic, and the
+    /// detector for a cache that stopped caching: written only on that slow path.
+    slow_lookups: AtomicU64,
+}
+
+impl Default for TlsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where registry identities come from; 0 is never handed out.
+static NEXT_REGISTRY: AtomicU64 = AtomicU64::new(1);
+
+/// One generation per key slot. See [`TlsRegistry::generations`].
+#[repr(align(128))]
+struct SlotGenerations([AtomicU64; PTHREAD_KEYS_MAX]);
+
+/// One guest thread's `pthread_setspecific` values: a pair per key slot.
+///
+/// Written only by the thread it belongs to (and by its own exit sweep), so its
+/// cache lines are that thread's alone; aligned so no other thread's block
+/// shares one. A pair's value counts only while its generation is the slot's.
+#[repr(align(128))]
+struct ThreadValues {
+    /// Set when the exit sweep leaves this thread nothing and its block is taken
+    /// out of the map: a host thread still caching it must look again rather than
+    /// write where nothing will read.
+    retired: AtomicBool,
+    pairs: [ValuePair; PTHREAD_KEYS_MAX],
+}
+
+/// A value and the generation of the key it was stored under.
+struct ValuePair {
+    generation: AtomicU64,
+    value: AtomicU64,
+}
+
+impl ThreadValues {
+    fn new() -> Self {
+        Self {
+            retired: AtomicBool::new(false),
+            pairs: std::array::from_fn(|_| ValuePair {
+                generation: AtomicU64::new(0),
+                value: AtomicU64::new(0),
+            }),
+        }
+    }
+}
+
+impl ValuePair {
+    /// The value, if it was stored under the key that has generation `generation`.
+    #[inline]
+    fn read(&self, generation: u64) -> u64 {
+        if self.generation.load(Ordering::Relaxed) == generation {
+            self.value.load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn write(&self, generation: u64, value: u64) {
+        self.value.store(value, Ordering::Relaxed);
+        self.generation.store(generation, Ordering::Relaxed);
+    }
+}
+
+/// A block this host thread has already looked up.
+struct Cached {
+    registry: u64,
+    thread: GuestThreadId,
+    values: Arc<ThreadValues>,
+}
+
+/// How many (registry, guest thread) blocks one host thread keeps. A guest thread
+/// is one host thread, so one entry is the common case; the rest cover a host
+/// thread that serves several identities or several registries (tests, the main
+/// thread) without taking the lock on every switch.
+const CACHE_ENTRIES: usize = 4;
+
+thread_local! {
+    // A `thread_local!` carries no rustdoc, so: the blocks this host thread has
+    // looked up, most recent first. See `TlsRegistry::with_values`.
+    static CACHE: RefCell<Vec<Cached>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Default)]
 struct TlsInner {
     /// key slot -> (dtor, generation). `next_key` is the slot index.
     keys: Vec<KeySlot>,
-    /// (thread id, key index) -> value (guest data pointer).
-    values: HashMap<(GuestThreadId, usize), u64>,
     /// Per-thread __cxa_thread_atexit registrations in registration order.
     thread_atexit: HashMap<GuestThreadId, Vec<(u64, u64, u64)>>,
     /// Monotonic generation counter for slots.
@@ -89,7 +216,115 @@ struct TlsInner {
 impl TlsRegistry {
     /// An empty registry.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            id: NEXT_REGISTRY.fetch_add(1, Ordering::Relaxed),
+            generations: Box::new(SlotGenerations(std::array::from_fn(|_| AtomicU64::new(0)))),
+            inner: HostMutex::new(TlsInner::default()),
+            threads: HostMutex::new(HashMap::new()),
+            slow_lookups: AtomicU64::new(0),
+        }
+    }
+
+    /// The generation of the live key in slot `idx`, or `None` for a free slot or
+    /// an index past the table.
+    #[inline]
+    fn live_generation(&self, idx: usize) -> Option<u64> {
+        let generation = self.generations.0.get(idx)?.load(Ordering::Acquire);
+        (generation != 0).then_some(generation)
+    }
+
+    /// Run `f` on `thread`'s values: from this host thread's cache when its most
+    /// recent entry is that block (no lock, no shared write), otherwise through
+    /// [`thread_values`](Self::thread_values).
+    #[inline]
+    fn with_values<R>(&self, thread: GuestThreadId, f: impl FnOnce(&ThreadValues) -> R) -> R {
+        let mut f = Some(f);
+        let fast = CACHE
+            .try_with(|cell| {
+                let cache = cell.try_borrow().ok()?;
+                let hit = cache.first()?;
+                if hit.registry == self.id
+                    && hit.thread == thread
+                    && !hit.values.retired.load(Ordering::Relaxed)
+                {
+                    f.take().map(|f| f(&hit.values))
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten();
+        match fast {
+            Some(result) => result,
+            None => {
+                let values = self.thread_values(thread);
+                (f.take().expect("the fast path returned without running it"))(&values)
+            }
+        }
+    }
+
+    /// `thread`'s values the slow way: promoted from further down this host
+    /// thread's cache, or found (or made) in the map under its lock and cached.
+    #[cold]
+    fn thread_values(&self, thread: GuestThreadId) -> Arc<ThreadValues> {
+        let mine = |c: &Cached| c.registry == self.id && c.thread == thread;
+        let promoted = CACHE
+            .try_with(|cell| {
+                let mut cache = cell.try_borrow_mut().ok()?;
+                let at = cache
+                    .iter()
+                    .position(|c| mine(c) && !c.values.retired.load(Ordering::Relaxed))?;
+                let entry = cache.remove(at);
+                let values = Arc::clone(&entry.values);
+                cache.insert(0, entry);
+                Some(values)
+            })
+            .ok()
+            .flatten();
+        if let Some(values) = promoted {
+            return values;
+        }
+        self.slow_lookups.fetch_add(1, Ordering::Relaxed);
+        let values = Arc::clone(
+            self.threads
+                .lock()
+                .unwrap()
+                .entry(thread)
+                .or_insert_with(|| Arc::new(ThreadValues::new())),
+        );
+        let _ = CACHE.try_with(|cell| {
+            if let Ok(mut cache) = cell.try_borrow_mut() {
+                cache.retain(|c| !mine(c) && !c.values.retired.load(Ordering::Relaxed));
+                cache.insert(
+                    0,
+                    Cached { registry: self.id, thread, values: Arc::clone(&values) },
+                );
+                cache.truncate(CACHE_ENTRIES);
+            }
+        });
+        values
+    }
+
+    /// Take `thread`'s block out of the map once its exit sweep has left it
+    /// nothing, so a process that starts and ends threads for hours does not
+    /// keep a block per thread it ever ran. Marked retired first, for any host
+    /// thread still caching it.
+    fn retire(&self, thread: GuestThreadId) {
+        if let Some(values) = self.threads.lock().unwrap().remove(&thread) {
+            values.retired.store(true, Ordering::Relaxed);
+        }
+        let _ = CACHE.try_with(|cell| {
+            if let Ok(mut cache) = cell.try_borrow_mut() {
+                cache.retain(|c| !(c.registry == self.id && c.thread == thread));
+            }
+        });
+    }
+
+    /// How many `getspecific`/`setspecific`/sweep accesses had to take the lock
+    /// on the thread map because the calling host thread had not cached the
+    /// block. Diagnostic: on a warm thread this does not move.
+    pub fn slow_lookups(&self) -> u64 {
+        self.slow_lookups.load(Ordering::Relaxed)
     }
 
     /// `pthread_key_create(&key, dtor)`. Returns the pthread error code:
@@ -100,7 +335,12 @@ impl TlsRegistry {
             // Look for a deleted (freed) slot first: bionic reuses slots.
             if let Some(idx) = inner.keys.iter().position(|s| s.dtor == u64::MAX && s.generation == 0) {
                 inner.generation += 1;
-                inner.keys[idx] = KeySlot { dtor, generation: inner.generation };
+                let gen = inner.generation;
+                inner.keys[idx] = KeySlot { dtor, generation: gen };
+                // Released after the slot is filled: a thread that sees this
+                // generation sees the key it names. A new generation, so every
+                // value stored under the slot's previous key stays invisible.
+                self.generations.0[idx].store(gen, Ordering::Release);
                 return Ok(idx as u32);
             }
             return Err(consts::EAGAIN);
@@ -108,7 +348,9 @@ impl TlsRegistry {
         inner.generation += 1;
         let gen = inner.generation;
         inner.keys.push(KeySlot { dtor, generation: gen });
-        Ok((inner.keys.len() - 1) as u32)
+        let idx = inner.keys.len() - 1;
+        self.generations.0[idx].store(gen, Ordering::Release);
+        Ok(idx as u32)
     }
 
     /// `pthread_key_delete(key)`. Frees the slot; per-thread values are
@@ -122,11 +364,13 @@ impl TlsRegistry {
         if idx >= inner.keys.len() {
             return consts::EINVAL;
         }
-        // Mark freed: dtor sentinel u64::MAX, generation 0. Values dropped.
+        // Mark freed: dtor sentinel u64::MAX, generation 0. Every thread's value
+        // for it is dropped by that alone: a pair counts only while its
+        // generation is the slot's, and no later key gets this generation again.
         let freed = inner.keys[idx].generation != 0;
         inner.keys[idx] = KeySlot { dtor: u64::MAX, generation: 0 };
+        self.generations.0[idx].store(0, Ordering::Release);
         if freed {
-            inner.values.retain(|(_tid, k), _| *k != idx);
             0
         } else {
             consts::EINVAL
@@ -135,29 +379,27 @@ impl TlsRegistry {
 
     /// `pthread_setspecific(key, value)`. 0, or EINVAL for a dead/invalid key.
     /// Storing NULL clears the entry (POSIX: a NULL set is a valid clear).
+    ///
+    /// No lock and no write outside `thread`'s own block (see the module docs).
     pub fn setspecific(&self, thread: GuestThreadId, key: u32, value: u64) -> i32 {
-        let mut inner = self.inner.lock().unwrap();
         let idx = key as usize;
-        if idx >= inner.keys.len() || inner.keys[idx].generation == 0 {
+        let Some(generation) = self.live_generation(idx) else {
             return consts::EINVAL;
-        }
-        if value == 0 {
-            inner.values.remove(&(thread, idx));
-        } else {
-            inner.values.insert((thread, idx), value);
-        }
+        };
+        self.with_values(thread, |values| values.pairs[idx].write(generation, value));
         0
     }
 
     /// `pthread_getspecific(key)`. The current value or NULL for a dead key
     /// (defined behaviour, matches bionic's reuse model).
+    ///
+    /// No lock and no shared write: the slot's generation, then `thread`'s pair.
     pub fn getspecific(&self, thread: GuestThreadId, key: u32) -> u64 {
-        let inner = self.inner.lock().unwrap();
         let idx = key as usize;
-        if idx >= inner.keys.len() || inner.keys[idx].generation == 0 {
+        let Some(generation) = self.live_generation(idx) else {
             return 0;
-        }
-        inner.values.get(&(thread, idx)).copied().unwrap_or(0)
+        };
+        self.with_values(thread, |values| values.pairs[idx].read(generation))
     }
 
     /// The destructor registered for `key` (0 = none / dead key). Diagnostic
@@ -251,19 +493,25 @@ impl TlsRegistry {
         for _round in 0..PTHREAD_DESTRUCTOR_ITERATIONS {
             let mut round_pairs: Vec<(u64, u64)> = Vec::new();
             {
-                let mut inner = self.inner.lock().unwrap();
-                for idx in 0..inner.keys.len() {
-                    if inner.keys[idx].generation == 0 {
-                        continue;
-                    }
-                    let k = (thread, idx);
-                    if let Some(v) = inner.values.remove(&k) {
-                        let dtor = if inner.keys[idx].dtor == u64::MAX { 0 } else { inner.keys[idx].dtor };
+                // The key table's lock, so each slot's destructor is the one of
+                // the generation the value was stored under.
+                let inner = self.inner.lock().unwrap();
+                self.with_values(thread, |values| {
+                    for (idx, slot) in inner.keys.iter().enumerate() {
+                        if slot.generation == 0 {
+                            continue;
+                        }
+                        let v = values.pairs[idx].read(slot.generation);
+                        if v == 0 {
+                            continue;
+                        }
+                        values.pairs[idx].write(slot.generation, 0);
+                        let dtor = if slot.dtor == u64::MAX { 0 } else { slot.dtor };
                         if dtor != 0 {
                             round_pairs.push((dtor, v));
                         }
                     }
-                }
+                });
             }
             if round_pairs.is_empty() {
                 break;
@@ -272,6 +520,21 @@ impl TlsRegistry {
                 run_recorded(*dtor, *value);
             }
             work.extend(round_pairs);
+        }
+
+        // A thread the sweep left with nothing gives its block back. One whose
+        // destructors kept re-setting past the cap keeps it, value and all, as
+        // before: that value is still what `getspecific` answers for it.
+        let leftover = {
+            let inner = self.inner.lock().unwrap();
+            self.with_values(thread, |values| {
+                inner.keys.iter().enumerate().any(|(idx, slot)| {
+                    slot.generation != 0 && values.pairs[idx].read(slot.generation) != 0
+                })
+            })
+        };
+        if !leftover {
+            self.retire(thread);
         }
 
         work
@@ -474,6 +737,268 @@ mod tests {
                 work,
                 vec![(0x8000, 0x66), (0x9000, 0x77)],
                 "atexit handler first, then key destructor (bionic order)"
+            );
+        }
+    }
+
+    /// Claim every slot, so the next `key_create` after a delete must reuse one.
+    fn full_table(reg: &TlsRegistry, dtor: u64) {
+        for i in 0..PTHREAD_KEYS_MAX {
+            assert_eq!(reg.key_create(dtor), Ok(i as u32), "slot {i}");
+        }
+    }
+
+    /// A key deleted and re-created **in the same slot** is a new key: every
+    /// thread reads NULL for it, including one that cached its block before the
+    /// delete and one on another host thread; the neighbouring key is untouched.
+    #[test]
+    fn delete_then_recreate_in_the_same_slot_hides_old_values() {
+        let reg = Arc::new(TlsRegistry::new());
+        full_table(&reg, 0);
+        let (a, b) = (GuestThreadId(21), GuestThreadId(22));
+        assert_eq!(reg.setspecific(a, 5, 0x55), 0);
+        assert_eq!(reg.setspecific(a, 6, 0x66), 0);
+        let r = reg.clone();
+        std::thread::spawn(move || assert_eq!(r.setspecific(b, 5, 0x77), 0)).join().unwrap();
+
+        assert_eq!(reg.key_delete(5), 0);
+        assert_eq!(reg.getspecific(a, 5), 0, "a deleted key reads NULL");
+        assert_eq!(reg.key_create(0), Ok(5), "the freed slot is the one reused");
+        assert_eq!(reg.getspecific(a, 5), 0, "the new key does not see the old key's value");
+        assert_eq!(reg.getspecific(b, 5), 0, "nor another thread's old value");
+        let r = reg.clone();
+        std::thread::spawn(move || assert_eq!(r.getspecific(b, 5), 0, "nor from its own host thread"))
+            .join()
+            .unwrap();
+        assert_eq!(reg.getspecific(a, 6), 0x66, "the neighbouring key is untouched");
+        assert_eq!(reg.setspecific(a, 5, 0x99), 0);
+        assert_eq!(reg.getspecific(a, 5), 0x99, "the new key stores normally");
+        assert_eq!(reg.getspecific(b, 5), 0);
+        // Past the table: defined, not a panic.
+        assert_eq!(reg.getspecific(a, PTHREAD_KEYS_MAX as u32), 0);
+        assert_eq!(reg.setspecific(a, PTHREAD_KEYS_MAX as u32, 1), consts::EINVAL);
+        assert_eq!(reg.getspecific(a, u32::MAX), 0);
+    }
+
+    /// The exit sweep hands a re-created key's destructor none of the value the
+    /// slot's previous key held: that value died with its key.
+    #[test]
+    fn a_recreated_slot_does_not_hand_an_old_value_to_the_new_destructor() {
+        let reg = TlsRegistry::new();
+        full_table(&reg, 0xD0);
+        let me = GuestThreadId(31);
+        assert_eq!(reg.setspecific(me, 3, 0xAB), 0);
+        assert_eq!(reg.setspecific(me, 4, 0xCD), 0);
+        assert_eq!(reg.key_delete(3), 0);
+        assert_eq!(reg.key_create(0xD1), Ok(3));
+        let work = reg.take_exit_work(me, &mut |_, _| {});
+        assert_eq!(work, vec![(0xD0, 0xCD)], "only the live key's value, to its own destructor");
+    }
+
+    /// Eight host threads, each its own guest thread, hammer the same keys with
+    /// values only they write, while a ninth creates and deletes other keys: every
+    /// read answers the reader's own last write.
+    #[test]
+    fn concurrent_threads_each_see_their_own_values() {
+        const THREADS: u64 = 8;
+        const ITERS: u64 = 100_000;
+        let reg = Arc::new(TlsRegistry::new());
+        let keys: Vec<u32> = (0..4).map(|_| reg.key_create(0).unwrap()).collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let (reg, stop) = (reg.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut cycles = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let k = reg.key_create(0).unwrap();
+                    assert_eq!(reg.getspecific(GuestThreadId(999), k), 0, "a fresh key starts NULL");
+                    reg.setspecific(GuestThreadId(999), k, 1);
+                    assert_eq!(reg.key_delete(k), 0);
+                    cycles += 1;
+                }
+                cycles
+            })
+        };
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (reg, keys) = (reg.clone(), keys.clone());
+                std::thread::spawn(move || {
+                    let me = GuestThreadId(100 + t);
+                    for n in 1..=ITERS {
+                        for (j, &k) in keys.iter().enumerate() {
+                            let v = (t << 48) | ((j as u64) << 40) | n;
+                            assert_eq!(reg.setspecific(me, k, v), 0);
+                            assert_eq!(reg.getspecific(me, k), v, "thread {t} key {k} at {n}");
+                        }
+                    }
+                    for (j, &k) in keys.iter().enumerate() {
+                        assert_eq!(reg.getspecific(me, k), (t << 48) | ((j as u64) << 40) | ITERS);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(churn.join().unwrap() > 0, "the churn ran alongside");
+    }
+
+    /// One host thread serving more guest identities than it caches keeps them
+    /// all apart, in any order.
+    #[test]
+    fn one_host_thread_serving_several_guest_ids_keeps_them_apart() {
+        let reg = TlsRegistry::new();
+        let key = reg.key_create(0).unwrap();
+        let ids: Vec<GuestThreadId> = (1..=(CACHE_ENTRIES as u64 + 3)).map(GuestThreadId).collect();
+        for id in &ids {
+            assert_eq!(reg.getspecific(*id, key), 0, "{id} starts NULL");
+            assert_eq!(reg.setspecific(*id, key, id.0 * 10), 0);
+        }
+        for round in 0..3 {
+            for id in ids.iter().rev().chain(ids.iter()).step_by(round + 1) {
+                assert_eq!(reg.getspecific(*id, key), id.0 * 10, "{id} in round {round}");
+            }
+        }
+    }
+
+    /// Values belong to the **guest** thread: one set on one host thread is the
+    /// value another host thread reads for that guest thread, and back.
+    #[test]
+    fn values_belong_to_the_guest_thread_not_the_host_thread() {
+        let reg = Arc::new(TlsRegistry::new());
+        let key = reg.key_create(0).unwrap();
+        let g = GuestThreadId(40);
+        assert_eq!(reg.setspecific(g, key, 1), 0);
+        let r = reg.clone();
+        std::thread::spawn(move || {
+            assert_eq!(r.getspecific(g, key), 1);
+            assert_eq!(r.setspecific(g, key, 2), 0);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(reg.getspecific(g, key), 2);
+    }
+
+    /// A thread its exit sweep left with nothing gives its block back; a value
+    /// set for it afterwards still lands where every host thread reads it.
+    #[test]
+    fn a_swept_thread_gives_its_block_back_and_later_values_still_land() {
+        let reg = Arc::new(TlsRegistry::new());
+        let key = reg.key_create(0).unwrap();
+        let g = GuestThreadId(50);
+        assert_eq!(reg.setspecific(g, key, 5), 0);
+        assert!(reg.threads.lock().unwrap().contains_key(&g));
+        assert_eq!(reg.take_exit_work(g, &mut |_, _| {}), vec![]);
+        assert!(!reg.threads.lock().unwrap().contains_key(&g), "the block was given back");
+        assert_eq!(reg.getspecific(g, key), 0, "swept");
+        assert_eq!(reg.setspecific(g, key, 6), 0);
+        let r = reg.clone();
+        std::thread::spawn(move || assert_eq!(r.getspecific(g, key), 6, "seen from another host thread"))
+            .join()
+            .unwrap();
+    }
+
+    /// A block given back by a sweep on one host thread while **another** host
+    /// thread still caches it: that thread's next write must land in the block
+    /// every host thread reads, not in the one given back.
+    #[test]
+    fn a_block_given_back_elsewhere_is_not_written_through_a_stale_cache() {
+        let reg = Arc::new(TlsRegistry::new());
+        let key = reg.key_create(0).unwrap();
+        let g = GuestThreadId(60);
+        let (to_worker, from_main) = std::sync::mpsc::channel::<()>();
+        let (to_main, from_worker) = std::sync::mpsc::channel::<()>();
+        let r = reg.clone();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(r.setspecific(g, key, 1), 0, "the worker caches g's block");
+            to_main.send(()).unwrap();
+            from_main.recv().unwrap();
+            assert_eq!(r.getspecific(g, key), 0, "the sweep cleared it");
+            assert_eq!(r.setspecific(g, key, 7), 0);
+        });
+        from_worker.recv().unwrap();
+        assert_eq!(reg.take_exit_work(g, &mut |_, _| {}), vec![]);
+        assert!(!reg.threads.lock().unwrap().contains_key(&g), "given back");
+        to_worker.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(reg.getspecific(g, key), 7, "the worker's write after the give-back");
+    }
+
+    /// Two registries on one host thread, with the same guest id and the same key
+    /// number, do not share values -- nor does one made after another was dropped.
+    #[test]
+    fn two_registries_on_one_host_thread_do_not_share_values() {
+        let me = GuestThreadId(1);
+        let one = TlsRegistry::new();
+        let two = TlsRegistry::new();
+        let (k1, k2) = (one.key_create(0).unwrap(), two.key_create(0).unwrap());
+        assert_eq!(k1, k2, "the same key number in both");
+        assert_eq!(one.setspecific(me, k1, 0xA), 0);
+        assert_eq!(two.getspecific(me, k2), 0);
+        assert_eq!(two.setspecific(me, k2, 0xB), 0);
+        assert_eq!(one.getspecific(me, k1), 0xA);
+        drop(one);
+        let three = TlsRegistry::new();
+        let k3 = three.key_create(0).unwrap();
+        assert_eq!(three.getspecific(me, k3), 0, "a new registry starts NULL");
+    }
+
+    /// **The hot path takes no lock.** Once a host thread has looked its blocks
+    /// up, reads and writes -- even alternating between two guest identities --
+    /// never go to the shared map again.
+    #[test]
+    fn a_warm_thread_takes_no_lock() {
+        let reg = TlsRegistry::new();
+        let key = reg.key_create(0).unwrap();
+        let (a, b) = (GuestThreadId(1), GuestThreadId(2));
+        assert_eq!(reg.setspecific(a, key, 1), 0);
+        assert_eq!(reg.setspecific(b, key, 2), 0);
+        let before = reg.slow_lookups();
+        for n in 0..1000u64 {
+            assert_eq!(reg.setspecific(a, key, n + 10), 0);
+            assert_eq!(reg.getspecific(b, key), 2);
+            assert_eq!(reg.getspecific(a, key), n + 10);
+        }
+        assert_eq!(reg.slow_lookups(), before, "a warm thread went to the locked map");
+        assert!(before >= 2, "the cold lookups are counted: {before}");
+    }
+
+    /// `getspecific` alone, without the import crossing around it (which
+    /// `omni-android`'s `tests/perf.rs` measures), on one thread and on eight.
+    ///
+    /// `cargo test -p omni-bionic --release --lib -- --ignored --nocapture getspecific_alone`
+    #[test]
+    #[ignore = "measurement, not a test"]
+    fn the_cost_of_getspecific_alone() {
+        const EACH: u64 = 10_000_000;
+        for threads in [1u64, 8] {
+            let reg = Arc::new(TlsRegistry::new());
+            let key = reg.key_create(0).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(threads as usize + 1));
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let (reg, barrier) = (reg.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let me = GuestThreadId(t + 1);
+                        reg.setspecific(me, key, t + 1);
+                        barrier.wait();
+                        let mut sum = 0u64;
+                        for _ in 0..EACH {
+                            sum = sum.wrapping_add(reg.getspecific(std::hint::black_box(me), key));
+                        }
+                        assert_eq!(sum, (t + 1).wrapping_mul(EACH));
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let start = std::time::Instant::now();
+            for h in handles {
+                h.join().unwrap();
+            }
+            println!(
+                "getspecific alone, {threads} thread(s): {:.1} ns per call per thread",
+                start.elapsed().as_secs_f64() * 1e9 / EACH as f64
             );
         }
     }

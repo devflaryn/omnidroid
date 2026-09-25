@@ -347,3 +347,115 @@ fn the_cost_of_a_bionic_import_crossing_with_the_census_on_and_off() {
     }
     boundary.stop_census();
 }
+
+/// **`pthread_getspecific` through the real import**, on one thread and on eight calling it at
+/// once, each with a live key holding its own value -- the shape of a world's hottest TLS reads
+/// (MEASURED in Pet Simulator 99: 1.4-1.9 M calls a second on one busy worker). A registry that
+/// takes one process-wide lock and hashes on every read shows up here as the eight-thread number
+/// running away from the one-thread number; one that reads the key's generation and the thread's
+/// own slot does not. Compare with `pthread_self` above, which is the crossing and nothing else.
+///
+/// `cargo test -p omni-android --release --test perf -- --ignored --nocapture getspecific`
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_pthread_getspecific_on_one_thread_and_on_eight() {
+    use omni_android::bionic::Bionic;
+    use std::sync::Barrier;
+    const EACH: u64 = 2_000_000;
+    const ROUNDS: usize = 6;
+    let guest = Guest::new();
+    let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
+    bionic.set_log_to_stderr(false);
+    let builder = guest.boundary(256);
+    bionic.bind_into(&builder).expect("bind every handler");
+    let boundary = builder.finish();
+    let thunk = |name: &str| boundary.slot_named(name).expect("bound").address;
+    let (create, set, get) =
+        (thunk("pthread_key_create"), thunk("pthread_setspecific"), thunk("pthread_getspecific"));
+
+    // Every program is assembled before any guest thread runs (see `Guest::load`).
+    let make_key = {
+        let at = guest.next_entry();
+        let mut asm = harness::Asm::at(at);
+        asm.push(mov_reg(20, 30));
+        asm.mov(0, guest.data as u64);
+        asm.mov(1, 0);
+        asm.bl(create);
+        asm.push(mov_reg(30, 20));
+        asm.push(ret(30));
+        guest.load(asm.words())
+    };
+    // Each thread sets its own value (X2) under the key (X3), then reads it back X1 times.
+    let entry = {
+        let at = guest.next_entry();
+        let mut asm = harness::Asm::at(at);
+        asm.push(mov_reg(20, 30));
+        asm.push(mov_reg(21, 1));
+        asm.push(mov_reg(22, 3));
+        asm.push(mov_reg(0, 22));
+        asm.push(mov_reg(1, 2));
+        asm.bl(set);
+        asm.push(mov_reg(1, 21));
+        let top = asm.pc();
+        asm.push(mov_reg(0, 22));
+        asm.bl(get);
+        asm.push(subs_imm(1, 1, 1));
+        let here = asm.pc();
+        asm.push(b_cond(1, (top as i64 - here as i64) as i32 / 4));
+        asm.push(mov_reg(30, 20));
+        asm.push(ret(30));
+        guest.load(asm.words())
+    };
+    // One key, created once on this thread, the way an engine creates its keys at startup.
+    let key = {
+        let _active = bionic.activate().expect("a thread block");
+        let mut cpu = guest.thread(&boundary);
+        boundary.run(&mut cpu, make_key, harness::BUDGET).expect("runs");
+        assert_eq!(cpu.x(x(0)), 0, "pthread_key_create");
+        guest.read_u64(guest.data) & 0xFFFF_FFFF
+    };
+    println!("
+== pthread_getspecific through the import, ns per call per thread (median of 5) ==");
+    for threads in [1usize, 8] {
+        let barrier = Barrier::new(threads + 1);
+        // `Guest` is not `Sync`; the loop touches no stack, so every thread may share its top.
+        let (stack_top, sentinel) = (guest.stack_top, boundary.sentinel());
+        let cpus: Vec<_> = (0..threads).map(|_| guest.thread(&boundary)).collect();
+        std::thread::scope(|scope| {
+            for (i, mut cpu) in cpus.into_iter().enumerate() {
+                let (bionic, boundary, barrier) = (&bionic, &boundary, &barrier);
+                scope.spawn(move || {
+                    let _active = bionic.activate().expect("a thread block");
+                    let mine = 0x5000_0000 + i as u64 * 0x100;
+                    for _ in 0..ROUNDS {
+                        cpu.set_sp(stack_top);
+                        cpu.set_x(x(30), sentinel as u64);
+                        cpu.set_x(x(1), EACH);
+                        cpu.set_x(x(2), mine);
+                        cpu.set_x(x(3), key);
+                        barrier.wait();
+                        boundary.run(&mut cpu, entry, RunLimit::Unlimited).expect("runs");
+                        barrier.wait();
+                        assert_eq!(cpu.x(x(0)), mine, "thread {i} read back another value");
+                    }
+                });
+            }
+            let mut samples = Vec::new();
+            for round in 0..ROUNDS {
+                barrier.wait();
+                let t = std::time::Instant::now();
+                barrier.wait();
+                if round > 0 {
+                    samples.push(t.elapsed());
+                }
+            }
+            samples.sort();
+            let median = samples[samples.len() / 2];
+            println!(
+                "  {:12}: {:6.1} ns per call per thread",
+                format!("{threads} thread(s)"),
+                median.as_secs_f64() * 1e9 / EACH as f64
+            );
+        });
+    }
+}

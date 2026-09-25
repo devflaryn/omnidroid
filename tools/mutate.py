@@ -8696,6 +8696,82 @@ directory", ADAPTER_FILES,
      """            if length != 32 {""",
      """            if length <= 32 {""",
      ANDROID_LIB),
+
+    # ---- pthread_key values without a shared lock (prefix `tlsfast-`) ---------------------------
+    # MEASURED in-world: `pthread_getspecific` at 1.4-1.9 M calls/s on one worker and ~4% of all
+    # non-JIT samples, every call taking one process-wide mutex and hashing. Key slots now carry
+    # atomic generations, each guest thread's values are a block only it writes, and a host thread
+    # caches the block it last used. Detectors: `omni_bionic::tls::tests`. The B rows are the
+    # property the change exists for -- a warm thread never reaching the locked map -- which no
+    # functional assertion sees, so `a_warm_thread_takes_no_lock` counts the slow lookups.
+    ("tlsfast-A1", "A", "a value is read whatever key it was stored under, so a re-created key sees the old one",
+     "crates/omni-bionic/src/tls.rs",
+     "        if self.generation.load(Ordering::Relaxed) == generation {",
+     "        if true {",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A2", "A", "a reused slot never publishes its new key's generation",
+     "crates/omni-bionic/src/tls.rs",
+     """                self.generations.0[idx].store(gen, Ordering::Release);
+                return Ok(idx as u32);""",
+     """                return Ok(idx as u32);""",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A3", "A", "key_delete leaves the slot's generation live, so a deleted key still reads",
+     "crates/omni-bionic/src/tls.rs",
+     "        self.generations.0[idx].store(0, Ordering::Release);",
+     "",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A4", "A", "the thread-local cache matches any registry, handing one instance another's values",
+     "crates/omni-bionic/src/tls.rs",
+     """                if hit.registry == self.id
+                    && hit.thread == thread""",
+     """                if hit.thread == thread""",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A5", "A", "the thread-local cache matches any guest thread on this host thread",
+     "crates/omni-bionic/src/tls.rs",
+     """                    && hit.thread == thread
+                    && !hit.values.retired""",
+     """                    && !hit.values.retired""",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A6", "A", "a host thread keeps writing into a block the exit sweep gave back",
+     "crates/omni-bionic/src/tls.rs",
+     """                    && !hit.values.retired.load(Ordering::Relaxed)
+                {""",
+     """                {""",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A7", "A", "the sweep gives back a block still holding a value past the destructor cap",
+     "crates/omni-bionic/src/tls.rs",
+     "        if !leftover {",
+     "        if true {",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A8", "A", "the sweep records a destructor without clearing the value first",
+     "crates/omni-bionic/src/tls.rs",
+     """                        values.pairs[idx].write(slot.generation, 0);
+""",
+     "",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A9", "A", "the sweep hands a deleted key's value to the destructor of the key now in its slot",
+     "crates/omni-bionic/src/tls.rs",
+     "                        let v = values.pairs[idx].read(slot.generation);",
+     "                        let v = values.pairs[idx].value.load(Ordering::Relaxed);",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-A10", "A", "an exited thread's empty block is never given back",
+     "crates/omni-bionic/src/tls.rs",
+     "            self.retire(thread);",
+     "            let _ = thread;",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-B1", "B", "the block is never cached, so every access takes the thread map's lock",
+     "crates/omni-bionic/src/tls.rs",
+     """                cache.insert(
+                    0,
+                    Cached { registry: self.id, thread, values: Arc::clone(&values) },
+                );""",
+     "",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
+    ("tlsfast-B2", "B", "the cache holds one block, so a host thread alternating two identities locks every call",
+     "crates/omni-bionic/src/tls.rs",
+     "const CACHE_ENTRIES: usize = 4;",
+     "const CACHE_ENTRIES: usize = 1;",
+     ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so
