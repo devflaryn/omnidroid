@@ -86,6 +86,7 @@ impl GuestCpu for RegisterFile {
             // the boundary, over whatever frame its veneer saved. It answers `false` here only
             // because it executes nothing at all.
             inline_thunks: false,
+            shared_translation: false,
         }
     }
 

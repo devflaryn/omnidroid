@@ -2389,6 +2389,13 @@ impl ReentrantCall<'_> {
         let range = omni_cpu::GuestRange::new(address, len)?;
         // This context first, synchronously, because the caller is about to return into it.
         self.cpu.invalidate_code(range)?;
+        // A backend whose contexts share one set of translations (D38) has just invalidated the
+        // range for all of them, each catching up by its next run: handing it to every other
+        // context as well would invalidate the one shared translation once per context -- and a
+        // queue that overflowed would throw away every thread's code, not one thread's.
+        if self.cpu.capabilities().shared_translation {
+            return Ok(());
+        }
         // Then every other live context, which applies it at the top of its next run segment.
         let me = CONTEXT.with(|cell| cell.borrow().as_ref().map(|(token, _)| *token));
         self.boundary.code_watch.broadcast(me.unwrap_or(u64::MAX), (address, len));

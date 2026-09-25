@@ -156,10 +156,18 @@ unsafe extern "C" fn cb_read_code(ctx: *mut c_void, vaddr: u64, out: *mut u32) -
             // Order matters. The sentinel and thunks are addresses Omnidroid planted, so they win
             // over whatever the guest has there; a breakpoint is a debugging overlay on a real
             // instruction, so it comes next; and only then is guest memory read.
-            if c.sentinel == Some(address)
-                || c.thunks.contains(&address)
-                || c.inline_thunks.contains_key(&address)
-            {
+            //
+            // With a shared code cache (D38) the translation is every context's, so what is planted
+            // is the space's set, not this context's; `cb_call_svc` still decides per context.
+            let planted = match &c.shared_plants {
+                Some(space) => space.contains(address),
+                None => {
+                    c.sentinel == Some(address)
+                        || c.thunks.contains(&address)
+                        || c.inline_thunks.contains_key(&address)
+                }
+            };
+            if planted {
                 *out = STOP_SVC;
                 return 1;
             }

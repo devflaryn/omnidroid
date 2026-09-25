@@ -506,6 +506,10 @@ fn real_guest_code_reads_the_thread_pointer_and_finds_the_stack_guard() {
         (tls.thread_pointer(), tls.stack_guard())
     };
     let reload = entry + STACK_GUARD_RELOAD_OFFSET as usize;
+    // A shared code cache (D38) refuses breakpoints; the guard-changed half needs one.
+    if harness::refuses_breakpoints_because_shared(&mut cpu) {
+        return;
+    }
     cpu.add_breakpoint(reload).expect("break before the second read of the guard");
 
     roblox.rearm(&mut cpu);
@@ -717,6 +721,33 @@ fn the_per_thread_cpu_cost_is_measured_and_under_its_ceiling() {
         per_thread_warm as f64 / 1048576.0,
         reported as f64 / 1048576.0,
     );
+
+    // **With a shared code cache (D38) a thread has no code cache of its own**: what it costs is
+    // its TLS page, its 64 KiB fast-dispatch table and dynarmic's per-thread state, below what the
+    // process commit counter resolves over eight threads (the heap reuses what the warm-up freed).
+    // So the bound here is a ceiling far below the per-thread figure, the shared cache's own
+    // commit is read from the cache, and the instrument is shown seeing 16 MiB.
+    if roblox.backend.shares_translations() {
+        let stats = roblox.backend.code_cache_stats().expect("the shared cache's counters");
+        println!(
+            "  shared code cache: {:.3} MiB committed for every thread ({} blocks)",
+            stats.committed_bytes as f64 / 1048576.0,
+            stats.blocks_emitted
+        );
+        assert!(
+            per_thread_warm <= 1024 * 1024,
+            "a guest thread on the shared code cache cost {per_thread_warm} bytes: it should have no \
+             code cache of its own"
+        );
+        assert!(stats.blocks_emitted > 0 && stats.committed_bytes > 0, "{stats:?}");
+        let before = omni_mem::process_commit_charge().expect("commit charge");
+        let touched = vec![1u8; 16 << 20];
+        std::hint::black_box(&touched);
+        let grew = omni_mem::process_commit_charge().expect("commit charge").saturating_sub(before);
+        assert!(grew >= 15 << 20, "touching 16 MiB moved the commit charge by {grew} bytes");
+        drop(threads);
+        return;
+    }
 
     // **The omission is bounded, not merely admitted.** `cost()` reports two derived terms and
     // leaves out the code cache's committed high-water mark, which this pin gives no way to read.
@@ -1105,4 +1136,197 @@ fn cold_and_warm_translation_throughput_on_real_roblox_code() {
          only touches its own stack)",
         cpu.slow_path_entries()
     );
+}
+
+/// **Eight guest threads running the same real Roblox code, each with its own code cache and all
+/// on one shared cache** (vendored patch 0022, D38): what the shared cache saves in translation,
+/// time and memory where the engine's workers meet the same new code.
+///
+/// Every leaf the scan graded runnable, run once on each of eight contexts, concurrently, all
+/// cold. Two orders:
+///
+/// * **same** -- every thread walks the functions in one order, so all eight reach each new
+///   function together: the worst case for sharing (one translates, seven wait) and the case
+///   where per-thread caches at least translate in parallel;
+/// * **spread** -- thread `i` starts an eighth of the way further along, so each thread meets a
+///   different part first, as when the engine spreads new work over its workers.
+///
+/// Per configuration and order: wall time until the slowest thread is done, the threads' CPU time,
+/// the guest instructions fetched for translation (the context counters), and the process's commit
+/// charge before and after. n = 5 samples each, alternating the configurations, a fresh address
+/// space and backend per sample; medians with min..max.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_eight_threads_meeting_the_same_real_roblox_code() {
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    let _serial = serialized();
+    const THREADS: usize = 8;
+    const SAMPLES: usize = 5;
+    let Some(probe) = Roblox::load() else { return };
+    let bytes = harness::roblox::main_lib_bytes().expect("the library bytes");
+    let elf = omni_elf::ElfImage::parse(bytes).expect("parse libroblox.so");
+    let leaves = omni_elf::leaf::find_leaves(&elf).expect("scan for leaves");
+    let vaddrs: Vec<u64> = leaves.iter().map(|l| l.bounds.start).collect();
+
+    /// One function, as the other measurement calls it. `true` if it returned.
+    fn call_one(roblox: &Roblox, cpu: &mut DynarmicCpu, entry: GuestAddr, stack_top: GuestAddr) -> bool {
+        for r in 0..8u8 {
+            cpu.set_x(x(r), 0x0101_0101_0101_0101u64.wrapping_mul(u64::from(r) + 1));
+        }
+        cpu.set_sp(stack_top);
+        cpu.set_x(x(30), roblox.sentinel as u64);
+        let result = cpu.run(entry, RunLimit::Instructions(200_000));
+        if !matches!(result, Ok(ExitReason::Returned { .. })) && std::env::var_os("OMNI_BENCH_VERBOSE").is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("    first call that did not return: {result:?}"));
+        }
+        matches!(result, Ok(ExitReason::Returned { .. }))
+    }
+
+    // Which functions simply return, found once on a throwaway space, so every measured run does
+    // the same work.
+    let keep: Vec<u64> = {
+        let mut cpu = probe.thread();
+        vaddrs
+            .iter()
+            .copied()
+            .filter(|&v| call_one(&probe, &mut cpu, probe.at(v), probe.stack_top))
+            .collect()
+    };
+    drop(probe);
+    println!("\n== eight threads meeting the same real Roblox code ({} functions) ==", keep.len());
+
+    #[derive(Clone, Copy, Default)]
+    struct Sample {
+        wall: Duration,
+        warm: Duration,
+        cpu: Duration,
+        fetched: u64,
+        commit: u64,
+        blocks: u64,
+    }
+
+    let run = |shared: bool, spread: bool| -> Sample {
+        let roblox = Roblox::with_options(DynarmicOptions {
+            max_threads: 16,
+            shared_code_cache: shared,
+            ..DynarmicOptions::default()
+        })
+        .expect("the library");
+        assert_eq!(roblox.backend.shares_translations(), shared);
+        // A stack per thread: these functions push frames.
+        let page = roblox.space.page_size();
+        let stacks: Vec<GuestAddr> = (0..THREADS)
+            .map(|_| {
+                let base = roblox
+                    .space
+                    .map_anonymous(
+                        omni_mem::Placement::Anywhere { align: page },
+                        harness::roblox::STACK_BYTES,
+                        omni_mem::Protection::ReadWrite,
+                        omni_mem::CommitPolicy::Eager,
+                    )
+                    .expect("a stack");
+                (base + harness::roblox::STACK_BYTES) & !0xF
+            })
+            .collect();
+        let before = omni_mem::process_commit_charge().expect("commit charge");
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let results: Vec<(Duration, Duration, u64, Duration, DynarmicCpu)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let roblox = &roblox;
+                    let keep = &keep;
+                    let barrier = Arc::clone(&barrier);
+                    let stack_top = stacks[i];
+                    scope.spawn(move || {
+                        let mut cpu = roblox.thread();
+                        cpu.set_return_sentinel(roblox.sentinel).expect("sentinel");
+                        let me = omni_platform::sampler::HostThread::current().expect("this thread");
+                        let offset = if spread { i * keep.len() / THREADS } else { 0 };
+                        barrier.wait();
+                        let cpu_before = me.cpu_time().expect("cpu time");
+                        let started = Instant::now();
+                        for k in 0..keep.len() {
+                            let v = keep[(offset + k) % keep.len()];
+                            call_one(roblox, &mut cpu, roblox.at(v), stack_top);
+                        }
+                        let wall = started.elapsed();
+                        let used = me.cpu_time().expect("cpu time").saturating_sub(cpu_before);
+                        let fetched = cpu.jit_counters().fetched;
+                        // The same again, everything translated: what the dispatcher costs.
+                        barrier.wait();
+                        let stats_before = cpu.stats();
+                        let warm_started = Instant::now();
+                        let mut failed = 0;
+                        for k in 0..keep.len() {
+                            let v = keep[(offset + k) % keep.len()];
+                            failed += usize::from(!call_one(roblox, &mut cpu, roblox.at(v), stack_top));
+                        }
+                        let warm = warm_started.elapsed();
+                        if std::env::var_os("OMNI_BENCH_VERBOSE").is_some() && i == 0 {
+                            let after = cpu.stats();
+                            eprintln!(
+                                "    thread 0 warm: {failed} calls did not return; slow path {} exceptions {} svc {} fallbacks {} read_code {}",
+                                after.slow_path_total - stats_before.slow_path_total,
+                                after.exceptions - stats_before.exceptions,
+                                after.svc_calls - stats_before.svc_calls,
+                                after.interpreter_fallbacks - stats_before.interpreter_fallbacks,
+                                after.read_code - stats_before.read_code,
+                            );
+                        }
+                        (wall, used, fetched, warm, cpu)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("a thread")).collect()
+        });
+        let after = omni_mem::process_commit_charge().expect("commit charge");
+        let blocks = roblox.backend.code_cache_stats().map_or(0, |s| s.blocks_emitted);
+        if std::env::var_os("OMNI_BENCH_VERBOSE").is_some() {
+            let warm: Vec<f64> = results.iter().map(|r| r.3.as_secs_f64() * 1e3).collect();
+            let cold: Vec<f64> = results.iter().map(|r| r.0.as_secs_f64() * 1e3).collect();
+            eprintln!("  shared {shared} spread {spread}: cold {cold:.1?} warm {warm:.2?} {:?}", roblox.backend.code_cache_stats().map(|s| (s.translate_ns, s.emit_ns, s.translations_raced)));
+        }
+        let sample = Sample {
+            wall: results.iter().map(|r| r.0).max().unwrap_or_default(),
+            warm: results.iter().map(|r| r.3).max().unwrap_or_default(),
+            cpu: results.iter().map(|r| r.1).sum(),
+            fetched: results.iter().map(|r| r.2).sum(),
+            commit: after.saturating_sub(before),
+            blocks,
+        };
+        drop(results);
+        sample
+    };
+
+    for spread in [false, true] {
+        let mut per_thread = Vec::new();
+        let mut shared = Vec::new();
+        for _ in 0..SAMPLES {
+            per_thread.push(run(false, spread));
+            shared.push(run(true, spread));
+        }
+        let median = |v: &mut Vec<f64>| -> (f64, f64, f64) {
+            v.sort_by(f64::total_cmp);
+            (v[v.len() / 2], v[0], v[v.len() - 1])
+        };
+        println!("  order: {}", if spread { "spread (thread i starts i/8 of the way along)" } else { "same (all eight together)" });
+        for (name, samples) in [("per-thread caches", &per_thread), ("one shared cache", &shared)] {
+            let (wall, wall_lo, wall_hi) = median(&mut samples.iter().map(|s| s.wall.as_secs_f64() * 1e3).collect());
+            let (cpu, cpu_lo, cpu_hi) = median(&mut samples.iter().map(|s| s.cpu.as_secs_f64() * 1e3).collect());
+            let (fetched, f_lo, f_hi) = median(&mut samples.iter().map(|s| s.fetched as f64).collect());
+            let (commit, c_lo, c_hi) = median(&mut samples.iter().map(|s| s.commit as f64 / 1048576.0).collect());
+            let (blocks, _, _) = median(&mut samples.iter().map(|s| s.blocks as f64).collect());
+            let (warm, warm_lo, warm_hi) = median(&mut samples.iter().map(|s| s.warm.as_secs_f64() * 1e3).collect());
+            println!(
+                "    {name:<18} cold wall {wall:7.1} ms [{wall_lo:.1}..{wall_hi:.1}]  warm wall {warm:6.2} ms [{warm_lo:.2}..{warm_hi:.2}]  threads' CPU {cpu:7.1} ms \
+                 [{cpu_lo:.1}..{cpu_hi:.1}]  fetched {fetched:8.0} insns [{f_lo:.0}..{f_hi:.0}]  commit \
+                 +{commit:6.1} MiB [{c_lo:.1}..{c_hi:.1}]{}",
+                if blocks > 0.0 { format!("  shared blocks {blocks:.0}") } else { String::new() }
+            );
+        }
+    }
 }

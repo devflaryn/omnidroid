@@ -87,6 +87,22 @@ pub fn monitor_part(monitors: &[MonitorLayout], address: usize) -> Option<Monito
     })
 }
 
+/// With a shared code cache (D38) the code does not carry the running thread's monitor slots as
+/// immediates: it loads them from its `JitState`, at these two offsets from `r15`. Registered by a
+/// backend with a shared cache; `None` otherwise.
+static JIT_STATE_MONITOR_OFFSETS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// Record where `JitState` keeps the monitor slot pointers (reservation address, reserved value).
+pub fn register_jit_state_monitor_offsets(address: u32, value: u32) {
+    *JIT_STATE_MONITOR_OFFSETS.lock() = Some((address, value));
+}
+
+/// See [`register_jit_state_monitor_offsets`].
+#[must_use]
+pub fn jit_state_monitor_offsets() -> Option<(u32, u32)> {
+    *JIT_STATE_MONITOR_OFFSETS.lock()
+}
+
 static TRACK_RETRANSLATION: AtomicBool = AtomicBool::new(false);
 
 /// Start counting, per context, translations of block starts that context had translated before

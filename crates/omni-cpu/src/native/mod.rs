@@ -855,6 +855,8 @@ impl GuestCpu for NativeCpu {
             breakpoints: false,
             // Every thunk is a VM exit (D17's design A); nothing dispatches inside the guest.
             inline_thunks: false,
+            // Nothing is translated.
+            shared_translation: false,
         }
     }
 

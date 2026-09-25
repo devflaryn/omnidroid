@@ -215,6 +215,7 @@ pub struct ThreadProfile {
 pub fn profile(boundary: &Boundary, duration: Duration, hz: u32) -> Vec<ThreadProfile> {
     let modules = Modules::load();
     let monitors = omni_cpu::stats::monitors();
+    let jit_state_offsets = omni_cpu::stats::jit_state_monitor_offsets();
     let classes = sampler::efficiency_classes().unwrap_or_default();
     let fastest = classes.iter().copied().max().unwrap_or(0);
     let tick = Duration::from_secs_f64(1.0 / f64::from(hz.max(1)));
@@ -226,7 +227,7 @@ pub fn profile(boundary: &Boundary, duration: Duration, hz: u32) -> Vec<ThreadPr
         records = boundary.perf_records();
         let census = boundary.census_on();
         for record in &records {
-            sample_one(record, census, &modules, &monitors, &classes, fastest, &mut code, &mut acc);
+            sample_one(record, census, &modules, &monitors, jit_state_offsets, &classes, fastest, &mut code, &mut acc);
         }
         std::thread::sleep(tick);
     }
@@ -403,12 +404,23 @@ fn is_driver_module(name: &str) -> bool {
 }
 
 /// Whether the code bytes around a sampled instruction pointer contain a 64-bit immediate that is
-/// one of the exclusive monitor's own addresses. See the module documentation for `mon`.
-fn near_monitor(code: &[u8], start: usize, end: usize, monitors: &[omni_cpu::stats::MonitorLayout]) -> bool {
-    if monitors.is_empty() || end < start + 10 {
+/// one of the exclusive monitor's own addresses -- or, in code from a shared code cache (D38),
+/// a load of the running thread's monitor slot out of its `JitState` (`mov r64, [r15 + disp32]`
+/// at one of `jit_state_offsets`). See the module documentation for `mon`.
+fn near_monitor(
+    code: &[u8],
+    start: usize,
+    end: usize,
+    monitors: &[omni_cpu::stats::MonitorLayout],
+    jit_state_offsets: Option<(u32, u32)>,
+) -> bool {
+    if monitors.is_empty() || end < start + 7 {
         return false;
     }
-    (start..=end - 10).any(|at| {
+    let immediate = |at: usize| {
+        if at + 10 > end {
+            return false;
+        }
         let rex = code[at];
         let op = code[at + 1];
         if (rex == 0x48 || rex == 0x49) && (0xB8..=0xBF).contains(&op) {
@@ -418,7 +430,21 @@ fn near_monitor(code: &[u8], start: usize, end: usize, monitors: &[omni_cpu::sta
         } else {
             false
         }
-    })
+    };
+    let slot_load = |at: usize| {
+        let Some((address, value)) = jit_state_offsets else { return false };
+        // REX.W with REX.B (the base is r15), REX.R for r8-r15 as the destination; `mov r64, r/m64`;
+        // ModRM mod=10 (disp32), rm=111 (r15 with REX.B).
+        let rex = code[at];
+        if !(rex == 0x49 || rex == 0x4D) || code[at + 1] != 0x8B || code[at + 2] & 0xC7 != 0x87 {
+            return false;
+        }
+        let mut disp = [0u8; 4];
+        disp.copy_from_slice(&code[at + 3..at + 7]);
+        let disp = u32::from_le_bytes(disp);
+        disp == address || disp == value
+    };
+    (start..=end - 7).any(|at| immediate(at) || slot_load(at))
 }
 
 // ----------------------------------------------------------------------------------- per thread
@@ -504,6 +530,7 @@ fn reporter(config: &Config) {
         }
     }
     let monitors = omni_cpu::stats::monitors();
+    let jit_state_offsets = omni_cpu::stats::jit_state_monitor_offsets();
     say(&format!(
         "PERF: ON (OMNI_PERF): a block every {:.1}s; sampler {} (OMNI_PERF_SAMPLE); dump {} \
          (OMNI_PERF_DUMP); handler timing {} (OMNI_PERF_WAITS); processor efficiency classes {:?}; \
@@ -531,6 +558,7 @@ fn reporter(config: &Config) {
     let mut prev: Option<Process> = None;
     let mut prev_waits = if config.waits { crate::waits::snapshot() } else { HashMap::new() };
     let mut monitors = monitors;
+    let mut jit_state_offsets = jit_state_offsets;
     loop {
         std::thread::sleep(tick);
         let (boundary, bionic, vulkans) = {
@@ -549,7 +577,7 @@ fn reporter(config: &Config) {
         let census = boundary.census_on();
         if config.sample_hz > 0 {
             for record in &records {
-                sample_one(record, census, &modules, &monitors, &classes, fastest, &mut code, &mut acc);
+                sample_one(record, census, &modules, &monitors, jit_state_offsets, &classes, fastest, &mut code, &mut acc);
             }
         }
         if Instant::now() < next_report {
@@ -584,6 +612,7 @@ fn reporter(config: &Config) {
         // when a backend is created after the reporter started.
         modules = Modules::load();
         monitors = omni_cpu::stats::monitors();
+        jit_state_offsets = omni_cpu::stats::jit_state_monitor_offsets();
     }
 }
 
@@ -609,6 +638,7 @@ fn sample_one(
     census: bool,
     modules: &Modules,
     monitors: &[omni_cpu::stats::MonitorLayout],
+    jit_state_offsets: Option<(u32, u32)>,
     classes: &[u8],
     fastest: u8,
     code: &mut [u8; CODE_BEFORE + CODE_AFTER],
@@ -650,7 +680,7 @@ fn sample_one(
         (false, Some(ModuleKind::Other)) => Class::Other,
         (false, None) => match sampler::memory_kind(sample.ip) {
             Ok(MemoryKind::PrivateWritableExecutable { .. }) => {
-                if near_monitor(code, sample.code_start, sample.code_end, monitors) {
+                if near_monitor(code, sample.code_start, sample.code_end, monitors, jit_state_offsets) {
                     Class::Monitor
                 } else {
                     Class::Jit
@@ -940,17 +970,48 @@ mod tests {
         code[at] = 0x48;
         code[at + 1] = 0xB9;
         code[at + 2..at + 10].copy_from_slice(&0x1234_5678_9000u64.to_le_bytes());
-        assert!(near_monitor(&code, 0, code.len(), &monitors));
+        assert!(near_monitor(&code, 0, code.len(), &monitors, None));
         // The same shape with an immediate that is not the monitor's.
         code[at + 2..at + 10].copy_from_slice(&0x1234_5678_9008u64.to_le_bytes());
-        assert!(!near_monitor(&code, 0, code.len(), &monitors));
+        assert!(!near_monitor(&code, 0, code.len(), &monitors, None));
         // A reservation slot, with r8-r15's REX prefix.
         code[at] = 0x49;
         code[at + 2..at + 10].copy_from_slice(&(0x1234_5678_a000u64 + 3 * 8).to_le_bytes());
-        assert!(near_monitor(&code, 0, code.len(), &monitors));
+        assert!(near_monitor(&code, 0, code.len(), &monitors, None));
         // Outside the bytes that were actually read, it does not count.
-        assert!(!near_monitor(&code, at + 1, code.len(), &monitors));
-        assert!(!near_monitor(&code, 0, code.len(), &[]));
+        assert!(!near_monitor(&code, at + 1, code.len(), &monitors, None));
+        assert!(!near_monitor(&code, 0, code.len(), &[], None));
+    }
+
+    /// D38: code from a shared cache loads the running thread's slot out of its `JitState`.
+    #[test]
+    fn a_monitor_slot_loaded_from_jit_state_is_recognised_and_nothing_else_is() {
+        let monitors = [omni_cpu::stats::MonitorLayout {
+            lock: 0x1234_5678_9000,
+            addresses: 0x1234_5678_a000,
+            address_stride: 8,
+            values: 0x1234_5678_b000,
+            value_stride: 16,
+            slots: 4,
+            global: false,
+        }];
+        let offsets = Some((0x498, 0x4A0));
+        let mut code = [0x90u8; CODE_BEFORE + CODE_AFTER];
+        // `mov rcx, [r15 + 0x498]`: 49 8b 8f 98 04 00 00.
+        let at = CODE_BEFORE - 20;
+        code[at..at + 7].copy_from_slice(&[0x49, 0x8B, 0x8F, 0x98, 0x04, 0x00, 0x00]);
+        assert!(near_monitor(&code, 0, code.len(), &monitors, offsets));
+        assert!(!near_monitor(&code, 0, code.len(), &monitors, None), "no shared cache registered");
+        // `mov r9, [r15 + 0x4a0]`: 4d 8b 8f a0 04 00 00.
+        code[at..at + 7].copy_from_slice(&[0x4D, 0x8B, 0x8F, 0xA0, 0x04, 0x00, 0x00]);
+        assert!(near_monitor(&code, 0, code.len(), &monitors, offsets));
+        // Another JitState field.
+        code[at + 3..at + 7].copy_from_slice(&0x4A8u32.to_le_bytes());
+        assert!(!near_monitor(&code, 0, code.len(), &monitors, offsets));
+        // Another base register (r14, rm=110).
+        code[at + 2] = 0x8E;
+        code[at + 3..at + 7].copy_from_slice(&0x498u32.to_le_bytes());
+        assert!(!near_monitor(&code, 0, code.len(), &monitors, offsets));
     }
 
     #[test]

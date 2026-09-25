@@ -259,6 +259,15 @@ fn held_store_status(monitor: ExclusiveMonitor, interfere: &[u64]) -> (u64, u64)
 fn aba_across_another_threads_exclusive_store_is_the_one_difference() {
     const UP: u64 = 1;
     const DOWN: u64 = u64::MAX; // -1
+    // The reservation is held by a breakpoint on the store-exclusive, which a shared-cache
+    // context refuses (D38); dynarmic-sys's `shared_cache.rs` covers exclusives on one.
+    {
+        let guest = Guest::new();
+        let (mut probe, _) = guest.thread();
+        if harness::refuses_breakpoints_because_shared(&mut probe) {
+            return;
+        }
+    }
     for monitor in [ExclusiveMonitor::Global, ExclusiveMonitor::ValueCompare] {
         // Nothing happened in between: both arms store (status 0), and the word is what the
         // holder stored -- the value it read, 40.

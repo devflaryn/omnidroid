@@ -230,8 +230,10 @@ fn stops_registered_at_hostile_addresses_are_survivable() {
     let (mut cpu, sentinel) = guest.thread();
 
     cpu.add_thunk(guest.unmapped).expect("a thunk in unmapped memory");
-    cpu.add_breakpoint(0).expect("a breakpoint at address zero");
-    cpu.add_breakpoint(usize::MAX & !3).expect("a breakpoint at the top of the space");
+    if !harness::refuses_breakpoints_because_shared(&mut cpu) {
+        cpu.add_breakpoint(0).expect("a breakpoint at address zero");
+        cpu.add_breakpoint(usize::MAX & !3).expect("a breakpoint at the top of the space");
+    }
     assert!(cpu.remove_thunk(guest.unmapped).expect("remove"), "it was registered");
     assert!(!cpu.remove_thunk(guest.unmapped).expect("remove again"), "and now it is not");
 
@@ -271,6 +273,9 @@ fn a_breakpoint_does_not_execute_its_instruction_and_resuming_does() {
     let program = vec![movz(0, 1, 0), movz(1, 2, 0), ret(30)];
     let entry = guest.load(&program);
     let (mut cpu, sentinel) = guest.thread();
+    if harness::refuses_breakpoints_because_shared(&mut cpu) {
+        return;
+    }
     assert!(cpu.capabilities().breakpoints);
 
     let bp = entry + 4;

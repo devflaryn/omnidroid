@@ -135,6 +135,15 @@ pub struct Capabilities {
     /// back to servicing every call through [`ExitReason::Thunk`](crate::ExitReason::Thunk) — slower,
     /// and correct.
     pub inline_thunks: bool,
+    /// Whether every context of this backend's address space runs **one** set of translations
+    /// (the translating backend's shared code cache, vendored patch 0022, D38).
+    ///
+    /// When it is `true`, [`GuestCpu::invalidate_code`] on one context invalidates the translation
+    /// for every context of the space, and each stops using it no later than its next run -- so a
+    /// caller that used to hand the range to every other context as well (omni-android's
+    /// cross-thread queue) must not: it would invalidate the one shared translation once per
+    /// context. `false` means each context has translations of its own.
+    pub shared_translation: bool,
 }
 
 /// One guest thread's ARM64 CPU.

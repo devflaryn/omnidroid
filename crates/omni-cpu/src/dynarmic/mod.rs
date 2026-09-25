@@ -88,14 +88,16 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dynarmic_sys::{
-    optimization, od_jit_clear_halt, od_jit_effective_config, od_jit_free, od_jit_get_pc,
-    od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec, od_jit_halt,
-    od_jit_invalidate_range, od_jit_new, od_jit_reset_stats, od_jit_run, od_jit_set_pc,
-    od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec, od_jit_slow_path_total,
-    od_jit_stats, od_monitor_free, od_monitor_layout_of,
-    od_monitor_new, OdConfig, OdEffectiveConfig, OdMonitorLayout, OdStats, OD_DYNARMIC_ABI_VERSION,
-    OD_HALT_CACHE_INVALIDATION, OD_HALT_MEMORY_ABORT, OD_HALT_SHIM_REENTERED, OD_HALT_SHIM_THREW,
-    OD_HALT_USER1, OD_HALT_USER8, OD_FIXED_PER_JIT_BYTES,
+    optimization, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
+    od_code_cache_stats_of, od_jit_clear_halt, od_jit_effective_config, od_jit_free,
+    od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec, od_jit_halt,
+    od_jit_invalidate_range, od_jit_new, od_jit_new_shared, od_jit_reset_stats, od_jit_run,
+    od_jit_set_pc, od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec,
+    od_jit_slow_path_total, od_jit_stats, od_monitor_free, od_monitor_layout_of, od_monitor_new,
+    OdCodeCacheStats, OdConfig, OdEffectiveConfig, OdMonitorLayout, OdStats,
+    OD_DYNARMIC_ABI_VERSION, OD_HALT_CACHE_INVALIDATION, OD_HALT_MEMORY_ABORT,
+    OD_HALT_SHIM_REENTERED, OD_HALT_SHIM_THREW, OD_HALT_USER1, OD_HALT_USER8,
+    OD_FIXED_PER_JIT_BYTES,
 };
 use omni_mem::{DemandPager, FaultAccess, GuestAddr, GuestSpace, PagerStats, Protection};
 
@@ -178,6 +180,15 @@ pub enum ExclusiveMonitor {
 /// slot, so there the stride stays 1.
 const VALUE_COMPARE_SLOT_STRIDE: u32 = 8;
 
+/// The address space a shared code cache reserves by default: 1 GiB, committed as code is emitted
+/// (D38). Regions are an eighth of it.
+pub const SHARED_CODE_CACHE_BYTES: u64 = 1 << 30;
+/// The smallest shared cache `OMNI_JIT_SHARED_CACHE_MB` may ask for: two 8 MiB regions and the
+/// prelude.
+pub const SHARED_CODE_CACHE_MIN_BYTES: u64 = 64 << 20;
+/// The largest: the x64 backend reaches its prelude from every block with a 32-bit displacement.
+pub const SHARED_CODE_CACHE_MAX_BYTES: u64 = 2 << 30;
+
 /// How the translating backend is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DynarmicOptions {
@@ -240,6 +251,20 @@ pub struct DynarmicOptions {
     /// [`interruptible`](Self::interruptible) selects. Set from `OMNI_JIT_OPTIMIZATIONS` by
     /// [`with_environment`](Self::with_environment), which says so.
     pub optimizations_override: Option<u32>,
+    /// **One translation cache for every guest thread of this address space** (vendored patch
+    /// 0022, `docs/research/shared-jit-cache.md`, D38) instead of one per thread, so a block one
+    /// thread translated is run by all. **Default `false`**; `OMNI_JIT_SHARED_CACHE=1` turns it on.
+    ///
+    /// x64 hosts only: on arm64 the backend has no shared cache, and asking for one gives
+    /// per-thread caches, said so on stderr. With it on, [`code_cache_size`](Self::code_cache_size)
+    /// no longer applies (a context has no cache of its own), breakpoints are refused (a breakpoint
+    /// for one thread cannot be planted in code every thread runs), and the addresses this backend
+    /// plants -- thunks, inline thunks, the return sentinel -- are a property of the space: what a
+    /// context reaches at one is still decided by that context's own registrations.
+    pub shared_code_cache: bool,
+    /// Bytes of address space the shared cache reserves, committed as code is emitted.
+    /// [`SHARED_CODE_CACHE_BYTES`] by default; `OMNI_JIT_SHARED_CACHE_MB` sets it.
+    pub shared_code_cache_bytes: u64,
 }
 
 impl Default for DynarmicOptions {
@@ -258,6 +283,9 @@ impl Default for DynarmicOptions {
             // is the way back, announced.
             exclusive_monitor: ExclusiveMonitor::ValueCompare,
             optimizations_override: None,
+            // D38: measured before it is the default.
+            shared_code_cache: false,
+            shared_code_cache_bytes: SHARED_CODE_CACHE_BYTES,
         }
     }
 }
@@ -353,6 +381,37 @@ impl DynarmicOptions {
             crate::stats::track_retranslation(true);
             say("counting retranslated block starts per context (OMNI_JIT_RETRANSLATION)");
         }
+        if let Ok(value) = std::env::var("OMNI_JIT_SHARED_CACHE") {
+            self.shared_code_cache = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_SHARED_CACHE={other:?} is not 0 or 1"),
+            };
+            say(&format!(
+                "shared code cache {} (OMNI_JIT_SHARED_CACHE): {}",
+                if self.shared_code_cache { "on" } else { "off" },
+                if self.shared_code_cache {
+                    "every guest thread runs one set of translations (D38)"
+                } else {
+                    "a code cache per guest thread"
+                }
+            ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_SHARED_CACHE_MB") {
+            let mb: u64 = value
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("OMNI_JIT_SHARED_CACHE_MB={value:?} is not a number of MiB"));
+            let bytes = mb << 20;
+            assert!(
+                (SHARED_CODE_CACHE_MIN_BYTES..=SHARED_CODE_CACHE_MAX_BYTES).contains(&bytes),
+                "OMNI_JIT_SHARED_CACHE_MB={mb} is outside {}..={} MiB",
+                SHARED_CODE_CACHE_MIN_BYTES >> 20,
+                SHARED_CODE_CACHE_MAX_BYTES >> 20
+            );
+            self.shared_code_cache_bytes = bytes;
+            say(&format!("a {mb} MiB shared code cache (OMNI_JIT_SHARED_CACHE_MB)"));
+        }
         self
     }
 }
@@ -412,6 +471,79 @@ struct Overrides {
     null_thread_pointer: bool,
 }
 
+impl Overrides {
+    /// Whether these override nothing, i.e. build the configuration every context gets.
+    fn is_conforming(&self) -> bool {
+        self.address_space_bits.is_none()
+            && self.direct_access.is_none()
+            && self.mirrors_out_of_range.is_none()
+            && !self.null_thread_pointer
+    }
+}
+
+/// The `OdConfig` a context of a backend with `options` passes: the one place it is written, so
+/// that a shared code cache's template (D38) is the same configuration its contexts attach with.
+fn thread_config(
+    options: &DynarmicOptions,
+    monitor: *mut c_void,
+    ctx: *mut c_void,
+    tpidr_el0: *mut u64,
+    tpidrro_el0: *const u64,
+    processor_id: u32,
+    overrides: Overrides,
+) -> OdConfig {
+    OdConfig {
+        abi_version: OD_DYNARMIC_ABI_VERSION,
+        callbacks: &callbacks::CALLBACKS,
+        ctx,
+        // D13. The shim accepts a null pointer here — its header says the guest's read then
+        // faults into `exception_raised` — which is precisely the configuration the startup
+        // assertion's `TPIDR_EL0 storage` check exists to refuse, so it has to be reachable for
+        // that check to be provable. Only `create_misconfigured_thread` can ask for it.
+        tpidr_el0: if overrides.null_thread_pointer { core::ptr::null_mut() } else { tpidr_el0 },
+        tpidrro_el0: if overrides.null_thread_pointer { core::ptr::null() } else { tpidrro_el0 },
+        // D4, all four fields together. `fastmem_pointer = 0` with 64 bits is the identity
+        // mapping; mirroring is off so a guest address with nothing behind it faults instead of
+        // aliasing a valid page; recompiling on a fastmem failure is what routes a declined
+        // fault to the slow path, where it becomes a typed exit. (With a shared code cache the
+        // shim turns the recompiling off: a declined fault still reaches the slow path, on every
+        // occurrence, and the block is not recompiled for every thread from a fault handler.)
+        //
+        // **"Faults" means "is unmapped in the HOST process", and that is narrower than it
+        // reads.** See this module's documentation, under "What fastmem does not check".
+        fastmem_enabled: i32::from(overrides.direct_access.unwrap_or(true)),
+        fastmem_pointer: 0,
+        fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(64),
+        silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(false)),
+        recompile_on_fastmem_failure: 1,
+        // Task 2's review measured this: off gives 1 slow-path read plus 1 exclusive callback
+        // per `LDXR`, on gives 0, which matters because D5 lists the global exclusive monitor's
+        // 21x anti-scaling as a primary risk.
+        fastmem_exclusive_access: 1,
+        monitor,
+        // Spaced by the stride the monitor was sized with; see `VALUE_COMPARE_SLOT_STRIDE`.
+        processor_id: processor_id * options.monitor_slot_stride(),
+        code_cache_size: options.code_cache_size,
+        // Programmed rather than left at 0, which would select dynarmic's own default. The
+        // default is the same 600 MHz, so nothing a guest can read changes -- but the counter
+        // `cb_get_cntpct` returns is scaled by this same constant, and two defaults that happen
+        // to agree is not the same thing as one constant used twice. See `crate::clock`.
+        cntfrq_el0: crate::clock::CNTFRQ_HZ,
+        ctr_el0: 0,
+        dczid_el0: 4,
+        // The watchdog. See `crate::run`.
+        enable_cycle_counting: 1,
+        wall_clock_cntpct: 0,
+        hook_hint_instructions: 0,
+        define_unpredictable_behaviour: 0,
+        check_halt_on_memory_access: i32::from(options.check_halt_on_memory_access),
+        // Open only for the one unsafe flag `DynarmicOptions` can select, and that flag is in
+        // `optimizations` exactly when this is 1 -- dynarmic requires both.
+        unsafe_optimizations: i32::from(options.unsafe_optimizations()),
+        optimizations: options.optimizations(),
+    }
+}
+
 /// Owns the exclusive monitor, which every guest thread of one address space shares.
 struct Monitor(*mut c_void);
 
@@ -444,10 +576,73 @@ impl Drop for Monitor {
     }
 }
 
+/// The shared code cache (vendored patch 0022), freed after every jit on it -- it is a field of
+/// [`Shared`], which every context holds an `Arc` of -- and before the monitor its code names.
+struct CodeCache(*mut c_void);
+
+// SAFETY: the cache is built to be used by the jits of several threads at once and does its own
+// locking; the handle is passed to `od_jit_new_shared`, to the invalidation and statistics calls,
+// and freed once, in `Drop`, after every jit attached to it.
+unsafe impl Send for CodeCache {}
+// SAFETY: as above.
+unsafe impl Sync for CodeCache {}
+
+impl Drop for CodeCache {
+    fn drop(&mut self) {
+        // SAFETY: from `od_code_cache_new`; every jit on it is freed (see the type's docs).
+        unsafe { od_code_cache_free(self.0) };
+    }
+}
+
+/// With a shared code cache, the addresses this backend plants into the instruction stream --
+/// thunks, inline thunks, the return sentinel (`read_code`'s `STOP_SVC`) -- are translated once
+/// for every context, so whether an address is planted is a property of the space: a count of the
+/// contexts that planted it. What a context reaches at a planted address is still decided by its
+/// own registrations (`cb_call_svc`).
+#[derive(Default)]
+pub(crate) struct Planted {
+    counts: parking_lot::RwLock<std::collections::HashMap<GuestAddr, u32>>,
+}
+
+impl Planted {
+    pub(crate) fn contains(&self, address: GuestAddr) -> bool {
+        self.counts.read().contains_key(&address)
+    }
+
+    /// Count one more context in; `true` if the address was not planted before.
+    fn add(&self, address: GuestAddr) -> bool {
+        let mut counts = self.counts.write();
+        let n = counts.entry(address).or_insert(0);
+        *n += 1;
+        *n == 1
+    }
+
+    /// Count one context out; `true` if no context plants the address any more.
+    fn remove(&self, address: GuestAddr) -> bool {
+        let mut counts = self.counts.write();
+        match counts.get_mut(&address) {
+            Some(n) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => {
+                counts.remove(&address);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// What every context of one guest address space shares.
 struct Shared {
     space: Arc<GuestSpace>,
     extent: GuestAddressSpace,
+    /// The shared code cache, when [`DynarmicOptions::shared_code_cache`] asked for one and the
+    /// host has it. Declared before `monitor`, so it is freed first.
+    code_cache: Option<CodeCache>,
+    /// The planted addresses, counted per space; used only with `code_cache`.
+    planted: Arc<Planted>,
     monitor: Monitor,
     tls: TlsArena,
     options: DynarmicOptions,
@@ -573,6 +768,47 @@ impl DynarmicBackend {
         let owns_guest_paging = pager.is_some();
 
         let monitor = Monitor(raw);
+
+        // D38: one code cache for the space, when asked for. Its template is the configuration
+        // every context of this backend passes (`thread_config`), with this backend's monitor.
+        let code_cache = if options.shared_code_cache {
+            let mut tpidr = 0u64;
+            let tpidrro = 0u64;
+            let template = thread_config(
+                &options,
+                raw,
+                core::ptr::null_mut(),
+                &mut tpidr,
+                &tpidrro,
+                0,
+                Overrides::default(),
+            );
+            let region = options.shared_code_cache_bytes / 8;
+            // SAFETY: `template` is a valid config; its pointers are not kept past the call. The
+            // cache is freed in `CodeCache::drop`, after every jit on it.
+            let cache = unsafe { od_code_cache_new(&template, options.shared_code_cache_bytes, region) };
+            if !cache.is_null() {
+                let (mut address, mut value) = (0u32, 0u32);
+                // SAFETY: two writable `u32`s.
+                unsafe { dynarmic_sys::od_shared_monitor_slot_offsets(&mut address, &mut value) };
+                crate::stats::register_jit_state_monitor_offsets(address, value);
+            }
+            if cache.is_null() {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "JIT SWITCH: shared code cache not available here (the arm64 backend has none, \
+                     or {} bytes were refused): a code cache per guest thread",
+                    options.shared_code_cache_bytes
+                );
+                None
+            } else {
+                Some(CodeCache(cache))
+            }
+        } else {
+            None
+        };
+
         let layout = monitor.layout();
         crate::stats::register_monitor(crate::stats::MonitorLayout {
             lock: layout.lock as usize,
@@ -588,6 +824,8 @@ impl DynarmicBackend {
             shared: Arc::new(Shared {
                 space,
                 extent,
+                code_cache,
+                planted: Arc::new(Planted::default()),
                 monitor,
                 tls,
                 options,
@@ -629,6 +867,40 @@ impl DynarmicBackend {
     #[must_use]
     pub fn tls(&self) -> &TlsArena {
         &self.shared.tls
+    }
+
+    /// Whether this backend's contexts run from one shared code cache (D38).
+    #[must_use]
+    pub fn shares_translations(&self) -> bool {
+        self.shared.code_cache.is_some()
+    }
+
+    /// Invalidate the translations of `range` that code written into the space **by the host** --
+    /// a loader, a test harness -- has made stale.
+    ///
+    /// With a shared code cache (D38) a translation is the space's, not a context's: a context
+    /// created after the write runs the space's translation of the old bytes until something
+    /// invalidates it, as every context that ran them before does. So whoever writes code into the
+    /// space outside a context invalidates it here. Without a shared cache this does nothing: a
+    /// context's own cache is its own, and code the guest itself rewrites is invalidated through
+    /// [`GuestCpu::invalidate_code`] on its context either way.
+    pub fn invalidate_code(&self, range: GuestRange) {
+        if let Some(cache) = &self.shared.code_cache {
+            // SAFETY: the cache is live for `self.shared`'s life; this is not called from inside a
+            // callback (the backend has none -- only its contexts do).
+            unsafe { od_code_cache_invalidate_range(cache.0, range.start() as u64, range.len() as u64) };
+        }
+    }
+
+    /// The shared code cache's counters, or `None` without one.
+    #[must_use]
+    pub fn code_cache_stats(&self) -> Option<OdCodeCacheStats> {
+        self.shared.code_cache.as_ref().map(|cache| {
+            let mut out = OdCodeCacheStats::default();
+            // SAFETY: the cache is live for `self.shared`'s life; `out` is writable.
+            unsafe { od_code_cache_stats_of(cache.0, &mut out) };
+            out
+        })
     }
 
     /// What this backend's demand pager has done, or `None` if it has none.
@@ -770,7 +1042,12 @@ impl GuestCpuBackend for DynarmicBackend {
     }
 
     fn shared_cost(&self) -> ContextCost {
-        self.shared.tls.cost()
+        let mut cost = self.shared.tls.cost();
+        // D38: the shared code cache is what every context shares, as the arena is.
+        if let Some(stats) = self.code_cache_stats() {
+            cost.shared_committed = cost.shared_committed.saturating_add(stats.committed_bytes as usize);
+        }
+        cost
     }
 }
 
@@ -1114,6 +1391,11 @@ pub(crate) struct CpuCtx {
     /// Block starts translated so far, kept only while
     /// [`crate::stats::tracking_retranslation`] is on.
     pub(crate) seen_blocks: Option<std::collections::HashSet<u64>>,
+    /// With a shared code cache (D38): the space's planted addresses, which `read_code` consults
+    /// instead of this context's own, and how many of this context's roles (thunk, inline thunk,
+    /// sentinel) plant each address it counted in.
+    pub(crate) shared_plants: Option<Arc<Planted>>,
+    pub(crate) plants_here: std::collections::HashMap<GuestAddr, u32>,
     pub(crate) ticks_remaining: u64,
     pub(crate) ticks_used: u64,
     pub(crate) panic_msg: Option<String>,
@@ -1227,6 +1509,8 @@ impl DynarmicCpu {
             counters: JitCounters::default(),
             last_fetch: 0,
             seen_blocks: None,
+            shared_plants: None,
+            plants_here: std::collections::HashMap::new(),
             ticks_remaining: 0,
             ticks_used: 0,
             panic_msg: None,
@@ -1238,67 +1522,39 @@ impl DynarmicCpu {
         let tpidrro_el0 = Box::new(config.tpidr_el0() as u64);
 
         let options = shared.options;
-        let cfg = OdConfig {
-            abi_version: OD_DYNARMIC_ABI_VERSION,
-            callbacks: &callbacks::CALLBACKS,
-            ctx: ctx.get().cast::<c_void>(),
-            // D13. The shim accepts a null pointer here — its header says the guest's read then
-            // faults into `exception_raised` — which is precisely the configuration the startup
-            // assertion's `TPIDR_EL0 storage` check exists to refuse, so it has to be reachable for
-            // that check to be provable. Only `create_misconfigured_thread` can ask for it.
-            tpidr_el0: if overrides.null_thread_pointer {
-                core::ptr::null_mut()
-            } else {
-                &mut *tpidr_el0
-            },
-            tpidrro_el0: if overrides.null_thread_pointer {
-                core::ptr::null()
-            } else {
-                &*tpidrro_el0
-            },
-            // D4, all four fields together. `fastmem_pointer = 0` with 64 bits is the identity
-            // mapping; mirroring is off so a guest address with nothing behind it faults instead of
-            // aliasing a valid page; recompiling on a fastmem failure is what routes a declined
-            // fault to the slow path, where it becomes a typed exit.
-            //
-            // **"Faults" means "is unmapped in the HOST process", and that is narrower than it
-            // reads.** See this module's documentation, under "What fastmem does not check".
-            fastmem_enabled: i32::from(overrides.direct_access.unwrap_or(true)),
-            fastmem_pointer: 0,
-            fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(64),
-            silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(false)),
-            recompile_on_fastmem_failure: 1,
-            // Task 2's review measured this: off gives 1 slow-path read plus 1 exclusive callback
-            // per `LDXR`, on gives 0, which matters because D5 lists the global exclusive monitor's
-            // 21x anti-scaling as a primary risk.
-            fastmem_exclusive_access: 1,
-            monitor: shared.monitor.0,
-            // Spaced by the stride the monitor was sized with; see `VALUE_COMPARE_SLOT_STRIDE`.
-            processor_id: processor_id * options.monitor_slot_stride(),
-            code_cache_size: options.code_cache_size,
-            // Programmed rather than left at 0, which would select dynarmic's own default. The
-            // default is the same 600 MHz, so nothing a guest can read changes -- but the counter
-            // `cb_get_cntpct` returns is scaled by this same constant, and two defaults that happen
-            // to agree is not the same thing as one constant used twice. See `crate::clock`.
-            cntfrq_el0: crate::clock::CNTFRQ_HZ,
-            ctr_el0: 0,
-            dczid_el0: 4,
-            // The watchdog. See `crate::run`.
-            enable_cycle_counting: 1,
-            wall_clock_cntpct: 0,
-            hook_hint_instructions: 0,
-            define_unpredictable_behaviour: 0,
-            check_halt_on_memory_access: i32::from(options.check_halt_on_memory_access),
-            // Open only for the one unsafe flag `DynarmicOptions` can select, and that flag is in
-            // `optimizations` exactly when this is 1 -- dynarmic requires both.
-            unsafe_optimizations: i32::from(options.unsafe_optimizations()),
-            optimizations: options.optimizations(),
-        };
+        let cfg = thread_config(
+            &options,
+            shared.monitor.0,
+            ctx.get().cast::<c_void>(),
+            &mut *tpidr_el0,
+            &*tpidrro_el0,
+            processor_id,
+            overrides,
+        );
+
+        // D38: a context of a space with a shared code cache runs from it -- unless it is one of
+        // `create_misconfigured_thread`'s, whose configuration shapes code differently on purpose
+        // and which the cache would refuse.
+        let shared_cache = shared
+            .code_cache
+            .as_ref()
+            .filter(|_| overrides.is_conforming())
+            .map(|cache| cache.0);
+        if shared_cache.is_some() {
+            // SAFETY: nothing is executing yet.
+            unsafe { (*ctx.get()).shared_plants = Some(Arc::clone(&shared.planted)) };
+        }
 
         // SAFETY: `cfg` is fully initialised; `callbacks` is a `'static` constant; `ctx`, the two
         // register boxes and the monitor all outlive the jit, which is freed in `Drop` before any of
-        // them. dynarmic copies `cfg` and keeps the pointers.
-        let jit = unsafe { od_jit_new(&cfg) };
+        // them -- and so does the shared cache, a field of the `Arc<Shared>` the context holds.
+        // dynarmic copies `cfg` and keeps the pointers.
+        let jit = unsafe {
+            match shared_cache {
+                Some(cache) => od_jit_new_shared(&cfg, cache),
+                None => od_jit_new(&cfg),
+            }
+        };
         if jit.is_null() {
             return Err(CpuError::Backend {
                 backend: BACKEND_NAME,
@@ -1456,6 +1712,49 @@ impl DynarmicCpu {
         f(unsafe { &mut *self.ctx.get() })
     }
 
+    /// Whether this context runs from the space's shared code cache (D38).
+    fn shares_code(&self) -> bool {
+        self.with_ctx(|ctx| ctx.shared_plants.is_some())
+    }
+
+    /// Shared code cache: one more of this context's roles plants `address` (`role_is_new` false
+    /// when the role already did, e.g. a thunk registered twice). The translated word changes --
+    /// and the translation is dropped, for every context -- only when the space's set changes.
+    fn plant(&mut self, address: GuestAddr, role_is_new: bool) -> CpuResult<()> {
+        if !role_is_new {
+            return Ok(());
+        }
+        let newly_planted = self.with_ctx(|ctx| {
+            let roles = ctx.plants_here.entry(address).or_insert(0);
+            *roles += 1;
+            *roles == 1 && ctx.shared_plants.as_ref().is_some_and(|p| p.add(address))
+        });
+        if newly_planted {
+            self.invalidate_word(address)?;
+        }
+        Ok(())
+    }
+
+    /// Shared code cache: one fewer of this context's roles plants `address`.
+    fn unplant(&mut self, address: GuestAddr, role_existed: bool) -> CpuResult<()> {
+        if !role_existed {
+            return Ok(());
+        }
+        let no_longer_planted = self.with_ctx(|ctx| {
+            let Some(roles) = ctx.plants_here.get_mut(&address) else { return false };
+            *roles -= 1;
+            if *roles > 0 {
+                return false;
+            }
+            ctx.plants_here.remove(&address);
+            ctx.shared_plants.as_ref().is_some_and(|p| p.remove(address))
+        });
+        if no_longer_planted {
+            self.invalidate_word(address)?;
+        }
+        Ok(())
+    }
+
     /// Drop the translation covering one instruction. Used whenever a thunk, breakpoint or sentinel
     /// is added or removed, because `read_code` only runs at translation time.
     fn invalidate_word(&self, address: GuestAddr) -> CpuResult<()> {
@@ -1493,6 +1792,20 @@ impl Drop for DynarmicCpu {
     /// freed explicitly at the top, which is both the earliest safe moment and the one that stopped
     /// being reached when a constructor failed halfway.
     fn drop(&mut self) {
+        // D38: this context's plants leave the space. An address no context plants any more is
+        // translated from guest memory again, for every context -- through the cache itself, since
+        // this jit is about to go.
+        let released: Vec<GuestAddr> = self.with_ctx(|ctx| {
+            let Some(planted) = ctx.shared_plants.as_ref() else { return Vec::new() };
+            ctx.plants_here.keys().copied().filter(|&address| planted.remove(address)).collect()
+        });
+        if let Some(cache) = &self.shared.code_cache {
+            for address in released {
+                // SAFETY: the cache outlives every context (`Arc<Shared>`); this thread is not
+                // executing a jit of it (`&mut self`).
+                unsafe { od_code_cache_invalidate_range(cache.0, address as u64, 4) };
+            }
+        }
         // SAFETY: `&mut self` means nothing is executing, and the jit is freed exactly once. It is
         // freed before `ctx`, `tpidr_el0` and `tpidrro_el0` — which are dropped after this — and
         // before the `Arc<Shared>` that owns the monitor it points at.
@@ -1520,11 +1833,14 @@ impl GuestCpu for DynarmicCpu {
             // stops it — which is precisely what `interruptible` exists to fix, and why this field
             // is computed rather than hard-coded to `true`.
             asynchronous_halt: self.shared.options.interruptible,
-            breakpoints: true,
+            // Refused on a shared code cache (D38): see `add_breakpoint`.
+            breakpoints: !self.shares_code(),
             // See `add_inline_thunk`: the `SVC` terminal's `CheckHalt{PopRSBHint}` is what makes it
             // possible. `PopRSBHint` is keyed on the PC the handler wrote, so the resume is that
             // address either way; the flag gates it because the path is only tested under it.
             inline_thunks: self.shared.options.interruptible,
+            // D38: this context runs the space's one set of translations.
+            shared_translation: self.with_ctx(|ctx| ctx.shared_plants.is_some()),
         }
     }
 
@@ -1807,12 +2123,19 @@ impl GuestCpu for DynarmicCpu {
     }
 
     fn add_thunk(&mut self, address: GuestAddr) -> CpuResult<()> {
-        self.with_ctx(|ctx| ctx.thunks.insert(address));
+        let new = self.with_ctx(|ctx| ctx.thunks.insert(address));
+        if self.shares_code() {
+            return self.plant(address, new);
+        }
         self.invalidate_word(address)
     }
 
     fn remove_thunk(&mut self, address: GuestAddr) -> CpuResult<bool> {
         let had = self.with_ctx(|ctx| ctx.thunks.remove(&address));
+        if self.shares_code() {
+            self.unplant(address, had)?;
+            return Ok(had);
+        }
         self.invalidate_word(address)?;
         Ok(had)
     }
@@ -1864,12 +2187,23 @@ impl GuestCpu for DynarmicCpu {
                          indirect-branch handlers are measured to check the halt flag",
             });
         }
-        self.with_ctx(|ctx| ctx.inline_thunks.insert(address, handler, context));
+        let new = self.with_ctx(|ctx| {
+            let new = !ctx.inline_thunks.contains_key(&address);
+            ctx.inline_thunks.insert(address, handler, context);
+            new
+        });
+        if self.shares_code() {
+            return self.plant(address, new);
+        }
         self.invalidate_word(address)
     }
 
     fn remove_inline_thunk(&mut self, address: GuestAddr) -> CpuResult<bool> {
         let had = self.with_ctx(|ctx| ctx.inline_thunks.remove(&address));
+        if self.shares_code() {
+            self.unplant(address, had)?;
+            return Ok(had);
+        }
         self.invalidate_word(address)?;
         Ok(had)
     }
@@ -1882,7 +2216,18 @@ impl GuestCpu for DynarmicCpu {
     }
 
     fn set_return_sentinel(&mut self, address: GuestAddr) -> CpuResult<()> {
-        self.with_ctx(|ctx| ctx.sentinel = Some(address));
+        let previous = self.with_ctx(|ctx| ctx.sentinel.replace(address));
+        if self.shares_code() {
+            // Re-arming the same sentinel -- every host-to-guest call does -- changes nothing a
+            // translation depends on.
+            if previous == Some(address) {
+                return Ok(());
+            }
+            if let Some(previous) = previous {
+                self.unplant(previous, true)?;
+            }
+            return self.plant(address, true);
+        }
         self.invalidate_word(address)
     }
 
@@ -1891,6 +2236,15 @@ impl GuestCpu for DynarmicCpu {
     }
 
     fn add_breakpoint(&mut self, address: GuestAddr) -> CpuResult<()> {
+        if self.shares_code() {
+            return Err(CpuError::Unsupported {
+                backend: BACKEND_NAME,
+                operation: "set a breakpoint",
+                reason: "this context runs from a code cache every guest thread of the space shares \
+                         (OMNI_JIT_SHARED_CACHE, D38): a breakpoint for one thread cannot be planted \
+                         in code every thread runs",
+            });
+        }
         self.with_ctx(|ctx| ctx.breakpoints.insert(address));
         self.invalidate_word(address)
     }

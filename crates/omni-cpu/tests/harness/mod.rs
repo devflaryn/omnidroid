@@ -53,6 +53,31 @@ pub const DATA_BYTES: usize = 64 * 1024;
 /// guest actually touches (D10).
 pub const LAZY_BYTES: usize = 512 * 1024;
 
+/// Whether this run asked for the shared code cache (`OMNI_JIT_SHARED_CACHE=1`, D38), under which
+/// a context refuses breakpoints. A test that needs one asserts the refusal instead -- and only
+/// then, so a backend that stopped offering breakpoints without being asked still fails it.
+pub fn shared_code_cache_asked() -> bool {
+    std::env::var("OMNI_JIT_SHARED_CACHE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// A context refused a breakpoint because it runs from a shared code cache, and only because of
+/// that. For the tests that cannot run without breakpoints.
+pub fn refuses_breakpoints_because_shared(cpu: &mut dyn GuestCpu) -> bool {
+    if cpu.capabilities().breakpoints {
+        return false;
+    }
+    assert!(
+        shared_code_cache_asked(),
+        "breakpoints are refused although no shared code cache was asked for"
+    );
+    assert!(
+        matches!(cpu.add_breakpoint(0), Err(omni_cpu::CpuError::Unsupported { .. })),
+        "a shared-cache context refuses a breakpoint with Unsupported"
+    );
+    eprintln!("breakpoints refused on the shared code cache (D38): the breakpoint half is skipped");
+    true
+}
+
 /// A guest address space with a code region, a data region and a backend over it.
 pub struct Guest {
     pub space: Arc<GuestSpace>,
@@ -176,6 +201,11 @@ impl Guest {
         self.space
             .protect(self.code, CODE_BYTES, Protection::ReadExecute)
             .expect("code region executable");
+        // Code written behind every context's back: on a shared code cache (D38) the space's
+        // translation of what was here before would otherwise still be run, by new contexts too.
+        self.backend.invalidate_code(
+            omni_cpu::GuestRange::new(entry, program.len() * 4).expect("a code range"),
+        );
         entry
     }
 

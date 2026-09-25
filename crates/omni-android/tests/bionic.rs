@@ -9460,8 +9460,28 @@ fn a_range_one_guest_thread_unmaps_reaches_another_threads_context() {
     assert!(matches!(run_program(&f, mapped).expect("completes"), ExitReason::Returned { .. }));
     assert_ne!(f.guest.read_u64(out + 64), u64::MAX, "the mapping succeeded");
     let mapped_only = f.boundary.code_invalidations().queued;
+    let cache_before = f.guest.backend.code_cache_stats();
     assert!(matches!(run_program(&f, unmapped).expect("completes"), ExitReason::Returned { .. }));
     assert_eq!(f.guest.read_u64(out + 72), 0, "and the unmapping did");
+
+    // D38: contexts that share one set of translations are all reached by the one invalidation
+    // the unmapping thread applies, and nothing may be queued -- a queue per context would
+    // invalidate the shared translation once per context.
+    if let (Some(before), Some(after)) = (cache_before, f.guest.backend.code_cache_stats()) {
+        assert!(
+            after.invalidations > before.invalidations,
+            "the unmapping reached the shared code cache: {before:?} -> {after:?}"
+        );
+        assert_eq!(
+            f.boundary.code_invalidations(),
+            omni_android::CodeInvalidations::default(),
+            "nothing is queued for another context on a shared code cache"
+        );
+        f.guest.write_u64(gate, 1);
+        assert!(matches!(run_program(&f, join).expect("completes"), ExitReason::Returned { .. }));
+        assert_eq!(f.guest.read_u64(out + 24), 0, "the join succeeded");
+        return;
+    }
     assert!(
         f.boundary.code_invalidations().queued > mapped_only,
         "unmapping executable memory must queue it for every other context: {:?}",
