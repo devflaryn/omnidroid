@@ -156,6 +156,18 @@ account's cookie in two sessions at once is not something to try.
 | **M6** | M4 + `OMNI_GUEST_CPUS=4 OMNI_LOOPER_IDLE_US=4000` | #6, #7 |
 | **M7** | M4's switches, **N instances at once** (5, then 10), one account and one storage each | whether the per-instance figures hold when instances compete (page cache sharing of the library shows as a smaller shareable-resident share per instance) |
 
+**Measured 2026-09-25, `51a0c43`, Windows, 12 min each** (settled = +300..+700 s of the session):
+
+| run | fps (median, min) | cores | private / working set | notes |
+|---|---|---|---|---|
+| M1 | 48.4 (33.4) | 2.61 | 3.27 / 2.90 GiB | +480 s table: guest heap 1,560 committed; JIT 246; **host C heaps 968 MiB** of which our Rust 55 -- blocks of 272, 224, 80, 64, 32 MiB (being identified) |
+| M2 | 0 (minimised, nothing drawn) | **1.42** | 3.22 / 2.84 | the game kept playing; no death |
+| M3 | **59.2 (56.8)** | 2.36 | **2.80 / 2.50** | a 3 GiB device: faster *and* lighter (the texture budget), so a B setting -- for A it costs texture resolution |
+| M4 | capped 10, minimised from +300 s | **0.57** | 2.80 / 2.52 | +480 s table: guest heap 1,283; read-only file copies 0.6 (101 in M1); JIT 251; host C heaps 962 |
+
+So today's B instance is **~2.8 GiB and ~0.6 cores**; the host C heaps (~0.95 GiB) are the next
+target, then the engine heap (~1.2-1.5 GiB) and the JIT cache (~250 MiB).
+
 Record in each: private and working set at `onGameLoaded` + 300 s, median cores and fps over
 +300..+450 s, and the `MEMREPORT` table at +300 s. `OMNI_GRAPHICS_QUALITY` edits the storage's
 existing settings file, so on a fresh storage run it twice (the first launch writes the file).
