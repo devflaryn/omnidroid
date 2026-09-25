@@ -335,6 +335,24 @@ const SURFACE_WIDTH: i32 = 1280;
 /// Pixels down. See [`SURFACE_WIDTH`].
 const SURFACE_HEIGHT: i32 = 720;
 
+/// The size the real window is opened at: [`SURFACE_WIDTH`] x [`SURFACE_HEIGHT`], or
+/// `OMNI_WINDOW_SIZE=<w>x<h>` (a measurement switch: the engine renders at the surface size it is
+/// given at start and did not follow a live resize on the GLES path -- g2, 2026-09-25 -- so how
+/// the GPU's time scales with pixels is measured by starting at another size).
+fn window_size() -> (u32, u32) {
+    let asked = std::env::var("OMNI_WINDOW_SIZE").ok().and_then(|v| {
+        let (w, h) = v.trim().split_once(['x', 'X'])?;
+        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+    });
+    match asked {
+        Some((w, h)) if (64..=8192).contains(&w) && (64..=8192).contains(&h) => {
+            let _ = writeln!(std::io::stderr(), "WINDOW: opened at {w}x{h} (OMNI_WINDOW_SIZE)");
+            (w, h)
+        }
+        _ => (SURFACE_WIDTH as u32, SURFACE_HEIGHT as u32),
+    }
+}
+
 /// Guest instructions **one §8 row 17-20 lifecycle native** is allowed.
 ///
 /// Generous for the same reason [`STEP_13_BUDGET`] is: `onSurfaceCreatedNative` posts
@@ -2040,10 +2058,11 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // **The window first, under the graphics gate**, because the display the engine is told about
     // is the window's -- its pixels and its host's DPI -- and the engine reads that before step 13.
     let early_window = graphics.then(|| {
+        let (width, height) = window_size();
         let opened = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
             "Omnidroid - Roblox",
-            SURFACE_WIDTH as u32,
-            SURFACE_HEIGHT as u32,
+            width,
+            height,
         ))
         .unwrap_or_else(|err| panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"));
         opened.show();
