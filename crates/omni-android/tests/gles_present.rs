@@ -631,6 +631,39 @@ fn an_eleven_argument_call_takes_its_last_three_from_the_guest_stack() {
     f.tear_down(display, surface, context);
 }
 
+/// **`OMNI_FPS_CAP` holds the guest's `eglSwapBuffers` to the cap** (`omni_android::pacing`), as
+/// `vulkan_present.rs` shows for `vkQueuePresentKHR`: seven swaps at 20 fps take at least six
+/// periods, every one is presented, and with the cap off none waits on the pacer.
+#[test]
+#[ignore = "opens a window and the host EGL; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn a_capped_swap_waits_for_its_turn_and_every_frame_is_presented() {
+    require_gate();
+    let _serial = serialized();
+    let f = Fixture::new("Omnidroid - GLES: an fps cap");
+    let (display, _config, surface, context) = f.bring_up();
+    let swaps = |n: usize| {
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            f.gl("glClear", &[GL_COLOR_BUFFER_BIT]);
+            assert_eq!(f.gl("eglSwapBuffers", &[display, surface]) as u32, 1);
+        }
+        started.elapsed()
+    };
+    let presents_before = f.gles.presents();
+    omni_android::pacing::set_cap(Some(20.0));
+    let (paced_before, _) = omni_android::pacing::paced();
+    let capped = swaps(7);
+    let (paced_after, _) = omni_android::pacing::paced();
+    omni_android::pacing::set_cap(None);
+    let _ = swaps(7);
+    let (paced_uncapped, _) = omni_android::pacing::paced();
+    assert!(capped >= std::time::Duration::from_millis(300), "7 swaps at 20 fps took {capped:?}");
+    assert_eq!(paced_after - paced_before, 7, "every capped swap went through the pacer");
+    assert_eq!(paced_uncapped, paced_after, "with the cap off no swap waits on the pacer");
+    assert_eq!(f.gles.presents(), presents_before + 14, "every frame was presented");
+    f.tear_down(display, surface, context);
+}
+
 /// A buffer mapping: the guest gets guest memory, filled from the buffer when the access says
 /// its contents are defined, copied back on unmap -- or, with `GL_MAP_FLUSH_EXPLICIT_BIT`, only the
 /// flushed range.

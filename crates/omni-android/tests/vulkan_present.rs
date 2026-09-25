@@ -3295,6 +3295,58 @@ fn the_clear_colour_travels_as_bytes_and_present_results_are_per_swapchain() {
     assert!(text.contains("rule 1"), "{text}");
 }
 
+/// **`OMNI_FPS_CAP` holds the guest's `vkQueuePresentKHR` to the cap** (`omni_android::pacing`):
+/// eleven presents from translated code at a 25 fps cap take at least ten periods, every one of
+/// them still reaches the host, and with the cap off none of the next eleven is paced at all.
+#[test]
+fn a_capped_present_waits_for_its_turn_and_every_frame_still_reaches_the_host() {
+    let _serial = serialized();
+    let up = up_to_a_device("fps-cap");
+    let create = up.f.resolve_device(up.get_proc, up.device, "vkCreateSwapchainKHR");
+    let present = up.f.resolve_device(up.get_proc, up.device, "vkQueuePresentKHR");
+    let create_semaphore = up.f.resolve_device(up.get_proc, up.device, "vkCreateSemaphore");
+    let info = up
+        .f
+        .swapchain_info(up.surface, 2, FORMAT_B8G8R8A8_UNORM, 1024, 576, SWAPCHAIN_USAGE, 1, 0);
+    let out = up.f.alloc(8);
+    up.f.call(create, [up.device, info, 0, out]).expect("create");
+    let swapchain = up.f.guest.read_u64(out as GuestAddr);
+    let sem_info = up.f.flags_only_info(STYPE_SEMAPHORE_CREATE_INFO, 0);
+    let sem_out = up.f.alloc(8);
+    up.f.call(create_semaphore, [up.device, sem_info, 0, sem_out]).expect("semaphore");
+    let semaphore = up.f.guest.read_u64(sem_out as GuestAddr);
+    let index_at = up.f.u32_array(&[0]);
+    let present_info = up.f.present_info(semaphore, swapchain, index_at, 0);
+
+    let presents = |n: usize| {
+        let started = std::time::Instant::now();
+        for _ in 0..n {
+            assert_eq!(up.f.call(present, [up.queue, present_info, 0, 0]).expect("present"), 0);
+        }
+        started.elapsed()
+    };
+
+    omni_android::pacing::set_cap(Some(25.0));
+    let (paced_before, waited_before) = omni_android::pacing::paced();
+    let capped = presents(11);
+    let (paced_after, waited_after) = omni_android::pacing::paced();
+    let waited = waited_after - waited_before;
+    omni_android::pacing::set_cap(None);
+    let _ = presents(11);
+    let (paced_uncapped, _) = omni_android::pacing::paced();
+
+    // Ten periods of 40 ms between the first present and the eleventh: never shorter.
+    assert!(capped >= std::time::Duration::from_millis(400), "11 presents at 25 fps took {capped:?}");
+    assert!(capped < std::time::Duration::from_secs(2), "and not unboundedly longer: {capped:?}");
+    assert_eq!(paced_after - paced_before, 11, "every capped present went through the pacer");
+    // Not ten periods of waiting: a sleep overshoots by up to the host's timer tick (15.6 ms on
+    // Windows at its default resolution, which this test binary keeps), the next present arrives
+    // that much later, and its wait is that much shorter -- the schedule holds the average.
+    assert!(waited >= std::time::Duration::from_millis(100), "they waited {waited:?} in all");
+    assert_eq!(paced_uncapped, paced_after, "with the cap off no present waits on the pacer");
+    assert_eq!(up.host.log().presents.len(), 22, "every frame reached the host, capped or not");
+}
+
 // ======================================================= the frame loop's objects and teardown
 
 /// **Every object stage 4 creates is destroyed, and the registries return to empty.**

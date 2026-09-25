@@ -394,6 +394,8 @@ pub(super) fn terminate(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) ->
 
 /// `eglSwapBuffers` and its damage variants: forwarded, and counted when the host says `EGL_TRUE`.
 pub(super) fn swap_buffers(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    // `OMNI_FPS_CAP`: this frame's turn first, when there is a cap (`crate::pacing`).
+    crate::pacing::pace_present();
     let r = gles.forward_value(call)?;
     if r as u32 != 0 {
         gles.note_present();

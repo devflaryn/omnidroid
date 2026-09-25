@@ -56,6 +56,7 @@ pub mod jni;
 pub mod mem;
 pub mod memreport;
 pub mod ndk;
+pub mod pacing;
 pub mod perf;
 pub mod region;
 mod sysroute;

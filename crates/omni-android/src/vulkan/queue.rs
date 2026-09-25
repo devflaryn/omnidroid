@@ -347,6 +347,9 @@ pub(super) fn queue_present(
         pointer => Some(guest_pointer(at, "pResults", pointer)?),
     };
 
+    // `OMNI_FPS_CAP`: wait for this frame's turn, when there is a cap (`crate::pacing`). Here,
+    // after everything the guest handed over is read and checked, and before the host presents.
+    crate::pacing::pace_present();
     let presented = host.queue_present(
         queue,
         &PresentRequest {
