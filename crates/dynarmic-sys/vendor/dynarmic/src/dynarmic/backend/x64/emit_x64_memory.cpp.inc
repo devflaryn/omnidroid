@@ -30,9 +30,9 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
     // Omnidroid patch 0022: in a shared code cache another thread may be emitting (inserting into
     // fastmem_patch_info) while this one faults, so the lookup takes the cache's lock, shared. The
     // faulting thread cannot already hold it: generated code never runs inside a lookup.
-    std::shared_lock<std::shared_mutex> lock;
+    std::shared_lock<SharedCodeLock> lock;
     if (shared_lock) {
-        lock = std::shared_lock<std::shared_mutex>{*shared_lock};
+        lock = std::shared_lock<SharedCodeLock>{*shared_lock};
     }
     const auto iter = fastmem_patch_info.find(rip_);
 

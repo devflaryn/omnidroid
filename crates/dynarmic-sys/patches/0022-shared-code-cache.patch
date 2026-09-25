@@ -594,7 +594,7 @@ index 450b16d..90d113e 100644
  #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
  #undef Axx
 diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
-index 7c0fa8d..0eb9796 100644
+index 7c0fa8d..407a2be 100644
 --- a/src/dynarmic/backend/x64/a64_interface.cpp
 +++ b/src/dynarmic/backend/x64/a64_interface.cpp
 @@ -3,19 +3,32 @@
@@ -646,7 +646,7 @@ index 7c0fa8d..0eb9796 100644
  namespace Dynarmic::A64 {
  
  using namespace Backend::X64;
-@@ -55,17 +77,308 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
+@@ -55,17 +77,309 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
      };
  }
  
@@ -800,7 +800,8 @@ index 7c0fa8d..0eb9796 100644
 +#if defined(_WIN32)
 +    FlushProcessWriteBuffers();
 +    return true;
-+#elif defined(__linux__) && defined(MEMBARRIER_CMD_PRIVATE_EXPEDITED)
++#elif defined(__linux__) && defined(__NR_membarrier)
++    // (The commands are enumerators, not macros: `#if defined` cannot test them.)
 +    return syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) == 0;
 +#else
 +    return false;
@@ -810,7 +811,7 @@ index 7c0fa8d..0eb9796 100644
 +bool RegisterAsymmetricBarrier() {
 +#if defined(_WIN32)
 +    return true;
-+#elif defined(__linux__) && defined(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
++#elif defined(__linux__) && defined(__NR_membarrier)
 +    return syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
 +#else
 +    return false;
@@ -847,7 +848,7 @@ index 7c0fa8d..0eb9796 100644
 +    Optimization::PolyfillOptions polyfill_options;
 +
 +    /// Translation and every map: exclusive. Lookups and the fault handler: shared.
-+    mutable std::shared_mutex lock;
++    mutable SharedCodeLock lock;
 +    std::vector<Region> regions;
 +    static constexpr size_t NO_REGION = std::numeric_limits<size_t>::max();
 +    size_t current = NO_REGION;
@@ -911,7 +912,7 @@ index 7c0fa8d..0eb9796 100644
 +    void ReclaimSoon();
 +
 +private:
-+    void EnsureRoom(SharedThreadState& thread, std::unique_lock<std::shared_mutex>& held);
++    void EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held);
 +    void StartRegion(size_t index);
 +    void RetireCurrentRegion(SharedThreadState& thread);
 +    void TryReclaimRetired();
@@ -958,7 +959,7 @@ index 7c0fa8d..0eb9796 100644
  
      HaltReason Run() {
          ASSERT(!is_executing);
-@@ -76,6 +389,16 @@ public:
+@@ -76,6 +390,16 @@ public:
              this->is_executing = false;
          };
  
@@ -975,7 +976,7 @@ index 7c0fa8d..0eb9796 100644
          // TODO: Check code alignment
  
          const CodePtr current_code_ptr = [this] {
-@@ -91,6 +414,13 @@ public:
+@@ -91,6 +415,13 @@ public:
  
          const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
  
@@ -989,7 +990,7 @@ index 7c0fa8d..0eb9796 100644
          PerformRequestedCacheInvalidation(hr);
  
          return hr;
-@@ -105,23 +435,50 @@ public:
+@@ -105,23 +436,50 @@ public:
              this->is_executing = false;
          };
  
@@ -1041,7 +1042,7 @@ index 7c0fa8d..0eb9796 100644
          invalid_cache_ranges.add(range);
          HaltExecution(HaltReason::CacheInvalidation);
      }
-@@ -129,6 +486,9 @@ public:
+@@ -129,6 +487,9 @@ public:
      void Reset() {
          ASSERT(!is_executing);
          jit_state = {};
@@ -1051,7 +1052,7 @@ index 7c0fa8d..0eb9796 100644
      }
  
      void HaltExecution(HaltReason hr) {
-@@ -239,11 +599,55 @@ public:
+@@ -239,11 +600,55 @@ public:
      }
  
  private:
@@ -1107,7 +1108,7 @@ index 7c0fa8d..0eb9796 100644
      IR::LocationDescriptor GetCurrentLocation() const {
          return IR::LocationDescriptor{jit_state.GetUniqueHash()};
      }
-@@ -257,10 +661,37 @@ private:
+@@ -257,10 +662,37 @@ private:
      }
  
      CodePtr GetBlock(IR::LocationDescriptor current_location) {
@@ -1146,7 +1147,7 @@ index 7c0fa8d..0eb9796 100644
          if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
              // Immediately evacuate cache
              invalidate_entire_cache = true;
-@@ -269,24 +700,7 @@ private:
+@@ -269,24 +701,7 @@ private:
          block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
  
          // JIT Compile
@@ -1172,7 +1173,7 @@ index 7c0fa8d..0eb9796 100644
          return emitter.Emit(ir_block).entrypoint;
      }
  
-@@ -300,6 +714,18 @@ private:
+@@ -300,6 +715,18 @@ private:
                  return;
              }
  
@@ -1191,7 +1192,7 @@ index 7c0fa8d..0eb9796 100644
              jit_state.ResetRSB();
              if (invalidate_entire_cache) {
                  block_of_code.ClearCache();
-@@ -316,15 +742,469 @@ private:
+@@ -316,15 +743,469 @@ private:
  
      const UserConfig conf;
      A64JitState jit_state;
@@ -1427,7 +1428,7 @@ index 7c0fa8d..0eb9796 100644
 +    block_of_code.SetCodePtr(r.use_begin);
 +}
 +
-+void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<std::shared_mutex>& held) {
++void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held) {
 +    for (;;) {
 +        if (current != NO_REGION) {
 +            Region& r = regions[current];
@@ -1986,7 +1987,7 @@ index 902ddef..c19280d 100644
          block_descriptors.erase(it);
      }
 diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
-index 5a46f04..5bcdb53 100644
+index 5a46f04..2bf8ccc 100644
 --- a/src/dynarmic/backend/x64/emit_x64.h
 +++ b/src/dynarmic/backend/x64/emit_x64.h
 @@ -9,6 +9,7 @@
@@ -1997,7 +1998,15 @@ index 5a46f04..5bcdb53 100644
  #include <string>
  #include <type_traits>
  #include <vector>
-@@ -122,11 +123,20 @@ protected:
+@@ -21,6 +22,7 @@
+ 
+ #include "dynarmic/backend/exception_handler.h"
+ #include "dynarmic/backend/x64/reg_alloc.h"
++#include "dynarmic/backend/x64/shared_code_lock.h"
+ #include "dynarmic/common/fp/fpcr.h"
+ #include "dynarmic/ir/location_descriptor.h"
+ #include "dynarmic/ir/terminal.h"
+@@ -122,11 +124,20 @@ protected:
      virtual void EmitTerminalImpl(IR::Term::CheckHalt terminal, IR::LocationDescriptor initial_location, bool is_single_step) = 0;
  
      // Patching
@@ -2018,7 +2027,7 @@ index 5a46f04..5bcdb53 100644
      };
      void Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
      virtual void Unpatch(const IR::LocationDescriptor& target_desc);
-@@ -140,6 +150,42 @@ protected:
+@@ -140,6 +151,42 @@ protected:
      ExceptionHandler exception_handler;
      tsl::robin_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
      tsl::robin_map<IR::LocationDescriptor, PatchInformation> patch_information;
@@ -2029,7 +2038,7 @@ index 5a46f04..5bcdb53 100644
 +    bool shared_code = false;
 +    /// Shared code cache only: the cache's lock, which a fault handler reading the emitter's
 +    /// tables takes shared.
-+    std::shared_mutex* shared_lock = nullptr;
++    SharedCodeLock* shared_lock = nullptr;
 +    /// Shared code cache only: store every link slot's unlinked value, so nothing reaches the
 +    /// blocks the maps are about to forget through a link.
 +    void UnlinkAllSlots();
@@ -2062,7 +2071,7 @@ index 5a46f04..5bcdb53 100644
  
  }  // namespace Dynarmic::Backend::X64
 diff --git a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
-index 272b896..80c001e 100644
+index 272b896..81c0ed9 100644
 --- a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
 +++ b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
 @@ -27,6 +27,13 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
@@ -2072,9 +2081,9 @@ index 272b896..80c001e 100644
 +    // Omnidroid patch 0022: in a shared code cache another thread may be emitting (inserting into
 +    // fastmem_patch_info) while this one faults, so the lookup takes the cache's lock, shared. The
 +    // faulting thread cannot already hold it: generated code never runs inside a lookup.
-+    std::shared_lock<std::shared_mutex> lock;
++    std::shared_lock<SharedCodeLock> lock;
 +    if (shared_lock) {
-+        lock = std::shared_lock<std::shared_mutex>{*shared_lock};
++        lock = std::shared_lock<SharedCodeLock>{*shared_lock};
 +    }
      const auto iter = fastmem_patch_info.find(rip_);
  
@@ -2200,6 +2209,70 @@ index c99980d..54fc46e 100644
              continue;
          }
          Xbyak::Label ok;
+diff --git a/src/dynarmic/backend/x64/shared_code_lock.h b/src/dynarmic/backend/x64/shared_code_lock.h
+new file mode 100644
+index 0000000..4b47a6f
+--- /dev/null
++++ b/src/dynarmic/backend/x64/shared_code_lock.h
+@@ -0,0 +1,58 @@
++/* This file is part of the dynarmic project.
++ * Copyright (c) 2026 Omnidroid contributors
++ * SPDX-License-Identifier: 0BSD
++ */
++
++#pragma once
++
++#if defined(_WIN32)
++#    include <shared_mutex>
++#else
++#    include <pthread.h>
++#endif
++
++namespace Dynarmic::Backend::X64 {
++
++/// Omnidroid patch 0022: the lock of a shared code cache -- dispatcher lookups shared, emission
++/// and invalidation exclusive -- which must not let a stream of lookups starve a writer.
++/// `std::shared_mutex` is an SRW lock on Windows, which does not. On glibc it is a
++/// `pthread_rwlock_t` of the default kind, which prefers readers: MEASURED on the Linux host,
++/// eight threads looking blocks up held off an invalidating thread so that it managed 4,675
++/// invalidations in 3 s against Windows' ~750,000. So there it is a writer-preferring rwlock.
++class SharedCodeLock {
++public:
++#if defined(_WIN32)
++    void lock() { m.lock(); }
++    bool try_lock() { return m.try_lock(); }
++    void unlock() { m.unlock(); }
++    void lock_shared() { m.lock_shared(); }
++    void unlock_shared() { m.unlock_shared(); }
++
++private:
++    std::shared_mutex m;
++#else
++    SharedCodeLock() {
++        pthread_rwlockattr_t attr;
++        pthread_rwlockattr_init(&attr);
++#    if defined(__GLIBC__)
++        pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
++#    endif
++        pthread_rwlock_init(&m, &attr);
++        pthread_rwlockattr_destroy(&attr);
++    }
++    ~SharedCodeLock() { pthread_rwlock_destroy(&m); }
++    SharedCodeLock(const SharedCodeLock&) = delete;
++    SharedCodeLock& operator=(const SharedCodeLock&) = delete;
++
++    void lock() { pthread_rwlock_wrlock(&m); }
++    bool try_lock() { return pthread_rwlock_trywrlock(&m) == 0; }
++    void unlock() { pthread_rwlock_unlock(&m); }
++    void lock_shared() { pthread_rwlock_rdlock(&m); }
++    void unlock_shared() { pthread_rwlock_unlock(&m); }
++
++private:
++    pthread_rwlock_t m;
++#endif
++};
++
++}  // namespace Dynarmic::Backend::X64
 diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
 index a150da8..febe5e4 100644
 --- a/src/dynarmic/interface/A64/a64.h

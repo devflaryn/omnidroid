@@ -227,7 +227,8 @@ bool AsymmetricBarrier() {
 #if defined(_WIN32)
     FlushProcessWriteBuffers();
     return true;
-#elif defined(__linux__) && defined(MEMBARRIER_CMD_PRIVATE_EXPEDITED)
+#elif defined(__linux__) && defined(__NR_membarrier)
+    // (The commands are enumerators, not macros: `#if defined` cannot test them.)
     return syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) == 0;
 #else
     return false;
@@ -237,7 +238,7 @@ bool AsymmetricBarrier() {
 bool RegisterAsymmetricBarrier() {
 #if defined(_WIN32)
     return true;
-#elif defined(__linux__) && defined(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
+#elif defined(__linux__) && defined(__NR_membarrier)
     return syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
 #else
     return false;
@@ -274,7 +275,7 @@ struct SharedCodeCache::Impl final {
     Optimization::PolyfillOptions polyfill_options;
 
     /// Translation and every map: exclusive. Lookups and the fault handler: shared.
-    mutable std::shared_mutex lock;
+    mutable SharedCodeLock lock;
     std::vector<Region> regions;
     static constexpr size_t NO_REGION = std::numeric_limits<size_t>::max();
     size_t current = NO_REGION;
@@ -338,7 +339,7 @@ struct SharedCodeCache::Impl final {
     void ReclaimSoon();
 
 private:
-    void EnsureRoom(SharedThreadState& thread, std::unique_lock<std::shared_mutex>& held);
+    void EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held);
     void StartRegion(size_t index);
     void RetireCurrentRegion(SharedThreadState& thread);
     void TryReclaimRetired();
@@ -972,7 +973,7 @@ void SharedCodeCache::Impl::StartRegion(size_t index) {
     block_of_code.SetCodePtr(r.use_begin);
 }
 
-void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<std::shared_mutex>& held) {
+void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held) {
     for (;;) {
         if (current != NO_REGION) {
             Region& r = regions[current];

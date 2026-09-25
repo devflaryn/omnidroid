@@ -22,6 +22,7 @@
 
 #include "dynarmic/backend/exception_handler.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
+#include "dynarmic/backend/x64/shared_code_lock.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/ir/location_descriptor.h"
 #include "dynarmic/ir/terminal.h"
@@ -157,7 +158,7 @@ public:
     bool shared_code = false;
     /// Shared code cache only: the cache's lock, which a fault handler reading the emitter's
     /// tables takes shared.
-    std::shared_mutex* shared_lock = nullptr;
+    SharedCodeLock* shared_lock = nullptr;
     /// Shared code cache only: store every link slot's unlinked value, so nothing reaches the
     /// blocks the maps are about to forget through a link.
     void UnlinkAllSlots();

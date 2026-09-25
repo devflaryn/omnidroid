@@ -369,9 +369,13 @@ fn threads_stay_right_while_another_rewrites_and_invalidates_their_code() {
         })
         .collect();
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // At least three seconds, and on until a region has been retired under the runners (a slow
+    // host emits less per second), for at most sixty.
+    let started = Instant::now();
     let mut flips = 0u64;
-    while Instant::now() < deadline {
+    while started.elapsed() < Duration::from_secs(3)
+        || (space.stats().regions_retired == 0 && started.elapsed() < Duration::from_secs(60))
+    {
         space.rewrite(1, a64::movz(0, if flips % 2 == 0 { B } else { A }, 0));
         space.invalidate(1);
         flips += 1;
@@ -473,10 +477,17 @@ fn a_thread_parked_in_a_callback_does_not_hold_a_retired_region() {
             });
             vm.start(u64::MAX >> 2);
             parked.store(true, Ordering::SeqCst);
-            // `SVC #1` sleeps and returns without halting; `SVC #0` halts.
+            // `SVC #1` sleeps and returns without halting; `SVC #0` halts. The run that parks must
+            // come back -- after the sleep -- through the halt the retirements raised, straight
+            // after the `SVC` (the loop's `ADD` not yet run), and not carry on into the retired
+            // region's code.
+            let first = vm.run();
+            let woke = (first, vm.pc(), vm.reg(0));
+            // SAFETY: live, not executing.
+            unsafe { od_jit_clear_halt(vm.raw(), OD_HALT_CACHE_INVALIDATION) };
             let hr = vm.run_to_completion(64);
             assert_eq!(hr & HALT_DONE, HALT_DONE);
-            (vm.reg(0), vm.with_ctx(|c| c.svc.clone()))
+            (vm.reg(0), vm.with_ctx(|c| c.svc.clone()), woke)
         })
     };
     while !parked.load(Ordering::SeqCst) {
@@ -498,7 +509,13 @@ fn a_thread_parked_in_a_callback_does_not_hold_a_retired_region() {
     }
     let during = space.stats();
     assert!(!p.is_finished(), "P was still parked through all of Q's passes");
-    let (x0, svc) = p.join().expect("P");
+    let (x0, svc, (woke_halt, woke_pc, woke_x0)) = p.join().expect("P");
+    assert_ne!(
+        woke_halt & OD_HALT_CACHE_INVALIDATION,
+        0,
+        "P woke and left through its block's halt test (halted {woke_halt:#x})"
+    );
+    assert_eq!((woke_pc, woke_x0), (CODE_BASE + 3 * 4, 6), "right after the SVC, the loop's ADD not yet run again");
     println!("while parked: {during:?}, pinned after each pass {pinned_while_parked:?}");
     assert!(during.regions_retired >= 2, "Q retired regions while P was parked: {during:?}");
     assert_eq!(
