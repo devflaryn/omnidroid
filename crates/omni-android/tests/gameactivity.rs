@@ -100,7 +100,9 @@ fn chosen_apk() -> &'static omni_apk::ChosenApk {
 /// this gate gives the engine **a real window and a real Vulkan driver**.
 ///
 /// Off, the gate is what it was: a constant geometry and no Vulkan bound, so `dlopen("libvulkan.so")`
-/// answers NULL and the run says so. On, the engine is handed an `ANativeWindow` backed by a
+/// answers NULL and the run says so -- and `libEGL.so` with no driver, so the engine's OpenGL ES
+/// fallback gets `EGL_NO_DISPLAY` and takes its own failure path (`Guest::load` has the
+/// measurement). On, the engine is handed an `ANativeWindow` backed by a
 /// resizable desktop window through [`HostWindowSource`], and `vkGetInstanceProcAddr` reaches this
 /// machine's driver through `omni_gfx::GfxVulkanHost` -- the same two seams the Vulkan stage tests
 /// verified against a real GPU, now driven by the engine instead of by assembled test code.
@@ -681,9 +683,10 @@ struct Guest {
     ndk: Arc<Ndk>,
     /// Bound only under [`GRAPHICS_GATE`]; see [`Guest::load`].
     vulkan: Option<Arc<Vulkan>>,
-    /// `libEGL.so`/`libGLESv2.so` over the host's EGL, bound with Vulkan: the engine's own fallback
-    /// when it refuses the Vulkan device (`omni_android::gles`).
-    gles: Option<Arc<Gles>>,
+    /// `libEGL.so`/`libGLESv2.so`, always bound: over the host's EGL with the window -- the engine's
+    /// own fallback when it refuses the Vulkan device (`omni_android::gles`) -- and **with no driver**
+    /// without it (`Gles::set_driverless`; see [`Guest::load`]).
+    gles: Arc<Gles>,
     /// `libaaudio.so` over the host's default output, bound with the window for the same reason.
     audio: Option<Arc<AAudio>>,
     boundary: Arc<Boundary>,
@@ -860,6 +863,8 @@ impl Guest {
         // **And `libaaudio.so`, with the window**: a session a person sits at has the host's audio
         // output behind FMOD's AAudio output (`omni_android::aaudio`), and a session without a
         // window has none -- FMOD's NOSOUND fallback, as before.
+        //
+        // **And `libEGL.so`/`libGLESv2.so` in both** (below): the same slot count either way.
         let with_audio = graphics.is_some();
         // **OMNI_AUDIO=off: no audio output, as a windowless session has none** -- `libaaudio.so`
         // is left unbound and FMOD takes its NOSOUND fallback, which is the path every session
@@ -876,17 +881,16 @@ impl Guest {
         }
         let (vulkan_slots, data_bytes) = if graphics.is_some() {
             (
-                omni_android::vulkan::BOUND_SYMBOLS
-                    + omni_android::aaudio::BOUND_SYMBOLS
-                    + omni_android::gles::bound_symbol_count(),
+                omni_android::vulkan::BOUND_SYMBOLS + omni_android::aaudio::BOUND_SYMBOLS,
                 omni_android::vulkan::REQUIRED_DATA_BYTES + omni_android::aaudio::REQUIRED_DATA_BYTES,
             )
         } else {
             (0, 4096)
         };
+        let gles_slots = omni_android::gles::bound_symbol_count();
         let builder = BoundaryBuilder::new(
             Arc::clone(&space),
-            TOTAL_IMPORTS + JNI_SLOTS + Ndk::bound_symbols().count() + vulkan_slots,
+            TOTAL_IMPORTS + JNI_SLOTS + Ndk::bound_symbols().count() + vulkan_slots + gles_slots,
             data_bytes,
         )
         .expect("a thunk region");
@@ -900,12 +904,22 @@ impl Guest {
         });
         // **And EGL/GLES over the host's EGL, with the window** -- chosen by the window's system when
         // the engine's first EGL call reaches the host.
-        let gles = with_audio.then(|| {
-            let gles = Gles::new(Arc::clone(&space));
-            gles.bind_into(&builder).expect("bind libEGL.so and libGLESv2.so");
+        //
+        // **Without the window, EGL/GLES with no driver** (`omni_android::gles::driverless`). The
+        // engine has a window here too (the constant geometry below), and once its own flag fetch
+        // answers it makes a renderer for it: MEASURED 2026-09-25, `Mode 6 failed: Unable to load
+        // Vulkan API`, then OpenGL ES -- and with `libEGL.so` unbound, `eglGetDisplay` killed the
+        // game thread and this gate failed on every host that could reach Roblox. A device has a
+        // `libEGL.so`; with no display to give, it answers `EGL_NO_DISPLAY`. MEASURED with that
+        // answer: the engine logs `Mode 4 failed: Error creating context: eglGetDisplay 300c` and
+        // `RenderView is NULL`, runs on without a view to `APP_READY` Landing, and no thread dies.
+        let gles = Gles::new(Arc::clone(&space));
+        gles.bind_into(&builder).expect("bind libEGL.so and libGLESv2.so");
+        if with_audio {
             gles.set_host(omni_gfx::GfxGlesHost::new() as Arc<dyn GlesHost>);
-            gles
-        });
+        } else {
+            gles.set_driverless();
+        }
         let audio = (with_audio && !audio_off).then(|| {
             let audio = AAudio::new(Arc::new(PlatformOutput));
             audio.bind_into(&builder).expect("bind libaaudio.so");
@@ -1018,9 +1032,7 @@ impl Guest {
         if let Some(vulkan) = &vulkan {
             thread_host = thread_host.with_instance(vulkan.thread_instance());
         }
-        if let Some(gles) = &gles {
-            thread_host = thread_host.with_instance(gles.thread_instance());
-        }
+        thread_host = thread_host.with_instance(gles.thread_instance());
         // **And AAudio**: FMOD opens its output on the engine's game thread, and the data callback
         // runs on a thread the library itself starts.
         if let Some(audio) = &audio {
@@ -2649,9 +2661,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         );
         let _ = writeln!(
             std::io::stderr(),
-            "GRAPHICS: NOT ATTEMPTED -- a constant {SURFACE_WIDTH}x{SURFACE_HEIGHT} geometry and \
-             no Vulkan bound, so dlopen(\"libvulkan.so\") answers NULL. Set {GRAPHICS_GATE}=1 \
-             to give the engine a real window and this machine's driver."
+            "GRAPHICS: NOT ATTEMPTED -- a constant {SURFACE_WIDTH}x{SURFACE_HEIGHT} geometry, \
+             no Vulkan bound, so dlopen(\"libvulkan.so\") answers NULL, and EGL with no driver, \
+             so eglGetDisplay answers EGL_NO_DISPLAY. Set {GRAPHICS_GATE}=1 to give the engine a \
+             real window and this machine's driver."
         );
         (SURFACE_WIDTH, SURFACE_HEIGHT)
     };
@@ -3604,7 +3617,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             .and_then(|vulkan| vulkan.call_counts().get("vkQueuePresentKHR").copied())
             .unwrap_or(0)
             // And every eglSwapBuffers the host answered EGL_TRUE, when the engine fell back to GLES.
-            + guest.gles.as_ref().map_or(0, |gles| gles.presents())
+            + guest.gles.presents()
     };
     let mut next_frames = std::time::Instant::now() + FRAMES_EVERY;
     let mut last_presents = presents();
@@ -4633,14 +4646,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
     }
     // **And the EGL/GLES census**, the same way.
-    match &guest.gles {
-        Some(gles) => {
-            let _ = writeln!(std::io::stderr(), "{}", gles.report());
-        }
-        None => {
-            let _ = writeln!(std::io::stderr(), "GLES: not bound ({GRAPHICS_GATE} unset)");
-        }
-    }
+    let _ = writeln!(std::io::stderr(), "{}", guest.gles.report());
     // **And what FMOD asked `libaaudio.so` for**, the same way.
     match &guest.audio {
         Some(audio) => {
