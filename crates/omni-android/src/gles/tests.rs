@@ -281,3 +281,114 @@ fn the_pool_slot_symbol_is_not_a_c_identifier() {
     assert_eq!(proc_slot_symbol(3), "gles::proc[3]");
     assert!(signature(&proc_slot_symbol(0)).is_none());
 }
+
+// ------------------------------------------------------------------ buffer mappings: what is copied
+
+/// ES 3.2 section 6.3 bit by bit, as cases written out rather than recomputed: `(access, the shadow
+/// is filled from the buffer at map, glUnmapBuffer uploads the whole range, glFlushMappedBufferRange
+/// uploads its range)`.
+#[test]
+fn each_access_combination_copies_what_the_specification_says() {
+    use super::gl::{fills_shadow, uploads_at_flush, uploads_at_unmap};
+    let cases: [(u32, bool, bool, bool); 12] = [
+        // READ: the guest may read every byte, and nothing it writes is taken back.
+        (0x01, true, false, false),
+        // READ | WRITE: read all, upload all.
+        (0x03, true, true, false),
+        // READ | WRITE | FLUSH_EXPLICIT: read all, upload only what is flushed.
+        (0x13, true, false, true),
+        // WRITE alone: every byte goes back at unmap, so the untouched ones must be the buffer's.
+        (0x02, true, true, false),
+        // WRITE | UNSYNCHRONIZED: the same; unsynchronized says nothing about the contents.
+        (0x22, true, true, false),
+        // WRITE | INVALIDATE_RANGE: the old contents may be discarded, so none are fetched.
+        (0x06, false, true, false),
+        // WRITE | INVALIDATE_BUFFER: likewise, for the whole buffer.
+        (0x0A, false, true, false),
+        // WRITE | INVALIDATE_RANGE | UNSYNCHRONIZED: a ring buffer's usual bits.
+        (0x26, false, true, false),
+        // WRITE | FLUSH_EXPLICIT: fetched (a flushed byte the guest did not write is the buffer's),
+        // uploaded only by flushes.
+        (0x12, true, false, true),
+        // WRITE | INVALIDATE_RANGE | FLUSH_EXPLICIT: neither fetched nor uploaded whole.
+        (0x16, false, false, true),
+        // WRITE | INVALIDATE_BUFFER | FLUSH_EXPLICIT | UNSYNCHRONIZED.
+        (0x3A, false, false, true),
+        // FLUSH_EXPLICIT without WRITE is an error the driver raises; nothing is uploaded.
+        (0x11, true, false, false),
+    ];
+    for (access, fills, at_unmap, at_flush) in cases {
+        assert_eq!(fills_shadow(access), fills, "fills_shadow({access:#x})");
+        assert_eq!(uploads_at_unmap(access), at_unmap, "uploads_at_unmap({access:#x})");
+        assert_eq!(uploads_at_flush(access), at_flush, "uploads_at_flush({access:#x})");
+    }
+}
+
+fn shadow(at: usize, capacity: usize) -> super::gl::Shadow {
+    super::gl::Shadow { at, capacity, id: omni_mem::MappingId(at as u64) }
+}
+
+#[test]
+fn a_map_takes_the_smallest_idle_shadow_that_fits() {
+    let mut pool = super::gl::ShadowPool::default();
+    assert_eq!(pool.take(1, |_| true), None, "an empty pool has nothing to give");
+    let big = shadow(0x10_0000, 1 << 20);
+    let middle = shadow(0x20_0000, 256 << 10);
+    let small = shadow(0x30_0000, 64 << 10);
+    // Returned largest first, so neither "first returned" nor "last returned" is the best fit.
+    for s in [big, middle, small] {
+        assert!(pool.give_back(s, usize::MAX).is_empty());
+    }
+    assert_eq!(pool.idle(), (3, (1 << 20) + (256 << 10) + (64 << 10)));
+    assert_eq!(pool.take(100 << 10, |_| true), Some(middle));
+    assert_eq!(pool.take(64 << 10, |_| true), Some(small), "exactly the capacity fits");
+    assert_eq!(pool.take(2 << 20, |_| true), None, "nothing idle is that large");
+    assert_eq!(pool.take(1, |_| true), Some(big));
+    assert_eq!(pool.idle(), (0, 0));
+    assert_eq!(pool.reused, 3);
+}
+
+#[test]
+fn an_idle_shadow_the_guest_has_taken_back_is_dropped_not_handed_out() {
+    let mut pool = super::gl::ShadowPool::default();
+    let gone = shadow(0x10_0000, 64 << 10);
+    let fine = shadow(0x20_0000, 128 << 10);
+    let _ = pool.give_back(gone, usize::MAX);
+    let _ = pool.give_back(fine, usize::MAX);
+    // The best fit is `gone`, and it is no longer this layer's: the next fit is answered instead.
+    assert_eq!(pool.take(1, |s| s.at != gone.at), Some(fine));
+    assert_eq!(pool.lost, 1);
+    assert_eq!(pool.idle(), (0, 0), "the lost shadow is not kept either");
+}
+
+#[test]
+fn idle_shadows_past_the_bound_are_let_go_oldest_first() {
+    let mut pool = super::gl::ShadowPool::default();
+    let limit = 300 << 10;
+    let a = shadow(0x10_0000, 64 << 10);
+    let b = shadow(0x20_0000, 128 << 10);
+    let c = shadow(0x30_0000, 128 << 10);
+    assert!(pool.give_back(a, limit).is_empty());
+    assert!(pool.give_back(b, limit).is_empty());
+    // 320 KiB idle: over by one shadow, and the one to go is the least recently returned.
+    assert_eq!(pool.give_back(c, limit), vec![a]);
+    assert_eq!(pool.idle(), (2, 256 << 10));
+    // A shadow larger than the bound on its own is let go at once, after everything older.
+    let huge = shadow(0x40_0000, 512 << 10);
+    assert_eq!(pool.give_back(huge, limit), vec![b, c, huge]);
+    assert_eq!(pool.idle(), (0, 0));
+    assert_eq!(pool.released, 4);
+}
+
+#[test]
+fn a_new_shadow_is_a_granule_or_a_power_of_two() {
+    use super::gl::{shadow_capacity, SHADOW_MIN_BYTES};
+    assert_eq!(SHADOW_MIN_BYTES, 64 << 10);
+    assert_eq!(shadow_capacity(0, 4096), Some(64 << 10));
+    assert_eq!(shadow_capacity(4, 4096), Some(64 << 10));
+    assert_eq!(shadow_capacity(64 << 10, 4096), Some(64 << 10));
+    assert_eq!(shadow_capacity((64 << 10) + 1, 4096), Some(128 << 10));
+    assert_eq!(shadow_capacity(3_000_000, 4096), Some(4 << 20));
+    assert_eq!(shadow_capacity(4, 1 << 17), Some(1 << 17), "never less than a page");
+    assert_eq!(shadow_capacity(usize::MAX, 4096), None);
+}

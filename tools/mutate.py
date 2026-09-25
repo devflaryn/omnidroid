@@ -363,6 +363,10 @@ INBOUND_PLAT = ["cargo", "test", "-p", "omni-platform", "--release", "--lib", "-
 INBOUND_BIONIC = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
                   "listen_and_accept"]
 INBOUND_JNI = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "public_ipv4"]
+# GLES buffer mappings (`gles/gl.rs`): which bytes each access bit copies, and the shadow pool, from
+# the lib's OS-free unit tests. The live halves (a real driver) are `tools/lnx_rows/gles.py`'s.
+GLES_MAP = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--no-fail-fast", "gles::"]
+GLES_GL = "crates/omni-android/src/gles/gl.rs"
 
 # `__vsprintf_chk` (a game world, 2026-09-23): its two tests.
 VSPRINTF = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
@@ -9479,6 +9483,57 @@ directory", ADAPTER_FILES,
      '            "lock cmpxchg16b xmmword ptr [{dst}]",',
      '            "cmpxchg16b xmmword ptr [{dst}]",',
      CORRUPT_CAS),
+    # --- GLES buffer mappings: the copies each access bit calls for, and the shadow pool ----------
+    ('glmap-A1', 'A', 'a write-only mapping without an invalidate bit is not filled from the buffer',
+     GLES_GL,
+     '    access & MAP_READ != 0 || access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER) == 0',
+     '    access & MAP_READ != 0',
+     GLES_MAP),
+    ('glmap-B1', 'B', 'an invalidating write-only mapping is filled from the buffer anyway',
+     GLES_GL,
+     '    access & MAP_READ != 0 || access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER) == 0',
+     '    access & MAP_READ != 0 || access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER) == 0 || true',
+     GLES_MAP),
+    ('glmap-B2', 'B', 'an explicit-flush mapping is uploaded whole at unmap',
+     GLES_GL,
+     '    access & MAP_WRITE != 0 && access & MAP_FLUSH_EXPLICIT == 0',
+     '    access & MAP_WRITE != 0',
+     GLES_MAP),
+    ('glmap-A2', 'A', 'a read-only mapping is uploaded at unmap',
+     GLES_GL,
+     '    access & MAP_WRITE != 0 && access & MAP_FLUSH_EXPLICIT == 0',
+     '    access & MAP_FLUSH_EXPLICIT == 0',
+     GLES_MAP),
+    ('glmap-A3', 'A', 'a flush uploads on a mapping without GL_MAP_WRITE_BIT',
+     GLES_GL,
+     '    access & MAP_WRITE != 0 && access & MAP_FLUSH_EXPLICIT != 0',
+     '    access & MAP_FLUSH_EXPLICIT != 0',
+     GLES_MAP),
+    ('glmap-A4', 'A', 'the pool hands out the first idle shadow that fits, not the smallest',
+     GLES_GL,
+     '                .min_by_key(|(_, s)| s.capacity)?;',
+     '                .min_by_key(|(i, _)| *i)?;',
+     GLES_MAP),
+    ('glmap-A5', 'A', 'an idle shadow is handed out without asking whether it is still ours',
+     GLES_GL,
+     '            if still_ours(&shadow) {',
+     '            if true || still_ours(&shadow) {',
+     GLES_MAP),
+    ('glmap-A6', 'A', 'past the bound, the most recently returned shadow is let go first',
+     GLES_GL,
+     '            let oldest = self.idle.remove(0);',
+     '            let oldest = self.idle.pop().expect("over the bound, so not empty");',
+     GLES_MAP),
+    ('glmap-A7', 'A', 'idle shadows are never let go (no bound)',
+     GLES_GL,
+     '        while self.idle_bytes > limit {',
+     '        while self.idle_bytes > limit && false {',
+     GLES_MAP),
+    ('glmap-B3', 'B', 'a new shadow is exactly the mapped length, so a growing range never fits again',
+     GLES_GL,
+     '    let capacity = length.max(SHADOW_MIN_BYTES).checked_next_power_of_two()?;',
+     '    let capacity = Some(length.max(SHADOW_MIN_BYTES))?;',
+     GLES_MAP),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

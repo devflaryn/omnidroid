@@ -688,6 +688,130 @@ fn a_buffer_mapping_round_trips_through_guest_memory() {
     f.tear_down(display, surface, context);
 }
 
+/// What each direction of a mapping's copy is, pinned where it can be seen:
+///
+/// * a write-only **invalidating** map fetches nothing -- witnessed on a reused shadow, which then
+///   still holds the previous mapping's bytes instead of this buffer's -- and costs nothing
+///   correct: the guest's bytes are what the buffer holds after the unmap;
+/// * under `GL_MAP_FLUSH_EXPLICIT_BIT` only the flushed ranges reach the buffer, however much of
+///   the shadow the guest wrote;
+/// * a write-only map without an invalidate bit uploads the whole range at unmap, the guest's
+///   bytes and the buffer's own where the guest wrote nothing.
+#[test]
+#[ignore = "opens a window and the host EGL; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn a_mapping_copies_exactly_what_its_access_bits_say() {
+    require_gate();
+    let _serial = serialized();
+    let f = Fixture::new("Omnidroid - GLES: mapping copies");
+    let (display, _config, surface, context) = f.bring_up();
+    let names = f.alloc(8);
+    f.gl("glGenBuffers", &[2, names]);
+    let (a, b) = (f.read_i32(names) as u64, f.read_i32(names + 4) as u64);
+    let first: Vec<u8> = (0..64u8).collect();
+    let second: Vec<u8> = (0..64u8).map(|i| 0x80 | i).collect();
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, a]);
+    f.gl("glBufferData", &[GL_ARRAY_BUFFER, 64, f.bytes(&first), GL_STATIC_DRAW]);
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, b]);
+    f.gl("glBufferData", &[GL_ARRAY_BUFFER, 64, f.bytes(&second), GL_STATIC_DRAW]);
+    let map = |offset: u64, length: u64, access: u64| -> u64 {
+        let at = f.gl("glMapBufferRange", &[GL_ARRAY_BUFFER, offset, length, access]);
+        assert_ne!(at, 0, "glMapBufferRange({access:#x}): glGetError {:#x}", f.gl("glGetError", &[]));
+        at
+    };
+    let unmap = || assert_eq!(f.gl("glUnmapBuffer", &[GL_ARRAY_BUFFER]) as u8, 1);
+    let contents = |buffer: u64| -> Vec<u8> {
+        f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, buffer]);
+        let at = map(0, 64, GL_MAP_READ_BIT);
+        let bytes = f.read(at, 64);
+        unmap();
+        bytes
+    };
+
+    // A READ map of `a` fetches it; the shadow goes back to the pool at unmap.
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, a]);
+    let read_at = map(0, 64, GL_MAP_READ_BIT);
+    assert_eq!(f.read(read_at, 64), first, "a READ map holds the buffer's bytes");
+    unmap();
+
+    // A write-only invalidating map of `b` is handed the same shadow, and nothing of `b` is
+    // fetched into it: it still holds `a`'s bytes.
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, b]);
+    let write_at = map(0, 64, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
+    assert_eq!(write_at, read_at, "the idle shadow is reused");
+    assert_eq!(f.read(write_at, 64), first, "an invalidating write map fetched the buffer anyway");
+    f.guest.write_bytes(write_at as GuestAddr, &[0xEE; 64]);
+    unmap();
+    assert_eq!(contents(b), vec![0xEE; 64], "the guest's bytes after an invalidating write map");
+
+    // Explicit flush, two ranges with a hole between: the hole and the tail keep the buffer's
+    // bytes although the guest wrote every one of them.
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, a]);
+    let at = map(0, 64, GL_MAP_WRITE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT);
+    f.guest.write_bytes(at as GuestAddr, &[0x77; 64]);
+    f.gl("glFlushMappedBufferRange", &[GL_ARRAY_BUFFER, 0, 8]);
+    f.gl("glFlushMappedBufferRange", &[GL_ARRAY_BUFFER, 40, 8]);
+    unmap();
+    f.no_gl_error("the explicit flushes");
+    let mut a_now = first.clone();
+    a_now[0..8].fill(0x77);
+    a_now[40..48].fill(0x77);
+    assert_eq!(contents(a), a_now, "only the flushed ranges are uploaded");
+
+    // Write-only, no invalidate, no flush: the whole range goes back at unmap -- the guest's
+    // bytes where it wrote, and where it did not, the buffer's own (fetched at map).
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, b]);
+    let at = map(8, 48, GL_MAP_WRITE_BIT);
+    f.guest.write_bytes(at as GuestAddr, &[0x33; 16]);
+    f.guest.write_bytes(at as GuestAddr + 40, &[0x44; 8]);
+    unmap();
+    let mut want = vec![0xEE; 64];
+    want[8..24].fill(0x33);
+    want[48..56].fill(0x44);
+    assert_eq!(contents(b), want, "the whole range is uploaded at unmap");
+    f.no_gl_error("the mappings");
+
+    let report = f.gles.report();
+    assert!(
+        report.contains("0x6 x1 (64 bytes each on average)"),
+        "the census counts mappings by access:\n{report}"
+    );
+    assert!(report.contains("shadows: 1 made, "), "one shadow served every map so far:\n{report}");
+
+    // A mapped buffer deleted: the driver unmaps it (ES 3.2 section 6.3.1) and no glUnmapBuffer
+    // comes. Its name bound again is a new buffer, whose map replaces the record -- and the old
+    // record's shadow goes back to the pool rather than being lost with it.
+    let at = map(0, 64, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
+    assert_eq!(at, read_at);
+    let name = f.alloc(4);
+    f.guest.write_u32(name as GuestAddr, b as u32);
+    f.gl("glDeleteBuffers", &[1, name]);
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, b]);
+    f.gl("glBufferData", &[GL_ARRAY_BUFFER, 64, f.bytes(&second), GL_STATIC_DRAW]);
+    let at = map(0, 64, GL_MAP_READ_BIT);
+    assert_ne!(at, read_at, "the deleted buffer's shadow was still recorded as in use");
+    assert_eq!(f.read(at, 64), second);
+    unmap();
+    f.no_gl_error("a deleted mapped buffer");
+    let report = f.gles.report();
+    assert!(
+        report.contains("shadows: 2 made, ") && report.contains(" 2 idle (131072 bytes)"),
+        "both shadows idle once nothing is mapped:\n{report}"
+    );
+
+    // The guest unmaps an idle shadow -- its own memory, as far as it can tell. The pool must not
+    // hand that address out again: the next map gets the other idle shadow, and the unmapped one
+    // is dropped.
+    f.guest.space.unmap(read_at as GuestAddr, 64 << 10).expect("the guest unmaps an idle shadow");
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, a]);
+    let at = map(0, 64, GL_MAP_READ_BIT);
+    assert_ne!(at, read_at, "a shadow the guest unmapped was handed out again");
+    assert_eq!(f.read(at, 64), a_now);
+    unmap();
+    let report = f.gles.report();
+    assert!(report.contains(" 1 lost, 1 idle "), "the unmapped shadow is dropped:\n{report}");
+    f.tear_down(display, surface, context);
+}
+
 /// **The engine's mapping pattern, timed through the real guest path.** MEASURED (Linux, NVC0, the
 /// Pet Simulator 99 world, 2026-09-25): the render thread spent up to 82% of its time inside
 /// `glMapBufferRange` and 9-10% in `glUnmapBuffer`, ~150 map/unmap pairs per frame (the census:
@@ -838,11 +962,45 @@ fn the_engines_map_write_unmap_pattern_timed() {
         let long = run(3 * iterations);
         (long - short).max(0.0) * 1e6 / (2 * iterations) as f64
     };
+    // The same loop as a native program would run it: the host's own functions, the fill written
+    // straight into the driver's mapping. What the driver and the data cost with no guest at all.
+    let host = |name: &str| f.host.proc_address(name).expect("loaded").expect(name).address();
+    // SAFETY: the host's `glMapBufferRange`, `glFlushMappedBufferRange` and `glUnmapBuffer`, in
+    // their ES 3.0 prototypes, called on this thread, whose context is current (the guest runs on
+    // the test thread); the pointer written is the driver's mapping of exactly `length` bytes.
+    let (host_map, host_flush, host_unmap) = unsafe {
+        (
+            core::mem::transmute::<usize, extern "C" fn(u32, isize, isize, u32) -> *mut u8>(host("glMapBufferRange")),
+            core::mem::transmute::<usize, extern "C" fn(u32, isize, isize)>(host("glFlushMappedBufferRange")),
+            core::mem::transmute::<usize, extern "C" fn(u32) -> u8>(host("glUnmapBuffer")),
+        )
+    };
+    let native = |length: u64, access: u64, fill: u8| -> f64 {
+        let run = |n: usize| {
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let p = host_map(GL_ARRAY_BUFFER as u32, 0, length as isize, access as u32);
+                assert!(!p.is_null());
+                // SAFETY: as above.
+                unsafe { core::ptr::write_bytes(p, fill, length as usize) };
+                if access & GL_MAP_FLUSH_EXPLICIT_BIT != 0 {
+                    host_flush(GL_ARRAY_BUFFER as u32, 0, length as isize);
+                }
+                assert_eq!(host_unmap(GL_ARRAY_BUFFER as u32), 1);
+            }
+            t.elapsed().as_secs_f64()
+        };
+        let short = run(iterations);
+        let long = run(3 * iterations);
+        (long - short).max(0.0) * 1e6 / (2 * iterations) as f64
+    };
     let mut fill = 0u8;
     for length in [4u64 << 10, 64 << 10, 1 << 20, 4 << 20] {
         let floor = timed(program(length, None, false, 0x11));
         for (label, access) in cases {
             fill = fill.wrapping_add(1).max(1);
+            // Its own fill, first: the read-back below then sees only what the guest's loop wrote.
+            let natively = native(length, access, !fill);
             let each = timed(program(length, Some(access), access & GL_MAP_FLUSH_EXPLICIT_BIT != 0, fill));
             f.no_gl_error(label);
             let at = f.gl("glMapBufferRange", &[GL_ARRAY_BUFFER, 0, length, GL_MAP_READ_BIT]);
@@ -851,11 +1009,12 @@ fn the_engines_map_write_unmap_pattern_timed() {
             assert_eq!(f.gl("glUnmapBuffer", &[GL_ARRAY_BUFFER]) as u8, 1);
             assert!(back.iter().all(|&b| b == fill), "{label}, {length} bytes: the guest's bytes did not all arrive");
             eprintln!(
-                "GLES-BENCH: {length:>8} B  {label:<40} {each:>9.1} us/iteration  (memset floor {floor:.1} us; map+unmap {:.1} us over it)",
-                each - floor
+                "GLES-BENCH: {length:>8} B  {label:<40} {each:>9.1} us/iteration  (native {natively:.1} us; guest memset floor {floor:.1} us; over native {:.1} us)",
+                each - natively
             );
         }
     }
+    eprintln!("GLES-BENCH: {} region-map entries afterwards", space.regions().len());
     f.tear_down(display, surface, context);
 }
 

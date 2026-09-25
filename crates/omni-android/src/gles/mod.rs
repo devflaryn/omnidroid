@@ -33,7 +33,7 @@
 //! | call | why it is not a plain forward | what this layer does |
 //! |---|---|---|
 //! | `glGetString`, `glGetStringi`, `eglQueryString` | the host returns a pointer into its own static data, which this layer's own validated imports (`strlen`, `strstr`, `memcpy`) refuse because it is not guest memory | the host's exact text is copied once into a guest pool and that address returned ([`gl`]) |
-//! | `glMapBufferRange`, `glMapBufferOES`, `glUnmapBuffer`, `glFlushMappedBufferRange`, `glGetBufferPointerv` | the driver's mapping is host memory, for the same reason | a guest-memory **shadow**, filled from the mapping when the access bits make its contents defined, copied back on flush/unmap as the access bits say ([`gl`]) |
+//! | `glMapBufferRange`, `glMapBufferOES`, `glUnmapBuffer`, `glFlushMappedBufferRange`, `glGetBufferPointerv` | the driver's mapping is host memory, for the same reason | a guest-memory **shadow**, filled from the mapping when the access bits make its contents defined, copied back on flush/unmap as the access bits say, and kept in a bounded pool for the next map rather than mapped and unmapped each time ([`gl`]) |
 //! | `eglGetDisplay(EGL_DEFAULT_DISPLAY)` | Android's default display has no host meaning | the host's display for the guest window's system ([`GlesHost::default_display`]) |
 //! | `eglCreateWindowSurface` | its window is an `ANativeWindow *` of this layer's | the host window behind it, resolved exactly as `vkCreateAndroidSurfaceKHR` resolves it ([`egl`]) |
 //! | `eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID)` | Android's value is a `WINDOW_FORMAT_*`; the host's is an X visual id | translated from the host config's channel sizes, recorded |
@@ -261,6 +261,10 @@ struct State {
     strings: gl::StringPool,
     /// Live buffer mappings, by `(host context, buffer name)`.
     maps: BTreeMap<(u64, u32), gl::Mapping>,
+    /// Idle mapping shadows, kept for the next map ([`gl`]'s "Shadows are reused").
+    shadows: gl::ShadowPool,
+    /// Every mapping made, by access bits: how many, and how many bytes in all.
+    map_census: BTreeMap<u32, (u64, u64)>,
     /// Window surfaces the host made, and their display.
     window_surfaces: BTreeMap<u64, u64>,
 }
@@ -301,6 +305,8 @@ impl Gles {
                 substitutions_dropped: 0,
                 strings: gl::StringPool::default(),
                 maps: BTreeMap::new(),
+                shadows: gl::ShadowPool::default(),
+                map_census: BTreeMap::new(),
                 window_surfaces: BTreeMap::new(),
             }),
             presents: AtomicU64::new(0),
@@ -483,6 +489,27 @@ impl Gles {
         for s in &state.substitutions {
             out.push_str(&format!("GLES:   {} x{}: {}\n", s.call, s.times, s.what));
         }
+        let (idle, idle_bytes) = state.shadows.idle();
+        out.push_str(&format!(
+            "GLES: mappings by access: {}; shadows: {} made, {} reused, {} released, {} lost, {idle} \
+             idle ({idle_bytes} bytes)\n",
+            if state.map_census.is_empty() {
+                "none".to_string()
+            } else {
+                state
+                    .map_census
+                    .iter()
+                    .map(|(access, (count, bytes))| {
+                        format!("{access:#x} x{count} ({} bytes each on average)", bytes / count.max(&1))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            state.shadows.made,
+            state.shadows.reused,
+            state.shadows.released,
+            state.shadows.lost,
+        ));
         out.push_str(&format!(
             "GLES: {} buffer mapping(s) live, {} window surface(s) live, {} byte(s) of guest \
              string pool used",

@@ -27,7 +27,7 @@ pick Vulkan device` -- D8, not worked around), and fell back to OpenGL ES, whose
 | `crates/omni-android/src/gles/mod.rs` | `Gles`: binds every **core** ES 2.0-3.2 and EGL 1.0-1.5 command by name (so the 91 imports resolve) plus a 256-slot `eglGetProcAddress` pool; one inline handler reads the arguments in AAPCS64 order by the registry's classes (x0-x7 then stack; s0-s7 then stack; each bank separately) and calls the host through the shape's caller. Census: calls by name (an atomic per slot, never dropped), every `eglGetProcAddress` with its answer, every substitution, presents |
 | `crates/omni-android/src/gles/host.rs` | the `GlesHost` seam (`select(RawWindow)`, `proc_address`, `default_display`, `create_window_surface`, `destroy_window_surface`, `display_terminated`) and `HostProc`, the host address that only a caller ever uses -- never handed to the guest |
 | `crates/omni-android/src/gles/egl.rs` | `eglGetDisplay(EGL_DEFAULT_DISPLAY)` -> the host display of the guest window's system; `eglCreateWindowSurface` -> the host window behind the `ANativeWindow` (checked against the NDK's live windows, raw window from the same `WindowSource` the Vulkan surface uses); `eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID)` translated to Android's `WINDOW_FORMAT_*` from the host config's channel sizes; `EGL_RECORDABLE_ANDROID`/`EGL_FRAMEBUFFER_TARGET_ANDROID` dropped from `eglChooseConfig` when the host lacks their extensions (MEASURED: Mesa X11 rejects both with `EGL_BAD_ATTRIBUTE` 0x3004); `eglQueryString` copied to guest memory; `eglGetProcAddress`; swaps counted; native-object calls refused by name |
-| `crates/omni-android/src/gles/gl.rs` | `glGetString`/`glGetStringi` copied into an interned guest pool; buffer mappings through a guest-memory **shadow** (filled when `GL_MAP_READ_BIT` is set or neither invalidate bit is; copied back at unmap under `GL_MAP_WRITE_BIT`, or only the flushed ranges under `GL_MAP_FLUSH_EXPLICIT_BIT`; `glGetBufferPointerv` answers the shadow); `GL_EXT_buffer_storage` **withheld** (below) |
+| `crates/omni-android/src/gles/gl.rs` | `glGetString`/`glGetStringi` copied into an interned guest pool; buffer mappings through a guest-memory **shadow** (filled when `GL_MAP_READ_BIT` is set or neither invalidate bit is; copied back at unmap under `GL_MAP_WRITE_BIT`, or only the flushed ranges under `GL_MAP_FLUSH_EXPLICIT_BIT`; `glGetBufferPointerv` answers the shadow; shadows **reused** from a pool bounded at 64 MiB idle -- "The mapping cost" below); `GL_EXT_buffer_storage` **withheld** (below) |
 | `crates/omni-gfx/src/gles.rs` | `GfxGlesHost`: a `HOSTS` table row per window system, chosen by the `RawWindow` variant at run time (no `cfg`). `Xlib` -> `libEGL.so.1` + `libGLESv2.so.2`, `eglGetPlatformDisplay(EGL_PLATFORM_X11_KHR, Display*)`, `eglCreatePlatformWindowSurface(&Window)`, the window claimed in `omni_gfx::claim`. `Win32` -> a typed refusal naming ANGLE |
 
 Calls whose values do not pass through, and why, are tabled in `gles/mod.rs`'s module docs. Values
@@ -124,6 +124,53 @@ test result: ok. 1 passed   (exit 0)
   The engine logged `Excluded 'Omnidroid:llvmpipe ...' - disabling SuperHQ shaders` -- its own rule.
 * Engine GLES 3 entry points asked through `eglGetProcAddress`: 55 (list in the run log's `GLES:`
   line); all answered by the host except the seven desktop spellings above.
+
+## The mapping cost (2026-09-25)
+
+**MEASURED in the engine** (NVC0, the Pet Simulator 99 world, `OMNI_PERF`): the render thread spent
+up to 82% of its time in `glMapBufferRange` (+ 9-10% `glUnmapBuffer`, 4-6% `memcpy`), 83% of those
+samples in this executable; 1-4 fps. The census: `glMapBufferRange=95285` / `glUnmapBuffer=95279`
+for 649 presents (~150 pairs a frame), **no** `glFlushMappedBufferRange`, `glBufferSubData=3284`.
+
+**What a map cost, per call, before:** `eglGetCurrentContext` + `glGetIntegerv(binding)` + the
+driver's map, then a **new guest mapping** (`GuestSpace::map_anonymous`, lazy): the region map's
+lock, a generation bump that empties every thread's `admit` cache, and `find_free`, which **walks
+every entry of the region map** and collects the free runs into a fresh `Vec` -- linear in the
+engine's map (tens of thousands of entries at ~3.8 GiB private). Then the shadow was committed by a
+fault per 64 KiB granule as the guest wrote it, the unmap's `admit` missed the cache, and the unmap
+decommitted and unmapped it (the lock and the bump again). The copies themselves were already
+right: nothing fetched for a write-only invalidating map, only flushed ranges under
+`FLUSH_EXPLICIT`.
+
+**Now:** a shadow is kept. `gl::ShadowPool` holds idle shadows (eagerly committed, one region-map
+entry each, so `admit` answers from the thread cache), a map takes the smallest that fits (new ones
+are 64 KiB or a power of two), an unmap gives it back, and past 64 MiB idle the least recently
+returned are unmapped. A pooled shadow is checked to be still exactly the mapping made (same
+`MappingId`, extent and protection) before it is handed out, so a guest that `munmap`s one does not
+get its address filled; a mapping ended by `glDeleteBuffers` gives its shadow back when the name's
+next map replaces the record. The census line `GLES: mappings by access: ...; shadows: ...` says
+which access bits the engine uses and how often the pool answered.
+
+**Benchmark** (`the_engines_map_write_unmap_pattern_timed`: a guest loop of map -> bionic `memset`
+-> [flush] -> unmap through the thunks, `(t(3n)-t(n))/2n`, n = 500; "native" is the same loop on the
+host's own functions writing straight into the driver's pointer; NVC0 on `:0`; µs per iteration):
+
+| region map | size | access | before | after | native |
+|---|---|---|---|---|---|
+| 60,013 entries | 4 KiB | WRITE\|INVALIDATE_RANGE | 1023.5 | 2.9 | 2.4 |
+| 60,013 entries | 4 KiB | WRITE\|INVALIDATE_RANGE\|FLUSH_EXPLICIT | 1159.4 | 5.8 | 2.4 |
+| 60,013 entries | 4 KiB | WRITE (read back) | 1201.9 | 3.8 | 2.5 |
+| 60,013 entries | 64 KiB | WRITE\|INVALIDATE_RANGE | 1308.2 | 20.7 | 20.8 |
+| 60,013 entries | 1 MiB | WRITE\|INVALIDATE_RANGE | 3317.5 | 389.8 | 298.6 |
+| 60,013 entries | 4 MiB | WRITE\|INVALIDATE_RANGE | 8831.5 | 2401.5 | 2225.0 |
+| 14 entries | 4 KiB | WRITE\|INVALIDATE_RANGE | 26.1 | 3.8 | 2.2 |
+| 14 entries | 1 MiB | WRITE\|INVALIDATE_RANGE | 1713.4 | 360.0 | 265.9 |
+| 14 entries | 4 MiB | WRITE\|INVALIDATE_RANGE | 7388.7 | 3842.2 | 2933.3 |
+
+(n = 1 run per cell; the driver's own times at 1-4 MiB vary run to run by up to 2x on this GPU --
+e.g. native 1 MiB `WRITE` 192 then 1219 µs -- so read those rows as "near native", not to the
+microsecond.) What remains over native at size is the shadow's one extra pass: the guest writes
+guest memory and this layer copies it into the driver's mapping.
 
 ## The owner's display: a nouveau GPU hang (READ FIRST)
 

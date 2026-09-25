@@ -95,26 +95,63 @@ ROWS = [
     # A mapping unmapped without copying the guest's writes back to the driver.
     ("lnx-gles-A6", "A", "glUnmapBuffer does not copy the shadow back",
      GL_RS,
-     """        copy_back(c, &mapping, 0, mapping.length)?;
-    }
-    let r = gles.forward_value(call)?;""",
-     """        let _ = &mapping;
-    }
-    let r = gles.forward_value(call)?;""",
+     """        copy_back(c, &mapping, 0, mapping.length)
+    } else {""",
+     """        Ok(())
+    } else {""",
      LIVE),
     # The shadow filled only for GL_MAP_READ_BIT: a write mapping without an invalidate bit then
-    # copies zeros back over every byte the guest did not touch.
+    # copies a reused shadow's stale bytes back over every byte the guest did not touch.
     ("lnx-gles-A7", "A", "a write-only mapping's shadow is not filled from the buffer",
      GL_RS,
-     """    let defined = access & MAP_READ != 0 || access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER) == 0;""",
-     """    let defined = access & MAP_READ != 0;""",
+     """    access & MAP_READ != 0 || access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER) == 0""",
+     """    access & MAP_READ != 0""",
      LIVE),
     # Over-correct: the whole shadow copied back at unmap even under GL_MAP_FLUSH_EXPLICIT_BIT, so
     # bytes the guest never flushed reach the buffer.
     ("lnx-gles-B2", "B", "an explicit-flush mapping is copied back whole at unmap",
      GL_RS,
-     """    if mapping.access & MAP_WRITE != 0 && mapping.access & MAP_FLUSH_EXPLICIT == 0 {""",
-     """    if mapping.access & MAP_WRITE != 0 {""",
+     """    access & MAP_WRITE != 0 && access & MAP_FLUSH_EXPLICIT == 0""",
+     """    access & MAP_WRITE != 0""",
+     LIVE),
+    # --- the mapping's cost (the render thread's 82% in glMapBufferRange) --------------------------
+    # Over-correct: every mapping fetched from the buffer, invalidating ones too -- correct bytes,
+    # and a read of the driver's (possibly write-combined) memory the specification made unneeded.
+    ("lnx-gles-B5", "B", "a write-only invalidating mapping is filled from the buffer anyway",
+     GL_RS,
+     """    access & MAP_READ != 0 || access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER) == 0""",
+     """    access & MAP_READ != 0 || access & (MAP_INVALIDATE_RANGE | MAP_INVALIDATE_BUFFER) == 0 || true""",
+     LIVE),
+    # A flush that uploads the whole mapping instead of its own range.
+    ("lnx-gles-B6", "B", "glFlushMappedBufferRange uploads the whole mapping",
+     GL_RS,
+     """            copy_back(c, &mapping, offset, length)?;""",
+     """            let _ = (offset, length);
+            copy_back(c, &mapping, 0, mapping.length)?;""",
+     LIVE),
+    # The pool never answers: every map makes a guest mapping again (the measured cost).
+    ("lnx-gles-A13", "A", "an idle shadow is never reused",
+     GL_RS,
+     """    if let Some(shadow) = gles.state().shadows.take(length, |shadow| is_ours(space, shadow)) {""",
+     """    if let Some(shadow) = gles.state().shadows.take(length, |shadow| is_ours(space, shadow)).filter(|_| false) {""",
+     LIVE),
+    # An unmapped mapping's shadow not given back: the pool never fills.
+    ("lnx-gles-A14", "A", "glUnmapBuffer does not give the shadow back",
+     GL_RS,
+     """    release_shadows(gles, [mapping.shadow]);""",
+     """    let _ = mapping.shadow;""",
+     LIVE),
+    # A mapping ended by glDeleteBuffers: its record replaced and its shadow lost with it.
+    ("lnx-gles-A15", "A", "a replaced mapping record's shadow is lost",
+     GL_RS,
+     """    if let Some(old) = replaced {""",
+     """    if let Some(old) = replaced.filter(|_| false) {""",
+     LIVE),
+    # A pooled shadow handed out without asking whether the guest has unmapped it since.
+    ("lnx-gles-A16", "A", "an idle shadow the guest unmapped is handed out again",
+     GL_RS,
+     """            if still_ours(&shadow) {""",
+     """            if true || still_ours(&shadow) {""",
      LIVE),
     # --- EGL ----------------------------------------------------------------------------------------
     # eglGetProcAddress answering a thunk for a name the host lacks or no registry has.
