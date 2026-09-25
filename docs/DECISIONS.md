@@ -4566,3 +4566,52 @@ lookups (the one steady-state cost measured above).
   translating thread waits for one (each leaves within its budget slice).
 * arm64: per-thread caches, as above.
 * D12's exception stands: the shared cache is W+X, as each per-thread cache was.
+
+### Amendment 1 (2026-09-25): the in-world A/B found a thrash; parked threads are now moved, not kept as holes
+
+**What the world showed** (the controller's A/B, Windows, PS99, `OMNI_PERF=1`, drags at +300/320/340
+s, 7 min each, same build `8e67e7a`): **w22** (shared) was the result the benches promised --
+translation 0-4k instructions a second by +100 s, the drags at a median 43 / minimum 37 fps with no
+second under 20 fps (baseline w21: 34.5 / 1 / 24 s under 20, peak 372k translated a second), 2.72
+GiB private against 4.19, and smoother by eye. **w24** (shared, the next run) never settled:
+translation at 120-240k a second for six minutes with private memory flat at ~2.5 GiB, ~3,500 host
+page faults a second, every thread 73-85% in the kernel, guest throughput 89 M instructions a second
+(normally ~1,000 M), frames only in two short windows.
+
+**Mechanism** (from the code; reproduced): a game keeps dozens of threads parked inside `SVC`
+callbacks -- imports that wait -- each with its return address in whichever region was current
+when it parked. The reclaimer kept the pages around each such address as a hole and reused a region
+only if 4 MiB of it was free of holes. With the parked threads' sites spread through the region, a
+retired region came back in small pieces or not at all; a working set larger than the piece it got
+filled it, retired it -- forgetting every block -- and started again: flat memory (each retired region
+given back as the next filled), page faults (fresh pages committed at the emission rate). And while
+any region stayed retired, every thread leaving `Run` retried the reclaim each millisecond, each try
+an asymmetric barrier (`FlushProcessWriteBuffers`, an IPI to every core), a re-decommit and a walk of
+the fastmem table: the kernel time. Which run went which way depended on where threads happened to be
+parked when the first region filled. The fields that would have shown it were not printed: the
+`code invalidations` counters cannot see a shared cache.
+
+**Fix** (`e82916e`): shared code calls every `SVC` callback through a prelude trampoline, which
+publishes the block's resume address in `JitState`, calls, and takes it back with an `xchg`; a parked
+thread's stack holds only prelude addresses. The reclaimer moves a parked thread whose resume address
+is in a retiring region, with one compare-exchange, to a prelude stub that leaves the run as the
+block's own halt test would; if the thread took its address first, the region waits for it. No
+barrier, no holes; threads waiting in the dispatcher re-publish their epoch; retries at most every 10
+ms. Regions are a quarter of the cache (256 MiB), not an eighth (`f7d4079`), and **`OMNI_PERF` now
+prints a `PERF jit cache:` line** -- blocks and bytes emitted, regions retired / reclaimed / held,
+parked threads moved, invalidations and blocks dropped, locked lookups, committed MiB -- on which w24
+would have shown as regions retired every few seconds.
+
+**Evidence**: `threads_parked_all_over_a_region_do_not_fragment_it` parks twelve threads through a
+region that two fills retire. On the hole design it fails (2 regions held, 23 MB committed); now all
+retired regions are given back while they are parked (12 moved), each finishes correctly, and a
+working set run again translates nothing. Hand mutation S6 (the move removed) is caught by it;
+`mutate_0022.py` 13/13. Suites, both modes: Windows dynarmic-sys 109, omni-cpu 139, omni-android 800;
+Linux dynarmic-sys 165, omni-cpu 141 (shared), omni-android 714 + the two bionic failures that are
+the host's (as before). The inline `SVC` path is unchanged (`thunk.rs` round trip, dispatch inside
+the run loop: 27-32 ns either way); an exit-path crossing costs ~15 ns more shared (100 -> 116 ns).
+Linux, eight threads on the Roblox leaves: cold 63.6 -> 48.2 ms (same order), 63.7 -> 57.3 ms
+(spread), threads' CPU 204 -> 108 / 68 ms.
+
+**Recommendation unchanged**: not the default until the A/B is repeated on this build -- now with the
+`PERF jit cache:` line, whose `retired` should stay at 0 or single digits for the session.

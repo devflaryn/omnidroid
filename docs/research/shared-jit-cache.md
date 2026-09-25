@@ -220,18 +220,33 @@ entries into it; a thread that entered after has flushed them. This is epoch-bas
 
 **A thread blocked inside a host callback** (an inline import that waits, e.g.
 `pthread_cond_wait`) is inside `RunCode` for as long as it waits, and will return into the block it
-called from. *As designed* it pinned every region retired while it waited. **As built** it does not:
-an `SVC` call sequence in shared code publishes its return site in `JitState` while the callback
-runs; a retirement raises a halt on every attached thread; so a parked thread, on waking, executes
-only the tail of its block after that site before it leaves through the block's halt test. The
-reclaimer -- after an asymmetric barrier (`FlushProcessWriteBuffers` on Windows, `membarrier`'s
-private expedited command on Linux), so that a thread's plain stores of its site are visible --
-treats a thread with a site as holding only the pages around it, keeps those committed as a hole,
-and gives the rest of the region back. A region whose largest span free of holes is under 4 MiB
-is not reused. Only a thread executing generated code that entered `RunCode` before the retirement
-holds a region, and it leaves within its budget slice. If every region is still held, the
-translating thread waits (without the lock) for one; `a_thread_parked_in_a_callback_does_not_hold_a_retired_region`
-retires and reclaims regions while a thread sleeps in a callback.
+called from. *As designed* it pinned every region retired while it waited.
+
+*As first built* it published its return site while the callback ran, and the reclaimer kept the
+pages around each parked thread's site as a hole and reused a region only if 4 MiB of it was free
+of holes. **That failed in the world** (D38 amendment 1, run w24): a game keeps dozens of threads
+parked in imports that wait, their sites spread through the region, so a retired region came back
+in small pieces or not at all; a working set larger than the piece it got filled it, retired it --
+forgetting every block -- and started again, for minutes; and every thread leaving `Run` retried
+the reclaim each millisecond, each try an asymmetric barrier (an IPI to every core) and a
+re-decommit.
+
+**As built now** a parked thread holds nothing of any region. Shared code calls every `SVC`
+callback through a prelude trampoline: the block jumps there with its resume address in a
+register; the trampoline publishes it in `JitState::od_callback_return`, calls, takes it back with
+an `xchg` (clearing it) and jumps to it. The thread's stack holds only prelude addresses. The
+reclaimer moves a parked thread whose resume address is in a retiring region with one
+compare-exchange to `svc_resume_retired`, a prelude stub that clears the exclusive state, as the
+block's tail would, and leaves the run, as the tail's halt test would (the retirement raised the
+halt). If the thread took its address first, the exchange fails and the region is kept -- the
+thread is running it and will leave within its budget slice. No barrier, no holes: a region is
+given back whole. Threads waiting in the dispatcher (for a region, or for a location another thread
+is translating) re-publish their epoch while they wait, so they do not hold one either.
+`threads_parked_all_over_a_region_do_not_fragment_it` parks twelve threads through a region that
+two fills retire, and fails on the hole design (two regions left held, 23 MB committed).
+
+Regions are a quarter of the cache (256 MiB by default), not an eighth: a retirement forgets every
+block, so a region must hold the whole working set with room to spare.
 
 `ClearCache` (and a guest `IC IALLU`) in shared mode drops every block and unlinks every slot, but
 does not retire the region: it is an invalidation of everything, not a reset of memory.
