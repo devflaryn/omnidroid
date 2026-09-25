@@ -4615,3 +4615,100 @@ Linux, eight threads on the Roblox leaves: cold 63.6 -> 48.2 ms (same order), 63
 
 **Recommendation unchanged**: not the default until the A/B is repeated on this build -- now with the
 `PERF jit cache:` line, whose `retired` should stay at 0 or single digits for the session.
+
+### Amendment 3 (2026-09-25): a full region is not a flush -- the oldest region is retired, alone, past 128 MiB of live code
+
+**The policy until now** (`a1ef0c5`, from the code): 1 GiB reserved, regions of a quarter of it --
+three of 256 MiB after the ~3 MiB prelude and constant pool. Blocks go into the current region; when
+it has less than 2 MiB left, `RetireCurrentRegion` calls `ForgetAllBlocks` -- **every block of the
+cache**, i.e. everything the threads run, since only the current region ever held live blocks --
+bumps the generation and the epoch, raises a halt on every other thread, and moves to the first free
+region, which starts empty. So a fill was a full retranslation of the working set **whether or not
+the other regions were free**; there was never more than one live region, the others being free or
+retired and waiting for their last holder (the emitting thread waits, lock released, if none is
+free). At most 254 MiB of live code.
+
+**The working set, measured** (`PERF jit cache:`, cumulative): w27 (7.5 min) 657,000 blocks, 225 MiB
+emitted, 247 MiB committed, the last 6 minutes adding ~16,000 blocks; w29 643,000 / 220 / 244 MiB;
+w30 (15 min) 241 MiB committed at +110 s and 246 MiB at the end -- about 0.4 MiB a minute; retired 0
+in all three. So translation **plateaus**: a world emits ~245 MiB in its first two to five minutes,
+mostly code that runs once (startup, loading), then trickles. A session would have reached the 254 MiB
+threshold somewhere past 30 minutes at w30's pace (w27 was at 247 MiB after 7.5), sooner after a
+teleport or a new area, and paid a full
+retranslation of the ~600,000-block set: the load hitch again, mid-session. And every instance kept
+~245 MiB of code committed, most of it cold, which use case B (30-35 instances) pays 35 times.
+(H1/H2, the controller's runs on `a1ef0c5`, had not landed when this was written.)
+
+**Now** (vendored patch 0028, `7c1cdeb`): regions of 16 MiB, filled in turn; a full region stays
+**live** -- its blocks run, are looked up and linked to -- and the next free one is started. At most
+**128 MiB** of regions are live; starting another past that retires the **oldest** live region, and
+only its blocks are forgotten (a location translated again since into a newer region keeps that
+block). A block still in use that was there is translated again on its next lookup, into the newest
+region, where it survives the next seven retirements: cold code is what goes. The retirement is
+otherwise unchanged (halt, epoch, given back when no thread holds it; parked threads redirected as
+amendment 1). Link records and guest ranges older than the next live region's are dropped then.
+`OMNI_JIT_SHARED_CACHE_LIVE_MB` and `OMNI_JIT_SHARED_CACHE_REGION_MB` set the two sizes (announced);
+`PERF jit cache:` now prints `evicted +N forgetting +B blocks, +R translated again (max M ms), live L
+regions`.
+
+**Why these sizes.** An eviction holds the cache's lock (and every thread is asked to halt) for a time
+set mostly by the region (`shared_cache.rs::the_cost_of_an_eviction`, release, one thread translating
+1.2 million blocks of the engine's shape, 135 bytes each; mean per eviction, longest in brackets):
+
+| | 16 MiB regions, 128 MiB live | 16 MiB, 32 MiB live | 8 MiB, 128 MiB live | one 128 MiB region live |
+|---|---|---|---|---|
+| Windows | 18.4 ms (19.3) | 16.9 (22.2) | 11.6 (16.9) | 148 (148), 917,505 blocks |
+| Linux (4-core i5) | 40.6 (44.2) | 21.7 (24.8) | 23.7 (36.4) | 204 (204) |
+
+About 170 ns a block forgotten on Windows. On the slower host the live code shows too (40.6 against
+21.7 ms): dropping the dead link records and ranges moves the live ones down (tens of MB at 128 MiB of
+small blocks); a store in fixed chunks would drop that part -- not done. The world's blocks average
+361 bytes (w30), ~46,000 to a 16 MiB region and ~370,000 to 128 MiB, so an in-world eviction is
+estimated at ~8 ms on Windows and ~15 ms on the Linux host, ~7-8 of them while a world loads (its ~245
+MiB against 128 live) and few or none after. 128 MiB is half of what a world emits in its first
+minutes and many times what it emits after them; 16 MiB keeps each retirement's stall and
+re-translation small without retiring every few seconds while loading.
+
+**Committed code per instance**: before, 242-247 MiB at the plateau (w27/w29/w30), and a flush to
+come; after, **at most 128 MiB live plus one 16 MiB region while it waits to be given back, plus the
+~3 MiB prelude** -- ~130 MiB steady, ~115 MiB less per instance (~4 GiB over 35 instances). The C++
+per-block tables scale with the live blocks as well (225 bytes a block, 0024-0027): ~370,000 at most
+instead of ~650,000; the block map's bucket array, which never shrinks, should stop at 2^19 (16 MiB)
+instead of 2^20 -- expected, to be confirmed by `OMNI_MEM_REPORT`.
+
+**Evidence.** `shared_cache.rs`: a working set run after each of 56 cold segments -- no fill with a
+free region translates it again or retires anything (0022 translated it at every fill: hand mutation
+S14 restores that and is caught), each eviction forgets at most one region's blocks, the working set
+is translated again 4 times over 14 evictions instead of at 17 fills, committed code within the live
+limit and a region, a clear gives the full regions back; a block translated into a newer region
+survives the old region's eviction and its link back into it is undone, and the trimmed range index
+still finds the right block afterwards; four threads keep a working set right while a fifth streams
+1.2 million cold blocks through a 24 MiB live limit (13 evictions, the set translated again 5 times,
+every retired region given back). Hand mutations (`mutate_0022.py` S14-S19): the six 0028 rows (S14
+the flush restored, S15 the newest region evicted, S16 a newer translation elsewhere evicted with
+the old region, S17 an evicted block's incoming links left, S18 the live regions' guest ranges
+dropped, S19 a clear keeping its full regions) are caught, and the whole table is 19/19 on this tree
+(S3 and S7 re-anchored for 0025 and 0028). Suites: Windows dynarmic-sys 122 / 122
+(`OD_TEST_SHARED_CACHE=1`), omni-cpu 139 / 139 (`OMNI_JIT_SHARED_CACHE=0`), omni-android 827 / 827,
+0 failed; Linux (the 4-core host, a temporary clone, removed): dynarmic-sys 178 / 178, omni-cpu 141
+/ 141, omni-android 825 per thread and 824 shared, the failures the two bionic tests that are the
+host's (as before) and, shared, once, the M3 initializer gate. **That gate is flaky under the shared
+cache on the base as well**, with the same two signatures: MEASURED, the whole `initializers` binary
+run alternately on Linux, n = 30 each, **3 failures on this build and 4 on `a1ef0c5`** (the pinned
+word at `p_vaddr 0x67d67d0` 6 instead of 5); the gate alone, n = 30, 0 against 1, per thread 0;
+Windows 3/12 and 1/24 here, 1/12 on `a1ef0c5` (92,432 image pointers instead of 92,431), per thread
+0/12. The initializers start guest threads; the shared cache changes how soon they run, and two of
+the words the gate pins depend on that. Not this change's; recorded as its own item (the gate should
+not pin a scheduling-dependent word)..
+
+**The live check** (the controller's; this task does not run the game): the w27 scene and drag
+script on this build, `OMNI_PERF=1`, `OMNI_MEM_REPORT=1`, 30 minutes or more. Expected: `evicted +1`
+on a handful of lines in the first ~3 minutes (7-8 in all while loading), each `forgetting` about
+40,000-50,000 blocks with `max` around 10 ms (under 30); `translated again` a few thousand while
+loading and near 0 after; `live 8 regions`; `committed` at most ~150 MiB (w27: 247); private bytes
+~0.1-0.2 GiB under w27/w29's 3.18-3.24 GiB; drag fps and settled fps as w27/w29 (0 s under 20 fps,
+48-52). **What would reverse the default**: evictions continuing through the settled world with
+`translated again` in the thousands per line (the in-world working set is larger than 128 MiB) or
+drag stalls where w27/w29 had none -- then `OMNI_JIT_SHARED_CACHE_LIVE_MB=256` (0022's capacity,
+without its flush) and a second look at the size. A B-instance run (`OMNI_PERF` on one of several)
+should show the same `committed` ceiling.

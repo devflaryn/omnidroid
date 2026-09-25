@@ -209,9 +209,12 @@ halt ends the block, `Run` returns, and the queue is applied before anything els
 **Reclaiming memory.** Upstream frees code only by resetting the whole cache (full cache,
 `ClearCache`), which with other threads running would pull code out from under them. The shared
 buffer is therefore split into **regions** after the prelude. Blocks are emitted into the current
-region. When it is full, it is **retired**: every slot in it is unlinked, the maps are emptied, the
-`generation` and an `epoch` counter are bumped, and emission moves to a free region. A retired
-region is **reclaimed** -- decommitted and made free -- once every attached thread either is not
+region. *As first built*, when it was full it was **retired**: every slot unlinked, the maps emptied
+-- every block of the cache forgotten --, the `generation` and an `epoch` counter bumped, and
+emission moved to a free region. *As built now* (patch 0028, D38 amendment 3) a full region stays
+live and the oldest live region is what is retired, its blocks alone forgotten -- "Retiring a region,
+oldest first" below. A retired region is **reclaimed** -- decommitted and made free -- once every
+attached thread either is not
 inside `RunCode` or entered it after the retirement: each thread publishes, at `Run` entry, the
 epoch it entered at (seq-cst, before it reads `generation`), and `UINT64_MAX` when it leaves. A
 thread that entered before the retirement may still be executing retired code or hold RSB/table
@@ -245,11 +248,36 @@ is translating) re-publish their epoch while they wait, so they do not hold one 
 `threads_parked_all_over_a_region_do_not_fragment_it` parks twelve threads through a region that
 two fills retire, and fails on the hole design (two regions left held, 23 MB committed).
 
-Regions are a quarter of the cache (256 MiB by default), not an eighth: a retirement forgets every
-block, so a region must hold the whole working set with room to spare.
+**Retiring a region, oldest first** (patch 0028, D38 amendment 3). With every block forgotten at a
+retirement, regions had to hold the whole working set (a quarter of the cache, 256 MiB), and a
+session that filled one paid a full retranslation of everything its threads run -- a load hitch --
+each time: the world's first minutes emit ~245 MiB (w27-w30, a plateau of ~530,000-650,000 blocks
+by +2 to +5 minutes, then +0.4 MiB a minute), so a 30-minute session would have met the first one.
+Now regions are small (16 MiB) and filled in turn; a full region stays **live** -- its blocks are
+still run, looked up and linked to -- and the next free one is started. At most `live_bytes` of
+regions are live (128 MiB by default); starting another past that retires the **oldest** live region
+first, and only its blocks are forgotten: for each guest range registered while that region was
+being filled (0026's ranges, one per emitted block, in emission order), a block whose code is in the
+region is taken out of the map, its incoming links are undone (0025's lists), its own slots are
+unlinked and taken out of theirs. A location translated again since into a newer region keeps that
+block. Because regions are filled and retired in order, every link record and guest range older
+than the next live region's first is dead then, and both are dropped from the front (their indices
+are serials, so nothing is renumbered). The retirement is otherwise as before: `generation` and
+`epoch` bumped, every thread asked to halt, the region given back when no thread holds it.
 
-`ClearCache` (and a guest `IC IALLU`) in shared mode drops every block and unlinks every slot, but
-does not retire the region: it is an invalidation of everything, not a reset of memory.
+What this changes for the threads: a block that is still run and was in the evicted region is
+translated again on its next lookup, into the newest region, where it is safe for the next `live /
+region - 1` retirements. A retirement stalls translation for the time it takes to forget one
+region's blocks (mostly set by the region size: 16-19 ms for a 16 MiB region of small blocks on
+Windows, measured in D38 amendment 3), not for the whole cache's, and the translation it causes is
+bounded by what that region held that is still in use -- the `+N translated again` field of `PERF
+jit cache:` counts it (blocks emitted at a location the latest eviction forgot). Cold code -- most
+of what a world's first minutes emit -- is what goes. `ClearCache` still forgets every block, and
+now also retires the full regions it emptied.
+
+`ClearCache` (and a guest `IC IALLU`) in shared mode drops every block and unlinks every slot; it
+does not retire the region being filled (an invalidation of everything, not a reset of memory), but
+since 0028 it retires the full ones, which then hold no block.
 
 ## 7. What the host plants into translated code (omni-cpu)
 
@@ -295,10 +323,13 @@ what makes the translation saving visible per thread.
 
 ## 9. Configuration, size, memory
 
-`OMNI_JIT_SHARED_CACHE=1` (announced on stderr as every JIT switch is) turns it on; **off by
-default**. `OMNI_JIT_SHARED_CACHE_MB` sizes it (default 1024 MiB of *address space*; regions of
-`size / 8`). Memory is committed as code is emitted -- 1 MiB ahead, as upstream -- and given back
-when a region is reclaimed. Per thread, what remains is `JitState`, the 64 KiB fast-dispatch table
+`OMNI_JIT_SHARED_CACHE=1` (announced on stderr as every JIT switch is) turns it on; *as first built*
+off by default, **the default on x64 since D38 amendment 2** (`OMNI_JIT_SHARED_CACHE=0` is the way
+back). `OMNI_JIT_SHARED_CACHE_MB` sizes it (default 1024 MiB of *address space*). Regions were
+`size / 8`, then `size / 4` (amendment 1); since 0028 they are 16 MiB
+(`OMNI_JIT_SHARED_CACHE_REGION_MB`) with 128 MiB of them live (`OMNI_JIT_SHARED_CACHE_LIVE_MB`).
+Memory is committed as code is emitted -- 1 MiB ahead, as upstream -- and given back when a region
+is reclaimed: committed code stays within the live limit and one region. Per thread, what remains is `JitState`, the 64 KiB fast-dispatch table
 and the shim's small allocations; no prelude, no constant pool, no code.
 
 ## 10. Expected gain (an estimate, to be replaced by measurements)
@@ -360,3 +391,7 @@ decision record, with every figure and its n, is **D38**; in short:
   measurements found (the fast-dispatch miss ordering, glibc's reader-preferring rwlock, the Linux
   barrier compiled out).
 * **arm64** keeps per-thread caches (section 8).
+* **Later** (D38 amendments 1-3): parked threads are moved out of a retiring region rather than kept
+  as holes (the w24 thrash); the cache is the default on x64; and a full region is no longer a
+  flush -- 16 MiB regions, the oldest retired alone past 128 MiB of live code (patch 0028); committed
+  code per instance ~245 MiB before, at most ~150 expected (to be confirmed in the world).

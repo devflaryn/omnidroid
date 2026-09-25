@@ -864,13 +864,16 @@ have met it, and every instance kept ~245 MiB of code committed.
 
 **MEASURED** (`tests/shared_cache.rs::the_cost_of_an_eviction`, ignored; Windows, release, one thread
 translating 1,200,001 blocks of the engine's shape -- a load, a store, a conditional branch; a branch
--- 135 bytes each): forgetting a region holds the lock for a time set by the region, not by the live
+-- 135 bytes each): forgetting a region holds the lock for a time set on Windows by the region, not the live
 code: **16 MiB regions, 128 MiB live: 18.4 ms per eviction (longest 19.3)**; 16 MiB with 32 MiB live
 16.9 (22.2); 8 MiB with 128 MiB live 11.6 (16.9); one 128 MiB region live -- every block of a full
 region forgotten, as 0022 did -- 148 ms for 917,505 blocks (that is this patch's path, not 0022's
 `ForgetAllBlocks`; 0022's cost was the retranslation that followed). About 170 ns a block forgotten;
 the world's blocks average 361 bytes (w30: 188,669 KiB in 535,066 blocks), about 46,000 to a 16 MiB
-region.
+region. On the 4-core Linux host: 40.6 ms (longest 44.2) with 128 MiB live, 21.7 (24.8) with 32 MiB,
+23.7 (36.4) for 8 MiB regions, 204 ms for the 128 MiB region -- there the live code shows as well:
+dropping the dead records and ranges moves the live ones down (tens of MB at 128 MiB of small blocks),
+which a store in fixed-size chunks would avoid (not done).
 
 **Detectors** (`tests/shared_cache.rs`): `a_full_region_is_not_a_flush_and_the_oldest_region_goes_first`
 (a 3,001-block working set run after each of 56 cold segments of 25,000 blocks, 8 MiB regions, 32
@@ -885,7 +888,10 @@ the working set's last block through the trimmed index, and only it), and
 a 2,001-block working set ~1.5 million times while a fifth streams 1.2 million cold blocks through a
 24 MiB live limit: 13 evictions, the working set translated again 5 times, every run right, every
 retired region given back). The tests written for 0022's cadence (`Space::new`) keep one region live,
-so that each fill still retires one.
+so that each fill still retires one. Hand mutations (`tools/mutate_0022.py`, rows S14-S19): the flush
+restored, the newest region evicted, a newer translation elsewhere evicted with the old region, an
+evicted block's incoming links left, the live regions' guest ranges dropped, a clear keeping its full
+regions -- **6/6 caught**, and the table's 0022 rows 13/13 on this tree (S3 and S7 re-anchored).
 
 ## How a patch is carried
 

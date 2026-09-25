@@ -35,7 +35,7 @@ CPU**, and this section is the plan for it.
 
 | owner | how much | how it is known | shared across instances? |
 |---|---|---|---|
-| **per-thread translation caches** (dynarmic `BlockOfCode`: a 32 MiB cap per guest thread, `CODE_CACHE_BYTES`; committed as code is emitted -- `EnsureMemoryCommitted` -- and never decommitted, even by a whole-cache clear) and their C++ block tables -- **replaced by one shared cache per instance, the default since `b934fc1`** | per-thread: **~1.1 GiB**; shared: **247 MiB** committed (`PERF jit cache:`, w27) -- a net **-0.8 to -0.85 GiB** | the same commit (`d30b583`) and scene: w28 4.03 GiB against w27/w29 3.18-3.23 GiB at +285 s (the earlier pairs w21/w22 and w23/w24, on `8e67e7a`, differed by ~1.45 GiB); 57 guest threads | no (per process) |
+| **per-thread translation caches** (dynarmic `BlockOfCode`: a 32 MiB cap per guest thread, `CODE_CACHE_BYTES`; committed as code is emitted -- `EnsureMemoryCommitted` -- and never decommitted, even by a whole-cache clear) and their C++ block tables -- **replaced by one shared cache per instance, the default since `b934fc1`** | per-thread: **~1.1 GiB**; shared: **247 MiB** committed (`PERF jit cache:`, w27) -- a net **-0.8 to -0.85 GiB**; since patch 0028 (D38 amendment 3) at most 128 MiB of live code and one 16 MiB region waiting to be given back: **~130 MiB expected**, to be confirmed live | the same commit (`d30b583`) and scene: w28 4.03 GiB against w27/w29 3.18-3.23 GiB at +285 s (the earlier pairs w21/w22 and w23/w24, on `8e67e7a`, differed by ~1.45 GiB); 57 guest threads | no (per process) |
 | `libroblox.so` text/rodata | 99.4 MiB mapped, resident as touched | ELF program headers; mapped `ReadExecute` from **one** extracted file per checkout (`target/omni-elf-fixtures/extraction-cache`, hard-linked into each account's storage -- link count 4 measured) | **yes, already**: every instance maps the same file and the OS shares its page cache (Windows data-file sections of one file share pages; a `ReadExecute` view is never privatised). Nothing to gain |
 | `libroblox.so` private part | **16.4 MiB**: relro 4.98 (relocated, so copy-on-write), `.data` 0.33, `.bss` 11.05 (eager) | ELF program headers; the loader's `LoadStats` | no (as on a device) |
 | the APK itself | `libroblox.so` is **deflated** (104.7 -> 44.6 MiB) at data offset 85,310,252 (not page-aligned), so it **cannot** be mapped from the APK; it is extracted once, as a device's installer does. Stored assets (60.5 MiB) are read out of the APK into a buffer per open asset (`AAsset_read`, `AAsset_getBuffer`), or handed over as a descriptor on the APK (`AAsset_openFileDescriptor`: the 14.0 MiB `shaders_vulkan_mobile.pack`) | `zipfile` over `Roblox-2.739.691.apk` | the extracted file: yes |
@@ -357,6 +357,18 @@ retirement forgot every block; fixed by moving parked threads out through a shar
 `PERF jit cache:` line now shows it: w27/w29 retired 0 regions all session. x64 only; the Mac keeps
 per-thread caches (its backend needs its own design). `OMNI_JIT_SHARED_CACHE=0` is the way back.
 
+**A full region is no longer a flush** (D38 amendment 3, patch 0028): until `a1ef0c5` a region that
+filled (256 MiB; a world is at ~245 MiB after its first minutes and adds ~0.4 MiB a minute) forgot
+every block, so a session past ~30 minutes would have retranslated its whole working set at once.
+Now regions are 16 MiB and a full one stays live; past 128 MiB of live code the oldest region alone
+is retired (cold startup code, mostly) and only what is still run from it is translated again.
+Committed code per instance: 242-247 MiB -> at most ~150, ~130 expected. **Live check pending**
+(D38 amendment 3 says what to look for; `OMNI_JIT_SHARED_CACHE_LIVE_MB=256` is the fallback).
+**Open, found on the way**: the M3 initializer gate (`initializers.rs`) fails about one run in ten
+under the shared cache -- on `a1ef0c5` as on this build (Linux n = 30: 4 and 3; per thread 0) -- a
+pinned word 6 instead of 5, or one image pointer too many: the initializers start guest threads and
+the shared cache changes how soon they run. The gate should not pin a scheduling-dependent word.
+
 **The owner's two products (stated 2026-09-25) -- they set the priorities from here:**
 (A) 3-4 instances at once on a good PC, high quality, high fps (gaming); (B) 30-35 instances at
 once on the same PC, lowest quality, capped fps acceptable -- only per-instance RAM and CPU matter.
@@ -365,7 +377,8 @@ frame cap of our own (the engine's `FramerateCap` needs a server flag that is of
 switch, `OMNI_FPS_CAP`, and a ranked sharing plan (library pages, translations across processes, a
 lower reported device RAM, audio off) are built: see "Multi-instance: the owner's two use cases" at the top. Every
 instance is its own process with its own window, input and storage; the shared code cache is per
-process (1 GiB of *reserved address space*, committed as code is emitted -- ~240 MiB in w27).
+process (1 GiB of *reserved address space*, committed as code is emitted -- ~240 MiB in w27; at
+most 128 MiB live plus a region since patch 0028, D38 amendment 3).
 Window behaviour for many instances (`beef41a`, `8cc3f91`): **an unfocused or minimised instance
 keeps playing** (desktop Roblox's behaviour); a minimised one draws nothing (our Vulkan layer
 answers the per-frame surface query with `VK_ERROR_SURFACE_LOST_KHR`, so the engine drops its
