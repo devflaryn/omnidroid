@@ -348,35 +348,70 @@ impl GuestMemory for GuestView<'_> {
     }
 }
 
-impl GuestAtomic for GuestView<'_> {
-    fn cas_u32(&self, addr: u64, expect: u32, new: u32) -> Result<bool, Fault> {
+impl GuestView<'_> {
+    /// The guest word at `addr` as a host atomic, after the checks every atomic access here makes:
+    /// the address fits, is 4-byte aligned, and its four bytes are admitted (`writable` for a
+    /// store or a CAS).
+    ///
+    /// **Alignment is a refusal, not a slow path.** A 32-bit atomic on an unaligned address is
+    /// undefined behaviour in Rust, and on the guest's own hardware `LDXR`/`STXR` -- and
+    /// `LDAR`/`STLR`, which the ordered load and store stand for -- take an alignment fault there
+    /// too. So refusing is what the guest would see on a real device, and it is the only answer
+    /// that is not undefined behaviour here. `what` names the operation in the refusal.
+    fn atomic_word(&self, addr: u64, writable: bool, what: &str) -> Result<&AtomicU32, Fault> {
         let at = usize::try_from(addr)
             .map_err(|_| self.stash(self.refusal("a guest address wider than the host's usize")))?;
-        // **Alignment is a refusal, not a slow path.** A 32-bit atomic on an unaligned address is
-        // undefined behaviour in Rust, and on the guest's own hardware `LDXR`/`STXR` take an
-        // alignment fault there too — so refusing is what the guest would see on a real device,
-        // and it is the only answer that is not undefined behaviour here.
         if at % 4 != 0 {
             return Err(self.stash(self.refusal(format!(
-                "a compare-and-swap on the unaligned guest address {at:#x}: AArch64's exclusive \
-                 accesses require 4-byte alignment and fault without it"
+                "{what} on the unaligned guest address {at:#x}: AArch64's exclusive and \
+                 ordered accesses require 4-byte alignment and fault without it"
             ))));
         }
-        let ptr = match self.mem.checked_ptr(at, 4, true, self.blame()) {
+        let ptr = match self.mem.checked_ptr(at, 4, writable, self.blame()) {
             Ok(ptr) => ptr,
             Err(error) => return Err(self.stash(error)),
         };
-        // SAFETY: `checked_ptr` established that the four bytes at `at` are mapped, writable and
-        // committed in this guest space, and the check above established 4-byte alignment, which
-        // is `AtomicU32`'s only additional requirement. Identity mapping (D4) makes the guest
-        // address a host address. Forming an `&AtomicU32` rather than a `&mut u32` is the whole
-        // point: other guest threads may be racing this word, and an atomic reference is the one
-        // Rust reference type that permits that.
-        let atomic = unsafe { AtomicU32::from_ptr(ptr.cast::<u32>()) };
-        // `SeqCst` on both paths. The guest's own `LDAXR`/`STLXR` pairs are acquire/release, and
+        // SAFETY: `checked_ptr` established that the four bytes at `at` are mapped, committed and
+        // (for a store or a CAS) writable in this guest space, and the check above established
+        // 4-byte alignment, which is `AtomicU32`'s only additional requirement. Identity mapping
+        // (D4) makes the guest address a host address. Forming an `&AtomicU32` rather than a
+        // `&mut u32` is the whole point: other guest threads may be racing this word, and an
+        // atomic reference is the one Rust reference type that permits that. The reference is
+        // used for one operation by the caller and does not outlive this call's view.
+        Ok(unsafe { AtomicU32::from_ptr(ptr.cast::<u32>()) })
+    }
+}
+
+impl GuestAtomic for GuestView<'_> {
+    fn cas_u32(&self, addr: u64, expect: u32, new: u32) -> Result<bool, Fault> {
+        let atomic = self.atomic_word(addr, true, "a compare-and-swap")?;
+        // `SeqCst` on both paths, which is more than `GuestAtomic` asks (`AcqRel` on success,
+        // `Acquire` on failure). The guest's own `LDAXR`/`STLXR` pairs are acquire/release, and
         // a weaker ordering here would be a memory-model difference between a mutex the guest
         // took through the thunk and one it took in its own code — invisible until it is not.
         Ok(atomic.compare_exchange(expect, new, Ordering::SeqCst, Ordering::SeqCst).is_ok())
+    }
+
+    fn load_u32_acquire(&self, addr: u64) -> Result<u32, Fault> {
+        // Read-only admission: `pthread_once` and `sem_getvalue` only read here, and a word the
+        // guest mapped read-only is one it may legitimately hand them.
+        let atomic = self.atomic_word(addr, false, "an acquire load")?;
+        // `Acquire`, the guest's `LDAR`: `LDAPR` or `LDAR` on an arm64 host, a plain `MOV` on
+        // x86-64, which is already acquire there. Paired with a release store or a CAS
+        // (SeqCst) of the same word by the thread that published it.
+        Ok(atomic.load(Ordering::Acquire))
+    }
+
+    fn store_u32_release(&self, addr: u64, value: u32) -> Result<(), Fault> {
+        let atomic = self.atomic_word(addr, true, "a release store")?;
+        // `Release`, the guest's `STLR`: `STLR` on an arm64 host, a plain `MOV` on x86-64 (TSO
+        // never lets a store pass an earlier one). What it orders is everything this host thread
+        // did before -- including the guest code it was running, whose loads and stores are this
+        // thread's own host loads and stores (D4) -- which is exactly the critical section an
+        // unlock hands over. Found by audit after macOS run m9: this used to be a plain
+        // `copy_nonoverlapping` through `GuestMemory::write`.
+        atomic.store(value, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -403,5 +438,46 @@ impl GuestContext for GuestView<'_> {
 
     fn scratch(&mut self) -> Option<(u64, usize)> {
         Some((self.scratch_address() as u64, STRING_SCRATCH_BYTES))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use omni_bionic::threads::GuestThreadId;
+    use omni_mem::GuestSpace;
+
+    use super::*;
+    use crate::bionic::Bionic;
+
+    /// The ordered load and store over real guest memory: a store is what the next load and CAS
+    /// see, and both refuse an unaligned word the way the CAS always has -- as the guest's own
+    /// `LDAR`/`STLR` would fault there, and because a Rust atomic there is undefined behaviour.
+    #[test]
+    fn the_ordered_load_and_store_round_trip_and_refuse_an_unaligned_word() {
+        let space = Arc::new(GuestSpace::new().expect("a guest address space"));
+        let bionic = Bionic::new(space).expect("a bionic instance");
+        let mem = GuestMem::new(Arc::clone(&bionic.space));
+        let state =
+            Active { bionic: Arc::clone(&bionic), thread: GuestThreadId(1), block: bionic.arena() };
+        let view = GuestView::new(&mem, "pthread_mutex_unlock", bionic.arena(), &state);
+        let word = view.scratch_address() as u64;
+
+        view.store_u32_release(word, 0xDEAD_BEEF).expect("an aligned, writable word");
+        assert_eq!(view.load_u32_acquire(word).expect("readable"), 0xDEAD_BEEF);
+        assert!(view.cas_u32(word, 0xDEAD_BEEF, 7).expect("the CAS sees the stored value"));
+        assert_eq!(view.load_u32_acquire(word).expect("readable"), 7);
+        // Through plain memory too: it is one word, not a shadow of it.
+        assert_eq!(view.mem().read_u32(word as GuestAddr, view.blame()).expect("readable"), 7);
+
+        // One at a time: the view keeps the first refusal of a call until `fault` takes it.
+        let fault = view.load_u32_acquire(word + 1).expect_err("an unaligned load");
+        let refusal = view.fault(fault).to_string();
+        assert!(refusal.contains("unaligned") && refusal.contains("acquire load"), "{refusal}");
+        let fault = view.store_u32_release(word + 2, 1).expect_err("an unaligned store");
+        let refusal = view.fault(fault).to_string();
+        assert!(refusal.contains("unaligned") && refusal.contains("release store"), "{refusal}");
+        assert_eq!(view.load_u32_acquire(word).expect("readable"), 7, "a refused store wrote nothing");
     }
 }

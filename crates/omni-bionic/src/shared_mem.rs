@@ -81,6 +81,20 @@ impl GuestAtomic for SharedMockMemory {
             Ok(false)
         }
     }
+
+    /// Ordered because the inner host lock is: a load under it sees every store
+    /// made under it before, which is an acquire and more.
+    fn load_u32_acquire(&self, addr: u64) -> Result<u32, Fault> {
+        let mem = self.inner.mem.lock().unwrap();
+        let mut b = [0u8; 4];
+        mem.read(addr, &mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    /// Ordered and untorn for the same reason: one hold of the inner lock.
+    fn store_u32_release(&self, addr: u64, value: u32) -> Result<(), Fault> {
+        self.inner.mem.lock().unwrap().write(addr, &value.to_le_bytes())
+    }
 }
 
 // NOTE: there is deliberately NO `GuestAtomic` impl for single-threaded
@@ -89,6 +103,128 @@ impl GuestAtomic for SharedMockMemory {
 // test that exercises the sync primitives wraps its memory in
 // [`SharedMockMemory`], whose CAS is atomic under its inner lock.
 // The cell mirror once planned for this was removed as redundant complexity.
+// The same holds for `store_u32_release`, which writes through `&self` as the
+// CAS does.
+
+/// How one access touched a watched guest word. See [`RecordingMemory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordAccess {
+    /// A plain [`GuestMemory::read`] that covered a byte of the word: no ordering.
+    Read,
+    /// A plain [`GuestMemory::write`] that covered a byte of the word, with the
+    /// value the word held after it: no ordering, and not even one store.
+    Write(u32),
+    /// [`GuestAtomic::load_u32_acquire`], with the value it returned.
+    LoadAcquire(u32),
+    /// [`GuestAtomic::store_u32_release`], with the value it stored.
+    StoreRelease(u32),
+    /// [`GuestAtomic::cas_u32`] to `new`; `swapped` says whether it wrote.
+    Cas {
+        /// The value the CAS would write.
+        new: u32,
+        /// Whether it did.
+        swapped: bool,
+    },
+}
+
+/// A [`SharedMockMemory`] that records **which primitive** touched one watched
+/// 32-bit word, in order.
+///
+/// # Why a behavioural test cannot do this job
+///
+/// The mock's inner host lock orders everything, so a primitive that publishes its
+/// word with a plain `write` behaves exactly like one that uses a release store,
+/// here and on every x86-64 host. The difference exists only on a weakly ordered
+/// host, in a window no unit test can make appear on demand. What a test *can* pin
+/// is the choice of primitive: a regression back to `write` shows up in this log as
+/// a [`WordAccess::Write`], and fails.
+#[derive(Clone)]
+pub struct RecordingMemory {
+    mem: SharedMockMemory,
+    word: u64,
+    log: Arc<Mutex<Vec<WordAccess>>>,
+}
+
+impl RecordingMemory {
+    /// Record every access to the four bytes at `word`, over `mem`.
+    pub fn new(mem: SharedMockMemory, word: u64) -> Self {
+        Self { mem, word, log: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    /// The accesses so far, oldest first.
+    pub fn log(&self) -> Vec<WordAccess> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Forget the accesses so far (for a test that only wants one call's).
+    pub fn clear(&self) {
+        self.log.lock().unwrap().clear();
+    }
+
+    /// The underlying shared memory.
+    pub fn shared(&self) -> &SharedMockMemory {
+        &self.mem
+    }
+
+    fn covers(&self, addr: u64, len: usize) -> bool {
+        len != 0 && addr < self.word + 4 && self.word < addr.saturating_add(len as u64)
+    }
+
+    fn push(&self, access: WordAccess) {
+        self.log.lock().unwrap().push(access);
+    }
+
+    fn word_now(&self) -> u32 {
+        self.mem.with_exclusive(|m| {
+            let mut b = [0u8; 4];
+            m.read(self.word, &mut b).map_or(0, |()| u32::from_le_bytes(b))
+        })
+    }
+}
+
+impl GuestMemory for RecordingMemory {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        if self.covers(addr, buf.len()) {
+            self.push(WordAccess::Read);
+        }
+        self.mem.read(addr, buf)
+    }
+
+    fn write(&mut self, addr: u64, buf: &[u8]) -> Result<(), Fault> {
+        let result = self.mem.write(addr, buf);
+        if self.covers(addr, buf.len()) {
+            let now = self.word_now();
+            self.push(WordAccess::Write(now));
+        }
+        result
+    }
+}
+
+impl GuestAtomic for RecordingMemory {
+    fn cas_u32(&self, addr: u64, expect: u32, new: u32) -> Result<bool, Fault> {
+        let swapped = self.mem.cas_u32(addr, expect, new)?;
+        if self.covers(addr, 4) {
+            self.push(WordAccess::Cas { new, swapped });
+        }
+        Ok(swapped)
+    }
+
+    fn load_u32_acquire(&self, addr: u64) -> Result<u32, Fault> {
+        let value = self.mem.load_u32_acquire(addr)?;
+        if self.covers(addr, 4) {
+            self.push(WordAccess::LoadAcquire(value));
+        }
+        Ok(value)
+    }
+
+    fn store_u32_release(&self, addr: u64, value: u32) -> Result<(), Fault> {
+        self.mem.store_u32_release(addr, value)?;
+        if self.covers(addr, 4) {
+            self.push(WordAccess::StoreRelease(value));
+        }
+        Ok(())
+    }
+}
 
 /// A futex that **compares its word**, as Linux's `FUTEX_WAIT` does and as the embedding's
 /// does: a word that differs from `expected` is `WouldBlock`, and each refusal is counted.
@@ -170,6 +306,21 @@ mod tests {
             g.read(0x1020, &mut b).unwrap();
             assert_eq!(b, [9]);
         });
+    }
+
+    /// The ordered load and store are the same word the CAS and plain reads see, and fault
+    /// where a plain access would.
+    #[test]
+    fn ordered_load_and_store_round_trip() {
+        let mut base = MockMemory::new();
+        base.map(0x3000, &[0u8; 8]);
+        let mem = SharedMockMemory::new(base);
+        mem.store_u32_release(0x3004, 0x0102_0304).unwrap();
+        assert_eq!(mem.load_u32_acquire(0x3004).unwrap(), 0x0102_0304);
+        assert!(mem.cas_u32(0x3004, 0x0102_0304, 9).unwrap());
+        assert_eq!(crate::atomics::read_u32(&mem, 0x3004).unwrap(), 9);
+        assert_eq!(mem.load_u32_acquire(0x3006), Err(Fault(0x3008)), "straddles the end");
+        assert_eq!(mem.store_u32_release(0x9000, 1), Err(Fault(0x9000)));
     }
 
     /// Clones see each other's writes (true sharing, not copy-on-write).
