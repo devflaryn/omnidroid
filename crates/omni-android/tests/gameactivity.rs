@@ -842,7 +842,7 @@ impl Guest {
                 .expect("OMNI_LOOPER_IDLE_US within the cap");
             let _ = writeln!(
                 std::io::stderr(),
-                "LOOPER: a spinning pollOnce(0) waits up to {idle_micros} us on its descriptors                  (OMNI_LOOPER_IDLE_US; `off` turns it off)"
+                "LOOPER: a spinning pollOnce(0) waits up to {idle_micros} us on its descriptors (OMNI_LOOPER_IDLE_US; `off` turns it off)"
             );
         } else {
             let _ = writeln!(std::io::stderr(), "LOOPER: the idle wait is OFF (OMNI_LOOPER_IDLE_US)");
