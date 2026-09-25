@@ -230,7 +230,7 @@ the withheld surface query). None changes behaviour with its switch unset. Teste
 omni-platform; gameactivity's unit tests) and Linux x86-64 in a temporary clone (the census, the
 labels, the report, the pacer); **no session was run**.
 
-## 2026-09-25: the host cursor follows the engine (`jni::cursor`; live check pending)
+## 2026-09-25: the host cursor follows the engine (`jni::cursor`; w33 fixes, live check pending)
 
 The owner saw two cursors racing -- the host's and the one Roblox draws, at the game's lower frame
 rate -- and asked that the host cursor follow **the engine's own signals, no button rules**. Decoded
@@ -242,32 +242,48 @@ holds its cursor still in two states of one word, `[[input + 0xb00] + 0x88]`: **
 a device captures nothing there). Built, `OMNI_KEYBOARD_MOUSE` only:
 
 * hidden over the client area while the engine has drawn into its view, on all three hosts
-  (`WM_SETCURSOR`, `XDefineCursor` of a blank cursor, a cursor rect), **only while the window has
-  the focus**;
+  (`WM_SETCURSOR`, `XDefineCursor` of a blank cursor, a cursor rect), **focused or not** (macOS:
+  only as far as AppKit lets a background app set the cursor -- not known, no Mac);
 * held -- the window's pointer capture: invisible, still, raw motion -- while the lock word is 1 or
-  2 (read from the engine's memory every UI turn) or `vk.e` holds Android's capture; in state 2 the
-  raw motion moves the pointer the Java side reports, so `vk.e.y`'s `dx`/`dy` still turn the camera,
-  unclamped at the view's edge;
-* given back (shown, not held) whenever the window lacks the focus or is minimised, re-taken when
-  the focus returns if the engine still wants it, and at a failed delivery and the session's end.
+  2 (read from the engine's memory every UI turn) or `vk.e` holds Android's capture, **only with the
+  focus**; in state 2 the raw motion reaches the engine as moves at the held position carrying the
+  motion (`vk.e.z` with Roblox's own `AndroidMouseLockButtonFix`), so the camera turns without limit
+  and the engine's cursor and button positions never move;
+* let go under the engine's cursor: the host cursor is moved there while still held and invisible,
+  then given back; never held while the window lacks the focus or is minimised, re-taken when the
+  focus returns if the engine still wants it; given back at a failed delivery and the session's end;
+* a button reported down is reported up however its release is lost: Windows on
+  `WM_CAPTURECHANGED` and, while one is held, from `GetAsyncKeyState` each poll; X11 from
+  `XQueryPointer`'s state; macOS from `CGEventSourceButtonState`.
+
+**w33** (`8959848`, the owner: "really cool, everything else works as intended") found three bugs,
+fixed in `738b538`/`ed2aae7`: the host cursor was shown over the **unfocused** window while the
+engine's cursor followed the pointer there (the hide was focus-scoped); the **right-drag stuck**
+turning the camera -- the log shows why: the held pointer's position followed its motion out of the
+1280x720 view (a release at x 1846, another at -42) and the engine never acted on a release there,
+until Esc's menu reset it; and a **flash at let-go** -- the engine's cursor jumped to that far
+position for a frame before the host's report brought it back.
 
 Logged as `INPUT: host cursor ...` lines (at most one a second) and a `host cursor --` line in the
-end-of-run INPUT summary. **Tested**: the rule's full table and a scripted session (unit), the
-decoder and the lock word's three stored values on the real library, the window seams on Windows
-(gated, 6/6 x3) and Linux (Xvfb, 15/15 x3); **macOS type-checked only** (the Mac was offline).
+end-of-run INPUT summary. **Tested**: the rule's full table, a scripted session and the let-go order
+(unit, each w33 fix caught by a mutation); the decoder and the lock word's three stored values on
+the real library; the window seams on Windows (gated, 7/7 x3, three mutations caught) and Linux
+(Xvfb); **macOS type-checked only** (the Mac was offline).
 
 **The owner's live check** (`omnidroid play`, a place with a free camera):
-1. Hover over the world: **one** cursor, Roblox's; the log says `host cursor hidden -- the engine
-   draws its own over its view`.
-2. Hold the right button and drag: the camera turns, and neither cursor moves; release: the Roblox
-   cursor is where the drag began and moves again (`held -- ... (LockCurrentPosition)`, then
-   `let go`). Drag far, past the window's edge: the camera keeps turning.
-3. Shift-lock (or zoom into first person): the cursor is locked at the centre and the camera follows
-   the mouse (`held`, and `pointer capture requested by vk.e -> the window holds it`); turn it off:
-   the cursor comes back.
+1. Hover over the world: **one** cursor, Roblox's (`host cursor hidden -- the engine draws its own
+   over its view`). Click another window so the game is **not selected**, then move the mouse over
+   the game: still one cursor, Roblox's following; off the game window the desktop cursor is back.
+2. Right-drag the camera, many times, short and long, far past the window's edges, releasing
+   anywhere: the camera turns while the button is down and **stops the moment it is released**,
+   every time (`held -- ... (LockCurrentPosition)`, then `let go`); neither cursor moves during the
+   drag, and at release **no cursor flashes elsewhere** -- Roblox's cursor is where the drag began.
+3. Shift-lock (or first person): the cursor is locked at the centre and the camera follows the
+   mouse; turn it off: the cursor comes back.
 4. Open a menu (Esc, the backpack): Roblox's cursor moves over it; the host's stays hidden.
-5. Alt+Tab away in each of the states above: the desktop cursor is visible and free at once
-   (`shown -- the window lost the focus`); Alt+Tab back: hidden (and held again in shift-lock).
+5. Alt+Tab away in each state above, including in the middle of a right-drag: the desktop cursor
+   moves freely at once, and the camera does not keep turning; Alt+Tab back: one cursor again (held
+   again in shift-lock).
 6. Minimise and restore: the cursor is free while minimised and follows the rule again after.
 7. At the end, the summary's `host cursor --` counts are non-zero and the lock state says where it
    was read from; `LockCurrentPosition` should count once per right-drag.
