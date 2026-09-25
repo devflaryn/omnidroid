@@ -4477,15 +4477,11 @@ directory", ADAPTER_FILES,
 
     # `MADV_DONTNEED` degraded to `MADV_FREE`: marked idle and never reclaimed, so the old
     # contents survive a guarantee that says a later read is zero.
+    # Re-anchored 2026-09-25: the mark and the reclaim are both inside `GuestSpace::discard` now.
     ("jni-A11", "A", "MADV_DONTNEED marks the range idle and never reclaims it",
-     ADAPTER_GUESTMEM,
-     """        if let Err(error) = space.reclaim_idle_in(at, len) {""",
-     """        if let Ok(()) = Ok::<(), omni_mem::MemError>(()) {
-            c.invalidate_code(at, len)?;
-            c.ret(|mut r| r.i32(0));
-            return Ok(());
-        }
-        if let Err(error) = space.reclaim_idle_in(at, len) {""",
+     SPACE,
+     """            discarded.decommitted = inner.reclaim_in(at, whole)?.bytes;""",
+     """            discarded.decommitted = 0;""",
      ANDROID),
 
     # `MADV_FREE` back to a mark alone: the range stays idle past the call, so the next
@@ -4493,12 +4489,13 @@ directory", ADAPTER_FILES,
     # found under an OpenSSL MemoryFault in PS99 (2026-09-24).
     ("madvfree-A1", "A", "MADV_FREE leaves its range marked idle for a later reclaim to wipe",
      ADAPTER_GUESTMEM,
-     """        if let Err(error) = space.reclaim_idle_in(at, len) {""",
+     """        if let Err(error) = space.discard(at, len) {""",
      """        if advice == MADV_FREE {
+            let _ = space.advise_idle(at, len);
             c.ret(|mut r| r.i32(0));
             return Ok(());
         }
-        if let Err(error) = space.reclaim_idle_in(at, len) {""",
+        if let Err(error) = space.discard(at, len) {""",
      ANDROID),
 
     # A slow memory reading taken afresh on every call: the Linux world's workers then spent
@@ -4532,6 +4529,35 @@ directory", ADAPTER_FILES,
      """                matches!(entry.os, OsState::Private { idle: true }).then_some((start, entry.len))""",
      """                (false && matches!(entry.os, OsState::Private { idle: true })).then_some((start, entry.len))""",
      ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "madv"]),
+
+    # MADV_DONTNEED at 4 KiB granularity on a larger host page (the Mac's 16 KiB, 2026-09-25):
+    # whole host pages are decommitted, the rest of the range is zeroed in place, and nothing
+    # outside it changes. Detected on every host: `tests/discard.rs` runs each scenario at 16 KiB
+    # and 64 KiB pages through `GuestSpace::with_page_size`, not only at the host's.
+    ("madv16k-A1", "A", "discard splits at 4 KiB instead of at the space's page, decommitting parts of a page",
+     SPACE,
+     """        let split = split_at_pages(address, len, self.page);""",
+     """        let split = split_at_pages(address, len, SMALL_PAGE);""",
+     MEM),
+    ("madv16k-A2", "A", "the parts of a host page in a discarded range are left as they were",
+     SPACE,
+     """        for (at, part) in split.partial() {""",
+     """        for (at, part) in split.partial().filter(|_| false) {""",
+     MEM),
+    # The over-corrections: the rounding the Mac used to do (the whole host page wiped for a 4 KiB
+    # range, the guest's bytes beside it with it), and zeroing by committing first -- which reads
+    # as thorough and spends commit charge the call was giving back.
+    ("madv16k-B1", "B", "a partial host page is zeroed whole, wiping the guest's bytes beside the range",
+     SPACE,
+     """        unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };""",
+     """        unsafe { std::ptr::write_bytes(page_start as *mut u8, 0, self.page) };""",
+     MEM),
+    ("madv16k-B2", "B", "an uncommitted partial host page is committed so that it can be zeroed",
+     SPACE,
+     """        for (at, part) in split.partial() {""",
+     """        for (at, part) in split.partial() {
+            inner.commit_range(OP, at, part)?;""",
+     MEM),
 
     # D37 undone: the guest told the host's whole processor count (24 on the Windows host), so
     # the engine starts twice the workers, each translating and holding the same code again.
@@ -4569,7 +4595,7 @@ directory", ADAPTER_FILES,
     # gone, so its next write faults.
     ("jni-B3", "B", "MADV_DONTNEED releases the mapping and not only the contents",
      ADAPTER_GUESTMEM,
-     """        if let Err(error) = space.advise_idle(at, len) {""",
+     """        if let Err(error) = space.discard(at, len) {""",
      """        if let Err(error) = space.unmap(at, len) {""",
      ANDROID),
 

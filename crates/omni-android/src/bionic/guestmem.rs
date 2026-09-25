@@ -52,7 +52,9 @@
 
 use omni_bionic::context::GuestContext;
 use omni_bionic::errno::consts;
-use omni_mem::{Backing, CommitPolicy, GuestAddr, MemError, Placement, Protection};
+use omni_mem::{
+    split_at_pages, Backing, CommitPolicy, GuestAddr, MemError, Placement, Protection, SMALL_PAGE,
+};
 
 use crate::boundary::{ImportCall, ReentrantCall};
 use crate::error::{AbiError, AbiResult};
@@ -708,6 +710,17 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 /// stopped §8 step 6. It is a correction to D21 rather than a relaxation of it: the refusal did
 /// exactly what it was written to do, and what was wrong was its premise.
 ///
+/// # 4 KiB-granular on every host, and what that means on a 16 KiB one
+///
+/// Both advices take any 4 KiB-aligned range ([`SMALL_PAGE`]), whatever the host page is:
+/// [`GuestSpace::discard`](omni_mem::GuestSpace::discard) decommits the range's whole host pages
+/// and **zeroes the rest in place**, leaving every byte outside the range as it was. MEASURED on
+/// the Mac (16 KiB pages, 2026-09-25): the check used to be against the host page, so
+/// `madvise(map + 4096, 4096, MADV_DONTNEED)` was `EINVAL` -- as was any purge an allocator
+/// started off a 16 KiB boundary -- and a 16 KiB-aligned 4 KiB range was rounded up to the host
+/// page, which wiped the 12 KiB after it (a guest probe read those three pages back as zero). On a
+/// 4 KiB host nothing changes: every such range is whole pages.
+///
 /// # Two things a reader needs to know
 ///
 /// * **`reclaim_idle` is space-wide**, so this handler never leaves a range marked idle past its
@@ -744,19 +757,15 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
     if advice == MADV_DONTNEED || advice == MADV_FREE {
         let name = if advice == MADV_FREE { "MADV_FREE" } else { "MADV_DONTNEED" };
-        let Some(len) = pages(length, page).filter(|&n| n != 0 && at % page == 0) else {
+        // 4 KiB-granular whatever the host page is: see `GuestSpace::discard`.
+        let Some(len) = pages(length, SMALL_PAGE).filter(|&n| n != 0 && at % SMALL_PAGE == 0)
+        else {
             let mut view = call.view();
             fail(&mut view, consts::EINVAL);
             c.ret(|mut r| r.i32(-1));
             return Ok(());
         };
-        if let Err(error) = space.advise_idle(at, len) {
-            let mut view = call.view();
-            fail(&mut view, errno_for(&error));
-            c.ret(|mut r| r.i32(-1));
-            return Ok(());
-        }
-        if let Err(error) = space.reclaim_idle_in(at, len) {
+        if let Err(error) = space.discard(at, len) {
             let mut view = call.view();
             fail(&mut view, errno_for(&error));
             c.ret(|mut r| r.i32(-1));
@@ -767,8 +776,11 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         // `advise_idle` returns how many bytes it *newly* marked, which is zero for a range an
         // earlier `MADV_FREE` already marked -- so a `marked < len` test refuses the ordinary
         // free-then-dontneed sequence an allocator makes, which is what it did the first time it
-        // was written. What actually has to be true is that nothing in the range is committed any
-        // more, and `RegionInfo::committed` says exactly that, per entry and unmerged.
+        // was written. What actually has to be true is that nothing in the range's whole host
+        // pages is committed any more, and `RegionInfo::committed` says exactly that, per entry
+        // and unmerged. A part of a host page stays committed by design -- it was zeroed in place,
+        // because the rest of that page is the guest's -- so only the whole pages are checked.
+        let whole = split_at_pages(at, len, page).whole.map_or(0..0, |(from, n)| from..from + n);
         let mut cursor = at;
         while cursor < at + len {
             let Some(region) = space.region_at(cursor) else {
@@ -777,7 +789,7 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                      {cursor:#x}, so the range it releases is not all mapped"
                 ));
             };
-            if region.committed != 0 {
+            if region.committed != 0 && whole.contains(&region.start.max(at)) {
                 return call.refuse(format!(
                     "{name} over {len} bytes at {at:#x} left {} committed bytes at {:#x}, \
                      so a later read there would return the old contents rather than the zeroes \

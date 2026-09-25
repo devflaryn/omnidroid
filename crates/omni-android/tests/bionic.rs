@@ -4608,6 +4608,74 @@ fn madvise_dontneed_really_does_return_zero_and_madv_remove_is_refused() {
     assert_eq!(unknown as i64 as i32, -1);
 }
 
+/// **`MADV_DONTNEED` and `MADV_FREE` over one 4 KiB page zero that page and no other**, on every
+/// host -- including the Mac, whose 16 KiB host page holds four of them.
+///
+/// MEASURED on the Mac (2026-09-25): the handler checked the range against the host page, so
+/// `madvise(map + 4096, 4096, MADV_DONTNEED)` was `EINVAL`, and a 16 KiB-aligned 4 KiB range was
+/// rounded up to the whole host page. Each 4 KiB page is marked at both ends by guest stores and
+/// read back by guest loads (through the demand pager), after each advice: the pinned case
+/// (`+4 KiB`, inside the first host page), one in the middle of a host page (`+24 KiB`), and one
+/// that starts a host page (`+32 KiB`), whose three neighbours in that page must survive.
+#[test]
+fn madvise_over_one_4k_page_zeroes_it_and_keeps_every_other_page_on_any_host() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    const SMALL: u64 = 4096;
+    let length = 64 * 1024;
+    let at = guest_mmap(&f, 0, length, PROT_RW, MAP_ANON_PRIVATE, -1, 0);
+    assert_ne!(at, u64::MAX);
+    let store = |address: u64, value: u64| {
+        let entry = program(&f, |asm| {
+            asm.mov(9, address);
+            asm.mov(10, value);
+            asm.push(str_imm(10, 9, 0));
+        });
+        run_program(&f, entry).expect("writable");
+    };
+    let load = |address: u64| -> u64 {
+        let entry = program(&f, |asm| {
+            asm.mov(9, address);
+            asm.push(ldr_imm(10, 9, 0));
+            asm.mov(11, f.guest.data as u64);
+            asm.push(str_imm(10, 11, 0));
+        });
+        run_program(&f, entry).expect("readable");
+        f.guest.read_u64(f.guest.data)
+    };
+    let marker = |page: u64| 0xA5A5_0000_0000_0000 | (page + 1);
+    let pages = length / SMALL;
+    for page in 0..pages {
+        store(at + page * SMALL, marker(page));
+        store(at + (page + 1) * SMALL - 8, marker(page));
+    }
+    let mut discarded = Vec::new();
+    for (index, advice) in [(1u64, 4u64), (6, 8), (8, 4)] {
+        let code = value_of(&f, "madvise", |asm| {
+            asm.mov(0, at + index * SMALL);
+            asm.mov(1, SMALL);
+            asm.mov(2, advice);
+        });
+        assert_eq!(code as i64 as i32, 0, "madvise(+{:#x}, 4096, {advice})", index * SMALL);
+        discarded.push(index);
+        for page in 0..pages {
+            let expected = if discarded.contains(&page) { 0 } else { marker(page) };
+            for address in [at + page * SMALL, at + (page + 1) * SMALL - 8] {
+                assert_eq!(
+                    load(address),
+                    expected,
+                    "after madvise(+{:#x}, 4096, {advice}): the word at +{:#x}",
+                    index * SMALL,
+                    address - at
+                );
+            }
+        }
+    }
+    // Still the guest's and still writable.
+    store(at + SMALL, 0x77);
+    assert_eq!(load(at + SMALL), 0x77);
+}
+
 
 /// `mlock` is refused, and the refusal says why `-1`/`ENOMEM` was rejected — it is the most
 /// tempting wrong answer in the group, because a failing `mlock` is ordinary on a real device.

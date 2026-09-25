@@ -246,6 +246,79 @@ pub struct Reclaimed {
     pub coalesced: usize,
 }
 
+/// The smallest page an arm64 Linux guest is built for, and the granularity
+/// [`GuestSpace::discard`] accepts **whatever the host's page is**.
+///
+/// On Windows and x86-64 Linux the host page is this size too. On Apple silicon it is 16 KiB,
+/// and `AT_PAGESZ` says so, but code built with a compile-time 4 KiB page still hands
+/// `madvise(MADV_DONTNEED)` ranges on 4 KiB boundaries -- the pinned case is
+/// `madvise(map + 4096, 4096, MADV_DONTNEED)`, which a 16 KiB-granular check refused with `EINVAL`
+/// (2026-09-25).
+pub const SMALL_PAGE: usize = 4096;
+
+/// How `[address, address + len)` lies across pages of one size: the part before the first page
+/// boundary inside it, the whole pages, and the part after the last. Each part is `(start, len)`
+/// and absent when empty. See [`split_at_pages`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageSplit {
+    /// The start of the range when it does not begin on a page boundary: from `address` to the
+    /// next boundary, or to the range's end if that comes first -- which makes it the whole range
+    /// when the range starts off a boundary and ends before the next one.
+    pub head: Option<(GuestAddr, usize)>,
+    /// Every page lying entirely inside the range.
+    pub whole: Option<(GuestAddr, usize)>,
+    /// The end of the range when it does not end on a page boundary: from the last boundary inside
+    /// the range (the range's own start, when that is one) to its end. Absent when the head
+    /// already reaches the end.
+    pub tail: Option<(GuestAddr, usize)>,
+}
+
+impl PageSplit {
+    /// The partial parts, head first: what cannot be handed back a page at a time.
+    #[must_use]
+    pub fn partial(&self) -> impl Iterator<Item = (GuestAddr, usize)> {
+        self.head.into_iter().chain(self.tail)
+    }
+}
+
+/// Split `[address, address + len)` at the boundaries of `page`-sized pages.
+///
+/// Pure, and `page` is a parameter rather than the host's so that the split a 16 KiB host makes
+/// can be checked on a 4 KiB one. The three parts tile the range exactly, in order.
+///
+/// # Panics
+///
+/// If `page` is not a power of two, or `address + len` overflows.
+#[must_use]
+pub fn split_at_pages(address: GuestAddr, len: usize, page: usize) -> PageSplit {
+    assert!(page.is_power_of_two(), "a page size is a power of two, not {page:#x}");
+    let end = address.checked_add(len).expect("the range wraps the address space");
+    let mask = page - 1;
+    // `then`, not `then_some`: the length is only computed when it is not negative.
+    let piece = |from: GuestAddr, to: GuestAddr| (from < to).then(|| (from, to - from));
+    // The first boundary at or after `address` (clamped to `end`, so a range inside one page
+    // gives a head that is the whole range) and the last at or before `end`. When the range lies
+    // inside one page, `first` is past `last` and there are no whole pages.
+    let first = address.checked_add(mask).map_or(end, |a| (a & !mask).min(end));
+    let last = end & !mask;
+    let head = (address & mask != 0).then(|| piece(address, first)).flatten();
+    let whole = piece(first, last);
+    let tail_from = last.max(head.map_or(address, |(at, len)| at + len));
+    let tail = (end & mask != 0).then(|| piece(tail_from, end)).flatten();
+    PageSplit { head, whole, tail }
+}
+
+/// What [`GuestSpace::discard`] did to a range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Discarded {
+    /// Bytes of whole host pages decommitted: their commit charge is back, and the demand pager
+    /// commits them again as zero-filled pages on the next touch.
+    pub decommitted: usize,
+    /// Bytes zeroed in place, because they share a host page with bytes outside the range that
+    /// the guest still owns. Those pages stay committed.
+    pub zeroed: usize,
+}
+
 /// A snapshot of what a guest address space currently holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceStats {
@@ -362,7 +435,33 @@ impl GuestSpace {
     /// multiple of the page size, or a base alignment that is not a power of two;
     /// [`MemError::Platform`] if the reservation itself fails.
     pub fn with_config(config: GuestSpaceConfig) -> MemResult<Self> {
-        let page = vm::page_size();
+        Self::build(config, vm::page_size())
+    }
+
+    /// Reserve a guest address space that works at `page` bytes a page rather than at the host's.
+    ///
+    /// **What a host with larger pages does, reproduced on one with smaller.** Every alignment,
+    /// rounding and split this space makes is at `page`, and a `page` that is a multiple of the
+    /// host's is always a legal thing to ask the host for, so a 16 KiB space on a 4 KiB host
+    /// behaves as the Apple silicon one does -- which is how the sub-page paths of
+    /// [`discard`](GuestSpace::discard) are tested on every host, not only on the Mac.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::InvalidConfig`] for a `page` that is not a power of two or not a multiple of
+    /// the host's page size, and otherwise as [`GuestSpace::with_config`].
+    pub fn with_page_size(config: GuestSpaceConfig, page: usize) -> MemResult<Self> {
+        if !page.is_power_of_two() || page % vm::page_size() != 0 {
+            return Err(MemError::InvalidConfig {
+                field: "page",
+                value: page as u64,
+                reason: "must be a power of two and a multiple of the host's page size",
+            });
+        }
+        Self::build(config, page)
+    }
+
+    fn build(config: GuestSpaceConfig, page: usize) -> MemResult<Self> {
         if config.size == 0 {
             return Err(MemError::InvalidConfig {
                 field: "size",
@@ -426,7 +525,9 @@ impl GuestSpace {
             });
         }
 
-        let reservation = vm::reserve_placeholder(config.size, config.base_alignment)
+        // At least page-aligned: the host's allocation granularity already is, for the host's own
+        // page, and is not for a larger page asked of `with_page_size`.
+        let reservation = vm::reserve_placeholder(config.size, config.base_alignment.max(page))
             .map_err(platform("GuestSpace::with_config", 0, config.size))?;
         let base = reservation.base();
         tracing::debug!(
@@ -870,24 +971,6 @@ impl GuestSpace {
         Ok(marked)
     }
 
-    /// Decommit everything the guest has released, and defragment the placeholder set.
-    ///
-    /// Two jobs, both of which return a scarce resource:
-    ///
-    /// * Every granule marked by [`advise_idle`](GuestSpace::advise_idle) is decommitted with
-    ///   `MEM_DECOMMIT`, which is the **only** primitive measured to give commit charge back.
-    ///   `MEM_RESET` is the cheapest call available at 32.5 ns/page and returns exactly 0.00 MB
-    ///   (D10), so it would pass any functional test while reclaiming nothing; it is not used here
-    ///   and is not reachable through `omni-platform` at all.
-    /// * Runs of adjacent free placeholders are merged back into single placeholders. Splitting is
-    ///   one-way at the OS level, and a mapping request that spans two separately-freed ranges
-    ///   fails with `ERROR_INVALID_PARAMETER` (87) until they are merged, so this is what keeps a
-    ///   long-lived instance able to place large mappings. Measured at about 270 ns per merged
-    ///   piece.
-    ///
-    /// # Errors
-    ///
-    /// [`MemError::Platform`] if a decommit or a coalesce fails.
     /// [`reclaim_idle`](GuestSpace::reclaim_idle) for the idle entries inside
     /// `[address, address + len)` only: what `madvise` needs once it has just marked that range.
     ///
@@ -908,6 +991,86 @@ impl GuestSpace {
         Ok(reclaimed)
     }
 
+    /// The guest's `MADV_DONTNEED` on private anonymous memory: afterwards every byte of
+    /// `[address, address + len)` reads zero, and **no byte outside it changes**.
+    ///
+    /// Granular at [`SMALL_PAGE`] (4 KiB), not at this space's page. The range is split at host
+    /// pages ([`split_at_pages`]):
+    ///
+    /// * **Whole host pages** are marked idle and decommitted at once, as
+    ///   [`advise_idle`](GuestSpace::advise_idle) and
+    ///   [`reclaim_idle_in`](GuestSpace::reclaim_idle_in) do: their commit charge comes back, and
+    ///   the demand pager commits them again zero-filled on the next touch.
+    /// * **A part of a host page** cannot be decommitted without taking the rest of that page with
+    ///   it, and the rest is the guest's. So it is **zeroed in place**, and the page stays
+    ///   committed. A page whose protection is not writable is raised to writable for the write
+    ///   and put back, under the map lock; a guest thread storing to one of its other bytes in that
+    ///   window succeeds where it would have faulted, which is the only difference and is a race
+    ///   the guest has with its own `madvise` anyway.
+    ///
+    /// On a host whose page is 4 KiB (Windows, x86-64 Linux) a 4 KiB-aligned range is all whole
+    /// pages and this is exactly the mark-and-reclaim it always was. On Apple silicon's 16 KiB
+    /// pages, a 16 KiB-granular check refused the engine's 4 KiB `madvise` ranges with `EINVAL`
+    /// (2026-09-25), and rounding one up to 16 KiB instead would wipe up to 12 KiB of live heap
+    /// beside it.
+    ///
+    /// Uncommitted pages already read zero and are left alone -- zeroing one would commit it,
+    /// which is the opposite of what the call asks for. File views are left alone too, as
+    /// `advise_idle` leaves them.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::ZeroSize`], [`MemError::Misaligned`] for an address that is not a multiple of
+    /// [`SMALL_PAGE`], [`MemError::OutsideSpace`], or [`MemError::Platform`] if a decommit or a
+    /// protection change fails.
+    pub fn discard(&self, address: GuestAddr, len: usize) -> MemResult<Discarded> {
+        const OP: &str = "discard";
+        if len == 0 {
+            return Err(MemError::ZeroSize { operation: OP });
+        }
+        if address % SMALL_PAGE != 0 {
+            return Err(MemError::Misaligned {
+                operation: OP,
+                what: "address",
+                value: address as u64,
+                required: SMALL_PAGE as u64,
+            });
+        }
+        // A length that cannot be rounded up is outside any space, and `check_range` says so.
+        let len = len.checked_next_multiple_of(SMALL_PAGE).unwrap_or(usize::MAX);
+        self.check_range(OP, address, len)?;
+        let split = split_at_pages(address, len, self.page);
+        let mut inner = self.write();
+        let mut discarded = Discarded::default();
+        if let Some((at, whole)) = split.whole {
+            inner.mark_idle(at, whole);
+            discarded.decommitted = inner.reclaim_in(at, whole)?.bytes;
+        }
+        for (at, part) in split.partial() {
+            discarded.zeroed += inner.zero_in_place(OP, at, part)?;
+        }
+        inner.validate();
+        Ok(discarded)
+    }
+
+    /// Decommit everything the guest has released, and defragment the placeholder set.
+    ///
+    /// Two jobs, both of which return a scarce resource:
+    ///
+    /// * Every granule marked by [`advise_idle`](GuestSpace::advise_idle) is decommitted with
+    ///   `MEM_DECOMMIT`, which is the **only** primitive measured to give commit charge back.
+    ///   `MEM_RESET` is the cheapest call available at 32.5 ns/page and returns exactly 0.00 MB
+    ///   (D10), so it would pass any functional test while reclaiming nothing; it is not used here
+    ///   and is not reachable through `omni-platform` at all.
+    /// * Runs of adjacent free placeholders are merged back into single placeholders. Splitting is
+    ///   one-way at the OS level, and a mapping request that spans two separately-freed ranges
+    ///   fails with `ERROR_INVALID_PARAMETER` (87) until they are merged, so this is what keeps a
+    ///   long-lived instance able to place large mappings. Measured at about 270 ns per merged
+    ///   piece.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Platform`] if a decommit or a coalesce fails.
     pub fn reclaim_idle(&self) -> MemResult<Reclaimed> {
         let mut inner = self.write();
         let reclaimed = inner.reclaim()?;
@@ -1915,6 +2078,45 @@ impl Inner {
             }
         }
         marked
+    }
+
+    /// Zero `[at, at + len)`, which lies inside one page, **where it is committed private memory**,
+    /// and return how many bytes were written. See [`GuestSpace::discard`].
+    ///
+    /// Entry boundaries are page-aligned, so one entry covers the whole page. An uncommitted page
+    /// already reads zero, free address space has nothing to zero, and a file view is left as
+    /// `advise_idle` leaves it; each of those is zero bytes.
+    fn zero_in_place(
+        &mut self,
+        operation: &'static str,
+        at: GuestAddr,
+        len: usize,
+    ) -> MemResult<usize> {
+        let page_start = at & !(self.page - 1);
+        debug_assert!(at + len <= page_start + self.page, "a partial piece crosses a page");
+        let Some(start) = self.map.entry_start(at) else { return Ok(0) };
+        let entry = self.map.get(start).expect("entry vanished");
+        debug_assert!(start <= page_start && page_start + self.page <= start + entry.len);
+        let (OsState::Private { .. }, Some(owner)) = (&entry.os, entry.owner.as_ref()) else {
+            return Ok(0);
+        };
+        let protection = owner.protection;
+        let raise = !protection.is_writable();
+        if raise {
+            // SAFETY: the page is committed private memory this process owns (the map says so,
+            // under its lock); a protection change dereferences nothing.
+            unsafe { vm::protect(page_start as *mut u8, self.page, Protection::ReadWrite) }
+                .map_err(platform(operation, page_start, self.page))?;
+        }
+        // SAFETY: `[at, at + len)` is inside that committed page, which is writable now. The guest
+        // has said it no longer needs these bytes; the bytes beside them are not written.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
+        if raise {
+            // SAFETY: as above; this puts back the protection the map records.
+            unsafe { vm::protect(page_start as *mut u8, self.page, protection) }
+                .map_err(platform(operation, page_start, self.page))?;
+        }
+        Ok(len)
     }
 
     /// Decommit each idle `(start, len)` entry to a placeholder, counting it into `reclaimed`.

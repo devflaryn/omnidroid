@@ -37,8 +37,8 @@ const WINDOWS_AND_MACOS_GATE: &str = r#"#![cfg(any(target_os = "windows", target
 /// compiles everywhere and reports a named `#[ignore]`d test with the reason attached. That is the
 /// shape this whole file argues for — a skip that appears where a pass would — so it is checked
 /// below rather than merely permitted.
-const PORTABLE: [&str; 4] =
-    ["admit_cache.rs", "arena_execution.rs", "config.rs", "windows_only.rs"];
+const PORTABLE: [&str; 5] =
+    ["admit_cache.rs", "arena_execution.rs", "config.rs", "discard.rs", "windows_only.rs"];
 
 /// Files that gate at the item level and must therefore announce their skip.
 const ITEM_GATED: [&str; 1] = ["arena_execution.rs"];
