@@ -20,6 +20,9 @@ Findings gathered before designing, so the design rests on measurements rather t
 - `research/windows-memory-model.md` — measured behaviour of the Windows virtual memory APIs
   that the demand-driven memory model depends on.
 - `research/graphics-spike.md` — measured host Vulkan and windowing capabilities.
+- `research/jni-audit-2.739.md` — every Java member `libroblox.so` 2.739.691 can call, whether
+  it is reachable here and what answers it; the `FacialAgeEstimationProtocol` decode and what the
+  "Unlock chat" flow shows.
 
 ## Conventions
 Every document states how each claim was established. Claims that were not verified by running
