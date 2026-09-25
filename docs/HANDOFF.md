@@ -492,6 +492,28 @@ GPU (`glClientWaitSync` 26%, `eglSwapBuffers` 21% -- Fermi at nouveau's boot clo
 flat at 3.8-4.0 GiB private / 2.8-3.1 GiB resident, ~1.9 of 4 cores; median 3.4 fps (0-14.2) --
 the frame rate on this host varies with the scene and is GPU-bound. `7728cf1` fixed the Linux link
 (`__atomic_compare_exchange_16`) that `d7b1350` had broken.
+**Linux GPU profile, 2026-09-25** (`OMNI_GLES_TIMING`, 10-minute runs, settled +300..+600 s, logs
+`g*`/`b3`/`e*`/`t2`/`r960` in the session scratchpad): **the GPU wait is the card, not this layer.**
+The layer forwards the engine's ~13,000-15,000 GL calls a frame 1:1 and adds ~330 host
+`glGetIntegerv`/`eglGetCurrentContext` a frame (the map/unmap bookkeeping) and a 4.5 MiB shadow ->
+driver `memcpy` (~2-3 ms of render-thread CPU a frame) -- no GPU work, no wait, no `glFinish`, no
+`glGetError` of its own. Mapping bits pass unchanged: in-world maps are `0x26`
+(`WRITE|INVALIDATE_RANGE|UNSYNCHRONIZED`, ~150 a frame, 3.3 KB) and `0xa`
+(`WRITE|INVALIDATE_BUFFER`, ~5-8 a frame, ~480 KB: orphaning), nothing is read back. The engine
+makes one fence a frame and waits on the newest (`GL_SYNC_FLUSH_COMMANDS_BIT`, 5 s) -- one frame
+in flight; its ~6,000-7,500 `glGetError` a frame cost 0.05 us each (Mesa, no glthread). At
+1280x720 the GPU is 96-98% busy and finishes each frame 80-100 ms after the CPU submits it; the
+scene pass (fb 105) is ~80% of the GPU frame. The window's surface config is RGB888, no depth,
+no MSAA; `eglSwapInterval(1)`. **fps depends on the desktop**: the same call mix took 90 ms of GPU a
+frame in one state (g2, 11.0 fps) and 71 ms in another (t2, 13.6); runs in the slow state gave
+7.6-7.8 (g5, g6) and one run jumped 6.8 -> 14.0 at an Alt+Tab on the desktop (e1) -- another GPU
+client (the owner's GNOME Remote Desktop session was connected, ~50% of a core) shares the card.
+Same (fast) state: 13.8 (b3, no timing), 14.0 (e2, CPU timing), 13.6 (t2, full timing) --
+the census costs nothing measurable. By window size (`OMNI_WINDOW_SIZE`, fast state): 1280x720
+13.6-14.0, **960x540 17.2** (r960; GPU 55 ms, still 96% busy); 640x360 14.6 in an unknown state
+(g4: the engine drew ~4,400 calls a frame there and the render thread waited on its workers, not
+the GPU). Found on the way: after a live resize (`OMNI_RESIZE_PROBE`) the engine's GLES renderer
+kept its 1280x720 viewport and never asked `eglQuerySurface` again.
 
 **The bottleneck list, ranked by measured cost** (Windows in-world profile w4, `OMNI_PERF=5`,
 `OMNI_PERF_DUMP`, symbolized with a debug-info build; shares are of the samples outside translated
@@ -520,6 +542,7 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 14 | **macOS 16 KiB host pages: `madvise(DONTNEED/FREE)` on a 4 KiB guest range** was refused with EINVAL when not 16 KiB-aligned, and a 16 KiB-aligned 4 KiB range was rounded up -- **zeroing the 12 KiB after it** (a guest probe confirmed) | every sub-16K purge on the Mac | **fixed** `7a56fdb` (`GuestSpace::discard`, 4 KiB-granular: whole host pages decommitted, partial ones zeroed in place). mimalloc's own OS calls audited clean on all hosts (`d30b583`) |
 | 15 | **a host window change froze the picture** (w26: `VK_ERROR_OUT_OF_DATE_KHR` forever) | w26 at +1470 s | **fixed** `5c967f2`..`8cc3f91` (above) -- live check pending |
 | 17 | **a menu click reaches an untranscribed Java method** -> the calling engine thread is refused and dies -> freeze (w31: "unlock chat" -> `FacialAgeEstimationProtocol.isAvailable`) | w31 at +155 s | **fixed** `7177327` (`isAvailable` is `personaSdk != null`; no Persona module runs here, so false -- the engine then offers the web age check; nothing faked), and the audit `docs/research/jni-audit-2.739.md` fixed four more refusals before a death (`27e3e9d`, `638615c`: idle-timer question on a stop in-world, the QoS-emergency dialog handler, the rating prompt, the ads-SDK question) -- live check pending. Open on that path: the Linking `openURL` request ("Continue" in the age-check modal does nothing here) and voice's `WebRtcAudioManager` |
+| 18 | **Linux: the GPU** (Quadro 4000, NVC0 at nouveau's boot clocks) -- the render thread's `glClientWaitSync` + `eglSwapBuffers` | 1280x720: GPU 96-98% busy, 71-96 ms a frame (the latter with another client on the card); layer's own cost ~2-3 ms render-thread CPU, 0 GPU | **not ours**; options: a smaller render size (960x540 window: 13.6 -> 17.2 fps), the game's lowest quality (already set on this account: `SavedQualityLevel` 1), NVIDIA's 390 legacy driver (a system change for the owner), keeping other GPU clients off the desktop |
 | 16 | **full disk on Windows** stopped a build mid-A/B (worktree `target/`s of finished agents, ~40 GB) | | cleaned 2026-09-25; agents' build dirs must be removed when they finish |
 
 **Deaths still open:** Windows `open(O_TRUNC)` on `memProfStorage<pid>.json` under a live mapping
@@ -1825,6 +1848,8 @@ The gate, and the switches it takes (every stimulus switch is opt-in and says so
 OMNI_M6_ROWS_21_22=1 OMNI_GFX_WINDOW_TESTS=1 cargo test -p omni-android --release --test gameactivity -- --nocapture --test-threads=1
   OMNI_SESSION_SECONDS=120   the session after the rows (default 20 s)
   OMNI_RESIZE_PROBE=1        resize the real window to 960x540 at 40% and back at 70%
+  OMNI_WINDOW_SIZE=<w>x<h>   open the real window at that size (default 1280x720)
+  OMNI_GLES_TIMING=1         GLES TIMING/GPU/WAITS/PASSES/DRAWS lines every FRAMES window (OMNI_GLES_TIMING_GPU=0: CPU side only)
   OMNI_INPUT_PROBE=1         one synthetic press-drag-release at the centre, once the surface is alive
   OMNI_LATE_INPUT=<s>,..     a synthetic 240 px drag at each second of the session
   OMNI_LATE_TAP=<s>@<x>,<y>;..   a synthetic tap at a window pixel (press one of the engine's buttons)
