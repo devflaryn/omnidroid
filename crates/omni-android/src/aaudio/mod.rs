@@ -251,13 +251,16 @@ pub trait OutputSink: Send {
     ///
     /// The host's failure, described.
     fn writable_frames(&self) -> Result<u32, String>;
-    /// Wait until the device wants data or `timeout` passes, then answer
-    /// [`writable_frames`](OutputSink::writable_frames).
+    /// Wait until at least `frames` frames are writable or `timeout` passes, then answer
+    /// [`writable_frames`](OutputSink::writable_frames) -- `omni_platform::audio`'s contract: the
+    /// device's wakes come a period at a time, and a wait goes on through them while fewer than
+    /// `frames` are free. A wait that returned with less room than asked for, while room was
+    /// still being made, would send the callback thread straight back into it: a busy loop.
     ///
     /// # Errors
     ///
     /// The host's failure, described.
-    fn wait_writable(&self, timeout: Duration) -> Result<u32, String>;
+    fn wait_writable(&self, frames: u32, timeout: Duration) -> Result<u32, String>;
     /// Append interleaved samples, no more frames than are writable.
     ///
     /// # Errors
@@ -1069,6 +1072,21 @@ fn allowed_frames(buffer_size: i32, buffer_frames: u32, writable: u32) -> u32 {
     u32::try_from(buffer_size).unwrap_or(0).saturating_sub(held)
 }
 
+/// The host's free frames at which [`allowed_frames`] reaches a burst: the host may hold no more
+/// than `buffer_size - burst`, so `buffer_frames - buffer_size + burst` must be free. What the
+/// callback thread waits for.
+///
+/// **Not "a period"**: with the buffer size below the capacity -- FMOD sets 1,440 frames in a
+/// 9,120-frame buffer, MEASURED on Linux with a 480-frame burst -- more than a period is always
+/// free, so a wait for one returns at once while the stream may not yet ask for a burst, and the
+/// thread spins. It did, on ALSA, at a whole core, for the length of the session. More than the
+/// buffer (a buffer size below a burst, which only a host buffer smaller than its own period could
+/// produce) can never be free, and the wait then runs to its timeout.
+fn frames_wanted(buffer_size: i32, buffer_frames: u32, burst_frames: u32) -> u32 {
+    let size = u32::try_from(buffer_size).unwrap_or(0).min(buffer_frames);
+    (buffer_frames - size).saturating_add(burst_frames)
+}
+
 /// [`THREAD_ENTRY`]: `void *start_routine(void *stream)`, on the guest thread `requestStart`
 /// created. See the module documentation.
 fn data_thread(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
@@ -1117,9 +1135,12 @@ fn data_thread(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             break;
         }
         // An unstarted host stream neither drains nor signals, so the first fill asks for the
-        // free space rather than waiting out the timeout for a signal that cannot come.
+        // free space rather than waiting out the timeout for a signal that cannot come. A started
+        // one is waited on for the room a burst needs, not for any room: see `frames_wanted`.
+        let buffer_frames = sink.lock().buffer_frames();
+        let wanted = frames_wanted(buffer_size, buffer_frames, burst_frames);
         let waited = if primed {
-            sink.lock().wait_writable(DEVICE_WAIT)
+            sink.lock().wait_writable(wanted, DEVICE_WAIT)
         } else {
             sink.lock().writable_frames()
         };
@@ -1131,7 +1152,6 @@ fn data_thread(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 break;
             }
         };
-        let buffer_frames = sink.lock().buffer_frames();
         if primed && writable >= buffer_frames {
             let mut state = audio.state.lock();
             if let Some(stream) = state.slot_of(handle).and_then(|slot| state.streams.get_mut(&slot)) {
@@ -1170,13 +1190,25 @@ fn data_thread(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                 break 'feed;
             }
         }
-        if wrote && !primed {
-            if let Err(why) = sink.lock().start() {
-                audio.state.lock().event(format!("{handle:#x}: the host device did not start: {why}"));
+        if !primed {
+            // Started once it holds something: what was just written, or -- a stream started
+            // again after a pause, whose host stream kept its queue -- what it already held, which
+            // may leave no room for a burst until it plays. Left unstarted then, nothing would
+            // ever drain it and this loop would ask again at once, for ever.
+            if wrote || writable < buffer_frames {
+                if let Err(why) = sink.lock().start() {
+                    audio.state.lock().event(format!("{handle:#x}: the host device did not start: {why}"));
+                    disconnected = true;
+                    break;
+                }
+                primed = true;
+            } else if let Err(why) = sink.lock().wait_writable(wanted, DEVICE_WAIT) {
+                // Empty and still no burst allowed: a buffer size below a burst. An unstarted
+                // stream's wait runs to its timeout, which paces this pass instead of a spin.
+                audio.state.lock().event(format!("{handle:#x}: the host device failed: {why}"));
                 disconnected = true;
                 break;
             }
-            primed = true;
         }
     }
     let _ = sink.lock().stop();
@@ -1246,8 +1278,8 @@ impl OutputSink for PlatformSink {
     fn writable_frames(&self) -> Result<u32, String> {
         self.0.writable_frames().map_err(|e| e.to_string())
     }
-    fn wait_writable(&self, timeout: Duration) -> Result<u32, String> {
-        self.0.wait_writable(timeout).map_err(|e| e.to_string())
+    fn wait_writable(&self, frames: u32, timeout: Duration) -> Result<u32, String> {
+        self.0.wait_writable(frames, timeout).map_err(|e| e.to_string())
     }
     fn write(&mut self, samples: &[f32]) -> Result<(), String> {
         self.0.write(samples).map_err(|e| e.to_string())
@@ -1303,5 +1335,22 @@ mod tests {
         // A 1920-frame host buffer holding 480 (writable 1440) with a 960 buffer size: 480 more.
         assert_eq!(allowed_frames(960, 1920, 1440), 480);
         assert_eq!(allowed_frames(960, 1920, 480), 0, "already holding more than the size");
+    }
+
+    /// What the callback thread waits for is exactly the free space at which a burst becomes
+    /// allowed: one frame less and the allowance is short of a burst. Where the buffer size is the
+    /// whole capacity that is one burst, the old wait's threshold; FMOD's shape is far above it.
+    #[test]
+    fn the_thread_waits_for_the_room_a_burst_needs() {
+        for (size, capacity, burst) in
+            [(1440, 9120, 480), (960, 1920, 480), (1920, 1920, 480), (480, 960, 480), (441, 4410, 441)]
+        {
+            let wanted = frames_wanted(size, capacity, burst);
+            assert!(allowed_frames(size, capacity, wanted) >= burst, "{size}/{capacity} at {wanted}");
+            assert!(allowed_frames(size, capacity, wanted - 1) < burst, "{size}/{capacity} at {wanted}");
+        }
+        assert_eq!(frames_wanted(1440, 9120, 480), 8160, "FMOD's stream on Linux, MEASURED shape");
+        assert_eq!(frames_wanted(1920, 1920, 480), 480, "the whole buffer: one burst, as before");
+        assert!(frames_wanted(240, 240, 480) > 240, "a buffer below a burst never has the room");
     }
 }

@@ -17,7 +17,7 @@
 //! AudioOutput::buffer_frames(&self) -> u32
 //! AudioOutput::period_frames(&self) -> u32
 //! AudioOutput::writable_frames(&self, operation) -> AudioResult<u32>
-//! AudioOutput::wait_writable(&self, timeout: Duration) -> AudioResult<u32>
+//! AudioOutput::wait_writable(&self, frames: u32, timeout: Duration) -> AudioResult<u32>
 //! AudioOutput::write(&mut self, samples: &[f32], frames: u32) -> AudioResult<()>
 //! AudioOutput::start(&mut self) -> AudioResult<()>
 //! AudioOutput::stop(&mut self) -> AudioResult<()>
@@ -48,9 +48,20 @@
 //! a host API that calls back on a thread of its own would be running guest-facing code on a
 //! thread the runtime did not create and cannot name to the guest. So the shape here is a **pull**:
 //! the thread that feeds the device calls [`AudioOutput::wait_writable`], which blocks until the
-//! device signals that it has consumed a period (or a timeout passes), and then writes what
-//! [`AudioOutput::writable_frames`] says fits. AAudio's data callback is built on top of that loop
-//! in `libaaudio.so`, on a thread the runtime starts.
+//! device has consumed enough for the frames the caller asked to have free (or a timeout passes),
+//! and then writes what [`AudioOutput::writable_frames`] says fits. AAudio's data callback is built
+//! on top of that loop in `libaaudio.so`, on a thread the runtime starts.
+//!
+//! # A wait is for as much room as the caller can use, not for any room
+//!
+//! The caller says how many frames it needs free before it has anything to write, and the wait
+//! does not return for less (short of its timeout). A feeder that keeps less queued than the whole
+//! buffer -- AAudio's buffer *size* below its *capacity*, which FMOD asks for (MEASURED on Linux:
+//! 1,440 of 9,120 frames, a 480-frame burst) -- always has more than a period free, so a wait for
+//! "a period is free" returns at once, the feeder finds nothing it may write yet, and waits again:
+//! a busy loop. It cost a whole core on Linux, where ALSA's `snd_pcm_wait` is level-triggered on
+//! one period free; WASAPI's event and Core Audio's semaphore fire once per period and hid it. So
+//! every backend keeps waiting, a period at a time, until `frames` are free.
 //!
 //! # Writes are never truncated
 //!
@@ -205,17 +216,27 @@ impl AudioOutput {
         self.inner.writable_frames("writable_frames")
     }
 
-    /// Block until the device signals that it wants data or `timeout` passes, then return
+    /// Block until at least `frames` frames are writable or `timeout` passes, then return
     /// [`AudioOutput::writable_frames`].
     ///
-    /// **A timeout is not an error**: it returns whatever is writable, which may be zero. A stream
-    /// that has not been started does not signal, so waiting on one always runs to the timeout.
+    /// The device wakes a waiter a period at a time, and the wait goes on through those wakes
+    /// while fewer than `frames` are free -- it never returns early with less room than the caller
+    /// said it needs, which a caller that then has nothing to write would turn into a busy loop
+    /// (see "A wait is for as much room as the caller can use"). `frames` of a period or less is
+    /// the old single wake. More than [`AudioOutput::buffer_frames`] can never be free, and such a
+    /// wait runs to its timeout. Where the room is free already, WASAPI and Core Audio still wait
+    /// for the next wake (an event and a semaphore, each at most one stale); ALSA returns at once,
+    /// its poll being level-triggered.
+    ///
+    /// **A timeout is not an error**: it returns whatever is writable, which may be less than
+    /// `frames`, or zero. A stream that has not been started does not signal, so waiting on one
+    /// always runs to the timeout.
     ///
     /// # Errors
     ///
     /// [`AudioError::Os`] if the wait itself failed or the host could not report the free space.
-    pub fn wait_writable(&self, timeout: Duration) -> AudioResult<u32> {
-        self.inner.wait_writable(timeout)
+    pub fn wait_writable(&self, frames: u32, timeout: Duration) -> AudioResult<u32> {
+        self.inner.wait_writable(frames, timeout)
     }
 
     /// Append interleaved samples to the host buffer.

@@ -287,6 +287,16 @@ GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "g
 # recording device. No APK and no audio hardware, so every row costs a build and not a run.
 AAUDIO = ["cargo", "test", "-p", "omni-android", "--lib", "--test", "aaudio", "--no-fail-fast"]
 
+# The AAudio feeding loop's pacing (`feed-` rows): the same two targets in release, because the
+# paced device plays in real time and the rows are about how often the loop waits, measured
+# against a guest callback at the device's rate.
+FEED_AAUDIO = ["cargo", "test", "-p", "omni-android", "--release", "--lib", "--test", "aaudio",
+               "--no-fail-fast"]
+# The audio seam against the host's real default playback device (silence only): the gated live
+# contract tests, with their gate set through `cmd` so that the row is a plain argv on Windows.
+FEED_LIVE = ["cmd", "/c", "set OMNI_AUDIO_LIVE_TESTS=1&& cargo test -p omni-platform --release "
+             "--no-fail-fast --test audio_live -- --include-ignored --test-threads=1"]
+
 # The Java side's web view (`jni::webview`, and its two answers in `jni::env`): the module's unit
 # tests alone, filtered by path. No APK, no guest and no browser -- the decisions are a state
 # machine and the answers are reached through `env::evaluate` -- so every row costs a build.
@@ -8969,6 +8979,50 @@ directory", ADAPTER_FILES,
             self.record_near_misses(addr);
         }""",
      FUTEX_RUNTIME),
+    # ---- the AAudio feeding loop waits for the room a burst needs (prefix `feed-`) --------------
+    # MEASURED on Linux in the Pet Simulator 99 world: FMOD's data-callback thread at 88-96 % of a
+    # core for the whole session, every sample in `sem_post` (the last import the thread made)
+    # with no guest instructions. FMOD's stream is 1,440 frames of buffer size in a 9,120-frame
+    # buffer with a 480-frame burst, so more than a period is always free: a wait for "a period"
+    # (ALSA's `avail_min`, level-triggered) answered at once, no burst was allowed yet, and the
+    # loop asked again. The loop now waits for `buffer - size + burst` free, and every backend's
+    # wait goes on until that much is. Detectors: `tests/aaudio.rs`'s paced device (a real-time
+    # double with the seam's contract, counting waits), the unit test of `frames_wanted`, and the
+    # live seam tests in `tests/audio_live.rs` on this host's WASAPI device.
+    ("feed-A1", "A", "the feeding loop waits for any room (a burst's worth) instead of the room a burst needs",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """            sink.lock().wait_writable(wanted, DEVICE_WAIT)
+        } else {""",
+     """            sink.lock().wait_writable(burst_frames, DEVICE_WAIT)
+        } else {""",
+     FEED_AAUDIO),
+    ("feed-A2", "A", "the room waited for is one burst whatever the buffer size",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """    (buffer_frames - size).saturating_add(burst_frames)""",
+     """    let _ = size;
+    burst_frames""",
+     FEED_AAUDIO),
+    ("feed-A3", "A", "a stream restarted after a pause starts its host only after writing, so a kept queue is never played",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """            if wrote || writable < buffer_frames {""",
+     """            if wrote {""",
+     FEED_AAUDIO),
+    ("feed-A4", "A", "the WASAPI wait comes back after one wake with less room than asked for",
+     "crates/omni-platform/src/audio/windows.rs",
+     """            if free >= frames || waited == WAIT_TIMEOUT {""",
+     """            if true {""",
+     FEED_LIVE),
+    ("feed-B1", "B", "the WASAPI wait for room that is short ignores its timeout",
+     "crates/omni-platform/src/audio/windows.rs",
+     """            if free >= frames || waited == WAIT_TIMEOUT {""",
+     """            if free >= frames {""",
+     FEED_LIVE),
+    ("feed-B2", "B", "the feeding loop waits for the whole buffer to drain, not for a burst's room",
+     "crates/omni-android/src/aaudio/mod.rs",
+     """    (buffer_frames - size).saturating_add(burst_frames)""",
+     """    let _ = (size, burst_frames);
+    buffer_frames""",
+     FEED_AAUDIO),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

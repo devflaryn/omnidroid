@@ -65,10 +65,11 @@ use core::ffi::c_void;
 use core::num::{NonZeroU16, NonZeroU32};
 use core::ptr::{self, NonNull};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     ERROR_NOT_FOUND, GetLastError, HANDLE, RPC_E_CHANGED_MODE, S_FALSE, S_OK, WAIT_FAILED,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, EDataFlow,
@@ -697,19 +698,28 @@ impl AudioOutput {
         Ok(self.buffer_frames.saturating_sub(padding))
     }
 
-    /// `WaitForSingleObject` on the stream's event, then [`AudioOutput::writable_frames`].
-    pub(super) fn wait_writable(&self, timeout: Duration) -> AudioResult<u32> {
-        // SAFETY: a live event handle owned by `self`, and a finite timeout (`wait_millis` never
-        // returns `INFINITE`).
-        let waited =
-            unsafe { WaitForSingleObject(self.event.as_raw_handle(), wait_millis(timeout)) };
-        if waited == WAIT_FAILED {
-            return Err(last_error("wait_writable", "WaitForSingleObject"));
+    /// `WaitForSingleObject` on the stream's event, then [`AudioOutput::writable_frames`] -- and
+    /// again, with what is left of the timeout, while fewer than `frames` are free. The event is
+    /// auto-reset and the engine sets it once per period, so each pass blocks for a period.
+    pub(super) fn wait_writable(&self, frames: u32, timeout: Duration) -> AudioResult<u32> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            // SAFETY: a live event handle owned by `self`, and a finite timeout (`wait_millis`
+            // never returns `INFINITE`).
+            let waited =
+                unsafe { WaitForSingleObject(self.event.as_raw_handle(), wait_millis(left)) };
+            if waited == WAIT_FAILED {
+                return Err(last_error("wait_writable", "WaitForSingleObject"));
+            }
+            // `WAIT_OBJECT_0` (the engine consumed a period) and `WAIT_TIMEOUT` both come here:
+            // either way the answer is what is writable now. `WAIT_ABANDONED` is for mutexes and
+            // cannot come from an event.
+            let free = self.writable_frames("wait_writable")?;
+            if free >= frames || waited == WAIT_TIMEOUT {
+                return Ok(free);
+            }
         }
-        // `WAIT_OBJECT_0` (the engine consumed a period) and `WAIT_TIMEOUT` both come here: either
-        // way the answer is what is writable now. `WAIT_ABANDONED` is for mutexes and cannot come
-        // from an event.
-        self.writable_frames("wait_writable")
     }
 
     /// `GetBuffer`, copy, `ReleaseBuffer`. The caller has checked that `frames` fits.

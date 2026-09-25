@@ -65,10 +65,14 @@ ROWS = [
             channels: u16::try_from(request.channels).unwrap_or(u16::MAX),""",
      AUDIO),
 
+    # The wait is a loop to a deadline since the lnx-feed- rows' fix, so its poll takes what is
+    # left of the timeout; `write`'s own poll spells the same call, hence the SAFETY line.
     ("lnx-audio-A5", "A", "a running wait ignores its timeout (snd_pcm_wait -1, for ever)",
      LINUX_RS,
-     """snd_pcm_wait(self.pcm.raw(), wait_millis(timeout))""",
-     """snd_pcm_wait(self.pcm.raw(), -1)""",
+     """            // SAFETY: a live PCM, and a timeout that is never negative (`wait_millis`).
+            let waited = unsafe { snd_pcm_wait(self.pcm.raw(), wait_millis(left)) };""",
+     """            // SAFETY: a live PCM, and a timeout that is never negative (`wait_millis`).
+            let waited = unsafe { snd_pcm_wait(self.pcm.raw(), -1) };""",
      AUDIO),
 
     ("lnx-audio-A6", "A", "an unstarted wait returns at once instead of running to its timeout",
@@ -136,10 +140,12 @@ ROWS = [
      """            SND_PCM_STATE_PREPARED => {""",
      HW_CARD),
 
+    # Anchored on the whole line since the wait's `set_avail_min(wanted.min(self.buffer_frames))`
+    # made the bare `.min(self.buffer_frames))` match twice.
     ("lnx-audio-B4", "B", "writable_frames keeps a period of headroom back from the caller",
      LINUX_RS,
-     """.min(self.buffer_frames))""",
-     """.min(self.buffer_frames - self.period_frames))""",
+     """        Ok(frames_u32(Uframes::try_from(avail).unwrap_or(0)).min(self.buffer_frames))""",
+     """        Ok(frames_u32(Uframes::try_from(avail).unwrap_or(0)).min(self.buffer_frames - self.period_frames))""",
      AUDIO),
 
     ("lnx-audio-B5", "B", "a running wait also sleeps its whole timeout out",

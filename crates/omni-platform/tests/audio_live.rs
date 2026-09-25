@@ -31,9 +31,11 @@
 //! must leave the free space where it was, on a stream that is not started, so that "unchanged"
 //! cannot be the device draining exactly as much as was wrongly queued.
 
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use omni_platform::audio::{AudioError, AudioOutput};
+use omni_platform::sampler::HostThread;
 
 /// The opt-in.
 const GATE: &str = "OMNI_AUDIO_LIVE_TESTS";
@@ -118,7 +120,7 @@ fn a_started_stream_drains_silence_at_its_rate_and_signals_for_more() {
     // The control: not started, so nothing drains and nothing signals. The wait runs to its
     // timeout and says so by returning what is free, which is nothing.
     let asked = Instant::now();
-    let idle = output.wait_writable(Duration::from_millis(100)).unwrap();
+    let idle = output.wait_writable(0, Duration::from_millis(100)).unwrap();
     let idled = asked.elapsed();
     assert_eq!(idle, 0, "an unstarted stream consumed audio");
     assert!(
@@ -167,7 +169,7 @@ fn a_started_stream_drains_silence_at_its_rate_and_signals_for_more() {
         let asked = Instant::now();
         let mut wakes = 0;
         let woke = loop {
-            let free = output.wait_writable(Duration::from_secs(2)).unwrap();
+            let free = output.wait_writable(0, Duration::from_secs(2)).unwrap();
             wakes += 1;
             if free > 0 {
                 break free;
@@ -240,4 +242,122 @@ fn a_write_larger_than_the_free_space_is_refused_and_writes_nothing() {
     // Dropped while running, so that `Drop`'s stop is exercised too; a crash in it fails the
     // process, which is the verdict (VERIFICATION entry 17).
     output.start().unwrap();
+}
+
+/// **A wait for more room than a period goes on until that much is free.** A full, started stream
+/// asked for four periods' room: the device wakes a waiter a period at a time, and the wait must
+/// not come back after the first wake with a period free (which is what a feeder that can only
+/// use four periods would then ask again for, at once). It comes back with at least four periods
+/// free, long before its timeout.
+#[test]
+#[ignore = "needs an audio output device: OMNI_AUDIO_LIVE_TESTS=1 cargo test -- --ignored"]
+fn a_wait_for_more_than_a_period_returns_with_that_much_free() {
+    require_gate();
+    let rate = open(0).format().sample_rate;
+    let mut output = open(rate / 2);
+    let period = output.period_frames();
+    let asked_for = 4 * period;
+    let driver = std::thread::spawn(move || {
+        let mut rounds = Vec::new();
+        for _ in 0..3 {
+            let free = output.writable_frames().unwrap();
+            output.write(&silence(&output, free)).unwrap();
+            output.start().unwrap();
+            let asked = Instant::now();
+            let free = output.wait_writable(asked_for, Duration::from_secs(2)).unwrap();
+            rounds.push((free, asked.elapsed()));
+        }
+        rounds
+    });
+    let rounds = driver.join().expect("the driving thread panicked; its message is above");
+    println!("period {period} at {rate} Hz; waits for {asked_for} frames came back with {rounds:?}");
+    for (free, waited) in rounds {
+        assert!(free >= asked_for, "a wait for {asked_for} came back with {free} free after {waited:?}");
+        assert!(waited < Duration::from_secs(1), "a wait for {asked_for} ran to its timeout ({waited:?})");
+    }
+}
+
+/// **More room than an unstarted stream has is not a reason to wait for ever, or to poll**: a wait
+/// for the whole buffer on a full stream that nothing drains runs to its timeout and answers what
+/// is free, which is nothing. Run on a thread with a deadline, so that a wait which never returned
+/// fails this test instead of hanging the run.
+#[test]
+#[ignore = "needs an audio output device: OMNI_AUDIO_LIVE_TESTS=1 cargo test -- --ignored"]
+fn a_wait_for_room_an_unstarted_stream_cannot_make_runs_to_its_timeout() {
+    require_gate();
+    let (done, answer) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = open(REQUEST_FRAMES);
+        let buffer = output.buffer_frames();
+        output.write(&silence(&output, buffer)).unwrap();
+        let asked = Instant::now();
+        let free = output.wait_writable(buffer, Duration::from_millis(100));
+        let _ = done.send((free, asked.elapsed()));
+    });
+    let (free, waited) = answer
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a 100 ms wait on an unstarted stream had not returned after 10 s");
+    assert_eq!(free, Ok(0), "an unstarted stream consumed audio");
+    assert!(
+        (Duration::from_millis(90)..Duration::from_secs(1)).contains(&waited),
+        "a 100 ms wait for room that cannot come took {waited:?}"
+    );
+}
+
+/// **A feeder that keeps less queued than the buffer holds is paced by the device, not spinning.**
+/// AAudio's shape as FMOD sets it (MEASURED on Linux: a 1,440-frame buffer size in a 9,120-frame
+/// buffer, a 480-frame burst): here a buffer size of three periods in a buffer of about a fifth of
+/// a second, a burst of one period, and each wait for the room a burst needs --
+/// `buffer - size + period` free. Over three seconds on its own thread the feeder writes about a
+/// burst per period and uses a small fraction of one processor. A wait that answered as soon as a
+/// period was free ran this loop flat out, because more than a period is always free here: one
+/// guest thread at 88-96 % of a core, for a whole Linux session.
+#[test]
+#[ignore = "needs an audio output device: OMNI_AUDIO_LIVE_TESTS=1 cargo test -- --ignored"]
+fn a_feeder_below_the_buffer_waits_for_its_burst_rather_than_spinning() {
+    require_gate();
+    let rate = open(0).format().sample_rate;
+    let mut output = open(rate / 5);
+    let (buffer, period) = (output.buffer_frames(), output.period_frames());
+    let size = 3 * period;
+    assert!(size + period < buffer, "buffer {buffer}, period {period}");
+    let wanted = buffer - size + period;
+    const RUN: Duration = Duration::from_secs(3);
+    let feeder = std::thread::spawn(move || {
+        output.write(&silence(&output, size)).unwrap();
+        output.start().unwrap();
+        let thread = HostThread::current().expect("this thread's CPU clock");
+        let (cpu_from, from) = (thread.cpu_time().unwrap(), Instant::now());
+        let (mut bursts, mut waits) = (0u64, 0u64);
+        let burst = silence(&output, period);
+        while from.elapsed() < RUN {
+            let free = output.wait_writable(wanted, Duration::from_millis(50)).unwrap();
+            waits += 1;
+            let mut allowed = size.saturating_sub(buffer - free);
+            while allowed >= period {
+                output.write(&burst).unwrap();
+                bursts += 1;
+                allowed -= period;
+            }
+        }
+        let (wall, cpu) = (from.elapsed(), thread.cpu_time().unwrap() - cpu_from);
+        output.stop().unwrap();
+        (bursts, waits, wall, cpu)
+    });
+    let (bursts, waits, wall, cpu) =
+        feeder.join().expect("the feeding thread panicked; its message is above");
+    let per_second = bursts as f64 / wall.as_secs_f64();
+    let expected = f64::from(rate) / f64::from(period);
+    let load = cpu.as_secs_f64() / wall.as_secs_f64();
+    println!(
+        "buffer {buffer}, size {size}, burst {period} at {rate} Hz: {bursts} bursts in {wall:?} \
+         ({per_second:.1}/s for {expected:.1}), {waits} waits, feeder CPU {cpu:?} ({:.2} % of the wall time)",
+        100.0 * load
+    );
+    assert!(
+        (0.75 * expected..=1.25 * expected).contains(&per_second),
+        "{per_second:.1} bursts/s where the device plays {expected:.1}"
+    );
+    assert!(load < 0.05, "the feeder used {cpu:?} of processor time in {wall:?}: it is polling");
+    assert!(waits <= 2 * bursts + 20, "{waits} waits for {bursts} bursts");
 }

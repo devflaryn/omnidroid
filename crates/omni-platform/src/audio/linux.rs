@@ -58,7 +58,8 @@
 //! 3. `snd_pcm_hw_params` installs them, and `snd_pcm_hw_params_current` + `get_*` read back what
 //!    was **granted**. That is what [`AudioOutput::format`], `buffer_frames` and `period_frames`
 //!    report.
-//! 4. sw params: `avail_min` one period (what `snd_pcm_wait` waits for), `start_threshold` the
+//! 4. sw params: `avail_min` one period (what `snd_pcm_wait` waits for, until a wait asks for
+//!    more: see "Waiting"), `start_threshold` the
 //!    boundary (a write never starts the stream -- [`start`](AudioOutput::start) does, as on
 //!    Windows), `stop_threshold` the buffer size (a stream that runs dry is an **xrun**, which is
 //!    seen, recovered and counted rather than played through silently).
@@ -88,12 +89,23 @@
 //!
 //! # Waiting
 //!
-//! `snd_pcm_wait` polls the PCM's descriptors until `avail >= avail_min` -- one period free -- or
-//! the timeout passes. A stream that is **not** started is not waited on at all: nothing consumes
-//! it, so nothing can free a period, and the seam's contract (a stream that has not been started
-//! does not signal; the wait runs to its timeout) is kept by sleeping the timeout out. ALSA's own
-//! poll would return at once on a prepared stream with room, which is the one place its answer and
-//! WASAPI's differ.
+//! `snd_pcm_wait` polls the PCM's descriptors until `avail >= avail_min` or the timeout passes.
+//! `avail_min` starts at one period and is **the frames the caller asked for**
+//! ([`AudioOutput::wait_writable`]'s `frames`, never less than a period), installed with
+//! `snd_pcm_sw_params` whenever it changes -- so the poll itself sleeps until that much is free.
+//! The poll is **level-triggered**: with `avail_min` left at a period, a caller that keeps less
+//! queued than the buffer holds (AAudio's buffer size below its capacity: MEASURED in the Pet
+//! Simulator 99 session, 1,440 of 9,120 frames with a 480-frame burst) always has a period free,
+//! so every wait returned at once and the feeding thread spun a whole core on `snd_pcm_wait` and
+//! `snd_pcm_avail`. WASAPI's event and Core Audio's semaphore fire once per period, which is why
+//! only this backend showed it. A wake with less than was asked for (a plugin that ignored
+//! `avail_min`) sleeps the time the missing frames take to play before polling again, so the wait
+//! can never become a spin whatever the host does.
+//!
+//! A stream that is **not** started is not waited on at all: nothing consumes it, so nothing can
+//! free a period, and the seam's contract (a stream that has not been started does not signal; the
+//! wait runs to its timeout) is kept by sleeping the timeout out. ALSA's own poll would return at
+//! once on a prepared stream with room, which is the one place its answer and WASAPI's differ.
 
 use core::cell::Cell;
 use core::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong};
@@ -313,8 +325,12 @@ const RESUME_WAIT: Duration = Duration::from_secs(1);
 /// device that does not make room in a whole buffer's time is not draining at all, and the write
 /// fails naming `snd_pcm_writei` and `EAGAIN` rather than blocking the thread for ever.
 fn write_wait(buffer_frames: u32, rate: u32) -> Duration {
-    Duration::from_secs_f64(f64::from(buffer_frames) / f64::from(rate.max(1)))
-        + Duration::from_millis(100)
+    play_time(buffer_frames, rate) + Duration::from_millis(100)
+}
+
+/// How long `frames` frames take to play at `rate`.
+fn play_time(frames: u32, rate: u32) -> Duration {
+    Duration::from_secs_f64(f64::from(frames) / f64::from(rate.max(1)))
 }
 
 /// A timeout as `snd_pcm_wait` milliseconds: **rounded up**, so that a wait asked for in
@@ -517,6 +533,8 @@ pub(super) struct AudioOutput {
     /// next write to start it.
     running: bool,
     counts: Cell<Recoveries>,
+    /// The `avail_min` installed: what `snd_pcm_wait` waits for. See this module's "Waiting".
+    avail_min: Cell<u32>,
 }
 
 // SAFETY: an ALSA PCM handle is not tied to the thread that opened it; alsa-lib's rule is only that
@@ -688,6 +706,7 @@ impl AudioOutput {
             period_frames,
             running: false,
             counts: Cell::new(Recoveries::default()),
+            avail_min: Cell::new(period_frames),
         })
     }
 
@@ -734,21 +753,61 @@ impl AudioOutput {
         Ok(frames_u32(Uframes::try_from(avail).unwrap_or(0)).min(self.buffer_frames))
     }
 
-    /// `snd_pcm_wait` on a started stream; the timeout slept out on one that is not. Then
+    /// `snd_pcm_wait` on a started stream, for `avail_min` = `frames` (at least a period, at most
+    /// the buffer); the timeout slept out on one that is not. Then
     /// [`AudioOutput::writable_frames`]. See this module's "Waiting".
-    pub(super) fn wait_writable(&self, timeout: Duration) -> AudioResult<u32> {
+    pub(super) fn wait_writable(&self, frames: u32, timeout: Duration) -> AudioResult<u32> {
         if !self.running {
             std::thread::sleep(timeout);
             return self.writable_frames("wait_writable");
         }
-        // SAFETY: a live PCM, and a timeout that is never negative (`wait_millis`).
-        let waited = unsafe { snd_pcm_wait(self.pcm.raw(), wait_millis(timeout)) };
-        if waited < 0 {
-            self.recover("wait_writable", "snd_pcm_wait", waited)?;
+        // Never below a period: alsa-lib raises a smaller `avail_min` to the period itself
+        // (MEASURED: a request of 0 reads back as 480), so this keeps `wanted` what is installed.
+        let wanted = frames.max(self.period_frames);
+        self.set_avail_min(wanted.min(self.buffer_frames))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            // SAFETY: a live PCM, and a timeout that is never negative (`wait_millis`).
+            let waited = unsafe { snd_pcm_wait(self.pcm.raw(), wait_millis(left)) };
+            if waited < 0 {
+                self.recover("wait_writable", "snd_pcm_wait", waited)?;
+            }
+            // 1 (`avail_min` is free), 0 (the timeout passed) and a recovered xrun all come here:
+            // the answer is what is writable now, unless the wake was short of what was asked.
+            let free = self.writable_frames("wait_writable")?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if free >= wanted || waited == 0 || left.is_zero() {
+                return Ok(free);
+            }
+            // Woken with less than `avail_min` free: the host did not honour it. Polling again
+            // now would answer at once again, so sleep until the missing frames have played.
+            std::thread::sleep(play_time(wanted - free, self.format.sample_rate).min(left));
         }
-        // 1 (a period is free) and 0 (the timeout passed) both come here: either way the answer is
-        // what is writable now.
-        self.writable_frames("wait_writable")
+    }
+
+    /// Install `frames` as `avail_min` -- what `snd_pcm_wait` waits for -- unless it already is.
+    /// `snd_pcm_sw_params` is a round trip to the plugin or the kernel, so it is made only when the
+    /// caller's threshold changes, not on every wait.
+    fn set_avail_min(&self, frames: u32) -> AudioResult<()> {
+        if self.avail_min.get() == frames {
+            return Ok(());
+        }
+        let sw = SwParams::new()?;
+        let (p, s) = (self.pcm.raw(), sw.raw());
+        // SAFETY: the live PCM and a live parameter block owned by `sw`, filled from the installed
+        // setup first so that only `avail_min` changes.
+        unsafe {
+            check("wait_writable", "snd_pcm_sw_params_current", snd_pcm_sw_params_current(p, s))?;
+            check(
+                "wait_writable",
+                "snd_pcm_sw_params_set_avail_min",
+                snd_pcm_sw_params_set_avail_min(p, s, Uframes::from(frames)),
+            )?;
+            check("wait_writable", "snd_pcm_sw_params", snd_pcm_sw_params(p, s))?;
+        }
+        self.avail_min.set(frames);
+        Ok(())
     }
 
     /// `snd_pcm_writei` until every frame is in, recovering an xrun or a suspend on the way, then
@@ -1069,7 +1128,7 @@ mod tests {
         for _ in 0..5 {
             fill(&mut output);
             let asked = Instant::now();
-            let free = output.wait_writable(timeout).unwrap();
+            let free = output.wait_writable(0, timeout).unwrap();
             let waited = asked.elapsed();
             took.push(waited);
             assert!(
@@ -1080,6 +1139,102 @@ mod tests {
         }
         println!("period {period} frames ({period_time:?}); five {timeout:?} waits took {took:?}");
         assert_eq!(output.recoveries(), Recoveries::default(), "a full buffer ran dry");
+    }
+
+    #[link(name = "asound")]
+    extern "C" {
+        fn snd_pcm_sw_params_get_avail_min(params: *const SndPcmSwParams, val: *mut Uframes) -> c_int;
+    }
+
+    /// The `avail_min` the PCM has installed, read back from it rather than from the backend's
+    /// cache of it.
+    fn installed_avail_min(output: &AudioOutput) -> u32 {
+        let sw = SwParams::new().unwrap();
+        let mut frames: Uframes = 0;
+        // SAFETY: the live PCM, a live parameter block, an out-pointer live for the call.
+        unsafe {
+            let current = snd_pcm_sw_params_current(output.pcm.raw(), sw.raw());
+            check("test", "snd_pcm_sw_params_current", current).unwrap();
+            let read = snd_pcm_sw_params_get_avail_min(sw.raw(), &mut frames);
+            check("test", "snd_pcm_sw_params_get_avail_min", read).unwrap();
+        }
+        frames_u32(frames)
+    }
+
+    /// This thread's processor time.
+    fn thread_cpu() -> Duration {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: an out-pointer live for the call.
+        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) }, 0);
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    fn fill(output: &mut AudioOutput) {
+        let channels = usize::from(output.format().channels);
+        let free = output.writable_frames("write").unwrap();
+        output.write(&vec![0.0; free as usize * channels], free).unwrap();
+    }
+
+    /// **A wait's frames become the PCM's `avail_min`** -- what `snd_pcm_wait` itself waits for --
+    /// read back from the PCM: one period from `open`, the frames asked for by a wait for more,
+    /// never less than a period and never more than the buffer. A wait for four periods on a full
+    /// running stream then comes back with four periods free.
+    #[test]
+    #[ignore = "needs an audio output device: OMNI_AUDIO_LIVE_TESTS=1 cargo test -- --ignored"]
+    fn a_wait_installs_the_frames_it_asks_for_as_avail_min() {
+        require_gate();
+        let mut output = AudioOutput::open(PREFERRED_RATE / 5).unwrap();
+        let (buffer, period) = (output.buffer_frames(), output.period_frames());
+        assert_eq!(installed_avail_min(&output), period, "open installs one period");
+        fill(&mut output);
+        output.start().unwrap();
+        let asked = Instant::now();
+        let free = output.wait_writable(4 * period, Duration::from_secs(2)).unwrap();
+        let waited = asked.elapsed();
+        println!(
+            "buffer {buffer}, period {period}: a wait for {} came back with {free} after {waited:?}",
+            4 * period
+        );
+        assert_eq!(installed_avail_min(&output), 4 * period);
+        assert!(free >= 4 * period, "{free} free after {waited:?}");
+        assert!(waited < Duration::from_secs(1), "the wait ran to its timeout: {waited:?}");
+        output.wait_writable(0, Duration::from_millis(20)).unwrap();
+        assert_eq!(installed_avail_min(&output), period, "never less than a period");
+        fill(&mut output);
+        output.wait_writable(2 * buffer, Duration::from_millis(20)).unwrap();
+        assert_eq!(installed_avail_min(&output), buffer, "never more than the buffer");
+        assert_eq!(output.recoveries(), Recoveries::default(), "a full buffer ran dry");
+    }
+
+    /// **A wake short of the frames asked for is slept through, not polled.** PipeWire's plugin
+    /// honours `avail_min`; this makes a host that does not, by putting the PCM's threshold back
+    /// to one period behind the backend's back (its cache still says the frames asked for), so
+    /// that `snd_pcm_wait` answers at once on every call. The wait must still come back only with
+    /// the room asked for, and must not spend the time that takes polling for it.
+    #[test]
+    #[ignore = "needs an audio output device: OMNI_AUDIO_LIVE_TESTS=1 cargo test -- --ignored"]
+    fn a_wake_short_of_the_frames_asked_for_is_slept_through_not_polled() {
+        require_gate();
+        let mut output = AudioOutput::open(PREFERRED_RATE / 5).unwrap();
+        let period = output.period_frames();
+        let wanted = 8 * period;
+        fill(&mut output);
+        output.start().unwrap();
+        output.set_avail_min(period).unwrap();
+        output.avail_min.set(wanted);
+        let mut rounds = Vec::new();
+        for _ in 0..3 {
+            fill(&mut output);
+            let (asked, cpu) = (Instant::now(), thread_cpu());
+            let free = output.wait_writable(wanted, Duration::from_secs(2)).unwrap();
+            let (waited, spent) = (asked.elapsed(), thread_cpu() - cpu);
+            assert_eq!(installed_avail_min(&output), period, "the host still wakes at a period");
+            assert!(free >= wanted, "{free} free after {waited:?}, for {wanted} asked");
+            assert!(waited < Duration::from_secs(1), "the wait ran to its timeout: {waited:?}");
+            assert!(spent * 5 < waited, "the wait used {spent:?} of processor time in {waited:?}: it polled");
+            rounds.push((free, waited, spent));
+        }
+        println!("period {period}, {wanted} asked, avail_min a period: (free, waited, CPU) {rounds:?}");
     }
 
     /// A write the device has no room for -- a full buffer, not started, so nothing will ever make
@@ -1182,7 +1337,7 @@ mod tests {
         };
         let mut feed = |output: &mut AudioOutput, written: &mut u64, until: Duration| {
             while started.elapsed() < until {
-                output.wait_writable(Duration::from_millis(100)).unwrap();
+                output.wait_writable(0, Duration::from_millis(100)).unwrap();
                 top_up(output, written);
             }
         };

@@ -74,8 +74,8 @@ impl AudioOutput {
     }
 
     /// Unreachable, as [`AudioOutput::format`].
-    pub(super) fn wait_writable(&self, timeout: Duration) -> AudioResult<u32> {
-        let _ = timeout;
+    pub(super) fn wait_writable(&self, frames: u32, timeout: Duration) -> AudioResult<u32> {
+        let _ = (frames, timeout);
         match *self {}
     }
 

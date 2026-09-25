@@ -160,4 +160,12 @@ ROWS = [
      """            sample_rate: device_format.sample_rate,""",
      """            sample_rate: device_format.sample_rate / 2.0,""",
      _AUDIO_CMD),
+
+    # The feeding loop's pacing (the `feed-` rows in tools/mutate.py): a wait goes on through the
+    # render callbacks' wakes until the frames asked for are free. Detector:
+    # `a_wait_for_more_than_a_period_returns_with_that_much_free` in tests/audio_live.rs.
+    ("mac-feed-A1", "A", "the Core Audio wait comes back after one wake with less room than asked for", _AUDIO,
+     """                if self.ring.free() >= frames {""",
+     """                if true {""",
+     _AUDIO_CMD),
 ]

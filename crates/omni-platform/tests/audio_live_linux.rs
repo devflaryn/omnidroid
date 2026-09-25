@@ -108,7 +108,7 @@ fn a_fed_stream_consumes_at_its_granted_rate_over_two_seconds() {
     let mut waits = 0u32;
     let mut feed_until = |output: &mut AudioOutput, written: &mut u64, until: Duration| {
         while started.elapsed() < until {
-            let free = output.wait_writable(Duration::from_millis(100)).unwrap();
+            let free = output.wait_writable(0, Duration::from_millis(100)).unwrap();
             waits += 1;
             output.write(&silence(output, free)).unwrap();
             *written += u64::from(free);
@@ -153,7 +153,7 @@ fn wait_writable_runs_to_its_timeout_unless_the_device_frees_a_period() {
     let timeout = Duration::from_millis(100);
 
     let asked = Instant::now();
-    let free = output.wait_writable(timeout).unwrap();
+    let free = output.wait_writable(0, timeout).unwrap();
     let empty_wait = asked.elapsed();
     assert_eq!(free, output.buffer_frames());
     assert!(
@@ -163,7 +163,7 @@ fn wait_writable_runs_to_its_timeout_unless_the_device_frees_a_period() {
 
     top_up(&mut output);
     let asked = Instant::now();
-    let free = output.wait_writable(timeout).unwrap();
+    let free = output.wait_writable(0, timeout).unwrap();
     let full_wait = asked.elapsed();
     assert_eq!(free, 0, "an unstarted stream consumed audio");
     assert!(
@@ -177,7 +177,7 @@ fn wait_writable_runs_to_its_timeout_unless_the_device_frees_a_period() {
     for _ in 0..5 {
         top_up(&mut output);
         let asked = Instant::now();
-        let free = output.wait_writable(Duration::from_secs(2)).unwrap();
+        let free = output.wait_writable(0, Duration::from_secs(2)).unwrap();
         let woke = asked.elapsed();
         wakes.push((woke, free));
         assert!(woke < Duration::from_millis(500), "a running wait took {woke:?}: no period freed");
@@ -223,7 +223,7 @@ fn an_xrun_is_recovered_counted_and_played_through() {
     assert_eq!(output.recoveries().xruns, 1, "draining after a refill is not an xrun");
 
     std::thread::sleep(dry);
-    let free = output.wait_writable(Duration::from_millis(100)).unwrap();
+    let free = output.wait_writable(0, Duration::from_millis(100)).unwrap();
     assert_eq!(free, buffer);
     assert_eq!(output.recoveries(), Recoveries { xruns: 2, suspends: 0 });
 

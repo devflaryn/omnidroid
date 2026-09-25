@@ -15,8 +15,9 @@
 //!   new read position, and signals a semaphore;
 //! * [`AudioOutput::writable_frames`] is the ring's free space, from the two positions;
 //! * [`AudioOutput::wait_writable`] waits on the semaphore -- the device consuming a period -- or
-//!   the timeout. Signals that piled up while nobody waited are collapsed after a wake, so a wait
-//!   behaves like the Windows backend's auto-reset event: at most one stale wake.
+//!   the timeout, and waits again while the ring has less free than the caller asked for.
+//!   Signals that piled up while nobody waited are collapsed after a wake, so a wait behaves like
+//!   the Windows backend's auto-reset event: at most one stale wake.
 //!
 //! The callback takes no lock and allocates nothing: two atomics, a copy, and
 //! `dispatch_semaphore_signal`, which is safe to call from a real-time thread.
@@ -376,14 +377,19 @@ impl AudioOutput {
         Ok(self.ring.free())
     }
 
-    pub(super) fn wait_writable(&self, timeout: Duration) -> AudioResult<u32> {
+    /// Wait on the semaphore -- a render callback, a period consumed -- and again, to the same
+    /// deadline, while fewer than `frames` are free.
+    pub(super) fn wait_writable(&self, frames: u32, timeout: Duration) -> AudioResult<u32> {
         let nanos = i64::try_from(timeout.as_nanos()).unwrap_or(i64::MAX);
         // SAFETY: libdispatch calls on the ring's live semaphore.
         unsafe {
             let deadline = dispatch_time(DISPATCH_TIME_NOW, nanos);
-            if dispatch_semaphore_wait(self.ring.wake, deadline) == 0 {
+            while dispatch_semaphore_wait(self.ring.wake, deadline) == 0 {
                 // Collapse the periods that passed unwatched into this one wake.
                 while dispatch_semaphore_wait(self.ring.wake, DISPATCH_TIME_NOW) == 0 {}
+                if self.ring.free() >= frames {
+                    break;
+                }
             }
         }
         Ok(self.ring.free())
