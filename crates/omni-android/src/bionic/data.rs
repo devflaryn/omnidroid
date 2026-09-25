@@ -233,9 +233,10 @@ pub(super) fn install(
     // POSIX-shaped code walks `environ` without checking it first, and a null there is a crash in
     // guest code rather than a refusal here. When a later phase gives the guest a real
     // environment, this is the cell that changes.
-    let empty_environ = bionic.reserve("environ", 8)?;
-    let environ = at("environ");
-    mem.write_u64(environ, empty_environ as u64, blame("environ", environ))?;
+    //
+    // The host may give it one ([`Bionic::set_env`]), before this runs or after, so the cell is
+    // recorded rather than written once: `environ` names what `getenv` finds.
+    bionic.set_environ_cell(at("environ"))?;
 
     let guard = at("__stack_chk_guard");
     mem.write_u64(guard, process.stack_guard, blame("__stack_chk_guard", guard))?;

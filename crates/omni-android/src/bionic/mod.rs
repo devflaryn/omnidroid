@@ -373,12 +373,16 @@ pub struct Bionic {
     /// The `static mbstate_t` each of bionic's conversion functions keeps for a NULL `ps`, one per
     /// function as bionic's are -- see [`MbStateOwner`].
     mbstate_private: OnceLock<GuestAddr>,
-    /// The guest's environment: the name, and the value interned in the pool.
+    /// The guest's environment: the name, and where its value is in the pool -- inside the
+    /// interned `NAME=VALUE` string `environ` points at, so the two cannot disagree.
     ///
     /// **Empty by default and that is a fact, not a gap** — this guest process was started with no
     /// environment, which is what the `environ` data object already says. The host fills it with
     /// [`Bionic::set_env`]. It is never the *host's* environment: see `procenv`'s module docs.
     env: Mutex<Vec<(Vec<u8>, GuestAddr)>>,
+    /// Where the guest's `char **environ` variable lives, once the data objects are installed; 0
+    /// before. [`Bionic::set_env`] points it at a new vector, so `environ` says what `getenv` does.
+    environ_cell: AtomicU64,
     /// The Android property table `__system_property_get` reads, empty by default for the same
     /// reason: there is no property service here.
     properties: Mutex<Vec<(Vec<u8>, String)>>,
@@ -687,6 +691,7 @@ impl Bionic {
             fs_device: OnceLock::new(),
             streams: Mutex::new(BTreeMap::new()),
             stdout_cell: AtomicU64::new(0),
+            environ_cell: AtomicU64::new(0),
             dirs: Mutex::new(BTreeMap::new()),
             thread_host: OnceLock::new(),
             guest_threads: Mutex::new(GuestThreads::default()),
@@ -818,11 +823,18 @@ impl Bionic {
 
     // ------------------------------------------------------------------ environment and properties
 
-    /// Give the guest an environment variable, visible to `getenv`.
+    /// Give the guest an environment variable, visible to `getenv` **and in `environ`**.
     ///
-    /// The **value** is copied into the adapter's pool, because `getenv` returns a pointer the
-    /// caller may hold indefinitely. Setting a name twice replaces the entry and leaves the old
-    /// value's pool bytes stranded — call this during setup, not in a loop.
+    /// `NAME=VALUE` is copied into the adapter's pool, because `getenv` returns a pointer the
+    /// caller may hold indefinitely; `getenv`'s answer points into that same string, as bionic's
+    /// does, and `environ` is pointed at a new vector naming every variable. Setting a name twice
+    /// replaces the entry and leaves the old bytes and vector stranded — call this during setup,
+    /// not in a loop.
+    ///
+    /// **Both, because code reads either.** DECODED: the engine's allocator (mimalloc, inside
+    /// `libroblox.so`) reads its `MIMALLOC_*` options by walking `environ` (`0x1db8e00`, through
+    /// the `environ` import) and never calls `getenv`, so a variable only `getenv` could see was
+    /// set for some of the guest and not for the rest.
     ///
     /// Call it **before any guest code runs**: it writes to the pool, and F9's constraint is that
     /// nothing maps or allocates guest memory from inside a handler.
@@ -842,13 +854,49 @@ impl Bionic {
                 ),
             });
         }
-        let at = self.intern("getenv", value.as_bytes())?;
-        let mut env = self.env.lock();
-        let key = name.as_bytes().to_vec();
-        match env.iter_mut().find(|(existing, _)| *existing == key) {
-            Some(entry) => entry.1 = at,
-            None => env.push((key, at)),
+        let entry = self.intern("getenv", format!("{name}={value}").as_bytes())?;
+        let at = entry + name.len() + 1;
+        {
+            let mut env = self.env.lock();
+            let key = name.as_bytes().to_vec();
+            match env.iter_mut().find(|(existing, _)| *existing == key) {
+                Some(entry) => entry.1 = at,
+                None => env.push((key, at)),
+            }
         }
+        self.publish_environ()
+    }
+
+    /// Record where the guest's `environ` variable lives, and point it at the environment.
+    pub(crate) fn set_environ_cell(&self, cell: GuestAddr) -> AbiResult<()> {
+        self.environ_cell.store(cell as u64, Ordering::Release);
+        self.publish_environ()
+    }
+
+    /// Point `environ` at a new null-terminated vector of this instance's `NAME=VALUE` strings,
+    /// in the order they were first set. Nothing to do before the data objects are installed:
+    /// [`set_environ_cell`](Self::set_environ_cell) publishes whatever was set by then.
+    ///
+    /// A new vector rather than one rewritten in place, because the guest may hold the old one;
+    /// with no variables it is one null -- the empty environment `environ` has always stated.
+    fn publish_environ(&self) -> AbiResult<()> {
+        let cell = match self.environ_cell.load(Ordering::Acquire) {
+            0 => return Ok(()),
+            cell => GuestAddr::try_from(cell).unwrap_or(usize::MAX),
+        };
+        // The value's address less `NAME=` is the entry: `set_env` interned it that way.
+        let entries: Vec<u8> = self
+            .env
+            .lock()
+            .iter()
+            .flat_map(|(name, at)| ((at - name.len() - 1) as u64).to_le_bytes())
+            .collect();
+        let vector = self.reserve("environ", entries.len() + 8)?;
+        let mem = GuestMem::new(Arc::clone(&self.space));
+        if !entries.is_empty() {
+            mem.write_bytes(vector, &entries, Blame::new("environ", vector, 0))?;
+        }
+        mem.write_u64(cell, vector as u64, Blame::new("environ", cell, 0))?;
         Ok(())
     }
 

@@ -966,6 +966,21 @@ impl Guest {
                 .set_system_property(name, &value)
                 .expect("a system property is a decision this gate makes");
         }
+        // **OMNI_GUEST_ENV: variables for the guest's own environment**, `NAME=VALUE` separated by
+        // `;` -- a measurement switch, never the host's environment (see `procenv`). Set before any
+        // guest code runs, and visible to `getenv` and in `environ` both. The use it exists for:
+        // the engine's allocator (mimalloc) reads `MIMALLOC_*` options from `environ` alone, so
+        // `OMNI_GUEST_ENV=MIMALLOC_PURGE_DELAY=-1` takes every `madvise` the heap makes out of a
+        // run -- the discriminator for heap corruption that is this layer's memory semantics.
+        if let Some(list) = std::env::var("OMNI_GUEST_ENV").ok().filter(|v| !v.is_empty()) {
+            for pair in list.split(';').map(str::trim).filter(|pair| !pair.is_empty()) {
+                let (name, value) = pair
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("OMNI_GUEST_ENV: {pair:?} is not NAME=VALUE"));
+                bionic.set_env(name, value).expect("a guest environment variable (OMNI_GUEST_ENV)");
+                let _ = writeln!(std::io::stderr(), "GUEST ENV: {name}={value} (OMNI_GUEST_ENV)");
+            }
+        }
         // **A created guest thread carries all three instances, not just bionic.**
         // MEASURED by an earlier run of this gate: without the NDK instance the game thread
         // `GameActivity_onCreate` spawns died on its first `AConfiguration_new`, never set

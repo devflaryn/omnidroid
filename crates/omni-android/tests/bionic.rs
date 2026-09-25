@@ -5592,6 +5592,49 @@ fn getenv_answers_null_until_the_host_gives_the_guest_a_variable() {
     assert!(f.bionic.set_env("A=B", "x").is_err());
 }
 
+/// **`environ` names every variable `getenv` finds, and `getenv`'s answer points into it.**
+///
+/// DECODED need: the engine's allocator (mimalloc) reads its `MIMALLOC_*` options by walking
+/// `environ` (`0x1db8e00`) and never calls `getenv`, so a variable only `getenv` could see was set
+/// for part of the guest and not for the rest. A `set_env` that left `environ` alone, a vector
+/// that was not null-terminated, or a `getenv` that answered a separate copy each fail here.
+#[test]
+fn environ_names_what_getenv_finds_and_getenv_points_into_it() {
+    let _guard = serialized();
+    // With the data objects installed, which is where `environ` lives.
+    let f = fixture_with(&[]);
+    let cell = f.thunk("environ");
+    let before = f.guest.read_u64(cell) as usize;
+    assert_eq!(f.guest.read_u64(before), 0, "no variable yet: the vector is one null");
+
+    f.bionic.set_env("MIMALLOC_PURGE_DELAY", "-1").expect("the pool has room");
+    f.bionic.set_env("OMNI_TEST", "a value").expect("the pool has room");
+    f.bionic.set_env("MIMALLOC_PURGE_DELAY", "0").expect("a second set replaces the first");
+
+    let vector = f.guest.read_u64(cell) as usize;
+    assert_ne!(vector, before, "a new vector, because the guest may still hold the old one");
+    let entries: Vec<Vec<u8>> = (0..)
+        .map(|k| f.guest.read_u64(vector + 8 * k) as usize)
+        .take_while(|&entry| entry != 0)
+        .take(8)
+        .map(|entry| f.read_cstring(entry))
+        .collect();
+    assert_eq!(
+        entries,
+        vec![b"MIMALLOC_PURGE_DELAY=0".to_vec(), b"OMNI_TEST=a value".to_vec()],
+        "every variable once, in the order first set, with its latest value, then the null"
+    );
+
+    let name = f.cstring(f.guest.data + 0x100, b"MIMALLOC_PURGE_DELAY");
+    let found = value_of(&f, "getenv", |asm| { asm.mov(0, name as u64); });
+    let first = f.guest.read_u64(vector) as usize;
+    assert_eq!(
+        found as usize,
+        first + b"MIMALLOC_PURGE_DELAY=".len(),
+        "getenv answers the value inside the string environ names, as bionic's does"
+    );
+}
+
 /// **The property table is empty until the host fills it**, and an oversized value is refused when
 /// it is set rather than truncated when it is read.
 #[test]
