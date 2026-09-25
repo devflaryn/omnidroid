@@ -820,23 +820,30 @@ fn believed_sysconf_name(name: i32) -> Option<&'static str> {
 /// the same source `getauxval(AT_PAGESZ)` answers from — so the two cannot disagree, which they
 /// could if this had its own constant. bionic implements `sysconf(_SC_PAGESIZE)` as
 /// `getauxval(AT_PAGESZ)` for exactly that reason.
-/// The processor count the guest is told: the host's, or fewer when `OMNI_GUEST_CPUS=<n>` asks
-/// for a device with `n` cores (never more than the host has).
+/// The processor count the guest is told: **at most 8** -- the host's count when it is smaller
+/// -- or what `OMNI_GUEST_CPUS=<n>` asks for (never more than the host has). D37.
 ///
-/// **A device property, like the screen's size.** The engine sizes its TaskScheduler from this
-/// answer (`TaskScheduler: 16` on a 24-thread host; a phone reports 8), and every worker it starts
-/// here is a guest thread with its own code cache that translates what it runs. The switch is
-/// read once and said on stderr.
+/// **A device property, like the screen's size and the RAM (D36).** The engine sizes its
+/// TaskScheduler from this answer (`TaskScheduler: 16` on a 24-thread host; `TaskScheduler: 8`
+/// when told 8, as an 8-core phone is), and every worker it starts here is a guest thread with
+/// its own code cache that translates what it runs. MEASURED in the Pet Simulator 99 world on
+/// Windows (w9 vs w7): told 8 instead of 24, the same settled frame rate (49.2 vs 48.2 fps) with
+/// 0.7 GiB less private memory (3.92 vs 4.65 GiB) and a shorter join (23 vs 26 s).
 fn guest_cpu_count(host: usize) -> usize {
-    static CHOSEN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let chosen = CHOSEN.get_or_init(|| {
-        let asked = std::env::var("OMNI_GUEST_CPUS").ok()?.trim().parse::<usize>().ok()?;
-        let n = asked.clamp(1, host);
-        eprintln!("CPUS: the guest is told {n} processor(s) (OMNI_GUEST_CPUS={asked}; the host has {host})");
-        Some(n)
-    });
-    chosen.unwrap_or(host)
+    static CHOSEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        let asked = std::env::var("OMNI_GUEST_CPUS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let n = asked.unwrap_or(DEVICE_CPUS).clamp(1, host);
+        eprintln!(
+            "CPUS: the guest is told {n} processor(s) ({}; the host has {host})",
+            asked.map_or_else(|| format!("a device of at most {DEVICE_CPUS}"), |a| format!("OMNI_GUEST_CPUS={a}"))
+        );
+        n
+    })
 }
+
+/// The most processors the guest is told by default. See [`guest_cpu_count`].
+pub const DEVICE_CPUS: usize = 8;
 
 pub(super) fn sysconf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let name = c.args().next_i32()?;

@@ -4395,3 +4395,23 @@ states a smaller device without a rebuild. If it is too mean, the engine picks a
 host could carry: lower-resolution textures and a smaller streaming budget, not a wrong answer; the
 same variable states a larger device. A host from which physical memory cannot be read fails the run
 at startup, naming the variable, rather than inventing a figure.
+
+## D37 -- The device has at most 8 processors
+
+**Decided 2026-09-25.** `sysconf(_SC_NPROCESSORS_CONF/ONLN)` answers at most 8 -- the host's count
+when smaller -- unless `OMNI_GUEST_CPUS=<n>` asks for another (never more than the host has).
+
+**Why.** Like the screen (the window) and the RAM (D36), the processor count is a property of the
+device the engine is told it runs on, and 8 is what the phones this APK targets have. The engine
+sizes its TaskScheduler from it: 16 workers on this project's 24-thread Windows host, 8 when told
+8. Each worker is a guest thread with its own translation cache, so every extra worker translates
+the same engine code again and holds its own copy.
+
+**Measured** (Pet Simulator 99, settled, Windows, n = 1 each): told 24 -> 48.2 fps, 4.65 GiB
+private, join 26 s (w7); told 8 -> 49.2 fps, 3.92 GiB, join 23 s (w9). macOS (8) and the Linux host
+(4) are unchanged by the default.
+
+**Trades nothing in correctness**: an 8-core device is an ordinary device, and the engine chooses
+its own pool for it. Cost if wrong: a host with more than 8 cores leaves parallelism unused if some
+workload needed more than 8 workers -- none measured did (the workers idle 55-80% in the world).
+

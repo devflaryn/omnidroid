@@ -4515,6 +4515,14 @@ directory", ADAPTER_FILES,
      """                (false && matches!(entry.os, OsState::Private { idle: true })).then_some((start, entry.len))""",
      ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "madv"]),
 
+    # D37 undone: the guest told the host's whole processor count (24 on the Windows host), so
+    # the engine starts twice the workers, each translating and holding the same code again.
+    ("devcpu-A1", "A", "the guest is told every host processor instead of an 8-core device",
+     "crates/omni-android/src/bionic/procenv.rs",
+     """        let n = asked.unwrap_or(DEVICE_CPUS).clamp(1, host);""",
+     """        let n = asked.unwrap_or(host).clamp(1, host);""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "the_process_symbols_answer"]),
+
     # ---- B: the over-corrections -----------------------------------------------------------
 
     # Every JNI slot on the exit path. It reads as safer -- a handler that *may* call guest code

@@ -92,7 +92,7 @@ pub use addrinfo::{
 };
 pub use net::{FD_SETSIZE, MAX_POLL_FDS};
 pub use omni_platform::log::Priority as LogPriority;
-pub use procenv::{HwcapPolicy, HWCAP_ATOMICS, PROP_VALUE_MAX};
+pub use procenv::{HwcapPolicy, DEVICE_CPUS, HWCAP_ATOMICS, PROP_VALUE_MAX};
 pub use runtime::{AddressFutex, CallThreads, HostClock, HostYield, ThreadSlot, ThreadTable};
 pub use threads::{
     DeathContext, FutexCall, GuestThreadFailure, GuestThreadState, GuestThreadSummary, ThreadHost,

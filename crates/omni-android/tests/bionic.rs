@@ -5518,6 +5518,12 @@ fn the_process_symbols_answer_what_is_known_and_refuse_the_rest() {
     let cpus = value_of(&f, "sysconf", |asm| { asm.mov(0, 0x61); });
     assert!(cpus >= 1, "_SC_NPROCESSORS_ONLN must be at least one: {cpus}");
     assert_eq!(value_of(&f, "sysconf", |asm| { asm.mov(0, 0x60); }), cpus, "_SC_NPROCESSORS_CONF");
+    // D37: the device has at most 8 processors (unless OMNI_GUEST_CPUS asks), and never more than
+    // the host has.
+    let host = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    if std::env::var_os("OMNI_GUEST_CPUS").is_none() {
+        assert_eq!(cpus, host.min(omni_android::bionic::DEVICE_CPUS as u64), "an 8-core device at most");
+    }
     // And still refuses the ones it does not know, naming the number and what it is believed to
     // be. `_SC_PHYS_PAGES` is refused **although a number is available**: it is the host's
     // physical memory, which is not the guest's budget.
