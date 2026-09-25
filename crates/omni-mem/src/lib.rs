@@ -60,6 +60,7 @@ mod budget;
 mod cache;
 mod entry;
 mod error;
+mod label;
 mod pager;
 mod region;
 mod space;
@@ -71,6 +72,7 @@ pub use arena::{
 pub use backing::{Backing, BackingId};
 pub use budget::CommitBudget;
 pub use error::{MemError, MemResult};
+pub use label::{label_scope, LabelScope, MapLabel};
 pub use access::{admit, admits_region, permits, scan_reach, Admitted, Refusal};
 pub use pager::{process_pager_totals, DemandPager, PagerStats};
 pub use region::{RegionInfo, RegionKind};

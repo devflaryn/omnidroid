@@ -668,6 +668,7 @@ impl GuestSpace {
             commit,
             backing: None,
             file_offset: 0,
+            label: crate::label::current(),
         };
         inner.map.replace(
             address,
@@ -760,6 +761,7 @@ impl GuestSpace {
             commit: CommitPolicy::Eager,
             backing: Some(Arc::clone(backing)),
             file_offset,
+            label: crate::label::current(),
         };
         inner.map.replace(
             address,
@@ -1100,6 +1102,15 @@ impl GuestSpace {
     #[must_use]
     pub fn mapped_regions(&self) -> Vec<RegionInfo> {
         self.read().regions(false)
+    }
+
+    /// Every mapped region, as [`mapped_regions`](GuestSpace::mapped_regions) gives them, each
+    /// with the [`MapLabel`](crate::MapLabel) of the mapping it belongs to -- who asked for it, as
+    /// the [`label_scope`](crate::label_scope) in force when it was mapped said. For a memory
+    /// report; nothing decides anything on a label.
+    #[must_use]
+    pub fn labelled_regions(&self) -> Vec<(RegionInfo, crate::MapLabel)> {
+        self.read().labelled_regions()
     }
 
     /// The region containing an address, if it is mapped.
@@ -2201,6 +2212,20 @@ impl Inner {
             match out.last_mut() {
                 Some(previous) if previous.can_absorb(&info) => previous.absorb(&info),
                 _ => out.push(info),
+            }
+        }
+        out
+    }
+
+    fn labelled_regions(&self) -> Vec<(RegionInfo, crate::MapLabel)> {
+        let mut out: Vec<(RegionInfo, crate::MapLabel)> = Vec::new();
+        for (start, entry) in self.map.iter() {
+            let Some(owner) = entry.owner.as_ref() else { continue };
+            let info = RegionInfo::from_entry(start, entry);
+            // `can_absorb` requires the same mapping, and so the same label.
+            match out.last_mut() {
+                Some((previous, _)) if previous.can_absorb(&info) => previous.absorb(&info),
+                _ => out.push((info, owner.label)),
             }
         }
         out

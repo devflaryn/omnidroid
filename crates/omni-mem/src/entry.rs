@@ -114,6 +114,9 @@ pub(crate) struct Owner {
     /// derived from it, because the correspondence is linear and stays linear when the mapping is
     /// carved up.
     pub(crate) file_offset: u64,
+    /// Who the mapping is for, from the [`crate::label_scope`] in force when it was made. Read by
+    /// [`crate::GuestSpace::labelled_regions`] and nothing else.
+    pub(crate) label: crate::MapLabel,
 }
 
 impl Owner {
