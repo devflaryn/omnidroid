@@ -182,6 +182,9 @@ JNI_INPUT = "crates/omni-android/src/jni/input.rs"
 # And `vk.g`, the hardware-key path, with the window seam's physical-key decode it depends on.
 JNI_KEYS = "crates/omni-android/src/jni/keys.rs"
 PLAT_WINDOW_WINDOWS = "crates/omni-platform/src/window/windows.rs"
+# The host window's state told to the activity: `jni::lifecycle`'s mapping and its safety net.
+JNI_LIFECYCLE = "crates/omni-android/src/jni/lifecycle.rs"
+VULKAN_MOD = "crates/omni-android/src/vulkan/mod.rs"
 # `/proc/meminfo` and `/proc/self/statm`: the adapter's two generated files, the seam's generated
 # file kind they are served through, and the process-memory snapshot `statm` is read from.
 ADAPTER_PROCFS = "crates/omni-android/src/bionic/procfs.rs"
@@ -7003,6 +7006,163 @@ directory", ADAPTER_FILES,
      """    let make = ((lparam >> 16) & 0xff) as u32;""",
      """    let make = ((lparam >> 16) & 0xffff) as u32;""",
      PLATFORM_LIB),
+
+    # ---- the host window's state, told to the activity: `jni::lifecycle` ---------------------------
+    #
+    # MEASURED (w26): a swapchain the driver called out of date, at an unchanged size, was never
+    # rebuilt, because the engine rebuilds only on a new window or a new extent (DECODED, the
+    # module header). Every row here is a mapping that reads as plausible and leaves that state.
+    #
+    # **A minimise that keeps the surface**: paused and stopped, but the window never taken, so the
+    # engine never gets `TERM_WINDOW` and the restore's `INIT_WINDOW` finds it still holding one.
+    ("hostwin-A1", "A", "paused in the background, a minimise pauses and stops but does not destroy the surface",
+     JNI_LIFECYCLE,
+     """        calls.extend([Call::Pause, Call::SurfaceDestroyed, Call::Stop, Call::TrimMemory(TRIM_MEMORY_UI_HIDDEN)]);""",
+     """        calls.extend([Call::Pause, Call::Stop, Call::TrimMemory(TRIM_MEMORY_UI_HIDDEN)]);""",
+     ANDROID_LIB),
+
+    # **A restore that re-sizes the old surface instead of giving a new one** -- the same-size
+    # `surfaceChanged` the decode says does nothing for a stale swapchain.
+    ("hostwin-A2", "A", "paused in the background, a restore sends surfaceChanged without surfaceCreated",
+     JNI_LIFECYCLE,
+     """        calls.extend([Call::SurfaceCreated, Call::SurfaceChanged { width, height }, Call::SurfaceRedrawNeeded]);""",
+     """        calls.extend([Call::SurfaceChanged { width, height }, Call::SurfaceRedrawNeeded]);""",
+     ANDROID_LIB),
+
+    # **The safety net's renewal as a same-size resize**: it fires, logs, and changes nothing.
+    ("hostwin-A3", "A", "a renewed surface is the old one resized to its own size",
+     JNI_LIFECYCLE,
+     """            Call::SurfaceDestroyed,
+            Call::SurfaceCreated,
+            Call::SurfaceChanged { width, height },""",
+     """            Call::SurfaceChanged { width, height },""",
+     ANDROID_LIB),
+
+    # **The process paused with the activity**, not 700 ms later: a restore inside that time then
+    # tells the engine the app went inactive and came back, which a device never does.
+    ("hostwin-A4", "A", "the process's pause is not delayed",
+     JNI_LIFECYCLE,
+     """            if !self.front && now.saturating_duration_since(paused) >= PROCESS_PAUSE_DELAY {""",
+     """            if !self.front && now.saturating_duration_since(paused) >= Duration::ZERO {""",
+     ANDROID_LIB),
+
+    # **A sent pause never answered**: the engine's process stays `setInactive`/`setHidden` after
+    # the app is back in the front.
+    ("hostwin-A5", "A", "a restore does not resume a process whose pause was sent",
+     JNI_LIFECYCLE,
+     """        if self.process_paused {
+            calls.push(Call::Process(ProcessEvent::Resume));""",
+     """        if false {
+            calls.push(Call::Process(ProcessEvent::Resume));""",
+     ANDROID_LIB),
+
+    # **Over-correction: the focus told on every host focus event**, including the ones that say
+    # what the activity already has -- a second `GAINED_FOCUS` on each click into the window.
+    ("hostwin-B1", "B", "the focus is told again when the activity already has it",
+     JNI_LIFECYCLE,
+     """                if focused == self.focus_told {""",
+     """                if false {""",
+     ANDROID_LIB),
+
+    # **Over-correction: the net keeps a run that frames ended**, and renews the surface under an
+    # engine that handled its own resize.
+    ("hostwin-B2", "B", "an out-of-date run is not ended by frames",
+     JNI_LIFECYCLE,
+     """        if presented && !answered {""",
+     """        if presented && !answered && false {""",
+     ANDROID_LIB),
+
+    # **Over-correction: the net runs without the focus** (OMNI_FOLLOW_FOCUS), when the engine's
+    # game thread is not ticking and no present is due.
+    ("hostwin-B3", "B", "the safety net runs while the activity does not have the focus",
+     JNI_LIFECYCLE,
+     """        if !self.front || self.minimized || !self.focus_told {""",
+     """        if !self.front || self.minimized {""",
+     ANDROID_LIB),
+
+    # **Over-correction: the net runs while minimised**: a window with no pixels answers out of
+    # date on every acquire, and the net would tear the surface down every few seconds for as long
+    # as an instance sits minimised -- 30 of them at once in the many-instance case.
+    ("hostwin-B5", "B", "the safety net runs while the window is minimised",
+     JNI_LIFECYCLE,
+     """        if !self.front || self.minimized || !self.focus_told {""",
+     """        if !self.front || !self.focus_told {""",
+     ANDROID_LIB),
+
+    # **The device's pause made the default**: a minimised instance stops playing, which the
+    # product (several instances, most minimised) cannot have.
+    ("hostwin-A7", "A", "a minimise pauses the instance without OMNI_PAUSE_IN_BACKGROUND",
+     JNI_LIFECYCLE,
+     """                if self.policy.pause_in_background {
+                    return self.send_to_background(width, height, now, how);""",
+     """                if true {
+                    return self.send_to_background(width, height, now, how);""",
+     ANDROID_LIB),
+
+    # **The focus told by default**: an instance behind another window stops ticking.
+    ("hostwin-A8", "A", "the focus is told without OMNI_FOLLOW_FOCUS",
+     JNI_LIFECYCLE,
+     """                if !self.policy.follow_focus {""",
+     """                if false {""",
+     ANDROID_LIB),
+
+    # **A restore that leaves the capabilities withheld**: the instance plays on and never draws
+    # again.
+    ("hostwin-A9", "A", "a restore of a playing instance does not answer the surface's capabilities again",
+     JNI_LIFECYCLE,
+     """                let mut calls = vec![Call::WithholdSurface(false)];""",
+     """                let mut calls = Vec::new();""",
+     ANDROID_LIB),
+
+    # **A minimise that withholds nothing**: the instance goes on recording and submitting every
+    # frame into the fallback framebuffer (DECODED: 0x2790b64, 0x28250f4) -- the whole GPU cost of
+    # a window nobody can see, times the instances minimised.
+    ("hostwin-A10", "A", "a minimise does not withhold the surface's capabilities",
+     JNI_LIFECYCLE,
+     """                    vec![Call::WithholdSurface(true)],
+                )""",
+     """                    Vec::new(),
+                )""",
+     ANDROID_LIB),
+
+    # **The safety net's first answer made the heavy one**: a new surface pauses the experience
+    # while the engine's own rebuild would have done.
+    ("hostwin-B6", "B", "the safety net's first renewal is a new surface rather than the engine's rebuild",
+     JNI_LIFECYCLE,
+     """        let first = watch.bound == OUT_OF_DATE_BOUND;""",
+     """        let first = false;""",
+     ANDROID_LIB),
+
+    # **A one-shot withhold that is never used up**: the engine destroys the framebuffer its rebuild
+    # just made, every frame, and draws nothing from then on.
+    ("hostwin-A11", "A", "a one-shot withheld capabilities query is not consumed",
+     VULKAN_MOD,
+     """        let withheld = state.surface_withheld || core::mem::take(&mut state.withhold_once);""",
+     """        let withheld = state.surface_withheld || state.withhold_once;""",
+     VULKAN),
+
+    # **The withhold ignored**: the driver answers, and a minimised instance draws on.
+    ("hostwin-A12", "A", "a withheld capabilities query asks the driver anyway",
+     "crates/omni-android/src/vulkan/physical.rs",
+     """    if vulkan.take_surface_withheld() {""",
+     """    if false && vulkan.take_surface_withheld() {""",
+     VULKAN),
+
+    # **Over-correction: no back-off**: under an exclusive full-screen game that holds the display,
+    # the surface is torn down and rebuilt every two seconds.
+    ("hostwin-B4", "B", "the safety net's bound does not grow after a renewal that did not help",
+     JNI_LIFECYCLE,
+     """        watch.bound = (watch.bound * 2).min(OUT_OF_DATE_BOUND_MAX);""",
+     """        watch.bound = OUT_OF_DATE_BOUND;""",
+     ANDROID_LIB),
+
+    # **The out-of-date count counting another code**: the net would watch `VK_SUBOPTIMAL_KHR`,
+    # which a working swapchain answers after every resize on MoltenVK.
+    ("hostwin-A6", "A", "the driver's out-of-date count counts VK_SUBOPTIMAL_KHR instead",
+     VULKAN_MOD,
+     """        if result == swapchain::VK_ERROR_OUT_OF_DATE_KHR {""",
+     """        if result == swapchain::VK_SUBOPTIMAL_KHR {""",
+     VULKAN),
 
     # ---- `/proc/meminfo` and `/proc/self/statm` ------------------------------------------------
     # MEASURED: every gate run logged `Failed to open` for both, many times a second. The engine

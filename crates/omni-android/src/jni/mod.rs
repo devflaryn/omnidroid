@@ -26,6 +26,7 @@
 //! | [`input`] | §8 row 26: `vk.e.onTouch`, host pointer events to `nativePassInput` |
 //! | [`keys`] | `vk.g`, host keys to `nativePassKeyEvent`, for a declared hardware keyboard |
 //! | [`text`] | `RbxKeyboard`, host typing into the engine's focused `TextBox` |
+//! | [`lifecycle`] | the host window's state to the activity's lifecycle callbacks |
 //!
 //! # Only what the engine uses, and the rest refuse by name
 //!
@@ -49,6 +50,7 @@ pub mod cookies;
 pub mod env;
 pub mod input;
 pub mod keys;
+pub mod lifecycle;
 pub mod mouse;
 pub mod pool;
 pub mod refs;
