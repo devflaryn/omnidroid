@@ -5,6 +5,174 @@ snapshot, not a history. The durable sources of truth are `docs/ARCHITECTURE.md`
 `docs/DECISIONS.md`, `docs/STATUS.md`, **`docs/VERIFICATION.md`**, the M3 plan and ledger, and git
 history.
 
+## Multi-instance: the owner's two use cases
+
+Written 2026-09-25 on `unified` after `4f33941` (the commits are listed at the end of this
+section). The owner named the two products the runtime has to serve:
+
+* **A -- gaming:** 3-4 instances at once on a good PC, each at high quality and high fps.
+* **B -- farming:** 30-35 instances at once on the same PC (this Windows host: 24 hardware
+  threads, 31.8 GB), lowest quality, fps capped. Only per-instance RAM and CPU matter. That is
+  **under ~0.8-0.9 GiB resident** (30 x 0.9 GiB already fills the RAM the desktop leaves) and
+  **well under 0.7 of a core** (24 threads / 35) per instance -- against ~3.2 GiB and ~2.4 cores
+  today (the shared translation cache is the default since `b934fc1`).
+
+A is already in reach (4 x 3.2 GiB = 13 GiB and 4 x 2.4 = 9.6 of 24 cores, with the shared
+translation cache that also ended the input stalls). **B needs a ~3.5x cut in memory and ~4x in
+CPU**, and this section is the plan for it.
+
+### One instance today, in the PS99 world (measured, `OMNI_PERF` logs in the session scratchpad)
+
+| host, run | private (commit charge) | resident | cores | fps |
+|---|---|---|---|---|
+| **Windows w27, w29, w30 (shared translation cache, the default; `d30b583`/`4f33941`)** | **3.18-3.23 GiB** | **2.80-2.83 GiB** | **2.35-2.45** | 48-52 |
+| Windows w28 (per-thread caches, `d30b583`) / w19, w25, w26 | 4.03 / 3.9-4.2 GiB | 3.60 / 3.5-3.8 GiB | ~1.7-2.1 | 46-53 |
+| Windows w22, w24 (shared, `8e67e7a`, input A/B) | 2.59-2.75 GiB | 2.16-2.33 GiB | 1.2-2.4 | -- |
+| macOS m4/m5 (default) / m6 (`SavedQualityLevel` 1) | 2.71-2.74 / 2.77 GiB (`phys_footprint`) | same | 4.35-4.51 / 3.51 | 34 / 43 |
+| Linux l3 (default) / l5 (quality 1) / l9 | 3.77 / 3.78 / 3.8-4.0 GiB (`VM_ACCOUNT`) | 2.7-3.0 GiB | ~1.9 | GPU-bound |
+
+### Where one instance's memory goes -- what offline measurement established
+
+| owner | how much | how it is known | shared across instances? |
+|---|---|---|---|
+| **per-thread translation caches** (dynarmic `BlockOfCode`: a 32 MiB cap per guest thread, `CODE_CACHE_BYTES`; committed as code is emitted -- `EnsureMemoryCommitted` -- and never decommitted, even by a whole-cache clear) and their C++ block tables -- **replaced by one shared cache per instance, the default since `b934fc1`** | per-thread: **~1.1 GiB**; shared: **247 MiB** committed (`PERF jit cache:`, w27) -- a net **-0.8 to -0.85 GiB** | the same commit (`d30b583`) and scene: w28 4.03 GiB against w27/w29 3.18-3.23 GiB at +285 s (the earlier pairs w21/w22 and w23/w24, on `8e67e7a`, differed by ~1.45 GiB); 57 guest threads | no (per process) |
+| `libroblox.so` text/rodata | 99.4 MiB mapped, resident as touched | ELF program headers; mapped `ReadExecute` from **one** extracted file per checkout (`target/omni-elf-fixtures/extraction-cache`, hard-linked into each account's storage -- link count 4 measured) | **yes, already**: every instance maps the same file and the OS shares its page cache (Windows data-file sections of one file share pages; a `ReadExecute` view is never privatised). Nothing to gain |
+| `libroblox.so` private part | **16.4 MiB**: relro 4.98 (relocated, so copy-on-write), `.data` 0.33, `.bss` 11.05 (eager) | ELF program headers; the loader's `LoadStats` | no (as on a device) |
+| the APK itself | `libroblox.so` is **deflated** (104.7 -> 44.6 MiB) at data offset 85,310,252 (not page-aligned), so it **cannot** be mapped from the APK; it is extracted once, as a device's installer does. Stored assets (60.5 MiB) are read out of the APK into a buffer per open asset (`AAsset_read`, `AAsset_getBuffer`), or handed over as a descriptor on the APK (`AAsset_openFileDescriptor`: the 14.0 MiB `shaders_vulkan_mobile.pack`) | `zipfile` over `Roblox-2.739.691.apk` | the extracted file: yes |
+| **shader packs** | the engine inflates the 14.0 MiB pack into **82.8 MB** of shaders ("Loaded 2919 shaders from pack vulkan_mobile ... (82816331 bytes)") **twice** (+9 s and +29 s: two graphics-device creations) -- into its own heap | the engine's `FLog::Graphics` lines, w26 | no; whether the first copy is freed is what the report's engine-heap row answers |
+| assets through `AAsset_getBuffer` | 41 MiB mapped over a whole w26 session (151 buffers, each unmapped at `AAsset_close`); 148 MiB opened in all (the 1.3 MiB zstd dictionary 42 times) -- transient: an open asset holds a host copy until closed | the gate's `ASSET` lines, w26 | no |
+| Vulkan host-visible memory (guest memory the driver imports, one copy) | **22 MiB live, 36 MiB peak** | the teardown line "guest memory imported for Vulkan: 11 live import(s) holding 23068672 byte(s), peak 37748736" (w26) | no |
+| guest thread stacks | lazily committed, 64 KiB granules, only what a thread touches (1 MiB default, 8 MiB main thread) -- **a deep frame that is probed page by page commits all of it** | `bionic/threads.rs` (`CommitPolicy::Lazy`) | no |
+| host thread stacks | Rust's 2 MiB reservation per thread, committed by the OS's guard page as it grows | std | no |
+| the commit granule | commit charge exceeds the working set by ~0.4 GiB on Windows (3.20 vs 2.82 GiB, w30): a 64 KiB granule is committed whole for one touched page | `OMNI_PERF` | -- |
+| **the engine's heap** (mimalloc v3 through guest `mmap`, `d30b583`'s decode; the library imports no allocator) and this runtime's own host heap | the rest: **~2.7-2.9 GiB** of w30's 3.2 (the Mac, per-thread caches but `phys_footprint`, 2.7-2.8 in all) | inferred by subtraction -- **`OMNI_MEM_REPORT` measures both, apart** | no |
+| the engine's own count (at Home, logged out, 2026-09-24) | `CpuMem` 415 MiB, `GpuMem` 143 MiB, `totalknown` 320 MiB (high water 771 MiB) | `memProfStorage46948.json` in an account's storage | -- |
+
+### `OMNI_MEM_REPORT`: the rest of the table, from a live run
+
+Built (`omni_android::memreport`). `OMNI_MEM_REPORT=1` prints a `MEMREPORT` table at +60 s,
++180 s and then every 300 s (`=<s>,<s>,...` at chosen seconds, `=every:<s>`). Each row is an owner
+with **mapped**, **committed** (private commit charge), **resident** and **private-resident**
+MiB, and a count:
+
+* **guest rows**, from the region map, each guest mapping labelled by whoever mapped it
+  (`omni_mem::label_scope`): the engine's anonymous `mmap`s **by guest call site** (as
+  `libroblox.so+0x...`, so the heap's owners can be decoded), the engine's read-only file `mmap`s
+  (served as private copies -- the one mapping kind where this layer costs more than a device),
+  `MAP_SHARED` file views, the library, guest thread stacks (with the largest stacks named),
+  Vulkan host-visible memory, GLES shadows, asset buffers, AAudio buffers, and this runtime's own
+  unlabelled structures; plus a cross-check of the space's commit per the region map and per the
+  OS;
+* **host rows**, from the OS's region walk: JIT code caches (private executable memory, with the
+  shared cache's own figure), host thread stacks, other private memory (the C heaps' own totals --
+  Rust, C/C++ including dynarmic's tables, drivers -- this runtime's **live Rust heap** counted by
+  the gate's `CountingAllocator` only while the switch is set, and the largest allocations),
+  images (DLLs by name) and mapped files;
+* the total, what is left unattributed (page tables, copy-on-write views), and **the engine's own
+  count** from the newest `memProfStorage*.json` in the app's storage.
+
+Windows and Linux have the host side (on Linux a thread's stack is found by its stack pointer, so a
+thread running at that instant has its stack counted as other private memory); macOS prints the
+guest side and says the host side is missing (the census refuses there by name). A report takes
+tens of milliseconds and nothing is measured between reports.
+
+### What the engine sizes from the device -- decoded (link addresses, 2.739.691)
+
+* **One number sizes its caches: total RAM, from `sysconf(_SC_PHYS_PAGES) * _SC_PAGE_SIZE`**
+  (`0x22a9108`, once `FFlagUseMemoryStatsTotalMemoryBytes` is on, as it is), which is our
+  `OMNI_GUEST_MEMORY_MB` / D36 figure. Before flags load it reads `DeviceParams.deviceTotalMemoryMB`
+  (still a constant 2048 in `jni/classes.rs`; several callers keep their first answer, so all RAM
+  facts should agree -- a one-line fix to make it follow D36, left for an A/B because early
+  callers cache it).
+* **Texture cache budget** (`TextureManager2`, `0x25e257c`): `FStringRenderTextureBudgetByRam` =
+  <= 1 GiB 32 MB, <= 2 GiB 48 MB, <= 3 GiB **72 MB**, <= 4 GiB 512 MB, **<= 8 GiB 680 MB**, <= 16 GiB
+  1536 MB.
+* **Texture resolution** (`0x3524198`, `0x354b510`): the top mip levels are skipped by RAM tier --
+  <= 2048 MB three, <= 3072 MB two, <= 4096 MB one (non-albedo one more; never below 64 px);
+  `FStringMaxCloudAssetDimensionByRam` caps cloud assets at 1024 px at <= 3584 MB.
+* **Harmony (PerformanceControl)** keeps a RAM-bucketed reserve and reads `MemAvailable` from
+  `/proc/meminfo` (`0x22a24a4`) to lower texture quality, streaming distance, sound cache and the
+  menu app under pressure; below ~350 MB available it drops everything to minimum.
+* `isLowRamDevice`, `memoryClass`, `largeMemoryClass` are **telemetry only** (read by one getter
+  that fills the memory-profile record). `InitParams.isPotato` means **Android TV**
+  (`android.software.leanback`), not a low-end phone: keep it false.
+* `SavedQualityLevel` never sets the texture quality level (only the override flags and Harmony
+  do): quality 1 saves GPU and per-frame CPU work, not memory -- which m6 and l5 measured (memory
+  unchanged; Mac per-frame CPU 0.128 -> 0.082 core-seconds, -36%).
+
+### The plan for B, ranked by expected saving per instance
+
+| # | lever | expected saving | cost | risk | state |
+|---|---|---|---|---|---|
+| 1 | **one translation cache per instance** (D38) | **-0.8 to -0.85 GiB** (measured, above); each block translated once, not per thread -- the input stalls gone (w27/w29) | -- | -- | **done: the default on x64 since `b934fc1`** (the Mac keeps per-thread caches) |
+| 2 | **report a 3 GiB device** (`OMNI_GUEST_MEMORY_MB=3072`) | texture cache 680 -> 72 MB, textures at 1/16 of the texels, cloud assets <= 1024 px, SQLite's low-end cache. **On this host the textures are GPU memory**: the saving is VRAM first (35 x 680 MB is three times the RTX 4060's 8 GB, and WDDM pages the overflow into system RAM), process RAM only as far as the engine keeps CPU-side copies -- M3's engine-heap row and the engine's own `GpuMem` say how much of each | a switch | the commit ceiling is the device's RAM (D36): an engine heap plus host-visible memory over 3 GiB fails `mmap` and takes the engine's OOM path -- the report shows the headroom; blurry textures (fine for B) | built (D36) |
+| 2b | the same at 2 GiB (`=2048`) | texture cache 48 MB, 1/64 of the texels | a switch | a 2 GiB commit ceiling may be below the heap the world needs; device capture off (< 2862 MB) | built; run after 2 |
+| 3 | **an fps cap from underneath** (`OMNI_FPS_CAP=<fps>`) | the render thread and every per-frame job run at the cap: at 10 fps from ~50, most of the ~2.4 cores (Windows per-frame CPU ~0.049 core-s at 49 fps, w30); a fixed part (network, the looper's wakes, audio) remains -- expected **~0.4-0.7 cores** | small (done) | none on correctness: every frame is presented, later (deadline schedule, no burst after a stall) | **built** (`omni_android::pacing`, both present paths) |
+| 4 | **lowest graphics** (`OMNI_GRAPHICS_QUALITY=1`) | **-36% CPU per frame** (Mac m4/m5 -> m6); no memory | small (done) | none: the game's own saved setting, where its menu writes it | **built** (edits an existing `GlobalBasicSettings_13.xml`; a fresh storage gets it from its second launch) |
+| 5 | **audio off** (`OMNI_AUDIO=off`) | the AAudio feed thread and host output stream; FMOD's NOSOUND fallback (every windowless session's path) -- small, to measure | small (done) | none known: the windowless path | **built** |
+| 6 | fewer guest CPUs (`OMNI_GUEST_CPUS=2..4`) with #1 | fewer TaskScheduler workers: fewer threads, stacks, wakes, and less contention between 35 instances; with per-thread caches 4 CPUs was far worse (w21: translation), with a shared cache that cost is gone | a switch | lower fps per instance (acceptable in B) | built; measure |
+| 7 | a longer looper idle wait (`OMNI_LOOPER_IDLE_US=4000`) | the game thread's 1,000 wakes/s -> 250/s per instance (35,000/s machine-wide at 1 ms) | a switch | input latency <= 4 ms, invisible at 10 fps | built; measure |
+| 8 | the engine's read-only file `mmap`s as real read-only views (page cache) rather than private copies | whatever the report's "engine read-only file mmap" row shows, times 35 | small-moderate (`bionic/guestmem.rs`: `Backing::open` + `map_file` for `PROT_READ`; the "snapshot" semantics stay right while nothing writes the file) | a file written while mapped would now show the write (Linux behaviour) | measure first |
+| 9 | a smaller commit granule for the engine's heap (64 -> 16 KiB) | part of the ~0.4 GiB commit-over-resident gap -- commit charge, not RAM: matters for 35 instances' pagefile (35 x 0.4 = 14 GiB) | small (`GuestSpaceConfig::commit_granule` per mapping) | 4x the pager faults for a dense heap (150 -> 596 ns/page, measured in `space.rs`) | measure the gap first |
+| 10 | a persistent on-disk translation cache | startup: translation off launch -> Home and join -> loaded, a burst every instance pays and 35 starting together pay at once; memory: if the file is mapped copy-on-write at a fixed address, the OS shares it (tens to ~150 MiB per instance) | **1.5-2.5k lines of C++ and 300-500 of Rust**: every host call through a per-process table (`[r15+od_image_base]`), a fixed-layout prelude, blocks serialised with offsets, the guest space and the library at fixed addresses (guest PCs are immediates nobody records), keys over the library hash, build and CPU features | stale or corrupt code runs wrong (keys and checksums); executing code from a user-writable file; a fixed address can collide | after 1-3; first measure `fetched` at Home and at loaded to size the win |
+| 11 | a live translation cache shared across processes | no more than #10's mapped file gives | 4-6k lines (0022's design again, across processes) | one instance crashing with the lock held stalls all; one corrupted instance writes code the others run | **not recommended** |
+| 12 | `onTrimMemory(15)` after the join (the Java side's `nativeAppBridgeV2OnLowMemory`: unloads the menu app) | the Lua menu app's heap, which stays loaded in a game (`LuaAppRunningWhileInExperience` 1 in the engine's profile) -- possibly hundreds of MB, the report's engine-heap sites will say | small | the menu reloads when the player leaves | decode done; measure |
+
+**What stays where it is**: `libroblox.so`'s text is already shared (above); `isPotato`,
+`isLowRamDevice` and the memory classes do nothing for memory.
+
+**Expected B instance after 1-7** (to be confirmed by the runs below): 3.2 GiB today with #1;
+#2 shows mostly in VRAM; so **~2.5-3 GiB of process memory, not yet 1 GiB**. The rest has to come out
+of the engine heap itself -- its largest call sites (the report names them, as link addresses to
+decode), the menu app (#12), the shader sets (inflated twice) -- and #8-#9. CPU ~0.3-0.6 cores with
+#3-#7. Also open: the engine sets `caps.videoMemory = 67108864` (64 MiB) on this host ("VULKAN
+unifiedMemory = false, device memory = 8567914496 ... setting caps.videoMemory = 67108864", w26),
+which may already be limiting what it keeps on the GPU -- not decoded.
+
+### Case A
+
+Per-thread caches cost ~0.85 GiB and the input stalls (every worker translating new code
+again); the shared cache (#1, now the default) removed both, the one change A and B share. Nothing
+else in the plan is for A: high quality keeps the 8 GiB device and no cap. Many windows at once:
+an unfocused or minimised instance keeps playing (`beef41a`, `8cc3f91`), a minimised one draws
+nothing -- and, with a cap, still ticks at the cap (`7621db5`).
+
+### The live runs that fill the table (Windows first; one run at a time)
+
+Each from the cookies folder, as the brief's `play` command, 12 minutes (`--minutes 12`), in
+PowerShell with the switches set first -- e.g.
+`$env:OMNI_MEM_REPORT='1'; $env:OMNI_PERF='30'; $env:OMNI_PERF_SAMPLE='0'; <checkout>\target\release\omnidroid play --cookie <file> --place 8737899170 --minutes 12`
+(`OMNI_PERF_SAMPLE=0`, in every run, keeps the sampler's own 3-10% of a core out of the CPU
+figures). Clear each `$env:` switch before the next run. M7 needs one account per instance: one
+account's cookie in two sessions at once is not something to try.
+
+| run | switches | fills |
+|---|---|---|
+| **M1** | `OMNI_MEM_REPORT=1 OMNI_PERF=30` (defaults otherwise) | the per-owner table for today's instance: the engine heap by call site, stacks, the shared JIT cache, heaps, the engine's own count |
+| **M2** | M1, minimised from +120 s | a minimised instance's CPU and memory with no cap (the engine's own 60 Hz, nothing drawn) |
+| **M3** | M1 + `OMNI_GUEST_MEMORY_MB=3072` | #2: the texture budget's effect on the engine heap, and the headroom under a 3 GiB ceiling |
+| **M4** | M3 + `OMNI_FPS_CAP=10 OMNI_GRAPHICS_QUALITY=1 OMNI_AUDIO=off`, visible, then minimised from +300 s | #3-#5: **the B instance** -- private, resident and cores at +300 s after `onGameLoaded`, and again minimised |
+| **M5** | M4 + `OMNI_GUEST_MEMORY_MB=2048` | #2b (watch for `mmap` failures and the engine's low-memory lines) |
+| **M6** | M4 + `OMNI_GUEST_CPUS=4 OMNI_LOOPER_IDLE_US=4000` | #6, #7 |
+| **M7** | M4's switches, **N instances at once** (5, then 10), one account and one storage each | whether the per-instance figures hold when instances compete (page cache sharing of the library shows as a smaller shareable-resident share per instance) |
+
+Record in each: private and working set at `onGameLoaded` + 300 s, median cores and fps over
++300..+450 s, and the `MEMREPORT` table at +300 s. `OMNI_GRAPHICS_QUALITY` edits the storage's
+existing settings file, so on a fresh storage run it twice (the first launch writes the file).
+
+**The commits**: `d10254c` the memory census on the platform seam (`vm::process_regions`,
+`vm::resident_set`, `vm::heap_totals`, `process::env_is_set_raw`); `5ce074e` mapping labels in
+`omni-mem` (`label_scope`, `labelled_regions`); `37c4cb6` `OMNI_MEM_REPORT`
+(`omni_android::memreport`, the labels at their sources, `ReentrantCall::caller`, the gate's
+`CountingAllocator`); `6b24b57` `OMNI_FPS_CAP` (`omni_android::pacing`, both present paths);
+`91213ae` `OMNI_AUDIO=off` and `OMNI_GRAPHICS_QUALITY`; `3e2b74c` the census on Linux (thread
+stacks found by stack pointer -- the guard page no longer splits a stack's VMA -- and the kernel's
+`[vdso]` as an image); `7621db5` a minimised instance keeps the cap (its frame takes its turn at
+the withheld surface query). None changes behaviour with its switch unset. Tested: Windows
+(omni-android's suites less the APK-path ones, which need an APK in the checkout's root; omni-mem;
+omni-platform; gameactivity's unit tests) and Linux x86-64 in a temporary clone (the census, the
+labels, the report, the pacer); **no session was run**.
+
 ## 2026-09-25: the performance goal in progress -- read this first
 
 Brief: `docs/briefs/goal-performance.md`. Everything below is MEASURED in PS99 (place 8737899170)
@@ -80,7 +248,7 @@ once on the same PC, lowest quality, capped fps acceptable -- only per-instance 
 One instance is ~2.7-4.2 GiB private and ~2 cores today, so (B) needs roughly a 4x memory cut and a
 frame cap of our own (the engine's `FramerateCap` needs a server flag that is off). A breakdown
 switch, `OMNI_FPS_CAP`, and a ranked sharing plan (library pages, translations across processes, a
-lower reported device RAM, audio off) are being built; see "Multi-instance" when it lands. Every
+lower reported device RAM, audio off) are built: see "Multi-instance: the owner's two use cases" at the top. Every
 instance is its own process with its own window, input and storage; the shared code cache is per
 process (1 GiB of *reserved address space*, committed as code is emitted -- ~240 MiB in w27).
 Window behaviour for many instances (`beef41a`, `8cc3f91`): **an unfocused or minimised instance
@@ -177,7 +345,7 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 7 | the game loop's `ALooper_pollOnce(0)` + mutex spin (engine design): one core, 2.8-4.5 M crossings/s | 96% of a core on every host | **fixed** `a69ee64` + `d434c2c` (decoded: nothing it serves needs sub-ms latency; an event-woken 1 ms idle wait): ~3.1 -> ~2.3 cores, 48 -> 50.6-54.2 fps |
 | 7a | Linux: the AAudio feed thread busy-looped (buffer-room rule vs a one-period ALSA wake) | 90% of a core | **fixed** `e09039f` (99.7% -> 0.4%) |
 | 7b | Linux: the engine's memory monitor made the host parse `/proc/self/smaps` | workers 40-50% in the kernel | **fixed** `a12cac5`: Linux 1.2 -> 4.0 fps |
-| 8 | memory: 4.4-4.8 GiB private in the world at default graphics (Windows); Linux swapped at 4.6 GiB on a 7 GB host | | **in part**: the device's RAM follows the host (`23f00e8`, D36: Linux a 4 GiB device, 3.76 GiB private); `OMNI_GUEST_CPUS=8` -0.7 GiB (w9, a switch) |
+| 8 | memory: 4.4-4.8 GiB private in the world at default graphics (Windows); Linux swapped at 4.6 GiB on a 7 GB host | | **in part**: the device's RAM follows the host (`23f00e8`, D36: Linux a 4 GiB device, 3.76 GiB private); `OMNI_GUEST_CPUS=8` -0.7 GiB (w9, a switch). **Where it goes, and the plan for 30-35 instances: "Multi-instance: the owner's two use cases" above** (`OMNI_MEM_REPORT`) |
 | 9 | **a ~60 fps limiter**: no 5 s window above ~59 fps even with `FramerateCap` 240 | w14-w16 | being decoded (the display rate a device on this path never sends -> the engine's frame-time table starts at 60 Hz) |
 | 10 | **intermittent "-1 pointer" heap corruption** (OpenSSL `impls`, w1; a `shared_ptr` control block, w13) -- 2 in ~16 runs, one froze the world | | being hunted; `printf` unbound (a thread died on it in w13) |
 | 11 | **macOS: the DataModel write-lock tracker's "lock theft" assert** (m9; m7's early worker death is the same thread kind) -- the lock owner is a fiber identity read through emutls (`0x3105578` -> `0x286c08c`); the engine's atomics run on LL/SC (the gate declines `HWCAP_ATOMICS`) and fibers park on `syscall(98)` | froze m9 at +185 s; m7, m11 the same worker | **m11 decoded as a control transfer into stale translated code (above)**: the arm64 JIT's mid-run cache clear is the lead, patch 0023 in progress; m12 (global monitor) ran 30 min clean, m13 (RSB off) running. Earlier suspects, ranked: the arm64 exclusive monitor; the sync primitives' plain stores (the ERRORCHECK/RECURSIVE unlock and `pthread_once`'s DONE publish with a plain byte copy -- no release ordering, harmless on x86, a race on the arm64 host; **audit and fix in progress**); a stale TLS/futex answer. A/B planned: patch 0021 vs `OMNI_JIT_EXCLUSIVE_MONITOR=global` |
