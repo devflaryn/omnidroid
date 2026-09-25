@@ -820,24 +820,32 @@ impl Guest {
 
         let bionic = Bionic::new(Arc::clone(&space)).expect("a bionic instance");
         let ndk = Ndk::new(Arc::clone(&space)).expect("an NDK instance");
-        // **The looper's idle wait, off unless this run asks** (`OMNI_LOOPER_IDLE_US=<µs>`, 0 or
-        // unset for off): the game loop's `pollOnce(0)` spin, once it is one, waits on the
-        // looper's own descriptors for at most that long. The decode, and why nothing the engine
-        // needs is late by more than that, is in `omni_android::ndk::looper`'s documentation.
-        if let Ok(micros) = std::env::var("OMNI_LOOPER_IDLE_US") {
-            let micros: u64 = micros
+        // **The looper's idle wait: 1000 µs unless this run says otherwise**
+        // (`OMNI_LOOPER_IDLE_US=<µs>`, `0` or `off` for off): the game loop's `pollOnce(0)` spin,
+        // once it is one, waits on the looper's own descriptors for at most that long. The decode,
+        // and why nothing the engine needs is late by more than that, is in
+        // `omni_android::ndk::looper`'s documentation. MEASURED in the Pet Simulator 99 world on
+        // Windows (2026-09-25, n = 2 each): off, the game thread holds a whole core and the
+        // process ~3.1 cores at 48-49 fps (w7, w9); at 1000 µs, 2.25-2.33 cores at 54.2 and 50.6
+        // fps (w14, w15), no guest thread lost, a clean close. A device's game thread is
+        // descheduled for as long as this routinely.
+        let idle_micros: u64 = match std::env::var("OMNI_LOOPER_IDLE_US") {
+            Ok(text) if text.trim().eq_ignore_ascii_case("off") => 0,
+            Ok(text) => text
                 .trim()
                 .parse()
-                .unwrap_or_else(|_| panic!("OMNI_LOOPER_IDLE_US={micros:?} is not microseconds"));
-            if micros > 0 {
-                ndk.set_looper_idle(Some(std::time::Duration::from_micros(micros)))
-                    .expect("OMNI_LOOPER_IDLE_US within the cap");
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "LOOPER: a spinning pollOnce(0) waits up to {micros} us on its descriptors \
-                     (OMNI_LOOPER_IDLE_US)"
-                );
-            }
+                .unwrap_or_else(|_| panic!("OMNI_LOOPER_IDLE_US={text:?} is not microseconds or `off`")),
+            Err(_) => 1000,
+        };
+        if idle_micros > 0 {
+            ndk.set_looper_idle(Some(std::time::Duration::from_micros(idle_micros)))
+                .expect("OMNI_LOOPER_IDLE_US within the cap");
+            let _ = writeln!(
+                std::io::stderr(),
+                "LOOPER: a spinning pollOnce(0) waits up to {idle_micros} us on its descriptors                  (OMNI_LOOPER_IDLE_US; `off` turns it off)"
+            );
+        } else {
+            let _ = writeln!(std::io::stderr(), "LOOPER: the idle wait is OFF (OMNI_LOOPER_IDLE_US)");
         }
         // Room for every import, the 241 JNI slots and the NDK surface -- and, with graphics, the
         // Vulkan loader's pool and the data area its handle registries need (8192, not 4096:
