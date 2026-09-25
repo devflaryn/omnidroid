@@ -438,6 +438,11 @@ DRIVERLESS = [
     "cargo", "test", "-p", "omni-android", "--release",
     "--lib", "--test", "gles_driverless", "--no-fail-fast",
 ]
+# The M3 gate's image-pointer count across two placements (`written_across`): its three unit tests,
+# filtered by name. They build their placements from numbers, so no APK and no guest run -- a build.
+INIT_GATE_FILE = "crates/omni-android/tests/initializers.rs"
+INIT_ACROSS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "initializers",
+               "--no-fail-fast", "written_across"]
 
 # (id, direction, description, file, old, new, command)
 MUTATIONS = [
@@ -9922,6 +9927,29 @@ directory", ADAPTER_FILES,
      '        _ => (0, Some(EGL_BAD_DISPLAY)),',
      '        _ => (0, Some(EGL_SUCCESS)),',
      DRIVERLESS),
+    # The M3 gate's count of image pointers (2026-09-25). One placement cannot tell a pointer into
+    # the image from a pair of u32 fields that the placement happened to put the image around --
+    # the gate failed on exactly that in 8 of 223 Windows runs. These undo the two-placement rule.
+    ('initgate-A1', 'A', 'a word inside the image in the first placement counts as a pointer, whatever the second holds',
+     INIT_GATE_FILE,
+     '            (Some(oa), Some(ob)) if oa == ob => out.pointers += 1,',
+     '            (Some(_), _) => out.pointers += 1,',
+     INIT_ACROSS),
+    ('initgate-A2', 'A', 'a pointer only one placement has is counted as a number, not named',
+     INIT_GATE_FILE,
+     '                        out.disagreements.push((word, Some(va), vb));',
+     '                        out.lookalikes.push((word, va));',
+     INIT_ACROSS),
+    ('initgate-A3', 'A', 'a word only the second placement wrote is not looked at',
+     INIT_GATE_FILE,
+     '        if !wa.contains_key(&word) && b.offset(vb).is_some() {',
+     '        if false && !wa.contains_key(&word) && b.offset(vb).is_some() {',
+     INIT_ACROSS),
+    ('initgate-A4', 'A', 'two placements at one address are compared anyway',
+     INIT_GATE_FILE,
+     '        a.base, b.base,',
+     '        a.base, a.base.wrapping_add(1),',
+     INIT_ACROSS),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so
