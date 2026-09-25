@@ -41,6 +41,7 @@ use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
 use omni_android::jni::classes::Answer;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
 use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput};
+use omni_android::jni::lifecycle::{Call as LifecycleCall, Policy, Reaction, WindowLifecycle};
 use omni_android::jni::mouse::{MouseCall, MouseInput};
 use omni_android::jni::text::TextInput;
 use omni_android::jni::webview::{
@@ -3496,12 +3497,9 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     };
     let mut next_frames = std::time::Instant::now() + FRAMES_EVERY;
     let mut last_presents = presents();
-    // **The size the engine was last told the surface has**, and the resizes to make if
-    // `OMNI_RESIZE_PROBE` asks: to 960x540 at 40% of the session and back at 70%. A size change
-    // from anywhere -- the probe, or a user dragging the frame -- is delivered as a device's
-    // `SurfaceView` delivers one: `onSurfaceChangedNative` with the new size, then
-    // `onContentRectChangedNative`, on this, the UI thread.
-    let mut told_size = (surface_width as u32, surface_height as u32);
+    // **The resizes to make if `OMNI_RESIZE_PROBE` asks**: to 960x540 at 40% of the session and
+    // back at 70%. A size change from anywhere -- the probe, or a user dragging the frame -- is
+    // delivered as a device's `SurfaceView` delivers one, by `lifecycle` below.
     let mut resize_probe: Vec<(f32, (u32, u32))> =
         if window.is_some() && std::env::var_os("OMNI_RESIZE_PROBE").is_some() {
             let _ = writeln!(
@@ -3681,7 +3679,6 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         late_input.sort_by(|a, b| a.0.total_cmp(&b.0));
         let _ = writeln!(std::io::stderr(), "LATE DRAG: SYNTHETIC drags {list} (OMNI_LATE_DRAG)");
     }
-    let mut resize_failure: Option<String> = None;
     // **OMNI_PROFILE=1**: `sample_profile` on its own thread for the whole session.
     let profiler = std::env::var_os("OMNI_PROFILE").is_some().then(|| {
         let boundary = Arc::clone(&guest.boundary);
@@ -3711,6 +3708,146 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // (events, time, longest) the touch seam spent delivering while the wait trace was on.
     let mut input_timing = (0u64, std::time::Duration::ZERO, std::time::Duration::ZERO);
     let settle = std::time::Instant::now();
+    // **The host window's state, told to the activity** (`omni_android::jni::lifecycle` has the
+    // mapping and the decode behind it). By default an instance keeps playing through a lost focus
+    // and a minimise, as desktop Roblox does -- several run at once and most are not in front --
+    // and what the engine is told is what keeps its swapchain alive: a new surface on a restore, a
+    // display mode change, or the driver answering out of date with nothing presented for 2 s
+    // (MEASURED why, w26: the engine rebuilds only on a new window or a new extent, and after a
+    // change the host told it nothing about it acquired out of date for two minutes). A device's
+    // pauses are opt-in: OMNI_FOLLOW_FOCUS=1 tells it the focus, OMNI_PAUSE_IN_BACKGROUND=1 sends a
+    // minimised instance to the background.
+    //
+    // Every call is made here, on the UI thread, as the startup rows are; and only over a
+    // lifecycle whose rows all returned, since a refused row leaves the glue's mutex held.
+    let mut window_failure: Option<String> = None;
+    let policy = Policy {
+        follow_focus: std::env::var_os("OMNI_FOLLOW_FOCUS").is_some(),
+        pause_in_background: std::env::var_os("OMNI_PAUSE_IN_BACKGROUND").is_some(),
+    };
+    let mut lifecycle: Option<WindowLifecycle> = (window.is_some()
+        && row_outcomes.iter().all(|(_, result)| result.is_ok()))
+    .then(|| WindowLifecycle::new((surface_width as u32, surface_height as u32), policy));
+    if window.is_some() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "WINDOW: {}",
+            match &lifecycle {
+                Some(_) => format!(
+                    "host window changes are told to the activity (jni::lifecycle); focus {}, minimised {}",
+                    if policy.follow_focus {
+                        "FOLLOWED (OMNI_FOLLOW_FOCUS): the game stops ticking without it"
+                    } else {
+                        "not told: the game keeps playing behind other windows"
+                    },
+                    if policy.pause_in_background {
+                        "PAUSES in the background (OMNI_PAUSE_IN_BACKGROUND)"
+                    } else {
+                        "keeps playing, and draws nothing until restored"
+                    }
+                ),
+                None => "host window changes are NOT told to the activity: a lifecycle row did not return".to_string(),
+            }
+        );
+    }
+    // (presents when it was given, what gave it) for every new surface or rebuilt swapchain.
+    let mut renewals: Vec<(u64, String)> = Vec::new();
+    // **One reaction, told**: its `WINDOW:` line, then each call in order, each reported as it
+    // returns. `MainGameActivity.surfaceDestroyed` clears the touch listener's surface flag before
+    // `super`, and `surfaceCreated` sets it after, so this does too.
+    let tell = |cpu: &mut DynarmicCpu, touch: &mut Option<TouchInput>, reaction: &Reaction, at: f32| -> Result<(), String> {
+        let _ = writeln!(
+            std::io::stderr(),
+            "WINDOW: +{at:.1}s {}{}",
+            reaction.said,
+            if reaction.calls.is_empty() { " -- no callback" } else { "" }
+        );
+        for call in &reaction.calls {
+            if *call == LifecycleCall::SurfaceDestroyed {
+                if let Some(seam) = touch.as_mut() {
+                    seam.set_surface_alive(false);
+                }
+            }
+            let result = match (call.native(), call) {
+                (Some((member, descriptor)), _) => {
+                    let target = native(member, descriptor);
+                    let mut args =
+                        vec![GuestArg::Pointer(guest.jni.env_for(0)), GuestArg::Int(thiz), GuestArg::Int(native_code)];
+                    args.extend(call.tail(surface));
+                    let result = {
+                        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                        let _jni = guest.jni.activate().expect("publish the JNI instance");
+                        let _ndk = guest.ndk.activate();
+                        guest.boundary.call_guest(cpu, member, target, &args, LIFECYCLE_BUDGET)
+                    };
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "WINDOW:   {call} -> {}",
+                        match &result {
+                            Ok(_) => "returned".to_string(),
+                            Err(error) => format!("{error}"),
+                        }
+                    );
+                    report_dead_guest_threads(&guest, &format!("after WINDOW {call}"));
+                    result.map(|_| ()).map_err(|error| error.to_string())
+                }
+                // `process_event` says its own line, as `WINDOW: ProcessLifecycleOwner ...`.
+                (None, LifecycleCall::Process(event)) => process_event(&guest, cpu, *event, "WINDOW"),
+                // The host's own Vulkan layer, not the guest: nothing to call, nothing to fail.
+                (None, LifecycleCall::WithholdSurface(_) | LifecycleCall::RebuildSwapchain) => {
+                    let done = match (&guest.vulkan, call) {
+                        (Some(vulkan), LifecycleCall::WithholdSurface(withheld)) => {
+                            vulkan.set_surface_withheld(*withheld);
+                            "done"
+                        }
+                        (Some(vulkan), _) => {
+                            vulkan.withhold_surface_once();
+                            "done"
+                        }
+                        (None, _) => "nothing to do: no Vulkan in this run",
+                    };
+                    let _ = writeln!(std::io::stderr(), "WINDOW:   {call} -> {done}");
+                    Ok(())
+                }
+                (None, other) => Err(format!("{other:?} names no native")),
+            };
+            result.map_err(|error| format!("{call}: {error}"))?;
+            if *call == LifecycleCall::SurfaceCreated {
+                if let Some(seam) = touch.as_mut() {
+                    seam.set_surface_alive(true);
+                }
+            }
+        }
+        Ok(())
+    };
+    // `tell`, and what follows from it: a failure ends the telling (the glue's mutex may be held
+    // behind it) and is asserted at the end; a new surface is recorded, and a resize with the rest.
+    let told = |cpu: &mut DynarmicCpu,
+                touch: &mut Option<TouchInput>,
+                reaction: &Reaction,
+                lifecycle: &mut Option<WindowLifecycle>,
+                failure: &mut Option<String>,
+                resizes: &mut Vec<(u64, (u32, u32))>,
+                renewals: &mut Vec<(u64, String)>| {
+        if failure.is_some() {
+            return;
+        }
+        match tell(cpu, touch, reaction, settle.elapsed().as_secs_f32()) {
+            Ok(()) => {
+                if reaction.renews_more_than_the_size() {
+                    renewals.push((presents(), reaction.said.clone()));
+                } else if reaction.renews_surface() {
+                    resizes.push((presents(), lifecycle.as_ref().map_or((0, 0), WindowLifecycle::size)));
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(std::io::stderr(), "WINDOW: a callback failed, and no more are told this session: {error}");
+                report_dead_guest_threads(&guest, "after a failed WINDOW callback");
+                *failure = Some(error);
+                *lifecycle = None;
+            }
+        }
+    };
     // **OMNI_JOIN_PLACE: auto-join a place once the app is up.** After login reaches Home
     // (authenticated), build the StartGameParams the app's own `fi.h0.C` builds and call
     // `nativeAppBridgeV2StartGameWithParam` -- the direct game-start the "play" button uses.
@@ -3938,61 +4075,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 let (_, (width, height)) = resize_probe.remove(0);
                 let _ = writeln!(std::io::stderr(), "RESIZE PROBE: the window to {width}x{height}");
                 if let Err(error) = open.set_client_size(width, height) {
-                    resize_failure = Some(format!("set_client_size({width}, {height}): {error}"));
-                }
-            }
-            if let Ok((width, height)) = open.client_size() {
-                if (width, height) != told_size && width > 0 && height > 0 && resize_failure.is_none() {
-                    for (member, descriptor, tail) in [
-                        (
-                            "onSurfaceChangedNative",
-                            "(JLandroid/view/Surface;III)V",
-                            vec![
-                                GuestArg::Int(surface),
-                                GuestArg::Int(1),
-                                GuestArg::Int(u64::from(width)),
-                                GuestArg::Int(u64::from(height)),
-                            ],
-                        ),
-                        (
-                            "onContentRectChangedNative",
-                            "(JIIII)V",
-                            vec![
-                                GuestArg::Int(0),
-                                GuestArg::Int(0),
-                                GuestArg::Int(u64::from(width)),
-                                GuestArg::Int(u64::from(height)),
-                            ],
-                        ),
-                    ] {
-                        let target = native(member, descriptor);
-                        let mut args = vec![
-                            GuestArg::Pointer(guest.jni.env_for(0)),
-                            GuestArg::Int(thiz),
-                            GuestArg::Int(native_code),
-                        ];
-                        args.extend(tail);
-                        let result = {
-                            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
-                            let _jni = guest.jni.activate().expect("publish the JNI instance");
-                            let _ndk = guest.ndk.activate();
-                            guest.boundary.call_guest(&mut cpu, member, target, &args, LIFECYCLE_BUDGET)
-                        };
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "RESIZE: {member} {width}x{height} -> {}",
-                            match &result {
-                                Ok(_) => "returned".to_string(),
-                                Err(error) => format!("{error}"),
-                            }
-                        );
-                        if let Err(error) = result {
-                            resize_failure = Some(format!("{member} {width}x{height}: {error}"));
-                            break;
-                        }
-                    }
-                    told_size = (width, height);
-                    resizes.push((presents(), (width, height)));
+                    window_failure = Some(format!("set_client_size({width}, {height}): {error}"));
                 }
             }
         }
@@ -4059,6 +4142,24 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 close_requested = true;
             }
             for event in &events {
+                // **The window's state first**, in the order the host reported it among the input.
+                let reaction = lifecycle.as_mut().and_then(|life| life.event(event, std::time::Instant::now()));
+                if let Some(reaction) = reaction {
+                    told(&mut cpu, &mut touch, &reaction, &mut lifecycle, &mut window_failure, &mut resizes, &mut renewals);
+                }
+                // **No input reaches an activity in the background**, as none reaches a stopped
+                // one on a device; the focus and a lost capture still go to the seams, which
+                // release what they hold.
+                let in_background = lifecycle.as_ref().is_some_and(|life| !life.in_front());
+                if in_background
+                    && !matches!(
+                        event,
+                        omni_platform::window::WindowEvent::FocusChanged { .. }
+                            | omni_platform::window::WindowEvent::PointerCaptureLost
+                    )
+                {
+                    continue;
+                }
                 let _bionic = guest.bionic.activate().expect("publish the bionic instance");
                 let _jni = guest.jni.activate().expect("publish the JNI instance");
                 let _ndk = guest.ndk.activate();
@@ -4171,6 +4272,22 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                     let _ = open.set_pointer_capture(false);
                     break;
                 }
+            }
+            // **Then what is due without an event**: the size the OS reports now (a display can
+            // change it with no event, `Window::client_size`'s reason for asking every time), the
+            // process's delayed pause, and the out-of-date safety net.
+            let now = std::time::Instant::now();
+            let sampled = open.client_size().ok();
+            let mut due = Vec::new();
+            if let Some(life) = lifecycle.as_mut() {
+                if let Some((width, height)) = sampled {
+                    due.extend(life.sampled(width, height, now));
+                }
+                let out_of_date = guest.vulkan.as_ref().map_or(0, |vulkan| vulkan.out_of_date_answers());
+                due.extend(life.tick(now, presents(), out_of_date));
+            }
+            for reaction in due {
+                told(&mut cpu, &mut touch, &reaction, &mut lifecycle, &mut window_failure, &mut resizes, &mut renewals);
             }
         }
         // **The Java side's web view, on this thread** -- the UI thread, where its callbacks'
@@ -4311,6 +4428,17 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         "FRAMES: {final_presents} presents in all; resizes delivered {:?}",
         resizes
     );
+    if window.is_some() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "WINDOW: {} surface renewal(s) after startup, (presents when given, why): {renewals:?}; {} presents since \
+             the last; the driver answered out of date {} time(s); {} capabilities query(ies) withheld",
+            renewals.len(),
+            final_presents - renewals.last().map_or(0, |(at, _)| *at),
+            guest.vulkan.as_ref().map_or(0, |vulkan| vulkan.out_of_date_answers()),
+            guest.vulkan.as_ref().map_or(0, |vulkan| vulkan.withheld_answers())
+        );
+    }
     let frames_after_resize = resizes
         .iter()
         .find(|(at, _)| final_presents <= *at)
@@ -4484,10 +4612,32 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         // otherwise comes with the delayed pause, after it. (androidx.lifecycle
         // `ProcessLifecycleOwner.activityPaused`/`activityStopped`/`dispatchStopIfNeeded`.)
         const PROCESS_PAUSE_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
-        let mut paused_at: Option<std::time::Instant> = None;
-        let mut pause_sent = false;
-        let mut stopped = false;
-        for (member, descriptor, tail) in [
+        // **What the activity was already told is not told again.** In the background
+        // (OMNI_PAUSE_IN_BACKGROUND, the window minimised) its focus, pause, surface and stop went
+        // with the minimise, and the process's pause is pending or sent; a focus lost in the front
+        // (OMNI_FOLLOW_FOCUS) went when it was lost. Otherwise -- by default, minimised or not, for
+        // the instance never stopped playing -- this is the whole close, unchanged.
+        let in_front = lifecycle.as_ref().is_none_or(WindowLifecycle::in_front);
+        let focus_told = lifecycle.as_ref().is_none_or(WindowLifecycle::focus_told);
+        if lifecycle.as_ref().is_some_and(WindowLifecycle::minimized) && in_front {
+            let _ = writeln!(
+                std::io::stderr(),
+                "CLOSE: the window is minimised and the game was still playing: the whole close follows"
+            );
+        }
+        if !in_front {
+            let _ = writeln!(
+                std::io::stderr(),
+                "CLOSE: the activity is already in the background (the window is minimised): its focus, pause, \
+                 surface and stop were told then"
+            );
+        } else if !focus_told {
+            let _ = writeln!(std::io::stderr(), "CLOSE: the activity already lost the focus, which is not told again");
+        }
+        let mut paused_at: Option<std::time::Instant> = lifecycle.as_ref().and_then(WindowLifecycle::paused_at);
+        let mut pause_sent = lifecycle.as_ref().is_some_and(WindowLifecycle::process_paused);
+        let mut stopped = !in_front;
+        let close_rows: Vec<(&str, &str, Vec<GuestArg>)> = vec![
             ("onWindowFocusChangedNative", "(JZ)V", vec![GuestArg::Int(0)]),
             ("onPauseNative", "(J)V", vec![]),
             ("onSurfaceDestroyedNative", "(J)V", vec![]),
@@ -4495,7 +4645,9 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             // The system tells a process its UI is hidden once no activity of it is visible:
             // `onTrimMemory(TRIM_MEMORY_UI_HIDDEN)`, 20, which GameActivity passes on.
             ("onTrimMemoryNative", "(JI)V", vec![GuestArg::Int(20)]),
-        ] {
+        ];
+        let owed = |member: &str| in_front && (member != "onWindowFocusChangedNative" || focus_told);
+        for (member, descriptor, tail) in close_rows.into_iter().filter(|(member, _, _)| owed(member)) {
             if paused_at.is_some_and(|at| at.elapsed() >= PROCESS_PAUSE_DELAY) && !pause_sent {
                 pause_sent = true;
                 let mut sent = process_event(&guest, &mut cpu, script::ProcessEvent::Pause, "CLOSE");
@@ -5018,9 +5170,9 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // **And a resize, asserted the same way**: the surface change reaching the engine, and the
     // engine presenting again after it.
     assert!(
-        resize_failure.is_none(),
-        "a window resize did not reach the engine: {}",
-        resize_failure.as_deref().unwrap_or_default()
+        window_failure.is_none(),
+        "a host window change did not reach the engine: {}",
+        window_failure.as_deref().unwrap_or_default()
     );
     assert!(
         frames_after_resize.is_none(),
