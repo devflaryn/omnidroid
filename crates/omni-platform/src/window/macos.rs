@@ -29,6 +29,12 @@
 //!
 //! * **Captured motion is accelerated.** AppKit's mouse deltas come after the system's pointer
 //!   ballistics; the seam asks for the device's counts. See `appkit::OmniView::motion`.
+//! * **The hidden cursor is a cursor rect, so it is AppKit's to apply.** `set_cursor_hidden` puts
+//!   an invisible `NSCursor` over the view with `-[NSView addCursorRect:cursor:]`, as winit's
+//!   invisible cursor does; AppKit applies a window's cursor rects only while it is the key window,
+//!   which is the focus scoping the seam promises, and the arrow is set back when the window
+//!   resigns key. `+[NSCursor hide]` was not used: it is one counter for the whole application and
+//!   hides the cursor over the title bar and every other window of it too.
 //! * **A window created while the main thread is unavailable is refused**, with
 //!   [`WindowError::MainThreadUnavailable`] naming why; see [`main_thread`].
 
@@ -57,11 +63,23 @@ pub(super) struct Shared {
     arrived: Condvar,
     /// Whether the pointer capture is held. Written on the AppKit thread; read from both.
     captured: AtomicBool,
+    /// Whether `set_cursor_hidden` asks for the cursor to be hidden over the view. Written on the
+    /// AppKit thread; read from both.
+    hide_cursor: AtomicBool,
+    /// Whether the window is the key window: the focus, as `windowDidBecomeKey:` and
+    /// `windowDidResignKey:` report it. Written on the AppKit thread; read from both.
+    key: AtomicBool,
 }
 
 impl Shared {
     fn new() -> Shared {
-        Shared { events: Mutex::new(Vec::new()), arrived: Condvar::new(), captured: AtomicBool::new(false) }
+        Shared {
+            events: Mutex::new(Vec::new()),
+            arrived: Condvar::new(),
+            captured: AtomicBool::new(false),
+            hide_cursor: AtomicBool::new(false),
+            key: AtomicBool::new(false),
+        }
     }
 
     /// Queue `event` with the seam's coalescing rule, and wake a waiter.
@@ -79,6 +97,23 @@ impl Shared {
     /// Set the capture flag; answers whether it changed.
     fn set_captured(&self, captured: bool) -> bool {
         self.captured.swap(captured, Ordering::AcqRel) != captured
+    }
+
+    fn hide_requested(&self) -> bool {
+        self.hide_cursor.load(Ordering::Acquire)
+    }
+
+    /// Set the hide request; answers whether it changed.
+    fn set_hide_requested(&self, hidden: bool) -> bool {
+        self.hide_cursor.swap(hidden, Ordering::AcqRel) != hidden
+    }
+
+    fn key(&self) -> bool {
+        self.key.load(Ordering::Acquire)
+    }
+
+    fn set_key(&self, key: bool) {
+        self.key.store(key, Ordering::Release);
     }
 }
 
@@ -153,6 +188,22 @@ impl Window {
 
     pub(super) fn has_pointer_capture(&self) -> bool {
         self.shared.captured()
+    }
+
+    pub(super) fn set_cursor_hidden(&mut self, hidden: bool) -> WindowResult<()> {
+        let id = self.id;
+        on_main(move |_| appkit::set_cursor_hidden(id, hidden));
+        Ok(())
+    }
+
+    /// Asked for and the key window: what the cursor rect is in force for.
+    pub(super) fn cursor_hidden(&self) -> bool {
+        self.shared.hide_requested() && self.shared.key()
+    }
+
+    /// The key window, as the delegate last heard.
+    pub(super) fn has_focus(&self) -> bool {
+        self.shared.key()
     }
 
     /// Block on the queue's condition until it is non-empty or `timeout` passes.

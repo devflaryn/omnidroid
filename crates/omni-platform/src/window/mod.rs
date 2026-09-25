@@ -22,6 +22,9 @@
 //! Window::request_close(&self) -> WindowResult<()>
 //! Window::set_pointer_capture(&mut self, captured: bool) -> WindowResult<bool>
 //! Window::has_pointer_capture(&self) -> bool
+//! Window::set_cursor_hidden(&mut self, hidden: bool) -> WindowResult<()>
+//! Window::cursor_hidden(&self) -> bool
+//! Window::has_focus(&self) -> bool
 //! Window::wait(&self, timeout: Duration) -> bool
 //! Window::raw(&self) -> RawWindow
 //! ```
@@ -97,7 +100,17 @@
 //! holds a capture nobody gave it. While it is held the absolute [`WindowEvent::PointerMoved`] is
 //! not reported at all: the cursor is not moving, and a position that does not move is not motion.
 //! This is the contract Android's `View.requestPointerCapture` offers an app, which is why it has
-//! this shape.
+//! this shape. Giving the capture back reports where the cursor now is (a
+//! [`WindowEvent::PointerMoved`] at the point it was held), so a consumer that followed the motion
+//! instead of the cursor learns where the cursor really is without waiting for the next move.
+//!
+//! **Hiding the cursor** without capturing it is the third: an app that draws its own pointer --
+//! Android's `View.onResolvePointerIcon` answering `PointerIcon.TYPE_NULL`, which Roblox's own
+//! surface view does -- wants the host's cursor gone over its client area while the pointer still
+//! moves freely. [`Window::set_cursor_hidden`] asks for that. It is **scoped to the focus**: while
+//! the window does not have the keyboard focus the cursor is shown over it as over any other
+//! window, and it is hidden again when the focus comes back, so switching away always gives the
+//! user a cursor.
 //!
 //! # No refresh-rate query, on purpose
 //!
@@ -787,7 +800,8 @@ impl Window {
     /// While the capture is held the cursor is hidden and held where it was, and the device's own
     /// relative motion arrives as [`WindowEvent::PointerMotion`] in place of
     /// [`WindowEvent::PointerMoved`]; buttons and the wheel are reported as before. Giving it back
-    /// shows the cursor where it was when the capture began.
+    /// shows the cursor where it was when the capture began -- unless [`Window::set_cursor_hidden`]
+    /// keeps it hidden there -- and reports that point as a [`WindowEvent::PointerMoved`].
     ///
     /// **Only a window with the keyboard focus is granted one**, and the answer says which
     /// happened: `Ok(true)` when the capture is now held, `Ok(false)` when a request was declined
@@ -809,6 +823,42 @@ impl Window {
     #[must_use]
     pub fn has_pointer_capture(&self) -> bool {
         self.inner.has_pointer_capture()
+    }
+
+    /// **Hide the cursor over the client area, or show it again** -- what Android does over a view
+    /// whose `onResolvePointerIcon` answers `PointerIcon.TYPE_NULL`: the pointer still moves and
+    /// is still reported ([`WindowEvent::PointerMoved`]), it is only not drawn, because the app
+    /// draws its own.
+    ///
+    /// A standing request, applied **only while the window has the keyboard focus**: losing the
+    /// focus shows the cursor at once, over this window too, and gaining it back hides it again
+    /// while the request stands. Nothing is reported for either; [`Window::cursor_hidden`] says
+    /// which is in force. Outside the client area (the frame, the title bar, other windows) the
+    /// cursor is never hidden. Independent of [`Window::set_pointer_capture`], which hides the
+    /// cursor for as long as it holds it whatever this says.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::Unsupported`] on the structural backends. The others cannot fail: a cursor
+    /// that could not be hidden is a cursor shown, which is the safe side.
+    pub fn set_cursor_hidden(&mut self, hidden: bool) -> WindowResult<()> {
+        self.inner.set_cursor_hidden(hidden)
+    }
+
+    /// Whether the cursor is hidden over the client area now by [`Window::set_cursor_hidden`]: it
+    /// was asked for and the window has the focus.
+    #[must_use]
+    pub fn cursor_hidden(&self) -> bool {
+        self.inner.cursor_hidden()
+    }
+
+    /// Whether this window has the keyboard focus now, as the host last told it -- the state the
+    /// [`WindowEvent::FocusChanged`] events describe, for a consumer that did not see them all (a
+    /// window's first focus arrives while it is being shown). What a pointer capture and a hidden
+    /// cursor are scoped to.
+    #[must_use]
+    pub fn has_focus(&self) -> bool {
+        self.inner.has_focus()
     }
 
     /// **Wait until something happens, or until `timeout` has passed**: `true` when there is input

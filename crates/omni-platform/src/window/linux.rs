@@ -68,6 +68,15 @@
 //!
 //! **5. The physical key is reported as Windows reports it.** See [`keymap`].
 //!
+//! **6. A hidden cursor is the window's own cursor attribute.** `XDefineCursor` with the blank
+//! cursor the capture already uses makes the pointer invisible over this window and nowhere else
+//! -- the server draws each window's own cursor while the pointer is in it, the frame's and every
+//! other window's included -- and `XUndefineCursor` gives the window back its parent's. It is
+//! defined only while the window has the keyboard focus ([`super::Window::set_cursor_hidden`]'s
+//! contract), and the focus events that count are where it is defined and undefined, so switching
+//! away shows the pointer without the mouse moving. `XFixesHideCursor` was not used: it hides the
+//! pointer on the whole screen for as long as the client that asked is connected.
+//!
 //! # Why X11 first
 //!
 //! One backend that reaches every Linux desktop -- a Wayland desktop through Xwayland -- rather
@@ -241,6 +250,9 @@ pub(super) struct Window {
     captured: Option<(i32, i32)>,
     /// The pointing devices raw motion has come from during this capture.
     devices: Vec<Device>,
+    /// Whether [`super::Window::set_cursor_hidden`] asks for the cursor to be hidden over the
+    /// window. See this module's point 6.
+    hide_cursor: bool,
 }
 
 impl Window {
@@ -313,6 +325,7 @@ impl Window {
             focus_on_map: Cell::new(false),
             captured: None,
             devices: Vec::new(),
+            hide_cursor: false,
         };
 
         // Auto-repeat as presses (this module's header, "Why Xlib").
@@ -994,7 +1007,46 @@ impl Window {
                 push_event(&mut self.queue, WindowEvent::PointerCaptureLost);
             }
         }
+        // A cursor hidden for the focus goes and comes back with it (point 6).
+        if self.hide_cursor {
+            self.apply_cursor();
+        }
         push_event(&mut self.queue, WindowEvent::FocusChanged { focused });
+    }
+
+    /// Define the blank cursor on the window while it is to be hidden -- asked for, and focused --
+    /// and undefine it otherwise (point 6).
+    fn apply_cursor(&self) {
+        let xl = &self.libs.xlib;
+        // SAFETY: a live display, window and cursor. Undefining a cursor the window does not have
+        // is a no-op.
+        unsafe {
+            if self.hide_cursor && self.focused {
+                (xl.XDefineCursor)(self.display, self.window, self.blank_cursor);
+            } else {
+                (xl.XUndefineCursor)(self.display, self.window);
+            }
+            (xl.XFlush)(self.display);
+        }
+    }
+
+    /// See [`super::Window::set_cursor_hidden`] and this module's point 6.
+    pub(super) fn set_cursor_hidden(&mut self, hidden: bool) -> WindowResult<()> {
+        if self.hide_cursor != hidden {
+            self.hide_cursor = hidden;
+            self.apply_cursor();
+        }
+        Ok(())
+    }
+
+    /// Hidden by the request, now: asked for, and focused.
+    pub(super) fn cursor_hidden(&self) -> bool {
+        self.hide_cursor && self.focused
+    }
+
+    /// From the focus events that count.
+    pub(super) fn has_focus(&self) -> bool {
+        self.focused
     }
 
     /// An XInput 2 event: raw motion, while captured.
@@ -1121,8 +1173,11 @@ impl Window {
     pub(super) fn set_pointer_capture(&mut self, captured: bool) -> WindowResult<bool> {
         const OP: &str = "set_pointer_capture";
         if !captured {
-            if self.captured.is_some() {
+            if let Some((x, y)) = self.captured {
                 self.end_capture(true);
+                // Where the pointer now is -- warped back to where it was held -- said: the
+                // consumer followed the motion, not the pointer.
+                push_event(&mut self.queue, WindowEvent::PointerMoved { x, y });
             }
             return Ok(false);
         }

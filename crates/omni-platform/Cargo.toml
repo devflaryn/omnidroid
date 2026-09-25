@@ -111,8 +111,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSNotification", "NSObject", "NSRange", "NSRunLoop", "NSString", "NSURL", "NSURLRequest", "NSValue",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
-    "std", "objc2-core-foundation", "objc2-quartz-core", "NSApplication", "NSCursor", "NSEvent", "NSGraphics", "NSResponder",
-    "NSRunningApplication", "NSScreen", "NSTextInputClient", "NSTrackingArea", "NSView", "NSWindow",
+    "std", "objc2-core-foundation", "objc2-quartz-core", "NSApplication", "NSCursor", "NSEvent", "NSGraphics", "NSImage",
+    "NSResponder", "NSRunningApplication", "NSScreen", "NSTextInputClient", "NSTrackingArea", "NSView", "NSWindow",
 ] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std", "objc2-core-foundation", "CALayer", "CAMetalLayer",

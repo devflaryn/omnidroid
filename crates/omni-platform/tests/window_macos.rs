@@ -528,6 +528,39 @@ fn a_capture_is_granted_to_the_focused_window_and_ends_with_the_focus() {
     drop(other);
 }
 
+/// The hidden cursor: in force only while the window is key -- asked for on a window never shown it
+/// is not, it is once the window has the focus, not after another window takes it -- and a capture
+/// given back reports where the pointer is. **Written without a Mac to run it on** (2026-09-25);
+/// the cursor image itself is not read here.
+#[test]
+#[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+fn a_hidden_cursor_is_in_force_only_while_the_window_is_key() {
+    require_gate();
+    let mut window = open("omnidroid: hidden cursor", 400, 300);
+    window.set_cursor_hidden(true).unwrap();
+    assert!(!window.cursor_hidden(), "a window never shown is not key");
+
+    window.show();
+    poll_until(&mut window, "the focus", |e| *e == WindowEvent::FocusChanged { focused: true });
+    assert!(window.cursor_hidden(), "key, and asked for");
+
+    assert_eq!(window.set_pointer_capture(true), Ok(true));
+    let _ = drain(&mut window);
+    assert_eq!(window.set_pointer_capture(false), Ok(false));
+    let seen = drain(&mut window);
+    assert!(seen.iter().any(|e| matches!(e, WindowEvent::PointerMoved { .. })), "the release says where: {seen:?}");
+    assert!(window.cursor_hidden(), "the request outlives the capture");
+
+    let other = open("omnidroid: focus thief", 200, 150);
+    other.show();
+    poll_until(&mut window, "the focus loss", |e| *e == WindowEvent::FocusChanged { focused: false });
+    assert!(!window.cursor_hidden(), "not key: shown");
+    drop(other);
+
+    window.set_cursor_hidden(false).unwrap();
+    assert!(!window.cursor_hidden());
+}
+
 // ---------------------------------------------------------------- the main-thread hand-over
 
 /// The child side of the tests below: does what `OMNI_MACOS_CHILD` says. Never run on its own.

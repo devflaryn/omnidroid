@@ -141,6 +141,22 @@ impl Window {
     }
 
     /// Unreachable, as [`Window::show`].
+    pub(super) fn set_cursor_hidden(&mut self, hidden: bool) -> WindowResult<()> {
+        let _ = hidden;
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
+    pub(super) fn cursor_hidden(&self) -> bool {
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
+    pub(super) fn has_focus(&self) -> bool {
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
     pub(super) fn wait(&self, timeout: core::time::Duration) -> bool {
         let _ = timeout;
         match *self {}

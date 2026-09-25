@@ -13,7 +13,7 @@
 //! source therefore reaches the same instance variables -- the queue, the last reported size, the
 //! modifier and capture state -- without any object having to find another.
 
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
-    NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSScreen, NSTextInputClient,
+    NSEventMask, NSEventModifierFlags, NSEventType, NSImage, NSResponder, NSScreen, NSTextInputClient,
     NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate,
     NSWindowOcclusionState, NSWindowStyleMask,
 };
@@ -172,6 +172,18 @@ define_class!(
         fn make_backing_layer(&self) -> Retained<CALayer> {
             let layer = CAMetalLayer::new();
             Retained::into_super(layer)
+        }
+
+        /// **The hidden cursor**: an invisible cursor over the whole view while
+        /// `set_cursor_hidden` asks for it. AppKit applies cursor rects only in the key window,
+        /// so this is scoped to the focus by AppKit itself.
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            // SAFETY: `NSView` implements it; the signature is `- (void)resetCursorRects`.
+            let _: () = unsafe { msg_send![super(self), resetCursorRects] };
+            if self.ivars().shared.hide_requested() {
+                self.addCursorRect_cursor(self.bounds(), &invisible_cursor());
+            }
         }
 
         #[unsafe(method(viewDidChangeBackingProperties))]
@@ -347,6 +359,10 @@ define_class!(
 
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
+            self.ivars().shared.set_key(true);
+            if self.ivars().shared.hide_requested() {
+                self.refresh_cursor();
+            }
             self.push(WindowEvent::FocusChanged { focused: true });
         }
 
@@ -357,6 +373,12 @@ define_class!(
             if self.ivars().shared.captured() {
                 end_capture(&self.ivars().shared);
                 self.push(WindowEvent::PointerCaptureLost);
+            }
+            self.ivars().shared.set_key(false);
+            // The cursor rect stops applying with the key status; the invisible cursor it set is
+            // replaced at once rather than at the next move over another window.
+            if self.ivars().shared.hide_requested() {
+                self.refresh_cursor();
             }
             self.push(WindowEvent::FocusChanged { focused: false });
         }
@@ -546,7 +568,12 @@ impl OmniView {
     /// An event's position in client pixels, origin top-left. The view is not flipped, so its
     /// own coordinates run up from the bottom and are turned over here.
     fn pixel_position(&self, event: &NSEvent) -> (i32, i32) {
-        let point = self.convertPoint_fromView(event.locationInWindow(), None);
+        self.pixel_at(event.locationInWindow())
+    }
+
+    /// A point in the window's coordinates, as the seam's client pixels.
+    fn pixel_at(&self, in_window: NSPoint) -> (i32, i32) {
+        let point = self.convertPoint_fromView(in_window, None);
         let scale = self.scale();
         let height = self.bounds().size.height;
         ((point.x * scale).floor() as i32, ((height - point.y) * scale).floor() as i32)
@@ -652,6 +679,60 @@ impl OmniView {
             WindowEvent::KeyUp { keycode, scancode }
         });
     }
+}
+
+// ---------------------------------------------------------------------------- hidden cursor
+
+/// A cursor with no visible pixel: a 16x16 image with nothing drawn in it -- winit's invisible
+/// cursor. Made once, on the main thread.
+fn invisible_cursor() -> Retained<NSCursor> {
+    thread_local! {
+        static INVISIBLE: OnceCell<Retained<NSCursor>> = const { OnceCell::new() };
+    }
+    INVISIBLE.with(|cell| {
+        cell.get_or_init(|| {
+            let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(16.0, 16.0));
+            NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &image, NSPoint::new(0.0, 0.0))
+        })
+        .clone()
+    })
+}
+
+impl OmniView {
+    /// Whether the pointer is over the view now.
+    fn pointer_inside(&self) -> bool {
+        let Some(window) = self.window() else { return false };
+        let point = self.convertPoint_fromView(window.mouseLocationOutsideOfEventStream(), None);
+        let bounds = self.bounds();
+        (bounds.origin.x..bounds.origin.x + bounds.size.width).contains(&point.x)
+            && (bounds.origin.y..bounds.origin.y + bounds.size.height).contains(&point.y)
+    }
+
+    /// Re-evaluate the cursor rects and set the cursor now, when the pointer is over the view:
+    /// invisible while asked for and key, the arrow otherwise. A cursor rect is otherwise applied
+    /// only when the pointer next crosses its edge.
+    fn refresh_cursor(&self) {
+        let shared = &self.ivars().shared;
+        if let Some(window) = self.window() {
+            window.invalidateCursorRectsForView(self);
+        }
+        if self.pointer_inside() {
+            if shared.hide_requested() && shared.key() {
+                invisible_cursor().set();
+            } else {
+                NSCursor::arrowCursor().set();
+            }
+        }
+    }
+}
+
+/// See `super::Window::set_cursor_hidden`.
+pub(super) fn set_cursor_hidden(id: u64, hidden: bool) {
+    with(id, |native| {
+        if native.view.ivars().shared.set_hide_requested(hidden) {
+            native.view.refresh_cursor();
+        }
+    });
 }
 
 // -------------------------------------------------------------------------- pointer capture
@@ -808,7 +889,14 @@ pub(super) fn set_pointer_capture(mtm: MainThreadMarker, id: u64, captured: bool
     with(id, |native| {
         let shared = &native.view.ivars().shared;
         if !captured {
-            end_capture(shared);
+            if shared.captured() {
+                end_capture(shared);
+                // The cursor was held where it is; that point said, since the consumer followed
+                // the motion. It stays invisible there if the hidden cursor's rect covers it.
+                let (x, y) = native.view.pixel_at(native.window.mouseLocationOutsideOfEventStream());
+                shared.push(WindowEvent::PointerMoved { x, y });
+                native.view.refresh_cursor();
+            }
             return Ok(false);
         }
         if shared.captured() {
@@ -856,6 +944,10 @@ pub(super) fn destroy(id: u64) {
         .with_borrow_mut(|windows| windows.remove(&id))
         .expect("a window id is removed only here, by its own Window's drop, once");
     end_capture(&native.view.ivars().shared);
+    // A cursor the view's rect made invisible is not left current after the view is gone.
+    if native.view.ivars().shared.set_hide_requested(false) {
+        NSCursor::arrowCursor().set();
+    }
     native.window.setDelegate(None);
     native.window.orderOut(None);
     native.window.close();
