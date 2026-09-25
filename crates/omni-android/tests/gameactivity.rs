@@ -861,6 +861,19 @@ impl Guest {
         // output behind FMOD's AAudio output (`omni_android::aaudio`), and a session without a
         // window has none -- FMOD's NOSOUND fallback, as before.
         let with_audio = graphics.is_some();
+        // **OMNI_AUDIO=off: no audio output, as a windowless session has none** -- `libaaudio.so`
+        // is left unbound and FMOD takes its NOSOUND fallback, which is the path every session
+        // without a window has always run. For the many-instance case, where nobody listens to
+        // thirty clients: no AAudio feed thread, no host output stream (HANDOFF, "Multi-instance").
+        let audio_off = audio_switched_off(std::env::var("OMNI_AUDIO").ok().as_deref())
+            .unwrap_or_else(|why| panic!("{why}"));
+        if with_audio && audio_off {
+            let _ = writeln!(
+                std::io::stderr(),
+                "AUDIO: OFF (OMNI_AUDIO=off): libaaudio.so is not bound, and FMOD falls back to no \
+                 output as a session without a window does"
+            );
+        }
         let (vulkan_slots, data_bytes) = if graphics.is_some() {
             (
                 omni_android::vulkan::BOUND_SYMBOLS
@@ -893,7 +906,7 @@ impl Guest {
             gles.set_host(omni_gfx::GfxGlesHost::new() as Arc<dyn GlesHost>);
             gles
         });
-        let audio = with_audio.then(|| {
+        let audio = (with_audio && !audio_off).then(|| {
             let audio = AAudio::new(Arc::new(PlatformOutput));
             audio.bind_into(&builder).expect("bind libaaudio.so");
             audio
@@ -1560,6 +1573,53 @@ fn death_signal(why: &str) -> i32 {
     }
 }
 
+/// `OMNI_AUDIO`: `off` turns the host's audio output off; unset or `on` leaves it; anything else
+/// is refused by name rather than guessed at.
+fn audio_switched_off(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("" | "on") => Ok(false),
+        Some("off") => Ok(true),
+        Some(other) => Err(format!("OMNI_AUDIO={other:?} is neither `off` nor `on`")),
+    }
+}
+
+/// The game's settings document with `SavedQualityLevel` set to `level` -- the one element, in
+/// place, and nothing else touched. A document without that element is refused: the engine
+/// writes it in every settings file MEASURED here, and one without it is not the file this was
+/// written against.
+fn with_saved_quality(xml: &str, level: u32) -> Result<String, String> {
+    const OPEN: &str = "<token name=\"SavedQualityLevel\">";
+    let at = xml.find(OPEN).ok_or("the settings file has no SavedQualityLevel element")? + OPEN.len();
+    let end = at + xml[at..].find("</token>").ok_or("SavedQualityLevel is not closed")?;
+    if !xml[at..end].trim().chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("SavedQualityLevel holds {:?}, not a level", &xml[at..end]));
+    }
+    Ok(format!("{}{level}{}", &xml[..at], &xml[end..]))
+}
+
+#[test]
+fn the_audio_switch_is_off_on_or_refused() {
+    assert_eq!(audio_switched_off(None), Ok(false));
+    assert_eq!(audio_switched_off(Some("on")), Ok(false));
+    assert_eq!(audio_switched_off(Some(" off ")), Ok(true));
+    assert!(audio_switched_off(Some("0")).unwrap_err().contains("OMNI_AUDIO"));
+}
+
+#[test]
+fn the_saved_quality_level_is_replaced_in_place_and_nothing_else_changes() {
+    let xml = "<Properties>
+	<int name=\"GraphicsQualityLevel\">0</int>
+	<token name=\"SavedQualityLevel\">0</token>
+	<float name=\"MasterVolume\">1</float>
+</Properties>";
+    let edited = with_saved_quality(xml, 1).expect("an edit");
+    assert_eq!(edited, xml.replace("\"SavedQualityLevel\">0<", "\"SavedQualityLevel\">1<"));
+    assert!(edited.contains("<int name=\"GraphicsQualityLevel\">0</int>"), "only the saved level");
+    assert_eq!(with_saved_quality(&edited, 10).expect("again").matches("\">10</token>").count(), 1);
+    assert!(with_saved_quality("<Properties/>", 1).is_err(), "no element: refused, not appended");
+    assert!(with_saved_quality("<token name=\"SavedQualityLevel\">x</token>", 1).is_err());
+}
+
 /// The three shapes a death's text takes, each from a real run (2026-09-23 p1/p2, 2026-09-24).
 #[test]
 fn a_death_is_recorded_with_the_signal_a_device_would_have_raised() {
@@ -1706,6 +1766,10 @@ impl Scratch {
     /// Where the engine looks for `ClientAppSettings.json`, measured (the missing-paths list).
     const CLIENT_APP_SETTINGS_DIRECTORY: &'static str =
         "data/data/com.roblox.client/files/exe/ClientSettings";
+    /// The game's own saved settings (graphics level, volume, camera), as its settings menu writes
+    /// them: MEASURED in every kept storage after a first run.
+    const BASIC_SETTINGS: &'static str =
+        "data/data/com.roblox.client/files/appData/GlobalBasicSettings_13.xml";
 
     fn new(tag: &str) -> Scratch {
         let mut at = std::env::temp_dir();
@@ -1815,6 +1879,37 @@ impl Scratch {
             )
             .expect("the client app settings, where the engine looks for them");
             println!("CLIENT APP SETTINGS (OMNI_CLIENT_APP_SETTINGS): {json}");
+        }
+        // **OMNI_GRAPHICS_QUALITY=<1..10>: the game's own saved graphics level**, written where
+        // its settings menu writes it -- `SavedQualityLevel` in the app's
+        // `GlobalBasicSettings_13.xml` -- before the engine reads it. What the m6 run did by
+        // hand. Only an existing file is edited: the engine writes it at its first run, and a
+        // file this gate invented could lack what the engine expects in it.
+        if let Some(text) = std::env::var("OMNI_GRAPHICS_QUALITY").ok().filter(|t| !t.trim().is_empty()) {
+            let level: u32 = text
+                .trim()
+                .parse()
+                .ok()
+                .filter(|level| (1..=10).contains(level))
+                .unwrap_or_else(|| panic!("OMNI_GRAPHICS_QUALITY={text:?} is not a level 1..=10"));
+            let path = at.join(Self::BASIC_SETTINGS);
+            match std::fs::read_to_string(&path) {
+                Ok(xml) => {
+                    let edited = with_saved_quality(&xml, level).unwrap_or_else(|why| panic!("{why}"));
+                    std::fs::write(&path, edited).expect("the game's basic settings, edited");
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "GRAPHICS: SavedQualityLevel {level} in the game's own settings (OMNI_GRAPHICS_QUALITY)"
+                    );
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "GRAPHICS: OMNI_GRAPHICS_QUALITY={level} not applied -- the engine has not written \
+                         its settings file in this storage yet; it applies from the next launch"
+                    );
+                }
+            }
         }
         Scratch(at, keep)
     }
