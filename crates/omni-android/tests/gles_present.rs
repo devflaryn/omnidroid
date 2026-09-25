@@ -688,6 +688,177 @@ fn a_buffer_mapping_round_trips_through_guest_memory() {
     f.tear_down(display, surface, context);
 }
 
+/// **The engine's mapping pattern, timed through the real guest path.** MEASURED (Linux, NVC0, the
+/// Pet Simulator 99 world, 2026-09-25): the render thread spent up to 82% of its time inside
+/// `glMapBufferRange` and 9-10% in `glUnmapBuffer`, ~150 map/unmap pairs per frame (the census:
+/// `glMapBufferRange=95285` for 649 presents), and never `glFlushMappedBufferRange`.
+///
+/// Each case is one guest program looping `glMapBufferRange` -> `memset` (bionic's, through its
+/// import, as the engine fills a mapping with `memcpy`) -> (`glFlushMappedBufferRange` of the whole
+/// range, under `FLUSH_EXPLICIT`) -> `glUnmapBuffer`, entirely in translated code. The floor printed
+/// beside it is the same `memset` of the same bytes into ordinary guest memory: what the data alone
+/// costs. Each is timed as `(t(3n) - t(n)) / 2n`, so a run's fixed cost is not an iteration's. The
+/// buffer is read back after each case, so a case that stopped uploading fails here rather than
+/// getting faster.
+///
+/// `OMNI_GLES_BENCH_ENTRIES=n` first fills the guest's region map with `n` separate one-page
+/// mappings (placed, lazily committed: address space, no memory), because a guest map with the
+/// engine's ~3.8 GiB of private memory is tens of thousands of entries, and a fresh test space is a
+/// handful. `OMNI_GLES_BENCH_ITERS` sets the iterations per case (default 64).
+#[test]
+#[ignore = "opens a window and the host EGL; set OMNI_GFX_WINDOW_TESTS=1 and run with --ignored"]
+fn the_engines_map_write_unmap_pattern_timed() {
+    require_gate();
+    let _serial = serialized();
+    let f = Fixture::new("Omnidroid - GLES: mapping benchmark");
+    let (display, _config, surface, context) = f.bring_up();
+    let env = |name: &str, default: usize| {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let iterations = env("OMNI_GLES_BENCH_ITERS", 64).max(1);
+    let entries = env("OMNI_GLES_BENCH_ENTRIES", 0);
+    let space = &f.guest.space;
+    let page = space.page_size();
+    if entries > 0 {
+        let run = space
+            .regions()
+            .into_iter()
+            .filter(|r| r.is_free())
+            .max_by_key(|r| r.len)
+            .expect("free address space");
+        assert!(run.len >= 2 * page * (entries + 1), "no free run holds {entries} entries");
+        let base = (run.start + page - 1) & !(page - 1);
+        for i in 0..entries {
+            space
+                .map_anonymous(
+                    omni_mem::Placement::Fixed(base + 2 * page * i),
+                    page,
+                    omni_mem::Protection::ReadWrite,
+                    omni_mem::CommitPolicy::Lazy,
+                )
+                .expect("a filler mapping");
+        }
+    }
+    eprintln!(
+        "GLES-BENCH: {} region-map entries, {iterations} iteration(s) per case",
+        space.regions().len()
+    );
+
+    const GL_DYNAMIC_DRAW: u64 = 0x88E8;
+    const INVALIDATE_BUFFER: u64 = 0x8;
+    const UNSYNCHRONIZED: u64 = 0x20;
+    const BUFFER_BYTES: u64 = 4 << 20;
+    let names = f.alloc(4);
+    f.gl("glGenBuffers", &[1, names]);
+    f.gl("glBindBuffer", &[GL_ARRAY_BUFFER, f.read_i32(names) as u64]);
+    f.gl("glBufferData", &[GL_ARRAY_BUFFER, BUFFER_BYTES, 0, GL_DYNAMIC_DRAW]);
+    f.no_gl_error("glBufferData");
+    let floor_buffer = space
+        .map_anonymous(
+            omni_mem::Placement::Anywhere { align: page },
+            BUFFER_BYTES as usize,
+            omni_mem::Protection::ReadWrite,
+            omni_mem::CommitPolicy::Eager,
+        )
+        .expect("the floor's buffer");
+
+    let (map, memset, flush, unmap) = (
+        f.thunk("glMapBufferRange"),
+        f.thunk("memset"),
+        f.thunk("glFlushMappedBufferRange"),
+        f.thunk("glUnmapBuffer"),
+    );
+    // x19 counts down from the count in `count_at`; x20..x26 hold what each iteration needs; x21
+    // is the return address. All callee-saved, so the thunks leave them alone.
+    let count_at = f.alloc(8);
+    let program = |length: u64, access: Option<u64>, flush_explicit: bool, fill: u8| -> GuestAddr {
+        let entry = f.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        asm.mov(9, count_at);
+        asm.push(ldr_imm(19, 9, 0));
+        asm.mov(22, length);
+        asm.mov(24, memset);
+        asm.mov(20, map);
+        asm.mov(25, flush);
+        asm.mov(26, unmap);
+        asm.mov(23, floor_buffer as u64);
+        let top = asm.pc();
+        match access {
+            Some(access) => {
+                asm.mov(0, GL_ARRAY_BUFFER);
+                asm.mov(1, 0);
+                asm.push(mov_reg(2, 22));
+                asm.mov(3, access);
+                asm.push(blr(20));
+            }
+            None => {
+                asm.push(mov_reg(0, 23));
+            }
+        }
+        asm.mov(1, u64::from(fill));
+        asm.push(mov_reg(2, 22));
+        asm.push(blr(24));
+        if access.is_some() {
+            if flush_explicit {
+                asm.mov(0, GL_ARRAY_BUFFER);
+                asm.mov(1, 0);
+                asm.push(mov_reg(2, 22));
+                asm.push(blr(25));
+            }
+            asm.mov(0, GL_ARRAY_BUFFER);
+            asm.push(blr(26));
+        }
+        asm.push(subs_imm(19, 19, 1));
+        let back = (top as i64 - asm.pc() as i64) / 4;
+        asm.push(b_cond(1, back as i32)); // B.NE top
+        asm.push(ret(21));
+        f.guest.load(asm.words())
+    };
+
+    let cases: [(&str, u64); 5] = [
+        ("WRITE|INVALIDATE_RANGE", GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT),
+        ("WRITE|INVALIDATE_BUFFER", GL_MAP_WRITE_BIT | INVALIDATE_BUFFER),
+        ("WRITE|INVALIDATE_RANGE|UNSYNCHRONIZED", GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | UNSYNCHRONIZED),
+        ("WRITE|INVALIDATE_RANGE|FLUSH_EXPLICIT", GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT),
+        ("WRITE (no invalidate: read back)", GL_MAP_WRITE_BIT),
+    ];
+    // Microseconds per iteration: each program run once for `iterations` and once for three times
+    // as many, and the difference divided by the difference -- so what a run costs whatever its
+    // length (a guest thread made, the program translated) is not charged to the iterations.
+    let timed = |entry: GuestAddr| -> f64 {
+        let run = |n: usize| {
+            f.guest.write_u64(count_at as GuestAddr, n as u64);
+            let t = std::time::Instant::now();
+            let exit = f.run(entry).expect("the benchmark program");
+            assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+            t.elapsed().as_secs_f64()
+        };
+        let short = run(iterations);
+        let long = run(3 * iterations);
+        (long - short).max(0.0) * 1e6 / (2 * iterations) as f64
+    };
+    let mut fill = 0u8;
+    for length in [4u64 << 10, 64 << 10, 1 << 20, 4 << 20] {
+        let floor = timed(program(length, None, false, 0x11));
+        for (label, access) in cases {
+            fill = fill.wrapping_add(1).max(1);
+            let each = timed(program(length, Some(access), access & GL_MAP_FLUSH_EXPLICIT_BIT != 0, fill));
+            f.no_gl_error(label);
+            let at = f.gl("glMapBufferRange", &[GL_ARRAY_BUFFER, 0, length, GL_MAP_READ_BIT]);
+            assert_ne!(at, 0);
+            let back = f.read(at, length as usize);
+            assert_eq!(f.gl("glUnmapBuffer", &[GL_ARRAY_BUFFER]) as u8, 1);
+            assert!(back.iter().all(|&b| b == fill), "{label}, {length} bytes: the guest's bytes did not all arrive");
+            eprintln!(
+                "GLES-BENCH: {length:>8} B  {label:<40} {each:>9.1} us/iteration  (memset floor {floor:.1} us; map+unmap {:.1} us over it)",
+                each - floor
+            );
+        }
+    }
+    f.tear_down(display, surface, context);
+}
+
 /// `eglGetProcAddress` is the host's truth: a thunk for a name the host has, NULL for one it lacks
 /// -- and NULL for a name no GLES or EGL registry has, whatever a dispatch layer would answer.
 #[test]
