@@ -36,6 +36,26 @@ with `omnidroid play --cookie ... --place 8737899170`, logs in the session scrat
 | w14 | `beb9d62`, `OMNI_LOOPER_IDLE_US=1000` | 25 s | **54.2** (37.6-56.8), 2.25 cores | 4.8 / 4.3 GiB |
 | w15 | same (a subagent build running) | 30 s | 50.6 (19-58.8), 2.33 cores | 4.6 / 4.2 GiB |
 | w16 | `d434c2c` (idle wait default), `FramerateCap` 240 | 24 s | 54.6 (21-58.0) -- **never above ~59: a 60 fps limiter, being decoded** | 4.7 / 4.3 GiB |
+| w18 | `7872f8a` (+ corruption fixes, 8 CPUs), `DFIntTaskSchedulerTargetFps` 240 via ClientAppSettings (measurement only) | 20 s | 56.0 (25.2-59.8) -- still capped | 3.95 / 3.5 GiB |
+| **w19** | **`9ef94f5`, 30 minutes, default settings** | **21 s** | **52.8 (+300..+1900 s, n = 321), max 60.0; no guest thread lost, clean close, gate passed** | **3.9-4.0 / 3.5-3.6 GiB, flat; ~2.1 of 24 cores** |
+
+**The 60 fps ceiling is the engine's, decoded (`601fb74`'s notes and the limiter decode):** the
+Android client's TaskScheduler (`TS::Step`, `0x22702a8`) paces at its built-in 1/60 s
+(`+0xb8 = 0x3f91111111111111`, set at `0x226fcec`). The saved `FramerateCap` is applied only when
+the server flag `GameBasicSettingsFramerateCap` is on, and the Harmony dynamic frame-time target
+only under `PerformanceControlDynamicFrameTimeTarget`; both are off in the live `GoogleAndroidApp`
+document, and a local `ClientAppSettings.json` `DFIntTaskSchedulerTargetFps` was loaded and did not
+lift it (w18). **A real phone on this APK and these flags is capped at 60 too**, so the Windows
+~120 target is not reachable without changing Roblox's own flags or engine behaviour -- the
+owner's call; Windows now sits at that ceiling.
+
+**Input stalls (reported by the owner, reproduced):** a mouse drag or key press drops the frame
+rate to 2-20 fps for several seconds (w20: `OMNI_LATE_INPUT` drags; translation jumps from 5-20 to
+150-310 kinsn/s in exactly those seconds). Input runs code no worker had run, the engine spreads it
+over its workers, and every worker translates it again into its own cache while the frame waits.
+Four workers instead of eight is far worse (w21: 3 fps before any input). **The structural fix is
+one translation cache shared by all guest threads** -- the largest item left, also the lever for
+memory, load time and Linux.
 
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
