@@ -537,6 +537,7 @@ fn shadow_mapping(
         // is a checked, committed, writable guest range of at least that length, owned by this
         // mapping alone from the moment it left the pool and not yet handed to the guest.
         unsafe { core::ptr::copy_nonoverlapping(host as usize as *const u8, to, length) };
+        gles.shadow_in.fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
     }
     let mapping = Mapping { shadow, host: host as usize, length, access };
     let replaced = {
@@ -556,7 +557,13 @@ fn shadow_mapping(
 }
 
 /// Copy `[offset, offset + len)` of a mapping's shadow back to the driver's mapping.
-fn copy_back(c: &ImportCall<'_, '_>, mapping: &Mapping, offset: usize, len: usize) -> AbiResult<()> {
+fn copy_back(
+    gles: &Gles,
+    c: &ImportCall<'_, '_>,
+    mapping: &Mapping,
+    offset: usize,
+    len: usize,
+) -> AbiResult<()> {
     if len == 0 {
         return Ok(());
     }
@@ -565,6 +572,7 @@ fn copy_back(c: &ImportCall<'_, '_>, mapping: &Mapping, offset: usize, len: usiz
     // ranges are inside the shadow and the driver's live mapping respectively; they cannot overlap,
     // one being guest memory and the other the driver's.
     unsafe { core::ptr::copy_nonoverlapping(from, (mapping.host + offset) as *mut u8, len) };
+    gles.shadow_out.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -644,7 +652,7 @@ pub(super) fn unmap_buffer(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call)
         return gles.forward(c, call);
     };
     let copied = if uploads_at_unmap(mapping.access) {
-        copy_back(c, &mapping, 0, mapping.length)
+        copy_back(gles, c, &mapping, 0, mapping.length)
     } else {
         Ok(())
     };
@@ -669,7 +677,7 @@ pub(super) fn flush_mapped_range(gles: &Gles, c: &mut ImportCall<'_, '_>, call: 
         // Outside the range, or on a mapping without FLUSH_EXPLICIT, the driver raises the GL
         // error and nothing is copied -- which is what the specification says happens to the data.
         if inside && uploads_at_flush(mapping.access) {
-            copy_back(c, &mapping, offset, length)?;
+            copy_back(gles, c, &mapping, offset, length)?;
         }
     }
     gles.forward(c, call)
@@ -693,5 +701,28 @@ pub(super) fn get_buffer_pointer(gles: &Gles, c: &mut ImportCall<'_, '_>, call: 
     let at = GuestAddr::try_from(out).map_err(|_| call.refuse(format!("{out:#x} is not an address")))?;
     c.mem().write_u64(at, mapping.shadow.at as u64, c.blame(2))?;
     c.ret().void();
+    Ok(())
+}
+
+/// `GLsync glFenceSync(GLenum condition, GLbitfield flags)`: forwarded; the timing census
+/// ([`super::timing`]) remembers the fence, so a later wait on it can say how old it was.
+pub(super) fn fence_sync(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    let r = gles.forward_value(call)?;
+    if let Some(timing) = &gles.timing {
+        timing.fence_made(r);
+    }
+    write_return(c, call.signature, r);
+    Ok(())
+}
+
+/// `GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout)`: forwarded; the
+/// timing census records its flags, timeout, answer, wall time and the fence's age.
+pub(super) fn client_wait_sync(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    let started = gles.timing.as_ref().map(|_| std::time::Instant::now());
+    let r = gles.forward_value(call)?;
+    if let (Some(timing), Some(started)) = (&gles.timing, started) {
+        timing.waited(call.lanes[0], call.lanes[1] as u32, call.lanes[2], r as u32, started.elapsed());
+    }
+    write_return(c, call.signature, r);
     Ok(())
 }

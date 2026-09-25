@@ -351,6 +351,7 @@ pub(super) fn create_window_surface(
     let attributes = if list_at == 0 { vec![EGL_NONE] } else { read_attributes(c, call, 3, list_at)? };
     let host = gles.ensure_selected(call)?;
     let made = host.create_window_surface(display, config, raw, &attributes)?;
+    observe_config(gles, call, display, config);
     gles.note(
         "eglCreateWindowSurface",
         format!("ANativeWindow {window:#x} -> {} = {:#x}", made.host_call, made.surface),
@@ -399,12 +400,64 @@ pub(super) fn terminate(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) ->
 pub(super) fn swap_buffers(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
     // `OMNI_FPS_CAP`: this frame's turn first, when there is a cap (`crate::pacing`).
     crate::pacing::pace_present();
+    let Some(timing) = &gles.timing else {
+        let r = gles.forward_value(call)?;
+        if r as u32 != 0 {
+            gles.note_present();
+        }
+        write_return(c, call.signature, r);
+        return Ok(());
+    };
+    // The timing census (`super::timing`): a GPU timestamp as the frame's last command and one as
+    // the next frame's first, around the host's own swap.
+    timing.before_swap(gles, call);
+    let started = std::time::Instant::now();
     let r = gles.forward_value(call)?;
+    let took = started.elapsed();
+    timing.after_swap(gles, call, took);
     if r as u32 != 0 {
         gles.note_present();
     }
     write_return(c, call.signature, r);
     Ok(())
+}
+
+/// `EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval)`: forwarded; the timing census
+/// records what the engine asked for and what the host answered.
+pub(super) fn swap_interval(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    let r = gles.forward_value(call)?;
+    if let Some(timing) = &gles.timing {
+        timing.observe(format!("eglSwapInterval({}) -> {}", call.lanes[1] as u32 as i32, r as u32));
+    }
+    write_return(c, call.signature, r);
+    Ok(())
+}
+
+/// For the timing census: the window surface's config, as the host describes it.
+fn observe_config(gles: &Gles, call: &Call, display: u64, config: u64) {
+    let Some(timing) = &gles.timing else { return };
+    let mut parts = Vec::new();
+    for (name, attribute) in [
+        ("R", EGL_RED_SIZE),
+        ("G", EGL_GREEN_SIZE),
+        ("B", EGL_BLUE_SIZE),
+        ("A", EGL_ALPHA_SIZE),
+        ("depth", 0x3025),   // EGL_DEPTH_SIZE
+        ("stencil", 0x3026), // EGL_STENCIL_SIZE
+        ("samples", 0x3031), // EGL_SAMPLES
+        ("id", 0x3028),      // EGL_CONFIG_ID
+    ] {
+        let mut value: i32 = 0;
+        let ok = gles.host_call_quiet(
+            call,
+            "eglGetConfigAttrib",
+            &[display, config, attribute as u32 as u64, &mut value as *mut i32 as u64],
+        );
+        if matches!(ok, Ok(v) if v as u32 != 0) {
+            parts.push(format!("{name} {value}"));
+        }
+    }
+    timing.observe(format!("window surface config: {}", parts.join(", ")));
 }
 
 /// The calls that take an Android native object this host has no counterpart for: a native

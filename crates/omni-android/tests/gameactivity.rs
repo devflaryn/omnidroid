@@ -4158,6 +4158,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 translated.unwrap_or_default(),
                 descriptors
             );
+            // `OMNI_GLES_TIMING`: where the window's frames spent their GL time, CPU and GPU.
+            if let Some(lines) = guest.gles.timing_window() {
+                let _ = writeln!(std::io::stderr(), "{lines}");
+            }
             last_presents = now;
             if crossing_rate {
                 let census = census_now();

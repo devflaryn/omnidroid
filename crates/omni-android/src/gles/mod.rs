@@ -78,6 +78,7 @@ mod gl;
 pub mod host;
 #[allow(clippy::all, missing_docs)]
 pub mod signatures;
+pub mod timing;
 
 pub use host::{DisplayOpened, GlesHost, HostProc, SurfaceMade};
 pub use signatures::{Shape, Signature, SHAPES, SIGNATURES};
@@ -223,11 +224,18 @@ struct Entry {
     /// The host function, looked up once. `None` inside means the host does not have it.
     host: OnceLock<Option<HostProc>>,
     calls: AtomicU64,
+    /// `OMNI_GLES_TIMING`'s counters ([`timing`]); the `extra` count is kept whether or not it is on.
+    timing: timing::EntryTiming,
 }
 
 impl Entry {
     fn new() -> Self {
-        Self { assigned: OnceLock::new(), host: OnceLock::new(), calls: AtomicU64::new(0) }
+        Self {
+            assigned: OnceLock::new(),
+            host: OnceLock::new(),
+            calls: AtomicU64::new(0),
+            timing: timing::EntryTiming::default(),
+        }
     }
 }
 
@@ -291,6 +299,11 @@ pub struct Gles {
     presents: AtomicU64,
     /// Set by [`Gles::set_driverless`]: every slot answers as [`driverless`] says.
     driverless: AtomicBool,
+    /// Bytes the mapping shadows copied: from the driver's mapping into a shadow, and back.
+    shadow_in: AtomicU64,
+    shadow_out: AtomicU64,
+    /// `OMNI_GLES_TIMING` ([`timing`]): `Some` when it is on.
+    timing: Option<timing::Timing>,
 }
 
 impl core::fmt::Debug for Gles {
@@ -323,7 +336,62 @@ impl Gles {
             }),
             presents: AtomicU64::new(0),
             driverless: AtomicBool::new(false),
+            shadow_in: AtomicU64::new(0),
+            shadow_out: AtomicU64::new(0),
+            timing: timing::asked(std::env::var("OMNI_GLES_TIMING").ok().as_deref())
+                .then(timing::Timing::default),
         })
+    }
+
+    /// An instance with the timing census on, whatever `OMNI_GLES_TIMING` says -- for tests.
+    #[must_use]
+    pub fn new_timed(space: Arc<GuestSpace>) -> Arc<Self> {
+        let mut gles = Self::new(space);
+        Arc::get_mut(&mut gles).expect("not shared yet").timing = Some(timing::Timing::default());
+        gles
+    }
+
+    /// Whether the timing census (`OMNI_GLES_TIMING`, [`timing`]) is on.
+    #[must_use]
+    pub fn is_timed(&self) -> bool {
+        self.timing.is_some()
+    }
+
+    /// The timing census's readings since the previous call (`GLES TIMING`, `GLES GPU` and
+    /// `GLES WAITS` lines), or `None` when it is off. See [`timing`].
+    #[must_use]
+    pub fn timing_window(&self) -> Option<String> {
+        self.timing.as_ref().map(|t| t.window(self))
+    }
+
+    /// Per slot: guest calls, their wall time (timing census), and this layer's extra host calls.
+    fn entry_counters(&self) -> Vec<(u64, u64, u64)> {
+        self.table.get().map_or_else(Vec::new, |table| {
+            table
+                .entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.calls.load(Ordering::Relaxed),
+                        e.timing.nanos.load(Ordering::Relaxed),
+                        e.timing.extra.load(Ordering::Relaxed),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Per slot: the command it stands for, once assigned.
+    fn entry_names(&self) -> Vec<Option<&'static str>> {
+        self.table.get().map_or_else(Vec::new, |table| {
+            table.entries.iter().map(|e| e.assigned.get().map(|a| a.signature.name)).collect()
+        })
+    }
+
+    /// Bytes the mapping shadows copied: (driver -> guest, guest -> driver).
+    #[must_use]
+    pub fn shadow_bytes(&self) -> (u64, u64) {
+        (self.shadow_in.load(Ordering::Relaxed), self.shadow_out.load(Ordering::Relaxed))
     }
 
     /// Attach the host EGL this instance forwards to. Last writer wins (this or
@@ -547,6 +615,19 @@ impl Gles {
             state.shadows.released,
             state.shadows.lost,
         ));
+        let (shadow_in, shadow_out) = self.shadow_bytes();
+        let extra: Vec<String> = self
+            .entry_counters()
+            .iter()
+            .zip(self.entry_names())
+            .filter(|((_, _, extra), _)| *extra > 0)
+            .map(|((_, _, extra), name)| format!("{}={extra}", name.unwrap_or("?")))
+            .collect();
+        out.push_str(&format!(
+            "GLES: shadow copies: {shadow_in} byte(s) driver -> guest, {shadow_out} guest -> driver; \
+             host calls this layer made beyond the guest's: {}\n",
+            if extra.is_empty() { "none".to_string() } else { extra.join(", ") }
+        ));
         out.push_str(&format!(
             "GLES: {} buffer mapping(s) live, {} window surface(s) live, {} byte(s) of guest \
              string pool used",
@@ -554,6 +635,11 @@ impl Gles {
             state.window_surfaces.len(),
             state.strings.used()
         ));
+        drop(state);
+        if let Some(timing) = &self.timing {
+            out.push('\n');
+            out.push_str(&timing.totals(self));
+        }
         out
     }
 
@@ -599,11 +685,30 @@ impl Gles {
     /// For the special handlers, which call helpers (`glGetIntegerv`, `eglGetCurrentContext`, ...)
     /// with arguments of their own, some of them host pointers to locals.
     fn host_call(&self, call: &Call, name: &'static str, lanes: &[u64]) -> AbiResult<u64> {
+        self.host_call_counted(call, name, lanes, true)
+    }
+
+    /// [`host_call`](Gles::host_call) for the timing census's own calls, which are not counted as
+    /// this layer's extra host calls (they exist only while it measures).
+    fn host_call_quiet(&self, call: &Call, name: &'static str, lanes: &[u64]) -> AbiResult<u64> {
+        self.host_call_counted(call, name, lanes, false)
+    }
+
+    fn host_call_counted(
+        &self,
+        call: &Call,
+        name: &'static str,
+        lanes: &[u64],
+        counted: bool,
+    ) -> AbiResult<u64> {
         let table = self.table.get().ok_or_else(|| call.refuse(unbound()))?;
         let index = *self.state.lock().by_name.get(name).ok_or_else(|| {
             call.refuse(format!("this layer needs the host's `{name}` and it is not bound by name"))
         })?;
         let entry = &table.entries[index as usize];
+        if counted {
+            entry.timing.extra.fetch_add(1, Ordering::Relaxed);
+        }
         let signature = entry.assigned.get().expect("named entries are assigned at bind").signature;
         let proc = self.host_proc(call, entry, name)?.ok_or_else(|| {
             call.refuse(format!(
@@ -789,6 +894,9 @@ fn special_for(name: &str) -> Option<SpecialFn> {
         "glUnmapBuffer" | "glUnmapBufferOES" => gl::unmap_buffer,
         "glFlushMappedBufferRange" | "glFlushMappedBufferRangeEXT" => gl::flush_mapped_range,
         "glGetBufferPointerv" | "glGetBufferPointervOES" => gl::get_buffer_pointer,
+        "glFenceSync" | "glFenceSyncAPPLE" => gl::fence_sync,
+        "glClientWaitSync" | "glClientWaitSyncAPPLE" => gl::client_wait_sync,
+        "eglSwapInterval" => egl::swap_interval,
         _ => return None,
     })
 }
@@ -875,10 +983,17 @@ fn dispatch(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     if gles.is_driverless() {
         return driverless::dispatch(&gles, c, &call);
     }
-    match assigned.special {
+    let started = gles.timing.as_ref().map(|_| std::time::Instant::now());
+    let result = match assigned.special {
         Some(special) => special(&gles, c, &call),
         None => gles.forward(c, &call),
+    };
+    if let (Some(started), Some(timing)) = (started, gles.timing.as_ref()) {
+        let took = started.elapsed();
+        entry.timing.add(took);
+        timing.call_made(&gles, &call, took);
     }
+    result
 }
 
 // ----------------------------------------------------------------------------- the activation

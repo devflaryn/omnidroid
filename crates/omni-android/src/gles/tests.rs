@@ -436,3 +436,33 @@ fn with_no_driver_egl_answers_as_aosps_libegl_and_gl_as_with_no_context() {
     // nothing above has left one on this thread.
     assert_eq!(error(), EGL_SUCCESS);
 }
+
+#[test]
+fn the_timing_census_is_asked_for_by_a_value_that_is_not_off() {
+    use super::timing::asked;
+    assert!(!asked(None));
+    for off in ["", " ", "0", "off", "OFF"] {
+        assert!(!asked(Some(off)), "{off:?}");
+    }
+    for on in ["1", "yes", "on"] {
+        assert!(asked(Some(on)), "{on:?}");
+    }
+}
+
+#[test]
+fn a_wait_is_filed_under_the_age_of_its_fence() {
+    use super::timing::Timing;
+    use std::time::Duration;
+    let timing = Timing::default();
+    timing.fence_made(0xA);
+    timing.fence_made(0xB);
+    timing.fence_made(0xC);
+    timing.waited(0xC, 1, 1_000, 0x911A, Duration::from_micros(5));
+    timing.waited(0xA, 1, 1_000, 0x911C, Duration::from_millis(20));
+    timing.waited(0xDEAD, 1, 1_000, 0x911C, Duration::from_millis(1));
+    let waits = timing.waits_so_far();
+    let ages: Vec<(u32, u32, u64)> = waits.iter().map(|(k, s)| (k.age, k.answer, s.count)).collect();
+    assert!(ages.contains(&(0, 0x911A, 1)), "{ages:?}");
+    assert!(ages.contains(&(2, 0x911C, 1)), "{ages:?}");
+    assert!(ages.contains(&(u32::MAX, 0x911C, 1)), "an unknown fence has no age: {ages:?}");
+}
