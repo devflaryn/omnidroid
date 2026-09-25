@@ -30,6 +30,14 @@
 //! -- the availability check may flush the command stream, which the swap has just done anyway.
 //! The engine makes no queries of its own on this path (the census: no `glBeginQuery`,
 //! `glQueryCounterEXT` or `glGetQueryObject*` call in 30 minutes, l10).
+//!
+//! `OMNI_GLES_TIMING_GPU=0` keeps the CPU side and turns the GPU queries off.
+//!
+//! **Read the GPU numbers with the host's desktop in mind.** The timestamps are the GPU's clock,
+//! and another client's work (the compositor, a remote-desktop screencast, a visible GL app)
+//! runs in time slices between the engine's commands, so it lands inside a frame's span. MEASURED
+//! (Linux, NVC0, 2026-09-25): the same call mix -- ~13,200 calls and ~230 draws a frame -- took
+//! 90 ms of GPU a frame in one desktop state (g2) and 71 ms in another (t2).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -347,7 +355,11 @@ impl Timing {
     /// Decide once whether the GPU part can run on this host, and resolve what it calls.
     fn gpu_procs(&self, gles: &Gles, call: &Call, state: &mut State) -> Option<Procs> {
         if state.gpu.is_none() {
-            state.gpu = Some(resolve_procs(gles, call));
+            state.gpu = Some(if std::env::var("OMNI_GLES_TIMING_GPU").is_ok_and(|v| v == "0") {
+                Err("off (OMNI_GLES_TIMING_GPU=0)".to_string())
+            } else {
+                resolve_procs(gles, call)
+            });
         }
         match &state.gpu {
             Some(Ok(procs)) => Some(*procs),
