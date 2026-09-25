@@ -54,9 +54,10 @@ impl Fixture {
             .address
     }
 
-    /// Run `entry` with this instance published to the calling thread.
+    /// Run `entry` with this instance published to the calling thread, under a [`RunWatchdog`].
     fn run(&self, cpu: &mut dyn GuestCpu, entry: omni_cpu::GuestAddr) -> Result<ExitReason, AbiError> {
         let _active = self.bionic.activate().expect("a thread block");
+        let _watchdog = RunWatchdog::arm(&self.bionic);
         self.boundary.run(cpu, entry, BUDGET)
     }
 
@@ -79,6 +80,54 @@ impl Fixture {
             out.push(byte);
         }
         out
+    }
+}
+
+/// How long one guest run on the test thread may take before [`RunWatchdog`] stops the instance.
+///
+/// Far past anything a correct run here needs -- the whole target runs in under a minute in
+/// release -- and past the longest deliberate wait in it (a 90 s sleep whose stop is the point).
+const RUN_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// **Every guest run on the test thread ends, even when the code under test is broken.**
+///
+/// Since 2026-09-24 a guest wait is carried out however long it asks for, and only the stop
+/// switch ends one early. That is right for the guest and dangerous for this file: a mutation that
+/// breaks a wake -- a pipe that never becomes readable, a clock that puts a deadline decades out,
+/// a malformed `nanosleep` accepted as `{-1, 0}` -- turned a wait the old cap refused after a minute
+/// into one that never returns, and a test that never returns is not a failing test. MEASURED:
+/// mutation row `clocks-A1` sat in `epoll_wait(-1)` for 7,522 s until the binary was killed.
+///
+/// So each run arms this, and if the run has not come back in [`RUN_WATCHDOG`] it throws the
+/// instance's stop switch: the wait ends in a refusal naming the stop, and the test fails on it.
+/// The switch is per instance and each test builds its own, so nothing else is touched.
+struct RunWatchdog {
+    done: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunWatchdog {
+    fn arm(bionic: &Arc<Bionic>) -> RunWatchdog {
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let bionic = Arc::clone(bionic);
+        let thread = std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                finished.recv_timeout(RUN_WATCHDOG)
+            {
+                eprintln!("RUN WATCHDOG: a guest run passed {RUN_WATCHDOG:?}; stopping the instance");
+                bionic.stop_guest_threads();
+            }
+        });
+        RunWatchdog { done: Some(done), thread: Some(thread) }
+    }
+}
+
+impl Drop for RunWatchdog {
+    fn drop(&mut self) {
+        drop(self.done.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -12515,9 +12564,15 @@ fn a_timerfd_wakes_epoll_at_its_deadline_on_the_guests_own_monotonic_clock() {
     let deadline = (seconds * 1_000_000_000 + nanos) + 60_000_000;
     write_itimerspec(&f, spec, (0, 0), (deadline / 1_000_000_000, deadline % 1_000_000_000));
     assert_eq!(call_with_errno(&f, "timerfd_settime", &[timer as u64, 1, spec as u64, 0]), (0, 0));
+    // **Bounded at 10 s, not -1**, and that is the detector's shape rather than a weakening: the
+    // relative arm above already proves -1 ends at a timer's deadline. Here a guest clock that is
+    // not the timer's clock (mutation row `clocks-A1`: CLOCK_MONOTONIC served from the wall
+    // clock) puts the deadline ~56 years out, and with -1 the test waited for it -- a hang the
+    // harness could only record as "caught" once someone killed the binary (7,522 s, 2026-09-24).
+    // Bounded, it fails with 0 ready after ten seconds.
     let started = std::time::Instant::now();
-    let (ready, _) = call_with_errno(&f, "epoll_wait", &[epfd as u64, events as u64, 4, u64::MAX]);
-    assert_eq!(ready, 1);
+    let (ready, _) = call_with_errno(&f, "epoll_wait", &[epfd as u64, events as u64, 4, 10_000]);
+    assert_eq!(ready, 1, "the absolute deadline, read on the guest's own clock, arrived");
     assert!(started.elapsed() < std::time::Duration::from_millis(1500), "{:?}", started.elapsed());
     assert_eq!(call_with_errno(&f, "read", &[timer as u64, buf, 8]), (8, 0));
     // **An absolute deadline already in the past is expired at once** -- the case that tells
