@@ -2125,17 +2125,57 @@ pub static DECLARED: &[ClassSpec] = &[
     // `setListener(J)V` is `Long.valueOf` then `sput-object nativeListenerPtr` and nothing else;
     // the only readers of that static are this class's own Java methods (`startInquiry`,
     // `onComplete`, `onError`, `onCancel`), which this runtime does not execute. So the host's
-    // duty is to observe it: a sink. `startInquiry` is the start of a facial-age-estimation flow
-    // through a third-party SDK and stays unanswered -- refused by name if it is ever reached.
+    // duty is to observe it: a sink.
+    //
+    // **`isAvailable()Z` (MEASURED 2026-09-25, run w31: the owner pressed "Unlock chat" in a
+    // world and the Lua thread died on `CallBooleanMethodV` of it, freezing the game).** What it
+    // is, from `classes2.dex`: `sget-object personaSdk; if-eqz -> false; true` -- whether the
+    // Persona SDK was set up, nothing about a camera. `personaSdk` is written in one place,
+    // `onCreate(LifecycleOwner)`: `NativeHelper.a0` adds this object to `MainGameActivity`'s
+    // lifecycle (when `pk.u.b()`: not TV, not Chromebook), and `onCreate` then does
+    // `Class.forName("com.roblox.client.personasdk.PersonaActivityResultLauncher")`, constructs it
+    // reflectively and stores it. The launcher is the `personasdk` dynamic feature module
+    // (`classes3.dex` here, fused; on a Play install it is downloaded on demand, `bi.g.k`), and
+    // it is the Persona SDK's camera activity that runs the age check. **This runtime carries no
+    // Persona SDK** -- no module code runs, no camera, no activity to launch -- which is exactly
+    // the state the Java writes for: `Class.forName` throws `ClassNotFoundException` ("Class not
+    // found: ..." in the log) and `personaSdk` stays null. So the field is `Assigned` (no
+    // scripted statement ever stores it) and `isAvailable` tests it: **false**, the answer a
+    // device without the module gives. Nothing is bypassed: the engine's own gate
+    // (`FacialAgeEstimationService:IsAvailable`, `0x4849fa0` -> core `0x2f50248` -> this) reports
+    // the native route unavailable and the Lua app takes its web route (the Persona link,
+    // `FAEDirectLinkUpsell`).
+    //
+    // `startInquiry` stays unanswered, and **the engine cannot reach it here**: its core
+    // (`0x2f50260`) calls `isAvailable` on this same object first and, on false, fails the
+    // inquiry with "Not available." without calling the platform. Were it reached anyway, its
+    // Java is the `personaSdk == null` branch (log, `JNIInquiryResultListener.onError(ptr, id,
+    // "PersonaSdk is not initialized")`), which a refusal naming it surfaces rather than hides.
     ClassSpec {
         name: "com/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol",
         tier: Tier::Support,
-        methods: &[m("setListener", "(J)V", Answer::Sink)],
-        fields: &[sf(
-            "INSTANCE",
-            "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;",
-            Answer::StaticInstance,
-        )],
+        methods: &[
+            m("setListener", "(J)V", Answer::Sink),
+            m("isAvailable", "()Z", Answer::StaticIsSet("personaSdk")),
+        ],
+        fields: &[
+            sf(
+                "INSTANCE",
+                "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;",
+                Answer::StaticInstance,
+            ),
+            sf("personaSdk", "Lcom/roblox/universalapp/facialageestimation/a;", Answer::Assigned),
+        ],
+    },
+    // The type of `personaSdk` above: the base dex's `PersonaSdk` interface (obfuscated `a`,
+    // `onActivityCreated(j.b)`, `launchInquiry(String, String, a$a)`), which the module's
+    // `PersonaActivityResultLauncher` implements. Declared so the field's type resolves and a
+    // store into it can be type-checked; nothing here constructs one.
+    ClassSpec {
+        name: "com/roblox/universalapp/facialageestimation/a",
+        tier: Tier::Support,
+        methods: NONE,
+        fields: NONE,
     },
     // ---- device attestation ("quote"): a class the generator cannot see -----------------------
     //

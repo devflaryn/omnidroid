@@ -2436,6 +2436,80 @@ mod tests {
         assert_eq!(member.answer, Answer::Sink);
     }
 
+    const FAE: &str = "com/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol";
+    const PERSONA_SDK: &str = "Lcom/roblox/universalapp/facialageestimation/a;";
+
+    /// `FacialAgeEstimationProtocol.INSTANCE.isAvailable()`, called the way the engine calls it:
+    /// `CallBooleanMethodV` on the object `GetStaticObjectField(INSTANCE)` answered.
+    fn fae_is_available(jni: &Jni) -> Value {
+        let mut state = jni.state();
+        let class = state.registry.find(FAE).expect("declared");
+        let own = format!("L{FAE};");
+        let field = state.registry.field(class, "INSTANCE", &own, true).expect("declared");
+        let holder = state.registry.field_member(field).expect("a member").clone();
+        let Value::Object(Some(receiver)) =
+            static_instance(&mut state, "GetStaticObjectField", 0, field, &holder).expect("INSTANCE")
+        else {
+            panic!("INSTANCE is an object")
+        };
+        let method = state.registry.method(class, "isAvailable", "()Z", false).expect("declared");
+        let member = state.registry.member(method).expect("a member").clone();
+        evaluate(&mut state, "CallBooleanMethodV", 0, class, &member, Some(receiver), &[])
+            .expect("isAvailable is answered, not refused")
+    }
+
+    /// **`FacialAgeEstimationProtocol.isAvailable()` is `personaSdk != null`, and on this runtime
+    /// nothing sets `personaSdk`: false, the answer of a device without the Persona SDK module.**
+    ///
+    /// MEASURED (run w31): the refusal this replaces killed the Lua thread when the owner pressed
+    /// "Unlock chat", and the game froze. Three wrong answers each fail a different line: the
+    /// refusal fails the first call; a constant `true` (a device *with* the module, which this
+    /// runtime is not) fails the first assertion; a constant `false` fails the second, which is
+    /// what proves the answer is the Java's own test of the field rather than a chosen value.
+    #[test]
+    fn facial_age_estimation_is_unavailable_until_a_persona_sdk_is_assigned() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        assert_eq!(
+            fae_is_available(&jni),
+            Value::Boolean(false),
+            "no onCreate stored a PersonaActivityResultLauncher: personaSdk is null"
+        );
+
+        // `onCreate`'s `sput-object personaSdk` on a device that has the module -- a state this
+        // runtime never reaches, set here only to show the answer follows the field.
+        let sdk = jni.new_object("com/roblox/universalapp/facialageestimation/a").expect("a PersonaSdk");
+        jni.put_static_object(FAE, "personaSdk", PERSONA_SDK, sdk).expect("onCreate's store");
+        assert_eq!(fae_is_available(&jni), Value::Boolean(true), "the field is what is tested");
+
+        // `onDestroy`'s `sput-object null`.
+        jni.put_static_object(FAE, "personaSdk", PERSONA_SDK, 0).expect("onDestroy's store");
+        assert_eq!(fae_is_available(&jni), Value::Boolean(false));
+    }
+
+    /// **`startInquiry` stays a refusal naming itself**: the engine's core calls `isAvailable`
+    /// first and never reaches it while that is false, so a call here means the engine changed,
+    /// and that must say so rather than be answered.
+    #[test]
+    fn facial_age_estimation_start_inquiry_is_refused_by_name() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let class = state.registry.find(FAE).expect("declared");
+        let method = state
+            .registry
+            .method(class, "startInquiry", "(Ljava/lang/String;Ljava/lang/String;)V", false)
+            .expect("on the surface");
+        let member = state.registry.member(method).expect("a member").clone();
+        assert_eq!(member.answer, Answer::Unanswered);
+        let error = evaluate(&mut state, "CallVoidMethodV", 0, class, &member, None, &[])
+            .expect_err("refused");
+        match error {
+            AbiError::JniRefused { detail, .. } => assert!(detail.contains("startInquiry"), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// **`StartAppParams.surface()` answers the very `Surface` the host stored**, through the
     /// accessor the engine calls -- identity, not a new object of the same class, because the
     /// engine turns it into the `ANativeWindow` the window came from. And a field that is not an

@@ -9071,6 +9071,35 @@ directory", ADAPTER_FILES,
      """            if length <= 32 {""",
      ANDROID_LIB),
 
+    # ---- facial age estimation: FacialAgeEstimationProtocol.isAvailable (prefix `fae-`) ----------
+    # MEASURED (run w31): "Unlock chat" killed the Lua thread on this refusal and froze the game.
+    # The Java is `personaSdk != null`, and nothing on this runtime stores a Persona SDK (the
+    # `personasdk` module does not run here), so the answer is false by the Java's own test.
+    # Detectors: `jni::env::tests::facial_age_estimation_is_unavailable_until_a_persona_sdk_is_assigned`
+    # (and the dex-reading gate test for the declaration's shape).
+    ("fae-A1", "A", "isAvailable goes back to unanswered, so Unlock chat kills the Lua thread again",
+     JNI_CLASSES,
+     """            m("isAvailable", "()Z", Answer::StaticIsSet("personaSdk")),""",
+     """            m("isAvailable", "()Z", Answer::Unanswered),""",
+     ANDROID_LIB),
+    ("fae-A2", "A", "isAvailable answers true, as a phone with the Persona module -- which this runtime is not",
+     JNI_CLASSES,
+     """            m("isAvailable", "()Z", Answer::StaticIsSet("personaSdk")),""",
+     """            m("isAvailable", "()Z", Answer::Bool(true)),""",
+     ANDROID_LIB),
+    # Reads as the careful choice ("never available") and loses the property that the answer is
+    # the Java's test of the field: a Persona SDK stored would still answer false.
+    ("fae-B1", "B", "isAvailable is a constant false rather than the test of personaSdk",
+     JNI_CLASSES,
+     """            m("isAvailable", "()Z", Answer::StaticIsSet("personaSdk")),""",
+     """            m("isAvailable", "()Z", Answer::Bool(false)),""",
+     ANDROID_LIB),
+    ("fae-B2", "B", "isAvailable tests the wrong static (INSTANCE, always set), so it answers true",
+     JNI_CLASSES,
+     """            m("isAvailable", "()Z", Answer::StaticIsSet("personaSdk")),""",
+     """            m("isAvailable", "()Z", Answer::StaticIsSet("INSTANCE")),""",
+     ANDROID_LIB),
+
     # ---- pthread_key values without a shared lock (prefix `tlsfast-`) ---------------------------
     # MEASURED in-world: `pthread_getspecific` at 1.4-1.9 M calls/s on one worker and ~4% of all
     # non-JIT samples, every call taking one process-wide mutex and hashing. Key slots now carry

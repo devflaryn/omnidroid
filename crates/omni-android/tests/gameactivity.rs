@@ -6062,6 +6062,28 @@ mod dex {
     /// shape the caller expects. A caller that wants those distinguished should not be using a
     /// helper this small.
     pub fn only_const_string(dex: &[u8], class: &str, method: &str) -> Option<String> {
+        single_const_string(dex, code_item(dex, class, method)?)
+    }
+
+    /// `class.method`'s instruction stream, as 16-bit code units, when it has code.
+    pub fn code_units(dex: &[u8], class: &str, method: &str) -> Option<Vec<u16>> {
+        let code = code_item(dex, class, method)?;
+        let units = u32_at(dex, code + 12)? as usize;
+        (0..units).map(|k| u16_at(dex, code + 16 + 2 * k)).collect()
+    }
+
+    /// `(declaring class, name)` of one `field_id`.
+    pub fn field_ref(dex: &[u8], index: u32) -> Option<(String, String)> {
+        let (count, off) = (u32_at(dex, 80)?, u32_at(dex, 84)? as usize);
+        if index >= count {
+            return None;
+        }
+        let at = off + 8 * index as usize;
+        Some((type_name(dex, u32::from(u16_at(dex, at)?))?, string(dex, u32_at(dex, at + 4)?)?))
+    }
+
+    /// The `code_item` offset of `class.method` (the first with that name that has code).
+    fn code_item(dex: &[u8], class: &str, method: &str) -> Option<usize> {
         if dex.get(..4)? != b"dex\n" {
             return None;
         }
@@ -6095,7 +6117,7 @@ mod dex {
                     if code == 0 || method_name(dex, index)? != method {
                         continue;
                     }
-                    return single_const_string(dex, code as usize);
+                    return Some(code as usize);
                 }
             }
             return None;
@@ -6235,6 +6257,61 @@ fn the_application_name_the_script_sends_is_the_one_the_apk_hands_the_engine() {
          host tells the engine -- is {:?}. That value reaches nativeSetRobloxVersion and the \
          platform headers, and the APK's own Java side is the thing that knows it",
         manifest.version_name
+    );
+}
+
+/// **`FacialAgeEstimationProtocol.isAvailable()` is exactly `personaSdk != null` in the APK this
+/// gate runs**, and the registry answers it as that test of that field.
+///
+/// The declaration (`jni::classes`) claims the method is `sget-object personaSdk; if-eqz` and
+/// nothing else -- no camera, permission or Play-services check -- which is what makes "false,
+/// because this runtime has no Persona SDK module" the device's own answer rather than a chosen
+/// one. A future APK that adds a check to the method, or moves the state to another field, fails
+/// here naming what it found, instead of the answer silently drifting from the Java.
+///
+/// It needs the APK's dex and not a run.
+#[test]
+fn facial_age_estimation_is_available_is_the_persona_sdk_field_test_in_the_apk() {
+    use omni_android::jni::classes::{Answer, Registry};
+    const CLASS: &str = "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;";
+    let apk = omni_apk::Apk::open(apk_path()).expect("the real APK");
+    let found = apk
+        .entries()
+        .iter()
+        .map(|entry| entry.name().to_string())
+        .filter(|name| name.ends_with(".dex") && name != "classes4.dex")
+        .find_map(|name| {
+            let bytes = apk.read_named(&name).expect("read a dex out of the APK");
+            dex::code_units(&bytes, CLASS, "isAvailable").map(|units| (name, bytes, units))
+        });
+    let (dex_name, bytes, units) = found.unwrap_or_else(|| {
+        panic!("{CLASS}.isAvailable has no code in any dex of the APK: re-decode it before answering it")
+    });
+    // sget-object v0, <field>; if-eqz v0, +4; const/4 v0, #1; return v0; const/4 v0, #0; return v0
+    assert_eq!(units.len(), 8, "{dex_name}: isAvailable is {units:04x?}, not the eight-unit field test");
+    assert_eq!(
+        [units[0], units[2], units[3], units[4], units[5], units[6], units[7]],
+        [0x0062, 0x0038, 0x0004, 0x1012, 0x000f, 0x0012, 0x000f],
+        "{dex_name}: isAvailable is {units:04x?}, not `sget-object v0; if-eqz v0 -> false; true`"
+    );
+    let (declaring, field) = dex::field_ref(&bytes, u32::from(units[1])).expect("the field it reads");
+    assert_eq!((declaring.as_str(), field.as_str()), (CLASS, "personaSdk"), "{dex_name}");
+
+    let registry = Registry::with_declared();
+    let class = registry.find(&CLASS[1..CLASS.len() - 1]).expect("declared");
+    let method = registry.method(class, "isAvailable", "()Z", false).expect("declared");
+    assert_eq!(
+        registry.member(method).expect("a member").answer,
+        Answer::StaticIsSet("personaSdk"),
+        "the registry must answer isAvailable as the Java does: by testing personaSdk"
+    );
+    let field = registry
+        .field(class, "personaSdk", "Lcom/roblox/universalapp/facialageestimation/a;", true)
+        .expect("declared");
+    assert_eq!(
+        registry.field_member(field).expect("a member").answer,
+        Answer::Assigned,
+        "personaSdk is written only by onCreate's reflective construction of the module's launcher"
     );
 }
 
