@@ -199,8 +199,19 @@ account's cookie in two sessions at once is not something to try.
 | M3 | **59.2 (56.8)** | 2.36 | **2.80 / 2.50** | a 3 GiB device: faster *and* lighter (the texture budget), so a B setting -- for A it costs texture resolution |
 | M4 | capped 10, minimised from +300 s | **0.57** | 2.80 / 2.52 | +480 s table: guest heap 1,283; read-only file copies 0.6 (101 in M1); JIT 251; host C heaps 962 |
 
-So today's B instance is **~2.8 GiB and ~0.6 cores**; the host C heaps (~0.95 GiB) are the next
-target, then the engine heap (~1.2-1.5 GiB) and the JIT cache (~250 MiB).
+| M5 | M4 + a 2 GiB device | 0.47 | 2.74 / 2.47 | engine heap 1,249 -- barely moves below 3 GiB |
+| M6 | M4 + `OMNI_GUEST_CPUS=4 OMNI_LOOPER_IDLE_US=4000` | 0.61 | 2.76 / 2.49 | no gain |
+| M8 | M4 + `OMNI_GUEST_ENV=MIMALLOC_PURGE_DELAY=0` | 0.44 | 2.76 / 2.49 | engine heap 1,267: **it is live data**, not purgeable slack |
+| **H1** | M1 on `a1ef0c5` (patches 0024-0027: dynarmic's per-block tables 1,144 -> 225 B/block) | **48.4 (39.8)**, 2.13 cores | **2.61 / 2.27** | **C heaps 968 -> 313 MiB** (tables 181 MiB for 704k blocks); engine heap 1,600 |
+| **H2** | M4 on `a1ef0c5` | 10 (capped), **0.63** | **2.48 / 2.16** | C heaps 304; engine heap 1,516 (M4 1,283 -- the engine heap varies run to run by ~0.2 GiB) |
+
+So a B instance is now **~2.5 GiB and ~0.6 cores**. What is left, largest first: the engine's own
+heap (1.25-1.6 GiB, live data -- a lighter place would need less; not ours to cut); the shared
+code cache (~250 MiB committed for ~700k blocks); ~8 allocations of ~31 MiB each that are
+*committed but never touched* (0 resident: commit charge, not RAM -- matters when 35 instances
+share one commit limit; owner not yet named); and the per-block tables (181 MiB). **On this
+32 GiB PC, PS99 fits ~15-18 such instances in RAM** (asked the owner which game and how much RAM
+the B machine has).
 
 Record in each: private and working set at `onGameLoaded` + 300 s, median cores and fps over
 +300..+450 s, and the `MEMREPORT` table at +300 s. `OMNI_GRAPHICS_QUALITY` edits the storage's
