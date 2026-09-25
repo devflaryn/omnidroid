@@ -22,7 +22,7 @@
 //! takes and releases one mutex ~900,000 times a second makes that window easy to hit.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use omni_bionic::metadata::Yield;
@@ -43,20 +43,39 @@ use parking_lot::Mutex;
 /// the keys `parking_lot`'s own mutexes use are in the same space. They cannot collide: a key
 /// is only ever the address of the object that parks on it, and a guest mapping is never a host
 /// `parking_lot` object.
-#[derive(Debug, Default)]
+///
+/// # Nothing on the wake path is shared by two threads waking two addresses
+///
+/// MEASURED in a world (sampling profiler with symbols, 2026-09-25): `wake` was 3.7% of the
+/// samples outside translated code and 8.5% of those in handlers. Every `pthread_mutex_unlock`
+/// issues one, and each did a `fetch_add` on one process-wide counter, locked the one table of
+/// parked addresses, and -- whenever anything at all was parked, which in a world is always --
+/// scanned every parked address for a near miss. Measured here (`tests/perf.rs`, eight threads
+/// each waking its own address with 32 parked elsewhere): over a microsecond a wake. Now:
+///
+/// * the wait and wake counters are **striped** by thread ([`STRIPES`] cache lines);
+/// * the parked table is **sharded** by address ([`PARK_SHARDS`] locks, each on its own lines);
+/// * the near-miss check reads two counters of an **occupancy** array -- threads parked per
+///   16-byte block, hashed -- and looks at a shard only when a waiter may be within eight bytes.
+///   Those counters are written only by a park and its end, so on the wake path they are lines
+///   every core reads and none writes.
 pub struct AddressFutex {
-    /// Diagnostics only: how many waits and wakes have been performed.
-    waits: AtomicU64,
-    wakes: AtomicU64,
+    /// Diagnostics only: how many waits and wakes have been performed, per stripe.
+    stripes: Box<[Stripe]>,
     /// The guest address of the most recent park. See [`AddressFutex::parked_on`].
     last_wait: AtomicU64,
-    /// Every address currently parked on, and how many threads are on each.
+    /// Every address currently parked on, and how many threads are on each, split by
+    /// [`park_slot`] into [`PARK_SHARDS`] tables.
     ///
     /// **Kept so that a shutdown can reach them.** `parking_lot_core` has no "unpark everything"
     /// across all keys -- it is a hash table and there is no key list -- so the only way to wake
     /// every waiter is to know which addresses have one. Maintained around the park itself, so
     /// an entry exists for exactly as long as a thread is on that queue.
-    parked: Mutex<HashMap<u64, usize>>,
+    parked: Box<[ParkShard]>,
+    /// Threads parked on an address in each 16-byte block, by [`park_slot`] of the block: the
+    /// wake path's one-load answer to "could a waiter be within eight bytes of this address".
+    /// Changed only under the lock of the shard the slot belongs to.
+    occupancy: Box<[AtomicU32]>,
     /// Set when the instance is shutting down. See [`AddressFutex::stop`].
     stopping: AtomicBool,
     /// How many parks were entered with **no deadline**. See [`AddressFutex::indefinite_parks`].
@@ -66,11 +85,94 @@ pub struct AddressFutex {
     near_misses: Mutex<Vec<(u64, u64)>>,
 }
 
+/// How many cache lines the wait and wake counters are striped over. A power of two.
+pub const STRIPES: usize = 64;
+/// How many independently locked tables the parked addresses are split into. A power of two.
+pub const PARK_SHARDS: usize = 64;
+/// How many occupancy counters there are: [`PARK_SHARDS`] times a power of two, so that a slot's
+/// shard is its top bits.
+const OCCUPANCY_SLOTS: usize = 4096;
+const _: () = assert!(OCCUPANCY_SLOTS.is_power_of_two() && OCCUPANCY_SLOTS % PARK_SHARDS == 0);
+
+/// One stripe of the counters, alone on its cache lines.
+#[repr(align(128))]
+#[derive(Default)]
+struct Stripe {
+    waits: AtomicU64,
+    wakes: AtomicU64,
+}
+
+/// One shard of the parked table, alone on its cache lines.
+#[repr(align(128))]
+#[derive(Default)]
+struct ParkShard(Mutex<HashMap<u64, usize>>);
+
+/// The occupancy slot of the 16-byte block holding `addr`. Its shard in the parked table is
+/// `slot / (OCCUPANCY_SLOTS / PARK_SHARDS)`, so the two always agree.
+fn park_slot(addr: u64) -> usize {
+    block_slot(addr >> 4)
+}
+
+fn block_slot(block: u64) -> usize {
+    (block.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - OCCUPANCY_SLOTS.trailing_zeros())) as usize
+}
+
+const fn shard_of_slot(slot: usize) -> usize {
+    slot / (OCCUPANCY_SLOTS / PARK_SHARDS)
+}
+
+/// This thread's stripe: assigned round-robin on a thread's first wait or wake.
+fn stripe() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+    MINE.with(|mine| {
+        let at = mine.get();
+        if at != usize::MAX {
+            return at;
+        }
+        let at = NEXT.fetch_add(1, Ordering::Relaxed) % STRIPES;
+        mine.set(at);
+        at
+    })
+}
+
+impl Default for AddressFutex {
+    fn default() -> Self {
+        Self {
+            stripes: (0..STRIPES).map(|_| Stripe::default()).collect(),
+            last_wait: AtomicU64::new(0),
+            parked: (0..PARK_SHARDS).map(|_| ParkShard::default()).collect(),
+            occupancy: (0..OCCUPANCY_SLOTS).map(|_| AtomicU32::new(0)).collect(),
+            stopping: AtomicBool::new(false),
+            indefinite: AtomicU64::new(0),
+            near_misses: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for AddressFutex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddressFutex")
+            .field("activity", &self.activity())
+            .field("parked_now", &self.parked_now())
+            .field("stopping", &self.stopped())
+            .field("indefinite", &self.indefinite_parks())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AddressFutex {
     /// A futex with no waiters.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The parked table's shard holding `addr`'s entry.
+    fn shard(&self, addr: u64) -> &Mutex<HashMap<u64, usize>> {
+        &self.parked[shard_of_slot(park_slot(addr))].0
     }
 
     /// How many waits have been entered, and how many wake calls issued.
@@ -80,7 +182,9 @@ impl AddressFutex {
     /// have. They exist so a test can say "this really blocked" rather than "this returned".
     #[must_use]
     pub fn activity(&self) -> (u64, u64) {
-        (self.waits.load(Ordering::Relaxed), self.wakes.load(Ordering::Relaxed))
+        self.stripes.iter().fold((0, 0), |(waits, wakes), stripe| {
+            (waits + stripe.waits.load(Ordering::Relaxed), wakes + stripe.wakes.load(Ordering::Relaxed))
+        })
     }
 
     /// Park on the guest word at `addr` **only if it still holds `expected`**, checked atomically
@@ -173,8 +277,11 @@ impl AddressFutex {
         if self.stopped() {
             return Ok(WaitResult::WouldBlock);
         }
+        // See `stop`: re-read under the bucket lock, so a stop that began after the check above
+        // cannot leave this thread asleep.
+        let validate = || !self.stopped() && still_expected();
         let _parked = self.enter_park(addr);
-        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.stripes[stripe()].waits.fetch_add(1, Ordering::Relaxed);
         self.last_wait.store(addr, Ordering::Relaxed);
         if timeout.is_none() {
             self.indefinite.fetch_add(1, Ordering::Relaxed);
@@ -184,12 +291,12 @@ impl AddressFutex {
         // concurrently used by another parking implementation with incompatible invariants — the
         // key is a guest address, which no other parker in this process uses — and that
         // `validate` and `timed_out` neither panic nor call into `parking_lot`. `before_sleep` and
-        // `timed_out` are empty. `validate` is `still_expected`: one atomic load and a
-        // comparison, which takes no lock of any kind.
+        // `timed_out` are empty. `validate` is `still_expected` after the stop flag: two atomic
+        // loads and a comparison, which take no lock of any kind.
         let result = unsafe {
             parking_lot_core::park(
                 addr as usize,
-                still_expected,
+                validate,
                 || {},
                 |_, _| {},
                 parking_lot_core::DEFAULT_PARK_TOKEN,
@@ -233,13 +340,33 @@ impl AddressFutex {
     ///
     /// Idempotent, and it cannot be taken back: a futex that has been stopped belongs to an
     /// instance that is shutting down.
+    ///
+    /// # Why a thread that parks while this runs cannot sleep through it
+    ///
+    /// The flag is set **before** any shard is read, and a waiter records its address in its
+    /// shard **before** it parks and re-reads the flag inside `park`'s `validate`, under the
+    /// queue's bucket lock. So for a waiter that passed the first check:
+    ///
+    /// * if this read the waiter's shard before the waiter's entry went in, the waiter's shard
+    ///   lock came after this one's, which came after the flag: `validate` sees the flag and the
+    ///   waiter does not sleep;
+    /// * otherwise this sees the address and wakes it, under the same bucket lock `validate`
+    ///   holds -- a waiter already queued is woken, and one not yet queued validates after the
+    ///   wake, which came after the flag, and does not sleep.
+    ///
+    /// Before the table was sharded that second re-read did not exist, and a waiter that
+    /// checked the flag, lost the processor, and recorded its address after the table had been
+    /// read would park on a queue nobody was going to wake.
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
-        let addresses: Vec<u64> = self.parked.lock().keys().copied().collect();
-        for address in addresses {
-            // Every waiter on every address, not one each: a queue with three threads on it needs
-            // three wakes, and `unpark_all` is the operation that does not have to know how many.
-            omni_bionic::threads::Futex::wake(self, address, u32::MAX);
+        for shard in self.parked.iter() {
+            let addresses: Vec<u64> = shard.0.lock().keys().copied().collect();
+            for address in addresses {
+                // Every waiter on every address, not one each: a queue with three threads on it
+                // needs three wakes, and `unpark_all` is the operation that does not have to know
+                // how many.
+                omni_bionic::threads::Futex::wake(self, address, u32::MAX);
+            }
         }
     }
 
@@ -253,10 +380,15 @@ impl AddressFutex {
     ///
     /// **A detector rather than a watch**, unlike [`activity`](AddressFutex::activity): it is zero
     /// exactly when nothing is parked, so a shutdown that left a thread behind is visible in it.
+    ///
+    /// Read shard by shard, so a count taken while threads park and wake is a sum of moments, not
+    /// one moment. Settled, it is exact.
     #[must_use]
     pub fn parked_now(&self) -> (usize, usize) {
-        let parked = self.parked.lock();
-        (parked.values().sum(), parked.len())
+        self.parked.iter().fold((0, 0), |(threads, addresses), shard| {
+            let parked = shard.0.lock();
+            (threads + parked.values().sum::<usize>(), addresses + parked.len())
+        })
     }
 
     /// Wakes that landed **within eight bytes of a parked waiter, without landing on it**.
@@ -280,8 +412,11 @@ impl AddressFutex {
     /// occur, which is a **detector** and not a watch: it is zero exactly when no wake came near a
     /// waiter it missed.
     ///
-    /// The check runs only when something is actually parked, which is rare — measured at two
-    /// waiters across a whole startup — so the common path is one uncontended mutex acquisition.
+    /// The check costs a wake two loads of counters nobody on the wake path writes: threads parked
+    /// in the two 16-byte blocks that eight bytes either side of the address can reach. Only
+    /// when one of them is non-zero does it take a lock -- the shard of the wake's own address,
+    /// and of each block's -- and compare addresses, so the answer is the one the whole table
+    /// would give, without a wake ever walking the table.
     #[must_use]
     pub fn near_misses(&self) -> Vec<(u64, u64)> {
         self.near_misses.lock().clone()
@@ -311,16 +446,55 @@ impl AddressFutex {
     /// Takes the table's lock, so it is a diagnostic call and not a hot path.
     #[must_use]
     pub fn parked_addresses(&self) -> Vec<(u64, usize)> {
-        let mut out: Vec<(u64, usize)> =
-            self.parked.lock().iter().map(|(addr, count)| (*addr, *count)).collect();
+        let mut out: Vec<(u64, usize)> = Vec::new();
+        for shard in self.parked.iter() {
+            out.extend(shard.0.lock().iter().map(|(addr, count)| (*addr, *count)));
+        }
         out.sort_unstable();
         out
     }
 
     /// Record this thread as parked on `addr` for as long as the guard lives.
     fn enter_park(&self, addr: u64) -> ParkedOn<'_> {
-        *self.parked.lock().entry(addr).or_insert(0) += 1;
-        ParkedOn { futex: self, addr }
+        let slot = park_slot(addr);
+        let mut shard = self.parked[shard_of_slot(slot)].0.lock();
+        *shard.entry(addr).or_insert(0) += 1;
+        self.occupancy[slot].fetch_add(1, Ordering::Relaxed);
+        ParkedOn { futex: self, addr, slot }
+    }
+
+    /// Whether a wake of `addr` may have come within eight bytes of a waiter: the occupancy of
+    /// the two 16-byte blocks `addr - 8` and `addr + 8` fall in (the seventeen bytes between them
+    /// always span exactly two). No lock, no write.
+    #[inline]
+    fn may_be_near_a_waiter(&self, addr: u64) -> bool {
+        let low = addr.saturating_sub(8) >> 4;
+        let high = addr.saturating_add(8) >> 4;
+        self.occupancy[block_slot(low)].load(Ordering::Relaxed) != 0
+            || self.occupancy[block_slot(high)].load(Ordering::Relaxed) != 0
+    }
+
+    /// The near-miss check proper, for a wake the occupancy could not clear. See `near_misses`.
+    #[cold]
+    fn record_near_misses(&self, addr: u64) {
+        if self.shard(addr).lock().contains_key(&addr) {
+            return;
+        }
+        let low = shard_of_slot(block_slot(addr.saturating_sub(8) >> 4));
+        let high = shard_of_slot(block_slot(addr.saturating_add(8) >> 4));
+        let mut near: Vec<u64> = Vec::new();
+        for shard in if low == high { vec![low] } else { vec![low, high] } {
+            near.extend(self.parked[shard].0.lock().keys().copied().filter(|at| at.abs_diff(addr) <= 8));
+        }
+        if near.is_empty() {
+            return;
+        }
+        let mut misses = self.near_misses.lock();
+        for at in near {
+            if !misses.contains(&(addr, at)) {
+                misses.push((addr, at));
+            }
+        }
     }
 
     /// The guest address of the most recent park, or `0` if nothing has parked.
@@ -363,16 +537,19 @@ unsafe fn word_holds(addr: u64, expected: u32) -> bool {
 struct ParkedOn<'a> {
     futex: &'a AddressFutex,
     addr: u64,
+    /// [`park_slot`] of `addr`, which names both its shard and its occupancy counter.
+    slot: usize,
 }
 
 impl Drop for ParkedOn<'_> {
     fn drop(&mut self) {
-        let mut parked = self.futex.parked.lock();
+        let mut parked = self.futex.parked[shard_of_slot(self.slot)].0.lock();
         if let Some(count) = parked.get_mut(&self.addr) {
             *count -= 1;
             if *count == 0 {
                 parked.remove(&self.addr);
             }
+            self.futex.occupancy[self.slot].fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -401,8 +578,11 @@ impl Futex for AddressFutex {
             // window.
             return WaitResult::WouldBlock;
         }
+        // See `stop`: re-read under the bucket lock, so a stop that began after the check above
+        // cannot leave this thread asleep.
+        let validate = || !self.stopped() && still_expected();
         let _parked = self.enter_park(addr);
-        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.stripes[stripe()].waits.fetch_add(1, Ordering::Relaxed);
         self.last_wait.store(addr, Ordering::Relaxed);
         if timeout.is_none() {
             self.indefinite.fetch_add(1, Ordering::Relaxed);
@@ -414,12 +594,12 @@ impl Futex for AddressFutex {
         // `before_sleep` is not called with the bucket lock held in a way that could deadlock.
         // The key here is a guest address, which no other parker in this process uses (see the
         // type's documentation); `before_sleep` and `timed_out` are empty closures; and
-        // `validate` is `still_expected`: one atomic load and a comparison, which takes no lock
-        // and cannot panic.
+        // `validate` is the stop flag and `still_expected`: two atomic loads and a comparison,
+        // which take no lock and cannot panic.
         let result = unsafe {
             parking_lot_core::park(
                 addr as usize,
-                still_expected,
+                validate,
                 || {},
                 |_, _| {},
                 parking_lot_core::DEFAULT_PARK_TOKEN,
@@ -450,27 +630,12 @@ impl Futex for AddressFutex {
     }
 
     fn wake(&self, addr: u64, count: u32) -> u32 {
-        self.wakes.fetch_add(1, Ordering::Relaxed);
-        // See `near_misses`. Guarded on the table being non-empty so that the overwhelmingly
-        // common case -- a wake with nothing parked anywhere -- is one lock and one `is_empty`.
-        {
-            let parked = self.parked.lock();
-            if !parked.is_empty() && !parked.contains_key(&addr) {
-                let near: Vec<u64> = parked
-                    .keys()
-                    .copied()
-                    .filter(|at| at.abs_diff(addr) <= 8)
-                    .collect();
-                if !near.is_empty() {
-                    drop(parked);
-                    let mut misses = self.near_misses.lock();
-                    for at in near {
-                        if !misses.contains(&(addr, at)) {
-                            misses.push((addr, at));
-                        }
-                    }
-                }
-            }
+        self.stripes[stripe()].wakes.fetch_add(1, Ordering::Relaxed);
+        // See `near_misses`. Two loads of counters only a park writes, so the overwhelmingly
+        // common case -- no waiter anywhere near this address -- takes no lock and writes nothing
+        // another thread reads.
+        if self.may_be_near_a_waiter(addr) {
+            self.record_near_misses(addr);
         }
         if count == 0 {
             return 0;
@@ -1154,5 +1319,190 @@ mod tests {
             "the word was released before the waiter reached the queue; TimedOut is the lost wake"
         );
         assert_eq!(holder.join().expect("the holder"), parking_lot_core::ParkResult::Invalid);
+    }
+
+    /// Sixteen aligned words, each in its own 16-byte block, for waits a test controls.
+    #[repr(align(256))]
+    struct Words([AtomicU32; 64]);
+
+    fn words() -> &'static Words {
+        Box::leak(Box::new(Words(std::array::from_fn(|_| AtomicU32::new(0)))))
+    }
+
+    fn address(words: &Words, index: usize) -> u64 {
+        words.0[index].as_ptr() as usize as u64
+    }
+
+    /// **`stop` wakes a thread parked on every shard it has one on**, with no deadline: sixteen
+    /// threads on addresses chosen to land in sixteen different shards of the parked table, all
+    /// released, and none left counted.
+    #[test]
+    fn stop_wakes_threads_parked_in_every_shard() {
+        let futex: &'static AddressFutex = Box::leak(Box::new(AddressFutex::new()));
+        let words = words();
+        let mut chosen: Vec<u64> = Vec::new();
+        let mut shards = std::collections::HashSet::new();
+        for index in (0..64).step_by(4) {
+            let at = address(words, index);
+            if shards.insert(shard_of_slot(park_slot(at))) {
+                chosen.push(at);
+            }
+        }
+        let backing: &'static [AtomicU32] =
+            Box::leak((0..1 << 16).map(|_| AtomicU32::new(0)).collect::<Vec<_>>().into_boxed_slice());
+        for word in backing {
+            if chosen.len() == 16 {
+                break;
+            }
+            let at = word.as_ptr() as usize as u64;
+            if shards.insert(shard_of_slot(park_slot(at))) {
+                chosen.push(at);
+            }
+        }
+        assert_eq!(chosen.len(), 16, "sixteen addresses in sixteen shards");
+        let (done_tx, done_rx) = mpsc::channel();
+        for &at in &chosen {
+            let done = done_tx.clone();
+            thread::spawn(move || done.send((at, Futex::wait(futex, at, 0, None))).ok());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while futex.parked_now() != (16, 16) {
+            assert!(Instant::now() < deadline, "sixteen parked: {:?}", futex.parked_now());
+            thread::sleep(Duration::from_millis(1));
+        }
+        let mut listed: Vec<u64> = futex.parked_addresses().into_iter().map(|(at, _)| at).collect();
+        let mut expected = chosen.clone();
+        listed.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(listed, expected, "parked_addresses lists every shard's entries");
+        futex.stop();
+        for _ in 0..16 {
+            let (at, result) = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("stop left a thread parked: {:?}", futex.parked_addresses()));
+            // `Woken` from the queue, or `WouldBlock` for a thread that had recorded itself but
+            // not yet reached the queue when the wake landed (its `validate` saw the flag).
+            assert!(matches!(result, WaitResult::Woken | WaitResult::WouldBlock), "{at:#x}: {result:?}");
+        }
+        assert_eq!(futex.parked_now(), (0, 0));
+        assert_eq!(Futex::wait(futex, chosen[0], 0, None), WaitResult::WouldBlock, "and refuses from then on");
+    }
+
+    /// **A waiter that passed the stop check, and records itself after `stop` has read its
+    /// shard, does not sleep.** The interleaving is built, not raced: the test holds every shard's
+    /// lock, so two waiters -- one through `Futex::wait`, one through `wait_compared` -- pass the
+    /// stop check and block on recording themselves; the test then sets the flag and reads the
+    /// shards as `stop` does, finds them empty, and lets the waiters go. Neither has a deadline,
+    /// and nothing will ever wake their addresses: only the stop flag re-read inside `validate`,
+    /// under the bucket lock, returns them.
+    #[test]
+    fn a_waiter_recorded_after_stop_read_its_shard_does_not_sleep() {
+        let futex: &'static AddressFutex = Box::leak(Box::new(AddressFutex::new()));
+        let words = words();
+        let (first, second) = (address(words, 0), address(words, 32));
+        let guards: Vec<_> = futex.parked.iter().map(|shard| shard.0.lock()).collect();
+        let (done_tx, done_rx) = mpsc::channel();
+        let done = done_tx.clone();
+        thread::spawn(move || done.send(("wait", Ok(Futex::wait(futex, first, 0, None)))).ok());
+        thread::spawn(move || {
+            // SAFETY: `second` is a live, aligned word this test leaked.
+            let result = unsafe { futex.wait_compared(second, 0, || Ok::<(), ()>(()), None) };
+            done_tx.send(("wait_compared", result)).ok()
+        });
+        // Long enough for both to pass the stop check and reach the shard lock; one that has not
+        // yet reached it sees the flag at the first check, and the test passes without exercising
+        // the re-read -- never the other way round.
+        thread::sleep(Duration::from_millis(300));
+        futex.stopping.store(true, Ordering::Release);
+        assert!(guards.iter().all(|shard| shard.is_empty()), "stop's read of the shards finds nobody");
+        drop(guards);
+        let mut finished: Vec<_> = (0..2)
+            .map(|_| {
+                done_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| {
+                    panic!(
+                        "a waiter recorded after stop read its shard is asleep with nothing to wake \
+                         it: {:?}",
+                        futex.parked_addresses()
+                    )
+                })
+            })
+            .collect();
+        finished.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            finished,
+            vec![("wait", Ok(WaitResult::WouldBlock)), ("wait_compared", Ok(WaitResult::WouldBlock))]
+        );
+        assert_eq!(futex.parked_now(), (0, 0));
+    }
+
+    /// **A wake within eight bytes of a waiter, and not on it, is recorded, on either side of a
+    /// 16-byte block boundary** -- the occupancy check reads both blocks eight bytes either side
+    /// can reach, so a waiter only the low block or only the high block holds is each found. Nine
+    /// bytes away, far away, and on the waiter itself are not near misses.
+    #[test]
+    fn a_wake_within_eight_bytes_of_a_waiter_is_a_near_miss_on_either_side_of_a_block() {
+        let futex: &'static AddressFutex = Box::leak(Box::new(AddressFutex::new()));
+        let words = words();
+        // Word 5 is at +0x14: in the block at +0x10, four bytes into it.
+        let waiter = address(words, 5);
+        assert_eq!(waiter & 0xF, 4);
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || done_tx.send(Futex::wait(futex, waiter, 0, None)).ok());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while futex.parked_now() != (1, 1) {
+            assert!(Instant::now() < deadline, "the waiter never parked");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // `waiter - 8` reaches blocks +0x00 and +0x10: only the high one holds the waiter.
+        // `waiter + 8` reaches +0x10 and +0x20: only the low one does.
+        for miss in [waiter - 8, waiter + 8, waiter + 1, waiter - 4] {
+            assert_eq!(Futex::wake(futex, miss, 1), 0, "{miss:#x} wakes nobody");
+        }
+        for not_near in [waiter - 9, waiter + 9, waiter + 0x1000, waiter] {
+            if not_near == waiter {
+                continue;
+            }
+            assert_eq!(Futex::wake(futex, not_near, 1), 0);
+        }
+        let mut misses = futex.near_misses();
+        misses.sort_unstable();
+        let mut expected: Vec<(u64, u64)> =
+            [waiter - 8, waiter + 8, waiter + 1, waiter - 4].iter().map(|&at| (at, waiter)).collect();
+        expected.sort_unstable();
+        assert_eq!(misses, expected, "each wake within eight bytes, and only those");
+        assert_eq!(futex.activity().1, 4 + 3, "every wake counted, whichever stripe it was on");
+        // A wake on the waiter itself is not a miss, and wakes it -- once the waiter, recorded
+        // before it parks, has reached the queue.
+        while Futex::wake(futex, waiter, 1) == 0 {
+            assert!(Instant::now() < deadline, "the waiter never reached the queue");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).expect("woken"), WaitResult::Woken);
+        assert_eq!(futex.near_misses().len(), 4, "nothing added by the wakes on the waiter itself");
+        assert_eq!(futex.parked_now(), (0, 0));
+    }
+
+    /// The counters are striped by thread and summed on reading: waits and wakes from many
+    /// threads all arrive.
+    #[test]
+    fn activity_sums_every_thread_s_stripe() {
+        let futex: &'static AddressFutex = Box::leak(Box::new(AddressFutex::new()));
+        let words = words();
+        let at = address(words, 0);
+        let threads: Vec<_> = (0..(STRIPES + 8))
+            .map(|_| {
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        Futex::wake(futex, at + 64, 1);
+                    }
+                    // The word is 0 and 1 is expected: refused, but a wait all the same.
+                    assert_eq!(Futex::wait(futex, at, 1, None), WaitResult::WouldBlock);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("joined");
+        }
+        assert_eq!(futex.activity(), ((STRIPES + 8) as u64, (STRIPES + 8) as u64 * 100));
     }
 }
