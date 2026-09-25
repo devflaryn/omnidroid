@@ -364,10 +364,25 @@ Now regions are 16 MiB and a full one stays live; past 128 MiB of live code the 
 is retired (cold startup code, mostly) and only what is still run from it is translated again.
 Committed code per instance: 242-247 MiB -> at most ~150, ~130 expected. **Live check pending**
 (D38 amendment 3 says what to look for; `OMNI_JIT_SHARED_CACHE_LIVE_MB=256` is the fallback).
-**Open, found on the way**: the M3 initializer gate (`initializers.rs`) fails about one run in ten
-under the shared cache -- on `a1ef0c5` as on this build (Linux n = 30: 4 and 3; per thread 0) -- a
-pinned word 6 instead of 5, or one image pointer too many: the initializers start guest threads and
-the shared cache changes how soon they run. The gate should not pin a scheduling-dependent word.
+**Found on the way, and decided (`2fa8f0b`, VERIFICATION entry 22): the M3 initializer gate's
+flake was the test's, not the shared cache's, and not bionic's.** Its two signatures had two causes,
+and **both occur with per-thread caches too**:
+* *a pinned word 6 instead of 5*: `0x067d_67d0` is an emulated-TLS index (compiler-rt numbers
+  thread-locals in first-touch order). The main thread starts a worker (`0x284d168`) while
+  initialising the thread-local that word belongs to, and the worker's own first thread-local races
+  it for number 5; every failure was an exact swap, and a trace of the emutls mutex named the worker
+  as the taker of 5 in each. A race the engine has on a device too. Pin replaced.
+* *92,432 image pointers instead of 92,431*: a word counted as a pointer when its value lay inside
+  the image, and the engine's service descriptors store u32 pairs (`0x2667`, `0x222`) that read as
+  `0x222_0000_2667`; Windows places the image anywhere from `0x113 << 32` to `0x2c3 << 32`, so a few
+  placements in a hundred put the image around one. The gate now counts across two placements.
+MEASURED before (the gate alone / the whole binary): Windows shared 6/143 / 1/30, per thread 3/80
+/ 1/30; Linux shared 0/74 / 8/55, per thread 0/40 / 3/30 (one of the three while a build ran on
+that 4-core host; the whole binary leaves earlier instances' workers running, which is the load
+that opens the window). After: Windows 0/60 / 0/30 shared,
+0/25 whole binary per thread; Linux whole binary 0/40 shared, 0/20 per thread. In 8 of Windows' 115
+runs the gate printed numbers a placement had put the image around; in 4 of them the first
+placement, which the old count would have failed.
 
 **The owner's two products (stated 2026-09-25) -- they set the priorities from here:**
 (A) 3-4 instances at once on a good PC, high quality, high fps (gaming); (B) 30-35 instances at
@@ -408,10 +423,9 @@ view so the release landed outside it; a flash at let-go), fixed in `738b538`, `
 let-gos, no stuck button. **w35** (30 min, `2caefcf`, patch 0028 at a 128 MiB live limit): clean,
 2.45 GiB (committed code 121 MiB), but PS99's settled world kept evicting (31 PERF lines, 12-50k
 blocks translated again each) and ran ~60 s at 0-18 fps around +1310-1370 s with no window event ->
-the default live limit is 256 MiB (`db56a5f`, D38 amendment 4). **w36** (30 min, `db56a5f`): clean, 47.0 fps median, 2.55 GiB private, 2.06 cores, evictions on 3 PERF lines (all while loading), 9 windows under 20 fps of 321 (w35: 63), committed code 241 MiB -- amendment 4 confirmed. Open: the
-initializer gate (`initializers.rs`) fails ~1 run in 10 under the shared cache on Windows and Linux
-(a pinned word 6 vs 5 / 92,432 vs 92,431 image pointers), also on `a1ef0c5`, never with per-thread
-caches -- timing-dependent pins or a real race, not yet decided.
+the default live limit is 256 MiB (`db56a5f`, D38 amendment 4). **w36** (30 min, `db56a5f`): clean, 47.0 fps median, 2.55 GiB private, 2.06 cores, evictions on 3 PERF lines (all while loading), 9 windows under 20 fps of 321 (w35: 63), committed code 241 MiB -- amendment 4 confirmed. The
+initializer gate's flake (a pinned word 6 vs 5 / 92,432 vs 92,431 image pointers) is decided: the
+test's, per-thread caches show both too -- see "Found on the way" above.
 
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their

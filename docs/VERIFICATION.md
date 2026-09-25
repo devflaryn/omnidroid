@@ -5,7 +5,7 @@ because each one produced a **green suite that proved less than it claimed**, an
 person who wrote the test was the person who wrote the code — which is the blind spot that makes all
 of them possible.
 
-There are **twenty-one** of them. Entry 12 arrived in M5 and is the only one found by a test that
+There are **twenty-two** of them. Entry 12 arrived in M5 and is the only one found by a test that
 could not be written rather than by one that passed. Entry 13 arrived in M6 and is the only one
 found by reviewing a *copy* of the defect rather than the original. Entry 14 arrived in M6 and is
 the only one where a **test asserted the defect** and a comment supplied the reasoning that made
@@ -14,7 +14,9 @@ it look right. Entries 15 and 16 arrived together, later in M6, and are the only
 like a system that had stopped, and three guest threads died unremarked behind a green gate.
 Entries 17-19 arrived at the first presented frames, and all three are about **which thing a result
 was about**: a verdict printed before the process had finished, a test binary built from another
-worktree's source, and a window capture that could not see a swapchain.
+worktree's source, and a window capture that could not see a swapchain. Entry 22 is the only one
+that arrived as a **red** run: a flaky gate, blamed on the translation cache it happened to run
+under, whose pins had been proving less than they claimed all along.
 
 **This count has itself been wrong.** It said "fourteen" for as long as there were sixteen,
 because two entries were appended without it — which is the same defect as an `expect` whose
@@ -458,6 +460,39 @@ Nothing was wrong with input; the target had moved.
 
 > Aim a synthetic tap from a capture of the same configuration it will land in, and capture after
 > it. "The engine ignored the tap" and "the tap missed" look the same in every log.
+
+## 22. A pinned value can be a record of a race, and a number in range is not a pointer
+
+The M3 gate pinned eight words the initializers wrote and an exact count of words that became
+pointers into the image. After the shared translation cache became the default it failed about one
+run in ten -- one pinned word 6 instead of 5, or 92,432 image pointers instead of 92,431 -- and
+never, it was said, with per-thread caches (0 in 12). Either the cache had a race or the test did.
+Both failures were the test's, and neither was about the cache:
+
+* **The word was not a constant.** `0x067d_67d0` is the `index` of an emulated-TLS control block:
+  compiler-rt numbers thread-locals in the order *any* thread first touches them, and the thread
+  that touches that one starts a worker thread on the way, whose own first thread-local races it
+  for number 5. Each of the 9 failures dumped was an exact swap of the two indices, 17 assigned
+  as always; a trace of the emutls mutex named the worker as the taker of 5 in each one traced. The shared cache only made
+  the worker start as fast as native code would. The value records a race the engine really has.
+* **The count was a classification by value, and the value's meaning depended on the placement.**
+  A word counted as a pointer when it lay inside the loaded image. The engine's service
+  descriptors store two u32 fields side by side (`0x2667`, `0x222`), which read as
+  `0x222_0000_2667` -- and Windows puts the image anywhere from `0x113 << 32` to `0x2c3 << 32`. In a
+  few placements in a hundred the image lands around one of them.
+
+**Per-thread caches failed both ways too** -- the count 3 times in 80 runs on Windows, the word 3
+times in 30 on Linux: "never" was a sample of 12 and 30 (entry 9).
+
+The shared cache changed how often the first was *seen* -- its worker starts sooner -- and the
+second (5 in 143 shared, 3 in 80 per thread) never depended on it; seen together, under the new
+default, they looked like one defect with one cause. What decided it was reading what each pinned value
+*is* (a disassembly of the code that writes it) before asking why it changed.
+
+> Before pinning a value, find the code that writes it and ask whether any thread's timing or any
+> placement can change it. A pinned word is evidence only if it is determined by the program; a
+> count of "pointers" is exact only if a pointer is told from a number by something other than its
+> value -- here, a second placement: a pointer moves with the image and a number does not.
 
 # Process rules these produced
 
