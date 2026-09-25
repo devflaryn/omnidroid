@@ -5,6 +5,8 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <limits>
+
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <mcl/assert.hpp>
@@ -166,21 +168,22 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     const A64::LocationDescriptor descriptor{block.Location()};
     const A64::LocationDescriptor end_location{block.EndLocation()};
 
-    const auto range = boost::icl::discrete_interval<u64>::closed(descriptor.PC(), end_location.PC() - 1);
-    block_ranges.AddRange(range, descriptor);
+    // Omnidroid patch 0026: the pin's `closed(descriptor.PC(), end_location.PC() - 1)`, which is
+    // empty -- and was never returned -- when the block covers no bytes.
+    AddGuestRange(descriptor, descriptor.PC(), end_location.PC() - 1);
 
     return RegisterBlock(descriptor, entrypoint, size);
 }
 
 void A64EmitX64::ClearCache() {
     EmitX64::ClearCache();
-    block_ranges.ClearCache();
+    ClearGuestRanges();
     ClearFastDispatchTable();
     fastmem_patch_info.clear();
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    InvalidateBasicBlocks(GuestRangeLocations(ranges));
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
@@ -190,7 +193,7 @@ void A64EmitX64::ClearFastDispatchTable() {
 }
 
 size_t A64EmitX64::InvalidateCacheRangesCounted(const boost::icl::interval_set<u64>& ranges) {
-    const auto locations = block_ranges.InvalidateRanges(ranges);
+    const auto locations = GuestRangeLocations(ranges);
     size_t dropped = 0;
     for (const auto& location : locations) {
         dropped += block_descriptors.count(location);
@@ -204,8 +207,79 @@ size_t A64EmitX64::ForgetAllBlocks() {
     const size_t dropped = block_descriptors.size();
     UnlinkAllSlots();
     EmitX64::ClearCache();
-    block_ranges.ClearCache();
+    ClearGuestRanges();
     return dropped;
+}
+
+void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 last) {
+    if (last < first) {
+        return;
+    }
+    ASSERT(guest_ranges.size() < std::numeric_limits<u32>::max());
+    const u32 index = static_cast<u32>(guest_ranges.size());
+    guest_ranges.push_back(GuestRange{location, first, last});
+
+    const u64 first_page = first >> guest_page_bits;
+    const u64 last_page = last >> guest_page_bits;
+    if (last_page - first_page >= max_indexed_pages) {
+        wide_guest_ranges.push_back(index);
+        return;
+    }
+    for (u64 page = first_page;; ++page) {
+        guest_range_pages[page].push_back(index);
+        if (page == last_page) {
+            break;
+        }
+    }
+}
+
+tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boost::icl::interval_set<u64>& ranges) const {
+    tsl::robin_set<IR::LocationDescriptor> locations;
+    for (const auto& interval : ranges) {
+        const u64 first = boost::icl::first(interval);
+        const u64 last = boost::icl::last(interval);
+        const auto consider = [&](u32 index) {
+            const GuestRange& range = guest_ranges[index];
+            if (range.first <= last && first <= range.last) {
+                locations.insert(range.location);
+            }
+        };
+
+        for (const u32 index : wide_guest_ranges) {
+            consider(index);
+        }
+
+        const u64 first_page = first >> guest_page_bits;
+        const u64 last_page = last >> guest_page_bits;
+        if (last_page - first_page >= guest_range_pages.size()) {
+            // More pages asked about than have anything on them: walk what there is.
+            for (const auto& [page, indices] : guest_range_pages) {
+                if (page >= first_page && page <= last_page) {
+                    for (const u32 index : indices) {
+                        consider(index);
+                    }
+                }
+            }
+        } else {
+            for (u64 page = first_page;; ++page) {
+                if (const auto iter = guest_range_pages.find(page); iter != guest_range_pages.end()) {
+                    for (const u32 index : iter->second) {
+                        consider(index);
+                    }
+                }
+                if (page == last_page) {
+                    break;
+                }
+            }
+        }
+    }
+    return locations;
+}
+
+void A64EmitX64::ClearGuestRanges() {
+    std::vector<GuestRange>{}.swap(guest_ranges);
+    guest_range_pages = {};
+    std::vector<u32>{}.swap(wide_guest_ranges);
 }
 
 void A64EmitX64::PurgeFastmemPatchInfo(const void* begin, const void* end) {
@@ -280,14 +354,17 @@ A64::SharedCodeCache::Tables A64EmitX64::Census() const {
         }
     }
 
-    // boost::icl's interval_map: one tree node per interval holding a std::set, whose own tree has
-    // a node per location (MSVC's also allocates a head node per set). Estimated from sizeof and a
-    // tree node's three links and colour: the allocations are many and small.
-    constexpr u64 tree_node_overhead = 4 * sizeof(void*);
-    const auto [intervals, locations] = block_ranges.Census();
-    t.guest_ranges.entries = locations;
-    t.guest_ranges.bytes = intervals * (2 * sizeof(u64) + sizeof(std::set<IR::LocationDescriptor>) + tree_node_overhead)
-                         + (intervals + locations) * (sizeof(IR::LocationDescriptor) + tree_node_overhead);
+    // Patch 0026: one record per block, and the page index over them.
+    t.guest_ranges = RobinMapFigure(guest_range_pages);
+    t.guest_ranges.entries = guest_ranges.size();
+    t.guest_ranges.bytes += VectorBytes(guest_ranges) + VectorBytes(wide_guest_ranges);
+    for (const auto& [page, indices] : guest_range_pages) {
+        t.guest_ranges.bytes += VectorBytes(indices);
+    }
+    if (VectorBytes(guest_ranges) > t.guest_ranges.largest_bytes) {
+        t.guest_ranges.largest_bytes = VectorBytes(guest_ranges);
+        t.guest_ranges.largest_address = reinterpret_cast<std::uintptr_t>(guest_ranges.data());
+    }
     return t;
 }
 

@@ -779,6 +779,27 @@ tail of its list and translated again over seven rounds, each then running the t
 In the world (~700,000 blocks, ~1-2 million fastmem sites and link slots) this is expected to take
 the three arrays of 272, 224 and 80 MiB -- and their entries' vectors -- down to tens of MiB.
 
+### 0026 — x64: the guest ranges of emitted blocks, compact
+
+`0026-x64-the-guest-ranges-of-emitted-blocks-compact.patch`. **x64, a Jit's own cache and a shared
+one alike.** 0011 for the x64 backend: `A64EmitX64` kept the guest bytes each block was translated
+from in a `BlockRangeInformation<u64>` -- a boost::icl `interval_map` of `std::set`s, a tree node per
+interval and per location (the census estimates 144 bytes per block; about 100 MiB of the world's
+~700,000 blocks). It keeps one 24-byte `GuestRange` per emitted block (location and the closed range
+the pin registered, skipped when empty as the icl skipped it), indexed by the 4 KiB guest pages it
+covers; a block covering more than 64 pages goes to a list checked on every invalidation.
+`InvalidateCacheRanges` (and the shared cache's counted form) returns every location registered with
+a range intersecting a requested one -- what `InvalidateRanges` returned -- looking the pages up, or
+walking the index when more pages are asked about than it has. The x64 backend already cleared its
+ranges with the cache (and a shared cache when it forgets every block), so unlike 0011 there is no
+difference in what is invalidated; the memory is now given back rather than kept.
+
+`tests/shared_bookkeeping.rs`: **401 -> 289 bytes per block** (guest ranges 144 -> 40; the bound is
+now 350). Its three behaviour tests are 0011's, on this backend and, with `OD_TEST_SHARED_CACHE=1`,
+on a shared cache: a write to the second page of a two-page block, a write to the last word of a
+70,001-instruction block (more than 64 pages; ignoring the wide list fails it), and a 16 GiB
+invalidation reaching every block.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

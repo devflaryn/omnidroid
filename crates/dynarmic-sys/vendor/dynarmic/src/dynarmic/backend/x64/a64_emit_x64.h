@@ -10,8 +10,12 @@
 #include <memory>
 #include <optional>
 #include <tuple>
+#include <vector>
 
-#include "dynarmic/backend/block_range_information.h"
+#include <boost/icl/interval_set.hpp>
+#include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
+
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64.h"
@@ -104,7 +108,31 @@ protected:
 
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
-    BlockRangeInformation<u64> block_ranges;
+
+    // Omnidroid patch 0026: the guest bytes each emitted block was translated from, for
+    // `InvalidateCacheRanges`. The pin kept them in a `BlockRangeInformation` -- a boost::icl
+    // interval_map of std::sets, about 150 bytes per block in tree nodes -- as the arm64 backend
+    // did before patch 0011. One `GuestRange` per emitted block (24 bytes), indexed by the 4 KiB
+    // guest pages it covers; as with the pin's, a range stays until the cache is cleared (or, in a
+    // shared cache, until every block is forgotten).
+    struct GuestRange {
+        IR::LocationDescriptor location;
+        u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
+        u64 last;
+    };
+    static constexpr unsigned guest_page_bits = 12;
+    /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
+    /// invalidation, instead of in every page it covers.
+    static constexpr u64 max_indexed_pages = 64;
+    std::vector<GuestRange> guest_ranges;
+    tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
+    std::vector<u32> wide_guest_ranges;
+    void AddGuestRange(IR::LocationDescriptor location, u64 first, u64 last);
+    /// Every location registered with a range intersecting one of `ranges` -- what
+    /// `BlockRangeInformation::InvalidateRanges` returned.
+    tsl::robin_set<IR::LocationDescriptor> GuestRangeLocations(const boost::icl::interval_set<u64>& ranges) const;
+    /// Empties the ranges and gives their memory back.
+    void ClearGuestRanges();
 
     struct FastDispatchEntry {
         u64 location_descriptor = 0xFFFF'FFFF'FFFF'FFFFull;

@@ -111,7 +111,7 @@ fn units(units: usize) -> Vec<u32> {
 const UNITS: usize = 32_768;
 const BLOCKS: usize = 2 * UNITS;
 /// What a block of [`units`]' shape may cost in the shared cache's tables.
-const BYTES_PER_BLOCK_BOUND: f64 = 550.0;
+const BYTES_PER_BLOCK_BOUND: f64 = 350.0;
 
 /// One guest address space on a shared cache big enough that nothing is retired.
 struct Shared {
@@ -210,12 +210,13 @@ fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
         );
     }
     eprintln!("  the census: {:.0} bytes per block", counted as f64 / BLOCKS as f64);
-    // MEASURED: 1,144 bytes per block on the pin (patch 0024's census); the bound sits above what
-    // the flat records cost (patch 0025) and well below what the maps did.
+    // MEASURED: 1,144 bytes per block on the pin (patch 0024's census), 401 with patch 0025's flat
+    // link and fastmem records, 289 with patch 0026's guest-range index; the bound sits above that
+    // and well below what the maps did.
     assert!(
         per_block < BYTES_PER_BLOCK_BOUND,
-        "{per_block:.0} bytes of bookkeeping per block: the shared cache is keeping its links or \
-         fastmem sites in maps of fat buckets again"
+        "{per_block:.0} bytes of bookkeeping per block: the shared cache is keeping its links, \
+         fastmem sites or guest ranges in maps and trees again"
     );
 
     // The census is what `OMNI_MEM_REPORT` says the heap holds for the cache: it must account for
@@ -233,6 +234,74 @@ fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
             assert!(span >= t.largest_bytes as usize, "{name}: its address is in an allocation of {span} bytes, not {}", t.largest_bytes);
         }
     }
+}
+
+/// `NOP` x `nops`, then `ADD X0, X0, #1 ; SVC`: one block covering `4 * (nops + 1)` bytes.
+fn straight_line(nops: usize) -> Vec<u32> {
+    let mut code = vec![a64::NOP; nops];
+    code.push(a64::add_imm(0, 0, 1));
+    code.push(a64::svc(0));
+    code
+}
+
+/// Translate `straight_line(nops)`, rewrite its `ADD` and invalidate only that word; the next run
+/// must run the new `ADD`. Returns how many instructions the retranslation fetched. On the jit's
+/// own cache, or -- `OD_TEST_SHARED_CACHE=1` -- a shared one.
+fn rewrite_the_last_word(nops: usize) -> u64 {
+    let mut code = straight_line(nops);
+    let vm = Vm::new(code.clone(), VmOptions { code_cache_size: 32 << 20, ..VmOptions::default() });
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 1);
+
+    code[nops] = a64::add_imm(0, 0, 100);
+    vm.with_ctx(|c| c.code = code);
+    vm.reset_stats();
+    // SAFETY: `vm.raw()` is live and not executing.
+    unsafe { od_jit_invalidate_range(vm.raw(), CODE_BASE + 4 * nops as u64, 4) };
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 1 + 100, "a {nops}-NOP block ran a stale translation of its last word");
+    vm.stats().read_code
+}
+
+/// Patch 0026 indexes a block by the 4 KiB guest pages it covers (the arm64 backend's patch 0011,
+/// and these three tests, for x64). 1,100 instructions cover two; the rewritten word is on the
+/// second.
+#[test]
+fn a_write_to_any_page_a_block_came_from_invalidates_it() {
+    let fetched = rewrite_the_last_word(1_100);
+    assert!(fetched > 1_024, "the whole two-page block was retranslated: {fetched} fetches");
+}
+
+/// More than 64 pages in one block goes to the list checked on every invalidation. That the block
+/// really is one block is shown by the retranslation fetching all of it.
+#[test]
+fn a_block_wider_than_the_page_index_is_still_found() {
+    let fetched = rewrite_the_last_word(70_000);
+    assert!(fetched > 64 * 1024, "the block spans more than 64 pages: {fetched} fetches");
+}
+
+/// More pages asked about than have anything on them: the index is walked rather than the range.
+/// 16 GiB from 0x1000, which covers the harness's code -- `omni-android` sends the whole guest space
+/// when a context's queue of other threads' invalidations overflows. Every block must go.
+#[test]
+fn an_invalidation_of_the_whole_address_space_reaches_every_block() {
+    let mut code = vec![a64::add_imm(0, 0, 1), a64::b(4), a64::NOP, a64::NOP, a64::NOP, a64::add_imm(0, 0, 1), a64::svc(0)];
+    let vm = Vm::new(code.clone(), VmOptions::default());
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 2);
+
+    code[0] = a64::add_imm(0, 0, 10);
+    code[5] = a64::add_imm(0, 0, 100);
+    vm.with_ctx(|c| c.code = code);
+    // SAFETY: `vm.raw()` is live and not executing.
+    unsafe { od_jit_invalidate_range(vm.raw(), 0x1000, 0x4_0000_0000) };
+    vm.set_reg(0, 0);
+    vm.start(u64::MAX);
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), 110, "both blocks were retranslated");
 }
 
 /// **A region given back takes its fastmem records with it** (patch 0025): the sites are records of
