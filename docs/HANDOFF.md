@@ -32,6 +32,10 @@ with `omnidroid play --cookie ... --place 8737899170`, logs in the session scrat
 | w7 | `5a80626` (+ fast dispatch, census) | 26 s | **48.2** (5-53) | 4.7 / 4.2 GiB |
 | w9 | `dfdcff2`, `OMNI_GUEST_CPUS=8` | 23 s | 49.2 (13-55) | **3.9 / 3.5 GiB** |
 | w10 | `dfdcff2` (file trace on) | 28 s | 39.8 (+250..+330 s) | 4.8 / 4.3 GiB |
+| w13 | `beb9d62` (+ TLS, contention, audio, memory reads, waits) | 26 s | **froze** -- the "-1 pointer" corruption (below) | 3.8 / 3.4 GiB |
+| w14 | `beb9d62`, `OMNI_LOOPER_IDLE_US=1000` | 25 s | **54.2** (37.6-56.8), 2.25 cores | 4.8 / 4.3 GiB |
+| w15 | same (a subagent build running) | 30 s | 50.6 (19-58.8), 2.33 cores | 4.6 / 4.2 GiB |
+| w16 | `d434c2c` (idle wait default), `FramerateCap` 240 | 24 s | 54.6 (21-58.0) -- **never above ~59: a 60 fps limiter, being decoded** | 4.7 / 4.3 GiB |
 
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
@@ -53,6 +57,13 @@ loaded 110 s, settled **~1 fps** (4-6 presents per 5 s), 2.3 of 4 cores busy but
 insn/s (Windows: ~1,160 M on 3 cores), `[SlowBenchmark] Types` 10.3 s (Windows 3.85 s). The close
 did not reach the background within 60 s (`SessionHistory None`). No sampler exists off Windows,
 so no per-thread profile yet (being ported); `perf` needs `perf_event_paranoid` < 4 (it is 4).
+Linux, after the fixes (sampler ported, `4878b1e`): **l3** (`2c1bb1b`: the AAudio feed thread no
+longer spins -- it burned 90% of a core, `e09039f`; the guest a 4 GiB device, `23f00e8`) 1.2 fps,
+3.76 GiB private (was 4.58); **l5** the same at the lowest graphics level: 1.2 fps -- not the GPU;
+**l6** (`a12cac5`: a slow `/proc/self/smaps`-based memory reading behind `/proc/meminfo`, `statm`
+and `sysinfo` reused for 500 ms -- the workers spent 40-50% in the kernel serving the engine's
+memory monitor) **4.0 fps** (0.8-6.2), join -> loaded 53 s, gate passed, clean close. What is left
+there: translation on the workers (`dyn` 32-36%) on a 4-core i5 at ~1.8 cores.
 
 **The bottleneck list, ranked by measured cost** (Windows in-world profile w4, `OMNI_PERF=5`,
 `OMNI_PERF_DUMP`, symbolized with a debug-info build; shares are of the samples outside translated
@@ -64,11 +75,17 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 2 | dynarmic's dispatcher lookup (`GetBasicBlock`) on every indirect branch that misses the RSB (FastDispatch off, D16) | 25% of g6's non-JIT samples, 12% across all threads | **fixed** `f9ea397` (patches 0019/0020, D35: fast dispatch and the arm64 RSB keep the budget/halt checks); with #3, w7 38 -> 48 fps, `GetBasicBlock` 12% -> 2.7% |
 | 3 | the import census: shared per-slot counters and global `last_call` stores on every crossing | 8-9% | **fixed** `5a80626` (per-thread records; 8 threads, one import: 518-614 -> 60-64 ns per crossing) |
 | 3a | **macOS: the arm64 backend ignores value-compare** (patch 0007's inline exclusives take the global monitor's spin lock and scan 2,048 slots on every guest atomic) | 1,306 ns per atomic vs 9.4 ns honoured; the lock saturates at ~770 k atomics/s and caps the process at ~400 M insn/s | fix in progress (patch 0021); interim A/B `OMNI_JIT_EXCLUSIVE_MONITOR=global` (186 ns) |
-| 4 | translation (per-thread code caches; each thread translates what it runs) | ~30% of dynarmic's own samples; 200+ kinsn/s for ~2 min after load | open |
-| 5 | per-crossing path (`bionic::active`, trampoline, `cb_call_svc`, `pthread_getspecific`) | ~15% together | open |
+| 4 | translation (per-thread code caches; each thread translates what it runs) | w17: 53% of dynarmic's own samples; a busy worker still 56k insn/s at +300 s; on Linux `dyn` 32-36% of the workers | **open -- the largest left** (a shared translation cache is the structural fix) |
+| 5 | per-crossing path (`bionic::active`, trampoline, `cb_call_svc`, `pthread_getspecific`) | ~15% together | **fixed in part**: `bionic::active` without a shared refcount (`5a80626`), `cb_call_svc` by array index (`bb8c00a`), `pthread_getspecific` lock-free (`13cbc42`: 8 threads 1,500 -> 69-105 ns) |
+| 5a | `AddressFutex` (global parked table, near-miss scan per wake) and `OwnerTable` (one global mutex per lock/unlock) | wake 8.5% of handler samples; owner set/clear ~6% | **fixed** `b3e15d7`, `7fc1b1e` (futex wake 8 threads 523-1,725 -> 18 ns; mutex pairs on 8 mutexes 5.9 -> 0.3 us) |
+| 5b | `madvise`'s whole-map reclaim walk (after `e6b7769`) | 16% of handler samples (w17) | **fixed** `fb01278` (range walk) |
 | 6 | the frame chain: render thread waits 60% in `pthread_cond_wait` for workers; workers wake each other through futex waits of 1-16 ms mean | `OMNI_PERF_WAITS` (w5) | open -- lowers with 1-5 |
-| 7 | the game loop's `ALooper_pollOnce(0)` + mutex spin (engine design): one core, 2.8 M crossings/s, and the main contender of #1 and #3 | 96% of a core | open -- cheaper with 1, 3 |
-| 8 | memory: 4.4 GiB private in the world at default graphics | | open |
+| 7 | the game loop's `ALooper_pollOnce(0)` + mutex spin (engine design): one core, 2.8-4.5 M crossings/s | 96% of a core on every host | **fixed** `a69ee64` + `d434c2c` (decoded: nothing it serves needs sub-ms latency; an event-woken 1 ms idle wait): ~3.1 -> ~2.3 cores, 48 -> 50.6-54.2 fps |
+| 7a | Linux: the AAudio feed thread busy-looped (buffer-room rule vs a one-period ALSA wake) | 90% of a core | **fixed** `e09039f` (99.7% -> 0.4%) |
+| 7b | Linux: the engine's memory monitor made the host parse `/proc/self/smaps` | workers 40-50% in the kernel | **fixed** `a12cac5`: Linux 1.2 -> 4.0 fps |
+| 8 | memory: 4.4-4.8 GiB private in the world at default graphics (Windows); Linux swapped at 4.6 GiB on a 7 GB host | | **in part**: the device's RAM follows the host (`23f00e8`, D36: Linux a 4 GiB device, 3.76 GiB private); `OMNI_GUEST_CPUS=8` -0.7 GiB (w9, a switch) |
+| 9 | **a ~60 fps limiter**: no 5 s window above ~59 fps even with `FramerateCap` 240 | w14-w16 | being decoded (the display rate a device on this path never sends -> the engine's frame-time table starts at 60 Hz) |
+| 10 | **intermittent "-1 pointer" heap corruption** (OpenSSL `impls`, w1; a `shared_ptr` control block, w13) -- 2 in ~16 runs, one froze the world | | being hunted; `printf` unbound (a thread died on it in w13) |
 
 **Deaths still open:** Windows `open(O_TRUNC)` on `memProfStorage<pid>.json` under a live mapping
 (error 1224, a worker at +5 s; logical EOF in progress); raw syscall 63 (`read`) from the engine's
