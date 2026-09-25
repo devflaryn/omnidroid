@@ -15,7 +15,7 @@ build -- `libasound2-dev` -- and `libasound.so.2` to run). No `Cargo.toml` chang
 | `open(buffer_frames)` | `snd_pcm_open("default", PLAYBACK, SND_PCM_NONBLOCK)`; hw params `RW_INTERLEAVED`, `FLOAT` (host-endian), `set_channels_near(2)`, `set_rate_near(48000)` then `set_rate(rate, 0)` exactly (a fractional rate is refused by ALSA, not rounded here), `set_period_size_near(10 ms)`, `set_buffer_size_min(asked)` + `set_buffer_size_first`; `snd_pcm_hw_params`; then **`snd_pcm_hw_params_current` + `get_access/format/channels/rate/period_size/buffer_size`** -- what is reported is what was granted. sw params: `avail_min` = period, `start_threshold` = boundary, `stop_threshold` = buffer |
 | `format / buffer_frames / period_frames` | the granted values read back above |
 | `writable_frames` | `snd_pcm_avail` (not `avail_update`: `avail` hw-syncs first; `avail_update` answers from the last position the driver reported) |
-| `wait_writable(timeout)` | started: `snd_pcm_wait(ms)`, timeout rounded up, capped at `INT_MAX`, never `-1`. Not started: the timeout is slept out (see "Differences") |
+| `wait_writable(frames, timeout)` | started: `avail_min` set to `frames` (at least a period, at most the buffer; `snd_pcm_sw_params` only when it changes), then `snd_pcm_wait(ms)` to a deadline, timeout rounded up, capped at `INT_MAX`, never `-1`; a wake with less than `frames` free sleeps the missing frames' play time before polling again. Not started: the timeout is slept out (see "Differences") |
 | `write` | `snd_pcm_writei` until every frame is in; no room (`-EAGAIN` or a 0 count) waits with `snd_pcm_wait` for at most a buffer's time + 100 ms, then `AudioError::Alsa { api: "snd_pcm_writei", errno: EAGAIN }` |
 | `start` | `snd_pcm_pause(0)` from paused; `snd_pcm_start` from prepared **if anything is queued**, else deferred to the first write |
 | `stop` | `snd_pcm_pause(1)`: the queue stays, nothing drains (WASAPI `Stop`'s semantics; not `snd_pcm_drop`, which discards) |
@@ -82,9 +82,11 @@ build -- `libasound2-dev` -- and `libasound.so.2` to run). No `Cargo.toml` chang
 * **An unstarted stream's wait sleeps its timeout out.** ALSA's poll returns at once on a prepared
   stream with room (avail >= avail_min); WASAPI's event does not fire until the stream is started,
   and the seam documents that. Nothing consumes an unstarted stream, so no period can free.
-* **A running wait returns at once if a period is already free** (poll semantics), where WASAPI
-  waits for the next period event. In the feeding loop (write what is free, then wait) the two are
-  the same: after a full write less than a period is free.
+* **A running wait returns at once if the frames asked for are already free** (poll semantics),
+  where WASAPI waits for the next period event. The wait used to be for *a period* whatever the
+  caller could use, on the reasoning that "after a full write less than a period is free". That
+  is false for AAudio's feeding loop, which writes only up to the stream's buffer size -- see
+  "The feeding thread that spun" below.
 * **Empty start is deferred** to the first write: the kernel refuses `snd_pcm_start` on an empty
   playback stream (`-EPIPE`, `snd_pcm_pre_start`); WASAPI starts it. PipeWire's plugin also starts
   it, which is why mutation row B3 is caught only by the card test.
@@ -157,6 +159,58 @@ What the runs taught, recorded because each changed the code:
 * The harness runs mutated live tests that can hang; a watchdog script killed any of this
   worktree's test binaries alive > 120 s during runs 2-3 (it killed none in run 3).
 
+## The feeding thread that spun (2026-09-25)
+
+**MEASURED in the Pet Simulator 99 world** (i5-4460, `OMNI_PERF` sampler): one guest thread (g70,
+FMOD's AAudio data-callback thread) at 88-96 % of a core for the whole session, every sample "in a
+handler" charged to `sem_post` (the last import the thread made -- FMOD's callback posts its
+mixer's semaphore), ~45 % in the executable and ~35 % in the kernel, ~0 guest instructions.
+Windows showed no such thread.
+
+**Cause.** FMOD's stream, from the session's own AAudio report: burst **480** (the ALSA period),
+capacity **9,120** (FMOD asks `setBufferCapacityInFrames(9120)` after a probe answered 960), buffer
+size **1,440** (`setBufferSizeInFrames`). The callback thread may only ask for a burst while the
+host holds at most `1440 - 480` frames, i.e. with at least `9120 - 1440 + 480 = 8,160` free. It
+waited with `wait_writable(50 ms)`, which on ALSA is `snd_pcm_wait` with `avail_min` one period --
+**level-triggered**, and with at least 7,680 frames always free it answered at once, every time.
+Nothing was written, and the loop asked again: `snd_pcm_wait` + `snd_pcm_avail` flat out. The
+burst is not larger than the period (both 480); the buffer size far below the capacity is what
+does it. WASAPI's event and Core Audio's semaphore fire once per period, so the same loop slept
+there. The unprimed branch had a second spin of the same shape: a stream started again after a
+pause, whose host stream kept its queue, found no room for a burst and never started the host,
+so nothing ever drained -- silence and a whole core, on every backend.
+
+**Fix.** The seam's `wait_writable` takes the frames the caller needs free and every backend waits
+until that much is (ALSA: `avail_min`; WASAPI and Core Audio: keep waiting on the per-period wake
+to the same deadline); AAudio waits for `buffer - size + burst` (`frames_wanted`), and starts a
+host that already holds frames on its first pass. With the buffer size equal to the capacity that
+is one burst: the old behaviour.
+
+**Measured, this host (PipeWire, 48 kHz, period 480), before -> after:**
+
+* `tests/audio_live.rs` `a_feeder_below_the_buffer_waits_for_its_burst_rather_than_spinning`
+  (buffer 9,600, size 1,440, burst 480, 3 s): feeder thread CPU **2.999 s (99.98 %) -> 4.5 ms
+  (0.15 %)**; waits **18,536,124 -> 301**; bursts 299 -> 301 (100/s both). "Before" is the same
+  test with the old threshold (`wait_writable(0, ..)`, i.e. `avail_min` one period).
+* `omni-android` `tests/aaudio.rs` `fmods_stream_on_the_host_device_is_fed_at_its_rate_without_spinning`
+  (FMOD's own sequence through `PlatformOutput`, capacity 9,120, size 1,440, 2 s): data-callback
+  thread **1.993 s (99.67 %) -> 8.3 ms (0.41 %)**; waits for 200 callbacks **9,655,152 -> 200**;
+  100.0 callbacks/s both. "Before" is mutation `feed-A1` (the loop waits for a burst's room).
+* PipeWire honours a raised `avail_min`: a wait for 1,920 frames came back with 2,048 free after
+  39.5-42.7 ms. With `avail_min` forced back to a period behind the backend's back (a host that
+  ignores it), a wait for 3,840 frames came back with 3,840 after 77-80 ms using 19-31 us of CPU.
+* Windows (WASAPI, 44.1 kHz, period 448) and macOS (Core Audio, 48 kHz, period 512): the same
+  feeder test 0.00 % (below the 15.6 ms tick) and 0.16 %; the live AAudio test on Windows 0.78 %
+  (one tick in 2 s), 98.5 callbacks/s for 98.4.
+
+**Mutation rows** (all run on the committed tree): Windows `feed-A1..A4, B1, B2` **6/6 caught**
+(`python tools/mutate.py --only feed-`: the paced double, the `frames_wanted` unit test, and the
+WASAPI live tests); Linux `lnx-feed-A1..A3, B1, B2` **5/5 caught** (the two ALSA live unit tests
+above), and `lnx-audio` re-run with A5 and B4 re-anchored **18/18 caught**; macOS `mac-feed-A1`
+**1/1 caught**. `lnx-feed-A4` (drop the wait's floor of a period) was **NOT CAUGHT** and was
+removed: alsa-lib raises an `avail_min` below the period to the period itself (MEASURED: a
+request of 0 read back as 480), so it is an equivalent mutant.
+
 ## Shared edits (for "Merge notes")
 
 * `crates/omni-platform/src/audio/mod.rs`: backend selection -- `unix.rs` now for
@@ -170,12 +224,10 @@ What the runs taught, recorded because each changed the code:
 
 ## Open
 
-* `omni-android --test aaudio` needs the vm and fault backends (MEMORY worker, `lnx-mem`). At the
-  time of writing `lnx-mem` has the vm commit (`6db973e`) and no fault work, so it was not merged
-  and the test was not run: **pending**. It drives a recording double, not this
-  backend; the path from FMOD to this backend has not run on Linux.
-* FMOD opens with capacity 0, which this backend answers with 960 frames (two 10 ms periods) --
-  20 ms of buffer for a guest callback running under translation. Whether that underruns in the
-  game is unmeasured; the xrun count will say.
+* ~~`omni-android --test aaudio` not run on Linux~~: it runs (9 passed, 2026-09-25), including
+  `fmods_stream_on_the_host_device_is_fed_at_its_rate_without_spinning`, FMOD's sequence into
+  this backend through `PlatformOutput`.
+* FMOD probes with capacity 0 (answered 960) and then opens with 9,120, keeping 1,440 queued
+  (30 ms). The session report counted 1 xrun; whether that is audible is unmeasured.
 * The graph rate is assumed 48 kHz by request, not read from PipeWire (see "Why ALSA").
 * Suspend recovery is unit-tested against a scripted double only; no live suspend was triggered.
