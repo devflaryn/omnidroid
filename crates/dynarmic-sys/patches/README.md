@@ -14,7 +14,9 @@ upstream rather than about us; that figure has **not** been re-measured with
 filter): **All tests passed (201,698 assertions in 84 test cases)** with 0001
 alone (built from a clean checkout of `83cfa6e`) **and the identical figure with
 0001 + 0017, with 0001 + 0017 + 0018, with 0001-0020** (2026-09-25) **and with 0001-0022**
-(2026-09-25; the suite runs the per-thread path, which 0022 leaves as it was). The older 202,200/123 was a build that also had the A32 frontend;
+(2026-09-25; the suite runs the per-thread path, which 0022 leaves as it was) **and with 0001-0022
+plus 0024-0027** (2026-09-25; 0026 replaces the per-thread path's guest-range bookkeeping, which the
+suite's invalidation tests exercise; 0023 is on another branch). The older 202,200/123 was a build that also had the A32 frontend;
 it is not comparable and was not re-run.
 
 **On the arm64 backend** (Apple M1, same configuration, AppleClang, Ninja, with

@@ -76,6 +76,39 @@ thread running at that instant has its stack counted as other private memory); m
 guest side and says the host side is missing (the census refuses there by name). A report takes
 tens of milliseconds and nothing is measured between reports.
 
+### The host's C heaps: dynarmic's per-block tables (M1/M4, decoded 2026-09-25)
+
+M1 and M4 put **968 / 962 MiB in the C heaps, 905 allocated, of which 55 MiB was the runtime's
+Rust** -- with single allocations of 272, 224, 80, 64 and 32 MiB, identical in both runs and
+present from +60 s. The first four are exactly the bucket arrays of the shared code cache's emitter
+(dynarmic `A64EmitX64`, robin_maps at a load factor of at most 0.5) for the ~700,000 blocks the
+cache held; most of the rest of the heap is the same emitter's per-entry vectors and icl nodes:
+
+| allocation | owner (dynarmic, shared cache) | size | scales with | fix (vendored patch) | after |
+|---|---|---|---|---|---|
+| 272 MiB | `patch_information`: 2^21 buckets x 136 B (five `std::vector`s inline; one entry per location ever emitted *or* linked to) + a vector per entry | ~300 MiB | blocks + link targets, never shrinks | 0025: a 24-byte `LinkRecord` per slot, lists per target from `link_heads` (u64 -> u32, 0.75) | tens of MiB |
+| 224 MiB | `fastmem_patch_info`: 2^22 buckets x 56 B (1-2 M fastmem sites) | 224 MiB | fastmem load/store sites | 0025: 16-byte sorted records per region, binary search on a fault | ~16-32 MiB |
+| 80 MiB | `outgoing_slots`: 2^21 x 40 B + a vector per block | ~120 MiB | blocks | 0025: gone (a block's records are contiguous, `BlockDescriptor::first_link`) | 0 |
+| 64 MiB | `block_descriptors`: 2^21 x 32 B (the dispatcher's map) | 64 MiB | blocks | 0027: load factor 0.75 (lookup cost measured unchanged) | 32 MiB |
+| (many small) | `block_ranges`: boost::icl map of `std::set`s | ~100 MiB | blocks | 0026: 24-byte ranges indexed by guest page (0011 on x64) | ~20 MiB |
+| 32 MiB (high address, 32 MiB-aligned) | not identified: no emitter table has that size at 700,000 blocks, and nothing in the runtime's Rust reserves it -- probably a driver's; the report now prints each large allocation's resident and reserved bytes, and H1 says whether the census names it | 32 MiB | -- | open | -- |
+
+None of it scales with guest threads (per-thread dynarmic state is ~70 KiB: JitState, a 64 KiB
+fast-dispatch table) or with the guest address width (no page table: fastmem, identity). Measured
+offline (`dynarmic-sys/tests/shared_bookkeeping.rs`, 65,536 blocks of the engine's shape): **1,144 ->
+225 bytes per block** of heap; at ~700,000 blocks that is **~0.8 GiB -> ~0.15 GiB per instance**
+(expected; the live runs H1/H2 below confirm). Emission got cheaper (7.1 -> 6.1 us per cold block);
+a locked dispatcher lookup is unchanged (~50 ns). `OMNI_MEM_REPORT` now names each such allocation by
+its table ("the shared code cache's link targets (dynarmic)") and prints the tables' census.
+
+Live runs to confirm (as M1/M4, same switches, this build): **H1** = M1 (`OMNI_MEM_REPORT=1
+OMNI_PERF=30`), **H2** = M4. Read at +480 s: the `C heaps` line (expected ~970 -> ~300 MiB
+committed), the `per-block tables (dynarmic, census)` line and its entry counts, the allocation list
+(the 272/224/80 MiB ones gone, the block map at 32 MiB), `private`/`working set` (expected -0.6 to
+-0.7 GiB), and from `PERF`: fps, cores, `locked lookups` rate and join -> `onGameLoaded` (expected
+unchanged). Optionally **H0** = M1 on `b5b8fc3` alone (census, the pin's maps) to see the four
+arrays named by the report before they go.
+
 ### What the engine sizes from the device -- decoded (link addresses, 2.739.691)
 
 * **One number sizes its caches: total RAM, from `sysconf(_SC_PHYS_PAGES) * _SC_PAGE_SIZE`**
@@ -105,6 +138,7 @@ tens of milliseconds and nothing is measured between reports.
 | # | lever | expected saving | cost | risk | state |
 |---|---|---|---|---|---|
 | 1 | **one translation cache per instance** (D38) | **-0.8 to -0.85 GiB** (measured, above); each block translated once, not per thread -- the input stalls gone (w27/w29) | -- | -- | **done: the default on x64 since `b934fc1`** (the Mac keeps per-thread caches) |
+| 1b | **the shared cache's per-block tables as flat records** (patches 0024-0027, section above) | **~0.65 GiB** of the C heaps (expected from 1,144 -> 225 bytes per block at ~700,000 blocks) | done | none found: dynarmic's suites in both cache modes, lookups and emission benched | **built**; confirm with H1/H2 |
 | 2 | **report a 3 GiB device** (`OMNI_GUEST_MEMORY_MB=3072`) | texture cache 680 -> 72 MB, textures at 1/16 of the texels, cloud assets <= 1024 px, SQLite's low-end cache. **On this host the textures are GPU memory**: the saving is VRAM first (35 x 680 MB is three times the RTX 4060's 8 GB, and WDDM pages the overflow into system RAM), process RAM only as far as the engine keeps CPU-side copies -- M3's engine-heap row and the engine's own `GpuMem` say how much of each | a switch | the commit ceiling is the device's RAM (D36): an engine heap plus host-visible memory over 3 GiB fails `mmap` and takes the engine's OOM path -- the report shows the headroom; blurry textures (fine for B) | built (D36) |
 | 2b | the same at 2 GiB (`=2048`) | texture cache 48 MB, 1/64 of the texels | a switch | a 2 GiB commit ceiling may be below the heap the world needs; device capture off (< 2862 MB) | built; run after 2 |
 | 3 | **an fps cap from underneath** (`OMNI_FPS_CAP=<fps>`) | the render thread and every per-frame job run at the cap: at 10 fps from ~50, most of the ~2.4 cores (Windows per-frame CPU ~0.049 core-s at 49 fps, w30); a fixed part (network, the looper's wakes, audio) remains -- expected **~0.4-0.7 cores** | small (done) | none on correctness: every frame is presented, later (deadline schedule, no burst after a stall) | **built** (`omni_android::pacing`, both present paths) |
@@ -160,7 +194,7 @@ account's cookie in two sessions at once is not something to try.
 
 | run | fps (median, min) | cores | private / working set | notes |
 |---|---|---|---|---|
-| M1 | 48.4 (33.4) | 2.61 | 3.27 / 2.90 GiB | +480 s table: guest heap 1,560 committed; JIT 246; **host C heaps 968 MiB** of which our Rust 55 -- blocks of 272, 224, 80, 64, 32 MiB (being identified) |
+| M1 | 48.4 (33.4) | 2.61 | 3.27 / 2.90 GiB | +480 s table: guest heap 1,560 committed; JIT 246; **host C heaps 968 MiB** of which our Rust 55 -- blocks of 272, 224, 80, 64, 32 MiB (the first four dynarmic's tables: "The host's C heaps" above) |
 | M2 | 0 (minimised, nothing drawn) | **1.42** | 3.22 / 2.84 | the game kept playing; no death |
 | M3 | **59.2 (56.8)** | 2.36 | **2.80 / 2.50** | a 3 GiB device: faster *and* lighter (the texture budget), so a B setting -- for A it costs texture resolution |
 | M4 | capped 10, minimised from +300 s | **0.57** | 2.80 / 2.52 | +480 s table: guest heap 1,283; read-only file copies 0.6 (101 in M1); JIT 251; host C heaps 962 |
