@@ -292,7 +292,7 @@ struct SharedCodeCache::Impl final {
     // Under `lock`, exclusive.
     u64 blocks_emitted = 0;
     u64 code_bytes_emitted = 0;
-    u64 translations_raced = 0;
+    std::atomic<u64> translations_raced{0};
     u64 invalidations = 0;
     u64 blocks_invalidated = 0;
     u64 regions_retired = 0;
@@ -306,10 +306,11 @@ struct SharedCodeCache::Impl final {
 
     /// Every applied invalidation bumps this; a translation made outside the lock compares it.
     std::atomic<u64> invalidation_serial{0};
-    /// Locations a thread is translating outside the lock (under `lock`, exclusive), and the
-    /// condition a thread that needs one of them waits on.
+    /// Locations a thread is translating outside the cache's lock, under a lock of their own, and
+    /// the condition a thread that needs one of them waits on.
+    std::mutex in_flight_lock;
     tsl::robin_set<IR::LocationDescriptor> in_flight;
-    std::condition_variable_any in_flight_done;
+    std::condition_variable in_flight_done;
     /// Bumped whenever a location stops being in flight, for a waiter that spins before sleeping.
     std::atomic<u64> in_flight_finished{0};
     struct RecentInvalidation {
@@ -828,58 +829,62 @@ std::optional<CodePtr> SharedCodeCache::Impl::Lookup(IR::LocationDescriptor loca
 
 CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserConfig& translator_conf, SharedThreadState& thread) {
     // Translate -- the frontend and the IR passes, most of the work, reading guest code through
-    // this thread's callbacks -- without the lock, so other threads' lookups are not held up by
-    // it. Only emission, which writes the shared buffer and maps, takes the lock. A location
+    // this thread's callbacks -- without the cache's lock, so other threads' lookups are not held
+    // up by it. Only emission, which writes the shared buffer and maps, takes the lock. A location
     // another thread is already translating is waited for, not translated twice: when a burst of
-    // new code reaches several threads at once, one translates it and the rest wait for it.
-    std::unique_lock held{lock};
+    // new code reaches several threads at once, one translates it and the rest wait for it -- on a
+    // lock of its own, not the cache's, so that waiting does not queue behind emission (MEASURED on
+    // the 4-core Linux host: waiters retaking the cache's writer-preferring lock doubled the cold
+    // pass of eight threads).
+    bool waited = false;
     for (;;) {
-        if (const auto block = emitter.GetBasicBlock(location)) {
-            translations_raced++;
-            return block->entrypoint;
+        if (const auto found = Lookup(location)) {
+            if (waited) {
+                translations_raced.fetch_add(1, std::memory_order_relaxed);
+            }
+            return *found;
         }
+        std::unique_lock flight{in_flight_lock};
         if (in_flight.count(location) == 0) {
+            in_flight.insert(location);
             break;
         }
-        // Another thread is translating it: a block takes microseconds, a sleep and a wake-up
-        // take about as long again, so wait by spinning first -- without the lock -- and sleep
-        // on the condition only if it takes longer.
+        // A block takes microseconds to translate, and a sleep and a wake-up about as long again:
+        // spin a little first, then sleep until this location is no longer in flight.
+        waited = true;
         const u64 seen = in_flight_finished.load(std::memory_order_acquire);
-        held.unlock();
+        flight.unlock();
         bool moved = false;
-        for (int spin = 0; spin < 4096 && !moved; spin++) {
+        for (int spin = 0; spin < 64 && !moved; spin++) {
             std::this_thread::yield();
             moved = in_flight_finished.load(std::memory_order_acquire) != seen;
         }
-        held.lock();
-        if (!moved && in_flight.count(location) != 0) {
-            in_flight_done.wait(held);
-        }
+        flight.lock();
+        in_flight_done.wait(flight, [&] { return in_flight.count(location) == 0; });
     }
-    in_flight.insert(location);
-    const u64 serial_before = invalidation_serial.load(std::memory_order_relaxed);
-    held.unlock();
-
-    std::optional<IR::Block> ir_block;
-    {
-        // Whatever happens, the location stops being in flight and its waiters wake.
-        SCOPE_EXIT {
-            if (!held.owns_lock()) {
-                held.lock();
-            }
+    // Whatever happens, the location stops being in flight -- after the block is registered, as
+    // `held` below is released first -- and its waiters wake.
+    SCOPE_EXIT {
+        {
+            std::lock_guard flight{in_flight_lock};
             in_flight.erase(location);
             in_flight_finished.fetch_add(1, std::memory_order_release);
-            in_flight_done.notify_all();
-        };
+        }
+        in_flight_done.notify_all();
+    };
+
+    const u64 serial_before = invalidation_serial.load(std::memory_order_acquire);
+    std::optional<IR::Block> ir_block;
+    {
         const auto t0 = std::chrono::steady_clock::now();
         ir_block.emplace(TranslateBlock(location, translator_conf, polyfill_options));
         translate_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
-        held.lock();
     }
 
+    std::unique_lock held{lock};
     for (;;) {
         if (const auto block = emitter.GetBasicBlock(location)) {
-            translations_raced++;
+            translations_raced.fetch_add(1, std::memory_order_relaxed);
             return block->entrypoint;
         }
         // Guest code the block was translated from may have changed since: an invalidation
@@ -1141,7 +1146,7 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
     SharedCodeCache::Stats s;
     s.blocks_emitted = blocks_emitted;
     s.code_bytes_emitted = code_bytes_emitted;
-    s.translations_raced = translations_raced;
+    s.translations_raced = translations_raced.load(std::memory_order_relaxed);
     s.translations_redone = translations_redone;
     s.translate_ns = translate_ns.load(std::memory_order_relaxed);
     s.emit_ns = emit_ns;

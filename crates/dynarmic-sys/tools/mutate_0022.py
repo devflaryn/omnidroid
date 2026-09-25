@@ -58,11 +58,9 @@ MUTATIONS = {
     }""", SC + ['--', 'a_translation_overtaken']),
     'S5': ('a location another thread is translating is translated again, not waited for', IFACE,
            """        if (in_flight.count(location) == 0) {
-            break;
-        }""",
+            in_flight.insert(location);""",
            """        if (true) {
-            break;
-        }""", SC + ['--', 'eight_jits_on_one_cache']),
+            in_flight.insert(location);""", SC + ['--', 'eight_jits_on_one_cache']),
     'S6': ('a thread parked in a callback holds its region (no holes)', IFACE,
            """    const bool known = barrier_available && AsymmetricBarrier();""",
            """    const bool known = false;""", SC + ['--', 'a_thread_parked_in_a_callback']),
