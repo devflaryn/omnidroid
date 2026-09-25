@@ -480,6 +480,67 @@ fn an_inline_thunk_and_an_exiting_thunk_coexist_at_different_addresses() {
     }
 }
 
+/// Adds the thunk's context to `X0`, so the sum says which thunks ran and how often.
+fn add_context(call: &mut ThunkCall<'_>) {
+    let sum = call.x(0).wrapping_add(call.context().0 as u64);
+    call.set_x(0, sum);
+}
+
+/// **The `SVC` path's O(1) lookup answers exactly what the map would**: thunks at the start of the
+/// window, inside it and past its end are each serviced by their own handler, and an exiting thunk
+/// at a site inside the window -- an empty window entry -- still exits.
+///
+/// The backend indexes its inline thunks by `(site - lowest) >> shift`, `1 << shift` being the
+/// largest power of two dividing every offset (`dynarmic::inline_table`). A thunk one byte past the
+/// first makes that stride one byte, so the window's 16 Ki entries span 16 KiB and a thunk
+/// `0x4100` bytes on is past it, inside this guest's 64 KiB code region. The one-byte thunk is never
+/// reached; it is there to shape the window.
+#[test]
+fn inline_thunks_in_the_window_and_past_it_are_each_serviced_and_an_exiting_one_still_exits() {
+    let _serial = serialized();
+    let guest = Guest::new();
+    let first = THUNK_AT;
+    let middle = THUNK_AT + 0x100;
+    let exiting = THUNK_AT + 0x180;
+    let past = THUNK_AT + 0x4100;
+    // MOV X21, X30 ; BL first ; BL middle ; BL past ; BL exiting ; RET X21
+    let mut program = vec![mov_reg(21, 30)];
+    for target in [first, middle, past, exiting] {
+        program.push(bl(target as i32 / 4 - program.len() as i32));
+    }
+    program.push(ret(21));
+    let entry = guest.load_at(0, &program);
+
+    let (mut cpu, sentinel) = guest.thread();
+    for (at, context) in [(first, 1), (first + 1, 1000), (middle, 10), (past, 100)] {
+        cpu.add_inline_thunk(guest.code + at, add_context, ThunkContext(context)).expect("inline");
+    }
+    cpu.add_thunk(guest.code + exiting).expect("exiting");
+    cpu.set_x(x(0), 0);
+    match cpu.run(entry, RunLimit::Unlimited).expect("run") {
+        ExitReason::Thunk { pc } => assert_eq!(pc, guest.code + exiting, "the exiting thunk exits"),
+        other => panic!("expected the exiting thunk, got {other}"),
+    }
+    assert_eq!(cpu.x(x(0)), 111, "first (1), middle (10) and past (100), each once, and nothing else");
+    assert_eq!(cpu.inline_thunk_calls().serviced, 3);
+    let resume = cpu.x(x(30)) as GuestAddr;
+    match cpu.run(resume, RunLimit::Unlimited).expect("resume") {
+        ExitReason::Returned { pc } => assert_eq!(pc, sentinel),
+        other => panic!("expected the sentinel, got {other}"),
+    }
+
+    // The window is rebuilt after a removal: the middle thunk becomes an exit, and nothing else moves.
+    assert!(cpu.remove_inline_thunk(guest.code + middle).expect("remove"));
+    cpu.add_thunk(guest.code + middle).expect("an exiting thunk where it was");
+    cpu.set_x(x(0), 0);
+    rearm(&mut cpu, sentinel);
+    match cpu.run(entry, RunLimit::Unlimited).expect("run again") {
+        ExitReason::Thunk { pc } => assert_eq!(pc, guest.code + middle, "the removed thunk exits"),
+        other => panic!("expected the removed thunk to exit, got {other}"),
+    }
+    assert_eq!(cpu.x(x(0)), 1, "only the first ran before it");
+}
+
 /// An inline thunk reached through a **real PLT stub** must behave exactly as one reached by a direct
 /// `BL`, because that is the path the loader actually builds.
 ///

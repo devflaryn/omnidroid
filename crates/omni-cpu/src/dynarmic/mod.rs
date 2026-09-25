@@ -81,7 +81,7 @@
 //! The watchdog is therefore a short budget expiring, checked in Rust between slices.
 
 use std::cell::UnsafeCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -112,6 +112,7 @@ use crate::thunk::{ThunkContext, ThunkFn, ThunkRegs};
 use crate::tls::{GuestTls, TlsArena};
 
 mod callbacks;
+mod inline_table;
 
 pub use callbacks::HINTS_OBSERVED;
 
@@ -1080,7 +1081,7 @@ pub(crate) struct CpuCtx {
     pub(crate) thunks: BTreeSet<GuestAddr>,
     /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
     /// [`DynarmicCpu::add_inline_thunk`].
-    pub(crate) inline_thunks: BTreeMap<GuestAddr, (ThunkFn, ThunkContext)>,
+    pub(crate) inline_thunks: inline_table::InlineThunks,
     /// How many inline thunks have been serviced, so a measurement can prove the path ran.
     pub(crate) inline_calls: u64,
     /// How many of those asked to be handed back to the caller. See
@@ -1214,7 +1215,7 @@ impl DynarmicCpu {
             jit: core::ptr::null_mut(),
             executable_cache: None,
             thunks: BTreeSet::new(),
-            inline_thunks: BTreeMap::new(),
+            inline_thunks: inline_table::InlineThunks::default(),
             inline_calls: 0,
             inline_deferred: 0,
             hints: 0,
@@ -1863,12 +1864,12 @@ impl GuestCpu for DynarmicCpu {
                          indirect-branch handlers are measured to check the halt flag",
             });
         }
-        self.with_ctx(|ctx| ctx.inline_thunks.insert(address, (handler, context)));
+        self.with_ctx(|ctx| ctx.inline_thunks.insert(address, handler, context));
         self.invalidate_word(address)
     }
 
     fn remove_inline_thunk(&mut self, address: GuestAddr) -> CpuResult<bool> {
-        let had = self.with_ctx(|ctx| ctx.inline_thunks.remove(&address).is_some());
+        let had = self.with_ctx(|ctx| ctx.inline_thunks.remove(&address));
         self.invalidate_word(address)?;
         Ok(had)
     }

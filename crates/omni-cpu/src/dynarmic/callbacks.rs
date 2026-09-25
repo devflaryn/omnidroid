@@ -369,8 +369,9 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
             let site = (dynarmic_sys::od_jit_get_pc(c.jit) as GuestAddr).wrapping_sub(4);
             // Serviced here and resumed here: no halt is raised, so `CheckHalt` falls through into
             // `PopRSBHint`, which with `ReturnStackBuffer` cleared is the emitted dispatcher loop
-            // and not a return to the caller. See `DynarmicCpu::add_inline_thunk`.
-            if let Some((handler, context)) = c.inline_thunks.get(&site).copied() {
+            // and not a return to the caller. See `DynarmicCpu::add_inline_thunk`. An array index
+            // for a site in the thunk region, not a tree walk: see `inline_table`.
+            if let Some((handler, context)) = c.inline_thunks.get(site) {
                 c.inline_calls += 1;
                 // The guest's SSE control word is live here -- generated code is still running and
                 // `EmitA64CallSupervisor` does not switch it -- and everything the handler runs is
