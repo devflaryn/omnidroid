@@ -318,6 +318,17 @@ swapchain went `VK_ERROR_OUT_OF_DATE_KHR` after a window change and the engine -
 on a changed extent, a lost framebuffer or a new window -- retried acquire ~2,400 times; decoded at
 `0x2790a34`). A 2 s out-of-date safety net renews the surface if no window event explains it.
 
+**w32, 30 minutes, `1fe4307`** (shared cache default + patches 0024-0027 + the window handling),
+the owner playing and switching windows 14 times: **45.2 fps median** (+300..+1900 s, n = 321),
+**2.57 GiB private / 2.17 GiB working set, flat**, 2.13 cores, no guest thread lost, clean close,
+gate passed; the shared code cache plateaued at 245-249 MiB with **0 regions retired** all session.
+**w31** (same build) froze at +155 s when the owner clicked the in-game **"unlock chat"** button:
+the engine called `FacialAgeEstimationProtocol.isAvailable()Z`, which is not transcribed, the refusal
+killed the job worker -- item 17 (a faithful transcription plus an audit of every JNI method the
+engine can reach from its menus, in progress). Also in progress at the owner's request: the host
+cursor follows the engine's own pointer signals (hidden while Roblox draws its cursor; captured and
+still while the engine holds it -- no button heuristics).
+
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
 spread is wide.) Luau's own load benchmark fell with the same changes: `[SlowBenchmark] Types`
@@ -410,6 +421,7 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 13 | **`pthread_cond_wait` released its mutex without waking its waiters** (a `NopFutex`): a thread blocked on the mutex slept its whole 1 s self-heal slice -- the engine's producer/consumer shape, every host | stress test 6.1 -> 3.0 s; a blocked producer got the mutex 993 ms late | **fixed** `c624460`; with it the ERRORCHECK/RECURSIVE unlocks and `pthread_once` publish with release/acquire (`62dcc34`, `724cb00`) -- plain byte copies before, a race on the arm64 host |
 | 14 | **macOS 16 KiB host pages: `madvise(DONTNEED/FREE)` on a 4 KiB guest range** was refused with EINVAL when not 16 KiB-aligned, and a 16 KiB-aligned 4 KiB range was rounded up -- **zeroing the 12 KiB after it** (a guest probe confirmed) | every sub-16K purge on the Mac | **fixed** `7a56fdb` (`GuestSpace::discard`, 4 KiB-granular: whole host pages decommitted, partial ones zeroed in place). mimalloc's own OS calls audited clean on all hosts (`d30b583`) |
 | 15 | **a host window change froze the picture** (w26: `VK_ERROR_OUT_OF_DATE_KHR` forever) | w26 at +1470 s | **fixed** `5c967f2`..`8cc3f91` (above) -- live check pending |
+| 17 | **a menu click reaches an untranscribed Java method** -> the calling engine thread is refused and dies -> freeze (w31: "unlock chat" -> `FacialAgeEstimationProtocol.isAvailable`) | w31 at +155 s | in progress: faithful transcription (a device without the module answers "not available"; age checks never faked) and an audit of every JNI method reachable from the menus |
 | 16 | **full disk on Windows** stopped a build mid-A/B (worktree `target/`s of finished agents, ~40 GB) | | cleaned 2026-09-25; agents' build dirs must be removed when they finish |
 
 **Deaths still open:** Windows `open(O_TRUNC)` on `memProfStorage<pid>.json` under a live mapping
