@@ -2536,7 +2536,7 @@ mod tests {
             panic!("INSTANCE is an object")
         };
         let interface = state.registry.find(DIALOG_INTERFACE).expect("declared");
-        let mut call = |state: &mut JniState, slot: &str, name: &str, descriptor: &str, args: &[Value]| {
+        let call = |state: &mut JniState, slot: &str, name: &str, descriptor: &str, args: &[Value]| {
             let method = state.registry.method(interface, name, descriptor, false).expect("declared");
             assert_eq!(method.class, interface, "{name}: the id is the interface's, as the engine takes it");
             let member = state.registry.member(method).expect("a member").clone();
