@@ -53,11 +53,15 @@ pub const DATA_BYTES: usize = 64 * 1024;
 /// guest actually touches (D10).
 pub const LAZY_BYTES: usize = 512 * 1024;
 
-/// Whether this run asked for the shared code cache (`OMNI_JIT_SHARED_CACHE=1`, D38), under which
-/// a context refuses breakpoints. A test that needs one asserts the refusal instead -- and only
+/// Whether this run uses the shared code cache (D38), under which a context refuses breakpoints:
+/// `OMNI_JIT_SHARED_CACHE=0|1` when set, and otherwise the default, which is on for x64 hosts
+/// (D38 amendment 2). A test that needs a breakpoint asserts the refusal instead -- and only
 /// then, so a backend that stopped offering breakpoints without being asked still fails it.
 pub fn shared_code_cache_asked() -> bool {
-    std::env::var("OMNI_JIT_SHARED_CACHE").is_ok_and(|v| v.trim() == "1")
+    match std::env::var("OMNI_JIT_SHARED_CACHE") {
+        Ok(value) => value.trim() == "1",
+        Err(_) => cfg!(target_arch = "x86_64"),
+    }
 }
 
 /// A context refused a breakpoint because it runs from a shared code cache, and only because of

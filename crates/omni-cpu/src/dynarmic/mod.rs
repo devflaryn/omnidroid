@@ -253,7 +253,8 @@ pub struct DynarmicOptions {
     pub optimizations_override: Option<u32>,
     /// **One translation cache for every guest thread of this address space** (vendored patch
     /// 0022, `docs/research/shared-jit-cache.md`, D38) instead of one per thread, so a block one
-    /// thread translated is run by all. **Default `false`**; `OMNI_JIT_SHARED_CACHE=1` turns it on.
+    /// thread translated is run by all. **Default `true` on x64 hosts** (D38 amendment 2) and
+    /// `false` elsewhere; `OMNI_JIT_SHARED_CACHE=0|1` overrides it.
     ///
     /// x64 hosts only: on arm64 the backend has no shared cache, and asking for one gives
     /// per-thread caches, said so on stderr. With it on, [`code_cache_size`](Self::code_cache_size)
@@ -283,8 +284,13 @@ impl Default for DynarmicOptions {
             // is the way back, announced.
             exclusive_monitor: ExclusiveMonitor::ValueCompare,
             optimizations_override: None,
-            // D38: measured before it is the default.
-            shared_code_cache: false,
+            // D38 amendment 2, decided 2026-09-25 on x64: in PS99 with w20's drag script, w27/w29
+            // (shared) against w28 (per-thread) -- 0 s under 20 fps during input against 14 s
+            // (minimum 38-42 against 2 fps), translation peaking at 16 against 326 kinsn/s,
+            // 3.2 against 4.1 GiB private, settled fps unchanged (48-52 against 49), no region
+            // retired in either run. arm64 has no shared cache, so it stays per-thread there.
+            // `OMNI_JIT_SHARED_CACHE=0` is the way back, announced.
+            shared_code_cache: cfg!(target_arch = "x86_64"),
             shared_code_cache_bytes: SHARED_CODE_CACHE_BYTES,
         }
     }
