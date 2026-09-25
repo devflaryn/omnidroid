@@ -888,6 +888,26 @@ impl GuestSpace {
     /// # Errors
     ///
     /// [`MemError::Platform`] if a decommit or a coalesce fails.
+    /// [`reclaim_idle`](GuestSpace::reclaim_idle) for the idle entries inside
+    /// `[address, address + len)` only: what `madvise` needs once it has just marked that range.
+    ///
+    /// **Why a range version exists.** `reclaim_idle` walks every entry of the map to find idle
+    /// ones and then walks it again to coalesce free placeholders. MEASURED (Windows, the Pet
+    /// Simulator 99 world, 2026-09-25): once `MADV_FREE` also reclaimed at once, that whole-map
+    /// walk under the write lock was 16% of all in-handler samples. A call that marked one range
+    /// has nothing to reclaim outside it, so this visits only the entries overlapping it and
+    /// leaves coalescing of free space to [`reclaim_idle`](GuestSpace::reclaim_idle) and `unmap`.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Platform`] if a decommit fails.
+    pub fn reclaim_idle_in(&self, address: GuestAddr, len: usize) -> MemResult<Reclaimed> {
+        let mut inner = self.write();
+        let reclaimed = inner.reclaim_in(address, len)?;
+        inner.validate();
+        Ok(reclaimed)
+    }
+
     pub fn reclaim_idle(&self) -> MemResult<Reclaimed> {
         let mut inner = self.write();
         let reclaimed = inner.reclaim()?;
@@ -1897,16 +1917,8 @@ impl Inner {
         marked
     }
 
-    fn reclaim(&mut self) -> MemResult<Reclaimed> {
-        let mut reclaimed = Reclaimed::default();
-
-        let idle: Vec<(GuestAddr, usize)> = self
-            .map
-            .iter()
-            .filter(|(_, entry)| matches!(entry.os, OsState::Private { idle: true }))
-            .map(|(start, entry)| (start, entry.len))
-            .collect();
-
+    /// Decommit each idle `(start, len)` entry to a placeholder, counting it into `reclaimed`.
+    fn decommit_idle(&mut self, idle: Vec<(GuestAddr, usize)>, reclaimed: &mut Reclaimed) -> MemResult<()> {
         for (start, len) in idle {
             // SAFETY: the range is private committed memory this process owns and the guest has
             // said it no longer needs the contents, so nothing may hold a reference into it.
@@ -1919,6 +1931,37 @@ impl Inner {
             reclaimed.bytes += len;
             reclaimed.granules += 1;
         }
+        Ok(())
+    }
+
+    /// The idle entries overlapping `[address, address + len)`, decommitted. See
+    /// [`GuestSpace::reclaim_idle_in`].
+    fn reclaim_in(&mut self, address: GuestAddr, len: usize) -> MemResult<Reclaimed> {
+        let mut reclaimed = Reclaimed::default();
+        let idle: Vec<(GuestAddr, usize)> = self
+            .map
+            .starts_overlapping(address, len)
+            .into_iter()
+            .filter_map(|start| {
+                let entry = self.map.get(start)?;
+                matches!(entry.os, OsState::Private { idle: true }).then_some((start, entry.len))
+            })
+            .collect();
+        self.decommit_idle(idle, &mut reclaimed)?;
+        Ok(reclaimed)
+    }
+
+    fn reclaim(&mut self) -> MemResult<Reclaimed> {
+        let mut reclaimed = Reclaimed::default();
+
+        let idle: Vec<(GuestAddr, usize)> = self
+            .map
+            .iter()
+            .filter(|(_, entry)| matches!(entry.os, OsState::Private { idle: true }))
+            .map(|(start, entry)| (start, entry.len))
+            .collect();
+        self.decommit_idle(idle, &mut reclaimed)?;
+
 
         // Defragment: merge every run of adjacent free placeholders into one placeholder.
         let mut runs: Vec<(GuestAddr, usize, usize)> = Vec::new();

@@ -4461,13 +4461,13 @@ directory", ADAPTER_FILES,
     # contents survive a guarantee that says a later read is zero.
     ("jni-A11", "A", "MADV_DONTNEED marks the range idle and never reclaims it",
      ADAPTER_GUESTMEM,
-     """        if let Err(error) = space.reclaim_idle() {""",
+     """        if let Err(error) = space.reclaim_idle_in(at, len) {""",
      """        if let Ok(()) = Ok::<(), omni_mem::MemError>(()) {
             c.invalidate_code(at, len)?;
             c.ret(|mut r| r.i32(0));
             return Ok(());
         }
-        if let Err(error) = space.reclaim_idle() {""",
+        if let Err(error) = space.reclaim_idle_in(at, len) {""",
      ANDROID),
 
     # `MADV_FREE` back to a mark alone: the range stays idle past the call, so the next
@@ -4475,12 +4475,12 @@ directory", ADAPTER_FILES,
     # found under an OpenSSL MemoryFault in PS99 (2026-09-24).
     ("madvfree-A1", "A", "MADV_FREE leaves its range marked idle for a later reclaim to wipe",
      ADAPTER_GUESTMEM,
-     """        if let Err(error) = space.reclaim_idle() {""",
+     """        if let Err(error) = space.reclaim_idle_in(at, len) {""",
      """        if advice == MADV_FREE {
             c.ret(|mut r| r.i32(0));
             return Ok(());
         }
-        if let Err(error) = space.reclaim_idle() {""",
+        if let Err(error) = space.reclaim_idle_in(at, len) {""",
      ANDROID),
 
     # A slow memory reading taken afresh on every call: the Linux world's workers then spent
@@ -4505,6 +4505,15 @@ directory", ADAPTER_FILES,
      """        if end.saturating_duration_since(now) <= STOP_SLICE {""",
      """        if false && end.saturating_duration_since(now) <= STOP_SLICE {""",
      ["cargo", "test", "-p", "omni-android", "--release", "--test", "ndk", "--no-fail-fast", "looper_idle_a_stopping"]),
+
+    # The range reclaim that finds nothing: madvise's own range stays committed, so
+    # MADV_DONTNEED's zero guarantee is broken (it then refuses) -- the whole-map walk it
+    # replaced cost 16% of in-handler samples in the world (2026-09-25).
+    ("madvrange-A1", "A", "reclaim_idle_in skips the idle entries of its own range",
+     "crates/omni-mem/src/space.rs",
+     """                matches!(entry.os, OsState::Private { idle: true }).then_some((start, entry.len))""",
+     """                (false && matches!(entry.os, OsState::Private { idle: true })).then_some((start, entry.len))""",
+     ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast", "madv"]),
 
     # ---- B: the over-corrections -----------------------------------------------------------
 

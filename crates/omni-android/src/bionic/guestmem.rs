@@ -756,7 +756,7 @@ pub(super) fn madvise(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             c.ret(|mut r| r.i32(-1));
             return Ok(());
         }
-        if let Err(error) = space.reclaim_idle() {
+        if let Err(error) = space.reclaim_idle_in(at, len) {
             let mut view = call.view();
             fail(&mut view, errno_for(&error));
             c.ret(|mut r| r.i32(-1));

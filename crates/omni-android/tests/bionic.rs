@@ -4231,6 +4231,10 @@ fn a_write_after_madv_free_survives_a_later_madv_dontneed_elsewhere() {
         }) as i64 as i32
     };
     assert_eq!(advise(freed, 8), 0, "MADV_FREE");
+    // This layer carries MADV_FREE out at once (the pages are dropped as the call returns, one of
+    // the outcomes the contract allows), so the range reads zero and its memory is given back --
+    // a mark left for later would neither free anything nor be safe.
+    assert_eq!(load(freed), 0, "MADV_FREE is carried out when it returns");
     // The allocator reuses the page by writing to it -- no call in between.
     store(freed, 0x3333_3333_3333_3333);
     assert_eq!(advise(other, 4), 0, "MADV_DONTNEED over a different range");
