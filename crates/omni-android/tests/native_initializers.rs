@@ -55,7 +55,10 @@ const WROTE: &[(usize, Written)] = &[
     (0x067d_c330, Written::Pointer(0x0684_03b8)),
     (0x067d_c468, Written::Pointer(0x0684_2988)),
     (0x067d_c338, Written::Constant(0x0010_0008)),
-    (0x067d_67d0, Written::Constant(5)),
+    // Not `0x067d_67d0 = 5`: that is an emulated-TLS index, numbered in the order threads first
+    // touch thread-locals, and a worker thread the initializers start races for it (see
+    // `tests/initializers.rs`, `WROTE`).
+    (0x067d_c3b8, Written::Constant(0x0010_0010)),
 ];
 const IMAGE_POINTERS_WRITTEN: usize = 92_431;
 
@@ -272,6 +275,11 @@ impl Guest {
 }
 
 /// Image pointers written into the writable image by the run: the `tests/initializers.rs` count.
+///
+/// **One placement**, so a number that happens to lie inside the image counts as a pointer; that
+/// gate counts across two placements for exactly that reason (`written_across`). It holds here
+/// because the space sits at macOS's 0x3_0000_0000 and none of the 795 service descriptors' u32
+/// pairs -- the numbers that did it on Windows -- has a high half of 3 or 4.
 fn image_pointers_written(guest: &Guest, before: &[(GuestAddr, Vec<u8>)], after: &[(GuestAddr, Vec<u8>)]) -> usize {
     let span = guest.object.start..guest.object.end;
     let mut pointers = 0usize;
