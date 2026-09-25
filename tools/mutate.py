@@ -68,6 +68,7 @@ BIONIC_MUTEX = "crates/omni-bionic/src/mutex.rs"
 BIONIC_NUMERICS = "crates/omni-bionic/src/numerics.rs"
 BIONIC_RWLOCK = "crates/omni-bionic/src/rwlock.rs"
 BIONIC_COND = "crates/omni-bionic/src/cond.rs"
+BIONIC_ONCE = "crates/omni-bionic/src/once.rs"
 # M6: `sched_get_priority_max`/`_min`, which the engine sizes a real-time band against.
 BIONIC_METADATA = "crates/omni-bionic/src/metadata.rs"
 BIONIC_PRINTF = "crates/omni-bionic/src/printf.rs"
@@ -335,6 +336,10 @@ CORRUPT_STACK = ["cargo", "test", "-p", "omni-android", "--release", "--test", "
 CORRUPT_STRUCTS = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic",
                    "--no-fail-fast", "every_struct_a_handler_writes"]
 CORRUPT_TLS = ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "tls::"]
+# The `memorder-` rows: the primitives' own unit tests, filtered by module. No guest, no APK.
+ORDER_ONCE = ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "once::"]
+ORDER_SEM = ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "sem::"]
+ORDER_COND = ["cargo", "test", "-p", "omni-bionic", "--release", "--lib", "--no-fail-fast", "cond::"]
 CORRUPT_CAS = ["cargo", "test", "-p", "omni-cpu", "--release", "--lib", "--no-fail-fast",
                "sixteen_byte"]
 BIONIC_PMTU = ["cargo", "test", "-p", "omni-android", "--release", "--test", "bionic", "--no-fail-fast",
@@ -9534,6 +9539,64 @@ directory", ADAPTER_FILES,
      '    let capacity = length.max(SHADOW_MIN_BYTES).checked_next_power_of_two()?;',
      '    let capacity = Some(length.max(SHADOW_MIN_BYTES))?;',
      GLES_MAP),
+
+    # ---- memorder-: memory ordering on a weakly ordered (arm64) host, found by audit after macOS m9.
+    # A plain `GuestMemory::write`/`read` and a release store/acquire load behave identically under
+    # the mock's host lock and on every x86-64 host, so no behavioural test can see these; the
+    # detectors record WHICH primitive touched the word (`shared_mem::RecordingMemory`).
+    ('memorder-A1', 'A', "ERRORCHECK's unlock publishes the released word with a plain write",
+     BIONIC_MUTEX,
+     '            owners.clear(mutex_addr);\n            store_state(mem, mutex_addr, 0)?;',
+     '            owners.clear(mutex_addr);\n            mem.write(mutex_addr, &0u32.to_le_bytes())?;',
+     BIONIC_MUTEX_LIB),
+    ('memorder-A2', 'A', "RECURSIVE's last unlock publishes the released word with a plain write",
+     BIONIC_MUTEX,
+     '                owners.clear(mutex_addr);\n                store_state(mem, mutex_addr, new)?;',
+     '                owners.clear(mutex_addr);\n                mem.write(mutex_addr, &new.to_le_bytes())?;',
+     BIONIC_MUTEX_LIB),
+    ('memorder-A3', 'A', 'a RECURSIVE unlock that leaves it held stores the count with a byte copy',
+     BIONIC_MUTEX,
+     '                // Still held: one atomic store of the count (see `store_state`).\n'
+     '                store_state(mem, mutex_addr, new)?;',
+     '                // Still held: one atomic store of the count (see `store_state`).\n'
+     '                mem.write(mutex_addr, &new.to_le_bytes())?;',
+     BIONIC_MUTEX_LIB),
+    # The over-correction: "every release is a release store now" reads as the fix applied
+    # evenly, and it throws away the CAS that notices a concurrent release of a NORMAL mutex.
+    ('memorder-B1', 'B', "NORMAL's unlock turned into a blind release store instead of its CAS",
+     BIONIC_MUTEX,
+     '            let released = mem.cas_u32(mutex_addr, lock_state::LOCKED, lock_state::UNLOCKED)?\n'
+     '                || mem.cas_u32(mutex_addr, lock_state::LOCKED_WITH_WAITERS, lock_state::UNLOCKED)?;',
+     '            let released = mem.store_u32_release(mutex_addr, lock_state::UNLOCKED).is_ok();',
+     BIONIC_MUTEX_LIB),
+    ('memorder-A4', 'A', "pthread_once publishes DONE with a plain write",
+     BIONIC_ONCE,
+     '                    mem.store_u32_release(once_addr, state::DONE)?;',
+     '                    mem.write(once_addr, &state::DONE.to_le_bytes())?;',
+     ORDER_ONCE),
+    ('memorder-A5', 'A', "pthread_once's fast path reads DONE with a plain read",
+     BIONIC_ONCE,
+     '        let current = mem.load_u32_acquire(once_addr)?;',
+     '        let current = crate::atomics::read_u32(&*mem, once_addr)?;',
+     ORDER_ONCE),
+    ('memorder-A6', 'A', 'a pthread_once loser that waited reads DONE with a plain read',
+     BIONIC_ONCE,
+     '                    match mem.load_u32_acquire(once_addr)? {',
+     '                    match crate::atomics::read_u32(&*mem, once_addr)? {',
+     ORDER_ONCE),
+    ('memorder-A7', 'A', 'sem_getvalue reads the word with a plain read',
+     BIONIC_SEM,
+     '    let word = mem.load_u32_acquire(sem_addr)?;',
+     '    let word = read_word(mem, sem_addr)?;',
+     ORDER_SEM),
+    # Not an ordering row but found by the same audit: the release inside `pthread_cond_wait`
+    # woke the mutex's waiters through a futex nobody waits on, so a thread blocked locking the
+    # cond's mutex slept out a whole 1,000 ms slice. A fresh mock futex is that futex again.
+    ('memorder-A8', 'A', "pthread_cond_wait releases its mutex through a futex that wakes nobody",
+     BIONIC_COND,
+     '    crate::mutex::unlock(mem, futex, owners, threads, mutex_addr)?;',
+     '    crate::mutex::unlock(mem, &crate::mock_threads::MockFutex::new(), owners, threads, mutex_addr)?;',
+     ORDER_COND),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so
