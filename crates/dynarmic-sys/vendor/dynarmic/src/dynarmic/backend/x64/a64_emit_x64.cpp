@@ -223,6 +223,57 @@ void A64EmitX64::FillFastDispatchTable(void* table, u64 descriptor, CodePtr code
     entry.code_ptr = code_ptr;
 }
 
+namespace {
+
+/// A robin_map's bucket array: `bucket_count()` buckets, each the value inline beside its probe
+/// distance (tsl's `bucket_entry`; these maps do not store hashes). One allocation.
+template<typename Map>
+A64::SharedCodeCache::Table RobinMapFigure(const Map& map) {
+    using Bucket = tsl::detail_robin_hash::bucket_entry<std::pair<typename Map::key_type, typename Map::mapped_type>, false>;
+    A64::SharedCodeCache::Table t;
+    t.entries = map.size();
+    t.largest_bytes = static_cast<u64>(map.bucket_count()) * sizeof(Bucket);
+    t.bytes = t.largest_bytes;
+    // Any element lies inside the bucket array; an empty map names no address.
+    t.largest_address = map.empty() ? 0 : reinterpret_cast<std::uintptr_t>(&*map.begin());
+    return t;
+}
+
+template<typename T>
+u64 VectorBytes(const std::vector<T>& v) {
+    return static_cast<u64>(v.capacity()) * sizeof(T);
+}
+
+}  // namespace
+
+A64::SharedCodeCache::Tables A64EmitX64::Census() const {
+    A64::SharedCodeCache::Tables t;
+    t.blocks = RobinMapFigure(block_descriptors);
+
+    t.link_targets = RobinMapFigure(patch_information);
+    for (const auto& [target, info] : patch_information) {
+        t.link_targets.bytes += VectorBytes(info.jg) + VectorBytes(info.jz) + VectorBytes(info.jmp)
+                              + VectorBytes(info.mov_rcx) + VectorBytes(info.slots);
+    }
+
+    t.links = RobinMapFigure(outgoing_slots);
+    for (const auto& [location, own] : outgoing_slots) {
+        t.links.bytes += VectorBytes(own);
+    }
+
+    t.fastmem_sites = RobinMapFigure(fastmem_patch_info);
+
+    // boost::icl's interval_map: one tree node per interval holding a std::set, whose own tree has
+    // a node per location (MSVC's also allocates a head node per set). Estimated from sizeof and a
+    // tree node's three links and colour: the allocations are many and small.
+    constexpr u64 tree_node_overhead = 4 * sizeof(void*);
+    const auto [intervals, locations] = block_ranges.Census();
+    t.guest_ranges.entries = locations;
+    t.guest_ranges.bytes = intervals * (2 * sizeof(u64) + sizeof(std::set<IR::LocationDescriptor>) + tree_node_overhead)
+                         + (intervals + locations) * (sizeof(IR::LocationDescriptor) + tree_node_overhead);
+    return t;
+}
+
 size_t A64EmitX64::FastDispatchTableBytes() {
     return sizeof(FastDispatchEntry) * fast_dispatch_table_size;
 }

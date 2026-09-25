@@ -706,6 +706,33 @@ makes it slower (22 -> 31 ms). Per guest thread 4.548 -> 0.055 MiB.
 each rebuilt, run and restored with the file's SHA-1 checked (`tools/mutate_0022.py`): 13 rows,
 13 caught -- see D38.
 
+### 0024 — x64: a census of the shared cache's per-block tables
+
+`0024-x64-a-census-of-the-shared-cache-s-tables.patch`. **x64 only, read-only: nothing is emitted,
+kept or looked up differently.** `A64::SharedCodeCache::GetTables()` (interface `a64.h`) takes the
+cache's lock shared and asks the emitter (`A64EmitX64::Census`) what each of its per-block tables
+holds on the C heap -- entries, bytes (arrays at capacity, entries' own allocations), and an address
+inside its largest single allocation with that allocation's size. `BlockRangeInformation::Census`
+counts the icl intervals and the locations their sets name. The shim exports it as
+`od_code_cache_tables_of` (`OD_DYNARMIC_ABI_VERSION` 3: `od_abi_layout` gained the struct's size).
+
+**Why.** MEASURED in the world (M1 and M4, `OMNI_MEM_REPORT`, Windows, 2026-09-25): the process's C
+heaps held 968 MiB committed, 905 MiB allocated, of which only 55 MiB was the runtime's Rust -- with
+single allocations of **272, 224, 80 and 64 MiB**, the same in both runs. Those are exactly the
+bucket arrays of the emitter's four robin_maps (load factor at most 0.5) for the ~700,000 blocks the
+shared cache held: `patch_information`, 2^21 buckets of 136 bytes (five `std::vector`s inline, of
+which a shared cache uses one) = 272 MiB; `fastmem_patch_info`, 2^22 of 56 = 224 MiB;
+`outgoing_slots`, 2^21 of 40 = 80 MiB; `block_descriptors`, 2^21 of 32 = 64 MiB. The census lets a
+report say so rather than infer it: `OMNI_MEM_REPORT` names each such allocation by its table.
+
+`tests/shared_bookkeeping.rs` (x64; Windows reads the process heap's `HeapSummary`, Linux
+`mallinfo2`; the instrument is first shown seeing 16 MiB): 65,536 blocks of the engine's shape (a
+load, a store and a conditional branch; then a branch) cost **1,144 bytes per block** of heap on the
+pin, and the census accounts for 1,136 of them -- block map 128, link targets 568, block links 184,
+fastmem sites 112, guest ranges 144 -- and **944 are still held after the cache is cleared**. The test
+requires the census within 15% of what the heap grew by, and each table's named address inside an
+allocation at least as large as the one it sizes.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

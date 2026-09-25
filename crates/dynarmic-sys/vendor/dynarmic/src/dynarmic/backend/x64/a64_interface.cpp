@@ -289,6 +289,7 @@ struct SharedCodeCache::Impl final {
     CodePtr Emit(IR::LocationDescriptor location, const UserConfig& translator_conf, SharedThreadState& thread);
     void Invalidate(bool entire, const boost::icl::interval_set<u64>& ranges);
     SharedCodeCache::Stats GetStats() const;
+    SharedCodeCache::Tables GetTables() const;
     /// Called by a thread that has just left RunCode: every attached thread was asked to halt when
     /// a region was retired, so this is when the last holder lets go. Throttled, and skipped if
     /// the lock is busy.
@@ -1096,6 +1097,11 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
     return s;
 }
 
+SharedCodeCache::Tables SharedCodeCache::Impl::GetTables() const {
+    std::shared_lock guard{lock};
+    return emitter.Census();
+}
+
 SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes)
         : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes)) {}
 
@@ -1103,6 +1109,10 @@ SharedCodeCache::~SharedCodeCache() = default;
 
 SharedCodeCache::Stats SharedCodeCache::GetStats() const {
     return impl->GetStats();
+}
+
+SharedCodeCache::Tables SharedCodeCache::GetTables() const {
+    return impl->GetTables();
 }
 
 void SharedCodeCache::InvalidateCacheRange(std::uint64_t start_address, std::size_t length) {

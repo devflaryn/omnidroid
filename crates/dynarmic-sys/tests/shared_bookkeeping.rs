@@ -1,0 +1,291 @@
+//! **What a shared code cache keeps for each translated block** (patch 0022's emitter, x86-64),
+//! measured with the C heap's own count of bytes allocated.
+//!
+//! MEASURED in the world (M1/M4, `OMNI_MEM_REPORT`, 2026-09-25): 968 MiB of the process's C heaps
+//! committed, 905 MiB allocated, of which only 55 MiB was the runtime's Rust -- and among it single
+//! allocations of 272, 224, 80 and 64 MiB. Those are exactly the bucket arrays of the emitter's
+//! four robin_maps at a load factor of at most 0.5 for the ~700,000 blocks the shared cache held:
+//! `patch_information` (2^21 buckets of 136 bytes -- five `std::vector`s inline, of which a shared
+//! cache uses one), `fastmem_patch_info` (2^22 of 56), `outgoing_slots` (2^21 of 40) and
+//! `block_descriptors` (2^21 of 32). The rest of the heap is their per-entry vectors and
+//! `block_ranges`' boost::icl nodes.
+//!
+//! Every test here takes [`LOCK`], so nothing else in this binary allocates while one measures.
+#![cfg(target_arch = "x86_64")]
+
+mod harness;
+
+use std::ffi::c_void;
+use std::sync::Mutex;
+
+use dynarmic_sys::*;
+use harness::{a64, Vm, VmOptions, CODE_BASE, HALT_DONE, MEM_GUARD, MEM_SIZE};
+
+static LOCK: Mutex<()> = Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(windows)]
+fn heap_in_use() -> usize {
+    /// `HEAP_SUMMARY` (`<heapapi.h>`).
+    #[repr(C)]
+    #[derive(Default)]
+    struct HeapSummaryT {
+        cb: u32,
+        allocated: usize,
+        committed: usize,
+        reserved: usize,
+        max_reserve: usize,
+    }
+    extern "system" {
+        fn GetProcessHeap() -> *mut c_void;
+        fn HeapSummary(heap: *mut c_void, flags: u32, summary: *mut HeapSummaryT) -> i32;
+    }
+    let mut s = HeapSummaryT { cb: std::mem::size_of::<HeapSummaryT>() as u32, ..Default::default() };
+    // SAFETY: the process heap is live for the process; `s` is writable and states its size. The
+    // C runtime's `malloc`/`operator new` and Rust's `System` allocator both allocate from it.
+    let ok = unsafe { HeapSummary(GetProcessHeap(), 0, &mut s) };
+    assert_ne!(ok, 0, "HeapSummary");
+    s.allocated
+}
+
+#[cfg(target_os = "linux")]
+fn heap_in_use() -> usize {
+    /// glibc's `struct mallinfo2`.
+    #[repr(C)]
+    struct Mallinfo2 {
+        arena: usize,
+        ordblks: usize,
+        smblks: usize,
+        hblks: usize,
+        hblkhd: usize,
+        usmblks: usize,
+        fsmblks: usize,
+        uordblks: usize,
+        fordblks: usize,
+        keepcost: usize,
+    }
+    extern "C" {
+        fn mallinfo2() -> Mallinfo2;
+    }
+    // SAFETY: no arguments; returns plain data.
+    let m = unsafe { mallinfo2() };
+    m.uordblks + m.hblkhd
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn heap_in_use() -> usize {
+    0
+}
+
+/// The instrument first: an allocation must show up in it, or a small number below means nothing.
+#[test]
+fn the_heap_reading_sees_an_allocation() {
+    let _g = lock();
+    let before = heap_in_use();
+    let block = vec![1u8; 16 << 20];
+    std::hint::black_box(&block);
+    let grew = heap_in_use() as f64 - before as f64;
+    assert!(grew >= (15 << 20) as f64, "a 16 MiB allocation moved the reading by only {grew} bytes");
+}
+
+/// `units` units of four instructions, then `SVC #0`. A unit is two blocks, as the engine's code
+/// is: `LDR X3, [X2] ; STR X3, [X2, #8] ; B.EQ +2` (two fastmem patch sites, two links: the
+/// branch not taken and the branch taken) and `B +1` (one link) -- so per unit two blocks, three
+/// link slots, two link targets and two fastmem sites. Z is clear, so `B.EQ` falls through and
+/// both blocks run.
+fn units(units: usize) -> Vec<u32> {
+    let mut code = Vec::with_capacity(units * 4 + 1);
+    for _ in 0..units {
+        code.push(a64::ldr_imm(3, 2, 0));
+        code.push(a64::str_imm(3, 2, 8));
+        code.push(a64::b_cond(a64::cond::EQ, 2));
+        code.push(a64::b(1));
+    }
+    code.push(a64::svc(0));
+    code
+}
+
+const UNITS: usize = 32_768;
+const BLOCKS: usize = 2 * UNITS;
+
+/// One guest address space on a shared cache big enough that nothing is retired.
+struct Shared {
+    vm: Option<Vm>,
+    cache: *mut c_void,
+    monitor: *mut c_void,
+}
+
+impl Shared {
+    fn new(code: Vec<u32>) -> Self {
+        let arena: &'static mut [u64] = Box::leak(vec![0u64; (MEM_SIZE + MEM_GUARD) / 8].into_boxed_slice());
+        let arena = arena.as_mut_ptr();
+        // SAFETY: freed in `Drop`, after the jit.
+        let monitor = unsafe { od_monitor_new(1) };
+        assert!(!monitor.is_null());
+        let opts = VmOptions {
+            shared_arena: arena as usize,
+            shared_monitor: monitor as usize,
+            ..VmOptions::default()
+        };
+        let cache = Vm::new_code_cache(&opts, monitor, arena, 256 << 20, 64 << 20);
+        assert!(!cache.is_null(), "od_code_cache_new refused the configuration");
+        let vm = Vm::new(code, VmOptions { shared_cache: cache as usize, ..opts });
+        Self { vm: Some(vm), cache, monitor }
+    }
+
+    fn vm(&self) -> &Vm {
+        self.vm.as_ref().expect("live")
+    }
+
+    fn run(&self) {
+        let vm = self.vm();
+        vm.with_ctx(|c| c.write_u64(0x100, 0x5EED));
+        vm.set_reg(2, 0x100);
+        vm.start(u64::MAX);
+        assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE, "the chain reached its SVC");
+        assert_eq!(vm.reg(3), 0x5EED, "the translated loads ran");
+        assert_eq!(vm.with_ctx(|c| c.read_u64(0x108)), 0x5EED, "the translated stores ran");
+    }
+
+    fn tables(&self) -> OdCodeCacheTables {
+        let mut t = OdCodeCacheTables::default();
+        // SAFETY: the cache is live.
+        unsafe { od_code_cache_tables_of(self.cache, &mut t) };
+        t
+    }
+
+    fn stats(&self) -> OdCodeCacheStats {
+        let mut s = OdCodeCacheStats::default();
+        // SAFETY: the cache is live.
+        unsafe { od_code_cache_stats_of(self.cache, &mut s) };
+        s
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        drop(self.vm.take());
+        // SAFETY: the only jit on the cache is gone; each handle is freed once.
+        unsafe {
+            od_code_cache_free(self.cache);
+            od_monitor_free(self.monitor);
+        }
+    }
+}
+
+#[test]
+fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
+    let _g = lock();
+    // One cache first, so one-time costs (dynarmic's statics, the decoder tables) are paid before
+    // the measurement.
+    Shared::new(units(UNITS)).run();
+
+    let shared = Shared::new(units(UNITS));
+    let created = heap_in_use();
+    shared.run();
+    let ran = heap_in_use();
+    let stats = shared.stats();
+    assert!(stats.blocks_emitted >= BLOCKS as u64, "every block was translated: {stats:?}");
+
+    let per_block = (ran as f64 - created as f64) / BLOCKS as f64;
+    eprintln!(
+        "shared-cache bookkeeping per translated block: {per_block:.0} bytes (n = {BLOCKS} blocks, \
+         {} bytes of code each)",
+        stats.code_bytes_emitted / stats.blocks_emitted
+    );
+    let tables = shared.tables();
+    let mut counted = 0u64;
+    for (name, t) in tables.named() {
+        counted += t.bytes;
+        eprintln!(
+            "  {name}: {} entries, {:.0} bytes per block, largest allocation {} KiB",
+            t.entries,
+            t.bytes as f64 / BLOCKS as f64,
+            t.largest_bytes >> 10
+        );
+    }
+    eprintln!("  the census: {:.0} bytes per block", counted as f64 / BLOCKS as f64);
+
+    // The census is what `OMNI_MEM_REPORT` says the heap holds for the cache: it must account for
+    // what the heap grew by (less the allocator's own headers, and the few blocks of the jit's own
+    // run), or the report's attribution means nothing.
+    let grew = (ran - created) as f64;
+    assert!(
+        (counted as f64 - grew).abs() < 0.15 * grew,
+        "the census counts {counted} bytes, the heap grew by {grew}"
+    );
+    // And the address it names lies inside an allocation at least as large as the one it sizes.
+    for (name, t) in tables.named() {
+        if t.largest_bytes >= 1 << 20 {
+            let span = allocation_span(t.largest_address as usize);
+            assert!(span >= t.largest_bytes as usize, "{name}: its address is in an allocation of {span} bytes, not {}", t.largest_bytes);
+        }
+    }
+}
+
+/// The bytes from the start of the allocation holding `address` to its end, per the OS.
+#[cfg(windows)]
+fn allocation_span(address: usize) -> usize {
+    /// `MEMORY_BASIC_INFORMATION` (x64).
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryBasicInformation {
+        base_address: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+    }
+    extern "system" {
+        fn VirtualQuery(address: *const c_void, info: *mut MemoryBasicInformation, len: usize) -> usize;
+    }
+    let query = |at: usize| {
+        let mut info = MemoryBasicInformation::default();
+        // SAFETY: `info` is writable and its size is passed; VirtualQuery reads nothing at `at`.
+        let got = unsafe { VirtualQuery(at as *const c_void, &mut info, std::mem::size_of::<MemoryBasicInformation>()) };
+        assert_ne!(got, 0, "VirtualQuery({at:#x})");
+        info
+    };
+    let base = query(address).allocation_base;
+    let mut end = base;
+    loop {
+        let info = query(end);
+        if info.allocation_base != base {
+            return end - base;
+        }
+        end = info.base_address + info.region_size;
+    }
+}
+
+/// On Linux a large array is its own `mmap`; the test does not read the maps.
+#[cfg(not(windows))]
+fn allocation_span(_address: usize) -> usize {
+    usize::MAX
+}
+
+#[test]
+fn clearing_a_shared_cache_gives_its_bookkeeping_back() {
+    let _g = lock();
+    Shared::new(units(UNITS)).run();
+
+    let shared = Shared::new(units(UNITS));
+    let created = heap_in_use();
+    shared.run();
+    let ran = heap_in_use();
+    // SAFETY: the cache is live and its one jit is not executing.
+    unsafe { od_code_cache_clear(shared.cache) };
+    let vm = shared.vm();
+    vm.set_pc(CODE_BASE + 4 * (4 * UNITS as u64));
+    assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE, "the SVC after the clear");
+    let cleared = heap_in_use();
+
+    let held = (ran as f64 - created as f64) / BLOCKS as f64;
+    let kept = (cleared as f64 - created as f64) / BLOCKS as f64;
+    eprintln!("per block: {held:.0} bytes held after running, {kept:.0} still held after a clear");
+}

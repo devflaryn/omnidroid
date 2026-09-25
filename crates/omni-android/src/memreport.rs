@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use omni_cpu::stats::CodeCacheTable;
 use omni_mem::{GuestAddr, GuestSpace, MapLabel, RegionInfo, RegionKind};
 use omni_platform::vm::{self, HeapTotals, HostRegion, HostRegionKind, Residency};
 use parking_lot::Mutex;
@@ -288,6 +289,8 @@ pub struct Inputs {
     pub rust_live: Option<u64>,
     /// The shared code cache's committed bytes and count, from `omni-cpu`'s stats.
     pub shared_code_cache: (u64, u64),
+    /// What the shared code caches' per-block tables hold on the C heap (dynarmic's census).
+    pub code_cache_tables: [CodeCacheTable; 5],
     /// Registered libraries.
     pub images: Vec<Image>,
     /// The engine's own figures, `(name, value)`, and the file they came from.
@@ -306,6 +309,7 @@ impl Default for Inputs {
             heaps: None,
             rust_live: None,
             shared_code_cache: (0, 0),
+            code_cache_tables: Default::default(),
             images: Vec::new(),
             engine: None,
         }
@@ -328,7 +332,7 @@ pub fn measure(space: &GuestSpace, images: &[Image], profile_dir: Option<&Path>,
             GuestPiece { region, label, residency }
         })
         .collect();
-    let caches = omni_cpu::stats::code_caches();
+    let caches = omni_cpu::stats::code_caches_with_tables();
     Inputs {
         at,
         process: vm::process_memory().ok(),
@@ -339,6 +343,7 @@ pub fn measure(space: &GuestSpace, images: &[Image], profile_dir: Option<&Path>,
         heaps: vm::heap_totals().ok(),
         rust_live: rust_heap_live(),
         shared_code_cache: (caches.committed_bytes, caches.caches),
+        code_cache_tables: caches.tables,
         images: images.to_vec(),
         engine: profile_dir.and_then(engine_profile),
     }
@@ -471,6 +476,8 @@ pub fn attribute(inputs: &Inputs) -> Vec<Row> {
     let mut mapped = Row { owner: MAPPED.into(), ..Row::default() };
     let mut groups: [BTreeSet<usize>; 5] = Default::default();
     let mut private_allocations: HashMap<usize, u64> = HashMap::new();
+    // Per allocation: bytes reserved and resident, to say what a large one is doing.
+    let mut private_extent: HashMap<usize, (u64, u64)> = HashMap::new();
     let mut named: [BTreeMap<String, Residency>; 2] = Default::default();
     let mut guest_os_committed = 0u64;
     for region in host {
@@ -486,6 +493,9 @@ pub fn attribute(inputs: &Inputs) -> Vec<Row> {
             HostRegionKind::Private if region.stack => (&mut stacks, 1),
             HostRegionKind::Private => {
                 *private_allocations.entry(region.allocation_base).or_default() += region.committed;
+                let extent = private_extent.entry(region.allocation_base).or_default();
+                extent.0 += region.len as u64;
+                extent.1 += residency.resident;
                 (&mut private, 2)
             }
             HostRegionKind::Image => {
@@ -526,13 +536,46 @@ pub fn attribute(inputs: &Inputs) -> Vec<Row> {
     if let Some(live) = inputs.rust_live {
         private.notes.push(format!("of which this runtime's live Rust allocations: {} MiB", mib(live)));
     }
-    // The allocations worth naming: a MiB or more committed. The rest is the long tail of small
-    // ones, which the row's own total already holds.
+    let tables = &inputs.code_cache_tables;
+    let table_bytes: u64 = tables.iter().map(|t| t.bytes).sum();
+    if table_bytes > 0 {
+        let each: Vec<String> = tables
+            .iter()
+            .filter(|t| t.bytes > 0)
+            .map(|t| format!("{} {} MiB ({} entries)", t.name, mib(t.bytes), t.entries))
+            .collect();
+        private.notes.push(format!(
+            "of which the shared code cache's per-block tables (dynarmic, census): {} MiB -- {}",
+            mib(table_bytes),
+            each.join(", ")
+        ));
+    }
+    // Whose an allocation is, where a table's census names an address inside it.
+    let mut owners: HashMap<usize, &str> = HashMap::new();
+    for table in tables.iter().filter(|t| t.largest_address != 0) {
+        let at = table.largest_address;
+        if let Some(region) = host.iter().find(|r| r.start <= at && at < r.end()) {
+            owners.insert(region.allocation_base, table.name);
+        }
+    }
+    // The allocations worth naming: every one of 16 MiB or more, and at least the five largest of
+    // a MiB or more. The rest is the long tail of small ones, which the row's own total holds.
     let mut largest: Vec<(usize, u64)> =
         private_allocations.into_iter().filter(|a| a.1 >= 1 << 20).collect();
     largest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    for (at, bytes) in largest.iter().take(5) {
-        private.notes.push(format!("allocation at {at:#x}: {} MiB committed", mib(*bytes)));
+    let listed = largest.iter().filter(|a| a.1 >= 16 << 20).count().max(5);
+    for (at, bytes) in largest.iter().take(listed) {
+        let owner = owners
+            .get(at)
+            .map(|name| format!(" -- the shared code cache's {name} (dynarmic)"))
+            .unwrap_or_default();
+        let (reserved, resident) = private_extent.get(at).copied().unwrap_or_default();
+        let reserved = if reserved > *bytes { format!(" of {} MiB reserved", mib(reserved)) } else { String::new() };
+        private.notes.push(format!(
+            "allocation at {at:#x}: {} MiB committed{reserved}, {} MiB resident{owner}",
+            mib(*bytes),
+            mib(resident)
+        ));
     }
     for (row, names) in [(&mut images, &named[0]), (&mut mapped, &named[1])] {
         let mut by: Vec<_> = names.iter().collect();
@@ -923,6 +966,43 @@ mod tests {
         assert!(text.lines().all(|l| l.starts_with("MEMREPORT")), "{text}");
         assert!(text.contains("total (MiB)"), "{text}");
         assert!(text.contains("the engine's own count: no memProfStorage file yet"), "{text}");
+    }
+
+    /// The shared code cache's census names the heap allocations it owns, and every allocation of
+    /// 16 MiB or more is listed -- M1 had four such tables and a report that stopped at five rows.
+    #[test]
+    fn a_large_heap_allocation_is_named_by_the_table_that_owns_it() {
+        // Seven private allocations of 16..22 MiB and one of 2 MiB, each its own region; the
+        // census puts the link targets' array inside the 20 MiB one, 4 KiB past its base.
+        let mut regions: Vec<HostRegion> = (0..7)
+            .map(|i| host(0x3000_0000 + i * 0x200_0000, (16 + i) * M, HostRegionKind::Private, ((16 + i) * M) as u64, M as u64))
+            .collect();
+        regions.push(host(0x5000_0000, 2 * M, HostRegionKind::Private, 2 * M as u64, M as u64));
+        let mut tables: [CodeCacheTable; 5] = Default::default();
+        tables[1] = CodeCacheTable {
+            name: "link targets",
+            entries: 1000,
+            bytes: 20 * M as u64,
+            largest_address: 0x3000_0000 + 4 * 0x200_0000 + 0x1000,
+            largest_bytes: 20 * M as u64,
+        };
+        tables[0] = CodeCacheTable { name: "block map", entries: 900, bytes: M as u64 / 2, ..CodeCacheTable::default() };
+        let inputs = Inputs { host: Ok(regions), code_cache_tables: tables, ..Inputs::default() };
+        let rows = attribute(&inputs);
+        let private = rows.iter().find(|r| r.owner == HOST_PRIVATE).expect("the host's private row");
+        let allocations: Vec<&String> = private.notes.iter().filter(|n| n.starts_with("allocation at")).collect();
+        assert_eq!(allocations.len(), 7, "every allocation of 16 MiB or more, and not the 2 MiB one: {allocations:#?}");
+        assert!(
+            allocations.iter().any(|n| *n == "allocation at 0x38000000: 20.0 MiB committed, 1.0 MiB resident -- the shared code cache's link targets (dynarmic)"),
+            "{allocations:#?}"
+        );
+        assert_eq!(allocations.iter().filter(|n| n.contains("dynarmic")).count(), 1, "only the one it names: {allocations:#?}");
+        assert!(
+            private.notes.iter().any(|n| n
+                == "of which the shared code cache's per-block tables (dynarmic, census): 20.5 MiB -- block map 0.5 MiB (900 entries), link targets 20.0 MiB (1000 entries)"),
+            "{:#?}",
+            private.notes
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 2u
+#define OD_DYNARMIC_ABI_VERSION 3u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -312,6 +312,8 @@ typedef struct od_abi_layout {
     uint32_t stats_align;
     uint32_t code_cache_stats_size;
     uint32_t code_cache_stats_align;
+    uint32_t code_cache_tables_size;
+    uint32_t code_cache_tables_align;
 } od_abi_layout;
 
 uint32_t od_dynarmic_abi_version(void);
@@ -388,6 +390,26 @@ typedef struct od_code_cache_stats {
     uint64_t attached;            /* jits attached now */
 } od_code_cache_stats;
 void od_code_cache_stats_of(void* cache, od_code_cache_stats* out);
+
+/* What one of a shared cache's per-block tables holds on the C heap (patch 0024): a census for a
+ * memory report. `largest_address` lies inside the table's largest single allocation (0 when it
+ * names none), so a report can say whose a large heap allocation is. */
+typedef struct od_code_cache_table {
+    uint64_t entries;          /* what it holds */
+    uint64_t bytes;            /* its arrays at capacity and its entries' own allocations */
+    uint64_t largest_address;  /* inside its largest single allocation, or 0 */
+    uint64_t largest_bytes;    /* that allocation's size */
+} od_code_cache_table;
+typedef struct od_code_cache_tables {
+    od_code_cache_table blocks;        /* location -> translated block (the dispatcher's map) */
+    od_code_cache_table link_targets;  /* link target -> the link slots jumping to it */
+    od_code_cache_table links;         /* each block's own link slots */
+    od_code_cache_table fastmem_sites; /* host fault site -> fallback, per fastmem access */
+    od_code_cache_table guest_ranges;  /* the guest bytes each block was translated from */
+} od_code_cache_tables;
+/* Takes the cache's lock, shared, and walks what the tables cannot size in O(1): for a report
+ * made every few minutes, not for a hot path. All zero on an arm64 host (no shared cache). */
+void od_code_cache_tables_of(void* cache, od_code_cache_tables* out);
 
 /* Invalidate for every jit of the cache, now. Not from inside a callback of a
  * jit on this cache: use `od_jit_invalidate_range` there (it is queued and the

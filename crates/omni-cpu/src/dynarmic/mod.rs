@@ -89,12 +89,12 @@ use std::sync::Arc;
 
 use dynarmic_sys::{
     optimization, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
-    od_code_cache_stats_of, od_jit_clear_halt, od_jit_effective_config, od_jit_free,
-    od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec, od_jit_halt,
-    od_jit_invalidate_range, od_jit_new, od_jit_new_shared, od_jit_reset_stats, od_jit_run,
+    od_code_cache_stats_of, od_code_cache_tables_of, od_jit_clear_halt, od_jit_effective_config,
+    od_jit_free, od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec,
+    od_jit_halt, od_jit_invalidate_range, od_jit_new, od_jit_new_shared, od_jit_reset_stats, od_jit_run,
     od_jit_set_pc, od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec,
     od_jit_slow_path_total, od_jit_stats, od_monitor_free, od_monitor_layout_of, od_monitor_new,
-    OdCodeCacheStats, OdConfig, OdEffectiveConfig, OdMonitorLayout, OdStats,
+    OdCodeCacheStats, OdCodeCacheTables, OdConfig, OdEffectiveConfig, OdMonitorLayout, OdStats,
     OD_DYNARMIC_ABI_VERSION, OD_HALT_CACHE_INVALIDATION, OD_HALT_MEMORY_ABORT,
     OD_HALT_SHIM_REENTERED, OD_HALT_SHIM_THREW, OD_HALT_USER1, OD_HALT_USER8,
     OD_FIXED_PER_JIT_BYTES,
@@ -848,12 +848,27 @@ impl DynarmicBackend {
         if has_code_cache {
             // D38: what `OMNI_PERF` prints about the cache, for as long as the backend lives.
             let shared = Arc::downgrade(&backend.shared);
-            crate::stats::register_code_cache(Box::new(move || {
+            crate::stats::register_code_cache(Box::new(move |with_tables| {
                 let shared = shared.upgrade()?;
                 let cache = shared.code_cache.as_ref()?;
                 let mut s = OdCodeCacheStats::default();
                 // SAFETY: the cache lives as long as `shared`, held here; `s` is writable.
                 unsafe { od_code_cache_stats_of(cache.0, &mut s) };
+                let mut tables = [crate::stats::CodeCacheTable::default(); 5];
+                if with_tables {
+                    let mut t = OdCodeCacheTables::default();
+                    // SAFETY: as above; `t` is writable.
+                    unsafe { od_code_cache_tables_of(cache.0, &mut t) };
+                    for (out, (name, one)) in tables.iter_mut().zip(t.named()) {
+                        *out = crate::stats::CodeCacheTable {
+                            name,
+                            entries: one.entries,
+                            bytes: one.bytes,
+                            largest_address: one.largest_address as usize,
+                            largest_bytes: one.largest_bytes,
+                        };
+                    }
+                }
                 Some(crate::stats::CodeCacheCounters {
                     caches: 1,
                     blocks_emitted: s.blocks_emitted,
@@ -866,6 +881,7 @@ impl DynarmicBackend {
                     parked_redirected: s.parked_redirected,
                     locked_lookups: s.locked_lookups,
                     committed_bytes: s.committed_bytes,
+                    tables,
                 })
             }));
         }

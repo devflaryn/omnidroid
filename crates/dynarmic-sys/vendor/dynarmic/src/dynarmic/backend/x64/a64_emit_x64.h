@@ -76,6 +76,9 @@ public:
     CodePtr ProbeFastDispatchTable(void* table, u64 descriptor) const;
     /// Record `code` for `descriptor` in `table`, as the emitted handler does on a miss.
     void FillFastDispatchTable(void* table, u64 descriptor, CodePtr code) const;
+    /// Omnidroid patch 0024: what each per-block table holds, for a memory report. The caller
+    /// holds the cache's lock (shared is enough).
+    A64::SharedCodeCache::Tables Census() const;
 
 protected:
     /// Patch 0022: a callback of the thread's UserCallbacks -- an immediate `this` in a Jit with

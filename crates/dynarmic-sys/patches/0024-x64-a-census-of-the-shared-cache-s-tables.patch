@@ -1,0 +1,183 @@
+diff --git a/src/dynarmic/backend/block_range_information.cpp b/src/dynarmic/backend/block_range_information.cpp
+index 47e512f..eac993e 100644
+--- a/src/dynarmic/backend/block_range_information.cpp
++++ b/src/dynarmic/backend/block_range_information.cpp
+@@ -37,6 +37,15 @@ tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>
+     return erase_locations;
+ }
+ 
++template<typename ProgramCounterType>
++std::pair<std::size_t, std::size_t> BlockRangeInformation<ProgramCounterType>::Census() const {
++    std::size_t locations = 0;
++    for (const auto& [interval, set] : block_ranges) {
++        locations += set.size();
++    }
++    return {block_ranges.iterative_size(), locations};
++}
++
+ template class BlockRangeInformation<u32>;
+ template class BlockRangeInformation<u64>;
+ 
+diff --git a/src/dynarmic/backend/block_range_information.h b/src/dynarmic/backend/block_range_information.h
+index 3402b15..6116f74 100644
+--- a/src/dynarmic/backend/block_range_information.h
++++ b/src/dynarmic/backend/block_range_information.h
+@@ -5,7 +5,9 @@
+ 
+ #pragma once
+ 
++#include <cstddef>
+ #include <set>
++#include <utility>
+ 
+ #include <boost/icl/interval_map.hpp>
+ #include <boost/icl/interval_set.hpp>
+@@ -21,6 +23,9 @@ public:
+     void AddRange(boost::icl::discrete_interval<ProgramCounterType> range, IR::LocationDescriptor location);
+     void ClearCache();
+     tsl::robin_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges);
++    /// Omnidroid patch 0024, a census for a memory report: the intervals held, and the locations
++    /// their sets name between them.
++    std::pair<std::size_t, std::size_t> Census() const;
+ 
+ private:
+     boost::icl::interval_map<ProgramCounterType, std::set<IR::LocationDescriptor>> block_ranges;
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index c20c4ec..7738731 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -223,6 +223,57 @@ void A64EmitX64::FillFastDispatchTable(void* table, u64 descriptor, CodePtr code
+     entry.code_ptr = code_ptr;
+ }
+ 
++namespace {
++
++/// A robin_map's bucket array: `bucket_count()` buckets, each the value inline beside its probe
++/// distance (tsl's `bucket_entry`; these maps do not store hashes). One allocation.
++template<typename Map>
++A64::SharedCodeCache::Table RobinMapFigure(const Map& map) {
++    using Bucket = tsl::detail_robin_hash::bucket_entry<std::pair<typename Map::key_type, typename Map::mapped_type>, false>;
++    A64::SharedCodeCache::Table t;
++    t.entries = map.size();
++    t.largest_bytes = static_cast<u64>(map.bucket_count()) * sizeof(Bucket);
++    t.bytes = t.largest_bytes;
++    // Any element lies inside the bucket array; an empty map names no address.
++    t.largest_address = map.empty() ? 0 : reinterpret_cast<std::uintptr_t>(&*map.begin());
++    return t;
++}
++
++template<typename T>
++u64 VectorBytes(const std::vector<T>& v) {
++    return static_cast<u64>(v.capacity()) * sizeof(T);
++}
++
++}  // namespace
++
++A64::SharedCodeCache::Tables A64EmitX64::Census() const {
++    A64::SharedCodeCache::Tables t;
++    t.blocks = RobinMapFigure(block_descriptors);
++
++    t.link_targets = RobinMapFigure(patch_information);
++    for (const auto& [target, info] : patch_information) {
++        t.link_targets.bytes += VectorBytes(info.jg) + VectorBytes(info.jz) + VectorBytes(info.jmp)
++                              + VectorBytes(info.mov_rcx) + VectorBytes(info.slots);
++    }
++
++    t.links = RobinMapFigure(outgoing_slots);
++    for (const auto& [location, own] : outgoing_slots) {
++        t.links.bytes += VectorBytes(own);
++    }
++
++    t.fastmem_sites = RobinMapFigure(fastmem_patch_info);
++
++    // boost::icl's interval_map: one tree node per interval holding a std::set, whose own tree has
++    // a node per location (MSVC's also allocates a head node per set). Estimated from sizeof and a
++    // tree node's three links and colour: the allocations are many and small.
++    constexpr u64 tree_node_overhead = 4 * sizeof(void*);
++    const auto [intervals, locations] = block_ranges.Census();
++    t.guest_ranges.entries = locations;
++    t.guest_ranges.bytes = intervals * (2 * sizeof(u64) + sizeof(std::set<IR::LocationDescriptor>) + tree_node_overhead)
++                         + (intervals + locations) * (sizeof(IR::LocationDescriptor) + tree_node_overhead);
++    return t;
++}
++
+ size_t A64EmitX64::FastDispatchTableBytes() {
+     return sizeof(FastDispatchEntry) * fast_dispatch_table_size;
+ }
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index ed30565..2cbbd52 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -76,6 +76,9 @@ public:
+     CodePtr ProbeFastDispatchTable(void* table, u64 descriptor) const;
+     /// Record `code` for `descriptor` in `table`, as the emitted handler does on a miss.
+     void FillFastDispatchTable(void* table, u64 descriptor, CodePtr code) const;
++    /// Omnidroid patch 0024: what each per-block table holds, for a memory report. The caller
++    /// holds the cache's lock (shared is enough).
++    A64::SharedCodeCache::Tables Census() const;
+ 
+ protected:
+     /// Patch 0022: a callback of the thread's UserCallbacks -- an immediate `this` in a Jit with
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index 749073d..8a9a9e5 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -289,6 +289,7 @@ struct SharedCodeCache::Impl final {
+     CodePtr Emit(IR::LocationDescriptor location, const UserConfig& translator_conf, SharedThreadState& thread);
+     void Invalidate(bool entire, const boost::icl::interval_set<u64>& ranges);
+     SharedCodeCache::Stats GetStats() const;
++    SharedCodeCache::Tables GetTables() const;
+     /// Called by a thread that has just left RunCode: every attached thread was asked to halt when
+     /// a region was retired, so this is when the last holder lets go. Throttled, and skipped if
+     /// the lock is busy.
+@@ -1096,6 +1097,11 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
+     return s;
+ }
+ 
++SharedCodeCache::Tables SharedCodeCache::Impl::GetTables() const {
++    std::shared_lock guard{lock};
++    return emitter.Census();
++}
++
+ SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes)
+         : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes)) {}
+ 
+@@ -1105,6 +1111,10 @@ SharedCodeCache::Stats SharedCodeCache::GetStats() const {
+     return impl->GetStats();
+ }
+ 
++SharedCodeCache::Tables SharedCodeCache::GetTables() const {
++    return impl->GetTables();
++}
++
+ void SharedCodeCache::InvalidateCacheRange(std::uint64_t start_address, std::size_t length) {
+     if (length == 0) {
+         return;
+diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+index 8e47b50..9fbfba3 100644
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -181,6 +181,23 @@ public:
+     };
+     Stats GetStats() const;
+ 
++    /// Omnidroid patch 0024: what one of the emitter's per-block tables holds on the C heap.
++    struct Table {
++        std::uint64_t entries = 0;          ///< what it holds
++        std::uint64_t bytes = 0;            ///< its arrays at their capacity, and its entries' own allocations
++        std::uintptr_t largest_address = 0; ///< an address inside its largest single allocation, 0 if none
++        std::uint64_t largest_bytes = 0;    ///< that allocation's size
++    };
++    struct Tables {
++        Table blocks;         ///< location -> translated block (the dispatcher's map)
++        Table link_targets;   ///< link target -> the link slots that jump to it
++        Table links;          ///< each block's own link slots
++        Table fastmem_sites;  ///< host fault site -> fallback, for fastmem accesses
++        Table guest_ranges;   ///< the guest bytes each block was translated from
++    };
++    /// Takes the cache's lock, shared: a census for a memory report, not for a hot path.
++    Tables GetTables() const;
++
+     /// Invalidate [start, start + length) for every attached Jit, now. Must not be called from
+     /// inside a callback of a Jit attached to this cache (use Jit::InvalidateCacheRange there).
+     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);

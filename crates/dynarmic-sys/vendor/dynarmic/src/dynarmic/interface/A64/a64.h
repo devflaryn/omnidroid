@@ -181,6 +181,23 @@ public:
     };
     Stats GetStats() const;
 
+    /// Omnidroid patch 0024: what one of the emitter's per-block tables holds on the C heap.
+    struct Table {
+        std::uint64_t entries = 0;          ///< what it holds
+        std::uint64_t bytes = 0;            ///< its arrays at their capacity, and its entries' own allocations
+        std::uintptr_t largest_address = 0; ///< an address inside its largest single allocation, 0 if none
+        std::uint64_t largest_bytes = 0;    ///< that allocation's size
+    };
+    struct Tables {
+        Table blocks;         ///< location -> translated block (the dispatcher's map)
+        Table link_targets;   ///< link target -> the link slots that jump to it
+        Table links;          ///< each block's own link slots
+        Table fastmem_sites;  ///< host fault site -> fallback, for fastmem accesses
+        Table guest_ranges;   ///< the guest bytes each block was translated from
+    };
+    /// Takes the cache's lock, shared: a census for a memory report, not for a hot path.
+    Tables GetTables() const;
+
     /// Invalidate [start, start + length) for every attached Jit, now. Must not be called from
     /// inside a callback of a Jit attached to this cache (use Jit::InvalidateCacheRange there).
     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);

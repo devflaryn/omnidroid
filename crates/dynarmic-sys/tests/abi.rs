@@ -43,6 +43,16 @@ fn struct_layouts_match_the_c_header() {
         align_of::<OdCodeCacheStats>(),
         "od_code_cache_stats align"
     );
+    assert_eq!(
+        l.code_cache_tables_size as usize,
+        size_of::<OdCodeCacheTables>(),
+        "od_code_cache_tables size"
+    );
+    assert_eq!(
+        l.code_cache_tables_align as usize,
+        align_of::<OdCodeCacheTables>(),
+        "od_code_cache_tables align"
+    );
 }
 
 #[test]

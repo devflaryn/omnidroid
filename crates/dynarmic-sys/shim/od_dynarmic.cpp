@@ -338,6 +338,8 @@ void od_dynarmic_abi_layout(od_abi_layout* out) {
     out->stats_align = static_cast<uint32_t>(alignof(od_stats));
     out->code_cache_stats_size = static_cast<uint32_t>(sizeof(od_code_cache_stats));
     out->code_cache_stats_align = static_cast<uint32_t>(alignof(od_code_cache_stats));
+    out->code_cache_tables_size = static_cast<uint32_t>(sizeof(od_code_cache_tables));
+    out->code_cache_tables_align = static_cast<uint32_t>(alignof(od_code_cache_tables));
 }
 
 void* od_monitor_new(uint64_t processor_count) {
@@ -573,6 +575,29 @@ void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
     out->reclaim_attempts = s.reclaim_attempts;
     out->committed_bytes = s.committed_bytes;
     out->attached = s.attached;
+#else
+    (void)p;
+#endif
+}
+
+void od_code_cache_tables_of(void* p, od_code_cache_tables* out) {
+    *out = od_code_cache_tables{};
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p == nullptr) {
+        return;
+    }
+    const auto t = static_cast<OdCodeCache*>(p)->cache->GetTables();
+    const auto copy = [](od_code_cache_table& to, const A64::SharedCodeCache::Table& from) {
+        to.entries = from.entries;
+        to.bytes = from.bytes;
+        to.largest_address = static_cast<uint64_t>(from.largest_address);
+        to.largest_bytes = from.largest_bytes;
+    };
+    copy(out->blocks, t.blocks);
+    copy(out->link_targets, t.link_targets);
+    copy(out->links, t.links);
+    copy(out->fastmem_sites, t.fastmem_sites);
+    copy(out->guest_ranges, t.guest_ranges);
 #else
     (void)p;
 #endif

@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 2;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 3;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -520,6 +520,10 @@ pub struct OdAbiLayout {
     pub code_cache_stats_size: u32,
     /// `alignof(od_code_cache_stats)`.
     pub code_cache_stats_align: u32,
+    /// `sizeof(od_code_cache_tables)`.
+    pub code_cache_tables_size: u32,
+    /// `alignof(od_code_cache_tables)`.
+    pub code_cache_tables_align: u32,
 }
 
 /// What a shared code cache (vendored patch 0022, [`od_code_cache_new`]) has done, from
@@ -568,6 +572,52 @@ pub struct OdCodeCacheStats {
     pub committed_bytes: u64,
     /// Jits attached now.
     pub attached: u64,
+}
+
+/// What one of a shared code cache's per-block tables holds on the C heap (vendored patch 0024),
+/// from [`od_code_cache_tables_of`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OdCodeCacheTable {
+    /// What it holds.
+    pub entries: u64,
+    /// Its arrays at their capacity, and its entries' own allocations.
+    pub bytes: u64,
+    /// An address inside its largest single allocation, or 0 when it names none -- so a report can
+    /// say whose a large heap allocation is.
+    pub largest_address: u64,
+    /// That allocation's size.
+    pub largest_bytes: u64,
+}
+
+/// A shared code cache's per-block tables (vendored patch 0024), from [`od_code_cache_tables_of`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OdCodeCacheTables {
+    /// Location -> translated block: the dispatcher's map.
+    pub blocks: OdCodeCacheTable,
+    /// Link target -> the link slots that jump to it.
+    pub link_targets: OdCodeCacheTable,
+    /// Each block's own link slots.
+    pub links: OdCodeCacheTable,
+    /// Host fault site -> fallback, one per fastmem access.
+    pub fastmem_sites: OdCodeCacheTable,
+    /// The guest bytes each block was translated from, for invalidation.
+    pub guest_ranges: OdCodeCacheTable,
+}
+
+impl OdCodeCacheTables {
+    /// Each table with its name, in the order the header declares them.
+    #[must_use]
+    pub fn named(&self) -> [(&'static str, OdCodeCacheTable); 5] {
+        [
+            ("block map", self.blocks),
+            ("link targets", self.link_targets),
+            ("block links", self.links),
+            ("fastmem sites", self.fastmem_sites),
+            ("guest ranges", self.guest_ranges),
+        ]
+    }
 }
 
 extern "C" {
@@ -657,6 +707,14 @@ extern "C" {
     /// # Safety
     /// `cache` must be live (or null, which zeroes `out`); `out` must be writable.
     pub fn od_code_cache_stats_of(cache: *mut c_void, out: *mut OdCodeCacheStats);
+
+    /// What the cache's per-block tables hold (a census: takes the cache's lock, shared, and walks
+    /// what cannot be sized in O(1) -- for a report made every few minutes, not a hot path). All
+    /// zero on an arm64 host.
+    ///
+    /// # Safety
+    /// `cache` must be live (or null, which zeroes `out`); `out` must be writable.
+    pub fn od_code_cache_tables_of(cache: *mut c_void, out: *mut OdCodeCacheTables);
 
     /// Invalidate `[addr, addr + len)` for every jit of the cache, now. Clamped as
     /// [`od_jit_invalidate_range`] is.

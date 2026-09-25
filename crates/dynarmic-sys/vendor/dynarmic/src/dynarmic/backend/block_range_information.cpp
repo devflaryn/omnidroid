@@ -37,6 +37,15 @@ tsl::robin_set<IR::LocationDescriptor> BlockRangeInformation<ProgramCounterType>
     return erase_locations;
 }
 
+template<typename ProgramCounterType>
+std::pair<std::size_t, std::size_t> BlockRangeInformation<ProgramCounterType>::Census() const {
+    std::size_t locations = 0;
+    for (const auto& [interval, set] : block_ranges) {
+        locations += set.size();
+    }
+    return {block_ranges.iterative_size(), locations};
+}
+
 template class BlockRangeInformation<u32>;
 template class BlockRangeInformation<u64>;
 
