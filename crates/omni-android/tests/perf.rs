@@ -459,3 +459,177 @@ fn the_cost_of_pthread_getspecific_on_one_thread_and_on_eight() {
         });
     }
 }
+
+/// **What a `pthread_mutex_lock` + `pthread_mutex_unlock` pair costs through the boundary**, on
+/// one thread and on eight, each on its own mutex and all eight on one. The world's game thread
+/// alone takes and releases a mutex more than a million times a second, and every pair used to
+/// write a process-wide owner table under one lock (`omni_bionic::mutex::OwnerTable`) and, in the
+/// unlock's wake, lock and scan the futex's process-wide parked table (`AddressFutex`) -- so eight
+/// threads on eight *different* mutexes serialised on two host locks. Distinct mutexes should
+/// scale; one shared mutex is contention by construction and is reported for scale, not judged.
+///
+/// `cargo test -p omni-android --release --test perf -- --ignored --nocapture mutex`
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_a_mutex_lock_and_unlock_pair_on_one_and_eight_threads() {
+    use omni_android::bionic::Bionic;
+    use std::sync::Barrier;
+    const ROUNDS: usize = 6;
+    let guest = Guest::new();
+    let bionic = Bionic::new(Arc::clone(&guest.space)).expect("a bionic instance");
+    bionic.set_log_to_stderr(false);
+    let builder = guest.boundary(256);
+    bionic.bind_into(&builder).expect("bind every handler");
+    let boundary = builder.finish();
+    let lock = boundary.slot_named("pthread_mutex_lock").expect("bound").address;
+    let unlock = boundary.slot_named("pthread_mutex_unlock").expect("bound").address;
+    // x19 = the mutex, x21 = pairs left. Callee-saved registers, so a handler cannot disturb them.
+    let entry = {
+        let at = guest.next_entry();
+        let mut asm = harness::Asm::at(at);
+        asm.push(mov_reg(20, 30));
+        asm.push(mov_reg(19, 0));
+        let top = asm.pc();
+        asm.push(mov_reg(0, 19));
+        asm.bl(lock);
+        asm.push(mov_reg(0, 19));
+        asm.bl(unlock);
+        asm.push(subs_imm(21, 21, 1));
+        let here = asm.pc();
+        asm.push(b_cond(1, (top as i64 - here as i64) as i32 / 4));
+        asm.push(mov_reg(30, 20));
+        asm.push(ret(30));
+        guest.load(asm.words())
+    };
+    // Eight all-zero (PTHREAD_MUTEX_INITIALIZER) mutexes, two cache lines apart.
+    let mutex = |i: usize| guest.data + 0x1000 + i * 128;
+    for i in 0..8 {
+        for word in 0..5 {
+            guest.write_u64(mutex(i) + word * 8, 0);
+        }
+    }
+    println!("\n== one pthread_mutex_lock + pthread_mutex_unlock pair, ns per pair per thread (median of 5) ==");
+    for (label, threads, shared, each) in [
+        ("1 thread", 1usize, false, 1_000_000u64),
+        ("8 threads, 8 mutexes", 8, false, 1_000_000),
+        ("8 threads, one mutex", 8, true, 100_000),
+    ] {
+        let barrier = Barrier::new(threads + 1);
+        let (stack_top, sentinel) = (guest.stack_top, boundary.sentinel());
+        let cpus: Vec<_> = (0..threads).map(|_| guest.thread(&boundary)).collect();
+        let mutexes: Vec<_> = (0..threads).map(|i| if shared { mutex(0) } else { mutex(i) }).collect();
+        let mut samples = Vec::new();
+        std::thread::scope(|scope| {
+            for (mut cpu, at) in cpus.into_iter().zip(mutexes) {
+                let (bionic, boundary, barrier) = (&bionic, &boundary, &barrier);
+                scope.spawn(move || {
+                    let _active = bionic.activate().expect("a thread block");
+                    for _ in 0..ROUNDS {
+                        cpu.set_sp(stack_top);
+                        cpu.set_x(x(30), sentinel as u64);
+                        cpu.set_x(x(0), at as u64);
+                        cpu.set_x(x(21), each);
+                        barrier.wait();
+                        boundary.run(&mut cpu, entry, RunLimit::Unlimited).expect("runs");
+                        assert_eq!(cpu.x(x(0)), 0, "the last unlock succeeded");
+                        barrier.wait();
+                    }
+                });
+            }
+            for round in 0..ROUNDS {
+                barrier.wait();
+                let t = std::time::Instant::now();
+                barrier.wait();
+                if round > 0 {
+                    samples.push(t.elapsed());
+                }
+            }
+        });
+        samples.sort();
+        let median = samples[samples.len() / 2];
+        println!("  {label:22} : {:7.1} ns per pair per thread", median.as_secs_f64() * 1e9 / each as f64);
+    }
+}
+
+/// **What a futex wake costs when it wakes nobody**, with nothing parked anywhere and with 32
+/// threads parked on *other* addresses -- the world's steady state, where dozens of guest threads
+/// sit parked while every mutex unlock issues a wake. Every wake used to bump one process-wide
+/// counter, lock the futex's one parked table and -- whenever anything at all was parked -- scan
+/// every parked address for a near miss. One thread and eight, each waking its own address.
+///
+/// `cargo test -p omni-android --release --test perf -- --ignored --nocapture futex`
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_a_futex_wake_with_nothing_parked_and_with_32_parked_elsewhere() {
+    use omni_android::bionic::AddressFutex;
+    use omni_bionic::threads::{Futex, WaitResult};
+    use std::sync::Barrier;
+    const EACH: u64 = 2_000_000;
+    const ROUNDS: usize = 6;
+    const PARKED: usize = 32;
+    let futex = AddressFutex::new();
+    // Host words stand in for guest words: under identity mapping (D4) the futex only ever reads a
+    // word through its address, and a wake reads nothing at all.
+    let words: &'static [AtomicU32] =
+        Box::leak((0..PARKED).map(|_| AtomicU32::new(0)).collect::<Vec<_>>().into_boxed_slice());
+    // One address per wake thread, each in its own cache line and far from every parked word.
+    let wake_at: Vec<u64> = (0..8).map(|i| words.as_ptr() as u64 + 4096 * 1024 + i * 128).collect();
+    let measure = |label: &str, futex: &AddressFutex| {
+        for threads in [1usize, 8] {
+            let barrier = Barrier::new(threads + 1);
+            let mut samples = Vec::new();
+            std::thread::scope(|scope| {
+                for &at in &wake_at[..threads] {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        for _ in 0..ROUNDS {
+                            barrier.wait();
+                            let mut woken = 0;
+                            for _ in 0..EACH {
+                                woken += futex.wake(at, 1);
+                            }
+                            assert_eq!(woken, 0, "nobody is parked on a wake thread's own address");
+                            barrier.wait();
+                        }
+                    });
+                }
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    let t = std::time::Instant::now();
+                    barrier.wait();
+                    if round > 0 {
+                        samples.push(t.elapsed());
+                    }
+                }
+            });
+            samples.sort();
+            let median = samples[samples.len() / 2];
+            println!(
+                "  {label:20}, {threads} thread(s) : {:6.1} ns per wake per thread",
+                median.as_secs_f64() * 1e9 / EACH as f64
+            );
+        }
+    };
+    println!("\n== one futex wake that wakes nobody (median of 5) ==");
+    measure("nothing parked", &futex);
+    std::thread::scope(|scope| {
+        for word in words {
+            let futex = &futex;
+            scope.spawn(move || {
+                let at = word as *const AtomicU32 as u64;
+                while !futex.stopped() {
+                    let _: WaitResult = futex.wait(at, 0, None);
+                }
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while futex.parked_now().0 < PARKED {
+            assert!(std::time::Instant::now() < deadline, "32 threads parked: {:?}", futex.parked_now());
+            std::thread::yield_now();
+        }
+        measure("32 parked elsewhere", &futex);
+        futex.stop();
+    });
+    assert_eq!(futex.parked_now(), (0, 0), "stop released every parked thread");
+    assert!(futex.near_misses().is_empty(), "no wake here lands within eight bytes of a waiter");
+}
