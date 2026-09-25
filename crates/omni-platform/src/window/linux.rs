@@ -84,7 +84,9 @@ use std::time::{Duration, Instant};
 use x11_dl::xinput2::{self, XInput2};
 use x11_dl::xlib::{self, Xlib};
 
-use super::{RawWindow, WindowDesc, WindowError, WindowEvent, WindowResult, push_event};
+use super::{
+    DisplayChange, RawWindow, WindowDesc, WindowError, WindowEvent, WindowResult, push_event,
+};
 
 mod decode;
 pub(super) mod keymap;
@@ -337,7 +339,9 @@ impl Window {
             | xlib::PointerMotionMask
             | xlib::StructureNotifyMask
             | xlib::FocusChangeMask
-            | xlib::PropertyChangeMask;
+            | xlib::PropertyChangeMask
+            // `VisibilityNotify`: `WindowEvent::Occluded`.
+            | xlib::VisibilityChangeMask;
         // SAFETY: an all-zero `XSetWindowAttributes` is a valid value; only the fields named in
         // the value mask are read.
         let mut attributes: xlib::XSetWindowAttributes = unsafe { core::mem::zeroed() };
@@ -368,6 +372,11 @@ impl Window {
         window.set_properties(desc.title)?;
         window.open_input_method(event_mask)?;
         window.blank_cursor = window.make_blank_cursor();
+        // **The root window's size is the screen's**, and RandR resizing the screen -- a mode
+        // change -- is a `ConfigureNotify` on the root: `WindowEvent::DisplayChanged`. Selected on
+        // this window's own connection, which no other client's selection on the root disturbs.
+        // SAFETY: a live display and root.
+        unsafe { (xl.XSelectInput)(display, root, xlib::StructureNotifyMask) };
 
         // The initial size, **measured**, in the queue before the first poll -- where the Windows
         // backend's creation-time `WM_SIZE` puts it.
@@ -831,6 +840,8 @@ impl Window {
                 if configure.window == self.window {
                     self.size = (configure.width.unsigned_abs(), configure.height.unsigned_abs());
                     self.report_size();
+                } else if configure.window == self.root {
+                    push_event(&mut self.queue, WindowEvent::DisplayChanged { change: DisplayChange::Mode });
                 }
             }
             xlib::PropertyNotify => {
@@ -856,6 +867,15 @@ impl Window {
                 let focus = unsafe { event.focus_change };
                 if counts_as_focus_change(focus.mode, focus.detail) {
                     self.set_focused(kind == xlib::FocusIn);
+                }
+            }
+            xlib::VisibilityNotify => {
+                // SAFETY: the type says `visibility` is the member.
+                let visibility = unsafe { event.visibility };
+                if visibility.window == self.window {
+                    push_event(&mut self.queue, WindowEvent::Occluded {
+                        occluded: visibility.state == xlib::VisibilityFullyObscured,
+                    });
                 }
             }
             xlib::MapNotify => {

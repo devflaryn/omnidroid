@@ -395,6 +395,60 @@ pub enum WindowEvent {
     ///
     /// Not reported for a capture the caller released itself: that caller already knows.
     PointerCaptureLost,
+    /// **Whether any of the window can be seen**, as the host's window system judges it: covered
+    /// by other windows, or on a space nobody is looking at.
+    ///
+    /// Reported where the host says so: macOS's `windowDidChangeOcclusionState:` and X11's
+    /// `VisibilityNotify` (which a compositing manager may never send, since every window it
+    /// composites is "unobscured"). **Win32 has no message for it and never reports it.** A
+    /// minimised window is not reported as occluded: it is a [`WindowEvent::Resized`] to zero.
+    ///
+    /// A fact about the host, not a request: nothing here stops presenting, and a consumer that
+    /// kept rendering behind another window is not wrong.
+    Occluded {
+        /// True when none of the window can be seen now.
+        occluded: bool,
+    },
+    /// **The display the window is shown on changed under it**: its mode, its scale, or which
+    /// display it is.
+    ///
+    /// Every one of these can leave a swapchain built before it out of date with no change to the
+    /// client size -- MEASURED on Windows (w26, 2026-09-25): after a change nothing in this seam
+    /// reported, the driver answered `VK_ERROR_OUT_OF_DATE_KHR` to every present and acquire for
+    /// two minutes with the window's size unchanged. A size change that comes with it arrives as its
+    /// own [`WindowEvent::Resized`].
+    ///
+    /// Never coalesced (see this module's `push_event`), because each names a different change.
+    DisplayChanged {
+        /// What changed.
+        change: DisplayChange,
+    },
+}
+
+/// What a [`WindowEvent::DisplayChanged`] says changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DisplayChange {
+    /// The display's mode: its resolution, colour depth or refresh rate -- a full-screen game
+    /// starting elsewhere and switching it is the common cause. `WM_DISPLAYCHANGE` on Windows; the
+    /// root window's `ConfigureNotify` (a RandR resize) on X11.
+    Mode,
+    /// The window's scale factor: `WM_DPICHANGED` on Windows,
+    /// `windowDidChangeBackingProperties:` on macOS.
+    Scale,
+    /// The window moved to another display: the monitor `MonitorFromWindow` names changed on
+    /// Windows, `windowDidChangeScreen:` on macOS.
+    Monitor,
+}
+
+impl fmt::Display for DisplayChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DisplayChange::Mode => "the display's mode",
+            DisplayChange::Scale => "the window's scale factor",
+            DisplayChange::Monitor => "the display the window is on",
+        })
+    }
 }
 
 /// Append `event` to `queue`, collapsing a run of the events for which only the newest matters.
@@ -844,6 +898,8 @@ mod tests {
             WindowEvent::CloseRequested,
             WindowEvent::FocusChanged { focused: true },
             WindowEvent::Text { text: "a".to_owned() },
+            WindowEvent::Occluded { occluded: true },
+            WindowEvent::DisplayChanged { change: DisplayChange::Mode },
         ];
         for event in &repeated {
             push_event(&mut queue, event.clone());

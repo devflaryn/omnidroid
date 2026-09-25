@@ -8,10 +8,10 @@
 //! # One object is the view, the window's delegate and its text-input client
 //!
 //! `OmniView` is the window's content view (it owns the `CAMetalLayer`, receives the mouse and the
-//! keyboard), its `NSWindowDelegate` (close, resize, minimise, focus, backing scale) and its
-//! `NSTextInputClient` (typed text, through the input method). Every event source therefore
-//! reaches the same instance variables -- the queue, the last reported size, the modifier and
-//! capture state -- without any object having to find another.
+//! keyboard), its `NSWindowDelegate` (close, resize, minimise, focus, backing scale, screen,
+//! occlusion) and its `NSTextInputClient` (typed text, through the input method). Every event
+//! source therefore reaches the same instance variables -- the queue, the last reported size, the
+//! modifier and capture state -- without any object having to find another.
 
 use core::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -24,7 +24,8 @@ use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, M
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
     NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSScreen, NSTextInputClient,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate,
+    NSWindowOcclusionState, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSDate, NSDefaultRunLoopMode,
@@ -33,7 +34,7 @@ use objc2_foundation::{
 use objc2_quartz_core::{CALayer, CAMetalLayer};
 
 use super::{keys, main_thread, Shared};
-use crate::window::{PointerButton, RawWindow, WindowError, WindowEvent, WindowResult};
+use crate::window::{DisplayChange, PointerButton, RawWindow, WindowError, WindowEvent, WindowResult};
 
 // ------------------------------------------------------------------------------ the application
 
@@ -129,6 +130,9 @@ struct ViewState {
     marked: Option<String>,
     /// The installed tracking area, replaced on every `updateTrackingAreas`.
     tracking: Option<Retained<NSTrackingArea>>,
+    /// The backing scale factor last seen, so that a backing-properties change that is not a
+    /// scale change (a colour space) is not reported as one. 0 until the window exists.
+    last_scale: f64,
 }
 
 /// The instance variables of [`OmniView`].
@@ -316,6 +320,29 @@ define_class!(
         fn window_did_change_backing_properties(&self, _notification: &NSNotification) {
             self.sync_layer_scale();
             self.report_size();
+            let scale = self.scale();
+            let mut state = self.ivars().state.borrow_mut();
+            let changed = state.last_scale != 0.0 && state.last_scale != scale;
+            state.last_scale = scale;
+            drop(state);
+            if changed {
+                self.push(WindowEvent::DisplayChanged { change: DisplayChange::Scale });
+            }
+        }
+
+        /// The window moved onto another display.
+        #[unsafe(method(windowDidChangeScreen:))]
+        fn window_did_change_screen(&self, _notification: &NSNotification) {
+            self.push(WindowEvent::DisplayChanged { change: DisplayChange::Monitor });
+        }
+
+        /// Covered, uncovered, or on a space that is not shown: whether any of it can be seen.
+        #[unsafe(method(windowDidChangeOcclusionState:))]
+        fn window_did_change_occlusion_state(&self, _notification: &NSNotification) {
+            if let Some(window) = self.window() {
+                let visible = window.occlusionState().contains(NSWindowOcclusionState::Visible);
+                self.push(WindowEvent::Occluded { occluded: !visible });
+            }
         }
 
         #[unsafe(method(windowDidBecomeKey:))]
@@ -471,6 +498,7 @@ impl OmniView {
                 wheel_residual: (0.0, 0.0),
                 marked: None,
                 tracking: None,
+                last_scale: 0.0,
             }),
         });
         // SAFETY: `NSView`'s designated initializer.
@@ -712,6 +740,7 @@ pub(super) fn create(
     window.center();
     view.sync_layer_scale();
     view.report_size();
+    view.ivars().state.borrow_mut().last_scale = window.backingScaleFactor();
 
     let raw = RawWindow::AppKit {
         ns_window: Retained::as_ptr(&window) as isize,

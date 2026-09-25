@@ -46,7 +46,9 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows_sys::Win32::Graphics::Gdi::{
+    ClientToScreen, HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow, ScreenToClient,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -65,14 +67,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_CAPTURECHANGED, WM_CHAR,
-    WM_CLOSE, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, XBUTTON1,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, XBUTTON1,
 };
 
 use super::{
-    PointerButton, RawWindow, WindowDesc, WindowError, WindowEvent, WindowResult, push_event,
+    DisplayChange, PointerButton, RawWindow, WindowDesc, WindowError, WindowEvent, WindowResult,
+    push_event,
 };
 
 /// Everything the window procedure owns.
@@ -111,6 +115,9 @@ struct WindowState {
     /// The last position an **absolute** raw-input device reported, in screen pixels, so that its
     /// next report can be turned into motion. See [`raw_motion`].
     last_absolute: Option<(i32, i32)>,
+    /// The monitor the window was last seen on, so that a move onto another one is reported as
+    /// [`DisplayChange::Monitor`]. Null until the first `WM_WINDOWPOSCHANGED`, which is not a move.
+    monitor: HMONITOR,
 }
 
 /// The mouse on the generic-desktop usage page: what [`start_capture`] registers raw input for.
@@ -443,6 +450,25 @@ unsafe extern "system" fn wnd_proc(
                 push_event(&mut state.queue, WindowEvent::Resized { width, height });
             }
         }
+        // **The display under the window changed** (`WindowEvent::DisplayChanged`). All three
+        // still go on to `DefWindowProcW`: `WM_WINDOWPOSCHANGED`'s default is what sends `WM_SIZE`
+        // and `WM_MOVE`, and `WM_DPICHANGED`'s suggested rectangle is not acted on here -- a
+        // window of this process keeps its physical size across a scale change, which is what the
+        // seam's pixels promise.
+        WM_DISPLAYCHANGE => {
+            push_event(&mut state.queue, WindowEvent::DisplayChanged { change: DisplayChange::Mode });
+        }
+        WM_DPICHANGED => {
+            push_event(&mut state.queue, WindowEvent::DisplayChanged { change: DisplayChange::Scale });
+        }
+        WM_WINDOWPOSCHANGED => {
+            // SAFETY: a live window handle; the answer is a handle, never null with this flag.
+            let now = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            if !state.monitor.is_null() && now != state.monitor {
+                push_event(&mut state.queue, WindowEvent::DisplayChanged { change: DisplayChange::Monitor });
+            }
+            state.monitor = now;
+        }
         WM_CLOSE => {
             // Swallowed; see this module's point 2.
             push_event(&mut state.queue, WindowEvent::CloseRequested);
@@ -649,6 +675,7 @@ impl Window {
             high_surrogate: None,
             captured: None,
             last_absolute: None,
+            monitor: core::ptr::null_mut(),
         }));
 
         // `super::validate` has already bounded both axes to 1..=65535, so neither cast can
@@ -1090,6 +1117,43 @@ mod tests {
             WindowEvent::Wheel { x: 10, y: 20, dx: 0, dy: 120 },
             WindowEvent::Wheel { x: 30, y: 40, dx: 0, dy: -120 },
             WindowEvent::Wheel { x: -5, y: 7, dx: 120, dy: 0 },
+        ]);
+    }
+
+    /// **A display change, through the window procedure**: `WM_DISPLAYCHANGE` (what Windows
+    /// broadcasts when another program switches the display's mode) and `WM_DPICHANGED` come out
+    /// as [`WindowEvent::DisplayChanged`] naming which, each one, and with no `Resized` of their
+    /// own: the client size did not change.
+    #[test]
+    #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+    fn display_changes_come_out_as_display_changed_events() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        assert!(
+            std::env::var("OMNI_GFX_WINDOW_TESTS").is_ok_and(|v| v == "1"),
+            "run with --ignored but OMNI_GFX_WINDOW_TESTS is not 1; this creates a real window"
+        );
+        let mut window = Window::create(&WindowDesc::new("omnidroid: display", 320, 240)).unwrap();
+        let mut drained = Vec::new();
+        window.poll(&mut drained);
+        let mut outer = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: writes a `RECT`; the handle is live.
+        assert_ne!(unsafe { GetWindowRect(window.hwnd, &raw mut outer) }, 0);
+        // 32 bits per pixel, 1920x1080: what the message carries; nothing here reads it.
+        let mode: LPARAM = (1080 << 16) | 1920;
+        // SAFETY: a live window handle; `WM_DISPLAYCHANGE` carries no pointer, and
+        // `WM_DPICHANGED`'s `LPARAM` is the window's own rectangle, live across the call.
+        unsafe {
+            SendMessageW(window.hwnd, WM_DISPLAYCHANGE, 32, mode);
+            SendMessageW(window.hwnd, WM_DPICHANGED, (144 << 16) | 144, (&raw const outer) as LPARAM);
+            SendMessageW(window.hwnd, WM_DISPLAYCHANGE, 32, mode);
+        }
+        let mut events = Vec::new();
+        window.poll(&mut events);
+        events.retain(|e| !matches!(e, WindowEvent::FocusChanged { .. } | WindowEvent::PointerMoved { .. }));
+        assert_eq!(events, [
+            WindowEvent::DisplayChanged { change: DisplayChange::Mode },
+            WindowEvent::DisplayChanged { change: DisplayChange::Scale },
+            WindowEvent::DisplayChanged { change: DisplayChange::Mode },
         ]);
     }
 

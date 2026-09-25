@@ -32,7 +32,7 @@ use std::os::raw::{c_int, c_long, c_uint, c_ulong};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use omni_platform::window::{PointerButton, RawWindow, Window, WindowDesc, WindowEvent};
+use omni_platform::window::{DisplayChange, PointerButton, RawWindow, Window, WindowDesc, WindowEvent};
 use x11_dl::xlib;
 
 const GATE: &str = "OMNI_GFX_WINDOW_TESTS";
@@ -744,4 +744,61 @@ fn the_raw_handle_is_a_live_xlib_window() {
         other => panic!("{other:?}"),
     }
     assert_eq!(window.raw().system_name(), "xlib");
+}
+
+/// **Covered and uncovered, as the server judges it**: a window of another client mapped over the
+/// whole screen leaves this one fully obscured, and taking it away uncovers it -- two
+/// [`WindowEvent::Occluded`], from the server's own `VisibilityNotify`, not a synthetic one.
+#[test]
+#[ignore = "needs an X server and xdotool: OMNI_GFX_WINDOW_TESTS=1 DISPLAY=:92 cargo test -- --ignored"]
+fn a_window_covered_by_another_is_occluded_and_uncovered_is_not() {
+    require_gate();
+    let peer = Peer::open();
+    let mut window = focused_window("omnidroid: occluded", 320, 240);
+    // SAFETY: a live display and root; the window is the peer's own, destroyed below.
+    let cover = unsafe {
+        let cover = (peer.xl.XCreateSimpleWindow)(peer.display, peer.root(), 0, 0, 4000, 4000, 0, 0, 0);
+        (peer.xl.XMapRaised)(peer.display, cover);
+        (peer.xl.XSync)(peer.display, xlib::False);
+        cover
+    };
+    poll_until(&mut window, "occluded", |e| *e == WindowEvent::Occluded { occluded: true });
+    // SAFETY: the peer's own window, destroyed once.
+    unsafe {
+        (peer.xl.XDestroyWindow)(peer.display, cover);
+        (peer.xl.XSync)(peer.display, xlib::False);
+    }
+    poll_until(&mut window, "uncovered", |e| *e == WindowEvent::Occluded { occluded: false });
+}
+
+/// **The screen's size changing is a display change**: RandR resizing the screen is a
+/// `ConfigureNotify` on the root window, and it comes out as [`WindowEvent::DisplayChanged`]
+/// naming the mode -- with no `Resized`, since this window's own size did not change. Sent by the
+/// peer rather than made by RandR, because Xvfb has one mode and cannot switch it; the server
+/// delivers a sent event to exactly the clients that selected `StructureNotify` on the root, which
+/// is the selection under test.
+#[test]
+#[ignore = "needs an X server and xdotool: OMNI_GFX_WINDOW_TESTS=1 DISPLAY=:92 cargo test -- --ignored"]
+fn the_roots_configure_notify_is_a_display_mode_change() {
+    require_gate();
+    let peer = Peer::open();
+    let mut window = focused_window("omnidroid: display", 320, 240);
+    // SAFETY: a zeroed configure event is valid; every field read is set.
+    let mut configure: xlib::XConfigureEvent = unsafe { std::mem::zeroed() };
+    configure.type_ = xlib::ConfigureNotify;
+    configure.event = peer.root();
+    configure.window = peer.root();
+    configure.width = 1600;
+    configure.height = 900;
+    let mut event = xlib::XEvent { configure };
+    let root = peer.root();
+    // SAFETY: a live display and root, and a fully initialised event.
+    unsafe {
+        let mask = xlib::StructureNotifyMask;
+        assert_ne!((peer.xl.XSendEvent)(peer.display, root, xlib::False, mask, &raw mut event), 0);
+        (peer.xl.XSync)(peer.display, xlib::False);
+    }
+    let seen = poll_until(&mut window, "the display change", |e| matches!(e, WindowEvent::DisplayChanged { .. }));
+    assert!(seen.contains(&WindowEvent::DisplayChanged { change: DisplayChange::Mode }), "{seen:?}");
+    assert!(!seen.iter().any(|e| matches!(e, WindowEvent::Resized { .. })), "{seen:?}");
 }
