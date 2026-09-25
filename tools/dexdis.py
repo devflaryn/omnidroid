@@ -12,6 +12,10 @@ of the guesses were wrong (`NativeUserJavaInterface`'s signed-out answers; see i
     python tools/dexdis.py 'Lok/c;'                    # every method of a class
     python tools/dexdis.py --grep 'Lfi/e$d;->d:'       # every instruction mentioning it
     python tools/dexdis.py --grep 'nativeSetAssetPath' --dex classes2.dex
+    python tools/dexdis.py --apk ../Roblox-2.739.691.apk 'Lfi/e;'   # another APK
+
+**The APK is input, not code** (as ``omni_apk::choose``): ``--apk <path>``, else ``OMNI_APK``, else
+the ``Roblox-*.apk`` in the repository root with the highest version in its name.
 
 ``classes4.dex`` is skipped: D6 and ``jni-surface.md``'s scope note put the injected payload out
 of scope. The instruction-format table is the Dalvik bytecode spec's; payload pseudo-instructions
@@ -26,7 +30,27 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-APK = REPO / "Roblox-2.738.1397.apk"
+
+
+def _version(path: Path) -> tuple[int, ...]:
+    return tuple(int(part) for part in path.stem.split("-", 1)[-1].split(".") if part.isdigit())
+
+
+def choose_apk(explicit: str | None) -> Path:
+    """``--apk``, else ``OMNI_APK``, else the highest-versioned ``Roblox-*.apk`` in the root."""
+    import os
+
+    if explicit:
+        return Path(explicit)
+    if os.environ.get("OMNI_APK"):
+        return Path(os.environ["OMNI_APK"])
+    found = sorted(REPO.glob("Roblox-*.apk"), key=_version)
+    if not found:
+        sys.exit(f"no APK: pass --apk <path>, set OMNI_APK, or put a Roblox-*.apk in {REPO}")
+    return found[-1]
+
+
+APK: Path = REPO / "Roblox.apk"
 
 
 def uleb(b: bytes, o: int) -> tuple[int, int]:
@@ -268,7 +292,14 @@ def dex_files(only: str | None = None):
 
 
 def main() -> int:
+    global APK
     args = sys.argv[1:]
+    if "--apk" in args:
+        at = args.index("--apk")
+        APK = choose_apk(args[at + 1])
+        del args[at:at + 2]
+    else:
+        APK = choose_apk(None)
     only = args[args.index("--dex") + 1] if "--dex" in args else None
     if "--grep" in args:
         needle = args[args.index("--grep") + 1]
