@@ -43,6 +43,10 @@ Luau's own load benchmarks (`[SlowBenchmark]`) on the Mac are 1.6-3.7x Windows'.
 macOS m2 (`57cc1a3`): join -> loaded 131 s, settled 9.0 fps (6.6-9.8), 2.8 GiB private. **m3, the
 same build with `OMNI_JIT_EXCLUSIVE_MONITOR=global`: join -> loaded 35 s, settled 30.6 fps
 (25.6-32.0)**, GUILoader 5,871 -> 1,597 ms -- the arm64 monitor finding (#3a below), confirmed.
+**m4/m5 (`7d2daea`, patch 0021, default settings): 34.6 and 34.0 fps** (29.8-39.4), join -> loaded
+27 / 26 s, GUILoader 814-820 ms, 2.7 GiB; m4 was the first in-world run to pass the whole gate.
+**m6, the same at the game's lowest graphics level** (`SavedQualityLevel` 1, set in the game's own
+`GlobalBasicSettings_13.xml` as its menu sets it): **43.2 fps** (40.6-45.6), 3.5 cores.
 
 Linux l1 (`53391a1`, GLES on the Quadro's NVC0 -- the engine refuses lavapipe as emulated): join ->
 loaded 110 s, settled **~1 fps** (4-6 presents per 5 s), 2.3 of 4 cores busy but only ~100 M guest
