@@ -51,7 +51,9 @@ pub mod window;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use omni_mem::{CommitPolicy, GuestAddr, GuestSpace, Placement, Protection};
 use parking_lot::Mutex;
@@ -71,6 +73,7 @@ pub use looper::{
     FdRegistration, Looper, ALOOPER_EVENT_ERROR, ALOOPER_EVENT_HANGUP, ALOOPER_EVENT_INPUT,
     ALOOPER_EVENT_INVALID, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK, ALOOPER_POLL_ERROR,
     ALOOPER_POLL_TIMEOUT, ALOOPER_POLL_WAKE, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS,
+    LOOPER_IDLE_GAP, LOOPER_IDLE_STREAK, MAX_LOOPER_IDLE,
 };
 pub use window::{WindowBacking, WindowGeometry, WindowSource, SURFACE_CLASS};
 
@@ -238,6 +241,12 @@ pub struct Ndk {
     /// itself and then takes the state lock, and folding the two together would make the state
     /// lock re-entrant.
     census: Mutex<BTreeMap<&'static str, u64>>,
+    /// The idle wait's bound in nanoseconds, or `0` for off -- the default. See
+    /// [`Ndk::set_looper_idle`]. An atomic because every `ALooper_pollOnce` reads it.
+    looper_idle_ns: AtomicU64,
+    /// How many idle waits `ALooper_pollOnce` has entered. Counted whether or not anything reads
+    /// it, so a run with the switch on can say what the switch did.
+    looper_idle_waits: AtomicU64,
 }
 
 impl core::fmt::Debug for Ndk {
@@ -307,7 +316,67 @@ impl Ndk {
                 events_dropped: 0,
             }),
             census: Mutex::new(BTreeMap::new()),
+            looper_idle_ns: AtomicU64::new(0),
+            looper_idle_waits: AtomicU64::new(0),
         }))
+    }
+
+    /// **Let a spinning `ALooper_pollOnce(0)` wait on its looper for at most `bound`**, or
+    /// `None` for the default: no wait, every zero-timeout poll answered at once.
+    ///
+    /// `NativeEngine::GameLoop` polls with a zero timeout for as long as the window is focused,
+    /// started and shown, and between polls does nothing (the decode is in
+    /// [`ndk::looper`](looper)'s documentation) -- a core for the whole session. With a bound, a
+    /// poll that is part of such a spin ([`LOOPER_IDLE_STREAK`] empty polls, each within
+    /// [`LOOPER_IDLE_GAP`] of the last) waits on the looper's own descriptors instead, returns
+    /// the moment one is ready, and answers `ALOOPER_POLL_TIMEOUT` after `bound` otherwise: what a
+    /// device thread descheduled for `bound` would answer.
+    ///
+    /// The embedding's switch, like the timer resolution: the gate reads `OMNI_LOOPER_IDLE_US`.
+    /// May be changed at any time; a poll reads it when it starts.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] for a zero bound (that is `None`) or one above
+    /// [`MAX_LOOPER_IDLE`], the interval the stop switch is read at.
+    pub fn set_looper_idle(&self, bound: Option<Duration>) -> AbiResult<()> {
+        if let Some(bound) = bound {
+            if bound.is_zero() || bound > MAX_LOOPER_IDLE {
+                return Err(AbiError::Refused {
+                    symbol: "Ndk::set_looper_idle".to_string(),
+                    address: self.arena,
+                    why: format!(
+                        "an idle wait of {bound:?} was asked for, and it must be above zero (no \
+                         wait is `None`) and at most {MAX_LOOPER_IDLE:?}: an idle wait reads the \
+                         stop switch only at its ends, and every other wait here reads it at \
+                         least that often"
+                    ),
+                });
+            }
+        }
+        let nanos = bound.map_or(0, |bound| u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX));
+        self.looper_idle_ns.store(nanos, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The idle wait's bound, or `None` when it is off.
+    #[must_use]
+    pub fn looper_idle(&self) -> Option<Duration> {
+        match self.looper_idle_ns.load(Ordering::Relaxed) {
+            0 => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// How many idle waits `ALooper_pollOnce` has entered on this instance.
+    #[must_use]
+    pub fn looper_idle_waits(&self) -> u64 {
+        self.looper_idle_waits.load(Ordering::Relaxed)
+    }
+
+    /// One idle wait entered.
+    fn count_idle_wait(&self) {
+        self.looper_idle_waits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Supply where the guest's assets come from.

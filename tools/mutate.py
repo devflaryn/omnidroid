@@ -258,6 +258,12 @@ ANDROID = [
 # function rather than an inline comparison.
 ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
 
+# The looper's idle wait (`looperidle-*`): `tests/ndk.rs` filtered to its `looper_idle_*` tests.
+# **Release**, because two of them bound a wait's length and an event's latency in wall time, and
+# a debug build's guest spin is slow enough to eat into the margins. No APK.
+LOOPER_IDLE = ["cargo", "test", "-p", "omni-android", "--release", "--test", "ndk", "--no-fail-fast",
+               "looper_idle"]
+
 # The Vulkan layer's own targets: every `vulkan/` row is detected by these and nothing else. Added
 # with the first rows for it (M6, the engine's device bring-up).
 VULKAN = [
@@ -4666,18 +4672,20 @@ directory", ADAPTER_FILES,
     # Callbacks run before an ident is reported. AOSP reports idents first, and the glue depends
     # on it: `android_app_entry` registers its command pipe with LOOPER_ID_MAIN and no callback,
     # and `GameLoop` switches on the return.
+    # (Pattern follows the pass into `let pass =`, which the idle wait's streak needed; the row's
+    # intent is unchanged.)
     ("looper-A2", "A", "a callback is run where an ident should have been reported",
      NDK_LOOPER,
-     """            match ident {
+     """            let pass = match ident {
                 Some(found) => found,
                 None if callbacks.is_empty() => Pass::Idle,
                 None => Pass::Callbacks(callbacks),
-            }""",
-     """            match ident {
+            };""",
+     """            let pass = match ident {
                 _ if !callbacks.is_empty() => Pass::Callbacks(callbacks),
                 Some(found) => found,
                 None => Pass::Idle,
-            }""",
+            };""",
      ANDROID),
 
     # A registration with a callback keeping the caller's ident. §5.2's constructor passes
@@ -4748,10 +4756,11 @@ directory", ADAPTER_FILES,
     # `ALooper_prepare` taking a reference for its caller as well as the thread's. It reads as the
     # careful thing -- the caller has a pointer, so surely it holds a reference -- and it leaves
     # the count one too high for ever, so the looper outlives the thread that owns it.
+    # (Pattern extended with the `idle` field the idle wait added; the row's intent is unchanged.)
     ("looper-B1", "B", "prepare takes a reference for the caller as well as the thread",
      NDK_LOOPER,
-     """        Looper { thread, opts, references: 1, fds: Vec::new() }""",
-     """        Looper { thread, opts, references: 2, fds: Vec::new() }""",
+     """        Looper { thread, opts, references: 1, fds: Vec::new(), idle: IdleStreak::default() }""",
+     """        Looper { thread, opts, references: 2, fds: Vec::new(), idle: IdleStreak::default() }""",
      ANDROID),
 
     # The indefinite-wait refusal widened to every non-positive timeout. It reads as stricter, and
@@ -9023,6 +9032,128 @@ directory", ADAPTER_FILES,
      """    let _ = (size, burst_frames);
     buffer_frames""",
      FEED_AAUDIO),
+    # ================================================================== the looper's idle wait
+    #
+    # `OMNI_LOOPER_IDLE_US`: a spinning `ALooper_pollOnce(0)` -- the game loop's, decoded in
+    # `ndk::looper`'s documentation -- waits on the looper's own readiness for at most B. Every
+    # row is detected by the `looper_idle_*` tests in `tests/ndk.rs`, which assert the idle-wait
+    # count exactly and time only where time is the property.
+
+    # The streak can never complete: the switch is on and nothing ever waits.
+    ("looperidle-A1", "A", "the streak never completes, so a spin never waits",
+     NDK_LOOPER,
+     """        self.empty >= LOOPER_IDLE_STREAK""",
+     """        self.empty >= u32::MAX""",
+     LOOPER_IDLE),
+
+    # The gap ignored: polls with work between them count as a spin, and that work is slowed by B
+    # per poll -- the one thing the streak exists to prevent.
+    ("looperidle-A2", "A", "polls further apart than the gap still count as a spin",
+     NDK_LOOPER,
+     """        let close = self.last.is_some_and(|last| now.saturating_duration_since(last) <= LOOPER_IDLE_GAP);""",
+     """        let close = self.last.is_some();""",
+     LOOPER_IDLE),
+
+    # A poll that found something no longer ends the streak, so the poll after a command waits B
+    # before `DoFrame` sees what the command changed.
+    ("looperidle-A3", "A", "an event does not end the streak",
+     NDK_LOOPER,
+     """                    _ => streak.reset(),""",
+     """                    _ => {}""",
+     LOOPER_IDLE),
+
+    # The wait slept rather than waiting on the gate: every event is found, but only when the
+    # sleep ends -- the latency the gate exists to remove.
+    ("looperidle-A4", "A", "the idle wait sleeps through events instead of waiting on the gate",
+     NDK_LOOPER,
+     """                if deadline <= now {
+                    break Pass::Idle;
+                }
+                deadline - now""",
+     """                if deadline <= now {
+                    break Pass::Idle;
+                }
+                std::thread::sleep(deadline - now);
+                continue;""",
+     LOOPER_IDLE),
+
+    # A woken idle wait answers POLL_TIMEOUT without testing the descriptors again, leaving the
+    # event that woke it to the next poll: a poll that says nothing is ready when something is.
+    ("looperidle-A5", "A", "a woken idle wait answers POLL_TIMEOUT without looking",
+     NDK_LOOPER,
+     """        fs.wait_for_readiness(seen, slice);
+    };""",
+     """        if fs.wait_for_readiness(seen, slice) && matches!(bound, Bound::Idle(_)) {
+            break Pass::Idle;
+        }
+    };""",
+     LOOPER_IDLE),
+
+    # A stopping runtime's spin enters the wait anyway: every poll of the teardown costs B.
+    ("looperidle-A6", "A", "a stopping runtime's spin still waits",
+     NDK_LOOPER,
+     """            if !bionic.bionic.guest_threads_stopping() {
+                bound = Bound::Idle(since + limit);""",
+     """            if true {
+                bound = Bound::Idle(since + limit);""",
+     LOOPER_IDLE),
+
+    # The switch read nowhere: set, and nothing changes.
+    ("looperidle-A7", "A", "the idle switch is ignored",
+     NDK_LOOPER,
+     """    let idle = if timeout_millis == 0 { ndk.looper_idle() } else { None };""",
+     """    let idle: Option<Duration> = None;""",
+     LOOPER_IDLE),
+
+    # The end of a wait not recorded, so the next poll's gap is measured from before the wait --
+    # longer than the gap -- and a spin waits once per streak instead of on every poll.
+    ("looperidle-A8", "A", "the end of an idle wait is not recorded, so the spin keeps restarting",
+     NDK_LOOPER,
+     """                    Pass::Idle => streak.touch(now),""",
+     """                    Pass::Idle => {}""",
+     LOOPER_IDLE),
+
+    # ---- the over-corrections ----
+
+    # A stop during an idle wait refused like a real wait. It reads as consistent with the bounded
+    # and indefinite waits, and it turns a *poll* into a refusal at teardown -- the exact defect
+    # `a_zero_timeout_poll_once_is_poll_timeout_even_while_stopping` pins for the plain poll.
+    ("looperidle-B1", "B", "a stop during an idle wait is refused like a real wait",
+     NDK_LOOPER,
+     """        if !matches!(bound, Bound::Idle(_)) && bionic.bionic.guest_threads_stopping() {""",
+     """        if bionic.bionic.guest_threads_stopping() {""",
+     LOOPER_IDLE),
+
+    # Every empty zero-timeout poll waits, streak or not. It reads as simpler; it slows any loop
+    # that polls between pieces of work by B per poll.
+    ("looperidle-B2", "B", "every empty zero-timeout poll waits, with no streak",
+     NDK_LOOPER,
+     """        self.empty >= LOOPER_IDLE_STREAK""",
+     """        self.empty >= 1""",
+     LOOPER_IDLE),
+
+    # The wait made a whole stop-switch slice instead of B: still bounded, still woken by events,
+    # and 25 times longer than a device thread would be away at B = 2 ms.
+    ("looperidle-B3", "B", "the idle wait lasts WAIT_SLICE instead of the bound",
+     NDK_LOOPER,
+     """                bound = Bound::Idle(since + limit);""",
+     """                bound = Bound::Idle(since + WAIT_SLICE);""",
+     LOOPER_IDLE),
+
+    # The cap removed: a bound past the interval the stop switch is read at.
+    ("looperidle-B4", "B", "a bound above MAX_LOOPER_IDLE is accepted",
+     NDK_MOD,
+     """            if bound.is_zero() || bound > MAX_LOOPER_IDLE {""",
+     """            if bound.is_zero() {""",
+     LOOPER_IDLE),
+
+    # Zero accepted as a bound, which stores the off value while the caller believes it turned the
+    # wait on.
+    ("looperidle-B5", "B", "a zero bound is accepted and silently means off",
+     NDK_MOD,
+     """            if bound.is_zero() || bound > MAX_LOOPER_IDLE {""",
+     """            if bound > MAX_LOOPER_IDLE {""",
+     LOOPER_IDLE),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

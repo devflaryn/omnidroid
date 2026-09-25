@@ -59,6 +59,101 @@
 //! Capping the wait and returning [`ALOOPER_POLL_TIMEOUT`] remains rejected on this project's own
 //! rule: it reports a timeout to a call that was given none, which is the believable wrong answer
 //! for this shape.
+//!
+//! # The game loop's `pollOnce(0)`, decoded (APK 2.739.691)
+//!
+//! MEASURED on every host: the engine's game thread (guest thread 5) spins for the whole session
+//! at ~95-100% of a core, 3-4.5 M import crossings a second, `ALooper_pollOnce` ~30% and
+//! `pthread_mutex_lock`/`_unlock` ~40% of its samples. This is why, in link addresses of
+//! `libroblox.so` 2.739.691 (2.738.1397's in brackets):
+//!
+//! * `ALooper_pollOnce`'s GOT slot is `0x685fe30`, its PLT stub `0x635f320`, and the stub has
+//!   **one** caller, `0x2bed664` (`0x2bcd648`), inside `NativeEngine::GameLoop` at `0x2bed5c4`
+//!   (`0x2bcd5d0`). `android_app_entry` (`0x2bdf8f0`) calls `android_main` (`0x2bec724`), which
+//!   builds the `NativeEngine` (0x318 bytes, constructor `0x2bed0d8`) and calls `GameLoop`
+//!   (`0x2bec838`).
+//! * `GameLoop` sets `app->userData = this`, `app->onAppCmd = 0x2bed6d8`, calls
+//!   `NativeDataModelManager::initialize` (`0x2bf18d0`, state 1 or 11 -> 2) on `this+0x30`, and
+//!   loops:
+//!
+//!   ```text
+//!   loop:  t = (this[+8] && this[+9]) ? this[+0xa] : 0
+//!          r = ALooper_pollOnce(t - 1, NULL, &events, &source)     ; 0x2bed664
+//!          if r >= 0: if source: source->process(app); if app->destroyRequested: return
+//!          else if this[+8] && this[+9] && this[+0xa]: DoFrame(this[+0x30])   ; 0x2bf1ce4
+//!   ```
+//!
+//!   The three bytes are **not fast flags and not settings**. They are written only by the
+//!   command handler `0x2bed6d8`, on the game thread, from commands read off the glue's pipe:
+//!   `+8` has-focus (`APP_CMD_GAINED_FOCUS` 1, `LOST_FOCUS` 0, `INIT_WINDOW` copies the last focus
+//!   from `0x68cc068`), `+9` started (`APP_CMD_START` 1, `STOP` 0), `+0xa` has-window
+//!   (`INIT_WINDOW` 1, `TERM_WINDOW` 0). Each is a `strb` of 0 or 1, so `t - 1` is **0 or -1 and
+//!   nothing else**: `pollOnce(0)` while focused, started and windowed, and `pollOnce(-1)` --
+//!   a real block on the pipe -- otherwise. No engine setting makes this loop wait.
+//! * `DoFrame` (`0x2bf1ce4`, was `0x2bd1cf0`) locks the `std::mutex` at `NativeDM+0x14`
+//!   (`0x2b70368` -> `pthread_mutex_lock`), switches on the state word at `NativeDM+0x10`, and
+//!   unlocks (`0x2b703bc`): **3** -> `initEngine_` (`0x2bf1d5c`: state 4, then
+//!   `initializeLuaApp_` inline sets 5, or 8), **5** -> `startLuaApp_` (`0x2bf24a8`: 6, then 7),
+//!   **9** -> `resumeExperience_` (`0x2bf265c`: 10). Every other state does nothing: in the
+//!   running states (7, 10) `DoFrame` is a lock, three compares and an unlock, and the loop is a
+//!   spin that draws nothing -- rendering, input (`nativePassInput`, a Java-thread native) and
+//!   the frame's work are all on other threads.
+//! * **Who writes the state, and whether the looper hears of it.** Only three writes reach a state
+//!   `DoFrame` acts on, and none of them writes to a looper descriptor (`ALooper_wake` is not even
+//!   imported):
+//!   - **3**, off the game thread, by whichever of two arrives second: settings
+//!     (`NativeEngine::setEngineSettings` `0x2bedda0` <- `Java_..._nativeAppBridgeSetInitParams`
+//!     `0x2bec8c0`, the Java main thread; `nativeActivity_onEngineSettingsReceived` `0x2bf1c2c`
+//!     sets `+0x288`) and flags (`continueAfterFlagsLoaded_` `0x2bf3b4c`, from the flag fetch's
+//!     completion `0x2bf5580`/`0x2bf59ec`; sets `+0x289`). Both under the `+0x14` mutex. **Seen
+//!     only by polling memory**, once per session, at startup.
+//!   - **5**: by `initEngine_` itself (the game thread, inside `DoFrame`); by `onKillSurface`
+//!     (`0x2bf2acc`, from `APP_CMD_TERM_WINDOW` on the game thread) when leaving a running Lua
+//!     app; and by the idle-time timer (`0x2bf47fc`, from `nativeActivity_onStop`'s timer) --
+//!     while stopped, i.e. while the loop is in `pollOnce(-1)`, so the `APP_CMD_START` that ends
+//!     that block is what brings it to `DoFrame`.
+//!   - **9**: by `onKillSurface` in an experience, on the game thread; `has-window` drops with it,
+//!     so the loop blocks until `APP_CMD_INIT_WINDOW` arrives **through the pipe**.
+//!
+//!   So every transition that matters is either signalled through the looper, made by the game
+//!   thread itself (the very next `DoFrame` sees it), or a once-per-session startup write from
+//!   another thread that tolerates any latency a scheduler could add.
+//!
+//! **What a device pays.** AOSP's `Looper::pollOnce(0)` is `pollInner(0)`: its own lock and one
+//! `epoll_wait(epfd, .., 0)` syscall, ~1-2 µs on a phone's big core (not measured here: there is
+//! no device). Here an iteration -- `pollOnce` plus the two mutex imports -- is ~0.7-1 µs on
+//! Windows (3-4.5 M crossings a second over three crossings). Both burn one core; a device burns
+//! it on a little core its scheduler can choose, and this runtime on a 4-core host burns a
+//! quarter of the machine.
+//!
+//! # The idle wait (`OMNI_LOOPER_IDLE_US`), off unless an embedding turns it on
+//!
+//! [`Ndk::set_looper_idle`](super::Ndk::set_looper_idle)`(Some(B))` makes a `pollOnce(0)` that is
+//! part of a **spin** wait on this looper's own readiness -- the same filesystem gate the bounded
+//! and indefinite waits above use -- for at most `B`, and then answer `ALOOPER_POLL_TIMEOUT`.
+//!
+//! * **A spin, measured, not assumed**: at least [`LOOPER_IDLE_STREAK`] consecutive
+//!   zero-timeout polls on this looper that found nothing, each entered within
+//!   [`LOOPER_IDLE_GAP`] of the previous one's return. A loop that does real work between its
+//!   polls never qualifies, and any poll that finds something ends the streak -- so after a
+//!   command the loop runs `DoFrame` at once rather than a wait later.
+//! * **It never skips an event.** The wait is the readiness gate: a write to any watched
+//!   descriptor returns it at once and the pass that follows reports the event exactly as an
+//!   immediate poll would have. What it answers after `B` is what a device thread descheduled for
+//!   `B` answers when it runs again.
+//! * **It keeps the stop switch.** A stopping runtime gets `ALOOPER_POLL_TIMEOUT` without a wait
+//!   -- never a refusal, because a zero-timeout poll is a poll and not a wait -- and a wait
+//!   already under way ends within `B`, which is capped at [`MAX_LOOPER_IDLE`] (the `WAIT_SLICE`
+//!   every other wait here reads the switch at), with that same answer.
+//! * **What `B` costs in latency**, from the decode: the once-per-session state 3 (and the 5 the
+//!   game thread sets itself inside a `DoFrame`) reach `DoFrame` up to `B` later. Nothing else.
+//! * **How close to `B` the host gets.** Linux and macOS time the gate's condition variable to the
+//!   microsecond (plus timer slack). Windows rounds every timed condition-variable wait up to a
+//!   whole millisecond: MEASURED on the 24-thread host, 200 waits each, with the 1 ms period the
+//!   session holds (`omni_platform::clock::TimerResolution`) a 250 µs or 1 ms request returned in
+//!   0.91-3.0 ms (median 1.06-1.5 ms), and at the default tick in 14.6-16.7 ms. So on Windows the
+//!   effective `B` is `max(B, 1 ms)` with a tail to ~3 ms -- still a deschedule a phone's scheduler
+//!   routinely gives a runnable thread, and the reason 1000 µs is the value to A/B first.
 
 use std::time::{Duration, Instant};
 
@@ -142,11 +237,14 @@ pub struct Looper {
     /// in thread-local storage with a strong reference, and `ALooper_acquire` adds the caller's.
     references: i64,
     fds: Vec<FdRegistration>,
+    /// The zero-timeout polls that found nothing, for the idle wait. See this module's
+    /// documentation.
+    idle: IdleStreak,
 }
 
 impl Looper {
     pub(super) fn new(thread: usize, opts: i32) -> Looper {
-        Looper { thread, opts, references: 1, fds: Vec::new() }
+        Looper { thread, opts, references: 1, fds: Vec::new(), idle: IdleStreak::default() }
     }
 
     /// The descriptors this looper watches.
@@ -579,6 +677,57 @@ enum Pass {
 /// is noticed and not a polling interval for the event itself.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 
+/// How many consecutive empty zero-timeout polls make a spin, for the idle wait.
+///
+/// The poll that completes the streak is the first to wait. Small beside what the game loop does
+/// (a million polls a second), large beside anything that polls, finds nothing and then has
+/// something to do: 64 empty polls in a row, each within [`LOOPER_IDLE_GAP`] of the last, is a
+/// loop with nothing between its polls.
+pub const LOOPER_IDLE_STREAK: u32 = 64;
+
+/// The longest a zero-timeout poll may follow the previous one's return and still continue a
+/// spin.
+///
+/// The game loop's steady-state iteration is ~1 µs here (three imports: `pollOnce`,
+/// `pthread_mutex_lock`, `_unlock`); a loop that spends longer than this between polls is doing
+/// something, and a wait would slow that something down rather than an idle core.
+pub const LOOPER_IDLE_GAP: Duration = Duration::from_micros(50);
+
+/// The largest idle wait [`Ndk::set_looper_idle`](super::Ndk::set_looper_idle) accepts.
+///
+/// `WAIT_SLICE`, the interval every other wait here reads the stop switch at: an idle wait reads
+/// it only at its ends, so this is also how late a stop can be noticed.
+pub const MAX_LOOPER_IDLE: Duration = WAIT_SLICE;
+
+/// One looper's run of zero-timeout polls that found nothing.
+#[derive(Debug, Default)]
+struct IdleStreak {
+    /// How many, consecutively.
+    empty: u32,
+    /// When the last one found nothing -- after its wait, if it waited.
+    last: Option<Instant>,
+}
+
+impl IdleStreak {
+    /// One more empty zero-timeout poll at `now`. Whether it completes a spin.
+    fn note_empty(&mut self, now: Instant) -> bool {
+        let close = self.last.is_some_and(|last| now.saturating_duration_since(last) <= LOOPER_IDLE_GAP);
+        self.empty = if close { self.empty.saturating_add(1) } else { 1 };
+        self.last = Some(now);
+        self.empty >= LOOPER_IDLE_STREAK
+    }
+
+    /// A pass inside an idle wait still found nothing at `now`: the poll ends no earlier.
+    fn touch(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
+    /// A poll found something: the loop has work, and the next empty poll starts a new streak.
+    fn reset(&mut self) {
+        *self = IdleStreak::default();
+    }
+}
+
 /// How long `ALooper_pollOnce` may wait.
 #[derive(Debug, Clone, Copy)]
 enum Bound {
@@ -587,6 +736,10 @@ enum Bound {
     /// `pollOnce(-1)`, allowed because a live wake source was measured. See this module's
     /// documentation for what is checked and why the check is a fact rather than a policy.
     Indefinite,
+    /// `pollOnce(0)` inside a spin, with the idle wait on: this instant, and then
+    /// [`ALOOPER_POLL_TIMEOUT`] -- which is also the answer a stopping runtime gets. See this
+    /// module's documentation.
+    Idle(Instant),
 }
 
 /// The descriptors a looper watches, rendered for a refusal that has to say *why* nothing can
@@ -654,7 +807,7 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         ));
     };
 
-    let bound = if timeout_millis < 0 {
+    let mut bound = if timeout_millis < 0 {
         // **The premise of the old refusal, tested rather than assumed.** See this module's
         // documentation: an indefinite wait is legitimate exactly when something in this runtime
         // can still make one of the watched descriptors ready, and for a pipe read end that is a
@@ -721,13 +874,20 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         Bound::Until(deadline)
     };
 
+    // **The idle wait, which only a zero-timeout poll can take**, and only with the embedding's
+    // switch on (`OMNI_LOOPER_IDLE_US`). See this module's documentation for the decode it rests
+    // on. Off, the streak is never touched and this call is what it was before the switch.
+    let idle = if timeout_millis == 0 { ndk.looper_idle() } else { None };
+    let mut first_pass = true;
+
     let pass = loop {
         // Read **before** the descriptors are tested. A write that lands in between raises it, so
         // the wait returns at once rather than sleeping through the event — `VERIFICATION.md`
         // entry 11, measured at 1.0104 s.
         let seen = fs.ready_generation();
+        let mut spinning = None;
         let pass = {
-            let state = ndk.state.lock();
+            let mut state = ndk.state.lock();
             // **Re-read every pass, because this loop sleeps.** The looper was live when
             // `pollOnce` was entered; another guest thread taking the last reference during a
             // sleep frees it, and a looper that goes away under a poll is a refusal naming the
@@ -769,14 +929,39 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
             }
             // Idents first, as AOSP does: the glue's command pipe is registered with
             // `LOOPER_ID_MAIN` and no callback, and `GameLoop` switches on the return.
-            match ident {
+            let pass = match ident {
                 Some(found) => found,
                 None if callbacks.is_empty() => Pass::Idle,
                 None => Pass::Callbacks(callbacks),
+            };
+            // The streak, under the lock the pass was taken under.
+            if idle.is_some() {
+                let now = Instant::now();
+                let streak =
+                    &mut state.loopers.get_mut(looper).expect("read live under this same lock").idle;
+                match pass {
+                    Pass::Idle if first_pass => {
+                        if streak.note_empty(now) {
+                            spinning = Some(now);
+                        }
+                    }
+                    Pass::Idle => streak.touch(now),
+                    _ => streak.reset(),
+                }
             }
+            pass
         };
         if !matches!(pass, Pass::Idle) {
             break pass;
+        }
+        first_pass = false;
+        // **A spin becomes a wait of at most `B`** -- unless the runtime is stopping, which gets
+        // the poll's own answer at once rather than a wait nobody will be there to end.
+        if let (Some(limit), Some(since)) = (idle, spinning) {
+            if !bionic.bionic.guest_threads_stopping() {
+                bound = Bound::Idle(since + limit);
+                ndk.count_idle_wait();
+            }
         }
         let slice = match bound {
             Bound::Indefinite => WAIT_SLICE,
@@ -786,6 +971,16 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
                     break Pass::Idle;
                 }
                 (deadline - now).min(WAIT_SLICE)
+            }
+            Bound::Idle(deadline) => {
+                // A stop does not end this wait early -- nothing wakes the gate for it, and `B`
+                // is at most `WAIT_SLICE`, the interval every other wait reads the switch at --
+                // and it must not turn it into a refusal either: see the check below.
+                let now = Instant::now();
+                if deadline <= now {
+                    break Pass::Idle;
+                }
+                deadline - now
             }
         };
         // **The stop switch, read every slice — and only once this call is going to sleep.**
@@ -800,8 +995,11 @@ fn poll_once(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
         // had been asked for.
         //
         // Refused rather than turned into POLL_TIMEOUT for a call that *was* waiting: the wait
-        // did not expire, the runtime ended it, and a timeout would say otherwise.
-        if bionic.bionic.guest_threads_stopping() {
+        // did not expire, the runtime ended it, and a timeout would say otherwise. **Not** for an
+        // idle wait: its call asked for no wait at all, so POLL_TIMEOUT stays the true answer
+        // however the wait ends, and a wake while stopping (any pipe in the instance raises the
+        // gate) simply waits out the rest of `B`.
+        if !matches!(bound, Bound::Idle(_)) && bionic.bionic.guest_threads_stopping() {
             return Err(refuse_reentrant(
                 c,
                 format!(

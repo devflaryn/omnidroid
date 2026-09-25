@@ -19,6 +19,7 @@
 mod harness;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use harness::a64::*;
 use harness::{serialized, Asm, Guest, BUDGET};
@@ -29,8 +30,9 @@ use omni_android::ndk::config::{ACONFIGURATION_SCREENSIZE_LARGE, ACONFIGURATION_
 use omni_android::ndk::{
     DeviceConfiguration, Ndk, ScreenSize, WindowGeometry, ACONFIGURATION_NAVHIDDEN_NO,
     ALOOPER_EVENT_HANGUP, ALOOPER_EVENT_INPUT, ALOOPER_EVENT_OUTPUT, ALOOPER_POLL_CALLBACK,
-    ALOOPER_POLL_ERROR, ALOOPER_POLL_TIMEOUT, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS, MAX_LOOPERS,
-    MAX_NATIVE_WINDOWS, MAX_OPEN_ASSETS, SURFACE_CLASS,
+    ALOOPER_POLL_ERROR, ALOOPER_POLL_TIMEOUT, ALOOPER_PREPARE_ALLOW_NON_CALLBACKS,
+    LOOPER_IDLE_GAP, LOOPER_IDLE_STREAK, MAX_LOOPERS, MAX_LOOPER_IDLE, MAX_NATIVE_WINDOWS,
+    MAX_OPEN_ASSETS, SURFACE_CLASS,
 };
 use omni_android::{AbiError, Boundary};
 use omni_cpu::ExitReason;
@@ -824,6 +826,419 @@ fn a_poll_once_with_a_timeout_waits_for_a_writer() {
         "POLL_TIMEOUT here would mean the poll answered before the writer arrived rather than \
          waiting for it"
     );
+}
+
+// =================================================================== the idle wait
+//
+// `NativeEngine::GameLoop` spins on `pollOnce(0)` with nothing between its polls for as long as
+// the window is active (the decode is in `ndk::looper`'s documentation), and `Ndk::set_looper_idle`
+// (`OMNI_LOOPER_IDLE_US`) turns such a spin into waits on the looper's own descriptors. Every
+// test here drives the spin the way the engine does -- a guest loop calling `pollOnce(0)` back to
+// back -- and asserts on `Ndk::looper_idle_waits` **exactly**, where a count is what pins the rule
+// (the streak length, the gap, the reset), and on time only where time is the property: a wait
+// is at least its bound, and an event ends it at once.
+
+/// `TBZ Wt, #bit, offset` (offset in instructions).
+const fn tbz(rt: u32, bit: u32, offset_insns: i32) -> u32 {
+    0x3600_0000 | ((bit & 0x1f) << 19) | (((offset_insns as u32) & 0x3FFF) << 5) | rt
+}
+
+impl Fixture {
+    /// Load the spin: a subroutine making `X19` zero-timeout `ALooper_pollOnce`s back to back --
+    /// the game loop's spin, with nothing between -- and leaving early at the first non-negative
+    /// answer, an ident. It returns with `X0` the last answer and `X19` how many polls were left
+    /// **before** that one (an ident leaves without counting its own). Uses `X20` for its return.
+    fn load_spin(&self) -> omni_cpu::GuestAddr {
+        let poll = self.thunk("ALooper_pollOnce");
+        let entry = self.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(20, 30));
+        let top = asm.pc();
+        asm.mov(0, 0);
+        asm.mov(1, 0);
+        asm.mov(2, 0);
+        asm.mov(3, 0);
+        asm.bl(poll);
+        asm.push(tbz(0, 31, 3)); // bit 31 clear: an ident, out of the loop
+        asm.push(subs_imm(19, 19, 1));
+        let here = asm.pc();
+        asm.push(b_cond(1 /* NE */, ((top as i64 - here as i64) / 4) as i32));
+        asm.push(ret(20));
+        self.guest.load(asm.words());
+        entry
+    }
+
+    /// Emit a spin of `polls` through `spin`, **warmed**: two polls first, then `usleep(1000)`.
+    ///
+    /// MEASURED, and the reason this exists: a spin's first return lands on code not yet
+    /// translated, and translating it took longer than `LOOPER_IDLE_GAP` -- so the streak
+    /// restarted at the second poll and every count here came out one short, on every run. The
+    /// two warm-up polls translate the spin; the sleep is longer than the gap, so they start no
+    /// streak of their own; and the measured spin then runs only code that is already translated,
+    /// which is the engine's case -- its loop has been running for the whole session.
+    fn emit_warm_spin(&self, asm: &mut Asm, spin: omni_cpu::GuestAddr, polls: u64) {
+        asm.mov(19, 2);
+        asm.bl(spin);
+        self.emit_call3(asm, "usleep", 1_000, 0, 0);
+        asm.mov(19, polls);
+        asm.bl(spin);
+    }
+
+    /// Emit `symbol(a, b, c)`.
+    fn emit_call3(&self, asm: &mut Asm, symbol: &str, a: u64, b: u64, c: u64) {
+        let thunk = self.thunk(symbol);
+        asm.mov(0, a);
+        asm.mov(1, b);
+        asm.mov(2, c);
+        asm.bl(thunk);
+    }
+
+    /// Run a program `body` builds, and return its final `X0`, its final `X19` and how long the
+    /// run took on the host.
+    fn run_timed(&self, body: impl FnOnce(&mut Asm)) -> (u64, u64, Duration) {
+        let entry = self.guest.next_entry();
+        let mut asm = Asm::at(entry);
+        asm.push(mov_reg(21, 30));
+        body(&mut asm);
+        asm.mov(22, self.guest.data as u64);
+        asm.push(str_imm(0, 22, 0));
+        asm.push(str_imm(19, 22, 8));
+        asm.push(ret(21));
+        self.guest.load(asm.words());
+        let started = Instant::now();
+        let exit = self.run(entry).expect("the run must complete");
+        let elapsed = started.elapsed();
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+        (self.guest.read_u64(self.guest.data), self.guest.read_u64(self.guest.data + 8), elapsed)
+    }
+
+    /// A looper watching the read end of a fresh pipe with `ident`, and the pipe's write end.
+    fn watched_pipe(&self, ident: i32) -> (u64, i32, i32) {
+        let looper = self.prepare();
+        let (read_fd, write_fd) = self.pipe();
+        assert_eq!(self.add_fd(looper, read_fd, ident, ALOOPER_EVENT_INPUT, 0, 0), 1);
+        (looper, read_fd, write_fd)
+    }
+}
+
+/// **Off -- the default -- a spin of zero-timeout polls never waits**, and is what it was.
+///
+/// Two hundred polls past the streak, every one `ALOOPER_POLL_TIMEOUT`, no idle wait entered, and
+/// the whole spin far quicker than any of them waiting would allow.
+#[test]
+fn looper_idle_off_a_spin_never_waits() {
+    let _guard = serialized();
+    let f = fixture("idle-off");
+    let _ = f.watched_pipe(4);
+    let spin = f.load_spin();
+    assert_eq!(f.ndk.looper_idle(), None, "the idle wait is off unless an embedding sets it");
+
+    let polls = u64::from(LOOPER_IDLE_STREAK) + 200;
+    let (answer, left, elapsed) = f.run_timed(|asm| f.emit_warm_spin(asm, spin, polls));
+    assert_eq!(answer as i32, ALOOPER_POLL_TIMEOUT);
+    assert_eq!(left, 0, "every poll ran and none reported an ident");
+    assert_eq!(f.ndk.looper_idle_waits(), 0, "off, no poll waits");
+    assert_eq!(f.ndk.census().get("ALooper_pollOnce").copied(), Some(polls + 2), "and the two warm-up polls");
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "{polls} immediate polls took {elapsed:?}: something waited"
+    );
+}
+
+/// **On, the poll that completes the streak is the first to wait, and each wait is at least the
+/// bound.**
+///
+/// First `LOOPER_IDLE_STREAK - 1` polls: no wait. Then, after a host pause longer than the gap
+/// (which starts a new streak), `LOOPER_IDLE_STREAK - 1 + 10` polls: exactly ten waits, and the
+/// spin takes at least ten bounds. The count pins the streak's length and the reset by the gap;
+/// the time pins the wait. The upper bound is deliberately loose -- Windows rounds a timed wait to
+/// its tick (`ndk::looper`'s documentation has the measurement) -- and is there to catch a wait of
+/// the wrong order, such as a whole `WAIT_SLICE` or more.
+///
+/// **Retried, in one direction only** (`VERIFICATION.md` entry 6). MEASURED: 2 runs in 33 counted
+/// fewer waits (5 and 9 of 10) -- a host hiccup longer than `LOOPER_IDLE_GAP` between two polls
+/// ends the streak, as it is meant to. That can only ever *lower* the count, so an attempt that
+/// counts more than expected fails at once, and the test passes only on an attempt that counts
+/// exactly; a defect that shifts the count fails every attempt.
+#[test]
+fn looper_idle_on_a_spin_waits_from_the_streak_on_and_each_wait_is_the_bound() {
+    let _guard = serialized();
+    let f = fixture("idle-on");
+    let _ = f.watched_pipe(4);
+    let spin = f.load_spin();
+    let bound = Duration::from_millis(2);
+    f.ndk.set_looper_idle(Some(bound)).expect("a bound within the cap");
+    assert_eq!(f.ndk.looper_idle(), Some(bound));
+
+    let streak = u64::from(LOOPER_IDLE_STREAK);
+    let waits = 10;
+    let mut seen = Vec::new();
+    for _attempt in 0..5 {
+        std::thread::sleep(LOOPER_IDLE_GAP * 20);
+        let before = f.ndk.looper_idle_waits();
+        let (answer, left, _) = f.run_timed(|asm| f.emit_warm_spin(asm, spin, streak - 1));
+        assert_eq!((answer as i32, left), (ALOOPER_POLL_TIMEOUT, 0));
+        assert_eq!(
+            f.ndk.looper_idle_waits() - before,
+            0,
+            "a streak one short of the length does not wait"
+        );
+
+        std::thread::sleep(LOOPER_IDLE_GAP * 20);
+        let before = f.ndk.looper_idle_waits();
+        let (answer, left, elapsed) =
+            f.run_timed(|asm| f.emit_warm_spin(asm, spin, streak - 1 + waits));
+        assert_eq!((answer as i32, left), (ALOOPER_POLL_TIMEOUT, 0), "every poll still times out");
+        let counted = f.ndk.looper_idle_waits() - before;
+        assert!(
+            counted <= waits,
+            "{counted} waits where at most {waits} are possible: the pause did not start a new \
+             streak, or polls before the {streak}th waited"
+        );
+        let floor = bound * u32::try_from(counted).expect("small");
+        assert!(elapsed >= floor, "{counted} waits of {bound:?} took {elapsed:?}");
+        assert!(
+            elapsed < (bound + Duration::from_millis(25)) * u32::try_from(counted.max(1)).expect("small"),
+            "{counted} waits of {bound:?} took {elapsed:?}: longer than the bound allows"
+        );
+        if counted == waits {
+            return;
+        }
+        seen.push(counted);
+    }
+    panic!("from the {streak}th poll on every poll should wait ({waits}); counted {seen:?}");
+}
+
+/// **Polls further apart than the gap are not a spin, however many there are.**
+///
+/// The loop that does real work between its polls: each poll is its own run, after a host pause
+/// four gaps long, and none of `LOOPER_IDLE_STREAK + 8` of them waits.
+#[test]
+fn looper_idle_polls_further_apart_than_the_gap_never_wait() {
+    let _guard = serialized();
+    let f = fixture("idle-apart");
+    let _ = f.watched_pipe(4);
+    let spin = f.load_spin();
+    f.ndk.set_looper_idle(Some(Duration::from_millis(2))).expect("a bound within the cap");
+
+    for _ in 0..LOOPER_IDLE_STREAK + 8 {
+        std::thread::sleep(LOOPER_IDLE_GAP * 4);
+        let (answer, left, _) = f.run_timed(|asm| {
+            asm.mov(19, 1);
+            asm.bl(spin);
+        });
+        assert_eq!((answer as i32, left), (ALOOPER_POLL_TIMEOUT, 0));
+    }
+    assert_eq!(f.ndk.looper_idle_waits(), 0, "polls with work between them never wait");
+}
+
+/// **A poll that finds something ends the streak**, so the loop acts on a command at once and
+/// the next wait needs a whole new streak.
+///
+/// All in one guest run, no host between: a spin two past the streak (three waits), a byte into
+/// the watched pipe, a poll that reports it, the byte read back, then a spin one short of the
+/// streak -- which must not wait. Kept, the old streak would make every one of those wait.
+///
+/// The sequence is a subroutine run twice, the first time with two-poll spins and a sleep after
+/// it, for `emit_warm_spin`'s measured reason: translating the code between the event and the
+/// second spin on its first run takes longer than the gap, and would end the streak whether or
+/// not the event did -- which would make this test pass with the reset removed.
+#[test]
+fn looper_idle_an_event_ends_the_streak() {
+    let _guard = serialized();
+    let f = fixture("idle-reset");
+    let (_, read_fd, write_fd) = f.watched_pipe(5);
+    let spin = f.load_spin();
+    f.ndk.set_looper_idle(Some(Duration::from_millis(2))).expect("a bound within the cap");
+
+    let byte = f.guest.data + 0x200;
+    let reported = f.guest.data + 0x280;
+    f.guest.write_u64(byte, 0x45);
+
+    // sequence(X24 = first spin, X25 = second spin): spin, write, poll -> [reported], read, spin.
+    let sequence = f.guest.next_entry();
+    let mut asm = Asm::at(sequence);
+    asm.push(mov_reg(26, 30));
+    asm.push(mov_reg(19, 24));
+    asm.bl(spin);
+    f.emit_call3(&mut asm, "write", i64::from(write_fd) as u64, byte as u64, 1);
+    f.emit_call3(&mut asm, "ALooper_pollOnce", 0, 0, 0);
+    asm.mov(23, reported as u64);
+    asm.push(str_imm(0, 23, 0));
+    f.emit_call3(&mut asm, "read", i64::from(read_fd) as u64, byte as u64, 1);
+    asm.push(mov_reg(19, 25));
+    asm.bl(spin);
+    asm.push(ret(26));
+    f.guest.load(asm.words());
+
+    // Retried in one direction only, for the reason the test above gives: a host hiccup can end
+    // the first spin's streak early and so *lower* the count, never raise it.
+    let streak = u64::from(LOOPER_IDLE_STREAK);
+    let mut seen = Vec::new();
+    for _attempt in 0..5 {
+        let before = f.ndk.looper_idle_waits();
+        let (answer, left, _) = f.run_timed(|asm| {
+            asm.mov(24, 2);
+            asm.mov(25, 2);
+            asm.bl(sequence);
+            f.emit_call3(asm, "usleep", 1_000, 0, 0);
+            asm.mov(23, reported as u64);
+            asm.mov(0, 0x5A5A_5A5A);
+            asm.push(str_imm(0, 23, 0));
+            asm.mov(24, streak + 2);
+            asm.mov(25, streak - 1);
+            asm.bl(sequence);
+        });
+        assert_eq!(f.guest.read_u64(reported) as i32, 5, "the poll after the write reported it");
+        assert_eq!((answer as i32, left), (ALOOPER_POLL_TIMEOUT, 0));
+        let counted = f.ndk.looper_idle_waits() - before;
+        assert!(
+            counted <= 3,
+            "{counted} waits: at most three before the event, and none may follow it in the {} \
+             polls after it",
+            streak - 1
+        );
+        if counted == 3 {
+            return;
+        }
+        seen.push(counted);
+    }
+    panic!("three waits before the event were expected; counted {seen:?}");
+}
+
+/// **An event during an idle wait ends it at once, and the waiting poll itself reports it.**
+///
+/// The bound is 40 ms; a host thread writes the watched pipe the moment the second wait begins.
+/// Asserted: the ident comes back; it comes back well inside the bound; and it is the *waiting*
+/// poll that returns it -- the count of polls before it is exactly the streak plus the waits
+/// before this one. A wait that answered POLL_TIMEOUT when woken (leaving the event to the next
+/// poll) would be one poll later, and a wait that slept through the gate would be late.
+#[test]
+fn looper_idle_an_event_during_the_wait_is_reported_by_that_poll_at_once() {
+    let _guard = serialized();
+    let f = fixture("idle-event");
+    let (_, read_fd, write_fd) = f.watched_pipe(6);
+    let spin = f.load_spin();
+    let bound = Duration::from_millis(40);
+    f.ndk.set_looper_idle(Some(bound)).expect("a bound within the cap");
+
+    // Retried until the count relation holds exactly, for the reason
+    // `looper_idle_on_a_spin_waits_from_the_streak_on_and_each_wait_is_the_bound` gives: a host
+    // hiccup that restarts the streak moves which poll waits. A wait that answers without looking
+    // is one poll off on every attempt.
+    let polls = u64::from(LOOPER_IDLE_STREAK) + 1_000;
+    let mut seen = Vec::new();
+    for _attempt in 0..4 {
+        let before = f.ndk.looper_idle_waits();
+        let ndk = Arc::clone(&f.ndk);
+        let bionic = Arc::clone(&f.bionic);
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while ndk.looper_idle_waits() < before + 2 {
+                assert!(Instant::now() < deadline, "the spin never reached a second idle wait");
+                std::thread::yield_now();
+            }
+            let at = Instant::now();
+            let fs = bionic.filesystem().expect("the instance has a root");
+            assert_eq!(fs.write(write_fd, b"E").expect("one byte into the pipe"), 1);
+            at
+        });
+
+        let (answer, left, _) = f.run_timed(|asm| f.emit_warm_spin(asm, spin, polls));
+        let returned = Instant::now();
+        let written = writer.join().expect("the writer thread");
+        assert_eq!(answer as i32, 6, "the ident of the registration the write made ready");
+        let fs = f.bionic.filesystem().expect("the instance has a root");
+        assert_eq!(fs.read(read_fd, &mut [0u8; 1]).expect("the byte back"), 1);
+
+        let waits = f.ndk.looper_idle_waits() - before;
+        assert!(waits >= 2, "{waits}");
+        if left == polls - (u64::from(LOOPER_IDLE_STREAK) + waits - 2) {
+            // The poll that was waiting when the byte arrived is the one that reported it.
+            let latency = returned.saturating_duration_since(written);
+            assert!(
+                latency < bound / 4,
+                "the event took {latency:?} to end a {bound:?} idle wait: the wait did not wake \
+                 on it"
+            );
+            return;
+        }
+        seen.push((waits, polls - left));
+    }
+    panic!(
+        "the poll that was waiting when the byte arrived never reported it; (waits, polls before \
+         the ident) per attempt: {seen:?}"
+    );
+}
+
+/// **A stopping runtime gets POLL_TIMEOUT from a spin and no wait.**
+#[test]
+fn looper_idle_a_stopping_runtime_spins_without_waiting() {
+    let _guard = serialized();
+    let f = fixture("idle-stopping");
+    let _ = f.watched_pipe(4);
+    let spin = f.load_spin();
+    let bound = Duration::from_millis(40);
+    f.ndk.set_looper_idle(Some(bound)).expect("a bound within the cap");
+    f.bionic.stop_guest_threads();
+
+    let polls = u64::from(LOOPER_IDLE_STREAK) + 20;
+    let (answer, left, elapsed) = f.run_timed(|asm| f.emit_warm_spin(asm, spin, polls));
+    assert_eq!((answer as i32, left), (ALOOPER_POLL_TIMEOUT, 0), "a poll, so POLL_TIMEOUT");
+    assert_eq!(f.ndk.looper_idle_waits(), 0, "no wait nobody will be there to end");
+    assert!(elapsed < bound * 5, "{elapsed:?}");
+}
+
+/// **A stop that arrives during an idle wait is still POLL_TIMEOUT, never a refusal** -- even when
+/// the wait is woken while stopping, which any pipe in the instance can do.
+///
+/// The host thread stops the runtime once the first wait has begun and then writes a pipe the
+/// looper does **not** watch, so the wait wakes, finds nothing and meets the stop switch. A
+/// bounded or indefinite wait is refused there; this one was a poll and must answer like one --
+/// and the polls after it must not wait at all.
+#[test]
+fn looper_idle_a_stop_during_the_wait_is_still_poll_timeout() {
+    let _guard = serialized();
+    let f = fixture("idle-stop-during");
+    let _ = f.watched_pipe(4);
+    let spin = f.load_spin();
+    let (_other_read, other_write) = f.pipe();
+    f.ndk.set_looper_idle(Some(Duration::from_millis(40))).expect("a bound within the cap");
+
+    let ndk = Arc::clone(&f.ndk);
+    let bionic = Arc::clone(&f.bionic);
+    let stopper = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ndk.looper_idle_waits() < 1 {
+            assert!(Instant::now() < deadline, "the spin never reached an idle wait");
+            std::thread::yield_now();
+        }
+        bionic.stop_guest_threads();
+        let fs = bionic.filesystem().expect("the instance has a root");
+        assert_eq!(fs.write(other_write, b"S").expect("a byte into the unwatched pipe"), 1);
+    });
+
+    let polls = u64::from(LOOPER_IDLE_STREAK) + 20;
+    let (answer, left, _) = f.run_timed(|asm| f.emit_warm_spin(asm, spin, polls));
+    stopper.join().expect("the stopping thread");
+    assert_eq!((answer as i32, left), (ALOOPER_POLL_TIMEOUT, 0), "every poll answered as a poll");
+    assert_eq!(f.ndk.looper_idle_waits(), 1, "the wait under way, and none once stopping");
+}
+
+/// **The bound is refused outside `(0, MAX_LOOPER_IDLE]`**, and `None` turns the wait off.
+#[test]
+fn looper_idle_bound_is_refused_outside_its_range() {
+    let _guard = serialized();
+    let f = fixture("idle-range");
+    for refused in [Duration::ZERO, MAX_LOOPER_IDLE + Duration::from_nanos(1)] {
+        let error = f.ndk.set_looper_idle(Some(refused)).expect_err("outside the range");
+        assert!(error.to_string().contains("idle wait"), "{error}");
+        assert_eq!(f.ndk.looper_idle(), None, "a refused bound changes nothing");
+    }
+    f.ndk.set_looper_idle(Some(MAX_LOOPER_IDLE)).expect("the cap itself is accepted");
+    assert_eq!(f.ndk.looper_idle(), Some(MAX_LOOPER_IDLE));
+    f.ndk.set_looper_idle(None).expect("off");
+    assert_eq!(f.ndk.looper_idle(), None);
 }
 
 // =================================================================== the instrumentation

@@ -820,6 +820,25 @@ impl Guest {
 
         let bionic = Bionic::new(Arc::clone(&space)).expect("a bionic instance");
         let ndk = Ndk::new(Arc::clone(&space)).expect("an NDK instance");
+        // **The looper's idle wait, off unless this run asks** (`OMNI_LOOPER_IDLE_US=<µs>`, 0 or
+        // unset for off): the game loop's `pollOnce(0)` spin, once it is one, waits on the
+        // looper's own descriptors for at most that long. The decode, and why nothing the engine
+        // needs is late by more than that, is in `omni_android::ndk::looper`'s documentation.
+        if let Ok(micros) = std::env::var("OMNI_LOOPER_IDLE_US") {
+            let micros: u64 = micros
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("OMNI_LOOPER_IDLE_US={micros:?} is not microseconds"));
+            if micros > 0 {
+                ndk.set_looper_idle(Some(std::time::Duration::from_micros(micros)))
+                    .expect("OMNI_LOOPER_IDLE_US within the cap");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "LOOPER: a spinning pollOnce(0) waits up to {micros} us on its descriptors \
+                     (OMNI_LOOPER_IDLE_US)"
+                );
+            }
+        }
         // Room for every import, the 241 JNI slots and the NDK surface -- and, with graphics, the
         // Vulkan loader's pool and the data area its handle registries need (8192, not 4096:
         // `vulkan::REQUIRED_DATA_BYTES` records why no smaller arrangement exists).
@@ -4761,6 +4780,17 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         // **And every asset the engine asked the APK for**, whether it was there or not: the
         // early report's census predates the renderer, which is where textures are read.
         let _ = writeln!(std::io::stderr(), "POST-TEARDOWN NDK census: {:?}", guest.ndk.census());
+        // The idle wait says whether it was on, so a zero cannot be read as "on and never used"
+        // (`VERIFICATION.md` entry 15).
+        let _ = writeln!(
+            std::io::stderr(),
+            "POST-TEARDOWN looper idle waits: {} ({})",
+            guest.ndk.looper_idle_waits(),
+            guest.ndk.looper_idle().map_or_else(
+                || "off".to_string(),
+                |bound| format!("OMNI_LOOPER_IDLE_US={}", bound.as_micros())
+            ),
+        );
         for event in guest.ndk.events().iter().filter(|e| {
             matches!(e.what, "openAsset" | "getBuffer" | "openFileDescriptor" | "read" | "close")
         }) {
