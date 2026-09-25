@@ -17,6 +17,62 @@
 //! module's parent for why reaching it without a looper produces §8.1's fourth failure mode, a
 //! **silent** `return 0`.
 //!
+//! # What a device on this path never sends: the display's refresh rate
+//!
+//! [`NEVER_SENT`] names two natives this script deliberately does **not** call, although the engine
+//! has a place for what they carry. DECODED on 2.739.691 (`classes2.dex`, `libroblox.so` link
+//! addresses), so nobody adds them, or a host query to feed them, again:
+//!
+//! * **Only `MainScreenController` (`fi.r0`) calls them.** `fi.r0.h` gets `DisplayManager`
+//!   (`Context.getSystemService("display")`), registers `fi.r0$a` as a display listener, takes
+//!   `getDisplay(0)`, and calls `n(display)` @`0x0033` -- `nl.a.a` = `Display.getRefreshRate()`,
+//!   then `nativePassCurrentDisplayRefreshRate(F)` @`0x000f` -- and
+//!   `nativePassSupportedRefreshRates(nl.a.k(display))` @`0x003a`, where `nl.a.k` is
+//!   `Display.getSupportedRefreshRates()`. `fi.r0$a.onDisplayChanged` re-sends the current rate.
+//!   `h` is reached from the lifecycle observer `fi.r0.g` @`0x00b0`. A whole-dex search
+//!   (`classes`, `classes2`, `classes3`) finds no other caller of either native and no other
+//!   `Display.getRefreshRate` / `getSupportedRefreshRates` in Roblox's code.
+//! * **Only `ActivityNativeMain` creates one** (`ActivityNativeMain.B2` @`0x005f`, the single
+//!   `new-instance Lfi/r0;`). `ActivitySplash.onCreate` starts `MainGameActivity` when `ci.i.B1()`
+//!   ("GameActivity = ON", @`0x000f`-`0x002b`) and returns; `ActivityNativeMain` is the other
+//!   branch's default (`bh.w.i`: "Using default Main class", because
+//!   `com.roblox.client.implementation.AppImplementations` is not in the APK). This script is the
+//!   `MainGameActivity` path, so a device on it never sends either rate.
+//! * **The engine has no other source.** `getPrimaryDisplayRefreshRate` (`0x23e5670`, and inlined
+//!   in `0x58b5568`) reads the `.bss` double at `0x6dc6900`, whose only writer is the native's
+//!   body (`0x23522e4`, stored @`0x2352314` before the `< 15.0 Hz` check). It calls no Java --
+//!   `libroblox.so` has no `getRefreshRate` string -- and imports no `AChoreographer_*`,
+//!   `ADisplay_*` or `ANativeWindow_setFrameRate`; its only pacing import is `eglSwapInterval`.
+//!   Unsent, it returns rate 0 and logs `getPrimaryDisplayRefreshRate FAILED: Could not retrieve
+//!   screen info. Defaulting to 0 Hz`; its first call also records
+//!   `PerformanceControlDisplaySupportedRefreshRates` as `Empty` (the vector at `0x6dc68e0`, filled
+//!   only by `nativePassSupportedRefreshRates`, `0x23523b4`).
+//!
+//! What the engine does with the rate, for whoever measures frame pacing next (DECODED, not
+//! measured). The consumer is `0x23e53fc` (reached @`0x23e483c` when the flag byte `0x6dc61e8`
+//! is set), through the thunk `0x58b5694`, plus a second copy at `0x5898cf4`:
+//!
+//! * `ApplicationFrameRate` (singleton `0x6251c38`) is given `round(rate)` when the rate is valid
+//!   and at least 15 Hz, else 0 (`0x23e5474`-`0x23e548c` -> `0x6252088`, field `+0xc`). Its frame
+//!   time (`0x62523d4`) is `max(base, 1 / rate)` only when that field is non-zero. `base`
+//!   (`0x6251cb0`) is `1 / FramerateCap` when the user set one (`0x2dd09a4` -> `0x6251f84`, field
+//!   `+0x8`; "unlimited", -1, stores 0), else `1 / TaskSchedulerTargetFps` (`0x23e54e0`: 0 means
+//!   60, capped at 240). The class's own log line (`0x29836f`) names the two fields
+//!   `user cap={} FPS` and `display cap={} FPS`. So with no rate there is **no display ceiling**,
+//!   and `FramerateCap` alone bounds the frame time.
+//! * The performance-control frame-time table is built for `max((int) rate, 60)`
+//!   (`0x23e54a8`-`0x23e54b4` -> `0x23e6620`): one rung per divisor of that rate. That figure is
+//!   also the `MaxDisplayRefreshRateHz` telemetry (`+0x30`, read @`0x58a5bbc`). Its first rung
+//!   becomes the target frame time (`0x23e6b68` -> `0x5899eb4`), except when the user overrode the
+//!   frame rate (`0x6252018`: `+0x8 != 0`) and the flag byte `0x6dc5fe0` is set. That flag is
+//!   presumably `FFlagPerformanceControlRespectUserFpsOverridden`, but the library does not store
+//!   flag names as plain strings, so the match is not checked. Unsent, the table tops out at 60 Hz.
+//!
+//! So, as far as this decode reaches, a missing rate does not by itself stop the engine at 60 fps
+//! when `FramerateCap` is 240. Presentation is what to measure next: the guest's swapchain present
+//! mode reaches the host swapchain unchanged (`omni-gfx` `host.rs`), and a FIFO swapchain is paced
+//! by the display the window is on.
+//!
 //! # The name mangling is the short form, and that is measured rather than assumed
 //!
 //! Section G of the lists file tags each of the 706 dex natives `SHORT`, `LONG` or `REGISTER`.
@@ -774,6 +830,15 @@ pub static FLAGS_AND_START: &[Downcall] = &[
     },
 ];
 
+/// Natives the engine exports that a device **on this path never calls**, as `(class, member)`:
+/// the display's current and supported refresh rates. The module doc's "What a device on this path
+/// never sends" has the decode. None of this script's tables may call them. Sending a rate would
+/// hand the engine a fact that a device on the `MainGameActivity` path does not give it.
+pub static NEVER_SENT: &[(&str, &str)] = &[
+    ("com/roblox/engine/jni/NativeGLInterface", "nativePassCurrentDisplayRefreshRate"),
+    ("com/roblox/engine/jni/NativeGLInterface", "nativePassSupportedRefreshRates"),
+];
+
 /// The classes [`SEQUENCE`] names that §3.1 does not rank, declared so that the engine can take
 /// a `jclass` for each and so that its member lookups on the parameter objects are **recorded**
 /// rather than refused.
@@ -1145,6 +1210,31 @@ mod tests {
         );
         // And the escapes themselves, which nothing in `SEQUENCE` exercises.
         assert_eq!(mangle("a/b_c", "d$e"), "Java_a_b_1c_d_00024e");
+    }
+
+    /// **No table sends the display's refresh rate**, because only `ActivityNativeMain`'s
+    /// `MainScreenController` does and this script is the `MainGameActivity` path. The list is
+    /// checked by the exports it names, both spelled out, so a list that lost one, or named another
+    /// member, fails here as well.
+    #[test]
+    fn no_table_sends_what_a_device_on_this_path_never_sends() {
+        let named: Vec<String> = NEVER_SENT.iter().map(|(class, member)| mangle(class, member)).collect();
+        assert_eq!(
+            named,
+            [
+                "Java_com_roblox_engine_jni_NativeGLInterface_nativePassCurrentDisplayRefreshRate",
+                "Java_com_roblox_engine_jni_NativeGLInterface_nativePassSupportedRefreshRates",
+            ]
+        );
+        for row in SEQUENCE.iter().chain(ENGINE_SETTINGS).chain(FLAGS_AND_START) {
+            assert!(
+                !NEVER_SENT.contains(&(row.class, row.member)),
+                "{} (step {}, from {}) is a native a device on the MainGameActivity path never calls",
+                row.symbol(),
+                row.step,
+                row.caller
+            );
+        }
     }
 
     /// §8's own counts, per step. Stated in the table rather than remembered, because the step

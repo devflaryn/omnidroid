@@ -1612,7 +1612,15 @@ gate, audio bound with the window, live `GUEST THREAD DIED` lines and 1 ms timer
   **not** `MainGameActivity`, so a device on the GameActivity path never sends them either; the
   engine's `PerformanceControlDisplaySupportedRefreshRates` `Empty` is that path's truth. (A
   window-seam refresh-rate query was written and removed for this reason; the patch is in the
-  session scratchpad.)
+  session scratchpad.) **Re-checked on 2.739.691 (2026-09-25), and still true.** The engine has no
+  other source: `getPrimaryDisplayRefreshRate` (`0x23e5670`) reads only the `.bss` double that the
+  native writes (`0x6dc6900`). The library calls no Java and no NDK display API for it. Unsent,
+  `ApplicationFrameRate` has no display cap, so `FramerateCap` alone bounds the frame time, and the
+  performance-control frame-time table is built for `max(rate, 60)` = 60. As far as the decode
+  reaches, this does **not** by itself explain the measured ~59 fps under `FramerateCap` 240.
+  Measure presentation next: Parsec's virtual display is 60 Hz, and the guest's present mode
+  reaches the host swapchain unchanged. `jni::script`'s module doc has the
+  full decode, and `NEVER_SENT` plus its test keep the two natives out of the script.
 
 ## After the first frame -- the goal is not a frame
 

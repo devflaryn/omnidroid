@@ -7178,6 +7178,62 @@ directory", ADAPTER_FILES,
             function: symbol,""",
      ANDROID_LIB),
 
+    # The display's refresh rate, which a device on the MainGameActivity path never sends: only
+    # `ActivityNativeMain`'s `MainScreenController` (`fi.r0`) calls the two natives, DECODED on
+    # 2.739.691 (`jni::script`'s module doc). Sending one reads as more faithful, which is why the B
+    # rows are the dangerous direction: the engine would get a fact that a device on this path
+    # never gives it.
+    ("refresh-B1", "B", "the script sends the current display refresh rate after global init",
+     JNI_SCRIPT,
+     """        member: "nativeGameGlobalInit",
+        descriptor: "()V",
+        java_before: &[],
+        args: &[],
+    },
+];""",
+     """        member: "nativeGameGlobalInit",
+        descriptor: "()V",
+        java_before: &[],
+        args: &[],
+    },
+    Downcall {
+        step: 22,
+        caller: "fi/r0.n",
+        class: "com/roblox/engine/jni/NativeGLInterface",
+        member: "nativePassCurrentDisplayRefreshRate",
+        descriptor: "(F)V",
+        java_before: &[],
+        args: &[],
+    },
+];""",
+     ANDROID_LIB),
+    ("refresh-B2", "B", "the script sends the supported refresh rates with step 11",
+     JNI_SCRIPT,
+     """        args: &[ScriptArg::PreviousExitReasons],
+    },
+];""",
+     """        args: &[ScriptArg::PreviousExitReasons],
+    },
+    Downcall {
+        step: 11,
+        caller: "fi/r0.h",
+        class: "com/roblox/engine/jni/NativeGLInterface",
+        member: "nativePassSupportedRefreshRates",
+        descriptor: "([F)V",
+        java_before: &[],
+        args: &[],
+    },
+];""",
+     ANDROID_LIB),
+    # The guard itself, reverted: the list no longer names the supported rates, so a table that
+    # sent them would pass the check.
+    ("refresh-A1", "A", "NEVER_SENT forgets nativePassSupportedRefreshRates",
+     JNI_SCRIPT,
+     """    ("com/roblox/engine/jni/NativeGLInterface", "nativePassSupportedRefreshRates"),
+];""",
+     """];""",
+     ANDROID_LIB),
+
     # libaaudio.so. The first is the one the whole module exists for: a started stream whose thread
     # never calls the guest's callback still "runs", and nothing but the samples says otherwise.
     ("aaudio-A1", "A", "the data-callback thread never calls the guest's callback",
