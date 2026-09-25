@@ -9474,10 +9474,10 @@ directory", ADAPTER_FILES,
      '                    slot.generation != 0\n                        && slot.dtor != 0\n                        && slot.dtor != u64::MAX\n',
      '                    slot.generation != 0\n',
      CORRUPT_TLS),
-    ('corrupt-A11', 'A', 'the 128-bit store-exclusive fallback is a compare and two stores again',
+    ('corrupt-A11', 'A', 'the 128-bit store-exclusive fallback loses its LOCK prefix, so it is not atomic',
      'crates/omni-cpu/src/dynarmic/callbacks.rs',
-     '    unsafe { cmpxchg16b(ptr.cast::<u128>(), old, new) == old }',
-     '    let _ = cmpxchg16b;\n    unsafe {\n        if ptr.cast::<u128>().read_volatile() != old {\n            return false;\n        }\n        ptr.cast::<u64>().write_volatile(new as u64);\n        ptr.add(8).cast::<u64>().write_volatile((new >> 64) as u64);\n    }\n    true',
+     '            "lock cmpxchg16b xmmword ptr [{dst}]",',
+     '            "cmpxchg16b xmmword ptr [{dst}]",',
      CORRUPT_CAS),
 ]
 

@@ -349,18 +349,36 @@ unsafe extern "C" fn cb_wx128(
 /// `ptr` must be valid for reads and writes of sixteen bytes.
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn compare_exchange_16(ptr: *mut u8, old: [u64; 2], new: [u64; 2]) -> bool {
-    #[target_feature(enable = "cmpxchg16b")]
-    unsafe fn cmpxchg16b(dst: *mut u128, old: u128, new: u128) -> u128 {
-        // SAFETY: the caller's contract, plus the alignment checked below.
-        unsafe { core::arch::x86_64::cmpxchg16b(dst, old, new, Ordering::SeqCst, Ordering::SeqCst) }
-    }
     if ptr as usize % 16 != 0 {
         return false;
     }
-    let old = u128::from(old[0]) | (u128::from(old[1]) << 64);
-    let new = u128::from(new[0]) | (u128::from(new[1]) << 64);
-    // SAFETY: D2 makes CMPXCHG16B part of every host this runs on; `ptr` is valid and aligned.
-    unsafe { cmpxchg16b(ptr.cast::<u128>(), old, new) == old }
+    // **The instruction itself, as inline assembly.** `core::arch::x86_64::cmpxchg16b` under
+    // `#[target_feature]` still became a call to libatomic's `__atomic_compare_exchange_16` on
+    // the Linux host, where nothing provides it, and the link failed (MEASURED 2026-09-25).
+    // `lock cmpxchg16b` is the same instruction dynarmic's inline path emits, it is a full
+    // barrier (SeqCst), and D2 makes it part of every x86-64 host this runs on. RBX is reserved
+    // by LLVM, so the new low half goes in through a scratch register and is swapped in and out.
+    let (mut lo, mut hi) = (old[0], old[1]);
+    let ok: u8;
+    // SAFETY: `ptr` is valid for sixteen bytes (the caller's contract) and 16-aligned (checked);
+    // RBX is restored before the block ends.
+    unsafe {
+        core::arch::asm!(
+            "xchg {nlo}, rbx",
+            "lock cmpxchg16b xmmword ptr [{dst}]",
+            "sete {ok}",
+            "xchg {nlo}, rbx",
+            dst = in(reg) ptr,
+            nlo = inout(reg) new[0] => _,
+            ok = out(reg_byte) ok,
+            inout("rax") lo,
+            inout("rdx") hi,
+            in("rcx") new[1],
+            options(nostack),
+        );
+    }
+    let _ = (lo, hi);
+    ok != 0
 }
 
 /// The arm64-host form: **not atomic** (see [`cb_wx128`]).
