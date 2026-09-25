@@ -800,6 +800,25 @@ on a shared cache: a write to the second page of a two-page block, a write to th
 70,001-instruction block (more than 64 pages; ignoring the wide list fails it), and a 16 GiB
 invalidation reaching every block.
 
+### 0027 — x64: a shared cache's block map at a load factor of 0.75
+
+`0027-x64-a-shared-cache-s-block-map-at-a-load-factor-of-0.75.patch`. **x64, shared caches only.**
+After 0025-0026 the largest per-block table is `block_descriptors` itself: 32-byte buckets at
+robin_map's default maximum load factor of 0.5 -- in the world 2^21 buckets, the 64 MiB allocation
+M1 and M4 showed. A shared cache now runs it at 0.75 (`UseLoadFactor`, 0025: from 64 buckets, so
+every size limit tsl computes in floating point is exact): for ~700,000 blocks, 2^20 buckets, 32 MiB.
+
+It is the dispatcher's map, so it was measured where it is read:
+`tests/shared_bookkeeping.rs::bench_dispatcher_lookups_in_a_shared_cache` (ignored; release) calls
+100,000 one-instruction functions through `BLR` in a scattered order, so nearly every call misses the
+thread's 4,096-entry fast-dispatch table and takes the cache's lock and the block map (100,003
+entries: 8 MiB of buckets at 0.5, 4 MiB at 0.75). Alternated builds, two rounds of three runs each,
+Windows: **45.5-51.0 ns per call at 0.5 (median 49.6), 46.3-50.9 at 0.75 (median 50.2)** -- within
+the noise. (A first try at 0.8 measured the same, 48.6-51.0, and failed `omni-cpu/tests/thunk.rs`:
+0025's note.) The cold translation bench beside it (emission writes the tables) is 6.1 us per block
+with 0025-0027 against 7.1 on 0024's maps. Bookkeeping per block (the same file's test): **289 ->
+225 bytes**; the bound is 260.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

@@ -106,6 +106,9 @@ protected:
     /// enter the dispatcher -- emitted right after it.
     void EmitSlotJump(const IR::LocationDescriptor& target);
 
+    /// Omnidroid patch 0027: a shared cache's block map load factor (robin_map's default is 0.5).
+    static constexpr float SHARED_BLOCK_MAP_LOAD_FACTOR = 0.75f;
+
     const A64::UserConfig conf;
     A64::Jit* jit_interface;
 

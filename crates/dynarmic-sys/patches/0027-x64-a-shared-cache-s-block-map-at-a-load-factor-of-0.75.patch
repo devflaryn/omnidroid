@@ -1,0 +1,30 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index ed36712..3e6296f 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -55,6 +55,11 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
+         : EmitX64(code), conf(conf), jit_interface{jit_interface} {
+     // Omnidroid patch 0022: before the prelude, which is shared too when this is.
+     shared_code = shared;
++    if (shared_code) {
++        // Omnidroid patch 0027: the block map of a shared cache holds every block of the process
++        // (~700,000 in a game world); at 0.75 rather than 0.5 its bucket array is half the size.
++        UseLoadFactor(block_descriptors, SHARED_BLOCK_MAP_LOAD_FACTOR);
++    }
+     // In a shared cache each thread owns its table (JitState::od_fast_dispatch_table).
+     if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {
+         fast_dispatch_table = std::make_unique<std::array<FastDispatchEntry, fast_dispatch_table_size>>();
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index e7563c7..601a59a 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -106,6 +106,9 @@ protected:
+     /// enter the dispatcher -- emitted right after it.
+     void EmitSlotJump(const IR::LocationDescriptor& target);
+ 
++    /// Omnidroid patch 0027: a shared cache's block map load factor (robin_map's default is 0.5).
++    static constexpr float SHARED_BLOCK_MAP_LOAD_FACTOR = 0.75f;
++
+     const A64::UserConfig conf;
+     A64::Jit* jit_interface;
+ 

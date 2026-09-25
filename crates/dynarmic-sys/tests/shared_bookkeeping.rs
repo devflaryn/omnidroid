@@ -111,7 +111,7 @@ fn units(units: usize) -> Vec<u32> {
 const UNITS: usize = 32_768;
 const BLOCKS: usize = 2 * UNITS;
 /// What a block of [`units`]' shape may cost in the shared cache's tables.
-const BYTES_PER_BLOCK_BOUND: f64 = 350.0;
+const BYTES_PER_BLOCK_BOUND: f64 = 260.0;
 
 /// One guest address space on a shared cache big enough that nothing is retired.
 struct Shared {
@@ -211,8 +211,8 @@ fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
     }
     eprintln!("  the census: {:.0} bytes per block", counted as f64 / BLOCKS as f64);
     // MEASURED: 1,144 bytes per block on the pin (patch 0024's census), 401 with patch 0025's flat
-    // link and fastmem records, 289 with patch 0026's guest-range index; the bound sits above that
-    // and well below what the maps did.
+    // link and fastmem records, 289 with patch 0026's guest-range index, 225 with patch 0027's
+    // fuller block map; the bound sits above that and below each earlier step.
     assert!(
         per_block < BYTES_PER_BLOCK_BOUND,
         "{per_block:.0} bytes of bookkeeping per block: the shared cache is keeping its links, \
@@ -234,6 +234,100 @@ fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
             assert!(span >= t.largest_bytes as usize, "{name}: its address is in an allocation of {span} bytes, not {}", t.largest_bytes);
         }
     }
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// **Measurement, not an assertion**: what a cold block costs a shared cache to translate and emit
+/// -- the bookkeeping is written at emission. Seven fresh caches, the median.
+///
+/// ```text
+/// cargo test -p dynarmic-sys --release --test shared_bookkeeping -- --ignored --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore]
+fn bench_cold_translation_into_a_shared_cache() {
+    let _g = lock();
+    let (mut wall, mut emit, mut translate) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..7 {
+        let shared = Shared::new(units(UNITS));
+        let t0 = std::time::Instant::now();
+        shared.run();
+        let ns = t0.elapsed().as_nanos() as f64;
+        let s = shared.stats();
+        wall.push(ns / s.blocks_emitted as f64);
+        emit.push(s.emit_ns as f64 / s.blocks_emitted as f64);
+        translate.push(s.translate_ns as f64 / s.blocks_emitted as f64);
+    }
+    eprintln!(
+        "cold, per block (n = {BLOCKS}, median of 7): {:.0} ns in all, {:.0} ns emitting, {:.0} ns translating",
+        median(wall),
+        median(emit),
+        median(translate)
+    );
+}
+
+/// **Measurement, not an assertion**: what a dispatcher lookup that misses the thread's own
+/// fast-dispatch table costs -- the shared cache's lock, taken shared, and the block map. A loop
+/// calls, through `BLR`, 100,000 one-instruction functions (`RET`) in a scattered order read from a
+/// table, so nearly every call misses the 4,096-entry fast-dispatch table and the block map is
+/// large. Warm: every block is translated before the timed passes.
+#[test]
+#[ignore]
+fn bench_dispatcher_lookups_in_a_shared_cache() {
+    let _g = lock();
+    const TARGETS: usize = 100_000;
+    const TABLE: u64 = 0x1_0000;
+    // 0: LDR X9, [X13, X10, LSL #3] ; 1: ADD X10, X10, #1 ; 2: BLR X9 ; 3: SUBS X12, X12, #1 ;
+    // 4: B.NE 0 ; 5: SVC #0 ; 6..: RET
+    let mut code = vec![
+        a64::ldr_reg(9, 13, 10),
+        a64::add_imm(10, 10, 1),
+        a64::blr(9),
+        a64::subs_imm(12, 12, 1),
+        a64::b_cond(a64::cond::NE, -4),
+        a64::svc(0),
+    ];
+    code.extend(std::iter::repeat(a64::ret(30)).take(TARGETS));
+    let shared = Shared::new(code);
+    let vm = shared.vm();
+    vm.with_ctx(|c| {
+        // A scattered order: a stride coprime with the count.
+        for i in 0..TARGETS as u64 {
+            let target = (i * 7_919) % TARGETS as u64;
+            c.write_u64(TABLE + 8 * i, CODE_BASE + 4 * (6 + target));
+        }
+    });
+    let pass = || {
+        vm.set_reg(10, 0);
+        vm.set_reg(12, TARGETS as u64);
+        vm.set_reg(13, TABLE);
+        vm.start(u64::MAX);
+        assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE);
+    };
+    pass();
+    let blocks = shared.stats().blocks_emitted;
+    let mut per_call = Vec::new();
+    for _ in 0..9 {
+        let before = shared.stats().locked_lookups;
+        let t0 = std::time::Instant::now();
+        pass();
+        let ns = t0.elapsed().as_nanos() as f64;
+        let locked = shared.stats().locked_lookups - before;
+        assert!(locked > TARGETS as u64 / 2, "the calls missed the fast-dispatch table: {locked}");
+        per_call.push(ns / TARGETS as f64);
+    }
+    assert_eq!(shared.stats().blocks_emitted, blocks, "the timed passes translated nothing");
+    let t = shared.tables().blocks;
+    eprintln!(
+        "a call through the dispatcher's locked lookup: {:.1} ns (median of 9 passes of {TARGETS}); block map {} entries in {} KiB",
+        median(per_call),
+        t.entries,
+        t.largest_bytes >> 10
+    );
 }
 
 /// `NOP` x `nops`, then `ADD X0, X0, #1 ; SVC`: one block covering `4 * (nops + 1)` bytes.

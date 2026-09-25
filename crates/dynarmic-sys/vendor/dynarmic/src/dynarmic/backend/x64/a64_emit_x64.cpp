@@ -55,6 +55,11 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         : EmitX64(code), conf(conf), jit_interface{jit_interface} {
     // Omnidroid patch 0022: before the prelude, which is shared too when this is.
     shared_code = shared;
+    if (shared_code) {
+        // Omnidroid patch 0027: the block map of a shared cache holds every block of the process
+        // (~700,000 in a game world); at 0.75 rather than 0.5 its bucket array is half the size.
+        UseLoadFactor(block_descriptors, SHARED_BLOCK_MAP_LOAD_FACTOR);
+    }
     // In a shared cache each thread owns its table (JitState::od_fast_dispatch_table).
     if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {
         fast_dispatch_table = std::make_unique<std::array<FastDispatchEntry, fast_dispatch_table_size>>();
