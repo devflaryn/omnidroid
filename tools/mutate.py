@@ -293,6 +293,12 @@ GATE_ACTIVITY = ["cargo", "test", "-p", "omni-android", "--release", "--test", "
 GATE_APPNAME = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
                 "--no-fail-fast", "the_application_name"]
 
+# The same target, filtered to the tests that read a transcribed Java method's shape out of the
+# APK's dex and check the registry's answer against it (`facial_age_estimation_is_available_...`,
+# `the_idle_timer_question_...`). Dex reads only, so a build and not a run.
+GATE_DEXSHAPE = ["cargo", "test", "-p", "omni-android", "--release", "--test", "gameactivity",
+                 "--no-fail-fast", "the_idle_timer"]
+
 # `libaaudio.so`: the module's unit tests (in the lib target) and `tests/aaudio.rs`, which drives it
 # from guest code through `dlopen`/`dlsym` and a guest data callback on a guest thread, into a
 # recording device. No APK and no audio hardware, so every row costs a build and not a run.
@@ -9098,6 +9104,49 @@ directory", ADAPTER_FILES,
      JNI_CLASSES,
      """            m("isAvailable", "()Z", Answer::StaticIsSet("personaSdk")),""",
      """            m("isAvailable", "()Z", Answer::StaticIsSet("INSTANCE")),""",
+     ANDROID_LIB),
+
+    # ---- the JNI audit's transcriptions (prefix `jniaudit-`) ------------------------------------
+    # docs/research/jni-audit-2.739.md. ExperienceSession.shouldDisableExperienceIdleTimer is called
+    # by nativeActivity_onStop inside an experience (minimised under pause-in-background); the
+    # system-dialog handler by the server's QoS emergency. Each was a refusal that kills the thread.
+    ("jniaudit-A1", "A", "shouldDisableExperienceIdleTimer goes back to unanswered, so a stop in-world kills the game thread",
+     JNI_CLASSES,
+     """        methods: &[s("shouldDisableExperienceIdleTimer", "()Z", Answer::Bool(false))],""",
+     """        methods: &[s("shouldDisableExperienceIdleTimer", "()Z", Answer::Unanswered)],""",
+     GATE_DEXSHAPE),
+    # Reads as "never kick an idle player" and is a call, a capture or an inquiry this runtime
+    # does not have: the device's answer is false.
+    ("jniaudit-B1", "B", "shouldDisableExperienceIdleTimer answers true, disabling the idle timer",
+     JNI_CLASSES,
+     """        methods: &[s("shouldDisableExperienceIdleTimer", "()Z", Answer::Bool(false))],""",
+     """        methods: &[s("shouldDisableExperienceIdleTimer", "()Z", Answer::Bool(true))],""",
+     GATE_DEXSHAPE),
+    ("jniaudit-A2", "A", "the dialog handler's methods go back to unanswered",
+     JNI_CLASSES,
+     """    m("isAvailable", "()Z", Answer::Bool(true)),
+    m(""",
+     """    m("isAvailable", "()Z", Answer::Unanswered),
+    m(""",
+     ANDROID_LIB),
+    # The over-correction: "a dialog we cannot show must not be available". The Java says true,
+    # and the engine then logs and continues on open's -1 -- which is the device's path.
+    ("jniaudit-B2", "B", "the dialog handler answers unavailable, which the Java never does",
+     JNI_CLASSES,
+     """    m("isAvailable", "()Z", Answer::Bool(true)),
+    m(""",
+     """    m("isAvailable", "()Z", Answer::Bool(false)),
+    m(""",
+     ANDROID_LIB),
+    ("jniaudit-A3", "A", "open answers an id, claiming a dialog is up that no activity could show",
+     JNI_CLASSES,
+     """        Answer::Long(-1),""",
+     """        Answer::Long(1),""",
+     ANDROID_LIB),
+    ("jniaudit-A4", "A", "the callback proxy drops nativeRef, so Djinni cannot unwrap it",
+     JNI_CLASSES,
+     """        methods: &[m("<init>", "(J)V", Answer::Construct(&[("nativeRef", "J")]))],""",
+     """        methods: &[m("<init>", "(J)V", Answer::NewInstance)],""",
      ANDROID_LIB),
 
     # ---- pthread_key values without a shared lock (prefix `tlsfast-`) ---------------------------

@@ -6082,6 +6082,16 @@ mod dex {
         Some((type_name(dex, u32::from(u16_at(dex, at)?))?, string(dex, u32_at(dex, at + 4)?)?))
     }
 
+    /// `(declaring class, name)` of one `method_id`.
+    pub fn method_ref(dex: &[u8], index: u32) -> Option<(String, String)> {
+        let (count, off) = (u32_at(dex, 88)?, u32_at(dex, 92)? as usize);
+        if index >= count {
+            return None;
+        }
+        let at = off + 8 * index as usize;
+        Some((type_name(dex, u32::from(u16_at(dex, at)?))?, method_name(dex, index)?))
+    }
+
     /// The `code_item` offset of `class.method` (the first with that name that has code).
     fn code_item(dex: &[u8], class: &str, method: &str) -> Option<usize> {
         if dex.get(..4)? != b"dex\n" {
@@ -6313,6 +6323,73 @@ fn facial_age_estimation_is_available_is_the_persona_sdk_field_test_in_the_apk()
         Answer::Assigned,
         "personaSdk is written only by onCreate's reflective construction of the module's launcher"
     );
+}
+
+/// Read `class.method`'s code out of whichever dex of the chosen APK declares it.
+fn apk_method_code(class: &str, method: &str) -> (String, Vec<u8>, Vec<u16>) {
+    let apk = omni_apk::Apk::open(apk_path()).expect("the real APK");
+    apk.entries()
+        .iter()
+        .map(|entry| entry.name().to_string())
+        .filter(|name| name.ends_with(".dex") && name != "classes4.dex")
+        .find_map(|name| {
+            let bytes = apk.read_named(&name).expect("read a dex out of the APK");
+            dex::code_units(&bytes, class, method).map(|units| (name, bytes, units))
+        })
+        .unwrap_or_else(|| panic!("{class}.{method} has no code in any dex of the APK: re-decode it"))
+}
+
+/// **`ExperienceSession.shouldDisableExperienceIdleTimer()` asks exactly three things**, each a
+/// state this runtime never enters -- a Roblox call ringing (`em.g.h`), a camera capture
+/// (`MediaPickerProtocolV2.isCapturingMedia`), a Persona inquiry (`isInInquiryFlow`) -- which is
+/// what makes the registry's `false` the method's own answer here. A future APK that adds a
+/// fourth question fails here naming what it calls.
+#[test]
+fn the_idle_timer_question_is_the_three_states_this_runtime_never_enters() {
+    use omni_android::jni::classes::{Answer, Registry};
+    const CLASS: &str = "Lcom/roblox/client/game/ExperienceSession;";
+    let (dex_name, bytes, units) = apk_method_code(CLASS, "shouldDisableExperienceIdleTimer");
+    // Every invoke (0x6e virtual, 0x71 static, 0x72 interface) and static read (0x62), in order,
+    // walked by format width as `dex::single_const_string` does -- the method has only 1-, 2- and
+    // 3-unit instructions (moves, returns, if-*z, goto, const/4, sget, invoke 35c).
+    let mut asked = Vec::new();
+    let mut at = 0;
+    while at < units.len() {
+        let opcode = units[at] & 0xff;
+        let width = match opcode {
+            0x6e | 0x71 | 0x72 => {
+                let (class, name) = dex::method_ref(&bytes, u32::from(units[at + 1])).expect("a method");
+                asked.push(format!("{class}->{name}"));
+                3
+            }
+            0x62 => {
+                let (class, name) = dex::field_ref(&bytes, u32::from(units[at + 1])).expect("a field");
+                asked.push(format!("{class}.{name}"));
+                2
+            }
+            0x38 | 0x39 => 2,
+            0x0a | 0x0c | 0x0f | 0x12 | 0x28 => 1,
+            other => panic!("{dex_name}: opcode {other:#04x} at {at:#06x} is not in the decoded method"),
+        };
+        at += width;
+    }
+    assert_eq!(
+        asked,
+        [
+            "Lem/g;->x",
+            "Lem/g;->h",
+            "Lcom/roblox/protocols/mediapicker/MediaPickerProtocolV2;->isCapturingMedia",
+            "Lci/h;->a",
+            "Lci/i;->k3",
+            "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;.INSTANCE",
+            "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;->isInInquiryFlow",
+        ],
+        "{dex_name}: shouldDisableExperienceIdleTimer asks something new; decode it before answering it"
+    );
+    let registry = Registry::with_declared();
+    let class = registry.find(&CLASS[1..CLASS.len() - 1]).expect("declared");
+    let method = registry.method(class, "shouldDisableExperienceIdleTimer", "()Z", true).expect("declared");
+    assert_eq!(registry.member(method).expect("a member").answer, Answer::Bool(false));
 }
 
 /// §8 row 23's three lookups all resolve from the **one** `jclass` the engine derives from the

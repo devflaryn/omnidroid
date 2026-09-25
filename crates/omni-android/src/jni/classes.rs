@@ -811,6 +811,20 @@ const fn sf(name: &'static str, descriptor: &'static str, answer: Answer) -> Mem
 
 const NONE: &[MemberSpec] = &[];
 
+/// `PlatformSystemDialogHandler`'s four engine-called methods, decoded at its declaration in
+/// [`DECLARED`] and shared with the Djinni interface the engine takes their ids on.
+const SYSTEM_DIALOG_HANDLER: &[MemberSpec] = &[
+    m("isAvailable", "()Z", Answer::Bool(true)),
+    m(
+        "open",
+        "(Lcom/roblox/protocols/systemdialogplatforminterface/generated/SystemDialogRequest;\
+         Lcom/roblox/protocols/systemdialogplatforminterface/generated/ISystemDialogCallback;)J",
+        Answer::Long(-1),
+    ),
+    m("dismiss", "(J)V", Answer::Sink),
+    m("dismissAll", "()V", Answer::Sink),
+];
+
 // ------------------------------------------------------------------- Tier 0, §3.1
 
 /// `com/google/androidgamesdk/GameActivity` — five `CHECK_NOT_NULL` members.
@@ -2064,15 +2078,69 @@ pub static DECLARED: &[ClassSpec] = &[
     // sput-object v0, INSTANCE` -- a Kotlin `object`. Only `INSTANCE` is declared here; the
     // other statics `<clinit>` sets (a coroutine scope, a mutex, two `AtomicReference`s, a
     // queue) have no measured reader, and the generated surface keeps every method Unanswered.
+    //
+    // **The four methods the engine looks up on it (JNI audit, docs/research/jni-audit-2.739.md)**
+    // -- Djinni's class setup at `0x22792f8` takes all four ids at startup, on the interface
+    // `IPlatformSystemDialogHandler` below, which is where a `Call…Method` on this object lands.
+    // Their one engine caller is `AppPlatformQoSEmergency` (`0x227a76c`): a blocking dialog the
+    // servers can switch on during an outage (`Stop_Until`), not a Lua API or a menu. Decoded:
+    //
+    // * `isAvailable()Z` is `const/4 v0, #1; return` -- **true**, whatever the state.
+    // * `open(request, callback)J` returns -1 when a blocking dialog is already up, or when
+    //   `currentActivity` is null ("openBlockingDialog: No activity is running."), and only past
+    //   both puts an AppCompat `AlertDialog` up on the UI thread and returns a random id.
+    //   `currentActivity` is written only by `setActivity`, which `ActivitySplash.onCreate` /
+    //   `MainGameActivity.onCreate` / the application's lifecycle callbacks reach under the Java
+    //   flags `EnableAppPlatformQoSEmergencyOnAndroidStartup` / `EnableSystemDialogHandlerInAndroid`
+    //   -- both `false` in `di.a.<init>` -- and no scripted statement here runs. So it is null and
+    //   `open` is **-1**, a phone's own answer with those flags at their defaults; the engine then
+    //   logs "Platform could not open the system dialog." and plays on. This host has no UI
+    //   toolkit to put the dialog up anyway: showing it would need an embedding seam, not an
+    //   answer.
+    // * `dismiss(J)V` closes the active dialog if its id matches, and `dismissAll()V` whatever
+    //   is active; with none ever active both do nothing: sinks.
     ClassSpec {
         name: "com/roblox/protocols/systemdialog/PlatformSystemDialogHandler",
         tier: Tier::Support,
-        methods: NONE,
+        methods: SYSTEM_DIALOG_HANDLER,
         fields: &[sf(
             "INSTANCE",
             "Lcom/roblox/protocols/systemdialog/PlatformSystemDialogHandler;",
             Answer::StaticInstance,
         )],
+    },
+    // The Djinni interface the ids are taken on (`GetMethodID` on its class), answered as its one
+    // implementation above: the only object the engine wraps as an `IPlatformSystemDialogHandler`
+    // is `PlatformSystemDialogHandler.INSTANCE`, so JNI's virtual dispatch lands there.
+    ClassSpec {
+        name: "com/roblox/protocols/systemdialogplatforminterface/generated/IPlatformSystemDialogHandler",
+        tier: Tier::Support,
+        methods: SYSTEM_DIALOG_HANDLER,
+        fields: NONE,
+    },
+    // What the engine builds before `open` (`0x35df540`: `NewObject`, `(String x4, Z, Z, J)`,
+    // from the `PlatformQoSEmergencyDialog*` flags). The Java constructor stores the seven
+    // arguments; the one reader is `open`'s dialog-building branch, which `currentActivity ==
+    // null` never reaches here, so the object is made and nothing is kept -- `Construct` cannot
+    // keep a `String`, and keeping one no reader reads would only be a reference to leak.
+    ClassSpec {
+        name: "com/roblox/protocols/systemdialogplatforminterface/generated/SystemDialogRequest",
+        tier: Tier::Support,
+        methods: &[m(
+            "<init>",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZJ)V",
+            Answer::NewInstance,
+        )],
+        fields: NONE,
+    },
+    // The engine's C++ callback wrapped for Java (`0x35dfb54`, `NewObject` `<init>(J)V`): Djinni's
+    // generated constructor stores `nativeRef` (the rest -- an `AtomicBoolean destroyed` and
+    // `NativeObjectManager.register` -- is Java-side cleanup the engine never reads).
+    ClassSpec {
+        name: "com/roblox/protocols/systemdialogplatforminterface/generated/ISystemDialogCallback$CppProxy",
+        tier: Tier::Support,
+        methods: &[m("<init>", "(J)V", Answer::Construct(&[("nativeRef", "J")]))],
+        fields: NONE,
     },
     // **MEASURED, M6's gate**: once the engine was on Vulkan, a worker died on
     // `CallStaticBooleanMethodV` of `isSystemThemeAvailable()Z`. In `classes2.dex` it is
@@ -2122,6 +2190,27 @@ pub static DECLARED: &[ClassSpec] = &[
     // `PlatformSystemDialogHandler` above, read from `classes2.dex`: `<clinit>` is `new-instance;
     // invoke-direct <init>()V; sput-object INSTANCE` -- a Kotlin `object`.
     //
+    // **`ExperienceSession.shouldDisableExperienceIdleTimer()Z` (static)**: found by the JNI
+    // audit (docs/research/jni-audit-2.739.md), not yet by a death. `nativeActivity_onStop`
+    // (`0x2bf27ac`) calls it through `0x2bfb430` whenever the app is stopped inside an
+    // experience -- this host sends `onStop` when the window is minimised under the
+    // pause-in-background policy -- and on false schedules the engine's idle timer (30.0) that
+    // later stops the experience, as a phone does in the background.
+    //
+    // From `classes2.dex`: `em.g.x().h() || MediaPickerProtocolV2.isCapturingMedia() ||
+    // (ci.i.k3() && FacialAgeEstimationProtocol.INSTANCE.isInInquiryFlow())`. Each term is a
+    // state this runtime never enters: `em.g.h` is "a Roblox call is connecting or ringing", set
+    // only by the Java call manager's `JNICallProtocol` subscriptions (no call UI here);
+    // `isCapturingMedia` becomes true only once a camera app has taken a capture intent (no
+    // camera); `isInInquiryFlow` only in `startInquiry` with a Persona SDK (none -- see the
+    // declaration below). So false, and if any of those is ever modelled this must become the
+    // disjunction of it.
+    ClassSpec {
+        name: "com/roblox/client/game/ExperienceSession",
+        tier: Tier::Support,
+        methods: &[s("shouldDisableExperienceIdleTimer", "()Z", Answer::Bool(false))],
+        fields: NONE,
+    },
     // `setListener(J)V` is `Long.valueOf` then `sput-object nativeListenerPtr` and nothing else;
     // the only readers of that static are this class's own Java methods (`startInquiry`,
     // `onComplete`, `onError`, `onCancel`), which this runtime does not execute. So the host's

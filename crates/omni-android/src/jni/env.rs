@@ -2510,6 +2510,100 @@ mod tests {
         }
     }
 
+    const DIALOG_INTERFACE: &str =
+        "com/roblox/protocols/systemdialogplatforminterface/generated/IPlatformSystemDialogHandler";
+    const DIALOG_OPEN: &str = "(Lcom/roblox/protocols/systemdialogplatforminterface/generated/\
+        SystemDialogRequest;Lcom/roblox/protocols/systemdialogplatforminterface/generated/\
+        ISystemDialogCallback;)J";
+
+    /// **The QoS-emergency dialog path, as the engine walks it** (`0x227a96c` .. `0x35e0818`):
+    /// ids taken on the Djinni interface, `isAvailable` on `PlatformSystemDialogHandler.INSTANCE`,
+    /// the request and the callback proxy built with `NewObject`, then `open` -- which answers
+    /// -1, the Java's own `currentActivity == null` exit, so the engine logs that it could not
+    /// open the dialog and plays on. Each call here was a refusal that killed the thread.
+    #[test]
+    fn the_system_dialog_handler_is_available_and_cannot_open_without_an_activity() {
+        let space = std::sync::Arc::new(omni_mem::GuestSpace::new().expect("a guest space"));
+        let jni = Jni::new(space).expect("a JNI instance");
+        let mut state = jni.state();
+        let handler = state.registry.find(HANDLER).expect("declared");
+        let own = format!("L{HANDLER};");
+        let field = state.registry.field(handler, "INSTANCE", &own, true).expect("declared");
+        let holder = state.registry.field_member(field).expect("a member").clone();
+        let Value::Object(Some(receiver)) =
+            static_instance(&mut state, "GetStaticObjectField", 0, field, &holder).expect("INSTANCE")
+        else {
+            panic!("INSTANCE is an object")
+        };
+        let interface = state.registry.find(DIALOG_INTERFACE).expect("declared");
+        let mut call = |state: &mut JniState, slot: &str, name: &str, descriptor: &str, args: &[Value]| {
+            let method = state.registry.method(interface, name, descriptor, false).expect("declared");
+            assert_eq!(method.class, interface, "{name}: the id is the interface's, as the engine takes it");
+            let member = state.registry.member(method).expect("a member").clone();
+            evaluate(state, slot, 0, interface, &member, Some(receiver), args)
+                .unwrap_or_else(|error| panic!("{name} is answered, not refused: {error:?}"))
+        };
+        assert_eq!(call(&mut state, "CallBooleanMethodV", "isAvailable", "()Z", &[]), Value::Boolean(true));
+
+        let request_class = state
+            .registry
+            .find("com/roblox/protocols/systemdialogplatforminterface/generated/SystemDialogRequest")
+            .expect("declared");
+        let constructor = state
+            .registry
+            .method(
+                request_class,
+                "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZJ)V",
+                false,
+            )
+            .expect("declared");
+        let member = state.registry.member(constructor).expect("a member").clone();
+        let request = evaluate(
+            &mut state,
+            "NewObjectV",
+            0,
+            request_class,
+            &member,
+            None,
+            &[
+                // Four `jstring`s, as the varargs reader hands them: references.
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Long(60),
+            ],
+        )
+        .expect("the request is built");
+        assert!(matches!(request, Value::Object(Some(_))), "{request:?}");
+
+        let proxy_class = state
+            .registry
+            .find("com/roblox/protocols/systemdialogplatforminterface/generated/ISystemDialogCallback$CppProxy")
+            .expect("declared");
+        let constructor = state.registry.method(proxy_class, "<init>", "(J)V", false).expect("declared");
+        let member = state.registry.member(constructor).expect("a member").clone();
+        let Value::Object(Some(proxy)) =
+            evaluate(&mut state, "NewObjectV", 0, proxy_class, &member, None, &[Value::Long(0x1234_5678)])
+                .expect("the proxy is built")
+        else {
+            panic!("an object")
+        };
+        let native_ref = state.registry.field(proxy_class, "nativeRef", "J", false).expect("declared");
+        assert_eq!(
+            instance_field(&state, "GetLongField", 0, proxy, native_ref).expect("stored"),
+            Value::Long(0x1234_5678),
+            "Djinni unwraps the proxy by nativeRef, so it must be the engine's pointer"
+        );
+
+        assert_eq!(call(&mut state, "CallLongMethodV", "open", DIALOG_OPEN, &[]), Value::Long(-1));
+        assert_eq!(call(&mut state, "CallVoidMethodV", "dismiss", "(J)V", &[Value::Long(7)]), Value::Void);
+        assert_eq!(call(&mut state, "CallVoidMethodV", "dismissAll", "()V", &[]), Value::Void);
+    }
+
     /// **`StartAppParams.surface()` answers the very `Surface` the host stored**, through the
     /// accessor the engine calls -- identity, not a new object of the same class, because the
     /// engine turns it into the `ANativeWindow` the window came from. And a field that is not an
