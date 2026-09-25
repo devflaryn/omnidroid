@@ -71,11 +71,17 @@
 //! **6. A hidden cursor is the window's own cursor attribute.** `XDefineCursor` with the blank
 //! cursor the capture already uses makes the pointer invisible over this window and nowhere else
 //! -- the server draws each window's own cursor while the pointer is in it, the frame's and every
-//! other window's included -- and `XUndefineCursor` gives the window back its parent's. It is
-//! defined only while the window has the keyboard focus ([`super::Window::set_cursor_hidden`]'s
-//! contract), and the focus events that count are where it is defined and undefined, so switching
-//! away shows the pointer without the mouse moving. `XFixesHideCursor` was not used: it hides the
-//! pointer on the whole screen for as long as the client that asked is connected.
+//! other window's included -- and `XUndefineCursor` gives the window back its parent's. It stays
+//! defined without the focus ([`super::Window::set_cursor_hidden`]'s contract): the pointer's
+//! moves over an unfocused window are reported, so it is not drawn there either, and leaving the
+//! window shows it. `XFixesHideCursor` was not used: it hides the pointer on the whole screen for
+//! as long as the client that asked is connected.
+//!
+//! **7. A button reported down is reported up, however its release was lost.** Another client's
+//! grab takes a release away from this window. So while a button is down, [`Window::poll`] asks
+//! the server for the pointer's button state (`XQueryPointer`) and reports up any of the three
+//! core buttons it finds up. Back and forward have no bit in the core state and are left to their
+//! own releases and to the focus.
 //!
 //! # Why X11 first
 //!
@@ -94,7 +100,8 @@ use x11_dl::xinput2::{self, XInput2};
 use x11_dl::xlib::{self, Xlib};
 
 use super::{
-    DisplayChange, RawWindow, WindowDesc, WindowError, WindowEvent, WindowResult, push_event,
+    DisplayChange, PointerButton, RawWindow, WindowDesc, WindowError, WindowEvent, WindowResult,
+    push_event,
 };
 
 mod decode;
@@ -253,6 +260,36 @@ pub(super) struct Window {
     /// Whether [`super::Window::set_cursor_hidden`] asks for the cursor to be hidden over the
     /// window. See this module's point 6.
     hide_cursor: bool,
+    /// The seam's buttons reported down and not yet up, by [`button_mask_bit`]; point 7.
+    buttons_down: u32,
+    /// The pointer's last position an event carried, for a release point 7 reports.
+    last_pointer: (i32, i32),
+}
+
+/// The bit a seam button is tracked by in `buttons_down`.
+const fn button_mask_bit(button: PointerButton) -> u32 {
+    match button {
+        PointerButton::Primary => 1,
+        PointerButton::Secondary => 2,
+        PointerButton::Middle => 4,
+        PointerButton::Back => 8,
+        PointerButton::Forward => 16,
+    }
+}
+
+/// **The buttons reported down that the server's pointer state says are up** (point 7): the three
+/// core buttons, whose `ButtonNMask` bits the state carries -- X button 1 is the primary, 2 the
+/// middle, 3 the secondary (see [`decode::button`]).
+fn lost_releases(down: u32, state: c_uint) -> Vec<PointerButton> {
+    [
+        (PointerButton::Primary, xlib::Button1Mask),
+        (PointerButton::Middle, xlib::Button2Mask),
+        (PointerButton::Secondary, xlib::Button3Mask),
+    ]
+    .into_iter()
+    .filter(|&(button, mask)| down & button_mask_bit(button) != 0 && state & mask == 0)
+    .map(|(button, _)| button)
+    .collect()
 }
 
 impl Window {
@@ -326,6 +363,8 @@ impl Window {
             captured: None,
             devices: Vec::new(),
             hide_cursor: false,
+            buttons_down: 0,
+            last_pointer: (0, 0),
         };
 
         // Auto-repeat as presses (this module's header, "Why Xlib").
@@ -791,6 +830,16 @@ impl Window {
         if self.captured.is_some() {
             self.grab();
         }
+        // A button reported down that the server says is up is released (point 7). The queue was
+        // drained first, so a release this window was sent is already in it.
+        if self.buttons_down & 0b111 != 0 {
+            let state = self.pointer_state();
+            let (x, y) = self.last_pointer;
+            for button in lost_releases(self.buttons_down, state) {
+                self.buttons_down &= !button_mask_bit(button);
+                push_event(&mut self.queue, WindowEvent::PointerUp { button, x, y });
+            }
+        }
         sink.append(&mut self.queue);
     }
 
@@ -823,15 +872,17 @@ impl Window {
                 // SAFETY: the type says `button` is the member.
                 let press = unsafe { event.button };
                 let (x, y) = self.captured.unwrap_or((press.x, press.y));
+                self.last_pointer = (x, y);
                 match decode::button(press.button) {
-                    Some(Button::Pointer(button)) => push_event(
-                        &mut self.queue,
+                    Some(Button::Pointer(button)) => {
                         if kind == xlib::ButtonPress {
-                            WindowEvent::PointerDown { button, x, y }
+                            self.buttons_down |= button_mask_bit(button);
+                            push_event(&mut self.queue, WindowEvent::PointerDown { button, x, y });
                         } else {
-                            WindowEvent::PointerUp { button, x, y }
-                        },
-                    ),
+                            self.buttons_down &= !button_mask_bit(button);
+                            push_event(&mut self.queue, WindowEvent::PointerUp { button, x, y });
+                        }
+                    }
                     // A notch is its press; its release carries nothing.
                     Some(Button::Wheel(dx, dy)) if kind == xlib::ButtonPress => {
                         push_event(&mut self.queue, WindowEvent::Wheel { x, y, dx, dy });
@@ -844,6 +895,7 @@ impl Window {
                 if self.captured.is_none() {
                     // SAFETY: the type says `motion` is the member.
                     let motion = unsafe { event.motion };
+                    self.last_pointer = (motion.x, motion.y);
                     push_event(&mut self.queue, WindowEvent::PointerMoved { x: motion.x, y: motion.y });
                 }
             }
@@ -1007,21 +1059,17 @@ impl Window {
                 push_event(&mut self.queue, WindowEvent::PointerCaptureLost);
             }
         }
-        // A cursor hidden for the focus goes and comes back with it (point 6).
-        if self.hide_cursor {
-            self.apply_cursor();
-        }
         push_event(&mut self.queue, WindowEvent::FocusChanged { focused });
     }
 
-    /// Define the blank cursor on the window while it is to be hidden -- asked for, and focused --
-    /// and undefine it otherwise (point 6).
+    /// Define the blank cursor on the window while it is to be hidden, and undefine it otherwise
+    /// (point 6).
     fn apply_cursor(&self) {
         let xl = &self.libs.xlib;
         // SAFETY: a live display, window and cursor. Undefining a cursor the window does not have
         // is a no-op.
         unsafe {
-            if self.hide_cursor && self.focused {
+            if self.hide_cursor {
                 (xl.XDefineCursor)(self.display, self.window, self.blank_cursor);
             } else {
                 (xl.XUndefineCursor)(self.display, self.window);
@@ -1039,9 +1087,53 @@ impl Window {
         Ok(())
     }
 
-    /// Hidden by the request, now: asked for, and focused.
+    /// The request (point 6: not scoped to the focus).
     pub(super) fn cursor_hidden(&self) -> bool {
-        self.hide_cursor && self.focused
+        self.hide_cursor
+    }
+
+    /// The pointer's button state, as the server has it now (`XQueryPointer`'s mask).
+    fn pointer_state(&self) -> c_uint {
+        let (mut root, mut child) = (0, 0);
+        let (mut root_x, mut root_y, mut x, mut y) = (0, 0, 0, 0);
+        let mut state = 0;
+        // SAFETY: a live display and window and writable out-parameters.
+        unsafe {
+            (self.libs.xlib.XQueryPointer)(
+                self.display,
+                self.window,
+                &raw mut root,
+                &raw mut child,
+                &raw mut root_x,
+                &raw mut root_y,
+                &raw mut x,
+                &raw mut y,
+                &raw mut state,
+            );
+        }
+        state
+    }
+
+    /// See [`super::Window::warp_pointer`]: `XWarpPointer` into the window, clamped to it; while
+    /// captured, the held point moves there too (the capture's end warps back to it).
+    pub(super) fn warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()> {
+        let (width, height) = self.geometry("warp_pointer")?;
+        if self.iconic || width == 0 || height == 0 {
+            return Ok(());
+        }
+        let x = x.clamp(0, i32::try_from(width).unwrap_or(i32::MAX) - 1);
+        let y = y.clamp(0, i32::try_from(height).unwrap_or(i32::MAX) - 1);
+        if self.captured.is_some() {
+            self.captured = Some((x, y));
+        }
+        self.last_pointer = (x, y);
+        let xl = &self.libs.xlib;
+        // SAFETY: a live display and window; the source window is `None`.
+        unsafe {
+            (xl.XWarpPointer)(self.display, 0, self.window, 0, 0, 0, 0, x, y);
+            (xl.XFlush)(self.display);
+        }
+        Ok(())
     }
 
     /// From the focus events that count.
@@ -1550,6 +1642,22 @@ impl Drop for Window {
 mod tests {
     use super::*;
     use crate::window::PointerButton;
+
+    /// **The releases point 7 reports**: a core button reported down whose `ButtonNMask` bit the
+    /// server's state lacks -- X 1 the primary, 2 the middle, 3 the secondary -- and nothing else:
+    /// not a button still down, not one never reported, not back or forward.
+    #[test]
+    fn a_lost_release_is_a_reported_button_the_server_has_up() {
+        let all = button_mask_bit(PointerButton::Primary)
+            | button_mask_bit(PointerButton::Secondary)
+            | button_mask_bit(PointerButton::Middle)
+            | button_mask_bit(PointerButton::Back);
+        assert_eq!(lost_releases(all, xlib::Button1Mask | xlib::Button2Mask | xlib::Button3Mask), []);
+        assert_eq!(lost_releases(all, xlib::Button1Mask), [PointerButton::Middle, PointerButton::Secondary]);
+        assert_eq!(lost_releases(button_mask_bit(PointerButton::Secondary), 0), [PointerButton::Secondary]);
+        assert_eq!(lost_releases(0, 0), []);
+        assert_eq!(lost_releases(button_mask_bit(PointerButton::Back), 0), [], "no core bit to ask");
+    }
 
     /// The focus events that count, and the ones that are a grab's or the server's bookkeeping.
     #[test]

@@ -157,6 +157,12 @@ impl Window {
     }
 
     /// Unreachable, as [`Window::show`].
+    pub(super) fn warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()> {
+        let _ = (x, y);
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
     pub(super) fn wait(&self, timeout: core::time::Duration) -> bool {
         let _ = timeout;
         match *self {}

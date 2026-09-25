@@ -25,6 +25,7 @@
 //! Window::set_cursor_hidden(&mut self, hidden: bool) -> WindowResult<()>
 //! Window::cursor_hidden(&self) -> bool
 //! Window::has_focus(&self) -> bool
+//! Window::warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()>
 //! Window::wait(&self, timeout: Duration) -> bool
 //! Window::raw(&self) -> RawWindow
 //! ```
@@ -107,10 +108,20 @@
 //! **Hiding the cursor** without capturing it is the third: an app that draws its own pointer --
 //! Android's `View.onResolvePointerIcon` answering `PointerIcon.TYPE_NULL`, which Roblox's own
 //! surface view does -- wants the host's cursor gone over its client area while the pointer still
-//! moves freely. [`Window::set_cursor_hidden`] asks for that. It is **scoped to the focus**: while
-//! the window does not have the keyboard focus the cursor is shown over it as over any other
-//! window, and it is hidden again when the focus comes back, so switching away always gives the
-//! user a cursor.
+//! moves freely. [`Window::set_cursor_hidden`] asks for that. It is **scoped to the client area,
+//! not to the focus**: the pointer's moves over an inactive window are reported like any others (a
+//! consumer draws its own pointer there too), so the host's is not drawn there either; off the
+//! client area, over the frame or another window, the cursor is that window's. Holding the pointer
+//! -- the capture -- is what the focus scopes, so switching away always gives the user a cursor
+//! that moves.
+//!
+//! **A button the host says is up is released.** A release can be lost to a window -- another
+//! window taking the mouse capture mid-drag, a system menu, a grab -- and a consumer that believes a
+//! button held for ever turns a game's camera for ever. So every backend reports a
+//! [`WindowEvent::PointerUp`] for a button it reported down when it learns, by any route, that the
+//! button is up: the capture taken away, or the host's own button state asked while a button is
+//! held. A release reported twice is harmless to a consumer that tracks its buttons; one never
+//! reported is not.
 //!
 //! # No refresh-rate query, on purpose
 //!
@@ -830,12 +841,13 @@ impl Window {
     /// is still reported ([`WindowEvent::PointerMoved`]), it is only not drawn, because the app
     /// draws its own.
     ///
-    /// A standing request, applied **only while the window has the keyboard focus**: losing the
-    /// focus shows the cursor at once, over this window too, and gaining it back hides it again
-    /// while the request stands. Nothing is reported for either; [`Window::cursor_hidden`] says
-    /// which is in force. Outside the client area (the frame, the title bar, other windows) the
-    /// cursor is never hidden. Independent of [`Window::set_pointer_capture`], which hides the
-    /// cursor for as long as it holds it whatever this says.
+    /// A standing request, applied **whenever the pointer is over the client area, focused or
+    /// not**: an inactive window still hears the pointer move over it, so whatever draws its own
+    /// pointer there still draws it. Outside the client area (the frame, the title bar, other
+    /// windows) the cursor is never hidden. Independent of [`Window::set_pointer_capture`], which
+    /// hides the cursor for as long as it holds it whatever this says. **macOS** can only honour
+    /// it for the key window: AppKit applies a view's cursor to the active application alone (see
+    /// the macOS backend).
     ///
     /// # Errors
     ///
@@ -845,8 +857,8 @@ impl Window {
         self.inner.set_cursor_hidden(hidden)
     }
 
-    /// Whether the cursor is hidden over the client area now by [`Window::set_cursor_hidden`]: it
-    /// was asked for and the window has the focus.
+    /// Whether [`Window::set_cursor_hidden`] asks for the cursor to be hidden over the client area
+    /// (on macOS: and the window is the key window, the only one AppKit honours it for).
     #[must_use]
     pub fn cursor_hidden(&self) -> bool {
         self.inner.cursor_hidden()
@@ -859,6 +871,21 @@ impl Window {
     #[must_use]
     pub fn has_focus(&self) -> bool {
         self.inner.has_focus()
+    }
+
+    /// **Put the cursor at `(x, y)` of the client area** (physical pixels), clamped into it --
+    /// where a consumer that drew its own pointer has it, before giving the host's back.
+    ///
+    /// While the pointer is captured the point it is held at moves there, so the capture's release
+    /// shows it there and reports it there. The move is not motion: nothing is reported for it but
+    /// the position it leaves the cursor at, when the host reports that at all (a
+    /// [`WindowEvent::PointerMoved`] to a consumer already told the pointer is there is none).
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::Unsupported`] on the structural backends; the host's refusal otherwise.
+    pub fn warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()> {
+        self.inner.warp_pointer(x, y)
     }
 
     /// **Wait until something happens, or until `timeout` has passed**: `true` when there is input

@@ -261,6 +261,34 @@ impl Peer {
         }
     }
 
+    /// Send `window` a `ButtonPress` of X button `button` at `(x, y)`, as another client can: a
+    /// press the window hears that the pointer never made.
+    fn send_button_press(&self, window: c_ulong, button: c_uint, x: c_int, y: c_int) {
+        // SAFETY: a zeroed `XEvent` with its `button` member filled; a live display and window.
+        unsafe {
+            let mut event: xlib::XEvent = std::mem::zeroed();
+            event.button = xlib::XButtonEvent {
+                type_: xlib::ButtonPress,
+                serial: 0,
+                send_event: xlib::True,
+                display: self.display,
+                window,
+                root: self.root(),
+                subwindow: 0,
+                time: xlib::CurrentTime,
+                x,
+                y,
+                x_root: x,
+                y_root: y,
+                state: 0,
+                button,
+                same_screen: xlib::True,
+            };
+            (self.xl.XSendEvent)(self.display, window, xlib::False, xlib::ButtonPressMask, &raw mut event);
+            (self.xl.XSync)(self.display, xlib::False);
+        }
+    }
+
     /// A window of this connection's, mapped, with the keyboard focus moved to it: another
     /// application taking the focus.
     fn take_focus(&self) -> c_ulong {
@@ -637,15 +665,17 @@ fn a_capture_grabs_hides_and_confines_reports_raw_motion_and_ends_with_the_focus
     assert!(!window.set_pointer_capture(true).unwrap(), "and a new one is declined without the focus");
 }
 
-/// **A hidden cursor is hidden over the window, and only while it has the focus**: asked for, the
-/// server's cursor image over the window has no visible pixel while the pointer still moves and is
-/// still reported; outside the window it is visible; another client taking the focus shows it
-/// over the window without the pointer moving, and the focus coming back hides it again; a capture
-/// given back leaves it hidden and reports the point it held; withdrawn, it is shown. Read from the
-/// server (`XFixesGetCursorImage`), not from the backend's own flag (VERIFICATION entry 7).
+/// **A hidden cursor is hidden over the window, focused or not**: asked for, the server's cursor
+/// image over the window has no visible pixel while the pointer still moves and is still reported;
+/// outside the window it is visible; **another client taking the focus does not show it over the
+/// window** (the owner's w33: a game cursor following the pointer over an inactive window beside
+/// the host's), and the pointer's moves over the unfocused window are still reported; a capture
+/// whose held point is moved (`warp_pointer`) and given back leaves it hidden, there, and reports
+/// that point; withdrawn, it is shown. Read from the server (`XFixesGetCursorImage`,
+/// `XQueryPointer`), not from the backend's own flag (VERIFICATION entry 7).
 #[test]
 #[ignore = "needs an X server and xdotool: OMNI_GFX_WINDOW_TESTS=1 DISPLAY=:92 cargo test -- --ignored"]
-fn a_hidden_cursor_is_hidden_over_the_window_only_while_it_has_the_focus() {
+fn a_hidden_cursor_is_hidden_over_the_window_focused_or_not() {
     require_gate();
     let peer = Peer::open();
     let mut window = focused_window("omnidroid: hidden cursor", 400, 300);
@@ -674,33 +704,75 @@ fn a_hidden_cursor_is_hidden_over_the_window_only_while_it_has_the_focus() {
     poll_until(&mut window, "back over the window", |e| *e == WindowEvent::PointerMoved { x: 200, y: 150 });
     assert!(peer.cursor_is_invisible(), "hidden again over it");
 
-    // Another client takes the focus, the pointer staying where it is: shown over the window.
+    // Another client takes the focus, the pointer staying where it is: still hidden over the
+    // window, whose moves are still reported.
     let _other = peer.take_focus();
     poll_until(&mut window, "the focus loss", |e| *e == WindowEvent::FocusChanged { focused: false });
     assert!(!window.has_focus());
-    assert!(!window.cursor_hidden(), "the request stands, the focus does not");
-    // MEASURED (Xvfb, the first run): read at once, the server's image was still the blank one;
-    // after the drain every other check of this file makes, it is not (3 runs of 3).
+    assert!(window.cursor_hidden(), "the request stands without the focus");
     let _ = drain_for(&mut window, Duration::from_millis(100));
-    assert!(!peer.cursor_is_invisible(), "the focus leaving shows the cursor over the window");
+    assert!(peer.cursor_is_invisible(), "the focus leaving does not show the cursor over the window");
+    xdo(&["mousemove", "--window", &id.to_string(), "210", "160"]);
+    poll_until(&mut window, "a move over the unfocused window", |e| *e == WindowEvent::PointerMoved { x: 210, y: 160 });
+    assert!(peer.cursor_is_invisible(), "and moving over it does not either");
+    xdo(&["mousemove", &outside.0, &outside.1]);
+    let _ = drain_for(&mut window, Duration::from_millis(100));
+    assert!(!peer.cursor_is_invisible(), "off the unfocused window: shown");
+    xdo(&["mousemove", "--window", &id.to_string(), "200", "150"]);
+    poll_until(&mut window, "back over the window", |e| *e == WindowEvent::PointerMoved { x: 200, y: 150 });
     xdo(&["windowfocus", "--sync", &id.to_string()]);
     poll_until(&mut window, "the focus back", |e| *e == WindowEvent::FocusChanged { focused: true });
     assert!(window.has_focus());
-    assert!(window.cursor_hidden());
-    assert!(peer.cursor_is_invisible(), "the focus coming back hides it again");
+    assert!(peer.cursor_is_invisible());
 
-    // A capture given back: still hidden where it was held, and that point reported.
+    // A capture whose held point is moved, then given back: still hidden, there, and that point
+    // reported -- where a consumer that drew its own pointer had it.
     assert!(window.set_pointer_capture(true).unwrap());
     let _ = drain_for(&mut window, Duration::from_millis(50));
+    window.warp_pointer(150, 120).unwrap();
     assert!(!window.set_pointer_capture(false).unwrap());
     let seen = drain_for(&mut window, Duration::from_millis(100));
-    assert!(seen.contains(&WindowEvent::PointerMoved { x: 200, y: 150 }), "the held point, reported: {seen:?}");
+    assert!(seen.contains(&WindowEvent::PointerMoved { x: 150, y: 120 }), "the moved point, reported: {seen:?}");
+    assert!(
+        !seen.iter().any(|e| matches!(e, WindowEvent::PointerMoved { x, y } if (*x, *y) != (150, 120))),
+        "and no other position on the way: {seen:?}"
+    );
+    assert_eq!(peer.pointer(), (left + 150, top + 120), "the pointer is where it was moved");
     assert!(peer.cursor_is_invisible(), "still hidden after the capture: the request stands");
 
     window.set_cursor_hidden(false).unwrap();
     assert!(!window.cursor_hidden());
     let _ = drain_for(&mut window, Duration::from_millis(50));
     assert!(!peer.cursor_is_invisible(), "withdrawn: shown");
+}
+
+/// **A button reported down is reported up when the server has it up** (the backend's point 7):
+/// a press this window heard that the pointer never made -- another client's `XSendEvent`, the
+/// shape of a release lost to someone else's grab -- is released by the next poll, which asks the
+/// server, and only once. The w33 right-drag that kept turning the camera is the reason.
+#[test]
+#[ignore = "needs an X server and xdotool: OMNI_GFX_WINDOW_TESTS=1 DISPLAY=:92 cargo test -- --ignored"]
+fn a_button_the_server_has_up_is_released() {
+    require_gate();
+    let peer = Peer::open();
+    let mut window = focused_window("omnidroid: lost release", 400, 300);
+    let id = xid(&window);
+    xdo(&["mousemove", "--window", &id.to_string(), "60", "70"]);
+    poll_until(&mut window, "the move", |e| *e == WindowEvent::PointerMoved { x: 60, y: 70 });
+    peer.send_button_press(id, 3, 60, 70);
+    let seen = poll_until(&mut window, "the release", |e| matches!(e, WindowEvent::PointerUp { .. }));
+    let buttons: Vec<&WindowEvent> =
+        seen.iter().filter(|e| matches!(e, WindowEvent::PointerDown { .. } | WindowEvent::PointerUp { .. })).collect();
+    assert_eq!(
+        buttons,
+        [
+            &WindowEvent::PointerDown { button: PointerButton::Secondary, x: 60, y: 70 },
+            &WindowEvent::PointerUp { button: PointerButton::Secondary, x: 60, y: 70 },
+        ],
+        "{seen:?}"
+    );
+    let later = drain_for(&mut window, Duration::from_millis(100));
+    assert!(!later.iter().any(|e| matches!(e, WindowEvent::PointerUp { .. })), "once: {later:?}");
 }
 
 /// **The close button is a request**: the window lists `WM_DELETE_WINDOW` in its `WM_PROTOCOLS`

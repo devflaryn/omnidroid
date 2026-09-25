@@ -201,6 +201,7 @@ define_class!(
                 self.removeTrackingArea(&old);
             }
             let options = NSTrackingAreaOptions::MouseMoved
+                | NSTrackingAreaOptions::MouseEnteredAndExited
                 | NSTrackingAreaOptions::ActiveAlways
                 | NSTrackingAreaOptions::InVisibleRect;
             // SAFETY: `self` owns the area and outlives it; no user info.
@@ -251,6 +252,16 @@ define_class!(
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             self.motion(event);
+        }
+
+        /// Leaving the view of a window that is not key gives the arrow back, where the cursor
+        /// rects that would otherwise do it are not applied.
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            let shared = &self.ivars().shared;
+            if shared.hide_requested() && !shared.key() {
+                NSCursor::arrowCursor().set();
+            }
         }
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
@@ -581,6 +592,8 @@ impl OmniView {
 
     fn button(&self, event: &NSEvent, button: PointerButton, down: bool) {
         let (x, y) = self.pixel_position(event);
+        self.ivars().shared.set_last_pointer(x, y);
+        self.ivars().shared.set_button(button, down);
         self.push(if down {
             WindowEvent::PointerDown { button, x, y }
         } else {
@@ -607,6 +620,14 @@ impl OmniView {
             return;
         }
         let (x, y) = self.pixel_position(event);
+        self.ivars().shared.set_last_pointer(x, y);
+        // Not key: cursor rects do not apply, so the invisible cursor is set from the move itself
+        // -- which the window server may or may not honour for an inactive application (see
+        // `super`'s "What this backend cannot do").
+        let shared = &self.ivars().shared;
+        if shared.hide_requested() && !shared.key() && self.pointer_inside() {
+            invisible_cursor().set();
+        }
         self.push(WindowEvent::PointerMoved { x, y });
     }
 
@@ -724,6 +745,27 @@ impl OmniView {
             }
         }
     }
+}
+
+/// See `super::Window::warp_pointer`: the client pixel `(x, y)`, clamped into the view, to global
+/// display coordinates, and `CGWarpMouseCursorPosition` there. It works with the cursor
+/// dissociated from the mouse (a capture), and produces no event.
+pub(super) fn warp_pointer(mtm: MainThreadMarker, id: u64, x: i32, y: i32) {
+    with(id, |native| {
+        let view = &native.view;
+        let scale = view.scale();
+        let bounds = view.bounds();
+        let px = (f64::from(x) / scale).clamp(0.0, (bounds.size.width - 1.0).max(0.0));
+        let py = (f64::from(y) / scale).clamp(0.0, (bounds.size.height - 1.0).max(0.0));
+        // The view is not flipped: its y runs up from the bottom.
+        let in_view = NSPoint::new(bounds.origin.x + px, bounds.origin.y + bounds.size.height - py);
+        let in_window = view.convertPoint_toView(in_view, None);
+        let on_screen = native.window.convertRectToScreen(NSRect::new(in_window, NSSize::new(0.0, 0.0))).origin;
+        let primary = NSScreen::screens(mtm).firstObject().map_or(0.0, |screen| screen.frame().size.height);
+        // SAFETY: plain CoreGraphics call.
+        unsafe { CGWarpMouseCursorPosition(NSPoint::new(on_screen.x, primary - on_screen.y)) };
+        view.ivars().shared.set_last_pointer(x, y);
+    });
 }
 
 /// See `super::Window::set_cursor_hidden`.

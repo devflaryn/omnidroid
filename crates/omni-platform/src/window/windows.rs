@@ -43,12 +43,20 @@
 //! **6. A hidden cursor is `WM_SETCURSOR`'s answer, not `ShowCursor`'s counter.** `ShowCursor` is
 //! a per-thread display count that outlives any window and has to be balanced exactly; a count
 //! left one short hides the cursor over every window of the desktop. `WM_SETCURSOR` is asked by
-//! the system, for this window only, every time the cursor moves over it: answering it with
-//! `SetCursor(NULL)` over the client area -- while [`Window::set_cursor_hidden`] asks and the
-//! window has the focus -- hides it exactly there and nowhere else, and the frame, the title bar
-//! and every other window keep their own cursors. The two focus messages and the request itself
-//! set the cursor at once when it is over the client area, because `WM_SETCURSOR` would otherwise
-//! wait for the next move: that is what makes `Alt+Tab` show it again without touching the mouse.
+//! the system, for the window under the cursor -- **active or not** -- every time the cursor moves
+//! over it: answering it with `SetCursor(NULL)` over the client area while
+//! [`Window::set_cursor_hidden`] asks hides it exactly there and nowhere else, and the frame, the
+//! title bar and every other window keep their own cursors, so moving off the window shows it.
+//! The request itself, and a capture's end, set the cursor at once when it is over the client
+//! area, because `WM_SETCURSOR` would otherwise wait for the next move.
+//!
+//! **7. A button reported down is reported up, however its release was lost.** The window takes
+//! the mouse capture on the first press (point 3), so a release outside the client area still
+//! comes here; but another window can take that capture (`WM_CAPTURECHANGED`, which a system menu
+//! or `WM_CANCELMODE` also causes), and then every button this window reported down is reported up
+//! at once. And while any button is down, [`Window::poll`] asks the host for the physical buttons
+//! (`GetAsyncKeyState`, through the swap setting `SM_SWAPBUTTON`) and reports up any that it
+//! finds up -- the safety net for a release no message brought.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -63,7 +71,10 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetFocus, ReleaseCapture, SetCapture, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    VK_XBUTTON1, VK_XBUTTON2,
+};
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, MOUSE_VIRTUAL_DESKTOP, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIDEV_REMOVE, RIM_TYPEMOUSE,
@@ -74,7 +85,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowRect, HTCLIENT, IDC_ARROW, LoadCursorW, MSG, MWMO_INPUTAVAILABLE,
     MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
-    RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SW_MINIMIZE,
+    RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WindowFromPoint, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
@@ -131,16 +142,49 @@ struct WindowState {
     /// Whether [`super::Window::set_cursor_hidden`] asks for the cursor to be hidden over the
     /// client area. See this module's point 6.
     hide_cursor: bool,
-    /// Whether this window has the keyboard focus, from `WM_SETFOCUS`/`WM_KILLFOCUS`: a hidden
-    /// cursor is hidden only while it does.
+    /// Whether this window has the keyboard focus, from `WM_SETFOCUS`/`WM_KILLFOCUS`.
     focused: bool,
+    /// The pointer's last client position a message carried: where a release this window
+    /// reports for a button whose own release was lost (point 7) is.
+    last_pointer: (i32, i32),
 }
 
 impl WindowState {
-    /// Whether the cursor is not drawn over the client area now: captured, or asked to be hidden
-    /// while the window has the focus.
+    /// Whether the cursor is not drawn over the client area now: captured, or asked to be hidden.
     fn cursor_invisible(&self) -> bool {
-        self.captured.is_some() || (self.hide_cursor && self.focused)
+        self.captured.is_some() || self.hide_cursor
+    }
+
+    /// Report every button held as released, at the last position, and forget them (point 7).
+    fn release_all_buttons(&mut self) {
+        let (x, y) = self.last_pointer;
+        for button in ALL_BUTTONS {
+            if self.buttons_down & (1 << button_bit(button)) != 0 {
+                push_event(&mut self.queue, WindowEvent::PointerUp { button, x, y });
+            }
+        }
+        self.buttons_down = 0;
+    }
+}
+
+/// Every button, in `button_bit` order.
+const ALL_BUTTONS: [PointerButton; 5] = [
+    PointerButton::Primary,
+    PointerButton::Secondary,
+    PointerButton::Middle,
+    PointerButton::Back,
+    PointerButton::Forward,
+];
+
+/// The virtual key `GetAsyncKeyState` answers a button by: the **physical** button, so the
+/// primary and secondary swap with the user's `SM_SWAPBUTTON` setting.
+const fn physical_key(button: PointerButton, swapped: bool) -> u16 {
+    match (button, swapped) {
+        (PointerButton::Primary, false) | (PointerButton::Secondary, true) => VK_LBUTTON,
+        (PointerButton::Secondary, false) | (PointerButton::Primary, true) => VK_RBUTTON,
+        (PointerButton::Middle, _) => VK_MBUTTON,
+        (PointerButton::Back, _) => VK_XBUTTON1,
+        (PointerButton::Forward, _) => VK_XBUTTON2,
     }
 }
 
@@ -545,10 +589,9 @@ unsafe extern "system" fn wnd_proc(
                 push_event(&mut state.queue, WindowEvent::PointerCaptureLost);
             }
             state.focused = msg == WM_SETFOCUS;
-            // A cursor hidden for the focus or the capture is shown the moment the focus goes, and
-            // a hidden one hidden again when it comes back, without waiting for a move (point 6):
-            // `Alt+Tab` never leaves it invisible.
-            if state.hide_cursor || capture_ended {
+            // A cursor the capture hid is shown the moment the focus goes, without waiting for a
+            // move (point 6) -- unless the pointer is over a client area asked to hide it.
+            if capture_ended {
                 refresh_cursor(hwnd, state);
             }
             push_event(&mut state.queue, WindowEvent::FocusChanged {
@@ -559,13 +602,14 @@ unsafe extern "system" fn wnd_proc(
             // Not while captured: the cursor is pinned, and what moves is `WM_INPUT`'s.
             if state.captured.is_none() {
                 let (x, y) = mouse_xy(lparam);
+                state.last_pointer = (x, y);
                 push_event(&mut state.queue, WindowEvent::PointerMoved { x, y });
             }
         }
         WM_SETCURSOR => {
-            // Hidden over the client area while captured, or while asked to be and focused (point
-            // 6); the class's arrow everywhere else, and over the client area otherwise, from
-            // `DefWindowProcW`.
+            // Hidden over the client area while captured, or while asked to be, focused or not
+            // (point 6); the class's arrow everywhere else, and over the client area otherwise,
+            // from `DefWindowProcW`.
             if state.cursor_invisible() && (lparam & 0xffff) as u32 == HTCLIENT {
                 // SAFETY: a null cursor hides it; no memory is read.
                 unsafe { SetCursor(core::ptr::null_mut()) };
@@ -601,6 +645,7 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
             let button = button_of(msg, wparam);
             let (x, y) = mouse_xy(lparam);
+            state.last_pointer = (x, y);
             if state.buttons_down == 0 {
                 // SAFETY: capturing to a window this thread owns; released below.
                 unsafe { SetCapture(hwnd) };
@@ -611,6 +656,7 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
             let button = button_of(msg, wparam);
             let (x, y) = mouse_xy(lparam);
+            state.last_pointer = (x, y);
             state.buttons_down &= !(1 << button_bit(button));
             if state.buttons_down == 0 {
                 // SAFETY: no arguments; a no-op when this thread holds no capture.
@@ -619,10 +665,13 @@ unsafe extern "system" fn wnd_proc(
             push_event(&mut state.queue, WindowEvent::PointerUp { button, x, y });
         }
         WM_CAPTURECHANGED => {
-            // Something else took the capture — a system drag, a menu, another window. The mask
-            // is now a lie, and a lie that never clears: every later button-up would find bits
-            // still set and never release. Reset it rather than tracking who has what.
-            state.buttons_down = 0;
+            // Something else took the capture — a system drag, a menu, another window. The
+            // releases will go there, so every button reported down is reported up here, now
+            // (point 7); the mask would otherwise be a lie that never clears. This window's own
+            // `ReleaseCapture` after the last release finds the mask empty and reports nothing.
+            if lparam as HWND != hwnd {
+                state.release_all_buttons();
+            }
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             push_event(&mut state.queue, WindowEvent::KeyDown {
@@ -749,6 +798,7 @@ impl Window {
             hide_cursor: false,
             // `WM_SETFOCUS` says when it arrives: a window is created without the focus.
             focused: false,
+            last_pointer: (0, 0),
         }));
 
         // `super::validate` has already bounded both axes to 1..=65535, so neither cast can
@@ -903,6 +953,27 @@ impl Window {
         if let (Some(at), true) = (state.captured, unsafe { GetFocus() } == self.hwnd) {
             let _ = clip_to(at);
         }
+        // A button reported down that the host says is up is released (point 7). The queue was
+        // drained first, so a release this window was sent is already in it.
+        if state.buttons_down != 0 {
+            // SAFETY: by-value index constant.
+            let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+            let (x, y) = state.last_pointer;
+            for button in ALL_BUTTONS {
+                let bit = 1 << button_bit(button);
+                // SAFETY: a virtual-key code. The high bit is "down now".
+                let down = unsafe { GetAsyncKeyState(i32::from(physical_key(button, swapped))) } as u16 & 0x8000 != 0;
+                if state.buttons_down & bit != 0 && !down {
+                    state.buttons_down &= !bit;
+                    push_event(&mut state.queue, WindowEvent::PointerUp { button, x, y });
+                }
+            }
+            if state.buttons_down == 0 {
+                // SAFETY: no arguments; a no-op when this thread holds no capture. Sends
+                // `WM_CAPTURECHANGED` naming no window, which finds the mask empty.
+                unsafe { ReleaseCapture() };
+            }
+        }
         sink.append(&mut state.queue);
     }
 
@@ -993,11 +1064,39 @@ impl Window {
         Ok(())
     }
 
-    /// Hidden by the request, now: asked for, and focused.
+    /// The request (point 6: not scoped to the focus).
     pub(super) fn cursor_hidden(&self) -> bool {
         // SAFETY: live for as long as `self`; a read.
-        let state = unsafe { &*self.state };
-        state.hide_cursor && state.focused
+        unsafe { (*self.state).hide_cursor }
+    }
+
+    /// See [`super::Window::warp_pointer`]. While captured the held pixel moves with it: the clip
+    /// is moved first, because `SetCursorPos` is confined by it.
+    pub(super) fn warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()> {
+        // SAFETY: as in `set_pointer_capture`.
+        let state = unsafe { &mut *self.state };
+        let mut client = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: writes a `RECT`; the handle is live.
+        if unsafe { GetClientRect(self.hwnd, &raw mut client) } == 0 || client.right <= 0 || client.bottom <= 0 {
+            // Minimised: there is nowhere in it to put the cursor.
+            return Ok(());
+        }
+        let (x, y) = (x.clamp(0, client.right - 1), y.clamp(0, client.bottom - 1));
+        let mut at = POINT { x, y };
+        // SAFETY: a live window handle and a `POINT` written in place.
+        unsafe { ClientToScreen(self.hwnd, &raw mut at) };
+        if state.captured.is_some() {
+            clip_to(at).map_err(|code| WindowError::LastError { operation: "warp_pointer", api: "ClipCursor", code })?;
+            state.captured = Some(at);
+        }
+        // SAFETY: by-value coordinates.
+        if unsafe { SetCursorPos(at.x, at.y) } == 0 {
+            // SAFETY: no arguments, and `SetCursorPos` is the last call this thread made.
+            let code = unsafe { GetLastError() };
+            return Err(WindowError::LastError { operation: "warp_pointer", api: "SetCursorPos", code });
+        }
+        state.last_pointer = (x, y);
+        Ok(())
     }
 
     /// From `WM_SETFOCUS`/`WM_KILLFOCUS`.
@@ -1378,11 +1477,12 @@ mod tests {
         );
     }
 
-    /// **A hidden cursor is hidden over the client area, and only while the window has the
-    /// focus** (point 6): asked for over the focused window it is gone at once, without a move,
-    /// and `WM_SETCURSOR` keeps it gone over the client area but not over the frame; the focus
-    /// leaving shows it at once and coming back hides it again; a capture given back leaves it
-    /// hidden and reports where it was held; and withdrawing the request shows it.
+    /// **A hidden cursor is hidden over the client area, focused or not** (point 6): asked for it
+    /// is gone at once, without a move, and `WM_SETCURSOR` keeps it gone over the client area but
+    /// not over the frame; **the focus leaving does not show it** -- the owner's w33: a Roblox
+    /// cursor following the pointer over an inactive window beside the host's -- and neither does
+    /// its coming back; a capture given back after the held point was moved (`warp_pointer`) leaves
+    /// it hidden, there, and reports that point; and withdrawing the request shows it.
     ///
     /// `GetCursor` is the cursor this thread last set, which is the one shown while the pointer is
     /// over this thread's window -- the instrument reads what the window procedure did, not the
@@ -1390,7 +1490,7 @@ mod tests {
     /// a moment, which is why it is gated.
     #[test]
     #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
-    fn a_hidden_cursor_is_hidden_over_the_client_area_only_while_focused() {
+    fn a_hidden_cursor_is_hidden_over_the_client_area_focused_or_not() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetCursor, HTCAPTION, SendMessageW, SetForegroundWindow, WM_MOUSEMOVE,
@@ -1489,27 +1589,39 @@ mod tests {
         // SAFETY: a live window handle; the focus messages carry a window handle, null here.
         unsafe { SendMessageW(hwnd, WM_KILLFOCUS, 0, 0) };
         assert!(!window.has_focus());
-        assert!(!window.cursor_hidden(), "the request stands, the focus does not");
-        assert!(visible(), "the focus leaving shows it at once");
+        assert!(window.cursor_hidden(), "the request stands without the focus");
+        assert!(!visible(), "the focus leaving does not show it over the client area");
         set_cursor(HTCLIENT);
-        assert!(visible(), "and WM_SETCURSOR leaves it shown while unfocused");
+        assert!(!visible(), "and WM_SETCURSOR keeps it hidden over an inactive window");
+        set_cursor(HTCAPTION);
+        assert!(visible(), "but not over its title bar");
         // SAFETY: as above.
         unsafe { SendMessageW(hwnd, WM_SETFOCUS, 0, 0) };
         assert!(window.has_focus());
-        assert!(window.cursor_hidden());
-        assert!(!visible(), "the focus coming back hides it again");
+        set_cursor(HTCLIENT);
+        assert!(!visible());
 
-        // A capture given back leaves it hidden where it was held, and says where that is.
+        // A capture whose held point is moved and then given back: hidden throughout, the cursor
+        // where it was moved to, and that point reported.
         assert!(window.set_pointer_capture(true).unwrap());
         drained.clear();
         window.poll(&mut drained);
+        let moved = (cx - 20, cy + 10);
+        window.warp_pointer(moved.0, moved.1).unwrap();
+        assert!(!visible(), "hidden while held and moved");
         assert!(!window.set_pointer_capture(false).unwrap());
-        clip_to(centre).expect("pin the cursor again: the release lifted the clip");
         assert!(!visible(), "still hidden after the capture: the request stands");
+        let mut at = POINT { x: 0, y: 0 };
+        // SAFETY: writes a `POINT`.
+        unsafe { GetCursorPos(&raw mut at) };
+        assert_eq!((at.x - origin.x, at.y - origin.y), moved, "the cursor is where it was moved to");
+        // SAFETY: by-value coordinates.
+        unsafe { SetCursorPos(centre.x, centre.y) };
+        clip_to(centre).expect("pin the cursor again: the release lifted the clip");
         drained.clear();
         window.poll(&mut drained);
         assert!(
-            drained.contains(&WindowEvent::PointerMoved { x: cx, y: cy }),
+            drained.contains(&WindowEvent::PointerMoved { x: moved.0, y: moved.1 }),
             "the release reports the point it held: {drained:?}"
         );
 
@@ -1518,6 +1630,75 @@ mod tests {
         assert!(visible(), "withdrawn: shown at once");
         set_cursor(HTCLIENT);
         assert!(visible());
+    }
+
+    /// **A button reported down is reported up however its release is lost** (point 7): a press
+    /// the physical mouse never made -- posted, so the host's own button state says up -- is
+    /// released by the next poll, which asks it; and a press whose mouse capture another window
+    /// takes (`WM_CAPTURECHANGED`, as a system menu or `WM_CANCELMODE` causes) is released at once,
+    /// once. The w33 right-drag that kept turning the camera is the reason.
+    ///
+    /// Assumes nobody holds a mouse button during the test. Gated: it creates a real window.
+    #[test]
+    #[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+    fn a_button_whose_release_is_lost_is_released() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        assert!(
+            std::env::var("OMNI_GFX_WINDOW_TESTS").is_ok_and(|v| v == "1"),
+            "run with --ignored but OMNI_GFX_WINDOW_TESTS is not 1; this creates a real window"
+        );
+        let mut window = Window::create(&WindowDesc::new("omnidroid: lost release", 320, 240)).unwrap();
+        let mut drained = Vec::new();
+        window.poll(&mut drained);
+        let at = |x: i32, y: i32| ((y << 16) | (x & 0xffff)) as LPARAM;
+
+        // Pressed, never released: the host says the right button is up.
+        // SAFETY: a live window handle; the message carries a key mask and a position.
+        unsafe { SendMessageW(window.hwnd, WM_RBUTTONDOWN, 0x0002, at(40, 30)) };
+        drained.clear();
+        window.poll(&mut drained);
+        assert_eq!(
+            drained,
+            [
+                WindowEvent::PointerDown { button: PointerButton::Secondary, x: 40, y: 30 },
+                WindowEvent::PointerUp { button: PointerButton::Secondary, x: 40, y: 30 },
+            ],
+            "the poll released a button the host says is up"
+        );
+        drained.clear();
+        window.poll(&mut drained);
+        assert!(drained.is_empty(), "and only once: {drained:?}");
+
+        // Pressed, then the capture taken away before any poll: released by that, once.
+        // SAFETY: as above; `WM_CAPTURECHANGED` names the window taking it, none here.
+        unsafe {
+            SendMessageW(window.hwnd, WM_LBUTTONDOWN, 0x0001, at(10, 20));
+            SendMessageW(window.hwnd, WM_CAPTURECHANGED, 0, 0);
+        }
+        // SAFETY: live for as long as `window`; a read, with the window procedure not running.
+        assert_eq!(unsafe { (*window.state).buttons_down }, 0, "released by the capture's loss itself, before any poll");
+        drained.clear();
+        window.poll(&mut drained);
+        assert_eq!(
+            drained,
+            [
+                WindowEvent::PointerDown { button: PointerButton::Primary, x: 10, y: 20 },
+                WindowEvent::PointerUp { button: PointerButton::Primary, x: 10, y: 20 },
+            ],
+            "the capture's loss released it, and the poll found nothing more to release"
+        );
+    }
+
+    /// The physical key of each button, through the swap setting.
+    #[test]
+    fn a_buttons_physical_key_follows_the_swap_setting() {
+        assert_eq!(physical_key(PointerButton::Primary, false), VK_LBUTTON);
+        assert_eq!(physical_key(PointerButton::Secondary, false), VK_RBUTTON);
+        assert_eq!(physical_key(PointerButton::Primary, true), VK_RBUTTON);
+        assert_eq!(physical_key(PointerButton::Secondary, true), VK_LBUTTON);
+        assert_eq!(physical_key(PointerButton::Middle, true), VK_MBUTTON);
+        assert_eq!(physical_key(PointerButton::Back, false), VK_XBUTTON1);
+        assert_eq!(physical_key(PointerButton::Forward, false), VK_XBUTTON2);
     }
 
     /// Feed `units` through one window's worth of `WM_CHAR` state, keeping every answer — the

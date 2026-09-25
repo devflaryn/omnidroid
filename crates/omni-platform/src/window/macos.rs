@@ -29,16 +29,22 @@
 //!
 //! * **Captured motion is accelerated.** AppKit's mouse deltas come after the system's pointer
 //!   ballistics; the seam asks for the device's counts. See `appkit::OmniView::motion`.
-//! * **The hidden cursor is a cursor rect, so it is AppKit's to apply.** `set_cursor_hidden` puts
-//!   an invisible `NSCursor` over the view with `-[NSView addCursorRect:cursor:]`, as winit's
-//!   invisible cursor does; AppKit applies a window's cursor rects only while it is the key window,
-//!   which is the focus scoping the seam promises, and the arrow is set back when the window
-//!   resigns key. `+[NSCursor hide]` was not used: it is one counter for the whole application and
-//!   hides the cursor over the title bar and every other window of it too.
+//! * **The hidden cursor is a cursor rect, so it is AppKit's to apply -- and only for the key
+//!   window.** `set_cursor_hidden` puts an invisible `NSCursor` over the view with
+//!   `-[NSView addCursorRect:cursor:]`, as winit's invisible cursor does. The seam asks for it over
+//!   an inactive window too (the pointer's moves over it are reported, and the game draws its own
+//!   cursor there), and AppKit has no public way to give it: cursor rects are applied only in the
+//!   key window, and the window server gives the cursor to the frontmost application. What is
+//!   done is the one thing public API allows -- the view sets the invisible cursor from the moves
+//!   its always-active tracking area still delivers while the window is not key, and the arrow
+//!   when the pointer leaves -- and whether the window server honours a background application's
+//!   `-[NSCursor set]` is **not known here** (untested: no Mac). The alternative is the private
+//!   `CGSSetConnectionProperty(..., "SetsCursorInBackground", true)`, which this backend does not
+//!   use. `+[NSCursor hide]` was not used either: one counter for the whole application.
 //! * **A window created while the main thread is unavailable is refused**, with
 //!   [`WindowError::MainThreadUnavailable`] naming why; see [`main_thread`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -69,7 +75,46 @@ pub(super) struct Shared {
     /// Whether the window is the key window: the focus, as `windowDidBecomeKey:` and
     /// `windowDidResignKey:` report it. Written on the AppKit thread; read from both.
     key: AtomicBool,
+    /// The seam's buttons reported down and not yet up, by [`button_bit`]: what [`Window::poll`]
+    /// asks the host about ("A button reported down is reported up" in `super`).
+    buttons_down: AtomicU32,
+    /// The pointer's last reported position, `x` in the high half and `y` in the low: where a
+    /// release `poll` reports for a lost one is.
+    last_pointer: AtomicU64,
 }
+
+/// The bit a seam button is tracked by in [`Shared::buttons_down`].
+pub(super) const fn button_bit(button: super::PointerButton) -> u32 {
+    match button {
+        super::PointerButton::Primary => 1,
+        super::PointerButton::Secondary => 2,
+        super::PointerButton::Middle => 4,
+        super::PointerButton::Back => 8,
+        super::PointerButton::Forward => 16,
+    }
+}
+
+/// The `CGMouseButton` a seam button is: left 0, right 1, centre 2, and the others by number, as
+/// `-[NSEvent buttonNumber]` numbers them (`appkit::other_button`).
+const fn cg_button(button: super::PointerButton) -> u32 {
+    match button {
+        super::PointerButton::Primary => 0,
+        super::PointerButton::Secondary => 1,
+        super::PointerButton::Middle => 2,
+        super::PointerButton::Back => 3,
+        super::PointerButton::Forward => 4,
+    }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    /// `CGEventSourceButtonState(3)`: whether a mouse button is down now, for a state table.
+    /// Callable from any thread.
+    fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+}
+
+/// `kCGEventSourceStateCombinedSessionState`: every source in the login session.
+const COMBINED_SESSION_STATE: i32 = 0;
 
 impl Shared {
     fn new() -> Shared {
@@ -79,6 +124,8 @@ impl Shared {
             captured: AtomicBool::new(false),
             hide_cursor: AtomicBool::new(false),
             key: AtomicBool::new(false),
+            buttons_down: AtomicU32::new(0),
+            last_pointer: AtomicU64::new(0),
         }
     }
 
@@ -115,6 +162,25 @@ impl Shared {
     fn set_key(&self, key: bool) {
         self.key.store(key, Ordering::Release);
     }
+
+    /// Record a position a pointer event carried.
+    fn set_last_pointer(&self, x: i32, y: i32) {
+        self.last_pointer.store((u64::from(x as u32) << 32) | u64::from(y as u32), Ordering::Release);
+    }
+
+    fn last_pointer(&self) -> (i32, i32) {
+        let packed = self.last_pointer.load(Ordering::Acquire);
+        ((packed >> 32) as u32 as i32, packed as u32 as i32)
+    }
+
+    /// Record a button going down or up, as reported.
+    fn set_button(&self, button: super::PointerButton, down: bool) {
+        if down {
+            self.buttons_down.fetch_or(button_bit(button), Ordering::AcqRel);
+        } else {
+            self.buttons_down.fetch_and(!button_bit(button), Ordering::AcqRel);
+        }
+    }
 }
 
 /// A window on the AppKit thread, as the thread that made it sees it.
@@ -145,7 +211,32 @@ impl Window {
     }
 
     /// Everything queued since the last poll. No thread is crossed: the AppKit thread queued it.
+    ///
+    /// **A button reported down that the host has up is released first**: while any is down, the
+    /// session's button state (`CGEventSourceButtonState`, callable from any thread) is asked, and
+    /// a release no event brought is queued behind whatever is queued already.
     pub(super) fn poll(&mut self, sink: &mut Vec<WindowEvent>) {
+        let down = self.shared.buttons_down.load(Ordering::Acquire);
+        if down != 0 {
+            for button in [
+                super::PointerButton::Primary,
+                super::PointerButton::Secondary,
+                super::PointerButton::Middle,
+                super::PointerButton::Back,
+                super::PointerButton::Forward,
+            ] {
+                // SAFETY: plain CoreGraphics call with by-value arguments.
+                let held = unsafe { CGEventSourceButtonState(COMBINED_SESSION_STATE, cg_button(button)) };
+                if down & button_bit(button) != 0 && !held {
+                    let before = self.shared.buttons_down.fetch_and(!button_bit(button), Ordering::AcqRel);
+                    // Only if no real release got there first.
+                    if before & button_bit(button) != 0 {
+                        let (x, y) = self.shared.last_pointer();
+                        self.shared.push(WindowEvent::PointerUp { button, x, y });
+                    }
+                }
+            }
+        }
         let mut events = self.shared.events.lock().unwrap_or_else(PoisonError::into_inner);
         sink.append(&mut events);
     }
@@ -204,6 +295,12 @@ impl Window {
     /// The key window, as the delegate last heard.
     pub(super) fn has_focus(&self) -> bool {
         self.shared.key()
+    }
+
+    pub(super) fn warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()> {
+        let id = self.id;
+        on_main(move |mtm| appkit::warp_pointer(mtm, id, x, y));
+        Ok(())
     }
 
     /// Block on the queue's condition until it is non-empty or `timeout` passes.
