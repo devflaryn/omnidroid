@@ -6,7 +6,9 @@
 //! meant to idle cheaply (the owner's many-instance case) cannot ask the engine for fewer frames.
 //! This asks for them from underneath: `vkQueuePresentKHR` and `eglSwapBuffers` wait, before the
 //! frame is handed to the host, until at least `1/fps` has passed since the previous present's
-//! turn. The render thread waiting is what a device with a slower display does to the engine: its
+//! turn. A **minimised** instance presents nothing -- its per-frame surface-capabilities query is
+//! answered `VK_ERROR_SURFACE_LOST_KHR` and the engine skips the frame's drawing
+//! (`Vulkan::set_surface_withheld`) -- so that answer is where its frame takes its turn instead. The render thread waiting is what a device with a slower display does to the engine: its
 //! frame loop runs at the rate presents complete, and the per-frame work -- render, the frame's
 //! Lua, the jobs that wait for it -- runs that often.
 //!

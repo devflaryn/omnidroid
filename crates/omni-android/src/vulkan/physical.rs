@@ -727,6 +727,10 @@ pub(super) fn surface_capabilities(
     // The embedding's window has no pixels (or asked for one rebuild): Android's answer for a
     // surface without a window, and the driver is not asked. See `Vulkan::set_surface_withheld`.
     if vulkan.take_surface_withheld() {
+        // `OMNI_FPS_CAP` (`crate::pacing`): a minimised instance's frame presents nothing, so this
+        // query -- asked once a frame -- is where it takes its turn instead. Without it a
+        // minimised instance would tick at the engine's own 60 while a visible one kept the cap.
+        crate::pacing::pace_present();
         c.ret().i32(VK_ERROR_SURFACE_LOST_KHR);
         return Ok(());
     }

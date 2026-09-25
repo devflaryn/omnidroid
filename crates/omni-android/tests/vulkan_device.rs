@@ -944,6 +944,48 @@ fn a_withheld_surface_answers_surface_lost_and_the_drivers_answer_comes_back() {
     );
 }
 
+/// **A minimised instance keeps `OMNI_FPS_CAP` too** (`omni_android::pacing`): its frames present
+/// nothing, so the per-frame capabilities query it is answered `VK_ERROR_SURFACE_LOST_KHR` on is
+/// where each takes its turn -- six at 25 fps take at least five periods -- while a query the
+/// driver answers (a visible window, which is paced at its present) is never paced.
+#[test]
+fn a_withheld_surface_query_takes_the_frames_turn_under_an_fps_cap() {
+    let _serial = serialized();
+    let f = fixture("withheld-paced", Some(StageThreeHost::new()));
+    f.ndk.set_window_source(a_source_with_a_handle() as Arc<dyn WindowSource>);
+    let entry_point = f.entry_point();
+    let instance = f.an_instance(entry_point);
+    let create = f.resolve(entry_point, instance, "vkCreateAndroidSurfaceKHR");
+    let capabilities = f.resolve(entry_point, instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    let info = f.android_surface_info(f.a_native_window());
+    let out = f.alloc(8);
+    assert_eq!(f.call(create, [instance, info, 0, out]).expect("surface") as i32, VK_SUCCESS);
+    let surface = f.guest.read_u64(out as GuestAddr);
+    let device = f.physical_devices(entry_point, instance)[0];
+    let at = f.alloc(SURFACE_CAPABILITIES_BYTES);
+    let ask = || f.call(capabilities, [device, surface, at, 0]).expect("the call completes") as i32;
+
+    omni_android::pacing::set_cap(Some(25.0));
+    let (before, _) = omni_android::pacing::paced();
+    for _ in 0..4 {
+        assert_eq!(ask(), VK_SUCCESS, "a visible window's query is the driver's");
+    }
+    let (visible, _) = omni_android::pacing::paced();
+    f.vulkan().set_surface_withheld(true);
+    let started = std::time::Instant::now();
+    for _ in 0..6 {
+        assert_eq!(ask(), VK_ERROR_SURFACE_LOST_KHR);
+    }
+    let minimised = started.elapsed();
+    let (after, _) = omni_android::pacing::paced();
+    f.vulkan().set_surface_withheld(false);
+    omni_android::pacing::set_cap(None);
+
+    assert_eq!(visible, before, "a query the driver answers is not paced");
+    assert_eq!(after - visible, 6, "every withheld query took its turn");
+    assert!(minimised >= std::time::Duration::from_millis(200), "six at 25 fps took {minimised:?}");
+}
+
 /// **`vkGetInstanceProcAddr("vkCreateAndroidSurfaceKHR")` answers a thunk the driver said it did
 /// not have — and says so in the log.**
 ///
