@@ -222,6 +222,26 @@ and the test that caught it:
 | A12 | `glGetStringi` not remapped past it | `get_proc_address...` |
 | B4 | a Win32 window given the X11 row | omni-gfx unit `a_win32_window_is_refused_naming_angle` |
 
+**2026-09-25, the mapping pool** (`--only lnx-gles`, Xvfb :94 llvmpipe, the committed tree): 22
+patterns, 3/3 commands pass unmutated, **21/22 caught** on the first run -- the miss was A6's own
+replacement not compiling (`Ok(())` with no error type to infer); corrected to
+`Ok::<(), crate::error::AbiError>(())` and rerun alone: caught (3 tests). So **22/22**; `git diff
+--exit-code crates tools` clean after. A6/A7/B2 were re-anchored on `copy_back`/`fills_shadow`/
+`uploads_at_unmap`; the new rows:
+
+| row | mutation | caught by |
+|---|---|---|
+| B5 | an invalidating write map filled from the buffer anyway | `a_mapping_copies_exactly_what_its_access_bits_say` (the reused shadow's stale bytes) |
+| B6 | a flush uploads the whole mapping | the mapping round trip, `a_mapping_copies...` (the hole between two flushes) |
+| A13 | an idle shadow never reused | `a_mapping_copies...`, the benchmark |
+| A14 | glUnmapBuffer does not give the shadow back | `a_mapping_copies...`, the benchmark |
+| A15 | a replaced record's shadow lost (glDeleteBuffers on a mapped buffer) | `a_mapping_copies...` |
+| A16 | an idle shadow the guest unmapped handed out again | `a_mapping_copies...` |
+
+The OS-free half (which bytes each access bit copies, best fit, the ownership check, oldest-first
+eviction, the bound, the capacity rounding) is `tools/mutate.py`'s `glmap-` rows: **10/10 caught**
+by the lib's `gles::` unit tests (Windows).
+
 The whole Linux table's 138 patterns were checked to match exactly once on this tree (no row
 staled by the shared edits); only the lnx-gles rows were run.
 

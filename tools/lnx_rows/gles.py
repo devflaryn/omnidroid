@@ -97,7 +97,7 @@ ROWS = [
      GL_RS,
      """        copy_back(c, &mapping, 0, mapping.length)
     } else {""",
-     """        Ok(())
+     """        Ok::<(), crate::error::AbiError>(())
     } else {""",
      LIVE),
     # The shadow filled only for GL_MAP_READ_BIT: a write mapping without an invalidate bit then
