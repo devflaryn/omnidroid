@@ -84,6 +84,15 @@ longer spins -- it burned 90% of a core, `e09039f`; the guest a 4 GiB device, `2
 and `sysinfo` reused for 500 ms -- the workers spent 40-50% in the kernel serving the engine's
 memory monitor) **4.0 fps** (0.8-6.2), join -> loaded 53 s, gate passed, clean close. What is left
 there: translation on the workers (`dyn` 32-36%) on a 4-core i5 at ~1.8 cores.
+**l8** (`b4918a9`: GLES buffer mappings keep and reuse their guest shadow -- a 4 KiB map/unmap in
+an engine-sized address space went from ~1 ms to ~3 us, and the engine does ~150 a frame,
+`f44b5f2`) **8.0 fps median, max 15.4**, join -> loaded 43 s; the render thread now waits on the
+GPU (`glClientWaitSync` 26%, `eglSwapBuffers` 21% -- Fermi at nouveau's boot clocks).
+**l9, 30 minutes** (`b4918a9`, lowest graphics level): no guest thread lost, clean close
+(`IASPJSPJSPB`: the window lost and regained focus twice during the run), gate passed, memory
+flat at 3.8-4.0 GiB private / 2.8-3.1 GiB resident, ~1.9 of 4 cores; median 3.4 fps (0-14.2) --
+the frame rate on this host varies with the scene and is GPU-bound. `7728cf1` fixed the Linux link
+(`__atomic_compare_exchange_16`) that `d7b1350` had broken.
 
 **The bottleneck list, ranked by measured cost** (Windows in-world profile w4, `OMNI_PERF=5`,
 `OMNI_PERF_DUMP`, symbolized with a debug-info build; shares are of the samples outside translated
