@@ -665,8 +665,11 @@ const WROTE: &[(usize, Written)] = &[
     // the thread that first touches `0x067d_67c0` starts a worker thread while doing so
     // (`pthread_create` at `0x285332c`, start routine `0x284d168`), which touches another one
     // (`0x0682_4fd0`) as it starts. Which of the two gets index 5 and which 6 is the race between
-    // those two threads, on a device as here. MEASURED (Linux, the whole binary, shared cache):
-    // 6 in 5 of 30 runs, every time as an exact swap of those two indices, 17 assigned in all.
+    // those two threads, on a device as here. MEASURED (the whole binary, Linux): 6 in 8 of 55
+    // runs with the shared translation cache and 3 of 30 with per-thread caches (Windows, the gate
+    // alone: 1 of 143 shared). Each of the 9 that were dumped is an exact swap of those two
+    // indices with 17 assigned, as in the 156 other Linux instances dumped; a trace of the mutex
+    // named the worker as the thread that took index 5, in each of the 3 failing runs traced.
     (0x067d_c338, Written::Constant(0x0010_0008)),
     (0x067d_c3b8, Written::Constant(0x0010_0010)),
 ];
@@ -845,8 +848,11 @@ fn assert_written(guest: &Guest) {
     }
 }
 
-/// Two placements of a four-word writable range, as `snapshot_writable` returns them.
-fn placed_words(base: GuestAddr, words: [u64; 4]) -> (Vec<(GuestAddr, Vec<u8>)>, Vec<(GuestAddr, Vec<u8>)>) {
+/// What `Guest::snapshot_writable` returns.
+type Snapshot = Vec<(GuestAddr, Vec<u8>)>;
+
+/// A four-word writable range before and after a run, as `snapshot_writable` returns it.
+fn placed_words(base: GuestAddr, words: [u64; 4]) -> (Snapshot, Snapshot) {
     let start = base + 0x0680_0000;
     let before = vec![(start, vec![0u8; 32])];
     let after = vec![(start, words.iter().flat_map(|w| w.to_le_bytes()).collect())];
