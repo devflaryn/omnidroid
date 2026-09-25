@@ -47,6 +47,7 @@
 
 pub mod classes;
 pub mod cookies;
+pub mod cursor;
 pub mod env;
 pub mod input;
 pub mod keys;

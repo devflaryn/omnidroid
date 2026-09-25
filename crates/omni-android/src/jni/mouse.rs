@@ -104,6 +104,16 @@
 //! * **The capture itself is the window's** ([`omni_platform::window::Window::set_pointer_capture`]):
 //!   [`MouseInput::deliver`] says when the listener asked for or gave back the capture, and the
 //!   embedding reports what the window did with [`MouseInput::set_pointer_capture`].
+//! * **A pointer the host holds without Android's capture moves invisibly.** When the engine holds
+//!   its cursor still with no capture -- `MouseBehavior.LockCurrentPosition`, the right-drag camera
+//!   (see [`super::cursor`]) -- the host holds its own cursor too, and what the window then reports
+//!   is raw motion. On a device the pointer, hidden over the game's view, would go on moving; so
+//!   here the motion moves the position this device reports ([`MouseInput::set_host_hold`]), and
+//!   `vk.e.y` computes its `dx`/`dy` from it exactly as from a moving pointer. Unlike a device's,
+//!   that position is **not clamped** to the screen: a pointer stopped at the display's edge stops
+//!   the camera on a device, and the host holding its cursor is what the owner asked for so that it
+//!   does not. Buttons and the wheel are at that position. When the hold ends, the window reports
+//!   where its cursor really is and the position goes back there.
 //!
 //! Not modelled, each for a stated reason: a touchpad as a touchpad (the host reports it as a
 //! mouse); `HOVER_ENTER`/`HOVER_EXIT`, which `y` answers `false` to without a call (their only
@@ -259,6 +269,9 @@ pub struct MouseDevice {
     buttons: i32,
     /// Where the pointer last was, in the view's pixels. `None` until the host first says.
     at: Option<(i32, i32)>,
+    /// Whether the host holds its cursor with no capture on the view: raw motion then moves `at`.
+    /// See this module's "What this embedding decides".
+    held: bool,
 }
 
 impl MouseDevice {
@@ -266,6 +279,9 @@ impl MouseDevice {
     /// not. Most window events are none.
     pub fn translate(&mut self, event: &WindowEvent, captured: bool) -> Vec<MouseEvent> {
         let mut out = Vec::new();
+        // Held by the host without the view's capture: the host's positions are where its cursor
+        // is held, not where the pointer is, so a press, a release and the wheel are at `at`.
+        let follows_host = !captured && !self.held;
         match *event {
             WindowEvent::PointerMoved { x, y } if !captured => self.move_to(x, y, &mut out),
             WindowEvent::PointerDown { button, x, y } => {
@@ -275,7 +291,7 @@ impl MouseDevice {
                     // second press of one button is not one a mouse can make.
                     return out;
                 }
-                if !captured {
+                if follows_host {
                     self.move_to(x, y, &mut out);
                 }
                 self.press(bit, captured, &mut out);
@@ -285,7 +301,7 @@ impl MouseDevice {
                 if self.buttons & bit == 0 {
                     return out;
                 }
-                if !captured {
+                if follows_host {
                     self.move_to(x, y, &mut out);
                 }
                 self.release(bit, captured, &mut out);
@@ -294,7 +310,9 @@ impl MouseDevice {
                 let route = if captured {
                     Route::Captured
                 } else {
-                    self.move_to(x, y, &mut out);
+                    if follows_host {
+                        self.move_to(x, y, &mut out);
+                    }
                     Route::Generic
                 };
                 let at = if captured { (0.0, 0.0) } else { self.position() };
@@ -309,6 +327,12 @@ impl MouseDevice {
                 let mut moved = MouseEvent::new(Route::Captured, MouseAction::Move, motion, self.buttons);
                 moved.relative = motion;
                 out.push(moved);
+            }
+            WindowEvent::PointerMotion { dx, dy } if self.held => {
+                // The pointer a device would go on moving under a hidden cursor: an ordinary move,
+                // `MOVE` with a button held or `HOVER_MOVE` without, to where the motion takes it.
+                let (x, y) = self.at.unwrap_or((0, 0));
+                self.move_to(x.saturating_add(dx), y.saturating_add(dy), &mut out);
             }
             WindowEvent::FocusChanged { focused: false } => {
                 // This embedding's decision (see the module documentation): every held button is
@@ -328,6 +352,18 @@ impl MouseDevice {
     #[must_use]
     pub fn buttons(&self) -> i32 {
         self.buttons
+    }
+
+    /// Say whether the host holds its cursor without the view's capture: see this module's "What
+    /// this embedding decides".
+    pub fn set_held(&mut self, held: bool) {
+        self.held = held;
+    }
+
+    /// Whether the host holds its cursor without the view's capture.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.held
     }
 
     fn position(&self) -> (f32, f32) {
@@ -657,6 +693,19 @@ pub struct MouseInput {
     /// One `jclass` for [`INPUT_CLASS`], for `TouchInput`'s reason.
     class: u64,
     counts: MouseCounts,
+    /// The engine's lock state: found at the first delivery.
+    lock: LockProbe,
+}
+
+/// Where [`MouseInput`] stands on finding the engine's lock state.
+#[derive(Debug)]
+enum LockProbe {
+    /// Not looked for yet: the first delivery does.
+    Unlocated,
+    Located(super::cursor::EngineLock),
+    /// Looked for, and why it was not found. Not an input failure: the host cursor then follows
+    /// only `vk.e`'s capture.
+    Failed(String),
 }
 
 impl MouseInput {
@@ -694,6 +743,7 @@ impl MouseInput {
             targets,
             class,
             counts: MouseCounts::default(),
+            lock: LockProbe::Unlocated,
         })
     }
 
@@ -707,6 +757,71 @@ impl MouseInput {
     #[must_use]
     pub fn has_pointer_capture(&self) -> bool {
         self.captured
+    }
+
+    /// Say whether the host holds its cursor **without** the view's capture -- the engine holding
+    /// its own cursor still with no capture, `LockCurrentPosition` -- so that the window's raw
+    /// motion moves the pointer this device reports. See this module's "What this embedding
+    /// decides".
+    pub fn set_host_hold(&mut self, held: bool) {
+        self.device.set_held(held);
+    }
+
+    /// Whether the host holds its cursor without the view's capture, as last said.
+    #[must_use]
+    pub fn host_hold(&self) -> bool {
+        self.device.held()
+    }
+
+    /// **The engine's own lock state, read now** -- see [`super::cursor::EngineLock`]. `None`
+    /// until the first delivery has located it, when it could not be located, or when the engine
+    /// has no main window to lock yet.
+    #[must_use]
+    pub fn engine_lock(&self, jni: &Jni) -> Option<super::cursor::LockState> {
+        match &self.lock {
+            LockProbe::Located(lock) => lock.read(jni.mem()),
+            _ => None,
+        }
+    }
+
+    /// Where the engine's lock state was found, or why it was not: for the report.
+    #[must_use]
+    pub fn lock_location(&self) -> Result<Option<String>, String> {
+        match &self.lock {
+            LockProbe::Unlocated => Ok(None),
+            LockProbe::Located(lock) => Ok(Some(lock.to_string())),
+            LockProbe::Failed(why) => Err(why.clone()),
+        }
+    }
+
+    /// Find the engine's lock state, once: decoded from `nativeGetMainWindowIsMouseLockedCenter`'s
+    /// own code, with the one call its first instruction makes. See [`super::cursor`].
+    fn locate_lock(&mut self, jni: &Jni, boundary: &Arc<Boundary>, cpu: &mut dyn GuestCpu) {
+        if !matches!(self.lock, LockProbe::Unlocated) {
+            return;
+        }
+        let mem = jni.mem();
+        let words_at = |at: GuestAddr, count: usize| -> Option<Vec<u32>> {
+            let blame = crate::mem::Blame::new(MOUSE_LOCKED_CENTER_SYMBOL, at, 0);
+            let bytes = mem.read_bytes(at, 4 * count, blame).ok()?;
+            Some(bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().expect("four bytes"))).collect())
+        };
+        let located = super::cursor::LockLocation::decode(&words_at, self.targets[3]).and_then(|location| {
+            let answer = boundary
+                .call_guest(
+                    cpu,
+                    "the input singleton's getter (nativeGetMainWindowIsMouseLockedCenter's first call)",
+                    location.getter,
+                    &[],
+                    PER_EVENT,
+                )
+                .map_err(|error| format!("calling the getter at {:#x}: {error}", location.getter))?;
+            Ok(location.at(answer.x0 as GuestAddr))
+        });
+        self.lock = match located {
+            Ok(lock) => LockProbe::Located(lock),
+            Err(why) => LockProbe::Failed(why),
+        };
     }
 
     /// Deliver one host window event: through [`MouseDevice`], then each resulting event through
@@ -731,7 +846,9 @@ impl MouseInput {
     ) -> AbiResult<MouseDelivery> {
         if matches!(event, WindowEvent::PointerCaptureLost) {
             self.captured = false;
+            self.device.set_held(false);
         }
+        self.locate_lock(jni, boundary, cpu);
         let env = jni.env_for(thread);
         let class = self.class;
         let [move_at, button_at, wheel_at, locked_at] = self.targets;
@@ -1050,6 +1167,33 @@ mod tests {
         ]);
         let heard = rig.feed(up(PointerButton::Primary, 500, 500));
         assert_eq!(heard.calls, [MouseCall::Button { x: 10.0, y: 20.0, down: false, button: 0 }]);
+    }
+
+    /// **Held by the host without the capture** (`LockCurrentPosition`, the right-drag camera): the
+    /// raw motion moves the pointer this device reports -- with the button held, `onTouch`'s
+    /// `MOVE`, whose `dx`/`dy` turn the camera -- past the view's edge, unclamped; no capture is
+    /// asked for, the engine not being locked at the centre; a release is at that position, not at
+    /// the host's held one; and the host's report of where its cursor is, when the hold ends, puts
+    /// the pointer back there.
+    #[test]
+    fn a_hold_without_the_capture_moves_the_reported_pointer_by_the_raw_motion() {
+        let mut rig = Rig::new();
+        rig.feed(moved(300, 150));
+        rig.feed(down(PointerButton::Secondary, 300, 150));
+        rig.device.set_held(true);
+        let heard = rig.feed(WindowEvent::PointerMotion { dx: -600, dy: 30 });
+        assert_eq!(heard.calls, [MouseCall::Move { x: -200.0, y: 120.0, dx: -400.0, dy: 20.0 }]);
+        assert_eq!(heard.capture, None);
+        let heard = rig.feed(up(PointerButton::Secondary, 300, 150));
+        assert_eq!(heard.calls[0], MouseCall::Button { x: -200.0, y: 120.0, down: false, button: 1 });
+        // Without a button, the same motion is a hover.
+        let heard = rig.feed(WindowEvent::PointerMotion { dx: 3, dy: 0 });
+        assert_eq!(heard.calls, [MouseCall::Move { x: -198.0, y: 120.0, dx: 2.0, dy: 0.0 }]);
+        rig.device.set_held(false);
+        let heard = rig.feed(moved(300, 150));
+        assert_eq!(heard.calls, [MouseCall::Move { x: 200.0, y: 100.0, dx: 398.0, dy: -20.0 }]);
+        // Not held: raw motion is nothing (the window reports it only while it holds the cursor).
+        assert!(rig.feed(WindowEvent::PointerMotion { dx: 5, dy: 5 }).calls.is_empty());
     }
 
     /// **Losing the focus releases every held button**, where the pointer is; losing it with none
