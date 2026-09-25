@@ -73,6 +73,21 @@ same build with `OMNI_JIT_EXCLUSIVE_MONITOR=global`: join -> loaded 35 s, settle
 27 / 26 s, GUILoader 814-820 ms, 2.7 GiB; m4 was the first in-world run to pass the whole gate.
 **m6, the same at the game's lowest graphics level** (`SavedQualityLevel` 1, set in the game's own
 `GlobalBasicSettings_13.xml` as its menu sets it): **43.2 fps** (40.6-45.6), 3.5 cores.
+**The Mac is now `berat@192.168.0.37`, on macOS 27.0** (updated 2026-09-25). **m7** (`82f7f8f`): a
+TaskScheduler worker died at +5 s on a MemoryFault reading `0x5555555555555551` (link `0x51f3704`)
+and the run hung; storage kept as `HezMi_ImYu916.hung-m7-0925`. **m8** (fresh storage, first
+launch): **50 fps**, join -> loaded 19 s, 2.8 GiB, gate passed. **m9, 30 minutes** (`82f7f8f`):
+~46 fps until +185 s, then **froze**: right after an Escape press the engine's DataModel write-lock
+tracker asserted (`RBXCRASH: InvalidAccess` at `onWriteUnlock`'s check, `0x24b6928`, from the
+TaskScheduler job runner `0x22cf768`: count 1, owner a different fiber), `raise(SIGTRAP)` was
+refused, the thread died holding the real write lock, and every later taker parked (0 presents
+for 25 min, 0.3 cores). Decode in item 11 below; Escape alone does not reproduce it (w19 pressed
+it 5 times, m6 4). **m10, 30 minutes** (`562b80d`, the death line now names `lr` and the frame
+walk): **median 55.8 fps** (22-60.8, +300..+1900 s, n = 321), 2.9 GiB private flat, 2.8 cores,
+join -> loaded 20 s, clean close -- **but two threads lost at +490 s** to a transient DNS failure:
+the host resolver answered `EAI_NONAME` for `clientsettingscdn.roblox.com`, the unix seam cannot
+classify an `EAI_*` (std drops the code), refused, and the `pthread_join`ing thread died with it;
+the engine itself retried and carried on (item 12).
 
 Linux l1 (`53391a1`, GLES on the Quadro's NVC0 -- the engine refuses lavapipe as emulated): join ->
 loaded 110 s, settled **~1 fps** (4-6 presents per 5 s), 2.3 of 4 cores busy but only ~100 M guest
@@ -117,6 +132,8 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 8 | memory: 4.4-4.8 GiB private in the world at default graphics (Windows); Linux swapped at 4.6 GiB on a 7 GB host | | **in part**: the device's RAM follows the host (`23f00e8`, D36: Linux a 4 GiB device, 3.76 GiB private); `OMNI_GUEST_CPUS=8` -0.7 GiB (w9, a switch) |
 | 9 | **a ~60 fps limiter**: no 5 s window above ~59 fps even with `FramerateCap` 240 | w14-w16 | being decoded (the display rate a device on this path never sends -> the engine's frame-time table starts at 60 Hz) |
 | 10 | **intermittent "-1 pointer" heap corruption** (OpenSSL `impls`, w1; a `shared_ptr` control block, w13) -- 2 in ~16 runs, one froze the world | | being hunted; `printf` unbound (a thread died on it in w13) |
+| 11 | **macOS: the DataModel write-lock tracker's "lock theft" assert** (m9; m7's early worker death is the same thread kind) -- the lock owner is a fiber identity read through emutls (`0x3105578` -> `0x286c08c`); the engine's atomics run on LL/SC (the gate declines `HWCAP_ATOMICS`) and fibers park on `syscall(98)` | froze m9 at +185 s | suspects, ranked: the arm64 exclusive monitor; the sync primitives' plain stores (the ERRORCHECK/RECURSIVE unlock and `pthread_once`'s DONE publish with a plain byte copy -- no release ordering, harmless on x86, a race on the arm64 host; **audit and fix in progress**); a stale TLS/futex answer. A/B planned: patch 0021 vs `OMNI_JIT_EXCLUSIVE_MONITOR=global` |
+| 12 | **unix `getaddrinfo` cannot classify a resolver failure** (std's unix path drops `EAI_*`) -- a DNS blip kills the resolving thread and its joiner | m10: 2 threads at +490 s | **fix in progress**: `libc::getaddrinfo` in a unix backend, as `net::resolver`'s header said |
 
 **Deaths still open:** Windows `open(O_TRUNC)` on `memProfStorage<pid>.json` under a live mapping
 (error 1224, a worker at +5 s; logical EOF in progress); raw syscall 63 (`read`) from the engine's
