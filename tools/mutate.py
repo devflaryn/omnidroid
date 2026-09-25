@@ -259,8 +259,9 @@ ANDROID = [
 ANDROID_LIB = ["cargo", "test", "-p", "omni-android", "--lib", "--no-fail-fast"]
 
 # The looper's idle wait (`looperidle-*`): `tests/ndk.rs` filtered to its `looper_idle_*` tests.
-# **Release**, because two of them bound a wait's length and an event's latency in wall time, and
-# a debug build's guest spin is slow enough to eat into the margins. No APK.
+# **Release**, because four of them depend on polls landing within 50 us of each other and are
+# `ignore`d in debug builds -- where, in the broad `ANDROID` command and under load, they failed on
+# rows they cannot see (`IDLE_TIMING` in `tests/ndk.rs`). No APK.
 LOOPER_IDLE = ["cargo", "test", "-p", "omni-android", "--release", "--test", "ndk", "--no-fail-fast",
                "looper_idle"]
 

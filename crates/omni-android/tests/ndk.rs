@@ -838,6 +838,24 @@ fn a_poll_once_with_a_timeout_waits_for_a_writer() {
 // (the streak length, the gap, the reset), and on time only where time is the property: a wait
 // is at least its bound, and an event ends it at once.
 
+/// How many times a count-exact idle test measures before it gives up.
+///
+/// # `IDLE_TIMING`: why four of these tests retry, and why they are release-only
+///
+/// A spin is polls within `LOOPER_IDLE_GAP` (50 µs) of each other, so anything that holds the
+/// host thread longer between two polls -- a preemption, a page fault, another process's build --
+/// ends the streak, **as it is meant to**. MEASURED: alone, 2 release runs in 33 counted fewer
+/// waits than exact (5 and 9 of 10); in a mutation run -- the `ANDROID` command, a **debug**
+/// build, with other builds on the machine -- they failed on rows whose mutations they cannot see
+/// (`looper-A3`, `-A4`, `-A12`), while the same debug build alone passed 6 runs of 6. A flake that
+/// inflates a catch list is `VERIFICATION.md` entry 6.
+///
+/// So: a hiccup can only **lower** a wait count, never raise it, and each test fails at once on
+/// an over-count and passes only on an attempt that counts exactly -- a defect that shifts the
+/// count fails every attempt. And the four are ignored in debug builds, which the broad `ANDROID`
+/// mutation command runs; `LOOPER_IDLE` runs them in release, the build the gate ships.
+const IDLE_ATTEMPTS: usize = 20;
+
 /// `TBZ Wt, #bit, offset` (offset in instructions).
 const fn tbz(rt: u32, bit: u32, offset_insns: i32) -> u32 {
     0x3600_0000 | ((bit & 0x1f) << 19) | (((offset_insns as u32) & 0x3FFF) << 5) | rt
@@ -961,6 +979,7 @@ fn looper_idle_off_a_spin_never_waits() {
 /// counts more than expected fails at once, and the test passes only on an attempt that counts
 /// exactly; a defect that shifts the count fails every attempt.
 #[test]
+#[cfg_attr(debug_assertions, ignore = "wall-clock: run in release (tools/mutate.py LOOPER_IDLE); see IDLE_TIMING")]
 fn looper_idle_on_a_spin_waits_from_the_streak_on_and_each_wait_is_the_bound() {
     let _guard = serialized();
     let f = fixture("idle-on");
@@ -973,7 +992,7 @@ fn looper_idle_on_a_spin_waits_from_the_streak_on_and_each_wait_is_the_bound() {
     let streak = u64::from(LOOPER_IDLE_STREAK);
     let waits = 10;
     let mut seen = Vec::new();
-    for _attempt in 0..5 {
+    for _attempt in 0..IDLE_ATTEMPTS {
         std::thread::sleep(LOOPER_IDLE_GAP * 20);
         let before = f.ndk.looper_idle_waits();
         let (answer, left, _) = f.run_timed(|asm| f.emit_warm_spin(asm, spin, streak - 1));
@@ -1044,6 +1063,7 @@ fn looper_idle_polls_further_apart_than_the_gap_never_wait() {
 /// second spin on its first run takes longer than the gap, and would end the streak whether or
 /// not the event did -- which would make this test pass with the reset removed.
 #[test]
+#[cfg_attr(debug_assertions, ignore = "wall-clock: run in release (tools/mutate.py LOOPER_IDLE); see IDLE_TIMING")]
 fn looper_idle_an_event_ends_the_streak() {
     let _guard = serialized();
     let f = fixture("idle-reset");
@@ -1075,7 +1095,7 @@ fn looper_idle_an_event_ends_the_streak() {
     // the first spin's streak early and so *lower* the count, never raise it.
     let streak = u64::from(LOOPER_IDLE_STREAK);
     let mut seen = Vec::new();
-    for _attempt in 0..5 {
+    for _attempt in 0..IDLE_ATTEMPTS {
         let before = f.ndk.looper_idle_waits();
         let (answer, left, _) = f.run_timed(|asm| {
             asm.mov(24, 2);
@@ -1114,6 +1134,7 @@ fn looper_idle_an_event_ends_the_streak() {
 /// before this one. A wait that answered POLL_TIMEOUT when woken (leaving the event to the next
 /// poll) would be one poll later, and a wait that slept through the gate would be late.
 #[test]
+#[cfg_attr(debug_assertions, ignore = "wall-clock: run in release (tools/mutate.py LOOPER_IDLE); see IDLE_TIMING")]
 fn looper_idle_an_event_during_the_wait_is_reported_by_that_poll_at_once() {
     let _guard = serialized();
     let f = fixture("idle-event");
@@ -1128,7 +1149,7 @@ fn looper_idle_an_event_during_the_wait_is_reported_by_that_poll_at_once() {
     // is one poll off on every attempt.
     let polls = u64::from(LOOPER_IDLE_STREAK) + 1_000;
     let mut seen = Vec::new();
-    for _attempt in 0..4 {
+    for _attempt in 0..IDLE_ATTEMPTS {
         let before = f.ndk.looper_idle_waits();
         let ndk = Arc::clone(&f.ndk);
         let bionic = Arc::clone(&f.bionic);
@@ -1197,6 +1218,7 @@ fn looper_idle_a_stopping_runtime_spins_without_waiting() {
 /// bounded or indefinite wait is refused there; this one was a poll and must answer like one --
 /// and the polls after it must not wait at all.
 #[test]
+#[cfg_attr(debug_assertions, ignore = "wall-clock: run in release (tools/mutate.py LOOPER_IDLE); see IDLE_TIMING")]
 fn looper_idle_a_stop_during_the_wait_is_still_poll_timeout() {
     let _guard = serialized();
     let f = fixture("idle-stop-during");
@@ -1218,7 +1240,9 @@ fn looper_idle_a_stop_during_the_wait_is_still_poll_timeout() {
         assert_eq!(fs.write(other_write, b"S").expect("a byte into the unwatched pipe"), 1);
     });
 
-    let polls = u64::from(LOOPER_IDLE_STREAK) + 20;
+    // Long, so that a host hiccup restarting the streak cannot end the spin before its first
+    // wait; once stopping, the rest of it answers at once.
+    let polls = u64::from(LOOPER_IDLE_STREAK) + 5_000;
     let (answer, left, _) = f.run_timed(|asm| f.emit_warm_spin(asm, spin, polls));
     stopper.join().expect("the stopping thread");
     assert_eq!((answer as i32, left), (ALOOPER_POLL_TIMEOUT, 0), "every poll answered as a poll");
