@@ -13,7 +13,8 @@ upstream rather than about us; that figure has **not** been re-measured with
 (`-DDYNARMIC_FRONTENDS=A64`, Release, MSVC 2022, `dynarmic_tests.exe` with no
 filter): **All tests passed (201,698 assertions in 84 test cases)** with 0001
 alone (built from a clean checkout of `83cfa6e`) **and the identical figure with
-0001 + 0017, with 0001 + 0017 + 0018, and with 0001-0020** (2026-09-25). The older 202,200/123 was a build that also had the A32 frontend;
+0001 + 0017, with 0001 + 0017 + 0018, with 0001-0020** (2026-09-25) **and with 0001-0022**
+(2026-09-25; the suite runs the per-thread path, which 0022 leaves as it was). The older 202,200/123 was a build that also had the A32 frontend;
 it is not comparable and was not re-run.
 
 **On the arm64 backend** (Apple M1, same configuration, AppleClang, Ninja, with
@@ -692,9 +693,10 @@ code equals the template's (the constructor throws otherwise; the shim returns n
 **MEASURED** (Windows, release, `omni-cpu/tests/roblox.rs::the_cost_of_eight_threads_meeting_the_same_real_roblox_code`
 and `dynarmic-sys/tests/shared_cache.rs`; D38 has the tables): eight threads each running the 870
 real Roblox leaves cold translate them once between them instead of eight times (fetched guest
-instructions 50,904 -> 6,363), commit +53 -> +1.6..5.5 MiB, and a warm call costs the same; when
-all eight meet every new block at the same moment on an otherwise idle 24-thread host the
-serialized emission makes the cold pass slower in wall time (see D38).
+instructions 50,904 -> 6,363), commit +54 -> +1.8..5.6 MiB, and a warm call costs the same. On the
+4-core Linux host the cold pass is also faster (63 -> 43 ms, half the CPU); on the idle 24-thread
+Windows host, where each thread had a core to translate its own copy on, the serialized emission
+makes it slower (22 -> 31 ms). Per guest thread 4.548 -> 0.055 MiB.
 
 **Detectors** (`tests/shared_cache.rs`, 15 tests and one measurement; the whole `dynarmic-sys` suite also runs with
 `OD_TEST_SHARED_CACHE=1`, every `Vm` on a cache of its own). Hand mutations of the vendored C++,

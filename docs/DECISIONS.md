@@ -4415,3 +4415,154 @@ private, join 26 s (w7); told 8 -> 49.2 fps, 3.92 GiB, join 23 s (w9). macOS (8)
 its own pool for it. Cost if wrong: a host with more than 8 cores leaves parallelism unused if some
 workload needed more than 8 workers -- none measured did (the workers idle 55-80% in the world).
 
+
+## D38 -- One translation cache per guest address space: vendored patch 0022, behind `OMNI_JIT_SHARED_CACHE=1`, off by default
+
+**Decided 2026-09-25 (Windows session, Linux measured over ssh; the Mac was unreachable).** A change
+to the vendored dynarmic tree (D5) and to how omni-cpu builds a guest thread. Design, written before
+the code and corrected where the build taught otherwise: `docs/research/shared-jit-cache.md`. Patch
+and detectors: `crates/dynarmic-sys/patches/README.md` under 0022.
+
+### Why
+
+Every guest thread's `A64::Jit` owned its code cache, so engine code was translated once per thread
+that ran it. MEASURED in PS99 (HANDOFF, w17-w21, l6): input stalls of several seconds at 2-20 fps
+while translation jumped from 5-20k to 150-310k guest instructions a second (new code spread over
+the 8 TaskScheduler workers, each translating it again); translation 53% of dynarmic's own samples
+in the settled world; ~0.4-0.5 GiB of translated code per instance, copies of the same code; on the
+4-core Linux host translation (`dyn`) 32-36% of the busy workers.
+
+### What
+
+`A64::SharedCodeCache` owns one prelude, constant pool and code buffer and one block map; a `Jit`
+built on it keeps only its `JitState`, its 64 KiB fast-dispatch table and its pending
+invalidations. Everything emitted code baked in per jit -- the callbacks' `this`, the dispatcher's
+argument, `&conf`, the monitor slots, the TPIDR boxes, the fast-dispatch table -- is read from
+`JitState`; links go through 8-byte slots so shared code is never rewritten; translation runs
+outside one lock and emission inside it; invalidation applies to every jit, each emptying its RSB
+and table by its next run or dispatcher entry; memory is regions retired and given back by epochs,
+a thread parked in a callback holding only the pages around its return site. omni-cpu turns it on
+with `OMNI_JIT_SHARED_CACHE=1` (1 GiB of address space, eight regions, committed as code is
+emitted; `OMNI_JIT_SHARED_CACHE_MB` sizes it); what `read_code` plants (thunks, sentinel) becomes a
+property of the space; breakpoints are refused; omni-android stops queueing invalidations for every
+other context when the backend says `shared_translation`.
+
+**Shared**: the prelude, the constant pool, every translated block, the block map and guest-range
+index, the link slots, the fastmem fault table, the exception-handler registration.
+**Per thread**: registers and `JitState`, the return-stack buffer, the fast-dispatch table, the
+exclusive-monitor slot, the callbacks (and so every host call's `ctx`), the cycle budget, the halt
+word, the pending invalidations, the epoch.
+
+**x64 only.** The arm64 backend keeps a cache per thread: the Mac was not reachable to build, run or
+measure anything, and its address space (0010-0016's records, trampolines carrying `this`/`&conf`
+as literals, `BL` into a per-jit prelude) is a separate design, not a port of this diff. The shim
+refuses a shared cache on arm64 and omni-cpu says so and falls back.
+
+### Evidence
+
+* **Suites**, both modes (`OD_TEST_SHARED_CACHE=1` puts every dynarmic-sys `Vm` on a cache of its
+  own; `OMNI_JIT_SHARED_CACHE=1` every omni-cpu/omni-android backend), release:
+
+  | | Windows, per thread | Windows, shared | Linux, per thread | Linux, shared |
+  |---|---|---|---|---|
+  | dynarmic-sys (stoppability matrix, hostile, exclusive, host_fault, shared_cache ...) | 108 | 108 | 164 | 164 |
+  | omni-cpu (real Roblox code included) | 139 | 139 | 141 | 141 |
+  | omni-android lib, bionic, hostile, roundtrip, thread_memory, initializers (3,594), jni_startup, libroblox, syscall, census, ndk, perf, input | 797 | 797 | 795 (+2) | 795 (+2) |
+
+  0 failed on Windows. On Linux the same two bionic tests fail both ways and at the base commit
+  too (a separate worktree of `82f7f8f`): `setpriority_applies_the_nice_value_to_the_calling_host_thread`
+  (`EACCES` on this host, every run) and `proc_self_statm_is_this_process_in_pages_and_the_engines_sscanf_reads_it`
+  (MEASURED flaky: base 1 pass 1 fail, this branch 1 pass 1 fail, run alternately -- a 1 ms
+  "slow reading" threshold decides whether the second read is served from the cache). Under the switch the breakpoint tests assert the refusal instead, and the
+  cross-thread invalidation test asserts the shared path (applied once, nothing queued).
+* **dynarmic's own suite** (A64, Release, MSVC) with 0001-0022: 201,698 assertions in 84 test
+  cases pass (it runs the per-thread path).
+* **New detectors**, `dynarmic-sys/tests/shared_cache.rs`: 15 tests (listed in the patch README).
+* **Hand mutations of the vendored C++** (`crates/dynarmic-sys/tools/mutate_0022.py`, each rebuilt,
+  run, restored, SHA-1 checked): **13/13 caught** -- RSB/table not emptied on a generation change
+  (S1); TPIDR from the template's box (S2); an invalidated target's slots not unlinked (S3); an
+  overtaken translation published (S4); an in-flight location translated again (S5); no holes for a
+  parked thread (S6); retirement not halting other threads (S7); attach accepting any configuration
+  (S8); `Run` not catching up at entry (S9); the fast-dispatch handler probing the wrong table
+  (S10); the monitor scan skipping the template's slot (S11); the fast-dispatch miss writing the
+  location before the lookup (S12); lookups always taking the lock (S13).
+* **Found on the way, fixed**, each with its detector: the fast-dispatch miss ordering (S12: 1 run
+  in 5, per process, every call of a thread ran another function's code); a reader-preferring
+  `pthread_rwlock` starving writers on glibc; the Linux asymmetric barrier compiled out
+  (`#if defined` on an enumerator); link records growing by one slot per translation of every block
+  linking to a target (emission 9 -> 42 us per block in the stress test).
+
+### Measurements (release, medians, n stated; Windows = the 24-thread workstation, Linux = the 4-core i5)
+
+**Eight threads meeting the same real Roblox code** (`omni-cpu/tests/roblox.rs::the_cost_of_eight_threads_meeting_the_same_real_roblox_code`:
+the 870 leaves the scan grades runnable, each thread calling all of them cold, then warm; n = 5 per
+row, alternating; "same" = all eight in one order, "spread" = thread i starts i/8 along):
+
+| | fetched for translation | cold, slowest thread | warm | commit |
+|---|---|---|---|---|
+| Windows, same, per thread | 50,904 | 21.9-22.0 ms | 0.15-0.16 ms | +53.9-54.0 MiB |
+| Windows, same, shared | **6,363** | 31.1-31.9 ms | 0.17-0.25 ms | **+1.8-2.2 MiB** |
+| Windows, spread, per thread | 50,883 | 19.8 ms | 0.20-0.21 ms | +53.5-54.1 MiB |
+| Windows, spread, shared | **6,366** | 25.6-25.8 ms | 0.17-0.20 ms | **+5.2-5.6 MiB** |
+| Linux, same, per thread | 50,904 | 62.7-63.9 ms | 0.28-0.34 ms | (see below) |
+| Linux, same, shared | **6,363** | **42.6-44.0 ms** | 0.21-0.36 ms | |
+| Linux, spread, per thread | 50,883 | 61.7-61.9 ms | 0.52-0.57 ms | |
+| Linux, spread, shared | **6,366** | **56.1-59.0 ms** | 0.20-0.21 ms | |
+
+Linux also measures the threads' CPU time finely (Windows' counter ticks at 15.6 ms): same order
+199-201 -> **99-104 ms**, spread 201-202 -> **68-69 ms**. (Its "commit" is the kernel's commit
+accounting, charged when a mapping is made: 64.2 MiB for eight 8 MiB caches against 0.1 MiB once
+the shared cache's reservation exists, i.e. it counts reservations, not touched pages -- the
+Windows column is the one that measures memory.)
+
+The translation work is divided by the eight threads (the `fetched` column is exact: every
+instruction fetched is fetched for a translation). Where cores are scarce (Linux) that is also the
+wall time; where eight idle cores each translate their own copy in parallel (Windows), the cold
+pass is slower shared, because emission -- two thirds of translation, MEASURED 15.3-16.6 ms of
+emission against 7.9-9.6 ms of frontend and IR passes for these blocks -- is serialized.
+
+**Per guest thread** (`roblox.rs::the_per_thread_cpu_cost_is_measured_and_under_its_ceiling`, n = 8
+threads, Windows commit charge): 4.548 MiB -> **0.055 MiB**, the shared cache committing 4.0 MiB
+once (prelude and constant pool included).
+
+**Costs on one thread** (`omni-cpu/tests/bench.rs`, Windows, ns, median of 5, the runtime's
+`0xFFFF`; one run of each, taken alternately): a direct-branch loop (block links through slots) 3,981
+vs 3,842 M insn/s; `BL`+`RET` at 128 / 2,048 / 32,768 / 131,072 / 262,144 blocks 2.66 / 10.8 /
+23.1 / 38.6 / 37.7 per thread against 2.32 / 9.19 / 29.6 / 37.9 / 42.1 shared; a `BR` through a
+table of 16 / 256 / 4,096 targets (served by the fast-dispatch table) 11.1 / 11.6 / 20.9 against
+10.7 / 12.4 / 27.0; of 16,384 / 65,536 targets (dispatcher lookups) 42.3 / 49.8 against 70.6 /
+99.2, and a `BLR`+`RET` 45.7 / 44.8 against 61.7 / 79.5 -- the lookup's shared lock and epoch
+check. A run's entry and exit, eight threads at once (`shared_cache.rs::the_cost_of_a_run_on_eight_threads`):
+36-50 ns per thread, 51-62 shared.
+
+### Recommendation, and what decides it
+
+**Not on by default yet.** The benches say the trade is right where cores are scarce (Linux: the
+cold pass 63 -> 43 ms and half the CPU) and costs wall time where every thread has an idle core to
+translate on (Windows: 22 -> 31 ms, with an eighth of the work); the in-world question -- does the
+input stall shorten, and does the settled frame rate hold -- is the controller's to measure (this
+task's rule: never run the live app). The A/B: PS99, the same drag script as w20, `OMNI_PERF=5`,
+with and without `OMNI_JIT_SHARED_CACHE=1`, on Windows and on the Linux host; compare translated
+instructions per second and fps in the drag windows, settled fps, private bytes. **Turn it on (x64)
+if** the stall windows are shorter or higher-fps and settled fps is within noise; on Linux first if
+only there. **What would reverse it**: a wrong result under the switch that the per-thread cache
+does not show (the suites above are the reference), or a settled-fps loss traced to dispatcher
+lookups (the one steady-state cost measured above).
+
+### Known limits
+
+* Serialized emission: a burst of new code on a many-core idle host completes later than per-thread
+  caches that each translate it in parallel (Windows, above), though with an eighth of the work.
+* A dispatcher lookup that misses the thread's fast-dispatch table takes a shared lock and costs
+  +15-50 ns at large indirect working sets.
+* Breakpoints are refused under the switch; planted addresses are per space (a context reaching an
+  address another planted stops with `UnsupportedInstruction` naming `SVC #0xFFFF`).
+* Recompile-on-fastmem-failure is off under the switch (a declined fault takes the fault path every
+  time, as its first occurrence always did).
+* A translation dropped by another thread's invalidation can still be reached through this thread's
+  RSB or fast-dispatch table until its next run or dispatcher entry -- never later than the
+  per-thread cache's own window (the other thread's queue drained at its next run segment).
+* If every region is held by threads running code that entered before its retirement, the
+  translating thread waits for one (each leaves within its budget slice).
+* arm64: per-thread caches, as above.
+* D12's exception stands: the shared cache is W+X, as each per-thread cache was.

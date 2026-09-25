@@ -117,9 +117,14 @@ aligned 8-byte store to the slot, which every x64 and arm64 core performs atomic
 that loads the slot gets either the old or the new target -- both valid code. The RSB push loads its
 code pointer the same way (`mov rcx, [rip + slot]`, unlinked value `ReturnFromRunCode`, as upstream).
 
-Slots are allocated from the top of the current region, growing down, so they are data pages apart
-from code (no self-modifying-code machine clears on the cores executing nearby), and they are
-retired with the region.
+*As designed*, slots were allocated from the top of the current region, growing down, apart from
+the code. **As built** they are 8 aligned bytes right after the block that reads them: MEASURED,
+slots a region away cost an extra cache and TLB miss per linked transition once the working set is
+large (section 11), and a store to a slot next to code is a self-modifying-code event for a core
+that has the line only at link and unlink time, which are rare. A dropped block's own slots are
+unlinked and taken out of their targets' records (without that, a target's record grew by one
+slot per translation of every block linking to it, and relinking it walked them all: MEASURED in
+the stress test, emission slowed from ~9 to ~42 us per block).
 
 Cost: one load-and-indirect-jump per linked transition instead of a direct `jg`. Predicted well by
 the branch target buffer; measured in section 9.
@@ -129,11 +134,28 @@ the branch target buffer; measured in section 9.
 One `std::shared_mutex` per cache.
 
 * **Lookup** (the dispatcher's `LookupBlock`, taken on a fast-dispatch miss, an unlinked slot, and
-  at `Run` entry): shared lock, probe the block map.
-* **Miss**: exclusive lock, probe again (another thread may just have emitted it), translate, emit,
-  register, link waiting slots, unlock. Translation reads guest code through the *translating*
-  thread's `MemoryReadCode` -- the same bytes in one address space; the omni-cpu side (section 7)
-  makes what it plants there a property of the space, not of the thread.
+  at `Run` entry): first the running thread's **own fast-dispatch table**, without any lock, then the
+  block map under the lock, shared, and the answer goes into the thread's table. MEASURED: without
+  the first step every run entry and dispatcher return of eight threads took the lock, and a warm
+  call on the real Roblox leaves cost 0.56 us instead of 0.20.
+* **Miss**: the frontend and the IR passes run **outside** the lock, with the location marked in
+  flight; a thread that needs a location another is translating waits for it (spinning with yields,
+  then on a condition), so a burst of new code reaching eight threads is translated once, not
+  eight times. Emission takes the lock exclusively: probe again, and if an invalidation applied
+  meanwhile touches the block's guest range (a serial number and the last 64 ranges are kept),
+  translate again under the lock; emit, register, link waiting slots, unlock. Translation reads
+  guest code through the *translating* thread's `MemoryReadCode` -- the same bytes in one address
+  space; the omni-cpu side (section 7) makes what it plants there a property of the space, not of
+  the thread.
+* **Found while measuring, and fixed**: the emitted fast-dispatch handler, on a miss, writes the
+  location into the table entry *before* it calls the lookup, and fills in the code pointer after.
+  Once the lookup consults that table, it can find its own location paired with the code pointer
+  of whichever location last held the entry, and return it. MEASURED: intermittently, per process
+  (the hash takes the table's address), every call of a thread ran into another function's code
+  (`the_cost_of_eight_threads_meeting_the_same_real_roblox_code` saw `StepLimitReached` on every
+  call in 1 run of 5). In shared code the entry is now written whole after the lookup;
+  `indirect_calls_that_collide_in_the_fast_dispatch_table_reach_their_own_targets` overfills the
+  table (8,192 targets) and fails without it.
 * Code, slots and the constant pool are written only under the exclusive lock, into memory no
   thread has been given a pointer to yet, and published by the block-map insert and the slot stores
   (release). On x64 instruction fetch is coherent with stores from other cores; fresh code published
@@ -196,12 +218,20 @@ thread that entered before the retirement may still be executing retired code or
 entries into it; a thread that entered after has flushed them. This is epoch-based reclamation with
 `Run` as the quiescent point.
 
-The one hazard it cannot remove: **a thread blocked inside a host callback** (an inline import that
-waits, e.g. `pthread_cond_wait`) is inside `RunCode` for as long as it waits, and will return into
-the block it called from. It pins every region retired while it waits. If every region is retired
-and pinned, translation fails -- the thread gets `OD_HALT_SHIM_THREW`, which omni-cpu reports as a
-backend error. With the default sizes (section 9) retirement needs hundreds of MiB of translation;
-the measurements say how far that is from happening.
+**A thread blocked inside a host callback** (an inline import that waits, e.g.
+`pthread_cond_wait`) is inside `RunCode` for as long as it waits, and will return into the block it
+called from. *As designed* it pinned every region retired while it waited. **As built** it does not:
+an `SVC` call sequence in shared code publishes its return site in `JitState` while the callback
+runs; a retirement raises a halt on every attached thread; so a parked thread, on waking, executes
+only the tail of its block after that site before it leaves through the block's halt test. The
+reclaimer -- after an asymmetric barrier (`FlushProcessWriteBuffers` on Windows, `membarrier`'s
+private expedited command on Linux), so that a thread's plain stores of its site are visible --
+treats a thread with a site as holding only the pages around it, keeps those committed as a hole,
+and gives the rest of the region back. A region whose largest span free of holes is under 4 MiB
+is not reused. Only a thread executing generated code that entered `RunCode` before the retirement
+holds a region, and it leaves within its budget slice. If every region is still held, the
+translating thread waits (without the lock) for one; `a_thread_parked_in_a_callback_does_not_hold_a_retired_region`
+retires and reclaims regions while a thread sleeps in a callback.
 
 `ClearCache` (and a guest `IC IALLU`) in shared mode drops every block and unlinks every slot, but
 does not retire the region: it is an invalidation of everything, not a reset of memory.
@@ -293,4 +323,25 @@ and the shim's small allocations; no prelude, no constant pool, no code.
 
 ## Results
 
-(filled in after the implementation)
+Built as vendored patch 0022 (x64) and omni-cpu's `OMNI_JIT_SHARED_CACHE=1`, off by default. The
+decision record, with every figure and its n, is **D38**; in short:
+
+* **Correct in every suite, both ways**: dynarmic-sys 108 (Windows) / 164 (Linux), omni-cpu 139 /
+  141, omni-android (bionic, hostile, roundtrip, thread_memory, the 3,594 initializers ...) 797 on
+  Windows, per-thread and shared alike; the stoppability matrix included. 15 new detectors;
+  13 hand mutations of the vendored C++, 13 caught.
+* **Translation work divided by the threads**: eight threads meeting the 870 real Roblox leaves
+  fetch 6,363 guest instructions for translation instead of 50,904.
+* **Memory**: 4.548 MiB per guest thread -> 0.055 MiB, plus 4 MiB once; eight cold threads commit
+  +1.8-5.6 MiB instead of +54 MiB.
+* **Time**: on the 4-core Linux host the cold pass of eight threads is 63 -> 43 ms (same order) and
+  62 -> 56-59 ms (spread), at half and a third of the CPU. On the 24-thread Windows host it is
+  22 -> 31 ms and 20 -> 26 ms: there each thread had an idle core to translate its own copy on, and
+  emission (two thirds of translation) is serialized. Warm code runs at the same speed; a lookup
+  that misses the thread's table costs +15-50 ns.
+* **What the build changed in this design** is marked *As designed* / *As built* above: slots next
+  to their block, lookups through the thread's own table first, waiting on in-flight translations,
+  translation outside the lock, parked threads holding only a hole, and three defects the
+  measurements found (the fast-dispatch miss ordering, glibc's reader-preferring rwlock, the Linux
+  barrier compiled out).
+* **arm64** keeps per-thread caches (section 8).

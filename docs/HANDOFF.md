@@ -55,7 +55,9 @@ rate to 2-20 fps for several seconds (w20: `OMNI_LATE_INPUT` drags; translation 
 over its workers, and every worker translates it again into its own cache while the frame waits.
 Four workers instead of eight is far worse (w21: 3 fps before any input). **The structural fix is
 one translation cache shared by all guest threads** -- the largest item left, also the lever for
-memory, load time and Linux.
+memory, load time and Linux. **Built (2026-09-25, D38), behind `OMNI_JIT_SHARED_CACHE=1`, off by
+default until the controller's in-world A/B** (w20's drag script with and without the switch, on
+Windows and Linux; D38 says what decides it). x64 only; the Mac keeps per-thread caches.
 
 (join -> loaded is `submitStartGameTask` -> `onGameLoaded`; settled is the median over the 5 s
 windows +300..+450 s with min-max; runs w6-w10 shared the machine with subagent builds, so their
@@ -104,7 +106,7 @@ code on the render thread g6, whose per-frame work plus the TaskScheduler worker
 | 2 | dynarmic's dispatcher lookup (`GetBasicBlock`) on every indirect branch that misses the RSB (FastDispatch off, D16) | 25% of g6's non-JIT samples, 12% across all threads | **fixed** `f9ea397` (patches 0019/0020, D35: fast dispatch and the arm64 RSB keep the budget/halt checks); with #3, w7 38 -> 48 fps, `GetBasicBlock` 12% -> 2.7% |
 | 3 | the import census: shared per-slot counters and global `last_call` stores on every crossing | 8-9% | **fixed** `5a80626` (per-thread records; 8 threads, one import: 518-614 -> 60-64 ns per crossing) |
 | 3a | **macOS: the arm64 backend ignores value-compare** (patch 0007's inline exclusives take the global monitor's spin lock and scan 2,048 slots on every guest atomic) | 1,306 ns per atomic vs 9.4 ns honoured; the lock saturates at ~770 k atomics/s and caps the process at ~400 M insn/s | fix in progress (patch 0021); interim A/B `OMNI_JIT_EXCLUSIVE_MONITOR=global` (186 ns) |
-| 4 | translation (per-thread code caches; each thread translates what it runs) | w17: 53% of dynarmic's own samples; a busy worker still 56k insn/s at +300 s; on Linux `dyn` 32-36% of the workers | **open -- the largest left** (a shared translation cache is the structural fix) |
+| 4 | translation (per-thread code caches; each thread translates what it runs) | w17: 53% of dynarmic's own samples; a busy worker still 56k insn/s at +300 s; on Linux `dyn` 32-36% of the workers | **built, off by default, awaiting the in-world A/B**: `OMNI_JIT_SHARED_CACHE=1` (vendored patch 0022, x64; D38): 8 threads on real Roblox code translate 1/8 as much, 4.5 -> 0.06 MiB per thread; Linux cold burst 63 -> 43 ms, Windows 22 -> 31 ms (serialized emission). A/B protocol in D38 |
 | 5 | per-crossing path (`bionic::active`, trampoline, `cb_call_svc`, `pthread_getspecific`) | ~15% together | **fixed in part**: `bionic::active` without a shared refcount (`5a80626`), `cb_call_svc` by array index (`bb8c00a`), `pthread_getspecific` lock-free (`13cbc42`: 8 threads 1,500 -> 69-105 ns) |
 | 5a | `AddressFutex` (global parked table, near-miss scan per wake) and `OwnerTable` (one global mutex per lock/unlock) | wake 8.5% of handler samples; owner set/clear ~6% | **fixed** `b3e15d7`, `7fc1b1e` (futex wake 8 threads 523-1,725 -> 18 ns; mutex pairs on 8 mutexes 5.9 -> 0.3 us) |
 | 5b | `madvise`'s whole-map reclaim walk (after `e6b7769`) | 16% of handler samples (w17) | **fixed** `fb01278` (range walk) |
