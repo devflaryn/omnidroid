@@ -1288,9 +1288,10 @@ fn threads_keep_their_working_set_while_another_streams_cold_code_through_the_ca
 /// Measurement: what an eviction costs, holding the cache's lock, on blocks of the engine's shape
 /// (`LDR ; STR ; B.cond` then `B`, as `shared_bookkeeping.rs` builds them: fastmem sites and link
 /// slots in every block). One thread translates a chain far longer than the live limit, once. Rows:
-/// 16 MiB regions with 128 MiB live (the runtime's default), with 32 MiB live (what depends on the
-/// live size), 8 MiB regions with 128 MiB live, and one 128 MiB region live -- every block of a full
-/// region forgotten at once, as patch 0022's flush did (through the eviction's path, not its own).
+/// 16 MiB regions with 128 MiB live (amendment 3's default; 256 since amendment 4), with 32 MiB live
+/// (what depends on the live size), 8 MiB regions with 128 MiB live, and one 128 MiB region live --
+/// every block of a full region forgotten at once, as patch 0022's flush did (through the
+/// eviction's path, not its own).
 #[test]
 #[ignore = "measurement, not a test"]
 fn the_cost_of_an_eviction() {

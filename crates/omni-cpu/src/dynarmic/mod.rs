@@ -188,9 +188,14 @@ pub const SHARED_CODE_CACHE_BYTES: u64 = 1 << 30;
 /// amendment 3). Small, so that a retirement forgets little and is quick.
 pub const SHARED_CODE_REGION_BYTES: u64 = 16 << 20;
 /// The code a shared cache keeps live by default: past it, the oldest region is retired and its
-/// blocks translated again if they are still run. A game world emits ~245 MiB in its first minutes,
-/// mostly run once (w27-w30); D38 amendment 3.
-pub const SHARED_CODE_LIVE_BYTES: u64 = 128 << 20;
+/// blocks translated again if they are still run. A game world emits ~245 MiB in its first minutes
+/// (w27-w30). D38 amendment 4, measured: at 128 MiB (amendment 3) PS99's settled world kept
+/// evicting all session (w35, 30 min: 31 PERF lines with evictions, 12-50k blocks translated again
+/// per line, and ~60 s at 0-18 fps around +1310-1370 s with no window event), against w32 at the
+/// old whole-cache capacity: no eviction, 3 windows under 20 fps. 256 MiB holds that working set
+/// and keeps amendment 3's point -- a full region is never a flush. A memory-first instance (the
+/// owner's 30-35-instance case) can set `OMNI_JIT_SHARED_CACHE_LIVE_MB=128` and accept the churn.
+pub const SHARED_CODE_LIVE_BYTES: u64 = 256 << 20;
 /// The smallest shared cache `OMNI_JIT_SHARED_CACHE_MB` may ask for: two 8 MiB regions and the
 /// prelude.
 pub const SHARED_CODE_CACHE_MIN_BYTES: u64 = 64 << 20;
