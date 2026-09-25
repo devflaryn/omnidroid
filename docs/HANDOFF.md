@@ -408,7 +408,7 @@ view so the release landed outside it; a flash at let-go), fixed in `738b538`, `
 let-gos, no stuck button. **w35** (30 min, `2caefcf`, patch 0028 at a 128 MiB live limit): clean,
 2.45 GiB (committed code 121 MiB), but PS99's settled world kept evicting (31 PERF lines, 12-50k
 blocks translated again each) and ran ~60 s at 0-18 fps around +1310-1370 s with no window event ->
-the default live limit is 256 MiB (`db56a5f`, D38 amendment 4); **w36** re-measures it. Open: the
+the default live limit is 256 MiB (`db56a5f`, D38 amendment 4). **w36** (30 min, `db56a5f`): clean, 47.0 fps median, 2.55 GiB private, 2.06 cores, evictions on 3 PERF lines (all while loading), 9 windows under 20 fps of 321 (w35: 63), committed code 241 MiB -- amendment 4 confirmed. Open: the
 initializer gate (`initializers.rs`) fails ~1 run in 10 under the shared cache on Windows and Linux
 (a pinned word 6 vs 5 / 92,432 vs 92,431 image pointers), also on `a1ef0c5`, never with per-thread
 caches -- timing-dependent pins or a real race, not yet decided.
