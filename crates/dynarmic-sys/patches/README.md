@@ -683,9 +683,12 @@ code equals the template's (the constructor throws otherwise; the shim returns n
 * **Memory** is regions after the prelude, committed as code is emitted. A full region is retired
   (its slots unlinked, the maps emptied, every other thread halted) and given back
   (`MEM_DECOMMIT` / `MADV_DONTNEED`) once each attached thread is outside `RunCode` or entered it
-  since -- epochs published at `Run` entry and at every lookup. A thread parked in an `SVC`
-  callback publishes its return site (`JitState::od_callback_return`); after an asymmetric barrier
-  (`FlushProcessWriteBuffers`, `membarrier`) the reclaimer keeps only the pages around it.
+  since -- epochs published at `Run` entry and at every lookup. Shared code calls every `SVC`
+  callback through a prelude trampoline that publishes the resume address in
+  `JitState::od_callback_return` and takes it back with an `xchg`; a thread parked in the callback
+  with its resume address in a retiring region is moved, with one compare-exchange, to a prelude
+  stub that leaves the run -- so a region is given back whole (D38 amendment 1: the first version
+  kept a hole around each parked thread, which fragmented regions in a game world).
 * Fault handling: the recompile-on-fastmem-failure flags are forced off for a shared cache (a
   declined fault reaches the fallback callback every time, as the handler routes it anyway); the
   handler's `fastmem_patch_info` lookup takes the lock shared.

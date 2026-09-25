@@ -60,6 +60,9 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
+    if (shared_code) {
+        GenSharedSvcTrampolines();  // Omnidroid patch 0022
+    }
     code.PreludeComplete();
     ClearFastDispatchTable();
 
@@ -609,17 +612,13 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[0].IsImmediate());
     const u32 imm = args[0].GetImmediateU32();
     if (shared_code) {
-        // Omnidroid patch 0022: publish where this call returns to while it is in progress. An
-        // SVC callback can park its thread for a long time (an import that waits); what it will
-        // execute of this block on return is only the tail below, up to the halt test.
+        // Omnidroid patch 0022: through the prelude's trampoline (see `svc_trampoline`), so that a
+        // thread parked in the callback -- an import that waits -- holds nothing of this block.
         Xbyak::Label returned;
+        code.mov(code.ABI_PARAM2.cvt32(), imm);
         code.lea(rax, ptr[rip + returned]);
-        code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], rax);
-        UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
-            code.mov(param[0], imm);
-        });
+        code.jmp(svc_trampoline);
         code.L(returned);
-        code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], 0);
     } else {
         UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
             code.mov(param[0], imm);
@@ -627,6 +626,31 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
     }
     // The kernel would have to execute ERET to get here, which would clear exclusive state.
     code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+}
+
+void A64EmitX64::GenSharedSvcTrampolines() {
+    code.align();
+    svc_trampoline = code.getCurr<const void*>();
+    // rax: where the block resumes; the callback's second argument: the immediate. Published
+    // before the call, from here -- by the time a reclaimer can see it, this thread is out of the
+    // block -- and taken back (and cleared) atomically after it, so that a reclaimer's swap either
+    // lands before the take, and the thread resumes where it was sent, or fails.
+    code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], rax);
+    UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [](RegList) {});
+    code.xor_(eax, eax);
+    code.xchg(qword[r15 + offsetof(A64JitState, od_callback_return)], rax);
+    code.jmp(rax);
+    PerfMapRegister(svc_trampoline, code.getCurr(), "a64_svc_trampoline");
+
+    code.align();
+    svc_resume_retired = code.getCurr<const void*>();
+    // A block's tail after its SVC, for a block in a retired region: clear the exclusive state, as
+    // the tail does, and leave the run -- the retirement raised a halt on this thread, so the
+    // tail's halt test would have left it here too. The PC is already the SVC's successor (or
+    // what the callback wrote). The block's cycle charge, emitted after the call, is not made.
+    code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
+    code.jmp(code.GetForceReturnFromRunCodeAddress());
+    PerfMapRegister(svc_resume_retired, code.getCurr(), "a64_svc_resume_retired");
 }
 
 void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {

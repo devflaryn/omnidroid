@@ -569,6 +569,8 @@ void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
     out->regions_retired = s.regions_retired;
     out->regions_reclaimed = s.regions_reclaimed;
     out->regions_pinned = s.regions_pinned;
+    out->parked_redirected = s.parked_redirected;
+    out->reclaim_attempts = s.reclaim_attempts;
     out->committed_bytes = s.committed_bytes;
     out->attached = s.attached;
 #else

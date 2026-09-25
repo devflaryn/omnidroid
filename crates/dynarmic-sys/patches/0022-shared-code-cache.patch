@@ -46,10 +46,10 @@ index f291948..a623485 100644
  #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
  #undef Axx
 diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
-index 36086af..dbd83b6 100644
+index 36086af..c20c4ec 100644
 --- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
 +++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
-@@ -49,9 +49,12 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
+@@ -49,14 +49,20 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
      return fpcr_controlled ? Location().FPCR() : Location().FPCR().ASIMDStandardValue();
  }
  
@@ -64,7 +64,15 @@ index 36086af..dbd83b6 100644
          fast_dispatch_table = std::make_unique<std::array<FastDispatchEntry, fast_dispatch_table_size>>();
      }
      GenMemory128Accessors();
-@@ -76,6 +79,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
+     GenFastmemFallbacks();
+     GenTerminalHandlers();
++    if (shared_code) {
++        GenSharedSvcTrampolines();  // Omnidroid patch 0022
++    }
+     code.PreludeComplete();
+     ClearFastDispatchTable();
+ 
+@@ -76,6 +82,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
      SCOPE_EXIT {
          code.DisableWriting();
      };
@@ -73,7 +81,7 @@ index 36086af..dbd83b6 100644
  
      const std::vector<HostLoc> gpr_order = [this] {
          std::vector<HostLoc> gprs{any_gpr};
-@@ -140,6 +145,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
+@@ -140,6 +148,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
          deferred_emit();
      }
      code.int3();
@@ -84,7 +92,7 @@ index 36086af..dbd83b6 100644
  
      const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
  
-@@ -164,11 +173,72 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
+@@ -164,11 +176,72 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
  }
  
  void A64EmitX64::ClearFastDispatchTable() {
@@ -158,7 +166,7 @@ index 36086af..dbd83b6 100644
  void A64EmitX64::GenTerminalHandlers() {
      // PC ends up in rbp, location_descriptor ends up in rbx
      const auto calculate_location_descriptor = [this] {
-@@ -230,7 +300,12 @@ void A64EmitX64::GenTerminalHandlers() {
+@@ -230,7 +303,12 @@ void A64EmitX64::GenTerminalHandlers() {
          }
          code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
          code.jne(code.GetReturnFromRunCodeAddress());
@@ -172,7 +180,7 @@ index 36086af..dbd83b6 100644
          code.mov(rbp, rbx);
          if (code.HasHostFeature(HostFeature::SSE42)) {
              code.crc32(rbp, r12);
-@@ -241,12 +316,38 @@ void A64EmitX64::GenTerminalHandlers() {
+@@ -241,12 +319,38 @@ void A64EmitX64::GenTerminalHandlers() {
          code.jne(fast_dispatch_cache_miss);
          code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
          code.L(fast_dispatch_cache_miss);
@@ -214,7 +222,7 @@ index 36086af..dbd83b6 100644
          code.align();
          fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
          code.mov(code.ABI_PARAM2, reinterpret_cast<u64>(fast_dispatch_table->data()));
-@@ -507,9 +608,23 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -507,20 +611,55 @@ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
      auto args = ctx.reg_alloc.GetArgumentInfo(inst);
      ASSERT(args[0].IsImmediate());
      const u32 imm = args[0].GetImmediateU32();
@@ -222,17 +230,13 @@ index 36086af..dbd83b6 100644
 -        code.mov(param[0], imm);
 -    });
 +    if (shared_code) {
-+        // Omnidroid patch 0022: publish where this call returns to while it is in progress. An
-+        // SVC callback can park its thread for a long time (an import that waits); what it will
-+        // execute of this block on return is only the tail below, up to the halt test.
++        // Omnidroid patch 0022: through the prelude's trampoline (see `svc_trampoline`), so that a
++        // thread parked in the callback -- an import that waits -- holds nothing of this block.
 +        Xbyak::Label returned;
++        code.mov(code.ABI_PARAM2.cvt32(), imm);
 +        code.lea(rax, ptr[rip + returned]);
-+        code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], rax);
-+        UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
-+            code.mov(param[0], imm);
-+        });
++        code.jmp(svc_trampoline);
 +        code.L(returned);
-+        code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], 0);
 +    } else {
 +        UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [&](RegList param) {
 +            code.mov(param[0], imm);
@@ -241,7 +245,35 @@ index 36086af..dbd83b6 100644
      // The kernel would have to execute ERET to get here, which would clear exclusive state.
      code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
  }
-@@ -520,7 +635,7 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
+ 
++void A64EmitX64::GenSharedSvcTrampolines() {
++    code.align();
++    svc_trampoline = code.getCurr<const void*>();
++    // rax: where the block resumes; the callback's second argument: the immediate. Published
++    // before the call, from here -- by the time a reclaimer can see it, this thread is out of the
++    // block -- and taken back (and cleared) atomically after it, so that a reclaimer's swap either
++    // lands before the take, and the thread resumes where it was sent, or fails.
++    code.mov(qword[r15 + offsetof(A64JitState, od_callback_return)], rax);
++    UserCallback<&A64::UserCallbacks::CallSVC>().EmitCall(code, [](RegList) {});
++    code.xor_(eax, eax);
++    code.xchg(qword[r15 + offsetof(A64JitState, od_callback_return)], rax);
++    code.jmp(rax);
++    PerfMapRegister(svc_trampoline, code.getCurr(), "a64_svc_trampoline");
++
++    code.align();
++    svc_resume_retired = code.getCurr<const void*>();
++    // A block's tail after its SVC, for a block in a retired region: clear the exclusive state, as
++    // the tail does, and leave the run -- the retirement raised a halt on this thread, so the
++    // tail's halt test would have left it here too. The PC is already the SVC's successor (or
++    // what the callback wrote). The block's cycle charge, emitted after the call, is not made.
++    code.mov(code.byte[r15 + offsetof(A64JitState, exclusive_state)], u8(0));
++    code.jmp(code.GetForceReturnFromRunCodeAddress());
++    PerfMapRegister(svc_resume_retired, code.getCurr(), "a64_svc_resume_retired");
++}
++
+ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
+     ctx.reg_alloc.HostCall(nullptr);
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
      ASSERT(args[0].IsImmediate() && args[1].IsImmediate());
      const u64 pc = args[0].GetImmediateU64();
      const u64 exception = args[1].GetImmediateU64();
@@ -250,7 +282,7 @@ index 36086af..dbd83b6 100644
          code.mov(param[0], pc);
          code.mov(param[1], exception);
      });
-@@ -529,13 +644,13 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -529,13 +668,13 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
  void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
      auto args = ctx.reg_alloc.GetArgumentInfo(inst);
      ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
@@ -266,7 +298,7 @@ index 36086af..dbd83b6 100644
  }
  
  void A64EmitX64::EmitA64DataSynchronizationBarrier(A64EmitContext&, IR::Inst*) {
-@@ -553,7 +668,7 @@ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, I
+@@ -553,7 +692,7 @@ void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, I
      }
  
      ctx.reg_alloc.HostCall(nullptr);
@@ -275,7 +307,7 @@ index 36086af..dbd83b6 100644
  }
  
  void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
-@@ -567,7 +682,7 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -567,7 +706,7 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
      if (!conf.wall_clock_cntpct) {
          code.UpdateTicks();
      }
@@ -284,7 +316,7 @@ index 36086af..dbd83b6 100644
  }
  
  void A64EmitX64::EmitA64GetCTR(A64EmitContext& ctx, IR::Inst* inst) {
-@@ -584,7 +699,11 @@ void A64EmitX64::EmitA64GetDCZID(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -584,7 +723,11 @@ void A64EmitX64::EmitA64GetDCZID(A64EmitContext& ctx, IR::Inst* inst) {
  
  void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
      const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
@@ -297,7 +329,7 @@ index 36086af..dbd83b6 100644
          code.mov(result, u64(conf.tpidr_el0));
          code.mov(result, qword[result]);
      } else {
-@@ -595,7 +714,10 @@ void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -595,7 +738,10 @@ void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
  
  void A64EmitX64::EmitA64GetTPIDRRO(A64EmitContext& ctx, IR::Inst* inst) {
      const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr();
@@ -309,7 +341,7 @@ index 36086af..dbd83b6 100644
          code.mov(result, u64(conf.tpidrro_el0));
          code.mov(result, qword[result]);
      } else {
-@@ -608,7 +730,10 @@ void A64EmitX64::EmitA64SetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -608,7 +754,10 @@ void A64EmitX64::EmitA64SetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
      auto args = ctx.reg_alloc.GetArgumentInfo(inst);
      const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(args[0]);
      const Xbyak::Reg64 addr = ctx.reg_alloc.ScratchGpr();
@@ -321,7 +353,7 @@ index 36086af..dbd83b6 100644
          code.mov(addr, u64(conf.tpidr_el0));
          code.mov(qword[addr], value);
      }
-@@ -623,7 +748,7 @@ std::string A64EmitX64::LocationDescriptorToFriendlyName(const IR::LocationDescr
+@@ -623,7 +772,7 @@ std::string A64EmitX64::LocationDescriptorToFriendlyName(const IR::LocationDescr
  
  void A64EmitX64::EmitTerminalImpl(IR::Term::Interpret terminal, IR::LocationDescriptor, bool) {
      code.SwitchMxcsrOnExit();
@@ -330,7 +362,7 @@ index 36086af..dbd83b6 100644
          code.mov(param[0], A64::LocationDescriptor{terminal.next}.PC());
          code.mov(qword[r15 + offsetof(A64JitState, pc)], param[0]);
          code.mov(param[1].cvt32(), terminal.num_instructions);
-@@ -643,6 +768,27 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
+@@ -643,6 +792,27 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
          return;
      }
  
@@ -358,7 +390,7 @@ index 36086af..dbd83b6 100644
      if (conf.enable_cycle_counting) {
          code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
  
-@@ -676,6 +822,11 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
+@@ -676,6 +846,11 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
          return;
      }
  
@@ -370,7 +402,7 @@ index 36086af..dbd83b6 100644
      patch_information[terminal.next].jmp.push_back(code.getCurr());
      if (auto next_bb = GetBasicBlock(terminal.next)) {
          EmitPatchJmp(terminal.next, next_bb->entrypoint);
-@@ -777,9 +928,21 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
+@@ -777,9 +952,21 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
      code.EnsurePatchLocationSize(patch_location, 10);
  }
  
@@ -394,7 +426,7 @@ index 36086af..dbd83b6 100644
          (*fast_dispatch_table_lookup)(location.Value()) = {};
          code.EnableWriting();
 diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
-index 06443fa..c2697e2 100644
+index 06443fa..ed30565 100644
 --- a/src/dynarmic/backend/x64/a64_emit_x64.h
 +++ b/src/dynarmic/backend/x64/a64_emit_x64.h
 @@ -13,6 +13,7 @@
@@ -467,8 +499,28 @@ index 06443fa..c2697e2 100644
      const A64::UserConfig conf;
      A64::Jit* jit_interface;
      BlockRangeInformation<u64> block_ranges;
-@@ -86,6 +132,8 @@ protected:
+@@ -84,8 +130,28 @@ protected:
+     void GenFastmemFallbacks();
+ 
      const void* terminal_handler_pop_rsb_hint;
++
++    // Omnidroid patch 0022, shared code cache only: every SVC callback is called from the prelude,
++    // not from its block, so that a thread parked inside one has no return address into a region
++    // on its stack. The block jumps to `svc_trampoline` with its resume address in rax and the
++    // immediate in the callback's second argument; the trampoline publishes the resume address in
++    // `JitState::od_callback_return`, calls, then takes it back with an `xchg` (clearing it) and
++    // jumps there. A reclaimer that finds a parked thread's resume address in a retiring region
++    // swaps it -- one compare-exchange -- for `svc_resume_retired`, which leaves the run as the
++    // block's own halt test would have: the region is then free of that thread.
++    const void* svc_trampoline = nullptr;
++    const void* svc_resume_retired = nullptr;
++    void GenSharedSvcTrampolines();
++
++public:
++    /// Shared code cache only: where a parked thread is sent instead of a retired region.
++    const void* SvcResumeRetired() const { return svc_resume_retired; }
++
++protected:
      const void* terminal_handler_fast_dispatch_hint = nullptr;
      FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
 +    /// Patch 0022: the same hash, for a table given as the second argument (a thread's own).
@@ -594,7 +646,7 @@ index 450b16d..90d113e 100644
  #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
  #undef Axx
 diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
-index 7c0fa8d..38ffe11 100644
+index 7c0fa8d..749073d 100644
 --- a/src/dynarmic/backend/x64/a64_interface.cpp
 +++ b/src/dynarmic/backend/x64/a64_interface.cpp
 @@ -3,19 +3,32 @@
@@ -630,23 +682,7 @@ index 7c0fa8d..38ffe11 100644
  #include "dynarmic/backend/x64/jitstate_info.h"
  #include "dynarmic/common/atomic.h"
  #include "dynarmic/common/x64_disassemble.h"
-@@ -24,6 +37,15 @@
- #include "dynarmic/ir/basic_block.h"
- #include "dynarmic/ir/opt/passes.h"
- 
-+#ifdef _WIN32
-+#    define WIN32_LEAN_AND_MEAN
-+#    include <windows.h>
-+#elif defined(__linux__)
-+#    include <linux/membarrier.h>
-+#    include <sys/syscall.h>
-+#    include <unistd.h>
-+#endif
-+
- namespace Dynarmic::A64 {
- 
- using namespace Backend::X64;
-@@ -55,17 +77,310 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
+@@ -55,17 +68,274 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
      };
  }
  
@@ -687,15 +723,10 @@ index 7c0fa8d..38ffe11 100644
 +constexpr size_t SHARED_GRANULE = 64 * 1024;
 +/// Room a region must have left, between code and slots, before a block is emitted into it.
 +constexpr size_t SHARED_HEADROOM = 2 * MINIMUM_REMAINING_CODESIZE;
-+/// A reclaimed region is reused only if its largest span free of parked threads' return sites is
-+/// at least this; a region is at least twice it.
-+constexpr size_t SHARED_MINIMUM_SPAN = 4 * MINIMUM_REMAINING_CODESIZE;
++/// The smallest region: a block never needs more than MINIMUM_REMAINING_CODESIZE.
++constexpr size_t SHARED_MINIMUM_REGION = 8 * MINIMUM_REMAINING_CODESIZE;
 +/// How often a thread leaving Run may try to give retired regions back.
-+constexpr u64 SHARED_RECLAIM_INTERVAL_NS = 1'000'000;
-+/// Bytes kept around a parked thread's return site: the call sequence before it and the block's
-+/// tail after it (clear the site, clear exclusive state, charge cycles, test the halt word, jump).
-+constexpr size_t SHARED_HOLE_BEFORE = 64;
-+constexpr size_t SHARED_HOLE_AFTER = 192;
++constexpr u64 SHARED_RECLAIM_INTERVAL_NS = 10'000'000;
 +
 +u8* AlignUp(u8* p, size_t a) {
 +    return reinterpret_cast<u8*>((reinterpret_cast<uintptr_t>(p) + a - 1) & ~(uintptr_t(a) - 1));
@@ -792,49 +823,17 @@ index 7c0fa8d..38ffe11 100644
 +        && (c.global_monitor == nullptr || c.processor_id < GetExclusiveMonitorProcessorCount(c.global_monitor));
 +}
 +
-+/// An asymmetric memory barrier: once it returns, every store any other thread of this process
-+/// made before it is visible here, and every load another thread makes after it sees what this
-+/// thread stored before it. Windows: FlushProcessWriteBuffers. Linux: membarrier's private
-+/// expedited command (registered when the cache is built). `false` where neither is available.
-+bool AsymmetricBarrier() {
-+#if defined(_WIN32)
-+    FlushProcessWriteBuffers();
-+    return true;
-+#elif defined(__linux__) && defined(__NR_membarrier)
-+    // (The commands are enumerators, not macros: `#if defined` cannot test them.)
-+    return syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) == 0;
-+#else
-+    return false;
-+#endif
-+}
-+
-+bool RegisterAsymmetricBarrier() {
-+#if defined(_WIN32)
-+    return true;
-+#elif defined(__linux__) && defined(__NR_membarrier)
-+    return syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
-+#else
-+    return false;
-+#endif
-+}
-+
 +}  // namespace
 +
 +struct SharedCodeCache::Impl final {
 +    Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes);
 +    ~Impl();
 +
-+    /// A span of the buffer after the prelude. Code grows up from `use_begin`, link slots down
-+    /// from `use_end`; `holes` are parked threads' return sites kept from a previous use.
++    /// A span of the buffer after the prelude, filled from `begin` (blocks and their link slots).
 +    struct Region {
 +        u8* begin = nullptr;
 +        u8* end = nullptr;
-+        u8* use_begin = nullptr;
-+        u8* use_end = nullptr;
 +        u8* code_committed_end = nullptr;
-+        u8* slot_top = nullptr;
-+        u8* slots_committed_begin = nullptr;
-+        std::vector<std::pair<u8*, u8*>> holes;
 +        enum class State { Free,
 +                           Current,
 +                           Retired } state = State::Free;
@@ -854,7 +853,6 @@ index 7c0fa8d..38ffe11 100644
 +    size_t current = NO_REGION;
 +    std::atomic<u64> generation{0};
 +    std::atomic<u64> epoch{0};
-+    bool barrier_available = false;
 +    /// Regions retired and not yet given back; when non-zero, a thread leaving Run tries.
 +    std::atomic<u64> retired_now{0};
 +    std::atomic<u64> last_reclaim_attempt_ns{0};
@@ -871,6 +869,8 @@ index 7c0fa8d..38ffe11 100644
 +    u64 regions_retired = 0;
 +    u64 regions_reclaimed = 0;
 +    u64 translations_redone = 0;
++    u64 parked_redirected = 0;  // parked threads sent to svc_resume_retired
++    u64 reclaim_attempts = 0;
 +    u64 emit_ns = 0;                      // under `lock`, exclusive
 +    std::atomic<u64> translate_ns{0};     // outside it, summed over threads
 +    /// Dispatcher lookups that took the lock, from threads that have detached (each attached
@@ -917,7 +917,7 @@ index 7c0fa8d..38ffe11 100644
 +    void StartRegion(size_t index);
 +    void RetireCurrentRegion(SharedThreadState& thread);
 +    void TryReclaimRetired();
-+    bool TryReclaim(Region& region, bool parked_sites_known);
++    bool TryReclaim(Region& region);
 +};
 +
 +// ------------------------------------------------------------------------------------------------
@@ -960,7 +960,7 @@ index 7c0fa8d..38ffe11 100644
  
      HaltReason Run() {
          ASSERT(!is_executing);
-@@ -76,6 +391,16 @@ public:
+@@ -76,6 +346,16 @@ public:
              this->is_executing = false;
          };
  
@@ -977,7 +977,7 @@ index 7c0fa8d..38ffe11 100644
          // TODO: Check code alignment
  
          const CodePtr current_code_ptr = [this] {
-@@ -91,6 +416,13 @@ public:
+@@ -91,6 +371,13 @@ public:
  
          const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
  
@@ -991,7 +991,7 @@ index 7c0fa8d..38ffe11 100644
          PerformRequestedCacheInvalidation(hr);
  
          return hr;
-@@ -105,23 +437,50 @@ public:
+@@ -105,23 +392,50 @@ public:
              this->is_executing = false;
          };
  
@@ -1043,7 +1043,7 @@ index 7c0fa8d..38ffe11 100644
          invalid_cache_ranges.add(range);
          HaltExecution(HaltReason::CacheInvalidation);
      }
-@@ -129,6 +488,9 @@ public:
+@@ -129,6 +443,9 @@ public:
      void Reset() {
          ASSERT(!is_executing);
          jit_state = {};
@@ -1053,7 +1053,7 @@ index 7c0fa8d..38ffe11 100644
      }
  
      void HaltExecution(HaltReason hr) {
-@@ -239,11 +601,55 @@ public:
+@@ -239,11 +556,55 @@ public:
      }
  
  private:
@@ -1109,7 +1109,7 @@ index 7c0fa8d..38ffe11 100644
      IR::LocationDescriptor GetCurrentLocation() const {
          return IR::LocationDescriptor{jit_state.GetUniqueHash()};
      }
-@@ -257,10 +663,37 @@ private:
+@@ -257,10 +618,37 @@ private:
      }
  
      CodePtr GetBlock(IR::LocationDescriptor current_location) {
@@ -1148,7 +1148,7 @@ index 7c0fa8d..38ffe11 100644
          if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
              // Immediately evacuate cache
              invalidate_entire_cache = true;
-@@ -269,24 +702,7 @@ private:
+@@ -269,24 +657,7 @@ private:
          block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
  
          // JIT Compile
@@ -1174,7 +1174,7 @@ index 7c0fa8d..38ffe11 100644
          return emitter.Emit(ir_block).entrypoint;
      }
  
-@@ -300,6 +716,18 @@ private:
+@@ -300,6 +671,18 @@ private:
                  return;
              }
  
@@ -1193,7 +1193,7 @@ index 7c0fa8d..38ffe11 100644
              jit_state.ResetRSB();
              if (invalidate_entire_cache) {
                  block_of_code.ClearCache();
-@@ -316,15 +744,473 @@ private:
+@@ -316,15 +699,427 @@ private:
  
      const UserConfig conf;
      A64JitState jit_state;
@@ -1222,12 +1222,11 @@ index 7c0fa8d..38ffe11 100644
 +        , emitter(block_of_code, conf, nullptr, true)
 +        , polyfill_options(GenPolyfillOptions(block_of_code)) {
 +    emitter.shared_lock = &lock;
-+    barrier_available = RegisterAsymmetricBarrier();
 +
 +    region_bytes &= ~(SHARED_GRANULE - 1);
 +    u8* const first = AlignUp(block_of_code.getCurr<u8*>(), SHARED_GRANULE);
 +    u8* const last = AlignDown(const_cast<u8*>(block_of_code.GetCodeEnd()), SHARED_GRANULE);
-+    if (region_bytes < 2 * SHARED_MINIMUM_SPAN || first >= last || static_cast<size_t>(last - first) / region_bytes < 2) {
++    if (region_bytes < SHARED_MINIMUM_REGION || first >= last || static_cast<size_t>(last - first) / region_bytes < 2) {
 +        throw std::invalid_argument("dynarmic: a shared code cache needs room for two regions of at least 8 MiB after its prelude");
 +    }
 +    for (u8* at = first; static_cast<size_t>(last - at) >= region_bytes; at += region_bytes) {
@@ -1293,6 +1292,11 @@ index 7c0fa8d..38ffe11 100644
 +    // pass of eight threads).
 +    bool waited = false;
 +    for (;;) {
++        if (waited) {
++            // Still in the dispatcher, holding nothing of any region: say so, so that waiting here
++            // does not keep a retired region from being given back.
++            Sync(thread);
++        }
 +        if (const auto found = Lookup(location)) {
 +            if (waited) {
 +                translations_raced.fetch_add(1, std::memory_order_relaxed);
@@ -1406,31 +1410,10 @@ index 7c0fa8d..38ffe11 100644
 +
 +void SharedCodeCache::Impl::StartRegion(size_t index) {
 +    Region& r = regions[index];
-+    // The largest span free of holes; a fresh region has none.
-+    u8* best_begin = r.begin;
-+    u8* best_end = r.begin;
-+    u8* cursor = r.begin;
-+    auto holes = r.holes;
-+    std::sort(holes.begin(), holes.end());
-+    for (const auto& [hole_begin, hole_end] : holes) {
-+        if (hole_begin - cursor > best_end - best_begin) {
-+            best_begin = cursor;
-+            best_end = hole_begin;
-+        }
-+        cursor = std::max(cursor, hole_end);
-+    }
-+    if (r.end - cursor > best_end - best_begin) {
-+        best_begin = cursor;
-+        best_end = r.end;
-+    }
-+    r.use_begin = best_begin;
-+    r.use_end = best_end;
-+    r.code_committed_end = r.use_begin;
-+    r.slot_top = r.use_end;
-+    r.slots_committed_begin = r.use_end;
++    r.code_committed_end = r.begin;
 +    r.state = Region::State::Current;
 +    current = index;
-+    block_of_code.SetCodePtr(r.use_begin);
++    block_of_code.SetCodePtr(r.begin);
 +}
 +
 +void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held) {
@@ -1438,8 +1421,8 @@ index 7c0fa8d..38ffe11 100644
 +        if (current != NO_REGION) {
 +            Region& r = regions[current];
 +            u8* const cur = block_of_code.getCurr<u8*>();
-+            if (r.slot_top - cur >= static_cast<ptrdiff_t>(SHARED_HEADROOM)) {
-+                u8* const want = std::min(AlignUp(cur + MINIMUM_REMAINING_CODESIZE, SHARED_GRANULE), r.slots_committed_begin);
++            if (r.end - cur >= static_cast<ptrdiff_t>(SHARED_HEADROOM)) {
++                u8* const want = std::min(AlignUp(cur + MINIMUM_REMAINING_CODESIZE, SHARED_GRANULE), r.end);
 +                if (want > r.code_committed_end) {
 +                    block_of_code.CommitRange(r.code_committed_end, static_cast<size_t>(want - r.code_committed_end));
 +                    r.code_committed_end = want;
@@ -1463,6 +1446,7 @@ index 7c0fa8d..38ffe11 100644
 +        // thread outside generated code does not hold a region, so this ends -- but not with the
 +        // lock held, which a running thread may need to reach its halt check.
 +        held.unlock();
++        Sync(thread);  // in the dispatcher: holds no region, so it must not pin one while it waits
 +        std::this_thread::yield();
 +        held.lock();
 +    }
@@ -1505,77 +1489,49 @@ index 7c0fa8d..38ffe11 100644
 +        return;
 +    }
 +
-+    // Where each thread parked inside a callback will return to. Read only after the asymmetric
-+    // barrier: a thread's plain store clearing its site (it returned) must be visible before the
-+    // site is believed, and a thread that stores its site after the barrier reads the halt word
-+    // after it too, so it leaves through its halt test (design section 6).
-+    const bool known = barrier_available && AsymmetricBarrier();
++    reclaim_attempts++;
 +    for (Region& r : regions) {
 +        if (r.state == Region::State::Retired) {
-+            TryReclaim(r, known);
++            TryReclaim(r);
 +        }
 +    }
 +}
 +
-+bool SharedCodeCache::Impl::TryReclaim(Region& r, bool parked_sites_known) {
-+    std::vector<std::pair<u8*, u8*>> holes;
++bool SharedCodeCache::Impl::TryReclaim(Region& r) {
++    // Every attached thread must be unable to execute this region again: outside RunCode, or
++    // entered (and synced) since the retirement, or parked in an SVC callback with its resume
++    // address -- the only address into generated code it holds -- outside the region, or swapped
++    // (compare-exchange against the thread's own take) for the prelude's `svc_resume_retired`.
++    u64 redirected_now = 0;
 +    {
 +        std::lock_guard guard{attach_lock};
 +        for (SharedThreadState* t : attached) {
 +            const u64 e = t->running_epoch.load(std::memory_order_seq_cst);
 +            if (e == NOT_RUNNING || e >= r.retired_epoch) {
-+                continue;  // outside RunCode, or entered (and synced) since the retirement
++                continue;
 +            }
-+            if (parked_sites_known) {
-+                const u64 site = std::atomic_ref<u64>{t->jit_state->od_callback_return}.load(std::memory_order_seq_cst);
-+                if (site != 0) {
-+                    u8* const at = reinterpret_cast<u8*>(site);
-+                    if (at >= r.begin && at < r.end) {
-+                        holes.emplace_back(AlignDown(at - SHARED_HOLE_BEFORE, 4096), AlignUp(at + SHARED_HOLE_AFTER, 4096));
-+                    }
-+                    continue;  // parked in a callback, halted: it will leave through its block's tail
-+                }
++            std::atomic_ref<u64> site_ref{t->jit_state->od_callback_return};
++            u64 site = site_ref.load(std::memory_order_seq_cst);
++            if (site == 0) {
++                return false;  // may be executing this region's code
 +            }
-+            return false;  // may still be executing code in this region
++            u8* const at = reinterpret_cast<u8*>(site);
++            if (at < r.begin || at >= r.end) {
++                // Parked, and its block is elsewhere: on waking it finishes that block's tail,
++                // whose halt test -- the retirement raised the halt -- leaves the run.
++                continue;
++            }
++            const u64 resume = reinterpret_cast<u64>(emitter.SvcResumeRetired());
++            if (!site_ref.compare_exchange_strong(site, resume, std::memory_order_seq_cst)) {
++                return false;  // it woke and took its resume address: running this region
++            }
++            redirected_now++;
 +        }
 +    }
++    parked_redirected += redirected_now;
 +
-+    // Keep the holes committed and untouched; give the rest back.
-+    std::sort(holes.begin(), holes.end());
-+    u8* cursor = r.begin;
-+    for (const auto& [hole_begin, hole_end] : holes) {
-+        const u8* const b = std::max(hole_begin, r.begin);
-+        if (b > cursor) {
-+            block_of_code.DecommitRange(cursor, static_cast<size_t>(b - cursor));
-+            emitter.PurgeFastmemPatchInfo(cursor, b);
-+        }
-+        cursor = std::max(cursor, std::min(hole_end, r.end));
-+    }
-+    if (r.end > cursor) {
-+        block_of_code.DecommitRange(cursor, static_cast<size_t>(r.end - cursor));
-+        emitter.PurgeFastmemPatchInfo(cursor, r.end);
-+    }
-+    r.holes = std::move(holes);
-+
-+    // Usable again only if a large enough span is free of holes.
-+    u8* best = r.begin;
-+    size_t best_len = 0;
-+    u8* c = r.begin;
-+    for (const auto& [hole_begin, hole_end] : r.holes) {
-+        if (hole_begin > c && static_cast<size_t>(hole_begin - c) > best_len) {
-+            best_len = static_cast<size_t>(hole_begin - c);
-+            best = c;
-+        }
-+        c = std::max(c, hole_end);
-+    }
-+    if (r.end > c && static_cast<size_t>(r.end - c) > best_len) {
-+        best_len = static_cast<size_t>(r.end - c);
-+        best = c;
-+    }
-+    (void)best;
-+    if (best_len < SHARED_MINIMUM_SPAN) {
-+        return false;
-+    }
++    block_of_code.DecommitRange(r.begin, static_cast<size_t>(r.end - r.begin));
++    emitter.PurgeFastmemPatchInfo(r.begin, r.end);
 +    r.state = Region::State::Free;
 +    regions_reclaimed++;
 +    retired_now.fetch_sub(1, std::memory_order_relaxed);
@@ -1619,8 +1575,7 @@ index 7c0fa8d..38ffe11 100644
 +    s.regions_retired = regions_retired;
 +    s.regions_reclaimed = regions_reclaimed;
 +    // The prelude's commit, up to where the regions start (Windows; 0 where pages come on first
-+    // touch), then each region's: its code and slot spans unless it has been given back, and the
-+    // holes kept for parked threads.
++    // touch), then each region's code, unless it has been given back.
 +    u64 committed = std::min<u64>(block_of_code.PreludeCommittedBytes(),
 +                                  static_cast<u64>(regions.front().begin - block_of_code.getCode()));
 +    for (const Region& r : regions) {
@@ -1628,12 +1583,11 @@ index 7c0fa8d..38ffe11 100644
 +            s.regions_pinned++;
 +        }
 +        if (r.state != Region::State::Free) {
-+            committed += static_cast<u64>(r.code_committed_end - r.use_begin) + static_cast<u64>(r.use_end - r.slots_committed_begin);
-+        }
-+        for (const auto& [hole_begin, hole_end] : r.holes) {
-+            committed += static_cast<u64>(hole_end - hole_begin);
++            committed += static_cast<u64>(r.code_committed_end - r.begin);
 +        }
 +    }
++    s.parked_redirected = parked_redirected;
++    s.reclaim_attempts = reclaim_attempts;
 +    s.committed_bytes = committed;
 +    {
 +        std::lock_guard attach_guard{attach_lock};
@@ -2279,10 +2233,10 @@ index 0000000..4b47a6f
 +
 +}  // namespace Dynarmic::Backend::X64
 diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
-index a150da8..febe5e4 100644
+index a150da8..8e47b50 100644
 --- a/src/dynarmic/interface/A64/a64.h
 +++ b/src/dynarmic/interface/A64/a64.h
-@@ -133,5 +133,61 @@ private:
+@@ -133,5 +133,63 @@ private:
      std::unique_ptr<Impl> impl;
  };
  
@@ -2327,6 +2281,8 @@ index a150da8..febe5e4 100644
 +        std::uint64_t regions_retired = 0;       ///< region retirements so far
 +        std::uint64_t regions_reclaimed = 0;     ///< retired regions given back so far
 +        std::uint64_t regions_pinned = 0;        ///< retired regions a running thread still holds
++        std::uint64_t parked_redirected = 0;     ///< threads parked in an SVC whose resume was moved out of a retiring region
++        std::uint64_t reclaim_attempts = 0;      ///< passes over the retired regions
 +        std::uint64_t committed_bytes = 0;       ///< code-cache bytes committed now, prelude included
 +        std::uint64_t attached = 0;              ///< Jits attached now
 +    };

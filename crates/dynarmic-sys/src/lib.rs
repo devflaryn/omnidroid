@@ -559,6 +559,11 @@ pub struct OdCodeCacheStats {
     pub regions_reclaimed: u64,
     /// Regions retired and not given back yet.
     pub regions_pinned: u64,
+    /// Threads parked in an `SVC` callback whose resume address was moved out of a retiring
+    /// region (to a stub that leaves the run), so the region could be given back.
+    pub parked_redirected: u64,
+    /// Passes over the retired regions looking for ones to give back.
+    pub reclaim_attempts: u64,
     /// Bytes committed now (Windows); where pages come on first touch, what was made available.
     pub committed_bytes: u64,
     /// Jits attached now.

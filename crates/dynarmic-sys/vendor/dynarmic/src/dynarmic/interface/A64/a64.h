@@ -174,6 +174,8 @@ public:
         std::uint64_t regions_retired = 0;       ///< region retirements so far
         std::uint64_t regions_reclaimed = 0;     ///< retired regions given back so far
         std::uint64_t regions_pinned = 0;        ///< retired regions a running thread still holds
+        std::uint64_t parked_redirected = 0;     ///< threads parked in an SVC whose resume was moved out of a retiring region
+        std::uint64_t reclaim_attempts = 0;      ///< passes over the retired regions
         std::uint64_t committed_bytes = 0;       ///< code-cache bytes committed now, prelude included
         std::uint64_t attached = 0;              ///< Jits attached now
     };

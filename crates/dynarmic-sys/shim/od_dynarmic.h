@@ -382,6 +382,8 @@ typedef struct od_code_cache_stats {
     uint64_t regions_retired;
     uint64_t regions_reclaimed;
     uint64_t regions_pinned;      /* retired and not yet given back */
+    uint64_t parked_redirected;   /* parked threads whose resume was moved out of a retiring region */
+    uint64_t reclaim_attempts;    /* passes over the retired regions */
     uint64_t committed_bytes;     /* committed now (Windows); what was made available elsewhere */
     uint64_t attached;            /* jits attached now */
 } od_code_cache_stats;

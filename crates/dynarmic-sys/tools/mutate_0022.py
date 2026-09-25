@@ -61,9 +61,9 @@ MUTATIONS = {
             in_flight.insert(location);""",
            """        if (true) {
             in_flight.insert(location);""", SC + ['--', 'eight_jits_on_one_cache']),
-    'S6': ('a thread parked in a callback holds its region (no holes)', IFACE,
-           """    const bool known = barrier_available && AsymmetricBarrier();""",
-           """    const bool known = false;""", SC + ['--', 'a_thread_parked_in_a_callback']),
+    'S6': ('a thread parked in a callback in a retiring region is not moved out of it (holds it)', IFACE,
+           """            if (!site_ref.compare_exchange_strong(site, resume, std::memory_order_seq_cst)) {""",
+           """            if (true) {""", SC + ['--', 'threads_parked_all_over']),
     'S7': ('retiring a region does not halt the other threads', IFACE,
            """            if (other != &thread) {
                 Atomic::Or(&other->jit_state->halt_reason, static_cast<u32>(HaltReason::CacheInvalidation));

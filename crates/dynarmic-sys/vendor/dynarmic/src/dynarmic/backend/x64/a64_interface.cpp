@@ -37,15 +37,6 @@
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opt/passes.h"
 
-#ifdef _WIN32
-#    define WIN32_LEAN_AND_MEAN
-#    include <windows.h>
-#elif defined(__linux__)
-#    include <linux/membarrier.h>
-#    include <sys/syscall.h>
-#    include <unistd.h>
-#endif
-
 namespace Dynarmic::A64 {
 
 using namespace Backend::X64;
@@ -114,15 +105,10 @@ constexpr u64 NOT_RUNNING = std::numeric_limits<u64>::max();
 constexpr size_t SHARED_GRANULE = 64 * 1024;
 /// Room a region must have left, between code and slots, before a block is emitted into it.
 constexpr size_t SHARED_HEADROOM = 2 * MINIMUM_REMAINING_CODESIZE;
-/// A reclaimed region is reused only if its largest span free of parked threads' return sites is
-/// at least this; a region is at least twice it.
-constexpr size_t SHARED_MINIMUM_SPAN = 4 * MINIMUM_REMAINING_CODESIZE;
+/// The smallest region: a block never needs more than MINIMUM_REMAINING_CODESIZE.
+constexpr size_t SHARED_MINIMUM_REGION = 8 * MINIMUM_REMAINING_CODESIZE;
 /// How often a thread leaving Run may try to give retired regions back.
-constexpr u64 SHARED_RECLAIM_INTERVAL_NS = 1'000'000;
-/// Bytes kept around a parked thread's return site: the call sequence before it and the block's
-/// tail after it (clear the site, clear exclusive state, charge cycles, test the halt word, jump).
-constexpr size_t SHARED_HOLE_BEFORE = 64;
-constexpr size_t SHARED_HOLE_AFTER = 192;
+constexpr u64 SHARED_RECLAIM_INTERVAL_NS = 10'000'000;
 
 u8* AlignUp(u8* p, size_t a) {
     return reinterpret_cast<u8*>((reinterpret_cast<uintptr_t>(p) + a - 1) & ~(uintptr_t(a) - 1));
@@ -219,49 +205,17 @@ bool EmitsTheSameCode(const UserConfig& t, const UserConfig& c) {
         && (c.global_monitor == nullptr || c.processor_id < GetExclusiveMonitorProcessorCount(c.global_monitor));
 }
 
-/// An asymmetric memory barrier: once it returns, every store any other thread of this process
-/// made before it is visible here, and every load another thread makes after it sees what this
-/// thread stored before it. Windows: FlushProcessWriteBuffers. Linux: membarrier's private
-/// expedited command (registered when the cache is built). `false` where neither is available.
-bool AsymmetricBarrier() {
-#if defined(_WIN32)
-    FlushProcessWriteBuffers();
-    return true;
-#elif defined(__linux__) && defined(__NR_membarrier)
-    // (The commands are enumerators, not macros: `#if defined` cannot test them.)
-    return syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) == 0;
-#else
-    return false;
-#endif
-}
-
-bool RegisterAsymmetricBarrier() {
-#if defined(_WIN32)
-    return true;
-#elif defined(__linux__) && defined(__NR_membarrier)
-    return syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0;
-#else
-    return false;
-#endif
-}
-
 }  // namespace
 
 struct SharedCodeCache::Impl final {
     Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes);
     ~Impl();
 
-    /// A span of the buffer after the prelude. Code grows up from `use_begin`, link slots down
-    /// from `use_end`; `holes` are parked threads' return sites kept from a previous use.
+    /// A span of the buffer after the prelude, filled from `begin` (blocks and their link slots).
     struct Region {
         u8* begin = nullptr;
         u8* end = nullptr;
-        u8* use_begin = nullptr;
-        u8* use_end = nullptr;
         u8* code_committed_end = nullptr;
-        u8* slot_top = nullptr;
-        u8* slots_committed_begin = nullptr;
-        std::vector<std::pair<u8*, u8*>> holes;
         enum class State { Free,
                            Current,
                            Retired } state = State::Free;
@@ -281,7 +235,6 @@ struct SharedCodeCache::Impl final {
     size_t current = NO_REGION;
     std::atomic<u64> generation{0};
     std::atomic<u64> epoch{0};
-    bool barrier_available = false;
     /// Regions retired and not yet given back; when non-zero, a thread leaving Run tries.
     std::atomic<u64> retired_now{0};
     std::atomic<u64> last_reclaim_attempt_ns{0};
@@ -298,6 +251,8 @@ struct SharedCodeCache::Impl final {
     u64 regions_retired = 0;
     u64 regions_reclaimed = 0;
     u64 translations_redone = 0;
+    u64 parked_redirected = 0;  // parked threads sent to svc_resume_retired
+    u64 reclaim_attempts = 0;
     u64 emit_ns = 0;                      // under `lock`, exclusive
     std::atomic<u64> translate_ns{0};     // outside it, summed over threads
     /// Dispatcher lookups that took the lock, from threads that have detached (each attached
@@ -344,7 +299,7 @@ private:
     void StartRegion(size_t index);
     void RetireCurrentRegion(SharedThreadState& thread);
     void TryReclaimRetired();
-    bool TryReclaim(Region& region, bool parked_sites_known);
+    bool TryReclaim(Region& region);
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -767,12 +722,11 @@ SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes,
         , emitter(block_of_code, conf, nullptr, true)
         , polyfill_options(GenPolyfillOptions(block_of_code)) {
     emitter.shared_lock = &lock;
-    barrier_available = RegisterAsymmetricBarrier();
 
     region_bytes &= ~(SHARED_GRANULE - 1);
     u8* const first = AlignUp(block_of_code.getCurr<u8*>(), SHARED_GRANULE);
     u8* const last = AlignDown(const_cast<u8*>(block_of_code.GetCodeEnd()), SHARED_GRANULE);
-    if (region_bytes < 2 * SHARED_MINIMUM_SPAN || first >= last || static_cast<size_t>(last - first) / region_bytes < 2) {
+    if (region_bytes < SHARED_MINIMUM_REGION || first >= last || static_cast<size_t>(last - first) / region_bytes < 2) {
         throw std::invalid_argument("dynarmic: a shared code cache needs room for two regions of at least 8 MiB after its prelude");
     }
     for (u8* at = first; static_cast<size_t>(last - at) >= region_bytes; at += region_bytes) {
@@ -838,6 +792,11 @@ CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserC
     // pass of eight threads).
     bool waited = false;
     for (;;) {
+        if (waited) {
+            // Still in the dispatcher, holding nothing of any region: say so, so that waiting here
+            // does not keep a retired region from being given back.
+            Sync(thread);
+        }
         if (const auto found = Lookup(location)) {
             if (waited) {
                 translations_raced.fetch_add(1, std::memory_order_relaxed);
@@ -951,31 +910,10 @@ void SharedCodeCache::Impl::Invalidate(bool entire, const boost::icl::interval_s
 
 void SharedCodeCache::Impl::StartRegion(size_t index) {
     Region& r = regions[index];
-    // The largest span free of holes; a fresh region has none.
-    u8* best_begin = r.begin;
-    u8* best_end = r.begin;
-    u8* cursor = r.begin;
-    auto holes = r.holes;
-    std::sort(holes.begin(), holes.end());
-    for (const auto& [hole_begin, hole_end] : holes) {
-        if (hole_begin - cursor > best_end - best_begin) {
-            best_begin = cursor;
-            best_end = hole_begin;
-        }
-        cursor = std::max(cursor, hole_end);
-    }
-    if (r.end - cursor > best_end - best_begin) {
-        best_begin = cursor;
-        best_end = r.end;
-    }
-    r.use_begin = best_begin;
-    r.use_end = best_end;
-    r.code_committed_end = r.use_begin;
-    r.slot_top = r.use_end;
-    r.slots_committed_begin = r.use_end;
+    r.code_committed_end = r.begin;
     r.state = Region::State::Current;
     current = index;
-    block_of_code.SetCodePtr(r.use_begin);
+    block_of_code.SetCodePtr(r.begin);
 }
 
 void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held) {
@@ -983,8 +921,8 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
         if (current != NO_REGION) {
             Region& r = regions[current];
             u8* const cur = block_of_code.getCurr<u8*>();
-            if (r.slot_top - cur >= static_cast<ptrdiff_t>(SHARED_HEADROOM)) {
-                u8* const want = std::min(AlignUp(cur + MINIMUM_REMAINING_CODESIZE, SHARED_GRANULE), r.slots_committed_begin);
+            if (r.end - cur >= static_cast<ptrdiff_t>(SHARED_HEADROOM)) {
+                u8* const want = std::min(AlignUp(cur + MINIMUM_REMAINING_CODESIZE, SHARED_GRANULE), r.end);
                 if (want > r.code_committed_end) {
                     block_of_code.CommitRange(r.code_committed_end, static_cast<size_t>(want - r.code_committed_end));
                     r.code_committed_end = want;
@@ -1008,6 +946,7 @@ void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lo
         // thread outside generated code does not hold a region, so this ends -- but not with the
         // lock held, which a running thread may need to reach its halt check.
         held.unlock();
+        Sync(thread);  // in the dispatcher: holds no region, so it must not pin one while it waits
         std::this_thread::yield();
         held.lock();
     }
@@ -1050,77 +989,49 @@ void SharedCodeCache::Impl::TryReclaimRetired() {
         return;
     }
 
-    // Where each thread parked inside a callback will return to. Read only after the asymmetric
-    // barrier: a thread's plain store clearing its site (it returned) must be visible before the
-    // site is believed, and a thread that stores its site after the barrier reads the halt word
-    // after it too, so it leaves through its halt test (design section 6).
-    const bool known = barrier_available && AsymmetricBarrier();
+    reclaim_attempts++;
     for (Region& r : regions) {
         if (r.state == Region::State::Retired) {
-            TryReclaim(r, known);
+            TryReclaim(r);
         }
     }
 }
 
-bool SharedCodeCache::Impl::TryReclaim(Region& r, bool parked_sites_known) {
-    std::vector<std::pair<u8*, u8*>> holes;
+bool SharedCodeCache::Impl::TryReclaim(Region& r) {
+    // Every attached thread must be unable to execute this region again: outside RunCode, or
+    // entered (and synced) since the retirement, or parked in an SVC callback with its resume
+    // address -- the only address into generated code it holds -- outside the region, or swapped
+    // (compare-exchange against the thread's own take) for the prelude's `svc_resume_retired`.
+    u64 redirected_now = 0;
     {
         std::lock_guard guard{attach_lock};
         for (SharedThreadState* t : attached) {
             const u64 e = t->running_epoch.load(std::memory_order_seq_cst);
             if (e == NOT_RUNNING || e >= r.retired_epoch) {
-                continue;  // outside RunCode, or entered (and synced) since the retirement
+                continue;
             }
-            if (parked_sites_known) {
-                const u64 site = std::atomic_ref<u64>{t->jit_state->od_callback_return}.load(std::memory_order_seq_cst);
-                if (site != 0) {
-                    u8* const at = reinterpret_cast<u8*>(site);
-                    if (at >= r.begin && at < r.end) {
-                        holes.emplace_back(AlignDown(at - SHARED_HOLE_BEFORE, 4096), AlignUp(at + SHARED_HOLE_AFTER, 4096));
-                    }
-                    continue;  // parked in a callback, halted: it will leave through its block's tail
-                }
+            std::atomic_ref<u64> site_ref{t->jit_state->od_callback_return};
+            u64 site = site_ref.load(std::memory_order_seq_cst);
+            if (site == 0) {
+                return false;  // may be executing this region's code
             }
-            return false;  // may still be executing code in this region
+            u8* const at = reinterpret_cast<u8*>(site);
+            if (at < r.begin || at >= r.end) {
+                // Parked, and its block is elsewhere: on waking it finishes that block's tail,
+                // whose halt test -- the retirement raised the halt -- leaves the run.
+                continue;
+            }
+            const u64 resume = reinterpret_cast<u64>(emitter.SvcResumeRetired());
+            if (!site_ref.compare_exchange_strong(site, resume, std::memory_order_seq_cst)) {
+                return false;  // it woke and took its resume address: running this region
+            }
+            redirected_now++;
         }
     }
+    parked_redirected += redirected_now;
 
-    // Keep the holes committed and untouched; give the rest back.
-    std::sort(holes.begin(), holes.end());
-    u8* cursor = r.begin;
-    for (const auto& [hole_begin, hole_end] : holes) {
-        const u8* const b = std::max(hole_begin, r.begin);
-        if (b > cursor) {
-            block_of_code.DecommitRange(cursor, static_cast<size_t>(b - cursor));
-            emitter.PurgeFastmemPatchInfo(cursor, b);
-        }
-        cursor = std::max(cursor, std::min(hole_end, r.end));
-    }
-    if (r.end > cursor) {
-        block_of_code.DecommitRange(cursor, static_cast<size_t>(r.end - cursor));
-        emitter.PurgeFastmemPatchInfo(cursor, r.end);
-    }
-    r.holes = std::move(holes);
-
-    // Usable again only if a large enough span is free of holes.
-    u8* best = r.begin;
-    size_t best_len = 0;
-    u8* c = r.begin;
-    for (const auto& [hole_begin, hole_end] : r.holes) {
-        if (hole_begin > c && static_cast<size_t>(hole_begin - c) > best_len) {
-            best_len = static_cast<size_t>(hole_begin - c);
-            best = c;
-        }
-        c = std::max(c, hole_end);
-    }
-    if (r.end > c && static_cast<size_t>(r.end - c) > best_len) {
-        best_len = static_cast<size_t>(r.end - c);
-        best = c;
-    }
-    (void)best;
-    if (best_len < SHARED_MINIMUM_SPAN) {
-        return false;
-    }
+    block_of_code.DecommitRange(r.begin, static_cast<size_t>(r.end - r.begin));
+    emitter.PurgeFastmemPatchInfo(r.begin, r.end);
     r.state = Region::State::Free;
     regions_reclaimed++;
     retired_now.fetch_sub(1, std::memory_order_relaxed);
@@ -1164,8 +1075,7 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
     s.regions_retired = regions_retired;
     s.regions_reclaimed = regions_reclaimed;
     // The prelude's commit, up to where the regions start (Windows; 0 where pages come on first
-    // touch), then each region's: its code and slot spans unless it has been given back, and the
-    // holes kept for parked threads.
+    // touch), then each region's code, unless it has been given back.
     u64 committed = std::min<u64>(block_of_code.PreludeCommittedBytes(),
                                   static_cast<u64>(regions.front().begin - block_of_code.getCode()));
     for (const Region& r : regions) {
@@ -1173,12 +1083,11 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
             s.regions_pinned++;
         }
         if (r.state != Region::State::Free) {
-            committed += static_cast<u64>(r.code_committed_end - r.use_begin) + static_cast<u64>(r.use_end - r.slots_committed_begin);
-        }
-        for (const auto& [hole_begin, hole_end] : r.holes) {
-            committed += static_cast<u64>(hole_end - hole_begin);
+            committed += static_cast<u64>(r.code_committed_end - r.begin);
         }
     }
+    s.parked_redirected = parked_redirected;
+    s.reclaim_attempts = reclaim_attempts;
     s.committed_bytes = committed;
     {
         std::lock_guard attach_guard{attach_lock};

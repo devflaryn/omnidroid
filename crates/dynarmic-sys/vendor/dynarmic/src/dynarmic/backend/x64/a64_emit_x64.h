@@ -130,6 +130,24 @@ protected:
     void GenFastmemFallbacks();
 
     const void* terminal_handler_pop_rsb_hint;
+
+    // Omnidroid patch 0022, shared code cache only: every SVC callback is called from the prelude,
+    // not from its block, so that a thread parked inside one has no return address into a region
+    // on its stack. The block jumps to `svc_trampoline` with its resume address in rax and the
+    // immediate in the callback's second argument; the trampoline publishes the resume address in
+    // `JitState::od_callback_return`, calls, then takes it back with an `xchg` (clearing it) and
+    // jumps there. A reclaimer that finds a parked thread's resume address in a retiring region
+    // swaps it -- one compare-exchange -- for `svc_resume_retired`, which leaves the run as the
+    // block's own halt test would have: the region is then free of that thread.
+    const void* svc_trampoline = nullptr;
+    const void* svc_resume_retired = nullptr;
+    void GenSharedSvcTrampolines();
+
+public:
+    /// Shared code cache only: where a parked thread is sent instead of a retired region.
+    const void* SvcResumeRetired() const { return svc_resume_retired; }
+
+protected:
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     /// Patch 0022: the same hash, for a table given as the second argument (a thread's own).

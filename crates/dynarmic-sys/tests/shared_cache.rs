@@ -527,6 +527,109 @@ fn a_thread_parked_in_a_callback_does_not_hold_a_retired_region() {
     assert_eq!(x0, 7, "P finished its block's tail and the rest of its code correctly");
 }
 
+/// **Threads parked all over a region do not fragment it** -- the in-world failure of 2026-09-25
+/// (D38 amendment 1). A game world keeps dozens of threads parked inside `SVC` callbacks (imports
+/// that wait), each with its return address in whichever region was current when it parked. The
+/// first version kept a hole of pages around each such address when the region was given back, and
+/// reused the region only if its largest hole-free span was at least 4 MiB: with the parked
+/// threads' blocks spread through the region, it came back in small pieces or not at all, and a
+/// working set larger than the piece it was given filled it, retired it, forgot every block and
+/// started again, for minutes (w24: translation at 120-240k instructions a second, memory flat).
+///
+/// Twelve threads park, one after each twelfth of a translation that fills and retires a region,
+/// and a second fill retires the next. While they are all still parked, every retired region must
+/// be given back whole (their resume addresses moved to the prelude); on waking each must finish
+/// correctly; and a working set run over and over afterwards must reach a steady state.
+#[test]
+fn threads_parked_all_over_a_region_do_not_fragment_it() {
+    const PARKED: usize = 12;
+    const SEGMENT: usize = 12_000; // blocks per segment: twelve segments are more than a region
+    const WORKING_SET: usize = 20_000;
+    // Segment k: SEGMENT x (ADD X0, X0, #1 ; B +1), then SVC #0. After the segments, the working
+    // set (the same shape). After that, park stub i: MOVZ X0, #i ; SVC #1 (sleeps) ; SVC #0.
+    let mut program = Vec::new();
+    let mut segment_at = Vec::new();
+    for _ in 0..PARKED {
+        segment_at.push(program.len());
+        program.extend(chain(SEGMENT));
+    }
+    let working_set_at = program.len();
+    program.extend(chain(WORKING_SET));
+    let mut stub_at = Vec::new();
+    for i in 0..PARKED {
+        stub_at.push(program.len());
+        program.extend([a64::movz(0, i as u16, 0), a64::svc(1), a64::svc(0)]);
+    }
+    let space = Space::new(VmOptions { cycle_counting: true, ..VmOptions::default() }, PARKED as u64 + 1, 40 << 20, 8 << 20, &program);
+    let q = space.vm(PARKED as u32, true);
+    let run_q = |at: usize| {
+        q.start(u64::MAX >> 2);
+        q.set_pc(CODE_BASE + 4 * at as u64);
+        q.set_reg(0, 0);
+        assert_eq!(q.run_to_completion(64) & HALT_DONE, HALT_DONE);
+    };
+
+    let mut parked = Vec::new();
+    for (k, &segment) in segment_at.iter().enumerate() {
+        run_q(segment);
+        // P_k translates its stub now -- right after segment k's code -- and parks in it.
+        let before = space.stats().blocks_emitted;
+        let space_k = Arc::clone(&space);
+        let stub = stub_at[k];
+        parked.push(std::thread::spawn(move || {
+            let vm = space_k.vm(k as u32, true);
+            vm.with_ctx(|c| {
+                c.sleep_on_svc1_us = 8_000_000;
+                c.halt_on_svc = true;
+            });
+            vm.start(u64::MAX >> 2);
+            vm.set_pc(CODE_BASE + 4 * stub as u64);
+            assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+            (vm.reg(0), vm.with_ctx(|c| c.svc.clone()))
+        }));
+        while space.stats().blocks_emitted == before {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A second fill, so the region the later threads parked in is retired too.
+    // SAFETY: the cache is live; this thread is not executing a jit on it.
+    unsafe { od_code_cache_clear(space.cache as *mut c_void) };
+    for &segment in &segment_at {
+        run_q(segment);
+    }
+    let during = space.stats();
+    println!("with {PARKED} threads parked: {during:?}");
+    assert!(during.regions_retired >= 2, "the fills retired regions: {during:?}");
+    assert_eq!(
+        during.regions_pinned, 0,
+        "every retired region was given back although {PARKED} threads were parked in them: {during:?}"
+    );
+    assert!(during.parked_redirected >= PARKED as u64 / 2, "{during:?}");
+    assert!(parked.iter().all(|p| !p.is_finished()), "the threads were still parked throughout");
+
+    for (i, p) in parked.into_iter().enumerate() {
+        let (x0, svc) = p.join().expect("a parked thread");
+        assert_eq!((x0, svc), (i as u64, vec![1, 0]), "parked thread {i} finished correctly");
+    }
+
+    // And the working set settles: after it has been translated, running it again translates
+    // nothing and retires nothing.
+    run_q(working_set_at);
+    run_q(working_set_at);
+    let settled = space.stats();
+    for _ in 0..3 {
+        run_q(working_set_at);
+        assert_eq!(q.reg(0), WORKING_SET as u64);
+    }
+    let after = space.stats();
+    assert_eq!(
+        (after.blocks_emitted, after.regions_retired),
+        (settled.blocks_emitted, settled.regions_retired),
+        "the working set was translated again: {settled:?} -> {after:?}"
+    );
+}
+
 /// **A link to an invalidated block is undone**, while the block that links to it stays: jit A
 /// runs `B` to a block (linking the two through a slot); jit B invalidates only the target, after
 /// its code changed; A's next run enters the kept first block, whose slot must now lead to the
