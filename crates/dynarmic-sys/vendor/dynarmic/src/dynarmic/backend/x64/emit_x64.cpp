@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <atomic>
 #include <iterator>
+#include <limits>
+#include <utility>
 
 #include <mcl/assert.hpp>
 #include <mcl/bit/bit_field.hpp>
@@ -45,6 +47,7 @@ void EmitContext::EraseInstruction(IR::Inst* inst) {
 EmitX64::EmitX64(BlockOfCode& code)
         : code(code) {
     exception_handler.Register(code);
+    UseLoadFactor(link_heads, LINK_HEADS_LOAD_FACTOR);
 }
 
 EmitX64::~EmitX64() = default;
@@ -347,7 +350,10 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
     PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
     Patch(descriptor, entrypoint);
 
-    BlockDescriptor block_desc{entrypoint, size};
+    ASSERT(size <= std::numeric_limits<u32>::max());
+    BlockDescriptor block_desc{entrypoint, static_cast<u32>(size)};
+    // Omnidroid patch 0025: the block's link records, which EmitPendingSlots has just made.
+    block_desc.first_link = std::exchange(pending_first_link, NO_LINK);
     block_descriptors.insert({IR::LocationDescriptor{descriptor.Value()}, block_desc});
     return block_desc;
 }
@@ -364,6 +370,23 @@ void EmitX64::EmitTerminal(IR::Terminal terminal, IR::LocationDescriptor initial
 }
 
 void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    if (shared_code) {
+        // Omnidroid patch 0022: a shared cache's links. One aligned 8-byte store each: a thread
+        // loading the slot sees the old target or the new one, and both are code. Patch 0025:
+        // they are the records listed from the target's head -- and a target nothing links to
+        // has no entry, rather than one made here for every block emitted.
+        const auto head = link_heads.find(target_desc.Value());
+        if (head == link_heads.end()) {
+            return;
+        }
+        for (u32 i = head->second; i != NO_LINK; i = link_records[i].next) {
+            const LinkRecord& link = link_records[i];
+            const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : LinkUnlinkedOf(link);
+            std::atomic_ref<u64>{*LinkSlotOf(link)}.store(value, std::memory_order_release);
+        }
+        return;
+    }
+
     const CodePtr save_code_ptr = code.getCurr();
     const PatchInformation& patch_info = patch_information[target_desc];
 
@@ -388,13 +411,14 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
     }
 
     code.SetCodePtr(save_code_ptr);
+}
 
-    // Omnidroid patch 0022: a shared cache's links. One aligned 8-byte store each: a thread
-    // loading the slot sees the old target or the new one, and both are code.
-    for (const LinkSlot& link : patch_info.slots) {
-        const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : link.unlinked;
-        std::atomic_ref<u64>{*link.slot}.store(value, std::memory_order_release);
-    }
+u64* EmitX64::LinkSlotOf(const LinkRecord& record) const {
+    return reinterpret_cast<u64*>(const_cast<u8*>(code.getCode()) + (record.slot & ~LAST_LINK_OF_BLOCK));
+}
+
+u64 EmitX64::LinkUnlinkedOf(const LinkRecord& record) const {
+    return reinterpret_cast<u64>(code.getCode() + record.unlinked);
 }
 
 Xbyak::Label& EmitX64::NewLinkSlot(const IR::LocationDescriptor& target, u64 unlinked, std::shared_ptr<Xbyak::Label> tail) {
@@ -403,12 +427,21 @@ Xbyak::Label& EmitX64::NewLinkSlot(const IR::LocationDescriptor& target, u64 unl
     return *pending_slots.back().label;
 }
 
-void EmitX64::EmitPendingSlots(const IR::LocationDescriptor& location) {
+void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
+    pending_first_link = NO_LINK;
     if (pending_slots.empty()) {
         return;
     }
-    auto& own = outgoing_slots[location];
+    // Offsets from the buffer's start, below LAST_LINK_OF_BLOCK: a shared cache is at most 2 GiB.
+    const u8* const base = code.getCode();
+    const auto offset_of = [base](u64 address) {
+        const u64 offset = address - reinterpret_cast<u64>(base);
+        ASSERT(address >= reinterpret_cast<u64>(base) && offset < LAST_LINK_OF_BLOCK);
+        return static_cast<u32>(offset);
+    };
+    ASSERT(link_records.size() + pending_slots.size() < NO_LINK);
     code.align(8);
+    pending_first_link = static_cast<u32>(link_records.size());
     for (PendingSlot& pending : pending_slots) {
         code.L(*pending.label);
         u64* const slot = code.getCurr<u64*>();
@@ -418,44 +451,148 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor& location) {
         // Not yet published: no thread has been given this block, so a plain store is enough. The
         // block becomes reachable through the block map or another slot, both written after this.
         *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(iter->second.entrypoint) : unlinked;
-        patch_information[pending.target].slots.push_back(LinkSlot{slot, unlinked});
-        own.emplace_back(pending.target, slot);
+        // Patch 0025: the newest record heads its target's list.
+        const u32 index = static_cast<u32>(link_records.size());
+        const u64 target = pending.target.Value();
+        LinkRecord record{target, offset_of(reinterpret_cast<u64>(slot)), offset_of(unlinked), NO_LINK, NO_LINK};
+        const auto [head, fresh] = link_heads.try_emplace(target, index);
+        if (!fresh) {
+            record.next = head->second;
+            link_records[head->second].prev = index;
+            head.value() = index;
+        }
+        link_records.push_back(record);
     }
+    link_records.back().slot |= LAST_LINK_OF_BLOCK;
     pending_slots.clear();
 }
 
-void EmitX64::ForgetOutgoingSlots(const IR::LocationDescriptor& location) {
-    const auto own = outgoing_slots.find(location);
-    if (own == outgoing_slots.end()) {
+void EmitX64::ForgetOutgoingSlots(u32 first_link) {
+    if (first_link == NO_LINK) {
         return;
     }
-    for (const auto& [target, slot] : own->second) {
-        const auto info = patch_information.find(target);
-        if (info == patch_information.end()) {
-            continue;
+    for (u32 i = first_link;; i++) {
+        LinkRecord& link = link_records[i];
+        // A thread still running the dropped block leaves it for the dispatcher at this link.
+        std::atomic_ref<u64>{*LinkSlotOf(link)}.store(LinkUnlinkedOf(link), std::memory_order_release);
+        // Out of its target's list; the record itself stays, dead, until the maps are emptied.
+        if (link.prev != NO_LINK) {
+            link_records[link.prev].next = link.next;
+        } else if (link.next != NO_LINK) {
+            link_heads[link.target] = link.next;
+        } else {
+            link_heads.erase(link.target);
         }
-        auto& slots = info.value().slots;
-        const auto at = std::find_if(slots.begin(), slots.end(), [slot = slot](const LinkSlot& l) { return l.slot == slot; });
-        if (at != slots.end()) {
-            // A thread still running the dropped block leaves it for the dispatcher at this link.
-            std::atomic_ref<u64>{*at->slot}.store(at->unlinked, std::memory_order_release);
-            *at = slots.back();
-            slots.pop_back();
+        if (link.next != NO_LINK) {
+            link_records[link.next].prev = link.prev;
+        }
+        link.next = link.prev = NO_LINK;
+        if (link.slot & LAST_LINK_OF_BLOCK) {
+            break;
         }
     }
-    outgoing_slots.erase(own);
 }
 
 void EmitX64::UnlinkAllSlots() {
-    for (auto& [target, info] : patch_information) {
-        for (const LinkSlot& link : info.slots) {
-            std::atomic_ref<u64>{*link.slot}.store(link.unlinked, std::memory_order_release);
+    // Every record, live or dead: a dead one's slot already holds its unlinked value, and its
+    // block's code is still there (records are emptied with the maps, before any region they
+    // name is given back).
+    for (const LinkRecord& link : link_records) {
+        std::atomic_ref<u64>{*LinkSlotOf(link)}.store(LinkUnlinkedOf(link), std::memory_order_release);
+    }
+}
+
+void EmitX64::BeginFastmemSites(const void* begin, const void* end) {
+    ASSERT(shared_code);
+    const u8* const b = static_cast<const u8*>(begin);
+    const u8* const e = static_cast<const u8*>(end);
+    // Offsets from `begin` are 32 bits: a region is far smaller than the 2 GiB a shared cache may be.
+    ASSERT(b < e && static_cast<u64>(e - b) <= std::numeric_limits<u32>::max());
+    for (FastmemSiteRun& run : fastmem_site_runs) {
+        if (run.begin == b) {
+            ASSERT(run.end == e);
+            std::vector<FastmemSite>{}.swap(run.sites);
+            return;
+        }
+        // Runs are regions: they never overlap.
+        ASSERT(e <= run.begin || run.end <= b);
+    }
+    fastmem_site_runs.push_back(FastmemSiteRun{b, e, {}});
+}
+
+void EmitX64::PurgeFastmemSites(const void* begin, const void* end) {
+    ASSERT(shared_code);
+    const u8* const b = static_cast<const u8*>(begin);
+    const u8* const e = static_cast<const u8*>(end);
+    for (FastmemSiteRun& run : fastmem_site_runs) {
+        if (b <= run.begin && run.end <= e) {
+            std::vector<FastmemSite>{}.swap(run.sites);
+        } else {
+            // A run is purged whole, with the region it is: never in part.
+            ASSERT(e <= run.begin || run.end <= b);
         }
     }
 }
 
+void EmitX64::RecordSharedFastmemSite(u64 site, u64 resume, u64 callback) {
+    ASSERT(shared_code);
+    pending_fastmem_sites.push_back(PendingFastmemSite{site, resume, callback});
+}
+
+void EmitX64::CommitSharedFastmemSites() {
+    if (pending_fastmem_sites.empty()) {
+        return;
+    }
+    SCOPE_EXIT {
+        pending_fastmem_sites.clear();
+    };
+    // Stable: of two records for one instruction the first stands, as `emplace` into the map did.
+    std::stable_sort(pending_fastmem_sites.begin(), pending_fastmem_sites.end(),
+                     [](const PendingFastmemSite& a, const PendingFastmemSite& b) { return a.site < b.site; });
+    const u64 first = pending_fastmem_sites.front().site;
+    const auto run = std::find_if(fastmem_site_runs.begin(), fastmem_site_runs.end(), [first](const FastmemSiteRun& r) {
+        return reinterpret_cast<u64>(r.begin) <= first && first < reinterpret_cast<u64>(r.end);
+    });
+    // Every block of a shared cache is emitted inside a region, and every region is a run.
+    ASSERT(run != fastmem_site_runs.end());
+    const u64 base = reinterpret_cast<u64>(run->begin);
+    const u64 limit = reinterpret_cast<u64>(run->end);
+    // A block is emitted above everything emitted in its region before it, so a record at or above
+    // its first site describes code that is no longer there (an emission that threw after its
+    // sites were committed) -- dropped rather than left to answer for this block's code.
+    const u32 first_offset = static_cast<u32>(first - base);
+    while (!run->sites.empty() && run->sites.back().site >= first_offset) {
+        run->sites.pop_back();
+    }
+    for (const PendingFastmemSite& p : pending_fastmem_sites) {
+        ASSERT(p.site >= base && p.site < limit && p.resume >= base && p.resume < limit);
+        const u32 site = static_cast<u32>(p.site - base);
+        if (!run->sites.empty() && run->sites.back().site == site) {
+            continue;
+        }
+        run->sites.push_back(FastmemSite{site, static_cast<u32>(p.resume - base), p.callback});
+    }
+}
+
+std::optional<FakeCall> EmitX64::FindSharedFastmemSite(u64 fault_rip) const {
+    for (const FastmemSiteRun& run : fastmem_site_runs) {
+        const u64 base = reinterpret_cast<u64>(run.begin);
+        if (fault_rip < base || fault_rip >= reinterpret_cast<u64>(run.end)) {
+            continue;
+        }
+        const u32 offset = static_cast<u32>(fault_rip - base);
+        const auto it = std::lower_bound(run.sites.begin(), run.sites.end(), offset,
+                                         [](const FastmemSite& s, u32 o) { return s.site < o; });
+        if (it == run.sites.end() || it->site != offset) {
+            return std::nullopt;
+        }
+        return FakeCall{.call_rip = it->callback, .ret_rip = base + it->resume};
+    }
+    return std::nullopt;
+}
+
 void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
-    if (patch_information.count(target_desc)) {
+    if (shared_code || patch_information.count(target_desc)) {
         Patch(target_desc, nullptr);
     }
 }
@@ -463,7 +600,12 @@ void EmitX64::Unpatch(const IR::LocationDescriptor& target_desc) {
 void EmitX64::ClearCache() {
     block_descriptors.clear();
     patch_information.clear();
-    outgoing_slots.clear();
+    // Omnidroid patch 0025: given back, not kept at capacity -- the records of every block the
+    // cache held, which it forgets whole only when a region is retired or the cache cleared.
+    std::vector<LinkRecord>{}.swap(link_records);
+    link_heads = {};
+    UseLoadFactor(link_heads, LINK_HEADS_LOAD_FACTOR);
+    pending_first_link = NO_LINK;
 
     PerfMapClear();
 }
@@ -482,7 +624,7 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
 
         Unpatch(descriptor);
         if (shared_code) {
-            ForgetOutgoingSlots(descriptor);  // Omnidroid patch 0022
+            ForgetOutgoingSlots(it->second.first_link);  // Omnidroid patches 0022, 0025
         }
 
         block_descriptors.erase(it);

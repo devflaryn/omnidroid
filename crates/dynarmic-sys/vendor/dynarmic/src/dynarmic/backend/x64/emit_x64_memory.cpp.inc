@@ -26,13 +26,33 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
     return marker;
 }
 
+void AxxEmitX64::RecordFastmemSite(u64 site, u64 resume, u64 callback, const DoNotFastmemMarker& marker, bool recompile) {
+    if (shared_code) {
+        // Omnidroid patch 0025: a shared cache keeps sorted records per region (EmitX64). Its
+        // template forces the recompile flags off, so the marker is never needed there.
+        ASSERT(!recompile);
+        RecordSharedFastmemSite(site, resume, callback);
+        return;
+    }
+    fastmem_patch_info.emplace(site, FastmemPatchInfo{resume, callback, marker, recompile});
+}
+
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
-    // Omnidroid patch 0022: in a shared code cache another thread may be emitting (inserting into
-    // fastmem_patch_info) while this one faults, so the lookup takes the cache's lock, shared. The
-    // faulting thread cannot already hold it: generated code never runs inside a lookup.
+    // Omnidroid patch 0022: in a shared code cache another thread may be emitting (adding fastmem
+    // records) while this one faults, so the lookup takes the cache's lock, shared. The faulting
+    // thread cannot already hold it: generated code never runs inside a lookup.
     std::shared_lock<SharedCodeLock> lock;
     if (shared_lock) {
         lock = std::shared_lock<SharedCodeLock>{*shared_lock};
+    }
+    if (shared_code) {
+        // Omnidroid patch 0025.
+        if (const auto found = FindSharedFastmemSite(rip_)) {
+            return *found;
+        }
+        fmt::print("dynarmic: Segfault happened within JITted code at rip = {:016x}\n", rip_);
+        fmt::print("Segfault wasn't at a fastmem patch location!\n");
+        ASSERT_FALSE("the faulting rip is a recorded fastmem site");
     }
     const auto iter = fastmem_patch_info.find(rip_);
 
@@ -114,14 +134,8 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
-                mcl::bit_cast<u64>(location),
-                FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
-                    *fastmem_marker,
-                    conf.recompile_on_fastmem_failure,
-                });
+            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+                              mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
 
             EmitCheckMemoryAbort(ctx, inst, end.get());
             code.jmp(*end, code.T_NEAR);
@@ -201,14 +215,8 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
-                mcl::bit_cast<u64>(location),
-                FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
-                    *fastmem_marker,
-                    conf.recompile_on_fastmem_failure,
-                });
+            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+                              mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
 
             EmitCheckMemoryAbort(ctx, inst, end.get());
             code.jmp(*end, code.T_NEAR);
@@ -381,14 +389,8 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        fastmem_patch_info.emplace(
-            mcl::bit_cast<u64>(location),
-            FastmemPatchInfo{
-                mcl::bit_cast<u64>(code.getCurr()),
-                mcl::bit_cast<u64>(wrapped_fn),
-                *fastmem_marker,
-                conf.recompile_on_exclusive_fastmem_failure,
-            });
+        RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+                          mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
 
         code.L(*end);
 
@@ -519,14 +521,8 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
             code.L(*abort);
             code.call(wrapped_fn);
 
-            fastmem_patch_info.emplace(
-                mcl::bit_cast<u64>(location),
-                FastmemPatchInfo{
-                    mcl::bit_cast<u64>(code.getCurr()),
-                    mcl::bit_cast<u64>(wrapped_fn),
-                    *fastmem_marker,
-                    conf.recompile_on_exclusive_fastmem_failure,
-                });
+            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+                              mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
 
             code.cmp(al, 0);
             code.setz(status.cvt8());

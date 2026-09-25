@@ -110,6 +110,8 @@ fn units(units: usize) -> Vec<u32> {
 
 const UNITS: usize = 32_768;
 const BLOCKS: usize = 2 * UNITS;
+/// What a block of [`units`]' shape may cost in the shared cache's tables.
+const BYTES_PER_BLOCK_BOUND: f64 = 550.0;
 
 /// One guest address space on a shared cache big enough that nothing is retired.
 struct Shared {
@@ -208,6 +210,13 @@ fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
         );
     }
     eprintln!("  the census: {:.0} bytes per block", counted as f64 / BLOCKS as f64);
+    // MEASURED: 1,144 bytes per block on the pin (patch 0024's census); the bound sits above what
+    // the flat records cost (patch 0025) and well below what the maps did.
+    assert!(
+        per_block < BYTES_PER_BLOCK_BOUND,
+        "{per_block:.0} bytes of bookkeeping per block: the shared cache is keeping its links or \
+         fastmem sites in maps of fat buckets again"
+    );
 
     // The census is what `OMNI_MEM_REPORT` says the heap holds for the cache: it must account for
     // what the heap grew by (less the allocator's own headers, and the few blocks of the jit's own
@@ -224,6 +233,40 @@ fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
             assert!(span >= t.largest_bytes as usize, "{name}: its address is in an allocation of {span} bytes, not {}", t.largest_bytes);
         }
     }
+}
+
+/// **A region given back takes its fastmem records with it** (patch 0025): the sites are records of
+/// the region they are in, dropped when it is reclaimed -- not entries of one map that only grows.
+/// The chain is longer than a region, so running it again after each clear retires regions, and
+/// the cache gives them back between passes.
+#[test]
+fn a_region_given_back_takes_its_fastmem_records_with_it() {
+    let _g = lock();
+    let arena: &'static mut [u64] = Box::leak(vec![0u64; (MEM_SIZE + MEM_GUARD) / 8].into_boxed_slice());
+    let arena = arena.as_mut_ptr();
+    // SAFETY: freed below, after the jit.
+    let monitor = unsafe { od_monitor_new(1) };
+    let opts = VmOptions { shared_arena: arena as usize, shared_monitor: monitor as usize, ..VmOptions::default() };
+    let cache = Vm::new_code_cache(&opts, monitor, arena, 40 << 20, 8 << 20);
+    assert!(!cache.is_null());
+    let shared = Shared { vm: Some(Vm::new(units(UNITS), VmOptions { shared_cache: cache as usize, ..opts })), cache, monitor };
+    for _ in 0..4 {
+        shared.run();
+        // SAFETY: the cache is live and its one jit is not executing.
+        unsafe { od_code_cache_clear(shared.cache) };
+    }
+    shared.run();
+    let stats = shared.stats();
+    let sites = shared.tables().fastmem_sites;
+    eprintln!("{} fastmem records for {} blocks emitted; {stats:?}", sites.entries, stats.blocks_emitted);
+    assert!(stats.regions_reclaimed >= 1, "regions were given back: {stats:?}");
+    // One site per block emitted, on average, in this shape: every record kept would be as many.
+    assert!(
+        sites.entries + 1_000 < stats.blocks_emitted,
+        "{} fastmem records for {} blocks emitted: a reclaimed region's records were kept",
+        sites.entries,
+        stats.blocks_emitted
+    );
 }
 
 /// The bytes from the start of the allocation holding `address` to its end, per the OS.

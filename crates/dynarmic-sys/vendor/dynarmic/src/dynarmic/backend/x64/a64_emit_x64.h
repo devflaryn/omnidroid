@@ -60,11 +60,11 @@ public:
     /// InvalidateCacheRanges, returning how many blocks it dropped.
     size_t InvalidateCacheRangesCounted(const boost::icl::interval_set<u64>& ranges);
     /// Forget every block: unlink every slot and empty the block map, the link table and the
-    /// guest ranges. The code stays where it is (threads may be running it), and so does
-    /// `fastmem_patch_info`, which a thread faulting in that code still needs.
+    /// guest ranges. The code stays where it is (threads may be running it), and so do its
+    /// fastmem records (patch 0025: its region's), which a thread faulting in that code still needs.
     size_t ForgetAllBlocks();
     /// Drop the fastmem records of faulting sites in `[begin, end)`: that memory is being given
-    /// back and nothing can execute it any more.
+    /// back and nothing can execute it any more (patch 0025: the region's records, whole).
     void PurgeFastmemPatchInfo(const void* begin, const void* end);
     /// Bytes of one thread's fast-dispatch table, and resetting one (each thread of a shared
     /// cache owns its table; the handler finds it through JitState::od_fast_dispatch_table).
@@ -182,6 +182,9 @@ protected:
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
+    /// Omnidroid patch 0025: record a fastmem patch site -- in `fastmem_patch_info`, or, in a
+    /// shared code cache, as a sorted record of its region.
+    void RecordFastmemSite(u64 site, u64 resume, u64 callback, const DoNotFastmemMarker& marker, bool recompile);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);

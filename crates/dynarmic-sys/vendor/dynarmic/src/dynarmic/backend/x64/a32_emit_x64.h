@@ -118,6 +118,9 @@ protected:
     std::set<DoNotFastmemMarker> do_not_fastmem;
     std::optional<DoNotFastmemMarker> ShouldFastmem(A32EmitContext& ctx, IR::Inst* inst) const;
     FakeCall FastmemCallback(u64 rip);
+    /// Omnidroid patch 0025: record a fastmem patch site -- in `fastmem_patch_info`, or, in a
+    /// shared code cache, as a sorted record of its region.
+    void RecordFastmemSite(u64 site, u64 resume, u64 callback, const DoNotFastmemMarker& marker, bool recompile);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);

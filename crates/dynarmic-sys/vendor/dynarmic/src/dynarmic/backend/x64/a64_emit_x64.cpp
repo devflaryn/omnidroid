@@ -84,6 +84,12 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     };
     // Omnidroid patch 0022: nothing is left over from an emission that threw.
     pending_slots.clear();
+    pending_fastmem_sites.clear();  // patch 0025
+    // Patch 0025: records made for a block whose emission then threw name no block; out of their
+    // targets' lists with them (their slots, in code nothing reaches, are unlinked on the way).
+    if (pending_first_link != NO_LINK) {
+        ForgetOutgoingSlots(std::exchange(pending_first_link, NO_LINK));
+    }
 
     const std::vector<HostLoc> gpr_order = [this] {
         std::vector<HostLoc> gprs{any_gpr};
@@ -151,6 +157,8 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     if (shared_code) {
         // Omnidroid patch 0022: the block's link slots, right after its code.
         EmitPendingSlots(block.Location());
+        // Patch 0025: the block's fastmem sites, now that its code is complete.
+        CommitSharedFastmemSites();
     }
 
     const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
@@ -201,15 +209,8 @@ size_t A64EmitX64::ForgetAllBlocks() {
 }
 
 void A64EmitX64::PurgeFastmemPatchInfo(const void* begin, const void* end) {
-    const u64 lo = reinterpret_cast<u64>(begin);
-    const u64 hi = reinterpret_cast<u64>(end);
-    for (auto it = fastmem_patch_info.begin(); it != fastmem_patch_info.end();) {
-        if (it->first >= lo && it->first < hi) {
-            it = fastmem_patch_info.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    // Patch 0025: a shared cache's sites are records of the region, given back with it.
+    PurgeFastmemSites(begin, end);
 }
 
 CodePtr A64EmitX64::ProbeFastDispatchTable(void* table, u64 descriptor) const {
@@ -250,18 +251,34 @@ A64::SharedCodeCache::Tables A64EmitX64::Census() const {
     A64::SharedCodeCache::Tables t;
     t.blocks = RobinMapFigure(block_descriptors);
 
-    t.link_targets = RobinMapFigure(patch_information);
-    for (const auto& [target, info] : patch_information) {
-        t.link_targets.bytes += VectorBytes(info.jg) + VectorBytes(info.jz) + VectorBytes(info.jmp)
-                              + VectorBytes(info.mov_rcx) + VectorBytes(info.slots);
+    // A Jit's own cache links through `patch_information`; a shared one through the link records
+    // and their targets' heads (patch 0025).
+    if (shared_code) {
+        t.link_targets = RobinMapFigure(link_heads);
+    } else {
+        t.link_targets = RobinMapFigure(patch_information);
+        for (const auto& [target, info] : patch_information) {
+            t.link_targets.bytes += VectorBytes(info.jg) + VectorBytes(info.jz) + VectorBytes(info.jmp)
+                                  + VectorBytes(info.mov_rcx);
+        }
     }
 
-    t.links = RobinMapFigure(outgoing_slots);
-    for (const auto& [location, own] : outgoing_slots) {
-        t.links.bytes += VectorBytes(own);
-    }
+    t.links.entries = link_records.size();
+    t.links.bytes = VectorBytes(link_records);
+    t.links.largest_bytes = t.links.bytes;
+    t.links.largest_address = reinterpret_cast<std::uintptr_t>(link_records.data());
 
     t.fastmem_sites = RobinMapFigure(fastmem_patch_info);
+    // Patch 0025: a shared cache's sites, one record each, per region.
+    t.fastmem_sites.bytes += VectorBytes(fastmem_site_runs) + VectorBytes(pending_fastmem_sites);
+    for (const FastmemSiteRun& run : fastmem_site_runs) {
+        t.fastmem_sites.entries += run.sites.size();
+        t.fastmem_sites.bytes += VectorBytes(run.sites);
+        if (VectorBytes(run.sites) > t.fastmem_sites.largest_bytes) {
+            t.fastmem_sites.largest_bytes = VectorBytes(run.sites);
+            t.fastmem_sites.largest_address = reinterpret_cast<std::uintptr_t>(run.sites.data());
+        }
+    }
 
     // boost::icl's interval_map: one tree node per interval holding a std::set, whose own tree has
     // a node per location (MSVC's also allocates a head node per set). Estimated from sizeof and a

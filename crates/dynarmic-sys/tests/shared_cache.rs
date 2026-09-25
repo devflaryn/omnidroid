@@ -660,6 +660,60 @@ fn a_link_to_an_invalidated_block_is_undone() {
     );
 }
 
+/// **Every block linking to a target is unlinked from it when it goes, however the list of its
+/// linkers was edited before** (patch 0025: the slots linking to a target are a list threaded
+/// through the link records, from the target's head). Four blocks, translated in order, branch to
+/// one target; some of them are dropped -- from the middle of the list, its head, its tail -- and
+/// translated again, which puts them back at the head; then the target's code changes. Every one
+/// of the four must run the new code: a linker the list lost would still jump to the old
+/// translation.
+#[test]
+fn every_block_linking_to_a_target_is_unlinked_from_it_whatever_was_dropped_before() {
+    // 0, 2, 4, 6: ADD X1, X1, #1 ; B -> 8.  8: MOVZ X0, #k (rewritten) ; 9: SVC #0
+    let mut program = Vec::new();
+    for linker in 0..4 {
+        program.push(a64::add_imm(1, 1, 1));
+        program.push(a64::b(8 - (2 * linker + 1)));
+    }
+    program.push(a64::movz(0, 1, 0));
+    program.push(a64::svc(0));
+    let space = Space::new(VmOptions::default(), 1, CACHE, REGION, &program);
+    let vm = space.vm(0, true);
+    let run_from = |linker: u64| -> u64 {
+        vm.set_pc(CODE_BASE + 8 * linker);
+        vm.with_ctx(|c| c.ticks_remaining = u64::MAX);
+        assert_eq!(vm.run_to_completion(16) & HALT_DONE, HALT_DONE, "from linker {linker}");
+        vm.reg(0)
+    };
+    let drop_linker = |linker: u64| {
+        // SAFETY: the cache is live and no jit of it is executing.
+        unsafe { od_code_cache_invalidate_range(space.cache as *mut c_void, CODE_BASE + 8 * linker, 8) };
+    };
+    for (round, dropped) in [&[1u64][..], &[3], &[0], &[2, 1], &[3, 0, 2], &[2], &[0, 3, 1, 2]].into_iter().enumerate() {
+        let value = round as u64 + 2;
+        for linker in 0..4 {
+            assert_eq!(run_from(linker), value - 1, "round {round}: linker {linker} before the change");
+        }
+        let linked = space.stats().blocks_emitted;
+        for linker in 0..4 {
+            assert_eq!(run_from(linker), value - 1, "round {round}: linker {linker} again");
+        }
+        assert_eq!(space.stats().blocks_emitted, linked, "round {round}: the second pass ran through the links");
+        for &linker in dropped {
+            drop_linker(linker);
+        }
+        // Translated again: back at the head of the target's list.
+        for &linker in dropped {
+            assert_eq!(run_from(linker), value - 1, "round {round}: dropped linker {linker}, translated again");
+        }
+        space.rewrite(8, a64::movz(0, value as u16, 0));
+        space.invalidate(8);
+        for linker in 0..4 {
+            assert_eq!(run_from(linker), value, "round {round}: linker {linker} after the target changed");
+        }
+    }
+}
+
 /// **A translation made while its code is invalidated is not published.** A jit translating a
 /// block outside the cache's lock reads the old word; before it emits, another thread rewrites the
 /// word and invalidates it. The translation must be made again (under the lock) and the run -- and

@@ -733,6 +733,52 @@ fastmem sites 112, guest ranges 144 -- and **944 are still held after the cache 
 requires the census within 15% of what the heap grew by, and each table's named address inside an
 allocation at least as large as the one it sizes.
 
+### 0025 — x64 shared cache: link slots and fastmem sites as flat records
+
+`0025-x64-shared-cache-links-and-fastmem-sites-as-flat-records.patch`. **x64; what a shared cache
+keeps, not what it emits or when** -- the one change a Jit with its own cache sees is
+`BlockDescriptor::size` as 32 bits beside a new 32-bit `first_link` (still 16 bytes), and
+`PatchInformation` without 0022's `slots` vector (upstream's four again).
+
+* **Link slots** (0022 kept them in `patch_information`, one entry -- five `std::vector`s inline, a
+  136-byte bucket -- for every location ever linked to *or emitted*, since `Patch`'s `operator[]`
+  made one per block; and in `outgoing_slots`, a vector per block in 40-byte buckets): one 24-byte
+  `LinkRecord` per slot -- target, the slot's and its unlinked value's offsets from the code buffer,
+  and a doubly linked list of the records linking to the same target -- appended by
+  `EmitPendingSlots`, the block's own records contiguous (`BlockDescriptor::first_link`, the last one
+  flagged in bit 31 of its slot offset). `link_heads` maps a target to its newest record (a robin_map
+  of `u64 -> u32` at a load factor of 0.75: it is read only when a block is emitted or dropped --
+  0.75 and a start at 64 buckets, `UseLoadFactor`, because tsl computes each size limit as
+  `float(bucket_count) * load_factor` on the emitting thread under the host's MXCSR, and an inexact
+  product sets the sticky precision flag that `omni-cpu/tests/thunk.rs` then finds in the host word
+  a handler runs under: 0.8 failed it). `Patch`
+  walks the list (and makes no entry for a target nothing links to), `ForgetOutgoingSlots` unlinks a
+  dropped block's slots and takes each record out of its list in O(1), `UnlinkAllSlots` stores every
+  record's unlinked value, and `ClearCache` gives the records back. Records made for a block whose
+  emission then threw are taken out at the next `Emit`.
+* **Fastmem sites** (0022 kept them in `fastmem_patch_info`, a robin_map of 56-byte buckets; a
+  shared cache's recompile flags are off, so the marker in each was never read): one 16-byte record
+  per site -- the site and its resume address as offsets from the region, and the fallback -- in a
+  run per region, in address order. A block's sites are collected while it is emitted and added,
+  sorted, once its code is complete (an inline exclusive load records its site before the deferred
+  plain ones before it, so recording order is not address order). `FastmemCallback` finds the run by
+  address and the site by binary search, under the cache's lock as before; a region's run is emptied
+  when it starts and given back when it is reclaimed.
+
+`tests/shared_bookkeeping.rs`, n = 65,536 blocks: **1,144 -> 401 bytes per block** (the census: link
+targets 568 -> 48, block links 184 -> 51, fastmem sites 112 -> 23; the bound is 550), and 944 -> 151
+still held after a clear; a region given back takes its records with it (after seven retirements,
+3,854 records for 327,685 blocks emitted). `tests/host_fault.rs`: four fastmem sites in one block,
+recorded out of address order, the lowest faulting -- served, and the three after it inline, on a
+Jit's own cache and on a shared one (removing the sort makes the lookup miss and dynarmic abort).
+`tests/shared_cache.rs`: four blocks linking to one target, dropped from the middle, the head and the
+tail of its list and translated again over seven rounds, each then running the target's new code
+(skipping the unlink from a predecessor, or the head's update, fails it). Both `dynarmic-sys` suites
+(own caches, and `OD_TEST_SHARED_CACHE=1`) pass.
+
+In the world (~700,000 blocks, ~1-2 million fastmem sites and link slots) this is expected to take
+the three arrays of 272, 224 and 80 MiB -- and their entries' vectors -- down to tens of MiB.
+
 ## How a patch is carried
 
 Patches are applied **into `vendor/dynarmic/` directly** and a `.patch` file is

@@ -915,6 +915,7 @@ void SharedCodeCache::Impl::StartRegion(size_t index) {
     r.state = Region::State::Current;
     current = index;
     block_of_code.SetCodePtr(r.begin);
+    emitter.BeginFastmemSites(r.begin, r.end);  // patch 0025
 }
 
 void SharedCodeCache::Impl::EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held) {

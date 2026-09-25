@@ -156,3 +156,66 @@ fn a_store_exclusive_pair_that_faults_after_its_load_succeeded_gives_its_registe
         assert_eq!(vm.reg(r), v, "X{r} changed across the faulting STXP");
     }
 }
+
+/// `LDR X3, [X0] ; LDXR X2, [X6] ; LDR X1, [X6] ; LDR X4, [X6, #8] ; SVC`: four fastmem patch sites
+/// in one block, of which only the first faults (X0 is the hole; X6 two doublewords on the host's
+/// heap -- writable, as the x64 inline exclusive load needs: on a read-only page it faults too). The
+/// inline exclusive load records its site while the block is being emitted, and the plain loads
+/// record theirs in deferred emits after it -- so the faulting site, the lowest, is recorded after
+/// a higher one.
+fn four_sites_program() -> Vec<u32> {
+    const LDXR_X2_X6: u32 = 0xC85F_7CC2;
+    vec![a64::ldr_imm(3, 0, 0), LDXR_X2_X6, a64::ldr_imm(1, 6, 0), a64::ldr_imm(4, 6, 8), a64::svc(0)]
+}
+
+/// Runs [`four_sites_program`] twice (the second time from translated code) and checks each load.
+fn four_sites_one_fault(vm: &Vm) {
+    let host = Box::new([0x0123_4567_89AB_CDEFu64, 0x0FED_CBA9_8765_4321]);
+    vm.with_ctx(|c| c.write_u64(HOLE, 0x1122_3344_5566_7788));
+    vm.set_reg(0, HOLE);
+    vm.set_reg(6, host.as_ptr() as u64);
+    for pass in 0..2 {
+        for r in 1..5 {
+            vm.set_reg(r, 0);
+        }
+        vm.start(1_000_000);
+        assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE, "pass {pass}: the guest reached its SVC");
+        assert_eq!(vm.reg(3), 0x1122_3344_5566_7788, "pass {pass}: the faulting load, through the callbacks");
+        assert_eq!(vm.reg(2), 0x0123_4567_89AB_CDEF, "pass {pass}: the exclusive load after it, inline");
+        assert_eq!(vm.reg(1), 0x0123_4567_89AB_CDEF, "pass {pass}: the next load, inline");
+        assert_eq!(vm.reg(4), 0x0FED_CBA9_8765_4321, "pass {pass}: the last load, inline");
+    }
+    assert_eq!(vm.stats().slow_path_reads, 2, "the hole, and only the hole, was read through the callbacks: {:?}", vm.stats());
+    drop(host);
+}
+
+#[test]
+fn every_fastmem_site_of_a_block_serves_its_own_fault() {
+    four_sites_one_fault(&Vm::new(four_sites_program(), identity()));
+}
+
+/// The same on a shared code cache (patch 0022), whose sites are sorted records of the region the
+/// block is in (patch 0025) rather than a map: a record kept out of address order, or resuming at
+/// the wrong place, fails here -- the lookup misses and dynarmic aborts the process, or a load after
+/// the fault reads the wrong value.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn every_fastmem_site_of_a_block_in_a_shared_cache_serves_its_own_fault() {
+    use dynarmic_sys::{od_code_cache_free, od_monitor_free, od_monitor_new};
+    use harness::{TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES};
+    // SAFETY: freed below, after the jit.
+    let monitor = unsafe { od_monitor_new(1) };
+    assert!(!monitor.is_null());
+    let opts = VmOptions { shared_monitor: monitor as usize, ..identity() };
+    let cache = Vm::new_code_cache(&opts, monitor, std::ptr::null_mut(), TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES);
+    assert!(!cache.is_null(), "od_code_cache_new refused the configuration");
+    let vm = Vm::new(four_sites_program(), VmOptions { shared_cache: cache as usize, ..opts });
+    assert_eq!(vm.code_cache(), cache, "the jit runs from the shared cache");
+    four_sites_one_fault(&vm);
+    drop(vm);
+    // SAFETY: the only jit on them is gone.
+    unsafe {
+        od_code_cache_free(cache);
+        od_monitor_free(monitor);
+    }
+}
