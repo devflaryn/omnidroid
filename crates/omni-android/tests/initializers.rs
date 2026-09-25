@@ -655,9 +655,20 @@ const WROTE: &[(usize, Written)] = &[
     // `.data` <- `.bss`: one statically constructed object pointing at another.
     (0x067d_c330, Written::Pointer(0x0684_03b8)),
     (0x067d_c468, Written::Pointer(0x0684_2988)),
-    // `.data` <- a value that does not move with the image.
+    // `.data` <- a value that does not move with the image: a field of each of the first two
+    // objects above, stored by the constructors that store their vtables.
+    //
+    // **Not `0x067d_67d0`, which held 5 here until 2026-09-25.** That word is the `index` of an
+    // emulated-TLS control block (compiler-rt's `__emutls_get_address`, link address
+    // `0x2b9dee0`, assigns `index = ++count` under its mutex the first time *any* thread touches
+    // the variable), so it records the order in which threads first touched thread-locals -- and
+    // the thread that first touches `0x067d_67c0` starts a worker thread while doing so
+    // (`pthread_create` at `0x285332c`, start routine `0x284d168`), which touches another one
+    // (`0x0682_4fd0`) as it starts. Which of the two gets index 5 and which 6 is the race between
+    // those two threads, on a device as here. MEASURED (Linux, the whole binary, shared cache):
+    // 6 in 5 of 30 runs, every time as an exact swap of those two indices, 17 assigned in all.
     (0x067d_c338, Written::Constant(0x0010_0008)),
-    (0x067d_67d0, Written::Constant(5)),
+    (0x067d_c3b8, Written::Constant(0x0010_0010)),
 ];
 
 /// How many words went from zero to a pointer into the image, over the whole writable image.
@@ -666,6 +677,9 @@ const WROTE: &[(usize, Written)] = &[
 /// It is pinned rather than bounded because a change in it is a change in what the engine's own
 /// static initialisation did, which is exactly the kind of thing that should be a visible diff
 /// rather than a number inside a range nobody re-derives.
+///
+/// **Counted across two placements of the image** ([`written_across`]): a value that merely lies
+/// inside the image in one placement is a number, not a pointer, and one placement cannot tell.
 const IMAGE_POINTERS_WRITTEN: usize = 92_431;
 
 /// A **floor** on how many went from zero to something that is not a pointer into the image.
@@ -700,25 +714,101 @@ const OTHER_WORDS_WRITTEN_AT_LEAST: usize = 133_000;
 /// which gave 131,991 or 131,992), with the same margin below it the Windows floor has.
 const OTHER_WORDS_WRITTEN_AT_LEAST_BELOW_2_40: usize = 131_700;
 
-/// Count the words of the writable image that went from zero to something.
-fn written(before: &[(GuestAddr, Vec<u8>)], after: &[(GuestAddr, Vec<u8>)], span: &std::ops::Range<GuestAddr>) -> (usize, usize) {
-    let mut pointers = 0usize;
-    let mut others = 0usize;
-    for ((_, old), (_, new)) in before.iter().zip(after.iter()) {
-        for (o, n) in old.chunks_exact(8).zip(new.chunks_exact(8)) {
-            let o = u64::from_le_bytes(o.try_into().expect("eight bytes"));
-            let n = u64::from_le_bytes(n.try_into().expect("eight bytes"));
-            if o != 0 || n == 0 {
-                continue;
+/// One placement of the image and what its writable ranges held before and after the run.
+struct Placed<'a> {
+    base: GuestAddr,
+    span: std::ops::Range<GuestAddr>,
+    before: &'a [(GuestAddr, Vec<u8>)],
+    after: &'a [(GuestAddr, Vec<u8>)],
+}
+
+impl Placed<'_> {
+    /// Every word that went from zero to something, as `(offset from the base, value)`.
+    fn written(&self) -> std::collections::BTreeMap<usize, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        for ((start, old), (_, new)) in self.before.iter().zip(self.after.iter()) {
+            for (index, (o, n)) in old.chunks_exact(8).zip(new.chunks_exact(8)).enumerate() {
+                let o = u64::from_le_bytes(o.try_into().expect("eight bytes"));
+                let n = u64::from_le_bytes(n.try_into().expect("eight bytes"));
+                if o == 0 && n != 0 {
+                    out.insert(start + index * 8 - self.base, n);
+                }
             }
-            if span.contains(&(n as GuestAddr)) {
-                pointers += 1;
-            } else {
-                others += 1;
+        }
+        out
+    }
+
+    /// Where `value` points in the image, as an offset from the base, if it points into it.
+    fn offset(&self, value: u64) -> Option<usize> {
+        let value = value as GuestAddr;
+        self.span.contains(&value).then(|| value - self.base)
+    }
+}
+
+/// What the initializers wrote, judged across **two placements** of the image.
+struct Written2 {
+    /// Words holding the same image offset in both placements: pointers into the image.
+    pointers: usize,
+    /// Words written in the first placement that are not such a pointer.
+    others: usize,
+    /// Words whose value is **the same number in both placements** and yet lies inside the image
+    /// in at least one of them: a value that does not move with the image, which a placement
+    /// happened to put the image around. `(offset of the word, value)`.
+    lookalikes: Vec<(usize, u64)>,
+    /// Words that point into the image in one placement and are neither the same pointer nor the
+    /// same number in the other. None is expected; each is named in the failure.
+    disagreements: Vec<(usize, Option<u64>, Option<u64>)>,
+}
+
+/// Classify every word the initializers wrote by whether its value **moved with the image**.
+///
+/// **Why one placement cannot count image pointers exactly.** A word counts as an image pointer
+/// when its value lies inside the loaded image. The engine also stores plain numbers that happen
+/// to be the right size: `libroblox.so`'s static service descriptors (the constructor at link
+/// address `0x5fb225c`, 795 call sites) store two 32-bit fields side by side at `+0x20` -- e.g.
+/// `0x2dc7c7` and `0x13a` (`0x1ea9ebc`), or `0x2667` and `0x222` for `MessagingService`
+/// (`0x45d52a4`) -- which read as one word `0x13a_002d_c7c7` or `0x222_0000_2667`. Windows put the
+/// image between `0x113 << 32` and `0x2c3 << 32` in 80 runs, the same range those pairs' high
+/// halves span (1 to 1,121), so in a few percent of placements the ~115 MiB image lands around one
+/// of them and it counts as a pointer (~2% from these 795 pairs alone, if the base were uniform
+/// over that range). MEASURED (2026-09-25, Windows, the gate alone): 92,432 or 92,433 in 8 of 223
+/// runs -- 5 of 143 with the shared translation cache, 3 of 80 with per-thread caches -- and 92,431
+/// in the rest. Of the five failing runs that were dumped, four had one of these pairs as the extra
+/// word (three different descriptors); the fifth's, at `0x6bbc0f0`, was not decoded.
+///
+/// Two placements decide it: a pointer moves with the image, a number does not.
+fn written_across(a: &Placed<'_>, b: &Placed<'_>) -> Written2 {
+    assert_ne!(
+        a.base, b.base,
+        "the two instances were loaded at the same address, so nothing here can tell a pointer \
+         from a number"
+    );
+    let (wa, wb) = (a.written(), b.written());
+    let mut out =
+        Written2 { pointers: 0, others: 0, lookalikes: Vec::new(), disagreements: Vec::new() };
+    for (&word, &va) in &wa {
+        let vb = wb.get(&word).copied();
+        match (a.offset(va), vb.and_then(|vb| b.offset(vb))) {
+            (Some(oa), Some(ob)) if oa == ob => out.pointers += 1,
+            (pa, pb) => {
+                out.others += 1;
+                if pa.is_some() || pb.is_some() {
+                    if vb == Some(va) {
+                        out.lookalikes.push((word, va));
+                    } else {
+                        out.disagreements.push((word, Some(va), vb));
+                    }
+                }
             }
         }
     }
-    (pointers, others)
+    // A word the second placement's run wrote and the first did not, pointing into the image.
+    for (&word, &vb) in &wb {
+        if !wa.contains_key(&word) && b.offset(vb).is_some() {
+            out.disagreements.push((word, None, Some(vb)));
+        }
+    }
+    out
 }
 
 /// Assert the eight pinned words were zero before the run.
@@ -753,6 +843,75 @@ fn assert_written(guest: &Guest) {
             ),
         }
     }
+}
+
+/// Two placements of a four-word writable range, as `snapshot_writable` returns them.
+fn placed_words(base: GuestAddr, words: [u64; 4]) -> (Vec<(GuestAddr, Vec<u8>)>, Vec<(GuestAddr, Vec<u8>)>) {
+    let start = base + 0x0680_0000;
+    let before = vec![(start, vec![0u8; 32])];
+    let after = vec![(start, words.iter().flat_map(|w| w.to_le_bytes()).collect())];
+    (before, after)
+}
+
+/// **The count's own detector**, with the numbers from the runs that failed: the
+/// `MessagingService` descriptor's `0x2667`/`0x222` pair, read as one word, lies inside an image
+/// based at `0x221_f9b4_4000` and nowhere near one based at `0x1b7_4599_4000`.
+#[test]
+fn written_across_counts_a_number_the_image_was_placed_around_as_a_number() {
+    const SPAN: usize = 0x0733_4000;
+    const LOOKALIKE: u64 = 0x0000_0222_0000_2667;
+    let (a_base, b_base) = (0x221_f9b4_4000usize, 0x1b7_4599_4000usize);
+    assert!((a_base..a_base + SPAN).contains(&(LOOKALIKE as usize)), "the premise: inside A");
+    // A vtable pointer, the lookalike, a heap pointer, an entropy word.
+    let (a0, a1) =
+        placed_words(a_base, [(a_base + 0x0636_5a38) as u64, LOOKALIKE, 0x7f00_1234_5678, 0x9e37]);
+    let (b0, b1) =
+        placed_words(b_base, [(b_base + 0x0636_5a38) as u64, LOOKALIKE, 0x7f00_8765_4320, 0x51ed]);
+    let a = Placed { base: a_base, span: a_base..a_base + SPAN, before: &a0, after: &a1 };
+    let b = Placed { base: b_base, span: b_base..b_base + SPAN, before: &b0, after: &b1 };
+    let judged = written_across(&a, &b);
+    assert_eq!(judged.pointers, 1, "only the vtable pointer moved with the image");
+    assert_eq!(judged.others, 3);
+    assert_eq!(judged.lookalikes, vec![(0x0680_0008, LOOKALIKE)]);
+    assert!(judged.disagreements.is_empty(), "{:x?}", judged.disagreements);
+    // Either order: the placement the number lands in may be the second one.
+    let judged = written_across(&b, &a);
+    assert_eq!((judged.pointers, judged.lookalikes.len()), (1, 1));
+}
+
+/// A word that points into the image in one placement and is something else in the other is
+/// **named**, not counted either way: it is what a pointer the engine wrote on only one run, or a
+/// pointer to a different place, looks like.
+#[test]
+fn written_across_names_a_pointer_the_other_placement_does_not_have() {
+    const SPAN: usize = 0x0733_4000;
+    let (a_base, b_base) = (0x1b7_4599_4000usize, 0x1b8_8ac3_4000usize);
+    let (a0, a1) = placed_words(
+        a_base,
+        [(a_base + 0x100) as u64, (a_base + 0x200) as u64, (a_base + 0x300) as u64, 0],
+    );
+    // Word 1 points elsewhere in B; word 2 is not written in B at all; word 3 is written only
+    // in B, and points into it.
+    let (b0, b1) = placed_words(
+        b_base,
+        [(b_base + 0x100) as u64, (b_base + 0x208) as u64, 0, (b_base + 0x400) as u64],
+    );
+    let a = Placed { base: a_base, span: a_base..a_base + SPAN, before: &a0, after: &a1 };
+    let b = Placed { base: b_base, span: b_base..b_base + SPAN, before: &b0, after: &b1 };
+    let judged = written_across(&a, &b);
+    assert_eq!(judged.pointers, 1);
+    let named: Vec<usize> = judged.disagreements.iter().map(|d| d.0).collect();
+    assert_eq!(named, vec![0x0680_0008, 0x0680_0010, 0x0680_0018]);
+    assert!(judged.lookalikes.is_empty());
+}
+
+/// Two placements at one address cannot tell a pointer from a number, so they are refused.
+#[test]
+#[should_panic(expected = "loaded at the same address")]
+fn written_across_refuses_two_placements_at_one_address() {
+    let (x0, x1) = placed_words(0x1000_0000, [0x1000_0100, 0, 0, 0]);
+    let a = Placed { base: 0x1000_0000, span: 0x1000_0000..0x1100_0000, before: &x0, after: &x1 };
+    let _ = written_across(&a, &a);
 }
 
 // ============================================================================= the gate
@@ -807,8 +966,41 @@ fn the_milestone_gate_all_3594_initializers_run_in_order() {
     // statics, because four of these words now hold pointers to its own C++ vtables.
     assert_written(&guest);
     let after = guest.snapshot_writable();
-    let (pointers, others) =
-        written(&before, &after, &(guest.object.start..guest.object.end));
+
+    // **A second placement, for the exact count.** A pointer into the image moves with the image
+    // and a number does not, and one placement cannot tell them apart (see [`written_across`]).
+    // `guest` stays alive, so the second instance cannot be given the same addresses.
+    let second = Guest::load().expect("the fixture loaded once already");
+    assert_unwritten(&second);
+    let second_before = second.snapshot_writable();
+    {
+        let mut cpu = second.thread();
+        let again = run_initializers(&second, &mut cpu, PER_INITIALIZER, OnFailure::Stop);
+        assert!(again.ok(), "the second placement: {}", describe(&again, INITIALIZERS));
+    }
+    assert_written(&second);
+    let second_after = second.snapshot_writable();
+    let judged = written_across(
+        &Placed {
+            base: guest.object.base,
+            span: guest.object.start..guest.object.end,
+            before: &before,
+            after: &after,
+        },
+        &Placed {
+            base: second.object.base,
+            span: second.object.start..second.object.end,
+            before: &second_before,
+            after: &second_after,
+        },
+    );
+    assert!(
+        judged.disagreements.is_empty(),
+        "words that point into the image in one placement and are neither the same pointer nor \
+         the same number in the other, as (offset, first, second): {:x?}",
+        judged.disagreements
+    );
+    let (pointers, others) = (judged.pointers, judged.others);
     assert_eq!(
         pointers, IMAGE_POINTERS_WRITTEN,
         "the writable image did not gain the image pointers a completed initializer run gives it"
@@ -828,12 +1020,16 @@ fn the_milestone_gate_all_3594_initializers_run_in_order() {
     let crossings = guest.boundary.crossings();
     eprintln!(
         "\nM3 GATE: {} initializers, {} guest instructions, {:?}\n  crossings: {:?}\n  \
-         __cxa_atexit registrations: {}\n",
+         __cxa_atexit registrations: {}\n  image pointers {pointers}, other words {others}, \
+         numbers a placement put the image around {:x?} (bases {:#x}, {:#x})\n",
         run.completed.len(),
         run.guest_instructions,
         run.elapsed,
         crossings,
         guest.bionic.atexit().pending(),
+        judged.lookalikes,
+        guest.object.base,
+        second.object.base,
     );
 }
 
