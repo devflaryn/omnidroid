@@ -2703,8 +2703,8 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     });
     // **The host's cursor follows the engine** (`omni_android::jni::cursor`), with every mouse:
     // hidden while the engine draws its own over its view, held while the engine holds its own
-    // still (its lock state, read every turn, or `vk.e`'s pointer capture), given back whenever the
-    // window does not have the focus or is minimised.
+    // still (its lock state, read every turn, or `vk.e`'s pointer capture) and let go under the
+    // engine's cursor, never held while the window does not have the focus or is minimised.
     let mut cursor: Option<CursorController> = mouse.as_ref().map(|_| CursorController::new());
     let mut input_failure: Option<String> = None;
     // **OMNI_INPUT_PROBE=1: one SYNTHETIC press-drag-release**, through the same seam, at the
@@ -4334,6 +4334,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                                     // not still hold it (`LockCurrentPosition`).
                                     let controller = cursor.as_mut().expect("a cursor with every mouse");
                                     controller.set_view_captured(wanted);
+                                    controller.set_pointer(Some(seam.pointer_px()));
                                     if !wanted {
                                         seam.set_pointer_capture(false);
                                     }
@@ -4457,6 +4458,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             if let (Some(controller), Some(seam)) = (cursor.as_mut(), mouse.as_mut()) {
                 controller.set_lock(seam.engine_lock(&guest.jni));
                 controller.set_draws_own_cursor(presents() > 0);
+                controller.set_pointer(Some(seam.pointer_px()));
                 match controller.apply(open, now) {
                     Ok(said) => {
                         if let Some(line) = said {

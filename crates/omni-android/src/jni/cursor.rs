@@ -42,18 +42,26 @@
 //!
 //! [`host_cursor`] is the whole rule, and it has no input of its own -- no button, no key:
 //!
-//! * **hidden** while the engine draws its own cursor over its view (the app's `TYPE_NULL`; this
-//!   embedding counts the view as drawn once the engine has presented a frame into it), and while
-//!   the cursor is held;
+//! * **hidden** over the view -- **focused or not** -- while the engine draws its own cursor there
+//!   (the app's `TYPE_NULL`; this embedding counts the view as drawn once the engine has presented
+//!   a frame into it), and while the cursor is held. Not scoped to the focus, because the engine's
+//!   cursor is not: the pointer's moves over an inactive window still reach it and it still draws
+//!   (MEASURED, the owner's w33: two cursors over the unfocused window). The window scopes it to
+//!   the client area, so leaving the view shows the host's cursor;
 //! * **held** -- the window's pointer capture: hidden, still, raw motion -- while the engine holds
 //!   its cursor still: its lock state is 1 or 2, or `vk.e` holds Android's pointer capture. For
 //!   state 1 that is what a device does. For state 2 a device does not hold the pointer, and the
 //!   host does, because a host cursor that went on moving under the engine's still one is exactly
 //!   the second cursor the owner asked to be rid of; the motion still reaches the engine as a
-//!   device's would (`super::mouse`, "What this embedding decides");
-//! * **neither** while the window does not have the focus or is minimised, whatever the engine
-//!   says: `Alt+Tab` always gives the user the cursor back, and it is taken again when the focus
-//!   returns if the engine still wants it.
+//!   relative move at the held position (`super::mouse`, "What this embedding decides");
+//! * **never held** while the window does not have the focus or is minimised, whatever the engine
+//!   says: `Alt+Tab` always gives the user a cursor that moves, and it is taken again when the
+//!   focus returns if the engine still wants it. Minimised, nothing is hidden either;
+//! * **let go where the engine has its cursor**: before the capture is given back, the host's
+//!   cursor is moved -- still invisible -- to the position the engine was last told
+//!   (`MouseInput::pointer_px`), so it reappears exactly under the engine's cursor and the window's
+//!   report of where it is makes no move (MEASURED, w33: a flash of a cursor elsewhere at every
+//!   let-go of the right-drag camera).
 //!
 //! The lock state is read straight from the engine's memory -- no call, so it can be read every
 //! turn of the UI loop -- at the location [`LockLocation::decode`] finds in the loaded library's
@@ -263,11 +271,9 @@ pub struct HostCursor {
 /// **The rule** (this module's "What the host does with them").
 #[must_use]
 pub const fn host_cursor(engine: EngineSignals, host: HostFacts) -> HostCursor {
-    if !host.focused || host.minimized {
-        return HostCursor { hidden: false, held: false };
-    }
-    let held = engine.view_captured || !matches!(engine.lock, LockState::Free);
-    HostCursor { hidden: engine.draws_own_cursor || held, held }
+    let still = engine.view_captured || !matches!(engine.lock, LockState::Free);
+    let held = host.focused && !host.minimized && still;
+    HostCursor { hidden: !host.minimized && (engine.draws_own_cursor || held), held }
 }
 
 /// The window the rule is carried out on -- [`Window`], or a test's -- and the two facts about it
@@ -292,6 +298,12 @@ pub trait CursorHost {
     fn set_pointer_capture(&mut self, captured: bool) -> Result<bool, String>;
     /// [`Window::has_pointer_capture`].
     fn has_pointer_capture(&self) -> bool;
+    /// [`Window::warp_pointer`].
+    ///
+    /// # Errors
+    ///
+    /// The host's refusal, as text.
+    fn warp_pointer(&mut self, x: i32, y: i32) -> Result<(), String>;
 }
 
 impl CursorHost for Window {
@@ -309,6 +321,9 @@ impl CursorHost for Window {
     }
     fn has_pointer_capture(&self) -> bool {
         Window::has_pointer_capture(self)
+    }
+    fn warp_pointer(&mut self, x: i32, y: i32) -> Result<(), String> {
+        Window::warp_pointer(self, x, y).map_err(|error| error.to_string())
     }
 }
 
@@ -346,6 +361,9 @@ pub struct CursorController {
     said_at: Option<Instant>,
     /// Changes since the last line said.
     unsaid: u64,
+    /// Where the engine has the pointer, in the view's pixels, as last told: where the host's
+    /// cursor goes before a hold is let go.
+    pointer: Option<(i32, i32)>,
 }
 
 impl Default for CursorController {
@@ -364,7 +382,13 @@ impl CursorController {
             counts: CursorCounts::default(),
             said_at: None,
             unsaid: 0,
+            pointer: None,
         }
+    }
+
+    /// Where the engine has the pointer now, in the view's pixels (`MouseInput::pointer_px`).
+    pub fn set_pointer(&mut self, at: Option<(i32, i32)>) {
+        self.pointer = at;
     }
 
     /// Take in what a window event says about Android's pointer capture: losing the focus, or the
@@ -454,6 +478,13 @@ impl CursorController {
                 Err(error) => return Err(self.fail(host, format!("holding the cursor: {error}"))),
             }
         } else if !want.held && host.has_pointer_capture() {
+            // Put the cursor under the engine's first, while it is still held and invisible: it
+            // reappears there, and the window's report of where it is is no move.
+            if let Some((x, y)) = self.pointer {
+                if let Err(error) = host.warp_pointer(x, y) {
+                    return Err(self.fail(host, format!("moving the cursor to the engine's: {error}")));
+                }
+            }
             if let Err(error) = host.set_pointer_capture(false) {
                 return Err(self.fail(host, format!("letting the cursor go: {error}")));
             }
@@ -539,10 +570,13 @@ mod tests {
                     for focused in [false, true] {
                         for minimized in [false, true] {
                             let got = host_cursor(engine(draws, lock, view), host(focused, minimized));
-                            let expected = if !focused || minimized {
+                            let still = view || lock == CENTER || lock == CURRENT;
+                            let expected = if minimized {
                                 HostCursor { hidden: false, held: false }
+                            } else if !focused {
+                                // Never held; hidden while the engine draws, as over any window.
+                                HostCursor { hidden: draws, held: false }
                             } else {
-                                let still = view || lock == CENTER || lock == CURRENT;
                                 HostCursor { hidden: draws || still, held: still }
                             };
                             assert_eq!(
@@ -560,7 +594,16 @@ mod tests {
         assert_eq!(host_cursor(engine(true, CURRENT, false), front), HostCursor { hidden: true, held: true }, "right-drag");
         assert_eq!(host_cursor(engine(true, CENTER, true), front), HostCursor { hidden: true, held: true }, "shift-lock");
         assert_eq!(host_cursor(engine(false, FREE, false), front), HostCursor::default(), "nothing drawn yet");
-        assert_eq!(host_cursor(engine(true, CENTER, true), host(false, false)), HostCursor::default(), "alt-tab");
+        assert_eq!(
+            host_cursor(engine(true, CENTER, true), host(false, false)),
+            HostCursor { hidden: true, held: false },
+            "alt-tab: free, and hidden only where the engine draws its own"
+        );
+        assert_eq!(
+            host_cursor(engine(true, FREE, false), host(false, false)),
+            HostCursor { hidden: true, held: false },
+            "w33: the pointer over the unfocused window, the engine's cursor following it"
+        );
         assert_eq!(host_cursor(engine(true, CURRENT, false), host(true, true)), HostCursor::default(), "minimised");
     }
 
@@ -605,12 +648,16 @@ mod tests {
         fn has_pointer_capture(&self) -> bool {
             self.captured
         }
+        fn warp_pointer(&mut self, x: i32, y: i32) -> Result<(), String> {
+            self.calls.push(format!("warp {x} {y}"));
+            Ok(())
+        }
     }
 
-    /// **A session, turn by turn**: nothing without the focus; hidden once the engine draws; held for
-    /// the right-drag and let go after it; `Alt+Tab` gives everything back (the window ends its own
-    /// capture, as the backends do) and the focus coming back takes it again while the engine still
-    /// holds; minimised gives it back; and every change is counted.
+    /// **A session, turn by turn**: hidden once the engine draws, focus or not; held for the
+    /// right-drag and let go after it; `Alt+Tab` lets go (the window ends its own capture, as the
+    /// backends do) and leaves it hidden over the view, and the focus coming back takes it again
+    /// while the engine still holds; minimised gives everything back; and every change is counted.
     #[test]
     fn a_session_hides_holds_and_gives_back_with_the_focus() {
         let mut fake = FakeHost::default();
@@ -620,13 +667,12 @@ mod tests {
             cursor.apply(fake, t0 + Duration::from_secs(seconds)).expect("applied")
         };
         cursor.set_draws_own_cursor(true);
-        assert_eq!(turn(&mut cursor, &mut fake, 0), None, "no focus yet: nothing");
-        assert!(!fake.hidden && fake.calls.is_empty());
+        let said = turn(&mut cursor, &mut fake, 0).expect("said");
+        assert!(said.contains("hidden") && said.contains("draws its own"), "no focus yet, and hidden: {said}");
+        assert!(fake.hidden && !fake.captured);
 
         fake.focused = true;
-        let said = turn(&mut cursor, &mut fake, 1).expect("said");
-        assert!(said.contains("hidden") && said.contains("draws its own"), "{said}");
-        assert!(fake.hidden && !fake.captured);
+        assert_eq!(turn(&mut cursor, &mut fake, 1), None, "the focus changes nothing while nothing is held");
 
         // The right-drag: the engine writes 2, then 0.
         cursor.set_lock(Some(CURRENT));
@@ -647,9 +693,8 @@ mod tests {
         fake.captured = false; // the window ends its own capture with the focus
         cursor.observe(&WindowEvent::PointerCaptureLost);
         cursor.observe(&WindowEvent::FocusChanged { focused: false });
-        let said = turn(&mut cursor, &mut fake, 5).expect("said");
-        assert!(said.contains("shown") && said.contains("lost the focus"), "{said}");
-        assert!(!fake.hidden && !fake.captured, "alt-tab gives the cursor back");
+        assert_eq!(turn(&mut cursor, &mut fake, 5), None, "nothing left to change");
+        assert!(fake.hidden && !fake.captured, "alt-tab: free, still hidden over the view (w33)");
         assert!(!cursor.engine().view_captured, "the view's capture ended with the focus");
         // Back: the engine still holds (state 1), so it is taken again without vk.e asking.
         fake.focused = true;
@@ -667,9 +712,37 @@ mod tests {
         cursor.give_back(&mut fake);
         assert!(!fake.captured && !fake.hidden, "the session's end gives everything back");
         let counts = cursor.counts();
-        assert_eq!((counts.hides, counts.shows), (3, 3), "{counts:?}");
+        assert_eq!((counts.hides, counts.shows), (2, 2), "{counts:?}");
         assert_eq!((counts.holds, counts.releases), (4, 3), "{counts:?}: alt-tab's release was the window's own");
         assert_eq!((counts.lock_center, counts.lock_current_position), (1, 1));
+    }
+
+    /// **A hold is let go where the engine has its cursor** (w33's flash at every let-go of the
+    /// right-drag camera): the host's cursor is moved there while still held -- and so invisible
+    /// -- and only then given back, and it is never shown in between. Without a position (nothing
+    /// told yet) it is given back where it was held.
+    #[test]
+    fn a_hold_is_let_go_under_the_engines_cursor_and_never_shown_on_the_way() {
+        let mut fake = FakeHost { focused: true, ..FakeHost::default() };
+        let mut cursor = CursorController::new();
+        cursor.set_draws_own_cursor(true);
+        cursor.set_lock(Some(CURRENT));
+        cursor.apply(&mut fake, Instant::now()).unwrap();
+        assert!(fake.captured && fake.hidden);
+        fake.calls.clear();
+        cursor.set_pointer(Some((412, 300)));
+        cursor.set_lock(Some(FREE));
+        cursor.apply(&mut fake, Instant::now()).unwrap();
+        assert_eq!(fake.calls, ["warp 412 300", "capture false"], "moved while held, then let go; never shown");
+        assert!(fake.hidden && !fake.captured);
+
+        fake.calls.clear();
+        cursor.set_pointer(None);
+        cursor.set_lock(Some(CURRENT));
+        cursor.apply(&mut fake, Instant::now()).unwrap();
+        cursor.set_lock(Some(FREE));
+        cursor.apply(&mut fake, Instant::now()).unwrap();
+        assert_eq!(fake.calls, ["capture true", "capture false"], "no position: no move");
     }
 
     /// **Said at most once a second**, and the line after a quiet spell names what went unsaid.
