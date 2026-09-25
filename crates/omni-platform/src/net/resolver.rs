@@ -1,12 +1,26 @@
 //! Name resolution: host + port to a list of addresses, with the failure cases kept apart.
 //!
-//! # This is `std` and has no backend, and that is the D23 test answering "yes"
+//! # The lookup is a backend; everything around it is written once
 //!
-//! [`std::net::ToSocketAddrs`] is `getaddrinfo(3)` on all three unix targets and
-//! `GetAddrInfoW`/`getaddrinfo` on Windows, reached through **one** portable call. D23's sharper
-//! test — *is there one `std` call that serves all five targets?* — answers yes here, so this
-//! module is written once, has no `cfg`, and gets **no fabricated `Unsupported` arm** for Linux or
-//! macOS, per D22's other half. It is the half of D30's "partly" that came out on the `std` side.
+//! This module used to be `std` with no backend, and that was D23's sharper test answering "yes":
+//! [`std::net::ToSocketAddrs`] is `getaddrinfo(3)` on the unix targets and `getaddrinfo` on
+//! Windows, reached through **one** portable call, so the module had no `cfg` and no fabricated
+//! `Unsupported` arm (D22's other half). **The test was asked about the wrong half.** One `std`
+//! call serves the *lookup* on all five targets; it does not serve the *failure*, and the failure
+//! is what a caller acts on — see the next section. MEASURED what that cost (macOS run m10, +490
+//! s): a lookup of `clientsettingscdn.roblox.com` failed during a DNS blip, `std` reported it as
+//! text with no number, this module could only call it unclassified, the adapter refused the
+//! guest's `getaddrinfo` by name as it must — and two guest threads died over a failure the engine
+//! itself had a retry path for.
+//!
+//! So resolution is now split where D30 splits sockets — `std` where `std` serves, a per-OS
+//! backend for the part it does not — and the split follows the readiness backend's rules: the
+//! `cfg` is in `net/mod.rs`'s backend selection and nowhere else, and this file still has none.
+//!
+//! | piece | where | Linux / macOS |
+//! |---|---|---|
+//! | the policy, an empty name, a NUL, an address literal, the empty list, the family filter | **this file**, once for all five targets | the same code |
+//! | the lookup and the classification of its failure | **backend** `lookup`: `std` plus the WSA table on Windows, **measured** | `libc::getaddrinfo` and the `EAI_*` table in `net/unix.rs`, with each target's `EAI_ADDRFAMILY` in `net/linux.rs` and `net/macos.rs` |
 //!
 //! # Why the classification cannot come from `ErrorKind`, and where it comes from instead
 //!
@@ -14,33 +28,35 @@
 //! separate `gai_strerror`, and the distinction a caller acts on is *which failures are worth
 //! retrying* — see [`ResolveFailure::is_retryable`]. `std::io::ErrorKind` has no variants for any
 //! of it: every resolver failure arrives as an unclassified `io::Error`, and the only thing in it
-//! that can be told apart is [`std::io::Error::raw_os_error`].
+//! that can be told apart is [`std::io::Error::raw_os_error`]. So the classification is a table of
+//! **host resolver error numbers**, one per backend, and the honest statement about each is:
 //!
-//! So the classification here is a table of **host resolver error numbers**, and the honest
-//! statement about it is precise:
+//! * **Windows has been measured, and keeps `std`.** `getaddrinfo` there returns WSA error codes
+//!   directly and `std` wraps them with `io::Error::from_raw_os_error`, so `raw_os_error()` is
+//!   `Some` and `WSAHOST_NOT_FOUND` and its three neighbours are what arrives. Nothing about that
+//!   path changed when the unix one did; the table moved into `net/windows.rs` with it.
+//! * **The unix targets could not be classified through `std`, and no longer go through it.**
+//!   `std`'s unix path turns a non-`EAI_SYSTEM` failure into an `io::Error` built from
+//!   `gai_strerror`'s *text* with no raw code at all, so there was nothing to match. The unix
+//!   backend calls `libc::getaddrinfo` itself, asking exactly the question `std` asked, and
+//!   classifies the `EAI_*` it returns by each target's own `libc` constants — glibc counts down
+//!   from -1 and Darwin up from 1, so a shared *table of names* is right on both and a shared
+//!   table of numbers would be right on neither.
 //!
-//! * **Windows has been measured.** `getaddrinfo` there returns WSA error codes directly and
-//!   `std` wraps them with `io::Error::from_raw_os_error`, so `raw_os_error()` is `Some` and the
-//!   numbers in [`WSA_HOST_NOT_FOUND`] and its neighbours are what arrives.
-//! * **The unix targets have not.** `std`'s unix path turns a non-`EAI_SYSTEM` failure into an
-//!   `io::Error` built from `gai_strerror`'s *text* with no raw code at all, so `raw_os_error()`
-//!   is `None` there and nothing in this table matches. Such a failure is reported as
-//!   [`ResolveFailure::Unclassified`], which the adapter above must refuse by name.
+//! A failure that neither table names is still [`ResolveFailure::Unclassified`], carrying the
+//! code and the host's text, and the adapter above still refuses the guest's call by name for it.
+//! What changed is that it is now a statement about *that code* rather than about a whole target.
 //!
-//! That is a real gap on four of the five targets and it is written down rather than papered
-//! over. What would close it is a resolver call that reports `EAI_*` directly, which means
-//! `libc::getaddrinfo` in a unix backend — the same shape the readiness backend has, and worth
-//! doing on the day somebody can run it.
-//!
-//! # `NoAddressOfFamily` is derived rather than reported
+//! # `NoAddressOfFamily` is derived here as well as reported
 //!
 //! A guest asking for `AF_INET6` addresses of a name that has only `A` records must get
 //! `EAI_ADDRFAMILY` and not `EAI_NONAME`, because the two mean different things to a client that
-//! is trying both families. No host reports it for us here — `to_socket_addrs` takes no family —
-//! so this module asks for **everything** and filters, and "the unfiltered answer had addresses
-//! and the filtered one did not" is a fact it can state on its own. That is the one classification
-//! here that does not depend on a host error number, and it therefore works identically on all
-//! five targets.
+//! is trying both families. Every backend asks for **everything** (`AF_UNSPEC`) and this file
+//! filters, so "the unfiltered answer had addresses and the filtered one did not" is a fact it can
+//! state on its own, identically on all five targets. A host *can* also report the class — the
+//! unix backend maps `EAI_ADDRFAMILY` and `EAI_NODATA` to it, Windows `WSANO_DATA` — but for an
+//! `AF_UNSPEC` question that means "the name exists and has no address of *either* family", and
+//! the class is the same one.
 //!
 //! # What this deliberately does not do
 //!
@@ -48,32 +64,20 @@
 //!   database; this seam takes a port number, and [`service_port`] refuses a name **by name**
 //!   rather than guessing that `https` is 443. A guessed table is a claim about the host's
 //!   `/etc/services` that this crate cannot check, and the one place a wrong entry surfaces is a
-//!   connection to the wrong port.
-//! * **No `AI_CANONNAME`.** `to_socket_addrs` does not return one, so nothing here can. A guest
-//!   that asks for it gets `ai_canonname` left null by the adapter, which is what `getaddrinfo`
-//!   returns when the flag is not set.
+//!   connection to the wrong port. The unix backend passes the port as a decimal string under
+//!   `AI_NUMERICSERV` for the same reason: no services database is consulted even by accident.
+//! * **No `AI_CANONNAME`.** No backend asks for one — `to_socket_addrs` cannot, and the unix
+//!   backend asks `std`'s question — so nothing here can return one. A guest that asks for it gets
+//!   `ai_canonname` left null by the adapter, which is what `getaddrinfo` returns when the flag is
+//!   not set.
 //! * **No reverse lookup.** `getnameinfo` is not in the import list and nothing has reached it.
 
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, SocketAddr};
 
 use super::address::{IpFamily, SocketAddress};
+use super::backend;
 use super::error::{NetError, NetResult, ResolveFailure};
 use super::policy::NetPolicy;
-
-/// `WSAHOST_NOT_FOUND`: the name does not exist. `EAI_NONAME`'s Windows number.
-///
-/// Spelled as a literal rather than imported from `windows-sys`, for the reason
-/// `fs::windows`'s `FILE_READ_ONLY_VOLUME` is: this module has no `cfg` and must not grow one,
-/// and the value is stable published API. It is matched against
-/// [`std::io::Error::raw_os_error`], which is `None` on a host that does not use this numbering,
-/// so a literal here cannot produce a wrong answer on another target — only an unclassified one.
-pub const WSA_HOST_NOT_FOUND: i32 = 11_001;
-/// `WSATRY_AGAIN`: the resolver did not answer. `EAI_AGAIN`'s Windows number.
-pub const WSA_TRY_AGAIN: i32 = 11_002;
-/// `WSANO_RECOVERY`: a permanent resolver failure. `EAI_FAIL`'s Windows number.
-pub const WSA_NO_RECOVERY: i32 = 11_003;
-/// `WSANO_DATA`: the name exists with no record of the type asked for. `EAI_NODATA`'s number.
-pub const WSA_NO_DATA: i32 = 11_004;
 
 /// Look a name up and return every address it has, filtered to one family if asked.
 ///
@@ -90,7 +94,8 @@ pub const WSA_NO_DATA: i32 = 11_004;
 ///
 /// * [`NetError::Policy`] when the embedding's policy does not admit the name — **before** any
 ///   query leaves this machine.
-/// * [`NetError::Refused`] for a host this seam will not look up at all, e.g. an empty name.
+/// * [`NetError::Refused`] for a host this seam will not look up at all: an empty name, or one
+///   with a NUL in it.
 /// * [`NetError::Resolve`] carrying a [`ResolveFailure`] for everything else. The failure is the
 ///   thing the caller acts on; see [`ResolveFailure::is_retryable`].
 pub fn resolve(
@@ -117,10 +122,25 @@ pub fn resolve(
              nothing could use. Pass a name or an address literal",
         ));
     }
+    if trimmed.contains('\0') {
+        // A C string ends at its first NUL, so the name a resolver would be asked about is not the
+        // name the caller passed. `std` refuses this as `InvalidInput`; refusing it here, before
+        // any backend, keeps the answer the same on every target. A guest cannot produce one (its
+        // `node` is itself a C string), so this is a caller of the seam, not a guest, being told.
+        return Err(NetError::refused(
+            OP,
+            format!("{trimmed:?}:{port}"),
+            "the name contains a NUL byte, and the resolver is asked through a C string that \
+             would end there — so it would be asked about a different name from the one passed",
+        ));
+    }
 
-    let all: Vec<SocketAddress> = match (trimmed, port).to_socket_addrs() {
-        Ok(addresses) => addresses.map(SocketAddress::from_std).collect(),
-        Err(error) => return Err(classify(trimmed, port, &error)),
+    // An address literal is answered without a resolver, as `std`'s `ToSocketAddrs` answers it:
+    // one address, the port attached, no query. Done here rather than left to each backend so
+    // that "a literal never leaves the machine" is one line on all five targets.
+    let all: Vec<SocketAddress> = match trimmed.parse::<IpAddr>() {
+        Ok(ip) => vec![SocketAddress::from_std(SocketAddr::new(ip, port))],
+        Err(_) => backend::lookup(trimmed, port)?,
     };
 
     if all.is_empty() {
@@ -155,7 +175,7 @@ pub fn resolve(
             detail: format!(
                 "the name resolved to {} address(es), all of them {}, and {} was asked for. \
                  Derived here rather than reported by the host: this seam asks for every family \
-                 and filters, because `to_socket_addrs` takes none",
+                 and filters",
                 all.len(),
                 families.join(" and "),
                 family
@@ -163,30 +183,6 @@ pub fn resolve(
         });
     }
     Ok(wanted)
-}
-
-/// Turn a host resolver failure into the class a caller acts on.
-///
-/// See this module's header for why the table is host error *numbers* and why only Windows'
-/// numbering has been measured.
-fn classify(host: &str, port: u16, error: &std::io::Error) -> NetError {
-    let code = error.raw_os_error();
-    let failure = match code {
-        Some(WSA_HOST_NOT_FOUND) => ResolveFailure::NoSuchHost,
-        Some(WSA_TRY_AGAIN) => ResolveFailure::Transient,
-        Some(WSA_NO_RECOVERY) => ResolveFailure::NonRecoverable,
-        Some(WSA_NO_DATA) => ResolveFailure::NoAddressOfFamily,
-        _ => ResolveFailure::Unclassified,
-    };
-    let detail = match code {
-        Some(code) => format!("{error} (host resolver error {code})"),
-        None => format!(
-            "{error} (the host reported no error number, so this seam has nothing to classify \
-             it by — see omni-platform's net::resolve for why that is the unix case and what \
-             would close it)"
-        ),
-    };
-    NetError::Resolve { host: host.to_owned(), port, failure, detail }
 }
 
 /// A `getaddrinfo` service argument to a port number, or a refusal that names what is missing.
@@ -221,8 +217,8 @@ mod tests {
 
     /// An address literal resolves without any query leaving the machine.
     ///
-    /// This is the one resolution that can be asserted on every target with no network: `std`
-    /// parses a literal itself rather than asking a resolver, so the test is about this module's
+    /// This is the one resolution that can be asserted on every target with no network: this
+    /// module parses a literal itself before any backend is asked, so the test is about the
     /// filtering and error shaping and needs nothing from the host but arithmetic.
     #[test]
     fn an_address_literal_resolves_to_itself_without_a_query() {
@@ -267,6 +263,17 @@ mod tests {
         assert!(matches!(err, NetError::Refused { .. }), "{err}");
     }
 
+    /// A name with a NUL is refused before any backend, the same way on every target, and is not
+    /// a resolver failure: no resolver was asked.
+    #[test]
+    fn a_name_with_a_nul_is_refused_before_any_backend_is_asked() {
+        let err = resolve("example.invalid\0.com", 443, None, &NetPolicy::unrestricted())
+            .unwrap_err();
+        assert!(matches!(err, NetError::Refused { .. }), "{err}");
+        assert_eq!(err.resolve_failure(), None, "{err}");
+        assert!(err.to_string().contains("NUL"), "{err}");
+    }
+
     /// A numeric service parses and a service name is refused by name.
     #[test]
     fn a_service_name_is_refused_and_a_numeric_service_is_not() {
@@ -279,46 +286,5 @@ mod tests {
         }
         // A port past 16 bits is not a port, and is refused rather than truncated.
         assert!(service_port("65536").is_err());
-    }
-
-    /// The Windows resolver numbers map to the classes a caller acts on.
-    ///
-    /// Constructed from the raw codes rather than by provoking a real lookup, because a test that
-    /// needed a DNS server would be a test that passes or fails on somebody's network — and the
-    /// thing under test is the table, not the resolver.
-    #[test]
-    fn the_measured_resolver_numbers_classify_and_an_unknown_one_does_not() {
-        let cases = [
-            (WSA_HOST_NOT_FOUND, ResolveFailure::NoSuchHost, false),
-            (WSA_TRY_AGAIN, ResolveFailure::Transient, true),
-            (WSA_NO_RECOVERY, ResolveFailure::NonRecoverable, false),
-            (WSA_NO_DATA, ResolveFailure::NoAddressOfFamily, false),
-            // A number that is not in the table: reported unclassified, never guessed at.
-            (1_234_567, ResolveFailure::Unclassified, false),
-        ];
-        for (code, expected, retryable) in cases {
-            let error = std::io::Error::from_raw_os_error(code);
-            let classified = classify("clientsettingscdn.roblox.com", 443, &error);
-            assert_eq!(
-                classified.resolve_failure(),
-                Some(expected),
-                "host resolver error {code} classified wrongly"
-            );
-            assert_eq!(expected.is_retryable(), retryable);
-            assert!(classified.to_string().contains(&code.to_string()), "{classified}");
-        }
-    }
-
-    /// A resolver failure with no host error number is unclassified and says why.
-    ///
-    /// This is the unix case, and the assertion exists so that the gap is visible in the suite on
-    /// the host where it cannot be reproduced.
-    #[test]
-    fn a_resolver_failure_with_no_number_is_unclassified_and_explains_itself() {
-        let error = std::io::Error::other("Name or service not known");
-        let classified = classify("example.invalid", 443, &error);
-        assert_eq!(classified.resolve_failure(), Some(ResolveFailure::Unclassified));
-        let text = classified.to_string();
-        assert!(text.contains("no error number"), "{text}");
     }
 }

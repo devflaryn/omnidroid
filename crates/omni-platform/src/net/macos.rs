@@ -24,6 +24,8 @@
 //! * **`poll(2)` is the readiness call**, and it reports what `select` on Windows could not: a
 //!   refused connect is `POLLOUT | POLLERR | POLLHUP`, and a peer that closed is `POLLHUP`, so
 //!   [`Readiness::hangup`] is the host's answer here rather than always false.
+//! * **Name resolution is the shared unix body's `getaddrinfo`**, with Darwin's `EAI_ADDRFAMILY`
+//!   (1) passed in; see [`lookup`]. Written to compile here and **not yet run on macOS**.
 
 use std::collections::HashMap;
 use std::net::{TcpStream, UdpSocket};
@@ -247,6 +249,28 @@ pub(super) fn accept(inner: &Inner) -> NetResult<(TcpStream, SocketAddress)> {
         .peer_addr()
         .map_err(|error| NetError::io("accept", "the accepted connection", &error))?;
     Ok((stream, SocketAddress::from_std(peer)))
+}
+
+/// `EAI_ADDRFAMILY` on macOS: **1**, Darwin's `<netdb.h>` number (and bionic's, by the shared
+/// BSD ancestry -- which is a coincidence nothing here relies on: the adapter maps a *class* to
+/// the guest's number, never a host number through).
+///
+/// `libc` does not carry it for Apple targets, so it is written here, where this host's own
+/// numbers live. Every other `EAI_*` the shared table matches is a `libc` constant; see
+/// [`unix::resolve_failure`](super::unix::resolve_failure).
+pub(super) const EAI_ADDRFAMILY: libc::c_int = 1;
+
+/// `getaddrinfo(3)`: the shared unix body, with this target's `EAI_ADDRFAMILY`.
+///
+/// This backend otherwise keeps its own socket calls rather than the shared body; name resolution
+/// is the exception because nothing about it differs here except that one number. Darwin's
+/// resolver is worth knowing about for what it returns rather than how it is called: the m10
+/// failure that motivated this path was `EAI_NONAME` -- "nodename nor servname provided, or not
+/// known" is Darwin's `gai_strerror(EAI_NONAME)` -- during what the engine itself treated as a
+/// blip and retried. It is classified [`NoSuchHost`](super::ResolveFailure::NoSuchHost) as the
+/// host said, and the guest now gets `EAI_NONAME` back instead of a refusal.
+pub(super) fn lookup(host: &str, port: u16) -> NetResult<Vec<SocketAddress>> {
+    super::unix::lookup(host, port, EAI_ADDRFAMILY)
 }
 
 /// Every IPv4 and IPv6 address of every interface, in `getifaddrs(3)`'s order, **each once**.
@@ -636,6 +660,38 @@ pub(super) fn poll(entries: &mut [PollEntry<'_>], timeout: Duration) -> NetResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Darwin's `EAI_*` numbers, pinned, and the class each gets here.**
+    ///
+    /// The shared table is written with `libc` names; this is the other half, the numbers
+    /// themselves -- Darwin's `<netdb.h>` counts up from 1, glibc down from -1 -- so that a `libc`
+    /// that renumbered a constant, or an `EAI_ADDRFAMILY` that drifted from Darwin's 1, fails here
+    /// rather than classifying a real failure wrongly.
+    #[test]
+    fn the_eai_numbers_are_darwins_and_classify_as_the_table_says() {
+        use super::super::unix::resolve_failure;
+        use super::super::ResolveFailure::{
+            NoAddressOfFamily, NoSuchHost, NonRecoverable, Transient, Unclassified,
+        };
+        let pinned = [
+            (EAI_ADDRFAMILY, 1, NoAddressOfFamily),
+            (libc::EAI_AGAIN, 2, Transient),
+            (libc::EAI_BADFLAGS, 3, Unclassified),
+            (libc::EAI_FAIL, 4, NonRecoverable),
+            (libc::EAI_FAMILY, 5, Unclassified),
+            (libc::EAI_MEMORY, 6, Unclassified),
+            (libc::EAI_NODATA, 7, NoAddressOfFamily),
+            (libc::EAI_NONAME, 8, NoSuchHost),
+            (libc::EAI_SERVICE, 9, Unclassified),
+            (libc::EAI_SOCKTYPE, 10, Unclassified),
+            (libc::EAI_SYSTEM, 11, Unclassified),
+            (libc::EAI_OVERFLOW, 14, Unclassified),
+        ];
+        for (constant, number, class) in pinned {
+            assert_eq!(constant, number, "Darwin's <netdb.h> numbers this {number}");
+            assert_eq!(resolve_failure(number, EAI_ADDRFAMILY), class, "EAI code {number}");
+        }
+    }
 
     #[test]
     fn the_connect_outcomes_are_classified_apart_from_one_another() {

@@ -21,8 +21,18 @@
 //! | path-MTU discovery | `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` and the `IP_PMTUDISC_*` modes | macOS has `IP_DONTFRAG`, a boolean with no `PROBE` |
 //!
 //! Everything else the seam offers -- `send`, `recv`, `sendto`, `recvfrom`, `shutdown`,
-//! `getsockname`, `getpeername`, non-blocking mode, `TCP_NODELAY`, both timeouts and the whole of
-//! [`resolve`](super::resolve) -- is `std::net` and is implemented once for all five targets.
+//! `getsockname`, `getpeername`, non-blocking mode, `TCP_NODELAY` and both timeouts -- is
+//! `std::net` and is implemented once for all five targets.
+//!
+//! # Name resolution is here, and is shared by both targets
+//!
+//! [`lookup`] is `getaddrinfo(3)` called directly, because `std`'s unix path reports a resolver
+//! failure as `gai_strerror`'s text with no number, and the number is what
+//! [`resolve`](super::resolve) classifies by. The call and the `EAI_*` table are POSIX and are
+//! written once, by `libc` name, so each target matches its own numbering; the one constant
+//! `libc` lacks for both, `EAI_ADDRFAMILY`, is passed in by [`linux`](super::linux) (-9) and
+//! [`macos`](super::macos) (1). **Run on Linux x86-64** (glibc) by this file's tests; **not yet
+//! run on macOS**.
 //!
 //! # Readiness, and what this target can say that Windows cannot
 //!
@@ -45,12 +55,13 @@
 //!
 //! [`MAX_POLL_SOCKETS`]: super::MAX_POLL_SOCKETS
 
+use std::ffi::{CStr, CString};
 use std::net::{TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use super::address::{IpFamily, SocketAddress};
-use super::error::{NetError, NetErrorKind, NetResult};
+use super::error::{NetError, NetErrorKind, NetResult, ResolveFailure};
 use super::{Buffer, ConnectProgress, Inner, PathMtu, PollEntry, Readiness};
 
 // ====================================================================== the errno table
@@ -602,6 +613,191 @@ pub(super) fn interface_addresses() -> NetResult<Vec<std::net::IpAddr>> {
     Ok(addresses)
 }
 
+// ====================================================================== name resolution
+
+/// `getaddrinfo(3)` for `host` and a numeric `port`: every `AF_INET` and `AF_INET6` address in the
+/// resolver's own order, or its `EAI_*` failure classified by [`resolve_failure`].
+///
+/// **The question is the one `std::net::ToSocketAddrs` asks**, so that leaving `std` changes the
+/// classification of a failure and nothing about a success: `ai_family` `AF_UNSPEC`,
+/// `ai_socktype` `SOCK_STREAM` (one entry per address, where no socket type would give one per
+/// type), no `AI_ADDRCONFIG`, no `AI_CANONNAME`; entries of any other family are skipped, as
+/// `std` skips them; and the list is walked in the order it came, which RFC 6724 makes the host's
+/// decision. The one difference is the service argument. `std` passes none and writes the port
+/// into each address afterwards; this passes the port as a decimal string under
+/// `AI_NUMERICSERV`, so the resolver writes it and no services database is consulted. The
+/// addresses come back the same either way, which `a_name_resolves_with_the_port_it_was_asked_for`
+/// holds it to.
+///
+/// `eai_addrfamily` is the target's `EAI_ADDRFAMILY`, which `libc` carries for neither target, so
+/// each backend passes its own (see [`resolve_failure`]).
+pub(super) fn lookup(
+    host: &str,
+    port: u16,
+    eai_addrfamily: libc::c_int,
+) -> NetResult<Vec<SocketAddress>> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+    let node = CString::new(host).map_err(|_| {
+        // `net::resolve` refuses a NUL before it asks a backend; this is that refusal again for a
+        // caller inside the crate, never a guess about which name was meant.
+        NetError::refused("getaddrinfo", format!("{host:?}:{port}"), "the name contains a NUL byte")
+    })?;
+    let service = CString::new(port.to_string()).expect("a decimal number has no NUL in it");
+    // SAFETY: `addrinfo` is plain C data; all-zero is "no preference" for every field, and the
+    // pointer fields must be null in a hints argument.
+    let mut hints: libc::addrinfo = unsafe { core::mem::zeroed() };
+    hints.ai_family = libc::AF_UNSPEC;
+    hints.ai_socktype = libc::SOCK_STREAM;
+    hints.ai_flags = libc::AI_NUMERICSERV;
+
+    let mut list: *mut libc::addrinfo = core::ptr::null_mut();
+    // SAFETY: two NUL-terminated strings and a hints struct that outlive the call, and a live
+    // local the call writes the head of an allocated list into.
+    let code = unsafe {
+        libc::getaddrinfo(node.as_ptr(), service.as_ptr(), &raw const hints, &raw mut list)
+    };
+    if code != 0 {
+        // Read at once: `EAI_SYSTEM` means "see errno", and nothing may run in between.
+        let errno = last_errno();
+        return Err(NetError::Resolve {
+            host: host.to_owned(),
+            port,
+            failure: resolve_failure(code, eai_addrfamily),
+            detail: failure_detail(code, errno, eai_addrfamily),
+        });
+    }
+
+    let mut addresses = Vec::new();
+    let mut entry = list;
+    while !entry.is_null() {
+        // SAFETY: a non-null node of the list `getaddrinfo` allocated, alive until `freeaddrinfo`.
+        let info = unsafe { &*entry };
+        let address = info.ai_addr;
+        let length = info.ai_addrlen as usize;
+        if !address.is_null() {
+            // SAFETY: `ai_addr` points at a `sockaddr` of `ai_addrlen` bytes whose family field
+            // comes first; each family's struct is read only when the length covers it.
+            let family = libc::c_int::from(unsafe { (*address).sa_family });
+            if family == libc::AF_INET && length >= core::mem::size_of::<libc::sockaddr_in>() {
+                // SAFETY: an `AF_INET` `sockaddr` of at least `sockaddr_in`'s size is one.
+                let v4 = unsafe { &*address.cast::<libc::sockaddr_in>() };
+                addresses.push(SocketAddress::from_std(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()),
+                    u16::from_be(v4.sin_port),
+                ))));
+            } else if family == libc::AF_INET6
+                && length >= core::mem::size_of::<libc::sockaddr_in6>()
+            {
+                // SAFETY: as above, for `AF_INET6` and `sockaddr_in6`. `flowinfo` and `scope_id`
+                // are passed through as the numbers they are, which is what `std` does with them.
+                let v6 = unsafe { &*address.cast::<libc::sockaddr_in6>() };
+                addresses.push(SocketAddress::from_std(SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::from(v6.sin6_addr.s6_addr),
+                    u16::from_be(v6.sin6_port),
+                    v6.sin6_flowinfo,
+                    v6.sin6_scope_id,
+                ))));
+            }
+        }
+        entry = info.ai_next;
+    }
+    // SAFETY: `list` is the head `getaddrinfo` returned, freed once, and nothing points into it
+    // any more -- every address above was copied out.
+    unsafe { libc::freeaddrinfo(list) };
+    Ok(addresses)
+}
+
+/// A host `EAI_*` code as the class a caller acts on.
+///
+/// **Every row is a `libc` constant, so the numbers are each target's own** -- `EAI_NONAME` is -2
+/// on Linux and 8 on macOS -- and this function is shared for that reason, as [`kind_from_raw`]
+/// is. The table:
+///
+/// | host code | class | why |
+/// |---|---|---|
+/// | `EAI_NONAME` | [`NoSuchHost`](ResolveFailure::NoSuchHost) | the name does not exist |
+/// | `EAI_AGAIN` | [`Transient`](ResolveFailure::Transient) | the resolver did not answer; the one worth retrying |
+/// | `EAI_FAIL` | [`NonRecoverable`](ResolveFailure::NonRecoverable) | a permanent failure that is not "no such name" |
+/// | `EAI_NODATA` | [`NoAddressOfFamily`](ResolveFailure::NoAddressOfFamily) | the name exists with no address record; both targets' `libc` define it |
+/// | `EAI_ADDRFAMILY` (`eai_addrfamily`) | [`NoAddressOfFamily`](ResolveFailure::NoAddressOfFamily) | the same, per family; its number is each backend's |
+/// | `EAI_SYSTEM` | [`Unclassified`](ResolveFailure::Unclassified), errno in the detail | below |
+/// | `EAI_MEMORY`, `EAI_SERVICE`, `EAI_SOCKTYPE`, `EAI_BADFLAGS`, `EAI_FAMILY`, `EAI_OVERFLOW`, anything else | [`Unclassified`](ResolveFailure::Unclassified), code and `gai_strerror` in the detail | none of them is a statement about the name |
+///
+/// **`EAI_SYSTEM` stays unclassified, and that is a decision rather than a gap.** It says "the
+/// failure is in `errno`", and what `errno` then holds is a fact about *this process* --
+/// `EMFILE` or `ENFILE` when the resolver could not open its socket, `ENOMEM`, `EACCES` on
+/// `/etc/resolv.conf` -- not about the name and not about whether a DNS server answered. The only
+/// class it could plausibly borrow is [`Transient`](ResolveFailure::Transient), and that would tell
+/// the guest `EAI_AGAIN`, which it retries: for descriptor exhaustion the retry fails the same way
+/// for as long as the descriptors are held, which is the spin [`ResolveFailure::is_retryable`]
+/// exists to prevent -- and nothing would record that this layer had chosen the code. So it is reported by name, with the errno and its text in the detail
+/// (see [`failure_detail`]), and the adapter refuses the call. Handing the guest a faithful
+/// `EAI_SYSTEM` would need the host errno translated into the guest's numbering as well, which is
+/// a second table and is not built.
+///
+/// The other unclassified codes are about the *question* (`EAI_BADFLAGS`, `EAI_SERVICE`,
+/// `EAI_SOCKTYPE`, `EAI_FAMILY`: this backend's own hints, which are fixed, so seeing one is a
+/// defect here) or about the host's resources (`EAI_MEMORY`, `EAI_OVERFLOW`); neither kind tells a
+/// guest anything true about the name.
+pub(super) fn resolve_failure(code: libc::c_int, eai_addrfamily: libc::c_int) -> ResolveFailure {
+    match code {
+        libc::EAI_NONAME => ResolveFailure::NoSuchHost,
+        libc::EAI_AGAIN => ResolveFailure::Transient,
+        libc::EAI_FAIL => ResolveFailure::NonRecoverable,
+        libc::EAI_NODATA => ResolveFailure::NoAddressOfFamily,
+        code if code == eai_addrfamily => ResolveFailure::NoAddressOfFamily,
+        // `EAI_SYSTEM` and the rest: see the table above.
+        _ => ResolveFailure::Unclassified,
+    }
+}
+
+/// The `EAI_*` name of a host code, for a message; `None` for a number no row here names.
+fn eai_name(code: libc::c_int, eai_addrfamily: libc::c_int) -> Option<&'static str> {
+    Some(match code {
+        libc::EAI_NONAME => "EAI_NONAME",
+        libc::EAI_AGAIN => "EAI_AGAIN",
+        libc::EAI_FAIL => "EAI_FAIL",
+        libc::EAI_NODATA => "EAI_NODATA",
+        libc::EAI_SYSTEM => "EAI_SYSTEM",
+        libc::EAI_MEMORY => "EAI_MEMORY",
+        libc::EAI_SERVICE => "EAI_SERVICE",
+        libc::EAI_SOCKTYPE => "EAI_SOCKTYPE",
+        libc::EAI_BADFLAGS => "EAI_BADFLAGS",
+        libc::EAI_FAMILY => "EAI_FAMILY",
+        libc::EAI_OVERFLOW => "EAI_OVERFLOW",
+        code if code == eai_addrfamily => "EAI_ADDRFAMILY",
+        _ => return None,
+    })
+}
+
+/// What the host said, kept whole: the code by name and number, `gai_strerror`'s text, and for
+/// `EAI_SYSTEM` the `errno` it points at -- an unclassified failure has nothing else.
+fn failure_detail(code: libc::c_int, errno: i32, eai_addrfamily: libc::c_int) -> String {
+    // SAFETY: `gai_strerror` returns a pointer to a static, NUL-terminated message (glibc's and
+    // Darwin's are both a table of string literals), or null, which is checked.
+    let text = unsafe {
+        let message = libc::gai_strerror(code);
+        if message.is_null() {
+            "(gai_strerror returned no text)".to_owned()
+        } else {
+            CStr::from_ptr(message).to_string_lossy().into_owned()
+        }
+    };
+    let name = eai_name(code, eai_addrfamily).unwrap_or("an EAI code this seam has no name for");
+    let mut detail = format!("the host's getaddrinfo returned {name} ({code}): {text}");
+    if code == libc::EAI_SYSTEM {
+        detail.push_str(&format!(
+            "; errno {errno} ({}). Not classified: EAI_SYSTEM reports a failure of this process \
+             (descriptors, memory, a file the resolver reads), not of the name or of a DNS \
+             server, and calling it EAI_AGAIN would have the guest retry it -- see \
+             omni-platform's net::unix::resolve_failure",
+            std::io::Error::from_raw_os_error(errno)
+        ));
+    }
+    detail
+}
+
 // ====================================================================== macOS-only structural
 
 /// The platform this backend was compiled for, for error messages.
@@ -693,4 +889,150 @@ pub(super) fn set_path_mtu(inner: &Inner, family: IpFamily, mode: PathMtu) -> Ne
 pub(super) fn path_mtu(inner: &Inner, family: IpFamily) -> NetResult<Option<PathMtu>> {
     let _ = (inner, family);
     unsupported("getsockopt", "IP_DONTFRAG/IPV6_DONTFRAG on macOS, which has no PROBE mode")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::ToSocketAddrs;
+
+    use super::super::{backend, resolve, NetPolicy};
+    use super::*;
+
+    /// **The `EAI_*` table, by this target's own numbers.**
+    ///
+    /// Written with `libc`'s names, so it is the same test on Linux (where they count down from
+    /// -1) and macOS (up from 1); `linux.rs` and `macos.rs` each pin the numbers themselves. The
+    /// named codes are also asserted distinct, because two equal constants would make one `match`
+    /// row shadow another and the second class would never be reached.
+    #[test]
+    fn each_eai_code_classifies_by_this_targets_own_number() {
+        let addrfamily = backend::EAI_ADDRFAMILY;
+        let cases = [
+            (libc::EAI_NONAME, ResolveFailure::NoSuchHost),
+            (libc::EAI_AGAIN, ResolveFailure::Transient),
+            (libc::EAI_FAIL, ResolveFailure::NonRecoverable),
+            (libc::EAI_NODATA, ResolveFailure::NoAddressOfFamily),
+            (addrfamily, ResolveFailure::NoAddressOfFamily),
+            // Decided, not defaulted: see `resolve_failure`.
+            (libc::EAI_SYSTEM, ResolveFailure::Unclassified),
+            (libc::EAI_MEMORY, ResolveFailure::Unclassified),
+            (libc::EAI_SERVICE, ResolveFailure::Unclassified),
+            (libc::EAI_SOCKTYPE, ResolveFailure::Unclassified),
+            (libc::EAI_BADFLAGS, ResolveFailure::Unclassified),
+            (libc::EAI_FAMILY, ResolveFailure::Unclassified),
+            (libc::EAI_OVERFLOW, ResolveFailure::Unclassified),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                resolve_failure(code, addrfamily),
+                expected,
+                "{} ({code}) classified wrongly",
+                eai_name(code, addrfamily).expect("every row of the table has a name")
+            );
+        }
+        // A number no header here names: unclassified, and named as such rather than guessed at.
+        assert_eq!(resolve_failure(12_345, addrfamily), ResolveFailure::Unclassified);
+        assert_eq!(eai_name(12_345, addrfamily), None);
+
+        let codes: Vec<libc::c_int> = cases.iter().map(|(code, _)| *code).collect();
+        for (i, a) in codes.iter().enumerate() {
+            assert!(!codes[i + 1..].contains(a), "EAI code {a} appears twice in this target's table");
+        }
+        // And the one a guest may retry is the one the resolver did not answer.
+        let retryable: Vec<libc::c_int> = cases
+            .iter()
+            .filter(|(_, class)| class.is_retryable())
+            .map(|(code, _)| *code)
+            .collect();
+        assert_eq!(retryable, vec![libc::EAI_AGAIN]);
+    }
+
+    /// An unclassified failure keeps everything the host said: the code by name and number,
+    /// `gai_strerror`'s text, and for `EAI_SYSTEM` the errno it points at.
+    #[test]
+    fn an_unclassified_failure_keeps_the_code_the_hosts_text_and_the_errno() {
+        let addrfamily = backend::EAI_ADDRFAMILY;
+        // SAFETY: as in `failure_detail`: a static message, checked for null.
+        let service_text = unsafe {
+            let message = libc::gai_strerror(libc::EAI_SERVICE);
+            assert!(!message.is_null());
+            CStr::from_ptr(message).to_string_lossy().into_owned()
+        };
+        let detail = failure_detail(libc::EAI_SERVICE, 0, addrfamily);
+        assert!(detail.contains("EAI_SERVICE"), "{detail}");
+        assert!(detail.contains(&format!("({})", libc::EAI_SERVICE)), "{detail}");
+        assert!(detail.contains(&service_text), "the host's own text is kept: {detail}");
+
+        let detail = failure_detail(libc::EAI_SYSTEM, libc::EMFILE, addrfamily);
+        assert!(detail.contains("EAI_SYSTEM"), "{detail}");
+        assert!(detail.contains(&format!("errno {}", libc::EMFILE)), "{detail}");
+        assert!(detail.contains("Not classified"), "and why it is not: {detail}");
+
+        let detail = failure_detail(12_345, 0, addrfamily);
+        assert!(detail.contains("no name for") && detail.contains("12345"), "{detail}");
+    }
+
+    /// **`getaddrinfo` here answers what `std` answers**, address for address and in the same
+    /// order, and every address carries the port that was asked for.
+    ///
+    /// `localhost` rather than a real name: it is answered from the hosts file on every unix
+    /// host, so the test needs no network, and it is a *name*, so it goes through `getaddrinfo`
+    /// on both sides rather than through a literal parser. The comparison with `std` is what
+    /// holds the claim in [`lookup`]'s documentation that leaving `std` changed nothing about a
+    /// success -- the family, the socket type, the skipped entries and the order.
+    #[test]
+    fn a_name_resolves_with_the_port_it_was_asked_for() {
+        let addresses =
+            lookup("localhost", 8_080, backend::EAI_ADDRFAMILY).expect("localhost resolves");
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().any(SocketAddress::is_loopback), "{addresses:?}");
+        for address in &addresses {
+            assert_eq!(address.to_std().port(), 8_080, "{address:?}");
+        }
+        let through_std: Vec<SocketAddress> = ("localhost", 8_080)
+            .to_socket_addrs()
+            .expect("std resolves localhost too")
+            .map(SocketAddress::from_std)
+            .collect();
+        assert_eq!(addresses, through_std, "the same question as std's, so the same answer");
+    }
+
+    /// **A name that cannot exist is `NoSuchHost` -- a classified failure, not `Unclassified`.**
+    ///
+    /// This is the gap the unix backend closes, asserted end to end through
+    /// [`resolve`](super::super::resolve): through `std` this failure arrived with no number and
+    /// the adapter had to refuse the guest's call. `.invalid` is reserved by RFC 6761 (section
+    /// 6.4) so that it never resolves, and a resolver is expected to answer it with a negative
+    /// response -- `EAI_NONAME`.
+    ///
+    /// **It passes offline too, and says so.** With no reachable resolver the host answers
+    /// `EAI_AGAIN` instead, which is [`Transient`](ResolveFailure::Transient): the right class
+    /// for that situation and still a classified one, so the test accepts it and prints that it
+    /// did. What it must never be is `Unclassified`, or an address (a resolver that answers names
+    /// that do not exist, which this test is where it announces itself).
+    #[test]
+    fn a_name_under_invalid_is_no_such_host_and_not_unclassified() {
+        let name = "omnidroid-no-such-name.invalid";
+        let err = resolve(name, 443, None, &NetPolicy::unrestricted()).expect_err(
+            "a .invalid name resolved: this host's resolver answers names that do not exist",
+        );
+        match err.resolve_failure() {
+            Some(ResolveFailure::NoSuchHost) => {}
+            Some(ResolveFailure::Transient) => eprintln!(
+                "note: {name} came back EAI_AGAIN (Transient), not EAI_NONAME -- this host has no \
+                 reachable resolver right now. Accepted: it is still a classified failure. {err}"
+            ),
+            other => panic!("expected NoSuchHost (or Transient offline), got {other:?}: {err}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("EAI_NONAME") || text.contains("EAI_AGAIN"), "{text}");
+    }
+
+    /// A NUL is refused rather than ending the name early, even for a caller that skipped
+    /// `resolve`'s own check.
+    #[test]
+    fn a_name_with_a_nul_is_refused_rather_than_truncated() {
+        let err = lookup("localhost\0.invalid", 443, backend::EAI_ADDRFAMILY).unwrap_err();
+        assert!(matches!(err, NetError::Refused { .. }), "{err}");
+    }
 }

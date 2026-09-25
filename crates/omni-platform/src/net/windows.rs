@@ -17,6 +17,11 @@
 //! `cfg` anywhere near it. This file reaches back through `AsRawSocket` for the handful that are
 //! not.
 //!
+//! Name resolution is here too, and on this host it is still `std`: [`lookup`] is
+//! `ToSocketAddrs`, and what makes it a backend function is only the table of WSA numbers that
+//! classifies its failures -- a table the unix backends spell in `EAI_*` and reach by calling
+//! `getaddrinfo` themselves, because `std` drops the number there and keeps it here.
+//!
 //! # Why `select` and not `WSAPoll`
 //!
 //! `WSAPoll` is the obvious choice: it takes an array rather than three fixed-size sets, so it has
@@ -49,7 +54,7 @@
 //! socket is a descriptor leaking out of an instance that D30 point 3 says is isolated, and the
 //! fix is `WSASocketW` with that flag rather than anything further up.
 
-use std::net::{TcpStream, UdpSocket};
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -69,12 +74,12 @@ use windows_sys::Win32::Networking::WinSock::{
     WSADATA, WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAEAFNOSUPPORT, WSAEALREADY,
     WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINPROGRESS, WSAEINTR,
     WSAEINVAL, WSAEISCONN, WSAEMSGSIZE, WSAENETUNREACH, WSAENOBUFS, WSAENOTCONN, WSAESHUTDOWN,
-    WSAETIMEDOUT, WSAEWOULDBLOCK,
+    WSAETIMEDOUT, WSAEWOULDBLOCK, WSAHOST_NOT_FOUND, WSANO_DATA, WSANO_RECOVERY, WSATRY_AGAIN,
 };
 
 use super::{
     Buffer, ConnectProgress, Inner, Interest, IpFamily, NetError, NetErrorKind, NetResult,
-    PathMtu, PollEntry, Readiness, SocketAddress,
+    PathMtu, PollEntry, Readiness, ResolveFailure, SocketAddress,
 };
 
 /// How many sockets one of this backend's sets holds: its `FD_SETSIZE`.
@@ -342,6 +347,53 @@ pub(super) fn accept(inner: &Inner) -> NetResult<(TcpStream, SocketAddress)> {
         .peer_addr()
         .map_err(|error| NetError::io("accept", "the accepted connection", &error))?;
     Ok((stream, SocketAddress::from_std(peer)))
+}
+
+// ====================================================================== name resolution
+
+/// Every address `host` has, through `std`'s [`ToSocketAddrs`] -- **the measured path, unchanged**
+/// -- or the failure classified by the WSA number `std` hands back.
+///
+/// This stays `std` on Windows because `std` keeps the number here: Winsock's `getaddrinfo`
+/// returns its failure as a WSA error code and `std` wraps it with `io::Error::from_raw_os_error`,
+/// so [`std::io::Error::raw_os_error`] is `Some` and the table below matches it. The unix backend
+/// could not say the same of `std` and calls `getaddrinfo` itself; see `net::resolver`'s header.
+/// Address literals never reach here -- the resolver answers them before asking a backend.
+pub(super) fn lookup(host: &str, port: u16) -> NetResult<Vec<SocketAddress>> {
+    match (host, port).to_socket_addrs() {
+        Ok(addresses) => Ok(addresses.map(SocketAddress::from_std).collect()),
+        Err(error) => Err(resolve_error(host, port, &error)),
+    }
+}
+
+/// A Winsock resolver number as the class a caller acts on.
+///
+/// `WSAHOST_NOT_FOUND`, `WSATRY_AGAIN`, `WSANO_RECOVERY` and `WSANO_DATA` are Winsock's spellings
+/// of `EAI_NONAME`, `EAI_AGAIN`, `EAI_FAIL` and `EAI_NODATA` (`ws2tcpip.h` defines the `EAI_*`
+/// names *as* them), and they are what a failed lookup was measured to return. Anything else is
+/// [`ResolveFailure::Unclassified`], which the adapter refuses by name.
+fn resolve_failure(code: Option<i32>) -> ResolveFailure {
+    match code {
+        Some(WSAHOST_NOT_FOUND) => ResolveFailure::NoSuchHost,
+        Some(WSATRY_AGAIN) => ResolveFailure::Transient,
+        Some(WSANO_RECOVERY) => ResolveFailure::NonRecoverable,
+        Some(WSANO_DATA) => ResolveFailure::NoAddressOfFamily,
+        _ => ResolveFailure::Unclassified,
+    }
+}
+
+/// A [`NetError::Resolve`] from `std`'s error, with the WSA number kept in the detail.
+fn resolve_error(host: &str, port: u16, error: &std::io::Error) -> NetError {
+    let code = error.raw_os_error();
+    let detail = match code {
+        Some(code) => format!("{error} (host resolver error {code})"),
+        // Not a shape Winsock's `getaddrinfo` produces: `std` builds an `io::Error` with no number
+        // only for input it refuses before calling it, and the resolver refuses that input first.
+        None => format!(
+            "{error} (the host reported no error number, so there is nothing to classify it by)"
+        ),
+    };
+    NetError::Resolve { host: host.to_owned(), port, failure: resolve_failure(code), detail }
 }
 
 /// Every unicast address of every adapter, in the order `GetAdaptersAddresses` lists them.
@@ -1032,6 +1084,50 @@ mod tests {
             assert_eq!(storage.v6.sin6_addr.u.Byte, octets);
             assert_eq!(storage.v6.Anonymous.sin6_scope_id, 17);
         }
+    }
+
+    /// The Winsock resolver numbers map to the classes a caller acts on.
+    ///
+    /// Constructed from the raw codes rather than by provoking a real lookup, because a test that
+    /// needed a DNS server would be a test that passes or fails on somebody's network — and the
+    /// thing under test is the table, not the resolver. The numbers are asserted as literals as
+    /// well as by name: they are the ones measured, and a `windows-sys` that renumbered them would
+    /// be a change to this path that nobody decided.
+    #[test]
+    fn the_measured_resolver_numbers_classify_and_an_unknown_one_does_not() {
+        assert_eq!(
+            [WSAHOST_NOT_FOUND, WSATRY_AGAIN, WSANO_RECOVERY, WSANO_DATA],
+            [11_001, 11_002, 11_003, 11_004]
+        );
+        let cases = [
+            (WSAHOST_NOT_FOUND, ResolveFailure::NoSuchHost, false),
+            (WSATRY_AGAIN, ResolveFailure::Transient, true),
+            (WSANO_RECOVERY, ResolveFailure::NonRecoverable, false),
+            (WSANO_DATA, ResolveFailure::NoAddressOfFamily, false),
+            // A number that is not in the table: reported unclassified, never guessed at.
+            (1_234_567, ResolveFailure::Unclassified, false),
+        ];
+        for (code, expected, retryable) in cases {
+            let error = std::io::Error::from_raw_os_error(code);
+            let classified = resolve_error("clientsettingscdn.roblox.com", 443, &error);
+            assert_eq!(
+                classified.resolve_failure(),
+                Some(expected),
+                "host resolver error {code} classified wrongly"
+            );
+            assert_eq!(expected.is_retryable(), retryable);
+            assert!(classified.to_string().contains(&code.to_string()), "{classified}");
+        }
+    }
+
+    /// A resolver failure with no host error number is unclassified and says why.
+    #[test]
+    fn a_resolver_failure_with_no_number_is_unclassified_and_explains_itself() {
+        let error = std::io::Error::other("No such host is known.");
+        let classified = resolve_error("example.invalid", 443, &error);
+        assert_eq!(classified.resolve_failure(), Some(ResolveFailure::Unclassified));
+        let text = classified.to_string();
+        assert!(text.contains("no error number"), "{text}");
     }
 
     /// The set helpers agree: what was pushed is found, and what was not is not.

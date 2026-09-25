@@ -3972,13 +3972,27 @@ fn is_socket(c: &ImportCall<'_, '_>, fd: i32) -> AbiResult<bool> {
 /// as a diagnostic and must never become the finished behaviour, and a default `EAI_NONAME` for
 /// anything unrecognised is exactly that — the guest would be told the name does not exist, would
 /// stop asking for ever, and nothing anywhere would record that this layer had invented the
-/// answer. `omni_platform::net::resolve` documents the case it arises in: the unix targets, where
-/// `std` reports a resolver failure with no error number at all.
+/// answer. `omni_platform::net::resolve` documents where it now arises: a host code outside its
+/// backend's table — `EAI_SYSTEM`, `EAI_MEMORY` and the flag-shaped codes on unix, anything but
+/// the four measured WSA numbers on Windows. (It used to be every resolver failure on the unix
+/// targets, where `std` reported one with no number; that is what killed two guest threads in
+/// macOS run m10, and the unix backend calls `getaddrinfo` itself now.)
 ///
-/// The numbering is bionic's `netdb.h`, which counts **up** from 1 where glibc counts down from
-/// -1 — so taking the development host's values would be silently wrong. It is corroborated inside
-/// `omni_bionic::net`: `gai_strerror_message`'s table is bionic's own `ai_errlist`, and row 8 is
-/// "Name or service not known", which is the string `EAI_NONAME` carries.
+/// **This is a class-to-number table, so no host number ever reaches the guest.** The platform
+/// classifies by the host's own `EAI_*` (glibc's count down from -1, Darwin's up from 1) and this
+/// function answers in bionic's `netdb.h`, which counts **up** from 1 — so taking the development
+/// host's values would be silently wrong. It is corroborated inside `omni_bionic::net`:
+/// `gai_strerror_message`'s rows are indexed by the same numbers.
+///
+/// READ, not measured, and recorded for the owner rather than acted on: on a device the app's
+/// `getaddrinfo` does not resolve a name itself. bionic's `android_getaddrinfo_proxy` asks `netd`
+/// and returns **`EAI_NODATA` (7) for every failure the daemon reports** (it reads the daemon's
+/// code and discards it), and the DnsResolver module's `herrnoToAiErrno` maps both
+/// `HOST_NOT_FOUND` and `NO_DATA` to `EAI_NODATA` as well (AOSP `bionic/libc/dns/net/getaddrinfo.c`
+/// and `packages/modules/DnsResolver/gethnamaddr.cpp`, main). So a real phone tells the engine 7
+/// where this table says 8 or 2. The classes are kept apart here because each is true and guest
+/// code can branch on the difference (`EAI_AGAIN` is the retryable one); collapsing them to 7
+/// would be a device-fidelity decision, not a correction.
 fn eai_for(failure: ResolveFailure) -> Option<i32> {
     Some(match failure {
         ResolveFailure::NoSuchHost => net::EAI_NONAME,
@@ -3990,6 +4004,19 @@ fn eai_for(failure: ResolveFailure) -> Option<i32> {
         // rather than acquire a plausible code.
         _ => return None,
     })
+}
+
+/// What `getaddrinfo` does with a failed [`platnet::resolve`]: `Some(code)` is **returned** to
+/// the guest as bionic's `EAI_*`, `None` is **refused by name**.
+///
+/// A resolver failure of a class [`eai_for`] maps is an answer the guest's own code handles -- a
+/// thread that gets `EAI_NONAME` or `EAI_AGAIN` back logs it and carries on, where a refusal kills
+/// it (macOS run m10: two threads, over a DNS blip). Everything else -- a policy refusal, an
+/// unclassified resolver failure, an empty name -- refuses by name. D30 names the alternative as
+/// the trap: an `EAI_*` for a failure nobody classified tells the guest something definite about
+/// a name, and the guest acts on it for ever.
+fn eai_answer(error: &NetError) -> Option<i32> {
+    error.resolve_failure().and_then(eai_for)
 }
 
 /// What the guest's `struct addrinfo` hints asked for.
@@ -4038,9 +4065,9 @@ impl Hints {
 ///   `omni_platform::net::service_port` refuses a service *name* by name rather than guessing that
 ///   `https` is 443, because a built-in table would be a claim about the host's `/etc/services`
 ///   that nothing here can check.
-/// * **`AI_CANONNAME` is accepted and `ai_canonname` is left null.** `std::net::ToSocketAddrs`
-///   returns no canonical name, so there is none to report; `omni_platform::net::resolve` records
-///   that limit, and a name invented here is the one the guest would log and trust.
+/// * **`AI_CANONNAME` is accepted and `ai_canonname` is left null.** The platform resolver asks
+///   the host for no canonical name, so there is none to report; `omni_platform::net::resolve`
+///   records that limit, and a name invented here is the one the guest would log and trust.
 /// * **`AI_ADDRCONFIG`, `AI_V4MAPPED`, `AI_V4MAPPED_CFG` and `AI_ALL` are accepted and do not
 ///   change the answer.** Each of them *narrows or widens by family*, and what they cannot do is
 ///   make this layer return an address the resolver did not give: the observable difference is a
@@ -4207,12 +4234,9 @@ fn resolve_into(
         match platnet::resolve(&name, port, want, &policy) {
         Ok(addresses) => addresses,
         Err(error) => {
-            return match error.resolve_failure().and_then(eai_for) {
+            return match eai_answer(&error) {
                 Some(code) => Ok(code),
-                // Everything else -- a policy refusal, an unclassified resolver failure, an empty
-                // name -- refuses by name. D30 names the alternative as the trap: an `EAI_*` for a
-                // failure nobody classified tells the guest something definite about a name, and
-                // the guest acts on it for ever.
+                // Everything else refuses by name; see `eai_answer`.
                 None => Err(view.refusal(error.to_string())),
             };
             }
@@ -4619,6 +4643,33 @@ mod tests {
         ] {
             assert!(!permanent.is_retryable(), "{permanent} is not worth asking again");
         }
+    }
+
+    /// **A classified resolver failure is returned to the guest as bionic's code; everything else
+    /// is refused.**
+    ///
+    /// The decision `getaddrinfo` makes on a failed lookup, on the errors the platform actually
+    /// builds: `NoSuchHost` and `Transient` -- the m10 case, a DNS blip -- come back as 8 and 2
+    /// and the guest thread carries on; `Unclassified` and a policy refusal come back as `None`,
+    /// which `getaddrinfo` turns into a refusal by name.
+    #[test]
+    fn a_classified_resolver_failure_is_returned_and_the_rest_are_refused() {
+        let failed = |failure| NetError::Resolve {
+            host: "clientsettingscdn.roblox.com".to_owned(),
+            port: 443,
+            failure,
+            detail: "the host's getaddrinfo returned ...".to_owned(),
+        };
+        assert_eq!(eai_answer(&failed(ResolveFailure::NoSuchHost)), Some(8), "EAI_NONAME");
+        assert_eq!(eai_answer(&failed(ResolveFailure::Transient)), Some(2), "EAI_AGAIN");
+        assert_eq!(eai_answer(&failed(ResolveFailure::NonRecoverable)), Some(4), "EAI_FAIL");
+        assert_eq!(eai_answer(&failed(ResolveFailure::NoAddressOfFamily)), Some(1), "EAI_ADDRFAMILY");
+        assert_eq!(eai_answer(&failed(ResolveFailure::Unclassified)), None, "refused by name");
+
+        let policy = platnet::resolve("clientsettingscdn.roblox.com", 443, None, &NetPolicy::closed())
+            .expect_err("a closed policy admits nothing");
+        assert!(matches!(policy, NetError::Policy { .. }), "{policy}");
+        assert_eq!(eai_answer(&policy), None, "a policy refusal is not an answer about the name");
     }
 
     /// **`MSG_DONTWAIT` is honoured only where it asks for something already true.**

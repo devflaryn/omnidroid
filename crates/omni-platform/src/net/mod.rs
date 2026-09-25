@@ -31,7 +31,7 @@
 //! | [`shutdown`](Socket::shutdown), [`local_address`](Socket::local_address), [`peer_address`](Socket::peer_address) | `std::net`, one call | **implemented** — portable `std` |
 //! | [`set_nonblocking`](Socket::set_nonblocking) | `std::net`'s `set_nonblocking` | **implemented** — portable `std` |
 //! | `TCP_NODELAY`, `SO_RCVTIMEO`, `SO_SNDTIMEO` | `set_nodelay`, `set_read_timeout`, `set_write_timeout` | **implemented** — portable `std` |
-//! | [`resolve`] | `std::net::ToSocketAddrs` | **implemented** — portable `std`; see [`resolve`] for the one gap in its *classification* |
+//! | [`resolve`] | **backend** for the lookup — `std::net::ToSocketAddrs` on Windows, `getaddrinfo(3)` on unix — and portable for the policy, literals and the family filter | **implemented** — `getaddrinfo(3)` called directly, because `std` drops the `EAI_*` code there; see [`resolve`] |
 //! | [`Socket::new`] | **backend**: `socket(2)` | **`Unsupported`**, naming `socket(2)` |
 //! | [`connect`](Socket::connect), [`bind`](Socket::bind) | **backend**: `connect(2)`, `bind(2)` | **`Unsupported`** |
 //! | [`listen`](Socket::listen), [`accept`](Socket::accept) | **backend**: `listen(2)`, `accept(2)`; `listen` asks [`NetPolicy::check_listen`] | **`Unsupported`** |

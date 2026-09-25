@@ -10,6 +10,7 @@
 //! | [`accept`] | `accept4(fd, NULL, NULL, SOCK_CLOEXEC)` | the same, for an accepted socket |
 //! | the keep-alive timing options | `TCP_KEEPIDLE` 4, `TCP_KEEPINTVL` 5, `TCP_KEEPCNT` 6 | Linux's numbers are the guest's; they still go through a named variant |
 //! | path-MTU discovery | `IP_MTU_DISCOVER` 10 / `IPV6_MTU_DISCOVER` 23; `DONT` 0, `WANT` 1, `DO` 2, `PROBE` 3 | `WANT`, the kernel's default, is the seam's "not set" |
+//! | [`lookup`]'s `EAI_ADDRFAMILY` | -9 | the one `EAI_*` `libc` does not carry for Linux; the rest of the resolver is the shared body |
 //!
 //! # Blocking, and close-on-exec, and why only one of them is a flag here
 //!
@@ -43,6 +44,18 @@ pub(super) use super::unix::{
     poll, reuse_address, set_broadcast, set_buffer_bytes, set_keep_alive, set_linger,
     set_reuse_address, set_v6only, socket_error, start_connect, v6only,
 };
+
+/// `EAI_ADDRFAMILY` on Linux: **-9**, glibc's `<netdb.h>` number (declared under `__USE_GNU`).
+///
+/// `libc` carries it for Hurd and Redox and not for Linux, so it is written here, where the
+/// numbers only Linux spells this way live. Every other `EAI_*` the shared table matches is a
+/// `libc` constant; see [`unix::resolve_failure`](super::unix::resolve_failure).
+pub(super) const EAI_ADDRFAMILY: libc::c_int = -9;
+
+/// `getaddrinfo(3)`, through the shared body with this target's `EAI_ADDRFAMILY`.
+pub(super) fn lookup(host: &str, port: u16) -> NetResult<Vec<SocketAddress>> {
+    super::unix::lookup(host, port, EAI_ADDRFAMILY)
+}
 
 /// `socket(af, kind | SOCK_CLOEXEC, 0)`: a new, unbound, **blocking** descriptor.
 fn socket(family: IpFamily, kind: libc::c_int, what: &str) -> NetResult<libc::c_int> {
@@ -241,6 +254,37 @@ mod tests {
 
     use super::super::{NetPolicy, Socket, SocketKind};
     use super::*;
+
+    /// **glibc's `EAI_*` numbers, pinned, and the class each gets here.**
+    ///
+    /// The shared table is written with `libc` names; this is the other half, the numbers
+    /// themselves, so that a `libc` that renumbered a constant, or an `EAI_ADDRFAMILY` that
+    /// drifted from glibc's -9, fails here rather than classifying a real failure wrongly.
+    #[test]
+    fn the_eai_numbers_are_glibcs_and_classify_as_the_table_says() {
+        use super::super::unix::resolve_failure;
+        use super::super::ResolveFailure::{
+            NoAddressOfFamily, NoSuchHost, NonRecoverable, Transient, Unclassified,
+        };
+        let pinned = [
+            (libc::EAI_BADFLAGS, -1, Unclassified),
+            (libc::EAI_NONAME, -2, NoSuchHost),
+            (libc::EAI_AGAIN, -3, Transient),
+            (libc::EAI_FAIL, -4, NonRecoverable),
+            (libc::EAI_NODATA, -5, NoAddressOfFamily),
+            (libc::EAI_FAMILY, -6, Unclassified),
+            (libc::EAI_SOCKTYPE, -7, Unclassified),
+            (libc::EAI_SERVICE, -8, Unclassified),
+            (EAI_ADDRFAMILY, -9, NoAddressOfFamily),
+            (libc::EAI_MEMORY, -10, Unclassified),
+            (libc::EAI_SYSTEM, -11, Unclassified),
+            (libc::EAI_OVERFLOW, -12, Unclassified),
+        ];
+        for (constant, number, class) in pinned {
+            assert_eq!(constant, number, "glibc's <netdb.h> numbers this {number}");
+            assert_eq!(resolve_failure(number, EAI_ADDRFAMILY), class, "EAI code {number}");
+        }
+    }
 
     /// `fcntl(F_GETFL)` and `fcntl(F_GETFD)` of a socket's descriptor: (non-blocking, close-on-exec).
     fn flags(inner: &Inner) -> (bool, bool) {

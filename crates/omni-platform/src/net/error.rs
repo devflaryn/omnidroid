@@ -29,10 +29,11 @@
 //! # `Unclassified` is a refusal, not a guess
 //!
 //! [`ResolveFailure::Unclassified`] exists because the host's own resolver error reaches this
-//! layer as a number in `std::io::Error::raw_os_error`, and that number has only been *measured*
-//! on Windows. A failure whose number is not in the table is reported as unclassified with the
-//! host's text kept, and the adapter above must refuse the guest call by name rather than choose
-//! an `EAI_*` for it. D30 is explicit about the trap: a deliberate `EAI_NONAME` that gets you past
+//! layer as a number — a WSA code on Windows, an `EAI_*` on unix — and each backend classifies
+//! only the numbers in its table. A failure whose number is not in the table (on unix that
+//! includes `EAI_SYSTEM`, by decision; see `net::unix::resolve_failure`) is reported as
+//! unclassified with the code and the host's text kept, and the adapter above must refuse the
+//! guest call by name rather than choose an `EAI_*` for it. D30 is explicit about the trap: a deliberate `EAI_NONAME` that gets you past
 //! a gate is indistinguishable, a week later, from an implementation that works.
 
 use core::fmt;
@@ -183,8 +184,10 @@ impl fmt::Display for NetErrorKind {
 /// Why a name lookup failed, in the terms `getaddrinfo`'s `EAI_*` numbering distinguishes.
 ///
 /// The variants are the ones a caller *behaves* differently about. `EAI_MEMORY`, `EAI_SYSTEM`,
-/// `EAI_BADFLAGS` and the rest are deliberately absent: none of them is reachable from this
-/// seam's own API, which takes a host, a port and a family rather than a flags word.
+/// `EAI_BADFLAGS` and the rest have no variant of their own: the flag-shaped ones cannot be asked
+/// for through this seam's API, which takes a host, a port and a family rather than a flags word,
+/// and a host that reports any of them anyway gets [`Unclassified`](Self::Unclassified), with the
+/// code, its text and (for `EAI_SYSTEM`) the errno in the error's detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ResolveFailure {
@@ -198,7 +201,9 @@ pub enum ResolveFailure {
     /// **Derived here rather than reported by the host**, in the ordinary case: this seam asks
     /// the resolver for every family and filters, so "the unfiltered answer had addresses and the
     /// filtered one did not" is a fact it can state without the host having a code for it. That
-    /// is the one classification in this enum that does not depend on a host error number.
+    /// is the one classification in this enum that does not depend on a host error number. A host
+    /// can report it as well — `EAI_ADDRFAMILY` or `EAI_NODATA` on unix, `WSANO_DATA` on Windows —
+    /// and the class is the same.
     NoAddressOfFamily,
     /// The resolver could not be reached, or answered `SERVFAIL` — `EAI_AGAIN`.
     ///
