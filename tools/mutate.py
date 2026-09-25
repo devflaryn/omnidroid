@@ -426,6 +426,12 @@ TEXTURE = [
     "--test", "spec_vectors", "--test", "hostile", "--test", "real_assets",
     "--no-fail-fast",
 ]
+# EGL/GLES with no driver: the pure answers in `--lib`, the guest-driven path in `gles_driverless`.
+GLES_DRIVERLESS = "crates/omni-android/src/gles/driverless.rs"
+DRIVERLESS = [
+    "cargo", "test", "-p", "omni-android", "--release",
+    "--lib", "--test", "gles_driverless", "--no-fail-fast",
+]
 
 # (id, direction, description, file, old, new, command)
 MUTATIONS = [
@@ -9783,6 +9789,43 @@ directory", ADAPTER_FILES,
      '    crate::mutex::unlock(mem, futex, owners, threads, mutex_addr)?;',
      '    crate::mutex::unlock(mem, &crate::mock_threads::MockFutex::new(), owners, threads, mutex_addr)?;',
      ORDER_COND),
+    # EGL/GLES with no driver (2026-09-25): what the headless gate's `libEGL.so` answers, so the
+    # engine's OpenGL ES fallback takes its own failure path instead of killing its game thread.
+    ('driverless-A1', 'A', 'eglGetDisplay with no driver sets EGL_BAD_DISPLAY, not AOSP\'s EGL_BAD_PARAMETER',
+     GLES_DRIVERLESS,
+     '        "eglGetDisplay" | "eglGetPlatformDisplay" | "eglGetProcAddress" | "eglBindAPI" | "eglQueryAPI" => {\n            (0, Some(EGL_BAD_PARAMETER))',
+     '        "eglGetDisplay" | "eglGetPlatformDisplay" | "eglGetProcAddress" | "eglBindAPI" | "eglQueryAPI" => {\n            (0, Some(EGL_BAD_DISPLAY))',
+     DRIVERLESS),
+    ('driverless-A2', 'A', 'eglGetError reads the error and leaves it set',
+     GLES_DRIVERLESS,
+     '    ERROR.with(|cell| cell.replace(EGL_SUCCESS))',
+     '    ERROR.with(|cell| cell.get())',
+     DRIVERLESS),
+    ('driverless-A3', 'A', 'a driverless instance forwards anyway',
+     'crates/omni-android/src/gles/mod.rs',
+     '    if gles.is_driverless() {\n        return driverless::dispatch(&gles, c, &call);\n    }',
+     '    if false {\n        return driverless::dispatch(&gles, c, &call);\n    }',
+     DRIVERLESS),
+    ('driverless-A4', 'A', 'the client-extension query is answered NULL instead of refused',
+     GLES_DRIVERLESS,
+     '        "eglQueryString"\n            if lanes.first() == Some(&0)',
+     '        "eglQueryString"\n            if lanes.first() == Some(&1)',
+     DRIVERLESS),
+    ('driverless-A5', 'A', 'set_host after set_driverless leaves the instance driverless',
+     'crates/omni-android/src/gles/mod.rs',
+     '        self.state.lock().host = Some(host);\n        self.driverless.store(false, Ordering::Release);',
+     '        self.state.lock().host = Some(host);',
+     DRIVERLESS),
+    ('driverless-A6', 'A', 'a GL call with no context sets an EGL error',
+     GLES_DRIVERLESS,
+     '    if !name.starts_with("egl") {\n        return Ok((0, None));',
+     '    if !name.starts_with("egl") {\n        return Ok((0, Some(EGL_BAD_CONTEXT)));',
+     DRIVERLESS),
+    ('driverless-A7', 'A', 'a display-taking EGL call fails with no error',
+     GLES_DRIVERLESS,
+     '        _ => (0, Some(EGL_BAD_DISPLAY)),',
+     '        _ => (0, Some(EGL_SUCCESS)),',
+     DRIVERLESS),
 ]
 
 # The macOS port's rows (prefix `mac-`) live in `tools/mutate_mac/`, one module per workstream, so

@@ -392,3 +392,47 @@ fn a_new_shadow_is_a_granule_or_a_power_of_two() {
     assert_eq!(shadow_capacity(4, 1 << 17), Some(1 << 17), "never less than a page");
     assert_eq!(shadow_capacity(usize::MAX, 4096), None);
 }
+
+// ------------------------------------------------------------------------------ no driver
+
+#[test]
+fn every_core_egl_command_without_a_display_argument_is_named() {
+    use super::driverless::WITHOUT_DISPLAY;
+    let core: Vec<&Signature> = core_signatures().filter(|s| s.name.starts_with("egl")).collect();
+    for name in WITHOUT_DISPLAY {
+        assert!(core.iter().any(|s| s.name == name), "{name} is not a core EGL command");
+    }
+    // Every other core EGL command answers EGL_BAD_DISPLAY, which is right only if its first
+    // argument is the display -- a pointer-width host argument.
+    for s in core.iter().filter(|s| !WITHOUT_DISPLAY.contains(&s.name)) {
+        assert!(s.abi.starts_with('P'), "{} takes no EGLDisplay first ({})", s.name, s.abi);
+    }
+    assert_eq!(core.len(), 44, "EGL 1.0-1.5 has 44 commands; a new one needs its no-driver answer decided");
+}
+
+#[test]
+fn with_no_driver_egl_answers_as_aosps_libegl_and_gl_as_with_no_context() {
+    use super::driverless::{
+        answer, take_error, EGL_BAD_CONTEXT, EGL_BAD_DISPLAY, EGL_BAD_PARAMETER, EGL_SUCCESS,
+    };
+    let _ = take_error();
+    let error = || answer("eglGetError", &[]).expect("answered").0 as u32 as i32;
+    assert_eq!(answer("eglGetDisplay", &[0]), Ok((0, Some(EGL_BAD_PARAMETER))));
+    assert_eq!(answer("eglGetPlatformDisplay", &[0x31D5, 0, 0]), Ok((0, Some(EGL_BAD_PARAMETER))));
+    assert_eq!(answer("eglGetProcAddress", &[0x1000]), Ok((0, Some(EGL_BAD_PARAMETER))));
+    assert_eq!(answer("eglBindAPI", &[0x30A0]), Ok((0, Some(EGL_BAD_PARAMETER))));
+    assert_eq!(answer("eglQueryAPI", &[]), Ok((0, Some(EGL_BAD_PARAMETER))));
+    assert_eq!(answer("eglInitialize", &[0, 0x1000, 0x1004]), Ok((0, Some(EGL_BAD_DISPLAY))));
+    assert_eq!(answer("eglInitialize", &[0xDEAD_0000, 0, 0]), Ok((0, Some(EGL_BAD_DISPLAY))), "any handle");
+    assert_eq!(answer("eglCreateContext", &[0, 0, 0, 0]), Ok((0, Some(EGL_BAD_DISPLAY))));
+    assert_eq!(answer("eglQueryString", &[0, 0x3053]), Ok((0, Some(EGL_BAD_DISPLAY))), "EGL_VENDOR");
+    assert!(answer("eglQueryString", &[0, 0x3055]).is_err(), "the client-extension string is refused");
+    assert_eq!(answer("eglGetCurrentContext", &[]), Ok((0, Some(EGL_SUCCESS))));
+    assert_eq!(answer("eglReleaseThread", &[]), Ok((1, Some(EGL_SUCCESS))));
+    assert_eq!(answer("eglWaitGL", &[]), Ok((0, Some(EGL_BAD_CONTEXT))));
+    assert_eq!(answer("glClear", &[0x4000]), Ok((0, None)));
+    assert_eq!(answer("glGetError", &[]), Ok((0, None)));
+    // answer() decides; the handler sets the error (tests/gles_driverless.rs drives that path), so
+    // nothing above has left one on this thread.
+    assert_eq!(error(), EGL_SUCCESS);
+}

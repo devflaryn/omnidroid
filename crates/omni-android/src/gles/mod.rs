@@ -54,10 +54,16 @@
 //! is counted by name (an atomic per entry, never dropped), every `eglGetProcAddress` is recorded
 //! with its answer, every substitution is recorded, and [`Gles::presents`] counts the
 //! `eglSwapBuffers` the host answered `EGL_TRUE` for. [`Gles::report`] prints it as `GLES:` lines.
+//!
+//! # No driver
+//!
+//! An embedding with a window it cannot draw into (the headless gate) calls
+//! [`Gles::set_driverless`] instead of [`Gles::set_host`]: nothing is forwarded, and every call is
+//! answered as AOSP's `libEGL` answers with no driver ([`driverless`]).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use omni_mem::{GuestAddr, GuestSpace};
@@ -66,6 +72,7 @@ use parking_lot::Mutex;
 use crate::boundary::{BoundaryBuilder, ImportCall, ImportFn};
 use crate::error::{AbiError, AbiResult};
 
+pub mod driverless;
 mod egl;
 mod gl;
 pub mod host;
@@ -171,6 +178,9 @@ pub enum ProcAnswer {
     /// NULL: the command belongs to an extension this layer **withholds** ([`WITHHELD`]) -- the host
     /// has it, and this layer cannot honour it for the guest.
     NullWithheld,
+    /// NULL with `EGL_BAD_PARAMETER`: the instance has no driver ([`Gles::set_driverless`]), and
+    /// AOSP's `libEGL` answers every name so before it looks at one.
+    NullNoDriver,
 }
 
 /// One `eglGetProcAddress` call, as the census records it.
@@ -279,6 +289,8 @@ pub struct Gles {
     table: OnceLock<Table>,
     state: Mutex<State>,
     presents: AtomicU64,
+    /// Set by [`Gles::set_driverless`]: every slot answers as [`driverless`] says.
+    driverless: AtomicBool,
 }
 
 impl core::fmt::Debug for Gles {
@@ -310,15 +322,34 @@ impl Gles {
                 window_surfaces: BTreeMap::new(),
             }),
             presents: AtomicU64::new(0),
+            driverless: AtomicBool::new(false),
         })
     }
 
-    /// Attach the host EGL this instance forwards to. Last writer wins; nothing is migrated.
+    /// Attach the host EGL this instance forwards to. Last writer wins (this or
+    /// [`set_driverless`](Gles::set_driverless)); nothing is migrated.
     ///
     /// **An instance with no host still binds**: every call refuses at its first use naming this
     /// method, rather than the import being unbound (which names nothing about GLES at all).
     pub fn set_host(&self, host: Arc<dyn GlesHost>) {
         self.state.lock().host = Some(host);
+        self.driverless.store(false, Ordering::Release);
+    }
+
+    /// **No driver**: from now on every EGL call answers what AOSP's `libEGL` answers when it has no
+    /// driver (`eglGetDisplay` is `EGL_NO_DISPLAY` with `EGL_BAD_PARAMETER`), and every GL call what
+    /// its no-context hooks answer (0) -- see [`driverless`] for each answer, its source, and how
+    /// faithful it is. For an embedding that gives the guest a window it has no way to draw into.
+    /// Any host is dropped. Last writer wins (this or [`set_host`](Gles::set_host)).
+    pub fn set_driverless(&self) {
+        self.state.lock().host = None;
+        self.driverless.store(true, Ordering::Release);
+    }
+
+    /// Whether [`set_driverless`](Gles::set_driverless) is in force.
+    #[must_use]
+    pub fn is_driverless(&self) -> bool {
+        self.driverless.load(Ordering::Acquire)
     }
 
     /// Bind every core ES 2.0-3.2 and EGL 1.0-1.5 command by name, and the `eglGetProcAddress`
@@ -443,7 +474,12 @@ impl Gles {
         let total: u64 = counts.values().sum();
         out.push_str(&format!(
             "GLES: host {}\n",
-            state.selected.as_deref().unwrap_or("not selected (no EGL or GL call reached the host)")
+            if self.is_driverless() {
+                "none -- no driver (Gles::set_driverless): EGL answers as AOSP's libEGL with no \
+                 driver, GL as with no current context"
+            } else {
+                state.selected.as_deref().unwrap_or("not selected (no EGL or GL call reached the host)")
+            }
         ));
         out.push_str(&format!(
             "GLES: {total} call(s) to {} entry point(s); {} present(s) (eglSwapBuffers answered \
@@ -473,6 +509,7 @@ impl Gles {
                     ProcAnswer::NullFromHost => format!("{} -> NULL (host)", r.name),
                     ProcAnswer::NullNotInRegistry => format!("{} -> NULL (not a GLES/EGL command)", r.name),
                     ProcAnswer::NullWithheld => format!("{} -> NULL (withheld)", r.name),
+                    ProcAnswer::NullNoDriver => format!("{} -> NULL (no driver)", r.name),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -835,6 +872,9 @@ fn dispatch(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         caller: c.caller(),
         entry: index,
     };
+    if gles.is_driverless() {
+        return driverless::dispatch(&gles, c, &call);
+    }
     match assigned.special {
         Some(special) => special(&gles, c, &call),
         None => gles.forward(c, &call),
