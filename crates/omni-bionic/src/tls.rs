@@ -486,50 +486,72 @@ impl TlsRegistry {
             work.extend(batch);
         }
 
-        // Phase 2: pthread_key destructors, ascending key order, up to
-        // PTHREAD_DESTRUCTOR_ITERATIONS rounds. Values are cleared BEFORE the
-        // destructor is recorded; a destructor that sets its key again is
-        // picked up by the next round.
+        // Phase 2: pthread_key destructors -- bionic's `pthread_key_clean_all`, step for step.
+        //
+        // Up to PTHREAD_DESTRUCTOR_ITERATIONS rounds of an ascending walk over the key table.
+        // At each key that has a destructor and a non-NULL value, the value is cleared and the
+        // destructor is called **before the walk moves on to the next key**; a key with no
+        // destructor is left alone ("just in case another destructor function is responsible
+        // for manually releasing the corresponding data", bionic's own comment). A round that
+        // called nothing ends the sweep, and a destructor that sets a key again is met by the
+        // next round.
+        //
+        // **It used to clear every value in a round before calling any destructor**, and clear
+        // the destructor-less ones too. Then a destructor saw NULL for every other key -- one
+        // that asked `getspecific` for a later key's object, or for a key nothing destroys, got
+        // nothing where a device hands it the value. With the engine's mimalloc, whose default
+        // heap is a `pthread_getspecific` value, a lower key's destructor that allocated found
+        // no heap, made a fresh one and set it, and mimalloc's own destructor then pointed the
+        // key at the empty heap -- a heap orphaned under this thread's TPIDR_EL0, which the next
+        // thread given the same TLS block inherits as its thread id.
         for _round in 0..PTHREAD_DESTRUCTOR_ITERATIONS {
-            let mut round_pairs: Vec<(u64, u64)> = Vec::new();
-            {
-                // The key table's lock, so each slot's destructor is the one of
-                // the generation the value was stored under.
-                let inner = self.inner.lock().unwrap();
-                self.with_values(thread, |values| {
-                    for (idx, slot) in inner.keys.iter().enumerate() {
-                        if slot.generation == 0 {
-                            continue;
-                        }
-                        let v = values.pairs[idx].read(slot.generation);
-                        if v == 0 {
-                            continue;
-                        }
-                        values.pairs[idx].write(slot.generation, 0);
-                        let dtor = if slot.dtor == u64::MAX { 0 } else { slot.dtor };
-                        if dtor != 0 {
-                            round_pairs.push((dtor, v));
-                        }
+            let mut called = 0usize;
+            let mut idx = 0usize;
+            loop {
+                // The key table's lock, so the destructor is the one of the generation the value
+                // was stored under -- and released before the call, which may create a key.
+                let next = {
+                    let inner = self.inner.lock().unwrap();
+                    let Some(slot) = inner.keys.get(idx).copied() else {
+                        break;
+                    };
+                    let dtor = if slot.dtor == u64::MAX { 0 } else { slot.dtor };
+                    if slot.generation == 0 || dtor == 0 {
+                        None
+                    } else {
+                        self.with_values(thread, |values| {
+                            let v = values.pairs[idx].read(slot.generation);
+                            (v != 0).then(|| {
+                                values.pairs[idx].write(slot.generation, 0);
+                                (dtor, v)
+                            })
+                        })
                     }
-                });
+                };
+                if let Some((dtor, value)) = next {
+                    run_recorded(dtor, value);
+                    work.push((dtor, value));
+                    called += 1;
+                }
+                idx += 1;
             }
-            if round_pairs.is_empty() {
+            if called == 0 {
                 break;
             }
-            for (dtor, value) in &round_pairs {
-                run_recorded(*dtor, *value);
-            }
-            work.extend(round_pairs);
         }
 
-        // A thread the sweep left with nothing gives its block back. One whose
-        // destructors kept re-setting past the cap keeps it, value and all, as
-        // before: that value is still what `getspecific` answers for it.
+        // A thread the sweep left with nothing to destroy gives its block back, and the values
+        // of keys with no destructor go with it, as bionic frees a thread's TLS at its exit. One
+        // whose destructors kept re-setting past the cap keeps it, value and all, as before:
+        // that value is still what `getspecific` answers for it.
         let leftover = {
             let inner = self.inner.lock().unwrap();
             self.with_values(thread, |values| {
                 inner.keys.iter().enumerate().any(|(idx, slot)| {
-                    slot.generation != 0 && values.pairs[idx].read(slot.generation) != 0
+                    slot.generation != 0
+                        && slot.dtor != 0
+                        && slot.dtor != u64::MAX
+                        && values.pairs[idx].read(slot.generation) != 0
                 })
             })
         };
@@ -588,9 +610,10 @@ mod tests {
         assert_eq!(reg.live_keys(), 0);
     }
 
-    /// Exit sweep: destructors run for non-NULL keys in ascending key order,
-    /// value cleared BEFORE the destructor is recorded, NULL-valued keys
-    /// skipped, no-dtor keys dropped silently.
+    /// Exit sweep, as bionic's `pthread_key_clean_all`: destructors run for non-NULL keys in
+    /// ascending key order, each key's value cleared just before ITS destructor is called --
+    /// so a destructor still sees every later key's value -- NULL-valued keys skipped, and a
+    /// key with no destructor neither called nor cleared.
     #[test]
     fn exit_sweep_order_and_clearing() {
         let reg = Arc::new(TlsRegistry::new());
@@ -600,14 +623,21 @@ mod tests {
         let me = GuestThreadId(42);
         assert_eq!(reg.setspecific(me, k0, 0xAA0), 0);
         assert_eq!(reg.setspecific(me, k1, 0xAA1), 0);
-        assert_eq!(reg.setspecific(me, k2, 0xAA2), 0); // dropped: no dtor
+        assert_eq!(reg.setspecific(me, k2, 0xAA2), 0); // not destroyed: no dtor
 
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut run = |dtor: u64, value: u64| {
             calls.lock().unwrap().push((dtor, value));
-            // While "inside" the destructor, the value must ALREADY be cleared.
-            assert_eq!(reg.getspecific(me, k0), 0, "cleared before dtor runs (k0)");
-            assert_eq!(reg.getspecific(me, k1), 0, "cleared before dtor runs (k1)");
+            // While "inside" a destructor, its own value is ALREADY cleared...
+            if dtor == 0x1000 {
+                assert_eq!(reg.getspecific(me, k0), 0, "k0 cleared before its dtor runs");
+                // ...and a later key's is NOT yet: bionic clears one key at a time.
+                assert_eq!(reg.getspecific(me, k1), 0xAA1, "k1 still set while k0's dtor runs");
+            } else {
+                assert_eq!(reg.getspecific(me, k1), 0, "k1 cleared before its dtor runs");
+            }
+            // A key without a destructor is left for the thread's TLS to be freed with.
+            assert_eq!(reg.getspecific(me, k2), 0xAA2, "a no-dtor key is not cleared");
         };
         let work = reg.take_exit_work(me, &mut run);
         assert_eq!(
