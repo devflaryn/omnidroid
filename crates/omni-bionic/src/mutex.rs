@@ -322,7 +322,7 @@ pub fn lock(
                     if state == u32::MAX {
                         return Ok(consts::EAGAIN); // recursive limit
                     }
-                    write_state(mem, mutex_addr, state + 1)?;
+                    store_state(mem, mutex_addr, state + 1)?;
                     return Ok(0);
                 }
                 // Not the owner: contend.
@@ -412,7 +412,7 @@ pub fn trylock(
                 if state == u32::MAX {
                     Ok(consts::EAGAIN)
                 } else {
-                    write_state(mem, mutex_addr, state + 1)?;
+                    store_state(mem, mutex_addr, state + 1)?;
                     Ok(0)
                 }
             } else {
@@ -475,7 +475,7 @@ pub fn timedlock(
                 if state == u32::MAX {
                     Ok(consts::EAGAIN)
                 } else {
-                    write_state(mem, mutex_addr, state + 1)?;
+                    store_state(mem, mutex_addr, state + 1)?;
                     Ok(0)
                 }
             } else {
@@ -555,8 +555,11 @@ pub fn unlock(
             // that wins the word in between registers as the new owner, and a
             // late `clear` here would delete the NEW owner's entry — the next
             // unlock would then fail EPERM with the mutex genuinely held.
+            // The publish is a RELEASE store (`store_state`): the next owner's CAS
+            // must see this critical section, and a plain `write` does not
+            // promise that on an arm64 host.
             owners.clear(mutex_addr);
-            write_state(mem, mutex_addr, 0)?;
+            store_state(mem, mutex_addr, 0)?;
             futex.wake(mutex_addr, 1);
             Ok(0)
         }
@@ -569,12 +572,14 @@ pub fn unlock(
             }
             let new = state - 1;
             if new == 0 {
-                // Same ordering discipline as ERRORCHECK: clear before publish.
+                // Same ordering discipline as ERRORCHECK: clear before publish,
+                // and the publish a release store.
                 owners.clear(mutex_addr);
-                write_state(mem, mutex_addr, new)?;
+                store_state(mem, mutex_addr, new)?;
                 futex.wake(mutex_addr, 1);
             } else {
-                write_state(mem, mutex_addr, new)?;
+                // Still held: one atomic store of the count (see `store_state`).
+                store_state(mem, mutex_addr, new)?;
             }
             Ok(0)
         }
@@ -638,7 +643,7 @@ fn contend(
         if type_ == mutex_type::RECURSIVE && owners.get(mutex_addr) == Some(me) {
             // Lost the mutex then got it back via recursion window — treat as
             // unlocked path.
-            write_state(mem, mutex_addr, state + 1)?;
+            store_state(mem, mutex_addr, state + 1)?;
             return Ok(Ok(()));
         }
         // Mark waiters present (LOCKED_WITH_WAITERS) so the unlock wakes us even
@@ -723,14 +728,44 @@ fn contend(
 // Guest struct access helpers
 // ---------------------------------------------------------------------------
 
+/// A plain read of the state word, and plain on purpose: every caller either follows it with a
+/// `cas_u32` that re-checks the value and is itself the acquire, or reads a count only its own
+/// thread stores (the RECURSIVE owner's). A stale value costs a failed CAS or an `EBUSY` that a
+/// moment later would not have been, never an entry without the acquire.
 fn read_state(mem: &impl GuestMemory, addr: u64) -> Result<u32, crate::memory::Fault> {
     let mut b = [0u8; 4];
     mem.read(addr, &mut b)?;
     Ok(u32::from_le_bytes(b))
 }
 
-fn write_state(mem: &mut impl GuestMemory, addr: u64, v: u32) -> Result<(), crate::memory::Fault> {
-    mem.write(addr, &v.to_le_bytes())
+/// Store the state word with **release** ordering, as one atomic store. Every store of the word
+/// outside `init`/`destroy` is here or a `cas_u32`, and none is a `GuestMemory::write`.
+///
+/// Two kinds of store come through here, and each needs something a plain `write` (a byte copy,
+/// no ordering) does not give:
+///
+/// * **The release to 0** -- ERRORCHECK, and RECURSIVE when the count reaches 0 -- hands the mutex
+///   to whichever thread CASes it next, and that thread must see this one's critical section.
+///   These were a plain `write`, while NORMAL/DEFAULT released through `cas_u32`. On an x86-64
+///   host (TSO) the two are the same; on an arm64 host the plain store may become visible before
+///   the critical section's own stores, and the next owner reads them stale. Found by audit
+///   after macOS run m9, where the engine's DataModel write-lock tracker asserted "lock owned by
+///   another fiber" on the Mac only. The release also orders the unlock's `owners.clear` before
+///   the publish, so the acquirer's `owners.set` (after its CAS reads this store) cannot land
+///   before the clear -- the property the clear-before-publish comments in `unlock` rely on,
+///   which a plain store only kept by the accident of TSO.
+/// * **The recursive count** -- a re-entry, or a release that leaves it above 0 -- needs no
+///   ordering: only the owner stores it, and other threads only read it or CAS it from 0. It
+///   needs to be **one** store, because those other threads race it, and a byte copy is not
+///   promised to be one: a count going `0xFF -> 0x100` a byte at a time is 0 in between, and a
+///   racing `cas_acquire` would take a mutex that is held. The release costs nothing on x86 and
+///   one `STLR` on arm64.
+fn store_state(
+    mem: &(impl GuestMemory + GuestAtomic),
+    addr: u64,
+    v: u32,
+) -> Result<(), crate::memory::Fault> {
+    mem.store_u32_release(addr, v)
 }
 
 fn read_type(mem: &impl GuestMemory, addr: u64) -> Result<i32, crate::memory::Fault> {
@@ -741,6 +776,9 @@ fn read_type(mem: &impl GuestMemory, addr: u64) -> Result<i32, crate::memory::Fa
 
 /// Atomic acquire: 0 -> LOCKED (1) via CAS. Returns true if THIS caller won.
 /// A failed CAS means another thread holds the mutex (or won the race).
+/// "Acquire" in both senses: `cas_u32` is at least acquire when it swaps (see
+/// [`GuestAtomic`]), which pairs with the previous owner's release -- its
+/// `store_state(0)` or its NORMAL unlock CAS.
 fn cas_acquire(
     mem: &(impl GuestMemory + GuestAtomic),
     mutex_addr: u64,
@@ -1195,6 +1233,73 @@ mod tests {
         for ty in [mutex_type::NORMAL, mutex_type::ERRORCHECK, mutex_type::RECURSIVE] {
             let refused = contended_over_a_comparing_futex(ty);
             assert!(refused < 100, "type {ty}: {refused} waits refused -- the contender spun");
+        }
+    }
+
+    /// **Every store of the state word is a release store or a CAS, never a plain `write`**, for
+    /// every type, through lock, trylock, re-entry and unlock -- and the store that gives the
+    /// mutex back is the ordered one.
+    ///
+    /// The mock orders everything under its host lock, so a plain `write` here behaves exactly
+    /// like a release store, and did: ERRORCHECK's unlock and RECURSIVE's last one published "0"
+    /// with a byte copy, and every behavioural test passed. The difference is on an arm64 host,
+    /// where the next owner could take the mutex and read the critical section stale (found by
+    /// audit after macOS run m9). What a test can pin is the primitive, so this records it.
+    #[test]
+    fn the_state_word_is_only_ever_stored_with_ordering() {
+        use crate::shared_mem::{RecordingMemory, WordAccess};
+        for ty in [
+            mutex_type::NORMAL,
+            mutex_type::DEFAULT,
+            mutex_type::ERRORCHECK,
+            mutex_type::RECURSIVE,
+        ] {
+            let (shared, f, o, t) = setup(0x1000);
+            set_type(&mut shared.clone(), 0x1000, ty);
+            let mut mem = RecordingMemory::new(shared, 0x1000);
+            assert_eq!(lock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0, "type {ty}: lock");
+            let holds = if ty == mutex_type::RECURSIVE {
+                // Re-entry through both paths that count: lock and trylock.
+                assert_eq!(lock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0);
+                assert_eq!(trylock(&mut mem, &o, &t, 0x1000).unwrap(), 0);
+                3
+            } else {
+                1
+            };
+            for _ in 0..holds {
+                assert_eq!(unlock(&mut mem, &f, &o, &t, 0x1000).unwrap(), 0, "type {ty}: unlock");
+            }
+            assert_eq!(read_state(mem.shared(), 0x1000).unwrap(), 0, "type {ty}: released");
+
+            let log = mem.log();
+            let plain: Vec<_> =
+                log.iter().filter(|a| matches!(a, WordAccess::Write(_))).collect();
+            assert!(plain.is_empty(), "type {ty}: the state word was stored plainly: {log:?}");
+            // The store that made the word 0 -- the hand-over -- is the ordered one the type uses.
+            let released = log
+                .iter()
+                .rev()
+                .find(|a| {
+                    matches!(a, WordAccess::StoreRelease(0) | WordAccess::Cas { new: 0, swapped: true })
+                })
+                .copied();
+            let expected = if ty == mutex_type::ERRORCHECK || ty == mutex_type::RECURSIVE {
+                WordAccess::StoreRelease(0)
+            } else {
+                WordAccess::Cas { new: 0, swapped: true }
+            };
+            assert_eq!(released, Some(expected), "type {ty}: the release was not ordered: {log:?}");
+            if ty == mutex_type::RECURSIVE {
+                // The count itself: one atomic store per step, up and down.
+                let counts: Vec<u32> = log
+                    .iter()
+                    .filter_map(|a| match a {
+                        WordAccess::StoreRelease(v) => Some(*v),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(counts, [2, 3, 2, 1, 0], "the recursive count's stores: {log:?}");
+            }
         }
     }
 }
