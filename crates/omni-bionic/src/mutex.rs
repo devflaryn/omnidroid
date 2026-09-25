@@ -80,10 +80,70 @@ mod lock_state {
 /// keyed by the mutex's guest address: it maps mutex address -> full 64-bit owner.
 /// The guest word exists so a *guest-visible* unlock by a wrong thread can be
 /// diagnosed without the table (the table is authoritative; the word is a witness).
-#[derive(Default)]
+///
+/// # Sharded by mutex address, so two threads on two mutexes never meet
+///
+/// Every successful lock writes an entry and every unlock removes one, from every
+/// guest thread. It was one `Mutex<HashMap>`, and MEASURED in a world (sampling
+/// profiler, 2026-09-25) `set` and `clear` were ~3% of the samples outside translated
+/// code and ~6% of those inside handlers: the game thread alone takes and releases a
+/// mutex more than a million times a second, and every other thread's lock queued
+/// behind it on the one host lock whatever guest mutex it was taking. An address now
+/// picks one of [`OWNER_SHARDS`] tables, each behind its own lock on its own cache
+/// lines, so the only threads that share a host lock are ones whose guest mutexes
+/// hash together -- and every operation on one address is still serialised by one
+/// lock, which is all the owner checks rely on.
 pub struct OwnerTable {
-    /// mutex guest address -> full owner identity. Entries removed on unlock/destroy.
-    owners: HostMutex<HashMap<u64, GuestThreadId>>,
+    /// mutex guest address -> full owner identity, split by [`shard_of`]. Entries
+    /// removed on unlock/destroy.
+    shards: Box<[OwnerShard]>,
+}
+
+/// How many independent tables an [`OwnerTable`] is split into. A power of two.
+pub const OWNER_SHARDS: usize = 64;
+
+/// One shard: its own lock, alone on its cache lines so that two shards' locks are
+/// not one line two cores fight over.
+#[repr(align(128))]
+#[derive(Default)]
+struct OwnerShard(HostMutex<HashMap<u64, GuestThreadId, AddressHashing>>);
+
+/// Which shard `addr`'s entry lives in: a multiplicative hash of the address, top bits.
+/// Mutexes are eight-aligned and 40 bytes apart when packed, so the low bits alone
+/// would put neighbours together.
+pub(crate) fn shard_of(addr: u64) -> usize {
+    ((addr >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - OWNER_SHARDS.trailing_zeros())) as usize
+}
+
+/// `HashMap`'s default SipHash is keyed against collision attacks, which an address
+/// the table's own lock and unlock paths insert does not need, and it costs more than
+/// the rest of a lookup. A multiply-and-fold of the one `u64` it is ever given.
+type AddressHashing = core::hash::BuildHasherDefault<AddressHasher>;
+
+#[derive(Default)]
+struct AddressHasher(u64);
+
+impl core::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        let mixed = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        mixed ^ (mixed >> 32)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 ^= value;
+    }
+}
+
+impl Default for OwnerTable {
+    fn default() -> Self {
+        Self { shards: (0..OWNER_SHARDS).map(|_| OwnerShard::default()).collect() }
+    }
 }
 
 impl OwnerTable {
@@ -92,8 +152,12 @@ impl OwnerTable {
         Self::default()
     }
 
+    fn shard(&self, addr: u64) -> &HostMutex<HashMap<u64, GuestThreadId, AddressHashing>> {
+        &self.shards[shard_of(addr)].0
+    }
+
     fn set(&self, addr: u64, owner: GuestThreadId) {
-        self.owners.lock().unwrap().insert(addr, owner);
+        self.shard(addr).lock().unwrap().insert(addr, owner);
     }
 
     /// Who holds the mutex at `addr`, if anybody.
@@ -103,11 +167,11 @@ impl OwnerTable {
     /// unlock paths decide on, so it cannot disagree with them.
     #[must_use]
     pub fn get(&self, addr: u64) -> Option<GuestThreadId> {
-        self.owners.lock().unwrap().get(&addr).copied()
+        self.shard(addr).lock().unwrap().get(&addr).copied()
     }
 
     fn clear(&self, addr: u64) -> bool {
-        self.owners.lock().unwrap().remove(&addr).is_some()
+        self.shard(addr).lock().unwrap().remove(&addr).is_some()
     }
 }
 
@@ -1020,6 +1084,65 @@ mod tests {
         assert!(lock(&mut mem.clone(), &f, &o, &t, u64::MAX - 20).is_err());
         // Unmapped:
         assert!(lock(&mut mem.clone(), &f, &o, &t, 0xdead_0000).is_err());
+    }
+
+    /// **The owner checks hold across every shard of the owner table**: 256 packed
+    /// ERRORCHECK mutexes, which land in most of the 64 shards, each report their own
+    /// owner; a second thread's unlock of any of them is EPERM and its trylock EBUSY;
+    /// releasing every other one leaves exactly the rest held; and a relock is EDEADLK.
+    #[test]
+    fn owner_checks_hold_for_mutexes_in_every_shard() {
+        const COUNT: u64 = 256;
+        const BASE: u64 = 0x1_0000;
+        let at = |i: u64| BASE + i * sizes::PTHREAD_MUTEX_T;
+        let mem = crate::shared_mem::SharedMockMemory::new({
+            let mut m = MockMemory::new();
+            m.map(BASE, &vec![0u8; (COUNT * sizes::PTHREAD_MUTEX_T) as usize]);
+            m
+        });
+        let shards: std::collections::HashSet<usize> = (0..COUNT).map(|i| shard_of(at(i))).collect();
+        assert!(shards.len() >= OWNER_SHARDS * 3 / 4, "packed mutexes spread over the shards: {}", shards.len());
+        for i in 0..COUNT {
+            set_type(&mut mem.clone(), at(i), mutex_type::ERRORCHECK);
+        }
+        let f = std::sync::Arc::new(MockFutex::new());
+        let o = std::sync::Arc::new(OwnerTable::new());
+        let t = std::sync::Arc::new(MockThreads::new());
+        let me = t.current();
+        for i in 0..COUNT {
+            assert_eq!(lock(&mut mem.clone(), &*f, &o, &*t, at(i)).unwrap(), 0, "lock {i}");
+        }
+        for i in 0..COUNT {
+            assert_eq!(o.get(at(i)), Some(me), "owner of {i}");
+            assert_eq!(lock(&mut mem.clone(), &*f, &o, &*t, at(i)).unwrap(), consts::EDEADLK, "relock {i}");
+        }
+        let other = {
+            let (mem, f, o, t) = (mem.clone(), f.clone(), o.clone(), t.clone());
+            std::thread::spawn(move || {
+                (0..COUNT)
+                    .map(|i| {
+                        let unlocked = unlock(&mut mem.clone(), &*f, &o, &*t, at(i)).unwrap();
+                        let tried = trylock(&mut mem.clone(), &o, &*t, at(i)).unwrap();
+                        (unlocked, tried)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        for (i, answer) in other.join().unwrap().into_iter().enumerate() {
+            assert_eq!(answer, (consts::EPERM, consts::EBUSY), "another thread on {i}");
+        }
+        for i in (0..COUNT).step_by(2) {
+            assert_eq!(unlock(&mut mem.clone(), &*f, &o, &*t, at(i)).unwrap(), 0, "unlock {i}");
+        }
+        for i in 0..COUNT {
+            let expected = if i % 2 == 0 { None } else { Some(me) };
+            assert_eq!(o.get(at(i)), expected, "after releasing the even ones, {i}");
+        }
+        for i in (1..COUNT).step_by(2) {
+            assert_eq!(unlock(&mut mem.clone(), &*f, &o, &*t, at(i)).unwrap(), 0, "unlock {i}");
+            assert_eq!(destroy(&mut mem.clone(), &o, at(i)).unwrap(), 0, "destroy {i}");
+        }
+        assert!((0..COUNT).all(|i| o.get(at(i)).is_none()), "every entry is gone");
     }
 
     fn set_type(mem: &mut crate::shared_mem::SharedMockMemory, addr: u64, ty: i32) {
