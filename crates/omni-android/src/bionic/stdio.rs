@@ -794,6 +794,50 @@ pub(super) fn fputs(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// The `FILE *` the guest's `stdout` variable holds now: what `printf` and `puts` write to.
+///
+/// Read through the variable rather than assumed to be `&__sF[1]`, because that is what bionic's
+/// `printf` does (`vfprintf(stdout, ..)`) -- a guest that pointed `stdout` elsewhere is honoured,
+/// and one that pointed it at something this layer never handed out is refused by
+/// [`stream_of`]'s name, as `fprintf` to that pointer would be.
+pub(super) fn stdout_stream(c: &ImportCall<'_, '_>) -> AbiResult<u64> {
+    let state = active(c.symbol(), c.address())?;
+    let Some(cell) = state.bionic.stdout_cell() else {
+        return Err(crate::AbiError::Refused {
+            symbol: c.symbol().to_string(),
+            address: c.address(),
+            why: "the guest's `stdout` variable was never installed in this instance, so there \
+                  is no stream for it to name"
+                .to_string(),
+        });
+    };
+    c.mem().read_u64(cell, c.blame(0))
+}
+
+/// `int puts(const char *s)`
+///
+/// bionic's (`libc/stdio/stdio.cpp`): `s` and then `"\n"` to `stdout` in one locked write, and
+/// the result is `'\n'` on success, `EOF` on failure -- **not** the byte count `fputs` returns.
+/// The two writes here are `fputs`'s and `fputc`'s over the same stream, so a failure in either
+/// sets the stream's error flag and `errno` exactly as those do.
+pub(super) fn puts(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let s = c.args().next_u64()?;
+    let file = stdout_stream(c)?;
+    let result = with_stream(c, file, |view, descriptors, stream| {
+        view.blaming(0);
+        let produced = stdio::fputs(view, descriptors, stream, s);
+        if lift(view, produced)? == EOF {
+            return Ok(EOF);
+        }
+        Ok(match stdio::fputc(view, descriptors, stream, i32::from(b'\n')) {
+            EOF => EOF,
+            _ => i32::from(b'\n'),
+        })
+    })?;
+    c.ret().i32(result);
+    Ok(())
+}
+
 /// `int fputc(int c, FILE *stream)`
 pub(super) fn fputc(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (value, file) = {

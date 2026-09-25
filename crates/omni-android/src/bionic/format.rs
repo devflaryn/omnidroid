@@ -448,6 +448,34 @@ pub(super) fn vfprintf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     Ok(())
 }
 
+/// `int printf(const char *fmt, ...)`
+///
+/// bionic's is `vfprintf(stdout, fmt, ap)`, and so is this: the text is rendered exactly as
+/// [`fprintf`] renders it, and written to the stream the guest's `stdout` variable names at the
+/// moment of the call -- `&__sF[1]`, fd 1, whose bytes reach the host's log as every other
+/// standard-stream write does.
+///
+/// MEASURED (in world, 2026-09-25, run w13): thread 88 died on this symbol unbound at call site
+/// link `0x50ae13c`, formatting through a thunk the engine's networking code reaches, and the game
+/// froze behind it. Outside Task 1's 188; `BEYOND_THE_PREDICTION` records it.
+pub(super) fn printf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let text = {
+        let state = active(c.symbol(), c.address())?;
+        let (fmt, consumed, overflow) = {
+            let mut a = c.args();
+            let fmt = a.next_u64()?;
+            (fmt, a.consumed(), a.overflow())
+        };
+        let mut source = c.varargs(consumed, overflow, 1);
+        let view = enter(c, &state);
+        render(&view, fmt, 0, &mut source)?
+    };
+    let stream = super::stdio::stdout_stream(c)?;
+    let written = super::stdio::print_to_stream(c, stream, &text)?;
+    c.ret().i32(written);
+    Ok(())
+}
+
 /// `int vasprintf(char **strp, const char *fmt, va_list ap)`
 ///
 /// The result has to be `malloc`ed in the **guest's** heap, and `libroblox.so` imports no

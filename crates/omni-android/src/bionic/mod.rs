@@ -418,6 +418,10 @@ pub struct Bionic {
     /// [`FILE_BYTES`] from being able to produce a wrong answer; `stdio`'s module documentation
     /// has the whole argument.
     streams: Mutex<BTreeMap<GuestAddr, Stream>>,
+    /// Where the guest's `FILE *stdout` variable lives, once the data objects are installed; 0
+    /// before. `printf` and `puts` read the stream through it, as bionic's `vfprintf(stdout, ..)`
+    /// does, rather than assuming `&__sF[1]`.
+    stdout_cell: AtomicU64,
     /// The open directory streams: the guest `DIR *`, and the seam's handle behind it.
     dirs: Mutex<BTreeMap<GuestAddr, i32>>,
 
@@ -681,6 +685,7 @@ impl Bionic {
             fs: OnceLock::new(),
             fs_device: OnceLock::new(),
             streams: Mutex::new(BTreeMap::new()),
+            stdout_cell: AtomicU64::new(0),
             dirs: Mutex::new(BTreeMap::new()),
             thread_host: OnceLock::new(),
             guest_threads: Mutex::new(GuestThreads::default()),
@@ -1189,6 +1194,20 @@ impl Bionic {
     /// Register a stream at a guest address the boundary already placed — the three `__sF` ones.
     pub(crate) fn register_stream(&self, at: GuestAddr, fd: i32) {
         self.streams.lock().insert(at, Stream::new(fd));
+    }
+
+    /// Record where the guest's `stdout` variable lives: the `FILE *` `printf` and `puts` write to.
+    pub(crate) fn set_stdout_cell(&self, cell: GuestAddr) {
+        self.stdout_cell.store(cell as u64, Ordering::Release);
+    }
+
+    /// The guest address of `FILE *stdout`, or `None` before the data objects were installed.
+    #[must_use]
+    pub(crate) fn stdout_cell(&self) -> Option<GuestAddr> {
+        match self.stdout_cell.load(Ordering::Acquire) {
+            0 => None,
+            cell => GuestAddr::try_from(cell).ok(),
+        }
     }
 
     /// Hand out a `FILE` object for `fd`, or `None` when the table is full.

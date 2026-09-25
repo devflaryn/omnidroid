@@ -1781,6 +1781,11 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("__vsprintf_chk", format::vsprintf_chk),
     ("fprintf", format::fprintf),
     ("vfprintf", format::vfprintf),
+    // The in-world run w13 (2026-09-25): thread 88 died on an unbound `printf` at call site link
+    // `0x50ae13c` and the game froze behind it. `puts` is the other stdout-only writer
+    // `libroblox.so` imports, bound beside it. Outside Task 1's 188; `BEYOND_THE_PREDICTION`
+    // records both.
+    ("printf", format::printf),
     ("vasprintf", format::vasprintf),
     ("sscanf", format::sscanf),
     ("fscanf", format::fscanf),
@@ -1930,6 +1935,7 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     ("ftell", stdio::ftello),
     ("fputc", stdio::fputc),
     ("fputs", stdio::fputs),
+    ("puts", stdio::puts),
     ("fread", stdio::fread),
     ("fwrite", stdio::fwrite),
     // ---- phase 3c: signals. One is answered because it is pure computation over the guest's

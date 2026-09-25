@@ -1101,6 +1101,17 @@ const BEYOND_THE_PREDICTION: &[(&str, &str)] = &[
          SO_RCVTIMEO); the new descriptor is blocking and not close-on-exec.",
     ),
     (
+        "printf",
+        "In-world run w13 (2026-09-25): thread 88 died on the imported symbol `printf` unbound, \
+         call site link 0x50ae13c, and the game froze at 0 fps. bionic's printf is \
+         vfprintf(stdout, ..); bound onto fprintf's renderer and the stream `stdout` names.",
+    ),
+    (
+        "puts",
+        "Bound beside `printf`, before a run reached it: the other stdout-only writer \
+         libroblox.so imports. bionic's puts writes s and '\\n' to stdout and answers '\\n'.",
+    ),
+    (
         "__vsprintf_chk",
         "The owner's session in place 606849621 (2026-09-23): GUEST THREAD DIED at +760s, thread \
          16 (started at link 0x284d168): the guest called the imported symbol `__vsprintf_chk` \
@@ -1192,7 +1203,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // Then `atol`, for 318: the next worker death in the same place, 2026-09-24.
     // Then `remove`, for 319: a thread's death on a second launch of kept storage (Linux).
     // Then `lseek`, for 320: raw syscall 62's handler, beside the worker's raw file scan.
-    assert_eq!(symbols.len(), 320, "bound symbols: {symbols:?}");
+    // Then `printf` and `puts`, for 322: in-world run w13's thread 88 died on `printf` unbound.
+    assert_eq!(symbols.len(), 322, "bound symbols: {symbols:?}");
     // Phase 1 bound 86 — 84 inline and two re-entrant. Phase 2 added ten: the four `dl*` refusals
     // inline, and `dl_iterate_phdr` plus the five guest-memory calls on the exit path, for 96.
     // Phase 3a adds 23, all inline: five clocks, fourteen process-and-environment, four logging.
@@ -1301,7 +1313,8 @@ fn the_bound_count_is_exactly_what_this_phase_claims() {
     // **`atol`, inline, for 318**: `strtol(s, NULL, 10)`, which on LP64 is `atoll`.
     // **`remove`, inline, for 319**: bionic's `unlink`, then `rmdir` on `EISDIR`.
     // **`lseek`, inline, for 320**: `Filesystem::seek`, for raw syscall 62.
-    assert_eq!(Bionic::inline_symbols().count(), 305);
+    // **`printf` and `puts`, inline, for 322**: the stream `stdout` names.
+    assert_eq!(Bionic::inline_symbols().count(), 307);
     assert_eq!(Bionic::reentrant_symbols().count(), 15);
     // Plus the eighteen `STT_OBJECT` data objects, which are not functions and are not bound to a
     // handler at all, and the two **declared absent** — a weak reference to either resolves to
@@ -2464,6 +2477,62 @@ fn fprintf_and_vfprintf_write_through_a_real_stream() {
         "[answer=42][answer=7]",
         "both calls formatted host-side and the bytes reached the file"
     );
+}
+
+/// **`printf` and `puts` write to the stream the guest's `stdout` variable names**, as bionic's
+/// `vfprintf(stdout, ..)` does -- asserted on the bytes in a file, by pointing `stdout` at an
+/// `fopen`ed stream first. A binding that assumed `&__sF[1]` would write the host's console and
+/// leave the file empty; one that returned a plausible count and wrote nothing fails the contents.
+///
+/// `puts`' result is bionic's `'\n'`, not `fputs`' byte count, and the newline is in the file.
+/// Then `stdout` is put back and both run over the real `__sF[1]`, which is the in-world case
+/// (run w13: thread 88 died on `printf` unbound).
+#[test]
+fn printf_and_puts_write_through_the_stream_stdout_names() {
+    let _guard = serialized();
+    let (f, scratch) = rooted("printf");
+    let path = f.cstring(f.guest.data + 0x100, b"stdout.txt");
+    let mode = f.cstring(f.guest.data + 0x140, b"w");
+    let fmt = f.cstring(f.guest.data + 0x180, b"[%s=%d]");
+    let word = f.cstring(f.guest.data + 0x1C0, b"answer");
+    let line = f.cstring(f.guest.data + 0x200, b"a line");
+
+    let stream = value_of(&f, "fopen", |asm| {
+        asm.mov(0, path as u64);
+        asm.mov(1, mode as u64);
+    });
+    assert_ne!(stream, 0, "fopen must give a stream to write through");
+    let stdout_cell = f.boundary.slot_named("stdout").expect("stdout is declared").address;
+    let standard = f.guest.read_u64(stdout_cell);
+    f.guest.write_u64(stdout_cell, stream);
+
+    let written = value_of(&f, "printf", |asm| {
+        asm.mov(0, fmt as u64);
+        asm.mov(1, word as u64);
+        asm.mov(2, 42);
+    });
+    assert_eq!(written as i64 as i32, 11, "`[answer=42]` is eleven bytes, and printf returns how many");
+    let answered = value_of(&f, "puts", |asm| {
+        asm.mov(0, line as u64);
+    });
+    assert_eq!(answered as i64 as i32, i32::from(b'\n'), "bionic's puts answers '\\n', not a count");
+
+    f.guest.write_u64(stdout_cell, standard);
+    assert_eq!(value_of(&f, "fclose", |asm| { asm.mov(0, stream); }) as i64 as i32, 0);
+    let contents = std::fs::read(scratch.path("stdout.txt")).expect("the file the guest wrote");
+    assert_eq!(String::from_utf8_lossy(&contents), "[answer=42]a line\n");
+
+    // The real standard output: the same counts, over descriptor 1.
+    let written = value_of(&f, "printf", |asm| {
+        asm.mov(0, fmt as u64);
+        asm.mov(1, word as u64);
+        asm.mov(2, 7);
+    });
+    assert_eq!(written as i64 as i32, 10, "`[answer=7]` to __sF[1]");
+    let answered = value_of(&f, "puts", |asm| {
+        asm.mov(0, line as u64);
+    });
+    assert_eq!(answered as i64 as i32, i32::from(b'\n'));
 }
 
 /// The five printf-family symbols that are *bound* but cannot be serviced refuse by name, and the

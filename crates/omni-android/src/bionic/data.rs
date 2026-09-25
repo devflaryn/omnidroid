@@ -220,6 +220,9 @@ pub(super) fn install(
         // `index` is 0, 1, 2 -- which are STDIN_FILENO, STDOUT_FILENO and STDERR_FILENO, and that
         // correspondence is the whole reason the three are declared in this order.
         bionic.register_stream(stream, index as i32);
+        if symbol == "stdout" {
+            bionic.set_stdout_cell(cell);
+        }
     }
 
     // `environ`: `char **environ`. It points at a vector of `char *` terminated by a null, and
