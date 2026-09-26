@@ -7,7 +7,11 @@ use omni_linux::syscall::nr;
 use omni_linux::{manifest, vfs::{Sysroot, Vfs}};
 
 fn fixture() -> (Arc<Process>, Task, u64, Arc<parking_lot::Mutex<Vec<u8>>>) {
-    let dir = std::env::temp_dir().join(format!("omni-linux-fd-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    // One directory per test: tests run in parallel, and rewriting a file another test has open
+    // races on Windows.
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("omni-linux-fd-{}-{n}", std::process::id()));
     std::fs::create_dir_all(dir.join("objects/aa")).unwrap();
     std::fs::write(dir.join("objects/aa/aa01"), b"hello, file\n").unwrap();
     let m = manifest::parse("d\t755\t/\nd\t755\t/system\nd\t755\t/system/bin\nf\t644\t12\taa01\t/system/bin/hello.txt\nl\thello.txt\t/system/bin/link\n").unwrap();

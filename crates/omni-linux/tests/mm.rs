@@ -15,7 +15,11 @@ const MAP_ANON: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 
 fn process() -> (Arc<Process>, omni_linux::Task, u64) {
-    let dir = std::env::temp_dir().join(format!("omni-linux-mm-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    // One directory per test: tests run in parallel, and rewriting a file another test has open
+    // races on Windows.
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("omni-linux-mm-{}-{n}", std::process::id()));
     std::fs::create_dir_all(dir.join("objects/bb")).unwrap();
     // 6000 bytes: one full page and a partial second page.
     let body: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8 + 1).collect();
