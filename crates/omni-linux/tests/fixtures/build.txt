@@ -3,4 +3,6 @@ Built on Windows with the Android NDK r28c (android-ndk-r28c-windows.zip from dl
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -o threads threads.c
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -o thread_exit thread_exit.c
 
+    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -o signals signals.c
+
 The binaries are committed so the runtime and its tests never need the NDK; SHA256SUMS pins them.
