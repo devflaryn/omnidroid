@@ -172,7 +172,7 @@ impl Remembered {
     /// The [`RegionInfo`] the locked lookup built this from, when it can be rebuilt exactly: for an
     /// anonymous entry. A file-backed one would need the file's name.
     pub(crate) fn anonymous_region(&self) -> Option<RegionInfo> {
-        self.anonymous.then(|| RegionInfo {
+        self.anonymous.then_some(RegionInfo {
             start: self.start,
             len: self.len,
             protection: self.protection,

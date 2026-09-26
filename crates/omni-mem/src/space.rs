@@ -274,7 +274,6 @@ pub struct PageSplit {
 
 impl PageSplit {
     /// The partial parts, head first: what cannot be handed back a page at a time.
-    #[must_use]
     pub fn partial(&self) -> impl Iterator<Item = (GuestAddr, usize)> {
         self.head.into_iter().chain(self.tail)
     }

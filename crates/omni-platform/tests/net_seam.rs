@@ -177,7 +177,8 @@ fn the_error_kinds_do_not_render_the_same_way_as_one_another() {
 #[test]
 fn the_poll_limit_is_public_and_is_the_size_of_the_set_it_protects() {
     assert_eq!(MAX_POLL_SOCKETS, 1024, "the Windows backend's own FD_SETSIZE");
-    assert!(
+    // Both are constants, so this holds or the file does not compile.
+    const _: () = assert!(
         MAX_POLL_SOCKETS >= omni_platform::fs::MAX_OPEN_FILES,
         "every descriptor a guest can hold fits in one poll"
     );

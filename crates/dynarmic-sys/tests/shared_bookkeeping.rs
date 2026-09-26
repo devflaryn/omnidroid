@@ -291,7 +291,7 @@ fn bench_dispatcher_lookups_in_a_shared_cache() {
         a64::b_cond(a64::cond::NE, -4),
         a64::svc(0),
     ];
-    code.extend(std::iter::repeat(a64::ret(30)).take(TARGETS));
+    code.extend(std::iter::repeat_n(a64::ret(30), TARGETS));
     let shared = Shared::new(code);
     let vm = shared.vm();
     vm.with_ctx(|c| {

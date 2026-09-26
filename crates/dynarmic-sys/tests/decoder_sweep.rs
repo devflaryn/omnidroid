@@ -86,7 +86,7 @@ fn pair_corpus() -> Vec<(String, Vec<u32>)> {
 
 /// Every single word the sweep executes, in order, each as a one-word program.
 fn corpus() -> Vec<(String, Vec<u32>)> {
-    let mut rng = Rng(0x5EED_0F_A64_u64);
+    let mut rng = Rng(0x5_EED0_FA64_u64);
     let mut out = Vec::new();
     for (name, pattern) in entries() {
         for _ in 0..variants() {

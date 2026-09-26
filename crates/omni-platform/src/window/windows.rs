@@ -1520,8 +1520,9 @@ mod tests {
         let mut drained = Vec::new();
         window.poll(&mut drained);
         // SAFETY: no arguments.
+        let focused = unsafe { GetFocus() };
         assert_eq!(
-            unsafe { GetFocus() },
+            focused,
             window.hwnd,
             "the test window could not take the focus (another window holds the foreground)"
         );
