@@ -6909,7 +6909,7 @@ unsafe fn read_back(
                         .level_count(1)
                         .layer_count(1);
                     let to_source = vk::ImageMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::MEMORY_READ)
+                        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
                         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                         .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                         .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -6951,7 +6951,10 @@ unsafe fn read_back(
                             .map_err(vk_failed("vkBeginCommandBuffer"))?;
                         device.cmd_pipeline_barrier(
                             command,
-                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            // ALL_COMMANDS, not TOP_OF_PIPE: with `waits` the transition must chain onto the
+                            // semaphore wait (whose scope is TRANSFER), or it could run before the
+                            // rendering it reads has finished.
+                            vk::PipelineStageFlags::ALL_COMMANDS,
                             vk::PipelineStageFlags::TRANSFER,
                             vk::DependencyFlags::empty(),
                             &[],
