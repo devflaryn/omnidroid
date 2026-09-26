@@ -293,6 +293,9 @@ pub struct Bionic {
     /// `sysconf` names asked for that this layer has no answer for, and their counts. See
     /// [`Bionic::sysconf_unknown_names`].
     sysconf_unknown: Mutex<std::collections::BTreeMap<i32, usize>>,
+    /// Every `mprotect` this layer refused, as `(prot, was_executable, address, length)`. See
+    /// [`Bionic::mprotect_refusals`].
+    mprotect_refusals: Mutex<Vec<(i32, bool, u64, u64)>>,
     /// `__register_atfork`'s registrations, `(prepare, parent, child, dso)`, in order. Recorded,
     /// never run: see [`procenv::register_atfork`].
     atfork: std::sync::Mutex<Vec<[u64; 4]>>,
@@ -672,6 +675,7 @@ impl Bionic {
             tls: TlsRegistry::new(),
             dispositions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sysconf_unknown: Mutex::new(std::collections::BTreeMap::new()),
+    mprotect_refusals: Mutex::new(Vec::new()),
             atfork: std::sync::Mutex::new(Vec::new()),
             setjmps: AtomicU64::new(0),
             owners: Arc::new(OwnerTable::new()),
@@ -1551,7 +1555,62 @@ impl Bionic {
             .join(", ")
     }
 
+    /// Record an `mprotect` this layer refused, keeping what the guest asked for and what the
+    /// range was.
+    ///
+    /// **The report, not the behaviour** -- exactly as [`Bionic::note_sysconf_unknown`] is, and for
+    /// the same reason. A refusal is a `Result` the guest is free to handle, so a guest that
+    /// handles it and carries on leaves nothing behind but silence: it is then indistinguishable
+    /// from a guest that never asked. MEASURED on a substituted build of the APK's compression
+    /// library, whose entry hooks Roblox's scheduler by rewriting code and would need W+X to do
+    /// it -- a run in which its overlay never appeared produced no thread failure and no refusal
+    /// line anywhere, which is a gap in what a run can tell, not a fact about the guest.
+    ///
+    /// `was_executable` is what the range was *before* the call, recorded because it separates the
+    /// two kinds of ask: W+X over pages that were already executable is a rewrite of code, and W+X
+    /// over pages that were not is a new mapping being made runnable.
+    pub(crate) fn note_mprotect_refused(&self, prot: i32, was_executable: bool, at: u64, len: u64) {
+        let mut refusals = self.mprotect_refusals.lock();
+        if refusals.len() < Self::MAX_RECORDED_REFUSALS {
+            refusals.push((prot, was_executable, at, len));
+        }
+    }
+
+    /// Every `mprotect` this instance refused, as `(prot, was_executable, address, length)`.
+    #[must_use]
+    pub fn mprotect_refusals(&self) -> Vec<(i32, bool, u64, u64)> {
+        self.mprotect_refusals.lock().clone()
+    }
+
+    /// [`Bionic::mprotect_refusals`] as one report line, each with the `PROT_*` spelled out and
+    /// what the range was.
+    #[must_use]
+    pub fn mprotect_refusal_report(&self) -> String {
+        let refusals = self.mprotect_refusals();
+        if refusals.is_empty() {
+            return "none".to_string();
+        }
+        refusals
+            .into_iter()
+            .map(|(prot, was_executable, at, len)| {
+                let was = if was_executable { "was executable" } else { "was not executable" };
+                format!("{prot:#x} ({}) at {at:#x}+{len:#x}, {was}", prot_names(prot))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// How many refusals one instance records.
+    ///
+    /// A cap because the list is a record, not a control surface: a guest that loops on a refused
+    /// `mprotect` would otherwise grow it without bound, and the first few already say everything
+    /// the rest would. Overflow is not silent -- [`Bionic::mprotect_refusals`] stops growing and
+    /// the count of what it holds is the count there is.
+    const MAX_RECORDED_REFUSALS: usize = 64;
+
     /// Apply `how`/`set` to a guest thread's blocked-signal mask and return what it was.
+    ///
+    /// `how` is `SIG_BLOCK`, `SIG_UNBLOCK` or `SIG_SETMASK`; `set` is `None` for a query.
     ///
     /// `how` is `SIG_BLOCK`, `SIG_UNBLOCK` or `SIG_SETMASK`; `set` is `None` for a query.
     pub(crate) fn update_signal_mask(
@@ -2680,4 +2739,30 @@ impl Drop for UncountedHalt<'_> {
     fn drop(&mut self) {
         self.bionic.uncounted_halts.lock().remove(&self.id);
     }
+}
+
+/// The `PROT_*` names in a guest's `prot`, for a report line.
+///
+/// A refusal's whole content is in its bits, so this spells them out rather than printing a hex
+/// number the next reader has to decode. Bits outside the four known ones are named as such
+/// instead of being dropped: a guest that asked for something this layer does not know is a fact
+/// worth keeping, and hiding it inside a name would lose it.
+fn prot_names(prot: i32) -> String {
+    let mut names = Vec::new();
+    for (bit, name) in [
+        (guestmem::PROT_READ, "PROT_READ"),
+        (guestmem::PROT_WRITE, "PROT_WRITE"),
+        (guestmem::PROT_EXEC, "PROT_EXEC"),
+    ] {
+        if prot & bit != 0 {
+            names.push(name);
+        }
+    }
+    if prot & !(guestmem::PROT_READ | guestmem::PROT_WRITE | guestmem::PROT_EXEC) != 0 {
+        names.push("bits this layer does not know");
+    }
+    if names.is_empty() {
+        names.push("PROT_NONE");
+    }
+    names.join("|")
 }

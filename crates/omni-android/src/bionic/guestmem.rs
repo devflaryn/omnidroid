@@ -434,7 +434,13 @@ pub(super) fn mmap(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
     let protection = match protection_for(prot) {
         Ok(protection) => protection,
-        Err(why) => return call.refuse(why),
+        Err(why) => {
+            // A `mmap` that asked for W+X is recorded in the same list as the `mprotect` that did:
+            // both are the same question asked of this layer, and a guest that gets "no" from one
+            // may ask the other.
+            call.state.bionic.note_mprotect_refused(prot, false, addr, length);
+            return call.refuse(why);
+        }
     };
 
     let placement = if flags & MAP_FIXED_NOREPLACE != 0 {
@@ -654,7 +660,17 @@ pub(super) fn mprotect(c: &mut ReentrantCall<'_>) -> AbiResult<()> {
 
     let protection = match protection_for(prot) {
         Ok(protection) => protection,
-        Err(why) => return call.refuse(why),
+        Err(why) => {
+            // Recorded, then refused: see `Bionic::note_mprotect_refused` for why a refusal the
+            // guest handles quietly still has to leave a trace here.
+            call.state.bionic.note_mprotect_refused(
+                prot,
+                executable_within(space, at, pages(length, page).unwrap_or(0).max(1)),
+                at as u64,
+                length,
+            );
+            return call.refuse(why);
+        }
     };
 
     // `mprotect` over zero bytes is a no-op that succeeds, which is what Linux answers; only a

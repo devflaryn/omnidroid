@@ -5735,6 +5735,55 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
             );
         }
     }
+    // **What the payload asked this layer for over the whole run, and what was called into it.**
+    //
+    // Printed HERE, at the end of the session, and not where the other payload lines are: those
+    // are emitted from `boot_the_compression_library`, which the sequence runs at step 8 --
+    // before the engine exists, let alone the place. A census taken there is evidence about step 8
+    // and nothing else, which is this file's own `VERIFICATION.md` entry 4, and a first run of
+    // this line duly reported no W+X refusal for a payload that had not yet been asked for
+    // anything at all.
+    //
+    // **The JNI count is the question a substituted build's overlay raises.** The payload exports
+    // 148 `Java_*` natives and the dex that would call them does not run (D7), so the entry point
+    // is called by hand and the rest are called by nothing -- and a member that is never called is
+    // indistinguishable from one that is missing unless the run says so.
+    {
+        let refused = guest.bionic.mprotect_refusal_report();
+        if refused != "none" {
+            let _ = writeln!(
+                std::io::stderr(),
+                "PAYLOAD MPROTECT REFUSED, whole run: {refused}"
+            );
+        }
+        let calls = guest.jni.calls();
+        let own: Vec<&omni_android::jni::CallRecord> =
+            calls.iter().filter(|call| call.class.starts_with("com/axjava")).collect();
+        let mut by_member: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for call in &own {
+            *by_member.entry(format!("{}::{}", call.class, call.member)).or_insert(0) += 1;
+        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "PAYLOAD JNI CALLS: {} call(s) into declared members in the whole run; {} into the \
+             payload's own {} declared on com/axjava",
+            calls.len(),
+            own.len(),
+            by_member.len()
+        );
+        for (member, count) in &by_member {
+            let _ = writeln!(std::io::stderr(), "  {member} x{count}");
+        }
+        if own.is_empty() && cached_compression_lib().build == payload::identity::Build::Substituted
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "PAYLOAD JNI CALLS: none of the payload's own members was ever called, so no code \
+                 behind them ran in this session -- whatever the entry started is all that ran"
+            );
+        }
+    }
     assert!(
         stopped,
         "the game thread did not stop within 60 s of being asked, so this address space cannot          be torn down: {} still running, parked {:?}",
@@ -6684,6 +6733,15 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
             entry.class, entry.member, entry.descriptor
         );
         let before = guest.jni.misses().len();
+        // **Which threads already existed**, so the ones this call starts can be named rather than
+        // counted: `pthread_create` is the payload's own, and a report that listed every thread
+        // would bury the three that matter under the engine's.
+        let known_threads: std::collections::BTreeSet<(u64, usize)> = guest
+            .bionic
+            .guest_thread_list()
+            .iter()
+            .map(|s| (s.id.0, s.start_routine))
+            .collect();
         let called = {
             let _bionic = guest.bionic.activate().expect("publish the bionic instance");
             let _jni = guest.jni.activate().expect("publish the JNI instance");
@@ -6720,6 +6778,114 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
             "PAYLOAD ENTRY: {} guest thread(s) recorded after the call",
             guest.bionic.guest_thread_records()
         );
+        // **Each of those threads, by name.** A count says how many; it cannot say whether they
+        // worked, which is the question a payload's threads raise -- a worker that installed a
+        // hook and returned and a worker that gave up at once both leave three threads behind and
+        // no other trace. The start routine is the identifying field (see
+        // [`GuestThreadSummary::start_routine`]), printed as a link address in whichever image it
+        // falls in, because a link address is what resolves to a function name offline.
+        //
+        // **The load base is derived, not assumed**: the lowest start among the regions the
+        // library's own file backs, which is where the loader put its first `PT_LOAD` and so the
+        // bias a shared object is relocated by. MEASURED: the substituted build's three threads
+        // are the only thing it leaves behind, so naming them is the only way to say what it did.
+        let library_file = cached_compression_lib().file_name.clone();
+        // **Every region the payload's own file backs, and the lowest of their starts**: that is
+        // where the loader put its first `PT_LOAD`, so it is the bias a shared object is relocated
+        // by, and subtracting it turns a guest address into the link address the binary names its
+        // functions by. Derived from the space rather than assumed, because assuming a base is how
+        // a link address comes out plausible and wrong.
+        let payload_regions: Vec<omni_mem::RegionInfo> = guest
+            .space
+            .regions()
+            .into_iter()
+            .filter(|region| {
+                matches!(&region.kind,
+                    omni_mem::RegionKind::File { name, .. } if name.as_ref() == library_file)
+            })
+            .collect();
+        let base = payload_regions.iter().map(|region| region.start).min();
+        // **Every thread, each marked for whether the entry started it.** Ids are recycled on exit
+        // (see the bionic thread host), so "not in the set from before" is not the same question as
+        // "started by this call" -- a thread created here can be handed the id of one that ended --
+        // and the pair is the best available discriminator. A line is worth more than a filter
+        // that silently drops the two threads it got wrong, which is what the first run of this
+        // did: three were recorded and one was printed.
+        let all_threads = guest.bionic.guest_thread_list();
+        for summary in all_threads.iter() {
+            let is_new = !known_threads.contains(&(summary.id.0, summary.start_routine));
+            if !is_new && !summary.running {
+                // Nothing changed about this thread across the call, and a report of the payload's
+                // threads is not a census of the engine's.
+                continue;
+            }
+            let where_ = match base {
+                // `checked_sub` as in `DeathContext::located`: a base above the address would wrap
+                // into a plausible-looking link address, which is worse than saying `abs`.
+                Some(base) => match summary.start_routine.checked_sub(base) {
+                    Some(link) => format!("link {link:#x} in {library_file}"),
+                    None => format!("abs {:#x}", summary.start_routine),
+                },
+                None => format!("abs {:#x}", summary.start_routine),
+            };
+            // **What the address is in**, which is the part that turns a bare number into a fact:
+            // an address in no mapping, in an anonymous range, or in some other image entirely are
+            // three different facts, and only this says which.
+            let in_region = match guest.space.region_at(summary.start_routine) {
+                Some(region) => {
+                    let what = match &region.kind {
+                        omni_mem::RegionKind::File { name, .. } => format!("{}", name),
+                        omni_mem::RegionKind::Anonymous => "anonymous".to_string(),
+                        omni_mem::RegionKind::Free => "free space".to_string(),
+                    };
+                    format!(
+                        "{:?} {} at {:#x}+{:#x} in the region from {:#x}",
+                        region.protection, what, region.start, region.len, region.mapping_start
+                    )
+                }
+                None => "in no mapped region".to_string(),
+            };
+            // `{:?}` rather than a match on the variants: the state is the fact, and naming the
+            // type here would make a report line depend on which module happens to re-export it.
+            let state = match guest.bionic.guest_thread_state(summary.id.0) {
+                Some(state) => format!("{state:?}"),
+                None => "no record".into(),
+            };
+            // **What this thread is calling, and where from.** The start routine is inside a
+            // stripped image, so its own name is not available to anyone -- but every call it
+            // makes crosses the boundary, and the boundary knows both the callee and the call site
+            // in the caller's image. MEASURED: the substituted build's live thread's start routine
+            // resolves to no symbol in its own `.symtab`, which makes this the only naming a run
+            // can give it, and a thread waiting in a retry loop names what it is waiting for.
+            let crossings = guest.boundary.threads();
+            let crossing = crossings
+                .iter()
+                .find(|report| report.guest_thread == summary.id.0)
+                .map_or_else(
+                    || "no crossing recorded".to_string(),
+                    |report| {
+                        let site = match base {
+                            Some(base) => match report.caller.checked_sub(base) {
+                                Some(link) => format!("link {link:#x}"),
+                                None => format!("abs {:#x}", report.caller),
+                            },
+                            None => format!("abs {:#x}", report.caller),
+                        };
+                        format!(
+                            "last into {} from {site} (x{})",
+                            report.symbol.as_deref().unwrap_or("?"),
+                            report.crossings
+                        )
+                    },
+                );
+            let _ = writeln!(
+                out,
+                "PAYLOAD THREAD {}{}: start {where_}, {in_region}, detached {}, {state}, {crossing}",
+                summary.id.0,
+                if is_new { " (new)" } else { "" },
+                summary.detached
+            );
+        }
     }
 
     let misses = guest.jni.misses();
