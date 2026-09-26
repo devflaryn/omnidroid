@@ -111,8 +111,9 @@ const GRAPHICS_GATE: &str = "OMNI_GFX_WINDOW_TESTS";
 const MAIN_LIB: &str = "libroblox.so";
 
 /// `DT_INIT_ARRAY` entries in 2.738.1397's `libroblox.so`, the figure M3's and M4's gates assert
-/// against that fixture. This gate runs whatever APK [`chosen_apk`] chose (2.739.691 has 3,610), so it
-/// asserts that **every** entry the loaded library declares ran, and only reports this one.
+/// against that fixture. This gate runs whatever APK [`chosen_apk`] chose (the modified 2.739.691
+/// build had 3,610), so it asserts that **every** entry the loaded library declares ran, and only
+/// reports this one.
 const INITIALIZERS_2_738: usize = 3_594;
 
 /// The class of the activity `initializeNativeCode` is called on.
@@ -6405,7 +6406,9 @@ fn the_idle_timer_question_is_the_three_states_this_runtime_never_enters() {
             "Lem/g;->h",
             "Lcom/roblox/protocols/mediapicker/MediaPickerProtocolV2;->isCapturingMedia",
             "Lci/h;->a",
-            "Lci/i;->k3",
+            // The stock 2.738.1397's name for the flag getter; the modified 2.739.691 build's
+            // obfuscator called the same interface slot `k3`.
+            "Lci/i;->h3",
             "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;.INSTANCE",
             "Lcom/roblox/universalapp/facialageestimation/FacialAgeEstimationProtocol;->isInInquiryFlow",
         ],
@@ -6942,12 +6945,13 @@ fn the_scan_codes_reach_the_usages_the_engine_expects() {
 /// and both are silent — a typo leaves the real symbol `Unbound` and the typo unreachable.
 const NDK_BEYOND_THE_IMPORTS: &[(&str, &str)] = &[(
     "AAsset_read",
-    "MEASURED in docs/research/apk-undefined-symbols.txt: `AAsset_read` is imported by \
-     `libzstd-jni-1.5.7-6.so` and NOT by `libroblox.so`, which reaches its assets through \
-     AAsset_getBuffer instead. It is bound for `freelocale`'s reason -- `AAssetManager_open` \
-     hands the guest an AAsset, and a layer that hands one out and cannot read it is worse than \
-     one that does neither -- and because `AAsset_openFileDescriptor`'s refusal names it as the \
-     fallback the NDK's own documentation tells a caller to use.",
+    "`AAsset_read` is NOT imported by `libroblox.so`, which reaches its assets through \
+     AAsset_getBuffer instead, nor by any other arm64 library of the stock APK (the modified \
+     fixture's `libzstd-jni-1.5.7-6.so` imported it; the stock one does not). It is bound \
+     for `freelocale`'s reason -- `AAssetManager_open` hands the guest an AAsset, and a layer \
+     that hands one out and cannot read it is worse than one that does neither -- and because \
+     `AAsset_openFileDescriptor`'s refusal names it as the fallback the NDK's own documentation \
+     tells a caller to use.",
 )];
 
 /// The NDK symbols this layer binds are imports of the real binary, and none of them is among the

@@ -1,10 +1,11 @@
-//! Tests against the real fixture, `Roblox-2.738.1397.apk`.
+//! Tests against the real fixture, the stock (Roblox-signed) `Roblox-2.738.1397.apk`.
 //!
 //! Every number asserted here is exact and comes from `docs/research/apk-analysis.md`, which was
 //! produced by an independent Python parser reading the same bytes. Two independent
-//! implementations agreeing on 2,365 entries, 954 STORED, one 4 KB-aligned payload and a
-//! `{0: 1660, 1: 242, 2: 231, 3: 232}` extra-field histogram is what makes either of them
-//! believable (Global Constraints 2 and 3).
+//! implementations agreeing on 2,382 entries, 950 STORED, two 4 KB-aligned payloads and a
+//! `{0: 1665, 1: 244, 2: 235, 3: 238}` extra-field histogram is what makes either of them
+//! believable (Global Constraints 2 and 3). Re-measured 2026-09-26 when the modified fixture this
+//! file used to pin was replaced by the stock build.
 //!
 //! The fixture is git-ignored, so every test here **skips** when it is absent rather than failing.
 
@@ -23,7 +24,7 @@ const FIXTURE: &str = "Roblox-2.738.1397.apk";
 
 /// Open the fixture, or explain why the test is doing nothing.
 ///
-/// Returning `None` rather than failing is deliberate: a fresh clone has no 160 MB APK in it, and a
+/// Returning `None` rather than failing is deliberate: a fresh clone has no 229 MB APK in it, and a
 /// test suite that fails on a clean checkout teaches people to ignore it.
 fn fixture() -> Option<Apk> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -106,15 +107,15 @@ fn alignment_bucket(alignment: u64) -> usize {
 fn container_facts_match_the_forensic_analysis() {
     let Some(apk) = fixture() else { return };
 
-    assert_eq!(apk.file_len(), 159_853_296, "file length");
+    assert_eq!(apk.file_len(), 229_466_269, "file length");
     let eocd = apk.end_of_central_directory();
-    assert_eq!(eocd.offset, 159_853_274, "end-of-central-directory offset");
+    assert_eq!(eocd.offset, 229_466_247, "end-of-central-directory offset");
     assert_eq!(
-        eocd.central_directory_offset, 159_629_312,
+        eocd.central_directory_offset, 229_240_832,
         "central directory offset"
     );
-    assert_eq!(eocd.central_directory_size, 223_962, "central directory size");
-    assert_eq!(eocd.entry_count, 2_365, "declared entry count");
+    assert_eq!(eocd.central_directory_size, 225_415, "central directory size");
+    assert_eq!(eocd.entry_count, 2_382, "declared entry count");
     assert_eq!(eocd.comment_len, 0, "archive comment length");
     assert!(
         !eocd.zip64,
@@ -126,22 +127,22 @@ fn container_facts_match_the_forensic_analysis() {
         "and therefore no zip64 locator either"
     );
 
-    assert_eq!(apk.entries().len(), 2_365, "parsed entry count");
+    assert_eq!(apk.entries().len(), 2_382, "parsed entry count");
 
     let stored = apk.entries().iter().filter(|e| e.is_stored()).count();
     let deflated = apk.entries().iter().filter(|e| e.is_deflated()).count();
-    assert_eq!(stored, 954, "STORED entries");
-    assert_eq!(deflated, 1_411, "DEFLATED entries");
+    assert_eq!(stored, 950, "STORED entries");
+    assert_eq!(deflated, 1_432, "DEFLATED entries");
     assert_eq!(
         stored + deflated,
-        2_365,
+        2_382,
         "no entry uses any method other than 0 and 8"
     );
 
     let total_uncompressed: u64 = apk.entries().iter().map(|e| e.uncompressed_size()).sum();
     let total_compressed: u64 = apk.entries().iter().map(|e| e.compressed_size()).sum();
-    assert_eq!(total_uncompressed, 247_032_045, "total uncompressed size");
-    assert_eq!(total_compressed, 159_413_043, "total compressed size");
+    assert_eq!(total_uncompressed, 433_379_038, "total uncompressed size");
+    assert_eq!(total_compressed, 229_037_710, "total compressed size");
 }
 
 #[test]
@@ -156,19 +157,19 @@ fn payload_alignment_matches_the_measured_histogram() {
     }
     assert_eq!(
         buckets[0],
-        [0, 1, 953, 0],
-        "STORED entries by payload alignment: exactly one lands on a 4 KiB boundary and it is an \
+        [0, 2, 948, 0],
+        "STORED entries by payload alignment: exactly two land on a 4 KiB boundary and they are an \
          accident of zipalign -f 4, not page alignment"
     );
     assert_eq!(
         buckets[1],
-        [0, 0, 377, 1034],
+        [0, 1, 378, 1053],
         "DEFLATED entries by payload alignment"
     );
 }
 
 #[test]
-fn exactly_one_entry_in_the_whole_apk_is_directly_mappable() {
+fn only_two_tiny_entries_in_the_whole_apk_are_directly_mappable() {
     let Some(apk) = fixture() else { return };
 
     let mappable: Vec<&str> = apk
@@ -178,24 +179,22 @@ fn exactly_one_entry_in_the_whole_apk_is_directly_mappable() {
         .map(|entry| entry.name())
         .collect();
 
-    // One 1,447-byte PNG, by luck. This is the whole of D11's case: the predicate is implemented
-    // and does fire, and on this APK it fires for nothing anybody wants to map. On a 16 KiB host
-    // (Apple silicon) it fires for nothing at all: the PNG is 4 KiB-aligned and not 16 KiB-aligned.
-    let expected: Vec<&str> = if mapping_alignment() == 4096 {
-        vec!["res/drawable-mdpi-v4/notification_icon.png"]
-    } else {
-        Vec::new()
-    };
+    // A 6-byte version file and a 174-byte PNG, by luck. This is the whole of D11's case: the
+    // predicate is implemented and does fire, and on this APK it fires for nothing anybody wants to
+    // map. On a 16 KiB host (Apple silicon) it fires for nothing at all: neither is 16 KiB-aligned.
+    const VERSION: &str = "META-INF/androidx.viewpager_viewpager.version";
+    const PNG: &str = "assets/content/textures/AvatarEditorImages/Sliders/gr-slide-bar-empty@3x.png";
+    let expected: Vec<&str> = if mapping_alignment() == 4096 { vec![VERSION, PNG] } else { Vec::new() };
     assert_eq!(mappable, expected, "directly mappable entries");
 
-    let png = apk
-        .require_entry("res/drawable-mdpi-v4/notification_icon.png")
-        .expect("the one mappable entry");
-    assert!(png.is_stored());
-    assert_eq!(png.payload_offset(), 5_042_176);
-    assert_eq!(png.payload_offset() % 4096, 0);
-    assert_eq!(png.payload_offset() % mapping_alignment() == 0, mapping_alignment() == 4096);
-    assert_eq!(png.uncompressed_size(), 1_447);
+    for (name, offset, size) in [(VERSION, 40_960, 6), (PNG, 48_820_224, 174)] {
+        let entry = apk.require_entry(name).expect("a mappable entry");
+        assert!(entry.is_stored(), "{name}");
+        assert_eq!(entry.payload_offset(), offset, "{name}");
+        assert_eq!(entry.payload_offset() % 4096, 0, "{name}");
+        assert_eq!(entry.payload_offset() % mapping_alignment() == 0, mapping_alignment() == 4096);
+        assert_eq!(entry.uncompressed_size(), size, "{name}");
+    }
 }
 
 #[test]
@@ -209,12 +208,12 @@ fn local_extra_field_histogram_shows_plain_four_byte_zipalign() {
     for entry in apk.entries() {
         *histogram.entry(entry.local_extra_len()).or_default() += 1;
     }
-    let expected: BTreeMap<u16, u64> = [(0, 1660), (1, 242), (2, 231), (3, 232)].into_iter().collect();
+    let expected: BTreeMap<u16, u64> = [(0, 1665), (1, 244), (2, 235), (3, 238)].into_iter().collect();
     assert_eq!(histogram, expected, "local extra field length histogram");
 }
 
 #[test]
-fn most_entries_defer_their_sizes_to_a_data_descriptor() {
+fn no_entry_defers_its_sizes_to_a_data_descriptor() {
     let Some(apk) = fixture() else { return };
 
     const FLAG_DATA_DESCRIPTOR: u16 = 1 << 3;
@@ -223,14 +222,13 @@ fn most_entries_defer_their_sizes_to_a_data_descriptor() {
         .iter()
         .filter(|e| e.flags() & FLAG_DATA_DESCRIPTOR != 0)
         .count();
-    // 1,408 entries declare that their sizes and CRC-32 live in a trailing data descriptor, which
-    // is why this crate takes all three from the central directory and never from the local header.
-    assert_eq!(deferred, 1_408, "entries with general-purpose flag bit 3");
+    // The stock build's writer puts sizes and CRC-32 in every local header (the modified fixture
+    // this used to pin had 1,408 entries with trailing data descriptors). This crate takes all
+    // three from the central directory either way; no test reads a descriptor entry any more.
+    assert_eq!(deferred, 0, "entries with general-purpose flag bit 3");
 
-    // And one of them still reads correctly, CRC and all.
     let entry = apk.require_entry("res/anim/stay.xml").expect("res/anim/stay.xml");
-    assert_ne!(entry.flags() & FLAG_DATA_DESCRIPTOR, 0);
-    let bytes = apk.read_entry(entry).expect("a deferred-size entry must read");
+    let bytes = apk.read_entry(entry).expect("an entry must read");
     assert_eq!(bytes.len() as u64, entry.uncompressed_size());
 }
 
@@ -238,10 +236,11 @@ fn most_entries_defer_their_sizes_to_a_data_descriptor() {
 // Native libraries
 // -------------------------------------------------------------------------------------------
 
-/// `(file name, uncompressed size, in-APK compressed size)` for all 11, from apk-analysis.md §2.2.
+/// `(file name, uncompressed size, in-APK compressed size)` for all 11 arm64-v8a libraries, from
+/// apk-analysis.md §2.2.
 const LIBRARIES: [(&str, u64, u64); 11] = [
     ("libroblox.so", 109_193_800, 46_516_719),
-    ("libzstd-jni-1.5.7-6.so", 18_440_296, 11_721_092),
+    ("libzstd-jni-1.5.7-6.so", 603_960, 261_877),
     ("libbacktrace-native.so", 5_339_704, 2_078_803),
     ("librenderscript-toolkit.so", 394_112, 129_704),
     ("libeigen_blas.so", 251_784, 81_495),
@@ -254,28 +253,39 @@ const LIBRARIES: [(&str, u64, u64); 11] = [
 ];
 
 #[test]
-fn there_are_exactly_eleven_arm64_v8a_libraries_and_no_other_abi() {
+fn there_are_eleven_libraries_for_each_of_three_abis() {
     let Some(apk) = fixture() else { return };
 
-    assert_eq!(
-        apk.abis(),
-        vec!["arm64-v8a"],
-        "this is a single-ABI, 64-bit-ARM-only APK"
-    );
-    for abi in ["armeabi-v7a", "x86", "x86_64", "riscv64"] {
+    // The stock build is a universal APK. This runtime loads arm64-v8a only; the 32-bit ARM and
+    // x86-64 sets are present and ignored by design.
+    assert_eq!(apk.abis(), vec!["arm64-v8a", "armeabi-v7a", "x86_64"], "ABIs under lib/");
+    for abi in ["x86", "riscv64"] {
         assert!(
             apk.native_libraries_for_abi(abi).is_empty(),
             "no lib/{abi}/ directory may exist"
         );
     }
-
-    let libraries = apk.native_libraries();
-    assert_eq!(libraries.len(), 11, "libraries under lib/arm64-v8a/");
+    let names_for = |abi: &str| -> Vec<String> {
+        let mut names: Vec<String> = apk
+            .native_libraries_for_abi(abi)
+            .iter()
+            .map(|library| library.file_name().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    for abi in ["armeabi-v7a", "x86_64"] {
+        assert_eq!(names_for(abi), names_for("arm64-v8a"), "lib/{abi}/ holds the same eleven libraries");
+    }
+    assert_eq!(apk.native_libraries().len(), 33, "11 libraries x 3 ABIs");
     assert_eq!(
         apk.lib_entries().len(),
-        11,
+        33,
         "and nothing under lib/ that is not one of them"
     );
+
+    let libraries = apk.native_libraries_for_abi("arm64-v8a");
+    assert_eq!(libraries.len(), 11, "libraries under lib/arm64-v8a/");
 
     let mut by_name: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for library in &libraries {
@@ -301,8 +311,8 @@ fn there_are_exactly_eleven_arm64_v8a_libraries_and_no_other_abi() {
         .map(|l| l.entry().uncompressed_size())
         .sum();
     let total_compressed: u64 = libraries.iter().map(|l| l.entry().compressed_size()).sum();
-    assert_eq!(total_uncompressed, 133_677_136, "total library bytes");
-    assert_eq!(total_compressed, 60_552_321, "total library bytes in the APK");
+    assert_eq!(total_uncompressed, 115_840_800, "total library bytes");
+    assert_eq!(total_compressed, 49_093_106, "total library bytes in the APK");
 }
 
 #[test]
@@ -322,7 +332,7 @@ fn libroblox_is_exactly_109_193_800_bytes() {
 fn no_native_library_can_be_mapped_out_of_the_apk() {
     let Some(apk) = fixture() else { return };
 
-    let libraries = apk.native_libraries();
+    let libraries = apk.native_libraries_for_abi("arm64-v8a");
     assert_eq!(libraries.len(), 11);
     for library in libraries {
         let entry = library.entry();
@@ -365,11 +375,12 @@ fn no_native_library_can_be_mapped_out_of_the_apk() {
 fn crc32_is_verified_on_read_and_corruption_is_rejected() {
     let Some(apk) = fixture() else { return };
 
-    // A DEFLATED library of 18.4 MB, a STORED dex of 9.1 MB, a small DEFLATED xml, and the
-    // manifest: both methods, and sizes spanning four orders of magnitude.
+    // A DEFLATED dex of 9.1 MB, a STORED resource table of 4.1 MB, a DEFLATED library of 0.6 MB,
+    // the manifest and a 3.7 KB library: both methods, and sizes spanning four orders of magnitude.
     for name in [
-        "lib/arm64-v8a/libzstd-jni-1.5.7-6.so",
         "classes.dex",
+        "resources.arsc",
+        "lib/arm64-v8a/libzstd-jni-1.5.7-6.so",
         "AndroidManifest.xml",
         "lib/arm64-v8a/libyuv_shared.so",
     ] {
@@ -420,17 +431,17 @@ fn the_manifest_is_returned_as_undecoded_binary_xml() {
     let Some(apk) = fixture() else { return };
 
     let entry = apk.manifest_entry().expect("AndroidManifest.xml");
-    assert_eq!(entry.uncompressed_size(), 56_204);
-    assert_eq!(entry.compressed_size(), 10_573);
+    assert_eq!(entry.uncompressed_size(), 56_240);
+    assert_eq!(entry.compressed_size(), 10_035);
     assert_eq!(entry.method(), CompressionMethod::Deflated);
 
     let bytes = apk.read_manifest().expect("the manifest must read");
-    assert_eq!(bytes.len(), 56_204);
+    assert_eq!(bytes.len(), 56_240);
     // AXML: RES_XML_TYPE (0x0003), header size 8, then the chunk size.
     assert_eq!(&bytes[..4], &[0x03, 0x00, 0x08, 0x00], "AXML magic");
     let chunk_size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     assert_eq!(
-        chunk_size, 56_204,
+        chunk_size, 56_240,
         "the AXML chunk spans the whole entry, which is as much as this crate knows about it"
     );
 }
@@ -464,7 +475,7 @@ fn stored_assets_and_dex_files_are_where_the_analysis_says() {
         pack.uncompressed_size(),
         "a STORED entry occupies exactly its own size"
     );
-    assert_eq!(pack.payload_offset(), 83_248_228);
+    assert_eq!(pack.payload_offset(), 54_298_364);
 
     // It is STORED but not page aligned, so it cannot be mapped *at* its payload offset — and does
     // not need to be. Map the aligned window below it and skip the delta.
@@ -473,8 +484,9 @@ fn stored_assets_and_dex_files_are_where_the_analysis_says() {
         .stored_map_window(mapping_alignment())
         .expect("a STORED entry always has a map window");
     assert_eq!(window.file_offset % mapping_alignment(), 0);
-    assert_eq!(window.file_offset, 83_247_104);
-    assert_eq!(window.payload_delta, 1_124);
+    // 54,296,576 is 16 KiB-aligned as well, so the window is the same on 4 KiB and 16 KiB hosts.
+    assert_eq!(window.file_offset, 54_296_576);
+    assert_eq!(window.payload_delta, 1_788);
     assert_eq!(
         window.file_offset + window.payload_delta,
         pack.payload_offset()
@@ -492,28 +504,28 @@ fn stored_assets_and_dex_files_are_where_the_analysis_says() {
     assert!(pack.stored_map_window(0).is_none());
     assert!(pack.stored_map_window(3000).is_none());
 
-    // All four dex files are STORED, which is what ART requires, and so is the resource table.
-    for (name, size) in [
-        ("classes.dex", 9_105_132u64),
-        ("classes2.dex", 6_178_724),
-        ("classes3.dex", 6_998_496),
-        ("classes4.dex", 7_348),
-        ("resources.arsc", 4_068_236),
+    // The three dex files are DEFLATED in the stock build; the resource table is STORED.
+    for (name, size, stored) in [
+        ("classes.dex", 9_099_932u64, false),
+        ("classes2.dex", 6_166_076, false),
+        ("classes3.dex", 6_983_052, false),
+        ("resources.arsc", 4_068_236, true),
     ] {
         let entry = apk.require_entry(name).expect(name);
-        assert!(entry.is_stored(), "{name} must be STORED");
+        assert_eq!(entry.is_stored(), stored, "{name} method");
         assert_eq!(entry.uncompressed_size(), size, "{name} size");
     }
+    assert!(apk.entry("classes4.dex").is_none(), "the stock build has three dex files");
     assert_eq!(
         apk.require_entry("resources.arsc")
             .expect("resources.arsc")
             .payload_offset(),
-        44,
-        "resources.arsc is the first entry in the archive"
+        225_157_748
     );
+    assert_eq!(apk.entries()[0].name(), "AndroidManifest.xml", "the first entry in the archive");
 
     let assets = apk.assets();
-    assert_eq!(assets.len(), 596, "entries under assets/");
+    assert_eq!(assets.len(), 594, "entries under assets/");
     assert_eq!(
         assets.iter().filter(|e| e.is_stored()).count(),
         391,
@@ -521,7 +533,7 @@ fn stored_assets_and_dex_files_are_where_the_analysis_says() {
     );
     assert_eq!(
         assets.iter().filter(|e| e.is_deflated()).count(),
-        205,
+        203,
         "DEFLATED assets"
     );
 
@@ -537,15 +549,15 @@ fn stored_assets_and_dex_files_are_where_the_analysis_says() {
 fn a_missing_entry_is_a_typed_error_naming_the_archive() {
     let Some(apk) = fixture() else { return };
 
-    match apk.require_entry("lib/x86_64/libroblox.so") {
+    match apk.require_entry("lib/riscv64/libroblox.so") {
         Err(ApkError::EntryNotFound { name, path }) => {
-            assert_eq!(name, "lib/x86_64/libroblox.so");
+            assert_eq!(name, "lib/riscv64/libroblox.so");
             assert!(path.ends_with(FIXTURE), "the error must name the archive");
         }
         Err(other) => panic!("wrong error: {other}"),
         Ok(entry) => panic!("found an entry that cannot exist: {}", entry.name()),
     }
-    assert!(apk.entry("lib/x86_64/libroblox.so").is_none());
+    assert!(apk.entry("lib/riscv64/libroblox.so").is_none());
     assert!(apk.asset_entry("no/such/asset").is_none());
 }
 

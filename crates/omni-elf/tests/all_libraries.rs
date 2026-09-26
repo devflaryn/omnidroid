@@ -2,7 +2,7 @@
 //!
 //! These pin the facts in `docs/DECISIONS.md` D9 and `docs/research/apk-analysis.md` §3.3 that
 //! are about the APK as a whole: that ten libraries use plain `DT_RELA` + `DT_JMPREL`, that no
-//! library uses `DT_RELR` or `DT_ANDROID_REL`, that the union of undefined symbols is 669, and
+//! library uses `DT_RELR` or `DT_ANDROID_REL`, that the union of undefined symbols is 641, and
 //! that where both hash tables exist they agree.
 
 mod common;
@@ -49,20 +49,6 @@ const EXPECTED: &[Expected] = &[
         symbol_count: 1_109,
     },
     Expected {
-        name: "libzstd-jni-1.5.7-6.so",
-        file_bytes: 18_440_296,
-        relative: 33_919,
-        abs64: 5,
-        glob_dat: 18,
-        jump_slot: 333,
-        total: 34_275,
-        relro_bytes: 580_752,
-        init_array_entries: 705,
-        undefined: 338,
-        sysv_symbol_count: None,
-        symbol_count: 488,
-    },
-    Expected {
         name: "libbacktrace-native.so",
         file_bytes: 5_339_704,
         relative: 11_325,
@@ -103,6 +89,22 @@ const EXPECTED: &[Expected] = &[
         undefined: 45,
         sysv_symbol_count: None,
         symbol_count: 346,
+    },
+    // The stock, genuine zstd-jni (the modified fixture carried an 18 MB impostor under this
+    // name). Plain `DT_RELA`, no `PT_GNU_RELRO`, no initializers, `DT_HASH` only.
+    Expected {
+        name: "libzstd-jni-1.5.7-6.so",
+        file_bytes: 603_960,
+        relative: 23,
+        abs64: 51,
+        glob_dat: 9,
+        jump_slot: 337,
+        total: 420,
+        relro_bytes: 0,
+        init_array_entries: 0,
+        undefined: 32,
+        sysv_symbol_count: Some(763),
+        symbol_count: 763,
     },
     Expected {
         name: "libimage_processing_util_jni.so",
@@ -190,9 +192,10 @@ const EXPECTED: &[Expected] = &[
     },
 ];
 
-/// The union across all eleven libraries, including the injected `libtrampoline.so`. Not in
-/// conflict with `libroblox.so`'s own 565 — both figures are correct (D9).
-const UNION_UNDEFINED: usize = 669;
+/// The union across all eleven arm64-v8a libraries of the stock APK. Not in conflict with
+/// `libroblox.so`'s own 565 — both figures are correct (D9). (669 on the modified fixture, whose
+/// impostor `libzstd-jni` imported 338 symbols; the genuine one imports 32.)
+const UNION_UNDEFINED: usize = 641;
 
 #[test]
 fn every_library_is_accounted_for() {
@@ -266,10 +269,13 @@ fn per_library_relocations_and_layout_match_d9() {
             assert_eq!(relocs.count_of_type(ty), 0, "{}: TLS reloc type {ty}", e.name);
         }
 
-        let relro = elf
-            .relro()
-            .unwrap_or_else(|| panic!("{}: PT_GNU_RELRO", e.name));
-        assert_eq!(relro.p_memsz, e.relro_bytes, "{}: PT_GNU_RELRO", e.name);
+        // `relro_bytes: 0` means the library has no `PT_GNU_RELRO` at all (only zstd-jni).
+        assert_eq!(
+            elf.relro().map_or(0, |relro| relro.p_memsz),
+            e.relro_bytes,
+            "{}: PT_GNU_RELRO",
+            e.name
+        );
         assert_eq!(
             elf.dynamic()
                 .init_array
@@ -313,7 +319,7 @@ fn per_library_relocations_and_layout_match_d9() {
 const MARGINS: &[(&str, u64, u64, u64)] = &[
     // (library, mapped_bytes, image-derived cap, minimum headroom over its real count)
     ("libroblox.so", 120_767_564, 60_383_782, 106),
-    ("libzstd-jni-1.5.7-6.so", 18_499_192, 9_249_596, 269),
+    ("libzstd-jni-1.5.7-6.so", 601_032, 300_516, 715),
     ("libbacktrace-native.so", 5_359_936, 2_679_968, 118),
     ("librenderscript-toolkit.so", 397_792, 198_896, 96),
     ("libeigen_blas.so", 252_800, 126_400, 74),
@@ -434,7 +440,7 @@ fn no_library_has_tls_of_any_kind() {
 }
 
 #[test]
-fn undefined_symbol_union_is_669_and_matches_the_research_appendix() {
+fn undefined_symbol_union_is_641_and_matches_the_research_appendix() {
     let Some(libs) = common::require_libs() else { return };
 
     let mut union: BTreeSet<String> = BTreeSet::new();
@@ -447,7 +453,7 @@ fn undefined_symbol_union_is_669_and_matches_the_research_appendix() {
     assert_eq!(union.len(), UNION_UNDEFINED, "union of undefined symbols");
 
     // Cross-check against docs/research/apk-undefined-symbols.txt, which was produced by a
-    // separate tool. Two independent parsers agreeing on all 669 names is much stronger than
+    // separate tool. Two independent parsers agreeing on all 641 names is much stronger than
     // agreeing on the count.
     let appendix = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/research/apk-undefined-symbols.txt");
@@ -494,7 +500,12 @@ fn dt_hash_and_dt_gnu_hash_agree_wherever_both_exist() {
         let elf = ElfImage::parse(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
         let sysv = elf.sysv_hash().unwrap();
         let gnu = elf.gnu_hash().unwrap();
-        assert!(gnu.is_some(), "{name}: every library has DT_GNU_HASH");
+        if name == "libzstd-jni-1.5.7-6.so" {
+            // Built with NDK r19: the one library with DT_HASH alone.
+            assert!(gnu.is_none() && sysv.is_some(), "{name}: DT_HASH only");
+            continue;
+        }
+        assert!(gnu.is_some(), "{name}: every other library has DT_GNU_HASH");
         let Some(sysv) = sysv else { continue };
         with_both.push(name.clone());
 
@@ -587,10 +598,12 @@ fn every_library_reports_its_ndk_note() {
             "{name}: ndk_version {:?}",
             ident.ndk_version
         );
-        // No AArch64 hardening features are requested anywhere in the APK (D9).
+        // AArch64 hardening: only the stock zstd-jni requests BTI and PAC, and nothing in this
+        // runtime loads it (it is the Java side's library). GCS nowhere.
         if let Some(props) = elf.gnu_properties().unwrap() {
-            assert!(!props.bti, "{name}: BTI");
-            assert!(!props.pac, "{name}: PAC");
+            let hardened = name == "libzstd-jni-1.5.7-6.so";
+            assert_eq!(props.bti, hardened, "{name}: BTI");
+            assert_eq!(props.pac, hardened, "{name}: PAC");
             assert!(!props.gcs, "{name}: GCS");
         }
     }

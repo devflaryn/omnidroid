@@ -122,7 +122,8 @@ ETC_RGB_FORMATS = {0x8D64, 0x9274, 0x9275}
 # right while the set under it was wrong by two in each direction.
 # ---------------------------------------------------------------------------------------------
 
-EXPECTED_ENTRY_COUNT = 2365
+# The stock APK (2026-09-26). The modified fixture before it had 2365; its texture set was the same.
+EXPECTED_ENTRY_COUNT = 2382
 
 # Every texture container in the APK, by path, with the format actually in its header.
 EXPECTED_TEXTURES = {

@@ -1,6 +1,6 @@
 //! Hostile input for the loader.
 //!
-//! D6 records that the supplied test APK is adversarially modified, so a tampered library is the
+//! Guest code and the libraries it ships are untrusted by design (D6), so a tampered library is the
 //! **expected** case here and not an exceptional one. This is also the task that writes into mapped
 //! memory inside a 109 MB binary, so a reachable panic, abort or stray store is a Critical defect.
 //!
@@ -726,8 +726,9 @@ fn every_library_in_the_apk_loads() {
         let backing = Backing::open(&path, MapExecutability::Executable).expect("open");
         let elf = ElfImage::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
         // A library aligned below the host page cannot be mapped at its alignment, and is refused
-        // by name -- as bionic refuses it on a 16 KiB-page device. None of the eleven is on a 4 KiB
-        // host; on a 16 KiB one (Apple silicon) `libzstd-jni` is, with `p_align` 0x1000.
+        // by name -- as bionic refuses it on a 16 KiB-page device. None of the stock APK's eleven is,
+        // on either page size: all are 16 KiB-aligned (the modified fixture's `libzstd-jni` was
+        // 0x1000 and was refused on Apple silicon).
         let host_page = f_page(&space) as u64;
         if let Some(align) = elf.load_segments().map(|s| s.p_align).find(|&a| a > 1 && a < host_page) {
             let outcome = loader::load(
@@ -795,16 +796,14 @@ fn every_library_in_the_apk_loads() {
          accounted for, {tail_copies} needed a private final page"
     );
     assert!(total_relocations > 568_806, "the main library alone has 568,806");
-    // Which libraries a host refuses is the host's page size and nothing else: none on 4 KiB pages,
-    // exactly the one 4 KiB-aligned library on 16 KiB pages (docs/ports/macos.md).
-    let expected: &[&str] =
-        if omni_platform::vm::page_size() > 0x1000 { &["libzstd-jni-1.5.7-6.so"] } else { &[] };
+    // Which libraries a host refuses is the host's page size and the libraries' alignment: every
+    // library in the stock APK is 16 KiB-aligned, so none is refused on 4 KiB or 16 KiB pages.
+    let expected: &[&str] = &[];
     assert_eq!(below_host_page, expected, "the libraries refused for p_align below the host page");
     // The largest single anonymous piece any real library asks for. This is the quantity
     // `GuestSpaceConfig::max_commit_request` is bracketed against on the legitimate side — one eager
     // commit call asks for exactly this — so it is asserted here rather than quoted in a doc comment
-    // and left to drift. Measured: 11,575,296 bytes in `libroblox.so`; the next largest across the
-    // eleven is 61,440, which is 188x smaller.
+    // and left to drift. Measured: 11,575,296 bytes in `libroblox.so`.
     eprintln!(
         "largest single anonymous piece across the 11 libraries: {} bytes in {}, {}x below the \
          {} byte per-request commit ceiling",
