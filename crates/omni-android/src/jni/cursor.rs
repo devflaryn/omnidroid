@@ -2,7 +2,7 @@
 //! own, held still while the engine holds its own still, and given back whenever the window is not
 //! the one the user is using.
 //!
-//! # What a device does, decoded (2.739.691)
+//! # What a device does, decoded (on the modified 2.739.691 build)
 //!
 //! **The app hides the system pointer over the engine's surface, always.**
 //! `com.roblox.client.RBXSurfaceView.onResolvePointerIcon(MotionEvent, int)` (`classes2.dex`) is
@@ -794,7 +794,8 @@ mod tests {
     }
     const NOP: u32 = 0xD503_201F;
 
-    /// **2.739.691's shape**: `bl getter; bl handler`, and in the handler `mov x19, x0` ...
+    /// **The modified 2.739.691 build's shape**: `bl getter; bl handler`, and in the handler
+    /// `mov x19, x0` ...
     /// `ldr x8, [x19, #0xb00]; add x0, sp, #8; ldr w8, [x8, #0x88]; cmp w8, #1; cset w19, eq`
     /// (`0x2e73f04`-`0x2e73f38`, the words as the library has them). The real library is decoded
     /// by the gate's own test, `the_mouse_lock_state_is_found_in_the_loaded_library`.

@@ -46,7 +46,7 @@ fn the_defaults_are_the_measured_ones() {
     // values: above the largest eager mapping anywhere in the workspace (the D10 requirement test's
     // 64 MiB chunk) and far below the smaller demonstrated tamper (+1026.004 MiB from a 1 GiB
     // `p_memsz`). The largest private anonymous piece any real library asks for is `libroblox.so`'s
-    // 11,575,296-byte `.bss`; the next largest across the eleven is 61,440 bytes.
+    // 11,575,296-byte `.bss`; the next largest across the eleven is 24,576 bytes.
     const LARGEST_REAL_SEGMENT: usize = 11_575_296;
     const LARGEST_EAGER_MAPPING_IN_THE_SUITE: usize = 64 * 1024 * 1024;
     const SMALLER_DEMONSTRATED_ATTACK: usize = 1_076_000_000;

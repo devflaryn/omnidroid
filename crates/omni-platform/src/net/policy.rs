@@ -2,10 +2,10 @@
 //!
 //! # What this is the successor to
 //!
-//! Global Constraint 8 was "no network access at runtime", and it was never arbitrary: D6 records
-//! that the APK under test is **cheat-injected and carries a Luau executor**, so guest code is
-//! hostile by assumption, and a socket handed to it is an unrestricted host socket. `socket`,
-//! `getaddrinfo` and `freeaddrinfo` were refused *by name* for that reason.
+//! Global Constraint 8 was "no network access at runtime", and it was never arbitrary: **guest
+//! code is untrusted by design** (D6), so it is hostile by assumption, and a socket handed to it
+//! is an unrestricted host socket. `socket`, `getaddrinfo` and `freeaddrinfo` were refused *by
+//! name* for that reason.
 //!
 //! **D30 withdrew the constraint and did not withdraw the threat.** The project owner's
 //! instruction is quoted in that record; the operative half here is that what replaces the
@@ -117,8 +117,7 @@ impl NetPolicy {
     /// **Named so that it cannot be reached by accident.** There is no `NetPolicy::new()` that
     /// happens to be this, no builder that becomes this once enough rules are added, and no flag
     /// that flips into it. An embedding that wants an unrestricted guest has to write the word,
-    /// and D6's threat — a cheat-injected APK carrying a Luau executor — is what the word is
-    /// worth reading twice for.
+    /// and D6 — guest code is untrusted by design — is what the word is worth reading twice for.
     #[must_use]
     pub fn unrestricted() -> NetPolicy {
         NetPolicy { unrestricted: true, ..NetPolicy::default() }

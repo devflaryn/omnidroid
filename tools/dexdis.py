@@ -12,14 +12,15 @@ of the guesses were wrong (`NativeUserJavaInterface`'s signed-out answers; see i
     python tools/dexdis.py 'Lok/c;'                    # every method of a class
     python tools/dexdis.py --grep 'Lfi/e$d;->d:'       # every instruction mentioning it
     python tools/dexdis.py --grep 'nativeSetAssetPath' --dex classes2.dex
-    python tools/dexdis.py --apk ../Roblox-2.739.691.apk 'Lfi/e;'   # another APK
+    python tools/dexdis.py --apk path/to/other.apk 'Lfi/e;'        # another APK
 
 **The APK is input, not code** (as ``omni_apk::choose``): ``--apk <path>``, else ``OMNI_APK``, else
 the ``Roblox-*.apk`` in the repository root with the highest version in its name.
 
-``classes4.dex`` is skipped: D6 and ``jni-surface.md``'s scope note put the injected payload out
-of scope. The instruction-format table is the Dalvik bytecode spec's; payload pseudo-instructions
-(switch tables, array data) are skipped by their own size headers. Needs only the standard library.
+The stock APK has three dex files; the ``classes4.dex`` skip (an injected dex in an earlier,
+modified fixture) is harmless. The instruction-format table is the Dalvik bytecode spec's; payload
+pseudo-instructions (switch tables, array data) are skipped by their own size headers. Needs only
+the standard library.
 """
 
 from __future__ import annotations

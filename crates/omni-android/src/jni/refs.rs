@@ -3,7 +3,7 @@
 //!
 //! # Every one of these is untrusted input
 //!
-//! Global Constraint 11, and the brief's own words: the APK is cheat-injected (D6) and every
+//! Global Constraint 11: guest code is untrusted by design (D6), and every
 //! `jobject`, `jstring`, `jmethodID` and array index the guest hands back is a 64-bit value this
 //! layer did not necessarily produce. JNI's own types are opaque pointers, so there is nothing in
 //! the ABI that constrains what arrives. A handle is therefore **not** a pointer here: it is an

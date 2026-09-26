@@ -1,8 +1,8 @@
 //! **The client-settings document `nativeInitClientSettings` is handed: fetched as the Java side
 //! fetches it, kept, and chosen.**
 //!
-//! DECODED from `classes2.dex` (2.739.691, 2026-09-24). The downcall's caller is the
-//! `AsyncTask` `fi.e$f`:
+//! DECODED from `classes2.dex` (the modified 2.739.691 build, 2026-09-24). The downcall's caller
+//! is the `AsyncTask` `fi.e$f`:
 //!
 //! ```text
 //! fi.e$f.a (doInBackground):

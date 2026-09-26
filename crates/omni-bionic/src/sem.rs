@@ -306,7 +306,7 @@ fn read_word(mem: &impl GuestMemory, addr: u64) -> Result<u32, crate::memory::Fa
 /// returned in the `Err`-carrying position of the *value*: these functions
 /// return `Ok(-1)` and the adapter reads the pending code from
 /// [`crate::sem::last_errno`]. This is the one piece of hidden state in the
-/// sync layer — documented in the report (§3) and keyed per-thread so
+/// sync layer — documented here and keyed per-thread so
 /// concurrent guest threads never see each other's errno.
 fn errno_result(
     mem: &mut impl GuestMemory,

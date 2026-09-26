@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [lints.rust]
-# Texture payloads are guest-controlled and the test APK is cheat-injected (D6). An overflowing
+# Texture payloads are guest-controlled and guest code is untrusted by design (D6). An overflowing
 # literal is the shape of a constant that silently wraps on a hostile dimension.
 overflowing_literals = "deny"
 

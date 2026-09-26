@@ -449,8 +449,9 @@ pub(super) fn strftime(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 ///
 /// Reached in M6: `nativePostClientSettingsLoadedInitialization3` calls it at guest `0x06258e44`,
 /// which is one call past the point where the client settings have been parsed and the engine
-/// starts reporting its own build. `jni-surface.md` records `strftime_l` in the file's LAST
-/// section as "there too and not reached" — it is reached now, one §8 row later than the note.
+/// starts reporting its own build. `docs/research/init-reachable-imports.txt` lists `strftime_l`
+/// under "Tier C only" (reached from the initializers solely through an address-taken edge, so
+/// outside the 188) — it is reached now, from a JNI entry rather than an initializer.
 pub(super) fn strftime_l(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (s, max, format, tm, locale) = {
         let mut a = c.args();
@@ -461,7 +462,10 @@ pub(super) fn strftime_l(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let view = enter(c, &state);
         if locale != 0 && locale != omni_bionic::locale::C_LOCALE_HANDLE {
             return Err(view.refusal(format!(
-                "`strftime_l` was given locale {locale:#x}, which is not a handle this layer                  issued. `newlocale` answers one handle here and bionic has one locale                  implementation, so a different value is a stale or fabricated `locale_t` rather                  than a locale whose formatting differs"
+                "`strftime_l` was given locale {locale:#x}, which is not a handle this layer \
+                 issued. `newlocale` answers one handle here and bionic has one locale \
+                 implementation, so a different value is a stale or fabricated `locale_t` rather \
+                 than a locale whose formatting differs"
             )));
         }
     }

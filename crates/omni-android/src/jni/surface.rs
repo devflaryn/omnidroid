@@ -1,7 +1,7 @@
 //! The Java surface, **generated from the APK's dex files**.
 //!
 //! ```text
-//! python crates/omni-android/tools/gen_dex_surface.py Roblox-2.739.691.apk \
+//! python crates/omni-android/tools/gen_dex_surface.py Roblox-2.738.1397.apk \
 //!     > crates/omni-android/src/jni/surface.rs
 //! ```
 //!
@@ -11,8 +11,8 @@
 //!
 //! **Provenance.** 98 classes and 1526 members, from the class-name string literals in
 //! `libroblox.so`'s own `.rodata` intersected with the classes the APK's dex declares.
-//! `classes4.dex` is excluded: D6 and `jni-surface.md`'s scope note put the injected
-//! payload out of scope. Per dex file: `classes.dex` 2, `classes2.dex` 96.
+//! The stock APK has three dex files; the generator's `classes4.dex` filter (an injected dex
+//! in an earlier, modified fixture) is harmless. Per dex file: `classes.dex` 2, `classes2.dex` 96.
 
 use super::classes::{Answer, ClassSpec, MemberSpec, Tier};
 

@@ -21,8 +21,8 @@
 //! refusal is gone and what replaced it is not an open socket — it is
 //! [`Bionic::set_network_policy`](super::Bionic::set_network_policy), which is the sentence
 //! `set_filesystem_root` already makes about directories: **which network may this instance reach
-//! is a question the embedding answers.** D6's threat is unchanged. An instance whose embedding
-//! has not answered it creates no socket at all, and says so by name.
+//! is a question the embedding answers.** D6 is unchanged: guest code is untrusted by design. An
+//! instance whose embedding has not answered it creates no socket at all, and says so by name.
 //!
 //! | symbol | where its answer comes from |
 //! |---|---|
@@ -1862,8 +1862,7 @@ fn policy(view: &GuestView<'_>) -> AbiResult<Arc<NetPolicy>> {
              There is deliberately no default: `NetPolicy::closed()` would make an embedding that \
              forgot indistinguishable from one that decided, and the guest would report a network \
              outage that this layer had invented (D30 withdrew Global Constraint 8 in favour of a \
-             policy, not in favour of an open socket; D6: the APK under test is cheat-injected \
-             and the executor is treated as hostile)",
+             policy, not in favour of an open socket; D6: guest code is untrusted by design)",
         )
     })
 }
@@ -2110,10 +2109,10 @@ fn read_sockaddr(
 /// policy that argument asked for — [`super::Bionic::set_network_policy`], which an instance
 /// **must** have before a socket exists at all.
 ///
-/// The part of the old reasoning that survives unchanged is D6's threat: the APK under test is
-/// cheat-injected and carries a Luau executor, so a descriptor handed out here is held by code
-/// treated as hostile. That is why the policy is consulted for every destination rather than once
-/// at creation, and why the default is no socket rather than a closed one.
+/// The part of the old reasoning that survives unchanged is D6: guest code is untrusted by
+/// design, so a descriptor handed out here is held by code treated as hostile. That is why the
+/// policy is consulted for every destination rather than once at creation, and why the default
+/// is no socket rather than a closed one.
 ///
 /// # The `AF_INET6` exception is now the ordinary case
 ///

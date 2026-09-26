@@ -51,10 +51,9 @@
 //!    shim in `omni-android` re-validates the same pointer and refuses it a long way from the
 //!    cause. Preferring memory that is already inside `GuestSpace` is therefore not a safety
 //!    nicety, it is what keeps one story true in both places.
-//! 2. D6 records that the APK under test is cheat-injected and carries a Luau executor. Under
-//!    identity fastmem, guest code that computes an address reaches whatever is at it. This
-//!    runtime is a **compatibility layer, not a sandbox**, and nothing in it should be described
-//!    as confining guest execution.
+//! 2. Guest code is untrusted by design (D6). Under identity fastmem, guest code that computes
+//!    an address reaches whatever is at it. This runtime is a **compatibility layer, not a
+//!    sandbox**, and nothing in it should be described as confining guest execution.
 //! 3. Turning this into isolation is not a patch. It would mean giving up identity mapping
 //!    (`fastmem_pointer` to a reserved base, `address_space_bits` down to the guest's real width so
 //!    out-of-range wraps into the reservation) and paying the 30-49x, or reserving the entire

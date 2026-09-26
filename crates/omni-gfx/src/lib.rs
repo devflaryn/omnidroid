@@ -19,6 +19,10 @@
 //! trait lives up there and the implementation lives here for the reason `Cargo.toml` records:
 //! `ash` and `libloading` must stay out of the adapter's dependency graph.
 //!
+//! [`gles`] — [`GfxGlesHost`], the host's EGL and OpenGL ES behind `omni_android::gles`, for the
+//! engine's GLES fallback (Linux/X11 today; the Windows ANGLE row is not plugged in). Binding the
+//! 91 EGL+GL imports `libroblox.so` hard-links is `omni-android`'s.
+//!
 //! [`claim`] — who owns a window's swapchain. Two Vulkan stacks point at one window in an
 //! Omnidroid process — [`vulkan::Renderer`] and the guest's, through [`host::GfxVulkanHost`] —
 //! and a native window may have at most one swapchain. This host has no validation layer to say
@@ -50,11 +54,6 @@
 //! present path is `vkCmdClearColorImage` and `vkCmdBlitImage`. D8 records that Roblox ships
 //! **1,364 SPIR-V modules** of its own; the shaders this project runs will be the guest's, and a
 //! triangle of our own would only have added a second source of them. See [`vulkan`].
-//!
-//! No EGL or GLES surface yet. D8 requires those symbols to *resolve*, because `libroblox.so`
-//! hard-links 91 EGL+GL imports through `DT_NEEDED` and will not load otherwise — but resolving
-//! them is a link-time requirement of `omni-android`'s import table, not a rendering requirement
-//! of this crate.
 
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]

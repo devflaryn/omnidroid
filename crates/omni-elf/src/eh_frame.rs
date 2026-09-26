@@ -21,7 +21,7 @@
 //!
 //! # Hostile input
 //!
-//! The header is attacker-controlled (D6: this project's own APK is adversarially modified). Every
+//! The header is attacker-controlled (D6: guest code is untrusted by design). Every
 //! field is read through [`View`], the table length is checked against the bytes actually present
 //! rather than trusted from `fde_count`, and an encoding this module does not implement is a typed
 //! refusal naming the encoding byte — never a silent reinterpretation of the bytes as some other

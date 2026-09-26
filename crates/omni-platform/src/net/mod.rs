@@ -14,8 +14,8 @@
 //!
 //! That shape is the point of D30 rather than a decoration on it. The old constraint was reached
 //! by a runtime that could not yet do anything a network was for; it was withdrawn by one that
-//! can. But D6's threat is unchanged — **the APK under test is cheat-injected and carries a Luau
-//! executor** — so what replaces a refusal is not an open socket. It is a question an embedding
+//! can. But D6 is unchanged — **guest code is untrusted by design** — so what replaces a refusal
+//! is not an open socket. It is a question an embedding
 //! answers: *which network may this instance reach.* See [`NetPolicy`] for the three gates, and for
 //! the paragraph about what they cannot prevent, which is the part worth reading before trusting
 //! them.

@@ -2,7 +2,8 @@
 //! with the demand pager installed: every block has one owner, and no call another thread makes
 //! changes a byte of it.
 //!
-//! DECODED (`libroblox.so` 2.739.691): the engine's allocator is mimalloc v3, compiled into the
+//! DECODED (the modified 2.739.691 build's `libroblox.so`, a different binary from the stock
+//! fixture's): the engine's allocator is mimalloc v3, compiled into the
 //! library, and these are the only calls it makes to the OS:
 //!
 //! * `mmap(NULL, size, PROT_READ|PROT_WRITE or PROT_NONE,

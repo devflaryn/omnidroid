@@ -10,8 +10,8 @@
 //! The split is load-bearing. `omni-cpu` holds the `GuestCpu` trait and has no
 //! build script and no C++ dependency, so the trait still compiles on a host
 //! with no C++ toolchain at all — which is exactly the host the ARM64-native
-//! path (`ARCHITECTURE.md` §6) targets. Mapping this crate onto that trait is a
-//! later task.
+//! path (`ARCHITECTURE.md` §6) targets. `omni-cpu`'s `dynarmic` module maps this
+//! crate onto that trait.
 //!
 //! # The three things that make this sound
 //!

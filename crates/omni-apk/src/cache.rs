@@ -15,8 +15,8 @@
 //!
 //! The cache path is `<root>/libs/<sha256 of the uncompressed bytes>/<file name>`. Keying on
 //! content rather than on APK path means two APKs that ship the same library share one cache entry,
-//! and — the part that matters for a modified APK like this one (D6) — a tampered library can never
-//! land on top of a stock one, because a different byte is a different path.
+//! and — the part that matters because APK input is untrusted by design (D6) — a tampered library
+//! can never land on top of a stock one, because a different byte is a different path.
 //!
 //! # How a hit is found without decompressing
 //!

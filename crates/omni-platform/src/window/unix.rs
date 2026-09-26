@@ -1,5 +1,5 @@
-//! Shared unix body of the window seam, used by the [`linux`](super::linux) and
-//! [`macos`](super::macos) backends.
+//! A structural unix body of the window seam, compiled on non-macOS unix and used by nothing: the
+//! real backends are [`linux`](super::linux) (Xlib) and `macos` (AppKit).
 //!
 //! # Status: structural, not implemented
 //!

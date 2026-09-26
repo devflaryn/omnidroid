@@ -121,19 +121,18 @@ pub const DEFAULT_MAX_COMMITTED: usize = 3584 * 1024 * 1024;
 /// | library | largest single anonymous piece |
 /// |---|---|
 /// | `libroblox.so` | **11,575,296 B** (11.04 MiB) — its `.bss` |
-/// | `libzstd-jni-1.5.7-6.so` | 61,440 B |
 /// | `libbacktrace-native.so` | 24,576 B |
 /// | six others | 4,096 B |
-/// | two others | 0 |
+/// | three others | 0 |
 ///
-/// So the real corpus has exactly one segment above 64 KiB, and the second-largest is **188x
+/// So the real corpus has exactly one segment above 64 KiB, and the second-largest is **471x
 /// smaller** than it. The other legitimate constraint is not a library at all: the D10 requirement
 /// test grows an instance in eager 64 MiB chunks, which is the largest single eager commit anywhere
 /// in the workspace and stands in for a guest asking for a large region up front.
 ///
 /// That brackets the value between **64 MiB** (must pass) and **1,026 MiB** (the smaller demonstrated
 /// attack; must fail). 128 MiB is the smallest power of two clear of the legitimate side with a
-/// factor of two in hand. Margins: **11.6x** the largest real segment, 2185x the second-largest
+/// factor of two in hand. Margins: **11.6x** the largest real segment, 5461x the second-largest
 /// library's, 2x the largest eager mapping in the suite; **8.4x** below the 1 GiB tamper and **27x**
 /// below the 3.3 GiB one. Nothing measured lies between 64 MiB and 1 GiB, which is why a looser
 /// value would buy nothing and a tighter one would start colliding with legitimate use.

@@ -128,8 +128,8 @@ pub struct LoaderConfig {
 /// magnitude. That is a **23x** margin, and `loader_hostile.rs`'s `every_library_in_the_apk_loads`
 /// pins it, so drift shows up long before a real object is rejected.
 ///
-/// It bounds a quantity that comes straight from `p_memsz`, which is a file field: D6 records that
-/// this project's own test APK is adversarially modified, and an eight-byte edit to that field was
+/// It bounds a quantity that comes straight from `p_memsz`, which is a file field: guest code and
+/// the libraries it ships are untrusted by design (D6), and an eight-byte edit to that field was
 /// measured to turn a 16.7 MiB load into a 3.4 GiB one. Note what the limit is *not* derived from:
 /// the image span, which `omni-elf` already bounds at 4 GiB and which D10 measured as free. A bound
 /// on the abundant resource is not a bound on the scarce one.

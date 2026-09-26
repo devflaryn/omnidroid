@@ -1,10 +1,10 @@
 //! The Android compatibility layer: bionic libc/libm, `libdl`, `liblog`, JNI without a JVM
 //! (D7), GameActivity, `ALooper`, `AAssetManager`, `ANativeWindow`.
 //!
-//! **M3 task 2 built the boundary, not the implementations.** What is here is the crossing: a reserved
-//! region of guest address space, one slot per imported symbol, AAPCS64 marshalling in both
-//! directions, and the machinery for calling guest code back. The 170 functions and 18 data objects
-//! the 3,594 static initializers reach are task 3's.
+//! Two halves. The **crossing**: a reserved region of guest address space, one slot per imported
+//! symbol, AAPCS64 marshalling in both directions, and the machinery for calling guest code back.
+//! And the **implementations** behind it: [`bionic`], [`jni`], [`ndk`], [`gles`], [`vulkan`] and
+//! [`aaudio`], which are what the engine reaches from its initializers onwards.
 //!
 //! # The shape of the crossing
 //!

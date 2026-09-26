@@ -6,9 +6,8 @@
 //! The guest is an Android ARM64 binary and the paths it uses are Android's: `/data/data/…`,
 //! `/system/lib64/…`, `/proc/self/maps`. **None of them exists on this host**, and none of them
 //! may be allowed to mean what it says: `open("/etc/passwd")` resolved against the host's own
-//! root would hand the guest a host file. That is not a hypothetical. D6 records that the APK
-//! under test is cheat-injected — a Luau executor was added to `libzstd-jni` by a third party —
-//! and the whole design treats guest code as hostile. It is also the ordinary requirement:
+//! root would hand the guest a host file. Guest code is untrusted by design (D6), so the whole
+//! design treats it as hostile. It is also the ordinary requirement:
 //! "several isolated instances in one process" is non-negotiable, and two instances that can
 //! reach each other's files are not isolated.
 //!

@@ -219,10 +219,10 @@ fn the_commit_charge_of_a_guest_thread_created_by_the_guest() {
          \x20 MiB/thread**, n = 1 run of 8 contexts. What this layer adds per thread is one lazily\n\
          \x20 committed 1 MiB stack -- of which a spinning thread touches one page -- and an arena\n\
          \x20 block that was already committed when the instance was built.\n\
-         \x20 16 MiB of the per-thread figure is `A64EmitX64`'s fixed fast-dispatch table, which is\n\
-         \x20 allocated and written by the constructor for a feature D16 runs DISABLED. The fork\n\
-         \x20 patch is written up in `crates/dynarmic-sys/patches/README.md` item 4 and is NOT\n\
-         \x20 applied: D5 pins the vendored tree byte-for-byte unmodified.\n"
+         \x20 Before patch 0017, 16 MiB of the per-thread figure was `A64EmitX64`'s fixed\n\
+         \x20 fast-dispatch table, allocated and written by the constructor for a feature D16\n\
+         \x20 runs DISABLED. `crates/dynarmic-sys/patches/README.md` item 4: applied as patch\n\
+         \x20 0017 (the table exists only with fast dispatch on), shrunk to 64 KiB by 0019.\n"
     );
 }
 

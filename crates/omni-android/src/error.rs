@@ -383,9 +383,9 @@ pub enum AbiError {
     /// never issued.
     ///
     /// Distinct from [`JniRefused`](AbiError::JniRefused) on purpose: that one is a gap in the
-    /// host, this one is a fact about the guest. The APK is cheat-injected (D6) and JNI's types
-    /// are opaque pointers, so there is nothing in the ABI that constrains what arrives — and a
-    /// null `jmethodID`, which is by far the commonest shape, means an earlier lookup returned
+    /// host, this one is a fact about the guest. Guest code is untrusted by design (D6) and JNI's
+    /// types are opaque pointers, so there is nothing in the ABI that constrains what arrives — and
+    /// a null `jmethodID`, which is by far the commonest shape, means an earlier lookup returned
     /// null and was not checked.
     #[error("`{function}` at {address:#x} was given {handle:#x} as a {kind}, which {why}")]
     JniBadHandle {

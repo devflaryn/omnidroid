@@ -637,8 +637,7 @@ pub(super) fn filesystem<'a>(view: &GuestView<'a>) -> AbiResult<&'a Filesystem> 
              supplies with `Bionic::set_filesystem_root`, and none has been supplied. There is \
              deliberately no default: a default root would have to be the process's working \
              directory or a temporary one, and either would let untrusted guest code read and \
-             write host files nobody decided to expose (D6: the APK under test is cheat-injected \
-             and the executor is treated as hostile)",
+             write host files nobody decided to expose (D6: guest code is untrusted by design)",
         )
     })
 }

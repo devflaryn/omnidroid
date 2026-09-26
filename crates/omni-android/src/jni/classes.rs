@@ -260,7 +260,7 @@ pub enum Answer {
     /// hardware key-attestation "quote", which this runtime cannot mint — so this returns what a
     /// **device that cannot attest** returns, decoded from `classes2.dex`, not guessed.
     ///
-    /// # What the engine does (decoded from `libroblox.so` 2.739.691)
+    /// # What the engine does (decoded on the modified 2.739.691 build's `libroblox.so`)
     ///
     /// One flattened, string-obfuscated function (`0x3298230`) builds the class name at runtime —
     /// which is why `"com/roblox/engine/jni/NativeQuoteInterface"` is in **no** `.rodata` literal
@@ -2080,9 +2080,11 @@ pub static DECLARED: &[ClassSpec] = &[
     // queue) have no measured reader, and the generated surface keeps every method Unanswered.
     //
     // **The four methods the engine looks up on it (JNI audit, docs/research/jni-audit-2.739.md)**
-    // -- Djinni's class setup at `0x22792f8` takes all four ids at startup, on the interface
+    // -- Djinni's class setup at `0x22792f8` (on the modified 2.739.691 build, a different
+    // `libroblox.so` from the stock fixture's) takes all four ids at startup, on the interface
     // `IPlatformSystemDialogHandler` below, which is where a `Call…Method` on this object lands.
-    // Their one engine caller is `AppPlatformQoSEmergency` (`0x227a76c`): a blocking dialog the
+    // Their one engine caller is `AppPlatformQoSEmergency` (`0x227a76c` on the modified 2.739.691
+    // build): a blocking dialog the
     // servers can switch on during an outage (`Stop_Until`), not a Lua API or a menu. Decoded:
     //
     // * `isAvailable()Z` is `const/4 v0, #1; return` -- **true**, whatever the state.
@@ -2118,7 +2120,8 @@ pub static DECLARED: &[ClassSpec] = &[
         methods: SYSTEM_DIALOG_HANDLER,
         fields: NONE,
     },
-    // What the engine builds before `open` (`0x35df540`: `NewObject`, `(String x4, Z, Z, J)`,
+    // What the engine builds before `open` (`0x35df540` on the modified 2.739.691 build:
+    // `NewObject`, `(String x4, Z, Z, J)`,
     // from the `PlatformQoSEmergencyDialog*` flags). The Java constructor stores the seven
     // arguments; the one reader is `open`'s dialog-building branch, which `currentActivity ==
     // null` never reaches here, so the object is made and nothing is kept -- `Construct` cannot
@@ -2133,7 +2136,8 @@ pub static DECLARED: &[ClassSpec] = &[
         )],
         fields: NONE,
     },
-    // The engine's C++ callback wrapped for Java (`0x35dfb54`, `NewObject` `<init>(J)V`): Djinni's
+    // The engine's C++ callback wrapped for Java (`0x35dfb54` on the modified 2.739.691 build,
+    // `NewObject` `<init>(J)V`): Djinni's
     // generated constructor stores `nativeRef` (the rest -- an `AtomicBoolean destroyed` and
     // `NativeObjectManager.register` -- is Java-side cleanup the engine never reads).
     ClassSpec {
@@ -2192,7 +2196,8 @@ pub static DECLARED: &[ClassSpec] = &[
     //
     // **The app-rating prompt (JNI audit)**: Lua's `AppRatingPromptService` reaches
     // `AndroidAppRatingPromptProtocol` (vtable `0x647c1e8`: `+0x10` `0x3614ec0`, `+0x18`
-    // `0x3614fa0`), which the `AppRatingPromptProtocolCore` subsystem creates unconditionally;
+    // `0x3614fa0`, on the modified 2.739.691 build), which the `AppRatingPromptProtocolCore`
+    // subsystem creates unconditionally;
     // the app shell asks after a game is left. From `classes2.dex`: `isAppRatingPromptAvailable`
     // is `return true`; `showAppRatingPrompt` logs, then reads the static `WeakReference b`, which
     // only `onCreate(LifecycleOwner)` fills with the activity -- a lifecycle registration no
@@ -2208,10 +2213,11 @@ pub static DECLARED: &[ClassSpec] = &[
         fields: NONE,
     },
     // **`GmaSdkAvailability.isInstalled()Z` (JNI audit)**: `platformIsGmaSdkInstalled`
-    // (`0x2f5dbf8`, the `DefaultNativeAdsProtocol`'s `+0x18`, which `StartupController::
+    // (`0x2f5dbf8` on the modified 2.739.691 build, the `DefaultNativeAdsProtocol`'s `+0x18`,
+    // which `StartupController::
     // initProtocols` creates) -- the ads eligibility question. The Java is
     // `Class.forName("com.roblox.client.gmasdk.GmaSdkController")` inside a `runCatching`:
-    // that class is the on-demand `gmasdk` module and is in none of this APK's four dex files
+    // that class is the on-demand `gmasdk` module and is in none of this APK's dex files
     // (only its `kotlin_module` marker is), so `ClassNotFoundException` and **false** -- the
     // answer of every install of this APK without the module, this one included.
     ClassSpec {
@@ -2222,7 +2228,8 @@ pub static DECLARED: &[ClassSpec] = &[
     },
     // **`ExperienceSession.shouldDisableExperienceIdleTimer()Z` (static)**: found by the JNI
     // audit (docs/research/jni-audit-2.739.md), not yet by a death. `nativeActivity_onStop`
-    // (`0x2bf27ac`) calls it through `0x2bfb430` whenever the app is stopped inside an
+    // (`0x2bf27ac` on the modified 2.739.691 build) calls it through `0x2bfb430` whenever the app
+    // is stopped inside an
     // experience -- this host sends `onStop` when the window is minimised under the
     // pause-in-background policy -- and on false schedules the engine's idle timer (30.0) that
     // later stops the experience, as a phone does in the background.

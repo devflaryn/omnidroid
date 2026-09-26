@@ -2,7 +2,7 @@
 
     python crates/omni-elf/tools/mutate_loader.py        # from the repository root
 
-Global Constraint 12: a test that does not fail when the logic it covers is reverted is not
+Global Constraint 13: a test that does not fail when the logic it covers is reverted is not
 evidence. This harness makes that checkable rather than claimed. It applies one mutation at a time
 to the loader's source, re-runs the loader test suites, records which tests noticed, and **always**
 restores the file — including on a failure, via `try`/`finally`.

@@ -75,7 +75,7 @@
 //!
 //! # Hostile input
 //!
-//! Texture data is guest-controlled and the test APK is cheat-injected (D6). Every entry point
+//! Texture data is guest-controlled and guest code is untrusted by design (D6). Every entry point
 //! takes untrusted dimensions and an untrusted payload, and returns a typed refusal for a
 //! truncated payload, a zero or overflowing extent, an undersized destination and an ETC2-mode
 //! block. Nothing panics, aborts or reads out of bounds.

@@ -1,4 +1,4 @@
-//! Unix backend for the web-view seam, shared by Linux and macOS.
+//! The web-view seam's Linux backend (macOS has its own, `webview::macos`).
 //!
 //! # Status: structural, not implemented
 //!

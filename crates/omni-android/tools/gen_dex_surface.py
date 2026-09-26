@@ -167,7 +167,8 @@ def main():
     for name in sorted(z.namelist()):
         if not (name.startswith('classes') and name.endswith('.dex')):
             continue
-        # `classes4.dex` is the injected payload's (D6, and jni-surface.md's scope note).
+        # An earlier, modified fixture carried an injected `classes4.dex`. The stock APK has
+        # three dex files, so this filter is harmless and kept.
         if name == 'classes4.dex':
             continue
         d = Dex(z.read(name))
@@ -197,8 +198,8 @@ def main():
     w('//! **Provenance.** %d classes and %d members, from the class-name string literals in\n'
       % (len(out), total))
     w("//! `libroblox.so`'s own `.rodata` intersected with the classes the APK's dex declares.\n")
-    w('//! `classes4.dex` is excluded: D6 and `jni-surface.md`\'s scope note put the injected\n')
-    w('//! payload out of scope. Per dex file: %s.\n'
+    w('//! The stock APK has three dex files; the generator\'s `classes4.dex` filter (an injected dex\n')
+    w('//! in an earlier, modified fixture) is harmless. Per dex file: %s.\n'
       % ', '.join('`%s` %d' % (k, v) for k, v in sorted(counts.items())))
     w('\n')
     w('use super::classes::{Answer, ClassSpec, MemberSpec, Tier};\n')

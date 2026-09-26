@@ -12,8 +12,8 @@
 //! # What this crate does not do
 //!
 //! * **No signature verification.** Nothing here reads `META-INF/`, the APK Signing Block, or any
-//!   certificate, and nothing here reports on them. The supplied test APK is signed by a
-//!   non-Roblox key (D6); this crate neither knows nor cares. Anything that needs to trust an APK's
+//!   certificate, and nothing here reports on them. APK input is untrusted by design (D6);
+//!   this crate neither knows nor cares who signed it. Anything that needs to trust an APK's
 //!   provenance must verify it somewhere else.
 //! * **No binary XML decoding, but for the manifest's identity.** [`Apk::read_manifest`] hands back
 //!   the raw AXML bytes of `AndroidManifest.xml`. [`AppManifest`] reads exactly three attributes of

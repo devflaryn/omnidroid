@@ -29,6 +29,11 @@ dynarmic/
                and ../patches/0020-arm64-rsb-hit-checks-budget-and-halt.patch
                and ../patches/0021-arm64-value-compare-honours-ignore-global-monitor.patch
                and ../patches/0022-shared-code-cache.patch
+               and ../patches/0024-x64-a-census-of-the-shared-cache-s-tables.patch
+               and ../patches/0025-x64-shared-cache-links-and-fastmem-sites-as-flat-records.patch
+               and ../patches/0026-x64-the-guest-ranges-of-emitted-blocks-compact.patch
+               and ../patches/0027-x64-a-shared-cache-s-block-map-at-a-load-factor-of-0.75.patch
+               and ../patches/0028-x64-a-full-region-is-not-a-flush-the-oldest-region-is-retired.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

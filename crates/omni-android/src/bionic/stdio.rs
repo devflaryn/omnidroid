@@ -76,7 +76,7 @@
 //! The paragraph above says `ferror`, `clearerr`, `fseek` and `setvbuf` are absent from the 188.
 //! That is true and it is **narrower than "not imported"**, so it is worth separating the two:
 //! all four are undefined dynamic symbols of the APK's libraries — `ferror` from
-//! `libroblox.so`, `libbacktrace-native.so` and `libzstd-jni`, `clearerr` from `libroblox.so` —
+//! `libroblox.so` and `libbacktrace-native.so`, `clearerr` from `libroblox.so` —
 //! and none is reachable from the 3,594 initializers, so none is bound here and no guest call in
 //! this milestone can reach one.
 //!

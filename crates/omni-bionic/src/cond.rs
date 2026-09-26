@@ -408,8 +408,9 @@ pub fn wait_begin(
 ///
 /// **A slice, not a cap.** A guest deadline further out than this is waited on in full, in
 /// slices, and answered `ETIMEDOUT` only when it has really passed. MEASURED on the real engine
-/// (2.739.691, 2026-09-24): the join worker started at link `0x22d457c` waits about 120 s on a
-/// cond; refusing that wait killed the thread and the join silently never started (6 of 8 runs).
+/// (the modified 2.739.691 build, 2026-09-24): the join worker started at that build's link
+/// `0x22d457c` waits about 120 s on a cond; refusing that wait killed the thread and the join
+/// silently never started (6 of 8 runs).
 pub const WAIT_SLICE: Duration = Duration::from_secs(60);
 
 thread_local! {

@@ -1605,7 +1605,8 @@ fn a_scan_of_an_unreadable_address_refuses_with_the_rule_that_said_no() {
 ///
 /// This test used to assert the opposite -- "two mappings placed adjacently are still two mappings,
 /// and an access that crosses from one into the other is a refusal". Linux does not check accesses
-/// per mapping, and the real engine proved it: Roblox 2.739.691's `init_array[188]` `memset`s 256
+/// per mapping, and the real engine proved it: the modified 2.739.691 build's `init_array[188]`
+/// (a different `libroblox.so` from the stock fixture's) `memset`s 256
 /// bytes across the seam between its last file-backed page and the `.bss` mapped after it, and the
 /// old rule stopped the engine there. What still refuses is free space, and a neighbour whose
 /// protection forbids the access. A lazily-committed neighbour is committed, and the extent reported

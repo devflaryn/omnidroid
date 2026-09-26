@@ -321,7 +321,8 @@ fn configure(
     // once. Upstream's default leaves dynarmic's code cache
     // `PAGE_EXECUTE_READWRITE`, which makes that false for the component that
     // holds every byte of generated guest code. The `w-xor-x` feature turns it
-    // on; `README.md` records the measured cost of doing so.
+    // on, but it crashes on this pin (`patches/README.md` "Known candidates"
+    // item 3), so `want_w_xor_x` refuses it without the override.
     c.arg(format!(
         "-DDYNARMIC_ENABLE_NO_EXECUTE_SUPPORT={}",
         if want_w_xor_x() { "ON" } else { "OFF" }

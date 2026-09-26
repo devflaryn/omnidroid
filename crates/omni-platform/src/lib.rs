@@ -11,44 +11,35 @@
 //!
 //! # What is here
 //!
+//! The OS-facing modules have Windows, Linux and macOS backends, with the gaps named below; what
+//! has run, and where, is `docs/STATUS.md` and `docs/ports/*.md`. A target without a backend gets
+//! a typed `Unsupported` refusal, never a fabricated answer.
+//!
 //! * [`vm`] — virtual memory: reservation, lazy commit, decommit, protection, placeholder
-//!   splitting and file-backed mapping. Implemented and measured on Windows; structural on Linux
-//!   and macOS, where every operation returns a typed
-//!   [`Unsupported`](vm::VmError::Unsupported) error.
-//! * [`fault`] — guest memory faults: one process-wide **vectored** exception handler, so that
-//!   Omnidroid sees an access violation in JIT-generated guest code before dynarmic's frame-based
-//!   SEH does. D4 verified the ordering (`veh_hits = 1`, dynarmic's slow path never entered) and
-//!   D10 requires it, because whoever handles the fault owns guest demand paging.
+//!   splitting and file-backed mapping.
+//! * [`fault`] — guest memory faults: one process-wide handler that sees an access violation in
+//!   JIT-generated guest code before dynarmic does (a **vectored** handler on Windows, where D4
+//!   verified the ordering). D10 requires it, because whoever handles the fault owns guest demand
+//!   paging. No backend on macOS x86-64.
 //! * [`clock`] — monotonic time, wall time and sleeping. One process-wide monotonic epoch.
 //! * [`process`] — pid, cpu count, entropy, the current processor number and this process's
-//!   consumed CPU time. Implemented and run on Windows; the entropy, cpu-id and cpu-time thirds
-//!   are structural on Linux and macOS, where they return
-//!   [`ProcessError::Unsupported`](process::ProcessError::Unsupported) naming the POSIX call they
-//!   intend to make.
+//!   consumed CPU time.
 //! * [`log`] — a sink for a line the guest wrote, with Android's and syslog's priority scales.
 //! * [`fs`] — files and directories: a **rooted** descriptor table, metadata, and directory
 //!   listings. Every guest path is resolved inside one host directory supplied by the embedding,
 //!   and a path that cannot be is refused by name; see [`fs::path`](fs) for the policy and the
-//!   hostile cases. Fifteen of its seventeen operations are `std::fs` and are implemented once;
-//!   `pread` and `statvfs` have a Windows backend and a structural unix one naming `pread(2)`
-//!   and `statvfs(3)`.
+//!   hostile cases.
 //! * [`net`] — TCP and UDP client sockets, socket options, readiness over a set of sockets, and
 //!   name resolution. The **only** place in the workspace where a socket call is made. It is a
 //!   seam with a **policy** on it rather than an open socket: a [`Socket`](net::Socket) cannot be
-//!   created without a [`NetPolicy`](net::NetPolicy), and the default reaches nothing. Sends,
-//!   receives, `shutdown`, timeouts, `TCP_NODELAY` and resolution are portable `std` and are
-//!   implemented once; socket *creation*, `bind`, `connect`, four socket options and readiness
-//!   have a Windows backend and a structural unix one, because `std` cannot make a socket that is
-//!   not already connected or bound and has no readiness call at all.
+//!   created without a [`NetPolicy`](net::NetPolicy), and the default reaches nothing.
 //! * [`window`] — a resizable desktop window, the handle a graphics backend puts a surface on,
-//!   and a **non-blocking** drain of input and lifecycle events. Implemented and run on Windows;
-//!   structural on Linux and macOS, where the window type is literally uninhabited so that the
-//!   compiler discharges every operation but the one that refuses. M6's renderer is its only
-//!   consumer today; GameActivity's input callbacks are the other one it exists for.
-//! * [`webview`] — a top-level window with a real browser in it (Microsoft Edge WebView2 on
-//!   Windows, loaded without the SDK's loader DLL), on a thread the seam owns, driven by commands
-//!   and a **non-blocking** event drain. For the pages the guest opens in an Android `WebView`,
-//!   first the sign-in challenge. Structural on Linux and macOS.
+//!   and a **non-blocking** drain of input and lifecycle events (Win32, Xlib, AppKit).
+//! * [`webview`] — a top-level window with a real browser in it (WebView2 on Windows, WKWebView on
+//!   macOS; none on Linux), on a thread the seam owns, for the pages the guest opens in an
+//!   Android `WebView`, first the sign-in challenge.
+//! * [`audio`], [`sampler`] and (behind a feature) `hypervisor` — the audio output device, the
+//!   sampling profiler, and Hypervisor.framework for the native backend on Apple silicon.
 //!
 //! Threads and dynamic loading may arrive as sibling modules in later tasks.
 //! **Sockets did not, until M6, and the sentence that used to stand here is corrected rather than
@@ -66,8 +57,8 @@
 //!
 //! # Not every primitive needs a `cfg`, and saying which is part of the seam
 //!
-//! [`vm`] and [`fault`] are OS APIs end to end, so both have a Windows backend and a structural
-//! unix one. [`clock`], [`log`], and half of [`process`] are **portable standard library** —
+//! [`vm`] and [`fault`] are OS APIs end to end, so both have a backend per host OS (with the gap
+//! named above). [`clock`], [`log`], and half of [`process`] are **portable standard library** —
 //! `Instant`, `SystemTime`, `thread::sleep`, `stderr`, `process::id`, `available_parallelism` —
 //! and they are implemented once, with no backend and no `cfg`.
 //!
@@ -76,7 +67,7 @@
 //! `std` call that serves all five targets?** `File::open`, `fs::metadata` and `fs::read_dir`
 //! are, so they are written once. `pread` is `FileExt::seek_read` on Windows and
 //! `FileExt::read_at` on unix — two traits, two modules, no single call — and `statvfs` has no
-//! `std` spelling at all, so those two get a backend and a structural unix half.
+//! `std` spelling at all, so those two get a backend.
 //!
 //! [`net`] answers that question a **third** way, and D30 asked for it to be said out loud:
 //! *partly*. Once a socket exists, everything done to it is one portable `std` call on all five
@@ -91,8 +82,8 @@
 //! project enforces is *never claim a platform works*, and a fabricated `Unsupported` return for
 //! something `std` already does correctly on all five targets would be a false claim in the other
 //! direction: it would assert that a clock this process can read cannot be read, and it would make
-//! the non-Windows bring-up harder rather than easier. What stays unclaimed is what has been
-//! **run**: nothing outside Windows x86-64 has been.
+//! the non-Windows bring-up harder rather than easier. What stays unclaimed is what has not been
+//! **run**: `docs/STATUS.md` says what has, per target.
 //!
 //! # Diagnostics are part of the API
 //!

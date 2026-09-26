@@ -9,7 +9,7 @@ rebuild path is different; and several of these mutations make the process
 **abort** or **hang** rather than fail a test, which needs a timeout the
 workspace runner does not have.
 
-Global Constraint 12: a test that does not fail when the logic it covers is
+Global Constraint 13: a test that does not fail when the logic it covers is
 reverted is not evidence. Both directions are here, and the second is the point:
 
 * **A** reverts a guard. Something must fail.

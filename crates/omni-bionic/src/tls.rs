@@ -7,8 +7,8 @@
 //! Bionic maps every `pthread_key_t` onto a slot in a fixed per-process table
 //! (128 slots on 64-bit; VERIFIED against bionic's `pthread_internal.h`
 //! `PTHREAD_KEYS_OVERFLOW_MAX_COUNT`/`__pthread_keys` sizing — the constant
-//! below is that table size, and the "out of TLS keys" failure libzstd-jni's
-//! Rust code hit is exactly this limit). Each slot carries one destructor
+//! below is that table size, and an "out of TLS keys" failure in guest code
+//! is this limit being hit). Each slot carries one destructor
 //! (guest function pointer, or 0 = none).
 //!
 //! * `key_create(&key, dtor)`: claim a free slot. EAGAIN when the table is full.
@@ -75,10 +75,9 @@ use std::sync::{Arc, Mutex as HostMutex};
 /// Bionic's per-process key table size on LP64.
 /// VERIFIED: bionic `pthread_internal.h` (`__pthread_keys` is
 /// `pthread_key_table_t[PTHREAD_KEYS_OVERFLOW_MAX_COUNT]`-bounded; the
-/// per-process slot count is 128 on 64-bit). Confidence: HIGH — this is also
-/// the limit libzstd-jni's "out of TLS keys" message ran into (repo research
-/// notes), and 128 is the value bionic has shipped since its pthread_key
-/// rework.
+/// per-process slot count is 128 on 64-bit). Confidence: HIGH — 128 is the
+/// value bionic has shipped since its pthread_key rework, and `key_create`
+/// answers EAGAIN past it, as bionic does.
 pub const PTHREAD_KEYS_MAX: usize = 128;
 
 /// POSIX/bionic destructor sweep rounds.

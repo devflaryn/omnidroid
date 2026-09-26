@@ -3,8 +3,9 @@
 //!
 //! No window and no host EGL: every call is a guest `BLR` into a thunk this boundary bound, and what
 //! comes back is what AOSP's `libEGL` answers with no driver (`omni_android::gles::driverless` has
-//! each answer's source). The engine's own sequence, MEASURED in the gate (2.739.691): `eglGetDisplay`
-//! then `eglGetError`, then `Mode 4 failed: Error creating context: eglGetDisplay 300c`.
+//! each answer's source). The engine's own sequence, MEASURED in the gate (on the modified
+//! 2.739.691 build): `eglGetDisplay` then `eglGetError`, then
+//! `Mode 4 failed: Error creating context: eglGetDisplay 300c`.
 
 mod harness;
 

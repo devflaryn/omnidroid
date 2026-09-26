@@ -160,7 +160,8 @@ pub fn admit(
     // **An access may also span mappings, provided every byte is mapped and permits it.** Linux
     // checks an access page by page, not mapping by mapping: a `memset` that runs from a library's
     // last file-backed page into the anonymous `.bss` mapped straight after it is an ordinary
-    // write on a device. MEASURED: Roblox 2.739.691's `init_array[188]` (link `0x1df98b0`) does
+    // write on a device. MEASURED on the modified 2.739.691 build (a different `libroblox.so` from
+    // the stock fixture's): its `init_array[188]` (link `0x1df98b0`) does
     // exactly that -- 256 bytes at link `0x68b8fd8`, across the seam at `0x68b9000` between the
     // third `PT_LOAD`'s tail page and its `.bss` -- and this check used to refuse it as
     // `NotMapped`, which stopped the whole engine before its first frame. Crossing **free space**

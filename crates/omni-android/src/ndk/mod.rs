@@ -1,7 +1,7 @@
 //! The NDK surface: `ALooper`, `AAssetManager`, `AConfiguration` and `ANativeWindow`.
 //!
 //! The third thing in this crate that the guest reaches, after the bionic adapter and the JNI
-//! tables, and the first that is neither. `libroblox.so` imports **32** `libandroid.so` /
+//! tables, and the first that is neither. `libroblox.so` imports **27** `libandroid.so` /
 //! `libnativewindow.so` symbols (`apk-analysis.md` §4.4) in four families, and **none of them is
 //! among the 188 the static initializers reach** — every one is reached from
 //! `Java_com_google_androidgamesdk_GameActivity_initializeNativeCode` or from the game thread it

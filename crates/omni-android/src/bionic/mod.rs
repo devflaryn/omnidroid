@@ -323,9 +323,9 @@ pub struct Bionic {
     ///
     /// **`None` until the embedding says, and a socket cannot be created without one** — the same
     /// shape as the filesystem root (D23), the thread host (D24) and the memory budget, and for
-    /// the same reason in a case where it matters more: D6 records that the APK under test is
-    /// cheat-injected and carries a Luau executor, so a default would hand untrusted guest code a
-    /// host socket nobody decided to open. See [`Bionic::set_network_policy`].
+    /// the same reason in a case where it matters more: guest code is untrusted by design (D6),
+    /// so a default would hand untrusted guest code a host socket nobody decided to open. See
+    /// [`Bionic::set_network_policy`].
     ///
     /// A `OnceLock` for [`Bionic::fs`]'s reason: a policy that changed while the guest ran would
     /// leave a socket created under one set of rules being used under another, which is a
@@ -1594,10 +1594,9 @@ impl Bionic {
     /// sentence [`set_filesystem_root`](Bionic::set_filesystem_root) makes about directories and
     /// is the shape D30 chose deliberately. Global Constraint 8 said "no network access at run
     /// time"; the project owner withdrew it because playable Roblox needs login, settings and a
-    /// game server. What replaced it is **not an open socket**: D6's threat is unchanged — the
-    /// APK under test is cheat-injected and carries a Luau executor — so which destinations an
-    /// instance may reach became a question an embedding answers, exactly as which host directory
-    /// it may read already was.
+    /// game server. What replaced it is **not an open socket**: D6 is unchanged — guest code
+    /// is untrusted by design — so which destinations an instance may reach became a question an
+    /// embedding answers, exactly as which host directory it may read already was.
     ///
     /// `set_filesystem_root` never meant "the guest gets no files"; this does not mean "the guest
     /// gets no network". It means every `connect`, every `sendto` and every name looked up goes
@@ -1772,10 +1771,11 @@ impl Bionic {
     ///
     /// Most of it is **not** the code cache: the same `omni-cpu` measurement at 8, 32 and 128 MiB
     /// of cache gives 24.56, 34.61 and 34.61 MiB/thread, so shrinking the cache does not help.
-    /// 16 MiB of it is a fixed fast-dispatch table `A64EmitX64` holds by value and **writes in
+    /// 16 MiB of it was a fixed fast-dispatch table `A64EmitX64` held by value and **wrote in
     /// its constructor** for a feature D16 runs **disabled** —
-    /// `crates/dynarmic-sys/patches/README.md` item 4 has the patch, and it is **not applied**,
-    /// because D5 pins the vendored tree byte-for-byte unmodified.
+    /// `crates/dynarmic-sys/patches/README.md` item 4, since applied as patch 0017 (the table
+    /// exists only with fast dispatch on) and shrunk to 64 KiB by 0019. The figures in this
+    /// paragraph predate both.
     ///
     /// **What comes back is the figure the multi-instance requirement turns on, and it is 98.6%**:
     /// after the eight threads were joined, the residual over the pre-thread baseline was 2.79 to

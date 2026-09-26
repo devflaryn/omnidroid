@@ -19,7 +19,10 @@
 //! thread died, and the host had delivered no window callback -- the only ones a session made were
 //! the startup rows and a resize.
 //!
-//! # What the engine rebuilds its swapchain on -- DECODED on 2.739 (link addresses)
+//! # What the engine rebuilds its swapchain on -- DECODED on the modified 2.739.691 build
+//!
+//! Link addresses below are that build's `libroblox.so`, a different binary from the stock
+//! fixture's.
 //!
 //! * **Out of date is logged, not acted on.** Acquire (`0x28405a4`) logs any non-zero result and
 //!   returns -1, and the frame goes to a fallback framebuffer; present (`0x2853d04`) logs a

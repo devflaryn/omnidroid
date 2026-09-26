@@ -4,7 +4,7 @@
     python tools/mutate.py --only mem    # one prefix
     python tools/mutate.py --list
 
-Global Constraint 12: a test that does not fail when the logic it covers is reverted is not
+Global Constraint 13: a test that does not fail when the logic it covers is reverted is not
 evidence. `crates/omni-elf/tools/mutate_loader.py` made that checkable for the loader; this is the
 generalisation the whole-branch review asked for — it takes a table of (file, old, new, command)
 rather than being loader-shaped, so a new fix anywhere in the workspace costs one table row.
@@ -2551,7 +2551,7 @@ MUTATIONS = [
      BIONIC),
     # ---- phase 3b: the confinement -------------------------------------------------------------
     # The rules in `fs::path` are the whole of what stops a guest opening an arbitrary host file,
-    # and the APK under test is cheat-injected (D6). Each row removes one of them.
+    # and guest code is untrusted by design (D6). Each row removes one of them.
 
     ("fs-A1", "A", "the lexical `..` pop removed, so a traversal reaches the host", PLAT_FS_PATH,
      """                components.pop();""",
@@ -6609,7 +6609,7 @@ directory", ADAPTER_FILES,
     #
     # Every row here has the same failure mode and it is why the prefix exists: **a wrong socket
     # option number is accepted by the host**. There is no error, no log line and no test that
-    # merely calls the function can see it -- which is exactly the shape `VERIFICATION.md` rule 1
+    # merely calls the function can see it -- which is exactly the shape Global Constraint 1
     # is about, one layer lower than a stub.
 
     ("sockcfg-A1", "A", "the guest's TCP_KEEPIDLE is routed to the probe INTERVAL instead of the idle time",

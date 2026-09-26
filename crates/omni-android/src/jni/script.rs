@@ -20,8 +20,9 @@
 //! # What a device on this path never sends: the display's refresh rate
 //!
 //! [`NEVER_SENT`] names two natives this script deliberately does **not** call, although the engine
-//! has a place for what they carry. DECODED on 2.739.691 (`classes2.dex`, `libroblox.so` link
-//! addresses), so nobody adds them, or a host query to feed them, again:
+//! has a place for what they carry. DECODED on the modified 2.739.691 build (`classes2.dex`,
+//! `libroblox.so` link addresses; a different `libroblox.so` from the stock fixture's), so nobody
+//! adds them, or a host query to feed them, again:
 //!
 //! * **Only `MainScreenController` (`fi.r0`) calls them.** `fi.r0.h` gets `DisplayManager`
 //!   (`Context.getSystemService("display")`), registers `fi.r0$a` as a display listener, takes
@@ -75,7 +76,7 @@
 //!
 //! # The name mangling is the short form, and that is measured rather than assumed
 //!
-//! Section G of the lists file tags each of the 706 dex natives `SHORT`, `LONG` or `REGISTER`.
+//! Section G of the lists file tags each of the 700 dex natives `SHORT`, `LONG` or `REGISTER`.
 //! Every method in this table is tagged **`SHORT:libroblox.so`** — a statically exported
 //! `Java_<class>_<method>` with no argument suffix — so [`mangle`] is the short form and
 //! `the_scripted_symbols_are_the_short_mangling_of_their_members` checks each entry against it.

@@ -85,8 +85,8 @@
 //! installed at startup (it is, in every Rust binary), sized `max(SIGSTKSZ, AT_MINSIGSTKSZ)`, which
 //! is 8 KiB on this host plus a guard page; dynarmic gives the thread that builds the first jit a
 //! 2 MiB one. The pager path's real need was **measured** against that, not assumed:
-//! `tests/fault_linux.rs` paints an alternate stack, serves a real demand fault through the whole
-//! `DemandPager` path on it, and reads the high-water mark back. The figure is in
+//! `omni-mem/tests/pager_linux` paints an alternate stack, serves a real demand fault through the
+//! whole `DemandPager` path on it, and reads the high-water mark back. The figure is in
 //! `docs/ports/linux-notes/mem.md`.
 
 use core::cell::Cell;

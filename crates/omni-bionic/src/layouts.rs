@@ -12,7 +12,7 @@
 //! 1. **Android NDK header arithmetic** — the sizes below equal `sizeof(struct)` for the
 //!    public definitions in bionic's `libc/include/pthread.h` (VERIFIED by reading the
 //!    committed APK research files in this repo and the upstream NDK definitions via
-//!    documented NDK API tables; see the report, §2, for the per-constant argument).
+//!    documented NDK API tables; each constant below states its own argument).
 //! 2. **`docs/research/jni-surface-lists.txt`** (VERIFIED, this repo): a real
 //!    `android_app` layout from the engine's own dependencies places
 //!    `pthread_mutex_t mutex` at `+0xc8` and `pthread_cond_t cond` at `+0xf0` — a gap of
@@ -37,7 +37,7 @@
 pub mod sizes {
     /// `sizeof(pthread_mutex_t)` — bionic LP64: `int32_t __private[10]`.
     /// Confidence: HIGH (NDK header arithmetic + VERIFIED 40-byte gap in
-    /// `docs/research/jni-surface-lists.txt` line 2195→2196: 0xf0−0xc8 = 0x28 = 40).
+    /// `docs/research/jni-surface-lists.txt` line 2186→2187: 0xf0−0xc8 = 0x28 = 40).
     pub const PTHREAD_MUTEX_T: u64 = 40;
 
     /// `sizeof(pthread_cond_t)` — bionic LP64: `int32_t __private[12]`.

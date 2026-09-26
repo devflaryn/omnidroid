@@ -349,8 +349,8 @@ pub fn atoll(ctx: &mut impl GuestContext, s: u64) -> Result<i64, BionicError> {
 /// The magnitude is built as an exact decimal `mantissa * 10^exp10` (or hex
 /// `mantissa * 2^exp2`) using integer arithmetic, then correctly rounded to the target
 /// type by a single f64 conversion of the (possibly rescaled) value. This is the
-/// Clinger/Ryd-style correct path for the common cases; see the report for the precision
-/// argument and the known limitation for very long inputs.
+/// Clinger/Ryd-style correct path for the common cases; `docs/research/bionic-pure-report.md`
+/// §4 has the precision figure.
 struct FloatParsed {
     /// Value as f64 (caller narrows to f32 for strtof).
     value: f64,
@@ -719,16 +719,12 @@ pub fn atof(ctx: &mut impl GuestContext, s: u64) -> Result<f64, BionicError> {
 
 /// `void srand(unsigned int seed)` — seeds the guest's rand state through the context.
 ///
-/// bionic's `rand` is a thin wrapper over `arc4random`-backed state in modern versions...
-/// actually no: bionic's `rand`/`srand` are the OpenBSD `arc4random`-seeded pair only for
-/// `rand_r`; the classic bionic `rand` is a *linear congruential generator identical to
-/// glibc's TYPE_3* (the documented `r[i] = 1103515245*r[i-1] + 12345` family). The exact
-/// sequence is NOT specified by any standard; what IS specified: `srand(1)` followed by
-/// `rand()` gives the same sequence on every run (C11 7.22.2.1). Divergence note: this
-/// crate implements the glibc/bionic-compatible LCG with the TYPE_0-style 32-bit update
-/// (r = 1103515245*r + 12345 mod 2^31), whose first values after `srand(1)` are the
-/// classic 1804289383, 846930886, ... sequence. Verified against that published sequence;
-/// full bionic bit-exactness is NOT claimed (see report §6).
+/// The exact `rand` sequence is NOT specified by any standard; what IS specified: `srand(1)`
+/// followed by `rand()` gives the same sequence on every run (C11 7.22.2.1). This crate
+/// implements the TYPE_0-style LCG `r = (1103515245*r + 12345) mod 2^31`, whose first values
+/// after `srand(1)` are 1103527590, 377401575, 662824084, ... (pinned in
+/// `tests/numerics_tests.rs`; glibc's 1804289383, 846930886, ... is a different generator).
+/// Full bionic bit-exactness is NOT claimed (`docs/research/bionic-pure-report.md` §4).
 pub fn srand(ctx: &mut impl GuestContext, seed: u32) {
     ctx.set_rand_state(seed & 0x7FFF_FFFF);
 }

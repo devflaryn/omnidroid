@@ -125,14 +125,14 @@
 //!
 //! # No refresh-rate query, on purpose
 //!
-//! This seam does not report the refresh rate of the monitor the window is on, although every
-//! host could answer (`EnumDisplaySettingsW`, `NSScreen.maximumFramesPerSecond`, an XRandR mode).
-//! The only consumer would be a guest's display refresh rate. On the path this runtime runs, a
-//! device never sends one to the engine: only `ActivityNativeMain`'s `MainScreenController` calls
+//! This seam does not report the refresh rate of the monitor the window is on, although every host
+//! could answer (`EnumDisplaySettingsW`, `NSScreen.maximumFramesPerSecond`, an XRandR mode). The
+//! only consumer would be a guest's display refresh rate. On the path this runtime runs, a device
+//! never sends one to the engine: only `ActivityNativeMain`'s `MainScreenController` calls
 //! `nativePassCurrentDisplayRefreshRate` / `nativePassSupportedRefreshRates`, and the engine has no
-//! other source. DECODED on 2.739.691; `omni-android`'s `jni::script` module doc has the addresses,
-//! and its `NEVER_SENT` has the test. The query has now been written and removed twice. Add it only
-//! together with a consumer that a device on that path actually has.
+//! other source. DECODED on the modified 2.739.691 build; `omni-android`'s `jni::script` module doc
+//! has the addresses, and its `NEVER_SENT` has the test. The query has now been written and removed
+//! twice. Add it only together with a consumer that a device on that path actually has.
 
 use core::fmt;
 use core::time::Duration;

@@ -1858,17 +1858,18 @@ impl Vulkan {
     /// for a surface whose window is gone (AOSP `swapchain.cpp`, a `DEAD_OBJECT` from the window).
     /// For an embedding whose window has no pixels: a minimised one.
     ///
-    /// DECODED on 2.739 why this, and not the driver's own answer, is what a minimised window
-    /// should give the engine. Every frame, the engine's swapchain check (`0x2790a34`) asks the
-    /// capabilities; **a failed query destroys the main framebuffer** (`0x2790b0c`, logging
-    /// `Vulkan: destroying window frame buffer` once), and with no framebuffer `beginFrame`
-    /// (`0x27de770`) returns nothing and the frame skips recording, acquire, `vkQueueSubmit` and
-    /// present (`0x27da27c`) -- the game ticks on and draws nothing. The driver's own answer for a
-    /// minimised Win32 window is a 0x0 extent, which the check returns on (`0x2790b64`) with the
-    /// framebuffer kept, so every frame is still recorded and submitted: to an image when the
-    /// acquire works, to the fallback framebuffer (`dev+0x810`) when it answers out of date. **And
-    /// the first query answered again rebuilds the swapchain** -- a null framebuffer is one of the
-    /// check's three rebuild conditions -- so a restore needs nothing else.
+    /// DECODED on the modified 2.739.691 build (link addresses are that build's) why this, and not
+    /// the driver's own answer, is what a minimised window should give the engine. Every frame, the
+    /// engine's swapchain check (`0x2790a34`) asks the capabilities; **a failed query destroys the
+    /// main framebuffer** (`0x2790b0c`, logging `Vulkan: destroying window frame buffer` once), and
+    /// with no framebuffer `beginFrame` (`0x27de770`) returns nothing and the frame skips
+    /// recording, acquire, `vkQueueSubmit` and present (`0x27da27c`) -- the game ticks on and draws
+    /// nothing. The driver's own answer for a minimised Win32 window is a 0x0 extent, which the
+    /// check returns on (`0x2790b64`) with the framebuffer kept, so every frame is still recorded
+    /// and submitted: to an image when the acquire works, to the fallback framebuffer (`dev+0x810`)
+    /// when it answers out of date. **And the first query answered again rebuilds the swapchain**
+    /// -- a null framebuffer is one of the check's three rebuild conditions -- so a restore needs
+    /// nothing else.
     pub fn set_surface_withheld(&self, withheld: bool) {
         self.state.lock().surface_withheld = withheld;
     }

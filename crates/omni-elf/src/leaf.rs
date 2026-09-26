@@ -685,7 +685,7 @@ mod tests {
     }
 
     /// **Global Constraint 11, on the classifier itself.** The bytes it decodes come from a 109 MB
-    /// file this project already knows is adversarially modified (D6), and a classifier that
+    /// file that is untrusted by design (D6), and a classifier that
     /// panicked on a hostile body would turn a static scan into a crash.
     ///
     /// Two properties over a deterministic sweep of the whole encoding space at a stride that hits

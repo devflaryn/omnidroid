@@ -1337,13 +1337,13 @@ pub(super) fn pthread_cond_timedwait(c: &mut ImportCall<'_, '_>) -> AbiResult<()
     let budget = absolute.saturating_sub(now);
     // **No cap on the deadline: a long one is waited on in slices.** This used to refuse any
     // deadline more than `MAX_SLEEP_SECONDS` out, and the refusal killed the thread. MEASURED on
-    // the real engine (2.739.691, 2026-09-24): about 5 s after the join call, the worker started
-    // at link `0x22d457c` waits ~120 s here, and in 6 of 8 runs its death meant the join never
-    // started -- the loading screen stayed for ever. What the cap protected is kept without it:
-    // `cond::wait_end` parks for at most `cond::WAIT_SLICE` at a time and re-reads its mark and
-    // the stop switch between slices, and `Bionic::stop_guest_threads` wakes every cond waiter,
-    // so a long wait never holds teardown. ETIMEDOUT is answered only at the real deadline --
-    // the reason clamping was rejected still stands.
+    // the real engine (the modified 2.739.691 build, 2026-09-24): about 5 s after the join call,
+    // the worker started at that build's link `0x22d457c` waits ~120 s here, and in 6 of 8 runs its
+    // death meant the join never started -- the loading screen stayed for ever. What the cap
+    // protected is kept without it: `cond::wait_end` parks for at most `cond::WAIT_SLICE` at a time
+    // and re-reads its mark and the stop switch between slices, and `Bionic::stop_guest_threads`
+    // wakes every cond waiter, so a long wait never holds teardown. ETIMEDOUT is answered only at
+    // the real deadline -- the reason clamping was rejected still stands.
 
     // **Read before anything runs, and only ever printed.** `X29`/`X30` are the guest's own,
     // so the walk defends itself rather than trusting them; see `omni_bionic::unwind::frames`.

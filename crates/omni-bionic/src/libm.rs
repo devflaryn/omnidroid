@@ -393,7 +393,7 @@ pub fn frexp(
 /// FP_ILOGBNAN as INT_MAX? glibc uses INT_MAX for ilogb(NaN)? POSIX leaves both choices;
 /// bionic's <math.h> sets FP_ILOGB0 = (-2147483647-1) and FP_ILOGBNAN = (-2147483647-1)
 /// — VERIFIED against bionic's `libm/include/math.h` (INT_MIN); documented divergence
-/// from glibc's INT_MAX in the report. No errno.
+/// from glibc's INT_MAX in `docs/research/bionic-pure-report.md` §4. No errno.
 pub fn ilogb(x: f64) -> i32 {
     if x == 0.0 {
         return i32::MIN; // FP_ILOGB0

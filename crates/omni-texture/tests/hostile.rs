@@ -1,6 +1,6 @@
 //! Hostile input is the expected case, not an edge case.
 //!
-//! Texture payloads reach this crate from the guest, and the test APK is cheat-injected (D6): a
+//! Texture payloads reach this crate from the guest, and guest code is untrusted by design (D6): a
 //! truncated block array, a bogus block mode, a dimension chosen to overflow the size arithmetic.
 //! None of these may panic, abort or read out of bounds -- a reachable panic is Critical, and an
 //! abort cannot be contained by any caller (HANDOFF working agreement 1).

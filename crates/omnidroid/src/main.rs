@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p omnidroid -- play                      # the newest APK in the repository root
-//! cargo run --release -p omnidroid -- play --apk Roblox-2.739.691.apk
+//! cargo run --release -p omnidroid -- play --apk Roblox-2.738.1397.apk
 //! cargo run --release -p omnidroid -- play --minutes 90 --fresh --phone
 //! cargo run --release -p omnidroid -- play --place 8737899170     # sign-in kept, then join the place
 //! cargo run --release -p omnidroid -- play --cookie farm4.txt --place 8737899170  # sign in as that account

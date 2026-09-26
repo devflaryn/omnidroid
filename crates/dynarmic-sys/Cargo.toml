@@ -15,8 +15,9 @@ build = "build.rs"
 
 [features]
 # Build dynarmic's code cache W^X rather than PAGE_EXECUTE_READWRITE. Off by
-# default because it is off upstream; see `README.md` for what it costs and
-# what leaving it off contradicts.
+# default because it is off upstream, and refused unless
+# OMNIDROID_DYNARMIC_ALLOW_BROKEN_WX=1 because it crashes on this pin: see
+# `README.md` item 4 (W^X) and `patches/README.md` "Known candidates" item 3.
 w-xor-x = []
 
 [build-dependencies]

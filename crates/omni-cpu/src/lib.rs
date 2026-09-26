@@ -1,7 +1,9 @@
 //! The [`GuestCpu`] trait: one guest thread's ARM64 CPU, behind an interface the rest of the
 //! runtime can hold without knowing which backend it has.
 //!
-//! No backend yet. This crate is the seam, and the seam is the load-bearing part.
+//! Two backends: `dynarmic`, the translating one (default feature, x86-64 and arm64 hosts), and
+//! `native`, Hypervisor.framework on Apple silicon (`native-hvf`, measured, not adopted: D34).
+//! This crate is the seam, and the seam is the load-bearing part.
 //!
 //! # What the seam has to survive
 //!

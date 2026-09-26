@@ -14,8 +14,9 @@
 //!
 //! # What the engine does with these answers: measured
 //!
-//! With `eglGetDisplay` answering `EGL_NO_DISPLAY` and `eglGetError` `EGL_BAD_PARAMETER` (2.739.691,
-//! Windows, 2026-09-25), the engine made exactly those two calls and took its own failure path:
+//! With `eglGetDisplay` answering `EGL_NO_DISPLAY` and `eglGetError` `EGL_BAD_PARAMETER` (the
+//! modified 2.739.691 build, Windows, 2026-09-25), the engine made exactly those two calls and
+//! took its own failure path:
 //!
 //! ```text
 //! [FLog::SurfaceController] Mode 6 failed: Unable to load Vulkan API

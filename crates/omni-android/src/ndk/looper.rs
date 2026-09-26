@@ -63,12 +63,13 @@
 //! rule: it reports a timeout to a call that was given none, which is the believable wrong answer
 //! for this shape.
 //!
-//! # The game loop's `pollOnce(0)`, decoded (APK 2.739.691)
+//! # The game loop's `pollOnce(0)`, decoded (on the modified 2.739.691 build)
 //!
 //! MEASURED on every host: the engine's game thread (guest thread 5) spins for the whole session
 //! at ~95-100% of a core, 3-4.5 M import crossings a second, `ALooper_pollOnce` ~30% and
-//! `pthread_mutex_lock`/`_unlock` ~40% of its samples. This is why, in link addresses of
-//! `libroblox.so` 2.739.691 (2.738.1397's in brackets):
+//! `pthread_mutex_lock`/`_unlock` ~40% of its samples. This is why, in link addresses of the
+//! modified 2.739.691 build's `libroblox.so`, a different binary from the stock fixture's
+//! (2.738.1397's in brackets):
 //!
 //! * `ALooper_pollOnce`'s GOT slot is `0x685fe30`, its PLT stub `0x635f320`, and the stub has
 //!   **one** caller, `0x2bed664` (`0x2bcd648`), inside `NativeEngine::GameLoop` at `0x2bed5c4`

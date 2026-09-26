@@ -2,11 +2,12 @@
 //! measured two ways, because the two ways are M3's actual design decision.
 //!
 //! The only cost figure on the branch before this was "under 53 ns" (D5 amendment 2), and **two
-//! things about it were wrong**. The M3 brief described it as an *entry* ceiling excluding the exit;
-//! `DECISIONS.md:1064-1074` measures "870 entries to **and exits from** `od_jit_run`", so it was
-//! already an entry-and-exit figure. And it is not a ceiling that holds: review measured the same path
-//! at **41.8 / 89.0 / 91.7 ns** in one process, so 53 ns describes the first measurement in a pristine
-//! process and not the ordinary cost. See `z_the_same_entry_and_exit_measured_last`.
+//! things about it were wrong**. The M3 brief described it as an *entry* ceiling excluding the
+//! exit; `DECISIONS.md` D5, risk 1 (amendment 2) measured 870 entries to **and exits from**
+//! `od_jit_run`, so it was already an entry-and-exit figure. And it is not a ceiling that holds:
+//! review measured the same path at **41.8 / 89.0 / 91.7 ns** in one process, so 53 ns describes
+//! the first measurement in a pristine process and not the ordinary cost. See
+//! `z_the_same_entry_and_exit_measured_last`.
 //!
 //! What M3 needs either way is the **round trip**: the guest branches into the thunk region, the host
 //! services the call, the guest resumes. Every one of `libroblox.so`'s imported symbols crosses this

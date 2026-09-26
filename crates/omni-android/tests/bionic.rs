@@ -4678,8 +4678,9 @@ fn madvise_over_one_4k_page_zeroes_it_and_keeps_every_other_page_on_any_host() {
 
 /// **The engine's allocator's own OS calls, with its own arguments, through the guest's imports.**
 ///
-/// DECODED (`libroblox.so` 2.739.691): the heap is mimalloc v3 inside the library, and this is its
-/// whole OS layer -- `mmap(NULL, n, prot, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)`
+/// DECODED (the modified 2.739.691 build's `libroblox.so`, a different binary from the stock
+/// fixture's; addresses are that build's): the heap is mimalloc v3 inside the library, and this is
+/// its whole OS layer -- `mmap(NULL, n, prot, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)`
 /// (`0x1db9770`, `0x4022` once it believes in overcommit), the over-allocate-and-trim fallback for
 /// an unaligned answer (two `munmap`s, `0x1db93b4`), commit as `mprotect(PROT_READ|PROT_WRITE)`
 /// (`0x62ca18c`), purge as `madvise(MADV_DONTNEED)` after which it touches the pages again with no
@@ -14817,10 +14818,10 @@ fn start_a_long_timedwait(f: &Fixture, create: usize, entered: usize) {
 /// **An absolute deadline further out than `MAX_SLEEP_SECONDS` is waited on, not refused**, and a
 /// signal ends it with 0.
 ///
-/// MEASURED on the real engine (2.739.691, 2026-09-24): the join worker started at link
-/// `0x22d457c` waits ~120 s on a cond. This layer refused any deadline past its 60 s cap, the
-/// refusal killed the worker, and the join silently never started in 6 of 8 runs. The deadline
-/// here is twice the cap, derived from the constant so it cannot drift from it.
+/// MEASURED on the real engine (the modified 2.739.691 build, 2026-09-24): the join worker started
+/// at that build's link `0x22d457c` waits ~120 s on a cond. This layer refused any deadline past
+/// its 60 s cap, the refusal killed the worker, and the join silently never started in 6 of 8 runs.
+/// The deadline here is twice the cap, derived from the constant so it cannot drift from it.
 #[test]
 fn an_absolute_deadline_past_the_park_bound_is_waited_on_and_a_signal_ends_it() {
     let _guard = serialized();

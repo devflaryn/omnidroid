@@ -8,7 +8,7 @@ the parsing and bucketing, and every non-obvious placement is an explicit named 
 can be reviewed rather than re-derived.
 
 Source of truth: ``docs/research/apk-undefined-symbols.txt``, section
-``PER-LIBRARY UNDEFINED SYMBOL LISTS``, ``libroblox.so`` block (line 728). It is the
+``PER-LIBRARY UNDEFINED SYMBOL LISTS``, ``libroblox.so`` block (line 705). It is the
 committed enumeration behind ARCHITECTURE section 5 and the same file
 ``tools/init_reach.py`` parses for its provider grouping.
 

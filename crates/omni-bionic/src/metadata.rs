@@ -8,8 +8,7 @@
 //!   mask, which lives behind the CPU/adapter seam (how a blocked signal
 //!   interacts with the emulated CPU's fault delivery is an M4+ decision). A
 //!   plausible stub would silently swallow signal-mask errors the engine's
-//!   watchdog paths depend on. Recorded in the report §1 as excluded-with-
-//!   reason, not forgotten.
+//!   watchdog paths depend on. Excluded with that reason, not forgotten.
 //! * `sched_yield` is a registry-level no-op on a real scheduler: the adapter
 //!   calls `std::thread::yield_now()` on the host thread. The trait hook
 //!   [`Yield::yield_now`] keeps it mockable.

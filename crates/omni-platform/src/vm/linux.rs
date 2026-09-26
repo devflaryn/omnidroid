@@ -1,7 +1,8 @@
 //! Linux backend for the virtual-memory seam.
 //!
 //! Every rule this module encodes was measured on the port host (Linux 7.0, x86-64,
-//! `vm.overcommit_memory = 0`) by the probes in `tests/vm_probe_linux.rs` and recorded in
+//! `vm.overcommit_memory = 0`) by the probes in `omni-mem/tests/probe_linux` and
+//! `omni-platform/tests/vm_commit_charge_linux.rs`, and recorded in
 //! `docs/ports/linux-notes/mem.md`. Where a rule is read from the kernel source rather than
 //! measured, it says so.
 //!

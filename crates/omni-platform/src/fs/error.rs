@@ -203,8 +203,8 @@ pub enum FsError {
     #[error(
         "`{operation}` refused the guest path `{path}`: {why}. Every path this guest can name is \
          resolved inside the instance's own root, because a guest that could open an arbitrary \
-         host file would break the isolation several instances in one process depend on (D6: the \
-         APK under test is cheat-injected, and the executor is treated as hostile)"
+         host file would break the isolation several instances in one process depend on (D6: \
+         guest code is untrusted by design)"
     )]
     Confined {
         /// The seam operation that was called.

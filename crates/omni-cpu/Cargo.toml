@@ -27,8 +27,8 @@ parking_lot = { workspace = true }
 # **Optional, and target-gated, so preflight ruling P1 still holds where it was aimed.** P1 put the
 # dynarmic FFI in its own crate so that `omni-cpu` — and therefore the `GuestCpu` trait — compiles
 # on a host with no C++ toolchain, which is what the ARM64-native path needs. That property is
-# unchanged: on an `aarch64` host this dependency does not exist at all, and on any host
-# `--no-default-features` gives the trait with no backend.
+# unchanged: this dependency is optional behind the `dynarmic` feature, so on any host (an
+# `aarch64` one included) `--no-default-features` gives the trait with no backend and no C++.
 #
 # It is a dependency here, rather than in a later task, because Task 3's deliverables are
 # *assertions about a live configuration* — zero callback-path entries, a startup check that fires,
@@ -82,6 +82,7 @@ dynarmic = ["dep:dynarmic-sys"]
 test-support = []
 # The native backend (`src/native`): Hypervisor.framework, guest at EL0, stage 2 at IPA == VA. arm64
 # hosts only; implemented on macOS on Apple silicon, a typed refusal elsewhere. Off by default and
-# never the default backend: see docs/ports/macos-hvf.md and its D34 draft. Test binaries that use it
-# must be signed with `com.apple.security.hypervisor` (tools/hvf_run.sh as the cargo runner).
+# never the default backend: see docs/ports/macos-hvf.md and docs/DECISIONS.md D34. Test binaries
+# that use it must be signed with `com.apple.security.hypervisor` (tools/hvf_run.sh as the cargo
+# runner).
 native-hvf = ["dep:omni-platform"]
