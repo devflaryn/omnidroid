@@ -58,7 +58,7 @@ whether Roblox's integrity check passes.
 | Sampling profiler (`OMNI_PERF`) | verified on Windows, Linux x86-64 | macOS arm64 backend built |
 | Multi-instance | partial | one process each works (Windows 3, Mac 4 of 4, Linux 4 before swapping on 7 GiB); per instance ~2.5 GiB and ~0.6 cores capped (H2) against a 0.8-0.9 GiB target |
 | `omni-core`, `omni-cli` | not started | the embedding lives in the gate test (ARCHITECTURE §2) |
-| Linux personality (`omni-linux`, D39) | partial: A1 verified on Windows | the real AOSP 15 `toybox` runs through the real `linker64` and bionic to exit 0 (`tests/a1_toybox.rs`); Linux and macOS not yet run; A2-A5 (procfs, properties, threads, signal delivery) not started |
+| Linux personality (`omni-linux`, D39) | partial: A1, A2 verified on Windows | the real AOSP 15 `toybox` runs through the real `linker64` and bionic to exit 0 (`tests/a1_toybox.rs`); in-loop syscall 43.8-50.1 ns per call including a 3-instruction loop, measured with other builds running (target <= 40 ns; `omni-cpu/tests/svc.rs`, re-measure quiet); Linux and macOS not yet run; A2: the real `ls -l`, `cat /proc/self/maps` and `ps -A` (`tests/a2_proc.rs`), `/proc` and `/sys` generated (`procfs`); A3-A5 (properties, threads, signal delivery) not started |
 
 ## Measured figures decisions rest on
 

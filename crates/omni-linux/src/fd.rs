@@ -40,6 +40,8 @@ pub enum FileKind {
     Stdin,
     Stdout(Output),
     Stderr(Output),
+    /// A generated file (`/proc`, `/sys`): its bytes, taken when it was opened.
+    Synth { data: Vec<u8>, guest: Vec<u8>, pos: usize },
 }
 
 pub struct OpenFile {
@@ -60,6 +62,12 @@ impl FdTable {
         fds.insert(1, (file(FileKind::Stdout(stdout)), false));
         fds.insert(2, (file(FileKind::Stderr(stderr)), false));
         Self { fds: Mutex::new(fds) }
+    }
+
+    /// Every open descriptor, lowest first.
+    #[must_use]
+    pub fn list(&self) -> Vec<(i32, Arc<OpenFile>)> {
+        self.fds.lock().iter().map(|(fd, (f, _))| (*fd, Arc::clone(f))).collect()
     }
 
     pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
@@ -135,6 +143,13 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
         Node::Dev(d) => FileKind::Dev(d),
+        Node::Generated => {
+            if write {
+                return Err(EACCES);
+            }
+            let data = vfs.read_generated(&r.path).ok_or(ENOENT)?;
+            FileKind::Synth { data, guest: r.path.clone(), pos: 0 }
+        }
         Node::Symlink { .. } => return Err(ELOOP), // O_NOFOLLOW on a link
     };
     Ok(OpenFile { kind: Mutex::new(kind), flags: Mutex::new(flags & !O_CLOEXEC) })
@@ -179,6 +194,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::SysFile { size, mode } => s(S_IFREG | mode, *size as i64),
         Node::HostFile { host } => s(S_IFREG | 0o600, std::fs::metadata(host).map_err(|_| EIO)?.len() as i64),
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
+        Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109 }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
@@ -200,6 +216,7 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => {
             Ok(Stat { ino: 1, mode: S_IFCHR | 0o620, nlink: 1, rdev: 0x8800, ..Stat::default() })
         }
+        FileKind::Synth { guest, .. } => stat_node(&Resolved { path: guest.clone(), node: Node::Generated }),
     }
 }
 
@@ -226,6 +243,15 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         }
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Stdout(_) | FileKind::Stderr(_) => Err(EBADF),
+        FileKind::Synth { data, pos, .. } => {
+            let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
+            let n = buf.len().min(data.len() - from);
+            buf[..n].copy_from_slice(&data[from..from + n]);
+            if at.is_none() {
+                *pos = from + n;
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -257,6 +283,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Host { .. } | FileKind::Stdin => Err(EBADF),
         FileKind::Dev(_) => Ok(bytes.len()),
         FileKind::Dir { .. } => Err(EISDIR),
+        FileKind::Synth { .. } => Err(EACCES),
     }
 }
 
@@ -362,6 +389,17 @@ fn sys_lseek(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         FileKind::Dev(_) => Ok(0),
+        FileKind::Synth { data, pos, .. } => {
+            let base = match a[2] {
+                0 => 0i64,
+                1 => *pos as i64,
+                2 => data.len() as i64,
+                _ => return Err(EINVAL),
+            };
+            let to = base.checked_add(a[1] as i64).filter(|t| *t >= 0).ok_or(EINVAL)?;
+            *pos = to as usize;
+            Ok(to as u64)
+        }
         _ => Err(ESPIPE),
     }
 }
@@ -392,9 +430,9 @@ fn sys_newfstatat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 /// The guest path an open descriptor names, as `/proc/self/fd/N` reports it.
-fn guest_path_of(file: &OpenFile) -> Vec<u8> {
+pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
     match &*file.kind.lock() {
-        FileKind::Host { guest, .. } => guest.clone(),
+        FileKind::Host { guest, .. } | FileKind::Synth { guest, .. } => guest.clone(),
         FileKind::Dir { dir, .. } => dir.path.clone(),
         FileKind::Dev(DevNode::Null) => b"/dev/null".to_vec(),
         FileKind::Dev(DevNode::Zero) => b"/dev/zero".to_vec(),
@@ -406,14 +444,6 @@ fn guest_path_of(file: &OpenFile) -> Vec<u8> {
 
 fn sys_readlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
-    if let Some(n) = path.strip_prefix(b"/proc/self/fd/") {
-        // The descriptor table is the process's, not the filesystem's: answered here.
-        let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok()).ok_or(ENOENT)?;
-        let target = guest_path_of(&*p.fds.get(fd).map_err(|_| ENOENT)?);
-        let n = target.len().min(a[3] as usize);
-        p.mem.write(a[2], &target[..n])?;
-        return Ok(n as u64);
-    }
     let base = base_dir(p, a[0], &path)?;
     match p.vfs.resolve(&base, &path, false)?.node {
         Node::Symlink { target } => {

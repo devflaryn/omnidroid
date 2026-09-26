@@ -107,3 +107,40 @@ f	644	3	abcdef	/x
     assert_eq!(root.host_path(b"/x"), Some(PathBuf::from("root").join("objects").join("ab").join("abcdef")));
     assert_eq!(root.host_path(b"/"), None, "a directory has no content");
 }
+
+/// A stand-in `/proc` with one generated file, for resolution and listing.
+pub struct FakeProc;
+
+impl omni_linux::procfs::ProcFs for FakeProc {
+    fn node(&self, path: &[u8]) -> Option<Node> {
+        match path {
+            b"/proc" => Some(Node::Dir),
+            b"/proc/fake" => Some(Node::Generated),
+            _ => None,
+        }
+    }
+    fn list(&self, path: &[u8]) -> Vec<omni_linux::vfs::DirEnt> {
+        if path == b"/proc" {
+            vec![omni_linux::vfs::DirEnt { name: b"fake".to_vec(), kind: omni_linux::vfs::DT_REG, ino: 7 }]
+        } else {
+            Vec::new()
+        }
+    }
+    fn read(&self, path: &[u8]) -> Option<Vec<u8>> {
+        (path == b"/proc/fake").then(|| b"0123456789".to_vec())
+    }
+}
+
+#[test]
+fn an_attached_procfs_answers_for_proc() {
+    let v = vfs();
+    let fake: std::sync::Arc<dyn omni_linux::procfs::ProcFs> = std::sync::Arc::new(FakeProc);
+    v.attach_proc(std::sync::Arc::downgrade(&fake));
+    let r = v.resolve(b"/", b"/proc/fake", true).expect("resolves");
+    assert_eq!(r.node, Node::Generated);
+    let dir = v.resolve(b"/", b"/proc", true).expect("dir");
+    let names: Vec<_> = v.list(&dir).expect("list").into_iter().map(|e| e.name).collect();
+    assert_eq!(names, [b"fake".to_vec()]);
+    assert_eq!(v.read_generated(b"/proc/fake").as_deref(), Some(&b"0123456789"[..]));
+    assert!(matches!(v.resolve(b"/", b"/proc/other", true).expect("missing").node, Node::Missing { .. }));
+}

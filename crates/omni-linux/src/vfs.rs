@@ -116,6 +116,8 @@ pub enum Node {
     HostDir { host: PathBuf },
     Symlink { target: Vec<u8> },
     Dev(DevNode),
+    /// A regular file whose bytes are generated when it is opened (`/proc`, `/sys`).
+    Generated,
     /// The final component does not exist. `host` is where it would be created, on a writable mount.
     Missing { parent_is_dir: bool, host: Option<PathBuf> },
 }
@@ -143,6 +145,12 @@ pub struct Vfs {
     sysroot: Arc<Sysroot>,
     writable: Vec<(Vec<u8>, PathBuf)>,
     exe: Vec<u8>,
+    /// `/proc` and `/sys`, once the process exists (`attach_proc`).
+    proc: std::sync::OnceLock<std::sync::Weak<dyn crate::procfs::ProcFs>>,
+}
+
+fn is_generated_tree(path: &[u8]) -> bool {
+    [&b"/proc"[..], b"/sys"].iter().any(|root| path == *root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/')))
 }
 
 fn join(components: &[Vec<u8>]) -> Vec<u8> {
@@ -159,7 +167,28 @@ fn split(path: &[u8]) -> Vec<Vec<u8>> {
 impl Vfs {
     #[must_use]
     pub fn new(sysroot: Arc<Sysroot>, writable: Vec<(Vec<u8>, PathBuf)>, exe: Vec<u8>) -> Self {
-        Self { sysroot, writable, exe }
+        Self { sysroot, writable, exe, proc: std::sync::OnceLock::new() }
+    }
+
+    /// Hand `/proc` and `/sys` to `proc`. Only the first attachment counts.
+    pub fn attach_proc(&self, proc: std::sync::Weak<dyn crate::procfs::ProcFs>) {
+        let _ = self.proc.set(proc);
+    }
+
+    fn procfs(&self) -> Option<Arc<dyn crate::procfs::ProcFs>> {
+        self.proc.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// The bytes of a generated file, produced now.
+    #[must_use]
+    pub fn read_generated(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.procfs()?.read(path)
+    }
+
+    /// The executable's guest path (`/proc/<pid>/exe`).
+    #[must_use]
+    pub fn exe(&self) -> &[u8] {
+        &self.exe
     }
 
     #[must_use]
@@ -169,6 +198,11 @@ impl Vfs {
 
     /// The node at an already-normalized absolute path, without following a final symlink.
     fn lookup(&self, path: &[u8]) -> Option<Node> {
+        if is_generated_tree(path) {
+            if let Some(proc) = self.procfs() {
+                return proc.node(path);
+            }
+        }
         match path {
             b"/dev" | b"/proc" | b"/proc/self" => return Some(Node::Dir),
             b"/dev/null" => return Some(Node::Dev(DevNode::Null)),
@@ -266,6 +300,9 @@ impl Vfs {
             p
         };
         match &dir.node {
+            Node::Dir if is_generated_tree(&dir.path) && self.procfs().is_some() => {
+                Ok(self.procfs().expect("attached").list(&dir.path))
+            }
             Node::Dir => {
                 let mut out = Vec::new();
                 let synthetic: &[&[u8]] = match dir.path.as_slice() {
