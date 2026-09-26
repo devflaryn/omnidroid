@@ -197,16 +197,37 @@ pub(super) fn query_string(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call)
 /// extension gets them unchanged.
 pub(super) fn choose_config(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
     let list_at = call.lanes[1];
-    if list_at == 0 {
+    // **A headless window's surface is a pbuffer** (`RawWindow::Headless`): the configs asked for
+    // are the ones that can back one -- `EGL_SURFACE_TYPE`'s `EGL_WINDOW_BIT` becomes
+    // `EGL_PBUFFER_BIT`, and a list without it (whose default is `EGL_WINDOW_BIT`) gets it. A
+    // display with no window system has no window-capable config at all.
+    let headless = matches!(instance_window(call), Ok(RawWindow::Headless { .. }));
+    if list_at == 0 && !headless {
         return gles.forward(c, call);
     }
-    let list = read_attributes(c, call, 1, list_at)?;
+    let mut list = if list_at == 0 { vec![EGL_NONE] } else { read_attributes(c, call, 1, list_at)? };
+    let original = list.clone();
+    if headless {
+        pbuffer_configs(&mut list);
+        gles.note(
+            "eglChooseConfig",
+            "EGL_SURFACE_TYPE: EGL_PBUFFER_BIT for EGL_WINDOW_BIT -- the window is headless, its \
+             surface a pbuffer"
+                .to_string(),
+        );
+    }
     let android: Vec<usize> = (0..list.len() - 1)
         .step_by(2)
         .filter(|&i| ANDROID_CONFIG_ATTRIBUTES.iter().any(|(a, _, _)| *a == list[i]))
         .collect();
     if android.is_empty() {
-        return gles.forward(c, call);
+        if list == original {
+            return gles.forward(c, call);
+        }
+        let lanes = [call.lanes[0], list.as_ptr() as u64, call.lanes[2], call.lanes[3], call.lanes[4]];
+        let r = gles.host_call(call, "eglChooseConfig", &lanes)?;
+        write_return(c, call.signature, r);
+        return Ok(());
     }
     let extensions = display_extensions(gles, call, call.lanes[0])?;
     let mut kept = Vec::with_capacity(list.len());
@@ -233,13 +254,39 @@ pub(super) fn choose_config(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call
         }
         i += 2;
     }
-    if kept.len() == list.len() {
+    if kept == original {
         return gles.forward(c, call);
     }
     let lanes = [call.lanes[0], kept.as_ptr() as u64, call.lanes[2], call.lanes[3], call.lanes[4]];
     let r = gles.host_call(call, "eglChooseConfig", &lanes)?;
     write_return(c, call.signature, r);
     Ok(())
+}
+
+/// `EGL_SURFACE_TYPE`.
+pub const EGL_SURFACE_TYPE: i32 = 0x3033;
+/// `EGL_PBUFFER_BIT`, `EGL_WINDOW_BIT`.
+pub const EGL_PBUFFER_BIT: i32 = 0x0001;
+/// `EGL_WINDOW_BIT`.
+pub const EGL_WINDOW_BIT: i32 = 0x0004;
+
+/// An `EGL_NONE`-terminated config list asking for pbuffer configs where it asked for window ones.
+pub fn pbuffer_configs(list: &mut Vec<i32>) {
+    let mut i = 0;
+    while i + 1 < list.len() && list[i] != EGL_NONE {
+        if list[i] == EGL_SURFACE_TYPE {
+            let value = list[i + 1];
+            if value & EGL_WINDOW_BIT != 0 {
+                list[i + 1] = (value & !EGL_WINDOW_BIT) | EGL_PBUFFER_BIT;
+            }
+            return;
+        }
+        i += 2;
+    }
+    // Absent: the default is EGL_WINDOW_BIT.
+    let end = list.iter().position(|&a| a == EGL_NONE).unwrap_or(list.len());
+    list.truncate(end);
+    list.extend_from_slice(&[EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE]);
 }
 
 /// `EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute,

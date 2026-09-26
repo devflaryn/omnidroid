@@ -921,7 +921,11 @@ impl Guest {
     /// `graphics` is the host driver to bind Vulkan to, when [`GRAPHICS_GATE`] asked for one.
     /// `None` binds no Vulkan at all -- not an unhosted one, which would hand the engine a loader
     /// whose every call refuses -- so the default gate's `dlopen("libvulkan.so")` stays NULL.
-    fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display) -> Self {
+    ///
+    /// `windowless`: headless mode with no display ([`windowless_asked`]) -- no Vulkan and no
+    /// audio, as without the window, but EGL/GLES over the host's EGL, whose display for the
+    /// headless window needs no window system.
+    fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display, windowless: bool) -> Self {
         let path = cached_main_lib();
         // **Read for this load, and given back when it returns** -- not through `main_lib_bytes`,
         // whose static kept the whole file for the life of the process. Nothing the load produces
@@ -1092,7 +1096,7 @@ impl Guest {
         // `RenderView is NULL`, runs on without a view to `APP_READY` Landing, and no thread dies.
         let gles = Gles::new(Arc::clone(&space));
         gles.bind_into(&builder).expect("bind libEGL.so and libGLESv2.so");
-        if with_audio {
+        if with_audio || windowless {
             gles.set_host(omni_gfx::GfxGlesHost::new() as Arc<dyn GlesHost>);
         } else {
             gles.set_driverless();
@@ -2031,6 +2035,13 @@ fn death_signal(why: &str) -> i32 {
     }
 }
 
+/// Whether this run asked for **no window at all** (`OMNI_NO_WINDOW=1`): headless mode on a host
+/// with no display, a container or a notebook. `OMNI_HEADLESS=1` on a host where no window opens
+/// gets the same, and says so.
+fn windowless_asked() -> bool {
+    std::env::var("OMNI_NO_WINDOW").is_ok_and(|v| v.trim() == "1")
+}
+
 /// **The control channel** (headless mode, `omni_android::headless`): command lines from this
 /// process's stdin (a reader thread) and from `OMNI_CONTROL=<file>` (append-only, followed from
 /// where it was last read), polled every turn of the session loop.
@@ -2574,26 +2585,45 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         omni_platform::net::record::record_first(record_bytes);
     }
     let graphics = std::env::var(GRAPHICS_GATE).is_ok_and(|v| v == "1");
-    let host: Option<Arc<dyn VulkanHost>> = graphics.then(|| {
+    // **Headless with no display** (`OMNI_NO_WINDOW=1`, or `OMNI_HEADLESS=1` where no window can
+    // be opened): the engine's surface is a headless window -- an off-screen pbuffer on an EGL
+    // display that needs no window system -- and no Vulkan is bound, so the engine takes its GLES
+    // renderer (`Mode 6 failed: Unable to load Vulkan API`). See `windowless_asked`.
+    let headless_start = std::env::var("OMNI_HEADLESS").is_ok_and(|v| v.trim() == "1");
+    let mut windowless = graphics && windowless_asked();
+    // **The window first, under the graphics gate**, because the display the engine is told about
+    // is the window's -- its pixels and its host's DPI -- and the engine reads that before step 13.
+    let early_window = (graphics && !windowless)
+        .then(|| {
+            let (width, height) = window_size();
+            let opened = match omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
+                "Omnidroid - Roblox",
+                width,
+                height,
+            )) {
+                Ok(opened) => opened,
+                Err(err) if headless_start => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "GRAPHICS: no window could be opened ({err}), and this run is headless \
+                         (OMNI_HEADLESS=1): WINDOWLESS -- a headless window instead"
+                    );
+                    windowless = true;
+                    return None;
+                }
+                Err(err) => panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"),
+            };
+            opened.show();
+            let mut opened = opened;
+            let _ = opened.poll_events().count();
+            Some(opened)
+        })
+        .flatten();
+    let host: Option<Arc<dyn VulkanHost>> = early_window.is_some().then(|| {
         omni_gfx::GfxVulkanHost::load().expect(
             "OMNI_GFX_WINDOW_TESTS=1 asks for this machine's Vulkan driver, and there is no \
              loader to reach it through",
         ) as Arc<dyn VulkanHost>
-    });
-    // **The window first, under the graphics gate**, because the display the engine is told about
-    // is the window's -- its pixels and its host's DPI -- and the engine reads that before step 13.
-    let early_window = graphics.then(|| {
-        let (width, height) = window_size();
-        let opened = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
-            "Omnidroid - Roblox",
-            width,
-            height,
-        ))
-        .unwrap_or_else(|err| panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"));
-        opened.show();
-        let mut opened = opened;
-        let _ = opened.poll_events().count();
-        opened
     });
     let display = match &early_window {
         Some(opened) => {
@@ -2603,6 +2633,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 height_px: height as i32,
                 dpi: opened.dpi().expect("the host's DPI for the window"),
             }
+        }
+        None if windowless => {
+            let (width, height) = window_size();
+            Display { width_px: width as i32, height_px: height as i32, dpi: 96 }
         }
         None => Display::HEADLESS,
     };
@@ -2617,7 +2651,7 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         display.width_dp(),
         display.height_dp()
     );
-    let guest = Guest::load(host, display);
+    let guest = Guest::load(host, display, windowless);
     // **OMNI_HEADLESS=1: headless from the first frame** (`omni_android::headless`): the frame's
     // draws are dropped where the engine cannot see it, and `headless off` on the control channel
     // (stdin, `OMNI_CONTROL`) brings them back.
@@ -3221,6 +3255,25 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         window = Some(opened);
         window_source = Some(source);
         (size.width, size.height)
+    } else if windowless {
+        // **The headless window**: a source with no OS window behind it, publishing the size the
+        // engine renders at, and a `RawWindow::Headless` the host EGL makes a pbuffer for.
+        let (width, height) = (display.width_px, display.height_px);
+        let source = HostWindowSource::unpublished();
+        source.set_raw_window(omni_platform::window::RawWindow::Headless {
+            id: u64::from(std::process::id()),
+            width: width as u32,
+            height: height as u32,
+        });
+        source.publish(width as u32, height as u32).expect("the headless window's size");
+        guest.ndk.set_window_source(Arc::clone(&source) as Arc<dyn WindowSource>);
+        let _ = writeln!(
+            std::io::stderr(),
+            "GRAPHICS: WINDOWLESS -- a headless {width}x{height} window, no Vulkan bound (the engine \
+             takes GLES), EGL over the host's with no window system: its surface is a pbuffer"
+        );
+        window_source = Some(source);
+        (width, height)
     } else {
         guest.ndk.set_window_geometry(
             WindowGeometry::new(SURFACE_WIDTH, SURFACE_HEIGHT).expect("a positive geometry"),

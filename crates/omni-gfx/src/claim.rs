@@ -91,6 +91,12 @@ impl WindowKey {
         WindowKey(window)
     }
 
+    /// The key for a headless surface (`RawWindow::Headless`), which is the embedding's id for it.
+    #[must_use]
+    pub const fn headless(id: u64) -> WindowKey {
+        WindowKey(id)
+    }
+
     /// The key as the number it is, for a diagnostic.
     #[must_use]
     pub const fn raw(self) -> u64 {

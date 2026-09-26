@@ -221,4 +221,15 @@ mod tests {
             assert_eq!(role_for(name), Role::Other, "{name}");
         }
     }
+
+    #[test]
+    fn a_headless_window_asks_for_pbuffer_configs() {
+        use super::super::egl::{pbuffer_configs, EGL_NONE, EGL_PBUFFER_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT};
+        let mut asked = vec![0x3024, 8, EGL_SURFACE_TYPE, EGL_WINDOW_BIT | 0x0400, EGL_NONE];
+        pbuffer_configs(&mut asked);
+        assert_eq!(asked, [0x3024, 8, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT | 0x0400, EGL_NONE]);
+        let mut default = vec![0x3024, 8, EGL_NONE];
+        pbuffer_configs(&mut default);
+        assert_eq!(default, [0x3024, 8, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE]);
+    }
 }
