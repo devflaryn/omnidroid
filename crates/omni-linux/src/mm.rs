@@ -9,7 +9,6 @@ use crate::fd::FileKind;
 use crate::process::{Process, Task};
 use crate::syscall::{nr, Table};
 
-const PAGE: u64 = 4096;
 const PROT_READ: u32 = 1;
 const PROT_WRITE: u32 = 2;
 const PROT_EXEC: u32 = 4;
@@ -39,14 +38,15 @@ struct FileMapping {
 
 pub struct Mm {
     space: Arc<GuestSpace>,
+    /// The page: the guest space's, which is the host's (4 KiB on Windows and x86-64 Linux, 16 KiB
+    /// on Apple silicon). The guest is told it (`AT_PAGESZ`), as a 16 KiB Android 15 device tells
+    /// its processes, so every mapping, protection and unmapping it asks for is whole host pages.
+    page: u64,
     /// `MAP_FIXED`'s unmap-then-map must not interleave with another thread's mapping.
     lock: Mutex<()>,
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
 }
 
-const fn round_up(v: u64) -> u64 {
-    (v + PAGE - 1) & !(PAGE - 1)
-}
 
 fn protection(prot: u32) -> Result<Protection, Errno> {
     Ok(match (prot & PROT_READ != 0, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0) {
@@ -61,7 +61,18 @@ fn protection(prot: u32) -> Result<Protection, Errno> {
 impl Mm {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>) -> Self {
-        Self { space, lock: Mutex::new(()), files: Mutex::default() }
+        let page = space.page_size() as u64;
+        Self { space, page, lock: Mutex::new(()), files: Mutex::default() }
+    }
+
+    /// The page size the guest is told and every `mmap`, `mprotect` and `munmap` is exact at.
+    #[must_use]
+    pub const fn page_size(&self) -> u64 {
+        self.page
+    }
+
+    const fn round_up(&self, v: u64) -> u64 {
+        (v + self.page - 1) & !(self.page - 1)
     }
 
     /// `path+0xoffset` for an address inside a file mapping.
@@ -104,39 +115,39 @@ impl Mm {
 
     pub fn unmap(&self, addr: u64, len: u64) -> Result<(), Errno> {
         let addr = crate::guest::untag(addr);
-        if addr % PAGE != 0 || len == 0 {
+        if addr % self.page != 0 || len == 0 {
             return Err(EINVAL);
         }
         let _g = self.lock.lock();
-        self.unmap_locked(addr, round_up(len))
+        self.unmap_locked(addr, self.round_up(len))
     }
 
     pub fn protect(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
         let addr = crate::guest::untag(addr);
-        if addr % PAGE != 0 {
+        if addr % self.page != 0 {
             return Err(EINVAL);
         }
         let prot = protection(prot)?;
-        self.space.protect(addr as usize, round_up(len) as usize, prot).map_err(|_| ENOMEM)
+        self.space.protect(addr as usize, self.round_up(len) as usize, prot).map_err(|_| ENOMEM)
     }
 
     pub fn map(&self, p: &Process, t: &Task, req: MapRequest) -> Result<u64, Errno> {
-        if req.len == 0 || req.offset % PAGE != 0 {
+        if req.len == 0 || req.offset % self.page != 0 {
             return Err(EINVAL);
         }
         let prot = protection(req.prot).inspect_err(|_| {
             p.refusals.record("mmap: PROT_WRITE|PROT_EXEC".into(), t.pc, t.lr);
         })?;
-        let len = round_up(req.len);
+        let len = self.round_up(req.len);
         let fixed = req.flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
-        if fixed && req.addr % PAGE != 0 {
+        if fixed && req.addr % self.page != 0 {
             return Err(EINVAL);
         }
-        let page = self.space.page_size();
+        let page = self.page as usize;
         let placement = if fixed {
             Placement::Fixed(req.addr as usize)
         } else if req.addr != 0 {
-            Placement::Hint { address: (req.addr & !(PAGE - 1)) as usize, align: page }
+            Placement::Hint { address: (req.addr & !(self.page - 1)) as usize, align: page }
         } else {
             Placement::Anywhere { align: page }
         };
@@ -164,7 +175,7 @@ impl Mm {
             return Err(ENODEV);
         }
         // The part of the request the file covers, in whole pages; the rest is anonymous zeros.
-        let in_file = round_up(file_len.saturating_sub(req.offset)).min(len);
+        let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
         let at = if in_file > 0 && sysroot {
             let backing = p.vfs.sysroot().backing(&guest)?;
             match self.space.map_file(&backing, req.offset, placement, in_file as usize, prot) {
@@ -224,7 +235,7 @@ fn sys_mprotect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if a[2] == MADV_DONTNEED {
-        p.mem.space().discard(crate::guest::untag(a[0]) as usize, round_up(a[1]) as usize).map_err(|_| EINVAL)?;
+        p.mem.space().discard(crate::guest::untag(a[0]) as usize, p.mm.round_up(a[1]) as usize).map_err(|_| EINVAL)?;
     }
     Ok(0)
 }
@@ -245,13 +256,14 @@ fn prot_bits(p: Protection) -> u32 {
 /// address, keeping contents and protection. bionic's CFI shadow uses the `FIXED` form to replace
 /// a range atomically; scudo's secondary grows with `MAYMOVE`.
 fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
-    let (old, old_len, new_len, flags, target) = (crate::guest::untag(a[0]), round_up(a[1]), round_up(a[2]), a[3], a[4]);
-    if old % PAGE != 0 || new_len == 0 || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
+    let page = p.mm.page;
+    let (old, old_len, new_len, flags, target) = (crate::guest::untag(a[0]), p.mm.round_up(a[1]), p.mm.round_up(a[2]), a[3], a[4]);
+    if old % page != 0 || new_len == 0 || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
         p.refusals.record(format!("mremap flags {flags:#x}"), t.pc, t.lr);
         return Err(EINVAL);
     }
     let fixed = flags & MREMAP_FIXED != 0;
-    if fixed && (flags & MREMAP_MAYMOVE == 0 || target % PAGE != 0 || (target < old + old_len && old < target + new_len)) {
+    if fixed && (flags & MREMAP_MAYMOVE == 0 || target % page != 0 || (target < old + old_len && old < target + new_len)) {
         return Err(EINVAL);
     }
     if !fixed && new_len <= old_len {

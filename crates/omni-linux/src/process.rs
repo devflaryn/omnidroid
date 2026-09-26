@@ -169,13 +169,14 @@ impl Process {
             }
             None => (program.entry, 0),
         };
-        let stack = p.mm.map(&p, &loader, MapRequest { addr: 0, len: STACK_BYTES + 4096, prot: 3, flags: 0x22 | 0x20000, fd: -1, offset: 0 }).map_err(|e| format!("the main stack: {e:?}"))?;
-        p.mm.protect(stack, 4096, 0).map_err(|e| format!("the stack guard: {e:?}"))?;
-        let top = stack + STACK_BYTES + 4096;
+        let page = p.mm.page_size();
+        let stack = p.mm.map(&p, &loader, MapRequest { addr: 0, len: STACK_BYTES + page, prot: 3, flags: 0x22 | 0x20000, fd: -1, offset: 0 }).map_err(|e| format!("the main stack: {e:?}"))?;
+        p.mm.protect(stack, page, 0).map_err(|e| format!("the stack guard: {e:?}"))?;
+        let top = stack + STACK_BYTES + page;
         let mut random = [0u8; 16];
         omni_platform::process::random_bytes(&mut random).map_err(|e| format!("AT_RANDOM: {e}"))?;
         let auxv = [
-            (AT_PHDR, program.phdr), (AT_PHENT, 56), (AT_PHNUM, program.phnum), (AT_PAGESZ, 4096),
+            (AT_PHDR, program.phdr), (AT_PHENT, 56), (AT_PHNUM, program.phnum), (AT_PAGESZ, page),
             (AT_BASE, base), (AT_FLAGS, 0), (AT_ENTRY, program.entry), (AT_UID, u64::from(UID)),
             (AT_EUID, u64::from(UID)), (AT_GID, u64::from(UID)), (AT_EGID, u64::from(UID)),
             (AT_HWCAP, HWCAP), (AT_HWCAP2, 0), (AT_CLKTCK, 100), (AT_SECURE, 0),
@@ -184,7 +185,7 @@ impl Process {
         p.mem.write(top - bytes.len() as u64, &bytes).map_err(|e| format!("the initial stack: {e:?}"))?;
         loader.exit = None;
         if p.trace {
-            eprintln!("[exec] stack [{stack:#x}, {top:#x}) guard [{stack:#x}, {:#x}) sp {sp:#x} entry {entry:#x}", stack + 4096);
+            eprintln!("[exec] stack [{stack:#x}, {top:#x}) guard [{stack:#x}, {:#x}) sp {sp:#x} entry {entry:#x}", stack + page);
         }
         *p.start.lock() = Some((entry, sp));
         Ok(p)

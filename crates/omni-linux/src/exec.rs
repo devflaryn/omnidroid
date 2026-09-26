@@ -31,7 +31,6 @@ pub const AT_EXECFN: u64 = 31;
 /// FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32 -- and not ATOMICS (bit 8): D26 declines LSE.
 pub const HWCAP: u64 = 0xFB;
 
-const PAGE: u64 = 4096;
 const PROT_READ: u32 = 1;
 const PROT_WRITE: u32 = 2;
 const PROT_EXEC: u32 = 4;
@@ -48,12 +47,6 @@ pub struct LoadedElf {
     pub interp: Option<Vec<u8>>,
 }
 
-const fn floor(v: u64) -> u64 {
-    v & !(PAGE - 1)
-}
-const fn ceil(v: u64) -> u64 {
-    (v + PAGE - 1) & !(PAGE - 1)
-}
 
 pub fn load_elf(p: &Process, t: &Task, path: &[u8]) -> Result<LoadedElf, Errno> {
     let file = std::sync::Arc::new(fd::open(&p.vfs, b"/", path, 0)?);
@@ -66,6 +59,11 @@ pub fn load_elf(p: &Process, t: &Task, path: &[u8]) -> Result<LoadedElf, Errno> 
     if loads.is_empty() {
         return Err(Errno(8));
     }
+    // The kernel's page, which is the host's (`Mm::page_size`): an ELF whose segments are aligned
+    // below it cannot be mapped, and `mmap` refuses its offsets, as a 16 KiB kernel refuses them.
+    let page = p.mm.page_size();
+    let floor = |v: u64| v & !(page - 1);
+    let ceil = |v: u64| (v + page - 1) & !(page - 1);
     let lo = floor(loads.iter().map(|s| s.p_vaddr).min().expect("non-empty"));
     let hi = ceil(loads.iter().map(|s| s.p_vaddr + s.p_memsz).max().expect("non-empty"));
     let fd_num = p.fds.insert(std::sync::Arc::clone(&file), true, 0)?;
