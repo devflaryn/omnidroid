@@ -298,6 +298,7 @@ fn emit_and_execute() {
 
 #[test]
 fn d10_and_d12_re_measured_on_this_host() {
+    omni_mem::DemandPager::prepare_thread().expect("room to take a guest fault");
     if cfg!(debug_assertions) {
         println!("note: a debug build; the figures in the port notes come from --release");
     }
