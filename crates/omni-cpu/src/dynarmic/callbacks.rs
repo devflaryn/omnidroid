@@ -77,6 +77,8 @@ impl CpuCtx {
     /// fallback value.
     fn data_ptr(&mut self, vaddr: u64, len: usize, want: Protection) -> Option<*mut u8> {
         let access = if want == Protection::ReadWrite { AccessKind::Write } else { AccessKind::Read };
+        // Top Byte Ignore, when the context has it: the tag is not part of the address.
+        let vaddr = if self.top_byte_ignore { vaddr & 0x00FF_FFFF_FFFF_FFFF } else { vaddr };
         let Ok(address) = usize::try_from(vaddr) else {
             self.fault(vaddr, access);
             return None;

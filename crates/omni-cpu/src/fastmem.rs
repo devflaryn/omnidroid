@@ -138,6 +138,20 @@ pub fn require_identity_mapping(
     observed: &MemoryMapping,
     space: GuestAddressSpace,
 ) -> CpuResult<()> {
+    require_memory_path(observed, space, false)
+}
+
+/// [`require_identity_mapping`] for a context that asked for Top Byte Ignore
+/// (`DynarmicOptions::top_byte_ignore`): the one permitted difference is 56 address bits, mirrored.
+///
+/// # Errors
+///
+/// As [`require_identity_mapping`].
+pub fn require_memory_path(
+    observed: &MemoryMapping,
+    space: GuestAddressSpace,
+    top_byte_ignore: bool,
+) -> CpuResult<()> {
     let refuse = |setting, expected: u64, actual: u64, consequence| {
         Err(CpuError::MisconfiguredMemoryPath { setting, expected, actual, consequence })
     };
@@ -162,10 +176,13 @@ pub fn require_identity_mapping(
              translating",
         );
     }
-    if observed.address_bits != 64 {
+    // Top Byte Ignore asks for exactly one other shape: 56 bits, mirrored (`DynarmicOptions::
+    // top_byte_ignore`). The mask is the architecture's, not an accident, so it is not refused.
+    let tbi_shape = top_byte_ignore && observed.address_bits == 56 && observed.mirrors_out_of_range;
+    if observed.address_bits != 64 && !tbi_shape {
         return refuse(
             "guest address bits covered by the direct path",
-            64,
+            if top_byte_ignore { 56 } else { 64 },
             observed.address_bits,
             "below 64 the backend emits a mask or a bounds check on every access instead of \
              folding the base into the addressing mode, and every guest address above the limit \
@@ -173,7 +190,7 @@ pub fn require_identity_mapping(
              while still producing correct results. dynarmic's own default here is 36",
         );
     }
-    if observed.mirrors_out_of_range {
+    if observed.mirrors_out_of_range && !tbi_shape {
         return refuse(
             "mirroring of out-of-range guest addresses",
             0,

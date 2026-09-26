@@ -106,7 +106,7 @@ use crate::cpu::{
 };
 use crate::error::{CpuError, CpuResult};
 use crate::exit::{AccessKind, ExitReason, RunLimit};
-use crate::fastmem::{require_identity_mapping, MemoryMapping};
+use crate::fastmem::{require_memory_path, MemoryMapping};
 use crate::regs::{Nzcv, VReg, XReg};
 use crate::run::Budget;
 use crate::thunk::{ThunkContext, ThunkFn, ThunkRegs};
@@ -285,6 +285,15 @@ pub struct DynarmicOptions {
     /// all but one). [`SHARED_CODE_LIVE_BYTES`] by default; `OMNI_JIT_SHARED_CACHE_LIVE_MB` sets
     /// it. Committed code stays within this and a region (the one retired, until it is given back).
     pub shared_code_live_bytes: u64,
+    /// Top Byte Ignore, as arm64 Linux enables it for user space: a data access through an
+    /// address with bits 56-63 set reaches the address with them cleared. Off by default, so the
+    /// Roblox path keeps D4's full 64-bit identity mapping; the Linux personality (`omni-linux`)
+    /// turns it on, because Android's scudo tags every heap pointer with 0x02 in the top byte.
+    ///
+    /// On, the direct path covers 56 address bits and masks the tag off (`shl`/`shr` before the
+    /// access, the cost of D4's rule for below-64-bit configurations) and the callback path
+    /// clears it before resolving.
+    pub top_byte_ignore: bool,
 }
 
 impl Default for DynarmicOptions {
@@ -302,6 +311,7 @@ impl Default for DynarmicOptions {
             // value-compare costs a tenth per atomic and scales. `OMNI_JIT_EXCLUSIVE_MONITOR=global`
             // is the way back, announced.
             exclusive_monitor: ExclusiveMonitor::ValueCompare,
+            top_byte_ignore: false,
             optimizations_override: None,
             // D38 amendment 2, decided 2026-09-25 on x64: in PS99 with w20's drag script, w27/w29
             // (shared) against w28 (per-thread) -- 0 s under 20 fps during input against 14 s
@@ -565,8 +575,11 @@ fn thread_config(
         // reads.** See this module's documentation, under "What fastmem does not check".
         fastmem_enabled: i32::from(overrides.direct_access.unwrap_or(true)),
         fastmem_pointer: 0,
-        fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(64),
-        silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(false)),
+        // Top Byte Ignore (`DynarmicOptions::top_byte_ignore`): 56 bits, mirrored, is dynarmic's
+        // mask of the top byte on every direct access -- aliasing across the top byte is exactly
+        // what the architecture specifies, and an address with nothing behind it still faults.
+        fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(if options.top_byte_ignore { 56 } else { 64 }),
+        silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(options.top_byte_ignore)),
         recompile_on_fastmem_failure: 1,
         // Task 2's review measured this: off gives 1 slow-path read plus 1 exclusive callback
         // per `LDXR`, on gives 0, which matters because D5 lists the global exclusive monitor's
@@ -1079,7 +1092,7 @@ impl DynarmicBackend {
                 return Err(error);
             }
         };
-        match require_identity_mapping(&cpu.memory_mapping(), self.shared.extent) {
+        match require_memory_path(&cpu.memory_mapping(), self.shared.extent, self.shared.options.top_byte_ignore) {
             Err(error) => Ok((cpu, error)),
             Ok(()) => {
                 // `cpu` is dropped here, and `DynarmicCpu::drop` returns the id and the TLS block.
@@ -1466,6 +1479,8 @@ pub(crate) struct CpuCtx {
     pub(crate) inline_thunks: inline_table::InlineThunks,
     /// The guest-syscall handler (`GuestCpu::set_svc_handler`), if one is registered.
     pub(crate) svc_handler: Option<(ThunkFn, ThunkContext)>,
+    /// `DynarmicOptions::top_byte_ignore`: the callback path clears bits 56-63 of a data address.
+    pub(crate) top_byte_ignore: bool,
     /// How many inline thunks have been serviced, so a measurement can prove the path ran.
     pub(crate) inline_calls: u64,
     /// How many of those asked to be handed back to the caller. See
@@ -1582,12 +1597,13 @@ impl DynarmicCpu {
         processor_id: u32,
     ) -> CpuResult<Self> {
         let extent = shared.extent;
+        let top_byte_ignore = shared.options.top_byte_ignore;
         let cpu =
             Self::build_unchecked(shared, config, tls, processor_id, Overrides::default())?;
         // **The startup assertion.** Read back from the live `UserConfig` rather than echoed from
         // what was asked for, and run before the context is handed to anyone, so a context that
         // exists is a context whose memory path is D4's.
-        require_identity_mapping(&cpu.memory_mapping(), extent)?;
+        require_memory_path(&cpu.memory_mapping(), extent, top_byte_ignore)?;
         Ok(cpu)
     }
 
@@ -1606,6 +1622,7 @@ impl DynarmicCpu {
             thunks: BTreeSet::new(),
             inline_thunks: inline_table::InlineThunks::default(),
             svc_handler: None,
+            top_byte_ignore: shared.options.top_byte_ignore,
             inline_calls: 0,
             inline_deferred: 0,
             hints: 0,

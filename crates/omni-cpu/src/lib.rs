@@ -72,7 +72,8 @@ pub use context::{
 pub use cpu::{Capabilities, GuestCpu, GuestCpuBackend, HaltHandle, InlineThunkCounts, JitCounters};
 pub use error::{CpuError, CpuResult};
 pub use fastmem::{
-    identity_mapping, pc_is_representable, require_identity_mapping, truncate_pc, MemoryMapping,
+    identity_mapping, pc_is_representable, require_identity_mapping, require_memory_path,
+    truncate_pc, MemoryMapping,
     GUEST_PC_BITS,
 };
 pub use tls::{
