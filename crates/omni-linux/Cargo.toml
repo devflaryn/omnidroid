@@ -1,0 +1,24 @@
+[package]
+name = "omni-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "The Linux kernel personality: the arm64 syscall ABI under the real AOSP bionic, linker64 and (later) ART."
+
+[dependencies]
+omni-platform = { workspace = true }
+omni-mem = { workspace = true }
+omni-elf = { workspace = true }
+omni-cpu = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+
+[[bin]]
+name = "omni-linux-run"
+path = "src/bin/omni-linux-run.rs"

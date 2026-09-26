@@ -1,0 +1,106 @@
+//! Checked copies between guest memory and the host: the kernel's `copy_{from,to}_user`.
+//!
+//! A range that is not mapped, or not readable (writable) throughout, is `EFAULT`, never a host
+//! fault: identity mapping (D4) makes a guest pointer a host pointer, so an unchecked copy through
+//! a hostile one would be the host's crash.
+use std::sync::Arc;
+
+use omni_mem::{GuestSpace, Protection};
+
+use crate::errno::{Errno, EFAULT};
+
+pub struct GuestMem {
+    space: Arc<GuestSpace>,
+}
+
+impl GuestMem {
+    #[must_use]
+    pub fn new(space: Arc<GuestSpace>) -> Self {
+        Self { space }
+    }
+
+    #[must_use]
+    pub fn space(&self) -> &Arc<GuestSpace> {
+        &self.space
+    }
+
+    fn check(&self, addr: u64, len: usize, write: bool) -> Result<*mut u8, Errno> {
+        if len == 0 {
+            return Ok(std::ptr::null_mut());
+        }
+        let start = usize::try_from(addr).map_err(|_| EFAULT)?;
+        let end = start.checked_add(len).ok_or(EFAULT)?;
+        if !self.space.contains(start, len) {
+            return Err(EFAULT);
+        }
+        let mut at = start;
+        while at < end {
+            let region = self.space.region_at(at).ok_or(EFAULT)?;
+            if region.mapping.is_none() {
+                return Err(EFAULT);
+            }
+            let ok = match region.protection {
+                Protection::None => false,
+                Protection::ReadWrite => true,
+                Protection::Read | Protection::ReadExecute => !write,
+            };
+            if !ok {
+                return Err(EFAULT);
+            }
+            at = region.start + region.len;
+        }
+        self.space.ensure_committed(start, len).map_err(|_| EFAULT)?;
+        self.space.ptr(start, len).map_err(|_| EFAULT)
+    }
+
+    pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        let ptr = self.check(addr, len, false)?;
+        let mut out = vec![0u8; len];
+        if len != 0 {
+            // SAFETY: `check` proved [addr, addr+len) mapped, readable and committed.
+            unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len) };
+        }
+        Ok(out)
+    }
+
+    pub fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+        let ptr = self.check(addr, bytes.len(), true)?;
+        if !bytes.is_empty() {
+            // SAFETY: `check` proved the range mapped, writable and committed.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        }
+        Ok(())
+    }
+
+    pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
+        Ok(u64::from_le_bytes(self.read(addr, 8)?.try_into().expect("eight bytes")))
+    }
+
+    pub fn write_u64(&self, addr: u64, value: u64) -> Result<(), Errno> {
+        self.write(addr, &value.to_le_bytes())
+    }
+
+    pub fn write_u32(&self, addr: u64, value: u32) -> Result<(), Errno> {
+        self.write(addr, &value.to_le_bytes())
+    }
+
+    /// A NUL-terminated string of at most `max` bytes (excluding the NUL); longer is `ENAMETOOLONG`.
+    pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
+        let mut out = Vec::new();
+        let mut at = addr;
+        loop {
+            // Read up to the end of the page, so a string ending just before an unmapped page works.
+            let page_left = 4096 - (at as usize & 4095);
+            let chunk = self.read(at, page_left)?;
+            if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+                out.extend_from_slice(&chunk[..nul]);
+                return Ok(out);
+            }
+            out.extend_from_slice(&chunk);
+            if out.len() > max {
+                return Err(crate::errno::ENAMETOOLONG);
+            }
+            at += page_left as u64;
+        }
+    }
+}

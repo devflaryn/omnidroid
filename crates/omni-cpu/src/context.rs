@@ -226,7 +226,6 @@ impl GuestThreadConfig {
         Ok(Self { space, tpidr_el0 })
     }
 
-    /// The guest address space this thread runs in.
     /// A thread whose thread pointer the guest manages itself, as the Linux kernel starts one:
     /// `TPIDR_EL0` is 0 until the guest writes it (real bionic's `__libc_init_main_thread_*` and
     /// `clone(CLONE_SETTLS)` do). No backend TLS block, so no D13 stack guard is provided: real
@@ -236,6 +235,7 @@ impl GuestThreadConfig {
         Self { space, tpidr_el0: 0 }
     }
 
+    /// The guest address space this thread runs in.
     #[must_use]
     pub const fn space(self) -> GuestAddressSpace {
         self.space
