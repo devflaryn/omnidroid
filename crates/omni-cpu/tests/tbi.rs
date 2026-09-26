@@ -36,9 +36,15 @@ fn with_tbi_a_tagged_pointer_reaches_the_untagged_address() {
     cpu.set_x(x(1), 0x1122_3344_5566_7788);
     cpu.set_x(x(3), 0xAABB);
 
+    let before = cpu.slow_path_entries();
     let exit = cpu.run(entry, RunLimit::Unlimited).expect("the program runs");
 
     assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "{exit}");
+    assert_eq!(
+        cpu.slow_path_entries() - before,
+        0,
+        "the tagged accesses stayed on the direct path: TBI is a mask, not a detour through callbacks"
+    );
     assert_eq!(cpu.x(x(2)), 0x1122_3344_5566_7788, "the load through the tagged pointer");
     assert_eq!(cpu.x(x(6)), 0, "the exclusive store through the tagged pointer succeeded");
     let stored = guest.space.ptr(guest.data, 16).expect("data");
@@ -54,4 +60,27 @@ fn without_tbi_a_tagged_pointer_still_faults() {
     let (mut cpu, _sentinel) = guest.thread();
     let exit = cpu.run(entry, RunLimit::Unlimited).expect("the program runs");
     assert!(matches!(exit, ExitReason::MemoryFault { .. }), "D4's configuration is unchanged: {exit}");
+}
+
+/// bionic's `malloc` starts with `ldar x8, [__libc_globals + 0x48]`, a load-acquire from a page
+/// libc has write-protected. It must stay on the direct path under TBI as it does without.
+fn load_acquire_from_read_only(options: DynarmicOptions) -> u64 {
+    let guest = Guest::with_options(options);
+    let mut program = mov64(0, guest.readonly as u64);
+    program.extend([ldar(1, 0), ret(30)]);
+    let entry = guest.load(&program);
+    let (mut cpu, sentinel) = guest.thread();
+    let before = cpu.slow_path_entries();
+    let exit = cpu
+        .run(entry, RunLimit::Unlimited)
+        .unwrap_or_else(|e| panic!("top_byte_ignore = {}: {e}", options.top_byte_ignore));
+    assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "{exit}");
+    cpu.slow_path_entries() - before
+}
+
+#[test]
+fn a_load_acquire_from_a_read_only_page_stays_on_the_direct_path() {
+    assert_eq!(load_acquire_from_read_only(DynarmicOptions::default()), 0, "without TBI");
+    let tbi = DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() };
+    assert_eq!(load_acquire_from_read_only(tbi), 0, "with TBI");
 }

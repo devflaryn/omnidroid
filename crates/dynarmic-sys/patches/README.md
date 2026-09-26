@@ -217,3 +217,13 @@ is guest-addressable in principle; only ASLR hides it.
 ### 4. `A64EmitX64` holds a 16 MiB fast-dispatch table by value, and fills it even when fast dispatch is off
 
 Applied as 0017, and shrunk to 64 KiB by 0019.
+
+### 0029 — x64: an ordered load of 64 bits or fewer is a plain `mov`
+
+x64. `LDAR`/`LDAPR` were emitted as `lock xadd [addr], 0`, a read-modify-write that faults on a
+read-only page, so the site fell to the callback path for good (`DegradedMemoryPath`). The real
+bionic hits it at the top of `malloc`: `ldar x8, [__libc_globals + 0x48]`, a page libc
+write-protects. x86 loads already have acquire semantics and every ordered store is an `xchg` (a
+full barrier), so release-then-acquire ordering is kept. 128-bit ordered loads keep `cmpxchg16b`.
+Verified: `omni-cpu/tests/tbi.rs::a_load_acquire_from_a_read_only_page_stays_on_the_direct_path`
+(fails without the patch, with and without Top Byte Ignore).

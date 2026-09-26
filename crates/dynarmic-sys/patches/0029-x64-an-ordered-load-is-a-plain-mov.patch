@@ -1,0 +1,19 @@
+diff --git a/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/backend/x64/emit_x64_memory.h
+index 54fc46e..6772526 100644
+--- a/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -201,7 +201,13 @@ template<>
+ 
+ template<std::size_t bitsize>
+ const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+-    if (ordered) {
++    // Omnidroid patch 0029: an ordered load of 64 bits or fewer is a plain `mov`. x86 loads already
++    // have acquire semantics, and every ordered store is an `xchg` (a full barrier, below), so a
++    // load-acquire cannot be reordered before an earlier store-release either. The `lock xadd` this
++    // replaces was a read-modify-write: on a read-only page (bionic's write-protected
++    // `__libc_globals`, read with `LDAR` at the top of `malloc`) it faulted, and the site fell to
++    // the callback path for good. 128 bits keep `cmpxchg16b`, the only atomic 16-byte read.
++    if (ordered && bitsize == 128) {
+         if constexpr (bitsize != 128) {
+             code.xor_(Xbyak::Reg32{value_idx}, Xbyak::Reg32{value_idx});
+         } else {

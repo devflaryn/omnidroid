@@ -34,6 +34,7 @@ dynarmic/
                and ../patches/0026-x64-the-guest-ranges-of-emitted-blocks-compact.patch
                and ../patches/0027-x64-a-shared-cache-s-block-map-at-a-load-factor-of-0.75.patch
                and ../patches/0028-x64-a-full-region-is-not-a-flush-the-oldest-region-is-retired.patch
+               and ../patches/0029-x64-an-ordered-load-is-a-plain-mov.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
