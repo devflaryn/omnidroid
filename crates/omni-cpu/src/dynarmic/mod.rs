@@ -1974,6 +1974,15 @@ impl GuestCpu for DynarmicCpu {
     }
 
     fn run(&mut self, from: GuestAddr, limit: RunLimit) -> CpuResult<ExitReason> {
+        // The thread about to take guest faults needs room to take them: the jit may have been
+        // built on another thread, so this is checked where guest code runs, once per thread.
+        if self.shared.owns_guest_paging {
+            DemandPager::prepare_thread().map_err(|error| CpuError::Backend {
+                backend: BACKEND_NAME,
+                operation: "prepare this thread to take guest faults",
+                detail: error.to_string(),
+            })?;
+        }
         self.set_pc(from);
         self.with_ctx(|ctx| {
             ctx.executable_cache = None;
