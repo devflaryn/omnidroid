@@ -137,3 +137,16 @@ fn mremap_maymove_grows_a_mapping_keeping_its_contents() {
     assert_eq!(p.mem.read(r, 4).unwrap(), b"grow");
     assert_eq!(p.mem.read(r + 2 * 4096, 4).unwrap(), [0; 4], "the new tail is zero");
 }
+
+#[test]
+fn absurd_lengths_are_errors_not_overflows() {
+    let (p, mut t, _) = process();
+    let huge = u64::MAX - 100;
+    assert_eq!(mmap(&p, &mut t, [0, huge, PROT_READ, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]), -12, "ENOMEM");
+    let at = mmap(&p, &mut t, [0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    assert_eq!(p.syscall(&mut t, nr::MUNMAP, [at, huge, 0, 0, 0, 0]) as i64, -22, "EINVAL");
+    assert_eq!(p.syscall(&mut t, nr::MPROTECT, [at, huge, PROT_READ, 0, 0, 0]) as i64, -22, "EINVAL");
+    assert_eq!(p.syscall(&mut t, nr::MADVISE, [at, huge, 4, 0, 0, 0]) as i64, -22, "EINVAL");
+    assert_eq!(p.syscall(&mut t, nr::MREMAP, [at, 4096, huge, 1, 0, 0]) as i64, -12, "ENOMEM");
+    assert!(p.mem.write(at, b"still mapped").is_ok(), "nothing was unmapped by the refused calls");
+}

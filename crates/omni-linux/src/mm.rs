@@ -44,6 +44,14 @@ pub struct Mm {
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
 }
 
+/// `len` rounded up to pages, if `[addr, addr + len)` fits in the 56-bit user address range.
+/// Every length from the guest goes through here first: a raw `addr + len` overflowed on absurd
+/// input (A1 review, Important 3).
+fn span(addr: u64, len: u64) -> Option<u64> {
+    let len = len.checked_add(PAGE - 1)? & !(PAGE - 1);
+    (addr.checked_add(len)? <= 1 << 56).then_some(len)
+}
+
 const fn round_up(v: u64) -> u64 {
     (v + PAGE - 1) & !(PAGE - 1)
 }
@@ -122,7 +130,8 @@ impl Mm {
             return Err(EINVAL);
         }
         let _g = self.lock.lock();
-        self.unmap_locked(addr, round_up(len))
+        let len = span(addr, len).ok_or(EINVAL)?;
+        self.unmap_locked(addr, len)
     }
 
     pub fn protect(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
@@ -131,7 +140,11 @@ impl Mm {
             return Err(EINVAL);
         }
         let prot = protection(prot)?;
-        self.space.protect(addr as usize, round_up(len) as usize, prot).map_err(|_| ENOMEM)
+        let len = span(addr, len).ok_or(EINVAL)?;
+        if len == 0 {
+            return Ok(());
+        }
+        self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)
     }
 
     pub fn map(&self, p: &Process, t: &Task, req: MapRequest) -> Result<u64, Errno> {
@@ -141,7 +154,7 @@ impl Mm {
         let prot = protection(req.prot).inspect_err(|_| {
             p.refusals.record("mmap: PROT_WRITE|PROT_EXEC".into(), t.pc, t.lr);
         })?;
-        let len = round_up(req.len);
+        let len = span(crate::guest::untag(req.addr), req.len).ok_or(ENOMEM)?;
         let fixed = req.flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
         if fixed && req.addr % PAGE != 0 {
             return Err(EINVAL);
@@ -238,7 +251,9 @@ fn sys_mprotect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if a[2] == MADV_DONTNEED {
-        p.mem.space().discard(crate::guest::untag(a[0]) as usize, round_up(a[1]) as usize).map_err(|_| EINVAL)?;
+        let addr = crate::guest::untag(a[0]);
+        let len = span(addr, a[1]).ok_or(EINVAL)?;
+        p.mem.space().discard(addr as usize, len as usize).map_err(|_| EINVAL)?;
     }
     Ok(0)
 }
@@ -259,7 +274,9 @@ fn prot_bits(p: Protection) -> u32 {
 /// address, keeping contents and protection. bionic's CFI shadow uses the `FIXED` form to replace
 /// a range atomically; scudo's secondary grows with `MAYMOVE`.
 fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
-    let (old, old_len, new_len, flags, target) = (crate::guest::untag(a[0]), round_up(a[1]), round_up(a[2]), a[3], a[4]);
+    let (old, flags, target) = (crate::guest::untag(a[0]), a[3], crate::guest::untag(a[4]));
+    let old_len = span(old, a[1]).ok_or(EINVAL)?;
+    let new_len = span(if flags & MREMAP_FIXED != 0 { target } else { 0 }, a[2]).ok_or(ENOMEM)?;
     if old % PAGE != 0 || new_len == 0 || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
         p.refusals.record(format!("mremap flags {flags:#x}"), t.pc, t.lr);
         return Err(EINVAL);

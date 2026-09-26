@@ -135,6 +135,38 @@ pub struct DirEnt {
     pub ino: u64,
 }
 
+/// The host path of `rel` (a normalized guest path relative to a writable mount) under `root`,
+/// or `None` when some component cannot be one plain host file name.
+///
+/// This is the sandbox: every guest name reaches the host through here. Joining the guest bytes
+/// as one string let Windows read `\`, `..\` and `C:\` inside a single guest component, so a
+/// guest could open or create any host file (A1 review, Critical 1). Each component must be valid
+/// UTF-8, not `.`/`..`, free of the characters Windows gives meaning to and of control characters,
+/// not end in a dot or space, and not be a DOS device name; the result must still lie under `root`.
+#[must_use]
+pub fn host_path(root: &Path, rel: &[u8]) -> Option<PathBuf> {
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let mut out = root.to_path_buf();
+    for component in rel.split(|&b| b == b'/') {
+        let name = std::str::from_utf8(component).ok()?;
+        let plain = !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.bytes().any(|b| b < 0x20 || br#"\:*?"<>|"#.contains(&b))
+            && !name.ends_with('.')
+            && !name.ends_with(' ');
+        let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+        if !plain || DEVICES.contains(&stem.as_str()) {
+            return None;
+        }
+        out.push(name);
+    }
+    out.starts_with(root).then_some(out)
+}
+
 /// A stable inode number for a guest path (FNV-1a).
 #[must_use]
 pub fn ino_of(path: &[u8]) -> u64 {
@@ -217,8 +249,8 @@ impl Vfs {
                 return Some(Node::HostDir { host: host.clone() });
             }
             if path.starts_with(mount) && path.get(mount.len()) == Some(&b'/') {
-                let rel = String::from_utf8_lossy(&path[mount.len() + 1..]).into_owned();
-                let host = host.join(rel);
+                // A guest name the host cannot hold as one plain name is not there (see `host_path`).
+                let host = host_path(host, &path[mount.len() + 1..])?;
                 return match std::fs::metadata(&host) {
                     Ok(m) if m.is_dir() => Some(Node::HostDir { host }),
                     Ok(_) => Some(Node::HostFile { host }),
@@ -236,7 +268,8 @@ impl Vfs {
     fn host_for_missing(&self, path: &[u8]) -> Option<PathBuf> {
         self.writable.iter().find_map(|(mount, host)| {
             (path.starts_with(mount) && path.get(mount.len()) == Some(&b'/'))
-                .then(|| host.join(String::from_utf8_lossy(&path[mount.len() + 1..]).as_ref()))
+                .then(|| host_path(host, &path[mount.len() + 1..]))
+                .flatten()
         })
     }
 

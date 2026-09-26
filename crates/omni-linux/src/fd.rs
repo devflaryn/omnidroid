@@ -360,6 +360,9 @@ fn sys_readv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     let mut total = 0u64;
     for (base, len) in iovecs(p, a[1], a[2])? {
+        // The same cap as `read`: the length is the guest's, and an allocation of it can abort
+        // the host (A1 review, Important 2).
+        let len = len.min(1 << 24);
         let mut buf = vec![0u8; len];
         let n = read_file(&file, &mut buf, None)?;
         p.mem.write(base, &buf[..n])?;
