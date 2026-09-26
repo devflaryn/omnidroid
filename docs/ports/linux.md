@@ -70,6 +70,13 @@ config attributes are dropped when the host lacks them; seven desktop-GL names a
   390 legacy driver (a system change for the owner), no other GPU client on the desktop.
 * After a live resize the engine's GLES renderer keeps its old viewport.
 * The engine's own Vulkan path on a real Linux GPU is unmeasured.
+* **Debug builds overrun a std thread's alternate signal stack** in the demand pager's `SIGSEGV`
+  path: 12,496 bytes used against the 8,192 Rust gives a thread (release: 3,016;
+  `omni-mem/tests/pager_linux`, 2026-09-27). A debug `cargo test --workspace` died by `SIGSEGV`,
+  the overrun's signature, in the suites that serve demand faults on test threads (`omni-mem` `pager_linux`,
+  `probe_linux`, `heap_pattern`; `omni-cpu` `faults`, `hostile`; `omni-android` `bionic`,
+  `initializers`, `jni_startup`; the overrun measured in `pager_linux` only); run the Linux suite in
+  release.
 * The demand pager locks and allocates inside the `SIGSEGV` handler: sound for the synchronous
   faults it serves (the Windows VEH's bargain), not async-signal-safe in the POSIX sense.
 * `vm.overcommit_memory = 2` and the default `vm.max_map_count` (65,530; this host 1,048,576) are
