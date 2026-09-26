@@ -72,6 +72,7 @@ impl Properties {
                 }
             }
         }
+        p.derive_as_init();
         p.apply_overlay();
         let dropped = p.drop_unrepresentable();
         (p, dropped)
@@ -90,6 +91,41 @@ impl Properties {
     pub fn load(&mut self, pairs: &[(String, String)]) {
         for (k, v) in pairs {
             self.set(k, v);
+        }
+    }
+
+    /// What init derives at boot (`property_initialize_ro_product_props`,
+    /// `property_derive_build_fingerprint`): each `ro.product.X` from the first partition in the
+    /// default source order that sets `ro.product.<partition>.X`, and `ro.build.fingerprint` from
+    /// its parts when no file sets it.
+    pub fn derive_as_init(&mut self) {
+        const SOURCES: [&str; 5] = ["product", "odm", "vendor", "system_ext", "system"];
+        for field in ["brand", "device", "manufacturer", "model", "name"] {
+            let key = format!("ro.product.{field}");
+            if self.get(&key).is_some() {
+                continue;
+            }
+            let found = SOURCES
+                .iter()
+                .find_map(|source| self.get(&format!("ro.product.{source}.{field}")).map(str::to_string));
+            if let Some(value) = found {
+                self.set(&key, &value);
+            }
+        }
+        if self.get("ro.build.fingerprint").is_none() {
+            let part = |k: &str| self.get(k).unwrap_or("").to_string();
+            let fingerprint = format!(
+                "{}/{}/{}:{}/{}/{}:{}/{}",
+                part("ro.product.brand"),
+                part("ro.product.name"),
+                part("ro.product.device"),
+                part("ro.build.version.release_or_codename"),
+                part("ro.build.id"),
+                part("ro.build.version.incremental"),
+                part("ro.build.type"),
+                part("ro.build.tags"),
+            );
+            self.set("ro.build.fingerprint", &fingerprint);
         }
     }
 

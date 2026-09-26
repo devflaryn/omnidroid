@@ -135,3 +135,28 @@ fn the_serial_area_is_an_empty_prop_area() {
     assert_eq!(u32_at(&serial, 8), 0x504f_5250);
     assert_eq!(serial.len(), 128 << 10);
 }
+
+
+#[test]
+fn init_derives_ro_product_and_the_fingerprint_as_it_does_at_boot() {
+    let mut p = Properties::default();
+    p.load(&props::parse_build_prop(
+        "ro.product.system.brand=SysBrand
+ro.product.system.model=sysmodel
+ro.product.product.model=ProdModel
+         ro.product.product.name=pname
+ro.product.system_ext.device=extdev
+ro.product.system.manufacturer=M
+         ro.build.version.release_or_codename=15
+ro.build.id=AE3A
+ro.build.version.incremental=123
+         ro.build.type=user
+ro.build.tags=release-keys
+",
+    ));
+    p.derive_as_init();
+    assert_eq!(p.get("ro.product.model"), Some("ProdModel"), "product wins over system");
+    assert_eq!(p.get("ro.product.brand"), Some("SysBrand"), "system when nothing earlier sets it");
+    assert_eq!(p.get("ro.product.device"), Some("extdev"));
+    assert_eq!(p.get("ro.build.fingerprint"), Some("SysBrand/pname/extdev:15/AE3A/123:user/release-keys"));
+}
