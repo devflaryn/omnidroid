@@ -118,3 +118,40 @@ fn readlink_of_proc_self_fd_names_the_open_file() {
     p.mem.write(s, b"/proc/self/fd/99\0").unwrap();
     assert_eq!(call(&p, &mut t, nr::READLINKAT, [(-100i64) as u64, s, s + 256, 256, 0, 0]), -(ENOENT.0 as i64));
 }
+
+struct OneFile;
+
+impl omni_linux::procfs::ProcFs for OneFile {
+    fn node(&self, path: &[u8]) -> Option<omni_linux::vfs::Node> {
+        match path {
+            b"/proc" => Some(omni_linux::vfs::Node::Dir),
+            b"/proc/fake" => Some(omni_linux::vfs::Node::Generated),
+            _ => None,
+        }
+    }
+    fn list(&self, _path: &[u8]) -> Vec<omni_linux::vfs::DirEnt> {
+        Vec::new()
+    }
+    fn read(&self, path: &[u8]) -> Option<Vec<u8>> {
+        (path == b"/proc/fake").then(|| b"0123456789".to_vec())
+    }
+}
+
+#[test]
+fn a_generated_file_reads_in_pieces_seeks_back_and_stats_like_proc() {
+    let (p, mut t, s, _) = fixture();
+    let fake: Arc<dyn omni_linux::procfs::ProcFs> = Arc::new(OneFile);
+    p.vfs.attach_proc(Arc::downgrade(&fake));
+    p.mem.write(s, b"/proc/fake\0").unwrap();
+    let fd = call(&p, &mut t, nr::OPENAT, [(-100i64) as u64, s, 0, 0, 0, 0]) as u64;
+    assert_eq!(call(&p, &mut t, nr::READ, [fd, s + 256, 3, 0, 0, 0]), 3);
+    assert_eq!(call(&p, &mut t, nr::READ, [fd, s + 259, 100, 0, 0, 0]), 7);
+    assert_eq!(p.mem.read(s + 256, 10).unwrap(), b"0123456789");
+    assert_eq!(call(&p, &mut t, nr::LSEEK, [fd, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(call(&p, &mut t, nr::READ, [fd, s + 512, 100, 0, 0, 0]), 10);
+    assert_eq!(call(&p, &mut t, nr::FSTAT, [fd, s + 1024, 0, 0, 0, 0]), 0);
+    let st = p.mem.read(s + 1024, 128).unwrap();
+    assert_eq!(u32::from_le_bytes(st[16..20].try_into().unwrap()), 0o100444, "a regular file, read-only");
+    assert_eq!(i64::from_le_bytes(st[48..56].try_into().unwrap()), 0, "size 0, as /proc reports");
+    assert_eq!(call(&p, &mut t, nr::WRITE, [fd, s, 1, 0, 0, 0]), -(omni_linux::errno::EACCES.0 as i64));
+}

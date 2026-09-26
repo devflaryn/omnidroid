@@ -11,6 +11,7 @@ pub mod guest;
 pub mod manifest;
 pub mod mm;
 pub mod process;
+pub mod procfs;
 pub mod sys;
 pub mod syscall;
 pub mod vfs;
