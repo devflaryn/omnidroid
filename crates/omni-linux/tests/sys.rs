@@ -85,3 +85,27 @@ fn the_scheduler_is_sched_other_at_priority_zero() {
     assert_eq!(p.mem.read(s, 4).unwrap(), [0; 4], "sched_priority 0");
     assert_eq!(p.syscall(&mut t, nr::SCHED_GET_PRIORITY_MAX, [0; 6]), 0);
 }
+
+#[test]
+fn the_tagged_address_abi_is_accepted_and_reported() {
+    let (p, mut t, _) = process();
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [56, 0, 0, 0, 0, 0]), 0, "PR_GET_TAGGED_ADDR_CTRL: off at first");
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [55, 1, 0, 0, 0, 0]), 0, "PR_SET_TAGGED_ADDR_CTRL(ENABLE)");
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [56, 0, 0, 0, 0, 0]), 1);
+}
+
+#[test]
+fn a_signal_with_its_default_action_ends_the_process_by_that_signal() {
+    let (p, mut t, _) = process();
+    let pid = p.syscall(&mut t, nr::GETPID, [0; 6]);
+    assert_eq!(p.syscall(&mut t, nr::RT_TGSIGQUEUEINFO, [pid, pid, 6, 0, 0, 0]), 0);
+    assert_eq!(t.exit, Some(omni_linux::Exit::Signal(6)), "SIGABRT, default action: terminate");
+}
+
+#[test]
+fn a_signal_that_is_ignored_by_default_changes_nothing() {
+    let (p, mut t, _) = process();
+    let pid = p.syscall(&mut t, nr::GETPID, [0; 6]);
+    assert_eq!(p.syscall(&mut t, nr::TGKILL, [pid, pid, 17, 0, 0, 0]), 0, "SIGCHLD");
+    assert_eq!(t.exit, None);
+}

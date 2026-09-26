@@ -9,6 +9,13 @@ use omni_mem::{GuestSpace, Protection};
 
 use crate::errno::{Errno, EFAULT};
 
+/// Clear an address's top byte, as arm64 Linux's tagged-address ABI does for user pointers
+/// (Android's scudo tags every heap pointer: see `DynarmicOptions::top_byte_ignore`).
+#[must_use]
+pub const fn untag(addr: u64) -> u64 {
+    addr & 0x00FF_FFFF_FFFF_FFFF
+}
+
 pub struct GuestMem {
     space: Arc<GuestSpace>,
 }
@@ -28,7 +35,7 @@ impl GuestMem {
         if len == 0 {
             return Ok(std::ptr::null_mut());
         }
-        let start = usize::try_from(addr).map_err(|_| EFAULT)?;
+        let start = usize::try_from(untag(addr)).map_err(|_| EFAULT)?;
         let end = start.checked_add(len).ok_or(EFAULT)?;
         if !self.space.contains(start, len) {
             return Err(EFAULT);

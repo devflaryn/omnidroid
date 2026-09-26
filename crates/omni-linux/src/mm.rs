@@ -29,10 +29,19 @@ pub struct MapRequest {
     pub offset: u64,
 }
 
+/// A file mapping, as `/proc/self/maps` and fault reports name it.
+#[derive(Debug, Clone)]
+struct FileMapping {
+    len: u64,
+    guest: Vec<u8>,
+    offset: u64,
+}
+
 pub struct Mm {
     space: Arc<GuestSpace>,
     /// `MAP_FIXED`'s unmap-then-map must not interleave with another thread's mapping.
     lock: Mutex<()>,
+    files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
 }
 
 const fn round_up(v: u64) -> u64 {
@@ -52,7 +61,32 @@ fn protection(prot: u32) -> Result<Protection, Errno> {
 impl Mm {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>) -> Self {
-        Self { space, lock: Mutex::new(()) }
+        Self { space, lock: Mutex::new(()), files: Mutex::default() }
+    }
+
+    /// `path+0xoffset` for an address inside a file mapping.
+    #[must_use]
+    pub fn describe(&self, addr: u64) -> Option<String> {
+        let files = self.files.lock();
+        let (start, m) = files.range(..=addr).next_back()?;
+        (addr < start + m.len)
+            .then(|| format!("{}+{:#x}", String::from_utf8_lossy(&m.guest), m.offset + (addr - start)))
+    }
+
+    /// Forget file mappings in `[addr, addr + len)`, splitting any that straddle an edge.
+    fn forget(&self, addr: u64, len: u64) {
+        let end = addr + len;
+        let mut files = self.files.lock();
+        let hit: Vec<u64> = files.range(..end).filter(|(s, m)| *s + m.len > addr).map(|(s, _)| *s).collect();
+        for start in hit {
+            let m = files.remove(&start).expect("present");
+            if start < addr {
+                files.insert(start, FileMapping { len: addr - start, ..m.clone() });
+            }
+            if start + m.len > end {
+                files.insert(end, FileMapping { len: start + m.len - end, offset: m.offset + (end - start), guest: m.guest });
+            }
+        }
     }
 
     fn unmap_locked(&self, addr: u64, len: u64) -> Result<(), Errno> {
@@ -64,10 +98,12 @@ impl Mm {
                 self.space.unmap(s, e - s).map_err(|_| EINVAL)?;
             }
         }
+        self.forget(addr, len);
         Ok(())
     }
 
     pub fn unmap(&self, addr: u64, len: u64) -> Result<(), Errno> {
+        let addr = crate::guest::untag(addr);
         if addr % PAGE != 0 || len == 0 {
             return Err(EINVAL);
         }
@@ -76,6 +112,7 @@ impl Mm {
     }
 
     pub fn protect(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
+        let addr = crate::guest::untag(addr);
         if addr % PAGE != 0 {
             return Err(EINVAL);
         }
@@ -140,6 +177,10 @@ impl Mm {
         } else {
             None
         };
+        let label = |at: u64| {
+            self.forget(at, len);
+            self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
+        };
         let at = match at {
             Some(a) => {
                 if len > in_file {
@@ -164,6 +205,7 @@ impl Mm {
                 a
             }
         };
+        label(at);
         Ok(at)
     }
 }
@@ -182,9 +224,61 @@ fn sys_mprotect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if a[2] == MADV_DONTNEED {
-        p.mem.space().discard(a[0] as usize, round_up(a[1]) as usize).map_err(|_| EINVAL)?;
+        p.mem.space().discard(crate::guest::untag(a[0]) as usize, round_up(a[1]) as usize).map_err(|_| EINVAL)?;
     }
     Ok(0)
+}
+
+const MREMAP_MAYMOVE: u64 = 1;
+const MREMAP_FIXED: u64 = 2;
+
+fn prot_bits(p: Protection) -> u32 {
+    match p {
+        Protection::None => 0,
+        Protection::Read => PROT_READ,
+        Protection::ReadWrite => PROT_READ | PROT_WRITE,
+        Protection::ReadExecute => PROT_READ | PROT_EXEC,
+    }
+}
+
+/// `mremap` by copy: shrink in place, or (with `MREMAP_MAYMOVE`) move to a new or `MREMAP_FIXED`
+/// address, keeping contents and protection. bionic's CFI shadow uses the `FIXED` form to replace
+/// a range atomically; scudo's secondary grows with `MAYMOVE`.
+fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let (old, old_len, new_len, flags, target) = (crate::guest::untag(a[0]), round_up(a[1]), round_up(a[2]), a[3], a[4]);
+    if old % PAGE != 0 || new_len == 0 || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
+        p.refusals.record(format!("mremap flags {flags:#x}"), t.pc, t.lr);
+        return Err(EINVAL);
+    }
+    let fixed = flags & MREMAP_FIXED != 0;
+    if fixed && (flags & MREMAP_MAYMOVE == 0 || target % PAGE != 0 || (target < old + old_len && old < target + new_len)) {
+        return Err(EINVAL);
+    }
+    if !fixed && new_len <= old_len {
+        if new_len < old_len {
+            p.mm.unmap(old + new_len, old_len - new_len)?;
+        }
+        return Ok(old);
+    }
+    if !fixed && flags & MREMAP_MAYMOVE == 0 {
+        return Err(ENOMEM); // growing in place is not offered
+    }
+    let space = p.mem.space();
+    let region = space.region_at(old as usize).filter(|r| r.mapping.is_some()).ok_or(EFAULT)?;
+    let prot = region.protection;
+    let keep = old_len.min(new_len);
+    if prot == Protection::None || prot == Protection::ReadExecute {
+        space.protect(old as usize, keep as usize, Protection::Read).map_err(|_| EFAULT)?;
+    }
+    let bytes = p.mem.read(old, keep as usize)?;
+    let flags = 0x22 | if fixed { MAP_FIXED } else { 0 }; // MAP_PRIVATE | MAP_ANONYMOUS
+    let at = p.mm.map(p, t, MapRequest { addr: if fixed { target } else { 0 }, len: new_len, prot: PROT_READ | PROT_WRITE, flags, fd: -1, offset: 0 })?;
+    p.mem.write(at, &bytes)?;
+    if prot != Protection::ReadWrite {
+        p.mm.protect(at, new_len, prot_bits(prot))?;
+    }
+    p.mm.unmap(old, old_len)?;
+    Ok(at)
 }
 
 /// Always the same break: bionic's allocator uses `mmap`, and `sbrk` callers see "no growth".
@@ -198,4 +292,5 @@ pub fn install(table: &mut Table) {
     table.set(nr::MPROTECT, sys_mprotect);
     table.set(nr::MADVISE, sys_madvise);
     table.set(nr::BRK, sys_brk);
+    table.set(nr::MREMAP, sys_mremap);
 }

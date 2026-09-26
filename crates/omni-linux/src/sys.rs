@@ -20,12 +20,15 @@ pub struct SysState {
     actions: Mutex<[[u8; 32]; 65]>,
     futex: Mutex<HashMap<u64, u64>>, // address -> wake generation
     futex_cv: Condvar,
+    /// `PR_SET_TAGGED_ADDR_CTRL`'s value. Tagged pointers are accepted either way (see
+    /// `guest::untag`); this is what `PR_GET_TAGGED_ADDR_CTRL` reports back.
+    tagged_addr_ctrl: std::sync::atomic::AtomicU64,
 }
 
 impl SysState {
     #[must_use]
     pub fn new(pid: i32, uid: u32) -> Self {
-        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), futex: Mutex::default(), futex_cv: Condvar::new() }
+        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), futex: Mutex::default(), futex_cv: Condvar::new(), tagged_addr_ctrl: std::sync::atomic::AtomicU64::new(0) }
     }
 
     /// Wake every waiter on `addr` (A1 has one thread; A4 counts and limits properly).
@@ -132,6 +135,8 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     match a[0] {
         15 => { t.name = p.mem.read_cstr(a[1], 4096)?.into_iter().take(15).collect(); Ok(0) } // PR_SET_NAME
         16 => { let mut n = t.name.clone(); n.resize(16, 0); p.mem.write(a[1], &n)?; Ok(0) } // PR_GET_NAME
+        55 => { p.sys.tagged_addr_ctrl.store(a[1], std::sync::atomic::Ordering::Relaxed); Ok(0) } // PR_SET_TAGGED_ADDR_CTRL
+        56 => Ok(p.sys.tagged_addr_ctrl.load(std::sync::atomic::Ordering::Relaxed)), // PR_GET_TAGGED_ADDR_CTRL
         3 => Ok(1),                              // PR_GET_DUMPABLE
         4 | 38 | 0x59616d61 => Ok(0),            // PR_SET_DUMPABLE, PR_SET_NO_NEW_PRIVS, PR_SET_PTRACER
         39 => Ok(0),                             // PR_GET_NO_NEW_PRIVS
@@ -297,7 +302,58 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     }
 }
 
+/// Send `sig` to this task. A1 has one thread and no delivery (A5): the default action is carried
+/// out -- terminate, or nothing for the signals ignored by default -- and a handler the guest
+/// installed is recorded as a refusal, not run.
+fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
+    if target != i64::from(t.tid) && target != i64::from(p.sys.pid) && target != 0 && target != -1 {
+        return Err(ESRCH);
+    }
+    if sig == 0 {
+        return Ok(0);
+    }
+    if !(1..=64).contains(&sig) {
+        return Err(EINVAL);
+    }
+    let handler = u64::from_le_bytes(p.sys.actions.lock()[sig as usize][..8].try_into().expect("8 bytes"));
+    match handler {
+        1 => Ok(0), // SIG_IGN
+        0 => {
+            match sig {
+                17 | 18 | 23 | 28 => {}                          // SIGCHLD, SIGCONT, SIGURG, SIGWINCH: ignored
+                19..=22 => p.refusals.record(format!("stop by signal {sig}"), t.pc, t.lr),
+                _ => t.exit = Some(Exit::Signal(sig as i32)),     // terminate
+            }
+            Ok(0)
+        }
+        _ => {
+            p.refusals.record(format!("signal delivery to a handler (A5): signal {sig}"), t.pc, t.lr);
+            Ok(0)
+        }
+    }
+}
+
+fn sys_kill(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    send_signal(p, t, a[0] as i64, a[1])
+}
+
+fn sys_tkill(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    send_signal(p, t, a[0] as i64, a[1])
+}
+
+/// `tgkill(tgid, tid, sig)` and `rt_tgsigqueueinfo(tgid, tid, sig, info)`: the target is `tid`.
+fn sys_tgkill(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    if a[0] as i64 != i64::from(p.sys.pid) {
+        return Err(ESRCH);
+    }
+    send_signal(p, t, a[1] as i64, a[2])
+}
+
 pub fn install(table: &mut Table) {
+    table.set(nr::KILL, sys_kill);
+    table.set(nr::TKILL, sys_tkill);
+    table.set(nr::TGKILL, sys_tgkill);
+    table.set(nr::RT_TGSIGQUEUEINFO, sys_tgkill);
     table.set(nr::GETPID, sys_getpid);
     table.set(nr::GETPPID, sys_getppid);
     table.set(nr::GETTID, sys_gettid);

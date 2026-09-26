@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use omni_cpu::dynarmic::{DynarmicBackend, DynarmicOptions};
-use omni_cpu::{ExitReason, GuestAddressSpace, GuestCpu, GuestCpuBackend, GuestThreadConfig, RunLimit, ThunkCall, ThunkContext};
+use omni_cpu::{ExitReason, GuestAddressSpace, GuestCpu, GuestCpuBackend, GuestThreadConfig, RunLimit, ThunkCall, ThunkContext, XReg};
 use omni_mem::{GuestSpace, GuestSpaceConfig};
 use parking_lot::Mutex;
 
@@ -26,6 +26,8 @@ pub enum ExitStatus {
 pub enum Exit {
     Thread(i32),
     Group(i32),
+    /// Ended by a signal whose action is to terminate (A5 delivers to handlers).
+    Signal(i32),
 }
 
 pub struct SpawnConfig {
@@ -153,7 +155,9 @@ impl Process {
             GuestSpace::with_config(GuestSpaceConfig { size: GUEST_SPACE_BYTES, ..GuestSpaceConfig::default() })
                 .map_err(|e| format!("reserve the guest address space: {e}"))?,
         );
-        let backend = DynarmicBackend::new(Arc::clone(&space), DynarmicOptions::default()).map_err(|e| format!("the CPU backend: {e}"))?;
+        // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
+        let options = DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() };
+        let backend = DynarmicBackend::new(Arc::clone(&space), options).map_err(|e| format!("the CPU backend: {e}"))?;
         let p = Self::assemble(space, vfs, config.stdout, config.stderr, config.trace, Some(backend), 0);
         let mut loader = Task::new(PID, Arc::clone(&p));
         let name = |e| format!("{}: {e:?}", String::from_utf8_lossy(&exe));
@@ -201,24 +205,56 @@ impl Process {
         loop {
             let exit = match cpu.run(pc as usize, RunLimit::Unlimited) {
                 Ok(e) => e,
-                Err(e) => return ExitStatus::Killed { signal: 6, pc, detail: format!("the CPU backend: {e}") },
+                Err(e) => {
+                    let detail = format!("the CPU backend: {e}
+{}", self.registers(cpu));
+                    return ExitStatus::Killed { signal: 6, pc: cpu.pc() as u64, detail };
+                }
             };
             match (exit, task.exit) {
                 (ExitReason::UnsupportedInstruction { .. }, Some(Exit::Group(code) | Exit::Thread(code))) => {
                     return ExitStatus::Exited(code);
+                }
+                (ExitReason::UnsupportedInstruction { pc: at, .. }, Some(Exit::Signal(signal))) => {
+                    let detail = format!("the default action of signal {signal}
+{}", self.registers(cpu));
+                    return ExitStatus::Killed { signal, pc: at as u64, detail };
                 }
                 (ExitReason::UnsupportedInstruction { pc: at, encoding }, None) if encoding & 0xFFE0_001F == 0xD400_0001 => {
                     // An SVC deferred for another reason (A5: signal delivery). None exist in A1.
                     pc = at as u64 + 4;
                 }
                 (ExitReason::MemoryFault { pc: at, address, access }, _) => {
-                    return ExitStatus::Killed { signal: 11, pc: at as u64, detail: format!("{access:?} at {address:#x}") };
+                    let detail = format!("{access:?} at {address:#x}
+{}", self.registers(cpu));
+                    return ExitStatus::Killed { signal: 11, pc: at as u64, detail };
                 }
                 (other, _) => {
-                    return ExitStatus::Killed { signal: 4, pc: other.pc() as u64, detail: format!("{other}") };
+                    let detail = format!("{other}
+{}", self.registers(cpu));
+                    return ExitStatus::Killed { signal: 4, pc: other.pc() as u64, detail };
                 }
             }
         }
+    }
+
+    /// `pc`, `lr` and `sp` labelled from the file mappings, then `x0`..`x28`: a fault's evidence.
+    fn registers(&self, cpu: &dyn GuestCpu) -> String {
+        let label = |a: u64| self.mm.describe(a).map_or_else(String::new, |d| format!(" ({d})"));
+        let x = |n: u8| cpu.x(XReg::new(n).expect("a general-purpose register"));
+        let mut out = format!(
+            "  pc {:#x}{}
+  lr {:#x}{}
+  sp {:#x}
+",
+            cpu.pc(), label(cpu.pc() as u64), x(30), label(x(30)), cpu.sp()
+        );
+        for n in 0..29u8 {
+            out += &format!("  x{n:<2} {:#018x}{}", x(n), if n % 4 == 3 { "
+" } else { "" });
+        }
+        out + "
+"
     }
 
     pub fn report(&self) -> String {

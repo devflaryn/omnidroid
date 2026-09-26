@@ -46,3 +46,11 @@ fn a_c_string_ending_at_the_end_of_the_mapping_is_read() {
     m.write(end - 4, b"abc\0").expect("write");
     assert_eq!(m.read_cstr(end - 4, 4096).expect("string"), b"abc");
 }
+
+#[test]
+fn a_tagged_pointer_reaches_the_untagged_address_as_the_tagged_address_abi_says() {
+    let (m, rw, _) = mem();
+    let tagged = rw | (0x02 << 56);
+    m.write(tagged, b"tag").expect("write through a tagged pointer");
+    assert_eq!(m.read(rw, 3).expect("read untagged"), b"tag");
+}

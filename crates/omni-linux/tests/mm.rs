@@ -99,3 +99,41 @@ fn munmap_over_holes_succeeds_and_mprotect_takes_effect() {
     assert_eq!(p.syscall(&mut t, nr::MPROTECT, [again, 4096, PROT_READ, 0, 0, 0]), 0);
     assert!(p.mem.write(again, b"x").is_err(), "read-only now");
 }
+
+#[test]
+fn an_address_in_a_file_mapping_is_described_as_file_plus_offset() {
+    let (p, mut t, s) = process();
+    p.mem.write(s, b"/system/lib64/libx.so\0").unwrap();
+    let fd = p.syscall(&mut t, nr::OPENAT, [(-100i64) as u64, s, 0, 0, 0, 0]);
+    let at = mmap(&p, &mut t, [0, 2 * 4096, PROT_READ, MAP_PRIVATE, fd, 4096]) as u64;
+    assert_eq!(p.mm.describe(at + 0x10).as_deref(), Some("/system/lib64/libx.so+0x1010"));
+    assert_eq!(p.syscall(&mut t, nr::MUNMAP, [at, 2 * 4096, 0, 0, 0, 0]), 0);
+    assert_eq!(p.mm.describe(at + 0x10), None, "gone with the mapping");
+}
+
+const MREMAP_MAYMOVE: u64 = 1;
+const MREMAP_FIXED: u64 = 2;
+
+#[test]
+fn mremap_fixed_moves_the_contents_over_an_existing_mapping() {
+    let (p, mut t, _) = process();
+    let a = mmap(&p, &mut t, [0, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    let b = mmap(&p, &mut t, [0, 4 * 4096, PROT_READ, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    p.mem.write(a + 4096, b"moved").unwrap();
+    let r = p.syscall(&mut t, nr::MREMAP, [a, 2 * 4096, 2 * 4096, MREMAP_MAYMOVE | MREMAP_FIXED, b + 4096, 0]);
+    assert_eq!(r, b + 4096);
+    assert_eq!(p.mem.read(b + 2 * 4096, 5).unwrap(), b"moved");
+    assert!(p.mem.write(b + 4096, b"w").is_ok(), "the moved pages keep their protection");
+    assert!(p.mem.read(a, 1).is_err(), "the old range is gone");
+}
+
+#[test]
+fn mremap_maymove_grows_a_mapping_keeping_its_contents() {
+    let (p, mut t, _) = process();
+    let a = mmap(&p, &mut t, [0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    p.mem.write(a, b"grow").unwrap();
+    let r = p.syscall(&mut t, nr::MREMAP, [a, 4096, 3 * 4096, MREMAP_MAYMOVE, 0, 0]);
+    assert!((r as i64) > 0);
+    assert_eq!(p.mem.read(r, 4).unwrap(), b"grow");
+    assert_eq!(p.mem.read(r + 2 * 4096, 4).unwrap(), [0; 4], "the new tail is zero");
+}
