@@ -64,6 +64,12 @@ impl FdTable {
         Self { fds: Mutex::new(fds) }
     }
 
+    /// Every open descriptor, lowest first.
+    #[must_use]
+    pub fn list(&self) -> Vec<(i32, Arc<OpenFile>)> {
+        self.fds.lock().iter().map(|(fd, (f, _))| (*fd, Arc::clone(f))).collect()
+    }
+
     pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
         self.fds.lock().get(&fd).map(|(f, _)| Arc::clone(f)).ok_or(EBADF)
     }
@@ -424,7 +430,7 @@ fn sys_newfstatat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 /// The guest path an open descriptor names, as `/proc/self/fd/N` reports it.
-fn guest_path_of(file: &OpenFile) -> Vec<u8> {
+pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
     match &*file.kind.lock() {
         FileKind::Host { guest, .. } | FileKind::Synth { guest, .. } => guest.clone(),
         FileKind::Dir { dir, .. } => dir.path.clone(),
@@ -438,14 +444,6 @@ fn guest_path_of(file: &OpenFile) -> Vec<u8> {
 
 fn sys_readlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
-    if let Some(n) = path.strip_prefix(b"/proc/self/fd/") {
-        // The descriptor table is the process's, not the filesystem's: answered here.
-        let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok()).ok_or(ENOENT)?;
-        let target = guest_path_of(&*p.fds.get(fd).map_err(|_| ENOENT)?);
-        let n = target.len().min(a[3] as usize);
-        p.mem.write(a[2], &target[..n])?;
-        return Ok(n as u64);
-    }
     let base = base_dir(p, a[0], &path)?;
     match p.vfs.resolve(&base, &path, false)?.node {
         Node::Symlink { target } => {

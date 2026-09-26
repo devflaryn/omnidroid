@@ -185,6 +185,12 @@ impl Vfs {
         self.procfs()?.read(path)
     }
 
+    /// The executable's guest path (`/proc/<pid>/exe`).
+    #[must_use]
+    pub fn exe(&self) -> &[u8] {
+        &self.exe
+    }
+
     #[must_use]
     pub fn sysroot(&self) -> &Arc<Sysroot> {
         &self.sysroot

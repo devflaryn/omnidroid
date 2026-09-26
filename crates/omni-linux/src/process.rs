@@ -50,6 +50,10 @@ pub struct Process {
     pub mm: Mm,
     pub sys: SysState,
     pub trace: bool,
+    /// The program's arguments, as `/proc/<pid>/cmdline` reports them.
+    pub argv: Vec<Vec<u8>>,
+    /// The main thread's name (`/proc/<pid>/comm`): argv[0]'s basename until `PR_SET_NAME`.
+    pub comm: Mutex<Vec<u8>>,
     backend: Option<DynarmicBackend>,
     start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
@@ -120,10 +124,14 @@ impl Process {
         }
     }
 
-    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, stdout: Output, stderr: Output, trace: bool, backend: Option<DynarmicBackend>, scratch: u64) -> Arc<Self> {
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<DynarmicBackend>, scratch: u64) -> Arc<Self> {
         let mut table = Table::new();
         crate::install_all(&mut table);
-        Arc::new(Self {
+        let comm = argv.first().map_or_else(Vec::new, |a| {
+            a.rsplit(|&b| b == b'/').next().unwrap_or(a).iter().copied().take(15).collect()
+        });
+        let p = Arc::new(Self {
             mem: GuestMem::new(Arc::clone(&space)),
             table,
             refusals: Refusals::default(),
@@ -133,11 +141,17 @@ impl Process {
             mm: Mm::new(space),
             sys: SysState::new(PID, UID),
             trace,
+            argv,
+            comm: Mutex::new(comm),
             backend,
             start: Mutex::new(None),
             exit: Mutex::new(None),
             scratch,
-        })
+        });
+        // `/proc` and `/sys` are generated from the process itself (`procfs`).
+        let proc: Arc<dyn crate::procfs::ProcFs> = Arc::clone(&p) as Arc<dyn crate::procfs::ProcFs>;
+        p.vfs.attach_proc(Arc::downgrade(&proc));
+        p
     }
 
     pub fn spawn(config: SpawnConfig) -> Result<Arc<Self>, String> {
@@ -158,7 +172,7 @@ impl Process {
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
         let options = DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() };
         let backend = DynarmicBackend::new(Arc::clone(&space), options).map_err(|e| format!("the CPU backend: {e}"))?;
-        let p = Self::assemble(space, vfs, config.stdout, config.stderr, config.trace, Some(backend), 0);
+        let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(backend), 0);
         let mut loader = Task::new(PID, Arc::clone(&p));
         let name = |e| format!("{}: {e:?}", String::from_utf8_lossy(&exe));
         let program = exec::load_elf(&p, &loader, &exe).map_err(name)?;
@@ -171,6 +185,7 @@ impl Process {
         };
         let stack = p.mm.map(&p, &loader, MapRequest { addr: 0, len: STACK_BYTES + 4096, prot: 3, flags: 0x22 | 0x20000, fd: -1, offset: 0 }).map_err(|e| format!("the main stack: {e:?}"))?;
         p.mm.protect(stack, 4096, 0).map_err(|e| format!("the stack guard: {e:?}"))?;
+        p.mm.label(stack + 4096, STACK_BYTES, b"[stack]");
         let top = stack + STACK_BYTES + 4096;
         let mut random = [0u8; 16];
         omni_platform::process::random_bytes(&mut random).map_err(|e| format!("AT_RANDOM: {e}"))?;
@@ -288,7 +303,8 @@ impl Process {
         let scratch = space
             .map_anonymous(omni_mem::Placement::Anywhere { align: space.page_size() }, 1 << 20, omni_mem::Protection::ReadWrite, omni_mem::CommitPolicy::Lazy)
             .expect("scratch") as u64;
-        Self::assemble(space, vfs, stdout.clone(), stdout, false, None, scratch)
+        let argv = vec![vfs.exe().to_vec()];
+        Self::assemble(space, vfs, argv, stdout.clone(), stdout, false, None, scratch)
     }
 
     pub fn scratch(&self) -> u64 {

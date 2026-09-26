@@ -33,6 +33,18 @@ impl SysState {
         Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), futex: Mutex::default(), futex_cv: Condvar::new(), tagged_addr_ctrl: std::sync::atomic::AtomicU64::new(0), umask: std::sync::atomic::AtomicU32::new(0o022) }
     }
 
+    /// Time since the process started.
+    #[must_use]
+    pub fn uptime(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    /// The file-creation mask.
+    #[must_use]
+    pub fn umask(&self) -> u32 {
+        self.umask.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Wake every waiter on `addr` (A1 has one thread; A4 counts and limits properly).
     pub fn futex_wake(&self, addr: u64) {
         *self.futex.lock().entry(addr).or_insert(0) += 1;
@@ -135,7 +147,14 @@ fn sys_sigaltstack(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     match a[0] {
-        15 => { t.name = p.mem.read_cstr(a[1], 4096)?.into_iter().take(15).collect(); Ok(0) } // PR_SET_NAME
+        15 => {
+            // PR_SET_NAME; the main thread's name is also the process's `comm`.
+            t.name = p.mem.read_cstr(a[1], 4096)?.into_iter().take(15).collect();
+            if t.tid == p.sys.pid {
+                *p.comm.lock() = t.name.clone();
+            }
+            Ok(0)
+        }
         16 => { let mut n = t.name.clone(); n.resize(16, 0); p.mem.write(a[1], &n)?; Ok(0) } // PR_GET_NAME
         55 => { p.sys.tagged_addr_ctrl.store(a[1], std::sync::atomic::Ordering::Relaxed); Ok(0) } // PR_SET_TAGGED_ADDR_CTRL
         56 => Ok(p.sys.tagged_addr_ctrl.load(std::sync::atomic::Ordering::Relaxed)), // PR_GET_TAGGED_ADDR_CTRL
@@ -205,7 +224,9 @@ fn sys_uname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
-fn limit(resource: u64) -> (u64, u64) {
+/// A resource limit's (soft, hard) pair, as `prlimit64` and `/proc/<pid>/limits` report it.
+#[must_use]
+pub fn limit(resource: u64) -> (u64, u64) {
     const INF: u64 = u64::MAX;
     match resource {
         3 => (8 << 20, INF),     // RLIMIT_STACK

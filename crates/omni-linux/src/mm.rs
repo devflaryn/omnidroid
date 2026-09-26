@@ -64,6 +64,20 @@ impl Mm {
         Self { space, lock: Mutex::new(()), files: Mutex::default() }
     }
 
+    /// Name a range that is not a file (`[stack]`), for `/proc/<pid>/maps`.
+    pub fn label(&self, start: u64, len: u64, name: &[u8]) {
+        self.forget(start, len);
+        self.files.lock().insert(start, FileMapping { len, guest: name.to_vec(), offset: 0 });
+    }
+
+    /// The name and file offset at `addr`, if a mapping there is named.
+    #[must_use]
+    pub fn name_at(&self, addr: u64) -> Option<(Vec<u8>, u64)> {
+        let files = self.files.lock();
+        let (start, m) = files.range(..=addr).next_back()?;
+        (addr < start + m.len).then(|| (m.guest.clone(), m.offset + (addr - start)))
+    }
+
     /// `path+0xoffset` for an address inside a file mapping.
     #[must_use]
     pub fn describe(&self, addr: u64) -> Option<String> {
