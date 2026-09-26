@@ -65,6 +65,24 @@ MEASURED with a probe, then pinned by `vm_footprint_macos`:
   device: of the APK's arm64 libraries only `libzstd-jni-1.5.7-6.so` (`p_align` 0x1000). Only
   `libroblox.so` is loaded, so nothing depends on it.
 
+## The Linux personality (`omni-linux`, D39)
+
+A1 passes here (`a1-mac`): the real AOSP 15 `toybox echo hello` prints `hello` and exits 0 through
+the real `linker64` and `libc.so`; the only refusal is liblog's `socket` to logd, as on Windows.
+
+* **The page is the host's.** `Mm` takes its page from the guest space and `AT_PAGESZ` says 16 KiB,
+  as a 16 KiB Android 15 device does, so every `mmap`/`mprotect`/`munmap` the guest makes is whole
+  host pages. Every ELF in the arm64 sysroot has `p_align` 0x4000 (1,590 checked), so nothing needs
+  a private copy for alignment. A program or interpreter whose `PT_LOAD` offset and address
+  disagree within the page is refused at exec (`EINVAL`), as a 16 KiB kernel refuses it; libraries
+  are `linker64`'s to judge.
+* **Top Byte Ignore**: dynarmic's arm64 backend already masks 56 mirrored bits (one `ubfx` before
+  the fastmem access), so no patch; `tbi.rs` passes with zero slow-path entries. XNU itself enables
+  TBI for user space (a native load through `ptr | 0x02 << 56` reaches `ptr`), so *without* the
+  option a tagged guest pointer does not fault here either: `vm::host_ignores_top_byte`.
+* The sysroot is not in git: copy `sysroot/aosp-35` from another machine and check it with
+  `python3 tools/make_sysroot.py --verify sysroot/aosp-35`.
+
 ## What differs on this host
 
 | area | macOS |
