@@ -346,6 +346,25 @@ pub trait GuestCpu: Send {
     /// As [`add_inline_thunk`](GuestCpu::add_inline_thunk).
     fn remove_inline_thunk(&mut self, address: GuestAddr) -> CpuResult<bool>;
 
+    /// Serve every guest `SVC` that is not one of Omnidroid's own thunks inside the run loop.
+    ///
+    /// This is the Linux kernel personality's entry (`omni-linux`): the handler sees the `SVC`'s
+    /// address and the registers; returning resumes the guest at the next instruction without
+    /// leaving the loop. A handler that needs the run to stop -- a thread exiting, a signal to
+    /// deliver -- calls [`ThunkCall::defer_to_caller`], and `run` returns
+    /// [`ExitReason::UnsupportedInstruction`] naming the `SVC`, exactly as an unserved one does.
+    ///
+    /// [`ThunkCall::defer_to_caller`]: crate::ThunkCall::defer_to_caller
+    /// [`ExitReason::UnsupportedInstruction`]: crate::ExitReason::UnsupportedInstruction
+    fn set_svc_handler(&mut self, handler: ThunkFn, context: ThunkContext) -> CpuResult<()> {
+        let _ = (handler, context);
+        Err(crate::error::CpuError::Unsupported {
+            backend: self.backend_name(),
+            operation: "serve guest syscalls inside the run loop",
+            reason: "this backend has no in-loop supervisor-call hook",
+        })
+    }
+
     /// How many inline thunks this context has serviced, of which how many were deferred.
     ///
     /// Not a statistic: it is what lets a test tell *dispatched inline* apart from *took the exit

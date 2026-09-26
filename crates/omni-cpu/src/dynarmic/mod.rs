@@ -1464,6 +1464,8 @@ pub(crate) struct CpuCtx {
     /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
     /// [`DynarmicCpu::add_inline_thunk`].
     pub(crate) inline_thunks: inline_table::InlineThunks,
+    /// The guest-syscall handler (`GuestCpu::set_svc_handler`), if one is registered.
+    pub(crate) svc_handler: Option<(ThunkFn, ThunkContext)>,
     /// How many inline thunks have been serviced, so a measurement can prove the path ran.
     pub(crate) inline_calls: u64,
     /// How many of those asked to be handed back to the caller. See
@@ -1603,6 +1605,7 @@ impl DynarmicCpu {
             executable_cache: None,
             thunks: BTreeSet::new(),
             inline_thunks: inline_table::InlineThunks::default(),
+            svc_handler: None,
             inline_calls: 0,
             inline_deferred: 0,
             hints: 0,
@@ -2311,6 +2314,20 @@ impl GuestCpu for DynarmicCpu {
         }
         self.invalidate_word(address)?;
         Ok(had)
+    }
+
+    fn set_svc_handler(&mut self, handler: ThunkFn, context: ThunkContext) -> CpuResult<()> {
+        // The same condition as `add_inline_thunk`, for the same reason: a handler served inside
+        // the loop is only tested under the flag set whose dispatch checks the halt flag (D35).
+        if !self.shared.options.interruptible {
+            return Err(CpuError::Unsupported {
+                backend: BACKEND_NAME,
+                operation: "serve guest syscalls inside the run loop",
+                reason: "`DynarmicOptions::interruptible` is false",
+            });
+        }
+        self.with_ctx(|ctx| ctx.svc_handler = Some((handler, context)));
+        Ok(())
     }
 
     fn inline_thunk_calls(&self) -> InlineThunkCounts {

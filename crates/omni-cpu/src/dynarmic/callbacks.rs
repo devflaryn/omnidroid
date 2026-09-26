@@ -475,11 +475,25 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
                 PendingExit::Returned { pc: site }
             } else if c.thunks.contains(&site) {
                 PendingExit::Thunk { pc: site }
+            } else if let Some((handler, context)) = c.svc_handler {
+                // A genuine guest syscall, and a kernel personality (`omni-linux`) to serve it.
+                // Same guard and same resume rule as an inline thunk, except that the resume is the
+                // instruction after the `SVC`, not `X30`: this was not a call.
+                let guard = mxcsr::Guard::enter(c.host_mxcsr);
+                let mut regs = JitRegs::new(c.jit);
+                let mut call = ThunkCall::new(&mut regs, site, context);
+                handler(&mut call);
+                let deferred = call.is_deferred();
+                drop(guard);
+                if !deferred {
+                    dynarmic_sys::od_jit_set_pc(c.jit, (site + 4) as u64);
+                    return;
+                }
+                PendingExit::Unsupported { pc: site, encoding: 0xD400_0001 | ((swi & 0xFFFF) << 5) }
             } else {
-                // A genuine guest supervisor call. `UnsupportedInstruction` rather than a fabricated
-                // success (Global Constraint 1): M3's syscall layer is what turns this into
-                // something the guest can proceed from, and until then the runtime must be told
-                // precisely which call it could not serve.
+                // A genuine guest supervisor call and no kernel personality registered.
+                // `UnsupportedInstruction` rather than a fabricated success (Global Constraint 1):
+                // the runtime must be told precisely which call it could not serve.
                 PendingExit::Unsupported {
                     pc: site,
                     encoding: 0xD400_0001 | ((swi & 0xFFFF) << 5),
