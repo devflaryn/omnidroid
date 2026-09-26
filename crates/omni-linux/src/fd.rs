@@ -229,6 +229,19 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
     }
 }
 
+/// Read up to `buf.len()` bytes at `offset` without moving the descriptor's position.
+pub fn pread_all(file: &OpenFile, buf: &mut [u8], offset: u64) -> Result<usize, Errno> {
+    let mut done = 0;
+    while done < buf.len() {
+        let n = read_file(file, &mut buf[done..], Some(offset + done as u64))?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    Ok(done)
+}
+
 fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
     let sink = |out: &Output, host: &mut dyn Write| match out {
         Output::Host => host.write_all(bytes).and_then(|()| host.flush()).map(|()| bytes.len()).map_err(|_| EIO),

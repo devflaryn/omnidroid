@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::fd::FdTable;
 use crate::guest::GuestMem;
+use crate::mm::Mm;
 use crate::syscall::{Refusals, Table};
 use crate::vfs::Vfs;
 
@@ -13,6 +14,7 @@ pub struct Process {
     pub vfs: Vfs,
     pub fds: FdTable,
     pub cwd: parking_lot::Mutex<Vec<u8>>,
+    pub mm: Mm,
     scratch: u64,
 }
 
@@ -41,7 +43,8 @@ impl Process {
         let mut table = Table::new();
         crate::install_all(&mut table);
         Arc::new(Self {
-            mem: GuestMem::new(space),
+            mem: GuestMem::new(Arc::clone(&space)),
+            mm: Mm::new(space),
             table,
             refusals: Refusals::default(),
             vfs,
