@@ -93,3 +93,37 @@ fn a_guest_managed_thread_starts_with_a_null_thread_pointer_and_sets_its_own() {
     assert_eq!(cpu.x(x(2)), 0x1234);
     assert_eq!(cpu.tpidr_el0(), 0x1234);
 }
+
+fn answer_one(call: &mut ThunkCall<'_>) {
+    call.set_x(0, 1);
+}
+
+/// The in-loop syscall's round trip (spec §5's performance guard, target <= 40 ns on Windows
+/// against the thunk's 26.7-31.0 ns). Prints the figure; asserts only that every call was served.
+#[test]
+fn the_in_loop_syscall_round_trip_is_measured() {
+    const CALLS: u64 = 2_000_000;
+    let guest = Guest::new();
+    let mut program = mov64(9, CALLS);
+    program.extend([
+        movz(8, 172, 0),
+        svc(0),
+        add_reg(10, 10, 0), // x10 += x0: counts the served calls
+        subs_imm(9, 9, 1),
+        b_cond(1, -4), // b.ne back to the movz
+        ret(30),
+    ]);
+    let entry = guest.load(&program);
+    let (mut cpu, sentinel) = guest.thread();
+    cpu.set_svc_handler(answer_one, ThunkContext(0)).expect("a syscall handler");
+    cpu.set_x(x(10), 0);
+    let start = std::time::Instant::now();
+    let exit = cpu.run(entry, RunLimit::Unlimited).expect("the loop runs");
+    let elapsed = start.elapsed();
+    assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "{exit}");
+    assert_eq!(cpu.x(x(10)), CALLS, "every call was served in the loop");
+    println!(
+        "in-loop syscall: {:.1} ns per call ({CALLS} calls, loop overhead included)",
+        elapsed.as_nanos() as f64 / CALLS as f64
+    );
+}
