@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::fd::FdTable;
 use crate::guest::GuestMem;
 use crate::mm::Mm;
+use crate::sys::SysState;
 use crate::syscall::{Refusals, Table};
 use crate::vfs::Vfs;
 
@@ -15,6 +16,7 @@ pub struct Process {
     pub fds: FdTable,
     pub cwd: parking_lot::Mutex<Vec<u8>>,
     pub mm: Mm,
+    pub sys: SysState,
     scratch: u64,
 }
 
@@ -45,6 +47,7 @@ impl Process {
         Arc::new(Self {
             mem: GuestMem::new(Arc::clone(&space)),
             mm: Mm::new(space),
+            sys: SysState::new(1000, 10000),
             table,
             refusals: Refusals::default(),
             vfs,
@@ -59,7 +62,7 @@ impl Process {
     }
 
     pub fn test_task(self: &Arc<Self>) -> Task {
-        Task { tid: 1, process: Arc::clone(self), pc: 0, lr: 0 }
+        Task::new(1000, Arc::clone(self))
     }
 }
 
@@ -69,4 +72,29 @@ pub struct Task {
     /// The `SVC`'s address and `X30` at the current syscall, for refusal records.
     pub pc: u64,
     pub lr: u64,
+    pub clear_child_tid: u64,
+    pub sigmask: u64,
+    pub altstack: [u8; 24],
+    pub name: Vec<u8>,
+    pub exit: Option<Exit>,
+}
+
+/// How a task asked to end: `exit` ends the thread, `exit_group` the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Thread(i32),
+    Group(i32),
+}
+
+fn altstack_disabled() -> [u8; 24] {
+    let mut s = [0u8; 24];
+    s[8..12].copy_from_slice(&2i32.to_le_bytes()); // SS_DISABLE
+    s
+}
+
+impl Task {
+    #[must_use]
+    pub fn new(tid: i32, process: Arc<Process>) -> Self {
+        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None }
+    }
 }

@@ -21,4 +21,5 @@ pub use process::{Process, Task};
 pub fn install_all(table: &mut syscall::Table) {
     fd::install(table);
     mm::install(table);
+    sys::install(table);
 }
