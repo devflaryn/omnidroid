@@ -183,6 +183,9 @@ impl Process {
         let (bytes, sp) = exec::build_stack(top, &config.argv, &config.envp, &auxv, random, &exe);
         p.mem.write(top - bytes.len() as u64, &bytes).map_err(|e| format!("the initial stack: {e:?}"))?;
         loader.exit = None;
+        if p.trace {
+            eprintln!("[exec] stack [{stack:#x}, {top:#x}) guard [{stack:#x}, {:#x}) sp {sp:#x} entry {entry:#x}", stack + 4096);
+        }
         *p.start.lock() = Some((entry, sp));
         Ok(p)
     }
@@ -193,15 +196,24 @@ impl Process {
         let backend = self.backend.as_ref().expect("a spawned process has a backend");
         let config = GuestThreadConfig::guest_managed(GuestAddressSpace::of(self.mem.space()).expect("the space's extent"));
         let mut cpu = backend.create_thread(config).expect("the main thread");
-        let mut task = Box::new(Task::new(PID, Arc::clone(self)));
-        cpu.set_svc_handler(on_svc, ThunkContext(&mut *task as *mut Task as usize)).expect("the syscall entry");
+        // The task is reached two ways: by `on_svc`, through the context pointer, from inside the
+        // JIT; and by the loop below, between runs. So no reference to it may live across
+        // `cpu.run` -- a `&mut Task` held there let the optimizer keep `exit` in a register and
+        // miss `exit_group` (a release-only hang that recursed bionic's exit onto the guard page).
+        // It is a raw pointer, and the loop reads it with a volatile load.
+        let task: *mut Task = Box::into_raw(Box::new(Task::new(PID, Arc::clone(self))));
+        cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
         cpu.set_sp(sp as usize);
-        let status = self.run_task(&mut *cpu, &mut task, pc);
+        let status = self.run_task(&mut *cpu, task, pc);
+        drop(cpu);
+        // SAFETY: `task` came from `Box::into_raw` above, and the only other path to it, the CPU's
+        // syscall handler, was dropped with the CPU on the line before.
+        drop(unsafe { Box::from_raw(task) });
         *self.exit.lock() = Some(status.clone());
         status
     }
 
-    fn run_task(&self, cpu: &mut dyn GuestCpu, task: &mut Task, mut pc: u64) -> ExitStatus {
+    fn run_task(&self, cpu: &mut dyn GuestCpu, task: *mut Task, mut pc: u64) -> ExitStatus {
         loop {
             let exit = match cpu.run(pc as usize, RunLimit::Unlimited) {
                 Ok(e) => e,
@@ -211,7 +223,10 @@ impl Process {
                     return ExitStatus::Killed { signal: 6, pc: cpu.pc() as u64, detail };
                 }
             };
-            match (exit, task.exit) {
+            // SAFETY: `task` is live for the whole loop (see `run`), and no reference to it is held
+            // here; the volatile read is what makes `on_svc`'s write inside `cpu.run` visible.
+            let asked = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*task).exit)) };
+            match (exit, asked) {
                 (ExitReason::UnsupportedInstruction { .. }, Some(Exit::Group(code) | Exit::Thread(code))) => {
                     return ExitStatus::Exited(code);
                 }
