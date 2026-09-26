@@ -1,1 +1,515 @@
-//! Filled in by the A1 plan, Task 6.
+//! Descriptors and the file syscalls.
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use crate::errno::*;
+use crate::process::{Process, Task};
+use crate::syscall::{nr, Table};
+use crate::vfs::{ino_of, DevNode, DirEnt, Node, Resolved, Vfs};
+
+pub const AT_FDCWD: i64 = -100;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_EMPTY_PATH: u64 = 0x1000;
+const O_ACCMODE: u32 = 3;
+const O_CREAT: u32 = 0o100;
+const O_EXCL: u32 = 0o200;
+const O_TRUNC: u32 = 0o1000;
+const O_APPEND: u32 = 0o2000;
+const O_DIRECTORY: u32 = 0o40000;
+const O_NOFOLLOW: u32 = 0o100000;
+const O_CLOEXEC: u32 = 0o2000000;
+const S_IFCHR: u32 = 0o020000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
+const PATH_MAX: usize = 4096;
+
+#[derive(Clone)]
+pub enum Output {
+    Host,
+    Capture(Arc<Mutex<Vec<u8>>>),
+}
+
+pub enum FileKind {
+    /// A sysroot file (read-only) or a writable-mount file.
+    Host { file: std::fs::File, guest: Vec<u8>, sysroot: bool },
+    Dir { dir: Resolved, entries: Option<Vec<DirEnt>>, next: usize },
+    Dev(DevNode),
+    Stdin,
+    Stdout(Output),
+    Stderr(Output),
+}
+
+pub struct OpenFile {
+    pub kind: Mutex<FileKind>,
+    pub flags: Mutex<u32>,
+}
+
+pub struct FdTable {
+    fds: Mutex<std::collections::BTreeMap<i32, (Arc<OpenFile>, bool)>>,
+}
+
+impl FdTable {
+    #[must_use]
+    pub fn standard(stdout: Output, stderr: Output) -> Self {
+        let file = |kind| Arc::new(OpenFile { kind: Mutex::new(kind), flags: Mutex::new(0) });
+        let mut fds = std::collections::BTreeMap::new();
+        fds.insert(0, (file(FileKind::Stdin), false));
+        fds.insert(1, (file(FileKind::Stdout(stdout)), false));
+        fds.insert(2, (file(FileKind::Stderr(stderr)), false));
+        Self { fds: Mutex::new(fds) }
+    }
+
+    pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
+        self.fds.lock().get(&fd).map(|(f, _)| Arc::clone(f)).ok_or(EBADF)
+    }
+
+    /// The lowest free descriptor at or above `min`.
+    pub fn insert(&self, file: Arc<OpenFile>, cloexec: bool, min: i32) -> Result<i32, Errno> {
+        let mut fds = self.fds.lock();
+        let mut fd = min;
+        while fds.contains_key(&fd) {
+            fd += 1;
+        }
+        if fd >= 32768 {
+            return Err(EMFILE);
+        }
+        fds.insert(fd, (file, cloexec));
+        Ok(fd)
+    }
+
+    pub fn place(&self, fd: i32, file: Arc<OpenFile>, cloexec: bool) {
+        self.fds.lock().insert(fd, (file, cloexec));
+    }
+
+    pub fn remove(&self, fd: i32) -> Result<(), Errno> {
+        self.fds.lock().remove(&fd).map(|_| ()).ok_or(EBADF)
+    }
+
+    pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
+        self.fds.lock().get(&fd).map(|(_, c)| *c).ok_or(EBADF)
+    }
+
+    pub fn set_cloexec(&self, fd: i32, on: bool) -> Result<(), Errno> {
+        self.fds.lock().get_mut(&fd).map(|e| e.1 = on).ok_or(EBADF)
+    }
+}
+
+pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, Errno> {
+    let r = vfs.resolve(cwd, path, flags & O_NOFOLLOW == 0)?;
+    let write = flags & O_ACCMODE != 0;
+    let kind = match r.node.clone() {
+        Node::Missing { .. } if flags & O_CREAT == 0 => return Err(ENOENT),
+        Node::Missing { host: Some(host), parent_is_dir: true } => {
+            let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&host).map_err(|_| EACCES)?;
+            FileKind::Host { file, guest: r.path.clone(), sysroot: false }
+        }
+        Node::Missing { host: None, .. } => return Err(if flags & O_CREAT != 0 { EROFS } else { ENOENT }),
+        Node::Missing { .. } => return Err(ENOENT),
+        _ if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
+        Node::Dir | Node::HostDir { .. } => {
+            if write {
+                return Err(EISDIR);
+            }
+            FileKind::Dir { dir: r.clone(), entries: None, next: 0 }
+        }
+        _ if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+        Node::SysFile { .. } => {
+            if write || flags & O_TRUNC != 0 {
+                return Err(EROFS);
+            }
+            let host = vfs.sysroot().host_path(&r.path).ok_or(EIO)?;
+            let file = std::fs::File::open(host).map_err(|_| EIO)?;
+            FileKind::Host { file, guest: r.path.clone(), sysroot: true }
+        }
+        Node::HostFile { host } => {
+            let file = std::fs::OpenOptions::new()
+                .read(flags & O_ACCMODE != 1)
+                .write(write)
+                .append(flags & O_APPEND != 0)
+                .truncate(flags & O_TRUNC != 0 && write)
+                .open(&host)
+                .map_err(|_| EACCES)?;
+            FileKind::Host { file, guest: r.path.clone(), sysroot: false }
+        }
+        Node::Dev(d) => FileKind::Dev(d),
+        Node::Symlink { .. } => return Err(ELOOP), // O_NOFOLLOW on a link
+    };
+    Ok(OpenFile { kind: Mutex::new(kind), flags: Mutex::new(flags & !O_CLOEXEC) })
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Stat {
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub rdev: u64,
+    pub size: i64,
+    pub blocks: i64,
+    pub mtime: i64,
+}
+
+impl Stat {
+    /// arm64 `struct stat` (asm-generic, 128 bytes).
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 128] {
+        let mut b = [0u8; 128];
+        b[0..8].copy_from_slice(&0x803u64.to_le_bytes()); // st_dev
+        b[8..16].copy_from_slice(&self.ino.to_le_bytes());
+        b[16..20].copy_from_slice(&self.mode.to_le_bytes());
+        b[20..24].copy_from_slice(&self.nlink.to_le_bytes());
+        b[32..40].copy_from_slice(&self.rdev.to_le_bytes());
+        b[48..56].copy_from_slice(&self.size.to_le_bytes());
+        b[56..60].copy_from_slice(&4096i32.to_le_bytes()); // st_blksize
+        b[64..72].copy_from_slice(&self.blocks.to_le_bytes());
+        for at in [72, 88, 104] {
+            b[at..at + 8].copy_from_slice(&self.mtime.to_le_bytes());
+        }
+        b
+    }
+}
+
+fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
+    let ino = ino_of(&r.path);
+    let s = |mode: u32, size: i64| Stat { ino, mode, nlink: 1, size, blocks: (size + 511) / 512, ..Stat::default() };
+    Ok(match &r.node {
+        Node::Dir | Node::HostDir { .. } => Stat { nlink: 2, ..s(S_IFDIR | 0o755, 4096) },
+        Node::SysFile { size, mode } => s(S_IFREG | mode, *size as i64),
+        Node::HostFile { host } => s(S_IFREG | 0o600, std::fs::metadata(host).map_err(|_| EIO)?.len() as i64),
+        Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
+        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109 }, ..s(S_IFCHR | 0o666, 0) },
+        Node::Missing { .. } => return Err(ENOENT),
+    })
+}
+
+pub fn stat_path(vfs: &Vfs, cwd: &[u8], path: &[u8], follow: bool) -> Result<Stat, Errno> {
+    stat_node(&vfs.resolve(cwd, path, follow)?)
+}
+
+pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
+    match &*file.kind.lock() {
+        FileKind::Host { file, guest, sysroot } => {
+            let len = file.metadata().map_err(|_| EIO)?.len() as i64;
+            let mode = if *sysroot { 0o644 } else { 0o600 };
+            Ok(Stat { ino: ino_of(guest), mode: S_IFREG | mode, nlink: 1, size: len, blocks: (len + 511) / 512, ..Stat::default() })
+        }
+        FileKind::Dir { dir, .. } => stat_node(dir),
+        FileKind::Dev(d) => stat_node(&Resolved { path: b"/dev/null".to_vec(), node: Node::Dev(*d) }),
+        FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => {
+            Ok(Stat { ino: 1, mode: S_IFCHR | 0o620, nlink: 1, rdev: 0x8800, ..Stat::default() })
+        }
+    }
+}
+
+fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, Errno> {
+    match &mut *file.kind.lock() {
+        FileKind::Host { file, .. } => match at {
+            Some(off) => {
+                let keep = file.stream_position().map_err(|_| EIO)?;
+                file.seek(SeekFrom::Start(off)).map_err(|_| EIO)?;
+                let n = file.read(buf).map_err(|_| EIO);
+                file.seek(SeekFrom::Start(keep)).map_err(|_| EIO)?;
+                n
+            }
+            None => file.read(buf).map_err(|_| EIO),
+        },
+        FileKind::Dev(DevNode::Null) | FileKind::Stdin => Ok(0),
+        FileKind::Dev(DevNode::Zero) => {
+            buf.fill(0);
+            Ok(buf.len())
+        }
+        FileKind::Dev(DevNode::Random | DevNode::Urandom) => {
+            omni_platform::process::random_bytes(buf).map_err(|_| EIO)?;
+            Ok(buf.len())
+        }
+        FileKind::Dir { .. } => Err(EISDIR),
+        FileKind::Stdout(_) | FileKind::Stderr(_) => Err(EBADF),
+    }
+}
+
+fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
+    let sink = |out: &Output, host: &mut dyn Write| match out {
+        Output::Host => host.write_all(bytes).and_then(|()| host.flush()).map(|()| bytes.len()).map_err(|_| EIO),
+        Output::Capture(buf) => {
+            buf.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    };
+    match &mut *file.kind.lock() {
+        FileKind::Stdout(out) => sink(out, &mut std::io::stdout()),
+        FileKind::Stderr(out) => sink(out, &mut std::io::stderr()),
+        FileKind::Host { file, sysroot: false, .. } => file.write(bytes).map_err(|_| EIO),
+        FileKind::Host { .. } | FileKind::Stdin => Err(EBADF),
+        FileKind::Dev(_) => Ok(bytes.len()),
+        FileKind::Dir { .. } => Err(EISDIR),
+    }
+}
+
+fn fd_arg(a: u64) -> i32 {
+    a as i64 as i32
+}
+
+fn path_arg(p: &Process, a: u64) -> Result<Vec<u8>, Errno> {
+    p.mem.read_cstr(a, PATH_MAX)
+}
+
+/// The directory a `*at` call's relative path is resolved against.
+fn base_dir(p: &Process, dirfd: u64, path: &[u8]) -> Result<Vec<u8>, Errno> {
+    if path.first() == Some(&b'/') || dirfd as i64 == AT_FDCWD {
+        return Ok(p.cwd.lock().clone());
+    }
+    match &*p.fds.get(fd_arg(dirfd))?.kind.lock() {
+        FileKind::Dir { dir, .. } => Ok(dir.path.clone()),
+        _ => Err(ENOTDIR),
+    }
+}
+
+fn sys_openat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[1])?;
+    let base = base_dir(p, a[0], &path)?;
+    let flags = a[2] as u32;
+    let file = open(&p.vfs, &base, &path, flags)?;
+    Ok(p.fds.insert(Arc::new(file), flags & O_CLOEXEC != 0, 0)? as u64)
+}
+
+fn sys_close(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    p.fds.remove(fd_arg(a[0])).map(|()| 0)
+}
+
+fn sys_read(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let mut buf = vec![0u8; (a[2] as usize).min(1 << 24)];
+    let n = read_file(&file, &mut buf, None)?;
+    p.mem.write(a[1], &buf[..n])?;
+    Ok(n as u64)
+}
+
+fn sys_pread64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let mut buf = vec![0u8; (a[2] as usize).min(1 << 24)];
+    let n = read_file(&file, &mut buf, Some(a[3]))?;
+    p.mem.write(a[1], &buf[..n])?;
+    Ok(n as u64)
+}
+
+fn sys_write(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let bytes = p.mem.read(a[1], (a[2] as usize).min(1 << 24))?;
+    Ok(write_file(&file, &bytes)? as u64)
+}
+
+fn iovecs(p: &Process, at: u64, count: u64) -> Result<Vec<(u64, usize)>, Errno> {
+    if count > 1024 {
+        return Err(EINVAL);
+    }
+    (0..count).map(|i| Ok((p.mem.read_u64(at + i * 16)?, p.mem.read_u64(at + i * 16 + 8)? as usize))).collect()
+}
+
+fn sys_writev(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let mut bytes = Vec::new();
+    for (base, len) in iovecs(p, a[1], a[2])? {
+        bytes.extend_from_slice(&p.mem.read(base, len)?);
+    }
+    Ok(write_file(&file, &bytes)? as u64)
+}
+
+fn sys_readv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let mut total = 0u64;
+    for (base, len) in iovecs(p, a[1], a[2])? {
+        let mut buf = vec![0u8; len];
+        let n = read_file(&file, &mut buf, None)?;
+        p.mem.write(base, &buf[..n])?;
+        total += n as u64;
+        if n < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+fn sys_lseek(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let mut kind = file.kind.lock();
+    match &mut *kind {
+        FileKind::Host { file, .. } => {
+            let whence = match a[2] {
+                0 => SeekFrom::Start(a[1]),
+                1 => SeekFrom::Current(a[1] as i64),
+                2 => SeekFrom::End(a[1] as i64),
+                _ => return Err(EINVAL),
+            };
+            file.seek(whence).map_err(|_| EINVAL)
+        }
+        FileKind::Dir { next, .. } if a[1] == 0 && a[2] == 0 => {
+            *next = 0;
+            Ok(0)
+        }
+        FileKind::Dev(_) => Ok(0),
+        _ => Err(ESPIPE),
+    }
+}
+
+fn sys_fstat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let st = stat_of(&*p.fds.get(fd_arg(a[0]))?)?;
+    p.mem.write(a[1], &st.to_bytes())?;
+    Ok(0)
+}
+
+fn sys_newfstatat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[1])?;
+    let st = if path.is_empty() {
+        if a[3] & AT_EMPTY_PATH == 0 {
+            return Err(ENOENT);
+        }
+        if a[0] as i64 == AT_FDCWD {
+            stat_path(&p.vfs, &p.cwd.lock(), b".", true)?
+        } else {
+            stat_of(&*p.fds.get(fd_arg(a[0]))?)?
+        }
+    } else {
+        let base = base_dir(p, a[0], &path)?;
+        stat_path(&p.vfs, &base, &path, a[3] & AT_SYMLINK_NOFOLLOW == 0)?
+    };
+    p.mem.write(a[2], &st.to_bytes())?;
+    Ok(0)
+}
+
+fn sys_readlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[1])?;
+    let base = base_dir(p, a[0], &path)?;
+    match p.vfs.resolve(&base, &path, false)?.node {
+        Node::Symlink { target } => {
+            let n = target.len().min(a[3] as usize);
+            p.mem.write(a[2], &target[..n])?;
+            Ok(n as u64)
+        }
+        Node::Missing { .. } => Err(ENOENT),
+        _ => Err(EINVAL),
+    }
+}
+
+fn sys_faccessat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[1])?;
+    let base = base_dir(p, a[0], &path)?;
+    let r = p.vfs.resolve(&base, &path, true)?;
+    match r.node {
+        Node::Missing { .. } => Err(ENOENT),
+        Node::SysFile { .. } | Node::Dir if a[2] & 2 != 0 => Err(EROFS),
+        _ => Ok(0),
+    }
+}
+
+fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    p.fds.get(fd_arg(a[0]))?;
+    match a[1] {
+        // TCGETS, TIOCGWINSZ, TIOCGPGRP: nothing here is a terminal.
+        0x5401 | 0x5413 | 0x540F => Err(ENOTTY),
+        other => {
+            p.refusals.record(format!("ioctl {other:#x}"), t.pc, t.lr);
+            Err(ENOTTY)
+        }
+    }
+}
+
+fn sys_fcntl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let fd = fd_arg(a[0]);
+    let file = p.fds.get(fd)?;
+    match a[1] {
+        0 => Ok(p.fds.insert(file, false, a[2] as i32)? as u64),
+        1030 => Ok(p.fds.insert(file, true, a[2] as i32)? as u64),
+        1 => Ok(u64::from(p.fds.cloexec(fd)?)),
+        2 => p.fds.set_cloexec(fd, a[2] & 1 != 0).map(|()| 0),
+        3 => Ok(u64::from(*file.flags.lock())),
+        4 => {
+            let mut f = file.flags.lock();
+            *f = (*f & O_ACCMODE) | (a[2] as u32 & (O_APPEND | 0o4000));
+            Ok(0)
+        }
+        other => {
+            p.refusals.record(format!("fcntl cmd {other}"), t.pc, t.lr);
+            Err(EINVAL)
+        }
+    }
+}
+
+fn sys_dup(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    Ok(p.fds.insert(file, false, 0)? as u64)
+}
+
+fn sys_dup3(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let (old, new) = (fd_arg(a[0]), fd_arg(a[1]));
+    if old == new {
+        return Err(EINVAL);
+    }
+    let file = p.fds.get(old)?;
+    p.fds.place(new, file, a[2] as u32 & O_CLOEXEC != 0);
+    Ok(new as u64)
+}
+
+fn sys_getdents64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let mut kind = file.kind.lock();
+    let FileKind::Dir { dir, entries, next } = &mut *kind else { return Err(ENOTDIR) };
+    if entries.is_none() {
+        *entries = Some(p.vfs.list(dir)?);
+    }
+    let list = entries.as_ref().expect("listed");
+    let mut out = Vec::new();
+    while *next < list.len() {
+        let e = &list[*next];
+        let reclen = (19 + e.name.len() + 1 + 7) & !7;
+        if out.len() + reclen > a[2] as usize {
+            if out.is_empty() {
+                return Err(EINVAL);
+            }
+            break;
+        }
+        let mut rec = vec![0u8; reclen];
+        rec[0..8].copy_from_slice(&e.ino.to_le_bytes());
+        rec[8..16].copy_from_slice(&((*next + 1) as i64).to_le_bytes());
+        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        rec[18] = e.kind;
+        rec[19..19 + e.name.len()].copy_from_slice(&e.name);
+        out.extend_from_slice(&rec);
+        *next += 1;
+    }
+    p.mem.write(a[1], &out)?;
+    Ok(out.len() as u64)
+}
+
+fn sys_getcwd(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let mut cwd = p.cwd.lock().clone();
+    cwd.push(0);
+    if cwd.len() > a[1] as usize {
+        return Err(ERANGE);
+    }
+    p.mem.write(a[0], &cwd)?;
+    Ok(cwd.len() as u64)
+}
+
+pub fn install(table: &mut Table) {
+    table.set(nr::OPENAT, sys_openat);
+    table.set(nr::CLOSE, sys_close);
+    table.set(nr::READ, sys_read);
+    table.set(nr::WRITE, sys_write);
+    table.set(nr::READV, sys_readv);
+    table.set(nr::WRITEV, sys_writev);
+    table.set(nr::PREAD64, sys_pread64);
+    table.set(nr::LSEEK, sys_lseek);
+    table.set(nr::FSTAT, sys_fstat);
+    table.set(nr::NEWFSTATAT, sys_newfstatat);
+    table.set(nr::READLINKAT, sys_readlinkat);
+    table.set(nr::FACCESSAT, sys_faccessat);
+    table.set(nr::FACCESSAT2, sys_faccessat);
+    table.set(nr::IOCTL, sys_ioctl);
+    table.set(nr::FCNTL, sys_fcntl);
+    table.set(nr::DUP, sys_dup);
+    table.set(nr::DUP3, sys_dup3);
+    table.set(nr::GETDENTS64, sys_getdents64);
+    table.set(nr::GETCWD, sys_getcwd);
+}

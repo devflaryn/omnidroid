@@ -16,3 +16,8 @@ pub mod syscall;
 pub mod vfs;
 
 pub use process::{Process, Task};
+
+/// Every handler this crate implements, installed into `table`.
+pub fn install_all(table: &mut syscall::Table) {
+    fd::install(table);
+}
