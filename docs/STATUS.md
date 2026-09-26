@@ -1,204 +1,78 @@
 # Status
 
-The honest capability record. A thing is **Verified** only if it was run and observed. Nothing is
-claimed for Linux or macOS, because nothing has been tested there.
+What works, per component and per platform. **Verified** means run and observed, with the record
+named; **partial** means built with a named gap; **not started** means no code runs it. Figures
+and run names (w = Windows, m = Mac, l = Linux) come from `HANDOFF.md` and `docs/ports/*.md`.
 
-Last updated: 2026-09-22
+Last updated: 2026-09-26.
+
+## The APK
+
+`Roblox-2.738.1397.apk` in the repository root is the **stock** build: 229,466,269 bytes, sha256
+`bbe00ae306cc251c4ea55b7a932d9c524ecb0d6d9203c2a6161bcf0fae792742`, signed by Roblox
+Corporation (v2+v3), versionCode 3092, `com.roblox.client`, 3 dex files. It ships `arm64-v8a`,
+`armeabi-v7a` and `x86_64` (11 libraries each); only arm64-v8a is loaded. Its arm64
+`libroblox.so` (109,193,800 bytes) is byte-identical to the one every 2.738.1397 figure was
+measured on. The Java surface regenerated from its dex equals `jni/surface.rs`.
+
+**The in-world runs cited here (2026-09-25) used the modified 2.739.691 build**, since removed; its
+`libroblox.so` is a different binary. None has been repeated on the stock APK yet, including
+whether Roblox's integrity check passes.
 
 ## Platforms
 
-| Target | Status |
-|---|---|
-| Windows x86-64 | **Active development.** Host capabilities verified; runtime not yet built |
-| Linux x86-64 | Not tested. Structural portability only |
-| Linux ARM64 | Not tested. Structural portability only |
-| macOS ARM64 | Not tested. Structural portability only |
-| macOS x86-64 | Not tested. Structural portability only |
-
-## Verified by measurement on this host
-
-| Area | Finding |
-|---|---|
-| Toolchain | Rust 1.89 msvc compiles and links; MSVC 14.44 present but off `PATH` |
-| Host CPU | AVX2, BMI2, FMA, F16C, AES, SHA, CMPXCHG16B; **no AVX-512** |
-| Vulkan | Loader 1.4.321; RTX 4060 device API 1.4.325; `VK_KHR_win32_surface` available |
-| Native window | Resizable desktop window rendering a Vulkan triangle, with correct swapchain recreation on resize |
-| Texture formats | ETC2 and ASTC **unsupported**; BC1/BC3/BC7 supported. Transcoding is mandatory |
-| Validation layers | **Absent.** A real use-after-free crashed the driver with no diagnostic. `omni-gfx` enables them only if the layer is present and treats absence as non-fatal |
-| Vulkan through `omni-gfx` | **Frames verified on the screen**, not merely presented: `CopyFromScreen` sampled at centre, top-left and bottom-right gave (255,0,255) for a magenta clear and (128,128,128) for an RGBA8 blit -- the second discriminating, since an `_SRGB` swapchain would have read ~187. RTX 4060, `B8G8R8A8_UNORM`, 1,983 frames, 0 Application and 0 TDR errors in the Windows Event Log over the whole session |
-| Memory: reservation | `MEM_RESERVE` costs 0 bytes of commit, verified to 97.7 TB |
-| Memory: commit | Debited immediately on commit, not on touch. 4 GB guest space = 37.25 MB commit |
-| Memory: reclamation | `MEM_DECOMMIT` is the only primitive that returns commit charge |
-| Memory: placeholders | `MapViewOfFile3` gives real `MAP_FIXED` at **4 KB** base and file-offset granularity (512/512 verified) |
-| JIT memory | Dual-mapped section: 162 ns per emit-and-execute cycle versus 2259 ns for `VirtualProtect` |
-| Multi-instance | 4 concurrent Vulkan instances independent, about 52 MiB VRAM and 110 to 160 MB host RAM each |
-| CPU: identity mapping | Guest VA == host VA verified at a 47-bit address with zero slow-path callbacks; costs one folded SIB base |
-| CPU: correctness | dynarmic builds in 49 s; all 202,200 of its test assertions pass; 37/37 hand-encoded A64 checks correct |
-| CPU: throughput | About 2.0x native on memory-heavy code, 2.2x on NEON/FP, about 33x on register-bound integer code |
-| CPU: fastmem gain | Losing identity mapping costs **30-49x** (n=31, through the runtime's real callback path, two loop shapes, both degraded mechanisms). An earlier 13.2x figure measured a bare stub and is a floor, not the runtime's cost |
-| CPU: silent degradation | Under the default 36-bit width a memory-heavy loop takes **20,000 of 20,000** callback-path entries and **still returns the right answer**; with identity mapping it takes **0**. Asserted at startup |
-| CPU: per-thread cost, by cache size | 24.5 MiB at an 8 MiB code cache, 34.65 at 32 MiB and **34.65 at 128 MiB** (n = 8 threads, serialized) — **shrinking the cache does not help**, because 16 MiB of it is a fixed array the constructor writes even when its feature is disabled |
-| Guest thread created by the **guest** | **24.76-24.84 MiB** of commit charge while running, and **98.6% of it comes back when the thread exits** — 0.35-0.40 MiB residual per thread (n = 4 runs of 8 threads, release, each in its own process; M3 task 3 phase 3c). Measured through a real `pthread_create` from translated ARM64 code rather than through raw contexts, and it agrees with the row above to within 1%, so the adapter's own per-thread cost is small. The constraint is therefore on **concurrent** guest threads rather than on threads ever created |
-| Roblox branch shape | 2.27% indirect, one indirect transfer every 44 words; mean **4.30** instructions per basic block. Both **static** mixes, used as proxies for per-executed-transfer cost models |
-| Thunk boundary: cost | **26.7-31.0 ns** per call dispatched inside the run loop, against **81-101 ns** for exiting to Rust (n = 31 per cell per process, 45 processes: 15 rounds × 3 code placements, `tools/thunk_sweep.py`). A band across three inline cells rather than a point; it is the boundary every imported call crosses. See D17 and D18 |
-| Thunk boundary: binding | All **565** of `libroblox.so`'s undefined symbols bind to a named slot in a reserved region, verified through the real loader; **560 of 560** thunk addresses found in the relocated image. Every unresolved import is `STT_OBJECT`, so **no function is bound to null**. Nothing is implemented yet: calling one names the symbol and the guest address |
-| Thunk boundary: `STT_OBJECT` split | **23** data imports across the library, **18** of them in the 188 the initializers reach. Two figures that looked like a drifted duplicate and are not: measured and asserted in `omni-android/tests/libroblox.rs` |
-| CPU: cold translation | 0.15 to 0.31 Mguest-insn/s on synthetic loops, implying 7 to 25 s to warm a Roblox-sized working set. On **870 real `libroblox.so` leaf functions**: **0.516 Mguest-insn/s** (n = 11 passes, median, a fresh context each; 8,679 guest instructions) — 1.7 to 3.4x *better*. Per-instruction cost **rises** with function length (0.698 for the shortest third against 0.494 for the longest), which is the direction the "short functions give the IR optimizer less to work over" explanation needs; that explanation is a **hypothesis**, not established |
-| CPU: per-thread cost | 20 to 35 MiB committed per guest thread, code caches not shared between threads. Measured at **24.5 MiB** for this backend's 8 MiB cache (n = 8 threads, serialized) and **asserted against a 32 MiB ceiling**. `GuestCpu::cost()` reports **16.004 MiB** of it from two derived terms — the TLS page and the pin's fixed 16 MiB `FastDispatchEntry` table — and the 8.52 MiB it still misses is itself bounded and asserted |
-| CPU: call overhead | **under 53 ns** per entry to and exit from the guest — a ceiling, not the boundary. 63.7 ns per timed iteration (n = 31 passes, median, 870 real leaf functions), of which 10.7 ns is the harness's own register setup and the remaining 53.0 ns still contains ~10 guest instructions of real work |
-| CPU: runtime degradation | The startup assertion cannot see a memory path that degrades *after* it passes. Per run slice the callback-path counter's delta must be zero unless the slice ended in a memory fault; measured at **0.396-0.430 ns per counter read** (two runs, each the median of n = 31 runs of 10,000,000) and **0.9906x** / **0.9989x** end to end on a 5,000,000-instruction workload (n = 31 per configuration, two runs) |
-| Roblox function map | `.eh_frame_hdr` names **245,117** functions with exact bounds, cross-checked against their FDEs. **0 of 568,806 relocations** land in an executable segment, so the bytes in the file at a function's address are the bytes that execute |
-| Roblox leaf functions | 819 pure-register, 6 stack-only, 45 stack-guard-protected — 870 of 245,117 are self-contained enough to run before the imported-symbol layer exists |
-| Guest-thread teardown | **A guest dropped with a live guest thread is an access violation**, and it is M4's unexplained one-off, reproduced: `STATUS_ACCESS_VIOLATION` (0xc0000005) **after both gate tests reported `ok`**, with the guest's own `[android_main] Create a new NativeEngine:` the last line before it. `stop_guest_threads` asked and nothing waited. `Bionic::join_guest_threads` is the missing half, and a `Drop` cannot do it — every running guest thread holds an `Arc<Bionic>`, so the instance's own `Drop` cannot run while one is alive |
-| The engine's own threads issue **raw syscalls** | `syscall 98` (arm64 `futex`), from two engine worker threads, MEASURED in M5's gate and **answered since M6**. Both calls are `FUTEX_WAIT_BITSET \| FUTEX_PRIVATE_FLAG` with a **null timeout**, from guest `0x0284d130`, on a word at `obj + 4`. They are the only unbounded waits in this runtime (`omni-bionic`'s own futex waits are all bounded slices that re-check), and `AddressFutex::indefinite_parks()` counts exactly those two |
-| Those two workers are **never woken** | MEASURED, n = 3 runs: both words still read the value the waiters parked expecting, and a scan of all 28 raw `syscall` sites finds the wake side — five `FUTEX_WAKE_BITSET\|PRIVATE` at `0x2856274`..`0x2857078` and one `FUTEX_WAKE\|PRIVATE` at `0x61a34d0` — **none of which runs**. They are idle workers on a queue nothing posts to, not a lost wake. One of them holds the guest spin lock at `0x06dd0a30`, which is what §8 row 21 spins on |
-| `sched_yield` under the declined AT_HWCAP | **22,387,975 calls** in one M5 gate run (n = 1) — D26's fallback path spinning. Not a correctness problem, and the first real figure against D26's "revisit at M8 under real thread load" |
-
-## Verified about the test APK
-
-`Roblox-2.738.1397.apk` — see `research/apk-analysis.md`. **Note: this APK is cheat-injected and is
-not a stock Roblox build** (D6). A stock Play-signed APK is needed before the API surface is frozen.
-
-| Area | Finding |
-|---|---|
-| ABI | `lib/arm64-v8a/` only, 11 `.so`, all DEFLATED and 4-byte aligned |
-| Relocations | `DT_ANDROID_RELA` (APS2): 568,272 (568,194 RELATIVE + 56 GLOB_DAT + 22 **ABS64**, type 257 — a **64-bit** store), plus 534 JUMP_SLOT from a separate `DT_JMPREL`, total 568,806. No `DT_RELA`, no `DT_RELR`. All 568,806 applied and verified against mapped memory |
-| Imports | 565 undefined symbols in `libroblox.so` — 539 `STT_FUNC`, 23 `STT_OBJECT`, 3 `STT_NOTYPE`, 4 weak; 669 in the union across all 11 libraries. `DT_VERNEED` attributes 407 of the 565 to `libc.so` (345), `libm.so` (56) and `libdl.so` (6); the other 158 are unversioned and the file records no provider for them |
-| JNI surface | Only 59 of 233 `JNINativeInterface` slots used; `JavaVM` needs 2; fields are read but never written; all `CallXxxMethod` go via the `...MethodV` slot |
-| Dex execution | **Not required.** No reflection, no `dalvik/system/*`, no Java-side HTTP or file I/O; both `RegisterNatives` sites are native-driven |
-| Java surface size | 409 members / 104 classes referenced; ~120 members needed for a first frame |
-| Thread prerequisite | `TPIDR_EL0` must point at a bionic TLS block with a stack guard at +0x28 before any guest code runs (1,276 of 1,282 reads target that slot) |
-| AGDK | Statically linked into `libroblox.so`; 21-slot callback map recovered, 19 of 21 individually verified; `android_main` at 0x2bcc6a4 |
-| TLS | **None.** No `PT_TLS`, no `STT_TLS` anywhere. `pthread_key_*` only |
-| Hardening | No ifunc, no BTI/PAC/MTE, no `DT_TEXTREL` |
-| Initializers | 3,594 `init_array` entries before `JNI_OnLoad`; RELRO covers 5,205,568 bytes |
-| C++ runtime | Statically linked; in-guest unwinder over 11.5 MB `.eh_frame`, needs real `dl_iterate_phdr` |
-| Startup | AGDK `GameActivity`, not `NativeActivity` |
-| Graphics | Vulkan `dlopen`-only with 1,364 shipped SPIR-V modules; EGL/GLESv2 hard-linked |
-
-## Runtime implementation
-
-The boot milestone ladder in `ARCHITECTURE.md` section 9 is the progress measure. Infrastructure
-below a milestone is tracked separately, since a milestone only counts when it passes against the
-real APK.
-
-**Infrastructure**
-
-"Reviewed" means an independent reviewer verified it and every Critical and Important finding was
-fixed and re-verified. "Pending review" means the implementer's tests pass but nothing independent
-has confirmed it yet — on this project that distinction has mattered every single time.
-
-| Component | Status |
-|---|---|
-| Cargo workspace, nine crates | **Done** |
-| `omni-platform` virtual-memory seam (Windows) | **Done, reviewed.** Reserve, 4 KB placeholder split, commit, decommit, protect, file-backed map, commit-charge measurement |
-| `omni-platform` dual-mapped sections + placeholder coalescing | **Done, reviewed** |
-| `omni-platform` vectored fault seam | **Done, reviewed.** Releasing a handler slot is a quiescence point: the slot is marked draining before the drain and zeroed only afterwards, so a new registrant cannot claim it mid-drain. Took four iterations; the last two defects were found by measurement, not inspection |
-| `omni-platform` clock / process / log seams | **Done, pending review.** M3 task 3 phase 3a, the crate's first growth past `vm` and `fault`. Monotonic and wall clocks from one process epoch, sleep, pid, cpu count, entropy, current processor, a log sink with Android's and syslog's priority scales. 16 tests |
-| `omni-platform` process CPU time | **Done, pending review.** M3 task 3 phase 3e (D25), and the only primitive that phase needed. `GetProcessTimes` on the current-process pseudo-handle, kernel plus user; it serves the guest's `clock()` and `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`. **The first primitive in three phases for which D23's "is there one `std` call for all five targets?" answers no** — `Instant` is wall time and nothing in `std` reports consumed processor time. **No socket seam was added**, because the network group did not need one |
-| `omni-platform` file seam | **Done, pending review.** M3 task 3 phase 3b (D23). A **rooted** descriptor table: every guest path is resolved inside one host directory the embedding supplies, by six rules four of which run before any host call, and a path that cannot be is refused by name. An instance with no root has no filesystem at all. Descriptors, metadata, the namespace and directory listings; 37 tests in the crate |
-| `omni-platform` Linux / macOS | **Not implemented, and does not pretend to be.** Every primitive that needs a *target-specific* call returns a typed "unsupported on this platform" error naming its intended POSIX call — `getrandom(2)`, `arc4random_buf(3)`, `sched_getcpu(3)`, `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, `pread(2)`, `statvfs(3)` — so a non-Windows build fails immediately rather than misbehaving. The primitives that are **one portable `std` call** — the clocks, the log sink, `pid`, `cpu_count`, and fifteen of the seventeen file operations — are implemented once, deliberately without a fabricated refusal (D22, D23). The test is not "does it call the OS" but "is there one `std` call that serves all five targets". **Nothing here has been run on any non-Windows target** |
-| `omni-platform` pipe | **Done, pending review.** M5. A fourth descriptor kind: an in-process byte queue with two ends, reference-counted by `Drop` rather than by `close`, a readiness rule per kind and a generation counter a caller waits on with **its own** deadline. **No OS call on either side**, so no fabricated `unsupported` arm — the fourth phase running whose OS-surface prediction was too high. 13 tests |
-| `omni-android::ndk` — `ALooper`, `AAssetManager`, `AAsset`, `AConfiguration` | **Done, pending review.** M5, D29. 23 symbols, all outside the 188. A third per-instance activation beside `Bionic` and `Jni`; four opaque-handle tables in one arena, **each with its own range**, so a handle of one kind passed where another belongs is a refusal rather than a lookup that happens to succeed. 28 tests |
-| The two instruments for §8.1's silent failure modes | **Done, and both fired.** `Ndk::prepare_looper` makes the null-looper case a *precondition* a gate asserts before step 13 rather than a `jlong` of 0 read back afterwards. `Bionic::parked()` names every guest thread blocked in `pthread_cond_wait` with its condvar and mutex; it diagnosed a real deadlock **two commits after it was written**. `parked_peak()` is a **watch** and is labelled one |
-| `omni-apk` — zip reading + 4 KB-aligned extraction cache | **Done, reviewed.** 35 tests. Milestone **M0** |
-| `omni-elf` — ELF64 parsing + APS2 packed relocations | **Done, reviewed.** 85 tests |
-| `omni-elf` — loader: map, relocate, resolve, seal | **Done, reviewed.** Milestone **M1** |
-| `omni-mem` — guest address space + JIT arena | **Done, reviewed.** 87 tests across `omni-mem` and `omni-platform` |
-| `omni-cpu` — `GuestCpu` trait + dynarmic backend | **Done, reviewed.** Milestone **M2**. 489 passing test cases and 8 ignored across the workspace; mutation tables 87/87, 45/45 and 23/23 |
-| `omni-elf` — `.eh_frame_hdr` function map + leaf classifier | **Done, reviewed.** 245,117 exact function bounds recovered and graded; the tool M2 chose its code with |
-| `omni-android` — the thunk boundary | **Done, reviewed.** M3 task 2. Region, AAPCS64 marshalling both ways, the variadic rules and a guest `va_list` walk, host → guest re-entry. **No symbol is implemented**: all 565 slots are `Unbound` and name themselves when called. Review found three defects, all fixed |
-| `omni-bionic` — the pure libc/libm subset | **Done, reviewed.** Strings, wide/multibyte, ctype, locale, numeric conversion, `printf` formatting, libm. Verified by mutation (11 rows, 11/11) after review found its errno constants had no test at all |
-| `omni-bionic` — pthread / sync / TLS | **Done for its scope, reviewed.** 42 of the 51 reachable thread symbols; 1 excluded; 8 need host → guest re-entry or the OS and belong to the adapter (D19) — **and the adapter has them as of phase 3c** (D24). Review found a `sem_post` lost wakeup — **1.0104 s** measured — and three timing flakes |
-| `omni-android` — the bionic adapter | **Complete, pending review.** M3 task 3, phases 1 through 3e (D20-D25). **All 188 statically reachable imports are accounted for**: 143 answered, 22 refused by name, 3 reporting a guest termination, 18 `STT_OBJECT` data objects placed and filled, and **2 deliberately absent** — `__gcov_dump` and `__gcov_flush` resolve to null, because the guest tests each for null before calling and no Android libc supplies either. The split is asserted by *calling* every symbol, not by counting a table. `AT_HWCAP` is deliberately still undecided and `getauxval` refuses until a host says which arm |
-| `omni-android` — the network group | **Done, pending review.** M3 task 3 phase 3d (D25). `inet_ntop` and `gai_strerror`'s table are pure computation in `omni-bionic`; `poll` and `select` answer over the descriptor table the file seam already had, with **no OS call at all**, because every descriptor in this runtime is a regular file, a directory or a standard stream and none of them can block; `socket`, `eventfd`, `getaddrinfo` and `freeaddrinfo` refuse by name. A wait that nothing can ever end is refused rather than entered. `inet_ntop` follows BIND rather than `Ipv6Addr::Display`, which a 200,000-address differential run showed differs on one address class |
-| `omni-android` — guest threads | **Done, pending review.** M3 task 3 phase 3c (D24). A guest thread is a host thread driving its own `GuestCpu`, whose bionic TLS block comes from the **backend's** arena so that one stack-guard value covers the address space (D13) — asserted from real guest code executing `MRS TPIDR_EL0` and `LDR [Xt, #0x28]` itself. It runs in short budget windows with a stop switch between them (D16). `pthread_create`, `join`, `detach` and `getschedparam`; joining yourself, joining in a cycle, detaching twice, a `SIZE_MAX` stack and a start routine at a bad address are each a defined answer. **It needed no `omni-platform` surface at all** |
-| `omni-android` — guest signals | **Not implemented, and says so by name.** There is no disposition table, no per-thread mask and no delivery path, so `sigaction`, `raise` and `pthread_sigmask` are bound and **refuse**, each naming the signal and the believable wrong answer it declines (D24). `sigfillset` is implemented exactly, in `omni-bionic`, because it is `memset(set, 0xff, sizeof(sigset_t))` and needs no signal state |
-| `omni-android` — all 3,594 initializers | **Done.** Milestone **M3**. Every `init_array` entry runs in order against the real `libroblox.so`, asserted on the recorded `(index, address)` sequence and on guest state the initializers wrote, not on a counter reaching 3,594 |
-| `omni-android` — JNI without a JVM | **Done for steps 6-12, pending review.** M4 (D28). The `JavaVM` and `JNIEnv` tables in guest memory (233 + 8 slots, all addressed, the 174 unused ones refusing **by name**), handles as checked indices, modified UTF-8 in both directions, a two-table class registry, and §8 steps 7-12 as 21 verified downcall edges with a runner. **Measured on the real engine:** `JNI_OnLoad` at `base + 0x2173ff4` returns **`0x00010006`**, step 6a/6b resolves its whole surface with **0 misses**, and **19 of 21** scripted downcalls return. 17 mutation rows, 17/17 caught |
-| `omni-android` — GameActivity, `initializeNativeCode` | **Not started.** M5 (§8 step 13). Needs `ALooper`, `AAssetManager` and `ANativeWindow`, none of which exists |
-| `omni-gfx`, `omni-core`, `omni-cli` | Not started |
-
-**Measured, not assumed**
-
-| Property | Measurement |
-|---|---|
-| Guest address space reservation | 4 GiB costs **0.000 MiB** of commit charge |
-| Grown to 1 GiB, written through | **+1026.004 MiB** (+2.004 is page tables at size/512) |
-| Everything unmapped, instance closed | back to **+0.000 MiB** — the project's memory requirement, as an assertion |
-| Shared read-only file view | 4 MiB costs **+0.008 MiB**, unchanged after reading every byte, so instances share `libroblox.so` text for free |
-| Commit granule | 64 KiB. Measured 2414 ns/page at 4 KiB (worse than the 2053 ns VEH fault D10 rejected), 150 ns/page at 64 KiB, against an unavoidable 381 ns first-touch fault |
-| JIT arena | Dual-mapped, W+X unrepresentable in the API; a child process storing through the execute pointer dies with `0xC0000005` |
-| Partial unmap | Copy-on-write content preserved in survivors, verified in the loader's exact relocation shape; sharing preserved at +0.008 MiB across a partial unmap of a clean 8 MiB view |
-| CoW charging | Charged at `protect` time, not write time: +8.020 MiB the instant an 8 MiB view becomes writable, refunded on restore |
-| **`libroblox.so` loaded, per instance** | ~16.7 MiB commit per instance (≈11 `.bss` + ≈5 RELRO + ≈0.3 `.data` + page tables), against ~104 MiB mapped file-backed and shared. Peak equals steady, so windowed relocation produces no transient spike. **What is pinned by assertion: steady ≤ 20 MiB and \|peak − steady\| ≤ 1 MiB.** The component figures vary by fractions of a MiB between runs and are indicative, not exact |
-| **Three concurrent instances** | ~50 MiB total, ~16.7 MiB each, ~312 MiB mapped file-backed. **Each instance's marginal cost is asserted separately**, so sharing cannot be first-instance-only nor decay with instance count; anything privatising more than ~3.3 MiB per instance fails the test |
-| Load wall-time | 11.8 ms release for a 109 MB library |
-| `libroblox.so` extraction | 413 ms once (release), 130 us on a cache hit |
-| `libroblox.so` load, end to end | **11.8 ms** release / 77.5 ms debug: map 32 us, bind 1,109 symbols 83 us, relocate 568,806 in 171 windows 11.7 ms, protect 13 us |
-| Relocation window | 64 KiB, equal to the commit granule. Transient copy-on-write charge 5.285 MiB, all of it the RELRO region becoming private anyway. 4 KiB costs 9 ms more for no saving; past 64 KiB the curve is flat |
-| Loader hostile input | 21 tamper cases each refused with a typed error and zero residue, plus 920 single-byte corruptions of a synthetic library: 447 loaded, 473 refused, 0 panics, 0 leaks, 1.8 s |
-| Loader mutation testing | 18 mutations of the loader logic, 15 reverting it and 3 over-correcting it; every one caught by at least one test |
-| Workspace mutation testing | See `tools/mutate.py`. Every row is caught by at least one named test, in both directions |
-| APS2 decode | 568,272 relocations from 46,184 groups in ~2 ms, consuming 2,100,778 of 2,100,778 bytes |
-
-**Known accounting gap (confirmed):** a pagefile-backed section does not appear in `PrivateUsage`, so
-the JIT arena's cost is invisible to per-process commit-charge measurement. It invalidates no recorded
-measurement — every commit-charge figure here concerns private memory — but the budgeting diagnostic
-cannot see its fastest-growing consumer, since the CPU core commits 20-35 MiB per guest thread. The
-arena's mapped size is now reported as a first-class figure alongside private usage.
-
-**Confirmed constraint for the loader:** copy-on-write is charged at `protect` time, not write time.
-Protecting an 8 MiB `ReadExecute` view to `ReadWrite` costs +8.020 MiB of commit immediately, before
-any byte is written, and is refunded on restore. So relocation must proceed in windows — dropping the
-whole 109 MB library to writable would transiently charge 109 MB per instance.
-
-**Known gap:** Windows `unmap` is whole-view-only, so a guest partial `munmap` cannot be serviced by
-the platform layer directly. The seam refuses it with a typed error carrying the view extent rather
-than over-unmapping, and emulation (unmap the view, re-map the survivors) is owed by `omni-mem`.
-
-| Milestone | Status |
-|---|---|
-| M0 APK parsed, libraries extracted to aligned cache | **Reached.** All 11 ARM64 libraries extracted into the content-addressed 4 KB-aligned cache and then mapped from it, end to end |
-| M1 ELF loaded, all 568,806 relocations applied, symbols resolved | **Reached.** 568,806 relocations applied and read back from mapped memory, RELRO sealed over 5,205,568 bytes, 565 imports enumerated and attributed, 3,594 initializers collected. ~16.7 MiB commit per instance (≈11 `.bss` + ≈5 RELRO + ≈0.3 `.data` + page tables), against ~104 MiB mapped file-backed and shared |
-| M2 ARM64 function from `libroblox.so` executes | **Reached.** Three real functions run out of the loaded, relocated, RELRO-sealed image with `init_array` deliberately not run. `+0x2c11e34` maps a base64 character to its sextet: **256 predicted values**, one per byte value, predicted from RFC 4648's alphabet rather than from the run, all 256 correct. `+0x2227844` converts a saturating `(seconds, microseconds)` difference to milliseconds across 18 vectors including both saturation bounds exactly. `+0x2872aac` is a stack-protected leaf and is D13's proof in three directions: it returns with the guard matching, it calls `__stack_chk_fail` when the guard is changed between the two reads, and it faults at exactly `TPIDR_EL0 + 0x28` when the thread pointer is unmapped |
-| M3 All 3,594 initializers complete | **Reached.** Every entry runs in order, asserted on the recorded `(index, address)` sequence and on guest state the initializers wrote — a counter reaching 3,594 is not accepted as proof. **91,581,468 guest instructions**; all 188 statically-reachable imports accounted for |
-| M4 `JNI_OnLoad` succeeds | **Reached.** `JNI_OnLoad` at `base + 0x2173ff4` returns **`0x00010006`** — the value §2.2 read out of the binary at `0x2174dac`, not merely "did not crash". The thread began detached, so `GetEnv` answered `JNI_EDETACHED` and the engine attached through the other `JavaVM` slot with the name `"Main"`. §8 steps 7-12 then run **19 of 21** scripted downcalls, with `nativeAppBridgeSetInitParams` (step 12) among them. The two that do not return name what they need: `strftime`, which `omni-bionic` does not have, and a `strchr` on a pointer mapped nowhere. D28 |
-| M5 `initializeNativeCode` runs, surface requested | **Reached.** `Java_com_google_androidgamesdk_GameActivity_initializeNativeCode` returns a **non-zero `NativeCode *`** on the real `libroblox.so`, and §5.2's own offsets are read back out of guest memory one assertion each — `callbacks == this+0x50`, `sdkVersion` 33 at `+0x30`, the looper at `+0x158`, the two pipe ends at `+0x150`/`+0x154`, the asset manager at `+0x40`. **`activity->instance` at `+0x38` is the assertion that §8 row 14's `pthread_cond_wait` completed**, because `GameActivity_onCreate` writes it only after the game thread signals `app->running`. The game thread ran `android_app_entry` — its own `ALooper_prepare`, `AConfiguration_fromAssetManager` → `en-US 411x731 dp`, and `addFd(ident 1, callback 0)` = `LOOPER_ID_MAIN` — and the engine reached `[FLog::NativeEngine] initializing.` §8 steps 7-12 now reach **20 of 21**; **0** JNI misses; **134** distinct imported symbols across the run. The *surface* is not yet requested: that is step 17 and M6. D29 |
-| M6 Vulkan device created through the forwarding layer | **Reached, and passed.** The engine bootstraps Vulkan itself through `dlopen("libvulkan.so")` + `dlsym("vkGetInstanceProcAddr")`, decoded at guest `0x02595160`; there are zero `vk*` imports, so that mechanism *is* the API. From assembled ARM64 through guest thunks against a real RTX 4060: instance, surface on the real resizable window, physical device, device, queue, swapchain, command buffers, submit, **present -- with the presented pixels copied back and asserted** (`[51, 153, 204, 255]` from a clear of `[0.2, 0.6, 0.8, 1.0]`). `VK_KHR_android_surface` is advertised where the driver offers `VK_KHR_win32_surface`, both directions logged as rewrites (Global Constraint 1). **It is not a Roblox frame**: it is this project's own test driving the guest path, and what it establishes is that the path exists and carries pixels. §8 rows 7-22 all return, the engine runs its own main loop with twelve guest threads, and networking is real (D30) -- the guest's OpenSSL completes a TLS handshake against `clientsettingscdn.roblox.com` and gets an `HTTP 400`, which is a server answer and proves the transport. What remains: the malformed settings request (the engine will not take the window until it succeeds -- `DataModel + 0x289`), and Vulkan stage 5, the memory and resource surface between a device and a draw |
-| M7 First frame presented | Not started |
-| M8 Interactive | Not started |
-
-## Open decisions
-
-None blocking. Both D5 (CPU backend) and D7 (JNI without a JVM) are resolved.
-
-| # | Decision | Blocked on |
+| Target | State | Evidence |
 |---|---|---|
+| Windows x86-64 | **Verified: plays in a world.** Signed in, PS99 joined, 30-minute sessions clean. Vulkan on an RTX 4060 | w19: 52.8 fps median, 3.9-4.0 GiB private; w36 (shared cache): 47.0 fps, 2.55 GiB, 2.06 cores. The engine caps itself at 60 fps |
+| Linux x86-64 | **Verified: plays in a world, GPU-bound.** Renders through GLES on a Quadro 4000 (nouveau, ES 3.1); X11 or Xwayland | l9: 30 min clean, 3.4 fps median; 13.6-14.0 fps on a quiet desktop (the GPU is 96-98% busy). Port suites and 122/122 `lnx-` mutation rows (`ports/linux.md`) |
+| macOS ARM64 | **Partial: plays in a world, with open freezes.** Apple M1, Vulkan via MoltenVK | m10: 30 min, 55.8 fps median, 2.9 GiB; m12: 30 min clean. m7, m9, m11 froze or died (dynarmic arm64, patch 0023 pending). Workspace on 2026-09-24: 2,069 passed, 1 failed (`ports/macos.md`) |
+| Linux ARM64 | **Not started.** Never built or run | -- |
+| macOS x86-64 | **Not started.** Never built or run; `fault` has no backend there | -- |
 
-## A note on the numbers in this document
+## Components
 
-Figures here are **indicative unless stated as pinned**. Commit-charge measurements vary between runs
-by fractions of a MiB — page-table overhead, allocator state and measurement timing all move them —
-so quoting them to three decimal places implies a precision that does not exist.
+| Component | State | Notes |
+|---|---|---|
+| Milestones M0-M8 | verified | M0-M7 on Windows and macOS; Linux M0-M5 and M7 through GLES (M6, the engine's own Vulkan device, unreached); M8 (the owner playing) on Windows, w32-w34 |
+| APK choice, extraction cache | verified | `choose_apk`; one cache file shared by all instances |
+| ELF loader, APS2 | verified | 568,806 relocations; relro sealed as bionic seals it, also at 16 KiB pages |
+| `omni-mem` guest space, pager, JIT arena | verified | Windows, Linux, macOS; D10 re-measured on each (`ports/linux-notes/mem.md`, `ports/macos-memory.md`) |
+| dynarmic, x86-64 | verified | shared translation cache default (D38): w27/w29 input with 0 s under 20 fps |
+| dynarmic, arm64 | partial | per-thread caches only; stale-code transfer (m11) under investigation |
+| native backend (Hypervisor.framework) | partial | runs M2 and all initializers; not adopted (D34) |
+| native backend for Linux ARM64 | not started | |
+| bionic adapter | verified | 322 bound symbols; raw `SVC #0` routed |
+| guest signals | not started | `sigaction`, `raise`, `pthread_sigmask` refuse by name |
+| JNI and the Java transcription | partial | works in-world; an untranscribed method reached from a menu kills its thread (w31, fixed case by case; `research/jni-audit-2.739.md`) |
+| NDK (`ALooper`, assets, config, window) | verified | |
+| Network (sockets, TLS by the guest's OpenSSL) | verified | Windows, Linux, macOS |
+| Vulkan forwarding | verified on Windows, macOS | Linux: the engine refuses lavapipe as emulated, so unreached there |
+| GLES forwarding | verified on Linux (X11) | Windows (ANGLE) and macOS hosts not started |
+| Headless EGL (`set_driverless`) | verified on Windows, Linux | Mac not re-run |
+| Audio (`libaaudio.so`) | verified | WASAPI, ALSA (`audio_live_linux`), Core Audio (`mac-win-` rows) |
+| Window, keyboard, mouse | verified | Win32; Xlib incl. Xwayland; AppKit. Native Wayland not started |
+| Host cursor following the engine | verified on Windows (w33, w34) | Linux on Xvfb tests; macOS type-checked only |
+| Web view (sign-in pages) | verified on Windows (WebView2) and macOS (WKWebView, `webview_live` 10/10, `45b2131`) | Linux not started: sign in with `--cookie` |
+| Cookie store, `omnidroid login`, per-account storage | verified on Windows | |
+| Memory report (`OMNI_MEM_REPORT`) | verified on Windows, Linux | macOS: guest side only |
+| Sampling profiler (`OMNI_PERF`) | verified on Windows, Linux x86-64 | macOS arm64 backend built |
+| Multi-instance | partial | one process each works (Windows 3, Mac 4 of 4, Linux 4 before swapping on 7 GiB); per instance ~2.5 GiB and ~0.6 cores capped (H2) against a 0.8-0.9 GiB target |
+| `omni-core`, `omni-cli` | not started | the embedding lives in the gate test (ARCHITECTURE §2) |
 
-This was not a hypothetical concern: an earlier revision of this file recorded lazy `.bss` at
-+5.602 MiB while `DECISIONS.md` recorded +5.395 MiB and a fresh release run produced +5.363 MiB.
-Three values, two documents, all written to three decimals, **none of them asserted by any test**.
-The whole-branch review caught it, and it is exactly the failure this project's discipline exists to
-prevent: a documented number being read later as a measured fact.
+## Measured figures decisions rest on
 
-The rule applied here: quote approximate values in prose, and state separately what is actually
-**pinned by an assertion**, because only the pinned values will still be true after the next change.
+| Quantity | Value |
+|---|---|
+| Guest reservation | 0 bytes of commit (Windows to 97.7 TB, Linux to 64 TiB) |
+| Commit granule | 64 KiB: 150 ns/page on Windows against 2,414 at 4 KiB |
+| Reclaim | only `MEM_DECOMMIT` returns commit on Windows; Linux re-maps `PROT_NONE` |
+| JIT emit+execute, dual-mapped | 162 ns Windows, 117.5 ns Linux, against 2,259 / 2,418 ns flipping protection |
+| `libroblox.so` per instance | ~16.4 MiB private; text shared |
+| Three guest instances in one process | each costs only its private part; asserted per instance (`omni-elf/tests/loader_commit.rs`, `three_instances_share_the_file_backed_image`) |
+| `libroblox.so` load | 11.8 ms release; extraction 413 ms once |
+| Thunk crossing | 26.7-31.0 ns inline, 81-101 ns exit to Rust (D17) |
+| Losing identity fastmem | 30-49x slower (D4) |
+| Per guest thread, x86-64 | 4.47 MiB with patch 0017 (was 24.56) |
+| Shared translation cache | 241-249 MiB committed in a world (w32, w36) |
 
-
-## Why two rows disagreed about the same number
-
-An earlier revision of this file carried the per-thread CPU cost twice, with two values for the same
-quantity at the same cache size, and the first of them carried **no sample size** — in the document
-whose own closing note describes exactly that failure. The M2 whole-branch review caught it.
-
-That is the third time in this project a measured figure has been recorded in two places and drifted,
-and the pattern is consistent: the duplicate is always added later, by someone summarising a result
-rather than measuring it. So the rule tightened here is not "check the figures" but **a measured
-quantity appears once, with its sample size, and everything else links to it**.
+Figures are indicative unless a test pins them; a measured quantity lives in one place.

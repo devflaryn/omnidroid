@@ -3,7 +3,10 @@ OMNIDROID / libroblox.so  -- JNI SURFACE RAW LISTS
 Generated from: apk/lib/arm64-v8a/libroblox.so  (109,193,800 B, stripped, ET_DYN, EM_AARCH64)
 Analysis: capstone-5.0.7 straight-line symbolic interpreter over 245,117 .eh_frame-derived
 function boundaries; JNIEnv identified by interprocedural taint from the 539 Java_* exports.
-EXCLUDED by scope: libzstd-jni-1.5.7-6.so, com.roblox.gloop.*, classes4.dex, assets/gloop/.
+Stock Roblox-2.738.1397.apk (sha256 bbe00ae3...2742); its libroblox.so is byte-identical to the one
+analysed. Sections A-F and I-M are about libroblox.so. Sections G-H cover every dex native, including
+zstd-jni's (a genuine library in the stock APK, not Roblox code). 2026-09-26: Section G re-checked
+against the stock dex (700 natives; the modified APK's 6 extra entries removed).
 ====================================================================================================
 
 ### SECTION A1 -- JNIEnv function-table slots actually dereferenced (59 distinct, 943 call sites)
@@ -1075,7 +1078,7 @@ total: 409 (296 methods, 113 fields) over 104 classes
 === table at 0x667edd8, 1 entries ===
   0x0667edd8  nativeCacheAudioParameters                       (IIIZZZZZZZIIJ)V                                             fn=0x04dd8294
 
-### SECTION G -- all 706 native methods declared in the dex, grouped by declaring class
+### SECTION G -- all 700 native methods declared in the dex, grouped by declaring class
 bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       REGISTER   = no matching export -> must be bound via RegisterNatives
 
@@ -1115,7 +1118,7 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       onResponseErrorNative                                (Ljava/lang/String;)V                                            instance REGISTER
       onResponseNative                                     (Ljava/lang/String;)V                                            instance REGISTER
 
---- com/github/luben/zstd/Zstd                                               85 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/Zstd                                               85 natives
       blockSizeMax                                         ()I                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       chainLogMax                                          ()I                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       chainLogMin                                          ()I                                                              static   SHORT:libzstd-jni-1.5.7-6.so
@@ -1202,14 +1205,14 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       windowLogMax                                         ()I                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       windowLogMin                                         ()I                                                              static   SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdBufferDecompressingStreamNoFinalizer           5 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdBufferDecompressingStreamNoFinalizer           5 natives
       createDStreamNative                                  ()J                                                              instance SHORT:libzstd-jni-1.5.7-6.so
       decompressStreamNative                               (J[BII[BII)J                                                     instance SHORT:libzstd-jni-1.5.7-6.so
       freeDStreamNative                                    (J)J                                                             instance SHORT:libzstd-jni-1.5.7-6.so
       initDStreamNative                                    (J)J                                                             instance SHORT:libzstd-jni-1.5.7-6.so
       recommendedDOutSizeNative                            ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdCompressCtx                                    14 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdCompressCtx                                    14 natives
       compressByteArray0                                   (J[BII[BII)J                                                     static   SHORT:libzstd-jni-1.5.7-6.so
       compressDirectByteBuffer0                            (JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;II)J               static   SHORT:libzstd-jni-1.5.7-6.so
       compressDirectByteBufferStream0                      (JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;III)J              static   SHORT:libzstd-jni-1.5.7-6.so
@@ -1225,7 +1228,7 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       setLevel0                                            (JI)V                                                            static   SHORT:libzstd-jni-1.5.7-6.so
       setPledgedSrcSize0                                   (JJ)J                                                            static   SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdDecompressCtx                                  10 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdDecompressCtx                                  10 natives
       decompressByteArray0                                 (J[BII[BII)J                                                     static   SHORT:libzstd-jni-1.5.7-6.so
       decompressByteArrayToDirectByteBuffer0               (JLjava/nio/ByteBuffer;II[BII)J                                  static   SHORT:libzstd-jni-1.5.7-6.so
       decompressDirectByteBuffer0                          (JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;II)J               static   SHORT:libzstd-jni-1.5.7-6.so
@@ -1237,17 +1240,17 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       loadDDictFast0                                       (JLcom/github/luben/zstd/ZstdDictDecompress;)J                   static   SHORT:libzstd-jni-1.5.7-6.so
       reset0                                               (J)J                                                             static   SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdDictCompress                                   3 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdDictCompress                                   3 natives
       free                                                 ()V                                                              instance SHORT:libzstd-jni-1.5.7-6.so
       init                                                 ([BIII)V                                                         instance SHORT:libzstd-jni-1.5.7-6.so
       initDirect                                           (Ljava/nio/ByteBuffer;IIII)V                                     instance SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdDictDecompress                                 3 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdDictDecompress                                 3 natives
       free                                                 ()V                                                              instance SHORT:libzstd-jni-1.5.7-6.so
       init                                                 ([BII)V                                                          instance SHORT:libzstd-jni-1.5.7-6.so
       initDirect                                           (Ljava/nio/ByteBuffer;III)V                                      instance SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdDirectBufferCompressingStreamNoFinalizer       9 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdDirectBufferCompressingStreamNoFinalizer       9 natives
       compressDirectByteBuffer                             (JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;II)J               instance SHORT:libzstd-jni-1.5.7-6.so
       createCStream                                        ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       endStream                                            (JLjava/nio/ByteBuffer;II)J                                      instance SHORT:libzstd-jni-1.5.7-6.so
@@ -1258,14 +1261,14 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       initCStreamWithFastDict                              (JLcom/github/luben/zstd/ZstdDictCompress;)J                     instance SHORT:libzstd-jni-1.5.7-6.so
       recommendedCOutSize                                  ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdDirectBufferDecompressingStreamNoFinalizer     5 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdDirectBufferDecompressingStreamNoFinalizer     5 natives
       createDStreamNative                                  ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       decompressStreamNative                               (JLjava/nio/ByteBuffer;IILjava/nio/ByteBuffer;II)J               instance SHORT:libzstd-jni-1.5.7-6.so
       freeDStreamNative                                    (J)J                                                             static   SHORT:libzstd-jni-1.5.7-6.so
       initDStreamNative                                    (J)J                                                             instance SHORT:libzstd-jni-1.5.7-6.so
       recommendedDOutSizeNative                            ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdInputStreamNoFinalizer                         6 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdInputStreamNoFinalizer                         6 natives
       createDStream                                        ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       decompressStream                                     (J[BI[BI)I                                                       instance SHORT:libzstd-jni-1.5.7-6.so
       freeDStream                                          (J)I                                                             static   SHORT:libzstd-jni-1.5.7-6.so
@@ -1273,7 +1276,7 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       recommendedDInSize                                   ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       recommendedDOutSize                                  ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
 
---- com/github/luben/zstd/ZstdOutputStreamNoFinalizer                        7 natives [EXCLUDED: zstd-jni / not stock Roblox]
+--- com/github/luben/zstd/ZstdOutputStreamNoFinalizer                        7 natives
       compressStream                                       (J[BI[BI)I                                                       instance SHORT:libzstd-jni-1.5.7-6.so
       createCStream                                        ()J                                                              static   SHORT:libzstd-jni-1.5.7-6.so
       endStream                                            (J[BI)I                                                          instance SHORT:libzstd-jni-1.5.7-6.so
@@ -1480,9 +1483,6 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
       nativeTVRemoteDisconnectEvent                        (I)V                                                             static   SHORT:libroblox.so
       nativeUpdateScreenOrientation                        (I)V                                                             static   SHORT:libroblox.so
 
---- com/roblox/engine/jni/NativeQuoteInterface                               1 natives
-      requestResponseContinue                              ([B)[B                                                           static   REGISTER
-
 --- com/roblox/engine/jni/NativeReportingInterface                           12 natives
       applicationBackgrounded                              ()V                                                              static   SHORT:libroblox.so
       applicationForegrounded                              ()V                                                              static   SHORT:libroblox.so
@@ -1556,12 +1556,6 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
 
 --- com/roblox/engine/jni/meta/NativeMetaInterface                           1 natives
       getDeviceAttestationToken                            (Ljava/lang/String;Lcom/roblox/engine/jni/meta/DeviceAttestationCallback;)V static   SHORT:libroblox.so
-
---- com/roblox/gloop/Loader                                                  4 natives [EXCLUDED: injected payload]
-      getDownloadUrl                                       ()Ljava/lang/String;                                             static   REGISTER
-      nativeContext                                        (Landroid/content/Context;)Z                                     instance REGISTER
-      nativeResize                                         (II)V                                                            instance REGISTER
-      nativeStart                                          (Landroid/app/Activity;Lcom/roblox/gloop/Loader;)I               static   REGISTER
 
 --- com/roblox/protocols/appagesignalsplatforminterface/generated/IAppAgeSignalsCore 1 natives
       setPlatformImpl                                      (Lcom/roblox/protocols/appagesignalsplatforminterface/generated/IPlatformAppAgeSignals;)Lcom/roblox/protocols/appagesignalsplatforminterface/generated/IAppAgeSignalsCore; static   SHORT:libroblox.so
@@ -1974,10 +1968,7 @@ bind: SHORT/LONG = statically exported Java_* symbol from the named .so
 --- org/webrtc/voiceengine/WebRtcAudioManager                                1 natives
       nativeCacheAudioParameters                           (IIIZZZZZZZIIJ)V                                                 instance REGISTER
 
---- pk/z                                                                     1 natives
-      a                                                    (Landroid/content/Context;Ljava/lang/String;)Z                   static   REGISTER
-
-### SECTION H -- classes whose Java code calls native methods (dex bytecode scan), top 40
+### SECTION H -- classes whose Java code calls native methods (dex bytecode scan), top 40  [measured on the modified APK's dex; not re-measured on stock]
    com/github/luben/zstd/ZstdCompressCtx                                          58 native call sites
    com/github/luben/zstd/ZstdOutputStreamNoFinalizer                              44 native call sites
    em/g                                                                           41 native call sites

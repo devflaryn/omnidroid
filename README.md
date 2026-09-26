@@ -1,37 +1,45 @@
 # Omnidroid
 
-A cross-platform desktop runtime that runs ARM64 Android Roblox builds directly, through a
-targeted compatibility layer — **not** an Android emulator, and **not** backed by any virtual
-machine, container, or hypervisor.
+Runs the ARM64 Android Roblox engine (`libroblox.so` from the stock `Roblox-2.738.1397.apk`) as a
+native desktop app. Not an emulator and no virtualization: the APK's arm64 libraries are loaded
+by our own ELF loader, executed by dynarmic (ARM64 → x86-64 translation, or ARM64 on ARM64
+hosts), and the Android surface the engine actually uses (bionic, JNI without a JVM, the NDK,
+Vulkan/GLES, audio, input, networking) is implemented on the host.
 
-Primary test target: `Roblox-2.738.1397.apk` (arm64-v8a), kept out of version control.
+The APK is not in version control; put it in the repo root. Only `lib/arm64-v8a` is used.
 
-## Status
+## Quick start (Windows)
 
-This project distinguishes **verified** from **planned** everywhere. A feature is only described
-as working if it has been run and observed on a real host. Nothing here is marked working on
-Linux or macOS until it has actually been tested there; development and testing so far is
-Windows x86-64 only.
+```text
+set OMNIDROID_DYNARMIC_BUILD_DIR=C:\od-build     (a short path; MSVC fails past MAX_PATH)
+cargo build --release -p omnidroid
+cargo test -p omni-android --release --test gameactivity --no-run
+target\release\omnidroid play                     (or: powershell -File tools\play.ps1)
+```
 
-See `docs/STATUS.md` for the current, honest capability matrix.
+Sign in inside the window (Quick Sign-in works), or `omnidroid login` once and then
+`omnidroid play --cookie <name>`. `omnidroid help` lists the options. Close the window to
+end a session cleanly.
 
-## Design constraints (from the project goal)
+## Hard constraints
 
-- No virtualization of any kind: no QEMU, KVM, WHPX, Hyper-V, VirtualBox, VMware, or Android VM.
-- Run only the Android surface Roblox actually uses — not a reimplementation of Android.
-- Native ARM64 execution on ARM64 hosts; ARM64 → x86-64 binary translation on x86-64 hosts.
-- Targets: Windows x86-64, Linux x86-64, Linux ARM64, macOS ARM64, macOS x86-64.
-- Vulkan is the primary graphics backend; the renderer is structured so DirectX and Metal
-  backends can be added without touching the rest of the runtime.
-- A genuinely native, user-resizable desktop window — not a fixed Android resolution.
-- Multiple instances run simultaneously with fully isolated process, filesystem, cache, config,
-  library, temp, and runtime state.
-- Memory is demand-driven. No large fixed per-instance RAM reservation, no dependence on a huge
-  pagefile, and unused memory is genuinely reclaimed.
-- Performance is a first-class requirement at every layer.
+- No virtualization of any kind (no QEMU, KVM, Hyper-V, Android VM), no JVM/ART/dex interpreter.
+- Only the Android surface Roblox uses, answered faithfully (no faked frames or skipped work).
+- Targets: Windows x86-64, Linux x86-64/ARM64, macOS ARM64/x86-64. A platform is claimed only
+  after it has been run there (see `docs/STATUS.md`).
+- A native, resizable window; instances isolated from each other; memory and CPU on demand
+  (no fixed reservation, no reliance on a page file).
 
 ## Documentation
 
-- `docs/ARCHITECTURE.md` — the design (written after research, see below)
-- `docs/STATUS.md` — verified vs. planned capability matrix
-- `docs/research/` — findings from investigating prior art, the APK, and the host platform
+| file | what it holds |
+|---|---|
+| `docs/HANDOFF.md` | current state, how to run, what is open -- start here |
+| `docs/STATUS.md` | what works, per component and per platform |
+| `docs/ARCHITECTURE.md` | how the runtime is built |
+| `docs/DECISIONS.md` | why (D0-D38) |
+| `docs/VERIFICATION.md` | how testing has failed here, the rules, and the Global Constraints |
+| `docs/ports/` | per-host notes: `windows.md`, `macos.md`, `linux.md` and topic files |
+| `docs/briefs/goal-performance.md` | the current goal |
+| `docs/research/` | measured facts: the APK, the startup contract (`jni-surface.md` §8), dynarmic, host memory, graphics, prior art |
+| `crates/dynarmic-sys/patches/README.md` | the vendored dynarmic patches |

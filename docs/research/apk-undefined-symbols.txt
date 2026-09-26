@@ -1,37 +1,37 @@
 APPENDIX: UNION OF UNDEFINED (imported) DYNAMIC SYMBOLS
 Source: .dynsym of all 11 lib/arm64-v8a/*.so, entries with st_shndx==SHN_UNDEF and a non-empty name.
-Extracted with scratchpad/elf.py (custom ELF64 parser). Total union: 669 symbols.
+Stock Roblox-2.738.1397.apk (sha256 bbe00ae3...2742), regenerated 2026-09-26 with pyelftools by a
+one-off script; group names kept from the first appendix. Total union: 641 symbols.
 
 
 ================================================================================
-### libc/bionic  (365 symbols)
+### libc/bionic  (354 symbols)
 ================================================================================
 _Exit                                                                  GLOBAL FUNC      <- libroblox.so
-_exit                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-abort                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+_exit                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+abort                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 accept                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-accept4                                                                GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+accept4                                                                GLOBAL FUNC      <- libroblox.so
 access                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 alarm                                                                  GLOBAL FUNC      <- libbacktrace-native.so
 asprintf                                                               GLOBAL FUNC      <- libbacktrace-native.so
 atof                                                                   GLOBAL FUNC      <- libroblox.so
-atoi                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+atoi                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 atol                                                                   GLOBAL FUNC      <- libroblox.so
-atoll                                                                  GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-basename                                                               GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
-bind                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-bsearch                                                                GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+atoll                                                                  GLOBAL FUNC      <- libroblox.so
+basename                                                               GLOBAL FUNC      <- libbacktrace-native.so
+bind                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+bsearch                                                                GLOBAL FUNC      <- libroblox.so
 btowc                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 calloc                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
-chmod                                                                  GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
 chown                                                                  GLOBAL FUNC      <- libbacktrace-native.so
 clearerr                                                               GLOBAL FUNC      <- libroblox.so
 clock                                                                  GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-clock_gettime                                                          GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-close                                                                  GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-closedir                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-closelog                                                               GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-connect                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+clock_gettime                                                          GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+close                                                                  GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+closedir                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+closelog                                                               GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+connect                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 difftime                                                               GLOBAL FUNC      <- libroblox.so
 dirfd                                                                  GLOBAL FUNC      <- libbacktrace-native.so
 dirname                                                                GLOBAL FUNC      <- libbacktrace-native.so
@@ -42,188 +42,178 @@ epoll_ctl                                                              GLOBAL FU
 epoll_wait                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 erfcf                                                                  GLOBAL FUNC      <- libroblox.so
 erff                                                                   GLOBAL FUNC      <- libroblox.so
-eventfd                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+eventfd                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 execv                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 execve                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-execvp                                                                 GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
 execvpe                                                                GLOBAL FUNC      <- libbacktrace-native.so
-exit                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+exit                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 fchmod                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 fchown                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-fclose                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fcntl                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fdopen                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-feof                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-ferror                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+fclose                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+fcntl                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+fdopen                                                                 GLOBAL FUNC      <- libroblox.so
+feof                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+ferror                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 fflush                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fgets                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fileno                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fnmatch                                                                GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-fopen                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fopen64                                                                GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-fork                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+fgets                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+fileno                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+fopen                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+fork                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 fprintf                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 fputc                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fputs                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+fputs                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 fputwc                                                                 GLOBAL FUNC      <- libroblox.so
-fread                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+fread                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 free                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libzstd-jni-1.5.7-6.so
-freeaddrinfo                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-freeifaddrs                                                            GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-freelocale                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+freeaddrinfo                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+freelocale                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 fscanf                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-fseek                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fseeko                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-fseeko64                                                               GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-fstat                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+fseek                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+fseeko                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+fstat                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 fsync                                                                  GLOBAL FUNC      <- libroblox.so
-ftell                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-ftello                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-ftello64                                                               GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+ftell                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+ftello                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 ftruncate                                                              GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libroblox.so
 fwrite                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-gai_strerror                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-getaddrinfo                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-getc                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-getcwd                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+gai_strerror                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+getaddrinfo                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+getc                                                                   GLOBAL FUNC      <- libroblox.so
+getcwd                                                                 GLOBAL FUNC      <- libroblox.so
 getegid                                                                GLOBAL FUNC      <- libbacktrace-native.so
-getentropy                                                             WEAK   NOTYPE    <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-getenv                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-geteuid                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+getentropy                                                             WEAK   NOTYPE    <- libbacktrace-native.so,libroblox.so
+getenv                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+geteuid                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getgrnam                                                               GLOBAL FUNC      <- libbacktrace-native.so
 gethostbyname                                                          GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-gethostname                                                            GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-getifaddrs                                                             GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-getnameinfo                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+gethostname                                                            GLOBAL FUNC      <- libroblox.so
+getnameinfo                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getopt_long                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getpagesize                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-getpeername                                                            GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-getpid                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+getpeername                                                            GLOBAL FUNC      <- libroblox.so
+getpid                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getppid                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getpriority                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getpwnam_r                                                             GLOBAL FUNC      <- libbacktrace-native.so
-getpwuid_r                                                             GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-getrandom                                                              WEAK   NOTYPE    <- libzstd-jni-1.5.7-6.so
-getsockname                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-getsockopt                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-gettimeofday                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+getsockname                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+getsockopt                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+gettimeofday                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getuid                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 getwc                                                                  GLOBAL FUNC      <- libroblox.so
 gmtime                                                                 GLOBAL FUNC      <- libroblox.so
-gmtime_r                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+gmtime_r                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 if_indextoname                                                         GLOBAL FUNC      <- libroblox.so
-if_nametoindex                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+if_nametoindex                                                         GLOBAL FUNC      <- libroblox.so
 in6addr_any                                                            GLOBAL OBJECT    <- libroblox.so
 in6addr_loopback                                                       GLOBAL OBJECT    <- libroblox.so
-inet_ntop                                                              GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-inet_pton                                                              GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-ioctl                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-isdigit_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
-islower_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
+inet_ntop                                                              GLOBAL FUNC      <- libroblox.so
+inet_pton                                                              GLOBAL FUNC      <- libroblox.so
+ioctl                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+isdigit_l                                                              GLOBAL FUNC      <- libbacktrace-native.so
+islower_l                                                              GLOBAL FUNC      <- libbacktrace-native.so
 isspace                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-isupper_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
+isupper_l                                                              GLOBAL FUNC      <- libbacktrace-native.so
 iswalpha_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswblank_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswcntrl_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswdigit_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-iswlower_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+iswlower_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswprint_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswpunct_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswspace_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswupper_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 iswxdigit_l                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-isxdigit_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
+isxdigit_l                                                             GLOBAL FUNC      <- libbacktrace-native.so
 kill                                                                   GLOBAL FUNC      <- libbacktrace-native.so
 ldiv                                                                   GLOBAL FUNC      <- libroblox.so
-listen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-localeconv                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+listen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+localeconv                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 localtime                                                              GLOBAL FUNC      <- libroblox.so
-localtime_r                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+localtime_r                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 longjmp                                                                GLOBAL FUNC      <- libroblox.so
-lseek                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-lseek64                                                                GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-lstat                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+lseek                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+lstat                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 madvise                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 malloc                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libzstd-jni-1.5.7-6.so
-mbrlen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-mbrtowc                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-mbsnrtowcs                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-mbsrtowcs                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-mbtowc                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-memchr                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+mbrlen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+mbrtowc                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+mbsnrtowcs                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+mbsrtowcs                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+mbtowc                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+memchr                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 memcmp                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 memcpy                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 memmove                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-memrchr                                                                GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+memrchr                                                                GLOBAL FUNC      <- libroblox.so
 memset                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-mkdir                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+mkdir                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 mkdtemp                                                                GLOBAL FUNC      <- libbacktrace-native.so
 mkstemp                                                                GLOBAL FUNC      <- libbacktrace-native.so
 mktime                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 mlock                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-mmap                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libroblox.so,libzstd-jni-1.5.7-6.so
-mprotect                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+mmap                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libroblox.so
+mprotect                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 mremap                                                                 GLOBAL FUNC      <- libroblox.so
 msync                                                                  GLOBAL FUNC      <- libroblox.so
-munmap                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-nanosleep                                                              GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-newlocale                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-nftw                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
-open                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-opendir                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-openlog                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+munmap                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+nanosleep                                                              GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+newlocale                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+nftw                                                                   GLOBAL FUNC      <- libbacktrace-native.so
+open                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+opendir                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+openlog                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 optarg                                                                 GLOBAL OBJECT    <- libbacktrace-native.so,libroblox.so
 optind                                                                 GLOBAL OBJECT    <- libbacktrace-native.so,libroblox.so
-pipe                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-poll                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+pipe                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+poll                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 posix_fallocate                                                        GLOBAL FUNC      <- libroblox.so
-posix_memalign                                                         GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libzstd-jni-1.5.7-6.so
-pread                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+posix_memalign                                                         GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so
+pread                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 pread64                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-printf                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+printf                                                                 GLOBAL FUNC      <- libroblox.so
 pthread_atfork                                                         GLOBAL FUNC      <- libbacktrace-native.so
-pthread_attr_destroy                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_attr_destroy                                                   GLOBAL FUNC      <- libroblox.so
 pthread_attr_getstack                                                  GLOBAL FUNC      <- libroblox.so
-pthread_attr_init                                                      GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_attr_setdetachstate                                            GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_attr_init                                                      GLOBAL FUNC      <- libroblox.so
+pthread_attr_setdetachstate                                            GLOBAL FUNC      <- libroblox.so
 pthread_attr_setschedparam                                             GLOBAL FUNC      <- libroblox.so
 pthread_attr_setstacksize                                              GLOBAL FUNC      <- libroblox.so
 pthread_cond_broadcast                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 pthread_cond_destroy                                                   GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 pthread_cond_init                                                      GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
 pthread_cond_signal                                                    GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_cond_timedwait                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_cond_timedwait                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
 pthread_cond_wait                                                      GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 pthread_condattr_destroy                                               GLOBAL FUNC      <- libroblox.so
 pthread_condattr_init                                                  GLOBAL FUNC      <- libroblox.so
 pthread_condattr_setclock                                              GLOBAL FUNC      <- libroblox.so
 pthread_create                                                         GLOBAL FUNC      <- librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_detach                                                         GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_equal                                                          GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_detach                                                         GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+pthread_equal                                                          GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 pthread_exit                                                           GLOBAL FUNC      <- libroblox.so
 pthread_getattr_np                                                     GLOBAL FUNC      <- libroblox.so
 pthread_getschedparam                                                  GLOBAL FUNC      <- libroblox.so
-pthread_getspecific                                                    GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_getspecific                                                    GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 pthread_join                                                           GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_key_create                                                     GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_key_delete                                                     GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_key_create                                                     GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+pthread_key_delete                                                     GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 pthread_mutex_destroy                                                  GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 pthread_mutex_init                                                     GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 pthread_mutex_lock                                                     GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
 pthread_mutex_trylock                                                  GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
 pthread_mutex_unlock                                                   GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_mutexattr_destroy                                              GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_mutexattr_init                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_mutexattr_settype                                              GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_once                                                           GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_rwlock_destroy                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_rwlock_init                                                    GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_rwlock_rdlock                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_rwlock_unlock                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_rwlock_wrlock                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-pthread_self                                                           GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_mutexattr_destroy                                              GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+pthread_mutexattr_init                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+pthread_mutexattr_settype                                              GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+pthread_once                                                           GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+pthread_rwlock_destroy                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+pthread_rwlock_init                                                    GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+pthread_rwlock_rdlock                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+pthread_rwlock_unlock                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+pthread_rwlock_wrlock                                                  GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+pthread_self                                                           GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
 pthread_setschedparam                                                  GLOBAL FUNC      <- libroblox.so
-pthread_setspecific                                                    GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_setspecific                                                    GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 pthread_sigmask                                                        GLOBAL FUNC      <- libroblox.so
 ptrace                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 puts                                                                   GLOBAL FUNC      <- libroblox.so
@@ -231,16 +221,16 @@ pwrite                                                                 GLOBAL FU
 qsort                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
 raise                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 rand                                                                   GLOBAL FUNC      <- libroblox.so
-read                                                                   GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-readdir                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-readlink                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-realloc                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libzstd-jni-1.5.7-6.so
-realpath                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-recvfrom                                                               GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-recvmmsg                                                               GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+read                                                                   GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+readdir                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+readlink                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+realloc                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so
+realpath                                                               GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+recvfrom                                                               GLOBAL FUNC      <- libroblox.so
+recvmmsg                                                               GLOBAL FUNC      <- libroblox.so
 recvmsg                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-remove                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-rename                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+remove                                                                 GLOBAL FUNC      <- libroblox.so
+rename                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 rmdir                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sched_get_priority_max                                                 GLOBAL FUNC      <- libroblox.so
 sched_get_priority_min                                                 GLOBAL FUNC      <- libroblox.so
@@ -249,88 +239,88 @@ sched_getparam                                                         GLOBAL FU
 sched_getscheduler                                                     GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sched_setaffinity                                                      GLOBAL FUNC      <- libbacktrace-native.so
 sched_setscheduler                                                     GLOBAL FUNC      <- libroblox.so
-sched_yield                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-select                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+sched_yield                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+select                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sem_destroy                                                            GLOBAL FUNC      <- libroblox.so
 sem_init                                                               GLOBAL FUNC      <- libroblox.so
 sem_post                                                               GLOBAL FUNC      <- libroblox.so
 sem_wait                                                               GLOBAL FUNC      <- libroblox.so
-sendmmsg                                                               GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+sendmmsg                                                               GLOBAL FUNC      <- libroblox.so
 sendmsg                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-sendto                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+sendto                                                                 GLOBAL FUNC      <- libroblox.so
 setgid                                                                 GLOBAL FUNC      <- libbacktrace-native.so
 setjmp                                                                 GLOBAL FUNC      <- libroblox.so
 setlocale                                                              GLOBAL FUNC      <- libbacktrace-native.so
 setpriority                                                            GLOBAL FUNC      <- libroblox.so
 setsid                                                                 GLOBAL FUNC      <- libbacktrace-native.so
-setsockopt                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+setsockopt                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 setuid                                                                 GLOBAL FUNC      <- libbacktrace-native.so
-setvbuf                                                                GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-shutdown                                                               GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-sigaction                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+setvbuf                                                                GLOBAL FUNC      <- libroblox.so
+shutdown                                                               GLOBAL FUNC      <- libroblox.so
+sigaction                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sigaddset                                                              GLOBAL FUNC      <- libbacktrace-native.so
 sigaltstack                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sigdelset                                                              GLOBAL FUNC      <- libbacktrace-native.so
-sigemptyset                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+sigemptyset                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sigfillset                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 siglongjmp                                                             GLOBAL FUNC      <- libbacktrace-native.so
-signal                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+signal                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sigprocmask                                                            GLOBAL FUNC      <- libbacktrace-native.so
 sigsetjmp                                                              GLOBAL FUNC      <- libbacktrace-native.so
-sleep                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
-snprintf                                                               GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-socket                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-socketpair                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+sleep                                                                  GLOBAL FUNC      <- libbacktrace-native.so
+snprintf                                                               GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+socket                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+socketpair                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 sprintf                                                                GLOBAL FUNC      <- libbacktrace-native.so
 srand                                                                  GLOBAL FUNC      <- libroblox.so
-sscanf                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-stat                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+sscanf                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+stat                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 statvfs                                                                GLOBAL FUNC      <- libroblox.so
-stderr                                                                 GLOBAL OBJECT    <- libroblox.so,libzstd-jni-1.5.7-6.so
-stdin                                                                  GLOBAL OBJECT    <- libroblox.so,libzstd-jni-1.5.7-6.so
-stdout                                                                 GLOBAL OBJECT    <- libroblox.so,libzstd-jni-1.5.7-6.so
+stderr                                                                 GLOBAL OBJECT    <- libroblox.so
+stdin                                                                  GLOBAL OBJECT    <- libroblox.so
+stdout                                                                 GLOBAL OBJECT    <- libroblox.so
 strcasecmp                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 strcat                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-strchr                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strcmp                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+strchr                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strcmp                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 strcoll_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-strcpy                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strcspn                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strdup                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libzstd-jni-1.5.7-6.so
-strerror                                                               GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strerror_r                                                             GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strftime                                                               GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-strftime_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strlen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+strcpy                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strcspn                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strdup                                                                 GLOBAL FUNC      <- libbacktrace-native.so
+strerror                                                               GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libroblox.so
+strerror_r                                                             GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+strftime                                                               GLOBAL FUNC      <- libroblox.so
+strftime_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strlen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 strncasecmp                                                            GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 strncat                                                                GLOBAL FUNC      <- libroblox.so
-strncmp                                                                GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strncpy                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+strncmp                                                                GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+strncpy                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 strnlen                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-strpbrk                                                                GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-strrchr                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+strpbrk                                                                GLOBAL FUNC      <- libroblox.so
+strrchr                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 strsignal                                                              GLOBAL FUNC      <- libbacktrace-native.so
-strspn                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strstr                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtod                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtof                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtol                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+strspn                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strstr                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strtod                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+strtof                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+strtol                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
 strtold                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so
-strtold_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtoll                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtoll_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtoul                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtoull                                                               GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-strtoull_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+strtold_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strtoll                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+strtoll_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+strtoul                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+strtoull                                                               GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+strtoull_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 strxfrm_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 swprintf                                                               GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so
-syscall                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-sysconf                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+syscall                                                                GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+sysconf                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
 sysinfo                                                                GLOBAL FUNC      <- libroblox.so
-syslog                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+syslog                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 tcgetattr                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 tcsetattr                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-time                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+time                                                                   GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 timerfd_create                                                         GLOBAL FUNC      <- libroblox.so
 timerfd_settime                                                        GLOBAL FUNC      <- libroblox.so
 tolower                                                                GLOBAL FUNC      <- libroblox.so
@@ -340,24 +330,24 @@ towlower_l                                                             GLOBAL FU
 towupper_l                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 tzset                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 uname                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-ungetc                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+ungetc                                                                 GLOBAL FUNC      <- libroblox.so
 ungetwc                                                                GLOBAL FUNC      <- libroblox.so
-unlink                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-uselocale                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+unlink                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+uselocale                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 usleep                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 utime                                                                  GLOBAL FUNC      <- libroblox.so
 utimes                                                                 GLOBAL FUNC      <- libroblox.so
-vasprintf                                                              GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+vasprintf                                                              GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 vfork                                                                  GLOBAL FUNC      <- libbacktrace-native.so
-vfprintf                                                               GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+vfprintf                                                               GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 vprintf                                                                GLOBAL FUNC      <- libbacktrace-native.so
-vsnprintf                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-vsscanf                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-waitpid                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-wcrtomb                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+vsnprintf                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+vsscanf                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+waitpid                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+wcrtomb                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 wcscoll_l                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-wcslen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-wcsnrtombs                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+wcslen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+wcsnrtombs                                                             GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 wcstod                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so
 wcstof                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so
 wcstol                                                                 GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so
@@ -369,120 +359,106 @@ wcsxfrm_l                                                              GLOBAL FU
 wctob                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 wmemchr                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
 wmemcmp                                                                GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
-write                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-writev                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+write                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+writev                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 
 ================================================================================
-### libGLESv2/v3  (88 symbols)
+### libGLESv2/v3  (74 symbols)
 ================================================================================
-glActiveTexture                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glAttachShader                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glActiveTexture                                                        GLOBAL FUNC      <- libroblox.so
+glAttachShader                                                         GLOBAL FUNC      <- libroblox.so
 glBindAttribLocation                                                   GLOBAL FUNC      <- libroblox.so
-glBindBuffer                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glBindBuffer                                                           GLOBAL FUNC      <- libroblox.so
 glBindFramebuffer                                                      GLOBAL FUNC      <- libroblox.so
 glBindRenderbuffer                                                     GLOBAL FUNC      <- libroblox.so
-glBindSampler                                                          GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glBindTexture                                                          GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glBindVertexArray                                                      GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glBlendEquation                                                        GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glBlendEquationSeparate                                                GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+glBindTexture                                                          GLOBAL FUNC      <- libroblox.so
 glBlendFunc                                                            GLOBAL FUNC      <- libroblox.so
-glBlendFuncSeparate                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glBufferData                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glBufferSubData                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glBlendFuncSeparate                                                    GLOBAL FUNC      <- libroblox.so
+glBufferData                                                           GLOBAL FUNC      <- libroblox.so
+glBufferSubData                                                        GLOBAL FUNC      <- libroblox.so
 glCheckFramebufferStatus                                               GLOBAL FUNC      <- libroblox.so
 glClear                                                                GLOBAL FUNC      <- libroblox.so
 glClearColor                                                           GLOBAL FUNC      <- libroblox.so
 glClearDepthf                                                          GLOBAL FUNC      <- libroblox.so
 glClearStencil                                                         GLOBAL FUNC      <- libroblox.so
 glColorMask                                                            GLOBAL FUNC      <- libroblox.so
-glCompileShader                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glCompileShader                                                        GLOBAL FUNC      <- libroblox.so
 glCompressedTexImage2D                                                 GLOBAL FUNC      <- libroblox.so
 glCompressedTexSubImage2D                                              GLOBAL FUNC      <- libroblox.so
 glCopyTexSubImage2D                                                    GLOBAL FUNC      <- libroblox.so
-glCreateProgram                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glCreateShader                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glCreateProgram                                                        GLOBAL FUNC      <- libroblox.so
+glCreateShader                                                         GLOBAL FUNC      <- libroblox.so
 glCullFace                                                             GLOBAL FUNC      <- libroblox.so
-glDeleteBuffers                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glDeleteBuffers                                                        GLOBAL FUNC      <- libroblox.so
 glDeleteFramebuffers                                                   GLOBAL FUNC      <- libroblox.so
-glDeleteProgram                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glDeleteProgram                                                        GLOBAL FUNC      <- libroblox.so
 glDeleteRenderbuffers                                                  GLOBAL FUNC      <- libroblox.so
-glDeleteSamplers                                                       GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glDeleteShader                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glDeleteTextures                                                       GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glDeleteVertexArrays                                                   GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+glDeleteShader                                                         GLOBAL FUNC      <- libroblox.so
+glDeleteTextures                                                       GLOBAL FUNC      <- libroblox.so
 glDepthFunc                                                            GLOBAL FUNC      <- libroblox.so
 glDepthMask                                                            GLOBAL FUNC      <- libroblox.so
-glDetachShader                                                         GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glDisable                                                              GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glDisable                                                              GLOBAL FUNC      <- libroblox.so
 glDisableVertexAttribArray                                             GLOBAL FUNC      <- libroblox.so
 glDrawArrays                                                           GLOBAL FUNC      <- libroblox.so
-glDrawElements                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glEnable                                                               GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glEnableVertexAttribArray                                              GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glDrawElements                                                         GLOBAL FUNC      <- libroblox.so
+glEnable                                                               GLOBAL FUNC      <- libroblox.so
+glEnableVertexAttribArray                                              GLOBAL FUNC      <- libroblox.so
 glFramebufferRenderbuffer                                              GLOBAL FUNC      <- libroblox.so
 glFramebufferTexture2D                                                 GLOBAL FUNC      <- libroblox.so
-glGenBuffers                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glGenBuffers                                                           GLOBAL FUNC      <- libroblox.so
 glGenFramebuffers                                                      GLOBAL FUNC      <- libroblox.so
 glGenRenderbuffers                                                     GLOBAL FUNC      <- libroblox.so
-glGenSamplers                                                          GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glGenTextures                                                          GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGenVertexArrays                                                      GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+glGenTextures                                                          GLOBAL FUNC      <- libroblox.so
 glGenerateMipmap                                                       GLOBAL FUNC      <- libroblox.so
 glGetActiveUniform                                                     GLOBAL FUNC      <- libroblox.so
-glGetAttribLocation                                                    GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glGetError                                                             GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGetIntegerv                                                          GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGetProgramInfoLog                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGetProgramiv                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGetShaderInfoLog                                                     GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGetShaderiv                                                          GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGetString                                                            GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glGetUniformLocation                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glIsEnabled                                                            GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glIsProgram                                                            GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glLinkProgram                                                          GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glPixelStorei                                                          GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glGetError                                                             GLOBAL FUNC      <- libroblox.so
+glGetIntegerv                                                          GLOBAL FUNC      <- libroblox.so
+glGetProgramInfoLog                                                    GLOBAL FUNC      <- libroblox.so
+glGetProgramiv                                                         GLOBAL FUNC      <- libroblox.so
+glGetShaderInfoLog                                                     GLOBAL FUNC      <- libroblox.so
+glGetShaderiv                                                          GLOBAL FUNC      <- libroblox.so
+glGetString                                                            GLOBAL FUNC      <- libroblox.so
+glGetUniformLocation                                                   GLOBAL FUNC      <- libroblox.so
+glLinkProgram                                                          GLOBAL FUNC      <- libroblox.so
+glPixelStorei                                                          GLOBAL FUNC      <- libroblox.so
 glPolygonOffset                                                        GLOBAL FUNC      <- libroblox.so
 glReadPixels                                                           GLOBAL FUNC      <- libroblox.so
 glReleaseShaderCompiler                                                GLOBAL FUNC      <- libroblox.so
 glRenderbufferStorage                                                  GLOBAL FUNC      <- libroblox.so
-glSamplerParameteri                                                    GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glScissor                                                              GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glShaderSource                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glScissor                                                              GLOBAL FUNC      <- libroblox.so
+glShaderSource                                                         GLOBAL FUNC      <- libroblox.so
 glStencilFunc                                                          GLOBAL FUNC      <- libroblox.so
 glStencilMask                                                          GLOBAL FUNC      <- libroblox.so
 glStencilOp                                                            GLOBAL FUNC      <- libroblox.so
-glTexImage2D                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glTexImage2D                                                           GLOBAL FUNC      <- libroblox.so
 glTexParameterf                                                        GLOBAL FUNC      <- libroblox.so
 glTexParameterfv                                                       GLOBAL FUNC      <- libroblox.so
-glTexParameteri                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glTexSubImage2D                                                        GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glUniform1i                                                            GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glUniformMatrix4fv                                                     GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-glUseProgram                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glVertexAttribPointer                                                  GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-glViewport                                                             GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+glTexParameteri                                                        GLOBAL FUNC      <- libroblox.so
+glTexSubImage2D                                                        GLOBAL FUNC      <- libroblox.so
+glUniform1i                                                            GLOBAL FUNC      <- libroblox.so
+glUseProgram                                                           GLOBAL FUNC      <- libroblox.so
+glVertexAttribPointer                                                  GLOBAL FUNC      <- libroblox.so
+glViewport                                                             GLOBAL FUNC      <- libroblox.so
 
 ================================================================================
 ### libm  (55 symbols)
 ================================================================================
-acos                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-acosf                                                                  GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-asin                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+acos                                                                   GLOBAL FUNC      <- libroblox.so
+acosf                                                                  GLOBAL FUNC      <- libroblox.so
+asin                                                                   GLOBAL FUNC      <- libroblox.so
 asinf                                                                  GLOBAL FUNC      <- libroblox.so
-atan                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-atan2                                                                  GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+atan                                                                   GLOBAL FUNC      <- libroblox.so
+atan2                                                                  GLOBAL FUNC      <- libroblox.so
 atan2f                                                                 GLOBAL FUNC      <- libroblox.so
 atanf                                                                  GLOBAL FUNC      <- libroblox.so
 cbrt                                                                   GLOBAL FUNC      <- libroblox.so
 cbrtf                                                                  GLOBAL FUNC      <- libroblox.so
-cos                                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-cosf                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-cosh                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+cos                                                                    GLOBAL FUNC      <- libroblox.so
+cosf                                                                   GLOBAL FUNC      <- libroblox.so
+cosh                                                                   GLOBAL FUNC      <- libroblox.so
 coshf                                                                  GLOBAL FUNC      <- libroblox.so
-exp                                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-exp2                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+exp                                                                    GLOBAL FUNC      <- libroblox.so
+exp2                                                                   GLOBAL FUNC      <- libroblox.so
 exp2f                                                                  GLOBAL FUNC      <- libroblox.so
 expf                                                                   GLOBAL FUNC      <- libroblox.so
 expm1                                                                  GLOBAL FUNC      <- libroblox.so
@@ -494,86 +470,83 @@ frexp                                                                  GLOBAL FU
 frexpf                                                                 GLOBAL FUNC      <- libroblox.so
 hypotf                                                                 GLOBAL FUNC      <- libroblox.so
 ilogb                                                                  GLOBAL FUNC      <- libroblox.so
-ldexp                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-ldexpf                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-log                                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-log10                                                                  GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+ldexp                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+ldexpf                                                                 GLOBAL FUNC      <- libroblox.so
+log                                                                    GLOBAL FUNC      <- libroblox.so
+log10                                                                  GLOBAL FUNC      <- libroblox.so
 log10f                                                                 GLOBAL FUNC      <- libroblox.so
-log2                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+log2                                                                   GLOBAL FUNC      <- libroblox.so
 log2f                                                                  GLOBAL FUNC      <- libroblox.so
 logf                                                                   GLOBAL FUNC      <- libroblox.so
 modf                                                                   GLOBAL FUNC      <- libroblox.so
 modff                                                                  GLOBAL FUNC      <- libroblox.so
 nan                                                                    GLOBAL FUNC      <- libroblox.so
 nextafterf                                                             GLOBAL FUNC      <- libroblox.so
-pow                                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-powf                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+pow                                                                    GLOBAL FUNC      <- libroblox.so
+powf                                                                   GLOBAL FUNC      <- libroblox.so
 powl                                                                   GLOBAL FUNC      <- libroblox.so
 remainderf                                                             GLOBAL FUNC      <- libroblox.so
 remquof                                                                GLOBAL FUNC      <- libroblox.so
 round                                                                  GLOBAL FUNC      <- libroblox.so
-sin                                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+sin                                                                    GLOBAL FUNC      <- libroblox.so
 sincos                                                                 GLOBAL FUNC      <- libroblox.so
-sincosf                                                                GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+sincosf                                                                GLOBAL FUNC      <- libroblox.so
 sinf                                                                   GLOBAL FUNC      <- libroblox.so
-sinh                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+sinh                                                                   GLOBAL FUNC      <- libroblox.so
 sinhf                                                                  GLOBAL FUNC      <- libroblox.so
-tan                                                                    GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+tan                                                                    GLOBAL FUNC      <- libroblox.so
 tanf                                                                   GLOBAL FUNC      <- libroblox.so
-tanh                                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+tanh                                                                   GLOBAL FUNC      <- libroblox.so
 tanhf                                                                  GLOBAL FUNC      <- libroblox.so
 
 ================================================================================
-### libc/bionic (BIONIC-SPECIFIC)  (50 symbols)
+### libc/bionic (BIONIC-SPECIFIC)  (47 symbols)
 ================================================================================
 __FD_CLR_chk                                                           GLOBAL FUNC      <- libroblox.so
 __FD_ISSET_chk                                                         GLOBAL FUNC      <- libroblox.so
 __FD_SET_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 __assert                                                               GLOBAL FUNC      <- libroblox.so
-__assert2                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__cmsg_nxthdr                                                          GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__ctype_get_mb_cur_max                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__errno                                                                GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__fread_chk                                                            GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-__fwrite_chk                                                           GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+__assert2                                                              GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+__cmsg_nxthdr                                                          GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+__ctype_get_mb_cur_max                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+__errno                                                                GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+__fread_chk                                                            GLOBAL FUNC      <- libroblox.so
 __gcov_dump                                                            WEAK   NOTYPE    <- libroblox.so
 __gcov_flush                                                           WEAK   NOTYPE    <- libroblox.so
 __gnu_strerror_r                                                       GLOBAL FUNC      <- libroblox.so
 __libc_init                                                            GLOBAL FUNC      <- libtrampoline.so
-__memcpy_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libimage_processing_util_jni.so,libroblox.so,libzstd-jni-1.5.7-6.so
+__memcpy_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libimage_processing_util_jni.so,libroblox.so
 __memmove_chk                                                          GLOBAL FUNC      <- libroblox.so
-__memset_chk                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-__open_2                                                               GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__read_chk                                                             GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+__memset_chk                                                           GLOBAL FUNC      <- libroblox.so
+__open_2                                                               GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
+__read_chk                                                             GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
 __readlink_chk                                                         GLOBAL FUNC      <- libroblox.so
-__register_atfork                                                      GLOBAL FUNC      <- libeigen_blas.so,libeigen_lapack.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libsurface_util_jni.so,libyuv_shared.so,libzstd-jni-1.5.7-6.so
+__register_atfork                                                      GLOBAL FUNC      <- libeigen_blas.so,libeigen_lapack.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libsurface_util_jni.so,libyuv_shared.so
 __sF                                                                   GLOBAL OBJECT    <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__sendto_chk                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+__sendto_chk                                                           GLOBAL FUNC      <- libroblox.so
 __stack_chk_fail                                                       GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libsurface_util_jni.so,libtrampoline.so,libzstd-jni-1.5.7-6.so
 __stack_chk_guard                                                      GLOBAL OBJECT    <- libroblox.so
-__strcat_chk                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-__strchr_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__strcpy_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+__strcat_chk                                                           GLOBAL FUNC      <- libroblox.so
+__strchr_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+__strcpy_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 __strlcpy_chk                                                          GLOBAL FUNC      <- libbacktrace-native.so
-__strlen_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__strncat_chk                                                          GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+__strlen_chk                                                           GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 __strncpy_chk                                                          GLOBAL FUNC      <- libroblox.so
 __strncpy_chk2                                                         GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
-__system_property_get                                                  GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+__system_property_get                                                  GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 __umask_chk                                                            GLOBAL FUNC      <- libbacktrace-native.so
-__vsnprintf_chk                                                        GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__vsprintf_chk                                                         GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-__write_chk                                                            GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-_ctype_                                                                GLOBAL OBJECT    <- libzstd-jni-1.5.7-6.so
-android_set_abort_message                                              GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
+__vsnprintf_chk                                                        GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+__vsprintf_chk                                                         GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+__write_chk                                                            GLOBAL FUNC      <- libroblox.so
+android_set_abort_message                                              GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
 arc4random_buf                                                         GLOBAL FUNC      <- libroblox.so
 daylight                                                               GLOBAL OBJECT    <- libbacktrace-native.so,libroblox.so
 environ                                                                GLOBAL OBJECT    <- libbacktrace-native.so,libroblox.so
-getauxval                                                              GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-gettid                                                                 WEAK   FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
+getauxval                                                              GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so
+gettid                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
 mallinfo                                                               GLOBAL FUNC      <- libroblox.so
 prctl                                                                  GLOBAL FUNC      <- libbacktrace-native.so,librenderscript-toolkit.so,libroblox.so
-pthread_setname_np                                                     GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+pthread_setname_np                                                     GLOBAL FUNC      <- libroblox.so
 timezone                                                               GLOBAL OBJECT    <- libbacktrace-native.so,libroblox.so
 tzname                                                                 GLOBAL OBJECT    <- libbacktrace-native.so,libroblox.so
 
@@ -615,15 +588,14 @@ AMediaFormat_setString                                                 GLOBAL FU
 AMediaFormat_toString                                                  GLOBAL FUNC      <- libroblox.so
 
 ================================================================================
-### libandroid/libnativewindow/libaaudio  (32 symbols)
+### libandroid/libnativewindow/libaaudio  (31 symbols)
 ================================================================================
-AAssetManager_fromJava                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-AAssetManager_open                                                     GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-AAsset_close                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+AAssetManager_fromJava                                                 GLOBAL FUNC      <- libroblox.so
+AAssetManager_open                                                     GLOBAL FUNC      <- libroblox.so
+AAsset_close                                                           GLOBAL FUNC      <- libroblox.so
 AAsset_getBuffer                                                       GLOBAL FUNC      <- libroblox.so
-AAsset_getLength                                                       GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+AAsset_getLength                                                       GLOBAL FUNC      <- libroblox.so
 AAsset_openFileDescriptor                                              GLOBAL FUNC      <- libroblox.so
-AAsset_read                                                            GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
 AConfiguration_delete                                                  GLOBAL FUNC      <- libroblox.so
 AConfiguration_fromAssetManager                                        GLOBAL FUNC      <- libroblox.so
 AConfiguration_getCountry                                              GLOBAL FUNC      <- libroblox.so
@@ -640,39 +612,36 @@ ALooper_pollOnce                                                       GLOBAL FU
 ALooper_prepare                                                        GLOBAL FUNC      <- libroblox.so
 ALooper_release                                                        GLOBAL FUNC      <- libroblox.so
 ALooper_removeFd                                                       GLOBAL FUNC      <- libroblox.so
-ANativeWindow_acquire                                                  GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+ANativeWindow_acquire                                                  GLOBAL FUNC      <- libroblox.so
 ANativeWindow_fromSurface                                              GLOBAL FUNC      <- libimage_processing_util_jni.so,libroblox.so,libsurface_util_jni.so
 ANativeWindow_getFormat                                                GLOBAL FUNC      <- libsurface_util_jni.so
-ANativeWindow_getHeight                                                GLOBAL FUNC      <- libroblox.so,libsurface_util_jni.so,libzstd-jni-1.5.7-6.so
-ANativeWindow_getWidth                                                 GLOBAL FUNC      <- libroblox.so,libsurface_util_jni.so,libzstd-jni-1.5.7-6.so
+ANativeWindow_getHeight                                                GLOBAL FUNC      <- libroblox.so,libsurface_util_jni.so
+ANativeWindow_getWidth                                                 GLOBAL FUNC      <- libroblox.so,libsurface_util_jni.so
 ANativeWindow_lock                                                     GLOBAL FUNC      <- libimage_processing_util_jni.so
-ANativeWindow_release                                                  GLOBAL FUNC      <- libimage_processing_util_jni.so,libroblox.so,libsurface_util_jni.so,libzstd-jni-1.5.7-6.so
+ANativeWindow_release                                                  GLOBAL FUNC      <- libimage_processing_util_jni.so,libroblox.so,libsurface_util_jni.so
 ANativeWindow_setBuffersGeometry                                       GLOBAL FUNC      <- libimage_processing_util_jni.so
 ANativeWindow_unlockAndPost                                            GLOBAL FUNC      <- libimage_processing_util_jni.so
 
 ================================================================================
-### libEGL  (20 symbols)
+### libEGL  (17 symbols)
 ================================================================================
 eglChooseConfig                                                        GLOBAL FUNC      <- libroblox.so
 eglCreateContext                                                       GLOBAL FUNC      <- libroblox.so
 eglCreatePbufferSurface                                                GLOBAL FUNC      <- libroblox.so
 eglCreateWindowSurface                                                 GLOBAL FUNC      <- libroblox.so
-eglDestroyContext                                                      GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+eglDestroyContext                                                      GLOBAL FUNC      <- libroblox.so
 eglDestroySurface                                                      GLOBAL FUNC      <- libroblox.so
 eglGetConfigAttrib                                                     GLOBAL FUNC      <- libroblox.so
-eglGetCurrentContext                                                   GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-eglGetCurrentDisplay                                                   GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
-eglGetCurrentSurface                                                   GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+eglGetCurrentContext                                                   GLOBAL FUNC      <- libroblox.so
 eglGetDisplay                                                          GLOBAL FUNC      <- libroblox.so
 eglGetError                                                            GLOBAL FUNC      <- libroblox.so
 eglGetProcAddress                                                      GLOBAL FUNC      <- libroblox.so
 eglInitialize                                                          GLOBAL FUNC      <- libroblox.so
-eglMakeCurrent                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-eglQueryContext                                                        GLOBAL FUNC      <- libzstd-jni-1.5.7-6.so
+eglMakeCurrent                                                         GLOBAL FUNC      <- libroblox.so
 eglQuerySurface                                                        GLOBAL FUNC      <- libroblox.so
-eglSwapBuffers                                                         GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+eglSwapBuffers                                                         GLOBAL FUNC      <- libroblox.so
 eglSwapInterval                                                        GLOBAL FUNC      <- libroblox.so
-eglTerminate                                                           GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+eglTerminate                                                           GLOBAL FUNC      <- libroblox.so
 
 ================================================================================
 ### libz  (8 symbols)
@@ -689,12 +658,12 @@ zError                                                                 GLOBAL FU
 ================================================================================
 ### libdl  (6 symbols)
 ================================================================================
-dl_iterate_phdr                                                        GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so,libzstd-jni-1.5.7-6.so
-dladdr                                                                 GLOBAL FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
-dlclose                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libzstd-jni-1.5.7-6.so
-dlerror                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libtrampoline.so,libzstd-jni-1.5.7-6.so
-dlopen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libtrampoline.so,libzstd-jni-1.5.7-6.so
-dlsym                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libtrampoline.so,libzstd-jni-1.5.7-6.so
+dl_iterate_phdr                                                        GLOBAL FUNC      <- libbacktrace-native.so,libeigen_blas.so,librenderscript-toolkit.so,libroblox.so
+dladdr                                                                 GLOBAL FUNC      <- libroblox.so
+dlclose                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so
+dlerror                                                                GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libtrampoline.so
+dlopen                                                                 GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libtrampoline.so
+dlsym                                                                  GLOBAL FUNC      <- libbacktrace-native.so,libroblox.so,libtrampoline.so
 
 ================================================================================
 ### liblog  (5 symbols)
@@ -710,7 +679,7 @@ __android_log_write                                                    GLOBAL FU
 ================================================================================
 __cxa_atexit                                                           GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,libeigen_lapack.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libsurface_util_jni.so,libtrampoline.so,libyuv_shared.so,libzstd-jni-1.5.7-6.so
 __cxa_finalize                                                         GLOBAL FUNC      <- libbacktrace-native.so,libdatastore_shared_counter.so,libeigen_blas.so,libeigen_lapack.so,libimage_processing_util_jni.so,librenderscript-toolkit.so,libroblox.so,libsurface_util_jni.so,libyuv_shared.so,libzstd-jni-1.5.7-6.so
-__cxa_thread_atexit_impl                                               WEAK   FUNC      <- libroblox.so,libzstd-jni-1.5.7-6.so
+__cxa_thread_atexit_impl                                               WEAK   FUNC      <- libroblox.so
 __gxx_personality_v0                                                   GLOBAL FUNC      <- libeigen_lapack.so
 
 ================================================================================
@@ -719,6 +688,14 @@ __gxx_personality_v0                                                   GLOBAL FU
 AndroidBitmap_getInfo                                                  GLOBAL FUNC      <- librenderscript-toolkit.so
 AndroidBitmap_lockPixels                                               GLOBAL FUNC      <- libimage_processing_util_jni.so,librenderscript-toolkit.so
 AndroidBitmap_unlockPixels                                             GLOBAL FUNC      <- libimage_processing_util_jni.so,librenderscript-toolkit.so
+
+================================================================================
+### zstd-jni trace hooks (WEAK, normally unresolved)  (4 symbols)
+================================================================================
+ZSTD_trace_compress_begin                                              WEAK   NOTYPE    <- libzstd-jni-1.5.7-6.so
+ZSTD_trace_compress_end                                                WEAK   NOTYPE    <- libzstd-jni-1.5.7-6.so
+ZSTD_trace_decompress_begin                                            WEAK   NOTYPE    <- libzstd-jni-1.5.7-6.so
+ZSTD_trace_decompress_end                                              WEAK   NOTYPE    <- libzstd-jni-1.5.7-6.so
 
 ================================================================================
 ### PER-LIBRARY UNDEFINED SYMBOL LISTS
@@ -1294,348 +1271,6 @@ libroblox.so  (565 undefined; DT_NEEDED: libOpenMAXAL.so, libmediandk.so, liband
   writev                                                         GLOBAL FUNC
 
 --------------------------------------------------------------------------------
-libzstd-jni-1.5.7-6.so  (338 undefined; DT_NEEDED: liblog.so, libandroid.so, libdl.so, libm.so, libc.so, libEGL.so, libGLESv3.so)
---------------------------------------------------------------------------------
-  AAssetManager_fromJava                                         GLOBAL FUNC
-  AAssetManager_open                                             GLOBAL FUNC
-  AAsset_close                                                   GLOBAL FUNC
-  AAsset_getLength                                               GLOBAL FUNC
-  AAsset_read                                                    GLOBAL FUNC
-  ANativeWindow_acquire                                          GLOBAL FUNC
-  ANativeWindow_getHeight                                        GLOBAL FUNC
-  ANativeWindow_getWidth                                         GLOBAL FUNC
-  ANativeWindow_release                                          GLOBAL FUNC
-  __assert2                                                      GLOBAL FUNC
-  __cmsg_nxthdr                                                  GLOBAL FUNC
-  __ctype_get_mb_cur_max                                         GLOBAL FUNC
-  __cxa_atexit                                                   GLOBAL FUNC
-  __cxa_finalize                                                 GLOBAL FUNC
-  __cxa_thread_atexit_impl                                       WEAK   FUNC
-  __errno                                                        GLOBAL FUNC
-  __fread_chk                                                    GLOBAL FUNC
-  __fwrite_chk                                                   GLOBAL FUNC
-  __memcpy_chk                                                   GLOBAL FUNC
-  __memset_chk                                                   GLOBAL FUNC
-  __open_2                                                       GLOBAL FUNC
-  __read_chk                                                     GLOBAL FUNC
-  __register_atfork                                              GLOBAL FUNC
-  __sF                                                           GLOBAL OBJECT
-  __sendto_chk                                                   GLOBAL FUNC
-  __stack_chk_fail                                               GLOBAL FUNC
-  __strcat_chk                                                   GLOBAL FUNC
-  __strchr_chk                                                   GLOBAL FUNC
-  __strcpy_chk                                                   GLOBAL FUNC
-  __strlen_chk                                                   GLOBAL FUNC
-  __strncat_chk                                                  GLOBAL FUNC
-  __system_property_get                                          GLOBAL FUNC
-  __vsnprintf_chk                                                GLOBAL FUNC
-  __vsprintf_chk                                                 GLOBAL FUNC
-  __write_chk                                                    GLOBAL FUNC
-  _ctype_                                                        GLOBAL OBJECT
-  _exit                                                          GLOBAL FUNC
-  abort                                                          GLOBAL FUNC
-  accept4                                                        GLOBAL FUNC
-  acos                                                           GLOBAL FUNC
-  acosf                                                          GLOBAL FUNC
-  android_set_abort_message                                      GLOBAL FUNC
-  asin                                                           GLOBAL FUNC
-  atan                                                           GLOBAL FUNC
-  atan2                                                          GLOBAL FUNC
-  atoi                                                           GLOBAL FUNC
-  atoll                                                          GLOBAL FUNC
-  basename                                                       GLOBAL FUNC
-  bind                                                           GLOBAL FUNC
-  bsearch                                                        GLOBAL FUNC
-  calloc                                                         GLOBAL FUNC
-  chmod                                                          GLOBAL FUNC
-  clock                                                          GLOBAL FUNC
-  clock_gettime                                                  GLOBAL FUNC
-  close                                                          GLOBAL FUNC
-  closedir                                                       GLOBAL FUNC
-  closelog                                                       GLOBAL FUNC
-  connect                                                        GLOBAL FUNC
-  cos                                                            GLOBAL FUNC
-  cosf                                                           GLOBAL FUNC
-  cosh                                                           GLOBAL FUNC
-  dl_iterate_phdr                                                GLOBAL FUNC
-  dladdr                                                         GLOBAL FUNC
-  dlclose                                                        GLOBAL FUNC
-  dlerror                                                        GLOBAL FUNC
-  dlopen                                                         GLOBAL FUNC
-  dlsym                                                          GLOBAL FUNC
-  eglDestroyContext                                              GLOBAL FUNC
-  eglGetCurrentContext                                           GLOBAL FUNC
-  eglGetCurrentDisplay                                           GLOBAL FUNC
-  eglGetCurrentSurface                                           GLOBAL FUNC
-  eglMakeCurrent                                                 GLOBAL FUNC
-  eglQueryContext                                                GLOBAL FUNC
-  eglSwapBuffers                                                 GLOBAL FUNC
-  eglTerminate                                                   GLOBAL FUNC
-  eventfd                                                        GLOBAL FUNC
-  execvp                                                         GLOBAL FUNC
-  exit                                                           GLOBAL FUNC
-  exp                                                            GLOBAL FUNC
-  exp2                                                           GLOBAL FUNC
-  fclose                                                         GLOBAL FUNC
-  fcntl                                                          GLOBAL FUNC
-  fdopen                                                         GLOBAL FUNC
-  feof                                                           GLOBAL FUNC
-  ferror                                                         GLOBAL FUNC
-  fflush                                                         GLOBAL FUNC
-  fgets                                                          GLOBAL FUNC
-  fileno                                                         GLOBAL FUNC
-  fnmatch                                                        GLOBAL FUNC
-  fopen                                                          GLOBAL FUNC
-  fopen64                                                        GLOBAL FUNC
-  fork                                                           GLOBAL FUNC
-  fprintf                                                        GLOBAL FUNC
-  fputc                                                          GLOBAL FUNC
-  fputs                                                          GLOBAL FUNC
-  fread                                                          GLOBAL FUNC
-  free                                                           GLOBAL FUNC
-  freeaddrinfo                                                   GLOBAL FUNC
-  freeifaddrs                                                    GLOBAL FUNC
-  freelocale                                                     GLOBAL FUNC
-  fseek                                                          GLOBAL FUNC
-  fseeko                                                         GLOBAL FUNC
-  fseeko64                                                       GLOBAL FUNC
-  fstat                                                          GLOBAL FUNC
-  ftell                                                          GLOBAL FUNC
-  ftello                                                         GLOBAL FUNC
-  ftello64                                                       GLOBAL FUNC
-  fwrite                                                         GLOBAL FUNC
-  gai_strerror                                                   GLOBAL FUNC
-  getaddrinfo                                                    GLOBAL FUNC
-  getauxval                                                      GLOBAL FUNC
-  getc                                                           GLOBAL FUNC
-  getcwd                                                         GLOBAL FUNC
-  getentropy                                                     WEAK   NOTYPE
-  getenv                                                         GLOBAL FUNC
-  geteuid                                                        GLOBAL FUNC
-  gethostname                                                    GLOBAL FUNC
-  getifaddrs                                                     GLOBAL FUNC
-  getnameinfo                                                    GLOBAL FUNC
-  getpeername                                                    GLOBAL FUNC
-  getpid                                                         GLOBAL FUNC
-  getpwuid_r                                                     GLOBAL FUNC
-  getrandom                                                      WEAK   NOTYPE
-  getsockname                                                    GLOBAL FUNC
-  getsockopt                                                     GLOBAL FUNC
-  gettid                                                         WEAK   FUNC
-  gettimeofday                                                   GLOBAL FUNC
-  glActiveTexture                                                GLOBAL FUNC
-  glAttachShader                                                 GLOBAL FUNC
-  glBindBuffer                                                   GLOBAL FUNC
-  glBindSampler                                                  GLOBAL FUNC
-  glBindTexture                                                  GLOBAL FUNC
-  glBindVertexArray                                              GLOBAL FUNC
-  glBlendEquation                                                GLOBAL FUNC
-  glBlendEquationSeparate                                        GLOBAL FUNC
-  glBlendFuncSeparate                                            GLOBAL FUNC
-  glBufferData                                                   GLOBAL FUNC
-  glBufferSubData                                                GLOBAL FUNC
-  glCompileShader                                                GLOBAL FUNC
-  glCreateProgram                                                GLOBAL FUNC
-  glCreateShader                                                 GLOBAL FUNC
-  glDeleteBuffers                                                GLOBAL FUNC
-  glDeleteProgram                                                GLOBAL FUNC
-  glDeleteSamplers                                               GLOBAL FUNC
-  glDeleteShader                                                 GLOBAL FUNC
-  glDeleteTextures                                               GLOBAL FUNC
-  glDeleteVertexArrays                                           GLOBAL FUNC
-  glDetachShader                                                 GLOBAL FUNC
-  glDisable                                                      GLOBAL FUNC
-  glDrawElements                                                 GLOBAL FUNC
-  glEnable                                                       GLOBAL FUNC
-  glEnableVertexAttribArray                                      GLOBAL FUNC
-  glGenBuffers                                                   GLOBAL FUNC
-  glGenSamplers                                                  GLOBAL FUNC
-  glGenTextures                                                  GLOBAL FUNC
-  glGenVertexArrays                                              GLOBAL FUNC
-  glGetAttribLocation                                            GLOBAL FUNC
-  glGetError                                                     GLOBAL FUNC
-  glGetIntegerv                                                  GLOBAL FUNC
-  glGetProgramInfoLog                                            GLOBAL FUNC
-  glGetProgramiv                                                 GLOBAL FUNC
-  glGetShaderInfoLog                                             GLOBAL FUNC
-  glGetShaderiv                                                  GLOBAL FUNC
-  glGetString                                                    GLOBAL FUNC
-  glGetUniformLocation                                           GLOBAL FUNC
-  glIsEnabled                                                    GLOBAL FUNC
-  glIsProgram                                                    GLOBAL FUNC
-  glLinkProgram                                                  GLOBAL FUNC
-  glPixelStorei                                                  GLOBAL FUNC
-  glSamplerParameteri                                            GLOBAL FUNC
-  glScissor                                                      GLOBAL FUNC
-  glShaderSource                                                 GLOBAL FUNC
-  glTexImage2D                                                   GLOBAL FUNC
-  glTexParameteri                                                GLOBAL FUNC
-  glTexSubImage2D                                                GLOBAL FUNC
-  glUniform1i                                                    GLOBAL FUNC
-  glUniformMatrix4fv                                             GLOBAL FUNC
-  glUseProgram                                                   GLOBAL FUNC
-  glVertexAttribPointer                                          GLOBAL FUNC
-  glViewport                                                     GLOBAL FUNC
-  gmtime_r                                                       GLOBAL FUNC
-  if_nametoindex                                                 GLOBAL FUNC
-  inet_ntop                                                      GLOBAL FUNC
-  inet_pton                                                      GLOBAL FUNC
-  ioctl                                                          GLOBAL FUNC
-  isdigit_l                                                      GLOBAL FUNC
-  islower_l                                                      GLOBAL FUNC
-  isupper_l                                                      GLOBAL FUNC
-  iswlower_l                                                     GLOBAL FUNC
-  isxdigit_l                                                     GLOBAL FUNC
-  ldexp                                                          GLOBAL FUNC
-  ldexpf                                                         GLOBAL FUNC
-  listen                                                         GLOBAL FUNC
-  localeconv                                                     GLOBAL FUNC
-  localtime_r                                                    GLOBAL FUNC
-  log                                                            GLOBAL FUNC
-  log10                                                          GLOBAL FUNC
-  log2                                                           GLOBAL FUNC
-  lseek                                                          GLOBAL FUNC
-  lseek64                                                        GLOBAL FUNC
-  lstat                                                          GLOBAL FUNC
-  malloc                                                         GLOBAL FUNC
-  mbrlen                                                         GLOBAL FUNC
-  mbrtowc                                                        GLOBAL FUNC
-  mbsnrtowcs                                                     GLOBAL FUNC
-  mbsrtowcs                                                      GLOBAL FUNC
-  mbtowc                                                         GLOBAL FUNC
-  memchr                                                         GLOBAL FUNC
-  memcmp                                                         GLOBAL FUNC
-  memcpy                                                         GLOBAL FUNC
-  memmove                                                        GLOBAL FUNC
-  memrchr                                                        GLOBAL FUNC
-  memset                                                         GLOBAL FUNC
-  mkdir                                                          GLOBAL FUNC
-  mmap                                                           GLOBAL FUNC
-  mprotect                                                       GLOBAL FUNC
-  munmap                                                         GLOBAL FUNC
-  nanosleep                                                      GLOBAL FUNC
-  newlocale                                                      GLOBAL FUNC
-  nftw                                                           GLOBAL FUNC
-  open                                                           GLOBAL FUNC
-  opendir                                                        GLOBAL FUNC
-  openlog                                                        GLOBAL FUNC
-  pipe                                                           GLOBAL FUNC
-  poll                                                           GLOBAL FUNC
-  posix_memalign                                                 GLOBAL FUNC
-  pow                                                            GLOBAL FUNC
-  powf                                                           GLOBAL FUNC
-  pread                                                          GLOBAL FUNC
-  printf                                                         GLOBAL FUNC
-  pthread_attr_destroy                                           GLOBAL FUNC
-  pthread_attr_init                                              GLOBAL FUNC
-  pthread_attr_setdetachstate                                    GLOBAL FUNC
-  pthread_cond_broadcast                                         GLOBAL FUNC
-  pthread_cond_destroy                                           GLOBAL FUNC
-  pthread_cond_init                                              GLOBAL FUNC
-  pthread_cond_signal                                            GLOBAL FUNC
-  pthread_cond_timedwait                                         GLOBAL FUNC
-  pthread_cond_wait                                              GLOBAL FUNC
-  pthread_create                                                 GLOBAL FUNC
-  pthread_detach                                                 GLOBAL FUNC
-  pthread_equal                                                  GLOBAL FUNC
-  pthread_getspecific                                            GLOBAL FUNC
-  pthread_join                                                   GLOBAL FUNC
-  pthread_key_create                                             GLOBAL FUNC
-  pthread_key_delete                                             GLOBAL FUNC
-  pthread_mutex_destroy                                          GLOBAL FUNC
-  pthread_mutex_init                                             GLOBAL FUNC
-  pthread_mutex_lock                                             GLOBAL FUNC
-  pthread_mutex_unlock                                           GLOBAL FUNC
-  pthread_mutexattr_destroy                                      GLOBAL FUNC
-  pthread_mutexattr_init                                         GLOBAL FUNC
-  pthread_mutexattr_settype                                      GLOBAL FUNC
-  pthread_once                                                   GLOBAL FUNC
-  pthread_rwlock_destroy                                         GLOBAL FUNC
-  pthread_rwlock_init                                            GLOBAL FUNC
-  pthread_rwlock_rdlock                                          GLOBAL FUNC
-  pthread_rwlock_unlock                                          GLOBAL FUNC
-  pthread_rwlock_wrlock                                          GLOBAL FUNC
-  pthread_self                                                   GLOBAL FUNC
-  pthread_setname_np                                             GLOBAL FUNC
-  pthread_setspecific                                            GLOBAL FUNC
-  qsort                                                          GLOBAL FUNC
-  read                                                           GLOBAL FUNC
-  readdir                                                        GLOBAL FUNC
-  readlink                                                       GLOBAL FUNC
-  realloc                                                        GLOBAL FUNC
-  realpath                                                       GLOBAL FUNC
-  recvfrom                                                       GLOBAL FUNC
-  recvmmsg                                                       GLOBAL FUNC
-  remove                                                         GLOBAL FUNC
-  rename                                                         GLOBAL FUNC
-  sched_yield                                                    GLOBAL FUNC
-  select                                                         GLOBAL FUNC
-  sendmmsg                                                       GLOBAL FUNC
-  sendto                                                         GLOBAL FUNC
-  setsockopt                                                     GLOBAL FUNC
-  setvbuf                                                        GLOBAL FUNC
-  shutdown                                                       GLOBAL FUNC
-  sigaction                                                      GLOBAL FUNC
-  sigemptyset                                                    GLOBAL FUNC
-  signal                                                         GLOBAL FUNC
-  sin                                                            GLOBAL FUNC
-  sincosf                                                        GLOBAL FUNC
-  sinh                                                           GLOBAL FUNC
-  sleep                                                          GLOBAL FUNC
-  snprintf                                                       GLOBAL FUNC
-  socket                                                         GLOBAL FUNC
-  socketpair                                                     GLOBAL FUNC
-  sscanf                                                         GLOBAL FUNC
-  stat                                                           GLOBAL FUNC
-  stderr                                                         GLOBAL OBJECT
-  stdin                                                          GLOBAL OBJECT
-  stdout                                                         GLOBAL OBJECT
-  strchr                                                         GLOBAL FUNC
-  strcmp                                                         GLOBAL FUNC
-  strcpy                                                         GLOBAL FUNC
-  strcspn                                                        GLOBAL FUNC
-  strdup                                                         GLOBAL FUNC
-  strerror                                                       GLOBAL FUNC
-  strerror_r                                                     GLOBAL FUNC
-  strftime                                                       GLOBAL FUNC
-  strftime_l                                                     GLOBAL FUNC
-  strlen                                                         GLOBAL FUNC
-  strncmp                                                        GLOBAL FUNC
-  strncpy                                                        GLOBAL FUNC
-  strpbrk                                                        GLOBAL FUNC
-  strrchr                                                        GLOBAL FUNC
-  strspn                                                         GLOBAL FUNC
-  strstr                                                         GLOBAL FUNC
-  strtod                                                         GLOBAL FUNC
-  strtof                                                         GLOBAL FUNC
-  strtol                                                         GLOBAL FUNC
-  strtold_l                                                      GLOBAL FUNC
-  strtoll                                                        GLOBAL FUNC
-  strtoll_l                                                      GLOBAL FUNC
-  strtoul                                                        GLOBAL FUNC
-  strtoull                                                       GLOBAL FUNC
-  strtoull_l                                                     GLOBAL FUNC
-  syscall                                                        GLOBAL FUNC
-  sysconf                                                        GLOBAL FUNC
-  syslog                                                         GLOBAL FUNC
-  tan                                                            GLOBAL FUNC
-  tanh                                                           GLOBAL FUNC
-  time                                                           GLOBAL FUNC
-  ungetc                                                         GLOBAL FUNC
-  unlink                                                         GLOBAL FUNC
-  uselocale                                                      GLOBAL FUNC
-  vasprintf                                                      GLOBAL FUNC
-  vfprintf                                                       GLOBAL FUNC
-  vsnprintf                                                      GLOBAL FUNC
-  vsscanf                                                        GLOBAL FUNC
-  waitpid                                                        GLOBAL FUNC
-  wcrtomb                                                        GLOBAL FUNC
-  wcslen                                                         GLOBAL FUNC
-  wcsnrtombs                                                     GLOBAL FUNC
-  write                                                          GLOBAL FUNC
-  writev                                                         GLOBAL FUNC
-
---------------------------------------------------------------------------------
 libbacktrace-native.so  (315 undefined; DT_NEEDED: liblog.so, libz.so, libdl.so, libm.so, libc.so)
 --------------------------------------------------------------------------------
   __FD_SET_chk                                                   GLOBAL FUNC
@@ -2095,6 +1730,42 @@ libeigen_blas.so  (45 undefined; DT_NEEDED: libm.so, libdl.so, libc.so)
   syslog                                                         GLOBAL FUNC
   vasprintf                                                      GLOBAL FUNC
   vfprintf                                                       GLOBAL FUNC
+
+--------------------------------------------------------------------------------
+libzstd-jni-1.5.7-6.so  (32 undefined; DT_NEEDED: libm.so, libdl.so, libc.so)
+--------------------------------------------------------------------------------
+  ZSTD_trace_compress_begin                                      WEAK   NOTYPE
+  ZSTD_trace_compress_end                                        WEAK   NOTYPE
+  ZSTD_trace_decompress_begin                                    WEAK   NOTYPE
+  ZSTD_trace_decompress_end                                      WEAK   NOTYPE
+  __cxa_atexit                                                   GLOBAL FUNC
+  __cxa_finalize                                                 GLOBAL FUNC
+  __sF                                                           GLOBAL OBJECT
+  __stack_chk_fail                                               GLOBAL FUNC
+  calloc                                                         GLOBAL FUNC
+  clock                                                          GLOBAL FUNC
+  fflush                                                         GLOBAL FUNC
+  fprintf                                                        GLOBAL FUNC
+  fputc                                                          GLOBAL FUNC
+  free                                                           GLOBAL FUNC
+  fwrite                                                         GLOBAL FUNC
+  malloc                                                         GLOBAL FUNC
+  memcmp                                                         GLOBAL FUNC
+  memcpy                                                         GLOBAL FUNC
+  memmove                                                        GLOBAL FUNC
+  memset                                                         GLOBAL FUNC
+  pthread_cond_broadcast                                         GLOBAL FUNC
+  pthread_cond_destroy                                           GLOBAL FUNC
+  pthread_cond_init                                              GLOBAL FUNC
+  pthread_cond_signal                                            GLOBAL FUNC
+  pthread_cond_wait                                              GLOBAL FUNC
+  pthread_create                                                 GLOBAL FUNC
+  pthread_join                                                   GLOBAL FUNC
+  pthread_mutex_destroy                                          GLOBAL FUNC
+  pthread_mutex_init                                             GLOBAL FUNC
+  pthread_mutex_lock                                             GLOBAL FUNC
+  pthread_mutex_unlock                                           GLOBAL FUNC
+  qsort                                                          GLOBAL FUNC
 
 --------------------------------------------------------------------------------
 libimage_processing_util_jni.so  (18 undefined; DT_NEEDED: liblog.so, libandroid.so, libjnigraphics.so, libm.so, libdl.so, libc.so)
@@ -2719,7 +2390,7 @@ libroblox.so  (539 Java_* exports; JNI_OnLoad=True)
   Java_org_fmod_FMOD_OutputAAudioHeadphonesChanged
 
 --------------------------------------------------------------------------------
-libzstd-jni-1.5.7-6.so  (148 Java_* exports; JNI_OnLoad=True)
+libzstd-jni-1.5.7-6.so  (148 Java_* exports; JNI_OnLoad=False)
 --------------------------------------------------------------------------------
   Java_com_github_luben_zstd_ZstdBufferDecompressingStreamNoFinalizer_createDStreamNative
   Java_com_github_luben_zstd_ZstdBufferDecompressingStreamNoFinalizer_decompressStreamNative

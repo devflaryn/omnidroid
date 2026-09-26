@@ -1,424 +1,163 @@
 # Omnidroid Architecture
 
-Omnidroid runs the ARM64 Android Roblox engine on desktop through a targeted compatibility layer.
-It is not an Android emulator and contains no virtual machine, container, or hypervisor.
-
-This document is written **after** the research in `docs/research/`, and every design choice below
-traces to a measurement or a verified observation recorded there. Where something is still
-unverified it says so. Rationale for the bigger calls lives in `docs/DECISIONS.md`.
-
----
+Omnidroid runs the arm64-v8a Android Roblox engine (`libroblox.so`) as a desktop process: no VM,
+no ART, no dex interpreter. Guest code runs through dynarmic; its imports are host Rust. Why:
+`DECISIONS.md`. What has run where: `STATUS.md`.
 
 ## 1. The central idea
 
-Conventional emulators give the guest its own address space and translate every guest address into
-a host address. Omnidroid does not. **A guest pointer is a host pointer.** Guest ARM64 code is
-loaded into the host process's own address space at its own addresses, and guest loads and stores
-touch host memory directly.
-
-Three requirements from the project goal fall out of this one decision:
-
-- **Performance.** There is no address translation on the memory path at all: no page table walk,
-  no base-register add, no bounds check. This is the largest single performance lever available.
-- **Demand-driven memory.** Guest `mmap` becomes a host reservation plus a lazy commit, and guest
-  `munmap` becomes `MEM_DECOMMIT`, which measurably returns commit charge. There is no preallocated
-  guest RAM blob to balloon, because there is no guest RAM. There is only host memory.
-- **Zero-copy API boundaries.** When the guest hands a pointer to Vulkan, the host driver reads it
-  directly. No struct marshalling, no bounce buffers.
-
-The cost is that Omnidroid gives up the memory isolation an emulator gets for free: buggy guest
-code can corrupt the host process. That is accepted deliberately, and it is why **instance
-isolation is done at the OS process level** (section 7) rather than inside the address space.
-
-```
-          one OS process per instance
-  +-------------------------------------------------+
-  |  host code (Rust)        guest code (ARM64)      |
-  |  - runtime core          - libroblox.so          |
-  |  - bionic/JNI impl  <->  - 3,594 init_array      |   same address space,
-  |  - Vulkan forward        - engine threads        |   identity mapped
-  |  - window/input                                  |
-  +-------------------------------------------------+
-        |                                    |
-   host OS (Win/Linux/macOS)          host GPU via Vulkan
-```
-
----
+**A guest pointer is a host pointer** (D4). Guest code and data sit in the host process at their
+own addresses: no address translation on the memory path, guest `mmap` is a host reservation plus
+lazy commit, and host drivers read guest structs in place. The cost: guest code can corrupt the
+host (D4 amendment 1), so each instance is its own OS process (§7).
 
 ## 2. Module structure
 
-A Cargo workspace. The dependency direction is strictly downward: `omni-core` defines traits, the
-backends implement them, and nothing in the core knows which backend it has.
+Dependencies point downward. Only `omni-platform` may use `cfg(target_os)` or an OS crate; all
+else compiles for the five targets without `cfg`. A primitive that is one portable `std` call is
+written once, with no backend and no fake `Unsupported` arm (D22, D23).
 
-| Crate | Responsibility | Platform-specific? |
-|---|---|---|
-| `omni-platform` | OS primitives: virtual memory, files, dynamic loading, clocks, windowing. One module per OS behind one trait set. **Today that is `vm`, `fault`, `clock`, `process`, `log` and `fs`** — dynamic loading and windowing are still aspirational, and the row is left describing the intent rather than trimmed, because the intent is what the later phases fill in. **`threads` is struck from the list rather than left aspirational**: M3 task 3 phase 3c implemented guest thread lifecycle and needed *no* primitive here — `std::thread` is portable, the guest stack is an `omni-mem` mapping and the context is `omni-cpu`'s, so a `threads` module would have had nothing target-specific to put in it (D24). `fs` is a **rooted** seam rather than a bare one: a guest path resolves only inside one host directory the embedding supplies (D23). **A `net` module is now required, and the sentence that used to stand here is corrected rather than deleted**: it read "No `net` module was ever added either, and that is a result rather than an omission", and it was true of a runtime that could not yet do anything a network was for. D25 found that `poll` and `select` needed no OS call because every descriptor was a file, a directory or a standard stream, and said in its own text that the day `socket` was bound for real it would have to grow a real readiness source. **D30 is that day**: the project owner withdrew Global Constraint 8 because playable Roblox needs login, settings and a game server, so `net` joins the seam, sockets join the descriptor table `fs` already owns, and `poll`/`select` grow real readiness. What replaces the old refusal is not an open socket but a policy an embedding sets, the shape `set_filesystem_root` already has. The one primitive those phases did need is `process::cpu_time`, for the guest's `clock()` | **yes**, the only place `cfg(target_os)` is allowed |
-| `omni-mem` | Guest address-space manager built on `omni-platform`: reservation, lazy commit, decommit, placeholder mapping, the JIT code arena | no |
-| `omni-apk` | APK reading, zip parsing, and the content-addressed 4 KB-aligned extraction cache | no |
-| `omni-elf` | Bionic-compatible ELF loader: program headers, APS2 packed relocations, symbol resolution, `init_array`, RELRO, `dl_iterate_phdr` state | no |
-| `omni-cpu` | `GuestCpu` trait plus backends: native execution on ARM64 hosts, binary translation on x86-64 hosts | backend-specific |
-| `omni-bionic` | Bionic libc/libm as pure computation over a guest-memory trait: strings, wide/multibyte, ctype, locale, numeric conversion, `printf` formatting, libm, and the pthread/sync/TLS layer. **Zero dependencies** — see D19 | no |
-| `omni-android` | The compatibility layer: the thunk boundary, the adapter binding `omni-bionic` to it, `libdl`, `liblog`, JNI without a JVM, GameActivity, `ALooper`, `AAssetManager`, `ANativeWindow` | no |
-| `omni-texture` | Runtime transcoding of the compressed texture formats the guest uses and the host GPU cannot sample. **Zero dependencies and `#![no_std]`, and it allocates nothing** — see D27, which applies D19's argument here: `omni-gfx` transitively links Vulkan and the windowing system, so pure computation that must not be able to reach the OS belongs where `cargo tree` can prove it cannot. Scope is one format, `GL_ETC1_RGB8_OES`, because that is the only compressed mobile format the APK actually ships (`tools/texture_census.py`); every other ETC2/EAC/ASTC/S3TC enum is refused by its specification name | no |
-| `omni-gfx` | Renderer abstraction and the guest-facing `libvulkan.so`/EGL/GLES surfaces; Vulkan backend now, D3D12/Metal later | backend-specific |
-| `omni-core` | Instance lifecycle, orchestration, configuration, diagnostics; owns the traits | no |
-| `omni-cli` | Command-line host, the first deliverable. Execution before UI. | no |
+| Crate | What it is |
+|---|---|
+| `omni-platform` | OS seams, backends `windows.rs`/`linux.rs`/`macos.rs` (`unix.rs` shared or structural): `vm`, `fault` (Mach ports on macOS arm64 only), `fs` (rooted), `net` (behind a `NetPolicy`), `process`, `clock`, `log`, `window` (Win32, Xlib, AppKit), `audio` (WASAPI, ALSA, Core Audio), `webview` (WebView2, WKWebView; Linux structural), `sampler`, `hypervisor` |
+| `omni-mem` | `GuestSpace` (region map, 64 KiB commit granules, partial-unmap emulation, mapping labels), `CodeArena` (D12), `CommitBudget`, the demand pager, `access` |
+| `omni-apk` | zip, the extraction cache (§3), manifest, `choose_apk` |
+| `omni-elf` | ELF64 parsing, APS2, `.eh_frame_hdr` function map, the loader (§4) |
+| `omni-cpu` | `GuestCpu` trait; `dynarmic` backend; `native` backend (feature `native-hvf`) (§6) |
+| `dynarmic-sys` | vendored dynarmic `9d45823`, CMake build, C shim, FFI, `patches/` 0001-0028 (no 0023) |
+| `omni-bionic` | pure libc/libm and pthread logic over a `GuestMemory` trait; zero dependencies (D19) |
+| `omni-android` | the compatibility layer (§5): thunk crossing (`region`, `abi`, `varargs`, `mem`, `boundary`), `bionic`, `jni`, `ndk`, `vulkan`, `gles`, `aaudio`; instruments `perf`, `memreport`, `waits`, `pacing` |
+| `omni-gfx` | host graphics: `GfxVulkanHost`, `GfxGlesHost`, a test `Renderer`, MoltenVK loading |
+| `omni-texture` | ETC1 to RGBA8 (D27), `no_std`; used by `omni-gfx`'s renderer, not the guest path |
+| `omni-core`, `omni-cli` | empty placeholders |
+| `omnidroid` | launcher binary: `play`, `login`, `which` |
 
-**Portability rule.** Anything that is not `omni-platform` or a named backend must compile for all
-five targets without `cfg`. Depending on `omni-platform` is the seam working as intended and not a
-breach of that rule — the rule forbids an *external* OS crate (`windows-sys`, `libc`) outside it.
-And the rule has a second half, established in D22: a primitive that calls **no** OS API is
-implemented once, with no backend and no fabricated `unsupported` arm, because claiming that
-something `std` already does on all five targets cannot be done is a false claim in the other
-direction. `omni-bionic` makes its half of that rule *structural* rather than
-conventional: with no dependencies at all it cannot reach an OS primitive, which is the argument D19
-turns on. Linux and macOS support is *structural* until it is actually tested on
-those systems; nothing will be described as working there before then.
-
----
+**The runtime is assembled in the M5 gate test**, `crates/omni-android/tests/gameactivity.rs`;
+`omnidroid play` picks the APK and account and runs it with `cargo test --release`. No library
+crate does this yet.
 
 ## 3. APK handling and the extraction cache
 
-The APK is a zip. Its 11 `.so` files are DEFLATED and only 4-byte aligned, so, as measured, none
-can be mapped in place: placeholder mapping needs a 4 KB-aligned file offset, and a misaligned
-offset fails with `ERROR_MAPPED_ALIGNMENT`.
+The APK is chosen at run time: `--apk`, else `OMNI_APK`, else the `*.apk` in the repository root
+with the highest `versionCode` (`omni_apk::choose_apk`). Only `lib/arm64-v8a` is used; the other
+ABIs are ignored by design.
 
-So each `.so` is decompressed **once** into a shared, content-addressed cache, written 4 KB-aligned:
-
-```
-<cache-root>/libs/<sha256-of-entry>/libroblox.so     (4 KB-aligned, immutable)
-```
-
-Keyed by content hash rather than by APK path, so different APKs sharing a library share the cache
-entry and a modified library can never collide with a stock one. The cache is the **only** state
-shared between instances, and instances open it read-only.
-
-This matters for the multi-instance requirement. Cache files are mapped file-backed
-`PAGE_EXECUTE_READ`, so the roughly 109 MB of `libroblox.so` text and rodata is backed by the file
-and shared across instances at near-zero marginal commit charge. Only private pages, meaning the
-5.2 MB RELRO region after relocation plus `.data`, `.bss` and heap, cost per-instance commit.
-
-Mechanical requirement found by measurement: the file must be opened `GENERIC_READ |
-GENERIC_EXECUTE` and the section created `PAGE_EXECUTE_READ`, or `.text` can never be made
-executable later.
-
-Assets are a separate concern: `AAssetManager` reads them from the APK on demand. Large STORED
-assets such as the 14.7 MB SPIR-V shader pack can be mapped directly when 4 KB-aligned, and are
-otherwise streamed.
-
----
+Libraries are DEFLATED and unaligned in the zip, so each is extracted once to
+`<cache>/libs/<sha256>/<name>.so` (content-addressed, read-only) and mapped file-backed
+`ReadExecute`: `libroblox.so`'s ~100 MiB of text is shared by all instances; relro, `.data` and
+eager `.bss` (~16.4 MiB) are private (D11, D14). Assets are read from the APK on demand.
 
 ## 4. ELF loading
 
-A bionic-compatible loader written from scratch, since no permissively-licensed one exists (D3).
-Requirements are taken from the actual binary rather than from the ELF spec in general:
+A bionic-compatible loader (D3, D9), built on these facts of 2.738.1397's `libroblox.so`:
 
-1. **APS2 packed relocations are mandatory.** `libroblox.so` carries `DT_ANDROID_RELA` and has
-   **no `DT_RELA` and no `DT_RELR`**. Its APS2 blob is 2,100,778 bytes holding **568,272**
-   relocations (568,194 `R_AARCH64_RELATIVE`, 56 `GLOB_DAT`, 22 **`ABS64`**), SLEB128-delta-encoded in a
-   group-based format. A further **534** `JUMP_SLOT` relocations arrive **separately** via
-   `DT_JMPREL`, for a grand total of 568,806. A loader without APS2 applies *zero* relocations. This
-   is the highest-risk piece of the loader and gets the most testing.
-2. **Relocation proceeds in windows**, because copy-on-write is charged at `protect` time and not at
-   write time (D11). A window is 64 KiB, equal to the commit granule, so a window landing in `.bss`
-   needs exactly one commit. Executability is chosen at map time and can never be raised; writability
-   is *not*, because a copy-on-write view is charged its full size the instant it is mapped, so a
-   writable segment is mapped read-only and raised in windows and once at the end.
-3. **Segment mapping** via placeholder split plus `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` at 4 KB
-   granularity, honouring `p_align`, which for `libroblox.so` is **0x4000 (16 KiB)** on every
-   `PT_LOAD` — not the 4 KiB an earlier draft assumed. Windows splits placeholders at 4 KiB, so 16 KiB
-   is satisfiable, but the segment arithmetic must use the real `p_align`.
-4. **Symbol resolution** against Omnidroid's own provided libraries (section 5). `libroblox.so` has
-   **only `DT_GNU_HASH`** — there is no `DT_HASH` fallback — though other libraries in the APK carry
-   both, and where both exist they were verified to agree exactly. Which library an import is expected
-   to come from is recorded only in `DT_VERNEED` + `DT_VERSYM`, which names `libc.so`, `libm.so` and
-   `libdl.so` for 407 of the 565; the other 158 are unversioned and the file says nothing, so the
-   loader reports them as unattributed rather than guessing from their names.
-5. **RELRO**: make the 5,205,568-byte `PT_GNU_RELRO` region read-only after relocation — and note
-   that `DT_PLTGOT` is **inside** it and `DT_FLAGS` carries `DF_BIND_NOW`, so all 534 `JUMP_SLOT`
-   relocations are sealed with it and lazy PLT binding is impossible. They must be applied before the
-   seal, which fixes the order of the whole load.
-6. **`init_array`**: run all 3,594 entries in order. All must succeed. The array must be read from
-   **relocated memory**: every slot is zero in the file, because the pointers are produced by
-   `R_AARCH64_RELATIVE` relocations, so reading the file image yields 3,594 null pointers.
-7. **`dl_iterate_phdr` must be faithful.** The C++ runtime is statically linked, so the unwinder
-   lives inside the guest and walks 11.5 MB of `.eh_frame` using this call. A stub breaks every C++
-   exception, and Roblox will throw.
-8. **Deliberately not implemented**, because the APK contains none of it: ELF TLS (no `PT_TLS` and
-   no `STT_TLS` anywhere), ifuncs, BTI/PAC/MTE, `DT_TEXTREL`. Thread-local storage is
-   `pthread_key_*` only. This is a real saving, recorded so nobody adds it speculatively.
-9. Two `DT_NEEDED` libraries (`libOpenSLES.so`, `libOpenMAXAL.so`) import zero symbols but must
-   still resolve as loadable objects, and 10 `AMEDIAFORMAT_KEY_*` imports are **data** symbols, not
-   functions. Both fail in ways that name no symbol, so the loader reports unresolved objects and
-   data-versus-function mismatches explicitly.
-
----
+1. Relocations are APS2: 568,272 (568,194 RELATIVE, 56 GLOB_DAT, 22 ABS64) plus 534 JUMP_SLOT
+   via `DT_JMPREL`, 568,806 in all. No `DT_RELA`, no `DT_RELR`.
+2. Relocation runs in 64 KiB windows: copy-on-write is charged when a view turns writable (D11).
+3. `p_align` is 16 KiB; a library aligned below the host page is refused (`AlignBelowPageSize`).
+4. `DT_GNU_HASH` only; 565 imports, `DT_VERNEED` names a provider for 407.
+5. RELRO (5,205,568 bytes, holding `DT_PLTGOT`; `DF_BIND_NOW`) is sealed after all relocation,
+   its end rounded up as bionic does.
+6. All 3,594 `init_array` entries run in order, read from relocated memory.
+7. `dl_iterate_phdr` is faithful: the statically linked C++ unwinder finds 11.5 MB of `.eh_frame`
+   through it (`bionic/dl.rs`).
+8. Absent from the APK, so not implemented: ELF TLS, ifuncs, BTI/PAC/MTE, `DT_TEXTREL`.
+9. `dlopen` answers for the libraries this layer provides and loads no other file.
 
 ## 5. The Android compatibility layer
 
-Omnidroid implements only what the engine imports: **669 distinct undefined symbols**, enumerated
-in `research/apk-undefined-symbols.txt` (365 generic libc, 55 libm, 50 bionic-specific, 88 GLES,
-32 libandroid, 33 libmediandk, 20 EGL, 8 libz, 6 libdl, 5 liblog, 4 C++ ABI, 3 jnigraphics). The
-import list *is* the specification, so the stub surface is generated from the ELF rather than
-hand-maintained, and a missing symbol becomes a build-time fact instead of a runtime surprise.
+**The import list is the specification.** Each of `libroblox.so`'s 565 imports
+(`research/apk-undefined-symbols.txt`) gets a 16-byte slot in a reserved thunk region, bound by
+the loader through a `SymbolProvider`; an unimplemented slot refuses by name. The engine imports
+no allocator (its mimalloc sits on guest `mmap`), so the heap seam is the demand pager.
 
-**Host-native, not guest-compiled.** Every one of these is a Rust function running as native host
-code, so libc runs at full native speed on x86-64 hosts instead of being translated.
+**The crossing** (D17, D18): a branch to a slot is served inside the run loop (~27-31 ns).
+Handlers that call guest code (thread entry, `atexit`, `qsort`, `dl_iterate_phdr`) exit to Rust
+(~80-100 ns) and re-enter with a sentinel return address. `abi`/`varargs` implement AAPCS64 and
+`va_list`; `mem` checks every guest pointer.
 
-**Correction (M3 task 1): `libroblox.so` imports no allocator at all.** An earlier draft of this
-section claimed `malloc` would be the host allocator, so that the guest heap *is* the host heap. That
-is not how this binary works: it imports **zero** allocator symbols of any kind — only `__cxa_atexit`,
-`__cxa_finalize` and `__cxa_thread_atexit_impl` — and carries its own allocator internally, reaching
-the host through **guest `mmap`**.
+**bionic**: 322 bound symbols (`tests/bionic.rs`); guest threads are host threads, each with its
+own `GuestCpu` (D24); rooted files (D23); real sockets (D30); synthesized `/proc`; raw `SVC #0`
+routed to the matching import (`sysroute`). `AT_HWCAP` declines LSE (D26). No signal delivery:
+`sigaction`, `raise`, `pthread_sigmask` refuse by name.
 
-So the heap seam is the **demand pager**, not `malloc`. That is arguably a better fit for D10 than the
-documented design, since every guest allocation arrives as a mapping request we already reserve lazily
-and commit in granules — but the previous claim was wrong and is withdrawn rather than reinterpreted.
+**JNI without a JVM** (D7, D28): `JavaVM`/`JNIEnv` tables in guest memory; of 233 + 8 slots,
+59 + 2 are implemented and the rest refuse by name (`jni/slots.rs`). The Java side is transcribed:
+`jni/surface.rs` (98 classes, 1,526 members, generated from the dex) and answers in
+`jni/classes.rs`. A missed lookup returns null with a pending exception; an untranscribed call
+refuses.
 
-**The thunk boundary** (built in M3 task 2; rationale in D17 and D18). Guest code is ARM64; host
-code is x86-64 on x86-64 hosts. Every undefined symbol gets a slot at a synthetic guest address in a
-reserved *thunk region*, which `omni-android` reserves and hands out and which the loader binds
-through a `SymbolProvider`. A branch into that region marshals AAPCS64 into the host ABI, calls the
-Rust implementation, and returns. Callbacks in the other direction, host to guest — a `pthread` entry
-point, an `atexit` handler, a `qsort` comparator — re-enter the guest with a sentinel return address
-and read the answer out of `X0`/`V0`. On ARM64 hosts the ABI already matches and the thunk reduces to
-close to a direct call; the slot is 16 bytes wide precisely so that path stays open, because there
-the backend plants a real four-instruction veneer rather than recognising an address.
-
-**Correction (M3 task 2): the call does not exit to Rust.** An earlier draft of this paragraph said
-the backend "marshals ... calls the Rust implementation, and returns", which is the exit-to-Rust shape
-at 80-102 ns per call. D17 measured in-loop dispatch at 26.7-31.0 ns — a factor of 3 — and chose it,
-keeping the exit only for unresolved imports and for handlers that must call back into guest code.
-Both paths exist and `Capabilities::inline_thunks` decides which a given backend gets, so the
-description above is the *contract* and the exit is the fallback rather than the mechanism.
-
-**Also corrected: the loader did not already do this.** Until M3 task 2 the workspace had a
-`SymbolProvider` trait and an `EmptyProvider` that resolves nothing, and no region, no address
-assignment and no allocator anywhere. The M3 plan described the region as existing code; it was a
-design statement, exactly as this section's `malloc`-is-the-host-allocator model was.
-
-**JNI without a JVM, and no dex interpreter** (D7, now verified). Omnidroid implements `JavaVM` and
-`JNIEnv` as host-native function tables. The measured surface is small and lopsided: only **59 of
-233** `JNINativeInterface` slots are ever dereferenced, `JavaVM` needs just **2** (`GetEnv` and
-`AttachCurrentThread`), the engine **only reads Java fields and never writes them**, and every
-`CallXxxMethod` funnels through the `...MethodV` slot — so the `va_list` forms must be right and the
-convenience forms need not exist at all. Of 409 referenced Java members across 104 classes, roughly
-**120 are needed for a first frame**.
-
-The real work is not interpretation but **orchestration**: `libroblox.so` does not bootstrap itself.
-Flags, client settings, base URLs, directories, device parameters and `InitParams` all arrive from
-Java, and `NativeEngine` waits for them, so Omnidroid supplies a native shell that issues that
-ordered sequence. A failed class or method lookup must return `NULL` with a pending exception rather
-than aborting, because 5 referenced members do not exist in this APK's dex at all.
-
-**Startup is AGDK `GameActivity`, not `NativeActivity`.** The entry point is
-`Java_com_google_androidgamesdk_GameActivity_initializeNativeCode`, with
-`meta-data android.app.lib_name=roblox`. GameActivity's native half is statically linked into
-`libroblox.so`, so Omnidroid supplies the Java-side half and drives the lifecycle and input
-callbacks itself. This contract is less documented than `NativeActivity` and is being pinned down
-from the binary.
-
----
-
-**The rule one level up: JNI (M4, D28).** `libroblox.so` reaches a JNI function by loading a slot
-out of a `JNINativeInterface` whose layout the NDK fixes, so the *slot list* is the specification
-the same way the import list is. **59 of 233** slots and **2 of 8** `JavaVM` slots are ever
-dereferenced, and all 241 get a real thunk address: the 174 this layer does not implement refuse
-**naming themselves**, because a null table entry would turn a call the analysis said cannot
-happen into a branch to zero with nothing attached to it — the same failure shape `region` exists
-to replace. The class and member surface follows the same rule from the other side: a *lookup* the
-registry cannot answer returns null with a pending exception **and is recorded**, and a *call* to a
-member nobody decided the answer for refuses by name.
-
-**And the structural fact that shapes the whole layer:** the Java side is the **initiator**.
-`libroblox.so` does not bootstrap itself — flags, settings, base URLs, directories and
-`InitParams` all arrive from Java, and the engine waits for them. So `omni-android` owns a
-*script* (`jni::script`) and the engine responds to it. That is an orchestration problem, not an
-interpretation one, and it is the whole of why D7 holds.
+**The Java side is the initiator**: the engine waits for flags, settings, directories and
+`InitParams`, so `jni::script` drives that sequence (`jni-surface.md` §8), then GameActivity
+(AGDK, statically linked). `jni` also holds input, cursor, the app's cookie store, settings and
+the WebView bridge. **NDK** (`ndk`, D29): `ALooper`, `AAssetManager`, `AConfiguration`,
+`ANativeWindow`. **Audio**: `aaudio` implements `libaaudio.so` for FMOD on the host output.
 
 ## 6. ARM64 execution
 
-`omni-cpu` exposes a `GuestCpu` trait (create a context, run from an address, handle a thunk exit,
-invalidate translated code for a range) with two backends.
+- **dynarmic** (D5), on every host. Identity fastmem is asserted at startup and checked per run
+  slice (D4 amendment 2); losing it costs 30-49x. Value-compare exclusives (D31); fast dispatch
+  and the return-stack buffer kept, with budget/halt checks (D33, D35; fast dispatch off on
+  arm64). **One translation cache per instance** is the x86-64 default (D38; 16 MiB regions,
+  256 MiB live); arm64 keeps per-thread caches. Only executable ranges invalidate translations.
+- **native** (macOS arm64, Hypervisor.framework): guest at EL0, stage 2 at IPA == VA. Faster
+  compute, but each import is a VM exit (~1.6 us); not adopted (D34, `ports/macos-hvf.md`).
 
-**On ARM64 hosts** (Linux ARM64, macOS ARM64): guest code executes **natively**. There is no
-translation at all; the loader maps it executable and calls it. The thunk boundary reduces to an
-ABI-compatible call. This is the reason the abstraction exists.
-
-**On x86-64 hosts**: ARM64 to x86-64 binary translation. Host baseline is x86-64-v3 (D2). BMI2's
-flag-preserving `SHLX`/`SHRX`/`SARX` map directly onto AArch64's pervasive shifted-register
-operands, and `CMPXCHG16B` is what makes 128-bit guest atomics implementable without a lock.
-AVX-512 is never required.
-
-Translated code lives in a **dual-mapped arena**, one RW view for emission and one RX view for
-execution of the same pages, measured at 162 ns per emit-and-execute cycle versus 2259 ns for
-`VirtualProtect` flipping, and never holding a W+X page (D12).
-
-**The backend is dynarmic, pinned as a fork** (D5), behind the `GuestCpu` trait. The spike
-confirmed the central bet: `fastmem_pointer = 0` with `fastmem_address_space_bits = 64` emits
-`mov reg, [r13 + vaddr]` with `r13 = 0` — identity mapping at **zero** runtime cost, verified at a
-47-bit host VA with no slow-path callbacks. Losing it costs **30-49x** (n=31, measured through the
-runtime's real callback path across two loop shapes and both degraded mechanisms; an earlier 13.2x
-figure measured a bare stub and is a floor). Omnidroid therefore asserts this configuration at startup
-rather than trusting the default, which is 36 bits and **silently degrades high addresses to the slow
-path while still producing correct results** — a loss no functional test can detect.
-
-That assertion defends the *configuration*, once. It structurally cannot see a memory path that
-degrades at **runtime**, after it has passed, which Task 3 found two ways to do. So the runtime also
-checks the behaviour: **per run slice, the callback-path counter's delta must be zero unless that
-slice ended in a memory-fault exit** (D4 amendment 2). It costs one load per slice — 0.396-0.430 ns
-across two runs, each the median of n = 31 runs of 10,000,000 reads — against a slice of a million
-guest instructions.
-
-Measured throughput is uneven and shapes what comes next: about **2.0x native** on memory-heavy
-code and **2.2x** on NEON/FP, but about **33x** on register-bound integer code, caused by per-block
-register allocation spilling every guest register to `JitState` each iteration plus `lahf`/`sahf`
-NZCV round-trips. That is a fixable backend-quality problem, which is why the plan is to replace the
-x64 backend eventually while keeping the A64 frontend.
-
-Three consequences the rest of the design must absorb:
-
-- **Cold translation is slow** (0.15-0.31 Mguest-insn/s on synthetic loops, implying 7-25 s to warm
-  a Roblox-sized working set), so translation is parallelized across cores and backed by a
-  persistent on-disk code cache keyed by library content hash. Measured on **870 real
-  `libroblox.so` leaf functions** it is **0.516 Mguest-insn/s** (n = 11, median, a fresh context
-  each) — better than the synthetic figure, so the synthetic number remains the right one for
-  loop-shaped code. *Why* real code is faster is a hypothesis rather than a result; see D5
-  amendment 2.
-- **Code caches are per-thread and not shared**, committing 20-35 MiB per guest thread regardless of
-  code volume. This is in direct tension with D10 and is tracked as a primary risk.
-- **`ExclusiveMonitor` uses one global spinlock** and anti-scales 21x from 1 to 16 threads. Since
-  Omnidroid implements bionic it controls `getauxval(AT_HWCAP)` and could decline to advertise LSE
-  atomics — but that steers the engine onto `LDXR`/`STXR` and into this very lock, so the two are
-  resolved together.
-
-`TPIDR_EL0` is fully supported, which matters because Android TLS depends on the thread pointer.
-Unimplemented instructions (LSE atomics, FP16 arithmetic, `CNTVCT_EL0`, `ID_AA64*`) surface cleanly
-through an interpreter fallback at about 87 ns per trap, so they are correct but slow, and are
-patches we carry on the fork.
-
----
+No native backend exists for Linux ARM64. `TPIDR_EL0` must point at a bionic TLS block with the
+stack guard at +0x28 before any guest code runs (D13). Runaway guests stop via `HaltHandle` (D16).
+`CNTVCT_EL0` reads are translated (patch 0001); an instruction the pin cannot translate ends the
+slice with `ExitReason::UnsupportedInstruction` (`SVC #0` is served there as a syscall).
 
 ## 7. Instance isolation
 
-**One OS process per instance.** This is the strongest isolation available, it is the only thing
-that actually contains the memory-safety consequence of identity mapping (section 1), and it was
-measured cheap: about 52 MiB VRAM and 110 to 160 MB host RAM per instance at 4 concurrent
-instances.
+**One OS process per instance**, with its own window, input, guest space and storage; only the
+read-only extraction cache is shared. Guest paths (`/data/data/com.roblox.client/...`) resolve
+only inside one host data directory (per account under `play --cookie`); an escaping path is
+refused (D23).
 
-Each instance gets a private directory tree, and nothing is shared except the read-only library
-cache:
-
-```
-<instance-root>/<instance-id>/
-    files/    cache/    config/    tmp/    logs/    state/
-```
-
-The guest filesystem is **virtual**: bionic file calls are serviced by a VFS that maps Android
-paths such as `/data/data/com.roblox.client/...` and `/sdcard/...` onto that tree. The guest cannot
-name a host path outside it, so isolation does not depend on the guest behaving. `/proc/self/maps`
-and similar are synthesized from the loader's own state.
-
-Per-instance memory follows D10: reserve a generous guest address space (free, 0 bytes of commit
-charge, verified to 97.7 TB), commit lazily in 64 KB to 1 MB blocks (per-page fault-driven paging
-costs 2053 ns per fault versus 3 ns per page for bulk commit, so it is not used as a hot path), and
-reclaim with `MEM_DECOMMIT`, the **only** primitive measured to return commit charge. A 4 GB guest
-space costs 37.25 MB of commit, and the goal's "several GB at startup, about 500 MB later" profile
-is directly achievable and was demonstrated end to end. `EmptyWorkingSet` is a secondary lever for
-backgrounded instances but is never mistaken for reclamation.
-
----
+Memory (D10): a 16 GiB guest reservation, commit in 64 KiB granules on touch, decommit to
+reclaim (`MEM_DECOMMIT`; a fresh `MAP_FIXED` mapping on Linux and macOS). The device's RAM, which
+is also the commit ceiling, is 60% of host RAM in whole GiB, at most 8 GiB, or
+`OMNI_GUEST_MEMORY_MB` (D36). `OMNI_MEM_REPORT` prints memory per owner.
 
 ## 8. Graphics
 
-**Vulkan is the primary path and it is nearly a pass-through.** The engine `dlopen`s
-`libvulkan.so` (volk-style: 593 `vk*` name strings, zero `vk*` imports), so Omnidroid supplies that
-library and forwards to the host driver. Because memory is identity-mapped, guest-filled Vulkan
-structs are read directly by the host driver with **no marshalling and no copies**; the structs are
-fixed-width and LP64 on both sides. Guest function pointers embedded in Vulkan structs, such as
-allocator and debug callbacks, go through host-to-guest trampolines.
+**Vulkan is forwarded** (D8). The engine `dlopen`s `libvulkan.so` and resolves everything via
+`vkGetInstanceProcAddr`; `omni_android::vulkan` forwards each call to `omni-gfx`'s
+`GfxVulkanHost`, guest structs read in place, guest memory imported as host-visible memory.
+`VK_KHR_android_surface` becomes win32, xlib or metal (MoltenVK). The engine refuses a device it
+thinks emulated, so a CPU rasterizer (lavapipe) sends it to GLES.
 
-Two findings shape the rest:
+**EGL and GLES are forwarded** (`omni_android::gles`): ES 2.0-3.2 and EGL, signatures generated
+from the Khronos registries (`tools/gen_gles_signatures.py`). The only host row is X11 (Mesa or
+GLVND); Win32 (ANGLE) and macOS are typed refusals. With no window, `Gles::set_driverless`
+answers as Android's `libEGL` does without a driver.
 
-- **The engine ships 1,364 SPIR-V modules** (`shaders_vulkan_mobile.pack`, 14.7 MB, STORED), so
-  shader translation is off the critical path entirely.
-- **The engine rejects emulated Vulkan devices**: `Vulkan: Device %s is emulated, skipping`, plus
-  vendor and driver blacklists. Forwarding to the real host GPU reports a genuine `deviceType` and
-  real IDs, which satisfies this. A software device would be refused.
-
-**EGL and GLESv2 are hard-linked** (`DT_NEEDED`, 91 EGL and GL imports) and must resolve at load
-time or the library will not load at all. That is a linker requirement, not a rendering one, so
-they are provided as resolvable symbols and a real GLES3 implementation is deferred until proven
-necessary. The manifest declares `glEsVersion=0x30000` required and no Vulkan feature at all, so
-GLES3 is the guaranteed fallback: if the Vulkan path is ever refused on a host we cannot control,
-GLES3-on-Vulkan becomes necessary, and the renderer abstraction stays general enough to admit it.
-
-**Texture compression is a real cost.** The host GPU supports **neither ETC2 nor ASTC** (measured,
-all variants); it supports BC1/BC3/BC7. Android assets ship ETC2/ASTC, so runtime transcoding is
-mandatory infrastructure, budgeted from the start with a disk-backed transcode cache and run on the
-**dedicated compute queue** so it does not serialize behind rendering. Bulk uploads use staging
-buffers over the **dedicated transfer queue**, because only about 214 MiB is both host-visible and
-device-local.
-
-**The window is a genuine native desktop window**, resizable by the user, via `winit`. Verified
-working end to end with correct swapchain recreation. The guest's `ANativeWindow` reports the real
-window geometry, and resizes propagate as GameActivity surface-changed callbacks. There is no fixed
-Android resolution anywhere.
-
-Backends sit behind a renderer trait so D3D12 and Metal can be added later without touching the
-compatibility layer.
-
----
+`ANativeWindow` reports the native window's real size. A minimised window answers the surface
+query with `VK_ERROR_SURFACE_LOST_KHR`, so the engine skips drawing. `OMNI_FPS_CAP` paces presents
+(`pacing`). The APK's compressed textures are ETC1 only (D27).
 
 ## 9. Testing strategy
 
-The project runs the real APK continuously. Progress is measured by a ladder of **falsifiable boot
-milestones**, each a checkpoint that either passes against the real binary or does not:
+Progress is a ladder of milestones, each passed against the real `libroblox.so`: M0 APK parsed
+and libraries cached; M1 ELF loaded, 568,806 relocations applied; M2 a real function returns known
+outputs; M3 all 3,594 initializers, asserted by `(index, address)` sequence; M4 `JNI_OnLoad`
+returns `0x00010006`; M5 `initializeNativeCode` returns and the game thread runs; M6 the engine
+creates its Vulkan device through the forwarding layer; M7 first frame; M8 interactive.
 
-| # | Milestone | Verified by |
-|---|---|---|
-| M0 | APK parsed; `.so` extracted to the 4 KB-aligned cache | entry list and hashes match the forensic report |
-| M1 | ELF loaded; **all 568,806** relocations applied (568,272 APS2 + 534 `DT_JMPREL`); imports enumerated | exact per-type relocation counts; all 565 `libroblox.so` imports accounted for |
-| M2 | A trivial ARM64 function from `libroblox.so` executes and returns | known input and output |
-| M3 | All **3,594** `init_array` entries complete | counter reaches 3,594 with no fault |
-| M4 | `JNI_OnLoad` returns successfully | return value is a valid JNI version |
-| M5 | `initializeNativeCode` runs; engine requests a surface | callback observed |
-| M6 | Vulkan instance and device created through the forwarding layer | device is the real GPU, not rejected as emulated |
-| M7 | First frame presented to the native window | visual confirmation |
-| M8 | Interactive: input, resize, sustained frames | sustained run |
-
-Alongside that:
-
-- **Golden-data unit tests** taken from the real binary. The APS2 decoder is tested against
-  `libroblox.so`'s own 568,272 relocations, which is a far stronger test than synthetic input; the
-  reference decoder used during analysis consumed 2,100,778 of 2,100,778 bytes exactly.
-- **A guest thread is not runnable until `TPIDR_EL0` points at a bionic-layout TLS block** with a
-  stack guard at offset 0x28 (D13). 1,276 of the engine's 1,282 thread-pointer reads want exactly
-  that slot, and they happen before `JNI_OnLoad` and before the first static initializer, so this is
-  asserted in thread bring-up rather than discovered at M3.
-- **Differential CPU tests** for the translation backend: instruction sequences run through the
-  backend and compared against a reference model, focused on flags, shifted operands, NEON, and
-  atomics.
-- **Memory-model assertions** that measure commit charge rather than assuming it, since the
-  difference between `MEM_DECOMMIT` and `MEM_RESET` is invisible to functional tests.
-- **Multi-instance tests** asserting no cross-instance filesystem or state visibility.
-
-Rules that follow from the goal: no placeholder success messages, no fabricated implementations,
-and no large bodies of untested code. A subsystem is "working" only when a milestone above passes
-against the real APK. `docs/STATUS.md` is the honest record and distinguishes verified from
-planned.
-
----
+The gate runs the whole sequence and, in a session, the game. Tests use golden data from the
+real binary, assert measured memory, fail when the APK is absent, and are checked by mutation
+(`tools/mutate.py`). Rules: `VERIFICATION.md`.
 
 ## 10. Known risks
 
 | Risk | Why it matters | Mitigation |
 |---|---|---|
-| CPU backend undecided | Determines feasibility and effort of the whole x86-64 path | Spike running; trait boundary keeps the choice cheap |
-| Test APK is cheat-injected | Library set, permissions and dex graph are contaminated (D6) | Design from stock `libroblox.so`; stock APK requested |
-| JNI surface size unknown | If large, or if dex execution is forced, D7 collapses | Being measured before code is written |
-| No Vulkan validation layers | A real use-after-free already crashed the driver silently | Install recommended; until then, extra care on resource lifetime |
-| APS2 relocations | A wrong decoder loads zero code and fails confusingly | Tested against the real 568,272-relocation binary |
-| 3,594 initializers | Any one failing blocks startup, far from the symptom | Per-initializer tracing from the start |
-| Linux and macOS untested | Claiming support without testing is explicitly forbidden | Structural portability only; no claims until tested |
-| Frame pacing measured through Parsec | Remote display distorts present timings | Re-verify on a local display before tuning |
+| No isolation inside a process | guest code can corrupt the host (D4 amendment 1) | one process per instance |
+| Untranscribed Java methods | a call to one refuses and kills that thread; the game can freeze | `research/jni-audit-2.739.md`; transcribe from the dex |
+| dynarmic arm64 backend | stale-code transfer and freezes on the Mac (m7, m9, m11) | patch 0023 in progress |
+| Memory per instance | ~2.5 GiB against a 0.8-0.9 GiB target for many instances | HANDOFF's plan; `OMNI_MEM_REPORT` |
+| Untested targets | Linux ARM64 and macOS x86-64 never built or run | no claims until run |
+
+Resolved: the CPU backend (D5), the JNI surface size (D7, D28), APS2 decoding (M1), and the
+modified test APK: the repository now holds the stock `Roblox-2.738.1397.apk` (D6).

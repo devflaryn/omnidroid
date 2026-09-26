@@ -1,82 +1,58 @@
 # `dynarmic-sys`
 
-Raw FFI bindings to the pinned dynarmic A64 JIT: the vendored source, the build
-script that compiles it, the `extern "C"` shim over its virtual-callback
-interfaces, and the `#[repr(C)]` declarations that match the shim.
+Raw FFI to the pinned dynarmic A64 JIT: the vendored source, the build script, the `extern "C"`
+shim over dynarmic's callback interfaces (`shim/od_dynarmic.{h,cpp}`, `OD_DYNARMIC_ABI_VERSION`
+4), and the matching `#[repr(C)]` declarations in `src/lib.rs`. No policy lives here: `omni-cpu`
+(`src/dynarmic/`) maps it onto the `GuestCpu` trait behind its default `dynarmic` feature.
 
-Nothing here decides policy. The `GuestCpu` trait lives in `omni-cpu`, which has
-**no build script and no C++ dependency**, so that trait keeps compiling on a
-host with no C++ toolchain — which is the host the ARM64-native path
-(`ARCHITECTURE.md` §6) targets. Mapping this crate onto the trait is a separate
-piece of work.
-
-## What is vendored
+## Vendored
 
 | | |
 |---|---|
-| dynarmic | `yuzu-mirror/dynarmic@9d4582339990d4eae53f1dc7160686920fc2075c` (6.7.0) |
-| Boost | a 1,786-file header subset of 1.88.0 |
+| dynarmic | `yuzu-mirror/dynarmic@9d4582339990d4eae53f1dc7160686920fc2075c` (6.7.0) + `patches/` |
+| Boost | 1.88.0, a derived 1,786-file header subset (`vendor/boost/README.md`) |
 
-`vendor/PIN.txt` records both, why the tree is vendored rather than
-submoduled, and how the Boost subset was derived. `LICENSES.md` records every
-licence, including one — BSL-1.0 — that D3 does not currently name.
+`vendor/PIN.txt` says why the tree is vendored rather than a submodule (the upstream is gone, D5).
+`LICENSES.md` lists every licence, including BSL-1.0. Patches: `patches/README.md`.
 
 ## Building
 
-Needs CMake (3.12+, 4.x works) and a C++20 compiler. `cl.exe` does not need to
-be on `PATH`; the `cc` crate locates MSVC through the registry and the build
-script passes its environment to CMake. Ninja is optional but strongly
-preferred. If any of that is missing, the build script says which one and stops,
-rather than letting CMake print a page about a failed compiler check.
+Needs CMake 3.12+ (4.x works) and a C++20 compiler; Ninja is optional but preferred. On Windows
+the `cc` crate finds MSVC itself. A missing tool stops the build with a one-line reason. dynarmic
+is always built `Release` with only the A64 frontend, whatever the Cargo profile.
 
-Four things the build script handles that are not obvious, all of them recorded
-in D5 and re-confirmed here:
+The build script handles:
 
-* **Boost is an undeclared dynarmic dependency** (`boost::icl` for code-cache
-  invalidation ranges, `boost::variant` for the IR terminal type).
-* **`-DCMAKE_POLICY_VERSION_MINIMUM=3.5`** is required: `robin-map` still
-  declares `cmake_minimum_required(VERSION 3.1)`, which CMake 4.x refuses.
-* **Build paths must be short.** MSVC still fails with `C1083` past 260
-  characters and CMake nests object files ~120 characters below the binary
-  directory. The script checks the budget before starting and points at
-  `OMNIDROID_DYNARMIC_BUILD_DIR` if it is exceeded.
-* dynarmic calls `find_package(Boost 1.57 REQUIRED)`. `cmake/boost/` provides a
-  CONFIG-mode package for the vendored subset, so this keeps working when CMake
-  finishes removing its deprecated `FindBoost` module.
+- Boost, an undeclared dynarmic dependency (`boost::icl`, `boost::variant`), through
+  `cmake/boost/`'s CONFIG package.
+- `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`, which CMake 4.x needs for `robin-map`.
+- MSVC's 260-character path limit (`C1083`): it checks the budget first; set
+  `OMNIDROID_DYNARMIC_BUILD_DIR` to a short path (e.g. `C:\od-build`) if it is exceeded.
+- `-DDYNARMIC_USE_BUNDLED_EXTERNALS=ON` off Windows, so a Homebrew `fmt` is not picked up.
 
-dynarmic is always built `Release`, whatever Cargo profile is in use: a debug
-build of a JIT is too slow to run a game engine under, and Rust's msvc target
-links the release CRT regardless, so a Debug build would also mix CRTs.
+Cargo watches only `build.rs`, the shim and `vendor/PIN.txt`: touch `PIN.txt` (or
+`cargo clean -p dynarmic-sys`) after editing anything under `vendor/`. `CMAKE`, `CXX` and `CC`
+select the tools.
 
-## Two things to read before using this crate
+## Before using it
 
-Both are in the crate documentation (`cargo doc -p dynarmic-sys --open`) and
-both are load-bearing.
+1. **Re-entrancy.** A callback can be entered from generated code at any instruction boundary.
+   The context pointer must not be the object `od_jit_run` was reached through, `run` takes
+   `&self`, and callbacks must not unwind. `tests/harness/mod.rs` is the worked example.
+2. **Fastmem degrades silently.** Identity fastmem is 30-49x faster than the callback path (D4).
+   Assert it with `od_jit_effective_config` and `od_jit_stats`.
+3. **Stopping a runaway guest.** `optimization::INTERRUPTIBLE` is `ALL_SAFE` on x64 and
+   `ALL_SAFE & !FAST_DISPATCH` on arm64 (patches 0018-0020, D35). A direct-branch loop still honours
+   only one of budget or halt unless `BLOCK_LINKING` is cleared, which costs about 7x on
+   4-instruction blocks (`libroblox.so` averages 4.30). `tests/hostile.rs::the_stoppability_matrix`
+   is the table; `patches/README.md` item 2 explains it.
+4. **W^X.** x64's code cache is `PAGE_EXECUTE_READWRITE` (the D12 exception) and guest-addressable
+   in principle under identity fastmem; Apple arm64 is W^X per thread (`MAP_JIT`, `tests/wx.rs`).
+   The `w-xor-x` feature is refused unless `OMNIDROID_DYNARMIC_ALLOW_BROKEN_WX=1`, because it
+   crashes on this pin (`patches/README.md` item 3).
 
-1. **Re-entrancy.** Every callback can be entered from generated guest code at
-   any instruction boundary. The context pointer must not be the object through
-   which `od_jit_run` was reached, `run` must take `&self`, and callbacks must
-   not unwind. `tests/harness/mod.rs` is the worked example.
-2. **Configuration that is not optional.** Identity fastmem is 30-49x faster than
-   the callback path (D4) and degrades to it *silently*.
-   `od_jit_effective_config` and `od_jit_stats` exist so that can be asserted
-   rather than assumed.
-3. **Stopping a runaway guest costs throughput, and how much depends on which
-   guests you need to stop.** `optimization::INTERRUPTIBLE` covers indirect
-   branches; clearing `BlockLinking` as well (`0x0000_FFF8`) covers everything.
-   `the_stoppability_matrix` in `tests/hostile.rs` is the table and
-   `patches/README.md` §2 is the explanation.
-4. **dynarmic's code cache is writable and executable at once**, which
-   contradicts D12, and under D4's identity mapping it is guest-addressable in
-   principle. `patches/README.md` §3.
+## Tests
 
-Measured costs, all n=31 in release, on the host in `docs/research/host-environment.md`:
-
-| | |
-|---|---|
-| `optimization::INTERRUPTIBLE` | ~3.9 ns per indirect transfer: 1.00x with no indirect branches, 4.56x at two transfers per twelve instructions, 4.71x at two per four |
-| also clearing `BlockLinking` (`0x0000_FFF8`) | a dispatcher round trip per basic block: 7.08–7.43x on these 4-instruction-block workloads, which is close to the worst case — the cost falls as blocks get longer |
-| cold translation | 7.2 us per basic block (2,000 blocks, 64 MiB cache) |
-
-Reproduce with
+`cargo test -p dynarmic-sys --release`. With `OD_TEST_SHARED_CACHE=1` every test `Vm` runs on a
+shared code cache of its own (x64). Benchmarks:
 `cargo test -p dynarmic-sys --release --test bench -- --ignored --nocapture`.
