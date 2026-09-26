@@ -57,6 +57,7 @@ pub const SI_TKILL: i32 = -6;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
 pub const ILL_ILLOPC: i32 = 1;
+pub const TRAP_BRKPT: i32 = 1;
 
 /// A `stack_t` (24 bytes) with `SS_DISABLE`: no alternate stack.
 #[must_use]

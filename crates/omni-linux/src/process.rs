@@ -284,7 +284,11 @@ impl Process {
     /// `exit`. Every other thread is stopped and joined before this returns.
     pub fn run(self: &Arc<Self>) -> ExitStatus {
         let (pc, sp) = self.start.lock().expect("spawned");
-        let mut cpu = self.new_cpu();
+        let Some(mut cpu) = self.new_cpu() else {
+            let status = ExitStatus::Killed { signal: 6, pc, detail: "the CPU backend made no CPU for the main task".into() };
+            *self.exit.lock() = Some(status.clone());
+            return status;
+        };
         // The task is reached two ways: by `on_svc`, through the context pointer, from inside the
         // JIT; and by the loop below, between runs. So no reference to it may live across
         // `cpu.run` -- a `&mut Task` held there let the optimizer keep `exit` in a register and
@@ -321,10 +325,11 @@ impl Process {
         status
     }
 
-    fn new_cpu(&self) -> Box<dyn GuestCpu> {
-        let backend = self.backend.as_ref().expect("a spawned process has a backend");
-        let config = GuestThreadConfig::guest_managed(GuestAddressSpace::of(self.mem.space()).expect("the space's extent"));
-        backend.create_thread(config).expect("a guest thread")
+    /// A CPU for a new task; `None` when the backend cannot make one (`clone` answers `EAGAIN`).
+    fn new_cpu(&self) -> Option<Box<dyn GuestCpu>> {
+        let backend = self.backend.as_ref()?;
+        let config = GuestThreadConfig::guest_managed(GuestAddressSpace::of(self.mem.space()).ok()?);
+        backend.create_thread(config).ok()
     }
 
     /// A task has ended: a thread's `exit` clears and wakes its `clear_child_tid` (what
@@ -364,7 +369,7 @@ impl Process {
     /// parent's `SVC` with `x0 = 0`, `sp = stack` (or the parent's) and `TPIDR_EL0 = tls`.
     pub(crate) fn spawn_thread(self: &Arc<Self>, parent: &Task, tid: i32, stack: u64, tls: Option<u64>, clear_child_tid: u64) -> Result<(), crate::errno::Errno> {
         let (regs, parent_sp) = parent.clone_regs.ok_or(crate::errno::EINVAL)?;
-        let mut cpu = self.new_cpu();
+        let mut cpu = self.new_cpu().ok_or(crate::errno::EAGAIN)?;
         for (n, value) in regs.iter().enumerate() {
             cpu.set_x(XReg::new(n as u8).expect("x0..x30"), *value);
         }
@@ -464,20 +469,38 @@ impl Process {
                         Err(killed) => return (killed, None),
                     }
                 }
-                (ExitReason::MemoryFault { pc: at, address, access }, _) if self.handles(11) => {
+                (ExitReason::MemoryFault { pc: at, address, access }, _) => {
                     let address = crate::guest::untag(address as u64);
                     let mapped = self.mem.space().region_at(address as usize).is_some_and(|r| r.mapping.is_some());
                     let code = if mapped { crate::signal::SEGV_ACCERR } else { crate::signal::SEGV_MAPERR };
                     let info = crate::signal::SigInfo { signo: 11, code, addr: address, pid: 0, uid: 0 };
-                    let _ = access;
-                    match self.deliver(cpu, task, info, at as u64, address) {
+                    let what = format!("{access:?} at {address:#x}");
+                    match self.fault(cpu, task, info, at as u64, address, &what) {
                         Ok(next) => pc = next,
                         Err(killed) => return (killed, None),
                     }
                 }
-                (ExitReason::MemoryFault { pc: at, address, access }, _) => {
-                    let detail = format!("{access:?} at {address:#x}\n{}", self.registers(cpu));
-                    return (ExitStatus::Killed { signal: 11, pc: at as u64, detail }, None);
+                (ExitReason::UnsupportedInstruction { pc: at, encoding }, None) => {
+                    // `brk` (which dynarmic reports as unsupported) is SIGTRAP with TRAP_BRKPT; any
+                    // other undefined instruction is SIGILL, as the kernel's undef handler raises it.
+                    let info = if encoding & 0xFFE0_001F == 0xD420_0000 {
+                        crate::signal::SigInfo { signo: 5, code: crate::signal::TRAP_BRKPT, addr: at as u64, pid: 0, uid: 0 }
+                    } else {
+                        crate::signal::SigInfo { signo: 4, code: crate::signal::ILL_ILLOPC, addr: at as u64, pid: 0, uid: 0 }
+                    };
+                    let what = format!("the guest executed an unsupported instruction {encoding:#010x} at {at:#x}");
+                    match self.fault(cpu, task, info, at as u64, 0, &what) {
+                        Ok(next) => pc = next,
+                        Err(killed) => return (killed, None),
+                    }
+                }
+                (ExitReason::Breakpoint { pc: at }, _) => {
+                    // `brk`: SIGTRAP with TRAP_BRKPT; the frame's pc is the `brk` itself.
+                    let info = crate::signal::SigInfo { signo: 5, code: crate::signal::TRAP_BRKPT, addr: at as u64, pid: 0, uid: 0 };
+                    match self.fault(cpu, task, info, at as u64, 0, &format!("breakpoint at {at:#x}")) {
+                        Ok(next) => pc = next,
+                        Err(killed) => return (killed, None),
+                    }
                 }
                 (other, _) => {
                     let detail = format!("{other}\n{}", self.registers(cpu));
@@ -487,9 +510,18 @@ impl Process {
         }
     }
 
-    /// Whether the guest has a handler for `sig` (not the default, not ignored).
-    fn handles(&self, sig: i32) -> bool {
-        self.sys.action(sig).0 > 1
+    /// A synchronous signal the task's own instruction raised. As the kernel's `force_sig_fault`:
+    /// if the task blocks it or has no handler for it (default or ignored), it cannot be deferred
+    /// or dropped -- re-running the instruction would fault again -- so the process is killed.
+    fn fault(&self, cpu: &mut dyn GuestCpu, task: *mut Task, info: crate::signal::SigInfo, pc: u64, fault_address: u64, what: &str) -> Result<u64, ExitStatus> {
+        let sig = info.signo;
+        // SAFETY: as in `deliver_pending`.
+        let blocked = unsafe { (*task).sigmask } & (1 << (sig - 1)) != 0;
+        if blocked || self.sys.action(sig).0 <= 1 {
+            let detail = format!("{what}\n{}", self.registers(cpu));
+            return Err(ExitStatus::Killed { signal: sig, pc, detail });
+        }
+        self.deliver(cpu, task, info, pc, fault_address)
     }
 
     /// The task's registers now, with `pc` where it resumes.
