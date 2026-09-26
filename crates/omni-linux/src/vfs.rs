@@ -1,1 +1,317 @@
-//! Filled in by the A1 plan, Task 5.
+//! The mount table and Linux path resolution.
+//!
+//! The AOSP sysroot is read-only and comes from its manifest (symlinks included: the tree on disk
+//! has none). Writable mounts (`/data`, `/tmp`) are per-instance host directories. `/dev/*` and
+//! `/proc/self/exe` are synthesized. A2 adds the rest of `/proc` and `/sys`.
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use omni_mem::{Backing, MapExecutability};
+use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
+
+use crate::errno::{Errno, EIO, ELOOP, ENOENT, ENOTDIR};
+use crate::manifest::{self, Entry, Manifest};
+
+/// The sha256 of the pinned `sysroot.manifest` (Task 1, Step 2).
+pub const SYSROOT_MANIFEST_SHA256: &str = "1a5ceae2fd1ba0f7b532d88bce9ae53b08a84987cb9b56b8bb12064257a4f161";
+
+pub const DT_CHR: u8 = 2;
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
+const MAX_LINKS: usize = 40;
+
+pub struct Sysroot {
+    objects: PathBuf,
+    manifest: Manifest,
+    children: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+    backings: Mutex<HashMap<Vec<u8>, Arc<Backing>>>,
+}
+
+impl Sysroot {
+    pub fn open(dir: &Path) -> Result<Arc<Self>, String> {
+        let path = dir.join("sysroot.manifest");
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if digest != SYSROOT_MANIFEST_SHA256 && std::env::var("OMNI_SYSROOT_UNPINNED").as_deref() != Ok("1") {
+            return Err(format!(
+                "{}: sha256 {digest} is not the pinned {SYSROOT_MANIFEST_SHA256} (tools/make_sysroot.py)",
+                path.display()
+            ));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| "sysroot.manifest is not UTF-8".to_string())?;
+        let manifest = manifest::parse(&text)?;
+        for entry in manifest.entries.values() {
+            if let Entry::File { size, sha256, .. } = entry {
+                let host = object_path(&dir.join("objects"), sha256);
+                let found = std::fs::metadata(&host).map(|m| m.len()).ok();
+                if found != Some(*size) {
+                    return Err(format!("{}: size {found:?}, manifest says {size}", host.display()));
+                }
+            }
+        }
+        Ok(Self::from_manifest(dir, manifest))
+    }
+
+    #[must_use]
+    pub fn from_manifest(dir: &Path, manifest: Manifest) -> Arc<Self> {
+        let mut children: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+        for path in manifest.entries.keys() {
+            if path.as_slice() == b"/" {
+                continue;
+            }
+            let cut = path.iter().rposition(|&b| b == b'/').expect("absolute");
+            let parent = if cut == 0 { b"/".to_vec() } else { path[..cut].to_vec() };
+            children.entry(parent).or_default().push(path[cut + 1..].to_vec());
+        }
+        Arc::new(Self { objects: dir.join("objects"), manifest, children, backings: Mutex::default() })
+    }
+
+    /// Where a regular file's content is on the host; `None` for anything that is not a file.
+    #[must_use]
+    pub fn host_path(&self, guest: &[u8]) -> Option<PathBuf> {
+        match self.entry(guest)? {
+            Entry::File { sha256, .. } => Some(object_path(&self.objects, sha256)),
+            _ => None,
+        }
+    }
+
+    fn entry(&self, guest: &[u8]) -> Option<&Entry> {
+        self.manifest.entries.get(guest)
+    }
+
+    /// One `Backing` per sysroot file, shared by every mapping of it in this process (and so its
+    /// text is shared the way `libroblox.so`'s is).
+    pub fn backing(&self, guest: &[u8]) -> Result<Arc<Backing>, Errno> {
+        let mut cache = self.backings.lock();
+        if let Some(b) = cache.get(guest) {
+            return Ok(Arc::clone(b));
+        }
+        let host = self.host_path(guest).ok_or(EIO)?;
+        let b = Backing::open(&host, MapExecutability::Executable).map_err(|_| EIO)?;
+        cache.insert(guest.to_vec(), Arc::clone(&b));
+        Ok(b)
+    }
+}
+
+fn object_path(objects: &Path, sha256: &str) -> PathBuf {
+    objects.join(&sha256[..2]).join(sha256)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevNode {
+    Null,
+    Zero,
+    Random,
+    Urandom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Node {
+    Dir,
+    SysFile { size: u64, mode: u32 },
+    HostFile { host: PathBuf },
+    HostDir { host: PathBuf },
+    Symlink { target: Vec<u8> },
+    Dev(DevNode),
+    /// The final component does not exist. `host` is where it would be created, on a writable mount.
+    Missing { parent_is_dir: bool, host: Option<PathBuf> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub path: Vec<u8>,
+    pub node: Node,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEnt {
+    pub name: Vec<u8>,
+    pub kind: u8,
+    pub ino: u64,
+}
+
+/// A stable inode number for a guest path (FNV-1a).
+#[must_use]
+pub fn ino_of(path: &[u8]) -> u64 {
+    path.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)) | 1
+}
+
+pub struct Vfs {
+    sysroot: Arc<Sysroot>,
+    writable: Vec<(Vec<u8>, PathBuf)>,
+    exe: Vec<u8>,
+}
+
+fn join(components: &[Vec<u8>]) -> Vec<u8> {
+    if components.is_empty() {
+        return b"/".to_vec();
+    }
+    components.iter().flat_map(|c| std::iter::once(b'/').chain(c.iter().copied())).collect()
+}
+
+fn split(path: &[u8]) -> Vec<Vec<u8>> {
+    path.split(|&b| b == b'/').filter(|c| !c.is_empty()).map(<[u8]>::to_vec).collect()
+}
+
+impl Vfs {
+    #[must_use]
+    pub fn new(sysroot: Arc<Sysroot>, writable: Vec<(Vec<u8>, PathBuf)>, exe: Vec<u8>) -> Self {
+        Self { sysroot, writable, exe }
+    }
+
+    #[must_use]
+    pub fn sysroot(&self) -> &Arc<Sysroot> {
+        &self.sysroot
+    }
+
+    /// The node at an already-normalized absolute path, without following a final symlink.
+    fn lookup(&self, path: &[u8]) -> Option<Node> {
+        match path {
+            b"/dev" | b"/proc" | b"/proc/self" => return Some(Node::Dir),
+            b"/dev/null" => return Some(Node::Dev(DevNode::Null)),
+            b"/dev/zero" => return Some(Node::Dev(DevNode::Zero)),
+            b"/dev/random" => return Some(Node::Dev(DevNode::Random)),
+            b"/dev/urandom" => return Some(Node::Dev(DevNode::Urandom)),
+            b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
+            _ => {}
+        }
+        for (mount, host) in &self.writable {
+            if path == mount.as_slice() {
+                return Some(Node::HostDir { host: host.clone() });
+            }
+            if path.starts_with(mount) && path.get(mount.len()) == Some(&b'/') {
+                let rel = String::from_utf8_lossy(&path[mount.len() + 1..]).into_owned();
+                let host = host.join(rel);
+                return match std::fs::metadata(&host) {
+                    Ok(m) if m.is_dir() => Some(Node::HostDir { host }),
+                    Ok(_) => Some(Node::HostFile { host }),
+                    Err(_) => None,
+                };
+            }
+        }
+        match self.sysroot.entry(path)? {
+            Entry::Dir { .. } => Some(Node::Dir),
+            Entry::File { size, mode, .. } => Some(Node::SysFile { size: *size, mode: *mode }),
+            Entry::Symlink { target } => Some(Node::Symlink { target: target.clone() }),
+        }
+    }
+
+    fn host_for_missing(&self, path: &[u8]) -> Option<PathBuf> {
+        self.writable.iter().find_map(|(mount, host)| {
+            (path.starts_with(mount) && path.get(mount.len()) == Some(&b'/'))
+                .then(|| host.join(String::from_utf8_lossy(&path[mount.len() + 1..]).as_ref()))
+        })
+    }
+
+    pub fn resolve(&self, cwd: &[u8], path: &[u8], follow_last: bool) -> Result<Resolved, Errno> {
+        if path.is_empty() {
+            return Err(ENOENT);
+        }
+        let mut done: Vec<Vec<u8>> = if path[0] == b'/' { Vec::new() } else { split(cwd) };
+        let mut todo: Vec<Vec<u8>> = split(path);
+        todo.reverse(); // a stack: the next component is at the end
+        let mut links = 0usize;
+        while let Some(component) = todo.pop() {
+            match component.as_slice() {
+                b"." => continue,
+                b".." => {
+                    done.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            done.push(component);
+            let here = join(&done);
+            let last = todo.is_empty();
+            match self.lookup(&here) {
+                None if last => {
+                    let parent = join(&done[..done.len() - 1]);
+                    let parent_is_dir = matches!(self.lookup(&parent), Some(Node::Dir | Node::HostDir { .. }));
+                    return Ok(Resolved { node: Node::Missing { parent_is_dir, host: self.host_for_missing(&here) }, path: here });
+                }
+                None => return Err(ENOENT),
+                Some(Node::Symlink { target }) if !last || follow_last => {
+                    links += 1;
+                    if links > MAX_LINKS {
+                        return Err(ELOOP);
+                    }
+                    done.pop();
+                    if target.first() == Some(&b'/') {
+                        done.clear();
+                    }
+                    let mut more = split(&target);
+                    more.reverse();
+                    todo.extend(more);
+                }
+                Some(node) if last => return Ok(Resolved { path: here, node }),
+                Some(Node::Dir | Node::HostDir { .. }) => {}
+                Some(_) => return Err(ENOTDIR),
+            }
+        }
+        let here = join(&done);
+        let node = self.lookup(&here).ok_or(ENOENT)?;
+        Ok(Resolved { path: here, node })
+    }
+
+    pub fn list(&self, dir: &Resolved) -> Result<Vec<DirEnt>, Errno> {
+        let child = |name: &[u8]| {
+            let mut p = dir.path.clone();
+            if p.as_slice() != b"/" {
+                p.push(b'/');
+            }
+            p.extend_from_slice(name);
+            p
+        };
+        match &dir.node {
+            Node::Dir => {
+                let mut out = Vec::new();
+                let synthetic: &[&[u8]] = match dir.path.as_slice() {
+                    b"/" => &[b"dev", b"proc", b"data", b"tmp"],
+                    b"/dev" => &[b"null", b"zero", b"random", b"urandom"],
+                    b"/proc" => &[b"self"],
+                    b"/proc/self" => &[b"exe"],
+                    _ => &[],
+                };
+                for name in synthetic {
+                    let path = child(name);
+                    if let Some(node) = self.lookup(&path) {
+                        out.push(DirEnt { name: name.to_vec(), kind: kind_of(&node), ino: ino_of(&path) });
+                    }
+                }
+                for name in self.sysroot.children.get(&dir.path).into_iter().flatten() {
+                    let path = child(name);
+                    if out.iter().any(|e| &e.name == name) {
+                        continue;
+                    }
+                    if let Some(node) = self.lookup(&path) {
+                        out.push(DirEnt { name: name.clone(), kind: kind_of(&node), ino: ino_of(&path) });
+                    }
+                }
+                Ok(out)
+            }
+            Node::HostDir { host } => {
+                let mut out = Vec::new();
+                for e in std::fs::read_dir(host).map_err(|_| EIO)? {
+                    let e = e.map_err(|_| EIO)?;
+                    let name = e.file_name().to_string_lossy().as_bytes().to_vec();
+                    let kind = if e.file_type().map_err(|_| EIO)?.is_dir() { DT_DIR } else { DT_REG };
+                    out.push(DirEnt { ino: ino_of(&child(&name)), name, kind });
+                }
+                Ok(out)
+            }
+            _ => Err(ENOTDIR),
+        }
+    }
+}
+
+fn kind_of(node: &Node) -> u8 {
+    match node {
+        Node::Dir | Node::HostDir { .. } => DT_DIR,
+        Node::Symlink { .. } => DT_LNK,
+        Node::Dev(_) => DT_CHR,
+        _ => DT_REG,
+    }
+}
