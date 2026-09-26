@@ -398,10 +398,13 @@ pub(super) fn terminate(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) ->
 
 /// `eglSwapBuffers` and its damage variants: forwarded, and counted when the host says `EGL_TRUE`.
 pub(super) fn swap_buffers(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call) -> AbiResult<()> {
+    // Headless mode's screenshot, when one is due: this frame, read back before the host swaps.
+    gles.screenshot_before_swap(call);
     // `OMNI_FPS_CAP`: this frame's turn first, when there is a cap (`crate::pacing`).
     crate::pacing::pace_present();
     let Some(timing) = &gles.timing else {
         let r = gles.forward_value(call)?;
+        gles.note_swap();
         if r as u32 != 0 {
             gles.note_present();
         }
@@ -413,6 +416,7 @@ pub(super) fn swap_buffers(gles: &Gles, c: &mut ImportCall<'_, '_>, call: &Call)
     timing.before_swap(gles, call);
     let started = std::time::Instant::now();
     let r = gles.forward_value(call)?;
+    gles.note_swap();
     let took = started.elapsed();
     timing.after_swap(gles, call, took);
     if r as u32 != 0 {

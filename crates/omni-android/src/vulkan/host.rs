@@ -541,6 +541,18 @@ pub struct Acquired {
     pub image_index: Option<u32>,
 }
 
+/// A swapchain image read back for headless mode's screenshot: `width * height` RGBA8 pixels, top
+/// row first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedImage {
+    /// The image's width in pixels.
+    pub width: u32,
+    /// Its height.
+    pub height: u32,
+    /// `width * height * 4` bytes, R G B A, top row first.
+    pub rgba: Vec<u8>,
+}
+
 /// What `vkQueuePresentKHR` did.
 ///
 /// [`Acquired`]'s argument, one call along: `VK_SUBOPTIMAL_KHR` from present means the frame
@@ -2519,6 +2531,33 @@ pub trait VulkanHost: Send + Sync + core::fmt::Debug {
             "VulkanHost::device_wait_idle",
             "there is nothing to wait for; see `queue_wait_idle` for what a fabricated success \
              licenses the guest to do next",
+        ))
+    }
+
+    /// **Headless mode's screenshot**: read swapchain image `image_index` back on `queue`, just
+    /// before the guest's present of it, and answer its pixels.
+    ///
+    /// Called inside the guest's `vkQueuePresentKHR` (whose queue the guest already holds, so the
+    /// submission is externally synchronized as the specification requires): the copy **waits on
+    /// `waits`** -- the present's own semaphores, which the guest's rendering signals -- and the
+    /// call returns once it has completed. Those semaphores are then consumed, so the present that
+    /// follows waits on none: the frame it presents is already finished.
+    ///
+    /// # Errors
+    ///
+    /// [`AbiError::Refused`] when this host cannot read the image back (a swapchain created
+    /// without `TRANSFER_SRC` usage, a format it cannot convert), or a driver call fails.
+    fn capture_before_present(
+        &self,
+        queue: HostQueue,
+        waits: &[HostSemaphore],
+        swapchain: HostSwapchain,
+        image_index: u32,
+    ) -> AbiResult<CapturedImage> {
+        let _ = (queue, waits, swapchain, image_index);
+        Err(host_has_no(
+            "VulkanHost::capture_before_present",
+            "no swapchain image can be read back, so there is no screenshot",
         ))
     }
 

@@ -2031,6 +2031,104 @@ fn death_signal(why: &str) -> i32 {
     }
 }
 
+/// **The control channel** (headless mode, `omni_android::headless`): command lines from this
+/// process's stdin (a reader thread) and from `OMNI_CONTROL=<file>` (append-only, followed from
+/// where it was last read), polled every turn of the session loop.
+struct ControlChannel {
+    stdin: Option<std::sync::mpsc::Receiver<String>>,
+    file: Option<omni_android::headless::control::ControlFile>,
+    /// Where a relative screenshot path is resolved: `OMNI_CONTROL_CWD` (the launcher's directory),
+    /// else this process's.
+    base: PathBuf,
+}
+
+impl ControlChannel {
+    fn open() -> Self {
+        let (send, stdin) = std::sync::mpsc::channel();
+        let reader = std::thread::Builder::new().name("omni-control-stdin".into()).spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let file = std::env::var_os("OMNI_CONTROL").map(|path| {
+            let control = omni_android::headless::control::ControlFile::new(Path::new(&path));
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONTROL: commands are read from stdin and from {} (OMNI_CONTROL): headless on|off, screenshot <path>, status",
+                control.path().display()
+            );
+            control
+        });
+        let base = std::env::var_os("OMNI_CONTROL_CWD")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        Self { stdin: reader.ok().map(|_| stdin), file, base }
+    }
+
+    fn poll(&mut self) -> Vec<String> {
+        let mut lines: Vec<String> = self.stdin.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        if let Some(file) = self.file.as_mut() {
+            lines.extend(file.poll());
+        }
+        lines
+    }
+}
+
+/// Run one control line against the guest's renderers, and say what was done on stderr.
+fn run_control(guest: &Guest, base: &Path, line: &str) {
+    use omni_android::headless::control::{parse, Command};
+    let command = match parse(line) {
+        Ok(Some(command)) => command,
+        Ok(None) => return,
+        Err(why) => {
+            let _ = writeln!(std::io::stderr(), "CONTROL: `{}` refused: {why}", line.trim());
+            return;
+        }
+    };
+    match command {
+        Command::Headless(on) => {
+            if let Some(vulkan) = &guest.vulkan {
+                vulkan.set_headless(on);
+            }
+            guest.gles.set_headless(on);
+            let _ = writeln!(std::io::stderr(), "CONTROL: headless {}", if on { "on" } else { "off" });
+        }
+        Command::Screenshot(path) => {
+            let path = if path.is_absolute() { path } else { base.join(path) };
+            // The renderer that is presenting: Vulkan when it has presented, GLES when it has;
+            // both when neither has yet (the first to present takes it).
+            let vulkan = guest
+                .vulkan
+                .as_ref()
+                .filter(|vulkan| vulkan.call_counts().get("vkQueuePresentKHR").copied().unwrap_or(0) > 0);
+            match vulkan {
+                Some(vulkan) => vulkan.request_screenshot(&path),
+                None if guest.gles.presents() > 0 => guest.gles.request_screenshot(&path),
+                None => {
+                    if let Some(vulkan) = &guest.vulkan {
+                        vulkan.request_screenshot(&path);
+                    }
+                    guest.gles.request_screenshot(&path);
+                }
+            }
+            let _ = writeln!(std::io::stderr(), "CONTROL: screenshot requested: {}", path.display());
+        }
+        Command::Status => {
+            let vulkan = guest.vulkan.as_ref().map_or_else(|| "none".to_string(), |v| v.headless_status());
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONTROL: status: Vulkan: {vulkan}. GLES: {}",
+                guest.gles.headless_status()
+            );
+        }
+    }
+}
+
 /// `OMNI_AUDIO`: `off` turns the host's audio output off; unset or `on` leaves it; anything else
 /// is refused by name rather than guessed at.
 fn audio_switched_off(value: Option<&str>) -> Result<bool, String> {
@@ -2520,6 +2618,13 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         display.height_dp()
     );
     let guest = Guest::load(host, display);
+    // **OMNI_HEADLESS=1: headless from the first frame** (`omni_android::headless`): the frame's
+    // draws are dropped where the engine cannot see it, and `headless off` on the control channel
+    // (stdin, `OMNI_CONTROL`) brings them back.
+    let mut control = ControlChannel::open();
+    if std::env::var("OMNI_HEADLESS").is_ok_and(|v| v.trim() == "1") {
+        run_control(&guest, &control.base, "headless on");
+    }
     // **OMNI_HARDWARE_KEYBOARD=1: this host's keyboard, told to the engine**, under the graphics
     // gate (the keys are the window's). Declared here, before step 13 reads the configuration, so
     // `Configuration.keyboard` says QWERTY to the engine and to `vk.g` alike -- see
@@ -4511,6 +4616,9 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         let turn_started = std::time::Instant::now();
         turns += 1;
+        for line in control.poll() {
+            run_control(&guest, &control.base, &line);
+        }
         if !join_done && settle.elapsed().as_secs_f32() >= join_delay {
             join_done = true;
             if let Some(place) = join_place {
@@ -4618,6 +4726,16 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 translated.unwrap_or_default(),
                 descriptors
             );
+            // Headless mode, while it is on: what it has dropped.
+            if guest.vulkan.as_ref().is_some_and(|v| v.headless()) || guest.gles.headless() {
+                let status = match &guest.vulkan {
+                    Some(vulkan) if vulkan.call_counts().get("vkQueuePresentKHR").copied().unwrap_or(0) > 0 => {
+                        format!("Vulkan: {}", vulkan.headless_status())
+                    }
+                    _ => format!("GLES: {}", guest.gles.headless_status()),
+                };
+                let _ = writeln!(std::io::stderr(), "HEADLESS: {status}");
+            }
             // `OMNI_GLES_TIMING`: where the window's frames spent their GL time, CPU and GPU.
             if let Some(lines) = guest.gles.timing_window() {
                 let _ = writeln!(std::io::stderr(), "{lines}");

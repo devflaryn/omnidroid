@@ -213,6 +213,8 @@ pub(super) fn cmd_begin_render_pass(
         },
         args[2] as u32,
     )?;
+    // Headless mode: the pass is recorded either way; whether its draws are is decided here.
+    vulkan.headless_state().begin_pass(buffer.token(), framebuffer.token());
     c.ret().void();
     Ok(())
 }
@@ -228,6 +230,7 @@ pub(super) fn cmd_end_render_pass(
     let host = vulkan.require_host(at)?;
     let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
     host.cmd_end_render_pass(buffer)?;
+    vulkan.headless_state().end_pass(buffer.token());
     c.ret().void();
     Ok(())
 }
@@ -450,7 +453,11 @@ pub(super) fn cmd_draw(
     const CALL: &str = "vkCmdDraw";
     let host = vulkan.require_host(at)?;
     let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
-    host.cmd_draw(buffer, args[1] as u32, args[2] as u32, args[3] as u32, args[4] as u32)?;
+    // Headless mode: a draw into a per-frame target is not recorded (`vkCmdDraw` returns `void`,
+    // so nothing the engine can read differs).
+    if !vulkan.headless_state().drops_draw(buffer.token()) {
+        host.cmd_draw(buffer, args[1] as u32, args[2] as u32, args[3] as u32, args[4] as u32)?;
+    }
     c.ret().void();
     Ok(())
 }
@@ -470,6 +477,10 @@ pub(super) fn cmd_draw_indexed(
     const CALL: &str = "vkCmdDrawIndexed";
     let host = vulkan.require_host(at)?;
     let buffer = vulkan.command_buffer_token(at, CALL, args[0])?;
+    if vulkan.headless_state().drops_draw(buffer.token()) {
+        c.ret().void();
+        return Ok(());
+    }
     host.cmd_draw_indexed(
         buffer,
         args[1] as u32,

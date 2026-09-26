@@ -905,6 +905,8 @@ pub(super) fn create_framebuffer(
             Ok(())
         }
         DriverAnswer::Ok(token) => {
+            let views: Vec<u64> = request.attachments.iter().map(|view| view.token()).collect();
+            vulkan.headless_state().framebuffer_created(token.token(), &views);
             let registered = vulkan.register_framebuffer(at, token)?;
             c.mem().write_bytes(registered.at, &registered.image, c.blame(3))?;
             c.mem().write_u64(out_at, registered.at as u64, c.blame(3))?;
@@ -933,6 +935,7 @@ pub(super) fn destroy_framebuffer(
     let handle = guest_pointer(at, "framebuffer", args[1])?;
     let token = vulkan.framebuffer_token(at, CALL, args[1])?;
     host.destroy_framebuffer(token)?;
+    vulkan.headless_state().framebuffer_destroyed(token.token());
     vulkan.forget_framebuffer(handle);
     c.ret().void();
     Ok(())

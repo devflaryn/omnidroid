@@ -52,6 +52,7 @@ pub mod bionic;
 pub mod boundary;
 pub mod error;
 pub mod gles;
+pub mod headless;
 pub mod jni;
 pub mod mem;
 pub mod memreport;
