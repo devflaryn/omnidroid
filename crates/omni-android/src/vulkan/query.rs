@@ -255,6 +255,15 @@ pub(super) fn get_query_pool_results(
     let mut data = c.mem().read_bytes(data_at, span, c.blame(5))?;
     let result = host.get_query_pool_results(device, pool, first, count, stride, flags, &mut data)?;
     if result >= 0 {
+        // Headless mode: the engine's GPU timer (two 64-bit timestamps) reads the last real
+        // frame's GPU time rather than an idle GPU's.
+        if result == VK_SUCCESS
+            && shape.query_type == QUERY_TYPE_TIMESTAMP
+            && count == 2
+            && flags & (RESULT_64_BIT | RESULT_WITH_AVAILABILITY_BIT) == RESULT_64_BIT
+        {
+            vulkan.headless_state().gpu_timer(&mut data, stride as usize);
+        }
         // `VK_SUCCESS` or `VK_NOT_READY`: what the driver wrote, and the guest's own bytes where it
         // wrote nothing.
         c.mem().write_bytes(data_at, &data, c.blame(5))?;

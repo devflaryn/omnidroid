@@ -41,6 +41,18 @@
 //!   app runs, and the store keeps the new one. The file's cookie is planted only when it is not the
 //!   one last planted in that account's storage (`omnidroid-cookie-planted` there), so an unchanged
 //!   file never puts a dead cookie back over a live one.
+//! * **`--no-window`: no window at all** (`OMNI_NO_WINDOW=1`, and headless): for a host with no
+//!   display. The engine's surface is an off-screen pbuffer on an EGL display that needs no window
+//!   system (a GPU's EGL device, or Mesa's surfaceless platform -- `LIBGL_ALWAYS_SOFTWARE=1` for the
+//!   CPU), and no Vulkan is bound, so the engine renders with GLES. `--headless` where no window
+//!   can be opened falls back to the same.
+//! * **`--headless` starts headless** (`OMNI_HEADLESS=1`, `omni_android::headless`): the engine runs
+//!   and presents every frame, and the GPU draws none of them. **`--control <file>`** follows that
+//!   file for commands (`OMNI_CONTROL`), one per line, appended by anything; the session's stdin is
+//!   read for the same commands. `headless on`, `headless off` (the next frame is drawn again),
+//!   `screenshot <path>` (that frame, rendered for real and saved as a PNG -- a relative path is
+//!   this launcher's directory's) and `status`. Each is answered on stderr: `CONTROL: headless on`,
+//!   `SCREENSHOT: saved <path> <w>x<h>`.
 //! * **`login` signs in in a real browser and keeps the session** (`tools/login.py`, Selenium with
 //!   Chromium in a fresh profile): with no arguments the person signs in; with a username and a
 //!   password the form is filled and submitted; with a username alone, the password `login` kept
@@ -62,6 +74,7 @@ const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 const USAGE: &str = "\
 usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [--join-delay <s>]
                        [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
+                       [--headless] [--no-window] [--control <file>]
        omnidroid which [--apk <path>]
        omnidroid login [<username> [<password>]] [--dir <dir>]
 
@@ -75,6 +88,12 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
   --fresh           a fresh install; the kept storage is left as it is
   --phone           a touch screen: the mouse is a finger, and there is no keyboard
   --data-dir <dir>  where the app's storage is kept (default: this host's app-data directory)
+  --headless        start headless: frames are run and presented, and the GPU draws none of them
+                    (OMNI_HEADLESS=1); `headless off` on the control channel draws them again
+  --no-window       no window at all (OMNI_NO_WINDOW=1; implies --headless): the engine's surface
+                    is an off-screen buffer, for a host with no display -- a container, a notebook
+  --control <file>  read commands from this file as lines are appended to it (OMNI_CONTROL), as
+                    well as from stdin: headless on|off, screenshot <path>, status
 
   login             sign in to Roblox in Chromium and keep the cookie, username and password in
                     <dir> (default <app-data>/../cookies): no arguments -- you sign in; a username
@@ -89,6 +108,9 @@ struct Options {
     fresh: bool,
     phone: bool,
     data_dir: Option<PathBuf>,
+    headless: bool,
+    no_window: bool,
+    control: Option<PathBuf>,
 }
 
 /// The command and the arguments after it. Options with no command in front of them mean
@@ -151,6 +173,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
         fresh: false,
         phone: false,
         data_dir: None,
+        headless: false,
+        no_window: false,
+        control: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -183,6 +208,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--fresh" => options.fresh = true,
             "--phone" => options.phone = true,
             "--data-dir" => options.data_dir = Some(PathBuf::from(value("--data-dir")?)),
+            "--headless" => options.headless = true,
+            "--no-window" => {
+                options.no_window = true;
+                options.headless = true;
+            }
+            "--control" => options.control = Some(PathBuf::from(value("--control")?)),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -587,6 +618,34 @@ fn play(options: &Options) -> ExitCode {
             println!("Sign in with Quick Sign-in (Sign In > Quick Sign-in), then enter the code on a signed-in device.");
         }
     }
+    // Headless mode and its control channel (the gate reads them; stdin stays this process's).
+    if let Ok(here) = std::env::current_dir() {
+        run.env("OMNI_CONTROL_CWD", here);
+    }
+    if options.no_window {
+        run.env("OMNI_NO_WINDOW", "1");
+        println!("Omnidroid: no window -- the engine draws into an off-screen buffer (OMNI_NO_WINDOW=1)");
+    } else {
+        run.env_remove("OMNI_NO_WINDOW");
+    }
+    if options.headless {
+        run.env("OMNI_HEADLESS", "1");
+        println!("Omnidroid: headless -- frames are run and presented, and the GPU draws none of them");
+    } else {
+        run.env_remove("OMNI_HEADLESS");
+    }
+    if let Some(control) = &options.control {
+        // Absolute, because the gate runs from its own working directory.
+        let control = std::path::absolute(control).unwrap_or_else(|_| control.clone());
+        run.env("OMNI_CONTROL", &control);
+        println!(
+            "Omnidroid: commands from {} and from stdin: headless on|off, screenshot <path>, status",
+            control.display()
+        );
+    } else {
+        run.env_remove("OMNI_CONTROL");
+        println!("Omnidroid: commands from stdin: headless on|off, screenshot <path>, status");
+    }
     println!("End the session by closing the window.");
 
     match run.status() {
@@ -660,6 +719,19 @@ mod tests {
         let (command, rest) = split(&["login", "name"]);
         assert_eq!((command.as_deref(), rest.as_slice()), (Some("login"), &["name".to_string()][..]));
         assert_eq!(split(&[]).0, None);
+    }
+
+    #[test]
+    fn headless_and_the_control_file_are_options_of_play() {
+        let parsed = |a: &[&str]| parse(a.iter().map(|s| (*s).to_string()));
+        let options = parsed(&["--headless", "--control", "cmds.txt", "--place", "1"]).expect("parsed");
+        assert!(options.headless);
+        assert_eq!(options.control.as_deref(), Some(Path::new("cmds.txt")));
+        let plain = parsed(&[]).expect("parsed");
+        assert!(!plain.headless && plain.control.is_none());
+        assert!(parsed(&["--control"]).is_err(), "--control needs a file");
+        let windowless = parsed(&["--no-window"]).expect("parsed");
+        assert!(windowless.no_window && windowless.headless, "--no-window is headless");
     }
 
     #[test]

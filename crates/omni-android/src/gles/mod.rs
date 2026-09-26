@@ -75,6 +75,7 @@ use crate::error::{AbiError, AbiResult};
 pub mod driverless;
 mod egl;
 mod gl;
+mod headless;
 pub mod host;
 #[allow(clippy::all, missing_docs)]
 pub mod signatures;
@@ -217,6 +218,8 @@ type SpecialFn = fn(&Gles, &mut ImportCall<'_, '_>, &Call) -> AbiResult<()>;
 struct Assigned {
     signature: &'static Signature,
     special: Option<SpecialFn>,
+    /// What the command is to headless mode ([`headless`]).
+    role: headless::Role,
 }
 
 struct Entry {
@@ -304,6 +307,8 @@ pub struct Gles {
     shadow_out: AtomicU64,
     /// `OMNI_GLES_TIMING` ([`timing`]): `Some` when it is on.
     timing: Option<timing::Timing>,
+    /// Headless mode ([`headless`]): the switch, the framebuffers' history, a pending screenshot.
+    headless: crate::headless::Headless,
 }
 
 impl core::fmt::Debug for Gles {
@@ -340,7 +345,39 @@ impl Gles {
             shadow_out: AtomicU64::new(0),
             timing: timing::asked(std::env::var("OMNI_GLES_TIMING").ok().as_deref())
                 .then(timing::Timing::default),
+            headless: {
+                let headless = crate::headless::Headless::new();
+                // Framebuffer 0 is the window's: presented, and drawn again, every frame.
+                headless.mark_swapchain_target(0);
+                headless
+            },
         })
+    }
+
+    /// **Headless mode** ([`headless`]): on, the draws, clears and blits into per-frame
+    /// framebuffers are not forwarded -- every other call is, and every call answers as before;
+    /// off, the next frame is whole again.
+    pub fn set_headless(&self, on: bool) {
+        self.headless.set(on);
+    }
+
+    /// Whether headless mode is on.
+    #[must_use]
+    pub fn headless(&self) -> bool {
+        self.headless.is_on()
+    }
+
+    /// Save a frame as a PNG at `path`: the next one swapped, or -- while headless -- one drawn for
+    /// real after [`WARMUP_FRAMES`](crate::headless::WARMUP_FRAMES) real frames. Read back with
+    /// `glReadPixels` just before the host's swap; `SCREENSHOT: saved <path> <w>x<h>` on stderr.
+    pub fn request_screenshot(&self, path: &std::path::Path) {
+        self.headless.request_screenshot(path);
+    }
+
+    /// One line on headless mode: on or off, frames, framebuffers, draws dropped.
+    #[must_use]
+    pub fn headless_status(&self) -> String {
+        self.headless.status()
     }
 
     /// An instance with the timing census on, whatever `OMNI_GLES_TIMING` says -- for tests.
@@ -446,7 +483,7 @@ impl Gles {
         for signature in core_signatures() {
             let at = builder.bind_inline(signature.name, dispatch as ImportFn)?;
             let entry = Entry::new();
-            let _ = entry.assigned.set(Assigned { signature, special: special_for(signature.name) });
+            let _ = entry.assigned.set(Assigned { signature, special: special_for(signature.name), role: headless::role_for(signature.name) });
             by_address.insert(at, entries.len() as u32);
             by_name.insert(signature.name, entries.len() as u32);
             addresses.push(at);
@@ -771,6 +808,11 @@ impl Gles {
         self.presents.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A swap was forwarded (whatever it answered): headless mode's next frame begins.
+    fn note_swap(&self) {
+        self.headless.presented();
+    }
+
     fn space(&self) -> &Arc<GuestSpace> {
         &self.space
     }
@@ -835,7 +877,7 @@ impl Gles {
         let index = table.named + state.next_pool;
         state.next_pool += 1;
         let entry = &table.entries[index];
-        let _ = entry.assigned.set(Assigned { signature, special: special_for(signature.name) });
+        let _ = entry.assigned.set(Assigned { signature, special: special_for(signature.name), role: headless::role_for(signature.name) });
         let _ = entry.host.set(Some(found));
         state.by_name.insert(signature.name, index as u32);
         Ok(table.addresses[index])
@@ -982,6 +1024,12 @@ fn dispatch(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     };
     if gles.is_driverless() {
         return driverless::dispatch(&gles, c, &call);
+    }
+    // Headless mode: a draw, clear or blit into a per-frame framebuffer is answered here (they
+    // all return `void`) and not forwarded.
+    if assigned.role != headless::Role::Other && gles.headless_drops(c, &call, assigned.role) {
+        write_return(c, signature, 0);
+        return Ok(());
     }
     let started = gles.timing.as_ref().map(|_| std::time::Instant::now());
     let result = match assigned.special {

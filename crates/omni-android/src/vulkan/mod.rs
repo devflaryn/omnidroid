@@ -141,6 +141,7 @@ pub mod descriptor;
 pub mod device;
 mod draw;
 mod handles;
+pub mod headless;
 pub mod host;
 pub mod instance;
 pub mod memory;
@@ -172,7 +173,7 @@ pub use device::{
 };
 pub use handles::HANDLE_SLOT_BYTES;
 pub use host::{
-    Acquired, ApplicationInfo, BufferRequest, ChainLink, ColorBlendState, ComputePipelineRequest,
+    Acquired, ApplicationInfo, BufferRequest, CapturedImage, ChainLink, ColorBlendState, ComputePipelineRequest,
     DescriptorBinding, DescriptorCopy,
     DescriptorPoolRequest, DescriptorSetLayoutRequest, DescriptorWrite, DescriptorWrites,
     DeviceRequest, DriverAnswer, FramebufferRequest, GraphicsPipelineRequest, HostBuffer,
@@ -957,6 +958,9 @@ pub fn loader_exports(name: &str) -> bool {
 /// renderers were counted together is a measurement nobody can unpick afterwards.
 pub struct Vulkan {
     state: Mutex<State>,
+    /// Headless mode: see [`headless`]. Outside `state` because a draw asks it, and a draw must
+    /// not take the loader's lock.
+    headless: headless::VulkanHeadless,
 }
 
 struct State {
@@ -1255,6 +1259,7 @@ impl Vulkan {
                 withhold_once: false,
                 withheld_answers: 0,
             }),
+            headless: headless::VulkanHeadless::default(),
         });
         crate::perf::register_vulkan(&vulkan);
         vulkan
@@ -1853,6 +1858,45 @@ impl Vulkan {
         self.state.lock().out_of_date_answers
     }
 
+    /// **Headless mode: drop the frame's draws, keep everything else** ([`headless`]).
+    ///
+    /// On: recordings begun from now drop `vkCmdDraw`/`vkCmdDrawIndexed` inside render passes onto
+    /// per-frame framebuffers; every other call is forwarded, and every call answers as before.
+    /// Off: recordings begun from now are whole again, and the next frame is drawn.
+    pub fn set_headless(&self, on: bool) {
+        self.headless.switch.set(on);
+    }
+
+    /// Whether headless mode is on ([`Vulkan::set_headless`]).
+    #[must_use]
+    pub fn headless(&self) -> bool {
+        self.headless.switch.is_on()
+    }
+
+    /// Save a frame as a PNG at `path`: the next one presented, or -- while headless -- one
+    /// rendered for real after [`WARMUP_FRAMES`](crate::headless::WARMUP_FRAMES) real frames. It
+    /// is read back from the swapchain image on the render thread, just before that image is
+    /// presented, and written on a thread of its own, which says `SCREENSHOT: saved <path> <w>x<h>`
+    /// (or `SCREENSHOT: failed ...`) on stderr.
+    pub fn request_screenshot(&self, path: &std::path::Path) {
+        self.headless.switch.request_screenshot(path);
+    }
+
+    /// One line on headless mode: on or off, frames, framebuffers, draws dropped.
+    #[must_use]
+    pub fn headless_status(&self) -> String {
+        self.headless.switch.status()
+    }
+
+    /// **The engine's own GPU timer** (its two-timestamp `gpuTimeQueryPool` read), as the driver
+    /// answered it since the previous call: (mean timestamp ticks per frame, frames read). What the
+    /// GPU really spent on a frame, headless or not -- the evidence for what headless mode saves.
+    /// `None` when the engine read none.
+    #[must_use]
+    pub fn gpu_timer_window(&self) -> Option<(u64, u64)> {
+        self.headless.gpu_window()
+    }
+
     /// **While `withheld`, every `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` answers
     /// `VK_ERROR_SURFACE_LOST_KHR` without asking the driver** -- what Android's own loader answers
     /// for a surface whose window is gone (AOSP `swapchain.cpp`, a `DEAD_OBJECT` from the window).
@@ -2115,6 +2159,11 @@ impl Vulkan {
     // ------------------------------------------------------------------ internals
 
     /// The driver behind this loader, or a refusal naming what an embedding must do.
+    /// Headless mode's state, for the handlers that record, pass, draw and present.
+    pub(crate) fn headless_state(&self) -> &headless::VulkanHeadless {
+        &self.headless
+    }
+
     fn require_host(&self, at: &Site) -> AbiResult<Arc<dyn VulkanHost>> {
         self.state.lock().host.clone().ok_or_else(|| {
             at.refuse(

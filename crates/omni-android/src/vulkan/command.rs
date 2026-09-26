@@ -450,6 +450,9 @@ pub(super) fn free_command_buffers(
         handles.push(guest_pointer(at, "pCommandBuffers", handle)?);
     }
     host.free_command_buffers(pool, &tokens)?;
+    for token in &tokens {
+        vulkan.headless_state().buffer_freed(token.token());
+    }
     for handle in handles {
         vulkan.forget_command_buffer(handle);
     }
@@ -523,7 +526,11 @@ pub(super) fn begin_command_buffer(
             vulkan.note_driver_result(CALL, result);
             c.ret().i32(result);
         }
-        DriverAnswer::Ok(()) => c.ret().i32(VK_SUCCESS),
+        DriverAnswer::Ok(()) => {
+            // Headless mode: this recording's mode, for the whole of it.
+            vulkan.headless_state().begin_recording(buffer.token());
+            c.ret().i32(VK_SUCCESS);
+        }
     }
     Ok(())
 }

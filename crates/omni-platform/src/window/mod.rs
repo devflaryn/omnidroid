@@ -564,6 +564,18 @@ pub enum RawWindow {
         /// The X window id (an `XID`, a `Window` in Xlib's spelling).
         window: u64,
     },
+    /// **No window at all**: an off-screen surface of a fixed size, for headless mode on a host
+    /// with no display (a container, a notebook). Nothing is shown; a renderer draws into a
+    /// buffer of its own (EGL: a pbuffer on a display that needs no window system). Not an OS
+    /// handle -- the embedding makes one up, and `id` is only its identity for a claim.
+    Headless {
+        /// The embedding's identity for this surface.
+        id: u64,
+        /// Its width in pixels.
+        width: u32,
+        /// Its height in pixels.
+        height: u32,
+    },
 }
 
 impl RawWindow {
@@ -577,6 +589,7 @@ impl RawWindow {
             RawWindow::Win32 { .. } => "win32",
             RawWindow::AppKit { .. } => "appkit",
             RawWindow::Xlib { .. } => "xlib",
+            RawWindow::Headless { .. } => "headless",
         }
     }
 }

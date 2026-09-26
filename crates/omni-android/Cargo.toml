@@ -51,6 +51,10 @@ parking_lot = { workspace = true }
 # re-deriving the registration/sleep window, and the one defect already found in the sync layer
 # was a lost wake.
 parking_lot_core = { workspace = true }
+# Headless mode's screenshots are PNG files (`headless::png`): the zlib stream and the chunk CRCs,
+# with the two crates the workspace already builds for `omni-apk` -- no new dependency.
+flate2 = { workspace = true }
+crc32fast = { workspace = true }
 
 [features]
 # The native backend (`omni-cpu`'s `native-hvf`: Hypervisor.framework, arm64 macOS), for this

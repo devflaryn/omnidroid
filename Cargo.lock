@@ -253,6 +253,8 @@ dependencies = [
 name = "omni-android"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "omni-apk",
  "omni-bionic",
  "omni-cpu",

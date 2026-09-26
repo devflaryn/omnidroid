@@ -294,7 +294,7 @@ pub(super) fn queue_present(
     }
 
     let wait_count = u32_at(16) as usize;
-    let waits = if wait_count == 0 {
+    let mut waits = if wait_count == 0 {
         Vec::new()
     } else {
         bound(at, CALL, "waitSemaphoreCount", wait_count)?;
@@ -347,6 +347,21 @@ pub(super) fn queue_present(
         pointer => Some(guest_pointer(at, "pResults", pointer)?),
     };
 
+    // Headless mode's screenshot, when one is due at this present: the image about to be
+    // presented is read back first -- a copy that waits on the present's own semaphores, so it is
+    // exactly this frame -- and the present then waits on nothing, the copy having consumed them.
+    let headless = vulkan.headless_state();
+    if let Some(shot) = headless.switch.take_due_screenshot() {
+        let (swapchain, index) = swapchains[0];
+        match host.capture_before_present(queue, &waits, swapchain, index) {
+            Ok(image) => {
+                waits.clear();
+                crate::headless::save_png(shot.path, image.width, image.height, image.rgba);
+            }
+            Err(error) => eprintln!("SCREENSHOT: failed {}: {error}", shot.path.display()),
+        }
+    }
+
     // `OMNI_FPS_CAP`: wait for this frame's turn, when there is a cap (`crate::pacing`). Here,
     // after everything the guest handed over is read and checked, and before the host presents.
     crate::pacing::pace_present();
@@ -357,7 +372,10 @@ pub(super) fn queue_present(
             swapchains,
             wants_per_swapchain_results: results_at.is_some(),
         },
-    )?;
+    );
+    // The frame the engine recorded is over, whatever the driver answered.
+    headless.switch.presented();
+    let presented = presented?;
 
     if let Some(results_at) = results_at {
         if presented.per_swapchain.len() != swapchain_count {

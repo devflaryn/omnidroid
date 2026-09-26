@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use ash::khr;
 use ash::vk;
 use omni_android::vulkan::{
+    CapturedImage,
     flat_structure, Acquired, BufferRequest, ChainLink, ComputePipelineRequest, DescriptorCopy,
     ImageFormatQuery, DescriptorPoolRequest, DescriptorSetLayoutRequest,
     DescriptorWrite, DescriptorWrites, DeviceRequest, DriverAnswer, FramebufferRequest,
@@ -319,6 +320,8 @@ struct SwapchainEntry {
     /// `vkGetSwapchainCreateInfoKHR` to ask.
     format: vk::Format,
     extent: vk::Extent2D,
+    /// Whether its images can be copied out (`TRANSFER_SRC`): headless mode's screenshot.
+    readable: bool,
     /// The driver's images, **cached on first enumeration**, for
     /// [`GfxVulkanHost::physical`]'s reason: the guest is required to receive the same `VkImage`
     /// handles from both halves of the two-call protocol, and `vkGetSwapchainImagesKHR` makes no
@@ -1047,6 +1050,7 @@ impl GfxVulkanHost {
             handle: entry.handle,
             format: entry.format,
             extent: entry.extent,
+            readable: entry.readable,
             images: entry.images.clone(),
             image_tokens: entry.image_tokens.clone(),
         })
@@ -1081,11 +1085,11 @@ impl GfxVulkanHost {
     /// makes is destroyed before it returns.
     ///
     /// The requirement: the swapchain must have been created with
-    /// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` in its `imageUsage`. That is the guest's choice, not this
-    /// host's — and it is deliberately not added behind the guest's back, because a swapchain
-    /// created with usage the engine did not ask for is a different swapchain from the one it
-    /// asked for. A guest that omits it gets a driver error from the copy rather than a silent
-    /// success.
+    /// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` in its `imageUsage`. Since D40 this host adds it to the
+    /// guest's usage whenever the surface supports it (headless mode's screenshot needs it; the
+    /// images and everything the guest can query about them are unchanged), so only a surface
+    /// without it leaves a swapchain unreadable -- and then the copy is a driver error rather than
+    /// a silent success.
     ///
     /// # Errors
     ///
@@ -1144,7 +1148,7 @@ impl GfxVulkanHost {
         // destroys before it returns; `read_back` is the whole of the unsafe sequence and its own
         // documentation says what each step requires.
         let pixels = unsafe {
-            read_back(&device, &memory, queue, family, image, parts.extent, bytes)
+            read_back(&device, &memory, queue, family, image, parts.extent, bytes, None)
         }?;
 
         Ok(PresentedImage {
@@ -1231,6 +1235,7 @@ struct SwapchainParts {
     handle: vk::SwapchainKHR,
     format: vk::Format,
     extent: vk::Extent2D,
+    readable: bool,
     images: Vec<vk::Image>,
     image_tokens: Vec<u64>,
 }
@@ -2736,6 +2741,22 @@ impl VulkanHost for GfxVulkanHost {
 
         let format = vk::Format::from_raw(request.format as i32);
         let extent = vk::Extent2D { width: request.width, height: request.height };
+        // **`TRANSFER_SRC` is added to the guest's usage when the surface supports it** (D40), so
+        // that headless mode's screenshot can copy a swapchain image out
+        // (`capture_before_present`). The guest never sees it: `vkGetSwapchainImagesKHR` answers
+        // the same images, the usage is not something a guest can query back, and an extra usage
+        // bit constrains the driver's choice of layout at most -- it changes no pixel.
+        let usage = {
+            let surface_fn = khr::surface::Instance::new(&self.entry, &parts.instance);
+            // SAFETY: the physical device and the surface are live and of this instance.
+            let supported = unsafe {
+                surface_fn.get_physical_device_surface_capabilities(parts.physical, surface)
+            }
+            .map_or(vk::ImageUsageFlags::empty(), |caps| caps.supported_usage_flags);
+            vk::ImageUsageFlags::from_raw(request.usage)
+                | (supported & vk::ImageUsageFlags::TRANSFER_SRC)
+        };
+        let readable = usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
         let info = vk::SwapchainCreateInfoKHR::default()
             .flags(vk::SwapchainCreateFlagsKHR::from_raw(request.flags))
             .surface(surface)
@@ -2744,7 +2765,7 @@ impl VulkanHost for GfxVulkanHost {
             .image_color_space(vk::ColorSpaceKHR::from_raw(request.colour_space as i32))
             .image_extent(extent)
             .image_array_layers(request.array_layers)
-            .image_usage(vk::ImageUsageFlags::from_raw(request.usage))
+            .image_usage(usage)
             .image_sharing_mode(vk::SharingMode::from_raw(request.sharing_mode as i32))
             .queue_family_indices(&request.queue_families)
             .pre_transform(vk::SurfaceTransformFlagsKHR::from_raw(request.pre_transform))
@@ -2781,6 +2802,7 @@ impl VulkanHost for GfxVulkanHost {
             handle,
             format,
             extent,
+            readable,
             images: Vec::new(),
             image_tokens: Vec::new(),
             claim: claim.take(),
@@ -3654,6 +3676,69 @@ impl VulkanHost for GfxVulkanHost {
             Ok(()) => Ok(DriverAnswer::Ok(())),
             Err(result) => Ok(DriverAnswer::Failed(result.as_raw())),
         }
+    }
+
+    fn capture_before_present(
+        &self,
+        queue: HostQueue,
+        waits: &[HostSemaphore],
+        swapchain: HostSwapchain,
+        image_index: u32,
+    ) -> AbiResult<CapturedImage> {
+        const METHOD: &str = "VulkanHost::capture_before_present";
+        let (device_index, family, queue_handle) = {
+            let queues = self.locked_queues();
+            let entry = Self::live_queue(&queues, queue)
+                .ok_or_else(|| refused(METHOD, &format!("{queue:?} is not a live queue of this host")))?;
+            (entry.device, entry.family, entry.queue)
+        };
+        let parts = self.swapchain_parts(swapchain)?;
+        if parts.device != device_index {
+            return Err(cross_device("VkSwapchainKHR", parts.device, device_index));
+        }
+        if !parts.readable {
+            return Err(refused(
+                METHOD,
+                "this swapchain's surface does not support `TRANSFER_SRC` usage, so its images \
+                 cannot be copied out",
+            ));
+        }
+        let image = *parts.images.get(image_index as usize).ok_or_else(|| {
+            refused(METHOD, &format!("image index {image_index} is out of range for {} image(s)", parts.images.len()))
+        })?;
+        let channels = Channels::of(parts.format).ok_or_else(|| {
+            refused(METHOD, &format!("the swapchain's format {:?} is not one this read-back converts", parts.format))
+        })?;
+        let semaphores: Vec<vk::Semaphore> = {
+            let table = self.locked_semaphores();
+            waits
+                .iter()
+                .map(|token| {
+                    let (owner, handle) = self.device_of(&table, token.token(), "VkSemaphore", METHOD)?;
+                    if owner != device_index {
+                        return Err(cross_device("VkSemaphore", owner, device_index));
+                    }
+                    Ok(handle)
+                })
+                .collect::<AbiResult<Vec<_>>>()?
+        };
+        let DeviceParts { device, physical, instance, .. } =
+            self.device_parts(HostDevice::from_token(device_index as u64))?;
+        // SAFETY: `physical` is the device this logical device was created from.
+        let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let bytes = u64::from(parts.extent.width) * u64::from(parts.extent.height) * 4;
+        // SAFETY: the queue is the guest's present queue, inside the guest's own
+        // `vkQueuePresentKHR` (externally synchronized by the guest); the image is a swapchain
+        // image of this device created with `TRANSFER_SRC`, which the semaphores' rendering left
+        // in `PRESENT_SRC_KHR` -- the layout a present requires.
+        let pixels = unsafe {
+            read_back(&device, &memory, queue_handle, family, image, parts.extent, bytes, Some(&semaphores))
+        }?;
+        Ok(CapturedImage {
+            width: parts.extent.width,
+            height: parts.extent.height,
+            rgba: channels.to_rgba(&pixels),
+        })
     }
 
     fn device_wait_idle(&self, device: HostDevice) -> AbiResult<DriverAnswer<()>> {
@@ -6725,6 +6810,11 @@ impl core::fmt::Debug for GfxVulkanHost {
 /// `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` whose swapchain was created with
 /// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`; `queue` must belong to `family` on that device; `bytes` must
 /// be `extent.width * extent.height * 4`.
+///
+/// `waits` (headless mode's screenshot, `capture_before_present`): semaphores the copy waits on --
+/// a present's own, signalled by the rendering of the image -- in place of the device wait; the
+/// image is then still `PRESENT_SRC_KHR` when they signal, and is left so.
+#[allow(clippy::too_many_arguments)]
 unsafe fn read_back(
     device: &ash::Device,
     memory: &vk::PhysicalDeviceMemoryProperties,
@@ -6733,6 +6823,7 @@ unsafe fn read_back(
     image: vk::Image,
     extent: vk::Extent2D,
     bytes: u64,
+    waits: Option<&[vk::Semaphore]>,
 ) -> AbiResult<Vec<u8>> {
     const METHOD: &str = "GfxVulkanHost::read_presented_image";
     fn vk_failed(api: &'static str) -> impl Fn(vk::Result) -> AbiError {
@@ -6743,8 +6834,10 @@ unsafe fn read_back(
 
     // SAFETY: the device is live. Waiting idle is what orders this copy against a present that
     // may still be in flight; the result is propagated rather than discarded, because unlike a
-    // teardown wait this one is load-bearing.
-    unsafe { device.device_wait_idle() }.map_err(vk_failed("vkDeviceWaitIdle"))?;
+    // teardown wait this one is load-bearing. With `waits`, the semaphores order it instead.
+    if waits.is_none() {
+        unsafe { device.device_wait_idle() }.map_err(vk_failed("vkDeviceWaitIdle"))?;
+    }
 
     let pool_info = vk::CommandPoolCreateInfo::default()
         .flags(vk::CommandPoolCreateFlags::TRANSIENT)
@@ -6816,7 +6909,7 @@ unsafe fn read_back(
                         .level_count(1)
                         .layer_count(1);
                     let to_source = vk::ImageMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::MEMORY_READ)
+                        .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
                         .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                         .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                         .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -6858,7 +6951,10 @@ unsafe fn read_back(
                             .map_err(vk_failed("vkBeginCommandBuffer"))?;
                         device.cmd_pipeline_barrier(
                             command,
-                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            // ALL_COMMANDS, not TOP_OF_PIPE: with `waits` the transition must chain onto the
+                            // semaphore wait (whose scope is TRANSFER), or it could run before the
+                            // rendering it reads has finished.
+                            vk::PipelineStageFlags::ALL_COMMANDS,
                             vk::PipelineStageFlags::TRANSFER,
                             vk::DependencyFlags::empty(),
                             &[],
@@ -6887,7 +6983,12 @@ unsafe fn read_back(
                     }
 
                     let commands = [command];
-                    let submit = vk::SubmitInfo::default().command_buffers(&commands);
+                    let wait_on = waits.unwrap_or(&[]);
+                    let stages = vec![vk::PipelineStageFlags::TRANSFER; wait_on.len()];
+                    let submit = vk::SubmitInfo::default()
+                        .command_buffers(&commands)
+                        .wait_semaphores(wait_on)
+                        .wait_dst_stage_mask(&stages);
                     // SAFETY: `queue` belongs to `family` of this device, `command` has been
                     // recorded and ended, and `fence` is unsignalled.
                     unsafe { device.queue_submit(queue, &[submit], fence) }

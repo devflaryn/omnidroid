@@ -921,7 +921,11 @@ impl Guest {
     /// `graphics` is the host driver to bind Vulkan to, when [`GRAPHICS_GATE`] asked for one.
     /// `None` binds no Vulkan at all -- not an unhosted one, which would hand the engine a loader
     /// whose every call refuses -- so the default gate's `dlopen("libvulkan.so")` stays NULL.
-    fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display) -> Self {
+    ///
+    /// `windowless`: headless mode with no display ([`windowless_asked`]) -- no Vulkan and no
+    /// audio, as without the window, but EGL/GLES over the host's EGL, whose display for the
+    /// headless window needs no window system.
+    fn load(graphics: Option<Arc<dyn VulkanHost>>, display: Display, windowless: bool) -> Self {
         let path = cached_main_lib();
         // **Read for this load, and given back when it returns** -- not through `main_lib_bytes`,
         // whose static kept the whole file for the life of the process. Nothing the load produces
@@ -1092,7 +1096,7 @@ impl Guest {
         // `RenderView is NULL`, runs on without a view to `APP_READY` Landing, and no thread dies.
         let gles = Gles::new(Arc::clone(&space));
         gles.bind_into(&builder).expect("bind libEGL.so and libGLESv2.so");
-        if with_audio {
+        if with_audio || windowless {
             gles.set_host(omni_gfx::GfxGlesHost::new() as Arc<dyn GlesHost>);
         } else {
             gles.set_driverless();
@@ -2031,6 +2035,111 @@ fn death_signal(why: &str) -> i32 {
     }
 }
 
+/// Whether this run asked for **no window at all** (`OMNI_NO_WINDOW=1`): headless mode on a host
+/// with no display, a container or a notebook. `OMNI_HEADLESS=1` on a host where no window opens
+/// gets the same, and says so.
+fn windowless_asked() -> bool {
+    std::env::var("OMNI_NO_WINDOW").is_ok_and(|v| v.trim() == "1")
+}
+
+/// **The control channel** (headless mode, `omni_android::headless`): command lines from this
+/// process's stdin (a reader thread) and from `OMNI_CONTROL=<file>` (append-only, followed from
+/// where it was last read), polled every turn of the session loop.
+struct ControlChannel {
+    stdin: Option<std::sync::mpsc::Receiver<String>>,
+    file: Option<omni_android::headless::control::ControlFile>,
+    /// Where a relative screenshot path is resolved: `OMNI_CONTROL_CWD` (the launcher's directory),
+    /// else this process's.
+    base: PathBuf,
+}
+
+impl ControlChannel {
+    fn open() -> Self {
+        let (send, stdin) = std::sync::mpsc::channel();
+        let reader = std::thread::Builder::new().name("omni-control-stdin".into()).spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let file = std::env::var_os("OMNI_CONTROL").map(|path| {
+            let control = omni_android::headless::control::ControlFile::new(Path::new(&path));
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONTROL: commands are read from stdin and from {} (OMNI_CONTROL): headless on|off, screenshot <path>, status",
+                control.path().display()
+            );
+            control
+        });
+        let base = std::env::var_os("OMNI_CONTROL_CWD")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        Self { stdin: reader.ok().map(|_| stdin), file, base }
+    }
+
+    fn poll(&mut self) -> Vec<String> {
+        let mut lines: Vec<String> = self.stdin.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        if let Some(file) = self.file.as_mut() {
+            lines.extend(file.poll());
+        }
+        lines
+    }
+}
+
+/// Run one control line against the guest's renderers, and say what was done on stderr.
+fn run_control(guest: &Guest, base: &Path, line: &str) {
+    use omni_android::headless::control::{parse, Command};
+    let command = match parse(line) {
+        Ok(Some(command)) => command,
+        Ok(None) => return,
+        Err(why) => {
+            let _ = writeln!(std::io::stderr(), "CONTROL: `{}` refused: {why}", line.trim());
+            return;
+        }
+    };
+    match command {
+        Command::Headless(on) => {
+            if let Some(vulkan) = &guest.vulkan {
+                vulkan.set_headless(on);
+            }
+            guest.gles.set_headless(on);
+            let _ = writeln!(std::io::stderr(), "CONTROL: headless {}", if on { "on" } else { "off" });
+        }
+        Command::Screenshot(path) => {
+            let path = if path.is_absolute() { path } else { base.join(path) };
+            // The renderer that is presenting: Vulkan when it has presented, GLES when it has;
+            // both when neither has yet (the first to present takes it).
+            let vulkan = guest
+                .vulkan
+                .as_ref()
+                .filter(|vulkan| vulkan.call_counts().get("vkQueuePresentKHR").copied().unwrap_or(0) > 0);
+            match vulkan {
+                Some(vulkan) => vulkan.request_screenshot(&path),
+                None if guest.gles.presents() > 0 => guest.gles.request_screenshot(&path),
+                None => {
+                    if let Some(vulkan) = &guest.vulkan {
+                        vulkan.request_screenshot(&path);
+                    }
+                    guest.gles.request_screenshot(&path);
+                }
+            }
+            let _ = writeln!(std::io::stderr(), "CONTROL: screenshot requested: {}", path.display());
+        }
+        Command::Status => {
+            let vulkan = guest.vulkan.as_ref().map_or_else(|| "none".to_string(), |v| v.headless_status());
+            let _ = writeln!(
+                std::io::stderr(),
+                "CONTROL: status: Vulkan: {vulkan}. GLES: {}",
+                guest.gles.headless_status()
+            );
+        }
+    }
+}
+
 /// `OMNI_AUDIO`: `off` turns the host's audio output off; unset or `on` leaves it; anything else
 /// is refused by name rather than guessed at.
 fn audio_switched_off(value: Option<&str>) -> Result<bool, String> {
@@ -2476,26 +2585,45 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         omni_platform::net::record::record_first(record_bytes);
     }
     let graphics = std::env::var(GRAPHICS_GATE).is_ok_and(|v| v == "1");
-    let host: Option<Arc<dyn VulkanHost>> = graphics.then(|| {
+    // **Headless with no display** (`OMNI_NO_WINDOW=1`, or `OMNI_HEADLESS=1` where no window can
+    // be opened): the engine's surface is a headless window -- an off-screen pbuffer on an EGL
+    // display that needs no window system -- and no Vulkan is bound, so the engine takes its GLES
+    // renderer (`Mode 6 failed: Unable to load Vulkan API`). See `windowless_asked`.
+    let headless_start = std::env::var("OMNI_HEADLESS").is_ok_and(|v| v.trim() == "1");
+    let mut windowless = graphics && windowless_asked();
+    // **The window first, under the graphics gate**, because the display the engine is told about
+    // is the window's -- its pixels and its host's DPI -- and the engine reads that before step 13.
+    let early_window = (graphics && !windowless)
+        .then(|| {
+            let (width, height) = window_size();
+            let opened = match omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
+                "Omnidroid - Roblox",
+                width,
+                height,
+            )) {
+                Ok(opened) => opened,
+                Err(err) if headless_start => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "GRAPHICS: no window could be opened ({err}), and this run is headless \
+                         (OMNI_HEADLESS=1): WINDOWLESS -- a headless window instead"
+                    );
+                    windowless = true;
+                    return None;
+                }
+                Err(err) => panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"),
+            };
+            opened.show();
+            let mut opened = opened;
+            let _ = opened.poll_events().count();
+            Some(opened)
+        })
+        .flatten();
+    let host: Option<Arc<dyn VulkanHost>> = early_window.is_some().then(|| {
         omni_gfx::GfxVulkanHost::load().expect(
             "OMNI_GFX_WINDOW_TESTS=1 asks for this machine's Vulkan driver, and there is no \
              loader to reach it through",
         ) as Arc<dyn VulkanHost>
-    });
-    // **The window first, under the graphics gate**, because the display the engine is told about
-    // is the window's -- its pixels and its host's DPI -- and the engine reads that before step 13.
-    let early_window = graphics.then(|| {
-        let (width, height) = window_size();
-        let opened = omni_platform::window::Window::new(&omni_platform::window::WindowDesc::new(
-            "Omnidroid - Roblox",
-            width,
-            height,
-        ))
-        .unwrap_or_else(|err| panic!("{GRAPHICS_GATE}=1 and no window could be opened: {err}"));
-        opened.show();
-        let mut opened = opened;
-        let _ = opened.poll_events().count();
-        opened
     });
     let display = match &early_window {
         Some(opened) => {
@@ -2505,6 +2633,10 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 height_px: height as i32,
                 dpi: opened.dpi().expect("the host's DPI for the window"),
             }
+        }
+        None if windowless => {
+            let (width, height) = window_size();
+            Display { width_px: width as i32, height_px: height as i32, dpi: 96 }
         }
         None => Display::HEADLESS,
     };
@@ -2519,7 +2651,14 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         display.width_dp(),
         display.height_dp()
     );
-    let guest = Guest::load(host, display);
+    let guest = Guest::load(host, display, windowless);
+    // **OMNI_HEADLESS=1: headless from the first frame** (`omni_android::headless`): the frame's
+    // draws are dropped where the engine cannot see it, and `headless off` on the control channel
+    // (stdin, `OMNI_CONTROL`) brings them back.
+    let mut control = ControlChannel::open();
+    if std::env::var("OMNI_HEADLESS").is_ok_and(|v| v.trim() == "1") {
+        run_control(&guest, &control.base, "headless on");
+    }
     // **OMNI_HARDWARE_KEYBOARD=1: this host's keyboard, told to the engine**, under the graphics
     // gate (the keys are the window's). Declared here, before step 13 reads the configuration, so
     // `Configuration.keyboard` says QWERTY to the engine and to `vk.g` alike -- see
@@ -3116,6 +3255,25 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         window = Some(opened);
         window_source = Some(source);
         (size.width, size.height)
+    } else if windowless {
+        // **The headless window**: a source with no OS window behind it, publishing the size the
+        // engine renders at, and a `RawWindow::Headless` the host EGL makes a pbuffer for.
+        let (width, height) = (display.width_px, display.height_px);
+        let source = HostWindowSource::unpublished();
+        source.set_raw_window(omni_platform::window::RawWindow::Headless {
+            id: u64::from(std::process::id()),
+            width: width as u32,
+            height: height as u32,
+        });
+        source.publish(width as u32, height as u32).expect("the headless window's size");
+        guest.ndk.set_window_source(Arc::clone(&source) as Arc<dyn WindowSource>);
+        let _ = writeln!(
+            std::io::stderr(),
+            "GRAPHICS: WINDOWLESS -- a headless {width}x{height} window, no Vulkan bound (the engine \
+             takes GLES), EGL over the host's with no window system: its surface is a pbuffer"
+        );
+        window_source = Some(source);
+        (width, height)
     } else {
         guest.ndk.set_window_geometry(
             WindowGeometry::new(SURFACE_WIDTH, SURFACE_HEIGHT).expect("a positive geometry"),
@@ -4511,6 +4669,9 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         let turn_started = std::time::Instant::now();
         turns += 1;
+        for line in control.poll() {
+            run_control(&guest, &control.base, &line);
+        }
         if !join_done && settle.elapsed().as_secs_f32() >= join_delay {
             join_done = true;
             if let Some(place) = join_place {
@@ -4618,6 +4779,24 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 translated.unwrap_or_default(),
                 descriptors
             );
+            // The engine's own GPU timer, as the driver answered it (headless mode's evidence).
+            if let Some((ticks, frames)) = guest.vulkan.as_ref().and_then(|v| v.gpu_timer_window()) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "GPU TIMER: {frames} frames read, mean {ticks} ticks (ns at a 1 ns timestampPeriod) of GPU per frame{}",
+                    if guest.vulkan.as_ref().is_some_and(|v| v.headless()) { ", headless" } else { "" }
+                );
+            }
+            // Headless mode, while it is on: what it has dropped.
+            if guest.vulkan.as_ref().is_some_and(|v| v.headless()) || guest.gles.headless() {
+                let status = match &guest.vulkan {
+                    Some(vulkan) if vulkan.call_counts().get("vkQueuePresentKHR").copied().unwrap_or(0) > 0 => {
+                        format!("Vulkan: {}", vulkan.headless_status())
+                    }
+                    _ => format!("GLES: {}", guest.gles.headless_status()),
+                };
+                let _ = writeln!(std::io::stderr(), "HEADLESS: {status}");
+            }
             // `OMNI_GLES_TIMING`: where the window's frames spent their GL time, CPU and GPU.
             if let Some(lines) = guest.gles.timing_window() {
                 let _ = writeln!(std::io::stderr(), "{lines}");

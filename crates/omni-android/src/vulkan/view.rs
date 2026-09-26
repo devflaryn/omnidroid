@@ -155,6 +155,9 @@ pub(super) fn create_image_view(
             Ok(())
         }
         DriverAnswer::Ok(token) => {
+            if matches!(request.image, super::HostImageRef::Swapchain(_)) {
+                vulkan.headless_state().swapchain_view(token.token());
+            }
             let registered = vulkan.register_image_view(at, token)?;
             c.mem().write_bytes(registered.at, &registered.image, c.blame(3))?;
             c.mem().write_u64(view_at, registered.at as u64, c.blame(3))?;
@@ -188,6 +191,7 @@ pub(super) fn destroy_image_view(
     let handle = guest_pointer(at, "imageView", args[1])?;
     let view = vulkan.image_view_token(at, CALL, args[1])?;
     host.destroy_image_view(view)?;
+    vulkan.headless_state().view_destroyed(view.token());
     vulkan.forget_image_view(handle);
     c.ret().void();
     Ok(())

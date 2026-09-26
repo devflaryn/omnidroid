@@ -793,3 +793,67 @@ C programs built with NDK r28c (`tests/fixtures`). A1 also verified on Linux x86
 and macOS arm64 (the host page is the guest page, 16 KiB). The A1 review's Critical finding -- a
 writable mount escaped with Windows path syntax -- is fixed (`vfs::host_path`).
 
+## D40 — Headless mode: the frame's draws dropped where the engine cannot see it, reversibly
+
+**Ruling (2026-09-27, the owner's requirements).** An instance nobody watches (a farm, a notebook, a
+GPU container) keeps running and presenting every frame while the GPU draws none of them, and can
+be turned back at runtime; a screenshot renders the moment's frame for real. `omni_android::headless`:
+
+- **What is dropped: the draws into the frame's own render targets, nothing else.** Vulkan at
+  record time (recording goes straight to the driver, every command buffer is primary):
+  `vkBeginCommandBuffer` latches the recording's mode; `vkCmdBeginRenderPass` onto a per-frame
+  framebuffer opens a dropping pass, which is itself recorded (clears, stores, layout transitions
+  happen); `vkCmdDraw`/`vkCmdDrawIndexed` inside it are not. GLES at the call (`dispatch`):
+  `glDraw*`, `glMultiDraw*`, `glClear`, `glClearBuffer*`, `glBlitFramebuffer` into a per-frame draw
+  framebuffer. Barriers, copies, uploads, compute, shader compiles, queries, fences, submits,
+  presents and swaps are forwarded, so every call answers as before and every fence is real. The
+  engine's GPU timer (two timestamps) reads the last real frame's GPU time while headless.
+- **Per-frame** (`headless::history`): a framebuffer with a swapchain image view (GL: framebuffer
+  0), or one rendered in at least 4 of the last 8 frames (double-buffered targets included). A
+  target drawn now and then (a composited avatar, a cached GUI) stays real, so nothing the engine
+  renders once and keeps is lost. MEASURED: PS99 at quality 10 has 40 targets, 20 per-frame; every
+  draw fell in a per-frame one (w2: 2.2 M dropped, 0 made into a kept target); GLES 110 targets,
+  4 per-frame, ~0.5% of draws kept real.
+- **Screenshot**: from the request on every recording is real; while headless it waits 3 frames
+  (targets that feed the next frame are whole again), then reads that frame back before it is
+  presented -- Vulkan: a copy on the present queue inside `vkQueuePresentKHR`, waiting on the
+  present's own semaphores (the present then waits on none); GLES: `glReadPixels` of framebuffer 0
+  before the host's swap, bindings restored. PNG off-thread (`flate2` + `crc32fast`, no new crate).
+  **The host swapchain gets `TRANSFER_SRC`** added to the guest's usage when the surface supports
+  it -- invisible to the guest, the images are the same (owner's ruling; `read_presented_image`'s
+  old stance was test-only).
+- **Control**: the gate reads stdin and `OMNI_CONTROL=<file>` (append-only) each turn: `headless
+  on|off`, `screenshot <path>`, `status`; answers `CONTROL: ...`, `SCREENSHOT: saved <path> <w>x<h>`.
+  `omnidroid --headless` (`OMNI_HEADLESS=1`), `--control <file>`, `--no-window`.
+- **No display** (`--no-window`, or `--headless` where no window opens): `RawWindow::Headless`, no
+  Vulkan bound (the engine logs `Mode 6 failed: Unable to load Vulkan API` and takes GLES), EGL on
+  `EGL_PLATFORM_DEVICE_EXT` (the first hardware device; a software one under
+  `LIBGL_ALWAYS_SOFTWARE=1`) else `EGL_PLATFORM_SURFACELESS_MESA`, a pbuffer of the window's size;
+  `eglChooseConfig` asks `EGL_PBUFFER_BIT` for `EGL_WINDOW_BIT` (recorded).
+
+**Why.** Rule 1 forbids fabricated answers, and none is made: every return value is the driver's;
+what is withheld is work whose only product is pixels nobody reads, in targets redrawn the next
+frame -- which is why `off` needs no repair. Dropping at present (skipping frames) would change
+the engine's frame pacing and its own state; withholding the surface (`set_surface_withheld`) makes
+the engine destroy its framebuffer, which it notices.
+
+**Evidence** (stock APK sha256 `bbe00ae3...2742`, PS99 8737899170). Windows RTX 4060, Vulkan, w2
+(2304x1296, `SavedQualityLevel` 10): the engine's GPU timer (`GPU TIMER` lines, the driver's
+answer) 3.7-4.6 ms per frame drawn, 0.87-1.13 ms headless, back on `off`; the game's 3D engine
+share (Windows GPU counters) 22.5% off, 7.8% headless, 23.3% off again; fps unchanged (the engine's
+cap). `nvidia-smi` overall utilisation stayed ~35% throughout: this desktop's other clients (Parsec,
+DWM) hold that much with no game running. Linux Quadro 4000 (nouveau, GPU-bound): X11 (l1) 12 fps
+drawn, 18-21 headless; no display (l2, EGL device + pbuffer) 15 drawn, 22 headless; llvmpipe, no
+display (l3): the engine accepts it (`GL Renderer: llvmpipe`, SuperHQ shaders excluded), 4-6 fps
+drawn, 18-21 headless. Screenshots while headless show the live world; after `off` the window
+draws again (w1, w2 desktop captures). Every session closed clean.
+
+**Costs, stated.** While headless a visible window shows the last real frame (Windows: the
+swapchain images keep it) -- cosmetic. The engine's own screenshot features read stale pixels. A
+target rendered in 4 of 8 frames and then kept (none measured) would be stale until next drawn.
+Compute dispatches, clears and copies still run (the ~0.9 ms left in w2). GLES has no GPU-timer
+rewrite (the engine's GLES timer queries are forwarded as they are).
+
+**Reverses it.** A target the rule drops that the engine keeps (a stale texture after `off`), or
+an engine path that reads back a per-frame target while headless and acts on it.
+
