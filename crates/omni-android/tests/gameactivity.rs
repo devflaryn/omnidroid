@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use omni_android::aaudio::{AAudio, PlatformOutput};
 use omni_android::bionic::{Bionic, GuestProcess, HwcapPolicy, ThreadHost};
-use omni_android::jni::classes::Answer;
+use omni_android::jni::classes::{Answer, ClassSpec, Tier};
 use omni_android::jni::cursor::CursorController;
 use omni_android::jni::input::{TouchInput, PASS_INPUT_SYMBOL, STATE_MOVED};
 use omni_android::jni::keys::{declare_hardware_keyboard, KeyInput};
@@ -796,6 +796,12 @@ struct Guest {
     audio: Option<Arc<AAudio>>,
     boundary: Arc<Boundary>,
     object: LoadedObject,
+    /// **The app's compression library**, loaded into the same boundary as the engine and held for
+    /// the run: on a device the Java side loads it and never unloads it, so the mappings and the
+    /// relocated image stay where `/proc/self/maps` and `dl_iterate_phdr` say they are.
+    compression: LoadedObject,
+    /// Its `JNI_OnLoad`, if it exports one, and its `Java_*` natives, by name.
+    compression_exports: std::collections::BTreeMap<String, GuestAddr>,
     stack_top: GuestAddr,
     process_args: [GuestArg; 3],
     exports: std::collections::BTreeMap<String, GuestAddr>,
@@ -1461,6 +1467,8 @@ impl Guest {
             audio,
             boundary,
             object,
+            compression,
+            compression_exports,
             stack_top,
             process_args: [
                 GuestArg::Int(1),
@@ -2569,7 +2577,16 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // `VERIFICATION.md` entry 4's shape -- a census taken after the work is not evidence about
     // when the work happened.
     let mut outcomes = Vec::new();
+    let mut compression_booted = false;
     for step in script::SEQUENCE {
+        // **The device's own point for the second library.** Step 8's caller is
+        // `ActivitySplash.onCreate`, and that is the activity whose Java side loads the compression
+        // library on a device -- so it is booted here, after step 7 and before step 8's downcall,
+        // rather than at a point this gate would have invented.
+        if step.step == 8 && !compression_booted {
+            compression_booted = true;
+            boot_the_compression_library(&guest, &mut cpu);
+        }
         let before = image_word(&guest, SPIN_LOCK_OFFSET, "the spin lock at 0x06dd0a30");
         let threads_before = guest.bionic.guest_thread_records();
         let produced = {
@@ -2610,6 +2627,11 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
         }
         outcomes.extend(produced);
     }
+    assert!(
+        compression_booted,
+        "the scripted sequence has no step 8, so the compression library was never booted at the \
+         point a device loads it"
+    );
     let reached = outcomes.iter().filter(|o| o.ok()).count();
     let _ = writeln!(
         std::io::stderr(),
@@ -6235,6 +6257,158 @@ fn report_network(out: &mut impl Write, boundary: &Boundary, when: &str) {
             let _ = writeln!(out, "  {}", transcript.outline());
         }
     }
+    let _ = out.flush();
+}
+
+/// **Boot the APK's second native library, where a device's Java side loads it.**
+///
+/// Its constructors first -- every `DT_INIT_ARRAY` entry, each under the same per-initializer budget
+/// the engine's get -- and then its exported `JNI_OnLoad`, with this layer's `JavaVM *` and version
+/// `0`, under [`ON_LOAD_BUDGET`]. **And nothing after that**: what the library's Java side would call
+/// next is a separate question, and calling an export to see what happens is the shape this project
+/// refuses, so no `Java_*` native is touched here.
+///
+/// The counts are all *differences*. The engine has been registering natives and missing member
+/// lookups since `JNI_OnLoad`, and a report that read the whole table would attribute the engine's
+/// surface to these bytes.
+fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
+    let mut out = std::io::stderr();
+    let registrations_before = guest.jni.registrations().len();
+    let misses_before = guest.jni.misses().len();
+
+    let total = guest.compression.init_array.len();
+    let (completed, stopped) = {
+        let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+        let _jni = guest.jni.activate().expect("publish the JNI instance");
+        let _ndk = guest.ndk.activate();
+        let mut completed = 0usize;
+        let mut stopped = None;
+        for (index, &entry) in guest.compression.init_array.iter().enumerate() {
+            let caller = format!("the compression library's init_array[{index}]");
+            match guest.boundary.call_guest(
+                cpu,
+                &caller,
+                entry as GuestAddr,
+                &guest.process_args,
+                PER_INITIALIZER,
+            ) {
+                Ok(_) => completed += 1,
+                Err(error) => {
+                    stopped = Some((index, error.to_string()));
+                    break;
+                }
+            }
+        }
+        (completed, stopped)
+    };
+    let _ = writeln!(
+        out,
+        "PAYLOAD CONSTRUCTORS: {completed}/{total} completed{}",
+        match &stopped {
+            None => String::new(),
+            Some((index, error)) => format!(", stopped at [{index}]: {error}"),
+        }
+    );
+    assert!(
+        stopped.is_none(),
+        "every constructor the compression library declares has to return through the sentinel, \
+         and one did not"
+    );
+    assert_eq!(completed, total, "every `init_array` entry the library declares was called");
+
+    // **`JNI_OnLoad`, if these bytes export one.** MEASURED on 2.738.1397's build: they do not --
+    // its natives are exported symbols the Java side binds by name, which is what `RegisterNatives`
+    // exists as an alternative to. Calling an address the library does not publish would be this
+    // gate inventing an entry point, so the line says what was found instead.
+    match guest.compression_exports.get("JNI_OnLoad").copied() {
+        Some(on_load) => {
+            let returned = {
+                let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+                let _jni = guest.jni.activate().expect("publish the JNI instance");
+                let _ndk = guest.ndk.activate();
+                guest.boundary.call_guest(
+                    cpu,
+                    "the compression library's JNI_OnLoad",
+                    on_load,
+                    &[GuestArg::Pointer(guest.jni.java_vm()), GuestArg::Int(0)],
+                    ON_LOAD_BUDGET,
+                )
+            };
+            match &returned {
+                Ok(value) => {
+                    let _ = writeln!(
+                        out,
+                        "PAYLOAD JNI_OnLoad -> X0 = {:#x}",
+                        value.as_pointer() as u64
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(out, "PAYLOAD JNI_OnLoad -> {error}");
+                }
+            }
+            returned.expect("the compression library's JNI_OnLoad must return");
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "PAYLOAD JNI_OnLoad -> not called: this build exports none, and its {} `Java_*` \
+                 natives are bound by name rather than registered",
+                guest.compression_exports.len()
+            );
+        }
+    }
+
+    // **Every class a registration names is declared afterwards**, as a memberless `Tier::Support`
+    // shell when the layer did not already declare it -- so a later member lookup on it is
+    // *recorded* as a miss this report can show rather than refused as an undeclared class.
+    let registrations = guest.jni.registrations();
+    let mine = registrations.get(registrations_before..).unwrap_or(&[]);
+    let _ = writeln!(
+        out,
+        "PAYLOAD REGISTERED NATIVES ({}): {}",
+        mine.len(),
+        mine.iter()
+            .map(|r| format!("{}::{}{}", r.class, r.member, r.descriptor))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let named: std::collections::BTreeSet<&str> = mine.iter().map(|r| r.class.as_str()).collect();
+    for class in named {
+        if guest.jni.with_registry(|registry| registry.find(class).is_some()) {
+            continue;
+        }
+        // The registry's class names are `&'static str`, and this one came out of the guest at run
+        // time. Leaked on purpose: the name has to outlive the registry, the process ends with this
+        // run, and widening the registry's own types for a test's sake would be the tail wagging the
+        // dog.
+        let name: &'static str = Box::leak(class.to_string().into_boxed_str());
+        guest
+            .jni
+            .with_registry(|registry| {
+                registry.declare(&ClassSpec {
+                    name,
+                    tier: Tier::Support,
+                    methods: &[],
+                    fields: &[],
+                })
+            })
+            .expect("declare a class a registration named");
+    }
+    for class in mine.iter().map(|r| r.class.as_str()) {
+        assert!(
+            guest.jni.with_registry(|registry| registry.find(class).is_some()),
+            "`{class}` is named by a registration the compression library made and is not declared"
+        );
+    }
+
+    let misses = guest.jni.misses();
+    let mine = misses.get(misses_before..).unwrap_or(&[]);
+    let _ = writeln!(
+        out,
+        "PAYLOAD LOOKUP MISSES ({}): {}",
+        mine.len(),
+        mine.iter().map(|m| format!("{}::{}", m.class, m.member)).collect::<Vec<_>>().join(", ")
+    );
     let _ = out.flush();
 }
 
