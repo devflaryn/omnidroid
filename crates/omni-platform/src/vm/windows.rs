@@ -532,6 +532,28 @@ pub(super) fn reserve(size: usize, align: usize) -> VmResult<usize> {
     reserve_inner("reserve", size, align, MEM_RESERVE)
 }
 
+pub(super) fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<usize> {
+    let alloc2 = virtual_alloc2()?;
+    // SAFETY: `alloc2` is the resolved `VirtualAlloc2`, called with its documented signature; a
+    // non-NULL base asks for exactly that range and fails if any of it is in use; nothing is
+    // committed or made accessible.
+    let got = unsafe {
+        alloc2(
+            GetCurrentProcess(),
+            base as *const c_void,
+            size,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if got.is_null() {
+        return Err(os("reserve_placeholder_at", base, size));
+    }
+    Ok(got as usize)
+}
+
 pub(super) fn reserve_placeholder(size: usize, align: usize) -> VmResult<usize> {
     reserve_inner(
         "reserve_placeholder",

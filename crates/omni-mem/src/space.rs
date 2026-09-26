@@ -187,6 +187,10 @@ pub enum Placement {
 /// How a guest address space is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestSpaceConfig {
+    /// Reserve at exactly this address instead of where the host chooses (`None`). A guest address
+    /// is a host address (D4), so a guest that needs low memory (ART's heap below 4 GiB) needs the
+    /// reservation there.
+    pub base: Option<GuestAddr>,
     /// Size of the reservation, in bytes. Rounded up to a page. Costs no commit charge whatever it
     /// is, so this is not the number to economize on (D10).
     pub size: usize,
@@ -221,6 +225,7 @@ pub struct GuestSpaceConfig {
 impl Default for GuestSpaceConfig {
     fn default() -> Self {
         Self {
+            base: None,
             size: DEFAULT_SPACE_SIZE,
             base_alignment: vm::allocation_granularity(),
             commit_granule: DEFAULT_COMMIT_GRANULE,
@@ -525,8 +530,12 @@ impl GuestSpace {
 
         // At least page-aligned: the host's allocation granularity already is, for the host's own
         // page, and is not for a larger page asked of `with_page_size`.
-        let reservation = vm::reserve_placeholder(config.size, config.base_alignment.max(page))
-            .map_err(platform("GuestSpace::with_config", 0, config.size))?;
+        let reservation = match config.base {
+            Some(at) => vm::reserve_placeholder_at(at, config.size)
+                .map_err(platform("GuestSpace::with_config", at, config.size))?,
+            None => vm::reserve_placeholder(config.size, config.base_alignment.max(page))
+                .map_err(platform("GuestSpace::with_config", 0, config.size))?,
+        };
         let base = reservation.base();
         tracing::debug!(
             base = format_args!("{base:#x}"),

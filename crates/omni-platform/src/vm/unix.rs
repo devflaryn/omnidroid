@@ -79,6 +79,10 @@ pub(super) fn reserve(_size: usize, _align: usize) -> VmResult<usize> {
 }
 
 /// Intended: identical to [`reserve`] — `mmap(MAP_FIXED)` needs no placeholder.
+pub(super) fn reserve_placeholder_at(_base: usize, _size: usize) -> VmResult<usize> {
+    unsupported("reserve_placeholder_at")
+}
+
 pub(super) fn reserve_placeholder(_size: usize, _align: usize) -> VmResult<usize> {
     unsupported("reserve_placeholder")
 }

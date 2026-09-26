@@ -351,6 +351,31 @@ pub(super) fn reserve_placeholder(size: usize, align: usize) -> VmResult<usize> 
     reserve_inner("reserve_placeholder", size, align, Kind::Placeholder)
 }
 
+pub(super) fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<usize> {
+    let len = round_up(size, page_size());
+    let mut map = registry();
+    // SAFETY: a hint without MAP_FIXED replaces nothing; PROT_NONE grants no access. The result is
+    // checked against the hint, and a mapping elsewhere is given back.
+    let raw = unsafe {
+        libc::mmap(base as *mut libc::c_void, len, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+    };
+    if raw == libc::MAP_FAILED {
+        return Err(os("reserve_placeholder_at", base, size));
+    }
+    if raw as usize != base {
+        // SAFETY: the mapping just made, which nothing else knows.
+        unsafe { libc::munmap(raw, len) };
+        return Err(VmError::Os {
+            operation: "reserve_placeholder_at",
+            address: base,
+            size,
+            source: OsError(libc::EEXIST as u32),
+        });
+    }
+    map.insert(base, Entry { len, kind: Kind::Placeholder });
+    Ok(base)
+}
+
 /// Carve an independent placeholder out of the placeholder that contains it. Bookkeeping only:
 /// `mmap(MAP_FIXED)` needs no OS-level split, but the seam's contract (a view replaces an
 /// exact-size piece; `release` frees exactly one piece) is written in terms of the pieces, so the

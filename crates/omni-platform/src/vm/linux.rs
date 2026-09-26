@@ -301,6 +301,23 @@ pub(super) fn reserve_placeholder(size: usize, align: usize) -> VmResult<usize> 
     reserve_inner("reserve_placeholder", size, align, Kind::Placeholder)
 }
 
+pub(super) fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<usize> {
+    const OP: &str = "reserve_placeholder_at";
+    let len = round_up(size, page_size()).ok_or_else(|| os(OP, base, size, libc::ENOMEM as u32))?;
+    // SAFETY: MAP_FIXED_NOREPLACE maps exactly `[base, base + len)` or fails with EEXIST if any
+    // of it is in use: nothing that exists is replaced, and PROT_NONE makes nothing reachable.
+    let got = unsafe { posix::mmap(base, len, libc::PROT_NONE, RESERVE_FLAGS | libc::MAP_FIXED_NOREPLACE, -1, 0) }
+        .map_err(|code| os(OP, base, size, code))?;
+    if got != base {
+        // A kernel before 4.17 ignores the flag and treats it as a hint.
+        // SAFETY: the mapping just made, which nothing else knows.
+        let _ = unsafe { posix::munmap(got, len) };
+        return Err(os(OP, base, size, libc::EEXIST as u32));
+    }
+    record_fresh(&mut ledger(), base, len, Kind::Placeholder);
+    Ok(base)
+}
+
 /// Split a placeholder: **no kernel call**, because a later `mmap(MAP_FIXED)` of the piece will
 /// replace exactly the piece. The ledger records the new boundaries, which is what makes the
 /// exact-size rule of [`commit_placeholder`] and [`map_file`] checkable.

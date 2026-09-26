@@ -492,6 +492,20 @@ pub fn reserve(size: usize, align: usize) -> VmResult<Reservation> {
     Ok(Reservation { base, len: size, kind: ReservationKind::Plain })
 }
 
+/// [`reserve_placeholder`] at exactly `base`, or an error if any of `[base, base + size)` is in
+/// use. For a guest that needs its memory at particular addresses: ART's heap and boot image must
+/// lie below 4 GiB (compressed references), and a guest address is a host address (D4).
+///
+/// # Errors
+///
+/// As [`reserve_placeholder`]; the OS's error when the range is not free.
+pub fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<Reservation> {
+    check_size("reserve_placeholder_at", size)?;
+    check_page_multiple("reserve_placeholder_at", "base address", base as u64)?;
+    let base = backend::reserve_placeholder_at(base, size)?;
+    Ok(Reservation { base, len: size, kind: ReservationKind::Placeholder })
+}
+
 /// Reserve address space as a *placeholder*, for later `MAP_FIXED`-style replacement.
 ///
 /// Like [`reserve`], this costs no commit charge. Unlike [`reserve`], the range can be
