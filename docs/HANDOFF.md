@@ -11,6 +11,15 @@ that code comments cite by number.
 - **`unified` is the source.** It contains every other line of work (`perf-windows`,
   `port-macos`, `port-linux`, `input-kbm`, `perf-world`, `main`). The one unmerged branch with
   pending work is `arm64-clear-audit` (patch 0023, see "Open").
+- **`perf-windows` is superseded, not a merge target.** Its two commits since (`799aca4`,
+  `c566be4`, 2026-09-26; `unified..perf-windows` = 2, `perf-windows..unified` = 306) add nothing
+  `unified` lacks. `c566be4` (a mapped file shortened as Linux does, by a logical end of file)
+  duplicates `struct Logical` in `omni-platform`'s `fs/windows.rs` and bionic's
+  `a_file_a_shared_mapping_holds_is_reopened_truncating_as_linux_does` (`memProfStorage`).
+  `799aca4` (raw `close`/`read`/`mprotect`) is superseded by `sysroute::ROUTES` (57, 63, 226
+  among them, each with a per-argument kernel-to-import map), which `service_raw_syscall`
+  dispatches through `call_routed` on the exit path: the two defects of its draft (arguments
+  read as zero; a re-entrant `mprotect` unreachable inline) cannot arise here.
 - `main` is behind. **Never merge to `main` or push to GitHub (`origin`) without the owner.**
 - Remotes `mac` and `linux` are the other machines' checkouts. The `mac` remote URL still says
   `192.168.0.24`; the Mac was moved to **`192.168.0.37`** (macOS 27.0) on 2026-09-25.
@@ -149,9 +158,17 @@ name). Not run on the Mac or Linux since the switch.
    `WebRtcAudioManager`.
 5. **A `poll` over sockets parks 60 s per slice and can hold teardown** (was in progress on
    09-25; unverified whether fixed).
-6. Multi-instance B: the unmeasured levers above; which game and RAM the B machine has is the
+6. **`/proc/<own pid>/cmdline` is not answered** (measured on `perf-windows`, 2026-09-26; not
+   fixed). With the logical end of file in place, the engine's "Evaluating deferred inferred
+   crashes" opens it; nothing answers that path (`bionic/procfs.rs` has `meminfo`,
+   `self/statm`, `self/maps`), so the engine takes its own `memProfStorage<pid>.json` for a dead
+   session's record -- re-opens it `O_TRUNC`, `fallocate`s, unlinks it -- and the gate's close
+   assertion failed with `SessionHistory None`. The windowed gate on `unified` is green today,
+   so the path is latent, not absent. The answer is **not** a `/proc` file invented to satisfy
+   the check: measure first what the engine reads there and what a device answers.
+7. Multi-instance B: the unmeasured levers above; which game and RAM the B machine has is the
    owner's answer.
-7. Re-anchor the 44 stale mutation rows (above), then run the whole table once; it has never run
+8. Re-anchor the 44 stale mutation rows (above), then run the whole table once; it has never run
    whole in one pass (VERIFICATION entry 8).
 
 ## Working rules that have paid for themselves
