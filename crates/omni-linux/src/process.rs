@@ -49,6 +49,8 @@ pub struct Process {
     pub cwd: Mutex<Vec<u8>>,
     pub mm: Mm,
     pub sys: SysState,
+    /// The process's futex wait queue (A4).
+    pub futexes: crate::futex::Futexes,
     pub trace: bool,
     /// The program's arguments, as `/proc/<pid>/cmdline` reports them.
     pub argv: Vec<Vec<u8>>,
@@ -148,6 +150,7 @@ impl Process {
             cwd: Mutex::new(b"/".to_vec()),
             mm: Mm::new(space),
             sys: SysState::new(PID, UID),
+            futexes: crate::futex::Futexes::default(),
             trace,
             argv,
             comm: Mutex::new(comm),

@@ -7,6 +7,7 @@
 pub mod errno;
 pub mod exec;
 pub mod fd;
+pub mod futex;
 pub mod guest;
 pub mod manifest;
 pub mod mm;

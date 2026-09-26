@@ -1,15 +1,13 @@
 //! The small syscalls: ids, clocks, `uname`, randomness, limits, `prctl`, signal state (stored;
 //! delivery is A5) and a minimal futex (A4 completes it).
-use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 
 use crate::errno::*;
 use crate::process::{Exit, Process, Task};
 use crate::syscall::{nr, Table};
 
-const ETIMEDOUT: Errno = Errno(110);
 const SIGKILL: u64 = 9;
 const SIGSTOP: u64 = 19;
 
@@ -18,8 +16,6 @@ pub struct SysState {
     pub uid: u32,
     start: Instant,
     actions: Mutex<[[u8; 32]; 65]>,
-    futex: Mutex<HashMap<u64, u64>>, // address -> wake generation
-    futex_cv: Condvar,
     /// `PR_SET_TAGGED_ADDR_CTRL`'s value. Tagged pointers are accepted either way (see
     /// `guest::untag`); this is what `PR_GET_TAGGED_ADDR_CTRL` reports back.
     tagged_addr_ctrl: std::sync::atomic::AtomicU64,
@@ -30,7 +26,7 @@ pub struct SysState {
 impl SysState {
     #[must_use]
     pub fn new(pid: i32, uid: u32) -> Self {
-        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), futex: Mutex::default(), futex_cv: Condvar::new(), tagged_addr_ctrl: std::sync::atomic::AtomicU64::new(0), umask: std::sync::atomic::AtomicU32::new(0o022) }
+        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), tagged_addr_ctrl: std::sync::atomic::AtomicU64::new(0), umask: std::sync::atomic::AtomicU32::new(0o022) }
     }
 
     /// Time since the process started.
@@ -45,11 +41,6 @@ impl SysState {
         self.umask.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Wake every waiter on `addr` (A1 has one thread; A4 counts and limits properly).
-    pub fn futex_wake(&self, addr: u64) {
-        *self.futex.lock().entry(addr).or_insert(0) += 1;
-        self.futex_cv.notify_all();
-    }
 }
 
 fn timespec(secs: u64, nanos: u32) -> [u8; 16] {
@@ -295,33 +286,31 @@ fn sys_getrusage(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
-    let op = a[1] & !(128 | 256); // FUTEX_PRIVATE_FLAG, FUTEX_CLOCK_REALTIME
-    match op {
+    const PRIVATE: u64 = 128;
+    const CLOCK_REALTIME: u64 = 256;
+    let all = u32::MAX;
+    match a[1] & !(PRIVATE | CLOCK_REALTIME) {
+        // FUTEX_WAIT: a relative timeout.
         0 => {
-            let timeout = if a[3] == 0 { None } else { Some(read_timespec(p, a[3])?) };
-            let mut table = p.sys.futex.lock();
-            let current = u32::from_le_bytes(p.mem.read(a[0], 4)?.try_into().expect("4 bytes"));
-            if current != a[2] as u32 {
-                return Err(EAGAIN);
-            }
-            let seen = *table.entry(a[0]).or_insert(0);
-            let deadline = timeout.map(|d| Instant::now() + d);
-            while table.get(&a[0]).copied() == Some(seen) {
-                match deadline {
-                    Some(d) => {
-                        if p.sys.futex_cv.wait_until(&mut table, d).timed_out() {
-                            return Err(ETIMEDOUT);
-                        }
-                    }
-                    None => p.sys.futex_cv.wait(&mut table),
-                }
-            }
-            Ok(0)
+            let deadline = if a[3] == 0 { None } else { Some(Instant::now() + read_timespec(p, a[3])?) };
+            p.futexes.wait(&p.mem, a[0], a[2] as u32, all, deadline)
         }
-        1 => {
-            p.sys.futex_wake(a[0]);
-            Ok(0)
+        // FUTEX_WAIT_BITSET: an absolute timeout on CLOCK_MONOTONIC (or REALTIME with the flag).
+        9 => {
+            let deadline = if a[3] == 0 {
+                None
+            } else {
+                let clock = if a[1] & CLOCK_REALTIME != 0 { 0 } else { 1 };
+                let at = read_timespec(p, a[3])?;
+                Some(Instant::now() + at.saturating_sub(now(p, clock)?))
+            };
+            p.futexes.wait(&p.mem, a[0], a[2] as u32, a[5] as u32, deadline)
         }
+        1 => p.futexes.wake(a[0], a[2], all),
+        10 => p.futexes.wake(a[0], a[2], a[5] as u32),
+        3 => p.futexes.requeue(&p.mem, a[0], a[2], a[4], a[3], None),
+        4 => p.futexes.requeue(&p.mem, a[0], a[2], a[4], a[3], Some(a[5] as u32)),
+        5 => p.futexes.wake_op(&p.mem, a[0], a[2], a[4], a[3], a[5] as u32),
         other => {
             p.refusals.record(format!("futex op {other}"), t.pc, t.lr);
             Err(ENOSYS)

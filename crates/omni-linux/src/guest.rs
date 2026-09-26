@@ -79,6 +79,18 @@ impl GuestMem {
         Ok(())
     }
 
+    /// The aligned, writable guest word at `addr`, for an atomic update the kernel makes
+    /// (`FUTEX_WAKE_OP`).
+    pub fn atomic_u32(&self, addr: u64) -> Result<&std::sync::atomic::AtomicU32, Errno> {
+        if untag(addr) % 4 != 0 {
+            return Err(crate::errno::EINVAL);
+        }
+        let ptr = self.check(addr, 4, true)?;
+        // SAFETY: `check` proved the four bytes mapped, writable and committed; they are aligned;
+        // guest memory outlives `self`, and every access to it is atomic or byte-wise.
+        Ok(unsafe { &*ptr.cast::<std::sync::atomic::AtomicU32>() })
+    }
+
     pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
         Ok(u64::from_le_bytes(self.read(addr, 8)?.try_into().expect("eight bytes")))
     }
