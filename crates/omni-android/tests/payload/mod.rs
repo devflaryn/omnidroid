@@ -33,6 +33,10 @@ use std::sync::{Arc, Mutex};
 use omni_android::{AbiError, AbiResult, ImportCall, ImportFn};
 use omni_cpu::GuestAddr;
 
+/// Which build of this library's name a file holds, and the image to load for it. See
+/// [`identity`]'s own header for the two builds, the digests, and why the decision is a digest.
+pub mod identity;
+
 /// Bytes of guest address space the arena reserves.
 ///
 /// **The reservation is free; only touched pages commit** ([`omni_mem::CommitPolicy::Lazy`]), so
@@ -398,6 +402,34 @@ pub const ALLOCATOR_HANDLERS: &[(&str, ImportFn)] = &[
     ("posix_memalign", posix_memalign),
     ("memalign", memalign),
     ("strdup", strdup),
+];
+
+/// The Java classes a substituted build of this library's name **registers its own natives on**.
+///
+/// # Why the embedding has to declare these, and why the list is short and named
+///
+/// A device has them because the APK carries a dex that declares them. This runtime executes no dex
+/// (D7: the Java side is *defined*, not executed), so a class exists here only if something declares
+/// it -- and the layer is right about that: `FindClass` on an undeclared class answers null and
+/// **records a miss**, and `RegisterNatives` then refuses a null class, because inventing a class
+/// would turn a missing declaration into a call that silently goes nowhere.
+///
+/// So the embedding declares what the library is going to ask for, which is a fact about *this*
+/// library rather than about the runtime. MEASURED, in order:
+///
+/// * The stock library registers nothing — its natives are exported symbols the Java side binds by
+///   name — so on 2.738.1397 this list is never used and every one of these names is a class the
+///   stock APK does not have.
+/// * The substituted build's `JNI_OnLoad` calls `RegisterNatives`, and the run reported
+///   `RegisterNatives ... was given 0x0 as a jobject`: it had asked `FindClass` for a class this
+///   registry had not declared. The names below are the four the analysis of that APK names, and
+///   the boot prints `Jni::misses()` after every call, so a class outside this list is **named in
+///   the report** rather than guessed at: the next one is added here with its measurement.
+pub const REGISTRATION_CLASSES: &[&str] = &[
+    "com/axjava/Main",
+    "com/axjava/JNIFunctions",
+    "com/axjava/AXWebViewController",
+    "com/axjava/MainActivity",
 ];
 
 // ============================================================ the heap, without the guest

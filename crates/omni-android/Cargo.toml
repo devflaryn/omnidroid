@@ -69,6 +69,12 @@ omni-cpu = { path = "../omni-cpu", default-features = false, features = ["dynarm
 # mock would assert facts about the mock. `omni-apk` is for the real-APK fixture (Global
 # Constraint 2).
 omni-apk = { workspace = true }
+# SHA-256, for the identity gate on the APK's compression library (`tests/payload/identity.rs`).
+# The two builds of `libzstd-jni-1.5.7-6.so` this project has bytes for differ in length, in import
+# count and in whether they declare `DT_INIT_ARRAY` — and a length cannot see a substitution, which
+# is this project's most expensive lesson. Test-only, and for the same reason as the two entries
+# above.
+sha2 = { workspace = true }
 # `omni-platform` is an ordinary dependency now (see above) and needs no entry here.
 #
 # The renderer, **for test targets only**, and the direction is why it is down here rather than
