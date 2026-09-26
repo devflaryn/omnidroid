@@ -109,3 +109,11 @@ fn a_signal_that_is_ignored_by_default_changes_nothing() {
     assert_eq!(p.syscall(&mut t, nr::TGKILL, [pid, pid, 17, 0, 0, 0]), 0, "SIGCHLD");
     assert_eq!(t.exit, None);
 }
+
+#[test]
+fn umask_answers_the_previous_mask_and_keeps_only_permission_bits() {
+    let (p, mut t, _) = process();
+    assert_eq!(p.syscall(&mut t, nr::UMASK, [0, 0, 0, 0, 0, 0]), 0o022, "the default");
+    assert_eq!(p.syscall(&mut t, nr::UMASK, [0o7777, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, nr::UMASK, [0o022, 0, 0, 0, 0, 0]), 0o777);
+}

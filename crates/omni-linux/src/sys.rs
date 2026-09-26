@@ -23,12 +23,14 @@ pub struct SysState {
     /// `PR_SET_TAGGED_ADDR_CTRL`'s value. Tagged pointers are accepted either way (see
     /// `guest::untag`); this is what `PR_GET_TAGGED_ADDR_CTRL` reports back.
     tagged_addr_ctrl: std::sync::atomic::AtomicU64,
+    /// The file-creation mask (`umask`), 022 to start with as a shell's is.
+    umask: std::sync::atomic::AtomicU32,
 }
 
 impl SysState {
     #[must_use]
     pub fn new(pid: i32, uid: u32) -> Self {
-        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), futex: Mutex::default(), futex_cv: Condvar::new(), tagged_addr_ctrl: std::sync::atomic::AtomicU64::new(0) }
+        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), futex: Mutex::default(), futex_cv: Condvar::new(), tagged_addr_ctrl: std::sync::atomic::AtomicU64::new(0), umask: std::sync::atomic::AtomicU32::new(0o022) }
     }
 
     /// Wake every waiter on `addr` (A1 has one thread; A4 counts and limits properly).
@@ -251,6 +253,10 @@ fn sys_sched_getparam(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+fn sys_umask(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    Ok(u64::from(p.sys.umask.swap(a[0] as u32 & 0o777, std::sync::atomic::Ordering::Relaxed)))
+}
+
 fn sys_sysinfo(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut b = [0u8; 112];
     b[..8].copy_from_slice(&p.sys.start.elapsed().as_secs().to_le_bytes()); // uptime
@@ -384,6 +390,7 @@ pub fn install(table: &mut Table) {
     }
     table.set(nr::SCHED_GETPARAM, sys_sched_getparam);
     table.set(nr::SYSINFO, sys_sysinfo);
+    table.set(nr::UMASK, sys_umask);
     table.set(nr::GETRUSAGE, sys_getrusage);
     table.set(nr::FUTEX, sys_futex);
 }
