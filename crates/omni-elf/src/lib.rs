@@ -781,6 +781,53 @@ impl<'a> ElfImage<'a> {
     }
 }
 
+/// What a kernel reads of an ELF before mapping it: the file header and the program headers.
+///
+/// [`ElfImage::parse`] is the *loader's* view and refuses what this crate's loader cannot relocate
+/// (`PT_TLS`, a missing `PT_DYNAMIC`). The Linux personality (`omni-linux`) maps the program and
+/// its interpreter and leaves relocation to the real `linker64`, which handles both, so it reads
+/// only this much.
+#[derive(Debug, Clone)]
+pub struct ProgramHeaders {
+    pub header: FileHeader,
+    pub segments: Vec<Segment>,
+}
+
+impl ProgramHeaders {
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        let view = View::new(data);
+        let header = FileHeader::parse(&view)?;
+        let phoff = reader::to_usize("e_phoff", header.e_phoff)?;
+        let mut segments = Vec::with_capacity(header.e_phnum as usize);
+        for i in 0..header.e_phnum as usize {
+            let at = phoff.checked_add(i * SIZEOF_PHDR).ok_or(ElfError::OutOfBounds {
+                what: "program header table",
+                offset: phoff,
+                need: i * SIZEOF_PHDR,
+                have: view.len(),
+            })?;
+            segments.push(Segment::parse(&view, at)?);
+        }
+        Ok(Self { header, segments })
+    }
+
+    /// The `PT_INTERP` path, without its terminating NUL; `None` for a static executable.
+    pub fn interpreter<'a>(&self, data: &'a [u8]) -> Result<Option<&'a [u8]>> {
+        let Some(seg) = self.segments.iter().find(|s| s.p_type == PT_INTERP) else {
+            return Ok(None);
+        };
+        let view = View::new(data);
+        let bytes = view
+            .subview(
+                "PT_INTERP",
+                reader::to_usize("PT_INTERP p_offset", seg.p_offset)?,
+                reader::to_usize("PT_INTERP p_filesz", seg.p_filesz)?,
+            )?
+            .bytes();
+        Ok(Some(bytes.split(|&b| b == 0).next().unwrap_or(bytes)))
+    }
+}
+
 impl core::fmt::Debug for ElfImage<'_> {
     /// Deliberately terse: the interesting contents are behind accessors, and a derived `Debug`
     /// on a 109 MB image would print the whole file.
