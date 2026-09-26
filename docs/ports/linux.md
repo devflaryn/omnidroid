@@ -64,19 +64,22 @@ coherent map cannot be shadowed; the engine then runs with `Persistent 0`); the 
 config attributes are dropped when the host lacks them; seven desktop-GL names answer NULL from
 `eglGetProcAddress`. 35 terrain shaders fail Mesa's strict GLSL ES compiler (the engine's source).
 
+The Linux personality (`omni-linux`, 2026-09-27): A1-A5 pass here in debug and release, the A4
+and A5 gates 10/10 each in release. **A thread that takes guest faults is given a 64 KiB alternate signal stack**
+(`fault::prepare_thread`, called by `omni-cpu` on entry to every run). The demand pager's
+`SIGSEGV` path needs 12,496 bytes of it in a debug build against the 8,192 Rust gives a std
+thread (release: 3,016; `omni-mem/tests/pager_linux`), and the overrun killed the debug suites
+that serve demand faults (`omni-linux` A1-A5, `omni-mem`, `omni-cpu` `faults`/`hostile`,
+`omni-android`) by `SIGSEGV`. `omni-platform/tests/fault_altstack_linux.rs` pins both sides: a
+32 KiB-deep handler serves a fault on a prepared thread, and kills an unprepared one. Host code
+that touches lazy guest memory from a thread of its own calls `DemandPager::prepare_thread` first.
+
 ## Open
 
 * The GPU is the frame-rate limit. Options: a smaller window, the lowest quality (set), NVIDIA's
   390 legacy driver (a system change for the owner), no other GPU client on the desktop.
 * After a live resize the engine's GLES renderer keeps its old viewport.
 * The engine's own Vulkan path on a real Linux GPU is unmeasured.
-* **Debug builds overrun a std thread's alternate signal stack** in the demand pager's `SIGSEGV`
-  path: 12,496 bytes used against the 8,192 Rust gives a thread (release: 3,016;
-  `omni-mem/tests/pager_linux`, 2026-09-27). A debug `cargo test --workspace` died by `SIGSEGV`,
-  the overrun's signature, in the suites that serve demand faults on test threads (`omni-mem` `pager_linux`,
-  `probe_linux`, `heap_pattern`; `omni-cpu` `faults`, `hostile`; `omni-android` `bionic`,
-  `initializers`, `jni_startup`; the overrun measured in `pager_linux` only); run the Linux suite in
-  release.
 * The demand pager locks and allocates inside the `SIGSEGV` handler: sound for the synchronous
   faults it serves (the Windows VEH's bargain), not async-signal-safe in the POSIX sense.
 * `vm.overcommit_memory = 2` and the default `vm.max_map_count` (65,530; this host 1,048,576) are
