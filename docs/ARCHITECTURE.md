@@ -24,11 +24,12 @@ written once, with no backend and no fake `Unsupported` arm (D22, D23).
 | `omni-apk` | zip, the extraction cache (§3), manifest, `choose_apk` |
 | `omni-elf` | ELF64 parsing, APS2, `.eh_frame_hdr` function map, the loader (§4) |
 | `omni-cpu` | `GuestCpu` trait; `dynarmic` backend; `native` backend (feature `native-hvf`) (§6) |
-| `dynarmic-sys` | vendored dynarmic `9d45823`, CMake build, C shim, FFI, `patches/` 0001-0028 (no 0023) |
+| `dynarmic-sys` | vendored dynarmic `9d45823`, CMake build, C shim, FFI, `patches/` 0001-0029 (no 0023) |
 | `omni-bionic` | pure libc/libm and pthread logic over a `GuestMemory` trait; zero dependencies (D19) |
 | `omni-android` | the compatibility layer (§5): thunk crossing (`region`, `abi`, `varargs`, `mem`, `boundary`), `bionic`, `jni`, `ndk`, `vulkan`, `gles`, `aaudio`; instruments `perf`, `memreport`, `waits`, `pacing` |
 | `omni-gfx` | host graphics: `GfxVulkanHost`, `GfxGlesHost`, a test `Renderer`, MoltenVK loading |
 | `omni-texture` | ETC1 to RGBA8 (D27), `no_std`; used by `omni-gfx`'s renderer, not the guest path |
+| `omni-linux` | the Linux kernel personality (D39): the arm64 syscall ABI under the real AOSP `linker64` and bionic, a manifest-backed AOSP 15 sysroot (`tools/make_sysroot.py`), `exec`, `mm`, `fd`, `vfs`; runner `omni-linux-run` |
 | `omni-core`, `omni-cli` | empty placeholders |
 | `omnidroid` | launcher binary: `play`, `login`, `which` |
 

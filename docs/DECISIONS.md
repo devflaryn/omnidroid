@@ -749,3 +749,36 @@ multi-instance setup can set `OMNI_JIT_SHARED_CACHE_LIVE_MB=128` and accept the 
 settled-fps loss traced to locked lookups. The initializer gate's flakiness under it was the test's
 (`VERIFICATION.md` entry 22). Evidence: `dynarmic-sys/tests/shared_cache.rs`,
 `crates/dynarmic-sys/tools/mutate_0022.py`, `research/shared-jit-cache.md`, patches README.
+
+## D39 — The real AOSP userspace on a Linux kernel personality (reverses D7)
+
+**Ruling (2026-09-27, the owner).** Any Roblox APK, future versions included, must run without
+omnidroid being updated for it: every `classes*.dex` loaded into the app's class loader and run,
+every `.so` loaded when code asks for it, as on a device. Transcribing the Java side (`jni/surface.rs`,
+`jni/classes.rs`) and emulating bionic function by function are per-version by construction, so
+omnidroid moves down a level: it emulates the **Linux kernel** (`omni-linux`), and the real AOSP 15
+`linker64`, bionic and (sub-project B) ART run unmodified as guest code. Four sub-projects:
+A kernel personality, B ART, C binder and services with Roblox's own `Application` and
+`PathClassLoader`, D Roblox in a world on the new path, then the transcription retired
+(`docs/superpowers/specs/2026-09-27-linux-abi-layer-design.md`). The current Roblox path is
+untouched until D.
+
+**A1, verified on Windows.** The real `toybox echo hello` from the pinned image
+(`arm64-v8a-35_r02.zip`, sysroot manifest sha256 `1a5ceae2...`) runs through the real `linker64`
+and `libc.so` (scudo, `libcrypto`'s self-test) and exits 0; `uname -a` and `ls` too
+(`omni-linux/tests/a1_toybox.rs`, `omni-linux-run`). Only liblog's `socket` to logd is refused.
+
+**What A1 found that the plan did not list.**
+- **Top Byte Ignore.** Android 15's scudo tags every heap pointer (`orr x9, x0, #0x200000000000000`)
+  and bionic adds `0xb4`; arm64 Linux gives user space TBI. `DynarmicOptions::top_byte_ignore`
+  (off by default: the Roblox path keeps D4's 64-bit identity mapping) covers 56 address bits,
+  mirrored, which is dynarmic's `shl`/`shr` mask, and clears the tag on the callback path.
+- **Patch 0029.** dynarmic's x64 `LDAR` was `lock xadd [addr], 0`, which faults on a read-only
+  page and degrades the site for good; bionic's `malloc` reads its write-protected globals that way.
+  Now a plain `mov` (x86 loads are acquire; ordered stores are `xchg`).
+- **Windows filenames.** Seven AOSP ringtones differ only by case, so the sysroot is stored by
+  content (`objects/<sha256>`), with symlinks kept in the manifest.
+
+**Reverses it.** Nothing planned; a sub-project that cannot reach its milestone is reported, not
+worked around with transcription.
+

@@ -4,7 +4,7 @@ What works, per component and per platform. **Verified** means run and observed,
 named; **partial** means built with a named gap; **not started** means no code runs it. Figures
 and run names (w = Windows, m = Mac, l = Linux) come from `HANDOFF.md` and `docs/ports/*.md`.
 
-Last updated: 2026-09-26.
+Last updated: 2026-09-27.
 
 ## The APK
 
@@ -58,6 +58,7 @@ whether Roblox's integrity check passes.
 | Sampling profiler (`OMNI_PERF`) | verified on Windows, Linux x86-64 | macOS arm64 backend built |
 | Multi-instance | partial | one process each works (Windows 3, Mac 4 of 4, Linux 4 before swapping on 7 GiB); per instance ~2.5 GiB and ~0.6 cores capped (H2) against a 0.8-0.9 GiB target |
 | `omni-core`, `omni-cli` | not started | the embedding lives in the gate test (ARCHITECTURE §2) |
+| Linux personality (`omni-linux`, D39) | partial: A1 verified on Windows | the real AOSP 15 `toybox` runs through the real `linker64` and bionic to exit 0 (`tests/a1_toybox.rs`); Linux and macOS not yet run; A2-A5 (procfs, properties, threads, signal delivery) not started |
 
 ## Measured figures decisions rest on
 
