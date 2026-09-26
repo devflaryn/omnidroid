@@ -288,6 +288,12 @@ pub(super) fn page_size() -> usize {
     value as usize
 }
 
+/// XNU enables Top Byte Ignore for user-space data accesses on Apple silicon (measured: a load and
+/// a store through `ptr | 0x02 << 56` reach `ptr`). An Intel Mac has no such bit.
+pub(super) const fn host_ignores_top_byte() -> bool {
+    cfg!(target_arch = "aarch64")
+}
+
 /// There is no separate allocation granularity: `mmap` places a mapping at any page boundary.
 pub(super) fn allocation_granularity() -> usize {
     page_size()

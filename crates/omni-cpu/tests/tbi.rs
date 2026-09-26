@@ -53,13 +53,20 @@ fn with_tbi_a_tagged_pointer_reaches_the_untagged_address() {
     assert_eq!(words, [0x1122_3344_5566_7788, 0xAABB], "both stores landed at the untagged address");
 }
 
+/// Without the option the translator adds no mask (D4's configuration is unchanged), so what a
+/// tagged pointer does is the host MMU's answer: a fault on x86-64, the untagged address where the
+/// host kernel itself enables TBI (arm64 Linux, macOS on Apple silicon).
 #[test]
-fn without_tbi_a_tagged_pointer_still_faults() {
+fn without_tbi_a_tagged_pointer_is_the_host_mmus_business() {
     let guest = Guest::new();
     let entry = guest.load(&program(guest.data as u64 | TAG));
-    let (mut cpu, _sentinel) = guest.thread();
+    let (mut cpu, sentinel) = guest.thread();
     let exit = cpu.run(entry, RunLimit::Unlimited).expect("the program runs");
-    assert!(matches!(exit, ExitReason::MemoryFault { .. }), "D4's configuration is unchanged: {exit}");
+    if omni_platform::vm::host_ignores_top_byte() {
+        assert_eq!(exit, ExitReason::Returned { pc: sentinel }, "the host ignored the tag: {exit}");
+    } else {
+        assert!(matches!(exit, ExitReason::MemoryFault { .. }), "D4's configuration is unchanged: {exit}");
+    }
 }
 
 /// bionic's `malloc` starts with `ldar x8, [__libc_globals + 0x48]`, a load-acquire from a page
