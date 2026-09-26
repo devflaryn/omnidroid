@@ -391,8 +391,29 @@ fn sys_newfstatat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// The guest path an open descriptor names, as `/proc/self/fd/N` reports it.
+fn guest_path_of(file: &OpenFile) -> Vec<u8> {
+    match &*file.kind.lock() {
+        FileKind::Host { guest, .. } => guest.clone(),
+        FileKind::Dir { dir, .. } => dir.path.clone(),
+        FileKind::Dev(DevNode::Null) => b"/dev/null".to_vec(),
+        FileKind::Dev(DevNode::Zero) => b"/dev/zero".to_vec(),
+        FileKind::Dev(DevNode::Random) => b"/dev/random".to_vec(),
+        FileKind::Dev(DevNode::Urandom) => b"/dev/urandom".to_vec(),
+        FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => b"/dev/pts/0".to_vec(),
+    }
+}
+
 fn sys_readlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
+    if let Some(n) = path.strip_prefix(b"/proc/self/fd/") {
+        // The descriptor table is the process's, not the filesystem's: answered here.
+        let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok()).ok_or(ENOENT)?;
+        let target = guest_path_of(&*p.fds.get(fd).map_err(|_| ENOENT)?);
+        let n = target.len().min(a[3] as usize);
+        p.mem.write(a[2], &target[..n])?;
+        return Ok(n as u64);
+    }
     let base = base_dir(p, a[0], &path)?;
     match p.vfs.resolve(&base, &path, false)?.node {
         Node::Symlink { target } => {
@@ -495,6 +516,41 @@ fn sys_getdents64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(out.len() as u64)
 }
 
+/// arm64 `struct statfs` (120 bytes) for an ext4 filesystem: every mount here answers as one.
+fn statfs_bytes() -> [u8; 120] {
+    let mut b = [0u8; 120];
+    let words: [(usize, u64); 8] = [
+        (0, 0xEF53),      // f_type: EXT4_SUPER_MAGIC
+        (8, 4096),        // f_bsize
+        (16, 1 << 20),    // f_blocks
+        (24, 1 << 19),    // f_bfree
+        (32, 1 << 19),    // f_bavail
+        (40, 1 << 20),    // f_files
+        (48, 1 << 19),    // f_ffree
+        (64, 255),        // f_namelen
+    ];
+    for (at, v) in words {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    b[72..80].copy_from_slice(&4096u64.to_le_bytes()); // f_frsize
+    b
+}
+
+fn sys_statfs(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[0])?;
+    if matches!(p.vfs.resolve(&p.cwd.lock(), &path, true)?.node, Node::Missing { .. }) {
+        return Err(ENOENT);
+    }
+    p.mem.write(a[1], &statfs_bytes())?;
+    Ok(0)
+}
+
+fn sys_fstatfs(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    p.fds.get(fd_arg(a[0]))?;
+    p.mem.write(a[1], &statfs_bytes())?;
+    Ok(0)
+}
+
 fn sys_getcwd(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut cwd = p.cwd.lock().clone();
     cwd.push(0);
@@ -525,4 +581,6 @@ pub fn install(table: &mut Table) {
     table.set(nr::DUP3, sys_dup3);
     table.set(nr::GETDENTS64, sys_getdents64);
     table.set(nr::GETCWD, sys_getcwd);
+    table.set(nr::STATFS, sys_statfs);
+    table.set(nr::FSTATFS, sys_fstatfs);
 }

@@ -235,6 +235,17 @@ fn sys_sched_yield(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// Every thread is `SCHED_OTHER` at priority 0; a change of policy or priority is accepted and
+/// has no effect (the host schedules the thread).
+fn sys_sched_zero(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
+    Ok(0)
+}
+
+fn sys_sched_getparam(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    p.mem.write_u32(a[1], 0)?;
+    Ok(0)
+}
+
 fn sys_sysinfo(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut b = [0u8; 112];
     b[..8].copy_from_slice(&p.sys.start.elapsed().as_secs().to_le_bytes()); // uptime
@@ -312,6 +323,10 @@ pub fn install(table: &mut Table) {
     table.set(nr::GETRLIMIT, sys_getrlimit);
     table.set(nr::SCHED_GETAFFINITY, sys_sched_getaffinity);
     table.set(nr::SCHED_YIELD, sys_sched_yield);
+    for n in [nr::SCHED_GETSCHEDULER, nr::SCHED_SETSCHEDULER, nr::SCHED_SETPARAM, nr::SCHED_GET_PRIORITY_MAX, nr::SCHED_GET_PRIORITY_MIN] {
+        table.set(n, sys_sched_zero);
+    }
+    table.set(nr::SCHED_GETPARAM, sys_sched_getparam);
     table.set(nr::SYSINFO, sys_sysinfo);
     table.set(nr::GETRUSAGE, sys_getrusage);
     table.set(nr::FUTEX, sys_futex);

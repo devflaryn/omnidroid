@@ -15,7 +15,8 @@ pub mod sys;
 pub mod syscall;
 pub mod vfs;
 
-pub use process::{Process, Task};
+pub use fd::Output;
+pub use process::{Exit, ExitStatus, Process, SpawnConfig, Task};
 
 /// Every handler this crate implements, installed into `table`.
 pub fn install_all(table: &mut syscall::Table) {

@@ -75,3 +75,13 @@ fn a_futex_wait_with_a_timeout_returns_etimedout() {
     p.mem.write(s + 40, &5_000_000u64.to_le_bytes()).unwrap(); // 5 ms
     assert_eq!(p.syscall(&mut t, nr::FUTEX, [s, 128, 0, s + 32, 0, 0]) as i64, -110, "ETIMEDOUT");
 }
+
+#[test]
+fn the_scheduler_is_sched_other_at_priority_zero() {
+    let (p, mut t, s) = process();
+    assert_eq!(p.syscall(&mut t, nr::SCHED_GETSCHEDULER, [0; 6]), 0, "SCHED_OTHER");
+    p.mem.write_u32(s, 7).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::SCHED_GETPARAM, [0, s, 0, 0, 0, 0]), 0);
+    assert_eq!(p.mem.read(s, 4).unwrap(), [0; 4], "sched_priority 0");
+    assert_eq!(p.syscall(&mut t, nr::SCHED_GET_PRIORITY_MAX, [0; 6]), 0);
+}

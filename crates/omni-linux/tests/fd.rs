@@ -95,3 +95,26 @@ fn readlink_of_proc_self_exe_and_getdents_of_a_directory() {
     assert_eq!(names, [&b"hello.txt"[..], b"link"]);
     assert_eq!(call(&p, &mut t, nr::GETDENTS64, [fd, s + 1024, 2048, 0, 0, 0]), 0, "exhausted");
 }
+
+#[test]
+fn fstatfs_describes_an_ext4_filesystem() {
+    let (p, mut t, s, _) = fixture();
+    p.mem.write(s, b"/system/bin/hello.txt\0").unwrap();
+    let fd = call(&p, &mut t, nr::OPENAT, [(-100i64) as u64, s, 0, 0, 0, 0]) as u64;
+    assert_eq!(call(&p, &mut t, nr::FSTATFS, [fd, s + 256, 0, 0, 0, 0]), 0);
+    assert_eq!(p.mem.read_u64(s + 256).unwrap(), 0xEF53, "f_type EXT4_SUPER_MAGIC");
+    assert_eq!(p.mem.read_u64(s + 264).unwrap(), 4096, "f_bsize");
+    assert_eq!(call(&p, &mut t, nr::STATFS, [s, s + 512, 0, 0, 0, 0]), 0);
+}
+
+#[test]
+fn readlink_of_proc_self_fd_names_the_open_file() {
+    let (p, mut t, s, _) = fixture();
+    p.mem.write(s, b"/system/bin/link\0").unwrap();
+    let fd = call(&p, &mut t, nr::OPENAT, [(-100i64) as u64, s, 0, 0, 0, 0]);
+    p.mem.write(s, format!("/proc/self/fd/{fd}\0").as_bytes()).unwrap();
+    let n = call(&p, &mut t, nr::READLINKAT, [(-100i64) as u64, s, s + 256, 256, 0, 0]);
+    assert_eq!(p.mem.read(s + 256, n as usize).unwrap(), b"/system/bin/hello.txt", "the resolved path");
+    p.mem.write(s, b"/proc/self/fd/99\0").unwrap();
+    assert_eq!(call(&p, &mut t, nr::READLINKAT, [(-100i64) as u64, s, s + 256, 256, 0, 0]), -(ENOENT.0 as i64));
+}
