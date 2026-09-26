@@ -136,7 +136,18 @@ fn on_svc(call: &mut ThunkCall<'_>) {
     let process = Arc::clone(&task.process);
     let result = process.syscall(task, number, args);
     if process.trace {
-        eprintln!("[{}] {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x}", task.tid, name_of(number), args[0], args[1], args[2], args[3], result);
+        // Path-taking calls show their path: what a trace is read for.
+        use crate::syscall::nr;
+        let path_arg = match number {
+            nr::OPENAT | nr::NEWFSTATAT | nr::FACCESSAT | nr::FACCESSAT2 | nr::READLINKAT | nr::MKDIRAT
+            | nr::UNLINKAT | nr::FCHMODAT | nr::FCHOWNAT | nr::STATX => Some(args[1]),
+            nr::STATFS | nr::CHDIR => Some(args[0]),
+            _ => None,
+        };
+        let path = path_arg
+            .and_then(|a| process.mem.read_cstr(a, 4096).ok())
+            .map_or_else(String::new, |p| format!(" \"{}\"", String::from_utf8_lossy(&p)));
+        eprintln!("[{}] {}({:#x}, {:#x}, {:#x}, {:#x}){path} = {:#x}", task.tid, name_of(number), args[0], args[1], args[2], args[3], result);
     }
     call.set_x(0, result);
     let deliverable = task.pending.load(std::sync::atomic::Ordering::SeqCst) & !task.sigmask != 0;

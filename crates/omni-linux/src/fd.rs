@@ -554,6 +554,85 @@ fn sys_getdents64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(out.len() as u64)
 }
 
+/// The host path a mutating call acts on, on a writable mount; the sysroot and the generated trees
+/// are read-only.
+fn writable_host(p: &Process, dirfd: u64, path: &[u8], follow: bool) -> Result<(Node, std::path::PathBuf), Errno> {
+    let base = base_dir(p, dirfd, path)?;
+    let r = p.vfs.resolve(&base, path, follow)?;
+    let host = match &r.node {
+        Node::HostFile { host } | Node::HostDir { host } | Node::Missing { host: Some(host), .. } => host.clone(),
+        Node::Missing { host: None, parent_is_dir: true } => return Err(EROFS),
+        Node::Missing { .. } => return Err(ENOENT),
+        _ => return Err(EROFS),
+    };
+    Ok((r.node, host))
+}
+
+fn sys_mkdirat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[1])?;
+    let base = base_dir(p, a[0], &path)?;
+    match p.vfs.resolve(&base, &path, false)?.node {
+        Node::Missing { host: Some(host), parent_is_dir: true } => std::fs::create_dir(&host).map(|()| 0).map_err(|_| EACCES),
+        Node::Missing { host: None, parent_is_dir: true } => Err(EROFS),
+        Node::Missing { .. } => Err(ENOENT),
+        _ => Err(EEXIST),
+    }
+}
+
+fn sys_unlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const AT_REMOVEDIR: u64 = 0x200;
+    let path = path_arg(p, a[1])?;
+    let (node, host) = writable_host(p, a[0], &path, false)?;
+    match (node, a[2] & AT_REMOVEDIR != 0) {
+        (Node::Missing { .. }, _) => Err(ENOENT),
+        (Node::HostDir { .. }, false) => Err(EISDIR),
+        (Node::HostDir { .. }, true) => std::fs::remove_dir(&host).map(|()| 0).map_err(|e| {
+            if std::fs::read_dir(&host).is_ok_and(|mut d| d.next().is_some()) { ENOTEMPTY } else { let _ = e; EACCES }
+        }),
+        (_, true) => Err(ENOTDIR),
+        (_, false) => std::fs::remove_file(&host).map(|()| 0).map_err(|_| EACCES),
+    }
+}
+
+/// `renameat`/`renameat2` (flags 0 only) within the writable mounts.
+fn sys_renameat2(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    if a[4] != 0 {
+        p.refusals.record(format!("renameat2 flags {:#x}", a[4]), t.pc, t.lr);
+        return Err(EINVAL);
+    }
+    let (from_path, to_path) = (path_arg(p, a[1])?, path_arg(p, a[3])?);
+    let (from_node, from) = writable_host(p, a[0], &from_path, false)?;
+    if matches!(from_node, Node::Missing { .. }) {
+        return Err(ENOENT);
+    }
+    let (_, to) = writable_host(p, a[2], &to_path, false)?;
+    std::fs::rename(&from, &to).map(|()| 0).map_err(|_| EACCES)
+}
+
+fn sys_renameat(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    sys_renameat2(p, t, [a[0], a[1], a[2], a[3], 0, 0])
+}
+
+fn sys_ftruncate(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
+        FileKind::Host { file, sysroot: false, .. } => file.set_len(a[1]).map(|()| 0).map_err(|_| EINVAL),
+        FileKind::Host { .. } | FileKind::Synth { .. } => Err(EROFS),
+        _ => Err(EINVAL),
+    }
+}
+
+fn sys_fsync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    if let FileKind::Host { file, sysroot: false, .. } = &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
+        file.sync_data().map_err(|_| EIO)?;
+    }
+    Ok(0)
+}
+
+/// `utimensat`: timestamps are accepted and not kept (nothing here reads them back as set).
+fn sys_utimensat(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
+    Ok(0)
+}
+
 /// `fchmod`/`fchown`: a mode or owner the host cannot hold (Windows has neither), so a writable
 /// file accepts it and keeps nothing; the sysroot is read-only.
 fn sys_fchmod(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -640,6 +719,14 @@ pub fn install(table: &mut Table) {
     table.set(nr::GETDENTS64, sys_getdents64);
     table.set(nr::GETCWD, sys_getcwd);
     table.set(nr::STATFS, sys_statfs);
+    table.set(nr::MKDIRAT, sys_mkdirat);
+    table.set(nr::UNLINKAT, sys_unlinkat);
+    table.set(nr::RENAMEAT, sys_renameat);
+    table.set(nr::RENAMEAT2, sys_renameat2);
+    table.set(nr::FTRUNCATE, sys_ftruncate);
+    table.set(nr::FSYNC, sys_fsync);
+    table.set(nr::FDATASYNC, sys_fsync);
+    table.set(nr::UTIMENSAT, sys_utimensat);
     table.set(nr::FCHMOD, sys_fchmod);
     table.set(nr::FCHOWN, sys_fchmod);
     table.set(nr::FCHMODAT, sys_fchmodat);
