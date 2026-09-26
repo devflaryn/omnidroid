@@ -1529,6 +1529,28 @@ impl Bionic {
         self.sysconf_unknown.lock().clone()
     }
 
+    /// [`Bionic::sysconf_unknown_names`] as one report line, each name with what it is **believed**
+    /// to be where this layer has an opinion.
+    ///
+    /// The names are the record; the beliefs are only there so the next reader has somewhere to
+    /// start, and nothing branches on them.
+    #[must_use]
+    pub fn sysconf_unknown_report(&self) -> String {
+        let names = self.sysconf_unknown_names();
+        if names.is_empty() {
+            return "none".to_string();
+        }
+        names
+            .into_iter()
+            .map(|(name, count)| {
+                let believed = procenv::believed_sysconf_name(name)
+                    .map_or_else(|| "no name this layer recognises".to_string(), |text| format!("{text}"));
+                format!("{name} (x{count}, {believed})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Apply `how`/`set` to a guest thread's blocked-signal mask and return what it was.
     ///
     /// `how` is `SIG_BLOCK`, `SIG_UNBLOCK` or `SIG_SETMASK`; `set` is `None` for a query.

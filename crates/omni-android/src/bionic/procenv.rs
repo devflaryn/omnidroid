@@ -790,12 +790,14 @@ const SC_PHYS_PAGES: i32 = 0x0062;
 /// bionic's `_SC_OPEN_MAX`.
 const SC_OPEN_MAX: i32 = 0x000b;
 
-/// What a `sysconf` name is believed to be, for the refusal's diagnostic half.
+/// What a `sysconf` name is believed to be, for a diagnostic.
 ///
-/// The four this layer answers are named as constants above. The rest are here so a refusal can
-/// say what the number it was given is *believed* to be and give whoever reads it somewhere to
-/// start; nothing branches on the text.
-fn believed_sysconf_name(name: i32) -> Option<&'static str> {
+/// The four this layer answers are named as constants above. The rest are here so a report can say
+/// what a number it could not answer is *believed* to be and give whoever reads it somewhere to
+/// start; nothing branches on the text. **It became a report rather than a refusal's message on
+/// 2026-09-26**, when the unknown-name arm started answering `-1`/`EINVAL` instead of refusing --
+/// which is what left this table with no reader.
+pub(crate) fn believed_sysconf_name(name: i32) -> Option<&'static str> {
     Some(match name {
         0x0006 => "_SC_CLK_TCK",
         SC_OPEN_MAX => "_SC_OPEN_MAX",
