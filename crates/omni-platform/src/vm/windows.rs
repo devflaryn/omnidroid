@@ -457,6 +457,12 @@ pub(super) fn allocation_granularity() -> usize {
     system_info().dwAllocationGranularity as usize
 }
 
+/// x86-64 has no Top Byte Ignore. Windows on arm64 is not a host Omnidroid claims, so nothing is
+/// claimed for it either: `false` is the answer that keeps a tagged pointer a fault.
+pub(super) const fn host_ignores_top_byte() -> bool {
+    false
+}
+
 /// Reserve address space, optionally at an alignment above the allocation granularity.
 ///
 /// Alignments up to `dwAllocationGranularity` come for free, because a reservation base is

@@ -449,6 +449,19 @@ pub fn page_size() -> usize {
     backend::page_size()
 }
 
+/// Whether this host's MMU ignores bits 56-63 of a user-space data address: arm64's Top Byte
+/// Ignore (`TCR_EL1.TBI0`), which the kernel chooses to enable or not.
+///
+/// It decides what a tagged guest pointer does under D4's identity mapping when the translator
+/// does not mask it (`DynarmicOptions::top_byte_ignore` off): where this is `false` the access
+/// faults, where it is `true` the host's own hardware reaches the untagged address. True on arm64
+/// Linux (the kernel's tagged-address ABI) and on macOS on Apple silicon (measured: a load and a
+/// store through `ptr | 0x02 << 56` reach `ptr`); false on x86-64, which has no such bit.
+#[must_use]
+pub fn host_ignores_top_byte() -> bool {
+    backend::host_ignores_top_byte()
+}
+
 /// Granularity that reservation *base addresses* are rounded to. 65536 on Windows.
 ///
 /// Almost nothing else is constrained by it: commit, protect, decommit, placeholder splits and

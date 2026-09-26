@@ -113,6 +113,12 @@ pub(super) fn page_size() -> usize {
     page
 }
 
+/// arm64 Linux enables Top Byte Ignore for user space (the tagged-address ABI,
+/// `Documentation/arch/arm64/tagged-pointers.rst`); x86-64 has no such bit.
+pub(super) const fn host_ignores_top_byte() -> bool {
+    cfg!(target_arch = "aarch64")
+}
+
 /// There is no separate reservation granularity on Linux: a mapping's base is page-aligned.
 pub(super) fn allocation_granularity() -> usize {
     page_size()

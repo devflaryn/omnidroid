@@ -184,3 +184,20 @@ fn structural_backends_report_unsupported() {
     assert!(vm::process_commit_charge().unwrap_err().is_unsupported());
     assert!(vm::process_working_set().unwrap_err().is_unsupported());
 }
+
+#[test]
+fn where_the_host_ignores_the_top_byte_a_tagged_pointer_reaches_the_untagged_address() {
+    // Only the `true` side can be exercised: where it is `false` the access below is a host fault.
+    if !vm::host_ignores_top_byte() {
+        return;
+    }
+    let mut word: u64 = 42;
+    let tagged = ((&raw mut word) as usize | (0x02 << 56)) as *mut u64;
+    // SAFETY: the host's MMU ignores bits 56-63 (the branch above), so `tagged` addresses `word`,
+    // which lives on this stack frame for the whole block.
+    unsafe {
+        assert_eq!(tagged.read_volatile(), 42);
+        tagged.write_volatile(7);
+    }
+    assert_eq!(std::hint::black_box(word), 7);
+}
