@@ -116,8 +116,11 @@ pub enum Node {
     HostDir { host: PathBuf },
     Symlink { target: Vec<u8> },
     Dev(DevNode),
-    /// A regular file whose bytes are generated when it is opened (`/proc`, `/sys`).
+    /// A regular file whose bytes are generated when it is opened (`/proc`, `/sys`); size 0.
     Generated,
+    /// An in-memory file of a fixed size (`/dev/__properties__/*`): stat reports the size, and it
+    /// can be mapped (as a private copy).
+    Blob { size: u64 },
     /// The final component does not exist. `host` is where it would be created, on a writable mount.
     Missing { parent_is_dir: bool, host: Option<PathBuf> },
 }
@@ -182,7 +185,7 @@ pub struct Vfs {
 }
 
 fn is_generated_tree(path: &[u8]) -> bool {
-    [&b"/proc"[..], b"/sys"].iter().any(|root| path == *root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/')))
+    [&b"/proc"[..], b"/sys", b"/dev/__properties__"].iter().any(|root| path == *root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/')))
 }
 
 fn join(components: &[Vec<u8>]) -> Vec<u8> {
@@ -340,7 +343,7 @@ impl Vfs {
                 let mut out = Vec::new();
                 let synthetic: &[&[u8]] = match dir.path.as_slice() {
                     b"/" => &[b"dev", b"proc", b"data", b"tmp"],
-                    b"/dev" => &[b"null", b"zero", b"random", b"urandom"],
+                    b"/dev" => &[b"null", b"zero", b"random", b"urandom", b"__properties__"],
                     b"/proc" => &[b"self"],
                     b"/proc/self" => &[b"exe"],
                     _ => &[],

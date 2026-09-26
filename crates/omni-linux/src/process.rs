@@ -54,6 +54,8 @@ pub struct Process {
     pub argv: Vec<Vec<u8>>,
     /// The main thread's name (`/proc/<pid>/comm`): argv[0]'s basename until `PR_SET_NAME`.
     pub comm: Mutex<Vec<u8>>,
+    /// `/dev/__properties__`: property_info, properties_serial and the one context's area (A3).
+    pub props: crate::procfs::PropFiles,
     backend: Option<DynarmicBackend>,
     start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
@@ -128,6 +130,12 @@ impl Process {
     fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<DynarmicBackend>, scratch: u64) -> Arc<Self> {
         let mut table = Table::new();
         crate::install_all(&mut table);
+        let (properties, dropped) = crate::props::Properties::from_sysroot(vfs.sysroot());
+        let props = crate::procfs::PropFiles {
+            info: crate::props::property_info_bytes(),
+            serial: crate::props::serial_area_bytes(),
+            area: properties.area_bytes(),
+        };
         let comm = argv.first().map_or_else(Vec::new, |a| {
             a.rsplit(|&b| b == b'/').next().unwrap_or(a).iter().copied().take(15).collect()
         });
@@ -143,6 +151,7 @@ impl Process {
             trace,
             argv,
             comm: Mutex::new(comm),
+            props,
             backend,
             start: Mutex::new(None),
             exit: Mutex::new(None),
@@ -151,6 +160,9 @@ impl Process {
         // `/proc` and `/sys` are generated from the process itself (`procfs`).
         let proc: Arc<dyn crate::procfs::ProcFs> = Arc::clone(&p) as Arc<dyn crate::procfs::ProcFs>;
         p.vfs.attach_proc(Arc::downgrade(&proc));
+        for name in dropped {
+            p.refusals.record(format!("property dropped (too long for its kind): {name}"), 0, 0);
+        }
         p
     }
 

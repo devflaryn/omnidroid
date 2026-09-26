@@ -191,6 +191,24 @@ impl Mm {
                 .map_err(|_| refused_fixed(ENOMEM));
         }
         let file = p.fds.get(req.fd)?;
+        if let FileKind::Synth { data, guest, .. } = &*file.kind.lock() {
+            // An in-memory file (`/dev/__properties__`): a private copy, read-only in effect.
+            if req.flags & MAP_SHARED != 0 && req.prot & PROT_WRITE != 0 {
+                return Err(EACCES);
+            }
+            let at = self
+                .space
+                .map_anonymous(placement, len as usize, Protection::ReadWrite, CommitPolicy::Lazy)
+                .map_err(|_| refused_fixed(ENOMEM))? as u64;
+            let from = (req.offset as usize).min(data.len());
+            let n = (len as usize).min(data.len() - from);
+            p.mem.write(at, &data[from..from + n])?;
+            if prot != Protection::ReadWrite {
+                self.space.protect(at as usize, len as usize, prot).map_err(|_| ENOMEM)?;
+            }
+            self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
+            return Ok(at);
+        }
         let (guest, sysroot, file_len) = match &*file.kind.lock() {
             FileKind::Host { file, guest, sysroot } => {
                 (guest.clone(), *sysroot, file.metadata().map_err(|_| EIO)?.len())

@@ -41,7 +41,7 @@ pub enum FileKind {
     Stdout(Output),
     Stderr(Output),
     /// A generated file (`/proc`, `/sys`): its bytes, taken when it was opened.
-    Synth { data: Vec<u8>, guest: Vec<u8>, pos: usize },
+    Synth { data: Vec<u8>, guest: Vec<u8>, pos: usize, sized: bool },
 }
 
 pub struct OpenFile {
@@ -143,12 +143,13 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
         Node::Dev(d) => FileKind::Dev(d),
-        Node::Generated => {
+        Node::Generated | Node::Blob { .. } => {
             if write {
                 return Err(EACCES);
             }
             let data = vfs.read_generated(&r.path).ok_or(ENOENT)?;
-            FileKind::Synth { data, guest: r.path.clone(), pos: 0 }
+            let sized = matches!(r.node, Node::Blob { .. });
+            FileKind::Synth { data, guest: r.path.clone(), pos: 0, sized }
         }
         Node::Symlink { .. } => return Err(ELOOP), // O_NOFOLLOW on a link
     };
@@ -195,6 +196,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::HostFile { host } => s(S_IFREG | 0o600, std::fs::metadata(host).map_err(|_| EIO)?.len() as i64),
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
+        Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
         Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109 }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
@@ -215,6 +217,9 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Dev(d) => stat_node(&Resolved { path: b"/dev/null".to_vec(), node: Node::Dev(*d) }),
         FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => {
             Ok(Stat { ino: 1, mode: S_IFCHR | 0o620, nlink: 1, rdev: 0x8800, ..Stat::default() })
+        }
+        FileKind::Synth { guest, data, sized: true, .. } => {
+            stat_node(&Resolved { path: guest.clone(), node: Node::Blob { size: data.len() as u64 } })
         }
         FileKind::Synth { guest, .. } => stat_node(&Resolved { path: guest.clone(), node: Node::Generated }),
     }

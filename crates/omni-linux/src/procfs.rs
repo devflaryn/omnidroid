@@ -20,6 +20,13 @@ pub trait ProcFs: Send + Sync {
     fn read(&self, path: &[u8]) -> Option<Vec<u8>>;
 }
 
+/// `/dev/__properties__`'s three files, built once when the process is.
+pub struct PropFiles {
+    pub info: Vec<u8>,
+    pub serial: Vec<u8>,
+    pub area: Vec<u8>,
+}
+
 /// What a path under `/proc` or `/sys` names.
 enum Entry {
     Dir(Vec<(&'static str, u8)>),
@@ -214,7 +221,25 @@ fn cpu_range(_p: &Process) -> Vec<u8> {
 }
 
 impl Process {
+    /// A `/dev/__properties__` file.
+    fn blob(&self, path: &[u8]) -> Option<&[u8]> {
+        let name = path.strip_prefix(b"/dev/__properties__/")?;
+        match name {
+            b"property_info" => Some(&self.props.info),
+            b"properties_serial" => Some(&self.props.serial),
+            _ if name == crate::props::CONTEXT.as_bytes() => Some(&self.props.area),
+            _ => None,
+        }
+    }
+
     fn entry(&self, path: &[u8]) -> Option<Entry> {
+        if path == b"/dev/__properties__" {
+            return Some(Entry::DynDir(vec![
+                ("property_info".to_string(), DT_REG),
+                ("properties_serial".to_string(), DT_REG),
+                (crate::props::CONTEXT.to_string(), DT_REG),
+            ]));
+        }
         let pid = self.sys.pid.to_string();
         let path = std::str::from_utf8(path).ok()?;
         match path {
@@ -315,6 +340,9 @@ impl Process {
 
 impl ProcFs for Process {
     fn node(&self, path: &[u8]) -> Option<Node> {
+        if let Some(blob) = self.blob(path) {
+            return Some(Node::Blob { size: blob.len() as u64 });
+        }
         Some(match self.entry(path)? {
             Entry::Dir(_) | Entry::DynDir(_) => Node::Dir,
             Entry::File(_) => Node::Generated,
@@ -337,6 +365,9 @@ impl ProcFs for Process {
     }
 
     fn read(&self, path: &[u8]) -> Option<Vec<u8>> {
+        if let Some(blob) = self.blob(path) {
+            return Some(blob.to_vec());
+        }
         match self.entry(path)? {
             Entry::File(generate) => Some(generate(self)),
             _ => None,
