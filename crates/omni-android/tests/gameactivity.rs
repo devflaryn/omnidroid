@@ -4779,6 +4779,14 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
                 translated.unwrap_or_default(),
                 descriptors
             );
+            // The engine's own GPU timer, as the driver answered it (headless mode's evidence).
+            if let Some((ticks, frames)) = guest.vulkan.as_ref().and_then(|v| v.gpu_timer_window()) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "GPU TIMER: {frames} frames read, mean {ticks} ticks (ns at a 1 ns timestampPeriod) of GPU per frame{}",
+                    if guest.vulkan.as_ref().is_some_and(|v| v.headless()) { ", headless" } else { "" }
+                );
+            }
             // Headless mode, while it is on: what it has dropped.
             if guest.vulkan.as_ref().is_some_and(|v| v.headless()) || guest.gles.headless() {
                 let status = match &guest.vulkan {

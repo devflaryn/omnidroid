@@ -45,6 +45,9 @@ struct Maps {
     latched: HashMap<u64, bool>,
     /// The last real frame's GPU time, in timestamp ticks.
     gpu_ticks: Option<u64>,
+    /// The driver's own readings since [`VulkanHeadless::gpu_window`]: (sum of ticks, frames) --
+    /// what the GPU really spent, before any answer is rewritten.
+    window: (u64, u64),
 }
 
 impl VulkanHeadless {
@@ -124,6 +127,14 @@ impl VulkanHeadless {
         dropped
     }
 
+    /// The engine's GPU timer as the driver answered it since the last call: (mean ticks per
+    /// frame, frames), and the window starts again. `None` when it was not read.
+    pub fn gpu_window(&self) -> Option<(u64, u64)> {
+        let mut maps = self.maps.lock();
+        let (sum, frames) = core::mem::take(&mut maps.window);
+        (frames > 0).then(|| (sum / frames, frames))
+    }
+
     /// A command buffer was freed.
     pub(super) fn buffer_freed(&self, buffer: u64) {
         let mut maps = self.maps.lock();
@@ -141,6 +152,10 @@ impl VulkanHeadless {
         let first = u64::from_le_bytes(data[..8].try_into().expect("eight"));
         let second = u64::from_le_bytes(data[stride..stride + 8].try_into().expect("eight"));
         let mut maps = self.maps.lock();
+        if second >= first {
+            maps.window.0 += second - first;
+            maps.window.1 += 1;
+        }
         if self.switch.is_on() {
             if let Some(ticks) = maps.gpu_ticks {
                 data[stride..stride + 8].copy_from_slice(&first.wrapping_add(ticks).to_le_bytes());
@@ -192,5 +207,7 @@ mod tests {
         let mut idle = pair(5000, 5010);
         headless.gpu_timer(&mut idle, 8);
         assert_eq!(idle, pair(5000, 5700));
+        assert_eq!(headless.gpu_window(), Some((355, 2)), "what the driver said: 700 and 10 ticks");
+        assert_eq!(headless.gpu_window(), None, "and the window starts again");
     }
 }

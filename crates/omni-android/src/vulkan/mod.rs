@@ -1888,6 +1888,15 @@ impl Vulkan {
         self.headless.switch.status()
     }
 
+    /// **The engine's own GPU timer** (its two-timestamp `gpuTimeQueryPool` read), as the driver
+    /// answered it since the previous call: (mean timestamp ticks per frame, frames read). What the
+    /// GPU really spent on a frame, headless or not -- the evidence for what headless mode saves.
+    /// `None` when the engine read none.
+    #[must_use]
+    pub fn gpu_timer_window(&self) -> Option<(u64, u64)> {
+        self.headless.gpu_window()
+    }
+
     /// **While `withheld`, every `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` answers
     /// `VK_ERROR_SURFACE_LOST_KHR` without asking the driver** -- what Android's own loader answers
     /// for a surface whose window is gone (AOSP `swapchain.cpp`, a `DEAD_OBJECT` from the window).
