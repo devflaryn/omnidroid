@@ -74,6 +74,10 @@ pub fn load_elf(p: &Process, t: &Task, path: &[u8]) -> Result<LoadedElf, Errno> 
         let prot = (if s.p_flags.bits() & 4 != 0 { PROT_READ } else { 0 })
             | (if s.p_flags.bits() & 2 != 0 { PROT_WRITE } else { 0 })
             | (if s.p_flags.bits() & 1 != 0 { PROT_EXEC } else { 0 });
+        if s.p_offset % page != s.p_vaddr % page {
+            // Aligned below the page: no view of the file puts `p_offset` at `p_vaddr`.
+            return Err(EINVAL);
+        }
         let start = floor(s.p_vaddr);
         let file_end = s.p_vaddr + s.p_filesz;
         let mapped = ceil(file_end) - start;
