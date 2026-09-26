@@ -2052,6 +2052,13 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // delivery here and each of them has a believable wrong answer that would not be observable
     // until much later. `signals`' module documentation has the table.
     ("sigfillset", signals::sigfillset),
+    // The set manipulators, 2026-09-26: total functions of one guest word, implemented in
+    // `omni_bionic::signal` beside `sigfillset`. MEASURED need: the worker thread this build's
+    // entry starts calls `sigemptyset` in its C-runtime start-up.
+    ("sigemptyset", signals::sigemptyset),
+    ("sigaddset", signals::sigaddset),
+    ("sigdelset", signals::sigdelset),
+    ("sigismember", signals::sigismember),
     ("sigaction", signals::sigaction),
     // 2026-09-26: the older spelling, under the same rule — answered only for the dispositions
     // that promise no delivery. MEASURED need: a substituted build of the APK's compression

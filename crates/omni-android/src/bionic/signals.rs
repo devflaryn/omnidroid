@@ -56,12 +56,14 @@
 //! set and then a refusal naming the symbol, rather than a correctly filled set and a lie.
 
 use omni_bionic::context::GuestContext;
+use omni_bionic::memory::Fault;
 use omni_bionic::signal;
 
 use crate::boundary::ImportCall;
 use crate::error::{AbiError, AbiResult};
 use crate::mem::Blame;
 
+use super::view::GuestView;
 use super::{active, enter};
 
 // ------------------------------------------------------------------ the guest's constants
@@ -93,6 +95,106 @@ fn refuse(c: &ImportCall<'_, '_>, why: String) -> AbiError {
 }
 
 // ================================================================== the one that is answered
+
+/// `int sigemptyset(sigset_t *set)`, `sigaddset`, `sigdelset` and `sigismember` — the four set
+/// manipulators, bound 2026-09-26.
+///
+/// **They are total functions of one guest word**, with no table, no mask and no delivery behind
+/// them, which is why [`omni_bionic::signal`] implements them (D19) and this is only the ABI edge.
+/// `sigfillset` was already answered on exactly this reasoning; these are its neighbours.
+///
+/// MEASURED need: a substituted build of the APK's compression library's **entry starts a worker
+/// thread**, and that thread's C-runtime start-up calls `sigemptyset` — the thread-failure
+/// assertion named it. Nothing about it is that build's own doing.
+///
+/// All four share one body, because they differ only in what they do with a bit, and the bit is
+/// `signo - 1` (POSIX numbers signals from 1; the kernel's set is zero-based). `sigismember` reads
+/// rather than writes and answers a truth value rather than 0.
+pub(super) fn sigemptyset(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    set_call(c, |mem, set| signal::emptyset(mem, set))
+}
+
+/// `int sigaddset(sigset_t *set, int signo)`
+pub(super) fn sigaddset(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    two_args(c, |mem, set, signo| signal::addset(mem, set, signo))
+}
+
+/// `int sigdelset(sigset_t *set, int signo)`
+pub(super) fn sigdelset(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    two_args(c, |mem, set, signo| signal::delset(mem, set, signo))
+}
+
+/// `int sigismember(const sigset_t *set, int signo)`
+pub(super) fn sigismember(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (set, signo) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let mut view = enter(c, &state);
+    match signal::ismember(&view, set, signo) {
+        Ok(Ok(member)) => {
+            drop(view);
+            c.ret().i32(i32::from(member));
+        }
+        Ok(Err(errno)) => {
+            view.set_errno(errno);
+            drop(view);
+            c.ret().i32(-1);
+        }
+        Err(fault) => return Err(view.fault(fault)),
+    }
+    Ok(())
+}
+
+/// `(sigset_t *)` in, one result out: `0`, or `-1` with `errno`.
+fn set_call(
+    c: &mut ImportCall<'_, '_>,
+    f: fn(&mut GuestView<'_>, u64) -> Result<Result<(), i32>, Fault>,
+) -> AbiResult<()> {
+    let set = c.args().next_u64()?;
+    let state = active(c.symbol(), c.address())?;
+    let mut view = enter(c, &state);
+    match f(&mut view, set) {
+        Ok(Ok(())) => {
+            drop(view);
+            c.ret().i32(0);
+        }
+        Ok(Err(errno)) => {
+            view.set_errno(errno);
+            drop(view);
+            c.ret().i32(-1);
+        }
+        Err(fault) => return Err(view.fault(fault)),
+    }
+    Ok(())
+}
+
+/// `(sigset_t *, int)` in, one result out — the same shape, with the signal number.
+fn two_args(
+    c: &mut ImportCall<'_, '_>,
+    f: fn(&mut GuestView<'_>, u64, i32) -> Result<Result<(), i32>, Fault>,
+) -> AbiResult<()> {
+    let (set, signo) = {
+        let mut a = c.args();
+        (a.next_u64()?, a.next_i32()?)
+    };
+    let state = active(c.symbol(), c.address())?;
+    let mut view = enter(c, &state);
+    match f(&mut view, set, signo) {
+        Ok(Ok(())) => {
+            drop(view);
+            c.ret().i32(0);
+        }
+        Ok(Err(errno)) => {
+            view.set_errno(errno);
+            drop(view);
+            c.ret().i32(-1);
+        }
+        Err(fault) => return Err(view.fault(fault)),
+    }
+    Ok(())
+}
 
 /// `int sigfillset(sigset_t *set)`
 ///

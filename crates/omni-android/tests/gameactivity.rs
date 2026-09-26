@@ -169,6 +169,15 @@ const PER_INITIALIZER: RunLimit = RunLimit::Instructions(200_000_000);
 /// Guest instructions `JNI_OnLoad` is allowed.
 const ON_LOAD_BUDGET: RunLimit = RunLimit::Instructions(200_000_000);
 
+/// Guest instructions the second library's **entry** is allowed -- the one native its Java side
+/// calls after `JNI_OnLoad` returns, with an Activity.
+///
+/// **Larger than [`ON_LOAD_BUDGET`] because on a device this call does the work of a whole app
+/// start**: it sets up its own state, starts threads, and reaches Roblox's engine for the job
+/// scheduler. A budget that reported `StepLimitReached` would be a fact about the budget and never
+/// about the guest, so this one is generous enough that reaching it would mean something.
+const ENTRY_BUDGET: RunLimit = RunLimit::Instructions(2_000_000_000);
+
 /// Guest instructions **step 13** is allowed.
 ///
 /// Larger than the others because this one call is the whole GameActivity constructor, the app
@@ -5792,12 +5801,35 @@ fn initialize_native_code_returns_a_native_code_and_the_game_thread_starts() {
     // carried on. Anything else missed still fails, by membership rather than by count.
     const TIER_X: &[(&str, &str)] =
         &[("java/lang/ClassLoader.findClass", "com/roblox/platform/util/DeviceUtils")];
+    // **A miss that has since been declared is not a miss any more.** MEASURED 2026-09-26: a
+    // substituted build of the APK's compression library registers seven natives on classes this
+    // registry had never heard of, and `RegisterNatives` answered null for each while **keeping
+    // every function pointer** -- so the members can be declared straight afterwards (the boot
+    // does, through `Jni::declare_registered_natives`). The miss log is append-only, so those six
+    // entries stay in it forever and counting them would be counting a moment rather than a state.
+    //
+    // So the question this asks is the one that matters: **is every recorded miss still
+    // unresolvable?** A member declared since is resolved; one that is not is the Tier 0 abort
+    // predictor this assertion exists for, and it still fails. Membership, not a count.
     let misses: Vec<_> = guest
         .jni
         .misses()
         .into_iter()
         .filter(|miss| {
             !TIER_X.iter().any(|(function, class)| miss.function == *function && miss.class == *class)
+        })
+        .filter(|miss| {
+            // Resolved since it was recorded? Then it is not an open miss. Both spellings are
+            // tried because `RegisterNatives` does not say which one a native is, and this
+            // declares it both ways.
+            !guest.jni.with_registry(|registry| {
+                registry.find(&miss.class).is_some_and(|class| {
+                    registry.declared_method(class, &miss.member, &miss.descriptor, true).is_some()
+                        || registry
+                            .declared_method(class, &miss.member, &miss.descriptor, false)
+                            .is_some()
+                })
+            })
         })
         .collect();
     assert!(
@@ -6573,6 +6605,123 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
         );
     }
 
+    // **The members those registrations named, declared with the pointers the guest bound.**
+    //
+    // MEASURED why: with memberless shells the registration resolved nothing, so the layer recorded
+    // six misses and the gate's "no JNI misses" assertion failed on them. Those six are this
+    // library's *own* registrations, so the fix is not to relax the assertion but to finish what
+    // `RegisterNatives` deferred: it kept each function pointer precisely so the member could be
+    // declared afterwards. That is what makes the other direction work — the payload's Java code
+    // calling these natives back — which is the half a device gets from its dex for free.
+    let declared_members = guest.jni.declare_registered_natives(registrations_before);
+    if declared_members > 0 {
+        let _ = writeln!(
+            out,
+            "PAYLOAD NATIVE MEMBERS: declared {declared_members} member(s) the registration named, \
+             each with the function pointer the guest bound"
+        );
+    }
+
+    // ---- the entry, at the point a device's Java side calls it -----------------------------
+    //
+    // **Where this is.** On a device the sequence is: the Java side loads the library, which runs
+    // its constructors and `JNI_OnLoad`, and then calls one native on the class that loaded it,
+    // passing the Activity. That is §8 step 8's caller (`ActivitySplash.onCreate`) — which is
+    // where this whole boot runs — so the call belongs here and not later, and not at the end of
+    // the session.
+    //
+    // **Which native is the entry, decided structurally.** Not by a name this project was told: it
+    // is the registration whose descriptor takes an `Activity` — the one argument a loader hands
+    // the thing it was loading for. MEASURED on this build: exactly one of the seven matches, and
+    // it is the one the analysis of the APK names. Zero or several would be reported and *not*
+    // called, because picking one of several is the guess this project refuses to make.
+    let entry = {
+        let takes_an_activity = |descriptor: &str| descriptor.contains("Landroid/app/Activity;");
+        let found: Vec<_> = mine.iter().filter(|r| takes_an_activity(&r.descriptor)).collect();
+        let _ = writeln!(
+            out,
+            "PAYLOAD ENTRY: {} of this build's {} registered natives take an Activity{}",
+            found.len(),
+            mine.len(),
+            if found.is_empty() {
+                " — nothing to call, and that is reported rather than worked around"
+            } else {
+                ""
+            }
+        );
+        match found.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    };
+    if let Some(entry) = entry {
+        // **The Activity argument.** The descriptor wants `android.app.Activity`, and this
+        // registry declares no such class; what it does declare is
+        // `com/roblox/client/startup/MainGameActivity`, which the class table makes a subclass of
+        // `GameActivity` and then of `android/content/Context` — so the members a loader reaches
+        // for on a Context resolve, and a member lookup on anything else is recorded as a miss and
+        // named below. It is the app's own activity class, which is the closest thing this runtime
+        // has to the object a device would hand it.
+        const ACTIVITY: &str = "com/roblox/client/startup/MainGameActivity";
+        let activity = guest.jni.new_object(ACTIVITY).expect("an object to hand the entry");
+        let class = guest
+            .jni
+            .class_reference(&entry.class)
+            .expect("a jclass for the entry's own class");
+        // **A `jclass`, not a `jobject`: the native is static.** JNI's `RegisterNatives` does not
+        // say -- the dex does, and the Java side that loads this library calls it as
+        // `Class.method(activity)`. MEASURED either way by the run: if the guest treats this
+        // second argument as an instance, the first thing it does with it is named in the misses
+        // or in the fault below.
+        let args = [
+            GuestArg::Pointer(guest.jni.env_for(0)),
+            GuestArg::Int(class),
+            GuestArg::Int(activity),
+        ];
+        let _ = writeln!(
+            out,
+            "PAYLOAD ENTRY: calling {}::{}{} with a {ACTIVITY} instance",
+            entry.class, entry.member, entry.descriptor
+        );
+        let before = guest.jni.misses().len();
+        let called = {
+            let _bionic = guest.bionic.activate().expect("publish the bionic instance");
+            let _jni = guest.jni.activate().expect("publish the JNI instance");
+            let _ndk = guest.ndk.activate();
+            guest.boundary.call_guest(
+                cpu,
+                &format!("the compression library's entry {}::{}", entry.class, entry.member),
+                entry.function,
+                &args,
+                ENTRY_BUDGET,
+            )
+        };
+        match &called {
+            Ok(returned) => {
+                let _ = writeln!(out, "PAYLOAD ENTRY -> returned, X0 = {:#x}", returned.as_pointer());
+            }
+            Err(error) => {
+                let _ = writeln!(out, "PAYLOAD ENTRY -> stopped: {error}");
+            }
+        }
+        let misses = guest.jni.misses();
+        let fresh = misses.get(before..).unwrap_or(&[]);
+        let _ = writeln!(
+            out,
+            "PAYLOAD ENTRY LOOKUPS ({}): {}",
+            fresh.len(),
+            fresh.iter().map(|m| format!("{}::{}", m.class, m.member)).collect::<Vec<_>>().join(", ")
+        );
+        // **A guest that dies here has still told us what it wanted**, so the thread count and the
+        // fault are reported rather than asserted away: the entry is the first thing this build
+        // does that the stock library never did, and where it stops is the measurement.
+        let _ = writeln!(
+            out,
+            "PAYLOAD ENTRY: {} guest thread(s) recorded after the call",
+            guest.bionic.guest_thread_records()
+        );
+    }
+
     let misses = guest.jni.misses();
     let mine = misses.get(misses_before..).unwrap_or(&[]);
     let _ = writeln!(
@@ -6581,6 +6730,13 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
         mine.len(),
         mine.iter().map(|m| format!("{}::{}", m.class, m.member)).collect::<Vec<_>>().join(", ")
     );
+    // **The `sysconf` names this instance could not answer**, which is a record rather than a
+    // behaviour: the answer is C's own `-1`/`EINVAL` and only the count is worth reporting.
+    // MEASURED: a substituted build asks for 148, which no guest in this project has asked for.
+    let unknown = guest.bionic.sysconf_unknown_report();
+    if unknown != "none" {
+        let _ = writeln!(out, "PAYLOAD SYSCONF: names with no answer here: {unknown}");
+    }
     let _ = out.flush();
 }
 

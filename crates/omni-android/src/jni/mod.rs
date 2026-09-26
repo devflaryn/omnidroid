@@ -1062,6 +1062,100 @@ impl Jni {
         self.state.lock().registrations.clone()
     }
 
+    /// **Declare the members the guest's own `RegisterNatives` calls named**, each with the
+    /// function pointer the guest bound, and answer it [`classes::Answer::Native`].
+    ///
+    /// `registrations[since..]` is examined, so a caller passes the length the table had before the
+    /// call it wants to complete — the same "the difference is mine" rule the rest of this layer
+    /// uses. Returns how many members this declared.
+    ///
+    /// # Why this exists, and why it is not the layer inventing a surface
+    ///
+    /// [`Self::register_natives`] (`env.rs`) binds a registration when the class **and** the member
+    /// are already declared, and when they are not it records a miss and **keeps the function
+    /// pointer anyway**, with the note that a later step may declare the class and find it already
+    /// there. This is that step, and it exists because a guest library can register natives on
+    /// classes this registry has never heard of — a substituted build of the APK's compression
+    /// library registers seven on `com/axjava/*` (MEASURED 2026-09-26), and on a device those
+    /// classes and methods are declared by the APK's dex, which this runtime does not execute
+    /// (D7).
+    ///
+    /// **The declarations come from the guest, not from here.** Every class, name, descriptor and
+    /// function pointer in this method is one the guest itself passed to `RegisterNatives`; nothing
+    /// is invented, and a class the guest never named is never declared. A member declared this way
+    /// is then callable *from* Java, which is the half that needs it: the payload's own Java code
+    /// calls these natives back.
+    ///
+    /// **The static-ness is the one thing `RegisterNatives` does not say** — the dex does, and JNI
+    /// passes a `jclass` for a static native and a `jobject` for an instance one. A member is
+    /// therefore declared **both ways** when it is not already present, so a call from either
+    /// direction resolves; the function pointer is the same either way, and the argument the guest
+    /// reads is whatever JNI would have passed.
+    pub fn declare_registered_natives(&self, since: usize) -> usize {
+        let registrations = self.registrations();
+        let mut state = self.state.lock();
+        let registry = &mut state.registry;
+        let mut declared = 0usize;
+        for registration in registrations.iter().skip(since) {
+            // The class first, as a memberless shell when it is new: the members below need a class
+            // to be declared on, and declaring the class alone records nothing.
+            let class: &'static str = Box::leak(registration.class.clone().into_boxed_str());
+            let name: &'static str = Box::leak(registration.member.clone().into_boxed_str());
+            let descriptor: &'static str = Box::leak(registration.descriptor.clone().into_boxed_str());
+            if registry.find(class).is_none() {
+                let _ = registry.declare(&classes::ClassSpec {
+                    name: class,
+                    tier: classes::Tier::Support,
+                    methods: &[],
+                    fields: &[],
+                });
+            }
+            for is_static in [true, false] {
+                let Some(id) = registry.find(class) else { continue };
+                if registry.declared_method(id, name, descriptor, is_static).is_some() {
+                    continue;
+                }
+                let before = registry.member_count();
+                // **Leaked, like the names above it.** `ClassSpec` holds a `&'static` member
+                // slice, and these names came out of the guest at run time; the process ends with
+                // this run, and widening the registry's own types for a guest-declared member
+                // would be the tail wagging the dog.
+                let methods: &'static [classes::MemberSpec] = Box::leak(
+                    vec![classes::MemberSpec {
+                        name,
+                        descriptor,
+                        is_static,
+                        answer: classes::Answer::Native,
+                    }]
+                    .into_boxed_slice(),
+                );
+                registry.extend_with(&classes::ClassSpec {
+                    name: class,
+                    tier: classes::Tier::Support,
+                    methods,
+                    fields: &[],
+                });
+                if registry.member_count() > before {
+                    declared += 1;
+                }
+            }
+            // And the binding the guest handed over, onto every member just declared for it.
+            let Some(id) = registry.find(class) else { continue };
+            for is_static in [true, false] {
+                let Some(method) = registry.declared_method(id, name, descriptor, is_static) else {
+                    continue;
+                };
+                if let Some(member) = registry.member_mut(method) {
+                    if member.bound_native.is_none() {
+                        member.bound_native = Some(registration.function);
+                        member.answer = classes::Answer::Native;
+                    }
+                }
+            }
+        }
+        declared
+    }
+
     /// Every class, member and descriptor the engine asked for that this layer does not declare.
     ///
     /// **The measurement M5 is built on.** A Tier 0 miss is a `CHECK_NOT_NULL` abort waiting to
