@@ -147,6 +147,7 @@ def extract_apexes(system_root, staging, mounts):
 
 def walk(host_root, guest_root, lines, objects):
     for dirpath, dirnames, filenames in os.walk(host_root, followlinks=False):
+        dirnames.sort()
         rel = os.path.relpath(dirpath, host_root)
         gdir = guest_root if rel == "." else f"{guest_root.rstrip('/')}/{rel.replace(os.sep, '/')}"
         lines.append(f"d\t{stat.S_IMODE(os.lstat(dirpath).st_mode):o}\t{gdir}")
@@ -196,6 +197,9 @@ def build(zip_path, out):
     lines = [f"# omnidroid sysroot v1 image={IMAGE_NAME} sha1={IMAGE_SHA1}", "d\t755\t/", "d\t755\t/apex"]
     for host_root, guest_root in mounts:
         walk(host_root, guest_root, lines, objects)
+    # Sorted by guest path, so the manifest (and its pinned sha256) is the same whatever order the
+    # extraction filesystem lists directories in.
+    lines = lines[:1] + sorted(set(lines[1:]), key=lambda line: line.rsplit("	", 1)[1])
     manifest = os.path.join(out, "sysroot.manifest")
     with open(manifest, "w", newline="\n") as f:
         f.write("\n".join(lines) + "\n")

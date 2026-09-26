@@ -225,5 +225,8 @@ read-only page, so the site fell to the callback path for good (`DegradedMemoryP
 bionic hits it at the top of `malloc`: `ldar x8, [__libc_globals + 0x48]`, a page libc
 write-protects. x86 loads already have acquire semantics and every ordered store is an `xchg` (a
 full barrier), so release-then-acquire ordering is kept. 128-bit ordered loads keep `cmpxchg16b`.
+It also applies to the Roblox path and to the inline exclusive reads (`LDXR`/`LDAXR`, which pass
+`ordered = true`): under the value-compare monitor (D31) the store-exclusive's `cmpxchg` is what
+decides success, so a plain load is sufficient there too.
 Verified: `omni-cpu/tests/tbi.rs::a_load_acquire_from_a_read_only_page_stays_on_the_direct_path`
 (fails without the patch, with and without Top Byte Ignore).

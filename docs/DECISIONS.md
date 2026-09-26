@@ -764,7 +764,7 @@ A kernel personality, B ART, C binder and services with Roblox's own `Applicatio
 untouched until D.
 
 **A1, verified on Windows.** The real `toybox echo hello` from the pinned image
-(`arm64-v8a-35_r02.zip`, sysroot manifest sha256 `1a5ceae2...`) runs through the real `linker64`
+(`arm64-v8a-35_r02.zip`, sysroot manifest sha256 `5b586655...`, reproducible: entries sorted by path) runs through the real `linker64`
 and `libc.so` (scudo, `libcrypto`'s self-test) and exits 0; `uname -a` and `ls` too
 (`omni-linux/tests/a1_toybox.rs`, `omni-linux-run`). Only liblog's `socket` to logd is refused.
 

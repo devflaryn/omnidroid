@@ -15,7 +15,7 @@ use crate::errno::{Errno, EIO, ELOOP, ENOENT, ENOTDIR};
 use crate::manifest::{self, Entry, Manifest};
 
 /// The sha256 of the pinned `sysroot.manifest` (Task 1, Step 2).
-pub const SYSROOT_MANIFEST_SHA256: &str = "1a5ceae2fd1ba0f7b532d88bce9ae53b08a84987cb9b56b8bb12064257a4f161";
+pub const SYSROOT_MANIFEST_SHA256: &str = "5b58665544077a8d807032e5caf6503081c8f04800be53373071a2e147d99656";
 
 pub const DT_CHR: u8 = 2;
 pub const DT_DIR: u8 = 4;
