@@ -280,8 +280,19 @@ pub struct Bionic {
     yielder: HostYield,
     /// `pthread_key_create` / `getspecific` / `setspecific`, and `__cxa_thread_atexit_impl`.
     tls: TlsRegistry,
-    /// The one signal disposition this layer holds -- `SIGPIPE`'s. See [`signals::sigaction`].
-    sigpipe_action: std::sync::Mutex<[u8; signals::SIGACTION_BYTES]>,
+    /// The signal dispositions this layer holds, one per signal number: **recorded, never
+    /// delivered**. See [`signals`]'s module documentation for why that is now an answer rather
+    /// than a refusal, and for what a guest observes when it triggers the signal it installed a
+    /// handler for.
+    ///
+    /// **One table, not one slot per signal.** It replaced a single `SIGPIPE` action when
+    /// `signal` joined `sigaction` (2026-09-26): a substituted build of the APK's compression
+    /// library installs a **SIGILL** handler from its fifth constructor, and a table that could
+    /// only remember one signal's disposition would have had to be a refusal for every other.
+    dispositions: std::sync::Mutex<std::collections::BTreeMap<i32, signals::Disposition>>,
+    /// `sysconf` names asked for that this layer has no answer for, and their counts. See
+    /// [`Bionic::sysconf_unknown_names`].
+    sysconf_unknown: Mutex<std::collections::BTreeMap<i32, usize>>,
     /// `__register_atfork`'s registrations, `(prepare, parent, child, dso)`, in order. Recorded,
     /// never run: see [`procenv::register_atfork`].
     atfork: std::sync::Mutex<Vec<[u64; 4]>>,
@@ -659,7 +670,8 @@ impl Bionic {
             clock: HostClock::new(),
             yielder: HostYield,
             tls: TlsRegistry::new(),
-            sigpipe_action: std::sync::Mutex::new([0; signals::SIGACTION_BYTES]),
+            dispositions: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            sysconf_unknown: Mutex::new(std::collections::BTreeMap::new()),
             atfork: std::sync::Mutex::new(Vec::new()),
             setjmps: AtomicU64::new(0),
             owners: Arc::new(OwnerTable::new()),
@@ -1499,6 +1511,22 @@ impl Bionic {
     #[must_use]
     pub fn attached(&self) -> usize {
         self.threads.live()
+    }
+
+    /// Record a `sysconf` name this layer has no answer for, with how many times it was asked.
+    ///
+    /// **The report, not the behaviour**: the answer is C's own (`-1` with `EINVAL`, see
+    /// [`procenv::sysconf`]), and this is what makes the set of names auditable from a run rather
+    /// than from a refusal that stopped the guest. A name here is a question this project cannot
+    /// answer, and the next person to see one can say what it was.
+    pub fn note_sysconf_unknown(&self, name: i32) {
+        *self.sysconf_unknown.lock().entry(name).or_insert(0) += 1;
+    }
+
+    /// Every `sysconf` name this instance could not answer, and how often each was asked for.
+    #[must_use]
+    pub fn sysconf_unknown_names(&self) -> std::collections::BTreeMap<i32, usize> {
+        self.sysconf_unknown.lock().clone()
     }
 
     /// Apply `how`/`set` to a guest thread's blocked-signal mask and return what it was.

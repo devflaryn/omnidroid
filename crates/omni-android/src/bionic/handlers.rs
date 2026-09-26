@@ -325,6 +325,99 @@ handlers! {
     /// `char *strrchr(const char *s, int c)`
     fn strrchr(s: ptr, c: i32) -> u64 = |v| omni_bionic::string::strrchr(&v, s, c);
 
+    // ------------------------------------------- ctype, and the `_l` forms (2026-09-26)
+    //
+    // `isspace` above was bound when a TaskScheduler worker died on it; its neighbours were
+    // deliberately left unbound with the note that "the thread-failure assertion will name it on
+    // the first run that does". **MEASURED 2026-09-26**: a substituted build of the APK's
+    // compression library imports `toupper`, `isalpha` and the `is{upper,lower,digit,xdigit}_l`
+    // family, and its fifth constructor called one. So they are bound now, over
+    // `omni_bionic::ctype`'s C-locale predicates, and each takes its *classification* the way C
+    // defines it -- some non-zero value for true, not necessarily 1.
+    //
+    // **The `_l` forms' `locale_t` is checked, not ignored.** bionic would honour the locale it is
+    // handed; this runtime has exactly one (the C locale, `LC_GLOBAL` == 0), so a zero is answered
+    // and a non-zero pointer is a **refusal naming itself** rather than a silent answer in the
+    // wrong locale -- which would be a plausible-looking wrong answer rather than a failure.
+
+    /// `int toupper(int c)`
+    fn toupper(c: i32) -> i32 = |_v| omni_bionic::ctype::to_upper(c);
+
+    /// `int isalpha(int c)`
+    fn isalpha(c: i32) -> i32 = |_v| i32::from(omni_bionic::ctype::is_alpha(c));
+
+    /// `int isupper_l(int c, locale_t locale)` -- see the block comment above.
+    fn isupper_l(c: i32, locale: u64) -> i32 = |v| {
+        if locale == 0 {
+            Ok(i32::from(omni_bionic::ctype::is_upper(c)))
+        } else {
+            Err(v.refusal(format!(
+                "isupper_l was handed locale {locale:#x}; this runtime has one locale, the C one, \
+                 and answering in a locale the guest did not ask for would be a wrong answer rather \
+                 than a failure"
+            )))
+        }
+    };
+
+    /// `int islower_l(int c, locale_t locale)`
+    fn islower_l(c: i32, locale: u64) -> i32 = |v| {
+        if locale == 0 {
+            Ok(i32::from(omni_bionic::ctype::is_lower(c)))
+        } else {
+            Err(v.refusal(format!(
+                "islower_l was handed locale {locale:#x}; this runtime has one locale, the C one"
+            )))
+        }
+    };
+
+    /// `int isdigit_l(int c, locale_t locale)`
+    fn isdigit_l(c: i32, locale: u64) -> i32 = |v| {
+        if locale == 0 {
+            Ok(i32::from(omni_bionic::ctype::is_digit(c)))
+        } else {
+            Err(v.refusal(format!(
+                "isdigit_l was handed locale {locale:#x}; this runtime has one locale, the C one"
+            )))
+        }
+    };
+
+    /// `int isxdigit_l(int c, locale_t locale)`
+    fn isxdigit_l(c: i32, locale: u64) -> i32 = |v| {
+        if locale == 0 {
+            Ok(i32::from(omni_bionic::ctype::is_xdigit(c)))
+        } else {
+            Err(v.refusal(format!(
+                "isxdigit_l was handed locale {locale:#x}; this runtime has one locale, the C one"
+            )))
+        }
+    };
+
+    // --------------------------------------- wmem*, wcstombs, mbstowcs (2026-09-26)
+    //
+    // The same measurement named these. Each is pure computation over guest bytes, so the
+    // implementation is in `omni-bionic::wide` and this is the ABI edge. **`wchar_t` is 4 bytes**
+    // (arm64), and `wmemset`'s fill value is a whole `wchar_t` rather than a byte -- read as a
+    // `u64` from the register and narrowed, which is what AAPCS64 puts there.
+
+    /// `wchar_t *wmemcpy(wchar_t *dst, const wchar_t *src, size_t n)`
+    fn wmemcpy(dst: ptr, src: ptr, n: u64) -> u64 = |v| omni_bionic::wide::wmemcpy(&mut v, dst, src, n);
+
+    /// `wchar_t *wmemmove(wchar_t *dst, const wchar_t *src, size_t n)`
+    fn wmemmove(dst: ptr, src: ptr, n: u64) -> u64 =
+        |v| omni_bionic::wide::wmemmove(&mut v, dst, src, n);
+
+    /// `wchar_t *wmemset(wchar_t *s, wchar_t c, size_t n)`
+    fn wmemset(s: ptr, c: u64, n: u64) -> u64 =
+        |v| omni_bionic::wide::wmemset(&mut v, s, c as u32, n);
+
+    /// `size_t wcstombs(char *dst, const wchar_t *src, size_t len)`
+    fn wcstombs(dst: ptr, src: ptr, len: u64) -> u64 =
+        |v| omni_bionic::wide::wcstombs(&mut v, dst, src, len);
+
+    /// `size_t mbstowcs(wchar_t *dst, const char *src, size_t len)`
+    fn mbstowcs(dst: ptr, src: ptr, len: u64) -> u64 =
+        |v| omni_bionic::wide::mbstowcs(&mut v, dst, src, len);
+
     /// `char *strstr(const char *haystack, const char *needle)`
     fn strstr(haystack: ptr, needle: ptr) -> u64 =
         |v| omni_bionic::string::strstr(&v, haystack, needle);
@@ -1591,11 +1684,27 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // since phase 1 and nothing called it. Its neighbour `tolower` has the same shape and is
     // deliberately NOT here; no run has reached it (D17).
     ("isspace", isspace),
+    // **The ctype family, 2026-09-26**: `toupper`, `isalpha` and the `_l` predicates, named by a
+    // substituted build of the APK's compression library (its fifth constructor called one). The
+    // comment above on `tolower` -- "no run has reached it" -- is why this line is dated rather
+    // than speculative: these are measured, not predicted.
+    ("toupper", toupper),
+    ("isalpha", isalpha),
+    ("isupper_l", isupper_l),
+    ("islower_l", islower_l),
+    ("isdigit_l", isdigit_l),
+    ("isxdigit_l", isxdigit_l),
     ("strchr", strchr),
     // M6: a guest worker once the renderer was being created. Outside Task 1's 188;
     // `BEYOND_THE_PREDICTION` records it.
     ("__strchr_chk", strchr_chk),
     ("strrchr", strrchr),
+    // The wide family, same measurement and same date. `wchar_t` is 4 bytes on arm64.
+    ("wmemcpy", wmemcpy),
+    ("wmemmove", wmemmove),
+    ("wmemset", wmemset),
+    ("wcstombs", wcstombs),
+    ("mbstowcs", mbstowcs),
     ("strstr", strstr),
     ("strerror", strerror),
     ("__gnu_strerror_r", gnu_strerror_r),
@@ -1944,8 +2053,17 @@ pub(super) static INLINE: &[(&str, ImportFn)] = &[
     // until much later. `signals`' module documentation has the table.
     ("sigfillset", signals::sigfillset),
     ("sigaction", signals::sigaction),
+    // 2026-09-26: the older spelling, under the same rule — answered only for the dispositions
+    // that promise no delivery. MEASURED need: a substituted build of the APK's compression
+    // library calls `signal(SIGPIPE, SIG_IGN)` from its fifth constructor.
+    ("signal", signals::signal),
     ("raise", signals::raise),
     ("pthread_sigmask", signals::pthread_sigmask),
+    // **The other spelling of the same function.** bionic exports `sigprocmask` and
+    // `pthread_sigmask` as weak aliases of one another, and a guest picks either: the engine
+    // imports `pthread_sigmask`, while a substituted build of the APK's compression library
+    // imports `sigprocmask` (MEASURED 2026-09-26, from its constructors). One handler, two names.
+    ("sigprocmask", signals::pthread_sigmask),
     // ---- phase 3c: the one thread symbol that runs no guest code and touches no mapping, so
     // the exit path would cost it 3x per call for nothing.
     ("pthread_getschedparam", threads::pthread_getschedparam),

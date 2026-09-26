@@ -909,23 +909,30 @@ pub(super) fn sysconf(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             pages
         }
         other => {
-            let believed = believed_sysconf_name(other).map_or_else(
-                || "no name this layer recognises".to_string(),
-                |text| format!("believed to be `{text}`"),
-            );
-            return Err(refuse(
-                c,
-                format!(
-                    "the guest asked for sysconf({other}), {believed}. This layer answers the \
-                     page size (`_SC_PAGESIZE` {SC_PAGESIZE}, `_SC_PAGE_SIZE` {SC_PAGE_SIZE}) and \
-                     the processor count (`_SC_NPROCESSORS_CONF` {SC_NPROCESSORS_CONF}, \
-                     `_SC_NPROCESSORS_ONLN` {SC_NPROCESSORS_ONLN}) because it knows both. It has \
-                     no clock tick, no descriptor ceiling of the guest's own and no `iovec` limit \
-                     to report, and every one of those has a believable wrong answer available. \
-                     `_SC_PHYS_PAGES` ({SC_PHYS_PAGES}) is answered from the embedding's memory \
-                     budget and never from the host's RAM"
-                ),
-            ));
+            // **A name this layer has no answer for is `-1` with `EINVAL`, which is what C
+            // defines for it** -- and, since 2026-09-26, that is an answer rather than the refusal
+            // this arm used to be.
+            //
+            // MEASURED why it changed: a substituted build of the APK's compression library asks
+            // for `sysconf(148)` from one of its constructors, and the refusal stopped the boot
+            // there. 148 is not a value this project has seen from any guest, and the engine --
+            // compiled against the same NDK -- asks for 39/40/96/97/98 for the same quantities
+            // (this module's header has the decode). **A third-party binary built with a different
+            // NDK plausibly numbers `_SC_` differently**, which is the likeliest explanation and
+            // precisely why answering it with the engine's numbering would be a guess: it would
+            // hand this guest a page count or a clock tick it did not ask for.
+            //
+            // So the fallback is C's own answer for a name the implementation does not define. It
+            // is **not** a guess at what 148 meant -- nothing here claims to know that -- and it is
+            // **not** a refusal, because a guest reading `-1` carries on and a guest stopped at a
+            // refusal does not. Each unknown name is counted and named by
+            // [`Bionic::sysconf_unknown_names`], so a run reports exactly which ones were asked for.
+            state.bionic.note_sysconf_unknown(other);
+            let mut view = enter(c, &state);
+            view.set_errno(omni_bionic::errno::consts::EINVAL);
+            drop(view);
+            c.ret().u64(-1i64 as u64);
+            return Ok(());
         }
     };
     c.ret().u64(value as u64);

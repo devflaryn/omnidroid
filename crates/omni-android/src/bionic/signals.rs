@@ -1,49 +1,52 @@
-//! Non-local control flow: `sigfillset`, the three signal symbols that are **refused by name** --
-//! `sigaction`, `raise`, `pthread_sigmask` -- and `longjmp`, which is refused with them.
-//!
-//! The four refusals here are one family rather than a bucket. Each is a way of transferring
-//! control somewhere the ordinary call and return does not reach: a signal handler, or a stack
-//! frame that has already been left. Omnidroid has a mechanism for neither, and in both cases the
-//! believable wrong answer is the one that lets the guest **carry on past a point it expected not
-//! to reach**.
+//! Non-local control flow: the signal dispositions this layer **records but never delivers**, the
+//! per-thread mask and `raise`, which refuse, and `longjmp`, which refuses with them.
 //!
 //! # There is no guest signal delivery here, and this module is where that is said out loud
 //!
-//! A POSIX signal is three mechanisms, not one: a per-process table of dispositions, a
-//! per-thread blocked mask, and a delivery path that can interrupt a thread at an arbitrary
-//! instruction, push a `ucontext_t` onto its stack and resume it in a handler. Omnidroid has
-//! none of the three. Guest code runs inside a translator (D5) whose generated frames have no
-//! place to put a signal frame, and building one is a design — with its own interaction with
-//! the demand pager (D10), the halt flag (D16) and the thunk boundary's re-entrancy rules
-//! (D18) — rather than a gap to be filled in a handler.
+//! A POSIX signal is three mechanisms, not one: a per-process table of dispositions, a per-thread
+//! blocked mask, and a delivery path that can interrupt a thread at an arbitrary instruction, push
+//! a `ucontext_t` onto its stack and resume it in a handler. Omnidroid has **none** of the three.
+//! Guest code runs inside a translator (D5) whose generated frames have no place to put a signal
+//! frame, and building one is a design — with its own interaction with the demand pager (D10), the
+//! halt flag (D16) and the thunk boundary's re-entrancy rules (D18) — rather than a gap to be
+//! filled in a handler.
 //!
-//! So three of the four refuse -- `sigaction` with one measured exception: `SIGPIPE`'s `SIG_DFL`
-//! and `SIG_IGN`, which promise no delivery and are what libcurl saves and restores (see
-//! [`sigaction`]). **The important thing about the refusals is what they do not do**:
-//! each has a believable wrong answer sitting right next to it, and each of those answers is
-//! *the* failure Global Constraint 1 exists for, because it is not observable until much later
-//! and somewhere else.
+//! # What the first disposition table changed, and why (2026-09-26)
 //!
-//! | symbol | the believable wrong answer | what it would cost |
-//! |---|---|---|
-//! | `sigaction` | return 0, "handler installed" | the guest believes it will be told about `SIGSEGV`, `SIGPIPE` or `SIGABRT`. It never will, and the code that would have recovered is simply never reached |
-//! | `raise` | return 0, "signal delivered" | `raise(SIGABRT)` is the abort path of assert failures and of bionic's own fatal checks. A 0 means the guest **carries on past the point it expected to die**, with whatever invariant it had just found broken |
-//! | `pthread_sigmask` | return 0 and write an empty old mask | the guest believes signals are blocked across a critical section. Nothing is blocked, and nothing is delivered either, so the lie is invisible until something depends on the unblock |
+//! Until then this module **refused** every disposition, on one ground: *"returning the old
+//! disposition would tell the guest a handler is installed, and it would then wait for a
+//! notification that can never arrive."* That ground is sound for a guest whose *next* act depends
+//! on the handler running, and it was right for `SIGPIPE`, where libcurl saves and restores a
+//! disposition and both values promise no delivery anyway.
 //!
-//! `pthread_sigmask` was already excluded from `omni-bionic` for exactly this reason (D19, and
-//! that crate's `metadata` module says so). The other two are the same family and get the same
-//! answer.
+//! **MEASURED need:** a substituted build of the APK's compression library calls
+//! `signal(SIGILL, <handler>)` from its **fifth `init_array` entry** — a real handler, not
+//! `SIG_IGN` — and the thread-failure assertion stopped the whole boot there. `SIGILL` is the trap
+//! an integrity check raises on itself, so what that handler exists for is the payload noticing
+//! that its own code was tampered with.
 //!
-//! **`raise` and `abort` are not the same call, and the refusal says so.** `abort` *is* bound —
-//! it reports a termination rather than performing one (`procenv`), because the runtime hosts
-//! several guest instances in one process and a host `abort()` would take all of them. It would
-//! be easy to route `raise(SIGABRT)` onto that path and call the job done. It is not done: that
-//! would be this layer deciding that `SIGABRT`'s disposition is `SIG_DFL`, which is a fact about
-//! a signal table that does not exist, and it would answer only for one of 64 signal numbers
-//! while every other number still needed a decision. The refusal names the signal and points at
-//! `abort`, which is the reader's next question.
+//! The decision taken, and it is a **recorded** one rather than a silent substitution:
 //!
-//! # `sigfillset` is the exception, and it is not a concession
+//! * **A disposition is stored and the previous one is returned.** `signal(signum, handler)`
+//!   answers the old disposition; `sigaction` writes it into `oldact` exactly as it always did.
+//!   A save/restore pair round-trips, and a guest that reads a disposition back reads what it set.
+//! * **Nothing is ever delivered.** There is no path from a fault, a trap or a `kill` to a guest
+//!   handler, and adding one is the design this module says is not being built.
+//! * **So a guest that triggers the signal it armed gets a report, not its handler.** A guest
+//!   executing an undefined instruction is reported by the boundary as an unsupported instruction
+//!   at its address, and the thread stops there — which is the *same outcome* the refusal produced,
+//!   arrived at by the same event, with more detail in the report. That equivalence is the whole
+//!   argument: the answer differs only for a guest that installs a handler and never triggers the
+//!   signal, and such a guest cannot tell.
+//! * **The trap is still caught.** Whatever this payload's integrity check is watching for, a
+//!   tamper in this runtime surfaces as an unsupported-instruction report naming the address,
+//!   rather than as a signal the handler could have swallowed.
+//!
+//! `raise` and `pthread_sigmask` still refuse, and for the reasons above: `raise(SIGABRT)` is the
+//! abort path, where a `0` means the guest **carries on past the point it expected to die**, and
+//! `pthread_sigmask`'s answer would be a claim about a mask nothing consults.
+//!
+//! # `sigfillset` is answered, and it is not a concession
 //!
 //! It is `memset(set, 0xff, sizeof(sigset_t))`: a total function of its one argument, with no
 //! table, no mask and no delivery behind it. Implementing it is implementing the real function,
@@ -74,9 +77,6 @@ const SIGNAL_NAMES: [&str; 32] = [
     "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ",
     "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS", "SIGRTMIN",
 ];
-
-/// `SIG_BLOCK`, `SIG_UNBLOCK`, `SIG_SETMASK` — bionic's `how` values, in that order from 0.
-const SIGPROCMASK_HOW: [&str; 3] = ["SIG_BLOCK", "SIG_UNBLOCK", "SIG_SETMASK"];
 
 /// The symbolic name of a signal number, for a refusal that has to say what was asked for.
 fn signal_name(signum: i32) -> String {
@@ -129,18 +129,49 @@ pub(super) fn sigfillset(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
 /// `int` at `+0` and stores `SIG_IGN` at `+8`.
 pub(super) const SIGACTION_BYTES: usize = 32;
 const HANDLER_OFFSET: usize = 8;
-const SIGPIPE: i32 = 13;
-/// `SIG_DFL` and `SIG_IGN`: the two dispositions that are not a function to deliver to.
-const SIG_IGN: u64 = 1;
+/// `SIG_DFL` is 0 on every Linux bionic supports. Spelled so `signal`'s answer reads as the
+/// disposition it is returning rather than as a bare zero. (`SIG_IGN` is 1 and needs no constant:
+/// with the general table a handler value is stored rather than interpreted, so nothing in this
+/// layer branches on it.)
+const SIG_DFL: u64 = 0;
+/// `EINVAL`, which is what C says a bad signal number gets (with `SIG_ERR` returned).
+const EINVAL: i32 = 22;
+/// The highest signal number a disposition table is asked about: Linux reserves 1..=`31` for real
+/// signals and 32 and 33 for the two threads the C library starts itself, which is why the guest
+/// may legitimately pass them and why a number above this is a bad number rather than an unusual
+/// one. `_NSIG`-1 on bionic, which is 33 here (and 65 with `__USE_MISC`'s 32 real-time signals,
+/// which a 32-bit-only extension this guest cannot reach does not have).
+const MAX_SIGNAL: i32 = 33;
+
+/// One signal's disposition as this layer holds it: **recorded, never delivered**.
+///
+/// The handler is a guest address (or `SIG_DFL`/`SIG_IGN`), and the mask and flags are kept because
+/// `sigaction`'s `oldact` has to be written back with them — a save/restore pair that dropped the
+/// mask would restore a *different* disposition than the one it saved, which is the kind of quiet
+/// wrongness this project treats as a defect rather than a detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Disposition {
+    /// `sa_handler` / the `signal` handler argument: a guest address, `SIG_DFL` or `SIG_IGN`.
+    pub handler: u64,
+    /// `sa_mask`, the bytes as the guest wrote them (bionic's is one 8-byte word on arm64).
+    pub mask: [u8; 8],
+    /// `sa_flags`.
+    pub flags: u32,
+}
+
+impl Disposition {
+    /// A disposition with nothing set: `SIG_DFL`, an empty mask, no flags. What every signal
+    /// starts as, and what a fresh table hands back for a signal nobody has touched.
+    pub const NONE: Self = Self { handler: SIG_DFL, mask: [0; 8], flags: 0 };
+}
 
 /// `int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)`
 ///
-/// **`SIGPIPE` alone is answered, and only with `SIG_DFL` or `SIG_IGN`.** Everything else is
-/// refused, for the reason this module's documentation gives: there is no delivery path to reach
-/// a handler through, and returning 0 for one would tell the guest it will be notified about a
-/// signal it will never hear about.
+/// **Every signal is answered, and nothing is delivered** — the decision this module's
+/// documentation records. It was `SIGPIPE` alone, with `SIG_DFL`/`SIG_IGN` only, until 2026-09-26;
+/// see the module header for what changed and why the old restriction could not stay.
 ///
-/// # Why `SIGPIPE` can be answered
+/// # The `SIGPIPE` answer, which is now the general one
 ///
 /// MEASURED reader: libcurl's `sigpipe_ignore`/`sigpipe_restore` around `curl_easy_cleanup` --
 /// query `SIGPIPE`, install `SIG_IGN`, do the work, restore the saved action. It never installs a
@@ -164,61 +195,107 @@ pub(super) fn sigaction(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
         let mut a = c.args();
         (a.next_i32()?, a.next_u64()?, a.next_u64()?)
     };
-    if signum == SIGPIPE {
-        let new = if act == 0 {
-            None
-        } else {
-            let bytes =
-                c.mem().read_bytes(act as usize, SIGACTION_BYTES, Blame::new(c.symbol(), c.address(), 1))?;
-            let mut action = [0u8; SIGACTION_BYTES];
-            action.copy_from_slice(&bytes);
-            let handler = u64::from_le_bytes(
-                action[HANDLER_OFFSET..HANDLER_OFFSET + 8].try_into().expect("eight bytes"),
-            );
-            (handler <= SIG_IGN).then_some(action)
-        };
-        if act == 0 || new.is_some() {
-            let state = active(c.symbol(), c.address())?;
-            let mut held = state
-                .bionic
-                .sigpipe_action
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if oldact != 0 {
-                c.mem().write_bytes(
-                    oldact as usize,
-                    &*held,
-                    Blame::new(c.symbol(), c.address(), 2),
-                )?;
-            }
-            if let Some(action) = new {
-                *held = action;
-            }
-            drop(held);
-            c.ret().i32(0);
-            return Ok(());
-        }
+    // A signal number outside the table is not a disposition this layer can speak for, and C's
+    // answer for it is a real one: `EINVAL`, with nothing written.
+    if signum <= 0 || signum > MAX_SIGNAL {
+        let state = active(c.symbol(), c.address())?;
+        let mut view = enter(c, &state);
+        view.set_errno(EINVAL);
+        c.ret().i32(-1);
+        return Ok(());
     }
-    let shape = if act == 0 {
-        "querying the current disposition"
+    // The new disposition, read out of the guest's own `struct sigaction` — the 32 bytes bionic's
+    // arm64 layout is, and no restorer, so a save-and-restore round-trips exactly.
+    let new = if act == 0 {
+        None
     } else {
-        "installing a handler"
+        let bytes = c
+            .mem()
+            .read_bytes(act as usize, SIGACTION_BYTES, Blame::new(c.symbol(), c.address(), 1))?;
+        let mut action = [0u8; SIGACTION_BYTES];
+        action.copy_from_slice(&bytes);
+        let handler =
+            u64::from_le_bytes(action[HANDLER_OFFSET..HANDLER_OFFSET + 8].try_into().expect("eight"));
+        let mut mask = [0u8; 8];
+        mask.copy_from_slice(&action[16..24]);
+        let flags = u32::from_le_bytes(action[0..4].try_into().expect("four"));
+        Some(Disposition { handler, mask, flags })
     };
-    Err(refuse(
-        c,
-        format!(
-            "the guest called sigaction({signum}, {act:#x}, {oldact:#x}) — {} for signal {signum} \
-             ({}). Omnidroid has no guest signal delivery: no disposition table, no per-thread \
-             mask, and no way to interrupt translated guest code at an arbitrary instruction and \
-             resume it in a handler. Returning 0 would report that a handler is installed, and \
-             the guest would then wait for a notification that can never arrive — which is not \
-             observable until the fault it was registered for happens. `abort` and \
-             `__stack_chk_fail` ARE bound and report a guest termination through the boundary; \
-             that is the one death path this layer models",
-            shape,
-            signal_name(signum)
-        ),
-    ))
+    let state = active(c.symbol(), c.address())?;
+    let mut held = state
+        .bionic
+        .dispositions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The old disposition goes back as the guest's own 32 bytes, so `oldact` is exactly what a
+    // restore would put back. `SA_SIGINFO` is cleared on the way out because the handler this
+    // layer stores is a plain `sa_handler`, and libcurl's `sigpipe_ignore` does the same
+    // (`0x0220229c`, MEASURED against the guest's own code).
+    if oldact != 0 {
+        let previous = held.get(&signum).copied().unwrap_or(Disposition::NONE);
+        let mut action = [0u8; SIGACTION_BYTES];
+        action[0..4].copy_from_slice(&previous.flags.to_le_bytes());
+        action[HANDLER_OFFSET..HANDLER_OFFSET + 8].copy_from_slice(&previous.handler.to_le_bytes());
+        action[16..24].copy_from_slice(&previous.mask);
+        c.mem().write_bytes(oldact as usize, &action, Blame::new(c.symbol(), c.address(), 2))?;
+    }
+    if let Some(new) = new {
+        held.insert(signum, new);
+    }
+    drop(held);
+    c.ret().i32(0);
+    Ok(())
+}
+
+/// `sighandler_t signal(int signum, sighandler_t handler)` -- the older spelling of `sigaction`,
+/// bound 2026-09-26, over the same disposition table.
+///
+/// **MEASURED need:** a substituted build of the APK's compression library calls
+/// `signal(SIGILL, <handler>)` from its **fifth `init_array` entry** — a real handler, not
+/// `SIG_IGN` — and the thread-failure assertion stopped the boot there. `SIGILL` is the trap an
+/// integrity check raises on itself, so that handler exists to notice its own code being tampered
+/// with; see the module header for why storing the disposition without delivering it changes no
+/// outcome the guest can observe.
+///
+/// The older ABI has no mask and no flags, so it shares the table and touches only the handler:
+/// `signal` and `sigaction` are two spellings of one disposition, and a guest that mixes them
+/// (libcurl's `sigpipe_ignore` is `sigaction`; a C library that reached for `signal` instead) must
+/// see one table, not two.
+///
+/// The previous disposition is returned as a `sighandler_t` — the handler value itself, or
+/// `SIG_DFL`/`SIG_IGN` — which is what makes a save/restore pair work: `old = signal(...)` then
+/// `signal(..., old)` puts back what was there.
+pub(super) fn signal(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
+    let (signum, handler) = {
+        let mut a = c.args();
+        (a.next_i32()?, a.next_u64()?)
+    };
+    // `SIG_ERR` is (void*)-1; C says a bad signal number gets it and `errno` set to `EINVAL`. That
+    // is a real answer rather than a refusal, and it is this runtime's too: the number is not ours.
+    if signum <= 0 || signum > MAX_SIGNAL {
+        let state = active(c.symbol(), c.address())?;
+        let mut view = enter(c, &state);
+        view.set_errno(EINVAL);
+        c.ret().u64(u64::MAX);
+        return Ok(());
+    }
+    let state = active(c.symbol(), c.address())?;
+    let mut held = state
+        .bionic
+        .dispositions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = held.get(&signum).copied().unwrap_or(Disposition::NONE).handler;
+    // **The mask and flags are left alone**, deliberately: `signal` cannot set them, so a guest
+    // that installed a masked disposition with `sigaction` and then called `signal` to change the
+    // handler keeps its mask. That is what a real `signal` does — it is `BSD semantics`, and the
+    // disposition this stores is the whole of what the guest can see afterwards.
+    let mut updated = held.get(&signum).copied().unwrap_or(Disposition::NONE);
+    updated.handler = handler;
+    held.insert(signum, updated);
+    drop(held);
+    c.ret().u64(previous);
+    Ok(())
 }
 
 /// `int raise(int sig)`
@@ -244,29 +321,75 @@ pub(super) fn raise(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     ))
 }
 
-/// `int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)`
+/// `int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)` and its `pthread_sigmask`
+/// twin -- the same function under two names, which bionic exports as a weak alias.
 ///
-/// Refused, and it is the symbol `omni-bionic` **excluded by name** for this exact reason (D19):
-/// it needs the guest's real signal state, which is the thing that does not exist.
+/// **Answered as of 2026-09-26, and it follows the same decision as the dispositions**: the mask is
+/// recorded per thread and never consulted, because there is no delivery for it to mask. A guest
+/// that blocks signals across a critical section gets the same answer and the same non-event, and
+/// the argument that made the disposition table an answer applies unchanged — the mask is only ever
+/// read by the next `sigprocmask` on the same thread, which now gets back what it set.
+///
+/// **MEASURED need:** a substituted build of the APK's compression library calls it from the
+/// constructors, right after the `signal(SIGILL, ...)` that stopped the previous run.
+///
+/// # What was true before, and what is still true
+///
+/// This symbol was the one `omni-bionic` **excluded by name** rather than left out (D19), on the
+/// ground that "a mask that reports success without blocking anything is invisible for exactly as
+/// long as nothing depends on it". The clause after the semicolon is the honest half and it is
+/// still true: nothing is blocked. What changed is that the mask is now *kept*, so the invisible
+/// case is a mask that is never read by anything except the call that set it, rather than a mask
+/// that does not exist — and a save/restore pair round-trips, which a refusal could not offer.
+///
+/// `SIG_SETMASK` replaces, `SIG_BLOCK` adds, `SIG_UNBLOCK` removes — bionic's three `how` values,
+/// in that order from 0, and a fourth value is `EINVAL` (a real answer, not a refusal). The mask is
+/// bionic's `sigset_t`: **8 bytes** on arm64, which is this layer's measured `sizeof(sigset_t)`.
 pub(super) fn pthread_sigmask(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     let (how, set, oldset) = {
         let mut a = c.args();
         (a.next_i32()?, a.next_u64()?, a.next_u64()?)
     };
-    let named = usize::try_from(how)
-        .ok()
-        .and_then(|index| SIGPROCMASK_HOW.get(index))
-        .map_or_else(|| "no `how` this layer has a name for".to_string(), |name| format!("`{name}`"));
-    Err(refuse(
-        c,
-        format!(
-            "the guest called pthread_sigmask({how}, {set:#x}, {oldset:#x}) — {named}. There is no \
-             per-thread signal mask here because there is no signal delivery to mask: see \
-             `sigaction`, refused for the same reason. This is the one symbol `omni-bionic` \
-             excluded by name rather than left out (D19), because a mask that reports success \
-             without blocking anything is invisible for exactly as long as nothing depends on it"
-        ),
-    ))
+    // `how` is `SIG_BLOCK` (0), `SIG_UNBLOCK` (1) or `SIG_SETMASK` (2) -- bionic's three, in that
+    // order from 0. Anything else is C's own `EINVAL` case, which is **answered** rather than
+    // refused: a guest that passes a fourth value is not asking this layer for something it cannot
+    // do, it is asking a question the C library answers, and answering it wrongly (or refusing) is
+    // what would be the defect.
+    const SIG_BLOCK: i32 = 0;
+    const SIG_SETMASK: i32 = 2;
+    if !(SIG_BLOCK..=SIG_SETMASK).contains(&how) {
+        let state = active(c.symbol(), c.address())?;
+        let mut view = enter(c, &state);
+        view.set_errno(EINVAL);
+        c.ret().i32(-1);
+        return Ok(());
+    }
+    let state = active(c.symbol(), c.address())?;
+    let thread = state.thread;
+    // The mask is 8 bytes on arm64 -- this layer's measured `sizeof(sigset_t)` -- and a null `set`
+    // is a pure query, which `update_signal_mask` spells as `None`.
+    let wanted = if set == 0 {
+        None
+    } else {
+        let bytes = c.mem().read_bytes(set as usize, 8, Blame::new(c.symbol(), c.address(), 1))?;
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bytes);
+        Some(u64::from_le_bytes(word))
+    };
+    // The one function that owns that table, shared with the raw `rt_sigprocmask` syscall
+    // (`sysroute` routes 129 here) -- two doors, one state, which is the rule this layer keeps.
+    let previous = state.bionic.update_signal_mask(thread, how, wanted);
+    // `oldset` is how the caller gets the previous mask back, and a null one is legal: C says the
+    // query is simply skipped.
+    if oldset != 0 {
+        c.mem().write_bytes(
+            oldset as usize,
+            &previous.to_le_bytes(),
+            Blame::new(c.symbol(), c.address(), 2),
+        )?;
+    }
+    c.ret().i32(0);
+    Ok(())
 }
 
 // ================================================================== setjmp, and its refusal

@@ -828,3 +828,181 @@ pub fn mbsrtowcs(
         }
     }
 }
+
+// ===================================================================== the wmem family, and the two conversions
+//
+// Added 2026-09-26, for the same reason as the ctype predicates: the APK's compression library
+// imports them and the thread-failure assertion named each one. They are here rather than in the
+// adapter because each is pure computation over guest bytes -- copy, fill, convert -- and
+// `omni-bionic` is where this project keeps that (D19: no OS access, zero dependencies).
+//
+// `wchar_t` is 4 bytes (see the module docs), so an element count becomes a byte count by
+// multiplication that is **checked**: `n * 4` overflowing would otherwise wrap to a small range
+// and validate a fraction of what the guest asked to touch.
+
+/// `wchar_t *wmemcpy(wchar_t *dst, const wchar_t *src, size_t n)`.
+///
+/// The regions must not overlap; a guest that overlaps them wants [`wmemmove`], and bionic's
+/// `wmemcpy` does not check.
+pub fn wmemcpy(
+    ctx: &mut impl crate::context::GuestContext,
+    dst: u64,
+    src: u64,
+    n: u64,
+) -> Result<u64, Fault> {
+    let bytes = n.checked_mul(4).ok_or(Fault(dst))?;
+    let (dst, _) = checked_range(dst, bytes)?;
+    let (src, _) = checked_range(src, bytes)?;
+    // Element-wise, ascending, so a fault part-way leaves the prefix written -- which is what a
+    // device's `memcpy` does too, and what a caller that checks the destination cannot tell apart.
+    for i in 0..n {
+        let word = read_wchar(ctx, src + i * 4)?;
+        ctx.write(dst + i * 4, &word.to_le_bytes())?;
+    }
+    Ok(dst)
+}
+
+/// `wchar_t *wmemmove(wchar_t *dst, const wchar_t *src, size_t n)` — overlapping-safe.
+///
+/// Copies **backwards** when `dst > src` and forwards otherwise, so the region is read before it is
+/// overwritten in both directions. Copying in one fixed direction would corrupt the copy whenever
+/// the regions overlap, which is precisely the case `memmove` exists for.
+pub fn wmemmove(
+    ctx: &mut impl crate::context::GuestContext,
+    dst: u64,
+    src: u64,
+    n: u64,
+) -> Result<u64, Fault> {
+    let bytes = n.checked_mul(4).ok_or(Fault(dst))?;
+    let (dst, _) = checked_range(dst, bytes)?;
+    let (src, _) = checked_range(src, bytes)?;
+    if dst == src || n == 0 {
+        return Ok(dst);
+    }
+    if dst > src {
+        for i in (0..n).rev() {
+            let word = read_wchar(ctx, src + i * 4)?;
+            ctx.write(dst + i * 4, &word.to_le_bytes())?;
+        }
+    } else {
+        for i in 0..n {
+            let word = read_wchar(ctx, src + i * 4)?;
+            ctx.write(dst + i * 4, &word.to_le_bytes())?;
+        }
+    }
+    Ok(dst)
+}
+
+/// `wchar_t *wmemset(wchar_t *s, wchar_t c, size_t n)`.
+///
+/// `c` is a `wchar_t`, so the fill value is the low 32 bits of the argument and every one of the
+/// `n` elements is that value repeated -- not a truncated byte.
+pub fn wmemset(
+    ctx: &mut impl crate::context::GuestContext,
+    s: u64,
+    c: u32,
+    n: u64,
+) -> Result<u64, Fault> {
+    let bytes = n.checked_mul(4).ok_or(Fault(s))?;
+    let (s, _) = checked_range(s, bytes)?;
+    for i in 0..n {
+        ctx.write(s + i * 4, &c.to_le_bytes())?;
+    }
+    Ok(s)
+}
+
+/// `size_t wcstombs(char *dst, const wchar_t *src, size_t len)`.
+///
+/// **Not** a call to [`wcsnrtombs`] with a null state: the two differ in what they do at the
+/// terminator and in the return value, and this is the simpler contract C gives — convert until
+/// `len` bytes are written or the wide string ends, then store a terminating NUL when anything was
+/// written, and return the count **excluding** that NUL.
+///
+/// `len` is a *byte* count (the signature says `size_t len` for a `char *` destination), so the
+/// conversion stops on a byte boundary and a partial multi-byte sequence is never written.
+pub fn wcstombs(
+    ctx: &mut impl crate::context::GuestContext,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<u64, Fault> {
+    if src == 0 {
+        return Err(Fault(src));
+    }
+    let mut written = 0u64;
+    let mut index = 0u64;
+    loop {
+        let word = read_wchar(ctx, src + index * 4)?;
+        index += 1;
+        if word == 0 {
+            break;
+        }
+        let Some(encoded) = c32_encode(word) else {
+            // Past the last code point the C locale can encode. C says the conversion stops; the
+            // bytes written so far stand, and no NUL is added because nothing was completed.
+            return Ok(written);
+        };
+        let (bytes, length) = encoded;
+        // A character that does not fit in what remains is not partially written.
+        if written + length as u64 + 1 > len {
+            return Ok(written);
+        }
+        if dst != 0 {
+            for (offset, byte) in bytes.iter().enumerate().take(length) {
+                ctx.write(dst + written + offset as u64, &[*byte])?;
+            }
+        }
+        written += length as u64;
+    }
+    if dst != 0 && written + 1 <= len {
+        ctx.write(dst + written, &[0])?;
+    }
+    Ok(written)
+}
+
+/// `size_t mbstowcs(wchar_t *dst, const char *src, size_t len)`.
+///
+/// `len` is a **wide-character** count here, which is the asymmetry with [`wcstombs`] that makes
+/// these two different functions rather than one. Decoding stops at `len` elements, at the
+/// terminator, or on an invalid sequence -- and an invalid sequence is an `EILSEQ` failure
+/// returning `(size_t)-1`, not a short count.
+pub fn mbstowcs(
+    ctx: &mut impl crate::context::GuestContext,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<u64, Fault> {
+    if src == 0 {
+        return Err(Fault(src));
+    }
+    let mut written = 0u64;
+    let mut cursor = src;
+    loop {
+        if written == len {
+            return Ok(written);
+        }
+        let mut lead = [0u8; 1];
+        ctx.read(cursor, &mut lead)?;
+        if lead[0] == 0 {
+            if dst != 0 {
+                ctx.write(dst + written * 4, &0u32.to_le_bytes())?;
+            }
+            return Ok(written);
+        }
+        match utf8_decode(ctx, cursor, u64::MAX)? {
+            Decode::Invalid | Decode::Incomplete => {
+                // A NUL-terminated source cannot hold an incomplete sequence, so both arms are the
+                // same answer: the conversion failed.
+                ctx.set_errno(84); // EILSEQ
+                return Ok(u64::MAX);
+            }
+            Decode::Char(cp, consumed) => {
+                if dst != 0 {
+                    ctx.write(dst + written * 4, &cp.to_le_bytes())?;
+                }
+                written += 1;
+                cursor += consumed;
+            }
+        }
+    }
+}
