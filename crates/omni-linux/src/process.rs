@@ -168,6 +168,7 @@ impl Process {
             info: crate::props::property_info_bytes(),
             serial: crate::props::serial_area_bytes(),
             area: properties.area_bytes(),
+            apex_info: crate::apex::apex_info_list(vfs.sysroot()),
         };
         let comm = argv.first().map_or_else(Vec::new, |a| {
             a.rsplit(|&b| b == b'/').next().unwrap_or(a).iter().copied().take(15).collect()
@@ -208,14 +209,16 @@ impl Process {
     pub fn spawn(config: SpawnConfig) -> Result<Arc<Self>, String> {
         let sysroot = Sysroot::open(&config.sysroot)?;
         let exe = config.argv.first().ok_or("no program: argv is empty")?.clone();
-        for dir in ["data", "tmp"] {
-            std::fs::create_dir_all(config.instance_dir.join(dir)).map_err(|e| format!("{}: {e}", config.instance_dir.display()))?;
+        // The instance's writable state: what a device keeps on its data partition and tmpfs, and
+        // `/linkerconfig`, which `linkerconfig` writes at boot for `linker64` to read (sub-project B).
+        let writable_dirs = ["data", "tmp", "linkerconfig"];
+        let mut writable = Vec::new();
+        for dir in writable_dirs {
+            let host = config.instance_dir.join(dir);
+            std::fs::create_dir_all(&host).map_err(|e| format!("{}: {e}", host.display()))?;
+            writable.push((format!("/{dir}").into_bytes(), host));
         }
-        let vfs = Vfs::new(
-            sysroot,
-            vec![(b"/data".to_vec(), config.instance_dir.join("data")), (b"/tmp".to_vec(), config.instance_dir.join("tmp"))],
-            exe.clone(),
-        );
+        let vfs = Vfs::new(sysroot, writable, exe.clone());
         let space = Arc::new(
             GuestSpace::with_config(GuestSpaceConfig { size: GUEST_SPACE_BYTES, ..GuestSpaceConfig::default() })
                 .map_err(|e| format!("reserve the guest address space: {e}"))?,

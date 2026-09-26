@@ -69,6 +69,24 @@ impl Sysroot {
         Arc::new(Self { objects: dir.join("objects"), manifest, children, backings: Mutex::default() })
     }
 
+    /// The names in a sysroot directory.
+    #[must_use]
+    pub fn children(&self, dir: &[u8]) -> Vec<Vec<u8>> {
+        self.children.get(dir).cloned().unwrap_or_default()
+    }
+
+    /// Whether the sysroot holds `guest` (any kind of entry).
+    #[must_use]
+    pub fn has(&self, guest: &[u8]) -> bool {
+        self.entry(guest).is_some()
+    }
+
+    /// A sysroot file's bytes.
+    #[must_use]
+    pub fn read(&self, guest: &[u8]) -> Option<Vec<u8>> {
+        std::fs::read(self.host_path(guest)?).ok()
+    }
+
     /// Where a regular file's content is on the host; `None` for anything that is not a file.
     #[must_use]
     pub fn host_path(&self, guest: &[u8]) -> Option<PathBuf> {
@@ -185,7 +203,8 @@ pub struct Vfs {
 }
 
 fn is_generated_tree(path: &[u8]) -> bool {
-    [&b"/proc"[..], b"/sys", b"/dev/__properties__"].iter().any(|root| path == *root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/')))
+    path == b"/apex/apex-info-list.xml"
+        || [&b"/proc"[..], b"/sys", b"/dev/__properties__"].iter().any(|root| path == *root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/')))
 }
 
 fn join(components: &[Vec<u8>]) -> Vec<u8> {

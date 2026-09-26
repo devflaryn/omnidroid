@@ -554,6 +554,26 @@ fn sys_getdents64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(out.len() as u64)
 }
 
+/// `fchmod`/`fchown`: a mode or owner the host cannot hold (Windows has neither), so a writable
+/// file accepts it and keeps nothing; the sysroot is read-only.
+fn sys_fchmod(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
+        FileKind::Host { sysroot: true, .. } | FileKind::Synth { .. } => Err(EROFS),
+        _ => Ok(0),
+    }
+}
+
+/// `fchmodat`/`fchownat`: the same, by path.
+fn sys_fchmodat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[1])?;
+    let base = base_dir(p, a[0], &path)?;
+    match p.vfs.resolve(&base, &path, true)?.node {
+        Node::Missing { .. } => Err(ENOENT),
+        Node::HostFile { .. } | Node::HostDir { .. } | Node::Dev(_) => Ok(0),
+        _ => Err(EROFS),
+    }
+}
+
 /// arm64 `struct statfs` (120 bytes) for an ext4 filesystem: every mount here answers as one.
 fn statfs_bytes() -> [u8; 120] {
     let mut b = [0u8; 120];
@@ -620,5 +640,9 @@ pub fn install(table: &mut Table) {
     table.set(nr::GETDENTS64, sys_getdents64);
     table.set(nr::GETCWD, sys_getcwd);
     table.set(nr::STATFS, sys_statfs);
+    table.set(nr::FCHMOD, sys_fchmod);
+    table.set(nr::FCHOWN, sys_fchmod);
+    table.set(nr::FCHMODAT, sys_fchmodat);
+    table.set(nr::FCHOWNAT, sys_fchmodat);
     table.set(nr::FSTATFS, sys_fstatfs);
 }

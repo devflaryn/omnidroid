@@ -25,6 +25,8 @@ pub struct PropFiles {
     pub info: Vec<u8>,
     pub serial: Vec<u8>,
     pub area: Vec<u8>,
+    /// `/apex/apex-info-list.xml`, as apexd writes it (sub-project B).
+    pub apex_info: Vec<u8>,
 }
 
 /// What a path under `/proc` or `/sys` names.
@@ -224,6 +226,9 @@ fn cpu_range(_p: &Process) -> Vec<u8> {
 impl Process {
     /// A `/dev/__properties__` file.
     fn blob(&self, path: &[u8]) -> Option<&[u8]> {
+        if path == b"/apex/apex-info-list.xml" {
+            return Some(&self.props.apex_info);
+        }
         let name = path.strip_prefix(b"/dev/__properties__/")?;
         match name {
             b"property_info" => Some(&self.props.info),
