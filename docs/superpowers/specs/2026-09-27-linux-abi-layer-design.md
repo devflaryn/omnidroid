@@ -32,9 +32,12 @@ specific to Roblox.
 
 The current Roblox path is untouched until D.
 
-**The binaries.** A prebuilt, Apache-licensed `aosp_arm64` build for **Android 15 (API 35)**
-(Roblox's `targetSdkVersion`) from ci.android.com, no Google apps, pinned by sha256 as the APK
-is. No AOSP source build until a patch is unavoidable.
+**The binaries.** ci.android.com publishes no Android 15 `aosp_arm64` builds (its release
+branches report no targets), so the pinned image is the Android SDK's "Default Android System
+Image" for arm64-v8a, API 35 (`arm64-v8a-35_r02.zip`, sha1
+`2026a06409db630b56711afdbffb457c1dbaed49`): an AOSP build without Google apps, distributed under
+the Android SDK license. It stays local and is never committed. No AOSP source build until a patch
+is unavoidable.
 
 ## 1. Scope
 
@@ -64,10 +67,15 @@ properties, scudo), then the program's own code. Nothing on this path is emulate
 
 **The sysroot.**
 - `tools/make_sysroot.py`, run once on the Linux machine (`simg2img`, `fsck.erofs --extract`,
-  `deapexer`), turns the pinned image into a plain tree: `/system`, `/system_ext`, `/product`,
+  `deapexer`), turns the pinned image into a manifest-backed tree: `/system`, `/system_ext`, `/product`,
   and every `/apex/<name>` flattened (`com.android.runtime` has bionic and `linker64`,
   `com.android.art` has ART).
-- `sysroot.manifest` pins every file by sha256. A run refuses a tree that differs.
+- `sysroot.manifest` records every directory, file (mode, size, sha256) and symlink. Files are
+  stored by content (`objects/<sha256[:2]>/<sha256>`): seven AOSP ringtones differ only by case,
+  which NTFS cannot hold, and Windows reserves names like `con`. Symlinks are not created on disk
+  (Windows cannot hold them without privileges); `omni-linux`'s `vfs` resolves them from the
+  manifest. A run checks the manifest's own sha256 and every file's size; `make_sysroot.py
+  --verify` checks every file's hash.
 - Mounted read-only into each instance and shared by all of them. `/data`, `/dev`, `/proc` and
   `/tmp` are per instance.
 

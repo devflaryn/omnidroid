@@ -36,3 +36,6 @@ __pycache__/
 # dynarmic's CMake runs `mig` on macOS and writes the Mach exception stubs into the SOURCE tree
 # (`src/dynarmic/CMakeLists.txt`, the APPLE branch). Generated per SDK; never part of the pin.
 crates/dynarmic-sys/vendor/dynarmic/src/dynarmic/backend/*/mig/
+
+# The AOSP sysroot (tools/make_sysroot.py): Google's image, not ours to redistribute
+/sysroot/
