@@ -60,7 +60,7 @@ const SESSION_TEST: &str = "initialize_native_code_returns_a_native_code_and_the
 const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 
 const USAGE: &str = "\
-usage: omnidroid play  [--apk <path>] [--cookie <file|value>] [--place <id>] [--join-delay <s>]
+usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [--join-delay <s>]
                        [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
        omnidroid which [--apk <path>]
        omnidroid login [<username> [<password>]] [--dir <dir>]
@@ -91,9 +91,23 @@ struct Options {
     data_dir: Option<PathBuf>,
 }
 
+/// The command and the arguments after it. Options with no command in front of them mean
+/// `play`: `omnidroid --cookie <file> --place <id>` is how the owner starts a game.
+fn command_and_rest(args: impl Iterator<Item = String>) -> (Option<String>, Vec<String>) {
+    let mut args: Vec<String> = args.collect();
+    if args.is_empty() {
+        return (None, args);
+    }
+    if args[0].starts_with("--") && !matches!(args[0].as_str(), "--help") {
+        return (Some("play".to_string()), args);
+    }
+    let command = args.remove(0);
+    (Some(command), args)
+}
+
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let command = args.next();
+    let (command, rest) = command_and_rest(std::env::args().skip(1));
+    let args = rest.into_iter();
     if command.as_deref() == Some("login") {
         return match parse_login(args) {
             Ok(login_options) => login(&login_options),
@@ -635,6 +649,17 @@ mod tests {
         assert!(!cookie_is_new_for(&dir, VALUE), "the same file again: the store's cookie is kept");
         assert!(cookie_is_new_for(&dir, "_|WARNING:-a-new-export|_X"), "a new export is planted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn options_without_a_command_mean_play() {
+        let split = |a: &[&str]| command_and_rest(a.iter().map(|s| (*s).to_string()));
+        let (command, rest) = split(&["--cookie", "c.txt", "--place", "1"]);
+        assert_eq!(command.as_deref(), Some("play"));
+        assert_eq!(rest, ["--cookie", "c.txt", "--place", "1"]);
+        let (command, rest) = split(&["login", "name"]);
+        assert_eq!((command.as_deref(), rest.as_slice()), (Some("login"), &["name".to_string()][..]));
+        assert_eq!(split(&[]).0, None);
     }
 
     #[test]
