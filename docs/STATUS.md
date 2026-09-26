@@ -49,6 +49,7 @@ whether Roblox's integrity check passes.
 | Vulkan forwarding | verified on Windows, macOS | Linux: the engine refuses lavapipe as emulated, so unreached there |
 | GLES forwarding | verified on Linux (X11) | Windows (ANGLE) and macOS hosts not started |
 | Headless EGL (`set_driverless`) | verified on Windows, Linux | Mac not re-run |
+| Headless mode (`--headless`, `--no-window`, `--control`; D40) | verified on Windows (Vulkan), Linux (GLES: X11, no display, llvmpipe) | stock APK, PS99. w2: the engine's GPU timer 3.7-4.6 ms/frame drawn, 0.87-1.13 headless; the game's 3D engine 22.5-23.3% -> 7.8%. l1/l2: 12-15 -> 18-22 fps (GPU-bound Quadro). l3 (llvmpipe, no display): 4-6 -> 18-21 fps. Screenshots while headless are the real frame; `headless off` redraws at once. macOS not run |
 | Audio (`libaaudio.so`) | verified | WASAPI, ALSA (`audio_live_linux`), Core Audio (`mac-win-` rows) |
 | Window, keyboard, mouse | verified | Win32; Xlib incl. Xwayland; AppKit. Native Wayland not started |
 | Host cursor following the engine | verified on Windows (w33, w34) | Linux on Xvfb tests; macOS type-checked only |

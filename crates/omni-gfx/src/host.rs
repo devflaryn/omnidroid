@@ -1085,11 +1085,11 @@ impl GfxVulkanHost {
     /// makes is destroyed before it returns.
     ///
     /// The requirement: the swapchain must have been created with
-    /// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` in its `imageUsage`. That is the guest's choice, not this
-    /// host's — and it is deliberately not added behind the guest's back, because a swapchain
-    /// created with usage the engine did not ask for is a different swapchain from the one it
-    /// asked for. A guest that omits it gets a driver error from the copy rather than a silent
-    /// success.
+    /// `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` in its `imageUsage`. Since D40 this host adds it to the
+    /// guest's usage whenever the surface supports it (headless mode's screenshot needs it; the
+    /// images and everything the guest can query about them are unchanged), so only a surface
+    /// without it leaves a swapchain unreadable -- and then the copy is a driver error rather than
+    /// a silent success.
     ///
     /// # Errors
     ///
