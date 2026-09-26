@@ -52,7 +52,7 @@ pub struct Process {
     /// The process's futex wait queue (A4).
     pub futexes: crate::futex::Futexes,
     /// Live tasks by tid, with the handle that stops each one's run (A4).
-    tasks: Mutex<std::collections::HashMap<i32, omni_cpu::HaltHandle>>,
+    tasks: Mutex<std::collections::HashMap<i32, TaskHandle>>,
     /// Signalled when a task ends, for `run` waiting on the others.
     task_ended: parking_lot::Condvar,
     next_tid: std::sync::atomic::AtomicI32,
@@ -63,12 +63,22 @@ pub struct Process {
     pub argv: Vec<Vec<u8>>,
     /// The main thread's name (`/proc/<pid>/comm`): argv[0]'s basename until `PR_SET_NAME`.
     pub comm: Mutex<Vec<u8>>,
+    /// The `[vdso]` page's `__kernel_rt_sigreturn`: where a handler returns when its action has no
+    /// `SA_RESTORER` (bionic on arm64 sets none; the kernel uses the vDSO's trampoline). 0 before
+    /// `spawn` maps it.
+    pub sigtramp: std::sync::atomic::AtomicU64,
     /// `/dev/__properties__`: property_info, properties_serial and the one context's area (A3).
     pub props: crate::procfs::PropFiles,
     backend: Option<DynarmicBackend>,
     start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
     scratch: u64,
+}
+
+/// What other tasks reach of a task: the handle that stops its run and its pending signals.
+struct TaskHandle {
+    halt: omni_cpu::HaltHandle,
+    pending: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub struct Task {
@@ -83,6 +93,10 @@ pub struct Task {
     pub exit: Option<Exit>,
     /// `x0`..`x30` and `sp` at a `clone`, captured by the syscall entry for `clone` only.
     pub clone_regs: Option<([u64; 31], u64)>,
+    /// Signals posted to this task and not yet delivered (bit `n - 1` for signal `n`).
+    pub pending: Arc<std::sync::atomic::AtomicU64>,
+    /// Set by `rt_sigreturn`: the run loop restores the frame at `sp`.
+    pub sigreturn: bool,
 }
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
@@ -99,7 +113,7 @@ fn altstack_disabled() -> [u8; 24] {
 impl Task {
     #[must_use]
     pub fn new(tid: i32, process: Arc<Process>) -> Self {
-        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None }
+        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false }
     }
 }
 
@@ -125,7 +139,8 @@ fn on_svc(call: &mut ThunkCall<'_>) {
         eprintln!("[{}] {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x}", task.tid, name_of(number), args[0], args[1], args[2], args[3], result);
     }
     call.set_x(0, result);
-    if task.exit.is_some() {
+    let deliverable = task.pending.load(std::sync::atomic::Ordering::SeqCst) & !task.sigmask != 0;
+    if task.exit.is_some() || task.sigreturn || deliverable {
         call.defer_to_caller();
     }
 }
@@ -175,6 +190,7 @@ impl Process {
             argv,
             comm: Mutex::new(comm),
             props,
+            sigtramp: std::sync::atomic::AtomicU64::new(0),
             backend,
             start: Mutex::new(None),
             exit: Mutex::new(None),
@@ -223,6 +239,13 @@ impl Process {
         let stack = p.mm.map(&p, &loader, MapRequest { addr: 0, len: STACK_BYTES + page, prot: 3, flags: 0x22 | 0x20000, fd: -1, offset: 0 }).map_err(|e| format!("the main stack: {e:?}"))?;
         p.mm.protect(stack, page, 0).map_err(|e| format!("the stack guard: {e:?}"))?;
         p.mm.label(stack + page, STACK_BYTES, b"[stack]");
+        // A one-page `[vdso]` holding the kernel's signal trampoline: `mov x8, #139; svc #0`.
+        let vdso = p.mm.map(&p, &loader, MapRequest { addr: 0, len: page, prot: 3, flags: 0x22, fd: -1, offset: 0 }).map_err(|e| format!("the vdso page: {e:?}"))?;
+        let trampoline: Vec<u8> = [0xD280_1168u32, 0xD400_0001].iter().flat_map(|w| w.to_le_bytes()).collect();
+        p.mem.write(vdso, &trampoline).map_err(|e| format!("the vdso page: {e:?}"))?;
+        p.mm.protect(vdso, page, 5).map_err(|e| format!("the vdso page: {e:?}"))?;
+        p.mm.label(vdso, page, b"[vdso]");
+        p.sigtramp.store(vdso, std::sync::atomic::Ordering::Relaxed);
         let top = stack + STACK_BYTES + page;
         let mut random = [0u8; 16];
         omni_platform::process::random_bytes(&mut random).map_err(|e| format!("AT_RANDOM: {e}"))?;
@@ -256,7 +279,9 @@ impl Process {
         let task: *mut Task = Box::into_raw(Box::new(Task::new(PID, Arc::clone(self))));
         cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
         cpu.set_sp(sp as usize);
-        self.tasks.lock().insert(PID, cpu.halt_handle());
+        // SAFETY: `task` is live (just made); nothing else reaches it yet.
+        let pending = Arc::clone(unsafe { &(*task).pending });
+        self.tasks.lock().insert(PID, TaskHandle { halt: cpu.halt_handle(), pending });
         let (status, asked) = self.run_task(&mut *cpu, task, pc);
         drop(cpu);
         // SAFETY: `task` came from `Box::into_raw` above, and the only other path to it, the CPU's
@@ -270,8 +295,8 @@ impl Process {
         while !tasks.is_empty() {
             self.task_ended.wait_for(&mut tasks, std::time::Duration::from_millis(200));
             if let Some(ending) = self.group_exit.lock().clone() {
-                for halt in tasks.values() {
-                    halt.request();
+                for handle in tasks.values() {
+                    handle.halt.request();
                 }
                 let _ = ending;
             }
@@ -315,8 +340,8 @@ impl Process {
                 *ending = Some(status);
             }
         }
-        for halt in self.tasks.lock().values() {
-            halt.request();
+        for handle in self.tasks.lock().values() {
+            handle.halt.request();
         }
         self.futexes.interrupt_all();
     }
@@ -337,9 +362,10 @@ impl Process {
         let mut task = Task::new(tid, Arc::clone(self));
         task.clear_child_tid = clear_child_tid;
         task.sigmask = parent.sigmask;
+        let pending = Arc::clone(&task.pending);
         let task: *mut Task = Box::into_raw(Box::new(task));
         cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
-        self.tasks.lock().insert(tid, cpu.halt_handle());
+        self.tasks.lock().insert(tid, TaskHandle { halt: cpu.halt_handle(), pending });
         let pc = parent.pc + 4;
         let process = Arc::clone(self);
         let task_addr = task as usize;
@@ -355,6 +381,16 @@ impl Process {
             self.tasks.lock().remove(&tid);
             crate::errno::EAGAIN
         })
+    }
+
+    /// Post `sig` to task `tid`: pending there, its run stopped so the loop delivers it, and its
+    /// futex wait (if any) ended with `EINTR`.
+    pub(crate) fn post_signal(&self, tid: i32, sig: i32) {
+        if let Some(handle) = self.tasks.lock().get(&tid) {
+            handle.pending.fetch_or(1 << (sig - 1), std::sync::atomic::Ordering::SeqCst);
+            handle.halt.request();
+        }
+        self.futexes.interrupt(tid);
     }
 
     /// The next thread id.
@@ -394,15 +430,36 @@ impl Process {
                     return (ExitStatus::Killed { signal, pc: at as u64, detail }, asked);
                 }
                 (ExitReason::UnsupportedInstruction { pc: at, encoding }, None) if encoding & 0xFFE0_001F == 0xD400_0001 => {
-                    // An SVC deferred for another reason (A5: signal delivery).
-                    pc = at as u64 + 4;
+                    // A syscall deferred for signals: `rt_sigreturn`, or one left deliverable.
+                    // SAFETY: as for `asked` above.
+                    let returning = unsafe { std::mem::replace(&mut (*task).sigreturn, false) };
+                    pc = if returning { self.sigreturn(cpu, task) } else { at as u64 + 4 };
+                    match self.deliver_pending(cpu, task, pc) {
+                        Ok(next) => pc = next,
+                        Err(killed) => return (killed, None),
+                    }
                 }
                 (ExitReason::Halted { pc: at }, _) => {
-                    // Another task ended the process; otherwise a spurious halt, and on we go.
+                    // Another task ended the process, or posted a signal to this one.
                     if let Some(ending) = self.group_exit.lock().clone() {
                         return (ending, Some(Exit::Group(0)));
                     }
-                    pc = at as u64;
+                    cpu.halt_handle().clear();
+                    match self.deliver_pending(cpu, task, at as u64) {
+                        Ok(next) => pc = next,
+                        Err(killed) => return (killed, None),
+                    }
+                }
+                (ExitReason::MemoryFault { pc: at, address, access }, _) if self.handles(11) => {
+                    let address = crate::guest::untag(address as u64);
+                    let mapped = self.mem.space().region_at(address as usize).is_some_and(|r| r.mapping.is_some());
+                    let code = if mapped { crate::signal::SEGV_ACCERR } else { crate::signal::SEGV_MAPERR };
+                    let info = crate::signal::SigInfo { signo: 11, code, addr: address, pid: 0, uid: 0 };
+                    let _ = access;
+                    match self.deliver(cpu, task, info, at as u64, address) {
+                        Ok(next) => pc = next,
+                        Err(killed) => return (killed, None),
+                    }
                 }
                 (ExitReason::MemoryFault { pc: at, address, access }, _) => {
                     let detail = format!("{access:?} at {address:#x}\n{}", self.registers(cpu));
@@ -414,6 +471,105 @@ impl Process {
                 }
             }
         }
+    }
+
+    /// Whether the guest has a handler for `sig` (not the default, not ignored).
+    fn handles(&self, sig: i32) -> bool {
+        self.sys.action(sig).0 > 1
+    }
+
+    /// The task's registers now, with `pc` where it resumes.
+    fn read_regs(cpu: &dyn GuestCpu, pc: u64) -> crate::signal::Regs {
+        let mut regs = crate::signal::Regs { sp: cpu.sp() as u64, pc, pstate: cpu.nzcv().to_pstate(), ..Default::default() };
+        for (n, x) in regs.x.iter_mut().enumerate() {
+            *x = cpu.x(XReg::new(n as u8).expect("x0..x30"));
+        }
+        for (n, v) in regs.v.iter_mut().enumerate() {
+            *v = cpu.v(omni_cpu::VReg::new(n as u8).expect("v0..v31"));
+        }
+        regs
+    }
+
+    /// Deliver the lowest-numbered pending signal the task does not block, if any; answers where
+    /// the task resumes.
+    fn deliver_pending(&self, cpu: &mut dyn GuestCpu, task: *mut Task, pc: u64) -> Result<u64, ExitStatus> {
+        // SAFETY: `task` is live for the loop and no reference to it is held across `cpu.run`.
+        let (pending, mask) = unsafe { (Arc::clone(&(*task).pending), (*task).sigmask) };
+        let ready = pending.load(std::sync::atomic::Ordering::SeqCst) & !mask;
+        if ready == 0 {
+            return Ok(pc);
+        }
+        let sig = ready.trailing_zeros() as i32 + 1;
+        pending.fetch_and(!(1u64 << (sig - 1)), std::sync::atomic::Ordering::SeqCst);
+        let info = crate::signal::SigInfo { signo: sig, code: crate::signal::SI_TKILL, addr: 0, pid: self.sys.pid, uid: self.sys.uid };
+        self.deliver(cpu, task, info, pc, 0)
+    }
+
+    /// Run the guest's handler for `info.signo`: build the kernel's frame below `sp` (or on the
+    /// alternate stack), point the task at the handler, and block what the action asks.
+    fn deliver(&self, cpu: &mut dyn GuestCpu, task: *mut Task, info: crate::signal::SigInfo, pc: u64, fault_address: u64) -> Result<u64, ExitStatus> {
+        const SA_ONSTACK: u64 = 0x0800_0000;
+        const SA_RESTORER: u64 = 0x0400_0000;
+        const SA_NODEFER: u64 = 0x4000_0000;
+        const SA_RESETHAND: u64 = 0x8000_0000;
+        let sig = info.signo;
+        let (handler, flags, restorer, sa_mask) = self.sys.action(sig);
+        let killed = |detail: String| ExitStatus::Killed { signal: sig, pc, detail };
+        match handler {
+            0 if (17..=28).contains(&sig) && matches!(sig, 17 | 18 | 23 | 28) => return Ok(pc),
+            0 => return Err(killed(format!("the default action of signal {sig}\n{}", self.registers(cpu)))),
+            1 => return Ok(pc),
+            _ => {}
+        }
+        let mut regs = Self::read_regs(cpu, pc);
+        regs.fault_address = fault_address;
+        if self.trace {
+            eprintln!("[deliver] signal {sig} handler {handler:#x} flags {flags:#x} restorer {restorer:#x} mask {sa_mask:#x} pc {pc:#x} sp {:#x}", regs.sp);
+        }
+        // SAFETY: as in `deliver_pending`.
+        let (mask, altstack) = unsafe { ((*task).sigmask, (*task).altstack) };
+        let at = crate::signal::placement(regs.sp, altstack, flags & SA_ONSTACK != 0);
+        let frame = crate::signal::Frame::build(&regs, &info, mask, altstack);
+        if self.mem.write(at, &frame).is_err() {
+            return Err(killed(format!("signal {sig}: no room for its frame at {at:#x}\n{}", self.registers(cpu))));
+        }
+        let x = |n: u8| XReg::new(n).expect("a general-purpose register");
+        cpu.set_x(x(0), sig as u64);
+        cpu.set_x(x(1), at);
+        cpu.set_x(x(2), at + crate::signal::UCONTEXT_OFFSET as u64);
+        cpu.set_x(x(29), at + crate::signal::RECORD_OFFSET as u64);
+        let sigtramp = self.sigtramp.load(std::sync::atomic::Ordering::Relaxed);
+        cpu.set_x(x(30), if flags & SA_RESTORER != 0 { restorer } else { sigtramp });
+        cpu.set_sp(at as usize);
+        let block = sa_mask | if flags & SA_NODEFER == 0 { 1 << (sig - 1) } else { 0 };
+        // SAFETY: as in `deliver_pending`.
+        unsafe { (*task).sigmask = mask | (block & !((1 << 8) | (1 << 18))) };
+        if flags & SA_RESETHAND != 0 {
+            self.sys.reset_action(sig);
+        }
+        Ok(handler)
+    }
+
+    /// `rt_sigreturn`: every register, the flags, the vector registers and the mask back from the
+    /// frame at `sp`; answers where the task resumes.
+    fn sigreturn(&self, cpu: &mut dyn GuestCpu, task: *mut Task) -> u64 {
+        let sp = cpu.sp() as u64;
+        let Ok(bytes) = self.mem.read(sp, crate::signal::FRAME_BYTES) else {
+            self.refusals.record(format!("rt_sigreturn: no frame at sp {sp:#x}"), 0, 0);
+            return cpu.pc() as u64;
+        };
+        let (regs, mask) = crate::signal::Frame::parse(&bytes);
+        for (n, v) in regs.x.iter().enumerate() {
+            cpu.set_x(XReg::new(n as u8).expect("x0..x30"), *v);
+        }
+        for (n, v) in regs.v.iter().enumerate() {
+            cpu.set_v(omni_cpu::VReg::new(n as u8).expect("v0..v31"), *v);
+        }
+        cpu.set_sp(regs.sp as usize);
+        cpu.set_nzcv(omni_cpu::Nzcv::from_pstate(regs.pstate));
+        // SAFETY: as in `deliver_pending`.
+        unsafe { (*task).sigmask = mask & !((1 << 8) | (1 << 18)) };
+        regs.pc
     }
 
     /// `pc`, `lr` and `sp` labelled from the file mappings, then `x0`..`x28`: a fault's evidence.

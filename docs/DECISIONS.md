@@ -782,3 +782,14 @@ and `libc.so` (scudo, `libcrypto`'s self-test) and exits 0; `uname -a` and `ls` 
 **Reverses it.** Nothing planned; a sub-project that cannot reach its milestone is reported, not
 worked around with transcription.
 
+**D39 amendment 1 — sub-project A complete on Windows (2026-09-27).** A2 `/proc` and `/sys`
+generated from the process (`procfs`); A3 system properties in bionic's own formats (`props`; the
+properties come from the image's system, system_ext and product partitions plus an omnidroid
+overlay -- the emulator's vendor partition is left out -- and init's derived `ro.product.*` and
+fingerprint); A4 real threads (`clone`, a futex queue with requeue and wake-op, `exit_group`
+halting every task); A5 signal delivery (the kernel's frame; bionic on arm64 sets no
+`SA_RESTORER`, so a one-page `[vdso]` carries `__kernel_rt_sigreturn`). A4 and A5 are proven by
+C programs built with NDK r28c (`tests/fixtures`). A1 also verified on Linux x86-64 (no change)
+and macOS arm64 (the host page is the guest page, 16 KiB). The A1 review's Critical finding -- a
+writable mount escaped with Windows path syntax -- is fixed (`vfs::host_path`).
+

@@ -324,7 +324,7 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         // FUTEX_WAIT: a relative timeout.
         0 => {
             let deadline = if a[3] == 0 { None } else { Some(Instant::now() + read_timespec(p, a[3])?) };
-            p.futexes.wait(&p.mem, a[0], a[2] as u32, all, deadline)
+            p.futexes.wait(&p.mem, a[0], a[2] as u32, all, deadline, t.tid)
         }
         // FUTEX_WAIT_BITSET: an absolute timeout on CLOCK_MONOTONIC (or REALTIME with the flag).
         9 => {
@@ -335,7 +335,7 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
                 let at = read_timespec(p, a[3])?;
                 Some(Instant::now() + at.saturating_sub(now(p, clock)?))
             };
-            p.futexes.wait(&p.mem, a[0], a[2] as u32, a[5] as u32, deadline)
+            p.futexes.wait(&p.mem, a[0], a[2] as u32, a[5] as u32, deadline, t.tid)
         }
         1 => p.futexes.wake(a[0], a[2], all),
         10 => p.futexes.wake(a[0], a[2], a[5] as u32),
@@ -349,12 +349,33 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     }
 }
 
-/// Send `sig` to this task. A1 has one thread and no delivery (A5): the default action is carried
-/// out -- terminate, or nothing for the signals ignored by default -- and a handler the guest
-/// installed is recorded as a refusal, not run.
+/// A signal's disposition: (handler, flags, restorer, mask) from `rt_sigaction`'s store.
+impl SysState {
+    #[must_use]
+    pub fn action(&self, sig: i32) -> (u64, u64, u64, u64) {
+        let a = self.actions.lock()[sig as usize];
+        let word = |i: usize| u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().expect("8"));
+        (word(0), word(1), word(2), word(3))
+    }
+
+    /// `SA_RESETHAND`: back to the default action once delivered.
+    pub fn reset_action(&self, sig: i32) {
+        self.actions.lock()[sig as usize] = [0; 32];
+    }
+}
+
+/// Signals ignored when their action is the default.
+fn ignored_by_default(sig: u64) -> bool {
+    matches!(sig, 17 | 18 | 23 | 28)
+}
+
+/// Send `sig` to task `target` (a tid; the process id or 0/-1 mean this task). A handler makes it
+/// pending on the target, which the target's run loop delivers (A5); the default action is carried
+/// out here -- terminate, or nothing for the signals ignored by default.
 fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
-    let live = i32::try_from(target).is_ok_and(|tid| p.tids().contains(&tid));
-    if !live && target != i64::from(t.tid) && target != i64::from(p.sys.pid) && target != 0 && target != -1 {
+    let own = target == i64::from(t.tid) || target == i64::from(p.sys.pid) || target == 0 || target == -1;
+    let tid = if own { t.tid } else { i32::try_from(target).map_err(|_| ESRCH)? };
+    if !own && !p.tids().contains(&tid) {
         return Err(ESRCH);
     }
     if sig == 0 {
@@ -363,22 +384,38 @@ fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
     if !(1..=64).contains(&sig) {
         return Err(EINVAL);
     }
-    let handler = u64::from_le_bytes(p.sys.actions.lock()[sig as usize][..8].try_into().expect("8 bytes"));
+    let (handler, ..) = p.sys.action(sig as i32);
     match handler {
         1 => Ok(0), // SIG_IGN
         0 => {
             match sig {
-                17 | 18 | 23 | 28 => {}                          // SIGCHLD, SIGCONT, SIGURG, SIGWINCH: ignored
+                _ if ignored_by_default(sig) => {}
                 19..=22 => p.refusals.record(format!("stop by signal {sig}"), t.pc, t.lr),
-                _ => t.exit = Some(Exit::Signal(sig as i32)),     // terminate
+                _ => t.exit = Some(Exit::Signal(sig as i32)), // terminate
             }
             Ok(0)
         }
+        _ if tid == t.tid => {
+            t.pending.fetch_or(1 << (sig - 1), std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
         _ => {
-            p.refusals.record(format!("signal delivery to a handler (A5): signal {sig}"), t.pc, t.lr);
+            p.post_signal(tid, sig as i32);
             Ok(0)
         }
     }
+}
+
+/// `rt_sigreturn`: the run loop restores the frame at `sp` (the syscall entry defers to it).
+fn sys_rt_sigreturn(_p: &Process, t: &mut Task, _a: [u64; 6]) -> SysResult {
+    t.sigreturn = true;
+    Ok(0)
+}
+
+fn sys_rt_sigpending(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let pending = t.pending.load(std::sync::atomic::Ordering::SeqCst) & t.sigmask;
+    p.mem.write_u64(a[0], pending)?;
+    Ok(0)
 }
 
 fn sys_kill(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -402,6 +439,8 @@ pub fn install(table: &mut Table) {
     table.set(nr::TKILL, sys_tkill);
     table.set(nr::TGKILL, sys_tgkill);
     table.set(nr::RT_TGSIGQUEUEINFO, sys_tgkill);
+    table.set(nr::RT_SIGRETURN, sys_rt_sigreturn);
+    table.set(nr::RT_SIGPENDING, sys_rt_sigpending);
     table.set(nr::GETPID, sys_getpid);
     table.set(nr::GETPPID, sys_getppid);
     table.set(nr::GETTID, sys_gettid);

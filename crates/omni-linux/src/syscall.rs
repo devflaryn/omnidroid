@@ -35,7 +35,7 @@ pub mod nr {
         SCHED_GET_PRIORITY_MIN = 126 => "sched_get_priority_min", KILL = 129 => "kill", TKILL = 130 => "tkill",
         TGKILL = 131 => "tgkill", SIGALTSTACK = 132 => "sigaltstack",
         RT_SIGACTION = 134 => "rt_sigaction", RT_SIGPROCMASK = 135 => "rt_sigprocmask",
-        RT_SIGRETURN = 139 => "rt_sigreturn", RT_TGSIGQUEUEINFO = 240 => "rt_tgsigqueueinfo", UNAME = 160 => "uname", GETRLIMIT = 163 => "getrlimit",
+        RT_SIGPENDING = 136 => "rt_sigpending", RT_SIGRETURN = 139 => "rt_sigreturn", RT_TGSIGQUEUEINFO = 240 => "rt_tgsigqueueinfo", UNAME = 160 => "uname", GETRLIMIT = 163 => "getrlimit",
         GETRUSAGE = 165 => "getrusage", UMASK = 166 => "umask", PRCTL = 167 => "prctl", GETTIMEOFDAY = 169 => "gettimeofday",
         GETPID = 172 => "getpid", GETPPID = 173 => "getppid", GETUID = 174 => "getuid",
         GETEUID = 175 => "geteuid", GETGID = 176 => "getgid", GETEGID = 177 => "getegid",

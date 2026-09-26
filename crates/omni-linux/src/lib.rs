@@ -14,6 +14,7 @@ pub mod mm;
 pub mod process;
 pub mod procfs;
 pub mod props;
+pub mod signal;
 pub mod sys;
 pub mod syscall;
 pub mod vfs;

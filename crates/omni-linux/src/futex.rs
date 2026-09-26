@@ -17,6 +17,7 @@ const ETIMEDOUT: Errno = Errno(110);
 struct Waiter {
     id: u64,
     bitset: u32,
+    tid: i32,
 }
 
 #[derive(Default)]
@@ -26,6 +27,8 @@ struct State {
     next_id: u64,
     /// Set by `interrupt_all` (the process is ending): every wait answers `EINTR`.
     interrupted: bool,
+    /// Tasks a signal was posted to: their current or next wait answers `EINTR` once.
+    interrupted_tids: HashSet<i32>,
 }
 
 impl State {
@@ -79,7 +82,7 @@ fn read_u32(mem: &GuestMem, addr: u64) -> Result<u32, Errno> {
 impl Futexes {
     /// `FUTEX_WAIT`/`FUTEX_WAIT_BITSET`: sleep while `*addr == expected`, until woken, the
     /// deadline, or an interrupt.
-    pub fn wait(&self, mem: &GuestMem, addr: u64, expected: u32, bitset: u32, deadline: Option<Instant>) -> SysResult {
+    pub fn wait(&self, mem: &GuestMem, addr: u64, expected: u32, bitset: u32, deadline: Option<Instant>, tid: i32) -> SysResult {
         if bitset == 0 {
             return Err(EINVAL);
         }
@@ -93,12 +96,12 @@ impl Futexes {
         }
         st.next_id += 1;
         let id = st.next_id;
-        st.queues.entry(key).or_default().push_back(Waiter { id, bitset });
+        st.queues.entry(key).or_default().push_back(Waiter { id, bitset, tid });
         loop {
             if st.woken.remove(&id) {
                 return Ok(0);
             }
-            if st.interrupted {
+            if st.interrupted || st.interrupted_tids.remove(&tid) {
                 st.remove(id);
                 return Err(EINTR);
             }
@@ -216,6 +219,18 @@ impl Futexes {
     #[must_use]
     pub fn waiters(&self, addr: u64) -> usize {
         self.state.lock().queues.get(&untag(addr)).map_or(0, VecDeque::len)
+    }
+
+    /// End `tid`'s wait with `EINTR` (a signal was posted to it); if it is not waiting, its next
+    /// wait ends at once.
+    pub fn interrupt(&self, tid: i32) {
+        let mut st = self.state.lock();
+        let waiting = st.queues.values().flatten().any(|w| w.tid == tid);
+        if waiting {
+            st.interrupted_tids.insert(tid);
+        }
+        drop(st);
+        self.cv.notify_all();
     }
 
     /// End every wait, now and later, with `EINTR`: the process is exiting.
