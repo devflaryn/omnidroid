@@ -67,6 +67,10 @@ use omni_mem::{
 };
 use omni_platform::net::NetPolicy;
 
+/// The guest heap the APK's second native library allocates out of, and the handlers that hand it
+/// out. Its own tests run without a guest at all.
+mod payload;
+
 /// **This runtime's Rust heap, counted when `OMNI_MEM_REPORT` asks** (`omni_android::memreport`):
 /// `System` plus one relaxed load when it does not.
 #[global_allocator]
@@ -109,6 +113,30 @@ fn chosen_apk() -> &'static omni_apk::ChosenApk {
 /// verified against a real GPU, now driven by the engine instead of by assembled test code.
 const GRAPHICS_GATE: &str = "OMNI_GFX_WINDOW_TESTS";
 const MAIN_LIB: &str = "libroblox.so";
+
+/// **The APK's second native library, named by its role and not by its version.**
+///
+/// The package ships eleven `arm64-v8a` libraries; this is the app's compression JNI library, whose
+/// file name carries the upstream version it was built from (`libzstd-jni-1.5.7-6.so` in the APK
+/// this gate ran). The prefix is what identifies it, so a package built against a newer upstream is
+/// found and loaded by the same code and nothing here pins a version -- the same rule
+/// [`chosen_apk`] follows for the package itself.
+///
+/// On a device the Java side loads it; here nothing did, so its constructors and any `JNI_OnLoad`
+/// it exports never ran. [`Guest::load`] loads it the way the device's linker would and the
+/// scripted sequence boots it where `ActivitySplash.onCreate` would.
+const COMPRESSION_LIB_PREFIX: &str = "libzstd-jni";
+
+/// Slots the boundary gets **beyond** the engine's own account, for the second library.
+///
+/// A flat figure rather than a measured one: the second library's imports that the layer does not
+/// already answer are a handful (its allocator), and the rest of the headroom is room for a refusal
+/// table that a future build of it would need -- so a build that imports one more name than this
+/// one does gets a slot rather than a region that ran out.
+const COMPRESSION_HEADROOM: usize = 256;
+
+/// What `OMNI_MEM_REPORT` calls the arena the second library allocates out of.
+const COMPRESSION_HEAP: &str = "the compression library's guest heap";
 
 /// `DT_INIT_ARRAY` entries in 2.738.1397's `libroblox.so`, the figure M3's and M4's gates assert
 /// against that fixture. This gate runs whatever APK [`chosen_apk`] chose (the modified 2.739.691
@@ -585,6 +613,57 @@ fn cached_main_lib() -> &'static Path {
     })
 }
 
+/// The APK's second native library: where the cache put it, what it is called, and where a device
+/// would keep it.
+///
+/// Extracted through the same [`omni_apk::LibraryCache`] into the same cache directory as
+/// [`cached_main_lib`], because it is the same kind of thing: an entry the package stores
+/// compressed, which a device's installer writes out beside `base.apk` before the linker maps it.
+struct SecondLibrary {
+    /// The cache entry the APK's bytes were extracted to.
+    path: PathBuf,
+    /// Its file name, as the APK carries it.
+    file_name: String,
+    /// Where a device's installer puts it, and the name the guest sees for the mapping.
+    guest_path: String,
+    /// Its length, extracted.
+    bytes: u64,
+}
+
+fn cached_compression_lib() -> &'static SecondLibrary {
+    static LIBRARY: OnceLock<SecondLibrary> = OnceLock::new();
+    LIBRARY.get_or_init(|| {
+        let apk = omni_apk::Apk::open(apk_path()).expect("the real APK must open");
+        let cache = omni_apk::LibraryCache::new(
+            repo_root().join("target").join("omni-elf-fixtures").join("extraction-cache"),
+        );
+        let mut matching: Vec<_> = apk
+            .native_libraries_for_abi("arm64-v8a")
+            .into_iter()
+            .filter(|l| l.file_name().starts_with(COMPRESSION_LIB_PREFIX))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "the APK must carry exactly one `{COMPRESSION_LIB_PREFIX}*` library for arm64-v8a, and \
+             it carries {}: {:?}",
+            matching.len(),
+            matching.iter().map(omni_apk::NativeLibrary::file_name).collect::<Vec<_>>()
+        );
+        let library = matching.remove(0);
+        let file_name = library.file_name().to_string();
+        let cached = cache.extract(&apk, library.entry()).expect("extract the compression library");
+        let path = cached.path().to_path_buf();
+        let bytes = std::fs::metadata(&path).expect("the cache entry's length").len();
+        SecondLibrary {
+            guest_path: format!("{GUEST_LIB_DIR}/{file_name}"),
+            path,
+            file_name,
+            bytes,
+        }
+    })
+}
+
 /// A file's bytes in pages of their own, given back to the host when dropped.
 ///
 /// **Not a `Vec`**: a freed heap allocation is the host allocator's to keep. MEASURED on macOS
@@ -641,6 +720,12 @@ fn main_lib_bytes() -> &'static [u8] {
 
 /// Where the package's own APK is, as the guest sees it: a device's `base.apk`.
 const GUEST_APK: &str = "/data/app/com.roblox.client/base.apk";
+
+/// Where the package manager extracts the package's native libraries: beside `base.apk`.
+///
+/// [`GUEST_LIB`] is this directory and `libroblox.so`; the second library's guest path
+/// ([`SecondLibrary::guest_path`]) is this directory and whatever the APK calls it.
+const GUEST_LIB_DIR: &str = "/data/app/com.roblox.client/lib/arm64";
 
 /// Where the package manager puts `libroblox.so` on a device: beside `base.apk`, in `lib/arm64/`.
 ///
@@ -715,6 +800,7 @@ struct Guest {
     process_args: [GuestArg; 3],
     exports: std::collections::BTreeMap<String, GuestAddr>,
     _backing: Arc<Backing>,
+    _compression_backing: Arc<Backing>,
     _root: Scratch,
 }
 
@@ -811,6 +897,26 @@ impl Guest {
         let backing = Backing::open_named(&lib_at, MapExecutability::Executable, GUEST_LIB)
             .expect("open libroblox.so where the guest sees it");
         let elf = ElfImage::parse(bytes.bytes()).expect("parse libroblox.so");
+        // **And the APK's second native library, staged exactly the same way.** The package stores
+        // it compressed, so a device's installer extracts it beside `base.apk` and the linker maps
+        // it from there; the same file at the same guest path is what `/proc/self/maps` and
+        // `dl_iterate_phdr` then name for it, rather than a host cache path.
+        let compression_lib = cached_compression_lib();
+        let compression_at = root.0.join(compression_lib.guest_path.trim_start_matches('/'));
+        let _ = std::fs::remove_file(&compression_at);
+        if std::fs::hard_link(&compression_lib.path, &compression_at).is_err() {
+            std::fs::copy(&compression_lib.path, &compression_at)
+                .expect("the compression library into the guest's lib/arm64");
+        }
+        let compression_backing = Backing::open_named(
+            &compression_at,
+            MapExecutability::Executable,
+            &compression_lib.guest_path,
+        )
+        .expect("open the compression library where the guest sees it");
+        let compression_bytes = LoadBytes::read(&compression_lib.path);
+        let compression_elf =
+            ElfImage::parse(compression_bytes.bytes()).expect("parse the compression library");
         // **The device's RAM**, decided once per process and said on stderr: the space's commit
         // ceiling and, below, what the guest is told it has.
         let memory = device_memory();
@@ -910,7 +1016,12 @@ impl Guest {
         let gles_slots = omni_android::gles::bound_symbol_count();
         let builder = BoundaryBuilder::new(
             Arc::clone(&space),
-            TOTAL_IMPORTS + JNI_SLOTS + Ndk::bound_symbols().count() + vulkan_slots + gles_slots,
+            TOTAL_IMPORTS
+                + JNI_SLOTS
+                + Ndk::bound_symbols().count()
+                + vulkan_slots
+                + gles_slots
+                + COMPRESSION_HEADROOM,
             data_bytes,
         )
         .expect("a thunk region");
@@ -1063,6 +1174,68 @@ impl Guest {
         ndk.set_asset_source(Arc::new(ApkAssets::open())).expect("the real APK's assets");
         ndk.set_configuration(device_configuration(&display));
 
+        // ---- the second library's load account ------------------------------------------------
+        //
+        // **Every import of the compression library has a named answer before it is loaded.** Each
+        // undefined symbol in its `.dynsym` falls into exactly one of five outcomes, in this order,
+        // and the report says how many went where:
+        //
+        // * **already bound by the bionic layer** -- the standard libc and pthread names, which are
+        //   the same handlers the engine's own imports reach;
+        // * **bound to this gate's guest heap** ([`payload`]): the allocator it imports and
+        //   `libroblox.so` does not, the engine having linked its own (D17). Checked before weakness
+        //   because a device's libc *does* define these, so a weak reference to one resolves there;
+        // * **weak and supplied by nothing**, so declared absent and left null, exactly as a
+        //   device's linker leaves it -- the guest's own null test then skips the call. A thunk here
+        //   would make the guest take a traced path a device never takes;
+        // * **imported by `libroblox.so` too** and bound by neither: the slot the engine's own load
+        //   makes already answers by name ([`omni_android::AbiError::Unbound`]), and binding this
+        //   name here would change the engine's surface for a symbol this task is not about -- D6
+        //   derives that surface from the stock engine only;
+        // * anything else: a **refusal-by-name** handler, which says that the embedding records the
+        //   call rather than answering it.
+        //
+        // The refusal table is measured rather than declared -- it is whatever this loop is left
+        // with -- so a build of the library that imports a name nobody predicted is refused by name
+        // instead of arriving as a branch to address zero.
+        let engine_imports: std::collections::BTreeSet<&str> = elf
+            .undefined_symbols()
+            .expect("read libroblox.so's .dynsym")
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        let mut compression_imports: Vec<(&str, bool)> = compression_elf
+            .undefined_symbols()
+            .expect("read the compression library's .dynsym")
+            .into_iter()
+            .map(|symbol| (symbol.name, symbol.sym.is_weak()))
+            .collect();
+        compression_imports.sort_unstable();
+        compression_imports.dedup();
+        let mut by_bionic = 0usize;
+        let (mut by_heap, mut left_null, mut engine_answers, mut refused) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for &(name, weak) in &compression_imports {
+            if builder.address_of(name).is_some() {
+                by_bionic += 1;
+            } else if let Some((_, handler)) =
+                payload::ALLOCATOR_HANDLERS.iter().find(|(bound, _)| *bound == name)
+            {
+                builder.bind_inline(name, *handler).expect("bind an allocator the library imports");
+                by_heap.push(name);
+            } else if weak {
+                builder.declare_absent(name).expect("leave a weak import null, as a device does");
+                left_null.push(name);
+            } else if engine_imports.contains(name) {
+                engine_answers.push(name);
+            } else {
+                builder
+                    .bind_inline(name, payload::refuse_by_name)
+                    .expect("bind a refusal naming the symbol");
+                refused.push(name);
+            }
+        }
+
         let shared = Arc::new(builder);
         let object = {
             let mut providers = ProviderRegistry::new();
@@ -1071,6 +1244,23 @@ impl Guest {
             let _label = omni_mem::label_scope(omni_mem::MapLabel::new(omni_android::memreport::LIBRARY));
             loader::load(&space, &backing, &elf, &providers, &LoaderConfig::default())
                 .expect("libroblox.so must load with a thunk boundary")
+        };
+        // **And the compression library, through the same loader into the same boundary.** A second
+        // `ProviderRegistry` with the same handle re-registered: the builder is the one thing both
+        // loads share, which is what makes them one process's link map rather than two.
+        let compression = {
+            let mut providers = ProviderRegistry::new();
+            providers.register(ProviderHandle(Arc::clone(&shared)));
+            let _label =
+                omni_mem::label_scope(omni_mem::MapLabel::new(omni_android::memreport::LIBRARY));
+            loader::load(
+                &space,
+                &compression_backing,
+                &compression_elf,
+                &providers,
+                &LoaderConfig::default(),
+            )
+            .expect("the compression library must load with a thunk boundary")
         };
         let builder = Arc::try_unwrap(shared)
             .unwrap_or_else(|_| panic!("the registry must have released the builder"));
@@ -1086,18 +1276,121 @@ impl Guest {
         // **`.bss`, labelled as Android's linker labels it**: each PT_LOAD's whole pages past its
         // file image, `prctl(PR_SET_VMA_ANON_NAME, ".bss")` in `linker_phdr.cpp`. What
         // `/proc/self/maps` then shows as `[anon:.bss]`.
-        for segment in elf.load_segments() {
-            let page = space.page_size() as u64;
-            let file_end = (segment.p_vaddr + segment.p_filesz).div_ceil(page) * page;
-            let mem_end = (segment.p_vaddr + segment.p_memsz).div_ceil(page) * page;
-            if mem_end > file_end {
-                bionic.name_anonymous_mapping(
-                    object.base as u64 + file_end,
-                    mem_end - file_end,
-                    ".bss",
-                );
+        //
+        // One closure, called for **both** loaded images, so the second library's `.bss` is labelled
+        // by the same rule as the engine's rather than by a second copy of it.
+        let label_bss = |image: &ElfImage<'_>, base: GuestAddr| {
+            for segment in image.load_segments() {
+                let page = space.page_size() as u64;
+                let file_end = (segment.p_vaddr + segment.p_filesz).div_ceil(page) * page;
+                let mem_end = (segment.p_vaddr + segment.p_memsz).div_ceil(page) * page;
+                if mem_end > file_end {
+                    bionic.name_anonymous_mapping(base as u64 + file_end, mem_end - file_end, ".bss");
+                }
             }
+        };
+        label_bss(&elf, object.base);
+        // The compression library, registered and labelled the same way: `dl_iterate_phdr` walks
+        // both images because a device's linker would have both in its link map.
+        bionic
+            .register_image(&compression.dl_phdr_info())
+            .expect("register the compression library's image");
+        omni_android::memreport::register_image(
+            &compression_lib.file_name,
+            compression.base,
+            compression.span(),
+        );
+        label_bss(&compression_elf, compression.base);
+
+        // **The guest heap the compression library allocates out of** ([`payload`]). The reservation
+        // is free and only touched pages commit, so what the run pays is what the library asks for.
+        let heap_base = {
+            let _label = omni_mem::label_scope(omni_mem::MapLabel::new(COMPRESSION_HEAP));
+            space
+                .map_anonymous(
+                    Placement::Anywhere { align: space.page_size() },
+                    payload::ARENA_BYTES,
+                    Protection::ReadWrite,
+                    CommitPolicy::Lazy,
+                )
+                .expect("a guest heap for the compression library")
+        };
+        payload::install(Arc::new(Mutex::new(payload::GuestHeap::over(
+            heap_base,
+            payload::ARENA_BYTES,
+        ))));
+
+        // **The load account, closed against what the loader actually resolved.** The only imports
+        // left unresolved must be the weak ones this gate declared absent on purpose: a strong
+        // import with no slot is a hole in the compatibility layer, and this is where it is named
+        // rather than discovered when the guest branches to zero.
+        let mut unresolved: Vec<&str> =
+            compression.imports.unresolved.iter().map(|i| i.name.as_str()).collect();
+        unresolved.sort_unstable();
+        assert_eq!(
+            unresolved, left_null,
+            "the compression library's unresolved imports must be exactly the weak ones left null"
+        );
+        assert_eq!(
+            compression.imports.total(),
+            compression_imports.len(),
+            "the loader and the account read the same `.dynsym`"
+        );
+
+        let compression_exports: std::collections::BTreeMap<String, GuestAddr> = compression_elf
+            .exported_symbols()
+            .expect("read the compression library's .dynsym")
+            .into_iter()
+            .filter(|symbol| symbol.name.starts_with("Java_") || symbol.name == "JNI_OnLoad")
+            .map(|symbol| {
+                (symbol.name.to_string(), compression.base + symbol.sym.st_value as GuestAddr)
+            })
+            .collect();
+        // Every export address is inside the image the loader mapped. Not a claim about *which*
+        // exports these bytes have -- that is the APK's to decide -- but about the load bias having
+        // been applied to each one.
+        for (name, at) in &compression_exports {
+            assert!(
+                *at >= compression.start && *at < compression.end,
+                "`{name}` is at {at:#x}, outside the loaded image [{:#x}, {:#x})",
+                compression.start,
+                compression.end
+            );
         }
+        let _ = writeln!(
+            std::io::stderr(),
+            "PAYLOAD: the APK's second native library, {} bytes at {}",
+            compression_lib.bytes,
+            compression_lib.guest_path
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "PAYLOAD LOAD: {} boundary slots, {} distinct imports, {} refusal(s)",
+            boundary.slots().count(),
+            compression_imports.len(),
+            refused.len()
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "PAYLOAD IMPORTS: {by_bionic} answered by the bionic layer, {} by this gate's guest \
+             heap {by_heap:?}, {} weak and left null {left_null:?}, {} the engine imports too \
+             {engine_answers:?}, {} refused by name {refused:?}",
+            by_heap.len(),
+            left_null.len(),
+            engine_answers.len(),
+            refused.len()
+        );
+        let _ = writeln!(
+            std::io::stderr(),
+            "PAYLOAD EXPORTS: {} `Java_*` native(s), and {}",
+            compression_exports.keys().filter(|name| name.starts_with("Java_")).count(),
+            if compression_exports.contains_key("JNI_OnLoad") {
+                "a `JNI_OnLoad`"
+            } else {
+                "no `JNI_OnLoad`: this build's natives are exported symbols the Java side binds by \
+                 name, which is a fact about these bytes and not a gap in this layer"
+            }
+        );
         // **OMNI_FILE_TRACE=1**: every path the guest probes (`open`, `stat`, `lstat`, `access`,
         // `opendir`) with its answer, and every raw `svc #0` with its number, arguments, result
         // and -- for an `openat` -- its path. For finding what a check that goes looking for files
@@ -1176,6 +1469,7 @@ impl Guest {
             ],
             exports,
             _backing: backing,
+            _compression_backing: compression_backing,
             _root: root,
         }
     }
