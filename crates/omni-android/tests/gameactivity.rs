@@ -620,14 +620,19 @@ fn cached_main_lib() -> &'static Path {
 /// [`cached_main_lib`], because it is the same kind of thing: an entry the package stores
 /// compressed, which a device's installer writes out beside `base.apk` before the linker maps it.
 struct SecondLibrary {
-    /// The cache entry the APK's bytes were extracted to.
+    /// The file the loader maps: the extraction cache's entry, or -- for a substituted build --
+    /// the decrypted image ([`payload::identity`] says which, and why).
     path: PathBuf,
     /// Its file name, as the APK carries it.
     file_name: String,
     /// Where a device's installer puts it, and the name the guest sees for the mapping.
     guest_path: String,
-    /// Its length, extracted.
+    /// Its length, as loaded.
     bytes: u64,
+    /// Which build of this library's name these bytes are.
+    build: payload::identity::Build,
+    /// sha256 of the entry **as the APK carries it**, whether or not that is the file loaded.
+    entry_sha256: String,
 }
 
 fn cached_compression_lib() -> &'static SecondLibrary {
@@ -653,13 +658,33 @@ fn cached_compression_lib() -> &'static SecondLibrary {
         let library = matching.remove(0);
         let file_name = library.file_name().to_string();
         let cached = cache.extract(&apk, library.entry()).expect("extract the compression library");
-        let path = cached.path().to_path_buf();
-        let bytes = std::fs::metadata(&path).expect("the cache entry's length").len();
+        let mut path = cached.path().to_path_buf();
+        let mut bytes = std::fs::metadata(&path).expect("the cache entry's length").len();
+
+        // **Which build of this library's name the APK carries, decided by digest.**
+        // [`payload::identity`] holds the two builds this project has measured, and the reason the
+        // decision is a sha256 rather than the length: 603,960 against 9,756,464 is a length, and a
+        // count cannot see a substitution. A pair matching neither build stops the run there.
+        let entry_sha256 = payload::identity::hex(&payload::identity::sha256_of_file(&path));
+        let build = payload::identity::build_of(bytes, &entry_sha256);
+        // **And, for a substituted build, the file that is loaded instead.** Its `.text` is
+        // encrypted on disk and the decryptor asks for a write-and-execute mapping, which this
+        // runtime refuses (D12), so the image is loaded already decrypted -- the same bytes with
+        // `.text` rewritten, asserted by digest, and its two `.dyncall` constructors skipped
+        // because the offline pass that produced it already ran them. The guest path, the file name
+        // and the staging are unchanged: `/proc/self/maps` and `dl_iterate_phdr` name the same
+        // library on a device either way, and only the contents of the mapping differ.
+        if build == payload::identity::Build::Substituted {
+            path = payload::identity::decrypted_image(&repo_root());
+            bytes = std::fs::metadata(&path).expect("the decrypted image's length").len();
+        }
         SecondLibrary {
             guest_path: format!("{GUEST_LIB_DIR}/{file_name}"),
             path,
             file_name,
             bytes,
+            build,
+            entry_sha256,
         }
     })
 }
@@ -802,6 +827,12 @@ struct Guest {
     compression: LoadedObject,
     /// Its `JNI_OnLoad`, if it exports one, and its `Java_*` natives, by name.
     compression_exports: std::collections::BTreeMap<String, GuestAddr>,
+    /// Which build of this library's name was loaded, and the file it came from
+    /// ([`payload::identity`]).
+    compression_lib: &'static SecondLibrary,
+    /// The section each skipped constructor's code was measured to be in. Reported, never asserted
+    /// on its own: the assertion that they are `.dyncall` is made where it is measured.
+    compression_stub_sections: Vec<String>,
     stack_top: GuestAddr,
     process_args: [GuestArg; 3],
     exports: std::collections::BTreeMap<String, GuestAddr>,
@@ -1308,6 +1339,88 @@ impl Guest {
         );
         label_bss(&compression_elf, compression.base);
 
+        // **Which section each `init_array` entry's code lives in**, and which entries this build's
+        // image must not run.
+        //
+        // **Measured on the loaded image, not on the file**, and that is not a detail: the file's
+        // `DT_INIT_ARRAY` slots are all **zero** (MEASURED on both builds' bytes, 197 of 197), and
+        // they are supposed to be -- the constructor addresses reach them through the image's
+        // `R_AARCH64_RELATIVE` relocations, which the loader has now applied. Reading
+        // `ElfImage::init_array()` here reported every entry as address 0 and every one of them
+        // inside `.comment`, which is the section whose link-time range covers 0.
+        //
+        // So the addresses are the loaded object's, unbiased by its base, and looked up in the
+        // section table. What is asserted is that this build's two skipped entries are the two
+        // `.dyncall` ones and that the first entry that *is* run is not -- "these two and no
+        // others", measured rather than assumed.
+        let compression_stub_sections = {
+            let names = payload::identity::section_names(compression_bytes.bytes(), &compression_elf);
+            let entries = &compression.init_array;
+            let base = compression.base as u64;
+            let section_of = |index: usize| -> Option<String> {
+                let entry = entries.get(index).copied()?;
+                payload::identity::section_holding(&names, &compression_elf, entry - base)
+                    .map(str::to_string)
+            };
+            let mut histogram: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for index in 0..entries.len() {
+                if let Some(name) = section_of(index) {
+                    *histogram.entry(Box::leak(name.into_boxed_str())).or_insert(0) += 1;
+                }
+            }
+            let _ = writeln!(
+                std::io::stderr(),
+                "PAYLOAD BUILD: {} — the APK entry is {} bytes, sha256 {}; {} bytes mapped, {} \
+                 `init_array` entries",
+                compression_lib.build.label(),
+                compression_lib.build.measured().len,
+                compression_lib.entry_sha256,
+                compression_bytes.bytes().len(),
+                entries.len()
+            );
+            let _ = writeln!(
+                std::io::stderr(),
+                "PAYLOAD SECTIONS: the section each entry's code is in, {:?} (and the first three: {:?})",
+                histogram,
+                (0..entries.len().min(3)).map(section_of).collect::<Vec<_>>()
+            );
+            let skipped = compression_lib.build.skipped_constructors();
+            for (position, &index) in skipped.iter().enumerate() {
+                let found = section_of(index);
+                assert!(
+                    index < entries.len(),
+                    "this build skips init_array[{index}] of {} entries",
+                    entries.len()
+                );
+                assert_eq!(
+                    found.as_deref(),
+                    Some(".dyncall"),
+                    "the entry this build skips at init_array[{index}] is not inside `.dyncall`, so \
+                     what would be skipped is not the decryptor: {found:?}"
+                );
+                if position > 0 {
+                    assert_eq!(
+                        index,
+                        skipped[0] + position,
+                        "the skipped entries are not consecutive from init_array[{}], so they are \
+                         not the two halves of one decryptor",
+                        skipped[0]
+                    );
+                }
+            }
+            if let Some(first_ran) = skipped.last().map(|last| last + 1) {
+                if first_ran < entries.len() {
+                    assert_ne!(
+                        section_of(first_ran).as_deref(),
+                        Some(".dyncall"),
+                        "init_array[{first_ran}] is also inside `.dyncall`, so skipping only the two \
+                         named entries would still run a decryptor stub"
+                    );
+                }
+            }
+            skipped.iter().filter_map(|&index| section_of(index)).collect::<Vec<_>>()
+        };
+
         // **The guest heap the compression library allocates out of** ([`payload`]). The reservation
         // is free and only touched pages commit, so what the run pays is what the library asks for.
         let heap_base = {
@@ -1469,6 +1582,8 @@ impl Guest {
             object,
             compression,
             compression_exports,
+            compression_lib,
+            compression_stub_sections,
             stack_top,
             process_args: [
                 GuestArg::Int(1),
@@ -6277,6 +6392,19 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
     let misses_before = guest.jni.misses().len();
 
     let total = guest.compression.init_array.len();
+    // **The entries this build's image must not run** ([`payload::identity`]). Empty for the stock
+    // library, which declares no `DT_INIT_ARRAY` at all. For a substituted build it is the two
+    // `.dyncall` entries, whose section `Guest::load` measured and asserted; they are reported
+    // rather than counted, because a count of what did *not* run is not evidence about anything.
+    let skipped = guest.compression_lib.build.skipped_constructors();
+    if !skipped.is_empty() {
+        let _ = writeln!(
+            out,
+            "PAYLOAD CONSTRUCTORS: skipping init_array{skipped:?} — {:?}, already run by the pass \
+             that decrypted this image",
+            guest.compression_stub_sections
+        );
+    }
     let (completed, stopped) = {
         let _bionic = guest.bionic.activate().expect("publish the bionic instance");
         let _jni = guest.jni.activate().expect("publish the JNI instance");
@@ -6284,6 +6412,9 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
         let mut completed = 0usize;
         let mut stopped = None;
         for (index, &entry) in guest.compression.init_array.iter().enumerate() {
+            if skipped.contains(&index) {
+                continue;
+            }
             let caller = format!("the compression library's init_array[{index}]");
             match guest.boundary.call_guest(
                 cpu,
@@ -6303,7 +6434,8 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
     };
     let _ = writeln!(
         out,
-        "PAYLOAD CONSTRUCTORS: {completed}/{total} completed{}",
+        "PAYLOAD CONSTRUCTORS: {completed}/{} completed{}",
+        total - skipped.len(),
         match &stopped {
             None => String::new(),
             Some((index, error)) => format!(", stopped at [{index}]: {error}"),
@@ -6311,10 +6443,15 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
     );
     assert!(
         stopped.is_none(),
-        "every constructor the compression library declares has to return through the sentinel, \
-         and one did not"
+        "every constructor the compression library declares, beyond the {} this build's image has \
+         already run, has to return through the sentinel — and one did not",
+        skipped.len()
     );
-    assert_eq!(completed, total, "every `init_array` entry the library declares was called");
+    assert_eq!(
+        completed,
+        total - skipped.len(),
+        "every `init_array` entry this build's image has left to run was called"
+    );
 
     // **`JNI_OnLoad`, if these bytes export one.** MEASURED on 2.738.1397's build: they do not --
     // its natives are exported symbols the Java side binds by name, which is what `RegisterNatives`
@@ -6322,6 +6459,41 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
     // gate inventing an entry point, so the line says what was found instead.
     match guest.compression_exports.get("JNI_OnLoad").copied() {
         Some(on_load) => {
+            // **The classes this library registers its own natives on, declared before the call.**
+            // MEASURED: without them its `JNI_OnLoad` reached `RegisterNatives` with a null class
+            // and the layer refused it — which is the right answer from the layer and the wrong
+            // state for the guest, because on a device those classes exist in the APK's dex. See
+            // [`payload::REGISTRATION_CLASSES`]; the misses printed below name anything else.
+            //
+            // **Empty shells on purpose.** A shell has no members, so every member lookup on one is
+            // *recorded* rather than refused, and the report can then show exactly which members
+            // the library's own code reaches for. Declaring answers for members nobody asked about
+            // would be inventing a Java surface.
+            let declared: Vec<&str> = payload::REGISTRATION_CLASSES
+                .iter()
+                .copied()
+                .filter(|name| {
+                    guest.jni.with_registry(|registry| {
+                        if registry.find(name).is_some() {
+                            return false;
+                        }
+                        let _ = registry.declare(&ClassSpec {
+                            name,
+                            tier: Tier::Support,
+                            methods: &[],
+                            fields: &[],
+                        });
+                        true
+                    })
+                })
+                .collect();
+            if !declared.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "PAYLOAD JAVA CLASSES: declared {declared:?} as memberless shells, for the \
+                     natives this build registers on them"
+                );
+            }
             let returned = {
                 let _bionic = guest.bionic.activate().expect("publish the bionic instance");
                 let _jni = guest.jni.activate().expect("publish the JNI instance");
