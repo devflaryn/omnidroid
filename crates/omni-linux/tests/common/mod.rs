@@ -14,14 +14,38 @@ pub fn sysroot() -> Option<PathBuf> {
     dir.join("sysroot.manifest").exists().then_some(dir)
 }
 
+/// An instance directory of its own for each run: tests run in parallel.
+fn instance_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("omni-linux-gate-{}-{n}", std::process::id()))
+}
+
 pub fn run(args: &[&str]) -> Option<(ExitStatus, String, String)> {
+    run_in(instance_dir(), args)
+}
+
+/// Run an NDK-built fixture (`tests/fixtures/<name>`) from the instance's `/data/local/tmp`, as
+/// `adb push` and a shell would.
+pub fn run_fixture(name: &str, args: &[&str]) -> Option<(ExitStatus, String, String)> {
+    let instance = instance_dir();
+    let tmp = instance.join("data/local/tmp");
+    std::fs::create_dir_all(&tmp).expect("the instance's /data/local/tmp");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    std::fs::copy(&fixture, tmp.join(name)).unwrap_or_else(|e| panic!("{}: {e}", fixture.display()));
+    let guest = format!("/data/local/tmp/{name}");
+    let mut argv = vec![guest.as_str()];
+    argv.extend_from_slice(args);
+    run_in(instance, &argv)
+}
+
+fn run_in(instance: PathBuf, args: &[&str]) -> Option<(ExitStatus, String, String)> {
     let Some(sysroot) = sysroot() else {
         eprintln!("SKIPPED: no sysroot (tools/make_sysroot.py, plan Task 1)");
         return None;
     };
     let out = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let err = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let instance = std::env::temp_dir().join(format!("omni-linux-a1-{}", std::process::id()));
     let p = Process::spawn(SpawnConfig {
         sysroot,
         instance_dir: instance,
@@ -37,4 +61,3 @@ pub fn run(args: &[&str]) -> Option<(ExitStatus, String, String)> {
     let s = |b: &Arc<parking_lot::Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock()).into_owned();
     Some((status, s(&out), s(&err)))
 }
-

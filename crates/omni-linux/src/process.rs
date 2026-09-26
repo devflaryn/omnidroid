@@ -51,6 +51,13 @@ pub struct Process {
     pub sys: SysState,
     /// The process's futex wait queue (A4).
     pub futexes: crate::futex::Futexes,
+    /// Live tasks by tid, with the handle that stops each one's run (A4).
+    tasks: Mutex<std::collections::HashMap<i32, omni_cpu::HaltHandle>>,
+    /// Signalled when a task ends, for `run` waiting on the others.
+    task_ended: parking_lot::Condvar,
+    next_tid: std::sync::atomic::AtomicI32,
+    /// How the process ends, once something has ended it (`exit_group`, a fatal signal or fault).
+    group_exit: Mutex<Option<ExitStatus>>,
     pub trace: bool,
     /// The program's arguments, as `/proc/<pid>/cmdline` reports them.
     pub argv: Vec<Vec<u8>>,
@@ -74,6 +81,8 @@ pub struct Task {
     pub altstack: [u8; 24],
     pub name: Vec<u8>,
     pub exit: Option<Exit>,
+    /// `x0`..`x30` and `sp` at a `clone`, captured by the syscall entry for `clone` only.
+    pub clone_regs: Option<([u64; 31], u64)>,
 }
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
@@ -90,7 +99,7 @@ fn altstack_disabled() -> [u8; 24] {
 impl Task {
     #[must_use]
     pub fn new(tid: i32, process: Arc<Process>) -> Self {
-        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None }
+        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None }
     }
 }
 
@@ -103,6 +112,13 @@ fn on_svc(call: &mut ThunkCall<'_>) {
     let args = [call.x(0), call.x(1), call.x(2), call.x(3), call.x(4), call.x(5)];
     task.pc = call.address() as u64;
     task.lr = call.lr() as u64;
+    if number == crate::syscall::nr::CLONE {
+        let mut regs = [0u64; 31];
+        for (n, r) in regs.iter_mut().enumerate() {
+            *r = call.x(n as u32);
+        }
+        task.clone_regs = Some((regs, call.sp() as u64));
+    }
     let process = Arc::clone(&task.process);
     let result = process.syscall(task, number, args);
     if process.trace {
@@ -151,6 +167,10 @@ impl Process {
             mm: Mm::new(space),
             sys: SysState::new(PID, UID),
             futexes: crate::futex::Futexes::default(),
+            tasks: Mutex::new(std::collections::HashMap::new()),
+            task_ended: parking_lot::Condvar::new(),
+            next_tid: std::sync::atomic::AtomicI32::new(PID + 1),
+            group_exit: Mutex::new(None),
             trace,
             argv,
             comm: Mutex::new(comm),
@@ -185,7 +205,8 @@ impl Process {
                 .map_err(|e| format!("reserve the guest address space: {e}"))?,
         );
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
-        let options = DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() };
+        // 128 guest threads: ART alone starts about twenty, and Roblox runs dozens.
+        let options = DynarmicOptions { top_byte_ignore: true, max_threads: 128, ..DynarmicOptions::default() };
         let backend = DynarmicBackend::new(Arc::clone(&space), options).map_err(|e| format!("the CPU backend: {e}"))?;
         let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(backend), 0);
         let mut loader = Task::new(PID, Arc::clone(&p));
@@ -222,11 +243,11 @@ impl Process {
     }
 
     /// Run the main task to its end; `exit_group` or its last `exit` ends the process.
+    /// Run the program to its end: `exit_group`, a fatal signal or fault, or its last thread's
+    /// `exit`. Every other thread is stopped and joined before this returns.
     pub fn run(self: &Arc<Self>) -> ExitStatus {
         let (pc, sp) = self.start.lock().expect("spawned");
-        let backend = self.backend.as_ref().expect("a spawned process has a backend");
-        let config = GuestThreadConfig::guest_managed(GuestAddressSpace::of(self.mem.space()).expect("the space's extent"));
-        let mut cpu = backend.create_thread(config).expect("the main thread");
+        let mut cpu = self.new_cpu();
         // The task is reached two ways: by `on_svc`, through the context pointer, from inside the
         // JIT; and by the loop below, between runs. So no reference to it may live across
         // `cpu.run` -- a `&mut Task` held there let the optimizer keep `exit` in a register and
@@ -235,23 +256,130 @@ impl Process {
         let task: *mut Task = Box::into_raw(Box::new(Task::new(PID, Arc::clone(self))));
         cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
         cpu.set_sp(sp as usize);
-        let status = self.run_task(&mut *cpu, task, pc);
+        self.tasks.lock().insert(PID, cpu.halt_handle());
+        let (status, asked) = self.run_task(&mut *cpu, task, pc);
         drop(cpu);
         // SAFETY: `task` came from `Box::into_raw` above, and the only other path to it, the CPU's
         // syscall handler, was dropped with the CPU on the line before.
-        drop(unsafe { Box::from_raw(task) });
+        let task = unsafe { Box::from_raw(task) };
+        let status = self.task_finished(&task, status, asked);
+        drop(task);
+        // Wait for the others: they were halted if the process is ending, or they end by
+        // themselves if the main thread only left with `exit`.
+        let mut tasks = self.tasks.lock();
+        while !tasks.is_empty() {
+            self.task_ended.wait_for(&mut tasks, std::time::Duration::from_millis(200));
+            if let Some(ending) = self.group_exit.lock().clone() {
+                for halt in tasks.values() {
+                    halt.request();
+                }
+                let _ = ending;
+            }
+        }
+        drop(tasks);
+        let status = self.group_exit.lock().clone().unwrap_or(status);
         *self.exit.lock() = Some(status.clone());
         status
     }
 
-    fn run_task(&self, cpu: &mut dyn GuestCpu, task: *mut Task, mut pc: u64) -> ExitStatus {
+    fn new_cpu(&self) -> Box<dyn GuestCpu> {
+        let backend = self.backend.as_ref().expect("a spawned process has a backend");
+        let config = GuestThreadConfig::guest_managed(GuestAddressSpace::of(self.mem.space()).expect("the space's extent"));
+        backend.create_thread(config).expect("a guest thread")
+    }
+
+    /// A task has ended: a thread's `exit` clears and wakes its `clear_child_tid` (what
+    /// `pthread_join` waits on); anything else ends the process -- every other task is halted and
+    /// every wait interrupted. Answers the status the task ended with.
+    fn task_finished(&self, task: &Task, status: ExitStatus, asked: Option<Exit>) -> ExitStatus {
+        match asked {
+            Some(Exit::Thread(_)) => {
+                if task.clear_child_tid != 0 {
+                    let _ = self.mem.write_u32(task.clear_child_tid, 0);
+                    let _ = self.futexes.wake(task.clear_child_tid, 1, u32::MAX);
+                }
+            }
+            _ => self.end_group(status.clone()),
+        }
+        let mut tasks = self.tasks.lock();
+        tasks.remove(&task.tid);
+        self.task_ended.notify_all();
+        status
+    }
+
+    /// End the whole process with `status` (the first ending wins).
+    fn end_group(&self, status: ExitStatus) {
+        {
+            let mut ending = self.group_exit.lock();
+            if ending.is_none() {
+                *ending = Some(status);
+            }
+        }
+        for halt in self.tasks.lock().values() {
+            halt.request();
+        }
+        self.futexes.interrupt_all();
+    }
+
+    /// `clone` with the thread flags: a new task on a new host thread, continuing after the
+    /// parent's `SVC` with `x0 = 0`, `sp = stack` (or the parent's) and `TPIDR_EL0 = tls`.
+    pub(crate) fn spawn_thread(self: &Arc<Self>, parent: &Task, tid: i32, stack: u64, tls: Option<u64>, clear_child_tid: u64) -> Result<(), crate::errno::Errno> {
+        let (regs, parent_sp) = parent.clone_regs.ok_or(crate::errno::EINVAL)?;
+        let mut cpu = self.new_cpu();
+        for (n, value) in regs.iter().enumerate() {
+            cpu.set_x(XReg::new(n as u8).expect("x0..x30"), *value);
+        }
+        cpu.set_x(XReg::new(0).expect("x0"), 0);
+        cpu.set_sp(if stack == 0 { parent_sp } else { stack } as usize);
+        if let Some(tls) = tls {
+            cpu.set_tpidr_el0(tls as usize);
+        }
+        let mut task = Task::new(tid, Arc::clone(self));
+        task.clear_child_tid = clear_child_tid;
+        task.sigmask = parent.sigmask;
+        let task: *mut Task = Box::into_raw(Box::new(task));
+        cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
+        self.tasks.lock().insert(tid, cpu.halt_handle());
+        let pc = parent.pc + 4;
+        let process = Arc::clone(self);
+        let task_addr = task as usize;
+        let spawned = std::thread::Builder::new().name(format!("omni-linux-{tid}")).spawn(move || {
+            let task = task_addr as *mut Task;
+            let (status, asked) = process.run_task(&mut *cpu, task, pc);
+            drop(cpu);
+            // SAFETY: from `Box::into_raw` above; the CPU that could reach it is dropped.
+            let task = unsafe { Box::from_raw(task) };
+            process.task_finished(&task, status, asked);
+        });
+        spawned.map(|_| ()).map_err(|_| {
+            self.tasks.lock().remove(&tid);
+            crate::errno::EAGAIN
+        })
+    }
+
+    /// The next thread id.
+    pub(crate) fn allocate_tid(&self) -> i32 {
+        self.next_tid.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The tids of every live task, lowest first.
+    #[must_use]
+    pub fn tids(&self) -> Vec<i32> {
+        let mut tids: Vec<i32> = self.tasks.lock().keys().copied().collect();
+        if tids.is_empty() {
+            tids.push(PID); // a process that has not started runs as its main task
+        }
+        tids.sort_unstable();
+        tids
+    }
+
+    fn run_task(&self, cpu: &mut dyn GuestCpu, task: *mut Task, mut pc: u64) -> (ExitStatus, Option<Exit>) {
         loop {
             let exit = match cpu.run(pc as usize, RunLimit::Unlimited) {
                 Ok(e) => e,
                 Err(e) => {
-                    let detail = format!("the CPU backend: {e}
-{}", self.registers(cpu));
-                    return ExitStatus::Killed { signal: 6, pc: cpu.pc() as u64, detail };
+                    let detail = format!("the CPU backend: {e}\n{}", self.registers(cpu));
+                    return (ExitStatus::Killed { signal: 6, pc: cpu.pc() as u64, detail }, None);
                 }
             };
             // SAFETY: `task` is live for the whole loop (see `run`), and no reference to it is held
@@ -259,26 +387,30 @@ impl Process {
             let asked = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*task).exit)) };
             match (exit, asked) {
                 (ExitReason::UnsupportedInstruction { .. }, Some(Exit::Group(code) | Exit::Thread(code))) => {
-                    return ExitStatus::Exited(code);
+                    return (ExitStatus::Exited(code & 0xff), asked);
                 }
                 (ExitReason::UnsupportedInstruction { pc: at, .. }, Some(Exit::Signal(signal))) => {
-                    let detail = format!("the default action of signal {signal}
-{}", self.registers(cpu));
-                    return ExitStatus::Killed { signal, pc: at as u64, detail };
+                    let detail = format!("the default action of signal {signal}\n{}", self.registers(cpu));
+                    return (ExitStatus::Killed { signal, pc: at as u64, detail }, asked);
                 }
                 (ExitReason::UnsupportedInstruction { pc: at, encoding }, None) if encoding & 0xFFE0_001F == 0xD400_0001 => {
-                    // An SVC deferred for another reason (A5: signal delivery). None exist in A1.
+                    // An SVC deferred for another reason (A5: signal delivery).
                     pc = at as u64 + 4;
                 }
+                (ExitReason::Halted { pc: at }, _) => {
+                    // Another task ended the process; otherwise a spurious halt, and on we go.
+                    if let Some(ending) = self.group_exit.lock().clone() {
+                        return (ending, Some(Exit::Group(0)));
+                    }
+                    pc = at as u64;
+                }
                 (ExitReason::MemoryFault { pc: at, address, access }, _) => {
-                    let detail = format!("{access:?} at {address:#x}
-{}", self.registers(cpu));
-                    return ExitStatus::Killed { signal: 11, pc: at as u64, detail };
+                    let detail = format!("{access:?} at {address:#x}\n{}", self.registers(cpu));
+                    return (ExitStatus::Killed { signal: 11, pc: at as u64, detail }, None);
                 }
                 (other, _) => {
-                    let detail = format!("{other}
-{}", self.registers(cpu));
-                    return ExitStatus::Killed { signal: 4, pc: other.pc() as u64, detail };
+                    let detail = format!("{other}\n{}", self.registers(cpu));
+                    return (ExitStatus::Killed { signal: 4, pc: other.pc() as u64, detail }, None);
                 }
             }
         }

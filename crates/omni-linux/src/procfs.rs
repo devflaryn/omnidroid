@@ -133,7 +133,8 @@ fn status(p: &Process) -> Vec<u8> {
     let _ = write!(out, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t1\nTracerPid:\t0\n");
     let _ = write!(out, "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
     let _ = write!(out, "FDSize:\t64\nGroups:\t\nVmSize:\t{} kB\nVmRSS:\t{} kB\n", mapped_bytes(p) / 1024, committed_pages(p) * 4);
-    let _ = write!(out, "Threads:\t1\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nCpus_allowed_list:\t0-{}\n", cpus() - 1);
+    let threads = p.tids().len();
+    let _ = write!(out, "Threads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nCpus_allowed_list:\t0-{}\n", cpus() - 1);
     out.into_bytes()
 }
 
@@ -285,11 +286,11 @@ impl Process {
         }
         if let Some(task) = tail.strip_prefix("task") {
             if task.is_empty() {
-                return Some(Entry::DynDir(vec![(pid, DT_DIR)]));
+                return Some(Entry::DynDir(self.tids().into_iter().map(|t| (t.to_string(), DT_DIR)).collect()));
             }
             let task = task.strip_prefix('/')?;
             let (tid, inner) = task.split_once('/').unwrap_or((task, ""));
-            if tid != pid {
+            if !tid.parse::<i32>().is_ok_and(|t| self.tids().contains(&t)) {
                 return None;
             }
             return match inner {

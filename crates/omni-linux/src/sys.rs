@@ -79,6 +79,37 @@ fn sys_set_tid_address(_p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_set_robust_list(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(0) }
 
+/// `clone`: only the thread shape (`CLONE_VM | CLONE_SIGHAND | CLONE_THREAD`, as bionic's
+/// `pthread_create` asks); a fork is refused by name.
+fn sys_clone(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    const CLONE_SETTLS: u64 = 0x8_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+    let flags = a[0];
+    let thread = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+    if flags & thread != thread {
+        p.refusals.record(format!("clone: flags {flags:#x} (fork)"), t.pc, t.lr);
+        return Err(ENOSYS);
+    }
+    let (stack, parent_tid, tls, child_tid) = (a[1], a[2], a[3], a[4]);
+    let tid = p.allocate_tid();
+    if flags & CLONE_PARENT_SETTID != 0 {
+        p.mem.write_u32(parent_tid, tid as u32)?;
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        p.mem.write_u32(child_tid, tid as u32)?;
+    }
+    let process = std::sync::Arc::clone(&t.process);
+    let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
+    process.spawn_thread(t, tid, stack, (flags & CLONE_SETTLS != 0).then_some(tls), clear)?;
+    t.clone_regs = None;
+    Ok(tid as u64)
+}
+
 fn sys_exit(_p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     t.exit = Some(Exit::Thread(a[0] as i32));
     Ok(0)
@@ -322,7 +353,8 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 /// out -- terminate, or nothing for the signals ignored by default -- and a handler the guest
 /// installed is recorded as a refusal, not run.
 fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
-    if target != i64::from(t.tid) && target != i64::from(p.sys.pid) && target != 0 && target != -1 {
+    let live = i32::try_from(target).is_ok_and(|tid| p.tids().contains(&tid));
+    if !live && target != i64::from(t.tid) && target != i64::from(p.sys.pid) && target != 0 && target != -1 {
         return Err(ESRCH);
     }
     if sig == 0 {
@@ -378,6 +410,7 @@ pub fn install(table: &mut Table) {
     }
     table.set(nr::SET_TID_ADDRESS, sys_set_tid_address);
     table.set(nr::SET_ROBUST_LIST, sys_set_robust_list);
+    table.set(nr::CLONE, sys_clone);
     table.set(nr::EXIT, sys_exit);
     table.set(nr::EXIT_GROUP, sys_exit_group);
     table.set(nr::RT_SIGACTION, sys_rt_sigaction);
