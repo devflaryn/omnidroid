@@ -354,9 +354,16 @@ fn iovecs(p: &Process, at: u64, count: u64) -> Result<Vec<(u64, usize)>, Errno> 
 
 fn sys_writev(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
+    // The same cap as `write`, on the total: many iovecs naming one large buffer must not make the
+    // host allocate their sum (A2-A5 review, Important 3c).
+    const CAP: usize = 1 << 24;
     let mut bytes = Vec::new();
     for (base, len) in iovecs(p, a[1], a[2])? {
-        bytes.extend_from_slice(&p.mem.read(base, len)?);
+        let take = len.min(CAP - bytes.len());
+        bytes.extend_from_slice(&p.mem.read(base, take)?);
+        if bytes.len() == CAP {
+            break;
+        }
     }
     Ok(write_file(&file, &bytes)? as u64)
 }

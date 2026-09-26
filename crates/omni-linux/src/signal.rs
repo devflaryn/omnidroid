@@ -89,7 +89,7 @@ fn stack_parts(stack: [u8; 24]) -> (u64, i32, u64) {
 pub fn placement(sp: u64, altstack: [u8; 24], onstack: bool) -> u64 {
     let (ss_sp, flags, size) = stack_parts(altstack);
     let on_it = sp > ss_sp && sp <= ss_sp.wrapping_add(size);
-    let top = if onstack && flags & SS_DISABLE == 0 && size != 0 && !on_it { ss_sp + size } else { sp };
+    let top = if onstack && flags & SS_DISABLE == 0 && size != 0 && !on_it { ss_sp.wrapping_add(size) } else { sp };
     top.wrapping_sub(FRAME_BYTES as u64) & !15
 }
 
@@ -97,7 +97,7 @@ pub fn placement(sp: u64, altstack: [u8; 24], onstack: bool) -> u64 {
 fn uc_stack(altstack: [u8; 24], sp: u64) -> [u8; 24] {
     let (ss_sp, flags, size) = stack_parts(altstack);
     let mut s = altstack;
-    if flags & SS_DISABLE == 0 && sp > ss_sp && sp <= ss_sp + size {
+    if flags & SS_DISABLE == 0 && sp > ss_sp && sp <= ss_sp.wrapping_add(size) {
         s[8..12].copy_from_slice(&SS_ONSTACK.to_le_bytes());
     }
     s

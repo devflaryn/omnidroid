@@ -51,12 +51,21 @@ fn timespec(secs: u64, nanos: u32) -> [u8; 16] {
 }
 
 fn read_timespec(p: &Process, at: u64) -> Result<Duration, Errno> {
-    let sec = p.mem.read_u64(at)?;
+    let sec = p.mem.read_u64(at)? as i64;
     let nsec = p.mem.read_u64(at + 8)?;
-    if nsec >= 1_000_000_000 {
+    if sec < 0 || nsec >= 1_000_000_000 {
         return Err(EINVAL);
     }
-    Ok(Duration::new(sec, nsec as u32))
+    Ok(Duration::new(sec as u64, nsec as u32))
+}
+
+/// `now + d`, or no deadline at all when that is beyond what the host's clock can hold.
+fn deadline_after(d: Duration) -> Option<Instant> {
+    Instant::now().checked_add(d)
+}
+
+fn signals(t: &Task) -> crate::futex::Signals<'_> {
+    crate::futex::Signals { pending: &t.pending, mask: t.sigmask }
 }
 
 fn now(p: &Process, clock: u64) -> Result<Duration, Errno> {
@@ -213,21 +222,35 @@ fn sys_gettimeofday(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
-fn sys_nanosleep(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    std::thread::sleep(read_timespec(p, a[0])?);
-    Ok(0)
+/// Sleep for `d`, interruptibly; on `EINTR` write the time left to `remaining` (if not null).
+fn sleep_for(p: &Process, t: &Task, d: Duration, remaining: u64) -> SysResult {
+    let deadline = deadline_after(d);
+    match p.futexes.sleep_until(deadline, signals(t)) {
+        Ok(()) => Ok(0),
+        Err(e) => {
+            if remaining != 0 {
+                let left = deadline.map_or(d, |dl| dl.saturating_duration_since(Instant::now()));
+                p.mem.write(remaining, &timespec(left.as_secs(), left.subsec_nanos()))?;
+            }
+            Err(e)
+        }
+    }
 }
 
-fn sys_clock_nanosleep(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_nanosleep(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let d = read_timespec(p, a[0])?;
+    sleep_for(p, t, d, a[1])
+}
+
+fn sys_clock_nanosleep(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let d = read_timespec(p, a[2])?;
     if a[1] & 1 != 0 {
-        // TIMER_ABSTIME
+        // TIMER_ABSTIME: no remaining time is reported.
         let n = now(p, a[0])?;
-        std::thread::sleep(d.saturating_sub(n));
+        sleep_for(p, t, d.saturating_sub(n), 0)
     } else {
-        std::thread::sleep(d);
+        sleep_for(p, t, d, a[3])
     }
-    Ok(0)
 }
 
 fn sys_getrandom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -323,8 +346,8 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     match a[1] & !(PRIVATE | CLOCK_REALTIME) {
         // FUTEX_WAIT: a relative timeout.
         0 => {
-            let deadline = if a[3] == 0 { None } else { Some(Instant::now() + read_timespec(p, a[3])?) };
-            p.futexes.wait(&p.mem, a[0], a[2] as u32, all, deadline, t.tid)
+            let deadline = if a[3] == 0 { None } else { deadline_after(read_timespec(p, a[3])?) };
+            p.futexes.wait(&p.mem, a[0], a[2] as u32, all, deadline, Some(signals(t)))
         }
         // FUTEX_WAIT_BITSET: an absolute timeout on CLOCK_MONOTONIC (or REALTIME with the flag).
         9 => {
@@ -333,9 +356,9 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             } else {
                 let clock = if a[1] & CLOCK_REALTIME != 0 { 0 } else { 1 };
                 let at = read_timespec(p, a[3])?;
-                Some(Instant::now() + at.saturating_sub(now(p, clock)?))
+                deadline_after(at.saturating_sub(now(p, clock)?))
             };
-            p.futexes.wait(&p.mem, a[0], a[2] as u32, a[5] as u32, deadline, t.tid)
+            p.futexes.wait(&p.mem, a[0], a[2] as u32, a[5] as u32, deadline, Some(signals(t)))
         }
         1 => p.futexes.wake(a[0], a[2], all),
         10 => p.futexes.wake(a[0], a[2], a[5] as u32),

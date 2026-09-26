@@ -17,7 +17,6 @@ const ETIMEDOUT: Errno = Errno(110);
 struct Waiter {
     id: u64,
     bitset: u32,
-    tid: i32,
 }
 
 #[derive(Default)]
@@ -27,8 +26,21 @@ struct State {
     next_id: u64,
     /// Set by `interrupt_all` (the process is ending): every wait answers `EINTR`.
     interrupted: bool,
-    /// Tasks a signal was posted to: their current or next wait answers `EINTR` once.
-    interrupted_tids: HashSet<i32>,
+}
+
+/// A waiting task's signals: its pending set and its mask. A wait ends with `EINTR` as soon as a
+/// pending signal is not blocked -- checked under the queue lock before sleeping and on every
+/// wake, so a signal posted just before the wait began is never lost (A2-A5 review, Critical 1).
+#[derive(Clone, Copy)]
+pub struct Signals<'a> {
+    pub pending: &'a std::sync::atomic::AtomicU64,
+    pub mask: u64,
+}
+
+impl Signals<'_> {
+    fn deliverable(self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst) & !self.mask != 0
+    }
 }
 
 impl State {
@@ -82,13 +94,13 @@ fn read_u32(mem: &GuestMem, addr: u64) -> Result<u32, Errno> {
 impl Futexes {
     /// `FUTEX_WAIT`/`FUTEX_WAIT_BITSET`: sleep while `*addr == expected`, until woken, the
     /// deadline, or an interrupt.
-    pub fn wait(&self, mem: &GuestMem, addr: u64, expected: u32, bitset: u32, deadline: Option<Instant>, tid: i32) -> SysResult {
+    pub fn wait(&self, mem: &GuestMem, addr: u64, expected: u32, bitset: u32, deadline: Option<Instant>, signals: Option<Signals<'_>>) -> SysResult {
         if bitset == 0 {
             return Err(EINVAL);
         }
         let key = key(addr)?;
         let mut st = self.state.lock();
-        if st.interrupted {
+        if st.interrupted || signals.is_some_and(Signals::deliverable) {
             return Err(EINTR);
         }
         if read_u32(mem, addr)? != expected {
@@ -96,12 +108,12 @@ impl Futexes {
         }
         st.next_id += 1;
         let id = st.next_id;
-        st.queues.entry(key).or_default().push_back(Waiter { id, bitset, tid });
+        st.queues.entry(key).or_default().push_back(Waiter { id, bitset });
         loop {
             if st.woken.remove(&id) {
                 return Ok(0);
             }
-            if st.interrupted || st.interrupted_tids.remove(&tid) {
+            if st.interrupted || signals.is_some_and(Signals::deliverable) {
                 st.remove(id);
                 return Err(EINTR);
             }
@@ -221,16 +233,34 @@ impl Futexes {
         self.state.lock().queues.get(&untag(addr)).map_or(0, VecDeque::len)
     }
 
-    /// End `tid`'s wait with `EINTR` (a signal was posted to it); if it is not waiting, its next
-    /// wait ends at once.
-    pub fn interrupt(&self, tid: i32) {
-        let mut st = self.state.lock();
-        let waiting = st.queues.values().flatten().any(|w| w.tid == tid);
-        if waiting {
-            st.interrupted_tids.insert(tid);
-        }
-        drop(st);
+    /// A signal was posted to `tid` (its pending bit is already set): wake every waiter so the one
+    /// that belongs to it sees the bit. Taking the lock first is what orders this after a waiter's
+    /// check, so the wake cannot fall between its check and its sleep.
+    pub fn interrupt(&self, _tid: i32) {
+        drop(self.state.lock());
         self.cv.notify_all();
+    }
+
+    /// Sleep until `deadline` (`None`: forever), a deliverable signal, or the process ending --
+    /// `nanosleep` and `clock_nanosleep`. `Ok` when the time ran out, `EINTR` otherwise.
+    pub fn sleep_until(&self, deadline: Option<Instant>, signals: Signals<'_>) -> Result<(), Errno> {
+        let mut st = self.state.lock();
+        loop {
+            if st.interrupted || signals.deliverable() {
+                return Err(EINTR);
+            }
+            match deadline {
+                Some(d) => {
+                    if Instant::now() >= d || self.cv.wait_until(&mut st, d).timed_out() {
+                        if st.interrupted || signals.deliverable() {
+                            return Err(EINTR);
+                        }
+                        return Ok(());
+                    }
+                }
+                None => self.cv.wait(&mut st),
+            }
+        }
     }
 
     /// End every wait, now and later, with `EINTR`: the process is exiting.

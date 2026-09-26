@@ -1,4 +1,4 @@
-//! `omni-linux-run --sysroot <dir> [--instance <dir>] -- <program> [args...]`
+//! `omni-linux-run --sysroot <dir> [--instance <dir>] [--env KEY=VALUE]... -- <program> [args...]`
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -9,10 +9,12 @@ fn main() -> ExitCode {
     let mut sysroot = PathBuf::from("sysroot/aosp-35");
     let mut instance = std::env::temp_dir().join("omni-linux-run");
     let mut argv = Vec::new();
+    let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
             "--sysroot" => sysroot = PathBuf::from(args.next().expect("--sysroot needs a value")),
             "--instance" => instance = PathBuf::from(args.next().expect("--instance needs a value")),
+            "--env" => envp.push(args.next().expect("--env needs KEY=VALUE").into_bytes()),
             "--" => {
                 argv.extend(args.by_ref().map(String::into_bytes));
             }
@@ -26,7 +28,7 @@ fn main() -> ExitCode {
         sysroot,
         instance_dir: instance,
         argv,
-        envp: vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()],
+        envp,
         stdout: Output::Host,
         stderr: Output::Host,
         trace: std::env::var("OMNI_SYSCALL_TRACE").as_deref() == Ok("1"),

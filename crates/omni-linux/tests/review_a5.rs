@@ -1,0 +1,134 @@
+//! The A2-A5 review's findings, each reproduced before its fix.
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use omni_linux::errno::{EINTR, EINVAL};
+use omni_linux::fd::Output;
+use omni_linux::process::Process;
+use omni_linux::syscall::nr;
+use omni_linux::{manifest, signal, vfs::{Sysroot, Vfs}, Task};
+
+const SIGUSR1: u64 = 10;
+const ETIMEDOUT: i64 = -110;
+
+fn process() -> (Arc<Process>, u64) {
+    let m = manifest::parse("d\t755\t/\n").unwrap();
+    let vfs = Vfs::new(Sysroot::from_manifest(&std::env::temp_dir(), m), vec![], b"/x".to_vec());
+    let p = Process::for_tests(vfs, Output::Capture(Default::default()));
+    let s = p.scratch();
+    (p, s)
+}
+
+fn pend(t: &Task, sig: u64) {
+    t.pending.fetch_or(1 << (sig - 1), Ordering::SeqCst);
+}
+
+/// Critical 1: a signal posted before the task sleeps must still end the sleep.
+#[test]
+fn a_signal_pending_before_a_futex_wait_ends_it_at_once() {
+    let (p, s) = process();
+    p.mem.write_u32(s, 0).unwrap();
+    let mut t = Task::new(2001, Arc::clone(&p));
+    pend(&t, SIGUSR1);
+    let start = Instant::now();
+    assert_eq!(p.syscall(&mut t, nr::FUTEX, [s, 0, 0, 0, 0, 0]) as i64, -(EINTR.0 as i64));
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn a_blocked_pending_signal_does_not_end_a_futex_wait() {
+    let (p, s) = process();
+    p.mem.write_u32(s, 0).unwrap();
+    p.mem.write(s + 64, &[0u8; 8]).unwrap();
+    p.mem.write_u64(s + 72, 20_000_000).unwrap(); // 20 ms
+    let mut t = Task::new(2002, Arc::clone(&p));
+    t.sigmask = 1 << (SIGUSR1 - 1);
+    pend(&t, SIGUSR1);
+    assert_eq!(p.syscall(&mut t, nr::FUTEX, [s, 0, 0, s + 64, 0, 0]) as i64, ETIMEDOUT);
+}
+
+#[test]
+fn a_signal_posted_to_a_task_blocked_in_futex_ends_the_wait() {
+    let (p, s) = process();
+    p.mem.write_u32(s, 0).unwrap();
+    let t = Task::new(2003, Arc::clone(&p));
+    let pending = Arc::clone(&t.pending);
+    let waiter = {
+        let p = Arc::clone(&p);
+        let mut t = t;
+        std::thread::spawn(move || p.syscall(&mut t, nr::FUTEX, [s, 0, 0, 0, 0, 0]) as i64)
+    };
+    while p.futexes.waiters(s) == 0 {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    pending.fetch_or(1 << (SIGUSR1 - 1), Ordering::SeqCst);
+    p.futexes.interrupt(2003);
+    assert_eq!(waiter.join().unwrap(), -(EINTR.0 as i64));
+}
+
+/// Important 2: a sleep ends early for a signal.
+#[test]
+fn nanosleep_is_ended_by_a_signal() {
+    let (p, s) = process();
+    p.mem.write_u64(s, 10).unwrap(); // 10 s
+    p.mem.write_u64(s + 8, 0).unwrap();
+    let t = Task::new(2004, Arc::clone(&p));
+    let pending = Arc::clone(&t.pending);
+    let start = Instant::now();
+    let sleeper = {
+        let p = Arc::clone(&p);
+        let mut t = t;
+        std::thread::spawn(move || p.syscall(&mut t, nr::NANOSLEEP, [s, 0, 0, 0, 0, 0]) as i64)
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    pending.fetch_or(1 << (SIGUSR1 - 1), Ordering::SeqCst);
+    p.futexes.interrupt(2004);
+    assert_eq!(sleeper.join().unwrap(), -(EINTR.0 as i64));
+    assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+}
+
+/// Important 3a: timeouts from the guest never overflow the host's clock arithmetic.
+#[test]
+fn absurd_timeouts_are_errors_not_panics() {
+    let (p, s) = process();
+    p.mem.write_u32(s, 0).unwrap();
+    let mut t = Task::new(2005, Arc::clone(&p));
+    p.mem.write_u64(s + 64, (-1i64) as u64).unwrap(); // tv_sec = -1
+    p.mem.write_u64(s + 72, 0).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::FUTEX, [s, 0, 0, s + 64, 0, 0]) as i64, -(EINVAL.0 as i64));
+    assert_eq!(p.syscall(&mut t, nr::NANOSLEEP, [s + 64, 0, 0, 0, 0, 0]) as i64, -(EINVAL.0 as i64));
+    // An absolute deadline at the end of time: no panic (the pending signal ends the wait).
+    p.mem.write_u64(s + 64, i64::MAX as u64).unwrap();
+    pend(&t, SIGUSR1);
+    assert_eq!(p.syscall(&mut t, nr::FUTEX, [s, 9, 0, s + 64, 0, u32::MAX as u64]) as i64, -(EINTR.0 as i64));
+    let mut t2 = Task::new(2006, Arc::clone(&p));
+    p.mem.write_u64(s + 64, u64::MAX >> 1).unwrap();
+    pend(&t2, SIGUSR1);
+    assert_eq!(p.syscall(&mut t2, nr::FUTEX, [s, 0, 0, s + 64, 0, 0]) as i64, -(EINTR.0 as i64));
+}
+
+/// Important 3c: writev's total is capped as write's is.
+#[test]
+fn writev_of_many_huge_iovecs_is_capped_not_an_abort() {
+    let (p, s) = process();
+    let mut t = Task::new(2007, Arc::clone(&p));
+    let big = p.syscall(&mut t, nr::MMAP, [0, 64 << 20, 3, 0x22, u64::MAX, 0]);
+    assert!((big as i64) > 0);
+    for i in 0..1024u64 {
+        p.mem.write_u64(s + i * 16, big).unwrap();
+        p.mem.write_u64(s + i * 16 + 8, 64 << 20).unwrap();
+    }
+    p.mem.write(s + 20000, b"/dev/null\0").unwrap();
+    let fd = p.syscall(&mut t, nr::OPENAT, [(-100i64) as u64, s + 20000, 1, 0, 0, 0]);
+    let n = p.syscall(&mut t, nr::WRITEV, [fd, s, 1024, 0, 0, 0]) as i64;
+    assert!(n > 0 && n <= 1 << 24, "{n}");
+}
+
+/// Important 3d: a guest-chosen alternate stack at the top of the address space does not overflow.
+#[test]
+fn an_alternate_stack_at_the_top_of_memory_does_not_panic() {
+    let alt = signal::altstack(u64::MAX - 10, 100);
+    let _ = signal::placement(0x1000, alt, true);
+    let _ = signal::placement(u64::MAX - 5, alt, true);
+}
