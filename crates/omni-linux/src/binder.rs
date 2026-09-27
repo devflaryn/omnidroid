@@ -196,8 +196,11 @@ impl State {
         self.procs.entry(id).or_default()
     }
 
-    /// `id`'s handle for `node`, made (and the node held by its owner) if it has none.
-    fn handle_for(&mut self, id: ProcId, node: NodeId) -> u32 {
+    /// `id`'s handle for `node`, made (and the node held by its owner) if it has none. When the
+    /// owner is the sender of the transaction making the handle, the hold (`BR_INCREFS`,
+    /// `BR_ACQUIRE`) goes to the sending thread, ahead of its `BR_TRANSACTION_COMPLETE`, as the
+    /// kernel queues it: the object is held before the sender frees the parcel that carried it.
+    fn handle_for(&mut self, id: ProcId, node: NodeId, sender: Option<(ProcId, i32)>) -> u32 {
         if self.context_mgr == Some(node) {
             return 0;
         }
@@ -212,9 +215,9 @@ impl State {
         if !n.held {
             n.held = true;
             let (owner, ptr, cookie) = (n.owner, n.ptr, n.cookie);
-            let o = self.proc_mut(owner);
-            o.todo.push_back(Work::Increfs { ptr, cookie });
-            o.todo.push_back(Work::Acquire { ptr, cookie });
+            let thread = sender.filter(|(p, _)| *p == owner).map(|(_, t)| t);
+            self.queue(owner, thread, Work::Increfs { ptr, cookie });
+            self.queue(owner, thread, Work::Acquire { ptr, cookie });
         }
         h
     }
@@ -623,7 +626,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
                 if target_proc == file.id {
                     continue;
                 }
-                let h = st.handle_for(target_proc, node);
+                let h = st.handle_for(target_proc, node, Some((file.id, t.tid)));
                 let kind = if kind == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE };
                 rewrite(&mut data, kind, u64::from(h), 0);
             }
@@ -635,7 +638,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
                     let kind = if kind == TYPE_HANDLE { TYPE_BINDER } else { TYPE_WEAK_BINDER };
                     rewrite(&mut data, kind, nptr, ncookie);
                 } else {
-                    let h = st.handle_for(target_proc, node);
+                    let h = st.handle_for(target_proc, node, Some((file.id, t.tid)));
                     rewrite(&mut data, kind, u64::from(h), 0);
                 }
             }
