@@ -24,8 +24,19 @@ const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 
+/// A process's credentials, as a socket's peer knows them: `struct ucred { pid, uid, gid }`.
+pub type Cred = [u32; 3];
+
+/// `p`'s credentials.
+#[must_use]
+pub fn cred_of(p: &Process) -> Cred {
+    [p.sys.pid as u32, p.sys.uid(), p.sys.gid()]
+}
+
 /// The two directions of a socket pair: what each end has been sent, and whether each is open.
 pub struct PairChannel {
+    /// `creds[side]`: the credentials of the process that made that end.
+    creds: [Cred; 2],
     /// `queues[side]`: what `side` has been sent (one entry a message; a stream's are merged).
     queues: Mutex<[std::collections::VecDeque<Vec<u8>>; 2]>,
     open: [std::sync::atomic::AtomicBool; 2],
@@ -36,25 +47,26 @@ pub struct PairChannel {
 /// A socket init makes for a service (`socket <name> <type>`): bound to `/dev/socket/<name>` in
 /// `instance`, as an open file to hand over.
 #[must_use]
-pub fn init_socket(instance: usize, name: &str, ty: u64, pid: u32) -> OpenFile {
+pub fn init_socket(instance: usize, name: &str, ty: u64, cred: Cred) -> OpenFile {
     let path = format!("/dev/socket/{name}");
-    let bound = crate::unix::Bound::bind_replacing(instance, path.as_bytes(), ty);
+    let bound = crate::unix::Bound::bind_replacing(instance, path.as_bytes(), ty, cred);
     let mut addr = (AF_UNIX as u16).to_le_bytes().to_vec();
     addr.extend_from_slice(path.as_bytes());
     addr.push(0);
-    let socket = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Bound(bound)), inbox: std::collections::VecDeque::new(), name: Some(addr), protocol: 0, owner: pid };
+    let socket = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Bound(bound)), inbox: std::collections::VecDeque::new(), name: Some(addr), protocol: 0, owner: cred[0], passcred: false };
     OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(2) }
 }
 
 /// A connected pair of type `ty`: the client end's peer, and the server's socket.
 #[must_use]
-pub fn pair(ty: u64, pid: u32) -> (Peer, Socket) {
+pub fn pair(ty: u64, client: Cred, server: Cred) -> (Peer, Socket) {
     let channel = Arc::new(PairChannel {
+        creds: [client, server],
         queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
         open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
         stream: ty == 1,
     });
-    let server = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side: 1 }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: pid };
+    let server = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side: 1 }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: server[0], passcred: false };
     (Peer::Pair { channel, side: 0 }, server)
 }
 
@@ -86,6 +98,8 @@ pub struct Socket {
     pub protocol: u64,
     /// The port a netlink socket is bound to when it sends unbound: its process's pid.
     pub owner: u32,
+    /// `SO_PASSCRED`: each message received carries its sender's credentials.
+    pub passcred: bool,
 }
 
 /// The property service's protocol 2: `PROP_MSG_SETPROP2`, then the name and the value, each
@@ -211,7 +225,7 @@ fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK) {
         return Err(EAFNOSUPPORT);
     }
-    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new(), name: None, protocol: a[2], owner: p.sys.pid as u32 };
+    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new(), name: None, protocol: a[2], owner: p.sys.pid as u32, passcred: false };
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
     Ok(p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)? as u64)
@@ -264,7 +278,7 @@ fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     // A socket bound to that name (a service's, init's): connected to it. (logdw and the property
     // service above stay the kernel's own: the log is printed where the runtime shows it.)
     if let Some(server) = crate::unix::Bound::find(instance_of(p), &path) {
-        return server.connect(socket, p.sys.pid as u32).map(|()| 0);
+        return server.connect(socket, cred_of(p)).map(|()| 0);
     }
     if p.trace {
         eprintln!("[socket] connect {:?}: no service", String::from_utf8_lossy(&path));
@@ -306,7 +320,7 @@ fn sys_bind(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
     if socket.domain == AF_UNIX {
         let name = unix_path(p, a[1], a[2])?;
-        let bound = crate::unix::Bound::bind(instance_of(p), &name, socket.ty)?;
+        let bound = crate::unix::Bound::bind(instance_of(p), &name, socket.ty, cred_of(p))?;
         socket.name = Some(p.mem.read(a[1], a[2] as usize)?);
         socket.peer = Some(Peer::Bound(bound));
         return Ok(0);
@@ -416,6 +430,14 @@ fn sys_setsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if !is_socket {
         return Err(crate::errno::ENOTSOCK);
     }
+    // SO_PASSCRED.
+    if a[1] == 1 && a[2] == 16 && a[4] >= 4 {
+        let on = p.mem.read_u32(a[3])? != 0;
+        if let FileKind::Socket(s) = &mut *file.kind.lock() {
+            s.passcred = on;
+        }
+        return Ok(0);
+    }
     // xtables, on a raw socket (iptables).
     if matches!(a[1], crate::xtables::SOL_IP | crate::xtables::SOL_IPV6) && matches!(a[2], 64 | 65) {
         return crate::xtables::set(p, a[1], a[2], a[3], a[4] as usize);
@@ -476,8 +498,8 @@ pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
 /// buffer sizes a plausible value. Everything else is zeroed.
 fn sys_getsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
-    let ty = match &*file.kind.lock() {
-        FileKind::Socket(s) => s.ty,
+    let (ty, peer_cred) = match &*file.kind.lock() {
+        FileKind::Socket(s) => (s.ty, peer_cred(s)),
         _ => return Err(crate::errno::ENOTSOCK),
     };
     let (level, name, val, len_ptr) = (a[1], a[2], a[3], a[4]);
@@ -498,10 +520,9 @@ fn sys_getsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if level == SOL_SOCKET {
         match name {
             17 => {
-                // SO_PEERCRED: struct ucred { pid, uid, gid }.
-                let mut c = [0u8; 12];
-                c[0..4].copy_from_slice(&1i32.to_le_bytes());
-                return write(&c);
+                // SO_PEERCRED: struct ucred { pid, uid, gid } -- the peer's; a socket connected to
+                // none of this runtime's processes (logd, the property service) reports init.
+                return write(&ucred(peer_cred.unwrap_or([1, 0, 0])));
             }
             3 => return write(&(ty as u32).to_le_bytes()), // SO_TYPE
             4 => return write(&0u32.to_le_bytes()),        // SO_ERROR
@@ -510,6 +531,24 @@ fn sys_getsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         }
     }
     write(&0u32.to_le_bytes())
+}
+
+/// The credentials of the process at a socket's other end, when it is one of this runtime's.
+fn peer_cred(s: &Socket) -> Option<Cred> {
+    match &s.peer {
+        Some(Peer::Pair { channel, side }) => Some(channel.creds[1 - *side]),
+        Some(Peer::Dgram(bound)) => Some(bound.cred),
+        _ => None,
+    }
+}
+
+/// `struct ucred`'s bytes.
+fn ucred(c: Cred) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    for (i, v) in c.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 /// `MSG_DONTWAIT`.
@@ -590,6 +629,7 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         return Err(EINVAL);
     }
     let channel = Arc::new(PairChannel {
+        creds: [cred_of(p), cred_of(p)],
         queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
         open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
         stream: kind == 1,
@@ -597,7 +637,7 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let mut fds = [0i32; 2];
     for (side, fd) in fds.iter_mut().enumerate() {
-        let socket = Socket { domain, ty: kind, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: p.sys.pid as u32 };
+        let socket = Socket { domain, ty: kind, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: p.sys.pid as u32, passcred: false };
         let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
         *fd = p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)?;
     }
@@ -634,9 +674,32 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         p.mem.write(base, &buf[at..at + k])?;
         at += k;
     }
-    // No control data; msg_flags 0.
-    p.mem.write(a[1] + 40, &0u64.to_le_bytes())?;
-    p.mem.write(a[1] + 48, &0u32.to_le_bytes())?;
+    // SO_PASSCRED: the sender's credentials, SCM_CREDENTIALS; otherwise no control data.
+    let creds = match &*file.kind.lock() {
+        FileKind::Socket(s) if s.passcred => peer_cred(s),
+        _ => None,
+    };
+    let (control, room) = (p.mem.read_u64(a[1] + 32)?, p.mem.read_u64(a[1] + 40)?);
+    let mut controllen = 0u64;
+    let mut flags = 0u32;
+    if let Some(c) = creds {
+        // struct cmsghdr { len u64, level i32, type i32 } + struct ucred, padded to 8.
+        const SCM_CREDENTIALS: u32 = 2;
+        if room >= 32 {
+            let mut cmsg = Vec::with_capacity(32);
+            cmsg.extend_from_slice(&28u64.to_le_bytes());
+            cmsg.extend_from_slice(&1u32.to_le_bytes());
+            cmsg.extend_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+            cmsg.extend_from_slice(&ucred(c));
+            cmsg.extend_from_slice(&[0; 4]);
+            p.mem.write(control, &cmsg)?;
+            controllen = 32;
+        } else {
+            flags |= 0x8; // MSG_CTRUNC
+        }
+    }
+    p.mem.write(a[1] + 40, &controllen.to_le_bytes())?;
+    p.mem.write(a[1] + 48, &flags.to_le_bytes())?;
     Ok(n as u64)
 }
 

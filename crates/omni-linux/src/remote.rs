@@ -134,8 +134,8 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
         }
         Some(3) => {
             let ty = u64::from(d.get(1).copied().unwrap_or(5));
-            let (mine, other) = crate::socket::pair(ty, 0);
-            let socket = crate::socket::Socket { domain: 1, ty, peer: Some(mine), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0 };
+            let (mine, other) = crate::socket::pair(ty, [0; 3], [0; 3]);
+            let socket = crate::socket::Socket { domain: 1, ty, peer: Some(mine), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0, passcred: false };
             keep(Box::new(other));
             Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(socket)), flags: parking_lot::Mutex::new(2) })
         }

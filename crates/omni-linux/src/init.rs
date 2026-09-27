@@ -569,7 +569,7 @@ impl Init {
         let p = Process::spawn_as(config, uid)?;
         let instance = Arc::as_ptr(p.vfs.binds()) as usize;
         for (i, (name, ty)) in sockets.iter().enumerate() {
-            let file = crate::socket::init_socket(instance, name, *ty, p.sys.pid as u32);
+            let file = crate::socket::init_socket(instance, name, *ty, crate::socket::cred_of(&p));
             p.fds.place(3 + i as i32, Arc::new(file), false);
         }
         Ok(p)

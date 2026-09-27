@@ -25,7 +25,7 @@ pub struct Launcher {
 /// Bind `/dev/socket/zygote` in `instance` (the key a process's sockets are named in) and answer
 /// it on host threads.
 pub fn serve(instance: usize, launcher: Launcher) {
-    let bound = crate::unix::Bound::bind_replacing(instance, b"/dev/socket/zygote", 1);
+    let bound = crate::unix::Bound::bind_replacing(instance, b"/dev/socket/zygote", 1, [0, 0, 0]);
     bound.listening.store(true, std::sync::atomic::Ordering::SeqCst);
     let launcher = Arc::new(launcher);
     let _ = std::thread::Builder::new().name("zygote".into()).spawn(move || loop {
