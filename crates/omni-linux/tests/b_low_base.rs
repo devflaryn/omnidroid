@@ -29,8 +29,14 @@ fn the_space_starts_below_4_gib_and_unhinted_mappings_leave_it_free() {
     let maps = String::from_utf8_lossy(&out.lock()).into_owned();
     let low: Vec<&str> = maps
         .lines()
-        // The CPU backend's TLS pool, made before the program starts, sits at the base.
-        .filter(|l| l.split('-').next().and_then(|a| u64::from_str_radix(a, 16).ok()).is_some_and(|a| a < 1 << 32 && a != base))
+        // The CPU backend's TLS pool, made before the program starts, sits at the base; what the
+        // host holds inside the range (Windows' KUSER_SHARED_DATA) shows as taken, and is the host's.
+        .filter(|l| {
+            l.split('-').next().and_then(|a| u64::from_str_radix(a, 16).ok()).is_some_and(|a| {
+                let host = p.mem.space().region_at(a as usize).is_some_and(|r| matches!(r.kind, omni_mem::RegionKind::Host));
+                a < 1 << 32 && a != base && !host
+            })
+        })
         .collect();
     assert!(low.is_empty(), "mapped below 4 GiB:\n{}", low.join("\n"));
 }
