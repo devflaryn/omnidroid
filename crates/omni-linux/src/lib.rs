@@ -17,6 +17,7 @@ pub mod futex;
 pub mod gpu;
 pub mod guest;
 pub mod hal;
+pub mod hostnet;
 pub mod init;
 pub mod locks;
 pub mod manifest;
