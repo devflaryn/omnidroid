@@ -263,10 +263,19 @@ impl Snapshot {
             }
         };
         for (start, bytes) in &self.kept {
+            // The range as it is now, read at once (a read a page is ten times slower), then
+            // compared page by page: most pages are as they were.
+            let whole = p.mem.read_holding_layout(*start, bytes.len()).ok();
             for (n, was) in bytes.chunks(PAGE).enumerate() {
                 let at = start + (n * PAGE) as u64;
-                let Ok(now) = p.mem.read_holding_layout(at, was.len()) else { continue };
-                if now != was {
+                let now = match &whole {
+                    Some(w) => std::borrow::Cow::Borrowed(&w[n * PAGE..n * PAGE + was.len()]),
+                    None => match p.mem.read_holding_layout(at, was.len()) {
+                        Ok(v) => std::borrow::Cow::Owned(v),
+                        Err(_) => continue,
+                    },
+                };
+                if *now != *was {
                     let mut page = was.to_vec();
                     keep_kernel_writes(at, &mut page, &now);
                     let _ = p.mem.write_holding_layout(at, &page);
