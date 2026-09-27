@@ -263,13 +263,15 @@ impl Process {
         let exe = config.argv.first().ok_or("no program: argv is empty")?.clone();
         // The instance's writable state: what a device keeps on its data partition and tmpfs, and
         // `/linkerconfig`, which `linkerconfig` writes at boot for `linker64` to read (sub-project B).
-        let writable_dirs = ["data", "tmp", "linkerconfig"];
+        let writable_dirs = ["data", "tmp", "linkerconfig", "metadata"];
         let mut writable = Vec::new();
         for dir in writable_dirs {
             let host = config.instance_dir.join(dir);
             std::fs::create_dir_all(&host).map_err(|e| format!("{}: {e}", host.display()))?;
             writable.push((format!("/{dir}").into_bytes(), host));
         }
+        // What init.rc makes before any service runs: its `mkdir`s on the writable mounts.
+        crate::boot::make_init_dirs(&sysroot, &config.instance_dir);
         let vfs = Vfs::new(sysroot, writable, exe.clone());
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.

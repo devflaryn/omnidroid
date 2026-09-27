@@ -6,6 +6,7 @@
 //! not implement answers `-ENOSYS` and is recorded by name ([`syscall::Refusals`]).
 pub mod apex;
 pub mod binder;
+pub mod boot;
 pub mod errno;
 pub mod exec;
 pub mod fd;

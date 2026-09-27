@@ -70,6 +70,11 @@ const TYPE_WEAK_BINDER: u32 = 0x7762_2a85;
 const TYPE_HANDLE: u32 = 0x7368_2a85;
 const TYPE_WEAK_HANDLE: u32 = 0x7768_2a85;
 const TYPE_FD: u32 = 0x6664_2a85;
+/// `binder_fd_array_object`: fds in a parent buffer (HIDL's native handles).
+const TYPE_FDA: u32 = 0x6664_6185;
+/// `binder_buffer_object`: a buffer copied beside the data (scatter-gather; HIDL).
+const TYPE_PTR: u32 = 0x7074_2a85;
+const BUFFER_FLAG_HAS_PARENT: u32 = 1;
 
 const TF_ONE_WAY: u32 = 0x01;
 const FLAT_BINDER_FLAG_TXN_SECURITY_CTX: u32 = 0x1000;
@@ -107,6 +112,17 @@ struct Txn {
     offsets: Vec<u64>,
     /// File descriptors to install in the receiver, by the offset of their object in `data`.
     fds: Vec<(usize, Arc<OpenFile>)>,
+    /// Scatter-gather buffers, in object order: (object offset in `data`, bytes, parent).
+    sg: Vec<SgBuffer>,
+    /// fd arrays: (index of the parent buffer in `sg`, offset in it, the files).
+    fda: Vec<(usize, usize, Vec<Arc<OpenFile>>)>,
+}
+
+struct SgBuffer {
+    obj_off: usize,
+    bytes: Vec<u8>,
+    /// (index in `sg` of the parent buffer, offset in it where this buffer's address goes).
+    parent: Option<(usize, usize)>,
 }
 
 enum Work {
@@ -554,8 +570,45 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
 
     // Translate the objects for the receiver.
     let mut fds = Vec::new();
-    for &off in &offsets {
+    let mut sg: Vec<SgBuffer> = Vec::new();
+    let mut fda = Vec::new();
+    // Which `sg` entry each object index is (buffer objects only).
+    let mut sg_of_object: HashMap<usize, usize> = HashMap::new();
+    for (index, &off) in offsets.iter().enumerate() {
         let off = off as usize;
+        let kind = u32_at(data.get(off..off + 4).ok_or(EINVAL)?, 0);
+        if kind == TYPE_PTR {
+            let obj = data.get(off..off + 40).ok_or(EINVAL)?.to_vec();
+            let (flags, buffer, length) = (u32_at(&obj, 4), u64_at(&obj, 8), u64_at(&obj, 16));
+            if length > 1 << 20 {
+                return Err(EINVAL);
+            }
+            let bytes = p.mem.read(buffer, length as usize)?;
+            let parent = if flags & BUFFER_FLAG_HAS_PARENT != 0 {
+                let parent_index = u64_at(&obj, 24) as usize;
+                let parent_sg = *sg_of_object.get(&parent_index).ok_or(EINVAL)?;
+                Some((parent_sg, u64_at(&obj, 32) as usize))
+            } else {
+                None
+            };
+            sg_of_object.insert(index, sg.len());
+            sg.push(SgBuffer { obj_off: off, bytes, parent });
+            continue;
+        }
+        if kind == TYPE_FDA {
+            let obj = data.get(off..off + 32).ok_or(EINVAL)?.to_vec();
+            let (num, parent_index, parent_offset) = (u64_at(&obj, 8) as usize, u64_at(&obj, 16) as usize, u64_at(&obj, 24) as usize);
+            let parent_sg = *sg_of_object.get(&parent_index).ok_or(EINVAL)?;
+            let parent_bytes = &sg[parent_sg].bytes;
+            let mut files = Vec::with_capacity(num);
+            for i in 0..num {
+                let at = parent_offset + i * 4;
+                let fd = u32_at(parent_bytes.get(at..at + 4).ok_or(EINVAL)?, 0) as i32;
+                files.push(p.fds.get(fd)?);
+            }
+            fda.push((parent_sg, parent_offset, files));
+            continue;
+        }
         let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
         let kind = u32_at(&obj, 0);
         let (ptr, cookie) = (u64_at(&obj, 8), u64_at(&obj, 16));
@@ -612,6 +665,8 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         data,
         offsets,
         fds,
+        sg,
+        fda,
     };
     if !reply && !oneway {
         st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
@@ -711,12 +766,45 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
             }
             let data_len = (txn.data.len() as u64 + 7) & !7;
             let offsets_len = txn.offsets.len() as u64 * 8;
+            let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
             let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
-            let buf = file.area.lock().alloc(data_len + offsets_len + sec_len).ok_or(ENOMEM)?;
+            let buf = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len).ok_or(ENOMEM)?;
+            // Scatter-gather buffers go after the offsets: each object points at its copy, and a
+            // child's address is written into its parent's copy where the sender had it.
+            let mut sg_at = Vec::with_capacity(txn.sg.len());
+            let mut cursor = buf + data_len + offsets_len;
+            for b in &txn.sg {
+                sg_at.push(cursor);
+                cursor += (b.bytes.len() as u64 + 7) & !7;
+            }
+            for (i, b) in txn.sg.iter().enumerate() {
+                txn.data[b.obj_off + 8..b.obj_off + 16].copy_from_slice(&sg_at[i].to_le_bytes());
+            }
+            let mut sg_bytes: Vec<Vec<u8>> = txn.sg.iter().map(|b| b.bytes.clone()).collect();
+            for (i, b) in txn.sg.iter().enumerate() {
+                if let Some((parent, at)) = b.parent {
+                    if let Some(slot) = sg_bytes[parent].get_mut(at..at + 8) {
+                        slot.copy_from_slice(&sg_at[i].to_le_bytes());
+                    }
+                }
+            }
+            for (parent, at, files) in &txn.fda {
+                for (i, open) in files.iter().enumerate() {
+                    let fd = p.fds.insert(Arc::clone(open), true, 0)?;
+                    if let Some(slot) = sg_bytes[*parent].get_mut(at + i * 4..at + i * 4 + 4) {
+                        slot.copy_from_slice(&(fd as u32).to_le_bytes());
+                    }
+                }
+            }
             let mut bytes = txn.data.clone();
             bytes.resize(data_len as usize, 0);
             for o in &txn.offsets {
                 bytes.extend_from_slice(&o.to_le_bytes());
+            }
+            for b in &sg_bytes {
+                let start = bytes.len();
+                bytes.extend_from_slice(b);
+                bytes.resize(start + ((b.len() + 7) & !7), 0);
             }
             bytes.extend_from_slice(if sec_len > 0 { SECCTX } else { &[] });
             p.mem.write(buf, &bytes)?;
@@ -741,7 +829,7 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
                     st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.push(txn.from);
                 }
                 if sec_len > 0 {
-                    tr.extend_from_slice(&(buf + data_len + offsets_len).to_le_bytes());
+                    tr.extend_from_slice(&(buf + data_len + offsets_len + sg_len).to_le_bytes());
                     BR_TRANSACTION_SEC_CTX
                 } else {
                     BR_TRANSACTION
