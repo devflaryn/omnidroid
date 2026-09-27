@@ -127,6 +127,7 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
     parent.freeze_others(t.tid);
     p.mem.start_journal();
     let snapshot = Snapshot::take(p);
+    let taken_at = std::time::Instant::now();
     let child = parent.fork_child();
     let pid = child.sys.pid;
     let sp = if a[1] == 0 { parent_sp } else { a[1] };
@@ -140,11 +141,20 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
     if let Ok(rx) = &started {
         let _ = rx.recv();
     }
+    let released_at = std::time::Instant::now();
     snapshot.restore(p);
     parent.thaw();
     // OMNI_FORK_TRACE=1: each fork, what it kept, and how long its parent stood still.
     if fork_trace() {
-        eprintln!("[fork] {} forked {pid}: {} MiB kept, parent frozen {} ms", p.sys.pid, snapshot.bytes() >> 20, frozen_at.elapsed().as_millis());
+        eprintln!(
+            "[fork] {} forked {pid}: {} MiB kept, parent frozen {} ms (snapshot {} ms, child to exec {} ms, restore {} ms)",
+            p.sys.pid,
+            snapshot.bytes() >> 20,
+            frozen_at.elapsed().as_millis(),
+            (taken_at - frozen_at).as_millis(),
+            (released_at - taken_at).as_millis(),
+            released_at.elapsed().as_millis()
+        );
     }
     started?;
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -353,10 +363,14 @@ fn sys_execve(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         Node::Dir | Node::HostDir { .. } => return Err(EACCES),
         _ => {}
     }
+    let loading = std::time::Instant::now();
     let image = me.exec_image(&path, &argv, &envp).map_err(|e| {
         p.refusals.record(format!("execve: {e}"), t.pc, t.lr);
         ENOEXEC
     })?;
+    if fork_trace() {
+        eprintln!("[fork] {} executes {}: image made in {} ms", p.sys.pid, String::from_utf8_lossy(&path), loading.elapsed().as_millis());
+    }
     image.family.start_mask.store(t.sigmask, Ordering::Relaxed);
     *me.family.successor.lock() = Some(Arc::clone(&image));
     me.family.superseded.store(true, Ordering::SeqCst);
