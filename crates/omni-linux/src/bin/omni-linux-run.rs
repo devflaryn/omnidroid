@@ -41,6 +41,24 @@ fn main() -> ExitCode {
         }
     };
     let status = p.run();
+    // OMNI_DUMP=0xADDR:0xLEN:path -- guest memory as it was when the process ended, for a post-mortem.
+    if let Ok(spec) = std::env::var("OMNI_DUMP") {
+        let parts: Vec<&str> = spec.splitn(3, ':').collect();
+        let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok();
+        if let [addr, len, path] = parts[..] {
+            if let (Some(addr), Some(len)) = (hex(addr), hex(len)) {
+                let mut out = Vec::with_capacity(len as usize);
+                let page = 4096u64;
+                let mut at = addr;
+                while at < addr + len {
+                    let n = (page - at % page).min(addr + len - at);
+                    out.extend(p.mem.read(at, n as usize).unwrap_or_else(|_| vec![0xEE; n as usize]));
+                    at += n;
+                }
+                let _ = std::fs::write(path, out);
+            }
+        }
+    }
     eprint!("{}", p.report());
     match status {
         ExitStatus::Exited(code) => ExitCode::from(code as u8),
