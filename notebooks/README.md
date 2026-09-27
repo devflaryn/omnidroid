@@ -1,6 +1,7 @@
 # Notebooks: omnidroid headless on Colab, Kaggle and Modal
 
-`omnidroid_headless.ipynb` builds omnidroid from source, starts Roblox with no screen, joins a
+`omnidroid_headless.ipynb` builds omnidroid from source, starts Roblox with no display at all
+(`omnidroid --no-window --control <file>`, in `unified` from `dce9ac0`), joins a
 place (Pet Simulator 99, `8737899170`, by default), waits for the world to load and takes a
 screenshot as proof -- shown in the notebook and printed as a `data:image/jpeg;base64,...` URL to
 paste into a browser's address bar. The same notebook runs on Google Colab, Kaggle, a Modal
@@ -77,8 +78,8 @@ OMNI_MODAL_GPU=T4 modal run notebooks/modal_app.py   # with a GPU
 ```
 
 The first run builds the image (Ubuntu 22.04, its packages, Rust, the release build) on an
-8-CPU builder: ~10-15 min, once per commit. Each run then takes ~5-10 min and writes `omnidroid-shot.png` /
-`.jpg` beside you and prints the `data:` URL. The app's storage is kept on the Volume
+8-CPU builder: ~10-15 min, once per commit. Each run then takes ~5-10 min and writes
+`omnidroid-shot.png` / `.jpg` beside you and prints the `data:` URL. The app's storage is kept on the Volume
 (`data/<account>`), so a cookie Roblox rotates is kept for the next run. Other settings
 (`OMNI_BRANCH`, `OMNI_MODAL_REGION`, `OMNI_ACCOUNT_COUNTRY`, ...) are listed at the top of the
 file.
@@ -91,7 +92,7 @@ packages; otherwise it checks them and names what is missing:
 ```sh
 sudo apt-get install -y build-essential cmake ninja-build pkg-config git curl zstd \
   libasound2-dev libx11-dev libxi-dev libxfixes-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers \
-  libegl1 libgles2 libegl-mesa0 libgl1-mesa-dri xvfb x11-xkb-utils xkb-data imagemagick x11-utils
+  libegl1 libgles2 libegl-mesa0 libgl1-mesa-dri libglvnd0
 ```
 
 Set `APK_PATH`, and the cookie as the `ROBLOSECURITY` environment variable or `COOKIE_FILE`.
@@ -107,15 +108,17 @@ Without root, the source and build go to `~/omnidroid-nb/src` and the run to `~/
 
 ## GPU or CPU
 
-* A build **with `--headless`** (the headless branch): no display at all; with an NVIDIA GPU whose
-  EGL library the platform exposes (Colab ships it in `/usr/lib64-nvidia`; Kaggle's and Modal's containers
-  may not -- the notebook looks, and says), the game renders on the GPU -- the
-  notebook writes the glvnd vendor file for `libEGL_nvidia.so.0` itself (`--headless --no-window`:
-  an off-screen EGL surface, GLES). With `headless on` the game runs and draws nothing, using much
-  less CPU/GPU; a `screenshot` renders its one frame for real either way.
-* A build **without `--headless`** (e.g. `unified` today): the game draws into a virtual X display
-  (Xvfb) with Mesa **llvmpipe** on the CPU -- also on a GPU machine, since NVIDIA's EGL cannot
-  draw into Xvfb. `RENDERER`, `HEADLESS` and the log say which path was taken.
+* There is **no display**: `--no-window` gives the engine an off-screen EGL pbuffer (NVIDIA's EGL
+  device, or Mesa's surfaceless platform) and it renders with GLES. It starts **headless** -- the
+  game runs and presents frames, nothing is drawn -- unless `START_HEADLESS` is off; `headless
+  off` / `headless on` switch drawing live, and `screenshot <path>` renders that one frame for
+  real either way.
+* **GPU:** with an NVIDIA GPU whose EGL library the platform exposes (Colab ships it in
+  `/usr/lib64-nvidia`; Kaggle's and Modal's containers may not -- the notebook looks, and says),
+  the notebook writes the glvnd vendor file for `libEGL_nvidia.so.0` and the game renders on the
+  GPU. `RENDERER` forces `gpu` or `cpu`.
+* **CPU:** Mesa **llvmpipe** (`LIBGL_ALWAYS_SOFTWARE=1`). Measured on 4 old cores: the place loads
+  and the world is drawn at ~5 frames/s, ~25 while headless.
 * Vulkan is limited to lavapipe, which the engine refuses by its own rule, so it always uses its
   GLES renderer (the path measured on Linux).
 * There is no sound card on these machines. ALSA says `Unknown PCM default` and the game runs on
@@ -141,6 +144,8 @@ free) work, more slowly: llvmpipe shares those two CPUs with the game.
 
 * **`branch 'unified' not found`**: the branch is not on GitHub yet (or the repository is private:
   add `GITHUB_TOKEN`). Set `BRANCH`, or upload a source tarball and set `SOURCE_TARBALL`.
+* **"has no --no-window/--control"**: the branch predates headless mode (`dce9ac0`). Use `unified`
+  from that commit on.
 * **"not signed in after 3 minutes"**: the cookie was rejected -- expired, or ended by Roblox
   (see the country warning). Export a fresh one.
 * **The game exits before the place loads**: the last 40 log lines are printed; the whole log is
@@ -150,6 +155,7 @@ free) work, more slowly: llvmpipe shares those two CPUs with the game.
   the world has streamed in; the wait cell looks at the screen every 20 s and goes on once it is
   no longer one flat colour. On a busy 2-CPU machine that can take several minutes; raise
   `LOAD_TIMEOUT_MINUTES`, or take another screenshot with cell 12 later.
-* **Stopping**: the last cell interrupts the game. The engine counts that as a crash at the next
-  start in the same storage directory, which it survives; a session that reaches
-  `SESSION_MINUTES` closes cleanly.
+* **Stopping**: the last cell interrupts the game; a session that reaches `SESSION_MINUTES`
+  closes cleanly instead. The engine judges an interrupted session a crash at the next start in
+  the same storage (`ACCOUNT_NAME`'s); if a later start misbehaves, use a new `ACCOUNT_NAME` (a
+  fresh storage directory -- the cookie is planted again).

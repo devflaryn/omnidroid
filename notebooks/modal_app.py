@@ -85,7 +85,6 @@ APT_PACKAGES = [
     "libasound2-dev", "libx11-dev", "libxi-dev", "libxfixes-dev",
     "libvulkan1", "libvulkan-dev", "mesa-vulkan-drivers",
     "libegl1", "libgles2", "libegl-mesa0", "libgl1-mesa-dri", "libglvnd0",
-    "xvfb", "x11-xkb-utils", "xkb-data", "xauth", "imagemagick", "x11-utils",
 ]
 
 BUILD_ENV = {
@@ -135,8 +134,8 @@ def _sh(args, **kw):
     return subprocess.run(args, capture_output=True, text=True, **kw)
 
 
-def _graphics(headless):
-    """(environment, description): NVIDIA EGL when it is there and the run is headless, else llvmpipe."""
+def _graphics():
+    """(environment, description): NVIDIA's EGL when the sandbox exposes it, else Mesa llvmpipe."""
     import glob
     import json
     import shutil
@@ -152,15 +151,14 @@ def _graphics(headless):
     if lvp:  # lavapipe only: the engine skips an emulated Vulkan device and draws with GLES
         env.update(VK_DRIVER_FILES=":".join(lvp), VK_ICD_FILENAMES=":".join(lvp))
     mesa_json = next(iter(glob.glob("/usr/share/glvnd/egl_vendor.d/*mesa*.json")), "")
-    if gpu and nvidia_egl and headless:
+    if gpu and nvidia_egl:
         os.makedirs("/tmp/egl", exist_ok=True)
         with open("/tmp/egl/10_nvidia.json", "w") as f:
             json.dump({"file_format_version": "1.0.0", "ICD": {"library_path": nvidia_egl}}, f)
         env["__EGL_VENDOR_LIBRARY_FILENAMES"] = f"/tmp/egl/10_nvidia.json:{mesa_json}"
         return env, f"GPU ({gpu}) through NVIDIA EGL"
     env.update(LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe", __EGL_VENDOR_LIBRARY_FILENAMES=mesa_json)
-    why = ("no GPU" if not gpu else "the GPU's EGL library is not exposed" if not nvidia_egl
-           else "this build has no --headless (Xvfb)")
+    why = "no GPU" if not gpu else "the GPU's EGL library is not exposed"
     return env, f"CPU (Mesa llvmpipe): {why}" + (f"; GPU present: {gpu}" if gpu else "")
 
 
@@ -239,9 +237,11 @@ def play_and_screenshot(place_id: int = 8737899170, settle_seconds: int = 60, lo
 
     omnidroid = f"{SRC}/target/release/omnidroid"
     usage = _sh([omnidroid, "--help"]).stdout
-    headless, has_control = "--headless" in usage, "--control" in usage
-    gfx, renderer = _graphics(headless)
-    note(f"{'headless' if headless else 'Xvfb'}; rendering on the {renderer}")
+    if "--no-window" not in usage or "--control" not in usage:
+        raise RuntimeError(f"this build ({BRANCH}) has no --no-window/--control: headless mode is in `unified` "
+                           "from dce9ac0 on")
+    gfx, renderer = _graphics()
+    note(f"no display; rendering on the {renderer}")
 
     env = dict(os.environ, **gfx, OMNI_WINDOW_SIZE="1280x720", OMNI_GRAPHICS_QUALITY="1")
     env.pop("ROBLOSECURITY", None)
@@ -249,20 +249,10 @@ def play_and_screenshot(place_id: int = 8737899170, settle_seconds: int = 60, lo
            "--join-delay", "20" if "GPU" in renderer.split(":")[0] else "45", "--minutes", "90", "--data-dir", data]
     control = f"{work}/control.txt"
     open(control, "w").close()
-    xvfb = None
-    if headless:
-        cmd.append("--headless")
-        if "--no-window" in usage:  # no display: an off-screen EGL surface, GLES
-            cmd.append("--no-window")
-        env.pop("DISPLAY", None)
-    else:
-        xvfb = subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x720x24", "-nolisten", "tcp", "-extension", "GLX"],
-                                env=dict(os.environ, LIBGL_ALWAYS_SOFTWARE="1"), stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
-        time.sleep(2)
-        env["DISPLAY"] = ":99"
-    if has_control:
-        cmd += ["--control", control]
+    # No display: an off-screen EGL surface, headless (nothing drawn but a screenshot's frame).
+    cmd += ["--no-window", "--control", control]
+    for name in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
+        env.pop(name, None)
     log_path = f"{work}/game.log"
     game = subprocess.Popen(cmd, env=env, cwd=work, stdin=subprocess.DEVNULL, stdout=open(log_path, "w"),
                             stderr=subprocess.STDOUT, start_new_session=True)
@@ -289,13 +279,10 @@ def play_and_screenshot(place_id: int = 8737899170, settle_seconds: int = 60, lo
             time.sleep(0.5)
         raise TimeoutError(f"no {expect!r} after {command!r}")
 
-    def take_screenshot():
-        if has_control:  # the frame is rendered for real even while headless
-            answer = send(f"screenshot {shot}", ("SCREENSHOT: saved", "SCREENSHOT: failed"))
-            if "failed" in answer:
-                raise RuntimeError(answer)
-        else:
-            subprocess.run(["import", "-display", ":99", "-window", "root", shot], check=True)
+    def take_screenshot():  # the frame is rendered for real even while headless
+        answer = send(f"screenshot {shot}", ("SCREENSHOT: saved", "SCREENSHOT: failed"))
+        if "failed" in answer:
+            raise RuntimeError(answer)
 
     def flatness():
         """The share of the screen in its most common colour: a loading screen ~95%, the world ~20%."""
@@ -355,8 +342,6 @@ def play_and_screenshot(place_id: int = 8737899170, settle_seconds: int = 60, lo
                 game.wait(30)
             except subprocess.TimeoutExpired:
                 os.killpg(game.pid, signal.SIGKILL)
-        if xvfb:
-            xvfb.terminate()
         shutil.copytree(data, kept, dirs_exist_ok=True, ignore=shutil.ignore_patterns("*.apk"))
         volume.commit()
     return {"png": png, "jpeg": jpeg, "notes": notes, "renderer": renderer, "country": country}
