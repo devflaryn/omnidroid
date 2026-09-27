@@ -83,9 +83,13 @@ pub struct OpenFile {
 }
 
 impl Drop for OpenFile {
-    /// Closed for the last time: its open-file-description locks go.
+    /// Closed for the last time: its open-file-description locks go, and a binder open is released
+    /// (a thread of its process still waiting in a read does not keep it).
     fn drop(&mut self) {
         crate::locks::released(self);
+        if let FileKind::Binder(b) = self.kind.get_mut() {
+            b.release();
+        }
     }
 }
 
@@ -164,12 +168,17 @@ impl FdTable {
     }
 
     pub fn remove(&self, fd: i32) -> Result<(), Errno> {
-        self.fds.lock().remove(&fd).map(|_| ()).ok_or(EBADF)
+        let (file, _) = self.fds.lock().remove(&fd).ok_or(EBADF)?;
+        flush(&file);
+        Ok(())
     }
 
     /// Close every descriptor, as a process's exit does (a pipe's reader then sees its end).
     pub fn close_all(&self) {
         let all = std::mem::take(&mut *self.fds.lock());
+        for (file, _) in all.values() {
+            flush(file);
+        }
         drop(all);
     }
 
@@ -179,6 +188,13 @@ impl FdTable {
 
     pub fn set_cloexec(&self, fd: i32, on: bool) -> Result<(), Errno> {
         self.fds.lock().get_mut(&fd).map(|e| e.1 = on).ok_or(EBADF)
+    }
+}
+
+/// A descriptor closed: a binder open's waiting readers return (`crate::binder::BinderFile::flush`).
+fn flush(file: &OpenFile) {
+    if let FileKind::Binder(b) = &*file.kind.lock() {
+        b.flush();
     }
 }
 

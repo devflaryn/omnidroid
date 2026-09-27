@@ -237,6 +237,21 @@ impl Mm {
                     // stack does not start): say why.
                     if len >= 1 << 20 && !fixed {
                         eprintln!("[mm] {len:#x} anonymous bytes refused: {e}");
+                        // The first time: what holds the space, by owner and call site.
+                        static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            let mut by: std::collections::HashMap<(&'static str, u64), (usize, usize)> = std::collections::HashMap::new();
+                            for (r, label) in p.mem.space().labelled_regions() {
+                                let e = by.entry((label.owner, label.site)).or_default();
+                                e.0 += r.len;
+                                e.1 += 1;
+                            }
+                            let mut top: Vec<_> = by.into_iter().collect();
+                            top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+                            for ((owner, site), (bytes, n)) in top.into_iter().take(12) {
+                                eprintln!("[mm]   {:>8} MiB in {n} regions: {owner:?} site {site:#x}", bytes >> 20);
+                            }
+                        }
                     }
                     refused_fixed(ENOMEM)
                 });

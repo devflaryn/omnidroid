@@ -308,7 +308,9 @@ impl Server {
                 // The open lasts as long as this connection: its end is the close.
                 let mut sink = [0u8; 1];
                 let _ = stream.read(&mut sink);
-                self.opens.lock().remove(&token);
+                if let Some((_, file)) = self.opens.lock().remove(&token) {
+                    file.release();
+                }
             }
             PROPS => {
                 // The system's properties as they are now, `name value ` each.

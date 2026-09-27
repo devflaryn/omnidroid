@@ -216,9 +216,6 @@ struct ProcState {
     pid: i32,
     refs: BTreeMap<u32, NodeId>,
     by_node: HashMap<NodeId, u32>,
-    /// Each handle's references, as the kernel's `binder_ref` counts them: `[strong, weak,
-    /// in delivered buffers not yet freed]`. A handle all three are zero for is deleted.
-    counts: HashMap<u32, [u32; 3]>,
     /// The last handle number given out: numbers are not reused (a process's cached proxy for a
     /// deleted handle must not name another object).
     last_handle: u32,
@@ -236,8 +233,6 @@ struct State {
     /// The buffers oneway transactions were delivered in, by (receiver, address): freeing one
     /// hands its node's next oneway transaction out.
     async_buffers: HashMap<(ProcId, u64), NodeId>,
-    /// The handles each delivered buffer carries, by (receiver, address): freeing it drops them.
-    buffer_handles: HashMap<(ProcId, u64), Vec<u32>>,
     /// (owner, ptr) -> node
     local: HashMap<(ProcId, u64), NodeId>,
     context_mgr: Option<NodeId>,
@@ -350,7 +345,6 @@ impl State {
                     return Ok(None);
                 }
                 let h = self.handle_for(target, node, Some(sender));
-                self.pin(target, h);
                 Ok(Some((if kind == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE }, u64::from(h), 0)))
             }
             TYPE_HANDLE | TYPE_WEAK_HANDLE => {
@@ -361,41 +355,10 @@ impl State {
                     Ok(Some((kind, n.ptr, n.cookie)))
                 } else {
                     let h = self.handle_for(target, node, Some(sender));
-                    self.pin(target, h);
                     Ok(Some((kind, u64::from(h), 0)))
                 }
             }
             _ => Err(EINVAL),
-        }
-    }
-
-    /// A handle of `id` is carried by a buffer on its way to it: kept until the buffer is freed.
-    fn pin(&mut self, id: ProcId, h: u32) {
-        if h != 0 {
-            self.proc_mut(id).counts.entry(h).or_default()[2] += 1;
-        }
-    }
-
-    /// `BC_ACQUIRE`/`BC_RELEASE` (`which` 0), `BC_INCREFS`/`BC_DECREFS` (1) or a freed buffer's
-    /// hold (2, down) on `id`'s handle `h`. A handle left with no references is deleted, and its
-    /// object let go by its owner when no process refers to it any more.
-    fn count(&mut self, id: ProcId, h: u32, which: usize, up: bool) {
-        if h == 0 {
-            return;
-        }
-        let Some(proc) = self.procs.get_mut(&id) else { return };
-        if !proc.refs.contains_key(&h) {
-            return;
-        }
-        let c = proc.counts.entry(h).or_default();
-        c[which] = if up { c[which] + 1 } else { c[which].saturating_sub(1) };
-        if up || c.iter().any(|v| *v > 0) {
-            return;
-        }
-        proc.counts.remove(&h);
-        if let Some(node) = proc.refs.remove(&h) {
-            proc.by_node.remove(&node);
-            self.release_if_unreferenced(node);
         }
     }
 
@@ -732,6 +695,10 @@ pub struct BinderFile {
     broker: Arc<Broker>,
     id: ProcId,
     area: Mutex<Area>,
+    /// [`BinderFile::release`] has run.
+    released: std::sync::atomic::AtomicBool,
+    /// Descriptors on it closed so far ([`BinderFile::flush`]): a read waiting across one returns.
+    flushes: std::sync::atomic::AtomicU64,
 }
 
 /// The `mmap`'d receive area and its allocator.
@@ -778,7 +745,7 @@ impl BinderFile {
             st.procs.insert(id, ProcState { max_threads: 0, ..ProcState::default() });
             id
         };
-        Arc::new(Self { broker, id, area: Mutex::default() })
+        Arc::new(Self { broker, id, area: Mutex::default(), released: std::sync::atomic::AtomicBool::new(false), flushes: std::sync::atomic::AtomicU64::new(0) })
     }
 
     /// `EPOLLIN` when there is work a looper of this process could take.
@@ -803,9 +770,28 @@ impl BinderFile {
 }
 
 impl Drop for BinderFile {
-    /// The process is gone (its last descriptor on the driver closed): its nodes die, the watchers
-    /// of each hear so, and every sync transaction waiting on it fails.
     fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl BinderFile {
+    /// A descriptor on it was closed (the kernel's `binder_flush`): every thread waiting in a
+    /// read returns, so a process closing the driver (`IPCThreadState::stopProcess`) or exiting
+    /// is not kept by a thread parked in its thread pool -- the last close then releases it.
+    pub fn flush(&self) {
+        self.flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::poll::notify();
+    }
+
+    /// The process is gone (its last descriptor on the driver closed, as the kernel's
+    /// `binder_release` -- even while one of its threads still waits in a read): its nodes die,
+    /// the watchers of each hear so, every sync transaction waiting on it fails, and its
+    /// references are dropped. Once.
+    pub fn release(&self) {
+        if self.released.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let mut st = self.broker.state.lock();
         let dying: Vec<NodeId> = st.nodes.iter().filter(|(_, n)| n.owner == self.id).map(|(id, _)| *id).collect();
         for node in dying {
@@ -846,9 +832,6 @@ impl Drop for BinderFile {
             p.by_node.clear();
             std::mem::take(&mut p.refs).into_values().collect()
         }).unwrap_or_default();
-        if let Some(p) = st.procs.get_mut(&self.id) {
-            p.counts.clear();
-        }
         let mut released = 0;
         for node in held {
             if st.release_if_unreferenced(node) {
@@ -970,9 +953,6 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
             file.area.lock().free(ptr);
             // A oneway transaction's buffer: its node's next oneway goes to this thread.
             let mut st = file.broker.state.lock();
-            for h in st.buffer_handles.remove(&(file.id, ptr)).unwrap_or_default() {
-                st.count(file.id, h, 2, false);
-            }
             if let Some(node) = st.async_buffers.remove(&(file.id, ptr)) {
                 let next = st.nodes.get_mut(&node).and_then(|n| {
                     let w = n.async_todo.pop_front();
@@ -984,11 +964,11 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                 }
             }
         }
-        BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {
-            let which = usize::from(matches!(code, BC_INCREFS | BC_DECREFS));
-            let up = matches!(code, BC_INCREFS | BC_ACQUIRE);
-            file.broker.state.lock().count(file.id, u32_at(arg, 0), which, up);
-        }
+        // A live process's handle references are not counted: its handles last as long as it
+        // does, and are released with it (`BinderFile::release`). Counting them needs the whole
+        // write to go on past a failed command, as the kernel's does (a dropped BC_ACQUIRE with
+        // its BC_RELEASE counted deleted handles still in use).
+        BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {}
         BC_ACQUIRE_DONE => file.broker.state.lock().acquire_done(file.id, u64_at(arg, 0)),
         BC_INCREFS_DONE | BC_DEAD_BINDER_DONE => {}
         BC_REGISTER_LOOPER | BC_ENTER_LOOPER => {
@@ -1241,6 +1221,7 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
     if first {
         out.extend_from_slice(&BR_NOOP.to_le_bytes());
     }
+    let flushed = file.flushes.load(std::sync::atomic::Ordering::SeqCst);
     loop {
         let seen = crate::poll::generation();
         let work = {
@@ -1284,6 +1265,11 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
                 p.mem.write(at, &out)?;
                 return Ok(out.len() as u64);
             }
+            // A descriptor was closed meanwhile: back to the caller with what there is.
+            None if file.flushes.load(std::sync::atomic::Ordering::SeqCst) != flushed => {
+                p.mem.write(at, &out)?;
+                return Ok(out.len() as u64);
+            }
             None => crate::poll::wait_for_change(seen, None, t)?,
         }
     }
@@ -1324,19 +1310,6 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
             let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
             let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
             let buf = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len).ok_or(ENOMEM)?;
-            // The handles it carries stay until the receiver frees it.
-            let handles: Vec<u32> = txn
-                .offsets
-                .iter()
-                .filter_map(|&off| {
-                    let off = off as usize;
-                    let kind = u32::from_le_bytes(txn.data.get(off..off + 4)?.try_into().ok()?);
-                    matches!(kind, TYPE_HANDLE | TYPE_WEAK_HANDLE).then(|| u32_at(&txn.data, off + 8))
-                })
-                .collect();
-            if !handles.is_empty() {
-                file.broker.state.lock().buffer_handles.insert((file.id, buf), handles);
-            }
             if txn.oneway && !txn.reply {
                 let mut st = file.broker.state.lock();
                 if let Some(node) = st.local.get(&(file.id, txn.target_ptr)).copied() {
