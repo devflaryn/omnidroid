@@ -13,6 +13,7 @@ fn main() -> ExitCode {
     let mut instance = std::env::temp_dir().join("omni-linux-run");
     let mut argv = Vec::new();
     let mut services: Vec<String> = Vec::new();
+    let mut uid: u32 = 10_000;
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -20,6 +21,7 @@ fn main() -> ExitCode {
             "--instance" => instance = PathBuf::from(args.next().expect("--instance needs a value")),
             "--env" => envp.push(args.next().expect("--env needs KEY=VALUE").into_bytes()),
             "--service" => services.push(args.next().expect("--service needs a program")),
+            "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
             "--" => {
                 argv.extend(args.by_ref().map(String::into_bytes));
             }
@@ -38,7 +40,7 @@ fn main() -> ExitCode {
         stderr: Output::Host,
         trace: std::env::var("OMNI_SYSCALL_TRACE").as_deref() == Ok("1"),
     };
-    let p = match Process::spawn(config) {
+    let p = match Process::spawn_as(config, uid) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("omni-linux-run: {e}");
