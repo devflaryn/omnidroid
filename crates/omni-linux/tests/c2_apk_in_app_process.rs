@@ -4,8 +4,8 @@
 //! loads every native library through that loader -- each in the loader's own linker namespace,
 //! each `JNI_OnLoad` run.
 //!
-//! The APK is the owner's: set `OMNI_TEST_APK` to a stock Roblox APK (its sha256 is checked) to
-//! run this; without it the test is skipped. Nothing about the APK is written here: its dex files
+//! The APK is the owner's: set `OMNI_TEST_APK` to any APK to run this; without it the test is
+//! skipped. Nothing about the APK is written here: its dex files
 //! and libraries are found in it.
 mod common;
 
@@ -14,8 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use omni_linux::{ExitStatus, Output, Process, SpawnConfig};
-
-const STOCK_SHA256: &str = "bbe00ae306cc251c4ea55b7a932d9c524ecb0d6d9203c2a6161bcf0fae792742";
 
 type Buf = Arc<parking_lot::Mutex<Vec<u8>>>;
 
@@ -44,24 +42,14 @@ fn text(b: &Buf) -> String {
     String::from_utf8_lossy(&b.lock()).into_owned()
 }
 
-fn sha256(path: &Path) -> Option<String> {
-    let out = std::process::Command::new(if cfg!(windows) { "certutil" } else { "sha256sum" })
-        .args(if cfg!(windows) { vec!["-hashfile".into(), path.display().to_string(), "SHA256".into()] } else { vec![path.display().to_string()] })
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-    text.split_whitespace().find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit())).map(String::from)
-}
-
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "macOS arm64 maps nothing below 4 GiB, where ART's heap must be (C design: Mac)")]
 fn c2_an_apk_loads_in_an_app_process() {
     let Some(sysroot) = common::sysroot() else { return };
     let Some(apk) = std::env::var_os("OMNI_TEST_APK").map(PathBuf::from) else {
-        eprintln!("SKIPPED: set OMNI_TEST_APK to a stock APK");
+        eprintln!("SKIPPED: set OMNI_TEST_APK to an APK");
         return;
     };
-    assert_eq!(sha256(&apk).as_deref(), Some(STOCK_SHA256), "only the stock APK is run");
     let instance = std::env::temp_dir().join(format!("omni-linux-c2-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&instance);
 

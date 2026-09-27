@@ -33,9 +33,8 @@ use std::sync::{Arc, Mutex};
 use omni_android::{AbiError, AbiResult, ImportCall, ImportFn};
 use omni_cpu::GuestAddr;
 
-/// Which build of this library's name a file holds, and the image to load for it. See
-/// [`identity`]'s own header for the two builds, the digests, and why the decision is a digest.
-pub mod identity;
+/// The library's digest and its constructors' sections, for the report lines.
+pub mod sections;
 
 /// Bytes of guest address space the arena reserves.
 ///
