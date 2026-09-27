@@ -13,6 +13,7 @@ pub mod exec;
 pub mod fd;
 pub mod futex;
 pub mod guest;
+pub mod hal;
 pub mod init;
 pub mod manifest;
 pub mod mm;
