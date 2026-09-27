@@ -29,7 +29,7 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 3] = ["/system/build.prop", "/system_ext/etc/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 13] = [
+const OVERLAY: [(&str, &str); 14] = [
     // The property service speaks protocol 2 (a reply for every set).
     ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
@@ -50,6 +50,8 @@ const OVERLAY: [(&str, &str); 13] = [
     // (`/vendor/lib64/hw/vulkan.omni.so`), which forwards to the host's GPU.
     ("ro.hardware.egl", "angle"),
     ("ro.hardware.vulkan", "omni"),
+    // The display (the host composer's, D3): 160 dpi, as the D design reports it.
+    ("ro.sf.lcd_density", "160"),
 ];
 
 /// `key=value` lines as init reads a `build.prop`: comments, blanks, `import` lines and lines
