@@ -100,6 +100,13 @@ pub struct Task {
 }
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
+
+/// `OMNI_SIGNAL_TRACE=1`: every signal delivered to a guest handler, with where it hit -- the
+/// syscall trace's signal lines alone, cheap enough to leave on.
+fn signal_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_SIGNAL_TRACE").as_deref() == Ok("1"))
+}
 /// Where the guest space is reserved: below 4 GiB, because ART keeps its heap and boot image there
 /// (compressed references are 32 bits; the boot image goes near `ART_BASE_ADDRESS`, 0x70000000),
 /// and a guest address is a host address (D4). On Windows 2 GiB for now: `KUSER_SHARED_DATA` sits
@@ -585,8 +592,12 @@ impl Process {
         }
         let mut regs = Self::read_regs(cpu, pc);
         regs.fault_address = fault_address;
-        if self.trace {
-            eprintln!("[deliver] signal {sig} handler {handler:#x} flags {flags:#x} restorer {restorer:#x} mask {sa_mask:#x} pc {pc:#x} sp {:#x}", regs.sp);
+        if self.trace || signal_trace() {
+            let at = |a: u64| self.mm.describe(a).map_or_else(String::new, |d| format!(" ({d})"));
+            eprintln!(
+                "[deliver] signal {sig} code {} addr {:#x} handler {handler:#x} flags {flags:#x} mask {sa_mask:#x} pc {pc:#x}{} lr {:#x}{} sp {:#x}",
+                info.code, info.addr, at(pc), regs.x[30], at(regs.x[30]), regs.sp
+            );
         }
         // SAFETY: as in `deliver_pending`.
         let (mask, altstack) = unsafe { ((*task).sigmask, (*task).altstack) };
