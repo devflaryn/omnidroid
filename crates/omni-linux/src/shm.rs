@@ -27,6 +27,10 @@ pub struct Shm {
     host_path: std::path::PathBuf,
     /// Made here (its host file removed with it) or opened from another host process's.
     owned: bool,
+    /// Handed to another host process (`crate::remote`), which opens the host file by its path --
+    /// perhaps after this process lets the region go (a gralloc buffer the allocator made, sent on
+    /// to SurfaceFlinger by the app), so the file is then left in place.
+    crossed: std::sync::atomic::AtomicBool,
 }
 
 impl Shm {
@@ -43,6 +47,7 @@ impl Shm {
             prot_mask: AtomicU64::new(0x7), // PROT_READ|WRITE|EXEC until ASHMEM_SET_PROT_MASK narrows it
             host_path,
             owned: true,
+            crossed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -52,12 +57,19 @@ impl Shm {
     /// The file cannot be opened.
     pub fn open_path(name: &str, host_path: &std::path::Path, len: u64) -> Result<Arc<Self>, Errno> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(host_path).map_err(|_| EIO)?;
-        Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false }))
+        Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false, crossed: std::sync::atomic::AtomicBool::new(true) }))
     }
 
     /// Its host file.
     #[must_use]
     pub fn host_path(&self) -> &std::path::Path {
+        &self.host_path
+    }
+
+    /// Its host file, for another host process to open: kept from then on.
+    #[must_use]
+    pub fn host_path_crossing(&self) -> &std::path::Path {
+        self.crossed.store(true, Ordering::SeqCst);
         &self.host_path
     }
 
@@ -108,7 +120,7 @@ impl Shm {
 
 impl Drop for Shm {
     fn drop(&mut self) {
-        if self.owned {
+        if self.owned && !self.crossed.load(Ordering::SeqCst) {
             let _ = std::fs::remove_file(&self.host_path);
         }
     }

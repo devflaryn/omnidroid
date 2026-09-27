@@ -102,7 +102,7 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
     match &*file.kind.lock() {
         FileKind::Shared(m) => {
             let mut d = vec![1u8];
-            for s in [m.name.as_bytes(), m.host_path().to_string_lossy().as_bytes()] {
+            for s in [m.name.as_bytes(), m.host_path_crossing().to_string_lossy().as_bytes()] {
                 d.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 d.extend_from_slice(s);
             }
@@ -113,7 +113,22 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
         // The receiver makes a connected end of its own and relays its other end to this one.
         FileKind::Socket(s) => [&[3u8, s.ty as u8][..], &port.to_le_bytes()].concat(),
         FileKind::Pipe(end) => [&[4u8, u8::from(end.is_write())][..], &port.to_le_bytes()].concat(),
-        _ => vec![0u8],
+        other => {
+            let kind = match other {
+                FileKind::Host { guest, .. } => format!("file {}", String::from_utf8_lossy(guest)),
+                FileKind::Dir { .. } => "directory".into(),
+                FileKind::Dev(_) => "device".into(),
+                FileKind::Synth { guest, .. } => format!("generated {}", String::from_utf8_lossy(guest)),
+                FileKind::EventFd(_) => "eventfd".into(),
+                FileKind::TimerFd(_) => "timerfd".into(),
+                FileKind::Epoll(_) => "epoll".into(),
+                FileKind::Binder(_) | FileKind::RemoteBinder(_) => "binder".into(),
+                FileKind::Gpu(_) => "gpu".into(),
+                _ => "other".into(),
+            };
+            eprintln!("[remote] a descriptor cannot cross host processes: {kind}");
+            vec![0u8]
+        }
     }
 }
 
@@ -323,7 +338,10 @@ impl Server {
                             file.set_area(u64_at(&body, 0), u64_at(&body, 8));
                             0
                         }
-                        _ => break,
+                        other => {
+                            eprintln!("[remote] pid {} tid {tid}: unexpected frame {other} on its thread's connection", p.sys.pid);
+                            break;
+                        }
                     };
                     if send(&mut stream, DONE, &ret.to_le_bytes()).is_err() {
                         break;
@@ -360,6 +378,12 @@ pub fn system_properties() -> Result<Vec<(String, String)>, Errno> {
     }
     let parts: Vec<&[u8]> = body.split(|b| *b == 0).collect();
     Ok(parts.chunks(2).filter(|c| c.len() == 2 && !c[0].is_empty()).map(|c| (String::from_utf8_lossy(c[0]).into_owned(), String::from_utf8_lossy(c[1]).into_owned())).collect())
+}
+
+/// A thread's connection to the system failed: said, and `EIO`.
+fn lost(what: &str, e: &std::io::Error) -> Errno {
+    eprintln!("[remote] {what}: {e}");
+    EIO
 }
 
 /// Whether binder is remote here.
@@ -401,11 +425,11 @@ impl RemoteBinder {
         if let Some(s) = self.threads.lock().get(&tid) {
             return Ok(Arc::clone(s));
         }
-        let mut s = TcpStream::connect(SERVER.get().ok_or(EIO)?).map_err(|_| EIO)?;
+        let mut s = TcpStream::connect(SERVER.get().ok_or(EIO)?).map_err(|e| lost("connect", &e))?;
         let _ = s.set_nodelay(true);
         let mut req = self.token.to_le_bytes().to_vec();
         req.extend_from_slice(&(tid as u32).to_le_bytes());
-        send(&mut s, ATTACH, &req).map_err(|_| EIO)?;
+        send(&mut s, ATTACH, &req).map_err(|e| lost("attach", &e))?;
         let s = Arc::new(Mutex::new(s));
         self.threads.lock().insert(tid, Arc::clone(&s));
         Ok(s)
@@ -416,9 +440,9 @@ impl RemoteBinder {
     fn call(&self, p: &Process, t: &Task, kind: u8, payload: &[u8]) -> SysResult {
         let conn = self.thread(t.tid)?;
         let mut s = conn.lock();
-        send(&mut s, kind, payload).map_err(|_| EIO)?;
+        send(&mut s, kind, payload).map_err(|e| lost("send", &e))?;
         loop {
-            let (kind, body) = receive(&mut s).map_err(|_| EIO)?;
+            let (kind, body) = receive(&mut s).map_err(|e| lost("receive", &e))?;
             match kind {
                 DONE => return Ok(u64_at(&body, 0)),
                 MEM_READ => {
@@ -444,7 +468,10 @@ impl RemoteBinder {
                     let d = p.fds.get(u32_at(&body, 0) as i32).map_or_else(|_| vec![0u8], |f| describe(&f));
                     send(&mut s, FD_DESC, &d).map_err(|_| EIO)?;
                 }
-                _ => return Err(EIO),
+                other => {
+                    eprintln!("[remote] pid {} tid {}: unexpected frame {other}", p.sys.pid, t.tid);
+                    return Err(EIO);
+                }
             }
         }
     }
@@ -455,7 +482,15 @@ impl RemoteBinder {
         req.extend_from_slice(&arg.to_le_bytes());
         let r = self.call(p, t, IOCTL, &req)?;
         // The driver's answer, as a syscall return value.
-        if r > (-4096i64) as u64 { Err(Errno(-(r as i64) as i32)) } else { Ok(r) }
+        if r > (-4096i64) as u64 {
+            let e = Errno(-(r as i64) as i32);
+            if e != crate::errno::EINTR {
+                eprintln!("[remote] binder ioctl {cmd:#x} of pid {} failed: errno {}", p.sys.pid, e.0);
+            }
+            Err(e)
+        } else {
+            Ok(r)
+        }
     }
 
     /// `mmap` of the device: the receive area is mapped here and its place told to the driver.
