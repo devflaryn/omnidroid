@@ -1120,9 +1120,38 @@ fn sys_renameat2(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
         eprintln!("[fs] {} ({comm}) rename {} -> {}", p.sys.pid, from.display(), to.display());
     }
-    std::fs::rename(&from, &to).map_err(|_| EACCES)?;
+    if std::fs::rename(&from, &to).is_err() {
+        // A directory holding an open file: the host (Windows) will not rename it, where Linux
+        // does. Its entries can each be renamed -- every host file here is opened with delete
+        // sharing -- so the tree is moved entry by entry, open descriptors staying valid.
+        if !from.is_dir() {
+            return Err(EACCES);
+        }
+        move_tree(&from, &to).map_err(|_| EACCES)?;
+    }
     p.vfs.owners().rename(&from, &to);
     Ok(0)
+}
+
+/// Move directory `from` to `to` (absent, or an empty directory it replaces): make `to`, rename
+/// each entry into it (a directory by the same means when the host refuses), remove `from`.
+fn move_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if to.is_dir() {
+        std::fs::remove_dir(to)?;
+    }
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if std::fs::rename(&src, &dst).is_err() {
+            if entry.file_type()?.is_dir() {
+                move_tree(&src, &dst)?;
+            } else {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+        }
+    }
+    std::fs::remove_dir(from)
 }
 
 fn sys_renameat(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
