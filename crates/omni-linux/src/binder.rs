@@ -96,6 +96,13 @@ const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// A host service: given a transaction's code and parcel, the reply's parcel.
 type HostHandler = Arc<dyn Fn(u32, &[u8]) -> Vec<u8> + Send + Sync>;
 
+thread_local! {
+    /// On a thread running a host service's handler: the guest thread waiting for its reply, which
+    /// a transaction from the handler to that thread's process goes to (the kernel's nested
+    /// transaction).
+    static HOST_SERVING: std::cell::Cell<Option<(ProcId, i32)>> = const { std::cell::Cell::new(None) };
+}
+
 struct Node {
     owner: ProcId,
     ptr: u64,
@@ -396,7 +403,8 @@ impl Broker {
             sg: Vec::new(),
             fda: Vec::new(),
         };
-        st.queue(target, None, Work::Txn(Box::new(txn)));
+        let nested = HOST_SERVING.with(std::cell::Cell::get).filter(|(p, _)| *p == target).map(|(_, tid)| tid);
+        st.queue(target, nested, Work::Txn(Box::new(txn)));
         let deadline = Instant::now() + HOST_REPLY_TIMEOUT;
         let result = loop {
             let seen = crate::poll::generation();
@@ -892,16 +900,27 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
     }
     if !reply && target_proc == HOST {
-        // A host service answers here, on the sending thread, off the broker lock: a handler may
-        // take time or other locks. The sender hears its transaction went, then the reply, as the
-        // kernel orders them.
+        // A host service answers on a host thread of its own, while the sender waits in `read`
+        // as it would for any process: a handler may take time, and may call back into the
+        // sender, which the waiting thread then serves. The sender hears its transaction went,
+        // then the reply, as the kernel orders them.
         let handler = st.host_services.get(&target_ptr).cloned();
         st.queue(file.id, Some(t.tid), Work::Complete);
         drop(st);
-        let reply_data = handler.map(|h| h(code, &txn.data)).unwrap_or_default();
-        if !oneway {
-            file.broker.state.lock().queue(file.id, Some(t.tid), Work::Txn(Box::new(Txn::reply_from_host(reply_data))));
-        }
+        let (broker, caller, data) = (Arc::clone(&file.broker), (file.id, t.tid), txn.data);
+        std::thread::Builder::new()
+            .name("omni-binder-host".into())
+            .spawn(move || {
+                HOST_SERVING.with(|s| s.set(Some(caller)));
+                let reply_data = handler.map(|h| h(code, &data)).unwrap_or_default();
+                if !oneway {
+                    let mut st = broker.state.lock();
+                    if st.procs.get(&caller.0).is_some_and(|pr| !pr.dead) {
+                        st.queue(caller.0, Some(caller.1), Work::Txn(Box::new(Txn::reply_from_host(reply_data))));
+                    }
+                }
+            })
+            .map_err(|_| ENOMEM)?;
         return Ok(());
     }
     let dead = st.procs.get(&target_proc).is_none_or(|pr| pr.dead);
