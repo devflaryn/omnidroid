@@ -311,16 +311,40 @@ impl Mm {
             self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
             return Ok(at);
         }
+        // An instance file mapped MAP_SHARED (SQLite's WAL index): the host file itself, so every
+        // mapping of it, and its reads and writes, are the same bytes.
+        let shared = match &*file.kind.lock() {
+            FileKind::Host { file: host, guest, sysroot: false } if req.flags & MAP_SHARED != 0 => {
+                Some((host.try_clone().map_err(|_| EIO)?, guest.clone(), host.metadata().map_err(|_| EIO)?.len()))
+            }
+            _ => None,
+        };
+        if let Some((host, guest, file_len)) = shared {
+            let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
+            let at = if in_file > 0 {
+                let backing = omni_mem::Backing::share(host, &String::from_utf8_lossy(&guest)).map_err(|_| {
+                    p.refusals.record("mmap: MAP_SHARED of a file the host cannot share".into(), t.pc, t.lr);
+                    ENODEV
+                })?;
+                self.space.map_file(&backing, req.offset, placement, in_file as usize, prot).map_err(|_| refused_fixed(ENOMEM))? as u64
+            } else {
+                self.space.map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy).map_err(|_| refused_fixed(ENOMEM))? as u64
+            };
+            if len > in_file && in_file > 0 {
+                self.space
+                    .map_anonymous(Placement::Fixed((at + in_file) as usize), (len - in_file) as usize, prot, CommitPolicy::Lazy)
+                    .map_err(|_| ENOMEM)?;
+            }
+            self.forget(at, len);
+            self.files.lock().insert(at, FileMapping { len, guest, offset: req.offset });
+            return Ok(at);
+        }
         let (guest, sysroot, file_len) = match &*file.kind.lock() {
             FileKind::Host { file, guest, sysroot } => {
                 (guest.clone(), *sysroot, file.metadata().map_err(|_| EIO)?.len())
             }
             _ => return Err(ENODEV),
         };
-        if req.flags & MAP_SHARED != 0 && req.prot & PROT_WRITE != 0 && !sysroot {
-            p.refusals.record("mmap: MAP_SHARED|PROT_WRITE of a writable file".into(), t.pc, t.lr);
-            return Err(ENODEV);
-        }
         // The part of the request the file covers, in whole pages; the rest is anonymous zeros.
         let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
         let at = if in_file > 0 && sysroot {
