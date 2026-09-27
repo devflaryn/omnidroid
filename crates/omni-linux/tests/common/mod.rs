@@ -1,5 +1,7 @@
 //! What the milestone gates share: the pinned sysroot and a run of a real AOSP program.
 #![allow(dead_code)]
+pub mod boot;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
