@@ -181,6 +181,17 @@ struct Txn {
     fda: Vec<(usize, usize, Vec<Arc<OpenFile>>)>,
     /// A oneway transaction's node, whose next oneway waits until this one's buffer is freed.
     async_node: Option<NodeId>,
+    /// The nodes it holds in flight ([`State::pin`]): its target's and those its objects name.
+    pinned: Vec<NodeId>,
+}
+
+/// A delivered buffer not yet freed (`BC_FREE_BUFFER`), by (receiver, address) in
+/// [`State::buffers`].
+struct Buffer {
+    /// A oneway's node: freeing the buffer hands the node's next oneway out.
+    async_node: Option<NodeId>,
+    /// The nodes the transaction held, let go when the buffer is freed.
+    pinned: Vec<NodeId>,
 }
 
 struct SgBuffer {
@@ -240,9 +251,14 @@ struct ProcState {
 struct State {
     procs: HashMap<ProcId, ProcState>,
     nodes: HashMap<NodeId, Node>,
-    /// The buffers oneway transactions were delivered in, by (receiver, address): freeing one
-    /// hands its node's next oneway transaction out.
-    async_buffers: HashMap<(ProcId, u64), NodeId>,
+    /// Delivered buffers that hold something until freed -- a oneway's node slot, nodes in
+    /// flight -- by (receiver, address).
+    buffers: HashMap<(ProcId, u64), Buffer>,
+    /// Nodes in flight, with how many transactions hold each: named by a transaction on its way
+    /// or by a delivered buffer not yet freed. The kernel takes a node reference for each
+    /// (`binder_inc_node` as it translates) and drops it with the buffer
+    /// (`binder_transaction_buffer_release`): an object in flight is not released by its owner.
+    pins: HashMap<NodeId, usize>,
     /// (owner, ptr) -> node
     local: HashMap<(ProcId, u64), NodeId>,
     context_mgr: Option<NodeId>,
@@ -344,13 +360,15 @@ impl State {
     }
 
     /// A binder or handle object `sender` sends to `target`, as the target receives it: the new
-    /// (type, binder or handle, cookie), or `None` when it arrives unchanged.
-    fn translate_ref(&mut self, sender: (ProcId, i32), target: ProcId, obj: &[u8]) -> Result<Option<(u32, u64, u64)>, Errno> {
+    /// (type, binder or handle, cookie), or `None` when it arrives unchanged. The node it names is
+    /// pinned into `pins` until the transaction is done with.
+    fn translate_ref(&mut self, sender: (ProcId, i32), target: ProcId, obj: &[u8], pins: &mut Vec<NodeId>) -> Result<Option<(u32, u64, u64)>, Errno> {
         let (kind, flags) = (u32_at(obj, 0), u32_at(obj, 4));
         let (ptr, cookie) = (u64_at(obj, 8), u64_at(obj, 16));
         match kind {
             TYPE_BINDER | TYPE_WEAK_BINDER => {
                 let node = self.local_node(sender.0, ptr, cookie, flags);
+                self.pin(node, pins);
                 if target == sender.0 {
                     return Ok(None);
                 }
@@ -359,6 +377,7 @@ impl State {
             }
             TYPE_HANDLE | TYPE_WEAK_HANDLE => {
                 let node = self.node_for_handle(sender.0, ptr as u32).ok_or(EINVAL)?;
+                self.pin(node, pins);
                 let n = self.nodes.get(&node).expect("a node");
                 if n.owner == target {
                     let kind = if kind == TYPE_HANDLE { TYPE_BINDER } else { TYPE_WEAK_BINDER };
@@ -391,10 +410,48 @@ impl State {
         }
     }
 
-    /// No live process refers to `node` any more: its owner lets it go (`BR_RELEASE`,
-    /// `BR_DECREFS`), and the object's address may later name a new node.
+    /// Hold `node` for a transaction in flight (recorded in its `pins`).
+    fn pin(&mut self, node: NodeId, pins: &mut Vec<NodeId>) {
+        *self.pins.entry(node).or_default() += 1;
+        pins.push(node);
+    }
+
+    /// A transaction in flight is done with the nodes it held (its buffer freed, or it was
+    /// dropped): one no live process refers to any more is released now. How many were.
+    fn unpin(&mut self, nodes: Vec<NodeId>) -> usize {
+        let mut released = 0;
+        for node in nodes {
+            let Some(count) = self.pins.get_mut(&node) else { continue };
+            *count -= 1;
+            if *count == 0 {
+                self.pins.remove(&node);
+                if self.release_if_unreferenced(node) {
+                    released += 1;
+                }
+            }
+        }
+        released
+    }
+
+    /// Work that will never be read (its process or thread gone): a sync transaction's sender
+    /// hears BR_DEAD_REPLY, a oneway's node lets its next one go, and the nodes it held are let
+    /// go (the kernel's `binder_release_work`). How many nodes that released.
+    fn drop_work(&mut self, receiver: ProcId, work: Work) -> usize {
+        let Work::Txn(txn) = work else { return 0 };
+        if let (false, false, Some((proc, tid))) = (txn.reply, txn.oneway, txn.from) {
+            self.queue(proc, Some(tid), Work::DeadReply);
+        }
+        if let Some(node) = txn.async_node {
+            self.async_done(node, receiver);
+        }
+        self.unpin(txn.pinned)
+    }
+
+    /// No live process refers to `node` any more, and no transaction in flight names it: its
+    /// owner lets it go (`BR_RELEASE`, `BR_DECREFS`), and the object's address may later name a
+    /// new node.
     fn release_if_unreferenced(&mut self, node: NodeId) -> bool {
-        if self.context_mgr == Some(node) || self.procs.values().any(|p| !p.dead && p.by_node.contains_key(&node)) {
+        if self.context_mgr == Some(node) || self.pins.contains_key(&node) || self.procs.values().any(|p| !p.dead && p.by_node.contains_key(&node)) {
             return false;
         }
         let Some(n) = self.nodes.get_mut(&node) else { return false };
@@ -444,20 +501,15 @@ impl State {
     /// caller, its files attached. `EINVAL` for an object that is not where the reply says.
     fn reply_from_host(&mut self, caller: ProcId, reply: HostReply) -> Result<Txn, Errno> {
         let HostReply { mut data, fds, binders } = reply;
-        let mut offsets: Vec<u64> = Vec::with_capacity(fds.len() + binders.len());
-        for &off in &binders {
-            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-            if let Some(to) = self.translate_ref((HOST, 0), caller, &obj)? {
-                rewrite_ref(&mut data, off, to);
-            }
-            offsets.push(off as u64);
-        }
         for (off, _) in &fds {
             if data.get(*off..off + 24).map(|o| u32_at(o, 0)) != Some(TYPE_FD) {
                 return Err(EINVAL);
             }
-            offsets.push(*off as u64);
         }
+        let binder_offsets: Vec<u64> = binders.iter().map(|&o| o as u64).collect();
+        let pinned = self.translate_refs((HOST, 0), caller, &mut data, &binder_offsets)?;
+        let mut offsets = binder_offsets;
+        offsets.extend(fds.iter().map(|(off, _)| *off as u64));
         offsets.sort_unstable();
         Ok(Txn {
             reply: true,
@@ -476,7 +528,31 @@ impl State {
             sg: Vec::new(),
             fda: Vec::new(),
             async_node: None,
+            pinned,
         })
+    }
+
+    /// Translate the binder and handle objects at `offsets` of `data` (the host's own
+    /// transactions carry no others) that `sender` sends to `target`: the nodes they hold in flight.
+    /// On an error none is held.
+    fn translate_refs(&mut self, sender: (ProcId, i32), target: ProcId, data: &mut [u8], offsets: &[u64]) -> Result<Vec<NodeId>, Errno> {
+        let mut pins = Vec::new();
+        for &off in offsets {
+            let off = off as usize;
+            let translated = match data.get(off..off + 24) {
+                Some(obj) => self.translate_ref(sender, target, &obj.to_vec(), &mut pins),
+                None => Err(EINVAL),
+            };
+            match translated {
+                Ok(Some(to)) => rewrite_ref(data, off, to),
+                Ok(None) => {}
+                Err(e) => {
+                    self.unpin(pins);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(pins)
     }
 }
 
@@ -527,13 +603,8 @@ impl Broker {
         if dead || st.procs.get(&target).is_none_or(|pr| pr.dead) {
             return Err(EPIPE);
         }
-        for &off in offsets {
-            let off = off as usize;
-            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-            if let Some(to) = st.translate_ref((HOST, tid), target, &obj)? {
-                rewrite_ref(&mut data, off, to);
-            }
-        }
+        let mut pinned = st.translate_refs((HOST, tid), target, &mut data, offsets)?;
+        st.pin(node, &mut pinned);
         let txn = Txn {
             reply: false,
             oneway: false,
@@ -551,6 +622,7 @@ impl Broker {
             sg: Vec::new(),
             fda: Vec::new(),
             async_node: None,
+            pinned,
         };
         let nested = HOST_SERVING.with(std::cell::Cell::get).filter(|(p, _)| *p == target).map(|(_, tid)| tid);
         st.queue(target, nested, Work::Txn(Box::new(txn)));
@@ -589,13 +661,8 @@ impl Broker {
         if dead || st.procs.get(&target).is_none_or(|pr| pr.dead) {
             return Err(EPIPE);
         }
-        for &off in offsets {
-            let off = off as usize;
-            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-            if let Some(to) = st.translate_ref((HOST, 0), target, &obj)? {
-                rewrite_ref(&mut data, off, to);
-            }
-        }
+        let mut pinned = st.translate_refs((HOST, 0), target, &mut data, offsets)?;
+        st.pin(node, &mut pinned);
         let txn = Txn {
             reply: false,
             oneway: true,
@@ -613,6 +680,7 @@ impl Broker {
             sg: Vec::new(),
             fda: Vec::new(),
             async_node: None,
+            pinned,
         };
         st.queue(target, None, Work::Txn(Box::new(txn)));
         Ok(())
@@ -825,11 +893,15 @@ impl BinderFile {
             return;
         }
         let mut st = self.broker.state.lock();
+        // Work that will never be read: the oneways queued on its nodes, its queues.
+        let mut dropped: Vec<Work> = Vec::new();
         let dying: Vec<NodeId> = st.nodes.iter().filter(|(_, n)| n.owner == self.id).map(|(id, _)| *id).collect();
         for node in dying {
             let watchers = {
                 let n = st.nodes.get_mut(&node).expect("node");
                 n.dead = true;
+                n.has_async = false;
+                dropped.extend(n.async_todo.drain(..));
                 std::mem::take(&mut n.watchers)
             };
             for (proc, cookie) in watchers {
@@ -839,32 +911,37 @@ impl BinderFile {
                 st.context_mgr = None;
             }
         }
-        let pending: Vec<(ProcId, i32)> = st
-            .procs
-            .get(&self.id)
-            .map(|p| {
-                p.todo
-                    .iter()
-                    .chain(p.threads.values().flat_map(|t| t.todo.iter()))
-                    .filter_map(|w| match w {
-                        Work::Txn(t) if !t.reply && !t.oneway => t.from,
-                        _ => None,
-                    })
-                    .chain(p.threads.values().flat_map(|t| t.serving.iter().filter_map(|f| *f)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (proc, tid) in pending {
-            st.queue(proc, Some(tid), Work::DeadReply);
-        }
         // Its references are gone with it: an object no live process refers to any more is let go
         // by its owner (`BR_RELEASE`, `BR_DECREFS`), as the kernel drops a dead process's refs --
-        // SurfaceFlinger removes a client's layers when their handles are released so.
-        let held: Vec<NodeId> = st.procs.get_mut(&self.id).map(|p| {
+        // SurfaceFlinger removes a client's layers when their handles are released so. One still
+        // in flight -- in a transaction queued elsewhere, or in a buffer not yet freed -- waits
+        // for that.
+        let mut serving = Vec::new();
+        let mut held = Vec::new();
+        if let Some(p) = st.procs.get_mut(&self.id) {
+            p.dead = true;
+            dropped.extend(p.todo.drain(..));
+            for (_, th) in p.threads.drain() {
+                dropped.extend(th.todo);
+                serving.extend(th.serving.into_iter().flatten());
+            }
             p.by_node.clear();
-            std::mem::take(&mut p.refs).into_values().collect()
-        }).unwrap_or_default();
+            held = std::mem::take(&mut p.refs).into_values().collect();
+        }
+        // Every sync transaction waiting on it fails.
+        for (proc, tid) in serving {
+            st.queue(proc, Some(tid), Work::DeadReply);
+        }
         let mut released = 0;
+        for work in dropped {
+            released += st.drop_work(self.id, work);
+        }
+        let buffers: Vec<(ProcId, u64)> = st.buffers.keys().filter(|(proc, _)| *proc == self.id).copied().collect();
+        for key in buffers {
+            if let Some(b) = st.buffers.remove(&key) {
+                released += st.unpin(b.pinned);
+            }
+        }
         for node in held {
             if st.release_if_unreferenced(node) {
                 released += 1;
@@ -873,11 +950,6 @@ impl BinderFile {
         if std::env::var_os("OMNI_BINDER_TRACE").is_some() || released > 0 {
             let pid = st.procs.get(&self.id).map_or(0, |p| p.pid);
             eprintln!("[binder] pid {pid} closed its driver: {released} objects released");
-        }
-        if let Some(p) = st.procs.get_mut(&self.id) {
-            p.dead = true;
-            p.todo.clear();
-            p.threads.clear();
         }
         crate::poll::notify();
     }
@@ -917,8 +989,16 @@ pub fn ioctl(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmd: u64, arg: u
             Ok(0)
         }
         BINDER_THREAD_EXIT => {
-            if let Some(proc) = file.broker.state.lock().procs.get_mut(&file.id) {
-                proc.threads.remove(&t.tid);
+            // The kernel's `binder_thread_release`: the caller of the transaction it was serving
+            // hears BR_DEAD_REPLY, and the work left in its queue is dropped as a dead process's.
+            let mut st = file.broker.state.lock();
+            if let Some(th) = st.procs.get_mut(&file.id).and_then(|p| p.threads.remove(&t.tid)) {
+                if let Some(Some((proc, tid))) = th.serving.last().copied() {
+                    st.queue(proc, Some(tid), Work::DeadReply);
+                }
+                for work in th.todo {
+                    st.drop_work(file.id, work);
+                }
             }
             Ok(0)
         }
@@ -1035,10 +1115,14 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         BC_FREE_BUFFER => {
             let ptr = u64_at(arg, 0);
             file.area.lock().free(ptr);
-            // A oneway transaction's buffer: its node's next oneway goes to the process.
+            // As the kernel's `binder_free_buf`: a oneway's node hands its next oneway to the
+            // process, and the nodes the transaction held are let go.
             let mut st = file.broker.state.lock();
-            if let Some(node) = st.async_buffers.remove(&(file.id, ptr)) {
-                st.async_done(node, file.id);
+            if let Some(b) = st.buffers.remove(&(file.id, ptr)) {
+                if let Some(node) = b.async_node {
+                    st.async_done(node, file.id);
+                }
+                st.unpin(b.pinned);
             }
         }
         // A live process's handle references are not counted: its handles last as long as it
@@ -1108,14 +1192,14 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     let mut st = file.broker.state.lock();
 
     // Where it goes.
-    let (target_proc, target_tid, target_ptr, target_cookie, secctx, from) = if reply {
+    let (target_proc, target_tid, target_ptr, target_cookie, secctx, from, target_node) = if reply {
         let serving = st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.pop().flatten();
         let Some((proc, tid)) = serving else {
             // The one who asked is gone, or this was not a sync transaction: nothing to answer.
             st.queue(file.id, Some(t.tid), Work::Complete);
             return Ok(());
         };
-        (proc, Some(tid), 0, 0, false, None)
+        (proc, Some(tid), 0, 0, false, None, None)
     } else {
         // The kernel's answers: no context manager is BR_DEAD_REPLY, a handle the process does
         // not have BR_FAILED_REPLY, a dead node BR_DEAD_REPLY.
@@ -1138,67 +1222,33 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
                 .and_then(|pr| pr.threads.get(&t.tid))
                 .and_then(|th| th.serving.iter().rev().flatten().find(|(pid, _)| *pid == owner).map(|(_, tid)| *tid))
         };
-        (owner, nested, ptr, cookie, sec, (!oneway).then_some((file.id, t.tid)))
+        (owner, nested, ptr, cookie, sec, (!oneway).then_some((file.id, t.tid)), Some(node))
     };
+    // A dead receiver, before anything is translated for it (a handle made for a dead process
+    // would hold its node for no one). The kernel's: a transaction to a dead process fails as
+    // the sender's BR_DEAD_REPLY; a reply to a caller gone completes for the replier.
+    if target_proc != HOST && st.procs.get(&target_proc).is_none_or(|pr| pr.dead) {
+        st.queue(file.id, Some(t.tid), if reply { Work::Complete } else { Work::ReturnError(BR_DEAD_REPLY) });
+        return Ok(());
+    }
 
-    // Translate the objects for the receiver.
-    let mut fds = Vec::new();
-    let mut sg: Vec<SgBuffer> = Vec::new();
-    let mut fda = Vec::new();
-    // Which `sg` entry each object index is (buffer objects only).
-    let mut sg_of_object: HashMap<usize, usize> = HashMap::new();
-    for (index, &off) in offsets.iter().enumerate() {
-        let off = off as usize;
-        let kind = u32_at(data.get(off..off + 4).ok_or(EINVAL)?, 0);
-        if kind == TYPE_PTR {
-            let obj = data.get(off..off + 40).ok_or(EINVAL)?.to_vec();
-            let (flags, buffer, length) = (u32_at(&obj, 4), u64_at(&obj, 8), u64_at(&obj, 16));
-            if length > 1 << 20 {
-                return Err(EINVAL);
-            }
-            let bytes = p.mem.read(buffer, length as usize)?;
-            let parent = if flags & BUFFER_FLAG_HAS_PARENT != 0 {
-                let parent_index = u64_at(&obj, 24) as usize;
-                let parent_sg = *sg_of_object.get(&parent_index).ok_or(EINVAL)?;
-                Some((parent_sg, u64_at(&obj, 32) as usize))
-            } else {
-                None
-            };
-            sg_of_object.insert(index, sg.len());
-            sg.push(SgBuffer { obj_off: off, bytes, parent });
-            continue;
+    // Translate the objects for the receiver; the nodes it names are held while it is in flight,
+    // its target's too (the kernel's `binder_inc_node` for the transaction's buffer).
+    let mut pinned = Vec::new();
+    let translated = translate_objects(p, t, &mut st, (file.id, t.tid), target_proc, &mut data, &offsets, &mut pinned);
+    let (fds, sg, fda) = match translated {
+        Ok(objects) => objects,
+        Err(e) => {
+            st.unpin(pinned);
+            return Err(e);
         }
-        if kind == TYPE_FDA {
-            let obj = data.get(off..off + 32).ok_or(EINVAL)?.to_vec();
-            let (num, parent_index, parent_offset) = (u64_at(&obj, 8) as usize, u64_at(&obj, 16) as usize, u64_at(&obj, 24) as usize);
-            let parent_sg = *sg_of_object.get(&parent_index).ok_or(EINVAL)?;
-            let parent_bytes = &sg[parent_sg].bytes;
-            let mut files = Vec::with_capacity(num);
-            for i in 0..num {
-                let at = parent_offset + i * 4;
-                let fd = u32_at(parent_bytes.get(at..at + 4).ok_or(EINVAL)?, 0) as i32;
-                files.push(p.fds.get(fd)?);
-            }
-            fda.push((parent_sg, parent_offset, files));
-            continue;
-        }
-        let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-        match u32_at(&obj, 0) {
-            TYPE_BINDER | TYPE_WEAK_BINDER | TYPE_HANDLE | TYPE_WEAK_HANDLE => {
-                if let Some(to) = st.translate_ref((file.id, t.tid), target_proc, &obj)? {
-                    rewrite_ref(&mut data, off, to);
-                }
-            }
-            TYPE_FD => {
-                let fd = u64_at(&obj, 8) as u32 as i32;
-                let open = p.fds.get(fd)?;
-                fds.push((off, open));
-            }
-            other => {
-                p.refusals.record(format!("binder object type {other:#x}"), t.pc, t.lr);
-                return Err(EINVAL);
-            }
-        }
+    };
+    if let Some(node) = target_node {
+        st.pin(node, &mut pinned);
+    }
+    if target_proc == HOST {
+        // The host's handles hold what it is sent for as long as it runs.
+        st.unpin(std::mem::take(&mut pinned));
     }
 
     // OMNI_BINDER_TRACE=1: every transaction and reply, sender to receiver.
@@ -1214,7 +1264,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
             data.len()
         );
     }
-    let txn = Txn {
+    let mut txn = Txn {
         reply,
         oneway,
         from,
@@ -1231,8 +1281,8 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         sg,
         fda,
         async_node: None,
+        pinned,
     };
-    let mut txn = txn;
     if !reply && target_proc == HOST {
         // A host service answers on a host thread of its own, while the sender waits in `read`
         // as it would for any process: a handler may take time, and may call back into the
@@ -1278,39 +1328,99 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         st.queue(file.id, Some(t.tid), Work::Complete);
         return Ok(());
     }
-    let dead = st.procs.get(&target_proc).is_none_or(|pr| pr.dead);
-    if dead {
-        // The kernel's: a transaction to a dead process fails as the sender's BR_DEAD_REPLY; a
-        // reply to a caller gone completes for the replier.
-        st.queue(file.id, Some(t.tid), if reply { Work::Complete } else { Work::ReturnError(BR_DEAD_REPLY) });
-        return Ok(());
-    }
     // A sync transaction: the sender now waits for its reply (the kernel's transaction_stack).
     if !reply && !oneway {
         st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
     }
     // A oneway transaction waits while one to the same node is out, as the driver orders them.
-    if oneway {
-        if let Some(id) = st.local.get(&(target_proc, target_ptr)).copied() {
-            txn.async_node = Some(id);
-            if let Some(n) = st.nodes.get_mut(&id) {
-                if n.has_async {
-                    n.async_todo.push_back(Work::Txn(Box::new(txn)));
-                    if n.async_todo.len() % 64 == 0 {
-                        let (owner, queued) = (n.owner, n.async_todo.len());
-                        let pid = st.procs.get(&owner).map_or(0, |pr| pr.pid);
-                        eprintln!("[binder] {queued} oneway calls wait on node {id} of pid {pid} (its last one's buffer not freed)");
-                    }
-                    st.queue(file.id, Some(t.tid), Work::Complete);
-                    return Ok(());
+    if let (true, Some(id)) = (oneway, target_node) {
+        txn.async_node = Some(id);
+        if let Some(n) = st.nodes.get_mut(&id) {
+            if n.has_async {
+                n.async_todo.push_back(Work::Txn(Box::new(txn)));
+                if n.async_todo.len() % 64 == 0 {
+                    let (owner, queued) = (n.owner, n.async_todo.len());
+                    let pid = st.procs.get(&owner).map_or(0, |pr| pr.pid);
+                    eprintln!("[binder] {queued} oneway calls wait on node {id} of pid {pid} (its last one's buffer not freed)");
                 }
-                n.has_async = true;
+                st.queue(file.id, Some(t.tid), Work::Complete);
+                return Ok(());
             }
+            n.has_async = true;
         }
     }
     st.queue(target_proc, target_tid, Work::Txn(Box::new(txn)));
     st.queue(file.id, Some(t.tid), Work::Complete);
     Ok(())
+}
+
+/// The descriptors, scatter-gather buffers and fd arrays a transaction carries.
+type Objects = (Vec<(usize, Arc<OpenFile>)>, Vec<SgBuffer>, Vec<(usize, usize, Vec<Arc<OpenFile>>)>);
+
+/// Translate the objects at `offsets` of `data` that `sender` sends to `target`: binders and
+/// handles rewritten in place (the nodes they name held in `pins`), descriptors, scatter-gather
+/// buffers and fd arrays gathered.
+#[allow(clippy::too_many_arguments)]
+fn translate_objects(p: &Process, t: &Task, st: &mut State, sender: (ProcId, i32), target: ProcId, data: &mut [u8], offsets: &[u64], pins: &mut Vec<NodeId>) -> Result<Objects, Errno> {
+    let mut fds = Vec::new();
+    let mut sg: Vec<SgBuffer> = Vec::new();
+    let mut fda = Vec::new();
+    // Which `sg` entry each object index is (buffer objects only).
+    let mut sg_of_object: HashMap<usize, usize> = HashMap::new();
+    for (index, &off) in offsets.iter().enumerate() {
+        let off = off as usize;
+        let kind = u32_at(data.get(off..off + 4).ok_or(EINVAL)?, 0);
+        if kind == TYPE_PTR {
+            let obj = data.get(off..off + 40).ok_or(EINVAL)?.to_vec();
+            let (flags, buffer, length) = (u32_at(&obj, 4), u64_at(&obj, 8), u64_at(&obj, 16));
+            if length > 1 << 20 {
+                return Err(EINVAL);
+            }
+            let bytes = p.mem.read(buffer, length as usize)?;
+            let parent = if flags & BUFFER_FLAG_HAS_PARENT != 0 {
+                let parent_index = u64_at(&obj, 24) as usize;
+                let parent_sg = *sg_of_object.get(&parent_index).ok_or(EINVAL)?;
+                Some((parent_sg, u64_at(&obj, 32) as usize))
+            } else {
+                None
+            };
+            sg_of_object.insert(index, sg.len());
+            sg.push(SgBuffer { obj_off: off, bytes, parent });
+            continue;
+        }
+        if kind == TYPE_FDA {
+            let obj = data.get(off..off + 32).ok_or(EINVAL)?.to_vec();
+            let (num, parent_index, parent_offset) = (u64_at(&obj, 8) as usize, u64_at(&obj, 16) as usize, u64_at(&obj, 24) as usize);
+            let parent_sg = *sg_of_object.get(&parent_index).ok_or(EINVAL)?;
+            let parent_bytes = &sg[parent_sg].bytes;
+            let mut files = Vec::with_capacity(num);
+            for i in 0..num {
+                let at = parent_offset + i * 4;
+                let fd = u32_at(parent_bytes.get(at..at + 4).ok_or(EINVAL)?, 0) as i32;
+                files.push(p.fds.get(fd)?);
+            }
+            fda.push((parent_sg, parent_offset, files));
+            continue;
+        }
+        let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
+        match u32_at(&obj, 0) {
+            TYPE_BINDER | TYPE_WEAK_BINDER | TYPE_HANDLE | TYPE_WEAK_HANDLE => {
+                if let Some(to) = st.translate_ref(sender, target, &obj, pins)? {
+                    rewrite_ref(data, off, to);
+                }
+            }
+            TYPE_FD => {
+                let fd = u64_at(&obj, 8) as u32 as i32;
+                let open = p.fds.get(fd)?;
+                fds.push((off, open));
+            }
+            other => {
+                p.refusals.record(format!("binder object type {other:#x}"), t.pc, t.lr);
+                return Err(EINVAL);
+            }
+        }
+    }
+    Ok((fds, sg, fda))
 }
 
 /// Fill the read buffer with work for this thread, waiting for some when there is none.
@@ -1441,9 +1551,11 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
                 Err(e) => return fail_undelivered(file, t.tid, txn, e, out),
             };
             let mut st = file.broker.state.lock();
-            // A oneway's buffer: freeing it hands its node's next oneway out.
-            if let Some(node) = txn.async_node {
-                st.async_buffers.insert((file.id, buf), node);
+            // Freeing the buffer hands a oneway's node's next oneway out, and lets go the nodes
+            // the transaction held.
+            if txn.async_node.is_some() || !txn.pinned.is_empty() {
+                let pinned = std::mem::take(&mut txn.pinned);
+                st.buffers.insert((file.id, buf), Buffer { async_node: txn.async_node, pinned });
             }
             let th = st.proc_mut(file.id).threads.entry(t.tid).or_default();
             if txn.reply {
@@ -1568,6 +1680,7 @@ fn fail_undelivered(file: &Arc<BinderFile>, tid: i32, txn: Txn, error: Errno, ou
         txn.code,
         error.0
     );
+    st.unpin(txn.pinned);
     if txn.reply {
         let th = st.proc_mut(file.id).threads.entry(tid).or_default();
         th.awaiting = th.awaiting.saturating_sub(1);
@@ -1592,8 +1705,11 @@ fn undeliver(p: &Process, file: &Arc<BinderFile>, tid: i32, h: Handed) {
     }
     file.area.lock().free(h.buf);
     let mut st = file.broker.state.lock();
-    if let Some(node) = st.async_buffers.remove(&(file.id, h.buf)) {
-        st.async_done(node, file.id);
+    if let Some(b) = st.buffers.remove(&(file.id, h.buf)) {
+        if let Some(node) = b.async_node {
+            st.async_done(node, file.id);
+        }
+        st.unpin(b.pinned);
     }
     if !h.reply && !h.oneway {
         let th = st.proc_mut(file.id).threads.entry(tid).or_default();
