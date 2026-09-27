@@ -25,6 +25,26 @@ pub fn run(args: &[&str]) -> Option<(ExitStatus, String, String)> {
     run_in(instance_dir(), args)
 }
 
+/// Run programs one after another in one instance (one filesystem), as a shell would -- which
+/// cannot here, having no fork.
+/// A program named `fixture:<name>` is the NDK-built fixture, pushed to `/data/local/tmp`.
+pub fn run_each(programs: &[&[&str]]) -> Option<Vec<(ExitStatus, String, String)>> {
+    let instance = instance_dir();
+    programs
+        .iter()
+        .map(|args| {
+            let Some(name) = args[0].strip_prefix("fixture:") else { return run_in(instance.clone(), args) };
+            let tmp = instance.join("data/local/tmp");
+            std::fs::create_dir_all(&tmp).expect("the instance's /data/local/tmp");
+            let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+            std::fs::copy(&fixture, tmp.join(name)).unwrap_or_else(|e| panic!("{}: {e}", fixture.display()));
+            let guest = format!("/data/local/tmp/{name}");
+            let argv: Vec<&str> = std::iter::once(guest.as_str()).chain(args[1..].iter().copied()).collect();
+            run_in(instance.clone(), &argv)
+        })
+        .collect()
+}
+
 /// Run an NDK-built fixture (`tests/fixtures/<name>`) from the instance's `/data/local/tmp`, as
 /// `adb push` and a shell would.
 pub fn run_fixture(name: &str, args: &[&str]) -> Option<(ExitStatus, String, String)> {

@@ -187,6 +187,10 @@ fn mounts(p: &Process) -> Vec<u8> {
         out.push_str(l);
         out.push('\n');
     }
+    // What processes of the instance bind-mounted (vold's /data/data on /data/user/0).
+    for (target, _) in p.vfs.binds().list() {
+        let _ = writeln!(out, "/dev/data {} ext4 rw 0 0", String::from_utf8_lossy(&target));
+    }
     // The APEXes, as apexd mounts them (and as its PopulateFromMounts reads them back).
     for m in apex_mounts(p) {
         let _ = writeln!(out, "/dev/block/loop{} /apex/{}@{} ext4 ro,dirsync,seclabel,nodev,noatime 0 0", m.index, m.name, m.version);
@@ -259,6 +263,56 @@ fn policyvers(_p: &Process) -> Vec<u8> {
 }
 
 /// The process's SELinux context: its domain as a device's policy names it, by program.
+/// The SELinux attributes a process sets for what it does next (`/proc/<pid>/attr/<name>`):
+/// the context of the files it creates, of the program it executes, of its keys and sockets.
+const SETTABLE_ATTRS: [&str; 4] = ["fscreate", "exec", "keycreate", "sockcreate"];
+
+/// What each process wrote to its settable attributes, by pid and name.
+fn attrs() -> &'static parking_lot::Mutex<std::collections::HashMap<(i32, String), Vec<u8>>> {
+    static ATTRS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<(i32, String), Vec<u8>>>> = std::sync::OnceLock::new();
+    ATTRS.get_or_init(Default::default)
+}
+
+/// The pid and attribute a path names, when it is a settable attribute:
+/// `/proc/<pid>/attr/<name>` or `/proc/<pid>/task/<tid>/attr/<name>`.
+fn settable_attr(path: &[u8]) -> Option<(i32, &'static str)> {
+    let path = std::str::from_utf8(path).ok()?;
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid, rest) = rest.split_once('/')?;
+    let pid = pid.parse().ok()?;
+    let rest = match rest.strip_prefix("task/") {
+        Some(task) => task.split_once('/')?.1,
+        None => rest,
+    };
+    let name = rest.strip_prefix("attr/")?;
+    SETTABLE_ATTRS.iter().find(|a| **a == name).map(|a| (pid, *a))
+}
+
+/// Whether a path is an attribute a process may write (`setfscreatecon` and its kin).
+#[must_use]
+pub fn is_settable_attr(path: &[u8]) -> bool {
+    settable_attr(path).is_some()
+}
+
+/// A write to a settable attribute: it holds the context written (empty clears it).
+pub fn write_attr(path: &[u8], bytes: &[u8]) -> Result<usize, crate::errno::Errno> {
+    let (pid, name) = settable_attr(path).ok_or(crate::errno::EACCES)?;
+    let value: Vec<u8> = bytes.iter().copied().take_while(|b| *b != 0 && *b != b'\n').collect();
+    let mut attrs = attrs().lock();
+    if value.is_empty() {
+        attrs.remove(&(pid, name.to_string()));
+    } else {
+        let mut stored = value;
+        stored.push(0);
+        attrs.insert((pid, name.to_string()), stored);
+    }
+    Ok(bytes.len())
+}
+
+fn attr_value(pid: i32, name: &str) -> Vec<u8> {
+    attrs().lock().get(&(pid, name.to_string())).cloned().unwrap_or_default()
+}
+
 fn selinux_context(p: &Process) -> Vec<u8> {
     let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
     let domain = match comm.as_str() {
@@ -389,7 +443,8 @@ impl Process {
             }
             return match inner {
                 "" => Some(Entry::Dir(vec![("stat", DT_REG), ("status", DT_REG), ("comm", DT_REG), ("attr", DT_DIR)])),
-                "stat" | "status" | "comm" | "attr" | "attr/current" => self.per_process(inner),
+                "stat" | "status" | "comm" => self.per_process(inner),
+                _ if inner == "attr" || inner.starts_with("attr/") => self.per_process(inner),
                 _ => None,
             };
         }
@@ -414,8 +469,18 @@ impl Process {
                 ("mounts", DT_REG),
                 ("attr", DT_DIR),
             ]),
-            "attr" => Entry::Dir(vec![("current", DT_REG)]),
-            "attr/current" => Entry::File(selinux_context),
+            "attr" => Entry::Dir(vec![
+                ("current", DT_REG),
+                ("prev", DT_REG),
+                ("fscreate", DT_REG),
+                ("exec", DT_REG),
+                ("keycreate", DT_REG),
+                ("sockcreate", DT_REG),
+            ]),
+            "attr/current" | "attr/prev" => Entry::File(selinux_context),
+            _ if tail.strip_prefix("attr/").is_some_and(|a| SETTABLE_ATTRS.contains(&a)) => {
+                Entry::Bytes(attr_value(self.sys.pid, &tail["attr/".len()..]))
+            }
             "maps" => Entry::File(maps),
             "stat" => Entry::File(stat),
             "status" => Entry::File(status),

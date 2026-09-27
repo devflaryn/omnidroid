@@ -74,6 +74,37 @@ pub enum Command {
     Export(String, String),
     /// `load_exports <file>`: its `export NAME VALUE` lines.
     LoadExports(String),
+    /// `wait_for_prop <name> <value>`: wait until a property has a value.
+    WaitForProp(String, String),
+    /// `setprop <name> <value>`.
+    SetProp(String, String),
+    /// `restart <service>`: start it (here: unless it runs).
+    Restart(String),
+    /// `init_user0`: vold prepares user 0's storage (`/data/user/0`, `/data/user_de/0`, ...), asked
+    /// by `vdc cryptfs init_user0` as AOSP init asks it.
+    InitUser0,
+}
+
+/// A script's lines as init reads them: a line ending in `\` continues on the next.
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pending = String::new();
+    for line in text.lines() {
+        match line.trim_end().strip_suffix('\\') {
+            Some(head) => {
+                pending.push_str(head);
+                pending.push(' ');
+            }
+            None => {
+                pending.push_str(line);
+                out.push(std::mem::take(&mut pending));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        out.push(pending);
+    }
+    out
 }
 
 /// The services, and the commands of the boot-phase `on` blocks, in phase order.
@@ -105,7 +136,7 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
         let mut current: Option<Service> = None;
         // The boot phase of the `on` block being read, when it is one with no other condition.
         let mut phase: Option<usize> = None;
-        for line in String::from_utf8_lossy(&text).lines() {
+        for line in logical_lines(&String::from_utf8_lossy(&text)) {
             let line = line.trim();
             let words: Vec<&str> = line.split_whitespace().collect();
             match words.first().copied() {
@@ -127,12 +158,16 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                     }
                     phase = (words.first() == Some(&"on") && words.len() == 2).then(|| BOOT_PHASES.iter().position(|p| *p == words[1])).flatten();
                 }
-                Some("start" | "exec_start" | "export" | "load_exports") if current.is_none() => {
+                Some("start" | "exec_start" | "export" | "load_exports" | "wait_for_prop" | "setprop" | "restart" | "init_user0") if current.is_none() => {
                     let command = match (words[0], words.len()) {
                         ("start", 2) => Some(Command::Start(words[1].to_string())),
                         ("exec_start", 2) => Some(Command::ExecStart(words[1].to_string())),
                         ("export", 3) => Some(Command::Export(words[1].to_string(), words[2].to_string())),
                         ("load_exports", 2) => Some(Command::LoadExports(words[1].to_string())),
+                        ("wait_for_prop", 3) => Some(Command::WaitForProp(words[1].to_string(), words[2].to_string())),
+                        ("setprop", 3) => Some(Command::SetProp(words[1].to_string(), words[2].to_string())),
+                        ("restart", 2) => Some(Command::Restart(words[1].to_string())),
+                        ("init_user0", 1) => Some(Command::InitUser0),
                         _ => None,
                     };
                     if let (Some(ph), Some(c)) = (phase, command) {
@@ -161,6 +196,26 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
     (out, commands.into_iter().map(|(_, c)| c).collect())
 }
 
+/// A command argument as init expands it: `""` is empty, `${name}` and `${name:-default}` are
+/// property values.
+fn expand(word: &str, get: impl Fn(&str) -> Option<String>) -> String {
+    if word == "\"\"" {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut rest = word;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let Some(end) = rest[at..].find('}') else { break };
+        let inner = &rest[at + 2..at + end];
+        let (name, default) = inner.split_once(":-").unwrap_or((inner, ""));
+        out.push_str(&get(name).filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string()));
+        rest = &rest[at + end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Set `name=value` in an environment, replacing an earlier value.
 fn set_env(envp: &mut Vec<Vec<u8>>, name: &str, value: &str) {
     let prefix = format!("{name}=");
@@ -170,6 +225,10 @@ fn set_env(envp: &mut Vec<Vec<u8>>, name: &str, value: &str) {
 
 /// How long `exec_start` waits for its service, at most.
 const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long `wait_for_prop` waits, at most. AOSP init waits forever; a boot here that never
+/// gets the property should still go on, and show what is missing.
+const WAIT_FOR_PROP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// init: the services, what runs, and how to start more.
 pub struct Init {
@@ -223,6 +282,12 @@ impl Init {
         &self.services
     }
 
+    /// The boot phases' commands, in the order boot carries them out.
+    #[must_use]
+    pub fn boot_commands(&self) -> &[Command] {
+        &self.boot_commands
+    }
+
     /// The global environment a service started now gets.
     #[must_use]
     pub fn environment(&self) -> Vec<Vec<u8>> {
@@ -230,7 +295,8 @@ impl Init {
     }
 
     /// Boot: the boot phases' commands in order (`start`, `exec_start`, `export`,
-    /// `load_exports`), then `class_start` of `classes`. What started.
+    /// `load_exports`, `wait_for_prop`, `setprop`, `restart`), then `class_start` of `classes`.
+    /// What started.
     pub fn boot(&self, classes: &[&str]) -> Vec<String> {
         let mut started = Vec::new();
         for c in &self.boot_commands {
@@ -250,10 +316,38 @@ impl Init {
                 }
                 Command::Export(name, value) => set_env(&mut self.envp.lock(), name, value),
                 Command::LoadExports(path) => self.load_exports(path),
+                Command::SetProp(name, value) => {
+                    let Some(props) = self.properties() else { continue };
+                    let value = expand(value, |n| props.get(n));
+                    props.set(name, &value);
+                }
+                Command::Restart(n) => {
+                    if self.start_service(n) {
+                        started.push(n.clone());
+                    }
+                }
+                Command::InitUser0 => {
+                    let status = self.exec(&["/system/bin/vdc", "--wait", "cryptfs", "init_user0"], 0);
+                    if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                        eprintln!("[init] init_user0: {status:?}");
+                    }
+                }
+                Command::WaitForProp(name, value) => {
+                    let Some(props) = self.properties() else { continue };
+                    let ok = props.wait_for(name, value, WAIT_FOR_PROP_TIMEOUT);
+                    if !ok || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                        eprintln!("[init] wait_for_prop {name} {value}: {}", if ok { "done" } else { "timed out" });
+                    }
+                }
             }
         }
         started.extend(self.class_start(classes));
         started
+    }
+
+    /// The property service of the instance.
+    fn properties(&self) -> Option<Arc<crate::props::PropertyService>> {
+        Sysroot::open(&self.sysroot).ok().map(|root| crate::props::PropertyService::global(&root))
     }
 
     /// `load_exports <path>`: the file's `export NAME VALUE` lines (a guest path on a writable
@@ -278,16 +372,24 @@ impl Init {
         if (self.skip)(service) {
             return None;
         }
+        let argv: Vec<&str> = service.argv.iter().map(String::as_str).collect();
+        self.exec(&argv, service.uid)
+    }
+
+    /// Run a program as `uid` and wait for it to end (at most [`EXEC_TIMEOUT`]). Its end, or
+    /// `None` when it could not start.
+    fn exec(&self, argv: &[&str], uid: u32) -> Option<Option<crate::process::ExitStatus>> {
         let config = SpawnConfig {
             sysroot: self.sysroot.clone(),
             instance_dir: self.instance.clone(),
-            argv: service.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+            argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
             envp: self.environment(),
             stdout: Output::Host,
             stderr: Output::Host,
             trace: false,
         };
-        let p = Process::spawn_as(config, service.uid).map_err(|e| eprintln!("[init] {name}: {e}")).ok()?;
+        let name = argv.first().copied().unwrap_or_default().rsplit('/').next().unwrap_or_default().to_string();
+        let p = Process::spawn_as(config, uid).map_err(|e| eprintln!("[init] {name}: {e}")).ok()?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new().name(format!("init-exec-{name}")).spawn(move || tx.send(p.run())).ok()?;
         Some(rx.recv_timeout(EXEC_TIMEOUT).ok())
@@ -368,5 +470,30 @@ impl Init {
             }
             _ => true, // stop and the rest: nothing here stops a service yet
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand;
+
+    #[test]
+    fn a_line_ending_in_a_backslash_continues() {
+        let text = "service vold /system/bin/vold \\\n        --blkid_context=u:r:blkid:s0 \\\n        --fsck_context=u:r:fsck:s0\n    class core\n";
+        assert_eq!(
+            super::logical_lines(text),
+            ["service vold /system/bin/vold          --blkid_context=u:r:blkid:s0          --fsck_context=u:r:fsck:s0", "    class core"]
+        );
+    }
+
+    #[test]
+    fn arguments_expand_as_init_expands_them() {
+        let get = |n: &str| (n == "a.set").then(|| "7".to_string());
+        assert_eq!(expand("\"\"", get), "");
+        assert_eq!(expand("30", get), "30");
+        assert_eq!(expand("${a.set}", get), "7");
+        assert_eq!(expand("${a.unset:-1}", get), "1");
+        assert_eq!(expand("x${a.set:-1}y", get), "x7y");
+        assert_eq!(expand("${a.unset}", get), "");
     }
 }

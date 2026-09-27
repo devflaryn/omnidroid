@@ -221,9 +221,58 @@ pub fn ino_of(path: &[u8]) -> u64 {
     path.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)) | 1
 }
 
+/// The bind mounts of an instance (its mount namespace, which every process of it shares): a
+/// guest directory that shows another's contents, by the host directory that holds them.
+#[derive(Default)]
+pub struct Binds {
+    binds: parking_lot::RwLock<Vec<(Vec<u8>, PathBuf)>>,
+}
+
+impl Binds {
+    /// The bind mounts of the instance at `instance` (one table per instance directory).
+    #[must_use]
+    pub fn of(instance: &Path) -> Arc<Self> {
+        static TABLES: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<Binds>>>> = std::sync::OnceLock::new();
+        let mut tables = TABLES.get_or_init(Default::default).lock();
+        Arc::clone(tables.entry(instance.to_path_buf()).or_default())
+    }
+
+    /// Mount `host` (a host directory or file) at the guest path `target`, over what was there.
+    pub fn bind(&self, target: Vec<u8>, host: PathBuf) {
+        let mut binds = self.binds.write();
+        binds.retain(|(t, _)| *t != target);
+        binds.push((target, host));
+    }
+
+    /// Unmount what is mounted at `target`. Whether something was.
+    pub fn unbind(&self, target: &[u8]) -> bool {
+        let mut binds = self.binds.write();
+        let before = binds.len();
+        binds.retain(|(t, _)| t.as_slice() != target);
+        binds.len() != before
+    }
+
+    /// The mounts, oldest first.
+    #[must_use]
+    pub fn list(&self) -> Vec<(Vec<u8>, PathBuf)> {
+        self.binds.read().clone()
+    }
+
+    /// The deepest bind mount at or above `path`: its target and host.
+    fn covering(&self, path: &[u8]) -> Option<(Vec<u8>, PathBuf)> {
+        self.binds
+            .read()
+            .iter()
+            .filter(|(t, _)| path == t.as_slice() || (path.starts_with(t) && path.get(t.len()) == Some(&b'/')))
+            .max_by_key(|(t, _)| t.len())
+            .cloned()
+    }
+}
+
 pub struct Vfs {
     sysroot: Arc<Sysroot>,
     writable: Vec<(Vec<u8>, PathBuf)>,
+    binds: Arc<Binds>,
     exe: Vec<u8>,
     /// `/proc` and `/sys`, once the process exists (`attach_proc`).
     proc: std::sync::OnceLock<std::sync::Weak<dyn crate::procfs::ProcFs>>,
@@ -301,7 +350,29 @@ fn split(path: &[u8]) -> Vec<Vec<u8>> {
 impl Vfs {
     #[must_use]
     pub fn new(sysroot: Arc<Sysroot>, writable: Vec<(Vec<u8>, PathBuf)>, exe: Vec<u8>) -> Self {
-        Self { sysroot, writable, exe, proc: std::sync::OnceLock::new() }
+        Self { sysroot, writable, binds: Arc::default(), exe, proc: std::sync::OnceLock::new() }
+    }
+
+    /// This VFS with the instance's bind mounts (shared with its other processes).
+    #[must_use]
+    pub fn with_binds(mut self, binds: Arc<Binds>) -> Self {
+        self.binds = binds;
+        self
+    }
+
+    /// The instance's bind mounts.
+    #[must_use]
+    pub fn binds(&self) -> &Arc<Binds> {
+        &self.binds
+    }
+
+    /// Whether a guest path is where something is mounted: a writable mount, a bind mount, or
+    /// one of the kernel's own (`/`, `/proc`, `/sys`, `/dev`).
+    #[must_use]
+    pub fn is_mount_point(&self, path: &[u8]) -> bool {
+        matches!(path, b"/" | b"/proc" | b"/sys" | b"/dev" | b"/system" | b"/vendor" | b"/apex")
+            || self.writable.iter().any(|(m, _)| m.as_slice() == path)
+            || self.binds.list().iter().any(|(t, _)| t.as_slice() == path)
     }
 
     /// Hand `/proc` and `/sys` to `proc`. Only the first attachment counts.
@@ -366,8 +437,13 @@ impl Vfs {
             b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
             _ => {}
         }
-        for (mount, host) in &self.writable {
+        let bound = self.binds.covering(path);
+        let mounts = bound.iter().chain(self.writable.iter());
+        for (mount, host) in mounts {
             if path == mount.as_slice() {
+                if !host.is_dir() {
+                    return Some(Node::HostFile { host: host.clone() });
+                }
                 return Some(Node::HostDir { host: host.clone() });
             }
             if path.starts_with(mount) && path.get(mount.len()) == Some(&b'/') {
@@ -388,7 +464,8 @@ impl Vfs {
     }
 
     fn host_for_missing(&self, path: &[u8]) -> Option<PathBuf> {
-        self.writable.iter().find_map(|(mount, host)| {
+        let bound = self.binds.covering(path);
+        bound.iter().chain(self.writable.iter()).find_map(|(mount, host)| {
             (path.starts_with(mount) && path.get(mount.len()) == Some(&b'/'))
                 .then(|| host_path(host, &path[mount.len() + 1..]))
                 .flatten()

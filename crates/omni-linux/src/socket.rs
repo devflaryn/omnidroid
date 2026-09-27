@@ -49,6 +49,8 @@ pub struct Socket {
     pub peer: Option<Peer>,
     /// What the peer sent back, not yet read.
     pub inbox: std::collections::VecDeque<u8>,
+    /// The address it is bound to, as `getsockname` reports it.
+    pub name: Option<Vec<u8>>,
 }
 
 /// The property service's protocol 2: `PROP_MSG_SETPROP2`, then the name and the value, each
@@ -155,7 +157,7 @@ fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK) {
         return Err(EAFNOSUPPORT);
     }
-    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new() };
+    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new(), name: None };
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
     Ok(p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)? as u64)
@@ -226,6 +228,49 @@ fn sys_sendmsg(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut kind = file.kind.lock();
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
     Ok(send(socket, &bytes)? as u64)
+}
+
+/// `bind`: a netlink socket (a kernel uevent socket: ueventd's, vold's) is bound to its groups
+/// under the port the kernel assigns -- the process's pid for its first -- and receives nothing,
+/// no device coming or going here. Serving an address of another family is not offered.
+fn sys_bind(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let mut kind = file.kind.lock();
+    let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
+    if socket.domain != AF_NETLINK {
+        p.refusals.record(format!("bind: family {}", socket.domain), t.pc, t.lr);
+        return Err(crate::errno::ENOSYS);
+    }
+    if a[2] < 12 {
+        return Err(EINVAL);
+    }
+    let addr = p.mem.read(a[1], 12)?;
+    if u16::from_le_bytes([addr[0], addr[1]]) as u64 != AF_NETLINK {
+        return Err(EINVAL);
+    }
+    if socket.name.is_some() {
+        return Err(EINVAL);
+    }
+    let port = match u32::from_le_bytes(addr[4..8].try_into().expect("4")) {
+        0 => p.sys.pid as u32,
+        port => port,
+    };
+    let mut name = addr;
+    name[4..8].copy_from_slice(&port.to_le_bytes());
+    socket.name = Some(name);
+    Ok(0)
+}
+
+/// `getsockname`: the bound address; unbound, the family alone.
+fn sys_getsockname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let kind = file.kind.lock();
+    let FileKind::Socket(socket) = &*kind else { return Err(crate::errno::ENOTSOCK) };
+    let name = socket.name.clone().unwrap_or_else(|| (socket.domain as u16).to_le_bytes().to_vec());
+    let room = u32::from_le_bytes(p.mem.read(a[2], 4)?.try_into().expect("4")) as usize;
+    p.mem.write(a[1], &name[..name.len().min(room)])?;
+    p.mem.write(a[2], &(name.len() as u32).to_le_bytes())?;
+    Ok(0)
 }
 
 /// Options are accepted and not acted on: timeouts, buffer sizes and credentials change nothing
@@ -386,7 +431,7 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let mut fds = [0i32; 2];
     for (side, fd) in fds.iter_mut().enumerate() {
-        let socket = Socket { domain, ty: kind, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side }), inbox: std::collections::VecDeque::new() };
+        let socket = Socket { domain, ty: kind, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side }), inbox: std::collections::VecDeque::new(), name: None };
         let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
         *fd = p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)?;
     }
@@ -434,6 +479,8 @@ pub fn install(table: &mut Table) {
     table.set(nr::RECVMSG, sys_recvmsg);
     table.set(nr::SOCKETPAIR, sys_socketpair);
     table.set(nr::SOCKET, sys_socket);
+    table.set(nr::BIND, sys_bind);
+    table.set(nr::GETSOCKNAME, sys_getsockname);
     table.set(nr::GETSOCKOPT, sys_getsockopt);
     table.set(nr::CONNECT, sys_connect);
     table.set(nr::SENDTO, sys_sendto);

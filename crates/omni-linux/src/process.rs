@@ -316,7 +316,7 @@ impl Process {
         }
         // What init.rc makes before any service runs: its `mkdir`s on the writable mounts.
         crate::boot::make_init_dirs(&sysroot, &config.instance_dir);
-        let vfs = Vfs::new(sysroot, writable, exe.clone());
+        let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir));
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
         // 128 guest threads: ART alone starts about twenty, and Roblox runs dozens.

@@ -17,6 +17,7 @@ pub mod guest;
 pub mod hal;
 pub mod init;
 pub mod manifest;
+pub mod mount;
 pub mod mm;
 pub mod pipe;
 pub mod poll;
@@ -30,6 +31,7 @@ pub mod sys;
 pub mod sync_file;
 pub mod syscall;
 pub mod vfs;
+pub mod xattr;
 
 pub use fd::Output;
 pub use process::{Exit, ExitStatus, Process, SpawnConfig, Task};
@@ -42,4 +44,6 @@ pub fn install_all(table: &mut syscall::Table) {
     socket::install(table);
     pipe::install(table);
     poll::install(table);
+    xattr::install(table);
+    mount::install(table);
 }

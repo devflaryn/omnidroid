@@ -54,6 +54,11 @@ pub mod nr {
         GETRANDOM = 278 => "getrandom", MEMFD_CREATE = 279 => "memfd_create",
         MEMBARRIER = 283 => "membarrier", STATX = 291 => "statx", RSEQ = 293 => "rseq",
         CLONE3 = 435 => "clone3", FACCESSAT2 = 439 => "faccessat2",
+        MOUNT = 40 => "mount", UMOUNT2 = 39 => "umount2",
+        SETXATTR = 5 => "setxattr", LSETXATTR = 6 => "lsetxattr", FSETXATTR = 7 => "fsetxattr",
+        GETXATTR = 8 => "getxattr", LGETXATTR = 9 => "lgetxattr", FGETXATTR = 10 => "fgetxattr",
+        LISTXATTR = 11 => "listxattr", LLISTXATTR = 12 => "llistxattr", FLISTXATTR = 13 => "flistxattr",
+        REMOVEXATTR = 14 => "removexattr", LREMOVEXATTR = 15 => "lremovexattr", FREMOVEXATTR = 16 => "fremovexattr",
     }
 }
 

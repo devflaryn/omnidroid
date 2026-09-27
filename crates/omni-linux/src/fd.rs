@@ -175,7 +175,7 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
         Node::Dev(DevNode::OmniGpu) => FileKind::Gpu(crate::gpu::Gpu::open()),
         Node::Dev(d) => FileKind::Dev(d),
         Node::Generated | Node::Blob { .. } => {
-            if write {
+            if write && !crate::procfs::is_settable_attr(&r.path) {
                 return Err(EACCES);
             }
             let data = vfs.read_generated(&r.path).ok_or(ENOENT)?;
@@ -356,7 +356,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Shared(m) => m.write_seq(bytes),
         FileKind::Inotify(_) => Err(EBADF),
-        FileKind::Synth { .. } => Err(EACCES),
+        FileKind::Synth { guest, .. } => crate::procfs::write_attr(guest, bytes),
         FileKind::Socket(s) => crate::socket::send(s, bytes),
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
         FileKind::Binder(_) | FileKind::Gpu(_) | FileKind::SyncFile(_) => Err(EINVAL),
@@ -839,7 +839,45 @@ fn sys_fsync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 /// `utimensat`: timestamps are accepted and not kept (nothing here reads them back as set).
-fn sys_utimensat(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
+/// `utimensat(dirfd, path, times, flags)`: a file's access and modification times. The
+/// modification time of a host file named by path is set (the host keeps it); a missing file is
+/// `ENOENT` --
+/// `touch` creates the file only when told so.
+fn sys_utimensat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    let host = if a[1] == 0 {
+        // futimens: an open descriptor; its times are not kept.
+        p.fds.get(fd_arg(a[0]))?;
+        None
+    } else {
+        let path = path_arg(p, a[1])?;
+        let base = base_dir(p, a[0], &path)?;
+        match p.vfs.resolve(&base, &path, a[3] & AT_SYMLINK_NOFOLLOW == 0)?.node {
+            Node::Missing { .. } => return Err(ENOENT),
+            Node::HostFile { host } => Some(host),
+            _ => None,
+        }
+    };
+    let Some(host) = host else { return Ok(0) };
+    let modified = if a[2] == 0 {
+        Some(std::time::SystemTime::now())
+    } else {
+        let t = p.mem.read(a[2] + 16, 16)?;
+        let sec = i64::from_le_bytes(t[..8].try_into().expect("8 bytes"));
+        let nsec = i64::from_le_bytes(t[8..].try_into().expect("8 bytes"));
+        match nsec {
+            UTIME_OMIT => None,
+            UTIME_NOW => Some(std::time::SystemTime::now()),
+            _ if sec >= 0 => Some(std::time::UNIX_EPOCH + std::time::Duration::new(sec as u64, nsec as u32)),
+            _ => None,
+        }
+    };
+    if let Some(m) = modified {
+        let file = std::fs::OpenOptions::new().write(true).open(&host).map_err(|_| EACCES)?;
+        file.set_modified(m).map_err(|_| EIO)?;
+    }
     Ok(0)
 }
 

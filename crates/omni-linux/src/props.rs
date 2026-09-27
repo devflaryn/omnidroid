@@ -337,6 +337,8 @@ impl Area {
 /// process's mapping of it, so a `setprop` in one process is what `getprop` reads in another.
 pub struct PropertyService {
     live: parking_lot::Mutex<Live>,
+    /// Notified after every change, for init's `wait_for_prop`.
+    changed: parking_lot::Condvar,
 }
 
 struct Live {
@@ -367,7 +369,10 @@ impl PropertyService {
             }
             // Room to grow: what the build set, and a megabyte more for what the system sets.
             let capacity = (HEADER + area.data.len() + (1 << 20)).div_ceil(AREA_UNIT) * AREA_UNIT;
-            std::sync::Arc::new(Self { live: parking_lot::Mutex::new(Live { area, info, serial: 0, capacity, mappings: Vec::new() }) })
+            std::sync::Arc::new(Self {
+                live: parking_lot::Mutex::new(Live { area, info, serial: 0, capacity, mappings: Vec::new() }),
+                changed: parking_lot::Condvar::new(),
+            })
         }))
     }
 
@@ -398,6 +403,40 @@ impl PropertyService {
         fill(&bytes)?;
         live.mappings.push((process, at, serial));
         Ok(())
+    }
+
+    /// A property's value, as `getprop` reads it.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<String> {
+        Self::value(&self.live.lock(), name)
+    }
+
+    fn value(live: &Live, name: &str) -> Option<String> {
+        let at = *live.info.get(name)?;
+        let serial = live.area.u32_at(at);
+        let bytes = if serial & LONG_FLAG != 0 {
+            let long = at + live.area.u32_at(at + 4 + 56) as usize;
+            let end = live.area.data[long..].iter().position(|b| *b == 0).map_or(live.area.data.len(), |n| long + n);
+            &live.area.data[long..end]
+        } else {
+            &live.area.data[at + 4..at + 4 + (serial >> 24) as usize]
+        };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// init's `wait_for_prop`: wait until `name` is `value` (`*` for any value), at most
+    /// `timeout`. Whether it is.
+    pub fn wait_for(&self, name: &str, value: &str, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut live = self.live.lock();
+        loop {
+            if Self::value(&live, name).is_some_and(|v| value == "*" || v == value) {
+                return true;
+            }
+            if self.changed.wait_until(&mut live, deadline).timed_out() {
+                return Self::value(&live, name).is_some_and(|v| value == "*" || v == value);
+            }
+        }
     }
 
     /// `setprop`: a new property is added, an existing one changed; `ro.*` is set once.
@@ -445,6 +484,7 @@ impl PropertyService {
         live.mappings.retain(|(p, _, _)| p.strong_count() > 0);
         let targets: Vec<_> = live.mappings.iter().filter_map(|(p, at, s)| p.upgrade().map(|p| (p, *at, *s))).collect();
         drop(live);
+        self.changed.notify_all();
         for (p, at, serial) in targets {
             let bytes = if serial { &serial_area[..HEADER] } else { &area[..] };
             if p.mm.kernel_write(&p.mem, at, bytes).is_ok() {
