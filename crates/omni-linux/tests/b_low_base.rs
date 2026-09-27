@@ -2,12 +2,35 @@
 //! process at that address, and tests in one binary run in parallel.
 mod common;
 
-/// Sub-project B: ART keeps its heap below 4 GiB (compressed references), so the guest space
-/// starts there and the first mappings land there.
+use std::sync::Arc;
+
+use omni_linux::{ExitStatus, Output, Process, SpawnConfig};
+
+/// ART keeps its heap and boot image below 4 GiB (compressed references), so the guest space
+/// starts there, and mappings made without a hint stay out of the low 4 GiB -- as on Linux, where
+/// the top-down `mmap_base` puts them high -- leaving it for what ART asks for by address.
 #[test]
-fn the_guest_space_starts_below_4_gib() {
-    let Some((status, out, err)) = common::run(&["/system/bin/toybox", "cat", "/proc/self/maps"]) else { return };
-    assert_eq!(status, omni_linux::ExitStatus::Exited(0), "stderr: {err}");
-    let lowest = out.lines().filter_map(|l| u64::from_str_radix(l.split('-').next()?, 16).ok()).min().unwrap();
-    assert!(lowest < 1 << 32, "lowest mapping {lowest:#x}\n{out}");
+fn the_space_starts_below_4_gib_and_unhinted_mappings_leave_it_free() {
+    let Some(sysroot) = common::sysroot() else { return };
+    let out = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let p = Process::spawn(SpawnConfig {
+        sysroot,
+        instance_dir: std::env::temp_dir().join(format!("omni-linux-low-{}", std::process::id())),
+        argv: vec![b"/system/bin/toybox".to_vec(), b"cat".to_vec(), b"/proc/self/maps".to_vec()],
+        envp: vec![b"PATH=/system/bin".to_vec()],
+        stdout: Output::Capture(Arc::clone(&out)),
+        stderr: Output::Capture(Arc::default()),
+        trace: false,
+    })
+    .expect("spawn");
+    let base = p.mem.space().base() as u64;
+    assert!(base < 1 << 32, "the guest space starts at {base:#x}");
+    assert_eq!(p.run(), ExitStatus::Exited(0));
+    let maps = String::from_utf8_lossy(&out.lock()).into_owned();
+    let low: Vec<&str> = maps
+        .lines()
+        // The CPU backend's TLS pool, made before the program starts, sits at the base.
+        .filter(|l| l.split('-').next().and_then(|a| u64::from_str_radix(a, 16).ok()).is_some_and(|a| a < 1 << 32 && a != base))
+        .collect();
+    assert!(low.is_empty(), "mapped below 4 GiB:\n{}", low.join("\n"));
 }

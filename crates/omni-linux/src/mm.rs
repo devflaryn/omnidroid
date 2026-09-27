@@ -192,7 +192,15 @@ impl Mm {
             }
             Placement::Hint { address: (hint & !(self.page - 1)) as usize, align: page }
         } else {
-            Placement::Anywhere { align: page }
+            // No hint: above 4 GiB when the space reaches there, as Linux's top-down `mmap_base`
+            // keeps ordinary mappings out of the low 4 GiB -- which ART needs for its heap and
+            // boot image, and asks for by address.
+            let low_end = 1usize << 32;
+            if self.space.base() < low_end && self.space.end() > low_end + len as usize {
+                Placement::Hint { address: low_end, align: page }
+            } else {
+                Placement::Anywhere { align: page }
+            }
         };
         let _g = self.lock.write();
         if req.flags & MAP_FIXED != 0 {
