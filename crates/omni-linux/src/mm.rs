@@ -281,7 +281,12 @@ impl Mm {
             let at = if backed > 0 {
                 self.space
                     .map_file(&backing, req.offset, placement, backed as usize, prot)
-                    .map_err(|_| refused_fixed(ENOMEM))? as u64
+                    .map_err(|e| {
+                        if fixed {
+                            eprintln!("[mm] {} at {:#x}+{backed:#x} refused: {e}", String::from_utf8_lossy(&name), req.addr);
+                        }
+                        refused_fixed(ENOMEM)
+                    })? as u64
             } else {
                 self.space
                     .map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy)

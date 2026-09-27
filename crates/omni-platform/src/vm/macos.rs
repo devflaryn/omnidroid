@@ -649,7 +649,9 @@ pub(super) fn share_file_for_mapping(file: std::fs::File, name: &Path) -> VmResu
     Ok(MappableFile {
         fd,
         len,
-        executability: MapExecutability::NonExecutable,
+        // A shared mapping of a file open read-write may be `PROT_EXEC` (ART's JIT code
+        // cache: a memfd mapped read-execute beside its read-write view).
+        executability: MapExecutability::Executable,
         path: name.to_path_buf(),
         shared: true,
     })

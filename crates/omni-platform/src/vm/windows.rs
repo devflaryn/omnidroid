@@ -1212,11 +1212,24 @@ pub(super) fn share_file_for_mapping(file: File, name: &Path) -> VmResult<Mappab
         return Err(VmError::EmptyFile { path: shown() });
     }
 
+    // Executable when the handle allows it (opened with execute access): Linux lets a shared
+    // mapping of any readable file be `PROT_EXEC` -- ART's JIT code cache is a memfd mapped
+    // read-execute beside its read-write view -- and the section's protection caps every view's
+    // for the section's life. A handle without execute access gets a read-write section, as before.
     // SAFETY: `guard.0` is a live file handle. A NULL security descriptor and name are the
     // documented defaults, and a maximum size of 0 means "the size of the file", so the file's
     // length is not changed by creating the section.
-    let section = unsafe {
-        CreateFileMappingW(guard.0, std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null())
+    let executable = unsafe {
+        CreateFileMappingW(guard.0, std::ptr::null(), PAGE_EXECUTE_READWRITE, 0, 0, std::ptr::null())
+    };
+    let (section, executability) = if executable.is_null() {
+        // SAFETY: as above.
+        let section = unsafe {
+            CreateFileMappingW(guard.0, std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null())
+        };
+        (section, MapExecutability::NonExecutable)
+    } else {
+        (executable, MapExecutability::Executable)
     };
     if section.is_null() {
         return Err(VmError::SectionCreate {
@@ -1231,7 +1244,7 @@ pub(super) fn share_file_for_mapping(file: File, name: &Path) -> VmResult<Mappab
         file: guard.into_raw(),
         section,
         len,
-        executability: MapExecutability::NonExecutable,
+        executability,
         path: name.to_path_buf(),
         shared: true,
     })
@@ -1280,7 +1293,10 @@ pub(super) fn map_file(
     // last page exactly. The seam has already refused a view reaching further than that page.
     let (create_with, view_size) = if file.shared {
         let in_file = file.len.saturating_sub(file_offset);
-        (PAGE_READWRITE, (size as u64).min(in_file) as usize)
+        // An executable section's view is made read-write-execute, so that `protect` can take it
+        // to read-execute later (ART's JIT: one memfd, a read-write and a read-execute view).
+        let widest = if file.executability == MapExecutability::Executable { PAGE_EXECUTE_READWRITE } else { PAGE_READWRITE };
+        (widest, (size as u64).min(in_file) as usize)
     } else {
         (view_protection(protection), size)
     };
@@ -1331,7 +1347,7 @@ pub(super) fn map_file(
         view as usize, address,
         "MapViewOfFile3 into a placeholder must return the requested base"
     );
-    if file.shared && protection != Protection::ReadWrite {
+    if file.shared && (protection != Protection::ReadWrite || create_with == PAGE_EXECUTE_READWRITE) {
         // Down from `PAGE_READWRITE` to what was asked for. `protect` resolves it through the
         // view's flavour, which is `SharedWritableView` now and for the life of the view, so a
         // later raise back to `ReadWrite` stays shared -- measured: `PAGE_READONLY` then

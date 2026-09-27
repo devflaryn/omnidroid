@@ -33,13 +33,27 @@ pub struct Shm {
     crossed: std::sync::atomic::AtomicBool,
 }
 
+/// A region's host file is opened so it can be mapped executable too, as Linux maps any shared
+/// memory `PROT_EXEC` on request (ART's JIT code cache is a memfd with a read-execute view).
+fn executable_access(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const GENERIC_EXECUTE: u32 = 0x2000_0000;
+        options.access_mode(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE);
+    }
+    options
+}
+
 impl Shm {
     /// Create one, `name` for `/proc` and diagnostics.
     pub fn create(name: &str) -> Result<Arc<Self>, Errno> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let host_path = std::env::temp_dir().join(format!("omni-shm-{}-{n}", std::process::id()));
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&host_path).map_err(|_| EIO)?;
+        let file = executable_access(std::fs::OpenOptions::new().read(true).write(true).create_new(true)).open(&host_path).map_err(|_| EIO)?;
         Ok(Arc::new(Self {
             file: Mutex::new(file),
             name: name.to_string(),
@@ -56,7 +70,7 @@ impl Shm {
     /// # Errors
     /// The file cannot be opened.
     pub fn open_path(name: &str, host_path: &std::path::Path, len: u64) -> Result<Arc<Self>, Errno> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(host_path).map_err(|_| EIO)?;
+        let file = executable_access(std::fs::OpenOptions::new().read(true).write(true)).open(host_path).map_err(|_| EIO)?;
         Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false, crossed: std::sync::atomic::AtomicBool::new(true) }))
     }
 
