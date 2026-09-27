@@ -207,6 +207,60 @@ pub struct Vfs {
     proc: std::sync::OnceLock<std::sync::Weak<dyn crate::procfs::ProcFs>>,
 }
 
+/// The cgroup controllers of the image's `cgroups.json`, where it mounts them.
+const CGROUP_MOUNTS: [&[u8]; 5] = [b"/dev/blkio", b"/dev/cpuctl", b"/dev/cpuset", b"/dev/memcg", b"/sys/fs/cgroup"];
+
+fn cgroup_node(path: &[u8]) -> Option<Node> {
+    let mount = CGROUP_MOUNTS.iter().find(|m| path == **m || (path.starts_with(m) && path.get(m.len()) == Some(&b'/')))?;
+    let rest = &path[mount.len()..];
+    let last = rest.rsplit(|&b| b == b'/').next().unwrap_or_default();
+    // A file is a named control (`tasks`, `cgroup.procs`, `cpu.shares`...): anything with a dot,
+    // and the few without one. Everything else is a group.
+    let file = last.contains(&b'.') || matches!(last, b"tasks" | b"notify_on_release" | b"release_agent");
+    Some(if file { Node::Dev(DevNode::Null) } else { Node::Dir })
+}
+
+thread_local! {
+    static CGROUP_RC: Vec<u8> = cgroup_rc();
+}
+
+/// `/dev/cgroup_info/cgroup.rc`, as init writes it from `cgroups.json` (libprocessgroup's
+/// `CgroupFile`: version, count, then per controller version, flags, max activation depth, a
+/// 16-byte name and a 32-byte path).
+fn cgroup_rc() -> Vec<u8> {
+    const MOUNTED: u32 = 1;
+    const OPTIONAL: u32 = 4;
+    let controllers: [(u32, u32, &str, &str); 6] = [
+        (1, MOUNTED, "blkio", "/dev/blkio"),
+        (1, MOUNTED, "cpu", "/dev/cpuctl"),
+        (1, MOUNTED, "cpuset", "/dev/cpuset"),
+        (1, MOUNTED | OPTIONAL, "memory", "/dev/memcg"),
+        (2, MOUNTED, "cgroup2", "/sys/fs/cgroup"),
+        (2, MOUNTED, "freezer", "/sys/fs/cgroup"),
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(controllers.len() as u32).to_le_bytes());
+    for (version, flags, name, path) in controllers {
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut n = [0u8; 16];
+        n[..name.len()].copy_from_slice(name.as_bytes());
+        out.extend_from_slice(&n);
+        let mut p = [0u8; 32];
+        p[..path.len()].copy_from_slice(path.as_bytes());
+        out.extend_from_slice(&p);
+    }
+    out
+}
+
+/// The generated blob at `path`, if the VFS itself makes it (not a process's `/proc`).
+#[must_use]
+pub fn vfs_blob(path: &[u8]) -> Option<Vec<u8>> {
+    (path == b"/dev/cgroup_info/cgroup.rc").then(|| CGROUP_RC.with(Clone::clone))
+}
+
 fn is_generated_tree(path: &[u8]) -> bool {
     path == b"/apex/apex-info-list.xml"
         || [&b"/proc"[..], b"/sys", b"/dev/__properties__"].iter().any(|root| path == *root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/')))
@@ -241,6 +295,9 @@ impl Vfs {
     /// The bytes of a generated file, produced now.
     #[must_use]
     pub fn read_generated(&self, path: &[u8]) -> Option<Vec<u8>> {
+        if let Some(blob) = vfs_blob(path) {
+            return Some(blob);
+        }
         self.procfs()?.read(path)
     }
 
@@ -257,6 +314,11 @@ impl Vfs {
 
     /// The node at an already-normalized absolute path, without following a final symlink.
     fn lookup(&self, path: &[u8]) -> Option<Node> {
+        // The cgroup hierarchies init mounts (cgroups.json): every group is there, and a task
+        // written into one is taken -- there is no scheduler here for it to change.
+        if let Some(node) = cgroup_node(path) {
+            return Some(node);
+        }
         if is_generated_tree(path) {
             if let Some(proc) = self.procfs() {
                 return proc.node(path);
@@ -264,6 +326,11 @@ impl Vfs {
         }
         match path {
             b"/dev" | b"/proc" | b"/proc/self" => return Some(Node::Dir),
+            // The root's links, as a device's first-stage init leaves them.
+            b"/etc" => return Some(Node::Symlink { target: b"/system/etc".to_vec() }),
+            b"/bin" => return Some(Node::Symlink { target: b"/system/bin".to_vec() }),
+            b"/dev/cgroup_info" => return Some(Node::Dir),
+            b"/dev/cgroup_info/cgroup.rc" => return Some(Node::Blob { size: CGROUP_RC.with(|rc| rc.len() as u64) }),
             b"/dev/null" => return Some(Node::Dev(DevNode::Null)),
             b"/dev/zero" => return Some(Node::Dev(DevNode::Zero)),
             b"/dev/random" => return Some(Node::Dev(DevNode::Random)),
