@@ -192,6 +192,9 @@ struct Buffer {
     async_node: Option<NodeId>,
     /// The nodes the transaction held, let go when the buffer is freed.
     pinned: Vec<NodeId>,
+    /// The thread it was delivered to, and the transaction's code (for the stall report).
+    tid: i32,
+    code: u32,
 }
 
 struct SgBuffer {
@@ -483,6 +486,44 @@ impl State {
             self.queue(owner, None, Work::Release { ptr, cookie });
             self.queue(owner, None, Work::Decrefs { ptr, cookie });
         }
+    }
+
+    /// Why `node`'s oneway calls wait: how many, the code of the next, and where the one that is
+    /// out is -- queued for the process or a thread (and whether any looper is free to take it),
+    /// or delivered to a thread whose buffer is not yet freed.
+    fn async_stall(&self, node: NodeId) -> String {
+        let Some(n) = self.nodes.get(&node) else { return format!("node {node} is gone") };
+        let pid_of = |id: ProcId| self.procs.get(&id).map_or(0, |pr| pr.pid);
+        let code_of = |w: &Work| match w {
+            Work::Txn(t) => format!("{:#x}", t.code),
+            _ => "?".into(),
+        };
+        let next = n.async_todo.front().map_or_else(|| "none".into(), code_of);
+        let thread_state = |th: &ThreadState| {
+            format!("looper {}, awaiting {}, serving {}, {} queued", th.looper && !th.exited, th.awaiting, th.serving.len(), th.todo.len())
+        };
+        let ours = |w: &Work| matches!(w, Work::Txn(t) if t.async_node == Some(node));
+        let owner = self.procs.get(&n.owner);
+        let out = owner.and_then(|pr| {
+            if let Some(w) = pr.todo.iter().find(|w| ours(w)) {
+                let free = pr.threads.values().filter(|th| th.looper && th.awaiting == 0 && th.serving.is_empty() && th.todo.is_empty()).count();
+                return Some(format!("code {} queued for the process ({} of {} threads free to take it)", code_of(w), free, pr.threads.len()));
+            }
+            pr.threads.iter().find_map(|(tid, th)| th.todo.iter().find(|w| ours(w)).map(|w| format!("code {} queued for thread {tid} ({})", code_of(w), thread_state(th))))
+        });
+        let out = out.or_else(|| {
+            self.buffers.iter().find(|(_, b)| b.async_node == Some(node)).map(|((proc, buf), b)| {
+                let th = self.procs.get(proc).and_then(|pr| pr.threads.get(&b.tid)).map_or_else(|| "gone".into(), thread_state);
+                format!("code {:#x} delivered to thread {} in buffer {buf:#x}, not freed (thread: {th})", b.code, b.tid)
+            })
+        });
+        format!(
+            "{} oneway calls wait on node {node} ({:#x}) of pid {}: next code {next}; the one out: {}",
+            n.async_todo.len(),
+            n.ptr,
+            pid_of(n.owner),
+            out.unwrap_or_else(|| "none found".into())
+        )
     }
 
     /// Queue work for a thread of `id`: `tid`'s own queue when given, the process's otherwise.
@@ -1339,9 +1380,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
             if n.has_async {
                 n.async_todo.push_back(Work::Txn(Box::new(txn)));
                 if n.async_todo.len() % 64 == 0 {
-                    let (owner, queued) = (n.owner, n.async_todo.len());
-                    let pid = st.procs.get(&owner).map_or(0, |pr| pr.pid);
-                    eprintln!("[binder] {queued} oneway calls wait on node {id} of pid {pid} (its last one's buffer not freed)");
+                    eprintln!("[binder] {}", st.async_stall(id));
                 }
                 st.queue(file.id, Some(t.tid), Work::Complete);
                 return Ok(());
@@ -1555,7 +1594,7 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
             // the transaction held.
             if txn.async_node.is_some() || !txn.pinned.is_empty() {
                 let pinned = std::mem::take(&mut txn.pinned);
-                st.buffers.insert((file.id, buf), Buffer { async_node: txn.async_node, pinned });
+                st.buffers.insert((file.id, buf), Buffer { async_node: txn.async_node, pinned, tid: t.tid, code: txn.code });
             }
             let th = st.proc_mut(file.id).threads.entry(t.tid).or_default();
             if txn.reply {
@@ -1727,4 +1766,56 @@ fn end_wait(file: &Arc<BinderFile>, tid: i32) {
     let mut st = file.broker.state.lock();
     let th = st.proc_mut(file.id).threads.entry(tid).or_default();
     th.awaiting = th.awaiting.saturating_sub(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oneway(node: NodeId, code: u32) -> Work {
+        Work::Txn(Box::new(Txn {
+            reply: false,
+            oneway: true,
+            from: None,
+            target_ptr: 0x10,
+            target_cookie: 0,
+            secctx: false,
+            code,
+            flags: TF_ONE_WAY,
+            sender_pid: 0,
+            sender_euid: 0,
+            data: Vec::new(),
+            offsets: Vec::new(),
+            fds: Vec::new(),
+            sg: Vec::new(),
+            fda: Vec::new(),
+            async_node: Some(node),
+            pinned: Vec::new(),
+        }))
+    }
+
+    /// The stall report names the next call's code and where the one out is.
+    #[test]
+    fn a_stalled_nodes_report_says_where_its_oneway_is() {
+        let mut st = State::default();
+        st.procs.insert(1, ProcState { pid: 42, ..ProcState::default() });
+        let node = st.local_node(1, 0x10, 0x20, 0);
+        st.nodes.get_mut(&node).unwrap().async_todo.push_back(oneway(node, 0x44));
+        st.proc_mut(1).threads.insert(7, ThreadState { looper: true, awaiting: 1, ..ThreadState::default() });
+
+        st.buffers.insert((1, 0x9000), Buffer { async_node: Some(node), pinned: Vec::new(), tid: 7, code: 0x33 });
+        let delivered = st.async_stall(node);
+        assert!(delivered.starts_with("1 oneway calls wait on node 1 (0x10) of pid 42: next code 0x44"), "{delivered}");
+        assert!(delivered.contains("code 0x33 delivered to thread 7 in buffer 0x9000, not freed (thread: looper true, awaiting 1"), "{delivered}");
+
+        st.buffers.clear();
+        st.proc_mut(1).threads.get_mut(&7).unwrap().todo.push_back(oneway(node, 0x33));
+        let queued = st.async_stall(node);
+        assert!(queued.contains("code 0x33 queued for thread 7 (looper true, awaiting 1, serving 0, 1 queued)"), "{queued}");
+
+        st.proc_mut(1).threads.get_mut(&7).unwrap().todo.clear();
+        st.proc_mut(1).todo.push_back(oneway(node, 0x33));
+        let for_proc = st.async_stall(node);
+        assert!(for_proc.contains("code 0x33 queued for the process (0 of 1 threads free to take it)"), "{for_proc}");
+    }
 }
