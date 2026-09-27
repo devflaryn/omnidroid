@@ -20,6 +20,7 @@ pub mod poll;
 pub mod process;
 pub mod procfs;
 pub mod props;
+pub mod shm;
 pub mod signal;
 pub mod socket;
 pub mod sys;

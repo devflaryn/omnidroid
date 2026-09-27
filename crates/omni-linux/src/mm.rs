@@ -243,6 +243,36 @@ impl Mm {
             return at;
         }
         let file = p.fds.get(req.fd)?;
+        // A shared-memory region (memfd, ashmem): MAP_SHARED maps the same host file, so another
+        // process that received this descriptor over binder and maps it sees the same memory; a
+        // private mapping is a copy-on-write view of it.
+        let shm = match &*file.kind.lock() {
+            FileKind::Shared(m) => Some(std::sync::Arc::clone(m)),
+            _ => None,
+        };
+        if let Some(m) = shm {
+            let name = format!("/memfd:{}", m.name).into_bytes();
+            let host = m.dup_file().map_err(|_| ENODEV)?;
+            let backing = omni_mem::Backing::share(host, &String::from_utf8_lossy(&name)).map_err(|_| ENODEV)?;
+            let backed = self.round_up((m.len()).saturating_sub(req.offset)).min(len);
+            let at = if backed > 0 {
+                self.space
+                    .map_file(&backing, req.offset, placement, backed as usize, prot)
+                    .map_err(|_| refused_fixed(ENOMEM))? as u64
+            } else {
+                self.space
+                    .map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy)
+                    .map_err(|_| refused_fixed(ENOMEM))? as u64
+            };
+            if len > backed && backed > 0 {
+                self.space
+                    .map_anonymous(Placement::Fixed((at + backed) as usize), (len - backed) as usize, prot, CommitPolicy::Lazy)
+                    .map_err(|_| ENOMEM)?;
+            }
+            self.forget(at, len);
+            self.files.lock().insert(at, FileMapping { len, guest: name, offset: req.offset });
+            return Ok(at);
+        }
         if let FileKind::Synth { data, guest, .. } = &*file.kind.lock() {
             // An in-memory file (`/dev/__properties__`): a private copy, read-only in effect.
             if req.flags & MAP_SHARED != 0 && req.prot & PROT_WRITE != 0 {

@@ -129,6 +129,8 @@ pub enum DevNode {
     VndBinder,
     /// `/dev/kmsg`: the kernel log, which native daemons (`servicemanager`) log to.
     Kmsg,
+    /// `/dev/ashmem`: opened, then sized and named by ioctl, it is a shared-memory region.
+    Ashmem,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,6 +341,7 @@ impl Vfs {
             b"/dev/hwbinder" => return Some(Node::Dev(DevNode::HwBinder)),
             b"/dev/vndbinder" => return Some(Node::Dev(DevNode::VndBinder)),
             b"/dev/kmsg" => return Some(Node::Dev(DevNode::Kmsg)),
+            b"/dev/ashmem" => return Some(Node::Dev(DevNode::Ashmem)),
             b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
             _ => {}
         }

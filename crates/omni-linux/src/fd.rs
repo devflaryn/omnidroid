@@ -48,6 +48,8 @@ pub enum FileKind {
     TimerFd(Arc<crate::poll::TimerFd>),
     Epoll(Arc<crate::poll::Epoll>),
     Binder(Arc<crate::binder::BinderFile>),
+    /// A shared-memory region (`memfd_create`, `/dev/ashmem`).
+    Shared(Arc<crate::shm::Shm>),
 }
 
 impl FileKind {
@@ -159,6 +161,7 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
                 .map_err(|_| EACCES)?;
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
+        Node::Dev(DevNode::Ashmem) => FileKind::Shared(crate::shm::Shm::create("/dev/ashmem")?),
         Node::Dev(DevNode::Binder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::Binder)),
         Node::Dev(DevNode::HwBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::HwBinder)),
         Node::Dev(DevNode::VndBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::VndBinder)),
@@ -226,7 +229,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
-        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b }, ..s(S_IFCHR | 0o666, 0) },
+        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b, DevNode::Ashmem => 0x1_0b }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
 }
@@ -257,6 +260,7 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         // anon_inode descriptors: a 0600 inode, as the kernel reports them.
         FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Ok(Stat { ino: 4, mode: 0o600, nlink: 1, ..Stat::default() }),
         FileKind::Binder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
+        FileKind::Shared(m) => Ok(Stat { ino: 5, mode: S_IFREG | 0o600, nlink: 1, size: m.len() as i64, blocks: (m.len() as i64 + 511) / 512, ..Stat::default() }),
     }
 }
 
@@ -287,7 +291,11 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
         FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder) | FileKind::Binder(_) => Err(EINVAL),
-        FileKind::Dev(DevNode::Kmsg) => Err(EAGAIN),
+        FileKind::Dev(DevNode::Kmsg | DevNode::Ashmem) => Err(EAGAIN),
+        FileKind::Shared(m) => match at {
+            Some(off) => m.read_at(buf, off),
+            None => m.read_seq(buf),
+        },
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
             let n = buf.len().min(data.len() - from);
@@ -333,6 +341,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         }
         FileKind::Dev(_) => Ok(bytes.len()),
         FileKind::Dir { .. } => Err(EISDIR),
+        FileKind::Shared(m) => m.write_seq(bytes),
         FileKind::Synth { .. } => Err(EACCES),
         FileKind::Socket(s) => crate::socket::send(s, bytes),
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
@@ -356,6 +365,39 @@ fn base_dir(p: &Process, dirfd: u64, path: &[u8]) -> Result<Vec<u8>, Errno> {
     match &*p.fds.get(fd_arg(dirfd))?.kind.lock() {
         FileKind::Dir { dir, .. } => Ok(dir.path.clone()),
         _ => Err(ENOTDIR),
+    }
+}
+
+/// `memfd_create(name, flags)`: an anonymous shared-memory region. `MFD_CLOEXEC` (bit 0) is
+/// honoured; the sealing and huge-page flags are accepted and have no effect here.
+fn sys_memfd_create(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let name = p.mem.read_cstr(a[0], 249)?;
+    let m = crate::shm::Shm::create(&String::from_utf8_lossy(&name))?;
+    let file = Arc::new(OpenFile { kind: Mutex::new(FileKind::Shared(m)), flags: Mutex::new(2) });
+    Ok(p.fds.insert(file, a[1] & 1 != 0, 0)? as u64)
+}
+
+/// `/dev/ashmem`'s ioctls (libcutils' `ashmem-dev` when it has no memfd): set the name, the size,
+/// and the protection mask; report the size; pin/unpin are no-ops (nothing is purged here).
+fn ashmem_ioctl(p: &Process, m: &Arc<crate::shm::Shm>, cmd: u64, arg: u64) -> SysResult {
+    const NAME_LEN: u64 = 256;
+    match cmd & 0xffff {
+        0x7701 => Ok(0),                                          // ASHMEM_SET_NAME (name kept from create)
+        0x7702 => p.mem.write(arg, &[0u8; 256]).map(|()| 0),      // ASHMEM_GET_NAME
+        0x7703 => m.set_len(arg).map(|()| 0),                     // ASHMEM_SET_SIZE
+        0x7704 => Ok(m.len()),                                    // ASHMEM_GET_SIZE
+        0x7705 => {                                               // ASHMEM_SET_PROT_MASK
+            m.prot_mask.store(arg, std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        0x7706 => Ok(m.prot_mask.load(std::sync::atomic::Ordering::SeqCst)), // ASHMEM_GET_PROT_MASK
+        0x7707 | 0x7708 => Ok(0),                                 // ASHMEM_PIN / UNPIN
+        0x7709 => Ok(0),                                          // ASHMEM_GET_PIN_STATUS: unpurged
+        0x770a => Ok(0),                                          // ASHMEM_PURGE_ALL_CACHES
+        _ => {
+            let _ = NAME_LEN;
+            Err(ENOTTY)
+        }
     }
 }
 
@@ -474,6 +516,7 @@ fn sys_lseek(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             };
             file.seek(whence).map_err(|_| EINVAL)
         }
+        FileKind::Shared(m) => m.seek(a[2] as u32, a[1] as i64),
         FileKind::Dir { next, .. } if a[1] == 0 && a[2] == 0 => {
             *next = 0;
             Ok(0)
@@ -538,6 +581,8 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Dev(DevNode::HwBinder) => b"/dev/hwbinder".to_vec(),
         FileKind::Dev(DevNode::VndBinder) => b"/dev/vndbinder".to_vec(),
         FileKind::Dev(DevNode::Kmsg) => b"/dev/kmsg".to_vec(),
+        FileKind::Dev(DevNode::Ashmem) => b"/dev/ashmem".to_vec(),
+        FileKind::Shared(m) => format!("/memfd:{} (deleted)", m.name).into_bytes(),
     }
 }
 
@@ -578,6 +623,13 @@ fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     };
     if let Some(b) = binder {
         return crate::binder::ioctl(p, t, &b, a[1], a[2]);
+    }
+    let shared = match &*file.kind.lock() {
+        FileKind::Shared(m) => Some(Arc::clone(m)),
+        _ => None,
+    };
+    if let Some(m) = shared {
+        return ashmem_ioctl(p, &m, a[1], a[2]);
     }
     match a[1] {
         // TCGETS, TIOCGWINSZ, TIOCGPGRP: nothing here is a terminal.
@@ -723,6 +775,7 @@ fn sys_renameat(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 fn sys_ftruncate(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
         FileKind::Host { file, sysroot: false, .. } => file.set_len(a[1]).map(|()| 0).map_err(|_| EINVAL),
+        FileKind::Shared(m) => m.set_len(a[1]).map(|()| 0),
         FileKind::Host { .. } | FileKind::Synth { .. } => Err(EROFS),
         _ => Err(EINVAL),
     }
@@ -889,6 +942,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::RENAMEAT, sys_renameat);
     table.set(nr::RENAMEAT2, sys_renameat2);
     table.set(nr::FTRUNCATE, sys_ftruncate);
+    table.set(nr::MEMFD_CREATE, sys_memfd_create);
     table.set(nr::FSYNC, sys_fsync);
     table.set(nr::FDATASYNC, sys_fsync);
     table.set(nr::UTIMENSAT, sys_utimensat);
