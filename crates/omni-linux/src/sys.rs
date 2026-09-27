@@ -69,10 +69,18 @@ pub(crate) fn clock_now(p: &Process, clock: u64) -> Result<Duration, Errno> {
     now(p, clock)
 }
 
-fn now(p: &Process, clock: u64) -> Result<Duration, Errno> {
+/// `CLOCK_MONOTONIC` (and `BOOTTIME`): one clock for every guest process of this host process, as
+/// the kernel's is for every process -- timestamps are compared across processes (a composer's
+/// vsync, a fence's signal time, a frame's deadline). It starts at 1000 s, a device's uptime.
+#[must_use]
+pub fn monotonic() -> Duration {
+    omni_platform::clock::monotonic_now() + Duration::from_secs(1000)
+}
+
+fn now(_p: &Process, clock: u64) -> Result<Duration, Errno> {
     match clock {
         0 | 5 | 8 | 11 => SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| EINVAL), // REALTIME(_COARSE/_ALARM), TAI
-        1 | 2 | 3 | 4 | 6 | 7 | 9 => Ok(p.sys.start.elapsed() + Duration::from_secs(1000)), // monotonic family, cputime approximated
+        1 | 2 | 3 | 4 | 6 | 7 | 9 => Ok(monotonic()), // monotonic family, cputime approximated
         _ => Err(EINVAL),
     }
 }
@@ -347,7 +355,7 @@ fn sys_umask(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_sysinfo(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut b = [0u8; 112];
-    b[..8].copy_from_slice(&p.sys.start.elapsed().as_secs().to_le_bytes()); // uptime
+    b[..8].copy_from_slice(&monotonic().as_secs().to_le_bytes()); // uptime
     b[32..40].copy_from_slice(&(8u64 << 30).to_le_bytes()); // totalram (D36 caps the device at 8 GiB)
     b[40..48].copy_from_slice(&(4u64 << 30).to_le_bytes()); // freeram
     b[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs

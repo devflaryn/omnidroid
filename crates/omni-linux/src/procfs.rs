@@ -199,7 +199,7 @@ fn meminfo(_p: &Process) -> Vec<u8> {
 fn proc_stat(p: &Process) -> Vec<u8> {
     let t = ticks(p);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let boot = now.saturating_sub(p.sys.uptime().as_secs() + 1000);
+    let boot = now.saturating_sub(crate::sys::monotonic().as_secs());
     let mut out = format!("cpu  {t} 0 0 {t} 0 0 0 0 0 0\n");
     for n in 0..cpus() {
         let _ = writeln!(out, "cpu{n} {t} 0 0 {t} 0 0 0 0 0 0");
@@ -208,8 +208,8 @@ fn proc_stat(p: &Process) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn uptime(p: &Process) -> Vec<u8> {
-    let up = p.sys.uptime().as_secs_f64() + 1000.0;
+fn uptime(_p: &Process) -> Vec<u8> {
+    let up = crate::sys::monotonic().as_secs_f64();
     format!("{up:.2} {:.2}\n", up * cpus() as f64).into_bytes()
 }
 

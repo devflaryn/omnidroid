@@ -133,3 +133,22 @@ fn membarrier_offers_the_private_expedited_commands_a_jit_registers_for() {
     assert_eq!(p.syscall(&mut t, omni_linux::syscall::nr::MEMBARRIER, [16, 0, 0, 0, 0, 0]), 0);
     assert_eq!(p.syscall(&mut t, omni_linux::syscall::nr::MEMBARRIER, [8, 0, 0, 0, 0, 0]), 0);
 }
+
+/// `CLOCK_MONOTONIC` is one clock for every process, as the kernel's is: a vsync timestamp the
+/// composer sends, a fence's signal time and a frame's deadline are compared across processes.
+#[test]
+fn every_process_reads_one_monotonic_clock() {
+    let read = |p: &Arc<Process>, t: &mut omni_linux::Task, s: u64| {
+        assert_eq!(p.syscall(t, nr::CLOCK_GETTIME, [1, s, 0, 0, 0, 0]), 0);
+        let b = p.mem.read(s, 16).unwrap();
+        let secs = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let nanos = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        std::time::Duration::new(secs, nanos as u32)
+    };
+    let (a, mut ta, sa) = process();
+    let first = read(&a, &mut ta, sa);
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let (b, mut tb, sb) = process();
+    let later = read(&b, &mut tb, sb);
+    assert!(later >= first + std::time::Duration::from_millis(50), "a process started later reads a later time: {first:?} then {later:?}");
+}
