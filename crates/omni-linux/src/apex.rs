@@ -47,21 +47,49 @@ pub fn manifest_name_version(pb: &[u8]) -> Option<(String, u64)> {
     Some((name?, version))
 }
 
-/// The XML `apexd` writes: every flattened APEX, active, from the system partition.
+/// An APEX of the image as it is mounted at boot: on `/dev/block/loop<index>`, at
+/// `/apex/<name>@<version>` (and bound to `/apex/<name>`, where the sysroot holds its flattened
+/// payload), backed by `backing`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApexMount {
+    pub name: String,
+    pub version: u64,
+    pub index: usize,
+    /// Its file on a partition (`/system/apex/<name>.apex`).
+    pub file: String,
+    /// What its loop device reads: the file, or for a compressed APEX (`.capex`) the file apexd
+    /// decompresses it into (`/data/apex/decompressed/<name>@<version>.decompressed.apex`).
+    pub backing: String,
+}
+
+/// The partitions' APEX directories, where a pre-installed APEX is.
+const APEX_DIRS: [&str; 4] = ["/system/apex", "/system_ext/apex", "/product/apex", "/vendor/apex"];
+
+/// Every APEX of the image with a payload in the sysroot and a file on a partition, in name order.
 #[must_use]
-pub fn apex_info_list(sysroot: &Sysroot) -> Vec<u8> {
-    let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<apex-info-list>\n");
+pub fn mounts(sysroot: &Sysroot) -> Vec<ApexMount> {
     let mut dirs = sysroot.children(b"/apex");
     dirs.sort();
+    let mut out = Vec::new();
     for dir in dirs {
         let dir = String::from_utf8_lossy(&dir).into_owned();
         let Some(pb) = sysroot.read(format!("/apex/{dir}/apex_manifest.pb").as_bytes()) else { continue };
         let Some((name, version)) = manifest_name_version(&pb) else { continue };
-        let path = ["capex", "apex"]
-            .iter()
-            .map(|ext| format!("/system/apex/{name}.{ext}"))
-            .find(|p| sysroot.read(p.as_bytes()).is_some() || sysroot.has(p.as_bytes()))
-            .unwrap_or_else(|| format!("/system/apex/{name}.apex"));
+        let Some(file) = APEX_DIRS.iter().flat_map(|d| ["apex", "capex"].map(|ext| format!("{d}/{name}.{ext}"))).find(|p| sysroot.has(p.as_bytes())) else {
+            continue;
+        };
+        let backing = if file.ends_with(".capex") { format!("/data/apex/decompressed/{name}@{version}.decompressed.apex") } else { file.clone() };
+        out.push(ApexMount { name, version, index: out.len(), file, backing });
+    }
+    out
+}
+
+/// The XML `apexd` writes: every flattened APEX, active, from its partition.
+#[must_use]
+pub fn apex_info_list(sysroot: &Sysroot) -> Vec<u8> {
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<apex-info-list>\n");
+    for m in mounts(sysroot) {
+        let (name, version, path) = (m.name, m.version, m.file);
         let _ = writeln!(
             out,
             "    <apex-info moduleName=\"{name}\" modulePath=\"{path}\" preinstalledModulePath=\"{path}\" \

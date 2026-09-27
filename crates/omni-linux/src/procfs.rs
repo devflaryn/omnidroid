@@ -34,7 +34,15 @@ enum Entry {
     Dir(Vec<(&'static str, u8)>),
     DynDir(Vec<(String, u8)>),
     File(fn(&Process) -> Vec<u8>),
+    /// A generated file whose bytes depend on its path.
+    Bytes(Vec<u8>),
     Link(Vec<u8>),
+}
+
+/// The image's APEXes as mounted at boot (`crate::apex::mounts`), computed once.
+fn apex_mounts(p: &Process) -> &'static [crate::apex::ApexMount] {
+    static MOUNTS: std::sync::OnceLock<Vec<crate::apex::ApexMount>> = std::sync::OnceLock::new();
+    MOUNTS.get_or_init(|| crate::apex::mounts(p.vfs.sysroot()))
 }
 
 /// The CPUs this device has: at most 8 (D37), as `sched_getaffinity` answers.
@@ -164,7 +172,7 @@ fn limits(_p: &Process) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn mounts(_p: &Process) -> Vec<u8> {
+fn mounts(p: &Process) -> Vec<u8> {
     let lines = [
         "/dev/root / ext4 ro 0 0",
         "proc /proc proc rw 0 0",
@@ -174,7 +182,17 @@ fn mounts(_p: &Process) -> Vec<u8> {
         "/dev/data /data ext4 rw 0 0",
         "tmpfs /tmp tmpfs rw 0 0",
     ];
-    lines.iter().flat_map(|l| l.bytes().chain(std::iter::once(b'\n'))).collect()
+    let mut out = String::new();
+    for l in lines {
+        out.push_str(l);
+        out.push('\n');
+    }
+    // The APEXes, as apexd mounts them (and as its PopulateFromMounts reads them back).
+    for m in apex_mounts(p) {
+        let _ = writeln!(out, "/dev/block/loop{} /apex/{}@{} ext4 ro,dirsync,seclabel,nodev,noatime 0 0", m.index, m.name, m.version);
+        let _ = writeln!(out, "/dev/block/loop{} /apex/{} ext4 ro,dirsync,seclabel,nodev,noatime 0 0", m.index, m.name);
+    }
+    out.into_bytes()
 }
 
 fn cpuinfo(_p: &Process) -> Vec<u8> {
@@ -306,7 +324,8 @@ impl Process {
             "/proc/version" => return Some(Entry::File(version)),
             "/proc/mounts" => return Some(Entry::File(mounts)),
             "/proc/filesystems" => return Some(Entry::File(filesystems)),
-            "/sys" => return Some(Entry::Dir(vec![("devices", DT_DIR), ("fs", DT_DIR)])),
+            "/sys" => return Some(Entry::Dir(vec![("block", DT_DIR), ("devices", DT_DIR), ("fs", DT_DIR)])),
+            "/sys/block" => return Some(Entry::DynDir(apex_mounts(self).iter().map(|m| (format!("loop{}", m.index), DT_DIR)).collect())),
             "/sys/fs" => return Some(Entry::Dir(vec![("selinux", DT_DIR)])),
             // selinuxfs, permissive: libselinux finds SELinux present (servicemanager insists on
             // it), every check is allowed -- enforce 0, and deny_unknown 0 for the classes this
@@ -339,6 +358,17 @@ impl Process {
                 return Some(Entry::File(cpu_range));
             }
             _ => {}
+        }
+        // A loop device of an APEX: its backing file.
+        if let Some(rest) = path.strip_prefix("/sys/block/loop") {
+            let (n, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            let m = n.parse::<usize>().ok().and_then(|n| apex_mounts(self).get(n))?;
+            return Some(match tail {
+                "" => Entry::Dir(vec![("loop", DT_DIR)]),
+                "loop" => Entry::Dir(vec![("backing_file", DT_REG)]),
+                "loop/backing_file" => Entry::Bytes(format!("{}\n", m.backing).into_bytes()),
+                _ => return None,
+            });
         }
         if let Some(n) = path.strip_prefix("/sys/devices/system/cpu/cpu") {
             return n.parse::<usize>().ok().filter(|n| *n < cpus()).map(|_| Entry::Dir(Vec::new()));
@@ -413,7 +443,7 @@ impl ProcFs for Process {
         }
         Some(match self.entry(path)? {
             Entry::Dir(_) | Entry::DynDir(_) => Node::Dir,
-            Entry::File(_) => Node::Generated,
+            Entry::File(_) | Entry::Bytes(_) => Node::Generated,
             Entry::Link(target) => Node::Symlink { target },
         })
     }
@@ -438,6 +468,7 @@ impl ProcFs for Process {
         }
         match self.entry(path)? {
             Entry::File(generate) => Some(generate(self)),
+            Entry::Bytes(bytes) => Some(bytes),
             _ => None,
         }
     }
