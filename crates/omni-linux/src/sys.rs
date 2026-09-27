@@ -139,9 +139,35 @@ pub(crate) fn clock_now(p: &Process, clock: u64) -> Result<Duration, Errno> {
 /// `CLOCK_MONOTONIC` (and `BOOTTIME`): one clock for every guest process of this host process, as
 /// the kernel's is for every process -- timestamps are compared across processes (a composer's
 /// vsync, a fence's signal time, a frame's deadline). It starts at 1000 s, a device's uptime.
+///
+/// And one for every host process of an instance: an app's host process (`crate::zygote`) is
+/// given its system's origin -- the wall-clock time at which the clock read zero,
+/// `OMNI_MONOTONIC_ORIGIN` in nanoseconds -- and reads the same numbers from then on.
 #[must_use]
 pub fn monotonic() -> Duration {
-    omni_platform::clock::monotonic_now() + Duration::from_secs(1000)
+    let shift = clock_anchor().0;
+    let ns = omni_platform::clock::monotonic_now().as_nanos() as i128 + shift;
+    Duration::from_nanos(ns.max(0) as u64)
+}
+
+/// `OMNI_MONOTONIC_ORIGIN` for a host process started for this instance.
+#[must_use]
+pub fn monotonic_origin() -> String {
+    clock_anchor().1.to_string()
+}
+
+/// (what is added to the platform's monotonic reading, the origin in wall-clock nanoseconds).
+fn clock_anchor() -> &'static (i128, i128) {
+    static ANCHOR: std::sync::OnceLock<(i128, i128)> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| {
+        let platform = omni_platform::clock::monotonic_now().as_nanos() as i128;
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i128);
+        let origin = std::env::var("OMNI_MONOTONIC_ORIGIN")
+            .ok()
+            .and_then(|v| v.parse::<i128>().ok())
+            .unwrap_or(wall - platform - Duration::from_secs(1000).as_nanos() as i128);
+        ((wall - origin) - platform, origin)
+    })
 }
 
 fn now(_p: &Process, clock: u64) -> Result<Duration, Errno> {

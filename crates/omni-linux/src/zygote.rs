@@ -148,6 +148,8 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
             cmd.arg("--env").arg(String::from_utf8_lossy(e).into_owned());
         }
     }
+    // One CLOCK_MONOTONIC for the instance: SurfaceFlinger's vsync times are the app's frame times.
+    cmd.env("OMNI_MONOTONIC_ORIGIN", crate::sys::monotonic_origin());
     cmd.args(["--", "/system/bin/app_process64"]);
     cmd.args(&launcher.vm_options);
     cmd.args(["/system/bin", "--application"]);

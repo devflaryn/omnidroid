@@ -153,6 +153,30 @@ fn every_process_reads_one_monotonic_clock() {
     assert!(later >= first + std::time::Duration::from_millis(50), "a process started later reads a later time: {first:?} then {later:?}");
 }
 
+/// And for every host process of an instance: one started later with the first one's origin
+/// (`OMNI_MONOTONIC_ORIGIN`, as an app's host process is started) reads the same clock.
+#[test]
+fn another_host_process_given_the_origin_reads_the_same_clock() {
+    if std::env::var("OMNI_CLOCK_CHILD").is_ok() {
+        println!("monotonic-ns {}", omni_linux::sys::monotonic().as_nanos());
+        return;
+    }
+    let origin = omni_linux::sys::monotonic_origin();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let before = omni_linux::sys::monotonic();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "another_host_process_given_the_origin_reads_the_same_clock", "--nocapture", "--test-threads=1"])
+        .env("OMNI_CLOCK_CHILD", "1")
+        .env("OMNI_MONOTONIC_ORIGIN", &origin)
+        .output()
+        .unwrap();
+    let after = omni_linux::sys::monotonic();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let child: u128 = text.lines().find_map(|l| l.split_once("monotonic-ns ").map(|(_, v)| v)).expect("the child's reading").trim().parse().unwrap();
+    let slack = 5_000_000; // 5 ms: the wall clock's and the platform clock's readings at the anchor
+    assert!(child + slack >= before.as_nanos() && child <= after.as_nanos() + slack, "child {child} outside {before:?}..{after:?}");
+}
+
 /// `capget` (crash_dump asks before dropping them): an app holds no capability; an unknown
 /// header version is answered with version 3 and `EINVAL`.
 #[test]
