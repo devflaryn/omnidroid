@@ -2,8 +2,8 @@
 //! ActivityManager, which asks the zygote's socket for a process (answered by launching the
 //! image's `app_process64 ... android.app.ActivityThread` in a host process of its own, whose
 //! binder is the system's), the app attaches, and the framework's own `bindApplication` and
-//! Activity launch run its `onCreate`. The probe APK (tests/fixtures/probe-app) is installed as a
-//! package manager finds one on a device: `/data/app/<package>-1/base.apk`, scanned at boot.
+//! Activity launch run its `onCreate`. The probe APK (tests/fixtures/probe-app) is installed as on
+//! a device: pushed to `/data/local/tmp`, then `pm install` once the system has booted.
 //!
 //! Minutes long: `cargo test -p omni-linux --test c5_app_launch -- --ignored`.
 mod common;
@@ -17,13 +17,14 @@ fn the_launcher_activity_of_an_installed_apk_is_created() {
     let Some(sysroot) = common::sysroot() else { return };
     let instance = std::env::temp_dir().join(format!("omni-linux-c5-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&instance);
-    let app = instance.join("data/app/com.omnidroid.probe-1");
-    std::fs::create_dir_all(&app).expect("/data/app");
+    let tmp = instance.join("data/local/tmp");
+    std::fs::create_dir_all(&tmp).expect("/data/local/tmp");
     let apk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe-app/probe.apk");
-    std::fs::copy(&apk, app.join("base.apk")).expect("the probe APK");
+    std::fs::copy(&apk, tmp.join("probe.apk")).expect("the probe APK");
 
     let then = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
                 echo \"[c5] boot_completed=$(getprop sys.boot_completed)\"; \
+                pm install -r /data/local/tmp/probe.apk; echo \"[c5] pm install: $?\"; \
                 am start -W -n com.omnidroid.probe/.MainActivity; echo \"[c5] am start: $?\"";
     let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote"], then);
     let (mut launched, mut created, mut resumed) = (false, None, false);
