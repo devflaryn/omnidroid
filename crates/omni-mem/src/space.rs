@@ -901,6 +901,76 @@ impl GuestSpace {
         Ok(())
     }
 
+    /// Write `bytes` at `address`, **bypassing the pages' own protection**, the way the kernel
+    /// writes into a process for `process_vm_writev` or `ptrace(POKETEXT)` -- a debugger patching
+    /// read-only code, or a self-decrypting library writing its plaintext into its own `.text`
+    /// after it has already set that code back to read-only.
+    ///
+    /// The bytes' pages must be mapped (a hole is [`MemError::NotMapped`], as a bad address is
+    /// `EFAULT` to those syscalls). A page that is not writable is transiently made writable --
+    /// copy-on-write on a file view, exactly the loader's relocation dance ([`protect`]) -- written,
+    /// and restored to its own protection before this returns, all under the one lock and with no
+    /// guest code running between, so no guest thread ever observes the page writable and no live
+    /// translation is touched (the caller invalidates if it patched code that had already run).
+    ///
+    /// Returns the number of bytes written (all of them, or an error and none).
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::ZeroSize`], [`MemError::OutsideSpace`], [`MemError::NotMapped`] for a hole,
+    /// [`MemError::HostOwned`], or [`MemError::Platform`].
+    pub fn write_forced(&self, address: GuestAddr, bytes: &[u8]) -> MemResult<usize> {
+        const OP: &str = "write_forced";
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let len = bytes.len();
+        self.check_range(OP, address, len)?;
+        let page = self.page;
+        let span = address & !(page - 1);
+        let span_end = (address + len + page - 1) & !(page - 1);
+        let span_len = span_end - span;
+
+        let mut inner = self.write();
+        inner.refuse_host(OP, span, span_len)?;
+        inner.require_mapped(OP, span, span_len)?;
+        // Lazy pages in the span get their backing so the raw write below lands; a view or already
+        // committed private range is left as it is (`commit_range` skips non-placeholders).
+        inner.commit_range(OP, span, span_len)?;
+        // Carve the map at the span's edges so every overlapping entry is fully inside it.
+        inner.ensure_boundary(OP, span)?;
+        inner.ensure_boundary(OP, span_end)?;
+
+        // Which sub-ranges are not writable, and the protection to restore each to.
+        let to_flip: Vec<(GuestAddr, usize, Protection)> = inner
+            .map
+            .starts_overlapping(span, span_len)
+            .into_iter()
+            .filter_map(|start| {
+                let entry = inner.map.get(start).expect("entry vanished");
+                let protection = RegionInfo::from_entry(start, entry).protection;
+                (!protection.is_writable()).then_some((start, entry.len, protection))
+            })
+            .collect();
+        for &(start, entry_len, protection) in &to_flip {
+            let writable = if protection.is_executable() { Protection::ReadWriteExecute } else { Protection::ReadWrite };
+            inner.protect_range(OP, start, entry_len, writable)?;
+        }
+
+        // SAFETY: a guest address is a host address (D4's identity mapping), the span is mapped,
+        // committed, and every page in it is now writable, and `check_range` bounded the write to
+        // the space. No guest code runs here, so nothing executes a page mid-flip.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, len);
+        }
+
+        for (start, entry_len, protection) in to_flip {
+            inner.protect_range(OP, start, entry_len, protection)?;
+        }
+        inner.validate();
+        Ok(len)
+    }
+
     /// Unmap a range, returning its commit charge and keeping the address space reserved.
     ///
     /// The guest's `munmap`. Committed granules are decommitted, which is the only primitive

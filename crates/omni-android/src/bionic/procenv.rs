@@ -1889,11 +1889,25 @@ fn process_vm_readv(c: &mut ImportCall<'_, '_>, args: ProcessVmReadv) -> AbiResu
             }
             let Some((lbase, llen)) = current else { break 'remote };
             let chunk = (rlen - roff).min(llen - lo);
+            // Read the source normally (it must be readable), and write the destination with the
+            // kernel's forced access: `process_vm_readv` writes into the target as the kernel, past
+            // the page's own protection, which is what a self-decrypting library relies on when it
+            // patches its own read-only `.text`.
             let result = view
                 .mem()
                 .read_bytes(guest_offset(rbase, roff), chunk, Blame::new(view.symbol(), view.address(), 3))
                 .and_then(|bytes| {
-                    view.mem().write_bytes(guest_offset(lbase, lo), &bytes, Blame::new(view.symbol(), view.address(), 1))
+                    view.mem()
+                        .space()
+                        .write_forced(guest_offset(lbase, lo), &bytes)
+                        .map(|_| ())
+                        .map_err(|error| {
+                            view.refusal(format!(
+                                "process_vm_readv could not write {chunk} byte(s) into the local \
+                                 buffer at {:#x}: {error}",
+                                guest_offset(lbase, lo)
+                            ))
+                        })
                 });
             if let Err(error) = result {
                 fault = Some(error);

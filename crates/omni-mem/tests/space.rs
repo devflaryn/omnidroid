@@ -1794,3 +1794,42 @@ fn a_shared_backing_needs_write_access_and_a_non_empty_file() {
 fn omni_platform_page() -> usize {
     space(MIB).page_size()
 }
+
+/// `write_forced` writes into read-only memory and restores its protection — the kernel's forced
+/// access for `process_vm_writev` / ptrace, which a self-decrypting library uses to patch its own
+/// `.text` after it has set that code back to read-only.
+#[test]
+fn write_forced_writes_into_read_only_memory_and_restores_its_protection() {
+    let space = space(4 * MIB);
+    let at = space
+        .map_anonymous(Placement::Anywhere { align: 64 * KIB }, 128 * KIB, Protection::ReadWrite, CommitPolicy::Eager)
+        .expect("map");
+    // Lock it read-execute: no page in it is writable now.
+    space.protect(at, 128 * KIB, Protection::ReadExecute).expect("protect r-x");
+    assert_eq!(space.region_at(at).expect("mapped").protection, Protection::ReadExecute);
+
+    // A forced write at an unaligned offset lands, past the read-only protection.
+    let payload = b"decrypted .text!";
+    let dst = at + 0x20;
+    let written = space.write_forced(dst, payload).expect("forced write into r-x memory");
+    assert_eq!(written, payload.len());
+    // SAFETY: identity mapping — the guest address is a host address.
+    let landed = unsafe { std::slice::from_raw_parts(dst as *const u8, payload.len()) };
+    assert_eq!(landed, payload, "the forced write did not land");
+
+    // And the page is read-execute again: `write_forced` never leaves memory writable.
+    assert_eq!(
+        space.region_at(dst).expect("mapped").protection,
+        Protection::ReadExecute,
+        "write_forced must restore the page's own protection"
+    );
+    assert_tiles_the_space(&space);
+}
+
+/// A `write_forced` into a hole (no mapping) is refused, as `EFAULT` refuses a bad local buffer.
+#[test]
+fn write_forced_into_an_unmapped_hole_is_refused() {
+    let space = space(4 * MIB);
+    let error = space.write_forced(space.base() + 0x40, b"nowhere").expect_err("a hole is not writable");
+    assert!(matches!(error, MemError::NotMapped { .. }), "{error:?}");
+}
