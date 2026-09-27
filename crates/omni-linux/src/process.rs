@@ -608,6 +608,19 @@ impl Process {
                 for (n, x) in regs.x.iter().enumerate() {
                     eprintln!("  x{n:<2} {x:#018x}{}", at(*x));
                 }
+                // The frame-pointer chain: AOSP builds arm64 with frame pointers.
+                let mut fp = regs.x[29];
+                for depth in 0..64 {
+                    let (Ok(next), Ok(lr)) = (self.mem.read_u64(fp), self.mem.read_u64(fp + 8)) else { break };
+                    if lr == 0 {
+                        break;
+                    }
+                    eprintln!("  #{depth:02} {lr:#x}{}", at(crate::guest::untag(lr)));
+                    if next <= fp {
+                        break;
+                    }
+                    fp = next;
+                }
             }
         }
         // SAFETY: as in `deliver_pending`.
