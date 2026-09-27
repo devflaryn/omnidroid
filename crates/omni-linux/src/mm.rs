@@ -446,6 +446,45 @@ fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 /// so what it answers is whether the range is mapped -- which is what ART's low-4-GiB allocator
 /// asks it. Outside the guest space the host owns the memory, so it is "in use" (0) there: ART
 /// then skips it rather than trying to map there.
+/// `mlock(addr, len)` and `munlock`: nothing here is ever paged out (there is no swap), so a
+/// mapped range is resident already; a range with a hole is ENOMEM, as the kernel answers.
+fn sys_mlock(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let addr = crate::guest::untag(a[0]);
+    let start = addr - addr % p.mm.page;
+    let len = p.mm.span(start, a[1] + (addr - start)).ok_or(ENOMEM)?;
+    let space = p.mem.space();
+    let mut at = start;
+    while at < start + len {
+        let region = space.region_at(at as usize).filter(|r| r.mapping.is_some()).ok_or(ENOMEM)?;
+        at = (region.start + region.len) as u64;
+    }
+    Ok(0)
+}
+
+/// `mlock2(addr, len, flags)`: `MLOCK_ONFAULT` (1) or none.
+fn sys_mlock2(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    if a[2] & !1 != 0 {
+        return Err(EINVAL);
+    }
+    sys_mlock(p, t, a)
+}
+
+/// `mlockall(flags)`: `MCL_CURRENT`, `MCL_FUTURE`, `MCL_ONFAULT` (with one of the others);
+/// satisfied, nothing being paged out.
+fn sys_mlockall(_p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const CURRENT: u64 = 1;
+    const FUTURE: u64 = 2;
+    const ONFAULT: u64 = 4;
+    if a[0] == 0 || a[0] & !(CURRENT | FUTURE | ONFAULT) != 0 || a[0] == ONFAULT {
+        return Err(EINVAL);
+    }
+    Ok(0)
+}
+
+fn sys_munlockall(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
+    Ok(0)
+}
+
 fn sys_msync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let addr = crate::guest::untag(a[0]);
     if addr % p.mm.page != 0 {
@@ -557,6 +596,11 @@ pub fn install(table: &mut Table) {
     table.set(nr::MPROTECT, sys_mprotect);
     table.set(nr::MADVISE, sys_madvise);
     table.set(nr::MSYNC, sys_msync);
+    table.set(nr::MLOCK, sys_mlock);
+    table.set(nr::MUNLOCK, sys_mlock);
+    table.set(nr::MLOCK2, sys_mlock2);
+    table.set(nr::MLOCKALL, sys_mlockall);
+    table.set(nr::MUNLOCKALL, sys_munlockall);
     table.set(nr::BRK, sys_brk);
     table.set(nr::MREMAP, sys_mremap);
 }

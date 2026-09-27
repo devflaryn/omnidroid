@@ -269,3 +269,23 @@ fn mremap_dontunmap_moves_the_pages_and_leaves_the_old_range_mapped_and_empty() 
     // Different lengths are EINVAL with DONTUNMAP.
     assert_eq!(p.syscall(&mut t, nr::MREMAP, [old, len, 2 * len, 7, target, 0]) as i64, -(EINVAL.0 as i64));
 }
+
+/// `mlock` and its kin (keystore2 locks its key buffers): a mapped range is resident already --
+/// nothing is paged out here -- so locking succeeds; a range with no mapping is ENOMEM, and
+/// `mlockall` checks its flags.
+#[test]
+fn mlock_succeeds_on_mapped_memory_and_refuses_a_hole() {
+    const PROT_RW: u64 = PROT_READ | PROT_WRITE;
+    let (p, mut t, _, pg) = process();
+    let at = mmap(&p, &mut t, [0, 2 * pg, PROT_RW, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]);
+    assert!(at > 0);
+    let call = |t: &mut omni_linux::Task, n: u64, a: [u64; 6]| p.syscall(t, n, a) as i64;
+    assert_eq!(call(&mut t, nr::MLOCK, [at as u64 + 8, 100, 0, 0, 0, 0]), 0);
+    assert_eq!(call(&mut t, nr::MUNLOCK, [at as u64, 2 * pg, 0, 0, 0, 0]), 0);
+    assert_eq!(call(&mut t, nr::MLOCK2, [at as u64, pg, 1, 0, 0, 0]), 0);
+    assert_eq!(call(&mut t, nr::MUNMAP, [at as u64 + pg, pg, 0, 0, 0, 0]), 0);
+    assert_eq!(call(&mut t, nr::MLOCK, [at as u64, 2 * pg, 0, 0, 0, 0]), -12, "ENOMEM over the hole");
+    assert_eq!(call(&mut t, nr::MLOCKALL, [3, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(call(&mut t, nr::MLOCKALL, [0, 0, 0, 0, 0, 0]), -(EINVAL.0 as i64));
+    assert_eq!(call(&mut t, nr::MUNLOCKALL, [0; 6]), 0);
+}

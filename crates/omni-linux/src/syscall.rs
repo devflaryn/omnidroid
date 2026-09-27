@@ -50,7 +50,7 @@ pub mod nr {
         PROCESS_VM_READV = 270 => "process_vm_readv", USERFAULTFD = 282 => "userfaultfd",
         BRK = 214 => "brk", MUNMAP = 215 => "munmap", MREMAP = 216 => "mremap",
         CLONE = 220 => "clone", EXECVE = 221 => "execve", MMAP = 222 => "mmap",
-        MPROTECT = 226 => "mprotect", MSYNC = 227 => "msync", MADVISE = 233 => "madvise", PRLIMIT64 = 261 => "prlimit64",
+        MPROTECT = 226 => "mprotect", MSYNC = 227 => "msync", MLOCK = 228 => "mlock", MUNLOCK = 229 => "munlock", MLOCKALL = 230 => "mlockall", MUNLOCKALL = 231 => "munlockall", MLOCK2 = 284 => "mlock2", MADVISE = 233 => "madvise", PRLIMIT64 = 261 => "prlimit64",
         SECCOMP = 277 => "seccomp", GETRANDOM = 278 => "getrandom", MEMFD_CREATE = 279 => "memfd_create",
         MEMBARRIER = 283 => "membarrier", STATX = 291 => "statx", RSEQ = 293 => "rseq",
         CLONE3 = 435 => "clone3", FACCESSAT2 = 439 => "faccessat2",
