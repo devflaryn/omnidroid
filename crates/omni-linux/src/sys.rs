@@ -471,7 +471,12 @@ fn sys_rt_sigtimedwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         match slept {
             Ok(()) if a[2] != 0 => return Err(EAGAIN),
             Ok(()) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                if p.trace {
+                    eprintln!("[sigwait] set {set:#x} pending {:#x} mask {:#x}: woken {e:?}", t.pending.load(std::sync::atomic::Ordering::SeqCst), t.sigmask);
+                }
+                return Err(e);
+            }
         }
     };
     if a[1] != 0 {
