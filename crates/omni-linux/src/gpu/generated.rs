@@ -722,7 +722,7 @@ pub(crate) const COMMANDS: &[(&str, u32, bool)] = &[
     ("vkCreateDescriptorUpdateTemplate", 4, false),
     ("vkCreateDevice", 4, true),
     ("vkCreateEvent", 4, false),
-    ("vkCreateFence", 4, false),
+    ("vkCreateFence", 4, true),
     ("vkCreateFramebuffer", 4, false),
     ("vkCreateGraphicsPipelines", 6, false),
     ("vkCreateImage", 4, true),
@@ -741,7 +741,7 @@ pub(crate) const COMMANDS: &[(&str, u32, bool)] = &[
     ("vkCreateRenderPass2", 4, false),
     ("vkCreateSampler", 4, false),
     ("vkCreateSamplerYcbcrConversion", 4, false),
-    ("vkCreateSemaphore", 4, false),
+    ("vkCreateSemaphore", 4, true),
     ("vkCreateShaderModule", 4, false),
     ("vkCreateShadersEXT", 5, false),
     ("vkCreateValidationCacheEXT", 4, false),
@@ -763,7 +763,7 @@ pub(crate) const COMMANDS: &[(&str, u32, bool)] = &[
     ("vkDestroyEvent", 3, false),
     ("vkDestroyFence", 3, false),
     ("vkDestroyFramebuffer", 3, false),
-    ("vkDestroyImage", 3, false),
+    ("vkDestroyImage", 3, true),
     ("vkDestroyImageView", 3, false),
     ("vkDestroyIndirectCommandsLayoutNV", 3, false),
     ("vkDestroyInstance", 2, true),
@@ -796,7 +796,7 @@ pub(crate) const COMMANDS: &[(&str, u32, bool)] = &[
     ("vkFlushMappedMemoryRanges", 3, false),
     ("vkFreeCommandBuffers", 4, true),
     ("vkFreeDescriptorSets", 4, false),
-    ("vkFreeMemory", 3, false),
+    ("vkFreeMemory", 3, true),
     ("vkGetAccelerationStructureBuildSizesKHR", 5, false),
     ("vkGetAccelerationStructureDeviceAddressKHR", 2, false),
     ("vkGetAccelerationStructureHandleNV", 4, false),
@@ -857,9 +857,9 @@ pub(crate) const COMMANDS: &[(&str, u32, bool)] = &[
     ("vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR", 3, false),
     ("vkGetPhysicalDeviceCooperativeMatrixPropertiesNV", 3, false),
     ("vkGetPhysicalDeviceExternalBufferProperties", 3, false),
-    ("vkGetPhysicalDeviceExternalFenceProperties", 3, false),
+    ("vkGetPhysicalDeviceExternalFenceProperties", 3, true),
     ("vkGetPhysicalDeviceExternalImageFormatPropertiesNV", 8, false),
-    ("vkGetPhysicalDeviceExternalSemaphoreProperties", 3, false),
+    ("vkGetPhysicalDeviceExternalSemaphoreProperties", 3, true),
     ("vkGetPhysicalDeviceFeatures", 2, false),
     ("vkGetPhysicalDeviceFeatures2", 2, false),
     ("vkGetPhysicalDeviceFormatProperties", 3, false),
@@ -1484,7 +1484,6 @@ pub(crate) fn dispatch(g: &Gpu, p: &Process, id: u32, a: &[u64]) -> Result<u64, 
         ID_VK_CREATE_DESCRIPTOR_SET_LAYOUT => vk_create_descriptor_set_layout(g, p, a),
         ID_VK_CREATE_DESCRIPTOR_UPDATE_TEMPLATE => vk_create_descriptor_update_template(g, p, a),
         ID_VK_CREATE_EVENT => vk_create_event(g, p, a),
-        ID_VK_CREATE_FENCE => vk_create_fence(g, p, a),
         ID_VK_CREATE_FRAMEBUFFER => vk_create_framebuffer(g, p, a),
         ID_VK_CREATE_GRAPHICS_PIPELINES => vk_create_graphics_pipelines(g, p, a),
         ID_VK_CREATE_IMAGE_VIEW => vk_create_image_view(g, p, a),
@@ -1501,7 +1500,6 @@ pub(crate) fn dispatch(g: &Gpu, p: &Process, id: u32, a: &[u64]) -> Result<u64, 
         ID_VK_CREATE_RENDER_PASS2 => vk_create_render_pass2(g, p, a),
         ID_VK_CREATE_SAMPLER => vk_create_sampler(g, p, a),
         ID_VK_CREATE_SAMPLER_YCBCR_CONVERSION => vk_create_sampler_ycbcr_conversion(g, p, a),
-        ID_VK_CREATE_SEMAPHORE => vk_create_semaphore(g, p, a),
         ID_VK_CREATE_SHADER_MODULE => vk_create_shader_module(g, p, a),
         ID_VK_CREATE_SHADERS_EXT => vk_create_shaders_ext(g, p, a),
         ID_VK_CREATE_VALIDATION_CACHE_EXT => vk_create_validation_cache_ext(g, p, a),
@@ -1522,7 +1520,6 @@ pub(crate) fn dispatch(g: &Gpu, p: &Process, id: u32, a: &[u64]) -> Result<u64, 
         ID_VK_DESTROY_EVENT => vk_destroy_event(g, p, a),
         ID_VK_DESTROY_FENCE => vk_destroy_fence(g, p, a),
         ID_VK_DESTROY_FRAMEBUFFER => vk_destroy_framebuffer(g, p, a),
-        ID_VK_DESTROY_IMAGE => vk_destroy_image(g, p, a),
         ID_VK_DESTROY_IMAGE_VIEW => vk_destroy_image_view(g, p, a),
         ID_VK_DESTROY_INDIRECT_COMMANDS_LAYOUT_NV => vk_destroy_indirect_commands_layout_nv(g, p, a),
         ID_VK_DESTROY_MICROMAP_EXT => vk_destroy_micromap_ext(g, p, a),
@@ -1546,7 +1543,6 @@ pub(crate) fn dispatch(g: &Gpu, p: &Process, id: u32, a: &[u64]) -> Result<u64, 
         ID_VK_ENUMERATE_PHYSICAL_DEVICE_QUEUE_FAMILY_PERFORMANCE_QUERY_COUNTERS_KHR => vk_enumerate_physical_device_queue_family_performance_query_counters_khr(g, p, a),
         ID_VK_FLUSH_MAPPED_MEMORY_RANGES => vk_flush_mapped_memory_ranges(g, p, a),
         ID_VK_FREE_DESCRIPTOR_SETS => vk_free_descriptor_sets(g, p, a),
-        ID_VK_FREE_MEMORY => vk_free_memory(g, p, a),
         ID_VK_GET_ACCELERATION_STRUCTURE_BUILD_SIZES_KHR => vk_get_acceleration_structure_build_sizes_khr(g, p, a),
         ID_VK_GET_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_KHR => vk_get_acceleration_structure_device_address_khr(g, p, a),
         ID_VK_GET_ACCELERATION_STRUCTURE_HANDLE_NV => vk_get_acceleration_structure_handle_nv(g, p, a),
@@ -1600,9 +1596,7 @@ pub(crate) fn dispatch(g: &Gpu, p: &Process, id: u32, a: &[u64]) -> Result<u64, 
         ID_VK_GET_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR => vk_get_physical_device_cooperative_matrix_properties_khr(g, p, a),
         ID_VK_GET_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_NV => vk_get_physical_device_cooperative_matrix_properties_nv(g, p, a),
         ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_BUFFER_PROPERTIES => vk_get_physical_device_external_buffer_properties(g, p, a),
-        ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES => vk_get_physical_device_external_fence_properties(g, p, a),
         ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_PROPERTIES_NV => vk_get_physical_device_external_image_format_properties_nv(g, p, a),
-        ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES => vk_get_physical_device_external_semaphore_properties(g, p, a),
         ID_VK_GET_PHYSICAL_DEVICE_FEATURES => vk_get_physical_device_features(g, p, a),
         ID_VK_GET_PHYSICAL_DEVICE_FEATURES2 => vk_get_physical_device_features2(g, p, a),
         ID_VK_GET_PHYSICAL_DEVICE_FORMAT_PROPERTIES => vk_get_physical_device_format_properties(g, p, a),
@@ -3565,14 +3559,6 @@ fn vk_create_event(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     Ok(u64::from(r as u32))
 }
 
-fn vk_create_fence(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
-    const NAMES: &[&CStr] = &[c"vkCreateFence"];
-    let (h0, t) = g.dispatchable(p, a[0])?;
-    let f: unsafe extern "system" fn(u64, u64, u64, u64) -> i32 = unsafe { std::mem::transmute(t.get(ID_VK_CREATE_FENCE, NAMES)?) };
-    let r = unsafe { f(h0, a[1], a[2], a[3]) };
-    Ok(u64::from(r as u32))
-}
-
 fn vk_create_framebuffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCreateFramebuffer"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -3697,14 +3683,6 @@ fn vk_create_sampler_ycbcr_conversion(g: &Gpu, p: &Process, a: &[u64]) -> Result
     const NAMES: &[&CStr] = &[c"vkCreateSamplerYcbcrConversion", c"vkCreateSamplerYcbcrConversionKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
     let f: unsafe extern "system" fn(u64, u64, u64, u64) -> i32 = unsafe { std::mem::transmute(t.get(ID_VK_CREATE_SAMPLER_YCBCR_CONVERSION, NAMES)?) };
-    let r = unsafe { f(h0, a[1], a[2], a[3]) };
-    Ok(u64::from(r as u32))
-}
-
-fn vk_create_semaphore(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
-    const NAMES: &[&CStr] = &[c"vkCreateSemaphore"];
-    let (h0, t) = g.dispatchable(p, a[0])?;
-    let f: unsafe extern "system" fn(u64, u64, u64, u64) -> i32 = unsafe { std::mem::transmute(t.get(ID_VK_CREATE_SEMAPHORE, NAMES)?) };
     let r = unsafe { f(h0, a[1], a[2], a[3]) };
     Ok(u64::from(r as u32))
 }
@@ -3865,14 +3843,6 @@ fn vk_destroy_framebuffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallEr
     const NAMES: &[&CStr] = &[c"vkDestroyFramebuffer"];
     let (h0, t) = g.dispatchable(p, a[0])?;
     let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_DESTROY_FRAMEBUFFER, NAMES)?) };
-    unsafe { f(h0, a[1], a[2]) };
-    Ok(0)
-}
-
-fn vk_destroy_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
-    const NAMES: &[&CStr] = &[c"vkDestroyImage"];
-    let (h0, t) = g.dispatchable(p, a[0])?;
-    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_DESTROY_IMAGE, NAMES)?) };
     unsafe { f(h0, a[1], a[2]) };
     Ok(0)
 }
@@ -4059,14 +4029,6 @@ fn vk_free_descriptor_sets(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallE
     let f: unsafe extern "system" fn(u64, u64, u32, u64) -> i32 = unsafe { std::mem::transmute(t.get(ID_VK_FREE_DESCRIPTOR_SETS, NAMES)?) };
     let r = unsafe { f(h0, a[1], a[2] as u32, a[3]) };
     Ok(u64::from(r as u32))
-}
-
-fn vk_free_memory(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
-    const NAMES: &[&CStr] = &[c"vkFreeMemory"];
-    let (h0, t) = g.dispatchable(p, a[0])?;
-    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_FREE_MEMORY, NAMES)?) };
-    unsafe { f(h0, a[1], a[2]) };
-    Ok(0)
 }
 
 fn vk_get_acceleration_structure_build_sizes_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
@@ -4493,28 +4455,12 @@ fn vk_get_physical_device_external_buffer_properties(g: &Gpu, p: &Process, a: &[
     Ok(0)
 }
 
-fn vk_get_physical_device_external_fence_properties(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
-    const NAMES: &[&CStr] = &[c"vkGetPhysicalDeviceExternalFenceProperties", c"vkGetPhysicalDeviceExternalFencePropertiesKHR"];
-    let (h0, t) = g.dispatchable(p, a[0])?;
-    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES, NAMES)?) };
-    unsafe { f(h0, a[1], a[2]) };
-    Ok(0)
-}
-
 fn vk_get_physical_device_external_image_format_properties_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkGetPhysicalDeviceExternalImageFormatPropertiesNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
     let f: unsafe extern "system" fn(u64, u32, u32, u32, u32, u32, u32, u64) -> i32 = unsafe { std::mem::transmute(t.get(ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_PROPERTIES_NV, NAMES)?) };
     let r = unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32, a[5] as u32, a[6] as u32, a[7]) };
     Ok(u64::from(r as u32))
-}
-
-fn vk_get_physical_device_external_semaphore_properties(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
-    const NAMES: &[&CStr] = &[c"vkGetPhysicalDeviceExternalSemaphoreProperties", c"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR"];
-    let (h0, t) = g.dispatchable(p, a[0])?;
-    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES, NAMES)?) };
-    unsafe { f(h0, a[1], a[2]) };
-    Ok(0)
 }
 
 fn vk_get_physical_device_features(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {

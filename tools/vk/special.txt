@@ -46,3 +46,11 @@ vkCreateImage
 vkAllocateMemory
 vkBindImageMemory
 vkBindImageMemory2
+vkDestroyImage
+# Emulated sync fds (SYNC_FD export/import is implemented on the host, not by its driver).
+vkCreateSemaphore
+vkCreateFence
+vkGetPhysicalDeviceExternalSemaphoreProperties
+vkGetPhysicalDeviceExternalFenceProperties
+# Gralloc-imported memory is freed with its host mirror.
+vkFreeMemory

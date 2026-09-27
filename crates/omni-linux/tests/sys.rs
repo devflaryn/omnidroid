@@ -86,12 +86,16 @@ fn the_scheduler_is_sched_other_at_priority_zero() {
     assert_eq!(p.syscall(&mut t, nr::SCHED_GET_PRIORITY_MAX, [0; 6]), 0);
 }
 
+/// This kernel is one without the tagged address ABI (`CONFIG_ARM64_TAGGED_ADDR_ABI` off): the
+/// prctls answer `EINVAL`, so bionic keeps an untagged heap. A tagged heap pointer would reach the
+/// host's GPU driver inside Vulkan structs, which no host can untag (D3a). A tagged pointer given
+/// to a syscall still works (`guest::untag`), as TBI still holds in the CPU.
 #[test]
-fn the_tagged_address_abi_is_accepted_and_reported() {
+fn the_tagged_address_abi_is_not_offered() {
+    const EINVAL: u64 = -22i64 as u64;
     let (p, mut t, _) = process();
-    assert_eq!(p.syscall(&mut t, nr::PRCTL, [56, 0, 0, 0, 0, 0]), 0, "PR_GET_TAGGED_ADDR_CTRL: off at first");
-    assert_eq!(p.syscall(&mut t, nr::PRCTL, [55, 1, 0, 0, 0, 0]), 0, "PR_SET_TAGGED_ADDR_CTRL(ENABLE)");
-    assert_eq!(p.syscall(&mut t, nr::PRCTL, [56, 0, 0, 0, 0, 0]), 1);
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [55, 1, 0, 0, 0, 0]), EINVAL, "PR_SET_TAGGED_ADDR_CTRL(ENABLE)");
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [56, 0, 0, 0, 0, 0]), EINVAL, "PR_GET_TAGGED_ADDR_CTRL");
 }
 
 /// A terminating signal with its default action is left pending for the run loop, which takes

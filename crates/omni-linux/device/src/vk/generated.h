@@ -506,9 +506,12 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkBindImageMemory(VkDevice device, VkImage i
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkBindImageMemory2(VkDevice device, uint32_t bindInfoCount, const VkBindImageMemoryInfo* pBindInfos);
 VKAPI_ATTR void VKAPI_CALL omni_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount, const VkCommandBuffer* pCommandBuffers);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice);
+VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFence* pFence);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkImage* pImage);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance);
+VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore);
 VKAPI_ATTR void VKAPI_CALL omni_vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator);
+VKAPI_ATTR void VKAPI_CALL omni_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR void VKAPI_CALL omni_vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice, uint32_t* pPropertyCount, VkLayerProperties* pProperties);
@@ -518,6 +521,7 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkEnumerateInstanceVersion(uint32_t* pApiVer
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkEnumeratePhysicalDeviceGroups(VkInstance instance, uint32_t* pPhysicalDeviceGroupCount, VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pPhysicalDeviceCount, VkPhysicalDevice* pPhysicalDevices);
 VKAPI_ATTR void VKAPI_CALL omni_vkFreeCommandBuffers(VkDevice device, VkCommandPool commandPool, uint32_t commandBufferCount, const VkCommandBuffer* pCommandBuffers);
+VKAPI_ATTR void VKAPI_CALL omni_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetAndroidHardwareBufferPropertiesANDROID(VkDevice device, const struct AHardwareBuffer* buffer, VkAndroidHardwareBufferPropertiesANDROID* pProperties);
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL omni_vkGetDeviceProcAddr(VkDevice device, const char* pName);
 VKAPI_ATTR void VKAPI_CALL omni_vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue);
@@ -525,6 +529,8 @@ VKAPI_ATTR void VKAPI_CALL omni_vkGetDeviceQueue2(VkDevice device, const VkDevic
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* pGetFdInfo, int* pFd);
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL omni_vkGetInstanceProcAddr(VkInstance instance, const char* pName);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetMemoryAndroidHardwareBufferANDROID(VkDevice device, const VkMemoryGetAndroidHardwareBufferInfoANDROID* pInfo, struct AHardwareBuffer** pBuffer);
+VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalFenceInfo* pExternalFenceInfo, VkExternalFenceProperties* pExternalFenceProperties);
+VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalSemaphoreInfo* pExternalSemaphoreInfo, VkExternalSemaphoreProperties* pExternalSemaphoreProperties);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo, VkImageFormatProperties2* pImageFormatProperties);
 VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties);
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd);

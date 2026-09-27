@@ -11,7 +11,16 @@ use crate::process::Process;
 
 /// VK_ANDROID_native_buffer's commands, which vk.xml does not number (the guest's `driver.h`).
 pub(crate) const ID_GRALLOC_USAGE: u32 = 0x1000;
-pub(crate) const ID_QUEUE_SIGNAL_RELEASE_IMAGE: u32 = 0x1005;
+const ID_GRALLOC_USAGE2: u32 = 0x1001;
+const ID_GRALLOC_USAGE3: u32 = 0x1002;
+const ID_GRALLOC_USAGE4: u32 = 0x1003;
+const ID_ACQUIRE_IMAGE: u32 = 0x1004;
+const ID_QUEUE_SIGNAL_RELEASE_IMAGE: u32 = 0x1005;
+
+/// The gralloc usage of a swapchain buffer: the GPU renders it and samples it
+/// (`GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER`, gralloc1's consumer `GPU_TEXTURE` and
+/// producer `GPU_RENDER_TARGET`).
+const GRALLOC_USAGE_SWAPCHAIN: u64 = 0x100 | 0x200;
 
 const VK_SUCCESS: i32 = 0;
 const VK_INCOMPLETE: i32 = 5;
@@ -19,6 +28,7 @@ const VK_ERROR_LAYER_NOT_PRESENT: i32 = -6;
 const VK_ERROR_FEATURE_NOT_PRESENT: i32 = -8;
 
 const STYPE_NATIVE_BUFFER_ANDROID: u32 = 1_000_010_000;
+const STYPE_SWAPCHAIN_IMAGE_CREATE_INFO_ANDROID: u32 = 1_000_010_001;
 const STYPE_PRESENTATION_PROPERTIES_ANDROID: u32 = 1_000_010_002;
 const STYPE_AHB_USAGE_ANDROID: u32 = 1_000_129_000;
 const STYPE_IMPORT_AHB_INFO_ANDROID: u32 = 1_000_129_003;
@@ -35,16 +45,7 @@ fn result(r: i32) -> u64 {
     u64::from(r as u32)
 }
 
-/// A host entry point of `table`, as function type `F`.
-///
-/// # Safety
-/// `F` must be the entry point's exact Vulkan signature.
-unsafe fn f<F: Copy>(table: &Table, id: u32, names: &'static [&'static CStr]) -> R<F> {
-    let p = table.get(id, names)?;
-    debug_assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<usize>());
-    // SAFETY: `p` is a non-null function address; the caller names its type.
-    Ok(unsafe { std::mem::transmute_copy(&p) })
-}
+use super::entry_point as f;
 
 fn rd_u32(p: &Process, at: u64) -> R<u32> {
     Ok(u32::from_le_bytes(p.mem.read(at, 4).map_err(|_| CallError::Args)?.try_into().expect("4")))
@@ -139,12 +140,27 @@ fn write_extensions(p: &Process, count_at: u64, props_at: u64, offered: &[(Strin
 
 /// Whether the guest is offered extension `name` of kind `device` when the host has it.
 fn forwarded(name: &str, device: bool) -> bool {
-    EXTENSIONS.iter().any(|(n, d)| *n == name && *d == device) && !EMULATED.contains(&name)
+    EXTENSIONS.iter().any(|(n, d)| *n == name && *d == device) && !EMULATED.iter().any(|(e, _)| *e == name)
 }
 
 /// Extensions implemented here rather than by the host driver: offered whatever the host has,
-/// and never enabled on it.
-const EMULATED: &[&str] = &[];
+/// and never enabled on it. (name, spec version)
+const EMULATED: &[(&str, u32)] = &[
+    ("VK_ANDROID_native_buffer", 8),
+    ("VK_ANDROID_external_memory_android_hardware_buffer", 5),
+    ("VK_KHR_external_semaphore_fd", 1),
+    ("VK_KHR_external_fence_fd", 1),
+];
+
+const STYPE_EXPORT_SEMAPHORE_CREATE_INFO: u32 = 1_000_077_000;
+const STYPE_EXPORT_FENCE_CREATE_INFO: u32 = 1_000_113_000;
+const STYPE_EXPORT_MEMORY_ALLOCATE_INFO: u32 = 1_000_072_002;
+const STYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO: u32 = 1_000_071_000;
+const STYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: u32 = 1_000_071_001;
+/// `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT`, `VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT`.
+const SEMAPHORE_SYNC_FD: u32 = 0x10;
+const FENCE_SYNC_FD: u32 = 0x8;
+const VK_ERROR_OUT_OF_HOST_MEMORY: i32 = -1;
 
 type Enumerate = unsafe extern "system" fn(*const c_char, *mut u32, *mut u8) -> i32;
 type EnumerateDev = unsafe extern "system" fn(u64, *const c_char, *mut u32, *mut u8) -> i32;
@@ -251,7 +267,7 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
             }
             let (pd, t) = gpu.dispatchable(p, a[0])?;
             let mut offered: Vec<_> = enumerate_host_device_extensions(&t, pd)?.into_iter().filter(|(n, _)| forwarded(n, true)).collect();
-            offered.extend(EMULATED.iter().map(|n| ((*n).to_string(), 1)));
+            offered.extend(EMULATED.iter().map(|(n, v)| ((*n).to_string(), *v)));
             write_extensions(p, a[2], a[3], &offered)
         }
         g::ID_VK_CREATE_DEVICE => create_device(gpu, p, a),
@@ -262,6 +278,9 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
             let d: unsafe extern "system" fn(u64, *const c_void) = unsafe { f(&t, id, NAMES)? };
             unsafe { d(h, std::ptr::null()) };
             gpu.objects.lock().retain(|k, o| *k != h && o.parent != h);
+            gpu.devices.lock().remove(&h);
+            gpu.native.lock().retain(|_, n| !n.belongs_to(h));
+            super::ahb::forget_device(gpu, h);
             Ok(0)
         }
         g::ID_VK_GET_DEVICE_QUEUE | g::ID_VK_GET_DEVICE_QUEUE2 => {
@@ -279,6 +298,10 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
                 unsafe { e(h, a[1], &mut q) };
             }
             if q != 0 {
+                let family = if id == g::ID_VK_GET_DEVICE_QUEUE { a[1] as u32 } else { rd_u32(p, a[1] + 20)? };
+                if let Some(info) = gpu.devices.lock().get_mut(&h) {
+                    info.queues.insert(q, family);
+                }
                 gpu.add(q, Kind::Queue, h, t);
             }
             wr(p, *a.last().expect("argc checked"), &q.to_le_bytes())?;
@@ -337,6 +360,13 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
         g::ID_VK_GET_PHYSICAL_DEVICE_IMAGE_FORMAT_PROPERTIES2 => {
             let (h, t) = gpu.dispatchable(p, a[0])?;
             let usage = splice(p, a[2], STYPE_AHB_USAGE_ANDROID)?;
+            // Gralloc buffers are importable (and only by a dedicated allocation); the host driver
+            // is asked about the image without that handle type.
+            let external = match chain_find(p, a[1], STYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)? {
+                Some((_, node)) if rd_u32(p, node + 16)? == super::ahb::HANDLE_TYPE_AHB => splice(p, a[1], STYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO)?,
+                _ => None,
+            };
+            let external_props = if external.is_some() { splice(p, a[2], STYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES)? } else { None };
             const NAMES: &[&CStr] = &[c"vkGetPhysicalDeviceImageFormatProperties2", c"vkGetPhysicalDeviceImageFormatProperties2KHR"];
             // SAFETY: the Vulkan signature.
             let e: unsafe extern "system" fn(u64, u64, u64) -> i32 = unsafe { f(&t, id, NAMES)? };
@@ -344,20 +374,134 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
             if let Some(s) = usage {
                 wr(p, s.node + 16, &AHB_USAGE_GPU.to_le_bytes())?;
             }
+            if let Some(s) = external_props {
+                // VkExternalMemoryProperties at 16: features (DEDICATED_ONLY | IMPORTABLE),
+                // exportFromImportedHandleTypes, compatibleHandleTypes.
+                let ahb = super::ahb::HANDLE_TYPE_AHB;
+                let mut b = [0u8; 12];
+                b[0..4].copy_from_slice(&(0x1u32 | 0x4).to_le_bytes());
+                b[4..8].copy_from_slice(&ahb.to_le_bytes());
+                b[8..12].copy_from_slice(&ahb.to_le_bytes());
+                wr(p, s.node + 16, &b)?;
+            }
             Ok(result(r))
         }
         g::ID_VK_CREATE_IMAGE => {
-            if chain_find(p, a[1], STYPE_NATIVE_BUFFER_ANDROID)?.is_some() || chain_find(p, a[1], STYPE_EXTERNAL_FORMAT_ANDROID)?.is_some() {
-                return Ok(result(VK_ERROR_FEATURE_NOT_PRESENT));
+            // An external format (a YUV layout only the vendor's GPU knows) is none here; 0 means
+            // "no external format" and is dropped.
+            if let Some((_, node)) = chain_find(p, a[1], STYPE_EXTERNAL_FORMAT_ANDROID)? {
+                if rd_u64(p, node + 16)? != 0 {
+                    return Ok(result(VK_ERROR_FEATURE_NOT_PRESENT));
+                }
+            }
+            if std::env::var("OMNI_GPU_TRACE").as_deref() == Ok("1") {
+                let mut link = a[1] + 8;
+                let mut chain = Vec::new();
+                while let Ok(node) = rd_u64(p, link) {
+                    if node == 0 || chain.len() > 16 {
+                        break;
+                    }
+                    chain.push((rd_u32(p, node).unwrap_or(0), rd_u32(p, node + 16).unwrap_or(0)));
+                    link = node + 8;
+                }
+                eprintln!("[gpu] vkCreateImage chain (sType, first u32): {chain:?}; flags {:#x} tiling {} usage {:#x}", rd_u32(p, a[1] + 16)?, rd_u32(p, a[1] + 52)?, rd_u32(p, a[1] + 56)?);
+            }
+            let _external_format = splice(p, a[1], STYPE_EXTERNAL_FORMAT_ANDROID)?;
+            if let Some((_, node)) = chain_find(p, a[1], super::ahb::STYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)? {
+                if rd_u32(p, node + 16)? & super::ahb::HANDLE_TYPE_AHB != 0 {
+                    let _external = splice(p, a[1], super::ahb::STYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)?;
+                    let (h, t) = gpu.dispatchable(p, a[0])?;
+                    let info = p.mem.read(a[1], 88).map_err(|_| CallError::Args)?;
+                    return super::ahb::create_image(gpu, p, h, &t, &info, a[3]);
+                }
+            }
+            let _swapchain = splice(p, a[1], STYPE_SWAPCHAIN_IMAGE_CREATE_INFO_ANDROID)?;
+            if let Some(native) = splice(p, a[1], STYPE_NATIVE_BUFFER_ANDROID)? {
+                let (h, t) = gpu.dispatchable(p, a[0])?;
+                let info = p.mem.read(a[1], 88).map_err(|_| CallError::Args)?;
+                return match super::native::create_image(gpu, p, h, &t, &info, native.node) {
+                    Ok(image) => {
+                        wr(p, a[3], &image.to_le_bytes())?;
+                        Ok(result(VK_SUCCESS))
+                    }
+                    Err(CallError::Host(r)) => Ok(result(r)),
+                    Err(e) => Err(e),
+                };
             }
             passthrough4(gpu, p, id, a, &[c"vkCreateImage"])
         }
+        g::ID_VK_DESTROY_IMAGE => {
+            let (h, t) = gpu.dispatchable(p, a[0])?;
+            if !super::native::destroy_image(gpu, &t, a[1])? {
+                const NAMES: &[&CStr] = &[c"vkDestroyImage"];
+                // SAFETY: the Vulkan signature.
+                let e: unsafe extern "system" fn(u64, u64, *const c_void) = unsafe { f(&t, id, NAMES)? };
+                unsafe { e(h, a[1], std::ptr::null()) };
+            }
+            Ok(0)
+        }
         g::ID_VK_ALLOCATE_MEMORY => {
-            if chain_find(p, a[1], STYPE_IMPORT_AHB_INFO_ANDROID)?.is_some() {
-                return Ok(result(VK_ERROR_FEATURE_NOT_PRESENT));
+            if let Some(import) = splice(p, a[1], STYPE_IMPORT_AHB_INFO_ANDROID)? {
+                // The guest passes the buffer's native handle in the allocator's place.
+                let (h, t) = gpu.dispatchable(p, a[0])?;
+                let _ = import;
+                return match super::ahb::import(gpu, p, h, &t, a[1], a[2], a[3]) {
+                    Err(CallError::Host(r)) => Ok(result(r)),
+                    other => other,
+                };
+            }
+            if let Some((_, node)) = chain_find(p, a[1], STYPE_EXPORT_MEMORY_ALLOCATE_INFO)? {
+                if rd_u32(p, node + 16)? & super::ahb::HANDLE_TYPE_AHB != 0 {
+                    // Exporting a gralloc buffer from device memory is not offered.
+                    return Ok(result(VK_ERROR_OUT_OF_HOST_MEMORY));
+                }
             }
             passthrough4(gpu, p, id, a, &[c"vkAllocateMemory"])
         }
+        g::ID_VK_FREE_MEMORY => {
+            let (h, t) = gpu.dispatchable(p, a[0])?;
+            super::ahb::forget_memory(gpu, a[1]);
+            const NAMES: &[&CStr] = &[c"vkFreeMemory"];
+            // SAFETY: the Vulkan signature.
+            let e: unsafe extern "system" fn(u64, u64, *const c_void) = unsafe { f(&t, id, NAMES)? };
+            unsafe { e(h, a[1], std::ptr::null()) };
+            Ok(0)
+        }
+        g::ID_VK_GET_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID => super::ahb::properties(gpu, p, a),
+        g::ID_VK_GET_MEMORY_ANDROID_HARDWARE_BUFFER_ANDROID => Ok(result(VK_ERROR_OUT_OF_HOST_MEMORY)),
+        g::ID_VK_CREATE_SEMAPHORE => {
+            let _export = splice(p, a[1], STYPE_EXPORT_SEMAPHORE_CREATE_INFO)?;
+            passthrough4(gpu, p, id, a, &[c"vkCreateSemaphore"])
+        }
+        g::ID_VK_CREATE_FENCE => {
+            let _export = splice(p, a[1], STYPE_EXPORT_FENCE_CREATE_INFO)?;
+            passthrough4(gpu, p, id, a, &[c"vkCreateFence"])
+        }
+        g::ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES | g::ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES => {
+            let semaphore = id == g::ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES;
+            let sync_fd = if semaphore { SEMAPHORE_SYNC_FD } else { FENCE_SYNC_FD };
+            if rd_u32(p, a[1] + 16)? == sync_fd {
+                // Emulated here: exportable and importable, of itself only.
+                let mut b = [0u8; 12];
+                b[0..4].copy_from_slice(&sync_fd.to_le_bytes());
+                b[4..8].copy_from_slice(&sync_fd.to_le_bytes());
+                b[8..12].copy_from_slice(&0x3u32.to_le_bytes());
+                wr(p, a[2] + 16, &b)?;
+                return Ok(0);
+            }
+            let (h, t) = gpu.dispatchable(p, a[0])?;
+            let names: &'static [&'static CStr] = if semaphore {
+                &[c"vkGetPhysicalDeviceExternalSemaphoreProperties", c"vkGetPhysicalDeviceExternalSemaphorePropertiesKHR"]
+            } else {
+                &[c"vkGetPhysicalDeviceExternalFenceProperties", c"vkGetPhysicalDeviceExternalFencePropertiesKHR"]
+            };
+            // SAFETY: the Vulkan signature.
+            let e: unsafe extern "system" fn(u64, u64, u64) = unsafe { f(&t, id, names)? };
+            unsafe { e(h, a[1], a[2]) };
+            Ok(0)
+        }
+        g::ID_VK_GET_SEMAPHORE_FD_KHR | g::ID_VK_GET_FENCE_FD_KHR => export_sync_fd(gpu, p, id, a),
+        g::ID_VK_IMPORT_SEMAPHORE_FD_KHR | g::ID_VK_IMPORT_FENCE_FD_KHR => import_sync_fd(gpu, p, id, a),
         g::ID_VK_BIND_IMAGE_MEMORY => {
             let (h, t) = gpu.dispatchable(p, a[0])?;
             const NAMES: &[&CStr] = &[c"vkBindImageMemory"];
@@ -380,11 +524,34 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
 }
 
 /// VK_ANDROID_native_buffer's commands (ids from [`ID_GRALLOC_USAGE`]).
-pub(crate) fn extra(_gpu: &Gpu, _p: &Process, id: u32, _a: &[u64]) -> R<u64> {
-    if (ID_GRALLOC_USAGE..=ID_QUEUE_SIGNAL_RELEASE_IMAGE).contains(&id) {
-        return Err(CallError::Missing("VK_ANDROID_native_buffer"));
+pub(crate) fn extra(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
+    let argc = match id {
+        ID_GRALLOC_USAGE | ID_GRALLOC_USAGE3 | ID_GRALLOC_USAGE4 => if id == ID_GRALLOC_USAGE { 4 } else { 3 },
+        ID_GRALLOC_USAGE2 => 6,
+        ID_ACQUIRE_IMAGE | ID_QUEUE_SIGNAL_RELEASE_IMAGE => 5,
+        _ => return Err(CallError::Args),
+    };
+    if a.len() != argc {
+        return Err(CallError::Args);
     }
-    Err(CallError::Args)
+    gpu.dispatchable(p, a[0])?;
+    let native = |r: R<u64>| match r {
+        Err(CallError::Host(v)) => Ok(result(v)),
+        other => other,
+    };
+    match id {
+        // (device, format, imageUsage, int* grallocUsage)
+        ID_GRALLOC_USAGE => wr(p, a[3], &(GRALLOC_USAGE_SWAPCHAIN as i32).to_le_bytes()).map(|()| 0),
+        // (device, format, imageUsage, swapchainUsage, u64* consumer, u64* producer)
+        ID_GRALLOC_USAGE2 => {
+            wr(p, a[4], &0x100u64.to_le_bytes())?;
+            wr(p, a[5], &0x200u64.to_le_bytes()).map(|()| 0)
+        }
+        // (device, info, u64* grallocUsage)
+        ID_GRALLOC_USAGE3 | ID_GRALLOC_USAGE4 => wr(p, a[2], &GRALLOC_USAGE_SWAPCHAIN.to_le_bytes()).map(|()| 0),
+        ID_ACQUIRE_IMAGE => native(super::native::acquire(gpu, p, a)),
+        _ => native(super::native::release(gpu, p, a)),
+    }
 }
 
 /// A command `(dispatchable, create info, allocator, out handle)` passed through, with no allocator.
@@ -453,7 +620,7 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     if ext_count > 1024 {
         return Err(CallError::Args);
     }
-    let names: Vec<CString> = strings(p, at(56), ext_count)?.into_iter().filter(|n| !EMULATED.iter().any(|e| e.as_bytes() == n.as_bytes())).collect();
+    let names: Vec<CString> = strings(p, at(56), ext_count)?.into_iter().filter(|n| !EMULATED.iter().any(|(e, _)| e.as_bytes() == n.as_bytes())).collect();
     let ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
     let mut host_ci = ci.clone();
     host_ci[32..36].copy_from_slice(&0u32.to_le_bytes()); // no layers
@@ -470,9 +637,95 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         // SAFETY: `vkGetDeviceProcAddr`'s signature is `GetProcAddr`'s.
         let gdpa = unsafe { f(&t, g::ID_VK_GET_DEVICE_PROC_ADDR, GDPA)? };
         gpu.add(device, Kind::Device, device, Table::new(gdpa, device));
+        const MEMORY: &[&CStr] = &[c"vkGetPhysicalDeviceMemoryProperties"];
+        // SAFETY: the Vulkan signature.
+        let mp: ash::vk::PFN_vkGetPhysicalDeviceMemoryProperties = unsafe { f(&t, g::ID_VK_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES, MEMORY)? };
+        let mut memory = ash::vk::PhysicalDeviceMemoryProperties::default();
+        unsafe { mp(ash::vk::Handle::from_raw(pd), &mut memory) };
+        gpu.devices.lock().insert(device, super::native::DeviceInfo::new(&memory));
         wr(p, a[3], &device.to_le_bytes())?;
     }
     Ok(result(r))
+}
+
+/// The device a queue belongs to.
+fn device_of_queue(gpu: &Gpu, queue: u64) -> R<u64> {
+    gpu.objects.lock().get(&queue).map(|o| o.parent).ok_or(CallError::Handle(queue))
+}
+
+/// Every queue of `device` idle.
+fn device_wait_idle(gpu: &Gpu, device: u64, t: &Table) -> R<()> {
+    const NAMES: &[&CStr] = &[c"vkDeviceWaitIdle"];
+    // SAFETY: the Vulkan signature; `device` is a live host device.
+    let e: unsafe extern "system" fn(u64) -> i32 = unsafe { f(t, g::ID_VK_DEVICE_WAIT_IDLE, NAMES)? };
+    let _ = gpu;
+    unsafe { e(device) };
+    Ok(())
+}
+
+/// Submit nothing on some queue of `device`: waiting for `wait`, signalling `signal` and `fence`.
+fn submit_nothing(gpu: &Gpu, device: u64, t: &Table, wait: u64, signal: u64, fence: u64) -> R<()> {
+    let queue = gpu.devices.lock().get(&device).and_then(|i| i.queues.keys().next().copied()).ok_or(CallError::Missing("a queue"))?;
+    let stage = ash::vk::PipelineStageFlags::ALL_COMMANDS.as_raw();
+    let mut si = [0u8; 72];
+    si[0..4].copy_from_slice(&4u32.to_le_bytes()); // VK_STRUCTURE_TYPE_SUBMIT_INFO
+    if wait != 0 {
+        si[16..20].copy_from_slice(&1u32.to_le_bytes());
+        si[24..32].copy_from_slice(&(std::ptr::from_ref(&wait) as u64).to_le_bytes());
+        si[32..40].copy_from_slice(&(std::ptr::from_ref(&stage) as u64).to_le_bytes());
+    }
+    if signal != 0 {
+        si[56..60].copy_from_slice(&1u32.to_le_bytes());
+        si[64..72].copy_from_slice(&(std::ptr::from_ref(&signal) as u64).to_le_bytes());
+    }
+    const NAMES: &[&CStr] = &[c"vkQueueSubmit"];
+    // SAFETY: the Vulkan signature; `si` is a VkSubmitInfo whose pointers outlive the call.
+    let e: unsafe extern "system" fn(u64, u32, *const u8, u64) -> i32 = unsafe { f(t, g::ID_VK_QUEUE_SUBMIT, NAMES)? };
+    let r = unsafe { e(queue, 1, si.as_ptr(), fence) };
+    if r == VK_SUCCESS { Ok(()) } else { Err(CallError::Host(r)) }
+}
+
+/// `vkGetSemaphoreFdKHR`/`vkGetFenceFdKHR` of a `SYNC_FD`: the work is waited for, and the fd is
+/// -1, a sync file already signalled. As a sync-file export does, the payload is taken: the
+/// semaphore is waited on (unsignalled), the fence reset.
+fn export_sync_fd(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
+    let (device, t) = gpu.dispatchable(p, a[0])?;
+    let object = rd_u64(p, a[1] + 16)?;
+    if id == g::ID_VK_GET_SEMAPHORE_FD_KHR {
+        device_wait_idle(gpu, device, &t)?;
+        submit_nothing(gpu, device, &t, object, 0, 0)?;
+        device_wait_idle(gpu, device, &t)?;
+    } else {
+        const WAIT: &[&CStr] = &[c"vkWaitForFences"];
+        const RESET: &[&CStr] = &[c"vkResetFences"];
+        // SAFETY: the Vulkan signatures.
+        let w: unsafe extern "system" fn(u64, u32, *const u64, u32, u64) -> i32 = unsafe { f(&t, g::ID_VK_WAIT_FOR_FENCES, WAIT)? };
+        let r: unsafe extern "system" fn(u64, u32, *const u64) -> i32 = unsafe { f(&t, g::ID_VK_RESET_FENCES, RESET)? };
+        unsafe {
+            w(device, 1, &object, 1, u64::MAX);
+            r(device, 1, &object);
+        }
+    }
+    wr(p, a[2], &(-1i32).to_le_bytes())?;
+    Ok(result(VK_SUCCESS))
+}
+
+/// `vkImportSemaphoreFdKHR`/`vkImportFenceFdKHR` of a `SYNC_FD`: every sync file here is already
+/// signalled (an export is -1), so the object is signalled; a real descriptor is the caller's to
+/// give up, and is closed.
+fn import_sync_fd(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
+    let (device, t) = gpu.dispatchable(p, a[0])?;
+    let object = rd_u64(p, a[1] + 16)?;
+    let fd = rd_u32(p, a[1] + 32)? as i32;
+    if fd >= 0 {
+        let _ = p.fds.remove(fd);
+    }
+    if id == g::ID_VK_IMPORT_SEMAPHORE_FD_KHR {
+        submit_nothing(gpu, device, &t, 0, object, 0)?;
+    } else {
+        submit_nothing(gpu, device, &t, 0, 0, object)?;
+    }
+    Ok(result(VK_SUCCESS))
 }
 
 /// `vkQueueSubmit`: each `VkSubmitInfo` (72 bytes) copied with its command buffers unwrapped.
@@ -494,7 +747,13 @@ fn queue_submit(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     const NAMES: &[&CStr] = &[c"vkQueueSubmit"];
     // SAFETY: the Vulkan signature; `infos` are VkSubmitInfos whose command buffers are host ones.
     let e: unsafe extern "system" fn(u64, u32, *const u8, u64) -> i32 = unsafe { f(&t, g::ID_VK_QUEUE_SUBMIT, NAMES)? };
-    Ok(result(unsafe { e(q, n, if n == 0 { std::ptr::null() } else { infos.as_ptr() }, a[3]) }))
+    let device = device_of_queue(gpu, q)?;
+    super::ahb::before_submit(gpu, device);
+    let r = unsafe { e(q, n, if n == 0 { std::ptr::null() } else { infos.as_ptr() }, a[3]) };
+    if r == VK_SUCCESS {
+        super::ahb::after_submit(gpu, &t, device, q)?;
+    }
+    Ok(result(r))
 }
 
 /// `vkQueueSubmit2`: each `VkSubmitInfo2` (64 bytes) copied, its `VkCommandBufferSubmitInfo`s
@@ -526,5 +785,11 @@ fn queue_submit2(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     const NAMES: &[&CStr] = &[c"vkQueueSubmit2", c"vkQueueSubmit2KHR"];
     // SAFETY: the Vulkan signature; the infos are VkSubmitInfo2s whose command buffers are host ones.
     let e: unsafe extern "system" fn(u64, u32, *const u8, u64) -> i32 = unsafe { f(&t, g::ID_VK_QUEUE_SUBMIT2, NAMES)? };
-    Ok(result(unsafe { e(q, n, if n == 0 { std::ptr::null() } else { infos.as_ptr() }, a[3]) }))
+    let device = device_of_queue(gpu, q)?;
+    super::ahb::before_submit(gpu, device);
+    let r = unsafe { e(q, n, if n == 0 { std::ptr::null() } else { infos.as_ptr() }, a[3]) };
+    if r == VK_SUCCESS {
+        super::ahb::after_submit(gpu, &t, device, q)?;
+    }
+    Ok(result(r))
 }

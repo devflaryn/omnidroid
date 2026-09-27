@@ -16,10 +16,12 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
-use crate::errno::{Errno, SysResult, EBADF, EINVAL, ENODEV, ENOSYS, ENOTTY};
+use crate::errno::{Errno, SysResult, EBADF, EINVAL, EIO, ENODEV, ENOSYS, ENOTTY};
 use crate::process::{Process, Task};
 
+pub(crate) mod ahb;
 pub(crate) mod generated;
+pub(crate) mod native;
 pub(crate) mod special;
 
 /// `_IOWR('G', 1, struct omni_gpu_call)`, a 32-byte argument.
@@ -38,6 +40,8 @@ pub(crate) enum CallError {
     Missing(&'static str),
     /// The host has no Vulkan at all.
     NoHost,
+    /// A host call made for the guest (not the guest's own) failed with this `VkResult`.
+    Host(i32),
 }
 
 impl CallError {
@@ -47,6 +51,7 @@ impl CallError {
             Self::Handle(_) => EBADF,
             Self::Missing(_) => ENOSYS,
             Self::NoHost => ENODEV,
+            Self::Host(_) => EIO,
         }
     }
 }
@@ -123,6 +128,13 @@ pub(crate) struct Object {
 pub struct Gpu {
     /// Dispatchable objects, by host handle.
     pub(crate) objects: Mutex<HashMap<u64, Object>>,
+    /// What the Android extensions need of each device, by host handle.
+    pub(crate) devices: Mutex<HashMap<u64, native::DeviceInfo>>,
+    /// Images on gralloc buffers (`VK_ANDROID_native_buffer`), by host handle.
+    pub(crate) native: Mutex<HashMap<u64, native::NativeImage>>,
+    /// Images made for imported gralloc buffers, and the imported memory (their mirrors).
+    pub(crate) ahb_images: Mutex<HashMap<u64, ahb::AhbImage>>,
+    pub(crate) ahb_memory: Mutex<HashMap<u64, ahb::AhbMemory>>,
 }
 
 impl Gpu {
@@ -158,6 +170,17 @@ impl Gpu {
     }
 }
 
+/// A host entry point of `table`, as function type `F`.
+///
+/// # Safety
+/// `F` must be the entry point's exact Vulkan signature.
+pub(crate) unsafe fn entry_point<F: Copy>(table: &Table, id: u32, names: &'static [&'static CStr]) -> Result<F, CallError> {
+    let p = table.get(id, names)?;
+    debug_assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<usize>());
+    // SAFETY: `p` is a non-null function address; the caller names its type.
+    Ok(unsafe { std::mem::transmute_copy(&p) })
+}
+
 /// The id of command `name` in the forwarding table (`vkCreateInstance`, ...).
 #[must_use]
 pub fn command_id(name: &str) -> Option<u32> {
@@ -177,8 +200,17 @@ pub fn ioctl(p: &Process, _t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> 
         return Err(EINVAL);
     }
     let args: Vec<u64> = p.mem.read(args_at, argc as usize * 8)?.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8"))).collect();
-    let result = if id >= special::ID_GRALLOC_USAGE { special::extra(gpu, p, id, &args) } else { generated::dispatch(gpu, p, id, &args) }
-        .map_err(CallError::errno)?;
+    // OMNI_GPU_TRACE=1: each command named before the host driver runs it.
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var("OMNI_GPU_TRACE").as_deref() == Ok("1")) {
+        let name = generated::COMMANDS.get(id as usize).map_or("(extra)", |c| c.0);
+        eprintln!("[gpu] {name} {args:x?}");
+    }
+    let answer = if id >= special::ID_GRALLOC_USAGE { special::extra(gpu, p, id, &args) } else { generated::dispatch(gpu, p, id, &args) };
+    if *TRACE.get().unwrap_or(&false) {
+        eprintln!("[gpu]   -> {answer:?}");
+    }
+    let result = answer.map_err(CallError::errno)?;
     p.mem.write(arg + 16, &result.to_le_bytes())?;
     Ok(0)
 }

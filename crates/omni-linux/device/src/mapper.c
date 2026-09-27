@@ -280,6 +280,11 @@ static const struct format_info* find_format(int32_t format) {
 #define HANDLE_NUM_INTS 14
 #define META_MAGIC 0x4d474d4fu    // 'OMGM'
 #define META_PAGE_SIZE 4096u
+// The region's content generation (D3a): a u64 every writer of the pixels bumps -- this mapper
+// when a CPU-write lock ends, the host after the GPU wrote them -- so the host GPU knows when its
+// copy of the pixels is stale.
+#define CONTENT_GENERATION_AT 4088u
+#define CPU_WRITE_MASK UINT64_C(0xF0)  // BufferUsage CPU_WRITE_MASK
 #define BLOB_MAX 1024u
 
 enum {  // indices into the ints (data[HANDLE_NUM_FDS + i])
@@ -335,7 +340,7 @@ _Static_assert(offsetof(struct omni_meta, cta861_3_present) == 300, "meta cta861
 _Static_assert(offsetof(struct omni_meta, cta861_3) == 304, "meta cta861_3 values");
 _Static_assert(offsetof(struct omni_meta, smpte2094_10) == 512, "meta smpte2094_10");
 _Static_assert(offsetof(struct omni_meta, smpte2094_40) == 2048, "meta smpte2094_40");
-_Static_assert(sizeof(struct omni_meta) <= META_PAGE_SIZE, "meta fits its page");
+_Static_assert(sizeof(struct omni_meta) <= CONTENT_GENERATION_AT, "meta ends before the content generation");
 
 // ---- The registry of imported buffers ---------------------------------------------------------
 
@@ -349,7 +354,8 @@ struct omni_buffer {
     uint32_t stride;
     uint32_t pixel_offset;
     uint64_t usage, id, pixel_bytes;
-    int locks;  // guarded by g_lock
+    int locks;          // guarded by g_lock
+    int writing_locks;  // of them, locked for CPU writing; guarded by g_lock
 };
 
 #define BUCKETS 64
@@ -902,6 +908,7 @@ static AIMapper_Error omni_lock(buffer_handle_t buffer, uint64_t cpuUsage, ARect
         err = AIMAPPER_ERROR_NO_RESOURCES;
     } else {
         b->locks++;
+        if (cpuUsage & CPU_WRITE_MASK) b->writing_locks++;
         *outData = b->base + b->pixel_offset;
     }
     pthread_mutex_unlock(&g_lock);
@@ -917,6 +924,11 @@ static AIMapper_Error omni_unlock(buffer_handle_t buffer, int* releaseFence) {
         err = AIMAPPER_ERROR_BAD_BUFFER;
     } else {
         b->locks--;
+        // The pixels may have changed: the host GPU's copy of them is stale.
+        if (b->writing_locks > 0) {
+            b->writing_locks--;
+            __atomic_fetch_add((uint64_t*)(void*)(b->base + CONTENT_GENERATION_AT), 1, __ATOMIC_SEQ_CST);
+        }
     }
     pthread_mutex_unlock(&g_lock);
     return err;

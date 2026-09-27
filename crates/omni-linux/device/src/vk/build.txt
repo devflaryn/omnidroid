@@ -2,7 +2,7 @@ vulkan.omni.so -- omnidroid's guest Vulkan driver (an hwvulkan HAL). Built on Wi
 NDK r28c, from crates/omni-linux/device/src/vk:
 
     python ../../../../../tools/gen_vk_forward.py        (regenerates generated.{c,h} and src/gpu/generated.rs)
-    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC -shared -fvisibility=hidden -Iinclude -I. -Wl,-soname,vulkan.omni.so -Wl,--as-needed -o ../../vendor/lib64/hw/vulkan.omni.so driver.c special.c generated.c -llog
+    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC -shared -fvisibility=hidden -Iinclude -I. -Wl,-soname,vulkan.omni.so -Wl,--as-needed -o ../../vendor/lib64/hw/vulkan.omni.so driver.c special.c generated.c -llog -ldl
 
 The binary is committed (the runtime never needs the NDK); ../../SHA256SUMS pins it.
 include/ holds AOSP's hardware/hardware.h, hardware/hwvulkan.h and vulkan/vk_android_native_buffer.h

@@ -16,9 +16,6 @@ pub struct SysState {
     pub uid: u32,
     start: Instant,
     actions: Mutex<[[u8; 32]; 65]>,
-    /// `PR_SET_TAGGED_ADDR_CTRL`'s value. Tagged pointers are accepted either way (see
-    /// `guest::untag`); this is what `PR_GET_TAGGED_ADDR_CTRL` reports back.
-    tagged_addr_ctrl: std::sync::atomic::AtomicU64,
     /// The file-creation mask (`umask`), 022 to start with as a shell's is.
     umask: std::sync::atomic::AtomicU32,
 }
@@ -26,7 +23,7 @@ pub struct SysState {
 impl SysState {
     #[must_use]
     pub fn new(pid: i32, uid: u32) -> Self {
-        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), tagged_addr_ctrl: std::sync::atomic::AtomicU64::new(0), umask: std::sync::atomic::AtomicU32::new(0o022) }
+        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), umask: std::sync::atomic::AtomicU32::new(0o022) }
     }
 
     /// Time since the process started.
@@ -191,8 +188,11 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         16 => { let mut n = t.name.clone(); n.resize(16, 0); p.mem.write(a[1], &n)?; Ok(0) } // PR_GET_NAME
-        55 => { p.sys.tagged_addr_ctrl.store(a[1], std::sync::atomic::Ordering::Relaxed); Ok(0) } // PR_SET_TAGGED_ADDR_CTRL
-        56 => Ok(p.sys.tagged_addr_ctrl.load(std::sync::atomic::Ordering::Relaxed)), // PR_GET_TAGGED_ADDR_CTRL
+        // PR_SET_TAGGED_ADDR_CTRL, PR_GET_TAGGED_ADDR_CTRL: a kernel without the tagged address ABI,
+        // so bionic keeps its heap untagged. Guest pointers inside structs reach the host's own
+        // code (the GPU driver, D3a), which cannot untag them; TBI in the CPU and `guest::untag` at
+        // the syscall boundary still make a tagged pointer work where one appears.
+        55 | 56 => Err(EINVAL),
         3 => Ok(1),                              // PR_GET_DUMPABLE
         4 | 38 | 0x59616d61 => Ok(0),            // PR_SET_DUMPABLE, PR_SET_NO_NEW_PRIVS, PR_SET_PTRACER
         39 => Ok(0),                             // PR_GET_NO_NEW_PRIVS

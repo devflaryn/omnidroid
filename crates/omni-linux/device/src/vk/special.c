@@ -4,6 +4,7 @@
  * crates/omni-linux/src/gpu/special.rs. */
 #include "driver.h"
 
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -221,10 +222,69 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateImage(VkDevice device, const VkImage
     return RESULT(OMNI_VK_ID_VK_CREATE_IMAGE, OMNI_U64(device), OMNI_U64(pCreateInfo), 0, OMNI_U64(pImage));
 }
 
+VKAPI_ATTR void VKAPI_CALL omni_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
+    (void)pAllocator;
+    CALL(OMNI_VK_ID_VK_DESTROY_IMAGE, OMNI_U64(device), OMNI_U64(image), 0);
+}
+
+/* The gralloc handle of an AHardwareBuffer: libnativewindow's AHardwareBuffer_getNativeHandle (an
+ * LLNDK function, not in the NDK's stub, so found at run time). */
+static const native_handle_t* (*g_get_native_handle)(const struct AHardwareBuffer*);
+static pthread_once_t g_get_native_handle_once = PTHREAD_ONCE_INIT;
+
+static void resolve_get_native_handle(void) {
+    void* lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_NOLOAD);
+    if (lib == NULL) lib = dlopen("libnativewindow.so", RTLD_NOW);
+    if (lib != NULL) g_get_native_handle = (const native_handle_t* (*)(const struct AHardwareBuffer*))dlsym(lib, "AHardwareBuffer_getNativeHandle");
+}
+
+static const native_handle_t* native_handle_of(const struct AHardwareBuffer* buffer) {
+    pthread_once(&g_get_native_handle_once, resolve_get_native_handle);
+    return g_get_native_handle != NULL && buffer != NULL ? g_get_native_handle(buffer) : NULL;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo,
                                                      const VkAllocationCallbacks* pAllocator, VkDeviceMemory* pMemory) {
     (void)pAllocator;
-    return RESULT(OMNI_VK_ID_VK_ALLOCATE_MEMORY, OMNI_U64(device), OMNI_U64(pAllocateInfo), 0, OMNI_U64(pMemory));
+    /* An import of a gralloc buffer passes the buffer's handle in the allocator's place (the host
+     * cannot read an AHardwareBuffer, which is libnativewindow's object). */
+    uint64_t handle = 0;
+    for (const VkBaseInStructure* s = pAllocateInfo->pNext; s != NULL; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID) {
+            handle = OMNI_U64(native_handle_of(((const VkImportAndroidHardwareBufferInfoANDROID*)s)->buffer));
+            if (handle == 0) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        }
+    }
+    return RESULT(OMNI_VK_ID_VK_ALLOCATE_MEMORY, OMNI_U64(device), OMNI_U64(pAllocateInfo), handle, OMNI_U64(pMemory));
+}
+
+VKAPI_ATTR void VKAPI_CALL omni_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator) {
+    (void)pAllocator;
+    CALL(OMNI_VK_ID_VK_FREE_MEMORY, OMNI_U64(device), OMNI_U64(memory), 0);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo,
+                                                      const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore) {
+    (void)pAllocator;
+    return RESULT(OMNI_VK_ID_VK_CREATE_SEMAPHORE, OMNI_U64(device), OMNI_U64(pCreateInfo), 0, OMNI_U64(pSemaphore));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
+                                                  VkFence* pFence) {
+    (void)pAllocator;
+    return RESULT(OMNI_VK_ID_VK_CREATE_FENCE, OMNI_U64(device), OMNI_U64(pCreateInfo), 0, OMNI_U64(pFence));
+}
+
+VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice physicalDevice,
+                                                                               const VkPhysicalDeviceExternalSemaphoreInfo* pInfo,
+                                                                               VkExternalSemaphoreProperties* pProperties) {
+    CALL(OMNI_VK_ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES, OMNI_U64(physicalDevice), OMNI_U64(pInfo), OMNI_U64(pProperties));
+}
+
+VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physicalDevice,
+                                                                           const VkPhysicalDeviceExternalFenceInfo* pInfo,
+                                                                           VkExternalFenceProperties* pProperties) {
+    CALL(OMNI_VK_ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES, OMNI_U64(physicalDevice), OMNI_U64(pInfo), OMNI_U64(pProperties));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset) {
@@ -237,7 +297,10 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkBindImageMemory2(VkDevice device, uint32_t
 
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetAndroidHardwareBufferPropertiesANDROID(VkDevice device, const struct AHardwareBuffer* buffer,
                                                                                 VkAndroidHardwareBufferPropertiesANDROID* pProperties) {
-    return RESULT(OMNI_VK_ID_VK_GET_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, OMNI_U64(device), OMNI_U64(buffer), OMNI_U64(pProperties));
+    /* The host is given the buffer's gralloc handle, not the AHardwareBuffer. */
+    const native_handle_t* handle = native_handle_of(buffer);
+    if (handle == NULL) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    return RESULT(OMNI_VK_ID_VK_GET_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID, OMNI_U64(device), OMNI_U64(handle), OMNI_U64(pProperties));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetMemoryAndroidHardwareBufferANDROID(VkDevice device,

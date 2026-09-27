@@ -2077,16 +2077,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateEvent(VkDevice device, const 
     return (VkResult)(int32_t)(uint32_t)omni_r;
 }
 
-static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFence* pFence) {
-    uint64_t omni_a[4];
-    omni_a[0] = (uint64_t)(uintptr_t)device;
-    omni_a[1] = (uint64_t)(uintptr_t)pCreateInfo;
-    omni_a[2] = (uint64_t)(uintptr_t)pAllocator;
-    omni_a[3] = (uint64_t)(uintptr_t)pFence;
-    uint64_t omni_r = omni_vk_call(OMNI_VK_ID_VK_CREATE_FENCE, omni_a, 4);
-    return (VkResult)(int32_t)(uint32_t)omni_r;
-}
-
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFramebuffer* pFramebuffer) {
     uint64_t omni_a[4];
     omni_a[0] = (uint64_t)(uintptr_t)device;
@@ -2251,16 +2241,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateSamplerYcbcrConversion(VkDevi
     omni_a[2] = (uint64_t)(uintptr_t)pAllocator;
     omni_a[3] = (uint64_t)(uintptr_t)pYcbcrConversion;
     uint64_t omni_r = omni_vk_call(OMNI_VK_ID_VK_CREATE_SAMPLER_YCBCR_CONVERSION, omni_a, 4);
-    return (VkResult)(int32_t)(uint32_t)omni_r;
-}
-
-static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore) {
-    uint64_t omni_a[4];
-    omni_a[0] = (uint64_t)(uintptr_t)device;
-    omni_a[1] = (uint64_t)(uintptr_t)pCreateInfo;
-    omni_a[2] = (uint64_t)(uintptr_t)pAllocator;
-    omni_a[3] = (uint64_t)(uintptr_t)pSemaphore;
-    uint64_t omni_r = omni_vk_call(OMNI_VK_ID_VK_CREATE_SEMAPHORE, omni_a, 4);
     return (VkResult)(int32_t)(uint32_t)omni_r;
 }
 
@@ -2433,14 +2413,6 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkDestroyFramebuffer(VkDevice device, VkF
     omni_a[1] = (uint64_t)(uintptr_t)framebuffer;
     omni_a[2] = (uint64_t)(uintptr_t)pAllocator;
     (void)omni_vk_call(OMNI_VK_ID_VK_DESTROY_FRAMEBUFFER, omni_a, 3);
-}
-
-static VKAPI_ATTR void VKAPI_CALL omni_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
-    uint64_t omni_a[3];
-    omni_a[0] = (uint64_t)(uintptr_t)device;
-    omni_a[1] = (uint64_t)(uintptr_t)image;
-    omni_a[2] = (uint64_t)(uintptr_t)pAllocator;
-    (void)omni_vk_call(OMNI_VK_ID_VK_DESTROY_IMAGE, omni_a, 3);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkDestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator) {
@@ -2629,14 +2601,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkFreeDescriptorSets(VkDevice device,
     omni_a[3] = (uint64_t)(uintptr_t)pDescriptorSets;
     uint64_t omni_r = omni_vk_call(OMNI_VK_ID_VK_FREE_DESCRIPTOR_SETS, omni_a, 4);
     return (VkResult)(int32_t)(uint32_t)omni_r;
-}
-
-static VKAPI_ATTR void VKAPI_CALL omni_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* pAllocator) {
-    uint64_t omni_a[3];
-    omni_a[0] = (uint64_t)(uintptr_t)device;
-    omni_a[1] = (uint64_t)(uintptr_t)memory;
-    omni_a[2] = (uint64_t)(uintptr_t)pAllocator;
-    (void)omni_vk_call(OMNI_VK_ID_VK_FREE_MEMORY, omni_a, 3);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkGetAccelerationStructureBuildSizesKHR(VkDevice device, VkAccelerationStructureBuildTypeKHR buildType, const VkAccelerationStructureBuildGeometryInfoKHR* pBuildInfo, const uint32_t* pMaxPrimitiveCounts, VkAccelerationStructureBuildSizesInfoKHR* pSizeInfo) {
@@ -3098,14 +3062,6 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceExternalBufferProperti
     (void)omni_vk_call(OMNI_VK_ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_BUFFER_PROPERTIES, omni_a, 3);
 }
 
-static VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalFenceInfo* pExternalFenceInfo, VkExternalFenceProperties* pExternalFenceProperties) {
-    uint64_t omni_a[3];
-    omni_a[0] = (uint64_t)(uintptr_t)physicalDevice;
-    omni_a[1] = (uint64_t)(uintptr_t)pExternalFenceInfo;
-    omni_a[2] = (uint64_t)(uintptr_t)pExternalFenceProperties;
-    (void)omni_vk_call(OMNI_VK_ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_FENCE_PROPERTIES, omni_a, 3);
-}
-
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetPhysicalDeviceExternalImageFormatPropertiesNV(VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkExternalMemoryHandleTypeFlagsNV externalHandleType, VkExternalImageFormatPropertiesNV* pExternalImageFormatProperties) {
     uint64_t omni_a[8];
     omni_a[0] = (uint64_t)(uintptr_t)physicalDevice;
@@ -3118,14 +3074,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkGetPhysicalDeviceExternalImageForma
     omni_a[7] = (uint64_t)(uintptr_t)pExternalImageFormatProperties;
     uint64_t omni_r = omni_vk_call(OMNI_VK_ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_PROPERTIES_NV, omni_a, 8);
     return (VkResult)(int32_t)(uint32_t)omni_r;
-}
-
-static VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalSemaphoreInfo* pExternalSemaphoreInfo, VkExternalSemaphoreProperties* pExternalSemaphoreProperties) {
-    uint64_t omni_a[3];
-    omni_a[0] = (uint64_t)(uintptr_t)physicalDevice;
-    omni_a[1] = (uint64_t)(uintptr_t)pExternalSemaphoreInfo;
-    omni_a[2] = (uint64_t)(uintptr_t)pExternalSemaphoreProperties;
-    (void)omni_vk_call(OMNI_VK_ID_VK_GET_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_PROPERTIES, omni_a, 3);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures* pFeatures) {
