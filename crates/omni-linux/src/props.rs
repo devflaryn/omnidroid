@@ -30,10 +30,11 @@ const BUILD_PROPS: [&str; 3] = ["/system/build.prop", "/system_ext/etc/build.pro
 
 /// What omnidroid, as the vendor, sets on top.
 const OVERLAY: [(&str, &str); 10] = [
-    // The runtime this device offers (AndroidRuntime turns these into ART's -Xgc: and -Xusejit:):
-    // CMC, the collector the boot image is compiled for, in its userfaultfd-less fallback mode;
-    // no JIT until its code cache (memfd, a writable and an executable view) is supported.
-    ("dalvik.vm.gctype", "CMC"),
+    // The runtime this device offers, as the options AndroidRuntime adds from
+    // dalvik.vm.extra-opts: CMC, the collector the boot image is compiled for, in its
+    // userfaultfd-less fallback mode; no JIT until its code cache (memfd, a writable and an
+    // executable view) is supported.
+    ("dalvik.vm.extra-opts", "-Xgc:CMC -Xusejit:false"),
     ("dalvik.vm.usejit", "false"),
     ("ro.product.cpu.abi", "arm64-v8a"),
     ("ro.product.cpu.abilist", "arm64-v8a"),
