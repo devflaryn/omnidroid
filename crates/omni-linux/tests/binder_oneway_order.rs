@@ -37,6 +37,12 @@ impl Guest {
         assert!((fd as i64) >= 0, "open /dev/binder: {}", fd as i64);
         let area = p.syscall(&mut t, nr::MMAP, [0, 1 << 18, 1, 2, fd, 0]);
         assert!((area as i64) > 0, "mmap: {}", area as i64);
+        // A thread of the binder thread pool (BC_ENTER_LOOPER): only a looper takes its process's work.
+        let (bwr, wbuf) = (s + 0x100, s + 0x1000);
+        p.mem.write(wbuf, &0x630cu32.to_le_bytes()).unwrap();
+        let b: Vec<u8> = [4u64, 0, wbuf, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        p.mem.write(bwr, &b).unwrap();
+        assert_eq!(p.syscall(&mut t, nr::IOCTL, [fd, BINDER_WRITE_READ, bwr, 0, 0, 0]), 0);
         Self { p, t, fd, s }
     }
 

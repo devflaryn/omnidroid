@@ -193,8 +193,12 @@ struct SgBuffer {
 enum Work {
     Txn(Box<Txn>),
     Complete,
+    /// A sync transaction this thread waits on failed: the wait is over.
     DeadReply,
     FailedReply,
+    /// A transaction this thread could not send (the kernel's `thread->return_error`): read as
+    /// `cmd`, and no wait ends -- the thread never began one.
+    ReturnError(u32),
     Increfs { ptr: u64, cookie: u64 },
     Acquire { ptr: u64, cookie: u64 },
     Release { ptr: u64, cookie: u64 },
@@ -206,7 +210,11 @@ enum Work {
 #[derive(Default)]
 struct ThreadState {
     todo: VecDeque<Work>,
+    /// `BC_ENTER_LOOPER` or `BC_REGISTER_LOOPER` came: the thread may take its process's work.
+    /// The kernel never clears it (`BC_EXIT_LOOPER` adds `exited`).
     looper: bool,
+    /// `BC_EXIT_LOOPER` came: no longer counted as a looper of the thread pool.
+    exited: bool,
     /// Transactions this thread is serving, innermost last: whom each reply goes to.
     serving: Vec<Option<(ProcId, i32)>>,
     /// Sync transactions this thread sent and waits on the reply of.
@@ -552,7 +560,7 @@ impl Broker {
             let work = st.proc_mut(HOST).threads.entry(tid).or_default().todo.pop_front();
             match work {
                 Some(Work::Txn(r)) if r.reply => break Ok(r.data),
-                Some(Work::DeadReply | Work::FailedReply) => break Err(EPIPE),
+                Some(Work::DeadReply | Work::FailedReply | Work::ReturnError(_)) => break Err(EPIPE),
                 Some(_) => continue,
                 None if Instant::now() >= deadline => break Err(ETIMEDOUT),
                 None => {
@@ -1019,7 +1027,7 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                         st.queue(proc, Some(tid), Work::FailedReply);
                     }
                 } else {
-                    st.queue(file.id, Some(t.tid), Work::FailedReply);
+                    st.queue(file.id, Some(t.tid), Work::ReturnError(BR_FAILED_REPLY));
                 }
                 return Err(Failed::Transaction(4 + size));
             }
@@ -1050,16 +1058,21 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         }
         BC_EXIT_LOOPER => {
             let mut st = file.broker.state.lock();
-            st.proc_mut(file.id).threads.entry(t.tid).or_default().looper = false;
+            st.proc_mut(file.id).threads.entry(t.tid).or_default().exited = true;
         }
         BC_REQUEST_DEATH_NOTIFICATION | BC_CLEAR_DEATH_NOTIFICATION => {
             let (handle, cookie) = (u32_at(arg, 0), u64_at(arg, 4));
             let mut st = file.broker.state.lock();
+            // The kernel's: the answer goes to this thread when it is a looper, else to the
+            // process (a thread that only writes, as `unlinkToDeath`'s `flushCommands`, would
+            // never read it).
+            let looper = st.proc_mut(file.id).threads.get(&t.tid).is_some_and(|th| th.looper);
+            let to = looper.then_some(t.tid);
             if let Some(node) = st.node_for_handle(file.id, handle) {
                 if code == BC_REQUEST_DEATH_NOTIFICATION {
                     let dead = st.nodes.get(&node).is_none_or(|n| n.dead);
                     if dead {
-                        st.queue(file.id, None, Work::DeadBinder { cookie });
+                        st.queue(file.id, to, Work::DeadBinder { cookie });
                     } else if let Some(n) = st.nodes.get_mut(&node) {
                         n.watchers.push((file.id, cookie));
                     }
@@ -1067,7 +1080,7 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                     if let Some(n) = st.nodes.get_mut(&node) {
                         n.watchers.retain(|w| *w != (file.id, cookie));
                     }
-                    st.queue(file.id, Some(t.tid), Work::ClearDeathDone { cookie });
+                    st.queue(file.id, to, Work::ClearDeathDone { cookie });
                 }
             }
         }
@@ -1104,13 +1117,15 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         };
         (proc, Some(tid), 0, 0, false, None)
     } else {
+        // The kernel's answers: no context manager is BR_DEAD_REPLY, a handle the process does
+        // not have BR_FAILED_REPLY, a dead node BR_DEAD_REPLY.
         let Some(node) = st.node_for_handle(file.id, handle) else {
-            st.queue(file.id, Some(t.tid), Work::DeadReply);
+            st.queue(file.id, Some(t.tid), Work::ReturnError(if handle == 0 { BR_DEAD_REPLY } else { BR_FAILED_REPLY }));
             return Ok(());
         };
         let n = st.nodes.get(&node).expect("a node");
         if n.dead {
-            st.queue(file.id, Some(t.tid), Work::DeadReply);
+            st.queue(file.id, Some(t.tid), Work::ReturnError(BR_DEAD_REPLY));
             return Ok(());
         }
         let (owner, ptr, cookie, sec) = (n.owner, n.ptr, n.cookie, n.txn_security_ctx);
@@ -1218,17 +1233,12 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         async_node: None,
     };
     let mut txn = txn;
-    if !reply && !oneway {
-        st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
-    }
     if !reply && target_proc == HOST {
         // A host service answers on a host thread of its own, while the sender waits in `read`
         // as it would for any process: a handler may take time, and may call back into the
         // sender, which the waiting thread then serves. The sender hears its transaction went,
-        // then the reply, as the kernel orders them.
+        // then the reply, as the kernel orders them (the handler's reply waits for the lock).
         let handler = st.host_services.get(&target_ptr).cloned();
-        st.queue(file.id, Some(t.tid), Work::Complete);
-        drop(st);
         let handles = txn
             .offsets
             .iter()
@@ -1262,12 +1272,22 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
                 }
             })
             .map_err(|_| ENOMEM)?;
+        if !oneway {
+            st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
+        }
+        st.queue(file.id, Some(t.tid), Work::Complete);
         return Ok(());
     }
     let dead = st.procs.get(&target_proc).is_none_or(|pr| pr.dead);
     if dead {
-        st.queue(file.id, Some(t.tid), if reply { Work::FailedReply } else { Work::DeadReply });
+        // The kernel's: a transaction to a dead process fails as the sender's BR_DEAD_REPLY; a
+        // reply to a caller gone completes for the replier.
+        st.queue(file.id, Some(t.tid), if reply { Work::Complete } else { Work::ReturnError(BR_DEAD_REPLY) });
         return Ok(());
+    }
+    // A sync transaction: the sender now waits for its reply (the kernel's transaction_stack).
+    if !reply && !oneway {
+        st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
     }
     // A oneway transaction waits while one to the same node is out, as the driver orders them.
     if oneway {
@@ -1308,9 +1328,11 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
             let proc = st.proc_mut(file.id);
             let thread = proc.threads.entry(t.tid).or_default();
             let own = thread.todo.pop_front();
-            // A thread waiting for a reply takes only its own work; an idle looper also the
-            // process's.
-            let may_take_proc = thread.awaiting == 0 && thread.serving.is_empty();
+            // The kernel's `binder_available_for_proc_work_ilocked`: only a looper
+            // (BC_ENTER_LOOPER/BC_REGISTER_LOOPER) with no transaction on its stack -- neither
+            // waiting for a reply nor serving a call -- and nothing of its own takes the
+            // process's work. A thread waiting for a reply is never handed a oneway.
+            let may_take_proc = thread.looper && thread.awaiting == 0 && thread.serving.is_empty();
             let looper = thread.looper;
             match own {
                 Some(w) => Some(w),
@@ -1318,7 +1340,7 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
                     let w = proc.todo.pop_front();
                     // Ask for another looper when this one takes the last idle slot.
                     if w.is_some() && looper && proc.spawn_requested == 0 {
-                        let loopers = proc.threads.values().filter(|th| th.looper).count() as u32;
+                        let loopers = proc.threads.values().filter(|th| th.looper && !th.exited).count() as u32;
                         if loopers < proc.max_threads + 1 {
                             proc.spawn_requested += 1;
                             out.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
@@ -1363,6 +1385,7 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
     };
     match work {
         Work::Complete => put(BR_TRANSACTION_COMPLETE, &[]),
+        Work::ReturnError(cmd) => put(cmd, &[]),
         Work::DeadReply => {
             end_wait(file, t.tid);
             put(BR_DEAD_REPLY, &[]);
