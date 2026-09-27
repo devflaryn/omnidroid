@@ -14,7 +14,7 @@ fn mem() -> (GuestMem, u64, u64) {
         .map_anonymous(Placement::Anywhere { align: page }, page, Protection::ReadWrite, CommitPolicy::Eager)
         .expect("ro");
     space.protect(ro, page, Protection::Read).expect("read-only");
-    (GuestMem::new(space), rw as u64, ro as u64)
+    (GuestMem::new(space, Default::default()), rw as u64, ro as u64)
 }
 
 #[test]

@@ -132,3 +132,35 @@ fn an_alternate_stack_at_the_top_of_memory_does_not_panic() {
     let _ = signal::placement(0x1000, alt, true);
     let _ = signal::placement(u64::MAX - 5, alt, true);
 }
+
+/// Important 7: a syscall copying into guest memory while another thread unmaps it answers EFAULT
+/// or succeeds -- never a host access violation.
+#[test]
+fn a_copy_racing_munmap_is_efault_not_a_host_crash() {
+    let (p, s) = process();
+    let page = p.mm.page_size();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut t = Task::new(2008, Arc::clone(&p));
+    let at = p.syscall(&mut t, nr::MMAP, [0, page, 3, 0x22, u64::MAX, 0]);
+    assert!((at as i64) > 0);
+    let unmapper = {
+        let (p, stop) = (Arc::clone(&p), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut t = Task::new(2009, Arc::clone(&p));
+            while !stop.load(Ordering::Relaxed) {
+                p.syscall(&mut t, nr::MUNMAP, [at, page, 0, 0, 0, 0]);
+                p.syscall(&mut t, nr::MMAP, [at, page, 3, 0x32, u64::MAX, 0]); // MAP_FIXED
+                p.syscall(&mut t, nr::MADVISE, [at, page, 4, 0, 0, 0]); // MADV_DONTNEED
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        // clock_gettime writes 16 bytes through the guest pointer.
+        let r = p.syscall(&mut t, nr::CLOCK_GETTIME, [1, at + page - 16, 0, 0, 0, 0]) as i64;
+        assert!(r == 0 || r == -14, "{r}");
+        let _ = s;
+    }
+    stop.store(true, Ordering::Relaxed);
+    unmapper.join().unwrap();
+}

@@ -16,14 +16,21 @@ pub const fn untag(addr: u64) -> u64 {
     addr & 0x00FF_FFFF_FFFF_FFFF
 }
 
+/// The lock on the space's layout. A copy holds it shared from its check to its last byte;
+/// `mmap`, `munmap`, `mprotect` and `madvise` hold it exclusively. Without it a copy could pass its
+/// check and then touch a page another thread had just unmapped: a host access violation (A2-A5
+/// review, Important 7).
+pub type Layout = Arc<parking_lot::RwLock<()>>;
+
 pub struct GuestMem {
     space: Arc<GuestSpace>,
+    layout: Layout,
 }
 
 impl GuestMem {
     #[must_use]
-    pub fn new(space: Arc<GuestSpace>) -> Self {
-        Self { space }
+    pub fn new(space: Arc<GuestSpace>, layout: Layout) -> Self {
+        Self { space, layout }
     }
 
     #[must_use]
@@ -61,6 +68,7 @@ impl GuestMem {
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        let _layout = self.layout.read();
         let ptr = self.check(addr, len, false)?;
         let mut out = vec![0u8; len];
         if len != 0 {
@@ -71,6 +79,13 @@ impl GuestMem {
     }
 
     pub fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+        let _layout = self.layout.read();
+        self.write_holding_layout(addr, bytes)
+    }
+
+    /// `write`, for a caller that already holds the layout lock exclusively (`mmap` filling the
+    /// private copy it just made).
+    pub(crate) fn write_holding_layout(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
         let ptr = self.check(addr, bytes.len(), true)?;
         if !bytes.is_empty() {
             // SAFETY: `check` proved the range mapped, writable and committed.

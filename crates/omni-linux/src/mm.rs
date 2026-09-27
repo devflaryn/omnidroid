@@ -42,8 +42,9 @@ pub struct Mm {
     /// on Apple silicon). The guest is told it (`AT_PAGESZ`), as a 16 KiB Android 15 device tells
     /// its processes, so every mapping, protection and unmapping it asks for is whole host pages.
     page: u64,
-    /// `MAP_FIXED`'s unmap-then-map must not interleave with another thread's mapping.
-    lock: Mutex<()>,
+    /// The layout lock, held exclusively for every change: `MAP_FIXED`'s unmap-then-map must not
+    /// interleave with another thread's mapping, nor any change with a syscall's copy.
+    lock: crate::guest::Layout,
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
 }
 
@@ -60,9 +61,9 @@ fn protection(prot: u32) -> Result<Protection, Errno> {
 
 impl Mm {
     #[must_use]
-    pub fn new(space: Arc<GuestSpace>) -> Self {
+    pub fn new(space: Arc<GuestSpace>, lock: crate::guest::Layout) -> Self {
         let page = space.page_size() as u64;
-        Self { space, page, lock: Mutex::new(()), files: Mutex::default() }
+        Self { space, page, lock, files: Mutex::default() }
     }
 
     /// The page size the guest is told and every `mmap`, `mprotect` and `munmap` is exact at.
@@ -140,7 +141,7 @@ impl Mm {
         if addr % self.page != 0 || len == 0 {
             return Err(EINVAL);
         }
-        let _g = self.lock.lock();
+        let _g = self.lock.write();
         let len = self.span(addr, len).ok_or(EINVAL)?;
         self.unmap_locked(addr, len)
     }
@@ -155,7 +156,14 @@ impl Mm {
         if len == 0 {
             return Ok(());
         }
+        let _g = self.lock.write();
         self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)
+    }
+
+    /// `MADV_DONTNEED`: the range reads as zeros again.
+    pub fn discard(&self, addr: u64, len: u64) -> Result<(), Errno> {
+        let _g = self.lock.write();
+        self.space.discard(addr as usize, len as usize).map(|_| ()).map_err(|_| EINVAL)
     }
 
     pub fn map(&self, p: &Process, t: &Task, req: MapRequest) -> Result<u64, Errno> {
@@ -178,7 +186,7 @@ impl Mm {
         } else {
             Placement::Anywhere { align: page }
         };
-        let _g = self.lock.lock();
+        let _g = self.lock.write();
         if req.flags & MAP_FIXED != 0 {
             self.unmap_locked(req.addr, len)?;
         }
@@ -202,7 +210,7 @@ impl Mm {
                 .map_err(|_| refused_fixed(ENOMEM))? as u64;
             let from = (req.offset as usize).min(data.len());
             let n = (len as usize).min(data.len() - from);
-            p.mem.write(at, &data[from..from + n])?;
+            p.mem.write_holding_layout(at, &data[from..from + n])?;
             if prot != Protection::ReadWrite {
                 self.space.protect(at as usize, len as usize, prot).map_err(|_| ENOMEM)?;
             }
@@ -254,7 +262,7 @@ impl Mm {
                     .map_err(|_| refused_fixed(ENOMEM))? as u64;
                 let mut buf = vec![0u8; in_file.min(file_len - req.offset.min(file_len)) as usize];
                 let n = crate::fd::pread_all(&file, &mut buf, req.offset)?;
-                p.mem.write(a, &buf[..n])?;
+                p.mem.write_holding_layout(a, &buf[..n])?;
                 if prot != Protection::ReadWrite {
                     self.space.protect(a as usize, len as usize, prot).map_err(|_| ENOMEM)?;
                 }
@@ -282,7 +290,7 @@ fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if a[2] == MADV_DONTNEED {
         let addr = crate::guest::untag(a[0]);
         let len = p.mm.span(addr, a[1]).ok_or(EINVAL)?;
-        p.mem.space().discard(addr as usize, len as usize).map_err(|_| EINVAL)?;
+        p.mm.discard(addr, len)?;
     }
     Ok(0)
 }
@@ -329,7 +337,7 @@ fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let prot = region.protection;
     let keep = old_len.min(new_len);
     if prot == Protection::None || prot == Protection::ReadExecute {
-        space.protect(old as usize, keep as usize, Protection::Read).map_err(|_| EFAULT)?;
+        p.mm.protect(old, keep, PROT_READ).map_err(|_| EFAULT)?;
     }
     let bytes = p.mem.read(old, keep as usize)?;
     let flags = 0x22 | if fixed { MAP_FIXED } else { 0 }; // MAP_PRIVATE | MAP_ANONYMOUS

@@ -184,14 +184,15 @@ impl Process {
         let comm = argv.first().map_or_else(Vec::new, |a| {
             a.rsplit(|&b| b == b'/').next().unwrap_or(a).iter().copied().take(15).collect()
         });
+        let layout = crate::guest::Layout::default();
         let p = Arc::new(Self {
-            mem: GuestMem::new(Arc::clone(&space)),
+            mem: GuestMem::new(Arc::clone(&space), Arc::clone(&layout)),
             table,
             refusals: Refusals::default(),
             vfs,
             fds: FdTable::standard(stdout, stderr),
             cwd: Mutex::new(b"/".to_vec()),
-            mm: Mm::new(space),
+            mm: Mm::new(space, layout),
             sys: SysState::new(PID, UID),
             futexes: crate::futex::Futexes::default(),
             tasks: Mutex::new(std::collections::HashMap::new()),
