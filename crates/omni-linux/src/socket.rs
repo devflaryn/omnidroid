@@ -3,6 +3,10 @@
 //! the framework log -- an abort's reason above all -- is seen. Every other address is refused at
 //! `connect` as it is on a device where that service is not running, and the caller takes its
 //! no-service path.
+//!
+//! `socketpair(AF_UNIX)` makes two connected ends ([`PairChannel`]): SurfaceFlinger's `BitTube`
+//! (vsync events) and an app's `InputChannel` (input) -- ends that are passed to other processes
+//! over binder, so the channel is shared, not owned by a process.
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -20,8 +24,19 @@ const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 
+/// The two directions of a socket pair: what each end has been sent, and whether each is open.
+pub struct PairChannel {
+    /// `queues[side]`: what `side` has been sent (one entry a message; a stream's are merged).
+    queues: Mutex<[std::collections::VecDeque<Vec<u8>>; 2]>,
+    open: [std::sync::atomic::AtomicBool; 2],
+    /// `SOCK_STREAM`: bytes; otherwise (`SOCK_SEQPACKET`, `SOCK_DGRAM`) whole messages.
+    stream: bool,
+}
+
 /// What a connected socket talks to.
 pub enum Peer {
+    /// The other end of a socket pair.
+    Pair { channel: Arc<PairChannel>, side: usize },
     /// `logd`: packets are printed to this output.
     Logd(Output),
     /// init's property service: `setprop` requests, answered one `u32` each.
@@ -93,10 +108,29 @@ pub fn format_log(packet: &[u8]) -> Option<String> {
     Some(out)
 }
 
+impl Drop for Socket {
+    /// The last descriptor of an end is closed: the other end is hung up.
+    fn drop(&mut self) {
+        if let Some(Peer::Pair { channel, side }) = &self.peer {
+            channel.open[*side].store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::poll::notify();
+        }
+    }
+}
+
 /// Deliver `bytes` to a connected socket's peer.
 pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
     let Socket { peer, inbox, .. } = socket;
     match peer {
+        Some(Peer::Pair { channel, side }) => {
+            let other = 1 - *side;
+            if !channel.open[other].load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::errno::EPIPE);
+            }
+            channel.queues.lock()[other].push_back(bytes.to_vec());
+            crate::poll::notify();
+            Ok(bytes.len())
+        }
         Some(Peer::PropertyService { pending, service }) => {
             pending.extend_from_slice(bytes);
             let service = std::sync::Arc::clone(service);
@@ -206,8 +240,35 @@ fn sys_shutdown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     sys_setsockopt(p, _t, a)
 }
 
-/// Take what the peer sent back: all of it that fits, or `EAGAIN` when nothing is there.
+/// Take what the peer sent back: all of it that fits, or `EAGAIN` when nothing is there. From a
+/// socket pair: one message (the rest of it discarded, as a datagram's is) or a stream's bytes;
+/// end of file (0) once the other end is closed and nothing is left.
 pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
+    if let Some(Peer::Pair { channel, side }) = &socket.peer {
+        let mut queues = channel.queues.lock();
+        let q = &mut queues[*side];
+        if q.is_empty() {
+            return if channel.open[1 - *side].load(std::sync::atomic::Ordering::SeqCst) { Err(crate::errno::EAGAIN) } else { Ok(0) };
+        }
+        if !channel.stream {
+            let msg = q.pop_front().expect("not empty");
+            let n = msg.len().min(buf.len());
+            buf[..n].copy_from_slice(&msg[..n]);
+            return Ok(n);
+        }
+        let mut n = 0;
+        while n < buf.len() {
+            let Some(front) = q.front_mut() else { break };
+            let take = front.len().min(buf.len() - n);
+            buf[n..n + take].copy_from_slice(&front[..take]);
+            front.drain(..take);
+            if front.is_empty() {
+                q.pop_front();
+            }
+            n += take;
+        }
+        return Ok(n);
+    }
     if socket.inbox.is_empty() {
         return Err(crate::errno::EAGAIN);
     }
@@ -253,20 +314,125 @@ fn sys_getsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     write(&0u32.to_le_bytes())
 }
 
-fn sys_recvfrom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+/// `MSG_DONTWAIT`.
+const MSG_DONTWAIT: u64 = 0x40;
+
+fn sys_recvfrom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let mut buf = vec![0u8; (a[2] as usize).min(1 << 20)];
-    let n = {
-        let mut kind = file.kind.lock();
-        let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
-        receive(socket, &mut buf)?
-    };
+    let n = receive_waiting(&file, &mut buf, a[3] & MSG_DONTWAIT != 0, t)?;
     p.mem.write(a[1], &buf[..n])?;
+    Ok(n as u64)
+}
+
+/// Receive from `file`, waiting (unless it or the call is non-blocking) while a socket pair's end
+/// has nothing to read and its other end is open.
+fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) -> Result<usize, Errno> {
+    loop {
+        let seen = crate::poll::generation();
+        let (r, pair) = {
+            let mut kind = file.kind.lock();
+            let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
+            (receive(socket, buf), matches!(socket.peer, Some(Peer::Pair { .. })))
+        };
+        let nonblocking = dontwait || *file.flags.lock() & 0o4000 != 0;
+        match r {
+            Err(e) if e == crate::errno::EAGAIN && pair && !nonblocking => crate::poll::wait_for_change(seen, None, t)?,
+            other => return other,
+        }
+    }
+}
+
+/// `read` of a socket pair's end (which may wait); `None` for anything else.
+pub fn read(file: &OpenFile, buf: &mut [u8], t: &Task) -> Option<Result<usize, Errno>> {
+    let pair = matches!(&*file.kind.lock(), FileKind::Socket(Socket { peer: Some(Peer::Pair { .. }), .. }));
+    pair.then(|| receive_waiting(file, buf, false, t))
+}
+
+/// What a socket is ready for: a pair's end is readable with something queued, writable while the
+/// other end is open, and hung up (readable, `POLLHUP`) when it is closed.
+#[must_use]
+pub fn readiness(socket: &Socket) -> u32 {
+    const IN: u32 = 0x1;
+    const OUT: u32 = 0x4;
+    const HUP: u32 = 0x10;
+    match &socket.peer {
+        Some(Peer::Pair { channel, side }) => {
+            let queued = !channel.queues.lock()[*side].is_empty();
+            let other_open = channel.open[1 - *side].load(std::sync::atomic::Ordering::SeqCst);
+            (if queued { IN } else { 0 }) | if other_open { OUT } else { IN | HUP }
+        }
+        _ => (if socket.inbox.is_empty() { 0 } else { IN }) | OUT,
+    }
+}
+
+/// `socketpair(AF_UNIX, type, 0, sv)`.
+fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let (domain, ty) = (a[0], a[1]);
+    if domain != AF_UNIX {
+        return Err(EAFNOSUPPORT);
+    }
+    const SOCK_DGRAM: u64 = 2;
+    const SOCK_SEQPACKET: u64 = 5;
+    let kind = ty & SOCK_TYPE_MASK;
+    if !matches!(kind, 1 | SOCK_DGRAM | SOCK_SEQPACKET) {
+        return Err(EINVAL);
+    }
+    let channel = Arc::new(PairChannel {
+        queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
+        open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
+        stream: kind == 1,
+    });
+    let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
+    let mut fds = [0i32; 2];
+    for (side, fd) in fds.iter_mut().enumerate() {
+        let socket = Socket { domain, ty: kind, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side }), inbox: std::collections::VecDeque::new() };
+        let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
+        *fd = p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)?;
+    }
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&fds[0].to_le_bytes());
+    out[4..8].copy_from_slice(&fds[1].to_le_bytes());
+    p.mem.write(a[3], &out)?;
+    Ok(0)
+}
+
+/// `recvmsg`: into the message's iovecs, no control data (nothing here passes descriptors over a
+/// socket).
+fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let (iov, iovlen) = (p.mem.read_u64(a[1] + 16)?, p.mem.read_u64(a[1] + 24)?);
+    if iovlen > 1024 {
+        return Err(EINVAL);
+    }
+    let mut spans = Vec::new();
+    let mut total = 0usize;
+    for i in 0..iovlen {
+        let (base, len) = (p.mem.read_u64(iov + i * 16)?, p.mem.read_u64(iov + i * 16 + 8)? as usize);
+        spans.push((base, len));
+        total = total.saturating_add(len);
+    }
+    let mut buf = vec![0u8; total.min(1 << 20)];
+    let n = receive_waiting(&file, &mut buf, a[2] & MSG_DONTWAIT != 0, t)?;
+    let mut at = 0;
+    for (base, len) in spans {
+        if at >= n {
+            break;
+        }
+        let k = len.min(n - at);
+        p.mem.write(base, &buf[at..at + k])?;
+        at += k;
+    }
+    // No control data; msg_flags 0.
+    p.mem.write(a[1] + 40, &0u64.to_le_bytes())?;
+    p.mem.write(a[1] + 48, &0u32.to_le_bytes())?;
     Ok(n as u64)
 }
 
 pub fn install(table: &mut Table) {
     table.set(nr::RECVFROM, sys_recvfrom);
+    table.set(nr::RECVMSG, sys_recvmsg);
+    table.set(nr::SOCKETPAIR, sys_socketpair);
     table.set(nr::SOCKET, sys_socket);
     table.set(nr::GETSOCKOPT, sys_getsockopt);
     table.set(nr::CONNECT, sys_connect);

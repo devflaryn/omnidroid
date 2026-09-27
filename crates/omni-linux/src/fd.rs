@@ -449,7 +449,7 @@ fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let n = match crate::pipe::end_of(&file) {
         Some((_, true, _)) => return Err(EBADF),
         Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, &mut buf, nonblocking, t)?,
-        None => match crate::poll::read(&file, &mut buf, t) {
+        None => match crate::poll::read(&file, &mut buf, t).or_else(|| crate::socket::read(&file, &mut buf, t)) {
             Some(r) => r?,
             None => read_file(&file, &mut buf, None)?,
         },
