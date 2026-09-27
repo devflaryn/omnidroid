@@ -23,6 +23,8 @@ const O_CLOEXEC: u32 = 0o2000000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFMT: u32 = 0o170000;
+/// The name an ashmem region's `Shm` is made with (a memfd's is its own).
+const ASHMEM: &str = "/dev/ashmem";
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
 const PATH_MAX: usize = 4096;
@@ -188,7 +190,7 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
                 .map_err(|_| EACCES)?;
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
-        Node::Dev(DevNode::Ashmem) => FileKind::Shared(crate::shm::Shm::create("/dev/ashmem")?),
+        Node::Dev(DevNode::Ashmem) => FileKind::Shared(crate::shm::Shm::create(ASHMEM)?),
         Node::Dev(DevNode::Binder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::Binder)),
         Node::Dev(DevNode::HwBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::HwBinder)),
         Node::Dev(DevNode::VndBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::VndBinder)),
@@ -312,6 +314,9 @@ pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Binder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
         FileKind::Gpu(_) => stat_node(&Resolved { path: b"/dev/omni-gpu".to_vec(), node: Node::Dev(DevNode::OmniGpu) }),
         FileKind::SyncFile(_) => Ok(Stat { ino: 7, mode: 0o600, nlink: 1, ..Stat::default() }),
+        // An ashmem region is the ashmem device's descriptor: a character device, with the device's
+        // number (libcutils tells ashmem from anything else by it). A memfd is a regular file.
+        FileKind::Shared(m) if m.name == ASHMEM => stat_node(&Resolved { path: ASHMEM.as_bytes().to_vec(), node: Node::Dev(DevNode::Ashmem) }),
         FileKind::Shared(m) => Ok(Stat { ino: 5, mode: S_IFREG | 0o600, nlink: 1, size: m.len() as i64, blocks: (m.len() as i64 + 511) / 512, ..Stat::default() }),
         FileKind::Inotify(_) => Ok(Stat { ino: 6, mode: 0o600, nlink: 1, ..Stat::default() }),
     }
@@ -755,6 +760,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Dev(DevNode::Ashmem) => b"/dev/ashmem".to_vec(),
         FileKind::Dev(DevNode::OmniGpu) | FileKind::Gpu(_) => b"/dev/omni-gpu".to_vec(),
         FileKind::SyncFile(_) => b"anon_inode:sync_file".to_vec(),
+        FileKind::Shared(m) if m.name == ASHMEM => ASHMEM.as_bytes().to_vec(),
         FileKind::Shared(m) => format!("/memfd:{} (deleted)", m.name).into_bytes(),
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
     }
@@ -1226,7 +1232,34 @@ fn sys_getcwd(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(cwd.len() as u64)
 }
 
+/// `chdir(path)`: the working directory becomes the directory `path` resolves to.
+fn sys_chdir(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[0])?;
+    let cwd = p.cwd.lock().clone();
+    let r = p.vfs.resolve(&cwd, &path, true)?;
+    match r.node {
+        Node::Dir | Node::HostDir { .. } => {
+            *p.cwd.lock() = r.path;
+            Ok(0)
+        }
+        Node::Missing { .. } => Err(ENOENT),
+        _ => Err(ENOTDIR),
+    }
+}
+
+/// `fchdir(fd)`: the working directory becomes the directory `fd` is open on.
+fn sys_fchdir(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
+        FileKind::Dir { dir, .. } => dir.path.clone(),
+        _ => return Err(ENOTDIR),
+    };
+    *p.cwd.lock() = path;
+    Ok(0)
+}
+
 pub fn install(table: &mut Table) {
+    table.set(nr::CHDIR, sys_chdir);
+    table.set(nr::FCHDIR, sys_fchdir);
     table.set(nr::OPENAT, sys_openat);
     table.set(nr::CLOSE, sys_close);
     table.set(nr::READ, sys_read);

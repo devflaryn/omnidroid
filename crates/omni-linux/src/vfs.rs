@@ -457,6 +457,8 @@ impl Vfs {
             b"/dev/vndbinder" => return Some(Node::Dev(DevNode::VndBinder)),
             b"/dev/kmsg" => return Some(Node::Dev(DevNode::Kmsg)),
             b"/dev/ashmem" => return Some(Node::Dev(DevNode::Ashmem)),
+            // The ashmem device as libcutils names it: after this boot's id.
+            _ if path.strip_prefix(b"/dev/ashmem").is_some_and(|id| id == crate::procfs::boot_id().as_bytes()) => return Some(Node::Dev(DevNode::Ashmem)),
             b"/dev/omni-gpu" => return Some(Node::Dev(DevNode::OmniGpu)),
             b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
             _ => {}

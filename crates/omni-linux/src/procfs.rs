@@ -39,6 +39,35 @@ enum Entry {
     Link(Vec<u8>),
 }
 
+/// This boot's id, a random UUID (`/proc/sys/kernel/random/boot_id`): libcutils names the
+/// ashmem device after it (`/dev/ashmem<boot_id>`).
+#[must_use]
+pub fn boot_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let mut b = [0u8; 16];
+        let _ = omni_platform::process::random_bytes(&mut b);
+        b[6] = (b[6] & 0x0f) | 0x40; // version 4
+        b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+        let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    })
+}
+
+/// A fresh random UUID each read (`/proc/sys/kernel/random/uuid`).
+fn random_uuid(_p: &Process) -> Vec<u8> {
+    let mut b = [0u8; 16];
+    let _ = omni_platform::process::random_bytes(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}\n", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]).into_bytes()
+}
+
+fn boot_id_file(_p: &Process) -> Vec<u8> {
+    format!("{}\n", boot_id()).into_bytes()
+}
+
 /// The image's APEXes as mounted at boot (`crate::apex::mounts`), computed once.
 fn apex_mounts(p: &Process) -> &'static [crate::apex::ApexMount] {
     static MOUNTS: std::sync::OnceLock<Vec<crate::apex::ApexMount>> = std::sync::OnceLock::new();
@@ -392,12 +421,18 @@ impl Process {
                     .iter()
                     .map(|n| ((*n).to_string(), DT_REG))
                     .collect();
+                entries.push(("sys".to_string(), DT_DIR));
                 entries.push(("self".to_string(), DT_LNK));
                 entries.push(("thread-self".to_string(), DT_LNK));
                 entries.push((pid, DT_DIR));
                 return Some(Entry::DynDir(entries));
             }
             "/proc/self" => return Some(Entry::Link(pid.into_bytes())),
+            "/proc/sys" => return Some(Entry::Dir(vec![("kernel", DT_DIR)])),
+            "/proc/sys/kernel" => return Some(Entry::Dir(vec![("random", DT_DIR)])),
+            "/proc/sys/kernel/random" => return Some(Entry::Dir(vec![("boot_id", DT_REG), ("uuid", DT_REG)])),
+            "/proc/sys/kernel/random/boot_id" => return Some(Entry::File(boot_id_file)),
+            "/proc/sys/kernel/random/uuid" => return Some(Entry::File(random_uuid)),
             "/proc/thread-self" => return Some(Entry::Link(format!("{pid}/task/{pid}").into_bytes())),
             "/proc/cpuinfo" => return Some(Entry::File(cpuinfo)),
             "/proc/meminfo" => return Some(Entry::File(meminfo)),

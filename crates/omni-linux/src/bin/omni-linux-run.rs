@@ -18,6 +18,7 @@ fn main() -> ExitCode {
     let mut init_classes: Vec<String> = Vec::new();
     let mut hals: Vec<String> = Vec::new();
     let mut caps: Option<u64> = None;
+    let mut setprops: Vec<(String, String)> = Vec::new();
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -27,6 +28,12 @@ fn main() -> ExitCode {
             "--service" => services.push(args.next().expect("--service needs a program")),
             "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
             "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc, composer)")),
+            // A property set before the program starts (`name=value`), as init sets one.
+            "--setprop" => {
+                let kv = args.next().expect("--setprop needs name=value");
+                let (k, v) = kv.split_once('=').expect("--setprop needs name=value");
+                setprops.push((k.to_string(), v.to_string()));
+            }
             // The program's capabilities (comma-separated names), as a zygote or init grants them.
             "--caps" => {
                 let names = args.next().expect("--caps needs capability names");
@@ -133,6 +140,12 @@ fn main() -> ExitCode {
     }
     if let Some(caps) = caps {
         p.sys.set_caps(caps);
+    }
+    if !setprops.is_empty() {
+        let service = omni_linux::props::PropertyService::global(p.vfs.sysroot());
+        for (k, v) in &setprops {
+            service.set(k, v);
+        }
     }
     let status = p.run();
     // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.
