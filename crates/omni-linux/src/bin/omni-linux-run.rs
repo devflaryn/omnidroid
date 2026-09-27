@@ -164,9 +164,17 @@ fn main() -> ExitCode {
     }
     // OMNI_SCREENSHOT=<path>: the display's framebuffer, as a PNG, every few seconds.
     if let (Some(fb), Ok(path)) = (framebuffer.clone(), std::env::var("OMNI_SCREENSHOT")) {
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            let _ = std::fs::write(&path, fb.png());
+        std::thread::spawn(move || {
+            let mut seen = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let frames = fb.frames();
+                if frames != seen {
+                    eprintln!("[display] {frames} frames presented");
+                    seen = frames;
+                }
+                let _ = std::fs::write(&path, fb.png());
+            }
         });
     }
     if let Some(caps) = caps {

@@ -162,6 +162,15 @@ impl Client {
             return;
         }
         let stride = target.stride;
+        // OMNI_COMPOSER_TRACE=2: each frame presented, its slot and two pixels (centre, corner).
+        static FRAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FRAMES.get_or_init(|| std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("2")) {
+            let px = |x: usize, y: usize| {
+                let at = (y * stride as usize + x) * 4;
+                u32::from_be_bytes(pixels[at..at + 4].try_into().expect("4"))
+            };
+            eprintln!("[composer] present slot {:?}: centre {:08x} corner {:08x}", st.current_target, px(WIDTH as usize / 2, HEIGHT as usize / 2), px(8, 8));
+        }
         drop(st);
         self.framebuffer.present_rgba(&pixels, stride);
     }

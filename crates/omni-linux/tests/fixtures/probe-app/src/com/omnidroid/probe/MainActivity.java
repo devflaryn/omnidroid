@@ -14,6 +14,8 @@ public class MainActivity extends Activity {
         View v = new View(this);
         v.setBackgroundColor(0xff2196f3);
         setContentView(v);
+        // Its first frame: drawn by the app, then committed to SurfaceFlinger.
+        v.getViewTreeObserver().registerFrameCommitCallback(() -> Log.i("OmniProbe", "frame committed"));
     }
 
     @Override
