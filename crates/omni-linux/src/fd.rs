@@ -199,13 +199,22 @@ impl Stat {
     }
 }
 
+/// A writable-mount file's permission bits: the host keeps one permission for us, read-only, and
+/// `chmod` without write bits sets it (Android refuses to load a writable dex file).
+fn host_mode(meta: &std::fs::Metadata) -> u32 {
+    if meta.permissions().readonly() { 0o444 } else { 0o600 }
+}
+
 fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
     let ino = ino_of(&r.path);
     let s = |mode: u32, size: i64| Stat { ino, mode, nlink: 1, size, blocks: (size + 511) / 512, ..Stat::default() };
     Ok(match &r.node {
         Node::Dir | Node::HostDir { .. } => Stat { nlink: 2, ..s(S_IFDIR | 0o755, 4096) },
         Node::SysFile { size, mode } => s(S_IFREG | mode, *size as i64),
-        Node::HostFile { host } => s(S_IFREG | 0o600, std::fs::metadata(host).map_err(|_| EIO)?.len() as i64),
+        Node::HostFile { host } => {
+            let meta = std::fs::metadata(host).map_err(|_| EIO)?;
+            s(S_IFREG | host_mode(&meta), meta.len() as i64)
+        }
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
@@ -221,8 +230,9 @@ pub fn stat_path(vfs: &Vfs, cwd: &[u8], path: &[u8], follow: bool) -> Result<Sta
 pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
     match &*file.kind.lock() {
         FileKind::Host { file, guest, sysroot } => {
-            let len = file.metadata().map_err(|_| EIO)?.len() as i64;
-            let mode = if *sysroot { 0o644 } else { 0o600 };
+            let meta = file.metadata().map_err(|_| EIO)?;
+            let len = meta.len() as i64;
+            let mode = if *sysroot { 0o644 } else { host_mode(&meta) };
             Ok(Stat { ino: ino_of(guest), mode: S_IFREG | mode, nlink: 1, size: len, blocks: (len + 511) / 512, ..Stat::default() })
         }
         FileKind::Dir { dir, .. } => stat_node(dir),
@@ -495,6 +505,10 @@ fn sys_faccessat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     match r.node {
         Node::Missing { .. } => Err(ENOENT),
         Node::SysFile { .. } | Node::Dir if a[2] & 2 != 0 => Err(EROFS),
+        Node::HostFile { host } if a[2] & 2 != 0 => {
+            let meta = std::fs::metadata(host).map_err(|_| EIO)?;
+            if meta.permissions().readonly() { Err(EACCES) } else { Ok(0) }
+        }
         _ => Ok(0),
     }
 }
@@ -659,7 +673,38 @@ fn sys_utimensat(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
 
 /// `fchmod`/`fchown`: a mode or owner the host cannot hold (Windows has neither), so a writable
 /// file accepts it and keeps nothing; the sysroot is read-only.
+/// Set a host file read-only exactly when `mode` grants no write permission.
+fn set_host_mode(host: &std::path::Path, mode: u64) -> Result<(), Errno> {
+    let meta = std::fs::metadata(host).map_err(|_| EIO)?;
+    if !meta.is_file() {
+        return Ok(()); // a directory keeps its permissions; nothing here checks them
+    }
+    let mut perms = meta.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(mode & 0o222 == 0);
+    std::fs::set_permissions(host, perms).map_err(|_| EIO)
+}
+
 fn sys_fchmod(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let kind = file.kind.lock();
+    match &*kind {
+        FileKind::Host { sysroot: true, .. } | FileKind::Synth { .. } => Err(EROFS),
+        FileKind::Host { guest, .. } => {
+            let guest = guest.clone();
+            drop(kind);
+            let r = p.vfs.resolve(b"/", &guest, true)?;
+            match r.node {
+                Node::HostFile { host } => set_host_mode(&host, a[1]).map(|()| 0),
+                _ => Ok(0),
+            }
+        }
+        _ => Ok(0),
+    }
+}
+
+/// `fchown`: ownership is not modelled (every file is the app's); accepted where `chmod` is.
+fn sys_fchown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
         FileKind::Host { sysroot: true, .. } | FileKind::Synth { .. } => Err(EROFS),
         _ => Ok(0),
@@ -668,6 +713,17 @@ fn sys_fchmod(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 /// `fchmodat`/`fchownat`: the same, by path.
 fn sys_fchmodat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let path = path_arg(p, a[1])?;
+    let base = base_dir(p, a[0], &path)?;
+    match p.vfs.resolve(&base, &path, true)?.node {
+        Node::Missing { .. } => Err(ENOENT),
+        Node::HostFile { host } => set_host_mode(&host, a[2]).map(|()| 0),
+        Node::HostDir { .. } | Node::Dev(_) => Ok(0),
+        _ => Err(EROFS),
+    }
+}
+
+fn sys_fchownat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
     match p.vfs.resolve(&base, &path, true)?.node {
@@ -752,8 +808,8 @@ pub fn install(table: &mut Table) {
     table.set(nr::FDATASYNC, sys_fsync);
     table.set(nr::UTIMENSAT, sys_utimensat);
     table.set(nr::FCHMOD, sys_fchmod);
-    table.set(nr::FCHOWN, sys_fchmod);
+    table.set(nr::FCHOWN, sys_fchown);
     table.set(nr::FCHMODAT, sys_fchmodat);
-    table.set(nr::FCHOWNAT, sys_fchmodat);
+    table.set(nr::FCHOWNAT, sys_fchownat);
     table.set(nr::FSTATFS, sys_fstatfs);
 }
