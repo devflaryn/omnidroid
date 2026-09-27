@@ -330,7 +330,9 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                                 Some("seqpacket") => 5,
                                 _ => continue,
                             };
-                            s.sockets.push((words[1].to_string(), ty));
+                            // `+passcred`: init sets SO_PASSCRED on it (lmkd's socket).
+                            let passcred = if words[2].split('+').any(|w| w == "passcred") { crate::socket::INIT_PASSCRED } else { 0 };
+                            s.sockets.push((words[1].to_string(), ty | passcred));
                         }
                         "capabilities" => {
                             s.capabilities = Some(words[1..].iter().filter_map(|w| crate::sys::cap_number(w)).fold(0, |m, n| m | (1 << n)));

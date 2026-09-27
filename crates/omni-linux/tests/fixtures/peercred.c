@@ -27,6 +27,10 @@ int main(void) {
     unlink(a.sun_path);
     int server = socket(AF_UNIX, SOCK_SEQPACKET, 0);
     check(bind(server, (struct sockaddr*)&a, sizeof(a)) == 0 && listen(server, 4) == 0, "bind and listen");
+    // On the listening socket, as init sets it for lmkd's (`seqpacket+passcred`): its connections
+    // inherit it.
+    int on = 1;
+    check(setsockopt(server, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0, "SO_PASSCRED on the listening socket");
 
     uid_t want = getuid() == 0 ? 1234 : getuid();
     pid_t child = fork();
@@ -47,8 +51,6 @@ int main(void) {
     len = sizeof(c);
     check(getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &c, &len) == 0 && c.pid == child && c.uid == want, "SO_PEERCRED names the child");
 
-    int on = 1;
-    check(setsockopt(conn, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0, "SO_PASSCRED");
     char buf[16];
     union { struct cmsghdr h; char space[CMSG_SPACE(sizeof(struct ucred))]; } control;
     struct iovec iov = { buf, sizeof(buf) };

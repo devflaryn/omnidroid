@@ -44,16 +44,22 @@ pub struct PairChannel {
     stream: bool,
 }
 
+/// In an init socket's type: `+passcred`.
+pub const INIT_PASSCRED: u64 = 1 << 32;
+
 /// A socket init makes for a service (`socket <name> <type>`): bound to `/dev/socket/<name>` in
 /// `instance`, as an open file to hand over.
 #[must_use]
 pub fn init_socket(instance: usize, name: &str, ty: u64, cred: Cred) -> OpenFile {
     let path = format!("/dev/socket/{name}");
+    let passcred = ty & INIT_PASSCRED != 0;
+    let ty = ty & SOCK_TYPE_MASK;
     let bound = crate::unix::Bound::bind_replacing(instance, path.as_bytes(), ty, cred);
+    bound.passcred.store(passcred, std::sync::atomic::Ordering::SeqCst);
     let mut addr = (AF_UNIX as u16).to_le_bytes().to_vec();
     addr.extend_from_slice(path.as_bytes());
     addr.push(0);
-    let socket = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Bound(bound)), inbox: std::collections::VecDeque::new(), name: Some(addr), protocol: 0, owner: cred[0], passcred: false };
+    let socket = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Bound(bound)), inbox: std::collections::VecDeque::new(), name: Some(addr), protocol: 0, owner: cred[0], passcred };
     OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(2) }
 }
 
@@ -435,6 +441,10 @@ fn sys_setsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         let on = p.mem.read_u32(a[3])? != 0;
         if let FileKind::Socket(s) = &mut *file.kind.lock() {
             s.passcred = on;
+            // A listening socket's connections inherit it.
+            if let Some(Peer::Bound(b)) = &s.peer {
+                b.passcred.store(on, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         return Ok(0);
     }

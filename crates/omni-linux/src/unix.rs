@@ -17,6 +17,8 @@ pub struct Bound {
     pub ty: u64,
     /// The credentials of the process that bound it: what its clients see as their peer.
     pub cred: crate::socket::Cred,
+    /// `SO_PASSCRED`, which the connections it accepts inherit.
+    pub passcred: std::sync::atomic::AtomicBool,
     pub listening: std::sync::atomic::AtomicBool,
     /// Connections not yet accepted: the server ends.
     backlog: Mutex<VecDeque<Socket>>,
@@ -42,7 +44,7 @@ impl Bound {
         if names.get(&key).is_some_and(|b| b.strong_count() > 0) {
             return Err(EADDRINUSE);
         }
-        let bound = Arc::new(Self { ty, cred, listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
+        let bound = Arc::new(Self { ty, cred, passcred: false.into(), listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
         names.insert(key, Arc::downgrade(&bound));
         Ok(bound)
     }
@@ -51,7 +53,7 @@ impl Bound {
     /// before it makes a new one).
     #[must_use]
     pub fn bind_replacing(instance: usize, name: &[u8], ty: u64, cred: crate::socket::Cred) -> Arc<Self> {
-        let bound = Arc::new(Self { ty, cred, listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
+        let bound = Arc::new(Self { ty, cred, passcred: false.into(), listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
         names().lock().insert((instance, name.to_vec()), Arc::downgrade(&bound));
         bound
     }
@@ -78,7 +80,8 @@ impl Bound {
         if !self.listening.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ECONNREFUSED);
         }
-        let (mine, theirs) = crate::socket::pair(self.ty, cred, self.cred);
+        let (mine, mut theirs) = crate::socket::pair(self.ty, cred, self.cred);
+        theirs.passcred = self.passcred.load(std::sync::atomic::Ordering::SeqCst);
         client.peer = Some(mine);
         self.backlog.lock().push_back(theirs);
         crate::poll::notify();
