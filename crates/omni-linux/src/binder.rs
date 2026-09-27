@@ -181,6 +181,20 @@ struct Txn {
     fda: Vec<(usize, usize, Vec<Arc<OpenFile>>)>,
     /// A oneway transaction's node, whose next oneway waits until this one's buffer is freed.
     async_node: Option<NodeId>,
+    /// The nodes it holds in flight ([`State::pin`]): its target's and those its objects name.
+    pinned: Vec<NodeId>,
+}
+
+/// A delivered buffer not yet freed (`BC_FREE_BUFFER`), by (receiver, address) in
+/// [`State::buffers`].
+struct Buffer {
+    /// A oneway's node: freeing the buffer hands the node's next oneway out.
+    async_node: Option<NodeId>,
+    /// The nodes the transaction held, let go when the buffer is freed.
+    pinned: Vec<NodeId>,
+    /// The thread it was delivered to, and the transaction's code (for the stall report).
+    tid: i32,
+    code: u32,
 }
 
 struct SgBuffer {
@@ -193,8 +207,12 @@ struct SgBuffer {
 enum Work {
     Txn(Box<Txn>),
     Complete,
+    /// A sync transaction this thread waits on failed: the wait is over.
     DeadReply,
     FailedReply,
+    /// A transaction this thread could not send (the kernel's `thread->return_error`): read as
+    /// `cmd`, and no wait ends -- the thread never began one.
+    ReturnError(u32),
     Increfs { ptr: u64, cookie: u64 },
     Acquire { ptr: u64, cookie: u64 },
     Release { ptr: u64, cookie: u64 },
@@ -206,7 +224,11 @@ enum Work {
 #[derive(Default)]
 struct ThreadState {
     todo: VecDeque<Work>,
+    /// `BC_ENTER_LOOPER` or `BC_REGISTER_LOOPER` came: the thread may take its process's work.
+    /// The kernel never clears it (`BC_EXIT_LOOPER` adds `exited`).
     looper: bool,
+    /// `BC_EXIT_LOOPER` came: no longer counted as a looper of the thread pool.
+    exited: bool,
     /// Transactions this thread is serving, innermost last: whom each reply goes to.
     serving: Vec<Option<(ProcId, i32)>>,
     /// Sync transactions this thread sent and waits on the reply of.
@@ -232,9 +254,14 @@ struct ProcState {
 struct State {
     procs: HashMap<ProcId, ProcState>,
     nodes: HashMap<NodeId, Node>,
-    /// The buffers oneway transactions were delivered in, by (receiver, address): freeing one
-    /// hands its node's next oneway transaction out.
-    async_buffers: HashMap<(ProcId, u64), NodeId>,
+    /// Delivered buffers that hold something until freed -- a oneway's node slot, nodes in
+    /// flight -- by (receiver, address).
+    buffers: HashMap<(ProcId, u64), Buffer>,
+    /// Nodes in flight, with how many transactions hold each: named by a transaction on its way
+    /// or by a delivered buffer not yet freed. The kernel takes a node reference for each
+    /// (`binder_inc_node` as it translates) and drops it with the buffer
+    /// (`binder_transaction_buffer_release`): an object in flight is not released by its owner.
+    pins: HashMap<NodeId, usize>,
     /// (owner, ptr) -> node
     local: HashMap<(ProcId, u64), NodeId>,
     context_mgr: Option<NodeId>,
@@ -336,13 +363,15 @@ impl State {
     }
 
     /// A binder or handle object `sender` sends to `target`, as the target receives it: the new
-    /// (type, binder or handle, cookie), or `None` when it arrives unchanged.
-    fn translate_ref(&mut self, sender: (ProcId, i32), target: ProcId, obj: &[u8]) -> Result<Option<(u32, u64, u64)>, Errno> {
+    /// (type, binder or handle, cookie), or `None` when it arrives unchanged. The node it names is
+    /// pinned into `pins` until the transaction is done with.
+    fn translate_ref(&mut self, sender: (ProcId, i32), target: ProcId, obj: &[u8], pins: &mut Vec<NodeId>) -> Result<Option<(u32, u64, u64)>, Errno> {
         let (kind, flags) = (u32_at(obj, 0), u32_at(obj, 4));
         let (ptr, cookie) = (u64_at(obj, 8), u64_at(obj, 16));
         match kind {
             TYPE_BINDER | TYPE_WEAK_BINDER => {
                 let node = self.local_node(sender.0, ptr, cookie, flags);
+                self.pin(node, pins);
                 if target == sender.0 {
                     return Ok(None);
                 }
@@ -351,6 +380,7 @@ impl State {
             }
             TYPE_HANDLE | TYPE_WEAK_HANDLE => {
                 let node = self.node_for_handle(sender.0, ptr as u32).ok_or(EINVAL)?;
+                self.pin(node, pins);
                 let n = self.nodes.get(&node).expect("a node");
                 if n.owner == target {
                     let kind = if kind == TYPE_HANDLE { TYPE_BINDER } else { TYPE_WEAK_BINDER };
@@ -365,23 +395,66 @@ impl State {
     }
 
     /// A oneway transaction to `node` is done with (its buffer freed, or it was not delivered):
-    /// the next waiting one goes to `owner` -- to thread `tid` when given, as the kernel hands it
-    /// to the thread that freed the buffer.
-    fn async_done(&mut self, node: NodeId, owner: ProcId, tid: Option<i32>) {
+    /// the next waiting one goes to `owner`'s process queue, for whichever thread is available for
+    /// process work -- as the kernel's `binder_free_buf` does (`binder_enqueue_work_ilocked(w,
+    /// &proc->todo)`). Kernels before 4.14 moved it to the freeing thread's own queue; since then
+    /// the kernel never queues a oneway to a thread. The node's oneways still run one at a time,
+    /// in order: the next is handed out only now. Handing it to the freeing thread held it on a
+    /// thread that only writes (libbinder's `flushCommands`, a thread's exit), and every later
+    /// oneway to the node queued behind it.
+    fn async_done(&mut self, node: NodeId, owner: ProcId) {
         let next = self.nodes.get_mut(&node).and_then(|n| {
             let w = n.async_todo.pop_front();
             n.has_async = w.is_some();
             w
         });
         if let Some(w) = next {
-            self.queue(owner, tid, w);
+            self.queue(owner, None, w);
         }
     }
 
-    /// No live process refers to `node` any more: its owner lets it go (`BR_RELEASE`,
-    /// `BR_DECREFS`), and the object's address may later name a new node.
+    /// Hold `node` for a transaction in flight (recorded in its `pins`).
+    fn pin(&mut self, node: NodeId, pins: &mut Vec<NodeId>) {
+        *self.pins.entry(node).or_default() += 1;
+        pins.push(node);
+    }
+
+    /// A transaction in flight is done with the nodes it held (its buffer freed, or it was
+    /// dropped): one no live process refers to any more is released now. How many were.
+    fn unpin(&mut self, nodes: Vec<NodeId>) -> usize {
+        let mut released = 0;
+        for node in nodes {
+            let Some(count) = self.pins.get_mut(&node) else { continue };
+            *count -= 1;
+            if *count == 0 {
+                self.pins.remove(&node);
+                if self.release_if_unreferenced(node) {
+                    released += 1;
+                }
+            }
+        }
+        released
+    }
+
+    /// Work that will never be read (its process or thread gone): a sync transaction's sender
+    /// hears BR_DEAD_REPLY, a oneway's node lets its next one go, and the nodes it held are let
+    /// go (the kernel's `binder_release_work`). How many nodes that released.
+    fn drop_work(&mut self, receiver: ProcId, work: Work) -> usize {
+        let Work::Txn(txn) = work else { return 0 };
+        if let (false, false, Some((proc, tid))) = (txn.reply, txn.oneway, txn.from) {
+            self.queue(proc, Some(tid), Work::DeadReply);
+        }
+        if let Some(node) = txn.async_node {
+            self.async_done(node, receiver);
+        }
+        self.unpin(txn.pinned)
+    }
+
+    /// No live process refers to `node` any more, and no transaction in flight names it: its
+    /// owner lets it go (`BR_RELEASE`, `BR_DECREFS`), and the object's address may later name a
+    /// new node.
     fn release_if_unreferenced(&mut self, node: NodeId) -> bool {
-        if self.context_mgr == Some(node) || self.procs.values().any(|p| !p.dead && p.by_node.contains_key(&node)) {
+        if self.context_mgr == Some(node) || self.pins.contains_key(&node) || self.procs.values().any(|p| !p.dead && p.by_node.contains_key(&node)) {
             return false;
         }
         let Some(n) = self.nodes.get_mut(&node) else { return false };
@@ -415,6 +488,62 @@ impl State {
         }
     }
 
+    /// Why `node`'s oneway calls wait: how many, the code of the next, and where the one that is
+    /// out is -- queued for the process or a thread (and whether any looper is free to take it),
+    /// or delivered to a thread whose buffer is not yet freed.
+    fn async_stall(&self, node: NodeId) -> String {
+        let Some(n) = self.nodes.get(&node) else { return format!("node {node} is gone") };
+        let pid_of = |id: ProcId| self.procs.get(&id).map_or(0, |pr| pr.pid);
+        let code_of = |w: &Work| match w {
+            Work::Txn(t) => format!("{:#x}", t.code),
+            _ => "?".into(),
+        };
+        let next = n.async_todo.front().map_or_else(|| "none".into(), code_of);
+        let thread_state = |th: &ThreadState| {
+            format!("looper {}, awaiting {}, serving {}, {} queued", th.looper && !th.exited, th.awaiting, th.serving.len(), th.todo.len())
+        };
+        let ours = |w: &Work| matches!(w, Work::Txn(t) if t.async_node == Some(node));
+        let owner = self.procs.get(&n.owner);
+        let out = owner.and_then(|pr| {
+            if let Some(w) = pr.todo.iter().find(|w| ours(w)) {
+                let free = pr.threads.values().filter(|th| th.looper && th.awaiting == 0 && th.serving.is_empty() && th.todo.is_empty()).count();
+                return Some(format!("code {} queued for the process ({} of {} threads free to take it)", code_of(w), free, pr.threads.len()));
+            }
+            pr.threads.iter().find_map(|(tid, th)| th.todo.iter().find(|w| ours(w)).map(|w| format!("code {} queued for thread {tid} ({})", code_of(w), thread_state(th))))
+        });
+        let out = out.or_else(|| {
+            self.buffers.iter().find(|(_, b)| b.async_node == Some(node)).map(|((proc, buf), b)| {
+                let th = self.procs.get(proc).and_then(|pr| pr.threads.get(&b.tid)).map_or_else(|| "gone".into(), thread_state);
+                format!("code {:#x} delivered to thread {} in buffer {buf:#x}, not freed (thread: {th})", b.code, b.tid)
+            })
+        });
+        format!(
+            "{} oneway calls wait on node {node} ({:#x}) of pid {}: next code {next}; the one out: {}",
+            n.async_todo.len(),
+            n.ptr,
+            pid_of(n.owner),
+            out.unwrap_or_else(|| "none found".into())
+        )
+    }
+
+    /// Queue a oneway transaction to `node` for its process `target` -- or, while one to the same
+    /// node is out, on the node, as the kernel's `binder_proc_transaction` orders them
+    /// (`node->has_async_transaction`, `node->async_todo`).
+    fn queue_oneway(&mut self, target: ProcId, node: NodeId, mut txn: Txn) {
+        txn.async_node = Some(node);
+        if let Some(n) = self.nodes.get_mut(&node) {
+            if n.has_async {
+                n.async_todo.push_back(Work::Txn(Box::new(txn)));
+                if n.async_todo.len() % 64 == 0 {
+                    eprintln!("[binder] {}", self.async_stall(node));
+                }
+                return;
+            }
+            n.has_async = true;
+        }
+        self.queue(target, None, Work::Txn(Box::new(txn)));
+    }
+
     /// Queue work for a thread of `id`: `tid`'s own queue when given, the process's otherwise.
     fn queue(&mut self, id: ProcId, tid: Option<i32>, work: Work) {
         let proc = self.proc_mut(id);
@@ -431,20 +560,15 @@ impl State {
     /// caller, its files attached. `EINVAL` for an object that is not where the reply says.
     fn reply_from_host(&mut self, caller: ProcId, reply: HostReply) -> Result<Txn, Errno> {
         let HostReply { mut data, fds, binders } = reply;
-        let mut offsets: Vec<u64> = Vec::with_capacity(fds.len() + binders.len());
-        for &off in &binders {
-            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-            if let Some(to) = self.translate_ref((HOST, 0), caller, &obj)? {
-                rewrite_ref(&mut data, off, to);
-            }
-            offsets.push(off as u64);
-        }
         for (off, _) in &fds {
             if data.get(*off..off + 24).map(|o| u32_at(o, 0)) != Some(TYPE_FD) {
                 return Err(EINVAL);
             }
-            offsets.push(*off as u64);
         }
+        let binder_offsets: Vec<u64> = binders.iter().map(|&o| o as u64).collect();
+        let pinned = self.translate_refs((HOST, 0), caller, &mut data, &binder_offsets)?;
+        let mut offsets = binder_offsets;
+        offsets.extend(fds.iter().map(|(off, _)| *off as u64));
         offsets.sort_unstable();
         Ok(Txn {
             reply: true,
@@ -463,7 +587,31 @@ impl State {
             sg: Vec::new(),
             fda: Vec::new(),
             async_node: None,
+            pinned,
         })
+    }
+
+    /// Translate the binder and handle objects at `offsets` of `data` (the host's own
+    /// transactions carry no others) that `sender` sends to `target`: the nodes they hold in flight.
+    /// On an error none is held.
+    fn translate_refs(&mut self, sender: (ProcId, i32), target: ProcId, data: &mut [u8], offsets: &[u64]) -> Result<Vec<NodeId>, Errno> {
+        let mut pins = Vec::new();
+        for &off in offsets {
+            let off = off as usize;
+            let translated = match data.get(off..off + 24) {
+                Some(obj) => self.translate_ref(sender, target, &obj.to_vec(), &mut pins),
+                None => Err(EINVAL),
+            };
+            match translated {
+                Ok(Some(to)) => rewrite_ref(data, off, to),
+                Ok(None) => {}
+                Err(e) => {
+                    self.unpin(pins);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(pins)
     }
 }
 
@@ -514,13 +662,8 @@ impl Broker {
         if dead || st.procs.get(&target).is_none_or(|pr| pr.dead) {
             return Err(EPIPE);
         }
-        for &off in offsets {
-            let off = off as usize;
-            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-            if let Some(to) = st.translate_ref((HOST, tid), target, &obj)? {
-                rewrite_ref(&mut data, off, to);
-            }
-        }
+        let mut pinned = st.translate_refs((HOST, tid), target, &mut data, offsets)?;
+        st.pin(node, &mut pinned);
         let txn = Txn {
             reply: false,
             oneway: false,
@@ -538,6 +681,7 @@ impl Broker {
             sg: Vec::new(),
             fda: Vec::new(),
             async_node: None,
+            pinned,
         };
         let nested = HOST_SERVING.with(std::cell::Cell::get).filter(|(p, _)| *p == target).map(|(_, tid)| tid);
         st.queue(target, nested, Work::Txn(Box::new(txn)));
@@ -547,7 +691,7 @@ impl Broker {
             let work = st.proc_mut(HOST).threads.entry(tid).or_default().todo.pop_front();
             match work {
                 Some(Work::Txn(r)) if r.reply => break Ok(r.data),
-                Some(Work::DeadReply | Work::FailedReply) => break Err(EPIPE),
+                Some(Work::DeadReply | Work::FailedReply | Work::ReturnError(_)) => break Err(EPIPE),
                 Some(_) => continue,
                 None if Instant::now() >= deadline => break Err(ETIMEDOUT),
                 None => {
@@ -562,7 +706,8 @@ impl Broker {
     }
 
     /// A one-way transaction from the host to `handle` (a HAL calling back its client:
-    /// `IComposerCallback.onVsync`): queued for the target's process, not waited on.
+    /// `IComposerCallback.onVsync`): queued for the target's process, not waited on -- after the
+    /// node's earlier oneways, one at a time, as any sender's.
     ///
     /// # Errors
     /// `EINVAL` for an unknown handle or an object that is not a binder or handle, `EPIPE` when the
@@ -576,13 +721,8 @@ impl Broker {
         if dead || st.procs.get(&target).is_none_or(|pr| pr.dead) {
             return Err(EPIPE);
         }
-        for &off in offsets {
-            let off = off as usize;
-            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-            if let Some(to) = st.translate_ref((HOST, 0), target, &obj)? {
-                rewrite_ref(&mut data, off, to);
-            }
-        }
+        let mut pinned = st.translate_refs((HOST, 0), target, &mut data, offsets)?;
+        st.pin(node, &mut pinned);
         let txn = Txn {
             reply: false,
             oneway: true,
@@ -600,8 +740,9 @@ impl Broker {
             sg: Vec::new(),
             fda: Vec::new(),
             async_node: None,
+            pinned,
         };
-        st.queue(target, None, Work::Txn(Box::new(txn)));
+        st.queue_oneway(target, node, txn);
         Ok(())
     }
 
@@ -812,11 +953,15 @@ impl BinderFile {
             return;
         }
         let mut st = self.broker.state.lock();
+        // Work that will never be read: the oneways queued on its nodes, its queues.
+        let mut dropped: Vec<Work> = Vec::new();
         let dying: Vec<NodeId> = st.nodes.iter().filter(|(_, n)| n.owner == self.id).map(|(id, _)| *id).collect();
         for node in dying {
             let watchers = {
                 let n = st.nodes.get_mut(&node).expect("node");
                 n.dead = true;
+                n.has_async = false;
+                dropped.extend(n.async_todo.drain(..));
                 std::mem::take(&mut n.watchers)
             };
             for (proc, cookie) in watchers {
@@ -826,32 +971,37 @@ impl BinderFile {
                 st.context_mgr = None;
             }
         }
-        let pending: Vec<(ProcId, i32)> = st
-            .procs
-            .get(&self.id)
-            .map(|p| {
-                p.todo
-                    .iter()
-                    .chain(p.threads.values().flat_map(|t| t.todo.iter()))
-                    .filter_map(|w| match w {
-                        Work::Txn(t) if !t.reply && !t.oneway => t.from,
-                        _ => None,
-                    })
-                    .chain(p.threads.values().flat_map(|t| t.serving.iter().filter_map(|f| *f)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (proc, tid) in pending {
-            st.queue(proc, Some(tid), Work::DeadReply);
-        }
         // Its references are gone with it: an object no live process refers to any more is let go
         // by its owner (`BR_RELEASE`, `BR_DECREFS`), as the kernel drops a dead process's refs --
-        // SurfaceFlinger removes a client's layers when their handles are released so.
-        let held: Vec<NodeId> = st.procs.get_mut(&self.id).map(|p| {
+        // SurfaceFlinger removes a client's layers when their handles are released so. One still
+        // in flight -- in a transaction queued elsewhere, or in a buffer not yet freed -- waits
+        // for that.
+        let mut serving = Vec::new();
+        let mut held = Vec::new();
+        if let Some(p) = st.procs.get_mut(&self.id) {
+            p.dead = true;
+            dropped.extend(p.todo.drain(..));
+            for (_, th) in p.threads.drain() {
+                dropped.extend(th.todo);
+                serving.extend(th.serving.into_iter().flatten());
+            }
             p.by_node.clear();
-            std::mem::take(&mut p.refs).into_values().collect()
-        }).unwrap_or_default();
+            held = std::mem::take(&mut p.refs).into_values().collect();
+        }
+        // Every sync transaction waiting on it fails.
+        for (proc, tid) in serving {
+            st.queue(proc, Some(tid), Work::DeadReply);
+        }
         let mut released = 0;
+        for work in dropped {
+            released += st.drop_work(self.id, work);
+        }
+        let buffers: Vec<(ProcId, u64)> = st.buffers.keys().filter(|(proc, _)| *proc == self.id).copied().collect();
+        for key in buffers {
+            if let Some(b) = st.buffers.remove(&key) {
+                released += st.unpin(b.pinned);
+            }
+        }
         for node in held {
             if st.release_if_unreferenced(node) {
                 released += 1;
@@ -860,11 +1010,6 @@ impl BinderFile {
         if std::env::var_os("OMNI_BINDER_TRACE").is_some() || released > 0 {
             let pid = st.procs.get(&self.id).map_or(0, |p| p.pid);
             eprintln!("[binder] pid {pid} closed its driver: {released} objects released");
-        }
-        if let Some(p) = st.procs.get_mut(&self.id) {
-            p.dead = true;
-            p.todo.clear();
-            p.threads.clear();
         }
         crate::poll::notify();
     }
@@ -904,8 +1049,16 @@ pub fn ioctl(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmd: u64, arg: u
             Ok(0)
         }
         BINDER_THREAD_EXIT => {
-            if let Some(proc) = file.broker.state.lock().procs.get_mut(&file.id) {
-                proc.threads.remove(&t.tid);
+            // The kernel's `binder_thread_release`: the caller of the transaction it was serving
+            // hears BR_DEAD_REPLY, and the work left in its queue is dropped as a dead process's.
+            let mut st = file.broker.state.lock();
+            if let Some(th) = st.procs.get_mut(&file.id).and_then(|p| p.threads.remove(&t.tid)) {
+                if let Some(Some((proc, tid))) = th.serving.last().copied() {
+                    st.queue(proc, Some(tid), Work::DeadReply);
+                }
+                for work in th.todo {
+                    st.drop_work(file.id, work);
+                }
             }
             Ok(0)
         }
@@ -990,14 +1143,16 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
     match code {
         BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG => {
             let reply = matches!(code, BC_REPLY | BC_REPLY_SG);
-            // The caller a reply answers, before the reply takes it off the thread.
+            // A reply takes the transaction it answers off the thread first, whatever becomes of
+            // the reply (the kernel's `thread->transaction_stack = in_reply_to->to_parent`): the
+            // caller it answers, if any is still waiting.
             let caller = if reply {
                 let mut st = file.broker.state.lock();
-                st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.last().copied().flatten()
+                st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.pop().flatten()
             } else {
                 None
             };
-            if let Err(e) = transaction(p, t, file, arg, reply) {
+            if let Err(e) = transaction(p, t, file, arg, reply, caller) {
                 if std::env::var("OMNI_BINDER_TRACE").is_ok() || crate::remote::is_remote() || p.trace {
                     eprintln!("[binder] {}:{} {} failed: {e:?}", p.sys.pid, t.tid, if reply { "reply" } else { "transaction" });
                 }
@@ -1005,16 +1160,12 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                 if reply {
                     // binder_transaction's error path for a reply: the replier completes, and the
                     // one waiting for it hears BR_FAILED_REPLY.
-                    let th = st.proc_mut(file.id).threads.entry(t.tid).or_default();
-                    if th.serving.last().copied().flatten() == caller && caller.is_some() {
-                        th.serving.pop();
-                    }
                     st.queue(file.id, Some(t.tid), Work::Complete);
                     if let Some((proc, tid)) = caller {
                         st.queue(proc, Some(tid), Work::FailedReply);
                     }
                 } else {
-                    st.queue(file.id, Some(t.tid), Work::FailedReply);
+                    st.queue(file.id, Some(t.tid), Work::ReturnError(BR_FAILED_REPLY));
                 }
                 return Err(Failed::Transaction(4 + size));
             }
@@ -1022,10 +1173,14 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         BC_FREE_BUFFER => {
             let ptr = u64_at(arg, 0);
             file.area.lock().free(ptr);
-            // A oneway transaction's buffer: its node's next oneway goes to this thread.
+            // As the kernel's `binder_free_buf`: a oneway's node hands its next oneway to the
+            // process, and the nodes the transaction held are let go.
             let mut st = file.broker.state.lock();
-            if let Some(node) = st.async_buffers.remove(&(file.id, ptr)) {
-                st.async_done(node, file.id, Some(t.tid));
+            if let Some(b) = st.buffers.remove(&(file.id, ptr)) {
+                if let Some(node) = b.async_node {
+                    st.async_done(node, file.id);
+                }
+                st.unpin(b.pinned);
             }
         }
         // A live process's handle references are not counted: its handles last as long as it
@@ -1045,16 +1200,21 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         }
         BC_EXIT_LOOPER => {
             let mut st = file.broker.state.lock();
-            st.proc_mut(file.id).threads.entry(t.tid).or_default().looper = false;
+            st.proc_mut(file.id).threads.entry(t.tid).or_default().exited = true;
         }
         BC_REQUEST_DEATH_NOTIFICATION | BC_CLEAR_DEATH_NOTIFICATION => {
             let (handle, cookie) = (u32_at(arg, 0), u64_at(arg, 4));
             let mut st = file.broker.state.lock();
+            // The kernel's: the answer goes to this thread when it is a looper, else to the
+            // process (a thread that only writes, as `unlinkToDeath`'s `flushCommands`, would
+            // never read it).
+            let looper = st.proc_mut(file.id).threads.get(&t.tid).is_some_and(|th| th.looper);
+            let to = looper.then_some(t.tid);
             if let Some(node) = st.node_for_handle(file.id, handle) {
                 if code == BC_REQUEST_DEATH_NOTIFICATION {
                     let dead = st.nodes.get(&node).is_none_or(|n| n.dead);
                     if dead {
-                        st.queue(file.id, None, Work::DeadBinder { cookie });
+                        st.queue(file.id, to, Work::DeadBinder { cookie });
                     } else if let Some(n) = st.nodes.get_mut(&node) {
                         n.watchers.push((file.id, cookie));
                     }
@@ -1062,7 +1222,7 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                     if let Some(n) = st.nodes.get_mut(&node) {
                         n.watchers.retain(|w| *w != (file.id, cookie));
                     }
-                    st.queue(file.id, Some(t.tid), Work::ClearDeathDone { cookie });
+                    st.queue(file.id, to, Work::ClearDeathDone { cookie });
                 }
             }
         }
@@ -1075,8 +1235,8 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
 }
 
 /// `BC_TRANSACTION`/`BC_REPLY`: read the sender's buffer, translate its objects for the receiver,
-/// and queue it.
-fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], reply: bool) -> Result<(), Errno> {
+/// and queue it. A reply goes to `caller`, the waiting thread of the transaction it answers.
+fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], reply: bool, caller: Option<(ProcId, i32)>) -> Result<(), Errno> {
     let handle = u32_at(tr, 0);
     let (code, flags) = (u32_at(tr, 16), u32_at(tr, 20));
     let (data_size, offsets_size) = (u64_at(tr, 32), u64_at(tr, 40));
@@ -1090,22 +1250,23 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     let mut st = file.broker.state.lock();
 
     // Where it goes.
-    let (target_proc, target_tid, target_ptr, target_cookie, secctx, from) = if reply {
-        let serving = st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.pop().flatten();
-        let Some((proc, tid)) = serving else {
+    let (target_proc, target_tid, target_ptr, target_cookie, secctx, from, target_node) = if reply {
+        let Some((proc, tid)) = caller else {
             // The one who asked is gone, or this was not a sync transaction: nothing to answer.
             st.queue(file.id, Some(t.tid), Work::Complete);
             return Ok(());
         };
-        (proc, Some(tid), 0, 0, false, None)
+        (proc, Some(tid), 0, 0, false, None, None)
     } else {
+        // The kernel's answers: no context manager is BR_DEAD_REPLY, a handle the process does
+        // not have BR_FAILED_REPLY, a dead node BR_DEAD_REPLY.
         let Some(node) = st.node_for_handle(file.id, handle) else {
-            st.queue(file.id, Some(t.tid), Work::DeadReply);
+            st.queue(file.id, Some(t.tid), Work::ReturnError(if handle == 0 { BR_DEAD_REPLY } else { BR_FAILED_REPLY }));
             return Ok(());
         };
         let n = st.nodes.get(&node).expect("a node");
         if n.dead {
-            st.queue(file.id, Some(t.tid), Work::DeadReply);
+            st.queue(file.id, Some(t.tid), Work::ReturnError(BR_DEAD_REPLY));
             return Ok(());
         }
         let (owner, ptr, cookie, sec) = (n.owner, n.ptr, n.cookie, n.txn_security_ctx);
@@ -1118,10 +1279,132 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
                 .and_then(|pr| pr.threads.get(&t.tid))
                 .and_then(|th| th.serving.iter().rev().flatten().find(|(pid, _)| *pid == owner).map(|(_, tid)| *tid))
         };
-        (owner, nested, ptr, cookie, sec, (!oneway).then_some((file.id, t.tid)))
+        (owner, nested, ptr, cookie, sec, (!oneway).then_some((file.id, t.tid)), Some(node))
     };
+    // A dead receiver, before anything is translated for it (a handle made for a dead process
+    // would hold its node for no one). The kernel's: a transaction to a dead process fails as
+    // the sender's BR_DEAD_REPLY; a reply to a caller gone completes for the replier.
+    if target_proc != HOST && st.procs.get(&target_proc).is_none_or(|pr| pr.dead) {
+        st.queue(file.id, Some(t.tid), if reply { Work::Complete } else { Work::ReturnError(BR_DEAD_REPLY) });
+        return Ok(());
+    }
 
-    // Translate the objects for the receiver.
+    // Translate the objects for the receiver; the nodes it names are held while it is in flight,
+    // its target's too (the kernel's `binder_inc_node` for the transaction's buffer).
+    let mut pinned = Vec::new();
+    let translated = translate_objects(p, t, &mut st, (file.id, t.tid), target_proc, &mut data, &offsets, &mut pinned);
+    let (fds, sg, fda) = match translated {
+        Ok(objects) => objects,
+        Err(e) => {
+            st.unpin(pinned);
+            return Err(e);
+        }
+    };
+    if let Some(node) = target_node {
+        st.pin(node, &mut pinned);
+    }
+    if target_proc == HOST {
+        // The host's handles hold what it is sent for as long as it runs.
+        st.unpin(std::mem::take(&mut pinned));
+    }
+
+    // OMNI_BINDER_TRACE=1: every transaction and reply, sender to receiver.
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var("OMNI_BINDER_TRACE").is_ok_and(|v| v == "1" || v == "2")) {
+        let to = if target_proc == HOST { "host".to_string() } else { format!("{}", st.procs.get(&target_proc).map_or(0, |pr| pr.pid)) };
+        eprintln!(
+            "[binder] {} {}:{} -> {to} code {code:#x}{} ({} bytes)",
+            if reply { "reply" } else { "call" },
+            p.sys.pid,
+            t.tid,
+            if oneway { " oneway" } else { "" },
+            data.len()
+        );
+    }
+    let txn = Txn {
+        reply,
+        oneway,
+        from,
+        target_ptr,
+        target_cookie,
+        secctx,
+        code,
+        flags,
+        sender_pid: p.sys.pid,
+        sender_euid: p.sys.uid(),
+        data,
+        offsets,
+        fds,
+        sg,
+        fda,
+        async_node: None,
+        pinned,
+    };
+    if !reply && target_proc == HOST {
+        // A host service answers on a host thread of its own, while the sender waits in `read`
+        // as it would for any process: a handler may take time, and may call back into the
+        // sender, which the waiting thread then serves. The sender hears its transaction went,
+        // then the reply, as the kernel orders them (the handler's reply waits for the lock).
+        let handler = st.host_services.get(&target_ptr).cloned();
+        let handles = txn
+            .offsets
+            .iter()
+            .filter_map(|&off| {
+                let obj = txn.data.get(off as usize..off as usize + 16)?;
+                matches!(u32_at(obj, 0), TYPE_HANDLE | TYPE_WEAK_HANDLE).then(|| u32_at(obj, 8))
+            })
+            .collect();
+        let call = HostCall {
+            code,
+            fds: txn.fds.into_iter().map(|(_, f)| f).collect(),
+            handles,
+            offsets: txn.offsets,
+            data: txn.data,
+            sender_pid: txn.sender_pid,
+            sender_euid: txn.sender_euid,
+        };
+        let (broker, caller) = (Arc::clone(&file.broker), (file.id, t.tid));
+        std::thread::Builder::new()
+            .name("omni-binder-host".into())
+            .spawn(move || {
+                HOST_SERVING.with(|s| s.set(Some(caller)));
+                let reply = handler.map_or_else(HostReply::default, |h| h(call));
+                if !oneway {
+                    let mut st = broker.state.lock();
+                    if st.procs.get(&caller.0).is_some_and(|pr| !pr.dead) {
+                        // A reply the host built wrong fails the call, as a malformed reply would.
+                        let work = st.reply_from_host(caller.0, reply).map_or(Work::FailedReply, |r| Work::Txn(Box::new(r)));
+                        st.queue(caller.0, Some(caller.1), work);
+                    }
+                }
+            })
+            .map_err(|_| ENOMEM)?;
+        if !oneway {
+            st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
+        }
+        st.queue(file.id, Some(t.tid), Work::Complete);
+        return Ok(());
+    }
+    // A sync transaction: the sender now waits for its reply (the kernel's transaction_stack).
+    if !reply && !oneway {
+        st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
+    }
+    match (oneway, target_node) {
+        (true, Some(node)) => st.queue_oneway(target_proc, node, txn),
+        _ => st.queue(target_proc, target_tid, Work::Txn(Box::new(txn))),
+    }
+    st.queue(file.id, Some(t.tid), Work::Complete);
+    Ok(())
+}
+
+/// The descriptors, scatter-gather buffers and fd arrays a transaction carries.
+type Objects = (Vec<(usize, Arc<OpenFile>)>, Vec<SgBuffer>, Vec<(usize, usize, Vec<Arc<OpenFile>>)>);
+
+/// Translate the objects at `offsets` of `data` that `sender` sends to `target`: binders and
+/// handles rewritten in place (the nodes they name held in `pins`), descriptors, scatter-gather
+/// buffers and fd arrays gathered.
+#[allow(clippy::too_many_arguments)]
+fn translate_objects(p: &Process, t: &Task, st: &mut State, sender: (ProcId, i32), target: ProcId, data: &mut [u8], offsets: &[u64], pins: &mut Vec<NodeId>) -> Result<Objects, Errno> {
     let mut fds = Vec::new();
     let mut sg: Vec<SgBuffer> = Vec::new();
     let mut fda = Vec::new();
@@ -1165,8 +1448,8 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
         match u32_at(&obj, 0) {
             TYPE_BINDER | TYPE_WEAK_BINDER | TYPE_HANDLE | TYPE_WEAK_HANDLE => {
-                if let Some(to) = st.translate_ref((file.id, t.tid), target_proc, &obj)? {
-                    rewrite_ref(&mut data, off, to);
+                if let Some(to) = st.translate_ref(sender, target, &obj, pins)? {
+                    rewrite_ref(data, off, to);
                 }
             }
             TYPE_FD => {
@@ -1180,112 +1463,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
             }
         }
     }
-
-    // OMNI_BINDER_TRACE=1: every transaction and reply, sender to receiver.
-    static TRACE: OnceLock<bool> = OnceLock::new();
-    if *TRACE.get_or_init(|| std::env::var("OMNI_BINDER_TRACE").is_ok_and(|v| v == "1" || v == "2")) {
-        let to = if target_proc == HOST { "host".to_string() } else { format!("{}", st.procs.get(&target_proc).map_or(0, |pr| pr.pid)) };
-        eprintln!(
-            "[binder] {} {}:{} -> {to} code {code:#x}{} ({} bytes)",
-            if reply { "reply" } else { "call" },
-            p.sys.pid,
-            t.tid,
-            if oneway { " oneway" } else { "" },
-            data.len()
-        );
-    }
-    let txn = Txn {
-        reply,
-        oneway,
-        from,
-        target_ptr,
-        target_cookie,
-        secctx,
-        code,
-        flags,
-        sender_pid: p.sys.pid,
-        sender_euid: p.sys.uid(),
-        data,
-        offsets,
-        fds,
-        sg,
-        fda,
-        async_node: None,
-    };
-    let mut txn = txn;
-    if !reply && !oneway {
-        st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
-    }
-    if !reply && target_proc == HOST {
-        // A host service answers on a host thread of its own, while the sender waits in `read`
-        // as it would for any process: a handler may take time, and may call back into the
-        // sender, which the waiting thread then serves. The sender hears its transaction went,
-        // then the reply, as the kernel orders them.
-        let handler = st.host_services.get(&target_ptr).cloned();
-        st.queue(file.id, Some(t.tid), Work::Complete);
-        drop(st);
-        let handles = txn
-            .offsets
-            .iter()
-            .filter_map(|&off| {
-                let obj = txn.data.get(off as usize..off as usize + 16)?;
-                matches!(u32_at(obj, 0), TYPE_HANDLE | TYPE_WEAK_HANDLE).then(|| u32_at(obj, 8))
-            })
-            .collect();
-        let call = HostCall {
-            code,
-            fds: txn.fds.into_iter().map(|(_, f)| f).collect(),
-            handles,
-            offsets: txn.offsets,
-            data: txn.data,
-            sender_pid: txn.sender_pid,
-            sender_euid: txn.sender_euid,
-        };
-        let (broker, caller) = (Arc::clone(&file.broker), (file.id, t.tid));
-        std::thread::Builder::new()
-            .name("omni-binder-host".into())
-            .spawn(move || {
-                HOST_SERVING.with(|s| s.set(Some(caller)));
-                let reply = handler.map_or_else(HostReply::default, |h| h(call));
-                if !oneway {
-                    let mut st = broker.state.lock();
-                    if st.procs.get(&caller.0).is_some_and(|pr| !pr.dead) {
-                        // A reply the host built wrong fails the call, as a malformed reply would.
-                        let work = st.reply_from_host(caller.0, reply).map_or(Work::FailedReply, |r| Work::Txn(Box::new(r)));
-                        st.queue(caller.0, Some(caller.1), work);
-                    }
-                }
-            })
-            .map_err(|_| ENOMEM)?;
-        return Ok(());
-    }
-    let dead = st.procs.get(&target_proc).is_none_or(|pr| pr.dead);
-    if dead {
-        st.queue(file.id, Some(t.tid), if reply { Work::FailedReply } else { Work::DeadReply });
-        return Ok(());
-    }
-    // A oneway transaction waits while one to the same node is out, as the driver orders them.
-    if oneway {
-        if let Some(id) = st.local.get(&(target_proc, target_ptr)).copied() {
-            txn.async_node = Some(id);
-            if let Some(n) = st.nodes.get_mut(&id) {
-                if n.has_async {
-                    n.async_todo.push_back(Work::Txn(Box::new(txn)));
-                    if n.async_todo.len() % 64 == 0 {
-                        let (owner, queued) = (n.owner, n.async_todo.len());
-                        let pid = st.procs.get(&owner).map_or(0, |pr| pr.pid);
-                        eprintln!("[binder] {queued} oneway calls wait on node {id} of pid {pid} (its last one's buffer not freed)");
-                    }
-                    st.queue(file.id, Some(t.tid), Work::Complete);
-                    return Ok(());
-                }
-                n.has_async = true;
-            }
-        }
-    }
-    st.queue(target_proc, target_tid, Work::Txn(Box::new(txn)));
-    st.queue(file.id, Some(t.tid), Work::Complete);
-    Ok(())
+    Ok((fds, sg, fda))
 }
 
 /// Fill the read buffer with work for this thread, waiting for some when there is none.
@@ -1303,9 +1481,11 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
             let proc = st.proc_mut(file.id);
             let thread = proc.threads.entry(t.tid).or_default();
             let own = thread.todo.pop_front();
-            // A thread waiting for a reply takes only its own work; an idle looper also the
-            // process's.
-            let may_take_proc = thread.awaiting == 0 && thread.serving.is_empty();
+            // The kernel's `binder_available_for_proc_work_ilocked`: only a looper
+            // (BC_ENTER_LOOPER/BC_REGISTER_LOOPER) with no transaction on its stack -- neither
+            // waiting for a reply nor serving a call -- and nothing of its own takes the
+            // process's work. A thread waiting for a reply is never handed a oneway.
+            let may_take_proc = thread.looper && thread.awaiting == 0 && thread.serving.is_empty();
             let looper = thread.looper;
             match own {
                 Some(w) => Some(w),
@@ -1313,7 +1493,7 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
                     let w = proc.todo.pop_front();
                     // Ask for another looper when this one takes the last idle slot.
                     if w.is_some() && looper && proc.spawn_requested == 0 {
-                        let loopers = proc.threads.values().filter(|th| th.looper).count() as u32;
+                        let loopers = proc.threads.values().filter(|th| th.looper && !th.exited).count() as u32;
                         if loopers < proc.max_threads + 1 {
                             proc.spawn_requested += 1;
                             out.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
@@ -1326,10 +1506,22 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
         };
         match work {
             Some(w) => {
-                deliver(p, t, file, w, &mut out)?;
+                let handed = match deliver(p, t, file, w, &mut out) {
+                    Delivery::Put => None,
+                    Delivery::Txn(h) => Some(h),
+                    // It failed on its way in, its sender told: on to the next.
+                    Delivery::Nothing => continue,
+                };
                 // Return what is there; more comes on the next read.
                 let n = (out.len() as u64).min(size);
-                p.mem.write(at, &out[..n as usize])?;
+                if let Err(e) = p.mem.write(at, &out[..n as usize]) {
+                    // The kernel's copy_to_user failure: the transaction fails towards its sender
+                    // and the read is EFAULT.
+                    if let Some(h) = handed {
+                        undeliver(p, file, t.tid, h);
+                    }
+                    return Err(e);
+                }
                 return Ok(n);
             }
             None if nonblocking || (!first && !out.is_empty()) => {
@@ -1349,7 +1541,28 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
     }
 }
 
-fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &mut Vec<u8>) -> Result<(), Errno> {
+/// What [`deliver`] did with a work item.
+enum Delivery {
+    /// Its return is in `out`.
+    Put,
+    /// A transaction or reply, its return in `out`: undone ([`undeliver`]) if the read cannot
+    /// reach the thread.
+    Txn(Handed),
+    /// Nothing reached this thread: the transaction failed on its way in, and whoever waited on it
+    /// heard so.
+    Nothing,
+}
+
+/// A transaction handed to this thread: what taking it back undoes.
+struct Handed {
+    buf: u64,
+    fds: Vec<i32>,
+    reply: bool,
+    oneway: bool,
+    from: Option<(ProcId, i32)>,
+}
+
+fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &mut Vec<u8>) -> Delivery {
     let mut put = |cmd: u32, words: &[u64]| {
         out.extend_from_slice(&cmd.to_le_bytes());
         for w in words {
@@ -1358,6 +1571,7 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
     };
     match work {
         Work::Complete => put(BR_TRANSACTION_COMPLETE, &[]),
+        Work::ReturnError(cmd) => put(cmd, &[]),
         Work::DeadReply => {
             end_wait(file, t.tid);
             put(BR_DEAD_REPLY, &[]);
@@ -1374,97 +1588,181 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
         Work::ClearDeathDone { cookie } => put(BR_CLEAR_DEATH_NOTIFICATION_DONE, &[cookie]),
         Work::Txn(txn) => {
             let mut txn = *txn;
-            // Install the file descriptors it carries in this process.
-            for (off, open) in &txn.fds {
-                let fd = p.fds.insert(Arc::clone(open), true, 0)?;
-                txn.data[*off + 8..*off + 12].copy_from_slice(&(fd as u32).to_le_bytes());
-            }
-            let data_len = (txn.data.len() as u64 + 7) & !7;
-            let offsets_len = txn.offsets.len() as u64 * 8;
-            let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
-            let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
-            let Some(buf) = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len) else {
-                // Not delivered: the node's next oneway may go.
-                if let Some(node) = txn.async_node {
-                    file.broker.state.lock().async_done(node, file.id, None);
-                }
-                return Err(ENOMEM);
+            let mut fds = Vec::new();
+            let (buf, cmd, tr) = match place(p, file, &mut txn, &mut fds) {
+                Ok(placed) => placed,
+                Err(e) => return fail_undelivered(file, t.tid, txn, e, out),
             };
-            if let Some(node) = txn.async_node {
-                file.broker.state.lock().async_buffers.insert((file.id, buf), node);
+            let mut st = file.broker.state.lock();
+            // Freeing the buffer hands a oneway's node's next oneway out, and lets go the nodes
+            // the transaction held.
+            if txn.async_node.is_some() || !txn.pinned.is_empty() {
+                let pinned = std::mem::take(&mut txn.pinned);
+                st.buffers.insert((file.id, buf), Buffer { async_node: txn.async_node, pinned, tid: t.tid, code: txn.code });
             }
-            // Scatter-gather buffers go after the offsets: each object points at its copy, and a
-            // child's address is written into its parent's copy where the sender had it.
-            let mut sg_at = Vec::with_capacity(txn.sg.len());
-            let mut cursor = buf + data_len + offsets_len;
-            for b in &txn.sg {
-                sg_at.push(cursor);
-                cursor += (b.bytes.len() as u64 + 7) & !7;
-            }
-            for (i, b) in txn.sg.iter().enumerate() {
-                txn.data[b.obj_off + 8..b.obj_off + 16].copy_from_slice(&sg_at[i].to_le_bytes());
-            }
-            let mut sg_bytes: Vec<Vec<u8>> = txn.sg.iter().map(|b| b.bytes.clone()).collect();
-            for (i, b) in txn.sg.iter().enumerate() {
-                if let Some((parent, at)) = b.parent {
-                    if let Some(slot) = sg_bytes[parent].get_mut(at..at + 8) {
-                        slot.copy_from_slice(&sg_at[i].to_le_bytes());
-                    }
-                }
-            }
-            for (parent, at, files) in &txn.fda {
-                for (i, open) in files.iter().enumerate() {
-                    let fd = p.fds.insert(Arc::clone(open), true, 0)?;
-                    if let Some(slot) = sg_bytes[*parent].get_mut(at + i * 4..at + i * 4 + 4) {
-                        slot.copy_from_slice(&(fd as u32).to_le_bytes());
-                    }
-                }
-            }
-            let mut bytes = txn.data.clone();
-            bytes.resize(data_len as usize, 0);
-            for o in &txn.offsets {
-                bytes.extend_from_slice(&o.to_le_bytes());
-            }
-            for b in &sg_bytes {
-                let start = bytes.len();
-                bytes.extend_from_slice(b);
-                bytes.resize(start + ((b.len() + 7) & !7), 0);
-            }
-            bytes.extend_from_slice(if sec_len > 0 { SECCTX } else { &[] });
-            p.mem.write(buf, &bytes)?;
-            let mut tr = Vec::with_capacity(72);
-            tr.extend_from_slice(&txn.target_ptr.to_le_bytes());
-            tr.extend_from_slice(&txn.target_cookie.to_le_bytes());
-            tr.extend_from_slice(&txn.code.to_le_bytes());
-            tr.extend_from_slice(&txn.flags.to_le_bytes());
-            tr.extend_from_slice(&txn.sender_pid.to_le_bytes());
-            tr.extend_from_slice(&txn.sender_euid.to_le_bytes());
-            tr.extend_from_slice(&(txn.data.len() as u64).to_le_bytes());
-            tr.extend_from_slice(&offsets_len.to_le_bytes());
-            tr.extend_from_slice(&buf.to_le_bytes());
-            tr.extend_from_slice(&(buf + data_len).to_le_bytes());
-            let cmd = if txn.reply {
-                end_wait(file, t.tid);
-                BR_REPLY
-            } else {
+            let th = st.proc_mut(file.id).threads.entry(t.tid).or_default();
+            if txn.reply {
+                th.awaiting = th.awaiting.saturating_sub(1);
+            } else if !txn.oneway {
                 // A sync transaction: this thread now serves it, and its reply goes to `from`.
-                if !txn.oneway {
-                    let mut st = file.broker.state.lock();
-                    st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.push(txn.from);
-                }
-                if sec_len > 0 {
-                    tr.extend_from_slice(&(buf + data_len + offsets_len + sg_len).to_le_bytes());
-                    BR_TRANSACTION_SEC_CTX
-                } else {
-                    BR_TRANSACTION
-                }
-            };
+                th.serving.push(txn.from);
+            }
+            drop(st);
             out.extend_from_slice(&cmd.to_le_bytes());
             out.extend_from_slice(&tr);
+            return Delivery::Txn(Handed { buf, fds, reply: txn.reply, oneway: txn.oneway, from: txn.from });
         }
     }
     let _ = (BR_ERROR, BR_OK);
-    Ok(())
+    Delivery::Put
+}
+
+/// Copy `txn` into this process's receive area, installing the descriptors it carries (their
+/// numbers in `fds`): the buffer, and the return and its `binder_transaction_data`. On an error
+/// nothing of it is left: the descriptors are closed and the buffer is freed.
+fn place(p: &Process, file: &Arc<BinderFile>, txn: &mut Txn, fds: &mut Vec<i32>) -> Result<(u64, u32, Vec<u8>), Errno> {
+    let data_len = (txn.data.len() as u64 + 7) & !7;
+    let offsets_len = txn.offsets.len() as u64 * 8;
+    let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
+    let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
+    let buf = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len).ok_or(ENOMEM)?;
+    let filled = fill(p, txn, buf, (data_len, offsets_len, sg_len, sec_len), fds);
+    if filled.is_err() {
+        for fd in fds.drain(..) {
+            // A stand-in's descriptors are its app's: those it cannot take back (the app closes
+            // them with the transaction it never sees).
+            let _ = p.fds.remove(fd);
+        }
+        file.area.lock().free(buf);
+    }
+    filled?;
+    let mut tr = Vec::with_capacity(72);
+    tr.extend_from_slice(&txn.target_ptr.to_le_bytes());
+    tr.extend_from_slice(&txn.target_cookie.to_le_bytes());
+    tr.extend_from_slice(&txn.code.to_le_bytes());
+    tr.extend_from_slice(&txn.flags.to_le_bytes());
+    tr.extend_from_slice(&txn.sender_pid.to_le_bytes());
+    tr.extend_from_slice(&txn.sender_euid.to_le_bytes());
+    tr.extend_from_slice(&(txn.data.len() as u64).to_le_bytes());
+    tr.extend_from_slice(&offsets_len.to_le_bytes());
+    tr.extend_from_slice(&buf.to_le_bytes());
+    tr.extend_from_slice(&(buf + data_len).to_le_bytes());
+    let cmd = if txn.reply {
+        BR_REPLY
+    } else if sec_len > 0 {
+        tr.extend_from_slice(&(buf + data_len + offsets_len + sg_len).to_le_bytes());
+        BR_TRANSACTION_SEC_CTX
+    } else {
+        BR_TRANSACTION
+    };
+    Ok((buf, cmd, tr))
+}
+
+/// Install `txn`'s descriptors (recording them in `fds`) and write it into `buf`, laid out by
+/// `lens` (data, offsets, scatter-gather buffers, security context).
+fn fill(p: &Process, txn: &mut Txn, buf: u64, (data_len, offsets_len, _sg_len, sec_len): (u64, u64, u64, u64), fds: &mut Vec<i32>) -> Result<(), Errno> {
+    for (off, open) in &txn.fds {
+        let fd = p.fds.insert(Arc::clone(open), true, 0)?;
+        fds.push(fd);
+        txn.data[*off + 8..*off + 12].copy_from_slice(&(fd as u32).to_le_bytes());
+    }
+    // Scatter-gather buffers go after the offsets: each object points at its copy, and a
+    // child's address is written into its parent's copy where the sender had it.
+    let mut sg_at = Vec::with_capacity(txn.sg.len());
+    let mut cursor = buf + data_len + offsets_len;
+    for b in &txn.sg {
+        sg_at.push(cursor);
+        cursor += (b.bytes.len() as u64 + 7) & !7;
+    }
+    for (i, b) in txn.sg.iter().enumerate() {
+        txn.data[b.obj_off + 8..b.obj_off + 16].copy_from_slice(&sg_at[i].to_le_bytes());
+    }
+    let mut sg_bytes: Vec<Vec<u8>> = txn.sg.iter().map(|b| b.bytes.clone()).collect();
+    for (i, b) in txn.sg.iter().enumerate() {
+        if let Some((parent, at)) = b.parent {
+            if let Some(slot) = sg_bytes[parent].get_mut(at..at + 8) {
+                slot.copy_from_slice(&sg_at[i].to_le_bytes());
+            }
+        }
+    }
+    for (parent, at, files) in &txn.fda {
+        for (i, open) in files.iter().enumerate() {
+            let fd = p.fds.insert(Arc::clone(open), true, 0)?;
+            fds.push(fd);
+            if let Some(slot) = sg_bytes[*parent].get_mut(at + i * 4..at + i * 4 + 4) {
+                slot.copy_from_slice(&(fd as u32).to_le_bytes());
+            }
+        }
+    }
+    let mut bytes = txn.data.clone();
+    bytes.resize(data_len as usize, 0);
+    for o in &txn.offsets {
+        bytes.extend_from_slice(&o.to_le_bytes());
+    }
+    for b in &sg_bytes {
+        let start = bytes.len();
+        bytes.extend_from_slice(b);
+        bytes.resize(start + ((b.len() + 7) & !7), 0);
+    }
+    bytes.extend_from_slice(if sec_len > 0 { SECCTX } else { &[] });
+    p.mem.write(buf, &bytes)
+}
+
+/// `txn` could not be placed in this process (`error`): nothing of it reached this thread. The
+/// kernel translates descriptors when the transaction is sent, so it fails such a transaction
+/// towards its sender, never the receiver; here they go in on delivery, so the failure goes
+/// where the kernel's would -- a sync transaction's sender reads BR_FAILED_REPLY, a oneway is
+/// dropped (its sender was told it went) and its node's next goes, and a reply this thread
+/// waited for is its BR_FAILED_REPLY.
+fn fail_undelivered(file: &Arc<BinderFile>, tid: i32, txn: Txn, error: Errno, out: &mut Vec<u8>) -> Delivery {
+    let mut st = file.broker.state.lock();
+    let pid = st.procs.get(&file.id).map_or(0, |pr| pr.pid);
+    eprintln!(
+        "[binder] {pid}:{tid} {} code {:#x} not delivered: errno {}",
+        if txn.reply { "reply" } else if txn.oneway { "oneway" } else { "transaction" },
+        txn.code,
+        error.0
+    );
+    st.unpin(txn.pinned);
+    if txn.reply {
+        let th = st.proc_mut(file.id).threads.entry(tid).or_default();
+        th.awaiting = th.awaiting.saturating_sub(1);
+        out.extend_from_slice(&BR_FAILED_REPLY.to_le_bytes());
+        return Delivery::Put;
+    }
+    if let Some(node) = txn.async_node {
+        st.async_done(node, file.id);
+    }
+    if let (false, Some((proc, from))) = (txn.oneway, txn.from) {
+        st.queue(proc, Some(from), Work::FailedReply);
+    }
+    Delivery::Nothing
+}
+
+/// A transaction handed to this thread whose read could not reach it (the kernel's
+/// copy_to_user failure): its descriptors are closed, its buffer freed, and it fails towards its
+/// sender as [`fail_undelivered`] does -- a reply's wait has ended, and the read's error answers it.
+fn undeliver(p: &Process, file: &Arc<BinderFile>, tid: i32, h: Handed) {
+    for fd in h.fds {
+        let _ = p.fds.remove(fd);
+    }
+    file.area.lock().free(h.buf);
+    let mut st = file.broker.state.lock();
+    if let Some(b) = st.buffers.remove(&(file.id, h.buf)) {
+        if let Some(node) = b.async_node {
+            st.async_done(node, file.id);
+        }
+        st.unpin(b.pinned);
+    }
+    if !h.reply && !h.oneway {
+        let th = st.proc_mut(file.id).threads.entry(tid).or_default();
+        if th.serving.last().copied() == Some(h.from) {
+            th.serving.pop();
+        }
+        if let Some((proc, from)) = h.from {
+            st.queue(proc, Some(from), Work::FailedReply);
+        }
+    }
 }
 
 /// The reply (or its failure) this thread waited for has come.
@@ -1472,4 +1770,56 @@ fn end_wait(file: &Arc<BinderFile>, tid: i32) {
     let mut st = file.broker.state.lock();
     let th = st.proc_mut(file.id).threads.entry(tid).or_default();
     th.awaiting = th.awaiting.saturating_sub(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oneway(node: NodeId, code: u32) -> Work {
+        Work::Txn(Box::new(Txn {
+            reply: false,
+            oneway: true,
+            from: None,
+            target_ptr: 0x10,
+            target_cookie: 0,
+            secctx: false,
+            code,
+            flags: TF_ONE_WAY,
+            sender_pid: 0,
+            sender_euid: 0,
+            data: Vec::new(),
+            offsets: Vec::new(),
+            fds: Vec::new(),
+            sg: Vec::new(),
+            fda: Vec::new(),
+            async_node: Some(node),
+            pinned: Vec::new(),
+        }))
+    }
+
+    /// The stall report names the next call's code and where the one out is.
+    #[test]
+    fn a_stalled_nodes_report_says_where_its_oneway_is() {
+        let mut st = State::default();
+        st.procs.insert(1, ProcState { pid: 42, ..ProcState::default() });
+        let node = st.local_node(1, 0x10, 0x20, 0);
+        st.nodes.get_mut(&node).unwrap().async_todo.push_back(oneway(node, 0x44));
+        st.proc_mut(1).threads.insert(7, ThreadState { looper: true, awaiting: 1, ..ThreadState::default() });
+
+        st.buffers.insert((1, 0x9000), Buffer { async_node: Some(node), pinned: Vec::new(), tid: 7, code: 0x33 });
+        let delivered = st.async_stall(node);
+        assert!(delivered.starts_with("1 oneway calls wait on node 1 (0x10) of pid 42: next code 0x44"), "{delivered}");
+        assert!(delivered.contains("code 0x33 delivered to thread 7 in buffer 0x9000, not freed (thread: looper true, awaiting 1"), "{delivered}");
+
+        st.buffers.clear();
+        st.proc_mut(1).threads.get_mut(&7).unwrap().todo.push_back(oneway(node, 0x33));
+        let queued = st.async_stall(node);
+        assert!(queued.contains("code 0x33 queued for thread 7 (looper true, awaiting 1, serving 0, 1 queued)"), "{queued}");
+
+        st.proc_mut(1).threads.get_mut(&7).unwrap().todo.clear();
+        st.proc_mut(1).todo.push_back(oneway(node, 0x33));
+        let for_proc = st.async_stall(node);
+        assert!(for_proc.contains("code 0x33 queued for the process (0 of 1 threads free to take it)"), "{for_proc}");
+    }
 }
