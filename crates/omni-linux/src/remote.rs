@@ -108,6 +108,10 @@ fn describe(file: &OpenFile) -> Vec<u8> {
             d
         }
         FileKind::SyncFile(_) => vec![2u8],
+        // A socket or a pipe cannot cross yet: the receiver gets a connected end of its own whose
+        // other end stays open (a window's InputChannel: the window works, no input reaches it).
+        FileKind::Socket(s) => vec![3u8, s.ty as u8],
+        FileKind::Pipe(end) => vec![4u8, u8::from(end.is_write())],
         _ => vec![0u8],
     }
 }
@@ -128,12 +132,31 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
             let shm = crate::shm::Shm::open_path(&name, std::path::Path::new(&path), len)?;
             Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Shared(shm)), flags: parking_lot::Mutex::new(2) })
         }
+        Some(3) => {
+            let ty = u64::from(d.get(1).copied().unwrap_or(5));
+            let (mine, other) = crate::socket::pair(ty, 0);
+            let socket = crate::socket::Socket { domain: 1, ty, peer: Some(mine), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0 };
+            keep(Box::new(other));
+            Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(socket)), flags: parking_lot::Mutex::new(2) })
+        }
+        Some(4) => {
+            let (read, write) = crate::pipe::pair();
+            let (mine, other) = if d.get(1) == Some(&1) { (write, read) } else { (read, write) };
+            keep(Box::new(other));
+            Arc::try_unwrap(mine).map_err(|_| EIO)
+        }
         Some(2) => {
             let now = crate::sys::monotonic().as_nanos() as u64;
             Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::SyncFile(Arc::new(crate::sync_file::SyncFile { signalled_ns: now }))), flags: parking_lot::Mutex::new(0) })
         }
         _ => Err(EBADF),
     }
+}
+
+/// The far ends of the stand-in pairs and pipes above, kept open.
+fn keep(end: Box<dyn std::any::Any + Send>) {
+    static KEPT: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
+    KEPT.lock().push(end);
 }
 
 // ---------------------------------------------------------------------------------------------

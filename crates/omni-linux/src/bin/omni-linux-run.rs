@@ -19,6 +19,8 @@ fn main() -> ExitCode {
     let mut hals: Vec<String> = Vec::new();
     let mut caps: Option<u64> = None;
     let mut setprops: Vec<(String, String)> = Vec::new();
+    let mut zygote = false;
+    let mut then: Vec<String> = Vec::new();
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -32,6 +34,11 @@ fn main() -> ExitCode {
             "--binder-server" => omni_linux::remote::set_server(&args.next().expect("--binder-server needs host:port")),
             // The program's pid, as the system assigned it.
             "--pid" => omni_linux::process::assign_next_pid(args.next().and_then(|v| v.parse().ok()).expect("--pid needs a number")),
+            // Answer /dev/socket/zygote: apps ActivityManager starts are launched in host processes
+            // of their own, their binder this one's (`omni_linux::zygote`).
+            "--zygote" => zygote = true,
+            // A shell command run beside the program, as the shell user (adb's `shell`).
+            "--then" => then.push(args.next().expect("--then needs a shell command")),
             // A property set before the program starts (`name=value`), as init sets one.
             "--setprop" => {
                 let kv = args.next().expect("--setprop needs name=value");
@@ -70,6 +77,17 @@ fn main() -> ExitCode {
             return ExitCode::from(127);
         }
     };
+    if zygote {
+        match omni_linux::remote::serve(std::sync::Arc::clone(p.vfs.sysroot())) {
+            Ok(addr) => {
+                let runner = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("omni-linux-run"));
+                let launcher = omni_linux::zygote::Launcher { runner, sysroot: sysroot.clone(), instance: instance.clone(), envp: envp.clone(), binder: addr.to_string() };
+                omni_linux::zygote::serve(std::sync::Arc::as_ptr(p.vfs.binds()) as usize, launcher);
+                eprintln!("[zygote] /dev/socket/zygote; apps' binder at {addr}");
+            }
+            Err(e) => eprintln!("[zygote] {e}"),
+        }
+    }
     // The daemons after the program: the program reserves its address space first, where ART
     // needs it (below 4 GiB); a native daemon lives anywhere.
     let mut daemons = Vec::new();
@@ -163,6 +181,26 @@ fn main() -> ExitCode {
         let service = omni_linux::props::PropertyService::global(p.vfs.sysroot());
         for (k, v) in &setprops {
             service.set(k, v);
+        }
+    }
+    for command in &then {
+        let config = SpawnConfig {
+            sysroot: sysroot.clone(),
+            instance_dir: instance.clone(),
+            argv: vec![b"/system/bin/sh".to_vec(), b"-c".to_vec(), command.as_bytes().to_vec()],
+            envp: envp.iter().filter(|e| !e.starts_with(b"CLASSPATH=")).cloned().collect(),
+            stdout: Output::Host,
+            stderr: Output::Host,
+            trace: false,
+        };
+        match Process::spawn_as(config, 2000) {
+            Ok(sh) => {
+                std::thread::spawn(move || {
+                    let status = sh.run();
+                    eprintln!("[then] {status:?}");
+                });
+            }
+            Err(e) => eprintln!("[then] {e}"),
         }
     }
     let status = p.run();

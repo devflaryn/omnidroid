@@ -40,6 +40,7 @@ pub mod syscall;
 pub mod vfs;
 pub mod xattr;
 pub mod xtables;
+pub mod zygote;
 
 pub use fd::Output;
 pub use process::{Exit, ExitStatus, Process, SpawnConfig, Task};

@@ -162,6 +162,14 @@ pub fn end_of(file: &OpenFile) -> Option<(Arc<Pipe>, bool, bool)> {
     }
 }
 
+/// A new pipe's two ends (read, write), as open files.
+#[must_use]
+pub fn pair() -> (Arc<OpenFile>, Arc<OpenFile>) {
+    let pipe = Arc::new(Pipe::default());
+    let open = |write: bool| Arc::new(OpenFile { kind: Mutex::new(FileKind::Pipe(End::new(&pipe, write))), flags: Mutex::new(if write { 1 } else { 0 }) });
+    (open(false), open(true))
+}
+
 fn sys_pipe2(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if a[1] & !(O_CLOEXEC | u64::from(O_NONBLOCK) | 0o40000 /* O_DIRECT */) != 0 {
         return Err(EINVAL);

@@ -116,13 +116,27 @@ Windows and Linux (see STATUS).
 
 - **D3b done on Windows** (`tests/d3b_display.rs`, the bootanimation screenshot). Linux open:
   RenderEngine faults in ANGLE on lavapipe (STATUS).
-- **D3c/C4 now**: system_server passes StartDisplayManager, stops in PackageManagerService: (1)
-  apexd activates no APEX (it cannot mkdir/mount `/apex/<name>@<v>` -- the plan: present the
-  sysroot's already-extracted APEXes as mounted through `/proc/mounts` + `/sys/block/loopN/loop/
-  backing_file`, which apexd's `PopulateFromMounts` reads, so the real apexd reports them active);
-  (2) installd SIGSEGVs at start (null deref); (3) the audio HAL (goldfish) is waited for.
-  Probe script shape: `omni-linux-run --init early_hal,core,hal,main --hal gralloc --hal composer`
-  with OMNI_SCREENSHOT=<png>.
+- **C4 now (2026-09-27)**: on a fresh instance, system_server boots through PackageManager,
+  SettingsProvider, WindowManager, input, Bluetooth and NetworkManagement (netd up) to
+  `StartNetworkStatsService`; the last run then aborted in ClatCoordinator on bpffs pin modes and
+  contexts (fixed since in `1f21f27..`: bpffs keeps modes/owners, genfs contexts from the image's
+  policy). What the boot needed, all below the framework: init's `wait_for_prop`, `setprop`,
+  `restart`, `init_user0` (vdc), `perform_apex_config` (linkerconfig), `load_bpf_programs`, APEX
+  versioned `.rc`, `socket` (init sockets); the kernel's xattrs/restorecon, bind mounts, fork/
+  exec/wait (vfork child in the parent's memory, the parent's private memory snapshot-restored),
+  ownership (persisted per instance), record locks, flock, capabilities, set*id, pwrite, sendfile,
+  eBPF (maps, programs, bpffs, attach/query), xtables, netlink, Unix server sockets, the boot id
+  and `/dev/ashmem<boot_id>`. The device lists no sensor sub-HAL (`device/vendor/etc/sensors/
+  hals.conf`). system_server is started directly: `--caps` (the zygote's set) and `--setprop
+  dalvik.vm.profilesystemserver=true` (standalone jars' class loaders on first use).
+- **C5 in progress** (spec `docs/superpowers/specs/2026-09-27-c5-app-launch-design.md`): binder
+  across host processes works (`tests/c3_remote_binder.rs`; `--binder-server`, `--pid`); the
+  zygote responder (`--zygote`, `crate::zygote`) launches an app's `app_process64 ...
+  android.app.ActivityThread seq=<n>` in its own host process. Probe: scratchpad `run_c5.sh`
+  (probe APK `tests/fixtures/probe-app/probe.apk` in `/data/app`, `--then` runs `am start`).
+- Probing: `OMNI_INIT_TRACE=1` (init's commands), `OMNI_TRACE_SERVICE=<name>` (one service's
+  syscalls), `OMNI_FS_TRACE=1` (unlink/rename), `OMNI_REMOTE_TRACE=1` (cross-host binder frames).
+  A full-disk C: shows as ENOMEM in every spawn (page file cannot grow): prune target/debug/deps.
 - system_server command = `app_process64 -Xgc:CMC -Xhidden-api-policy:disabled /system/bin
   com.android.server.SystemServer` as uid 1000 with CLASSPATH=$SYSTEMSERVERCLASSPATH and the
   derive_classpath environment, `omni-linux-run --init early_hal,core,hal,main --hal gralloc`
