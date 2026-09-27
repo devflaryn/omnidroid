@@ -364,6 +364,7 @@ fn sys_msync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 const MREMAP_MAYMOVE: u64 = 1;
 const MREMAP_FIXED: u64 = 2;
+const MREMAP_DONTUNMAP: u64 = 4;
 
 fn prot_bits(p: Protection) -> u32 {
     match p {
@@ -382,7 +383,11 @@ fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let (old, flags, target) = (crate::guest::untag(a[0]), a[3], crate::guest::untag(a[4]));
     let old_len = p.mm.span(old, a[1]).ok_or(EINVAL)?;
     let new_len = p.mm.span(if flags & MREMAP_FIXED != 0 { target } else { 0 }, a[2]).ok_or(ENOMEM)?;
-    if old % page != 0 || new_len == 0 || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
+    let dontunmap = flags & MREMAP_DONTUNMAP != 0;
+    if dontunmap && (flags & MREMAP_MAYMOVE == 0 || new_len != old_len) {
+        return Err(EINVAL);
+    }
+    if old % page != 0 || new_len == 0 || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
         p.refusals.record(format!("mremap flags {flags:#x}"), t.pc, t.lr);
         return Err(EINVAL);
     }
@@ -406,14 +411,29 @@ fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     if prot == Protection::None || prot == Protection::ReadExecute {
         p.mm.protect(old, keep, PROT_READ).map_err(|_| EFAULT)?;
     }
-    let bytes = p.mem.read(old, keep as usize)?;
     let flags = 0x22 | if fixed { MAP_FIXED } else { 0 }; // MAP_PRIVATE | MAP_ANONYMOUS
     let at = p.mm.map(p, t, MapRequest { addr: if fixed { target } else { 0 }, len: new_len, prot: PROT_READ | PROT_WRITE, flags, fd: -1, offset: 0 })?;
-    p.mem.write(at, &bytes)?;
+    // In pieces: the range may be a GC space of hundreds of MiB.
+    const PIECE: u64 = 16 << 20;
+    let mut done = 0;
+    while done < keep {
+        let n = (keep - done).min(PIECE);
+        let bytes = p.mem.read(old + done, n as usize)?;
+        p.mem.write(at + done, &bytes)?;
+        done += n;
+    }
     if prot != Protection::ReadWrite {
         p.mm.protect(at, new_len, prot_bits(prot))?;
     }
-    p.mm.unmap(old, old_len)?;
+    if dontunmap {
+        // The old range stays mapped, its pages gone: it reads zeros, with its protection back.
+        p.mm.discard(old, old_len)?;
+        if prot == Protection::None || prot == Protection::ReadExecute {
+            p.mm.protect(old, keep, prot_bits(prot))?;
+        }
+    } else {
+        p.mm.unmap(old, old_len)?;
+    }
     Ok(at)
 }
 

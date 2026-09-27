@@ -245,3 +245,21 @@ fn madv_remove_reads_back_zeros_and_an_unaligned_start_is_einval() {
     assert_eq!(p.mem.read(at + pg, 64).unwrap(), vec![0; 64]);
     assert_eq!(p.syscall(&mut t, nr::MADVISE, [at + 8, pg, 4, 0, 0, 0]) as i64, -(EINVAL.0 as i64));
 }
+
+/// `MREMAP_DONTUNMAP` (ART's compacting GC moves its space's pages aside with it): the pages move
+/// to the new address, and the old range stays mapped, reading zeros.
+#[test]
+fn mremap_dontunmap_moves_the_pages_and_leaves_the_old_range_mapped_and_empty() {
+    let (p, mut t, _, pg) = process();
+    let len = 8 * pg;
+    let old = mmap(&p, &mut t, [0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    let target = mmap(&p, &mut t, [0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    p.mem.write(old + 3 * pg + 5, b"moved").unwrap();
+    // MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP
+    assert_eq!(p.syscall(&mut t, nr::MREMAP, [old, len, len, 7, target, 0]), target);
+    assert_eq!(p.mem.read(target + 3 * pg + 5, 5).unwrap(), b"moved");
+    assert_eq!(p.mem.read(old + 3 * pg + 5, 5).unwrap(), vec![0; 5], "the old range is mapped and empty");
+    p.mem.write(old, b"x").unwrap();
+    // Different lengths are EINVAL with DONTUNMAP.
+    assert_eq!(p.syscall(&mut t, nr::MREMAP, [old, len, 2 * len, 7, target, 0]) as i64, -(EINVAL.0 as i64));
+}
