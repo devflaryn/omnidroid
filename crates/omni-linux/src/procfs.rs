@@ -268,6 +268,62 @@ fn loadavg(p: &Process) -> Vec<u8> {
     format!("0.00 0.00 0.00 1/1 {}\n", p.sys.pid).into_bytes()
 }
 
+/// This kernel's configuration, as `CONFIG_IKCONFIG_PROC` publishes it: what the personality
+/// offers (VINTF reads it; ActivityManager asks it whether stacks are vmapped).
+const KERNEL_CONFIG: &str = "\
+CONFIG_ARM64=y
+CONFIG_64BIT=y
+CONFIG_MMU=y
+CONFIG_ARM64_4K_PAGES=y
+CONFIG_ARM64_TAGGED_ADDR_ABI=n
+CONFIG_VMAP_STACK=y
+CONFIG_SHADOW_CALL_STACK=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+CONFIG_ANDROID_BINDER_IPC=y
+CONFIG_ANDROID_BINDER_DEVICES=\"binder,hwbinder,vndbinder\"
+CONFIG_ASHMEM=y
+CONFIG_MEMFD_CREATE=y
+CONFIG_FUTEX=y
+CONFIG_FUTEX_PI=y
+CONFIG_EPOLL=y
+CONFIG_EVENTFD=y
+CONFIG_TIMERFD=y
+CONFIG_SIGNALFD=y
+CONFIG_INOTIFY_USER=y
+CONFIG_SYNC_FILE=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_NET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_NETLINK_DIAG=n
+CONFIG_NET_KEY=y
+CONFIG_NETFILTER=y
+CONFIG_IP_NF_IPTABLES=y
+CONFIG_IP6_NF_IPTABLES=y
+CONFIG_SECURITY=y
+CONFIG_SECURITY_SELINUX=y
+CONFIG_TMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_TRACING=y
+CONFIG_FTRACE=y
+CONFIG_SWAP=n
+CONFIG_USERFAULTFD=n
+";
+
+fn kernel_config_gz(_p: &Process) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let _ = gz.write_all(KERNEL_CONFIG.as_bytes());
+    gz.finish().unwrap_or_default()
+}
+
 fn filesystems(_p: &Process) -> Vec<u8> {
     b"nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\nnodev\tselinuxfs\nnodev\tbinder\n\text4\n".to_vec()
 }
@@ -523,6 +579,7 @@ impl Process {
             "/proc/uptime" => return Some(Entry::File(uptime)),
             "/proc/loadavg" => return Some(Entry::File(loadavg)),
             "/proc/version" => return Some(Entry::File(version)),
+            "/proc/config.gz" => return Some(Entry::File(kernel_config_gz)),
             "/proc/mounts" => return Some(Entry::File(mounts)),
             "/proc/filesystems" => return Some(Entry::File(filesystems)),
             "/sys" => return Some(Entry::Dir(vec![("block", DT_DIR), ("class", DT_DIR), ("devices", DT_DIR), ("fs", DT_DIR), ("kernel", DT_DIR)])),

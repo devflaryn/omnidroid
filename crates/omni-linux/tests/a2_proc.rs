@@ -46,3 +46,14 @@ fn tracefs_is_mounted_with_tracing_off() {
     assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
     assert_eq!(out, "0\nmarked\n/sys/kernel/tracing/events\n", "{err}");
 }
+
+/// The kernel's configuration, as `CONFIG_IKCONFIG_PROC` publishes it (`/proc/config.gz`):
+/// ActivityManager aborts when VINTF cannot read it.
+#[test]
+fn the_kernel_configuration_is_published() {
+    let Some((status, out, err)) = common::run(&["/system/bin/sh", "-c", "zcat /proc/config.gz | grep -c '^CONFIG_'; zcat /proc/config.gz | grep VMAP_STACK"]) else { return };
+    assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
+    let mut lines = out.lines();
+    assert!(lines.next().and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n > 20), "{out}");
+    assert_eq!(lines.next(), Some("CONFIG_VMAP_STACK=y"), "{out}");
+}
