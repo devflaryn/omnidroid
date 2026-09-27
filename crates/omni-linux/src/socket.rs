@@ -22,6 +22,7 @@ const AF_INET: u64 = 2;
 const AF_INET6: u64 = 10;
 const AF_NETLINK: u64 = 16;
 const AF_KEY: u64 = 15;
+const AF_VSOCK: u64 = 40;
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
@@ -268,7 +269,9 @@ fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let (domain, ty) = (a[0], a[1]);
     // AF_KEY too: key management with no security associations (netd opens and closes one to
     // have the kernel synchronize RCU before it swaps its traffic-stats maps).
-    if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK | AF_KEY) {
+    // AF_VSOCK too: the device has its vsock transport, and nothing listens on the host side
+    // (connect below), as on a VM with no modem simulator or vsock adb.
+    if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK | AF_KEY | AF_VSOCK) {
         return Err(EAFNOSUPPORT);
     }
     let peer = if crate::hostnet::eligible(domain, ty & SOCK_TYPE_MASK, a[2]) {
@@ -316,6 +319,11 @@ fn sys_connect(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
     if socket.domain == AF_NETLINK {
         return Ok(0); // to the kernel: what it sends is answered (`crate::netlink`)
+    }
+    if socket.domain == AF_VSOCK {
+        // No host-side listener (a modem simulator, adb over vsock): virtio-vsock resets the
+        // connection.
+        return Err(crate::errno::ECONNRESET);
     }
     if socket.domain != AF_UNIX {
         // A raw or ICMP socket: the host's network does not stand behind it.

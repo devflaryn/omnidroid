@@ -1,0 +1,10 @@
+# omnidroid: this device has no modem. The image's RIL (libgoldfish-rild with the cuttlefish RIL)
+# talks to a modem simulator over vsock that nothing provides here, and retries without pause:
+# ~99,000 failed connects and log lines in 100 s, 2.4 GB of log in one session. A device without
+# a radio declares its RIL and does not start it.
+service vendor.ril-daemon /vendor/bin/hw/libgoldfish-rild
+    class main
+    user radio
+    group radio cache inet misc audio log readproc wakelock
+    capabilities BLOCK_SUSPEND NET_ADMIN NET_RAW
+    disabled

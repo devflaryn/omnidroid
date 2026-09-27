@@ -21,12 +21,14 @@ pub const FILES: &[(&str, &[u8])] = &[
     // This device has no sensors: the AOSP sensors multihal loads no sub-HAL and serves an empty
     // list (the image's lists the emulator's, which needs QEMU's sensors transport).
     ("/vendor/etc/sensors/hals.conf", include_bytes!("../device/vendor/etc/sensors/hals.conf")),
+    // This device has no modem: its RIL is declared and not started (the file says why).
+    ("/vendor/etc/init/rild_goldfish.rc", include_bytes!("../device/vendor/etc/init/rild_goldfish.rc")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a
 /// vendor partition holds for its hardware. Any other overlay path already in the image is an
 /// error.
-pub const REPLACES: &[&str] = &["/vendor/etc/sensors/hals.conf"];
+pub const REPLACES: &[&str] = &["/vendor/etc/sensors/hals.conf", "/vendor/etc/init/rild_goldfish.rc"];
 
 /// An overlay file as the sysroot holds it: its guest path, its manifest entry, and the host file
 /// with its bytes.
