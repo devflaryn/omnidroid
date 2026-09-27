@@ -25,7 +25,7 @@ fn main() -> ExitCode {
             "--env" => envp.push(args.next().expect("--env needs KEY=VALUE").into_bytes()),
             "--service" => services.push(args.next().expect("--service needs a program")),
             "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
-            "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc)")),
+            "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc, composer)")),
             // init: read the image's services, and class_start these classes (comma-separated).
             "--init" => init_classes = args.next().expect("--init needs classes").split(',').map(String::from).collect(),
             "--" => {
@@ -92,6 +92,8 @@ fn main() -> ExitCode {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
     let mut _served = Vec::new();
+    let mut _composers = Vec::new();
+    let mut framebuffer: Option<std::sync::Arc<omni_linux::hal::framebuffer::Framebuffer>> = None;
     for hal in &hals {
         let broker = omni_linux::binder::broker(omni_linux::binder::Context::Binder);
         match hal.as_str() {
@@ -103,8 +105,25 @@ fn main() -> ExitCode {
                 }
                 _served.push(allocator);
             }
+            "composer" => {
+                let fb = std::sync::Arc::new(omni_linux::hal::framebuffer::Framebuffer::new(omni_linux::hal::composer::WIDTH, omni_linux::hal::composer::HEIGHT));
+                let composer = omni_linux::hal::composer::Composer::new(std::sync::Arc::clone(&broker), std::sync::Arc::clone(&fb));
+                match composer.register() {
+                    Ok(()) => eprintln!("[hal] composer: {}", omni_linux::hal::composer::INSTANCE),
+                    Err(e) => eprintln!("[hal] composer: {e}"),
+                }
+                framebuffer = Some(fb);
+                _composers.push(composer);
+            }
             other => eprintln!("[hal] unknown HAL {other:?}"),
         }
+    }
+    // OMNI_SCREENSHOT=<path>: the display's framebuffer, as a PNG, every few seconds.
+    if let (Some(fb), Ok(path)) = (framebuffer.clone(), std::env::var("OMNI_SCREENSHOT")) {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = std::fs::write(&path, fb.png());
+        });
     }
     let status = p.run();
     // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.
