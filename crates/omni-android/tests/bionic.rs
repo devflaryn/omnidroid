@@ -6172,6 +6172,64 @@ fn the_process_symbols_answer_what_is_known_and_refuse_the_rest() {
     assert!(text.contains("ENOSYS"), "the refusal must say why -1/ENOSYS was rejected: {text}");
 }
 
+/// **`syscall(process_vm_readv)` copies within the guest's own address space**, the way a device's
+/// kernel copies it when a process reads its own memory.
+///
+/// A repacked APK's self-decrypting library issues it raw to read its own pages (a self-integrity
+/// read). The runtime *has* the thing being asked for -- guest memory reading guest memory -- so it
+/// is answered rather than refused, the same reason `gettid`, `futex` and `getrandom` are answered:
+/// a second spelling reaches an implementation the runtime already owns.
+///
+/// The interesting case is the one the flat-iovec contract turns on: **one remote segment feeding
+/// two local segments**. `process_vm_readv` treats each side as a flat byte sequence, so sixteen
+/// bytes read from one remote range must land split across two eight-byte local ranges, and the
+/// return is the byte count transferred.
+#[test]
+fn process_vm_readv_copies_the_guest_address_space_into_itself() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let d = f.guest.data;
+    let (remote_src, local1, local2) = (d + 0x100, d + 0x140, d + 0x180);
+    let (remote_iov, local_iov, out) = (d + 0x200, d + 0x240, d + 0x300);
+    let (a, b) = (0x1122_3344_5566_7788u64, 0x99aa_bbcc_ddee_ff00u64);
+    f.guest.write_u64(remote_src, a);
+    f.guest.write_u64(remote_src + 8, b);
+    f.guest.write_u64(local1, 0);
+    f.guest.write_u64(local2, 0);
+    // One remote iovec of sixteen bytes; two local iovecs of eight each.
+    f.guest.write_u64(remote_iov, remote_src as u64);
+    f.guest.write_u64(remote_iov + 8, 16);
+    f.guest.write_u64(local_iov, local1 as u64);
+    f.guest.write_u64(local_iov + 8, 8);
+    f.guest.write_u64(local_iov + 16, local2 as u64);
+    f.guest.write_u64(local_iov + 24, 8);
+
+    // `syscall(SYS_process_vm_readv, pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`, as
+    // libc issues it: the number in x0, the six arguments in x1..x6. The guest asks for its own pid
+    // first, then reads its own memory with it.
+    let entry = program(&f, |asm| {
+        asm.bl(f.thunk("getpid"));
+        asm.push(mov_reg(19, 0)); // save pid across the argument setup
+        asm.mov(0, SYS_PROCESS_VM_READV);
+        asm.push(mov_reg(1, 19)); // pid
+        asm.mov(2, local_iov as u64);
+        asm.mov(3, 2); // liovcnt
+        asm.mov(4, remote_iov as u64);
+        asm.mov(5, 1); // riovcnt
+        asm.mov(6, 0); // flags
+        asm.bl(f.thunk("syscall"));
+        asm.mov(22, out as u64);
+        asm.push(str_imm(0, 22, 0));
+    });
+    assert!(matches!(run_program(&f, entry).expect("completes"), ExitReason::Returned { .. }));
+    assert_eq!(f.guest.read_u64(out) as i64, 16, "sixteen bytes transferred");
+    assert_eq!(f.guest.read_u64(local1), a, "the first local segment got the first eight bytes");
+    assert_eq!(f.guest.read_u64(local2), b, "the second local segment got the next eight");
+}
+
+/// `process_vm_readv`, in the asm-generic numbering arm64 Linux uses.
+const SYS_PROCESS_VM_READV: u64 = 270;
+
 /// **`syscall(SYS_rt_sigprocmask)` is the engine's pointer-readability probe, and it answers it.**
 ///
 /// The engine passes `how = -1` deliberately: the kernel validates `sigsetsize`, then the `set`

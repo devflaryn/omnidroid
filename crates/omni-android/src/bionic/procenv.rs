@@ -1363,6 +1363,14 @@ const SYS_FUTEX: i64 = 98;
 /// directly, which is what `libroblox.so` does here.
 const SYS_GETRANDOM: i64 = 278;
 
+/// `process_vm_readv`, in the asm-generic numbering arm64 Linux uses.
+///
+/// **MEASURED**: a repacked build's self-decrypting library issues it raw to read its own pages
+/// (a self-integrity read of its own `.text`). It is answered for the same reason `gettid`,
+/// `futex` and `getrandom` are -- the runtime already has the thing under another name -- here,
+/// guest memory reading guest memory.
+const SYS_PROCESS_VM_READV: i64 = 270;
+
 /// `GRND_NONBLOCK`: do not wait for the entropy pool to be initialised; fail with `EAGAIN`.
 const GRND_NONBLOCK: u64 = 0x0001;
 /// `GRND_RANDOM`: draw from the blocking pool rather than `urandom`.
@@ -1808,8 +1816,139 @@ fn getrandom(c: &mut ImportCall<'_, '_>, buf: u64, buflen: u64, flags: u64) -> A
     Ok(())
 }
 
+/// The six arguments of `process_vm_readv`, gathered so the dispatch call is not a wall of `u64`s.
+struct ProcessVmReadv {
+    pid: u64,
+    local_iov: u64,
+    liovcnt: u64,
+    remote_iov: u64,
+    riovcnt: u64,
+    flags: u64,
+}
+
+/// One `struct iovec` on LP64: a base pointer and a length, sixteen bytes.
+const IOVEC_BYTES: usize = 16;
+/// `UIO_MAXIOV`: Linux refuses a longer iovec list with `EINVAL`.
+const UIO_MAXIOV: u64 = 1024;
+
+/// `ssize_t process_vm_readv(pid, local_iov, liovcnt, remote_iov, riovcnt, flags)`
+///
+/// **Answered only for the guest reading its own address space**, which is the whole of what a
+/// self-integrity read needs and the only process there is (one guest process per host process,
+/// sub-project C's design). It is a copy within the guest space -- `GuestMem` reading `GuestMem`,
+/// the identity mapping making each side a host address -- so it is answered rather than refused,
+/// the same reason [`syscall`] answers `gettid`, `futex` and `getrandom`: a second spelling reaches
+/// an implementation the runtime already owns. A foreign `pid`, or any nonzero `flags` (Linux
+/// defines none), is refused or `EINVAL` rather than faked.
+///
+/// The transfer is the kernel's: each side is a flat byte sequence across its iovecs, and
+/// `min(sum local, sum remote)` bytes are copied, so one remote segment can feed several local ones
+/// and the return is the count transferred. A bad address partway returns the bytes already copied
+/// if any, and `-1`/`EFAULT` if none -- exactly as reading through a short iovec does on Linux.
+fn process_vm_readv(c: &mut ImportCall<'_, '_>, args: ProcessVmReadv) -> AbiResult<()> {
+    let ProcessVmReadv { pid, local_iov, liovcnt, remote_iov, riovcnt, flags } = args;
+    let state = active(c.symbol(), c.address())?;
+    let self_pid = i64::from(omni_platform::process::pid());
+    let mut view = enter(c, &state);
+
+    if flags != 0 {
+        view.set_errno(omni_bionic::errno::consts::EINVAL);
+        c.ret().u64(-1i64 as u64);
+        return Ok(());
+    }
+    if i64::from(pid as i32) != self_pid {
+        return Err(view.refusal(format!(
+            "process_vm_readv for pid {}, which is not this process ({self_pid}). This runtime is \
+             one guest process per host process, so there is no other address space to read; a \
+             foreign pid is refused rather than answered from nothing",
+            pid as i32
+        )));
+    }
+    if liovcnt > UIO_MAXIOV || riovcnt > UIO_MAXIOV {
+        view.set_errno(omni_bionic::errno::consts::EINVAL);
+        c.ret().u64(-1i64 as u64);
+        return Ok(());
+    }
+
+    let locals = read_iovecs(&view, local_iov, liovcnt as usize, 1)?;
+    let remotes = read_iovecs(&view, remote_iov, riovcnt as usize, 3)?;
+
+    // The flat transfer: walk the remote segments, filling local segments as they run out.
+    let mut local = locals.into_iter();
+    let mut current: Option<(u64, usize)> = local.next();
+    let mut lo = 0usize;
+    let mut copied: usize = 0;
+    let mut fault: Option<AbiError> = None;
+    'remote: for (rbase, rlen) in remotes {
+        let mut roff = 0usize;
+        while roff < rlen {
+            // Advance to a local segment with room left.
+            while current.is_some_and(|(_, len)| lo >= len) {
+                current = local.next();
+                lo = 0;
+            }
+            let Some((lbase, llen)) = current else { break 'remote };
+            let chunk = (rlen - roff).min(llen - lo);
+            let result = view
+                .mem()
+                .read_bytes(guest_offset(rbase, roff), chunk, Blame::new(view.symbol(), view.address(), 3))
+                .and_then(|bytes| {
+                    view.mem().write_bytes(guest_offset(lbase, lo), &bytes, Blame::new(view.symbol(), view.address(), 1))
+                });
+            if let Err(error) = result {
+                fault = Some(error);
+                break 'remote;
+            }
+            copied += chunk;
+            roff += chunk;
+            lo += chunk;
+        }
+    }
+
+    // A page this process could not touch stops the transfer: the bytes already copied are the
+    // answer if there are any -- as a short read is -- and `-1`/`EFAULT` only when nothing moved.
+    if copied == 0 {
+        if let Some(error) = fault {
+            return Err(error);
+        }
+    }
+    c.ret().u64(copied as u64);
+    Ok(())
+}
+
+/// Read `count` `struct iovec`s at `array` into (base, length) pairs, blaming argument `argument`.
+///
+/// A length wider than the host's `usize` is refused rather than truncated; that is the one thing
+/// a byte count must never silently narrow (Global Constraint 11).
+fn read_iovecs(view: &GuestView<'_>, array: u64, count: usize, argument: usize) -> AbiResult<Vec<(u64, usize)>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let at = guest_address(view.blaming(argument), array)?;
+    let blame = Blame::new(view.symbol(), view.address(), argument);
+    let bytes = view.mem().read_bytes(at, count * IOVEC_BYTES, blame)?;
+    let mut out = Vec::with_capacity(count);
+    for entry in bytes.chunks_exact(IOVEC_BYTES) {
+        let base = u64::from_le_bytes(entry[0..8].try_into().expect("eight bytes"));
+        let len = u64::from_le_bytes(entry[8..16].try_into().expect("eight bytes"));
+        let len = usize::try_from(len).map_err(|_| {
+            view.refusal(format!("an iovec length {len} wider than the host's usize in process_vm_readv"))
+        })?;
+        out.push((base, len));
+    }
+    Ok(out)
+}
+
+/// A guest address plus a byte offset, as a host-usize guest address. The add **saturates** to
+/// `u64::MAX` rather than wrapping, because a wrap would turn an out-of-range range into a small
+/// in-bounds one; a saturated address is far outside the space and the memory check rejects it
+/// (Global Constraint 11).
+fn guest_offset(base: u64, offset: usize) -> GuestAddr {
+    base.saturating_add(offset as u64) as GuestAddr
+}
+
 pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
-    let (number, a1, a2, a3, a4, _a5, a6) = {
+    let (number, a1, a2, a3, a4, a5, a6) = {
         let mut a = c.args();
         (
             a.next_u64()? as i64,
@@ -1817,8 +1956,9 @@ pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
             a.next_u64()?,
             a.next_u64()?,
             a.next_u64()?,
-            // `uaddr2`, which only the operations this layer refuses use. Read so that the
-            // sixth argument -- `val3`, the bitset -- lands in the right register.
+            // `uaddr2` for futex (unused there), and `riovcnt` for process_vm_readv. Read so that
+            // the sixth argument -- futex's `val3`/the bitset, or the flags -- lands in the right
+            // register.
             a.next_u64()?,
             a.next_u64()?,
         )
@@ -1834,6 +1974,9 @@ pub(super) fn syscall(c: &mut ImportCall<'_, '_>) -> AbiResult<()> {
     }
     if number == SYS_GETRANDOM {
         return getrandom(c, a1, a2, a3);
+    }
+    if number == SYS_PROCESS_VM_READV {
+        return process_vm_readv(c, ProcessVmReadv { pid: a1, local_iov: a2, liovcnt: a3, remote_iov: a4, riovcnt: a5, flags: a6 });
     }
     // The volume a path or a descriptor is on, answered by the file layer that owns both. MEASURED
     // need for 44: a TaskScheduler worker died on it in the Pet Simulator 99 world (2026-09-24).
