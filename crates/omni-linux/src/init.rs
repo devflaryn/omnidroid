@@ -24,6 +24,8 @@ pub struct Service {
     pub classes: Vec<String>,
     pub disabled: bool,
     pub oneshot: bool,
+    /// `onrestart restart <service>`: the services restarted with this one.
+    pub onrestart: Vec<String>,
     /// `interface aidl <name>` and `interface <hidl@version::IFoo> <instance>`.
     pub interfaces: Vec<String>,
     /// `capabilities <NAME>...`: exactly these (bit `n` for `CAP_*` `n`).
@@ -322,6 +324,7 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                         "class" => s.classes = words[1..].iter().map(|w| (*w).to_string()).collect(),
                         "disabled" => s.disabled = true,
                         "oneshot" => s.oneshot = true,
+                        "onrestart" if words.len() >= 3 && words[1] == "restart" => s.onrestart.push(words[2].to_string()),
                         "interface" if words.len() >= 3 => s.interfaces.push(words[1..].join(" ")),
                         "socket" if words.len() >= 3 => {
                             let ty = match words[2].split('+').next() {
@@ -400,11 +403,16 @@ pub struct Init {
     services: HashMap<String, Service>,
     boot_commands: Vec<Command>,
     running: Mutex<HashMap<String, Weak<Process>>>,
+    /// Services stopped (`ctl.stop`): not restarted when they end.
+    stopped: Mutex<std::collections::HashSet<String>>,
     /// Services never started here, by program: what runs only in a zygote-forked process.
     skip: fn(&Service) -> bool,
 }
 
 static INIT: OnceLock<Arc<Init>> = OnceLock::new();
+
+/// A service is restarted no sooner than this after it last started (init's `restart_period`).
+const RESTART_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The init of this host process, once one is started.
 pub fn current() -> Option<Arc<Init>> {
@@ -430,6 +438,7 @@ impl Init {
             services,
             boot_commands,
             running: Mutex::default(),
+            stopped: Mutex::default(),
             // The zygote (app_process): apps are started without it (the C design, decision 4).
             skip: |s| s.argv.first().is_some_and(|p| p.contains("app_process")),
         });
@@ -637,14 +646,36 @@ impl Init {
                     p.sys.set_caps(caps);
                 }
                 self.running.lock().insert(name.to_string(), Arc::downgrade(&p));
+                self.stopped.lock().remove(name);
                 let name = name.to_string();
+                let (oneshot, onrestart) = (service.oneshot, service.onrestart.clone());
                 std::thread::Builder::new()
                     .name(format!("init-{name}"))
                     .spawn(move || {
+                        let started = std::time::Instant::now();
                         let status = p.run();
+                        drop(p);
                         if std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
                             eprintln!("[init] {name} ended: {status:?}");
                         }
+                        // A service that is not oneshot is restarted when it ends, as init does it:
+                        // no sooner than its restart period (five seconds) after it last started,
+                        // with the services it names `onrestart`; unless it was stopped.
+                        if oneshot {
+                            return;
+                        }
+                        std::thread::sleep(RESTART_PERIOD.saturating_sub(started.elapsed()));
+                        let Some(init) = current() else { return };
+                        if init.stopped.lock().contains(&name) {
+                            return;
+                        }
+                        if std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                            eprintln!("[init] restarting {name}");
+                        }
+                        for other in &onrestart {
+                            init.restart(other);
+                        }
+                        init.start_service(&name);
                     })
                     .is_ok()
             }
@@ -652,6 +683,26 @@ impl Init {
                 eprintln!("[init] {name}: {e}");
                 false
             }
+        }
+    }
+
+    /// Stop a service (`ctl.stop`): it ends as SIGKILL ends it, and is not restarted.
+    pub fn stop(&self, name: &str) {
+        self.stopped.lock().insert(name.to_string());
+        let running = self.running.lock().get(name).and_then(Weak::upgrade);
+        if let Some(p) = running {
+            p.end(crate::process::ExitStatus::Killed { signal: 9, pc: 0, detail: "stopped by init".into() });
+        }
+    }
+
+    /// Restart a service (`restart`, `onrestart restart`): stop it if it runs, then start it.
+    pub fn restart(&self, name: &str) {
+        let running = self.running.lock().get(name).and_then(Weak::upgrade);
+        if let Some(p) = running {
+            // Its own ending restarts it (it is not stopped).
+            p.end(crate::process::ExitStatus::Killed { signal: 9, pc: 0, detail: "restarted by init".into() });
+        } else {
+            self.start_service(name);
         }
     }
 
@@ -674,7 +725,11 @@ impl Init {
                 let wanted = value.strip_prefix("aidl/").unwrap_or(value);
                 self.service_for_interface(wanted).is_some_and(|s| self.start_service(&s))
             }
-            _ => true, // stop and the rest: nothing here stops a service yet
+            "ctl.stop" => {
+                self.stop(value);
+                true
+            }
+            _ => true,
         }
     }
 }

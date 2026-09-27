@@ -84,3 +84,16 @@ fn a_services_sockets_are_read() {
         assert!(sockets.iter().any(|(n, ty)| n == name && *ty == 1), "{name} in {sockets:?}");
     }
 }
+
+/// What a service restarts with it (`onrestart restart`), and whether it is restarted at all
+/// (`oneshot`): init restarts a service that ends unless it is oneshot or stopped.
+#[test]
+fn a_service_names_what_restarts_with_it() {
+    let sysroot = common::sysroot().expect("no sysroot (tools/make_sysroot.py)");
+    let instance = std::env::temp_dir().join(format!("omni-linux-init-onrestart-{}", std::process::id()));
+    let init = Init::start(sysroot, instance, Vec::new()).expect("init");
+    let hal = &init.services()["vendor.audio-hal"];
+    assert_eq!(hal.onrestart, ["audioserver"], "{:?}", hal.onrestart);
+    assert!(!hal.oneshot);
+    assert!(init.services()["derive_classpath"].oneshot);
+}
