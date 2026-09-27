@@ -51,7 +51,10 @@ pub struct Mm {
 
 fn protection(prot: u32) -> Result<Protection, Errno> {
     Ok(match (prot & PROT_READ != 0, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0) {
-        (_, true, true) => return Err(EACCES),
+        // Write and execute together -- ART's JIT code cache when it has no dual view. The guest's
+        // instructions are translated from memory, never run from it, so this is writable memory
+        // to the host, and its W^X is not at stake.
+        (_, true, true) => Protection::ReadWrite,
         (false, false, false) => Protection::None,
         (_, true, false) => Protection::ReadWrite,
         (_, false, true) => Protection::ReadExecute,
@@ -176,9 +179,7 @@ impl Mm {
         if req.len == 0 || req.offset % self.page != 0 {
             return Err(EINVAL);
         }
-        let prot = protection(req.prot).inspect_err(|_| {
-            p.refusals.record("mmap: PROT_WRITE|PROT_EXEC".into(), t.pc, t.lr);
-        })?;
+        let prot = protection(req.prot)?;
         let len = self.span(crate::guest::untag(req.addr), req.len).ok_or(ENOMEM)?;
         let fixed = req.flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
         if fixed && req.addr % self.page != 0 {

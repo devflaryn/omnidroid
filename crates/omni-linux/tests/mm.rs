@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use omni_linux::errno::{EACCES, EEXIST, EINVAL};
+use omni_linux::errno::{EEXIST, EINVAL};
 use omni_linux::fd::Output;
 use omni_linux::process::Process;
 use omni_linux::syscall::nr;
@@ -102,12 +102,18 @@ fn a_private_writable_file_mapping_does_not_change_the_file() {
     assert_eq!(p.mem.read(again, 2).unwrap(), [1, 2]);
 }
 
+/// Write and execute together (ART's JIT code cache without a dual view) is granted as writable
+/// memory: the guest's instructions are translated from memory, never run from it, so the host's
+/// W^X is not at stake.
 #[test]
-fn write_and_execute_together_is_refused_by_name() {
-    let (p, mut t, _, _) = process();
-    let r = mmap(&p, &mut t, [0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]);
-    assert_eq!(r, -(EACCES.0 as i64));
-    assert!(p.refusals.report().contains("PROT_WRITE|PROT_EXEC"));
+fn write_and_execute_together_is_granted_as_writable_memory() {
+    let (p, mut t, _, pg) = process();
+    let r = mmap(&p, &mut t, [0, pg, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]);
+    assert!(r > 0, "{r}");
+    p.mem.write(r as u64, b"code").unwrap();
+    assert_eq!(p.syscall(&mut t, nr::MPROTECT, [r as u64, pg, PROT_READ | PROT_EXEC, 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, nr::MPROTECT, [r as u64, pg, PROT_READ | PROT_WRITE | PROT_EXEC, 0, 0, 0]), 0);
+    p.mem.write(r as u64, b"more").unwrap();
     assert_eq!(mmap(&p, &mut t, [0, 0, PROT_READ, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]), -(EINVAL.0 as i64));
 }
 
