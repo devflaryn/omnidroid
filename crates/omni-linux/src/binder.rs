@@ -144,6 +144,11 @@ struct Node {
     cookie: u64,
     /// `BR_INCREFS`/`BR_ACQUIRE` sent: the owner holds the object for its remote references.
     held: bool,
+    /// `BR_ACQUIRE` sent and its `BC_ACQUIRE_DONE` not yet back: a release waits for it (the
+    /// kernel's `pending_strong_ref`), or the owner could drop the object before holding it.
+    acquiring: bool,
+    /// Released while `acquiring`: `BR_RELEASE`/`BR_DECREFS` go once the acquire is done.
+    release_deferred: bool,
     txn_security_ctx: bool,
     dead: bool,
     watchers: Vec<(ProcId, u64)>,
@@ -291,6 +296,7 @@ impl State {
         let n = self.nodes.get_mut(&node).expect("a node");
         if !n.held {
             n.held = true;
+            n.acquiring = true;
             let (owner, ptr, cookie) = (n.owner, n.ptr, n.cookie);
             let thread = sender.filter(|(p, _)| *p == owner).map(|(_, t)| t);
             self.queue(owner, thread, Work::Increfs { ptr, cookie });
@@ -319,6 +325,8 @@ impl State {
                 ptr,
                 cookie,
                 held: false,
+                acquiring: false,
+                release_deferred: false,
                 txn_security_ctx: flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0,
                 dead: false,
                 watchers: Vec::new(),
@@ -402,13 +410,30 @@ impl State {
             return false;
         }
         n.held = false;
-        let (owner, ptr, cookie) = (n.owner, n.ptr, n.cookie);
+        let (owner, ptr, cookie, acquiring) = (n.owner, n.ptr, n.cookie, n.acquiring);
+        if acquiring {
+            n.release_deferred = true;
+        }
         if self.local.get(&(owner, ptr)) == Some(&node) {
             self.local.remove(&(owner, ptr));
         }
-        self.queue(owner, None, Work::Release { ptr, cookie });
-        self.queue(owner, None, Work::Decrefs { ptr, cookie });
+        if !acquiring {
+            self.queue(owner, None, Work::Release { ptr, cookie });
+            self.queue(owner, None, Work::Decrefs { ptr, cookie });
+        }
         true
+    }
+
+    /// `BC_ACQUIRE_DONE` from `owner` for its object at `ptr`: a release that waited goes now.
+    fn acquire_done(&mut self, owner: ProcId, ptr: u64) {
+        let Some((&id, _)) = self.nodes.iter().find(|(_, n)| n.owner == owner && n.ptr == ptr && n.acquiring) else { return };
+        let n = self.nodes.get_mut(&id).expect("the node");
+        n.acquiring = false;
+        if std::mem::take(&mut n.release_deferred) {
+            let cookie = n.cookie;
+            self.queue(owner, None, Work::Release { ptr, cookie });
+            self.queue(owner, None, Work::Decrefs { ptr, cookie });
+        }
     }
 
     /// Queue work for a thread of `id`: `tid`'s own queue when given, the process's otherwise.
@@ -964,7 +989,8 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
             let up = matches!(code, BC_INCREFS | BC_ACQUIRE);
             file.broker.state.lock().count(file.id, u32_at(arg, 0), which, up);
         }
-        BC_INCREFS_DONE | BC_ACQUIRE_DONE | BC_DEAD_BINDER_DONE => {}
+        BC_ACQUIRE_DONE => file.broker.state.lock().acquire_done(file.id, u64_at(arg, 0)),
+        BC_INCREFS_DONE | BC_DEAD_BINDER_DONE => {}
         BC_REGISTER_LOOPER | BC_ENTER_LOOPER => {
             let mut st = file.broker.state.lock();
             let proc = st.proc_mut(file.id);

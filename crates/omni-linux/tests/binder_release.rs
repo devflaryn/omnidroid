@@ -17,6 +17,7 @@ const BR_INCREFS: u32 = 0x8010_7207;
 const BR_ACQUIRE: u32 = 0x8010_7208;
 const BR_RELEASE: u32 = 0x8010_7209;
 const BR_DECREFS: u32 = 0x8010_720a;
+const BC_ACQUIRE_DONE: u32 = 0x4010_6309;
 const BINDER_TYPE_BINDER: u32 = 0x7362_2a85;
 const TF_ONE_WAY: u32 = 1;
 const O_RDWR_NONBLOCK: u64 = 2 | 0o4000;
@@ -113,11 +114,18 @@ fn an_object_only_a_dead_process_held_is_released_by_its_owner() {
     first.extend(owner.drain());
     assert!(first.contains(&BR_INCREFS) && first.contains(&BR_ACQUIRE), "the owner holds the object for the manager: {first:x?}");
 
-    // The manager dies (its descriptor on the driver closed, as its exit closes it): the owner
-    // hears that the object is no longer referred to.
+    // The manager dies (its descriptor on the driver closed, as its exit closes it) before the
+    // owner has said it holds the object: the release waits for that (the object must not be
+    // dropped before it is held), then comes.
     let fd = manager.fd;
     assert_eq!(manager.p.syscall(&mut manager.t, nr::CLOSE, [fd, 0, 0, 0, 0, 0]), 0);
     drop(manager);
-    let later = owner.drain();
-    assert!(later.contains(&BR_RELEASE) && later.contains(&BR_DECREFS), "released when its only holder died: {later:x?}");
+    let early = owner.drain();
+    assert!(!early.contains(&BR_RELEASE), "no release before BC_ACQUIRE_DONE: {early:x?}");
+    let mut done = BC_ACQUIRE_DONE.to_le_bytes().to_vec();
+    done.extend_from_slice(&0x5000u64.to_le_bytes());
+    done.extend_from_slice(&0x6000u64.to_le_bytes());
+    let mut later = owner.write_read(&done);
+    later.extend(owner.drain());
+    assert!(later.contains(&BR_RELEASE) && later.contains(&BR_DECREFS), "released once held, its only holder dead: {later:x?}");
 }
