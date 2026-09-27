@@ -598,6 +598,12 @@ impl Process {
                 "[deliver] signal {sig} code {} addr {:#x} handler {handler:#x} flags {flags:#x} mask {sa_mask:#x} pc {pc:#x}{} lr {:#x}{} sp {:#x}",
                 info.code, info.addr, at(pc), regs.x[30], at(regs.x[30]), regs.sp
             );
+            if info.code > 0 {
+                // A fault: the registers too, each labelled when it points into a mapping.
+                for (n, x) in regs.x.iter().enumerate() {
+                    eprintln!("  x{n:<2} {x:#018x}{}", at(*x));
+                }
+            }
         }
         // SAFETY: as in `deliver_pending`.
         let (mask, altstack) = unsafe { ((*task).sigmask, (*task).altstack) };
