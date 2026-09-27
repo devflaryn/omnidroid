@@ -61,3 +61,26 @@ fn boot_generates_the_linker_configuration() {
     assert!(c.contains(&Command::PerformApexConfig { bootstrap: true }), "{c:?}");
     assert!(wait < config, "{c:?}");
 }
+
+/// An APEX's versioned script overrides a service: `bpfloader` is the tethering APEX's
+/// netbpfload (`netbpfload.35rc`), not the platform's placeholder `/system/bin/false`.
+#[test]
+fn an_apex_script_for_this_sdk_overrides_a_service() {
+    let sysroot = common::sysroot().expect("no sysroot (tools/make_sysroot.py)");
+    let instance = std::env::temp_dir().join(format!("omni-linux-init-apexrc-{}", std::process::id()));
+    let init = Init::start(sysroot, instance, Vec::new()).expect("init");
+    assert_eq!(init.services()["bpfloader"].argv[0], "/apex/com.android.tethering/bin/netbpfload");
+}
+
+/// A service's `socket` lines: netd gets dnsproxyd, fwmarkd and mdns (stream sockets, handed over
+/// in `ANDROID_SOCKET_<name>`).
+#[test]
+fn a_services_sockets_are_read() {
+    let sysroot = common::sysroot().expect("no sysroot (tools/make_sysroot.py)");
+    let instance = std::env::temp_dir().join(format!("omni-linux-init-sockets-{}", std::process::id()));
+    let init = Init::start(sysroot, instance, Vec::new()).expect("init");
+    let sockets = &init.services()["netd"].sockets;
+    for name in ["dnsproxyd", "fwmarkd", "mdns"] {
+        assert!(sockets.iter().any(|(n, ty)| n == name && *ty == 1), "{name} in {sockets:?}");
+    }
+}

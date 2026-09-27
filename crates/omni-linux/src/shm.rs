@@ -25,6 +25,8 @@ pub struct Shm {
     /// Ashmem's protection mask (`ASHMEM_SET_PROT_MASK`), which caps what a mapping may ask for.
     pub prot_mask: AtomicU64,
     host_path: std::path::PathBuf,
+    /// Made here (its host file removed with it) or opened from another host process's.
+    owned: bool,
 }
 
 impl Shm {
@@ -40,7 +42,23 @@ impl Shm {
             len: AtomicU64::new(0),
             prot_mask: AtomicU64::new(0x7), // PROT_READ|WRITE|EXEC until ASHMEM_SET_PROT_MASK narrows it
             host_path,
+            owned: true,
         }))
+    }
+
+    /// Open another host process's region by its host file (`crate::remote`).
+    ///
+    /// # Errors
+    /// The file cannot be opened.
+    pub fn open_path(name: &str, host_path: &std::path::Path, len: u64) -> Result<Arc<Self>, Errno> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(host_path).map_err(|_| EIO)?;
+        Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false }))
+    }
+
+    /// Its host file.
+    #[must_use]
+    pub fn host_path(&self) -> &std::path::Path {
+        &self.host_path
     }
 
     #[must_use]
@@ -90,7 +108,9 @@ impl Shm {
 
 impl Drop for Shm {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.host_path);
+        if self.owned {
+            let _ = std::fs::remove_file(&self.host_path);
+        }
     }
 }
 

@@ -33,8 +33,37 @@ pub struct PairChannel {
     stream: bool,
 }
 
+/// A socket init makes for a service (`socket <name> <type>`): bound to `/dev/socket/<name>` in
+/// `instance`, as an open file to hand over.
+#[must_use]
+pub fn init_socket(instance: usize, name: &str, ty: u64, pid: u32) -> OpenFile {
+    let path = format!("/dev/socket/{name}");
+    let bound = crate::unix::Bound::bind_replacing(instance, path.as_bytes(), ty);
+    let mut addr = (AF_UNIX as u16).to_le_bytes().to_vec();
+    addr.extend_from_slice(path.as_bytes());
+    addr.push(0);
+    let socket = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Bound(bound)), inbox: std::collections::VecDeque::new(), name: Some(addr), protocol: 0, owner: pid };
+    OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(2) }
+}
+
+/// A connected pair of type `ty`: the client end's peer, and the server's socket.
+#[must_use]
+pub fn pair(ty: u64, pid: u32) -> (Peer, Socket) {
+    let channel = Arc::new(PairChannel {
+        queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
+        open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
+        stream: ty == 1,
+    });
+    let server = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side: 1 }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: pid };
+    (Peer::Pair { channel, side: 0 }, server)
+}
+
 /// What a connected socket talks to.
 pub enum Peer {
+    /// This socket is bound to a name (`crate::unix`): it listens, or receives datagrams.
+    Bound(Arc<crate::unix::Bound>),
+    /// A datagram socket connected to a bound one: what it sends goes there.
+    Dgram(Arc<crate::unix::Bound>),
     /// The other end of a socket pair.
     Pair { channel: Arc<PairChannel>, side: usize },
     /// `logd`: packets are printed to this output.
@@ -51,6 +80,10 @@ pub struct Socket {
     pub inbox: std::collections::VecDeque<u8>,
     /// The address it is bound to, as `getsockname` reports it.
     pub name: Option<Vec<u8>>,
+    /// The protocol it was made with (a netlink family: `NETLINK_ROUTE`, ...).
+    pub protocol: u64,
+    /// The port a netlink socket is bound to when it sends unbound: its process's pid.
+    pub owner: u32,
 }
 
 /// The property service's protocol 2: `PROP_MSG_SETPROP2`, then the name and the value, each
@@ -122,8 +155,27 @@ impl Drop for Socket {
 
 /// Deliver `bytes` to a connected socket's peer.
 pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
+    // To the kernel (`crate::netlink`), from the port the socket is bound to (bound now if not).
+    if socket.domain == AF_NETLINK && socket.peer.is_none() {
+        let port = match &socket.name {
+            Some(name) => u32::from_le_bytes(name[4..8].try_into().expect("4")),
+            None => {
+                let mut name = vec![0u8; 12];
+                name[0..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+                name[4..8].copy_from_slice(&socket.owner.to_le_bytes());
+                socket.name = Some(name);
+                socket.owner
+            }
+        };
+        return crate::netlink::send(socket, bytes, port);
+    }
     let Socket { peer, inbox, .. } = socket;
     match peer {
+        Some(Peer::Dgram(server)) => {
+            server.deliver(bytes);
+            Ok(bytes.len())
+        }
+        Some(Peer::Bound(_)) => Err(ENOTCONN),
         Some(Peer::Pair { channel, side }) => {
             let other = 1 - *side;
             if !channel.open[other].load(std::sync::atomic::Ordering::SeqCst) {
@@ -157,7 +209,7 @@ fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK) {
         return Err(EAFNOSUPPORT);
     }
-    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new(), name: None };
+    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new(), name: None, protocol: a[2], owner: p.sys.pid as u32 };
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
     Ok(p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)? as u64)
@@ -177,6 +229,11 @@ fn unix_path(p: &Process, at: u64, len: u64) -> Result<Vec<u8>, Errno> {
     })
 }
 
+/// Which instance a process is of, for the names sockets are bound to.
+fn instance_of(p: &Process) -> usize {
+    Arc::as_ptr(p.vfs.binds()) as usize
+}
+
 fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let stderr = match p.fds.get(2).ok().as_deref().map(|f| f.kind.lock().output()) {
@@ -185,6 +242,9 @@ fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     };
     let mut kind = file.kind.lock();
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
+    if socket.domain == AF_NETLINK {
+        return Ok(0); // to the kernel: what it sends is answered (`crate::netlink`)
+    }
     if socket.domain != AF_UNIX {
         // No network: an address that cannot be reached.
         return Err(crate::errno::ENETUNREACH);
@@ -198,6 +258,11 @@ fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         let service = crate::props::PropertyService::global(p.vfs.sysroot());
         socket.peer = Some(Peer::PropertyService { pending: Vec::new(), service });
         return Ok(0);
+    }
+    // A socket bound to that name (a service's, init's): connected to it. (logdw and the property
+    // service above stay the kernel's own: the log is printed where the runtime shows it.)
+    if let Some(server) = crate::unix::Bound::find(instance_of(p), &path) {
+        return server.connect(socket, p.sys.pid as u32).map(|()| 0);
     }
     if p.trace {
         eprintln!("[socket] connect {:?}: no service", String::from_utf8_lossy(&path));
@@ -237,6 +302,13 @@ fn sys_bind(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let mut kind = file.kind.lock();
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
+    if socket.domain == AF_UNIX {
+        let name = unix_path(p, a[1], a[2])?;
+        let bound = crate::unix::Bound::bind(instance_of(p), &name, socket.ty)?;
+        socket.name = Some(p.mem.read(a[1], a[2] as usize)?);
+        socket.peer = Some(Peer::Bound(bound));
+        return Ok(0);
+    }
     if socket.domain != AF_NETLINK {
         p.refusals.record(format!("bind: family {}", socket.domain), t.pc, t.lr);
         return Err(crate::errno::ENOSYS);
@@ -261,6 +333,53 @@ fn sys_bind(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// `listen`: a bound stream or seqpacket socket takes connections.
+fn sys_listen(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let kind = file.kind.lock();
+    let FileKind::Socket(socket) = &*kind else { return Err(crate::errno::ENOTSOCK) };
+    match &socket.peer {
+        Some(Peer::Bound(bound)) if bound.ty != 2 => {
+            bound.listening.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
+fn sys_accept(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    sys_accept4(p, t, [a[0], a[1], a[2], 0, 0, 0])
+}
+
+/// `accept4(fd, addr, addrlen, flags)`: the next connection (waiting for one unless
+/// non-blocking), as a new descriptor; the peer's address is unnamed.
+fn sys_accept4(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let bound = match &*file.kind.lock() {
+        FileKind::Socket(Socket { peer: Some(Peer::Bound(b)), .. }) if b.listening.load(std::sync::atomic::Ordering::SeqCst) => Arc::clone(b),
+        FileKind::Socket(_) => return Err(EINVAL),
+        _ => return Err(crate::errno::ENOTSOCK),
+    };
+    let nonblocking = *file.flags.lock() & 0o4000 != 0;
+    let socket = loop {
+        let seen = crate::poll::generation();
+        if let Some(s) = bound.accept() {
+            break s;
+        }
+        if nonblocking {
+            return Err(crate::errno::EAGAIN);
+        }
+        crate::poll::wait_for_change(seen, None, t)?;
+    };
+    if a[1] != 0 && a[2] != 0 {
+        p.mem.write(a[1], &(AF_UNIX as u16).to_le_bytes())?;
+        p.mem.write_u32(a[2], 2)?;
+    }
+    let flags = if a[3] & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2;
+    let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
+    Ok(p.fds.insert(Arc::new(file), a[3] & SOCK_CLOEXEC != 0, 0)? as u64)
+}
+
 /// `getsockname`: the bound address; unbound, the family alone.
 fn sys_getsockname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
@@ -278,17 +397,29 @@ fn sys_getsockname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 fn sys_setsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let is_socket = matches!(&*file.kind.lock(), FileKind::Socket(_));
-    if is_socket { Ok(0) } else { Err(crate::errno::ENOTSOCK) }
+    if !is_socket {
+        return Err(crate::errno::ENOTSOCK);
+    }
+    // xtables, on a raw socket (iptables).
+    if matches!(a[1], crate::xtables::SOL_IP | crate::xtables::SOL_IPV6) && matches!(a[2], 64 | 65) {
+        return crate::xtables::set(p, a[1], a[2], a[3], a[4] as usize);
+    }
+    Ok(0)
 }
 
 fn sys_shutdown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    sys_setsockopt(p, _t, a)
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let is_socket = matches!(&*file.kind.lock(), FileKind::Socket(_));
+    if is_socket { Ok(0) } else { Err(crate::errno::ENOTSOCK) }
 }
 
 /// Take what the peer sent back: all of it that fits, or `EAGAIN` when nothing is there. From a
 /// socket pair: one message (the rest of it discarded, as a datagram's is) or a stream's bytes;
 /// end of file (0) once the other end is closed and nothing is left.
 pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
+    if let Some(Peer::Bound(bound)) = &socket.peer {
+        return bound.receive(buf).ok_or(crate::errno::EAGAIN);
+    }
     if let Some(Peer::Pair { channel, side }) = &socket.peer {
         let mut queues = channel.queues.lock();
         let q = &mut queues[*side];
@@ -341,6 +472,12 @@ fn sys_getsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         p.mem.write_u32(len_ptr, n as u32)?;
         Ok(0)
     };
+    // xtables, on a raw socket (iptables).
+    if matches!(level, crate::xtables::SOL_IP | crate::xtables::SOL_IPV6) && (64..=67).contains(&name) {
+        let room = p.mem.read_u32(len_ptr)? as usize;
+        let bytes = crate::xtables::get(p, level, name, val, room)?;
+        return write(&bytes);
+    }
     const SOL_SOCKET: u64 = 1;
     if level == SOL_SOCKET {
         match name {
@@ -378,7 +515,7 @@ fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) ->
         let (r, pair) = {
             let mut kind = file.kind.lock();
             let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
-            (receive(socket, buf), matches!(socket.peer, Some(Peer::Pair { .. })))
+            (receive(socket, buf), matches!(socket.peer, Some(Peer::Pair { .. } | Peer::Bound(_))) || socket.domain == AF_NETLINK)
         };
         let nonblocking = dontwait || *file.flags.lock() & 0o4000 != 0;
         match r {
@@ -413,6 +550,8 @@ pub fn readiness(socket: &Socket) -> u32 {
     const OUT: u32 = 0x4;
     const HUP: u32 = 0x10;
     match &socket.peer {
+        Some(Peer::Bound(bound)) => if bound.ready() { IN } else { 0 },
+        Some(Peer::Dgram(_)) => OUT,
         Some(Peer::Pair { channel, side }) => {
             let queued = !channel.queues.lock()[*side].is_empty();
             let other_open = channel.open[1 - *side].load(std::sync::atomic::Ordering::SeqCst);
@@ -442,7 +581,7 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let mut fds = [0i32; 2];
     for (side, fd) in fds.iter_mut().enumerate() {
-        let socket = Socket { domain, ty: kind, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side }), inbox: std::collections::VecDeque::new(), name: None };
+        let socket = Socket { domain, ty: kind, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: p.sys.pid as u32 };
         let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
         *fd = p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)?;
     }
@@ -491,6 +630,9 @@ pub fn install(table: &mut Table) {
     table.set(nr::SOCKETPAIR, sys_socketpair);
     table.set(nr::SOCKET, sys_socket);
     table.set(nr::BIND, sys_bind);
+    table.set(nr::LISTEN, sys_listen);
+    table.set(nr::ACCEPT, sys_accept);
+    table.set(nr::ACCEPT4, sys_accept4);
     table.set(nr::GETSOCKNAME, sys_getsockname);
     table.set(nr::GETSOCKOPT, sys_getsockopt);
     table.set(nr::CONNECT, sys_connect);

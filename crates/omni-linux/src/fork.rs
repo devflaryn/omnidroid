@@ -47,6 +47,8 @@ pub struct Family {
     superseded: AtomicBool,
     /// The image that replaced this one: `run` answers how it ended.
     successor: Mutex<Option<Arc<Process>>>,
+    /// A stand-in for another host process's process (`crate::remote`).
+    stand_in: AtomicBool,
     /// The signal mask the main task starts with (a fork child's and an executed program's are
     /// the calling thread's).
     start_mask: AtomicU64,
@@ -74,6 +76,14 @@ impl Family {
             0 => 1,
             pid => pid,
         }
+    }
+
+    pub(crate) fn mark_stand_in(&self) {
+        self.stand_in.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_stand_in(&self) -> bool {
+        self.stand_in.load(Ordering::Relaxed)
     }
 
     pub(crate) fn superseded(&self) -> bool {

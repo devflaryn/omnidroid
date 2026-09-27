@@ -188,6 +188,70 @@ fn fs() -> &'static Mutex<BTreeMap<String, Node>> {
     FS.get_or_init(Mutex::default)
 }
 
+/// Each BPF filesystem path's mode and owner (the loader sets them; netd and system_server check
+/// them).
+fn meta() -> &'static Mutex<BTreeMap<String, (u32, u32, u32)>> {
+    static M: OnceLock<Mutex<BTreeMap<String, (u32, u32, u32)>>> = OnceLock::new();
+    M.get_or_init(Mutex::default)
+}
+
+/// A path's mode (permission bits) and owner.
+#[must_use]
+pub fn owner(path: &[u8]) -> Option<(u32, u32, u32)> {
+    let path = key(path);
+    if path == ROOT {
+        return Some((0o1777, 0, 0));
+    }
+    meta().lock().get(&path).copied()
+}
+
+/// `chmod` on the BPF filesystem.
+pub fn chmod(path: &[u8], mode: u32) {
+    if let Some(m) = meta().lock().get_mut(&key(path)) {
+        m.0 = mode & 0o7777;
+    }
+}
+
+/// `chown` on the BPF filesystem (`u32::MAX`: unchanged).
+pub fn chown(path: &[u8], uid: u32, gid: u32) {
+    if let Some(m) = meta().lock().get_mut(&key(path)) {
+        if uid != u32::MAX {
+            m.1 = uid;
+        }
+        if gid != u32::MAX {
+            m.2 = gid;
+        }
+    }
+}
+
+/// A path's SELinux context: what the policy's `genfscon bpf` rules give it (the longest prefix of
+/// the path below `/sys/fs/bpf`), read from the image's policy.
+#[must_use]
+pub fn context(path: &[u8], sysroot: &crate::vfs::Sysroot) -> String {
+    static RULES: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        let mut rules = Vec::new();
+        for file in [&b"/system/etc/selinux/plat_sepolicy.cil"[..], b"/system_ext/etc/selinux/system_ext_sepolicy.cil", b"/vendor/etc/selinux/vendor_sepolicy.cil"] {
+            let text = sysroot.read(file).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+            for line in text.lines() {
+                // (genfscon bpf "/net_shared" (u object_r fs_bpf_net_shared ((s0) (s0))))
+                let Some(rest) = line.trim().strip_prefix("(genfscon bpf \"") else { continue };
+                let Some((prefix, ctx)) = rest.split_once('"') else { continue };
+                let words: Vec<&str> = ctx.split(|c: char| c == '(' || c == ')' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
+                if let [user, role, kind, level, ..] = words[..] {
+                    rules.push((prefix.to_string(), format!("{user}:{role}:{kind}:{level}")));
+                }
+            }
+        }
+        rules.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        rules
+    });
+    let path = key(path);
+    let rel = path.strip_prefix(ROOT).unwrap_or("/");
+    let rel = if rel.is_empty() { "/" } else { rel };
+    rules.iter().find(|(prefix, _)| rel.starts_with(prefix.as_str())).map_or_else(|| "u:object_r:fs_bpf:s0".to_string(), |(_, c)| c.clone())
+}
+
 /// Whether a guest path is on the BPF filesystem.
 #[must_use]
 pub fn on_bpffs(path: &[u8]) -> bool {
@@ -229,8 +293,14 @@ pub fn list(path: &[u8]) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// `mkdir` on the BPF filesystem.
-pub fn mkdir(path: &[u8]) -> Result<(), Errno> {
+/// `mkdir` on the BPF filesystem, with its mode and owner.
+pub fn mkdir(path: &[u8], mode: u32, uid: u32, gid: u32) -> Result<(), Errno> {
+    make_dir(path)?;
+    meta().lock().insert(key(path), (mode & 0o7777, uid, gid));
+    Ok(())
+}
+
+fn make_dir(path: &[u8]) -> Result<(), Errno> {
     let path = key(path);
     if path == ROOT {
         return Err(EEXIST);
@@ -257,6 +327,7 @@ pub fn remove(path: &[u8], dir: bool) -> Result<(), Errno> {
         (Some(Node::Dir), true) if fs.keys().any(|k| k.starts_with(&format!("{path}/"))) => Err(crate::errno::ENOTEMPTY),
         _ => {
             fs.remove(&path);
+            meta().lock().remove(&path);
             Ok(())
         }
     }
@@ -280,13 +351,28 @@ pub fn rename(from: &[u8], to: &[u8], noreplace: bool) -> Result<(), Errno> {
     }
     fs.remove(&from);
     fs.insert(to.clone(), node);
+    {
+        let mut meta = meta().lock();
+        let moved_meta: Vec<(String, (u32, u32, u32))> = meta.iter().filter(|(k, _)| **k == from || k.starts_with(&format!("{from}/"))).map(|(k, v)| (k.clone(), *v)).collect();
+        for (k, v) in moved_meta {
+            meta.remove(&k);
+            meta.insert(format!("{to}{}", &k[from.len()..]), v);
+        }
+    }
     for (k, v) in moved {
         fs.insert(format!("{to}{}", &k[from.len()..]), v);
     }
     Ok(())
 }
 
-fn pin(path: &[u8], object: Object) -> Result<(), Errno> {
+fn pin(path: &[u8], object: Object, uid: u32, gid: u32) -> Result<(), Errno> {
+    pin_node(path, object)?;
+    // A pinned object is its pinner's, readable and writable by it alone until chmod.
+    meta().lock().insert(key(path), (0o600, uid, gid));
+    Ok(())
+}
+
+fn pin_node(path: &[u8], object: Object) -> Result<(), Errno> {
     if !on_bpffs(path) {
         return Err(EINVAL);
     }
@@ -300,6 +386,19 @@ fn pin(path: &[u8], object: Object) -> Result<(), Errno> {
     }
     fs.insert(path, Node::Pin(object));
     Ok(())
+}
+
+/// What programs are attached where: by the attach target (a cgroup directory, by its path) and
+/// the attach type, the programs' ids in order.
+fn attachments() -> &'static Mutex<BTreeMap<(Vec<u8>, u32), Vec<u32>>> {
+    static A: OnceLock<Mutex<BTreeMap<(Vec<u8>, u32), Vec<u32>>>> = OnceLock::new();
+    A.get_or_init(Mutex::default)
+}
+
+/// An attach target by its descriptor: the path it is open on.
+fn target_of(p: &Process, fd: u32) -> Result<Vec<u8>, Errno> {
+    let file = p.fds.get(fd as i32)?;
+    Ok(crate::fd::guest_path_of(&file))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -447,7 +546,7 @@ fn sys_bpf(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             // BPF_OBJ_PIN: {pathname, bpf_fd, file_flags}
             let path = p.mem.read_cstr(u64_at(&attr, 0), 4096)?;
             let object = object_of(p, u32_at(&attr, 8))?;
-            pin(&path, object).map(|()| 0)
+            pin(&path, object, p.sys.uid(), p.sys.gid()).map(|()| 0)
         }
         7 => {
             // BPF_OBJ_GET
@@ -458,8 +557,42 @@ fn sys_bpf(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
                 None => Err(ENOENT),
             }
         }
-        // BPF_PROG_ATTACH, BPF_PROG_DETACH: accepted; nothing here would run the program.
-        8 | 9 => Ok(0),
+        // BPF_PROG_ATTACH: {target_fd, attach_bpf_fd, attach_type, attach_flags}. Recorded (a
+        // daemon queries it back); nothing here runs the program.
+        8 => {
+            let target = target_of(p, u32_at(&attr, 0))?;
+            let Object::Prog(prog) = object_of(p, u32_at(&attr, 4))? else { return Err(EINVAL) };
+            let (kind, flags) = (u32_at(&attr, 8), u32_at(&attr, 12));
+            let mut attached = attachments().lock();
+            let ids = attached.entry((target, kind)).or_default();
+            const ALLOW_MULTI: u32 = 2;
+            if flags & ALLOW_MULTI == 0 {
+                ids.clear();
+            }
+            if !ids.contains(&prog.id) {
+                ids.push(prog.id);
+            }
+            Ok(0)
+        }
+        // BPF_PROG_DETACH: {target_fd, attach_bpf_fd (0: all), attach_type}
+        9 => {
+            let target = target_of(p, u32_at(&attr, 0))?;
+            let kind = u32_at(&attr, 8);
+            let prog = match u32_at(&attr, 4) {
+                0 => None,
+                fd => match object_of(p, fd)? {
+                    Object::Prog(pr) => Some(pr.id),
+                    _ => return Err(EINVAL),
+                },
+            };
+            let mut attached = attachments().lock();
+            let ids = attached.get_mut(&(target, kind)).ok_or(ENOENT)?;
+            match prog {
+                Some(id) => ids.retain(|i| *i != id),
+                None => ids.clear(),
+            }
+            Ok(0)
+        }
         // BPF_PROG_GET_NEXT_ID, BPF_MAP_GET_NEXT_ID: {start_id, next_id}
         11 | 12 => {
             let start = u32_at(&attr, 0);
@@ -475,10 +608,21 @@ fn sys_bpf(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             install(p, object.ok_or(ENOENT)?)
         }
         15 => info_by_fd(p, attr_at, &attr),
-        // BPF_PROG_QUERY: nothing attached.
+        // BPF_PROG_QUERY: {target_fd, attach_type, query_flags, attach_flags (out), prog_ids,
+        // prog_cnt (in: room; out: count)}.
         16 => {
-            p.mem.write_u32(attr_at + 12, 0)?; // attach_flags
-            p.mem.write_u32(attr_at + 24, 0)?; // prog_cnt
+            let target = target_of(p, u32_at(&attr, 0))?;
+            let ids = attachments().lock().get(&(target, u32_at(&attr, 4))).cloned().unwrap_or_default();
+            let (ids_at, room) = (u64_at(&attr, 16), u32_at(&attr, 24) as usize);
+            p.mem.write_u32(attr_at + 12, 0)?;
+            p.mem.write_u32(attr_at + 24, ids.len() as u32)?;
+            if ids_at != 0 {
+                if room < ids.len() {
+                    return Err(crate::errno::ENOSPC);
+                }
+                let bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
+                p.mem.write(ids_at, &bytes)?;
+            }
             Ok(0)
         }
         // BPF_RAW_TRACEPOINT_OPEN, BPF_BTF_LOAD, BPF_LINK_CREATE: a descriptor that holds it.

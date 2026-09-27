@@ -62,6 +62,8 @@ pub enum FileKind {
     Inotify(Arc<std::sync::atomic::AtomicI32>),
     /// A BPF map, program or link (`crate::bpf`).
     Bpf(crate::bpf::Object),
+    /// `/dev/binder` whose driver is in the system's host process (`crate::remote`).
+    RemoteBinder(Arc<crate::remote::RemoteBinder>),
 }
 
 impl FileKind {
@@ -89,19 +91,27 @@ impl Drop for OpenFile {
 
 pub struct FdTable {
     fds: Mutex<std::collections::BTreeMap<i32, (Arc<OpenFile>, bool)>>,
+    /// Set for a stand-in: its descriptors are another host process's (`crate::remote`).
+    remote: std::sync::OnceLock<Arc<dyn RemoteFds>>,
+}
+
+/// Descriptors that are another host process's.
+pub trait RemoteFds: Send + Sync {
+    fn insert(&self, file: Arc<OpenFile>) -> Result<i32, Errno>;
+    fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno>;
 }
 
 impl FdTable {
     /// A fork child's table: the same open files at the same numbers, close-on-exec kept.
     #[must_use]
     pub fn for_fork(&self) -> Self {
-        Self { fds: Mutex::new(self.fds.lock().clone()) }
+        Self { fds: Mutex::new(self.fds.lock().clone()), remote: std::sync::OnceLock::new() }
     }
 
     /// The table a program `execve` loads starts with: every descriptor not close-on-exec.
     #[must_use]
     pub fn for_exec(&self) -> Self {
-        Self { fds: Mutex::new(self.fds.lock().iter().filter(|(_, (_, cloexec))| !cloexec).map(|(n, e)| (*n, e.clone())).collect()) }
+        Self { fds: Mutex::new(self.fds.lock().iter().filter(|(_, (_, cloexec))| !cloexec).map(|(n, e)| (*n, e.clone())).collect()), remote: std::sync::OnceLock::new() }
     }
 
     #[must_use]
@@ -111,7 +121,7 @@ impl FdTable {
         fds.insert(0, (file(FileKind::Stdin), false));
         fds.insert(1, (file(FileKind::Stdout(stdout)), false));
         fds.insert(2, (file(FileKind::Stderr(stderr)), false));
-        Self { fds: Mutex::new(fds) }
+        Self { fds: Mutex::new(fds), remote: std::sync::OnceLock::new() }
     }
 
     /// Every open descriptor, lowest first.
@@ -120,12 +130,23 @@ impl FdTable {
         self.fds.lock().iter().map(|(fd, (f, _))| (*fd, Arc::clone(f))).collect()
     }
 
+    /// Make this a stand-in's table: descriptors are got from and put in `remote`.
+    pub fn set_remote(&self, remote: Arc<dyn RemoteFds>) {
+        let _ = self.remote.set(remote);
+    }
+
     pub fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
+        if let Some(r) = self.remote.get() {
+            return r.get(fd);
+        }
         self.fds.lock().get(&fd).map(|(f, _)| Arc::clone(f)).ok_or(EBADF)
     }
 
     /// The lowest free descriptor at or above `min`.
     pub fn insert(&self, file: Arc<OpenFile>, cloexec: bool, min: i32) -> Result<i32, Errno> {
+        if let Some(r) = self.remote.get() {
+            return r.insert(file);
+        }
         let mut fds = self.fds.lock();
         let mut fd = min;
         while fds.contains_key(&fd) {
@@ -156,6 +177,11 @@ impl FdTable {
 }
 
 pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, Errno> {
+    open_by(None, vfs, cwd, path, flags)
+}
+
+/// `open`, by process `opener` (what a device that knows its opener needs: remote binder).
+pub fn open_by(opener: Option<&Process>, vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, Errno> {
     let r = vfs.resolve(cwd, path, flags & O_NOFOLLOW == 0)?;
     let write = flags & O_ACCMODE != 0;
     let kind = match r.node.clone() {
@@ -193,9 +219,18 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
         Node::Dev(DevNode::Ashmem) => FileKind::Shared(crate::shm::Shm::create(ASHMEM)?),
-        Node::Dev(DevNode::Binder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::Binder)),
-        Node::Dev(DevNode::HwBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::HwBinder)),
-        Node::Dev(DevNode::VndBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::VndBinder)),
+        Node::Dev(d @ (DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder)) => {
+            let context = match d {
+                DevNode::HwBinder => crate::binder::Context::HwBinder,
+                DevNode::VndBinder => crate::binder::Context::VndBinder,
+                _ => crate::binder::Context::Binder,
+            };
+            match opener {
+                // The driver is the system's, in its host process.
+                Some(p) if crate::remote::is_remote() => FileKind::RemoteBinder(crate::remote::RemoteBinder::open(p, context)?),
+                _ => FileKind::Binder(crate::binder::BinderFile::open(context)),
+            }
+        }
         Node::Dev(DevNode::OmniGpu) => FileKind::Gpu(crate::gpu::Gpu::open()),
         Node::Dev(d) => FileKind::Dev(d),
         Node::Generated | Node::Blob { .. } => {
@@ -262,7 +297,12 @@ fn owned(vfs: &Vfs, r: &Resolved, st: Stat) -> Stat {
 }
 
 fn stat_resolved(vfs: &Vfs, r: &Resolved) -> Result<Stat, Errno> {
-    Ok(owned(vfs, r, stat_node(r)?))
+    let st = stat_node(r)?;
+    // The BPF filesystem keeps its own modes and owners.
+    if let Some((mode, uid, gid)) = crate::bpf::owner(&r.path).filter(|_| crate::bpf::on_bpffs(&r.path)) {
+        return Ok(Stat { mode: (st.mode & S_IFMT) | mode, uid, gid, ..st });
+    }
+    Ok(owned(vfs, r, st))
 }
 
 fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
@@ -322,6 +362,7 @@ pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Shared(m) => Ok(Stat { ino: 5, mode: S_IFREG | 0o600, nlink: 1, size: m.len() as i64, blocks: (m.len() as i64 + 511) / 512, ..Stat::default() }),
         FileKind::Inotify(_) => Ok(Stat { ino: 6, mode: 0o600, nlink: 1, ..Stat::default() }),
         FileKind::Bpf(_) => Ok(Stat { ino: 8, mode: 0o600, nlink: 1, ..Stat::default() }),
+        FileKind::RemoteBinder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
     }
 }
 
@@ -358,7 +399,7 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
             None => m.read_seq(buf),
         },
         FileKind::Inotify(_) => Err(EAGAIN), // no event is ever ready
-        FileKind::Bpf(_) => Err(EINVAL),
+        FileKind::Bpf(_) | FileKind::RemoteBinder(_) => Err(EINVAL),
 
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
@@ -407,7 +448,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Shared(m) => m.write_seq(bytes),
         FileKind::Inotify(_) => Err(EBADF),
-        FileKind::Bpf(_) => Err(EINVAL),
+        FileKind::Bpf(_) | FileKind::RemoteBinder(_) => Err(EINVAL),
         FileKind::Synth { guest, data, pos, .. } => {
             let written = crate::procfs::write_generated(guest, bytes, data)?;
             *pos = 0;
@@ -495,7 +536,7 @@ fn sys_openat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let base = base_dir(p, a[0], &path)?;
     let flags = a[2] as u32;
     let creating = flags & O_CREAT != 0 && matches!(p.vfs.resolve(&base, &path, flags & O_NOFOLLOW == 0).map(|r| r.node), Ok(Node::Missing { .. }));
-    let file = open(&p.vfs, &base, &path, flags)?;
+    let file = open_by(Some(p), &p.vfs, &base, &path, flags)?;
     if creating {
         // The new file is its creator's, with the mode it asked for less its umask.
         if let Ok(Node::HostFile { host }) = p.vfs.resolve(&base, &path, true).map(|r| r.node) {
@@ -769,6 +810,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Shared(m) => format!("/memfd:{} (deleted)", m.name).into_bytes(),
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
         FileKind::Bpf(o) => o.describe().as_bytes().to_vec(),
+        FileKind::RemoteBinder(_) => b"/dev/binder".to_vec(),
     }
 }
 
@@ -803,6 +845,13 @@ fn sys_faccessat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
+    let remote = match &*file.kind.lock() {
+        FileKind::RemoteBinder(b) => Some(Arc::clone(b)),
+        _ => None,
+    };
+    if let Some(b) = remote {
+        return b.ioctl(p, t, a[1], a[2]);
+    }
     let binder = match &*file.kind.lock() {
         FileKind::Binder(b) => Some(Arc::clone(b)),
         _ => None,
@@ -887,6 +936,11 @@ fn sys_fcntl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     }
 }
 
+fn sys_flock(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    crate::locks::flock(p, t, &file, a[1])
+}
+
 fn sys_dup(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     Ok(p.fds.insert(file, false, 0)? as u64)
@@ -958,7 +1012,7 @@ fn sys_mkdirat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let base = base_dir(p, a[0], &path)?;
     let r = p.vfs.resolve(&base, &path, false)?;
     if crate::bpf::on_bpffs(&r.path) {
-        return crate::bpf::mkdir(&r.path).map(|()| 0);
+        return crate::bpf::mkdir(&r.path, a[2] as u32 & !p.sys.umask(), p.sys.uid(), p.sys.gid()).map(|()| 0);
     }
     match r.node {
         Node::Missing { host: Some(host), parent_is_dir: true } => {
@@ -1187,8 +1241,8 @@ fn sys_fchmodat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
     let r = p.vfs.resolve(&base, &path, true)?;
-    // The BPF filesystem's modes are accepted (nothing here checks them).
     if crate::bpf::on_bpffs(&r.path) && !matches!(r.node, Node::Missing { .. }) {
+        crate::bpf::chmod(&r.path, a[2] as u32);
         return Ok(0);
     }
     chmod_node(p, r.node, a[2])
@@ -1200,6 +1254,7 @@ fn sys_fchownat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let base = base_dir(p, a[0], &path)?;
     let r = p.vfs.resolve(&base, &path, a[4] & AT_SYMLINK_NOFOLLOW == 0)?;
     if crate::bpf::on_bpffs(&r.path) && !matches!(r.node, Node::Missing { .. }) {
+        crate::bpf::chown(&r.path, a[2] as u32, a[3] as u32);
         return Ok(0);
     }
     chown_node(p, r.node, a[2], a[3])
@@ -1294,6 +1349,7 @@ fn sys_fchdir(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 pub fn install(table: &mut Table) {
+    table.set(nr::FLOCK, sys_flock);
     table.set(nr::CHDIR, sys_chdir);
     table.set(nr::FCHDIR, sys_fchdir);
     table.set(nr::OPENAT, sys_openat);

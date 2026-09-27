@@ -22,9 +22,17 @@ pub const fn untag(addr: u64) -> u64 {
 /// review, Important 7).
 pub type Layout = Arc<parking_lot::RwLock<()>>;
 
+/// Memory that is another host process's (a stand-in's: `crate::remote`).
+pub trait Remote: Send + Sync {
+    fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno>;
+    fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno>;
+}
+
 pub struct GuestMem {
     space: Arc<GuestSpace>,
     layout: Layout,
+    /// Set for a stand-in: every read and write goes there.
+    remote: std::sync::OnceLock<Arc<dyn Remote>>,
     /// While a fork child runs in this process's memory: the ranges the kernel wrote for this
     /// process (a blocked call completing), which the fork's restore keeps.
     journaling: std::sync::atomic::AtomicBool,
@@ -34,7 +42,12 @@ pub struct GuestMem {
 impl GuestMem {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>, layout: Layout) -> Self {
-        Self { space, layout, journaling: std::sync::atomic::AtomicBool::new(false), journal: parking_lot::Mutex::default() }
+        Self { space, layout, remote: std::sync::OnceLock::new(), journaling: std::sync::atomic::AtomicBool::new(false), journal: parking_lot::Mutex::default() }
+    }
+
+    /// Make this a stand-in's memory: every access goes to `remote`.
+    pub fn set_remote(&self, remote: Arc<dyn Remote>) {
+        let _ = self.remote.set(remote);
     }
 
     /// Start recording the ranges written through this view.
@@ -107,6 +120,9 @@ impl GuestMem {
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        if let Some(r) = self.remote.get() {
+            return r.read(untag(addr), len);
+        }
         let _layout = self.layout.read();
         let ptr = self.check(addr, len, false)?;
         let mut out = vec![0u8; len];
@@ -125,6 +141,9 @@ impl GuestMem {
     /// `write`, for a caller that already holds the layout lock exclusively (`mmap` filling the
     /// private copy it just made).
     pub(crate) fn write_holding_layout(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+        if let Some(r) = self.remote.get() {
+            return r.write(untag(addr), bytes);
+        }
         let ptr = self.check(addr, bytes.len(), true)?;
         if !bytes.is_empty() {
             self.note(addr, bytes.len());

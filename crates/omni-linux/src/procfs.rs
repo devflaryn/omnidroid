@@ -328,7 +328,25 @@ const SELINUX_CONTEXT: &[u8] = b"/sys/fs/selinux/context";
 
 /// The kernel tunables a process may write (`/proc/sys/...`), with their boot values: the BPF
 /// loader enables the JIT and unprivileged BPF.
+/// `/proc/sys/net/ipv{4,6}/{conf,neigh}` (0), or one interface's directory in it (1).
+fn net_if_dir(path: &str) -> Option<u8> {
+    let rest = path.strip_prefix("/proc/sys/net/ipv4/").or_else(|| path.strip_prefix("/proc/sys/net/ipv6/"))?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts[..] {
+        ["conf" | "neigh"] => Some(0),
+        ["conf" | "neigh", "all" | "default" | "lo"] => Some(1),
+        _ => None,
+    }
+}
+
 fn sysctl_default(path: &str) -> Option<&'static str> {
+    // An interface's setting (netd writes many): any name, 0 until written.
+    if let Some((dir, name)) = path.rsplit_once('/') {
+        if net_if_dir(dir) == Some(1) && !name.is_empty() {
+            return Some("0
+");
+        }
+    }
     Some(match path {
         "/proc/sys/kernel/unprivileged_bpf_disabled" => "2\n",
         "/proc/sys/kernel/perf_event_paranoid" => "3\n",
@@ -455,8 +473,32 @@ impl Process {
             "/proc/self" => return Some(Entry::Link(pid.into_bytes())),
             "/proc/sys" => return Some(Entry::Dir(vec![("kernel", DT_DIR), ("net", DT_DIR)])),
             "/proc/sys/kernel" => return Some(Entry::Dir(vec![("random", DT_DIR), ("unprivileged_bpf_disabled", DT_REG), ("perf_event_paranoid", DT_REG)])),
-            "/proc/sys/net" => return Some(Entry::Dir(vec![("core", DT_DIR)])),
+            "/proc/sys/net" => return Some(Entry::Dir(vec![("core", DT_DIR), ("ipv4", DT_DIR), ("ipv6", DT_DIR)])),
             "/proc/sys/net/core" => return Some(Entry::Dir(vec![("bpf_jit_enable", DT_REG), ("bpf_jit_kallsyms", DT_REG)])),
+            "/proc/sys/net/ipv4" | "/proc/sys/net/ipv6" => return Some(Entry::Dir(vec![("conf", DT_DIR), ("neigh", DT_DIR)])),
+            // Per interface: all, default and the one there is, the loopback.
+            _ if net_if_dir(path) == Some(0) => return Some(Entry::Dir(vec![("all", DT_DIR), ("default", DT_DIR), ("lo", DT_DIR)])),
+            _ if net_if_dir(path) == Some(1) => {
+                let prefix = format!("{path}/");
+                let names: Vec<(String, u8)> = sysctls().lock().keys().filter_map(|k| k.strip_prefix(&prefix)).map(|n| (n.to_string(), DT_REG)).collect();
+                return Some(Entry::DynDir(names));
+            }
+            // The network interfaces: the loopback.
+            "/sys/class" => return Some(Entry::Dir(vec![("net", DT_DIR)])),
+            "/sys/class/net" => return Some(Entry::Dir(vec![("lo", DT_DIR)])),
+            "/sys/class/net/lo" => return Some(Entry::Dir(vec![("ifindex", DT_REG), ("mtu", DT_REG), ("type", DT_REG), ("flags", DT_REG), ("address", DT_REG), ("operstate", DT_REG)])),
+            "/sys/class/net/lo/ifindex" => return Some(Entry::Bytes(b"1
+".to_vec())),
+            "/sys/class/net/lo/mtu" => return Some(Entry::Bytes(b"65536
+".to_vec())),
+            "/sys/class/net/lo/type" => return Some(Entry::Bytes(b"772
+".to_vec())),
+            "/sys/class/net/lo/flags" => return Some(Entry::Bytes(b"0x9
+".to_vec())),
+            "/sys/class/net/lo/address" => return Some(Entry::Bytes(b"00:00:00:00:00:00
+".to_vec())),
+            "/sys/class/net/lo/operstate" => return Some(Entry::Bytes(b"unknown
+".to_vec())),
             _ if sysctl_default(path).is_some() => return Some(Entry::Bytes(sysctl_value(path))),
             "/proc/sys/kernel/random" => return Some(Entry::Dir(vec![("boot_id", DT_REG), ("uuid", DT_REG)])),
             "/proc/sys/kernel/random/boot_id" => return Some(Entry::File(boot_id_file)),
@@ -470,7 +512,7 @@ impl Process {
             "/proc/version" => return Some(Entry::File(version)),
             "/proc/mounts" => return Some(Entry::File(mounts)),
             "/proc/filesystems" => return Some(Entry::File(filesystems)),
-            "/sys" => return Some(Entry::Dir(vec![("block", DT_DIR), ("devices", DT_DIR), ("fs", DT_DIR)])),
+            "/sys" => return Some(Entry::Dir(vec![("block", DT_DIR), ("class", DT_DIR), ("devices", DT_DIR), ("fs", DT_DIR)])),
             "/sys/block" => return Some(Entry::DynDir(apex_mounts(self).iter().map(|m| (format!("loop{}", m.index), DT_DIR)).collect())),
             "/sys/fs" => return Some(Entry::Dir(vec![("selinux", DT_DIR), ("bpf", DT_DIR)])),
             // The BPF filesystem (`crate::bpf`): its directories and pins.

@@ -28,6 +28,10 @@ fn main() -> ExitCode {
             "--service" => services.push(args.next().expect("--service needs a program")),
             "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
             "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc, composer)")),
+            // This host process's binder is the system's, in another host process (`crate::remote`).
+            "--binder-server" => omni_linux::remote::set_server(&args.next().expect("--binder-server needs host:port")),
+            // The program's pid, as the system assigned it.
+            "--pid" => omni_linux::process::assign_next_pid(args.next().and_then(|v| v.parse().ok()).expect("--pid needs a number")),
             // A property set before the program starts (`name=value`), as init sets one.
             "--setprop" => {
                 let kv = args.next().expect("--setprop needs name=value");
@@ -140,6 +144,20 @@ fn main() -> ExitCode {
     }
     if let Some(caps) = caps {
         p.sys.set_caps(caps);
+    }
+    // An app's host process: the system's properties, as they are now.
+    if omni_linux::remote::is_remote() {
+        match omni_linux::remote::system_properties() {
+            Ok(props) => {
+                let service = omni_linux::props::PropertyService::global(p.vfs.sysroot());
+                for (k, v) in props {
+                    if !k.starts_with("ro.") || service.get(&k).is_none() {
+                        service.set(&k, &v);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[remote] the system's properties: {e:?}"),
+        }
     }
     if !setprops.is_empty() {
         let service = omni_linux::props::PropertyService::global(p.vfs.sysroot());

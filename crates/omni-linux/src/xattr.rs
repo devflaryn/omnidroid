@@ -101,6 +101,13 @@ fn get(p: &Process, key: Key, a: [u64; 6]) -> SysResult {
     let value = store().lock().get(&key).and_then(|attrs| attrs.get(&name).cloned());
     let value = match value {
         Some(v) => v,
+        // The BPF filesystem is labelled by the policy's genfs rules.
+        None if name == SELINUX && matches!(&key, Key::Guest(_, path) if crate::bpf::on_bpffs(path)) => {
+            let Key::Guest(_, path) = &key else { unreachable!() };
+            let mut c = crate::bpf::context(path, p.vfs.sysroot()).into_bytes();
+            c.push(0);
+            c
+        }
         None if name == SELINUX => UNLABELED.to_vec(),
         None => return Err(ENODATA),
     };

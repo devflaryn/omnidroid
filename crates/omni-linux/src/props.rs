@@ -405,6 +405,13 @@ impl PropertyService {
         Ok(())
     }
 
+    /// Every property and its value.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(String, String)> {
+        let live = self.live.lock();
+        live.info.keys().filter_map(|k| Self::value(&live, k).map(|v| (k.clone(), v))).collect()
+    }
+
     /// A property's value, as `getprop` reads it.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<String> {

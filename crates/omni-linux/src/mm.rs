@@ -232,7 +232,14 @@ impl Mm {
                 .space
                 .map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy)
                 .map(|a| a as u64)
-                .map_err(|_| refused_fixed(ENOMEM));
+                .map_err(|e| {
+                    // A large mapping refused is rare and decisive (a process that cannot map its
+                    // stack does not start): say why.
+                    if len >= 1 << 20 && !fixed {
+                        eprintln!("[mm] {len:#x} anonymous bytes refused: {e}");
+                    }
+                    refused_fixed(ENOMEM)
+                });
             if p.trace {
                 if let (Placement::Hint { address, .. }, Ok(got)) = (placement, &at) {
                     if *got != address as u64 {
@@ -371,6 +378,13 @@ fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             };
             if let Some(b) = binder {
                 return crate::binder::mmap(p, t, &b, a[1]);
+            }
+            let remote = match &*file.kind.lock() {
+                FileKind::RemoteBinder(b) => Some(std::sync::Arc::clone(b)),
+                _ => None,
+            };
+            if let Some(b) = remote {
+                return b.mmap(p, t, a[1]);
             }
         }
     }

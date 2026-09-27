@@ -48,10 +48,12 @@ fn table() -> &'static Table {
 }
 
 /// Which file a descriptor's locks are on: a writable-mount file by its host path, an image file
-/// by its guest path, anything else by the open file itself.
+/// by its guest path, a BPF map by its id, anything else by the open file itself.
 fn file_key(p: &Process, file: &Arc<OpenFile>) -> String {
     let (guest, sysroot) = match &*file.kind.lock() {
         FileKind::Host { guest, sysroot, .. } => (guest.clone(), *sysroot),
+        // A BPF map is one inode however many times it is opened (netd locks each of its maps).
+        FileKind::Bpf(crate::bpf::Object::Map(m)) => return format!("bpf-map:{}", m.id),
         _ => return format!("open:{:p}", Arc::as_ptr(file)),
     };
     if sysroot {
@@ -212,4 +214,38 @@ pub fn process_ended(pid: i32) {
     if locks.len() != before {
         table.changed.notify_all();
     }
+}
+
+/// `flock(fd, op)`: a BSD lock on the whole file, held by the open file (`LOCK_SH` 1, `LOCK_EX` 2,
+/// `LOCK_UN` 8, with `LOCK_NB` 4 not to wait). Apart from `fcntl` locks, as on Linux.
+pub fn flock(p: &Process, t: &Task, file: &Arc<OpenFile>, op: u64) -> SysResult {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    let key = format!("flock:{}", file_key(p, file));
+    let holder = Holder::Ofd(Arc::as_ptr(file) as usize);
+    let table = table();
+    let mut locks = table.locks.lock();
+    locks.retain(|l| !(l.file == key && l.holder == holder));
+    let write = match op & !LOCK_NB {
+        LOCK_UN => {
+            table.changed.notify_all();
+            return Ok(0);
+        }
+        LOCK_SH => false,
+        LOCK_EX => true,
+        _ => return Err(EINVAL),
+    };
+    while conflict(&locks, &key, holder, 0, u64::MAX, write).is_some() {
+        if op & LOCK_NB != 0 {
+            return Err(crate::errno::EAGAIN);
+        }
+        if t.pending.load(std::sync::atomic::Ordering::SeqCst) & !t.sigmask != 0 {
+            return Err(EINTR);
+        }
+        table.changed.wait_for(&mut locks, std::time::Duration::from_millis(50));
+    }
+    locks.push(Lock { file: key, via: Arc::as_ptr(file) as usize, holder, pid: p.sys.pid, start: 0, end: u64::MAX, write });
+    Ok(0)
 }

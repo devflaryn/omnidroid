@@ -28,6 +28,8 @@ pub struct Service {
     pub interfaces: Vec<String>,
     /// `capabilities <NAME>...`: exactly these (bit `n` for `CAP_*` `n`).
     pub capabilities: Option<u64>,
+    /// `socket <name> <type> ...`: sockets init makes and hands over (name, `SOCK_*` type).
+    pub sockets: Vec<(String, u64)>,
 }
 
 /// A user or group name as `android_filesystem_config.h` numbers it (`AID_*`); a number stands
@@ -185,6 +187,34 @@ pub enum Command {
     InitUser0,
 }
 
+/// The device's API level (`ro.build.version.sdk` in `/system/build.prop`).
+fn device_sdk(sysroot: &Sysroot) -> u32 {
+    let text = sysroot.read(b"/system/build.prop").map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    text.lines().find_map(|l| l.strip_prefix("ro.build.version.sdk=")).and_then(|v| v.trim().parse().ok()).unwrap_or(35)
+}
+
+/// Of an APEX's `etc` names, the init scripts init reads: per base name, `base.<n>rc` with the
+/// highest `n` at most `sdk`, else `base.rc`.
+fn apex_scripts(names: &[String], sdk: u32) -> Vec<String> {
+    let mut best: std::collections::BTreeMap<&str, (u32, &str)> = std::collections::BTreeMap::new();
+    for name in names {
+        let Some(stem) = name.strip_suffix("rc") else { continue };
+        let Some((base, version)) = stem.rsplit_once('.') else { continue };
+        let version = if version.is_empty() {
+            0
+        } else {
+            match version.parse::<u32>() {
+                Ok(v) if v <= sdk => v,
+                _ => continue,
+            }
+        };
+        if best.get(base).is_none_or(|(v, _)| version > *v) {
+            best.insert(base, (version, name.as_str()));
+        }
+    }
+    best.into_values().map(|(_, n)| n.to_string()).collect()
+}
+
 /// A script's lines as init reads them: a line ending in `\` continues on the next.
 fn logical_lines(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -211,14 +241,8 @@ fn logical_lines(text: &str) -> Vec<String> {
 fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
     // The ramdisk's global environment first (init.rc imports it), then init.rc.
     let mut scripts: Vec<Vec<u8>> = vec![b"/init.environ.rc".to_vec(), b"/system/etc/init/hw/init.rc".to_vec()];
-    let mut dirs: Vec<Vec<u8>> =
+    let dirs: Vec<Vec<u8>> =
         vec![b"/system/etc/init".to_vec(), b"/system_ext/etc/init".to_vec(), b"/product/etc/init".to_vec(), b"/vendor/etc/init".to_vec(), b"/odm/etc/init".to_vec()];
-    for apex in sysroot.children(b"/apex") {
-        let mut d = b"/apex/".to_vec();
-        d.extend_from_slice(&apex);
-        d.extend_from_slice(b"/etc");
-        dirs.push(d);
-    }
     for dir in dirs {
         for name in sysroot.children(&dir) {
             if name.ends_with(b".rc") {
@@ -227,6 +251,21 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                 path.extend_from_slice(&name);
                 scripts.push(path);
             }
+        }
+    }
+    // An APEX's scripts, as init chooses them: of `name.rc` and `name.<sdk>rc`, the highest version
+    // the device's SDK reaches (the tethering APEX's `netbpfload.35rc` overrides `bpfloader`).
+    let sdk = device_sdk(sysroot);
+    for apex in sysroot.children(b"/apex") {
+        let mut dir = b"/apex/".to_vec();
+        dir.extend_from_slice(&apex);
+        dir.extend_from_slice(b"/etc");
+        let names: Vec<String> = sysroot.children(&dir).iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+        for name in apex_scripts(&names, sdk) {
+            let mut path = dir.clone();
+            path.push(b'/');
+            path.extend_from_slice(name.as_bytes());
+            scripts.push(path);
         }
     }
     let mut out = HashMap::new();
@@ -284,6 +323,15 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                         "disabled" => s.disabled = true,
                         "oneshot" => s.oneshot = true,
                         "interface" if words.len() >= 3 => s.interfaces.push(words[1..].join(" ")),
+                        "socket" if words.len() >= 3 => {
+                            let ty = match words[2].split('+').next() {
+                                Some("stream") => 1,
+                                Some("dgram") => 2,
+                                Some("seqpacket") => 5,
+                                _ => continue,
+                            };
+                            s.sockets.push((words[1].to_string(), ty));
+                        }
                         "capabilities" => {
                             s.capabilities = Some(words[1..].iter().filter_map(|w| crate::sys::cap_number(w)).fold(0, |m, n| m | (1 << n)));
                         }
@@ -503,17 +551,32 @@ impl Init {
             return None;
         }
         let argv: Vec<&str> = service.argv.iter().map(String::as_str).collect();
-        self.exec_with(&argv, service.uid, service.capabilities)
+        self.exec_with(&argv, service.uid, service.capabilities, &service.sockets)
     }
 
     /// Run a program as `uid` and wait for it to end (at most [`EXEC_TIMEOUT`]). Its end, or
     /// `None` when it could not start.
     fn exec(&self, argv: &[&str], uid: u32) -> Option<Option<crate::process::ExitStatus>> {
-        self.exec_with(argv, uid, None)
+        self.exec_with(argv, uid, None, &[])
+    }
+
+    /// Spawn a program as `uid` with init's sockets for it: each bound to `/dev/socket/<name>`,
+    /// open at 3, 4, ... in the new process, named to it by `ANDROID_SOCKET_<name>`.
+    fn spawn_with_sockets(&self, mut config: SpawnConfig, uid: u32, sockets: &[(String, u64)]) -> Result<Arc<Process>, String> {
+        for (i, (name, _)) in sockets.iter().enumerate() {
+            config.envp.push(format!("ANDROID_SOCKET_{name}={}", 3 + i).into_bytes());
+        }
+        let p = Process::spawn_as(config, uid)?;
+        let instance = Arc::as_ptr(p.vfs.binds()) as usize;
+        for (i, (name, ty)) in sockets.iter().enumerate() {
+            let file = crate::socket::init_socket(instance, name, *ty, p.sys.pid as u32);
+            p.fds.place(3 + i as i32, Arc::new(file), false);
+        }
+        Ok(p)
     }
 
     /// `exec`, the program holding exactly `caps` when given.
-    fn exec_with(&self, argv: &[&str], uid: u32, caps: Option<u64>) -> Option<Option<crate::process::ExitStatus>> {
+    fn exec_with(&self, argv: &[&str], uid: u32, caps: Option<u64>, sockets: &[(String, u64)]) -> Option<Option<crate::process::ExitStatus>> {
         let config = SpawnConfig {
             sysroot: self.sysroot.clone(),
             instance_dir: self.instance.clone(),
@@ -524,7 +587,7 @@ impl Init {
             trace: traced(argv.first().copied().unwrap_or_default()),
         };
         let name = argv.first().copied().unwrap_or_default().rsplit('/').next().unwrap_or_default().to_string();
-        let p = Process::spawn_as(config, uid).map_err(|e| eprintln!("[init] {name}: {e}")).ok()?;
+        let p = self.spawn_with_sockets(config, uid, sockets).map_err(|e| eprintln!("[init] {name}: {e}")).ok()?;
         if let Some(caps) = caps {
             p.sys.set_caps(caps);
         }
@@ -566,7 +629,7 @@ impl Init {
             stderr: Output::Host,
             trace: traced(name),
         };
-        match Process::spawn_as(config, service.uid) {
+        match self.spawn_with_sockets(config, service.uid, &service.sockets) {
             Ok(p) => {
                 if let Some(caps) = service.capabilities {
                     p.sys.set_caps(caps);
@@ -625,6 +688,12 @@ mod tests {
             super::logical_lines(text),
             ["service vold /system/bin/vold          --blkid_context=u:r:blkid:s0          --fsck_context=u:r:fsck:s0", "    class core"]
         );
+    }
+
+    #[test]
+    fn an_apex_script_is_its_highest_version_the_sdk_reaches() {
+        let names: Vec<String> = ["netbpfload.33rc", "netbpfload.35rc", "netbpfload.36rc", "x.rc", "y.rc", "y.30rc", "notes.txt"].map(String::from).to_vec();
+        assert_eq!(super::apex_scripts(&names, 35), ["netbpfload.35rc", "x.rc", "y.30rc"]);
     }
 
     #[test]

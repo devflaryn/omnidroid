@@ -153,8 +153,26 @@ const STACK_BYTES: u64 = 8 << 20;
 /// apart -- by binder's sender pid, by `/proc/<pid>` -- and their thread ids never meet.
 static LIVE_PIDS: Mutex<std::collections::BTreeSet<i32>> = Mutex::new(std::collections::BTreeSet::new());
 
+/// The pid the next process of this host process gets, when one was assigned (an app launched
+/// for the system's ActivityManager gets the pid it was promised).
+static ASSIGNED_PID: Mutex<Option<i32>> = Mutex::new(None);
+
+/// Give the next process made here pid `pid`.
+pub fn assign_next_pid(pid: i32) {
+    *ASSIGNED_PID.lock() = Some(pid);
+}
+
+/// A pid for a process of another host process (an app's): out of this one's, and kept from it.
+pub fn reserve_pid() -> i32 {
+    allocate_pid()
+}
+
 fn allocate_pid() -> i32 {
     let mut live = LIVE_PIDS.lock();
+    if let Some(pid) = ASSIGNED_PID.lock().take() {
+        live.insert(pid);
+        return pid;
+    }
     let pid = (1..).map(|k| k * 1000).find(|p| !live.contains(p)).expect("a free pid");
     live.insert(pid);
     pid
@@ -383,6 +401,18 @@ impl Process {
         p.family.inherit(&self.family);
         p.load(exe, argv, envp)?;
         Ok(p)
+    }
+
+    /// A stand-in for another host process's process (`crate::remote`): its pid and uid, its memory
+    /// and descriptors reached through `mem` and `fds`; no CPU runs it.
+    pub fn stand_in(sysroot: Arc<crate::vfs::Sysroot>, pid: i32, uid: u32, mem: Arc<dyn crate::guest::Remote>, fds: Arc<dyn crate::fd::RemoteFds>) -> Arc<Self> {
+        let space = Arc::new(GuestSpace::new().expect("a guest space"));
+        let vfs = Vfs::new(sysroot, Vec::new(), b"/remote".to_vec());
+        let p = Self::assemble_as(space, None, Some(pid), vfs, vec![b"/remote".to_vec()], FdTable::standard(Output::Host, Output::Host), false, None, 0, uid);
+        p.mem.set_remote(mem);
+        p.fds.set_remote(fds);
+        p.family.mark_stand_in();
+        p
     }
 
     /// A vfork child of this process: the same memory (space, layout lock, CPU backend), a copy of
@@ -929,8 +959,9 @@ impl Drop for Process {
         if self.trace {
             eprintln!("[process] {} dropped", self.sys.pid);
         }
-        // An image `execve` replaced leaves its pid to the image that replaced it.
-        if !self.family.superseded() {
+        // An image `execve` replaced leaves its pid to the image that replaced it; a stand-in's
+        // pid is its own host process's.
+        if !self.family.superseded() && !self.family.is_stand_in() {
             LIVE_PIDS.lock().remove(&self.sys.pid);
             crate::locks::process_ended(self.sys.pid);
         }
