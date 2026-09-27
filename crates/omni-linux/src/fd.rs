@@ -479,7 +479,8 @@ fn path_arg(p: &Process, a: u64) -> Result<Vec<u8>, Errno> {
 
 /// The directory a `*at` call's relative path is resolved against.
 fn base_dir(p: &Process, dirfd: u64, path: &[u8]) -> Result<Vec<u8>, Errno> {
-    if path.first() == Some(&b'/') || dirfd as i64 == AT_FDCWD {
+    // A descriptor is an `int`: the register's upper half is not part of it.
+    if path.first() == Some(&b'/') || i64::from(fd_arg(dirfd)) == AT_FDCWD {
         return Ok(p.cwd.lock().clone());
     }
     match &*p.fds.get(fd_arg(dirfd))?.kind.lock() {
@@ -780,7 +781,7 @@ fn sys_newfstatat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         if a[3] & AT_EMPTY_PATH == 0 {
             return Err(ENOENT);
         }
-        if a[0] as i64 == AT_FDCWD {
+        if i64::from(fd_arg(a[0])) == AT_FDCWD {
             stat_path(&p.vfs, &p.cwd.lock(), b".", true)?
         } else {
             stat_of(&p.vfs, &*p.fds.get(fd_arg(a[0]))?)?
