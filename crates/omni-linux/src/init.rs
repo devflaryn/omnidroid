@@ -65,9 +65,21 @@ pub fn services(sysroot: &Sysroot) -> HashMap<String, Service> {
     parse(sysroot).0
 }
 
-/// The services, and the `start`s of the boot-phase `on` blocks, in phase order.
-fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<String>) {
-    let mut scripts: Vec<Vec<u8>> = vec![b"/system/etc/init/hw/init.rc".to_vec()];
+/// A command of a boot phase's `on` block that init carries out here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Start(String),
+    /// `exec_start`: start a service and wait for it to end.
+    ExecStart(String),
+    Export(String, String),
+    /// `load_exports <file>`: its `export NAME VALUE` lines.
+    LoadExports(String),
+}
+
+/// The services, and the commands of the boot-phase `on` blocks, in phase order.
+fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
+    // The ramdisk's global environment first (init.rc imports it), then init.rc.
+    let mut scripts: Vec<Vec<u8>> = vec![b"/init.environ.rc".to_vec(), b"/system/etc/init/hw/init.rc".to_vec()];
     let mut dirs: Vec<Vec<u8>> =
         vec![b"/system/etc/init".to_vec(), b"/system_ext/etc/init".to_vec(), b"/product/etc/init".to_vec(), b"/vendor/etc/init".to_vec(), b"/odm/etc/init".to_vec()];
     for apex in sysroot.children(b"/apex") {
@@ -87,7 +99,7 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<String>) {
         }
     }
     let mut out = HashMap::new();
-    let mut starts: Vec<(usize, String)> = Vec::new();
+    let mut commands: Vec<(usize, Command)> = Vec::new();
     for script in scripts {
         let Some(text) = sysroot.read(&script) else { continue };
         let mut current: Option<Service> = None;
@@ -115,9 +127,16 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<String>) {
                     }
                     phase = (words.first() == Some(&"on") && words.len() == 2).then(|| BOOT_PHASES.iter().position(|p| *p == words[1])).flatten();
                 }
-                Some("start") if current.is_none() && words.len() == 2 => {
-                    if let Some(ph) = phase {
-                        starts.push((ph, words[1].to_string()));
+                Some("start" | "exec_start" | "export" | "load_exports") if current.is_none() => {
+                    let command = match (words[0], words.len()) {
+                        ("start", 2) => Some(Command::Start(words[1].to_string())),
+                        ("exec_start", 2) => Some(Command::ExecStart(words[1].to_string())),
+                        ("export", 3) => Some(Command::Export(words[1].to_string(), words[2].to_string())),
+                        ("load_exports", 2) => Some(Command::LoadExports(words[1].to_string())),
+                        _ => None,
+                    };
+                    if let (Some(ph), Some(c)) = (phase, command) {
+                        commands.push((ph, c));
                     }
                 }
                 Some(option) => {
@@ -138,17 +157,28 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<String>) {
             out.insert(s.name.clone(), s);
         }
     }
-    starts.sort_by_key(|(ph, _)| *ph);
-    (out, starts.into_iter().map(|(_, n)| n).collect())
+    commands.sort_by_key(|(ph, _)| *ph); // stable: a phase's commands keep their order
+    (out, commands.into_iter().map(|(_, c)| c).collect())
 }
+
+/// Set `name=value` in an environment, replacing an earlier value.
+fn set_env(envp: &mut Vec<Vec<u8>>, name: &str, value: &str) {
+    let prefix = format!("{name}=");
+    envp.retain(|e| !e.starts_with(prefix.as_bytes()));
+    envp.push(format!("{name}={value}").into_bytes());
+}
+
+/// How long `exec_start` waits for its service, at most.
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// init: the services, what runs, and how to start more.
 pub struct Init {
     sysroot: PathBuf,
     instance: PathBuf,
-    envp: Vec<Vec<u8>>,
+    /// The global environment every service is started with (`export`, `load_exports`).
+    envp: Mutex<Vec<Vec<u8>>>,
     services: HashMap<String, Service>,
-    boot_starts: Vec<String>,
+    boot_commands: Vec<Command>,
     running: Mutex<HashMap<String, Weak<Process>>>,
     /// Services never started here, by program: what runs only in a zygote-forked process.
     skip: fn(&Service) -> bool,
@@ -165,13 +195,20 @@ impl Init {
     /// Read the services and become this host process's init.
     pub fn start(sysroot: PathBuf, instance: PathBuf, envp: Vec<Vec<u8>>) -> Result<Arc<Self>, String> {
         let root = Sysroot::open(&sysroot)?;
-        let (services, boot_starts) = parse(&root);
+        let (services, boot_commands) = parse(&root);
+        // The boot phases' exports are unconditional: the environment has them from the start.
+        let mut envp = envp;
+        for c in &boot_commands {
+            if let Command::Export(name, value) = c {
+                set_env(&mut envp, name, value);
+            }
+        }
         let init = Arc::new(Self {
             sysroot,
             instance,
-            envp,
+            envp: Mutex::new(envp),
             services,
-            boot_starts,
+            boot_commands,
             running: Mutex::default(),
             // The zygote (app_process): apps are started without it (the C design, decision 4).
             skip: |s| s.argv.first().is_some_and(|p| p.contains("app_process")),
@@ -186,11 +223,74 @@ impl Init {
         &self.services
     }
 
-    /// Boot: the `start`s of the boot phases, then `class_start` of `classes`. What started.
+    /// The global environment a service started now gets.
+    #[must_use]
+    pub fn environment(&self) -> Vec<Vec<u8>> {
+        self.envp.lock().clone()
+    }
+
+    /// Boot: the boot phases' commands in order (`start`, `exec_start`, `export`,
+    /// `load_exports`), then `class_start` of `classes`. What started.
     pub fn boot(&self, classes: &[&str]) -> Vec<String> {
-        let mut started: Vec<String> = self.boot_starts.iter().filter(|n| self.start_service(n)).cloned().collect();
+        let mut started = Vec::new();
+        for c in &self.boot_commands {
+            match c {
+                Command::Start(n) => {
+                    if self.start_service(n) {
+                        started.push(n.clone());
+                    }
+                }
+                Command::ExecStart(n) => {
+                    if let Some(status) = self.exec_service(n) {
+                        started.push(n.clone());
+                        if std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                            eprintln!("[init] exec_start {n}: {status:?}");
+                        }
+                    }
+                }
+                Command::Export(name, value) => set_env(&mut self.envp.lock(), name, value),
+                Command::LoadExports(path) => self.load_exports(path),
+            }
+        }
         started.extend(self.class_start(classes));
         started
+    }
+
+    /// `load_exports <path>`: the file's `export NAME VALUE` lines (a guest path on a writable
+    /// mount, written by a service such as derive_classpath).
+    fn load_exports(&self, path: &str) {
+        let Some(rel) = path.strip_prefix('/') else { return };
+        let Some(host) = crate::vfs::host_path(&self.instance, rel.as_bytes()) else { return };
+        let Ok(text) = std::fs::read_to_string(host) else { return };
+        let mut envp = self.envp.lock();
+        for line in text.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if let ["export", name, value] = words[..] {
+                set_env(&mut envp, name, value);
+            }
+        }
+    }
+
+    /// `exec_start`: start a service and wait for it to end (at most [`EXEC_TIMEOUT`]). Its end,
+    /// or `None` when it could not start.
+    fn exec_service(&self, name: &str) -> Option<Option<crate::process::ExitStatus>> {
+        let service = self.services.get(name)?;
+        if (self.skip)(service) {
+            return None;
+        }
+        let config = SpawnConfig {
+            sysroot: self.sysroot.clone(),
+            instance_dir: self.instance.clone(),
+            argv: service.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+            envp: self.environment(),
+            stdout: Output::Host,
+            stderr: Output::Host,
+            trace: false,
+        };
+        let p = Process::spawn_as(config, service.uid).map_err(|e| eprintln!("[init] {name}: {e}")).ok()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name(format!("init-exec-{name}")).spawn(move || tx.send(p.run())).ok()?;
+        Some(rx.recv_timeout(EXEC_TIMEOUT).ok())
     }
 
     /// `class_start <class>` for each class: every service in it that is not `disabled`.
@@ -221,7 +321,7 @@ impl Init {
             sysroot: self.sysroot.clone(),
             instance_dir: self.instance.clone(),
             argv: service.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
-            envp: self.envp.clone(),
+            envp: self.environment(),
             stdout: Output::Host,
             stderr: Output::Host,
             trace: false,
