@@ -46,3 +46,18 @@ fn a_continued_service_line_keeps_its_arguments() {
     assert!(vold.classes.iter().any(|c| c == "core"), "{:?}", vold.classes);
     assert!(init.boot_commands().contains(&omni_linux::init::Command::InitUser0));
 }
+
+/// Boot generates the linker configuration from the active APEXes, as init's
+/// `perform_apex_config` does (early, and again once apexd has activated them).
+#[test]
+fn boot_generates_the_linker_configuration() {
+    use omni_linux::init::Command;
+    let sysroot = common::sysroot().expect("no sysroot (tools/make_sysroot.py)");
+    let instance = std::env::temp_dir().join(format!("omni-linux-init-linkerconfig-{}", std::process::id()));
+    let init = Init::start(sysroot, instance, Vec::new()).expect("init");
+    let c = init.boot_commands();
+    let wait = c.iter().position(|x| *x == Command::WaitForProp("apexd.status".into(), "activated".into())).expect("wait for apexd");
+    let config = c.iter().position(|x| *x == Command::PerformApexConfig { bootstrap: false }).expect("perform_apex_config");
+    assert!(c.contains(&Command::PerformApexConfig { bootstrap: true }), "{c:?}");
+    assert!(wait < config, "{c:?}");
+}

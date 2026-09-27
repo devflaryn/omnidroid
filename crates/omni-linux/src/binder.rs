@@ -1017,7 +1017,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         code,
         flags,
         sender_pid: p.sys.pid,
-        sender_euid: p.sys.uid,
+        sender_euid: p.sys.uid(),
         data,
         offsets,
         fds,

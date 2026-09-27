@@ -22,6 +22,7 @@ const O_NOFOLLOW: u32 = 0o100000;
 const O_CLOEXEC: u32 = 0o2000000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
+const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
 const PATH_MAX: usize = 4096;
@@ -75,11 +76,30 @@ pub struct OpenFile {
     pub flags: Mutex<u32>,
 }
 
+impl Drop for OpenFile {
+    /// Closed for the last time: its open-file-description locks go.
+    fn drop(&mut self) {
+        crate::locks::released(self);
+    }
+}
+
 pub struct FdTable {
     fds: Mutex<std::collections::BTreeMap<i32, (Arc<OpenFile>, bool)>>,
 }
 
 impl FdTable {
+    /// A fork child's table: the same open files at the same numbers, close-on-exec kept.
+    #[must_use]
+    pub fn for_fork(&self) -> Self {
+        Self { fds: Mutex::new(self.fds.lock().clone()) }
+    }
+
+    /// The table a program `execve` loads starts with: every descriptor not close-on-exec.
+    #[must_use]
+    pub fn for_exec(&self) -> Self {
+        Self { fds: Mutex::new(self.fds.lock().iter().filter(|(_, (_, cloexec))| !cloexec).map(|(n, e)| (*n, e.clone())).collect()) }
+    }
+
     #[must_use]
     pub fn standard(stdout: Output, stderr: Output) -> Self {
         let file = |kind| Arc::new(OpenFile { kind: Mutex::new(kind), flags: Mutex::new(0) });
@@ -191,6 +211,8 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
 pub struct Stat {
     pub ino: u64,
     pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
     pub nlink: u32,
     pub rdev: u64,
     pub size: i64,
@@ -207,6 +229,8 @@ impl Stat {
         b[8..16].copy_from_slice(&self.ino.to_le_bytes());
         b[16..20].copy_from_slice(&self.mode.to_le_bytes());
         b[20..24].copy_from_slice(&self.nlink.to_le_bytes());
+        b[24..28].copy_from_slice(&self.uid.to_le_bytes());
+        b[28..32].copy_from_slice(&self.gid.to_le_bytes());
         b[32..40].copy_from_slice(&self.rdev.to_le_bytes());
         b[48..56].copy_from_slice(&self.size.to_le_bytes());
         b[56..60].copy_from_slice(&4096i32.to_le_bytes()); // st_blksize
@@ -222,6 +246,19 @@ impl Stat {
 /// `chmod` without write bits sets it (Android refuses to load a writable dex file).
 fn host_mode(meta: &std::fs::Metadata) -> u32 {
     if meta.permissions().readonly() { 0o444 } else { 0o600 }
+}
+
+/// A writable-mount file's owner and mode, where one is recorded (`crate::owners`).
+fn owned(vfs: &Vfs, r: &Resolved, st: Stat) -> Stat {
+    let (Node::HostFile { host } | Node::HostDir { host }) = &r.node else { return st };
+    match vfs.owners().get(host) {
+        Some(o) => Stat { mode: (st.mode & S_IFMT) | (o.mode & 0o7777), uid: o.uid, gid: o.gid, ..st },
+        None => st,
+    }
+}
+
+fn stat_resolved(vfs: &Vfs, r: &Resolved) -> Result<Stat, Errno> {
+    Ok(owned(vfs, r, stat_node(r)?))
 }
 
 fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
@@ -243,18 +280,23 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
 }
 
 pub fn stat_path(vfs: &Vfs, cwd: &[u8], path: &[u8], follow: bool) -> Result<Stat, Errno> {
-    stat_node(&vfs.resolve(cwd, path, follow)?)
+    stat_resolved(vfs, &vfs.resolve(cwd, path, follow)?)
 }
 
-pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
+pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
     match &*file.kind.lock() {
         FileKind::Host { file, guest, sysroot } => {
             let meta = file.metadata().map_err(|_| EIO)?;
             let len = meta.len() as i64;
             let mode = if *sysroot { 0o644 } else { host_mode(&meta) };
-            Ok(Stat { ino: ino_of(guest), mode: S_IFREG | mode, nlink: 1, size: len, blocks: (len + 511) / 512, ..Stat::default() })
+            let st = Stat { ino: ino_of(guest), mode: S_IFREG | mode, nlink: 1, size: len, blocks: (len + 511) / 512, ..Stat::default() };
+            if *sysroot {
+                return Ok(st);
+            }
+            // The file's owner, by where it is now (a renamed file is found by its new name).
+            Ok(vfs.resolve(b"/", guest, true).map_or(st, |r| owned(vfs, &r, st)))
         }
-        FileKind::Dir { dir, .. } => stat_node(dir),
+        FileKind::Dir { dir, .. } => stat_resolved(vfs, dir),
         FileKind::Dev(d) => stat_node(&Resolved { path: b"/dev/null".to_vec(), node: Node::Dev(*d) }),
         FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => {
             Ok(Stat { ino: 1, mode: S_IFCHR | 0o620, nlink: 1, rdev: 0x8800, ..Stat::default() })
@@ -356,7 +398,11 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Shared(m) => m.write_seq(bytes),
         FileKind::Inotify(_) => Err(EBADF),
-        FileKind::Synth { guest, .. } => crate::procfs::write_attr(guest, bytes),
+        FileKind::Synth { guest, data, pos, .. } => {
+            let written = crate::procfs::write_generated(guest, bytes, data)?;
+            *pos = 0;
+            Ok(written)
+        }
         FileKind::Socket(s) => crate::socket::send(s, bytes),
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
         FileKind::Binder(_) | FileKind::Gpu(_) | FileKind::SyncFile(_) => Err(EINVAL),
@@ -438,12 +484,22 @@ fn sys_openat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
     let flags = a[2] as u32;
+    let creating = flags & O_CREAT != 0 && matches!(p.vfs.resolve(&base, &path, flags & O_NOFOLLOW == 0).map(|r| r.node), Ok(Node::Missing { .. }));
     let file = open(&p.vfs, &base, &path, flags)?;
+    if creating {
+        // The new file is its creator's, with the mode it asked for less its umask.
+        if let Ok(Node::HostFile { host }) = p.vfs.resolve(&base, &path, true).map(|r| r.node) {
+            created(p, &host, a[3] as u32);
+        }
+    }
     Ok(p.fds.insert(Arc::new(file), flags & O_CLOEXEC != 0, 0)? as u64)
 }
 
 fn sys_close(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    p.fds.remove(fd_arg(a[0])).map(|()| 0)
+    let file = p.fds.get(fd_arg(a[0]))?;
+    p.fds.remove(fd_arg(a[0]))?;
+    crate::locks::closed(p, &file);
+    Ok(0)
 }
 
 fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -467,6 +523,88 @@ fn sys_pread64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let n = read_file(&file, &mut buf, Some(a[3]))?;
     p.mem.write(a[1], &buf[..n])?;
     Ok(n as u64)
+}
+
+/// A write at `offset`, the file's position left where it was (`pwrite`): a writable-mount file or
+/// shared memory; anything without positions is `ESPIPE`.
+fn write_file_at(file: &OpenFile, bytes: &[u8], offset: u64) -> Result<usize, Errno> {
+    match &mut *file.kind.lock() {
+        FileKind::Host { file, sysroot: false, .. } => {
+            let keep = file.stream_position().map_err(|_| EIO)?;
+            file.seek(SeekFrom::Start(offset)).map_err(|_| EIO)?;
+            let n = file.write_all(bytes).map(|()| bytes.len()).map_err(|_| EIO);
+            file.seek(SeekFrom::Start(keep)).map_err(|_| EIO)?;
+            n
+        }
+        FileKind::Host { .. } | FileKind::Synth { .. } => Err(EBADF),
+        FileKind::Shared(m) => m.write_at(bytes, offset),
+        FileKind::Dir { .. } => Err(EISDIR),
+        FileKind::Dev(_) => Ok(bytes.len()),
+        _ => Err(ESPIPE),
+    }
+}
+
+fn sys_pwrite64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    if (a[3] as i64) < 0 {
+        return Err(EINVAL);
+    }
+    let bytes = p.mem.read(a[1], (a[2] as usize).min(1 << 24))?;
+    Ok(write_file_at(&file, &bytes, a[3])? as u64)
+}
+
+/// `pwritev(fd, iov, iovcnt, offset)`: the buffers written one after another from `offset`.
+fn sys_pwritev(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    const CAP: usize = 1 << 24;
+    let mut bytes = Vec::new();
+    for (base, len) in iovecs(p, a[1], a[2])? {
+        let take = len.min(CAP - bytes.len());
+        bytes.extend_from_slice(&p.mem.read(base, take)?);
+        if bytes.len() == CAP {
+            break;
+        }
+    }
+    Ok(write_file_at(&file, &bytes, a[3])? as u64)
+}
+
+/// `preadv(fd, iov, iovcnt, offset)`: the buffers filled one after another from `offset`.
+fn sys_preadv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let mut total = 0u64;
+    for (base, len) in iovecs(p, a[1], a[2])? {
+        let mut buf = vec![0u8; len.min(1 << 24)];
+        let n = read_file(&file, &mut buf, Some(a[3] + total))?;
+        p.mem.write(base, &buf[..n])?;
+        total += n as u64;
+        if n < buf.len() {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// `sendfile(out_fd, in_fd, offset, count)`: bytes copied from one descriptor to the other --
+/// from `*offset` (updated, the input's position untouched) or the input's position.
+fn sys_sendfile(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let (out, input) = (p.fds.get(fd_arg(a[0]))?, p.fds.get(fd_arg(a[1]))?);
+    let offset = if a[2] == 0 { None } else { Some(p.mem.read_u64(a[2])?) };
+    let mut buf = vec![0u8; (a[3] as usize).min(1 << 24)];
+    let n = read_file(&input, &mut buf, offset)?;
+    let written = match crate::pipe::end_of(&out) {
+        Some((_, false, _)) => return Err(EBADF),
+        Some((pipe, true, nonblocking)) => crate::pipe::write(&pipe, &buf[..n], nonblocking, t)?,
+        None => write_file(&out, &buf[..n])?,
+    };
+    if let Some(at) = offset {
+        p.mem.write_u64(a[2], at + written as u64)?;
+    } else if written < n {
+        // The input moved past what was not written: put it back.
+        if let FileKind::Host { file, .. } = &mut *input.kind.lock() {
+            let _ = file.seek(SeekFrom::Current(-((n - written) as i64)));
+        }
+    }
+    Ok(written as u64)
 }
 
 fn sys_write(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -571,7 +709,7 @@ fn sys_lseek(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 fn sys_fstat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    let st = stat_of(&*p.fds.get(fd_arg(a[0]))?)?;
+    let st = stat_of(&p.vfs, &*p.fds.get(fd_arg(a[0]))?)?;
     p.mem.write(a[1], &st.to_bytes())?;
     Ok(0)
 }
@@ -585,7 +723,7 @@ fn sys_newfstatat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         if a[0] as i64 == AT_FDCWD {
             stat_path(&p.vfs, &p.cwd.lock(), b".", true)?
         } else {
-            stat_of(&*p.fds.get(fd_arg(a[0]))?)?
+            stat_of(&p.vfs, &*p.fds.get(fd_arg(a[0]))?)?
         }
     } else {
         let base = base_dir(p, a[0], &path)?;
@@ -684,6 +822,24 @@ fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     match a[1] {
         // TCGETS, TIOCGWINSZ, TIOCGPGRP: nothing here is a terminal.
         0x5401 | 0x5413 | 0x540F => Err(ENOTTY),
+        // FIONREAD: the bytes ready to read.
+        0x541b => {
+            let n = match crate::pipe::end_of(&file) {
+                Some((pipe, _, _)) => crate::pipe::queued(&pipe),
+                None => match &mut *file.kind.lock() {
+                    FileKind::Socket(s) => crate::socket::available(s),
+                    FileKind::Host { file, .. } => {
+                        let at = file.stream_position().map_err(|_| EIO)?;
+                        file.metadata().map_err(|_| EIO)?.len().saturating_sub(at) as usize
+                    }
+                    FileKind::Synth { data, pos, .. } => data.len().saturating_sub(*pos),
+                    FileKind::Dir { .. } => return Err(EISDIR),
+                    _ => 0,
+                },
+            };
+            p.mem.write_u32(a[2], n as u32)?;
+            Ok(0)
+        }
         other => {
             p.refusals.record(format!("ioctl {other:#x}"), t.pc, t.lr);
             Err(ENOTTY)
@@ -705,6 +861,8 @@ fn sys_fcntl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         1031 | 1032 if crate::pipe::end_of(&file).is_some() => {
             Ok(if a[1] == 1031 { (a[2].clamp(4096, 1 << 20) + 4095) & !4095 } else { 64 << 10 })
         }
+        // Record locks: F_GETLK, F_SETLK, F_SETLKW and the open-file-description forms.
+        5..=7 | 36..=38 => crate::locks::fcntl(p, t, &file, a[1], a[2]),
         4 => {
             let mut f = file.flags.lock();
             *f = (*f & O_ACCMODE) | (a[2] as u32 & (O_APPEND | 0o4000));
@@ -777,29 +935,58 @@ fn writable_host(p: &Process, dirfd: u64, path: &[u8], follow: bool) -> Result<(
     Ok((r.node, host))
 }
 
+/// A file or directory `p` just made: its, with `mode` less the umask.
+fn created(p: &Process, host: &std::path::Path, mode: u32) {
+    let mode = mode & 0o7777 & !p.sys.umask();
+    p.vfs.owners().set(host, crate::owners::Owner { uid: p.sys.uid(), gid: p.sys.gid(), mode });
+}
+
 fn sys_mkdirat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
     match p.vfs.resolve(&base, &path, false)?.node {
-        Node::Missing { host: Some(host), parent_is_dir: true } => std::fs::create_dir(&host).map(|()| 0).map_err(|_| EACCES),
+        Node::Missing { host: Some(host), parent_is_dir: true } => {
+            std::fs::create_dir(&host).map_err(|_| EACCES)?;
+            created(p, &host, a[2] as u32);
+            Ok(0)
+        }
         Node::Missing { host: None, parent_is_dir: true } => Err(EROFS),
         Node::Missing { .. } => Err(ENOENT),
         _ => Err(EEXIST),
     }
 }
 
+/// `OMNI_FS_TRACE=1`: every file or directory removed or renamed, by which process -- what a
+/// directory that vanished is traced back with.
+fn fs_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_FS_TRACE").as_deref() == Ok("1"))
+}
+
 fn sys_unlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     const AT_REMOVEDIR: u64 = 0x200;
     let path = path_arg(p, a[1])?;
     let (node, host) = writable_host(p, a[0], &path, false)?;
+    if fs_trace() {
+        let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
+        eprintln!("[fs] {} ({comm}) {} {} -> {}", p.sys.pid, if a[2] & AT_REMOVEDIR != 0 { "rmdir" } else { "unlink" }, String::from_utf8_lossy(&path), host.display());
+    }
     match (node, a[2] & AT_REMOVEDIR != 0) {
         (Node::Missing { .. }, _) => Err(ENOENT),
         (Node::HostDir { .. }, false) => Err(EISDIR),
-        (Node::HostDir { .. }, true) => std::fs::remove_dir(&host).map(|()| 0).map_err(|e| {
-            if std::fs::read_dir(&host).is_ok_and(|mut d| d.next().is_some()) { ENOTEMPTY } else { let _ = e; EACCES }
-        }),
+        (Node::HostDir { .. }, true) => {
+            std::fs::remove_dir(&host).map_err(|e| {
+                if std::fs::read_dir(&host).is_ok_and(|mut d| d.next().is_some()) { ENOTEMPTY } else { let _ = e; EACCES }
+            })?;
+            p.vfs.owners().forget(&host);
+            Ok(0)
+        }
         (_, true) => Err(ENOTDIR),
-        (_, false) => std::fs::remove_file(&host).map(|()| 0).map_err(|_| EACCES),
+        (_, false) => {
+            std::fs::remove_file(&host).map_err(|_| EACCES)?;
+            p.vfs.owners().forget(&host);
+            Ok(0)
+        }
     }
 }
 
@@ -815,7 +1002,13 @@ fn sys_renameat2(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         return Err(ENOENT);
     }
     let (_, to) = writable_host(p, a[2], &to_path, false)?;
-    std::fs::rename(&from, &to).map(|()| 0).map_err(|_| EACCES)
+    if fs_trace() {
+        let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
+        eprintln!("[fs] {} ({comm}) rename {} -> {}", p.sys.pid, from.display(), to.display());
+    }
+    std::fs::rename(&from, &to).map_err(|_| EACCES)?;
+    p.vfs.owners().rename(&from, &to);
+    Ok(0)
 }
 
 fn sys_renameat(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -895,52 +1088,81 @@ fn set_host_mode(host: &std::path::Path, mode: u64) -> Result<(), Errno> {
     std::fs::set_permissions(host, perms).map_err(|_| EIO)
 }
 
-fn sys_fchmod(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    let file = p.fds.get(fd_arg(a[0]))?;
-    let kind = file.kind.lock();
-    match &*kind {
-        FileKind::Host { sysroot: true, .. } | FileKind::Synth { .. } => Err(EROFS),
-        FileKind::Host { guest, .. } => {
-            let guest = guest.clone();
-            drop(kind);
-            let r = p.vfs.resolve(b"/", &guest, true)?;
-            match r.node {
-                Node::HostFile { host } => set_host_mode(&host, a[1]).map(|()| 0),
-                _ => Ok(0),
-            }
-        }
-        _ => Ok(0),
-    }
+/// What an open descriptor names, resolved again by its path (for `fchmod`, `fchown`).
+fn node_of(p: &Process, file: &OpenFile) -> Result<Node, Errno> {
+    let guest = match &*file.kind.lock() {
+        FileKind::Host { sysroot: true, .. } | FileKind::Synth { .. } => return Err(EROFS),
+        FileKind::Host { guest, .. } => guest.clone(),
+        FileKind::Dir { dir, .. } => dir.path.clone(),
+        _ => return Ok(Node::Generated),
+    };
+    Ok(p.vfs.resolve(b"/", &guest, true)?.node)
 }
 
-/// `fchown`: ownership is not modelled (every file is the app's); accepted where `chmod` is.
-fn sys_fchown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
-        FileKind::Host { sysroot: true, .. } | FileKind::Synth { .. } => Err(EROFS),
-        _ => Ok(0),
+/// `chmod` of a node: a writable-mount file's mode is recorded (and a file without write bits is
+/// read-only on the host too: Android refuses to load a writable dex file); a device's is
+/// accepted; the image is read-only.
+fn chmod_node(p: &Process, node: Node, mode: u64) -> SysResult {
+    let host = match node {
+        Node::Missing { .. } => return Err(ENOENT),
+        Node::HostFile { host } => {
+            set_host_mode(&host, mode)?;
+            host
+        }
+        Node::HostDir { host } => host,
+        Node::Dev(_) | Node::Generated => return Ok(0),
+        _ => return Err(EROFS),
+    };
+    let was = p.vfs.owners().get(&host).unwrap_or(crate::owners::Owner { uid: 0, gid: 0, mode: 0 });
+    p.vfs.owners().set(&host, crate::owners::Owner { mode: mode as u32 & 0o7777, ..was });
+    Ok(0)
+}
+
+/// `chown` of a node: root gives any owner; another user may only leave it as it is. `-1` keeps
+/// that id.
+fn chown_node(p: &Process, node: Node, uid: u64, gid: u64) -> SysResult {
+    let host = match node {
+        Node::Missing { .. } => return Err(ENOENT),
+        Node::HostFile { host } | Node::HostDir { host } => host,
+        Node::Dev(_) | Node::Generated => return Ok(0),
+        _ => return Err(EROFS),
+    };
+    let was = p.vfs.owners().get(&host).unwrap_or(crate::owners::Owner { uid: 0, gid: 0, mode: 0o755 });
+    let pick = |want: u64, old: u32| if want as u32 == u32::MAX { old } else { want as u32 };
+    let now = crate::owners::Owner { uid: pick(uid, was.uid), gid: pick(gid, was.gid), ..was };
+    if p.sys.uid() != 0 && (now.uid != was.uid || now.gid != was.gid) && !(was.uid == p.sys.uid() && now.uid == was.uid) {
+        return Err(EPERM);
     }
+    p.vfs.owners().set(&host, now);
+    Ok(0)
+}
+
+fn sys_fchmod(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let node = node_of(p, &file)?;
+    chmod_node(p, node, a[1])
+}
+
+fn sys_fchown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let node = node_of(p, &file)?;
+    chown_node(p, node, a[1], a[2])
 }
 
 /// `fchmodat`/`fchownat`: the same, by path.
 fn sys_fchmodat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
-    match p.vfs.resolve(&base, &path, true)?.node {
-        Node::Missing { .. } => Err(ENOENT),
-        Node::HostFile { host } => set_host_mode(&host, a[2]).map(|()| 0),
-        Node::HostDir { .. } | Node::Dev(_) => Ok(0),
-        _ => Err(EROFS),
-    }
+    let node = p.vfs.resolve(&base, &path, true)?.node;
+    chmod_node(p, node, a[2])
 }
 
 fn sys_fchownat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
-    match p.vfs.resolve(&base, &path, true)?.node {
-        Node::Missing { .. } => Err(ENOENT),
-        Node::HostFile { .. } | Node::HostDir { .. } | Node::Dev(_) => Ok(0),
-        _ => Err(EROFS),
-    }
+    let node = p.vfs.resolve(&base, &path, a[4] & AT_SYMLINK_NOFOLLOW == 0)?.node;
+    chown_node(p, node, a[2], a[3])
 }
 
 /// The filesystem magic a path is on: selinuxfs, sysfs and proc where the kernel mounts them,
@@ -1030,6 +1252,10 @@ pub fn install(table: &mut Table) {
     table.set(nr::RENAMEAT, sys_renameat);
     table.set(nr::RENAMEAT2, sys_renameat2);
     table.set(nr::FTRUNCATE, sys_ftruncate);
+    table.set(nr::PWRITE64, sys_pwrite64);
+    table.set(nr::SENDFILE, sys_sendfile);
+    table.set(nr::PREADV, sys_preadv);
+    table.set(nr::PWRITEV, sys_pwritev);
     table.set(nr::MEMFD_CREATE, sys_memfd_create);
     table.set(nr::INOTIFY_INIT1, sys_inotify_init1);
     table.set(nr::INOTIFY_ADD_WATCH, sys_inotify_add_watch);

@@ -61,6 +61,12 @@ impl Drop for End {
     }
 }
 
+/// Bytes queued in the pipe (`FIONREAD`).
+#[must_use]
+pub fn queued(pipe: &Pipe) -> usize {
+    pipe.bytes.lock().len()
+}
+
 /// `EPOLL*` readiness of one end.
 #[must_use]
 pub fn readiness(end: &End) -> u32 {

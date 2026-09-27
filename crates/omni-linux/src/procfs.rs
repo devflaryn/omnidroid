@@ -138,12 +138,12 @@ fn stat(p: &Process) -> Vec<u8> {
 
 fn status(p: &Process) -> Vec<u8> {
     let pid = p.sys.pid;
-    let uid = p.sys.uid;
+    let (uid, gid) = (p.sys.uid(), p.sys.gid());
     let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
     let mut out = String::new();
     let _ = write!(out, "Name:\t{name}\nUmask:\t{:04o}\nState:\tR (running)\n", p.sys.umask());
     let _ = write!(out, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t1\nTracerPid:\t0\n");
-    let _ = write!(out, "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
+    let _ = write!(out, "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n");
     let _ = write!(out, "FDSize:\t64\nGroups:\t\nVmSize:\t{} kB\nVmRSS:\t{} kB\n", mapped_bytes(p) / 1024, committed_pages(p) * 4);
     let threads = p.tids().len();
     let _ = write!(out, "Threads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nCpus_allowed_list:\t0-{}\n", cpus() - 1);
@@ -288,10 +288,39 @@ fn settable_attr(path: &[u8]) -> Option<(i32, &'static str)> {
     SETTABLE_ATTRS.iter().find(|a| **a == name).map(|a| (pid, *a))
 }
 
-/// Whether a path is an attribute a process may write (`setfscreatecon` and its kin).
+/// Whether a path is an attribute a process may write (`setfscreatecon` and its kin), or a
+/// selinuxfs transaction file.
 #[must_use]
 pub fn is_settable_attr(path: &[u8]) -> bool {
-    settable_attr(path).is_some()
+    settable_attr(path).is_some() || path == SELINUX_CONTEXT
+}
+
+const SELINUX_CONTEXT: &[u8] = b"/sys/fs/selinux/context";
+
+/// A write to a writable generated file: an attribute, or selinuxfs's `context` transaction,
+/// whose answer (`answer`) the same descriptor then reads.
+pub fn write_generated(path: &[u8], bytes: &[u8], answer: &mut Vec<u8>) -> Result<usize, crate::errno::Errno> {
+    if path == SELINUX_CONTEXT {
+        *answer = check_context(bytes)?;
+        return Ok(bytes.len());
+    }
+    write_attr(path, bytes)
+}
+
+/// `security_check_context`: with no policy loaded here (permissive), a context is valid when it
+/// is well formed -- `user:role:type:level`, the level optionally with categories -- and its
+/// canonical form is itself, NUL-terminated.
+fn check_context(bytes: &[u8]) -> Result<Vec<u8>, crate::errno::Errno> {
+    let text = bytes.split(|b| *b == 0).next().unwrap_or_default();
+    let text = std::str::from_utf8(text).map_err(|_| crate::errno::EINVAL)?.trim_end_matches('\n');
+    let fields: Vec<&str> = text.splitn(4, ':').collect();
+    let word = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+    if fields.len() != 4 || !fields[..3].iter().all(|f| word(f)) || fields[3].is_empty() || fields[3].bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(crate::errno::EINVAL);
+    }
+    let mut canonical = text.as_bytes().to_vec();
+    canonical.push(0);
+    Ok(canonical)
 }
 
 /// A write to a settable attribute: it holds the context written (empty clears it).
@@ -393,8 +422,12 @@ impl Process {
                     ("policyvers", DT_REG),
                     ("mls", DT_REG),
                     ("checkreqprot", DT_REG),
+                    ("context", DT_REG),
                 ]))
             }
+            // A transaction file: a context written is checked, and the same descriptor reads
+            // back its canonical form (`write_selinux_context`).
+            "/sys/fs/selinux/context" => return Some(Entry::Bytes(Vec::new())),
             "/sys/fs/selinux/status" => return Some(Entry::File(selinux_status)),
             "/sys/fs/selinux/enforce" | "/sys/fs/selinux/deny_unknown" | "/sys/fs/selinux/reject_unknown" | "/sys/fs/selinux/checkreqprot" => {
                 return Some(Entry::File(zero))

@@ -58,3 +58,34 @@ fn a_process_sets_its_file_creation_context() {
     assert_eq!(status, OK, "{out}\n{err}");
     assert_eq!(out, "[u:object_r:system_data_file:s0]\n[]\n", "{err}");
 }
+
+/// A recursive restorecon (the fts walk installd's `restorecon_pkgdir` makes over an app's data
+/// directory) labels the tree.
+#[test]
+fn a_recursive_restorecon_labels_a_tree() {
+    let Some(runs) = common::run_each(&[
+        &["/system/bin/mkdir", "-p", "/data/misc/probe/a/b"],
+        &["/system/bin/touch", "/data/misc/probe/a/b/f"],
+        &["/system/bin/restorecon", "-R", "/data/misc/probe"],
+        &["/system/bin/ls", "-Z", "/data/misc/probe/a/b/f"],
+    ]) else {
+        return;
+    };
+    for (status, out, err) in &runs {
+        assert_eq!(*status, OK, "{out}\n{err}");
+    }
+    assert!(runs[3].1.contains("u:object_r:system_data_file:s0"), "{:?}", runs[3]);
+}
+
+/// selinuxfs's `context` transaction (`security_check_context`, which installd's app-data
+/// restorecon asks): a well-formed context is accepted and read back; a malformed one is
+/// `EINVAL`.
+#[test]
+fn selinuxfs_checks_a_context() {
+    let script = "{ echo -n u:object_r:app_data_file:s0:c136,c256,c512,c768 >&3 && read -r v <&3; echo \"[$v]\"; } 3<>/sys/fs/selinux/context; \
+                  { echo -n nonsense >&3 && echo accepted || echo refused; } 3<>/sys/fs/selinux/context";
+    let Some((status, out, err)) = common::run(&["/system/bin/sh", "-c", script]) else { return };
+    assert_eq!(status, OK, "{out}\n{err}");
+    assert!(out.contains("[u:object_r:app_data_file:s0:c136,c256,c512,c768"), "{out}\n{err}");
+    assert!(out.trim_end().ends_with("refused"), "{out}\n{err}");
+}

@@ -25,17 +25,56 @@ pub type Layout = Arc<parking_lot::RwLock<()>>;
 pub struct GuestMem {
     space: Arc<GuestSpace>,
     layout: Layout,
+    /// While a fork child runs in this process's memory: the ranges the kernel wrote for this
+    /// process (a blocked call completing), which the fork's restore keeps.
+    journaling: std::sync::atomic::AtomicBool,
+    journal: parking_lot::Mutex<Vec<(u64, usize)>>,
 }
 
 impl GuestMem {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>, layout: Layout) -> Self {
-        Self { space, layout }
+        Self { space, layout, journaling: std::sync::atomic::AtomicBool::new(false), journal: parking_lot::Mutex::default() }
+    }
+
+    /// Start recording the ranges written through this view.
+    pub fn start_journal(&self) {
+        self.journal.lock().clear();
+        self.journaling.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stop recording; the ranges written since `start_journal`.
+    pub fn take_journal(&self) -> Vec<(u64, usize)> {
+        self.journaling.store(false, std::sync::atomic::Ordering::SeqCst);
+        std::mem::take(&mut *self.journal.lock())
+    }
+
+    fn note(&self, addr: u64, len: usize) {
+        if self.journaling.load(std::sync::atomic::Ordering::Relaxed) {
+            self.journal.lock().push((untag(addr), len));
+        }
+    }
+
+    /// `read`, for a caller that holds the layout lock exclusively.
+    pub(crate) fn read_holding_layout(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        let ptr = self.check(addr, len, false)?;
+        let mut out = vec![0u8; len];
+        if len != 0 {
+            // SAFETY: `check` proved [addr, addr+len) mapped, readable and committed.
+            unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len) };
+        }
+        Ok(out)
     }
 
     #[must_use]
     pub fn space(&self) -> &Arc<GuestSpace> {
         &self.space
+    }
+
+    /// The layout lock (shared by a vfork child with its parent).
+    #[must_use]
+    pub fn layout(&self) -> &Layout {
+        &self.layout
     }
 
     fn check(&self, addr: u64, len: usize, write: bool) -> Result<*mut u8, Errno> {
@@ -88,6 +127,7 @@ impl GuestMem {
     pub(crate) fn write_holding_layout(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
         let ptr = self.check(addr, bytes.len(), true)?;
         if !bytes.is_empty() {
+            self.note(addr, bytes.len());
             // SAFETY: `check` proved the range mapped, writable and committed.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
         }
@@ -101,6 +141,7 @@ impl GuestMem {
             return Err(crate::errno::EINVAL);
         }
         let ptr = self.check(addr, 4, true)?;
+        self.note(addr, 4);
         // SAFETY: `check` proved the four bytes mapped, writable and committed; they are aligned;
         // guest memory outlives `self`, and every access to it is atomic or byte-wise.
         Ok(unsafe { &*ptr.cast::<std::sync::atomic::AtomicU32>() })

@@ -17,6 +17,7 @@ fn main() -> ExitCode {
     let mut uid: u32 = 10_000;
     let mut init_classes: Vec<String> = Vec::new();
     let mut hals: Vec<String> = Vec::new();
+    let mut caps: Option<u64> = None;
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -26,6 +27,11 @@ fn main() -> ExitCode {
             "--service" => services.push(args.next().expect("--service needs a program")),
             "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
             "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc, composer)")),
+            // The program's capabilities (comma-separated names), as a zygote or init grants them.
+            "--caps" => {
+                let names = args.next().expect("--caps needs capability names");
+                caps = Some(names.split(',').filter_map(omni_linux::sys::cap_number).fold(0, |m, n| m | (1u64 << n)));
+            }
             // init: read the image's services, and class_start these classes (comma-separated).
             "--init" => init_classes = args.next().expect("--init needs classes").split(',').map(String::from).collect(),
             "--" => {
@@ -124,6 +130,9 @@ fn main() -> ExitCode {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let _ = std::fs::write(&path, fb.png());
         });
+    }
+    if let Some(caps) = caps {
+        p.sys.set_caps(caps);
     }
     let status = p.run();
     // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.

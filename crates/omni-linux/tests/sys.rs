@@ -152,3 +152,58 @@ fn every_process_reads_one_monotonic_clock() {
     let later = read(&b, &mut tb, sb);
     assert!(later >= first + std::time::Duration::from_millis(50), "a process started later reads a later time: {first:?} then {later:?}");
 }
+
+/// `capget` (crash_dump asks before dropping them): an app holds no capability; an unknown
+/// header version is answered with version 3 and `EINVAL`.
+#[test]
+fn capget_reports_an_apps_empty_capability_sets() {
+    let (p, mut t, s) = process();
+    p.mem.write(s, &[0u8; 8]).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::CAPGET, [s, s + 64, 0, 0, 0, 0]), EINVAL.as_return());
+    assert_eq!(p.mem.read_u32(s).unwrap(), 0x2008_0522);
+    p.mem.write(s + 64, &[0xffu8; 24]).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::CAPGET, [s, s + 64, 0, 0, 0, 0]), 0);
+    assert_eq!(p.mem.read(s + 64, 24).unwrap(), vec![0u8; 24]);
+    assert_eq!(p.syscall(&mut t, nr::CAPSET, [s, s + 64, 0, 0, 0, 0]), 0);
+}
+
+/// The set*id calls: a user may keep its own ids (and `-1` changes nothing) but take no other;
+/// `getresuid` and the group list answer what is held.
+#[test]
+fn an_app_keeps_its_ids_and_takes_no_others() {
+    let (p, mut t, s) = process();
+    let uid = p.syscall(&mut t, nr::GETUID, [0; 6]);
+    assert_eq!(p.syscall(&mut t, nr::SETGID, [uid, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, nr::SETRESUID, [u64::from(u32::MAX), uid, u64::from(u32::MAX), 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, nr::SETUID, [0, 0, 0, 0, 0, 0]), omni_linux::errno::EPERM.as_return());
+    assert_eq!(p.syscall(&mut t, nr::SETGID, [1000, 0, 0, 0, 0, 0]), omni_linux::errno::EPERM.as_return());
+    assert_eq!(p.syscall(&mut t, nr::GETRESUID, [s, s + 4, s + 8, 0, 0, 0]), 0);
+    assert_eq!(p.mem.read(s, 12).unwrap(), [uid as u32; 3].iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<_>>());
+    assert_eq!(p.syscall(&mut t, nr::GETGROUPS, [0; 6]), 0);
+    assert_eq!(p.syscall(&mut t, nr::SETGROUPS, [0, s, 0, 0, 0, 0]), omni_linux::errno::EPERM.as_return());
+}
+
+/// Capabilities: what the process was granted (system_server's `BLOCK_SUSPEND`, as the zygote
+/// grants it) is what `capget` reports; `capset` drops but never takes; the bounding set holds
+/// every one.
+#[test]
+fn capabilities_are_what_was_granted_and_can_only_be_dropped() {
+    let (p, mut t, s) = process();
+    let block_suspend = omni_linux::sys::cap_number("BLOCK_SUSPEND").unwrap();
+    let wake_alarm = omni_linux::sys::cap_number("CAP_WAKE_ALARM").unwrap();
+    assert_eq!((block_suspend, wake_alarm), (36, 35));
+    p.sys.set_caps((1 << block_suspend) | (1 << wake_alarm));
+    p.mem.write_u32(s, 0x2008_0522).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::CAPGET, [s, s + 64, 0, 0, 0, 0]), 0);
+    let word = |n: u64| p.mem.read_u32(s + 64 + n * 4).unwrap();
+    assert_eq!((word(0), word(3), word(4)), (0, 0b11 << 3, 0b11 << 3), "caps 35 and 36 live in the second word");
+    // Dropping WAKE_ALARM is allowed; taking SYS_ADMIN is not.
+    p.mem.write(s + 64, &[0u8; 24]).unwrap();
+    p.mem.write_u32(s + 64 + 12, 1 << (block_suspend - 32)).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::CAPSET, [s, s + 64, 0, 0, 0, 0]), 0);
+    assert_eq!(p.sys.caps(), 1 << block_suspend);
+    p.mem.write_u32(s + 64, 1 << 21).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::CAPSET, [s, s + 64, 0, 0, 0, 0]), omni_linux::errno::EPERM.as_return());
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [23, 21, 0, 0, 0, 0]), 1, "PR_CAPBSET_READ");
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [47, 1, u64::from(block_suspend), 0, 0, 0]), 1, "PR_CAP_AMBIENT_IS_SET");
+}

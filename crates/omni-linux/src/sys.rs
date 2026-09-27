@@ -13,7 +13,15 @@ const SIGSTOP: u64 = 19;
 
 pub struct SysState {
     pub pid: i32,
-    pub uid: u32,
+    /// The user and group ids (real = effective = saved here), which `setuid`/`setgid` change.
+    uid: std::sync::atomic::AtomicU32,
+    gid: std::sync::atomic::AtomicU32,
+    groups: Mutex<Vec<u32>>,
+    /// The capabilities held (effective = permitted here): every one for root, none for another
+    /// user, unless granted (init's `capabilities`, the zygote's for system_server).
+    caps: std::sync::atomic::AtomicU64,
+    /// `PR_SET_KEEPCAPS`: a root process keeps its capabilities across `setuid`.
+    keepcaps: std::sync::atomic::AtomicBool,
     start: Instant,
     actions: Mutex<[[u8; 32]; 65]>,
     /// The file-creation mask (`umask`), 022 to start with as a shell's is.
@@ -23,7 +31,56 @@ pub struct SysState {
 impl SysState {
     #[must_use]
     pub fn new(pid: i32, uid: u32) -> Self {
-        Self { pid, uid, start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), umask: std::sync::atomic::AtomicU32::new(0o022) }
+        Self { pid, uid: uid.into(), gid: uid.into(), groups: Mutex::default(), caps: (if uid == 0 { ALL_CAPS } else { 0 }).into(), keepcaps: false.into(), start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), umask: std::sync::atomic::AtomicU32::new(0o022) }
+    }
+
+    #[must_use]
+    pub fn uid(&self) -> u32 {
+        self.uid.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn gid(&self) -> u32 {
+        self.gid.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A fork child's or an executed program's ids and capabilities: the process's.
+    pub fn inherit_ids(&self, from: &SysState) {
+        self.uid.store(from.uid(), std::sync::atomic::Ordering::Relaxed);
+        self.gid.store(from.gid(), std::sync::atomic::Ordering::Relaxed);
+        *self.groups.lock() = from.groups.lock().clone();
+        self.caps.store(from.caps(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The capabilities held, bit `n` for `CAP_*` number `n`.
+    #[must_use]
+    pub fn caps(&self) -> u64 {
+        self.caps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Grant exactly these capabilities (init for a service; the launcher for system_server, as
+    /// the zygote grants them).
+    pub fn set_caps(&self, caps: u64) {
+        self.caps.store(caps & ALL_CAPS, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A fork child's: its parent's signal actions and umask.
+    pub fn inherit(&self, parent: &SysState) {
+        *self.actions.lock() = *parent.actions.lock();
+        self.umask.store(parent.umask.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An executed program's: ignored signals stay ignored, handled ones return to their default
+    /// (the handlers are gone with the old image); the umask stays.
+    pub fn inherit_ignored(&self, old: &SysState) {
+        let old_actions = *old.actions.lock();
+        let mut actions = self.actions.lock();
+        for (sig, action) in old_actions.iter().enumerate() {
+            if u64::from_le_bytes(action[..8].try_into().expect("8 bytes")) == 1 {
+                actions[sig] = *action;
+            }
+        }
+        self.umask.store(old.umask.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Time since the process started.
@@ -86,19 +143,188 @@ fn now(_p: &Process, clock: u64) -> Result<Duration, Errno> {
 }
 
 fn sys_getpid(p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(p.sys.pid as u64) }
-fn sys_getppid(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(1) }
+fn sys_getppid(p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(p.family.ppid() as u64) }
 fn sys_gettid(_p: &Process, t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(t.tid as u64) }
-fn sys_getuid(p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(u64::from(p.sys.uid)) }
+fn sys_getuid(p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(u64::from(p.sys.uid())) }
+fn sys_getgid(p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(u64::from(p.sys.gid())) }
+
+/// Change an id to `wanted` (`-1`: unchanged): root may take any, another user only its own.
+fn set_id(id: &std::sync::atomic::AtomicU32, root: bool, wanted: u64) -> Result<(), Errno> {
+    let wanted = wanted as u32;
+    if wanted == u32::MAX {
+        return Ok(());
+    }
+    if !root && wanted != id.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(EPERM);
+    }
+    id.store(wanted, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// `setuid`, `setreuid`, `setresuid` (and `setfsuid`): real, effective and saved are one id here;
+/// the last of the ids given that is not `-1` is the one taken. A group change is checked against
+/// the user before it (the order a daemon drops privileges in: groups, then user).
+/// A root process that becomes another user loses its capabilities, unless it asked to keep
+/// them (`PR_SET_KEEPCAPS`).
+fn left_root(p: &Process, was_root: bool) {
+    if was_root && p.sys.uid() != 0 && !p.sys.keepcaps.load(std::sync::atomic::Ordering::Relaxed) {
+        p.sys.set_caps(0);
+    }
+}
+
+fn sys_setuid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let root = p.sys.uid() == 0;
+    set_id(&p.sys.uid, root, a[0])?;
+    left_root(p, root);
+    Ok(0)
+}
+fn sys_setresuid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let root = p.sys.uid() == 0;
+    for id in [a[0], a[1], a[2]] {
+        set_id(&p.sys.uid, root, id)?;
+    }
+    left_root(p, root);
+    Ok(0)
+}
+fn sys_setreuid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let root = p.sys.uid() == 0;
+    for id in [a[0], a[1]] {
+        set_id(&p.sys.uid, root, id)?;
+    }
+    left_root(p, root);
+    Ok(0)
+}
+fn sys_setgid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    set_id(&p.sys.gid, p.sys.uid() == 0, a[0]).map(|()| 0)
+}
+fn sys_setresgid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let root = p.sys.uid() == 0;
+    for id in [a[0], a[1], a[2]] {
+        set_id(&p.sys.gid, root, id)?;
+    }
+    Ok(0)
+}
+fn sys_setregid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let root = p.sys.uid() == 0;
+    for id in [a[0], a[1]] {
+        set_id(&p.sys.gid, root, id)?;
+    }
+    Ok(0)
+}
+/// `setfsuid`/`setfsgid`: the previous id, always (as the kernel answers).
+fn sys_setfsuid(p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(u64::from(p.sys.uid())) }
+fn sys_setfsgid(p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(u64::from(p.sys.gid())) }
+fn sys_getresuid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    for at in [a[0], a[1], a[2]] {
+        p.mem.write_u32(at, p.sys.uid())?;
+    }
+    Ok(0)
+}
+fn sys_getresgid(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    for at in [a[0], a[1], a[2]] {
+        p.mem.write_u32(at, p.sys.gid())?;
+    }
+    Ok(0)
+}
+/// `setgroups(n, list)`: root only.
+fn sys_setgroups(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    if p.sys.uid() != 0 {
+        return Err(EPERM);
+    }
+    let n = usize::try_from(a[0]).map_err(|_| EINVAL)?;
+    if n > 65536 {
+        return Err(EINVAL);
+    }
+    let bytes = p.mem.read(a[1], n * 4)?;
+    *p.sys.groups.lock() = bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().expect("4"))).collect();
+    Ok(0)
+}
+/// `getgroups(size, list)`: the count with size 0; `EINVAL` when they do not fit.
+fn sys_getgroups(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let groups = p.sys.groups.lock().clone();
+    if a[0] == 0 {
+        return Ok(groups.len() as u64);
+    }
+    if (a[0] as usize) < groups.len() {
+        return Err(EINVAL);
+    }
+    let bytes: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+    p.mem.write(a[1], &bytes)?;
+    Ok(groups.len() as u64)
+}
 
 fn sys_set_tid_address(_p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     t.clear_child_tid = a[0];
     Ok(t.tid as u64)
 }
 
+/// Every capability this kernel knows (`CAP_CHOWN` 0 .. `CAP_CHECKPOINT_RESTORE` 40).
+pub const ALL_CAPS: u64 = (1 << 41) - 1;
+
+/// The `CAP_*` number of a capability's name (`BLOCK_SUSPEND`, `CAP_NET_ADMIN`, ...).
+#[must_use]
+pub fn cap_number(name: &str) -> Option<u32> {
+    const NAMES: [&str; 41] = [
+        "CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID", "KILL", "SETGID", "SETUID", "SETPCAP",
+        "LINUX_IMMUTABLE", "NET_BIND_SERVICE", "NET_BROADCAST", "NET_ADMIN", "NET_RAW", "IPC_LOCK", "IPC_OWNER",
+        "SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT", "SYS_PTRACE", "SYS_PACCT", "SYS_ADMIN", "SYS_BOOT", "SYS_NICE",
+        "SYS_RESOURCE", "SYS_TIME", "SYS_TTY_CONFIG", "MKNOD", "LEASE", "AUDIT_WRITE", "AUDIT_CONTROL", "SETFCAP",
+        "MAC_OVERRIDE", "MAC_ADMIN", "SYSLOG", "WAKE_ALARM", "BLOCK_SUSPEND", "AUDIT_READ", "PERFMON", "BPF",
+        "CHECKPOINT_RESTORE",
+    ];
+    let name = name.trim().to_ascii_uppercase();
+    let name = name.strip_prefix("CAP_").unwrap_or(&name);
+    NAMES.iter().position(|n| *n == name).map(|n| n as u32)
+}
+
+/// `capget(header, data)`: the process's capabilities, effective and permitted (none inheritable).
+/// Version 3's two data words; an unknown version is answered with version 3 and `EINVAL`, as the
+/// kernel asks a caller to retry.
+fn sys_capget(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const V3: u32 = 0x2008_0522;
+    let version = p.mem.read_u32(a[0])?;
+    if version != V3 && version != 0x2007_1026 && version != 0x1998_0330 {
+        p.mem.write_u32(a[0], V3)?;
+        return Err(EINVAL);
+    }
+    if a[1] != 0 {
+        let caps = p.sys.caps();
+        let words = if version == 0x1998_0330 { 1 } else { 2 };
+        let mut data = Vec::new();
+        for word in 0..words {
+            let bits = (caps >> (32 * word)) as u32;
+            for field in [bits, bits, 0] {
+                data.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        p.mem.write(a[1], &data)?;
+    }
+    Ok(0)
+}
+
+/// `capset`: the effective set becomes what is asked, within what is held (a process drops
+/// capabilities; it cannot take new ones).
+fn sys_capset(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let version = p.mem.read_u32(a[0])?;
+    let words = if version == 0x1998_0330 { 1 } else { 2 };
+    let data = p.mem.read(a[1], 12 * words)?;
+    let mut effective = 0u64;
+    for word in 0..words {
+        let at = 12 * word;
+        effective |= u64::from(u32::from_le_bytes(data[at..at + 4].try_into().expect("4"))) << (32 * word);
+    }
+    if effective & !p.sys.caps() != 0 {
+        return Err(EPERM);
+    }
+    p.sys.set_caps(effective);
+    Ok(0)
+}
+
 fn sys_set_robust_list(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult { Ok(0) }
 
-/// `clone`: only the thread shape (`CLONE_VM | CLONE_SIGHAND | CLONE_THREAD`, as bionic's
-/// `pthread_create` asks); a fork is refused by name.
+/// `clone`: a thread (`CLONE_VM | CLONE_SIGHAND | CLONE_THREAD`, as bionic's `pthread_create`
+/// asks), or a process -- `fork`, `vfork` -- as `crate::fork` makes one. Another shape is refused
+/// by name.
 fn sys_clone(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     const CLONE_VM: u64 = 0x100;
     const CLONE_SIGHAND: u64 = 0x800;
@@ -109,6 +335,9 @@ fn sys_clone(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     const CLONE_CHILD_SETTID: u64 = 0x100_0000;
     let flags = a[0];
     let thread = CLONE_VM | CLONE_SIGHAND | CLONE_THREAD;
+    if flags & CLONE_THREAD == 0 {
+        return crate::fork::fork(p, t, flags, a);
+    }
     if flags & thread != thread {
         p.refusals.record(format!("clone: flags {flags:#x} (fork)"), t.pc, t.lr);
         return Err(ENOSYS);
@@ -202,6 +431,25 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         // the syscall boundary still make a tagged pointer work where one appears.
         55 | 56 => Err(EINVAL),
         3 => Ok(1),                              // PR_GET_DUMPABLE
+        7 => Ok(u64::from(p.sys.keepcaps.load(std::sync::atomic::Ordering::Relaxed))), // PR_GET_KEEPCAPS
+        8 => {
+            // PR_SET_KEEPCAPS
+            p.sys.keepcaps.store(a[1] != 0, std::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
+        // PR_CAPBSET_READ: every capability is in the bounding set; PR_CAPBSET_DROP: accepted.
+        23 => if a[1] <= 40 { Ok(1) } else { Err(EINVAL) },
+        24 => if a[1] <= 40 { Ok(0) } else { Err(EINVAL) },
+        // PR_SET_TIMERSLACK: there is no timer slack to set.
+        29 => Ok(0),
+        // PR_CAP_AMBIENT: IS_SET answers whether it is held; RAISE takes one already permitted;
+        // LOWER and CLEAR_ALL are accepted.
+        47 => match a[1] {
+            1 => if a[2] <= 40 { Ok(u64::from(p.sys.caps() & (1 << a[2]) != 0)) } else { Err(EINVAL) },
+            2 => if a[2] <= 40 && p.sys.caps() & (1 << a[2]) != 0 { Ok(0) } else { Err(EPERM) },
+            3 | 4 => Ok(0),
+            _ => Err(EINVAL),
+        },
         4 | 38 | 0x59616d61 => Ok(0),            // PR_SET_DUMPABLE, PR_SET_NO_NEW_PRIVS, PR_SET_PTRACER
         39 => Ok(0),                             // PR_GET_NO_NEW_PRIVS
         0x5356_4d41 => Ok(0),                    // PR_SET_VMA (names anonymous memory): accepted, ignored
@@ -429,7 +677,15 @@ fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
     let own = target == i64::from(t.tid) || target == i64::from(p.sys.pid) || target == 0 || target == -1;
     let tid = if own { t.tid } else { i32::try_from(target).map_err(|_| ESRCH)? };
     if !own && !p.tids().contains(&tid) {
-        return Err(ESRCH);
+        // A child of this process (vold's, installd's): the signal is its to act on.
+        let child = p.family.child(tid).ok_or(ESRCH)?;
+        if sig != 0 {
+            if !(1..=64).contains(&sig) {
+                return Err(EINVAL);
+            }
+            crate::fork::signal_process(&child, sig as i32);
+        }
+        return Ok(0);
     }
     if sig == 0 {
         return Ok(0);
@@ -515,7 +771,7 @@ fn sys_rt_sigtimedwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         info[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
         info[8..12].copy_from_slice(&crate::signal::SI_TKILL.to_le_bytes());
         info[16..20].copy_from_slice(&p.sys.pid.to_le_bytes());
-        info[20..24].copy_from_slice(&p.sys.uid.to_le_bytes());
+        info[20..24].copy_from_slice(&p.sys.uid().to_le_bytes());
         p.mem.write(a[1], &info)?;
     }
     Ok(sig)
@@ -640,10 +896,25 @@ pub fn install(table: &mut Table) {
     table.set(nr::RT_SIGPENDING, sys_rt_sigpending);
     table.set(nr::GETPID, sys_getpid);
     table.set(nr::GETPPID, sys_getppid);
+    table.set(nr::CAPGET, sys_capget);
+    table.set(nr::CAPSET, sys_capset);
     table.set(nr::GETTID, sys_gettid);
-    for n in [nr::GETUID, nr::GETEUID, nr::GETGID, nr::GETEGID] {
-        table.set(n, sys_getuid);
-    }
+    table.set(nr::GETUID, sys_getuid);
+    table.set(nr::GETEUID, sys_getuid);
+    table.set(nr::GETGID, sys_getgid);
+    table.set(nr::GETEGID, sys_getgid);
+    table.set(nr::SETUID, sys_setuid);
+    table.set(nr::SETREUID, sys_setreuid);
+    table.set(nr::SETRESUID, sys_setresuid);
+    table.set(nr::SETGID, sys_setgid);
+    table.set(nr::SETREGID, sys_setregid);
+    table.set(nr::SETRESGID, sys_setresgid);
+    table.set(nr::SETFSUID, sys_setfsuid);
+    table.set(nr::SETFSGID, sys_setfsgid);
+    table.set(nr::GETRESUID, sys_getresuid);
+    table.set(nr::GETRESGID, sys_getresgid);
+    table.set(nr::SETGROUPS, sys_setgroups);
+    table.set(nr::GETGROUPS, sys_getgroups);
     table.set(nr::SET_TID_ADDRESS, sys_set_tid_address);
     table.set(nr::SET_ROBUST_LIST, sys_set_robust_list);
     table.set(nr::CLONE, sys_clone);

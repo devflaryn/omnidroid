@@ -26,10 +26,13 @@ pub struct Service {
     pub oneshot: bool,
     /// `interface aidl <name>` and `interface <hidl@version::IFoo> <instance>`.
     pub interfaces: Vec<String>,
+    /// `capabilities <NAME>...`: exactly these (bit `n` for `CAP_*` `n`).
+    pub capabilities: Option<u64>,
 }
 
-/// A user name as `android_filesystem_config.h` numbers it.
-fn uid_of(user: &str) -> u32 {
+/// A user or group name as `android_filesystem_config.h` numbers it (`AID_*`); a number stands
+/// for itself.
+pub(crate) fn uid_of(user: &str) -> u32 {
     match user {
         "root" => 0,
         "system" => 1000,
@@ -40,16 +43,106 @@ fn uid_of(user: &str) -> u32 {
         "audio" => 1005,
         "camera" => 1006,
         "log" => 1007,
+        "compass" => 1008,
+        "mount" => 1009,
         "wifi" => 1010,
+        "adb" => 1011,
+        "install" => 1012,
         "media" => 1013,
-        "drm" => 1019,
-        "gps" => 1021,
-        "nfc" => 1027,
-        "shell" => 2000,
-        "cameraserver" => 1047,
+        "dhcp" => 1014,
+        "sdcard_rw" => 1015,
+        "vpn" => 1016,
         "keystore" => 1017,
+        "usb" => 1018,
+        "drm" => 1019,
+        "mdnsr" => 1020,
+        "gps" => 1021,
+        "media_rw" => 1023,
+        "mtp" => 1024,
+        "drmrpc" => 1026,
+        "nfc" => 1027,
+        "sdcard_r" => 1028,
+        "clat" => 1029,
+        "loop_radio" => 1030,
+        "mediadrm" => 1031,
+        "package_info" => 1032,
+        "sdcard_pics" => 1033,
+        "sdcard_av" => 1034,
+        "sdcard_all" => 1035,
+        "logd" => 1036,
+        "shared_relro" => 1037,
+        "dbus" => 1038,
+        "tlsdate" => 1039,
+        "mediaex" => 1040,
+        "audioserver" => 1041,
+        "metrics_coll" => 1042,
+        "metricsd" => 1043,
+        "webserv" => 1044,
+        "debuggerd" => 1045,
+        "mediacodec" => 1046,
+        "cameraserver" => 1047,
+        "firewall" => 1048,
+        "trunks" => 1049,
+        "nvram" => 1050,
+        "dns" => 1051,
+        "dns_tether" => 1052,
+        "webview_zygote" => 1053,
+        "vehicle_network" => 1054,
+        "media_audio" => 1055,
+        "media_video" => 1056,
+        "media_image" => 1057,
+        "tombstoned" => 1058,
+        "media_obb" => 1059,
+        "ese" => 1060,
+        "ota_update" => 1061,
+        "automotive_evs" => 1062,
+        "lowpan" => 1063,
+        "hsm" => 1064,
+        "reserved_disk" => 1065,
         "statsd" => 1066,
-        "hsm" => 1076,
+        "incidentd" => 1067,
+        "secure_element" => 1068,
+        "lmkd" => 1069,
+        "llkd" => 1070,
+        "iorapd" => 1071,
+        "gpu_service" => 1072,
+        "network_stack" => 1073,
+        "gsid" => 1074,
+        "fsverity_cert" => 1075,
+        "credstore" => 1076,
+        "external_storage" => 1077,
+        "ext_data_rw" => 1078,
+        "ext_obb_rw" => 1079,
+        "context_hub" => 1080,
+        "virtualizationservice" => 1081,
+        "artd" => 1082,
+        "uwb" => 1083,
+        "thread_network" => 1084,
+        "diced" => 1085,
+        "dmesgd" => 1086,
+        "jc_weaver" => 1087,
+        "jc_strongbox" => 1088,
+        "jc_identitycred" => 1089,
+        "sdk_sandbox" => 1090,
+        "security_log_writer" => 1091,
+        "prng_seeder" => 1092,
+        "uprobestats" => 1093,
+        "shell" => 2000,
+        "cache" => 2001,
+        "diag" => 2002,
+        "net_bt_admin" => 3001,
+        "net_bt" => 3002,
+        "inet" => 3003,
+        "net_raw" => 3004,
+        "net_admin" => 3005,
+        "net_bw_stats" => 3006,
+        "net_bw_acct" => 3007,
+        "readproc" => 3009,
+        "wakelock" => 3010,
+        "uhid" => 3011,
+        "readtracefs" => 3012,
+        "everybody" => 9997,
+        "misc" => 9998,
         "nobody" => 9999,
         other => other.parse().unwrap_or(1000),
     }
@@ -80,6 +173,9 @@ pub enum Command {
     SetProp(String, String),
     /// `restart <service>`: start it (here: unless it runs).
     Restart(String),
+    /// `perform_apex_config [--bootstrap]`: the APEXes' data directories (not at bootstrap), then
+    /// the linker configuration for the APEXes now active (`linkerconfig --target /linkerconfig`).
+    PerformApexConfig { bootstrap: bool },
     /// `init_user0`: vold prepares user 0's storage (`/data/user/0`, `/data/user_de/0`, ...), asked
     /// by `vdc cryptfs init_user0` as AOSP init asks it.
     InitUser0,
@@ -158,7 +254,7 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                     }
                     phase = (words.first() == Some(&"on") && words.len() == 2).then(|| BOOT_PHASES.iter().position(|p| *p == words[1])).flatten();
                 }
-                Some("start" | "exec_start" | "export" | "load_exports" | "wait_for_prop" | "setprop" | "restart" | "init_user0") if current.is_none() => {
+                Some("start" | "exec_start" | "export" | "load_exports" | "wait_for_prop" | "setprop" | "restart" | "init_user0" | "perform_apex_config") if current.is_none() => {
                     let command = match (words[0], words.len()) {
                         ("start", 2) => Some(Command::Start(words[1].to_string())),
                         ("exec_start", 2) => Some(Command::ExecStart(words[1].to_string())),
@@ -168,6 +264,8 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                         ("setprop", 3) => Some(Command::SetProp(words[1].to_string(), words[2].to_string())),
                         ("restart", 2) => Some(Command::Restart(words[1].to_string())),
                         ("init_user0", 1) => Some(Command::InitUser0),
+                        ("perform_apex_config", 1) => Some(Command::PerformApexConfig { bootstrap: false }),
+                        ("perform_apex_config", 2) if words[1] == "--bootstrap" => Some(Command::PerformApexConfig { bootstrap: true }),
                         _ => None,
                     };
                     if let (Some(ph), Some(c)) = (phase, command) {
@@ -182,6 +280,9 @@ fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<Command>) {
                         "disabled" => s.disabled = true,
                         "oneshot" => s.oneshot = true,
                         "interface" if words.len() >= 3 => s.interfaces.push(words[1..].join(" ")),
+                        "capabilities" => {
+                            s.capabilities = Some(words[1..].iter().filter_map(|w| crate::sys::cap_number(w)).fold(0, |m, n| m | (1 << n)));
+                        }
                         _ => {}
                     }
                 }
@@ -221,6 +322,12 @@ fn set_env(envp: &mut Vec<Vec<u8>>, name: &str, value: &str) {
     let prefix = format!("{name}=");
     envp.retain(|e| !e.starts_with(prefix.as_bytes()));
     envp.push(format!("{name}={value}").into_bytes());
+}
+
+/// `OMNI_TRACE_SERVICE=<name>`: the syscalls of that service (or program, by its path's last
+/// component), and of the processes it forks.
+fn traced(name: &str) -> bool {
+    std::env::var("OMNI_TRACE_SERVICE").is_ok_and(|want| want == name || name.rsplit('/').next() == Some(want.as_str()))
 }
 
 /// How long `exec_start` waits for its service, at most.
@@ -326,6 +433,15 @@ impl Init {
                         started.push(n.clone());
                     }
                 }
+                Command::PerformApexConfig { bootstrap } => {
+                    if !bootstrap {
+                        self.create_apex_data_dirs();
+                    }
+                    let status = self.exec(&["/apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig"], 0);
+                    if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                        eprintln!("[init] perform_apex_config{}: linkerconfig {status:?}", if *bootstrap { " --bootstrap" } else { "" });
+                    }
+                }
                 Command::InitUser0 => {
                     let status = self.exec(&["/system/bin/vdc", "--wait", "cryptfs", "init_user0"], 0);
                     if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
@@ -343,6 +459,16 @@ impl Init {
         }
         started.extend(self.class_start(classes));
         started
+    }
+
+    /// `/data/misc/apexdata/<name>` for every active APEX, as init's `create_apex_data_dirs`.
+    fn create_apex_data_dirs(&self) {
+        let Ok(root) = Sysroot::open(&self.sysroot) else { return };
+        for m in crate::apex::mounts(&root) {
+            if let Some(host) = crate::vfs::host_path(&self.instance, format!("data/misc/apexdata/{}", m.name).as_bytes()) {
+                let _ = std::fs::create_dir_all(host);
+            }
+        }
     }
 
     /// The property service of the instance.
@@ -373,12 +499,17 @@ impl Init {
             return None;
         }
         let argv: Vec<&str> = service.argv.iter().map(String::as_str).collect();
-        self.exec(&argv, service.uid)
+        self.exec_with(&argv, service.uid, service.capabilities)
     }
 
     /// Run a program as `uid` and wait for it to end (at most [`EXEC_TIMEOUT`]). Its end, or
     /// `None` when it could not start.
     fn exec(&self, argv: &[&str], uid: u32) -> Option<Option<crate::process::ExitStatus>> {
+        self.exec_with(argv, uid, None)
+    }
+
+    /// `exec`, the program holding exactly `caps` when given.
+    fn exec_with(&self, argv: &[&str], uid: u32, caps: Option<u64>) -> Option<Option<crate::process::ExitStatus>> {
         let config = SpawnConfig {
             sysroot: self.sysroot.clone(),
             instance_dir: self.instance.clone(),
@@ -386,10 +517,13 @@ impl Init {
             envp: self.environment(),
             stdout: Output::Host,
             stderr: Output::Host,
-            trace: false,
+            trace: traced(argv.first().copied().unwrap_or_default()),
         };
         let name = argv.first().copied().unwrap_or_default().rsplit('/').next().unwrap_or_default().to_string();
         let p = Process::spawn_as(config, uid).map_err(|e| eprintln!("[init] {name}: {e}")).ok()?;
+        if let Some(caps) = caps {
+            p.sys.set_caps(caps);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new().name(format!("init-exec-{name}")).spawn(move || tx.send(p.run())).ok()?;
         Some(rx.recv_timeout(EXEC_TIMEOUT).ok())
@@ -426,10 +560,13 @@ impl Init {
             envp: self.environment(),
             stdout: Output::Host,
             stderr: Output::Host,
-            trace: false,
+            trace: traced(name),
         };
         match Process::spawn_as(config, service.uid) {
             Ok(p) => {
+                if let Some(caps) = service.capabilities {
+                    p.sys.set_caps(caps);
+                }
                 self.running.lock().insert(name.to_string(), Arc::downgrade(&p));
                 let name = name.to_string();
                 std::thread::Builder::new()

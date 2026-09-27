@@ -11,13 +11,16 @@ pub mod device;
 pub mod errno;
 pub mod exec;
 pub mod fd;
+pub mod fork;
 pub mod futex;
 pub mod gpu;
 pub mod guest;
 pub mod hal;
 pub mod init;
+pub mod locks;
 pub mod manifest;
 pub mod mount;
+pub mod owners;
 pub mod mm;
 pub mod pipe;
 pub mod poll;
@@ -46,4 +49,5 @@ pub fn install_all(table: &mut syscall::Table) {
     poll::install(table);
     xattr::install(table);
     mount::install(table);
+    fork::install(table);
 }

@@ -47,7 +47,8 @@ fn chmod_without_write_bits_makes_a_file_read_only_and_back() {
 
     assert_eq!(p.syscall(&mut t, nr::FCHMODAT, [AT_FDCWD, s, 0o644, 0, 0, 0]), 0);
     assert_ne!(mode_of(&p, &mut t, s) & 0o200, 0, "writable again after chmod 0644");
-    // chown changes nothing and succeeds.
-    assert_eq!(p.syscall(&mut t, nr::FCHOWNAT, [AT_FDCWD, s, 0, 0, 0, 0]), 0);
+    // chown to its own owner changes nothing and succeeds (to another is EPERM: tests/owners.rs).
+    let uid = p.syscall(&mut t, nr::GETUID, [0; 6]);
+    assert_eq!(p.syscall(&mut t, nr::FCHOWNAT, [AT_FDCWD, s, uid, uid, 0, 0]), 0);
     assert_ne!(mode_of(&p, &mut t, s) & 0o200, 0);
 }

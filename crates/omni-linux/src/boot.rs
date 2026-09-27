@@ -15,6 +15,7 @@ pub fn make_init_dirs(sysroot: &Sysroot, instance: &Path) {
     if marker.exists() {
         return;
     }
+    let owners = crate::owners::Owners::of(instance);
     let mut scripts: Vec<Vec<u8>> = vec![b"/system/etc/init/hw/init.rc".to_vec()];
     for dir in [&b"/system/etc/init"[..], b"/system_ext/etc/init", b"/product/etc/init", b"/vendor/etc/init"] {
         for name in sysroot.children(dir) {
@@ -44,7 +45,12 @@ pub fn make_init_dirs(sysroot: &Sysroot, instance: &Path) {
                 continue;
             }
             let host = instance.join(&root[1..]).join(rest.trim_start_matches('/'));
-            let _ = std::fs::create_dir_all(host);
+            let _ = std::fs::create_dir_all(&host);
+            // `mkdir <path> [mode] [owner] [group]`: init makes it so (root, 0755 by default).
+            let mode = words.next().and_then(|m| u32::from_str_radix(m, 8).ok()).unwrap_or(0o755);
+            let uid = words.next().map_or(0, crate::init::uid_of);
+            let gid = words.next().filter(|g| !g.contains('=')).map_or(uid, crate::init::uid_of);
+            owners.set(&host, crate::owners::Owner { uid, gid, mode });
         }
     }
     let _ = std::fs::create_dir_all(instance.join("data"));

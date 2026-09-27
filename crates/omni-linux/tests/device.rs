@@ -28,3 +28,13 @@ fn a_real_ls_lists_the_overlay_file() {
     assert!(out.contains("omni-graphics.xml"), "ls: {out}");
     assert!(out.contains("hwc3.xml"), "ls: {out}");
 }
+
+/// The device configuration the overlay replaces: this device has no sensors, so the AOSP
+/// sensors multihal's list of sub-HALs is empty (the image's names the emulator's).
+#[test]
+fn the_device_lists_no_sensor_sub_hal() {
+    let Some(dir) = common::sysroot() else { panic!("no sysroot (tools/make_sysroot.py)") };
+    let root = Sysroot::open(&dir).expect("the sysroot");
+    assert_eq!(root.read(b"/vendor/etc/sensors/hals.conf").as_deref(), Some(&b""[..]));
+    assert!(root.read(b"/vendor/lib64/android.hardware.sensors@2.1-impl.ranchu.so").is_some() || root.has(b"/vendor/lib64/hw/android.hardware.sensors@2.1-impl.ranchu.so"), "the image's sub-HAL is still there, unlisted");
+}

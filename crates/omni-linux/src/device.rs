@@ -18,7 +18,15 @@ pub const FILES: &[(&str, &[u8])] = &[
     ("/init.environ.rc", include_bytes!("../device/init.environ.rc")),
     // The Vulkan driver, forwarding to the host's GPU (`device/src/vk/`; `crate::gpu`).
     ("/vendor/lib64/hw/vulkan.omni.so", include_bytes!("../device/vendor/lib64/hw/vulkan.omni.so")),
+    // This device has no sensors: the AOSP sensors multihal loads no sub-HAL and serves an empty
+    // list (the image's lists the emulator's, which needs QEMU's sensors transport).
+    ("/vendor/etc/sensors/hals.conf", include_bytes!("../device/vendor/etc/sensors/hals.conf")),
 ];
+
+/// The image's vendor files this device replaces with its own: device configuration, which a
+/// vendor partition holds for its hardware. Any other overlay path already in the image is an
+/// error.
+pub const REPLACES: &[&str] = &["/vendor/etc/sensors/hals.conf"];
 
 /// An overlay file as the sysroot holds it: its guest path, its manifest entry, and the host file
 /// with its bytes.

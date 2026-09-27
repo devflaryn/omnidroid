@@ -55,6 +55,9 @@ pub struct Process {
     tasks: Mutex<std::collections::HashMap<i32, TaskHandle>>,
     /// Signalled when a task ends, for `run` waiting on the others.
     task_ended: parking_lot::Condvar,
+    /// The task forking, while its process is frozen (`crate::fork`).
+    freeze: Mutex<Option<i32>>,
+    thawed: parking_lot::Condvar,
     next_tid: std::sync::atomic::AtomicI32,
     /// How the process ends, once something has ended it (`exit_group`, a fatal signal or fault).
     group_exit: Mutex<Option<ExitStatus>>,
@@ -71,7 +74,10 @@ pub struct Process {
     pub props: crate::procfs::PropFiles,
     /// This process, for what must reach it later from outside (the property service).
     pub(crate) me: std::sync::OnceLock<std::sync::Weak<Process>>,
-    backend: Option<DynarmicBackend>,
+    /// Its parent and children (`crate::fork`).
+    pub(crate) family: crate::fork::Family,
+    /// Shared with the vfork children running in this process's memory.
+    backend: Option<Arc<DynarmicBackend>>,
     pub(crate) start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
     scratch: u64,
@@ -81,7 +87,14 @@ pub struct Process {
 struct TaskHandle {
     halt: omni_cpu::HaltHandle,
     pending: Arc<std::sync::atomic::AtomicU64>,
+    state: Arc<std::sync::atomic::AtomicU8>,
 }
+
+/// Where a task is: running guest code, in the kernel (a syscall, or between runs), or parked
+/// while its process is frozen for a fork.
+pub(crate) const IN_GUEST: u8 = 0;
+pub(crate) const IN_KERNEL: u8 = 1;
+pub(crate) const PARKED: u8 = 2;
 
 pub struct Task {
     pub tid: i32,
@@ -104,6 +117,8 @@ pub struct Task {
     pub saved_sigmask: Option<u64>,
     /// `TPIDR_EL0` at the last `clone`: a thread made without `CLONE_SETTLS` inherits it.
     pub clone_tpidr: Option<u64>,
+    /// `IN_GUEST`, `IN_KERNEL` or `PARKED`.
+    pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
 }
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
@@ -153,7 +168,7 @@ fn altstack_disabled() -> [u8; 24] {
 impl Task {
     #[must_use]
     pub fn new(tid: i32, process: Arc<Process>) -> Self {
-        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None, clone_tpidr: None }
+        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None, clone_tpidr: None, state: Arc::new(std::sync::atomic::AtomicU8::new(IN_KERNEL)) }
     }
 }
 
@@ -162,6 +177,7 @@ fn on_svc(call: &mut ThunkCall<'_>) {
     // SAFETY: the context is `&mut Task` of the task this CPU runs, set by `run_task`, which owns
     // the task for exactly as long as the CPU can call this.
     let task = unsafe { &mut *(call.context().0 as *mut Task) };
+    task.state.store(IN_KERNEL, std::sync::atomic::Ordering::SeqCst);
     let number = call.x(8);
     let args = [call.x(0), call.x(1), call.x(2), call.x(3), call.x(4), call.x(5)];
     task.pc = call.address() as u64;
@@ -224,6 +240,9 @@ fn on_svc(call: &mut ThunkCall<'_>) {
         eprintln!("[{}] {}({:#x}, {:#x}, {:#x}, {:#x}){path} = {:#x}", task.tid, name_of(number), args[0], args[1], args[2], args[3], result);
     }
     call.set_x(0, result);
+    // Frozen for a fork: not back to guest code until the child has let go of the memory.
+    process.park_if_frozen(task.tid, &task.state);
+    task.state.store(IN_GUEST, std::sync::atomic::Ordering::SeqCst);
     let deliverable = task.pending.load(std::sync::atomic::Ordering::SeqCst) & !task.sigmask != 0;
     if task.exit.is_some() || task.sigreturn || deliverable {
         call.defer_to_caller();
@@ -245,7 +264,14 @@ impl Process {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<DynarmicBackend>, scratch: u64, uid: u32) -> Arc<Self> {
+    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<Arc<DynarmicBackend>>, scratch: u64, uid: u32) -> Arc<Self> {
+        Self::assemble_as(space, None, None, vfs, argv, FdTable::standard(stdout, stderr), trace, backend, scratch, uid)
+    }
+
+    /// A process in `space`: under `layout` (a vfork child's is its parent's) and `pid` (an
+    /// executed image keeps its process's), else fresh ones.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_as(space: Arc<GuestSpace>, layout: Option<crate::guest::Layout>, pid: Option<i32>, vfs: Vfs, argv: Vec<Vec<u8>>, fds: FdTable, trace: bool, backend: Option<Arc<DynarmicBackend>>, scratch: u64, uid: u32) -> Arc<Self> {
         let mut table = Table::new();
         crate::install_all(&mut table);
         let (_, dropped) = crate::props::Properties::from_sysroot(vfs.sysroot());
@@ -259,20 +285,22 @@ impl Process {
         let comm = argv.first().map_or_else(Vec::new, |a| {
             a.rsplit(|&b| b == b'/').next().unwrap_or(a).iter().copied().take(15).collect()
         });
-        let pid = allocate_pid();
-        let layout = crate::guest::Layout::default();
+        let pid = pid.unwrap_or_else(allocate_pid);
+        let layout = layout.unwrap_or_default();
         let p = Arc::new(Self {
             mem: GuestMem::new(Arc::clone(&space), Arc::clone(&layout)),
             table,
             refusals: Refusals::default(),
             vfs,
-            fds: FdTable::standard(stdout, stderr),
+            fds,
             cwd: Mutex::new(b"/".to_vec()),
             mm: Mm::new(space, layout),
             sys: SysState::new(pid, uid),
             futexes: crate::futex::Futexes::default(),
             tasks: Mutex::new(std::collections::HashMap::new()),
             task_ended: parking_lot::Condvar::new(),
+            freeze: Mutex::new(None),
+            thawed: parking_lot::Condvar::new(),
             next_tid: std::sync::atomic::AtomicI32::new(pid + 1),
             group_exit: Mutex::new(None),
             trace,
@@ -280,6 +308,7 @@ impl Process {
             comm: Mutex::new(comm),
             props,
             me: std::sync::OnceLock::new(),
+            family: crate::fork::Family::default(),
             sigtramp: std::sync::atomic::AtomicU64::new(0),
             backend,
             start: Mutex::new(None),
@@ -316,34 +345,78 @@ impl Process {
         }
         // What init.rc makes before any service runs: its `mkdir`s on the writable mounts.
         crate::boot::make_init_dirs(&sysroot, &config.instance_dir);
-        let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir));
+        let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir))
+            .with_owners(crate::owners::Owners::of(&config.instance_dir));
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
+        let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
+        let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(Arc::new(backend)), 0, uid);
+        p.load(&exe, &config.argv, &config.envp)?;
+        Ok(p)
+    }
+
+    /// The CPU options every process runs with. `OMNI_DYNARMIC_OPT=<hex mask>`: only these (safe)
+    /// JIT optimizations -- 0 for none, to tell a translation fault from a kernel one.
+    fn cpu_options() -> DynarmicOptions {
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
         // 128 guest threads: ART alone starts about twenty, and Roblox runs dozens.
         let mut options = DynarmicOptions { top_byte_ignore: true, max_threads: 128, ..DynarmicOptions::default() };
-        // OMNI_DYNARMIC_OPT=<hex mask>: run with only these (safe) JIT optimizations -- 0 for none,
-        // to tell a translation fault from a kernel one.
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             options.optimizations_override = Some(mask);
         }
-        let backend = DynarmicBackend::new(Arc::clone(&space), options).map_err(|e| format!("the CPU backend: {e}"))?;
-        let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(backend), 0, uid);
-        let mut loader = Task::new(p.sys.pid, Arc::clone(&p));
+        options
+    }
+
+    /// `execve` in a vfork child: `exe` loaded into a fresh space as `spawn` loads a program, under
+    /// this process's pid, uid and cwd, with its descriptors less the close-on-exec ones.
+    pub(crate) fn exec_image(self: &Arc<Self>, exe: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Arc<Self>, String> {
+        let vfs = self.vfs.for_exec(exe.to_vec());
+        let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
+        let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
+        let fds = self.fds.for_exec();
+        let p = Self::assemble_as(space, None, Some(self.sys.pid), vfs, argv.to_vec(), fds, self.trace, Some(Arc::new(backend)), 0, self.sys.uid());
+        *p.cwd.lock() = self.cwd.lock().clone();
+        p.sys.inherit_ignored(&self.sys);
+        p.sys.inherit_ids(&self.sys);
+        p.family.inherit(&self.family);
+        p.load(exe, argv, envp)?;
+        Ok(p)
+    }
+
+    /// A vfork child of this process: the same memory (space, layout lock, CPU backend), a copy of
+    /// the descriptors, cwd, signal actions and umask, and a pid of its own.
+    pub(crate) fn fork_child(self: &Arc<Self>) -> Arc<Self> {
+        let vfs = self.vfs.for_exec(self.vfs.exe().to_vec());
+        let fds = self.fds.for_fork();
+        let child = Self::assemble_as(Arc::clone(self.mem.space()), Some(self.mem.layout().clone()), None, vfs, self.argv.clone(), fds, self.trace, self.backend.clone(), self.scratch, self.sys.uid());
+        *child.cwd.lock() = self.cwd.lock().clone();
+        child.sys.inherit(&self.sys);
+        child.sys.inherit_ids(&self.sys);
+        *child.comm.lock() = self.comm.lock().clone();
+        child.sigtramp.store(self.sigtramp.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+        child.family.set_parent(self);
+        child
+    }
+
+    /// Load `exe` (and its interpreter), map the stack and the vDSO, and build the initial stack
+    /// from `argv`, `envp` and the auxiliary vector: what `run` then starts.
+    fn load(self: &Arc<Self>, exe: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<(), String> {
+        let p = self;
+        let mut loader = Task::new(p.sys.pid, Arc::clone(p));
         let name = |e| format!("{}: {e:?}", String::from_utf8_lossy(&exe));
-        let program = exec::load_elf(&p, &loader, &exe).map_err(name)?;
+        let program = exec::load_elf(p, &loader, exe).map_err(name)?;
         let (entry, base) = match &program.interp {
             Some(interp) => {
-                let i = exec::load_elf(&p, &loader, interp).map_err(|e| format!("{}: {e:?}", String::from_utf8_lossy(interp)))?;
+                let i = exec::load_elf(p, &loader, interp).map_err(|e| format!("{}: {e:?}", String::from_utf8_lossy(interp)))?;
                 (i.entry, i.bias)
             }
             None => (program.entry, 0),
         };
         let page = p.mm.page_size();
-        let stack = p.mm.map(&p, &loader, MapRequest { addr: 0, len: STACK_BYTES + page, prot: 3, flags: 0x22 | 0x20000, fd: -1, offset: 0 }).map_err(|e| format!("the main stack: {e:?}"))?;
+        let stack = p.mm.map(p, &loader, MapRequest { addr: 0, len: STACK_BYTES + page, prot: 3, flags: 0x22 | 0x20000, fd: -1, offset: 0 }).map_err(|e| format!("the main stack: {e:?}"))?;
         p.mm.protect(stack, page, 0).map_err(|e| format!("the stack guard: {e:?}"))?;
         p.mm.label(stack + page, STACK_BYTES, b"[stack]");
         // A one-page `[vdso]` holding the kernel's signal trampoline: `mov x8, #139; svc #0`.
-        let vdso = p.mm.map(&p, &loader, MapRequest { addr: 0, len: page, prot: 3, flags: 0x22, fd: -1, offset: 0 }).map_err(|e| format!("the vdso page: {e:?}"))?;
+        let vdso = p.mm.map(p, &loader, MapRequest { addr: 0, len: page, prot: 3, flags: 0x22, fd: -1, offset: 0 }).map_err(|e| format!("the vdso page: {e:?}"))?;
         let trampoline: Vec<u8> = [0xD280_1168u32, 0xD400_0001].iter().flat_map(|w| w.to_le_bytes()).collect();
         p.mem.write(vdso, &trampoline).map_err(|e| format!("the vdso page: {e:?}"))?;
         p.mm.protect(vdso, page, 5).map_err(|e| format!("the vdso page: {e:?}"))?;
@@ -358,14 +431,14 @@ impl Process {
             (AT_EUID, u64::from(UID)), (AT_GID, u64::from(UID)), (AT_EGID, u64::from(UID)),
             (AT_HWCAP, HWCAP), (AT_HWCAP2, 0), (AT_CLKTCK, 100), (AT_SECURE, 0),
         ];
-        let (bytes, sp) = exec::build_stack(top, &config.argv, &config.envp, &auxv, random, &exe);
+        let (bytes, sp) = exec::build_stack(top, argv, envp, &auxv, random, exe);
         p.mem.write(top - bytes.len() as u64, &bytes).map_err(|e| format!("the initial stack: {e:?}"))?;
         loader.exit = None;
         if p.trace {
             eprintln!("[exec] stack [{stack:#x}, {top:#x}) guard [{stack:#x}, {:#x}) sp {sp:#x} entry {entry:#x}", stack + page);
         }
         *p.start.lock() = Some((entry, sp));
-        Ok(p)
+        Ok(())
     }
 
     /// Run the main task to its end; `exit_group` or its last `exit` ends the process.
@@ -373,6 +446,12 @@ impl Process {
     /// `exit`. Every other thread is stopped and joined before this returns.
     pub fn run(self: &Arc<Self>) -> ExitStatus {
         let (pc, sp) = self.start.lock().expect("spawned");
+        self.run_from(pc, |cpu| cpu.set_sp(sp as usize))
+    }
+
+    /// Run the main task from `pc`, its registers set by `setup`: `run`'s loop, for a program
+    /// just loaded or a vfork child continuing from its parent's `clone`.
+    pub(crate) fn run_from(self: &Arc<Self>, pc: u64, setup: impl FnOnce(&mut dyn GuestCpu)) -> ExitStatus {
         let Some(mut cpu) = self.new_cpu() else {
             let status = ExitStatus::Killed { signal: 6, pc, detail: "the CPU backend made no CPU for the main task".into() };
             *self.exit.lock() = Some(status.clone());
@@ -383,12 +462,14 @@ impl Process {
         // `cpu.run` -- a `&mut Task` held there let the optimizer keep `exit` in a register and
         // miss `exit_group` (a release-only hang that recursed bionic's exit onto the guard page).
         // It is a raw pointer, and the loop reads it with a volatile load.
-        let task: *mut Task = Box::into_raw(Box::new(Task::new(self.sys.pid, Arc::clone(self))));
+        let mut main = Task::new(self.sys.pid, Arc::clone(self));
+        main.sigmask = self.family.start_mask();
+        let task: *mut Task = Box::into_raw(Box::new(main));
         cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
-        cpu.set_sp(sp as usize);
+        setup(&mut *cpu);
         // SAFETY: `task` is live (just made); nothing else reaches it yet.
-        let pending = Arc::clone(unsafe { &(*task).pending });
-        self.tasks.lock().insert(self.sys.pid, TaskHandle { halt: cpu.halt_handle(), pending });
+        let (pending, state) = unsafe { (Arc::clone(&(*task).pending), Arc::clone(&(*task).state)) };
+        self.tasks.lock().insert(self.sys.pid, TaskHandle { halt: cpu.halt_handle(), pending, state });
         let (status, asked) = self.run_task(&mut *cpu, task, pc);
         drop(cpu);
         // SAFETY: `task` came from `Box::into_raw` above, and the only other path to it, the CPU's
@@ -440,6 +521,37 @@ impl Process {
         status
     }
 
+    /// Freeze every task but `me` for a fork: each is asked to stop, and this returns once none
+    /// runs guest code (a task in a syscall parks as it returns).
+    pub(crate) fn freeze_others(&self, me: i32) {
+        *self.freeze.lock() = Some(me);
+        let handles: Vec<(omni_cpu::HaltHandle, Arc<std::sync::atomic::AtomicU8>)> =
+            self.tasks.lock().iter().filter(|(tid, _)| **tid != me).map(|(_, h)| (h.halt.clone(), Arc::clone(&h.state))).collect();
+        for (halt, _) in &handles {
+            halt.request();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handles.iter().any(|(_, s)| s.load(std::sync::atomic::Ordering::SeqCst) == IN_GUEST) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
+    /// Let the frozen tasks run again.
+    pub(crate) fn thaw(&self) {
+        *self.freeze.lock() = None;
+        self.thawed.notify_all();
+    }
+
+    /// Park the task while the process is frozen for another task's fork (not when it is ending).
+    fn park_if_frozen(&self, tid: i32, state: &std::sync::atomic::AtomicU8) {
+        let mut freeze = self.freeze.lock();
+        while freeze.is_some_and(|forking| forking != tid) && self.group_exit.lock().is_none() {
+            state.store(PARKED, std::sync::atomic::Ordering::SeqCst);
+            self.thawed.wait_for(&mut freeze, std::time::Duration::from_millis(100));
+        }
+        state.store(IN_KERNEL, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// End the process from outside, as `kill` does: every task halts and `run` returns `status`.
     pub fn end(&self, status: ExitStatus) {
         self.end_group(status);
@@ -477,9 +589,10 @@ impl Process {
         task.clear_child_tid = clear_child_tid;
         task.sigmask = parent.sigmask;
         let pending = Arc::clone(&task.pending);
+        let state = Arc::clone(&task.state);
         let task: *mut Task = Box::into_raw(Box::new(task));
         cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
-        self.tasks.lock().insert(tid, TaskHandle { halt: cpu.halt_handle(), pending });
+        self.tasks.lock().insert(tid, TaskHandle { halt: cpu.halt_handle(), pending, state });
         let pc = parent.pc + 4;
         let process = Arc::clone(self);
         let task_addr = task as usize;
@@ -524,8 +637,13 @@ impl Process {
     }
 
     fn run_task(&self, cpu: &mut dyn GuestCpu, task: *mut Task, mut pc: u64) -> (ExitStatus, Option<Exit>) {
+        // SAFETY: `task` is live for the whole loop (see `run`).
+        let state = unsafe { Arc::clone(&(*task).state) };
         loop {
-            let exit = match cpu.run(pc as usize, RunLimit::Unlimited) {
+            state.store(IN_GUEST, std::sync::atomic::Ordering::SeqCst);
+            let ran = cpu.run(pc as usize, RunLimit::Unlimited);
+            state.store(IN_KERNEL, std::sync::atomic::Ordering::SeqCst);
+            let exit = match ran {
                 Ok(e) => e,
                 Err(e) => {
                     let detail = format!("the CPU backend: {e}\n{}", self.registers(cpu));
@@ -559,6 +677,8 @@ impl Process {
                         return (ending, Some(Exit::Group(0)));
                     }
                     cpu.halt_handle().clear();
+                    // SAFETY: as for `asked` above.
+                    self.park_if_frozen(unsafe { (*task).tid }, &state);
                     match self.deliver_pending(cpu, task, at as u64) {
                         Ok(next) => pc = next,
                         Err(killed) => return (killed, None),
@@ -642,7 +762,7 @@ impl Process {
         }
         let sig = ready.trailing_zeros() as i32 + 1;
         pending.fetch_and(!(1u64 << (sig - 1)), std::sync::atomic::Ordering::SeqCst);
-        let info = crate::signal::SigInfo { signo: sig, code: crate::signal::SI_TKILL, addr: 0, pid: self.sys.pid, uid: self.sys.uid };
+        let info = crate::signal::SigInfo { signo: sig, code: crate::signal::SI_TKILL, addr: 0, pid: self.sys.pid, uid: self.sys.uid() };
         self.deliver(cpu, task, info, pc, 0)
     }
 
@@ -786,6 +906,13 @@ impl Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        LIVE_PIDS.lock().remove(&self.sys.pid);
+        if self.trace {
+            eprintln!("[process] {} dropped", self.sys.pid);
+        }
+        // An image `execve` replaced leaves its pid to the image that replaced it.
+        if !self.family.superseded() {
+            LIVE_PIDS.lock().remove(&self.sys.pid);
+            crate::locks::process_ended(self.sys.pid);
+        }
     }
 }

@@ -50,7 +50,7 @@ pub struct LoadedElf {
 
 pub fn load_elf(p: &Process, t: &Task, path: &[u8]) -> Result<LoadedElf, Errno> {
     let file = std::sync::Arc::new(fd::open(&p.vfs, b"/", path, 0)?);
-    let len = fd::stat_of(&file)?.size as usize;
+    let len = fd::stat_of(&p.vfs, &file)?.size as usize;
     let mut data = vec![0u8; len];
     fd::pread_all(&file, &mut data, 0)?;
     let ph = ProgramHeaders::parse(&data).map_err(|_| Errno(8))?; // ENOEXEC

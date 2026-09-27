@@ -394,6 +394,17 @@ pub fn read(file: &OpenFile, buf: &mut [u8], t: &Task) -> Option<Result<usize, E
     pair.then(|| receive_waiting(file, buf, false, t))
 }
 
+/// Bytes ready to read (`FIONREAD`): a datagram's the next message's, a stream's all queued.
+#[must_use]
+pub fn available(socket: &Socket) -> usize {
+    if let Some(Peer::Pair { channel, side }) = &socket.peer {
+        let queues = channel.queues.lock();
+        let q = &queues[*side];
+        return if channel.stream { q.iter().map(Vec::len).sum() } else { q.front().map_or(0, Vec::len) };
+    }
+    socket.inbox.len()
+}
+
 /// What a socket is ready for: a pair's end is readable with something queued, writable while the
 /// other end is open, and hung up (readable, `POLLHUP`) when it is closed.
 #[must_use]

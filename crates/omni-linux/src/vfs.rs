@@ -54,10 +54,12 @@ impl Sysroot {
                 }
             }
         }
-        // omnidroid's device overlay, over the image: its files where the image has none.
+        // omnidroid's device overlay, over the image: its files where the image has none, and the
+        // device configuration it replaces (`device::REPLACES`).
         let mut overlay = HashMap::new();
         for file in crate::device::materialize()? {
-            if manifest.entries.contains_key(&file.guest) {
+            let replaces = crate::device::REPLACES.iter().any(|r| r.as_bytes() == file.guest.as_slice());
+            if manifest.entries.contains_key(&file.guest) && !replaces {
                 return Err(format!("the device overlay's {} is also in the image", String::from_utf8_lossy(&file.guest)));
             }
             if let Entry::File { sha256, .. } = &file.entry {
@@ -273,6 +275,8 @@ pub struct Vfs {
     sysroot: Arc<Sysroot>,
     writable: Vec<(Vec<u8>, PathBuf)>,
     binds: Arc<Binds>,
+    /// The owners and modes of the writable mounts' files.
+    owners: Arc<crate::owners::Owners>,
     exe: Vec<u8>,
     /// `/proc` and `/sys`, once the process exists (`attach_proc`).
     proc: std::sync::OnceLock<std::sync::Weak<dyn crate::procfs::ProcFs>>,
@@ -350,7 +354,14 @@ fn split(path: &[u8]) -> Vec<Vec<u8>> {
 impl Vfs {
     #[must_use]
     pub fn new(sysroot: Arc<Sysroot>, writable: Vec<(Vec<u8>, PathBuf)>, exe: Vec<u8>) -> Self {
-        Self { sysroot, writable, binds: Arc::default(), exe, proc: std::sync::OnceLock::new() }
+        Self { sysroot, writable, binds: Arc::default(), owners: crate::owners::Owners::detached(), exe, proc: std::sync::OnceLock::new() }
+    }
+
+    /// The same filesystem (sysroot, writable mounts, bind mounts) for a process running `exe`:
+    /// a fork child, or the program `execve` loads.
+    #[must_use]
+    pub fn for_exec(&self, exe: Vec<u8>) -> Self {
+        Self { sysroot: Arc::clone(&self.sysroot), writable: self.writable.clone(), binds: Arc::clone(&self.binds), owners: Arc::clone(&self.owners), exe, proc: std::sync::OnceLock::new() }
     }
 
     /// This VFS with the instance's bind mounts (shared with its other processes).
@@ -364,6 +375,19 @@ impl Vfs {
     #[must_use]
     pub fn binds(&self) -> &Arc<Binds> {
         &self.binds
+    }
+
+    /// This VFS with the instance's owners (shared with its other processes, and kept on disk).
+    #[must_use]
+    pub fn with_owners(mut self, owners: Arc<crate::owners::Owners>) -> Self {
+        self.owners = owners;
+        self
+    }
+
+    /// The owners and modes of the writable mounts' files.
+    #[must_use]
+    pub fn owners(&self) -> &Arc<crate::owners::Owners> {
+        &self.owners
     }
 
     /// Whether a guest path is where something is mounted: a writable mount, a bind mount, or
