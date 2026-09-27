@@ -155,12 +155,22 @@ pub fn format_log(packet: &[u8]) -> Option<String> {
         7 => 'F',
         _ => '?',
     };
+    // OMNI_LOG_TIME=1: each line starts with the time the entry was written (seconds, from the
+    // entry's own header), as logcat's `-v time` shows it.
+    static TIMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let stamp = if *TIMED.get_or_init(|| std::env::var("OMNI_LOG_TIME").as_deref() == Ok("1")) {
+        let sec = u32::from_le_bytes([rest[2], rest[3], rest[4], rest[5]]);
+        let nsec = u32::from_le_bytes([rest[6], rest[7], rest[8], rest[9]]);
+        format!("{}.{:03} ", sec % 100_000, nsec / 1_000_000)
+    } else {
+        String::new()
+    };
     let mut out = String::new();
     for line in msg.lines() {
-        out += &format!("{level}/{tag}({tid:5}): {line}\n");
+        out += &format!("{stamp}{level}/{tag}({tid:5}): {line}\n");
     }
     if out.is_empty() {
-        out = format!("{level}/{tag}({tid:5}): \n");
+        out = format!("{stamp}{level}/{tag}({tid:5}): \n");
     }
     Some(out)
 }

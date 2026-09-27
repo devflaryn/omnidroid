@@ -123,6 +123,7 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
     let parent = Arc::clone(&t.process);
     let (regs, parent_sp) = t.clone_regs.take().ok_or(EINVAL)?;
     let tpidr = t.clone_tpidr;
+    let frozen_at = std::time::Instant::now();
     parent.freeze_others(t.tid);
     p.mem.start_journal();
     let snapshot = Snapshot::take(p);
@@ -141,11 +142,20 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
     }
     snapshot.restore(p);
     parent.thaw();
+    // OMNI_FORK_TRACE=1: each fork, what it kept, and how long its parent stood still.
+    if fork_trace() {
+        eprintln!("[fork] {} forked {pid}: {} MiB kept, parent frozen {} ms", p.sys.pid, snapshot.bytes() >> 20, frozen_at.elapsed().as_millis());
+    }
     started?;
     if flags & CLONE_PARENT_SETTID != 0 {
         p.mem.write_u32(a[2], pid as u32).map_err(|_| EFAULT)?;
     }
     Ok(pid as u64)
+}
+
+fn fork_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_FORK_TRACE").as_deref() == Ok("1"))
 }
 
 /// Start the fork child's thread; the receiver its release comes on.

@@ -44,6 +44,9 @@ pub struct Boot {
     /// The last lines seen, for a failure's message.
     pub tail: std::collections::VecDeque<String>,
     pub instance: PathBuf,
+    /// Every line, kept for a failure's reader: `<temp>/<instance name>.log`.
+    pub log: PathBuf,
+    log_file: Option<std::fs::File>,
 }
 
 impl Boot {
@@ -78,7 +81,9 @@ impl Boot {
                 }
             });
         }
-        Self { child, lines, tail: std::collections::VecDeque::new(), instance }
+        let log = instance.with_extension("log");
+        let log_file = std::fs::File::create(&log).ok();
+        Self { child, lines, tail: std::collections::VecDeque::new(), instance, log, log_file }
     }
 
     /// Give each line to `seen` until it answers that the boot has shown what it must, the runner
@@ -93,6 +98,10 @@ impl Boot {
                 }
                 continue;
             };
+            if let Some(f) = &mut self.log_file {
+                use std::io::Write;
+                let _ = writeln!(f, "{line}");
+            }
             done = seen(&line);
             self.tail.push_back(line);
             if self.tail.len() > 80 {
@@ -101,9 +110,9 @@ impl Boot {
         }
     }
 
-    /// The last lines, joined.
+    /// The last lines, joined, and where the whole log is.
     pub fn tail(&self) -> String {
-        self.tail.iter().cloned().collect::<Vec<_>>().join("\n")
+        format!("{}\n(the whole boot: {})", self.tail.iter().cloned().collect::<Vec<_>>().join("\n"), self.log.display())
     }
 }
 

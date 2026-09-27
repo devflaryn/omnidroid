@@ -15,7 +15,7 @@ fn system_server_publishes_activity_package_and_window() {
     let Some(sysroot) = common::sysroot() else { return };
     let instance = std::env::temp_dir().join(format!("omni-linux-c4-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&instance);
-    let then = "i=0; until service check window | grep -q found || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
+    let then = "i=0; until service check window | grep -q 'window: found' || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
                 for s in activity package window; do service check $s; done; echo '[c4] checked'";
     let mut boot = common::boot::Boot::start(&sysroot, instance, &[], then);
     let (mut ready, mut checked, mut found) = (false, false, Vec::new());
