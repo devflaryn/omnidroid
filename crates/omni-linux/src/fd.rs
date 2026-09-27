@@ -855,19 +855,47 @@ fn sys_readlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     }
 }
 
+/// `faccessat(dirfd, path, mode, flags)`: existence, then the permission bits the caller's ids
+/// select -- the owner's when it owns the file, the group's when it is in the file's group, the
+/// others' otherwise; root reads and writes anything, and executes what has an execute bit. ART
+/// refuses an app's dex file the app could write (it asks here).
 fn sys_faccessat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const R: u64 = 4;
+    const W: u64 = 2;
+    const X: u64 = 1;
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
     let r = p.vfs.resolve(&base, &path, true)?;
+    let want = a[2] & (R | W | X);
     match r.node {
-        Node::Missing { .. } => Err(ENOENT),
-        Node::SysFile { .. } | Node::Dir if a[2] & 2 != 0 => Err(EROFS),
-        Node::HostFile { host } if a[2] & 2 != 0 => {
+        Node::Missing { .. } => return Err(ENOENT),
+        Node::SysFile { .. } | Node::Dir if want & W != 0 => return Err(EROFS),
+        Node::HostFile { ref host } if want & W != 0 => {
             let meta = std::fs::metadata(host).map_err(|_| EIO)?;
-            if meta.permissions().readonly() { Err(EACCES) } else { Ok(0) }
+            if meta.permissions().readonly() {
+                return Err(EACCES);
+            }
         }
-        _ => Ok(0),
+        _ => {}
     }
+    if want == 0 {
+        return Ok(0);
+    }
+    let st = stat_resolved(&p.vfs, &r)?;
+    let mode = u64::from(st.mode);
+    let uid = p.sys.uid();
+    if uid == 0 {
+        let executable = mode & 0o111 != 0 || mode & u64::from(S_IFMT) == u64::from(S_IFDIR);
+        return if want & X == 0 || executable { Ok(0) } else { Err(EACCES) };
+    }
+    let bits = if st.uid == uid {
+        (mode >> 6) & 7
+    } else if p.sys.in_group(st.gid) {
+        (mode >> 3) & 7
+    } else {
+        mode & 7
+    };
+    if want & !bits == 0 { Ok(0) } else { Err(EACCES) }
 }
 
 fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {

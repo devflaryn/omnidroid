@@ -56,6 +56,12 @@ impl SysState {
         self.seccomp.inherit(&from.seccomp);
     }
 
+    /// Whether `gid` is this process's group or one of its supplementary groups.
+    #[must_use]
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.gid() == gid || self.groups.lock().contains(&gid)
+    }
+
     /// The capabilities held, bit `n` for `CAP_*` number `n`.
     #[must_use]
     pub fn caps(&self) -> u64 {

@@ -27,3 +27,18 @@ fn a_new_file_is_its_creators_with_its_mode_less_the_umask() {
     assert_eq!(runs[4].1.trim(), "600");
     assert_ne!(runs[5].0, OK, "an app gives no file away: {:?}", runs[5]);
 }
+
+/// `access` answers by the permission bits the caller's ids select -- an owner by the owner's bits
+/// alone, whatever the others' allow (ART refuses an app's dex file the app could write).
+#[test]
+fn access_answers_by_the_owners_bits() {
+    let Some((status, out, err)) = common::run(&[
+        "/system/bin/sh",
+        "-c",
+        "f=/data/local/tmp/f; echo x > $f; chmod 444 $f; test -w $f || echo not-writable; chmod 066 $f; test -r $f || echo not-readable; chmod 644 $f; test -r $f && test -w $f && echo owner-rw; test -x /system/bin/sh && echo executable",
+    ]) else {
+        return;
+    };
+    assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
+    assert_eq!(out, "not-writable\nnot-readable\nowner-rw\nexecutable\n", "{err}");
+}
