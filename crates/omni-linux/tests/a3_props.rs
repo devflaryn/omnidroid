@@ -39,6 +39,8 @@ fn a3_the_bootloader_properties_are_the_images() {
         ("ro.boot.vbmeta.digest", "836f26adcab3883794ba405c6bf019f74afbdc3c9d76bdb26cb1ea1672ffa8e8"),
         ("ro.boot.vbmeta.hash_alg", "sha256"),
         ("ro.boot.vbmeta.size", "6720"),
+        // The vendor partition's own (its build.prop), which its HALs read.
+        ("ro.vendor.build.security_patch", "2024-09-05"),
     ] {
         let Some((status, out, err)) = run(&["/system/bin/getprop", name]) else { return };
         assert_eq!(status, ExitStatus::Exited(0), "stderr: {err}");

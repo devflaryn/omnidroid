@@ -23,10 +23,11 @@ const AREA_UNIT: usize = 128 << 10;
 const LONG_FLAG: u32 = 1 << 16;
 const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to read";
 
-/// The build properties the image's generic partitions set, in init's load order. `/vendor` is
-/// deliberately absent: this image's vendor partition is the emulator's (`ro.kernel.qemu=1`,
-/// `ranchu` HALs), and omnidroid is this device's vendor.
-const BUILD_PROPS: [&str; 3] = ["/system/build.prop", "/system_ext/etc/build.prop", "/product/etc/build.prop"];
+/// The build properties the image's partitions set, in init's load order. The vendor partition's
+/// are the image's too: init runs that partition's HALs (KeyMint, audio, codecs), which read them
+/// (its patch level, its heap sizes); what omnidroid sets as this device's vendor (`OVERLAY`) is
+/// applied over all of them.
+const BUILD_PROPS: [&str; 4] = ["/system/build.prop", "/system_ext/etc/build.prop", "/vendor/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
 const OVERLAY: [(&str, &str); 19] = [
