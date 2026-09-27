@@ -97,6 +97,9 @@ pub struct Task {
     pub pending: Arc<std::sync::atomic::AtomicU64>,
     /// Set by `rt_sigreturn`: the run loop restores the frame at `sp`.
     pub sigreturn: bool,
+    /// The mask `rt_sigsuspend` replaced: the next handler's frame records it, so the handler's
+    /// return restores it (as the kernel's `saved_sigmask`).
+    pub saved_sigmask: Option<u64>,
 }
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
@@ -138,7 +141,7 @@ fn altstack_disabled() -> [u8; 24] {
 impl Task {
     #[must_use]
     pub fn new(tid: i32, process: Arc<Process>) -> Self {
-        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false }
+        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None }
     }
 }
 
@@ -624,7 +627,7 @@ impl Process {
             }
         }
         // SAFETY: as in `deliver_pending`.
-        let (mask, altstack) = unsafe { ((*task).sigmask, (*task).altstack) };
+        let (mask, altstack) = unsafe { ((*task).saved_sigmask.take().unwrap_or((*task).sigmask), (*task).altstack) };
         let at = crate::signal::placement(regs.sp, altstack, flags & SA_ONSTACK != 0);
         let frame = crate::signal::Frame::build(&regs, &info, mask, altstack);
         if self.mem.write(at, &frame).is_err() {

@@ -435,6 +435,71 @@ fn sys_rt_sigreturn(_p: &Process, t: &mut Task, _a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// `rt_sigtimedwait` (`sigwait`, ART's signal catcher): take the lowest pending signal in the set
+/// and answer its number (and siginfo); wait for one otherwise -- until the timeout (`EAGAIN`) or
+/// a signal outside the set that the task does not block (`EINTR`).
+fn sys_rt_sigtimedwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    if a[3] != 8 {
+        return Err(EINVAL);
+    }
+    let set = p.mem.read_u64(a[0])? & !((1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1)));
+    let deadline = if a[2] == 0 { None } else { deadline_after(read_timespec(p, a[2])?) };
+    let take = |t: &Task| -> Option<u64> {
+        let ready = t.pending.load(std::sync::atomic::Ordering::SeqCst) & set;
+        (ready != 0).then(|| {
+            let sig = u64::from(ready.trailing_zeros()) + 1;
+            t.pending.fetch_and(!(1 << (sig - 1)), std::sync::atomic::Ordering::SeqCst);
+            sig
+        })
+    };
+    let sig = loop {
+        if let Some(sig) = take(t) {
+            break sig;
+        }
+        if t.pending.load(std::sync::atomic::Ordering::SeqCst) & !t.sigmask != 0 {
+            return Err(EINTR); // a signal outside the set that a handler takes
+        }
+        // Wake for a signal in the set, or for one the task would take as a handler.
+        let wake = crate::futex::Signals { pending: &t.pending, mask: !set & t.sigmask };
+        let slept = p.futexes.sleep_until(deadline, wake);
+        if let Some(sig) = take(t) {
+            break sig;
+        }
+        match slept {
+            Ok(()) if a[2] != 0 => return Err(EAGAIN),
+            Ok(()) => {}
+            Err(e) => return Err(e),
+        }
+    };
+    if a[1] != 0 {
+        let mut info = [0u8; 128];
+        info[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
+        info[8..12].copy_from_slice(&crate::signal::SI_TKILL.to_le_bytes());
+        info[16..20].copy_from_slice(&p.sys.pid.to_le_bytes());
+        info[20..24].copy_from_slice(&p.sys.uid.to_le_bytes());
+        p.mem.write(a[1], &info)?;
+    }
+    Ok(sig)
+}
+
+/// `rt_sigsuspend`: wait under a temporary mask until a signal is deliverable, then `EINTR`. The
+/// temporary mask stands while that signal's handler is entered; the frame records the old one
+/// (`saved_sigmask`), so the handler's return restores it.
+fn sys_rt_sigsuspend(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    if a[1] != 8 {
+        return Err(EINVAL);
+    }
+    let temporary = p.mem.read_u64(a[0])? & !((1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1)));
+    t.saved_sigmask = Some(t.sigmask);
+    t.sigmask = temporary;
+    loop {
+        match p.futexes.sleep_until(None, signals(t)) {
+            Err(e) => return Err(e),
+            Ok(()) => continue,
+        }
+    }
+}
+
 fn sys_rt_sigpending(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let pending = t.pending.load(std::sync::atomic::Ordering::SeqCst) & t.sigmask;
     p.mem.write_u64(a[0], pending)?;
@@ -520,6 +585,8 @@ fn sys_membarrier(_p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 pub fn install(table: &mut Table) {
+    table.set(nr::RT_SIGTIMEDWAIT, sys_rt_sigtimedwait);
+    table.set(nr::RT_SIGSUSPEND, sys_rt_sigsuspend);
     table.set(nr::MEMBARRIER, sys_membarrier);
     table.set(nr::GETPRIORITY, sys_getpriority);
     table.set(nr::SETPRIORITY, sys_setpriority);

@@ -164,3 +164,46 @@ fn a_copy_racing_munmap_is_efault_not_a_host_crash() {
     stop.store(true, Ordering::Relaxed);
     unmapper.join().unwrap();
 }
+
+/// `sigwait` (ART's signal catcher): a pending signal in the set is taken and its number returned,
+/// with its siginfo; one posted while waiting ends the wait; a timeout is EAGAIN.
+#[test]
+fn rt_sigtimedwait_takes_a_signal_from_the_set() {
+    let (p, s) = process();
+    let mut t = Task::new(2010, Arc::clone(&p));
+    let set = 1u64 << (SIGUSR1 - 1);
+    t.sigmask = set;
+    p.mem.write_u64(s, set).unwrap();
+    pend(&t, SIGUSR1);
+    assert_eq!(p.syscall(&mut t, nr::RT_SIGTIMEDWAIT, [s, s + 64, 0, 8, 0, 0]), SIGUSR1);
+    assert_eq!(p.mem.read(s + 64, 4).unwrap(), (SIGUSR1 as u32).to_le_bytes());
+    assert_eq!(t.pending.load(Ordering::SeqCst) & set, 0, "taken, not left pending");
+    // A 10 ms timeout with nothing pending.
+    p.mem.write_u64(s + 256, 0).unwrap();
+    p.mem.write_u64(s + 264, 10_000_000).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::RT_SIGTIMEDWAIT, [s, 0, s + 256, 8, 0, 0]) as i64, -11);
+    // Posted while waiting.
+    let pending = Arc::clone(&t.pending);
+    let waiter = {
+        let p = Arc::clone(&p);
+        std::thread::spawn(move || p.syscall(&mut t, nr::RT_SIGTIMEDWAIT, [s, 0, 0, 8, 0, 0]))
+    };
+    std::thread::sleep(Duration::from_millis(30));
+    pending.fetch_or(set, Ordering::SeqCst);
+    p.futexes.interrupt(2010);
+    assert_eq!(waiter.join().unwrap(), SIGUSR1);
+}
+
+/// `sigsuspend` waits with a temporary mask and answers EINTR once a signal is deliverable.
+#[test]
+fn rt_sigsuspend_waits_under_a_temporary_mask() {
+    let (p, s) = process();
+    let mut t = Task::new(2011, Arc::clone(&p));
+    let usr1 = 1u64 << (SIGUSR1 - 1);
+    t.sigmask = usr1;
+    pend(&t, SIGUSR1);
+    p.mem.write_u64(s, 0).unwrap(); // suspend with nothing blocked
+    assert_eq!(p.syscall(&mut t, nr::RT_SIGSUSPEND, [s, 8, 0, 0, 0, 0]) as i64, -(EINTR.0 as i64));
+    assert_eq!(t.sigmask, 0, "the temporary mask stands until the handler's frame records the old one");
+    assert_eq!(t.saved_sigmask, Some(usr1));
+}
