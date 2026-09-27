@@ -317,9 +317,17 @@ fn sys_mprotect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     p.mm.protect(a[0], a[1], a[2] as u32).map(|()| 0)
 }
 
+/// `madvise`. The advice that changes what memory reads -- `MADV_DONTNEED` and `MADV_REMOVE` --
+/// leaves zeros; the rest are hints and are accepted. A success must mean what it means on Linux:
+/// ART zeroes released arena memory with `MADV_REMOVE` and trusts the answer, and a no-op here
+/// once left stale bytes that became garbage `DexCache` entries.
 fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    if a[2] == MADV_DONTNEED {
-        let addr = crate::guest::untag(a[0]);
+    const MADV_REMOVE: u64 = 9;
+    let addr = crate::guest::untag(a[0]);
+    if addr % p.mm.page != 0 {
+        return Err(EINVAL);
+    }
+    if matches!(a[2], MADV_DONTNEED | MADV_REMOVE) {
         let len = p.mm.span(addr, a[1]).ok_or(EINVAL)?;
         p.mm.discard(addr, len)?;
     }

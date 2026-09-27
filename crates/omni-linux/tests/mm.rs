@@ -233,3 +233,15 @@ fn madv_dontneed_reads_back_zeros() {
     }
     assert_eq!(p.mem.read(at + 63 * pg + 8, 4).unwrap(), vec![0xAB; 4]);
 }
+
+/// `MADV_REMOVE` that answers success must leave zeros, as Linux's does: ART's arena pool zeroes
+/// released arenas with it and trusts the answer (garbage there became garbage `DexCache` entries).
+#[test]
+fn madv_remove_reads_back_zeros_and_an_unaligned_start_is_einval() {
+    let (p, mut t, _, pg) = process();
+    let at = mmap(&p, &mut t, [0, 4 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    p.mem.write(at + pg, &[0xCD; 64]).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::MADVISE, [at + pg, 2 * pg, 9, 0, 0, 0]), 0);
+    assert_eq!(p.mem.read(at + pg, 64).unwrap(), vec![0; 64]);
+    assert_eq!(p.syscall(&mut t, nr::MADVISE, [at + 8, pg, 4, 0, 0, 0]) as i64, -(EINVAL.0 as i64));
+}
