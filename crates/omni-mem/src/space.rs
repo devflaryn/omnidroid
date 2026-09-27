@@ -952,9 +952,13 @@ impl GuestSpace {
                 (!protection.is_writable()).then_some((start, entry.len, protection))
             })
             .collect();
-        for &(start, entry_len, protection) in &to_flip {
-            let writable = if protection.is_executable() { Protection::ReadWriteExecute } else { Protection::ReadWrite };
-            inner.protect_range(OP, start, entry_len, writable)?;
+        // Drop each to plain read-write for the copy -- never writable-and-executable. Nothing
+        // runs while this lock is held, so execute is not needed during the write, and asking for
+        // W+X here would be refused on macOS's hardened runtime (EACCES). This is the loader's own
+        // relocation dance: `ReadExecute` down to `ReadWrite` (copy-on-write on a file view), write,
+        // and back up.
+        for &(start, entry_len, _) in &to_flip {
+            inner.protect_range(OP, start, entry_len, Protection::ReadWrite)?;
         }
 
         // SAFETY: a guest address is a host address (D4's identity mapping), the span is mapped,
