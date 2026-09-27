@@ -98,6 +98,12 @@ impl Mm {
         (addr < start + m.len).then(|| (m.guest.clone(), m.offset + (addr - start)))
     }
 
+    /// Every named mapping: (start, len, guest path, file offset).
+    #[must_use]
+    pub fn file_mappings(&self) -> Vec<(u64, u64, Vec<u8>, u64)> {
+        self.files.lock().iter().map(|(s, m)| (*s, m.len, m.guest.clone(), m.offset)).collect()
+    }
+
     /// `path+0xoffset` for an address inside a file mapping.
     #[must_use]
     pub fn describe(&self, addr: u64) -> Option<String> {

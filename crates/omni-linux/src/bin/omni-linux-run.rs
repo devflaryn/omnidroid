@@ -41,6 +41,29 @@ fn main() -> ExitCode {
         }
     };
     let status = p.run();
+    // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.
+    if std::env::var("OMNI_VERIFY_MAPS").as_deref() == Ok("1") {
+        let (mut checked, mut bad) = (0usize, 0usize);
+        for (start, len, guest, offset) in p.mm.file_mappings() {
+            let Some(region) = p.mem.space().region_at(start as usize) else { continue };
+            if !matches!(region.protection, omni_mem::Protection::Read | omni_mem::Protection::ReadExecute) {
+                continue;
+            }
+            let Some(file) = p.vfs.sysroot().read(&guest) else { continue };
+            let end = (offset as usize + len as usize).min(file.len());
+            if offset as usize >= end {
+                continue;
+            }
+            let want = &file[offset as usize..end];
+            let Ok(got) = p.mem.read(start, want.len()) else { continue };
+            checked += 1;
+            if let Some(i) = got.iter().zip(want).position(|(a, b)| a != b) {
+                bad += 1;
+                eprintln!("[verify] {start:#x}+{i:#x} {}+{:#x}: guest {:02x?} file {:02x?}", String::from_utf8_lossy(&guest), offset as usize + i, &got[i..(i + 8).min(got.len())], &want[i..(i + 8).min(want.len())]);
+            }
+        }
+        eprintln!("[verify] {checked} read-only file mappings, {bad} differ");
+    }
     // OMNI_DUMP=0xADDR:0xLEN:path -- guest memory as it was when the process ended, for a post-mortem.
     if let Ok(spec) = std::env::var("OMNI_DUMP") {
         let parts: Vec<&str> = spec.splitn(3, ':').collect();
