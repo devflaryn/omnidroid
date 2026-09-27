@@ -32,6 +32,9 @@ int main(void) {
     fd = open(path, O_RDONLY);
     memset(buf, 0, sizeof(buf));
     check(pread(fd, buf, 9, 100) == 9 && memcmp(buf, "wal-index", 9) == 0, "the write outlives the mapping");
+    // Read-only and shared, through a read-only descriptor (an idmap, an APK).
+    char* r = mmap(NULL, 32768, PROT_READ, MAP_SHARED, fd, 0);
+    check(r != MAP_FAILED && memcmp(r + 100, "wal-index", 9) == 0, "a read-only descriptor maps shared for reading");
     close(fd);
     printf(failed ? "FAILED\n" : "PASSED\n");
     return failed;

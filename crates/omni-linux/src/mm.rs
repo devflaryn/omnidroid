@@ -311,10 +311,12 @@ impl Mm {
             self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
             return Ok(at);
         }
-        // An instance file mapped MAP_SHARED (SQLite's WAL index): the host file itself, so every
-        // mapping of it, and its reads and writes, are the same bytes.
+        // An instance file mapped MAP_SHARED to be written (SQLite's WAL index): the host file
+        // itself, so every mapping of it, and its reads and writes, are the same bytes. (A read-only
+        // shared mapping -- an idmap, an APK -- is a copy: its descriptor may not be writable, and
+        // the host shares only a writable one.)
         let shared = match &*file.kind.lock() {
-            FileKind::Host { file: host, guest, sysroot: false } if req.flags & MAP_SHARED != 0 => {
+            FileKind::Host { file: host, guest, sysroot: false } if req.flags & MAP_SHARED != 0 && req.prot & PROT_WRITE != 0 => {
                 Some((host.try_clone().map_err(|_| EIO)?, guest.clone(), host.metadata().map_err(|_| EIO)?.len()))
             }
             _ => None,
