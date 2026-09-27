@@ -7,3 +7,8 @@ Built on Windows with the Android NDK r28c (android-ndk-r28c-windows.zip from dl
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -o faults faults.c
 
 The binaries are committed so the runtime and its tests never need the NDK; SHA256SUMS pins them.
+
+dex/hello.dex, from dex/Hello.java with JDK 21 and SDK build-tools 36.0.0:
+
+    javac --release 8 Hello.java
+    d8 --min-api 26 --output . Hello.class      (classes.dex, renamed hello.dex)
