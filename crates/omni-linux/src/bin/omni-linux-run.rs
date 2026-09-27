@@ -1,4 +1,7 @@
-//! `omni-linux-run --sysroot <dir> [--instance <dir>] [--env KEY=VALUE]... -- <program> [args...]`
+//! `omni-linux-run --sysroot <dir> [--instance <dir>] [--env KEY=VALUE]... [--service <program>]... -- <program> [args...]`
+//!
+//! A `--service` is started first, as `system` (uid 1000), in this host process -- a daemon the
+//! program talks to over binder, as `servicemanager`.
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -9,12 +12,14 @@ fn main() -> ExitCode {
     let mut sysroot = PathBuf::from("sysroot/aosp-35");
     let mut instance = std::env::temp_dir().join("omni-linux-run");
     let mut argv = Vec::new();
+    let mut services: Vec<String> = Vec::new();
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
             "--sysroot" => sysroot = PathBuf::from(args.next().expect("--sysroot needs a value")),
             "--instance" => instance = PathBuf::from(args.next().expect("--instance needs a value")),
             "--env" => envp.push(args.next().expect("--env needs KEY=VALUE").into_bytes()),
+            "--service" => services.push(args.next().expect("--service needs a program")),
             "--" => {
                 argv.extend(args.by_ref().map(String::into_bytes));
             }
@@ -23,6 +28,32 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+    let mut daemons = Vec::new();
+    for service in &services {
+        let config = SpawnConfig {
+            sysroot: sysroot.clone(),
+            instance_dir: instance.clone(),
+            argv: service.split(' ').map(|a| a.as_bytes().to_vec()).collect(),
+            envp: envp.clone(),
+            stdout: Output::Host,
+            stderr: Output::Host,
+            trace: std::env::var("OMNI_SYSCALL_TRACE").as_deref() == Ok("1"),
+        };
+        match Process::spawn_as(config, 1000) {
+            Ok(d) => {
+                let run = std::sync::Arc::clone(&d);
+                std::thread::spawn(move || run.run());
+                daemons.push(d);
+            }
+            Err(e) => {
+                eprintln!("omni-linux-run: {service}: {e}");
+                return ExitCode::from(127);
+            }
+        }
+    }
+    if !daemons.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
     }
     let config = SpawnConfig {
         sysroot,
