@@ -14,6 +14,17 @@ unified root; `choose_apk` would pick it (higher versionCode), so always name th
 |---|---|---|
 | 1 address space | **fixed** (`d65fbe8`): 10/10 boots reach "System now ready" (72-75 s each, 0 `[mm]` refusals, 0 guest deaths). Before: 5/7 D5 logs of 09-27 reached it, 1/7 exhausted the space (49 refusals, 1,048,576 bytes free of 64 GiB) | `docs/runs/2026-09-28-phase1-c4-10boots.csv`; `tests/low_space.rs` (fails without the fix with the boot log's exact figure) |
 
+| 2 launch | **Roblox starts on the real AOSP stack**: `pm install` 0 (libs extracted), `LauncherAliasMain` -> `ActivitySplash`, "Displayed ... +24-25 s", `libroblox.so` loaded by its class loader, the engine's own `I/Roblox [FLog::...]` lines, crashpad up. r1: its splash on the display, then its main thread died (below). r2 (after `4f600d3`): alive, its own **"Connection error -- Unable to contact server"** dialog: no network on this path yet | `work/overnight/r1-roblox-splash.png` (97.4% #f8f8f8, 2.0% #3058f8 = the Roblox logo), `work/overnight/r2-roblox-connection-error.png` (80.9% #606060 scrim + 16.6% #f8f8f8 dialog); logs `work/overnight/r1.log`, `r2.log` (untracked) |
+
+Fixed on the way (phase 2), each with a test that fails without it:
+- `4f600d3` binder: a transaction that cannot be made is `BR_FAILED_REPLY` to the sender (the
+  command consumed, the ioctl 0), not an ioctl errno -- libbinder kept its out-buffer and every
+  later call of the thread failed (`tests/binder_failed.rs`; old driver: -9). And a plain file's
+  descriptor crosses host processes (the WebView's `variations_seed_new`), by
+  `omni_platform::fs::path_of` (`remote::tests`).
+- `617f943` ART's JIT code cache: a memfd's section was never executable, so every ART process
+  (system_server, SystemUI, Roblox) ran without JIT (`tests/jit_cache_map.rs`: -17 before).
+
 Cause (phase 1): every guest process asks for the same low range; system_server holds it,
 reserved *around* the host's pieces there, host threads' 1 MiB stacks among them. When such a
 thread exited, its stack was the only free piece, and the next process's space "succeeded" with

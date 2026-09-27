@@ -67,6 +67,26 @@ fn the_apk_is_installed_started_and_draws() {
     std::env::set_var("OMNI_SCREENSHOT", &screenshot);
 
     let extra = std::env::var("OMNI_R_THEN").unwrap_or_default();
+    // `OMNI_R_COOKIE=<file>`: the app's first start makes its own cookie store; the app is stopped,
+    // the session cookie put in that store (`tools/plant_cookie.py`, never printed), and the app
+    // started again -- as a device that had signed in starts it.
+    let cookie = std::env::var_os("OMNI_R_COOKIE").map(PathBuf::from);
+    let sign_in = if cookie.is_some() {
+        "sleep 45; am force-stop com.roblox.client; echo \"[r] cookie-stop\"; \
+         i=0; until [ -e /data/local/tmp/cookie-planted ] || [ $i -ge 180 ]; do sleep 1; i=$((i+1)); done; \
+         echo \"[r] cookie planted: $(cat /data/local/tmp/cookie-planted)\"; \
+         am start -W -n \"$act\"; echo \"[r] relaunched: $?\"; "
+    } else {
+        ""
+    };
+    // `OMNI_R_PLACE=<id>`: once signed in, the place's deep link, as a link opened on a device.
+    let join = std::env::var("OMNI_R_PLACE").ok().map_or_else(String::new, |id| {
+        format!(
+            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 20; \
+             am start -a android.intent.action.VIEW -d 'roblox://experiences/start?placeId={id}' -n com.roblox.client/com.roblox.client.ActivityProtocolLaunch; \
+             echo \"[r] join intent for {id}: $?\"; "
+        )
+    });
     let then = format!(
         "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
          echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; \
@@ -76,11 +96,13 @@ fn the_apk_is_installed_started_and_draws() {
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
          pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
+         am kill-all; echo \"[r] background processes let go: $?\"; \
          pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
          act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \
-         {extra}"
+         {sign_in}{join}{extra}"
     );
+    let kept = instance.clone();
     let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote"], &then);
     let expect: Vec<String> = std::env::var("OMNI_R_EXPECT")
         .unwrap_or_else(|_| "[zygote] launching com.roblox.client|frames presented".into())
@@ -94,6 +116,24 @@ fn the_apk_is_installed_started_and_draws() {
     boot.watch(Duration::from_secs(minutes * 60), |line| {
         for (s, e) in seen.iter_mut().zip(&expect) {
             *s |= line.contains(e.as_str());
+        }
+        if line.contains("[r] cookie-stop") {
+            if let Some(file) = &cookie {
+                std::thread::sleep(Duration::from_secs(3));
+                let store = kept.join("data/data/com.roblox.client/app_webview/Default/Cookies");
+                let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/plant_cookie.py");
+                let planted = std::process::Command::new("python").arg(&tool).arg(&store).arg(file).output();
+                let said = match &planted {
+                    Ok(o) => format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+                    Err(e) => format!("python: {e}"),
+                };
+                eprintln!("[r] {}", said.trim());
+                let ok = planted.is_ok_and(|o| o.status.success());
+                let _ = std::fs::write(kept.join("data/local/tmp/cookie-planted"), if ok { "ok" } else { "failed" });
+            }
+        }
+        if line.contains("DID_LOG_IN") && !kept.join("data/local/tmp/signed-in").exists() {
+            let _ = std::fs::write(kept.join("data/local/tmp/signed-in"), "1");
         }
         if last_shot.elapsed() > Duration::from_secs(20) {
             last_shot = Instant::now();
