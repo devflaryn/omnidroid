@@ -1,6 +1,6 @@
 # Handoff
 
-Current as of **2026-09-26**, branch `unified`. This file is the state and the next steps only.
+Current as of **2026-09-27**, branch `unified`. This file is the state and the next steps only.
 Design is in `ARCHITECTURE.md`, reasons in `DECISIONS.md`, capabilities in `STATUS.md`, per-host
 detail in `ports/<os>.md`, the current goal in `briefs/goal-performance.md`. Read
 `VERIFICATION.md` before writing a test you will rely on; it also holds the Global Constraints
@@ -105,6 +105,31 @@ Read once at start; each announces itself in the log.
 | `OMNI_FILE_TRACE`, `OMNI_WAIT_TRACE`, `OMNI_PROFILE`, `OMNI_IMPORT_CENSUS=off`, `OMNI_GLES_TIMING` | diagnostics |
 | `OMNI_CLIENT_APP_SETTINGS=<json>` | the engine's own ClientAppSettings (measurement only) |
 | gate/test: `OMNI_GFX_WINDOW_TESTS=1`, `OMNI_M6_ROWS_21_22=1`, `OMNI_SESSION_SECONDS`, `OMNI_DATA_DIR`, `OMNI_LATE_{TAP,TEXT,INPUT,DRAG,KEYS,WHEEL}`, `OMNI_RESIZE_PROBE`, `OMNI_INPUT_PROBE`, `OMNI_INJECT_DEATH` | set by `play`, or synthetic stimuli for unattended runs |
+
+## The real-AOSP path (`omni-linux`, sub-projects C and D) -- the current goal
+
+Goal: an installed APK's launcher Activity starts through the real AOSP stack and renders to a
+screenshot. Milestones D2 -> D3 (a: GPU, b: composer + SurfaceFlinger, c: system_server to
+SystemReady) -> C4 -> C5 -> D4 -> D5; specs in `docs/superpowers/specs/2026-09-27-*`, plans in
+`docs/superpowers/plans/`. Done: D2 (gralloc 5), D3a (guest Vulkan + ANGLE on the host GPU) on
+Windows and Linux (see STATUS).
+
+- **D3b in progress**: `tools/gen_aidl.py` generates Rust for frozen AIDL (`tools/aidl/`,
+  `src/hal/aidl/`); the host composer (`src/hal/composer.rs`) implements composer3 V3 on it and
+  presents the client target into `hal::framebuffer`. Gate `tests/d3b_display.rs`: the real
+  surfaceflinger + bootanimation, a screenshot. SurfaceFlinger already starts its RenderEngine on
+  ANGLE and waits for `IComposer/default`.
+- **D3c next**: system_server = `app_process64 -Xgc:CMC -Xhidden-api-policy:disabled /system/bin
+  com.android.server.SystemServer` as uid 1000 with CLASSPATH=$SYSTEMSERVERCLASSPATH and the
+  derive_classpath environment, `omni-linux-run --init early_hal,core,hal,main --hal gralloc`
+  (init starts ~58 services incl. apexd, which system_server needs). It stops at
+  StartDisplayManager today (waits for SurfaceFlinger).
+- Probing from Git Bash: `export MSYS_NO_PATHCONV=1` or guest paths are rewritten.
+- Diagnostics: `OMNI_GPU_TRACE=1` (every forwarded Vulkan command and its answer).
+- Known gaps: AHB mirrors are linear images (input-attachment usage and other-format views are
+  dropped when the host refuses them linear); no sync_file fds (fences are -1: synchronous);
+  `vkDestroyCommandPool` leaves guest command-buffer wrappers behind; CLOCK_MONOTONIC is shared per
+  host process (not across host processes).
 
 ## Where it stands
 
