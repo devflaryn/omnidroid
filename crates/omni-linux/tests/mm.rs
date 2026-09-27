@@ -215,3 +215,21 @@ fn a_free_hint_inside_the_space_is_honoured() {
     let len = 0x6bc_8000u64;
     assert_eq!(mmap(&p, &mut t, [hint, len, 0, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64, hint);
 }
+
+/// `MADV_DONTNEED` on private anonymous memory: the next read is zeros, as ART's arenas rely on
+/// when they reuse memory released that way.
+#[test]
+fn madv_dontneed_reads_back_zeros() {
+    let (p, mut t, _, pg) = process();
+    let len = 64 * pg;
+    let at = mmap(&p, &mut t, [0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    for i in 0..64 {
+        p.mem.write(at + i * pg + 8, &[0xAB; 64]).unwrap();
+    }
+    assert_eq!(p.syscall(&mut t, nr::MADVISE, [at + pg, 62 * pg, 4, 0, 0, 0]), 0);
+    assert_eq!(p.mem.read(at + 8, 4).unwrap(), vec![0xAB; 4], "outside the range is kept");
+    for i in 1..63 {
+        assert_eq!(p.mem.read(at + i * pg + 8, 64).unwrap(), vec![0; 64], "page {i} reads zeros");
+    }
+    assert_eq!(p.mem.read(at + 63 * pg + 8, 4).unwrap(), vec![0xAB; 4]);
+}
