@@ -25,6 +25,19 @@ Fixed on the way (phase 2), each with a test that fails without it:
 - `617f943` ART's JIT code cache: a memfd's section was never executable, so every ART process
   (system_server, SystemUI, Roblox) ran without JIT (`tests/jit_cache_map.rs`: -17 before).
 
+- `efd0e33` (merge `aosp-net`): TCP/UDP are real host sockets (`tests/host_sockets.rs`, 37 checks
+  in a guest), `pselect6`, and the kernel answers `/dev/socket/dnsproxyd` in an app's host process
+  (`tests/dns_proxy.rs`: a guest `getaddrinfo` through the real bionic gets the host resolver's
+  addresses). Before it, every inet `connect` was ENETUNREACH.
+- merge `binder-oneway` (7 commits, a test each that fails on the old driver): a freed oneway
+  buffer hands the node's next oneway to the process, not the freeing thread; only free loopers
+  take process work; undelivered work is freed and its sender told; nodes named by a transaction
+  are held until the receiver frees the buffer (the system_server SIGSEGV of r1: a use-after-free
+  in `Parcel::unflattenBinder`, symbolized to `RefBase::incStrongRequireStrong` on a freed object).
+- `2832702` no modem: the image's RIL spun on its modem's vsock (198,217 log lines per 100 s; one
+  session's log reached 2.4 GB and filled C:); it is declared and not started, as on a device
+  without a radio. C4 logs 4 MB -> 1.2 MB. 3/3 C4 boots after both merges: ready in 70-84 s.
+
 Cause (phase 1): every guest process asks for the same low range; system_server holds it,
 reserved *around* the host's pieces there, host threads' 1 MiB stacks among them. When such a
 thread exited, its stack was the only free piece, and the next process's space "succeeded" with
