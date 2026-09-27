@@ -31,3 +31,18 @@ fn a2_ps_shows_this_process() {
     let pid = |l: &str| l.split_whitespace().nth(1).and_then(|p| p.parse::<i32>().ok()).is_some_and(|p| p % 1000 == 0);
     assert!(out.lines().any(|l| pid(l) && l.ends_with("toybox")), "{out}");
 }
+
+/// tracefs, mounted with tracing off: its settings read and write, the marker takes a write, and
+/// the events directory is there (the tracing HAL aborts without it).
+#[test]
+fn tracefs_is_mounted_with_tracing_off() {
+    let Some((status, out, err)) = common::run(&[
+        "/system/bin/sh",
+        "-c",
+        "cat /sys/kernel/tracing/tracing_on; echo hello > /sys/kernel/tracing/trace_marker && echo marked; ls -d /sys/kernel/tracing/events",
+    ]) else {
+        return;
+    };
+    assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
+    assert_eq!(out, "0\nmarked\n/sys/kernel/tracing/events\n", "{err}");
+}

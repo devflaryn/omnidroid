@@ -321,10 +321,13 @@ fn settable_attr(path: &[u8]) -> Option<(i32, &'static str)> {
 /// selinuxfs transaction file.
 #[must_use]
 pub fn is_settable_attr(path: &[u8]) -> bool {
-    settable_attr(path).is_some() || path == SELINUX_CONTEXT || std::str::from_utf8(path).is_ok_and(|p| sysctl_default(p).is_some())
+    settable_attr(path).is_some() || path == SELINUX_CONTEXT || path == TRACE_MARKER || std::str::from_utf8(path).is_ok_and(|p| sysctl_default(p).is_some())
 }
 
 const SELINUX_CONTEXT: &[u8] = b"/sys/fs/selinux/context";
+
+/// tracefs's marker.
+const TRACE_MARKER: &[u8] = b"/sys/kernel/tracing/trace_marker";
 
 /// The kernel tunables a process may write (`/proc/sys/...`), with their boot values: the BPF
 /// loader enables the JIT and unprivileged BPF.
@@ -352,6 +355,12 @@ fn sysctl_default(path: &str) -> Option<&'static str> {
         "/proc/sys/kernel/perf_event_paranoid" => "3\n",
         "/proc/sys/net/core/bpf_jit_enable" => "0\n",
         "/proc/sys/net/core/bpf_jit_kallsyms" => "0\n",
+        // tracefs, with tracing off: what atrace and the tracing HAL set before they trace.
+        "/sys/kernel/tracing/tracing_on" => "0\n",
+        "/sys/kernel/tracing/current_tracer" => "nop\n",
+        "/sys/kernel/tracing/buffer_size_kb" => "1408\n",
+        "/sys/kernel/tracing/trace_clock" => "[local] global counter uptime perf mono mono_raw boot\n",
+        "/sys/kernel/tracing/set_event" => "",
         _ => return None,
     })
 }
@@ -370,6 +379,10 @@ fn sysctl_value(path: &str) -> Vec<u8> {
 pub fn write_generated(path: &[u8], bytes: &[u8], answer: &mut Vec<u8>) -> Result<usize, crate::errno::Errno> {
     if path == SELINUX_CONTEXT {
         *answer = check_context(bytes)?;
+        return Ok(bytes.len());
+    }
+    // tracefs's marker, with tracing off: a write is accepted and goes nowhere.
+    if path == TRACE_MARKER {
         return Ok(bytes.len());
     }
     if let Some(p) = std::str::from_utf8(path).ok().filter(|p| sysctl_default(p).is_some()) {
@@ -512,7 +525,24 @@ impl Process {
             "/proc/version" => return Some(Entry::File(version)),
             "/proc/mounts" => return Some(Entry::File(mounts)),
             "/proc/filesystems" => return Some(Entry::File(filesystems)),
-            "/sys" => return Some(Entry::Dir(vec![("block", DT_DIR), ("class", DT_DIR), ("devices", DT_DIR), ("fs", DT_DIR)])),
+            "/sys" => return Some(Entry::Dir(vec![("block", DT_DIR), ("class", DT_DIR), ("devices", DT_DIR), ("fs", DT_DIR), ("kernel", DT_DIR)])),
+            // tracefs, mounted with tracing off: its settings, a marker that takes writes, and no
+            // events -- a kernel built without tracepoints (atrace finds each category absent).
+            "/sys/kernel" => return Some(Entry::Dir(vec![("tracing", DT_DIR)])),
+            "/sys/kernel/tracing" => {
+                return Some(Entry::Dir(vec![
+                    ("tracing_on", DT_REG),
+                    ("current_tracer", DT_REG),
+                    ("buffer_size_kb", DT_REG),
+                    ("trace_clock", DT_REG),
+                    ("set_event", DT_REG),
+                    ("trace_marker", DT_REG),
+                    ("events", DT_DIR),
+                    ("options", DT_DIR),
+                ]))
+            }
+            "/sys/kernel/tracing/events" | "/sys/kernel/tracing/options" => return Some(Entry::Dir(Vec::new())),
+            "/sys/kernel/tracing/trace_marker" => return Some(Entry::Bytes(Vec::new())),
             "/sys/block" => return Some(Entry::DynDir(apex_mounts(self).iter().map(|m| (format!("loop{}", m.index), DT_DIR)).collect())),
             "/sys/fs" => return Some(Entry::Dir(vec![("selinux", DT_DIR), ("bpf", DT_DIR)])),
             // The BPF filesystem (`crate::bpf`): its directories and pins.
