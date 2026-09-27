@@ -29,7 +29,7 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 3] = ["/system/build.prop", "/system_ext/etc/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 14] = [
+const OVERLAY: [(&str, &str); 19] = [
     // The property service speaks protocol 2 (a reply for every set).
     ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
@@ -46,6 +46,14 @@ const OVERLAY: [(&str, &str); 14] = [
     ("ro.secure", "1"),
     ("ro.hardware", "omnidroid"),
     ("ro.boot.hardware", "omnidroid"),
+    // What a bootloader hands init (`androidboot.*`): omnidroid boots the image unverified, as an
+    // unlocked device does, and reports the pinned image's vbmeta as its `VerifiedBootParams.textproto`
+    // gives it (KeyMint waits for these before it registers).
+    ("ro.boot.verifiedbootstate", "orange"),
+    ("ro.boot.vbmeta.device_state", "unlocked"),
+    ("ro.boot.vbmeta.digest", "836f26adcab3883794ba405c6bf019f74afbdc3c9d76bdb26cb1ea1672ffa8e8"),
+    ("ro.boot.vbmeta.hash_alg", "sha256"),
+    ("ro.boot.vbmeta.size", "6720"),
     // The GPU drivers (D3a): the image's own ANGLE for GLES, on omnidroid's Vulkan driver
     // (`/vendor/lib64/hw/vulkan.omni.so`), which forwards to the host's GPU.
     ("ro.hardware.egl", "angle"),

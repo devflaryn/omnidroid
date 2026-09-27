@@ -27,3 +27,21 @@ fn a3_libc_initializes_its_properties_without_complaint() {
     assert_eq!(status, ExitStatus::Exited(0), "stderr: {err}");
     assert!(!err.contains("propert"), "no property warning from libc: {err}");
 }
+
+/// What a bootloader hands init (`androidboot.*`, as `ro.boot.*`): the verified-boot state of an
+/// unlocked device, and the pinned image's own vbmeta digest (its `VerifiedBootParams.textproto`).
+/// KeyMint waits for these before it registers.
+#[test]
+fn a3_the_bootloader_properties_are_the_images() {
+    for (name, want) in [
+        ("ro.boot.verifiedbootstate", "orange"),
+        ("ro.boot.vbmeta.device_state", "unlocked"),
+        ("ro.boot.vbmeta.digest", "836f26adcab3883794ba405c6bf019f74afbdc3c9d76bdb26cb1ea1672ffa8e8"),
+        ("ro.boot.vbmeta.hash_alg", "sha256"),
+        ("ro.boot.vbmeta.size", "6720"),
+    ] {
+        let Some((status, out, err)) = run(&["/system/bin/getprop", name]) else { return };
+        assert_eq!(status, ExitStatus::Exited(0), "stderr: {err}");
+        assert_eq!(out.trim(), want, "{name}");
+    }
+}
