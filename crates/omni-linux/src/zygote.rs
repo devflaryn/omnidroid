@@ -20,6 +20,9 @@ pub struct Launcher {
     pub instance: PathBuf,
     pub envp: Vec<Vec<u8>>,
     pub binder: String,
+    /// The zygote's VM options (`-X...`), which every app it forks runs with: the ones the
+    /// system's `app_process` was started with, less what the zygote sets per app.
+    pub vm_options: Vec<String>,
 }
 
 /// Bind `/dev/socket/zygote` in `instance` (the key a process's sockets are named in) and answer
@@ -139,7 +142,9 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, class_and_args: &[S
             cmd.arg("--env").arg(String::from_utf8_lossy(e).into_owned());
         }
     }
-    cmd.args(["--", "/system/bin/app_process64", "/system/bin", "--application"]);
+    cmd.args(["--", "/system/bin/app_process64"]);
+    cmd.args(&launcher.vm_options);
+    cmd.args(["/system/bin", "--application"]);
     if let Some(n) = nice {
         cmd.arg(format!("--nice-name={n}"));
     }

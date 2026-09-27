@@ -64,7 +64,7 @@ fn main() -> ExitCode {
     let config = SpawnConfig {
         sysroot: sysroot.clone(),
         instance_dir: instance.clone(),
-        argv,
+        argv: argv.clone(),
         envp: envp.clone(),
         stdout: Output::Host,
         stderr: Output::Host,
@@ -81,7 +81,16 @@ fn main() -> ExitCode {
         match omni_linux::remote::serve(std::sync::Arc::clone(p.vfs.sysroot())) {
             Ok(addr) => {
                 let runner = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("omni-linux-run"));
-                let launcher = omni_linux::zygote::Launcher { runner, sysroot: sysroot.clone(), instance: instance.clone(), envp: envp.clone(), binder: addr.to_string() };
+                // The zygote's VM options: the system's app_process's `-X` options (argv before its
+                // parent directory), less the hidden-API policy the zygote sets for each app.
+                let vm_options: Vec<String> = argv
+                    .iter()
+                    .skip(1)
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .take_while(|a| a.starts_with("-X"))
+                    .filter(|a| !a.starts_with("-Xhidden-api-policy"))
+                    .collect();
+                let launcher = omni_linux::zygote::Launcher { runner, sysroot: sysroot.clone(), instance: instance.clone(), envp: envp.clone(), binder: addr.to_string(), vm_options };
                 omni_linux::zygote::serve(std::sync::Arc::as_ptr(p.vfs.binds()) as usize, launcher);
                 eprintln!("[zygote] /dev/socket/zygote; apps' binder at {addr}");
             }
