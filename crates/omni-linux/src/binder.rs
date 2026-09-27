@@ -365,16 +365,21 @@ impl State {
     }
 
     /// A oneway transaction to `node` is done with (its buffer freed, or it was not delivered):
-    /// the next waiting one goes to `owner` -- to thread `tid` when given, as the kernel hands it
-    /// to the thread that freed the buffer.
-    fn async_done(&mut self, node: NodeId, owner: ProcId, tid: Option<i32>) {
+    /// the next waiting one goes to `owner`'s process queue, for whichever thread is available for
+    /// process work -- as the kernel's `binder_free_buf` does (`binder_enqueue_work_ilocked(w,
+    /// &proc->todo)`). Kernels before 4.14 moved it to the freeing thread's own queue; since then
+    /// the kernel never queues a oneway to a thread. The node's oneways still run one at a time,
+    /// in order: the next is handed out only now. Handing it to the freeing thread held it on a
+    /// thread that only writes (libbinder's `flushCommands`, a thread's exit), and every later
+    /// oneway to the node queued behind it.
+    fn async_done(&mut self, node: NodeId, owner: ProcId) {
         let next = self.nodes.get_mut(&node).and_then(|n| {
             let w = n.async_todo.pop_front();
             n.has_async = w.is_some();
             w
         });
         if let Some(w) = next {
-            self.queue(owner, tid, w);
+            self.queue(owner, None, w);
         }
     }
 
@@ -1022,10 +1027,10 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         BC_FREE_BUFFER => {
             let ptr = u64_at(arg, 0);
             file.area.lock().free(ptr);
-            // A oneway transaction's buffer: its node's next oneway goes to this thread.
+            // A oneway transaction's buffer: its node's next oneway goes to the process.
             let mut st = file.broker.state.lock();
             if let Some(node) = st.async_buffers.remove(&(file.id, ptr)) {
-                st.async_done(node, file.id, Some(t.tid));
+                st.async_done(node, file.id);
             }
         }
         // A live process's handle references are not counted: its handles last as long as it
@@ -1386,7 +1391,7 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
             let Some(buf) = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len) else {
                 // Not delivered: the node's next oneway may go.
                 if let Some(node) = txn.async_node {
-                    file.broker.state.lock().async_done(node, file.id, None);
+                    file.broker.state.lock().async_done(node, file.id);
                 }
                 return Err(ENOMEM);
             };
