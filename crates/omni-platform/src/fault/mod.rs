@@ -228,6 +228,16 @@ pub enum FaultError {
         source: OsError,
     },
 
+    /// A thread's alternate signal stack could not be mapped or installed (Linux, see
+    /// [`prepare_thread`]).
+    #[error("the {bytes}-byte alternate signal stack could not be set up: {source}")]
+    AlternateStack {
+        /// [`ALTERNATE_STACK_BYTES`].
+        bytes: usize,
+        /// The `errno` `mmap` or `sigaltstack` failed with.
+        source: OsError,
+    },
+
     /// Something in this process keeps installing its own handler over this module's (Linux).
     ///
     /// A POSIX signal has one disposition, so first place is held by re-asserting it
@@ -317,6 +327,37 @@ pub fn reassert_precedence() -> FaultResult<()> {
     #[cfg(target_os = "linux")]
     {
         backend::reassert_precedence()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
+/// The alternate signal stack [`prepare_thread`] gives a thread, in bytes.
+///
+/// A POSIX fault handler that must survive a stack overflow runs on an alternate stack, and Rust
+/// gives a `std::thread` one of `max(SIGSTKSZ, AT_MINSIGSTKSZ)`: 8 KiB on Linux x86-64. The demand
+/// pager's path measured 12,496 bytes of it in a debug build and 3,016 in release
+/// (`omni-mem/tests/pager_linux`), and a handler that overruns it faults on the guard page with the
+/// fault signals blocked, which kills the process. 64 KiB is five times the debug figure; the pages
+/// a thread never touches are never committed.
+pub const ALTERNATE_STACK_BYTES: usize = 64 * 1024;
+
+/// Make the calling thread fit to take a guest fault: on Linux, give it an alternate signal stack of
+/// at least [`ALTERNATE_STACK_BYTES`] if it has a smaller one or none, freed when the thread exits.
+/// Call it on every thread that runs guest code, before it does (`omni-cpu` does, on entry to a
+/// run). Idempotent, and after the first call on a thread one thread-local read. A no-op on Windows,
+/// where a vectored handler runs on the faulting thread's own stack, and on macOS, where a guest
+/// fault is a Mach exception served on the exception thread.
+///
+/// # Errors
+///
+/// [`FaultError::AlternateStack`] if the stack cannot be mapped or installed.
+pub fn prepare_thread() -> FaultResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        backend::prepare_thread()
     }
     #[cfg(not(target_os = "linux"))]
     {

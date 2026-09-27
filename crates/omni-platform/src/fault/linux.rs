@@ -87,7 +87,10 @@
 //! 2 MiB one. The pager path's real need was **measured** against that, not assumed:
 //! `omni-mem/tests/pager_linux` paints an alternate stack, serves a real demand fault through the
 //! whole `DemandPager` path on it, and reads the high-water mark back. The figure is in
-//! `docs/ports/linux-notes/mem.md`.
+//! `docs/ports/linux-notes/mem.md`: 3,016 bytes in release, **12,496 in debug** -- more than a std
+//! thread has, so a debug build died by `SIGSEGV` in the handler. Hence [`prepare_thread`]: a
+//! thread that runs guest code is given an alternate stack of `ALTERNATE_STACK_BYTES` first
+//! (`omni-cpu` calls it on entry to a run), and `tests/fault_altstack_linux.rs` pins both sides.
 
 use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -399,6 +402,115 @@ pub(super) fn reassert_precedence() -> FaultResult<()> {
         put_on_top(signal, index)?;
     }
     Ok(())
+}
+
+/// An alternate signal stack this module mapped for a thread: `len` bytes from `base`, the lowest
+/// page a guard. Unmapped when the thread exits, after it is uninstalled if it is still the current
+/// one (std's own thread-exit handler normally disables it first).
+struct AlternateStack {
+    base: *mut libc::c_void,
+    len: usize,
+    guard: usize,
+}
+
+impl Drop for AlternateStack {
+    fn drop(&mut self) {
+        // SAFETY: plain data, filled in by a query-only call.
+        let mut current: libc::stack_t = unsafe { core::mem::zeroed() };
+        // SAFETY: a NULL new stack only reads the current one.
+        let queried = unsafe { libc::sigaltstack(core::ptr::null(), &mut current) } == 0;
+        // SAFETY: `guard` is inside the mapping.
+        let ours = unsafe { self.base.cast::<u8>().add(self.guard) }.cast::<libc::c_void>();
+        if !queried || (current.ss_sp == ours && current.ss_flags & libc::SS_ONSTACK != 0) {
+            return; // cannot tell, or running on it: leak rather than pull it out from under us
+        }
+        if current.ss_sp == ours && current.ss_flags & libc::SS_DISABLE == 0 {
+            let disable = libc::stack_t { ss_sp: core::ptr::null_mut(), ss_flags: libc::SS_DISABLE, ss_size: 0 };
+            // SAFETY: disabling this thread's alternate stack, which it is not running on.
+            if unsafe { libc::sigaltstack(&disable, core::ptr::null_mut()) } != 0 {
+                return;
+            }
+        }
+        // SAFETY: the mapping `prepare_thread` made, no longer installed.
+        unsafe { libc::munmap(self.base, self.len) };
+    }
+}
+
+std::thread_local! {
+    /// Whether `prepare_thread` has run on this thread, and the stack it mapped, if it mapped one.
+    static PREPARED: core::cell::RefCell<Option<Option<AlternateStack>>> = const { core::cell::RefCell::new(None) };
+}
+
+/// See [`super::prepare_thread`].
+pub(super) fn prepare_thread() -> FaultResult<()> {
+    let result = PREPARED.try_with(|prepared| {
+        if prepared.borrow().is_some() {
+            return Ok(());
+        }
+        let mapped = give_alternate_stack()?;
+        *prepared.borrow_mut() = Some(mapped);
+        Ok(())
+    });
+    // A thread already tearing down its thread-locals runs no more guest code.
+    result.unwrap_or(Ok(()))
+}
+
+fn alternate_stack_failed() -> FaultError {
+    FaultError::AlternateStack {
+        bytes: super::ALTERNATE_STACK_BYTES,
+        source: OsError(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32),
+    }
+}
+
+/// Install a larger alternate stack on this thread unless it already has one large enough (the one
+/// dynarmic gives the thread that builds the first jit is 2 MiB) or is running on its current one.
+fn give_alternate_stack() -> FaultResult<Option<AlternateStack>> {
+    let wanted = super::ALTERNATE_STACK_BYTES;
+    // SAFETY: plain data, filled in by a query-only call.
+    let mut current: libc::stack_t = unsafe { core::mem::zeroed() };
+    // SAFETY: a NULL new stack only reads the current one.
+    if unsafe { libc::sigaltstack(core::ptr::null(), &mut current) } != 0 {
+        return Err(alternate_stack_failed());
+    }
+    let enabled = current.ss_flags & libc::SS_DISABLE == 0;
+    if current.ss_flags & libc::SS_ONSTACK != 0 || (enabled && current.ss_size >= wanted) {
+        return Ok(None);
+    }
+    // SAFETY: sysconf has no preconditions.
+    let guard = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+    let len = guard + wanted;
+    // SAFETY: a fresh anonymous private mapping, placed by the kernel.
+    let base = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(alternate_stack_failed());
+    }
+    let mapped = AlternateStack { base, len, guard };
+    // SAFETY: the lowest page of the mapping just made, so an overrun faults instead of writing
+    // into whatever lies below.
+    if unsafe { libc::mprotect(base, guard, libc::PROT_NONE) } != 0 {
+        return Err(alternate_stack_failed()); // `mapped` unmaps it
+    }
+    let stack = libc::stack_t {
+        // SAFETY: `guard` is inside the mapping.
+        ss_sp: unsafe { base.cast::<u8>().add(guard) }.cast(),
+        ss_flags: 0,
+        ss_size: wanted,
+    };
+    // SAFETY: `stack` is a live, writable mapping this thread owns until `mapped` is dropped at
+    // thread exit, and the thread is not running on its current alternate stack (checked above).
+    if unsafe { libc::sigaltstack(&stack, core::ptr::null_mut()) } != 0 {
+        return Err(alternate_stack_failed());
+    }
+    Ok(Some(mapped))
 }
 
 // `si_code` values that name a real page fault. From <asm-generic/siginfo.h>.

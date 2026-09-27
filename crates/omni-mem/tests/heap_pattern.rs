@@ -170,6 +170,7 @@ fn run(space: GuestSpace, threads: usize, rounds: usize) {
             let space = Arc::clone(&space);
             let start = Arc::clone(&start);
             std::thread::spawn(move || {
+                DemandPager::prepare_thread().expect("room to take a guest fault");
                 start.wait();
                 play(&space, owner, rounds);
             })

@@ -282,6 +282,18 @@ impl DemandPager {
         fault::reassert_precedence()
     }
 
+    /// Make the calling thread fit to take a guest fault before it runs guest code: on Linux an
+    /// alternate signal stack big enough for this pager's path in a debug build, which a std
+    /// thread's 8 KiB is not. A no-op elsewhere, and after the first call on a thread. See
+    /// [`omni_platform::fault::prepare_thread`].
+    ///
+    /// # Errors
+    ///
+    /// What `prepare_thread` refuses with: the stack could not be mapped or installed.
+    pub fn prepare_thread() -> Result<(), FaultError> {
+        fault::prepare_thread()
+    }
+
     /// What this pager has done. See [`PagerStats`].
     #[must_use]
     pub fn stats(&self) -> PagerStats {

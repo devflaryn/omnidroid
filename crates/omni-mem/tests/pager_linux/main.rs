@@ -65,7 +65,7 @@ fn stack_used_by_faults_at(addresses: Vec<usize>, size: usize) -> usize {
 }
 
 #[test]
-fn the_demand_pager_path_fits_the_alternate_stack_rust_gives_a_thread() {
+fn the_demand_pager_path_fits_the_alternate_stack_a_prepared_thread_has() {
     let space = Arc::new(
         GuestSpace::with_config(GuestSpaceConfig { size: 256 * MIB, ..GuestSpaceConfig::default() })
             .expect("a guest space"),
@@ -107,20 +107,23 @@ fn the_demand_pager_path_fits_the_alternate_stack_rust_gives_a_thread() {
         addresses.len()
     );
     assert!(used > 0, "the painted stack was never used: the fault did not run on it");
-    // A margin of a quarter of the std stack, for paths this run did not take (an error being built,
-    // a panic being caught). The measured figure is the one to read; this is what makes it binding.
+    // A margin of a quarter of the stack, for paths this run did not take (an error being built, a
+    // panic being caught). The measured figure is the one to read; this is what makes it binding.
+    // The stack is `prepare_thread`'s, not std's: a debug build's path (12,496 bytes on 2026-09-27)
+    // does not fit std's 8 KiB, which is why every thread that runs guest code is prepared.
+    let prepared = omni_platform::fault::ALTERNATE_STACK_BYTES;
     assert!(
-        used + std_size / 4 <= std_size,
-        "the pager path used {used} bytes of alternate stack, too close to the {std_size} bytes a \
-         std thread has: a demand fault on such a thread would overrun it"
+        used + prepared / 4 <= prepared,
+        "the pager path used {used} bytes of alternate stack, too close to the {prepared} bytes a \
+         prepared thread has: a demand fault on such a thread would overrun it"
     );
 }
 
-/// And the real thing: a std thread, with the alternate stack std gave it, serves demand faults.
-/// A path that overran it would kill this process (a fault inside the handler, with `SIGSEGV`
-/// blocked, is fatal), so a pass is the evidence.
+/// And the real thing: prepared std threads serve demand faults on their alternate stacks. A path
+/// that overran one would kill this process (a fault inside the handler, with `SIGSEGV` blocked, is
+/// fatal), so a pass is the evidence.
 #[test]
-fn std_threads_serve_demand_faults_on_their_own_alternate_stacks() {
+fn prepared_threads_serve_demand_faults_on_their_alternate_stacks() {
     let space = Arc::new(
         GuestSpace::with_config(GuestSpaceConfig { size: 256 * MIB, ..GuestSpaceConfig::default() })
             .expect("a guest space"),
@@ -141,7 +144,9 @@ fn std_threads_serve_demand_faults_on_their_own_alternate_stacks() {
     let workers: Vec<_> = (0..THREADS)
         .map(|thread| {
             std::thread::spawn(move || {
-                assert!(current_altstack().1, "a std thread has an alternate stack");
+                DemandPager::prepare_thread().expect("room to take a guest fault");
+                let (size, enabled) = current_altstack();
+                assert!(enabled && size >= omni_platform::fault::ALTERNATE_STACK_BYTES, "{size} bytes");
                 for index in 0..PER_THREAD {
                     let address = lazy + (thread * PER_THREAD + index) * granule;
                     // SAFETY: inside the lazy mapping; the pager commits it.
