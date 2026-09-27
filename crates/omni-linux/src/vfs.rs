@@ -310,17 +310,20 @@ impl Binds {
     /// or now when `force`).
     fn reload(&self, force: bool) {
         let Some(file) = &self.file else { return };
-        let mut seen = self.seen.lock();
-        let now = std::time::Instant::now();
-        if !force && seen.1.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(1)) {
-            return;
+        // The time lock is never held with the table's (bind and unbind take the table's first).
+        {
+            let mut seen = self.seen.lock();
+            let now = std::time::Instant::now();
+            if !force && seen.1.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(1)) {
+                return;
+            }
+            seen.1 = Some(now);
+            let modified = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+            if modified == seen.0 {
+                return;
+            }
+            seen.0 = modified;
         }
-        seen.1 = Some(now);
-        let modified = std::fs::metadata(file).and_then(|m| m.modified()).ok();
-        if modified == seen.0 {
-            return;
-        }
-        seen.0 = modified;
         let text = std::fs::read(file).unwrap_or_default();
         let table = text
             .split(|b| *b == b'\n')
@@ -350,21 +353,26 @@ impl Binds {
     /// Mount `host` (a host directory or file) at the guest path `target`, over what was there.
     pub fn bind(&self, target: Vec<u8>, host: PathBuf) {
         self.reload(true);
-        let mut binds = self.binds.write();
-        binds.retain(|(t, _)| *t != target);
-        binds.push((target, host));
-        self.save(&binds);
+        let table = {
+            let mut binds = self.binds.write();
+            binds.retain(|(t, _)| *t != target);
+            binds.push((target, host));
+            binds.clone()
+        };
+        self.save(&table);
     }
 
     /// Unmount what is mounted at `target`. Whether something was.
     pub fn unbind(&self, target: &[u8]) -> bool {
         self.reload(true);
-        let mut binds = self.binds.write();
-        let before = binds.len();
-        binds.retain(|(t, _)| t.as_slice() != target);
-        let removed = binds.len() != before;
+        let (removed, table) = {
+            let mut binds = self.binds.write();
+            let before = binds.len();
+            binds.retain(|(t, _)| t.as_slice() != target);
+            (binds.len() != before, binds.clone())
+        };
         if removed {
-            self.save(&binds);
+            self.save(&table);
         }
         removed
     }

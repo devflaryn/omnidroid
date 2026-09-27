@@ -154,6 +154,10 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     if let Some(n) = nice {
         cmd.arg(format!("--nice-name={n}"));
     }
+    // OMNI_TRACE_APP=<process name>: that app's host process traces its system calls.
+    if nice.is_some() && std::env::var("OMNI_TRACE_APP").ok().as_deref() == nice {
+        cmd.env("OMNI_SYSCALL_TRACE", "1");
+    }
     // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
     cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
     cmd.args(class_and_args);
