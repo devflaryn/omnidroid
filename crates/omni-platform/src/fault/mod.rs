@@ -163,7 +163,12 @@ pub type FaultHandler = fn(context: usize, fault: &Fault) -> FaultOutcome;
 /// guest fault on dynarmic's own handler and its 30-49x recompiled callback path — and it was
 /// intermittent, because it depended on how libtest happened to schedule. The table is now refused
 /// rather than swallowed by `omni-cpu` as well; see `DynarmicBackend::new`.
-pub const MAX_HANDLERS: usize = 32;
+///
+/// **Raised from 32 to 256 for `omni-linux`**, whose host process runs a device's native daemons
+/// side by side, each a guest process with its own address space: init starts about fifty at boot
+/// (servicemanager, logd, vold, netd, the HALs...), and the thirty-third was refused. An empty slot
+/// costs the dispatch scan one relaxed load, so a full table is ~256 loads on a fault's path.
+pub const MAX_HANDLERS: usize = 256;
 
 /// Counters for the dispatch path, so the ordering claim above can be tested rather than asserted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
