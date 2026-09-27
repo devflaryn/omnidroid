@@ -513,13 +513,21 @@ impl Process {
         // Wait for the others: they were halted if the process is ending, or they end by
         // themselves if the main thread only left with `exit`.
         let mut tasks = self.tasks.lock();
+        let mut ending_since: Option<std::time::Instant> = None;
         while !tasks.is_empty() {
             self.task_ended.wait_for(&mut tasks, std::time::Duration::from_millis(200));
-            if let Some(ending) = self.group_exit.lock().clone() {
+            if self.group_exit.lock().is_some() {
                 for handle in tasks.values() {
                     handle.halt.request();
                 }
-                let _ = ending;
+                // A process killed ends whatever its threads are doing: one blocked in a wait the
+                // halt cannot reach (a host-level wait in a driver) is not waited for.
+                let since = *ending_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > std::time::Duration::from_secs(5) {
+                    let stuck: Vec<i32> = tasks.keys().copied().collect();
+                    eprintln!("[process {}] ended; tasks {stuck:?} did not stop and are abandoned", self.sys.pid);
+                    break;
+                }
             }
         }
         drop(tasks);
