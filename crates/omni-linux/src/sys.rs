@@ -643,6 +643,20 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         3 => p.futexes.requeue(&p.mem, a[0], a[2], a[4], a[3], None),
         4 => p.futexes.requeue(&p.mem, a[0], a[2], a[4], a[3], Some(a[5] as u32)),
         5 => p.futexes.wake_op(&p.mem, a[0], a[2], a[4], a[3], a[5] as u32),
+        // FUTEX_LOCK_PI (an absolute CLOCK_REALTIME timeout) and FUTEX_LOCK_PI2 (CLOCK_MONOTONIC,
+        // or REALTIME with the flag).
+        6 | 13 => {
+            let deadline = if a[3] == 0 {
+                None
+            } else {
+                let clock = if a[1] & !(PRIVATE | CLOCK_REALTIME) == 6 || a[1] & CLOCK_REALTIME != 0 { 0 } else { 1 };
+                let at = read_timespec(p, a[3])?;
+                deadline_after(at.saturating_sub(now(p, clock)?))
+            };
+            p.futexes.lock_pi(&p.mem, a[0], t.tid as u32, deadline)
+        }
+        7 => p.futexes.unlock_pi(&p.mem, a[0], t.tid as u32),
+        8 => p.futexes.trylock_pi(&p.mem, a[0], t.tid as u32),
         other => {
             p.refusals.record(format!("futex op {other}"), t.pc, t.lr);
             Err(ENOSYS)

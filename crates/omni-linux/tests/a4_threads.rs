@@ -21,3 +21,13 @@ fn a4_exit_from_a_thread_ends_the_process_however_main_is_blocked() {
     assert_eq!(status, ExitStatus::Exited(3), "stdout: {out}\nstderr: {err}");
     assert!(start.elapsed() < Duration::from_secs(10), "took {:?}", start.elapsed());
 }
+
+/// Priority-inheritance mutexes (`FUTEX_LOCK_PI`, `UNLOCK_PI`, `TRYLOCK_PI`): audioserver's
+/// audio_utils mutexes are these, and `std::mutex` aborted on `ENOSYS`.
+#[test]
+fn priority_inheritance_mutexes_lock_contend_and_time_out() {
+    let Some((status, out, err)) = common::run_fixture("pimutex", &[]) else { return };
+    assert!(!out.contains("FAIL"), "{out}\n{err}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 9, "{out}\n{err}");
+    assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
+}

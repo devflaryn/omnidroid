@@ -13,6 +13,13 @@ use crate::errno::{Errno, SysResult, EAGAIN, EINTR, EINVAL};
 use crate::guest::{untag, GuestMem};
 
 const ETIMEDOUT: Errno = Errno(110);
+const EDEADLK: Errno = Errno(35);
+const EPERM: Errno = Errno(1);
+
+/// A priority-inheritance futex word: the owner's tid, and whether any wait for it.
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
 struct Waiter {
     id: u64,
@@ -225,6 +232,104 @@ impl Futexes {
             self.cv.notify_all();
         }
         Ok(woken)
+    }
+
+    /// `FUTEX_LOCK_PI`: take the lock at `addr` for `tid` -- at once when no one owns it, otherwise
+    /// marking it contended (`FUTEX_WAITERS`, so its owner's unlock comes here) and waiting until
+    /// it is released, the deadline, or the process ending. A lock taken while others still wait
+    /// keeps the mark. (Priorities are not boosted: every task runs at one priority here.)
+    pub fn lock_pi(&self, mem: &GuestMem, addr: u64, tid: u32, deadline: Option<Instant>) -> SysResult {
+        let key = key(addr)?;
+        let word = mem.atomic_u32(addr)?;
+        let mut st = self.state.lock();
+        let mut queued: Option<u64> = None;
+        loop {
+            if let Some(id) = queued {
+                if st.woken.remove(&id) {
+                    queued = None;
+                }
+            }
+            if st.interrupted {
+                if let Some(id) = queued {
+                    st.remove(id);
+                }
+                return Err(EINTR);
+            }
+            let v = word.load(std::sync::atomic::Ordering::SeqCst);
+            let owner = v & FUTEX_TID_MASK;
+            if owner == 0 {
+                if let Some(id) = queued.take() {
+                    st.remove(id);
+                }
+                let others = st.queues.get(&key).map_or(0, VecDeque::len);
+                let mine = tid | (v & FUTEX_OWNER_DIED) | if others > 0 { FUTEX_WAITERS } else { 0 };
+                if word.compare_exchange(v, mine, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_ok() {
+                    return Ok(0);
+                }
+                continue;
+            }
+            if owner == tid {
+                if let Some(id) = queued {
+                    st.remove(id);
+                }
+                return Err(EDEADLK);
+            }
+            if v & FUTEX_WAITERS == 0 && word.compare_exchange(v, v | FUTEX_WAITERS, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
+                continue;
+            }
+            let id = match queued {
+                Some(id) => id,
+                None => {
+                    st.next_id += 1;
+                    let id = st.next_id;
+                    st.queues.entry(key).or_default().push_back(Waiter { id, bitset: u32::MAX });
+                    queued = Some(id);
+                    id
+                }
+            };
+            match deadline {
+                Some(d) => {
+                    if self.cv.wait_until(&mut st, d).timed_out() && !st.woken.remove(&id) {
+                        st.remove(id);
+                        return Err(ETIMEDOUT);
+                    }
+                }
+                None => self.cv.wait(&mut st),
+            }
+        }
+    }
+
+    /// `FUTEX_TRYLOCK_PI`: take the lock only if no one owns it.
+    pub fn trylock_pi(&self, mem: &GuestMem, addr: u64, tid: u32) -> SysResult {
+        key(addr)?;
+        let word = mem.atomic_u32(addr)?;
+        let _st = self.state.lock();
+        let v = word.load(std::sync::atomic::Ordering::SeqCst);
+        match v & FUTEX_TID_MASK {
+            0 => {
+                let mine = tid | (v & (FUTEX_OWNER_DIED | FUTEX_WAITERS));
+                word.compare_exchange(v, mine, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).map(|_| 0).map_err(|_| EAGAIN)
+            }
+            owner if owner == tid => Err(EDEADLK),
+            _ => Err(EAGAIN),
+        }
+    }
+
+    /// `FUTEX_UNLOCK_PI`: release the lock `tid` owns, and wake those waiting to take it.
+    pub fn unlock_pi(&self, mem: &GuestMem, addr: u64, tid: u32) -> SysResult {
+        let key = key(addr)?;
+        let word = mem.atomic_u32(addr)?;
+        let mut st = self.state.lock();
+        if word.load(std::sync::atomic::Ordering::SeqCst) & FUTEX_TID_MASK != tid {
+            return Err(EPERM);
+        }
+        word.store(0, std::sync::atomic::Ordering::SeqCst);
+        let woken = st.wake(key, u64::MAX, u32::MAX);
+        drop(st);
+        if woken > 0 {
+            self.cv.notify_all();
+        }
+        Ok(0)
     }
 
     /// How many wait on `addr` now (tests and `/proc` diagnostics).
