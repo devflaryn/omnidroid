@@ -182,9 +182,13 @@ pub fn decrypted_image(repo_root: &Path) -> PathBuf {
     let at = repo_root.join("work").join("extracted").join("libzstd-jni-1.5.7-6.decrypted.so");
     assert!(
         at.is_file(),
-        "the decrypted image of the substituted `{LIBRARY}` is not at {}. It is the shipped file \
-         with `.text` decrypted in place, produced by emulating the two `.dyncall` constructors \
-         offline; copy it there from the analysis workspace that produced it.",
+        "this APK carries the MODIFIED build of `{LIBRARY}` (9.75 MB, `.text` encrypted), not the \
+         stock one (604 KB) -- its identity was matched by sha256. Running a modified build with a \
+         real account cookie hands the account to whoever repacked the APK, so this run stops here. \
+         Use the verified stock APK instead (Roblox 2.738.1397, sha256 \
+         bbe00ae306cc251c4ea55b7a932d9c524ecb0d6d9203c2a6161bcf0fae792742), whose stock library \
+         needs no staged image. (Only an authorized analysis workspace stages {} for offline study \
+         of the modified build.)",
         at.display()
     );
     let len = std::fs::metadata(&at).expect("the decrypted image's length").len();
