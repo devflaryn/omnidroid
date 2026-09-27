@@ -55,9 +55,18 @@ fn uid_of(user: &str) -> u32 {
     }
 }
 
+/// The boot phases init triggers unconditionally, in order: a `start` in their `on` blocks runs.
+const BOOT_PHASES: [&str; 11] =
+    ["early-init", "init", "late-init", "early-fs", "fs", "post-fs", "late-fs", "post-fs-data", "zygote-start", "early-boot", "boot"];
+
 /// Every `service` in the image's init scripts, by name.
 #[must_use]
 pub fn services(sysroot: &Sysroot) -> HashMap<String, Service> {
+    parse(sysroot).0
+}
+
+/// The services, and the `start`s of the boot-phase `on` blocks, in phase order.
+fn parse(sysroot: &Sysroot) -> (HashMap<String, Service>, Vec<String>) {
     let mut scripts: Vec<Vec<u8>> = vec![b"/system/etc/init/hw/init.rc".to_vec()];
     let mut dirs: Vec<Vec<u8>> =
         vec![b"/system/etc/init".to_vec(), b"/system_ext/etc/init".to_vec(), b"/product/etc/init".to_vec(), b"/vendor/etc/init".to_vec(), b"/odm/etc/init".to_vec()];
@@ -78,9 +87,12 @@ pub fn services(sysroot: &Sysroot) -> HashMap<String, Service> {
         }
     }
     let mut out = HashMap::new();
+    let mut starts: Vec<(usize, String)> = Vec::new();
     for script in scripts {
         let Some(text) = sysroot.read(&script) else { continue };
         let mut current: Option<Service> = None;
+        // The boot phase of the `on` block being read, when it is one with no other condition.
+        let mut phase: Option<usize> = None;
         for line in String::from_utf8_lossy(&text).lines() {
             let line = line.trim();
             let words: Vec<&str> = line.split_whitespace().collect();
@@ -101,6 +113,12 @@ pub fn services(sysroot: &Sysroot) -> HashMap<String, Service> {
                     if let Some(s) = current.take() {
                         out.insert(s.name.clone(), s);
                     }
+                    phase = (words.first() == Some(&"on") && words.len() == 2).then(|| BOOT_PHASES.iter().position(|p| *p == words[1])).flatten();
+                }
+                Some("start") if current.is_none() && words.len() == 2 => {
+                    if let Some(ph) = phase {
+                        starts.push((ph, words[1].to_string()));
+                    }
                 }
                 Some(option) => {
                     let Some(s) = current.as_mut() else { continue };
@@ -120,7 +138,8 @@ pub fn services(sysroot: &Sysroot) -> HashMap<String, Service> {
             out.insert(s.name.clone(), s);
         }
     }
-    out
+    starts.sort_by_key(|(ph, _)| *ph);
+    (out, starts.into_iter().map(|(_, n)| n).collect())
 }
 
 /// init: the services, what runs, and how to start more.
@@ -129,6 +148,7 @@ pub struct Init {
     instance: PathBuf,
     envp: Vec<Vec<u8>>,
     services: HashMap<String, Service>,
+    boot_starts: Vec<String>,
     running: Mutex<HashMap<String, Weak<Process>>>,
     /// Services never started here, by program: what runs only in a zygote-forked process.
     skip: fn(&Service) -> bool,
@@ -145,12 +165,13 @@ impl Init {
     /// Read the services and become this host process's init.
     pub fn start(sysroot: PathBuf, instance: PathBuf, envp: Vec<Vec<u8>>) -> Result<Arc<Self>, String> {
         let root = Sysroot::open(&sysroot)?;
-        let services = services(&root);
+        let (services, boot_starts) = parse(&root);
         let init = Arc::new(Self {
             sysroot,
             instance,
             envp,
             services,
+            boot_starts,
             running: Mutex::default(),
             // The zygote (app_process): apps are started without it (the C design, decision 4).
             skip: |s| s.argv.first().is_some_and(|p| p.contains("app_process")),
@@ -163,6 +184,13 @@ impl Init {
     #[must_use]
     pub fn services(&self) -> &HashMap<String, Service> {
         &self.services
+    }
+
+    /// Boot: the `start`s of the boot phases, then `class_start` of `classes`. What started.
+    pub fn boot(&self, classes: &[&str]) -> Vec<String> {
+        let mut started: Vec<String> = self.boot_starts.iter().filter(|n| self.start_service(n)).cloned().collect();
+        started.extend(self.class_start(classes));
+        started
     }
 
     /// `class_start <class>` for each class: every service in it that is not `disabled`.

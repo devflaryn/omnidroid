@@ -79,7 +79,7 @@ fn main() -> ExitCode {
         match omni_linux::init::Init::start(sysroot.clone(), instance.clone(), envp.clone()) {
             Ok(init) => {
                 let classes: Vec<&str> = init_classes.iter().map(String::as_str).collect();
-                let started = init.class_start(&classes);
+                let started = init.boot(&classes);
                 eprintln!("[init] started {} services: {}", started.len(), started.join(" "));
             }
             Err(e) => eprintln!("[init] {e}"),
