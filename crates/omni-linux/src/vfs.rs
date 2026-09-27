@@ -285,6 +285,12 @@ pub fn ino_of(path: &[u8]) -> u64 {
 #[derive(Default)]
 pub struct Binds {
     binds: parking_lot::RwLock<Vec<(Vec<u8>, PathBuf)>>,
+    /// Where the table is kept (`<instance>/.omni-binds`), so every host process of the instance
+    /// has the same mounts -- as a kernel's are the whole system's (vold binds /data/data onto
+    /// /data/user/0 in the system's host process; an app, in its own, finds its data there).
+    file: Option<PathBuf>,
+    /// The file's modification time when last read, and when that was checked.
+    seen: parking_lot::Mutex<(Option<std::time::SystemTime>, Option<std::time::Instant>)>,
 }
 
 impl Binds {
@@ -293,32 +299,86 @@ impl Binds {
     pub fn of(instance: &Path) -> Arc<Self> {
         static TABLES: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<PathBuf, Arc<Binds>>>> = std::sync::OnceLock::new();
         let mut tables = TABLES.get_or_init(Default::default).lock();
-        Arc::clone(tables.entry(instance.to_path_buf()).or_default())
+        Arc::clone(tables.entry(instance.to_path_buf()).or_insert_with(|| {
+            let binds = Binds { file: Some(instance.join(".omni-binds")), ..Binds::default() };
+            binds.reload(true);
+            Arc::new(binds)
+        }))
+    }
+
+    /// Read the table again if another host process changed it (checked at most once a second,
+    /// or now when `force`).
+    fn reload(&self, force: bool) {
+        let Some(file) = &self.file else { return };
+        let mut seen = self.seen.lock();
+        let now = std::time::Instant::now();
+        if !force && seen.1.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        seen.1 = Some(now);
+        let modified = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+        if modified == seen.0 {
+            return;
+        }
+        seen.0 = modified;
+        let text = std::fs::read(file).unwrap_or_default();
+        let table = text
+            .split(|b| *b == b'\n')
+            .filter_map(|line| {
+                let tab = line.iter().position(|b| *b == b'\t')?;
+                Some((line[..tab].to_vec(), PathBuf::from(String::from_utf8_lossy(&line[tab + 1..]).into_owned())))
+            })
+            .collect();
+        *self.binds.write() = table;
+    }
+
+    /// Write the table for the instance's other host processes.
+    fn save(&self, binds: &[(Vec<u8>, PathBuf)]) {
+        let Some(file) = &self.file else { return };
+        let mut text = Vec::new();
+        for (target, host) in binds {
+            text.extend_from_slice(target);
+            text.push(b'\t');
+            text.extend_from_slice(host.to_string_lossy().as_bytes());
+            text.push(b'\n');
+        }
+        let _ = std::fs::write(file, text);
+        let mut seen = self.seen.lock();
+        seen.0 = std::fs::metadata(file).and_then(|m| m.modified()).ok();
     }
 
     /// Mount `host` (a host directory or file) at the guest path `target`, over what was there.
     pub fn bind(&self, target: Vec<u8>, host: PathBuf) {
+        self.reload(true);
         let mut binds = self.binds.write();
         binds.retain(|(t, _)| *t != target);
         binds.push((target, host));
+        self.save(&binds);
     }
 
     /// Unmount what is mounted at `target`. Whether something was.
     pub fn unbind(&self, target: &[u8]) -> bool {
+        self.reload(true);
         let mut binds = self.binds.write();
         let before = binds.len();
         binds.retain(|(t, _)| t.as_slice() != target);
-        binds.len() != before
+        let removed = binds.len() != before;
+        if removed {
+            self.save(&binds);
+        }
+        removed
     }
 
     /// The mounts, oldest first.
     #[must_use]
     pub fn list(&self) -> Vec<(Vec<u8>, PathBuf)> {
+        self.reload(false);
         self.binds.read().clone()
     }
 
     /// The deepest bind mount at or above `path`: its target and host.
     fn covering(&self, path: &[u8]) -> Option<(Vec<u8>, PathBuf)> {
+        self.reload(false);
         self.binds
             .read()
             .iter()
