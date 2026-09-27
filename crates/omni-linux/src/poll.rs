@@ -40,12 +40,12 @@ pub fn notify() {
 
 /// Wait for a change, until `deadline` at the latest; `EINTR` if the task has a deliverable
 /// signal. A waiter re-checks what it waits for afterwards: this can wake early.
-fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task) -> Result<(), Errno> {
+pub(crate) fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task) -> Result<(), Errno> {
     let mut generation = CHANGED.generation.lock();
     if *generation != seen {
         return Ok(());
     }
-    if task.pending.load(Ordering::SeqCst) & !task.sigmask != 0 {
+    if task.pending.load(Ordering::SeqCst) & !task.sigmask != 0 || task.process.futexes.interrupted() {
         return Err(EINTR);
     }
     // In slices, so a posted signal is seen without a notification of its own.
@@ -55,7 +55,7 @@ fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task) -> Result<
     Ok(())
 }
 
-fn generation() -> u64 {
+pub(crate) fn generation() -> u64 {
     *CHANGED.generation.lock()
 }
 
@@ -265,6 +265,7 @@ fn readiness(file: &OpenFile, now: Instant) -> (u32, Option<Instant>) {
         FileKind::Pipe(end) => (crate::pipe::readiness(end), None),
         FileKind::Epoll(ep) => (if ep.any_ready(now) { IN } else { 0 }, None),
         FileKind::Socket(_) => (OUT, None),
+        FileKind::Binder(b) => (b.readiness(), None),
         _ => (IN | OUT, None),
     }
 }

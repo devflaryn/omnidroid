@@ -216,6 +216,41 @@ fn loadavg(p: &Process) -> Vec<u8> {
     format!("0.00 0.00 0.00 1/1 {}\n", p.sys.pid).into_bytes()
 }
 
+fn filesystems(_p: &Process) -> Vec<u8> {
+    b"nodev\tsysfs\nnodev\tproc\nnodev\ttmpfs\nnodev\tselinuxfs\nnodev\tbinder\n\text4\n".to_vec()
+}
+
+/// `struct selinux_status_t`: version 1, sequence 0, permissive, no policy loads, allow unknown.
+fn selinux_status(_p: &Process) -> Vec<u8> {
+    let mut b = vec![0u8; 4096];
+    b[0..4].copy_from_slice(&1u32.to_le_bytes());
+    b
+}
+
+fn zero(_p: &Process) -> Vec<u8> {
+    b"0".to_vec()
+}
+
+fn one(_p: &Process) -> Vec<u8> {
+    b"1".to_vec()
+}
+
+fn policyvers(_p: &Process) -> Vec<u8> {
+    b"33".to_vec()
+}
+
+/// The process's SELinux context: its domain as a device's policy names it, by program.
+fn selinux_context(p: &Process) -> Vec<u8> {
+    let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
+    let domain = match comm.as_str() {
+        "servicemanager" => "servicemanager",
+        "system_server" => "system_server",
+        "surfaceflinger" => "surfaceflinger",
+        _ => "untrusted_app",
+    };
+    format!("u:r:{domain}:s0\0").into_bytes()
+}
+
 fn version(_p: &Process) -> Vec<u8> {
     b"Linux version 6.1.0-omnidroid (omnidroid) #1 SMP PREEMPT\n".to_vec()
 }
@@ -269,7 +304,29 @@ impl Process {
             "/proc/loadavg" => return Some(Entry::File(loadavg)),
             "/proc/version" => return Some(Entry::File(version)),
             "/proc/mounts" => return Some(Entry::File(mounts)),
-            "/sys" => return Some(Entry::Dir(vec![("devices", DT_DIR)])),
+            "/proc/filesystems" => return Some(Entry::File(filesystems)),
+            "/sys" => return Some(Entry::Dir(vec![("devices", DT_DIR), ("fs", DT_DIR)])),
+            "/sys/fs" => return Some(Entry::Dir(vec![("selinux", DT_DIR)])),
+            // selinuxfs, permissive: libselinux finds SELinux present (servicemanager insists on
+            // it), every check is allowed -- enforce 0, and deny_unknown 0 for the classes this
+            // policy-less filesystem does not list.
+            "/sys/fs/selinux" => {
+                return Some(Entry::Dir(vec![
+                    ("status", DT_REG),
+                    ("enforce", DT_REG),
+                    ("deny_unknown", DT_REG),
+                    ("reject_unknown", DT_REG),
+                    ("policyvers", DT_REG),
+                    ("mls", DT_REG),
+                    ("checkreqprot", DT_REG),
+                ]))
+            }
+            "/sys/fs/selinux/status" => return Some(Entry::File(selinux_status)),
+            "/sys/fs/selinux/enforce" | "/sys/fs/selinux/deny_unknown" | "/sys/fs/selinux/reject_unknown" | "/sys/fs/selinux/checkreqprot" => {
+                return Some(Entry::File(zero))
+            }
+            "/sys/fs/selinux/mls" => return Some(Entry::File(one)),
+            "/sys/fs/selinux/policyvers" => return Some(Entry::File(policyvers)),
             "/sys/devices" => return Some(Entry::Dir(vec![("system", DT_DIR)])),
             "/sys/devices/system" => return Some(Entry::Dir(vec![("cpu", DT_DIR)])),
             "/sys/devices/system/cpu" => {
@@ -300,8 +357,8 @@ impl Process {
                 return None;
             }
             return match inner {
-                "" => Some(Entry::Dir(vec![("stat", DT_REG), ("status", DT_REG), ("comm", DT_REG)])),
-                "stat" | "status" | "comm" => self.per_process(inner),
+                "" => Some(Entry::Dir(vec![("stat", DT_REG), ("status", DT_REG), ("comm", DT_REG), ("attr", DT_DIR)])),
+                "stat" | "status" | "comm" | "attr" | "attr/current" => self.per_process(inner),
                 _ => None,
             };
         }
@@ -324,7 +381,10 @@ impl Process {
                 ("task", DT_DIR),
                 ("limits", DT_REG),
                 ("mounts", DT_REG),
+                ("attr", DT_DIR),
             ]),
+            "attr" => Entry::Dir(vec![("current", DT_REG)]),
+            "attr/current" => Entry::File(selinux_context),
             "maps" => Entry::File(maps),
             "stat" => Entry::File(stat),
             "status" => Entry::File(status),

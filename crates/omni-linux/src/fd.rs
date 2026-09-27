@@ -47,6 +47,7 @@ pub enum FileKind {
     EventFd(Arc<crate::poll::EventFd>),
     TimerFd(Arc<crate::poll::TimerFd>),
     Epoll(Arc<crate::poll::Epoll>),
+    Binder(Arc<crate::binder::BinderFile>),
 }
 
 impl FileKind {
@@ -158,6 +159,7 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
                 .map_err(|_| EACCES)?;
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
+        Node::Dev(DevNode::Binder) => FileKind::Binder(crate::binder::BinderFile::open()),
         Node::Dev(d) => FileKind::Dev(d),
         Node::Generated | Node::Blob { .. } => {
             if write {
@@ -222,7 +224,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
-        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109 }, ..s(S_IFCHR | 0o666, 0) },
+        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::Kmsg => 0x10b }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
 }
@@ -252,6 +254,7 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Pipe(_) => Ok(Stat { ino: 3, mode: 0o010000 | 0o600, nlink: 1, ..Stat::default() }),
         // anon_inode descriptors: a 0600 inode, as the kernel reports them.
         FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Ok(Stat { ino: 4, mode: 0o600, nlink: 1, ..Stat::default() }),
+        FileKind::Binder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
     }
 }
 
@@ -278,10 +281,11 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         }
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Stdout(_) | FileKind::Stderr(_) => Err(EBADF),
-        // Nothing ever arrives: logd does not answer, and no other socket has a peer.
-        FileKind::Socket(_) => Err(EAGAIN),
+        FileKind::Socket(s) => crate::socket::receive(s, buf),
         // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
+        FileKind::Dev(DevNode::Binder) | FileKind::Binder(_) => Err(EINVAL),
+        FileKind::Dev(DevNode::Kmsg) => Err(EAGAIN),
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
             let n = buf.len().min(data.len() - from);
@@ -320,11 +324,17 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Stderr(out) => sink(out, &mut std::io::stderr()),
         FileKind::Host { file, sysroot: false, .. } => file.write(bytes).map_err(|_| EIO),
         FileKind::Host { .. } | FileKind::Stdin => Err(EBADF),
+        FileKind::Dev(DevNode::Kmsg) => {
+            // One record per write, "<level>tag: message", shown as the kernel log would be.
+            eprintln!("K/{}", String::from_utf8_lossy(bytes).trim_end());
+            Ok(bytes.len())
+        }
         FileKind::Dev(_) => Ok(bytes.len()),
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Synth { .. } => Err(EACCES),
         FileKind::Socket(s) => crate::socket::send(s, bytes),
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
+        FileKind::Binder(_) => Err(EINVAL),
     }
 }
 
@@ -522,6 +532,8 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::EventFd(_) => b"anon_inode:[eventfd]".to_vec(),
         FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
         FileKind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
+        FileKind::Dev(DevNode::Binder) | FileKind::Binder(_) => b"/dev/binder".to_vec(),
+        FileKind::Dev(DevNode::Kmsg) => b"/dev/kmsg".to_vec(),
     }
 }
 
@@ -555,7 +567,14 @@ fn sys_faccessat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
-    p.fds.get(fd_arg(a[0]))?;
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let binder = match &*file.kind.lock() {
+        FileKind::Binder(b) => Some(Arc::clone(b)),
+        _ => None,
+    };
+    if let Some(b) = binder {
+        return crate::binder::ioctl(p, t, &b, a[1], a[2]);
+    }
     match a[1] {
         // TCGETS, TIOCGWINSZ, TIOCGPGRP: nothing here is a terminal.
         0x5401 | 0x5413 | 0x540F => Err(ENOTTY),
@@ -779,11 +798,26 @@ fn sys_fchownat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     }
 }
 
-/// arm64 `struct statfs` (120 bytes) for an ext4 filesystem: every mount here answers as one.
-fn statfs_bytes() -> [u8; 120] {
+/// The filesystem magic a path is on: selinuxfs, sysfs and proc where the kernel mounts them,
+/// ext4 everywhere else. libselinux knows SELinux is there by selinuxfs's magic.
+fn fs_magic(path: &[u8]) -> u64 {
+    let under = |root: &[u8]| path == root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/'));
+    if under(b"/sys/fs/selinux") {
+        0xf97c_ff8c // SELINUX_MAGIC
+    } else if under(b"/sys") {
+        0x6265_6572 // SYSFS_MAGIC
+    } else if under(b"/proc") {
+        0x9fa0 // PROC_SUPER_MAGIC
+    } else {
+        0xEF53 // EXT4_SUPER_MAGIC
+    }
+}
+
+/// arm64 `struct statfs` (120 bytes).
+fn statfs_bytes(magic: u64) -> [u8; 120] {
     let mut b = [0u8; 120];
     let words: [(usize, u64); 8] = [
-        (0, 0xEF53),      // f_type: EXT4_SUPER_MAGIC
+        (0, magic),       // f_type
         (8, 4096),        // f_bsize
         (16, 1 << 20),    // f_blocks
         (24, 1 << 19),    // f_bfree
@@ -801,16 +835,17 @@ fn statfs_bytes() -> [u8; 120] {
 
 fn sys_statfs(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[0])?;
-    if matches!(p.vfs.resolve(&p.cwd.lock(), &path, true)?.node, Node::Missing { .. }) {
+    let r = p.vfs.resolve(&p.cwd.lock(), &path, true)?;
+    if matches!(r.node, Node::Missing { .. }) {
         return Err(ENOENT);
     }
-    p.mem.write(a[1], &statfs_bytes())?;
+    p.mem.write(a[1], &statfs_bytes(fs_magic(&r.path)))?;
     Ok(0)
 }
 
 fn sys_fstatfs(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    p.fds.get(fd_arg(a[0]))?;
-    p.mem.write(a[1], &statfs_bytes())?;
+    let file = p.fds.get(fd_arg(a[0]))?;
+    p.mem.write(a[1], &statfs_bytes(fs_magic(&guest_path_of(&file))))?;
     Ok(0)
 }
 

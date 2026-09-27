@@ -29,7 +29,9 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 3] = ["/system/build.prop", "/system_ext/etc/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 10] = [
+const OVERLAY: [(&str, &str); 11] = [
+    // The property service speaks protocol 2 (a reply for every set).
+    ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
     // dalvik.vm.extra-opts: CMC, the collector the boot image is compiled for, in its
     // userfaultfd-less fallback mode; no JIT until its code cache (memfd, a writable and an
@@ -281,7 +283,7 @@ impl Area {
         }
     }
 
-    fn add(&mut self, name: &str, value: &str) {
+    fn add(&mut self, name: &str, value: &str) -> usize {
         let mut current = 0usize;
         for part in name.split('.') {
             current = self.child(current, part.as_bytes());
@@ -302,16 +304,124 @@ impl Area {
             self.set_u32(info + 4 + 56, (long - info) as u32);
         }
         self.set_u32(current + 4, info as u32); // prop
+        info
     }
 
     fn finish(self) -> Vec<u8> {
+        self.bytes(0, 0)
+    }
+
+    /// The area as mapped: the header (`bytes_used`, `serial`, magic, version), the data, and
+    /// zeros up to `capacity` (at least a whole number of 128 KiB).
+    fn bytes(&self, serial: u32, capacity: usize) -> Vec<u8> {
         let mut out = vec![0u8; HEADER];
         out[0..4].copy_from_slice(&(self.data.len() as u32).to_le_bytes()); // bytes_used
+        out[4..8].copy_from_slice(&serial.to_le_bytes());
         out[8..12].copy_from_slice(&PROP_AREA_MAGIC.to_le_bytes());
         out[12..16].copy_from_slice(&PROP_AREA_VERSION.to_le_bytes());
         out.extend_from_slice(&self.data);
         let size = out.len().div_ceil(AREA_UNIT).max(1) * AREA_UNIT;
-        out.resize(size, 0);
+        out.resize(size.max(capacity), 0);
         out
+    }
+}
+
+/// The property service: init's, for every process of an instance. The prop area only grows,
+/// as bionic's does -- readers keep pointers into it -- and every change is written into every
+/// process's mapping of it, so a `setprop` in one process is what `getprop` reads in another.
+pub struct PropertyService {
+    live: parking_lot::Mutex<Live>,
+}
+
+struct Live {
+    area: Area,
+    /// name -> offset of its `prop_info` in the area's data.
+    info: HashMap<String, usize>,
+    serial: u32,
+    capacity: usize,
+    mappings: Vec<(std::sync::Weak<crate::process::Process>, u64, bool)>,
+}
+
+/// `PROP_ERROR_*` answers of `setprop`.
+pub const PROP_SUCCESS: u32 = 0;
+pub const PROP_ERROR_READ_ONLY_PROPERTY: u32 = 0x0b;
+pub const PROP_ERROR_INVALID_NAME: u32 = 0x10;
+pub const PROP_ERROR_INVALID_VALUE: u32 = 0x14;
+
+impl PropertyService {
+    /// The service of this host process, started from the first process's sysroot.
+    pub fn global(sysroot: &Sysroot) -> std::sync::Arc<Self> {
+        static SERVICE: std::sync::OnceLock<std::sync::Arc<PropertyService>> = std::sync::OnceLock::new();
+        std::sync::Arc::clone(SERVICE.get_or_init(|| {
+            let (props, _) = Properties::from_sysroot(sysroot);
+            let mut area = Area::new();
+            let mut info = HashMap::new();
+            for (k, v) in &props.entries {
+                info.insert(k.clone(), area.add(k, v));
+            }
+            // Room to grow: what the build set, and a megabyte more for what the system sets.
+            let capacity = (HEADER + area.data.len() + (1 << 20)).div_ceil(AREA_UNIT) * AREA_UNIT;
+            std::sync::Arc::new(Self { live: parking_lot::Mutex::new(Live { area, info, serial: 0, capacity, mappings: Vec::new() }) })
+        }))
+    }
+
+    /// The prop area as it is now, at its full mapped size.
+    #[must_use]
+    pub fn area_bytes(&self) -> Vec<u8> {
+        let live = self.live.lock();
+        live.area.bytes(live.serial, live.capacity)
+    }
+
+    /// A process mapped the prop area (`serial` false) or `properties_serial` (`serial` true)
+    /// at `at`: changes are written there from now on.
+    pub fn watch(&self, process: std::sync::Weak<crate::process::Process>, at: u64, serial: bool) {
+        self.live.lock().mappings.push((process, at, serial));
+    }
+
+    /// `setprop`: a new property is added, an existing one changed; `ro.*` is set once.
+    pub fn set(&self, name: &str, value: &str) -> u32 {
+        if name.is_empty() || name.len() >= 256 || name.contains(char::is_whitespace) {
+            return PROP_ERROR_INVALID_NAME;
+        }
+        if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
+            return PROP_ERROR_INVALID_VALUE;
+        }
+        let mut live = self.live.lock();
+        let changed_info = match live.info.get(name).copied() {
+            Some(_) if name.starts_with("ro.") => return PROP_ERROR_READ_ONLY_PROPERTY,
+            Some(at) => {
+                let old = live.area.u32_at(at);
+                let serial = ((value.len() as u32) << 24) | (old.wrapping_add(2) & 0x00ff_fffe);
+                live.area.data[at + 4..at + 4 + PROP_VALUE_MAX].fill(0);
+                live.area.data[at + 4..at + 4 + value.len()].copy_from_slice(value.as_bytes());
+                live.area.set_u32(at, serial);
+                at
+            }
+            None => {
+                if HEADER + live.area.data.len() + 512 + value.len() > live.capacity {
+                    return PROP_ERROR_INVALID_VALUE; // the area is full
+                }
+                let at = live.area.add(name, value);
+                live.info.insert(name.to_string(), at);
+                at
+            }
+        };
+        live.serial = live.serial.wrapping_add(1);
+        let area = live.area.bytes(live.serial, live.capacity);
+        let serial_area = Area::new().bytes(live.serial, 0);
+        live.mappings.retain(|(p, _, _)| p.strong_count() > 0);
+        let targets: Vec<_> = live.mappings.iter().filter_map(|(p, at, s)| p.upgrade().map(|p| (p, *at, *s))).collect();
+        drop(live);
+        for (p, at, serial) in targets {
+            let bytes = if serial { &serial_area[..HEADER] } else { &area[..] };
+            if p.mm.kernel_write(&p.mem, at, bytes).is_ok() {
+                // Wake whoever waits on the area's serial or on this property's.
+                let _ = p.futexes.wake(at + 4, i32::MAX as u64, u32::MAX);
+                if !serial {
+                    let _ = p.futexes.wake(at + (HEADER + changed_info) as u64, i32::MAX as u64, u32::MAX);
+                }
+            }
+        }
+        PROP_SUCCESS
     }
 }

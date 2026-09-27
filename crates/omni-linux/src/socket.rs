@@ -24,12 +24,37 @@ const SOCK_CLOEXEC: u64 = 0o2000000;
 pub enum Peer {
     /// `logd`: packets are printed to this output.
     Logd(Output),
+    /// init's property service: `setprop` requests, answered one `u32` each.
+    PropertyService { pending: Vec<u8>, service: std::sync::Arc<crate::props::PropertyService> },
 }
 
 pub struct Socket {
     pub domain: u64,
     pub ty: u64,
     pub peer: Option<Peer>,
+    /// What the peer sent back, not yet read.
+    pub inbox: std::collections::VecDeque<u8>,
+}
+
+/// The property service's protocol 2: `PROP_MSG_SETPROP2`, then the name and the value, each
+/// a `u32` length and its bytes. Complete requests are applied and answered.
+fn property_requests(pending: &mut Vec<u8>, service: &crate::props::PropertyService, inbox: &mut std::collections::VecDeque<u8>) {
+    const PROP_MSG_SETPROP2: u32 = 0x0002_0001;
+    loop {
+        let word = |b: &[u8], at: usize| b.get(at..at + 4).map(|w| u32::from_le_bytes(w.try_into().expect("4")) as usize);
+        let Some(cmd) = word(pending, 0) else { return };
+        let Some(name_len) = word(pending, 4) else { return };
+        let Some(value_len) = word(pending, 8 + name_len) else { return };
+        let total = 12 + name_len + value_len;
+        if pending.len() < total {
+            return;
+        }
+        let name = String::from_utf8_lossy(&pending[8..8 + name_len]).into_owned();
+        let value = String::from_utf8_lossy(&pending[12 + name_len..total]).into_owned();
+        pending.drain(..total);
+        let result = if cmd as u32 == PROP_MSG_SETPROP2 { service.set(&name, &value) } else { 0xfe };
+        inbox.extend(result.to_le_bytes());
+    }
 }
 
 /// One `logd` packet, as liblog's `logd_writer` sends it: a header `{ log_id u8, tid u16, sec
@@ -70,7 +95,14 @@ pub fn format_log(packet: &[u8]) -> Option<String> {
 
 /// Deliver `bytes` to a connected socket's peer.
 pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
-    match &socket.peer {
+    let Socket { peer, inbox, .. } = socket;
+    match peer {
+        Some(Peer::PropertyService { pending, service }) => {
+            pending.extend_from_slice(bytes);
+            let service = std::sync::Arc::clone(service);
+            property_requests(pending, &service, inbox);
+            Ok(bytes.len())
+        }
         Some(Peer::Logd(out)) => {
             if let Some(text) = format_log(bytes) {
                 match out {
@@ -89,7 +121,7 @@ fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK) {
         return Err(EAFNOSUPPORT);
     }
-    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None };
+    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new() };
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
     Ok(p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)? as u64)
@@ -124,6 +156,11 @@ fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = unix_path(p, a[1], a[2])?;
     if path == b"/dev/socket/logdw" {
         socket.peer = Some(Peer::Logd(stderr));
+        return Ok(0);
+    }
+    if path == b"/dev/socket/property_service" {
+        let service = crate::props::PropertyService::global(p.vfs.sysroot());
+        socket.peer = Some(Peer::PropertyService { pending: Vec::new(), service });
         return Ok(0);
     }
     if p.trace {
@@ -169,7 +206,32 @@ fn sys_shutdown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     sys_setsockopt(p, _t, a)
 }
 
+/// Take what the peer sent back: all of it that fits, or `EAGAIN` when nothing is there.
+pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
+    if socket.inbox.is_empty() {
+        return Err(crate::errno::EAGAIN);
+    }
+    let n = buf.len().min(socket.inbox.len());
+    for (slot, b) in buf.iter_mut().zip(socket.inbox.drain(..n)) {
+        *slot = b;
+    }
+    Ok(n)
+}
+
+fn sys_recvfrom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let mut buf = vec![0u8; (a[2] as usize).min(1 << 20)];
+    let n = {
+        let mut kind = file.kind.lock();
+        let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
+        receive(socket, &mut buf)?
+    };
+    p.mem.write(a[1], &buf[..n])?;
+    Ok(n as u64)
+}
+
 pub fn install(table: &mut Table) {
+    table.set(nr::RECVFROM, sys_recvfrom);
     table.set(nr::SOCKET, sys_socket);
     table.set(nr::CONNECT, sys_connect);
     table.set(nr::SENDTO, sys_sendto);

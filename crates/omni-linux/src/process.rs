@@ -69,6 +69,8 @@ pub struct Process {
     pub sigtramp: std::sync::atomic::AtomicU64,
     /// `/dev/__properties__`: property_info, properties_serial and the one context's area (A3).
     pub props: crate::procfs::PropFiles,
+    /// This process, for what must reach it later from outside (the property service).
+    pub(crate) me: std::sync::OnceLock<std::sync::Weak<Process>>,
     backend: Option<DynarmicBackend>,
     pub(crate) start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
@@ -200,14 +202,15 @@ impl Process {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<DynarmicBackend>, scratch: u64) -> Arc<Self> {
+    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<DynarmicBackend>, scratch: u64, uid: u32) -> Arc<Self> {
         let mut table = Table::new();
         crate::install_all(&mut table);
-        let (properties, dropped) = crate::props::Properties::from_sysroot(vfs.sysroot());
+        let (_, dropped) = crate::props::Properties::from_sysroot(vfs.sysroot());
         let props = crate::procfs::PropFiles {
             info: crate::props::property_info_bytes(),
             serial: crate::props::serial_area_bytes(),
-            area: properties.area_bytes(),
+            // The live area of the instance's property service: what every process reads.
+            area: crate::props::PropertyService::global(vfs.sysroot()).area_bytes(),
             apex_info: crate::apex::apex_info_list(vfs.sysroot()),
         };
         let comm = argv.first().map_or_else(Vec::new, |a| {
@@ -222,7 +225,7 @@ impl Process {
             fds: FdTable::standard(stdout, stderr),
             cwd: Mutex::new(b"/".to_vec()),
             mm: Mm::new(space, layout),
-            sys: SysState::new(PID, UID),
+            sys: SysState::new(PID, uid),
             futexes: crate::futex::Futexes::default(),
             tasks: Mutex::new(std::collections::HashMap::new()),
             task_ended: parking_lot::Condvar::new(),
@@ -232,12 +235,14 @@ impl Process {
             argv,
             comm: Mutex::new(comm),
             props,
+            me: std::sync::OnceLock::new(),
             sigtramp: std::sync::atomic::AtomicU64::new(0),
             backend,
             start: Mutex::new(None),
             exit: Mutex::new(None),
             scratch,
         });
+        let _ = p.me.set(Arc::downgrade(&p));
         // `/proc` and `/sys` are generated from the process itself (`procfs`).
         let proc: Arc<dyn crate::procfs::ProcFs> = Arc::clone(&p) as Arc<dyn crate::procfs::ProcFs>;
         p.vfs.attach_proc(Arc::downgrade(&proc));
@@ -247,7 +252,13 @@ impl Process {
         p
     }
 
+    /// The program as an app runs (`AID_APP_START`, 10000).
     pub fn spawn(config: SpawnConfig) -> Result<Arc<Self>, String> {
+        Self::spawn_as(config, UID)
+    }
+
+    /// The program as user `uid`, as init starts a daemon (`user system` is 1000).
+    pub fn spawn_as(config: SpawnConfig, uid: u32) -> Result<Arc<Self>, String> {
         let sysroot = Sysroot::open(&config.sysroot)?;
         let exe = config.argv.first().ok_or("no program: argv is empty")?.clone();
         // The instance's writable state: what a device keeps on its data partition and tmpfs, and
@@ -270,7 +281,7 @@ impl Process {
             options.optimizations_override = Some(mask);
         }
         let backend = DynarmicBackend::new(Arc::clone(&space), options).map_err(|e| format!("the CPU backend: {e}"))?;
-        let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(backend), 0);
+        let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(backend), 0, uid);
         let mut loader = Task::new(PID, Arc::clone(&p));
         let name = |e| format!("{}: {e:?}", String::from_utf8_lossy(&exe));
         let program = exec::load_elf(&p, &loader, &exe).map_err(name)?;
@@ -381,6 +392,11 @@ impl Process {
         tasks.remove(&task.tid);
         self.task_ended.notify_all();
         status
+    }
+
+    /// End the process from outside, as `kill` does: every task halts and `run` returns `status`.
+    pub fn end(&self, status: ExitStatus) {
+        self.end_group(status);
     }
 
     /// End the whole process with `status` (the first ending wins).
@@ -710,7 +726,7 @@ impl Process {
             .map_anonymous(omni_mem::Placement::Anywhere { align: space.page_size() }, 1 << 20, omni_mem::Protection::ReadWrite, omni_mem::CommitPolicy::Lazy)
             .expect("scratch") as u64;
         let argv = vec![vfs.exe().to_vec()];
-        Self::assemble(space, vfs, argv, stdout.clone(), stdout, false, None, scratch)
+        Self::assemble(space, vfs, argv, stdout.clone(), stdout, false, None, scratch, UID)
     }
 
     pub fn scratch(&self) -> u64 {

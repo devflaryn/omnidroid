@@ -264,6 +264,12 @@ impl Futexes {
     }
 
     /// End every wait, now and later, with `EINTR`: the process is exiting.
+    /// Whether the process is ending (`interrupt_all`): every wait answers `EINTR` from now on.
+    #[must_use]
+    pub fn interrupted(&self) -> bool {
+        self.state.lock().interrupted
+    }
+
     pub fn interrupt_all(&self) {
         self.state.lock().interrupted = true;
         self.cv.notify_all();

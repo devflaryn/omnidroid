@@ -5,6 +5,7 @@
 //! load whatever `.so` any code asks for. Every syscall answers as Linux would; one this layer does
 //! not implement answers `-ENOSYS` and is recorded by name ([`syscall::Refusals`]).
 pub mod apex;
+pub mod binder;
 pub mod errno;
 pub mod exec;
 pub mod fd;

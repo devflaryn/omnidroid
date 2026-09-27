@@ -85,7 +85,7 @@ pub fn readiness(end: &End) -> u32 {
 
 /// Wait for the pipe to change, up to a slice at a time, so a signal posted meanwhile is seen.
 fn wait(pipe: &Pipe, bytes: &mut parking_lot::MutexGuard<'_, VecDeque<u8>>, task: &Task) -> Result<(), Errno> {
-    if task.pending.load(Ordering::SeqCst) & !task.sigmask != 0 {
+    if task.pending.load(Ordering::SeqCst) & !task.sigmask != 0 || task.process.futexes.interrupted() {
         return Err(EINTR);
     }
     pipe.changed.wait_for(bytes, Duration::from_millis(50));

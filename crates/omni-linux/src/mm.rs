@@ -169,6 +169,18 @@ impl Mm {
         self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)
     }
 
+    /// Write into a mapping the guest may only read -- what the kernel does to memory it owns (the
+    /// property areas): made writable for the write, and given its protection back.
+    pub fn kernel_write(&self, mem: &crate::guest::GuestMem, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+        let _g = self.lock.write();
+        let len = self.span(addr, bytes.len() as u64).ok_or(EINVAL)?;
+        let prot = self.space.region_at(addr as usize).map(|r| r.protection).ok_or(EFAULT)?;
+        self.space.protect(addr as usize, len as usize, Protection::ReadWrite).map_err(|_| EFAULT)?;
+        let written = mem.write_holding_layout(addr, bytes);
+        self.space.protect(addr as usize, len as usize, prot).map_err(|_| EFAULT)?;
+        written
+    }
+
     /// `MADV_DONTNEED`: the range reads as zeros again.
     pub fn discard(&self, addr: u64, len: u64) -> Result<(), Errno> {
         let _g = self.lock.write();
@@ -247,6 +259,15 @@ impl Mm {
                 self.space.protect(at as usize, len as usize, prot).map_err(|_| ENOMEM)?;
             }
             self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
+            // The property areas: the property service writes every change into them.
+            if let Some(name) = guest.strip_prefix(b"/dev/__properties__/".as_slice()) {
+                if name != b"property_info" {
+                    if let Some(me) = p.me.get() {
+                        let service = crate::props::PropertyService::global(p.vfs.sysroot());
+                        service.watch(me.clone(), at, name == b"properties_serial");
+                    }
+                }
+            }
             return Ok(at);
         }
         let (guest, sysroot, file_len) = match &*file.kind.lock() {
@@ -307,6 +328,18 @@ impl Mm {
 }
 
 fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    // `/dev/binder`'s receive area is the driver's to fill.
+    if a[3] & u64::from(MAP_ANONYMOUS) == 0 {
+        if let Ok(file) = p.fds.get(a[4] as i64 as i32) {
+            let binder = match &*file.kind.lock() {
+                FileKind::Binder(b) => Some(std::sync::Arc::clone(b)),
+                _ => None,
+            };
+            if let Some(b) = binder {
+                return crate::binder::mmap(p, t, &b, a[1]);
+            }
+        }
+    }
     p.mm.map(p, t, MapRequest { addr: a[0], len: a[1], prot: a[2] as u32, flags: a[3] as u32, fd: a[4] as i64 as i32, offset: a[5] })
 }
 

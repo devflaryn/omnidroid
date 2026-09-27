@@ -61,7 +61,7 @@ fn a_socket_with_no_service_behind_it_is_refused_at_connect() {
     let (p, mut t, s, _) = process();
     let fd = p.syscall(&mut t, nr::SOCKET, [AF_UNIX, SOCK_STREAM, 0, 0, 0, 0]) as i64;
     assert!(fd >= 3);
-    let len = sockaddr_un(&p, s, "/dev/socket/property_service");
+    let len = sockaddr_un(&p, s, "/dev/socket/statsdw");
     assert_eq!(p.syscall(&mut t, nr::CONNECT, [fd as u64, s, len, 0, 0, 0]) as i64, ENOENT);
     assert_eq!(p.syscall(&mut t, nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]), 0);
 }
