@@ -141,6 +141,12 @@ Windows and Linux (see STATUS).
   pids allocated onward (mksh pipelines and `$(...)`). A killed process no longer waits for
   threads a halt cannot reach (5 s). Gates: `tests/c4_system_server.rs`,
   `tests/c5_app_launch.rs` (`--ignored`, minutes; `tests/common/boot.rs`).
+- **Run the boot in release** (`cargo test --release ... -- --ignored`, or a release
+  `omni-linux-run`): the debug build's syscall/binder/memory paths made system_server ~5x slower
+  (PackageManagerService 61 s debug, 12.7 s release; system_server start to "System now ready"
+  41 s release), and its watchdog (60 s on the main thread) killed it after systemReady in debug.
+  JIT on (`dalvik.vm.usejit=true`) changed nothing measurable. `OMNI_LOG_TIME=1` stamps log lines;
+  `OMNI_FORK_TRACE=1` times forks (system_server's: 43 MiB kept, ~0.7 s frozen).
 - **C5 in progress** (spec `docs/superpowers/specs/2026-09-27-c5-app-launch-design.md`): binder
   across host processes works (`tests/c3_remote_binder.rs`; `--binder-server`, `--pid`); the
   zygote responder (`--zygote`, `crate::zygote`) launches an app's `app_process64 ...
