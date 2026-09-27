@@ -481,6 +481,49 @@ impl Broker {
         result
     }
 
+    /// A one-way transaction from the host to `handle` (a HAL calling back its client:
+    /// `IComposerCallback.onVsync`): queued for the target's process, not waited on.
+    ///
+    /// # Errors
+    /// `EINVAL` for an unknown handle or an object that is not a binder or handle, `EPIPE` when the
+    /// target is dead.
+    pub fn host_transact_oneway(&self, handle: u32, code: u32, mut data: Vec<u8>, offsets: &[u64]) -> Result<(), Errno> {
+        let mut st = self.state.lock();
+        st.proc_mut(HOST);
+        let node = st.node_for_handle(HOST, handle).ok_or(EINVAL)?;
+        let n = st.nodes.get(&node).expect("a node");
+        let (target, ptr, cookie, secctx, dead) = (n.owner, n.ptr, n.cookie, n.txn_security_ctx, n.dead);
+        if dead || st.procs.get(&target).is_none_or(|pr| pr.dead) {
+            return Err(EPIPE);
+        }
+        for &off in offsets {
+            let off = off as usize;
+            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
+            if let Some(to) = st.translate_ref((HOST, 0), target, &obj)? {
+                rewrite_ref(&mut data, off, to);
+            }
+        }
+        let txn = Txn {
+            reply: false,
+            oneway: true,
+            from: None,
+            target_ptr: ptr,
+            target_cookie: cookie,
+            secctx,
+            code,
+            flags: TF_ONE_WAY,
+            sender_pid: 0,
+            sender_euid: HOST_EUID,
+            data,
+            offsets: offsets.to_vec(),
+            fds: Vec::new(),
+            sg: Vec::new(),
+            fda: Vec::new(),
+        };
+        st.queue(target, None, Work::Txn(Box::new(txn)));
+        Ok(())
+    }
+
     /// Publish host service `ptr` as `name` with `servicemanager` (`IServiceManager.addService`).
     ///
     /// # Errors
