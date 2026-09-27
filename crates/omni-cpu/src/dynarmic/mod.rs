@@ -1435,6 +1435,14 @@ impl ThunkRegs for JitRegs<'_> {
     /// The ninth and later AAPCS64 arguments live at `[SP]` upward, and a variadic call's overflow
     /// area is there too, so a register file without this could marshal at most eight arguments —
     /// and would do it silently, reading whatever `X0`-`X7` happened to hold for the ninth.
+    fn tpidr_el0(&self) -> Option<u64> {
+        let mut out = OdEffectiveConfig::default();
+        // SAFETY: the jit is live (this runs inside one of its callbacks) and `out` is writable.
+        unsafe { od_jit_effective_config(self.jit, &mut out) };
+        // SAFETY: the slot is the boxed `u64` the jit was configured with, alive as long as it is.
+        (out.tpidr_el0_ptr != 0).then(|| unsafe { *(out.tpidr_el0_ptr as *const u64) })
+    }
+
     fn sp(&self) -> GuestAddr {
         // SAFETY: as `x`. `SP` is a field of `JitState` like any other.
         unsafe { od_jit_get_sp(self.jit) as GuestAddr }

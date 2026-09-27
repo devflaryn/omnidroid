@@ -69,6 +69,11 @@ pub trait ThunkRegs {
     fn sp(&self) -> GuestAddr;
     /// Write `SP`.
     fn set_sp(&mut self, value: GuestAddr);
+    /// Read `TPIDR_EL0`, when the backend can. A kernel personality needs it at `clone`: a thread
+    /// created without `CLONE_SETTLS` inherits its parent's (bionic's debuggerd pseudothread).
+    fn tpidr_el0(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// An opaque token a thunk is registered with and handed back at every call.
@@ -157,6 +162,12 @@ impl<'a> ThunkCall<'a> {
     #[must_use]
     pub fn lr(&self) -> GuestAddr {
         self.regs.x(30) as GuestAddr
+    }
+
+    /// `TPIDR_EL0` at the call, when the backend can read it.
+    #[must_use]
+    pub fn tpidr_el0(&self) -> Option<u64> {
+        self.regs.tpidr_el0()
     }
 
     /// Do **not** resume the guest: return [`ExitReason::Thunk`](crate::ExitReason::Thunk) to

@@ -43,6 +43,7 @@ pub enum FileKind {
     /// A generated file (`/proc`, `/sys`): its bytes, taken when it was opened.
     Synth { data: Vec<u8>, guest: Vec<u8>, pos: usize, sized: bool },
     Socket(crate::socket::Socket),
+    Pipe(crate::pipe::End),
 }
 
 impl FileKind {
@@ -245,6 +246,7 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         }
         FileKind::Synth { guest, .. } => stat_node(&Resolved { path: guest.clone(), node: Node::Generated }),
         FileKind::Socket(_) => Ok(Stat { ino: 2, mode: 0o140000 | 0o777, nlink: 1, ..Stat::default() }),
+        FileKind::Pipe(_) => Ok(Stat { ino: 3, mode: 0o010000 | 0o600, nlink: 1, ..Stat::default() }),
     }
 }
 
@@ -273,6 +275,8 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         FileKind::Stdout(_) | FileKind::Stderr(_) => Err(EBADF),
         // Nothing ever arrives: logd does not answer, and no other socket has a peer.
         FileKind::Socket(_) => Err(EAGAIN),
+        // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
+        FileKind::Pipe(_) => Err(ESPIPE),
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
             let n = buf.len().min(data.len() - from);
@@ -315,6 +319,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Synth { .. } => Err(EACCES),
         FileKind::Socket(s) => crate::socket::send(s, bytes),
+        FileKind::Pipe(_) => Err(ESPIPE),
     }
 }
 
@@ -349,10 +354,14 @@ fn sys_close(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     p.fds.remove(fd_arg(a[0])).map(|()| 0)
 }
 
-fn sys_read(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     let mut buf = vec![0u8; (a[2] as usize).min(1 << 24)];
-    let n = read_file(&file, &mut buf, None)?;
+    let n = match crate::pipe::end_of(&file) {
+        Some((_, true, _)) => return Err(EBADF),
+        Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, &mut buf, nonblocking, t)?,
+        None => read_file(&file, &mut buf, None)?,
+    };
     p.mem.write(a[1], &buf[..n])?;
     Ok(n as u64)
 }
@@ -365,10 +374,14 @@ fn sys_pread64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(n as u64)
 }
 
-fn sys_write(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_write(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     let bytes = p.mem.read(a[1], (a[2] as usize).min(1 << 24))?;
-    Ok(write_file(&file, &bytes)? as u64)
+    match crate::pipe::end_of(&file) {
+        Some((_, false, _)) => Err(EBADF),
+        Some((pipe, true, nonblocking)) => Ok(crate::pipe::write(&pipe, &bytes, nonblocking, t)? as u64),
+        None => Ok(write_file(&file, &bytes)? as u64),
+    }
 }
 
 fn iovecs(p: &Process, at: u64, count: u64) -> Result<Vec<(u64, usize)>, Errno> {
@@ -378,7 +391,7 @@ fn iovecs(p: &Process, at: u64, count: u64) -> Result<Vec<(u64, usize)>, Errno> 
     (0..count).map(|i| Ok((p.mem.read_u64(at + i * 16)?, p.mem.read_u64(at + i * 16 + 8)? as usize))).collect()
 }
 
-fn sys_writev(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_writev(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     // The same cap as `write`, on the total: many iovecs naming one large buffer must not make the
     // host allocate their sum (A2-A5 review, Important 3c).
@@ -391,18 +404,31 @@ fn sys_writev(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             break;
         }
     }
-    Ok(write_file(&file, &bytes)? as u64)
+    match crate::pipe::end_of(&file) {
+        Some((_, false, _)) => Err(EBADF),
+        Some((pipe, true, nonblocking)) => Ok(crate::pipe::write(&pipe, &bytes, nonblocking, t)? as u64),
+        None => Ok(write_file(&file, &bytes)? as u64),
+    }
 }
 
-fn sys_readv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_readv(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
+    let pipe = crate::pipe::end_of(&file);
     let mut total = 0u64;
     for (base, len) in iovecs(p, a[1], a[2])? {
         // The same cap as `read`: the length is the guest's, and an allocation of it can abort
         // the host (A1 review, Important 2).
         let len = len.min(1 << 24);
         let mut buf = vec![0u8; len];
-        let n = read_file(&file, &mut buf, None)?;
+        let n = match &pipe {
+            Some((_, true, _)) => return Err(EBADF),
+            // A pipe waits only for the first iovec; after that, what is there.
+            Some((pipe, false, nonblocking)) => match crate::pipe::read(pipe, &mut buf, *nonblocking || total > 0, t) {
+                Err(EAGAIN) if total > 0 => 0,
+                r => r?,
+            },
+            None => read_file(&file, &mut buf, None)?,
+        };
         p.mem.write(base, &buf[..n])?;
         total += n as u64;
         if n < len {
@@ -481,6 +507,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Dev(DevNode::Urandom) => b"/dev/urandom".to_vec(),
         FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => b"/dev/pts/0".to_vec(),
         FileKind::Socket(_) => b"socket:[2]".to_vec(),
+        FileKind::Pipe(_) => b"pipe:[3]".to_vec(),
     }
 }
 
@@ -534,6 +561,11 @@ fn sys_fcntl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         1 => Ok(u64::from(p.fds.cloexec(fd)?)),
         2 => p.fds.set_cloexec(fd, a[2] & 1 != 0).map(|()| 0),
         3 => Ok(u64::from(*file.flags.lock())),
+        // F_SETPIPE_SZ / F_GETPIPE_SZ: a pipe's capacity is fixed at 64 KiB here; a request is
+        // answered with what it would round to, as a successful resize is.
+        1031 | 1032 if crate::pipe::end_of(&file).is_some() => {
+            Ok(if a[1] == 1031 { (a[2].clamp(4096, 1 << 20) + 4095) & !4095 } else { 64 << 10 })
+        }
         4 => {
             let mut f = file.flags.lock();
             *f = (*f & O_ACCMODE) | (a[2] as u32 & (O_APPEND | 0o4000));

@@ -12,6 +12,7 @@ pub mod futex;
 pub mod guest;
 pub mod manifest;
 pub mod mm;
+pub mod pipe;
 pub mod process;
 pub mod procfs;
 pub mod props;
@@ -30,4 +31,5 @@ pub fn install_all(table: &mut syscall::Table) {
     mm::install(table);
     sys::install(table);
     socket::install(table);
+    pipe::install(table);
 }

@@ -207,3 +207,17 @@ fn rt_sigsuspend_waits_under_a_temporary_mask() {
     assert_eq!(t.sigmask, 0, "the temporary mask stands until the handler's frame records the old one");
     assert_eq!(t.saved_sigmask, Some(usr1));
 }
+
+/// A signal with its default action is acted on when it is *delivered*, to its target: a blocked
+/// one stays pending (for `sigwait`), and the sender is never the one it kills. ART stops its
+/// signal catcher with `tgkill(SIGQUIT)`, which that thread blocks and waits for.
+#[test]
+fn a_blocked_default_action_signal_stays_pending_and_does_not_kill_the_sender() {
+    let (p, _s) = process();
+    let mut t = Task::new(1000, Arc::clone(&p)); // the pid: the main task
+    let quit = 1u64 << (3 - 1);
+    t.sigmask = quit;
+    assert_eq!(p.syscall(&mut t, nr::TGKILL, [1000, 1000, 3, 0, 0, 0]), 0);
+    assert!(t.exit.is_none(), "the sender is not killed: {:?}", t.exit);
+    assert_ne!(t.pending.load(Ordering::SeqCst) & quit, 0, "pending for sigwait");
+}

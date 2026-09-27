@@ -100,6 +100,8 @@ pub struct Task {
     /// The mask `rt_sigsuspend` replaced: the next handler's frame records it, so the handler's
     /// return restores it (as the kernel's `saved_sigmask`).
     pub saved_sigmask: Option<u64>,
+    /// `TPIDR_EL0` at the last `clone`: a thread made without `CLONE_SETTLS` inherits it.
+    pub clone_tpidr: Option<u64>,
 }
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
@@ -141,7 +143,7 @@ fn altstack_disabled() -> [u8; 24] {
 impl Task {
     #[must_use]
     pub fn new(tid: i32, process: Arc<Process>) -> Self {
-        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None }
+        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None, clone_tpidr: None }
     }
 }
 
@@ -160,6 +162,7 @@ fn on_svc(call: &mut ThunkCall<'_>) {
             *r = call.x(n as u32);
         }
         task.clone_regs = Some((regs, call.sp() as u64));
+        task.clone_tpidr = call.tpidr_el0();
     }
     let process = Arc::clone(&task.process);
     let result = process.syscall(task, number, args);
@@ -406,7 +409,8 @@ impl Process {
         }
         cpu.set_x(XReg::new(0).expect("x0"), 0);
         cpu.set_sp(if stack == 0 { parent_sp } else { stack } as usize);
-        if let Some(tls) = tls {
+        // Without CLONE_SETTLS the child keeps its parent's thread pointer, as on Linux.
+        if let Some(tls) = tls.or(parent.clone_tpidr) {
             cpu.set_tpidr_el0(tls as usize);
         }
         let mut task = Task::new(tid, Arc::clone(self));

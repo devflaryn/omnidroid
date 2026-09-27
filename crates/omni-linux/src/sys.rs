@@ -408,14 +408,15 @@ fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
         return Err(EINVAL);
     }
     let (handler, ..) = p.sys.action(sig as i32);
+    let bit = 1u64 << (sig - 1);
+    // A default action is taken when the signal is *delivered*, by its target: a blocked one stays
+    // pending (ART's signal catcher takes SIGQUIT with sigwait), and a terminating one kills the
+    // process from the target's run loop -- never the sender for being the sender.
     match handler {
         1 => Ok(0), // SIG_IGN
-        0 => {
-            match sig {
-                _ if ignored_by_default(sig) => {}
-                19..=22 => p.refusals.record(format!("stop by signal {sig}"), t.pc, t.lr),
-                _ => t.exit = Some(Exit::Signal(sig as i32)), // terminate
-            }
+        0 if ignored_by_default(sig) && !(tid == t.tid && t.sigmask & bit != 0) => Ok(0),
+        0 if (19..=22).contains(&sig) => {
+            p.refusals.record(format!("stop by signal {sig}"), t.pc, t.lr);
             Ok(0)
         }
         _ if tid == t.tid => {

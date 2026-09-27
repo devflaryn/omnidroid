@@ -94,12 +94,15 @@ fn the_tagged_address_abi_is_accepted_and_reported() {
     assert_eq!(p.syscall(&mut t, nr::PRCTL, [56, 0, 0, 0, 0, 0]), 1);
 }
 
+/// A terminating signal with its default action is left pending for the run loop, which takes
+/// the action on delivery (the A5 gate's `faults` fixture and bionic's abort show the process end).
 #[test]
-fn a_signal_with_its_default_action_ends_the_process_by_that_signal() {
+fn a_signal_with_its_default_action_is_pending_for_delivery() {
     let (p, mut t, _) = process();
     let pid = p.syscall(&mut t, nr::GETPID, [0; 6]);
     assert_eq!(p.syscall(&mut t, nr::RT_TGSIGQUEUEINFO, [pid, pid, 6, 0, 0, 0]), 0);
-    assert_eq!(t.exit, Some(omni_linux::Exit::Signal(6)), "SIGABRT, default action: terminate");
+    assert_eq!(t.exit, None);
+    assert_ne!(t.pending.load(std::sync::atomic::Ordering::SeqCst) & (1 << 5), 0, "SIGABRT pending");
 }
 
 #[test]
