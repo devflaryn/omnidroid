@@ -54,6 +54,7 @@ fn sha256(path: &Path) -> Option<String> {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS arm64 maps nothing below 4 GiB, where ART's heap must be (C design: Mac)")]
 fn c2_an_apk_loads_in_an_app_process() {
     let Some(sysroot) = common::sysroot() else { return };
     let Some(apk) = std::env::var_os("OMNI_TEST_APK").map(PathBuf::from) else {

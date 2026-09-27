@@ -33,6 +33,7 @@ fn spawn(sysroot: &Path, instance: &Path, argv: &[&str], env: &[String]) -> (Exi
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS arm64 maps nothing below 4 GiB, where ART's heap must be (C design: Mac)")]
 fn b_hello_dex_runs_on_art() {
     let Some(sysroot) = common::sysroot() else { return };
     let instance: PathBuf = std::env::temp_dir().join(format!("omni-linux-b-{}", std::process::id()));

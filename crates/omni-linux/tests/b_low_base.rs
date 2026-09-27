@@ -10,6 +10,7 @@ use omni_linux::{ExitStatus, Output, Process, SpawnConfig};
 /// starts there, and mappings made without a hint stay out of the low 4 GiB -- as on Linux, where
 /// the top-down `mmap_base` puts them high -- leaving it for what ART asks for by address.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS arm64 maps nothing below 4 GiB, where ART's heap must be (C design: Mac)")]
 fn the_space_starts_below_4_gib_and_unhinted_mappings_leave_it_free() {
     let Some(sysroot) = common::sysroot() else { return };
     let out = Arc::new(parking_lot::Mutex::new(Vec::new()));
