@@ -57,6 +57,29 @@ impl Drop for End {
         count.fetch_sub(1, Ordering::SeqCst);
         let _held = self.pipe.bytes.lock();
         self.pipe.changed.notify_all();
+        crate::poll::notify();
+    }
+}
+
+/// `EPOLL*` readiness of one end.
+#[must_use]
+pub fn readiness(end: &End) -> u32 {
+    let pipe = &end.pipe;
+    let queued = pipe.bytes.lock().len();
+    if end.write {
+        if pipe.readers.load(Ordering::SeqCst) == 0 {
+            crate::poll::ERR
+        } else if queued < CAPACITY {
+            crate::poll::OUT
+        } else {
+            0
+        }
+    } else if queued > 0 {
+        crate::poll::IN
+    } else if pipe.writers.load(Ordering::SeqCst) == 0 {
+        crate::poll::IN | crate::poll::HUP
+    } else {
+        0
     }
 }
 
@@ -79,6 +102,7 @@ pub fn read(pipe: &Pipe, buf: &mut [u8], nonblocking: bool, task: &Task) -> Resu
                 *slot = b;
             }
             pipe.changed.notify_all();
+            crate::poll::notify();
             return Ok(n);
         }
         if pipe.writers.load(Ordering::SeqCst) == 0 {
@@ -112,6 +136,7 @@ pub fn write(pipe: &Pipe, data: &[u8], nonblocking: bool, task: &Task) -> Result
         bytes.extend(&data[done..done + n]);
         done += n;
         pipe.changed.notify_all();
+        crate::poll::notify();
     }
     Ok(done)
 }

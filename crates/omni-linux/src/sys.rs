@@ -68,6 +68,10 @@ fn signals(t: &Task) -> crate::futex::Signals<'_> {
     crate::futex::Signals { pending: &t.pending, mask: t.sigmask }
 }
 
+pub(crate) fn clock_now(p: &Process, clock: u64) -> Result<Duration, Errno> {
+    now(p, clock)
+}
+
 fn now(p: &Process, clock: u64) -> Result<Duration, Errno> {
     match clock {
         0 | 5 | 8 | 11 => SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| EINVAL), // REALTIME(_COARSE/_ALARM), TAI

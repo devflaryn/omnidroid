@@ -24,7 +24,7 @@ pub mod nr {
         FTRUNCATE = 46 => "ftruncate", OPENAT = 56 => "openat", CLOSE = 57 => "close", PIPE2 = 59 => "pipe2",
         GETDENTS64 = 61 => "getdents64", LSEEK = 62 => "lseek", READ = 63 => "read",
         WRITE = 64 => "write", READV = 65 => "readv", WRITEV = 66 => "writev",
-        PREAD64 = 67 => "pread64", PWRITE64 = 68 => "pwrite64", PPOLL = 73 => "ppoll",
+        PREAD64 = 67 => "pread64", PWRITE64 = 68 => "pwrite64", PPOLL = 73 => "ppoll", EVENTFD2 = 19 => "eventfd2", EPOLL_CREATE1 = 20 => "epoll_create1", EPOLL_CTL = 21 => "epoll_ctl", EPOLL_PWAIT = 22 => "epoll_pwait", TIMERFD_CREATE = 85 => "timerfd_create", TIMERFD_SETTIME = 86 => "timerfd_settime", TIMERFD_GETTIME = 87 => "timerfd_gettime",
         READLINKAT = 78 => "readlinkat", FSYNC = 82 => "fsync", FDATASYNC = 83 => "fdatasync",
         UTIMENSAT = 88 => "utimensat", RENAMEAT = 38 => "renameat", RENAMEAT2 = 276 => "renameat2", NEWFSTATAT = 79 => "newfstatat", FSTAT = 80 => "fstat",
         EXIT = 93 => "exit", EXIT_GROUP = 94 => "exit_group", SET_TID_ADDRESS = 96 => "set_tid_address",

@@ -44,6 +44,9 @@ pub enum FileKind {
     Synth { data: Vec<u8>, guest: Vec<u8>, pos: usize, sized: bool },
     Socket(crate::socket::Socket),
     Pipe(crate::pipe::End),
+    EventFd(Arc<crate::poll::EventFd>),
+    TimerFd(Arc<crate::poll::TimerFd>),
+    Epoll(Arc<crate::poll::Epoll>),
 }
 
 impl FileKind {
@@ -247,6 +250,8 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Synth { guest, .. } => stat_node(&Resolved { path: guest.clone(), node: Node::Generated }),
         FileKind::Socket(_) => Ok(Stat { ino: 2, mode: 0o140000 | 0o777, nlink: 1, ..Stat::default() }),
         FileKind::Pipe(_) => Ok(Stat { ino: 3, mode: 0o010000 | 0o600, nlink: 1, ..Stat::default() }),
+        // anon_inode descriptors: a 0600 inode, as the kernel reports them.
+        FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Ok(Stat { ino: 4, mode: 0o600, nlink: 1, ..Stat::default() }),
     }
 }
 
@@ -276,7 +281,7 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         // Nothing ever arrives: logd does not answer, and no other socket has a peer.
         FileKind::Socket(_) => Err(EAGAIN),
         // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
-        FileKind::Pipe(_) => Err(ESPIPE),
+        FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
             let n = buf.len().min(data.len() - from);
@@ -319,7 +324,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Synth { .. } => Err(EACCES),
         FileKind::Socket(s) => crate::socket::send(s, bytes),
-        FileKind::Pipe(_) => Err(ESPIPE),
+        FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
     }
 }
 
@@ -360,7 +365,10 @@ fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let n = match crate::pipe::end_of(&file) {
         Some((_, true, _)) => return Err(EBADF),
         Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, &mut buf, nonblocking, t)?,
-        None => read_file(&file, &mut buf, None)?,
+        None => match crate::poll::read(&file, &mut buf, t) {
+            Some(r) => r?,
+            None => read_file(&file, &mut buf, None)?,
+        },
     };
     p.mem.write(a[1], &buf[..n])?;
     Ok(n as u64)
@@ -377,6 +385,9 @@ fn sys_pread64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 fn sys_write(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     let bytes = p.mem.read(a[1], (a[2] as usize).min(1 << 24))?;
+    if let Some(r) = crate::poll::write(&file, &bytes, t) {
+        return Ok(r? as u64);
+    }
     match crate::pipe::end_of(&file) {
         Some((_, false, _)) => Err(EBADF),
         Some((pipe, true, nonblocking)) => Ok(crate::pipe::write(&pipe, &bytes, nonblocking, t)? as u64),
@@ -508,6 +519,9 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => b"/dev/pts/0".to_vec(),
         FileKind::Socket(_) => b"socket:[2]".to_vec(),
         FileKind::Pipe(_) => b"pipe:[3]".to_vec(),
+        FileKind::EventFd(_) => b"anon_inode:[eventfd]".to_vec(),
+        FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
+        FileKind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
     }
 }
 
