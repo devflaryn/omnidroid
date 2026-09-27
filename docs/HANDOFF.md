@@ -1,5 +1,29 @@
 # Handoff
 
+## MORNING REPORT (overnight run 2026-09-28, Windows only, stock APK)
+
+APK used throughout: `omnidroid-unified/Roblox-2.738.1397.apk`, 229,466,269 bytes, sha256
+`BBE00AE3...2742`, signer "Roblox Corporation", 3 dex. **Not** the 159,853,296-byte file of the
+same name in the main checkout `Desktop/Omni Apps/omnidroid` (sha256 `4BCB90EE...6128`): that one
+has an extra `classes4.dex`, an 18,440,296-byte `libzstd-jni` (stock: 603,960) and is re-signed
+with a non-Roblox key (`META-INF/KEY.RSA`, "Gloopiest Man") -- the modified build this file warns
+about. `libroblox.so` is byte-identical in both. A `Roblox-2.739.691.apk` is also still in the
+unified root; `choose_apk` would pick it (higher versionCode), so always name the APK.
+
+| phase | result | artifact |
+|---|---|---|
+| 1 address space | **fixed** (`d65fbe8`): 10/10 boots reach "System now ready" (72-75 s each, 0 `[mm]` refusals, 0 guest deaths). Before: 5/7 D5 logs of 09-27 reached it, 1/7 exhausted the space (49 refusals, 1,048,576 bytes free of 64 GiB) | `docs/runs/2026-09-28-phase1-c4-10boots.csv`; `tests/low_space.rs` (fails without the fix with the boot log's exact figure) |
+
+Cause (phase 1): every guest process asks for the same low range; system_server holds it,
+reserved *around* the host's pieces there, host threads' 1 MiB stacks among them. When such a
+thread exited, its stack was the only free piece, and the next process's space "succeeded" with
+1 MiB free. `process::reserve_space` now refuses a low space less than half free.
+
+Markers on this path: `DID_LOG_IN`, `onGameLoaded: placeId:`, `submitStartGameTask` are the
+engine's own (logcat tag `Roblox`). `JOIN: ... returned 1` and `FRAMES:` are printed only by the
+HLE gate (`omni-android/tests/gameactivity.rs`) and cannot appear here; their stand-ins are the
+engine's `onGameLoaded` / `NativeDM ... placeId` and the runner's `[display] N frames presented`.
+
 Current as of **2026-09-27**, branch `unified`. This file is the state and the next steps only.
 Design is in `ARCHITECTURE.md`, reasons in `DECISIONS.md`, capabilities in `STATUS.md`, per-host
 detail in `ports/<os>.md`, the current goal in `briefs/goal-performance.md`. Read

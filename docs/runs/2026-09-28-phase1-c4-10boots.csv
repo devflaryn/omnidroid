@@ -1,0 +1,12 @@
+run,start,seconds,exit,free_commit_gb,ready,mm_refused,guest_died,log
+1,00:33:17,74,0,17.2,1,0,0,omni-linux-c4-61792.log
+2,00:34:32,74,0,17.3,1,0,0,omni-linux-c4-51012.log
+3,00:35:47,75,0,12,1,0,0,omni-linux-c4-60932.log
+4,00:37:02,72,0,12.1,1,0,0,omni-linux-c4-61876.log
+5,00:38:14,74,0,12.4,1,0,0,omni-linux-c4-3780.log
+6,00:39:29,73,0,12.7,1,0,0,omni-linux-c4-25760.log
+7,00:40:42,74,0,12.6,1,0,0,omni-linux-c4-58016.log
+8,00:41:57,73,0,12.6,1,0,0,omni-linux-c4-20676.log
+9,00:43:10,72,0,12.4,1,0,0,omni-linux-c4-49484.log
+10,00:44:23,73,0,12.5,1,0,0,omni-linux-c4-44784.log
+done
