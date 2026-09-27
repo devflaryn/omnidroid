@@ -457,6 +457,9 @@ fn sys_rt_sigtimedwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             break sig;
         }
         if t.pending.load(std::sync::atomic::Ordering::SeqCst) & !t.sigmask != 0 {
+            if p.trace {
+                eprintln!("[sigwait] set {set:#x} pending {:#x} mask {:#x}: EINTR", t.pending.load(std::sync::atomic::Ordering::SeqCst), t.sigmask);
+            }
             return Err(EINTR); // a signal outside the set that a handler takes
         }
         // Wake for a signal in the set, or for one the task would take as a handler.
