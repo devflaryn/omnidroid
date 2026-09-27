@@ -83,5 +83,7 @@ public class ApkLoad {
             }
         }
         System.out.println("done");
+        // As Android's command-line tools do: the binder pool's threads would keep the VM alive.
+        System.exit(0);
     }
 }

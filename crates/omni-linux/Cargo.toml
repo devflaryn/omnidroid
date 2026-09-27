@@ -22,3 +22,6 @@ sha2 = { workspace = true }
 [[bin]]
 name = "omni-linux-run"
 path = "src/bin/omni-linux-run.rs"
+
+[dev-dependencies]
+flate2 = { workspace = true }
