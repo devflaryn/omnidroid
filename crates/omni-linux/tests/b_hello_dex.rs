@@ -41,6 +41,8 @@ fn b_hello_dex_runs_on_art() {
     // What init does before any app process: the linker's namespaces, then the class paths.
     let (status, _, err) = spawn(&sysroot, &instance, &["/apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig"], &[]);
     assert_eq!(status, ExitStatus::Exited(0), "linkerconfig: {err}");
+    // init.rc makes the directory derive_classpath writes into.
+    std::fs::create_dir_all(instance.join("data/system/environ")).unwrap();
     let (status, _, err) =
         spawn(&sysroot, &instance, &["/apex/com.android.sdkext/bin/derive_classpath", "/data/system/environ/classpath"], &[]);
     assert_eq!(status, ExitStatus::Exited(0), "derive_classpath: {err}");

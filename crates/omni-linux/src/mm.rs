@@ -352,7 +352,11 @@ fn sys_msync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             at = if at < base { base.min(addr + len) } else { addr + len };
             continue;
         }
-        let region = space.region_at(at as usize).filter(|r| r.mapping.is_some()).ok_or(ENOMEM)?;
+        // A host-owned hole inside the space (`around_host`) is in use, like the host outside it.
+        let region = space
+            .region_at(at as usize)
+            .filter(|r| r.mapping.is_some() || matches!(r.kind, omni_mem::RegionKind::Host))
+            .ok_or(ENOMEM)?;
         at = (region.start + region.len) as u64;
     }
     Ok(0)
