@@ -182,7 +182,15 @@ impl Mm {
         let placement = if fixed {
             Placement::Fixed(req.addr as usize)
         } else if req.addr != 0 {
-            Placement::Hint { address: (req.addr & !(self.page - 1)) as usize, align: page }
+            let hint = crate::guest::untag(req.addr);
+            if hint < 1 << 32 && !self.space.contains(hint as usize, len as usize) {
+                // A low hint is a request for low memory (ART's heap, anything that needs 32-bit
+                // pointers), and below 4 GiB outside the guest space is the host's. Linux would
+                // map elsewhere, and the caller would unmap and try the next page: answering
+                // "not there" at once is the same answer without the mapping.
+                return Err(ENOMEM);
+            }
+            Placement::Hint { address: (hint & !(self.page - 1)) as usize, align: page }
         } else {
             Placement::Anywhere { align: page }
         };

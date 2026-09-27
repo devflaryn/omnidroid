@@ -189,3 +189,19 @@ fn msync_tells_mapped_from_free_pages() {
         assert_eq!(p.syscall(&mut t, nr::MSYNC, [base - pg, pg, 0, 0, 0, 0]), 0, "below the space is the host's");
     }
 }
+
+/// ART's low-4-GiB allocator asks for each candidate address with a hint and gives back whatever
+/// else it gets: below 4 GiB and outside the guest space, where nothing can be mapped, the answer
+/// is `ENOMEM` at once rather than a mapping elsewhere made and unmade for every page it tries.
+#[test]
+fn a_low_hint_outside_the_space_is_enomem_and_a_high_one_is_a_preference() {
+    let (p, mut t, _, pg) = process();
+    let base = p.mem.space().base() as u64;
+    let end = p.mem.space().end() as u64;
+    let low = 0x1000_0000u64;
+    if base > low + pg {
+        assert_eq!(mmap(&p, &mut t, [low, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]), -12);
+    }
+    let high = mmap(&p, &mut t, [(end + (1 << 30)).max(1 << 40), pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]);
+    assert!(high > 0, "a high hint outside the space still maps somewhere: {high}");
+}

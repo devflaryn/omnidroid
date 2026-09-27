@@ -101,9 +101,13 @@ pub struct Task {
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
 /// Where the guest space is reserved: below 4 GiB, because ART keeps its heap and boot image there
-/// (compressed references are 32 bits), and a guest address is a host address (D4). 2 GiB, not
-/// lower: Windows keeps `KUSER_SHARED_DATA` at `0x7FFE0000` in every process.
+/// (compressed references are 32 bits; the boot image goes near `ART_BASE_ADDRESS`, 0x70000000),
+/// and a guest address is a host address (D4). On Windows 2 GiB for now: `KUSER_SHARED_DATA` sits
+/// at `0x7FFE0000` in every process, so a space from lower down must step around it.
+#[cfg(windows)]
 const GUEST_SPACE_LOW_BASE: usize = 0x8000_0000;
+#[cfg(not(windows))]
+const GUEST_SPACE_LOW_BASE: usize = 0x1000_0000;
 
 /// The guest space, at [`GUEST_SPACE_LOW_BASE`] if the host has that free, else wherever it
 /// chooses (a program that needs no low memory still runs; ART will not).
