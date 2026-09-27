@@ -179,6 +179,8 @@ struct Txn {
     sg: Vec<SgBuffer>,
     /// fd arrays: (index of the parent buffer in `sg`, offset in it, the files).
     fda: Vec<(usize, usize, Vec<Arc<OpenFile>>)>,
+    /// A oneway transaction's node, whose next oneway waits until this one's buffer is freed.
+    async_node: Option<NodeId>,
 }
 
 struct SgBuffer {
@@ -362,6 +364,20 @@ impl State {
         }
     }
 
+    /// A oneway transaction to `node` is done with (its buffer freed, or it was not delivered):
+    /// the next waiting one goes to `owner` -- to thread `tid` when given, as the kernel hands it
+    /// to the thread that freed the buffer.
+    fn async_done(&mut self, node: NodeId, owner: ProcId, tid: Option<i32>) {
+        let next = self.nodes.get_mut(&node).and_then(|n| {
+            let w = n.async_todo.pop_front();
+            n.has_async = w.is_some();
+            w
+        });
+        if let Some(w) = next {
+            self.queue(owner, tid, w);
+        }
+    }
+
     /// No live process refers to `node` any more: its owner lets it go (`BR_RELEASE`,
     /// `BR_DECREFS`), and the object's address may later name a new node.
     fn release_if_unreferenced(&mut self, node: NodeId) -> bool {
@@ -446,6 +462,7 @@ impl State {
             fds,
             sg: Vec::new(),
             fda: Vec::new(),
+            async_node: None,
         })
     }
 }
@@ -520,6 +537,7 @@ impl Broker {
             fds: Vec::new(),
             sg: Vec::new(),
             fda: Vec::new(),
+            async_node: None,
         };
         let nested = HOST_SERVING.with(std::cell::Cell::get).filter(|(p, _)| *p == target).map(|(_, tid)| tid);
         st.queue(target, nested, Work::Txn(Box::new(txn)));
@@ -581,6 +599,7 @@ impl Broker {
             fds: Vec::new(),
             sg: Vec::new(),
             fda: Vec::new(),
+            async_node: None,
         };
         st.queue(target, None, Work::Txn(Box::new(txn)));
         Ok(())
@@ -954,14 +973,7 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
             // A oneway transaction's buffer: its node's next oneway goes to this thread.
             let mut st = file.broker.state.lock();
             if let Some(node) = st.async_buffers.remove(&(file.id, ptr)) {
-                let next = st.nodes.get_mut(&node).and_then(|n| {
-                    let w = n.async_todo.pop_front();
-                    n.has_async = w.is_some();
-                    w
-                });
-                if let Some(w) = next {
-                    st.queue(file.id, Some(t.tid), w);
-                }
+                st.async_done(node, file.id, Some(t.tid));
             }
         }
         // A live process's handle references are not counted: its handles last as long as it
@@ -1146,7 +1158,9 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         fds,
         sg,
         fda,
+        async_node: None,
     };
+    let mut txn = txn;
     if !reply && !oneway {
         st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
     }
@@ -1200,13 +1214,21 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     }
     // A oneway transaction waits while one to the same node is out, as the driver orders them.
     if oneway {
-        if let Some(n) = st.local.get(&(target_proc, target_ptr)).copied().and_then(|id| st.nodes.get_mut(&id)) {
-            if n.has_async {
-                n.async_todo.push_back(Work::Txn(Box::new(txn)));
-                st.queue(file.id, Some(t.tid), Work::Complete);
-                return Ok(());
+        if let Some(id) = st.local.get(&(target_proc, target_ptr)).copied() {
+            txn.async_node = Some(id);
+            if let Some(n) = st.nodes.get_mut(&id) {
+                if n.has_async {
+                    n.async_todo.push_back(Work::Txn(Box::new(txn)));
+                    if n.async_todo.len() % 64 == 0 {
+                        let (owner, queued) = (n.owner, n.async_todo.len());
+                        let pid = st.procs.get(&owner).map_or(0, |pr| pr.pid);
+                        eprintln!("[binder] {queued} oneway calls wait on node {id} of pid {pid} (its last one's buffer not freed)");
+                    }
+                    st.queue(file.id, Some(t.tid), Work::Complete);
+                    return Ok(());
+                }
+                n.has_async = true;
             }
-            n.has_async = true;
         }
     }
     st.queue(target_proc, target_tid, Work::Txn(Box::new(txn)));
@@ -1309,12 +1331,15 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
             let offsets_len = txn.offsets.len() as u64 * 8;
             let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
             let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
-            let buf = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len).ok_or(ENOMEM)?;
-            if txn.oneway && !txn.reply {
-                let mut st = file.broker.state.lock();
-                if let Some(node) = st.local.get(&(file.id, txn.target_ptr)).copied() {
-                    st.async_buffers.insert((file.id, buf), node);
+            let Some(buf) = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len) else {
+                // Not delivered: the node's next oneway may go.
+                if let Some(node) = txn.async_node {
+                    file.broker.state.lock().async_done(node, file.id, None);
                 }
+                return Err(ENOMEM);
+            };
+            if let Some(node) = txn.async_node {
+                file.broker.state.lock().async_buffers.insert((file.id, buf), node);
             }
             // Scatter-gather buffers go after the offsets: each object points at its copy, and a
             // child's address is written into its parent's copy where the sender had it.
