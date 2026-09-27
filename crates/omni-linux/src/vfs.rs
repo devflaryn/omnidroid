@@ -325,9 +325,10 @@ impl Vfs {
         }
         match path {
             b"/dev" | b"/proc" | b"/proc/self" => return Some(Node::Dir),
-            // The root's links, as a device's first-stage init leaves them.
-            b"/etc" => return Some(Node::Symlink { target: b"/system/etc".to_vec() }),
-            b"/bin" => return Some(Node::Symlink { target: b"/system/bin".to_vec() }),
+            // The root's links, as a device's first-stage init leaves them (where the image has
+            // nothing of its own there).
+            b"/etc" if !self.sysroot.has(path) => return Some(Node::Symlink { target: b"/system/etc".to_vec() }),
+            b"/bin" if !self.sysroot.has(path) => return Some(Node::Symlink { target: b"/system/bin".to_vec() }),
             b"/dev/cgroup_info" => return Some(Node::Dir),
             b"/dev/cgroup_info/cgroup.rc" => return Some(Node::Blob { size: CGROUP_RC.with(|rc| rc.len() as u64) }),
             b"/dev/null" => return Some(Node::Dev(DevNode::Null)),
