@@ -302,6 +302,12 @@ fn stat_resolved(vfs: &Vfs, r: &Resolved) -> Result<Stat, Errno> {
     if let Some((mode, uid, gid)) = crate::bpf::owner(&r.path).filter(|_| crate::bpf::on_bpffs(&r.path)) {
         return Ok(Stat { mode: (st.mode & S_IFMT) | mode, uid, gid, ..st });
     }
+    // An image file or directory: the image's owner and mode.
+    if matches!(r.node, Node::Dir | Node::SysFile { .. }) {
+        if let Some(m) = vfs.sysroot().image_meta(&r.path) {
+            return Ok(Stat { mode: (st.mode & S_IFMT) | m.mode, uid: m.uid, gid: m.gid, ..st });
+        }
+    }
     Ok(owned(vfs, r, st))
 }
 
@@ -335,7 +341,10 @@ pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
             let mode = if *sysroot { 0o644 } else { host_mode(&meta) };
             let st = Stat { ino: ino_of(guest), mode: S_IFREG | mode, nlink: 1, size: len, blocks: (len + 511) / 512, ..Stat::default() };
             if *sysroot {
-                return Ok(st);
+                return Ok(match vfs.sysroot().image_meta(guest) {
+                    Some(m) => Stat { mode: S_IFREG | m.mode, uid: m.uid, gid: m.gid, ..st },
+                    None => st,
+                });
             }
             // The file's owner, by where it is now (a renamed file is found by its new name).
             Ok(vfs.resolve(b"/", guest, true).map_or(st, |r| owned(vfs, &r, st)))

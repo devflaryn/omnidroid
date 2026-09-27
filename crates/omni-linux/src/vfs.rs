@@ -17,6 +17,45 @@ use crate::manifest::{self, Entry, Manifest};
 /// The sha256 of the pinned `sysroot.manifest` (Task 1, Step 2).
 pub const SYSROOT_MANIFEST_SHA256: &str = "5b58665544077a8d807032e5caf6503081c8f04800be53373071a2e147d99656";
 
+/// The sha256 of the pinned `sysroot.meta` (tools/make_sysroot.py --meta).
+pub const SYSROOT_META_SHA256: &str = "dc7309c933d135a55f68fa19c978dea5da4759aa56f661246dd9c645da99e7b1";
+
+/// An image path's owner, permission bits, SELinux label and file capability, as the image's
+/// filesystem holds them (fs_config's owners and modes, file_contexts' labels): what a device's
+/// mounted image reports, and an unprivileged extraction loses.
+#[derive(Clone, Debug, Default)]
+pub struct ImageMeta {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    /// `security.selinux`, NUL-terminated as the kernel returns it.
+    pub label: Option<Vec<u8>>,
+    /// `security.capability`'s raw value.
+    pub capability: Option<Vec<u8>>,
+}
+
+/// Parse `sysroot.meta`: `path \t uid \t gid \t mode (octal) \t label|- \t capability (hex)|-`.
+fn parse_meta(text: &str) -> Result<HashMap<Vec<u8>, ImageMeta>, String> {
+    let mut out = HashMap::new();
+    for line in text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [path, uid, gid, mode, label, cap] = f[..] else { return Err(format!("sysroot.meta: {line}")) };
+        let num = |s: &str, radix| u32::from_str_radix(s, radix).map_err(|_| format!("sysroot.meta: {line}"));
+        let label = (label != "-").then(|| {
+            let mut l = label.as_bytes().to_vec();
+            l.push(0);
+            l
+        });
+        let capability = if cap == "-" {
+            None
+        } else {
+            Some((0..cap.len()).step_by(2).map(|i| u8::from_str_radix(&cap[i..i + 2], 16)).collect::<Result<Vec<u8>, _>>().map_err(|_| format!("sysroot.meta: {line}"))?)
+        };
+        out.insert(path.as_bytes().to_vec(), ImageMeta { uid: num(uid, 10)?, gid: num(gid, 10)?, mode: num(mode, 8)?, label, capability });
+    }
+    Ok(out)
+}
+
 pub const DT_CHR: u8 = 2;
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
@@ -30,6 +69,8 @@ pub struct Sysroot {
     manifest: Manifest,
     children: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     backings: Mutex<HashMap<Vec<u8>, Arc<Backing>>>,
+    /// Each image path's owner, mode, label and capability (`sysroot.meta`; empty without one).
+    meta: HashMap<Vec<u8>, ImageMeta>,
 }
 
 impl Sysroot {
@@ -67,7 +108,23 @@ impl Sysroot {
             }
             manifest.entries.insert(file.guest, file.entry);
         }
-        Ok(Self::build(dir, manifest, overlay))
+        let mut sysroot = Self::build(dir, manifest, overlay);
+        let meta_path = dir.join("sysroot.meta");
+        if let Ok(bytes) = std::fs::read(&meta_path) {
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            if digest != SYSROOT_META_SHA256 && std::env::var("OMNI_SYSROOT_UNPINNED").as_deref() != Ok("1") {
+                return Err(format!("{}: sha256 {digest} is not the pinned {SYSROOT_META_SHA256} (tools/make_sysroot.py --meta)", meta_path.display()));
+            }
+            let meta = parse_meta(&String::from_utf8_lossy(&bytes))?;
+            Arc::get_mut(&mut sysroot).expect("a new sysroot").meta = meta;
+        }
+        Ok(sysroot)
+    }
+
+    /// An image path's owner, mode, label and capability.
+    #[must_use]
+    pub fn image_meta(&self, path: &[u8]) -> Option<&ImageMeta> {
+        self.meta.get(path)
     }
 
     #[must_use]
@@ -85,7 +142,7 @@ impl Sysroot {
             let parent = if cut == 0 { b"/".to_vec() } else { path[..cut].to_vec() };
             children.entry(parent).or_default().push(path[cut + 1..].to_vec());
         }
-        Arc::new(Self { objects: dir.join("objects"), overlay, manifest, children, backings: Mutex::default() })
+        Arc::new(Self { objects: dir.join("objects"), overlay, manifest, children, backings: Mutex::default(), meta: HashMap::new() })
     }
 
     /// The names in a sysroot directory.

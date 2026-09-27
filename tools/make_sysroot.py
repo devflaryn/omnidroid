@@ -6,11 +6,13 @@ Runs on Linux (needs `debugfs`; `fsck.erofs` only if an APEX payload is erofs). 
                                         only by case (seven ringtones do) or be names Windows reserves,
                                         and symlinks are NOT created (Windows cannot hold them)
   <out>/sysroot.manifest    every directory, file (mode, size, sha256) and symlink (target)
+  <out>/sysroot.meta        (--meta) every path's owner, mode, SELinux label and file capability
 
     python3 tools/make_sysroot.py --zip arm64-v8a-35_r02.zip --out sysroot/aosp-35
+    python3 tools/make_sysroot.py --zip arm64-v8a-35_r02.zip --out sysroot/aosp-35 --meta
     python3 tools/make_sysroot.py --verify sysroot/aosp-35
 """
-import argparse, hashlib, io, os, shutil, stat, struct, subprocess, sys, tempfile, zipfile
+import argparse, hashlib, io, os, re, shutil, stat, struct, subprocess, sys, tempfile, zipfile
 
 IMAGE_NAME = "arm64-v8a-35_r02.zip"
 IMAGE_SHA1 = "2026a06409db630b56711afdbffb457c1dbaed49"
@@ -208,6 +210,108 @@ def build(zip_path, out):
     print("entries", len(lines) - 1)
 
 
+def image_meta(image, paths):
+    """{path: [uid, gid, mode, label, capability]} of `paths` inside ext4 `image`, as its inodes and
+    extended attributes hold them (what a device's mounted image reports: fs_config's owners and
+    modes, file_contexts' labels, file capabilities) -- lost when files are extracted unprivileged."""
+    cmds = image + ".cmds"
+    with open(cmds, "w", newline="\n") as f:
+        for p in paths:
+            f.write('stat "%s"\n' % p)
+    out = subprocess.run(["debugfs", "-f", cmds, image], capture_output=True, text=True,
+                         errors="surrogateescape").stdout
+    os.remove(cmds)
+    meta, cur = {}, None
+    for line in out.splitlines():
+        if line.startswith("debugfs: stat "):
+            cur = line[len("debugfs: stat "):].strip().strip('"')
+            meta[cur] = [0, 0, 0, "", "-"]
+        elif cur is None:
+            continue
+        elif line.startswith("Inode:") and (m := re.search(r"Mode:\s+(\d+)", line)):
+            meta[cur][2] = int(m.group(1), 8)
+        elif m := re.match(r"User:\s+(\d+)\s+Group:\s+(\d+)", line):
+            meta[cur][0], meta[cur][1] = int(m.group(1)), int(m.group(2))
+        elif m := re.match(r'\s+security\.selinux \(\d+\) = "(.*?)(\\000)?"$', line):
+            meta[cur][3] = m.group(1)
+        elif m := re.match(r"\s+security\.capability \(\d+\) = ([0-9a-f ]+)$", line):
+            meta[cur][4] = m.group(1).replace(" ", "")
+    return meta
+
+
+def build_meta(zip_path, out):
+    """<out>/sysroot.meta: every manifest path's owner, mode, SELinux label and file capability,
+    read from the pinned image's filesystems."""
+    if os.path.basename(zip_path) != IMAGE_NAME or sha1_of(zip_path) != IMAGE_SHA1:
+        sys.exit(f"{zip_path}: not the pinned {IMAGE_NAME} (sha1 {IMAGE_SHA1})")
+    guests = []
+    for line in open(os.path.join(out, "sysroot.manifest"), encoding="utf-8"):
+        if not line.startswith("#"):
+            guests.append(line.rstrip("\n").rsplit("\t", 1)[1])
+    staging = tempfile.mkdtemp(prefix="sysmeta-", dir=os.path.dirname(os.path.abspath(out)) or ".")
+    with zipfile.ZipFile(zip_path) as z:
+        z.extract("arm64-v8a/system.img", staging)
+    img_path = os.path.join(staging, "arm64-v8a", "system.img")
+    images = {}
+    with open(img_path, "rb") as img:
+        super_off, _ = gpt_partition(img)
+        parts = lp_partitions(img, super_off)
+        for name in PARTITIONS:
+            part_img = os.path.join(staging, f"{name}.img")
+            copy_extents(img, parts[name], part_img)
+            images[name] = part_img
+    os.remove(img_path)
+    apex_files = os.path.join(staging, "apexfiles")
+    os.makedirs(apex_files)
+    subprocess.run(["debugfs", "-R", f"rdump /system/apex {apex_files}", images["system"]], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    payloads = {}
+    for entry in sorted(os.listdir(os.path.join(apex_files, "apex"))):
+        path = os.path.join(apex_files, "apex", entry)
+        if entry.endswith(".capex"):
+            with zipfile.ZipFile(path) as z:
+                data = z.read("original_apex")
+        elif entry.endswith(".apex"):
+            data = open(path, "rb").read()
+        else:
+            continue
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            name = apex_name(z.read("apex_manifest.pb")) or entry.rsplit(".", 1)[0]
+            payload = os.path.join(staging, f"apex-{name}.img")
+            with open(payload, "wb") as f:
+                f.write(z.read("apex_payload.img"))
+        payloads[name] = payload
+    # Each guest path's image, and its path in that image.
+    wanted = {}
+    for g in guests:
+        where = None
+        if g == "/system" or g.startswith("/system/"):
+            where = (images["system"], g)
+        for name, mount in PARTITIONS.items():
+            if mount and (g == mount or g.startswith(mount + "/")):
+                where = (images[name], g[len(mount):] or "/")
+        if g.startswith("/apex/"):
+            name, _, rest = g[len("/apex/"):].partition("/")
+            if name in payloads:
+                where = (payloads[name], "/" + rest)
+        if where:
+            wanted.setdefault(where[0], []).append((g, where[1]))
+    lines = []
+    for image, pairs in wanted.items():
+        meta = image_meta(image, [inner for _, inner in pairs])
+        for g, inner in pairs:
+            if inner in meta:
+                uid, gid, mode, label, cap = meta[inner]
+                lines.append(f"{g}\t{uid}\t{gid}\t{mode & 0o7777:o}\t{label or '-'}\t{cap}")
+    lines.sort(key=lambda l: l.split("\t", 1)[0])
+    path = os.path.join(out, "sysroot.meta")
+    with open(path, "w", newline="\n") as f:
+        f.write(f"# omnidroid sysroot meta v1 image={IMAGE_NAME} sha1={IMAGE_SHA1}\n" + "\n".join(lines) + "\n")
+    shutil.rmtree(staging)
+    print("sysroot.meta sha256", hashlib.sha256(open(path, "rb").read()).hexdigest())
+    print("entries", len(lines), "of", len(guests))
+
+
 def verify(out):
     bad = 0
     for line in open(os.path.join(out, "sysroot.manifest"), encoding="utf-8"):
@@ -226,5 +330,6 @@ def verify(out):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--zip"); ap.add_argument("--out"); ap.add_argument("--verify")
+    ap.add_argument("--meta", action="store_true", help="write <out>/sysroot.meta for an existing sysroot")
     a = ap.parse_args()
-    sys.exit(verify(a.verify) if a.verify else build(a.zip, a.out))
+    sys.exit(verify(a.verify) if a.verify else build_meta(a.zip, a.out) if a.meta else build(a.zip, a.out))

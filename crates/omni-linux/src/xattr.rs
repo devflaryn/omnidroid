@@ -20,6 +20,7 @@ const XATTR_REPLACE: u64 = 2;
 const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
 const SELINUX: &[u8] = b"security.selinux";
+const CAPABILITY: &[u8] = b"security.capability";
 /// What the kernel reports for a file with no context of its own.
 const UNLABELED: &[u8] = b"u:object_r:unlabeled:s0\0";
 
@@ -108,16 +109,32 @@ fn get(p: &Process, key: Key, a: [u64; 6]) -> SysResult {
             c.push(0);
             c
         }
+        // An image path: the image's label and capability.
+        None if image_attr(p, &key, &name).is_some() => image_attr(p, &key, &name).expect("checked"),
         None if name == SELINUX => UNLABELED.to_vec(),
         None => return Err(ENODATA),
     };
     reply(p, a[2], a[3], &value)
 }
 
+/// An image path's `security.selinux` or `security.capability`.
+fn image_attr(p: &Process, key: &Key, name: &[u8]) -> Option<Vec<u8>> {
+    let Key::Guest(_, path) = key else { return None };
+    let meta = p.vfs.sysroot().image_meta(path)?;
+    match name {
+        SELINUX => meta.label.clone(),
+        CAPABILITY => meta.capability.clone(),
+        _ => None,
+    }
+}
+
 fn list(p: &Process, key: Key, a: [u64; 6]) -> SysResult {
     let mut names = store().lock().get(&key).map(|attrs| attrs.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
     if !names.iter().any(|n| n == SELINUX) {
         names.push(SELINUX.to_vec());
+    }
+    if !names.iter().any(|n| n == CAPABILITY) && image_attr(p, &key, CAPABILITY).is_some() {
+        names.push(CAPABILITY.to_vec());
     }
     names.sort();
     let mut out = Vec::new();
