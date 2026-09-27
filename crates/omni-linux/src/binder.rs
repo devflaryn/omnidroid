@@ -145,6 +145,10 @@ struct Node {
     txn_security_ctx: bool,
     dead: bool,
     watchers: Vec<(ProcId, u64)>,
+    /// A oneway transaction to this node is out (delivered, its buffer not yet freed): the next
+    /// waits in `async_todo`, so one node's oneway calls run one at a time, in order.
+    has_async: bool,
+    async_todo: VecDeque<Work>,
 }
 
 /// A transaction or reply on its way, with its objects already translated for the receiver.
@@ -214,6 +218,9 @@ struct ProcState {
 struct State {
     procs: HashMap<ProcId, ProcState>,
     nodes: HashMap<NodeId, Node>,
+    /// The buffers oneway transactions were delivered in, by (receiver, address): freeing one
+    /// hands its node's next oneway transaction out.
+    async_buffers: HashMap<(ProcId, u64), NodeId>,
     /// (owner, ptr) -> node
     local: HashMap<(ProcId, u64), NodeId>,
     context_mgr: Option<NodeId>,
@@ -302,6 +309,8 @@ impl State {
                 txn_security_ctx: flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0,
                 dead: false,
                 watchers: Vec::new(),
+                has_async: false,
+                async_todo: VecDeque::new(),
             },
         );
         self.local.insert((owner, ptr), id);
@@ -758,7 +767,8 @@ pub fn mmap(p: &Process, t: &Task, file: &Arc<BinderFile>, len: u64) -> Result<u
     Ok(at)
 }
 
-pub fn ioctl(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmd: u64, arg: u64) -> SysResult {
+/// `nonblocking`: the descriptor is O_NONBLOCK -- a read with nothing to hand out answers EAGAIN.
+pub fn ioctl(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmd: u64, arg: u64, nonblocking: bool) -> SysResult {
     match cmd {
         BINDER_VERSION => p.mem.write_u32(arg, 8).map(|()| 0),
         BINDER_SET_MAX_THREADS => {
@@ -787,12 +797,12 @@ pub fn ioctl(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmd: u64, arg: u
             }
             Ok(0)
         }
-        BINDER_WRITE_READ => write_read(p, t, file, arg),
+        BINDER_WRITE_READ => write_read(p, t, file, arg, nonblocking),
         _ => Err(EINVAL),
     }
 }
 
-fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64) -> SysResult {
+fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64, nonblocking: bool) -> SysResult {
     let bwr = p.mem.read(arg, 48)?;
     let (write_size, mut write_consumed, write_buffer) = (u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 16));
     let (read_size, mut read_consumed, read_buffer) = (u64_at(&bwr, 24), u64_at(&bwr, 32), u64_at(&bwr, 40));
@@ -823,7 +833,6 @@ fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64) -> Sy
         write_consumed += at as u64;
     }
     if result.is_ok() && read_size > read_consumed {
-        let nonblocking = false;
         match read(p, t, file, read_buffer + read_consumed, read_size - read_consumed, read_consumed == 0, nonblocking) {
             Ok(n) => read_consumed += n,
             Err(e) => result = Err(e),
@@ -846,7 +855,22 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG => {
             transaction(p, t, file, arg, matches!(code, BC_REPLY | BC_REPLY_SG))?;
         }
-        BC_FREE_BUFFER => file.area.lock().free(u64_at(arg, 0)),
+        BC_FREE_BUFFER => {
+            let ptr = u64_at(arg, 0);
+            file.area.lock().free(ptr);
+            // A oneway transaction's buffer: its node's next oneway goes to this thread.
+            let mut st = file.broker.state.lock();
+            if let Some(node) = st.async_buffers.remove(&(file.id, ptr)) {
+                let next = st.nodes.get_mut(&node).and_then(|n| {
+                    let w = n.async_todo.pop_front();
+                    n.has_async = w.is_some();
+                    w
+                });
+                if let Some(w) = next {
+                    st.queue(file.id, Some(t.tid), w);
+                }
+            }
+        }
         BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS | BC_INCREFS_DONE | BC_ACQUIRE_DONE | BC_DEAD_BINDER_DONE => {}
         BC_REGISTER_LOOPER | BC_ENTER_LOOPER => {
             let mut st = file.broker.state.lock();
@@ -1075,6 +1099,17 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         st.queue(file.id, Some(t.tid), if reply { Work::FailedReply } else { Work::DeadReply });
         return Ok(());
     }
+    // A oneway transaction waits while one to the same node is out, as the driver orders them.
+    if oneway {
+        if let Some(n) = st.local.get(&(target_proc, target_ptr)).copied().and_then(|id| st.nodes.get_mut(&id)) {
+            if n.has_async {
+                n.async_todo.push_back(Work::Txn(Box::new(txn)));
+                st.queue(file.id, Some(t.tid), Work::Complete);
+                return Ok(());
+            }
+            n.has_async = true;
+        }
+    }
     st.queue(target_proc, target_tid, Work::Txn(Box::new(txn)));
     st.queue(file.id, Some(t.tid), Work::Complete);
     Ok(())
@@ -1168,6 +1203,12 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
             let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
             let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
             let buf = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len).ok_or(ENOMEM)?;
+            if txn.oneway && !txn.reply {
+                let mut st = file.broker.state.lock();
+                if let Some(node) = st.local.get(&(file.id, txn.target_ptr)).copied() {
+                    st.async_buffers.insert((file.id, buf), node);
+                }
+            }
             // Scatter-gather buffers go after the offsets: each object points at its copy, and a
             // child's address is written into its parent's copy where the sender had it.
             let mut sg_at = Vec::with_capacity(txn.sg.len());

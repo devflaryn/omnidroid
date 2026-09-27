@@ -912,7 +912,8 @@ fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         _ => None,
     };
     if let Some(b) = binder {
-        return crate::binder::ioctl(p, t, &b, a[1], a[2]);
+        let nonblocking = *file.flags.lock() & 0o4000 != 0;
+        return crate::binder::ioctl(p, t, &b, a[1], a[2], nonblocking);
     }
     let gpu = match &*file.kind.lock() {
         FileKind::Gpu(g) => Some(Arc::clone(g)),

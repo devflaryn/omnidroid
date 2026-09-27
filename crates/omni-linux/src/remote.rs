@@ -297,7 +297,7 @@ impl Server {
                 loop {
                     let Ok((kind, body)) = receive(&mut stream) else { break };
                     let ret: u64 = match kind {
-                        IOCTL => match crate::binder::ioctl(&p, &mut task, &file, u64_at(&body, 0), u64_at(&body, 8)) {
+                        IOCTL => match crate::binder::ioctl(&p, &mut task, &file, u64_at(&body, 0), u64_at(&body, 8), false) {
                             Ok(v) => v,
                             Err(e) => e.as_return(),
                         },
