@@ -1143,14 +1143,16 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
     match code {
         BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG => {
             let reply = matches!(code, BC_REPLY | BC_REPLY_SG);
-            // The caller a reply answers, before the reply takes it off the thread.
+            // A reply takes the transaction it answers off the thread first, whatever becomes of
+            // the reply (the kernel's `thread->transaction_stack = in_reply_to->to_parent`): the
+            // caller it answers, if any is still waiting.
             let caller = if reply {
                 let mut st = file.broker.state.lock();
-                st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.last().copied().flatten()
+                st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.pop().flatten()
             } else {
                 None
             };
-            if let Err(e) = transaction(p, t, file, arg, reply) {
+            if let Err(e) = transaction(p, t, file, arg, reply, caller) {
                 if std::env::var("OMNI_BINDER_TRACE").is_ok() || crate::remote::is_remote() || p.trace {
                     eprintln!("[binder] {}:{} {} failed: {e:?}", p.sys.pid, t.tid, if reply { "reply" } else { "transaction" });
                 }
@@ -1158,10 +1160,6 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                 if reply {
                     // binder_transaction's error path for a reply: the replier completes, and the
                     // one waiting for it hears BR_FAILED_REPLY.
-                    let th = st.proc_mut(file.id).threads.entry(t.tid).or_default();
-                    if th.serving.last().copied().flatten() == caller && caller.is_some() {
-                        th.serving.pop();
-                    }
                     st.queue(file.id, Some(t.tid), Work::Complete);
                     if let Some((proc, tid)) = caller {
                         st.queue(proc, Some(tid), Work::FailedReply);
@@ -1237,8 +1235,8 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
 }
 
 /// `BC_TRANSACTION`/`BC_REPLY`: read the sender's buffer, translate its objects for the receiver,
-/// and queue it.
-fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], reply: bool) -> Result<(), Errno> {
+/// and queue it. A reply goes to `caller`, the waiting thread of the transaction it answers.
+fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], reply: bool, caller: Option<(ProcId, i32)>) -> Result<(), Errno> {
     let handle = u32_at(tr, 0);
     let (code, flags) = (u32_at(tr, 16), u32_at(tr, 20));
     let (data_size, offsets_size) = (u64_at(tr, 32), u64_at(tr, 40));
@@ -1253,8 +1251,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
 
     // Where it goes.
     let (target_proc, target_tid, target_ptr, target_cookie, secctx, from, target_node) = if reply {
-        let serving = st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.pop().flatten();
-        let Some((proc, tid)) = serving else {
+        let Some((proc, tid)) = caller else {
             // The one who asked is gone, or this was not a sync transaction: nothing to answer.
             st.queue(file.id, Some(t.tid), Work::Complete);
             return Ok(());
