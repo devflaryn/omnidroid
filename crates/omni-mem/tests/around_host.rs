@@ -37,11 +37,15 @@ fn granule() -> usize {
     vm::allocation_granularity().max(vm::page_size())
 }
 
-/// A range of `len` bytes nothing holds right now.
+/// A range of `len` bytes nothing holds right now: the middle third of a probe reserved by the
+/// host's choice and given back. The middle, because whatever the process allocates next (a
+/// `malloc` large enough for its own `mmap`, say) lands at one end of a gap that has just opened:
+/// MEASURED on Linux (top-down) and macOS (bottom-up), where a probe used whole intermittently
+/// had a stranger inside it by the time the space was reserved.
 fn free_range(len: usize) -> usize {
-    let probe = GuestSpace::with_config(GuestSpaceConfig { size: len, ..GuestSpaceConfig::default() })
+    let probe = GuestSpace::with_config(GuestSpaceConfig { size: 3 * len, ..GuestSpaceConfig::default() })
         .expect("a probe space");
-    let base = probe.base();
+    let base = probe.base() + len;
     probe.close().expect("the probe released");
     base
 }
