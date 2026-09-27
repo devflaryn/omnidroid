@@ -20,6 +20,7 @@ const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 10;
 const AF_NETLINK: u64 = 16;
+const AF_KEY: u64 = 15;
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
@@ -238,7 +239,9 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
 
 fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let (domain, ty) = (a[0], a[1]);
-    if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK) {
+    // AF_KEY too: key management with no security associations (netd opens and closes one to
+    // have the kernel synchronize RCU before it swaps its traffic-stats maps).
+    if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK | AF_KEY) {
         return Err(EAFNOSUPPORT);
     }
     let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new(), name: None, protocol: a[2], owner: p.sys.pid as u32, passcred: false };
