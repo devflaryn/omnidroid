@@ -141,14 +141,31 @@ fn signal_trace() -> bool {
 /// around them (`GuestSpaceConfig::around_host`).
 const GUEST_SPACE_LOW_BASE: usize = 0x1000_0000;
 
+/// The least of a low space that must be free for it to be taken: the host's own pieces of that
+/// range (`KUSER_SHARED_DATA`, a DLL, a thread's stack) are megabytes, never gigabytes.
+const LOW_SPACE_MIN_FREE: usize = GUEST_SPACE_BYTES / 2;
+
 /// The guest space, at [`GUEST_SPACE_LOW_BASE`] if the host has that free, else wherever it
 /// chooses (a program that needs no low memory still runs; ART will not).
-fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
+///
+/// "Free" means most of the range. Every process of a host process asks for the same low range,
+/// and the one that holds it (system_server) was reserved around what the host held there then --
+/// host threads' 1 MiB stacks among them. When such a thread exits, its stack is the one free
+/// piece of the range, and a space reserved around everything else "succeeded" with 1 MiB free of
+/// 64 GiB: every service init started after that failed to map its first segment (D5, ~1 boot in
+/// 3, right after odsign stopped). Such a space is given back and the host chooses.
+pub fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
     let config = |base: Option<usize>| GuestSpaceConfig { base, size: GUEST_SPACE_BYTES, around_host: base.is_some(), ..GuestSpaceConfig::default() };
-    GuestSpace::with_config(config(Some(GUEST_SPACE_LOW_BASE))).or_else(|e| {
-        tracing::warn!(%e, "no guest space below 4 GiB; reserving where the host chooses");
-        GuestSpace::with_config(config(None))
-    })
+    match GuestSpace::with_config(config(Some(GUEST_SPACE_LOW_BASE))) {
+        Ok(low) if low.stats().free >= LOW_SPACE_MIN_FREE => Ok(low),
+        low => {
+            match low {
+                Ok(low) => tracing::debug!(free = low.stats().free, "the low range is mostly another's; reserving where the host chooses"),
+                Err(e) => tracing::warn!(%e, "no guest space below 4 GiB; reserving where the host chooses"),
+            }
+            GuestSpace::with_config(config(None))
+        }
+    }
 }
 const STACK_BYTES: u64 = 8 << 20;
 /// Process ids: 1000 for the first live process of this host process, then the next free
