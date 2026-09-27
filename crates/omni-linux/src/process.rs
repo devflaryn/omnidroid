@@ -259,7 +259,12 @@ impl Process {
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
         // 128 guest threads: ART alone starts about twenty, and Roblox runs dozens.
-        let options = DynarmicOptions { top_byte_ignore: true, max_threads: 128, ..DynarmicOptions::default() };
+        let mut options = DynarmicOptions { top_byte_ignore: true, max_threads: 128, ..DynarmicOptions::default() };
+        // OMNI_DYNARMIC_OPT=<hex mask>: run with only these (safe) JIT optimizations -- 0 for none,
+        // to tell a translation fault from a kernel one.
+        if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+            options.optimizations_override = Some(mask);
+        }
         let backend = DynarmicBackend::new(Arc::clone(&space), options).map_err(|e| format!("the CPU backend: {e}"))?;
         let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(backend), 0);
         let mut loader = Task::new(PID, Arc::clone(&p));
