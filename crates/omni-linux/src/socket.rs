@@ -218,6 +218,41 @@ pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
     Ok(n)
 }
 
+/// `getsockopt`: the few options callers read. `SO_PEERCRED` reports the peer as init (a local
+/// service's client-credential check then passes); `SO_TYPE` the socket's type; `SO_ERROR` none;
+/// buffer sizes a plausible value. Everything else is zeroed.
+fn sys_getsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    let ty = match &*file.kind.lock() {
+        FileKind::Socket(s) => s.ty,
+        _ => return Err(crate::errno::ENOTSOCK),
+    };
+    let (level, name, val, len_ptr) = (a[1], a[2], a[3], a[4]);
+    let write = |bytes: &[u8]| -> SysResult {
+        let cap = p.mem.read_u32(len_ptr)? as usize;
+        let n = bytes.len().min(cap);
+        p.mem.write(val, &bytes[..n])?;
+        p.mem.write_u32(len_ptr, n as u32)?;
+        Ok(0)
+    };
+    const SOL_SOCKET: u64 = 1;
+    if level == SOL_SOCKET {
+        match name {
+            17 => {
+                // SO_PEERCRED: struct ucred { pid, uid, gid }.
+                let mut c = [0u8; 12];
+                c[0..4].copy_from_slice(&1i32.to_le_bytes());
+                return write(&c);
+            }
+            3 => return write(&(ty as u32).to_le_bytes()), // SO_TYPE
+            4 => return write(&0u32.to_le_bytes()),        // SO_ERROR
+            7 | 8 => return write(&(256 * 1024u32).to_le_bytes()), // SO_SNDBUF/RCVBUF
+            _ => return write(&0u32.to_le_bytes()),
+        }
+    }
+    write(&0u32.to_le_bytes())
+}
+
 fn sys_recvfrom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let mut buf = vec![0u8; (a[2] as usize).min(1 << 20)];
@@ -233,6 +268,7 @@ fn sys_recvfrom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 pub fn install(table: &mut Table) {
     table.set(nr::RECVFROM, sys_recvfrom);
     table.set(nr::SOCKET, sys_socket);
+    table.set(nr::GETSOCKOPT, sys_getsockopt);
     table.set(nr::CONNECT, sys_connect);
     table.set(nr::SENDTO, sys_sendto);
     table.set(nr::SENDMSG, sys_sendmsg);

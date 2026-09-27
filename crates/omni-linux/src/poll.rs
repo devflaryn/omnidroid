@@ -266,6 +266,7 @@ fn readiness(file: &OpenFile, now: Instant) -> (u32, Option<Instant>) {
         FileKind::Epoll(ep) => (if ep.any_ready(now) { IN } else { 0 }, None),
         FileKind::Socket(_) => (OUT, None),
         FileKind::Binder(b) => (b.readiness(), None),
+        FileKind::Inotify(_) => (0, None),
         _ => (IN | OUT, None),
     }
 }

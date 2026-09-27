@@ -50,6 +50,9 @@ pub enum FileKind {
     Binder(Arc<crate::binder::BinderFile>),
     /// A shared-memory region (`memfd_create`, `/dev/ashmem`).
     Shared(Arc<crate::shm::Shm>),
+    /// An inotify instance: watches are accepted, no event is ever reported (nothing here changes
+    /// a watched path behind the app's back). The `AtomicI32` is the next watch descriptor.
+    Inotify(Arc<std::sync::atomic::AtomicI32>),
 }
 
 impl FileKind {
@@ -261,6 +264,7 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Ok(Stat { ino: 4, mode: 0o600, nlink: 1, ..Stat::default() }),
         FileKind::Binder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
         FileKind::Shared(m) => Ok(Stat { ino: 5, mode: S_IFREG | 0o600, nlink: 1, size: m.len() as i64, blocks: (m.len() as i64 + 511) / 512, ..Stat::default() }),
+        FileKind::Inotify(_) => Ok(Stat { ino: 6, mode: 0o600, nlink: 1, ..Stat::default() }),
     }
 }
 
@@ -296,6 +300,8 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
             Some(off) => m.read_at(buf, off),
             None => m.read_seq(buf),
         },
+        FileKind::Inotify(_) => Err(EAGAIN), // no event is ever ready
+
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
             let n = buf.len().min(data.len() - from);
@@ -342,6 +348,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dev(_) => Ok(bytes.len()),
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Shared(m) => m.write_seq(bytes),
+        FileKind::Inotify(_) => Err(EBADF),
         FileKind::Synth { .. } => Err(EACCES),
         FileKind::Socket(s) => crate::socket::send(s, bytes),
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
@@ -370,6 +377,25 @@ fn base_dir(p: &Process, dirfd: u64, path: &[u8]) -> Result<Vec<u8>, Errno> {
 
 /// `memfd_create(name, flags)`: an anonymous shared-memory region. `MFD_CLOEXEC` (bit 0) is
 /// honoured; the sealing and huge-page flags are accepted and have no effect here.
+fn sys_inotify_init1(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = Arc::new(OpenFile { kind: Mutex::new(FileKind::Inotify(Arc::default())), flags: Mutex::new(a[0] as u32 & 0o4000) });
+    Ok(p.fds.insert(file, a[0] & 0o2000000 != 0, 0)? as u64)
+}
+
+fn sys_inotify_add_watch(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
+        FileKind::Inotify(next) => Ok(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed).max(1) as u64),
+        _ => Err(EINVAL),
+    }
+}
+
+fn sys_inotify_rm_watch(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
+        FileKind::Inotify(_) => Ok(0),
+        _ => Err(EINVAL),
+    }
+}
+
 fn sys_memfd_create(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let name = p.mem.read_cstr(a[0], 249)?;
     let m = crate::shm::Shm::create(&String::from_utf8_lossy(&name))?;
@@ -583,6 +609,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Dev(DevNode::Kmsg) => b"/dev/kmsg".to_vec(),
         FileKind::Dev(DevNode::Ashmem) => b"/dev/ashmem".to_vec(),
         FileKind::Shared(m) => format!("/memfd:{} (deleted)", m.name).into_bytes(),
+        FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
     }
 }
 
@@ -943,6 +970,9 @@ pub fn install(table: &mut Table) {
     table.set(nr::RENAMEAT2, sys_renameat2);
     table.set(nr::FTRUNCATE, sys_ftruncate);
     table.set(nr::MEMFD_CREATE, sys_memfd_create);
+    table.set(nr::INOTIFY_INIT1, sys_inotify_init1);
+    table.set(nr::INOTIFY_ADD_WATCH, sys_inotify_add_watch);
+    table.set(nr::INOTIFY_RM_WATCH, sys_inotify_rm_watch);
     table.set(nr::FSYNC, sys_fsync);
     table.set(nr::FDATASYNC, sys_fsync);
     table.set(nr::UTIMENSAT, sys_utimensat);

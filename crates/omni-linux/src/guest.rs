@@ -114,6 +114,10 @@ impl GuestMem {
         self.write(addr, &value.to_le_bytes())
     }
 
+    pub fn read_u32(&self, addr: u64) -> Result<u32, Errno> {
+        Ok(u32::from_le_bytes(self.read(addr, 4)?.try_into().expect("four bytes")))
+    }
+
     pub fn write_u32(&self, addr: u64, value: u32) -> Result<(), Errno> {
         self.write(addr, &value.to_le_bytes())
     }
