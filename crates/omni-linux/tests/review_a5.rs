@@ -214,10 +214,11 @@ fn rt_sigsuspend_waits_under_a_temporary_mask() {
 #[test]
 fn a_blocked_default_action_signal_stays_pending_and_does_not_kill_the_sender() {
     let (p, _s) = process();
-    let mut t = Task::new(1000, Arc::clone(&p)); // the pid: the main task
+    let pid = p.sys.pid;
+    let mut t = Task::new(pid, Arc::clone(&p)); // the pid: the main task
     let quit = 1u64 << (3 - 1);
     t.sigmask = quit;
-    assert_eq!(p.syscall(&mut t, nr::TGKILL, [1000, 1000, 3, 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, nr::TGKILL, [pid as u64, pid as u64, 3, 0, 0, 0]), 0);
     assert!(t.exit.is_none(), "the sender is not killed: {:?}", t.exit);
     assert_ne!(t.pending.load(Ordering::SeqCst) & quit, 0, "pending for sigwait");
 }

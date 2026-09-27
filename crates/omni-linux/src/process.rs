@@ -131,7 +131,17 @@ fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
     })
 }
 const STACK_BYTES: u64 = 8 << 20;
-const PID: i32 = 1000;
+/// Process ids: 1000 for the first live process of this host process, then the next free
+/// thousand, so processes that run side by side (servicemanager, system_server, an app) are told
+/// apart -- by binder's sender pid, by `/proc/<pid>` -- and their thread ids never meet.
+static LIVE_PIDS: Mutex<std::collections::BTreeSet<i32>> = Mutex::new(std::collections::BTreeSet::new());
+
+fn allocate_pid() -> i32 {
+    let mut live = LIVE_PIDS.lock();
+    let pid = (1..).map(|k| k * 1000).find(|p| !live.contains(p)).expect("a free pid");
+    live.insert(pid);
+    pid
+}
 const UID: u32 = 10000;
 
 fn altstack_disabled() -> [u8; 24] {
@@ -216,6 +226,7 @@ impl Process {
         let comm = argv.first().map_or_else(Vec::new, |a| {
             a.rsplit(|&b| b == b'/').next().unwrap_or(a).iter().copied().take(15).collect()
         });
+        let pid = allocate_pid();
         let layout = crate::guest::Layout::default();
         let p = Arc::new(Self {
             mem: GuestMem::new(Arc::clone(&space), Arc::clone(&layout)),
@@ -225,11 +236,11 @@ impl Process {
             fds: FdTable::standard(stdout, stderr),
             cwd: Mutex::new(b"/".to_vec()),
             mm: Mm::new(space, layout),
-            sys: SysState::new(PID, uid),
+            sys: SysState::new(pid, uid),
             futexes: crate::futex::Futexes::default(),
             tasks: Mutex::new(std::collections::HashMap::new()),
             task_ended: parking_lot::Condvar::new(),
-            next_tid: std::sync::atomic::AtomicI32::new(PID + 1),
+            next_tid: std::sync::atomic::AtomicI32::new(pid + 1),
             group_exit: Mutex::new(None),
             trace,
             argv,
@@ -284,7 +295,7 @@ impl Process {
         }
         let backend = DynarmicBackend::new(Arc::clone(&space), options).map_err(|e| format!("the CPU backend: {e}"))?;
         let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(backend), 0, uid);
-        let mut loader = Task::new(PID, Arc::clone(&p));
+        let mut loader = Task::new(p.sys.pid, Arc::clone(&p));
         let name = |e| format!("{}: {e:?}", String::from_utf8_lossy(&exe));
         let program = exec::load_elf(&p, &loader, &exe).map_err(name)?;
         let (entry, base) = match &program.interp {
@@ -339,12 +350,12 @@ impl Process {
         // `cpu.run` -- a `&mut Task` held there let the optimizer keep `exit` in a register and
         // miss `exit_group` (a release-only hang that recursed bionic's exit onto the guard page).
         // It is a raw pointer, and the loop reads it with a volatile load.
-        let task: *mut Task = Box::into_raw(Box::new(Task::new(PID, Arc::clone(self))));
+        let task: *mut Task = Box::into_raw(Box::new(Task::new(self.sys.pid, Arc::clone(self))));
         cpu.set_svc_handler(on_svc, ThunkContext(task as usize)).expect("the syscall entry");
         cpu.set_sp(sp as usize);
         // SAFETY: `task` is live (just made); nothing else reaches it yet.
         let pending = Arc::clone(unsafe { &(*task).pending });
-        self.tasks.lock().insert(PID, TaskHandle { halt: cpu.halt_handle(), pending });
+        self.tasks.lock().insert(self.sys.pid, TaskHandle { halt: cpu.halt_handle(), pending });
         let (status, asked) = self.run_task(&mut *cpu, task, pc);
         drop(cpu);
         // SAFETY: `task` came from `Box::into_raw` above, and the only other path to it, the CPU's
@@ -473,7 +484,7 @@ impl Process {
     pub fn tids(&self) -> Vec<i32> {
         let mut tids: Vec<i32> = self.tasks.lock().keys().copied().collect();
         if tids.is_empty() {
-            tids.push(PID); // a process that has not started runs as its main task
+            tids.push(self.sys.pid); // a process that has not started runs as its main task
         }
         tids.sort_unstable();
         tids
@@ -736,6 +747,12 @@ impl Process {
     }
 
     pub fn test_task(self: &Arc<Self>) -> Task {
-        Task::new(PID, Arc::clone(self))
+        Task::new(self.sys.pid, Arc::clone(self))
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        LIVE_PIDS.lock().remove(&self.sys.pid);
     }
 }

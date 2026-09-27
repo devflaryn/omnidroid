@@ -27,5 +27,7 @@ fn a2_cat_proc_self_maps_names_the_program_its_libraries_and_its_stack() {
 fn a2_ps_shows_this_process() {
     let Some((status, out, err)) = run(&["/system/bin/toybox", "ps", "-A"]) else { return };
     assert_eq!(status, ExitStatus::Exited(0), "stderr: {err}");
-    assert!(out.lines().any(|l| l.contains(" 1000 ") && l.ends_with("toybox")), "{out}");
+    // Its pid: 1000, or the next free thousand when other tests' processes are alive.
+    let pid = |l: &str| l.split_whitespace().nth(1).and_then(|p| p.parse::<i32>().ok()).is_some_and(|p| p % 1000 == 0);
+    assert!(out.lines().any(|l| pid(l) && l.ends_with("toybox")), "{out}");
 }

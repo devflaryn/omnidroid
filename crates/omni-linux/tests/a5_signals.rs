@@ -44,6 +44,6 @@ fn a_fault_while_sigsegv_is_blocked_or_ignored_kills() {
 /// abort(): SIGABRT's default action ends the process by that signal, taken on delivery.
 #[test]
 fn abort_ends_the_process_by_sigabrt() {
-    let Some((status, _out, err)) = common::run(&["/system/bin/toybox", "kill", "-ABRT", "1000"]) else { return };
+    let Some((status, _out, err)) = common::run(&["/system/bin/sh", "-c", "kill -ABRT $$"]) else { return };
     assert!(matches!(status, ExitStatus::Killed { signal: 6, .. }), "{status:?}\n{err}");
 }
