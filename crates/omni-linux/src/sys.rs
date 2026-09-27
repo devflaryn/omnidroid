@@ -457,7 +457,54 @@ fn sys_tgkill(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     send_signal(p, t, a[1] as i64, a[2])
 }
 
+/// Nice values are remembered for no one: every task runs at nice 0, which `getpriority` reports
+/// as the kernel does (`20 - nice`), and `setpriority` is accepted.
+fn sys_getpriority(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
+    Ok(20)
+}
+
+fn sys_setpriority(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
+    Ok(0)
+}
+
+/// `process_vm_readv` on this process (what libunwindstack reads memory with, so a bad pointer is
+/// an error and not a fault): each remote range copied into the local ones in order, stopping at
+/// the first that cannot be read. Another pid is `ESRCH`: there is no other process.
+fn sys_process_vm_readv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    if a[0] as i64 as i32 != p.sys.pid {
+        return Err(crate::errno::ESRCH);
+    }
+    if a[2] > 1024 || a[4] > 1024 || a[5] != 0 {
+        return Err(EINVAL);
+    }
+    let iov = |at: u64, n: u64| -> Result<Vec<(u64, usize)>, crate::errno::Errno> {
+        (0..n).map(|i| Ok((p.mem.read_u64(at + i * 16)?, p.mem.read_u64(at + i * 16 + 8)? as usize))).collect()
+    };
+    let (local, remote) = (iov(a[1], a[2])?, iov(a[3], a[4])?);
+    let mut data = Vec::new();
+    for (base, len) in remote {
+        match p.mem.read(base, len.min((1 << 24) - data.len().min(1 << 24))) {
+            Ok(bytes) => data.extend_from_slice(&bytes),
+            Err(e) if data.is_empty() => return Err(e),
+            Err(_) => break,
+        }
+    }
+    let mut done = 0;
+    for (base, len) in local {
+        let n = len.min(data.len() - done);
+        p.mem.write(base, &data[done..done + n])?;
+        done += n;
+        if done == data.len() {
+            break;
+        }
+    }
+    Ok(done as u64)
+}
+
 pub fn install(table: &mut Table) {
+    table.set(nr::GETPRIORITY, sys_getpriority);
+    table.set(nr::SETPRIORITY, sys_setpriority);
+    table.set(nr::PROCESS_VM_READV, sys_process_vm_readv);
     table.set(nr::KILL, sys_kill);
     table.set(nr::TKILL, sys_tkill);
     table.set(nr::TGKILL, sys_tgkill);

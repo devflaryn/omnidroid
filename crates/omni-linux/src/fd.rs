@@ -42,6 +42,18 @@ pub enum FileKind {
     Stderr(Output),
     /// A generated file (`/proc`, `/sys`): its bytes, taken when it was opened.
     Synth { data: Vec<u8>, guest: Vec<u8>, pos: usize, sized: bool },
+    Socket(crate::socket::Socket),
+}
+
+impl FileKind {
+    /// Where a standard output or error descriptor writes.
+    #[must_use]
+    pub fn output(&self) -> Option<Output> {
+        match self {
+            Self::Stdout(o) | Self::Stderr(o) => Some(o.clone()),
+            _ => None,
+        }
+    }
 }
 
 pub struct OpenFile {
@@ -222,6 +234,7 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
             stat_node(&Resolved { path: guest.clone(), node: Node::Blob { size: data.len() as u64 } })
         }
         FileKind::Synth { guest, .. } => stat_node(&Resolved { path: guest.clone(), node: Node::Generated }),
+        FileKind::Socket(_) => Ok(Stat { ino: 2, mode: 0o140000 | 0o777, nlink: 1, ..Stat::default() }),
     }
 }
 
@@ -248,6 +261,8 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         }
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Stdout(_) | FileKind::Stderr(_) => Err(EBADF),
+        // Nothing ever arrives: logd does not answer, and no other socket has a peer.
+        FileKind::Socket(_) => Err(EAGAIN),
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
             let n = buf.len().min(data.len() - from);
@@ -289,6 +304,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dev(_) => Ok(bytes.len()),
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Synth { .. } => Err(EACCES),
+        FileKind::Socket(s) => crate::socket::send(s, bytes),
     }
 }
 
@@ -454,6 +470,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Dev(DevNode::Random) => b"/dev/random".to_vec(),
         FileKind::Dev(DevNode::Urandom) => b"/dev/urandom".to_vec(),
         FileKind::Stdin | FileKind::Stdout(_) | FileKind::Stderr(_) => b"/dev/pts/0".to_vec(),
+        FileKind::Socket(_) => b"socket:[2]".to_vec(),
     }
 }
 

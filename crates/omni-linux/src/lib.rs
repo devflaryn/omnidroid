@@ -16,6 +16,7 @@ pub mod process;
 pub mod procfs;
 pub mod props;
 pub mod signal;
+pub mod socket;
 pub mod sys;
 pub mod syscall;
 pub mod vfs;
@@ -28,4 +29,5 @@ pub fn install_all(table: &mut syscall::Table) {
     fd::install(table);
     mm::install(table);
     sys::install(table);
+    socket::install(table);
 }
