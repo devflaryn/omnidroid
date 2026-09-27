@@ -501,7 +501,26 @@ fn sys_process_vm_readv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(done as u64)
 }
 
+/// `membarrier`: every command a JIT uses is offered. Each is a full host fence -- the expedited
+/// "all threads of this process" forms included, since a guest thread's instructions are host
+/// instructions and the host fence orders them.
+fn sys_membarrier(_p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const QUERY: u64 = 0;
+    // GLOBAL | PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE |
+    // REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+    const SUPPORTED: u64 = 1 | 8 | 16 | 32 | 64;
+    match a[0] {
+        QUERY => Ok(SUPPORTED),
+        cmd if cmd & SUPPORTED == cmd && cmd.count_ones() == 1 => {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
 pub fn install(table: &mut Table) {
+    table.set(nr::MEMBARRIER, sys_membarrier);
     table.set(nr::GETPRIORITY, sys_getpriority);
     table.set(nr::SETPRIORITY, sys_setpriority);
     table.set(nr::PROCESS_VM_READV, sys_process_vm_readv);

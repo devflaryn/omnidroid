@@ -70,7 +70,7 @@ pub struct Process {
     /// `/dev/__properties__`: property_info, properties_serial and the one context's area (A3).
     pub props: crate::procfs::PropFiles,
     backend: Option<DynarmicBackend>,
-    start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
+    pub(crate) start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
     scratch: u64,
 }

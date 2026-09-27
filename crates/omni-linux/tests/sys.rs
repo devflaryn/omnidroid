@@ -117,3 +117,12 @@ fn umask_answers_the_previous_mask_and_keeps_only_permission_bits() {
     assert_eq!(p.syscall(&mut t, nr::UMASK, [0o7777, 0, 0, 0, 0, 0]), 0);
     assert_eq!(p.syscall(&mut t, nr::UMASK, [0o022, 0, 0, 0, 0, 0]), 0o777);
 }
+
+#[test]
+fn membarrier_offers_the_private_expedited_commands_a_jit_registers_for() {
+    let (p, mut t, _) = process();
+    let offered = p.syscall(&mut t, omni_linux::syscall::nr::MEMBARRIER, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(offered & (8 | 16), 8 | 16, "{offered:#x}");
+    assert_eq!(p.syscall(&mut t, omni_linux::syscall::nr::MEMBARRIER, [16, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, omni_linux::syscall::nr::MEMBARRIER, [8, 0, 0, 0, 0, 0]), 0);
+}

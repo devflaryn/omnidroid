@@ -104,13 +104,14 @@ fn stat(p: &Process) -> Vec<u8> {
         0, 0, 0, 0,        // minflt cminflt majflt cmajflt
         t, 0, 0, 0,        // utime stime cutime cstime
         20, 0,             // priority nice
-        1,                 // num_threads
+        p.tids().len() as u64, // num_threads
         0,                 // itrealvalue
         0,                 // starttime
         mapped_bytes(p),   // vsize
         committed_pages(p),// rss
         u64::MAX,          // rsslim
-        0, 0, 0, 0, 0,     // startcode endcode startstack kstkesp kstkeip
+        // startstack: bionic finds the main thread's stack by the maps line holding it.
+        0, 0, p.start.lock().map_or(0, |(_, sp)| sp), 0, 0, // startcode endcode startstack kstkesp kstkeip
         0, 0, 0, 0,        // signal blocked sigignore sigcatch
         0, 0, 0,           // wchan nswap cnswap
         17, 0,             // exit_signal processor
