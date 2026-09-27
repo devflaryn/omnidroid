@@ -64,6 +64,8 @@ pub enum Peer {
     Bound(Arc<crate::unix::Bound>),
     /// A datagram socket connected to a bound one: what it sends goes there.
     Dgram(Arc<crate::unix::Bound>),
+    /// An internet socket bound to a port (`crate::inet`).
+    Inet(Arc<crate::inet::Port>),
     /// The other end of a socket pair.
     Pair { channel: Arc<PairChannel>, side: usize },
     /// `logd`: packets are printed to this output.
@@ -175,7 +177,7 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
             server.deliver(bytes);
             Ok(bytes.len())
         }
-        Some(Peer::Bound(_)) => Err(ENOTCONN),
+        Some(Peer::Bound(_) | Peer::Inet(_)) => Err(ENOTCONN),
         Some(Peer::Pair { channel, side }) => {
             let other = 1 - *side;
             if !channel.open[other].load(std::sync::atomic::Ordering::SeqCst) {
@@ -309,6 +311,16 @@ fn sys_bind(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         socket.peer = Some(Peer::Bound(bound));
         return Ok(0);
     }
+    if matches!(socket.domain, AF_INET | AF_INET6) {
+        if socket.name.is_some() {
+            return Err(EINVAL);
+        }
+        let addr = p.mem.read(a[1], (a[2] as usize).min(28))?;
+        let port = crate::inet::bind(instance_of(p), socket.domain as u16, socket.ty, &addr)?;
+        socket.name = Some(port.name.clone());
+        socket.peer = Some(Peer::Inet(port));
+        return Ok(0);
+    }
     if socket.domain != AF_NETLINK {
         p.refusals.record(format!("bind: family {}", socket.domain), t.pc, t.lr);
         return Err(crate::errno::ENOSYS);
@@ -385,7 +397,11 @@ fn sys_getsockname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let kind = file.kind.lock();
     let FileKind::Socket(socket) = &*kind else { return Err(crate::errno::ENOTSOCK) };
-    let name = socket.name.clone().unwrap_or_else(|| (socket.domain as u16).to_le_bytes().to_vec());
+    let name = match &socket.name {
+        Some(name) => name.clone(),
+        None if matches!(socket.domain, AF_INET | AF_INET6) => crate::inet::unbound_name(socket.domain as u16),
+        None => (socket.domain as u16).to_le_bytes().to_vec(),
+    };
     let room = u32::from_le_bytes(p.mem.read(a[2], 4)?.try_into().expect("4")) as usize;
     p.mem.write(a[1], &name[..name.len().min(room)])?;
     p.mem.write(a[2], &(name.len() as u32).to_le_bytes())?;

@@ -21,6 +21,7 @@ pub mod init;
 pub mod locks;
 pub mod manifest;
 pub mod mount;
+pub mod inet;
 pub mod netlink;
 pub mod owners;
 pub mod mm;
