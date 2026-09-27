@@ -24,3 +24,13 @@ fn a_process_replaces_itself_with_a_program() {
     assert_eq!(pids.len(), 2, "{out}");
     assert_eq!(pids[0], pids[1], "the same process: {out}");
 }
+
+/// The shell's own forks: a pipeline (two children at once, told apart by pid -- a pid just freed
+/// is not given again at once) and command substitution (a child that runs a builtin and exits
+/// without executing anything: the parent's memory, `.data` included, is its own again).
+#[test]
+fn the_shell_runs_pipelines_and_command_substitution() {
+    let Some((status, out, err)) = common::run(&["/system/bin/sh", "-c", "echo pipe | cat; echo $(echo sub); x=$(getprop ro.build.version.sdk); echo sdk $x"]) else { return };
+    assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
+    assert_eq!(out, "pipe\nsub\nsdk 35\n", "{err}");
+}

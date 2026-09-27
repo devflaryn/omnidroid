@@ -167,6 +167,12 @@ impl FdTable {
         self.fds.lock().remove(&fd).map(|_| ()).ok_or(EBADF)
     }
 
+    /// Close every descriptor, as a process's exit does (a pipe's reader then sees its end).
+    pub fn close_all(&self) {
+        let all = std::mem::take(&mut *self.fds.lock());
+        drop(all);
+    }
+
     pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
         self.fds.lock().get(&fd).map(|(_, c)| *c).ok_or(EBADF)
     }

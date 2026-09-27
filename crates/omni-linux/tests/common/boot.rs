@@ -59,7 +59,7 @@ impl Boot {
         }
         cmd.args(["--env", &format!("CLASSPATH={ss_classpath}")]);
         cmd.args(["--env", "ANDROID_ART_ROOT=/apex/com.android.art", "--env", "ANDROID_I18N_ROOT=/apex/com.android.i18n", "--env", "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata"]);
-        cmd.args(["--init", "early_hal,core,hal,main", "--hal", "gralloc", "--hal", "composer"]);
+        cmd.args(["--init", "early_hal,core,hal,main,late_start", "--hal", "gralloc", "--hal", "composer"]);
         cmd.args(["--setprop", "dalvik.vm.profilesystemserver=true"]);
         // The capabilities the zygote gives system_server (ZygoteInit.forkSystemServer).
         cmd.args(["--caps", "IPC_LOCK,KILL,NET_ADMIN,NET_BIND_SERVICE,NET_BROADCAST,NET_RAW,SYS_MODULE,SYS_NICE,SYS_PTRACE,SYS_TIME,SYS_TTY_CONFIG,WAKE_ALARM,BLOCK_SUSPEND"]);

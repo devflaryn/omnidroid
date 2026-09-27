@@ -176,7 +176,17 @@ fn allocate_pid() -> i32 {
         live.insert(pid);
         return pid;
     }
-    let pid = (1..).map(|k| k * 1000).find(|p| !live.contains(p)).expect("a free pid");
+    // Onward from the last one handed out, as the kernel allocates (wrapping at pid_max): a pid
+    // just freed is not given again at once -- a shell waiting for two children of one pipeline
+    // tells them apart by it.
+    static LAST: Mutex<i32> = Mutex::new(0);
+    let mut last = LAST.lock();
+    const SLOTS: i32 = 4_194_304 / 1000;
+    let pid = (1..=SLOTS)
+        .map(|step| ((*last / 1000 + step - 1) % SLOTS + 1) * 1000)
+        .find(|p| !live.contains(p))
+        .expect("a free pid");
+    *last = pid;
     live.insert(pid);
     pid
 }
@@ -562,6 +572,9 @@ impl Process {
         }
         drop(tasks);
         let status = self.group_exit.lock().clone().unwrap_or(status);
+        // Exit closes every descriptor, whoever still holds the process (a parent that has not
+        // waited for it): a pipe's reader sees end of file once its last writer has ended.
+        self.fds.close_all();
         // Replaced by `execve`: the process goes on as the new image, and ends as it does.
         let status = match self.family.successor() {
             Some(next) => next.wait_exit(),

@@ -190,15 +190,17 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    /// Every committed range of a private, writable, anonymous mapping (a shared or file mapping
-    /// is shared with the child under fork too).
+    /// Every committed range of a private, writable mapping -- anonymous, or a file's private view
+    /// (a program's `.data`, which fork gives the child a copy of as much as its heap). A shared
+    /// mapping is shared with the child under fork too.
     fn take(p: &Process) -> Self {
         let _layout = p.mem.layout().write();
         let space = p.mem.space();
         let mut snapshot = Self { kept: Vec::new(), untouched: Vec::new() };
         for region in space.mapped_regions() {
             let writable = matches!(region.protection, omni_mem::Protection::ReadWrite | omni_mem::Protection::ReadWriteExecute);
-            if !writable || !matches!(region.kind, omni_mem::RegionKind::Anonymous) {
+            let private = matches!(region.kind, omni_mem::RegionKind::Anonymous | omni_mem::RegionKind::File { shared: false, .. });
+            if !writable || !private {
                 continue;
             }
             let end = (region.start + region.len) as u64;
@@ -206,7 +208,9 @@ impl Snapshot {
             while at < end {
                 let Some(r) = space.region_at(at as usize) else { break };
                 let next = ((r.start + r.len) as u64).min(end);
-                if r.committed == 0 {
+                // An untouched anonymous page reads as zeros; a file view's untouched page is the
+                // file's, so it is kept by its content.
+                if r.committed == 0 && matches!(region.kind, omni_mem::RegionKind::Anonymous) {
                     snapshot.untouched.push((at, next));
                 } else if let Ok(bytes) = p.mem.read_holding_layout(at, (next - at) as usize) {
                     snapshot.kept.push((at, bytes));
