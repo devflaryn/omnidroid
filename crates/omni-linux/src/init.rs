@@ -149,8 +149,12 @@ pub(crate) fn uid_of(user: &str) -> u32 {
 }
 
 /// The boot phases init triggers unconditionally, in order: a `start` in their `on` blocks runs.
-const BOOT_PHASES: [&str; 11] =
-    ["early-init", "init", "late-init", "early-fs", "fs", "post-fs", "late-fs", "post-fs-data", "zygote-start", "early-boot", "boot"];
+/// late-init's order: `load_bpf_programs` between post-fs-data and zygote-start (the BPF loader
+/// before netd), `firmware_mounts_complete` after zygote-start.
+const BOOT_PHASES: [&str; 13] = [
+    "early-init", "init", "late-init", "early-fs", "fs", "post-fs", "late-fs", "post-fs-data", "load_bpf_programs", "zygote-start",
+    "firmware_mounts_complete", "early-boot", "boot",
+];
 
 /// Every `service` in the image's init scripts, by name.
 #[must_use]

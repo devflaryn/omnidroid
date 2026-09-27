@@ -60,6 +60,8 @@ pub enum FileKind {
     /// An inotify instance: watches are accepted, no event is ever reported (nothing here changes
     /// a watched path behind the app's back). The `AtomicI32` is the next watch descriptor.
     Inotify(Arc<std::sync::atomic::AtomicI32>),
+    /// A BPF map, program or link (`crate::bpf`).
+    Bpf(crate::bpf::Object),
 }
 
 impl FileKind {
@@ -319,6 +321,7 @@ pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Shared(m) if m.name == ASHMEM => stat_node(&Resolved { path: ASHMEM.as_bytes().to_vec(), node: Node::Dev(DevNode::Ashmem) }),
         FileKind::Shared(m) => Ok(Stat { ino: 5, mode: S_IFREG | 0o600, nlink: 1, size: m.len() as i64, blocks: (m.len() as i64 + 511) / 512, ..Stat::default() }),
         FileKind::Inotify(_) => Ok(Stat { ino: 6, mode: 0o600, nlink: 1, ..Stat::default() }),
+        FileKind::Bpf(_) => Ok(Stat { ino: 8, mode: 0o600, nlink: 1, ..Stat::default() }),
     }
 }
 
@@ -355,6 +358,7 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
             None => m.read_seq(buf),
         },
         FileKind::Inotify(_) => Err(EAGAIN), // no event is ever ready
+        FileKind::Bpf(_) => Err(EINVAL),
 
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
@@ -403,6 +407,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Dir { .. } => Err(EISDIR),
         FileKind::Shared(m) => m.write_seq(bytes),
         FileKind::Inotify(_) => Err(EBADF),
+        FileKind::Bpf(_) => Err(EINVAL),
         FileKind::Synth { guest, data, pos, .. } => {
             let written = crate::procfs::write_generated(guest, bytes, data)?;
             *pos = 0;
@@ -763,6 +768,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Shared(m) if m.name == ASHMEM => ASHMEM.as_bytes().to_vec(),
         FileKind::Shared(m) => format!("/memfd:{} (deleted)", m.name).into_bytes(),
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
+        FileKind::Bpf(o) => o.describe().as_bytes().to_vec(),
     }
 }
 
@@ -950,7 +956,11 @@ fn created(p: &Process, host: &std::path::Path, mode: u32) {
 fn sys_mkdirat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
-    match p.vfs.resolve(&base, &path, false)?.node {
+    let r = p.vfs.resolve(&base, &path, false)?;
+    if crate::bpf::on_bpffs(&r.path) {
+        return crate::bpf::mkdir(&r.path).map(|()| 0);
+    }
+    match r.node {
         Node::Missing { host: Some(host), parent_is_dir: true } => {
             std::fs::create_dir(&host).map_err(|_| EACCES)?;
             created(p, &host, a[2] as u32);
@@ -972,6 +982,12 @@ fn fs_trace() -> bool {
 fn sys_unlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     const AT_REMOVEDIR: u64 = 0x200;
     let path = path_arg(p, a[1])?;
+    let base = base_dir(p, a[0], &path)?;
+    if let Ok(r) = p.vfs.resolve(&base, &path, false) {
+        if crate::bpf::on_bpffs(&r.path) {
+            return crate::bpf::remove(&r.path, a[2] & AT_REMOVEDIR != 0).map(|()| 0);
+        }
+    }
     let (node, host) = writable_host(p, a[0], &path, false)?;
     if fs_trace() {
         let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
@@ -998,16 +1014,27 @@ fn sys_unlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 /// `renameat`/`renameat2` (flags 0 only) within the writable mounts.
 fn sys_renameat2(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
-    if a[4] != 0 {
+    const RENAME_NOREPLACE: u64 = 1;
+    if a[4] & !RENAME_NOREPLACE != 0 {
         p.refusals.record(format!("renameat2 flags {:#x}", a[4]), t.pc, t.lr);
         return Err(EINVAL);
     }
+    let noreplace = a[4] & RENAME_NOREPLACE != 0;
     let (from_path, to_path) = (path_arg(p, a[1])?, path_arg(p, a[3])?);
+    // On the BPF filesystem: its own names (a loader pins under a temporary name, then renames).
+    let from_r = p.vfs.resolve(&base_dir(p, a[0], &from_path)?, &from_path, false)?;
+    if crate::bpf::on_bpffs(&from_r.path) {
+        let to_r = p.vfs.resolve(&base_dir(p, a[2], &to_path)?, &to_path, false)?;
+        return crate::bpf::rename(&from_r.path, &to_r.path, noreplace).map(|()| 0);
+    }
     let (from_node, from) = writable_host(p, a[0], &from_path, false)?;
     if matches!(from_node, Node::Missing { .. }) {
         return Err(ENOENT);
     }
-    let (_, to) = writable_host(p, a[2], &to_path, false)?;
+    let (to_node, to) = writable_host(p, a[2], &to_path, false)?;
+    if noreplace && !matches!(to_node, Node::Missing { .. }) {
+        return Err(EEXIST);
+    }
     if fs_trace() {
         let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
         eprintln!("[fs] {} ({comm}) rename {} -> {}", p.sys.pid, from.display(), to.display());
@@ -1159,16 +1186,23 @@ fn sys_fchown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 fn sys_fchmodat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
-    let node = p.vfs.resolve(&base, &path, true)?.node;
-    chmod_node(p, node, a[2])
+    let r = p.vfs.resolve(&base, &path, true)?;
+    // The BPF filesystem's modes are accepted (nothing here checks them).
+    if crate::bpf::on_bpffs(&r.path) && !matches!(r.node, Node::Missing { .. }) {
+        return Ok(0);
+    }
+    chmod_node(p, r.node, a[2])
 }
 
 fn sys_fchownat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
-    let node = p.vfs.resolve(&base, &path, a[4] & AT_SYMLINK_NOFOLLOW == 0)?.node;
-    chown_node(p, node, a[2], a[3])
+    let r = p.vfs.resolve(&base, &path, a[4] & AT_SYMLINK_NOFOLLOW == 0)?;
+    if crate::bpf::on_bpffs(&r.path) && !matches!(r.node, Node::Missing { .. }) {
+        return Ok(0);
+    }
+    chown_node(p, r.node, a[2], a[3])
 }
 
 /// The filesystem magic a path is on: selinuxfs, sysfs and proc where the kernel mounts them,
@@ -1177,6 +1211,8 @@ fn fs_magic(path: &[u8]) -> u64 {
     let under = |root: &[u8]| path == root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/'));
     if under(b"/sys/fs/selinux") {
         0xf97c_ff8c // SELINUX_MAGIC
+    } else if under(b"/sys/fs/bpf") {
+        0xcafe_4a11 // BPF_FS_MAGIC
     } else if under(b"/sys") {
         0x6265_6572 // SYSFS_MAGIC
     } else if under(b"/proc") {

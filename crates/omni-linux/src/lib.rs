@@ -7,6 +7,7 @@
 pub mod apex;
 pub mod binder;
 pub mod boot;
+pub mod bpf;
 pub mod device;
 pub mod errno;
 pub mod exec;
@@ -50,4 +51,5 @@ pub fn install_all(table: &mut syscall::Table) {
     xattr::install(table);
     mount::install(table);
     fork::install(table);
+    bpf::install_syscalls(table);
 }

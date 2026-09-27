@@ -522,7 +522,7 @@ fn sys_getrandom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_uname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut u = [0u8; 6 * 65];
-    for (i, s) in ["Linux", "localhost", "6.1.0-omnidroid", "#1 SMP PREEMPT", "aarch64", "localdomain"].iter().enumerate() {
+    for (i, s) in ["Linux", "localhost", "6.1.99-omnidroid", "#1 SMP PREEMPT", "aarch64", "localdomain"].iter().enumerate() {
         u[i * 65..i * 65 + s.len()].copy_from_slice(s.as_bytes());
     }
     p.mem.write(a[0], &u)?;

@@ -14,7 +14,7 @@ use std::sync::{Arc, Weak};
 use omni_cpu::XReg;
 use parking_lot::{Condvar, Mutex};
 
-use crate::errno::{Errno, SysResult, EAGAIN, EFAULT, EINTR, EINVAL, ENOENT, ENOSYS};
+use crate::errno::{Errno, SysResult, EAGAIN, EFAULT, EINTR, EINVAL, ENOENT};
 use crate::process::{Exit, ExitStatus, Process, Task};
 use crate::syscall::{nr, Table};
 use crate::vfs::Node;
@@ -45,6 +45,8 @@ pub struct Family {
     release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// An image `execve` replaced: its end is not the process's end.
     superseded: AtomicBool,
+    /// The image that replaced this one: `run` answers how it ended.
+    successor: Mutex<Option<Arc<Process>>>,
     /// The signal mask the main task starts with (a fork child's and an executed program's are
     /// the calling thread's).
     start_mask: AtomicU64,
@@ -76,6 +78,11 @@ impl Family {
 
     pub(crate) fn superseded(&self) -> bool {
         self.superseded.load(Ordering::SeqCst)
+    }
+
+    /// The image `execve` replaced this one with, if it did.
+    pub(crate) fn successor(&self) -> Option<Arc<Process>> {
+        self.successor.lock().clone()
     }
 
     pub(crate) fn start_mask(&self) -> u64 {
@@ -307,17 +314,14 @@ fn strings(p: &Process, mut at: u64) -> Result<Vec<Vec<u8>>, Errno> {
     }
 }
 
-/// `execve(path, argv, envp)` in a fork child: the program is loaded into a space of its own under
-/// the child's pid, the parent is released, and the child's old image ends without a status.
+/// `execve(path, argv, envp)`: the program is loaded into a space of its own under this pid, and
+/// the old image ends without a status: a parent waiting on its fork is released, and the old
+/// image's `run` answers how the new one ends.
 fn sys_execve(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = p.mem.read_cstr(a[0], 4096)?;
     let argv = strings(p, a[1])?;
     let envp = strings(p, a[2])?;
     let me = Arc::clone(&t.process);
-    if me.family.release.lock().is_none() {
-        p.refusals.record(format!("execve {} (not in a fork child)", String::from_utf8_lossy(&path)), t.pc, t.lr);
-        return Err(ENOSYS);
-    }
     // What `execvp` tries path after path must be cheap to refuse.
     let cwd = p.cwd.lock().clone();
     match p.vfs.resolve(&cwd, &path, true)?.node {
@@ -330,6 +334,7 @@ fn sys_execve(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         ENOEXEC
     })?;
     image.family.start_mask.store(t.sigmask, Ordering::Relaxed);
+    *me.family.successor.lock() = Some(Arc::clone(&image));
     me.family.superseded.store(true, Ordering::SeqCst);
     if let Some(parent) = me.family.parent() {
         parent.family.children.lock().insert(me.sys.pid, Child::Running(Arc::downgrade(&image)));
@@ -341,6 +346,7 @@ fn sys_execve(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     });
     if spawned.is_err() {
         me.family.superseded.store(false, Ordering::SeqCst);
+        *me.family.successor.lock() = None;
         return Err(EAGAIN);
     }
     me.family.release_parent();

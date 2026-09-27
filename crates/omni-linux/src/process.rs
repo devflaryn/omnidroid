@@ -80,6 +80,8 @@ pub struct Process {
     backend: Option<Arc<DynarmicBackend>>,
     pub(crate) start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
+    /// Signalled when `exit` is set.
+    exited: parking_lot::Condvar,
     scratch: u64,
 }
 
@@ -313,6 +315,7 @@ impl Process {
             backend,
             start: Mutex::new(None),
             exit: Mutex::new(None),
+            exited: parking_lot::Condvar::new(),
             scratch,
         });
         let _ = p.me.set(Arc::downgrade(&p));
@@ -491,8 +494,25 @@ impl Process {
         }
         drop(tasks);
         let status = self.group_exit.lock().clone().unwrap_or(status);
+        // Replaced by `execve`: the process goes on as the new image, and ends as it does.
+        let status = match self.family.successor() {
+            Some(next) => next.wait_exit(),
+            None => status,
+        };
         *self.exit.lock() = Some(status.clone());
+        self.exited.notify_all();
         status
+    }
+
+    /// Wait for this image to end (following `execve` to the image that ends).
+    pub fn wait_exit(&self) -> ExitStatus {
+        let mut exit = self.exit.lock();
+        loop {
+            if let Some(status) = exit.clone() {
+                return status;
+            }
+            self.exited.wait(&mut exit);
+        }
     }
 
     /// A CPU for a new task; `None` when the backend cannot make one (`clone` answers `EAGAIN`).

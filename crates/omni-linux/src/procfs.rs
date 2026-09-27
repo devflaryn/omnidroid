@@ -321,16 +321,41 @@ fn settable_attr(path: &[u8]) -> Option<(i32, &'static str)> {
 /// selinuxfs transaction file.
 #[must_use]
 pub fn is_settable_attr(path: &[u8]) -> bool {
-    settable_attr(path).is_some() || path == SELINUX_CONTEXT
+    settable_attr(path).is_some() || path == SELINUX_CONTEXT || std::str::from_utf8(path).is_ok_and(|p| sysctl_default(p).is_some())
 }
 
 const SELINUX_CONTEXT: &[u8] = b"/sys/fs/selinux/context";
+
+/// The kernel tunables a process may write (`/proc/sys/...`), with their boot values: the BPF
+/// loader enables the JIT and unprivileged BPF.
+fn sysctl_default(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "/proc/sys/kernel/unprivileged_bpf_disabled" => "2\n",
+        "/proc/sys/kernel/perf_event_paranoid" => "3\n",
+        "/proc/sys/net/core/bpf_jit_enable" => "0\n",
+        "/proc/sys/net/core/bpf_jit_kallsyms" => "0\n",
+        _ => return None,
+    })
+}
+
+fn sysctls() -> &'static parking_lot::Mutex<std::collections::HashMap<String, Vec<u8>>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<String, Vec<u8>>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn sysctl_value(path: &str) -> Vec<u8> {
+    sysctls().lock().get(path).cloned().unwrap_or_else(|| sysctl_default(path).unwrap_or_default().as_bytes().to_vec())
+}
 
 /// A write to a writable generated file: an attribute, or selinuxfs's `context` transaction,
 /// whose answer (`answer`) the same descriptor then reads.
 pub fn write_generated(path: &[u8], bytes: &[u8], answer: &mut Vec<u8>) -> Result<usize, crate::errno::Errno> {
     if path == SELINUX_CONTEXT {
         *answer = check_context(bytes)?;
+        return Ok(bytes.len());
+    }
+    if let Some(p) = std::str::from_utf8(path).ok().filter(|p| sysctl_default(p).is_some()) {
+        sysctls().lock().insert(p.to_string(), bytes.to_vec());
         return Ok(bytes.len());
     }
     write_attr(path, bytes)
@@ -383,7 +408,7 @@ fn selinux_context(p: &Process) -> Vec<u8> {
 }
 
 fn version(_p: &Process) -> Vec<u8> {
-    b"Linux version 6.1.0-omnidroid (omnidroid) #1 SMP PREEMPT\n".to_vec()
+    b"Linux version 6.1.99-omnidroid (omnidroid) #1 SMP PREEMPT\n".to_vec()
 }
 
 fn cpu_range(_p: &Process) -> Vec<u8> {
@@ -428,8 +453,11 @@ impl Process {
                 return Some(Entry::DynDir(entries));
             }
             "/proc/self" => return Some(Entry::Link(pid.into_bytes())),
-            "/proc/sys" => return Some(Entry::Dir(vec![("kernel", DT_DIR)])),
-            "/proc/sys/kernel" => return Some(Entry::Dir(vec![("random", DT_DIR)])),
+            "/proc/sys" => return Some(Entry::Dir(vec![("kernel", DT_DIR), ("net", DT_DIR)])),
+            "/proc/sys/kernel" => return Some(Entry::Dir(vec![("random", DT_DIR), ("unprivileged_bpf_disabled", DT_REG), ("perf_event_paranoid", DT_REG)])),
+            "/proc/sys/net" => return Some(Entry::Dir(vec![("core", DT_DIR)])),
+            "/proc/sys/net/core" => return Some(Entry::Dir(vec![("bpf_jit_enable", DT_REG), ("bpf_jit_kallsyms", DT_REG)])),
+            _ if sysctl_default(path).is_some() => return Some(Entry::Bytes(sysctl_value(path))),
             "/proc/sys/kernel/random" => return Some(Entry::Dir(vec![("boot_id", DT_REG), ("uuid", DT_REG)])),
             "/proc/sys/kernel/random/boot_id" => return Some(Entry::File(boot_id_file)),
             "/proc/sys/kernel/random/uuid" => return Some(Entry::File(random_uuid)),
@@ -444,7 +472,16 @@ impl Process {
             "/proc/filesystems" => return Some(Entry::File(filesystems)),
             "/sys" => return Some(Entry::Dir(vec![("block", DT_DIR), ("devices", DT_DIR), ("fs", DT_DIR)])),
             "/sys/block" => return Some(Entry::DynDir(apex_mounts(self).iter().map(|m| (format!("loop{}", m.index), DT_DIR)).collect())),
-            "/sys/fs" => return Some(Entry::Dir(vec![("selinux", DT_DIR)])),
+            "/sys/fs" => return Some(Entry::Dir(vec![("selinux", DT_DIR), ("bpf", DT_DIR)])),
+            // The BPF filesystem (`crate::bpf`): its directories and pins.
+            _ if crate::bpf::on_bpffs(path.as_bytes()) => {
+                return match crate::bpf::lookup(path.as_bytes())? {
+                    crate::bpf::Node::Dir => Some(Entry::DynDir(
+                        crate::bpf::list(path.as_bytes()).into_iter().map(|(n, dir)| (n, if dir { DT_DIR } else { DT_REG })).collect(),
+                    )),
+                    crate::bpf::Node::Pin(_) => Some(Entry::Bytes(Vec::new())),
+                };
+            }
             // selinuxfs, permissive: libselinux finds SELinux present (servicemanager insists on
             // it), every check is allowed -- enforce 0, and deny_unknown 0 for the classes this
             // policy-less filesystem does not list.

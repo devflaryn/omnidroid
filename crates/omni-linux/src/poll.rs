@@ -278,6 +278,7 @@ fn readiness(file: &OpenFile, now: Instant) -> (u32, Option<Instant>) {
         FileKind::SyncFile(_) => (IN, None),
         FileKind::Binder(b) => (b.readiness(), None),
         FileKind::Inotify(_) => (0, None),
+        FileKind::Bpf(_) => (0, None),
         _ => (IN | OUT, None),
     }
 }
