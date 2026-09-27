@@ -3,18 +3,32 @@
 //!
 //! Portable: every host has a way to walk its own address space.
 
+use std::sync::Mutex;
+
 use omni_platform::vm;
 
-/// A range nothing holds right now: reserved by the host's choice, then given back.
+/// These tests find a free range and then use it by address, so each must not allocate into the
+/// other's. One at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A range nothing holds right now: the middle third of a range reserved by the host's choice and
+/// then given back. The middle, because the next allocation anything else in the process makes
+/// is most likely to land at one end of a gap it has just seen open -- MEASURED on Linux, where a
+/// one-page mapping from another test thread landed inside a probe taken whole.
 fn free_range(len: usize) -> usize {
-    let probe = vm::reserve_placeholder(len, vm::allocation_granularity()).expect("a probe");
-    let base = probe.base();
+    let probe = vm::reserve_placeholder(3 * len, vm::allocation_granularity()).expect("a probe");
+    let base = probe.base() + len;
     vm::release(probe).expect("the probe released");
     base
 }
 
 #[test]
 fn a_reservation_inside_the_range_is_reported_and_nothing_else_is() {
+    let _serial = serial();
     let granule = vm::allocation_granularity();
     let len = 64 * granule;
     let base = free_range(len);
@@ -34,6 +48,7 @@ fn a_reservation_inside_the_range_is_reported_and_nothing_else_is() {
 
 #[test]
 fn committed_memory_counts_as_occupied_too() {
+    let _serial = serial();
     let granule = vm::allocation_granularity();
     let len = 32 * granule;
     let base = free_range(len);
