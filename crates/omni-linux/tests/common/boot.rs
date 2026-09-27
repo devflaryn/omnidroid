@@ -1,6 +1,8 @@
 //! A whole boot for the framework gates (C4, C5): the image's `derive_classpath`, then
 //! `omni-linux-run` with init's classes, the display HALs and system_server started as the zygote
-//! would start it, its output read line by line.
+//! starts a wrapped one (`WrapperInit.execApplication`: `app_process ... --application
+//! --nice-name=system_server com.android.internal.os.WrapperInit 0 <sdk> -cp
+//! $SYSTEMSERVERCLASSPATH com.android.server.SystemServer`), its output read line by line.
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -60,7 +62,6 @@ impl Boot {
         for (k, v) in &exports {
             cmd.arg("--env").arg(format!("{k}={v}"));
         }
-        cmd.args(["--env", &format!("CLASSPATH={ss_classpath}")]);
         cmd.args(["--env", "ANDROID_ART_ROOT=/apex/com.android.art", "--env", "ANDROID_I18N_ROOT=/apex/com.android.i18n", "--env", "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata"]);
         cmd.args(["--init", "early_hal,core,hal,main,late_start", "--hal", "gralloc", "--hal", "composer"]);
         cmd.args(["--setprop", "dalvik.vm.profilesystemserver=true"]);
@@ -68,7 +69,8 @@ impl Boot {
         cmd.args(["--caps", "IPC_LOCK,KILL,NET_ADMIN,NET_BIND_SERVICE,NET_BROADCAST,NET_RAW,SYS_MODULE,SYS_NICE,SYS_PTRACE,SYS_TIME,SYS_TTY_CONFIG,WAKE_ALARM,BLOCK_SUSPEND"]);
         cmd.args(extra);
         cmd.args(["--then", then]);
-        cmd.args(["--", "/system/bin/app_process64", "-Xgc:CMC", "-Xhidden-api-policy:disabled", "/system/bin", "com.android.server.SystemServer"]);
+        cmd.args(["--", "/system/bin/app_process64", "-Xgc:CMC", "-Xhidden-api-policy:disabled", "/system/bin", "--application", "--nice-name=system_server"]);
+        cmd.args(["com.android.internal.os.WrapperInit", "0", "35", "-cp", &ss_classpath, "com.android.server.SystemServer"]);
         let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("omni-linux-run");
         let (tx, lines) = mpsc::channel::<String>();
         for stream in [Box::new(child.stdout.take().expect("stdout")) as Box<dyn std::io::Read + Send>, Box::new(child.stderr.take().expect("stderr"))] {

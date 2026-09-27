@@ -2,11 +2,14 @@
 //! launch-design.md). ActivityManager starts every app process through the zygote's socket
 //! protocol and waits for the new pid. The zygote's fork cannot be made here (an ART child would
 //! share its parent's address space, and the fork design keeps a parent waiting until its child
-//! executes a program), so the fork alone is replaced: a start request **launches** the image's
-//! `app_process64 ... android.app.ActivityThread seq=<n>` -- the zygote-less path of the binder
-//! and app boot design's decision 4 -- in a host process of its own, whose binder is the system's
-//! (`crate::remote`), under the uid and pid the reply gives. Everything the app then does
-//! (`attachApplication`, `bindApplication`, its Activity) is the framework's own.
+//! executes a program), so every start is answered the way the zygote answers one with an
+//! invoke-with wrapper: `WrapperInit.execApplication`'s command -- the image's `app_process64
+//! /system/bin --application --nice-name=<name> com.android.internal.os.WrapperInit 0 <sdk>
+//! android.app.ActivityThread seq=<n>` -- run in a host process of its own, whose binder is the
+//! system's (`crate::remote`), under the uid and pid the reply gives, and the reply says a wrapper
+//! is used (ActivityManager then waits for the app as long as for a wrapped one). WrapperInit
+//! preloads as the zygote does; everything the app then does (`attachApplication`,
+//! `bindApplication`, its Activity) is the framework's own.
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -103,6 +106,7 @@ fn answer(args: &[String], launcher: &Launcher) -> Option<Vec<u8>> {
     // A start: options, then the class and its arguments.
     let mut uid = None;
     let mut nice = None;
+    let mut sdk = None;
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -114,6 +118,8 @@ fn answer(args: &[String], launcher: &Launcher) -> Option<Vec<u8>> {
             uid = v.parse::<u32>().ok();
         } else if let Some(v) = a.strip_prefix("--nice-name=") {
             nice = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--target-sdk-version=") {
+            sdk = v.parse::<u32>().ok();
         } else if !a.starts_with("--") {
             rest.push(a.clone());
             rest.extend(it.cloned());
@@ -124,14 +130,14 @@ fn answer(args: &[String], launcher: &Launcher) -> Option<Vec<u8>> {
         // A setting (`--set-api-denylist-exemptions`, `--boot-completed`, ...): accepted.
         return Some(int(0));
     }
-    let pid = launch(launcher, uid.unwrap_or(10000), nice.as_deref(), &rest).unwrap_or(-1);
+    let pid = launch(launcher, uid.unwrap_or(10000), nice.as_deref(), sdk.unwrap_or(0), &rest).unwrap_or(-1);
     let mut reply = int(pid);
-    reply.push(0); // usingWrapper: false
+    reply.push(1); // usingWrapper: the process is WrapperInit's
     Some(reply)
 }
 
 /// Launch `class args...` in a host process of its own; the pid it runs under.
-fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, class_and_args: &[String]) -> Option<i32> {
+fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String]) -> Option<i32> {
     let pid = crate::process::reserve_pid();
     let mut cmd = std::process::Command::new(&launcher.runner);
     cmd.arg("--sysroot").arg(&launcher.sysroot).arg("--instance").arg(&launcher.instance);
@@ -148,6 +154,8 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, class_and_args: &[S
     if let Some(n) = nice {
         cmd.arg(format!("--nice-name={n}"));
     }
+    // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
+    cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
     cmd.args(class_and_args);
     eprintln!("[zygote] launching {} as pid {pid} uid {uid}: {}", nice.unwrap_or("?"), class_and_args.join(" "));
     match cmd.spawn() {
