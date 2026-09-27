@@ -42,8 +42,8 @@ use windows_sys::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_MAPPED,
     MEM_PRESERVE_PLACEHOLDER,
     MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
-    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-    PAGE_WRITECOPY,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_NOACCESS, PAGE_READONLY,
+    PAGE_READWRITE, PAGE_WRITECOPY,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
@@ -260,6 +260,7 @@ fn private_protection(protection: Protection) -> u32 {
         Protection::Read => PAGE_READONLY,
         Protection::ReadWrite => PAGE_READWRITE,
         Protection::ReadExecute => PAGE_EXECUTE_READ,
+        Protection::ReadWriteExecute => PAGE_EXECUTE_READWRITE,
     }
 }
 
@@ -277,6 +278,7 @@ fn view_protection(protection: Protection) -> u32 {
         Protection::Read => PAGE_READONLY,
         Protection::ReadWrite => PAGE_WRITECOPY,
         Protection::ReadExecute => PAGE_EXECUTE_READ,
+        Protection::ReadWriteExecute => PAGE_EXECUTE_WRITECOPY,
     }
 }
 
@@ -1508,16 +1510,33 @@ mod tests {
             );
         }
 
-        // And no Protection can ever resolve to a writable *and* executable Win32 flag, whatever
-        // the region is. This is the W^X invariant restated at the layer that actually talks to
-        // the OS, where a mis-mapped flag could reintroduce it without any API change.
+        // No protection *other than* `ReadWriteExecute` resolves to a writable-and-executable Win32
+        // flag, whatever the region is: the W^X invariant restated at the layer that talks to the
+        // OS, where a mis-mapped flag could reintroduce it without any API change. `ReadWriteExecute`
+        // is the guest-only concession and is the sole exception, checked separately below.
         for protection in Protection::ALL {
+            if protection == Protection::ReadWriteExecute {
+                continue;
+            }
             for flavour in [Private, PrivateView, SharedWritableView] {
                 let flags = resolved_protection(protection, flavour);
                 assert_ne!(flags, PAGE_EXECUTE_READWRITE, "{protection} on {flavour:?}");
                 assert_ne!(flags, PAGE_EXECUTE_WRITECOPY, "{protection} on {flavour:?}");
             }
         }
+
+        // The one variant that is W+X on purpose, for a guest that maps its own code writable: a
+        // private page becomes `PAGE_EXECUTE_READWRITE`, a private file view becomes
+        // `PAGE_EXECUTE_WRITECOPY` so writes privatise and never touch the file.
+        assert_eq!(resolved_protection(Protection::ReadWriteExecute, Private), PAGE_EXECUTE_READWRITE);
+        assert_eq!(
+            resolved_protection(Protection::ReadWriteExecute, SharedWritableView),
+            PAGE_EXECUTE_READWRITE
+        );
+        assert_eq!(
+            resolved_protection(Protection::ReadWriteExecute, PrivateView),
+            PAGE_EXECUTE_WRITECOPY
+        );
     }
 
     /// `PAGE_EXECUTE_WRITECOPY`, referenced only to assert that nothing ever resolves to it.

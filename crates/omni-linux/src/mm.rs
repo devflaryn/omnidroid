@@ -51,10 +51,11 @@ pub struct Mm {
 
 fn protection(prot: u32) -> Result<Protection, Errno> {
     Ok(match (prot & PROT_READ != 0, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0) {
-        // Write and execute together -- ART's JIT code cache when it has no dual view. The guest's
-        // instructions are translated from memory, never run from it, so this is writable memory
-        // to the host, and its W^X is not at stake.
-        (_, true, true) => Protection::ReadWrite,
+        // Write and execute together -- ART's JIT code cache when it has no dual view. A device
+        // grants it; the guest issues `IC IVAU` after writing code and the CPU backend discards the
+        // stale translation there, so the page is genuinely writable-and-executable rather than
+        // silently stripped to writable.
+        (_, true, true) => Protection::ReadWriteExecute,
         (false, false, false) => Protection::None,
         (_, true, false) => Protection::ReadWrite,
         (_, false, true) => Protection::ReadExecute,
@@ -436,6 +437,7 @@ fn prot_bits(p: Protection) -> u32 {
         Protection::Read => PROT_READ,
         Protection::ReadWrite => PROT_READ | PROT_WRITE,
         Protection::ReadExecute => PROT_READ | PROT_EXEC,
+        Protection::ReadWriteExecute => PROT_READ | PROT_WRITE | PROT_EXEC,
     }
 }
 

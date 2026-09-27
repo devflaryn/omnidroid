@@ -437,13 +437,14 @@ mod tests {
             (Protection::Read, true, false, false),
             (Protection::ReadWrite, true, true, false),
             (Protection::ReadExecute, true, false, true),
+            (Protection::ReadWriteExecute, true, true, true),
         ] {
             assert_eq!(permits(protection, Read), read, "{protection} read");
             assert_eq!(permits(protection, Write), write, "{protection} write");
             assert_eq!(permits(protection, Execute), exec, "{protection} execute");
         }
         // Every variant was covered, so a new one cannot be added without failing here.
-        assert_eq!(Protection::ALL.len(), 4, "Protection gained or lost a variant");
+        assert_eq!(Protection::ALL.len(), 5, "Protection gained or lost a variant");
     }
 
     /// Rule 2, which is the rule the two sides used to disagree about.

@@ -1557,7 +1557,11 @@ impl CpuCtx {
         // dynarmic asks in terms of the protection it wants; the policy asks in terms of the access
         // being attempted. The mapping is total and is the only translation between the two.
         let access = match want {
-            Protection::ReadExecute => FaultAccess::Execute,
+            // dynarmic asks for exactly one access per fault, so it never wants a W+X page as such;
+            // a guest's own `PROT_READ|PROT_WRITE|PROT_EXEC` mapping reaches this only ever as a
+            // read, write or code fetch, each of which a W+X region already permits. Execute is the
+            // conservative reading of a W+X intent were it ever passed here.
+            Protection::ReadExecute | Protection::ReadWriteExecute => FaultAccess::Execute,
             Protection::ReadWrite => FaultAccess::Write,
             Protection::Read | Protection::None => FaultAccess::Read,
         };

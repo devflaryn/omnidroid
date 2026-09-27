@@ -4351,8 +4351,11 @@ fn every_unimplementable_mmap_shape_is_refused_by_name() {
     let unknown = guest_mmap_refusal(&f, 0, page, PROT_RW, MAP_ANON_PRIVATE | 0x0100, -1);
     assert!(unknown.to_string().contains("0x100"), "{unknown}");
 
-    // Write without read, and write with execute.
-    for prot in [2u64, 4, 6, 7] {
+    // Write or execute without read: `omni_mem::Protection` has no read-less state, and answering
+    // with the readable form would widen the grant. 2 = W, 4 = X, 6 = W|X, all without read.
+    // (`PROT_READ | PROT_WRITE | PROT_EXEC` = 7 **is** implementable now and is not in this list;
+    // see `writable_executable_memory_runs_code_the_guest_writes_and_invalidates`.)
+    for prot in [2u64, 4, 6] {
         let error = guest_mmap_refusal(&f, 0, page, prot, MAP_ANON_PRIVATE, -1);
         assert_eq!(error.symbol(), Some("mmap"), "prot {prot:#x}");
         assert!(error.to_string().contains(&format!("{prot:#x}")), "{error}");
@@ -5045,6 +5048,113 @@ fn code_at_a_reused_address_is_retranslated_rather_than_run_from_the_cache() {
     );
 }
 
+
+/// `PROT_READ | PROT_WRITE | PROT_EXEC`.
+const PROT_RWX: u64 = 7;
+
+/// **A guest may map memory writable and executable at once, and code it writes there and then
+/// invalidates runs as the new code.**
+///
+/// A self-decrypting library — the shape that made this necessary — writes its plaintext `.text`
+/// into a page it holds writable-and-executable and jumps into it. AArch64 requires it to issue
+/// `IC IVAU` after the write (the instruction cache is not coherent with stores), and this runtime
+/// intercepts that op to discard the stale translation. So the two halves are tested together:
+/// that `mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)` is granted rather than refused, and that a
+/// rewrite in place followed by `IC IVAU` runs the new bytes — never the cached translation of the
+/// old ones.
+///
+/// **One page, never reprotected between the two programs**, which is what makes it a W+X test and
+/// not a repeat of [`code_at_a_reused_address_is_retranslated_rather_than_run_from_the_cache`]: the
+/// only thing that tells the backend the bytes changed is the guest's own cache maintenance.
+///
+/// Not run on macOS: a guest address is a host address (D4), and Apple Silicon's hardened runtime
+/// refuses a plain `PROT_WRITE | PROT_EXEC` mapping -- it needs `MAP_JIT` and the per-thread
+/// write-protect toggle, which the backend does not yet arrange for guest mappings. Windows and
+/// Linux grant W+X directly.
+#[cfg_attr(target_os = "macos", ignore = "guest W+X on Apple Silicon needs MAP_JIT (not yet wired)")]
+#[test]
+fn writable_executable_memory_runs_code_the_guest_writes_and_invalidates() {
+    let _guard = serialized();
+    let f = fixture_with(&[]);
+    let length = 64 * 1024;
+    let out = f.guest.data + 0x400;
+    let mut cpu = f.guest.thread(&f.boundary);
+
+    let at = {
+        let entry = call_one(&f, "mmap", |asm| {
+            asm.mov(0, 0);
+            asm.mov(1, length);
+            asm.mov(2, PROT_RW);
+            asm.mov(3, MAP_ANON_PRIVATE);
+            asm.mov(4, u64::MAX);
+            asm.mov(5, 0);
+        });
+        f.guest.rearm(&mut cpu, &f.boundary);
+        f.run(&mut cpu, entry).expect("mmap");
+        f.guest.read_u64(f.guest.data)
+    };
+    assert_ne!(at, u64::MAX);
+
+    // Writable **and** executable, in one mapping: on a device this is what a JIT or a packer
+    // holds its code in. This is the call D12 used to refuse.
+    let protect = call_one(&f, "mprotect", |asm| {
+        asm.mov(0, at);
+        asm.mov(1, length);
+        asm.mov(2, PROT_RWX);
+    });
+    f.guest.rearm(&mut cpu, &f.boundary);
+    f.run(&mut cpu, protect).expect("mprotect W+X");
+    assert_eq!(
+        f.guest.read_u64(f.guest.data) as i64 as i32,
+        0,
+        "mprotect(PROT_READ|PROT_WRITE|PROT_EXEC) has to be granted, not refused"
+    );
+
+    // Write program A into the W+X page and run it. No reprotect: the page is already executable.
+    f.guest.space.ensure_committed(at as usize, 16).expect("the first page of the mapping");
+    f.guest.write_bytes(
+        at as usize,
+        &[movz(0, 0xAA, 0).to_le_bytes(), ret(30).to_le_bytes()].concat(),
+    );
+    let call_it = |f: &Fixture, cpu: &mut omni_cpu::dynarmic::DynarmicCpu, slot: u32| {
+        let caller = program(f, |asm| {
+            asm.mov(9, at);
+            asm.mov(10, out as u64);
+            asm.push(blr(9));
+            asm.push(str_imm(0, 10, slot));
+        });
+        f.guest.rearm(cpu, &f.boundary);
+        let exit = f.run(cpu, caller).expect("the guest runs what it wrote");
+        assert!(matches!(exit, ExitReason::Returned { .. }), "{exit:?}");
+    };
+    call_it(&f, &mut cpu, 0);
+    assert_eq!(f.guest.read_u64(out), 0xAA);
+
+    // Overwrite the same bytes with program B and tell the CPU the code changed, the way a device's
+    // self-modifying code does: `DC CVAU`, `DSB`, `IC IVAU`, `DSB`, `ISB` over the line.
+    f.guest.write_bytes(
+        at as usize,
+        &[movz(0, 0xBB, 0).to_le_bytes(), ret(30).to_le_bytes()].concat(),
+    );
+    let maintain = program(&f, |asm| {
+        asm.mov(0, at);
+        asm.push(dc_cvau(0));
+        asm.push(dsb_ish());
+        asm.push(ic_ivau(0));
+        asm.push(dsb_ish());
+        asm.push(isb());
+    });
+    f.guest.rearm(&mut cpu, &f.boundary);
+    f.run(&mut cpu, maintain).expect("the guest's cache maintenance");
+
+    call_it(&f, &mut cpu, 8);
+    assert_eq!(
+        f.guest.read_u64(out + 8),
+        0xBB,
+        "0xAA here is the first program's translation, run from the code cache after the W+X page \
+         it was translated from was rewritten and invalidated"
+    );
+}
 
 // =================================================================== M3 task 3 phase 3a
 //

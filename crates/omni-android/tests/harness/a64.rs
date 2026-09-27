@@ -101,6 +101,31 @@ pub const fn ret(rn: u32) -> u32 {
     0xD65F_0000 | (rn << 5)
 }
 
+/// `IC IVAU, Xt` — invalidate the instruction cache for the line `Xt` names, to the point of
+/// unification. This is how a guest that has just written code tells the CPU (and this translator)
+/// that the bytes there changed; AArch64's instruction cache is not coherent with writes without
+/// it.
+pub const fn ic_ivau(rt: u32) -> u32 {
+    0xD50B_7520 | rt
+}
+
+/// `DC CVAU, Xt` — clean the data cache for the line `Xt` names to the point of unification, so a
+/// following `IC IVAU` sees the written bytes. The write-then-execute sequence is `DC CVAU`, `DSB`,
+/// `IC IVAU`, `DSB`, `ISB`.
+pub const fn dc_cvau(rt: u32) -> u32 {
+    0xD50B_7B20 | rt
+}
+
+/// `DSB ISH` — a data-synchronisation barrier over the inner-shareable domain.
+pub const fn dsb_ish() -> u32 {
+    0xD503_3B9F
+}
+
+/// `ISB` — flush the pipeline, so instructions fetched after a code write are the new ones.
+pub const fn isb() -> u32 {
+    0xD503_3FDF
+}
+
 /// `LDR Xt, [Xn, #byte_offset]` — unsigned offset, scaled by 8.
 pub const fn ldr_imm(rt: u32, rn: u32, byte_offset: u32) -> u32 {
     0xF940_0000 | ((byte_offset / 8) << 10) | (rn << 5) | rt

@@ -55,7 +55,7 @@ impl GuestMem {
             }
             let ok = match region.protection {
                 Protection::None => false,
-                Protection::ReadWrite => true,
+                Protection::ReadWrite | Protection::ReadWriteExecute => true,
                 Protection::Read | Protection::ReadExecute => !write,
             };
             if !ok {

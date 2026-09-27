@@ -7,24 +7,32 @@
 use omni_platform::vm::{self, MapExecutability, OsError, Protection, VmError};
 
 #[test]
-fn no_protection_is_both_writable_and_executable() {
-    // The W^X invariant, asserted over every variant rather than trusted to review. If someone
-    // adds a `ReadWriteExecute` variant to `Protection::ALL`, this fails.
-    for protection in Protection::ALL {
-        assert!(
-            !(protection.is_writable() && protection.is_executable()),
-            "{protection} is both writable and executable; Omnidroid never holds a W+X page (D12)"
-        );
-    }
-    assert_eq!(Protection::ALL.len(), 4, "Protection gained or lost a variant");
+fn read_write_execute_is_the_only_writable_and_executable_protection() {
+    // W^X is confined to exactly one variant: `ReadWriteExecute`, the guest-only concession for a
+    // guest that maps its own code writable (a self-decrypting library, an embedded JIT). Every
+    // other variant is still W^X, and Omnidroid's *own* JIT pages never use this one (D12). If a
+    // second W+X variant is ever added, this fails.
+    let both: Vec<_> = Protection::ALL
+        .into_iter()
+        .filter(|p| p.is_writable() && p.is_executable())
+        .collect();
+    assert_eq!(
+        both,
+        [Protection::ReadWriteExecute],
+        "the only writable-and-executable protection must be ReadWriteExecute"
+    );
+    assert_eq!(Protection::ALL.len(), 5, "Protection gained or lost a variant");
 
-    // And the three that carry access are distinguishable from each other and from `None`.
+    // And the variants that carry access are distinguishable from each other and from `None`.
     assert!(!Protection::None.is_readable());
     assert!(Protection::Read.is_readable());
     assert!(Protection::ReadWrite.is_writable());
     assert!(Protection::ReadExecute.is_executable());
     assert!(!Protection::Read.is_writable());
     assert!(!Protection::ReadWrite.is_executable());
+    assert!(Protection::ReadWriteExecute.is_readable());
+    assert!(Protection::ReadWriteExecute.is_writable());
+    assert!(Protection::ReadWriteExecute.is_executable());
 }
 
 #[test]

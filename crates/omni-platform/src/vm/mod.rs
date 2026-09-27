@@ -123,20 +123,22 @@ use macos as backend;
 
 /// Page protection.
 ///
-/// # Why there is no `ReadWriteExecute`
+/// # `ReadWriteExecute` is for **guest** mappings only, never Omnidroid's own
 ///
-/// **The absence of a W+X variant is deliberate and load-bearing. Do not add one as a
-/// convenience.** Omnidroid never holds a page that is simultaneously writable and executable.
-/// That is not only a hardening choice: per D12 the dual-mapped-section approach the JIT will use
-/// (one RW view and one RX view of the same pages) measured **162 ns** per emit-and-execute cycle
-/// against **2259 ns** for flipping one mapping RW→RX→RW with `VirtualProtect`, so the W^X design
-/// is also about fourteen times faster. A `ReadWriteExecute` variant would let a caller take the
-/// slow, unsafe path without noticing, and on macOS (`MAP_JIT`) and on ARM64 hosts it would not be
-/// available anyway.
+/// Omnidroid never holds one of *its own* pages writable and executable at once: per D12 its JIT
+/// uses a dual-mapped section (one RW view and one RX view of the same pages), measured at
+/// **162 ns** per emit-and-execute cycle against **2259 ns** for flipping one mapping RW→RX→RW
+/// with `VirtualProtect`, so W^X there is both a hardening choice and about fourteen times faster.
 ///
-/// If you are here because you want to write to code pages: use the dual-mapped code arena, or
-/// [`protect`] the pages down to [`Protection::ReadWrite`], write, and [`protect`] them back to
-/// [`Protection::ReadExecute`].
+/// [`Protection::ReadWriteExecute`] exists for the one thing that dual-mapping cannot serve: a
+/// **guest** that maps a page `PROT_READ | PROT_WRITE | PROT_EXEC` and runs code it writes there
+/// (a self-decrypting library, an embedded JIT). A device grants that, so omnidroid grants it too;
+/// the guest is required by AArch64 to issue `IC IVAU` after writing code, and the CPU backend
+/// intercepts that op to discard the stale translation, so correctness does not rest on the
+/// protection. **Do not reach for this for Omnidroid's own code pages** — use the dual-mapped
+/// arena, or [`protect`] down to [`Protection::ReadWrite`], write, and back to
+/// [`Protection::ReadExecute`]. On macOS (`MAP_JIT`) and on ARM64 hosts a guest W+X mapping is
+/// backed by whatever the host grants a JIT, which is why this stays a guest-only concession.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protection {
     /// No access at all. Touching the page faults.
@@ -149,15 +151,18 @@ pub enum Protection {
     ReadWrite,
     /// Read and execute, not writable.
     ReadExecute,
+    /// Read, write and execute at once. **Guest mappings only** — see the type's own note.
+    ReadWriteExecute,
 }
 
 impl Protection {
     /// Every variant, in order. Exists so that invariants can be asserted over all of them.
-    pub const ALL: [Protection; 4] = [
+    pub const ALL: [Protection; 5] = [
         Protection::None,
         Protection::Read,
         Protection::ReadWrite,
         Protection::ReadExecute,
+        Protection::ReadWriteExecute,
     ];
 
     /// Whether the page may be read.
@@ -169,13 +174,13 @@ impl Protection {
     /// Whether the page may be written.
     #[must_use]
     pub const fn is_writable(self) -> bool {
-        matches!(self, Protection::ReadWrite)
+        matches!(self, Protection::ReadWrite | Protection::ReadWriteExecute)
     }
 
     /// Whether the page may be executed.
     #[must_use]
     pub const fn is_executable(self) -> bool {
-        matches!(self, Protection::ReadExecute)
+        matches!(self, Protection::ReadExecute | Protection::ReadWriteExecute)
     }
 }
 
@@ -186,6 +191,7 @@ impl fmt::Display for Protection {
             Protection::Read => "r--",
             Protection::ReadWrite => "rw-",
             Protection::ReadExecute => "r-x",
+            Protection::ReadWriteExecute => "rwx",
         };
         f.write_str(s)
     }

@@ -1220,7 +1220,7 @@ impl GuestSpace {
         while cursor < end {
             let Some(start) = inner.map.entry_start(cursor) else { return false };
             let Some(entry) = inner.map.get(start) else { return false };
-            if RegionInfo::from_entry(start, entry).protection == Protection::ReadExecute {
+            if RegionInfo::from_entry(start, entry).protection.is_executable() {
                 return true;
             }
             let next = start.saturating_add(entry.len);

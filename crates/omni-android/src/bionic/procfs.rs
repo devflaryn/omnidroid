@@ -179,6 +179,7 @@ fn generate_maps(source: &MapsSource) -> FsResult<Vec<u8>> {
                 Protection::Read => (b'r', b'-', b'-'),
                 Protection::ReadWrite => (b'r', b'w', b'-'),
                 Protection::ReadExecute => (b'r', b'-', b'x'),
+                Protection::ReadWriteExecute => (b'r', b'w', b'x'),
             };
             [r, w, x, if shared { b's' } else { b'p' }]
         };

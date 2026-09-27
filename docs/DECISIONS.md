@@ -252,11 +252,24 @@ Evidence: `omni-mem/tests/space.rs`, `omni-elf/tests/loader_commit.rs`.
 ## D12 — Omnidroid's JIT memory is a dual-mapped section, never W+X
 
 **Ruling.** Omnidroid's own JIT arena (`omni_mem::arena`) is one pagefile-backed section mapped RW
-and RX; no page Omnidroid owns is writable and executable at once, and a guest
-`mprotect(PROT_WRITE | PROT_EXEC)` is refused (`bionic/guestmem.rs`).
+and RX; no page **Omnidroid owns** is writable and executable at once.
 
 **Why.** 162 ns per emit+execute, 0 mismatches in 200,000, against 2,259 ns for a `VirtualProtect`
 flip. Linux maps a `memfd_create` section twice; macOS remaps one anchor (`omni-platform/src/vm/`).
+
+**D12 (guest carve-out, 2026-09-27) — a *guest* may map its own memory W+X.** `mprotect`/`mmap`
+with `PROT_READ | PROT_WRITE | PROT_EXEC` from the guest is granted, as
+`omni_platform::vm::Protection::ReadWriteExecute` (`bionic/guestmem.rs`, `omni-linux/src/mm.rs`).
+The shapes that need it -- a self-decrypting library, an app's embedded JIT -- are apps this
+runtime exists to run, and a device grants it. W^X above is an invariant of Omnidroid's *own* JIT
+pages, not a rule imposed on the guest. Correctness does not rest on the protection: AArch64
+requires the guest to issue `IC IVAU` after writing code (its instruction cache is not coherent
+with stores), and the CPU backend intercepts that op to discard the stale translation
+(`omni-cpu/src/dynarmic/callbacks.rs`, `cb_icache_op`). Pinned by
+`bionic.rs::writable_executable_memory_runs_code_the_guest_writes_and_invalidates`. On Windows a
+private W+X page is `PAGE_EXECUTE_READWRITE` and a private file view `PAGE_EXECUTE_WRITECOPY`; on
+Apple Silicon a guest W+X mapping still needs `MAP_JIT` and is not yet wired, so the test is
+skipped there.
 
 **D12 (exception) — dynarmic's x64 code cache is W+X.** It is committed `PAGE_EXECUTE_READWRITE`;
 `DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT=ON` makes upstream's suite segfault and `build.rs` refuses it.

@@ -234,6 +234,7 @@ fn prot(protection: Protection) -> libc::c_int {
         Protection::Read => libc::PROT_READ,
         Protection::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
         Protection::ReadExecute => libc::PROT_READ | libc::PROT_EXEC,
+        Protection::ReadWriteExecute => libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
     }
 }
 

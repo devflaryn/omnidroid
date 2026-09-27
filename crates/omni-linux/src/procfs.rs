@@ -57,6 +57,7 @@ fn maps(p: &Process) -> Vec<u8> {
             Protection::Read => "r--p",
             Protection::ReadWrite => "rw-p",
             Protection::ReadExecute => "r-xp",
+            Protection::ReadWriteExecute => "rwxp",
         };
         match p.mm.name_at(start) {
             Some((name, offset)) if name.first() == Some(&b'/') => {

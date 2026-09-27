@@ -165,26 +165,28 @@ fn errno_for(error: &MemError) -> i32 {
 /// `PROT_EXEC` alone have no read-less form here, and answering them with `ReadWrite` or
 /// `ReadExecute` would hand the guest *more* permission than it asked for — the direction Global
 /// Constraint 11 calls out, where saturating a limit turns hostile input into a larger permission.
-/// `PROT_WRITE | PROT_EXEC` is refused because D12 makes W^X an invariant of this runtime with one
-/// recorded exception, and the guest's own mappings are not it.
+///
+/// `PROT_READ | PROT_WRITE | PROT_EXEC` **is** granted, as [`Protection::ReadWriteExecute`]: a
+/// device grants it, and the shapes that ask for it -- a self-decrypting library, an embedded JIT
+/// -- are apps this runtime is meant to run. D12's W^X is an invariant of Omnidroid's *own* JIT
+/// pages, not a rule imposed on the guest; the guest is required by AArch64 to issue `IC IVAU`
+/// after it writes code, and the CPU backend discards the stale translation there, so correctness
+/// does not rest on withholding the protection.
 fn protection_for(prot: i32) -> Result<Protection, String> {
     match prot {
         PROT_NONE => Ok(Protection::None),
         p if p == PROT_READ => Ok(Protection::Read),
         p if p == PROT_READ | PROT_WRITE => Ok(Protection::ReadWrite),
         p if p == PROT_READ | PROT_EXEC => Ok(Protection::ReadExecute),
+        p if p == PROT_READ | PROT_WRITE | PROT_EXEC => Ok(Protection::ReadWriteExecute),
         p if p & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 => Err(format!(
             "the protection {p:#x} sets bits outside PROT_READ|PROT_WRITE|PROT_EXEC, and this \
              layer will not guess what they mean"
         )),
-        p if p == PROT_WRITE || p == PROT_EXEC => Err(format!(
+        p => Err(format!(
             "the protection {p:#x} asks for write or execute without read. `omni_mem::Protection` \
              has no such state, and answering with the readable form would grant the guest more \
              access than it asked for"
-        )),
-        p => Err(format!(
-            "the protection {p:#x} asks for write and execute at once, which D12 makes an \
-             invariant of this runtime with one recorded exception that is not a guest mapping"
         )),
     }
 }
