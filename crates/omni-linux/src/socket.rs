@@ -516,6 +516,34 @@ pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
     Ok(n)
 }
 
+/// Whether `socket` is a socket pair's end (one `crate::relay` can carry to another host process).
+#[must_use]
+pub fn is_pair(socket: &Socket) -> bool {
+    matches!(socket.peer, Some(Peer::Pair { .. }))
+}
+
+/// For `crate::relay`: the next message a pair's end was sent (a stream's queued bytes), without
+/// waiting.
+pub fn take(socket: &Socket) -> crate::relay::Took {
+    let Some(Peer::Pair { channel, side }) = &socket.peer else { return crate::relay::Took::Closed };
+    let mut queues = channel.queues.lock();
+    let q = &mut queues[*side];
+    if let Some(msg) = q.pop_front() {
+        let mut msg = msg;
+        if channel.stream {
+            while let Some(more) = q.pop_front() {
+                msg.extend_from_slice(&more);
+            }
+        }
+        return crate::relay::Took::Data(msg);
+    }
+    if channel.open[1 - *side].load(std::sync::atomic::Ordering::SeqCst) {
+        crate::relay::Took::Nothing
+    } else {
+        crate::relay::Took::Closed
+    }
+}
+
 /// `getsockopt`: the few options callers read. `SO_PEERCRED` reports the peer as init (a local
 /// service's client-credential check then passes); `SO_TYPE` the socket's type; `SO_ERROR` none;
 /// buffer sizes a plausible value. Everything else is zeroed.

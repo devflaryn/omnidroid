@@ -147,6 +147,34 @@ pub fn write(pipe: &Pipe, data: &[u8], nonblocking: bool, task: &Task) -> Result
     Ok(done)
 }
 
+/// For `crate::relay`: a read end's queued bytes, without waiting; a write end has none to give,
+/// and is closed once no reader is left.
+pub fn take(end: &End) -> crate::relay::Took {
+    let pipe = &end.pipe;
+    if end.write {
+        return if pipe.readers.load(Ordering::SeqCst) == 0 { crate::relay::Took::Closed } else { crate::relay::Took::Nothing };
+    }
+    let mut bytes = pipe.bytes.lock();
+    if !bytes.is_empty() {
+        let out: Vec<u8> = bytes.drain(..).collect();
+        pipe.changed.notify_all();
+        crate::poll::notify();
+        return crate::relay::Took::Data(out);
+    }
+    if pipe.writers.load(Ordering::SeqCst) == 0 { crate::relay::Took::Closed } else { crate::relay::Took::Nothing }
+}
+
+/// For `crate::relay`: write through a write end, whatever is queued (the sending host process
+/// already let its writer go on).
+pub fn give(end: &End, data: &[u8]) {
+    if !end.write || end.pipe.readers.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    end.pipe.bytes.lock().extend(data);
+    end.pipe.changed.notify_all();
+    crate::poll::notify();
+}
+
 /// Bytes waiting to be read (`FIONREAD`, and `poll`'s readiness).
 #[must_use]
 pub fn available(pipe: &Pipe) -> usize {

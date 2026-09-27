@@ -95,8 +95,10 @@ fn context_of(b: u8) -> Context {
 // ---------------------------------------------------------------------------------------------
 // Descriptors across host processes: shared memory by its host file, a sync file as signalled.
 
-/// A descriptor as it crosses: `[kind]` then, for shared memory, its name, host path and length.
-fn describe(file: &OpenFile) -> Vec<u8> {
+/// A descriptor as it crosses: `[kind]` then, for shared memory, its name, host path and length;
+/// for a socket pair's end or a pipe's end, the port its relay waits on (`crate::relay`).
+fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
+    let port = if crate::relay::relayable(file) { crate::relay::offer(Arc::clone(file)).unwrap_or(0) } else { 0 };
     match &*file.kind.lock() {
         FileKind::Shared(m) => {
             let mut d = vec![1u8];
@@ -108,10 +110,9 @@ fn describe(file: &OpenFile) -> Vec<u8> {
             d
         }
         FileKind::SyncFile(_) => vec![2u8],
-        // A socket or a pipe cannot cross yet: the receiver gets a connected end of its own whose
-        // other end stays open (a window's InputChannel: the window works, no input reaches it).
-        FileKind::Socket(s) => vec![3u8, s.ty as u8],
-        FileKind::Pipe(end) => vec![4u8, u8::from(end.is_write())],
+        // The receiver makes a connected end of its own and relays its other end to this one.
+        FileKind::Socket(s) => [&[3u8, s.ty as u8][..], &port.to_le_bytes()].concat(),
+        FileKind::Pipe(end) => [&[4u8, u8::from(end.is_write())][..], &port.to_le_bytes()].concat(),
         _ => vec![0u8],
     }
 }
@@ -136,13 +137,14 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
             let ty = u64::from(d.get(1).copied().unwrap_or(5));
             let (mine, other) = crate::socket::pair(ty, [0; 3], [0; 3]);
             let socket = crate::socket::Socket { domain: 1, ty, peer: Some(mine), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0, passcred: false };
-            keep(Box::new(other));
+            let other = Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(other)), flags: parking_lot::Mutex::new(2) });
+            relay_or_keep(other, port_at(d));
             Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(socket)), flags: parking_lot::Mutex::new(2) })
         }
         Some(4) => {
             let (read, write) = crate::pipe::pair();
             let (mine, other) = if d.get(1) == Some(&1) { (write, read) } else { (read, write) };
-            keep(Box::new(other));
+            relay_or_keep(other, port_at(d));
             Arc::try_unwrap(mine).map_err(|_| EIO)
         }
         Some(2) => {
@@ -151,6 +153,22 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
         }
         _ => Err(EBADF),
     }
+}
+
+/// A described socket's or pipe's relay port (0: none).
+fn port_at(d: &[u8]) -> u16 {
+    d.get(2..4).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// Relay the far end of a stand-in pair or pipe to the sender's end, or (no relay) keep it open.
+fn relay_or_keep(other: Arc<OpenFile>, port: u16) {
+    if port != 0 {
+        let held = Arc::clone(&other);
+        if crate::relay::attach(held, port).is_ok() {
+            return;
+        }
+    }
+    keep(Box::new(other));
 }
 
 /// The far ends of the stand-in pairs and pipes above, kept open.
