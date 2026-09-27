@@ -225,8 +225,8 @@ thread_local! {
 }
 
 /// `/dev/cgroup_info/cgroup.rc`, as init writes it from `cgroups.json` (libprocessgroup's
-/// `CgroupFile`: version, count, then per controller version, flags, max activation depth, a
-/// 16-byte name and a 32-byte path).
+/// `CgroupFile`: version, count, then per controller version, flags, a 16-byte name and a
+/// 32-byte path -- 56 bytes, as this image's libprocessgroup checks).
 fn cgroup_rc() -> Vec<u8> {
     const MOUNTED: u32 = 1;
     const OPTIONAL: u32 = 4;
@@ -244,7 +244,6 @@ fn cgroup_rc() -> Vec<u8> {
     for (version, flags, name, path) in controllers {
         out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&flags.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
         let mut n = [0u8; 16];
         n[..name.len()].copy_from_slice(name.as_bytes());
         out.extend_from_slice(&n);
