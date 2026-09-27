@@ -26,16 +26,29 @@ int main(void) {
     check(ntohs(got6.sin6_port) >= 32768, "udp6 given an ephemeral port");
     check(bind(u6, (struct sockaddr*)&a6, sizeof(a6)) == -1 && errno == EINVAL, "a bound socket binds again: EINVAL");
 
+    // A port free on this machine: the guest shares the host's ports (crate::hostnet), so a fixed
+    // one (adb's 5037) may be another program's. Found by binding port 0 and letting it go.
+    int probe = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in any4;
+    memset(&any4, 0, sizeof(any4));
+    any4.sin_family = AF_INET;
+    any4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t plen = sizeof(any4);
+    bind(probe, (struct sockaddr*)&any4, sizeof(any4));
+    getsockname(probe, (struct sockaddr*)&any4, &plen);
+    int port = ntohs(any4.sin_port);
+    close(probe);
+
     int t4 = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a4;
     memset(&a4, 0, sizeof(a4));
     a4.sin_family = AF_INET;
-    a4.sin_port = htons(5037);
+    a4.sin_port = htons(port);
     a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    check(bind(t4, (struct sockaddr*)&a4, sizeof(a4)) == 0, "tcp4 loopback port 5037 binds");
+    check(bind(t4, (struct sockaddr*)&a4, sizeof(a4)) == 0, "tcp4 loopback port (a free one) binds");
     struct sockaddr_in got4;
     len = sizeof(got4);
-    check(getsockname(t4, (struct sockaddr*)&got4, &len) == 0 && ntohs(got4.sin_port) == 5037 && got4.sin_addr.s_addr == htonl(INADDR_LOOPBACK), "tcp4 getsockname: 127.0.0.1:5037");
+    check(getsockname(t4, (struct sockaddr*)&got4, &len) == 0 && port != 0 && ntohs(got4.sin_port) == port && got4.sin_addr.s_addr == htonl(INADDR_LOOPBACK), "tcp4 getsockname: 127.0.0.1 and that port");
 
     int t4b = socket(AF_INET, SOCK_STREAM, 0);
     check(bind(t4b, (struct sockaddr*)&a4, sizeof(a4)) == -1 && errno == EADDRINUSE, "the same port again: EADDRINUSE");

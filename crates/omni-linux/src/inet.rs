@@ -2,6 +2,10 @@
 //! reports): the wildcard and loopback addresses can be bound, port 0 is given an ephemeral port
 //! (`ip_local_port_range`, 32768-60999), and a stream port is one socket's at a time. A bound port
 //! is held while its socket is open.
+//!
+//! TCP and UDP sockets are the host's (`crate::hostnet`): their ports are the host's, and only
+//! [`check`] -- which addresses lo has -- applies to them. The bookkeeping here is what the
+//! sockets the host's network does not stand behind (raw, ICMP) bind.
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -45,12 +49,14 @@ fn local_v4(a: [u8; 4]) -> bool {
     a == [0; 4] || a[0] == 127
 }
 
-/// `bind(addr)` for a socket of `domain` and type `ty` in `instance`.
+/// Whether `addr` is one a socket of `domain` may bind here: long enough, of the socket's family,
+/// and the wildcard or one of lo's addresses. A host socket (`crate::hostnet`) is checked by it
+/// too, before the host is asked: the guest's machine has lo alone.
 ///
 /// # Errors
 /// `EINVAL` for a short address, `EAFNOSUPPORT` for another family, `EADDRNOTAVAIL` for an address
-/// no interface has, `EADDRINUSE` for a stream port already bound.
-pub fn bind(instance: usize, domain: u16, ty: u64, addr: &[u8]) -> Result<Arc<Port>, Errno> {
+/// no interface has.
+pub fn check(domain: u16, addr: &[u8]) -> Result<(), Errno> {
     let want = if domain == AF_INET { 16 } else { 24 };
     if addr.len() < want {
         return Err(EINVAL);
@@ -65,9 +71,17 @@ pub fn bind(instance: usize, domain: u16, ty: u64, addr: &[u8]) -> Result<Arc<Po
         let v4_mapped = a[..10] == [0; 10] && a[10..12] == [0xff, 0xff];
         a == [0; 16] || a == { let mut l = [0; 16]; l[15] = 1; l } || (v4_mapped && local_v4(a[12..16].try_into().expect("4")))
     };
-    if !local {
-        return Err(EADDRNOTAVAIL);
-    }
+    if local { Ok(()) } else { Err(EADDRNOTAVAIL) }
+}
+
+/// `bind(addr)` for a socket of `domain` and type `ty` in `instance`.
+///
+/// # Errors
+/// `EINVAL` for a short address, `EAFNOSUPPORT` for another family, `EADDRNOTAVAIL` for an address
+/// no interface has, `EADDRINUSE` for a stream port already bound.
+pub fn bind(instance: usize, domain: u16, ty: u64, addr: &[u8]) -> Result<Arc<Port>, Errno> {
+    check(domain, addr)?;
+    let want = if domain == AF_INET { 16 } else { 24 };
     let mut name = addr[..want].to_vec();
     if domain == AF_INET6 {
         name.resize(28, 0); // sin6_scope_id

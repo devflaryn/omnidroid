@@ -1171,6 +1171,30 @@ impl Socket {
             .map_err(|error| NetError::io(OP, self.describe(), &error))
     }
 
+    /// Look at what has arrived without taking it: `recv(2)` with `MSG_PEEK`. On a datagram
+    /// socket it is the next datagram (truncated to `buf`, as [`recv_from`](Self::recv_from)
+    /// truncates) and its source; on a stream, the queued bytes that fit and no address (a stream
+    /// has one peer: [`peer_address`](Self::peer_address)).
+    ///
+    /// **What a guest's `MSG_PEEK` and `FIONREAD` are answered from** (`omni-linux`): `std` has
+    /// `peek` and `peek_from` on every target, so this is written once. Nothing is recorded:
+    /// the bytes are recorded when [`recv`](Self::recv) takes them.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Io`] with [`NetErrorKind::WouldBlock`] when nothing has arrived on a
+    /// non-blocking socket, or the host's own failure.
+    pub fn peek(&self, buf: &mut [u8]) -> NetResult<(usize, Option<SocketAddress>)> {
+        const OP: &str = "recv(MSG_PEEK)";
+        match &self.inner {
+            Inner::Tcp(stream) => stream.peek(buf).map(|read| (read, None)),
+            Inner::Udp(socket) => {
+                socket.peek_from(buf).map(|(read, from)| (read, Some(SocketAddress::from_std(from))))
+            }
+        }
+        .map_err(|error| NetError::io(OP, self.describe(), &error))
+    }
+
     /// Close one or both directions of a stream: `shutdown(2)`.
     ///
     /// # Errors

@@ -197,6 +197,15 @@ Windows and Linux (see STATUS).
   StartDisplayManager today (waits for SurfaceFlinger).
 - Probing from Git Bash: `export MSYS_NO_PATHCONV=1` or guest paths are rewritten.
 - Diagnostics: `OMNI_GPU_TRACE=1` (every forwarded Vulkan command and its answer).
+- **Network (2026-09-28, `aosp-net`)**: TCP/UDP sockets are host sockets (`crate::hostnet`, via
+  `omni_platform::net`, policy `hostnet::set_policy`, unrestricted by default); the guest shares
+  the host's ports. One watcher thread per host process turns host readiness into `crate::poll`
+  wakeups (`tests/host_sockets.rs`). In a host process with no netd (an app's), the kernel answers
+  `/dev/socket/dnsproxyd` itself (`crate::dnsproxy`: getaddrinfo, gethostby*, resnsend from the
+  host resolver); where netd bound it, netd answers. `OMNI_NET_TRACE=1` prints host socket and
+  lookup failures. Open: SCM_RIGHTS is not passed, so in the system's host process a connect by
+  a process whose libnetd_client reaches netd's fwmarkd gets netd's error for the missing fd
+  (apps are unaffected: fwmarkd is absent there and a failed fwmarkd connect is "no error").
 - Known gaps: AHB mirrors are linear images (input-attachment usage and other-format views are
   dropped when the host refuses them linear); no sync_file fds (fences are -1: synchronous);
   `vkDestroyCommandPool` leaves guest command-buffer wrappers behind; CLOCK_MONOTONIC is shared per

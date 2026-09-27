@@ -487,6 +487,89 @@ fn sys_ppoll(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     result
 }
 
+/// `pselect6(nfds, readfds, writefds, exceptfds, timeout, {sigmask, size})`: `select` as bionic
+/// makes it. Readable is `POLLIN | POLLHUP | POLLERR`, writable `POLLOUT | POLLERR`, as Linux's
+/// `select` reads them; nothing here has exceptional (`POLLPRI`) data. The time left is written
+/// back, as Linux does.
+fn sys_pselect6(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let n = a[0] as i64;
+    if !(0..=1 << 16).contains(&n) {
+        return Err(EINVAL);
+    }
+    let n = n as usize;
+    let bytes = n.div_ceil(64) * 8;
+    let read_set = |at: u64| -> Result<Option<Vec<u8>>, Errno> { if at == 0 { Ok(None) } else { p.mem.read(at, bytes).map(Some) } };
+    let sets = [read_set(a[1])?, read_set(a[2])?, read_set(a[3])?];
+    let deadline = if a[4] == 0 { None } else { Instant::now().checked_add(read_timespec(p, a[4])?) };
+    let timed = a[4] != 0;
+    let restore = if a[5] == 0 { None } else { temporary_mask(p, t, p.mem.read_u64(a[5])?, p.mem.read_u64(a[5] + 8)?)? };
+    let bit = |set: &Option<Vec<u8>>, fd: usize| set.as_ref().is_some_and(|s| s[fd / 8] & (1 << (fd % 8)) != 0);
+    let result = loop {
+        let seen = generation();
+        let now = Instant::now();
+        let mut out = [vec![0u8; bytes], vec![0u8; bytes], vec![0u8; bytes]];
+        let mut count = 0u64;
+        let mut earliest: Option<Instant> = None;
+        let mut bad = false;
+        for fd in 0..n {
+            let (r, w) = (bit(&sets[0], fd), bit(&sets[1], fd));
+            if !r && !w && !bit(&sets[2], fd) {
+                continue;
+            }
+            let Ok(file) = p.fds.get(fd as i32) else {
+                bad = true;
+                break;
+            };
+            let (ready, next) = readiness(&file, now);
+            if let Some(x) = next {
+                earliest = Some(earliest.map_or(x, |e: Instant| e.min(x)));
+            }
+            if r && ready & (IN | HUP | ERR) != 0 {
+                out[0][fd / 8] |= 1 << (fd % 8);
+                count += 1;
+            }
+            if w && ready & (OUT | ERR) != 0 {
+                out[1][fd / 8] |= 1 << (fd % 8);
+                count += 1;
+            }
+        }
+        if bad {
+            break Err(crate::errno::EBADF);
+        }
+        if count > 0 || (timed && deadline.is_none_or(|d| now >= d)) {
+            let written = (|| -> Result<(), Errno> {
+                for (i, at) in [a[1], a[2], a[3]].into_iter().enumerate() {
+                    if at != 0 {
+                        p.mem.write(at, &out[i])?;
+                    }
+                }
+                if let Some(d) = deadline {
+                    let left = d.saturating_duration_since(Instant::now());
+                    p.mem.write_u64(a[4], left.as_secs())?;
+                    p.mem.write_u64(a[4] + 8, u64::from(left.subsec_nanos()))?;
+                }
+                Ok(())
+            })();
+            break written.map(|()| count);
+        }
+        let wake = match (deadline, earliest) {
+            (Some(d), Some(e)) => Some(d.min(e)),
+            (d, e) => d.or(e),
+        };
+        if let Err(e) = wait_for_change(seen, wake, t) {
+            break Err(e);
+        }
+    };
+    if let Some(old) = restore {
+        if result == Err(EINTR) {
+            t.saved_sigmask = Some(old);
+        } else {
+            t.sigmask = old;
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------------- I/O
 
 /// `read` on a descriptor this module owns; `None` for any other.
@@ -530,6 +613,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::EPOLL_CTL, sys_epoll_ctl);
     table.set(nr::EPOLL_PWAIT, sys_epoll_pwait);
     table.set(nr::PPOLL, sys_ppoll);
+    table.set(nr::PSELECT6, sys_pselect6);
     table.set(nr::TIMERFD_CREATE, sys_timerfd_create);
     table.set(nr::TIMERFD_SETTIME, sys_timerfd_settime);
     table.set(nr::TIMERFD_GETTIME, sys_timerfd_gettime);

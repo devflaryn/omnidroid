@@ -704,7 +704,7 @@ fn sys_sendfile(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 fn sys_write(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     let bytes = p.mem.read(a[1], (a[2] as usize).min(1 << 24))?;
-    if let Some(r) = crate::poll::write(&file, &bytes, t) {
+    if let Some(r) = crate::poll::write(&file, &bytes, t).or_else(|| crate::socket::write(&file, &bytes, t)) {
         return Ok(r? as u64);
     }
     match crate::pipe::end_of(&file) {
@@ -734,6 +734,9 @@ fn sys_writev(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             break;
         }
     }
+    if let Some(r) = crate::socket::write(&file, &bytes, t) {
+        return Ok(r? as u64);
+    }
     match crate::pipe::end_of(&file) {
         Some((_, false, _)) => Err(EBADF),
         Some((pipe, true, nonblocking)) => Ok(crate::pipe::write(&pipe, &bytes, nonblocking, t)? as u64),
@@ -743,6 +746,23 @@ fn sys_writev(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_readv(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
+    if crate::socket::host_of(&file).is_some() {
+        // A host socket: one receive (which may wait) spread over the buffers.
+        let spans = iovecs(p, a[1], a[2])?;
+        let total = spans.iter().fold(0usize, |n, (_, len)| n.saturating_add(*len)).min(1 << 24);
+        let mut buf = vec![0u8; total];
+        let n = crate::socket::read(&file, &mut buf, t).expect("a host socket")?;
+        let mut at = 0;
+        for (base, len) in spans {
+            if at >= n {
+                break;
+            }
+            let k = len.min(n - at);
+            p.mem.write(base, &buf[at..at + k])?;
+            at += k;
+        }
+        return Ok(n as u64);
+    }
     let pipe = crate::pipe::end_of(&file);
     let mut total = 0u64;
     for (base, len) in iovecs(p, a[1], a[2])? {
@@ -955,6 +975,14 @@ fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     match a[1] {
         // TCGETS, TIOCGWINSZ, TIOCGPGRP: nothing here is a terminal.
         0x5401 | 0x5413 | 0x540F => Err(ENOTTY),
+        // FIONBIO: O_NONBLOCK on or off, as fcntl(F_SETFL) sets it -- what a host socket's calls
+        // (`crate::hostnet`) and every other waiting descriptor here read.
+        0x5421 => {
+            let on = p.mem.read_u32(a[2])? != 0;
+            let mut f = file.flags.lock();
+            *f = if on { *f | 0o4000 } else { *f & !0o4000 };
+            Ok(0)
+        }
         // FIONREAD: the bytes ready to read.
         0x541b => {
             let n = match crate::pipe::end_of(&file) {

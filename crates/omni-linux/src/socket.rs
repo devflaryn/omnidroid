@@ -1,8 +1,9 @@
 //! Sockets. One service stands behind an address here: `logd`'s write socket
 //! (`/dev/socket/logdw`), whose packets are printed as `logcat` would print them, so what ART and
-//! the framework log -- an abort's reason above all -- is seen. Every other address is refused at
-//! `connect` as it is on a device where that service is not running, and the caller takes its
-//! no-service path.
+//! the framework log -- an abort's reason above all -- is seen. A Unix address no socket is bound
+//! to is refused at `connect` as it is on a device where that service is not running, and the
+//! caller takes its no-service path. A TCP or UDP socket is a host socket on the host's network
+//! (`crate::hostnet`).
 //!
 //! `socketpair(AF_UNIX)` makes two connected ends ([`PairChannel`]): SurfaceFlinger's `BitTube`
 //! (vsync events) and an app's `InputChannel` (input) -- ends that are passed to other processes
@@ -83,8 +84,14 @@ pub enum Peer {
     Bound(Arc<crate::unix::Bound>),
     /// A datagram socket connected to a bound one: what it sends goes there.
     Dgram(Arc<crate::unix::Bound>),
-    /// An internet socket bound to a port (`crate::inet`).
+    /// An internet socket bound to a port (`crate::inet`): a raw or ICMP socket, which the host's
+    /// network does not stand behind.
     Inet(Arc<crate::inet::Port>),
+    /// A TCP or UDP socket: a host socket on the host's network (`crate::hostnet`).
+    Host(Arc<crate::hostnet::Host>),
+    /// netd's DNS proxy, answered by the kernel where nothing in this host process is bound to
+    /// `/dev/socket/dnsproxyd` (`crate::dnsproxy`).
+    Dns(Arc<crate::dnsproxy::Proxy>),
     /// The other end of a socket pair.
     Pair { channel: Arc<PairChannel>, side: usize },
     /// `logd`: packets are printed to this output.
@@ -177,13 +184,31 @@ pub fn format_log(packet: &[u8]) -> Option<String> {
 }
 
 impl Drop for Socket {
-    /// The last descriptor of an end is closed: the other end is hung up.
+    /// The last descriptor of an end is closed: the other end is hung up. A host socket is
+    /// released, and the watcher told to let go of it, so the host closes it now.
     fn drop(&mut self) {
         if let Some(Peer::Pair { channel, side }) = &self.peer {
             channel.open[*side].store(false, std::sync::atomic::Ordering::SeqCst);
             crate::poll::notify();
         }
+        if let Some(Peer::Host(_)) = &self.peer {
+            self.peer = None;
+            crate::hostnet::wake();
+        }
     }
+}
+
+/// The host socket behind `file`, if it is a TCP or UDP socket.
+#[must_use]
+pub fn host_of(file: &OpenFile) -> Option<Arc<crate::hostnet::Host>> {
+    match &*file.kind.lock() {
+        FileKind::Socket(Socket { peer: Some(Peer::Host(h)), .. }) => Some(Arc::clone(h)),
+        _ => None,
+    }
+}
+
+fn nonblocking(file: &OpenFile) -> bool {
+    *file.flags.lock() & 0o4000 != 0
 }
 
 /// Deliver `bytes` to a connected socket's peer.
@@ -209,6 +234,8 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
             Ok(bytes.len())
         }
         Some(Peer::Bound(_) | Peer::Inet(_)) => Err(ENOTCONN),
+        Some(Peer::Host(h)) => h.try_send(bytes),
+        Some(Peer::Dns(proxy)) => Ok(proxy.send(bytes)),
         Some(Peer::Pair { channel, side }) => {
             let other = 1 - *side;
             if !channel.open[other].load(std::sync::atomic::Ordering::SeqCst) {
@@ -244,7 +271,12 @@ fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if !matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK | AF_KEY) {
         return Err(EAFNOSUPPORT);
     }
-    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer: None, inbox: std::collections::VecDeque::new(), name: None, protocol: a[2], owner: p.sys.pid as u32, passcred: false };
+    let peer = if crate::hostnet::eligible(domain, ty & SOCK_TYPE_MASK, a[2]) {
+        Some(Peer::Host(crate::hostnet::Host::create(domain as u16, ty & SOCK_TYPE_MASK == 1)?))
+    } else {
+        None
+    };
+    let socket = Socket { domain, ty: ty & SOCK_TYPE_MASK, peer, inbox: std::collections::VecDeque::new(), name: None, protocol: a[2], owner: p.sys.pid as u32, passcred: false };
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let file = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
     Ok(p.fds.insert(Arc::new(file), ty & SOCK_CLOEXEC != 0, 0)? as u64)
@@ -269,8 +301,13 @@ fn instance_of(p: &Process) -> usize {
     Arc::as_ptr(p.vfs.binds()) as usize
 }
 
-fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_connect(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
+    // A host socket connects without its descriptor's lock held: a blocking connect waits.
+    if let Some(host) = host_of(&file) {
+        let addr = p.mem.read(a[1], (a[2] as usize).min(128))?;
+        return host.connect(&addr, nonblocking(&file), t).map(|()| 0);
+    }
     let stderr = match p.fds.get(2).ok().as_deref().map(|f| f.kind.lock().output()) {
         Some(Some(out)) => out,
         _ => Output::Host,
@@ -281,7 +318,7 @@ fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         return Ok(0); // to the kernel: what it sends is answered (`crate::netlink`)
     }
     if socket.domain != AF_UNIX {
-        // No network: an address that cannot be reached.
+        // A raw or ICMP socket: the host's network does not stand behind it.
         return Err(crate::errno::ENETUNREACH);
     }
     let path = unix_path(p, a[1], a[2])?;
@@ -299,21 +336,32 @@ fn sys_connect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if let Some(server) = crate::unix::Bound::find(instance_of(p), &path) {
         return server.connect(socket, cred_of(p)).map(|()| 0);
     }
+    // No netd in this host process (an app's): the kernel answers its DNS proxy. (fwmarkd is not
+    // answered: libnetd_client's FwmarkClient::send takes a failed connect as "no error".)
+    if path == b"/dev/socket/dnsproxyd" && socket.ty == 1 {
+        let hosts = p.vfs.sysroot().read(b"/system/etc/hosts").unwrap_or_default();
+        socket.peer = Some(Peer::Dns(crate::dnsproxy::Proxy::new(&hosts)));
+        return Ok(0);
+    }
     if p.trace {
         eprintln!("[socket] connect {:?}: no service", String::from_utf8_lossy(&path));
     }
     Err(ENOENT)
 }
 
-fn sys_sendto(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_sendto(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let bytes = p.mem.read(a[1], (a[2] as usize).min(1 << 20))?;
+    if let Some(host) = host_of(&file) {
+        let to = if a[4] == 0 { None } else { Some(p.mem.read(a[4], (a[5] as usize).min(128))?) };
+        return Ok(host.send(&bytes, to.as_deref(), a[3], nonblocking(&file), t)? as u64);
+    }
     let mut kind = file.kind.lock();
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
     Ok(send(socket, &bytes)? as u64)
 }
 
-fn sys_sendmsg(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_sendmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     // struct msghdr: name, namelen, iov, iovlen, control, controllen, flags.
     let (iov, iovlen) = (p.mem.read_u64(a[1] + 16)?, p.mem.read_u64(a[1] + 24)?);
@@ -324,6 +372,11 @@ fn sys_sendmsg(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     for i in 0..iovlen {
         let (base, len) = (p.mem.read_u64(iov + i * 16)?, p.mem.read_u64(iov + i * 16 + 8)? as usize);
         bytes.extend_from_slice(&p.mem.read(base, len.min((1 << 20) - bytes.len().min(1 << 20)))?);
+    }
+    if let Some(host) = host_of(&file) {
+        let (name, namelen) = (p.mem.read_u64(a[1])?, p.mem.read_u32(a[1] + 8)?);
+        let to = if name == 0 { None } else { Some(p.mem.read(name, (namelen as usize).min(128))?) };
+        return Ok(host.send(&bytes, to.as_deref(), a[2], nonblocking(&file), t)? as u64);
     }
     let mut kind = file.kind.lock();
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
@@ -343,6 +396,10 @@ fn sys_bind(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         socket.name = Some(p.mem.read(a[1], a[2] as usize)?);
         socket.peer = Some(Peer::Bound(bound));
         return Ok(0);
+    }
+    if let Some(Peer::Host(host)) = &socket.peer {
+        let addr = p.mem.read(a[1], (a[2] as usize).min(28))?;
+        return host.bind(&addr).map(|()| 0);
     }
     if matches!(socket.domain, AF_INET | AF_INET6) {
         if socket.name.is_some() {
@@ -388,6 +445,7 @@ fn sys_listen(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             bound.listening.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(0)
         }
+        Some(Peer::Host(host)) => host.listen(a[1] as i64 as i32).map(|()| 0),
         _ => Err(EINVAL),
     }
 }
@@ -400,6 +458,20 @@ fn sys_accept(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 /// non-blocking), as a new descriptor; the peer's address is unnamed.
 fn sys_accept4(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
+    if a[3] & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return Err(EINVAL);
+    }
+    if let Some(host) = host_of(&file) {
+        let (conn, peer) = host.accept(nonblocking(&file), t)?;
+        let socket = Socket { domain: u64::from(host.domain), ty: 1, peer: Some(Peer::Host(conn)), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: p.sys.pid as u32, passcred: false };
+        let flags = if a[3] & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2;
+        let new = OpenFile { kind: Mutex::new(FileKind::Socket(socket)), flags: Mutex::new(flags) };
+        let fd = p.fds.insert(Arc::new(new), a[3] & SOCK_CLOEXEC != 0, 0)?;
+        if a[1] != 0 && a[2] != 0 {
+            write_name(p, a[1], a[2], &peer)?;
+        }
+        return Ok(fd as u64);
+    }
     let bound = match &*file.kind.lock() {
         FileKind::Socket(Socket { peer: Some(Peer::Bound(b)), .. }) if b.listening.load(std::sync::atomic::Ordering::SeqCst) => Arc::clone(b),
         FileKind::Socket(_) => return Err(EINVAL),
@@ -425,9 +497,38 @@ fn sys_accept4(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(p.fds.insert(Arc::new(file), a[3] & SOCK_CLOEXEC != 0, 0)? as u64)
 }
 
+/// A socket address into the caller's buffer as `getsockname` returns one: as much as fits in
+/// `*len_at`, and `*len_at` set to its full length.
+fn write_name(p: &Process, at: u64, len_at: u64, name: &[u8]) -> Result<(), Errno> {
+    let room = u32::from_le_bytes(p.mem.read(len_at, 4)?.try_into().expect("4")) as usize;
+    p.mem.write(at, &name[..name.len().min(room)])?;
+    p.mem.write(len_at, &(name.len() as u32).to_le_bytes())
+}
+
+/// `getpeername`: a host socket's peer; a socket pair's other end (unnamed: the family alone).
+fn sys_getpeername(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(a[0] as i64 as i32)?;
+    if let Some(host) = host_of(&file) {
+        let name = host.peer()?;
+        return write_name(p, a[1], a[2], &name).map(|()| 0);
+    }
+    let name = match &*file.kind.lock() {
+        FileKind::Socket(Socket { peer: None | Some(Peer::Bound(_) | Peer::Inet(_)), domain, .. }) if *domain != AF_NETLINK => return Err(ENOTCONN),
+        // Netlink's peer is the kernel: `sockaddr_nl` with port 0.
+        FileKind::Socket(s) if s.domain == AF_NETLINK => [&(AF_NETLINK as u16).to_le_bytes()[..], &[0; 10]].concat(),
+        FileKind::Socket(s) => (s.domain as u16).to_le_bytes().to_vec(),
+        _ => return Err(crate::errno::ENOTSOCK),
+    };
+    write_name(p, a[1], a[2], &name).map(|()| 0)
+}
+
 /// `getsockname`: the bound address; unbound, the family alone.
 fn sys_getsockname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
+    if let Some(host) = host_of(&file) {
+        let name = host.name()?;
+        return write_name(p, a[1], a[2], &name).map(|()| 0);
+    }
     let kind = file.kind.lock();
     let FileKind::Socket(socket) = &*kind else { return Err(crate::errno::ENOTSOCK) };
     let name = match &socket.name {
@@ -448,6 +549,15 @@ fn sys_setsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let is_socket = matches!(&*file.kind.lock(), FileKind::Socket(_));
     if !is_socket {
         return Err(crate::errno::ENOTSOCK);
+    }
+    if let Some(host) = host_of(&file) {
+        let value = p.mem.read(a[3], (a[4] as usize).min(256))?;
+        if host.set_option(a[1], a[2], &value)? {
+            return Ok(0);
+        }
+        if p.trace {
+            eprintln!("[socket] setsockopt level {} name {}: accepted, not acted on", a[1], a[2]);
+        }
     }
     // SO_PASSCRED.
     if a[1] == 1 && a[2] == 16 && a[4] >= 4 {
@@ -470,6 +580,9 @@ fn sys_setsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_shutdown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
+    if let Some(host) = host_of(&file) {
+        return host.shutdown(a[1]).map(|()| 0);
+    }
     let is_socket = matches!(&*file.kind.lock(), FileKind::Socket(_));
     if is_socket { Ok(0) } else { Err(crate::errno::ENOTSOCK) }
 }
@@ -478,6 +591,12 @@ fn sys_shutdown(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 /// socket pair: one message (the rest of it discarded, as a datagram's is) or a stream's bytes;
 /// end of file (0) once the other end is closed and nothing is left.
 pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
+    if let Some(Peer::Host(host)) = &socket.peer {
+        return host.try_recv(buf);
+    }
+    if let Some(Peer::Dns(proxy)) = &socket.peer {
+        return proxy.receive(buf);
+    }
     if let Some(Peer::Bound(bound)) = &socket.peer {
         return bound.receive(buf).ok_or(crate::errno::EAGAIN);
     }
@@ -549,6 +668,15 @@ pub fn take(socket: &Socket) -> crate::relay::Took {
 /// buffer sizes a plausible value. Everything else is zeroed.
 fn sys_getsockopt(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
+    if let Some(host) = host_of(&file) {
+        if let Some(bytes) = host.get_option(a[1], a[2])? {
+            let cap = p.mem.read_u32(a[4])? as usize;
+            let n = bytes.len().min(cap);
+            p.mem.write(a[3], &bytes[..n])?;
+            p.mem.write_u32(a[4], n as u32)?;
+            return Ok(0);
+        }
+    }
     let (ty, peer_cred) = match &*file.kind.lock() {
         FileKind::Socket(s) => (s.ty, peer_cred(s)),
         _ => return Err(crate::errno::ENOTSOCK),
@@ -608,6 +736,17 @@ const MSG_DONTWAIT: u64 = 0x40;
 fn sys_recvfrom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let mut buf = vec![0u8; (a[2] as usize).min(1 << 20)];
+    if let Some(host) = host_of(&file) {
+        let (n, from) = host.recv(&mut buf, a[3], nonblocking(&file), t)?;
+        p.mem.write(a[1], &buf[..n])?;
+        if a[4] != 0 && a[5] != 0 {
+            match from {
+                Some(addr) => write_name(p, a[4], a[5], &crate::hostnet::sockaddr(&addr))?,
+                None => p.mem.write_u32(a[5], 0)?,
+            }
+        }
+        return Ok(n as u64);
+    }
     let n = receive_waiting(&file, &mut buf, a[3] & MSG_DONTWAIT != 0, t)?;
     p.mem.write(a[1], &buf[..n])?;
     Ok(n as u64)
@@ -621,7 +760,7 @@ fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) ->
         let (r, pair) = {
             let mut kind = file.kind.lock();
             let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
-            (receive(socket, buf), matches!(socket.peer, Some(Peer::Pair { .. } | Peer::Bound(_))) || socket.domain == AF_NETLINK)
+            (receive(socket, buf), matches!(socket.peer, Some(Peer::Pair { .. } | Peer::Bound(_) | Peer::Dns(_))) || socket.domain == AF_NETLINK)
         };
         let nonblocking = dontwait || *file.flags.lock() & 0o4000 != 0;
         match r {
@@ -633,13 +772,28 @@ fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) ->
 
 /// `read` of a socket pair's end (which may wait); `None` for anything else.
 pub fn read(file: &OpenFile, buf: &mut [u8], t: &Task) -> Option<Result<usize, Errno>> {
-    let pair = matches!(&*file.kind.lock(), FileKind::Socket(Socket { peer: Some(Peer::Pair { .. }), .. }));
+    if let Some(host) = host_of(file) {
+        return Some(host.recv(buf, 0, nonblocking(file), t).map(|(n, _)| n));
+    }
+    let pair = matches!(&*file.kind.lock(), FileKind::Socket(Socket { peer: Some(Peer::Pair { .. } | Peer::Dns(_)), .. }));
     pair.then(|| receive_waiting(file, buf, false, t))
+}
+
+/// `write` of a host socket (which may wait; `EPIPE` raises `SIGPIPE`); `None` for anything else.
+pub fn write(file: &OpenFile, bytes: &[u8], t: &Task) -> Option<Result<usize, Errno>> {
+    let host = host_of(file)?;
+    Some(host.send(bytes, None, 0, nonblocking(file), t))
 }
 
 /// Bytes ready to read (`FIONREAD`): a datagram's the next message's, a stream's all queued.
 #[must_use]
 pub fn available(socket: &Socket) -> usize {
+    if let Some(Peer::Host(host)) = &socket.peer {
+        return host.available();
+    }
+    if let Some(Peer::Dns(proxy)) = &socket.peer {
+        return proxy.available();
+    }
     if let Some(Peer::Pair { channel, side }) = &socket.peer {
         let queues = channel.queues.lock();
         let q = &queues[*side];
@@ -656,6 +810,8 @@ pub fn readiness(socket: &Socket) -> u32 {
     const OUT: u32 = 0x4;
     const HUP: u32 = 0x10;
     match &socket.peer {
+        Some(Peer::Host(host)) => host.readiness(),
+        Some(Peer::Dns(proxy)) => (if proxy.available() > 0 { IN } else { 0 }) | OUT,
         Some(Peer::Bound(bound)) => if bound.ready() { IN } else { 0 },
         Some(Peer::Dgram(_)) => OUT,
         Some(Peer::Pair { channel, side }) => {
@@ -715,7 +871,11 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         total = total.saturating_add(len);
     }
     let mut buf = vec![0u8; total.min(1 << 20)];
-    let n = receive_waiting(&file, &mut buf, a[2] & MSG_DONTWAIT != 0, t)?;
+    let host = host_of(&file);
+    let (n, from) = match &host {
+        Some(host) => host.recv(&mut buf, a[2], nonblocking(&file), t)?,
+        None => (receive_waiting(&file, &mut buf, a[2] & MSG_DONTWAIT != 0, t)?, None),
+    };
     let mut at = 0;
     for (base, len) in spans {
         if at >= n {
@@ -724,6 +884,19 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         let k = len.min(n - at);
         p.mem.write(base, &buf[at..at + k])?;
         at += k;
+    }
+    if host.is_some() {
+        // msg_name: where a datagram came from (a stream's is not reported: namelen 0).
+        let name = p.mem.read_u64(a[1])?;
+        if name != 0 {
+            match from {
+                Some(addr) => write_name(p, name, a[1] + 8, &crate::hostnet::sockaddr(&addr))?,
+                None => p.mem.write_u32(a[1] + 8, 0)?,
+            }
+        }
+        p.mem.write(a[1] + 40, &0u64.to_le_bytes())?;
+        p.mem.write(a[1] + 48, &0u32.to_le_bytes())?;
+        return Ok(n as u64);
     }
     // SO_PASSCRED: the sender's credentials, SCM_CREDENTIALS; otherwise no control data.
     let creds = match &*file.kind.lock() {
@@ -764,6 +937,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::ACCEPT, sys_accept);
     table.set(nr::ACCEPT4, sys_accept4);
     table.set(nr::GETSOCKNAME, sys_getsockname);
+    table.set(nr::GETPEERNAME, sys_getpeername);
     table.set(nr::GETSOCKOPT, sys_getsockopt);
     table.set(nr::CONNECT, sys_connect);
     table.set(nr::SENDTO, sys_sendto);
