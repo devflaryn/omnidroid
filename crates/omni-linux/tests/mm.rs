@@ -205,3 +205,13 @@ fn a_low_hint_outside_the_space_is_enomem_and_a_high_one_is_a_preference() {
     let high = mmap(&p, &mut t, [(end + (1 << 30)).max(1 << 40), pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]);
     assert!(high > 0, "a high hint outside the space still maps somewhere: {high}");
 }
+
+/// A hint at a free address inside the space is where the mapping goes: ART reserves its boot image
+/// at the address it chose (`PROT_NONE`, then maps the image over it).
+#[test]
+fn a_free_hint_inside_the_space_is_honoured() {
+    let (p, mut t, _, pg) = process();
+    let hint = (p.mem.space().base() as u64 + (1 << 30)) & !(pg - 1);
+    let len = 0x6bc_8000u64;
+    assert_eq!(mmap(&p, &mut t, [hint, len, 0, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64, hint);
+}

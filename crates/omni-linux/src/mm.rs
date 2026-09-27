@@ -200,11 +200,20 @@ impl Mm {
         }
         let refused_fixed = |e| if fixed { EEXIST } else { e };
         if req.flags & MAP_ANONYMOUS != 0 {
-            return self
+            let at = self
                 .space
                 .map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy)
                 .map(|a| a as u64)
                 .map_err(|_| refused_fixed(ENOMEM));
+            if p.trace {
+                if let (Placement::Hint { address, .. }, Ok(got)) = (placement, &at) {
+                    if *got != address as u64 {
+                        let r = self.space.region_at(address);
+                        eprintln!("[mm] hint {address:#x}+{len:#x} not free: {r:?}");
+                    }
+                }
+            }
+            return at;
         }
         let file = p.fds.get(req.fd)?;
         if let FileKind::Synth { data, guest, .. } = &*file.kind.lock() {
