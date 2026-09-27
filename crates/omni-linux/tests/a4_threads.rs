@@ -31,3 +31,13 @@ fn priority_inheritance_mutexes_lock_contend_and_time_out() {
     assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 9, "{out}\n{err}");
     assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
 }
+
+/// Threads creating one new file at once (keystore2's first database): the loser of the race
+/// opens what the winner made (O_CREAT without O_EXCL), not EACCES.
+#[test]
+fn threads_racing_to_create_a_file_all_open_it() {
+    let Some((status, out, err)) = common::run_fixture("creatrace", &[]) else { return };
+    assert!(!out.contains("FAIL"), "{out}\n{err}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 2, "{out}\n{err}");
+    assert_eq!(status, omni_linux::ExitStatus::Exited(0), "{out}\n{err}");
+}

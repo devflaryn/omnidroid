@@ -193,7 +193,18 @@ pub fn open_by(opener: Option<&Process>, vfs: &Vfs, cwd: &[u8], path: &[u8], fla
     let kind = match r.node.clone() {
         Node::Missing { .. } if flags & O_CREAT == 0 => return Err(ENOENT),
         Node::Missing { host: Some(host), parent_is_dir: true } => {
-            let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&host).map_err(|_| EACCES)?;
+            let file = match std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&host) {
+                Ok(file) => file,
+                // Created meanwhile by another task (two threads opening one new database): with
+                // O_EXCL that is EEXIST; a plain O_CREAT opens the file that is there now.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if flags & O_EXCL != 0 {
+                        return Err(EEXIST);
+                    }
+                    return open_by(opener, vfs, cwd, path, flags & !O_CREAT);
+                }
+                Err(_) => return Err(EACCES),
+            };
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
         Node::Missing { host: None, .. } => return Err(if flags & O_CREAT != 0 { EROFS } else { ENOENT }),
