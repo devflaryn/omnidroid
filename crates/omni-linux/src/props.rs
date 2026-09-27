@@ -380,6 +380,17 @@ impl PropertyService {
 
     /// `setprop`: a new property is added, an existing one changed; `ro.*` is set once.
     pub fn set(&self, name: &str, value: &str) -> u32 {
+        // Control messages are init's, not properties.
+        if name.starts_with("ctl.") {
+            if let Some(init) = crate::init::current() {
+                let (n, v) = (name.to_string(), value.to_string());
+                // Not on the caller's thread: starting a process must not wait on its sender.
+                std::thread::spawn(move || {
+                    init.control(&n, &v);
+                });
+            }
+            return PROP_SUCCESS;
+        }
         if name.is_empty() || name.len() >= 256 || name.contains(char::is_whitespace) {
             return PROP_ERROR_INVALID_NAME;
         }

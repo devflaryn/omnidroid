@@ -14,6 +14,7 @@ fn main() -> ExitCode {
     let mut argv = Vec::new();
     let mut services: Vec<String> = Vec::new();
     let mut uid: u32 = 10_000;
+    let mut init_classes: Vec<String> = Vec::new();
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -22,6 +23,8 @@ fn main() -> ExitCode {
             "--env" => envp.push(args.next().expect("--env needs KEY=VALUE").into_bytes()),
             "--service" => services.push(args.next().expect("--service needs a program")),
             "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
+            // init: read the image's services, and class_start these classes (comma-separated).
+            "--init" => init_classes = args.next().expect("--init needs classes").split(',').map(String::from).collect(),
             "--" => {
                 argv.extend(args.by_ref().map(String::into_bytes));
             }
@@ -72,7 +75,17 @@ fn main() -> ExitCode {
             }
         }
     }
-    if !daemons.is_empty() {
+    if !init_classes.is_empty() {
+        match omni_linux::init::Init::start(sysroot.clone(), instance.clone(), envp.clone()) {
+            Ok(init) => {
+                let classes: Vec<&str> = init_classes.iter().map(String::as_str).collect();
+                let started = init.class_start(&classes);
+                eprintln!("[init] started {} services: {}", started.len(), started.join(" "));
+            }
+            Err(e) => eprintln!("[init] {e}"),
+        }
+    }
+    if !daemons.is_empty() || !init_classes.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
     let status = p.run();
