@@ -526,6 +526,24 @@ impl State {
         )
     }
 
+    /// Queue a oneway transaction to `node` for its process `target` -- or, while one to the same
+    /// node is out, on the node, as the kernel's `binder_proc_transaction` orders them
+    /// (`node->has_async_transaction`, `node->async_todo`).
+    fn queue_oneway(&mut self, target: ProcId, node: NodeId, mut txn: Txn) {
+        txn.async_node = Some(node);
+        if let Some(n) = self.nodes.get_mut(&node) {
+            if n.has_async {
+                n.async_todo.push_back(Work::Txn(Box::new(txn)));
+                if n.async_todo.len() % 64 == 0 {
+                    eprintln!("[binder] {}", self.async_stall(node));
+                }
+                return;
+            }
+            n.has_async = true;
+        }
+        self.queue(target, None, Work::Txn(Box::new(txn)));
+    }
+
     /// Queue work for a thread of `id`: `tid`'s own queue when given, the process's otherwise.
     fn queue(&mut self, id: ProcId, tid: Option<i32>, work: Work) {
         let proc = self.proc_mut(id);
@@ -688,7 +706,8 @@ impl Broker {
     }
 
     /// A one-way transaction from the host to `handle` (a HAL calling back its client:
-    /// `IComposerCallback.onVsync`): queued for the target's process, not waited on.
+    /// `IComposerCallback.onVsync`): queued for the target's process, not waited on -- after the
+    /// node's earlier oneways, one at a time, as any sender's.
     ///
     /// # Errors
     /// `EINVAL` for an unknown handle or an object that is not a binder or handle, `EPIPE` when the
@@ -723,7 +742,7 @@ impl Broker {
             async_node: None,
             pinned,
         };
-        st.queue(target, None, Work::Txn(Box::new(txn)));
+        st.queue_oneway(target, node, txn);
         Ok(())
     }
 
@@ -1305,7 +1324,7 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
             data.len()
         );
     }
-    let mut txn = Txn {
+    let txn = Txn {
         reply,
         oneway,
         from,
@@ -1373,22 +1392,10 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     if !reply && !oneway {
         st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
     }
-    // A oneway transaction waits while one to the same node is out, as the driver orders them.
-    if let (true, Some(id)) = (oneway, target_node) {
-        txn.async_node = Some(id);
-        if let Some(n) = st.nodes.get_mut(&id) {
-            if n.has_async {
-                n.async_todo.push_back(Work::Txn(Box::new(txn)));
-                if n.async_todo.len() % 64 == 0 {
-                    eprintln!("[binder] {}", st.async_stall(id));
-                }
-                st.queue(file.id, Some(t.tid), Work::Complete);
-                return Ok(());
-            }
-            n.has_async = true;
-        }
+    match (oneway, target_node) {
+        (true, Some(node)) => st.queue_oneway(target_proc, node, txn),
+        _ => st.queue(target_proc, target_tid, Work::Txn(Box::new(txn))),
     }
-    st.queue(target_proc, target_tid, Work::Txn(Box::new(txn)));
     st.queue(file.id, Some(t.tid), Work::Complete);
     Ok(())
 }
