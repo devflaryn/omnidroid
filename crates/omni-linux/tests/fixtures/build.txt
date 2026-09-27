@@ -6,6 +6,8 @@ Built on Windows with the Android NDK r28c (android-ndk-r28c-windows.zip from dl
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -o signals signals.c
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -o faults faults.c
 
+    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -o gralloc gralloc.c -lnativewindow
+
 The binaries are committed so the runtime and its tests never need the NDK; SHA256SUMS pins them.
 
 dex/hello.dex, from dex/Hello.java with JDK 21 and SDK build-tools 36.0.0:

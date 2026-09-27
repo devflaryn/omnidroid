@@ -10,10 +10,11 @@ use sha2::{Digest, Sha256};
 use crate::manifest::Entry;
 
 /// Every overlay file: its guest path and its bytes.
-pub const FILES: &[(&str, &[u8])] = &[(
-    "/vendor/etc/vintf/manifest/omni-graphics.xml",
-    include_bytes!("../device/vendor/etc/vintf/manifest/omni-graphics.xml"),
-)];
+pub const FILES: &[(&str, &[u8])] = &[
+    ("/vendor/etc/vintf/manifest/omni-graphics.xml", include_bytes!("../device/vendor/etc/vintf/manifest/omni-graphics.xml")),
+    // gralloc 5's in-process mapper (`device/src/mapper.c`; `device/src/build.txt`, `device/SHA256SUMS`).
+    ("/vendor/lib64/hw/mapper.omni.so", include_bytes!("../device/vendor/lib64/hw/mapper.omni.so")),
+];
 
 /// An overlay file as the sysroot holds it: its guest path, its manifest entry, and the host file
 /// with its bytes.

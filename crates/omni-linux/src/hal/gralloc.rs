@@ -152,6 +152,12 @@ impl Allocator {
         self.buffers.lock().get(&id).and_then(Weak::upgrade)
     }
 
+    /// Every buffer some process still holds, by id.
+    #[must_use]
+    pub fn live(&self) -> Vec<(u64, Arc<Shm>)> {
+        self.buffers.lock().iter().filter_map(|(id, b)| Some((*id, b.upgrade()?))).collect()
+    }
+
     /// Answer one transaction.
     #[must_use]
     pub fn call(&self, call: HostCall) -> HostReply {

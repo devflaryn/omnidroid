@@ -1,0 +1,8 @@
+Built on Windows with the Android NDK r28c (android-ndk-r28c-windows.zip from dl.google.com),
+from this directory (crates/omni-linux/device/src):
+
+    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -fPIC -shared -fvisibility=hidden -Wl,-soname,mapper.omni.so -o ../vendor/lib64/hw/mapper.omni.so mapper.c -llog
+
+The library is committed so the runtime and its tests never need the NDK; ../SHA256SUMS pins it.
+NEEDED: liblog.so, libdl.so (added by the NDK driver), libc.so. The one exported symbol is
+AIMapper_loadIMapper.
