@@ -1353,10 +1353,22 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
         };
         match work {
             Some(w) => {
-                deliver(p, t, file, w, &mut out)?;
+                let handed = match deliver(p, t, file, w, &mut out) {
+                    Delivery::Put => None,
+                    Delivery::Txn(h) => Some(h),
+                    // It failed on its way in, its sender told: on to the next.
+                    Delivery::Nothing => continue,
+                };
                 // Return what is there; more comes on the next read.
                 let n = (out.len() as u64).min(size);
-                p.mem.write(at, &out[..n as usize])?;
+                if let Err(e) = p.mem.write(at, &out[..n as usize]) {
+                    // The kernel's copy_to_user failure: the transaction fails towards its sender
+                    // and the read is EFAULT.
+                    if let Some(h) = handed {
+                        undeliver(p, file, t.tid, h);
+                    }
+                    return Err(e);
+                }
                 return Ok(n);
             }
             None if nonblocking || (!first && !out.is_empty()) => {
@@ -1376,7 +1388,28 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
     }
 }
 
-fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &mut Vec<u8>) -> Result<(), Errno> {
+/// What [`deliver`] did with a work item.
+enum Delivery {
+    /// Its return is in `out`.
+    Put,
+    /// A transaction or reply, its return in `out`: undone ([`undeliver`]) if the read cannot
+    /// reach the thread.
+    Txn(Handed),
+    /// Nothing reached this thread: the transaction failed on its way in, and whoever waited on it
+    /// heard so.
+    Nothing,
+}
+
+/// A transaction handed to this thread: what taking it back undoes.
+struct Handed {
+    buf: u64,
+    fds: Vec<i32>,
+    reply: bool,
+    oneway: bool,
+    from: Option<(ProcId, i32)>,
+}
+
+fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &mut Vec<u8>) -> Delivery {
     let mut put = |cmd: u32, words: &[u64]| {
         out.extend_from_slice(&cmd.to_le_bytes());
         for w in words {
@@ -1402,97 +1435,175 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
         Work::ClearDeathDone { cookie } => put(BR_CLEAR_DEATH_NOTIFICATION_DONE, &[cookie]),
         Work::Txn(txn) => {
             let mut txn = *txn;
-            // Install the file descriptors it carries in this process.
-            for (off, open) in &txn.fds {
-                let fd = p.fds.insert(Arc::clone(open), true, 0)?;
-                txn.data[*off + 8..*off + 12].copy_from_slice(&(fd as u32).to_le_bytes());
-            }
-            let data_len = (txn.data.len() as u64 + 7) & !7;
-            let offsets_len = txn.offsets.len() as u64 * 8;
-            let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
-            let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
-            let Some(buf) = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len) else {
-                // Not delivered: the node's next oneway may go.
-                if let Some(node) = txn.async_node {
-                    file.broker.state.lock().async_done(node, file.id);
-                }
-                return Err(ENOMEM);
+            let mut fds = Vec::new();
+            let (buf, cmd, tr) = match place(p, file, &mut txn, &mut fds) {
+                Ok(placed) => placed,
+                Err(e) => return fail_undelivered(file, t.tid, txn, e, out),
             };
+            let mut st = file.broker.state.lock();
+            // A oneway's buffer: freeing it hands its node's next oneway out.
             if let Some(node) = txn.async_node {
-                file.broker.state.lock().async_buffers.insert((file.id, buf), node);
+                st.async_buffers.insert((file.id, buf), node);
             }
-            // Scatter-gather buffers go after the offsets: each object points at its copy, and a
-            // child's address is written into its parent's copy where the sender had it.
-            let mut sg_at = Vec::with_capacity(txn.sg.len());
-            let mut cursor = buf + data_len + offsets_len;
-            for b in &txn.sg {
-                sg_at.push(cursor);
-                cursor += (b.bytes.len() as u64 + 7) & !7;
-            }
-            for (i, b) in txn.sg.iter().enumerate() {
-                txn.data[b.obj_off + 8..b.obj_off + 16].copy_from_slice(&sg_at[i].to_le_bytes());
-            }
-            let mut sg_bytes: Vec<Vec<u8>> = txn.sg.iter().map(|b| b.bytes.clone()).collect();
-            for (i, b) in txn.sg.iter().enumerate() {
-                if let Some((parent, at)) = b.parent {
-                    if let Some(slot) = sg_bytes[parent].get_mut(at..at + 8) {
-                        slot.copy_from_slice(&sg_at[i].to_le_bytes());
-                    }
-                }
-            }
-            for (parent, at, files) in &txn.fda {
-                for (i, open) in files.iter().enumerate() {
-                    let fd = p.fds.insert(Arc::clone(open), true, 0)?;
-                    if let Some(slot) = sg_bytes[*parent].get_mut(at + i * 4..at + i * 4 + 4) {
-                        slot.copy_from_slice(&(fd as u32).to_le_bytes());
-                    }
-                }
-            }
-            let mut bytes = txn.data.clone();
-            bytes.resize(data_len as usize, 0);
-            for o in &txn.offsets {
-                bytes.extend_from_slice(&o.to_le_bytes());
-            }
-            for b in &sg_bytes {
-                let start = bytes.len();
-                bytes.extend_from_slice(b);
-                bytes.resize(start + ((b.len() + 7) & !7), 0);
-            }
-            bytes.extend_from_slice(if sec_len > 0 { SECCTX } else { &[] });
-            p.mem.write(buf, &bytes)?;
-            let mut tr = Vec::with_capacity(72);
-            tr.extend_from_slice(&txn.target_ptr.to_le_bytes());
-            tr.extend_from_slice(&txn.target_cookie.to_le_bytes());
-            tr.extend_from_slice(&txn.code.to_le_bytes());
-            tr.extend_from_slice(&txn.flags.to_le_bytes());
-            tr.extend_from_slice(&txn.sender_pid.to_le_bytes());
-            tr.extend_from_slice(&txn.sender_euid.to_le_bytes());
-            tr.extend_from_slice(&(txn.data.len() as u64).to_le_bytes());
-            tr.extend_from_slice(&offsets_len.to_le_bytes());
-            tr.extend_from_slice(&buf.to_le_bytes());
-            tr.extend_from_slice(&(buf + data_len).to_le_bytes());
-            let cmd = if txn.reply {
-                end_wait(file, t.tid);
-                BR_REPLY
-            } else {
+            let th = st.proc_mut(file.id).threads.entry(t.tid).or_default();
+            if txn.reply {
+                th.awaiting = th.awaiting.saturating_sub(1);
+            } else if !txn.oneway {
                 // A sync transaction: this thread now serves it, and its reply goes to `from`.
-                if !txn.oneway {
-                    let mut st = file.broker.state.lock();
-                    st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.push(txn.from);
-                }
-                if sec_len > 0 {
-                    tr.extend_from_slice(&(buf + data_len + offsets_len + sg_len).to_le_bytes());
-                    BR_TRANSACTION_SEC_CTX
-                } else {
-                    BR_TRANSACTION
-                }
-            };
+                th.serving.push(txn.from);
+            }
+            drop(st);
             out.extend_from_slice(&cmd.to_le_bytes());
             out.extend_from_slice(&tr);
+            return Delivery::Txn(Handed { buf, fds, reply: txn.reply, oneway: txn.oneway, from: txn.from });
         }
     }
     let _ = (BR_ERROR, BR_OK);
-    Ok(())
+    Delivery::Put
+}
+
+/// Copy `txn` into this process's receive area, installing the descriptors it carries (their
+/// numbers in `fds`): the buffer, and the return and its `binder_transaction_data`. On an error
+/// nothing of it is left: the descriptors are closed and the buffer is freed.
+fn place(p: &Process, file: &Arc<BinderFile>, txn: &mut Txn, fds: &mut Vec<i32>) -> Result<(u64, u32, Vec<u8>), Errno> {
+    let data_len = (txn.data.len() as u64 + 7) & !7;
+    let offsets_len = txn.offsets.len() as u64 * 8;
+    let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
+    let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
+    let buf = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len).ok_or(ENOMEM)?;
+    let filled = fill(p, txn, buf, (data_len, offsets_len, sg_len, sec_len), fds);
+    if filled.is_err() {
+        for fd in fds.drain(..) {
+            // A stand-in's descriptors are its app's: those it cannot take back (the app closes
+            // them with the transaction it never sees).
+            let _ = p.fds.remove(fd);
+        }
+        file.area.lock().free(buf);
+    }
+    filled?;
+    let mut tr = Vec::with_capacity(72);
+    tr.extend_from_slice(&txn.target_ptr.to_le_bytes());
+    tr.extend_from_slice(&txn.target_cookie.to_le_bytes());
+    tr.extend_from_slice(&txn.code.to_le_bytes());
+    tr.extend_from_slice(&txn.flags.to_le_bytes());
+    tr.extend_from_slice(&txn.sender_pid.to_le_bytes());
+    tr.extend_from_slice(&txn.sender_euid.to_le_bytes());
+    tr.extend_from_slice(&(txn.data.len() as u64).to_le_bytes());
+    tr.extend_from_slice(&offsets_len.to_le_bytes());
+    tr.extend_from_slice(&buf.to_le_bytes());
+    tr.extend_from_slice(&(buf + data_len).to_le_bytes());
+    let cmd = if txn.reply {
+        BR_REPLY
+    } else if sec_len > 0 {
+        tr.extend_from_slice(&(buf + data_len + offsets_len + sg_len).to_le_bytes());
+        BR_TRANSACTION_SEC_CTX
+    } else {
+        BR_TRANSACTION
+    };
+    Ok((buf, cmd, tr))
+}
+
+/// Install `txn`'s descriptors (recording them in `fds`) and write it into `buf`, laid out by
+/// `lens` (data, offsets, scatter-gather buffers, security context).
+fn fill(p: &Process, txn: &mut Txn, buf: u64, (data_len, offsets_len, _sg_len, sec_len): (u64, u64, u64, u64), fds: &mut Vec<i32>) -> Result<(), Errno> {
+    for (off, open) in &txn.fds {
+        let fd = p.fds.insert(Arc::clone(open), true, 0)?;
+        fds.push(fd);
+        txn.data[*off + 8..*off + 12].copy_from_slice(&(fd as u32).to_le_bytes());
+    }
+    // Scatter-gather buffers go after the offsets: each object points at its copy, and a
+    // child's address is written into its parent's copy where the sender had it.
+    let mut sg_at = Vec::with_capacity(txn.sg.len());
+    let mut cursor = buf + data_len + offsets_len;
+    for b in &txn.sg {
+        sg_at.push(cursor);
+        cursor += (b.bytes.len() as u64 + 7) & !7;
+    }
+    for (i, b) in txn.sg.iter().enumerate() {
+        txn.data[b.obj_off + 8..b.obj_off + 16].copy_from_slice(&sg_at[i].to_le_bytes());
+    }
+    let mut sg_bytes: Vec<Vec<u8>> = txn.sg.iter().map(|b| b.bytes.clone()).collect();
+    for (i, b) in txn.sg.iter().enumerate() {
+        if let Some((parent, at)) = b.parent {
+            if let Some(slot) = sg_bytes[parent].get_mut(at..at + 8) {
+                slot.copy_from_slice(&sg_at[i].to_le_bytes());
+            }
+        }
+    }
+    for (parent, at, files) in &txn.fda {
+        for (i, open) in files.iter().enumerate() {
+            let fd = p.fds.insert(Arc::clone(open), true, 0)?;
+            fds.push(fd);
+            if let Some(slot) = sg_bytes[*parent].get_mut(at + i * 4..at + i * 4 + 4) {
+                slot.copy_from_slice(&(fd as u32).to_le_bytes());
+            }
+        }
+    }
+    let mut bytes = txn.data.clone();
+    bytes.resize(data_len as usize, 0);
+    for o in &txn.offsets {
+        bytes.extend_from_slice(&o.to_le_bytes());
+    }
+    for b in &sg_bytes {
+        let start = bytes.len();
+        bytes.extend_from_slice(b);
+        bytes.resize(start + ((b.len() + 7) & !7), 0);
+    }
+    bytes.extend_from_slice(if sec_len > 0 { SECCTX } else { &[] });
+    p.mem.write(buf, &bytes)
+}
+
+/// `txn` could not be placed in this process (`error`): nothing of it reached this thread. The
+/// kernel translates descriptors when the transaction is sent, so it fails such a transaction
+/// towards its sender, never the receiver; here they go in on delivery, so the failure goes
+/// where the kernel's would -- a sync transaction's sender reads BR_FAILED_REPLY, a oneway is
+/// dropped (its sender was told it went) and its node's next goes, and a reply this thread
+/// waited for is its BR_FAILED_REPLY.
+fn fail_undelivered(file: &Arc<BinderFile>, tid: i32, txn: Txn, error: Errno, out: &mut Vec<u8>) -> Delivery {
+    let mut st = file.broker.state.lock();
+    let pid = st.procs.get(&file.id).map_or(0, |pr| pr.pid);
+    eprintln!(
+        "[binder] {pid}:{tid} {} code {:#x} not delivered: errno {}",
+        if txn.reply { "reply" } else if txn.oneway { "oneway" } else { "transaction" },
+        txn.code,
+        error.0
+    );
+    if txn.reply {
+        let th = st.proc_mut(file.id).threads.entry(tid).or_default();
+        th.awaiting = th.awaiting.saturating_sub(1);
+        out.extend_from_slice(&BR_FAILED_REPLY.to_le_bytes());
+        return Delivery::Put;
+    }
+    if let Some(node) = txn.async_node {
+        st.async_done(node, file.id);
+    }
+    if let (false, Some((proc, from))) = (txn.oneway, txn.from) {
+        st.queue(proc, Some(from), Work::FailedReply);
+    }
+    Delivery::Nothing
+}
+
+/// A transaction handed to this thread whose read could not reach it (the kernel's
+/// copy_to_user failure): its descriptors are closed, its buffer freed, and it fails towards its
+/// sender as [`fail_undelivered`] does -- a reply's wait has ended, and the read's error answers it.
+fn undeliver(p: &Process, file: &Arc<BinderFile>, tid: i32, h: Handed) {
+    for fd in h.fds {
+        let _ = p.fds.remove(fd);
+    }
+    file.area.lock().free(h.buf);
+    let mut st = file.broker.state.lock();
+    if let Some(node) = st.async_buffers.remove(&(file.id, h.buf)) {
+        st.async_done(node, file.id);
+    }
+    if !h.reply && !h.oneway {
+        let th = st.proc_mut(file.id).threads.entry(tid).or_default();
+        if th.serving.last().copied() == Some(h.from) {
+            th.serving.pop();
+        }
+        if let Some((proc, from)) = h.from {
+            st.queue(proc, Some(from), Work::FailedReply);
+        }
+    }
 }
 
 /// The reply (or its failure) this thread waited for has come.
