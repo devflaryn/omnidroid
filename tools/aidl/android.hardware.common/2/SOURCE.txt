@@ -1,0 +1,9 @@
+AOSP platform/hardware/interfaces, branch android15-release (refs/heads/android15-release).
+Frozen AIDL API android.hardware.common version 2, fetched with ?format=TEXT (base64) from:
+https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/android15-release/common/aidl/aidl_api/android.hardware.common/2/
+
+Files:
+.hash  https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/android15-release/common/aidl/aidl_api/android.hardware.common/2/.hash
+android/hardware/common/Ashmem.aidl  https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/android15-release/common/aidl/aidl_api/android.hardware.common/2/android/hardware/common/Ashmem.aidl
+android/hardware/common/MappableFile.aidl  https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/android15-release/common/aidl/aidl_api/android.hardware.common/2/android/hardware/common/MappableFile.aidl
+android/hardware/common/NativeHandle.aidl  https://android.googlesource.com/platform/hardware/interfaces/+/refs/heads/android15-release/common/aidl/aidl_api/android.hardware.common/2/android/hardware/common/NativeHandle.aidl
