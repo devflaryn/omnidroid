@@ -129,6 +129,18 @@ Windows and Linux (see STATUS).
   and `/dev/ashmem<boot_id>`. The device lists no sensor sub-HAL (`device/vendor/etc/sensors/
   hals.conf`). system_server is started directly: `--caps` (the zygote's set) and `--setprop
   dalvik.vm.profilesystemserver=true` (standalone jars' class loaders on first use).
+  Later the same day (`5043072..f38e95e`) it passed NetworkStats, Connectivity, Audio and
+  SoundTrigger to BiometricService (gatekeeperd: init's `late_start` class, now started). Filled
+  on the way, each below the framework: the image's owners/modes/labels/capabilities
+  (`sysroot.meta`, `tools/make_sysroot.py --meta`), inet `bind`, MAP_SHARED file mappings
+  (SQLite WAL), peer credentials (SO_PEERCRED, SCM_CREDENTIALS, init's `+passcred`), `*at`
+  dirfd as an int (AT_FDCWD), PI futexes (audioserver), the bootloader's `ro.boot.*` and the
+  vendor build.prop (KeyMint), init restarting services (`onrestart`, `ctl.stop`), seccomp
+  filters (a cBPF interpreter; minijail in the media daemons), 512 threads per process,
+  tracefs (tracing off), and fork: private file views snapshotted, descriptors closed at exit,
+  pids allocated onward (mksh pipelines and `$(...)`). A killed process no longer waits for
+  threads a halt cannot reach (5 s). Gates: `tests/c4_system_server.rs`,
+  `tests/c5_app_launch.rs` (`--ignored`, minutes; `tests/common/boot.rs`).
 - **C5 in progress** (spec `docs/superpowers/specs/2026-09-27-c5-app-launch-design.md`): binder
   across host processes works (`tests/c3_remote_binder.rs`; `--binder-server`, `--pid`); the
   zygote responder (`--zygote`, `crate::zygote`) launches an app's `app_process64 ...
