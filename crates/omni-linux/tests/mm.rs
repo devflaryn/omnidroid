@@ -172,3 +172,20 @@ fn absurd_lengths_are_errors_not_overflows() {
     assert_eq!(p.syscall(&mut t, nr::MREMAP, [at, 4096, huge, 1, 0, 0]) as i64, -12, "ENOMEM");
     assert!(p.mem.write(at, b"still mapped").is_ok(), "nothing was unmapped by the refused calls");
 }
+
+/// `msync` is how ART's low-4-GiB allocator asks whether a page is in use: 0 when mapped, `ENOMEM`
+/// when free. What lies outside the guest space is the host's, so it answers "in use" there.
+#[test]
+fn msync_tells_mapped_from_free_pages() {
+    let (p, mut t, _, pg) = process();
+    let at = mmap(&p, &mut t, [0, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    assert_eq!(p.syscall(&mut t, nr::MSYNC, [at, 2 * pg, 0, 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, nr::MUNMAP, [at + pg, pg, 0, 0, 0, 0]), 0);
+    assert_eq!(p.syscall(&mut t, nr::MSYNC, [at + pg, pg, 0, 0, 0, 0]) as i64, -12, "a free page is ENOMEM");
+    assert_eq!(p.syscall(&mut t, nr::MSYNC, [at, 2 * pg, 0, 0, 0, 0]) as i64, -12, "a range with a hole is ENOMEM");
+    assert_eq!(p.syscall(&mut t, nr::MSYNC, [at + 1, pg, 0, 0, 0, 0]) as i64, -(EINVAL.0 as i64));
+    let base = p.mem.space().base() as u64;
+    if base > pg {
+        assert_eq!(p.syscall(&mut t, nr::MSYNC, [base - pg, pg, 0, 0, 0, 0]), 0, "below the space is the host's");
+    }
+}

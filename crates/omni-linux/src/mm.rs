@@ -295,6 +295,30 @@ fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// `msync`: nothing is ever dirty against a file here (shared writable file mappings are refused),
+/// so what it answers is whether the range is mapped -- which is what ART's low-4-GiB allocator
+/// asks it. Outside the guest space the host owns the memory, so it is "in use" (0) there: ART
+/// then skips it rather than trying to map there.
+fn sys_msync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let addr = crate::guest::untag(a[0]);
+    if addr % p.mm.page != 0 {
+        return Err(EINVAL);
+    }
+    let len = p.mm.span(addr, a[1]).ok_or(ENOMEM)?;
+    let space = p.mem.space();
+    let (base, end) = (space.base() as u64, space.end() as u64);
+    let mut at = addr;
+    while at < addr + len {
+        if at < base || at >= end {
+            at = if at < base { base.min(addr + len) } else { addr + len };
+            continue;
+        }
+        let region = space.region_at(at as usize).filter(|r| r.mapping.is_some()).ok_or(ENOMEM)?;
+        at = (region.start + region.len) as u64;
+    }
+    Ok(0)
+}
+
 const MREMAP_MAYMOVE: u64 = 1;
 const MREMAP_FIXED: u64 = 2;
 
@@ -360,6 +384,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::MUNMAP, sys_munmap);
     table.set(nr::MPROTECT, sys_mprotect);
     table.set(nr::MADVISE, sys_madvise);
+    table.set(nr::MSYNC, sys_msync);
     table.set(nr::BRK, sys_brk);
     table.set(nr::MREMAP, sys_mremap);
 }

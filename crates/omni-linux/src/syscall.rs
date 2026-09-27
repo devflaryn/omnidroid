@@ -44,7 +44,7 @@ pub mod nr {
         GETTID = 178 => "gettid", SYSINFO = 179 => "sysinfo", SOCKET = 198 => "socket",
         BRK = 214 => "brk", MUNMAP = 215 => "munmap", MREMAP = 216 => "mremap",
         CLONE = 220 => "clone", EXECVE = 221 => "execve", MMAP = 222 => "mmap",
-        MPROTECT = 226 => "mprotect", MADVISE = 233 => "madvise", PRLIMIT64 = 261 => "prlimit64",
+        MPROTECT = 226 => "mprotect", MSYNC = 227 => "msync", MADVISE = 233 => "madvise", PRLIMIT64 = 261 => "prlimit64",
         GETRANDOM = 278 => "getrandom", MEMFD_CREATE = 279 => "memfd_create",
         MEMBARRIER = 283 => "membarrier", STATX = 291 => "statx", RSEQ = 293 => "rseq",
         CLONE3 = 435 => "clone3", FACCESSAT2 = 439 => "faccessat2",

@@ -100,6 +100,20 @@ pub struct Task {
 }
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
+/// Where the guest space is reserved: below 4 GiB, because ART keeps its heap and boot image there
+/// (compressed references are 32 bits), and a guest address is a host address (D4). 2 GiB, not
+/// lower: Windows keeps `KUSER_SHARED_DATA` at `0x7FFE0000` in every process.
+const GUEST_SPACE_LOW_BASE: usize = 0x8000_0000;
+
+/// The guest space, at [`GUEST_SPACE_LOW_BASE`] if the host has that free, else wherever it
+/// chooses (a program that needs no low memory still runs; ART will not).
+fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
+    let config = |base| GuestSpaceConfig { base, size: GUEST_SPACE_BYTES, ..GuestSpaceConfig::default() };
+    GuestSpace::with_config(config(Some(GUEST_SPACE_LOW_BASE))).or_else(|e| {
+        tracing::warn!(%e, "no guest space below 4 GiB; reserving where the host chooses");
+        GuestSpace::with_config(config(None))
+    })
+}
 const STACK_BYTES: u64 = 8 << 20;
 const PID: i32 = 1000;
 const UID: u32 = 10000;
@@ -231,10 +245,7 @@ impl Process {
             writable.push((format!("/{dir}").into_bytes(), host));
         }
         let vfs = Vfs::new(sysroot, writable, exe.clone());
-        let space = Arc::new(
-            GuestSpace::with_config(GuestSpaceConfig { size: GUEST_SPACE_BYTES, ..GuestSpaceConfig::default() })
-                .map_err(|e| format!("reserve the guest address space: {e}"))?,
-        );
+        let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
         // 128 guest threads: ART alone starts about twenty, and Roblox runs dozens.
         let options = DynarmicOptions { top_byte_ignore: true, max_threads: 128, ..DynarmicOptions::default() };
