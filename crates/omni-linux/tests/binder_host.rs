@@ -96,6 +96,24 @@ impl Guest {
         }
     }
 
+    /// Take references on a handle it was given, as libbinder's proxy does (`BC_INCREFS`,
+    /// `BC_ACQUIRE`): the handle then outlives the buffer that carried it.
+    fn acquire(&mut self, handle: u32) {
+        let mut cmds = Vec::new();
+        for cmd in [0x4004_6304u32, 0x4004_6305] {
+            cmds.extend_from_slice(&cmd.to_le_bytes());
+            cmds.extend_from_slice(&handle.to_le_bytes());
+        }
+        let (bwr, wbuf) = (self.s + 0x100, self.s + 0x1000);
+        self.p.mem.write(wbuf, &cmds).unwrap();
+        let mut b = Vec::new();
+        for v in [cmds.len() as u64, 0, wbuf, 0, 0, 0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        self.p.mem.write(bwr, &b).unwrap();
+        assert_eq!(self.ioctl(BINDER_WRITE_READ, bwr), 0);
+    }
+
     /// `BC_TRANSACTION`/`BC_REPLY` of `data` (no objects), preceded by freeing `free`.
     fn send(&mut self, cmd: u32, handle: u32, code: u32, data: &[u8], free: Option<u64>) {
         let dbuf = self.s + 0x8000;
@@ -162,6 +180,7 @@ fn a_host_service_calls_back_into_its_waiting_caller() {
         assert!(!reply && code == 1, "the host's transaction: {code}");
         assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), TYPE_HANDLE);
         let handle = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        g.acquire(handle);
         g.send(BC_REPLY, 0, 0, &[], Some(buffer));
         assert_eq!(host.join().unwrap(), Ok(Vec::new()));
 

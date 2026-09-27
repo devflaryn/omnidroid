@@ -59,6 +59,8 @@ const BR_DEAD_REPLY: u32 = 0x0000_7205;
 const BR_TRANSACTION_COMPLETE: u32 = 0x0000_7206;
 const BR_INCREFS: u32 = 0x8010_7207;
 const BR_ACQUIRE: u32 = 0x8010_7208;
+const BR_RELEASE: u32 = 0x8010_7209;
+const BR_DECREFS: u32 = 0x8010_720a;
 const BR_NOOP: u32 = 0x0000_720c;
 const BR_SPAWN_LOOPER: u32 = 0x0000_720d;
 const BR_DEAD_BINDER: u32 = 0x8008_720f;
@@ -188,6 +190,8 @@ enum Work {
     FailedReply,
     Increfs { ptr: u64, cookie: u64 },
     Acquire { ptr: u64, cookie: u64 },
+    Release { ptr: u64, cookie: u64 },
+    Decrefs { ptr: u64, cookie: u64 },
     DeadBinder { cookie: u64 },
     ClearDeathDone { cookie: u64 },
 }
@@ -207,6 +211,12 @@ struct ProcState {
     pid: i32,
     refs: BTreeMap<u32, NodeId>,
     by_node: HashMap<NodeId, u32>,
+    /// Each handle's references, as the kernel's `binder_ref` counts them: `[strong, weak,
+    /// in delivered buffers not yet freed]`. A handle all three are zero for is deleted.
+    counts: HashMap<u32, [u32; 3]>,
+    /// The last handle number given out: numbers are not reused (a process's cached proxy for a
+    /// deleted handle must not name another object).
+    last_handle: u32,
     todo: VecDeque<Work>,
     threads: HashMap<i32, ThreadState>,
     max_threads: u32,
@@ -221,6 +231,8 @@ struct State {
     /// The buffers oneway transactions were delivered in, by (receiver, address): freeing one
     /// hands its node's next oneway transaction out.
     async_buffers: HashMap<(ProcId, u64), NodeId>,
+    /// The handles each delivered buffer carries, by (receiver, address): freeing it drops them.
+    buffer_handles: HashMap<(ProcId, u64), Vec<u32>>,
     /// (owner, ptr) -> node
     local: HashMap<(ProcId, u64), NodeId>,
     context_mgr: Option<NodeId>,
@@ -272,7 +284,8 @@ impl State {
             return *h;
         }
         let proc = self.proc_mut(id);
-        let h = proc.refs.keys().next_back().map_or(1, |k| k + 1).max(1);
+        proc.last_handle = proc.last_handle.max(proc.refs.keys().next_back().copied().unwrap_or(0)) + 1;
+        let h = proc.last_handle;
         proc.refs.insert(h, node);
         proc.by_node.insert(node, h);
         let n = self.nodes.get_mut(&node).expect("a node");
@@ -329,6 +342,7 @@ impl State {
                     return Ok(None);
                 }
                 let h = self.handle_for(target, node, Some(sender));
+                self.pin(target, h);
                 Ok(Some((if kind == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE }, u64::from(h), 0)))
             }
             TYPE_HANDLE | TYPE_WEAK_HANDLE => {
@@ -339,11 +353,62 @@ impl State {
                     Ok(Some((kind, n.ptr, n.cookie)))
                 } else {
                     let h = self.handle_for(target, node, Some(sender));
+                    self.pin(target, h);
                     Ok(Some((kind, u64::from(h), 0)))
                 }
             }
             _ => Err(EINVAL),
         }
+    }
+
+    /// A handle of `id` is carried by a buffer on its way to it: kept until the buffer is freed.
+    fn pin(&mut self, id: ProcId, h: u32) {
+        if h != 0 {
+            self.proc_mut(id).counts.entry(h).or_default()[2] += 1;
+        }
+    }
+
+    /// `BC_ACQUIRE`/`BC_RELEASE` (`which` 0), `BC_INCREFS`/`BC_DECREFS` (1) or a freed buffer's
+    /// hold (2, down) on `id`'s handle `h`. A handle left with no references is deleted, and its
+    /// object let go by its owner when no process refers to it any more.
+    fn count(&mut self, id: ProcId, h: u32, which: usize, up: bool) {
+        if h == 0 {
+            return;
+        }
+        let Some(proc) = self.procs.get_mut(&id) else { return };
+        if !proc.refs.contains_key(&h) {
+            return;
+        }
+        let c = proc.counts.entry(h).or_default();
+        c[which] = if up { c[which] + 1 } else { c[which].saturating_sub(1) };
+        if up || c.iter().any(|v| *v > 0) {
+            return;
+        }
+        proc.counts.remove(&h);
+        if let Some(node) = proc.refs.remove(&h) {
+            proc.by_node.remove(&node);
+            self.release_if_unreferenced(node);
+        }
+    }
+
+    /// No live process refers to `node` any more: its owner lets it go (`BR_RELEASE`,
+    /// `BR_DECREFS`), and the object's address may later name a new node.
+    fn release_if_unreferenced(&mut self, node: NodeId) -> bool {
+        if self.context_mgr == Some(node) || self.procs.values().any(|p| !p.dead && p.by_node.contains_key(&node)) {
+            return false;
+        }
+        let Some(n) = self.nodes.get_mut(&node) else { return false };
+        if !n.held || n.dead || n.owner == HOST {
+            return false;
+        }
+        n.held = false;
+        let (owner, ptr, cookie) = (n.owner, n.ptr, n.cookie);
+        if self.local.get(&(owner, ptr)) == Some(&node) {
+            self.local.remove(&(owner, ptr));
+        }
+        self.queue(owner, None, Work::Release { ptr, cookie });
+        self.queue(owner, None, Work::Decrefs { ptr, cookie });
+        true
     }
 
     /// Queue work for a thread of `id`: `tid`'s own queue when given, the process's otherwise.
@@ -749,6 +814,26 @@ impl Drop for BinderFile {
         for (proc, tid) in pending {
             st.queue(proc, Some(tid), Work::DeadReply);
         }
+        // Its references are gone with it: an object no live process refers to any more is let go
+        // by its owner (`BR_RELEASE`, `BR_DECREFS`), as the kernel drops a dead process's refs --
+        // SurfaceFlinger removes a client's layers when their handles are released so.
+        let held: Vec<NodeId> = st.procs.get_mut(&self.id).map(|p| {
+            p.by_node.clear();
+            std::mem::take(&mut p.refs).into_values().collect()
+        }).unwrap_or_default();
+        if let Some(p) = st.procs.get_mut(&self.id) {
+            p.counts.clear();
+        }
+        let mut released = 0;
+        for node in held {
+            if st.release_if_unreferenced(node) {
+                released += 1;
+            }
+        }
+        if std::env::var_os("OMNI_BINDER_TRACE").is_some() || released > 0 {
+            let pid = st.procs.get(&self.id).map_or(0, |p| p.pid);
+            eprintln!("[binder] pid {pid} closed its driver: {released} objects released");
+        }
         if let Some(p) = st.procs.get_mut(&self.id) {
             p.dead = true;
             p.todo.clear();
@@ -860,6 +945,9 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
             file.area.lock().free(ptr);
             // A oneway transaction's buffer: its node's next oneway goes to this thread.
             let mut st = file.broker.state.lock();
+            for h in st.buffer_handles.remove(&(file.id, ptr)).unwrap_or_default() {
+                st.count(file.id, h, 2, false);
+            }
             if let Some(node) = st.async_buffers.remove(&(file.id, ptr)) {
                 let next = st.nodes.get_mut(&node).and_then(|n| {
                     let w = n.async_todo.pop_front();
@@ -871,7 +959,12 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                 }
             }
         }
-        BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS | BC_INCREFS_DONE | BC_ACQUIRE_DONE | BC_DEAD_BINDER_DONE => {}
+        BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {
+            let which = usize::from(matches!(code, BC_INCREFS | BC_DECREFS));
+            let up = matches!(code, BC_INCREFS | BC_ACQUIRE);
+            file.broker.state.lock().count(file.id, u32_at(arg, 0), which, up);
+        }
+        BC_INCREFS_DONE | BC_ACQUIRE_DONE | BC_DEAD_BINDER_DONE => {}
         BC_REGISTER_LOOPER | BC_ENTER_LOOPER => {
             let mut st = file.broker.state.lock();
             let proc = st.proc_mut(file.id);
@@ -1189,6 +1282,8 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
         }
         Work::Increfs { ptr, cookie } => put(BR_INCREFS, &[ptr, cookie]),
         Work::Acquire { ptr, cookie } => put(BR_ACQUIRE, &[ptr, cookie]),
+        Work::Release { ptr, cookie } => put(BR_RELEASE, &[ptr, cookie]),
+        Work::Decrefs { ptr, cookie } => put(BR_DECREFS, &[ptr, cookie]),
         Work::DeadBinder { cookie } => put(BR_DEAD_BINDER, &[cookie]),
         Work::ClearDeathDone { cookie } => put(BR_CLEAR_DEATH_NOTIFICATION_DONE, &[cookie]),
         Work::Txn(txn) => {
@@ -1203,6 +1298,19 @@ fn deliver(p: &Process, t: &mut Task, file: &Arc<BinderFile>, work: Work, out: &
             let sg_len: u64 = txn.sg.iter().map(|b| (b.bytes.len() as u64 + 7) & !7).sum();
             let sec_len = if txn.secctx && !txn.reply { SECCTX.len() as u64 } else { 0 };
             let buf = file.area.lock().alloc(data_len + offsets_len + sg_len + sec_len).ok_or(ENOMEM)?;
+            // The handles it carries stay until the receiver frees it.
+            let handles: Vec<u32> = txn
+                .offsets
+                .iter()
+                .filter_map(|&off| {
+                    let off = off as usize;
+                    let kind = u32::from_le_bytes(txn.data.get(off..off + 4)?.try_into().ok()?);
+                    matches!(kind, TYPE_HANDLE | TYPE_WEAK_HANDLE).then(|| u32_at(&txn.data, off + 8))
+                })
+                .collect();
+            if !handles.is_empty() {
+                file.broker.state.lock().buffer_handles.insert((file.id, buf), handles);
+            }
             if txn.oneway && !txn.reply {
                 let mut st = file.broker.state.lock();
                 if let Some(node) = st.local.get(&(file.id, txn.target_ptr)).copied() {
