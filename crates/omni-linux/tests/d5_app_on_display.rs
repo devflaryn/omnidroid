@@ -55,17 +55,24 @@ fn the_launcher_activity_is_drawn_on_the_host_display() {
     // The runner writes its display here every few seconds.
     std::env::set_var("OMNI_SCREENSHOT", &screenshot);
 
-    // A device as its owner leaves it after setup: provisioned, awake, not locked.
+    // A device as its owner leaves it after setup: provisioned, awake, not locked -- and, as a
+    // test device is set up (CTS, emulator test images), with window animations off: the starting
+    // window's reveal is then no animation to wait on.
     let then = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
                 echo \"[d5] boot_completed=$(getprop sys.boot_completed)\"; \
                 settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
                 settings put system screen_off_timeout 1800000; svc power stayon true; \
                 input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
+                settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
+                settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
                 pm install -r /data/local/tmp/probe.apk; echo \"[d5] pm install: $?\"; \
-                am start -W -n com.omnidroid.probe/.MainActivity; echo \"[d5] am start: $?\"";
+                am start -W -n com.omnidroid.probe/.MainActivity; echo \"[d5] am start: $?\"; \
+                sleep 30; dumpsys SurfaceFlinger --list | sed 's/^/[d5] layer /'; \
+                dumpsys window | grep -E 'mCurrentFocus|isKeyguardShowing|mAwake' | sed 's/^/[d5] wm /'";
     let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote"], then);
     let (mut committed, mut displayed, mut blue) = (false, false, false);
     let mut last_check = Instant::now();
+    let mut shown_since: Option<Instant> = None;
     boot.watch(Duration::from_secs(2400), |line| {
         committed |= line.contains("OmniProbe") && line.contains("frame committed");
         displayed |= line.contains("Displayed com.omnidroid.probe/.MainActivity");
@@ -73,7 +80,9 @@ fn the_launcher_activity_is_drawn_on_the_host_display() {
             last_check = Instant::now();
             blue = pixel(&screenshot, 640, 360) == Some(PROBE_BLUE);
         }
-        blue
+        // Three minutes after the frame was committed, the display has shown it or never will.
+        let since = if committed && displayed { *shown_since.get_or_insert_with(Instant::now) } else { Instant::now() };
+        blue || (committed && displayed && since.elapsed() > Duration::from_secs(180))
     });
     let tail = boot.tail();
     assert!(committed, "the probe's first frame was never committed to SurfaceFlinger\n{tail}");

@@ -167,6 +167,33 @@ Windows and Linux (see STATUS).
   `vkDestroyCommandPool` leaves guest command-buffer wrappers behind; CLOCK_MONOTONIC is shared per
   host process (not across host processes).
 
+### D4/D5: the app on the display (2026-09-28, Windows)
+
+`tests/d5_app_on_display.rs` (release, `--ignored`): boot, set the device up (provisioned, awake,
+animations off), `pm install` the probe, `am start`, then require the probe's `frame committed`,
+ActivityTaskManager's `Displayed`, and the probe's blue (0xff2196f3) at the centre of the host
+display's screenshot. Passed once (161 s); 3 of 4 runs failed -- the flakiness is the open work:
+
+1. **Starting window left on top.** WindowManager removes the splash window (its input channel is
+   disposed) but its layer stays under a `window_animation` leash at z max; the removal transition
+   never completes (seen with animations on and off). `BLASTSyncEngine: Sync group 0 timed-out
+   because not ready` and `SurfaceSyncGroup ... Failed to receive transaction ready` precede it.
+2. **Guest space exhausted early in boot** (~1 run in 3): right after init stops odsign, every
+   `map_anonymous` fails with ~225 KiB free of 64 GiB. `mm.rs` now lists what holds the space at the
+   first refusal (by label and call site) -- not yet caught with it.
+3. **Live handle refcounts.** BC_RELEASE/BC_DECREFS are still no-ops (a live process's handles last
+   as long as it does). Counting them deleted handles in use because a write stops at its first
+   failed command, dropping later BC_ACQUIREs; the kernel goes on past a failed transaction. Fix
+   that first, then restore the counting (commit `5e62d85` has it, with `tests/binder_release.rs`).
+4. `probe.apk` logs `frame committed` (ViewTreeObserver.registerFrameCommitCallback).
+
+Diagnostics added: `OMNI_COMPOSER_TRACE=2` (each presented frame: slot, centre and corner pixel),
+`[display] N frames presented` with `OMNI_SCREENSHOT`, `[remote]` binder ioctl failures and
+descriptors that cannot cross, `[binder] N oneway calls wait on node` (every 64 queued),
+`[binder] pid P closed its driver: N objects released`, `OMNI_TRACE_SERVICE=<service>` for one
+init service's syscalls. Crossed gralloc files stay in `%TEMP%\omni-shm-*` (clean them between
+sessions).
+
 ## Where it stands
 
 - The whole startup contract (`research/jni-surface.md` §8, 26 steps) runs on the real engine:
