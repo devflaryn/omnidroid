@@ -283,22 +283,25 @@ impl Mm {
                 .space
                 .map_anonymous(placement, len as usize, Protection::ReadWrite, CommitPolicy::Lazy)
                 .map_err(|_| refused_fixed(ENOMEM))? as u64;
-            let from = (req.offset as usize).min(data.len());
-            let n = (len as usize).min(data.len() - from);
-            p.mem.write_holding_layout(at, &data[from..from + n])?;
+            let copy = |bytes: &[u8]| {
+                let from = (req.offset as usize).min(bytes.len());
+                let n = (len as usize).min(bytes.len() - from);
+                p.mem.write_holding_layout(at, &bytes[from..from + n])
+            };
+            // The property areas: their bytes as they are now (not when the file was opened), and
+            // every later change written into them by the property service.
+            let area = guest.strip_prefix(b"/dev/__properties__/".as_slice()).filter(|name| *name != b"property_info");
+            match (area, p.me.get()) {
+                (Some(name), Some(me)) => {
+                    let service = crate::props::PropertyService::global(p.vfs.sysroot());
+                    service.attach(me.clone(), at, name == b"properties_serial", copy)?;
+                }
+                _ => copy(data)?,
+            }
             if prot != Protection::ReadWrite {
                 self.space.protect(at as usize, len as usize, prot).map_err(|_| ENOMEM)?;
             }
             self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
-            // The property areas: the property service writes every change into them.
-            if let Some(name) = guest.strip_prefix(b"/dev/__properties__/".as_slice()) {
-                if name != b"property_info" {
-                    if let Some(me) = p.me.get() {
-                        let service = crate::props::PropertyService::global(p.vfs.sysroot());
-                        service.watch(me.clone(), at, name == b"properties_serial");
-                    }
-                }
-            }
             return Ok(at);
         }
         let (guest, sysroot, file_len) = match &*file.kind.lock() {

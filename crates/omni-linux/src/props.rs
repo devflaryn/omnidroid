@@ -382,6 +382,22 @@ impl PropertyService {
         self.live.lock().mappings.push((process, at, serial));
     }
 
+    /// A process maps the prop area (`serial` false) or `properties_serial` (`serial` true) at
+    /// `at`: `fill` writes the area as it is now into the mapping, and every later change is
+    /// written there too. Both happen under the service's lock, so no change falls between the
+    /// bytes a process starts from and the changes it is sent (a process spawned before a daemon
+    /// sets a property, and mapping the area after, sees it).
+    ///
+    /// # Errors
+    /// What `fill` fails with; the mapping is then not watched.
+    pub fn attach<E>(&self, process: std::sync::Weak<crate::process::Process>, at: u64, serial: bool, fill: impl FnOnce(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        let mut live = self.live.lock();
+        let bytes = if serial { Area::new().bytes(live.serial, 0) } else { live.area.bytes(live.serial, live.capacity) };
+        fill(&bytes)?;
+        live.mappings.push((process, at, serial));
+        Ok(())
+    }
+
     /// `setprop`: a new property is added, an existing one changed; `ro.*` is set once.
     pub fn set(&self, name: &str, value: &str) -> u32 {
         // Control messages are init's, not properties.

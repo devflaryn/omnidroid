@@ -1,7 +1,8 @@
 //! `omni-linux-run --sysroot <dir> [--instance <dir>] [--env KEY=VALUE]... [--service <program>]... -- <program> [args...]`
 //!
 //! A `--service` is started first, as `system` (uid 1000), in this host process -- a daemon the
-//! program talks to over binder, as `servicemanager`.
+//! program talks to over binder, as `servicemanager`. A `--hal` (`gralloc`) is a HAL the host
+//! serves, published with servicemanager once it runs.
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -15,6 +16,7 @@ fn main() -> ExitCode {
     let mut services: Vec<String> = Vec::new();
     let mut uid: u32 = 10_000;
     let mut init_classes: Vec<String> = Vec::new();
+    let mut hals: Vec<String> = Vec::new();
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -23,6 +25,7 @@ fn main() -> ExitCode {
             "--env" => envp.push(args.next().expect("--env needs KEY=VALUE").into_bytes()),
             "--service" => services.push(args.next().expect("--service needs a program")),
             "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
+            "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc)")),
             // init: read the image's services, and class_start these classes (comma-separated).
             "--init" => init_classes = args.next().expect("--init needs classes").split(',').map(String::from).collect(),
             "--" => {
@@ -87,6 +90,21 @@ fn main() -> ExitCode {
     }
     if !daemons.is_empty() || !init_classes.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    let mut _served = Vec::new();
+    for hal in &hals {
+        let broker = omni_linux::binder::broker(omni_linux::binder::Context::Binder);
+        match hal.as_str() {
+            "gralloc" => {
+                let allocator = omni_linux::hal::gralloc::Allocator::new();
+                match allocator.register(&broker) {
+                    Ok(()) => eprintln!("[hal] gralloc: {}", omni_linux::hal::gralloc::INSTANCE),
+                    Err(e) => eprintln!("[hal] gralloc: {e}"),
+                }
+                _served.push(allocator);
+            }
+            other => eprintln!("[hal] unknown HAL {other:?}"),
+        }
     }
     let status = p.run();
     // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.
