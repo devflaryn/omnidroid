@@ -125,6 +125,8 @@ pub enum DevNode {
     Random,
     Urandom,
     Binder,
+    HwBinder,
+    VndBinder,
     /// `/dev/kmsg`: the kernel log, which native daemons (`servicemanager`) log to.
     Kmsg,
 }
@@ -267,6 +269,8 @@ impl Vfs {
             b"/dev/random" => return Some(Node::Dev(DevNode::Random)),
             b"/dev/urandom" => return Some(Node::Dev(DevNode::Urandom)),
             b"/dev/binder" => return Some(Node::Dev(DevNode::Binder)),
+            b"/dev/hwbinder" => return Some(Node::Dev(DevNode::HwBinder)),
+            b"/dev/vndbinder" => return Some(Node::Dev(DevNode::VndBinder)),
             b"/dev/kmsg" => return Some(Node::Dev(DevNode::Kmsg)),
             b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
             _ => {}

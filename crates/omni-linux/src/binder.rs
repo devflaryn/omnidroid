@@ -159,10 +159,20 @@ pub struct Broker {
     state: Mutex<State>,
 }
 
-/// The broker every `/dev/binder` in this host process talks to.
-pub fn broker() -> Arc<Broker> {
-    static BROKER: OnceLock<Arc<Broker>> = OnceLock::new();
-    Arc::clone(BROKER.get_or_init(Arc::default))
+/// The binder devices: each its own context, as the kernel's `binder`, `hwbinder` (HIDL) and
+/// `vndbinder` are -- a context manager and handles of one are nothing to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Context {
+    Binder,
+    HwBinder,
+    VndBinder,
+}
+
+/// The broker a device's opens in this host process talk to.
+pub fn broker(context: Context) -> Arc<Broker> {
+    static BROKERS: OnceLock<Mutex<HashMap<Context, Arc<Broker>>>> = OnceLock::new();
+    let brokers = BROKERS.get_or_init(Mutex::default);
+    Arc::clone(brokers.lock().entry(context).or_default())
 }
 
 impl State {
@@ -283,8 +293,8 @@ impl Area {
 
 impl BinderFile {
     #[must_use]
-    pub fn open() -> Arc<Self> {
-        let broker = broker();
+    pub fn open(context: Context) -> Arc<Self> {
+        let broker = broker(context);
         let id = {
             let mut st = broker.state.lock();
             st.next_proc += 1;

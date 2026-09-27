@@ -159,7 +159,9 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
                 .map_err(|_| EACCES)?;
             FileKind::Host { file, guest: r.path.clone(), sysroot: false }
         }
-        Node::Dev(DevNode::Binder) => FileKind::Binder(crate::binder::BinderFile::open()),
+        Node::Dev(DevNode::Binder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::Binder)),
+        Node::Dev(DevNode::HwBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::HwBinder)),
+        Node::Dev(DevNode::VndBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::VndBinder)),
         Node::Dev(d) => FileKind::Dev(d),
         Node::Generated | Node::Blob { .. } => {
             if write {
@@ -224,7 +226,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
-        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::Kmsg => 0x10b }, ..s(S_IFCHR | 0o666, 0) },
+        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
 }
@@ -284,7 +286,7 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         FileKind::Socket(s) => crate::socket::receive(s, buf),
         // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
-        FileKind::Dev(DevNode::Binder) | FileKind::Binder(_) => Err(EINVAL),
+        FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder) | FileKind::Binder(_) => Err(EINVAL),
         FileKind::Dev(DevNode::Kmsg) => Err(EAGAIN),
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
@@ -533,6 +535,8 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::TimerFd(_) => b"anon_inode:[timerfd]".to_vec(),
         FileKind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
         FileKind::Dev(DevNode::Binder) | FileKind::Binder(_) => b"/dev/binder".to_vec(),
+        FileKind::Dev(DevNode::HwBinder) => b"/dev/hwbinder".to_vec(),
+        FileKind::Dev(DevNode::VndBinder) => b"/dev/vndbinder".to_vec(),
         FileKind::Dev(DevNode::Kmsg) => b"/dev/kmsg".to_vec(),
     }
 }
