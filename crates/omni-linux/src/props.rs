@@ -29,7 +29,12 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 3] = ["/system/build.prop", "/system_ext/etc/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 8] = [
+const OVERLAY: [(&str, &str); 10] = [
+    // The runtime this device offers (AndroidRuntime turns these into ART's -Xgc: and -Xusejit:):
+    // CMC, the collector the boot image is compiled for, in its userfaultfd-less fallback mode;
+    // no JIT until its code cache (memfd, a writable and an executable view) is supported.
+    ("dalvik.vm.gctype", "CMC"),
+    ("dalvik.vm.usejit", "false"),
     ("ro.product.cpu.abi", "arm64-v8a"),
     ("ro.product.cpu.abilist", "arm64-v8a"),
     ("ro.product.cpu.abilist64", "arm64-v8a"),
