@@ -318,6 +318,24 @@ fn sys_sched_zero(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// `sched_get_priority_max`/`_min`: Linux's ranges -- 1..99 for the real-time policies (FIFO, RR),
+/// 0 for the others -- so a caller computing a real-time priority gets a valid one.
+fn sys_sched_get_priority_max(_p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    match a[0] & !0x4000_0000 {
+        1 | 2 => Ok(99),
+        0 | 3 | 5 | 6 => Ok(0),
+        _ => Err(EINVAL),
+    }
+}
+
+fn sys_sched_get_priority_min(_p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    match a[0] & !0x4000_0000 {
+        1 | 2 => Ok(1),
+        0 | 3 | 5 | 6 => Ok(0),
+        _ => Err(EINVAL),
+    }
+}
+
 fn sys_sched_getparam(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     p.mem.write_u32(a[1], 0)?;
     Ok(0)
@@ -598,6 +616,8 @@ fn sys_membarrier(_p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 pub fn install(table: &mut Table) {
+    table.set(nr::SCHED_GET_PRIORITY_MAX, sys_sched_get_priority_max);
+    table.set(nr::SCHED_GET_PRIORITY_MIN, sys_sched_get_priority_min);
     table.set(nr::RT_SIGTIMEDWAIT, sys_rt_sigtimedwait);
     table.set(nr::RT_SIGSUSPEND, sys_rt_sigsuspend);
     table.set(nr::MEMBARRIER, sys_membarrier);
@@ -636,7 +656,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::GETRLIMIT, sys_getrlimit);
     table.set(nr::SCHED_GETAFFINITY, sys_sched_getaffinity);
     table.set(nr::SCHED_YIELD, sys_sched_yield);
-    for n in [nr::SCHED_GETSCHEDULER, nr::SCHED_SETSCHEDULER, nr::SCHED_SETPARAM, nr::SCHED_GET_PRIORITY_MAX, nr::SCHED_GET_PRIORITY_MIN] {
+    for n in [nr::SCHED_GETSCHEDULER, nr::SCHED_SETSCHEDULER, nr::SCHED_SETPARAM] {
         table.set(n, sys_sched_zero);
     }
     table.set(nr::SCHED_GETPARAM, sys_sched_getparam);
