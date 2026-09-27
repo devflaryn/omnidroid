@@ -936,7 +936,16 @@ fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64, nonbl
         while at + 4 <= cmds.len() {
             match command(p, t, file, &cmds, at) {
                 Ok(len) => at += len,
-                Err(e) => {
+                // A transaction that failed is answered as the kernel answers it: consumed, the
+                // write stops there, and the error is the thread's to read (BR_FAILED_REPLY) --
+                // not the ioctl's. An ioctl error left libbinder's out-buffer unconsumed and every
+                // later call of that thread failed with it (an app's `unbindService` threw
+                // IllegalArgumentException and killed its main thread).
+                Err(Failed::Transaction(len)) => {
+                    at += len;
+                    break;
+                }
+                Err(Failed::Command(e)) => {
                     result = Err(e);
                     break;
                 }
@@ -958,14 +967,57 @@ fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64, nonbl
     result
 }
 
-/// One `BC_*` command at `at` in `cmds`: its length, or an error that stops the write.
-fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: usize) -> Result<usize, Errno> {
+/// Why a write stopped at a command.
+enum Failed {
+    /// A transaction or reply that could not be made (`len` bytes, consumed): its failure was
+    /// queued for the threads that must hear of it.
+    Transaction(usize),
+    /// A command the driver refuses: the ioctl's error.
+    Command(Errno),
+}
+
+impl From<Errno> for Failed {
+    fn from(e: Errno) -> Self {
+        Self::Command(e)
+    }
+}
+
+/// One `BC_*` command at `at` in `cmds`: its length, or why the write stops.
+fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: usize) -> Result<usize, Failed> {
     let code = u32_at(cmds, at);
     let size = ((code >> 16) & 0x3fff) as usize;
     let arg = cmds.get(at + 4..at + 4 + size).ok_or(EFAULT)?;
     match code {
         BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG => {
-            transaction(p, t, file, arg, matches!(code, BC_REPLY | BC_REPLY_SG))?;
+            let reply = matches!(code, BC_REPLY | BC_REPLY_SG);
+            // The caller a reply answers, before the reply takes it off the thread.
+            let caller = if reply {
+                let mut st = file.broker.state.lock();
+                st.proc_mut(file.id).threads.entry(t.tid).or_default().serving.last().copied().flatten()
+            } else {
+                None
+            };
+            if let Err(e) = transaction(p, t, file, arg, reply) {
+                if std::env::var("OMNI_BINDER_TRACE").is_ok() || crate::remote::is_remote() || p.trace {
+                    eprintln!("[binder] {}:{} {} failed: {e:?}", p.sys.pid, t.tid, if reply { "reply" } else { "transaction" });
+                }
+                let mut st = file.broker.state.lock();
+                if reply {
+                    // binder_transaction's error path for a reply: the replier completes, and the
+                    // one waiting for it hears BR_FAILED_REPLY.
+                    let th = st.proc_mut(file.id).threads.entry(t.tid).or_default();
+                    if th.serving.last().copied().flatten() == caller && caller.is_some() {
+                        th.serving.pop();
+                    }
+                    st.queue(file.id, Some(t.tid), Work::Complete);
+                    if let Some((proc, tid)) = caller {
+                        st.queue(proc, Some(tid), Work::FailedReply);
+                    }
+                } else {
+                    st.queue(file.id, Some(t.tid), Work::FailedReply);
+                }
+                return Err(Failed::Transaction(4 + size));
+            }
         }
         BC_FREE_BUFFER => {
             let ptr = u64_at(arg, 0);
@@ -1016,7 +1068,7 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         }
         _ => {
             p.refusals.record(format!("binder command {code:#x}"), t.pc, t.lr);
-            return Err(EINVAL);
+            return Err(Failed::Command(EINVAL));
         }
     }
     Ok(4 + size)

@@ -113,6 +113,23 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
         // The receiver makes a connected end of its own and relays its other end to this one.
         FileKind::Socket(s) => [&[3u8, s.ty as u8][..], &port.to_le_bytes()].concat(),
         FileKind::Pipe(end) => [&[4u8, u8::from(end.is_write())][..], &port.to_le_bytes()].concat(),
+        // A file (an app's `ParcelFileDescriptor` of its own data, a sysroot file): the receiver
+        // opens the same host file, with the same access, at the same offset. The offset is then
+        // each side's own (a Linux descriptor passed on shares one); the files that cross are read
+        // or written by one side at a time.
+        FileKind::Host { file: host, guest, sysroot } if omni_platform::fs::path_of(host).is_ok() => {
+            use std::io::Seek;
+            let path = omni_platform::fs::path_of(host).expect("checked");
+            let offset = (&*host).stream_position().unwrap_or(0);
+            let mut d = vec![5u8, u8::from(*sysroot)];
+            d.extend_from_slice(&file.flags.lock().to_le_bytes());
+            d.extend_from_slice(&offset.to_le_bytes());
+            for s in [guest.as_slice(), path.to_string_lossy().as_bytes()] {
+                d.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                d.extend_from_slice(s);
+            }
+            d
+        }
         other => {
             let kind = match other {
                 FileKind::Host { guest, .. } => format!("file {}", String::from_utf8_lossy(guest)),
@@ -161,6 +178,29 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
             let (mine, other) = if d.get(1) == Some(&1) { (write, read) } else { (read, write) };
             relay_or_keep(other, port_at(d));
             Arc::try_unwrap(mine).map_err(|_| EIO)
+        }
+        Some(5) => {
+            use std::io::Seek;
+            let sysroot = d.get(1) == Some(&1);
+            let flags = u32_at(d, 2);
+            let offset = u64_at(d, 6);
+            let mut at = 14;
+            let mut field = || {
+                let len = u32_at(d, at) as usize;
+                let s = d.get(at + 4..at + 4 + len).unwrap_or_default().to_vec();
+                at += 4 + len;
+                s
+            };
+            let (guest, path) = (field(), field());
+            let access = flags & 3;
+            let mut host = std::fs::OpenOptions::new()
+                .read(access != 1)
+                .write(access != 0)
+                .append(flags & 0o2000 != 0)
+                .open(String::from_utf8_lossy(&path).as_ref())
+                .map_err(|_| EBADF)?;
+            host.seek(std::io::SeekFrom::Start(offset)).map_err(|_| EIO)?;
+            Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Host { file: host, guest, sysroot }), flags: parking_lot::Mutex::new(flags) })
         }
         Some(2) => {
             let now = crate::sys::monotonic().as_nanos() as u64;
@@ -503,5 +543,44 @@ impl RemoteBinder {
         req.extend_from_slice(&len.to_le_bytes());
         self.call(p, t, MMAP, &req)?;
         Ok(at)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, Write};
+
+    /// A file's descriptor crosses to another host process as the same host file, with its access
+    /// and offset: the WebView hands its service a `ParcelFileDescriptor` of the app's own data
+    /// (`app_webview/variations_seed_new`), and a refused descriptor failed the whole transaction.
+    #[test]
+    fn a_file_crosses_as_the_same_host_file_at_the_same_offset() {
+        let path = std::env::temp_dir().join(format!("omni-remote-file-{}", std::process::id()));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let mut host = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        host.seek(std::io::SeekFrom::Start(4)).unwrap();
+        let file = Arc::new(OpenFile {
+            kind: parking_lot::Mutex::new(FileKind::Host { file: host, guest: b"/data/user/0/x/seed".to_vec(), sysroot: false }),
+            flags: parking_lot::Mutex::new(2),
+        });
+        let d = describe(&file);
+        assert_eq!(d.first(), Some(&5), "a file is described, not refused");
+        let crossed = open_described(&d).expect("opened on the other side");
+        assert_eq!(*crossed.flags.lock(), 2);
+        {
+            let mut kind = crossed.kind.lock();
+            let FileKind::Host { file: other, guest, sysroot } = &mut *kind else { panic!("a host file") };
+            assert_eq!(guest, b"/data/user/0/x/seed");
+            assert!(!*sysroot);
+            let mut rest = String::new();
+            other.read_to_string(&mut rest).unwrap();
+            assert_eq!(rest, "456789", "read from the sender's offset");
+            other.write_all(b"!").unwrap();
+        }
+        drop(crossed);
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789!", "writable, and the same file");
+        let _ = std::fs::remove_file(&path);
     }
 }

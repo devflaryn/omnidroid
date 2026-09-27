@@ -117,6 +117,55 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
 
+/// The host path an open file is at now (after any rename), for another host process to open the
+/// same file: Windows `GetFinalPathNameByHandleW`, Linux `/proc/self/fd`, macOS `F_GETPATH`.
+///
+/// # Errors
+///
+/// The host's error when it cannot name the file (an unlinked file has no path on Windows).
+pub fn path_of(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS};
+        let mut buf = vec![0u16; 1024];
+        loop {
+            // SAFETY: the handle is `file`'s, open for this call; `buf` holds `buf.len()` u16s.
+            let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) } as usize;
+            if n == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if n < buf.len() {
+                return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
+            }
+            buf.resize(n + 1, 0);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`, which holds that many.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..n])))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Write};
