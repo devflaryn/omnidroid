@@ -18,6 +18,8 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+# The host's Vulkan, loaded at run time (`crate::gpu`); as omni-gfx loads it (its Cargo.toml says why).
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
 
 [[bin]]
 name = "omni-linux-run"

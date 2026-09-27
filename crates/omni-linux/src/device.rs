@@ -14,6 +14,8 @@ pub const FILES: &[(&str, &[u8])] = &[
     ("/vendor/etc/vintf/manifest/omni-graphics.xml", include_bytes!("../device/vendor/etc/vintf/manifest/omni-graphics.xml")),
     // gralloc 5's in-process mapper (`device/src/mapper.c`; `device/src/build.txt`, `device/SHA256SUMS`).
     ("/vendor/lib64/hw/mapper.omni.so", include_bytes!("../device/vendor/lib64/hw/mapper.omni.so")),
+    // The Vulkan driver, forwarding to the host's GPU (`device/src/vk/`; `crate::gpu`).
+    ("/vendor/lib64/hw/vulkan.omni.so", include_bytes!("../device/vendor/lib64/hw/vulkan.omni.so")),
 ];
 
 /// An overlay file as the sysroot holds it: its guest path, its manifest entry, and the host file

@@ -1,0 +1,48 @@
+# Vulkan commands forwarded by hand on both sides (tools/gen_vk_forward.py reads this).
+# Host: crates/omni-linux/src/gpu/special.rs. Guest: crates/omni-linux/device/src/vk/special.c
+# (and driver.c). One command name per line; an alias name counts as its command.
+# The generator fails on a name that is not a forwarded command.
+
+# Instance and device lifetime, enumeration, proc addresses.
+vkCreateInstance
+vkDestroyInstance
+vkEnumerateInstanceExtensionProperties
+vkEnumerateInstanceLayerProperties
+vkEnumerateInstanceVersion
+vkEnumeratePhysicalDevices
+vkEnumeratePhysicalDeviceGroups
+vkGetInstanceProcAddr
+vkGetDeviceProcAddr
+vkCreateDevice
+vkDestroyDevice
+vkEnumerateDeviceExtensionProperties
+vkEnumerateDeviceLayerProperties
+
+# Dispatchable handles made or consumed.
+vkGetDeviceQueue
+vkGetDeviceQueue2
+vkAllocateCommandBuffers
+vkFreeCommandBuffers
+vkQueueSubmit
+vkQueueSubmit2
+vkCmdExecuteCommands
+
+# Queries that carry Android outputs.
+vkGetPhysicalDeviceProperties2
+vkGetPhysicalDeviceImageFormatProperties2
+
+# VK_ANDROID_external_memory_android_hardware_buffer.
+vkGetAndroidHardwareBufferPropertiesANDROID
+vkGetMemoryAndroidHardwareBufferANDROID
+
+# Sync fds (VK_KHR_external_semaphore_fd, VK_KHR_external_fence_fd; SYNC_FD only).
+vkGetSemaphoreFdKHR
+vkImportSemaphoreFdKHR
+vkGetFenceFdKHR
+vkImportFenceFdKHR
+
+# Gralloc images (VkNativeBufferANDROID, AHardwareBuffer import) and their memory.
+vkCreateImage
+vkAllocateMemory
+vkBindImageMemory
+vkBindImageMemory2

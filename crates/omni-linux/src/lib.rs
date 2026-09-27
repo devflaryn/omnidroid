@@ -12,6 +12,7 @@ pub mod errno;
 pub mod exec;
 pub mod fd;
 pub mod futex;
+pub mod gpu;
 pub mod guest;
 pub mod hal;
 pub mod init;

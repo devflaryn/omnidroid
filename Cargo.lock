@@ -337,6 +337,8 @@ dependencies = [
 name = "omni-linux"
 version = "0.1.0"
 dependencies = [
+ "ash",
+ "flate2",
  "omni-cpu",
  "omni-elf",
  "omni-mem",

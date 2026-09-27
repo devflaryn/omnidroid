@@ -148,6 +148,9 @@ pub enum DevNode {
     Kmsg,
     /// `/dev/ashmem`: opened, then sized and named by ioctl, it is a shared-memory region.
     Ashmem,
+    /// `/dev/omni-gpu`: the host's GPU, which the guest's Vulkan driver forwards to
+    /// ([`crate::gpu`]).
+    OmniGpu,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +362,7 @@ impl Vfs {
             b"/dev/vndbinder" => return Some(Node::Dev(DevNode::VndBinder)),
             b"/dev/kmsg" => return Some(Node::Dev(DevNode::Kmsg)),
             b"/dev/ashmem" => return Some(Node::Dev(DevNode::Ashmem)),
+            b"/dev/omni-gpu" => return Some(Node::Dev(DevNode::OmniGpu)),
             b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
             _ => {}
         }

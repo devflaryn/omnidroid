@@ -48,6 +48,8 @@ pub enum FileKind {
     TimerFd(Arc<crate::poll::TimerFd>),
     Epoll(Arc<crate::poll::Epoll>),
     Binder(Arc<crate::binder::BinderFile>),
+    /// An open of `/dev/omni-gpu`.
+    Gpu(Arc<crate::gpu::Gpu>),
     /// A shared-memory region (`memfd_create`, `/dev/ashmem`).
     Shared(Arc<crate::shm::Shm>),
     /// An inotify instance: watches are accepted, no event is ever reported (nothing here changes
@@ -168,6 +170,7 @@ pub fn open(vfs: &Vfs, cwd: &[u8], path: &[u8], flags: u32) -> Result<OpenFile, 
         Node::Dev(DevNode::Binder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::Binder)),
         Node::Dev(DevNode::HwBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::HwBinder)),
         Node::Dev(DevNode::VndBinder) => FileKind::Binder(crate::binder::BinderFile::open(crate::binder::Context::VndBinder)),
+        Node::Dev(DevNode::OmniGpu) => FileKind::Gpu(crate::gpu::Gpu::open()),
         Node::Dev(d) => FileKind::Dev(d),
         Node::Generated | Node::Blob { .. } => {
             if write {
@@ -232,7 +235,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
-        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b, DevNode::Ashmem => 0x1_0b }, ..s(S_IFCHR | 0o666, 0) },
+        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b, DevNode::Ashmem => 0x1_0b, DevNode::OmniGpu => 0xe2_00 }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
 }
@@ -263,6 +266,7 @@ pub fn stat_of(file: &OpenFile) -> Result<Stat, Errno> {
         // anon_inode descriptors: a 0600 inode, as the kernel reports them.
         FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Ok(Stat { ino: 4, mode: 0o600, nlink: 1, ..Stat::default() }),
         FileKind::Binder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
+        FileKind::Gpu(_) => stat_node(&Resolved { path: b"/dev/omni-gpu".to_vec(), node: Node::Dev(DevNode::OmniGpu) }),
         FileKind::Shared(m) => Ok(Stat { ino: 5, mode: S_IFREG | 0o600, nlink: 1, size: m.len() as i64, blocks: (m.len() as i64 + 511) / 512, ..Stat::default() }),
         FileKind::Inotify(_) => Ok(Stat { ino: 6, mode: 0o600, nlink: 1, ..Stat::default() }),
     }
@@ -294,7 +298,7 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         FileKind::Socket(s) => crate::socket::receive(s, buf),
         // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
-        FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder) | FileKind::Binder(_) => Err(EINVAL),
+        FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder | DevNode::OmniGpu) | FileKind::Binder(_) | FileKind::Gpu(_) => Err(EINVAL),
         FileKind::Dev(DevNode::Kmsg | DevNode::Ashmem) => Err(EAGAIN),
         FileKind::Shared(m) => match at {
             Some(off) => m.read_at(buf, off),
@@ -352,7 +356,7 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Synth { .. } => Err(EACCES),
         FileKind::Socket(s) => crate::socket::send(s, bytes),
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
-        FileKind::Binder(_) => Err(EINVAL),
+        FileKind::Binder(_) | FileKind::Gpu(_) => Err(EINVAL),
     }
 }
 
@@ -608,6 +612,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Dev(DevNode::VndBinder) => b"/dev/vndbinder".to_vec(),
         FileKind::Dev(DevNode::Kmsg) => b"/dev/kmsg".to_vec(),
         FileKind::Dev(DevNode::Ashmem) => b"/dev/ashmem".to_vec(),
+        FileKind::Dev(DevNode::OmniGpu) | FileKind::Gpu(_) => b"/dev/omni-gpu".to_vec(),
         FileKind::Shared(m) => format!("/memfd:{} (deleted)", m.name).into_bytes(),
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
     }
@@ -650,6 +655,13 @@ fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     };
     if let Some(b) = binder {
         return crate::binder::ioctl(p, t, &b, a[1], a[2]);
+    }
+    let gpu = match &*file.kind.lock() {
+        FileKind::Gpu(g) => Some(Arc::clone(g)),
+        _ => None,
+    };
+    if let Some(g) = gpu {
+        return crate::gpu::ioctl(p, t, &g, a[1], a[2]);
     }
     let shared = match &*file.kind.lock() {
         FileKind::Shared(m) => Some(Arc::clone(m)),
