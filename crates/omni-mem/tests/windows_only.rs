@@ -37,11 +37,12 @@ const WINDOWS_AND_MACOS_GATE: &str = r#"#![cfg(any(target_os = "windows", target
 /// compiles everywhere and reports a named `#[ignore]`d test with the reason attached. That is the
 /// shape this whole file argues for — a skip that appears where a pass would — so it is checked
 /// below rather than merely permitted.
-const PORTABLE: [&str; 7] = [
+const PORTABLE: [&str; 8] = [
     "admit_cache.rs",
     "arena_execution.rs",
     "config.rs",
     "discard.rs",
+    "fixed_base.rs",
     "heap_pattern.rs",
     "labels.rs",
     "windows_only.rs",
