@@ -186,7 +186,7 @@ impl Remembered {
 
     fn of(region: &RegionInfo) -> Option<Self> {
         let anonymous = match region.kind {
-            RegionKind::Free => return None,
+            RegionKind::Free | RegionKind::Host => return None,
             RegionKind::Anonymous => true,
             RegionKind::File { .. } => false,
         };

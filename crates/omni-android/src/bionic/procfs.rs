@@ -238,6 +238,11 @@ fn generate_maps(source: &MapsSource) -> FsResult<Vec<u8>> {
                     push_line(&mut out, cursor, end, perms(false), 0, (0, 0, 0), None);
                 }
             }
+            // Held by the host inside a space reserved around it: in use, and not the guest's to
+            // touch, which is what a `---p` line with no name says.
+            RegionKind::Host => {
+                push_line(&mut out, region.start as u64, region.end() as u64, perms(false), 0, (0, 0, 0), None);
+            }
             RegionKind::Free => {}
         }
     }

@@ -220,6 +220,30 @@ pub struct GuestSpaceConfig {
     /// eagerly-committed mapping, because [`CommitPolicy::Eager`] commits a mapping's whole length in
     /// one call. Reaching it is [`MemError::CommitRequestTooLarge`].
     pub max_commit_request: usize,
+    /// Reserve [`base`](Self::base)'s range **around** whatever the host already holds inside it,
+    /// rather than failing. Default `false`; only meaningful with `base: Some(_)` (a space placed by
+    /// the host is free by construction, and this is ignored).
+    ///
+    /// Why: a guest address is a host address (D4), ART needs its boot image near 0x7000_0000 and
+    /// its heap below 4 GiB, and on Windows every process has `KUSER_SHARED_DATA` at 0x7FFE_0000 --
+    /// so one reservation of a low range that covers it fails with `ERROR_INVALID_ADDRESS`
+    /// (measured: base 0x4000_0000 fails at any size, 0x1000_0000 + 1 GiB and 0x8000_0000 + 64 GiB
+    /// succeed).
+    ///
+    /// With it, the space asks the host which sub-ranges are in use
+    /// ([`vm::occupied_ranges`](omni_platform::vm::occupied_ranges)), rounds each out to the host's
+    /// allocation granularity (and to this space's page) because the rest of a granule the host has
+    /// touched cannot be reserved, and reserves one placeholder on each free range between them.
+    /// Each in-use range becomes a permanent entry the host owns ([`RegionKind::Host`]): never free,
+    /// never placed into by any [`Placement`], refused by `unmap`, `protect` and `discard`
+    /// ([`MemError::HostOwned`]), and left alone by teardown. [`GuestSpace::base`] and
+    /// [`GuestSpace::end`] still span the whole range, holes included.
+    ///
+    /// The host can take more of the range between the question and the reservations; the space
+    /// then asks again, a few times, before giving up with the reservation's error.
+    ///
+    /// [`RegionKind::Host`]: crate::RegionKind::Host
+    pub around_host: bool,
 }
 
 impl Default for GuestSpaceConfig {
@@ -231,6 +255,7 @@ impl Default for GuestSpaceConfig {
             commit_granule: DEFAULT_COMMIT_GRANULE,
             max_committed: DEFAULT_MAX_COMMITTED,
             max_commit_request: DEFAULT_MAX_COMMIT_REQUEST,
+            around_host: false,
         }
     }
 }
@@ -325,7 +350,8 @@ pub struct Discarded {
 /// A snapshot of what a guest address space currently holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceStats {
-    /// Size of the reservation.
+    /// Size of the reservation: the space's whole range, including any ranges the host holds
+    /// inside it ([`GuestSpaceConfig::around_host`]), which count as neither `mapped` nor `free`.
     pub reserved: usize,
     /// Bytes claimed by guest mappings, committed or not.
     pub mapped: usize,
@@ -400,7 +426,11 @@ impl core::ops::Deref for MapRead<'_> {
 
 struct Inner {
     map: EntryMap,
-    reservation: Reservation,
+    /// The OS placeholders this space reserved, in address order: one for the whole space, or --
+    /// reserved [`around_host`](GuestSpaceConfig::around_host) -- one per free range between the
+    /// host's. A split or coalesce never crosses from one to the next (the host's range lies
+    /// between them), and teardown releases each exactly once.
+    reservations: Vec<Reservation>,
     page: usize,
     granule: usize,
     cursor: GuestAddr,
@@ -530,17 +560,25 @@ impl GuestSpace {
 
         // At least page-aligned: the host's allocation granularity already is, for the host's own
         // page, and is not for a larger page asked of `with_page_size`.
-        let reservation = match config.base {
-            Some(at) => vm::reserve_placeholder_at(at, config.size)
-                .map_err(platform("GuestSpace::with_config", at, config.size))?,
-            None => vm::reserve_placeholder(config.size, config.base_alignment.max(page))
-                .map_err(platform("GuestSpace::with_config", 0, config.size))?,
+        let (reservations, hosts) = match config.base {
+            Some(at) if config.around_host => reserve_around_host(at, config.size, page)?,
+            Some(at) => (
+                vec![vm::reserve_placeholder_at(at, config.size)
+                    .map_err(platform("GuestSpace::with_config", at, config.size))?],
+                Vec::new(),
+            ),
+            None => (
+                vec![vm::reserve_placeholder(config.size, config.base_alignment.max(page))
+                    .map_err(platform("GuestSpace::with_config", 0, config.size))?],
+                Vec::new(),
+            ),
         };
-        let base = reservation.base();
+        let base = config.base.unwrap_or_else(|| reservations[0].base());
         tracing::debug!(
             base = format_args!("{base:#x}"),
             size = config.size,
             granule = config.commit_granule,
+            host_ranges = hosts.len(),
             "reserved a guest address space"
         );
         Ok(Self {
@@ -549,8 +587,8 @@ impl GuestSpace {
             page,
             granule: config.commit_granule,
             inner: Mutex::new(Inner {
-                map: EntryMap::new(base, config.size),
-                reservation,
+                map: EntryMap::with_hosts(base, config.size, hosts),
+                reservations,
                 page,
                 granule: config.commit_granule,
                 cursor: base,
@@ -841,7 +879,8 @@ impl GuestSpace {
     /// # Errors
     ///
     /// [`MemError::ZeroSize`], [`MemError::Misaligned`], [`MemError::OutsideSpace`],
-    /// [`MemError::NotMapped`] if any part of the range is free, or [`MemError::Platform`] —
+    /// [`MemError::NotMapped`] if any part of the range is free, [`MemError::HostOwned`] if any
+    /// part of it is the host's (nothing is changed), or [`MemError::Platform`] —
     /// `ERROR_INVALID_PARAMETER` (87) when the protection exceeds what the backing file's section
     /// allows.
     pub fn protect(
@@ -855,6 +894,7 @@ impl GuestSpace {
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
         let mut inner = self.write();
+        inner.refuse_host(OP, address, len)?;
         inner.require_mapped(OP, address, len)?;
         inner.protect_range(OP, address, len, protection)?;
         inner.validate();
@@ -882,7 +922,9 @@ impl GuestSpace {
     ///
     /// # Errors
     ///
-    /// [`MemError::ZeroSize`], [`MemError::Misaligned`], [`MemError::OutsideSpace`], or
+    /// [`MemError::ZeroSize`], [`MemError::Misaligned`], [`MemError::OutsideSpace`],
+    /// [`MemError::HostOwned`] if the range reaches into one the host holds -- refused whole, so the
+    /// parts on either side stay mapped -- or
     /// [`MemError::Platform`].
     pub fn unmap(&self, address: GuestAddr, len: usize) -> MemResult<()> {
         const OP: &str = "unmap";
@@ -890,6 +932,7 @@ impl GuestSpace {
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
         let mut inner = self.write();
+        inner.refuse_host(OP, address, len)?;
         inner.unmap_range(OP, address, len)?;
         inner.validate();
         tracing::debug!(address = format_args!("{address:#x}"), len, "unmapped guest memory");
@@ -1030,7 +1073,8 @@ impl GuestSpace {
     /// # Errors
     ///
     /// [`MemError::ZeroSize`], [`MemError::Misaligned`] for an address that is not a multiple of
-    /// [`SMALL_PAGE`], [`MemError::OutsideSpace`], or [`MemError::Platform`] if a decommit or a
+    /// [`SMALL_PAGE`], [`MemError::OutsideSpace`], [`MemError::HostOwned`] if the range reaches
+    /// into one the host holds (nothing is changed), or [`MemError::Platform`] if a decommit or a
     /// protection change fails.
     pub fn discard(&self, address: GuestAddr, len: usize) -> MemResult<Discarded> {
         const OP: &str = "discard";
@@ -1051,6 +1095,7 @@ impl GuestSpace {
         let split = split_at_pages(address, len, self.page);
         let mut inner = self.write();
         let mut discarded = Discarded::default();
+        inner.refuse_host(OP, address, len)?;
         if let Some((at, whole)) = split.whole {
             inner.mark_idle(at, whole);
             discarded.decommitted = inner.reclaim_in(at, whole)?.bytes;
@@ -1573,15 +1618,47 @@ impl Inner {
     ) -> MemResult<()> {
         debug_assert!(at > start);
         let len = at - start;
-        let offset = start - self.map.base();
-        let piece = vm::split_placeholder(&self.reservation, offset, len)
+        // The OS placeholder the split is inside. A placeholder entry never crosses from one to
+        // the next, because the host's range lies between them and a free entry never spans it.
+        let reservation = self.reservation_at(start);
+        let offset = start - reservation.base();
+        let piece = vm::split_placeholder(reservation, offset, len)
             .map_err(platform(operation, start, len))?;
         debug_assert_eq!(piece.base(), start, "a split must carve the range it was given");
         self.map.split_bookkeeping(start, at);
         Ok(())
     }
 
+    /// The reservation containing `address`, which must be one of this space's own.
+    fn reservation_at(&self, address: GuestAddr) -> &Reservation {
+        let index = self.reservations.partition_point(|r| r.end() <= address);
+        let reservation = &self.reservations[index];
+        assert!(
+            reservation.base() <= address,
+            "{address:#x} is in none of this space's reservations: it is the host's"
+        );
+        reservation
+    }
+
+    /// Refuse a range that reaches into one the host holds: see [`MemError::HostOwned`].
+    fn refuse_host(&self, operation: &'static str, address: GuestAddr, len: usize) -> MemResult<()> {
+        match self.map.host_overlapping(address, len) {
+            Some((host_start, host_end)) => Err(MemError::HostOwned {
+                operation,
+                address,
+                end: address + len,
+                host_start,
+                host_end,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Make sure an entry boundary exists at `at`, splitting the OS placeholder if the entry is one.
+    ///
+    /// A range the host holds is never split: a boundary asked for inside one is not made, and
+    /// every path that would then act on the pieces refuses such a range first
+    /// ([`refuse_host`](Self::refuse_host)) or skips entries it does not wholly cover.
     fn ensure_boundary(&mut self, operation: &'static str, at: GuestAddr) -> MemResult<()> {
         if at == self.map.end() {
             return Ok(());
@@ -1594,6 +1671,9 @@ impl Inner {
             return Ok(());
         }
         let entry = self.map.get(start).expect("entry vanished");
+        if entry.is_host() {
+            return Ok(());
+        }
         if entry.os == OsState::Placeholder {
             self.split_placeholder(operation, start, at)?;
         } else {
@@ -1758,6 +1838,8 @@ impl Inner {
             let entry_len = entry.len;
             debug_assert!(start >= address && start + entry_len <= end);
             match entry.os {
+                // `protect` refuses a range that reaches one; nothing to record on it either way.
+                OsState::Host => continue,
                 // An uncommitted granule has no pages to protect; it records the protection and is
                 // committed with it when something reaches it.
                 OsState::Placeholder => {}
@@ -1829,6 +1911,9 @@ impl Inner {
                 OsState::View { view } => {
                     position = self.unmap_view(operation, view, start, address, end)?;
                 }
+                // Never the space's to unmap. `unmap` refuses such a range before it gets here;
+                // an internal caller that reaches one leaves it as it is.
+                OsState::Host => position = entry_end,
             }
         }
         Ok(())
@@ -2250,7 +2335,8 @@ impl Inner {
             entries: self.map.entry_count(),
         };
         for (_, entry) in self.map.iter() {
-            if entry.is_free() {
+            // The host's ranges are neither free nor the guest's: in `reserved`, and nowhere else.
+            if entry.is_free() || entry.is_host() {
                 continue;
             }
             stats.mapped += entry.len;
@@ -2291,7 +2377,8 @@ impl Inner {
             let entry = self.map.get(start).expect("entry vanished").clone();
             let entry_end = start + entry.len;
             match entry.os {
-                OsState::Placeholder => {}
+                // The host's: not this space's to tear down.
+                OsState::Placeholder | OsState::Host => {}
                 OsState::Private { .. } => {
                     // SAFETY: private committed memory this process owns, produced by
                     // `commit_placeholder`, being torn down; the space is going away, so nothing
@@ -2323,37 +2410,48 @@ impl Inner {
             position = entry_end.max(position + self.page);
         }
 
-        // 2. One reservation again. Coalescing is only legal — and only necessary — when the space
-        //    was actually split; a coalesce of a range holding a single placeholder fails with 487.
-        let base = self.map.base();
-        let len = self.map.end() - base;
-        if self.map.entry_count() > 1 {
-            // SAFETY: after step 1 the whole space is placeholders this process owns.
-            match unsafe { vm::coalesce_placeholders(base as *mut u8, len) } {
-                Ok(()) => self.map.replace(base, len, Entry::free(len)),
-                Err(error) => fail(platform("close", base, len)(error)),
-            }
-        }
+        // Steps 2 and 3 run once per reservation: one for an ordinary space, one per free range
+        // between the host's for a space reserved around them. A coalesce or release never
+        // crosses from one to the next, and the host's ranges between them are never touched.
+        let reservations = self.reservations.clone();
+        for reservation in reservations {
+            let base = reservation.base();
+            let len = reservation.len();
 
-        // 3. Release. If the coalesce failed the space is still fragmented, so fall back to
-        //    releasing each placeholder individually rather than leaking all of it.
-        if self.map.entry_count() == 1 {
-            if let Err(error) = vm::release(self.reservation) {
-                fail(platform("close", base, len)(error));
+            // 2. One placeholder again. Coalescing is only legal — and only necessary — when the
+            //    reservation was actually split; a coalesce of a range holding a single placeholder
+            //    fails with 487.
+            if self.map.starts_overlapping(base, len).len() > 1 {
+                // SAFETY: after step 1 the whole reservation is placeholders this process owns.
+                match unsafe { vm::coalesce_placeholders(base as *mut u8, len) } {
+                    Ok(()) => self.map.replace(base, len, Entry::free(len)),
+                    Err(error) => fail(platform("close", base, len)(error)),
+                }
             }
-        } else {
-            let pieces: Vec<(GuestAddr, usize)> =
-                self.map.iter().map(|(start, entry)| (start, entry.len)).collect();
-            for (start, piece_len) in pieces {
-                let offset = start - base;
-                match self.reservation.subrange(offset, piece_len, vm::ReservationKind::Placeholder)
-                {
-                    Ok(piece) => {
-                        if let Err(error) = vm::release(piece) {
-                            fail(platform("close", start, piece_len)(error));
+
+            // 3. Release. If the coalesce failed the reservation is still fragmented, so fall back
+            //    to releasing each placeholder individually rather than leaking all of it.
+            if self.map.starts_overlapping(base, len).len() == 1 {
+                if let Err(error) = vm::release(reservation) {
+                    fail(platform("close", base, len)(error));
+                }
+            } else {
+                let pieces: Vec<(GuestAddr, usize)> = self
+                    .map
+                    .starts_overlapping(base, len)
+                    .into_iter()
+                    .map(|start| (start, self.map.get(start).expect("entry vanished").len))
+                    .collect();
+                for (start, piece_len) in pieces {
+                    let offset = start - base;
+                    match reservation.subrange(offset, piece_len, vm::ReservationKind::Placeholder) {
+                        Ok(piece) => {
+                            if let Err(error) = vm::release(piece) {
+                                fail(platform("close", start, piece_len)(error));
+                            }
                         }
+                        Err(error) => fail(platform("close", start, piece_len)(error)),
                     }
-                    Err(error) => fail(platform("close", start, piece_len)(error)),
                 }
             }
         }
@@ -2362,6 +2460,116 @@ impl Inner {
             None => Ok(()),
         }
     }
+}
+
+/// What [`reserve_around_host`] reserved: the placeholders, in address order, and the host's ranges
+/// between them as `(start, len)`.
+type AroundHost = (Vec<Reservation>, Vec<(GuestAddr, usize)>);
+
+/// How many times [`reserve_around_host`] asks the host again after the host took part of the
+/// range between the question and the reservation.
+const AROUND_HOST_ATTEMPTS: usize = 4;
+
+/// Reserve `[base, base + size)` around what the host holds in it: one placeholder per free range,
+/// and the host's ranges, `(start, len)`, for the region map. See
+/// [`GuestSpaceConfig::around_host`].
+fn reserve_around_host(
+    base: GuestAddr,
+    size: usize,
+    page: usize,
+) -> MemResult<AroundHost> {
+    const OP: &str = "GuestSpace::with_config";
+    let granule = vm::allocation_granularity().max(page);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let occupied = vm::occupied_ranges(base, size).map_err(platform(OP, base, size))?;
+        let hosts = host_holes(base, size, &occupied, granule);
+        let pieces = free_between(base, size, &hosts);
+        if pieces.is_empty() {
+            return Err(MemError::InvalidConfig {
+                field: "base",
+                value: base as u64,
+                reason: "is the start of a range the host holds all of; there is nothing to reserve \
+                         around",
+            });
+        }
+        let mut reserved: Vec<Reservation> = Vec::with_capacity(pieces.len());
+        let mut failure = None;
+        for &(at, len) in &pieces {
+            match vm::reserve_placeholder_at(at, len) {
+                Ok(reservation) => reserved.push(reservation),
+                Err(error) => {
+                    failure = Some(platform(OP, at, len)(error));
+                    break;
+                }
+            }
+        }
+        let Some(error) = failure else {
+            if !hosts.is_empty() {
+                tracing::debug!(
+                    base = format_args!("{base:#x}"),
+                    size,
+                    ?hosts,
+                    "reserved a guest address space around the host's ranges"
+                );
+            }
+            return Ok((reserved, hosts));
+        };
+        // Give back what this attempt got, whatever happens next: a piece left reserved would be
+        // address space nothing owns.
+        for reservation in reserved {
+            if let Err(release) = vm::release(reservation) {
+                tracing::error!(%release, "could not give back part of a failed reservation");
+            }
+        }
+        if attempt >= AROUND_HOST_ATTEMPTS {
+            return Err(error);
+        }
+        tracing::debug!(%error, attempt, "the host took part of the range; asking again");
+    }
+}
+
+/// The host's ranges inside `[base, base + size)`, as the region map records them: each occupied
+/// `(start, end)` rounded out to `granule` -- the rest of a granule the host has used cannot be
+/// reserved -- clipped to the space, and merged where they meet. `(start, len)`, in address order.
+fn host_holes(
+    base: GuestAddr,
+    size: usize,
+    occupied: &[(usize, usize)],
+    granule: usize,
+) -> Vec<(GuestAddr, usize)> {
+    debug_assert!(granule.is_power_of_two());
+    let end = base + size;
+    let mut holes: Vec<(GuestAddr, GuestAddr)> = Vec::new();
+    for &(start, stop) in occupied {
+        let from = (start & !(granule - 1)).max(base);
+        let to = stop.checked_next_multiple_of(granule).unwrap_or(usize::MAX).min(end);
+        if from >= to {
+            continue;
+        }
+        match holes.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => holes.push((from, to)),
+        }
+    }
+    holes.into_iter().map(|(from, to)| (from, to - from)).collect()
+}
+
+/// The ranges of `[base, base + size)` between `holes` (sorted, disjoint), as `(start, len)`.
+fn free_between(base: GuestAddr, size: usize, holes: &[(GuestAddr, usize)]) -> Vec<(GuestAddr, usize)> {
+    let mut pieces = Vec::new();
+    let mut cursor = base;
+    for &(start, len) in holes {
+        if start > cursor {
+            pieces.push((cursor, start - cursor));
+        }
+        cursor = start + len;
+    }
+    if cursor < base + size {
+        pieces.push((cursor, base + size - cursor));
+    }
+    pieces
 }
 
 /// How much of a survivor is compared against the file at a time.
@@ -2610,7 +2818,36 @@ fn subtract(
 
 #[cfg(test)]
 mod tests {
-    use super::subtract;
+    use super::{free_between, host_holes, subtract};
+
+    #[test]
+    fn host_ranges_are_rounded_out_to_the_granule_clipped_and_merged() {
+        const G: usize = 0x1_0000;
+        let base = 0x1000_0000;
+        let size = 0x100_0000;
+        // KUSER_SHARED_DATA's shape: one 4 KiB page, which costs the whole 64 KiB granule.
+        assert_eq!(
+            host_holes(base, size, &[(base + 0x7_0000, base + 0x7_1000)], G),
+            vec![(base + 0x7_0000, G)]
+        );
+        // Two in one granule and one in the next become one range; one straddling each end of
+        // the space is clipped to it.
+        let occupied = [
+            (base - 0x1000, base + 0x1000),
+            (base + 0x10_2000, base + 0x10_3000),
+            (base + 0x10_8000, base + 0x11_1000),
+            (base + size - 0x1000, base + size + 0x5000),
+        ];
+        let holes = host_holes(base, size, &occupied, G);
+        assert_eq!(holes, vec![(base, G), (base + 0x10_0000, 2 * G), (base + size - G, G)]);
+        assert_eq!(
+            free_between(base, size, &holes),
+            vec![(base + G, 0x10_0000 - G), (base + 0x12_0000, size - 0x12_0000 - G)]
+        );
+        // Nothing held: the whole space is one free range.
+        assert_eq!(host_holes(base, size, &[], G), Vec::new());
+        assert_eq!(free_between(base, size, &[]), vec![(base, size)]);
+    }
 
     #[test]
     fn subtract_covers_head_tail_middle_and_everything() {

@@ -65,6 +65,11 @@ const VM_FLAGS_ANYWHERE: libc::c_int = 0x0001;
 const VM_INHERIT_NONE: libc::c_uint = 2;
 const VM_PROT_NONE: VmProt = 0;
 const TASK_VM_INFO: libc::c_int = 22;
+/// `VM_REGION_BASIC_INFO_64` from `<mach/vm_region.h>`, and its size in `int`s
+/// (`VM_REGION_BASIC_INFO_COUNT_64`). Only the region's extent is read, not the info.
+const VM_REGION_BASIC_INFO_64: libc::c_int = 9;
+const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+const KERN_INVALID_ADDRESS: KernReturn = 1;
 
 /// `task_vm_info_data_t` from `<mach/task_info.h>` up to its revision-2 fields, which is as far as
 /// this backend reads. `#pragma pack(4)` there: the two `integer_t`s after `virtual_size` keep
@@ -104,6 +109,15 @@ extern "C" {
     fn mach_vm_allocate(target: MachPort, address: *mut u64, size: u64, flags: libc::c_int)
         -> KernReturn;
     fn mach_vm_deallocate(target: MachPort, address: u64, size: u64) -> KernReturn;
+    fn mach_vm_region(
+        target: MachPort,
+        address: *mut u64,
+        size: *mut u64,
+        flavor: libc::c_int,
+        info: *mut libc::c_int,
+        info_count: *mut u32,
+        object_name: *mut MachPort,
+    ) -> KernReturn;
     fn mach_vm_protect(
         target: MachPort,
         address: u64,
@@ -345,6 +359,52 @@ fn reserve_inner(operation: &'static str, size: usize, align: usize, kind: Kind)
 
 pub(super) fn reserve(size: usize, align: usize) -> VmResult<usize> {
     reserve_inner("reserve", size, align, Kind::Plain)
+}
+
+/// Every region `mach_vm_region` reports in `[base, end)`. Unclipped and unmerged: the seam does
+/// that. `mach_vm_region` answers with the first region at or above the address asked about, so
+/// the walk steps from one region's end to the next and never visits free space.
+pub(super) fn occupied_ranges(base: usize, end: usize) -> VmResult<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    let mut cursor = base as u64;
+    let end = end as u64;
+    while cursor < end {
+        let mut address = cursor;
+        let mut size = 0u64;
+        let mut info = [0 as libc::c_int; VM_REGION_BASIC_INFO_COUNT_64 as usize];
+        let mut count = VM_REGION_BASIC_INFO_COUNT_64;
+        let mut object: MachPort = 0;
+        // SAFETY: every out-pointer is a live local of the size the call expects; `info` holds
+        // `count` ints, which is the basic-info-64 layout's size. Nothing in the task changes.
+        let kr = unsafe {
+            mach_vm_region(
+                task_self(),
+                &mut address,
+                &mut size,
+                VM_REGION_BASIC_INFO_64,
+                info.as_mut_ptr(),
+                &mut count,
+                &mut object,
+            )
+        };
+        if kr == KERN_INVALID_ADDRESS {
+            // Nothing at or above the cursor.
+            break;
+        }
+        if kr != KERN_SUCCESS {
+            return Err(refused("occupied_ranges", cursor as usize, (end - cursor) as usize, kr));
+        }
+        if address >= end {
+            break;
+        }
+        let region_end = address.saturating_add(size);
+        out.push((address as usize, region_end as usize));
+        if region_end <= cursor {
+            break;
+        }
+        cursor = region_end;
+    }
+    Ok(out)
 }
 
 pub(super) fn reserve_placeholder(size: usize, align: usize) -> VmResult<usize> {

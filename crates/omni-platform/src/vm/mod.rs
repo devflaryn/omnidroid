@@ -506,6 +506,48 @@ pub fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<Reservation>
     Ok(Reservation { base, len: size, kind: ReservationKind::Placeholder })
 }
 
+/// The parts of `[base, base + size)` this process already has something at: every range that is
+/// not free address space, as sorted, non-overlapping, non-adjacent `(start, end)` pairs clipped
+/// to the range asked about. An empty list means the whole range is free *as far as the host can
+/// tell*, right now -- another thread may take part of it the moment this returns.
+///
+/// Reserved, committed, mapped, image: all the same here, because what the caller wants to know
+/// is where it can *not* reserve. What it is for: a guest address space placed over a range the
+/// host holds parts of (Windows maps `KUSER_SHARED_DATA` at 0x7FFE_0000 in every process, in the
+/// middle of the low 4 GiB ART needs), which reserves the rest and steps around these.
+///
+/// Per host: Windows walks the range with `VirtualQuery` (anything not `MEM_FREE`, and anything
+/// past the highest address `VirtualQuery` will describe); Linux reads `/proc/self/maps`; macOS
+/// walks it with `mach_vm_region`. A host with no way to ask reports nothing known.
+///
+/// # Errors
+///
+/// [`VmError::ZeroSize`], or [`VmError::Os`] if the host refuses the walk.
+pub fn occupied_ranges(base: usize, size: usize) -> VmResult<Vec<(usize, usize)>> {
+    check_size("occupied_ranges", size)?;
+    let end = base.saturating_add(size);
+    Ok(clip_and_merge(backend::occupied_ranges(base, end)?, base, end))
+}
+
+/// `ranges` clipped to `[base, end)`, sorted, with overlapping and touching ranges merged and empty
+/// ones dropped: the shape [`occupied_ranges`] promises, whatever order and overlap a backend's walk
+/// produced them in.
+fn clip_and_merge(mut ranges: Vec<(usize, usize)>, base: usize, end: usize) -> Vec<(usize, usize)> {
+    for range in &mut ranges {
+        *range = (range.0.max(base), range.1.min(end));
+    }
+    ranges.retain(|&(start, stop)| start < stop);
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, stop) in ranges {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(stop),
+            _ => out.push((start, stop)),
+        }
+    }
+    out
+}
+
 /// Reserve address space as a *placeholder*, for later `MAP_FIXED`-style replacement.
 ///
 /// Like [`reserve`], this costs no commit charge. Unlike [`reserve`], the range can be
@@ -1308,4 +1350,17 @@ fn check_page_multiple(operation: &'static str, what: &'static str, value: u64) 
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clip_and_merge;
+
+    #[test]
+    fn occupied_ranges_are_clipped_sorted_and_merged() {
+        // Out of order, overlapping, touching, one straddling each end, one empty, one outside.
+        let raw = vec![(50, 60), (0, 15), (20, 30), (25, 40), (40, 45), (95, 200), (70, 70), (300, 400)];
+        assert_eq!(clip_and_merge(raw, 10, 100), vec![(10, 15), (20, 45), (50, 60), (95, 100)]);
+        assert_eq!(clip_and_merge(Vec::new(), 10, 100), Vec::new());
+    }
 }

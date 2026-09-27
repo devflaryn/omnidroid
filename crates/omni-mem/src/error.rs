@@ -139,6 +139,31 @@ pub enum MemError {
         unmapped_end: GuestAddr,
     },
 
+    /// An `unmap`, `protect` or `discard` reached into a range **the host** holds inside a space
+    /// reserved around it ([`GuestSpaceConfig::around_host`](crate::GuestSpaceConfig::around_host)).
+    ///
+    /// Refused as a whole, before anything changes: the parts of the request on either side of the
+    /// host's range are left as they were too. Doing the rest and skipping the hole would hand the
+    /// caller a half-done `munmap` it cannot tell from a whole one; the host's range is not the
+    /// guest's to unmap, so the request as made cannot be honoured, and the caller -- who can see
+    /// the hole in `region_at` / `mapped_regions` as a `RegionKind::Host` -- can split it.
+    #[error(
+        "`{operation}`: {address:#x}..{end:#x} reaches into {host_start:#x}..{host_end:#x}, which \
+         the host holds and this guest address space was reserved around; nothing was changed"
+    )]
+    HostOwned {
+        /// The operation that was called.
+        operation: &'static str,
+        /// Start of the requested range.
+        address: GuestAddr,
+        /// End of the requested range, exclusive.
+        end: GuestAddr,
+        /// Start of the host's range it reaches into.
+        host_start: GuestAddr,
+        /// End of that range, exclusive.
+        host_end: GuestAddr,
+    },
+
     /// An alignment argument was larger than the guest address space, so no address could satisfy
     /// it.
     ///

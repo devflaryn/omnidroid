@@ -25,6 +25,11 @@
 //! comparison against neighbours. [`EntryMap::check_invariants`] asserts all of it and is called
 //! from the tests after every interesting operation.
 //!
+//! A space reserved around the host (`GuestSpaceConfig::around_host`) also tiles the ranges the
+//! host holds, each as one ownerless [`OsState::Host`] entry that is *not* free. Those are fixed at
+//! construction and [`EntryMap::check_invariants`] asserts they still are, exactly: no operation
+//! may split, merge, free, replace or claim one, and a free run never spans one.
+//!
 //! # One more invariant, this one imposed by Windows
 //!
 //! A [`OsState::Placeholder`] entry is **exactly one OS placeholder**. That is not bookkeeping
@@ -75,12 +80,22 @@ pub(crate) enum OsState {
         /// Which OS view this entry belongs to. All entries of one view are contiguous.
         view: ViewId,
     },
+    /// Address space **the host** holds, inside the space's range: something was there before the
+    /// space was reserved around it ([`crate::GuestSpaceConfig::around_host`]) -- on Windows,
+    /// `KUSER_SHARED_DATA` at 0x7FFE_0000, which every process has. This process's reservation does
+    /// not cover it, so nothing here may ever touch it: it is never free, never mapped over, never
+    /// split, merged, unmapped, protected or released. Rounded out to the host's allocation
+    /// granularity, because the rest of a granule the host has used cannot be reserved either.
+    ///
+    /// Always ownerless, and never [`Entry::is_free`].
+    Host,
 }
 
 impl OsState {
     /// A short noun for diagnostics.
     pub(crate) fn describe(self) -> &'static str {
         match self {
+            OsState::Host => "held by the host",
             OsState::Placeholder => "reserved",
             OsState::Private { idle: false } => "private committed memory",
             OsState::Private { idle: true } => "private committed memory marked idle",
@@ -156,20 +171,33 @@ impl Entry {
         Self { len, os: OsState::Placeholder, owner: None, ever_writable: false }
     }
 
+    /// A range the host holds: see [`OsState::Host`].
+    pub(crate) fn host(len: usize) -> Self {
+        Self { len, os: OsState::Host, owner: None, ever_writable: false }
+    }
+
+    /// Free address space: ownerless, and this process's own. A [`OsState::Host`] entry is
+    /// ownerless too and is **not** free.
     pub(crate) fn is_free(&self) -> bool {
-        self.owner.is_none()
+        self.owner.is_none() && self.os != OsState::Host
+    }
+
+    /// Whether the host holds this range: see [`OsState::Host`].
+    pub(crate) fn is_host(&self) -> bool {
+        self.os == OsState::Host
     }
 
     /// Commit charge this entry is responsible for, ignoring page tables.
     pub(crate) fn committed_bytes(&self) -> usize {
         match self.os {
             OsState::Private { .. } => self.len,
-            OsState::Placeholder | OsState::View { .. } => 0,
+            OsState::Placeholder | OsState::View { .. } | OsState::Host => 0,
         }
     }
 
     pub(crate) fn describe(&self) -> &'static str {
         match (&self.owner, self.os) {
+            (None, OsState::Host) => "address space the host holds",
             (None, _) => "free address space",
             (Some(owner), os) => match (owner.backing.is_some(), os) {
                 (true, _) => "a file mapping",
@@ -186,14 +214,41 @@ pub(crate) struct EntryMap {
     base: GuestAddr,
     len: usize,
     entries: BTreeMap<GuestAddr, Entry>,
+    /// The ranges the host holds, `(start, len)` in address order, fixed for the life of the map.
+    /// Kept apart from `entries` so that [`check_invariants`](Self::check_invariants) can assert
+    /// that no operation has split, merged, freed or claimed one.
+    hosts: Vec<(GuestAddr, usize)>,
 }
 
 impl EntryMap {
-    /// A whole guest address space as one free entry.
-    pub(crate) fn new(base: GuestAddr, len: usize) -> Self {
+    /// A guest address space in which `hosts` -- sorted, non-overlapping, non-adjacent `(start,
+    /// len)` ranges inside it -- are [`OsState::Host`] entries, and every range between them is one
+    /// free entry. With no hosts, the whole space is one free entry.
+    pub(crate) fn with_hosts(base: GuestAddr, len: usize, hosts: Vec<(GuestAddr, usize)>) -> Self {
         let mut entries = BTreeMap::new();
-        entries.insert(base, Entry::free(len));
-        Self { base, len, entries }
+        let mut cursor = base;
+        for &(start, host_len) in &hosts {
+            assert!(start >= cursor && host_len > 0, "host ranges must be sorted and disjoint");
+            if start > cursor {
+                entries.insert(cursor, Entry::free(start - cursor));
+            }
+            entries.insert(start, Entry::host(host_len));
+            cursor = start + host_len;
+        }
+        assert!(cursor <= base + len, "a host range runs past the space");
+        if cursor < base + len {
+            entries.insert(cursor, Entry::free(base + len - cursor));
+        }
+        Self { base, len, entries, hosts }
+    }
+
+    /// The first range the host holds that overlaps `[address, address + len)`, as `(start, end)`.
+    pub(crate) fn host_overlapping(&self, address: GuestAddr, len: usize) -> Option<(GuestAddr, GuestAddr)> {
+        let end = address.saturating_add(len);
+        self.hosts
+            .iter()
+            .find(|&&(start, host_len)| start < end && address < start + host_len)
+            .map(|&(start, host_len)| (start, start + host_len))
     }
 
     pub(crate) fn base(&self) -> GuestAddr {
@@ -250,6 +305,7 @@ impl EntryMap {
     pub(crate) fn split_bookkeeping(&mut self, start: GuestAddr, at: GuestAddr) {
         let entry = self.entries.get_mut(&start).expect("split of a range with no entry");
         assert!(at > start && at < start + entry.len, "split at {at:#x} is not inside the entry");
+        assert!(!entry.is_host(), "a range the host holds is never split ({start:#x})");
         let tail_len = start + entry.len - at;
         entry.len = at - start;
         let tail = Entry {
@@ -274,6 +330,7 @@ impl EntryMap {
         for s in doomed {
             let removed = self.entries.remove(&s).expect("entry vanished");
             debug_assert!(s + removed.len <= end, "replace must end on an entry boundary");
+            assert!(!removed.is_host(), "a range the host holds is never replaced ({s:#x})");
         }
         self.entries.insert(start, entry);
     }
@@ -283,6 +340,7 @@ impl EntryMap {
         for s in self.starts_overlapping(start, len) {
             let entry = self.entries.get_mut(&s).expect("entry vanished");
             debug_assert!(s >= start && s + entry.len <= start + len);
+            assert!(!entry.is_host(), "a range the host holds is never freed ({s:#x})");
             entry.owner = None;
             entry.os = OsState::Placeholder;
             entry.ever_writable = false;
@@ -338,9 +396,21 @@ impl EntryMap {
             return;
         }
         let mut expected = self.base;
+        let mut hosts = self.hosts.iter();
         for (&start, entry) in &self.entries {
             assert_eq!(start, expected, "gap or overlap at {start:#x}, expected {expected:#x}");
             assert_ne!(entry.len, 0, "zero-length entry at {start:#x}");
+            // The host's ranges are exactly the entries recorded at construction, in order: none
+            // split, merged, freed, claimed by a mapping or made up since.
+            if entry.is_host() {
+                assert_eq!(
+                    hosts.next(),
+                    Some(&(start, entry.len)),
+                    "a host entry at {start:#x}+{:#x} is not one the host was found holding",
+                    entry.len
+                );
+                assert!(entry.owner.is_none() && !entry.ever_writable, "host entry {start:#x} is claimed");
+            }
             if let Some(owner) = &entry.owner {
                 assert!(
                     start >= owner.mapping_start
@@ -363,5 +433,6 @@ impl EntryMap {
             expected = start + entry.len;
         }
         assert_eq!(expected, self.end(), "the region map ends at {expected:#x}, not {:#x}", self.end());
+        assert_eq!(hosts.next(), None, "a range the host holds has no entry any more");
     }
 }

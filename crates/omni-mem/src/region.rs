@@ -14,6 +14,16 @@ pub enum RegionKind {
     /// Address space this guest space owns with nothing mapped in it. Reported so that a consumer
     /// can see the whole space accounted for; `/proc/self/maps` would simply omit these.
     Free,
+    /// Inside the space's range but **held by the host**, not by this space: something was there
+    /// when the space was reserved around it ([`GuestSpaceConfig::around_host`]) -- on Windows,
+    /// `KUSER_SHARED_DATA` at 0x7FFE_0000. In use by someone else: never free, nothing can be
+    /// mapped over it, and `unmap`, `protect` and `discard` over it are refused
+    /// ([`MemError::HostOwned`]). Its protection reads [`Protection::None`] because the guest may
+    /// not touch it, whatever the host's own protection is.
+    ///
+    /// [`GuestSpaceConfig::around_host`]: crate::GuestSpaceConfig::around_host
+    /// [`MemError::HostOwned`]: crate::MemError::HostOwned
+    Host,
     /// Anonymous memory, the guest's `mmap(MAP_ANONYMOUS)`.
     Anonymous,
     /// Memory mapped from a file.
@@ -95,7 +105,7 @@ impl RegionInfo {
                 start,
                 len: entry.len,
                 protection: Protection::None,
-                kind: RegionKind::Free,
+                kind: if entry.os == OsState::Host { RegionKind::Host } else { RegionKind::Free },
                 committed: 0,
                 mapping: None,
                 mapping_start: start,
@@ -119,7 +129,7 @@ impl RegionInfo {
                     kind,
                     committed: match entry.os {
                         OsState::Private { .. } => entry.len,
-                        OsState::Placeholder | OsState::View { .. } => 0,
+                        OsState::Placeholder | OsState::View { .. } | OsState::Host => 0,
                     },
                     mapping: Some(owner.id),
                     mapping_start: owner.mapping_start,

@@ -7016,6 +7016,7 @@ fn boot_the_compression_library(guest: &Guest, cpu: &mut DynarmicCpu) {
                         omni_mem::RegionKind::File { name, .. } => format!("{}", name),
                         omni_mem::RegionKind::Anonymous => "anonymous".to_string(),
                         omni_mem::RegionKind::Free => "free space".to_string(),
+                        omni_mem::RegionKind::Host => "held by the host".to_string(),
                     };
                     format!(
                         "{:?} {} at {:#x}+{:#x} in the region from {:#x}",

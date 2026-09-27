@@ -406,7 +406,7 @@ pub fn admits_region(
     len: usize,
     access: FaultAccess,
 ) -> Result<(), Refusal> {
-    if region.is_free() {
+    if region.is_free() || region.kind == RegionKind::Host {
         return Err(Refusal::NotMapped);
     }
     let Some(access_end) = address.checked_add(len) else {
@@ -514,6 +514,15 @@ mod tests {
         for access in [FaultAccess::Read, FaultAccess::Write, FaultAccess::Execute] {
             assert_eq!(
                 admits_region(&free, free.start, 1, access),
+                Err(Refusal::NotMapped),
+                "{access}"
+            );
+        }
+        // A range the host holds is not the guest's either, whatever it carries.
+        let host = RegionInfo { kind: RegionKind::Host, ..free };
+        for access in [FaultAccess::Read, FaultAccess::Write, FaultAccess::Execute] {
+            assert_eq!(
+                admits_region(&host, host.start, 1, access),
                 Err(Refusal::NotMapped),
                 "{access}"
             );
