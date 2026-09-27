@@ -1,0 +1,11 @@
+<!--
+    omnidroid's graphics HALs. The allocator is served by the host (omni-linux, src/hal/gralloc.rs)
+    on the binder broker; its in-process mapper is /vendor/lib64/hw/mapper.omni.so.
+-->
+<manifest version="8.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.graphics.allocator</name>
+        <version>2</version>
+        <fqname>IAllocator/default</fqname>
+    </hal>
+</manifest>

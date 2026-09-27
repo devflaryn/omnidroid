@@ -7,6 +7,7 @@
 pub mod apex;
 pub mod binder;
 pub mod boot;
+pub mod device;
 pub mod errno;
 pub mod exec;
 pub mod fd;

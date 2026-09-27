@@ -25,6 +25,8 @@ const MAX_LINKS: usize = 40;
 
 pub struct Sysroot {
     objects: PathBuf,
+    /// Where the device overlay's files are on the host, by sha256 ([`crate::device`]).
+    overlay: HashMap<String, PathBuf>,
     manifest: Manifest,
     children: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     backings: Mutex<HashMap<Vec<u8>, Arc<Backing>>>,
@@ -42,7 +44,7 @@ impl Sysroot {
             ));
         }
         let text = String::from_utf8(bytes).map_err(|_| "sysroot.manifest is not UTF-8".to_string())?;
-        let manifest = manifest::parse(&text)?;
+        let mut manifest = manifest::parse(&text)?;
         for entry in manifest.entries.values() {
             if let Entry::File { size, sha256, .. } = entry {
                 let host = object_path(&dir.join("objects"), sha256);
@@ -52,11 +54,26 @@ impl Sysroot {
                 }
             }
         }
-        Ok(Self::from_manifest(dir, manifest))
+        // omnidroid's device overlay, over the image: its files where the image has none.
+        let mut overlay = HashMap::new();
+        for file in crate::device::materialize()? {
+            if manifest.entries.contains_key(&file.guest) {
+                return Err(format!("the device overlay's {} is also in the image", String::from_utf8_lossy(&file.guest)));
+            }
+            if let Entry::File { sha256, .. } = &file.entry {
+                overlay.insert(sha256.clone(), file.host);
+            }
+            manifest.entries.insert(file.guest, file.entry);
+        }
+        Ok(Self::build(dir, manifest, overlay))
     }
 
     #[must_use]
     pub fn from_manifest(dir: &Path, manifest: Manifest) -> Arc<Self> {
+        Self::build(dir, manifest, HashMap::new())
+    }
+
+    fn build(dir: &Path, manifest: Manifest, overlay: HashMap<String, PathBuf>) -> Arc<Self> {
         let mut children: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
         for path in manifest.entries.keys() {
             if path.as_slice() == b"/" {
@@ -66,7 +83,7 @@ impl Sysroot {
             let parent = if cut == 0 { b"/".to_vec() } else { path[..cut].to_vec() };
             children.entry(parent).or_default().push(path[cut + 1..].to_vec());
         }
-        Arc::new(Self { objects: dir.join("objects"), manifest, children, backings: Mutex::default() })
+        Arc::new(Self { objects: dir.join("objects"), overlay, manifest, children, backings: Mutex::default() })
     }
 
     /// The names in a sysroot directory.
@@ -91,7 +108,7 @@ impl Sysroot {
     #[must_use]
     pub fn host_path(&self, guest: &[u8]) -> Option<PathBuf> {
         match self.entry(guest)? {
-            Entry::File { sha256, .. } => Some(object_path(&self.objects, sha256)),
+            Entry::File { sha256, .. } => Some(self.overlay.get(sha256).cloned().unwrap_or_else(|| object_path(&self.objects, sha256))),
             _ => None,
         }
     }
