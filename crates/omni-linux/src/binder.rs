@@ -93,8 +93,41 @@ const HOST_EUID: u32 = 1000;
 /// How long the host waits for a reply before giving up on it.
 const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A host service: given a transaction's code and parcel, the reply's parcel.
-type HostHandler = Arc<dyn Fn(u32, &[u8]) -> Vec<u8> + Send + Sync>;
+/// A transaction to a host service, its objects already translated for the host: a binder the
+/// sender passed is a handle in the host's table, a file descriptor is the sender's open file.
+pub struct HostCall {
+    pub code: u32,
+    pub data: Vec<u8>,
+    /// Where each object is in `data`.
+    pub offsets: Vec<u64>,
+    /// The file descriptors it carried, in object order.
+    pub fds: Vec<Arc<OpenFile>>,
+    /// The binder handles it carried (in the host's table), in object order.
+    pub handles: Vec<u32>,
+    pub sender_pid: i32,
+    pub sender_euid: u32,
+}
+
+/// A host service's reply: its parcel, the files to send as the `TYPE_FD` objects at the given
+/// offsets of `data`, and the offsets of binder objects in it (a host service's `ptr` as a
+/// `TYPE_BINDER`, or a handle of the host's as a `TYPE_HANDLE`), translated for the caller.
+#[derive(Default)]
+pub struct HostReply {
+    pub data: Vec<u8>,
+    pub fds: Vec<(usize, Arc<OpenFile>)>,
+    pub binders: Vec<usize>,
+}
+
+impl HostReply {
+    /// A reply of bytes only.
+    #[must_use]
+    pub fn bytes(data: Vec<u8>) -> Self {
+        Self { data, ..Self::default() }
+    }
+}
+
+/// A host service: given a transaction, its reply.
+type HostHandler = Arc<dyn Fn(HostCall) -> HostReply + Send + Sync>;
 
 thread_local! {
     /// On a thread running a host service's handler: the guest thread waiting for its reply, which
@@ -315,10 +348,27 @@ impl State {
     }
 }
 
-impl Txn {
-    /// A host service's reply: bytes only.
-    fn reply_from_host(data: Vec<u8>) -> Self {
-        Self {
+impl State {
+    /// A host service's reply as `caller` receives it: its binder objects translated for the
+    /// caller, its files attached. `EINVAL` for an object that is not where the reply says.
+    fn reply_from_host(&mut self, caller: ProcId, reply: HostReply) -> Result<Txn, Errno> {
+        let HostReply { mut data, fds, binders } = reply;
+        let mut offsets: Vec<u64> = Vec::with_capacity(fds.len() + binders.len());
+        for &off in &binders {
+            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
+            if let Some(to) = self.translate_ref((HOST, 0), caller, &obj)? {
+                rewrite_ref(&mut data, off, to);
+            }
+            offsets.push(off as u64);
+        }
+        for (off, _) in &fds {
+            if data.get(*off..off + 24).map(|o| u32_at(o, 0)) != Some(TYPE_FD) {
+                return Err(EINVAL);
+            }
+            offsets.push(*off as u64);
+        }
+        offsets.sort_unstable();
+        Ok(Txn {
             reply: true,
             oneway: false,
             from: None,
@@ -330,11 +380,11 @@ impl Txn {
             sender_pid: 0,
             sender_euid: HOST_EUID,
             data,
-            offsets: Vec::new(),
-            fds: Vec::new(),
+            offsets,
+            fds,
             sg: Vec::new(),
             fda: Vec::new(),
-        }
+        })
     }
 }
 
@@ -350,6 +400,12 @@ impl Broker {
     /// answers. Its `ptr` (the node's binder in a parcel) is returned; the service lives as long as
     /// the broker.
     pub fn create_host_service(&self, handler: impl Fn(u32, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> u64 {
+        self.create_host_service_objects(move |call| HostReply::bytes(handler(call.code, &call.data)))
+    }
+
+    /// A host service that sees the objects a transaction carries and may send objects back
+    /// ([`HostCall`], [`HostReply`]).
+    pub fn create_host_service_objects(&self, handler: impl Fn(HostCall) -> HostReply + Send + Sync + 'static) -> u64 {
         let mut st = self.state.lock();
         st.proc_mut(HOST);
         st.next_host_ptr += 1;
@@ -430,9 +486,18 @@ impl Broker {
     /// # Errors
     /// The transaction's failure, or the exception `servicemanager` answered with.
     pub fn add_service(&self, name: &str, ptr: u64) -> Result<(), String> {
+        self.add_service_with_stability(name, ptr, STABILITY_SYSTEM)
+    }
+
+    /// [`Self::add_service`] with the stability written after the binder: [`STABILITY_VINTF`] for a
+    /// HAL, which `servicemanager` then requires to be declared in the VINTF manifest.
+    ///
+    /// # Errors
+    /// The transaction's failure, or the exception `servicemanager` answered with.
+    pub fn add_service_with_stability(&self, name: &str, ptr: u64, stability: i32) -> Result<(), String> {
         let mut parcel = Parcel::with_interface_token(SERVICE_MANAGER);
         parcel.string16(name);
-        let object = parcel.binder(ptr, STABILITY_SYSTEM);
+        let object = parcel.binder(ptr, stability);
         parcel.i32(0); // allowIsolated
         parcel.i32(DUMP_FLAG_PRIORITY_DEFAULT);
         let reply = self.host_transact(0, ADD_SERVICE, parcel.bytes, &[object]).map_err(|e| format!("transaction: errno {}", e.0))?;
@@ -450,7 +515,9 @@ const ADD_SERVICE: u32 = 3;
 /// `IServiceManager.DUMP_FLAG_PRIORITY_DEFAULT`.
 const DUMP_FLAG_PRIORITY_DEFAULT: i32 = 1 << 3;
 /// libbinder's `Stability::Level::SYSTEM`, written after a binder in a parcel.
-const STABILITY_SYSTEM: i32 = 0b00_1100;
+pub const STABILITY_SYSTEM: i32 = 0b00_1100;
+/// libbinder's `Stability::Level::VINTF`: a HAL's binder, usable from the system and vendor sides.
+pub const STABILITY_VINTF: i32 = 0b11_1111;
 /// libbinder's interface header for the system partition, `'SYST'`.
 const INTERFACE_HEADER_SYSTEM: i32 = 0x5359_5354;
 /// The strict-mode word libbinder's `writeInterfaceToken` leads with (as `service call` sends it).
@@ -907,16 +974,35 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         let handler = st.host_services.get(&target_ptr).cloned();
         st.queue(file.id, Some(t.tid), Work::Complete);
         drop(st);
-        let (broker, caller, data) = (Arc::clone(&file.broker), (file.id, t.tid), txn.data);
+        let handles = txn
+            .offsets
+            .iter()
+            .filter_map(|&off| {
+                let obj = txn.data.get(off as usize..off as usize + 16)?;
+                matches!(u32_at(obj, 0), TYPE_HANDLE | TYPE_WEAK_HANDLE).then(|| u32_at(obj, 8))
+            })
+            .collect();
+        let call = HostCall {
+            code,
+            fds: txn.fds.into_iter().map(|(_, f)| f).collect(),
+            handles,
+            offsets: txn.offsets,
+            data: txn.data,
+            sender_pid: txn.sender_pid,
+            sender_euid: txn.sender_euid,
+        };
+        let (broker, caller) = (Arc::clone(&file.broker), (file.id, t.tid));
         std::thread::Builder::new()
             .name("omni-binder-host".into())
             .spawn(move || {
                 HOST_SERVING.with(|s| s.set(Some(caller)));
-                let reply_data = handler.map(|h| h(code, &data)).unwrap_or_default();
+                let reply = handler.map_or_else(HostReply::default, |h| h(call));
                 if !oneway {
                     let mut st = broker.state.lock();
                     if st.procs.get(&caller.0).is_some_and(|pr| !pr.dead) {
-                        st.queue(caller.0, Some(caller.1), Work::Txn(Box::new(Txn::reply_from_host(reply_data))));
+                        // A reply the host built wrong fails the call, as a malformed reply would.
+                        let work = st.reply_from_host(caller.0, reply).map_or(Work::FailedReply, |r| Work::Txn(Box::new(r)));
+                        st.queue(caller.0, Some(caller.1), work);
                     }
                 }
             })
