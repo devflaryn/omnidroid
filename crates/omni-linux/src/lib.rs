@@ -9,6 +9,7 @@ pub mod binder;
 pub mod boot;
 pub mod bpf;
 pub mod device;
+pub mod dnsproxy;
 pub mod errno;
 pub mod exec;
 pub mod fd;

@@ -89,6 +89,9 @@ pub enum Peer {
     Inet(Arc<crate::inet::Port>),
     /// A TCP or UDP socket: a host socket on the host's network (`crate::hostnet`).
     Host(Arc<crate::hostnet::Host>),
+    /// netd's DNS proxy, answered by the kernel where nothing in this host process is bound to
+    /// `/dev/socket/dnsproxyd` (`crate::dnsproxy`).
+    Dns(Arc<crate::dnsproxy::Proxy>),
     /// The other end of a socket pair.
     Pair { channel: Arc<PairChannel>, side: usize },
     /// `logd`: packets are printed to this output.
@@ -232,6 +235,7 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
         }
         Some(Peer::Bound(_) | Peer::Inet(_)) => Err(ENOTCONN),
         Some(Peer::Host(h)) => h.try_send(bytes),
+        Some(Peer::Dns(proxy)) => Ok(proxy.send(bytes)),
         Some(Peer::Pair { channel, side }) => {
             let other = 1 - *side;
             if !channel.open[other].load(std::sync::atomic::Ordering::SeqCst) {
@@ -331,6 +335,13 @@ fn sys_connect(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     // service above stay the kernel's own: the log is printed where the runtime shows it.)
     if let Some(server) = crate::unix::Bound::find(instance_of(p), &path) {
         return server.connect(socket, cred_of(p)).map(|()| 0);
+    }
+    // No netd in this host process (an app's): the kernel answers its DNS proxy. (fwmarkd is not
+    // answered: libnetd_client's FwmarkClient::send takes a failed connect as "no error".)
+    if path == b"/dev/socket/dnsproxyd" && socket.ty == 1 {
+        let hosts = p.vfs.sysroot().read(b"/system/etc/hosts").unwrap_or_default();
+        socket.peer = Some(Peer::Dns(crate::dnsproxy::Proxy::new(&hosts)));
+        return Ok(0);
     }
     if p.trace {
         eprintln!("[socket] connect {:?}: no service", String::from_utf8_lossy(&path));
@@ -583,6 +594,9 @@ pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
     if let Some(Peer::Host(host)) = &socket.peer {
         return host.try_recv(buf);
     }
+    if let Some(Peer::Dns(proxy)) = &socket.peer {
+        return proxy.receive(buf);
+    }
     if let Some(Peer::Bound(bound)) = &socket.peer {
         return bound.receive(buf).ok_or(crate::errno::EAGAIN);
     }
@@ -746,7 +760,7 @@ fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) ->
         let (r, pair) = {
             let mut kind = file.kind.lock();
             let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
-            (receive(socket, buf), matches!(socket.peer, Some(Peer::Pair { .. } | Peer::Bound(_))) || socket.domain == AF_NETLINK)
+            (receive(socket, buf), matches!(socket.peer, Some(Peer::Pair { .. } | Peer::Bound(_) | Peer::Dns(_))) || socket.domain == AF_NETLINK)
         };
         let nonblocking = dontwait || *file.flags.lock() & 0o4000 != 0;
         match r {
@@ -761,7 +775,7 @@ pub fn read(file: &OpenFile, buf: &mut [u8], t: &Task) -> Option<Result<usize, E
     if let Some(host) = host_of(file) {
         return Some(host.recv(buf, 0, nonblocking(file), t).map(|(n, _)| n));
     }
-    let pair = matches!(&*file.kind.lock(), FileKind::Socket(Socket { peer: Some(Peer::Pair { .. }), .. }));
+    let pair = matches!(&*file.kind.lock(), FileKind::Socket(Socket { peer: Some(Peer::Pair { .. } | Peer::Dns(_)), .. }));
     pair.then(|| receive_waiting(file, buf, false, t))
 }
 
@@ -776,6 +790,9 @@ pub fn write(file: &OpenFile, bytes: &[u8], t: &Task) -> Option<Result<usize, Er
 pub fn available(socket: &Socket) -> usize {
     if let Some(Peer::Host(host)) = &socket.peer {
         return host.available();
+    }
+    if let Some(Peer::Dns(proxy)) = &socket.peer {
+        return proxy.available();
     }
     if let Some(Peer::Pair { channel, side }) = &socket.peer {
         let queues = channel.queues.lock();
@@ -794,6 +811,7 @@ pub fn readiness(socket: &Socket) -> u32 {
     const HUP: u32 = 0x10;
     match &socket.peer {
         Some(Peer::Host(host)) => host.readiness(),
+        Some(Peer::Dns(proxy)) => (if proxy.available() > 0 { IN } else { 0 }) | OUT,
         Some(Peer::Bound(bound)) => if bound.ready() { IN } else { 0 },
         Some(Peer::Dgram(_)) => OUT,
         Some(Peer::Pair { channel, side }) => {
