@@ -29,6 +29,24 @@ fn main() -> ExitCode {
             }
         }
     }
+    let config = SpawnConfig {
+        sysroot: sysroot.clone(),
+        instance_dir: instance.clone(),
+        argv,
+        envp: envp.clone(),
+        stdout: Output::Host,
+        stderr: Output::Host,
+        trace: std::env::var("OMNI_SYSCALL_TRACE").as_deref() == Ok("1"),
+    };
+    let p = match Process::spawn(config) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("omni-linux-run: {e}");
+            return ExitCode::from(127);
+        }
+    };
+    // The daemons after the program: the program reserves its address space first, where ART
+    // needs it (below 4 GiB); a native daemon lives anywhere.
     let mut daemons = Vec::new();
     for service in &services {
         let config = SpawnConfig {
@@ -55,22 +73,6 @@ fn main() -> ExitCode {
     if !daemons.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
-    let config = SpawnConfig {
-        sysroot,
-        instance_dir: instance,
-        argv,
-        envp,
-        stdout: Output::Host,
-        stderr: Output::Host,
-        trace: std::env::var("OMNI_SYSCALL_TRACE").as_deref() == Ok("1"),
-    };
-    let p = match Process::spawn(config) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("omni-linux-run: {e}");
-            return ExitCode::from(127);
-        }
-    };
     let status = p.run();
     // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.
     if std::env::var("OMNI_VERIFY_MAPS").as_deref() == Ok("1") {
