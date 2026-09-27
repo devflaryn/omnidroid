@@ -55,6 +55,15 @@ pub(crate) fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task)
     Ok(())
 }
 
+/// [`wait_for_change`] for a host thread, which has no signals to see: until `deadline` at the
+/// latest.
+pub(crate) fn wait_for_change_host(seen: u64, deadline: Instant) {
+    let mut generation = CHANGED.generation.lock();
+    if *generation == seen {
+        CHANGED.cv.wait_until(&mut generation, deadline);
+    }
+}
+
 pub(crate) fn generation() -> u64 {
     *CHANGED.generation.lock()
 }

@@ -10,10 +10,11 @@
 //! arrives as the binder; a file descriptor arrives as a new descriptor in the receiver.
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::errno::{Errno, SysResult, EAGAIN, EFAULT, EINVAL, ENOMEM};
+use crate::errno::{Errno, SysResult, EAGAIN, EFAULT, EINVAL, ENOMEM, EPIPE, ETIMEDOUT};
 use crate::fd::OpenFile;
 use crate::process::{Process, Task};
 
@@ -83,6 +84,17 @@ const SECCTX: &[u8] = b"u:r:untrusted_app:s0\0";
 
 type ProcId = u64;
 type NodeId = u64;
+
+/// The host: the owner of host services' nodes and the sender of the host's own transactions. A
+/// guest's id counts up from 1, so never meets it.
+const HOST: ProcId = u64::MAX;
+/// The uid the host's transactions come from: `system`, as a platform service's are.
+const HOST_EUID: u32 = 1000;
+/// How long the host waits for a reply before giving up on it.
+const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A host service: given a transaction's code and parcel, the reply's parcel.
+type HostHandler = Arc<dyn Fn(u32, &[u8]) -> Vec<u8> + Send + Sync>;
 
 struct Node {
     owner: ProcId,
@@ -167,6 +179,11 @@ struct State {
     context_mgr: Option<NodeId>,
     next_proc: ProcId,
     next_node: NodeId,
+    /// Host services, by their node's `ptr`.
+    host_services: HashMap<u64, HostHandler>,
+    next_host_ptr: u64,
+    /// The host's transactions each wait as a thread of [`HOST`] of their own.
+    next_host_tid: i32,
 }
 
 /// The cross-process part of the driver.
@@ -251,6 +268,35 @@ impl State {
         id
     }
 
+    /// A binder or handle object `sender` sends to `target`, as the target receives it: the new
+    /// (type, binder or handle, cookie), or `None` when it arrives unchanged.
+    fn translate_ref(&mut self, sender: (ProcId, i32), target: ProcId, obj: &[u8]) -> Result<Option<(u32, u64, u64)>, Errno> {
+        let (kind, flags) = (u32_at(obj, 0), u32_at(obj, 4));
+        let (ptr, cookie) = (u64_at(obj, 8), u64_at(obj, 16));
+        match kind {
+            TYPE_BINDER | TYPE_WEAK_BINDER => {
+                let node = self.local_node(sender.0, ptr, cookie, flags);
+                if target == sender.0 {
+                    return Ok(None);
+                }
+                let h = self.handle_for(target, node, Some(sender));
+                Ok(Some((if kind == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE }, u64::from(h), 0)))
+            }
+            TYPE_HANDLE | TYPE_WEAK_HANDLE => {
+                let node = self.node_for_handle(sender.0, ptr as u32).ok_or(EINVAL)?;
+                let n = self.nodes.get(&node).expect("a node");
+                if n.owner == target {
+                    let kind = if kind == TYPE_HANDLE { TYPE_BINDER } else { TYPE_WEAK_BINDER };
+                    Ok(Some((kind, n.ptr, n.cookie)))
+                } else {
+                    let h = self.handle_for(target, node, Some(sender));
+                    Ok(Some((kind, u64::from(h), 0)))
+                }
+            }
+            _ => Err(EINVAL),
+        }
+    }
+
     /// Queue work for a thread of `id`: `tid`'s own queue when given, the process's otherwise.
     fn queue(&mut self, id: ProcId, tid: Option<i32>, work: Work) {
         let proc = self.proc_mut(id);
@@ -260,6 +306,200 @@ impl State {
         }
         crate::poll::notify();
     }
+}
+
+impl Txn {
+    /// A host service's reply: bytes only.
+    fn reply_from_host(data: Vec<u8>) -> Self {
+        Self {
+            reply: true,
+            oneway: false,
+            from: None,
+            target_ptr: 0,
+            target_cookie: 0,
+            secctx: false,
+            code: 0,
+            flags: 0,
+            sender_pid: 0,
+            sender_euid: HOST_EUID,
+            data,
+            offsets: Vec::new(),
+            fds: Vec::new(),
+            sg: Vec::new(),
+            fda: Vec::new(),
+        }
+    }
+}
+
+/// Write a translated binder or handle object (type, binder or handle, cookie) at `off`.
+fn rewrite_ref(data: &mut [u8], off: usize, (kind, value, cookie): (u32, u64, u64)) {
+    data[off..off + 4].copy_from_slice(&kind.to_le_bytes());
+    data[off + 8..off + 16].copy_from_slice(&value.to_le_bytes());
+    data[off + 16..off + 24].copy_from_slice(&cookie.to_le_bytes());
+}
+
+impl Broker {
+    /// A binder service served by the host: a node owned by [`HOST`] whose transactions `handler`
+    /// answers. Its `ptr` (the node's binder in a parcel) is returned; the service lives as long as
+    /// the broker.
+    pub fn create_host_service(&self, handler: impl Fn(u32, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> u64 {
+        let mut st = self.state.lock();
+        st.proc_mut(HOST);
+        st.next_host_ptr += 1;
+        let ptr = st.next_host_ptr;
+        st.host_services.insert(ptr, Arc::new(handler));
+        let node = st.local_node(HOST, ptr, ptr, 0);
+        // Held from the start: the host has no looper to hear `BR_INCREFS`/`BR_ACQUIRE`.
+        st.nodes.get_mut(&node).expect("the node").held = true;
+        ptr
+    }
+
+    /// A sync transaction from the host to `handle` (in the host's handle table; 0 is the context
+    /// manager): the reply's parcel. `data` may carry the host's own services as binder objects,
+    /// at `offsets`.
+    ///
+    /// # Errors
+    /// `EINVAL` for an unknown handle or an object that is not a binder or handle, `EPIPE` when the
+    /// target is dead or dies before replying, `ETIMEDOUT` when no reply comes in time.
+    pub fn host_transact(&self, handle: u32, code: u32, mut data: Vec<u8>, offsets: &[u64]) -> Result<Vec<u8>, Errno> {
+        let mut st = self.state.lock();
+        st.proc_mut(HOST);
+        st.next_host_tid += 1;
+        let tid = st.next_host_tid;
+        let node = st.node_for_handle(HOST, handle).ok_or(EINVAL)?;
+        let n = st.nodes.get(&node).expect("a node");
+        let (target, ptr, cookie, secctx, dead) = (n.owner, n.ptr, n.cookie, n.txn_security_ctx, n.dead);
+        if dead || st.procs.get(&target).is_none_or(|pr| pr.dead) {
+            return Err(EPIPE);
+        }
+        for &off in offsets {
+            let off = off as usize;
+            let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
+            if let Some(to) = st.translate_ref((HOST, tid), target, &obj)? {
+                rewrite_ref(&mut data, off, to);
+            }
+        }
+        let txn = Txn {
+            reply: false,
+            oneway: false,
+            from: Some((HOST, tid)),
+            target_ptr: ptr,
+            target_cookie: cookie,
+            secctx,
+            code,
+            flags: 0,
+            sender_pid: 0,
+            sender_euid: HOST_EUID,
+            data,
+            offsets: offsets.to_vec(),
+            fds: Vec::new(),
+            sg: Vec::new(),
+            fda: Vec::new(),
+        };
+        st.queue(target, None, Work::Txn(Box::new(txn)));
+        let deadline = Instant::now() + HOST_REPLY_TIMEOUT;
+        let result = loop {
+            let seen = crate::poll::generation();
+            let work = st.proc_mut(HOST).threads.entry(tid).or_default().todo.pop_front();
+            match work {
+                Some(Work::Txn(r)) if r.reply => break Ok(r.data),
+                Some(Work::DeadReply | Work::FailedReply) => break Err(EPIPE),
+                Some(_) => continue,
+                None if Instant::now() >= deadline => break Err(ETIMEDOUT),
+                None => {
+                    drop(st);
+                    crate::poll::wait_for_change_host(seen, deadline);
+                    st = self.state.lock();
+                }
+            }
+        };
+        st.proc_mut(HOST).threads.remove(&tid);
+        result
+    }
+
+    /// Publish host service `ptr` as `name` with `servicemanager` (`IServiceManager.addService`).
+    ///
+    /// # Errors
+    /// The transaction's failure, or the exception `servicemanager` answered with.
+    pub fn add_service(&self, name: &str, ptr: u64) -> Result<(), String> {
+        let mut parcel = Parcel::with_interface_token(SERVICE_MANAGER);
+        parcel.string16(name);
+        let object = parcel.binder(ptr, STABILITY_SYSTEM);
+        parcel.i32(0); // allowIsolated
+        parcel.i32(DUMP_FLAG_PRIORITY_DEFAULT);
+        let reply = self.host_transact(0, ADD_SERVICE, parcel.bytes, &[object]).map_err(|e| format!("transaction: errno {}", e.0))?;
+        match reply.get(0..4).map(|b| i32::from_le_bytes(b.try_into().expect("4"))) {
+            Some(0) => Ok(()),
+            Some(exception) => Err(format!("exception {exception}: {}", read_string16(&reply, 4).unwrap_or_default())),
+            None => Err("an empty reply".into()),
+        }
+    }
+}
+
+/// `IServiceManager`'s interface token and the transaction codes of its AIDL (Android 15).
+const SERVICE_MANAGER: &str = "android.os.IServiceManager";
+const ADD_SERVICE: u32 = 3;
+/// `IServiceManager.DUMP_FLAG_PRIORITY_DEFAULT`.
+const DUMP_FLAG_PRIORITY_DEFAULT: i32 = 1 << 3;
+/// libbinder's `Stability::Level::SYSTEM`, written after a binder in a parcel.
+const STABILITY_SYSTEM: i32 = 0b00_1100;
+/// libbinder's interface header for the system partition, `'SYST'`.
+const INTERFACE_HEADER_SYSTEM: i32 = 0x5359_5354;
+/// The strict-mode word libbinder's `writeInterfaceToken` leads with (as `service call` sends it).
+const STRICT_MODE_PENALTY_GATHER: i32 = i32::MIN;
+/// `IBinder::UNSET_WORKSOURCE`.
+const UNSET_WORK_SOURCE: i32 = -1;
+const FLAT_BINDER_FLAG_ACCEPTS_FDS: u32 = 0x100;
+
+/// A parcel as libbinder writes one, for the host's transactions.
+struct Parcel {
+    bytes: Vec<u8>,
+}
+
+impl Parcel {
+    /// `Parcel::writeInterfaceToken`, byte for byte as the image's libbinder writes it: strict-mode
+    /// policy, work source, the partition header, the interface's name.
+    fn with_interface_token(interface: &str) -> Self {
+        let mut p = Self { bytes: Vec::new() };
+        p.i32(STRICT_MODE_PENALTY_GATHER);
+        p.i32(UNSET_WORK_SOURCE);
+        p.i32(INTERFACE_HEADER_SYSTEM);
+        p.string16(interface);
+        p
+    }
+
+    fn i32(&mut self, v: i32) {
+        self.bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Its length in UTF-16 units, the units and a NUL, padded to 4 bytes.
+    fn string16(&mut self, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().chain([0]).collect();
+        self.i32(units.len() as i32 - 1);
+        for u in units {
+            self.bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        self.bytes.resize((self.bytes.len() + 3) & !3, 0);
+    }
+
+    /// `writeStrongBinder` of host service `ptr`: a `flat_binder_object` and its stability. The
+    /// object's offset, for the offsets array.
+    fn binder(&mut self, ptr: u64, stability: i32) -> u64 {
+        let at = self.bytes.len() as u64;
+        self.bytes.extend_from_slice(&TYPE_BINDER.to_le_bytes());
+        self.bytes.extend_from_slice(&FLAT_BINDER_FLAG_ACCEPTS_FDS.to_le_bytes());
+        self.bytes.extend_from_slice(&ptr.to_le_bytes());
+        self.bytes.extend_from_slice(&ptr.to_le_bytes());
+        self.i32(stability);
+        at
+    }
+}
+
+/// A `String16` at `at` in a parcel.
+fn read_string16(b: &[u8], at: usize) -> Option<String> {
+    let len = usize::try_from(i32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?)).ok()?;
+    let units: Vec<u16> = b.get(at + 4..at + 4 + len * 2)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
 fn u32_at(b: &[u8], at: usize) -> u32 {
@@ -613,37 +853,14 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
             continue;
         }
         let obj = data.get(off..off + 24).ok_or(EINVAL)?.to_vec();
-        let kind = u32_at(&obj, 0);
-        let (ptr, cookie) = (u64_at(&obj, 8), u64_at(&obj, 16));
-        let rewrite = |data: &mut Vec<u8>, kind: u32, value: u64, cookie: u64| {
-            data[off..off + 4].copy_from_slice(&kind.to_le_bytes());
-            data[off + 8..off + 16].copy_from_slice(&value.to_le_bytes());
-            data[off + 16..off + 24].copy_from_slice(&cookie.to_le_bytes());
-        };
-        match kind {
-            TYPE_BINDER | TYPE_WEAK_BINDER => {
-                let node = st.local_node(file.id, ptr, cookie, u32_at(&obj, 4));
-                if target_proc == file.id {
-                    continue;
-                }
-                let h = st.handle_for(target_proc, node, Some((file.id, t.tid)));
-                let kind = if kind == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE };
-                rewrite(&mut data, kind, u64::from(h), 0);
-            }
-            TYPE_HANDLE | TYPE_WEAK_HANDLE => {
-                let node = st.node_for_handle(file.id, ptr as u32).ok_or(EINVAL)?;
-                let n = st.nodes.get(&node).expect("a node");
-                if n.owner == target_proc {
-                    let (nptr, ncookie) = (n.ptr, n.cookie);
-                    let kind = if kind == TYPE_HANDLE { TYPE_BINDER } else { TYPE_WEAK_BINDER };
-                    rewrite(&mut data, kind, nptr, ncookie);
-                } else {
-                    let h = st.handle_for(target_proc, node, Some((file.id, t.tid)));
-                    rewrite(&mut data, kind, u64::from(h), 0);
+        match u32_at(&obj, 0) {
+            TYPE_BINDER | TYPE_WEAK_BINDER | TYPE_HANDLE | TYPE_WEAK_HANDLE => {
+                if let Some(to) = st.translate_ref((file.id, t.tid), target_proc, &obj)? {
+                    rewrite_ref(&mut data, off, to);
                 }
             }
             TYPE_FD => {
-                let fd = ptr as u32 as i32;
+                let fd = u64_at(&obj, 8) as u32 as i32;
                 let open = p.fds.get(fd)?;
                 fds.push((off, open));
             }
@@ -673,6 +890,19 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     };
     if !reply && !oneway {
         st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
+    }
+    if !reply && target_proc == HOST {
+        // A host service answers here, on the sending thread, off the broker lock: a handler may
+        // take time or other locks. The sender hears its transaction went, then the reply, as the
+        // kernel orders them.
+        let handler = st.host_services.get(&target_ptr).cloned();
+        st.queue(file.id, Some(t.tid), Work::Complete);
+        drop(st);
+        let reply_data = handler.map(|h| h(code, &txn.data)).unwrap_or_default();
+        if !oneway {
+            file.broker.state.lock().queue(file.id, Some(t.tid), Work::Txn(Box::new(Txn::reply_from_host(reply_data))));
+        }
+        return Ok(());
     }
     let dead = st.procs.get(&target_proc).is_none_or(|pr| pr.dead);
     if dead {
