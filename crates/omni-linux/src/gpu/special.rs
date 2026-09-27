@@ -29,6 +29,10 @@ const VK_ERROR_FEATURE_NOT_PRESENT: i32 = -8;
 
 const STYPE_NATIVE_BUFFER_ANDROID: u32 = 1_000_010_000;
 const STYPE_SWAPCHAIN_IMAGE_CREATE_INFO_ANDROID: u32 = 1_000_010_001;
+/// `VkImageSwapchainCreateInfoKHR` and `VkBindImageMemorySwapchainInfoKHR`: they name the
+/// loader's swapchain, which no host driver knows.
+const STYPE_IMAGE_SWAPCHAIN_CREATE_INFO: u32 = 1_000_060_008;
+const STYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO: u32 = 1_000_060_009;
 const STYPE_PRESENTATION_PROPERTIES_ANDROID: u32 = 1_000_010_002;
 const STYPE_AHB_USAGE_ANDROID: u32 = 1_000_129_000;
 const STYPE_IMPORT_AHB_INFO_ANDROID: u32 = 1_000_129_003;
@@ -428,9 +432,23 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
                     Err(e) => Err(e),
                 };
             }
+            // (Bound, so the structure stays out of the chain until the image is made.)
+            if let Some(_swapchain_info) = splice(p, a[1], STYPE_IMAGE_SWAPCHAIN_CREATE_INFO)? {
+                let (h, t) = gpu.dispatchable(p, a[0])?;
+                let info = p.mem.read(a[1], 88).map_err(|_| CallError::Args)?;
+                return match super::native::create_swapchain_image(gpu, h, &t, &info) {
+                    Ok(image) => {
+                        wr(p, a[3], &image.to_le_bytes())?;
+                        Ok(result(VK_SUCCESS))
+                    }
+                    Err(CallError::Host(r)) => Ok(result(r)),
+                    Err(e) => Err(e),
+                };
+            }
             passthrough4(gpu, p, id, a, &[c"vkCreateImage"])
         }
         g::ID_VK_DESTROY_IMAGE => {
+            gpu.swapchain_images.lock().remove(&a[1]);
             let (h, t) = gpu.dispatchable(p, a[0])?;
             if !super::native::destroy_image(gpu, &t, a[1])? {
                 const NAMES: &[&CStr] = &[c"vkDestroyImage"];
@@ -509,13 +527,7 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
             let e: unsafe extern "system" fn(u64, u64, u64, u64) -> i32 = unsafe { f(&t, id, NAMES)? };
             Ok(result(unsafe { e(h, a[1], a[2], a[3]) }))
         }
-        g::ID_VK_BIND_IMAGE_MEMORY2 => {
-            let (h, t) = gpu.dispatchable(p, a[0])?;
-            const NAMES: &[&CStr] = &[c"vkBindImageMemory2", c"vkBindImageMemory2KHR"];
-            // SAFETY: the Vulkan signature.
-            let e: unsafe extern "system" fn(u64, u32, u64) -> i32 = unsafe { f(&t, id, NAMES)? };
-            Ok(result(unsafe { e(h, a[1] as u32, a[2]) }))
-        }
+        g::ID_VK_BIND_IMAGE_MEMORY2 => bind_image_memory2(gpu, p, a),
         _ => {
             let name = g::COMMANDS.get(id as usize).map_or("?", |c| c.0);
             Err(CallError::Missing(name))
@@ -648,6 +660,43 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     Ok(result(r))
 }
 
+/// `vkBindImageMemory2`: a swapchain image with a `VkNativeBufferANDROID` (what the loader turns a
+/// `VkBindImageMemorySwapchainInfoKHR` into) is bound to its gralloc buffer here; the rest go to the
+/// host driver, copied (`VkBindImageMemoryInfo`, 40 bytes), minus the swapchain structure.
+fn bind_image_memory2(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
+    let (h, t) = gpu.dispatchable(p, a[0])?;
+    let n = a[1] as u32;
+    if n > 1 << 12 {
+        return Err(CallError::Args);
+    }
+    let mut host: Vec<u8> = Vec::new();
+    let mut spliced = Vec::new();
+    for i in 0..u64::from(n) {
+        let at = a[2] + i * 40;
+        if let Some((_, native)) = chain_find(p, at, STYPE_NATIVE_BUFFER_ANDROID)? {
+            let image = rd_u64(p, at + 16)?;
+            match super::native::bind_swapchain_image(gpu, p, h, &t, image, native) {
+                Ok(()) => continue,
+                Err(CallError::Host(r)) => return Ok(result(r)),
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(s) = splice(p, at, STYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO)? {
+            spliced.push(s);
+        }
+        host.extend_from_slice(&p.mem.read(at, 40).map_err(|_| CallError::Args)?);
+    }
+    if host.is_empty() {
+        return Ok(result(VK_SUCCESS));
+    }
+    const NAMES: &[&CStr] = &[c"vkBindImageMemory2", c"vkBindImageMemory2KHR"];
+    // SAFETY: the Vulkan signature; `host` holds whole VkBindImageMemoryInfos.
+    let e: unsafe extern "system" fn(u64, u32, *const u8) -> i32 = unsafe { f(&t, g::ID_VK_BIND_IMAGE_MEMORY2, NAMES)? };
+    let r = unsafe { e(h, (host.len() / 40) as u32, host.as_ptr()) };
+    drop(spliced);
+    Ok(result(r))
+}
+
 /// The device a queue belongs to.
 fn device_of_queue(gpu: &Gpu, queue: u64) -> R<u64> {
     gpu.objects.lock().get(&queue).map(|o| o.parent).ok_or(CallError::Handle(queue))
@@ -686,8 +735,9 @@ fn submit_nothing(gpu: &Gpu, device: u64, t: &Table, wait: u64, signal: u64, fen
 }
 
 /// `vkGetSemaphoreFdKHR`/`vkGetFenceFdKHR` of a `SYNC_FD`: the work is waited for, and the fd is
-/// -1, a sync file already signalled. As a sync-file export does, the payload is taken: the
-/// semaphore is waited on (unsignalled), the fence reset.
+/// a sync file, signalled (`crate::sync_file`) -- not -1, which the specification allows but
+/// which ANGLE then polls forever. As a sync-file export does, the payload is taken: the semaphore
+/// is waited on (unsignalled), the fence reset.
 fn export_sync_fd(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
     let (device, t) = gpu.dispatchable(p, a[0])?;
     let object = rd_u64(p, a[1] + 16)?;
@@ -706,7 +756,8 @@ fn export_sync_fd(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
             r(device, 1, &object);
         }
     }
-    wr(p, a[2], &(-1i32).to_le_bytes())?;
+    let fd = crate::sync_file::signalled(p).map_err(|_| CallError::Args)?;
+    wr(p, a[2], &fd.to_le_bytes())?;
     Ok(result(VK_SUCCESS))
 }
 

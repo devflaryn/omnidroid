@@ -135,20 +135,60 @@ fn check(r: vk::Result) -> R<()> {
 /// the image, its memory, and its staging buffer. The `VkImageCreateInfo` (88 bytes) is `info`,
 /// its chain what the host may see.
 pub(crate) fn create_image(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, info: &[u8], native: u64) -> R<u64> {
-    let handle = p.mem.read_u64(native + 16).map_err(|_| CallError::Args)?;
-    let (shm, stride, pixels_at) = gralloc_buffer(p, handle)?;
+    let (image, format, width, height) = create_for_swapchain(device, t, info)?;
+    match attach(gpu, p, device, t, image, format, width, height, native) {
+        Ok(n) => {
+            gpu.native.lock().insert(image.as_raw(), n);
+            Ok(image.as_raw())
+        }
+        Err(e) => {
+            unsafe { vkfn!(t, ID_VK_DESTROY_IMAGE, c"vkDestroyImage", vk::PFN_vkDestroyImage)(vk::Device::from_raw(device), image, std::ptr::null()) };
+            Err(e)
+        }
+    }
+}
+
+/// The image of a swapchain (its `VkImageSwapchainCreateInfoKHR` names the loader's swapchain, out
+/// of the chain): made now, bound to its gralloc buffer when the loader binds it
+/// (`vkBindImageMemory2` with a `VkNativeBufferANDROID`, spec version 8).
+pub(crate) fn create_swapchain_image(gpu: &Gpu, device: u64, t: &Arc<Table>, info: &[u8]) -> R<u64> {
+    let (image, format, width, height) = create_for_swapchain(device, t, info)?;
+    gpu.swapchain_images.lock().insert(image.as_raw(), (format, width, height));
+    Ok(image.as_raw())
+}
+
+/// `vkBindImageMemory2`'s `VkBindImageMemoryInfo` of a swapchain image with a
+/// `VkNativeBufferANDROID` at `native`: the image gets its memory and staging buffer.
+pub(crate) fn bind_swapchain_image(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, image: u64, native: u64) -> R<()> {
+    let (format, width, height) = gpu.swapchain_images.lock().remove(&image).ok_or(CallError::Args)?;
+    let n = attach(gpu, p, device, t, vk::Image::from_raw(image), format, width, height, native)?;
+    gpu.native.lock().insert(image, n);
+    Ok(())
+}
+
+/// An image to hold a gralloc buffer's pixels: as the guest described it, and a copy source.
+fn create_for_swapchain(device: u64, t: &Arc<Table>, info: &[u8]) -> R<(vk::Image, vk::Format, u32, u32)> {
     // SAFETY: `info` is a whole VkImageCreateInfo (the caller read 88 bytes of one).
     let mut ci: vk::ImageCreateInfo<'static> = unsafe { std::ptr::read_unaligned(info.as_ptr().cast()) };
     ci.usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-    let bpp = bytes_per_pixel(ci.format).ok_or(CallError::Args)?;
-    let (width, height) = (ci.extent.width, ci.extent.height);
+    bytes_per_pixel(ci.format).ok_or(CallError::Args)?;
+    let mut image = vk::Image::null();
+    check(unsafe { vkfn!(t, ID_VK_CREATE_IMAGE, c"vkCreateImage", vk::PFN_vkCreateImage)(vk::Device::from_raw(device), &ci, std::ptr::null(), &mut image) })?;
+    Ok((image, ci.format, ci.extent.width, ci.extent.height))
+}
+
+/// Give `image` memory of its own and a staging buffer its pixels leave through into the gralloc
+/// buffer a `VkNativeBufferANDROID` (at `native`) names.
+#[allow(clippy::too_many_arguments)]
+fn attach(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, image: vk::Image, format: vk::Format, width: u32, height: u32, native: u64) -> R<NativeImage> {
+    let handle = p.mem.read_u64(native + 16).map_err(|_| CallError::Args)?;
+    let (shm, stride, pixels_at) = gralloc_buffer(p, handle)?;
+    let bpp = bytes_per_pixel(format).ok_or(CallError::Args)?;
     if stride < width || u64::from(stride) * u64::from(height) * u64::from(bpp) > shm.len().saturating_sub(pixels_at) {
         return Err(CallError::Args);
     }
     let d = vk::Device::from_raw(device);
-    let mut image = vk::Image::null();
-    check(unsafe { vkfn!(t, ID_VK_CREATE_IMAGE, c"vkCreateImage", vk::PFN_vkCreateImage)(d, &ci, std::ptr::null(), &mut image) })?;
-    let result = (|| {
+    {
         let mut req = vk::MemoryRequirements::default();
         unsafe { vkfn!(t, ID_VK_GET_IMAGE_MEMORY_REQUIREMENTS, c"vkGetImageMemoryRequirements", vk::PFN_vkGetImageMemoryRequirements)(d, image, &mut req) };
         let devices = gpu.devices.lock();
@@ -167,16 +207,6 @@ pub(crate) fn create_image(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, 
         let mut mapped = std::ptr::null_mut();
         check(unsafe { vkfn!(t, ID_VK_MAP_MEMORY, c"vkMapMemory", vk::PFN_vkMapMemory)(d, staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty(), &mut mapped) })?;
         Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, bytes, width, height, stride, shm, pixels_at })
-    })();
-    match result {
-        Ok(native) => {
-            gpu.native.lock().insert(image.as_raw(), native);
-            Ok(image.as_raw())
-        }
-        Err(e) => {
-            unsafe { vkfn!(t, ID_VK_DESTROY_IMAGE, c"vkDestroyImage", vk::PFN_vkDestroyImage)(d, image, std::ptr::null()) };
-            Err(e)
-        }
     }
 }
 
@@ -258,7 +288,7 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     let mut devices = gpu.devices.lock();
     let info = devices.get_mut(&device).ok_or(CallError::Handle(device))?;
     let family = *info.queues.get(&queue).ok_or(CallError::Handle(queue))?;
-    if !info.copiers.contains_key(&family) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = info.copiers.entry(family) {
         let pci = vk::CommandPoolCreateInfo { flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER, queue_family_index: family, ..Default::default() };
         let mut pool = vk::CommandPool::null();
         check(unsafe { vkfn!(t, ID_VK_CREATE_COMMAND_POOL, c"vkCreateCommandPool", vk::PFN_vkCreateCommandPool)(d, &pci, std::ptr::null(), &mut pool) })?;
@@ -269,7 +299,7 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         let mut fence = vk::Fence::null();
         let fci = vk::FenceCreateInfo::default();
         check(unsafe { vkfn!(t, ID_VK_CREATE_FENCE, c"vkCreateFence", vk::PFN_vkCreateFence)(d, &fci, std::ptr::null(), &mut fence) })?;
-        info.copiers.insert(family, Copier { cb, fence });
+        slot.insert(Copier { cb, fence });
     }
     let copier = info.copiers.get(&family).expect("made above");
     let (cb, fence) = (copier.cb, copier.fence);

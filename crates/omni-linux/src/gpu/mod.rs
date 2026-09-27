@@ -132,6 +132,8 @@ pub struct Gpu {
     pub(crate) devices: Mutex<HashMap<u64, native::DeviceInfo>>,
     /// Images on gralloc buffers (`VK_ANDROID_native_buffer`), by host handle.
     pub(crate) native: Mutex<HashMap<u64, native::NativeImage>>,
+    /// Swapchain images made and not yet bound to their gralloc buffer: format and size.
+    pub(crate) swapchain_images: Mutex<HashMap<u64, (ash::vk::Format, u32, u32)>>,
     /// Images made for imported gralloc buffers, and the imported memory (their mirrors).
     pub(crate) ahb_images: Mutex<HashMap<u64, ahb::AhbImage>>,
     pub(crate) ahb_memory: Mutex<HashMap<u64, ahb::AhbMemory>>,
@@ -188,7 +190,7 @@ pub fn command_id(name: &str) -> Option<u32> {
 }
 
 /// `ioctl` on `/dev/omni-gpu`.
-pub fn ioctl(p: &Process, _t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> SysResult {
+pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> SysResult {
     if cmd != OMNI_GPU_CALL {
         return Err(ENOTTY);
     }
@@ -204,11 +206,11 @@ pub fn ioctl(p: &Process, _t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> 
     static TRACE: OnceLock<bool> = OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var("OMNI_GPU_TRACE").as_deref() == Ok("1")) {
         let name = generated::COMMANDS.get(id as usize).map_or("(extra)", |c| c.0);
-        eprintln!("[gpu] {name} {args:x?}");
+        eprintln!("[gpu] {}:{} {name} {args:x?}", p.sys.pid, t.tid);
     }
     let answer = if id >= special::ID_GRALLOC_USAGE { special::extra(gpu, p, id, &args) } else { generated::dispatch(gpu, p, id, &args) };
     if *TRACE.get().unwrap_or(&false) {
-        eprintln!("[gpu]   -> {answer:?}");
+        eprintln!("[gpu] {}:{}   -> {answer:?}", p.sys.pid, t.tid);
     }
     let result = answer.map_err(CallError::errno)?;
     p.mem.write(arg + 16, &result.to_le_bytes())?;

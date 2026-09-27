@@ -274,6 +274,8 @@ fn readiness(file: &OpenFile, now: Instant) -> (u32, Option<Instant>) {
         FileKind::Pipe(end) => (crate::pipe::readiness(end), None),
         FileKind::Epoll(ep) => (if ep.any_ready(now) { IN } else { 0 }, None),
         FileKind::Socket(s) => (crate::socket::readiness(s), None),
+        // Every fence here is signalled when made.
+        FileKind::SyncFile(_) => (IN, None),
         FileKind::Binder(b) => (b.readiness(), None),
         FileKind::Inotify(_) => (0, None),
         _ => (IN | OUT, None),

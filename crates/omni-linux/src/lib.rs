@@ -27,6 +27,7 @@ pub mod shm;
 pub mod signal;
 pub mod socket;
 pub mod sys;
+pub mod sync_file;
 pub mod syscall;
 pub mod vfs;
 

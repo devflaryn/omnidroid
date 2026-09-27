@@ -796,6 +796,11 @@ fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64) -> Sy
     let bwr = p.mem.read(arg, 48)?;
     let (write_size, mut write_consumed, write_buffer) = (u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 16));
     let (read_size, mut read_consumed, read_buffer) = (u64_at(&bwr, 24), u64_at(&bwr, 32), u64_at(&bwr, 40));
+    if std::env::var("OMNI_BINDER_TRACE").as_deref() == Ok("2") {
+        let cmds = if write_size > write_consumed { p.mem.read(write_buffer + write_consumed, (write_size - write_consumed).min(64) as usize).unwrap_or_default() } else { Vec::new() };
+        let first = cmds.get(0..4).map(|c| u32_at(c, 0));
+        eprintln!("[binder] {}:{} write {} (first cmd {first:x?}) read {}", p.sys.pid, t.tid, write_size - write_consumed, read_size - read_consumed);
+    }
     {
         let mut st = file.broker.state.lock();
         let proc = st.proc_mut(file.id);
@@ -989,6 +994,19 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         }
     }
 
+    // OMNI_BINDER_TRACE=1: every transaction and reply, sender to receiver.
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var("OMNI_BINDER_TRACE").is_ok_and(|v| v == "1" || v == "2")) {
+        let to = if target_proc == HOST { "host".to_string() } else { format!("{}", st.procs.get(&target_proc).map_or(0, |pr| pr.pid)) };
+        eprintln!(
+            "[binder] {} {}:{} -> {to} code {code:#x}{} ({} bytes)",
+            if reply { "reply" } else { "call" },
+            p.sys.pid,
+            t.tid,
+            if oneway { " oneway" } else { "" },
+            data.len()
+        );
+    }
     let txn = Txn {
         reply,
         oneway,

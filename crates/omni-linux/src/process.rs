@@ -175,6 +175,39 @@ fn on_svc(call: &mut ThunkCall<'_>) {
         task.clone_tpidr = call.tpidr_el0();
     }
     let process = Arc::clone(&task.process);
+    if process.trace {
+        // A call that may wait is shown as it starts too: a thread that never returns is then seen
+        // where it waits.
+        use crate::syscall::nr;
+        if matches!(number, nr::FUTEX | nr::EPOLL_PWAIT | nr::PPOLL | nr::IOCTL | nr::READ | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP) {
+            let what = if number == nr::PPOLL || (number == nr::FUTEX && args[1] & 0x7f == 9) {
+                // The first descriptor polled, and what it is.
+                let fd = if number == nr::PPOLL { process.mem.read_u32(args[0]).map_or(-1, |f| f as i32) } else { -1 };
+                let kind = process.fds.get(fd).map_or_else(|_| "?".to_string(), |f| String::from_utf8_lossy(&crate::fd::guest_path_of(&f)).into_owned());
+                // The return addresses of the frames above (the frame-pointer chain), by library.
+                let maps = process.mm.file_mappings();
+                let name = |at: u64| {
+                    maps.iter()
+                        .find(|(start, len, _, _)| (*start..start + len).contains(&at))
+                        .map_or_else(|| format!("{at:#x}"), |(start, _, guest, offset)| format!("{}+{:#x}", String::from_utf8_lossy(guest).rsplit('/').next().unwrap_or_default(), at - start + offset))
+                };
+                let mut frames = vec![name(task.lr)];
+                let mut fp = call.x(29);
+                for _ in 0..8 {
+                    let (Ok(next), Ok(ret)) = (process.mem.read_u64(fp), process.mem.read_u64(fp + 8)) else { break };
+                    if ret == 0 {
+                        break;
+                    }
+                    frames.push(name(ret & 0x00ff_ffff_ffff_ffff));
+                    fp = next;
+                }
+                format!(" fd {fd} {kind} from {}", frames.join(" < "))
+            } else {
+                String::new()
+            };
+            eprintln!("[{}] {}({:#x}, {:#x}, {:#x}, {:#x}){what} ...", task.tid, name_of(number), args[0], args[1], args[2], args[3]);
+        }
+    }
     let result = process.syscall(task, number, args);
     if process.trace {
         // Path-taking calls show their path: what a trace is read for.
