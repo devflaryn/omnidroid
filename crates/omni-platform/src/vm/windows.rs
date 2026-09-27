@@ -554,6 +554,35 @@ pub(super) fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<usize
     Ok(got as usize)
 }
 
+/// Every range in `[base, end)` that is not `MEM_FREE`, by walking it with `VirtualQuery`. Unclipped
+/// and unmerged: the seam does that.
+///
+/// An address `VirtualQuery` will not describe -- past the highest address a user-mode allocation
+/// may have -- is reported occupied from there to `end`, because nothing can be reserved there
+/// either.
+pub(super) fn occupied_ranges(base: usize, end: usize) -> VmResult<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    let mut cursor = base;
+    while cursor < end {
+        let Some(mbi) = query(cursor) else {
+            out.push((cursor, end));
+            break;
+        };
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if mbi.State != MEM_FREE {
+            out.push((mbi.BaseAddress as usize, region_end));
+        }
+        if region_end <= cursor {
+            // A region that does not move the walk forward would loop forever; nothing sane
+            // returns one, and the rest of the range is reported as unknown, so occupied.
+            out.push((cursor, end));
+            break;
+        }
+        cursor = region_end;
+    }
+    Ok(out)
+}
+
 pub(super) fn reserve_placeholder(size: usize, align: usize) -> VmResult<usize> {
     reserve_inner(
         "reserve_placeholder",

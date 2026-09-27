@@ -83,6 +83,12 @@ pub(super) fn reserve_placeholder_at(_base: usize, _size: usize) -> VmResult<usi
     unsupported("reserve_placeholder_at")
 }
 
+/// A unix host with no backend of its own has no way to ask here, so nothing is known to be in
+/// the range: the reservation that follows is what finds out.
+pub(super) fn occupied_ranges(_base: usize, _end: usize) -> VmResult<Vec<(usize, usize)>> {
+    Ok(Vec::new())
+}
+
 pub(super) fn reserve_placeholder(_size: usize, _align: usize) -> VmResult<usize> {
     unsupported("reserve_placeholder")
 }

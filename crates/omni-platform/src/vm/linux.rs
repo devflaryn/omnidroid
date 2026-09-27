@@ -318,6 +318,29 @@ pub(super) fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<usize
     Ok(base)
 }
 
+/// Every mapping `/proc/self/maps` lists that overlaps `[base, end)`. Unclipped and unmerged: the
+/// seam does that. Each line starts `start-end ` in hex, which is all this reads.
+pub(super) fn occupied_ranges(base: usize, end: usize) -> VmResult<Vec<(usize, usize)>> {
+    const OP: &str = "occupied_ranges";
+    let text = std::fs::read_to_string("/proc/self/maps").map_err(|error| {
+        os(OP, base, end - base, error.raw_os_error().unwrap_or(libc::EIO) as u32)
+    })?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((range, _)) = line.split_once(' ') else { continue };
+        let Some((start, stop)) = range.split_once('-') else { continue };
+        let (Ok(start), Ok(stop)) =
+            (usize::from_str_radix(start, 16), usize::from_str_radix(stop, 16))
+        else {
+            continue;
+        };
+        if start < end && base < stop {
+            out.push((start, stop));
+        }
+    }
+    Ok(out)
+}
+
 /// Split a placeholder: **no kernel call**, because a later `mmap(MAP_FIXED)` of the piece will
 /// replace exactly the piece. The ledger records the new boundaries, which is what makes the
 /// exact-size rule of [`commit_placeholder`] and [`map_file`] checkable.
