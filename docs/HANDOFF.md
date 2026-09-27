@@ -114,12 +114,16 @@ SystemReady) -> C4 -> C5 -> D4 -> D5; specs in `docs/superpowers/specs/2026-09-2
 `docs/superpowers/plans/`. Done: D2 (gralloc 5), D3a (guest Vulkan + ANGLE on the host GPU) on
 Windows and Linux (see STATUS).
 
-- **D3b in progress**: `tools/gen_aidl.py` generates Rust for frozen AIDL (`tools/aidl/`,
-  `src/hal/aidl/`); the host composer (`src/hal/composer.rs`) implements composer3 V3 on it and
-  presents the client target into `hal::framebuffer`. Gate `tests/d3b_display.rs`: the real
-  surfaceflinger + bootanimation, a screenshot. SurfaceFlinger already starts its RenderEngine on
-  ANGLE and waits for `IComposer/default`.
-- **D3c next**: system_server = `app_process64 -Xgc:CMC -Xhidden-api-policy:disabled /system/bin
+- **D3b done on Windows** (`tests/d3b_display.rs`, the bootanimation screenshot). Linux open:
+  RenderEngine faults in ANGLE on lavapipe (STATUS).
+- **D3c/C4 now**: system_server passes StartDisplayManager, stops in PackageManagerService: (1)
+  apexd activates no APEX (it cannot mkdir/mount `/apex/<name>@<v>` -- the plan: present the
+  sysroot's already-extracted APEXes as mounted through `/proc/mounts` + `/sys/block/loopN/loop/
+  backing_file`, which apexd's `PopulateFromMounts` reads, so the real apexd reports them active);
+  (2) installd SIGSEGVs at start (null deref); (3) the audio HAL (goldfish) is waited for.
+  Probe script shape: `omni-linux-run --init early_hal,core,hal,main --hal gralloc --hal composer`
+  with OMNI_SCREENSHOT=<png>.
+- system_server command = `app_process64 -Xgc:CMC -Xhidden-api-policy:disabled /system/bin
   com.android.server.SystemServer` as uid 1000 with CLASSPATH=$SYSTEMSERVERCLASSPATH and the
   derive_classpath environment, `omni-linux-run --init early_hal,core,hal,main --hal gralloc`
   (init starts ~58 services incl. apexd, which system_server needs). It stops at
