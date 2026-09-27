@@ -26,12 +26,14 @@ pub struct SysState {
     actions: Mutex<[[u8; 32]; 65]>,
     /// The file-creation mask (`umask`), 022 to start with as a shell's is.
     umask: std::sync::atomic::AtomicU32,
+    /// The system-call filters and `no_new_privs` (`crate::seccomp`).
+    pub seccomp: crate::seccomp::Seccomp,
 }
 
 impl SysState {
     #[must_use]
     pub fn new(pid: i32, uid: u32) -> Self {
-        Self { pid, uid: uid.into(), gid: uid.into(), groups: Mutex::default(), caps: (if uid == 0 { ALL_CAPS } else { 0 }).into(), keepcaps: false.into(), start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), umask: std::sync::atomic::AtomicU32::new(0o022) }
+        Self { pid, uid: uid.into(), gid: uid.into(), groups: Mutex::default(), caps: (if uid == 0 { ALL_CAPS } else { 0 }).into(), keepcaps: false.into(), start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), umask: std::sync::atomic::AtomicU32::new(0o022), seccomp: crate::seccomp::Seccomp::default() }
     }
 
     #[must_use]
@@ -50,6 +52,8 @@ impl SysState {
         self.gid.store(from.gid(), std::sync::atomic::Ordering::Relaxed);
         *self.groups.lock() = from.groups.lock().clone();
         self.caps.store(from.caps(), std::sync::atomic::Ordering::Relaxed);
+        // Filters and no_new_privs are kept across fork and execve.
+        self.seccomp.inherit(&from.seccomp);
     }
 
     /// The capabilities held, bit `n` for `CAP_*` number `n`.
@@ -414,6 +418,43 @@ fn sys_sigaltstack(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// Install the filter `struct sock_fprog { u16 len; struct sock_filter *filter; }` at `fprog`:
+/// allowed with `no_new_privs` or CAP_SYS_ADMIN.
+fn install_filter(p: &Process, fprog: u64) -> Result<(), crate::errno::Errno> {
+    const CAP_SYS_ADMIN: u64 = 21;
+    if !p.sys.seccomp.no_new_privs.load(std::sync::atomic::Ordering::SeqCst) && p.sys.caps() & (1 << CAP_SYS_ADMIN) == 0 {
+        return Err(crate::errno::EACCES);
+    }
+    let len = u16::from_le_bytes(p.mem.read(fprog, 2)?.try_into().expect("2")) as usize;
+    let at = p.mem.read_u64(fprog + 8)?;
+    if len == 0 || len > 4096 {
+        return Err(EINVAL);
+    }
+    let bytes = p.mem.read(at, len * 8)?;
+    p.sys.seccomp.install(&bytes)
+}
+
+/// `seccomp(op, flags, args)`.
+fn sys_seccomp(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const TSYNC: u64 = 1;
+    const LOG: u64 = 2;
+    const SPEC_ALLOW: u64 = 4;
+    const TSYNC_ESRCH: u64 = 16;
+    match a[0] {
+        // SECCOMP_SET_MODE_STRICT
+        0 if a[1] == 0 && a[2] == 0 => p.sys.seccomp.set_strict().map(|()| 0),
+        // SECCOMP_SET_MODE_FILTER: every thread shares the filters here, so TSYNC holds already;
+        // a user-notification listener is not offered.
+        1 if a[1] & !(TSYNC | LOG | SPEC_ALLOW | TSYNC_ESRCH) == 0 => install_filter(p, a[2]).map(|()| 0),
+        // SECCOMP_GET_ACTION_AVAIL
+        2 if a[1] == 0 => {
+            let action = p.mem.read_u32(a[2])?;
+            if crate::seccomp::action_available(action) { Ok(0) } else { Err(crate::errno::EOPNOTSUPP) }
+        }
+        _ => Err(EINVAL),
+    }
+}
+
 fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     match a[0] {
         15 => {
@@ -450,8 +491,23 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             3 | 4 => Ok(0),
             _ => Err(EINVAL),
         },
-        4 | 38 | 0x59616d61 => Ok(0),            // PR_SET_DUMPABLE, PR_SET_NO_NEW_PRIVS, PR_SET_PTRACER
-        39 => Ok(0),                             // PR_GET_NO_NEW_PRIVS
+        4 | 0x59616d61 => Ok(0),                 // PR_SET_DUMPABLE, PR_SET_PTRACER
+        // PR_SET_NO_NEW_PRIVS: once set, never cleared.
+        38 => {
+            if a[1] != 1 || a[2] != 0 || a[3] != 0 || a[4] != 0 {
+                return Err(EINVAL);
+            }
+            p.sys.seccomp.no_new_privs.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        39 => Ok(u64::from(p.sys.seccomp.no_new_privs.load(std::sync::atomic::Ordering::SeqCst))), // PR_GET_NO_NEW_PRIVS
+        21 => Ok(u64::from(p.sys.seccomp.mode())), // PR_GET_SECCOMP
+        // PR_SET_SECCOMP: strict, or a filter (`struct sock_fprog *` in the third argument).
+        22 => match a[1] {
+            1 => p.sys.seccomp.set_strict().map(|()| 0),
+            2 => install_filter(p, a[2]).map(|()| 0),
+            _ => Err(EINVAL),
+        },
         0x5356_4d41 => Ok(0),                    // PR_SET_VMA (names anonymous memory): accepted, ignored
         other => {
             p.refusals.record(format!("prctl option {other:#x}"), t.pc, t.lr);
@@ -938,6 +994,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::RT_SIGPROCMASK, sys_rt_sigprocmask);
     table.set(nr::SIGALTSTACK, sys_sigaltstack);
     table.set(nr::PRCTL, sys_prctl);
+    table.set(nr::SECCOMP, sys_seccomp);
     table.set(nr::CLOCK_GETTIME, sys_clock_gettime);
     table.set(nr::CLOCK_GETRES, sys_clock_getres);
     table.set(nr::GETTIMEOFDAY, sys_gettimeofday);

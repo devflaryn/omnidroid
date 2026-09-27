@@ -26,7 +26,7 @@ fn regs() -> Regs {
 
 #[test]
 fn the_layout_is_the_kernels() {
-    let info = SigInfo { signo: 11, code: 2, addr: 0xdead_0000, pid: 0, uid: 0 };
+    let info = SigInfo { signo: 11, code: 2, addr: 0xdead_0000, pid: 0, uid: 0, ..SigInfo::default() };
     let bytes = Frame::build(&regs(), &info, 0b1010, signal::altstack_disabled());
     assert_eq!(bytes.len(), signal::FRAME_BYTES);
     assert_eq!(signal::FRAME_BYTES % 16, 0);
@@ -54,7 +54,7 @@ fn the_layout_is_the_kernels() {
 
 #[test]
 fn a_frame_parses_back_to_the_registers_and_mask_it_saved() {
-    let info = SigInfo { signo: 10, code: -6, addr: 0, pid: 1000, uid: 10000 };
+    let info = SigInfo { signo: 10, code: -6, addr: 0, pid: 1000, uid: 10000, ..SigInfo::default() };
     let bytes = Frame::build(&regs(), &info, 0xff00, signal::altstack_disabled());
     let (back, mask) = Frame::parse(&bytes);
     assert_eq!(back, Regs { fault_address: back.fault_address, ..regs() });

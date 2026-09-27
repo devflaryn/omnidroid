@@ -119,6 +119,9 @@ pub struct Task {
     pub saved_sigmask: Option<u64>,
     /// `TPIDR_EL0` at the last `clone`: a thread made without `CLONE_SETTLS` inherits it.
     pub clone_tpidr: Option<u64>,
+    /// A signal this task raised itself with its own `siginfo` (a seccomp trap's SIGSYS), used
+    /// when that signal is delivered.
+    pub queued_info: Option<crate::signal::SigInfo>,
     /// `IN_GUEST`, `IN_KERNEL` or `PARKED`.
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
 }
@@ -188,7 +191,7 @@ fn altstack_disabled() -> [u8; 24] {
 impl Task {
     #[must_use]
     pub fn new(tid: i32, process: Arc<Process>) -> Self {
-        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None, clone_tpidr: None, state: Arc::new(std::sync::atomic::AtomicU8::new(IN_KERNEL)) }
+        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None, clone_tpidr: None, queued_info: None, state: Arc::new(std::sync::atomic::AtomicU8::new(IN_KERNEL)) }
     }
 }
 
@@ -271,6 +274,32 @@ fn on_svc(call: &mut ThunkCall<'_>) {
 
 impl Process {
     pub fn syscall(&self, task: &mut Task, number: u64, args: [u64; 6]) -> u64 {
+        // The process's seccomp filters answer first.
+        if self.sys.seccomp.active() {
+            use crate::seccomp::Verdict;
+            match self.sys.seccomp.check(number, task.pc, &args) {
+                Verdict::Allow => {}
+                Verdict::Errno(e) => return crate::errno::Errno(i32::from(e)).as_return(),
+                Verdict::Trap(data) => {
+                    task.queued_info = Some(crate::signal::SigInfo {
+                        signo: 31,
+                        code: crate::signal::SYS_SECCOMP,
+                        addr: task.pc,
+                        errno: i32::from(data),
+                        syscall: number as i32,
+                        arch: crate::seccomp::AUDIT_ARCH_AARCH64,
+                        ..crate::signal::SigInfo::default()
+                    });
+                    task.pending.fetch_or(1 << 30, std::sync::atomic::Ordering::SeqCst);
+                    return crate::errno::ENOSYS.as_return();
+                }
+                Verdict::Kill => {
+                    self.end(ExitStatus::Killed { signal: 31, pc: task.pc, detail: format!("seccomp: {} is not allowed", name_of(number)) });
+                    return crate::errno::ENOSYS.as_return();
+                }
+                Verdict::Unavailable => return crate::errno::ENOSYS.as_return(),
+            }
+        }
         match self.table.get(number) {
             Some(handler) => match handler(self, task, args) {
                 Ok(v) => v,
@@ -379,8 +408,9 @@ impl Process {
     /// JIT optimizations -- 0 for none, to tell a translation fault from a kernel one.
     fn cpu_options() -> DynarmicOptions {
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
-        // 128 guest threads: ART alone starts about twenty, and Roblox runs dozens.
-        let mut options = DynarmicOptions { top_byte_ignore: true, max_threads: 128, ..DynarmicOptions::default() };
+        // 512 guest threads: ART alone starts about twenty, Roblox runs dozens, and system_server
+        // well over a hundred (the value-compare monitor costs nothing per slot unused).
+        let mut options = DynarmicOptions { top_byte_ignore: true, max_threads: 512, ..DynarmicOptions::default() };
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             options.optimizations_override = Some(mask);
         }
@@ -746,7 +776,7 @@ impl Process {
                     let address = crate::guest::untag(address as u64);
                     let mapped = self.mem.space().region_at(address as usize).is_some_and(|r| r.mapping.is_some());
                     let code = if mapped { crate::signal::SEGV_ACCERR } else { crate::signal::SEGV_MAPERR };
-                    let info = crate::signal::SigInfo { signo: 11, code, addr: address, pid: 0, uid: 0 };
+                    let info = crate::signal::SigInfo { signo: 11, code, addr: address, pid: 0, uid: 0, ..crate::signal::SigInfo::default() };
                     let what = format!("{access:?} at {address:#x}");
                     match self.fault(cpu, task, info, at as u64, address, &what) {
                         Ok(next) => pc = next,
@@ -757,9 +787,9 @@ impl Process {
                     // `brk` (which dynarmic reports as unsupported) is SIGTRAP with TRAP_BRKPT; any
                     // other undefined instruction is SIGILL, as the kernel's undef handler raises it.
                     let info = if encoding & 0xFFE0_001F == 0xD420_0000 {
-                        crate::signal::SigInfo { signo: 5, code: crate::signal::TRAP_BRKPT, addr: at as u64, pid: 0, uid: 0 }
+                        crate::signal::SigInfo { signo: 5, code: crate::signal::TRAP_BRKPT, addr: at as u64, pid: 0, uid: 0, ..crate::signal::SigInfo::default() }
                     } else {
-                        crate::signal::SigInfo { signo: 4, code: crate::signal::ILL_ILLOPC, addr: at as u64, pid: 0, uid: 0 }
+                        crate::signal::SigInfo { signo: 4, code: crate::signal::ILL_ILLOPC, addr: at as u64, pid: 0, uid: 0, ..crate::signal::SigInfo::default() }
                     };
                     let what = format!("the guest executed an unsupported instruction {encoding:#010x} at {at:#x}");
                     match self.fault(cpu, task, info, at as u64, 0, &what) {
@@ -769,7 +799,7 @@ impl Process {
                 }
                 (ExitReason::Breakpoint { pc: at }, _) => {
                     // `brk`: SIGTRAP with TRAP_BRKPT; the frame's pc is the `brk` itself.
-                    let info = crate::signal::SigInfo { signo: 5, code: crate::signal::TRAP_BRKPT, addr: at as u64, pid: 0, uid: 0 };
+                    let info = crate::signal::SigInfo { signo: 5, code: crate::signal::TRAP_BRKPT, addr: at as u64, pid: 0, uid: 0, ..crate::signal::SigInfo::default() };
                     match self.fault(cpu, task, info, at as u64, 0, &format!("breakpoint at {at:#x}")) {
                         Ok(next) => pc = next,
                         Err(killed) => return (killed, None),
@@ -820,7 +850,9 @@ impl Process {
         }
         let sig = ready.trailing_zeros() as i32 + 1;
         pending.fetch_and(!(1u64 << (sig - 1)), std::sync::atomic::Ordering::SeqCst);
-        let info = crate::signal::SigInfo { signo: sig, code: crate::signal::SI_TKILL, addr: 0, pid: self.sys.pid, uid: self.sys.uid() };
+        // SAFETY: as above.
+        let queued = unsafe { (*task).queued_info.take() }.filter(|i| i.signo == sig);
+        let info = queued.unwrap_or(crate::signal::SigInfo { signo: sig, code: crate::signal::SI_TKILL, pid: self.sys.pid, uid: self.sys.uid(), ..crate::signal::SigInfo::default() });
         self.deliver(cpu, task, info, pc, 0)
     }
 

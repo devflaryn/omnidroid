@@ -30,6 +30,7 @@ pub mod poll;
 pub mod process;
 pub mod procfs;
 pub mod props;
+pub mod seccomp;
 pub mod remote;
 pub mod shm;
 pub mod signal;

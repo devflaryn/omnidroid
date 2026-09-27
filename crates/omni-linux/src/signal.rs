@@ -49,6 +49,11 @@ pub struct SigInfo {
     pub addr: u64,
     pub pid: i32,
     pub uid: u32,
+    /// `si_errno`.
+    pub errno: i32,
+    /// SIGSYS: `si_syscall` and `si_arch` (the call's address is `addr`).
+    pub syscall: i32,
+    pub arch: u32,
 }
 
 /// `si_code` values used here.
@@ -58,6 +63,7 @@ pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
 pub const ILL_ILLOPC: i32 = 1;
 pub const TRAP_BRKPT: i32 = 1;
+pub const SYS_SECCOMP: i32 = 1;
 
 /// A `stack_t` (24 bytes) with `SS_DISABLE`: no alternate stack.
 #[must_use]
@@ -114,8 +120,13 @@ impl Frame {
         let put = |b: &mut Vec<u8>, at: usize, bytes: &[u8]| b[at..at + bytes.len()].copy_from_slice(bytes);
         // siginfo
         put(&mut b, 0, &info.signo.to_le_bytes());
+        put(&mut b, 4, &info.errno.to_le_bytes());
         put(&mut b, 8, &info.code.to_le_bytes());
-        if info.code > 0 && matches!(info.signo, 4 | 5 | 7 | 8 | 11) {
+        if info.signo == 31 && info.code == SYS_SECCOMP {
+            put(&mut b, 16, &info.addr.to_le_bytes()); // si_call_addr
+            put(&mut b, 24, &info.syscall.to_le_bytes()); // si_syscall
+            put(&mut b, 28, &info.arch.to_le_bytes()); // si_arch
+        } else if info.code > 0 && matches!(info.signo, 4 | 5 | 7 | 8 | 11) {
             put(&mut b, 16, &info.addr.to_le_bytes()); // si_addr
         } else {
             put(&mut b, 16, &info.pid.to_le_bytes()); // si_pid
