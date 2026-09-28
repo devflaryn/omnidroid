@@ -1,8 +1,9 @@
 //! **The live window's keyboard and mouse, as a device's**: host window events
-//! ([`WindowEvent`]) turned into evdev events for the two input devices the display window makes
-//! ([`crate::evdev`]) -- a USB-style keyboard and a five-button wheel mouse -- which Android's own
-//! `InputReader` reads. Platform-agnostic; no window here, only what to send and what to ask of the
-//! window ([`Out`]), so it is tested without one.
+//! ([`WindowEvent`]) turned into input for the guest -- evdev events for a USB-style keyboard and a
+//! five-button wheel mouse ([`crate::evdev`]) that Android's own `InputReader` reads, and packets
+//! for the absolute pointer that [`crate::inject`] hands to the input dispatcher as a mouse's
+//! events. Platform-agnostic; no window here, only what to send and what to ask of the window
+//! ([`Out`]), so it is tested without one.
 //!
 //! # The keyboard
 //!
@@ -13,50 +14,49 @@
 //! too (the Start menu), and Meta alone opens Android's app list, so passing them on would do two
 //! things at once.
 //!
-//! # The mouse: held on a click, as a virtual machine holds it
+//! # The mouse: free and absolute, held only while the app holds the pointer capture
 //!
-//! Android has no absolute mouse: a mouse is relative motion (`REL_X`/`REL_Y`) that Android moves
-//! its own pointer by, through its own acceleration, and `SOURCE_MOUSE` -- what Roblox reads a
-//! mouse by -- comes from nothing else. So the host's mouse is **held** while it drives Android's:
-//! a click in the window takes the pointer capture ([`Out::Capture`]: the host cursor hidden and
-//! still, the device's raw motion reported), and from then on the motion, the five buttons and both
-//! wheels go to the mouse device. **Right Ctrl gives it back** (and is not passed on); so does the
-//! window losing the focus. The keyboard does not need the hold.
+//! **Free** (the default): the host's cursor moves over the window as over any other, and where it
+//! is, is where the app's pointer is -- the window position scaled to the display, sent as an
+//! absolute position ([`Out::Pointer`], `ABS_X`/`ABS_Y`). [`crate::inject`] makes of it what
+//! Android's `CursorInputMapper` makes of a mouse:
+//! `SOURCE_MOUSE` hover moves, `DOWN`/`BUTTON_PRESS`/`MOVE`/`BUTTON_RELEASE`/`UP` and `SCROLL`,
+//! at that position. Android has no absolute mouse device (its mouse is relative motion it moves its
+//! own pointer by, through its own acceleration), so this is the only way the pointer can *be*
+//! where the host's is rather than chase it. Nothing is captured and no key is taken for it.
 //!
-//! **The first click lands where it was made.** Android's pointer is somewhere else when the hold
-//! begins, and a relative mouse cannot say where to go -- except by the one motion whose scaling is
-//! known: the first after the pointer has been still. Its velocity tracker resets at rest, and a
-//! first sample, having no velocity, gets the acceleration curve's base gain -- [`PLACE_GAIN`],
-//! MEASURED on this image (it uses the curved "new ballistics"). So the hold sends one move far
-//! past the top-left corner, which Android clamps to (0, 0) whatever it scales it by; waits
-//! [`PLACE_WAIT`]; sends one move of the click's display position divided by that gain; and only
-//! then the click. Anything that happens meanwhile waits and follows in order. Motion while the
-//! mouse is held is the device's own, undivided: Android's curve on top of it, as on a device with
-//! a USB mouse.
-use std::collections::{BTreeSet, VecDeque};
+//! **Held** while -- and only while -- **the app holds Android's pointer capture**
+//! ([`crate::input_channel::capture`]: the `CAPTURE` message the input dispatcher sends the focused
+//! window; Roblox asks for it for its camera lock, `MouseBehavior.LockCenter`). Then the host's
+//! pointer is captured too ([`Out::Capture`]: hidden, held still, raw motion), and the motion,
+//! buttons and wheel go to the relative mouse ([`Out::Mouse`]), which Android reports to the app
+//! as `SOURCE_MOUSE_RELATIVE` -- what a captured pointer is on a device. When the app releases the
+//! capture, the host's is given back and the pointer is free again, where the host's cursor is.
+//! Losing the window's focus gives the host's pointer back as well (Alt+Tab always frees the
+//! mouse); it is taken again when the focus returns, if the app still holds the capture.
+//!
+//! # Coalesced, not queued
+//!
+//! A mouse reports up to 8,000 times a second, and each report sent on is work for the guest's
+//! whole input pipeline -- the kernel, `InputReader`, the dispatcher, the app's UI thread -- all of
+//! it translated code. A pointer has one position, so **positions are coalesced**: the newest is
+//! sent at most every [`MOVE_EVERY`], and a press, release or wheel first sends the position it
+//! happened at, so a click lands where it was made. Captured motion is **summed** the same way (it
+//! is distance, and all of it counts). Keys are never delayed.
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use omni_platform::window::{evdev_code, PointerButton, WindowEvent};
 
-use crate::evdev::{BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_KEY, EV_REL, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y};
+use crate::evdev::{ABS_X, ABS_Y, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_ABS, EV_KEY, EV_REL, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y};
 
-/// How long Android's pointer is left still before the move that places it: past its velocity
-/// tracker's 300 ms reset, so the move is not accelerated.
-pub const PLACE_WAIT: Duration = Duration::from_millis(400);
-/// **The gain Android gives a mouse's first move after a rest**, at the default pointer speed.
-/// MEASURED 2026-09-28 (d7 run 1, AOSP 15 arm64 emulator image, `pointer_speed` 0): one move of
-/// (400, 300) counts, 400 ms after the pointer was sent home, put it at (817, 612) -- a gain in
-/// 2.040..=2.042 on both axes, one figure. The gate places at two far-apart points to hold it to
-/// that. A changed pointer speed changes it.
-pub const PLACE_GAIN: f64 = 2.04;
 /// Keys the host keeps: `KEY_LEFTMETA`, `KEY_RIGHTMETA`.
 pub const HOST_KEYS: [u16; 2] = [125, 126];
-/// `KEY_RIGHTCTRL`: the key that gives the mouse back.
-pub const RELEASE_KEY: u16 = 97;
 /// One wheel notch in the window seam's units.
 const NOTCH: i32 = 120;
-/// Far enough past the corner for any display: Android clamps its pointer there.
-const HOME: i32 = -65_536;
+/// **How often a moving pointer is sent**, at most: 125 times a second, more than the display's
+/// frame rate, far less than a mouse's report rate. `OMNI_POINTER_HZ` changes it.
+pub const MOVE_EVERY: Duration = Duration::from_millis(8);
 
 /// Evdev events for one device, as one packet.
 pub type Packet = Vec<(u16, u16, i32)>;
@@ -66,24 +66,21 @@ pub type Packet = Vec<(u16, u16, i32)>;
 pub enum Out {
     /// Send to the keyboard.
     Keyboard(Packet),
-    /// Send to the mouse.
+    /// Send to the relative mouse (the pointer captured).
     Mouse(Packet),
-    /// Take (`true`) or give back the pointer capture; the caller answers whether it is held, by
-    /// [`Input::captured`].
+    /// Send to the absolute pointer (the pointer free).
+    Pointer(Packet),
+    /// Take (`true`) or give back the host's pointer capture; the caller answers whether it is held,
+    /// by [`Input::captured`].
     Capture(bool),
     /// The window's title should say this.
     Title(&'static str),
 }
 
 /// The title while the mouse is free.
-pub const TITLE_FREE: &str = "omnidroid \u{2014} click to control with the mouse (keyboard goes to Android)";
-/// The title while the mouse is held.
-pub const TITLE_HELD: &str = "omnidroid \u{2014} mouse held \u{00b7} Right Ctrl releases it";
-
-/// The move far past the top-left corner that puts Android's pointer at (0, 0).
-fn home() -> Out {
-    Out::Mouse(vec![(EV_REL, REL_X, HOME), (EV_REL, REL_Y, HOME)])
-}
+pub const TITLE_FREE: &str = "omnidroid";
+/// The title while the app holds the mouse.
+pub const TITLE_HELD: &str = "omnidroid \u{2014} the app holds the mouse (Alt+Tab frees it)";
 
 /// The evdev button of a host button.
 #[must_use]
@@ -97,115 +94,165 @@ pub const fn button_code(button: PointerButton) -> u16 {
     }
 }
 
-/// A placement under way: the pointer sent home at `since`, to be moved to `to` (display pixels),
-/// with the click and whatever came after it held until then.
-#[derive(Debug)]
-struct Placing {
-    since: Instant,
-    to: (i32, i32),
-    after: VecDeque<WindowEvent>,
-}
-
 /// The translation's state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Input {
+    /// The app holds the pointer capture (the guest's word).
+    wanted: bool,
+    /// The host's pointer capture is held.
     held: bool,
+    /// The window has the focus.
+    focused: bool,
     keys: BTreeSet<u16>,
-    buttons: BTreeSet<u16>,
-    /// The release key's own release, not to be passed on.
-    swallow: Option<u16>,
+    /// Buttons down on the absolute pointer, and on the relative mouse.
+    pointer_buttons: BTreeSet<u16>,
+    mouse_buttons: BTreeSet<u16>,
     /// Wheel remainders below a notch, (horizontal, vertical).
     wheel: (i32, i32),
-    placing: Option<Placing>,
+    /// The display position last sent, the newest not yet sent, and when one was last sent.
+    sent: Option<(i32, i32)>,
+    pending: Option<(i32, i32)>,
+    last_move: Option<Instant>,
+    /// Captured motion not yet sent.
+    motion: (i32, i32),
+    every: Duration,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self::new(MOVE_EVERY)
+    }
+}
+
+/// `OMNI_POINTER_HZ`: how often a moving pointer is sent, at most.
+#[must_use]
+pub fn move_every_from_env() -> Duration {
+    std::env::var("OMNI_POINTER_HZ").ok().and_then(|v| v.parse::<u32>().ok()).filter(|&hz| hz > 0).map_or(MOVE_EVERY, |hz| Duration::from_micros(1_000_000 / u64::from(hz)))
 }
 
 impl Input {
-    /// Whether the mouse is held.
+    /// A translation that sends a moving pointer at most every `every`.
+    #[must_use]
+    pub fn new(every: Duration) -> Self {
+        Self {
+            wanted: false,
+            held: false,
+            focused: true,
+            keys: BTreeSet::new(),
+            pointer_buttons: BTreeSet::new(),
+            mouse_buttons: BTreeSet::new(),
+            wheel: (0, 0),
+            sent: None,
+            pending: None,
+            last_move: None,
+            motion: (0, 0),
+            every,
+        }
+    }
+
+    /// Whether the host's pointer capture is held (the app holds Android's).
     #[must_use]
     pub fn held(&self) -> bool {
         self.held
     }
 
-    /// The caller's answer to an [`Out::Capture`]`(true)`: whether the capture is now held. Held:
-    /// the placement starts (the pointer sent home now). Not held: it is abandoned and the click
-    /// goes nowhere -- the next click asks again.
-    pub fn captured(&mut self, held: bool, now: Instant) -> Vec<Out> {
+    /// The caller's answer to an [`Out::Capture`]`(true)`: whether the capture is now held.
+    pub fn captured(&mut self, held: bool) -> Vec<Out> {
         self.held = held;
-        if !held {
-            self.placing = None;
-            return Vec::new();
-        }
-        let mut out = vec![Out::Title(TITLE_HELD)];
-        if let Some(p) = &mut self.placing {
-            p.since = now;
-            out.push(home());
-        }
-        out
+        if held { vec![Out::Title(TITLE_HELD)] } else { Vec::new() }
     }
 
-    /// One window event. `scale` turns window pixels into display pixels (display / window size).
-    pub fn event(&mut self, event: &WindowEvent, now: Instant, scale: (f64, f64)) -> Vec<Out> {
-        if let Some(p) = &mut self.placing {
-            // Keys are not held back: they have nothing to do with where the pointer is.
-            if !matches!(event, WindowEvent::KeyDown { .. } | WindowEvent::KeyUp { .. } | WindowEvent::FocusChanged { .. } | WindowEvent::PointerCaptureLost) {
-                p.after.push_back(event.clone());
-                return Vec::new();
-            }
+    /// The app took (`true`) or released the pointer capture.
+    pub fn guest_capture(&mut self, wanted: bool) -> Vec<Out> {
+        if wanted == self.wanted {
+            return Vec::new();
         }
+        self.wanted = wanted;
+        if wanted {
+            // What the free pointer has down is let go first: the app's pointer changes source.
+            let mut out = self.release_pointer_buttons();
+            self.pending = None;
+            if self.focused && !self.held {
+                out.push(Out::Capture(true));
+            }
+            out
+        } else {
+            let mut out = self.release_mouse_buttons();
+            self.motion = (0, 0);
+            if self.held {
+                self.held = false;
+                out.push(Out::Capture(false));
+                out.push(Out::Title(TITLE_FREE));
+            }
+            // The host's cursor shows where it was held; the app's pointer is synced to it by the
+            // move the window reports there.
+            self.sent = None;
+            out
+        }
+    }
+
+    /// Whether a pointer event is the relative mouse's now: the app holds the capture and so does
+    /// the host.
+    fn relative(&self) -> bool {
+        self.wanted && self.held
+    }
+
+    /// One window event. `scale` turns window pixels into display pixels (display / window size);
+    /// `display` is the display's size, which positions are kept inside.
+    pub fn event(&mut self, event: &WindowEvent, now: Instant, scale: (f64, f64), display: (u32, u32)) -> Vec<Out> {
         let mut out = Vec::new();
+        let at = |x: i32, y: i32| -> (i32, i32) {
+            let clamp = |v: f64, max: u32| (v.round() as i32).clamp(0, max.saturating_sub(1) as i32);
+            (clamp(f64::from(x) * scale.0, display.0), clamp(f64::from(y) * scale.1, display.1))
+        };
         match *event {
             WindowEvent::KeyDown { scancode, repeat, .. } => {
                 let Some(code) = evdev_code(scancode).filter(|c| !HOST_KEYS.contains(c)) else { return out };
-                if code == RELEASE_KEY && self.held && !repeat {
-                    self.swallow = Some(code);
-                    return self.release();
-                }
                 self.keys.insert(code);
                 out.push(Out::Keyboard(vec![(EV_KEY, code, if repeat { 2 } else { 1 })]));
             }
             WindowEvent::KeyUp { scancode, .. } => {
                 let Some(code) = evdev_code(scancode).filter(|c| !HOST_KEYS.contains(c)) else { return out };
-                if self.swallow == Some(code) {
-                    self.swallow = None;
-                    return out;
-                }
                 if self.keys.remove(&code) {
                     out.push(Out::Keyboard(vec![(EV_KEY, code, 0)]));
                 }
             }
-            WindowEvent::PointerDown { button, x, y } if !self.held => {
-                // The click that takes the mouse: capture; once held, the pointer home, then placed,
-                // then the click (`captured`, `tick`).
-                out.push(Out::Capture(true));
-                let to = ((f64::from(x) * scale.0 / PLACE_GAIN).round() as i32, (f64::from(y) * scale.1 / PLACE_GAIN).round() as i32);
-                let mut after = VecDeque::new();
-                after.push_back(WindowEvent::PointerDown { button, x, y });
-                self.placing = Some(Placing { since: now, to, after });
+            WindowEvent::PointerMoved { x, y } if !self.relative() => {
+                self.pending = Some(at(x, y));
+                out.extend(self.tick(now));
             }
-            WindowEvent::PointerDown { button, .. } => {
-                let code = button_code(button);
-                self.buttons.insert(code);
-                out.push(Out::Mouse(vec![(EV_KEY, code, 1)]));
+            WindowEvent::PointerMotion { dx, dy } if self.relative() => {
+                self.motion.0 = self.motion.0.saturating_add(dx);
+                self.motion.1 = self.motion.1.saturating_add(dy);
+                out.extend(self.tick(now));
             }
-            WindowEvent::PointerUp { button, .. } => {
+            WindowEvent::PointerDown { button, x, y } | WindowEvent::PointerUp { button, x, y } => {
+                let down = matches!(event, WindowEvent::PointerDown { .. });
                 let code = button_code(button);
-                if self.buttons.remove(&code) {
+                if self.relative() {
+                    out.extend(self.flush_motion(now));
+                    let changed = if down { self.mouse_buttons.insert(code) } else { self.mouse_buttons.remove(&code) };
+                    if changed {
+                        out.push(Out::Mouse(vec![(EV_KEY, code, i32::from(down))]));
+                    }
+                } else if down || self.pointer_buttons.contains(&code) {
+                    // The press or release where it happened, in the packet that moves there.
+                    self.pending = None;
+                    let (px, py) = at(x, y);
+                    let mut packet = self.position(px, py, now);
+                    if down {
+                        self.pointer_buttons.insert(code);
+                    } else {
+                        self.pointer_buttons.remove(&code);
+                    }
+                    packet.push((EV_KEY, code, i32::from(down)));
+                    out.push(Out::Pointer(packet));
+                } else if self.mouse_buttons.remove(&code) {
+                    // Pressed while the pointer was held, released after it was given back.
                     out.push(Out::Mouse(vec![(EV_KEY, code, 0)]));
                 }
             }
-            WindowEvent::PointerMotion { dx, dy } if self.held => {
-                let mut packet = Vec::new();
-                if dx != 0 {
-                    packet.push((EV_REL, REL_X, dx));
-                }
-                if dy != 0 {
-                    packet.push((EV_REL, REL_Y, dy));
-                }
-                if !packet.is_empty() {
-                    out.push(Out::Mouse(packet));
-                }
-            }
-            WindowEvent::Wheel { dx, dy, .. } if self.held => {
+            WindowEvent::Wheel { x, y, dx, dy } => {
                 self.wheel.0 += dx;
                 self.wheel.1 += dy;
                 let (h, v) = (self.wheel.0 / NOTCH, self.wheel.1 / NOTCH);
@@ -218,23 +265,38 @@ impl Input {
                     packet.push((EV_REL, REL_HWHEEL, h));
                 }
                 if !packet.is_empty() {
-                    out.push(Out::Mouse(packet));
+                    if self.relative() {
+                        out.extend(self.flush_motion(now));
+                        out.push(Out::Mouse(packet));
+                    } else {
+                        self.pending = None;
+                        let (px, py) = at(x, y);
+                        let mut p = self.position(px, py, now);
+                        p.extend(packet);
+                        out.push(Out::Pointer(p));
+                    }
                 }
             }
             WindowEvent::PointerCaptureLost => {
                 self.held = false;
-                self.placing = None;
-                out.extend(self.release_buttons());
+                out.extend(self.release_mouse_buttons());
                 out.push(Out::Title(TITLE_FREE));
             }
-            WindowEvent::FocusChanged { focused: false } => {
-                out.extend(self.release_keys());
-                out.extend(self.release_buttons());
-                self.placing = None;
-                if self.held {
-                    self.held = false;
-                    out.push(Out::Capture(false));
-                    out.push(Out::Title(TITLE_FREE));
+            WindowEvent::FocusChanged { focused } => {
+                self.focused = focused;
+                if focused {
+                    if self.wanted && !self.held {
+                        out.push(Out::Capture(true));
+                    }
+                } else {
+                    out.extend(self.release_keys());
+                    out.extend(self.release_pointer_buttons());
+                    out.extend(self.release_mouse_buttons());
+                    if self.held {
+                        self.held = false;
+                        out.push(Out::Capture(false));
+                        out.push(Out::Title(TITLE_FREE));
+                    }
                 }
             }
             _ => {}
@@ -242,49 +304,66 @@ impl Input {
         out
     }
 
-    /// Time passing: a placement due now finishes -- the move to the click, then what waited.
-    pub fn tick(&mut self, now: Instant, scale: (f64, f64)) -> Vec<Out> {
-        let due = self.placing.as_ref().is_some_and(|p| now.duration_since(p.since) >= PLACE_WAIT);
-        if !due {
+    /// The position packet for `(x, y)`, empty if the guest has it already.
+    fn position(&mut self, x: i32, y: i32, now: Instant) -> Packet {
+        if self.sent == Some((x, y)) {
             return Vec::new();
         }
-        let p = self.placing.take().expect("checked");
-        let mut out = vec![Out::Mouse(vec![(EV_REL, REL_X, p.to.0), (EV_REL, REL_Y, p.to.1)])];
-        for event in p.after {
-            // The click itself as a held mouse's: `held` may still be false for a scripted click.
-            let was = self.held;
-            self.held = true;
-            out.extend(self.event(&event, now, scale));
-            self.held = was;
-        }
-        out
+        self.sent = Some((x, y));
+        self.last_move = Some(now);
+        vec![(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)]
     }
 
-    /// A scripted click at window position (`x`, `y`): placed and pressed as a real one is, with no
-    /// capture asked for (a script has no hand on the mouse).
-    pub fn scripted_click(&mut self, x: i32, y: i32, button: PointerButton, now: Instant, scale: (f64, f64)) -> Vec<Out> {
-        let was = self.held;
-        self.held = false;
-        let mut out: Vec<Out> = self.event(&WindowEvent::PointerDown { button, x, y }, now, scale).into_iter().filter(|o| !matches!(o, Out::Capture(_))).collect();
-        self.held = was;
-        if self.placing.is_some() {
-            out.push(home());
-        }
-        if let Some(p) = &mut self.placing {
-            p.after.push_back(WindowEvent::PointerUp { button, x, y });
-        } else {
-            out.extend(self.event(&WindowEvent::PointerUp { button, x, y }, now, scale));
-        }
-        out
+    /// When the next coalesced move is due, if one is waiting.
+    #[must_use]
+    pub fn due(&self) -> Option<Instant> {
+        let waiting = self.pending.is_some() || self.motion != (0, 0);
+        waiting.then(|| self.last_move.map_or_else(Instant::now, |t| t + self.every))
     }
 
-    /// Give the mouse back: its buttons released, the capture ended.
-    fn release(&mut self) -> Vec<Out> {
-        self.held = false;
-        self.placing = None;
-        let mut out = self.release_buttons();
-        out.push(Out::Capture(false));
-        out.push(Out::Title(TITLE_FREE));
+    /// Time passing: the coalesced move, if one is waiting and due.
+    pub fn tick(&mut self, now: Instant) -> Vec<Out> {
+        if self.last_move.is_some_and(|t| now < t + self.every) {
+            return Vec::new();
+        }
+        if self.relative() {
+            return self.flush_motion(now);
+        }
+        match self.pending.take() {
+            Some((x, y)) => {
+                let packet = self.position(x, y, now);
+                if packet.is_empty() { Vec::new() } else { vec![Out::Pointer(packet)] }
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The waiting move now, due or not (a scripted move is one, not a stream).
+    pub fn flush(&mut self, now: Instant) -> Vec<Out> {
+        self.last_move = None;
+        self.tick(now)
+    }
+
+    fn flush_motion(&mut self, now: Instant) -> Vec<Out> {
+        let (dx, dy) = std::mem::take(&mut self.motion);
+        let mut packet = Vec::new();
+        if dx != 0 {
+            packet.push((EV_REL, REL_X, dx));
+        }
+        if dy != 0 {
+            packet.push((EV_REL, REL_Y, dy));
+        }
+        if packet.is_empty() {
+            return Vec::new();
+        }
+        self.last_move = Some(now);
+        vec![Out::Mouse(packet)]
+    }
+
+    /// A scripted click at window position (`x`, `y`): the window's own press and release there.
+    pub fn scripted_click(&mut self, x: i32, y: i32, button: PointerButton, now: Instant, scale: (f64, f64), display: (u32, u32)) -> Vec<Out> {
+        let mut out = self.event(&WindowEvent::PointerDown { button, x, y }, now, scale, display);
+        out.extend(self.event(&WindowEvent::PointerUp { button, x, y }, now, scale, display));
         out
     }
 
@@ -293,8 +372,13 @@ impl Input {
         if packet.is_empty() { Vec::new() } else { vec![Out::Keyboard(packet)] }
     }
 
-    fn release_buttons(&mut self) -> Vec<Out> {
-        let packet: Packet = std::mem::take(&mut self.buttons).into_iter().map(|b| (EV_KEY, b, 0)).collect();
+    fn release_pointer_buttons(&mut self) -> Vec<Out> {
+        let packet: Packet = std::mem::take(&mut self.pointer_buttons).into_iter().map(|b| (EV_KEY, b, 0)).collect();
+        if packet.is_empty() { Vec::new() } else { vec![Out::Pointer(packet)] }
+    }
+
+    fn release_mouse_buttons(&mut self) -> Vec<Out> {
+        let packet: Packet = std::mem::take(&mut self.mouse_buttons).into_iter().map(|b| (EV_KEY, b, 0)).collect();
         if packet.is_empty() { Vec::new() } else { vec![Out::Mouse(packet)] }
     }
 }
@@ -304,99 +388,100 @@ mod tests {
     use super::*;
 
     const ONE: (f64, f64) = (1.0, 1.0);
+    const DISPLAY: (u32, u32) = (1280, 720);
 
     fn key(scancode: u32, down: bool) -> WindowEvent {
         if down { WindowEvent::KeyDown { keycode: 0, scancode, repeat: false } } else { WindowEvent::KeyUp { keycode: 0, scancode } }
     }
 
+    fn abs(x: i32, y: i32) -> Packet {
+        vec![(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)]
+    }
+
     #[test]
     fn keys_go_to_the_keyboard_by_their_physical_code_and_repeat_as_the_driver_does() {
         let (mut input, now) = (Input::default(), Instant::now());
-        assert_eq!(input.event(&key(0x1E, true), now, ONE), [Out::Keyboard(vec![(EV_KEY, 30, 1)])], "A is KEY_A");
-        assert_eq!(input.event(&WindowEvent::KeyDown { keycode: 0, scancode: 0x1E, repeat: true }, now, ONE), [Out::Keyboard(vec![(EV_KEY, 30, 2)])]);
-        assert_eq!(input.event(&key(0x1E, false), now, ONE), [Out::Keyboard(vec![(EV_KEY, 30, 0)])]);
-        assert_eq!(input.event(&key(0xE048, true), now, ONE), [Out::Keyboard(vec![(EV_KEY, 103, 1)])], "Up is KEY_UP");
-        assert!(input.event(&key(0x1E, false), now, ONE).is_empty(), "a release of a key not down is not passed on");
-        assert!(input.event(&key(0xE05B, true), now, ONE).is_empty(), "the left Windows key is the host's");
-        assert!(input.event(&key(0xE05C, false), now, ONE).is_empty(), "and the right one");
+        assert_eq!(input.event(&key(0x1E, true), now, ONE, DISPLAY), [Out::Keyboard(vec![(EV_KEY, 30, 1)])], "A is KEY_A");
+        assert_eq!(input.event(&WindowEvent::KeyDown { keycode: 0, scancode: 0x1E, repeat: true }, now, ONE, DISPLAY), [Out::Keyboard(vec![(EV_KEY, 30, 2)])]);
+        assert_eq!(input.event(&key(0x1E, false), now, ONE, DISPLAY), [Out::Keyboard(vec![(EV_KEY, 30, 0)])]);
+        assert!(input.event(&key(0x1E, false), now, ONE, DISPLAY).is_empty(), "a release of a key not down is not passed on");
+        assert!(input.event(&key(0xE05B, true), now, ONE, DISPLAY).is_empty(), "the left Windows key is the host's");
+        assert_eq!(input.event(&key(0xE01D, true), now, ONE, DISPLAY), [Out::Keyboard(vec![(EV_KEY, 97, 1)])], "Right Ctrl is only a key");
     }
 
-    /// The click that takes the mouse: capture, home, then -- only after the wait -- the move to the
-    /// click and the click; a release that came meanwhile follows it, in order.
+    /// Free: a click is the absolute pointer's, where it was made, with nothing captured.
     #[test]
-    fn the_first_click_captures_places_the_pointer_and_then_clicks() {
+    fn a_click_lands_where_it_is_made_without_a_capture() {
         let (mut input, t0) = (Input::default(), Instant::now());
-        let out = input.event(&WindowEvent::PointerDown { button: PointerButton::Primary, x: 100, y: 50 }, t0, (2.0, 2.0));
-        assert_eq!(out, [Out::Capture(true)], "nothing moves before the capture is held");
-        assert_eq!(input.captured(true, t0), [Out::Title(TITLE_HELD), home()]);
-        assert!(input.event(&WindowEvent::PointerUp { button: PointerButton::Primary, x: 100, y: 50 }, t0, ONE).is_empty(), "held back");
-        assert!(input.tick(t0 + Duration::from_millis(100), ONE).is_empty(), "not yet");
-        assert_eq!(
-            input.tick(t0 + PLACE_WAIT, ONE),
-            [
-                Out::Mouse(vec![(EV_REL, REL_X, 98), (EV_REL, REL_Y, 49)]),
-                Out::Mouse(vec![(EV_KEY, BTN_LEFT, 1)]),
-                Out::Mouse(vec![(EV_KEY, BTN_LEFT, 0)]),
-            ],
-            "placed at the click's display position (window x2, then over the gain), then pressed and released"
-        );
-        assert_eq!(input.event(&WindowEvent::PointerMotion { dx: 3, dy: -4 }, t0, ONE), [Out::Mouse(vec![(EV_REL, REL_X, 3), (EV_REL, REL_Y, -4)])]);
-    }
-
-    #[test]
-    fn right_ctrl_gives_the_mouse_back_and_is_not_passed_on() {
-        let (mut input, t0) = (Input::default(), Instant::now());
-        input.event(&WindowEvent::PointerDown { button: PointerButton::Secondary, x: 1, y: 1 }, t0, ONE);
-        input.captured(true, t0);
-        input.tick(t0 + PLACE_WAIT, ONE);
-        let out = input.event(&key(0xE01D, true), t0, ONE);
-        assert_eq!(out, [Out::Mouse(vec![(EV_KEY, BTN_RIGHT, 0)]), Out::Capture(false), Out::Title(TITLE_FREE)]);
-        assert!(input.event(&key(0xE01D, false), t0, ONE).is_empty(), "its release is swallowed too");
+        let out = input.event(&WindowEvent::PointerDown { button: PointerButton::Primary, x: 100, y: 50 }, t0, (2.0, 2.0), DISPLAY);
+        assert_eq!(out, [Out::Pointer(vec![(EV_ABS, ABS_X, 200), (EV_ABS, ABS_Y, 100), (EV_KEY, BTN_LEFT, 1)])]);
+        let out = input.event(&WindowEvent::PointerUp { button: PointerButton::Primary, x: 100, y: 50 }, t0, (2.0, 2.0), DISPLAY);
+        assert_eq!(out, [Out::Pointer(vec![(EV_KEY, BTN_LEFT, 0)])], "same place: no move with it");
         assert!(!input.held());
-        assert!(input.event(&WindowEvent::PointerMotion { dx: 5, dy: 5 }, t0, ONE).is_empty(), "free: motion is not passed on");
-        assert_eq!(input.event(&key(0xE01D, true), t0, ONE), [Out::Keyboard(vec![(EV_KEY, RELEASE_KEY, 1)])], "while free Right Ctrl is a key");
     }
 
+    /// A flood of moves is one position per `MOVE_EVERY`, the newest.
     #[test]
-    fn wheel_notches_are_whole_and_losing_the_focus_releases_everything() {
-        let (mut input, t0) = (Input::default(), Instant::now());
-        input.event(&WindowEvent::PointerDown { button: PointerButton::Primary, x: 1, y: 1 }, t0, ONE);
-        input.captured(true, t0);
-        input.tick(t0 + PLACE_WAIT, ONE);
-        assert!(input.event(&WindowEvent::Wheel { x: 0, y: 0, dx: 0, dy: 60 }, t0, ONE).is_empty(), "half a notch");
-        assert_eq!(input.event(&WindowEvent::Wheel { x: 0, y: 0, dx: 0, dy: 60 }, t0, ONE), [Out::Mouse(vec![(EV_REL, REL_WHEEL, 1)])]);
-        assert_eq!(input.event(&WindowEvent::Wheel { x: 0, y: 0, dx: -240, dy: 0 }, t0, ONE), [Out::Mouse(vec![(EV_REL, REL_HWHEEL, -2)])]);
-        input.event(&key(0x11, true), t0, ONE);
-        let out = input.event(&WindowEvent::FocusChanged { focused: false }, t0, ONE);
-        assert_eq!(
-            out,
-            [
-                Out::Keyboard(vec![(EV_KEY, 17, 0)]),
-                Out::Mouse(vec![(EV_KEY, BTN_LEFT, 0)]),
-                Out::Capture(false),
-                Out::Title(TITLE_FREE),
-            ]
-        );
+    fn moves_are_coalesced_to_the_newest_and_sent_at_most_every_interval() {
+        let (mut input, t0) = (Input::new(Duration::from_millis(8)), Instant::now());
+        assert_eq!(input.event(&WindowEvent::PointerMoved { x: 1, y: 1 }, t0, ONE, DISPLAY), [Out::Pointer(abs(1, 1))], "the first at once");
+        for i in 2..100 {
+            assert!(input.event(&WindowEvent::PointerMoved { x: i, y: i }, t0 + Duration::from_millis(1), ONE, DISPLAY).is_empty(), "held back");
+        }
+        assert_eq!(input.due(), Some(t0 + Duration::from_millis(8)));
+        assert!(input.tick(t0 + Duration::from_millis(7)).is_empty());
+        assert_eq!(input.tick(t0 + Duration::from_millis(8)), [Out::Pointer(abs(99, 99))], "the newest");
+        assert_eq!(input.due(), None);
+        // A press flushes the position it happened at, even inside the interval.
+        let out = input.event(&WindowEvent::PointerDown { button: PointerButton::Secondary, x: 5, y: 6 }, t0 + Duration::from_millis(9), ONE, DISPLAY);
+        assert_eq!(out, [Out::Pointer(vec![(EV_ABS, ABS_X, 5), (EV_ABS, ABS_Y, 6), (EV_KEY, BTN_RIGHT, 1)])]);
+        // Positions stay on the display.
+        let out = input.event(&WindowEvent::PointerMoved { x: -40, y: 9000 }, t0 + Duration::from_secs(1), ONE, DISPLAY);
+        assert_eq!(out, [Out::Pointer(abs(0, 719))]);
     }
 
+    /// The app's capture holds the host's pointer; motion is then relative, summed, and the
+    /// release frees it again.
     #[test]
-    fn a_refused_capture_moves_nothing_and_the_next_click_asks_again() {
-        let (mut input, t0) = (Input::default(), Instant::now());
-        assert_eq!(input.event(&WindowEvent::PointerDown { button: PointerButton::Primary, x: 9, y: 9 }, t0, ONE), [Out::Capture(true)]);
-        assert!(input.captured(false, t0).is_empty());
-        assert!(input.tick(t0 + PLACE_WAIT, ONE).is_empty(), "no placement left");
-        assert_eq!(input.event(&WindowEvent::PointerDown { button: PointerButton::Primary, x: 9, y: 9 }, t0, ONE), [Out::Capture(true)]);
-    }
-
-    #[test]
-    fn a_scripted_click_is_placed_and_clicked_without_a_capture() {
-        let (mut input, t0) = (Input::default(), Instant::now());
-        let out = input.scripted_click(40, 30, PointerButton::Primary, t0, ONE);
-        assert_eq!(out, [Out::Mouse(vec![(EV_REL, REL_X, HOME), (EV_REL, REL_Y, HOME)])]);
-        assert_eq!(
-            input.tick(t0 + PLACE_WAIT, ONE),
-            [Out::Mouse(vec![(EV_REL, REL_X, 20), (EV_REL, REL_Y, 15)]), Out::Mouse(vec![(EV_KEY, BTN_LEFT, 1)]), Out::Mouse(vec![(EV_KEY, BTN_LEFT, 0)])]
-        );
+    fn the_apps_capture_holds_the_mouse_and_its_release_frees_it() {
+        let (mut input, t0) = (Input::new(Duration::from_millis(8)), Instant::now());
+        assert_eq!(input.guest_capture(true), [Out::Capture(true)]);
+        assert_eq!(input.captured(true), [Out::Title(TITLE_HELD)]);
+        assert_eq!(input.event(&WindowEvent::PointerMotion { dx: 3, dy: -4 }, t0, ONE, DISPLAY), [Out::Mouse(vec![(EV_REL, REL_X, 3), (EV_REL, REL_Y, -4)])]);
+        assert!(input.event(&WindowEvent::PointerMotion { dx: 1, dy: 1 }, t0 + Duration::from_millis(1), ONE, DISPLAY).is_empty());
+        assert!(input.event(&WindowEvent::PointerMotion { dx: 2, dy: 0 }, t0 + Duration::from_millis(2), ONE, DISPLAY).is_empty());
+        // A press sends the motion before it.
+        let out = input.event(&WindowEvent::PointerDown { button: PointerButton::Primary, x: 0, y: 0 }, t0 + Duration::from_millis(3), ONE, DISPLAY);
+        assert_eq!(out, [Out::Mouse(vec![(EV_REL, REL_X, 3), (EV_REL, REL_Y, 1)]), Out::Mouse(vec![(EV_KEY, BTN_LEFT, 1)])]);
+        assert_eq!(input.event(&WindowEvent::Wheel { x: 0, y: 0, dx: 0, dy: 120 }, t0, ONE, DISPLAY), [Out::Mouse(vec![(EV_REL, REL_WHEEL, 1)])]);
+        assert!(input.event(&WindowEvent::PointerMoved { x: 9, y: 9 }, t0, ONE, DISPLAY).is_empty(), "no absolute moves while held");
+        let out = input.guest_capture(false);
+        assert_eq!(out, [Out::Mouse(vec![(EV_KEY, BTN_LEFT, 0)]), Out::Capture(false), Out::Title(TITLE_FREE)]);
         assert!(!input.held());
+        assert_eq!(input.event(&WindowEvent::PointerMoved { x: 9, y: 9 }, t0 + Duration::from_secs(1), ONE, DISPLAY), [Out::Pointer(abs(9, 9))], "free again");
+    }
+
+    /// Losing the focus frees the host's pointer whatever the app holds; the focus back takes it
+    /// again if the app still holds the capture.
+    #[test]
+    fn the_focus_frees_the_mouse_and_takes_it_back() {
+        let (mut input, t0) = (Input::default(), Instant::now());
+        input.event(&key(0x11, true), t0, ONE, DISPLAY);
+        input.event(&WindowEvent::PointerDown { button: PointerButton::Primary, x: 1, y: 1 }, t0, ONE, DISPLAY);
+        let out = input.event(&WindowEvent::FocusChanged { focused: false }, t0, ONE, DISPLAY);
+        assert_eq!(out, [Out::Keyboard(vec![(EV_KEY, 17, 0)]), Out::Pointer(vec![(EV_KEY, BTN_LEFT, 0)])]);
+        assert!(input.guest_capture(true).is_empty(), "no capture asked for without the focus");
+        assert_eq!(input.event(&WindowEvent::FocusChanged { focused: true }, t0, ONE, DISPLAY), [Out::Capture(true)]);
+        input.captured(true);
+        let out = input.event(&WindowEvent::FocusChanged { focused: false }, t0, ONE, DISPLAY);
+        assert_eq!(out, [Out::Capture(false), Out::Title(TITLE_FREE)]);
+    }
+
+    #[test]
+    fn wheel_notches_are_whole() {
+        let (mut input, t0) = (Input::default(), Instant::now());
+        assert!(input.event(&WindowEvent::Wheel { x: 10, y: 10, dx: 0, dy: 60 }, t0, ONE, DISPLAY).is_empty(), "half a notch");
+        assert_eq!(input.event(&WindowEvent::Wheel { x: 10, y: 10, dx: 0, dy: 60 }, t0, ONE, DISPLAY), [Out::Pointer(vec![(EV_ABS, ABS_X, 10), (EV_ABS, ABS_Y, 10), (EV_REL, REL_WHEEL, 1)])]);
+        assert_eq!(input.event(&WindowEvent::Wheel { x: 10, y: 10, dx: -240, dy: 0 }, t0, ONE, DISPLAY), [Out::Pointer(vec![(EV_REL, REL_HWHEEL, -2)])]);
     }
 }

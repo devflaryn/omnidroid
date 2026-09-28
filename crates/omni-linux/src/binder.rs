@@ -551,7 +551,7 @@ impl State {
             Some(t) => proc.threads.entry(t).or_default().todo.push_back(work),
             None => proc.todo.push_back(work),
         }
-        crate::poll::notify();
+        crate::poll::notify_key(proc_key(std::ptr::from_ref(self), id));
     }
 }
 
@@ -746,6 +746,22 @@ impl Broker {
         Ok(())
     }
 
+    /// A guest service by name (`IServiceManager.checkService`, which does not wait for one): its
+    /// handle in the host's table, `None` while none is published.
+    ///
+    /// # Errors
+    /// The transaction's failure, or the exception `servicemanager` answered with.
+    pub fn check_service(&self, name: &str) -> Result<Option<u32>, String> {
+        let mut parcel = Parcel::with_interface_token(SERVICE_MANAGER);
+        parcel.string16(name);
+        let reply = self.host_transact(0, CHECK_SERVICE, parcel.bytes, &[]).map_err(|e| format!("transaction: errno {}", e.0))?;
+        match reply.get(0..4).map(|b| i32::from_le_bytes(b.try_into().expect("4"))) {
+            Some(0) => Ok(reply.get(4..24).filter(|o| u32_at(o, 0) == TYPE_HANDLE).map(|o| u32_at(o, 8))),
+            Some(exception) => Err(format!("exception {exception}: {}", read_string16(&reply, 4).unwrap_or_default())),
+            None => Err("an empty reply".into()),
+        }
+    }
+
     /// Publish host service `ptr` as `name` with `servicemanager` (`IServiceManager.addService`).
     ///
     /// # Errors
@@ -776,6 +792,7 @@ impl Broker {
 
 /// `IServiceManager`'s interface token and the transaction codes of its AIDL (Android 15).
 const SERVICE_MANAGER: &str = "android.os.IServiceManager";
+const CHECK_SERVICE: u32 = 2;
 const ADD_SERVICE: u32 = 3;
 /// `IServiceManager.DUMP_FLAG_PRIORITY_DEFAULT`.
 const DUMP_FLAG_PRIORITY_DEFAULT: i32 = 1 << 3;
@@ -792,14 +809,14 @@ const UNSET_WORK_SOURCE: i32 = -1;
 const FLAT_BINDER_FLAG_ACCEPTS_FDS: u32 = 0x100;
 
 /// A parcel as libbinder writes one, for the host's transactions.
-struct Parcel {
-    bytes: Vec<u8>,
+pub(crate) struct Parcel {
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl Parcel {
     /// `Parcel::writeInterfaceToken`, byte for byte as the image's libbinder writes it: strict-mode
     /// policy, work source, the partition header, the interface's name.
-    fn with_interface_token(interface: &str) -> Self {
+    pub(crate) fn with_interface_token(interface: &str) -> Self {
         let mut p = Self { bytes: Vec::new() };
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
@@ -808,12 +825,29 @@ impl Parcel {
         p
     }
 
-    fn i32(&mut self, v: i32) {
+    /// `writeInt32` (and `writeByte`, `writeBool`, `writeUint32`: libbinder widens them to 32 bits).
+    pub(crate) fn i32(&mut self, v: i32) {
         self.bytes.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// `writeInt64`: 8 bytes where the parcel is (libbinder aligns to 4 only).
+    pub(crate) fn i64(&mut self, v: i64) {
+        self.bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    pub(crate) fn f32(&mut self, v: f32) {
+        self.bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// `writeByteVector`: the length, then the bytes padded to 4.
+    pub(crate) fn byte_vector(&mut self, v: &[u8]) {
+        self.i32(v.len() as i32);
+        self.bytes.extend_from_slice(v);
+        self.bytes.resize((self.bytes.len() + 3) & !3, 0);
+    }
+
     /// Its length in UTF-16 units, the units and a NUL, padded to 4 bytes.
-    fn string16(&mut self, s: &str) {
+    pub(crate) fn string16(&mut self, s: &str) {
         let units: Vec<u16> = s.encode_utf16().chain([0]).collect();
         self.i32(units.len() as i32 - 1);
         for u in units {
@@ -833,6 +867,11 @@ impl Parcel {
         self.i32(stability);
         at
     }
+}
+
+/// The key a process's work is told by: its broker's state and its id.
+fn proc_key(state: *const State, id: ProcId) -> crate::poll::Key {
+    (state as crate::poll::Key).wrapping_add((id as crate::poll::Key).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as crate::poll::Key))
 }
 
 /// A `String16` at `at` in a parcel.
@@ -906,6 +945,12 @@ impl BinderFile {
             id
         };
         Arc::new(Self { broker, id, area: Mutex::default(), released: std::sync::atomic::AtomicBool::new(false), flushes: std::sync::atomic::AtomicU64::new(0) })
+    }
+
+    /// What work queued for this process is told by (`crate::poll::notify_key`).
+    #[must_use]
+    pub fn key(&self) -> crate::poll::Key {
+        proc_key(self.broker.state.data_ptr(), self.id)
     }
 
     /// `EPOLLIN` when there is work a looper of this process could take.
@@ -1480,7 +1525,9 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
     }
     let flushed = file.flushes.load(std::sync::atomic::Ordering::SeqCst);
     loop {
-        let seen = crate::poll::generation();
+        // Woken by work for this process (`queue`), or by a descriptor's close (`flush`, told to
+        // everyone).
+        let watch = crate::poll::watch(Some(vec![file.key()]));
         let work = {
             let mut st = file.broker.state.lock();
             let proc = st.proc_mut(file.id);
@@ -1541,7 +1588,7 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
                 p.mem.write(at, &out)?;
                 return Ok(out.len() as u64);
             }
-            None => crate::poll::wait_for_change(seen, None, t)?,
+            None => watch.wait(None, t)?,
         }
     }
 }

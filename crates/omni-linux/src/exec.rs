@@ -22,6 +22,7 @@ pub const AT_GID: u64 = 13;
 pub const AT_EGID: u64 = 14;
 pub const AT_PLATFORM: u64 = 15;
 pub const AT_HWCAP: u64 = 16;
+pub const AT_SYSINFO_EHDR: u64 = 33;
 pub const AT_CLKTCK: u64 = 17;
 pub const AT_SECURE: u64 = 23;
 pub const AT_RANDOM: u64 = 25;

@@ -100,8 +100,8 @@ fn run(file: Arc<OpenFile>, stream: TcpStream) {
     let outbound = Arc::clone(&held);
     let _ = std::thread::Builder::new().name("relay-out".into()).spawn(move || {
         loop {
-            let seen = crate::poll::generation();
             let Some(file) = outbound.lock().clone() else { return };
+            let watch = crate::poll::watch(crate::poll::key_of(&file).map(|k| vec![k]));
             match take(&file) {
                 Took::Data(bytes) => {
                     let mut frame = (bytes.len() as u32).to_le_bytes().to_vec();
@@ -116,7 +116,7 @@ fn run(file: Arc<OpenFile>, stream: TcpStream) {
                 }
                 Took::Nothing => {
                     drop(file);
-                    crate::poll::wait_for_change_host(seen, Instant::now() + Duration::from_millis(50));
+                    watch.sleep(Instant::now() + Duration::from_millis(50));
                 }
             }
         }

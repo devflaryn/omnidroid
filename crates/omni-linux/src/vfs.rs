@@ -106,6 +106,13 @@ impl Sysroot {
             if let Entry::File { sha256, .. } = &file.entry {
                 overlay.insert(sha256.clone(), file.host);
             }
+            // A directory the image does not have (`/vendor/framework`) is the device's, as its
+            // vendor partition would hold it.
+            let mut dir = file.guest.clone();
+            while let Some(cut) = dir.iter().rposition(|&b| b == b'/').filter(|&c| c > 0) {
+                dir.truncate(cut);
+                manifest.entries.entry(dir.clone()).or_insert(Entry::Dir { mode: 0o755 });
+            }
             manifest.entries.insert(file.guest, file.entry);
         }
         // What the device leaves out of the image (`device::left_out`): each path and what is under it.

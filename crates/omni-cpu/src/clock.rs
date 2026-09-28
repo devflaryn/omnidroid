@@ -58,6 +58,13 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 /// as a machine that has just been powered on would.
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
+/// The instant the counter reads 0 at: a kernel that turns the counter into a clock (a vDSO's
+/// `clock_gettime`) needs it to agree with its own clock exactly.
+#[must_use]
+pub fn cntpct_epoch() -> Instant {
+    *EPOCH.get_or_init(Instant::now)
+}
+
 /// `CNTPCT_EL0`: elapsed time since the process's counter epoch, in [`CNTFRQ_HZ`] ticks.
 ///
 /// Called from a dynarmic callback, so it must not panic. It does not: `Instant::now` does not
@@ -66,8 +73,7 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 /// written saturating anyway because a wrapped clock is a clock that goes backwards.
 #[must_use]
 pub fn cntpct() -> u64 {
-    let epoch = *EPOCH.get_or_init(Instant::now);
-    let nanos = Instant::now().saturating_duration_since(epoch).as_nanos();
+    let nanos = Instant::now().saturating_duration_since(cntpct_epoch()).as_nanos();
     let ticks = nanos.saturating_mul(u128::from(CNTFRQ_HZ)) / NANOS_PER_SECOND;
     u64::try_from(ticks).unwrap_or(u64::MAX)
 }

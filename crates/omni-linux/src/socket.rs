@@ -45,6 +45,8 @@ pub struct PairChannel {
     open: [std::sync::atomic::AtomicBool; 2],
     /// `SOCK_STREAM`: bytes; otherwise (`SOCK_SEQPACKET`, `SOCK_DGRAM`) whole messages.
     stream: bool,
+    /// An input channel's messages in flight (`crate::input_channel`), if this pair is one.
+    input: Mutex<crate::input_channel::Channel>,
 }
 
 /// In an init socket's type: `+passcred`.
@@ -74,6 +76,7 @@ pub fn pair(ty: u64, client: Cred, server: Cred) -> (Peer, Socket) {
         queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
         open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
         stream: ty == 1,
+        input: Mutex::default(),
     });
     let server = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side: 1 }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: server[0], passcred: false };
     (Peer::Pair { channel, side: 0 }, server)
@@ -190,7 +193,7 @@ impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(Peer::Pair { channel, side }) = &self.peer {
             channel.open[*side].store(false, std::sync::atomic::Ordering::SeqCst);
-            crate::poll::notify();
+            crate::poll::notify_key(Arc::as_ptr(channel) as crate::poll::Key);
         }
         if let Some(Peer::Host(_)) = &self.peer {
             self.peer = None;
@@ -242,8 +245,11 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
             if !channel.open[other].load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(crate::errno::EPIPE);
             }
+            if !channel.stream {
+                crate::input_channel::observe(&channel.input, bytes);
+            }
             channel.queues.lock()[other].push_back(bytes.to_vec());
-            crate::poll::notify();
+            crate::poll::notify_key(Arc::as_ptr(channel) as crate::poll::Key);
             Ok(bytes.len())
         }
         Some(Peer::PropertyService { pending, service }) => {
@@ -773,7 +779,7 @@ fn sys_recvfrom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 /// has nothing to read and its other end is open.
 fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) -> Result<usize, Errno> {
     loop {
-        let seen = crate::poll::generation();
+        let watch = crate::poll::watch(crate::poll::key_of(file).map(|k| vec![k]));
         let (r, pair) = {
             let mut kind = file.kind.lock();
             let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
@@ -781,9 +787,21 @@ fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) ->
         };
         let nonblocking = dontwait || *file.flags.lock() & 0o4000 != 0;
         match r {
-            Err(e) if e == crate::errno::EAGAIN && pair && !nonblocking => crate::poll::wait_for_change(seen, None, t)?,
+            Err(e) if e == crate::errno::EAGAIN && pair && !nonblocking => watch.wait(None, t)?,
             other => return other,
         }
+    }
+}
+
+/// What a change to this socket is told by: its pair's channel, its host socket, the bound socket
+/// it listens or receives on; `None` for the rest (their changes are told to everyone).
+#[must_use]
+pub fn key(socket: &Socket) -> Option<crate::poll::Key> {
+    match &socket.peer {
+        Some(Peer::Pair { channel, .. }) => Some(Arc::as_ptr(channel) as crate::poll::Key),
+        Some(Peer::Host(h)) => Some(Arc::as_ptr(h) as crate::poll::Key),
+        Some(Peer::Bound(b)) => Some(Arc::as_ptr(b) as crate::poll::Key),
+        _ => None,
     }
 }
 
@@ -857,6 +875,7 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
         open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
         stream: kind == 1,
+        input: Mutex::default(),
     });
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let mut fds = [0i32; 2];

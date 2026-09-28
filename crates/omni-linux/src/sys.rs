@@ -143,11 +143,43 @@ pub(crate) fn clock_now(p: &Process, clock: u64) -> Result<Duration, Errno> {
 /// And one for every host process of an instance: an app's host process (`crate::zygote`) is
 /// given its system's origin -- the wall-clock time at which the clock read zero,
 /// `OMNI_MONOTONIC_ORIGIN` in nanoseconds -- and reads the same numbers from then on.
+///
+/// **Read from the guest's counter** (`CNTVCT_EL0`, [`omni_cpu::cntpct`]) as the vDSO reads it
+/// (`crate::vdso`): [`counter_ns`] of it plus [`counter_offset`]. The system call and the vDSO are
+/// then one function of time, and a clock read one way and then the other never goes back.
 #[must_use]
 pub fn monotonic() -> Duration {
-    let shift = clock_anchor().0;
-    let ns = omni_platform::clock::monotonic_now().as_nanos() as i128 + shift;
+    let ns = i128::from(counter_ns(omni_cpu::cntpct())) + counter_offset();
     Duration::from_nanos(ns.max(0) as u64)
+}
+
+/// Nanoseconds of `ticks` of the guest's counter, as the vDSO computes them: whole seconds, then
+/// the remainder, so nothing overflows.
+#[must_use]
+pub fn counter_ns(ticks: u64) -> u64 {
+    let f = u64::from(omni_cpu::CNTFRQ_HZ);
+    (ticks / f) * 1_000_000_000 + (ticks % f) * 1_000_000_000 / f
+}
+
+/// `CLOCK_REALTIME` less `CLOCK_MONOTONIC`, in ns: the instance's origin -- the wall-clock time at
+/// which its `CLOCK_MONOTONIC` read zero (`OMNI_MONOTONIC_ORIGIN`). The guest's wall clock is its
+/// monotonic clock from there, in every host process of the instance and through the vDSO alike;
+/// it does not follow the host's clock being set while it runs.
+#[must_use]
+pub fn realtime_offset() -> i128 {
+    clock_anchor().1
+}
+
+/// `CLOCK_MONOTONIC` when the guest's counter read 0, in ns: the counter's epoch on the platform's
+/// monotonic clock, plus this instance's shift of it.
+#[must_use]
+pub fn counter_offset() -> i128 {
+    static OFFSET: std::sync::OnceLock<i128> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        let (counter, platform) = (omni_cpu::cntpct_epoch(), omni_platform::clock::monotonic_epoch());
+        let since = if counter >= platform { counter.duration_since(platform).as_nanos() as i128 } else { -(platform.duration_since(counter).as_nanos() as i128) };
+        since + clock_anchor().0
+    })
 }
 
 /// `OMNI_MONOTONIC_ORIGIN` for a host process started for this instance.
@@ -172,7 +204,8 @@ fn clock_anchor() -> &'static (i128, i128) {
 
 fn now(_p: &Process, clock: u64) -> Result<Duration, Errno> {
     match clock {
-        0 | 5 | 8 | 11 => SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| EINVAL), // REALTIME(_COARSE/_ALARM), TAI
+        // REALTIME(_COARSE/_ALARM), TAI: the monotonic clock from the instance's origin, as the vDSO.
+        0 | 5 | 8 | 11 => Ok(Duration::from_nanos((monotonic().as_nanos() as i128 + realtime_offset()).max(0) as u64)),
         1 | 2 | 3 | 4 | 6 | 7 | 9 => Ok(monotonic()), // monotonic family, cputime approximated
         _ => Err(EINVAL),
     }
@@ -889,13 +922,11 @@ fn sys_rt_sigtimedwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             }
         }
     };
+    // Its own `siginfo` when it came with one (a timer's `SI_TIMER`: bionic's SIGEV_THREAD thread
+    // calls its callback on exactly that), else a kill's.
+    let info = p.take_info(t.tid, sig as i32).unwrap_or(crate::signal::SigInfo { signo: sig as i32, code: crate::signal::SI_TKILL, pid: p.sys.pid, uid: p.sys.uid(), ..crate::signal::SigInfo::default() });
     if a[1] != 0 {
-        let mut info = [0u8; 128];
-        info[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
-        info[8..12].copy_from_slice(&crate::signal::SI_TKILL.to_le_bytes());
-        info[16..20].copy_from_slice(&p.sys.pid.to_le_bytes());
-        info[20..24].copy_from_slice(&p.sys.uid().to_le_bytes());
-        p.mem.write(a[1], &info)?;
+        p.mem.write(a[1], &crate::signal::encode(&info))?;
     }
     Ok(sig)
 }

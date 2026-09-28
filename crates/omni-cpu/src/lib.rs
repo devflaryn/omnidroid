@@ -65,7 +65,7 @@ pub mod stats;
 mod thunk;
 mod tls;
 
-pub use clock::{cntpct, CNTFRQ_HZ};
+pub use clock::{cntpct, cntpct_epoch, CNTFRQ_HZ};
 pub use context::{
     ContextCost, GuestAddressSpace, GuestRange, GuestThreadConfig, TLS_SLOT_STACK_GUARD_OFFSET,
 };

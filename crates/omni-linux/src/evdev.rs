@@ -29,10 +29,14 @@ use crate::process::{Process, Task};
 pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
+pub const EV_ABS: u16 = 0x03;
 pub const EV_MSC: u16 = 0x04;
 /// `SYN_REPORT`, `SYN_DROPPED`.
 pub const SYN_REPORT: u16 = 0;
 pub const SYN_DROPPED: u16 = 3;
+/// Absolute axes.
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
 /// Relative axes.
 pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
@@ -67,6 +71,7 @@ pub struct Spec {
     pub id: [u16; 4],
     pub keys: Vec<u16>,
     pub rels: Vec<u16>,
+    pub abs: Vec<u16>,
     pub msc: Vec<u16>,
 }
 
@@ -74,7 +79,7 @@ impl Spec {
     /// A full PC keyboard: every key code from `KEY_ESC` to `KEY_MICMUTE`.
     #[must_use]
     pub fn keyboard(name: &str) -> Self {
-        Self { name: name.into(), id: [BUS_USB, 0, 0, 1], keys: (1..=248).collect(), rels: Vec::new(), msc: Vec::new() }
+        Self { name: name.into(), id: [BUS_USB, 0, 0, 1], keys: (1..=248).collect(), rels: Vec::new(), abs: Vec::new(), msc: Vec::new() }
     }
 
     /// A five-button wheel mouse: relative X and Y, both wheels.
@@ -85,6 +90,7 @@ impl Spec {
             id: [BUS_USB, 0, 0, 1],
             keys: vec![BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA],
             rels: vec![REL_X, REL_Y, REL_HWHEEL, REL_WHEEL],
+            abs: Vec::new(),
             msc: Vec::new(),
         }
     }
@@ -96,6 +102,9 @@ impl Spec {
         }
         if !self.rels.is_empty() {
             t.push(EV_REL);
+        }
+        if !self.abs.is_empty() {
+            t.push(EV_ABS);
         }
         if !self.msc.is_empty() {
             t.push(EV_MSC);
@@ -200,7 +209,7 @@ impl Device {
             q.extend(packet.iter().copied());
         }
         drop(clients);
-        crate::poll::notify();
+        crate::poll::notify_key(std::ptr::from_ref(self) as crate::poll::Key);
     }
 
     /// The bitmap of `kind`'s codes (`EVIOCGBIT`), `kind` 0 being the event types.
@@ -209,6 +218,7 @@ impl Device {
             0 => (self.spec.types(), SMALL_BYTES),
             EV_KEY => (self.spec.keys.clone(), KEY_BYTES),
             EV_REL => (self.spec.rels.clone(), SMALL_BYTES),
+            EV_ABS => (self.spec.abs.clone(), SMALL_BYTES),
             EV_MSC => (self.spec.msc.clone(), SMALL_BYTES),
             0x15 => (Vec::new(), FF_BYTES),
             _ => (Vec::new(), SMALL_BYTES),
@@ -238,7 +248,7 @@ fn client_read(client: &Client, buf: &mut [u8], nonblocking: bool, task: &Task) 
         return Err(EINVAL);
     }
     loop {
-        let seen = crate::poll::generation();
+        let watch = crate::poll::watch(Some(vec![Arc::as_ptr(&client.device) as crate::poll::Key]));
         {
             let mut q = client.queue.lock();
             if !q.is_empty() {
@@ -254,7 +264,7 @@ fn client_read(client: &Client, buf: &mut [u8], nonblocking: bool, task: &Task) 
         if nonblocking {
             return Err(EAGAIN);
         }
-        crate::poll::wait_for_change(seen, None, task)?;
+        watch.wait(None, task)?;
     }
 }
 

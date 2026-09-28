@@ -54,10 +54,16 @@ pub struct SigInfo {
     /// SIGSYS: `si_syscall` and `si_arch` (the call's address is `addr`).
     pub syscall: i32,
     pub arch: u32,
+    /// `SI_TIMER`: `si_timerid` and `si_overrun`; with `SI_QUEUE`, `si_value` too.
+    pub timer: i32,
+    pub overrun: i32,
+    pub value: u64,
 }
 
 /// `si_code` values used here.
 pub const SI_USER: i32 = 0;
+pub const SI_QUEUE: i32 = -1;
+pub const SI_TIMER: i32 = -2;
 pub const SI_TKILL: i32 = -6;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
@@ -110,6 +116,36 @@ fn uc_stack(altstack: [u8; 24], sp: u64) -> [u8; 24] {
     s
 }
 
+/// A `siginfo_t` (128 bytes), laid out by what it says: a fault's address, a seccomp trap's call,
+/// a timer's id, overrun and value (`_timer`), a queued signal's sender and value (`_rt`), or a
+/// sender (`_kill`).
+#[must_use]
+pub fn encode(info: &SigInfo) -> [u8; 128] {
+    let mut b = [0u8; 128];
+    let mut put = |at: usize, bytes: &[u8]| b[at..at + bytes.len()].copy_from_slice(bytes);
+    put(0, &info.signo.to_le_bytes());
+    put(4, &info.errno.to_le_bytes());
+    put(8, &info.code.to_le_bytes());
+    if info.signo == 31 && info.code == SYS_SECCOMP {
+        put(16, &info.addr.to_le_bytes()); // si_call_addr
+        put(24, &info.syscall.to_le_bytes()); // si_syscall
+        put(28, &info.arch.to_le_bytes()); // si_arch
+    } else if info.code > 0 && matches!(info.signo, 4 | 5 | 7 | 8 | 11) {
+        put(16, &info.addr.to_le_bytes()); // si_addr
+    } else if info.code == SI_TIMER {
+        put(16, &info.timer.to_le_bytes()); // si_timerid
+        put(20, &info.overrun.to_le_bytes()); // si_overrun
+        put(24, &info.value.to_le_bytes()); // si_value
+    } else {
+        put(16, &info.pid.to_le_bytes()); // si_pid
+        put(20, &info.uid.to_le_bytes()); // si_uid
+        if info.code == SI_QUEUE {
+            put(24, &info.value.to_le_bytes()); // si_value
+        }
+    }
+    b
+}
+
 pub struct Frame;
 
 impl Frame {
@@ -118,20 +154,7 @@ impl Frame {
     pub fn build(regs: &Regs, info: &SigInfo, mask: u64, altstack: [u8; 24]) -> Vec<u8> {
         let mut b = vec![0u8; FRAME_BYTES];
         let put = |b: &mut Vec<u8>, at: usize, bytes: &[u8]| b[at..at + bytes.len()].copy_from_slice(bytes);
-        // siginfo
-        put(&mut b, 0, &info.signo.to_le_bytes());
-        put(&mut b, 4, &info.errno.to_le_bytes());
-        put(&mut b, 8, &info.code.to_le_bytes());
-        if info.signo == 31 && info.code == SYS_SECCOMP {
-            put(&mut b, 16, &info.addr.to_le_bytes()); // si_call_addr
-            put(&mut b, 24, &info.syscall.to_le_bytes()); // si_syscall
-            put(&mut b, 28, &info.arch.to_le_bytes()); // si_arch
-        } else if info.code > 0 && matches!(info.signo, 4 | 5 | 7 | 8 | 11) {
-            put(&mut b, 16, &info.addr.to_le_bytes()); // si_addr
-        } else {
-            put(&mut b, 16, &info.pid.to_le_bytes()); // si_pid
-            put(&mut b, 20, &info.uid.to_le_bytes()); // si_uid
-        }
+        put(&mut b, 0, &encode(info));
         // ucontext
         let uc = UCONTEXT_OFFSET;
         put(&mut b, uc + 16, &uc_stack(altstack, regs.sp));

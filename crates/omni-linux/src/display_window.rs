@@ -34,12 +34,15 @@
 //!
 //! # Keyboard and mouse
 //!
-//! With [`Options::input`], the window's keyboard and mouse are a keyboard and a mouse of the
-//! device's (`crate::evdev`, `/dev/input/event0` and `event1`, registered before system_server's
-//! `InputReader` scans), translated by [`crate::window_input`]: keys whenever the window has the
-//! focus; the mouse **held on a click** (the host cursor hidden, Android's own pointer placed where
-//! the click was, then driven by the mouse's raw motion) and **given back with Right Ctrl** or when
-//! the window loses the focus. The title bar says which.
+//! With [`Options::input`], the window's keyboard and mouse are the device's, translated by
+//! [`crate::window_input`]: a keyboard and a relative mouse (`crate::evdev`, `/dev/input/event0`
+//! and `event1`, registered before system_server's `InputReader` scans) and the absolute pointer
+//! (`crate::inject`: a mouse's events handed to the input dispatcher). Keys whenever the window has the
+//! focus; the mouse **free and absolute** -- the host's cursor over the window is the app's pointer
+//! -- and **held** (the host's cursor captured, raw motion to the relative mouse) only while the app
+//! holds Android's pointer capture, as [`crate::input_channel::capture`] reports it. Moves are
+//! coalesced ([`crate::window_input::MOVE_EVERY`]). `OMNI_HOST_CURSOR=hide` hides the host's cursor
+//! over the window (the app draws its own); by default it is shown.
 //!
 //! # Scripted resizes and input
 //!
@@ -47,9 +50,11 @@
 //! [`CONTROL_EVERY`]): `size <w>x<h>` resizes the **window** as a drag would -- the display then
 //! follows by the same path as a user's resize, which is what makes that path testable. `key
 //! <scancode> [down|up]` (a set-1 scancode, `0x`-hex or decimal, `0xE0..` for an extended key;
-//! both halves when neither is named), `click <x> <y> [primary|secondary|middle]` (window pixels:
-//! placed and clicked as a real first click is, without a capture), `move <dx> <dy>` and `wheel
-//! <notches>` drive the input devices as the window's own events would. `chrome show` / `chrome
+//! both halves when neither is named), `click <x> <y> [primary|secondary|middle]` and `point <x>
+//! <y>` (window pixels, as the window's own press and release, or move, there), `move <dx> <dy>`
+//! (the relative mouse, as captured motion), `wheel <notches>` (the absolute pointer, where it is)
+//! and `flood <hz> <seconds>` (window moves around a circle at that rate -- a mouse's report rate,
+//! through the same coalescing) drive the input devices as the window's own events would. `chrome show` / `chrome
 //! hide` present the system's bars and taskbar with the app, or the app alone (the default,
 //! [`Composer::set_show_chrome`]). Unknown lines are reported and skipped.
 //!
@@ -72,6 +77,7 @@ use omni_platform::window::{Presenter, Window, WindowDesc, WindowEvent};
 use omni_platform::window::PointerButton;
 
 use crate::evdev::{Device, Spec, EV_REL, REL_WHEEL, REL_X, REL_Y};
+use crate::window_input::move_every_from_env;
 use crate::hal::composer::{Composer, MIN_SIDE};
 use crate::hal::framebuffer::Framebuffer;
 use crate::window_input::{Input, Out, TITLE_FREE};
@@ -99,10 +105,11 @@ pub struct Options {
     pub input: bool,
 }
 
-/// The two input devices: the keyboard, the mouse.
+/// The input devices: the keyboard, the relative mouse, the absolute pointer.
 struct Devices {
     keyboard: Arc<Device>,
     mouse: Arc<Device>,
+    pointer: crate::inject::Injector,
 }
 
 /// Show the display in a window of its own, on threads of their own (see this module's "Two
@@ -116,9 +123,10 @@ pub fn spawn(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: Op
     let devices = options.input.then(|| Devices {
         keyboard: crate::evdev::register(Spec::keyboard("omnidroid keyboard")),
         mouse: crate::evdev::register(Spec::mouse("omnidroid mouse")),
+        pointer: crate::inject::Injector::new(crate::binder::broker(crate::binder::Context::Binder)),
     });
     if let Some(d) = &devices {
-        eprintln!("[window] input: /dev/input/event{} keyboard, /dev/input/event{} mouse", d.keyboard.number, d.mouse.number);
+        eprintln!("[window] input: /dev/input/event{} keyboard, /dev/input/event{} mouse; the pointer injected", d.keyboard.number, d.mouse.number);
     }
     std::thread::Builder::new().name("omni-display-window".into()).spawn(move || run(framebuffer, composer, &options, devices.as_ref()))
 }
@@ -130,7 +138,11 @@ enum Command {
     /// A key by its set-1 scancode: down, up, or (`None`) both.
     Key(u32, Option<bool>),
     Click(i32, i32, PointerButton),
+    /// The pointer to a window position.
+    Point(i32, i32),
     Move(i32, i32),
+    /// Window moves at `hz` for `seconds`.
+    Flood(u32, u32),
     Wheel(i32),
     /// Present the system's chrome with the app (`chrome show`) or the app alone (`chrome hide`).
     Chrome(bool),
@@ -163,6 +175,8 @@ fn parse(line: &str) -> Option<Command> {
             Some(Command::Click(i32::try_from(int(x)?).ok()?, i32::try_from(int(y)?).ok()?, button))
         }
         ["move", dx, dy] => Some(Command::Move(i32::try_from(int(dx)?).ok()?, i32::try_from(int(dy)?).ok()?)),
+        ["point", x, y] => Some(Command::Point(i32::try_from(int(x)?).ok()?, i32::try_from(int(y)?).ok()?)),
+        ["flood", hz, secs] => Some(Command::Flood(u32::try_from(int(hz)?).ok().filter(|&h| h > 0)?, u32::try_from(int(secs)?).ok()?)),
         ["wheel", n] => Some(Command::Wheel(i32::try_from(int(n)?).ok()?)),
         ["chrome", "show"] => Some(Command::Chrome(true)),
         ["chrome", "hide"] => Some(Command::Chrome(false)),
@@ -179,22 +193,23 @@ fn new_lines(text: &str, seen: usize) -> (Vec<String>, usize) {
 }
 
 /// Do what the input translation asks: send to a device, take or give back the capture, retitle.
-fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Devices, now: Instant) {
+fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Devices) {
     let mut queue: std::collections::VecDeque<Out> = outs.into();
     while let Some(out) = queue.pop_front() {
         match out {
             Out::Keyboard(packet) => devices.keyboard.send(&packet),
             Out::Mouse(packet) => devices.mouse.send(&packet),
+            Out::Pointer(packet) => devices.pointer.send(&packet),
             Out::Capture(take) => {
                 let held = window.set_pointer_capture(take).unwrap_or_else(|e| {
                     eprintln!("[window] pointer capture: {e}");
                     false
                 });
-                // Said, so a run's log shows when a hand was on the mouse.
-                eprintln!("[window] mouse {}", if !take { "given back" } else if held { "held (a click in the window)" } else { "not held: the window has no focus" });
+                // Said, so a run's log shows when the app held the mouse.
+                eprintln!("[window] mouse {}", if !take { "free" } else if held { "held (the app holds the pointer capture)" } else { "not held: the window has no focus" });
                 if take {
                     // What follows the answer comes before anything else queued.
-                    for o in input.captured(held, now).into_iter().rev() {
+                    for o in input.captured(held).into_iter().rev() {
                         queue.push_front(o);
                     }
                 }
@@ -227,10 +242,17 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     };
     window.show();
     eprintln!("[window] {width}x{height}: the display, live (a window resize resizes the display)");
-    let mut input = Input::default();
+    let mut input = Input::new(move_every_from_env());
     if devices.is_some() {
         let _ = window.set_title(TITLE_FREE);
+        if std::env::var("OMNI_HOST_CURSOR").as_deref() == Ok("hide") {
+            let _ = window.set_cursor_hidden(true);
+        }
     }
+    // The app's pointer capture as last seen (`input_channel::capture`'s counter).
+    let mut capture_seen = u64::MAX;
+    // A scripted flood: (until, interval, next, step).
+    let mut flood: Option<(Instant, Duration, Instant, u32)> = None;
     let stop = Arc::new(AtomicBool::new(false));
     let presenter = window.presenter();
     let present = {
@@ -247,7 +269,12 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     };
     let (mut control_seen, mut control_read) = (0usize, Instant::now());
     loop {
-        window.wait(PUMP_WAIT);
+        // Woken by input, else when a coalesced move or a flood's next step is due.
+        let mut wait = PUMP_WAIT;
+        for due in [input.due(), flood.map(|f| f.2)].into_iter().flatten() {
+            wait = wait.min(due.saturating_duration_since(Instant::now()));
+        }
+        window.wait(wait);
         let events: Vec<WindowEvent> = window.poll_events().collect();
         if events.contains(&WindowEvent::CloseRequested) {
             break;
@@ -255,12 +282,34 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
         if let Some(devices) = devices {
             let now = Instant::now();
             let s = scale(&window, &composer);
-            for event in &events {
-                let outs = input.event(event, now, s);
-                perform(outs, &mut window, &mut input, devices, now);
+            let display = composer.display_size();
+            let (wanted, count) = crate::input_channel::capture();
+            if count != capture_seen {
+                capture_seen = count;
+                let outs = input.guest_capture(wanted == Some(true));
+                perform(outs, &mut window, &mut input, devices);
             }
-            let outs = input.tick(now, s);
-            perform(outs, &mut window, &mut input, devices, now);
+            for event in &events {
+                let outs = input.event(event, now, s, display);
+                perform(outs, &mut window, &mut input, devices);
+            }
+            if let Some((until, every, next, step)) = &mut flood {
+                if now >= *until {
+                    flood = None;
+                    eprintln!("[window] flood done");
+                } else if now >= *next {
+                    // A circle of 200 window pixels around the middle, a step a report.
+                    let (w, h) = window.client_size().unwrap_or((1280, 720));
+                    let a = f64::from(*step) * 0.05;
+                    let (x, y) = ((f64::from(w) / 2.0 + 200.0 * a.cos()) as i32, (f64::from(h) / 2.0 + 200.0 * a.sin()) as i32);
+                    *step += 1;
+                    *next += *every;
+                    let outs = input.event(&WindowEvent::PointerMoved { x, y }, now, s, display);
+                    perform(outs, &mut window, &mut input, devices);
+                }
+            }
+            let outs = input.tick(now);
+            perform(outs, &mut window, &mut input, devices);
         }
         if present.is_finished() {
             eprintln!("[window] the present thread ended; closing the window");
@@ -282,12 +331,17 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
                                 eprintln!("[window] control: {line}");
                                 composer.set_show_chrome(show);
                             }
+                            Some(Command::Flood(hz, secs)) if devices.is_some() => {
+                                eprintln!("[window] control: {line}");
+                                let now = Instant::now();
+                                flood = Some((now + Duration::from_secs(u64::from(secs)), Duration::from_micros(1_000_000 / u64::from(hz)), now, 0));
+                            }
                             Some(command) => match devices {
                                 Some(devices) => {
                                     eprintln!("[window] control: {line}");
                                     let (now, s) = (Instant::now(), scale(&window, &composer));
-                                    let outs = scripted(command, &mut input, now, s);
-                                    perform(outs, &mut window, &mut input, devices, now);
+                                    let outs = scripted(command, &mut input, now, s, composer.display_size());
+                                    perform(outs, &mut window, &mut input, devices);
                                 }
                                 None => eprintln!("[window] control: {line:?}: no input devices (OMNI_WINDOW_INPUT=0)"),
                             },
@@ -304,24 +358,30 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
 }
 
 /// An input command from the control file, as the window's own events would be.
-fn scripted(command: Command, input: &mut Input, now: Instant, s: (f64, f64)) -> Vec<Out> {
+fn scripted(command: Command, input: &mut Input, now: Instant, s: (f64, f64), display: (u32, u32)) -> Vec<Out> {
     let key = |down| if down { WindowEvent::KeyDown { keycode: 0, scancode: 0, repeat: false } } else { WindowEvent::KeyUp { keycode: 0, scancode: 0 } };
     let with_code = |e: WindowEvent, code: u32| match e {
         WindowEvent::KeyDown { repeat, .. } => WindowEvent::KeyDown { keycode: 0, scancode: code, repeat },
         _ => WindowEvent::KeyUp { keycode: 0, scancode: code },
     };
     match command {
-        Command::Key(code, Some(down)) => input.event(&with_code(key(down), code), now, s),
+        Command::Key(code, Some(down)) => input.event(&with_code(key(down), code), now, s, display),
         Command::Key(code, None) => {
-            let mut out = input.event(&with_code(key(true), code), now, s);
-            out.extend(input.event(&with_code(key(false), code), now, s));
+            let mut out = input.event(&with_code(key(true), code), now, s, display);
+            out.extend(input.event(&with_code(key(false), code), now, s, display));
             out
         }
-        Command::Click(x, y, button) => input.scripted_click(x, y, button, now, s),
-        // Straight to the mouse: a script moves Android's pointer whether or not the mouse is held.
+        Command::Click(x, y, button) => input.scripted_click(x, y, button, now, s, display),
+        Command::Point(x, y) => {
+            let mut out = input.event(&WindowEvent::PointerMoved { x, y }, now, s, display);
+            // Sent now, not at the next tick: a script's move is one, not a stream.
+            out.extend(input.flush(now));
+            out
+        }
+        // Straight to the relative mouse: what captured motion is.
         Command::Move(dx, dy) => vec![Out::Mouse(vec![(EV_REL, REL_X, dx), (EV_REL, REL_Y, dy)])],
-        Command::Wheel(n) => vec![Out::Mouse(vec![(EV_REL, REL_WHEEL, n)])],
-        Command::Size(..) | Command::Chrome(_) => Vec::new(),
+        Command::Wheel(n) => vec![Out::Pointer(vec![(EV_REL, REL_WHEEL, n)])],
+        Command::Size(..) | Command::Chrome(_) | Command::Flood(..) => Vec::new(),
     }
 }
 
@@ -396,9 +456,11 @@ mod tests {
         assert_eq!(parse("click 5 6 secondary"), Some(Command::Click(5, 6, PointerButton::Secondary)));
         assert_eq!(parse("move -20 15"), Some(Command::Move(-20, 15)));
         assert_eq!(parse("wheel -2"), Some(Command::Wheel(-2)));
+        assert_eq!(parse("point 7 8"), Some(Command::Point(7, 8)));
+        assert_eq!(parse("flood 1000 5"), Some(Command::Flood(1000, 5)));
         assert_eq!(parse("chrome show"), Some(Command::Chrome(true)));
         assert_eq!(parse("chrome hide"), Some(Command::Chrome(false)));
-        for bad in ["chrome", "chrome on", "size","size 960", "size 960x", "size x600", "size 9x6 extra", "resize 1x1", "", "size -1x5", "key", "key zz", "key 1 sideways", "click 1", "click 1 2 left", "move 1"] {
+        for bad in ["chrome", "chrome on", "size","size 960", "size 960x", "size x600", "size 9x6 extra", "resize 1x1", "", "size -1x5", "key", "key zz", "key 1 sideways", "click 1", "click 1 2 left", "move 1", "flood 0 5", "point 1"] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
     }

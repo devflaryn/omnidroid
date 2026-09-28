@@ -1,0 +1,6 @@
+linux-vdso.so, from vdso.S and vdso.lds, with the Android NDK r28c (Windows):
+
+    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe --target=aarch64-linux-android35 -nostdlib -shared -fPIC \
+        -Wl,-T,vdso.lds -Wl,-soname=linux-vdso.so.1 -Wl,--hash-style=both -Wl,--no-undefined -Wl,--build-id=none \
+        -Wl,-z,norelro -Wl,-z,max-page-size=4096 -Wl,--strip-debug -o linux-vdso.so vdso.S
+    cp linux-vdso.so ../../lib64/linux-vdso.so    (and its sha256 into ../../SHA256SUMS)

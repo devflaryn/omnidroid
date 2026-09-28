@@ -57,8 +57,14 @@ impl Drop for End {
         count.fetch_sub(1, Ordering::SeqCst);
         let _held = self.pipe.bytes.lock();
         self.pipe.changed.notify_all();
-        crate::poll::notify();
+        crate::poll::notify_key(Arc::as_ptr(&self.pipe) as crate::poll::Key);
     }
+}
+
+/// What a change to this pipe is told by (`crate::poll::notify_key`).
+#[must_use]
+pub fn key(end: &End) -> crate::poll::Key {
+    Arc::as_ptr(&end.pipe) as crate::poll::Key
 }
 
 /// Bytes queued in the pipe (`FIONREAD`).
@@ -108,7 +114,7 @@ pub fn read(pipe: &Pipe, buf: &mut [u8], nonblocking: bool, task: &Task) -> Resu
                 *slot = b;
             }
             pipe.changed.notify_all();
-            crate::poll::notify();
+            crate::poll::notify_key(std::ptr::from_ref(pipe) as crate::poll::Key);
             return Ok(n);
         }
         if pipe.writers.load(Ordering::SeqCst) == 0 {
@@ -142,7 +148,7 @@ pub fn write(pipe: &Pipe, data: &[u8], nonblocking: bool, task: &Task) -> Result
         bytes.extend(&data[done..done + n]);
         done += n;
         pipe.changed.notify_all();
-        crate::poll::notify();
+        crate::poll::notify_key(std::ptr::from_ref(pipe) as crate::poll::Key);
     }
     Ok(done)
 }
@@ -158,7 +164,7 @@ pub fn take(end: &End) -> crate::relay::Took {
     if !bytes.is_empty() {
         let out: Vec<u8> = bytes.drain(..).collect();
         pipe.changed.notify_all();
-        crate::poll::notify();
+        crate::poll::notify_key(std::ptr::from_ref(pipe) as crate::poll::Key);
         return crate::relay::Took::Data(out);
     }
     if pipe.writers.load(Ordering::SeqCst) == 0 { crate::relay::Took::Closed } else { crate::relay::Took::Nothing }
@@ -172,7 +178,7 @@ pub fn give(end: &End, data: &[u8]) {
     }
     end.pipe.bytes.lock().extend(data);
     end.pipe.changed.notify_all();
-    crate::poll::notify();
+    crate::poll::notify_key(Arc::as_ptr(&end.pipe) as crate::poll::Key);
 }
 
 /// Bytes waiting to be read (`FIONREAD`, and `poll`'s readiness).

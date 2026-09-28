@@ -93,7 +93,7 @@ impl Bound {
         theirs.passcred = self.passcred.load(std::sync::atomic::Ordering::SeqCst);
         client.peer = Some(mine);
         self.backlog.lock().push_back(theirs);
-        crate::poll::notify();
+        crate::poll::notify_key(std::ptr::from_ref(self) as crate::poll::Key);
         Ok(())
     }
 
@@ -105,7 +105,7 @@ impl Bound {
     /// A datagram sent to this socket.
     pub fn deliver(&self, message: &[u8]) {
         self.datagrams.lock().push_back(message.to_vec());
-        crate::poll::notify();
+        crate::poll::notify_key(std::ptr::from_ref(self) as crate::poll::Key);
     }
 
     /// The next datagram, whole (the rest of it discarded when `buf` is short, as a datagram's is).

@@ -83,6 +83,11 @@ pub struct Process {
     /// Signalled when `exit` is set.
     exited: parking_lot::Condvar,
     scratch: u64,
+    /// The `siginfo` of signals sent to a task by another (a timer's `SI_TIMER`), by tid, taken
+    /// when the signal is delivered or waited for.
+    queued_infos: Mutex<Vec<(i32, crate::signal::SigInfo)>>,
+    /// The process's POSIX timers (`timer_create`).
+    pub(crate) timers: crate::timer::Timers,
 }
 
 /// What other tasks reach of a task: the handle that stops its run and its pending signals.
@@ -522,6 +527,8 @@ impl Process {
             exit: Mutex::new(None),
             exited: parking_lot::Condvar::new(),
             scratch,
+            queued_infos: Mutex::new(Vec::new()),
+            timers: crate::timer::Timers::default(),
         });
         let _ = p.me.set(Arc::downgrade(&p));
         // `/proc` and `/sys` are generated from the process itself (`procfs`).
@@ -638,13 +645,14 @@ impl Process {
         let stack = p.mm.map(p, &loader, MapRequest { addr: 0, len: STACK_BYTES + page, prot: 3, flags: 0x22 | 0x20000, fd: -1, offset: 0 }).map_err(|e| format!("the main stack: {e:?}"))?;
         p.mm.protect(stack, page, 0).map_err(|e| format!("the stack guard: {e:?}"))?;
         p.mm.label(stack + page, STACK_BYTES, b"[stack]");
-        // A one-page `[vdso]` holding the kernel's signal trampoline: `mov x8, #139; svc #0`.
-        let vdso = p.mm.map(p, &loader, MapRequest { addr: 0, len: page, prot: 3, flags: 0x22, fd: -1, offset: 0 }).map_err(|e| format!("the vdso page: {e:?}"))?;
-        let trampoline: Vec<u8> = [0xD280_1168u32, 0xD400_0001].iter().flat_map(|w| w.to_le_bytes()).collect();
-        p.mem.write(vdso, &trampoline).map_err(|e| format!("the vdso page: {e:?}"))?;
-        p.mm.protect(vdso, page, 5).map_err(|e| format!("the vdso page: {e:?}"))?;
-        p.mm.label(vdso, page, b"[vdso]");
-        p.sigtramp.store(vdso, std::sync::atomic::Ordering::Relaxed);
+        // The `[vdso]` (`crate::vdso`): the kernel's time functions and its signal trampoline.
+        let image = crate::vdso::filled();
+        let len = (image.len() as u64).div_ceil(page) * page;
+        let vdso = p.mm.map(p, &loader, MapRequest { addr: 0, len, prot: 3, flags: 0x22, fd: -1, offset: 0 }).map_err(|e| format!("the vdso: {e:?}"))?;
+        p.mem.write(vdso, &image).map_err(|e| format!("the vdso: {e:?}"))?;
+        p.mm.protect(vdso, len, 5).map_err(|e| format!("the vdso: {e:?}"))?;
+        p.mm.label(vdso, len, b"[vdso]");
+        p.sigtramp.store(vdso + crate::vdso::layout().sigreturn, std::sync::atomic::Ordering::Relaxed);
         let top = stack + STACK_BYTES + page;
         let mut random = [0u8; 16];
         omni_platform::process::random_bytes(&mut random).map_err(|e| format!("AT_RANDOM: {e}"))?;
@@ -652,7 +660,7 @@ impl Process {
             (AT_PHDR, program.phdr), (AT_PHENT, 56), (AT_PHNUM, program.phnum), (AT_PAGESZ, page),
             (AT_BASE, base), (AT_FLAGS, 0), (AT_ENTRY, program.entry), (AT_UID, u64::from(UID)),
             (AT_EUID, u64::from(UID)), (AT_GID, u64::from(UID)), (AT_EGID, u64::from(UID)),
-            (AT_HWCAP, HWCAP), (AT_HWCAP2, 0), (AT_CLKTCK, 100), (AT_SECURE, 0),
+            (AT_HWCAP, HWCAP), (AT_HWCAP2, 0), (AT_CLKTCK, 100), (AT_SECURE, 0), (AT_SYSINFO_EHDR, vdso),
         ];
         let (bytes, sp) = exec::build_stack(top, argv, envp, &auxv, random, exe);
         p.mem.write(top - bytes.len() as u64, &bytes).map_err(|e| format!("the initial stack: {e:?}"))?;
@@ -861,6 +869,27 @@ impl Process {
         })
     }
 
+    /// Post a signal with its own `siginfo` to task `tid` (a timer's): delivered with it, or handed
+    /// to `rt_sigtimedwait` with it.
+    pub(crate) fn post_signal_info(&self, tid: i32, info: crate::signal::SigInfo) {
+        self.queued_infos.lock().push((tid, info));
+        self.post_signal(tid, info.signo);
+    }
+
+    /// The `siginfo` queued for `sig` on task `tid`, if one was ([`Process::post_signal_info`]).
+    /// A timer's is its timer's no longer (`crate::timer`: an expiry meanwhile is an overrun).
+    pub(crate) fn take_info(&self, tid: i32, sig: i32) -> Option<crate::signal::SigInfo> {
+        let info = {
+            let mut q = self.queued_infos.lock();
+            let at = q.iter().position(|(t, i)| *t == tid && i.signo == sig)?;
+            q.remove(at).1
+        };
+        if info.code == crate::signal::SI_TIMER {
+            return Some(self.timers.dequeued(info));
+        }
+        Some(info)
+    }
+
     /// Post `sig` to task `tid`: pending there, its run stopped so the loop delivers it, and its
     /// futex wait (if any) ended with `EINTR`.
     pub(crate) fn post_signal(&self, tid: i32, sig: i32) {
@@ -1027,6 +1056,9 @@ impl Process {
         pending.fetch_and(!(1u64 << (sig - 1)), std::sync::atomic::Ordering::SeqCst);
         // SAFETY: as above.
         let queued = unsafe { (*task).queued_info.take() }.filter(|i| i.signo == sig);
+        // SAFETY: as above.
+        let tid = unsafe { (*task).tid };
+        let queued = queued.or_else(|| self.take_info(tid, sig));
         let info = queued.unwrap_or(crate::signal::SigInfo { signo: sig, code: crate::signal::SI_TKILL, pid: self.sys.pid, uid: self.sys.uid(), ..crate::signal::SigInfo::default() });
         self.deliver(cpu, task, info, pc, 0)
     }

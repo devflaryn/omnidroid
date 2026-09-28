@@ -29,6 +29,8 @@ pub mod nr {
         UTIMENSAT = 88 => "utimensat", RENAMEAT = 38 => "renameat", RENAMEAT2 = 276 => "renameat2", NEWFSTATAT = 79 => "newfstatat", FSTAT = 80 => "fstat",
         EXIT = 93 => "exit", EXIT_GROUP = 94 => "exit_group", SET_TID_ADDRESS = 96 => "set_tid_address",
         FUTEX = 98 => "futex", SET_ROBUST_LIST = 99 => "set_robust_list", NANOSLEEP = 101 => "nanosleep",
+        TIMER_CREATE = 107 => "timer_create", TIMER_GETTIME = 108 => "timer_gettime", TIMER_GETOVERRUN = 109 => "timer_getoverrun",
+        TIMER_SETTIME = 110 => "timer_settime", TIMER_DELETE = 111 => "timer_delete",
         CLOCK_GETTIME = 113 => "clock_gettime", CLOCK_GETRES = 114 => "clock_getres",
         CLOCK_NANOSLEEP = 115 => "clock_nanosleep", SCHED_SETPARAM = 118 => "sched_setparam", SCHED_SETSCHEDULER = 119 => "sched_setscheduler",
         SCHED_GETSCHEDULER = 120 => "sched_getscheduler", SCHED_GETPARAM = 121 => "sched_getparam",

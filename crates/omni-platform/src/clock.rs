@@ -72,6 +72,13 @@ pub fn monotonic_now() -> Duration {
     Instant::now().saturating_duration_since(epoch)
 }
 
+/// The instant [`monotonic_now`] reads zero at, for a consumer that must agree with it exactly
+/// while reading time another way (a guest's counter).
+#[must_use]
+pub fn monotonic_epoch() -> Instant {
+    *EPOCH.get_or_init(Instant::now)
+}
+
 /// `CLOCK_REALTIME`: the wall clock, as a duration since the Unix epoch.
 ///
 /// May jump in either direction; that is what a wall clock is. A host clock set before 1970 reads
