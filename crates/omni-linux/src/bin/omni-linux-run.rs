@@ -162,18 +162,26 @@ fn main() -> ExitCode {
             other => eprintln!("[hal] unknown HAL {other:?}"),
         }
     }
-    // OMNI_SCREENSHOT=<path>: the display's framebuffer, as a PNG, every few seconds.
+    // OMNI_SCREENSHOT=<path>: the display's framebuffer, as a PNG, every few seconds
+    // (`OMNI_SCREENSHOT_MS`, default 5000), written whole (a rename) so a reader never sees half.
     if let (Some(fb), Ok(path)) = (framebuffer.clone(), std::env::var("OMNI_SCREENSHOT")) {
+        let every = std::env::var("OMNI_SCREENSHOT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5000);
         std::thread::spawn(move || {
-            let mut seen = 0;
+            let (mut seen, mut since) = (0, std::time::Instant::now());
+            let mut last_line = std::time::Instant::now();
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_millis(every.max(100)));
                 let frames = fb.frames();
-                if frames != seen {
-                    eprintln!("[display] {frames} frames presented");
-                    seen = frames;
+                // Presented frames, and the rate since the previous line (at most one line in 5 s).
+                if frames != seen && last_line.elapsed() >= std::time::Duration::from_secs(5) {
+                    let fps = (frames - seen) as f64 / since.elapsed().as_secs_f64();
+                    eprintln!("[display] {frames} frames presented ({fps:.2}/s)");
+                    (seen, since, last_line) = (frames, std::time::Instant::now(), std::time::Instant::now());
                 }
-                let _ = std::fs::write(&path, fb.png());
+                let partial = format!("{path}.part");
+                if std::fs::write(&partial, fb.png()).is_ok() {
+                    let _ = std::fs::rename(&partial, &path);
+                }
             }
         });
     }

@@ -492,6 +492,7 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         15 => {
             // PR_SET_NAME; the main thread's name is also the process's `comm`.
             t.name = p.mem.read_cstr(a[1], 4096)?.into_iter().take(15).collect();
+            crate::cpuprof::renamed(t.tid, &t.name);
             if t.tid == p.sys.pid {
                 *p.comm.lock() = t.name.clone();
             }

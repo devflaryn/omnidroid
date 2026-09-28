@@ -148,6 +148,9 @@ fn the_apk_is_installed_started_and_draws() {
     let started = Instant::now();
     let mut last_shot = Instant::now();
     let mut n = 0;
+    let mut kicked = false;
+    // `OMNI_R_SHOT_SECS`: how often the display is kept (default 20).
+    let shot_every = Duration::from_secs(std::env::var("OMNI_R_SHOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20));
     boot.watch(Duration::from_secs(minutes * 60), |line| {
         for (s, e) in seen.iter_mut().zip(&expect) {
             *s |= line.contains(e.as_str());
@@ -167,10 +170,20 @@ fn the_apk_is_installed_started_and_draws() {
                 let _ = std::fs::write(kept.join("data/local/tmp/cookie-planted"), if ok { "ok" } else { "failed" });
             }
         }
+        // The server's kick: the display as it was when the line came (the game's last frame, before
+        // the app draws its dialog), and the periodic shot before that.
+        if line.contains("Client has been disconnected") && !kicked {
+            kicked = true;
+            let _ = std::fs::copy(&screenshot, shots.join("kick.png"));
+            if n > 0 {
+                let _ = std::fs::copy(shots.join(format!("{:04}.png", n - 1)), shots.join("kick-before.png"));
+            }
+            eprintln!("[r] +{}s kick: display saved as {}", started.elapsed().as_secs(), shots.join("kick.png").display());
+        }
         if line.contains("DID_LOG_IN") && !kept.join("data/local/tmp/signed-in").exists() {
             let _ = std::fs::write(kept.join("data/local/tmp/signed-in"), "1");
         }
-        if last_shot.elapsed() > Duration::from_secs(20) {
+        if last_shot.elapsed() > shot_every {
             last_shot = Instant::now();
             let to = shots.join(format!("{n:04}.png"));
             if std::fs::copy(&screenshot, &to).is_ok() {

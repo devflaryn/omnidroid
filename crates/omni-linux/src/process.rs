@@ -241,7 +241,12 @@ pub fn syscall_stats() -> Vec<(String, u64, u64)> {
         .filter_map(|n| {
             let c = STAT_COUNT[n].swap(0, std::sync::atomic::Ordering::Relaxed);
             let ns = STAT_NANOS[n].swap(0, std::sync::atomic::Ordering::Relaxed);
-            (c > 0).then(|| (name_of(n as u64).into_owned(), c, ns / 1_000_000))
+            let name = match n {
+                500 => "ioctl:gpu".to_string(),
+                501 => "ioctl:binder".to_string(),
+                _ => name_of(n as u64).into_owned(),
+            };
+            (c > 0).then(|| (name, c, ns / 1_000_000))
         })
         .collect();
     out.sort_by(|a, b| b.2.cmp(&a.2));
@@ -334,7 +339,12 @@ fn on_svc(call: &mut ThunkCall<'_>) {
     let stats_from = syscall_stats_on().then(std::time::Instant::now);
     let result = process.syscall(task, number, args);
     if let Some(t0) = stats_from {
-        let n = (number as usize).min(STAT_CALLS - 1);
+        // ioctl split by its device: the GPU's ('G', one per Vulkan command) and binder's ('b').
+        let n = match (number, (args[1] >> 8) & 0xff) {
+            (crate::syscall::nr::IOCTL, 0x47) => 500,
+            (crate::syscall::nr::IOCTL, 0x62) => 501,
+            _ => (number as usize).min(STAT_CALLS - 1),
+        };
         STAT_COUNT[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         STAT_NANOS[n].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
@@ -825,6 +835,18 @@ impl Process {
     fn run_task(&self, cpu: &mut dyn GuestCpu, task: *mut Task, mut pc: u64) -> (ExitStatus, Option<Exit>) {
         // SAFETY: `task` is live for the whole loop (see `run`).
         let state = unsafe { Arc::clone(&(*task).state) };
+        // `OMNI_THREAD_CPU`: this host thread's time, sampled for as long as it runs the task.
+        struct Profiled(i32);
+        impl Drop for Profiled {
+            fn drop(&mut self) {
+                crate::cpuprof::stopped(self.0);
+            }
+        }
+        // SAFETY: as above.
+        let _profiled = unsafe {
+            crate::cpuprof::started((*task).tid, &(*task).name, &state);
+            Profiled((*task).tid)
+        };
         loop {
             state.store(IN_GUEST, std::sync::atomic::Ordering::SeqCst);
             let ran = cpu.run(pc as usize, RunLimit::Unlimited);

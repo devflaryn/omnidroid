@@ -184,6 +184,11 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     if nice.is_some() && std::env::var("OMNI_THREAD_DUMP_APP").ok().as_deref() == nice {
         cmd.env("OMNI_THREAD_DUMP", "15");
     }
+    // OMNI_THREAD_CPU_APP=<process name>: that app's host process reports its threads' processor
+    // time and where it went every 10 s (`OMNI_THREAD_CPU`).
+    if nice.is_some() && std::env::var("OMNI_THREAD_CPU_APP").ok().as_deref() == nice {
+        cmd.env("OMNI_THREAD_CPU", "10");
+    }
     // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
     cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
     cmd.args(class_and_args);

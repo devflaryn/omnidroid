@@ -7,6 +7,7 @@
 pub mod apex;
 pub mod binder;
 pub mod boot;
+pub mod cpuprof;
 pub mod bpf;
 pub mod device;
 pub mod dnsproxy;
