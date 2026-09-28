@@ -1,17 +1,19 @@
 //! The display's framebuffer on the host: what the host composer presents (D3), a frame count to
-//! wait on, and a screenshot of it as a PNG.
+//! wait on, and a screenshot of it as a PNG. Its size is the last frame's: the display can be
+//! resized (the composer's `set_display_size`), and a frame of the new size replaces the old one
+//! whole.
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
 pub struct Framebuffer {
-    pub width: u32,
-    pub height: u32,
     state: Mutex<State>,
     presented: Condvar,
 }
 
 struct State {
+    width: u32,
+    height: u32,
     /// RGBA, 8 bits a channel, `width` pixels a row.
     pixels: Vec<u8>,
     frames: u64,
@@ -20,15 +22,34 @@ struct State {
 impl Framebuffer {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, state: Mutex::new(State { pixels: vec![0; width as usize * height as usize * 4], frames: 0 }), presented: Condvar::new() }
+        Self { state: Mutex::new(State { width, height, pixels: vec![0; width as usize * height as usize * 4], frames: 0 }), presented: Condvar::new() }
     }
 
-    /// Present a frame of RGBA rows `stride` pixels apart (a buffer's stride may exceed the
-    /// display's width); rows or bytes the source lacks are left as they were.
+    /// The size of the frame it holds.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        let st = self.state.lock();
+        (st.width, st.height)
+    }
+
+    /// Present a frame of the framebuffer's current size, RGBA rows `stride` pixels apart (a
+    /// buffer's stride may exceed the display's width); rows or bytes the source lacks are left
+    /// as they were.
     pub fn present_rgba(&self, src: &[u8], stride: u32) {
-        let (w, stride) = (self.width as usize * 4, stride as usize * 4);
+        let (width, height) = self.size();
+        self.present_frame(src, width, height, stride);
+    }
+
+    /// Present a `width` x `height` frame, RGBA rows `stride` pixels apart. A frame of another size
+    /// than the one held replaces it, black where the source lacks rows or bytes.
+    pub fn present_frame(&self, src: &[u8], width: u32, height: u32, stride: u32) {
+        let (w, stride) = (width as usize * 4, stride as usize * 4);
         let mut st = self.state.lock();
-        for y in 0..self.height as usize {
+        if (st.width, st.height) != (width, height) {
+            (st.width, st.height) = (width, height);
+            st.pixels = vec![0; w * height as usize];
+        }
+        for y in 0..height as usize {
             let Some(row) = src.get(y * stride..y * stride + w) else { break };
             st.pixels[y * w..y * w + w].copy_from_slice(row);
         }
@@ -60,21 +81,29 @@ impl Framebuffer {
         self.state.lock().pixels.clone()
     }
 
+    /// The current frame: its number (the frame count when it was presented), its size and its
+    /// pixels (RGBA), taken together.
+    #[must_use]
+    pub fn frame(&self) -> (u64, u32, u32, Vec<u8>) {
+        let st = self.state.lock();
+        (st.frames, st.width, st.height, st.pixels.clone())
+    }
+
     /// The current frame as a PNG (8-bit RGBA; stored, uncompressed deflate blocks: a screenshot
     /// is taken to be looked at, not kept small).
     #[must_use]
     pub fn png(&self) -> Vec<u8> {
-        let pixels = self.pixels();
-        let row = self.width as usize * 4;
-        let mut raw = Vec::with_capacity((row + 1) * self.height as usize);
-        for y in 0..self.height as usize {
+        let (_, width, height, pixels) = self.frame();
+        let row = width as usize * 4;
+        let mut raw = Vec::with_capacity((row + 1) * height as usize);
+        for y in 0..height as usize {
             raw.push(0); // filter: none
             raw.extend_from_slice(&pixels[y * row..y * row + row]);
         }
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&self.width.to_be_bytes());
-        ihdr.extend_from_slice(&self.height.to_be_bytes());
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
         ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
         chunk(&mut png, b"IHDR", &ihdr);
         chunk(&mut png, b"IDAT", &zlib_stored(&raw));

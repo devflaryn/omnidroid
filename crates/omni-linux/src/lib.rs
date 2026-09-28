@@ -10,6 +10,7 @@ pub mod boot;
 pub mod cpuprof;
 pub mod bpf;
 pub mod device;
+pub mod display_window;
 pub mod dnsproxy;
 pub mod errno;
 pub mod exec;

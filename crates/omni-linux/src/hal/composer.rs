@@ -9,6 +9,13 @@
 //! them (on the host GPU, D3a) into the client target, and presenting copies that target.
 //! `OMNI_COMPOSER_DEVICE=0` makes every frame `CLIENT`. Composition is synchronous, so there are no
 //! fences to report.
+//!
+//! **The display can be resized** ([`Composer::set_display_size`]), as an external display whose
+//! mode changes is: the composer offers one configuration of the new size under a new id and
+//! reports the display connected again (`onHotplug`). SurfaceFlinger takes that as a reconnect
+//! ("Reconnecting ..."): it reloads the display's modes, recreates the display at the new size and
+//! tells DisplayManager, whose LocalDisplayAdapter updates the display device -- and from there
+//! WindowManager and every app get the configuration change a resized display causes on a device.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -22,7 +29,7 @@ use super::aidl::android_hardware_graphics_composer3::{
     i_composer, i_composer_client, Capability, ChangedCompositionLayer, ChangedCompositionTypes, ColorMode, CommandError, CommandResultPayload, Composition,
     DisplayAttribute, DisplayCapability, DisplayCommand, DisplayConfiguration, DisplayConfiguration_Dpi, DisplayConnectionType, HdrCapabilities,
     IComposerCallbackProxy, IComposerClientServer, IComposerServer, PerFrameMetadataKey, PowerMode, PresentOrValidate, PresentOrValidate_Result,
-    RenderIntent, ContentType, ClockMonotonicTimestamp,
+    RenderIntent, ContentType, ClockMonotonicTimestamp, VsyncPeriodChangeConstraints, VsyncPeriodChangeTimeline,
 };
 use super::aidl::{Binder, Ctx, Fd, Status};
 use super::framebuffer::Framebuffer;
@@ -34,10 +41,13 @@ use crate::shm::Shm;
 /// The instance SurfaceFlinger waits for (declared by the image's `hwc3.xml`).
 pub const INSTANCE: &str = "android.hardware.graphics.composer3.IComposer/default";
 
-/// The one display's id, size, refresh and density.
+/// The one display's id, initial size, refresh and density.
 const DISPLAY: i64 = 0;
 pub const WIDTH: u32 = 1280;
 pub const HEIGHT: u32 = 720;
+/// The smallest display [`Composer::set_display_size`] makes, in either axis: Android's smallest
+/// screen width is 320 dp (the CDD's minimum), 320 pixels at this display's 160 dpi.
+pub const MIN_SIDE: u32 = 320;
 const VSYNC_PERIOD_NS: i32 = 16_666_666;
 const DPI: f32 = 160.0;
 
@@ -53,16 +63,60 @@ const RGBA_8888: i32 = 1;
 const RGBX_8888: i32 = 2;
 const IMPLEMENTATION_DEFINED: i32 = 0x22;
 
+/// The display's one configuration: its id and size. A resize is a new id, so that nothing
+/// SurfaceFlinger or DisplayManager kept of the old mode can be mistaken for the new one.
+#[derive(Debug, Clone, Copy)]
+struct Mode {
+    config: i32,
+    width: u32,
+    height: u32,
+}
+
 pub struct Composer {
     broker: Arc<Broker>,
     framebuffer: Arc<Framebuffer>,
     client: Mutex<Option<Arc<Client>>>,
+    mode: Arc<Mutex<Mode>>,
 }
 
 impl Composer {
     #[must_use]
     pub fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>) -> Arc<Self> {
-        Arc::new(Self { broker, framebuffer, client: Mutex::new(None) })
+        let (width, height) = framebuffer.size();
+        let mode = Arc::new(Mutex::new(Mode { config: 0, width, height }));
+        Arc::new(Self { broker, framebuffer, client: Mutex::new(None), mode })
+    }
+
+    /// The display's size now.
+    #[must_use]
+    pub fn display_size(&self) -> (u32, u32) {
+        let m = *self.mode.lock();
+        (m.width, m.height)
+    }
+
+    /// **Resize the display** to `width` x `height` (each at least [`MIN_SIDE`]): a configuration
+    /// of that size under a new id, and the display reported connected again -- see this module's
+    /// doc. Answers the size the display now has. Before SurfaceFlinger has registered its
+    /// callback the size is only recorded, for its first look at the display.
+    ///
+    /// # Errors
+    /// The hotplug's delivery failed (SurfaceFlinger gone).
+    pub fn set_display_size(&self, width: u32, height: u32) -> Result<(u32, u32), String> {
+        let (width, height) = (width.max(MIN_SIDE), height.max(MIN_SIDE));
+        let config = {
+            let mut m = self.mode.lock();
+            if (m.width, m.height) == (width, height) {
+                return Ok((width, height));
+            }
+            *m = Mode { config: m.config + 1, width, height };
+            m.config
+        };
+        let callback = self.client.lock().as_ref().and_then(|c| c.state.lock().callback);
+        eprintln!("[composer] display {width}x{height} (config {config}): {}", if callback.is_some() { "hotplug" } else { "before SurfaceFlinger" });
+        if let Some(callback) = callback {
+            IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_hotplug(DISPLAY, true).map_err(|e| format!("onHotplug: {e:?}"))?;
+        }
+        Ok((width, height))
     }
 
     /// Serve the composer and publish it with `servicemanager` as [`INSTANCE`].
@@ -83,7 +137,7 @@ impl IComposerServer for Composer {
             // One client at a time, as the interface says.
             return Err(Status::ServiceSpecific(EX_NO_RESOURCES));
         }
-        let c = Client::new(Arc::clone(&self.broker), Arc::clone(&self.framebuffer));
+        let c = Client::new(Arc::clone(&self.broker), Arc::clone(&self.framebuffer), Arc::clone(&self.mode));
         let serve = Arc::clone(&c);
         let trace = std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("1");
         let ptr = self.broker.create_host_service_objects(move |call| {
@@ -105,6 +159,8 @@ impl IComposerServer for Composer {
 struct Target {
     shm: Arc<Shm>,
     format: i32,
+    width: u32,
+    height: u32,
     stride: u32,
     pixels_at: u64,
 }
@@ -183,11 +239,12 @@ pub struct Client {
     framebuffer: Arc<Framebuffer>,
     state: Mutex<State>,
     vsync: Arc<AtomicBool>,
+    mode: Arc<Mutex<Mode>>,
 }
 
 impl Client {
-    fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>) -> Arc<Self> {
-        let c = Arc::new(Self { broker, framebuffer, state: Mutex::default(), vsync: Arc::default() });
+    fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>, mode: Arc<Mutex<Mode>>) -> Arc<Self> {
+        let c = Arc::new(Self { broker, framebuffer, state: Mutex::default(), vsync: Arc::default(), mode });
         // Vsync, every period while enabled, for as long as the client lives.
         let weak: Weak<Self> = Arc::downgrade(&c);
         let _ = std::thread::Builder::new().name("omni-composer-vsync".into()).spawn(move || loop {
@@ -205,6 +262,10 @@ impl Client {
 
     fn display(display: i64) -> Result<(), Status> {
         if display == DISPLAY { Ok(()) } else { Err(Status::ServiceSpecific(EX_BAD_DISPLAY)) }
+    }
+
+    fn mode(&self) -> Mode {
+        *self.mode.lock()
     }
 
     /// Present the frame: the composer's own composition of its layers, or the client target.
@@ -246,11 +307,12 @@ impl Client {
                 };
                 layers.push(super::compose::Layer { source, frame: (f.left, f.top, f.right, f.bottom), blend, alpha: d.alpha.unwrap_or(1.0) });
             }
-            let mut out = vec![0u8; WIDTH as usize * HEIGHT as usize * 4];
-            super::compose::compose(&mut out, WIDTH as usize, HEIGHT as usize, &layers);
+            let Mode { width, height, .. } = self.mode();
+            let mut out = vec![0u8; width as usize * height as usize * 4];
+            super::compose::compose(&mut out, width as usize, height as usize, &layers);
             drop(layers);
             drop(st);
-            self.framebuffer.present_rgba(&out, WIDTH);
+            self.framebuffer.present_frame(&out, width, height, width);
             return;
         }
         st.frames_client += 1;
@@ -263,7 +325,10 @@ impl Client {
             }
             return;
         }
-        let mut pixels = vec![0u8; target.stride as usize * HEIGHT as usize * 4];
+        // The target's own size: the display's, except for a frame SurfaceFlinger drew for the
+        // size before a resize.
+        let (width, height) = (target.width, target.height);
+        let mut pixels = vec![0u8; target.stride as usize * height as usize * 4];
         if target.shm.read_at(&mut pixels, target.pixels_at).is_err() {
             return;
         }
@@ -275,10 +340,10 @@ impl Client {
                 let at = (y * stride as usize + x) * 4;
                 u32::from_be_bytes(pixels[at..at + 4].try_into().expect("4"))
             };
-            eprintln!("[composer] present slot {:?}: centre {:08x} corner {:08x}", st.current_target, px(WIDTH as usize / 2, HEIGHT as usize / 2), px(8, 8));
+            eprintln!("[composer] present slot {:?}: centre {:08x} corner {:08x}", st.current_target, px(width as usize / 2, height as usize / 2), px(8, 8));
         }
         drop(st);
-        self.framebuffer.present_rgba(&pixels, stride);
+        self.framebuffer.present_frame(&pixels, width, height, stride);
     }
 }
 
@@ -313,8 +378,8 @@ fn target_of(handle: &NativeHandle) -> Option<Target> {
         FileKind::Shared(m) => Arc::clone(m),
         _ => return None,
     };
-    let (format, stride, pixels_at) = (handle.ints[5], handle.ints[8] as u32, handle.ints[13] as u32 as u64);
-    (stride >= WIDTH && pixels_at == PIXELS_AT).then_some(Target { shm, format, stride, pixels_at })
+    let (width, height, format, stride, pixels_at) = (handle.ints[2] as u32, handle.ints[3] as u32, handle.ints[5], handle.ints[8] as u32, handle.ints[13] as u32 as u64);
+    (width > 0 && height > 0 && stride >= width && pixels_at == PIXELS_AT).then_some(Target { shm, format, width, height, stride, pixels_at })
 }
 
 impl IComposerClientServer for Client {
@@ -444,7 +509,7 @@ impl IComposerClientServer for Client {
     }
 
     fn get_active_config(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {
-        Self::display(display).map(|()| 0)
+        Self::display(display).map(|()| self.mode().config)
     }
 
     fn get_color_modes(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Vec<ColorMode>, Status> {
@@ -457,12 +522,13 @@ impl IComposerClientServer for Client {
 
     fn get_display_attribute(&self, _ctx: &Ctx<'_>, display: i64, config: i32, attribute: DisplayAttribute) -> Result<i32, Status> {
         Self::display(display)?;
-        if config != 0 {
+        let mode = self.mode();
+        if config != mode.config {
             return Err(Status::ServiceSpecific(1)); // EX_BAD_CONFIG
         }
         Ok(match attribute {
-            DisplayAttribute::WIDTH => WIDTH as i32,
-            DisplayAttribute::HEIGHT => HEIGHT as i32,
+            DisplayAttribute::WIDTH => mode.width as i32,
+            DisplayAttribute::HEIGHT => mode.height as i32,
             DisplayAttribute::VSYNC_PERIOD => VSYNC_PERIOD_NS,
             DisplayAttribute::DPI_X | DisplayAttribute::DPI_Y => (DPI * 1000.0) as i32,
             DisplayAttribute::CONFIG_GROUP => 0,
@@ -475,15 +541,16 @@ impl IComposerClientServer for Client {
     }
 
     fn get_display_configs(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Vec<i32>, Status> {
-        Self::display(display).map(|()| vec![0])
+        Self::display(display).map(|()| vec![self.mode().config])
     }
 
     fn get_display_configurations(&self, _ctx: &Ctx<'_>, display: i64, _max_frame_interval_ns: i32) -> Result<Vec<DisplayConfiguration>, Status> {
         Self::display(display)?;
+        let mode = self.mode();
         Ok(vec![DisplayConfiguration {
-            config_id: 0,
-            width: WIDTH as i32,
-            height: HEIGHT as i32,
+            config_id: mode.config,
+            width: mode.width as i32,
+            height: mode.height as i32,
             dpi: Some(DisplayConfiguration_Dpi { x: DPI, y: DPI }),
             config_group: 0,
             vsync_period: VSYNC_PERIOD_NS,
@@ -538,7 +605,17 @@ impl IComposerClientServer for Client {
 
     fn set_active_config(&self, _ctx: &Ctx<'_>, display: i64, config: i32) -> Result<(), Status> {
         Self::display(display)?;
-        if config == 0 { Ok(()) } else { Err(Status::ServiceSpecific(1)) }
+        if config == self.mode().config { Ok(()) } else { Err(Status::ServiceSpecific(1)) }
+    }
+
+    /// The one configuration there is, at once: nothing to wait for and no refresh needed.
+    fn set_active_config_with_constraints(&self, _ctx: &Ctx<'_>, display: i64, config: i32, _constraints: VsyncPeriodChangeConstraints) -> Result<VsyncPeriodChangeTimeline, Status> {
+        Self::display(display)?;
+        if config != self.mode().config {
+            return Err(Status::ServiceSpecific(1)); // EX_BAD_CONFIG
+        }
+        let now = crate::sys::monotonic().as_nanos() as i64;
+        Ok(VsyncPeriodChangeTimeline { new_vsync_applied_time_nanos: now, refresh_required: false, refresh_time_nanos: 0 })
     }
 
     fn get_preferred_boot_display_config(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {

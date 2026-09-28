@@ -150,11 +150,29 @@ fn main() -> ExitCode {
                 _served.push(allocator);
             }
             "composer" => {
-                let fb = std::sync::Arc::new(omni_linux::hal::framebuffer::Framebuffer::new(omni_linux::hal::composer::WIDTH, omni_linux::hal::composer::HEIGHT));
+                // OMNI_WINDOW_SIZE=<w>x<h>: the display's size at boot (default 1280x720).
+                let (w, h) = std::env::var("OMNI_WINDOW_SIZE")
+                    .ok()
+                    .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))))
+                    .map_or((omni_linux::hal::composer::WIDTH, omni_linux::hal::composer::HEIGHT), |(w, h)| {
+                        (w.max(omni_linux::hal::composer::MIN_SIDE), h.max(omni_linux::hal::composer::MIN_SIDE))
+                    });
+                let fb = std::sync::Arc::new(omni_linux::hal::framebuffer::Framebuffer::new(w, h));
                 let composer = omni_linux::hal::composer::Composer::new(std::sync::Arc::clone(&broker), std::sync::Arc::clone(&fb));
                 match composer.register() {
                     Ok(()) => eprintln!("[hal] composer: {}", omni_linux::hal::composer::INSTANCE),
                     Err(e) => eprintln!("[hal] composer: {e}"),
+                }
+                // OMNI_WINDOW=1: the display in a live host window whose size is the display's
+                // (`omni_linux::display_window`); OMNI_WINDOW_CONTROL=<file> scripts its resizes.
+                if std::env::var("OMNI_WINDOW").as_deref() == Ok("1") {
+                    let options = omni_linux::display_window::Options {
+                        title: "omnidroid".into(),
+                        control: std::env::var_os("OMNI_WINDOW_CONTROL").map(PathBuf::from),
+                    };
+                    if let Err(e) = omni_linux::display_window::spawn(std::sync::Arc::clone(&fb), std::sync::Arc::clone(&composer), options) {
+                        eprintln!("[window] {e}");
+                    }
                 }
                 framebuffer = Some(fb);
                 _composers.push(composer);

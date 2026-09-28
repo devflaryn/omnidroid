@@ -58,3 +58,21 @@ fn a_presented_frame_is_counted_and_screenshotted() {
     assert_eq!((w, h), (5, 3));
     assert_eq!(px, frame);
 }
+
+/// A frame of another size replaces the held one whole: the size, the pixels and the screenshot
+/// are the new frame's, and the frame count goes on.
+#[test]
+fn a_frame_of_a_new_size_replaces_the_old_one() {
+    let fb = Framebuffer::new(5, 3);
+    fb.present_rgba(&[7; 5 * 3 * 4], 5);
+    let frame: Vec<u8> = (0..4 * 2).flat_map(|i| [i as u8, 0, 0, 255]).collect();
+    fb.present_frame(&frame, 4, 2, 4);
+    assert_eq!(fb.size(), (4, 2));
+    let (n, w, h, px) = fb.frame();
+    assert_eq!((n, w, h), (2, 4, 2));
+    assert_eq!(px, frame);
+    assert_eq!(decode(&fb.png()), (4, 2, frame.clone()));
+    // A present at the current size keeps it.
+    fb.present_rgba(&frame, 4);
+    assert_eq!((fb.size(), fb.frames()), ((4, 2), 3));
+}
