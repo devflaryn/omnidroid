@@ -379,12 +379,46 @@ impl Mm {
         } else {
             installed.and_then(|(path, len, modified)| installed_backing(&path, len, modified, &guest))
         };
-        let at = if let Some(backing) = backing {
-            match self.space.map_file(&backing, req.offset, placement, in_file as usize, prot) {
-                Ok(a) => Some(a as u64),
-                Err(e) => {
-                    tracing::debug!(%e, "a file view could not be made; mapping a private copy");
-                    None
+        // **The view covers the file's whole pages only.** A read-only view may not run past the
+        // file's last byte, and a file's size is rarely a whole number of pages: the rounded-up
+        // request was refused, and every such mapping -- ICU's data, fonts, APKs, vdex files, in
+        // every process -- fell back to a private copy of all of it (26 MiB of ICU data twice in
+        // each app process, run 2026-09-29). Now the whole pages are the view and only the last,
+        // partial page is a private copy (below).
+        let whole = (file_len.saturating_sub(req.offset) / self.page_size() * self.page_size()).min(len);
+        let at = if let (Some(backing), true) = (backing, whole > 0) {
+            if whole == in_file {
+                match self.space.map_file(&backing, req.offset, placement, in_file as usize, prot) {
+                    Ok(a) => Some(a as u64),
+                    Err(e) => {
+                        tracing::debug!(%e, "a file view could not be made; mapping a private copy");
+                        None
+                    }
+                }
+            } else {
+                // Room for all of it, the tail filled from the file, then the view over the head.
+                let a = self.space.map_anonymous(placement, len as usize, Protection::ReadWrite, CommitPolicy::Lazy).map_err(|_| refused_fixed(ENOMEM))? as u64;
+                let tail = in_file.min(file_len.saturating_sub(req.offset)).saturating_sub(whole);
+                let mut buf = vec![0u8; tail as usize];
+                let n = crate::fd::pread_all(&file, &mut buf, req.offset + whole)?;
+                p.mem.write_holding_layout(a + whole, &buf[..n])?;
+                // `Fixed` does not replace: the head's anonymous pages go first (the layout lock is
+                // held, so nothing else takes the hole).
+                self.space.unmap(a as usize, whole as usize).map_err(|_| ENOMEM)?;
+                match self.space.map_file(&backing, req.offset, Placement::Fixed(a as usize), whole as usize, prot) {
+                    Ok(_) => {
+                        if prot != Protection::ReadWrite {
+                            self.space.protect((a + whole) as usize, (len - whole) as usize, prot).map_err(|_| ENOMEM)?;
+                        }
+                        self.forget(a, len);
+                        self.files.lock().insert(a, FileMapping { len, guest: guest.clone(), offset: req.offset });
+                        return Ok(a);
+                    }
+                    Err(e) => {
+                        tracing::debug!(%e, "a file view could not be made; mapping a private copy");
+                        let _ = self.space.unmap(a as usize, len as usize);
+                        None
+                    }
                 }
             }
         } else {
