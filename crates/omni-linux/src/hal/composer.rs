@@ -352,6 +352,8 @@ impl Client {
                     continue;
                 }
                 if let Some(b) = d.slot.and_then(|s| d.buffers.get(&s)) {
+                    // The app's copy into the buffer lands first, as a release fence is waited on.
+                    crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
                     let mut bytes = vec![0u8; b.stride as usize * b.height as usize * 4];
                     if b.shm.read_at(&mut bytes, b.pixels_at).is_ok() {
                         pixels.insert(l, bytes);

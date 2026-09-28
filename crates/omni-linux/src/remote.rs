@@ -96,9 +96,11 @@ fn context_of(b: u8) -> Context {
 // Descriptors across host processes: shared memory by its host file, a sync file as signalled.
 
 /// A descriptor as it crosses: `[kind]` then, for shared memory, its name, host path and length;
-/// for a socket pair's end or a pipe's end, the port its relay waits on (`crate::relay`).
+/// for a socket pair's end or a pipe's end, the port its relay waits on (`crate::relay`) and the
+/// end's identity ([`crossing_id`]).
 fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
     let port = if crate::relay::relayable(file) { crate::relay::offer(Arc::clone(file)).unwrap_or(0) } else { 0 };
+    let id = || [&std::process::id().to_le_bytes()[..], &crossing_id(file).to_le_bytes()].concat();
     match &*file.kind.lock() {
         FileKind::Shared(m) => {
             let mut d = vec![1u8];
@@ -114,8 +116,8 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
         // is shared but the handshake, which the receiver answers).
         FileKind::Fuse(_) => vec![6u8],
         // The receiver makes a connected end of its own and relays its other end to this one.
-        FileKind::Socket(s) => [&[3u8, s.ty as u8][..], &port.to_le_bytes()].concat(),
-        FileKind::Pipe(end) => [&[4u8, u8::from(end.is_write())][..], &port.to_le_bytes()].concat(),
+        FileKind::Socket(s) => [&[3u8, s.ty as u8][..], &port.to_le_bytes(), &id()].concat(),
+        FileKind::Pipe(end) => [&[4u8, u8::from(end.is_write())][..], &port.to_le_bytes(), &id()].concat(),
         // A file (an app's `ParcelFileDescriptor` of its own data, a sysroot file): the receiver
         // opens the same host file, with the same access, at the same offset. The offset is then
         // each side's own (a Linux descriptor passed on shares one); the files that cross are read
@@ -153,7 +155,14 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
 }
 
 /// The open file a description names, in this host process.
-fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
+fn open_described(d: &[u8]) -> Result<Arc<OpenFile>, Errno> {
+    // An end this host process already holds (the same end, crossing again): the same end, as a
+    // dup of one socket is one socket -- not a second relay taking from its queue.
+    if matches!(d.first(), Some(3 | 4)) {
+        if let Some(known) = crossed(d) {
+            return Ok(known);
+        }
+    }
     match d.first() {
         Some(1) => {
             let mut at = 1;
@@ -166,7 +175,7 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
             let (name, path) = (field(), field());
             let len = u64_at(d, at);
             let shm = crate::shm::Shm::open_path(&name, std::path::Path::new(&path), len)?;
-            Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Shared(shm)), flags: parking_lot::Mutex::new(2) })
+            Ok(Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Shared(shm)), flags: parking_lot::Mutex::new(2) }))
         }
         Some(3) => {
             let ty = u64::from(d.get(1).copied().unwrap_or(5));
@@ -174,13 +183,13 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
             let socket = crate::socket::Socket { domain: 1, ty, peer: Some(mine), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0, passcred: false };
             let other = Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(other)), flags: parking_lot::Mutex::new(2) });
             relay_or_keep(other, port_at(d));
-            Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(socket)), flags: parking_lot::Mutex::new(2) })
+            Ok(remember_crossed(d, Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(socket)), flags: parking_lot::Mutex::new(2) })))
         }
         Some(4) => {
             let (read, write) = crate::pipe::pair();
             let (mine, other) = if d.get(1) == Some(&1) { (write, read) } else { (read, write) };
             relay_or_keep(other, port_at(d));
-            Arc::try_unwrap(mine).map_err(|_| EIO)
+            Ok(remember_crossed(d, mine))
         }
         Some(5) => {
             use std::io::Seek;
@@ -203,12 +212,12 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
                 .open(String::from_utf8_lossy(&path).as_ref())
                 .map_err(|_| EBADF)?;
             host.seek(std::io::SeekFrom::Start(offset)).map_err(|_| EIO)?;
-            Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Host { file: host, guest, sysroot }), flags: parking_lot::Mutex::new(flags) })
+            Ok(Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Host { file: host, guest, sysroot }), flags: parking_lot::Mutex::new(flags) }))
         }
-        Some(6) => Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Fuse(crate::fuse::Fuse::open())), flags: parking_lot::Mutex::new(2) }),
+        Some(6) => Ok(Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Fuse(crate::fuse::Fuse::open())), flags: parking_lot::Mutex::new(2) })),
         Some(2) => {
             let now = crate::sys::monotonic().as_nanos() as u64;
-            Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::SyncFile(Arc::new(crate::sync_file::SyncFile { signalled_ns: now }))), flags: parking_lot::Mutex::new(0) })
+            Ok(Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::SyncFile(Arc::new(crate::sync_file::SyncFile { signalled_ns: now }))), flags: parking_lot::Mutex::new(0) }))
         }
         _ => Err(EBADF),
     }
@@ -217,6 +226,54 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
 /// A described socket's or pipe's relay port (0: none).
 fn port_at(d: &[u8]) -> u16 {
     d.get(2..4).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// **An end's identity as it crosses**: the same number each time the same end (the same open
+/// file) is handed to another host process, a new one for another end. A descriptor Android hands
+/// out again and again -- the input method's channel to an app, dup'd for every `startInput` --
+/// is then one end on the other side, as it is one socket on Linux. When each crossing made an end
+/// and a relay of its own, the relays took turns at the one queue: replies went to ends the app
+/// had let go, and every key waited 2.5 s for the input method (`Timeout waiting for IME`, run
+/// 2026-09-28), clicks behind it.
+fn crossing_id(file: &Arc<OpenFile>) -> u64 {
+    static IDS: Mutex<Vec<(Weak<OpenFile>, u64)>> = Mutex::new(Vec::new());
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut ids = IDS.lock();
+    ids.retain(|(w, _)| w.strong_count() > 0);
+    if let Some((_, id)) = ids.iter().find(|(w, _)| w.as_ptr() == Arc::as_ptr(file)) {
+        return *id;
+    }
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ids.push((Arc::downgrade(file), id));
+    id
+}
+
+/// The ends that crossed into this host process, by the sender's host process and the end's
+/// identity there.
+fn crossed_ends() -> &'static Mutex<HashMap<(u32, u64), Weak<OpenFile>>> {
+    static CROSSED: OnceLock<Mutex<HashMap<(u32, u64), Weak<OpenFile>>>> = OnceLock::new();
+    CROSSED.get_or_init(Mutex::default)
+}
+
+/// The identity a described end carries: (sender's host process, end), if it carries one.
+fn crossing_of(d: &[u8]) -> Option<(u32, u64)> {
+    Some((u32::from_le_bytes(d.get(4..8)?.try_into().ok()?), u64::from_le_bytes(d.get(8..16)?.try_into().ok()?)))
+}
+
+/// The end this host process already holds for described `d`, if it is still open.
+fn crossed(d: &[u8]) -> Option<Arc<OpenFile>> {
+    let key = crossing_of(d)?;
+    crossed_ends().lock().get(&key).and_then(Weak::upgrade)
+}
+
+/// Remember `mine` as the end described `d` crossed to.
+fn remember_crossed(d: &[u8], mine: Arc<OpenFile>) -> Arc<OpenFile> {
+    if let Some(key) = crossing_of(d) {
+        let mut ends = crossed_ends().lock();
+        ends.retain(|_, w| w.strong_count() > 0);
+        ends.insert(key, Arc::downgrade(&mine));
+    }
+    mine
 }
 
 /// Relay the far end of a stand-in pair or pipe to the sender's end, or (no relay) keep it open.
@@ -293,7 +350,7 @@ impl crate::fd::RemoteFds for RemoteFds {
 
     fn get(&self, fd: i32) -> Result<Arc<OpenFile>, Errno> {
         match ask(FD_GET, &fd.to_le_bytes())? {
-            (FD_DESC, d) => open_described(&d).map(Arc::new),
+            (FD_DESC, d) => open_described(&d),
             _ => Err(EBADF),
         }
     }
@@ -503,7 +560,7 @@ impl RemoteBinder {
                     send(&mut s, DONE, &r.to_le_bytes()).map_err(|_| EIO)?;
                 }
                 FD_INSERT => {
-                    let r = open_described(&body).and_then(|f| p.fds.insert(Arc::new(f), false, 0));
+                    let r = open_described(&body).and_then(|f| p.fds.insert(f, false, 0));
                     let v: i64 = match r {
                         Ok(fd) => i64::from(fd),
                         Err(e) => -i64::from(e.0),
@@ -584,7 +641,47 @@ mod tests {
         }
         drop(crossed);
         drop(file);
+        assert!(std::fs::read(&path).is_ok());
         assert_eq!(std::fs::read(&path).unwrap(), b"0123456789!", "writable, and the same file");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same socket pair's end handed over twice is one end on the other side (a dup of one
+    /// socket), and what its peer sends is read there, whole, in order -- not split between two.
+    #[test]
+    fn an_end_that_crosses_twice_is_one_end_and_loses_nothing() {
+        let (peer, kept) = crate::socket::pair(5, [0; 3], [0; 3]);
+        let handed = Arc::new(OpenFile {
+            kind: parking_lot::Mutex::new(FileKind::Socket(crate::socket::Socket { domain: 1, ty: 5, peer: Some(peer), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0, passcred: false })),
+            flags: parking_lot::Mutex::new(2),
+        });
+        let first = open_described(&describe(&handed)).expect("first crossing");
+        let second = open_described(&describe(&handed)).expect("second crossing");
+        assert!(Arc::ptr_eq(&first, &second), "one end");
+        let mut kept = kept;
+        for i in 0..20u8 {
+            crate::socket::send(&mut kept, &[i]).expect("send");
+        }
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got.len() < 20 && std::time::Instant::now() < deadline {
+            let mut buf = [0u8; 8];
+            let r = {
+                let FileKind::Socket(s) = &mut *second.kind.lock() else { panic!("socket") };
+                crate::socket::receive(s, &mut buf)
+            };
+            match r {
+                Ok(n) => got.push(buf[..n][0]),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+        assert_eq!(got, (0..20).collect::<Vec<u8>>());
+        // Another end is another identity.
+        let (other, _) = crate::socket::pair(5, [0; 3], [0; 3]);
+        let another = Arc::new(OpenFile {
+            kind: parking_lot::Mutex::new(FileKind::Socket(crate::socket::Socket { domain: 1, ty: 5, peer: Some(other), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0, passcred: false })),
+            flags: parking_lot::Mutex::new(2),
+        });
+        assert!(!Arc::ptr_eq(&open_described(&describe(&another)).expect("another"), &first));
     }
 }

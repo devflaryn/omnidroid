@@ -246,6 +246,8 @@ pub(crate) fn import(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, info: 
 
 /// Copy the region's pixels into the mirror, if they changed since it last held them.
 fn upload(m: &mut AhbMemory) {
+    // A swapchain copy on its way into the region lands first (`native::wait_written`).
+    super::native::wait_written(&m.shm, std::time::Duration::from_millis(50));
     let now = generation(&m.shm);
     if now == m.generation {
         return;

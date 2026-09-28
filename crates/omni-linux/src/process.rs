@@ -90,6 +90,29 @@ pub struct Process {
     pub(crate) timers: crate::timer::Timers,
 }
 
+/// Every process of this host process, for what reports on all of them (`OMNI_MEM_TRACE`).
+static ALL: Mutex<Vec<std::sync::Weak<Process>>> = Mutex::new(Vec::new());
+
+/// The live processes of this host process.
+#[must_use]
+pub fn all_live() -> Vec<Arc<Process>> {
+    ALL.lock().iter().filter_map(std::sync::Weak::upgrade).collect()
+}
+
+impl Process {
+    /// Bytes its translation cache has committed (0 without a shared cache).
+    #[must_use]
+    pub fn code_cache_committed(&self) -> u64 {
+        self.backend.as_ref().and_then(|b| b.code_cache_stats()).map_or(0, |s| s.committed_bytes)
+    }
+
+    /// Bytes of guest memory it has committed.
+    #[must_use]
+    pub fn guest_committed(&self) -> u64 {
+        self.mem.space().stats().committed as u64
+    }
+}
+
 /// What other tasks reach of a task: the handle that stops its run and its pending signals.
 struct TaskHandle {
     halt: omni_cpu::HaltHandle,
@@ -531,6 +554,11 @@ impl Process {
             timers: crate::timer::Timers::default(),
         });
         let _ = p.me.set(Arc::downgrade(&p));
+        {
+            let mut all = ALL.lock();
+            all.retain(|w| w.strong_count() > 0);
+            all.push(Arc::downgrade(&p));
+        }
         // `/proc` and `/sys` are generated from the process itself (`procfs`).
         let proc: Arc<dyn crate::procfs::ProcFs> = Arc::clone(&p) as Arc<dyn crate::procfs::ProcFs>;
         p.vfs.attach_proc(Arc::downgrade(&proc));

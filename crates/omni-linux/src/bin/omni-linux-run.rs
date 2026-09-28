@@ -266,6 +266,14 @@ fn main() -> ExitCode {
                 })
                 .collect();
             eprintln!("[mem] {name} top: {}", names.join("; "));
+            // Every guest process of this host process: their guest memory and their translation
+            // caches, the largest named.
+            let all = omni_linux::process::all_live();
+            let mut each: Vec<(String, u64, u64)> = all.iter().map(|p| (String::from_utf8_lossy(&p.comm.lock()).into_owned(), p.guest_committed() >> 20, p.code_cache_committed() >> 20)).collect();
+            let (guest, code): (u64, u64) = each.iter().fold((0, 0), |(g, c), e| (g + e.1, c + e.2));
+            each.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+            let largest: Vec<String> = each.iter().take(6).map(|(n, g, c)| format!("{n} {g}+{c}M")).collect();
+            eprintln!("[mem] {name} host process {}: {} guest processes, guest memory {guest} MiB, translation caches {code} MiB; largest (guest+code): {}", std::process::id(), all.len(), largest.join(", "));
         });
     }
     // An app's host process: the system's properties, as they are now.

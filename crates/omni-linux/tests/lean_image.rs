@@ -54,5 +54,21 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
     for p in KEPT {
         assert!(kiosk.has(p), "kept: {}", String::from_utf8_lossy(p));
     }
+
+    // The hardware the device does not have (`device::HARDWARE_LEFT_OUT`): gone from lean and kiosk
+    // with its VINTF declaration and features; kept by `lean-hw`. What the app uses stays.
+    const CAMERA_HAL: &[u8] = b"/vendor/etc/init/android.hardware.camera.provider.ranchu.rc";
+    const CAMERA_VINTF: &[u8] = b"/vendor/etc/vintf/manifest/android.hardware.camera.provider.ranchu.xml";
+    const FINGERPRINT_HAL: &[u8] = b"/vendor/etc/init/android.hardware.biometrics.fingerprint-service.ranchu.rc";
+    for device in [&lean, &kiosk] {
+        for p in [CAMERA_HAL, CAMERA_VINTF, FINGERPRINT_HAL] {
+            assert!(!device.has(p), "left out: {}", String::from_utf8_lossy(p));
+        }
+        for p in [b"/system/etc/init/cameraserver.rc".as_slice(), b"/vendor/etc/init/android.hardware.audio.service.rc", b"/vendor/etc/init/android.hardware.health-service.example.rc", b"/vendor/etc/init/android.hardware.security.keymint-service.rc"] {
+            assert!(device.has(p), "kept: {}", String::from_utf8_lossy(p));
+        }
+    }
+    let with_hardware = open(Some("lean-hw"));
+    assert!(with_hardware.has(CAMERA_HAL) && with_hardware.has(FINGERPRINT_HAL) && !with_hardware.has(TELESERVICE));
     std::env::remove_var("OMNI_DEVICE_APPS");
 }

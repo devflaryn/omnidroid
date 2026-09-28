@@ -169,8 +169,12 @@ fn report(seen: &[(&'static str, i64, i64)]) -> String {
     let mut all: Vec<i64> = seen.iter().map(|s| s.1).collect();
     all.sort_unstable();
     let pick = |v: &[i64], q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
-    let mut clicks: Vec<i64> = seen.iter().filter(|s| matches!(s.0, "down" | "up" | "button" | "key")).map(|s| s.1).collect();
-    clicks.sort_unstable();
+    let of = |kinds: &[&str]| -> Vec<i64> {
+        let mut v: Vec<i64> = seen.iter().filter(|s| kinds.contains(&s.0)).map(|s| s.1).collect();
+        v.sort_unstable();
+        v
+    };
+    let (presses, keys) = (of(&["down", "up", "button"]), of(&["key"]));
     let mut line = format!(
         "[input] {} events answered by the app in {}s: event -> handled p50 {:.1} ms, p90 {:.1}, max {:.1}",
         all.len(),
@@ -179,8 +183,10 @@ fn report(seen: &[(&'static str, i64, i64)]) -> String {
         ms(pick(&all, 0.9)),
         ms(*all.last().expect("non-empty"))
     );
-    if !clicks.is_empty() {
-        line.push_str(&format!("; presses and keys ({}) p50 {:.1} ms, max {:.1}", clicks.len(), ms(pick(&clicks, 0.5)), ms(*clicks.last().expect("non-empty"))));
+    for (name, v) in [("presses", &presses), ("keys", &keys)] {
+        if !v.is_empty() {
+            line.push_str(&format!("; {name} ({}) p50 {:.1} ms, max {:.1}", v.len(), ms(pick(v, 0.5)), ms(*v.last().expect("non-empty"))));
+        }
     }
     line
 }
@@ -241,6 +247,6 @@ mod tests {
         observe(&channel, &finished(99, now));
         assert!(finished_total() > before);
         let line = report(&[("hover", 20_000_000, 10_000_000), ("down", 40_000_000, 1)]);
-        assert!(line.contains("2 events") && line.contains("p50 40.0") && line.contains("presses and keys (1) p50 40.0"), "{line}");
+        assert!(line.contains("2 events") && line.contains("p50 40.0") && line.contains("presses (1) p50 40.0") && !line.contains("keys"), "{line}");
     }
 }

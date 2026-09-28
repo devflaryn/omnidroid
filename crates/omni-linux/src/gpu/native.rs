@@ -6,6 +6,14 @@
 //! (`vkQueueSignalReleaseImageANDROID`, the image then in `PRESENT_SRC_KHR`), it is copied through a
 //! staging buffer into the region, row for row at the buffer's stride, and the region's content
 //! generation is bumped (D3a design, "Gralloc buffers on the host GPU").
+//!
+//! **The release does not wait for the GPU.** The copy into the staging buffer is submitted on the
+//! app's thread; waiting for it (NVIDIA's `vkWaitForFences` spins, ~3.1 ms a frame in a Roblox
+//! world, on the engine's render thread) and the copy into the region are a worker's. The region's
+//! metadata page says a copy is on its way ([`PENDING_GENERATION_AT`]: the generation it will have),
+//! and whoever reads the pixels -- the composer -- waits for that ([`wait_written`]) the way a
+//! consumer waits on a release fence. An image's next release waits for its previous copy (its
+//! staging buffer and command buffer are reused), so do its destruction and a device's.
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::Arc;
@@ -20,12 +28,26 @@ use crate::shm::Shm;
 
 type R<T> = Result<T, CallError>;
 
+macro_rules! vkfn {
+    ($t:expr, $id:ident, $name:literal, $ty:ty) => {{
+        const NAMES: &[&CStr] = &[$name];
+        // SAFETY: `$ty` is the command's Vulkan signature (ash's PFN type for it). (A call site
+        // may already be in an `unsafe` block.)
+        #[allow(unused_unsafe)]
+        let f: $ty = unsafe { entry_point::<$ty>(&$t, g::$id, NAMES)? };
+        f
+    }};
+}
+
 /// The gralloc handle's ints (`hal::gralloc`): magic, then ... the stride at 8 and the pixels'
 /// offset at 13.
 const HANDLE_MAGIC: u32 = 0x4247_4d4f;
 const HANDLE_INTS: u32 = 14;
 /// Where a region's content generation is (`hal::gralloc`, `mapper.c`).
 pub(crate) const CONTENT_GENERATION_AT: u64 = 4088;
+/// The generation the region will have once the copy on its way lands (0 or not above the content
+/// generation: nothing on its way).
+pub(crate) const PENDING_GENERATION_AT: u64 = 4080;
 
 /// What the host keeps of a device for the Android extensions: its physical device's memory
 /// types, the queues it handed out, and a copier per queue family.
@@ -34,11 +56,13 @@ pub(crate) struct DeviceInfo {
     /// Each queue the guest got, and its family.
     pub queues: HashMap<u64, u32>,
     copiers: HashMap<u32, Copier>,
+    /// The command pool of each family's copier, which the images' own come from.
+    pools: HashMap<u32, vk::CommandPool>,
 }
 
 impl DeviceInfo {
     pub(crate) fn new(memory: &vk::PhysicalDeviceMemoryProperties) -> Self {
-        Self { memory_types: memory.memory_types[..memory.memory_type_count as usize].to_vec(), queues: HashMap::new(), copiers: HashMap::new() }
+        Self { memory_types: memory.memory_types[..memory.memory_type_count as usize].to_vec(), queues: HashMap::new(), copiers: HashMap::new(), pools: HashMap::new() }
     }
 
     fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> R<u32> {
@@ -69,6 +93,105 @@ pub(crate) struct NativeImage {
     stride: u32,
     shm: Arc<Shm>,
     pixels_at: u64,
+    /// Its own copy command buffer and fence, made at its first release.
+    copier: Option<Copier>,
+    /// A copy of it is on its way (the worker's).
+    in_flight: Arc<InFlight>,
+}
+
+/// Whether an image's copy is on its way, and a wait for it to land.
+#[derive(Default)]
+struct InFlight {
+    busy: parking_lot::Mutex<bool>,
+    done: parking_lot::Condvar,
+}
+
+impl InFlight {
+    fn wait(&self) {
+        let mut busy = self.busy.lock();
+        while *busy {
+            self.done.wait(&mut busy);
+        }
+    }
+}
+
+/// A copy the worker lands: the fence the GPU's copy signals, then the staging bytes into the region.
+struct Landing {
+    table: Arc<Table>,
+    device: u64,
+    fence: vk::Fence,
+    invalidate: bool,
+    staging_memory: vk::DeviceMemory,
+    mapped: usize,
+    bytes: usize,
+    shm: Arc<Shm>,
+    pixels_at: u64,
+    in_flight: Arc<InFlight>,
+}
+
+// SAFETY: the Vulkan handles are plain handles; the staging mapping (`mapped`) is the image's, read
+// only by the worker while `in_flight` is set, and nothing else touches it meanwhile.
+unsafe impl Send for Landing {}
+
+impl Landing {
+    fn land(self) {
+        let t = &self.table;
+        let d = vk::Device::from_raw(self.device);
+        let waited = std::time::Instant::now();
+        let ok = (|| -> R<()> {
+            check(unsafe { vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences)(d, 1, &self.fence, vk::TRUE, u64::MAX) })?;
+            if super::stats::enabled() {
+                super::stats::add(super::special::ID_GRALLOC_USAGE + 6, waited.elapsed());
+            }
+            if self.invalidate {
+                let range = vk::MappedMemoryRange { memory: self.staging_memory, offset: 0, size: vk::WHOLE_SIZE, ..Default::default() };
+                check(unsafe { vkfn!(t, ID_VK_INVALIDATE_MAPPED_MEMORY_RANGES, c"vkInvalidateMappedMemoryRanges", vk::PFN_vkInvalidateMappedMemoryRanges)(d, 1, &range) })?;
+            }
+            Ok(())
+        })();
+        let written = std::time::Instant::now();
+        if ok.is_ok() {
+            // SAFETY: `mapped` is the staging memory's host mapping, `bytes` long, written by the copy
+            // the fence has just seen finish.
+            let pixels = unsafe { std::slice::from_raw_parts(self.mapped as *const u8, self.bytes) };
+            let _ = self.shm.write_at(pixels, self.pixels_at);
+        }
+        // Landed (or given up on): the generation it was promised, so no reader waits for ever.
+        bump_generation(&self.shm);
+        if super::stats::enabled() {
+            super::stats::add(super::special::ID_GRALLOC_USAGE + 7, written.elapsed());
+        }
+        *self.in_flight.busy.lock() = false;
+        self.in_flight.done.notify_all();
+    }
+}
+
+/// The worker that lands the copies, in the order they were released.
+fn landings() -> &'static parking_lot::Mutex<std::sync::mpsc::Sender<Landing>> {
+    static WORKER: std::sync::OnceLock<parking_lot::Mutex<std::sync::mpsc::Sender<Landing>>> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Landing>();
+        let _ = std::thread::Builder::new().name("omni-gpu-release".into()).spawn(move || {
+            for landing in rx {
+                landing.land();
+            }
+        });
+        parking_lot::Mutex::new(tx)
+    })
+}
+
+/// Wait (at most `limit`) until the copy on its way into `shm`, if any, has landed: what a reader of
+/// a released buffer's pixels waits on, as a consumer waits on a release fence.
+pub(crate) fn wait_written(shm: &Shm, limit: std::time::Duration) {
+    let word = |at: u64| {
+        let mut g = [0u8; 8];
+        let _ = shm.read_at(&mut g, at);
+        u64::from_le_bytes(g)
+    };
+    let started = std::time::Instant::now();
+    while word(PENDING_GENERATION_AT) > word(CONTENT_GENERATION_AT) && started.elapsed() < limit {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
 }
 
 impl NativeImage {
@@ -119,16 +242,6 @@ pub(crate) fn bump_generation(shm: &Shm) {
     let _ = shm.write_at(&(u64::from_le_bytes(g).wrapping_add(1)).to_le_bytes(), CONTENT_GENERATION_AT);
 }
 
-macro_rules! vkfn {
-    ($t:expr, $id:ident, $name:literal, $ty:ty) => {{
-        const NAMES: &[&CStr] = &[$name];
-        // SAFETY: `$ty` is the command's Vulkan signature (ash's PFN type for it). (A call site
-        // may already be in an `unsafe` block.)
-        #[allow(unused_unsafe)]
-        let f: $ty = unsafe { entry_point::<$ty>(&$t, g::$id, NAMES)? };
-        f
-    }};
-}
 
 fn check(r: vk::Result) -> R<()> {
     if r == vk::Result::SUCCESS { Ok(()) } else { Err(CallError::Host(r.as_raw())) }
@@ -220,7 +333,7 @@ fn attach(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, image: vk::Image,
         check(unsafe { vkfn!(t, ID_VK_BIND_BUFFER_MEMORY, c"vkBindBufferMemory", vk::PFN_vkBindBufferMemory)(d, staging, staging_memory, 0) })?;
         let mut mapped = std::ptr::null_mut();
         check(unsafe { vkfn!(t, ID_VK_MAP_MEMORY, c"vkMapMemory", vk::PFN_vkMapMemory)(d, staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty(), &mut mapped) })?;
-        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, invalidate, bytes, width, height, stride, shm, pixels_at })
+        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, invalidate, bytes, width, height, stride, shm, pixels_at, copier: None, in_flight: Arc::default() })
     }
 }
 
@@ -235,8 +348,13 @@ fn allocate(t: &Arc<Table>, d: vk::Device, size: u64, memory_type_index: u32) ->
 /// is not one.
 pub(crate) fn destroy_image(gpu: &Gpu, t: &Arc<Table>, image: u64) -> R<bool> {
     let Some(n) = gpu.native.lock().remove(&image) else { return Ok(false) };
+    // Its copy on its way lands first: it reads the staging buffer.
+    n.in_flight.wait();
     let d = vk::Device::from_raw(n.device);
     unsafe {
+        if let Some(c) = &n.copier {
+            vkfn!(t, ID_VK_DESTROY_FENCE, c"vkDestroyFence", vk::PFN_vkDestroyFence)(d, c.fence, std::ptr::null());
+        }
         vkfn!(t, ID_VK_DESTROY_IMAGE, c"vkDestroyImage", vk::PFN_vkDestroyImage)(d, vk::Image::from_raw(image), std::ptr::null());
         vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory)(d, n.memory, std::ptr::null());
         vkfn!(t, ID_VK_DESTROY_BUFFER, c"vkDestroyBuffer", vk::PFN_vkDestroyBuffer)(d, n.staging, std::ptr::null());
@@ -291,6 +409,9 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     }
     let waits: Vec<vk::Semaphore> = (0..u64::from(n)).map(|i| p.mem.read_u64(a[2] + i * 8).map(vk::Semaphore::from_raw).map_err(|_| CallError::Args)).collect::<R<_>>()?;
     let image = a[3];
+    // Its previous copy lands first: the staging buffer and the command buffer are reused.
+    let in_flight = gpu.native.lock().get(&image).map(|img| Arc::clone(&img.in_flight)).ok_or(CallError::Args)?;
+    in_flight.wait();
     let natives = gpu.native.lock();
     let Some(img) = natives.get(&image) else {
         return Err(CallError::Args);
@@ -298,6 +419,7 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     let (device, width, height, stride, staging) = (img.device, img.width, img.height, img.stride, img.staging);
     let (mapped, bytes, shm, pixels_at) = (img.mapped, img.bytes, Arc::clone(&img.shm), img.pixels_at);
     let (invalidate, staging_memory) = (img.invalidate, img.staging_memory);
+    let own = img.copier.as_ref().map(|c| (c.cb, c.fence));
     drop(natives);
     let d = vk::Device::from_raw(device);
     let mut devices = gpu.devices.lock();
@@ -315,10 +437,25 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         let fci = vk::FenceCreateInfo::default();
         check(unsafe { vkfn!(t, ID_VK_CREATE_FENCE, c"vkCreateFence", vk::PFN_vkCreateFence)(d, &fci, std::ptr::null(), &mut fence) })?;
         slot.insert(Copier { cb, fence });
+        info.pools.insert(family, pool);
     }
-    let copier = info.copiers.get(&family).expect("made above");
-    let (cb, fence) = (copier.cb, copier.fence);
-    // The copier is this device's, and the lock is held until its fence has signalled.
+    // The image's own command buffer and fence, from its family's pool (made once, under this lock).
+    let (cb, fence) = match own {
+        Some(c) => c,
+        None => {
+            let pool = info.pools.get(&family).copied().ok_or(CallError::Missing("a copy pool"))?;
+            let cai = vk::CommandBufferAllocateInfo { command_pool: pool, level: vk::CommandBufferLevel::PRIMARY, command_buffer_count: 1, ..Default::default() };
+            let mut cb = vk::CommandBuffer::null();
+            check(unsafe { vkfn!(t, ID_VK_ALLOCATE_COMMAND_BUFFERS, c"vkAllocateCommandBuffers", vk::PFN_vkAllocateCommandBuffers)(d, &cai, &mut cb) })?;
+            let mut fence = vk::Fence::null();
+            let fci = vk::FenceCreateInfo::default();
+            check(unsafe { vkfn!(t, ID_VK_CREATE_FENCE, c"vkCreateFence", vk::PFN_vkCreateFence)(d, &fci, std::ptr::null(), &mut fence) })?;
+            if let Some(img) = gpu.native.lock().get_mut(&image) {
+                img.copier = Some(Copier { cb, fence });
+            }
+            (cb, fence)
+        }
+    };
     let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
     let to_src = vk::ImageMemoryBarrier {
         src_access_mask: vk::AccessFlags::MEMORY_WRITE,
@@ -373,25 +510,16 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
             ..Default::default()
         };
         check(vkfn!(t, ID_VK_QUEUE_SUBMIT, c"vkQueueSubmit", vk::PFN_vkQueueSubmit)(vk::Queue::from_raw(queue), 1, &si, fence))?;
-        let waited = std::time::Instant::now();
-        check(vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences)(d, 1, &fence, vk::TRUE, u64::MAX))?;
-        if super::stats::enabled() {
-            super::stats::add(super::special::ID_GRALLOC_USAGE + 6, waited.elapsed());
-        }
-        if invalidate {
-            let range = vk::MappedMemoryRange { memory: staging_memory, offset: 0, size: vk::WHOLE_SIZE, ..Default::default() };
-            check(vkfn!(t, ID_VK_INVALIDATE_MAPPED_MEMORY_RANGES, c"vkInvalidateMappedMemoryRanges", vk::PFN_vkInvalidateMappedMemoryRanges)(d, 1, &range))?;
-        }
     }
     drop(devices);
-    let written = std::time::Instant::now();
-    // SAFETY: `mapped` is the staging memory's host mapping, `bytes` long, written by the copy the
-    // fence has just seen finish.
-    let pixels = unsafe { std::slice::from_raw_parts(mapped as *const u8, bytes) };
-    shm.write_at(pixels, pixels_at).map_err(|_| CallError::Args)?;
-    bump_generation(&shm);
-    if super::stats::enabled() {
-        super::stats::add(super::special::ID_GRALLOC_USAGE + 7, written.elapsed());
+    // On its way: the region says which generation it will have, and the worker lands it.
+    let mut g = [0u8; 8];
+    let _ = shm.read_at(&mut g, CONTENT_GENERATION_AT);
+    let _ = shm.write_at(&u64::from_le_bytes(g).wrapping_add(1).to_le_bytes(), PENDING_GENERATION_AT);
+    *in_flight.busy.lock() = true;
+    let landing = Landing { table: Arc::clone(&t), device, fence, invalidate, staging_memory, mapped, bytes, shm, pixels_at, in_flight: Arc::clone(&in_flight) };
+    if let Err(std::sync::mpsc::SendError(landing)) = landings().lock().send(landing) {
+        landing.land();
     }
     if a[4] != 0 {
         p.mem.write(a[4], &(-1i32).to_le_bytes()).map_err(|_| CallError::Args)?;

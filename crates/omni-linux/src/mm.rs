@@ -361,16 +361,25 @@ impl Mm {
             self.files.lock().insert(at, FileMapping { len, guest, offset: req.offset });
             return Ok(at);
         }
-        let (guest, sysroot, file_len) = match &*file.kind.lock() {
+        let (guest, sysroot, file_len, installed) = match &*file.kind.lock() {
             FileKind::Host { file, guest, sysroot } => {
-                (guest.clone(), *sysroot, file.metadata().map_err(|_| EIO)?.len())
+                let meta = file.metadata().map_err(|_| EIO)?;
+                // An installed package's file: the host file behind it, for a view like the image's.
+                let installed = (!sysroot && is_installed(guest)).then(|| omni_platform::fs::path_of(file).ok().map(|path| (path, meta.len(), meta.modified().ok()))).flatten();
+                (guest.clone(), *sysroot, meta.len(), installed)
             }
             _ => return Err(ENODEV),
         };
         // The part of the request the file covers, in whole pages; the rest is anonymous zeros.
         let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
-        let at = if in_file > 0 && sysroot {
-            let backing = p.vfs.sysroot().backing(&guest)?;
+        let backing = if in_file == 0 {
+            None
+        } else if sysroot {
+            Some(p.vfs.sysroot().backing(&guest)?)
+        } else {
+            installed.and_then(|(path, len, modified)| installed_backing(&path, len, modified, &guest))
+        };
+        let at = if let Some(backing) = backing {
             match self.space.map_file(&backing, req.offset, placement, in_file as usize, prot) {
                 Ok(a) => Some(a as u64),
                 Err(e) => {
@@ -412,6 +421,42 @@ impl Mm {
         label(at);
         Ok(at)
     }
+}
+
+/// **An installed app's native library** (`/data/app/<package>/lib/<abi>/*.so`, extracted at
+/// install and never written after) -- mapped privately as a view of the host file, as the image's
+/// libraries are, instead of as a private copy: the pages no one writes are the host's file cache,
+/// shared, and cost the process no commit (`libroblox.so` alone was 98 MiB of private copy in the
+/// app's host process, run 2026-09-28). A write to such a mapping is copy-on-write, as a private
+/// mapping's is.
+///
+/// Only those: a host file with a live view cannot be renamed or deleted on Windows, and installd
+/// renames an install's staging directory (`vmdl*.tmp`) after PackageManager has parsed the APK in
+/// it (`INSTALL_FAILED_INSUFFICIENT_STORAGE: Failed to rename`, run 2026-09-29, when every
+/// `/data/app` file was a view). A library is mapped by its app alone, which is gone before its
+/// package is.
+fn is_installed(guest: &[u8]) -> bool {
+    let path = String::from_utf8_lossy(guest);
+    path.starts_with("/data/app/") && path.contains("/lib/") && path.ends_with(".so") && !path.contains(".tmp/")
+}
+
+/// The view backing of an installed library while something maps it: one per host file while it is
+/// unchanged (the same size and time), and nothing kept once no mapping holds it.
+fn installed_backing(path: &std::path::Path, len: u64, modified: Option<std::time::SystemTime>, guest: &[u8]) -> Option<Arc<omni_mem::Backing>> {
+    type Cache = std::collections::HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, std::sync::Weak<omni_mem::Backing>)>;
+    static CACHE: std::sync::OnceLock<Mutex<Cache>> = std::sync::OnceLock::new();
+    let mut cache = CACHE.get_or_init(Mutex::default).lock();
+    cache.retain(|_, (_, _, w)| w.strong_count() > 0);
+    if let Some((l, m, w)) = cache.get(path) {
+        if *l == len && *m == modified {
+            if let Some(b) = w.upgrade() {
+                return Some(b);
+            }
+        }
+    }
+    let backing = omni_mem::Backing::open_named(path, omni_mem::MapExecutability::Executable, &String::from_utf8_lossy(guest)).ok()?;
+    cache.insert(path.to_path_buf(), (len, modified, Arc::downgrade(&backing)));
+    Some(backing)
 }
 
 fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {

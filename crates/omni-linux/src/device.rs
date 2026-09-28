@@ -111,6 +111,84 @@ pub const LEAVES_OUT: &[&str] = &[
     "/system/priv-app/DynamicSystemInstallationService",
 ];
 
+/// **The hardware this device does not have**, left out as a product build leaves a HAL's package
+/// out: its init service (`.rc`), its VINTF declaration (so no client waits for it) and its
+/// feature files (so no system service or app looks for it). What remains is what the app and the
+/// runtime use: audio, graphics (the host's), input, health, keystore/KeyMint, gatekeeper, the
+/// network, media.
+///
+/// Gone: cameras (the emulator's two providers and the virtual camera; cameraserver stays and
+/// reports none), fingerprint and
+/// face (the emulator's and an example), Bluetooth's HAL,
+/// USB (its HAL and `usbd`), the context hub, identity credentials (HAL and `credstore`), lights,
+/// the vibrator, power statistics, the mock thermal HAL, GNSS, the goldfish codec2 HAL (the software
+/// codecs stay), the goldfish allocator 3.0 and composer 3 (the host serves gralloc 5 and the
+/// composer), the atrace HAL, and the daemons of a phone's maintenance: `incidentd`, `storaged`,
+/// `update_verifier`, `misctrl`. Each ran as a guest process of the system's host process, with its
+/// own memory and binder threads (`[init] started 67 services`, run 2026-09-28).
+pub const HARDWARE_LEFT_OUT: &[&str] = &[
+    // Cameras: the HALs. cameraserver stays, as on any device without a camera -- it answers
+    // that there is none; without it apps wait for `media.camera` (Roblox's engine did, its
+    // display stalled, run 2026-09-29).
+    "/system/etc/init/virtual_camera.hal.rc",
+    "/vendor/etc/init/android.hardware.camera.provider.ranchu.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.camera.provider.ranchu.xml",
+    "/vendor/etc/init/android.hardware.camera.provider@2.7-service-google.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.camera.provider@2.7-service-google.xml",
+    "/vendor/etc/permissions/android.hardware.camera.concurrent.xml",
+    "/vendor/etc/permissions/android.hardware.camera.flash-autofocus.xml",
+    "/vendor/etc/permissions/android.hardware.camera.front.xml",
+    "/vendor/etc/permissions/android.hardware.camera.full.xml",
+    "/vendor/etc/permissions/android.hardware.camera.raw.xml",
+    // Bluetooth's HAL (its features are in LEAVES_OUT).
+    "/vendor/etc/init/bluetooth-service-default.rc",
+    "/vendor/etc/vintf/manifest/bluetooth-service-default.xml",
+    // USB.
+    "/system/etc/init/usbd.rc",
+    "/vendor/etc/init/android.hardware.usb-service.example.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.usb-service.example.xml",
+    // Context hub, identity credentials.
+    "/vendor/etc/init/contexthub-default.rc",
+    "/vendor/etc/vintf/manifest/contexthub-default.xml",
+    "/vendor/etc/init/identity-default.rc",
+    "/vendor/etc/vintf/manifest/identity-default.xml",
+    "/vendor/etc/permissions/android.hardware.identity_credential.xml",
+    "/system/etc/init/credstore.rc",
+    // Lights, vibrator, power statistics, thermal, GNSS.
+    "/vendor/etc/init/lights-default.rc",
+    "/vendor/etc/vintf/manifest/lights-default.xml",
+    "/vendor/etc/init/vibrator-default.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.vibrator.xml",
+    "/vendor/etc/init/power.stats-default.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.power.stats.xml",
+    "/vendor/etc/init/android.hardware.thermal@2.0-service.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.thermal@2.0-service.xml",
+    "/vendor/etc/init/android.hardware.gnss-service.ranchu.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.gnss-service.ranchu.xml",
+    // The emulator's codec2, allocator 3.0 and composer 3 (they need QEMU's pipe; the host serves
+    // graphics).
+    "/vendor/etc/init/android.hardware.media.c2@1.0-service-goldfish.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.media.c2@1.0-service-goldfish.xml",
+    "/vendor/etc/init/android.hardware.graphics.allocator@3.0-service.ranchu.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.graphics.gralloc3.ranchu.xml",
+    "/vendor/etc/init/hwc3.rc",
+    // Biometrics: the emulator's fingerprint HAL needs QEMU's pipe (it aborted at every boot:
+    // "Could not open the sensor service: 'fingerprintlisten'"), the face HAL is an example.
+    "/vendor/etc/init/android.hardware.biometrics.fingerprint-service.ranchu.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.biometrics.fingerprint-service.ranchu.xml",
+    "/vendor/etc/permissions/android.hardware.fingerprint.xml",
+    "/vendor/etc/init/face-example.rc",
+    "/vendor/etc/vintf/manifest/face-example.xml",
+    "/vendor/etc/permissions/android.hardware.biometrics.face.xml",
+    // Tracing and a phone's maintenance daemons.
+    "/vendor/etc/init/android.hardware.atrace@1.0-service.rc",
+    "/vendor/etc/vintf/manifest/android.hardware.atrace@1.0-service.xml",
+    "/system/etc/init/incidentd.rc",
+    "/system/etc/init/storaged.rc",
+    "/system/etc/init/update_verifier.rc",
+    "/system/etc/init/misctrl.rc",
+];
+
 /// A kiosk device (`OMNI_DEVICE_APPS=kiosk`) has also no SystemUI and no launcher: no status bar,
 /// navigation bar, taskbar or keyguard, the app given the whole display from the first boot
 /// (`tests/d8_app_only.rs` ran it as SystemUI disabled at a second boot). The home is Settings'
@@ -118,14 +196,16 @@ pub const LEAVES_OUT: &[&str] = &[
 pub const KIOSK_LEAVES_OUT: &[&str] = &["/system_ext/priv-app/SystemUI", "/system_ext/priv-app/Launcher3QuickStep"];
 
 /// What `OMNI_DEVICE_APPS` makes of the image: `full` (the image as it is), `lean` (the default:
-/// [`LEAVES_OUT`] left out) or `kiosk` (and [`KIOSK_LEAVES_OUT`]). Read by each host process of an
+/// [`LEAVES_OUT`] and [`HARDWARE_LEFT_OUT`] left out), `lean-hw` (only [`LEAVES_OUT`]: the hardware
+/// kept) or `kiosk` (lean, and [`KIOSK_LEAVES_OUT`]). Read by each host process of an
 /// instance alike (the variable is inherited), so they all see one image.
 #[must_use]
 pub fn left_out() -> Vec<&'static str> {
     match std::env::var("OMNI_DEVICE_APPS").as_deref() {
         Ok("full") => Vec::new(),
-        Ok("kiosk") => LEAVES_OUT.iter().chain(KIOSK_LEAVES_OUT).copied().collect(),
-        _ => LEAVES_OUT.to_vec(),
+        Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).copied().collect(),
+        Ok("lean-hw") => LEAVES_OUT.to_vec(),
+        _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).copied().collect(),
     }
 }
 

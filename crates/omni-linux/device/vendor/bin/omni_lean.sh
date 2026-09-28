@@ -21,7 +21,9 @@ n=$(getprop persist.omni.cached_processes)
 [ "$n" = off ] && exit 0
 # The device configuration answers once the settings provider is up.
 i=0
-until [ "$(device_config get activity_manager max_cached_processes 2>/dev/null)" = "$n" ] || [ $i -ge 300 ]; do
+# Both read back before it ends: the settings provider can take the first and not yet the second
+# (run 2026-09-29: "post-boot grace null ms", and Android kept its ten minutes).
+until { [ "$(device_config get activity_manager max_cached_processes 2>/dev/null)" = "$n" ] && [ "$(device_config get activity_manager no_kill_cached_processes_post_boot_completed_duration_millis 2>/dev/null)" = 0 ]; } || [ $i -ge 300 ]; do
     device_config put activity_manager no_kill_cached_processes_post_boot_completed_duration_millis 0 >/dev/null 2>&1
     device_config put activity_manager max_cached_processes "$n" >/dev/null 2>&1
     sleep 2
