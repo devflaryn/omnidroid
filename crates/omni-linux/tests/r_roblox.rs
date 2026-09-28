@@ -87,6 +87,28 @@ fn the_apk_is_installed_started_and_draws() {
              echo \"[r] join intent for {id}: $?\"; "
         )
     });
+    // A test device trimmed as test images are (`OMNI_R_LEAN=0` keeps everything): the image's apps
+    // that nothing here uses are disabled, so they neither run nor come back -- each app host
+    // process holds ~263 MiB, and with ~20 of them started at boot the host ran out of memory as
+    // the game loaded (r11: two sessions stopped by Claude Code's low-memory reaper).
+    const IDLE_APPS: &[&str] = &[
+        "com.android.calendar", "com.android.providers.calendar", "com.android.contacts", "com.android.camera2",
+        "com.android.messaging", "com.android.printspooler", "com.android.cellbroadcastreceiver",
+        "com.android.cellbroadcastreceiver.module", "com.android.dynsystem", "com.android.traceur", "com.android.nfc",
+        "com.android.imsserviceentitlement", "com.android.healthconnect.controller", "com.android.ondevicepersonalization.services",
+        "com.android.devicelockcontroller", "com.android.statementservice", "com.android.documentsui",
+        "com.android.localtransport", "com.android.emulator.multidisplay", "com.android.federatedcompute.services",
+        "com.android.adservices.api", "com.android.bluetooth", "com.android.managedprovisioning", "com.android.traceur",
+    ];
+    let lean = if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
+        String::new()
+    } else {
+        format!(
+            "for a in {}; do cmd package disable-user --user 0 $a >/dev/null 2>&1; done; echo \"[r] idle apps disabled: {}\"; ",
+            IDLE_APPS.join(" "),
+            IDLE_APPS.len()
+        )
+    };
     let then = format!(
         "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
          echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; \
@@ -95,7 +117,7 @@ fn the_apk_is_installed_started_and_draws() {
          input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
-         pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
+         {lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
          pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
          act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \
