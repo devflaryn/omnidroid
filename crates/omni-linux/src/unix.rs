@@ -14,6 +14,8 @@ use crate::socket::{Peer, Socket};
 
 /// A bound socket: its type, whether it listens, and what waits on it.
 pub struct Bound {
+    /// The name it is bound to (`@...` abstract, or a path).
+    pub name: Vec<u8>,
     pub ty: u64,
     /// The credentials of the process that bound it: what its clients see as their peer.
     pub cred: crate::socket::Cred,
@@ -44,7 +46,7 @@ impl Bound {
         if names.get(&key).is_some_and(|b| b.strong_count() > 0) {
             return Err(EADDRINUSE);
         }
-        let bound = Arc::new(Self { ty, cred, passcred: false.into(), listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
+        let bound = Arc::new(Self { name: name.to_vec(), ty, cred, passcred: false.into(), listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
         names.insert(key, Arc::downgrade(&bound));
         Ok(bound)
     }
@@ -53,7 +55,7 @@ impl Bound {
     /// before it makes a new one).
     #[must_use]
     pub fn bind_replacing(instance: usize, name: &[u8], ty: u64, cred: crate::socket::Cred) -> Arc<Self> {
-        let bound = Arc::new(Self { ty, cred, passcred: false.into(), listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
+        let bound = Arc::new(Self { name: name.to_vec(), ty, cred, passcred: false.into(), listening: false.into(), backlog: Mutex::default(), datagrams: Mutex::default() });
         names().lock().insert((instance, name.to_vec()), Arc::downgrade(&bound));
         bound
     }
@@ -62,6 +64,13 @@ impl Bound {
     #[must_use]
     pub fn find(instance: usize, name: &[u8]) -> Option<Arc<Self>> {
         names().lock().get(&(instance, name.to_vec())).and_then(Weak::upgrade)
+    }
+
+    /// The live socket bound to `name` in any instance of this host process (a request from another
+    /// host process, `crate::xsocket`, names no instance: a host process runs one).
+    #[must_use]
+    pub fn find_any(name: &[u8]) -> Option<Arc<Self>> {
+        names().lock().iter().filter(|((_, n), _)| n == name).find_map(|(_, b)| b.upgrade())
     }
 
     /// `connect` to this socket: a stream or seqpacket client gets its end of a new pair (the

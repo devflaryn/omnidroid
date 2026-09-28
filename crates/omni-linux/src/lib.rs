@@ -44,6 +44,7 @@ pub mod sync_file;
 pub mod syscall;
 pub mod vfs;
 pub mod xattr;
+pub mod xsocket;
 pub mod xtables;
 pub mod zygote;
 

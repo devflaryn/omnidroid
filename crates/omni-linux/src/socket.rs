@@ -351,6 +351,12 @@ fn sys_connect(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         socket.peer = Some(Peer::Dns(crate::dnsproxy::Proxy::new(&hosts)));
         return Ok(0);
     }
+    // An abstract name another host process of the instance listens on (`crate::xsocket`).
+    if let Some(dir) = p.vfs.binds().instance_dir() {
+        if let Some(done) = crate::xsocket::connect(dir, &path, socket, cred_of(p)) {
+            return done.map(|()| 0);
+        }
+    }
     if p.trace {
         eprintln!("[socket] connect {:?}: no service", String::from_utf8_lossy(&path));
     }
@@ -451,6 +457,9 @@ fn sys_listen(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     match &socket.peer {
         Some(Peer::Bound(bound)) if bound.ty != 2 => {
             bound.listening.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(dir) = p.vfs.binds().instance_dir() {
+                crate::xsocket::publish(dir, &bound.name);
+            }
             Ok(0)
         }
         Some(Peer::Host(host)) => host.listen(a[1] as i64 as i32).map(|()| 0),

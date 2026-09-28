@@ -294,6 +294,12 @@ pub struct Binds {
 }
 
 impl Binds {
+    /// The instance's directory, when the table is kept in one.
+    #[must_use]
+    pub fn instance_dir(&self) -> Option<&Path> {
+        self.file.as_deref().and_then(Path::parent)
+    }
+
     /// The bind mounts of the instance at `instance` (one table per instance directory).
     #[must_use]
     pub fn of(instance: &Path) -> Arc<Self> {

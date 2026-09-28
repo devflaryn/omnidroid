@@ -1307,7 +1307,6 @@ fn sys_fallocate(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         (FileKind::Host { .. } | FileKind::Shared(_), _) => Err(crate::errno::EOPNOTSUPP),
-        (FileKind::Host { .. }, _) => Err(crate::errno::EBADF),
         (FileKind::Pipe(_) | FileKind::Socket(_), _) => Err(crate::errno::ESPIPE),
         _ => Err(crate::errno::ENODEV),
     }
