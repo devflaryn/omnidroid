@@ -185,6 +185,8 @@ fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Dev
                     eprintln!("[window] pointer capture: {e}");
                     false
                 });
+                // Said, so a run's log shows when a hand was on the mouse.
+                eprintln!("[window] mouse {}", if !take { "given back" } else if held { "held (a click in the window)" } else { "not held: the window has no focus" });
                 if take {
                     // What follows the answer comes before anything else queued.
                     for o in input.captured(held, now).into_iter().rev() {

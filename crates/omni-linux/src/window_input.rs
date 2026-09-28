@@ -9,7 +9,9 @@
 //! Every key the window has the focus for, by its **physical** key ([`evdev_code`] of the
 //! scancode), so Android's key layout (`Generic.kl`) and the app see the key a device's keyboard
 //! would report. A host auto-repeat is the driver's repeat (value 2). Keys held when the focus goes
-//! are released.
+//! are released. **The Windows (Meta) keys stay the host's** ([`HOST_KEYS`]): the host acts on them
+//! too (the Start menu), and Meta alone opens Android's app list, so passing them on would do two
+//! things at once.
 //!
 //! # The mouse: held on a click, as a virtual machine holds it
 //!
@@ -47,6 +49,8 @@ pub const PLACE_WAIT: Duration = Duration::from_millis(400);
 /// 2.040..=2.042 on both axes, one figure. The gate places at two far-apart points to hold it to
 /// that. A changed pointer speed changes it.
 pub const PLACE_GAIN: f64 = 2.04;
+/// Keys the host keeps: `KEY_LEFTMETA`, `KEY_RIGHTMETA`.
+pub const HOST_KEYS: [u16; 2] = [125, 126];
 /// `KEY_RIGHTCTRL`: the key that gives the mouse back.
 pub const RELEASE_KEY: u16 = 97;
 /// One wheel notch in the window seam's units.
@@ -151,7 +155,7 @@ impl Input {
         let mut out = Vec::new();
         match *event {
             WindowEvent::KeyDown { scancode, repeat, .. } => {
-                let Some(code) = evdev_code(scancode) else { return out };
+                let Some(code) = evdev_code(scancode).filter(|c| !HOST_KEYS.contains(c)) else { return out };
                 if code == RELEASE_KEY && self.held && !repeat {
                     self.swallow = Some(code);
                     return self.release();
@@ -160,7 +164,7 @@ impl Input {
                 out.push(Out::Keyboard(vec![(EV_KEY, code, if repeat { 2 } else { 1 })]));
             }
             WindowEvent::KeyUp { scancode, .. } => {
-                let Some(code) = evdev_code(scancode) else { return out };
+                let Some(code) = evdev_code(scancode).filter(|c| !HOST_KEYS.contains(c)) else { return out };
                 if self.swallow == Some(code) {
                     self.swallow = None;
                     return out;
@@ -313,6 +317,8 @@ mod tests {
         assert_eq!(input.event(&key(0x1E, false), now, ONE), [Out::Keyboard(vec![(EV_KEY, 30, 0)])]);
         assert_eq!(input.event(&key(0xE048, true), now, ONE), [Out::Keyboard(vec![(EV_KEY, 103, 1)])], "Up is KEY_UP");
         assert!(input.event(&key(0x1E, false), now, ONE).is_empty(), "a release of a key not down is not passed on");
+        assert!(input.event(&key(0xE05B, true), now, ONE).is_empty(), "the left Windows key is the host's");
+        assert!(input.event(&key(0xE05C, false), now, ONE).is_empty(), "and the right one");
     }
 
     /// The click that takes the mouse: capture, home, then -- only after the wait -- the move to the

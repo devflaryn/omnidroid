@@ -83,7 +83,9 @@ The window's keyboard and mouse are now **the device's**, through Android's real
 - **Translation** (`window_input`, platform-agnostic): keys by physical key (the set-1 ->
   `KEY_*` table moved from omni-android into the window seam as `evdev_code`); **the mouse is held
   on a click** (pointer capture: host cursor hidden, raw motion) and **Right Ctrl gives it back**
-  (so does losing the focus); the title bar says which (`Window::set_title`, new, all three
+  (so does losing the focus); **the Windows (Meta) keys stay the host's** (Meta alone opens Android's
+  app list: a D6 run found it open, cause not pinned -- a Win key press or a click on the taskbar;
+  `[window] mouse held/given back` is logged since); the title bar says which (`Window::set_title`, new, all three
   backends). Why a hold: Android has no absolute mouse -- `SOURCE_MOUSE`, what Roblox reads a mouse
   by (`omni-android/src/jni/mouse.rs`), comes only from a relative device that Android moves its
   own pointer for, through its own acceleration, and the switch to turn that off
@@ -99,6 +101,7 @@ The window's keyboard and mouse are now **the device's**, through Android's real
   `vscroll 1.0`. Control-file commands: `key`, `click`, `move`, `wheel` (module doc).
 - **Roblox**: both devices added, Landing reached; its hand cursor follows the mouse over "Giriş Yap"
   (`work/roblox-input/after-click.png`, a 2305x1085 window the display followed).
+- Regression with input on: D6 passes (817x542 in 2.0 s, 1531x877 in 4.2 s, 1090/1090 frames).
 - `r_roblox` now sets `force_resizable_activities` **by default** (the owner's choice), window or
   not; `tools/aosp_play.ps1 [-Cookie f] [-Place id] [-Minutes n] [-Size WxH] [-NotResizable]`
   runs it in the live window with input.
