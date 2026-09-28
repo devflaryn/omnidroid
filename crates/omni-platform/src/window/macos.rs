@@ -321,6 +321,14 @@ impl Window {
         true
     }
 
+    /// The image goes to the AppKit thread (a copy: the proxy's caller keeps its buffer), where it
+    /// becomes the contents of a layer over the view: `appkit::present_rgba`.
+    pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        let id = self.id;
+        let pixels = rgba.to_vec();
+        on_main(move |_| appkit::present_rgba(id, pixels, width, height))
+    }
+
     pub(super) fn raw(&self) -> RawWindow {
         self.raw
     }

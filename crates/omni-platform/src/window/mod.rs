@@ -27,6 +27,7 @@
 //! Window::has_focus(&self) -> bool
 //! Window::warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()>
 //! Window::wait(&self, timeout: Duration) -> bool
+//! Window::present_rgba(&mut self, rgba: &[u8], width, height) -> WindowResult<()>
 //! Window::raw(&self) -> RawWindow
 //! ```
 //!
@@ -122,6 +123,25 @@
 //! button is up: the capture taken away, or the host's own button state asked while a button is
 //! held. A release reported twice is harmless to a consumer that tracks its buttons; one never
 //! reported is not.
+//!
+//! # Pixels the host CPU already has: `present_rgba`
+//!
+//! A window's content normally comes from a swapchain `omni-gfx` builds on [`Window::raw`]. The
+//! other source is an image already in host memory -- the real-AOSP path's framebuffer, which
+//! SurfaceFlinger's composer fills (`omni-linux`'s `hal::framebuffer`) -- and for that the seam
+//! has [`Window::present_rgba`]: RGBA rows, **stretched to the whole client area**, alpha ignored.
+//! Stretched rather than placed 1:1 because the image and the window disagree about the size only
+//! while one is catching up with the other (a guest display resizing to follow the window), and a
+//! picture that briefly scales reads better than one cropped or bordered. Each backend uses the
+//! host's own scaler where it has one: `StretchDIBits` on Windows, a `CALayer`'s contents gravity
+//! on macOS; X11's core protocol has none, so its backend scales on the CPU
+//! ([`scale_nearest`]).
+//!
+//! A window presented to this way **keeps its last image and repaints it itself** when the host
+//! asks (Windows' `WM_PAINT`, X11's `Expose`), stretched to whatever the client area is by then --
+//! which on Windows is what keeps a window with content while the user drags its border, when the
+//! modal loop in "Why polling" stops the caller from presenting. Use one source per window: a
+//! window with a swapchain on it must not also be presented to.
 //!
 //! # No refresh-rate query, on purpose
 //!
@@ -916,6 +936,28 @@ impl Window {
         self.inner.wait(timeout)
     }
 
+    /// **Show an image in the client area**: `width` x `height` pixels, RGBA with 8 bits a channel,
+    /// rows packed (`width * 4` bytes apart), stretched to fill the client area. Alpha is ignored:
+    /// the window is opaque.
+    ///
+    /// The image stays the window's content until the next call: the window repaints it itself
+    /// when the host asks, stretched to the client area as it is then (see this module's "Pixels
+    /// the host CPU already has"). A minimised window takes the image and shows it when restored.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::SizeOutOfRange`] for an extent outside `1..=`[`MAX_EXTENT`];
+    /// [`WindowError::PixelsTooShort`] when `rgba` is shorter than `width * height * 4` (extra
+    /// bytes are ignored); the host's refusal otherwise.
+    pub fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        validate_extent(width, height, "present_rgba")?;
+        let needed = width as usize * height as usize * 4;
+        let Some(image) = rgba.get(..needed) else {
+            return Err(WindowError::PixelsTooShort { operation: "present_rgba", width, height, needed, got: rgba.len() });
+        };
+        self.inner.present_rgba(image, width, height)
+    }
+
     /// The native handle, for a graphics backend to build a surface on.
     ///
     /// Valid for as long as this `Window` is. A surface outliving its window is undefined
@@ -923,6 +965,33 @@ impl Window {
     #[must_use]
     pub fn raw(&self) -> RawWindow {
         self.inner.raw()
+    }
+}
+
+/// **Nearest-neighbour scaling** of a packed 4-byte-per-pixel image (`src`, `sw` x `sh`) into
+/// `dst` at `dw` x `dh`, for a backend whose host has no scaler of its own (X11's core protocol).
+/// `dst` is resized to fit. Each destination pixel takes the source pixel its centre falls in, so
+/// equal sizes copy exactly and no source row or column is read out of range.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+pub(crate) fn scale_nearest(src: &[u8], sw: usize, sh: usize, dst: &mut Vec<u8>, dw: usize, dh: usize) {
+    dst.resize(dw * dh * 4, 0);
+    if sw == 0 || sh == 0 {
+        dst.fill(0);
+        return;
+    }
+    // The source column of each destination column, computed once for all rows.
+    let columns: Vec<usize> = (0..dw).map(|x| ((2 * x + 1) * sw / (2 * dw)).min(sw - 1)).collect();
+    for y in 0..dh {
+        let sy = ((2 * y + 1) * sh / (2 * dh)).min(sh - 1);
+        let src_row = &src[sy * sw * 4..(sy + 1) * sw * 4];
+        let dst_row = &mut dst[y * dw * 4..(y + 1) * dw * 4];
+        if sw == dw {
+            dst_row.copy_from_slice(src_row);
+            continue;
+        }
+        for (d, &sx) in dst_row.chunks_exact_mut(4).zip(&columns) {
+            d.copy_from_slice(&src_row[sx * 4..sx * 4 + 4]);
+        }
     }
 }
 
@@ -1058,6 +1127,30 @@ mod tests {
         let mut queue = vec![WindowEvent::PointerMotion { dx: i32::MAX - 1, dy: i32::MIN + 1 }];
         push_event(&mut queue, WindowEvent::PointerMotion { dx: 5, dy: -5 });
         assert_eq!(queue, vec![WindowEvent::PointerMotion { dx: i32::MAX, dy: i32::MIN }]);
+    }
+
+    /// Each pixel of a 3x2 image is distinct, so a scaler that picked the wrong source pixel -- or
+    /// read a row or column past the image -- fails on the value, not only on the length.
+    #[test]
+    fn nearest_scaling_copies_equal_sizes_and_picks_the_pixel_under_each_centre() {
+        let src: Vec<u8> = (0..6u8).flat_map(|i| [i, 10 + i, 20 + i, 255]).collect();
+        let mut dst = Vec::new();
+        scale_nearest(&src, 3, 2, &mut dst, 3, 2);
+        assert_eq!(dst, src, "equal sizes are a copy");
+
+        scale_nearest(&src, 3, 2, &mut dst, 6, 4);
+        let at = |x: usize, y: usize| dst[(y * 6 + x) * 4];
+        let row0: Vec<u8> = (0..6).map(|x| at(x, 0)).collect();
+        let row3: Vec<u8> = (0..6).map(|x| at(x, 3)).collect();
+        assert_eq!(row0, [0, 0, 1, 1, 2, 2], "doubled: each column twice");
+        assert_eq!(row3, [3, 3, 4, 4, 5, 5], "the last row is the source's last row");
+        assert_eq!(at(0, 1), 0, "doubled: each row twice");
+
+        scale_nearest(&src, 3, 2, &mut dst, 1, 1);
+        assert_eq!(&dst[..], &src[4 * 4..4 * 4 + 4], "one pixel: the centre's (1, 1)");
+
+        scale_nearest(&src, 3, 2, &mut dst, 2, 5);
+        assert_eq!(dst.len(), 2 * 5 * 4);
     }
 
     /// A move separated from another move by anything at all is two moves. This is the property

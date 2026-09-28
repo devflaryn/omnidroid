@@ -95,6 +95,24 @@ pub enum WindowError {
         max: u32,
     },
 
+    /// [`super::Window::present_rgba`] was handed fewer bytes than the image it names: `width` x
+    /// `height` pixels of four bytes each. Refused rather than drawn part-way, because a short
+    /// buffer is a caller that has the size or the stride wrong, and a picture of the wrong size is
+    /// the silent wrong answer.
+    #[error("`{operation}`: a {width}x{height} RGBA image needs {needed} bytes and {got} were given")]
+    PixelsTooShort {
+        /// The seam operation that was called.
+        operation: &'static str,
+        /// The image's width, in pixels.
+        width: u32,
+        /// The image's height, in pixels.
+        height: u32,
+        /// `width * height * 4`.
+        needed: usize,
+        /// The length of the buffer given.
+        got: usize,
+    },
+
     /// The window title contains a NUL character.
     ///
     /// Win32 takes a NUL-terminated UTF-16 string, so a title with an interior NUL would be

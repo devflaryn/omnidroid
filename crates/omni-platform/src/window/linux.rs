@@ -83,6 +83,14 @@
 //! core buttons it finds up. Back and forward have no bit in the core state and are left to their
 //! own releases and to the focus.
 //!
+//! **8. A presented image is put with `XPutImage`, and repainted on `Expose`.** The core protocol
+//! has no scaler, so [`Window::present_rgba`]'s image is scaled on the CPU to the window's size
+//! ([`super::scale_nearest`]) and converted to the default visual's pixel layout (its channel
+//! masks, 24- or 32-bit TrueColor), in a client-owned `XImage` (`XInitImage`: nothing for Xlib to
+//! free). `ExposureMask` is selected at the first present, so a window a swapchain owns hears no
+//! `Expose`; after it, an `Expose` (the last of a run) draws the kept image again at the size the
+//! window has then -- which a resize produces, the window's bit gravity being `ForgetGravity`.
+//!
 //! # Why X11 first
 //!
 //! One backend that reaches every Linux desktop -- a Wayland desktop through Xwayland -- rather
@@ -264,6 +272,11 @@ pub(super) struct Window {
     buttons_down: u32,
     /// The pointer's last position an event carried, for a release point 7 reports.
     last_pointer: (i32, i32),
+    /// The image [`super::Window::present_rgba`] last gave: RGBA, and its size. Point 8.
+    image: Option<(Vec<u8>, u32, u32)>,
+    /// The image scaled to the window, then in the visual's layout: kept to be reused.
+    scaled: Vec<u8>,
+    converted: Vec<u8>,
 }
 
 /// The bit a seam button is tracked by in `buttons_down`.
@@ -365,6 +378,9 @@ impl Window {
             hide_cursor: false,
             buttons_down: 0,
             last_pointer: (0, 0),
+            image: None,
+            scaled: Vec::new(),
+            converted: Vec::new(),
         };
 
         // Auto-repeat as presses (this module's header, "Why Xlib").
@@ -941,6 +957,14 @@ impl Window {
                     push_event(&mut self.queue, WindowEvent::Occluded {
                         occluded: visibility.state == xlib::VisibilityFullyObscured,
                     });
+                }
+            }
+            xlib::Expose => {
+                // SAFETY: the type says `expose` is the member.
+                let expose = unsafe { event.expose };
+                // Only the last of a run: one draw covers the whole window (point 8).
+                if expose.count == 0 && self.image.is_some() {
+                    let _ = self.draw("present_rgba");
                 }
             }
             xlib::MapNotify => {
@@ -1581,6 +1605,80 @@ impl Window {
     }
 
     /// The connection and the window, for `VkXlibSurfaceCreateInfoKHR`.
+    /// Keep the image and draw it now: point 8. The first present selects `ExposureMask`.
+    pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        if self.image.is_none() {
+            let xl = &self.libs.xlib;
+            // SAFETY: a zeroed `XWindowAttributes` is valid to be overwritten; a live display and
+            // window. The mask selected so far (this window's and the input method's) is kept.
+            unsafe {
+                let mut attributes: xlib::XWindowAttributes = core::mem::zeroed();
+                (xl.XGetWindowAttributes)(self.display, self.window, &raw mut attributes);
+                (xl.XSelectInput)(self.display, self.window, attributes.your_event_mask | xlib::ExposureMask);
+            }
+        }
+        let image = self.image.get_or_insert_with(|| (Vec::new(), 0, 0));
+        image.0.clear();
+        image.0.extend_from_slice(rgba);
+        (image.1, image.2) = (width, height);
+        self.draw("present_rgba")
+    }
+
+    /// Put the kept image on the window, scaled to its size: point 8. Nothing while iconic.
+    fn draw(&mut self, operation: &'static str) -> WindowResult<()> {
+        let Some((rgba, width, height)) = &self.image else { return Ok(()) };
+        let (cw, ch) = self.size;
+        if self.iconic || cw == 0 || ch == 0 {
+            return Ok(());
+        }
+        let xl = &self.libs.xlib;
+        // SAFETY: a live display and its default screen; the visual is the server's, live for the
+        // connection.
+        let (visual, depth) = unsafe { ((xl.XDefaultVisual)(self.display, self.screen), (xl.XDefaultDepth)(self.display, self.screen)) };
+        // SAFETY: a live visual.
+        let masks = unsafe { ((*visual).red_mask, (*visual).green_mask, (*visual).blue_mask) };
+        if !(depth == 24 || depth == 32) || masks.0 == 0 || masks.1 == 0 || masks.2 == 0 {
+            return Err(x11(operation, "XPutImage", format!("the default visual is {depth}-bit with channel masks {masks:x?}; only 24- and 32-bit TrueColor is drawn")));
+        }
+        super::scale_nearest(rgba, *width as usize, *height as usize, &mut self.scaled, cw as usize, ch as usize);
+        // Each channel at its mask's place and width.
+        let place = |mask: c_ulong, value: u8| -> u32 {
+            let shift = mask.trailing_zeros();
+            let max = mask >> shift;
+            ((c_ulong::from(value) * max / 255) << shift) as u32
+        };
+        self.converted.resize(self.scaled.len(), 0);
+        for (d, p) in self.converted.chunks_exact_mut(4).zip(self.scaled.chunks_exact(4)) {
+            let pixel = place(masks.0, p[0]) | place(masks.1, p[1]) | place(masks.2, p[2]);
+            d.copy_from_slice(&pixel.to_le_bytes());
+        }
+        // SAFETY: an all-zero `XImage` is a valid value to fill; `XInitImage` sets its functions
+        // from the fields. The data is this window's buffer of `cw * ch` 32-bit pixels, and outlives
+        // the `XPutImage` (which copies it into the request) -- Xlib never frees it.
+        unsafe {
+            let mut image: xlib::XImage = core::mem::zeroed();
+            image.width = cw as c_int;
+            image.height = ch as c_int;
+            image.format = xlib::ZPixmap;
+            image.data = self.converted.as_mut_ptr().cast();
+            image.byte_order = xlib::LSBFirst;
+            image.bitmap_unit = 32;
+            image.bitmap_bit_order = xlib::LSBFirst;
+            image.bitmap_pad = 32;
+            image.depth = depth;
+            image.bytes_per_line = (cw * 4) as c_int;
+            image.bits_per_pixel = 32;
+            (image.red_mask, image.green_mask, image.blue_mask) = masks;
+            if (xl.XInitImage)(&raw mut image) == 0 {
+                return Err(x11(operation, "XInitImage", "Xlib refused the image's layout"));
+            }
+            let gc = (xl.XDefaultGC)(self.display, self.screen);
+            (xl.XPutImage)(self.display, self.window, gc, &raw mut image, 0, 0, 0, 0, cw, ch);
+            (xl.XFlush)(self.display);
+        }
+        Ok(())
+    }
+
     pub(super) fn raw(&self) -> RawWindow {
         RawWindow::Xlib { display: self.display as usize, window: self.window as u64 }
     }

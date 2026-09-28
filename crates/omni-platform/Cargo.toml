@@ -116,6 +116,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std", "objc2-core-foundation", "CALayer", "CAMetalLayer",
+    # `present_rgba`'s contents change without the implicit cross-fade.
+    "CATransaction",
 ] }
 # The web view seam (src/webview/macos.rs): `WKWebView`, its configuration and user scripts, the
 # navigation delegate and the script-message handler the page's `postMessage` arrives through.

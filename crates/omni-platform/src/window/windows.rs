@@ -57,6 +57,15 @@
 //! at once. And while any button is down, [`Window::poll`] asks the host for the physical buttons
 //! (`GetAsyncKeyState`, through the swap setting `SM_SWAPBUTTON`) and reports up any that it
 //! finds up -- the safety net for a release no message brought.
+//!
+//! **8. A presented image is painted from `WM_PAINT`, and kept.** [`Window::present_rgba`] stores
+//! the image and asks for a paint (`InvalidateRect` + `UpdateWindow`, which sends `WM_PAINT` at
+//! once); `WM_PAINT` stretches it over the client area with `StretchDIBits`. Painting from the
+//! message rather than straight into the window's DC is what lets the window keep its content
+//! while the caller cannot present: during a border drag the modal loop (see [`super`]'s "Why
+//! polling") still dispatches `WM_PAINT`, and every `WM_SIZE` invalidates the whole client area --
+//! the class has no `CS_HREDRAW`/`CS_VREDRAW` -- so the last image follows the border instead of
+//! leaving the newly exposed strip undrawn.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -65,7 +74,9 @@ use windows_sys::Win32::Foundation::{
     GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow, ScreenToClient,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLORONCOLOR, ClientToScreen, DIB_RGB_COLORS,
+    EndPaint, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MonitorFromWindow, PAINTSTRUCT,
+    SRCCOPY, ScreenToClient, SetStretchBltMode, StretchDIBits, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
@@ -90,7 +101,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WindowFromPoint, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
     WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN,
     WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, XBUTTON1,
 };
@@ -147,6 +158,18 @@ struct WindowState {
     /// The pointer's last client position a message carried: where a release this window
     /// reports for a button whose own release was lost (point 7) is.
     last_pointer: (i32, i32),
+    /// The image [`super::Window::present_rgba`] last gave, which `WM_PAINT` stretches over the
+    /// client area (point 8). `None` for a window nothing was presented to -- one a swapchain owns
+    /// -- whose painting is left to `DefWindowProcW` as before.
+    image: Option<Image>,
+}
+
+/// A presented image, as GDI takes it: bottom-up is GDI's default, so the height in the header is
+/// negated to say "top-down", and the bytes are BGRA -- `BI_RGB` at 32 bits a pixel is blue first.
+struct Image {
+    bgra: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 impl WindowState {
@@ -554,6 +577,16 @@ unsafe extern "system" fn wnd_proc(
                 state.last_size = (width, height);
                 push_event(&mut state.queue, WindowEvent::Resized { width, height });
             }
+            // A presented image is stretched to the new size everywhere, not only over the strip
+            // the resize exposed (point 8).
+            if state.image.is_some() {
+                // SAFETY: a live window handle; a null rectangle is the whole client area.
+                unsafe { InvalidateRect(hwnd, core::ptr::null(), 0) };
+            }
+        }
+        WM_PAINT if state.image.is_some() => {
+            paint(hwnd, state);
+            return 0;
         }
         // **The display under the window changed** (`WindowEvent::DisplayChanged`). All three
         // still go on to `DefWindowProcW`: `WM_WINDOWPOSCHANGED`'s default is what sends `WM_SIZE`
@@ -710,6 +743,56 @@ unsafe extern "system" fn wnd_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+/// `WM_PAINT` for a window with a presented image: the image stretched over the whole client area
+/// (point 8). `BeginPaint` validates the update region whether or not anything is drawn, so a
+/// paint that cannot draw still ends the `WM_PAINT`s for it.
+fn paint(hwnd: HWND, state: &WindowState) {
+    let mut ps = PAINTSTRUCT::default();
+    // SAFETY: a live window handle, in its `WM_PAINT`; writes the `PAINTSTRUCT`.
+    let hdc = unsafe { BeginPaint(hwnd, &raw mut ps) };
+    if let (false, Some(image)) = (hdc.is_null(), &state.image) {
+        let mut client = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: writes a `RECT`; the handle is live.
+        unsafe { GetClientRect(hwnd, &raw mut client) };
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                // Both bounded to `MAX_EXTENT` by `super::validate_extent`.
+                biWidth: image.width as i32,
+                biHeight: -(image.height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: the DC `BeginPaint` gave; `bgra` holds `width * height` 4-byte pixels, which is
+        // what the header describes, and lives across the call.
+        unsafe {
+            // Nearest-pixel stretching: the default (`BLACKONWHITE`) ANDs the rows it drops.
+            SetStretchBltMode(hdc, COLORONCOLOR);
+            StretchDIBits(
+                hdc,
+                0,
+                0,
+                client.right,
+                client.bottom,
+                0,
+                0,
+                image.width as i32,
+                image.height as i32,
+                image.bgra.as_ptr().cast(),
+                &raw const info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+    }
+    // SAFETY: pairs the `BeginPaint` above, with its `PAINTSTRUCT`.
+    unsafe { EndPaint(hwnd, &raw const ps) };
+}
+
 /// Which button a mouse message is about.
 ///
 /// The `WM_XBUTTON*` pair does not say in the message id — both extended buttons share it and the
@@ -799,6 +882,7 @@ impl Window {
             // `WM_SETFOCUS` says when it arrives: a window is created without the focus.
             focused: false,
             last_pointer: (0, 0),
+            image: None,
         }));
 
         // `super::validate` has already bounded both axes to 1..=65535, so neither cast can
@@ -1197,6 +1281,29 @@ impl Window {
                 api: "PostMessageW",
                 code,
             });
+        }
+        Ok(())
+    }
+
+    /// Keep the image (as BGRA) and paint it now: point 8.
+    pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        {
+            // SAFETY: as in `poll`: live for as long as `self`, and the window procedure is not
+            // running. The reference ends before `UpdateWindow` re-enters it.
+            let state = unsafe { &mut *self.state };
+            let image = state.image.get_or_insert_with(|| Image { bgra: Vec::new(), width: 0, height: 0 });
+            image.bgra.resize(rgba.len(), 0);
+            for (d, s) in image.bgra.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+                d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
+            }
+            (image.width, image.height) = (width, height);
+        }
+        // SAFETY: a live window handle; a null rectangle is the whole client area. `UpdateWindow`
+        // sends the `WM_PAINT` to `wnd_proc` on this thread before it returns (none for a minimised
+        // window, which paints when restored).
+        unsafe {
+            InvalidateRect(self.hwnd, core::ptr::null(), 0);
+            UpdateWindow(self.hwnd);
         }
         Ok(())
     }

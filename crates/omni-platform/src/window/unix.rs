@@ -169,6 +169,12 @@ impl Window {
     }
 
     /// Unreachable, as [`Window::show`].
+    pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        let _ = (rgba, width, height);
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
     pub(super) fn raw(&self) -> RawWindow {
         match *self {}
     }

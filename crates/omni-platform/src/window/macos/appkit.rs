@@ -31,7 +31,7 @@ use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSDate, NSDefaultRunLoopMode,
     NSNotification, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSNotFound,
 };
-use objc2_quartz_core::{CALayer, CAMetalLayer};
+use objc2_quartz_core::{CAAutoresizingMask, CALayer, CAMetalLayer, CATransaction};
 
 use super::{keys, main_thread, Shared};
 use crate::window::{DisplayChange, PointerButton, RawWindow, WindowError, WindowEvent, WindowResult};
@@ -95,6 +95,8 @@ pub(super) fn pump_one(mtm: MainThreadMarker) {
 struct Native {
     window: Retained<NSWindow>,
     view: Retained<OmniView>,
+    /// The sublayer a presented image is shown in, made at the first `present_rgba`.
+    image_layer: OnceCell<Retained<CALayer>>,
 }
 
 thread_local! {
@@ -875,7 +877,7 @@ pub(super) fn create(
         next.set(id + 1);
         id
     });
-    WINDOWS.with_borrow_mut(|windows| windows.insert(id, Native { window, view }));
+    WINDOWS.with_borrow_mut(|windows| windows.insert(id, Native { window, view, image_layer: OnceCell::new() }));
     Ok((id, raw))
 }
 
@@ -976,6 +978,92 @@ pub(super) fn set_pointer_capture(mtm: MainThreadMarker, id: u64, captured: bool
         native.view.ivars().state.borrow_mut().motion_residual = (0.0, 0.0);
         shared.set_captured(true);
         Ok(true)
+    })
+}
+
+// CoreGraphics and CoreFoundation, for `present_rgba`: a handful of C functions, declared here as
+// the other CoreGraphics calls of this backend are.
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> *mut core::ffi::c_void;
+    fn CGColorSpaceRelease(space: *mut core::ffi::c_void);
+    fn CGDataProviderCreateWithCFData(data: *const core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn CGDataProviderRelease(provider: *mut core::ffi::c_void);
+    #[allow(clippy::too_many_arguments)]
+    fn CGImageCreate(
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bits_per_pixel: usize,
+        bytes_per_row: usize,
+        space: *mut core::ffi::c_void,
+        bitmap_info: u32,
+        provider: *mut core::ffi::c_void,
+        decode: *const f64,
+        should_interpolate: bool,
+        intent: i32,
+    ) -> *mut core::ffi::c_void;
+    fn CGImageRelease(image: *mut core::ffi::c_void);
+}
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFDataCreate(allocator: *const core::ffi::c_void, bytes: *const u8, length: isize) -> *const core::ffi::c_void;
+    fn CFRelease(cf: *const core::ffi::c_void);
+}
+
+/// `kCGImageAlphaNoneSkipLast` with the default byte order: four bytes a pixel, R, G, B and one
+/// ignored -- RGBA read as opaque, with no conversion.
+const RGBX: u32 = 5;
+
+/// **`present_rgba`**: the image as a `CGImage`, set as the contents of a sublayer that covers the
+/// view (made at the first present, autoresized with it). The sublayer's gravity is the default,
+/// `kCAGravityResize`, which stretches the image to the layer's bounds -- the seam's "stretched to
+/// the client area" -- and Core Animation keeps showing it until the next present, through any
+/// resize. Implicit animation is off for the change: a layer that is not a view's own cross-fades
+/// new contents over a quarter of a second otherwise.
+pub(super) fn present_rgba(id: u64, rgba: Vec<u8>, width: u32, height: u32) -> WindowResult<()> {
+    let failed = |api: &'static str, detail: &str| WindowError::AppKit { operation: "present_rgba", api, detail: detail.to_owned() };
+    with(id, |native| {
+        let Some(backing) = native.view.layer() else {
+            return Err(failed("-[NSView layer]", "the view has no layer to show the image in"));
+        };
+        let (w, h) = (width as usize, height as usize);
+        // SAFETY: `rgba` holds `w * h * 4` bytes (the seam checked), which `CFDataCreate` copies;
+        // every object created is released below once the image holds what it needs.
+        let image = unsafe {
+            let data = CFDataCreate(core::ptr::null(), rgba.as_ptr(), rgba.len() as isize);
+            if data.is_null() {
+                return Err(failed("CFDataCreate", "no memory for the image"));
+            }
+            let provider = CGDataProviderCreateWithCFData(data);
+            CFRelease(data);
+            let space = CGColorSpaceCreateDeviceRGB();
+            let image = CGImageCreate(w, h, 8, 32, w * 4, space, RGBX, provider, core::ptr::null(), false, 0);
+            CGColorSpaceRelease(space);
+            CGDataProviderRelease(provider);
+            image
+        };
+        if image.is_null() {
+            return Err(failed("CGImageCreate", "the image was refused"));
+        }
+        let layer = native.image_layer.get_or_init(|| {
+            let layer = CALayer::new();
+            layer.setFrame(backing.bounds());
+            layer.setAutoresizingMask(CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable);
+            layer.setOpaque(true);
+            backing.addSublayer(&layer);
+            layer
+        });
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        // SAFETY: a `CGImageRef` is a Core Foundation object, toll-free an Objective-C one, which
+        // is what `contents` takes; the layer retains it, so this function's reference is released.
+        unsafe {
+            layer.setContents(Some(&*image.cast::<AnyObject>()));
+            CGImageRelease(image);
+        }
+        CATransaction::commit();
+        Ok(())
     })
 }
 
