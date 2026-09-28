@@ -106,6 +106,19 @@ impl Process {
         self.backend.as_ref().and_then(|b| b.code_cache_stats()).map_or(0, |s| s.committed_bytes)
     }
 
+    /// Bytes of host code its translation cache has emitted, ever.
+    #[must_use]
+    pub fn code_emitted(&self) -> u64 {
+        self.backend.as_ref().and_then(|b| b.code_cache_stats()).map_or(0, |s| s.code_bytes_emitted)
+    }
+
+    /// Drop its translations (`crate::code_trim`).
+    pub fn trim_code(&self) {
+        if let Some(b) = &self.backend {
+            b.clear_code_cache();
+        }
+    }
+
     /// Bytes of guest memory it has committed.
     #[must_use]
     pub fn guest_committed(&self) -> u64 {

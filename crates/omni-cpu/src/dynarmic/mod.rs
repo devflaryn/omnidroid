@@ -87,7 +87,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dynarmic_sys::{
-    optimization, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
+    optimization, od_code_cache_clear, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
     od_code_cache_stats_of, od_code_cache_tables_of, od_jit_clear_halt, od_jit_effective_config,
     od_jit_free, od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec,
     od_jit_halt, od_jit_invalidate_range, od_jit_new, od_jit_new_shared, od_jit_reset_stats, od_jit_run,
@@ -1007,6 +1007,19 @@ impl DynarmicBackend {
             // SAFETY: the cache is live for `self.shared`'s life; this is not called from inside a
             // callback (the backend has none -- only its contexts do).
             unsafe { od_code_cache_invalidate_range(cache.0, range.start() as u64, range.len() as u64) };
+        }
+    }
+
+    /// **Drop every translation of the shared code cache**, from a host thread (not a callback of
+    /// one of its contexts): every region filled so far is retired and given back to the OS as
+    /// soon as the threads that ran in it have left generated code, and what runs next is
+    /// translated again. What a process that has gone idle keeps of the code it ran once. Nothing
+    /// without a shared cache.
+    pub fn clear_code_cache(&self) {
+        if let Some(cache) = &self.shared.code_cache {
+            // SAFETY: the cache is live for `self.shared`'s life; this is not called from inside a
+            // callback (the backend has none -- only its contexts do).
+            unsafe { od_code_cache_clear(cache.0) };
         }
     }
 
