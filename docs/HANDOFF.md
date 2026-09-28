@@ -12,6 +12,21 @@ unified root; `choose_apk` would pick it (higher versionCode), so always name th
 
 | phase | result | artifact |
 |---|---|---|
+**Update 09:50 (r21-r26, at the owner's request: the main checkout's modified APK).** That APK
+first waited on Android's "All files access" page (r21), then aborted in its own loader
+(`com.roblox.gloop.Loader.nativeStart`: "JNI DETECTED ERROR: obj == null") because shared storage
+did not exist here (r22: /mnt and /storage absent, vold "emulated;0 failed to create mount
+points", the volume unmountable). Fixed as platform features (`760bb59`): shared storage without
+FUSE, and an `omni_autogrant` service granting installed apps what they ask for. r26: "Mounted
+volume emulated;0", "omni_autogrant: granted com.roblox.client", DID_LOG_IN, `onGameLoaded
+placeId:8737899170`, **in-game PS99 on the display at 4.0 fps (steady), no emulator kick in 17
+min** (`work/overnight/r26-ps99-in-game.png`). But the APK is the **Delta exploit executor** (its
+"Access Delta ... key system ... Start exploiting" panel is on the screenshot); its injected code
+is the likely reason the kick did not come. Not interacted with, session stopped. The Roblox host
+process in-game: 0.68 cores; its threads' samples are 93-96% `kern` (inside system-call handlers),
+FunctionMarshal 26% of a core -- the next speed target is the handlers' own time (OMNI_THREAD_CPU,
+`cd5aaac`).
+
 | 1 address space | **fixed** (`d65fbe8`): 10/10 boots reach "System now ready" (72-75 s each, 0 `[mm]` refusals, 0 guest deaths). Before: 5/7 D5 logs of 09-27 reached it, 1/7 exhausted the space (49 refusals, 1,048,576 bytes free of 64 GiB) | `docs/runs/2026-09-28-phase1-c4-10boots.csv`; `tests/low_space.rs` (fails without the fix with the boot log's exact figure) |
 | 2 login screen | **the logged-out login screen on the host display** (r15): ROBLOX logo, "Hesap Oluştur" (Create Account), "Giriş Yap" (Log In), Koşullar/Gizlilik over the game-art backdrop, drawn by the engine's own Vulkan (RTX 4060 via `vulkan.omni.so`) through SurfaceFlinger; the engine's `onDataModelNotification() type:APP_READY data:Landing`. Also the **signed-in Home** (r12) | `work/overnight/r15-login-landing.png` (1,531 colours, 43.8% #000000, 9.7% #f8f8f8); `r12-home-signed-in.png` (12,189 colours: Home, "HeZmI_ImYu1080", "Arkadaşlar (10)"); `r15.log` |
 | 3 `--cookie` | **signed in, 4/4 runs** (r10-r13): `onDataModelNotification() type:DID_LOG_IN data:{"username":"HeZmI_ImYu1080",...,"countryCode":"TR","userId":5457009831}`; 0 HTTP 401/403 after it (r10) | `work/overnight/r10-signin-markers.txt`, `r13-markers.txt` |
