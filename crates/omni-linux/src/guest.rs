@@ -100,8 +100,14 @@ impl GuestMem {
             return Err(EFAULT);
         }
         let mut at = start;
+        // Whether any of it is still a lazy mapping's uncommitted placeholder. Almost never: an
+        // anonymous region is committed whole or not at all, and a file view is mapped whole. So
+        // the common access takes no lock -- `region_at` answers from this thread's cache -- and
+        // `ensure_committed` (the space's lock) is left for the rare first touch.
+        let mut commit = false;
         while at < end {
             let region = self.space.region_at(at).ok_or(EFAULT)?;
+            commit |= matches!(region.kind, omni_mem::RegionKind::Anonymous) && region.committed < region.len;
             if region.mapping.is_none() {
                 return Err(EFAULT);
             }
@@ -115,7 +121,9 @@ impl GuestMem {
             }
             at = region.start + region.len;
         }
-        self.space.ensure_committed(start, len).map_err(|_| EFAULT)?;
+        if commit {
+            self.space.ensure_committed(start, len).map_err(|_| EFAULT)?;
+        }
         self.space.ptr(start, len).map_err(|_| EFAULT)
     }
 
