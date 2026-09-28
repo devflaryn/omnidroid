@@ -7,6 +7,9 @@
 //! their colour histograms). `OMNI_R_MINUTES` bounds the session (default 20); `OMNI_R_THEN`
 //! is shell run after the launch (a deep link, a cookie); `OMNI_R_EXPECT` names the lines that must
 //! have appeared, `|`-separated (default: the app's process started and a frame presented).
+//! `OMNI_R_KIOSK=1` runs the app on a device without SystemUI (set up, then started again): no
+//! bars, no taskbar, the whole display the app's. The composer presents only the app either way
+//! (`hal::composer`, `OMNI_APP_ONLY`).
 //!
 //! Minutes long: `cargo test -p omni-linux --release --test r_roblox -- --ignored --nocapture`.
 mod common;
@@ -129,21 +132,38 @@ fn the_apk_is_installed_started_and_draws() {
     } else {
         ""
     };
-    let then = format!(
-        "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
-         echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; \
-         settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
+    let booted = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
+                  echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; ";
+    let setup = format!(
+        "settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
          settings put system screen_off_timeout 1800000; svc power stayon true; \
          input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
          {resizable}{lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
-         {lean_after}{after_install}
-         pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
+         {lean_after}{after_install}"
+    );
+    let launch = format!(
+        "pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
          act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \
          {sign_in}{join}{extra}"
     );
+    // `OMNI_R_KIOSK=1`: a dedicated single-app device -- no SystemUI, so no status bar, navigation
+    // bar or taskbar (the launcher's taskbar lives only while SystemUI binds it), and the app is
+    // given the whole display. SystemUI is disabled once the device is set up, and the device
+    // started again: disabling it on a running device locks the device (Android shows the
+    // keyguard when the keyguard's service, SystemUI's, dies), and a package disabled at boot is
+    // never started (`tests/d8_app_only.rs`, stage 4).
+    let kiosk = std::env::var("OMNI_R_KIOSK").as_deref() == Ok("1");
+    let then = if kiosk {
+        format!(
+            "{booted}{setup}echo \"[r] kiosk: $(pm disable-user --user 0 com.android.systemui 2>&1)\"; \
+             sleep 15; sync; echo \"[r] kiosk kept\""
+        )
+    } else {
+        format!("{booted}{setup}{launch}")
+    };
     let kept = instance.clone();
     // The device's language: the account's (`OMNI_R_LOCALE`, default tr-TR -- the owner's accounts
     // are Turkish). The app applies the account's locale to itself once signed in; on a device in
@@ -153,6 +173,16 @@ fn the_apk_is_installed_started_and_draws() {
     // relaunch activity", "Ending game session with place ID 8737899170").
     let locale = format!("persist.sys.locale={}", std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into()));
     let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote", "--setprop", &locale], &then);
+    if kiosk {
+        let mut kept = false;
+        boot.watch(Duration::from_secs(1800), |line| {
+            kept |= line.contains("[r] kiosk kept");
+            kept
+        });
+        assert!(kept, "the device was never set up without SystemUI\n{}", boot.tail());
+        eprintln!("[r] SystemUI disabled; the device is started again");
+        boot = boot.reboot(&sysroot, &["--zygote", "--setprop", &locale], &format!("{booted}input keyevent KEYCODE_WAKEUP; {launch}"));
+    }
     let expect: Vec<String> = std::env::var("OMNI_R_EXPECT")
         .unwrap_or_else(|_| "[zygote] launching com.roblox.client|frames presented".into())
         .split('|')

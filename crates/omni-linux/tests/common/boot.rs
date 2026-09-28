@@ -112,6 +112,19 @@ impl Boot {
         }
     }
 
+    /// Shut this boot down keeping its instance (its `/data`), and boot the instance again with
+    /// `extra` and `then`: what takes effect only at boot (a package disabled) then applies. This
+    /// boot's log is kept as `<instance>.1.log`.
+    pub fn reboot(mut self, sysroot: &Path, extra: &[&str], then: &str) -> Self {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.log_file = None;
+        let _ = std::fs::rename(&self.log, self.instance.with_extension("1.log"));
+        // What is left of this boot no longer owns the instance: its drop removes nothing.
+        let instance = std::mem::take(&mut self.instance);
+        Self::start(sysroot, instance, extra, then)
+    }
+
     /// The last lines, joined, and where the whole log is.
     pub fn tail(&self) -> String {
         format!("{}\n(the whole boot: {})", self.tail.iter().cloned().collect::<Vec<_>>().join("\n"), self.log.display())
@@ -122,6 +135,8 @@ impl Drop for Boot {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.instance);
+        if !self.instance.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.instance);
+        }
     }
 }

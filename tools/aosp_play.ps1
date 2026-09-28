@@ -9,6 +9,12 @@
 #   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -Cookie cookie.txt -Place 8737899170
 #   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -Minutes 60 -Size 1600x900
 #   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -NotResizable          # the app's own resizeableActivity
+#   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -Kiosk                 # no SystemUI: no bars, no taskbar, the app edge to edge
+#   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -ShowChrome            # the whole display, bars and taskbar included
+#
+# The window shows only the app: the composer leaves the system's bars and taskbar out. The app
+# itself keeps clear of the bars unless it hides them (a game in play does) or -Kiosk is given (the
+# device set up without SystemUI and started again: about a minute more).
 #
 # The session ends after -Minutes (default 30). Closing the window ends the window, not the session.
 # The whole log is in %TEMP%\omni-linux-r-<pid>.log; screenshots of the display in
@@ -19,7 +25,9 @@ param(
     [long]$Place = 0,
     [int]$Minutes = 30,
     [string]$Size = "",
-    [switch]$NotResizable
+    [switch]$NotResizable,
+    [switch]$Kiosk,
+    [switch]$ShowChrome
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -30,6 +38,8 @@ if ($Cookie) { $env:OMNI_R_COOKIE = (Resolve-Path $Cookie).Path }
 if ($Place -gt 0) { $env:OMNI_R_PLACE = [string]$Place }
 if ($Size) { $env:OMNI_WINDOW_SIZE = $Size }
 if ($NotResizable) { $env:OMNI_R_RESIZABLE = "0" }
+if ($Kiosk) { $env:OMNI_R_KIOSK = "1" }
+if ($ShowChrome) { $env:OMNI_APP_ONLY = "0" }
 # The build directory the vendored CPU backend needs (a short path: MAX_PATH).
 if (-not $env:OMNIDROID_DYNARMIC_BUILD_DIR) { $env:OMNIDROID_DYNARMIC_BUILD_DIR = "C:\od-unified" }
 Get-ChildItem $env:TEMP -Filter "omni-shm-*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
