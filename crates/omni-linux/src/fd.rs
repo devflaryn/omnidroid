@@ -1231,9 +1231,39 @@ fn sys_renameat(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     sys_renameat2(p, t, [a[0], a[1], a[2], a[3], 0, 0])
 }
 
+/// Set a host file's length. Windows will not shorten a file another view maps
+/// (`ERROR_USER_MAPPED_FILE`, 1224); Linux does, and the bytes past the new end read as zeros --
+/// what SQLite's `-shm` open relies on (`ftruncate(<db>-shm, 3)` resets the WAL index while another
+/// connection maps it; the EINVAL this gave was `SQLITE_IOERR_SHMOPEN`, and the contacts provider
+/// died of it). So when the host refuses for a mapping, the bytes past `len` are zeroed and the
+/// file keeps its host length: every reader sees zeros there, and SQLite takes a longer `-shm`
+/// file as it is.
+fn shorten(file: &std::fs::File, len: u64) -> Result<(), Errno> {
+    match file.set_len(len) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(1224) => {
+            use std::io::{Seek, Write};
+            let physical = file.metadata().map_err(|_| EIO)?.len();
+            let mut f = file.try_clone().map_err(|_| EIO)?;
+            let at = f.stream_position().map_err(|_| EIO)?;
+            f.seek(std::io::SeekFrom::Start(len)).map_err(|_| EIO)?;
+            let zeros = vec![0u8; 64 << 10];
+            let mut left = physical.saturating_sub(len);
+            while left > 0 {
+                let n = left.min(zeros.len() as u64) as usize;
+                f.write_all(&zeros[..n]).map_err(|_| EIO)?;
+                left -= n as u64;
+            }
+            f.seek(std::io::SeekFrom::Start(at)).map_err(|_| EIO)?;
+            Ok(())
+        }
+        Err(_) => Err(EINVAL),
+    }
+}
+
 fn sys_ftruncate(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
-        FileKind::Host { file, sysroot: false, .. } => file.set_len(a[1]).map(|()| 0).map_err(|_| EINVAL),
+        FileKind::Host { file, sysroot: false, .. } => shorten(file, a[1]).map(|()| 0),
         FileKind::Shared(m) => m.set_len(a[1]).map(|()| 0),
         FileKind::Host { .. } | FileKind::Synth { .. } => Err(EROFS),
         _ => Err(EINVAL),
