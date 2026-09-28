@@ -118,6 +118,17 @@ fn the_apk_is_installed_started_and_draws() {
     // `OMNI_R_AFTER_INSTALL`: shell run once the APK is installed, before its first start (an
     // app-op the APK asks for, granted as its owner would grant it in Settings).
     let after_install = std::env::var("OMNI_R_AFTER_INSTALL").map_or_else(|_| String::new(), |c| format!("{c}; echo \"[r] after install: $?\"; "));
+    // With the display in a resizable host window (`OMNI_WINDOW=1`), the device is set up as a
+    // freely resizable one is: Developer options' "Force activities to be resizable", for every
+    // app (`OMNI_R_RESIZABLE=0` leaves it off). The APK declares `resizeableActivity="false"` on
+    // its application, and without this Android answers a display resize with size-compatibility
+    // mode -- the app kept at its old size, scaled, and a "restart for a better view" button (run
+    // 2026-09-28, 1280x720 -> 817x542) -- rather than a new size for the app to draw at.
+    let resizable = if std::env::var("OMNI_WINDOW").as_deref() == Ok("1") && std::env::var("OMNI_R_RESIZABLE").as_deref() != Ok("0") {
+        "settings put global force_resizable_activities 1; echo \"[r] activities resizable\"; "
+    } else {
+        ""
+    };
     let then = format!(
         "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
          echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; \
@@ -126,7 +137,7 @@ fn the_apk_is_installed_started_and_draws() {
          input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
-         {lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
+         {resizable}{lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
          {lean_after}{after_install}
          pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
          act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
