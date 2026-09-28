@@ -96,7 +96,8 @@ fn the_apk_is_installed_started_and_draws() {
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
          pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
-         am kill-all; echo \"[r] background processes let go: $?\"; \
+         cmd activity kill-all; echo \"[r] background processes let go: $?\"; \
+         (while sleep 60; do cmd activity kill-all; done) & \
          pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
          act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \

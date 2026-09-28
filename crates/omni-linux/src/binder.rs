@@ -1172,11 +1172,16 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
         }
         BC_FREE_BUFFER => {
             let ptr = u64_at(arg, 0);
-            file.area.lock().free(ptr);
             // As the kernel's `binder_free_buf`: a oneway's node hands its next oneway to the
-            // process, and the nodes the transaction held are let go.
+            // process, and the nodes the transaction held are let go. The buffer's record goes
+            // before its memory: freed first, the memory could be given to a transaction another
+            // thread is delivered, whose record then replaced this one -- the oneway's node never
+            // heard its call was done, and every later oneway to it waited (SurfaceFlinger's
+            // composer callback: 100,000 vsyncs queued, the boot stalled).
             let mut st = file.broker.state.lock();
-            if let Some(b) = st.buffers.remove(&(file.id, ptr)) {
+            let record = st.buffers.remove(&(file.id, ptr));
+            file.area.lock().free(ptr);
+            if let Some(b) = record {
                 if let Some(node) = b.async_node {
                     st.async_done(node, file.id);
                 }
@@ -1746,9 +1751,11 @@ fn undeliver(p: &Process, file: &Arc<BinderFile>, tid: i32, h: Handed) {
     for fd in h.fds {
         let _ = p.fds.remove(fd);
     }
-    file.area.lock().free(h.buf);
     let mut st = file.broker.state.lock();
-    if let Some(b) = st.buffers.remove(&(file.id, h.buf)) {
+    // The record before the memory, as BC_FREE_BUFFER.
+    let record = st.buffers.remove(&(file.id, h.buf));
+    file.area.lock().free(h.buf);
+    if let Some(b) = record {
         if let Some(node) = b.async_node {
             st.async_done(node, file.id);
         }
