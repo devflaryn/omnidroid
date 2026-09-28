@@ -358,14 +358,22 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
             ..Default::default()
         };
         check(vkfn!(t, ID_VK_QUEUE_SUBMIT, c"vkQueueSubmit", vk::PFN_vkQueueSubmit)(vk::Queue::from_raw(queue), 1, &si, fence))?;
+        let waited = std::time::Instant::now();
         check(vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences)(d, 1, &fence, vk::TRUE, u64::MAX))?;
+        if super::stats::enabled() {
+            super::stats::add(super::special::ID_GRALLOC_USAGE + 6, waited.elapsed());
+        }
     }
     drop(devices);
+    let written = std::time::Instant::now();
     // SAFETY: `mapped` is the staging memory's host mapping, `bytes` long, written by the copy the
     // fence has just seen finish.
     let pixels = unsafe { std::slice::from_raw_parts(mapped as *const u8, bytes) };
     shm.write_at(pixels, pixels_at).map_err(|_| CallError::Args)?;
     bump_generation(&shm);
+    if super::stats::enabled() {
+        super::stats::add(super::special::ID_GRALLOC_USAGE + 7, written.elapsed());
+    }
     if a[4] != 0 {
         p.mem.write(a[4], &(-1i32).to_le_bytes()).map_err(|_| CallError::Args)?;
     }

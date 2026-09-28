@@ -189,6 +189,82 @@ pub fn command_id(name: &str) -> Option<u32> {
     generated::COMMANDS.iter().position(|(n, _, _)| *n == name).map(|i| i as u32)
 }
 
+/// `OMNI_GPU_STATS=<seconds>`: per forwarded command, how many this host process made and the time
+/// the host spent on them, every so often, most time first (`[gpu-stats]`) -- the forwarding's
+/// cost per frame, and which command a frame waits in.
+pub(crate) mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    const SLOTS: usize = 512;
+    static COUNT: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static NANOS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static MAX: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<Option<u64>> = OnceLock::new();
+        ON.get_or_init(|| {
+            let every = std::env::var("OMNI_GPU_STATS").ok().and_then(|v| v.parse::<u64>().ok())?;
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(every.max(1)));
+                report(every.max(1));
+            });
+            Some(every)
+        })
+        .is_some()
+    }
+
+    /// Whether stats are being kept (for a command's own parts, [`add`] with a part's id).
+    pub(crate) fn enabled() -> bool {
+        on()
+    }
+
+    pub(crate) fn add(id: u32, took: Duration) {
+        // The Android extension's commands (0x1000..) in the last slots.
+        let i = if id >= super::special::ID_GRALLOC_USAGE { SLOTS - 8 + ((id - super::special::ID_GRALLOC_USAGE) as usize).min(7) } else { (id as usize).min(SLOTS - 9) };
+        let ns = took.as_nanos() as u64;
+        COUNT[i].fetch_add(1, Relaxed);
+        NANOS[i].fetch_add(ns, Relaxed);
+        MAX[i].fetch_max(ns, Relaxed);
+    }
+
+    fn report(every: u64) {
+        let mut rows: Vec<(u64, u64, u64, usize)> = (0..SLOTS)
+            .filter_map(|i| {
+                let (c, ns, max) = (COUNT[i].swap(0, Relaxed), NANOS[i].swap(0, Relaxed), MAX[i].swap(0, Relaxed));
+                (c > 0).then_some((ns, c, max, i))
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        let (calls, ns): (u64, u64) = rows.iter().fold((0, 0), |(c, n), r| (c + r.1, n + r.0));
+        const EXTRA: [&str; 8] = [
+            "vkGetSwapchainGrallocUsageANDROID",
+            "vkGetSwapchainGrallocUsage2ANDROID",
+            "vkGetSwapchainGrallocUsage3ANDROID",
+            "vkGetSwapchainGrallocUsage4ANDROID",
+            "vkAcquireImageANDROID",
+            "vkQueueSignalReleaseImageANDROID",
+            "(release: GPU wait)",
+            "(release: into the buffer)",
+        ];
+        let name = |i: usize| match i.checked_sub(SLOTS - 8) {
+            Some(e) => EXTRA.get(e).map_or_else(|| format!("extra#{e}"), |n| (*n).to_string()),
+            None => super::generated::COMMANDS.get(i).map_or_else(|| format!("#{i}"), |c| c.0.to_string()),
+        };
+        let top: Vec<String> = rows.iter().take(14).map(|(n, c, m, i)| format!("{} {c}x {:.1}ms (max {:.1})", name(*i), *n as f64 / 1e6, *m as f64 / 1e6)).collect();
+        eprintln!(
+            "[gpu-stats] host pid {} {every}s: {calls} calls, {:.1} ms in the host: {}",
+            std::process::id(),
+            ns as f64 / 1e6,
+            top.join(", ")
+        );
+    }
+}
+
 /// `ioctl` on `/dev/omni-gpu`.
 pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> SysResult {
     if cmd != OMNI_GPU_CALL {
@@ -208,7 +284,11 @@ pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> S
         let name = generated::COMMANDS.get(id as usize).map_or("(extra)", |c| c.0);
         eprintln!("[gpu] {}:{} {name} {args:x?}", p.sys.pid, t.tid);
     }
+    let started = stats::on().then(std::time::Instant::now);
     let answer = if id >= special::ID_GRALLOC_USAGE { special::extra(gpu, p, id, &args) } else { generated::dispatch(gpu, p, id, &args) };
+    if let Some(t0) = started {
+        stats::add(id, t0.elapsed());
+    }
     if *TRACE.get().unwrap_or(&false) {
         eprintln!("[gpu] {}:{}   -> {answer:?}", p.sys.pid, t.tid);
     }

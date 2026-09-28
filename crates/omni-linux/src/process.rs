@@ -230,6 +230,14 @@ fn syscall_stats_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("OMNI_SYSCALL_STATS").is_some())
 }
 
+/// `OMNI_SLOW_SYSCALL_MS=<ms>`: every system call of this host process that takes at least that
+/// long, logged as it returns (`[slow]`: the instance's monotonic ms, task, call, how long, where
+/// from) -- where a thread that should be busy waits, without a whole trace's cost.
+fn slow_syscall_ms() -> Option<u64> {
+    static ON: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_SLOW_SYSCALL_MS").ok().and_then(|v| v.parse().ok()))
+}
+
 const STAT_CALLS: usize = 512;
 static STAT_COUNT: [std::sync::atomic::AtomicU64; STAT_CALLS] = [const { std::sync::atomic::AtomicU64::new(0) }; STAT_CALLS];
 static STAT_NANOS: [std::sync::atomic::AtomicU64; STAT_CALLS] = [const { std::sync::atomic::AtomicU64::new(0) }; STAT_CALLS];
@@ -336,8 +344,53 @@ fn on_svc(call: &mut ThunkCall<'_>) {
     if thread_dump() {
         IN_FLIGHT.lock().get_or_insert_with(Default::default).insert(task.tid, (number, task.pc, task.lr, std::time::Instant::now(), task.name.clone()));
     }
-    let stats_from = syscall_stats_on().then(std::time::Instant::now);
+    let stats_from = (syscall_stats_on() || slow_syscall_ms().is_some()).then(std::time::Instant::now);
     let result = process.syscall(task, number, args);
+    if let (Some(t0), Some(ms)) = (stats_from, slow_syscall_ms()) {
+        let took = t0.elapsed();
+        if took.as_millis() >= u128::from(ms) {
+            let maps = process.mm.file_mappings();
+            let lib = |at: u64| {
+                maps.iter()
+                    .find(|(start, len, _, _)| (*start..start + len).contains(&at))
+                    .map_or_else(|| format!("{at:#x}"), |(start, _, guest, offset)| format!("{}+{:#x}", String::from_utf8_lossy(guest).rsplit('/').next().unwrap_or_default(), at - start + offset))
+            };
+            let fd = match number {
+                crate::syscall::nr::PPOLL => process.mem.read_u32(args[0]).map_or(-1, |f| f as i32),
+                crate::syscall::nr::FUTEX | crate::syscall::nr::NANOSLEEP | crate::syscall::nr::CLOCK_NANOSLEEP => -1,
+                _ => args[0] as i32,
+            };
+            let kind = process.fds.get(fd).map_or_else(|_| String::new(), |f| format!(" fd {fd} {}", String::from_utf8_lossy(&crate::fd::guest_path_of(&f))));
+            // The return addresses of the frames above (the frame-pointer chain).
+            let mut frames = Vec::new();
+            let mut fp = call.x(29);
+            for _ in 0..10 {
+                let (Ok(next), Ok(ret)) = (process.mem.read_u64(fp), process.mem.read_u64(fp + 8)) else { break };
+                if ret == 0 {
+                    break;
+                }
+                frames.push(lib(ret & 0x00ff_ffff_ffff_ffff));
+                fp = next;
+            }
+            eprintln!(
+                "[slow] {} {}:{} {:?} {}({:#x}, {:#x}, {:#x}, {:#x}){kind} took {} ms = {:#x}, from {} < {} < {}",
+                crate::sys::monotonic().as_millis(),
+                process.sys.pid,
+                task.tid,
+                String::from_utf8_lossy(&task.name),
+                name_of(number),
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                took.as_millis(),
+                result,
+                lib(task.pc),
+                lib(task.lr),
+                frames.join(" < ")
+            );
+        }
+    }
     if let Some(t0) = stats_from {
         // ioctl split by its device: the GPU's ('G', one per Vulkan command) and binder's ('b').
         let n = match (number, (args[1] >> 8) & 0xff) {

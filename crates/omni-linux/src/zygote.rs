@@ -189,6 +189,11 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     if nice.is_some() && std::env::var("OMNI_THREAD_CPU_APP").ok().as_deref() == nice {
         cmd.env("OMNI_THREAD_CPU", "10");
     }
+    // OMNI_SLOW_APP=<process name>: that app's host process logs each system call taking
+    // `OMNI_SLOW_APP_MS` (default 200) ms or more (`[slow]`).
+    if nice.is_some() && std::env::var("OMNI_SLOW_APP").ok().as_deref() == nice {
+        cmd.env("OMNI_SLOW_SYSCALL_MS", std::env::var("OMNI_SLOW_APP_MS").unwrap_or_else(|_| "200".into()));
+    }
     // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
     cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
     cmd.args(class_and_args);
