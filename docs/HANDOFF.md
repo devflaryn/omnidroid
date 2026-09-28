@@ -72,7 +72,38 @@ Regression after it (Windows, release): `cargo test -p omni-linux` 86/86 binarie
 D5 (no window) passed in 149 s; `omni-platform` lib 202/202, `window_live` 11/11,
 `window_seam` 7/7; `r_roblox` with the window, 15 minutes, passed.
 
-Known limits: the window is output only (input injection is the next, separate task); frames
+### Keyboard and mouse in the live window (`e489061`, same day)
+
+The window's keyboard and mouse are now **the device's**, through Android's real input stack:
+- **Kernel** (`crate::evdev`): `/dev/input/event0` (keyboard) and `event1` (mouse) as the evdev
+  driver presents them -- listed, per-open queues of arm64 `input_event`s on the instance's
+  `CLOCK_MONOTONIC`, pollable, the `EVIOC*` requests EventHub makes. system_server's own
+  InputReader: "Device added ... 'omnidroid mouse' sources=MOUSE", "'omnidroid keyboard'
+  sources=KEYBOARD". `tests/evdev.rs` runs the `evdev` fixture under the real bionic.
+- **Translation** (`window_input`, platform-agnostic): keys by physical key (the set-1 ->
+  `KEY_*` table moved from omni-android into the window seam as `evdev_code`); **the mouse is held
+  on a click** (pointer capture: host cursor hidden, raw motion) and **Right Ctrl gives it back**
+  (so does losing the focus); the title bar says which (`Window::set_title`, new, all three
+  backends). Why a hold: Android has no absolute mouse -- `SOURCE_MOUSE`, what Roblox reads a mouse
+  by (`omni-android/src/jni/mouse.rs`), comes only from a relative device that Android moves its
+  own pointer for, through its own acceleration, and the switch to turn that off
+  (`setMousePointerAccelerationEnabled`) is internal to system_server.
+- **The grabbing click lands where it was made**: the pointer is sent home (one huge negative move,
+  clamped to 0,0), then after 400 ms at rest one move of the target over **`PLACE_GAIN` = 2.04**
+  -- MEASURED (d7 run 1: (400,300) after rest landed at (817,612); this image uses the curved
+  "new ballistics", whose first sample after rest gets the curve's base gain). A changed Android
+  pointer speed would change it.
+- **Gate `tests/d7_window_input.rs`** (release, 170 s, pass): `KEYCODE_A` scan 30 from
+  `SOURCE_KEYBOARD`; a mouse press (`SOURCE_MOUSE`, tool MOUSE, primary) at exactly (400,300) and at
+  (1000,151) for (1000,150); a rested move of (+50,-20) at the predicted (502,259); one wheel notch
+  `vscroll 1.0`. Control-file commands: `key`, `click`, `move`, `wheel` (module doc).
+- **Roblox**: both devices added, Landing reached; its hand cursor follows the mouse over "Giriş Yap"
+  (`work/roblox-input/after-click.png`, a 2305x1085 window the display followed).
+- `r_roblox` now sets `force_resizable_activities` **by default** (the owner's choice), window or
+  not; `tools/aosp_play.ps1 [-Cookie f] [-Place id] [-Minutes n] [-Size WxH] [-NotResizable]`
+  runs it in the live window with input.
+
+Known limits: frames
 are copied on the CPU (RGBA -> BGRA and GDI's stretch each present); the display density stays
 160 dpi whatever the host's scaling; a Windows drag shows the last frame stretched until the size
 has held 300 ms, then the app redraws at it mid-drag.
@@ -317,7 +348,7 @@ Read once at start; each announces itself in the log.
 | `OMNI_JIT_CACHE_MB`, `OMNI_JIT_EXCLUSIVE_MONITOR=global`, `OMNI_JIT_OPTIMIZATIONS` | per-thread cache size; the old monitor (D31); dynarmic optimization mask |
 | `OMNI_PAUSE_IN_BACKGROUND=1`, `OMNI_FOLLOW_FOCUS=1` | Android's pause-in-background (default: keep playing, as desktop Roblox) |
 | `OMNI_WINDOW_SIZE=<w>x<h>` | initial window size; on the real-AOSP path, the display's size at boot |
-| `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size WxH` lines. `r_roblox` then also sets `force_resizable_activities` (`OMNI_R_RESIZABLE=0`: not) |
+| `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size`, `key`, `click`, `move`, `wheel` lines; `OMNI_WINDOW_INPUT=0`: no keyboard or mouse. `r_roblox` sets `force_resizable_activities` by default (`OMNI_R_RESIZABLE=0`: not) |
 | `OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY`, `OMNI_DEEPLINK` | join a place (the app's own join URL) |
 | `OMNI_GUEST_ENV=K=V,..` | extra guest environment (e.g. `MIMALLOC_PURGE_DELAY`) |
 | `OMNI_FILE_TRACE`, `OMNI_WAIT_TRACE`, `OMNI_PROFILE`, `OMNI_IMPORT_CENSUS=off`, `OMNI_GLES_TIMING` | diagnostics |

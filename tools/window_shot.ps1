@@ -1,4 +1,4 @@
-# window_shot.ps1 -Title <window title> -Out <png> [-Process omni-linux-run]
+# window_shot.ps1 -Title <window title, or its start> -Out <png> [-Process omni-linux-run]
 #
 # A screenshot of one window's client area as the desktop compositor holds it (PrintWindow with
 # PW_RENDERFULLCONTENT, so a covered window is captured whole), in physical pixels (the script
@@ -38,7 +38,8 @@ $callback = [OmniShot+EnumProc]{
     if (-not [OmniShot]::IsWindowVisible($hwnd)) { return $true }
     $text = New-Object System.Text.StringBuilder 256
     [void][OmniShot]::GetWindowText($hwnd, $text, 256)
-    if ($text.ToString() -ne $Title) { return $true }
+    # The title or its start: the live window adds what it is doing ("omnidroid - mouse held ...").
+    if (-not $text.ToString().StartsWith($Title)) { return $true }
     $procId = [uint32]0
     [void][OmniShot]::GetWindowThreadProcessId($hwnd, [ref]$procId)
     if ($pids.Count -gt 0 -and -not ($pids -contains [int]$procId)) { return $true }
