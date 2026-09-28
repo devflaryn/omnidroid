@@ -1,6 +1,11 @@
 //! `mount` and `umount2`, for what the system's daemons mount at run time: bind mounts (vold
 //! binds /data/data onto /data/user/0), changes of propagation, and remounts. A bind mount is
 //! kept in the instance's table (`crate::vfs::Binds`), which every process of the instance sees.
+//!
+//! Shared storage: vold mounts the emulated volume with FUSE (`/mnt/user/<user>/emulated`, served
+//! by MediaProvider from `/data/media`). There is no FUSE here; the mount is a bind of
+//! `/data/media` -- what MediaProvider's daemon would pass through for an app with access to all
+//! files -- and `/dev/fuse` answers the daemon's handshake (`crate::fuse`).
 use crate::errno::{Errno, SysResult, EINVAL, ENOENT, ENOTDIR};
 use crate::process::{Process, Task};
 use crate::syscall::{nr, Table};
@@ -28,6 +33,10 @@ fn sys_mount(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     if matches!(target.node, Node::Missing { .. }) {
         return Err(ENOENT);
     }
+    let over = match &target.node {
+        Node::HostDir { host } => Some(host.clone()),
+        _ => None,
+    };
     if flags & MS_BIND != 0 && flags & MS_REMOUNT == 0 {
         let source = p.vfs.resolve(&cwd, &path_arg(p, a[0])?, true)?;
         let host = match source.node {
@@ -45,7 +54,7 @@ fn sys_mount(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
                 return Err(EINVAL);
             }
         };
-        p.vfs.binds().bind(target.path, host);
+        p.vfs.binds().bind(target.path, host, over);
         return Ok(0);
     }
     // Changing how mounts propagate, or remounting with other flags: nothing here depends on it.
@@ -53,8 +62,22 @@ fn sys_mount(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         return Ok(0);
     }
     let fstype = if a[2] == 0 { Vec::new() } else { p.mem.read_cstr(a[2], 64)? };
+    // The emulated volume's FUSE mount (vold's `MountUserFuse`): `/data/media`, passed through.
+    if fstype == b"fuse" && is_emulated_volume(&target.path) {
+        let lower = p.vfs.resolve(b"/", b"/data/media", true)?;
+        let Node::HostDir { host } = lower.node else { return Err(ENOENT) };
+        p.vfs.binds().bind(target.path, host, over);
+        return Ok(0);
+    }
     p.refusals.record(format!("mount: {} on {}", String::from_utf8_lossy(&fstype), String::from_utf8_lossy(&target.path)), t.pc, t.lr);
     Err(crate::errno::ENOSYS)
+}
+
+/// `/mnt/user/<user>/emulated`, where vold mounts the emulated volume for a user.
+fn is_emulated_volume(path: &[u8]) -> bool {
+    let Some(rest) = path.strip_prefix(b"/mnt/user/") else { return false };
+    let mut parts = rest.split(|b| *b == b'/');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(user), Some(b"emulated"), None) if !user.is_empty() && user.iter().all(u8::is_ascii_digit))
 }
 
 /// `umount2(target, flags)`: a bind mount is removed; the kernel's own mounts and the writable

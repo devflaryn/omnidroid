@@ -15,6 +15,7 @@ pub mod errno;
 pub mod exec;
 pub mod fd;
 pub mod fork;
+pub mod fuse;
 pub mod futex;
 pub mod gpu;
 pub mod guest;

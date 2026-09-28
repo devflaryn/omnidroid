@@ -491,7 +491,9 @@ impl Process {
         let exe = config.argv.first().ok_or("no program: argv is empty")?.clone();
         // The instance's writable state: what a device keeps on its data partition and tmpfs, and
         // `/linkerconfig`, which `linkerconfig` writes at boot for `linker64` to read (sub-project B).
-        let writable_dirs = ["data", "tmp", "linkerconfig", "metadata"];
+        // `/mnt` and `/storage` are the tmpfs a device's init makes them: shared storage's mount
+        // points (`crate::mount`).
+        let writable_dirs = ["data", "tmp", "linkerconfig", "metadata", "mnt", "storage"];
         let mut writable = Vec::new();
         for dir in writable_dirs {
             let host = config.instance_dir.join(dir);

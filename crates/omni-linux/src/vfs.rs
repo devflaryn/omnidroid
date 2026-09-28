@@ -210,6 +210,8 @@ pub enum DevNode {
     /// `/dev/omni-gpu`: the host's GPU, which the guest's Vulkan driver forwards to
     /// ([`crate::gpu`]).
     OmniGpu,
+    /// `/dev/fuse` ([`crate::fuse`]).
+    Fuse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,11 +282,26 @@ pub fn ino_of(path: &[u8]) -> u64 {
     path.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)) | 1
 }
 
+/// One bind mount: the guest directory `target` shows the host directory `host`. `over` is the
+/// host directory that was at `target` when it was mounted, if it was one: a kernel attaches a
+/// mount to the directory, not to its path, so the mount is seen through any other path that
+/// reaches that directory -- init binds /mnt/user/0 onto /storage, then vold mounts the emulated
+/// volume on /mnt/user/0/emulated, and /storage/emulated shows the volume.
+#[derive(Clone)]
+struct Bind {
+    target: Vec<u8>,
+    host: PathBuf,
+    over: Option<PathBuf>,
+}
+
 /// The bind mounts of an instance (its mount namespace, which every process of it shares): a
 /// guest directory that shows another's contents, by the host directory that holds them.
 #[derive(Default)]
 pub struct Binds {
-    binds: parking_lot::RwLock<Vec<(Vec<u8>, PathBuf)>>,
+    binds: parking_lot::RwLock<Vec<Bind>>,
+    /// Whether any bind is attached over a host directory (`Bind::over`): only then does a host
+    /// path need [`Binds::redirect`].
+    any_over: std::sync::atomic::AtomicBool,
     /// Where the table is kept (`<instance>/.omni-binds`), so every host process of the instance
     /// has the same mounts -- as a kernel's are the whole system's (vold binds /data/data onto
     /// /data/user/0 in the system's host process; an app, in its own, finds its data there).
@@ -331,24 +348,33 @@ impl Binds {
             seen.0 = modified;
         }
         let text = std::fs::read(file).unwrap_or_default();
-        let table = text
+        let table: Vec<Bind> = text
             .split(|b| *b == b'\n')
             .filter_map(|line| {
-                let tab = line.iter().position(|b| *b == b'\t')?;
-                Some((line[..tab].to_vec(), PathBuf::from(String::from_utf8_lossy(&line[tab + 1..]).into_owned())))
+                let mut fields = line.split(|b| *b == b'\t');
+                let target = fields.next()?.to_vec();
+                let host = PathBuf::from(String::from_utf8_lossy(fields.next()?).into_owned());
+                let over = fields.next().filter(|o| !o.is_empty()).map(|o| PathBuf::from(String::from_utf8_lossy(o).into_owned()));
+                Some(Bind { target, host, over })
             })
             .collect();
+        self.any_over.store(table.iter().any(|b| b.over.is_some()), std::sync::atomic::Ordering::Relaxed);
         *self.binds.write() = table;
     }
 
     /// Write the table for the instance's other host processes.
-    fn save(&self, binds: &[(Vec<u8>, PathBuf)]) {
+    fn save(&self, binds: &[Bind]) {
+        self.any_over.store(binds.iter().any(|b| b.over.is_some()), std::sync::atomic::Ordering::Relaxed);
         let Some(file) = &self.file else { return };
         let mut text = Vec::new();
-        for (target, host) in binds {
-            text.extend_from_slice(target);
+        for b in binds {
+            text.extend_from_slice(&b.target);
             text.push(b'\t');
-            text.extend_from_slice(host.to_string_lossy().as_bytes());
+            text.extend_from_slice(b.host.to_string_lossy().as_bytes());
+            text.push(b'\t');
+            if let Some(over) = &b.over {
+                text.extend_from_slice(over.to_string_lossy().as_bytes());
+            }
             text.push(b'\n');
         }
         let _ = std::fs::write(file, text);
@@ -356,16 +382,42 @@ impl Binds {
         seen.0 = std::fs::metadata(file).and_then(|m| m.modified()).ok();
     }
 
-    /// Mount `host` (a host directory or file) at the guest path `target`, over what was there.
-    pub fn bind(&self, target: Vec<u8>, host: PathBuf) {
+    /// Mount `host` (a host directory or file) at the guest path `target`, over what was there --
+    /// `over`, the host directory at `target` if it was one (see [`Bind`]).
+    pub fn bind(&self, target: Vec<u8>, host: PathBuf, over: Option<PathBuf>) {
         self.reload(true);
+        let over = over.filter(|o| *o != host);
         let table = {
             let mut binds = self.binds.write();
-            binds.retain(|(t, _)| *t != target);
-            binds.push((target, host));
+            binds.retain(|b| b.target != target);
+            binds.push(Bind { target, host, over });
             binds.clone()
         };
         self.save(&table);
+    }
+
+    /// `host` as the mounts show it: a path at or under a directory something is mounted over is
+    /// in what is mounted there (repeatedly: a mount inside a mount).
+    #[must_use]
+    pub fn redirect(&self, mut host: PathBuf) -> PathBuf {
+        if !self.any_over.load(std::sync::atomic::Ordering::Relaxed) {
+            return host;
+        }
+        let binds = self.binds.read();
+        for _ in 0..8 {
+            let Some(b) = binds
+                .iter()
+                // A bind of a directory inside the one it covers would only lead into itself.
+                .filter(|b| b.over.as_ref().is_some_and(|o| host.starts_with(o) && !b.host.starts_with(o)))
+                .max_by_key(|b| b.over.as_ref().map_or(0, |o| o.as_os_str().len()))
+            else {
+                break;
+            };
+            let over = b.over.as_ref().expect("filtered");
+            let rest = host.strip_prefix(over).map(Path::to_path_buf).unwrap_or_default();
+            host = if rest.as_os_str().is_empty() { b.host.clone() } else { b.host.join(rest) };
+        }
+        host
     }
 
     /// Unmount what is mounted at `target`. Whether something was.
@@ -374,7 +426,7 @@ impl Binds {
         let (removed, table) = {
             let mut binds = self.binds.write();
             let before = binds.len();
-            binds.retain(|(t, _)| t.as_slice() != target);
+            binds.retain(|b| b.target.as_slice() != target);
             (binds.len() != before, binds.clone())
         };
         if removed {
@@ -387,7 +439,7 @@ impl Binds {
     #[must_use]
     pub fn list(&self) -> Vec<(Vec<u8>, PathBuf)> {
         self.reload(false);
-        self.binds.read().clone()
+        self.binds.read().iter().map(|b| (b.target.clone(), b.host.clone())).collect()
     }
 
     /// The deepest bind mount at or above `path`: its target and host.
@@ -396,9 +448,9 @@ impl Binds {
         self.binds
             .read()
             .iter()
-            .filter(|(t, _)| path == t.as_slice() || (path.starts_with(t) && path.get(t.len()) == Some(&b'/')))
-            .max_by_key(|(t, _)| t.len())
-            .cloned()
+            .filter(|b| path == b.target.as_slice() || (path.starts_with(&b.target) && path.get(b.target.len()) == Some(&b'/')))
+            .max_by_key(|b| b.target.len())
+            .map(|b| (b.target.clone(), b.host.clone()))
     }
 }
 
@@ -591,27 +643,32 @@ impl Vfs {
             // The ashmem device as libcutils names it: after this boot's id.
             _ if path.strip_prefix(b"/dev/ashmem").is_some_and(|id| id == crate::procfs::boot_id().as_bytes()) => return Some(Node::Dev(DevNode::Ashmem)),
             b"/dev/omni-gpu" => return Some(Node::Dev(DevNode::OmniGpu)),
+            b"/dev/fuse" => return Some(Node::Dev(DevNode::Fuse)),
             b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
             _ => {}
         }
         let bound = self.binds.covering(path);
         let mounts = bound.iter().chain(self.writable.iter());
         for (mount, host) in mounts {
-            if path == mount.as_slice() {
-                if !host.is_dir() {
-                    return Some(Node::HostFile { host: host.clone() });
-                }
-                return Some(Node::HostDir { host: host.clone() });
-            }
-            if path.starts_with(mount) && path.get(mount.len()) == Some(&b'/') {
+            let host = if path == mount.as_slice() {
+                host.clone()
+            } else if path.starts_with(mount) && path.get(mount.len()) == Some(&b'/') {
                 // A guest name the host cannot hold as one plain name is not there (see `host_path`).
-                let host = host_path(host, &path[mount.len() + 1..])?;
-                return match std::fs::metadata(&host) {
-                    Ok(m) if m.is_dir() => Some(Node::HostDir { host }),
-                    Ok(_) => Some(Node::HostFile { host }),
-                    Err(_) => None,
-                };
-            }
+                host_path(host, &path[mount.len() + 1..])?
+            } else {
+                continue;
+            };
+            let host = self.binds.redirect(host);
+            return match std::fs::metadata(&host) {
+                Ok(m) if m.is_dir() => Some(Node::HostDir { host }),
+                Ok(_) => match self.owners.get(&host) {
+                    // A symbolic link on a writable mount: a file holding its target (`symlinkat`).
+                    Some(o) if o.mode & 0o170_000 == 0o120_000 => Some(Node::Symlink { target: std::fs::read(&host).ok()? }),
+                    _ => Some(Node::HostFile { host }),
+                },
+                Err(_) if path == mount.as_slice() => Some(Node::HostDir { host }),
+                Err(_) => None,
+            };
         }
         match self.sysroot.entry(path)? {
             Entry::Dir { .. } => Some(Node::Dir),
@@ -626,7 +683,14 @@ impl Vfs {
             (path.starts_with(mount) && path.get(mount.len()) == Some(&b'/'))
                 .then(|| host_path(host, &path[mount.len() + 1..]))
                 .flatten()
+                .map(|h| self.binds.redirect(h))
         })
+    }
+
+    /// The host path of a guest path on a writable or bind mount, whether or not anything is there.
+    #[must_use]
+    pub fn host_of(&self, path: &[u8]) -> Option<PathBuf> {
+        self.host_for_missing(path)
     }
 
     pub fn resolve(&self, cwd: &[u8], path: &[u8], follow_last: bool) -> Result<Resolved, Errno> {
@@ -695,7 +759,7 @@ impl Vfs {
             Node::Dir => {
                 let mut out = Vec::new();
                 let synthetic: &[&[u8]] = match dir.path.as_slice() {
-                    b"/" => &[b"dev", b"proc", b"data", b"tmp"],
+                    b"/" => &[b"dev", b"proc", b"data", b"tmp", b"mnt", b"storage"],
                     b"/dev" => &[b"null", b"zero", b"random", b"urandom", b"__properties__"],
                     b"/proc" => &[b"self"],
                     b"/proc/self" => &[b"exe"],

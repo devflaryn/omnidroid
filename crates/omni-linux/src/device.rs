@@ -26,6 +26,10 @@ pub const FILES: &[(&str, &[u8])] = &[
     // Nor does it declare telephony: the image's handheld features less `android.hardware.telephony*`
     // (the file says why).
     ("/vendor/etc/permissions/handheld_core_hardware.xml", include_bytes!("../device/vendor/etc/permissions/handheld_core_hardware.xml")),
+    // Installed apps are granted what they ask for: a closed device with no owner's data on it (the
+    // script says why; `persist.omni.autogrant=0` turns it off).
+    ("/vendor/etc/init/omni_autogrant.rc", include_bytes!("../device/vendor/etc/init/omni_autogrant.rc")),
+    ("/vendor/bin/omni_autogrant.sh", include_bytes!("../device/vendor/bin/omni_autogrant.sh")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a

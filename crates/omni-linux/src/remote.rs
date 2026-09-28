@@ -110,6 +110,9 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
             d
         }
         FileKind::SyncFile(_) => vec![2u8],
+        // vold's `/dev/fuse`, handed to MediaProvider: a new open there (`crate::fuse`: nothing
+        // is shared but the handshake, which the receiver answers).
+        FileKind::Fuse(_) => vec![6u8],
         // The receiver makes a connected end of its own and relays its other end to this one.
         FileKind::Socket(s) => [&[3u8, s.ty as u8][..], &port.to_le_bytes()].concat(),
         FileKind::Pipe(end) => [&[4u8, u8::from(end.is_write())][..], &port.to_le_bytes()].concat(),
@@ -202,6 +205,7 @@ fn open_described(d: &[u8]) -> Result<OpenFile, Errno> {
             host.seek(std::io::SeekFrom::Start(offset)).map_err(|_| EIO)?;
             Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Host { file: host, guest, sysroot }), flags: parking_lot::Mutex::new(flags) })
         }
+        Some(6) => Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::Fuse(crate::fuse::Fuse::open())), flags: parking_lot::Mutex::new(2) }),
         Some(2) => {
             let now = crate::sys::monotonic().as_nanos() as u64;
             Ok(OpenFile { kind: parking_lot::Mutex::new(FileKind::SyncFile(Arc::new(crate::sync_file::SyncFile { signalled_ns: now }))), flags: parking_lot::Mutex::new(0) })

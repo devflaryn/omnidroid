@@ -1,0 +1,7 @@
+# omnidroid: installed apps are granted the permissions and special access they ask for
+# (/vendor/bin/omni_autogrant.sh says why). Root: it lists /data/app and grants for user 0. Started
+# with its class: the script waits for the package manager itself.
+service omni_autogrant /system/bin/sh /vendor/bin/omni_autogrant.sh
+    class late_start
+    user root
+    group root shell

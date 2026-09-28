@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::vfs::Sysroot;
 
 /// The mounts an instance keeps on the host, by guest root: what an `.rc` `mkdir` may create.
-const WRITABLE: [&str; 4] = ["/data", "/metadata", "/tmp", "/linkerconfig"];
+pub const WRITABLE: [&str; 6] = ["/data", "/metadata", "/tmp", "/linkerconfig", "/mnt", "/storage"];
 
 /// Every `mkdir` in the image's init scripts whose path lies on a writable mount, made under
 /// `instance`. Once per instance: a marker records it.
@@ -51,6 +51,37 @@ pub fn make_init_dirs(sysroot: &Sysroot, instance: &Path) {
             let uid = words.next().map_or(0, crate::init::uid_of);
             let gid = words.next().filter(|g| !g.contains('=')).map_or(uid, crate::init::uid_of);
             owners.set(&host, crate::owners::Owner { uid, gid, mode });
+        }
+    }
+    // Its bind mounts and symbolic links between writable places: /storage shows /mnt/user/0,
+    // where vold mounts the emulated volume (`crate::mount`); /mnt/sdcard is /storage/self/primary.
+    let binds = crate::vfs::Binds::of(instance);
+    let on_writable = |path: &str| {
+        let root = WRITABLE.iter().find(|r| path == **r || path.starts_with(&format!("{r}/")))?;
+        let rest = &path[root.len()..];
+        (!rest.split('/').any(|c| c == "..")).then(|| instance.join(&root[1..]).join(rest.trim_start_matches('/')))
+    };
+    let script = sysroot.read(b"/system/etc/init/hw/init.rc").unwrap_or_default();
+    for line in String::from_utf8_lossy(&script).lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            // Not one inside the other: `/linkerconfig/bootstrap` on `/linkerconfig` is init's own
+            // switch of linker configurations, which `crate::init` makes itself.
+            ["mount", "none", source, target, "bind", ..] if !source.starts_with(&format!("{target}/")) && !target.starts_with(&format!("{source}/")) => {
+                if let (Some(host), Some(over)) = (on_writable(source), on_writable(target)) {
+                    let _ = std::fs::create_dir_all(&host);
+                    let _ = std::fs::create_dir_all(&over);
+                    binds.bind(target.as_bytes().to_vec(), host, Some(over));
+                }
+            }
+            ["symlink", target, link] => {
+                if let Some(host) = on_writable(link) {
+                    if !target.contains('$') && std::fs::write(&host, target.as_bytes()).is_ok() {
+                        owners.set(&host, crate::owners::Owner { uid: 0, gid: 0, mode: 0o120_777 });
+                    }
+                }
+            }
+            _ => {}
         }
     }
     let _ = std::fs::create_dir_all(instance.join("data"));

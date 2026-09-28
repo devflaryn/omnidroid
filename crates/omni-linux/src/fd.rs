@@ -64,6 +64,8 @@ pub enum FileKind {
     Bpf(crate::bpf::Object),
     /// `/dev/binder` whose driver is in the system's host process (`crate::remote`).
     RemoteBinder(Arc<crate::remote::RemoteBinder>),
+    /// An open of `/dev/fuse` (`crate::fuse`).
+    Fuse(Arc<crate::fuse::Fuse>),
 }
 
 impl FileKind {
@@ -265,6 +267,7 @@ pub fn open_by(opener: Option<&Process>, vfs: &Vfs, cwd: &[u8], path: &[u8], fla
             }
         }
         Node::Dev(DevNode::OmniGpu) => FileKind::Gpu(crate::gpu::Gpu::open()),
+        Node::Dev(DevNode::Fuse) => FileKind::Fuse(crate::fuse::Fuse::open()),
         Node::Dev(d) => FileKind::Dev(d),
         Node::Generated | Node::Blob { .. } => {
             if write && !crate::procfs::is_settable_attr(&r.path) {
@@ -357,7 +360,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
-        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b, DevNode::Ashmem => 0x1_0b, DevNode::OmniGpu => 0xe2_00 }, ..s(S_IFCHR | 0o666, 0) },
+        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b, DevNode::Ashmem => 0x1_0b, DevNode::OmniGpu => 0xe2_00, DevNode::Fuse => 0xa_e5 }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
 }
@@ -397,6 +400,7 @@ pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Ok(Stat { ino: 4, mode: 0o600, nlink: 1, ..Stat::default() }),
         FileKind::Binder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
         FileKind::Gpu(_) => stat_node(&Resolved { path: b"/dev/omni-gpu".to_vec(), node: Node::Dev(DevNode::OmniGpu) }),
+        FileKind::Fuse(_) => stat_node(&Resolved { path: b"/dev/fuse".to_vec(), node: Node::Dev(DevNode::Fuse) }),
         FileKind::SyncFile(_) => Ok(Stat { ino: 7, mode: 0o600, nlink: 1, ..Stat::default() }),
         // An ashmem region is the ashmem device's descriptor: a character device, with the device's
         // number (libcutils tells ashmem from anything else by it). A memfd is a regular file.
@@ -434,7 +438,7 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         FileKind::Socket(s) => crate::socket::receive(s, buf),
         // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
-        FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder | DevNode::OmniGpu) | FileKind::Binder(_) | FileKind::Gpu(_) | FileKind::SyncFile(_) => Err(EINVAL),
+        FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder | DevNode::OmniGpu | DevNode::Fuse) | FileKind::Binder(_) | FileKind::Gpu(_) | FileKind::SyncFile(_) => Err(EINVAL),
         FileKind::Dev(DevNode::Kmsg | DevNode::Ashmem) => Err(EAGAIN),
         FileKind::Shared(m) => match at {
             Some(off) => m.read_at(buf, off),
@@ -442,6 +446,8 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         },
         FileKind::Inotify(_) => Err(EAGAIN), // no event is ever ready
         FileKind::Bpf(_) | FileKind::RemoteBinder(_) => Err(EINVAL),
+        // Read by `sys_read` without this lock held (`crate::fuse`: it waits).
+        FileKind::Fuse(_) => Err(EINVAL),
 
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
@@ -491,6 +497,8 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Shared(m) => m.write_seq(bytes),
         FileKind::Inotify(_) => Err(EBADF),
         FileKind::Bpf(_) | FileKind::RemoteBinder(_) => Err(EINVAL),
+        // MediaProvider's daemon's replies (to `FUSE_INIT` only: `crate::fuse`).
+        FileKind::Fuse(_) => Ok(bytes.len()),
         FileKind::Synth { guest, data, pos, .. } => {
             let written = crate::procfs::write_generated(guest, bytes, data)?;
             *pos = 0;
@@ -602,7 +610,7 @@ fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let n = match crate::pipe::end_of(&file) {
         Some((_, true, _)) => return Err(EBADF),
         Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, &mut buf, nonblocking, t)?,
-        None => match crate::poll::read(&file, &mut buf, t).or_else(|| crate::socket::read(&file, &mut buf, t)) {
+        None => match crate::poll::read(&file, &mut buf, t).or_else(|| crate::socket::read(&file, &mut buf, t)).or_else(|| crate::fuse::read(&file, &mut buf, t)) {
             Some(r) => r?,
             None => read_file(&file, &mut buf, None)?,
         },
@@ -874,6 +882,7 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Inotify(_) => b"anon_inode:inotify".to_vec(),
         FileKind::Bpf(o) => o.describe().as_bytes().to_vec(),
         FileKind::RemoteBinder(_) => b"/dev/binder".to_vec(),
+        FileKind::Fuse(_) | FileKind::Dev(DevNode::Fuse) => b"/dev/fuse".to_vec(),
     }
 }
 
@@ -1094,6 +1103,7 @@ fn writable_host(p: &Process, dirfd: u64, path: &[u8], follow: bool) -> Result<(
     let r = p.vfs.resolve(&base, path, follow)?;
     let host = match &r.node {
         Node::HostFile { host } | Node::HostDir { host } | Node::Missing { host: Some(host), .. } => host.clone(),
+        Node::Symlink { .. } => p.vfs.host_of(&r.path).filter(|h| h.is_file()).ok_or(EROFS)?,
         Node::Missing { host: None, parent_is_dir: true } => return Err(EROFS),
         Node::Missing { .. } => return Err(ENOENT),
         _ => return Err(EROFS),
@@ -1105,6 +1115,24 @@ fn writable_host(p: &Process, dirfd: u64, path: &[u8], follow: bool) -> Result<(
 fn created(p: &Process, host: &std::path::Path, mode: u32) {
     let mode = mode & 0o7777 & !p.sys.umask();
     p.vfs.owners().set(host, crate::owners::Owner { uid: p.sys.uid(), gid: p.sys.gid(), mode });
+}
+
+/// `symlinkat(target, newdirfd, linkpath)` on a writable mount: a file holding the target, marked
+/// a link in the mount's owners (`crate::vfs` shows it as one).
+fn sys_symlinkat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let target = path_arg(p, a[0])?;
+    let path = path_arg(p, a[2])?;
+    let base = base_dir(p, a[1], &path)?;
+    match p.vfs.resolve(&base, &path, false)?.node {
+        Node::Missing { host: Some(host), parent_is_dir: true } => {
+            std::fs::write(&host, &target).map_err(|_| EACCES)?;
+            p.vfs.owners().set(&host, crate::owners::Owner { uid: p.sys.uid(), gid: p.sys.gid(), mode: 0o120_777 });
+            Ok(0)
+        }
+        Node::Missing { host: None, parent_is_dir: true } => Err(EROFS),
+        Node::Missing { .. } => Err(ENOENT),
+        _ => Err(EEXIST),
+    }
 }
 
 fn sys_mkdirat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -1573,6 +1601,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::FSTAT, sys_fstat);
     table.set(nr::NEWFSTATAT, sys_newfstatat);
     table.set(nr::READLINKAT, sys_readlinkat);
+    table.set(nr::SYMLINKAT, sys_symlinkat);
     table.set(nr::FACCESSAT, sys_faccessat);
     table.set(nr::FACCESSAT2, sys_faccessat);
     table.set(nr::IOCTL, sys_ioctl);

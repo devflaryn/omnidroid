@@ -115,6 +115,9 @@ fn the_apk_is_installed_started_and_draws() {
     };
     // After the install: the package installer, which the install itself needed.
     let lean_after = if lean.is_empty() { String::new() } else { "cmd package disable-user --user 0 com.android.packageinstaller >/dev/null 2>&1; ".to_string() };
+    // `OMNI_R_AFTER_INSTALL`: shell run once the APK is installed, before its first start (an
+    // app-op the APK asks for, granted as its owner would grant it in Settings).
+    let after_install = std::env::var("OMNI_R_AFTER_INSTALL").map_or_else(|_| String::new(), |c| format!("{c}; echo \"[r] after install: $?\"; "));
     let then = format!(
         "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
          echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; \
@@ -124,7 +127,7 @@ fn the_apk_is_installed_started_and_draws() {
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
          {lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
-         {lean_after}
+         {lean_after}{after_install}
          pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
          act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \
