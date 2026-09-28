@@ -1,6 +1,6 @@
 # Handoff
 
-## ONLY THE APP IN THE WINDOW (2026-09-28 evening, Windows; `68ad3fe`, `904c79f`)
+## ONLY THE APP IN THE WINDOW (2026-09-28 evening, Windows; `68ad3fe`, `904c79f`, `e43f680`)
 
 The live window (and every framebuffer screenshot) now shows **only the app**: no status bar, no
 navigation bar, no taskbar. Two mechanisms, both Android's own objects, nothing in the framework
@@ -73,6 +73,10 @@ session's wider composer (scaling, transforms, BGRA, chrome left out) may take t
 an in-game run with the owner's cookie and `OMNI_COMPOSER_TRACE=layers`** shows which layers
 still go to SurfaceFlinger and the fps with them taken; HANDOFF's r26 profile (the app's threads
 93-96% inside system-call handlers) says the app side is the larger cost.
+
+Regression with app-only the default (Windows, release): `omni-linux` lib 20/20; D5 passed
+(155 s); D6 passed (817x542 in 2.0 s, 1531x877 in 4.2 s, window frames 1146 = framebuffer
+1146); D7 passed (170 s).
 
 Portability: nothing platform-specific changed. `hal::composer`, `hal::compose` and
 `display_window` hold no `cfg` and no platform call; the window seam (`omni-platform::window`,
