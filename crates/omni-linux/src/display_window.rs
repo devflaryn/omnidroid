@@ -32,12 +32,25 @@
 //! stretched while the border moves, and a pause of [`SETTLE`] -- mid-drag or at its end --
 //! resizes the display to it, and the app redraws at that size while the border is still held.
 //!
-//! # Scripted resizes
+//! # Keyboard and mouse
+//!
+//! With [`Options::input`], the window's keyboard and mouse are a keyboard and a mouse of the
+//! device's (`crate::evdev`, `/dev/input/event0` and `event1`, registered before system_server's
+//! `InputReader` scans), translated by [`crate::window_input`]: keys whenever the window has the
+//! focus; the mouse **held on a click** (the host cursor hidden, Android's own pointer placed where
+//! the click was, then driven by the mouse's raw motion) and **given back with Right Ctrl** or when
+//! the window loses the focus. The title bar says which.
+//!
+//! # Scripted resizes and input
 //!
 //! [`Options::control`] names a file of commands, one a line, read as it grows (every
 //! [`CONTROL_EVERY`]): `size <w>x<h>` resizes the **window** as a drag would -- the display then
-//! follows by the same path as a user's resize, which is what makes that path testable. Unknown
-//! lines are reported and skipped.
+//! follows by the same path as a user's resize, which is what makes that path testable. `key
+//! <scancode> [down|up]` (a set-1 scancode, `0x`-hex or decimal, `0xE0..` for an extended key;
+//! both halves when neither is named), `click <x> <y> [primary|secondary|middle]` (window pixels:
+//! placed and clicked as a real first click is, without a capture), `move <dx> <dy>` and `wheel
+//! <notches>` drive the input devices as the window's own events would. Unknown lines are
+//! reported and skipped.
 //!
 //! # What it says
 //!
@@ -55,8 +68,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use omni_platform::window::{Presenter, Window, WindowDesc, WindowEvent};
 
+use omni_platform::window::PointerButton;
+
+use crate::evdev::{Device, Spec, EV_REL, REL_WHEEL, REL_X, REL_Y};
 use crate::hal::composer::{Composer, MIN_SIDE};
 use crate::hal::framebuffer::Framebuffer;
+use crate::window_input::{Input, Out, TITLE_FREE};
 
 /// How long a window size must hold before the display is resized to it.
 pub const SETTLE: Duration = Duration::from_millis(300);
@@ -75,8 +92,16 @@ pub const REPORT_EVERY: Duration = Duration::from_secs(5);
 pub struct Options {
     /// The title bar's text.
     pub title: String,
-    /// A file of commands (see this module's "Scripted resizes"), if any.
+    /// A file of commands (see this module's "Scripted resizes and input"), if any.
     pub control: Option<PathBuf>,
+    /// The window's keyboard and mouse as the device's (see this module's "Keyboard and mouse").
+    pub input: bool,
+}
+
+/// The two input devices: the keyboard, the mouse.
+struct Devices {
+    keyboard: Arc<Device>,
+    mouse: Arc<Device>,
 }
 
 /// Show the display in a window of its own, on threads of their own (see this module's "Two
@@ -86,23 +111,56 @@ pub struct Options {
 /// # Errors
 /// The thread could not be started.
 pub fn spawn(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: Options) -> std::io::Result<JoinHandle<()>> {
-    std::thread::Builder::new().name("omni-display-window".into()).spawn(move || run(framebuffer, composer, &options))
+    // The devices now, on the caller's thread: they must exist before `InputReader` scans.
+    let devices = options.input.then(|| Devices {
+        keyboard: crate::evdev::register(Spec::keyboard("omnidroid keyboard")),
+        mouse: crate::evdev::register(Spec::mouse("omnidroid mouse")),
+    });
+    if let Some(d) = &devices {
+        eprintln!("[window] input: /dev/input/event{} keyboard, /dev/input/event{} mouse", d.keyboard.number, d.mouse.number);
+    }
+    std::thread::Builder::new().name("omni-display-window".into()).spawn(move || run(framebuffer, composer, &options, devices.as_ref()))
 }
 
 /// A command from the control file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Size(u32, u32),
+    /// A key by its set-1 scancode: down, up, or (`None`) both.
+    Key(u32, Option<bool>),
+    Click(i32, i32, PointerButton),
+    Move(i32, i32),
+    Wheel(i32),
 }
 
 /// One line of the control file: `None` for a line that is not a command (reported by the caller).
 fn parse(line: &str) -> Option<Command> {
-    let mut words = line.split_whitespace();
-    match (words.next()?, words.next(), words.next()) {
-        ("size", Some(size), None) => {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let int = |s: &str| -> Option<i64> {
+        match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(hex) => i64::from_str_radix(hex, 16).ok(),
+            None => s.parse().ok(),
+        }
+    };
+    match words.as_slice() {
+        ["size", size] => {
             let (w, h) = size.split_once('x')?;
             Some(Command::Size(w.parse().ok()?, h.parse().ok()?))
         }
+        ["key", code] => Some(Command::Key(u32::try_from(int(code)?).ok()?, None)),
+        ["key", code, "down"] => Some(Command::Key(u32::try_from(int(code)?).ok()?, Some(true))),
+        ["key", code, "up"] => Some(Command::Key(u32::try_from(int(code)?).ok()?, Some(false))),
+        ["click", x, y, rest @ ..] => {
+            let button = match rest {
+                [] | ["primary"] => PointerButton::Primary,
+                ["secondary"] => PointerButton::Secondary,
+                ["middle"] => PointerButton::Middle,
+                _ => return None,
+            };
+            Some(Command::Click(i32::try_from(int(x)?).ok()?, i32::try_from(int(y)?).ok()?, button))
+        }
+        ["move", dx, dy] => Some(Command::Move(i32::try_from(int(dx)?).ok()?, i32::try_from(int(dy)?).ok()?)),
+        ["wheel", n] => Some(Command::Wheel(i32::try_from(int(n)?).ok()?)),
         _ => None,
     }
 }
@@ -115,8 +173,43 @@ fn new_lines(text: &str, seen: usize) -> (Vec<String>, usize) {
     (fresh, complete.len().max(seen))
 }
 
+/// Do what the input translation asks: send to a device, take or give back the capture, retitle.
+fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Devices, now: Instant) {
+    let mut queue: std::collections::VecDeque<Out> = outs.into();
+    while let Some(out) = queue.pop_front() {
+        match out {
+            Out::Keyboard(packet) => devices.keyboard.send(&packet),
+            Out::Mouse(packet) => devices.mouse.send(&packet),
+            Out::Capture(take) => {
+                let held = window.set_pointer_capture(take).unwrap_or_else(|e| {
+                    eprintln!("[window] pointer capture: {e}");
+                    false
+                });
+                if take {
+                    // What follows the answer comes before anything else queued.
+                    for o in input.captured(held, now).into_iter().rev() {
+                        queue.push_front(o);
+                    }
+                }
+            }
+            Out::Title(title) => {
+                let _ = window.set_title(title);
+            }
+        }
+    }
+}
+
+/// Display pixels per window pixel, each way.
+fn scale(window: &Window, composer: &Composer) -> (f64, f64) {
+    let (dw, dh) = composer.display_size();
+    match window.client_size() {
+        Ok((w, h)) if w > 0 && h > 0 => (f64::from(dw) / f64::from(w), f64::from(dh) / f64::from(h)),
+        _ => (1.0, 1.0),
+    }
+}
+
 /// The window thread: make the window, start the present thread, pump, run the control file.
-fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options) {
+fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options, devices: Option<&Devices>) {
     let (width, height) = composer.display_size();
     let mut window = match Window::new(&WindowDesc::new(&options.title, width, height)) {
         Ok(w) => w,
@@ -127,10 +220,15 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     };
     window.show();
     eprintln!("[window] {width}x{height}: the display, live (a window resize resizes the display)");
+    let mut input = Input::default();
+    if devices.is_some() {
+        let _ = window.set_title(TITLE_FREE);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let presenter = window.presenter();
     let present = {
         let stop = Arc::clone(&stop);
+        let composer = Arc::clone(&composer);
         std::thread::Builder::new().name("omni-display-present".into()).spawn(move || present(&presenter, &framebuffer, &composer, &stop))
     };
     let present = match present {
@@ -143,8 +241,19 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     let (mut control_seen, mut control_read) = (0usize, Instant::now());
     loop {
         window.wait(PUMP_WAIT);
-        if window.poll_events().any(|e| e == WindowEvent::CloseRequested) {
+        let events: Vec<WindowEvent> = window.poll_events().collect();
+        if events.contains(&WindowEvent::CloseRequested) {
             break;
+        }
+        if let Some(devices) = devices {
+            let now = Instant::now();
+            let s = scale(&window, &composer);
+            for event in &events {
+                let outs = input.event(event, now, s);
+                perform(outs, &mut window, &mut input, devices, now);
+            }
+            let outs = input.tick(now, s);
+            perform(outs, &mut window, &mut input, devices, now);
         }
         if present.is_finished() {
             eprintln!("[window] the present thread ended; closing the window");
@@ -162,6 +271,15 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
                                 Ok(()) => eprintln!("[window] control: size {w}x{h}"),
                                 Err(e) => eprintln!("[window] control: size {w}x{h}: {e}"),
                             },
+                            Some(command) => match devices {
+                                Some(devices) => {
+                                    eprintln!("[window] control: {line}");
+                                    let (now, s) = (Instant::now(), scale(&window, &composer));
+                                    let outs = scripted(command, &mut input, now, s);
+                                    perform(outs, &mut window, &mut input, devices, now);
+                                }
+                                None => eprintln!("[window] control: {line:?}: no input devices (OMNI_WINDOW_INPUT=0)"),
+                            },
                             None => eprintln!("[window] control: not a command: {line:?}"),
                         }
                     }
@@ -172,6 +290,28 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     stop.store(true, Ordering::Release);
     let _ = present.join();
     eprintln!("[window] closed; the display goes on without it");
+}
+
+/// An input command from the control file, as the window's own events would be.
+fn scripted(command: Command, input: &mut Input, now: Instant, s: (f64, f64)) -> Vec<Out> {
+    let key = |down| if down { WindowEvent::KeyDown { keycode: 0, scancode: 0, repeat: false } } else { WindowEvent::KeyUp { keycode: 0, scancode: 0 } };
+    let with_code = |e: WindowEvent, code: u32| match e {
+        WindowEvent::KeyDown { repeat, .. } => WindowEvent::KeyDown { keycode: 0, scancode: code, repeat },
+        _ => WindowEvent::KeyUp { keycode: 0, scancode: code },
+    };
+    match command {
+        Command::Key(code, Some(down)) => input.event(&with_code(key(down), code), now, s),
+        Command::Key(code, None) => {
+            let mut out = input.event(&with_code(key(true), code), now, s);
+            out.extend(input.event(&with_code(key(false), code), now, s));
+            out
+        }
+        Command::Click(x, y, button) => input.scripted_click(x, y, button, now, s),
+        // Straight to the mouse: a script moves Android's pointer whether or not the mouse is held.
+        Command::Move(dx, dy) => vec![Out::Mouse(vec![(EV_REL, REL_X, dx), (EV_REL, REL_Y, dy)])],
+        Command::Wheel(n) => vec![Out::Mouse(vec![(EV_REL, REL_WHEEL, n)])],
+        Command::Size(..) => Vec::new(),
+    }
 }
 
 /// The present thread: each frame to the window, and the window's size to the display.
@@ -238,7 +378,14 @@ mod tests {
     fn a_size_command_is_parsed_and_anything_else_is_not() {
         assert_eq!(parse("size 960x600"), Some(Command::Size(960, 600)));
         assert_eq!(parse("  size   1600x900  "), Some(Command::Size(1600, 900)));
-        for bad in ["size", "size 960", "size 960x", "size x600", "size 9x6 extra", "resize 1x1", "", "size -1x5"] {
+        assert_eq!(parse("key 0x1E"), Some(Command::Key(0x1E, None)));
+        assert_eq!(parse("key 0xE048 down"), Some(Command::Key(0xE048, Some(true))));
+        assert_eq!(parse("key 30 up"), Some(Command::Key(30, Some(false))));
+        assert_eq!(parse("click 400 300"), Some(Command::Click(400, 300, PointerButton::Primary)));
+        assert_eq!(parse("click 5 6 secondary"), Some(Command::Click(5, 6, PointerButton::Secondary)));
+        assert_eq!(parse("move -20 15"), Some(Command::Move(-20, 15)));
+        assert_eq!(parse("wheel -2"), Some(Command::Wheel(-2)));
+        for bad in ["size", "size 960", "size 960x", "size x600", "size 9x6 extra", "resize 1x1", "", "size -1x5", "key", "key zz", "key 1 sideways", "click 1", "click 1 2 left", "move 1"] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
     }

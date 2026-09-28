@@ -175,6 +175,12 @@ impl Window {
     }
 
     /// Unreachable, as [`Window::show`].
+    pub(super) fn set_title(&self, title: &str) -> WindowResult<()> {
+        let _ = title;
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
     pub(super) fn presenter(&self) -> Presenter {
         match *self {}
     }

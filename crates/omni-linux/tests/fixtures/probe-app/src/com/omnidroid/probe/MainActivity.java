@@ -6,12 +6,16 @@ import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 
 /**
  * The launcher Activity: says that it was created, then fills its window with one colour. It
  * handles a display resize itself (the manifest's configChanges) and says so: the configuration it
- * was given, the size its view was laid out at, and the size it then drew at.
+ * was given, the size its view was laid out at, and the size it then drew at. And it says what
+ * input reaches it: each key (its key code, scan code and source) and each pointer event (action,
+ * source, tool, position on the screen, buttons, scroll).
  */
 public class MainActivity extends Activity {
     @Override
@@ -35,7 +39,32 @@ public class MainActivity extends Activity {
     public void onConfigurationChanged(Configuration c) {
         super.onConfigurationChanged(c);
         Log.i("OmniProbe", "onConfigurationChanged screen " + c.screenWidthDp + "x" + c.screenHeightDp + " dp, smallest "
-                + c.smallestScreenWidthDp + " dp, density " + c.densityDpi);
+                + c.smallestScreenWidthDp + " dp, density " + c.densityDpi + ", keyboard " + c.keyboard);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        Log.i("OmniProbe", "key " + (e.getAction() == KeyEvent.ACTION_DOWN ? "down" : "up") + " code " + e.getKeyCode()
+                + " scan " + e.getScanCode() + " repeat " + e.getRepeatCount() + " source 0x" + Integer.toHexString(e.getSource()));
+        return super.dispatchKeyEvent(e);
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent e) {
+        logMotion(e);
+        return super.dispatchTouchEvent(e);
+    }
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent e) {
+        logMotion(e);
+        return super.dispatchGenericMotionEvent(e);
+    }
+
+    private static void logMotion(MotionEvent e) {
+        Log.i("OmniProbe", "motion " + MotionEvent.actionToString(e.getActionMasked()) + " source 0x" + Integer.toHexString(e.getSource())
+                + " tool " + e.getToolType(0) + " at " + Math.round(e.getRawX()) + "," + Math.round(e.getRawY())
+                + " buttons " + e.getButtonState() + " vscroll " + e.getAxisValue(MotionEvent.AXIS_VSCROLL));
     }
 
     /** The content view: logs each size it is laid out at, and the first draw at each. */

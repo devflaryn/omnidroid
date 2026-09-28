@@ -29,6 +29,7 @@
 //! Window::wait(&self, timeout: Duration) -> bool
 //! Window::present_rgba(&mut self, rgba: &[u8], width, height) -> WindowResult<()>
 //! Window::presenter(&self) -> Presenter
+//! Window::set_title(&self, title: &str) -> WindowResult<()>
 //! Window::raw(&self) -> RawWindow
 //! Presenter::present_rgba(&self, rgba: &[u8], width, height) -> WindowResult<()>
 //! Presenter::client_size(&self) -> Option<(u32, u32)>
@@ -169,8 +170,10 @@ use core::time::Duration;
 use core::marker::PhantomData;
 
 mod error;
+mod scancode;
 
 pub use error::{WindowError, WindowResult};
+pub use scancode::{evdev_code, EXTENDED_SCANCODES};
 
 // The backend modules are **private**, for the reason `vm::mod` records: a `pub mod windows` is a
 // public surface no other crate can name without writing `#[cfg(target_os = "windows")]` itself,
@@ -966,6 +969,20 @@ impl Window {
             return Err(WindowError::PixelsTooShort { operation: "present_rgba", width, height, needed, got: rgba.len() });
         };
         self.inner.present_rgba(image, width, height)
+    }
+
+    /// **Change the title bar's text** -- what the window tells the user about itself now (a live
+    /// display says whether it holds the mouse).
+    ///
+    /// # Errors
+    ///
+    /// [`WindowError::TitleHasInteriorNul`] for a title with a NUL in it; the host's refusal
+    /// otherwise.
+    pub fn set_title(&self, title: &str) -> WindowResult<()> {
+        if let Some(at) = title.chars().position(|c| c == '\0') {
+            return Err(WindowError::TitleHasInteriorNul { operation: "set_title", at });
+        }
+        self.inner.set_title(title)
     }
 
     /// **A handle that presents to this window from any thread** (see this module's "From another

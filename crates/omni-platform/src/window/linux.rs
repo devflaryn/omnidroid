@@ -1767,6 +1767,21 @@ impl Window {
         self.presenter().present_rgba(rgba, width, height)
     }
 
+    /// `WM_NAME` and `_NET_WM_NAME`, as creation set them.
+    pub(super) fn set_title(&self, title: &str) -> WindowResult<()> {
+        let (display, window, atoms) = (self.display, self.window, self.atoms);
+        self.checked("set_title", "XChangeProperty", |xl| {
+            let title = title.as_bytes();
+            // SAFETY: a live display and window; the buffer lives across each call and its length
+            // is passed.
+            unsafe {
+                for property in [XA_WM_NAME, atoms.net_wm_name] {
+                    (xl.XChangeProperty)(display, window, property, atoms.utf8_string, 8, xlib::PropModeReplace, title.as_ptr(), title.len() as c_int);
+                }
+            }
+        })
+    }
+
     /// A handle presenting to this window from any thread: point 8.
     pub(super) fn presenter(&self) -> Presenter {
         Presenter { canvas: Arc::clone(self.canvas.as_ref().expect("a created window has its canvas")) }

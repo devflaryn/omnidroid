@@ -916,6 +916,11 @@ pub(super) fn set_client_size(id: u64, width: u32, height: u32) {
     });
 }
 
+/// `-[NSWindow setTitle:]`.
+pub(super) fn set_title(id: u64, title: &str) {
+    with(id, |native| native.window.setTitle(&NSString::from_str(title)));
+}
+
 /// `-[NSWindow miniaturize:]` / `deminiaturize:`.
 pub(super) fn set_minimized(id: u64, minimized: bool) {
     with(id, |native| {

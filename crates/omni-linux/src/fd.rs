@@ -66,6 +66,8 @@ pub enum FileKind {
     RemoteBinder(Arc<crate::remote::RemoteBinder>),
     /// An open of `/dev/fuse` (`crate::fuse`).
     Fuse(Arc<crate::fuse::Fuse>),
+    /// An open of an input device (`crate::evdev`).
+    Evdev(Arc<crate::evdev::Client>),
 }
 
 impl FileKind {
@@ -268,6 +270,7 @@ pub fn open_by(opener: Option<&Process>, vfs: &Vfs, cwd: &[u8], path: &[u8], fla
         }
         Node::Dev(DevNode::OmniGpu) => FileKind::Gpu(crate::gpu::Gpu::open()),
         Node::Dev(DevNode::Fuse) => FileKind::Fuse(crate::fuse::Fuse::open()),
+        Node::Dev(DevNode::Input(n)) => FileKind::Evdev(crate::evdev::open(usize::from(n))?),
         Node::Dev(d) => FileKind::Dev(d),
         Node::Generated | Node::Blob { .. } => {
             if write && !crate::procfs::is_settable_attr(&r.path) {
@@ -360,7 +363,7 @@ fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
         Node::Blob { size } => s(S_IFREG | 0o444, *size as i64),
-        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b, DevNode::Ashmem => 0x1_0b, DevNode::OmniGpu => 0xe2_00, DevNode::Fuse => 0xa_e5 }, ..s(S_IFCHR | 0o666, 0) },
+        Node::Dev(d) => Stat { rdev: match d { DevNode::Null => 0x103, DevNode::Zero => 0x105, DevNode::Random => 0x108, DevNode::Urandom => 0x109, DevNode::Binder => 0xa3_00, DevNode::HwBinder => 0xa3_01, DevNode::VndBinder => 0xa3_02, DevNode::Kmsg => 0x10b, DevNode::Ashmem => 0x1_0b, DevNode::OmniGpu => 0xe2_00, DevNode::Fuse => 0xa_e5, DevNode::Input(n) => 0xd_40 + u64::from(*n) }, ..s(S_IFCHR | 0o666, 0) },
         Node::Missing { .. } => return Err(ENOENT),
     })
 }
@@ -401,6 +404,7 @@ pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
         FileKind::Binder(_) => stat_node(&Resolved { path: b"/dev/binder".to_vec(), node: Node::Dev(DevNode::Binder) }),
         FileKind::Gpu(_) => stat_node(&Resolved { path: b"/dev/omni-gpu".to_vec(), node: Node::Dev(DevNode::OmniGpu) }),
         FileKind::Fuse(_) => stat_node(&Resolved { path: b"/dev/fuse".to_vec(), node: Node::Dev(DevNode::Fuse) }),
+        FileKind::Evdev(c) => stat_node(&Resolved { path: format!("/dev/input/event{}", c.device().number).into_bytes(), node: Node::Dev(DevNode::Input(c.device().number as u16)) }),
         FileKind::SyncFile(_) => Ok(Stat { ino: 7, mode: 0o600, nlink: 1, ..Stat::default() }),
         // An ashmem region is the ashmem device's descriptor: a character device, with the device's
         // number (libcutils tells ashmem from anything else by it). A memfd is a regular file.
@@ -438,7 +442,7 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         FileKind::Socket(s) => crate::socket::receive(s, buf),
         // Pipes are read by `sys_read`/`sys_readv` without this lock held (they may wait).
         FileKind::Pipe(_) | FileKind::EventFd(_) | FileKind::TimerFd(_) | FileKind::Epoll(_) => Err(ESPIPE),
-        FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder | DevNode::OmniGpu | DevNode::Fuse) | FileKind::Binder(_) | FileKind::Gpu(_) | FileKind::SyncFile(_) => Err(EINVAL),
+        FileKind::Dev(DevNode::Binder | DevNode::HwBinder | DevNode::VndBinder | DevNode::OmniGpu | DevNode::Fuse | DevNode::Input(_)) | FileKind::Binder(_) | FileKind::Gpu(_) | FileKind::SyncFile(_) => Err(EINVAL),
         FileKind::Dev(DevNode::Kmsg | DevNode::Ashmem) => Err(EAGAIN),
         FileKind::Shared(m) => match at {
             Some(off) => m.read_at(buf, off),
@@ -448,6 +452,8 @@ fn read_file(file: &OpenFile, buf: &mut [u8], at: Option<u64>) -> Result<usize, 
         FileKind::Bpf(_) | FileKind::RemoteBinder(_) => Err(EINVAL),
         // Read by `sys_read` without this lock held (`crate::fuse`: it waits).
         FileKind::Fuse(_) => Err(EINVAL),
+        // Read by `sys_read` without this lock held (`crate::evdev`: it waits).
+        FileKind::Evdev(_) => Err(EINVAL),
 
         FileKind::Synth { data, pos, .. } => {
             let from = at.map_or(*pos, |o| usize::try_from(o).unwrap_or(usize::MAX)).min(data.len());
@@ -499,6 +505,8 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Bpf(_) | FileKind::RemoteBinder(_) => Err(EINVAL),
         // MediaProvider's daemon's replies (to `FUSE_INIT` only: `crate::fuse`).
         FileKind::Fuse(_) => Ok(bytes.len()),
+        // An LED or a force-feedback write: nothing here has either.
+        FileKind::Evdev(_) => Ok(bytes.len()),
         FileKind::Synth { guest, data, pos, .. } => {
             let written = crate::procfs::write_generated(guest, bytes, data)?;
             *pos = 0;
@@ -610,7 +618,7 @@ fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let n = match crate::pipe::end_of(&file) {
         Some((_, true, _)) => return Err(EBADF),
         Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, &mut buf, nonblocking, t)?,
-        None => match crate::poll::read(&file, &mut buf, t).or_else(|| crate::socket::read(&file, &mut buf, t)).or_else(|| crate::fuse::read(&file, &mut buf, t)) {
+        None => match crate::poll::read(&file, &mut buf, t).or_else(|| crate::socket::read(&file, &mut buf, t)).or_else(|| crate::fuse::read(&file, &mut buf, t)).or_else(|| crate::evdev::read(&file, &mut buf, t)) {
             Some(r) => r?,
             None => read_file(&file, &mut buf, None)?,
         },
@@ -883,6 +891,8 @@ pub(crate) fn guest_path_of(file: &OpenFile) -> Vec<u8> {
         FileKind::Bpf(o) => o.describe().as_bytes().to_vec(),
         FileKind::RemoteBinder(_) => b"/dev/binder".to_vec(),
         FileKind::Fuse(_) | FileKind::Dev(DevNode::Fuse) => b"/dev/fuse".to_vec(),
+        FileKind::Evdev(c) => format!("/dev/input/event{}", c.device().number).into_bytes(),
+        FileKind::Dev(DevNode::Input(n)) => format!("/dev/input/event{n}").into_bytes(),
     }
 }
 
@@ -966,6 +976,13 @@ fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     };
     if let Some(g) = gpu {
         return crate::gpu::ioctl(p, t, &g, a[1], a[2]);
+    }
+    let input = match &*file.kind.lock() {
+        FileKind::Evdev(c) => Some(Arc::clone(c)),
+        _ => None,
+    };
+    if let Some(c) = input {
+        return crate::evdev::ioctl(p, &c, a[1], a[2]);
     }
     let fence = match &*file.kind.lock() {
         FileKind::SyncFile(f) => Some(Arc::clone(f)),

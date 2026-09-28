@@ -169,6 +169,8 @@ fn main() -> ExitCode {
                     let options = omni_linux::display_window::Options {
                         title: "omnidroid".into(),
                         control: std::env::var_os("OMNI_WINDOW_CONTROL").map(PathBuf::from),
+                        // OMNI_WINDOW_INPUT=0: the window shows, and Android has no keyboard or mouse.
+                        input: std::env::var("OMNI_WINDOW_INPUT").as_deref() != Ok("0"),
                     };
                     if let Err(e) = omni_linux::display_window::spawn(std::sync::Arc::clone(&fb), std::sync::Arc::clone(&composer), options) {
                         eprintln!("[window] {e}");

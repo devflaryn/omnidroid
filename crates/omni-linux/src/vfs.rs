@@ -212,6 +212,8 @@ pub enum DevNode {
     OmniGpu,
     /// `/dev/fuse` ([`crate::fuse`]).
     Fuse,
+    /// `/dev/input/event<n>`: an input device ([`crate::evdev`]).
+    Input(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,6 +646,11 @@ impl Vfs {
             _ if path.strip_prefix(b"/dev/ashmem").is_some_and(|id| id == crate::procfs::boot_id().as_bytes()) => return Some(Node::Dev(DevNode::Ashmem)),
             b"/dev/omni-gpu" => return Some(Node::Dev(DevNode::OmniGpu)),
             b"/dev/fuse" => return Some(Node::Dev(DevNode::Fuse)),
+            // Input devices, where the embedding made any (`crate::evdev`).
+            b"/dev/input" => return Some(Node::Dir),
+            _ if path.starts_with(b"/dev/input/") => {
+                return crate::evdev::node_number(&path[b"/dev/input/".len()..]).map(|n| Node::Dev(DevNode::Input(n as u16)));
+            }
             b"/proc/self/exe" => return Some(Node::Symlink { target: self.exe.clone() }),
             _ => {}
         }
@@ -760,11 +767,17 @@ impl Vfs {
                 let mut out = Vec::new();
                 let synthetic: &[&[u8]] = match dir.path.as_slice() {
                     b"/" => &[b"dev", b"proc", b"data", b"tmp", b"mnt", b"storage"],
-                    b"/dev" => &[b"null", b"zero", b"random", b"urandom", b"__properties__"],
+                    b"/dev" => &[b"null", b"zero", b"random", b"urandom", b"__properties__", b"input"],
                     b"/proc" => &[b"self"],
                     b"/proc/self" => &[b"exe"],
                     _ => &[],
                 };
+                if dir.path.as_slice() == b"/dev/input" {
+                    for n in 0..crate::evdev::count() {
+                        let name = format!("event{n}").into_bytes();
+                        out.push(DirEnt { ino: ino_of(&child(&name)), kind: DT_CHR, name });
+                    }
+                }
                 for name in synthetic {
                     let path = child(name);
                     if let Some(node) = self.lookup(&path) {

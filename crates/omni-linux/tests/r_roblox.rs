@@ -118,13 +118,13 @@ fn the_apk_is_installed_started_and_draws() {
     // `OMNI_R_AFTER_INSTALL`: shell run once the APK is installed, before its first start (an
     // app-op the APK asks for, granted as its owner would grant it in Settings).
     let after_install = std::env::var("OMNI_R_AFTER_INSTALL").map_or_else(|_| String::new(), |c| format!("{c}; echo \"[r] after install: $?\"; "));
-    // With the display in a resizable host window (`OMNI_WINDOW=1`), the device is set up as a
-    // freely resizable one is: Developer options' "Force activities to be resizable", for every
-    // app (`OMNI_R_RESIZABLE=0` leaves it off). The APK declares `resizeableActivity="false"` on
-    // its application, and without this Android answers a display resize with size-compatibility
-    // mode -- the app kept at its old size, scaled, and a "restart for a better view" button (run
-    // 2026-09-28, 1280x720 -> 817x542) -- rather than a new size for the app to draw at.
-    let resizable = if std::env::var("OMNI_WINDOW").as_deref() == Ok("1") && std::env::var("OMNI_R_RESIZABLE").as_deref() != Ok("0") {
+    // The device is set up as a freely resizable one is: Developer options' "Force activities to
+    // be resizable", for every app (the owner's choice, 2026-09-28; `OMNI_R_RESIZABLE=0` leaves it
+    // off). The APK declares `resizeableActivity="false"` on its application, and without this
+    // Android answers a display resize with size-compatibility mode -- the app kept at its old size,
+    // scaled, and a "restart for a better view" button (run 2026-09-28, 1280x720 -> 817x542) --
+    // rather than a new size for the app to draw at.
+    let resizable = if std::env::var("OMNI_R_RESIZABLE").as_deref() != Ok("0") {
         "settings put global force_resizable_activities 1; echo \"[r] activities resizable\"; "
     } else {
         ""

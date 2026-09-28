@@ -327,6 +327,13 @@ impl Window {
         self.presenter().present_rgba(rgba, width, height)
     }
 
+    /// `-[NSWindow setTitle:]` on the AppKit thread.
+    pub(super) fn set_title(&self, title: &str) -> WindowResult<()> {
+        let (id, title) = (self.id, title.to_owned());
+        on_main(move |_| appkit::set_title(id, &title));
+        Ok(())
+    }
+
     /// A handle presenting from any thread: the window's id, which every call carries to the
     /// AppKit thread -- as this proxy's own calls do -- and which finds nothing once it is closed.
     pub(super) fn presenter(&self) -> Presenter {

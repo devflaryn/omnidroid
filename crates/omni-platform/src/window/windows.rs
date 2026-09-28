@@ -101,7 +101,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
     RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WindowFromPoint, WM_CAPTURECHANGED, WM_CHAR,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
@@ -1362,6 +1362,18 @@ impl Window {
         // invalidation asked for to `wnd_proc` on this thread before it returns (none for a
         // minimised window, which paints when restored); no reference into the state is held.
         unsafe { UpdateWindow(self.hwnd) };
+        Ok(())
+    }
+
+    /// `SetWindowTextW`.
+    pub(super) fn set_title(&self, title: &str) -> WindowResult<()> {
+        let wide: Vec<u16> = title.encode_utf16().chain(core::iter::once(0)).collect();
+        // SAFETY: a live window handle and a NUL-terminated UTF-16 string that outlives the call.
+        if unsafe { SetWindowTextW(self.hwnd, wide.as_ptr()) } == 0 {
+            // SAFETY: no arguments, and `SetWindowTextW` is the last call this thread made.
+            let code = unsafe { GetLastError() };
+            return Err(WindowError::LastError { operation: "set_title", api: "SetWindowTextW", code });
+        }
         Ok(())
     }
 
