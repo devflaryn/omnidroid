@@ -540,7 +540,22 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             2 => install_filter(p, a[2]).map(|()| 0),
             _ => Err(EINVAL),
         },
-        0x5356_4d41 => Ok(0),                    // PR_SET_VMA (names anonymous memory): accepted, ignored
+        // PR_SET_VMA, PR_SET_VMA_ANON_NAME: anonymous memory named `[anon:<name>]`, as
+        // `/proc/<pid>/maps` shows it (ART names its spaces, bionic its allocator's). A range that
+        // is a file's keeps its file's name, as Linux names only anonymous memory.
+        0x5356_4d41 => {
+            if a[1] == 0 && a[4] != 0 && a[3] != 0 {
+                let name = p.mem.read_cstr(a[4], 80)?;
+                let (start, len) = (crate::guest::untag(a[2]), a[3]);
+                if p.mm.name_at(start).is_none() {
+                    let mut label = b"[anon:".to_vec();
+                    label.extend_from_slice(&name);
+                    label.push(b']');
+                    p.mm.label(start, len, &label);
+                }
+            }
+            Ok(0)
+        }
         other => {
             p.refusals.record(format!("prctl option {other:#x}"), t.pc, t.lr);
             Err(EINVAL)

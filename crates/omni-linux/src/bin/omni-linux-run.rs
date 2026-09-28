@@ -180,6 +180,42 @@ fn main() -> ExitCode {
     if let Some(caps) = caps {
         p.sys.set_caps(caps);
     }
+    // OMNI_MEM_TRACE=<seconds>: this host process's commit charge beside its program's guest
+    // memory, every so often -- what the difference (the CPU backend's translations, the runtime's
+    // own heap) costs per host process.
+    if let Some(every) = std::env::var("OMNI_MEM_TRACE").ok().and_then(|v| v.parse::<u64>().ok()) {
+        let space = std::sync::Arc::clone(p.mem.space());
+        let program = std::sync::Arc::clone(&p);
+        let name = argv.iter().find_map(|a| String::from_utf8_lossy(a).strip_prefix("--nice-name=").map(String::from)).unwrap_or_else(|| String::from_utf8_lossy(argv.first().map_or(&[][..], |a| a.as_slice())).into_owned());
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
+            let host = omni_platform::vm::process_commit_charge().unwrap_or(0) >> 20;
+            let s = space.stats();
+            eprintln!(
+                "[mem] {name} host process {}: commit {host} MiB; the program's guest space: committed {} MiB, mapped {} MiB (file {} MiB)",
+                std::process::id(),
+                s.committed >> 20,
+                s.mapped >> 20,
+                s.file_backed >> 20
+            );
+            // The largest committers, by mapping, with the name the guest gave each.
+            let mut by: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+            for r in space.mapped_regions() {
+                *by.entry((r.mapping_start, r.mapping_len)).or_default() += r.committed;
+            }
+            let mut top: Vec<_> = by.into_iter().filter(|(_, c)| *c >= 4 << 20).collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            let names: Vec<String> = top
+                .iter()
+                .take(8)
+                .map(|((start, len), c)| {
+                    let label = program.mm.name_at(*start as u64).map_or_else(|| "anon".into(), |(n, _)| String::from_utf8_lossy(&n).into_owned());
+                    format!("{label} {start:#x}+{}M: {}M", len >> 20, c >> 20)
+                })
+                .collect();
+            eprintln!("[mem] {name} top: {}", names.join("; "));
+        });
+    }
     // An app's host process: the system's properties, as they are now.
     if omni_linux::remote::is_remote() {
         match omni_linux::remote::system_properties() {

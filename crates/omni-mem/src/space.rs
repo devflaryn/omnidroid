@@ -1230,6 +1230,32 @@ impl GuestSpace {
         self.read().regions(false)
     }
 
+    /// The parts of `[address, address + len)` that hold anything: committed private memory and
+    /// file views, in address order, clipped to the range. The rest is free space or a lazy
+    /// mapping's uncommitted granules, which read as zeros by construction -- what a copy of the
+    /// range (the guest's `mremap`) need not touch, and must not, or it commits them.
+    #[must_use]
+    pub fn held_ranges(&self, address: GuestAddr, len: usize) -> Vec<(GuestAddr, usize)> {
+        let inner = self.read();
+        let end = address.saturating_add(len);
+        let mut out: Vec<(GuestAddr, usize)> = Vec::new();
+        for start in inner.map.starts_overlapping(address, len) {
+            let Some(entry) = inner.map.get(start) else { continue };
+            if !matches!(entry.os, OsState::Private { .. } | OsState::View { .. }) {
+                continue;
+            }
+            let (s, e) = (start.max(address), (start + entry.len).min(end));
+            if s >= e {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == s => last.1 += e - s,
+                _ => out.push((s, e - s)),
+            }
+        }
+        out
+    }
+
     /// Every mapped region, as [`mapped_regions`](GuestSpace::mapped_regions) gives them, each
     /// with the [`MapLabel`](crate::MapLabel) of the mapping it belongs to -- who asked for it, as
     /// the [`label_scope`](crate::label_scope) in force when it was mapped said. For a memory

@@ -563,7 +563,8 @@ fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     if fixed && (flags & MREMAP_MAYMOVE == 0 || target % page != 0 || (target < old + old_len && old < target + new_len)) {
         return Err(EINVAL);
     }
-    if !fixed && new_len <= old_len {
+    // Shrinking in place (DONTUNMAP always moves: its point is a second range).
+    if !fixed && !dontunmap && new_len <= old_len {
         if new_len < old_len {
             p.mm.unmap(old + new_len, old_len - new_len)?;
         }
@@ -581,14 +582,22 @@ fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     }
     let flags = 0x22 | if fixed { MAP_FIXED } else { 0 }; // MAP_PRIVATE | MAP_ANONYMOUS
     let at = p.mm.map(p, t, MapRequest { addr: if fixed { target } else { 0 }, len: new_len, prot: PROT_READ | PROT_WRITE, flags, fd: -1, offset: 0 })?;
-    // In pieces: the range may be a GC space of hundreds of MiB.
+    // Only what the old range holds: its committed pages and its file's. Linux moves page-table
+    // entries and touches no page; a copy of every byte read the never-touched pages as zeros and
+    // wrote them, committing the whole range -- ART's concurrent-mark-compact GC moves its 512 MiB
+    // space with MREMAP_DONTUNMAP, and every Java process then held 504 MiB it never used (35 of
+    // them after boot exhausted the host). The new range is fresh anonymous memory: zeros already.
+    // In pieces: a committed run may be a GC space of hundreds of MiB.
     const PIECE: u64 = 16 << 20;
-    let mut done = 0;
-    while done < keep {
-        let n = (keep - done).min(PIECE);
-        let bytes = p.mem.read(old + done, n as usize)?;
-        p.mem.write(at + done, &bytes)?;
-        done += n;
+    let held: Vec<(u64, u64)> = space.held_ranges(old as usize, keep as usize).into_iter().map(|(s, n)| (s as u64, (s + n) as u64)).collect();
+    for (start, end) in held {
+        let mut done = start;
+        while done < end {
+            let n = (end - done).min(PIECE);
+            let bytes = p.mem.read(done, n as usize)?;
+            p.mem.write(at + (done - old), &bytes)?;
+            done += n;
+        }
     }
     if prot != Protection::ReadWrite {
         p.mm.protect(at, new_len, prot_bits(prot))?;
