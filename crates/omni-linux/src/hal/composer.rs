@@ -2,10 +2,13 @@
 //! (AIDL V3), what SurfaceFlinger composes through (D3b design,
 //! `docs/superpowers/specs/2026-09-27-d3b-composer-design.md`).
 //!
-//! One display. The composer composes nothing itself: at validation every layer is changed to
-//! `CLIENT` composition, so SurfaceFlinger's RenderEngine composes all of them (on the host GPU,
-//! D3a) into the client target, and presenting copies the client target's gralloc region (D2) into
-//! the host [`Framebuffer`]. Composition is synchronous, so there are no fences to report.
+//! One display. When every layer of a frame is one it can compose itself (`super::compose`: RGBA
+//! buffers at 1:1 with no transform, solid colours), the composer keeps them `DEVICE` and blends
+//! them from their gralloc regions (D2) into the host [`Framebuffer`] at present: SurfaceFlinger's
+//! RenderEngine draws nothing. Otherwise every layer is changed to `CLIENT`, RenderEngine composes
+//! them (on the host GPU, D3a) into the client target, and presenting copies that target.
+//! `OMNI_COMPOSER_DEVICE=0` makes every frame `CLIENT`. Composition is synchronous, so there are no
+//! fences to report.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -106,6 +109,57 @@ struct Target {
     pixels_at: u64,
 }
 
+/// A buffer a layer has sent in some slot.
+struct LayerBuffer {
+    shm: Arc<Shm>,
+    format: i32,
+    stride: u32,
+    width: u32,
+    height: u32,
+    pixels_at: u64,
+}
+
+/// What the client last set on a layer (a command carries only what changed).
+#[derive(Default)]
+struct LayerState {
+    buffers: HashMap<i32, LayerBuffer>,
+    slot: Option<i32>,
+    frame: Option<common::Rect>,
+    crop: Option<common::FRect>,
+    blend: Option<common::BlendMode>,
+    alpha: Option<f32>,
+    z: i32,
+    transform: Option<common::Transform>,
+    color: Option<[f32; 4]>,
+}
+
+impl LayerState {
+    /// Whether the composer can compose this layer itself as `composition`.
+    fn composable(&self, composition: Composition) -> bool {
+        let Some(frame) = &self.frame else { return false };
+        if frame.right <= frame.left || frame.bottom <= frame.top {
+            return true; // nothing to draw
+        }
+        if composition == Composition::SOLID_COLOR {
+            return self.color.is_some();
+        }
+        if composition != Composition::DEVICE || self.transform.is_some_and(|t| t != common::Transform::NONE) {
+            return false;
+        }
+        let (Some(buffer), Some(crop)) = (self.slot.and_then(|s| self.buffers.get(&s)), &self.crop) else { return false };
+        let (cw, ch) = (crop.right - crop.left, crop.bottom - crop.top);
+        matches!(buffer.format, RGBA_8888 | RGBX_8888 | IMPLEMENTATION_DEFINED)
+            && crop.left >= 0.0
+            && crop.top >= 0.0
+            && crop.left.fract() == 0.0
+            && crop.top.fract() == 0.0
+            && (cw - (frame.right - frame.left) as f32).abs() < 0.01
+            && (ch - (frame.bottom - frame.top) as f32).abs() < 0.01
+            && crop.right <= buffer.width as f32
+            && crop.bottom <= buffer.height as f32
+    }
+}
+
 #[derive(Default)]
 struct State {
     callback: Option<u32>,
@@ -115,6 +169,13 @@ struct State {
     targets: HashMap<i32, Target>,
     current_target: Option<i32>,
     refused_format: Option<i32>,
+    /// Each layer's properties, for the composer's own composition.
+    device: HashMap<i64, LayerState>,
+    /// Whether the frame being presented is the composer's own (`DEVICE`), decided at validation.
+    device_frame: bool,
+    /// Frames presented by each path, for the `[composer]` line.
+    frames_device: u64,
+    frames_client: u64,
 }
 
 pub struct Client {
@@ -146,9 +207,54 @@ impl Client {
         if display == DISPLAY { Ok(()) } else { Err(Status::ServiceSpecific(EX_BAD_DISPLAY)) }
     }
 
-    /// Present the current client target into the framebuffer.
+    /// Present the frame: the composer's own composition of its layers, or the client target.
     fn present(&self) {
         let mut st = self.state.lock();
+        if st.device_frame {
+            st.frames_device += 1;
+            log_paths(&st);
+            let mut order: Vec<(i32, i64)> = st.layers.keys().map(|l| (st.device.get(l).map_or(0, |d| d.z), *l)).collect();
+            order.sort_unstable();
+            // Each buffer layer's pixels, read whole from its region.
+            let mut pixels: HashMap<i64, Vec<u8>> = HashMap::new();
+            for &(_, l) in &order {
+                let Some(d) = st.device.get(&l) else { continue };
+                if st.layers.get(&l) != Some(&Composition::DEVICE) {
+                    continue;
+                }
+                if let Some(b) = d.slot.and_then(|s| d.buffers.get(&s)) {
+                    let mut bytes = vec![0u8; b.stride as usize * b.height as usize * 4];
+                    if b.shm.read_at(&mut bytes, b.pixels_at).is_ok() {
+                        pixels.insert(l, bytes);
+                    }
+                }
+            }
+            let mut layers = Vec::new();
+            for &(_, l) in &order {
+                let Some(d) = st.device.get(&l) else { continue };
+                let Some(f) = &d.frame else { continue };
+                let blend = match d.blend {
+                    Some(common::BlendMode::NONE) => super::compose::Blend::None,
+                    Some(common::BlendMode::COVERAGE) => super::compose::Blend::Coverage,
+                    _ => super::compose::Blend::Premultiplied,
+                };
+                let source = if st.layers.get(&l) == Some(&Composition::SOLID_COLOR) {
+                    super::compose::Source::Color(d.color.unwrap_or_default())
+                } else {
+                    let (Some(b), Some(data), Some(c)) = (d.slot.and_then(|s| d.buffers.get(&s)), pixels.get(&l), &d.crop) else { continue };
+                    super::compose::Source::Pixels { data, stride: b.stride as usize, opaque: b.format == RGBX_8888, crop_x: c.left as usize, crop_y: c.top as usize }
+                };
+                layers.push(super::compose::Layer { source, frame: (f.left, f.top, f.right, f.bottom), blend, alpha: d.alpha.unwrap_or(1.0) });
+            }
+            let mut out = vec![0u8; WIDTH as usize * HEIGHT as usize * 4];
+            super::compose::compose(&mut out, WIDTH as usize, HEIGHT as usize, &layers);
+            drop(layers);
+            drop(st);
+            self.framebuffer.present_rgba(&out, WIDTH);
+            return;
+        }
+        st.frames_client += 1;
+        log_paths(&st);
         let Some(target) = st.current_target.and_then(|slot| st.targets.get(&slot)) else { return };
         if !matches!(target.format, RGBA_8888 | RGBX_8888 | IMPLEMENTATION_DEFINED) {
             if st.refused_format != Some(target.format) {
@@ -174,6 +280,27 @@ impl Client {
         drop(st);
         self.framebuffer.present_rgba(&pixels, stride);
     }
+}
+
+/// Every 600 frames: how many were the composer's own and how many SurfaceFlinger's.
+fn log_paths(st: &State) {
+    if (st.frames_device + st.frames_client) % 600 == 0 {
+        eprintln!("[composer] frames composed here {}, by SurfaceFlinger {}", st.frames_device, st.frames_client);
+    }
+}
+
+/// A layer's buffer a gralloc handle names.
+fn layer_buffer_of(handle: &NativeHandle) -> Option<LayerBuffer> {
+    if handle.fds.len() != 1 || handle.ints.len() != HANDLE_INTS || handle.ints[0] as u32 != 0x4247_4d4f {
+        return None;
+    }
+    let Fd(file) = &handle.fds[0];
+    let shm = match &*file.kind.lock() {
+        FileKind::Shared(m) => Arc::clone(m),
+        _ => return None,
+    };
+    let (width, height, format, stride, pixels_at) = (handle.ints[2] as u32, handle.ints[3] as u32, handle.ints[5], handle.ints[8] as u32, handle.ints[13] as u32 as u64);
+    (stride >= width && pixels_at == PIXELS_AT).then_some(LayerBuffer { shm, format, stride, width, height, pixels_at })
 }
 
 /// The client target a gralloc handle names (D2's 14 ints and one region).
@@ -212,7 +339,9 @@ impl IComposerClientServer for Client {
 
     fn destroy_layer(&self, _ctx: &Ctx<'_>, display: i64, layer: i64) -> Result<(), Status> {
         Self::display(display)?;
-        self.state.lock().layers.remove(&layer).map(|_| ()).ok_or(Status::ServiceSpecific(EX_BAD_LAYER))
+        let mut st = self.state.lock();
+        st.device.remove(&layer);
+        st.layers.remove(&layer).map(|_| ()).ok_or(Status::ServiceSpecific(EX_BAD_LAYER))
     }
 
     fn execute_commands(&self, _ctx: &Ctx<'_>, commands: Vec<DisplayCommand>) -> Result<Vec<CommandResultPayload>, Status> {
@@ -228,6 +357,37 @@ impl IComposerClientServer for Client {
                     if let Some(c) = &layer.composition {
                         st.layers.insert(layer.layer, c.composition);
                     }
+                    let d = st.device.entry(layer.layer).or_default();
+                    if let Some(buffer) = &layer.buffer {
+                        if let Some(b) = buffer.handle.as_ref().and_then(layer_buffer_of) {
+                            d.buffers.insert(buffer.slot, b);
+                        }
+                        d.slot = Some(buffer.slot);
+                    }
+                    for slot in layer.buffer_slots_to_clear.iter().flatten() {
+                        d.buffers.remove(slot);
+                    }
+                    if let Some(f) = &layer.display_frame {
+                        d.frame = Some(f.clone());
+                    }
+                    if let Some(c) = &layer.source_crop {
+                        d.crop = Some(c.clone());
+                    }
+                    if let Some(b) = &layer.blend_mode {
+                        d.blend = Some(b.blend_mode);
+                    }
+                    if let Some(a) = &layer.plane_alpha {
+                        d.alpha = Some(a.alpha);
+                    }
+                    if let Some(z) = &layer.z {
+                        d.z = z.z;
+                    }
+                    if let Some(t) = &layer.transform {
+                        d.transform = Some(t.transform);
+                    }
+                    if let Some(c) = &layer.color {
+                        d.color = Some([c.r, c.g, c.b, c.a]);
+                    }
                 }
                 if let Some(ct) = &cmd.client_target {
                     if let Some(handle) = &ct.buffer.handle {
@@ -242,6 +402,24 @@ impl IComposerClientServer for Client {
                 }
             }
             if cmd.validate_display || cmd.present_or_validate_display {
+                // The composer's own composition when it can take every layer.
+                static DEVICE_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let off = *DEVICE_OFF.get_or_init(|| std::env::var("OMNI_COMPOSER_DEVICE").as_deref() == Ok("0"));
+                let device = {
+                    let mut st = self.state.lock();
+                    let all = !off && !st.layers.is_empty() && st.layers.iter().all(|(l, c)| st.device.get(l).is_some_and(|d| d.composable(*c)));
+                    st.device_frame = all;
+                    all
+                };
+                if device {
+                    if cmd.present_or_validate_display {
+                        results.push(CommandResultPayload::PresentOrValidateResult(PresentOrValidate { display: DISPLAY, result: PresentOrValidate_Result::Validated }));
+                    }
+                    if cmd.present_display {
+                        self.present();
+                    }
+                    continue;
+                }
                 // Every layer is composed by the client.
                 let changed: Vec<ChangedCompositionLayer> = {
                     let mut st = self.state.lock();
