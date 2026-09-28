@@ -537,3 +537,25 @@ fn the_cost_of_admit_single_threaded_and_with_eight_threads() {
         contended[RUNS - 1].0
     );
 }
+
+/// `ensure_committed` of a range already committed -- what the kernel does before every read or
+/// write of a system call's guest memory -- changes nothing, so it must not make the remembered
+/// regions stale: each thread would go back to the lock on every lookup, and every guest memory
+/// access of every thread would serialize on it (MEASURED on the real-AOSP path, 2026-09-28: the
+/// engine's threads' samples parked in `ZwWaitForAlertByThreadId`). A range that does need a
+/// commit still gets one.
+#[test]
+fn ensuring_a_committed_range_keeps_remembered_regions_fresh() {
+    let s = space(64 * MIB);
+    let at = lazy(&s, 4 * MIB);
+    assert!(s.ensure_committed(at, 4096).expect("the first commit") > 0, "a lazy range is committed");
+    assert!(s.region_at(at).is_some());
+    let before = fast_regions();
+    for _ in 0..100 {
+        assert_eq!(s.ensure_committed(at, 4096).expect("already committed"), 0);
+        assert!(s.region_at(at).is_some());
+    }
+    assert!(fast_regions() - before >= 99, "region_at kept answering from the cache: {}", fast_regions() - before);
+    // Beyond what was committed, a commit still happens.
+    assert!(s.ensure_committed(at + 2 * MIB, 4096).expect("a second commit") > 0);
+}

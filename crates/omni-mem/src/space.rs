@@ -858,6 +858,12 @@ impl GuestSpace {
             return Err(MemError::ZeroSize { operation: OP });
         }
         self.check_range(OP, address, len)?;
+        // Already committed -- the common case, the kernel reading a system call's arguments --
+        // changes nothing, so it neither bumps the generation (which makes every thread's
+        // remembered regions stale, sending each `region_at` back to the lock) nor stays long.
+        if !self.read().needs_commit(address, len) {
+            return Ok(0);
+        }
         let mut inner = self.write();
         let committed = inner.commit_range(OP, address, len)?;
         inner.validate();
@@ -1831,6 +1837,22 @@ impl Inner {
     }
 
     /// Commit the granules covering `[address, address + len)` that are not committed yet.
+    /// Whether [`commit_range`](Self::commit_range) of this range would commit anything: some
+    /// entry in it is a mapping's placeholder, accessible.
+    fn needs_commit(&self, address: GuestAddr, len: usize) -> bool {
+        let end = address + len;
+        let mut position = address;
+        while position < end {
+            let Some(start) = self.map.entry_start(position) else { return false };
+            let Some(entry) = self.map.get(start) else { return false };
+            if entry.os == OsState::Placeholder && entry.owner.as_ref().is_some_and(|o| o.protection != Protection::None) {
+                return true;
+            }
+            position = start + entry.len;
+        }
+        false
+    }
+
     fn commit_range(
         &mut self,
         operation: &'static str,
