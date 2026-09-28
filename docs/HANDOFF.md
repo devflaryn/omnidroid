@@ -1,5 +1,149 @@
 # Handoff
 
+## LIGHTER AND FASTER (2026-09-28 night, Windows; `6eff7ff`..`7669317`)
+
+Goal: heavily less RAM, heavily more speed on the real-AOSP path. Measured first, every figure
+below is from a run named in `work/` (logs in `%TEMP%\omni-linux-r-<pid>.log`), Roblox stock APK,
+release, live window, 1280x720.
+
+### Memory: 8.96 GB -> 5.81 GB on Landing (kiosk, the default now)
+
+Per host process, sampled every 30 s from the host (private bytes / working set;
+`scratchpad memsample.ps1` -- `Get-Process` of each `omni-linux-run` by its `--nice-name`):
+
+| device | processes | private | working set | run |
+|---|---|---|---|---|
+| before (runtime `pm disable-user` list only) | 18 | 8.96 GB | 9.8 GB | `perf-base-mem.txt` |
+| lean image (default device) | 15 | 8.13 GB | 8.8 GB | `perf-lean-mem.txt` |
+| **kiosk** (lean + no SystemUI/launcher + no cached processes) | **8** | **5.81 GB** | **6.04 GB** | `perf-kiosk-mem.txt` |
+| kiosk, signed in, in PS99 (loading) | 7 | 7.1 GB | 7.2 GB | `perf-ingame-mem.txt` |
+
+Before: system_server's host process 2.5 GB, Roblox 1.4, SystemUI 0.55, launcher 0.52, Settings
+(FallbackHome) 0.40, and 13 more app processes of 250-320 MB each (media, permission controller,
+phone, IME, network stack, ext services, adservices, SE, shell, webview zygote + service,
+multidisplay, ...). The runtime's `pm disable-user` did not stop **persistent** apps: Android
+never kills a persistent process when its package is disabled (`com.android.se`,
+`com.android.emulator.multidisplay` alive after it). `com.android.phone` was started once, not
+crash-looping (`d36233b` fixed that); it is simply gone now.
+
+What changed (`512cd79`), all Android's own mechanisms:
+- **Apps left out of the image** (`device::LEAVES_OUT`, the way a product build leaves packages
+  out of `PRODUCT_PACKAGES`): telephony (TeleService and the phone-uid apps), SecureElement,
+  MultiDisplayProvider, Bluetooth's feature files, print, backup transport, contacts, calendar,
+  messaging, a phone's own apps. PackageManager never scans them, nothing starts them.
+  Bluetooth, backup and print are also gone from `handheld_core_hardware.xml`, so SystemServer
+  starts none of those services. `OMNI_DEVICE_APPS=full|lean|kiosk` (default lean).
+- **Kiosk from the first boot**: `kiosk` also leaves out SystemUI and Launcher3QuickStep; the
+  home is Settings' FallbackHome. The second boot the old kiosk needed is gone. **`r_roblox` and
+  `tools/aosp_play.ps1` now run the kiosk device by default** (`OMNI_R_KIOSK=0` /
+  `-WithSystemUI`: with them, ~1.1 GB more).
+- **No cached app processes** (`omni_lean.sh`, an init service): ActivityManager's
+  `max_cached_processes 0` -- Developer options' "No background processes" -- and its
+  `no_kill_cached_processes_post_boot_completed_duration_millis` 0 (Android spares cached
+  processes for 10 minutes after boot; the first attempt reaped nothing because of it,
+  `dumpsys activity settings`). `persist.omni.cached_processes=<n>|off`.
+- Kept (measured need): the WebView (Roblox binds `VariationsSeedServer` at start), the IME,
+  MediaProvider (persistent, storage), the network stack, ext services, the package installer.
+- Left at 8: system_server 2.4 GB, Roblox 1.5, IME 0.40, Settings 0.40, media 0.32, network
+  stack 0.28, ext services 0.27, webview zygote 0.25. The next lever is the system host process
+  itself (all of init's ~66 services and system_server in one host process).
+- Gate `tests/lean_image.rs`; r_roblox passes in lean (`perf-lean-run1.txt`) and kiosk
+  (`perf-kiosk-run1.txt`) -- Roblox boots, installs, reaches Landing and draws.
+
+### Speed: in-world PS99 4.0 -> 34.6 fps
+
+**Landing's 0.99 fps is the engine idling, not a stall.** Profiled (`OMNI_SLOW_APP` stacks,
+`OMNI_THREAD_CPU_APP`): the Roblox process used **0.07 cores**; one engine thread (entry near
+`libroblox.so+0x22a3398`) times out a 1000 ms condition wait every second and the engine's main
+thread (`FunctionMarshal`) renders once after it. Every run shows ~25 fps while Landing animates
+in, then 0.99 once the screen is still. Input raises it: the frames follow the input (a scripted
+`move` every 50 ms gave ~4.4 fps only because the window's control file is read every 250 ms,
+`CONTROL_EVERY`). So the Landing number that matters is the animated phase.
+
+**Where a frame went** (`OMNI_GPU_STATS`, per forwarded Vulkan command): ~220 commands per frame at
+~1 us each -- the per-call forwarding is not the cost -- and **`vkQueueSignalReleaseImageANDROID`
+~24 ms**, of which **22.5 ms putting the 1280x720 frame into its gralloc region** and ~1.5 ms the
+GPU wait. Two causes (`246bc9e`):
+1. The staging buffer was `HOST_VISIBLE|HOST_COHERENT` without `HOST_CACHED` -- on NVIDIA that is
+   uncached, write-combined memory, which the CPU reads at a fraction of memory speed. Now
+   host-cached (invalidated when not coherent); writable AHB mirrors likewise.
+2. The region was written (and the composer read it back) with a 3.6 MiB file write/read
+   through the host's file system each frame. Graphics-buffer regions (`Shm::as_graphics_buffer`)
+   now go through a host view of their file (`omni_platform::vm`), a memory copy.
+   `OMNI_SHM_VIEW=0` restores file I/O for comparison.
+
+Release now ~2 ms (0.3-0.7 ms into the buffer). Results:
+
+| screen | before | after | runs |
+|---|---|---|---|
+| Landing, animating in | 25-30 fps (peak) | **52 fps** (peak) | `perf-base-run1`, `perf-cached-run1` |
+| Landing, still | 0.99 (engine idle) | 0.99 (engine idle) | same |
+| signed-in Home | -- | **47 fps** | `perf-ingame-run2` |
+| PS99 join/loading screen | ~4 fps (r26, modified APK) | **40-45 fps** (run 1), 7-18 (run 2) | `perf-ingame-run1/2` |
+| PS99 in-world, after the kick | 4.0 (r26, modified APK) | see below: **34.6 fps** median | `perf-inworld-run1..4` |
+
+**In-world is measured after the emulator kick** (the owner: the client disconnects but goes on
+rendering the scene, so the frame rate is the real one). The world loads for ~30-60 s after
+`onGameLoaded` (0.1-0.3 fps, the engine's workers busy), then renders steadily. Median of the
+5-s `[display]` rates after the kick line, each run ~10 minutes:
+
+| change | median fps | p10 / p90 | n | run |
+|---|---|---|---|---|
+| release fix (`246bc9e`) | 29.0 | 28.0 / 29.8 | 87 | `perf-inworld-run1` |
+| + composer keeps a refilled slot (`c6c7cc8`, below) | 28.5 | 27.9 / 28.7 | 66 | `perf-inworld-run2` |
+| + `ensure_committed` bumps nothing (`348477c`) | 32.9 | 27.1 / 35.5 | 42 | `perf-inworld-run3` |
+| + guest memory checked without the lock (`7669317`) | **34.6** | 33.5 / 35.7 | 42 | `perf-inworld-run4` |
+
+- **The composer** set a layer command's buffer and *then* cleared the command's slots;
+  SurfaceFlinger frees and refills a slot in one command (logged: "slots cleared [1]; this
+  command's buffer: (1, true)", as the app's swapchain is made anew at the join), so that slot
+  held nothing and every third frame went to SurfaceFlinger's own composition (1,474 of 6,000).
+  Clearing first: 32 of 9,600. No fps change -- SurfaceFlinger's work ran beside the app's --
+  but the system process no longer composes a third of the frames.
+- **The guest space's lock.** Every read or write of guest memory by the kernel (a Vulkan call's
+  arguments, each `clock_gettime` result -- ~117k a second) called `ensure_committed`, which took
+  the space's one mutex and bumped the map's generation, making every thread's remembered
+  regions stale, so the next `region_at` everywhere went to the same mutex: all threads'
+  system calls serialized on one lock. Now a committed range bumps nothing (omni-mem), and
+  `guest.rs` does not even ask when its regions (from the thread's cache) are committed. A
+  forwarded Vulkan call's kernel time ~5.6 -> ~2.9 us; `clock_gettime` ~2.6 -> ~0.8 us.
+- In-world memory: 7 host processes, 6.98 GB private (Roblox 2.9 GB).
+
+**What limits it now** (run 4): the engine's render thread (`FunctionMarshal`) is saturated,
+~100% of a core, ~29 ms a frame: ~53% of its samples in translated code, ~40% in system calls.
+Per frame ~2,240 forwarded Vulkan calls at ~1.3 us each (~0.64 us the host driver, ~0.7 us the
+crossing: ~1.6 ms -- batching the `vkCmd*` calls would save at most that), and the release,
+~3.5 ms, of which ~3.1 ms `vkWaitForFences` (which NVIDIA's driver spins in) -- an asynchronous
+release (a real fence handed to the consumer) is the larger forwarding lever. The rest is the
+engine's own code, translated: the old path (omni-android, 47-53 fps in-world) ran bionic's libc
+(memcpy, malloc, ...) natively on the host; this path translates real bionic. That, not the
+graphics forwarding, is the remaining gap.
+
+**Reading OMNI_THREAD_CPU's `kern`**: its samples, now bucketed by host address, sit almost all
+at `ntdll!ZwWaitForAlertByThreadId` -- a thread parked on a host lock or condition variable,
+sampled just after it ran. A high `kern` share mostly means waiting, not handler time (r26's
+"93-96% kern" read as handler cost was this).
+
+Found on the way, not fixed:
+- `mediaextractor` aborts on `timer_create` (ENOSYS: POSIX timers are not implemented) each
+  time MediaProvider's boot scan sniffs a sound file (libmidiextractor's `Watchdog`): 25
+  restarts in one session. bionic's `SIGEV_THREAD` timers need `SI_TIMER` siginfo, so a real
+  implementation, not a stub.
+- `clock_gettime` is a system call here (~117k/s in-world): the `[vdso]` page holds only the
+  signal trampoline, so bionic falls back to `svc`. A real vDSO would remove the crossing.
+
+Regression with everything above (Windows, release): D5 passed (128 s, was 155: the lean image
+boots faster), D8 passed (338 s: app only, chrome shown and hidden, kiosk by a second boot), D7
+passed (153 s); omni-linux `shm`, `guest_mem`, `mm`, `d2_gralloc`, `d3a_gpu`, `lean_image`; omni-mem
+all. Portability: no platform code added -- the views go through `omni_platform::vm`, the rest
+is omni-linux/omni-mem logic; not built off Windows (the goal's rule: Linux/Mac not run).
+
+Diagnostics added (`6eff7ff`): `OMNI_SLOW_SYSCALL_MS` / `OMNI_SLOW_APP=<process>`
+(`OMNI_SLOW_APP_MS`): each system call at least that long, with its frame-pointer chain;
+`OMNI_GPU_STATS=<s>`: per forwarded Vulkan command, calls and host time, with the release split.
+`OMNI_COMPOSER_TRACE=layers` also names a bufferless layer's slot, each slot clear, and any
+buffer handle the composer refuses.
+
 ## ONLY THE APP IN THE WINDOW (2026-09-28 evening, Windows; `68ad3fe`, `904c79f`, `e43f680`)
 
 The live window (and every framebuffer screenshot) now shows **only the app**: no status bar, no
@@ -436,7 +580,9 @@ Read once at start; each announces itself in the log.
 | `OMNI_PAUSE_IN_BACKGROUND=1`, `OMNI_FOLLOW_FOCUS=1` | Android's pause-in-background (default: keep playing, as desktop Roblox) |
 | `OMNI_WINDOW_SIZE=<w>x<h>` | initial window size; on the real-AOSP path, the display's size at boot |
 | `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size`, `key`, `click`, `move`, `wheel`, `chrome show|hide` lines; `OMNI_WINDOW_INPUT=0`: no keyboard or mouse. `r_roblox` sets `force_resizable_activities` by default (`OMNI_R_RESIZABLE=0`: not) |
-| `OMNI_APP_ONLY=0`, `OMNI_R_KIOSK=1` | real-AOSP path: present the whole display, bars and taskbar included (default: only the app); run the app on a device without SystemUI (a second boot). `OMNI_COMPOSER_TRACE=layers` lists each frame's layers |
+| `OMNI_APP_ONLY=0`, `OMNI_R_KIOSK=0` | real-AOSP path: present the whole display, bars and taskbar included (default: only the app); run the app on a device with SystemUI and the launcher (default: the kiosk device, without them, from the first boot). `OMNI_COMPOSER_TRACE=layers` lists each frame's layers |
+| `OMNI_DEVICE_APPS=full\|lean\|kiosk`, `persist.omni.cached_processes=<n>\|off` | real-AOSP path: what the device leaves out of its image (default lean; `device::LEAVES_OUT`); ActivityManager's cached-process limit (default 0, `omni_lean.sh`) |
+| `OMNI_SLOW_APP=<process>` (`OMNI_SLOW_APP_MS`), `OMNI_SLOW_SYSCALL_MS`, `OMNI_GPU_STATS=<s>`, `OMNI_SHM_VIEW=0` | real-AOSP path diagnostics: slow system calls with stacks; per-Vulkan-command calls and host time; graphics buffers through file I/O instead of a view |
 | `OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY`, `OMNI_DEEPLINK` | join a place (the app's own join URL) |
 | `OMNI_GUEST_ENV=K=V,..` | extra guest environment (e.g. `MIMALLOC_PURGE_DELAY`) |
 | `OMNI_FILE_TRACE`, `OMNI_WAIT_TRACE`, `OMNI_PROFILE`, `OMNI_IMPORT_CENSUS=off`, `OMNI_GLES_TIMING` | diagnostics |
@@ -576,11 +722,13 @@ name). Not run on the Mac or Linux since the switch.
 
 ## Open, in order
 
-0. **In-game fps on the real-AOSP path with the app-only composer** (needs the owner's cookie): a
-   PS99 run with `OMNI_COMPOSER_TRACE=layers` -- which layers still go to SurfaceFlinger in a
-   world (r26: ~1/3 of frames), whether the wider composer now takes them, and the fps before and
-   after (r26 baseline 4.0). Also: whether `OMNI_R_KIOSK=1` should become the runtime's default
-   (it costs a second boot, ~1 minute; D8 and Roblox Landing pass with it).
+0. **Real-AOSP speed, next levers** (HANDOFF "LIGHTER AND FASTER", in-world 34.6 fps, the render
+   thread saturated): an asynchronous swapchain release (~3.1 ms/frame of spinning GPU wait; needs
+   a real fence to the consumer), the translated libc (the old path ran bionic's memcpy/malloc
+   natively), a vDSO `clock_gettime` (~117k system calls a second), `vkCmd*` batching (<= ~1.6
+   ms/frame). Memory: the system host process (2.4 GB). `timer_create` for mediaextractor. The
+   old item 0 is answered: in-world frames are the composer's (32 of 9,600 SurfaceFlinger's),
+   and the kiosk device is the default.
 1. **Re-validate on the stock APK in a world** (needs the owner's sign-in): a 30-minute PS99 run
    per host; watch for Roblox's "missing or corrupted files" kick (seen only on the modified
    builds); re-measure what was decoded on 2.739.691 wherever it is still used.
