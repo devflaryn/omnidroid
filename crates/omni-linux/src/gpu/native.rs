@@ -61,6 +61,8 @@ pub(crate) struct NativeImage {
     staging: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     mapped: usize,
+    /// The staging memory is not host-coherent: invalidated before the CPU reads it.
+    invalidate: bool,
     bytes: usize,
     width: u32,
     height: u32,
@@ -106,6 +108,7 @@ pub(crate) fn gralloc_buffer(p: &Process, handle: u64) -> R<(Arc<Shm>, u32, u64)
         FileKind::Shared(m) => Arc::clone(m),
         _ => return Err(CallError::Args),
     };
+    shm.as_graphics_buffer();
     Ok((shm, int(8)?, u64::from(int(13)?)))
 }
 
@@ -200,13 +203,24 @@ fn attach(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, image: vk::Image,
         let mut staging = vk::Buffer::null();
         check(unsafe { vkfn!(t, ID_VK_CREATE_BUFFER, c"vkCreateBuffer", vk::PFN_vkCreateBuffer)(d, &bci, std::ptr::null(), &mut staging) })?;
         unsafe { vkfn!(t, ID_VK_GET_BUFFER_MEMORY_REQUIREMENTS, c"vkGetBufferMemoryRequirements", vk::PFN_vkGetBufferMemoryRequirements)(d, staging, &mut req) };
-        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let staging_memory = allocate(t, d, req.size, info.memory_type(req.memory_type_bits, host)?)?;
+        // The CPU reads every frame out of it: host-cached memory. Uncached (write-combined)
+        // host-visible memory -- what `HOST_VISIBLE | HOST_COHERENT` alone finds first on NVIDIA --
+        // reads at a fraction of memory speed: MEASURED (Windows, RTX 4060, 2026-09-28), a 1280x720
+        // frame took 13-15 ms to copy out of it into a mapped region, against ~1 ms for the copy.
+        let (visible, coherent, cached) = (vk::MemoryPropertyFlags::HOST_VISIBLE, vk::MemoryPropertyFlags::HOST_COHERENT, vk::MemoryPropertyFlags::HOST_CACHED);
+        let (staging_type, invalidate) = match info.memory_type(req.memory_type_bits, visible | coherent | cached) {
+            Ok(i) => (i, false),
+            Err(_) => match info.memory_type(req.memory_type_bits, visible | cached) {
+                Ok(i) => (i, true),
+                Err(_) => (info.memory_type(req.memory_type_bits, visible | coherent)?, false),
+            },
+        };
+        let staging_memory = allocate(t, d, req.size, staging_type)?;
         drop(devices);
         check(unsafe { vkfn!(t, ID_VK_BIND_BUFFER_MEMORY, c"vkBindBufferMemory", vk::PFN_vkBindBufferMemory)(d, staging, staging_memory, 0) })?;
         let mut mapped = std::ptr::null_mut();
         check(unsafe { vkfn!(t, ID_VK_MAP_MEMORY, c"vkMapMemory", vk::PFN_vkMapMemory)(d, staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty(), &mut mapped) })?;
-        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, bytes, width, height, stride, shm, pixels_at })
+        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, invalidate, bytes, width, height, stride, shm, pixels_at })
     }
 }
 
@@ -283,6 +297,7 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     };
     let (device, width, height, stride, staging) = (img.device, img.width, img.height, img.stride, img.staging);
     let (mapped, bytes, shm, pixels_at) = (img.mapped, img.bytes, Arc::clone(&img.shm), img.pixels_at);
+    let (invalidate, staging_memory) = (img.invalidate, img.staging_memory);
     drop(natives);
     let d = vk::Device::from_raw(device);
     let mut devices = gpu.devices.lock();
@@ -362,6 +377,10 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         check(vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences)(d, 1, &fence, vk::TRUE, u64::MAX))?;
         if super::stats::enabled() {
             super::stats::add(super::special::ID_GRALLOC_USAGE + 6, waited.elapsed());
+        }
+        if invalidate {
+            let range = vk::MappedMemoryRange { memory: staging_memory, offset: 0, size: vk::WHOLE_SIZE, ..Default::default() };
+            check(vkfn!(t, ID_VK_INVALIDATE_MAPPED_MEMORY_RANGES, c"vkInvalidateMappedMemoryRanges", vk::PFN_vkInvalidateMappedMemoryRanges)(d, 1, &range))?;
         }
     }
     drop(devices);

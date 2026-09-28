@@ -202,8 +202,14 @@ pub(crate) fn import(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, info: 
     let memory_type_index = {
         let devices = gpu.devices.lock();
         let info = devices.get(&device).ok_or(CallError::Handle(device))?;
+        let has = |i: u32, want: vk::MemoryPropertyFlags| req.memory_type_bits & (1 << i) != 0 && info.memory_types[i as usize].property_flags.contains(want);
+        let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // A mirror the GPU writes is read back by the CPU after each submit: host-cached memory,
+        // which uncached (write-combined) memory reads at a fraction of the speed (`native`).
+        let first = if writable { coherent | vk::MemoryPropertyFlags::HOST_CACHED } else { coherent };
         (0..info.memory_types.len() as u32)
-            .find(|&i| req.memory_type_bits & (1 << i) != 0 && info.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT))
+            .find(|&i| has(i, first))
+            .or_else(|| (0..info.memory_types.len() as u32).find(|&i| has(i, coherent)))
             .ok_or(CallError::Missing("host-visible memory for a linear image"))?
     };
     let dedicated = vk::MemoryDedicatedAllocateInfo { image: vk::Image::from_raw(image), ..Default::default() };

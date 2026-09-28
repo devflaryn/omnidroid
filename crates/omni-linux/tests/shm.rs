@@ -76,3 +76,38 @@ fn a_crossed_region_outlives_its_maker() {
     drop(kept);
     assert!(!path.exists(), "a region never handed over is removed with its maker");
 }
+
+/// A graphics buffer's region is read and written through a host view (`Shm::as_graphics_buffer`):
+/// what goes in that way is the file's, as another host process opening the file sees it, and the
+/// other way round -- and the region can still change size.
+#[test]
+fn a_graphics_buffer_is_read_and_written_through_a_view_the_file_agrees_with() {
+    use omni_linux::shm::Shm;
+    let shm = Shm::create("test-gralloc").unwrap();
+    shm.set_len(4096 + 1280 * 720 * 4).unwrap();
+    shm.as_graphics_buffer();
+    let frame: Vec<u8> = (0..1280 * 720 * 4).map(|i| (i % 251) as u8).collect();
+    assert_eq!(shm.write_at(&frame, 4096), Ok(frame.len()));
+    // Another host process's handle on the same file (as `crate::remote` opens a crossed region).
+    let other = Shm::open_path("test-gralloc", shm.host_path(), shm.len()).unwrap();
+    let mut back = vec![0u8; frame.len()];
+    assert_eq!(other.read_at(&mut back, 4096), Ok(frame.len()));
+    assert!(back == frame, "the view's write is the file's");
+    // The other way: a file write, read through the view.
+    other.write_at(b"generation", 4088 - 2).unwrap();
+    let mut g = [0u8; 10];
+    assert_eq!(shm.read_at(&mut g, 4088 - 2), Ok(10));
+    assert_eq!(&g, b"generation");
+    // A read past the end is short, as a file's is.
+    let mut tail = [0u8; 16];
+    assert_eq!(shm.read_at(&mut tail, shm.len() - 4), Ok(4));
+    // Its size can still change: the view goes with it and is made again.
+    drop(other);
+    shm.set_len(8192).unwrap();
+    assert_eq!(shm.len(), 8192);
+    shm.write_at(b"after", 5000).unwrap();
+    let mut a = [0u8; 5];
+    shm.read_at(&mut a, 5000).unwrap();
+    assert_eq!(&a, b"after");
+    assert_eq!(std::fs::metadata(shm.host_path()).unwrap().len(), 8192);
+}

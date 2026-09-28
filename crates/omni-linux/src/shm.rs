@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::errno::{Errno, EINVAL, EIO};
 
@@ -31,6 +31,62 @@ pub struct Shm {
     /// perhaps after this process lets the region go (a gralloc buffer the allocator made, sent on
     /// to SurfaceFlinger by the app), so the file is then left in place.
     crossed: std::sync::atomic::AtomicBool,
+    /// A graphics buffer's region ([`Shm::as_graphics_buffer`]): read and written through a host
+    /// view of its file rather than a file read or write per call.
+    graphics: std::sync::atomic::AtomicBool,
+    view: RwLock<Option<View>>,
+}
+
+/// A host view of a region's whole file, for [`Shm::read_at`] and [`Shm::write_at`]: a memory copy
+/// where a file read or write went through the host's file system. MEASURED (Windows, Roblox's
+/// Landing, 2026-09-28): the swapchain's release wrote each 1280x720 frame (3.6 MiB) into its
+/// gralloc region in 22.5 ms of the 24 ms it took, and the composer read it back the same way.
+///
+/// Only for a region whose size does not change (a graphics buffer): a view -- even its section
+/// alone -- stops the host shortening the file (`omni_platform::vm::share_file_for_mapping`), and
+/// the view here lives as long as the region, in whichever host process made it.
+struct View {
+    base: usize,
+    size: usize,
+    /// The region's length when it was made.
+    len: u64,
+    /// Kept for the view's life; dropped after it is unmapped.
+    _file: omni_platform::vm::MappableFile,
+}
+
+// SAFETY: `base` names a mapping this value owns; the bytes are shared memory, copied in and out
+// under the region's lock.
+unsafe impl Send for View {}
+unsafe impl Sync for View {}
+
+impl View {
+    fn map(file: &std::fs::File, path: &std::path::Path, len: u64) -> Option<Self> {
+        use omni_platform::vm;
+        let page = vm::page_size();
+        let size = usize::try_from(len).ok()?.div_ceil(page).checked_mul(page)?;
+        let shared = vm::share_file_for_mapping(file.try_clone().ok()?, path).ok()?;
+        let place = vm::reserve_placeholder(size, vm::allocation_granularity()).ok()?;
+        let base = place.base();
+        // SAFETY: `place` is one whole unreplaced placeholder of exactly `size` bytes.
+        if unsafe { vm::map_file(&shared, 0, size, place.as_ptr(), vm::Protection::ReadWrite) }.is_err() {
+            let _ = vm::release(place);
+            return None;
+        }
+        Some(Self { base, size, len, _file: shared })
+    }
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        // SAFETY: `[base, base + size)` is the one view `map` made, and nothing refers into it.
+        let _ = unsafe { omni_platform::vm::unmap_and_release(self.base as *mut u8, self.size) };
+    }
+}
+
+/// `OMNI_SHM_VIEW=0`: graphics buffers are read and written as files too (the old path, to compare).
+fn views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_SHM_VIEW").as_deref() != Ok("0"))
 }
 
 /// A region's host file is opened so it can be mapped executable too, as Linux maps any shared
@@ -62,6 +118,8 @@ impl Shm {
             host_path,
             owned: true,
             crossed: std::sync::atomic::AtomicBool::new(false),
+            graphics: std::sync::atomic::AtomicBool::new(false),
+            view: RwLock::new(None),
         }))
     }
 
@@ -71,7 +129,7 @@ impl Shm {
     /// The file cannot be opened.
     pub fn open_path(name: &str, host_path: &std::path::Path, len: u64) -> Result<Arc<Self>, Errno> {
         let file = executable_access(std::fs::OpenOptions::new().read(true).write(true)).open(host_path).map_err(|_| EIO)?;
-        Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false, crossed: std::sync::atomic::AtomicBool::new(true) }))
+        Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false, crossed: std::sync::atomic::AtomicBool::new(true), graphics: std::sync::atomic::AtomicBool::new(false), view: RwLock::new(None) }))
     }
 
     /// Its host file.
@@ -102,12 +160,52 @@ impl Shm {
         if len > 1 << 34 {
             return Err(EINVAL);
         }
+        // This process's own view goes first (a view stops the host shortening the file); the next
+        // read or write maps the new length.
+        let mut view = self.view.write();
+        *view = None;
         self.file.lock().set_len(len).map_err(|_| EINVAL)?;
         self.len.store(len, Ordering::SeqCst);
         Ok(())
     }
 
+    /// This region is a graphics buffer (a gralloc allocation, made here or received): its size
+    /// never changes, and its pixels are read and written whole every frame, so from now on
+    /// [`read_at`](Self::read_at) and [`write_at`](Self::write_at) go through a host view of it.
+    pub fn as_graphics_buffer(&self) {
+        self.graphics.store(true, Ordering::Relaxed);
+    }
+
+    /// `f` of the host view, made if needed, when this region is a graphics buffer.
+    fn with_view<T>(&self, f: impl FnOnce(&View) -> T) -> Option<T> {
+        if !self.graphics.load(Ordering::Relaxed) || !views_on() {
+            return None;
+        }
+        {
+            let view = self.view.read();
+            if let Some(v) = view.as_ref().filter(|v| v.len == self.len()) {
+                return Some(f(v));
+            }
+        }
+        let mut view = self.view.write();
+        if view.as_ref().is_none_or(|v| v.len != self.len()) {
+            *view = None;
+            *view = View::map(&self.file.lock(), &self.host_path, self.len());
+        }
+        view.as_ref().map(f)
+    }
+
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Errno> {
+        let viewed = self.with_view(|v| {
+            let n = usize::try_from(v.len.saturating_sub(offset)).unwrap_or(usize::MAX).min(buf.len());
+            // SAFETY: `[offset, offset + n)` lies inside the view (`n` is cut at the region's
+            // length), and `buf` holds `n` or more bytes outside it.
+            unsafe { std::ptr::copy_nonoverlapping((v.base + offset as usize) as *const u8, buf.as_mut_ptr(), n) };
+            n
+        });
+        if let Some(n) = viewed {
+            return Ok(n);
+        }
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(offset)).map_err(|_| EIO)?;
         file.read(buf).map_err(|_| EIO)
@@ -118,6 +216,15 @@ impl Shm {
         let end = offset + bytes.len() as u64;
         if end > self.len() {
             self.set_len(end)?;
+        }
+        let viewed = self.with_view(|v| {
+            (end <= v.len).then(|| {
+                // SAFETY: `[offset, end)` lies inside the view; `bytes` is outside it.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (v.base + offset as usize) as *mut u8, bytes.len()) };
+            })
+        });
+        if viewed.flatten().is_some() {
+            return Ok(bytes.len());
         }
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(offset)).map_err(|_| EIO)?;

@@ -491,6 +491,7 @@ fn layer_buffer_of(handle: &NativeHandle) -> Option<LayerBuffer> {
     if stride < width || pixels_at != PIXELS_AT {
         return None;
     }
+    shm.as_graphics_buffer();
     let mut name = [0u8; 128];
     let _ = shm.read_at(&mut name, NAME_AT);
     let name = String::from_utf8_lossy(&name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())]).into_owned();
@@ -508,7 +509,11 @@ fn target_of(handle: &NativeHandle) -> Option<Target> {
         _ => return None,
     };
     let (width, height, format, stride, pixels_at) = (handle.ints[2] as u32, handle.ints[3] as u32, handle.ints[5], handle.ints[8] as u32, handle.ints[13] as u32 as u64);
-    (width > 0 && height > 0 && stride >= width && pixels_at == PIXELS_AT).then_some(Target { shm, format, width, height, stride, pixels_at })
+    let target = (width > 0 && height > 0 && stride >= width && pixels_at == PIXELS_AT).then_some(Target { shm, format, width, height, stride, pixels_at });
+    if let Some(t) = &target {
+        t.shm.as_graphics_buffer();
+    }
+    target
 }
 
 impl IComposerClientServer for Client {

@@ -265,6 +265,7 @@ impl Allocator {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let shm = Shm::create(&format!("omni-gralloc-{id}")).map_err(|_| ())?;
         shm.set_len(PIXELS_AT + bytes).map_err(|_| ())?;
+        shm.as_graphics_buffer();
         let mut name = d.name.clone();
         name.push(0);
         shm.write_at(&name, NAME_AT).map_err(|_| ())?;
