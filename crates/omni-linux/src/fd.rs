@@ -1261,6 +1261,58 @@ fn shorten(file: &std::fs::File, len: u64) -> Result<(), Errno> {
     }
 }
 
+/// `fallocate(fd, mode, offset, len)`. Mode 0 makes `[offset, offset + len)` part of the file (a
+/// longer file reads zeros there, as the kernel's allocation does); `FALLOC_FL_KEEP_SIZE` alone
+/// reserves blocks the host has no need to (the file's size and bytes are unchanged, so success);
+/// `FALLOC_FL_PUNCH_HOLE | KEEP_SIZE` makes the range read zeros. The engine allocates its
+/// `memProfStorage` file this way before mapping it (ENOSYS: "Failed to fallocate ... for mmap").
+fn sys_fallocate(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const KEEP_SIZE: u64 = 1;
+    const PUNCH_HOLE: u64 = 2;
+    let (mode, offset, len) = (a[1], a[2], a[3]);
+    if (offset as i64) < 0 || (len as i64) <= 0 {
+        return Err(EINVAL);
+    }
+    let end = offset.checked_add(len).ok_or(EINVAL)?;
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let kind = file.kind.lock();
+    match (&*kind, mode) {
+        (FileKind::Host { file, sysroot: false, .. }, 0) => {
+            if file.metadata().map_err(|_| EIO)?.len() < end {
+                file.set_len(end).map_err(|_| crate::errno::ENOSPC)?;
+            }
+            Ok(0)
+        }
+        (FileKind::Shared(m), 0) => {
+            if m.len() < end {
+                m.set_len(end)?;
+            }
+            Ok(0)
+        }
+        (FileKind::Host { sysroot: false, .. } | FileKind::Shared(_), KEEP_SIZE) => Ok(0),
+        (FileKind::Host { file, sysroot: false, .. }, m) if m == PUNCH_HOLE | KEEP_SIZE => {
+            use std::io::{Seek, Write};
+            let size = file.metadata().map_err(|_| EIO)?.len();
+            let mut f = file.try_clone().map_err(|_| EIO)?;
+            let was = f.stream_position().map_err(|_| EIO)?;
+            f.seek(std::io::SeekFrom::Start(offset)).map_err(|_| EIO)?;
+            let zeros = vec![0u8; 64 << 10];
+            let mut at = offset;
+            while at < end.min(size) {
+                let n = (end.min(size) - at).min(zeros.len() as u64) as usize;
+                f.write_all(&zeros[..n]).map_err(|_| EIO)?;
+                at += n as u64;
+            }
+            f.seek(std::io::SeekFrom::Start(was)).map_err(|_| EIO)?;
+            Ok(0)
+        }
+        (FileKind::Host { .. } | FileKind::Shared(_), _) => Err(crate::errno::EOPNOTSUPP),
+        (FileKind::Host { .. }, _) => Err(crate::errno::EBADF),
+        (FileKind::Pipe(_) | FileKind::Socket(_), _) => Err(crate::errno::ESPIPE),
+        _ => Err(crate::errno::ENODEV),
+    }
+}
+
 fn sys_ftruncate(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     match &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
         FileKind::Host { file, sysroot: false, .. } => shorten(file, a[1]).map(|()| 0),
@@ -1536,6 +1588,7 @@ pub fn install(table: &mut Table) {
     table.set(nr::RENAMEAT, sys_renameat);
     table.set(nr::RENAMEAT2, sys_renameat2);
     table.set(nr::FTRUNCATE, sys_ftruncate);
+    table.set(nr::FALLOCATE, sys_fallocate);
     table.set(nr::PWRITE64, sys_pwrite64);
     table.set(nr::SENDFILE, sys_sendfile);
     table.set(nr::PREADV, sys_preadv);

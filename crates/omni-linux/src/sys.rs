@@ -794,6 +794,11 @@ fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
     let own = target == i64::from(t.tid) || target == i64::from(p.sys.pid) || target == 0 || target == -1;
     let tid = if own { t.tid } else { i32::try_from(target).map_err(|_| ESRCH)? };
     if !own && !p.tids().contains(&tid) {
+        // An app launched in a host process of its own (`crate::zygote`), by its pid or its
+        // process group's (`kill(-pid)`): ActivityManager ending it.
+        if crate::zygote::signal(tid.abs(), sig as i32).is_some() {
+            return if (0..=64).contains(&sig) { Ok(0) } else { Err(EINVAL) };
+        }
         // A child of this process (vold's, installd's): the signal is its to act on.
         let child = p.family.child(tid).ok_or(ESRCH)?;
         if sig != 0 {

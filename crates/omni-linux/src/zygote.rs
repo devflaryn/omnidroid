@@ -136,6 +136,25 @@ fn answer(args: &[String], launcher: &Launcher) -> Option<Vec<u8>> {
     Some(reply)
 }
 
+/// The app processes launched here and still running, by the pid the system gave each.
+static CHILDREN: parking_lot::Mutex<std::collections::BTreeMap<i32, Arc<parking_lot::Mutex<std::process::Child>>>> =
+    parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+/// A signal to an app process launched here, which lives in a host process of its own: `None` if
+/// `pid` is not one. SIGKILL and SIGTERM (whose default action ends the process) end its host
+/// process -- ActivityManager's `kill` of an app it stops (`am force-stop`, a restart), which
+/// otherwise "refused to die"; signal 0 answers that it lives; any other is accepted and not
+/// delivered (SIGQUIT's ANR traces, SIGUSR1's heap profile), which the app's host process would
+/// need to be told of.
+pub fn signal(pid: i32, sig: i32) -> Option<()> {
+    let child = CHILDREN.lock().get(&pid).cloned()?;
+    if matches!(sig, 9 | 15) {
+        eprintln!("[zygote] pid {pid}: signal {sig}, its host process ended");
+        let _ = child.lock().kill();
+    }
+    Some(())
+}
+
 /// Launch `class args...` in a host process of its own; the pid it runs under.
 fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String]) -> Option<i32> {
     let pid = crate::process::reserve_pid();
@@ -166,10 +185,20 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     eprintln!("[zygote] launching {} as pid {pid} uid {uid}: {}", nice.unwrap_or("?"), class_and_args.join(" "));
     match cmd.spawn() {
         Ok(child) => {
-            // Reaped by a thread of its own; the app's end reaches the system through binder.
+            // Reaped by a thread of its own; the app's end reaches the system through binder. Kept
+            // by pid meanwhile, for a signal the system sends it (`signal`).
+            let child = Arc::new(parking_lot::Mutex::new(child));
+            CHILDREN.lock().insert(pid, Arc::clone(&child));
             std::thread::spawn(move || {
-                let mut child = child;
-                let status = child.wait();
+                let status = loop {
+                    match child.lock().try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) => {}
+                        Err(e) => break Err(e),
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                };
+                CHILDREN.lock().remove(&pid);
                 eprintln!("[zygote] pid {pid} ended: {status:?}");
             });
             Some(pid)

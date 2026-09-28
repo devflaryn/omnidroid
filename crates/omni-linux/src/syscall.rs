@@ -21,7 +21,7 @@ pub mod nr {
         SYMLINKAT = 36 => "symlinkat", STATFS = 43 => "statfs", FSTATFS = 44 => "fstatfs",
         FACCESSAT = 48 => "faccessat", FCHMOD = 52 => "fchmod", FCHMODAT = 53 => "fchmodat",
         FCHOWNAT = 54 => "fchownat", FCHOWN = 55 => "fchown", CHDIR = 49 => "chdir", FCHDIR = 50 => "fchdir",
-        FTRUNCATE = 46 => "ftruncate", OPENAT = 56 => "openat", CLOSE = 57 => "close", PIPE2 = 59 => "pipe2",
+        FTRUNCATE = 46 => "ftruncate", FALLOCATE = 47 => "fallocate", OPENAT = 56 => "openat", CLOSE = 57 => "close", PIPE2 = 59 => "pipe2",
         GETDENTS64 = 61 => "getdents64", LSEEK = 62 => "lseek", READ = 63 => "read",
         WRITE = 64 => "write", READV = 65 => "readv", WRITEV = 66 => "writev",
         PREAD64 = 67 => "pread64", PWRITE64 = 68 => "pwrite64", PREADV = 69 => "preadv", PWRITEV = 70 => "pwritev", SENDFILE = 71 => "sendfile", PSELECT6 = 72 => "pselect6", PPOLL = 73 => "ppoll", INOTIFY_INIT1 = 26 => "inotify_init1", INOTIFY_ADD_WATCH = 27 => "inotify_add_watch", INOTIFY_RM_WATCH = 28 => "inotify_rm_watch", EVENTFD2 = 19 => "eventfd2", EPOLL_CREATE1 = 20 => "epoll_create1", EPOLL_CTL = 21 => "epoll_ctl", EPOLL_PWAIT = 22 => "epoll_pwait", TIMERFD_CREATE = 85 => "timerfd_create", TIMERFD_SETTIME = 86 => "timerfd_settime", TIMERFD_GETTIME = 87 => "timerfd_gettime",

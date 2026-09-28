@@ -35,3 +35,27 @@ fn a_mapped_file_is_shortened_and_reads_zeros_past_its_end() {
     assert!(p.mem.read(map as u64 + 3, 64).unwrap().iter().all(|b| *b == 0), "the mapping reads zeros past the end");
     let _ = std::fs::remove_dir_all(&data);
 }
+
+/// `fallocate(fd, 0, offset, len)` makes the range part of the file, reading zeros; the engine
+/// allocates its `memProfStorage` file so before mapping it ("Failed to fallocate ... errno
+/// (Function not implemented)" while it was ENOSYS).
+#[test]
+fn fallocate_makes_the_range_part_of_the_file() {
+    let data = std::env::temp_dir().join(format!("omni-fallocate-{}", std::process::id()));
+    std::fs::create_dir_all(&data).unwrap();
+    let m = manifest::parse("d\t755\t/\n").unwrap();
+    let vfs = Vfs::new(Sysroot::from_manifest(&std::env::temp_dir(), m), vec![(b"/data".to_vec(), data.clone())], b"/x".to_vec());
+    let p = Process::for_tests(vfs, Output::Capture(Default::default()));
+    let mut t = p.test_task();
+    let s = p.scratch();
+    p.mem.write(s, b"/data/memProfStorage.json\0").unwrap();
+    let fd = p.syscall(&mut t, nr::OPENAT, [(-100i64) as u64, s, 2 | 0o100, 0o600, 0, 0]) as u64;
+    assert_eq!(p.syscall(&mut t, nr::FALLOCATE, [fd, 0, 0, 102_400, 0, 0]) as i64, 0);
+    assert_eq!(std::fs::metadata(data.join("memProfStorage.json")).unwrap().len(), 102_400);
+    // KEEP_SIZE: success, the size unchanged.
+    assert_eq!(p.syscall(&mut t, nr::FALLOCATE, [fd, 1, 0, 1 << 20, 0, 0]) as i64, 0);
+    assert_eq!(std::fs::metadata(data.join("memProfStorage.json")).unwrap().len(), 102_400);
+    let map = p.syscall(&mut t, nr::MMAP, [0, 102_400, 3, 1, fd, 0]) as i64;
+    assert!(map > 0, "mmap of the allocated file: {map}");
+    let _ = std::fs::remove_dir_all(&data);
+}
