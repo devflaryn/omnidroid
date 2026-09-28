@@ -60,8 +60,18 @@ Fixed on the way (phase 2), each with a test that fails without it:
   window; status and task bars drawn) and presented frames nearly stop once the native activity
   shows (~500 in total, then ~1/min): the engine does not present. Under investigation (r9: the
   app's syscalls traced).
-- `--cookie`: planted `ok` into the app's own Chromium `Cookies` store (r8), but force-stop did not
-  kill the app then (fixed in `b1a8f08`, not yet re-run). No `DID_LOG_IN` yet.
+- **`--cookie`: signed in (r10, 02:13 guest time).** Planted into the app's own Chromium `Cookies`
+  store, `am force-stop` now ends the app (`[zygote] pid 172000: signal 9`), the fresh process
+  (pid 196000) calls `initializeLuaAppWithLoggedInUser` and the engine logs
+  `onDataModelNotification() type:DID_LOG_IN data:{"username":"HeZmI_ImYu1080",...,
+  "countryCode":"TR","userId":5457009831}`. After it: **0** HTTP 401/403 and no logout line in the
+  log. Evidence: `work/overnight/r10-signin-markers.txt`, `work/overnight/r10.log` (untracked).
+- `--place` (r10): the deep link `roblox://experiences/start?placeId=8737899170` was delivered to
+  `ActivityProtocolLaunch` (`am start` 0), but the app was killed ~60 s later: ANR "Input
+  dispatching timed out" -- its main thread waited 50 s in a binder call on a system_server stalled
+  by ActivityManager retrying the WebView zygote's socket (2,402 x "Got error connecting to zygote").
+  Fixed below the framework in `9724db0` (abstract unix sockets across host processes); r11 re-runs
+  it.
 
 Cause (phase 1): every guest process asks for the same low range; system_server holds it,
 reserved *around* the host's pieces there, host threads' 1 MiB stacks among them. When such a
