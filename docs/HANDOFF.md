@@ -50,6 +50,23 @@ Fixed on the way (phase 2), each with a test that fails without it:
   contacts provider. `b1a8f08` kill(2) of an app in its own host process ("refused to die":
   `am force-stop` never stopped Roblox, so the planted cookie was never read); fallocate(2).
 
+### r11/r12 (2026-09-28 02:28-03:00 guest time): signed-in Home on the display, the game joined
+
+- **The engine draws on the host display**: `work/overnight/r12-home-signed-in.png` -- Roblox's
+  signed-in Home (HeZmI_ImYu1080, Turkish UI: "Ana Sayfa", "Arkadaşlar (10)", game tiles), 12,189
+  distinct colours, 66.5% #101010. The black window of r8 was system_server stalled by the WebView
+  zygote's socket (`9724db0`).
+- **The game joined**: r12 `GameJoinLoadTime ... join_time:1.856, referral_page:DeepLink,
+  placeid:8737899170, userid:5457009831`; `! Joining game ... place 8737899170`; RakNet to
+  128.116.5.33 "Handshake complete", "Connection accepted", "Replicator created"; PS99's own client
+  scripts ran (`✅ CLIENT | _L took 1818ms to initialize!`, `[MiningFrontend] inMine=false`, server
+  `RobloxGitHash: ef44663a...`). Markers: `work/overnight/r12-join-markers.txt`.
+- **No `onGameLoaded`**: 2.3 s into the game the app's activity was relaunched (the app applied the
+  account's locale tr_tr on an en-US device; ActivityNativeMain's configChanges 0xfb0 has no
+  locale), its Java game session ended ("Ending game session with place ID 8737899170") and the
+  UI went back to Home while the engine stayed in the server. The test device now boots in the
+  account's locale (`persist.sys.locale=tr-TR`, as the owner's phone) and joins 45 s after sign-in.
+
 ### Phase 2/3 state (r8, 2026-09-28 01:31 guest time)
 
 - With the network: `ActivityNativeMain` displayed (+6.6 s); the engine's **own Vulkan** on the RTX

@@ -82,7 +82,7 @@ fn the_apk_is_installed_started_and_draws() {
     // `OMNI_R_PLACE=<id>`: once signed in, the place's deep link, as a link opened on a device.
     let join = std::env::var("OMNI_R_PLACE").ok().map_or_else(String::new, |id| {
         format!(
-            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 20; \
+            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 45; \
              am start -a android.intent.action.VIEW -d 'roblox://experiences/start?placeId={id}' -n com.roblox.client/com.roblox.client.ActivityProtocolLaunch; \
              echo \"[r] join intent for {id}: $?\"; "
         )
@@ -124,7 +124,14 @@ fn the_apk_is_installed_started_and_draws() {
          {sign_in}{join}{extra}"
     );
     let kept = instance.clone();
-    let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote"], &then);
+    // The device's language: the account's (`OMNI_R_LOCALE`, default tr-TR -- the owner's accounts
+    // are Turkish). The app applies the account's locale to itself once signed in; on a device in
+    // another language that is a configuration change ActivityNativeMain does not handle
+    // (configChanges 0xfb0 leaves locale out), and the relaunch ended the game session the deep link
+    // had just started (r12: "Updating App configuration based on locale tr_tr", then "Schedule
+    // relaunch activity", "Ending game session with place ID 8737899170").
+    let locale = format!("persist.sys.locale={}", std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into()));
+    let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote", "--setprop", &locale], &then);
     let expect: Vec<String> = std::env::var("OMNI_R_EXPECT")
         .unwrap_or_else(|_| "[zygote] launching com.roblox.client|frames presented".into())
         .split('|')
