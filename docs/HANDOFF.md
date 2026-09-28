@@ -38,6 +38,31 @@ Fixed on the way (phase 2), each with a test that fails without it:
   session's log reached 2.4 GB and filled C:); it is declared and not started, as on a device
   without a radio. C4 logs 4 MB -> 1.2 MB. 3/3 C4 boots after both merges: ready in 70-84 s.
 
+- `7f1bde0` binder: BC_FREE_BUFFER freed the memory before removing the buffer's record; a
+  transaction delivered into the reused address replaced the record, and SurfaceFlinger's composer
+  callback node wedged ("101,312 oneway calls wait on node 85 ... the one out: none found", boot
+  stalled). 5/5 C4 boots after: 0 stall lines (before: 1 of 3 C4 + r5).
+- `e8e3461` mremap: ART's CMC GC moves its 512 MiB space with MREMAP_DONTUNMAP; the byte copy
+  committed all of it. Idle app host process 765 -> 263 MiB (guest 636 -> 135), system_server
+  2,971 -> 2,486 MiB (`OMNI_MEM_TRACE`). Two sessions (r4, r6) had been stopped by Claude Code's
+  low-memory reaper before it.
+- `1792321` ftruncate of a mapped file (SQLite `-shm`): `SQLITE_IOERR_SHMOPEN` killed the
+  contacts provider. `b1a8f08` kill(2) of an app in its own host process ("refused to die":
+  `am force-stop` never stopped Roblox, so the planted cookie was never read); fallocate(2).
+
+### Phase 2/3 state (r8, 2026-09-28 01:31 guest time)
+
+- With the network: `ActivityNativeMain` displayed (+6.6 s); the engine's **own Vulkan** on the RTX
+  4060 through `vulkan.omni.so` ("Vulkan Device: NVIDIA GeForce RTX 4060", "swapchain images 3
+  present mode 2 format 37 size 1280x720", 2,919 shaders loaded); `SingleSurfaceApp` reaches
+  `stage:LuaApp`; HTTPS answered by Roblox (401 "Authentication required to access Asset" while
+  signed out). **But the app's surface is black** (r8 shots 0008-0068: 92.2% #000000 = the whole
+  window; status and task bars drawn) and presented frames nearly stop once the native activity
+  shows (~500 in total, then ~1/min): the engine does not present. Under investigation (r9: the
+  app's syscalls traced).
+- `--cookie`: planted `ok` into the app's own Chromium `Cookies` store (r8), but force-stop did not
+  kill the app then (fixed in `b1a8f08`, not yet re-run). No `DID_LOG_IN` yet.
+
 Cause (phase 1): every guest process asks for the same low range; system_server holds it,
 reserved *around* the host's pieces there, host threads' 1 MiB stacks among them. When such a
 thread exited, its stack was the only free piece, and the next process's space "succeeded" with
