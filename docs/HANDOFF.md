@@ -1,5 +1,134 @@
 # Handoff
 
+## PLAYABLE INPUT, LIGHTER, FASTER (2026-09-28/29 night, Windows; `5d01e0e`..`f664bc4`)
+
+Goal (owner): input unplayable (mouse captured on click, Right Ctrl to release; a click took 5-7 s;
+input dropped in-world fps below 10), memory ~6-7 GB, CPU. Runs: `work/inworld*-run.txt`,
+`work/inworld*-mem.txt` (host private bytes per process every 30 s), logs
+`%TEMP%\omni-linux-r-<pid>.log`. APKs: run 1 the owner's modified 2.738.1397
+(`Desktop/Omni Apps/omnidroid/Roblox-2.738.1397.apk`); from run 3 on
+**`Downloads/Roblox-2.739.691.apk`** at the owner's word (2.738 is no longer accepted by Roblox's
+servers: run 2 never joined). 2.739.691 is kicked ~80 s in (error 305, "emulator"); the scene keeps
+rendering behind the dialog and in-world fps is measured after the kick, as before.
+
+| | start of session (run 1, 2.738) | end (run 7, 2.739.691) |
+|---|---|---|
+| mouse | captured on a click, Right Ctrl releases | free, absolute; held only while the app holds the pointer capture |
+| a key, event -> handled by the app | p50 ~1-4 s, max 5.3 s | **p50 4.2-5.5 ms**, max 13 ms |
+| a click | same queue as the keys (seconds) | **p50 5.1-7.0 ms**, max 16 ms |
+| 1000 Hz mouse flood | fps < 10 (owner) | p50 5-16 ms, max 28 ms; fps 52 -> 46-48 |
+| in-world fps, median after the kick | 34.5 (p10 33.9, n=108) | **57.1** (p10 55.6, n=144) |
+| private bytes, all host processes | 7.36 GB (8 processes) | **5.11 GB** (7) |
+| system host process | 2.61 GB, 67 init services | 1.69 GB, 46 init services |
+
+### Input
+
+- **The mouse is free and absolute** (`window_input`, `inject`). The host cursor's position is the
+  app's pointer. Android has no absolute mouse device (CursorInputMapper is relative, with its
+  own acceleration), so the host injects the mouse's MotionEvents itself:
+  `IInputManager.injectInputEvent` (transaction 11, read from the image's `IInputManager$Stub.
+  getDefaultTransactionName` switch), as binder client uid 1000, one way, in CursorInputMapper's
+  order (BUTTON_RELEASE, DOWN/UP/MOVE/HOVER_MOVE, BUTTON_PRESS, HOVER_MOVE after UP, SCROLL),
+  `MotionEvent::writeToParcel`'s AOSP 15 layout (LineageOS 22.1 mirror; `PointerCoords` bits are
+  `BitSet64`, bit n = `0x8000000000000000 >> n` -- the first attempt put every click at 0,0).
+  A guest-side injector (Java, app_process) was tried first and cannot run: a second ART in the
+  system's host process finds no low 4 GiB (system_server holds it) -- the same reason `svc`
+  aborts there.
+- **Held only while the app holds Android's pointer capture**: `input_channel` reads the
+  dispatcher's `CAPTURE` message on the window's input channel (`InputMessage`, type 4); then
+  the host window captures, raw motion goes to the relative evdev mouse (`SOURCE_MOUSE_RELATIVE`,
+  what `onCapturedPointer` gets). Focus loss frees it (Alt+Tab); focus back retakes it if the app
+  still holds it. No Right Ctrl. `OMNI_HOST_CURSOR=hide` hides the host cursor over the window
+  (default shown).
+- **Coalesced**: a moving pointer at most every 8 ms (`OMNI_POINTER_HZ`), captured motion summed,
+  a press carries its position. The old held mouse sent one evdev packet per raw-input batch into
+  a 4096-event queue that translated InputReader drained slower than it filled.
+- **The 5-7 s**: every key went to the IME first (`ImeInputStage`) and the IME's answers were
+  lost: `Timeout waiting for IME to handle input event after 2500 ms`, `spent 2501ms processing
+  KeyEvent`, and the dispatcher held pointer events behind the waiting keys. Cause, in `remote`/
+  `relay`: InputMethodManagerService hands the app a dup of the IME session's channel at every
+  `startInput`; each crossing became a separate local end with its own relay, all taking turns at
+  the one queue in the system process, so replies went to ends the app had let go. Now an end
+  that crosses to the same host process again is that same end (`crossing_id`), as a dup of one
+  socket is one socket (`remote::tests::an_end_that_crosses_twice_is_one_end_and_loses_nothing`).
+- **Latency is measured in the kernel** (`input_channel`): each KEY/MOTION's event time to the
+  app's FINISHED on the same channel: `[input] N events answered ... p50/p90/max; presses (n) ...;
+  keys (n) ...` every 5 s while there is input.
+- Gate `tests/d7_window_input.rs` rewritten: absolute clicks exact at (400,300) and (1000,150),
+  hover, wheel, the probe's pointer capture round trip (C/R keys; `captured ... source 0x20004 rel
+  30,-10`), a 1000 Hz flood's latency line. Probe app: C requests, R releases the capture.
+
+### Kernel
+
+- **Wait queues by key** (`poll`): pipes, socket pairs, bound sockets, eventfd, timerfd, a
+  binder process's work, evdev devices notify their own key; epoll/ppoll/read/binder/relay waiters
+  register the keys they wait on before they look. Unkeyed changes still wake everyone (unconverted
+  sites keep the old semantics). Boot: 10.8k/30.4k/77k wake-ups/s -> 3.1k/6.8k/24.9k at the same
+  phases (`OMNI_POLL_STATS=<s>`). Much of what remains is the 50 ms signal slice.
+- **vDSO** (`vdso`, `device/src/vdso/`): `__kernel_clock_gettime/gettimeofday/clock_getres/
+  rt_sigreturn` over `CNTVCT_EL0` and a data page; `AT_SYSINFO_EHDR`. The system calls compute
+  CLOCK_MONOTONIC from the same counter (`sys::counter_ns`, `counter_offset`) and CLOCK_REALTIME
+  as monotonic + the instance's origin, so both paths are one function of time (`tests/vdso.rs`:
+  libc 53 ns vs the call 153 ns idle; interleaved reads never go back).
+- **POSIX timers** (`timer`): create/settime/gettime/getoverrun/delete, SIGEV_SIGNAL/THREAD_ID/NONE;
+  a timer's `SI_TIMER` siginfo queued per thread and taken by delivery or `rt_sigtimedwait` (bionic's
+  SIGEV_THREAD helper checks exactly that); overruns counted while the signal waits
+  (`tests/timers.rs`). mediaextractor's `timer_create` restarts are gone.
+
+### Speed: 34.5 -> 57.1 fps in-world
+
+- **Asynchronous swapchain release** (`gpu::native`): `vkQueueSignalReleaseImageANDROID`
+  submits the copy and returns; a worker waits for the fence (NVIDIA spins in it: ~3.1 ms a frame
+  on the render thread) and copies into the region; the region's metadata page carries the pending
+  generation (`PENDING_GENERATION_AT` 4080) that the composer and the AHB mirrors wait on
+  (`wait_written`, 50 ms at most). An image's next release and its destruction wait for its copy.
+- **Confound, said plainly**: the async release and the APK switch landed in the same run (run 5:
+  52.9 fps). 2.739.691 was not measured on this path without it. The render thread is still the
+  limit (FunctionMarshal ~1 core; its workers mostly waiting).
+- Not done (next levers, unchanged from before): `vkCmd*` batching (<= ~1.6 ms/frame at 34 fps;
+  less now), translated bionic memcpy/malloc (the old path ran them natively).
+
+### Memory: 7.36 -> 5.11 GB
+
+- **Lean hardware** (`device::HARDWARE_LEFT_OUT`, on in `lean` and `kiosk`; `OMNI_DEVICE_APPS=
+  lean-hw` keeps it): the HALs of hardware the device lacks -- camera providers, fingerprint/face
+  (the emulator's fingerprint HAL aborted every boot: QEMU pipe), Bluetooth, USB, context hub,
+  identity, lights, vibrator, power stats, thermal mock, GNSS, goldfish codec2/allocator 3/hwc3,
+  atrace -- and incidentd, storaged, update_verifier, misctrl, each with its VINTF fragment and
+  feature files. **cameraserver stays**: without it Roblox's engine waits for `media.camera` and
+  its display stalled (run 4). 67 -> 46 init services, system host process 2.61 -> 2.12 GB (run 2).
+- **Whole-page file views** (`mm`): a mapping reaching the end of a file whose size is not a page
+  multiple asked for a rounded-up view, which a read-only view may not do, and silently fell back
+  to a private copy of the whole file -- ICU data (26 MiB, twice per ART process), fonts, APKs,
+  vdex. Now the whole pages are the view and only the partial last page is copied
+  (`tests/mm.rs::a_file_mapping_is_a_view_of_its_whole_pages_and_copies_only_the_last`). Idle app
+  guest memory 135-150 -> 58-78 MiB. Installed apps' `lib/*.so` are views too (libroblox.so was
+  98 MiB private); only those -- a live view blocks installd's rename of a staging directory
+  (`INSTALL_FAILED_INSUFFICIENT_STORAGE`, run 3, when every `/data/app` file was a view).
+- **Translation trimming** (`code_trim`): a guest process quiet for a minute (< 1 MiB newly
+  translated) holding > 24 MiB of translations has them dropped (`clear_code_cache`, patch 0022),
+  given back once its threads leave generated code; never in a busy host process (the game's) nor
+  SurfaceFlinger; at most every 10 min (`OMNI_CODE_TRIM=0`). system_server 219 -> 14 MiB, idle
+  apps 66-91 -> ~15-35 MiB. No fps cost measured (57.1).
+- `omni_lean` confirms both settings (run 5 got "post-boot grace null ms" and Android kept its
+  10-minute grace for cached processes: 12 host processes).
+- Where it is now (run 7): Roblox 2.88 GB (engine mimalloc heaps ~1.55 GB, translations 234 MiB,
+  the rest mostly the host GPU driver's), system host 1.69 GB (65 guest processes: guest 359 MiB,
+  translations 461 MiB -- SurfaceFlinger 59, the rest small services near one region each),
+  Settings/FallbackHome 197 MB, media module 139, network stack 118, IME 107, ext services 105.
+  A custom minimal AOSP image was not built: the lean device leaves out at the image level
+  (packages, HALs, features) what such a build would, on the pinned image.
+- `OMNI_MEM_TRACE=<s>` now also prints every guest process of the host process (guest memory +
+  translations).
+
+### Found, not fixed
+
+- SurfaceFlinger logs `trackPendingFrame: Invalid present fence` every frame (the host composer
+  answers -1); pre-existing, ~25k lines a run.
+- `svc` (app_process) aborts in the system host process (no low 4 GiB); the setup's `svc power
+  stayon` never ran. Pre-existing.
+- D7's FORTIFY `pthread_mutex_lock called on a destroyed mutex` (2 lines each run), pre-existing.
+
 ## LIGHTER AND FASTER (2026-09-28 night, Windows; `6eff7ff`..`7669317`)
 
 Goal: heavily less RAM, heavily more speed on the real-AOSP path. Measured first, every figure
@@ -302,6 +431,10 @@ D5 (no window) passed in 149 s; `omni-platform` lib 202/202, `window_live` 11/11
 
 ### Keyboard and mouse in the live window (`e489061`, same day)
 
+**Superseded for the mouse (2026-09-29)**: it is free and absolute now, held only while the app
+holds the pointer capture, and there is no Right Ctrl ("PLAYABLE INPUT, LIGHTER, FASTER"). The
+placement below (`PLACE_GAIN`) is gone.
+
 The window's keyboard and mouse are now **the device's**, through Android's real input stack:
 - **Kernel** (`crate::evdev`): `/dev/input/event0` (keyboard) and `event1` (mouse) as the evdev
   driver presents them -- listed, per-open queues of arm64 `input_event`s on the instance's
@@ -579,9 +712,10 @@ Read once at start; each announces itself in the log.
 | `OMNI_JIT_CACHE_MB`, `OMNI_JIT_EXCLUSIVE_MONITOR=global`, `OMNI_JIT_OPTIMIZATIONS` | per-thread cache size; the old monitor (D31); dynarmic optimization mask |
 | `OMNI_PAUSE_IN_BACKGROUND=1`, `OMNI_FOLLOW_FOCUS=1` | Android's pause-in-background (default: keep playing, as desktop Roblox) |
 | `OMNI_WINDOW_SIZE=<w>x<h>` | initial window size; on the real-AOSP path, the display's size at boot |
-| `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size`, `key`, `click`, `move`, `wheel`, `chrome show|hide` lines; `OMNI_WINDOW_INPUT=0`: no keyboard or mouse. `r_roblox` sets `force_resizable_activities` by default (`OMNI_R_RESIZABLE=0`: not) |
+| `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size`, `key`, `click`, `point`, `move` (captured motion), `wheel`, `flood <hz> <s>`, `chrome show|hide` lines; `OMNI_WINDOW_INPUT=0`: no keyboard or mouse; `OMNI_POINTER_HZ` (default 125), `OMNI_HOST_CURSOR=hide`. `r_roblox` sets `force_resizable_activities` by default (`OMNI_R_RESIZABLE=0`: not) |
 | `OMNI_APP_ONLY=0`, `OMNI_R_KIOSK=0` | real-AOSP path: present the whole display, bars and taskbar included (default: only the app); run the app on a device with SystemUI and the launcher (default: the kiosk device, without them, from the first boot). `OMNI_COMPOSER_TRACE=layers` lists each frame's layers |
-| `OMNI_DEVICE_APPS=full\|lean\|kiosk`, `persist.omni.cached_processes=<n>\|off` | real-AOSP path: what the device leaves out of its image (default lean; `device::LEAVES_OUT`); ActivityManager's cached-process limit (default 0, `omni_lean.sh`) |
+| `OMNI_POLL_STATS=<s>`, `OMNI_CODE_TRIM=0` | real-AOSP path: wake-up counters per host process; no translation trimming |
+| `OMNI_DEVICE_APPS=full\|lean\|lean-hw\|kiosk`, `persist.omni.cached_processes=<n>\|off` | real-AOSP path: what the device leaves out of its image (default lean; `device::LEAVES_OUT`); ActivityManager's cached-process limit (default 0, `omni_lean.sh`) |
 | `OMNI_SLOW_APP=<process>` (`OMNI_SLOW_APP_MS`), `OMNI_SLOW_SYSCALL_MS`, `OMNI_GPU_STATS=<s>`, `OMNI_SHM_VIEW=0` | real-AOSP path diagnostics: slow system calls with stacks; per-Vulkan-command calls and host time; graphics buffers through file I/O instead of a view |
 | `OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY`, `OMNI_DEEPLINK` | join a place (the app's own join URL) |
 | `OMNI_GUEST_ENV=K=V,..` | extra guest environment (e.g. `MIMALLOC_PURGE_DELAY`) |
@@ -722,13 +856,12 @@ name). Not run on the Mac or Linux since the switch.
 
 ## Open, in order
 
-0. **Real-AOSP speed, next levers** (HANDOFF "LIGHTER AND FASTER", in-world 34.6 fps, the render
-   thread saturated): an asynchronous swapchain release (~3.1 ms/frame of spinning GPU wait; needs
-   a real fence to the consumer), the translated libc (the old path ran bionic's memcpy/malloc
-   natively), a vDSO `clock_gettime` (~117k system calls a second), `vkCmd*` batching (<= ~1.6
-   ms/frame). Memory: the system host process (2.4 GB). `timer_create` for mediaextractor. The
-   old item 0 is answered: in-world frames are the composer's (32 of 9,600 SurfaceFlinger's),
-   and the kiosk device is the default.
+0. **Real-AOSP, next levers** (HANDOFF "PLAYABLE INPUT, LIGHTER, FASTER": 57.1 fps, 5.11 GB, input
+   in milliseconds): the render thread is the limit -- translated bionic (memcpy/malloc natively,
+   as the old path), `vkCmd*` batching; memory -- the system host's 65 guest processes (one
+   translation region each), the idle app processes (~100-200 MB each), Roblox's engine heap.
+   The composer's present fence (-1: SurfaceFlinger complains every frame). Done since the old
+   item 0: async release, vDSO, POSIX timers, keyed wake-ups.
 1. **Re-validate on the stock APK in a world** (needs the owner's sign-in): a 30-minute PS99 run
    per host; watch for Roblox's "missing or corrupted files" kick (seen only on the modified
    builds); re-measure what was decoded on 2.739.691 wherever it is still used.
