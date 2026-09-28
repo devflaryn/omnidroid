@@ -116,8 +116,17 @@ fn the_apk_is_installed_started_and_draws() {
             IDLE_APPS.len()
         )
     };
-    // After the install: the package installer, which the install itself needed.
-    let lean_after = if lean.is_empty() { String::new() } else { "cmd package disable-user --user 0 com.android.packageinstaller >/dev/null 2>&1; ".to_string() };
+    // `OMNI_R_KIOSK=1`: a dedicated single-app device -- no SystemUI, so no status bar, navigation
+    // bar or taskbar (the launcher's taskbar lives only while SystemUI binds it), and the app is
+    // given the whole display. SystemUI is disabled once the device is set up, and the device
+    // started again: disabling it on a running device locks the device (Android shows the
+    // keyguard when the keyguard's service, SystemUI's, dies), and a package disabled at boot is
+    // never started (`tests/d8_app_only.rs`, stage 4).
+    let kiosk = std::env::var("OMNI_R_KIOSK").as_deref() == Ok("1");
+    // After the install: the package installer, which the install itself needed -- but not on a
+    // device that boots again (the kiosk): PackageManager does not start without an installer
+    // ("There must be exactly one installer; found []", system_server's death at boot).
+    let lean_after = if lean.is_empty() || kiosk { String::new() } else { "cmd package disable-user --user 0 com.android.packageinstaller >/dev/null 2>&1; ".to_string() };
     // `OMNI_R_AFTER_INSTALL`: shell run once the APK is installed, before its first start (an
     // app-op the APK asks for, granted as its owner would grant it in Settings).
     let after_install = std::env::var("OMNI_R_AFTER_INSTALL").map_or_else(|_| String::new(), |c| format!("{c}; echo \"[r] after install: $?\"; "));
@@ -149,13 +158,6 @@ fn the_apk_is_installed_started_and_draws() {
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \
          {sign_in}{join}{extra}"
     );
-    // `OMNI_R_KIOSK=1`: a dedicated single-app device -- no SystemUI, so no status bar, navigation
-    // bar or taskbar (the launcher's taskbar lives only while SystemUI binds it), and the app is
-    // given the whole display. SystemUI is disabled once the device is set up, and the device
-    // started again: disabling it on a running device locks the device (Android shows the
-    // keyguard when the keyguard's service, SystemUI's, dies), and a package disabled at boot is
-    // never started (`tests/d8_app_only.rs`, stage 4).
-    let kiosk = std::env::var("OMNI_R_KIOSK").as_deref() == Ok("1");
     let then = if kiosk {
         format!(
             "{booted}{setup}echo \"[r] kiosk: $(pm disable-user --user 0 com.android.systemui 2>&1)\"; \

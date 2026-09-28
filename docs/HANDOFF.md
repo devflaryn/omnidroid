@@ -1,5 +1,85 @@
 # Handoff
 
+## ONLY THE APP IN THE WINDOW (2026-09-28 evening, Windows; `68ad3fe`, `904c79f`)
+
+The live window (and every framebuffer screenshot) now shows **only the app**: no status bar, no
+navigation bar, no taskbar. Two mechanisms, both Android's own objects, nothing in the framework
+changed:
+
+- **The composer leaves the chrome out** (`hal::composer`, default on; `OMNI_APP_ONLY=0` shows the
+  whole display; `chrome show|hide` in the window's control file toggles it live, with `onRefresh`
+  so a still screen changes). It knows a chrome layer by the window its buffers are for: a view
+  root's BufferQueue names its buffers after the window when it asks the allocator
+  (`VRI[StatusBar]#0(BLAST Consumer)0`, `VRI[Taskbar]#0...`; `hal::gralloc` keeps the name in the
+  region's metadata page; `is_chrome`: `StatusBar`, `NavigationBar*`, `Taskbar`,
+  `ScreenDecorOverlay*`, `ScreenDecorHwcLayer`). A chrome layer stays `DEVICE` (the composer's to
+  draw) and is not drawn; the rest are composed here, or -- when one is not the composer's -- go
+  to SurfaceFlinger as `CLIENT`, whose client target then lacks only the chrome. Limit: a chrome
+  layer SurfaceFlinger itself insists on composing (`CLIENT` requested, e.g. a blur) would be
+  drawn; not seen.
+- **Kiosk: a device without SystemUI** (`OMNI_R_KIOSK=1`, `tools/aosp_play.ps1 -Kiosk`). With
+  SystemUI running, the app still *lays out* around the bars (its own background where they were)
+  unless it hides them itself -- Roblox in a game does, its Landing and Home do not. Android 15
+  has no system-side switch to force an arbitrary app immersive (`policy_control` and
+  `qemu.hw.mainkeys` are gone from this image's `services.jar`; `cmd window` has nothing). So the
+  kiosk: set the device up, `pm disable-user com.android.systemui`, start the device again. No
+  SystemUI: no bars, no taskbar (the launcher's taskbar exists only while SystemUI binds its
+  service), no keyguard (`KeyguardServiceDelegate` cannot bind it and marks the device as having
+  none), and the app is given the whole display. **Disabling SystemUI on a running device does
+  not work**: Android shows the keyguard when the keyguard's service dies (D8 run 1: black
+  display, SystemUI restarted as a persistent app). The second boot costs ~1 minute
+  (`common::boot::Boot::reboot` keeps the instance).
+- The composer's own composition also takes more now: a source crop scaled to its frame (nearest
+  pixel), the eight HWC transforms, BGRA (`hal::compose`, unit-tested).
+- `OMNI_COMPOSER_TRACE=layers`: each frame's layers whenever they change -- buffer name, geometry,
+  whether the composer takes it, `HIDDEN` for chrome left out.
+
+Evidence (Windows, release):
+- **Gate `tests/d8_app_only.rs`** (366 s, pass): the probe in the live window. App only: the
+  status bar's 24 rows and the taskbar's bottom 56 have no near-white pixel (the probe's own bar
+  colour and nav scrim there: 1 colour each). `chrome show`: 0.47% near-white in the top strip
+  (clock, icons), 96.1% in the bottom one (the taskbar). `chrome hide`: gone again. Kiosk (second
+  boot, whole display presented): SurfaceFlinger lists no `StatusBar`/`NavigationBar`/`Taskbar`
+  layer, the probe's action bar at the top edge and its blue to the bottom edge. Window captures:
+  `docs/runs/2026-09-28-app-only/d8-window-{app-only,chrome-shown,kiosk}.png`;
+  `python tools/chrome_check.py <png>` measures the same strips on a capture ("chrome absent /
+  present").
+- **Mixed path** (D8 with `OMNI_COMPOSER_DEVICE=0 OMNI_D8_KIOSK=0`, 169 s, pass): every frame
+  SurfaceFlinger's, the status bar and taskbar `DEVICE`, `HIDDEN`, and absent from the display.
+- **Roblox (stock APK, logged out, Landing, live window)**, captures in
+  `docs/runs/2026-09-28-app-only/`:
+  - with SystemUI, app only (`roblox-landing-app-only.png`): no clock, no taskbar; the bottom 56
+    rows are one black colour -- Roblox's own window (`VRI[ActivityNativeMain]`, frame 664..720)
+    painting behind where the taskbar was, since the app keeps clear of its insets on this screen;
+  - kiosk (`OMNI_R_KIOSK=1`, 565 s run, pass; `roblox-landing-kiosk.png`): **edge to edge** -- one
+    layer, `SurfaceView[com.roblox.client/...]` 1280x720, the game art to the bottom edge (539
+    colours in the bottom strip) and the Landing UI laid out over the whole display.
+  - In kiosk the lean setup must keep `com.android.packageinstaller` enabled: PackageManager does
+    not start without an installer ("There must be exactly one installer; found []", system_server
+    dead at the second boot, run 1). That run's runner then ended on a dynarmic assertion
+    (`IsImmediate() && GetType() == IR::Type::AccType`), after system_server's death -- seen once,
+    never before in any kept log; not investigated.
+
+**fps (the goal's item 3) -- not the jump the goal expected, and why.** Device composition of
+full-screen app layers already existed (`5b6a0d2`, before this session): on Roblox's Landing
+**every** frame was already composed by the composer, none by SurfaceFlinger
+(`OMNI_COMPOSER_TRACE=layers`: `SurfaceView[com.roblox.client/...ActivityNativeMain]` 1280x720
+RGBA at 1:1, `ours`), and the app presents **0.99 frames/s** there before this change, after it
+(app only, 1,200 frames composed here, 0 by SurfaceFlinger) and in the kiosk -- the app's own
+rendering is the limit on that screen, not SurfaceFlinger. The in-game 4.0 fps
+(r26, 2026-09-28, the modified APK) had ~1/3 of its frames composed by SurfaceFlinger
+(`frames composed here 4069, by SurfaceFlinger 1331`) for layers not recorded then; this
+session's wider composer (scaling, transforms, BGRA, chrome left out) may take them. **Follow-up:
+an in-game run with the owner's cookie and `OMNI_COMPOSER_TRACE=layers`** shows which layers
+still go to SurfaceFlinger and the fps with them taken; HANDOFF's r26 profile (the app's threads
+93-96% inside system-call handlers) says the app side is the larger cost.
+
+Portability: nothing platform-specific changed. `hal::composer`, `hal::compose` and
+`display_window` hold no `cfg` and no platform call; the window seam (`omni-platform::window`,
+`Presenter`) was already enough -- no new primitive was needed, so Xlib and AppKit are untouched.
+Not cross-checked this session (omni-linux cannot be, dynarmic's C++); the D6 note below on the
+scratch-crate check still describes how.
+
 ## LIVE WINDOW (2026-09-28 day session, Windows; `a1509cd`, `b5a4277`, `6d8db75`, `63a7f4a`)
 
 The real-AOSP path's display is no longer only headless: **`OMNI_WINDOW=1` shows it live in a
@@ -351,7 +431,8 @@ Read once at start; each announces itself in the log.
 | `OMNI_JIT_CACHE_MB`, `OMNI_JIT_EXCLUSIVE_MONITOR=global`, `OMNI_JIT_OPTIMIZATIONS` | per-thread cache size; the old monitor (D31); dynarmic optimization mask |
 | `OMNI_PAUSE_IN_BACKGROUND=1`, `OMNI_FOLLOW_FOCUS=1` | Android's pause-in-background (default: keep playing, as desktop Roblox) |
 | `OMNI_WINDOW_SIZE=<w>x<h>` | initial window size; on the real-AOSP path, the display's size at boot |
-| `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size`, `key`, `click`, `move`, `wheel` lines; `OMNI_WINDOW_INPUT=0`: no keyboard or mouse. `r_roblox` sets `force_resizable_activities` by default (`OMNI_R_RESIZABLE=0`: not) |
+| `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size`, `key`, `click`, `move`, `wheel`, `chrome show|hide` lines; `OMNI_WINDOW_INPUT=0`: no keyboard or mouse. `r_roblox` sets `force_resizable_activities` by default (`OMNI_R_RESIZABLE=0`: not) |
+| `OMNI_APP_ONLY=0`, `OMNI_R_KIOSK=1` | real-AOSP path: present the whole display, bars and taskbar included (default: only the app); run the app on a device without SystemUI (a second boot). `OMNI_COMPOSER_TRACE=layers` lists each frame's layers |
 | `OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY`, `OMNI_DEEPLINK` | join a place (the app's own join URL) |
 | `OMNI_GUEST_ENV=K=V,..` | extra guest environment (e.g. `MIMALLOC_PURGE_DELAY`) |
 | `OMNI_FILE_TRACE`, `OMNI_WAIT_TRACE`, `OMNI_PROFILE`, `OMNI_IMPORT_CENSUS=off`, `OMNI_GLES_TIMING` | diagnostics |
@@ -491,6 +572,11 @@ name). Not run on the Mac or Linux since the switch.
 
 ## Open, in order
 
+0. **In-game fps on the real-AOSP path with the app-only composer** (needs the owner's cookie): a
+   PS99 run with `OMNI_COMPOSER_TRACE=layers` -- which layers still go to SurfaceFlinger in a
+   world (r26: ~1/3 of frames), whether the wider composer now takes them, and the fps before and
+   after (r26 baseline 4.0). Also: whether `OMNI_R_KIOSK=1` should become the runtime's default
+   (it costs a second boot, ~1 minute; D8 and Roblox Landing pass with it).
 1. **Re-validate on the stock APK in a world** (needs the owner's sign-in): a 30-minute PS99 run
    per host; watch for Roblox's "missing or corrupted files" kick (seen only on the modified
    builds); re-measure what was decoded on 2.739.691 wherever it is still used.
