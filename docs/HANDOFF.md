@@ -1,5 +1,78 @@
 # Handoff
 
+## LIVE WINDOW (2026-09-28 day session, Windows; `a1509cd`, `b5a4277`, `6d8db75`, `63a7f4a`)
+
+The real-AOSP path's display is no longer only headless: **`OMNI_WINDOW=1` shows it live in a
+native window, and the window's size is Android's display size** -- drag the border and the
+display, SystemUI and the running app relayout and redraw at exactly that size, any size (no
+aspect ratio, no preset list; 320 px floor per side, Android's minimum screen width).
+
+How it works:
+- **Seam (`omni-platform::window`)**: `Window::present_rgba` (host-CPU RGBA, stretched to the
+  client area, kept and repainted by the window itself) and `Window::presenter()` -> `Presenter`
+  (`Send + Sync`: `present_rgba` and `client_size` from any thread). Win32: `StretchDIBits` from
+  `WM_PAINT`, image in a shared canvas -- a presenter on another thread stays live through the
+  border drag's modal loop, and `GetClientRect` follows the border. Xlib: `XPutImage` of a
+  CPU-scaled image in the visual's layout, repainted on `Expose`. AppKit: a `CGImage` as the
+  contents of a sublayer over the view.
+- **Sink (`omni_linux::display_window`)**: platform-agnostic (no `cfg`). A window thread pumps and
+  runs `OMNI_WINDOW_CONTROL` (`size WxH` lines: scripted resizes through `set_client_size`); a
+  present thread shows each framebuffer frame and watches `Presenter::client_size`; a size that
+  holds 300 ms becomes the display's. `[window] N frames presented to the window; framebuffer M`
+  every 5 s.
+- **Resize = Android's own mechanism** (`hal::composer::Composer::set_display_size`): one HWC
+  configuration of the new size under a new config id, then `onHotplug(display, connected)` again.
+  SurfaceFlinger logs `Reconnecting display 0`, recreates the display at the new mode;
+  DisplayManager's LocalDisplayAdapter picks the new mode ("New display modes are added and the
+  active mode has changed"); WindowManager sends the configuration change. `Framebuffer` takes each
+  frame's own size; client targets carry theirs. `setActiveConfigWithConstraints` is answered.
+
+Evidence (Windows, release):
+- **Gate `tests/d6_window_resize.rs`** (179 s, pass): probe at 1280x720 (79.3% its blue), window
+  -> **817x542**: display in 2.0 s, `Reconnecting`, probe `onConfigurationChanged screen 817x542
+  dp`, view relaid out and drawn at 817x542, 82.8% blue, `wm size` = 817x542; window ->
+  **1531x877**: 4.0 s, drawn 1531x877, 89.4%; **window frames 962 = framebuffer frames 962**.
+  Window captures (`tools/window_shot.ps1`, PrintWindow of the real window):
+  `docs/runs/2026-09-28-live-window/d6-window-start.png` (1280x720), `d6-window-shrink.png`
+  (817x542), `d6-window-grow.png` (1531x877); the framebuffer's at each, `work/d6-run2/d6-display-*.png`. Run 1 (960x600 /
+  1600x900) passed every stage and then failed only because the window was resized by hand
+  to 1024x900 after the grow -- the display followed it; the gate now checks `wm size` against
+  the display size in force.
+- **Roblox (stock APK, logged out, Landing, `r_roblox` with `OMNI_WINDOW=1`)**: the engine's own
+  Vulkan swapchain recreated at **817x542, 1222x633 (a hand drag), 1531x877, 817x542**,
+  each within ~3 s (`[FLog::Graphics] Vulkan: swapchain images 3 ... size WxH`,
+  `doUpdateAppUISizes() vw:W`); window frames 1545 = framebuffer 1545. Captures:
+  `work/roblox-window/r2-1280x720.png`, `r2-817x542-b.png`, `r2-1531x877.png`,
+  `r2-817x542.png` (in fact 1222x633: a hand drag).
+- **The one thing that is not the app's size by default**: Roblox's `<application>` declares
+  `resizeableActivity="false"`, and Android answers a display resize under a non-resizable app
+  with size-compatibility mode -- kept at 1280x720, scaled, a "restart for a better view" bubble
+  (`work/roblox-window/roblox-817x542-a.png`, run 1). With the window on, `r_roblox` sets the
+  device up with Developer options' **"Force activities to be resizable"**
+  (`settings put global force_resizable_activities 1`, every app, `OMNI_R_RESIZABLE=0` to leave
+  it off); then Android itself gives the app each size. It is a device-wide setting, not a per-app
+  patch -- but it is the setting named "force", so the owner decides whether it stays the default.
+- Seam tests: `omni-platform/tests/window_present_windows.rs` (read-back of the painted window,
+  a presenter on another thread, a presenter outliving its window; 3/3 x 3). GDI `GetPixel` on
+  this host reads colour-managed values (0xe01020 -> 0xf1256b) and the opening animation's blend:
+  the test compares dominant channels and polls until settled.
+
+Portability (not run off Windows, as the goal said): `cargo check -p omni-platform --tests` for
+`x86_64-unknown-linux-gnu` is clean; for `aarch64-apple-darwin` the lib is clean with this PC's
+rustc 1.89 given `-Zcrate-attr=feature(new_zeroed_alloc)` (the pre-existing `fault/macos.rs`
+uses an API stable only from 1.92; the Mac's own toolchain is newer). `omni-linux` itself cannot
+be cross-checked here (dynarmic's C++), so `display_window.rs` + `framebuffer.rs` were
+type-checked for all three targets through a scratch crate that includes them verbatim against
+the real `omni-platform` (nightly 1.100). **Owed on Linux**: `window_linux.rs`'s new
+`a_presented_image_fills_the_window_and_is_repainted_at_a_new_size` (XGetImage read-back, written,
+never run) and one D6 run on Xlib. **Owed on macOS**: the AppKit present (type-checked only);
+note the window needs the AppKit main thread the backend takes before `main`.
+
+Known limits: the window is output only (input injection is the next, separate task); frames
+are copied on the CPU (RGBA -> BGRA and GDI's stretch each present); the display density stays
+160 dpi whatever the host's scaling; a Windows drag shows the last frame stretched until the size
+has held 300 ms, then the app redraws at it mid-drag.
+
 ## MORNING REPORT (overnight run 2026-09-28, Windows only, stock APK)
 
 APK used throughout: `omnidroid-unified/Roblox-2.738.1397.apk`, 229,466,269 bytes, sha256
@@ -239,7 +312,8 @@ Read once at start; each announces itself in the log.
 | `OMNI_JIT_SHARED_CACHE=0/1`, `..._MB`, `..._LIVE_MB`, `..._REGION_MB` | D38 shared translation cache (default on for x64, off on arm64) and its sizes |
 | `OMNI_JIT_CACHE_MB`, `OMNI_JIT_EXCLUSIVE_MONITOR=global`, `OMNI_JIT_OPTIMIZATIONS` | per-thread cache size; the old monitor (D31); dynarmic optimization mask |
 | `OMNI_PAUSE_IN_BACKGROUND=1`, `OMNI_FOLLOW_FOCUS=1` | Android's pause-in-background (default: keep playing, as desktop Roblox) |
-| `OMNI_WINDOW_SIZE=<w>x<h>` | initial window size |
+| `OMNI_WINDOW_SIZE=<w>x<h>` | initial window size; on the real-AOSP path, the display's size at boot |
+| `OMNI_WINDOW=1`, `OMNI_WINDOW_CONTROL=<file>` | real-AOSP path: the display live in a resizable host window (`display_window`); the file takes `size WxH` lines. `r_roblox` then also sets `force_resizable_activities` (`OMNI_R_RESIZABLE=0`: not) |
 | `OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY`, `OMNI_DEEPLINK` | join a place (the app's own join URL) |
 | `OMNI_GUEST_ENV=K=V,..` | extra guest environment (e.g. `MIMALLOC_PURGE_DELAY`) |
 | `OMNI_FILE_TRACE`, `OMNI_WAIT_TRACE`, `OMNI_PROFILE`, `OMNI_IMPORT_CENSUS=off`, `OMNI_GLES_TIMING` | diagnostics |
