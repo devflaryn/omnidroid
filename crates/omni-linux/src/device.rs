@@ -23,12 +23,15 @@ pub const FILES: &[(&str, &[u8])] = &[
     ("/vendor/etc/sensors/hals.conf", include_bytes!("../device/vendor/etc/sensors/hals.conf")),
     // This device has no modem: its RIL is declared and not started (the file says why).
     ("/vendor/etc/init/rild_goldfish.rc", include_bytes!("../device/vendor/etc/init/rild_goldfish.rc")),
+    // Nor does it declare telephony: the image's handheld features less `android.hardware.telephony*`
+    // (the file says why).
+    ("/vendor/etc/permissions/handheld_core_hardware.xml", include_bytes!("../device/vendor/etc/permissions/handheld_core_hardware.xml")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a
 /// vendor partition holds for its hardware. Any other overlay path already in the image is an
 /// error.
-pub const REPLACES: &[&str] = &["/vendor/etc/sensors/hals.conf", "/vendor/etc/init/rild_goldfish.rc"];
+pub const REPLACES: &[&str] = &["/vendor/etc/sensors/hals.conf", "/vendor/etc/init/rild_goldfish.rc", "/vendor/etc/permissions/handheld_core_hardware.xml"];
 
 /// An overlay file as the sysroot holds it: its guest path, its manifest entry, and the host file
 /// with its bytes.
