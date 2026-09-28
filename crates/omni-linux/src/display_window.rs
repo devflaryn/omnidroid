@@ -49,8 +49,9 @@
 //! <scancode> [down|up]` (a set-1 scancode, `0x`-hex or decimal, `0xE0..` for an extended key;
 //! both halves when neither is named), `click <x> <y> [primary|secondary|middle]` (window pixels:
 //! placed and clicked as a real first click is, without a capture), `move <dx> <dy>` and `wheel
-//! <notches>` drive the input devices as the window's own events would. Unknown lines are
-//! reported and skipped.
+//! <notches>` drive the input devices as the window's own events would. `chrome show` / `chrome
+//! hide` present the system's bars and taskbar with the app, or the app alone (the default,
+//! [`Composer::set_show_chrome`]). Unknown lines are reported and skipped.
 //!
 //! # What it says
 //!
@@ -131,6 +132,8 @@ enum Command {
     Click(i32, i32, PointerButton),
     Move(i32, i32),
     Wheel(i32),
+    /// Present the system's chrome with the app (`chrome show`) or the app alone (`chrome hide`).
+    Chrome(bool),
 }
 
 /// One line of the control file: `None` for a line that is not a command (reported by the caller).
@@ -161,6 +164,8 @@ fn parse(line: &str) -> Option<Command> {
         }
         ["move", dx, dy] => Some(Command::Move(i32::try_from(int(dx)?).ok()?, i32::try_from(int(dy)?).ok()?)),
         ["wheel", n] => Some(Command::Wheel(i32::try_from(int(n)?).ok()?)),
+        ["chrome", "show"] => Some(Command::Chrome(true)),
+        ["chrome", "hide"] => Some(Command::Chrome(false)),
         _ => None,
     }
 }
@@ -273,6 +278,10 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
                                 Ok(()) => eprintln!("[window] control: size {w}x{h}"),
                                 Err(e) => eprintln!("[window] control: size {w}x{h}: {e}"),
                             },
+                            Some(Command::Chrome(show)) => {
+                                eprintln!("[window] control: {line}");
+                                composer.set_show_chrome(show);
+                            }
                             Some(command) => match devices {
                                 Some(devices) => {
                                     eprintln!("[window] control: {line}");
@@ -312,7 +321,7 @@ fn scripted(command: Command, input: &mut Input, now: Instant, s: (f64, f64)) ->
         // Straight to the mouse: a script moves Android's pointer whether or not the mouse is held.
         Command::Move(dx, dy) => vec![Out::Mouse(vec![(EV_REL, REL_X, dx), (EV_REL, REL_Y, dy)])],
         Command::Wheel(n) => vec![Out::Mouse(vec![(EV_REL, REL_WHEEL, n)])],
-        Command::Size(..) => Vec::new(),
+        Command::Size(..) | Command::Chrome(_) => Vec::new(),
     }
 }
 
@@ -387,7 +396,9 @@ mod tests {
         assert_eq!(parse("click 5 6 secondary"), Some(Command::Click(5, 6, PointerButton::Secondary)));
         assert_eq!(parse("move -20 15"), Some(Command::Move(-20, 15)));
         assert_eq!(parse("wheel -2"), Some(Command::Wheel(-2)));
-        for bad in ["size", "size 960", "size 960x", "size x600", "size 9x6 extra", "resize 1x1", "", "size -1x5", "key", "key zz", "key 1 sideways", "click 1", "click 1 2 left", "move 1"] {
+        assert_eq!(parse("chrome show"), Some(Command::Chrome(true)));
+        assert_eq!(parse("chrome hide"), Some(Command::Chrome(false)));
+        for bad in ["chrome", "chrome on", "size","size 960", "size 960x", "size x600", "size 9x6 extra", "resize 1x1", "", "size -1x5", "key", "key zz", "key 1 sideways", "click 1", "click 1 2 left", "move 1"] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
     }

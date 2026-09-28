@@ -1,9 +1,10 @@
 //! The composer's own composition (`DEVICE`): the layers of a frame blended straight into the
 //! display's pixels on the host CPU, so SurfaceFlinger's RenderEngine -- GLES on ANGLE on the
 //! paravirtual Vulkan driver, every command a forwarded call -- draws nothing. What it takes: RGBA
-//! buffers at 1:1 (a source crop the size of the display frame), no transform, blending `NONE`,
-//! `PREMULTIPLIED` or `COVERAGE` with a plane alpha; and solid colours. Anything else the composer
-//! leaves to SurfaceFlinger for the whole frame (`crate::hal::composer`).
+//! (or BGRA) buffers, their source crop scaled to the display frame (nearest pixel) under any of
+//! the eight HWC transforms (flips and quarter turns), blending `NONE`, `PREMULTIPLIED` or
+//! `COVERAGE` with a plane alpha; and solid colours. Anything else the composer leaves to
+//! SurfaceFlinger (`crate::hal::composer`).
 //!
 //! Roblox in a world ran at 1.65 composed frames a second with SurfaceFlinger composing every frame
 //! (r16: its own process at 1.37 cores, waiting; the system's at 3.97).
@@ -22,7 +23,12 @@ pub enum Blend {
 /// One layer to compose.
 pub enum Source<'a> {
     /// RGBA rows `stride` pixels apart; `opaque` for a format with no alpha (RGBX): its alpha is 1.
+    /// The pixels shown are the crop's, at 1:1 from its corner.
     Pixels { data: &'a [u8], stride: usize, opaque: bool, crop_x: usize, crop_y: usize },
+    /// The same, but the crop (left, top, right, bottom, in source pixels) scaled to the frame
+    /// under `transform` (HWC's bits: 1 flip horizontally, 2 flip vertically, 4 turn a quarter
+    /// clockwise, applied in that order); `bgra` for red and blue swapped.
+    Mapped { data: &'a [u8], stride: usize, rows: usize, opaque: bool, bgra: bool, crop: (f32, f32, f32, f32), transform: u32 },
     /// One colour, RGBA in 0..=1.
     Color([f32; 4]),
 }
@@ -60,6 +66,10 @@ pub fn compose(out: &mut [u8], width: usize, height: usize, layers: &[Layer<'_>]
                     let Some(src_row) = data.get(at..at + (x1 - x0) * 4) else { continue };
                     blend_row(dst_row, src_row, layer.blend, *opaque, plane);
                 }
+                Source::Mapped { data, stride, rows, opaque, bgra, crop, transform } => {
+                    let row = mapped_row(data, *stride, *rows, *bgra, *crop, *transform, layer.frame, y, x0, x1);
+                    blend_row(dst_row, &row, layer.blend, *opaque, plane);
+                }
                 Source::Color(c) => {
                     let px = [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, (c[3] * 255.0) as u8];
                     for d in dst_row.chunks_exact_mut(4) {
@@ -69,6 +79,40 @@ pub fn compose(out: &mut [u8], width: usize, height: usize, layers: &[Layer<'_>]
             }
         }
     }
+}
+
+/// Display row `y`, columns `x0..x1`, of a [`Source::Mapped`] layer: each pixel the source pixel
+/// its centre maps to (nearest), as RGBA.
+#[allow(clippy::too_many_arguments)]
+fn mapped_row(data: &[u8], stride: usize, rows: usize, bgra: bool, crop: (f32, f32, f32, f32), transform: u32, frame: (i32, i32, i32, i32), y: usize, x0: usize, x1: usize) -> Vec<u8> {
+    let (l, t, r, b) = frame;
+    let (fw, fh) = ((r - l) as f32, (b - t) as f32);
+    let (cl, ct, cw, ch) = (crop.0, crop.1, crop.2 - crop.0, crop.3 - crop.1);
+    let v = (y as f32 + 0.5 - t as f32) / fh;
+    let mut out = vec![0u8; (x1 - x0) * 4];
+    let src_px = |s: f32, tt: f32| -> [u8; 4] {
+        let sx = ((cl + s * cw) as isize).clamp(0, stride as isize - 1) as usize;
+        let sy = ((ct + tt * ch) as isize).clamp(0, rows as isize - 1) as usize;
+        let at = (sy * stride + sx) * 4;
+        match data.get(at..at + 4) {
+            Some(p) if bgra => [p[2], p[1], p[0], p[3]],
+            Some(p) => [p[0], p[1], p[2], p[3]],
+            None => [0; 4],
+        }
+    };
+    for (i, o) in out.chunks_exact_mut(4).enumerate() {
+        let u = ((x0 + i) as f32 + 0.5 - l as f32) / fw;
+        // Undo the transform: the quarter turn first (it was applied last), then the flips.
+        let (mut s, mut tt) = if transform & 4 != 0 { (v, 1.0 - u) } else { (u, v) };
+        if transform & 1 != 0 {
+            s = 1.0 - s;
+        }
+        if transform & 2 != 0 {
+            tt = 1.0 - tt;
+        }
+        o.copy_from_slice(&src_px(s.clamp(0.0, 0.999_999), tt.clamp(0.0, 0.999_999)));
+    }
+    out
 }
 
 fn blend_row(dst: &mut [u8], src: &[u8], blend: Blend, opaque: bool, plane: u32) {
@@ -138,6 +182,40 @@ mod tests {
         // Display (0, 0) is frame-relative (1, 0): source (1 + 1, 1 + 0).
         assert_eq!(px(&out, w, 0, 0), [20, 10, 0, 255]);
         assert_eq!(px(&out, w, 3, 3), [0, 0, 0, 255], "outside the frame stays black");
+    }
+
+    /// A 2x1 source (red, green) at 4x2: each source pixel twice as wide and tall; turned a quarter
+    /// clockwise the left pixel is on top; flipped horizontally green comes first.
+    #[test]
+    fn a_crop_is_scaled_to_its_frame_and_transformed() {
+        let src: Vec<u8> = [[255, 0, 0, 255], [0, 255, 0, 255]].concat();
+        let layer = |frame, transform| Layer {
+            source: Source::Mapped { data: &src, stride: 2, rows: 1, opaque: true, bgra: false, crop: (0.0, 0.0, 2.0, 1.0), transform },
+            frame,
+            blend: Blend::None,
+            alpha: 1.0,
+        };
+        let mut out = vec![0u8; 4 * 2 * 4];
+        compose(&mut out, 4, 2, &[layer((0, 0, 4, 2), 0)]);
+        assert_eq!([px(&out, 4, 1, 1), px(&out, 4, 2, 0)], [[255, 0, 0, 255], [0, 255, 0, 255]], "scaled");
+        compose(&mut out, 4, 2, &[layer((0, 0, 4, 2), 1)]);
+        assert_eq!([px(&out, 4, 0, 0), px(&out, 4, 3, 1)], [[0, 255, 0, 255], [255, 0, 0, 255]], "flipped");
+        let mut out = vec![0u8; 2 * 4 * 4];
+        compose(&mut out, 2, 4, &[layer((0, 0, 2, 4), 4)]);
+        assert_eq!([px(&out, 2, 0, 0), px(&out, 2, 1, 3)], [[255, 0, 0, 255], [0, 255, 0, 255]], "turned: red on top, green below");
+    }
+
+    #[test]
+    fn a_bgra_source_is_swapped() {
+        let src: Vec<u8> = vec![255, 0, 0, 255];
+        let mut out = vec![0u8; 4];
+        compose(
+            &mut out,
+            1,
+            1,
+            &[Layer { source: Source::Mapped { data: &src, stride: 1, rows: 1, opaque: false, bgra: true, crop: (0.0, 0.0, 1.0, 1.0), transform: 0 }, frame: (0, 0, 1, 1), blend: Blend::None, alpha: 1.0 }],
+        );
+        assert_eq!(px(&out, 1, 0, 0), [0, 0, 255, 255]);
     }
 
     #[test]

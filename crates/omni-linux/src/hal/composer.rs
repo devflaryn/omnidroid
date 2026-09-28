@@ -16,6 +16,19 @@
 //! ("Reconnecting ..."): it reloads the display's modes, recreates the display at the new size and
 //! tells DisplayManager, whose LocalDisplayAdapter updates the display device -- and from there
 //! WindowManager and every app get the configuration change a resized display causes on a device.
+//!
+//! **Only the app is presented** (the default; `OMNI_APP_ONLY=0` or
+//! [`Composer::set_show_chrome`] shows the whole display): the system's chrome -- SystemUI's status
+//! and navigation bars and screen decorations, the launcher's taskbar -- are layers like any other
+//! here, and the composer leaves them out of what it presents. It knows them by the window their
+//! buffers are for: a window's BufferQueue names its buffers after it when it asks the allocator
+//! for them (`VRI[StatusBar]#0(BLAST Consumer)0`; `hal::gralloc` keeps the name, [`is_chrome`]).
+//! A chrome layer stays `DEVICE`, which is the composer's to draw -- and it draws nothing. When the
+//! frame's other layers are the composer's too, they are composed as they are; when one is not,
+//! they go to SurfaceFlinger (`CLIENT`), whose client target then holds everything but the chrome,
+//! with the app's own pixels where the chrome would have been on top of them. The app's layer is
+//! not moved or scaled: an app that draws edge to edge (a game; any app on a device without
+//! SystemUI) fills the display, and one that keeps clear of the bars shows its own background there.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -33,7 +46,7 @@ use super::aidl::android_hardware_graphics_composer3::{
 };
 use super::aidl::{Binder, Ctx, Fd, Status};
 use super::framebuffer::Framebuffer;
-use super::gralloc::PIXELS_AT;
+use super::gralloc::{NAME_AT, PIXELS_AT};
 use crate::binder::{Broker, STABILITY_VINTF};
 use crate::fd::FileKind;
 use crate::shm::Shm;
@@ -61,6 +74,7 @@ const EX_UNSUPPORTED: i32 = 8;
 const HANDLE_INTS: usize = 14;
 const RGBA_8888: i32 = 1;
 const RGBX_8888: i32 = 2;
+const BGRA_8888: i32 = 5;
 const IMPLEMENTATION_DEFINED: i32 = 0x22;
 
 /// The display's one configuration: its id and size. A resize is a new id, so that nothing
@@ -72,11 +86,26 @@ struct Mode {
     height: u32,
 }
 
+/// The windows that are the system's chrome, by the start of their title: SystemUI's bars and
+/// screen decorations (rounded corners, cutout), and the launcher's taskbar.
+const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer"];
+
+/// Whether a buffer of this name (`hal::gralloc`'s metadata page) is one of the system's chrome:
+/// a view root's BufferQueue is named `VRI[<window title>]#<n>(BLAST Consumer)<n>`, and the title
+/// is one of [`CHROME`]'s.
+#[must_use]
+pub fn is_chrome(buffer_name: &str) -> bool {
+    let Some(title) = buffer_name.strip_prefix("VRI[").and_then(|rest| rest.split(']').next()) else { return false };
+    CHROME.iter().any(|c| title.starts_with(c))
+}
+
 pub struct Composer {
     broker: Arc<Broker>,
     framebuffer: Arc<Framebuffer>,
     client: Mutex<Option<Arc<Client>>>,
     mode: Arc<Mutex<Mode>>,
+    /// Whether the system's chrome is presented (see this module's "Only the app").
+    show_chrome: Arc<AtomicBool>,
 }
 
 impl Composer {
@@ -84,7 +113,29 @@ impl Composer {
     pub fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>) -> Arc<Self> {
         let (width, height) = framebuffer.size();
         let mode = Arc::new(Mutex::new(Mode { config: 0, width, height }));
-        Arc::new(Self { broker, framebuffer, client: Mutex::new(None), mode })
+        let show_chrome = std::env::var("OMNI_APP_ONLY").as_deref() == Ok("0");
+        eprintln!("[composer] {}", if show_chrome { "the whole display is presented (OMNI_APP_ONLY=0)" } else { "only the app is presented: the system's bars and taskbar are left out" });
+        Arc::new(Self { broker, framebuffer, client: Mutex::new(None), mode, show_chrome: Arc::new(AtomicBool::new(show_chrome)) })
+    }
+
+    /// Whether the system's chrome is presented.
+    #[must_use]
+    pub fn shows_chrome(&self) -> bool {
+        self.show_chrome.load(Ordering::Relaxed)
+    }
+
+    /// Present the system's chrome with the app, or the app alone (see this module's "Only the
+    /// app"), from the next frame on -- which is asked for at once (`onRefresh`), so that a still
+    /// screen changes too.
+    pub fn set_show_chrome(&self, show: bool) {
+        if self.show_chrome.swap(show, Ordering::Relaxed) == show {
+            return;
+        }
+        eprintln!("[composer] {}", if show { "the whole display is presented" } else { "only the app is presented" });
+        let callback = self.client.lock().as_ref().and_then(|c| c.state.lock().callback);
+        if let Some(callback) = callback {
+            let _ = IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_refresh(DISPLAY);
+        }
     }
 
     /// The display's size now.
@@ -137,7 +188,7 @@ impl IComposerServer for Composer {
             // One client at a time, as the interface says.
             return Err(Status::ServiceSpecific(EX_NO_RESOURCES));
         }
-        let c = Client::new(Arc::clone(&self.broker), Arc::clone(&self.framebuffer), Arc::clone(&self.mode));
+        let c = Client::new(Arc::clone(&self.broker), Arc::clone(&self.framebuffer), Arc::clone(&self.mode), Arc::clone(&self.show_chrome));
         let serve = Arc::clone(&c);
         let trace = std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("1");
         let ptr = self.broker.create_host_service_objects(move |call| {
@@ -173,6 +224,9 @@ struct LayerBuffer {
     width: u32,
     height: u32,
     pixels_at: u64,
+    /// The name its requestor gave the allocator (`hal::gralloc`'s metadata page): a BufferQueue's
+    /// consumer name, which names the window it is for.
+    name: String,
 }
 
 /// What the client last set on a layer (a command carries only what changed).
@@ -199,20 +253,29 @@ impl LayerState {
         if composition == Composition::SOLID_COLOR {
             return self.color.is_some();
         }
-        if composition != Composition::DEVICE || self.transform.is_some_and(|t| t != common::Transform::NONE) {
+        if composition != Composition::DEVICE || self.transform.is_some_and(|t| !(0..=7).contains(&t.0)) {
             return false;
         }
         let (Some(buffer), Some(crop)) = (self.slot.and_then(|s| self.buffers.get(&s)), &self.crop) else { return false };
-        let (cw, ch) = (crop.right - crop.left, crop.bottom - crop.top);
-        matches!(buffer.format, RGBA_8888 | RGBX_8888 | IMPLEMENTATION_DEFINED)
+        matches!(buffer.format, RGBA_8888 | RGBX_8888 | BGRA_8888 | IMPLEMENTATION_DEFINED)
             && crop.left >= 0.0
             && crop.top >= 0.0
-            && crop.left.fract() == 0.0
-            && crop.top.fract() == 0.0
-            && (cw - (frame.right - frame.left) as f32).abs() < 0.01
-            && (ch - (frame.bottom - frame.top) as f32).abs() < 0.01
+            && crop.right > crop.left
+            && crop.bottom > crop.top
             && crop.right <= buffer.width as f32
             && crop.bottom <= buffer.height as f32
+    }
+
+    /// Whether its buffer is shown at 1:1 from a whole-pixel corner, untransformed, as stored: the
+    /// fast path (rows copied or blended as they are).
+    fn one_to_one(&self) -> bool {
+        let (Some(f), Some(c), Some(b)) = (&self.frame, &self.crop, self.slot.and_then(|s| self.buffers.get(&s))) else { return false };
+        self.transform.is_none_or(|t| t == common::Transform::NONE)
+            && b.format != BGRA_8888
+            && c.left.fract() == 0.0
+            && c.top.fract() == 0.0
+            && ((c.right - c.left) - (f.right - f.left) as f32).abs() < 0.01
+            && ((c.bottom - c.top) - (f.bottom - f.top) as f32).abs() < 0.01
     }
 }
 
@@ -229,9 +292,13 @@ struct State {
     device: HashMap<i64, LayerState>,
     /// Whether the frame being presented is the composer's own (`DEVICE`), decided at validation.
     device_frame: bool,
+    /// The chrome layers left out of the frame being presented, decided at validation.
+    hidden: std::collections::HashSet<i64>,
     /// Frames presented by each path, for the `[composer]` line.
     frames_device: u64,
     frames_client: u64,
+    /// The layer list `OMNI_COMPOSER_TRACE=layers` last printed.
+    traced: String,
 }
 
 pub struct Client {
@@ -240,11 +307,12 @@ pub struct Client {
     state: Mutex<State>,
     vsync: Arc<AtomicBool>,
     mode: Arc<Mutex<Mode>>,
+    show_chrome: Arc<AtomicBool>,
 }
 
 impl Client {
-    fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>, mode: Arc<Mutex<Mode>>) -> Arc<Self> {
-        let c = Arc::new(Self { broker, framebuffer, state: Mutex::default(), vsync: Arc::default(), mode });
+    fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>, mode: Arc<Mutex<Mode>>, show_chrome: Arc<AtomicBool>) -> Arc<Self> {
+        let c = Arc::new(Self { broker, framebuffer, state: Mutex::default(), vsync: Arc::default(), mode, show_chrome });
         // Vsync, every period while enabled, for as long as the client lives.
         let weak: Weak<Self> = Arc::downgrade(&c);
         let _ = std::thread::Builder::new().name("omni-composer-vsync".into()).spawn(move || loop {
@@ -280,7 +348,7 @@ impl Client {
             let mut pixels: HashMap<i64, Vec<u8>> = HashMap::new();
             for &(_, l) in &order {
                 let Some(d) = st.device.get(&l) else { continue };
-                if st.layers.get(&l) != Some(&Composition::DEVICE) {
+                if st.layers.get(&l) != Some(&Composition::DEVICE) || st.hidden.contains(&l) {
                     continue;
                 }
                 if let Some(b) = d.slot.and_then(|s| d.buffers.get(&s)) {
@@ -294,6 +362,9 @@ impl Client {
             for &(_, l) in &order {
                 let Some(d) = st.device.get(&l) else { continue };
                 let Some(f) = &d.frame else { continue };
+                if st.hidden.contains(&l) {
+                    continue;
+                }
                 let blend = match d.blend {
                     Some(common::BlendMode::NONE) => super::compose::Blend::None,
                     Some(common::BlendMode::COVERAGE) => super::compose::Blend::Coverage,
@@ -303,7 +374,19 @@ impl Client {
                     super::compose::Source::Color(d.color.unwrap_or_default())
                 } else {
                     let (Some(b), Some(data), Some(c)) = (d.slot.and_then(|s| d.buffers.get(&s)), pixels.get(&l), &d.crop) else { continue };
-                    super::compose::Source::Pixels { data, stride: b.stride as usize, opaque: b.format == RGBX_8888, crop_x: c.left as usize, crop_y: c.top as usize }
+                    if d.one_to_one() {
+                        super::compose::Source::Pixels { data, stride: b.stride as usize, opaque: b.format == RGBX_8888, crop_x: c.left as usize, crop_y: c.top as usize }
+                    } else {
+                        super::compose::Source::Mapped {
+                            data,
+                            stride: b.stride as usize,
+                            rows: b.height as usize,
+                            opaque: b.format == RGBX_8888,
+                            bgra: b.format == BGRA_8888,
+                            crop: (c.left, c.top, c.right, c.bottom),
+                            transform: d.transform.map_or(0, |t| t.0 as u32),
+                        }
+                    }
                 };
                 layers.push(super::compose::Layer { source, frame: (f.left, f.top, f.right, f.bottom), blend, alpha: d.alpha.unwrap_or(1.0) });
             }
@@ -347,6 +430,46 @@ impl Client {
     }
 }
 
+/// `OMNI_COMPOSER_TRACE=layers`: the frame's layers, bottom first, each time their list or their
+/// geometry changes -- what each is (its buffer's name), where, and whether the composer can take it.
+fn trace_layers(st: &mut State) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("layers")) {
+        return;
+    }
+    let mut order: Vec<(i32, i64)> = st.layers.keys().map(|l| (st.device.get(l).map_or(0, |d| d.z), *l)).collect();
+    order.sort_unstable();
+    let mut text = String::new();
+    for (z, l) in order {
+        let c = st.layers[&l];
+        let Some(d) = st.device.get(&l) else {
+            text.push_str(&format!("  layer {l} z {z} {c:?}: nothing set\n"));
+            continue;
+        };
+        let buffer = d.slot.and_then(|s| d.buffers.get(&s)).map_or_else(
+            || "no buffer".to_string(),
+            |b| format!("{:?} {}x{} fmt {:#x} stride {}", b.name, b.width, b.height, b.format, b.stride),
+        );
+        let frame = d.frame.as_ref().map(|f| format!("[{},{} {},{}]", f.left, f.top, f.right, f.bottom));
+        let crop = d.crop.as_ref().map(|c| format!("[{},{} {},{}]", c.left, c.top, c.right, c.bottom));
+        text.push_str(&format!(
+            "  layer {l} z {z} {c:?} {}{} frame {} crop {} transform {:?} blend {:?} alpha {:?} colour {:?}: {buffer}\n",
+            if d.composable(c) { "ours" } else { "NOT OURS" },
+            if st.hidden.contains(&l) { " HIDDEN" } else { "" },
+            frame.unwrap_or_default(),
+            crop.unwrap_or_default(),
+            d.transform,
+            d.blend,
+            d.alpha,
+            d.color,
+        ));
+    }
+    if text != st.traced {
+        eprint!("[composer] layers ({} frame):\n{text}", if st.device_frame { "composer's" } else { "SurfaceFlinger's" });
+        st.traced = text;
+    }
+}
+
 /// Every 600 frames: how many were the composer's own and how many SurfaceFlinger's.
 fn log_paths(st: &State) {
     if (st.frames_device + st.frames_client) % 600 == 0 {
@@ -365,7 +488,13 @@ fn layer_buffer_of(handle: &NativeHandle) -> Option<LayerBuffer> {
         _ => return None,
     };
     let (width, height, format, stride, pixels_at) = (handle.ints[2] as u32, handle.ints[3] as u32, handle.ints[5], handle.ints[8] as u32, handle.ints[13] as u32 as u64);
-    (stride >= width && pixels_at == PIXELS_AT).then_some(LayerBuffer { shm, format, stride, width, height, pixels_at })
+    if stride < width || pixels_at != PIXELS_AT {
+        return None;
+    }
+    let mut name = [0u8; 128];
+    let _ = shm.read_at(&mut name, NAME_AT);
+    let name = String::from_utf8_lossy(&name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())]).into_owned();
+    Some(LayerBuffer { shm, format, stride, width, height, pixels_at, name })
 }
 
 /// The client target a gralloc handle names (D2's 14 ints and one region).
@@ -470,10 +599,23 @@ impl IComposerClientServer for Client {
                 // The composer's own composition when it can take every layer.
                 static DEVICE_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let off = *DEVICE_OFF.get_or_init(|| std::env::var("OMNI_COMPOSER_DEVICE").as_deref() == Ok("0"));
+                let hide = !self.show_chrome.load(Ordering::Relaxed);
                 let device = {
                     let mut st = self.state.lock();
-                    let all = !off && !st.layers.is_empty() && st.layers.iter().all(|(l, c)| st.device.get(l).is_some_and(|d| d.composable(*c)));
+                    // The chrome left out: layers the composer was asked to draw itself.
+                    let hidden: std::collections::HashSet<i64> = if hide {
+                        st.layers
+                            .iter()
+                            .filter(|(l, c)| **c == Composition::DEVICE && st.device.get(l).and_then(|d| d.slot.and_then(|s| d.buffers.get(&s))).is_some_and(|b| is_chrome(&b.name)))
+                            .map(|(l, _)| *l)
+                            .collect()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+                    let all = !off && !st.layers.is_empty() && st.layers.iter().filter(|(l, _)| !hidden.contains(l)).all(|(l, c)| st.device.get(l).is_some_and(|d| d.composable(*c)));
+                    st.hidden = hidden;
                     st.device_frame = all;
+                    trace_layers(&mut st);
                     all
                 };
                 if device {
@@ -485,12 +627,17 @@ impl IComposerClientServer for Client {
                     }
                     continue;
                 }
-                // Every layer is composed by the client.
+                // Every layer is composed by the client -- but the chrome left out, which stays the
+                // composer's (and is not drawn).
                 let changed: Vec<ChangedCompositionLayer> = {
                     let mut st = self.state.lock();
-                    let changed = st.layers.iter().filter(|(_, c)| **c != Composition::CLIENT).map(|(l, _)| ChangedCompositionLayer { layer: *l, composition: Composition::CLIENT }).collect();
-                    for c in st.layers.values_mut() {
-                        *c = Composition::CLIENT;
+                    let State { layers, hidden, .. } = &mut *st;
+                    let mut changed = Vec::new();
+                    for (l, c) in layers.iter_mut() {
+                        if *c != Composition::CLIENT && !hidden.contains(l) {
+                            changed.push(ChangedCompositionLayer { layer: *l, composition: Composition::CLIENT });
+                            *c = Composition::CLIENT;
+                        }
                     }
                     changed
                 };
@@ -669,5 +816,28 @@ impl IComposerClientServer for Client {
 
     fn notify_expected_present(&self, _ctx: &Ctx<'_>, display: i64, _t: ClockMonotonicTimestamp, _frame_interval_ns: i32) -> Result<(), Status> {
         Self::display(display)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_chrome;
+
+    /// Names as the image's own windows give them (run 2026-09-28: SystemUI, the launcher, Roblox).
+    #[test]
+    fn the_bars_and_the_taskbar_are_chrome_and_an_app_is_not() {
+        for chrome in ["VRI[StatusBar]#0(BLAST Consumer)0", "VRI[Taskbar]#0(BLAST Consumer)0", "VRI[NavigationBar0]#3(BLAST Consumer)3", "VRI[ScreenDecorOverlayBottom]#5(BLAST Consumer)5"] {
+            assert!(is_chrome(chrome), "{chrome}");
+        }
+        for app in [
+            "SurfaceView[com.roblox.client/com.roblox.client.ActivityNativeMain]#2(BLAST Consumer)2",
+            "VRI[ActivityNativeMain]#1(BLAST Consumer)1",
+            "VRI[FallbackHome]#0(BLAST Consumer)0",
+            "bbq-adapter#0(BLAST Consumer)0",
+            "",
+            "StatusBar",
+        ] {
+            assert!(!is_chrome(app), "{app}");
+        }
     }
 }
