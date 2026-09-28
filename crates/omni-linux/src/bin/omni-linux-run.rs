@@ -193,6 +193,16 @@ fn main() -> ExitCode {
 [threads]   "));
         });
     }
+    // OMNI_SYSCALL_STATS=<seconds>: this host process's system calls over each period, most time
+    // first (calls, and the time spent in them, summed over threads).
+    if let Some(every) = std::env::var("OMNI_SYSCALL_STATS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        let name = argv.iter().find_map(|a| String::from_utf8_lossy(a).strip_prefix("--nice-name=").map(String::from)).unwrap_or_else(|| "system".into());
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
+            let top: Vec<String> = omni_linux::process::syscall_stats().into_iter().take(8).map(|(n, c, ms)| format!("{n} {c}x {ms}ms")).collect();
+            eprintln!("[syscalls] {name} {}s: {}", every, top.join(", "));
+        });
+    }
     // OMNI_MEM_TRACE=<seconds>: this host process's commit charge beside its program's guest
     // memory, every so often -- what the difference (the CPU backend's translations, the runtime's
     // own heap) costs per host process.

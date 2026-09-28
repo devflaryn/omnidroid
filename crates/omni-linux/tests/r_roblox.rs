@@ -98,17 +98,23 @@ fn the_apk_is_installed_started_and_draws() {
         "com.android.imsserviceentitlement", "com.android.healthconnect.controller", "com.android.ondevicepersonalization.services",
         "com.android.devicelockcontroller", "com.android.statementservice", "com.android.documentsui",
         "com.android.localtransport", "com.android.emulator.multidisplay", "com.android.federatedcompute.services",
-        "com.android.adservices.api", "com.android.bluetooth", "com.android.managedprovisioning", "com.android.traceur",
+        "com.android.adservices.api", "com.android.bluetooth", "com.android.managedprovisioning",
+        "com.android.se", "com.android.rkpdapp", "com.android.externalstorage", "com.android.keychain",
+        "com.android.ext.adservices.api", "com.android.providers.contacts", "com.android.providers.blockednumber",
+        "com.android.providers.userdictionary", "com.android.wallpaperbackup", "com.android.carrierconfig",
+        "com.android.providers.telephony", "com.android.stk", "com.android.mms.service", "com.android.cellbroadcastservice",
     ];
     let lean = if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
         String::new()
     } else {
         format!(
-            "for a in {}; do cmd package disable-user --user 0 $a >/dev/null 2>&1; done; echo \"[r] idle apps disabled: {}\"; ",
+            "for a in {}; do r=$(cmd package disable-user --user 0 $a 2>&1); case \"$r\" in *disabled*) ;; *) echo \"[r] not disabled: $a: $r\";; esac; done; echo \"[r] idle apps disabled: {}\"; ",
             IDLE_APPS.join(" "),
             IDLE_APPS.len()
         )
     };
+    // After the install: the package installer, which the install itself needed.
+    let lean_after = if lean.is_empty() { String::new() } else { "cmd package disable-user --user 0 com.android.packageinstaller >/dev/null 2>&1; ".to_string() };
     let then = format!(
         "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
          echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; \
@@ -118,6 +124,7 @@ fn the_apk_is_installed_started_and_draws() {
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
          {lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
+         {lean_after}
          pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
          act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \

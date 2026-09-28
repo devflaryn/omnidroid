@@ -222,6 +222,32 @@ impl Task {
     }
 }
 
+/// `OMNI_SYSCALL_STATS=<seconds>`: per system call, how many were made in this host process and how
+/// long they took, summed and printed (`syscall_stats`) -- what share of a process's time is the
+/// kernel's, and which call's.
+fn syscall_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OMNI_SYSCALL_STATS").is_some())
+}
+
+const STAT_CALLS: usize = 512;
+static STAT_COUNT: [std::sync::atomic::AtomicU64; STAT_CALLS] = [const { std::sync::atomic::AtomicU64::new(0) }; STAT_CALLS];
+static STAT_NANOS: [std::sync::atomic::AtomicU64; STAT_CALLS] = [const { std::sync::atomic::AtomicU64::new(0) }; STAT_CALLS];
+
+/// The calls since the last report, most time first: (name, calls, total ms), and the counters
+/// reset.
+pub fn syscall_stats() -> Vec<(String, u64, u64)> {
+    let mut out: Vec<(String, u64, u64)> = (0..STAT_CALLS)
+        .filter_map(|n| {
+            let c = STAT_COUNT[n].swap(0, std::sync::atomic::Ordering::Relaxed);
+            let ns = STAT_NANOS[n].swap(0, std::sync::atomic::Ordering::Relaxed);
+            (c > 0).then(|| (name_of(n as u64).into_owned(), c, ns / 1_000_000))
+        })
+        .collect();
+    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out
+}
+
 /// `OMNI_THREAD_DUMP=<seconds>`: every task's system call in progress is kept (number, pc, lr,
 /// since when, the task's name), for [`blocked_calls`] -- where the threads of a process that has
 /// stopped making progress wait, without a full trace's cost.
@@ -305,7 +331,13 @@ fn on_svc(call: &mut ThunkCall<'_>) {
     if thread_dump() {
         IN_FLIGHT.lock().get_or_insert_with(Default::default).insert(task.tid, (number, task.pc, task.lr, std::time::Instant::now(), task.name.clone()));
     }
+    let stats_from = syscall_stats_on().then(std::time::Instant::now);
     let result = process.syscall(task, number, args);
+    if let Some(t0) = stats_from {
+        let n = (number as usize).min(STAT_CALLS - 1);
+        STAT_COUNT[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STAT_NANOS[n].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     if thread_dump() {
         if let Some(m) = IN_FLIGHT.lock().as_mut() {
             m.remove(&task.tid);
