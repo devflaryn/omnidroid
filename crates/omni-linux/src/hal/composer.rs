@@ -565,6 +565,22 @@ impl IComposerClientServer for Client {
                         st.layers.insert(layer.layer, c.composition);
                     }
                     let d = st.device.entry(layer.layer).or_default();
+                    // The slots SurfaceFlinger frees first, then the command's buffer: a buffer
+                    // cache that frees a slot and fills it again in one command (a swapchain made
+                    // anew as a game is joined) means the new buffer. Cleared after it, slot 0
+                    // held nothing, and every third frame went to SurfaceFlinger (in-world PS99,
+                    // 2026-09-28: "no buffer (slot Some(0); slots held [1, 2])").
+                    for slot in layer.buffer_slots_to_clear.iter().flatten() {
+                        d.buffers.remove(slot);
+                    }
+                    if trace_on() && layer.buffer_slots_to_clear.as_ref().is_some_and(|s| !s.is_empty()) {
+                        eprintln!(
+                            "[composer] layer {}: slots cleared {:?}; this command's buffer: {:?}",
+                            layer.layer,
+                            layer.buffer_slots_to_clear,
+                            layer.buffer.as_ref().map(|b| (b.slot, b.handle.is_some()))
+                        );
+                    }
                     if let Some(buffer) = &layer.buffer {
                         match buffer.handle.as_ref().map(|h| (h, layer_buffer_of(h))) {
                             Some((_, Some(b))) => {
@@ -584,9 +600,6 @@ impl IComposerClientServer for Client {
                             _ => {}
                         }
                         d.slot = Some(buffer.slot);
-                    }
-                    for slot in layer.buffer_slots_to_clear.iter().flatten() {
-                        d.buffers.remove(slot);
                     }
                     if let Some(f) = &layer.display_frame {
                         d.frame = Some(f.clone());
