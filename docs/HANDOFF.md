@@ -68,6 +68,10 @@ the real `omni-platform` (nightly 1.100). **Owed on Linux**: `window_linux.rs`'s
 never run) and one D6 run on Xlib. **Owed on macOS**: the AppKit present (type-checked only);
 note the window needs the AppKit main thread the backend takes before `main`.
 
+Regression after it (Windows, release): `cargo test -p omni-linux` 86/86 binaries green;
+D5 (no window) passed in 149 s; `omni-platform` lib 202/202, `window_live` 11/11,
+`window_seam` 7/7; `r_roblox` with the window, 15 minutes, passed.
+
 Known limits: the window is output only (input injection is the next, separate task); frames
 are copied on the CPU (RGBA -> BGRA and GDI's stretch each present); the display density stays
 160 dpi whatever the host's scaling; a Windows drag shows the last frame stretched until the size
