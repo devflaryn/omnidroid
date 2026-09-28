@@ -175,7 +175,29 @@ impl Window {
     }
 
     /// Unreachable, as [`Window::show`].
+    pub(super) fn presenter(&self) -> Presenter {
+        match *self {}
+    }
+
+    /// Unreachable, as [`Window::show`].
     pub(super) fn raw(&self) -> RawWindow {
+        match *self {}
+    }
+}
+
+/// Uninhabited, as [`Window`]: no window, so no presenter.
+#[derive(Clone)]
+pub(super) enum Presenter {}
+
+impl Presenter {
+    /// Unreachable: no value exists.
+    pub(super) fn present_rgba(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        let _ = (rgba, width, height);
+        match *self {}
+    }
+
+    /// Unreachable: no value exists.
+    pub(super) fn client_size(&self) -> Option<(u32, u32)> {
         match *self {}
     }
 }

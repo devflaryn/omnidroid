@@ -115,6 +115,11 @@ fn with<R>(id: u64, work: impl FnOnce(&Native) -> R) -> R {
     })
 }
 
+/// Run `work` with window `id` if it is still open: for a `Presenter`, which may outlive its window.
+fn with_live<R>(id: u64, work: impl FnOnce(&Native) -> R) -> Option<R> {
+    WINDOWS.with_borrow(|windows| windows.get(&id).map(work))
+}
+
 // ---------------------------------------------------------------------------------- the view
 
 /// State the view's handlers share, all on the main thread.
@@ -1021,9 +1026,11 @@ const RGBX: u32 = 5;
 /// the client area" -- and Core Animation keeps showing it until the next present, through any
 /// resize. Implicit animation is off for the change: a layer that is not a view's own cross-fades
 /// new contents over a quarter of a second otherwise.
+///
+/// A window already closed (a `Presenter` outliving it) takes nothing and answers `Ok`.
 pub(super) fn present_rgba(id: u64, rgba: Vec<u8>, width: u32, height: u32) -> WindowResult<()> {
     let failed = |api: &'static str, detail: &str| WindowError::AppKit { operation: "present_rgba", api, detail: detail.to_owned() };
-    with(id, |native| {
+    with_live(id, |native| {
         let Some(backing) = native.view.layer() else {
             return Err(failed("-[NSView layer]", "the view has no layer to show the image in"));
         };
@@ -1065,6 +1072,12 @@ pub(super) fn present_rgba(id: u64, rgba: Vec<u8>, width: u32, height: u32) -> W
         CATransaction::commit();
         Ok(())
     })
+    .unwrap_or(Ok(()))
+}
+
+/// The backing size, or `None` once the window is closed: a `Presenter`'s question.
+pub(super) fn live_client_size(id: u64) -> Option<(u32, u32)> {
+    with_live(id, |native| native.view.pixel_size())
 }
 
 /// Close and forget the window. A held capture is given back first: the cursor's association is

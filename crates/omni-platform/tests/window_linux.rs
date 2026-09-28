@@ -339,6 +339,22 @@ impl Peer {
     }
 }
 
+impl Peer {
+    /// The pixel at client (`x`, `y`) of `window` as the server holds it, as RGB -- the 24-bit
+    /// TrueColor layout of the port's Xvfb (`-screen 0 1920x1080x24`).
+    fn pixel(&self, window: c_ulong, x: c_int, y: c_int) -> [u8; 3] {
+        // SAFETY: a live connection and window; the image Xlib returns is destroyed with its own
+        // function once read.
+        unsafe {
+            let image = (self.xl.XGetImage)(self.display, window, x, y, 1, 1, !0, xlib::ZPixmap);
+            assert!(!image.is_null(), "XGetImage of ({x}, {y}) of {window:#x}");
+            let p = ((*image).funcs.get_pixel.expect("an XImage's get_pixel"))(image, 0, 0);
+            ((*image).funcs.destroy_image.expect("an XImage's destroy_image"))(image);
+            [(p >> 16) as u8, (p >> 8) as u8, p as u8]
+        }
+    }
+}
+
 impl Drop for Peer {
     fn drop(&mut self) {
         // SAFETY: the connection this struct opened, closed once.
@@ -939,4 +955,30 @@ fn the_roots_configure_notify_is_a_display_mode_change() {
     let seen = poll_until(&mut window, "the display change", |e| matches!(e, WindowEvent::DisplayChanged { .. }));
     assert!(seen.contains(&WindowEvent::DisplayChanged { change: DisplayChange::Mode }), "{seen:?}");
     assert!(!seen.iter().any(|e| matches!(e, WindowEvent::Resized { .. })), "{seen:?}");
+}
+
+/// **`present_rgba` on X11**: the image is on the window as the server holds it -- read back on this
+/// file's own connection -- stretched over the whole window, and after a resize nobody presented
+/// after, it is there again at the new size (the backend's `Expose` repaint). Exact colours: nothing
+/// between a client and Xvfb manages colour. WRITTEN 2026-09-28 ON WINDOWS AND NOT YET RUN: the
+/// Linux host did not boot or test in that session.
+#[test]
+#[ignore = "needs an X server and xdotool: OMNI_GFX_WINDOW_TESTS=1 DISPLAY=:92 cargo test -- --ignored"]
+fn a_presented_image_fills_the_window_and_is_repainted_at_a_new_size() {
+    require_gate();
+    let peer = Peer::open();
+    let mut window = focused_window("omnidroid: present", 200, 100);
+    let (red, blue) = ([0xe0, 0x10, 0x20], [0x21, 0x96, 0xf3]);
+    // Two pixels, red then blue; the blue's alpha is 0 and must not matter.
+    window.present_rgba(&[0xe0, 0x10, 0x20, 0xff, 0x21, 0x96, 0xf3, 0x00], 2, 1).expect("present");
+    let id = xid(&window);
+    for (x, y, want) in [(50, 50, red), (150, 50, blue), (0, 0, red), (199, 99, blue)] {
+        assert_eq!(peer.pixel(id, x, y), want, "({x}, {y}) of the 200x100 window");
+    }
+    window.set_client_size(400, 200).expect("resize");
+    poll_until(&mut window, "the resize", |e| *e == WindowEvent::Resized { width: 400, height: 200 });
+    let _ = drain_for(&mut window, Duration::from_millis(200));
+    for (x, y, want) in [(100, 100, red), (300, 100, blue), (0, 199, red), (399, 0, blue)] {
+        assert_eq!(peer.pixel(id, x, y), want, "({x}, {y}) of the 400x200 window, not presented to since the resize");
+    }
 }

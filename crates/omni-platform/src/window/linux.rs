@@ -83,7 +83,9 @@
 //! core buttons it finds up. Back and forward have no bit in the core state and are left to their
 //! own releases and to the focus.
 //!
-//! **8. A presented image is put with `XPutImage`, and repainted on `Expose`.** The core protocol
+//! **8. A presented image is put with `XPutImage`, and repainted on `Expose`.** The image lives in
+//! a `Canvas` the window shares with its [`Presenter`]s, which may present from any thread (the
+//! connection is `XInitThreads`'s); the window's thread keeps the canvas's size current. The core protocol
 //! has no scaler, so [`Window::present_rgba`]'s image is scaled on the CPU to the window's size
 //! ([`super::scale_nearest`]) and converted to the default visual's pixel layout (its channel
 //! masks, 24- or 32-bit TrueColor), in a client-owned `XImage` (`XInitImage`: nothing for Xlib to
@@ -101,7 +103,7 @@ use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use core::ptr;
 use std::cell::Cell;
 use std::ffi::{CStr, CString};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use x11_dl::xinput2::{self, XInput2};
@@ -272,11 +274,157 @@ pub(super) struct Window {
     buttons_down: u32,
     /// The pointer's last position an event carried, for a release point 7 reports.
     last_pointer: (i32, i32),
-    /// The image [`super::Window::present_rgba`] last gave: RGBA, and its size. Point 8.
+    /// What the window shows when something is presented to it (point 8), shared with its
+    /// [`Presenter`]s. `None` only until the window exists.
+    canvas: Option<Arc<Canvas>>,
+}
+
+/// The presented image and what drawing it needs, shared between the window (which repaints it on
+/// `Expose`) and any [`Presenter`] (which replaces it, from any thread: the connection is
+/// `XInitThreads`'s, point 2's `libs`).
+struct Canvas {
+    libs: &'static Libs,
+    display: *mut xlib::Display,
+    window: xlib::Window,
+    screen: c_int,
+    state: Mutex<CanvasState>,
+}
+
+// SAFETY: the display pointer is used only for Xlib calls, which `XInitThreads` made safe from any
+// thread, and only while `alive` holds under the lock the window's `Drop` takes before closing it.
+unsafe impl Send for Canvas {}
+// SAFETY: as above; every field that changes is behind the `Mutex`.
+unsafe impl Sync for Canvas {}
+
+struct CanvasState {
+    /// Cleared, under this lock, before the window and its connection go.
+    alive: bool,
+    /// The window's size as its thread last learnt it, 0x0 while iconic.
+    size: (u32, u32),
+    /// Whether `ExposureMask` has been selected (at the first present).
+    exposure: bool,
+    /// The image last presented: RGBA, and its size.
     image: Option<(Vec<u8>, u32, u32)>,
     /// The image scaled to the window, then in the visual's layout: kept to be reused.
     scaled: Vec<u8>,
     converted: Vec<u8>,
+}
+
+impl Canvas {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CanvasState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep the image and draw it now. The first present selects `ExposureMask`.
+    fn present(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        let mut st = self.lock();
+        if !st.alive {
+            return Ok(());
+        }
+        if !st.exposure {
+            st.exposure = true;
+            let xl = &self.libs.xlib;
+            // SAFETY: a zeroed `XWindowAttributes` is valid to be overwritten; a live display and
+            // window. The mask selected so far (this window's and the input method's) is kept.
+            unsafe {
+                let mut attributes: xlib::XWindowAttributes = core::mem::zeroed();
+                (xl.XGetWindowAttributes)(self.display, self.window, &raw mut attributes);
+                (xl.XSelectInput)(self.display, self.window, attributes.your_event_mask | xlib::ExposureMask);
+            }
+        }
+        let image = st.image.get_or_insert_with(|| (Vec::new(), 0, 0));
+        image.0.clear();
+        image.0.extend_from_slice(rgba);
+        (image.1, image.2) = (width, height);
+        self.draw(&mut st, "present_rgba")
+    }
+
+    /// The window's new size (0x0 while iconic), from its thread.
+    fn set_size(&self, size: (u32, u32)) {
+        self.lock().size = size;
+    }
+
+    /// `Expose`: the kept image again, at the window's size now.
+    fn repaint(&self) {
+        let mut st = self.lock();
+        if st.alive && st.image.is_some() {
+            let _ = self.draw(&mut st, "present_rgba");
+        }
+    }
+
+    /// Put the kept image on the window, scaled to its size: point 8. Nothing while iconic.
+    fn draw(&self, st: &mut CanvasState, operation: &'static str) -> WindowResult<()> {
+        let CanvasState { image: Some((rgba, width, height)), size: (cw, ch), scaled, converted, .. } = st else { return Ok(()) };
+        let (cw, ch) = (*cw, *ch);
+        if cw == 0 || ch == 0 {
+            return Ok(());
+        }
+        let xl = &self.libs.xlib;
+        // SAFETY: a live display and its default screen; the visual is the server's, live for the
+        // connection.
+        let (visual, depth) = unsafe { ((xl.XDefaultVisual)(self.display, self.screen), (xl.XDefaultDepth)(self.display, self.screen)) };
+        // SAFETY: a live visual.
+        let masks = unsafe { ((*visual).red_mask, (*visual).green_mask, (*visual).blue_mask) };
+        if !(depth == 24 || depth == 32) || masks.0 == 0 || masks.1 == 0 || masks.2 == 0 {
+            return Err(x11(operation, "XPutImage", format!("the default visual is {depth}-bit with channel masks {masks:x?}; only 24- and 32-bit TrueColor is drawn")));
+        }
+        super::scale_nearest(rgba, *width as usize, *height as usize, scaled, cw as usize, ch as usize);
+        // Each channel at its mask's place and width.
+        let place = |mask: c_ulong, value: u8| -> u32 {
+            let shift = mask.trailing_zeros();
+            let max = mask >> shift;
+            ((c_ulong::from(value) * max / 255) << shift) as u32
+        };
+        converted.resize(scaled.len(), 0);
+        for (d, p) in converted.chunks_exact_mut(4).zip(scaled.chunks_exact(4)) {
+            let pixel = place(masks.0, p[0]) | place(masks.1, p[1]) | place(masks.2, p[2]);
+            d.copy_from_slice(&pixel.to_le_bytes());
+        }
+        // SAFETY: an all-zero `XImage` is a valid value to fill; `XInitImage` sets its functions
+        // from the fields. The data is the canvas's buffer of `cw * ch` 32-bit pixels, and outlives
+        // the `XPutImage` (which copies it into the request) -- Xlib never frees it.
+        unsafe {
+            let mut image: xlib::XImage = core::mem::zeroed();
+            image.width = cw as c_int;
+            image.height = ch as c_int;
+            image.format = xlib::ZPixmap;
+            image.data = converted.as_mut_ptr().cast();
+            image.byte_order = xlib::LSBFirst;
+            image.bitmap_unit = 32;
+            image.bitmap_bit_order = xlib::LSBFirst;
+            image.bitmap_pad = 32;
+            image.depth = depth;
+            image.bytes_per_line = (cw * 4) as c_int;
+            image.bits_per_pixel = 32;
+            (image.red_mask, image.green_mask, image.blue_mask) = masks;
+            if (xl.XInitImage)(&raw mut image) == 0 {
+                return Err(x11(operation, "XInitImage", "Xlib refused the image's layout"));
+            }
+            let gc = (xl.XDefaultGC)(self.display, self.screen);
+            (xl.XPutImage)(self.display, self.window, gc, &raw mut image, 0, 0, 0, 0, cw, ch);
+            (xl.XFlush)(self.display);
+        }
+        Ok(())
+    }
+}
+
+/// Presents to a window from any thread: see [`super::Presenter`] and point 8.
+#[derive(Clone)]
+pub(super) struct Presenter {
+    canvas: Arc<Canvas>,
+}
+
+impl Presenter {
+    pub(super) fn present_rgba(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        self.canvas.present(rgba, width, height)
+    }
+
+    /// The size the window's thread last learnt (`ConfigureNotify`), 0x0 while iconic; `None`
+    /// once the window is gone.
+    pub(super) fn client_size(&self) -> Option<(u32, u32)> {
+        let st = self.canvas.lock();
+        st.alive.then_some(st.size)
+    }
 }
 
 /// The bit a seam button is tracked by in `buttons_down`.
@@ -378,9 +526,7 @@ impl Window {
             hide_cursor: false,
             buttons_down: 0,
             last_pointer: (0, 0),
-            image: None,
-            scaled: Vec::new(),
-            converted: Vec::new(),
+            canvas: None,
         };
 
         // Auto-repeat as presses (this module's header, "Why Xlib").
@@ -437,6 +583,13 @@ impl Window {
             };
         })?;
         window.window = created;
+        window.canvas = Some(Arc::new(Canvas {
+            libs,
+            display,
+            window: created,
+            screen,
+            state: Mutex::new(CanvasState { alive: true, size: (0, 0), exposure: false, image: None, scaled: Vec::new(), converted: Vec::new() }),
+        }));
         window.set_properties(desc.title)?;
         window.open_input_method(event_mask)?;
         window.blank_cursor = window.make_blank_cursor();
@@ -760,6 +913,9 @@ impl Window {
     /// last one reported: 0x0 while iconic.
     fn report_size(&mut self) {
         let now = if self.iconic { (0, 0) } else { self.size };
+        if let Some(canvas) = &self.canvas {
+            canvas.set_size(now);
+        }
         if now != self.last_size {
             self.last_size = now;
             push_event(&mut self.queue, WindowEvent::Resized { width: now.0, height: now.1 });
@@ -963,8 +1119,10 @@ impl Window {
                 // SAFETY: the type says `expose` is the member.
                 let expose = unsafe { event.expose };
                 // Only the last of a run: one draw covers the whole window (point 8).
-                if expose.count == 0 && self.image.is_some() {
-                    let _ = self.draw("present_rgba");
+                if expose.count == 0 {
+                    if let Some(canvas) = &self.canvas {
+                        canvas.repaint();
+                    }
                 }
             }
             xlib::MapNotify => {
@@ -1604,81 +1762,17 @@ impl Window {
         Ok(())
     }
 
-    /// The connection and the window, for `VkXlibSurfaceCreateInfoKHR`.
-    /// Keep the image and draw it now: point 8. The first present selects `ExposureMask`.
+    /// Keep the image and draw it now: point 8.
     pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
-        if self.image.is_none() {
-            let xl = &self.libs.xlib;
-            // SAFETY: a zeroed `XWindowAttributes` is valid to be overwritten; a live display and
-            // window. The mask selected so far (this window's and the input method's) is kept.
-            unsafe {
-                let mut attributes: xlib::XWindowAttributes = core::mem::zeroed();
-                (xl.XGetWindowAttributes)(self.display, self.window, &raw mut attributes);
-                (xl.XSelectInput)(self.display, self.window, attributes.your_event_mask | xlib::ExposureMask);
-            }
-        }
-        let image = self.image.get_or_insert_with(|| (Vec::new(), 0, 0));
-        image.0.clear();
-        image.0.extend_from_slice(rgba);
-        (image.1, image.2) = (width, height);
-        self.draw("present_rgba")
+        self.presenter().present_rgba(rgba, width, height)
     }
 
-    /// Put the kept image on the window, scaled to its size: point 8. Nothing while iconic.
-    fn draw(&mut self, operation: &'static str) -> WindowResult<()> {
-        let Some((rgba, width, height)) = &self.image else { return Ok(()) };
-        let (cw, ch) = self.size;
-        if self.iconic || cw == 0 || ch == 0 {
-            return Ok(());
-        }
-        let xl = &self.libs.xlib;
-        // SAFETY: a live display and its default screen; the visual is the server's, live for the
-        // connection.
-        let (visual, depth) = unsafe { ((xl.XDefaultVisual)(self.display, self.screen), (xl.XDefaultDepth)(self.display, self.screen)) };
-        // SAFETY: a live visual.
-        let masks = unsafe { ((*visual).red_mask, (*visual).green_mask, (*visual).blue_mask) };
-        if !(depth == 24 || depth == 32) || masks.0 == 0 || masks.1 == 0 || masks.2 == 0 {
-            return Err(x11(operation, "XPutImage", format!("the default visual is {depth}-bit with channel masks {masks:x?}; only 24- and 32-bit TrueColor is drawn")));
-        }
-        super::scale_nearest(rgba, *width as usize, *height as usize, &mut self.scaled, cw as usize, ch as usize);
-        // Each channel at its mask's place and width.
-        let place = |mask: c_ulong, value: u8| -> u32 {
-            let shift = mask.trailing_zeros();
-            let max = mask >> shift;
-            ((c_ulong::from(value) * max / 255) << shift) as u32
-        };
-        self.converted.resize(self.scaled.len(), 0);
-        for (d, p) in self.converted.chunks_exact_mut(4).zip(self.scaled.chunks_exact(4)) {
-            let pixel = place(masks.0, p[0]) | place(masks.1, p[1]) | place(masks.2, p[2]);
-            d.copy_from_slice(&pixel.to_le_bytes());
-        }
-        // SAFETY: an all-zero `XImage` is a valid value to fill; `XInitImage` sets its functions
-        // from the fields. The data is this window's buffer of `cw * ch` 32-bit pixels, and outlives
-        // the `XPutImage` (which copies it into the request) -- Xlib never frees it.
-        unsafe {
-            let mut image: xlib::XImage = core::mem::zeroed();
-            image.width = cw as c_int;
-            image.height = ch as c_int;
-            image.format = xlib::ZPixmap;
-            image.data = self.converted.as_mut_ptr().cast();
-            image.byte_order = xlib::LSBFirst;
-            image.bitmap_unit = 32;
-            image.bitmap_bit_order = xlib::LSBFirst;
-            image.bitmap_pad = 32;
-            image.depth = depth;
-            image.bytes_per_line = (cw * 4) as c_int;
-            image.bits_per_pixel = 32;
-            (image.red_mask, image.green_mask, image.blue_mask) = masks;
-            if (xl.XInitImage)(&raw mut image) == 0 {
-                return Err(x11(operation, "XInitImage", "Xlib refused the image's layout"));
-            }
-            let gc = (xl.XDefaultGC)(self.display, self.screen);
-            (xl.XPutImage)(self.display, self.window, gc, &raw mut image, 0, 0, 0, 0, cw, ch);
-            (xl.XFlush)(self.display);
-        }
-        Ok(())
+    /// A handle presenting to this window from any thread: point 8.
+    pub(super) fn presenter(&self) -> Presenter {
+        Presenter { canvas: Arc::clone(self.canvas.as_ref().expect("a created window has its canvas")) }
     }
 
+    /// The connection and the window, for `VkXlibSurfaceCreateInfoKHR`.
     pub(super) fn raw(&self) -> RawWindow {
         RawWindow::Xlib { display: self.display as usize, window: self.window as u64 }
     }
@@ -1727,6 +1821,10 @@ impl Drop for Window {
             }
             if self.blank_cursor != 0 {
                 (xl.XFreeCursor)(self.display, self.blank_cursor);
+            }
+            // Presenters stop before the window and the connection go (point 8).
+            if let Some(canvas) = &self.canvas {
+                canvas.lock().alive = false;
             }
             if self.window != 0 {
                 (xl.XDestroyWindow)(self.display, self.window);

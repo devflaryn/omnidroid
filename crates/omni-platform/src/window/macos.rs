@@ -324,13 +324,35 @@ impl Window {
     /// The image goes to the AppKit thread (a copy: the proxy's caller keeps its buffer), where it
     /// becomes the contents of a layer over the view: `appkit::present_rgba`.
     pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
-        let id = self.id;
-        let pixels = rgba.to_vec();
-        on_main(move |_| appkit::present_rgba(id, pixels, width, height))
+        self.presenter().present_rgba(rgba, width, height)
+    }
+
+    /// A handle presenting from any thread: the window's id, which every call carries to the
+    /// AppKit thread -- as this proxy's own calls do -- and which finds nothing once it is closed.
+    pub(super) fn presenter(&self) -> Presenter {
+        Presenter { id: self.id }
     }
 
     pub(super) fn raw(&self) -> RawWindow {
         self.raw
+    }
+}
+
+/// Presents to a window from any thread: see [`super::Presenter`].
+#[derive(Clone)]
+pub(super) struct Presenter {
+    id: u64,
+}
+
+impl Presenter {
+    pub(super) fn present_rgba(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        let (id, pixels) = (self.id, rgba.to_vec());
+        on_main(move |_| appkit::present_rgba(id, pixels, width, height))
+    }
+
+    pub(super) fn client_size(&self) -> Option<(u32, u32)> {
+        let id = self.id;
+        on_main(move |_| appkit::live_client_size(id))
     }
 }
 

@@ -133,3 +133,35 @@ fn a_short_buffer_or_an_empty_image_is_refused_by_name() {
     // And the window's events are unaffected by the refusals.
     assert!(window.poll_events().any(|e| matches!(e, WindowEvent::Resized { .. })), "the creation's size is still reported");
 }
+
+/// **A `Presenter` on another thread**: its image reaches the window, painted by the window's own
+/// thread as it pumps; its `client_size` answers the size a resize made; and once the window is
+/// dropped it presents nothing and says so with `None`.
+#[test]
+#[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+fn a_presenter_on_another_thread_presents_and_follows_the_size() {
+    require_gate();
+    let mut window = Window::new(&WindowDesc::new("omni presenter", 240, 120)).expect("a window");
+    window.show();
+    let presenter = window.presenter();
+    let image: Vec<u8> = RED.iter().chain(BLUE.iter()).copied().collect();
+    let from = std::thread::spawn({
+        let presenter = presenter.clone();
+        move || presenter.present_rgba(&image, 2, 1)
+    });
+    from.join().expect("the presenting thread").expect("present");
+    let (w, h) = window.client_size().expect("size");
+    assert!(
+        pump_until(&mut window, |win| hue(pixel(win, (w / 4) as i32, (h / 2) as i32)) == Hue::Red && hue(pixel(win, (w * 3 / 4) as i32, (h / 2) as i32)) == Hue::Blue),
+        "the other thread's image is not on the window"
+    );
+    window.set_client_size(317, 141).expect("resize");
+    let asked = std::thread::spawn({
+        let presenter = presenter.clone();
+        move || presenter.client_size()
+    });
+    assert_eq!(asked.join().expect("the asking thread"), Some(window.client_size().expect("size")));
+    drop(window);
+    assert_eq!(presenter.client_size(), None, "a presenter outliving its window has no size");
+    presenter.present_rgba(&[0; 4], 1, 1).expect("a present to a closed window is dropped, not refused");
+}

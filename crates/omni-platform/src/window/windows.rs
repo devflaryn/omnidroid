@@ -58,16 +58,19 @@
 //! (`GetAsyncKeyState`, through the swap setting `SM_SWAPBUTTON`) and reports up any that it
 //! finds up -- the safety net for a release no message brought.
 //!
-//! **8. A presented image is painted from `WM_PAINT`, and kept.** [`Window::present_rgba`] stores
-//! the image and asks for a paint (`InvalidateRect` + `UpdateWindow`, which sends `WM_PAINT` at
-//! once); `WM_PAINT` stretches it over the client area with `StretchDIBits`. Painting from the
-//! message rather than straight into the window's DC is what lets the window keep its content
-//! while the caller cannot present: during a border drag the modal loop (see [`super`]'s "Why
-//! polling") still dispatches `WM_PAINT`, and every `WM_SIZE` invalidates the whole client area --
-//! the class has no `CS_HREDRAW`/`CS_VREDRAW` -- so the last image follows the border instead of
-//! leaving the newly exposed strip undrawn.
+//! **8. A presented image is painted from `WM_PAINT`, and kept.** [`Window::present_rgba`] and a
+//! [`Presenter`] store the image in the window's [`Canvas`] and invalidate the client area;
+//! `WM_PAINT` stretches it over the client area with `StretchDIBits` (`Window::present_rgba`,
+//! on the window's thread, also calls `UpdateWindow`, which sends that `WM_PAINT` at once).
+//! Painting from the message rather than straight into a DC is what makes a [`Presenter`] on
+//! another thread live **during a border drag**: the modal loop (see [`super`]'s "Why polling")
+//! keeps the window's thread inside `DispatchMessageW`, and it still dispatches `WM_PAINT` for
+//! the invalidations the other thread makes -- and `GetClientRect`, which the presenter's
+//! `client_size` asks, answers the size the border is at. Every `WM_SIZE` invalidates the whole
+//! client area -- the class has no `CS_HREDRAW`/`CS_VREDRAW` -- so the image follows the border
+//! instead of leaving the newly exposed strip undrawn.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
@@ -158,10 +161,72 @@ struct WindowState {
     /// The pointer's last client position a message carried: where a release this window
     /// reports for a button whose own release was lost (point 7) is.
     last_pointer: (i32, i32),
-    /// The image [`super::Window::present_rgba`] last gave, which `WM_PAINT` stretches over the
-    /// client area (point 8). `None` for a window nothing was presented to -- one a swapchain owns
-    /// -- whose painting is left to `DefWindowProcW` as before.
+    /// What the window shows when something is presented to it (point 8), shared with its
+    /// [`Presenter`]s.
+    canvas: Arc<Mutex<Canvas>>,
+}
+
+/// The presented image, shared between the window's thread (which paints it) and any
+/// [`Presenter`] (which replaces it).
+struct Canvas {
+    /// `None` for a window nothing was presented to -- one a swapchain owns -- whose painting is
+    /// left to `DefWindowProcW` as before.
     image: Option<Image>,
+    /// Cleared, under this lock, before the window is destroyed: a presenter that finds it clear
+    /// touches no handle, since the `HWND` may by then name another window.
+    alive: bool,
+}
+
+/// Lock a canvas; a panic elsewhere while holding it leaves an image, which is still an image.
+fn lock(canvas: &Mutex<Canvas>) -> std::sync::MutexGuard<'_, Canvas> {
+    canvas.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Store `rgba` in the canvas as GDI's BGRA.
+fn store(canvas: &mut Canvas, rgba: &[u8], width: u32, height: u32) {
+    let image = canvas.image.get_or_insert_with(|| Image { bgra: Vec::new(), width: 0, height: 0 });
+    image.bgra.resize(rgba.len(), 0);
+    for (d, s) in image.bgra.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+        d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
+    }
+    (image.width, image.height) = (width, height);
+}
+
+/// Presents to a window from any thread: see [`super::Presenter`] and point 8.
+#[derive(Clone)]
+pub(super) struct Presenter {
+    /// The `HWND`, as an integer (a handle is not `Send`; the canvas's `alive` says when it is
+    /// still this window's).
+    hwnd: isize,
+    canvas: Arc<Mutex<Canvas>>,
+}
+
+impl Presenter {
+    /// Replace the image and invalidate the client area; the window's thread paints it at its
+    /// next message pump, inside a modal loop too. Nothing once the window is gone.
+    pub(super) fn present_rgba(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        let mut canvas = lock(&self.canvas);
+        if !canvas.alive {
+            return Ok(());
+        }
+        store(&mut canvas, rgba, width, height);
+        // SAFETY: the window is alive (checked under the lock its destruction takes first);
+        // `InvalidateRect` may be called from any thread and sends nothing. A null rectangle is
+        // the whole client area.
+        unsafe { InvalidateRect(self.hwnd as HWND, core::ptr::null(), 0) };
+        Ok(())
+    }
+
+    /// `GetClientRect`, callable from any thread: the size the border is at, mid-drag included.
+    pub(super) fn client_size(&self) -> Option<(u32, u32)> {
+        let canvas = lock(&self.canvas);
+        if !canvas.alive {
+            return None;
+        }
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window (checked under the lock); writes a `RECT`.
+        (unsafe { GetClientRect(self.hwnd as HWND, &raw mut rect) } != 0).then(|| (rect.right.unsigned_abs(), rect.bottom.unsigned_abs()))
+    }
 }
 
 /// A presented image, as GDI takes it: bottom-up is GDI's default, so the height in the header is
@@ -579,14 +644,15 @@ unsafe extern "system" fn wnd_proc(
             }
             // A presented image is stretched to the new size everywhere, not only over the strip
             // the resize exposed (point 8).
-            if state.image.is_some() {
+            if lock(&state.canvas).image.is_some() {
                 // SAFETY: a live window handle; a null rectangle is the whole client area.
                 unsafe { InvalidateRect(hwnd, core::ptr::null(), 0) };
             }
         }
-        WM_PAINT if state.image.is_some() => {
-            paint(hwnd, state);
-            return 0;
+        WM_PAINT => {
+            if paint(hwnd, state) {
+                return 0;
+            }
         }
         // **The display under the window changed** (`WindowEvent::DisplayChanged`). All three
         // still go on to `DefWindowProcW`: `WM_WINDOWPOSCHANGED`'s default is what sends `WM_SIZE`
@@ -744,13 +810,16 @@ unsafe extern "system" fn wnd_proc(
 }
 
 /// `WM_PAINT` for a window with a presented image: the image stretched over the whole client area
-/// (point 8). `BeginPaint` validates the update region whether or not anything is drawn, so a
-/// paint that cannot draw still ends the `WM_PAINT`s for it.
-fn paint(hwnd: HWND, state: &WindowState) {
+/// (point 8). `false`, having done nothing, for a window with none -- its `WM_PAINT` is
+/// `DefWindowProcW`'s. `BeginPaint` validates the update region whether or not anything is drawn,
+/// so a paint that cannot draw still ends the `WM_PAINT`s for it.
+fn paint(hwnd: HWND, state: &WindowState) -> bool {
+    let canvas = lock(&state.canvas);
+    let Some(image) = &canvas.image else { return false };
     let mut ps = PAINTSTRUCT::default();
     // SAFETY: a live window handle, in its `WM_PAINT`; writes the `PAINTSTRUCT`.
     let hdc = unsafe { BeginPaint(hwnd, &raw mut ps) };
-    if let (false, Some(image)) = (hdc.is_null(), &state.image) {
+    if !hdc.is_null() {
         let mut client = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         // SAFETY: writes a `RECT`; the handle is live.
         unsafe { GetClientRect(hwnd, &raw mut client) };
@@ -791,6 +860,7 @@ fn paint(hwnd: HWND, state: &WindowState) {
     }
     // SAFETY: pairs the `BeginPaint` above, with its `PAINTSTRUCT`.
     unsafe { EndPaint(hwnd, &raw const ps) };
+    true
 }
 
 /// Which button a mouse message is about.
@@ -882,7 +952,7 @@ impl Window {
             // `WM_SETFOCUS` says when it arrives: a window is created without the focus.
             focused: false,
             last_pointer: (0, 0),
-            image: None,
+            canvas: Arc::new(Mutex::new(Canvas { image: None, alive: true })),
         }));
 
         // `super::validate` has already bounded both axes to 1..=65535, so neither cast can
@@ -1287,25 +1357,19 @@ impl Window {
 
     /// Keep the image (as BGRA) and paint it now: point 8.
     pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
-        {
-            // SAFETY: as in `poll`: live for as long as `self`, and the window procedure is not
-            // running. The reference ends before `UpdateWindow` re-enters it.
-            let state = unsafe { &mut *self.state };
-            let image = state.image.get_or_insert_with(|| Image { bgra: Vec::new(), width: 0, height: 0 });
-            image.bgra.resize(rgba.len(), 0);
-            for (d, s) in image.bgra.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
-                d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
-            }
-            (image.width, image.height) = (width, height);
-        }
-        // SAFETY: a live window handle; a null rectangle is the whole client area. `UpdateWindow`
-        // sends the `WM_PAINT` to `wnd_proc` on this thread before it returns (none for a minimised
-        // window, which paints when restored).
-        unsafe {
-            InvalidateRect(self.hwnd, core::ptr::null(), 0);
-            UpdateWindow(self.hwnd);
-        }
+        self.presenter().present_rgba(rgba, width, height)?;
+        // SAFETY: a live window handle. `UpdateWindow` sends the `WM_PAINT` the presenter's
+        // invalidation asked for to `wnd_proc` on this thread before it returns (none for a
+        // minimised window, which paints when restored); no reference into the state is held.
+        unsafe { UpdateWindow(self.hwnd) };
         Ok(())
+    }
+
+    /// A handle presenting to this window from any thread (point 8).
+    pub(super) fn presenter(&self) -> Presenter {
+        // SAFETY: live for as long as `self`; the `Arc` is cloned, nothing else is touched.
+        let canvas = Arc::clone(&unsafe { &*self.state }.canvas);
+        Presenter { hwnd: self.hwnd as isize, canvas }
     }
 
     /// The `HWND` and the `HINSTANCE` its class was registered with.
@@ -1336,6 +1400,8 @@ impl Drop for Window {
         if invisible {
             refresh_cursor(self.hwnd, state);
         }
+        // Presenters stop before the handle can go stale (point 8).
+        lock(&state.canvas).alive = false;
         // SAFETY: a live window handle, destroyed from the thread that created it — which is the
         // only thread that can hold a `Window`, because it is `!Send`.
         unsafe { DestroyWindow(self.hwnd) };

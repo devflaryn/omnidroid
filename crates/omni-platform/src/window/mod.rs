@@ -28,7 +28,10 @@
 //! Window::warp_pointer(&mut self, x: i32, y: i32) -> WindowResult<()>
 //! Window::wait(&self, timeout: Duration) -> bool
 //! Window::present_rgba(&mut self, rgba: &[u8], width, height) -> WindowResult<()>
+//! Window::presenter(&self) -> Presenter
 //! Window::raw(&self) -> RawWindow
+//! Presenter::present_rgba(&self, rgba: &[u8], width, height) -> WindowResult<()>
+//! Presenter::client_size(&self) -> Option<(u32, u32)>
 //! ```
 //!
 //! so a backend that is missing one, or whose signature has drifted, does not build for that
@@ -138,10 +141,17 @@
 //! ([`scale_nearest`]).
 //!
 //! A window presented to this way **keeps its last image and repaints it itself** when the host
-//! asks (Windows' `WM_PAINT`, X11's `Expose`), stretched to whatever the client area is by then --
-//! which on Windows is what keeps a window with content while the user drags its border, when the
-//! modal loop in "Why polling" stops the caller from presenting. Use one source per window: a
-//! window with a swapchain on it must not also be presented to.
+//! asks (Windows' `WM_PAINT`, X11's `Expose`), stretched to whatever the client area is by then.
+//! Use one source per window: a window with a swapchain on it must not also be presented to.
+//!
+//! **From another thread: [`Presenter`].** [`Window::presenter`] hands out a `Send + Sync` handle
+//! that presents and reads the client size from any thread, while the window's own thread goes on
+//! polling it. That is what makes a live border drag possible on Windows: the modal loop in "Why
+//! polling" holds the window's thread for the whole drag, but it still paints what a presenter on
+//! another thread presents, and the presenter's [`Presenter::client_size`] follows the border as it
+//! moves -- so frames keep coming and the size is known mid-drag, although no
+//! [`WindowEvent::Resized`] can be drained until the drag ends. A presenter outliving its window
+//! does nothing: its presents are dropped and its size is `None`.
 //!
 //! # No refresh-rate query, on purpose
 //!
@@ -958,6 +968,14 @@ impl Window {
         self.inner.present_rgba(image, width, height)
     }
 
+    /// **A handle that presents to this window from any thread** (see this module's "From another
+    /// thread"). Cheap; any number may exist; each stops working, harmlessly, when the window is
+    /// dropped.
+    #[must_use]
+    pub fn presenter(&self) -> Presenter {
+        Presenter { inner: self.inner.presenter() }
+    }
+
     /// The native handle, for a graphics backend to build a surface on.
     ///
     /// Valid for as long as this `Window` is. A surface outliving its window is undefined
@@ -967,6 +985,51 @@ impl Window {
         self.inner.raw()
     }
 }
+
+/// **Presents to a [`Window`] from any thread**: [`Window::presenter`]'s handle, `Send + Sync` and
+/// cheap to clone. See the module's "From another thread".
+#[derive(Clone)]
+pub struct Presenter {
+    inner: backend::Presenter,
+}
+
+impl Presenter {
+    /// [`Window::present_rgba`], from any thread: the image replaces the window's, and the window's
+    /// thread paints it at its next message pump -- within a modal loop too. Once the window is
+    /// gone this does nothing and answers `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Window::present_rgba`].
+    pub fn present_rgba(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        validate_extent(width, height, "present_rgba")?;
+        let needed = width as usize * height as usize * 4;
+        let Some(image) = rgba.get(..needed) else {
+            return Err(WindowError::PixelsTooShort { operation: "present_rgba", width, height, needed, got: rgba.len() });
+        };
+        self.inner.present_rgba(image, width, height)
+    }
+
+    /// The window's client size in physical pixels as the host has it now -- on Windows asked of
+    /// the OS, so it follows a border drag as it happens; elsewhere as the window's thread last
+    /// heard it. `(0, 0)` while minimised; `None` once the window is gone.
+    #[must_use]
+    pub fn client_size(&self) -> Option<(u32, u32)> {
+        self.inner.client_size()
+    }
+}
+
+impl fmt::Debug for Presenter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Presenter").finish_non_exhaustive()
+    }
+}
+
+/// `Presenter` is `Send + Sync` on every backend, or this does not build.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<Presenter>();
+};
 
 /// **Nearest-neighbour scaling** of a packed 4-byte-per-pixel image (`src`, `sw` x `sh`) into
 /// `dst` at `dw` x `dh`, for a backend whose host has no scaler of its own (X11's core protocol).
