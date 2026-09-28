@@ -30,12 +30,104 @@ pub const FILES: &[(&str, &[u8])] = &[
     // script says why; `persist.omni.autogrant=0` turns it off).
     ("/vendor/etc/init/omni_autogrant.rc", include_bytes!("../device/vendor/etc/init/omni_autogrant.rc")),
     ("/vendor/bin/omni_autogrant.sh", include_bytes!("../device/vendor/bin/omni_autogrant.sh")),
+    // No background app processes kept: ActivityManager's cached-process limit (the script says
+    // why; `persist.omni.cached_processes`).
+    ("/vendor/etc/init/omni_lean.rc", include_bytes!("../device/vendor/etc/init/omni_lean.rc")),
+    ("/vendor/bin/omni_lean.sh", include_bytes!("../device/vendor/bin/omni_lean.sh")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a
 /// vendor partition holds for its hardware. Any other overlay path already in the image is an
 /// error.
 pub const REPLACES: &[&str] = &["/vendor/etc/sensors/hals.conf", "/vendor/etc/init/rild_goldfish.rc", "/vendor/etc/permissions/handheld_core_hardware.xml"];
+
+/// The image's apps and feature files this device does not have, as a product build leaves
+/// packages out of its `PRODUCT_PACKAGES`: PackageManager never scans them, so nothing starts them
+/// -- not a boot broadcast, and not `persistent` (which `pm disable-user` cannot stop: Android does
+/// not kill a persistent process when its package is disabled, run 2026-09-28: `com.android.se` and
+/// `com.android.emulator.multidisplay` alive after it). Each app process costs a host process of
+/// ~260 MiB (the same run: 16 such, 5.0 GiB beside the app). A directory drops what is under it.
+///
+/// What a device of this kind has no use for: telephony (no modem, `rild_goldfish.rc`; the
+/// `com.android.phone` stack is persistent), the secure element, the emulator's multi-display
+/// provider, Bluetooth (its feature files: no feature, no Bluetooth service), printing and backup
+/// (their features are gone from `handheld_core_hardware.xml` too, so their services never bind
+/// the apps), and the phone's own apps. Kept: everything PackageManager requires (installer,
+/// permission controller, ext services, settings, shell), the network stack, the WebView (the
+/// app loads it at start: `VariationsSeedServer`), the keyboard, media storage.
+pub const LEAVES_OUT: &[&str] = &[
+    // Telephony.
+    "/system/priv-app/TeleService",
+    "/system/priv-app/TelephonyProvider",
+    "/system_ext/priv-app/CarrierConfig",
+    "/system/app/Stk",
+    "/system/priv-app/MmsService",
+    "/system/priv-app/ONS",
+    "/system/priv-app/CellBroadcastLegacyApp",
+    "/system/app/CarrierDefaultApp",
+    "/system/app/SimAppDialog",
+    "/system_ext/priv-app/EmulatorRadioConfig",
+    "/product/priv-app/ImsServiceEntitlement",
+    "/product/priv-app/Dialer",
+    "/system/priv-app/CallLogBackup",
+    "/system_ext/priv-app/EmergencyInfo",
+    // The secure element and the emulator's displays: persistent.
+    "/system/app/SecureElement",
+    "/system_ext/priv-app/MultiDisplayProvider",
+    // Bluetooth: the features (SystemServer starts no Bluetooth service without them).
+    "/vendor/etc/permissions/android.hardware.bluetooth.xml",
+    "/vendor/etc/permissions/android.hardware.bluetooth_le.xml",
+    "/system/app/BluetoothMidiService",
+    // Printing and backup (features gone; nothing binds these).
+    "/system/app/PrintSpooler",
+    "/system/priv-app/BuiltInPrintService",
+    "/system/app/PrintRecommendationService",
+    "/system/priv-app/LocalTransport",
+    "/system/priv-app/SharedStorageBackup",
+    // Contacts, calendar, messaging.
+    "/product/priv-app/Contacts",
+    "/system/priv-app/ContactsProvider",
+    "/system/priv-app/E2eeContactKeysProvider",
+    "/system/priv-app/BlockedNumberProvider",
+    "/product/app/Calendar",
+    "/system/priv-app/CalendarProvider",
+    "/product/app/messaging",
+    // A phone's own apps.
+    "/product/app/Camera2",
+    "/product/app/Gallery2",
+    "/product/app/DeskClock",
+    "/product/app/Music",
+    "/product/app/PhotoTable",
+    "/product/app/QuickSearchBox",
+    "/product/app/Browser2",
+    "/system/app/EasterEgg",
+    "/system/app/BasicDreams",
+    "/system/priv-app/LiveWallpapersPicker",
+    "/system_ext/priv-app/ThemePicker",
+    "/system/priv-app/AvatarPicker",
+    "/system/priv-app/DeviceDiagnostics",
+    "/system/priv-app/DeviceAsWebcam",
+    "/system/app/Traceur",
+    "/system/priv-app/DynamicSystemInstallationService",
+];
+
+/// A kiosk device (`OMNI_DEVICE_APPS=kiosk`) has also no SystemUI and no launcher: no status bar,
+/// navigation bar, taskbar or keyguard, the app given the whole display from the first boot
+/// (`tests/d8_app_only.rs` ran it as SystemUI disabled at a second boot). The home is Settings'
+/// `FallbackHome`, which the system starts when no launcher is there.
+pub const KIOSK_LEAVES_OUT: &[&str] = &["/system_ext/priv-app/SystemUI", "/system_ext/priv-app/Launcher3QuickStep"];
+
+/// What `OMNI_DEVICE_APPS` makes of the image: `full` (the image as it is), `lean` (the default:
+/// [`LEAVES_OUT`] left out) or `kiosk` (and [`KIOSK_LEAVES_OUT`]). Read by each host process of an
+/// instance alike (the variable is inherited), so they all see one image.
+#[must_use]
+pub fn left_out() -> Vec<&'static str> {
+    match std::env::var("OMNI_DEVICE_APPS").as_deref() {
+        Ok("full") => Vec::new(),
+        Ok("kiosk") => LEAVES_OUT.iter().chain(KIOSK_LEAVES_OUT).copied().collect(),
+        _ => LEAVES_OUT.to_vec(),
+    }
+}
 
 /// An overlay file as the sysroot holds it: its guest path, its manifest entry, and the host file
 /// with its bytes.

@@ -9,16 +9,18 @@
 #   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -Cookie cookie.txt -Place 8737899170
 #   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -Minutes 60 -Size 1600x900
 #   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -NotResizable          # the app's own resizeableActivity
-#   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -Kiosk                 # no SystemUI: no bars, no taskbar, the app edge to edge
-#   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -ShowChrome            # the whole display, bars and taskbar included
+#   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -WithSystemUI          # the device with SystemUI and its launcher (~1.1 GB more)
+#   powershell -ExecutionPolicy Bypass -File tools\aosp_play.ps1 -WithSystemUI -ShowChrome  # ... and the whole display, bars and taskbar included
 #
-# The window shows only the app: the composer leaves the system's bars and taskbar out. The app
-# itself keeps clear of the bars unless it hides them (a game in play does) or -Kiosk is given (the
-# device set up without SystemUI and started again: about a minute more).
+# The device is a single-app one: no SystemUI and no launcher in its image, so no bars, no
+# taskbar, and the app edge to edge; apps it has no use for are not in its image either, and
+# Android keeps no background app process. -WithSystemUI keeps SystemUI and the launcher (the
+# composer then leaves their bars out of the window; the app keeps clear of them unless it hides
+# them, as a game in play does).
 #
 # The session ends after -Minutes (default 30). Closing the window ends the window, not the session.
 # The whole log is in %TEMP%\omni-linux-r-<pid>.log; screenshots of the display in
-# %TEMP%\omni-linux-r-<pid>-shots. Needs ~13 GB of free commit (close big games first).
+# %TEMP%\omni-linux-r-<pid>-shots. Needs ~8 GB of free commit (close big games first).
 param(
     [string]$Apk = "",
     [string]$Cookie = "",
@@ -26,7 +28,7 @@ param(
     [int]$Minutes = 30,
     [string]$Size = "",
     [switch]$NotResizable,
-    [switch]$Kiosk,
+    [switch]$WithSystemUI,
     [switch]$ShowChrome
 )
 $ErrorActionPreference = "Stop"
@@ -38,7 +40,7 @@ if ($Cookie) { $env:OMNI_R_COOKIE = (Resolve-Path $Cookie).Path }
 if ($Place -gt 0) { $env:OMNI_R_PLACE = [string]$Place }
 if ($Size) { $env:OMNI_WINDOW_SIZE = $Size }
 if ($NotResizable) { $env:OMNI_R_RESIZABLE = "0" }
-if ($Kiosk) { $env:OMNI_R_KIOSK = "1" }
+$env:OMNI_R_KIOSK = if ($WithSystemUI) { "0" } else { "1" }
 if ($ShowChrome) { $env:OMNI_APP_ONLY = "0" }
 # The build directory the vendored CPU backend needs (a short path: MAX_PATH).
 if (-not $env:OMNIDROID_DYNARMIC_BUILD_DIR) { $env:OMNIDROID_DYNARMIC_BUILD_DIR = "C:\od-unified" }

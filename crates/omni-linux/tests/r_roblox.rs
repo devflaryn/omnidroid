@@ -7,8 +7,8 @@
 //! their colour histograms). `OMNI_R_MINUTES` bounds the session (default 20); `OMNI_R_THEN`
 //! is shell run after the launch (a deep link, a cookie); `OMNI_R_EXPECT` names the lines that must
 //! have appeared, `|`-separated (default: the app's process started and a frame presented).
-//! `OMNI_R_KIOSK=1` runs the app on a device without SystemUI (set up, then started again): no
-//! bars, no taskbar, the whole display the app's. The composer presents only the app either way
+//! The app runs on a device without SystemUI or a launcher in its image (`OMNI_R_KIOSK=0`: with
+//! them): no bars, no taskbar, the whole display the app's, from the first boot. The composer presents only the app either way
 //! (`hal::composer`, `OMNI_APP_ONLY`).
 //!
 //! Minutes long: `cargo test -p omni-linux --release --test r_roblox -- --ignored --nocapture`.
@@ -94,18 +94,17 @@ fn the_apk_is_installed_started_and_draws() {
     // that nothing here uses are disabled, so they neither run nor come back -- each app host
     // process holds ~263 MiB, and with ~20 of them started at boot the host ran out of memory as
     // the game loaded (r11: two sessions stopped by Claude Code's low-memory reaper).
+    // What the device has no use for at all is not in its image (`omni_linux::device::LEAVES_OUT`:
+    // never started, not even at boot or when persistent), and ActivityManager keeps no cached app
+    // process (`omni_lean.sh`); these are the image's apps it still has, disabled once it is up.
     const IDLE_APPS: &[&str] = &[
-        "com.android.calendar", "com.android.providers.calendar", "com.android.contacts", "com.android.camera2",
-        "com.android.messaging", "com.android.printspooler", "com.android.cellbroadcastreceiver",
-        "com.android.cellbroadcastreceiver.module", "com.android.dynsystem", "com.android.traceur", "com.android.nfc",
-        "com.android.imsserviceentitlement", "com.android.healthconnect.controller", "com.android.ondevicepersonalization.services",
+        "com.android.cellbroadcastreceiver", "com.android.cellbroadcastreceiver.module", "com.android.nfc",
+        "com.android.healthconnect.controller", "com.android.ondevicepersonalization.services",
         "com.android.devicelockcontroller", "com.android.statementservice", "com.android.documentsui",
-        "com.android.localtransport", "com.android.emulator.multidisplay", "com.android.federatedcompute.services",
-        "com.android.adservices.api", "com.android.bluetooth", "com.android.managedprovisioning",
-        "com.android.se", "com.android.rkpdapp", "com.android.externalstorage", "com.android.keychain",
-        "com.android.ext.adservices.api", "com.android.providers.contacts", "com.android.providers.blockednumber",
-        "com.android.providers.userdictionary", "com.android.wallpaperbackup", "com.android.carrierconfig",
-        "com.android.providers.telephony", "com.android.stk", "com.android.mms.service", "com.android.cellbroadcastservice",
+        "com.android.federatedcompute.services", "com.android.adservices.api", "com.android.managedprovisioning",
+        "com.android.rkpdapp", "com.android.externalstorage", "com.android.keychain",
+        "com.android.ext.adservices.api", "com.android.providers.userdictionary", "com.android.wallpaperbackup",
+        "com.android.cellbroadcastservice",
     ];
     let lean = if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
         String::new()
@@ -116,17 +115,20 @@ fn the_apk_is_installed_started_and_draws() {
             IDLE_APPS.len()
         )
     };
-    // `OMNI_R_KIOSK=1`: a dedicated single-app device -- no SystemUI, so no status bar, navigation
-    // bar or taskbar (the launcher's taskbar lives only while SystemUI binds it), and the app is
-    // given the whole display. SystemUI is disabled once the device is set up, and the device
-    // started again: disabling it on a running device locks the device (Android shows the
-    // keyguard when the keyguard's service, SystemUI's, dies), and a package disabled at boot is
-    // never started (`tests/d8_app_only.rs`, stage 4).
-    let kiosk = std::env::var("OMNI_R_KIOSK").as_deref() == Ok("1");
-    // After the install: the package installer, which the install itself needed -- but not on a
-    // device that boots again (the kiosk): PackageManager does not start without an installer
-    // ("There must be exactly one installer; found []", system_server's death at boot).
-    let lean_after = if lean.is_empty() || kiosk { String::new() } else { "cmd package disable-user --user 0 com.android.packageinstaller >/dev/null 2>&1; ".to_string() };
+    // A dedicated single-app device (the default; `OMNI_R_KIOSK=0`: with SystemUI and the
+    // launcher, ~1.1 GiB more, run 2026-09-28) -- no SystemUI and no launcher in its image
+    // (`omni_linux::device::KIOSK_LEAVES_OUT`), so no status bar, navigation bar, taskbar or
+    // keyguard, and the app is given the whole display, from the first boot. (Disabling SystemUI
+    // on a running device locks it: Android shows the keyguard when the keyguard's service,
+    // SystemUI's, dies -- `tests/d8_app_only.rs` disables it and boots again.)
+    let kiosk = std::env::var("OMNI_R_KIOSK").as_deref() != Ok("0");
+    if kiosk {
+        std::env::set_var("OMNI_DEVICE_APPS", "kiosk");
+    }
+    // After the install: the package installer, which the install itself needed. (A device that
+    // boots again must keep it: PackageManager does not start without an installer, "There must
+    // be exactly one installer; found []".)
+    let lean_after = if lean.is_empty() { String::new() } else { "cmd package disable-user --user 0 com.android.packageinstaller >/dev/null 2>&1; ".to_string() };
     // `OMNI_R_AFTER_INSTALL`: shell run once the APK is installed, before its first start (an
     // app-op the APK asks for, granted as its owner would grant it in Settings).
     let after_install = std::env::var("OMNI_R_AFTER_INSTALL").map_or_else(|_| String::new(), |c| format!("{c}; echo \"[r] after install: $?\"; "));
@@ -158,14 +160,7 @@ fn the_apk_is_installed_started_and_draws() {
          am start -W -n \"$act\"; echo \"[r] am start: $?\"; \
          {sign_in}{join}{extra}"
     );
-    let then = if kiosk {
-        format!(
-            "{booted}{setup}echo \"[r] kiosk: $(pm disable-user --user 0 com.android.systemui 2>&1)\"; \
-             sleep 15; sync; echo \"[r] kiosk kept\""
-        )
-    } else {
-        format!("{booted}{setup}{launch}")
-    };
+    let then = format!("{booted}{setup}{launch}");
     let kept = instance.clone();
     // The device's language: the account's (`OMNI_R_LOCALE`, default tr-TR -- the owner's accounts
     // are Turkish). The app applies the account's locale to itself once signed in; on a device in
@@ -175,16 +170,6 @@ fn the_apk_is_installed_started_and_draws() {
     // relaunch activity", "Ending game session with place ID 8737899170").
     let locale = format!("persist.sys.locale={}", std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into()));
     let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote", "--setprop", &locale], &then);
-    if kiosk {
-        let mut kept = false;
-        boot.watch(Duration::from_secs(1800), |line| {
-            kept |= line.contains("[r] kiosk kept");
-            kept
-        });
-        assert!(kept, "the device was never set up without SystemUI\n{}", boot.tail());
-        eprintln!("[r] SystemUI disabled; the device is started again");
-        boot = boot.reboot(&sysroot, &["--zygote", "--setprop", &locale], &format!("{booted}input keyevent KEYCODE_WAKEUP; {launch}"));
-    }
     let expect: Vec<String> = std::env::var("OMNI_R_EXPECT")
         .unwrap_or_else(|_| "[zygote] launching com.roblox.client|frames presented".into())
         .split('|')

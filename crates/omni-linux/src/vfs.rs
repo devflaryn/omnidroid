@@ -108,6 +108,11 @@ impl Sysroot {
             }
             manifest.entries.insert(file.guest, file.entry);
         }
+        // What the device leaves out of the image (`device::left_out`): each path and what is under it.
+        for gone in crate::device::left_out() {
+            let (path, under) = (gone.as_bytes(), [gone.as_bytes(), b"/"].concat());
+            manifest.entries.retain(|p, _| p.as_slice() != path && !p.starts_with(&under));
+        }
         let mut sysroot = Self::build(dir, manifest, overlay);
         let meta_path = dir.join("sysroot.meta");
         if let Ok(bytes) = std::fs::read(&meta_path) {

@@ -1,0 +1,7 @@
+# omnidroid: no background app processes kept (/vendor/bin/omni_lean.sh says why). Root: it sets
+# ActivityManager's device configuration once the system answers, then ends.
+service omni_lean /system/bin/sh /vendor/bin/omni_lean.sh
+    class late_start
+    user root
+    group root shell
+    oneshot
