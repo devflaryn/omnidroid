@@ -1,0 +1,10 @@
+gate,run,start,seconds,exit,log
+c4_system_server,1,06:45:14,65,0,omni-linux-c4-46596.log
+c4_system_server,2,06:46:19,66,0,omni-linux-c4-60912.log
+c4_system_server,3,06:47:25,67,0,omni-linux-c4-63536.log
+c4_system_server,4,06:48:32,65,0,omni-linux-c4-30812.log
+c4_system_server,5,06:49:37,64,0,omni-linux-c4-61796.log
+d5_app_on_display,1,06:50:41,149,0,omni-linux-d5-65292.log
+d5_app_on_display,2,06:53:10,149,0,omni-linux-d5-46868.log
+d5_app_on_display,3,06:55:39,161,0,omni-linux-d5-45716.log
+done
