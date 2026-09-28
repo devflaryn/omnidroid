@@ -180,6 +180,19 @@ fn main() -> ExitCode {
     if let Some(caps) = caps {
         p.sys.set_caps(caps);
     }
+    // OMNI_THREAD_DUMP=<seconds>: the program's threads waiting in a system call for 2 s or more,
+    // every so often, by name and where they called from.
+    if let Some(every) = std::env::var("OMNI_THREAD_DUMP").ok().and_then(|v| v.parse::<u64>().ok()) {
+        let program = std::sync::Arc::clone(&p);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
+            let describe = |at: u64| program.mm.describe(at & 0x00ff_ffff_ffff_ffff).unwrap_or_else(|| format!("{at:#x}"));
+            let lines = omni_linux::process::blocked_calls(std::time::Duration::from_secs(2), describe);
+            eprintln!("[threads] pid {}: {} waiting
+[threads]   {}", program.sys.pid, lines.len(), lines.join("
+[threads]   "));
+        });
+    }
     // OMNI_MEM_TRACE=<seconds>: this host process's commit charge beside its program's guest
     // memory, every so often -- what the difference (the CPU backend's translations, the runtime's
     // own heap) costs per host process.

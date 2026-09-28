@@ -222,6 +222,34 @@ impl Task {
     }
 }
 
+/// `OMNI_THREAD_DUMP=<seconds>`: every task's system call in progress is kept (number, pc, lr,
+/// since when, the task's name), for [`blocked_calls`] -- where the threads of a process that has
+/// stopped making progress wait, without a full trace's cost.
+fn thread_dump() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OMNI_THREAD_DUMP").is_some())
+}
+
+type InFlight = std::collections::HashMap<i32, (u64, u64, u64, std::time::Instant, Vec<u8>)>;
+static IN_FLIGHT: Mutex<Option<InFlight>> = Mutex::new(None);
+
+/// The system calls in progress for longer than `at_least` (`OMNI_THREAD_DUMP`), each as a line:
+/// tid, name, call, and its return address named by `describe`.
+pub fn blocked_calls(at_least: std::time::Duration, describe: impl Fn(u64) -> String) -> Vec<String> {
+    let now = std::time::Instant::now();
+    let map = IN_FLIGHT.lock();
+    let mut out: Vec<(i32, String)> = map
+        .iter()
+        .flatten()
+        .filter(|(_, (_, _, _, since, _))| now.duration_since(*since) >= at_least)
+        .map(|(tid, (nr, pc, lr, since, name))| {
+            (*tid, format!("{tid} {:?} {} for {}s, lr {}, pc {}", String::from_utf8_lossy(name), name_of(*nr), now.duration_since(*since).as_secs(), describe(*lr), describe(*pc)))
+        })
+        .collect();
+    out.sort();
+    out.into_iter().map(|(_, s)| s).collect()
+}
+
 /// The in-loop syscall entry (`GuestCpu::set_svc_handler`): `ThunkContext` is the task's address.
 fn on_svc(call: &mut ThunkCall<'_>) {
     // SAFETY: the context is `&mut Task` of the task this CPU runs, set by `run_task`, which owns
@@ -274,7 +302,15 @@ fn on_svc(call: &mut ThunkCall<'_>) {
             eprintln!("[{}] {}({:#x}, {:#x}, {:#x}, {:#x}){what} ...", task.tid, name_of(number), args[0], args[1], args[2], args[3]);
         }
     }
+    if thread_dump() {
+        IN_FLIGHT.lock().get_or_insert_with(Default::default).insert(task.tid, (number, task.pc, task.lr, std::time::Instant::now(), task.name.clone()));
+    }
     let result = process.syscall(task, number, args);
+    if thread_dump() {
+        if let Some(m) = IN_FLIGHT.lock().as_mut() {
+            m.remove(&task.tid);
+        }
+    }
     if process.trace {
         // Path-taking calls show their path: what a trace is read for.
         use crate::syscall::nr;
