@@ -72,7 +72,8 @@ Fixed on the way (phase 2), each with a test that fails without it:
   vold waited forever on a property; not reproduced by `tests/props_order.rs`, argued in props.rs).
 - `5dd6ba1` the test device boots in the account's locale (tr-TR) so the app's locale change does
   not relaunch its game activity; `5bfcc91` 24 idle image apps disabled (memory: the reaper).
-- Open: com.android.phone crash-loops without a radio (47 restarts in r12), costing CPU.
+- `d36233b` no telephony feature (the device has no modem): com.android.phone restarted 47 times in
+  r12 ("failed to complete startup"); one D5 run after: 0 deaths, 0 IRadioModem waits (was 66).
 
 ### r11/r12 (2026-09-28 02:28-03:00 guest time): signed-in Home on the display, the game joined
 
