@@ -518,7 +518,11 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     let _ = shm.write_at(&u64::from_le_bytes(g).wrapping_add(1).to_le_bytes(), PENDING_GENERATION_AT);
     *in_flight.busy.lock() = true;
     let landing = Landing { table: Arc::clone(&t), device, fence, invalidate, staging_memory, mapped, bytes, shm, pixels_at, in_flight: Arc::clone(&in_flight) };
-    if let Err(std::sync::mpsc::SendError(landing)) = landings().lock().send(landing) {
+    // `OMNI_ASYNC_RELEASE=0`: landed here, on the app's thread, as before (for comparison).
+    static ASYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ASYNC.get_or_init(|| std::env::var("OMNI_ASYNC_RELEASE").as_deref() != Ok("0")) {
+        landing.land();
+    } else if let Err(std::sync::mpsc::SendError(landing)) = landings().lock().send(landing) {
         landing.land();
     }
     if a[4] != 0 {
