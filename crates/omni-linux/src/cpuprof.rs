@@ -34,6 +34,8 @@ struct Entry {
     classes: HashMap<String, u32>,
     /// `dyn` samples by offset in this executable (a 256-byte bucket), for symbolization.
     exe: HashMap<usize, u32>,
+    /// `kern` samples likewise: where in the kernel's handlers (or a module: its name and offset).
+    kern: HashMap<String, u32>,
 }
 
 static THREADS: Mutex<Option<HashMap<i32, Entry>>> = Mutex::new(None);
@@ -49,7 +51,7 @@ pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>) {
     let cpu = host.cpu_time().unwrap_or_default();
     THREADS.lock().get_or_insert_with(HashMap::new).insert(
         tid,
-        Entry { host, state: Arc::clone(state), name: name.to_vec(), cycles: 0, cpu, classes: HashMap::new(), exe: HashMap::new() },
+        Entry { host, state: Arc::clone(state), name: name.to_vec(), cycles: 0, cpu, classes: HashMap::new(), exe: HashMap::new(), kern: HashMap::new() },
     );
 }
 
@@ -96,6 +98,14 @@ fn sample_loop(every: u64) {
             let Ok(s) = e.host.sample(&mut code) else { continue };
             let page = s.ip & !0xfff;
             let kind = *kinds.entry(page).or_insert_with(|| sampler::memory_kind(s.ip).unwrap_or(MemoryKind::Other));
+            if kernel {
+                let at = match kind {
+                    MemoryKind::Image { base } if base == exe_base => format!("+{:#x}", (s.ip - exe_base) & !0xff),
+                    MemoryKind::Image { base } => format!("{}+{:#x}", module_of(base), (s.ip - base) & !0xff),
+                    _ => "other".to_string(),
+                };
+                *e.kern.entry(at).or_default() += 1;
+            }
             let class = match kind {
                 _ if kernel => "kern".to_string(),
                 MemoryKind::PrivateWritableExecutable { .. } => "jit".to_string(),
@@ -122,6 +132,7 @@ fn sample_loop(every: u64) {
                 e.cpu = now;
                 let classes = std::mem::take(&mut e.classes);
                 let exe = std::mem::take(&mut e.exe);
+                let kern = std::mem::take(&mut e.kern);
                 if used < Duration::from_millis(every * 50) {
                     return None; // under 5% of a core
                 }
@@ -132,8 +143,20 @@ fn sample_loop(every: u64) {
                 let mut hot: Vec<(usize, u32)> = exe.into_iter().collect();
                 hot.sort_by(|a, b| b.1.cmp(&a.1));
                 let hot: Vec<String> = hot.iter().take(4).map(|(o, n)| format!("+{o:#x}:{n}")).collect();
+                let mut kern: Vec<(String, u32)> = kern.into_iter().collect();
+                kern.sort_by(|a, b| b.1.cmp(&a.1));
+                let kern: Vec<String> = kern.iter().take(6).map(|(o, n)| format!("{o}:{n}")).collect();
                 let pct = used.as_secs_f64() * 100.0 / every as f64;
-                Some((used, format!("{tid} {:?} {pct:.0}%: {}{}", String::from_utf8_lossy(&e.name), shares.join(", "), if hot.is_empty() { String::new() } else { format!(" (exe {})", hot.join(" ")) })))
+                Some((
+                    used,
+                    format!(
+                        "{tid} {:?} {pct:.0}%: {}{}{}",
+                        String::from_utf8_lossy(&e.name),
+                        shares.join(", "),
+                        if hot.is_empty() { String::new() } else { format!(" (exe {})", hot.join(" ")) },
+                        if kern.is_empty() { String::new() } else { format!(" (kern {})", kern.join(" ")) }
+                    ),
+                ))
             })
             .collect();
         drop(guard);

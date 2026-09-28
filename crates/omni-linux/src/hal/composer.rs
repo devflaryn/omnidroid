@@ -432,9 +432,13 @@ impl Client {
 
 /// `OMNI_COMPOSER_TRACE=layers`: the frame's layers, bottom first, each time their list or their
 /// geometry changes -- what each is (its buffer's name), where, and whether the composer can take it.
-fn trace_layers(st: &mut State) {
+fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("layers")) {
+    *ON.get_or_init(|| std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("layers"))
+}
+
+fn trace_layers(st: &mut State) {
+    if !trace_on() {
         return;
     }
     let mut order: Vec<(i32, i64)> = st.layers.keys().map(|l| (st.device.get(l).map_or(0, |d| d.z), *l)).collect();
@@ -447,7 +451,11 @@ fn trace_layers(st: &mut State) {
             continue;
         };
         let buffer = d.slot.and_then(|s| d.buffers.get(&s)).map_or_else(
-            || "no buffer".to_string(),
+            || {
+                let mut held: Vec<_> = d.buffers.keys().collect();
+                held.sort_unstable();
+                format!("no buffer (slot {:?}; slots held {held:?})", d.slot)
+            },
             |b| format!("{:?} {}x{} fmt {:#x} stride {}", b.name, b.width, b.height, b.format, b.stride),
         );
         let frame = d.frame.as_ref().map(|f| format!("[{},{} {},{}]", f.left, f.top, f.right, f.bottom));
@@ -558,8 +566,22 @@ impl IComposerClientServer for Client {
                     }
                     let d = st.device.entry(layer.layer).or_default();
                     if let Some(buffer) = &layer.buffer {
-                        if let Some(b) = buffer.handle.as_ref().and_then(layer_buffer_of) {
-                            d.buffers.insert(buffer.slot, b);
+                        match buffer.handle.as_ref().map(|h| (h, layer_buffer_of(h))) {
+                            Some((_, Some(b))) => {
+                                d.buffers.insert(buffer.slot, b);
+                            }
+                            // A handle the composer cannot take (`OMNI_COMPOSER_TRACE=layers`
+                            // names it): the slot then holds nothing, and SurfaceFlinger composes.
+                            Some((h, None)) if trace_on() => eprintln!(
+                                "[composer] layer {} slot {}: a buffer not taken: {} fds ({}), {} ints {:x?}",
+                                layer.layer,
+                                buffer.slot,
+                                h.fds.len(),
+                                h.fds.iter().map(|Fd(f)| String::from_utf8_lossy(&crate::fd::guest_path_of(f)).into_owned()).collect::<Vec<_>>().join(", "),
+                                h.ints.len(),
+                                h.ints
+                            ),
+                            _ => {}
                         }
                         d.slot = Some(buffer.slot);
                     }
