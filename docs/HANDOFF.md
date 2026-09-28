@@ -13,7 +13,7 @@ unified root; `choose_apk` would pick it (higher versionCode), so always name th
 | phase | result | artifact |
 |---|---|---|
 | 1 address space | **fixed** (`d65fbe8`): 10/10 boots reach "System now ready" (72-75 s each, 0 `[mm]` refusals, 0 guest deaths). Before: 5/7 D5 logs of 09-27 reached it, 1/7 exhausted the space (49 refusals, 1,048,576 bytes free of 64 GiB) | `docs/runs/2026-09-28-phase1-c4-10boots.csv`; `tests/low_space.rs` (fails without the fix with the boot log's exact figure) |
-| 2 UI on the display | the engine's own Vulkan (RTX 4060 via `vulkan.omni.so`) draws Roblox's UI through SurfaceFlinger: the **signed-in Home** (r12). The logged-out login screen: r14 (see below) | `work/overnight/r12-home-signed-in.png` (12,189 colours, 66.5% #101010: Home, "HeZmI_ImYu1080", "Arkadaşlar (10)") |
+| 2 login screen | **the logged-out login screen on the host display** (r15): ROBLOX logo, "Hesap Oluştur" (Create Account), "Giriş Yap" (Log In), Koşullar/Gizlilik over the game-art backdrop, drawn by the engine's own Vulkan (RTX 4060 via `vulkan.omni.so`) through SurfaceFlinger; the engine's `onDataModelNotification() type:APP_READY data:Landing`. Also the **signed-in Home** (r12) | `work/overnight/r15-login-landing.png` (1,531 colours, 43.8% #000000, 9.7% #f8f8f8); `r12-home-signed-in.png` (12,189 colours: Home, "HeZmI_ImYu1080", "Arkadaşlar (10)"); `r15.log` |
 | 3 `--cookie` | **signed in, 4/4 runs** (r10-r13): `onDataModelNotification() type:DID_LOG_IN data:{"username":"HeZmI_ImYu1080",...,"countryCode":"TR","userId":5457009831}`; 0 HTTP 401/403 after it (r10) | `work/overnight/r10-signin-markers.txt`, `r13-markers.txt` |
 | 3 `--place` | **joined** (r13, `am start -d roblox://experiences/start?placeId=8737899170 -n .../.ActivityProtocolLaunch`): `GameJoinLoadTime join_time:1.773 referral_page:DeepLink placeid:8737899170`, `onGameStarted`, **`D/rbx.jni onGameLoaded() SessionReporterState_GameLoaded placeId:8737899170`**, `ExperienceSession onGameLoaded: placeId = 8737899170`. (The HLE gate's `JOIN: ... returned 1` does not exist on this path; the engine's `GameJoinLoadTime`/`onGameLoaded` are its equivalents.) | `work/overnight/r13-markers.txt`, `r13.log` |
 | 4 in place | **ran ~80 s, then Roblox ended it**: after `onGameLoaded`, frames kept presenting (727 -> 1,147 in 281 s, ~1.5/s); PS99's own in-place loading GUI drawn (BIG Games logo, 3/5 dots) under Roblox's in-experience top bar; the game's client scripts ran (r12: `✅ CLIENT \| _L took 1818ms to initialize!`). Then **"Client has been disconnected with reason: Roblox cannot be used in an emulated environment. Please run Roblox on a supported device."** (reason 305, `connectionTime 80142` ms). This is Roblox's emulator detection -- a security control; per this file's rules it is **not** worked around. The in-world screenshot and a settled world are therefore not reached | `work/overnight/r13-inplace-loading.png` (233 colours: 97.6% #f8f8f8, 1.3% #f89840 = the BIG Games logo), `r13-markers.txt` (the disconnect lines) |
@@ -59,6 +59,18 @@ Fixed on the way (phase 2), each with a test that fails without it:
 - `1792321` ftruncate of a mapped file (SQLite `-shm`): `SQLITE_IOERR_SHMOPEN` killed the
   contacts provider. `b1a8f08` kill(2) of an app in its own host process ("refused to die":
   `am force-stop` never stopped Roblox, so the planted cookie was never read); fallocate(2).
+
+### Later fixes (after r12)
+
+- `9724db0` abstract unix sockets across host processes (the WebView zygote; ActivityManager's
+  2,402 connect retries stalled system_server; `tests/xsocket.rs`, ENOENT before).
+- `b1a8f08` kill(2) of an app in its own host process; fallocate(2).
+- `1792321` ftruncate of a mapped file (SQLite `-shm`).
+- `fa11ddc` property changes published in order (r14: system_server killed by its Watchdog after
+  vold waited forever on a property; not reproduced by `tests/props_order.rs`, argued in props.rs).
+- `5dd6ba1` the test device boots in the account's locale (tr-TR) so the app's locale change does
+  not relaunch its game activity; `5bfcc91` 24 idle image apps disabled (memory: the reaper).
+- Open: com.android.phone crash-loops without a radio (47 restarts in r12), costing CPU.
 
 ### r11/r12 (2026-09-28 02:28-03:00 guest time): signed-in Home on the display, the game joined
 
