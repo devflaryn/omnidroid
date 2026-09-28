@@ -348,6 +348,12 @@ pub struct PropertyService {
     live: parking_lot::Mutex<Live>,
     /// Notified after every change, for init's `wait_for_prop`.
     changed: parking_lot::Condvar,
+    /// Held from a change's snapshot until every mapping has it: changes reach the mappings in the
+    /// order they were made. Two setters publishing unordered let an older snapshot land last --
+    /// a property went back to its old value and serial in a process's mapping, and a waiter on
+    /// that serial (vold's `WaitForProperty` for `selinux.restorecon_recursive`) slept for good;
+    /// system_server's Watchdog then killed it after 65 s in `IVold.prepareUserStorage` (r14).
+    publish: parking_lot::Mutex<()>,
 }
 
 struct Live {
@@ -381,6 +387,7 @@ impl PropertyService {
             std::sync::Arc::new(Self {
                 live: parking_lot::Mutex::new(Live { area, info, serial: 0, capacity, mappings: Vec::new() }),
                 changed: parking_lot::Condvar::new(),
+                publish: parking_lot::Mutex::new(()),
             })
         }))
     }
@@ -474,6 +481,7 @@ impl PropertyService {
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
             return PROP_ERROR_INVALID_VALUE;
         }
+        let _publishing = self.publish.lock();
         let mut live = self.live.lock();
         let changed_info = match live.info.get(name).copied() {
             Some(_) if name.starts_with("ro.") => return PROP_ERROR_READ_ONLY_PROPERTY,
