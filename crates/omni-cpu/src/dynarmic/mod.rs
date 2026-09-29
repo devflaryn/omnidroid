@@ -718,6 +718,12 @@ impl Planted {
     }
 }
 
+/// The jits of one guest address space's contexts, as addresses. A context is in it from the
+/// moment its jit exists until just before the jit is freed, and every use holds the lock, so an
+/// address read from it is a live jit for as long as the lock is held.
+#[derive(Default)]
+pub(crate) struct Peers(pub(crate) parking_lot::Mutex<Vec<usize>>);
+
 /// What every context of one guest address space shares.
 struct Shared {
     space: Arc<GuestSpace>,
@@ -735,6 +741,11 @@ struct Shared {
     /// [`DynarmicBackend::owns_guest_paging`].
     _pager: Option<DemandPager>,
     owns_guest_paging: bool,
+    /// The jits of this space's contexts, when each has its own translation cache (no shared cache:
+    /// arm64). A guest's `IC IVAU` is broadcast to all of them, as the architecture broadcasts it
+    /// to every core of the inner-shareable domain; with a shared cache one invalidation of it is
+    /// every context's already. See `callbacks::cb_icache_op`.
+    peers: Arc<Peers>,
     /// Processor ids handed back by dropped contexts.
     ///
     /// Recycled rather than monotonic, because a `processor_id` indexes into the shared exclusive
@@ -923,6 +934,7 @@ impl DynarmicBackend {
                 options,
                 _pager: pager,
                 owns_guest_paging,
+                peers: Arc::new(Peers::default()),
                 free_processors: parking_lot::Mutex::new(Vec::new()),
                 next_processor: AtomicU32::new(0),
                 ids_released_early: AtomicU64::new(0),
@@ -1558,6 +1570,8 @@ pub(crate) struct CpuCtx {
     /// instead of this context's own, and how many of this context's roles (thunk, inline thunk,
     /// sentinel) plant each address it counted in.
     pub(crate) shared_plants: Option<Arc<Planted>>,
+    /// This space's other contexts' jits, for a guest `IC IVAU` to reach (none with a shared cache).
+    pub(crate) peers: Option<Arc<Peers>>,
     pub(crate) plants_here: std::collections::HashMap<GuestAddr, u32>,
     pub(crate) ticks_remaining: u64,
     pub(crate) ticks_used: u64,
@@ -1680,6 +1694,7 @@ impl DynarmicCpu {
             last_fetch: 0,
             seen_blocks: None,
             shared_plants: None,
+            peers: shared.code_cache.is_none().then(|| Arc::clone(&shared.peers)),
             plants_here: std::collections::HashMap::new(),
             ticks_remaining: 0,
             ticks_used: 0,
@@ -1765,6 +1780,9 @@ impl DynarmicCpu {
         }
 
         let armed = options.assert_callback_free_slices && shared.owns_guest_paging;
+        if shared.code_cache.is_none() {
+            shared.peers.0.lock().push(jit as usize);
+        }
 
         Ok(Self {
             jit,
@@ -1978,6 +1996,10 @@ impl Drop for DynarmicCpu {
                 unsafe { od_code_cache_invalidate_range(cache.0, address as u64, 4) };
             }
         }
+        // Out of the peers first, under their lock: no other context's `IC IVAU` can then be
+        // reaching this jit when it is freed.
+        let jit = self.jit as usize;
+        self.shared.peers.0.lock().retain(|&p| p != jit);
         // SAFETY: `&mut self` means nothing is executing, and the jit is freed exactly once. It is
         // freed before `ctx`, `tpidr_el0` and `tpidrro_el0` — which are dropped after this — and
         // before the `Arc<Shared>` that owns the monitor it points at.

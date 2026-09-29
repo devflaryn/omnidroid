@@ -1150,6 +1150,12 @@ impl Process {
                 for (n, x) in regs.x.iter().enumerate() {
                     eprintln!("  x{n:<2} {x:#018x}{}", at(*x));
                 }
+                // The code around the fault, as it is in memory now (a packed library's is not
+                // what its file holds): 24 instructions before the pc, 8 from it.
+                if let Ok(code) = self.mem.read(pc.wrapping_sub(96) & !3, 128) {
+                    let words: Vec<String> = code.chunks_exact(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().expect("4")))).collect();
+                    eprintln!("  code at {:#x}: {}", pc.wrapping_sub(96) & !3, words.join(" "));
+                }
                 // The frame-pointer chain: AOSP builds arm64 with frame pointers.
                 let mut fp = regs.x[29];
                 for depth in 0..64 {

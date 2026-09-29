@@ -651,14 +651,29 @@ unsafe extern "C" fn cb_icache_op(ctx: *mut c_void, op: u32, vaddr: u64) {
             // `op` 0 is `IC IVAU` (one cache line); anything else is an all-instruction-cache
             // operation. dynarmic's own A64 frontend raises this from a `CheckHalt{ReturnToDispatch}`
             // terminal, so invalidating from here is safe.
-            if op == 0 {
-                // A cache line, not a word: the guest named a line and the architecture invalidates
-                // the whole of it. 64 bytes is `CTR_EL0`'s default line size on this pin
-                // (0x8444c004), and over-invalidating is correct-but-slower where
-                // under-invalidating is silently wrong.
-                dynarmic_sys::od_jit_invalidate_range(c.jit, vaddr & !63, 64);
-            } else {
-                dynarmic_sys::od_jit_clear_cache(c.jit);
+            let invalidate = |jit: *mut c_void| {
+                if op == 0 {
+                    // A cache line, not a word: the guest named a line and the architecture
+                    // invalidates the whole of it. 64 bytes is `CTR_EL0`'s default line size on
+                    // this pin (0x8444c004), and over-invalidating is correct-but-slower where
+                    // under-invalidating is silently wrong.
+                    dynarmic_sys::od_jit_invalidate_range(jit, vaddr & !63, 64);
+                } else {
+                    dynarmic_sys::od_jit_clear_cache(jit);
+                }
+            };
+            // Every thread of the space, as the architecture broadcasts it to every core: on
+            // arm64 each has its own translations, and a JIT that rewrites code another thread
+            // ran (ART reusing its code cache) otherwise leaves that thread running the old ones.
+            // Another jit's invalidation is queued and halts it (dynarmic's `InvalidateCacheRange`
+            // takes its own lock); the peers' lock keeps each one alive while it is reached.
+            match &c.peers {
+                Some(peers) => {
+                    for &jit in peers.0.lock().iter() {
+                        invalidate(jit as *mut c_void);
+                    }
+                }
+                None => invalidate(c.jit),
             }
         })
     }
