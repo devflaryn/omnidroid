@@ -33,6 +33,23 @@ build), 18,434,968 bytes. Time-boxed; the mechanism is **not** fully pinned (why
 * The faulting pc itself was not recorded (no signal trace in that run). The plaintext dumps made
   then (`~/omni-dump/...`) no longer exist.
 
+**The faulting instruction** (captured 17:20 the same day, on a quiet host,
+`OMNI_SIGNAL_TRACE_APP=com.roblox.client`, `$TMPDIR/omni-linux-r-10946.log:27647`). The same crash
+happened 20 s after the library loaded, with `fault addr 0x40` at pc `libzstd-jni+0x5f4320`, lr
+`+0x5f42a0` and frame `#00 +0x63d478`. Disassembled from the trace's code dump:
+
+```
++0x5f42d0  ldr  x9, [x9]          ; a pointer loaded from one of the library's globals
+  ...      (mixed boolean arithmetic: x8 = *global + 0x3f, obfuscated)
++0x5f4320  ldur x8, [x8, #1]      ; *(*global + 0x40)  <- faults: *global is null
++0x5f4324  blr  x8                ; an indirect call through that table slot
+```
+
+So the obfuscated (OLLVM-style) library calls through slot 0x40 of a function table whose pointer,
+in its own writable data, is still null on this thread's first use. The table is filled by the
+library's own initialisation after it decrypts itself; on the 16 KiB guest that initialisation
+did not fill it.
+
 ## What a 4 KiB guest changes
 
 * The file is no longer rewritten: `linker64` maps each segment where its headers say, at 4 KiB
@@ -58,8 +75,8 @@ pinning which one it was. A standalone reproduction would need the app's `JNI_On
 
 ## Why it stopped here
 
-Four boots attempted today to capture the faulting pc all died at about 220 s, before the app
-launched. `system_server`'s 60 s Watchdog fired on a host at load 21-25: Chrome's GPU process was
-using about 440% CPU. That was a separate problem, diagnosed from the logs (boot phases 1.4-2.0x
-slower than the good run, a different blocked frame each time). A quiet host is needed for the
-gate itself.
+Four boots earlier in the day died at about 220 s, before the app launched. `system_server`'s 60 s
+Watchdog fired on a host at load 21-25, with Chrome's GPU process at about 440% CPU. The fifth,
+with Chrome quit, booted and launched the app, and captured the pc above. Pinning which global
+stays null would take the decrypted text, which is out of scope: the fix removes both reasons the
+library could see a different world.
