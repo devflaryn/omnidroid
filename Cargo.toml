@@ -30,6 +30,10 @@ omni-bionic = { path = "crates/omni-bionic" }
 omni-texture = { path = "crates/omni-texture" }
 omni-gfx = { path = "crates/omni-gfx" }
 omni-core = { path = "crates/omni-core" }
+# The emulation-layer debugger (Phase B) and the MCP server (Phase A) that drives it. Both are
+# top-level tools; neither is depended on by a core crate.
+omni-debug = { path = "crates/omni-debug" }
+omni-mcp = { path = "crates/omni-mcp" }
 # The dynarmic FFI (preflight ruling P1). Only `omni-cpu` depends on it, and only on an x86-64
 # host: on an ARM64 host `ARCHITECTURE.md` section 6 runs guest code natively and there is no
 # translator to build.

@@ -1,0 +1,36 @@
+[package]
+name = "omni-debug"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Emulation-layer debugging and dumping: breakpoints, hooks, call_function and dump_module over a guest arm64 library loaded on the translating backend. Host-agnostic (D5: dynarmic on every host)."
+
+# The differentiator (night brief, Phase B): instrumentation that lives *below* the guest, so it is
+# invisible to the target, needs no ptrace, and is byte-for-byte the same on Windows, Linux and
+# macOS because the guest is always arm64 regardless of host CPU. It builds only on primitives that
+# already exist -- omni-cpu's breakpoints/thunks/return-sentinel, omni-mem's W^X and COW writes,
+# omni-elf's symbol tables -- and adds no OS access of its own (Global Constraint 4: no cfg(target_os)
+# here, no windows-sys/libc; what differs per host is omni-platform's, reached through omni-mem/omni-cpu).
+[dependencies]
+# The translating backend and the GuestCpu trait it satisfies. `dynarmic` is on: this crate's whole
+# job is to drive real guest code, and every host it targets (x86-64 Windows/Linux, arm64 macos)
+# has the backend. On an arm64 host the native path would serve too, but the lab uses the translator
+# uniformly so breakpoints and per-thread caches behave identically everywhere.
+omni-cpu = { workspace = true }
+omni-mem = { workspace = true }
+omni-elf = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The fixture library (tests/fixtures/libz.so) is a real AOSP arm64 object; crc32/adler32 are checked
+# against an oracle computed in the test itself, so no third-party checksum crate is needed.
+omni-platform = { workspace = true }
+
+# No [lints] forbidding unsafe: guest memory is reached through `GuestSpace::ptr`, which returns the
+# identity-mapped host pointer (D4) that only `unsafe` can read or write. Every such site carries a
+# SAFETY comment tying it to a range `GuestSpace` checked and the session committed.
