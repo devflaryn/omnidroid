@@ -275,6 +275,11 @@ fn main() -> ExitCode {
             each.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
             let largest: Vec<String> = each.iter().take(6).map(|(n, g, c)| format!("{n} {g}+{c}M")).collect();
             eprintln!("[mem] {name} host process {}: {} guest processes, guest memory {guest} MiB, translation caches {code} MiB; largest (guest+code): {}", std::process::id(), all.len(), largest.join(", "));
+            // The translation caches' own tables, on the host's heap (not in the caches' commit).
+            let census = omni_cpu::stats::code_caches_with_tables();
+            let tables: Vec<String> = census.tables.iter().filter(|t| t.bytes > 0).map(|t| format!("{} {} entries {} KiB", t.name, t.entries, t.bytes >> 10)).collect();
+            let heap: u64 = census.tables.iter().map(|t| t.bytes).sum();
+            eprintln!("[mem] {name} host process {}: {} code caches' tables on the heap {} MiB: {}", std::process::id(), census.caches, heap >> 20, tables.join(", "));
         });
     }
     // An app's host process: the system's properties, as they are now.

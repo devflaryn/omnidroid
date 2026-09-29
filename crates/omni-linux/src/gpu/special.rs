@@ -474,11 +474,20 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
                     return Ok(result(VK_ERROR_OUT_OF_HOST_MEMORY));
                 }
             }
-            passthrough4(gpu, p, id, a, &[c"vkAllocateMemory"])
+            let r = passthrough4(gpu, p, id, a, &[c"vkAllocateMemory"])?;
+            if r == result(VK_SUCCESS) && device_memory::on() {
+                // VkMemoryAllocateInfo: allocationSize at 16, memoryTypeIndex at 24.
+                let (size, index) = (rd_u64(p, a[1] + 16)?, rd_u32(p, a[1] + 24)?);
+                let (host_device, _) = gpu.dispatchable(p, a[0])?;
+                let flags = gpu.devices.lock().get(&host_device).and_then(|d| d.memory_types.get(index as usize).map(|m| m.property_flags.as_raw()));
+                device_memory::allocated(rd_u64(p, a[3])?, size, index, flags.unwrap_or(0));
+            }
+            Ok(r)
         }
         g::ID_VK_FREE_MEMORY => {
             let (h, t) = gpu.dispatchable(p, a[0])?;
             super::ahb::forget_memory(gpu, a[1]);
+            device_memory::freed(a[1]);
             const NAMES: &[&CStr] = &[c"vkFreeMemory"];
             // SAFETY: the Vulkan signature.
             let e: unsafe extern "system" fn(u64, u64, *const c_void) = unsafe { f(&t, id, NAMES)? };
@@ -573,6 +582,64 @@ fn passthrough4(gpu: &Gpu, p: &Process, id: u32, a: &[u64], names: &'static [&'s
     // create command is; the out-pointer is the guest's.
     let e: unsafe extern "system" fn(u64, u64, *const c_void, u64) -> i32 = unsafe { f(&t, id, names)? };
     Ok(result(unsafe { e(h, a[1], std::ptr::null(), a[3]) }))
+}
+
+/// `OMNI_GPU_MEM=<seconds>`: the app's live device memory by memory type (index, property flags:
+/// 1 device-local, 2 host-visible, 4 coherent, 8 cached), every so often -- which of a host
+/// process's commit is its own Vulkan allocations in host memory.
+mod device_memory {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
+    /// Live allocations: memory -> (size, type index, flags).
+    static LIVE: Mutex<Option<HashMap<u64, (u64, u32, u32)>>> = Mutex::new(None);
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let Some(every) = std::env::var("OMNI_GPU_MEM").ok().and_then(|v| v.parse::<u64>().ok()) else { return false };
+            *LIVE.lock() = Some(HashMap::new());
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(every.max(1)));
+                report();
+            });
+            true
+        })
+    }
+
+    pub(super) fn allocated(memory: u64, size: u64, index: u32, flags: u32) {
+        if let Some(live) = LIVE.lock().as_mut() {
+            live.insert(memory, (size, index, flags));
+        }
+    }
+
+    pub(super) fn freed(memory: u64) {
+        if let Some(live) = LIVE.lock().as_mut() {
+            live.remove(&memory);
+        }
+    }
+
+    fn report() {
+        let by: BTreeMap<(u32, u32), (u64, u64, u64)> = {
+            let live = LIVE.lock();
+            let mut by = BTreeMap::new();
+            for &(size, index, flags) in live.as_ref().map(|l| l.values()).into_iter().flatten() {
+                let e: &mut (u64, u64, u64) = by.entry((index, flags)).or_default();
+                e.0 += 1;
+                e.1 += size;
+                e.2 = e.2.max(size);
+            }
+            by
+        };
+        if by.is_empty() {
+            return;
+        }
+        let rows: Vec<String> = by.iter().map(|((i, f), (n, bytes, max))| format!("type {i} (flags {f:#x}): {n} allocations {} MiB (largest {} KiB)", bytes >> 20, max >> 10)).collect();
+        eprintln!("[gpu-mem] host pid {}: {}", std::process::id(), rows.join("; "));
+    }
 }
 
 /// The host command buffers behind `count` guest wrappers at `at`.
