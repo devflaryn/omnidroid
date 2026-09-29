@@ -193,7 +193,15 @@ pub const HARDWARE_LEFT_OUT: &[&str] = &[
 /// navigation bar, taskbar or keyguard, the app given the whole display from the first boot
 /// (`tests/d8_app_only.rs` ran it as SystemUI disabled at a second boot). The home is Settings'
 /// `FallbackHome`, which the system starts when no launcher is there.
+///
+/// `OMNI_KIOSK_IME=0` also leaves out the soft keyboard: the device's keyboard is the host's, which
+/// a text field takes without an input method, and LatinIME is a host process of its own (~120 MiB,
+/// run 2026-09-29) that every key visits first (`ImeInputStage`). Not the default: in PS99 without
+/// it the first held key took 347-425 ms and a few more keys ended with the app force-finished
+/// (run 2026-09-29, "runc"), cause not yet pinned.
 pub const KIOSK_LEAVES_OUT: &[&str] = &["/system_ext/priv-app/SystemUI", "/system_ext/priv-app/Launcher3QuickStep"];
+/// The soft keyboard, left out of a kiosk device with `OMNI_KIOSK_IME=0` (see [`KIOSK_LEAVES_OUT`]).
+pub const KIOSK_IME: &str = "/product/app/LatinIME";
 
 /// What `OMNI_DEVICE_APPS` makes of the image: `full` (the image as it is), `lean` (the default:
 /// [`LEAVES_OUT`] and [`HARDWARE_LEFT_OUT`] left out), `lean-hw` (only [`LEAVES_OUT`]: the hardware
@@ -203,7 +211,10 @@ pub const KIOSK_LEAVES_OUT: &[&str] = &["/system_ext/priv-app/SystemUI", "/syste
 pub fn left_out() -> Vec<&'static str> {
     match std::env::var("OMNI_DEVICE_APPS").as_deref() {
         Ok("full") => Vec::new(),
-        Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).copied().collect(),
+        Ok("kiosk") => {
+            let ime = (std::env::var("OMNI_KIOSK_IME").as_deref() == Ok("0")).then_some(KIOSK_IME);
+            LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).copied().chain(ime).collect()
+        }
         Ok("lean-hw") => LEAVES_OUT.to_vec(),
         _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).copied().collect(),
     }

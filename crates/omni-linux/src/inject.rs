@@ -341,6 +341,11 @@ impl Injector {
                         h,
                         SET_POINTER_ICON,
                         Arc::new(move |parcel: &[u8]| {
+                            // OMNI_POINTER_ICON_TRACE=1: each setPointerIcon heard, and what was read of it.
+                            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                            if *TRACE.get_or_init(|| std::env::var("OMNI_POINTER_ICON_TRACE").as_deref() == Ok("1")) {
+                                eprintln!("[inject] setPointerIcon: {} bytes, type {:?}, head {:02x?}", parcel.len(), pointer_icon_type(parcel), &parcel[..parcel.len().min(96)]);
+                            }
                             if let Some(t) = pointer_icon_type(parcel) {
                                 if icon.swap(t, Ordering::Relaxed) != t {
                                     eprintln!("[inject] the app's pointer icon: type {t}");

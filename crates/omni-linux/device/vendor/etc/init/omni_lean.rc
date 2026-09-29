@@ -1,5 +1,6 @@
 # omnidroid: no background app processes kept (/vendor/bin/omni_lean.sh says why). Root: it sets
-# ActivityManager's device configuration once the system answers, then ends.
+# ActivityManager's device configuration once the system answers; on a device without a launcher it
+# then stays, ending the placeholder home's process whenever it is in the background.
 service omni_lean /system/bin/sh /vendor/bin/omni_lean.sh
     class late_start
     user root

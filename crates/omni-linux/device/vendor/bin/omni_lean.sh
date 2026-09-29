@@ -30,3 +30,18 @@ until { [ "$(device_config get activity_manager max_cached_processes 2>/dev/null
     i=$((i+1))
 done
 log -t omni_lean "max_cached_processes $(device_config get activity_manager max_cached_processes 2>/dev/null), post-boot grace $(device_config get activity_manager no_kill_cached_processes_post_boot_completed_duration_millis 2>/dev/null) ms"
+
+# The home screen's process, once another app is in front. A kiosk device has no launcher: its home
+# is Settings' FallbackHome, a blank placeholder that ActivityManager keeps alive behind the app
+# (HOME_APP_ADJ, not cached, so the limit above spares it) -- the whole Settings app, ~200 MiB of
+# host process (run 2026-09-29), for a screen nobody sees. `cmd activity kill` is `am kill` without
+# starting a VM: it ends a package's processes only while they are in the background (adj >=
+# SERVICE_ADJ), so never while the home is in front, and Android starts it again if the home is
+# asked for. `setprop persist.omni.home_process keep` keeps it.
+[ "$(getprop persist.omni.home_process)" = keep ] && exit 0
+# Only without a launcher in the image (the kiosk device): a real home is left alone.
+[ -d /system_ext/priv-app/Launcher3QuickStep ] && exit 0
+while :; do
+    sleep 30
+    cmd activity kill com.android.settings >/dev/null 2>&1
+done
