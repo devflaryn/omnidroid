@@ -69,9 +69,12 @@ use crate::evdev::{ABS_X, ABS_Y, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN
 pub const HOST_KEYS: [u16; 2] = [125, 126];
 /// One wheel notch in the window seam's units.
 const NOTCH: i32 = 120;
-/// **How often a moving pointer is sent**, at most: 125 times a second, more than the display's
-/// frame rate, far less than a mouse's report rate. `OMNI_POINTER_HZ` changes it.
-pub const MOVE_EVERY: Duration = Duration::from_millis(8);
+/// **How often a moving pointer is sent**, at most: 60 times a second, as often as the display can
+/// show it (a game world here draws at 30-40), far less than a mouse's report rate. Each move is a
+/// trip through the input dispatcher and the app's translated UI thread: in PS99 a mouse streaming
+/// over the window cost the game ~10% of its frames at 125 a second (run base1) and ~5% at 60 (run
+/// F, 2026-09-29), with a click still landing in 2-9 ms. `OMNI_POINTER_HZ` changes it.
+pub const MOVE_EVERY: Duration = Duration::from_micros(16_667);
 
 /// Evdev events for one device, as one packet.
 pub type Packet = Vec<(u16, u16, i32)>;
