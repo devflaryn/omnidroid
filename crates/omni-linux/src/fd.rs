@@ -246,11 +246,6 @@ pub fn open_by(opener: Option<&Process>, vfs: &Vfs, cwd: &[u8], path: &[u8], fla
             FileKind::Host { file, guest: r.path.clone(), sysroot: true }
         }
         Node::HostFile { host } => {
-            // An app's library linked for smaller pages than this device's, laid out for them
-            // before anything reads it (`crate::pagecompat`).
-            if !write && r.path.starts_with(b"/data/app/") && r.path.ends_with(b".so") {
-                crate::pagecompat::realign_file(&host, omni_platform::vm::page_size() as u64);
-            }
             let file = std::fs::OpenOptions::new()
                 .read(flags & O_ACCMODE != 1)
                 .write(write)
