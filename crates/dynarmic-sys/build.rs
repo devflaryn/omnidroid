@@ -84,7 +84,7 @@ fn main() {
 
     let build_dir = match env::var_os("OMNIDROID_DYNARMIC_BUILD_DIR") {
         Some(v) => PathBuf::from(v),
-        None => out_dir.join("b"),
+        None => default_build_dir(&out_dir, &dynarmic_src),
     };
     check_path_budget(&build_dir);
     std::fs::create_dir_all(&build_dir).unwrap_or_else(|e| {
@@ -168,6 +168,35 @@ fn want_w_xor_x() -> bool {
         s("To retest it on a new pin anyway, set"),
         s("OMNIDROID_DYNARMIC_ALLOW_BROKEN_WX=1."),
     ])
+}
+
+/// Where the CMake build goes when `OMNIDROID_DYNARMIC_BUILD_DIR` is not set.
+///
+/// On a macOS host: a per-machine directory under `$HOME`,
+/// `~/Library/Caches/omnidroid/dynarmic/<target>-<profile>-<source>`, not the checkout. The
+/// ~4,000-object build then survives `cargo clean` and a checkout moved or cloned again, and it is
+/// not under a path with a space in it (`Omni Apps`), which CMake and Ninja take but every tool
+/// around them does not. `<source>` is a hash of the vendored tree's path, because one CMake
+/// directory serves exactly one source directory; `<profile>` keeps a debug and a release build
+/// from sharing (and racing in) one. Elsewhere: `OUT_DIR/b`, as always.
+fn default_build_dir(out_dir: &Path, dynarmic_src: &Path) -> PathBuf {
+    let home = env::var_os("HOME").filter(|h| !h.is_empty());
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") || !cfg!(target_os = "macos") {
+        return out_dir.join("b");
+    }
+    let Some(home) = home else { return out_dir.join("b") };
+    // FNV-1a: stable across Rust releases, unlike `DefaultHasher`, so the directory does not move
+    // with the toolchain.
+    let hash = dynarmic_src
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    let target = env::var("TARGET").unwrap_or_default();
+    let profile = env::var("PROFILE").unwrap_or_default();
+    PathBuf::from(home)
+        .join("Library/Caches/omnidroid/dynarmic")
+        .join(format!("{target}-{profile}-{hash:016x}"))
 }
 
 /// Refuses to start a build that MSVC will abandon with `C1083` a minute in.

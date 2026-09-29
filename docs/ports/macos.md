@@ -30,6 +30,12 @@ tools/play.sh --cookie <file> --place <id>                  # or target/release/
 python3 tools/footprint_mac.py --match '[d]eps/gameactivity' # memory from outside, optional
 ```
 
+* **dynarmic's CMake build is per machine**, not in the checkout: with no
+  `OMNIDROID_DYNARMIC_BUILD_DIR`, `dynarmic-sys/build.rs` builds in
+  `~/Library/Caches/omnidroid/dynarmic/<target>-<profile>-<hash of the source path>` (it survives
+  `cargo clean`, and the checkout's path may hold a space). The arm64 backend runs the arm64 guest:
+  dynarmic translates A64 to A64 (no x64 path is involved), with fastmem, the low window (D41) and
+  per-thread caches.
 * **The APK must not be a symbolic link**: the gate hard-links it into the guest's root, and the
   guest filesystem refuses a link to a symlink.
 * Off Windows, `dynarmic-sys/build.rs` passes `DYNARMIC_USE_BUNDLED_EXTERNALS=ON`; without it CMake

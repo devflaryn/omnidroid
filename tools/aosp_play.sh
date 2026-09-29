@@ -35,8 +35,9 @@ export OMNI_TEST_APK="$(abs "${apk:-$repo/Roblox-2.738.1397.apk}")"
 [ -n "$place" ] && export OMNI_R_PLACE="$place"
 [ -n "$size" ] && export OMNI_WINDOW_SIZE="$size"
 export OMNI_R_KIOSK="${OMNI_R_KIOSK:-1}"
-# The CPU backend's CMake build lives outside the checkout (a path with a space breaks nothing
-# there, and one build serves every checkout of this machine): see crates/dynarmic-sys/build.rs.
+# The CPU backend's CMake build lives outside the checkout on macOS, in
+# ~/Library/Caches/omnidroid/dynarmic (OMNIDROID_DYNARMIC_BUILD_DIR overrides): see
+# crates/dynarmic-sys/build.rs.
 rm -f "${TMPDIR:-/tmp}"/omni-shm-* 2>/dev/null || true
 cd "$repo"
 exec cargo test --release -q -p omni-linux --test r_roblox -- --ignored --nocapture
