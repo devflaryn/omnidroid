@@ -62,6 +62,7 @@ type VmProt = libc::c_int;
 
 const KERN_SUCCESS: KernReturn = 0;
 const VM_FLAGS_ANYWHERE: libc::c_int = 0x0001;
+const VM_FLAGS_FIXED: libc::c_int = 0x0000;
 const VM_INHERIT_NONE: libc::c_uint = 2;
 const VM_PROT_NONE: VmProt = 0;
 const TASK_VM_INFO: libc::c_int = 22;
@@ -314,6 +315,37 @@ pub(super) fn allocation_granularity() -> usize {
     page_size()
 }
 
+/// The end of the main executable's `__PAGEZERO` where it was loaded: its load commands' end
+/// (`getsegbyname` answers for the main executable, unslid) plus the executable's ASLR slide,
+/// because the page zero slides with it. The loader raises the map's minimum address to exactly
+/// that (`vm_map_raise_min_offset`), and on arm64 refuses an executable whose page zero is under
+/// 4 GiB. MEASURED: a fixed allocation anywhere from 4 GiB up to the executable's first byte is
+/// `KERN_INVALID_ADDRESS`. An executable with no page zero (none is built that way) answers the
+/// first page.
+pub(super) fn lowest_mappable_address() -> usize {
+    /// `struct segment_command_64`, as far as `vmsize` (`<mach-o/loader.h>`).
+    #[repr(C)]
+    struct SegmentCommand64 {
+        cmd: u32,
+        cmdsize: u32,
+        segname: [u8; 16],
+        vmaddr: u64,
+        vmsize: u64,
+    }
+    extern "C" {
+        fn getsegbyname(name: *const libc::c_char) -> *const SegmentCommand64;
+    }
+    // SAFETY: a NUL-terminated name; the answer is null or points into the main executable's
+    // mapped header, which lives as long as the process.
+    let segment = unsafe { getsegbyname(c"__PAGEZERO".as_ptr()) };
+    // SAFETY: non-null is a live `segment_command_64` in the header (see above).
+    let end = (!segment.is_null()).then(|| unsafe { (*segment).vmaddr + (*segment).vmsize }).unwrap_or(0);
+    // SAFETY: image 0 is the main executable, loaded before any Rust code runs.
+    let slide = unsafe { _dyld_get_image_vmaddr_slide(0) } as u64;
+    let end = if end == 0 { 0 } else { end.wrapping_add(slide) };
+    usize::try_from(end).unwrap_or(usize::MAX).max(page_size())
+}
+
 fn reserve_inner(operation: &'static str, size: usize, align: usize, kind: Kind) -> VmResult<usize> {
     let page = page_size();
     let len = round_up(size, page);
@@ -412,26 +444,29 @@ pub(super) fn reserve_placeholder(size: usize, align: usize) -> VmResult<usize> 
     reserve_inner("reserve_placeholder", size, align, Kind::Placeholder)
 }
 
+/// `mach_vm_allocate` with `VM_FLAGS_FIXED`: exactly `[base, base + len)` or `EEXIST`, never a
+/// replacement. Not an `mmap` hint: XNU moves a hint that falls where it keeps room for the heap
+/// -- the range just above the main executable, which is where a guest space's part above 4 GiB
+/// starts (D41) -- so a free range asked for by hint came back elsewhere (MEASURED: `0x1_0000_0000`
+/// with 38 MiB free below the executable).
 pub(super) fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<usize> {
+    const OP: &str = "reserve_placeholder_at";
     let len = round_up(size, page_size());
     let mut map = registry();
-    // SAFETY: a hint without MAP_FIXED replaces nothing; PROT_NONE grants no access. The result is
-    // checked against the hint, and a mapping elsewhere is given back.
-    let raw = unsafe {
-        libc::mmap(base as *mut libc::c_void, len, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
-    };
-    if raw == libc::MAP_FAILED {
-        return Err(os("reserve_placeholder_at", base, size));
+    let mut at = base as u64;
+    // SAFETY: a fixed allocation of fresh zero-fill memory replaces nothing (`KERN_NO_SPACE` if any
+    // of the range is in use) and touches no memory.
+    let kr = unsafe { mach_vm_allocate(task_self(), &mut at, len as u64, VM_FLAGS_FIXED) };
+    if kr != KERN_SUCCESS || at != base as u64 {
+        let code = if kr == KERN_INVALID_ADDRESS { libc::ENOMEM } else { libc::EEXIST };
+        return Err(refused(OP, base, size, code));
     }
-    if raw as usize != base {
-        // SAFETY: the mapping just made, which nothing else knows.
-        unsafe { libc::munmap(raw, len) };
-        return Err(VmError::Os {
-            operation: "reserve_placeholder_at",
-            address: base,
-            size,
-            source: OsError(libc::EEXIST as u32),
-        });
+    // SAFETY: the range just allocated, which nothing else knows; dropping its access touches no page.
+    let kr = unsafe { mach_vm_protect(task_self(), at, len as u64, 0, VM_PROT_NONE) };
+    if kr != KERN_SUCCESS {
+        // SAFETY: as above.
+        unsafe { mach_vm_deallocate(task_self(), at, len as u64) };
+        return Err(refused(OP, base, size, libc::EINVAL));
     }
     map.insert(base, Entry { len, kind: Kind::Placeholder });
     Ok(base)

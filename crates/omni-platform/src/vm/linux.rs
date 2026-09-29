@@ -124,6 +124,16 @@ pub(super) fn allocation_granularity() -> usize {
     page_size()
 }
 
+/// `vm.mmap_min_addr` (65536 by default), rounded up to a page; the first page if it cannot be read.
+pub(super) fn lowest_mappable_address() -> usize {
+    let page = page_size();
+    let min = std::fs::read_to_string("/proc/sys/vm/mmap_min_addr")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    round_up(min, page).unwrap_or(min).max(page)
+}
+
 fn round_up(value: usize, to: usize) -> Option<usize> {
     value.checked_add(to - 1).map(|v| v & !(to - 1))
 }

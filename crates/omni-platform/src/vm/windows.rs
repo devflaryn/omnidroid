@@ -459,6 +459,11 @@ pub(super) fn allocation_granularity() -> usize {
     system_info().dwAllocationGranularity as usize
 }
 
+/// `lpMinimumApplicationAddress`: 64 KiB, which the allocator never hands out.
+pub(super) fn lowest_mappable_address() -> usize {
+    (system_info().lpMinimumApplicationAddress as usize).max(page_size())
+}
+
 /// x86-64 has no Top Byte Ignore. Windows on arm64 is not a host Omnidroid claims, so nothing is
 /// claimed for it either: `false` is the answer that keeps a tagged pointer a fault.
 pub(super) const fn host_ignores_top_byte() -> bool {

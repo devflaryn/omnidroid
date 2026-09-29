@@ -455,6 +455,19 @@ pub fn page_size() -> usize {
     backend::page_size()
 }
 
+/// The least address this process can map anything at: a page multiple, never 0.
+///
+/// What decides whether a guest's low 4 GiB can be the host's own (D4) or must be a based window
+/// (D41): ART keeps its heap and boot image below 4 GiB. Windows: the 64 KiB the allocator never
+/// hands out. Linux: `vm.mmap_min_addr`. macOS: the end of the main executable's `__PAGEZERO` --
+/// **4 GiB on Apple silicon**, where an arm64 Mach-O must keep a hard page zero at least that large
+/// (a smaller one is killed at exec) and the map's minimum address is raised past it, so nothing
+/// below it can be mapped by any means.
+#[must_use]
+pub fn lowest_mappable_address() -> usize {
+    backend::lowest_mappable_address()
+}
+
 /// Whether this host's MMU ignores bits 56-63 of a user-space data address: arm64's Top Byte
 /// Ignore (`TCR_EL1.TBI0`), which the kernel chooses to enable or not.
 ///
@@ -524,7 +537,8 @@ pub fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<Reservation>
 ///
 /// Per host: Windows walks the range with `VirtualQuery` (anything not `MEM_FREE`, and anything
 /// past the highest address `VirtualQuery` will describe); Linux reads `/proc/self/maps`; macOS
-/// walks it with `mach_vm_region`. A host with no way to ask reports nothing known.
+/// walks it with `mach_vm_region`. A host with no way to ask reports nothing known. On every host,
+/// everything below [`lowest_mappable_address`] is reported held.
 ///
 /// # Errors
 ///
@@ -532,7 +546,11 @@ pub fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<Reservation>
 pub fn occupied_ranges(base: usize, size: usize) -> VmResult<Vec<(usize, usize)>> {
     check_size("occupied_ranges", size)?;
     let end = base.saturating_add(size);
-    Ok(clip_and_merge(backend::occupied_ranges(base, end)?, base, end))
+    let mut ranges = backend::occupied_ranges(base, end)?;
+    // Below the floor nothing can be reserved, and no host's walk names it: macOS's region walk
+    // never reports the page zero -- nor the part of it the executable's slide moved above 4 GiB.
+    ranges.push((0, lowest_mappable_address()));
+    Ok(clip_and_merge(ranges, base, end))
 }
 
 /// `ranges` clipped to `[base, end)`, sorted, with overlapping and touching ranges merged and empty
