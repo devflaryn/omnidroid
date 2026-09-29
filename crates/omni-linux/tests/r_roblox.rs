@@ -191,7 +191,10 @@ fn the_apk_is_installed_started_and_draws() {
                 std::thread::sleep(Duration::from_secs(3));
                 let store = kept.join("data/data/com.roblox.client/app_webview/Default/Cookies");
                 let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/plant_cookie.py");
-                let planted = std::process::Command::new("python").arg(&tool).arg(&store).arg(file).output();
+                // Windows installs `python`; Linux and macOS distributions name it `python3` (Ubuntu
+                // ships no `python` at all).
+                let python = if cfg!(windows) { "python" } else { "python3" };
+                let planted = std::process::Command::new(python).arg(&tool).arg(&store).arg(file).output();
                 let said = match &planted {
                     Ok(o) => format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
                     Err(e) => format!("python: {e}"),
