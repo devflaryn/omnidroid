@@ -143,3 +143,17 @@ fn an_egl_image_on_a_gralloc_buffer_renders_where_the_host_reads_it() {
     let status = rx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| panic!("ahbrender did not finish\n{}", report()));
     assert_eq!(status, ExitStatus::Exited(0), "{}", report());
 }
+
+/// Two buffers mapped at once through one target: each mapping is its buffer's, as a renderer
+/// streaming vertices and indices relies on (`fixtures/glmaps.c` says what went wrong before).
+#[test]
+fn a_mapping_belongs_to_its_buffer_not_to_the_target() {
+    let Some((sysroot, instance)) = prepare("maps", "glmaps") else { return };
+    let (p, out, err) = spawn(&sysroot, &instance, &["/data/local/tmp/glmaps"], 10_000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(p.run()));
+    let status = rx.recv_timeout(Duration::from_secs(180)).unwrap_or_else(|_| panic!("glmaps did not finish\nstdout: {}\nstderr: {}", text(&out), text(&err)));
+    let (out, err) = (text(&out), text(&err));
+    assert_eq!(status, ExitStatus::Exited(0), "glmaps\nstdout: {out}\nstderr: {err}");
+    assert!(out.contains("glmaps ok"), "stdout: {out}\nstderr: {err}");
+}

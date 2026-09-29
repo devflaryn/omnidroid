@@ -625,6 +625,10 @@ struct ContextInfo {
     images: HashMap<u64, Image>,
     /// The guest's texture (0) and renderbuffer (1) names targeted with an image.
     names: HashMap<(u8, u32), u64>,
+    /// Buffer maps, by buffer object: a mapping is its buffer's, not its target's -- two buffers can
+    /// be mapped at once through one target, bound in turn (a renderer streaming vertices and
+    /// indices does), and `glUnmapBuffer(target)` unmaps whichever is bound now.
+    maps: HashMap<u32, Mapping>,
 }
 
 struct Mapping {
@@ -634,13 +638,37 @@ struct Mapping {
     access: u64,
 }
 
+/// The `glGetIntegerv` name of the buffer bound to a buffer `target` (ES 3.2's targets), or none.
+#[must_use]
+pub fn binding_of(target: u32) -> Option<u32> {
+    Some(match target {
+        0x8892 => 0x8894, // ARRAY_BUFFER
+        0x8893 => 0x8895, // ELEMENT_ARRAY_BUFFER
+        0x88EB => 0x88ED, // PIXEL_PACK_BUFFER
+        0x88EC => 0x88EF, // PIXEL_UNPACK_BUFFER
+        0x8A11 => 0x8A28, // UNIFORM_BUFFER
+        0x8C8E => 0x8C8F, // TRANSFORM_FEEDBACK_BUFFER
+        0x8F36 => 0x8F36, // COPY_READ_BUFFER (its binding's name is the same)
+        0x8F37 => 0x8F37, // COPY_WRITE_BUFFER
+        0x8F3F => 0x8F43, // DRAW_INDIRECT_BUFFER
+        0x90D2 => 0x90D3, // SHADER_STORAGE_BUFFER
+        0x90EE => 0x90EF, // DISPATCH_INDIRECT_BUFFER
+        0x92C0 => 0x92C1, // ATOMIC_COUNTER_BUFFER
+        0x8C2A => 0x8C2A, // TEXTURE_BUFFER
+        _ => return None,
+    })
+}
+
+/// The buffer object bound to `target` in the current context (0: none, or not a buffer target).
+fn bound_buffer(h: &Host, target: u32) -> u32 {
+    binding_of(target).map_or(0, |pname| h.get_integer(pname) as u32)
+}
+
 #[derive(Default)]
 struct Current {
     context: usize,
     draw: u64,
     read: u64,
-    /// Buffer maps, by target.
-    maps: HashMap<u32, Mapping>,
 }
 
 thread_local! {
@@ -810,7 +838,10 @@ fn special_call(p: &Process, id: u32, a: &[u64]) -> u64 {
             flush_mapped(h, p, arg(0) as u32, arg(1), arg(2));
             0
         }
-        special::BUFFER_POINTER => CURRENT.with(|c| c.borrow().maps.get(&(arg(0) as u32)).map_or(0, |m| m.shadow)),
+        special::BUFFER_POINTER => {
+            let buffer = bound_buffer(h, arg(0) as u32);
+            context_info(current_context()).and_then(|i| i.lock().maps.get(&buffer).map(|m| m.shadow)).unwrap_or(0)
+        }
         special::IMAGE_TARGET => {
             image_target(h, p, arg(0), arg(1) as u32, arg(2), arg(3), arg(4) as u32, arg(5) as u32, arg(6) as u32);
             0
@@ -1216,7 +1247,10 @@ fn map(h: &Host, p: &Process, target: u32, offset: u64, length: u64, access: u64
             return 0;
         }
     }
-    CURRENT.with(|c| c.borrow_mut().maps.insert(target, Mapping { host, shadow, length, access }));
+    let buffer = bound_buffer(h, target);
+    if let Some(info) = context_info(current_context()) {
+        info.lock().maps.insert(buffer, Mapping { host, shadow, length, access });
+    }
     1
 }
 
@@ -1230,7 +1264,8 @@ fn copy_out(p: &Process, m: &Mapping, from: usize, len: usize) {
 }
 
 fn unmap(h: &Host, p: &Process, target: u32) -> u64 {
-    let m = CURRENT.with(|c| c.borrow_mut().maps.remove(&target));
+    let buffer = bound_buffer(h, target);
+    let m = context_info(current_context()).and_then(|i| i.lock().maps.remove(&buffer));
     if let Some(m) = &m {
         if m.access & GL_MAP_WRITE_BIT != 0 && m.access & GL_MAP_FLUSH_EXPLICIT_BIT == 0 {
             copy_out(p, m, 0, m.length);
@@ -1241,11 +1276,12 @@ fn unmap(h: &Host, p: &Process, target: u32) -> u64 {
 }
 
 fn flush_mapped(h: &Host, p: &Process, target: u32, offset: u64, length: u64) {
-    CURRENT.with(|c| {
-        if let Some(m) = c.borrow().maps.get(&target) {
+    let buffer = bound_buffer(h, target);
+    if let Some(info) = context_info(current_context()) {
+        if let Some(m) = info.lock().maps.get(&buffer) {
             copy_out(p, m, offset as usize, length as usize);
         }
-    });
+    }
     h.call("glFlushMappedBufferRange", &[u64::from(target), offset, length]);
 }
 
@@ -1465,6 +1501,14 @@ mod tests {
         let up = from_buffer(&half, 1, 1, HAL_RGBA_FP16, 1).unwrap();
         assert_eq!((up.pixels.as_slice(), up.internal, up.kind), (&half[..], GL_RGBA16F, GL_HALF_FLOAT));
         assert_eq!(from_buffer(&[0; 4], 1, 1, HAL_RGBA_1010102, 1).unwrap().internal, GL_RGB10_A2);
+    }
+
+    #[test]
+    fn every_buffer_target_names_its_binding() {
+        assert_eq!(binding_of(0x8892), Some(0x8894), "ARRAY_BUFFER");
+        assert_eq!(binding_of(0x8893), Some(0x8895), "ELEMENT_ARRAY_BUFFER");
+        assert_eq!(binding_of(0x8A11), Some(0x8A28), "UNIFORM_BUFFER");
+        assert_eq!(binding_of(0x0DE1), None, "TEXTURE_2D is not a buffer target");
     }
 
     #[test]
