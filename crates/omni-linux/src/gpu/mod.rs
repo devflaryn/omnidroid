@@ -58,12 +58,27 @@ impl CallError {
 
 type GetProcAddr = unsafe extern "system" fn(u64, *const c_char) -> Option<unsafe extern "system" fn()>;
 
-/// The host's Vulkan loader, loaded once per host process.
+/// The host's Vulkan loader, loaded once per host process: where the platform says a loader may
+/// be (`omni_platform::window::vulkan_loader_candidates`, as `omni-gfx` loads it), else the
+/// system's default. On macOS the default finds nothing -- dyld does not search Homebrew's
+/// `/opt/homebrew/lib` -- and every forwarded command answered `ENODEV` (SurfaceFlinger's ANGLE then
+/// had no instance extensions and aborted: the first real-AOSP boot on the M1).
 pub(crate) fn entry() -> Result<&'static ash::Entry, CallError> {
     static ENTRY: OnceLock<Option<ash::Entry>> = OnceLock::new();
-    // SAFETY: loading the system's Vulkan loader runs its initializers, which is what loading it
-    // is for; it is loaded once and never unloaded.
-    ENTRY.get_or_init(|| unsafe { ash::Entry::load() }.ok()).as_ref().ok_or(CallError::NoHost)
+    ENTRY
+        .get_or_init(|| {
+            let candidates = omni_platform::window::vulkan_loader_candidates();
+            // SAFETY: loading the host's Vulkan loader runs its initializers, which is what loading
+            // it is for; it is loaded once and never unloaded.
+            let loaded = candidates.iter().find_map(|path| unsafe { ash::Entry::load_from(path) }.ok());
+            let entry = loaded.or_else(|| unsafe { ash::Entry::load() }.ok());
+            if entry.is_none() {
+                eprintln!("[gpu] no host Vulkan loader: tried {candidates:?} and the system default");
+            }
+            entry
+        })
+        .as_ref()
+        .ok_or(CallError::NoHost)
 }
 
 /// The host driver's entry points for one host `VkInstance` or `VkDevice`, each resolved once.
@@ -75,6 +90,11 @@ pub(crate) struct Table {
 }
 
 impl Table {
+    /// The host instance or device this table's entry points belong to.
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
+    }
+
     pub(crate) fn new(get_proc: GetProcAddr, owner: u64) -> Arc<Self> {
         Arc::new(Self { get_proc, owner, fns: (0..generated::COMMANDS.len()).map(|_| AtomicUsize::new(0)).collect() })
     }
@@ -285,7 +305,13 @@ pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> S
         eprintln!("[gpu] {}:{} {name} {args:x?}", p.sys.pid, t.tid);
     }
     let started = stats::on().then(std::time::Instant::now);
-    let answer = if id >= special::ID_GRALLOC_USAGE { special::extra(gpu, p, id, &args) } else { generated::dispatch(gpu, p, id, &args) };
+    let answer = if id >= special::ID_GRALLOC_USAGE {
+        special::extra(gpu, p, id, &args)
+    } else if let Some(answer) = special::foreign_barrier(gpu, p, id, &args) {
+        answer
+    } else {
+        generated::dispatch(gpu, p, id, &args)
+    };
     if let Some(t0) = started {
         stats::add(id, t0.elapsed());
     }
