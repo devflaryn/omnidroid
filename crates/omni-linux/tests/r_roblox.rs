@@ -64,7 +64,12 @@ fn the_apk_is_installed_started_and_draws() {
     let tmp = instance.join("data/local/tmp");
     std::fs::create_dir_all(&tmp).expect("/data/local/tmp");
     std::fs::copy(&apk, tmp.join("app.apk")).expect("the APK");
-    let screenshot = instance.with_extension("png");
+    // A caller (the MCP server, `omni-mcp`) can name the live framebuffer PNG up front by presetting
+    // OMNI_SCREENSHOT, so it knows where to read a frame from without guessing this process's pid.
+    // Otherwise the default is this instance's own path.
+    let screenshot = std::env::var_os("OMNI_SCREENSHOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| instance.with_extension("png"));
     let shots = std::env::temp_dir().join(format!("{tag}-shots"));
     let _ = std::fs::create_dir_all(&shots);
     std::env::set_var("OMNI_SCREENSHOT", &screenshot);

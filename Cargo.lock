@@ -363,6 +363,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-mcp"
+version = "0.1.0"
+dependencies = [
+ "omni-apk",
+ "omni-debug",
+ "omni-platform",
+]
+
+[[package]]
 name = "omni-mem"
 version = "0.1.0"
 dependencies = [
