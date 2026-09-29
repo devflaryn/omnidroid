@@ -179,6 +179,13 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     if nice.is_some() && std::env::var("OMNI_TRACE_APP").ok().as_deref() == nice {
         cmd.env("OMNI_SYSCALL_TRACE", "1");
     }
+    // OMNI_SIGNAL_TRACE_APP=<process name>: that app's host process traces every signal it
+    // delivers, with registers (`OMNI_SIGNAL_TRACE`). Only that process: traced system-wide, ART's
+    // implicit null checks in system_server print thirty lines each, and its Watchdog kills it
+    // mid-boot (runs 2026-09-29, both at ~220 s).
+    if nice.is_some() && std::env::var("OMNI_SIGNAL_TRACE_APP").ok().as_deref() == nice {
+        cmd.env("OMNI_SIGNAL_TRACE", "1");
+    }
     // OMNI_THREAD_DUMP_APP=<process name>: that app's host process lists its threads waiting in a
     // system call every 15 s (`OMNI_THREAD_DUMP`).
     if nice.is_some() && std::env::var("OMNI_THREAD_DUMP_APP").ok().as_deref() == nice {
