@@ -31,14 +31,18 @@ pub struct Launcher {
 /// Bind `/dev/socket/zygote` in `instance` (the key a process's sockets are named in) and answer
 /// it on host threads.
 pub fn serve(instance: usize, launcher: Launcher) {
-    let bound = crate::unix::Bound::bind_replacing(instance, b"/dev/socket/zygote", 1, [0, 0, 0]);
+    serve_at(instance, b"/dev/socket/zygote", Arc::new(launcher));
+}
+
+/// Answer the zygote protocol on socket `name` in `instance`.
+fn serve_at(instance: usize, name: &[u8], launcher: Arc<Launcher>) {
+    let bound = crate::unix::Bound::bind_replacing(instance, name, 1, [0, 0, 0]);
     bound.listening.store(true, std::sync::atomic::Ordering::SeqCst);
-    let launcher = Arc::new(launcher);
     let _ = std::thread::Builder::new().name("zygote".into()).spawn(move || loop {
         match bound.accept() {
             Some(socket) => {
                 let launcher = Arc::clone(&launcher);
-                let _ = std::thread::Builder::new().name("zygote-conn".into()).spawn(move || connection(socket, &launcher));
+                let _ = std::thread::Builder::new().name("zygote-conn".into()).spawn(move || connection(socket, &launcher, instance));
             }
             None => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
@@ -62,7 +66,7 @@ fn line(socket: &mut Socket, pending: &mut Vec<u8>) -> Option<String> {
     }
 }
 
-fn connection(mut socket: Socket, launcher: &Launcher) {
+fn connection(mut socket: Socket, launcher: &Arc<Launcher>, instance: usize) {
     let mut pending = Vec::new();
     loop {
         let Some(count) = line(&mut socket, &mut pending) else { return };
@@ -72,7 +76,7 @@ fn connection(mut socket: Socket, launcher: &Launcher) {
             let Some(a) = line(&mut socket, &mut pending) else { return };
             args.push(a);
         }
-        let reply = answer(&args, launcher);
+        let reply = answer(&args, launcher, instance);
         if let Some(reply) = reply {
             if crate::socket::send(&mut socket, &reply).is_err() {
                 return;
@@ -92,10 +96,16 @@ fn string(s: &str) -> Vec<u8> {
 }
 
 /// The zygote's answer to one command (`None`: it answers nothing).
-fn answer(args: &[String], launcher: &Launcher) -> Option<Vec<u8>> {
+fn answer(args: &[String], launcher: &Arc<Launcher>, instance: usize) -> Option<Vec<u8>> {
     let first = args.first().map(String::as_str).unwrap_or_default();
     if first.starts_with("--usap-pool-enabled") {
         return None;
+    }
+    // A child zygote's preload (`ZygoteProcess.preloadPackageForAbi`, `preloadApp`): the paths
+    // after it are not a class to start. Nothing is preloaded -- each process this answers starts
+    // in a host process of its own and loads what it uses -- and 0 is the zygote's success.
+    if matches!(first, "--preload-package" | "--preload-app" | "--preload-default") {
+        return Some(int(0));
     }
     if first == "--query-abi-list" {
         return Some(string("arm64-v8a"));
@@ -130,10 +140,33 @@ fn answer(args: &[String], launcher: &Launcher) -> Option<Vec<u8>> {
         // A setting (`--set-api-denylist-exemptions`, `--boot-completed`, ...): accepted.
         return Some(int(0));
     }
+    // A child zygote (`--start-child-zygote`: the WebView's `WebViewZygoteInit`, an app's
+    // `AppZygoteInit`), which forks the processes asked of it on `--zygote-socket=<name>`. An ART
+    // started here is not a zygote (no `-Xzygote`: its first fork aborts, "runtime instance not
+    // started with -Xzygote", and every WebView renderer failed to start), so this answers that
+    // socket itself, as it answers its own: each process asked of it starts in a host process of
+    // its own. The pid given is the child zygote's; nothing runs under it.
+    if let Some(socket) = child_zygote_socket(args) {
+        let pid = crate::process::reserve_pid();
+        let name = format!("@{socket}");
+        serve_at(instance, name.as_bytes(), Arc::clone(launcher));
+        eprintln!("[zygote] child zygote {} as pid {pid}: answered here, on {name}", nice.as_deref().unwrap_or("?"));
+        let mut reply = int(pid);
+        reply.push(0);
+        return Some(reply);
+    }
     let pid = launch(launcher, uid.unwrap_or(10000), nice.as_deref(), sdk.unwrap_or(0), &rest).unwrap_or(-1);
     let mut reply = int(pid);
     reply.push(1); // usingWrapper: the process is WrapperInit's
     Some(reply)
+}
+
+/// The socket a child zygote is asked to listen on, when `args` start one.
+fn child_zygote_socket(args: &[String]) -> Option<&str> {
+    if !args.iter().any(|a| a == "--start-child-zygote") {
+        return None;
+    }
+    args.iter().find_map(|a| a.strip_prefix("--zygote-socket="))
 }
 
 /// The app processes launched here and still running, by the pid the system gave each.
@@ -222,5 +255,54 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
             eprintln!("[zygote] launch: {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launcher() -> Arc<Launcher> {
+        Arc::new(Launcher {
+            runner: PathBuf::from("/nonexistent/omni-linux-run"),
+            sysroot: PathBuf::new(),
+            instance: PathBuf::new(),
+            envp: Vec::new(),
+            binder: String::new(),
+            vm_options: Vec::new(),
+        })
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_preload_is_answered_as_done_not_started_as_a_class() {
+        let l = launcher();
+        for first in ["--preload-package", "--preload-app"] {
+            let a = args(&[first, "/product/app/webview/webview.apk", "/product/app/webview/lib/arm64", "libwebviewchromium.so", "arm64-v8a"]);
+            assert_eq!(answer(&a, &l, 0x5157), Some(int(0)), "{first}");
+        }
+    }
+
+    /// The WebView's zygote, as ActivityManager asks for it (`ZygoteProcess.startChildZygote`).
+    #[test]
+    fn a_child_zygote_is_answered_here_on_its_socket() {
+        let l = launcher();
+        let a = args(&[
+            "--runtime-args", "--setuid=1053", "--setgid=1053", "--start-child-zygote", "--nice-name=webview_zygote",
+            "com.android.internal.os.WebViewZygoteInit", "--zygote-socket=com.android.internal.os.WebViewZygoteInit/test-socket",
+            "--abi-list=arm64-v8a", "--uid-range-start=99000", "--uid-range-end=99999",
+        ]);
+        assert_eq!(child_zygote_socket(&a), Some("com.android.internal.os.WebViewZygoteInit/test-socket"));
+        let reply = answer(&a, &l, 0x5158).expect("a reply");
+        let pid = i32::from_be_bytes(reply[0..4].try_into().unwrap());
+        assert!(pid > 0, "a pid for the child zygote: {pid}");
+        // Its socket is listening in the instance: a start is asked of it next.
+        let bound = crate::unix::Bound::find(0x5158, b"@com.android.internal.os.WebViewZygoteInit/test-socket");
+        assert!(bound.is_some_and(|b| b.listening.load(std::sync::atomic::Ordering::SeqCst)));
+        // Not a child zygote: an app.
+        assert_eq!(child_zygote_socket(&args(&["--setuid=10115", "android.app.ActivityThread", "seq=1"])), None);
     }
 }
