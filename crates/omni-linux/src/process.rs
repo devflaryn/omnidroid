@@ -651,6 +651,14 @@ impl Process {
             top_byte_ignore: true,
             max_threads: 512,
             recompile_on_declined_fault: false,
+            // An app's threads get a 128 MiB code cache each (where a thread has its own: arm64).
+            // At dynarmic's 8 MiB minimum a large app's startup thread fills its cache and clears
+            // it again and again, retranslating what it runs: Roblox 2.740.931's main thread spent
+            // two thirds of its time translating, its packed library's initialisation came ~19 s
+            // after load -- past the ~20 s its own worker allows (a null table, SIGSEGV at 0x40) --
+            // and in-world it drew 1-3 frames a second. At 128 MiB: 9.8 s, no crash, 18-44 fps.
+            // A reservation, committed as used. The system's processes keep the minimum.
+            code_cache_size: if std::env::var_os("OMNI_LINUX_APP").is_some() { 128 << 20 } else { 8 << 20 },
             ..DynarmicOptions::default()
         };
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {

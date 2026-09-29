@@ -187,16 +187,20 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     if nice.is_some() && std::env::var("OMNI_SIGNAL_TRACE_APP").ok().as_deref() == nice {
         cmd.env("OMNI_SIGNAL_TRACE", "1");
     }
+    // An app's host process: its CPU options are an app's (`Process::cpu_options`).
+    cmd.env("OMNI_LINUX_APP", "1");
     // Per-app CPU switches, `<process name>:<value>`, that process only -- the system keeps its own,
     // so the boot is not slowed into system_server's Watchdog (nor its other apps changed):
     //   OMNI_DYNARMIC_OPT_APP=<name>:<hex mask>       only these JIT optimizations (`OMNI_DYNARMIC_OPT`)
     //   OMNI_JIT_EXCLUSIVE_MONITOR_APP=<name>:global  the exclusive monitor (`OMNI_JIT_EXCLUSIVE_MONITOR`)
     //   OMNI_JIT_FORCE_ORDERED_APP=<name>:1           every guest access fenced (a dynarmic probe)
+    //   OMNI_JIT_CODE_CACHE_MB_APP=<name>:<MiB>       each thread's code cache (`OMNI_JIT_CODE_CACHE_MB`)
     if let Some(n) = nice {
         for (knob, var) in [
             ("OMNI_DYNARMIC_OPT_APP", "OMNI_DYNARMIC_OPT"),
             ("OMNI_JIT_EXCLUSIVE_MONITOR_APP", "OMNI_JIT_EXCLUSIVE_MONITOR"),
             ("OMNI_JIT_FORCE_ORDERED_APP", "OMNI_JIT_FORCE_ORDERED"),
+            ("OMNI_JIT_CODE_CACHE_MB_APP", "OMNI_JIT_CODE_CACHE_MB"),
         ] {
             if let Some(value) = std::env::var(knob).ok().and_then(|v| v.strip_prefix(&format!("{n}:")).map(str::to_string)) {
                 cmd.env(var, value);

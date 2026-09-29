@@ -379,7 +379,9 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_EXCLUSIVE_MONITOR=global|value` -- [`ExclusiveMonitor`];
     /// * `OMNI_JIT_OPTIMIZATIONS=<hex mask>` -- [`optimizations_override`](Self::optimizations_override);
     /// * `OMNI_JIT_CHECK_HALT_ON_MEMORY=0|1` -- [`check_halt_on_memory_access`](Self::check_halt_on_memory_access);
-    /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`].
+    /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
+    /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
+    ///   where each thread has its own cache (arm64).
     ///
     /// Called by [`DynarmicBackend::new`], so every backend in the process sees the same switches.
     ///
@@ -391,6 +393,11 @@ impl DynarmicOptions {
         fn say(text: &str) {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "JIT SWITCH: {text}");
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_CODE_CACHE_MB") {
+            let mib: u64 = value.parse().unwrap_or_else(|_| panic!("OMNI_JIT_CODE_CACHE_MB={value:?} is not a number of MiB"));
+            self.code_cache_size = mib << 20;
+            say(&format!("code cache {mib} MiB per thread (OMNI_JIT_CODE_CACHE_MB)"));
         }
         if let Ok(value) = std::env::var("OMNI_JIT_EXCLUSIVE_MONITOR") {
             self.exclusive_monitor = match value.trim() {
