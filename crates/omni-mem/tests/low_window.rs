@@ -146,6 +146,26 @@ fn a_mapping_across_the_seam_is_refused() {
     space.close().expect("closed");
 }
 
+/// Below the space's base the window is the guest's null page and everything near it -- ART's
+/// implicit null checks load through null and must fault. So the window's whole 4 GiB stay held:
+/// nothing else in the process may be placed where a guest null pointer would read it.
+#[test]
+fn the_window_below_the_base_and_the_seam_stay_reserved_for_nothing() {
+    let _serial = serial();
+    let space = windowed(4 * GIB);
+    let delta = space.low_window().expect("the window").delta;
+    let page = vm_page();
+    for (what, at) in [("guest 0", delta), ("just below the base", delta + BASE - page), ("the seam's guard", delta + LOW_WINDOW_END - page)] {
+        let taken = omni_platform::vm::reserve_placeholder_at(at, page);
+        assert!(taken.is_err(), "{what} ({at:#x}) was free for the host to take");
+    }
+    assert!(!omni_platform::vm::occupied_ranges(delta, BASE).expect("the walk").is_empty());
+    space.close().expect("closed");
+    // Given back with the space.
+    let again = omni_platform::vm::reserve_placeholder_at(delta, page).expect("free again after close");
+    omni_platform::vm::release(again).expect("released");
+}
+
 #[test]
 fn a_space_without_the_window_is_the_identity() {
     let space = GuestSpace::with_config(GuestSpaceConfig { size: 64 * MIB, ..GuestSpaceConfig::default() })

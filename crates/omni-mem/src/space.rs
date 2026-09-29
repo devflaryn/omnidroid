@@ -509,6 +509,10 @@ struct Inner {
     floor: GuestAddr,
     /// [`GuestSpace::window`], for the host calls made under the lock.
     window: Option<LowWindow>,
+    /// The rest of a [`LowWindow`]'s 4 GiB -- below the base (the guest's null page and all near
+    /// it) and from the seam up -- held inaccessible for as long as the space lives, so that
+    /// nothing else in the process is ever placed where a guest pointer there would reach it.
+    held: Vec<Reservation>,
     released: bool,
     /// Bytes of private committed memory this space currently holds, maintained incrementally
     /// because [`Inner::commit_range`] has to know it on every granule and walking the map there
@@ -636,13 +640,15 @@ impl GuestSpace {
         // At least page-aligned: the host's allocation granularity already is, for the host's own
         // page, and is not for a larger page asked of `with_page_size`.
         let mut window = None;
+        let mut held = Vec::new();
         let mut size = config.size;
         let (reservations, hosts) = match config.base {
             Some(at) if config.low_window => {
-                let (reservations, hosts, low, len) = reserve_with_window(at, config.size, page)?;
-                window = Some(low);
-                size = len;
-                (reservations, hosts)
+                let reserved = reserve_with_window(at, config.size, page)?;
+                window = Some(reserved.window);
+                size = reserved.len;
+                held = reserved.held;
+                (reserved.reservations, reserved.hosts)
             }
             Some(at) if config.around_host => reserve_around_host(at, config.size, page)?,
             Some(at) => (
@@ -689,6 +695,7 @@ impl GuestSpace {
                 cursor: floor,
                 floor,
                 window,
+                held,
                 released: false,
                 committed: 0,
                 max_committed: config.max_committed,
@@ -2728,6 +2735,12 @@ impl Inner {
                 }
             }
         }
+        for reservation in std::mem::take(&mut self.held) {
+            let (base, len) = (reservation.base(), reservation.len());
+            if let Err(error) = vm::release(reservation) {
+                fail(platform("close", base, len)(error));
+            }
+        }
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -2755,11 +2768,20 @@ const AROUND_HOST_ATTEMPTS: usize = 4;
 /// macOS 27: fixed allocations at 16, 64 and 128 GiB are `KERN_NO_SPACE`, and the host's own choice
 /// for 64 GiB was `0x7b_2640_0000`). The guest does not care where its high memory is: what it
 /// places without an address goes to the lowest free range above 4 GiB (`omni-linux`'s `mm`).
-fn reserve_with_window(
-    base: GuestAddr,
-    size: usize,
-    page: usize,
-) -> MemResult<(Vec<Reservation>, Vec<(GuestAddr, usize)>, LowWindow, usize)> {
+/// What [`reserve_with_window`] reserved.
+struct WithWindow {
+    /// The space's own reservations, sorted by host address.
+    reservations: Vec<Reservation>,
+    /// The host's ranges inside the space, by guest address.
+    hosts: Vec<(GuestAddr, usize)>,
+    window: LowWindow,
+    /// The space's length.
+    len: usize,
+    /// The window's 4 GiB outside the space's part of it, held inaccessible.
+    held: Vec<Reservation>,
+}
+
+fn reserve_with_window(base: GuestAddr, size: usize, page: usize) -> MemResult<WithWindow> {
     const OP: &str = "GuestSpace::with_config";
     let end = base.checked_add(size).ok_or(MemError::InvalidConfig {
         field: "size",
@@ -2778,18 +2800,43 @@ fn reserve_with_window(
     let low_len = low_end - base;
 
     let mut attempt = 0;
-    let (low, delta) = loop {
+    let (low, delta, held) = loop {
         attempt += 1;
         // Where the host has 4 GiB free, found by reserving it and giving it back; then the window's
-        // part of it by address. Something else can take it in between: ask again.
+        // three parts of it by address -- below the base, the space's, and from its end up -- the
+        // first and last held inaccessible, so a guest null pointer (and anything near 0 or the
+        // seam) reaches nothing of the host's and faults as on a device. Something else can take
+        // part of it in between: give back what was got and ask again.
         let probe = vm::reserve_placeholder(LOW_WINDOW_END, LOW_WINDOW_END)
             .map_err(platform(OP, base, LOW_WINDOW_END))?;
         let delta = probe.base();
         vm::release(probe).map_err(platform(OP, delta, LOW_WINDOW_END))?;
-        match vm::reserve_placeholder_at(delta + base, low_len) {
-            Ok(low) => break (low, delta),
-            Err(error) if attempt >= AROUND_HOST_ATTEMPTS => return Err(platform(OP, delta + base, low_len)(error)),
-            Err(error) => tracing::debug!(%error, attempt, "the host took the window's range; asking again"),
+        let parts = [(delta, base), (delta + base, low_len), (delta + low_end, LOW_WINDOW_END - low_end)];
+        let mut got = Vec::new();
+        let mut failed = None;
+        for (at, len) in parts.into_iter().filter(|&(_, len)| len > 0) {
+            match vm::reserve_placeholder_at(at, len) {
+                Ok(r) => got.push(r),
+                Err(error) => {
+                    failed = Some(platform(OP, at, len)(error));
+                    break;
+                }
+            }
+        }
+        match failed {
+            None => {
+                let low = got.remove(usize::from(base > 0));
+                break (low, delta, got);
+            }
+            Some(error) => {
+                for r in got {
+                    let _ = vm::release(r);
+                }
+                if attempt >= AROUND_HOST_ATTEMPTS {
+                    return Err(error);
+                }
+                tracing::debug!(%error, attempt, "the host took part of the window's range; asking again");
+            }
         }
     };
     let window = LowWindow { start: base, end: LOW_WINDOW_END, delta };
@@ -2816,8 +2863,10 @@ fn reserve_with_window(
                 reservations.push(high);
             }
             Err(error) => {
-                if let Err(release) = vm::release(reservations.pop().expect("the window")) {
-                    tracing::error!(%release, "could not give back a window's reservation");
+                for reservation in reservations.drain(..).chain(held) {
+                    if let Err(release) = vm::release(reservation) {
+                        tracing::error!(%release, "could not give back a window's reservation");
+                    }
                 }
                 return Err(platform(OP, LOW_WINDOW_END, high_len)(error));
             }
@@ -2825,7 +2874,7 @@ fn reserve_with_window(
     }
     reservations.sort_by_key(Reservation::base);
     tracing::debug!(delta = format_args!("{delta:#x}"), low_len, len, "reserved a low window");
-    Ok((reservations, hosts, window, len))
+    Ok(WithWindow { reservations, hosts, window, len, held })
 }
 
 /// Reserve `[base, base + size)` around what the host holds in it: one placeholder per free range,
