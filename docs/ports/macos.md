@@ -140,6 +140,21 @@ default; evidence and how to run its tests: `macos-hvf.md`.
 
 ## Open
 
+* **Roblox 2.740.931 does not reach a world on this host (either path).** Its
+  `libzstd-jni-1.5.7-6.so` is linked for 4 KiB pages and is a packed library, and the app's startup
+  requires it. Measured on the M1 (2026-09-29):
+  - *real-AOSP path* (`tools/aosp_play.sh`): boots to `boot_completed=1` (~5 min), `pm install`,
+    the app starts, the library loads (`pagecompat`, widened `mprotect`) -- then within about a
+    minute of launch a thread of that library reads through a function table it never set up
+    (`SIGSEGV` at `0x40`) and the app dies, before it draws. On a real 16 KiB-page Android 15
+    device this build could not load the library at all, so that code has never run on 16 KiB
+    pages; a 4 KiB-page host runs it.
+  - *direct path* (`omnidroid play`): the loader refuses the same library
+    (`AlignBelowPageSize { align: 4096, page_size: 16384 }`).
+  What would close it: a Roblox build whose native libraries are 16 KiB-aligned, or a guest with
+  4 KiB pages on this 16 KiB host (sub-page mappings and protections in `omni-linux`'s `mm` --
+  large). Reverse-engineering that library's behaviour was stopped on purpose.
+
 * **Stale translated code on arm64** (m11): fixed in this tree by patch 0031 (a mid-run clear
   forgets the return-stack buffer; `omni-cpu/tests/cache_clear_rsb.rs` fails without it). Branch
   `arm64-clear-audit`'s patch 0023 addressed the same defect and is not merged; reconcile the two
