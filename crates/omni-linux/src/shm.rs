@@ -103,12 +103,41 @@ fn executable_access(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOp
     options
 }
 
+/// Where regions' host files are made: `/dev/shm` where the host has one (Linux: tmpfs, memory
+/// as a memfd is), else the temp directory. The temp directory can be a disk, where a dirty
+/// `MAP_SHARED` page is written back while it is mapped -- a graphics buffer, every frame -- or a
+/// size-capped tmpfs that the instance's own files fill (Ubuntu's `/tmp`). `OMNI_SHM_DIR` names
+/// another.
+#[must_use]
+pub fn host_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Some(dir) = std::env::var_os("OMNI_SHM_DIR") {
+            return dir.into();
+        }
+        let shm = std::path::Path::new("/dev/shm");
+        let writable = shm.is_dir()
+            && std::fs::metadata(shm).is_ok_and(|m| !m.permissions().readonly())
+            && tempfile_in(shm);
+        if writable { shm.to_path_buf() } else { std::env::temp_dir() }
+    })
+    .clone()
+}
+
+/// Whether a file can be made (and is removed again) in `dir`.
+fn tempfile_in(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!("omni-shm-probe-{}", std::process::id()));
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
 impl Shm {
     /// Create one, `name` for `/proc` and diagnostics.
     pub fn create(name: &str) -> Result<Arc<Self>, Errno> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let host_path = std::env::temp_dir().join(format!("omni-shm-{}-{n}", std::process::id()));
+        let host_path = host_dir().join(format!("omni-shm-{}-{n}", std::process::id()));
         let file = executable_access(std::fs::OpenOptions::new().read(true).write(true).create_new(true)).open(&host_path).map_err(|_| EIO)?;
         Ok(Arc::new(Self {
             file: Mutex::new(file),

@@ -111,3 +111,16 @@ fn a_graphics_buffer_is_read_and_written_through_a_view_the_file_agrees_with() {
     assert_eq!(&a, b"after");
     assert_eq!(std::fs::metadata(shm.host_path()).unwrap().len(), 8192);
 }
+
+/// A region's host file is memory, as a memfd is: on Linux it lives in `/dev/shm` (tmpfs), not in
+/// the temp directory, which may be a disk (a disk-backed `MAP_SHARED` file is written back to the
+/// disk while it is dirty -- a graphics buffer, every frame) or a size-capped tmpfs.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_region_lives_in_host_memory_on_linux() {
+    if !std::path::Path::new("/dev/shm").is_dir() {
+        return;
+    }
+    let shm = omni_linux::shm::Shm::create("probe").expect("a region");
+    assert!(shm.host_path().starts_with("/dev/shm"), "{}", shm.host_path().display());
+}
