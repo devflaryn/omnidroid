@@ -84,10 +84,16 @@ fn the_apk_is_installed_started_and_draws() {
     };
     // `OMNI_R_PLACE=<id>`: once signed in, the place's deep link, as a link opened on a device.
     let join = std::env::var("OMNI_R_PLACE").ok().map_or_else(String::new, |id| {
+        // Up to three times: the app sometimes answers the link by restarting its session and
+        // settling on Home instead of joining (2026-09-29). `joining` is written when it logs
+        // "Joining game".
         format!(
             "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 45; \
+             for try in 1 2 3; do \
              am start -a android.intent.action.VIEW -d 'roblox://experiences/start?placeId={id}' -n com.roblox.client/com.roblox.client.ActivityProtocolLaunch; \
-             echo \"[r] join intent for {id}: $?\"; "
+             echo \"[r] join intent for {id} (try $try): $?\"; \
+             j=0; until [ -e /data/local/tmp/joining ] || [ $j -ge 90 ]; do sleep 1; j=$((j+1)); done; \
+             [ -e /data/local/tmp/joining ] && break; done; "
         )
     });
     // A test device trimmed as test images are (`OMNI_R_LEAN=0` keeps everything): the image's apps
@@ -216,6 +222,9 @@ fn the_apk_is_installed_started_and_draws() {
         }
         if line.contains("DID_LOG_IN") && !kept.join("data/local/tmp/signed-in").exists() {
             let _ = std::fs::write(kept.join("data/local/tmp/signed-in"), "1");
+        }
+        if line.contains("Joining game") && !kept.join("data/local/tmp/joining").exists() {
+            let _ = std::fs::write(kept.join("data/local/tmp/joining"), "1");
         }
         if last_shot.elapsed() > shot_every {
             last_shot = Instant::now();
