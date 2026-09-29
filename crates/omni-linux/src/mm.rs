@@ -109,26 +109,42 @@ impl Mm {
         offset % self.host_page == 0 && (!fixed || addr % self.host_page == 0)
     }
 
-    /// A shared mapping whose offset a host view cannot honour: refused, as sharing a copy would
-    /// silently not be sharing (D42). Never expected: shared offsets are 0.
+    /// A shared mapping a host view cannot honour: a *fixed* address that does not agree with its
+    /// file offset modulo the host page (a placement we choose is made to agree,
+    /// `map_shared_view`). Refused, as sharing a copy would silently not be sharing (D42).
     fn refuse_unshareable(&self, p: &Process, t: &Task, req: &MapRequest, fixed: bool) -> Result<(), Errno> {
-        if self.viewable(req.offset, req.addr, fixed) {
+        if !fixed || req.addr % self.host_page == req.offset % self.host_page {
             return Ok(());
         }
-        p.refusals.record("mmap: MAP_SHARED at a 4 KiB offset on a larger host page".into(), t.pc, t.lr);
+        p.refusals.record("mmap: MAP_SHARED at a fixed address incongruent with its offset".into(), t.pc, t.lr);
         Err(EINVAL)
     }
 
-    /// Map `backed` bytes of `backing` from `req.offset` for a shared mapping of `len` bytes: a view
-    /// of whole host pages (the backing's host file is whole host pages, `crate::shm`), the part of
-    /// it past `len` given back as 4 KiB holes, and anything of `len` past the view anonymous.
+    /// Map `backed` bytes of `backing` from `req.offset` for a shared mapping of `len` bytes. A view
+    /// is whole host pages at a host-page file offset, so the view starts at the host page below the
+    /// offset and is placed so the guest's address agrees with the offset modulo the host page (an
+    /// FMQ ring, a plane of a graphics buffer, at a 4 KiB offset: D42). The view's parts before the
+    /// address and past `len` are given back as 4 KiB holes; anything of `len` past the view is
+    /// anonymous.
     fn map_shared_view(&self, backing: &Arc<omni_mem::Backing>, req: &MapRequest, placement: Placement, backed: u64, len: u64, prot: Protection) -> Result<u64, omni_mem::MemError> {
-        let viewed = self.round_up_host(backed);
-        let at = self.space.map_file(backing, req.offset, placement, viewed as usize, prot)? as u64;
-        if viewed > len {
-            self.space.unmap((at + len) as usize, (viewed - len) as usize)?;
-        } else if len > viewed {
-            self.space.map_anonymous(Placement::Fixed((at + viewed) as usize), (len - viewed) as usize, prot, CommitPolicy::Lazy)?;
+        let host = self.host_page;
+        let head = req.offset % host;
+        let viewed = self.round_up_host(head + backed);
+        let placement = match placement {
+            Placement::Fixed(a) => Placement::Fixed(a - head as usize),
+            Placement::Hint { address, align } => Placement::Hint { address: address & !(host as usize - 1), align },
+            anywhere @ Placement::Anywhere { .. } => anywhere,
+        };
+        let base = self.space.map_file(backing, req.offset - head, placement, viewed as usize, prot)? as u64;
+        let at = base + head;
+        if head > 0 {
+            self.space.unmap(base as usize, head as usize)?;
+        }
+        let from_at = viewed - head;
+        if from_at > len {
+            self.space.unmap((at + len) as usize, (from_at - len) as usize)?;
+        } else if len > from_at {
+            self.space.map_anonymous(Placement::Fixed((at + from_at) as usize), (len - from_at) as usize, prot, CommitPolicy::Lazy)?;
         }
         Ok(at)
     }
