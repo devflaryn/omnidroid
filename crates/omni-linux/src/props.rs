@@ -30,7 +30,7 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 4] = ["/system/build.prop", "/system_ext/etc/build.prop", "/vendor/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 19] = [
+const OVERLAY: [(&str, &str); 17] = [
     // The property service speaks protocol 2 (a reply for every set).
     ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
@@ -55,10 +55,8 @@ const OVERLAY: [(&str, &str); 19] = [
     ("ro.boot.vbmeta.digest", "836f26adcab3883794ba405c6bf019f74afbdc3c9d76bdb26cb1ea1672ffa8e8"),
     ("ro.boot.vbmeta.hash_alg", "sha256"),
     ("ro.boot.vbmeta.size", "6720"),
-    // The GPU drivers (D3a): the image's own ANGLE for GLES, on omnidroid's Vulkan driver
-    // (`/vendor/lib64/hw/vulkan.omni.so`), which forwards to the host's GPU.
-    ("ro.hardware.egl", "angle"),
-    ("ro.hardware.vulkan", "omni"),
+    // The GPU drivers (`ro.hardware.egl`, `ro.hardware.vulkan`) are the backend's
+    // (`crate::gpu::backend::properties`), set after these.
     // The display (the host composer's, D3): 160 dpi, as the D design reports it.
     ("ro.sf.lcd_density", "160"),
 ];
@@ -154,6 +152,12 @@ impl Properties {
 
     pub fn apply_overlay(&mut self) {
         for (k, v) in OVERLAY {
+            self.set(k, v);
+        }
+        // The GPU drivers: on Vulkan (D3a) the image's own ANGLE for GLES on omnidroid's Vulkan
+        // driver (`/vendor/lib64/hw/vulkan.omni.so`); on GL omnidroid's GLES driver
+        // (`/vendor/lib64/egl/libGLES_omni.so`) and no Vulkan. Both forward to the host's GPU.
+        for (k, v) in crate::gpu::backend::properties(crate::gpu::backend::backend()) {
             self.set(k, v);
         }
     }

@@ -20,7 +20,9 @@ use crate::errno::{Errno, SysResult, EBADF, EINVAL, EIO, ENODEV, ENOSYS, ENOTTY}
 use crate::process::{Process, Task};
 
 pub(crate) mod ahb;
+pub mod backend;
 pub(crate) mod generated;
+pub mod gl;
 pub(crate) mod native;
 pub(crate) mod special;
 
@@ -267,6 +269,10 @@ pub(crate) mod stats {
 
 /// `ioctl` on `/dev/omni-gpu`.
 pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> SysResult {
+    // The GLES driver's commands (the GL backend) on the same node.
+    if cmd == gl::OMNI_GL_CALL {
+        return gl::ioctl(p, t, arg);
+    }
     if cmd != OMNI_GPU_CALL {
         return Err(ENOTTY);
     }

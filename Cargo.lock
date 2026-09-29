@@ -339,6 +339,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "flate2",
+ "libloading",
  "omni-cpu",
  "omni-elf",
  "omni-mem",

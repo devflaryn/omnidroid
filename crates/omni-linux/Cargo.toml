@@ -22,6 +22,10 @@ sha2 = { workspace = true }
 flate2 = { workspace = true }
 # The host's Vulkan, loaded at run time (`crate::gpu`); as omni-gfx loads it (its Cargo.toml says why).
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
+# The host's EGL and GLES for the GL backend (`crate::gpu::gl`), loaded at run time: the loader
+# `ash`'s `loaded` already brings in, and the Global Constraint 4 exception omni-gfx's manifest
+# records for its GLES host, for the same reason (a GPU API with no loader crate of its own).
+libloading = "0.8"
 
 [[bin]]
 name = "omni-linux-run"
