@@ -1216,9 +1216,16 @@ impl Process {
     pub fn report(&self) -> String {
         let status = self.exit.lock().clone();
         let refused = self.refusals.report();
+        // The guest space's commit against its ceiling (D15): a commit the ceiling refuses reaches
+        // the guest as a silent SEGV_ACCERR (the pager cannot log from its handler), so a process
+        // ended by a fault says how near the ceiling it was.
+        let stats = self.mem.space().stats();
         format!(
-            "omni-linux: {}\n{}",
+            "omni-linux: {}\n  guest space: {} MiB committed of a {} MiB ceiling, {} MiB mapped\n{}",
             status.map_or_else(|| "not run".to_string(), |s| format!("{s:?}")),
+            stats.committed >> 20,
+            omni_mem::DEFAULT_MAX_COMMITTED >> 20,
+            stats.mapped >> 20,
             if refused.is_empty() { "  nothing refused\n".to_string() } else { format!("refused:\n{refused}") }
         )
     }
