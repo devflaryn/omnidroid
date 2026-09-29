@@ -31,6 +31,26 @@ argues from it).
 * Windows, x86-64 Linux and the direct path (`omni-android`, `omnidroid play`) do not change
   behaviour.
 * No dynarmic patch in M1. `crates/dynarmic-sys/vendor` is untouched.
+* **SUBPAGE-ORDER** (the named lock-ordering and publication rule; cite it in code comments where
+  it is relied on):
+  1. Lock order: `omni-linux`'s layout lock → `GuestSpace::inner` → `SubPagesHandle::state`.
+     `state` is taken only while `inner` is held, except by `split_stats`/`note_split_served`, which
+     use `try_lock` and never block.
+  2. The fault path (pager `handle_fault`, and `access_ptr` in the slow path) reads only the atomic
+     `count` and bit words before deciding. It takes no lock ahead of `admit`, which takes `inner`
+     as it does today.
+  3. A page starts trapping as: alias live → bit set (`Release`) → host protection lowered. A page
+     stops trapping as: host protection raised → bit cleared. Bits are read with `Acquire`. So a
+     fault caused by a lowered protection always sees its bit, and a thread that saw a bit always
+     finds a live alias.
+  4. `Split` parts are written only under `inner`. Readers are `region_at_locked`, or the
+     per-thread cache, which is validated by the generation that `write()` bumps before any change.
+     No reader sees a half-updated page.
+  5. An alias is unmapped only after its host page is unmapped or replaced (never on a protection
+     change).
+* Execution: inline (Native), TDD per task. A fresh-reviewer checkpoint follows Task 7 (the
+  memory and fault-handler layer, Tasks 1-7) before Tasks 8-12. The end-of-branch review runs on
+  the most capable model.
 * Commits:
   * small and on `mac-port`, one per task (a task may have more);
   * message style `type(scope): sentence`, as in `git log`;
@@ -500,16 +520,29 @@ where `op` is `Map(Protection) | Protect(Protection) | Unmap`):
    * **Op `Protect(p)`:** all target parts must be `Mapped(_)`; otherwise return the error today's
      `require_mapped` returns (Mm maps it to `ENOMEM`). Set them.
    * **Op `Unmap`:** set them to `StrictHole` if the range intersects `sub.strict`, else `Hole`.
-   * **Then settle `P`:**
-     * `uniform() == Some(p)`: untrack it and `protect_range(P, page, p)`.
-     * `empty()`: untrack it and unmap `P` on the host.
-     * Otherwise: `protect_range(P, page, host_protection())`. If `traps()`, ensure the alias
-       exists (make the space-sized alias reservation lazily, then `vm::alias(host_addr(P), alias_base + (P - base), page)`)
-       and set the bit; if not `traps()` and the bit is set, unalias and clear it. Keep `count` equal
-       to the number of set bits.
+   * **Then settle `P`**, strictly in SUBPAGE-ORDER (Global Constraints):
+     * `uniform() == Some(p)`: untrack it. Raise the host protection to `p`, **then** clear the
+       bit. The alias stays; see the rule below.
+     * `empty()`: untrack it. Clear the bit, unmap `P` on the host, **then** unalias it.
+     * Otherwise, if `traps()`:
+       1. Ensure the alias exists: make the space-sized alias reservation lazily, then
+          `vm::alias(host_addr(P), alias_base + (P - base), page)` unless `sub.aliased` already
+          holds `P`.
+       2. Set the bit (`Release`).
+       3. **Then** `protect_range(P, page, host_protection())`.
+
+       If not `traps()`: raise or lower the protection to `host_protection()` first, **then**
+       clear the bit.
+     * Keep `count` equal to the number of set bits.
+     * **Alias lifetime:** an alias is removed only when its host page is unmapped, decommitted or
+       replaced (a whole-page `unmap`, `discard` decommit, `map_*` over it, or privatisation).
+       Every such path checks `sub.aliased` and unaliases after the host operation. A page that
+       merely stops trapping keeps its alias (it is the same memory, and a re-trap reuses it). So a
+       slow-path access that read the bit just before it was cleared still lands on live memory.
 4. Every step runs under the one `self.write()` guard, which bumps the generation (invariant 4).
-   Order per host page: compute the new `Split` → apply to the host → publish into the map and
-   bits. If the host call fails, return the error with nothing published.
+   Order per host page: compute the new `Split` → apply to the host in SUBPAGE-ORDER → publish
+   the `Split` into the map. If a host call fails, restore what that page had and return the
+   error; nothing half-applied is published.
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/subpage.rs`; each returns early when
   `!overlay_expected()`, after asserting on a 4 KiB host that the same calls behave as before):
@@ -978,6 +1011,16 @@ fn four_threads_increment_a_split_page_counter() {
   Expected: all green, including `declined_fault.rs` and `low_window.rs`.
 - [ ] **Step 5: Commit** `feat(cpu): guest code on a split page -- served through the alias, never a degraded slice`.
 
+### Checkpoint A: fresh review of the memory and fault-handler layer (Tasks 1-7)
+
+- [ ] Dispatch one fresh reviewer subagent (the most capable model) on `git diff <Task 1's parent>..HEAD`
+  for `omni-platform`, `omni-mem` and `omni-cpu`, with the spec and this plan. Ask it to check:
+  * SUBPAGE-ORDER holds on every path that changes a split page (map, protect, unmap, discard,
+    `write_forced`, privatisation, space close);
+  * no host-side dereference of a guest address bypasses `access_ptr`;
+  * the pager and slice invariants still hold, and the 4 KiB-host path is byte-for-byte unchanged.
+- [ ] Fix every Important finding (test first), then continue with Task 8.
+
 ---
 
 ### Task 8: `omni-linux`: the guest is told 4 KiB, and gets it
@@ -1048,6 +1091,57 @@ fn mremap_moves_split_edges_intact() {
     assert_eq!(p.mem.read(to, 6 * 4096).unwrap(), vec![1; 6 * 4096]);
     // mremap keeps the first page's protection for the whole range (sys_mremap's rule); what
     // matters here is that the move of a split range neither fails nor loses bytes.
+}
+
+/// The futex word on a *strict* split page: a read-write 4 KiB beside a strict gap and a
+/// read-only 4 KiB, so the host page is inaccessible and every kernel read of the word must go
+/// through the alias. Four waiters, one waker.
+#[test]
+fn four_threads_wait_and_wake_on_a_futex_word_in_a_strict_split_page() {
+    const FUTEX_WAIT_PRIVATE: u64 = 128;
+    const FUTEX_WAKE_PRIVATE: u64 = 129;
+    std::env::set_var("OMNI_STRICT_GAPS", "futex-strict:");
+    let (p, mut t, s, _) = process();
+    let host = p.mem.space().page_size() as u64;
+    let at = mmap(&p, &mut t, [0, host, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, u64::MAX, 0]) as u64;
+    p.mem.write(s, b"futex-strict:w\0").unwrap();
+    assert_eq!(p.syscall(&mut t, nr::PRCTL, [0x5356_4d41, 0, at, host, s, 0]), 0);
+    let word = at + 4096;
+    p.mem.write_u32(word, 0).unwrap();
+    if host > 4096 {
+        assert_eq!(p.syscall(&mut t, nr::MPROTECT, [at, 4096, PROT_READ, 0, 0, 0]), 0);
+        assert_eq!(p.syscall(&mut t, nr::MUNMAP, [at + 2 * 4096, 4096, 0, 0, 0, 0]), 0);
+        if p.mem.space().subpages_active() {
+            assert!(p.mem.space().is_trapping(at), "the word's host page traps");
+        }
+    }
+    // A mismatched value is EAGAIN: the kernel read the word (through the alias).
+    let eagain = p.syscall(&mut t, nr::FUTEX, [word, FUTEX_WAIT_PRIVATE, 1, 0, 0, 0]) as i64;
+    assert_eq!(eagain, -(omni_linux::errno::EAGAIN.0 as i64));
+    let woken = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..4 {
+            let (p, woken) = (&p, &woken);
+            sc.spawn(move || {
+                let mut t = p.test_task();
+                loop {
+                    let r = p.syscall(&mut t, nr::FUTEX, [word, FUTEX_WAIT_PRIVATE, 0, 0, 0, 0]) as i64;
+                    if p.mem.read_u32(word).unwrap() == 1 {
+                        break;
+                    }
+                    assert!(r == 0 || r == -(omni_linux::errno::EAGAIN.0 as i64), "{r}");
+                }
+                woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        p.mem.write_u32(word, 1).unwrap();
+        while woken.load(std::sync::atomic::Ordering::SeqCst) < 4 {
+            p.syscall(&mut t, nr::FUTEX, [word, FUTEX_WAKE_PRIVATE, 4, 0, 0, 0]);
+            std::thread::yield_now();
+        }
+    });
+    assert_eq!(woken.into_inner(), 4);
 }
 
 #[test]
