@@ -534,6 +534,7 @@ fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if addr % p.mm.page != 0 {
         return Err(EINVAL);
     }
+    madvise_stats::count(a[2], a[1]);
     if matches!(a[2], MADV_DONTNEED | MADV_REMOVE) {
         let len = p.mm.span(addr, a[1]).ok_or(EINVAL)?;
         p.mm.discard(addr, len)?;
@@ -711,4 +712,43 @@ pub fn install(table: &mut Table) {
     table.set(nr::MUNLOCKALL, sys_munlockall);
     table.set(nr::BRK, sys_brk);
     table.set(nr::MREMAP, sys_mremap);
+}
+
+/// `OMNI_MADVISE_STATS=<seconds>`: this host process's `madvise` calls by advice, with the bytes
+/// they named, every so often (`[madvise]`) -- which advice an allocator gives memory back with.
+mod madvise_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    const ADVICE: usize = 32;
+    static CALLS: [AtomicU64; ADVICE] = [const { AtomicU64::new(0) }; ADVICE];
+    static BYTES: [AtomicU64; ADVICE] = [const { AtomicU64::new(0) }; ADVICE];
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let Some(every) = std::env::var("OMNI_MADVISE_STATS").ok().and_then(|v| v.parse::<u64>().ok()) else { return false };
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
+                let rows: Vec<String> = (0..ADVICE)
+                    .filter_map(|i| {
+                        let (c, b) = (CALLS[i].swap(0, Relaxed), BYTES[i].swap(0, Relaxed));
+                        (c > 0).then(|| format!("advice {i}: {c}x {} MiB", b >> 20))
+                    })
+                    .collect();
+                if !rows.is_empty() {
+                    eprintln!("[madvise] host pid {} {every}s: {}", std::process::id(), rows.join(", "));
+                }
+            });
+            true
+        })
+    }
+
+    pub(super) fn count(advice: u64, len: u64) {
+        if on() {
+            let i = (advice as usize).min(ADVICE - 1);
+            CALLS[i].fetch_add(1, Relaxed);
+            BYTES[i].fetch_add(len, Relaxed);
+        }
+    }
 }
