@@ -1,4 +1,4 @@
-# What `libzstd-jni` does on a 16 KiB guest (Task 0 of the 4 KiB guest plan)
+# What `libzstd-jni` does on a 16 KiB guest -- and on a 4 KiB one (Task 0 of the 4 KiB guest plan)
 
 Date: 2026-09-29. Library: `lib/arm64-v8a/libzstd-jni-1.5.7-6.so` from Roblox 2.740.931 (Delta
 build), 18,434,968 bytes. Time-boxed; the mechanism is **not** fully pinned (why at the end).
@@ -80,3 +80,21 @@ Watchdog fired on a host at load 21-25, with Chrome's GPU process at about 440% 
 with Chrome quit, booted and launched the app, and captured the pc above. Pinning which global
 stays null would take the decrypted text, which is out of scope: the fix removes both reasons the
 library could see a different world.
+
+## The 4 KiB guest does not fix it (measured 2026-09-29, 19:10)
+
+With the 4 KiB guest built (D42, `73e6f60`) the full gate boots, installs and launches the app
+(`$TMPDIR/omni-linux-r-25289.log`). `libzstd-jni` is loaded by `linker64` at 4 KiB pages from the
+unmodified file (no `pagecompat`), and every 4 KiB `mprotect` is exact. The app then dies the same
+way, 20 s after the library loads:
+* `Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x40`;
+* lr `libzstd-jni-1.5.7-6.so+0x5f42a0`, the same instruction as on the 16 KiB guest.
+
+**Both hypotheses above are falsified.** The page size, the rewritten file and the union
+protections are not the cause. What the Mac run differs in from the Windows and Linux runs that
+work is elsewhere: the arm64 dynarmic backend, the low window (D41), and the host itself.
+
+The obvious suspect for a self-decrypting, obfuscated library is **stale translated code**. Its
+constructors decrypt `.text` in place and then run it. On arm64, `Open` in `docs/ports/macos.md`
+records a mid-run cache-clear defect: patch 0031 is here, but `arm64-clear-audit`'s patch 0023 is
+not merged. Not yet tested.
