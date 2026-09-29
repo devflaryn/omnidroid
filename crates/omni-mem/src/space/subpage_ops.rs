@@ -246,7 +246,9 @@ impl GuestSpace {
             self.unalias_range(st, host_page, page);
             return Ok(());
         }
-        let needs_view = split.traps() || eager || (zero.is_some() && committed(inner));
+        // PROT_NONE parts count toward the host page only where the guest asked for strictness.
+        let strict = crate::subpage::strict_prot_none_everywhere() || Self::is_strict(st, host_page, page);
+        let needs_view = split.traps(strict) || eager || (zero.is_some() && committed(inner));
         if needs_view {
             self.commit_page(inner, operation, host_page)?;
             self.privatise(inner, st, operation, host_page)?;
@@ -267,8 +269,8 @@ impl GuestSpace {
             st.split.remove(&host_page);
             return Ok(());
         }
-        let host = split.host_protection();
-        if split.traps() {
+        let host = split.host_protection(strict);
+        if split.traps(strict) {
             let was = sub.is_trapping(index);
             sub.set_trapping(index, self.host_pages(), true);
             if let Err(e) = inner.protect_range(operation, host_page, page, host) {
@@ -629,8 +631,9 @@ impl GuestSpace {
         }
     }
 
-    /// Mark `[address, address + len)` so its unmapped parts must fault (`Part::StrictHole`), or
-    /// no longer. Parts already unmapped are left as they are until mapped again.
+    /// Mark `[address, address + len)` strict, or no longer: its unmapped parts must fault
+    /// (`Part::StrictHole`), and so must its PROT_NONE parts even beside accessible ones. Takes
+    /// effect on the next change to each host page.
     pub fn set_strict_gaps(&self, address: GuestAddr, len: usize, strict: bool) {
         let Some(sub) = &self.sub else { return };
         let _inner = self.write();

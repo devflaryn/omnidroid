@@ -78,10 +78,11 @@ fn two_4_kib_pages_in_one_host_page_keep_their_own_protection() {
 }
 
 #[test]
-fn a_prot_none_4_kib_page_traps_and_its_neighbours_do_not() {
+fn a_strict_prot_none_4_kib_page_traps_and_its_neighbours_do_not() {
     let (g, at) = guest_and_page();
     let page = g.space.page_size();
     let none = at + GUEST_PAGE.min(page - GUEST_PAGE);
+    g.space.set_strict_gaps(at, page, true);
     g.space.protect(none, GUEST_PAGE, Protection::None).unwrap();
     let (exit, _) = load(&g, none);
     assert!(faulted_at(&exit, none), "{exit}");
@@ -173,4 +174,23 @@ fn four_threads_increment_a_split_page_counter() {
         }
     });
     assert_eq!(g.read_u64(counter), 2000, "no lost update");
+}
+
+/// By default a PROT_NONE 4 KiB beside live parts of its host page is not enforced on a larger host
+/// page (D42): its neighbours are reached directly, with no trap. On a 4 KiB host it is a whole page
+/// and faults as ever.
+#[test]
+fn a_lenient_prot_none_part_costs_its_neighbours_nothing() {
+    let (g, at) = guest_and_page();
+    let page = g.space.page_size();
+    g.space.protect(at + page - GUEST_PAGE, GUEST_PAGE, Protection::None).unwrap();
+    let (exit, cpu) = run_with(&g, &[ldr_imm(2, 0, 0), str_imm(2, 0, 8), ret(30)], |cpu| cpu.set_x(x(0), at as u64));
+    assert!(returned(&exit), "{exit}");
+    assert_eq!(cpu.split_served(), 0, "no trap for the live parts");
+    let (exit, _) = load(&g, at + page - GUEST_PAGE);
+    if g.space.subpages_active() {
+        assert!(returned(&exit), "lenient: {exit}");
+    } else {
+        assert!(faulted_at(&exit, at + page - GUEST_PAGE), "a whole page on a 4 KiB host: {exit}");
+    }
 }

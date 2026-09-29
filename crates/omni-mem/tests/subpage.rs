@@ -167,7 +167,7 @@ fn a_whole_page_protect_over_a_tracked_page_makes_it_uniform() {
         return;
     }
     let (s, at) = one_page();
-    s.protect(at, GUEST_PAGE, Protection::None).unwrap();
+    s.protect(at, GUEST_PAGE, Protection::Read).unwrap();
     assert!(s.is_trapping(at));
     s.protect(at, host_page(), Protection::Read).unwrap();
     assert!(!s.is_trapping(at));
@@ -420,4 +420,22 @@ fn held_ranges_leave_out_a_split_pages_holes() {
     s.unmap(at + GUEST_PAGE, GUEST_PAGE).unwrap();
     let held = s.held_ranges(at, host_page());
     assert_eq!(held, vec![(at, GUEST_PAGE), (at + 2 * GUEST_PAGE, host_page() - 2 * GUEST_PAGE)]);
+}
+
+/// A PROT_NONE 4 KiB beside accessible parts of its host page (a library's reservation filler, a
+/// 4 KiB guard): lenient by default -- the live parts do not trap -- and enforced in a strict
+/// range. The guest's view says PROT_NONE either way.
+#[test]
+fn a_prot_none_part_is_lenient_unless_its_range_is_strict() {
+    if !overlay_expected() {
+        return;
+    }
+    let (s, at) = one_page();
+    s.protect(at, GUEST_PAGE, Protection::None).unwrap();
+    assert!(!s.is_trapping(at), "the live parts are reached directly");
+    assert_eq!(s.region_at(at).unwrap().protection, Protection::None, "the guest's view");
+    let (strict, at2) = one_page();
+    strict.set_strict_gaps(at2, host_page(), true);
+    strict.protect(at2, GUEST_PAGE, Protection::None).unwrap();
+    assert!(strict.is_trapping(at2), "strict: the PROT_NONE part faults, so its neighbours trap");
 }

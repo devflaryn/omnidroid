@@ -73,13 +73,18 @@ impl Split {
     }
 
     /// The host protection: readable if every counted part is, writable if every counted part is
-    /// too. `Mapped` parts and `StrictHole`s (as nothing) count; `Hole`s do not. With nothing
-    /// counted, `None`.
-    pub(crate) fn host_protection(&self) -> Protection {
+    /// too. `Mapped` parts and `StrictHole`s (as nothing) count; `Hole`s do not, and nor does a
+    /// `Mapped(None)` part unless `strict_none` (the page is in a strict range, or
+    /// `OMNI_STRICT_PROT_NONE=1`). With nothing counted, `None`.
+    pub(crate) fn host_protection(&self, strict_none: bool) -> Protection {
         let mut counted = false;
         let (mut read, mut write) = (true, true);
         for part in &self.parts {
             let (r, w) = match *part {
+                // A PROT_NONE part beside accessible ones: enforced only when strict (D42) -- a
+                // library's reservation filler and a 4 KiB guard would otherwise make every access
+                // to their host page's live part a trap.
+                Part::Mapped(Protection::None) if !strict_none => continue,
                 Part::Mapped(p) => bits(p),
                 Part::StrictHole => (false, false),
                 Part::Hole => continue,
@@ -97,8 +102,8 @@ impl Split {
 
     /// Whether some `Mapped` part allows an access the host protection refuses: the page traps,
     /// and a served access needs its alias.
-    pub(crate) fn traps(&self) -> bool {
-        let host = bits(self.host_protection());
+    pub(crate) fn traps(&self, strict_none: bool) -> bool {
+        let host = bits(self.host_protection(strict_none));
         self.parts.iter().any(|part| match *part {
             Part::Mapped(p) => {
                 let (r, w) = bits(p);
@@ -205,6 +210,14 @@ impl SubPagesHandle {
     }
 }
 
+/// `OMNI_STRICT_PROT_NONE=1`: every PROT_NONE 4 KiB part is enforced, even beside accessible parts
+/// of its host page (each access to those then traps). Off by default; per range, see
+/// `GuestSpace::set_strict_gaps`.
+pub(crate) fn strict_prot_none_everywhere() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_STRICT_PROT_NONE").as_deref() == Ok("1"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,27 +229,38 @@ mod tests {
 
     #[test]
     fn host_protection_is_the_least_any_counted_part_allows() {
-        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::Mapped(Read)]).host_protection(), Read);
-        assert_eq!(split(&[Part::Mapped(ReadExecute), Part::Mapped(ReadWrite)]).host_protection(), Read);
-        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::Mapped(Protection::None)]).host_protection(), Protection::None);
-        assert_eq!(split(&[Part::Mapped(ReadWriteExecute), Part::Mapped(ReadWrite)]).host_protection(), ReadWrite);
+        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::Mapped(Read)]).host_protection(true), Read);
+        assert_eq!(split(&[Part::Mapped(ReadExecute), Part::Mapped(ReadWrite)]).host_protection(true), Read);
+        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::Mapped(Protection::None)]).host_protection(true), Protection::None);
+        assert_eq!(split(&[Part::Mapped(ReadWriteExecute), Part::Mapped(ReadWrite)]).host_protection(true), ReadWrite);
     }
 
     #[test]
     fn a_lenient_hole_does_not_count_and_a_strict_one_does() {
-        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::Hole]).host_protection(), ReadWrite);
-        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::StrictHole]).host_protection(), Protection::None);
-        assert_eq!(split(&[Part::Hole, Part::Hole]).host_protection(), Protection::None);
+        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::Hole]).host_protection(true), ReadWrite);
+        assert_eq!(split(&[Part::Mapped(ReadWrite), Part::StrictHole]).host_protection(true), Protection::None);
+        assert_eq!(split(&[Part::Hole, Part::Hole]).host_protection(true), Protection::None);
     }
 
     #[test]
     fn a_page_traps_only_when_a_mapped_part_allows_more_than_the_host() {
-        assert!(!split(&[Part::Mapped(ReadWrite), Part::Hole]).traps());
-        assert!(split(&[Part::Mapped(ReadWrite), Part::Mapped(Read)]).traps());
-        assert!(!split(&[Part::Mapped(Protection::None), Part::StrictHole]).traps());
-        assert!(split(&[Part::Mapped(Read), Part::StrictHole]).traps());
+        assert!(!split(&[Part::Mapped(ReadWrite), Part::Hole]).traps(true));
+        assert!(split(&[Part::Mapped(ReadWrite), Part::Mapped(Read)]).traps(true));
+        assert!(!split(&[Part::Mapped(Protection::None), Part::StrictHole]).traps(true));
+        assert!(split(&[Part::Mapped(Read), Part::StrictHole]).traps(true));
         // Execute alone never traps: guest code is fetched in software.
-        assert!(!split(&[Part::Mapped(Read), Part::Mapped(ReadExecute)]).traps());
+        assert!(!split(&[Part::Mapped(Read), Part::Mapped(ReadExecute)]).traps(true));
+    }
+
+    #[test]
+    fn a_prot_none_part_is_lenient_unless_strict() {
+        let s = split(&[Part::Mapped(Read), Part::Mapped(Protection::None)]);
+        assert_eq!(s.host_protection(false), Read, "lenient: the readable part does not trap");
+        assert!(!s.traps(false));
+        assert_eq!(s.host_protection(true), Protection::None, "strict: it faults, so the readable part traps");
+        assert!(s.traps(true));
+        let all_none = split(&[Part::Mapped(Protection::None), Part::Hole]);
+        assert_eq!(all_none.host_protection(false), Protection::None, "nothing accessible: no access");
     }
 
     #[test]
