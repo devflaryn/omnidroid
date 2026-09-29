@@ -25,7 +25,7 @@ on `unified`, 1,037 commits ahead of `main`); the owner merges.
   instance off Ubuntu's tmpfs `/tmp`; `python3` for the cookie step; `ro.hw_timeout_multiplier` 5 on
   hosts with < 8 CPUs (Android's startup timeout killed Roblox's first start twice).
 - **Verdict**: booted, signed in, PS99 **not reached**: `join-game` answers 403 with a security
-  challenge, 3 runs of 3, and the app's "Security" WebView says "Unable to contact server" (its
+  challenge (`challengedByGcs`), 4 runs of 4 (the 4th with Android's default cached processes), and the app's "Security" WebView says "Unable to contact server" (its
   network works: host TCP to Roblox and CloudFront). Not worked around. For the owner: does this
   account join PS99 on a phone right now; is a challenge pending on it?
 - Open, next: the GL backend's per-frame readback (`glReadPixels` at every swap) and the upload of

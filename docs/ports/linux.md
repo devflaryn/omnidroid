@@ -76,7 +76,7 @@ Measured (runs `omni-linux-r-720229`, `-749163`, 2026-09-29, APK 2.740.931, WARP
 | install, start | `pm install` 0; the stock 15 s `bindApplication` timeout ANR-killed Roblox twice at first (system_server at 100% of a core) -> `ro.hw_timeout_multiplier` 5 on < 8 CPUs (`props::timeout_multiplier`) |
 | sign-in | cookie planted once the app's store exists (`r_roblox`); `DID_LOG_IN` (countryCode TR) ~466 s after start |
 | engine | Vulkan: "Unable to pick Vulkan device" (none, by design) -> GLES: "OpenGL ES 3.1 Mesa 26.0.8"; its loading screen drawn; composer up to ~14-15 presents/s |
-| join | `gamejoin.roblox.com/v1/join-game` **403** (a security challenge), 3 runs of 3; the app's "Security" WebView then shows "Unable to contact server". The WebView has network (host TCP to Roblox and CloudFront, IPv6 included). **Not worked around** (VERIFICATION rules): the owner's to look at |
+| join | `gamejoin.roblox.com/v1/join-game` **403** (a security challenge, the engine logs `challengedByGcs`), 4 runs of 4 -- the 4th with Android's default cached processes (the lean device reaps a WebView process right after the 403), same screen; the app's "Security" screen then shows "Unable to contact server". The WebView has network (host TCP to Roblox and CloudFront, IPv6 included). **Not worked around** (VERIFICATION rules): the owner's to look at |
 | memory | ~4.3 GB RAM + ~0.9 GB swap for the device, signed in (system `free`, 1.5 GB desktop baseline subtracted) |
 
 Also found: `svc` (app_process) aborts in the system host process at boot (pre-existing, Windows
