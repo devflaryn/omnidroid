@@ -651,6 +651,7 @@ pub fn config_for(
         // test that asks for one (`UNSAFE_IGNORE_GLOBAL_MONITOR`) gets it, and no other does.
         unsafe_optimizations: i32::from(opts.optimizations & !optimization::ALL_SAFE != 0),
         optimizations: opts.optimizations,
+        fastmem_low_window: 0,
     }
 }
 

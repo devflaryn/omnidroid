@@ -259,6 +259,11 @@ struct UserConfig {
     /// relevant memory callback.
     /// This is only used if fastmem_pointer is set.
     bool silently_mirror_fastmem = true;
+    /// Omnidroid patch 0030: fastmem_pointer is added only to an address below 2^32 (after the
+    /// top-byte mirroring above); at and above 2^32 the host address is the guest address. For a
+    /// host that can map nothing below 4 GiB (macOS on arm64) running a guest whose low 4 GiB must
+    /// exist (ART). arm64 backend only; requires fastmem_address_space_bits of 64, or of 56 mirrored.
+    bool fastmem_low_window = false;
 
     /// Determines if we should use the above fastmem_pointer for exclusive reads and
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not

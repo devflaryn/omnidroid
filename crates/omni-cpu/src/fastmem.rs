@@ -88,6 +88,9 @@ pub struct MemoryMapping {
     pub direct_access: bool,
     /// Host address that guest address 0 maps to. **0** is identity mapping.
     pub host_base: u64,
+    /// Whether [`host_base`](Self::host_base) applies only below 4 GiB, the identity holding above
+    /// (D41: a space's low window, on a host that maps nothing below 4 GiB).
+    pub low_window: bool,
     /// How many bits of guest address the direct path covers. **64** for a full-width space.
     pub address_bits: u64,
     /// Whether an address beyond `address_bits` is *masked* into range rather than faulting.
@@ -117,6 +120,7 @@ pub const fn identity_mapping(tpidr_el0_slot: u64) -> MemoryMapping {
     MemoryMapping {
         direct_access: true,
         host_base: 0,
+        low_window: false,
         address_bits: 64,
         mirrors_out_of_range: false,
         page_table_present: false,
@@ -166,14 +170,26 @@ pub fn require_memory_path(
              results throughout",
         );
     }
-    if observed.host_base != 0 {
+    // D41: a space with a low window asks for exactly one other shape -- its window's base,
+    // applied below 4 GiB only. Anything else is D4's identity.
+    let expected_window = space.low_window_delta();
+    if observed.low_window != expected_window.is_some() {
+        return refuse(
+            "a base for the low 4 GiB only (the space's low window)",
+            u64::from(expected_window.is_some()),
+            u64::from(observed.low_window),
+            "the space's low 4 GiB live somewhere else in the host (D41); a path that disagrees \
+             reads and writes the wrong memory -- or, above 4 GiB, based memory that is not there",
+        );
+    }
+    if observed.host_base != expected_window.unwrap_or(0) {
         return refuse(
             "host base for guest address 0",
-            0,
+            expected_window.unwrap_or(0),
             observed.host_base,
-            "a non-zero base means guest VA is not host VA, so D4 does not hold: every pointer the \
-             loader hands to guest code, and every pointer guest code hands back, would need \
-             translating",
+            "a base that is not the space's means guest VA is not host VA, so D4 does not hold: \
+             every pointer the loader hands to guest code, and every pointer guest code hands \
+             back, would need translating",
         );
     }
     // Top Byte Ignore asks for exactly one other shape: 56 bits, mirrored (`DynarmicOptions::

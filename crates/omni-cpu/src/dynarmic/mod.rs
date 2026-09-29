@@ -553,6 +553,7 @@ fn thread_config(
     tpidrro_el0: *const u64,
     processor_id: u32,
     overrides: Overrides,
+    low_window_delta: Option<u64>,
 ) -> OdConfig {
     OdConfig {
         abi_version: OD_DYNARMIC_ABI_VERSION,
@@ -574,7 +575,10 @@ fn thread_config(
         // **"Faults" means "is unmapped in the HOST process", and that is narrower than it
         // reads.** See this module's documentation, under "What fastmem does not check".
         fastmem_enabled: i32::from(overrides.direct_access.unwrap_or(true)),
-        fastmem_pointer: 0,
+        // D41: a space with a low window (macOS: nothing maps below 4 GiB) has its guest's low
+        // 4 GiB at `delta + address`; dynarmic adds the base below 2^32 only (patch 0030), and
+        // above it this is still the identity.
+        fastmem_pointer: low_window_delta.unwrap_or(0),
         // Top Byte Ignore (`DynarmicOptions::top_byte_ignore`): 56 bits, mirrored, is dynarmic's
         // mask of the top byte on every direct access -- aliasing across the top byte is exactly
         // what the architecture specifies, and an address with nothing behind it still faults.
@@ -606,6 +610,7 @@ fn thread_config(
         // `optimizations` exactly when this is 1 -- dynarmic requires both.
         unsafe_optimizations: i32::from(options.unsafe_optimizations()),
         optimizations: options.optimizations(),
+        fastmem_low_window: i32::from(low_window_delta.is_some()),
     }
 }
 
@@ -847,6 +852,7 @@ impl DynarmicBackend {
                 &tpidrro,
                 0,
                 Overrides::default(),
+                extent.low_window_delta(),
             );
             // D38 amendment 3 (vendored patch 0028): regions are filled one at a time and a full
             // one stays live; past `shared_code_live_bytes` the oldest is retired, and only its
@@ -1680,6 +1686,7 @@ impl DynarmicCpu {
             &*tpidrro_el0,
             processor_id,
             overrides,
+            shared.extent.low_window_delta(),
         );
 
         // D38: a context of a space with a shared code cache runs from it -- unless it is one of
@@ -1784,6 +1791,7 @@ impl DynarmicCpu {
         MemoryMapping {
             direct_access: observed.fastmem_enabled != 0,
             host_base: observed.fastmem_pointer,
+            low_window: observed.fastmem_low_window != 0,
             address_bits: observed.fastmem_address_space_bits,
             mirrors_out_of_range: observed.silently_mirror_fastmem != 0,
             page_table_present: observed.page_table_present != 0,

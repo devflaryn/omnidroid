@@ -510,6 +510,29 @@ inline bool ShouldExt32(EmitContext& ctx) {
 // Trashes NZCV
 template<size_t bitsize>
 std::pair<oaknut::XReg, oaknut::XReg> FastmemEmitVAddrLookup(oaknut::CodeGenerator& code, EmitContext& ctx, oaknut::XReg Xaddr, const SharedLabel& fallback) {
+    // Omnidroid patch 0030: the low window. Xfastmem is the host base of the guest's low 4 GiB
+    // only; an address at or above 2^32 is its own host address. Two instructions and no branch:
+    //   tst  offset, #0xffffffff00000000 ; csel base, Xfastmem, xzr, eq ; access [base, offset]
+    // The base goes in whichever scratch the offset does not use (Xscratch1 when top-byte
+    // mirroring put the offset in Xscratch0); neither is live at any caller.
+    if (ctx.conf.fastmem_low_window) {
+        ASSERT(!ShouldExt32(ctx));
+        oaknut::XReg Xoffset = Xaddr;
+        if (ctx.conf.fastmem_address_space_bits != 64) {
+            if (ctx.conf.silently_mirror_fastmem) {
+                code.UBFX(Xscratch0, Xaddr, 0, ctx.conf.fastmem_address_space_bits);
+                Xoffset = Xscratch0;
+            } else {
+                code.LSR(Xscratch0, Xaddr, ctx.conf.fastmem_address_space_bits);
+                code.CBNZ(Xscratch0, *fallback);
+            }
+        }
+        const oaknut::XReg Xbase = Xoffset.index() == Xscratch0.index() ? Xscratch1 : Xscratch0;
+        code.TST(Xoffset, 0xFFFF'FFFF'0000'0000);
+        code.CSEL(Xbase, Xfastmem, XZR, EQ);
+        return std::make_pair(Xbase, Xoffset);
+    }
+
     if (ctx.conf.fastmem_address_space_bits == 64 || ShouldExt32(ctx)) {
         return std::make_pair(Xfastmem, Xaddr);
     }

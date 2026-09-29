@@ -230,3 +230,15 @@ It also applies to the Roblox path and to the inline exclusive reads (`LDXR`/`LD
 decides success, so a plain load is sufficient there too.
 Verified: `omni-cpu/tests/tbi.rs::a_load_acquire_from_a_read_only_page_stays_on_the_direct_path`
 (fails without the patch, with and without Top Byte Ignore).
+
+### 0030 — arm64: a low window for the guest's first 4 GiB
+
+arm64 (D41). `UserConfig::fastmem_low_window`: `fastmem_pointer` is added only to an address below
+2^32 (after the top-byte mirror); at and above it the host address is the guest address.
+`FastmemEmitVAddrLookup` emits `tst offset, #0xffffffff00000000; csel base, Xfastmem, xzr, eq` and
+the access goes through `[base, offset]` -- two instructions, no branch, no callback -- and the
+inline exclusives take the same path (`EmitExclusiveHostAddress`). For macOS, which maps nothing
+below 4 GiB, running ART, whose heap must be there. Off by default; the x64 backend ignores the
+field and the shim refuses it on an x64 host. Verified: `omni-cpu/tests/low_window.rs` (a load,
+a store and an exclusive pair at a low address reach `W + g`, a high address stays the identity,
+demand paging in the window, zero slow-path entries, with and without Top Byte Ignore).

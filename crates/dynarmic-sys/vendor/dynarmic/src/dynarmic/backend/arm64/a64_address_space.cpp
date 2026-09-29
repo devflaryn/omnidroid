@@ -886,6 +886,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
         .recompile_on_fastmem_failure = conf.recompile_on_fastmem_failure,
         .fastmem_address_space_bits = conf.fastmem_address_space_bits,
         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
+        .fastmem_low_window = conf.fastmem_low_window,
 
         .fastmem_exclusive_access = conf.fastmem_exclusive_access,
         .global_monitor = conf.global_monitor,

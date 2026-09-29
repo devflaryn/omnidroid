@@ -64,11 +64,11 @@ impl CpuCtx {
         }
         // SAFETY: `resolve` established that `[address, address + 4)` lies inside a mapped,
         // executable region of this guest space, and committed it if the mapping was lazy. D4's
-        // identity mapping makes the guest address a host address, so this is an ordinary read of
-        // memory this process owns. Unaligned is impossible — the 4-byte alignment is checked
+        // identity mapping makes the guest address a host address (in a low window, D41, the one
+        // `host_addr` gives), so this is an ordinary read of memory this process owns. Unaligned is impossible — the 4-byte alignment is checked
         // above — but `read_unaligned` costs nothing extra and does not rely on that check being
         // upstream of a future edit.
-        Some(unsafe { (address as *const u32).read_unaligned() })
+        Some(unsafe { (self.space.host_addr(address) as *const u32).read_unaligned() })
     }
 
     /// Resolve a guest data address for an access of `len` bytes, or record a fault and stop.
@@ -87,7 +87,9 @@ impl CpuCtx {
             self.fault(vaddr, access);
             return None;
         }
-        Some(address as *mut u8)
+        // D41: in a low window the host address is not the guest's. A range across its seam is
+        // never resolved (the guard page below 4 GiB is never mapped).
+        Some(self.space.host_addr(address) as *mut u8)
     }
 
     /// Record a data fault and stop.

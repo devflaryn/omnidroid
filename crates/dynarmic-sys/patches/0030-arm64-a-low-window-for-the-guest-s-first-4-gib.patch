@@ -1,0 +1,75 @@
+diff --git a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+index cc7b3c6..6c27995 100644
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -886,6 +886,7 @@ EmitConfig A64AddressSpace::GetEmitConfig() {
+         .recompile_on_fastmem_failure = conf.recompile_on_fastmem_failure,
+         .fastmem_address_space_bits = conf.fastmem_address_space_bits,
+         .silently_mirror_fastmem = conf.silently_mirror_fastmem,
++        .fastmem_low_window = conf.fastmem_low_window,
+ 
+         .fastmem_exclusive_access = conf.fastmem_exclusive_access,
+         .global_monitor = conf.global_monitor,
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index f20fcbb..be88b00 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -158,6 +158,8 @@ struct EmitConfig {
+     bool recompile_on_fastmem_failure;
+     size_t fastmem_address_space_bits;
+     bool silently_mirror_fastmem;
++    // Omnidroid patch 0030: Xfastmem only below 2^32 (A64 UserConfig::fastmem_low_window).
++    bool fastmem_low_window;
+ 
+     // Omnidroid patch 0007: what the inline exclusive accesses need. `fastmem_exclusive_access` was
+     // accepted by the A64 UserConfig and ignored by this backend.
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+index 1fae884..6039da6 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+@@ -510,6 +510,29 @@ inline bool ShouldExt32(EmitContext& ctx) {
+ // Trashes NZCV
+ template<size_t bitsize>
+ std::pair<oaknut::XReg, oaknut::XReg> FastmemEmitVAddrLookup(oaknut::CodeGenerator& code, EmitContext& ctx, oaknut::XReg Xaddr, const SharedLabel& fallback) {
++    // Omnidroid patch 0030: the low window. Xfastmem is the host base of the guest's low 4 GiB
++    // only; an address at or above 2^32 is its own host address. Two instructions and no branch:
++    //   tst  offset, #0xffffffff00000000 ; csel base, Xfastmem, xzr, eq ; access [base, offset]
++    // The base goes in whichever scratch the offset does not use (Xscratch1 when top-byte
++    // mirroring put the offset in Xscratch0); neither is live at any caller.
++    if (ctx.conf.fastmem_low_window) {
++        ASSERT(!ShouldExt32(ctx));
++        oaknut::XReg Xoffset = Xaddr;
++        if (ctx.conf.fastmem_address_space_bits != 64) {
++            if (ctx.conf.silently_mirror_fastmem) {
++                code.UBFX(Xscratch0, Xaddr, 0, ctx.conf.fastmem_address_space_bits);
++                Xoffset = Xscratch0;
++            } else {
++                code.LSR(Xscratch0, Xaddr, ctx.conf.fastmem_address_space_bits);
++                code.CBNZ(Xscratch0, *fallback);
++            }
++        }
++        const oaknut::XReg Xbase = Xoffset.index() == Xscratch0.index() ? Xscratch1 : Xscratch0;
++        code.TST(Xoffset, 0xFFFF'FFFF'0000'0000);
++        code.CSEL(Xbase, Xfastmem, XZR, EQ);
++        return std::make_pair(Xbase, Xoffset);
++    }
++
+     if (ctx.conf.fastmem_address_space_bits == 64 || ShouldExt32(ctx)) {
+         return std::make_pair(Xfastmem, Xaddr);
+     }
+diff --git a/src/dynarmic/interface/A64/config.h b/src/dynarmic/interface/A64/config.h
+index a41020c..b17dc39 100644
+--- a/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/interface/A64/config.h
+@@ -259,6 +259,11 @@ struct UserConfig {
+     /// relevant memory callback.
+     /// This is only used if fastmem_pointer is set.
+     bool silently_mirror_fastmem = true;
++    /// Omnidroid patch 0030: fastmem_pointer is added only to an address below 2^32 (after the
++    /// top-byte mirroring above); at and above 2^32 the host address is the guest address. For a
++    /// host that can map nothing below 4 GiB (macOS on arm64) running a guest whose low 4 GiB must
++    /// exist (ART). arm64 backend only; requires fastmem_address_space_bits of 64, or of 56 mirrored.
++    bool fastmem_low_window = false;
+ 
+     /// Determines if we should use the above fastmem_pointer for exclusive reads and
+     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not

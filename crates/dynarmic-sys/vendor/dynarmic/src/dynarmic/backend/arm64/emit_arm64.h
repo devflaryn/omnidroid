@@ -158,6 +158,8 @@ struct EmitConfig {
     bool recompile_on_fastmem_failure;
     size_t fastmem_address_space_bits;
     bool silently_mirror_fastmem;
+    // Omnidroid patch 0030: Xfastmem only below 2^32 (A64 UserConfig::fastmem_low_window).
+    bool fastmem_low_window;
 
     // Omnidroid patch 0007: what the inline exclusive accesses need. `fastmem_exclusive_access` was
     // accepted by the A64 UserConfig and ignored by this backend.
