@@ -61,6 +61,23 @@ const OVERLAY: [(&str, &str); 17] = [
     ("ro.sf.lcd_density", "160"),
 ];
 
+/// `ro.hw_timeout_multiplier` for a host with `cpus` logical CPUs (`asked`: `OMNI_HW_TIMEOUT_MULTIPLIER`),
+/// or none (Android's own 1). Android scales its timeouts by it (`Build.HW_TIMEOUT_MULTIPLIER`: an
+/// app's startup, input dispatch, broadcasts), as emulator images set it for a device slower than a
+/// phone. MEASURED (Linux, i5-4460, 4 cores, 2026-09-29): Roblox's start was killed twice at the
+/// stock 15 s ("failed to complete startup") while system_server held a core; the Windows host
+/// (24 threads) never hit it.
+#[must_use]
+pub fn timeout_multiplier(cpus: usize, asked: Option<&str>) -> Option<u32> {
+    let m = match asked.and_then(|a| a.trim().parse::<u32>().ok()) {
+        Some(m) => m,
+        None if cpus >= 12 => 1,
+        None if cpus >= 8 => 2,
+        None => 5,
+    };
+    (m > 1).then_some(m)
+}
+
 /// `key=value` lines as init reads a `build.prop`: comments, blanks, `import` lines and lines
 /// without `=` are skipped; key and value are trimmed; the value keeps any further `=`.
 #[must_use]
@@ -159,6 +176,10 @@ impl Properties {
         // (`/vendor/lib64/egl/libGLES_omni.so`) and no Vulkan. Both forward to the host's GPU.
         for (k, v) in crate::gpu::backend::properties(crate::gpu::backend::backend()) {
             self.set(k, v);
+        }
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        if let Some(m) = timeout_multiplier(cpus, std::env::var("OMNI_HW_TIMEOUT_MULTIPLIER").ok().as_deref()) {
+            self.set("ro.hw_timeout_multiplier", &m.to_string());
         }
     }
 

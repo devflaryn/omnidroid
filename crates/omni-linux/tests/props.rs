@@ -160,3 +160,18 @@ ro.build.tags=release-keys
     assert_eq!(p.get("ro.product.device"), Some("extdev"));
     assert_eq!(p.get("ro.build.fingerprint"), Some("SysBrand/pname/extdev:15/AE3A/123:user/release-keys"));
 }
+
+/// A slow host is a slow device: Android scales its startup and input timeouts by
+/// `ro.hw_timeout_multiplier` (`Build.HW_TIMEOUT_MULTIPLIER`), which the emulator images set. Four
+/// cores (the Linux host, i5-4460) ANR'd Roblox's start twice at the stock 15 s ("failed to
+/// complete startup"); a host with 12 or more is left at Android's own 1.
+#[test]
+fn a_host_with_few_cores_is_a_device_with_longer_timeouts() {
+    use omni_linux::props::timeout_multiplier;
+    assert_eq!(timeout_multiplier(4, None), Some(5));
+    assert_eq!(timeout_multiplier(6, None), Some(5));
+    assert_eq!(timeout_multiplier(8, None), Some(2));
+    assert_eq!(timeout_multiplier(24, None), None, "the Windows host: unchanged");
+    assert_eq!(timeout_multiplier(4, Some("3")), Some(3), "OMNI_HW_TIMEOUT_MULTIPLIER names one");
+    assert_eq!(timeout_multiplier(4, Some("1")), None, "1 is Android's own");
+}
