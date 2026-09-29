@@ -30,7 +30,7 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 4] = ["/system/build.prop", "/system_ext/etc/build.prop", "/vendor/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 20] = [
+const OVERLAY: [(&str, &str); 18] = [
     // The property service speaks protocol 2 (a reply for every set).
     ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
@@ -55,10 +55,8 @@ const OVERLAY: [(&str, &str); 20] = [
     ("ro.boot.vbmeta.digest", "836f26adcab3883794ba405c6bf019f74afbdc3c9d76bdb26cb1ea1672ffa8e8"),
     ("ro.boot.vbmeta.hash_alg", "sha256"),
     ("ro.boot.vbmeta.size", "6720"),
-    // The GPU drivers (D3a): the image's own ANGLE for GLES, on omnidroid's Vulkan driver
-    // (`/vendor/lib64/hw/vulkan.omni.so`), which forwards to the host's GPU.
-    ("ro.hardware.egl", "angle"),
-    ("ro.hardware.vulkan", "omni"),
+    // The GPU drivers (`ro.hardware.egl`, `ro.hardware.vulkan`) are the backend's
+    // (`crate::gpu::backend::properties`), set after these.
     // The display (the host composer's, D3): 160 dpi, as the D design reports it.
     ("ro.sf.lcd_density", "160"),
     // A slow device's timeouts: Android's own scale for them (`Build.HW_TIMEOUT_MULTIPLIER`,
@@ -69,6 +67,23 @@ const OVERLAY: [(&str, &str); 20] = [
     // (a space pressed its "Close app").
     ("ro.hw_timeout_multiplier", "5"),
 ];
+
+/// `ro.hw_timeout_multiplier` for a host with `cpus` logical CPUs (`asked`: `OMNI_HW_TIMEOUT_MULTIPLIER`),
+/// or none (Android's own 1). Android scales its timeouts by it (`Build.HW_TIMEOUT_MULTIPLIER`: an
+/// app's startup, input dispatch, broadcasts), as emulator images set it for a device slower than a
+/// phone. MEASURED (Linux, i5-4460, 4 cores, 2026-09-29): Roblox's start was killed twice at the
+/// stock 15 s ("failed to complete startup") while system_server held a core; the Windows host
+/// (24 threads) never hit it.
+#[must_use]
+pub fn timeout_multiplier(cpus: usize, asked: Option<&str>) -> Option<u32> {
+    let m = match asked.and_then(|a| a.trim().parse::<u32>().ok()) {
+        Some(m) => m,
+        None if cpus >= 12 => 1,
+        None if cpus >= 8 => 2,
+        None => 5,
+    };
+    (m > 1).then_some(m)
+}
 
 /// `key=value` lines as init reads a `build.prop`: comments, blanks, `import` lines and lines
 /// without `=` are skipped; key and value are trimmed; the value keeps any further `=`.
@@ -162,6 +177,16 @@ impl Properties {
     pub fn apply_overlay(&mut self) {
         for (k, v) in OVERLAY {
             self.set(k, v);
+        }
+        // The GPU drivers: on Vulkan (D3a) the image's own ANGLE for GLES on omnidroid's Vulkan
+        // driver (`/vendor/lib64/hw/vulkan.omni.so`); on GL omnidroid's GLES driver
+        // (`/vendor/lib64/egl/libGLES_omni.so`) and no Vulkan. Both forward to the host's GPU.
+        for (k, v) in crate::gpu::backend::properties(crate::gpu::backend::backend()) {
+            self.set(k, v);
+        }
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        if let Some(m) = timeout_multiplier(cpus, std::env::var("OMNI_HW_TIMEOUT_MULTIPLIER").ok().as_deref()) {
+            self.set("ro.hw_timeout_multiplier", &m.to_string());
         }
     }
 

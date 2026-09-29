@@ -18,6 +18,10 @@ pub const FILES: &[(&str, &[u8])] = &[
     ("/init.environ.rc", include_bytes!("../device/init.environ.rc")),
     // The Vulkan driver, forwarding to the host's GPU (`device/src/vk/`; `crate::gpu`).
     ("/vendor/lib64/hw/vulkan.omni.so", include_bytes!("../device/vendor/lib64/hw/vulkan.omni.so")),
+    // The GLES driver of the GL backend (`OMNI_GPU=gl`, a host whose GPU has no Vulkan), forwarding
+    // every GLES command to the host's GLES (`device/src/gl/`; `crate::gpu::gl`). Android's EGL
+    // loader takes it when `ro.hardware.egl=omni` (`crate::gpu::backend`).
+    ("/vendor/lib64/egl/libGLES_omni.so", include_bytes!("../device/vendor/lib64/egl/libGLES_omni.so")),
     // This device has no sensors: the AOSP sensors multihal loads no sub-HAL and serves an empty
     // list (the image's lists the emulator's, which needs QEMU's sensors transport).
     ("/vendor/etc/sensors/hals.conf", include_bytes!("../device/vendor/etc/sensors/hals.conf")),

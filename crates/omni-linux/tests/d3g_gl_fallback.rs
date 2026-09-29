@@ -1,7 +1,6 @@
-//! Sub-project D3a's gate: the guest has a GPU. Vulkan through the real Android loader and
-//! omnidroid's driver (`/vendor/lib64/hw/vulkan.omni.so`) runs on the host's GPU; GLES through the
-//! image's own ANGLE runs on that Vulkan. This is the Vulkan backend's gate (`OMNI_GPU=vulkan`,
-//! whatever `auto` would choose on this host); `d3g_gl_fallback.rs` is the GL backend's.
+//! The GL backend's gate (`OMNI_GPU=gl`, for a host whose GPU has no Vulkan): GLES through the
+//! real Android EGL loader and omnidroid's GLES driver (`/vendor/lib64/egl/libGLES_omni.so`) runs on
+//! the host's GLES -- the same fixtures as D3a's ANGLE rows, so the two backends answer one test.
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -18,10 +17,14 @@ fn text(b: &Buf) -> String {
     String::from_utf8_lossy(&b.lock()).into_owned()
 }
 
+/// Every test of this binary is on the GL backend: set before the first process reads it.
+fn gl_backend() {
+    static SET: OnceLock<()> = OnceLock::new();
+    SET.get_or_init(|| std::env::set_var("OMNI_GPU", "gl"));
+    assert_eq!(omni_linux::gpu::backend::backend(), omni_linux::gpu::backend::Backend::Gl);
+}
+
 fn spawn(sysroot: &Path, instance: &Path, argv: &[&str], uid: u32) -> (Arc<Process>, Buf, Buf) {
-    // Every test of this binary is on the Vulkan backend: set before the first process reads it.
-    static VULKAN: OnceLock<()> = OnceLock::new();
-    VULKAN.get_or_init(|| std::env::set_var("OMNI_GPU", "vulkan"));
     let out = Buf::default();
     let err = Buf::default();
     let p = Process::spawn_as(
@@ -40,14 +43,12 @@ fn spawn(sysroot: &Path, instance: &Path, argv: &[&str], uid: u32) -> (Arc<Proce
     (p, out, err)
 }
 
-/// What every process here finds, as on a device: the real `servicemanager` and the graphics
-/// allocator (D2), which libui -- under EGL and ANGLE -- asks for. Once per test binary: the binder
-/// broker is per host process.
+/// servicemanager, hwservicemanager and the graphics allocator, as D3a's gate starts them.
 fn device(sysroot: &Path) -> &'static Arc<Allocator> {
     static DEVICE: OnceLock<(Arc<Process>, Arc<Allocator>)> = OnceLock::new();
     &DEVICE
         .get_or_init(|| {
-            let instance = std::env::temp_dir().join(format!("omni-linux-d3a-device-{}", std::process::id()));
+            let instance = std::env::temp_dir().join(format!("omni-linux-d3g-device-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&instance);
             let (p, _, e) = spawn(sysroot, &instance, &["/apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig"], 0);
             assert_eq!(p.run(), ExitStatus::Exited(0), "linkerconfig: {}", text(&e));
@@ -56,13 +57,10 @@ fn device(sysroot: &Path) -> &'static Arc<Allocator> {
                 let sm = Arc::clone(&sm);
                 std::thread::spawn(move || sm.run());
             }
-            // HIDL's service manager: libhidl waits for it before any lookup (EGL looks up the
-            // SurfaceFlinger configstore, which is not declared and so not found).
             let (hwsm, _, _) = spawn(sysroot, &instance, &["/system/bin/hwservicemanager"], 1000);
             std::thread::spawn(move || hwsm.run());
             let allocator = Allocator::new();
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            // servicemanager takes the context manager once it has started.
             while let Err(e) = allocator.register(&broker(Context::Binder)) {
                 assert!(std::time::Instant::now() < deadline, "the allocator: {e}\nservicemanager: {}", text(&sm_err));
                 std::thread::sleep(Duration::from_millis(100));
@@ -72,11 +70,15 @@ fn device(sysroot: &Path) -> &'static Arc<Allocator> {
         .1
 }
 
-/// An instance with its linker configuration, and a fixture copied to its `/data/local/tmp`.
-fn prepare(name: &str, fixture: &str) -> (PathBuf, PathBuf) {
+fn prepare(name: &str, fixture: &str) -> Option<(PathBuf, PathBuf)> {
+    gl_backend();
+    if let Err(why) = omni_linux::gpu::gl::host_available() {
+        eprintln!("SKIPPED: this host has no GLES the GL backend can open: {why}");
+        return None;
+    }
     let sysroot = common::sysroot().expect("no sysroot (tools/make_sysroot.py): the gate cannot run");
     device(&sysroot);
-    let instance = std::env::temp_dir().join(format!("omni-linux-d3a-{name}-{}", std::process::id()));
+    let instance = std::env::temp_dir().join(format!("omni-linux-d3g-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&instance);
     let (p, _, e) = spawn(&sysroot, &instance, &["/apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig"], 0);
     assert_eq!(p.run(), ExitStatus::Exited(0), "linkerconfig: {}", text(&e));
@@ -84,46 +86,30 @@ fn prepare(name: &str, fixture: &str) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&tmp).unwrap();
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fixture);
     std::fs::copy(&src, tmp.join(fixture)).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
-    (sysroot, instance)
+    Some((sysroot, instance))
 }
 
-/// Run `/data/local/tmp/<fixture>` to its end (at most 3 minutes): its status, stdout, stderr.
-fn run_fixture(sysroot: &Path, instance: &Path, fixture: &str) -> (ExitStatus, String, String) {
-    let guest = format!("/data/local/tmp/{fixture}");
-    let (p, out, err) = spawn(sysroot, instance, &[guest.as_str()], 10_000);
+#[test]
+fn the_gl_driver_clears_a_pbuffer_on_the_host_gpu() {
+    let Some((sysroot, instance)) = prepare("gl", "glclear") else { return };
+    let (p, out, err) = spawn(&sysroot, &instance, &["/data/local/tmp/glclear"], 10_000);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || tx.send(p.run()));
-    match rx.recv_timeout(Duration::from_secs(180)) {
-        Ok(status) => (status, text(&out), text(&err)),
-        Err(_) => panic!("{fixture} did not finish\nstdout: {}\nstderr: {}", text(&out), text(&err)),
-    }
-}
-
-#[test]
-fn vulkan_clears_an_image_on_the_host_gpu() {
-    let (sysroot, instance) = prepare("vk", "vkclear");
-    let (status, out, err) = run_fixture(&sysroot, &instance, "vkclear");
-    assert_eq!(status, ExitStatus::Exited(0), "vkclear\nstdout: {out}\nstderr: {err}");
-    let line = out.lines().find(|l| l.starts_with("vulkan ok ")).unwrap_or_else(|| panic!("stdout: {out}\nstderr: {err}"));
-    eprintln!("{line}");
-}
-
-#[test]
-fn angle_clears_a_pbuffer_on_the_host_gpu() {
-    let (sysroot, instance) = prepare("gl", "glclear");
-    let (status, out, err) = run_fixture(&sysroot, &instance, "glclear");
+    let status = rx.recv_timeout(Duration::from_secs(180)).unwrap_or_else(|_| panic!("glclear did not finish\nstdout: {}\nstderr: {}", text(&out), text(&err)));
+    let (out, err) = (text(&out), text(&err));
     assert_eq!(status, ExitStatus::Exited(0), "glclear\nstdout: {out}\nstderr: {err}");
     let line = out.lines().find(|l| l.starts_with("gles ok ")).unwrap_or_else(|| panic!("stdout: {out}\nstderr: {err}"));
-    assert!(line.contains("ANGLE"), "the renderer is ANGLE's: {line}");
+    // The host's own renderer, not ANGLE on a Vulkan device.
+    assert!(!line.contains("ANGLE"), "the renderer is the host's GLES: {line}");
     eprintln!("{line}");
 }
 
-/// GLES renders into a gralloc buffer through an `EGLImage` -- what SurfaceFlinger's RenderEngine
-/// does with every output -- and the colour is in the buffer's `shm` region, where the host reads
-/// it (and so the host composer will).
+/// GLES renders into a gralloc buffer through an `EGLImage` (what RenderEngine does with an output,
+/// HWUI with a hardware bitmap), and the colour is in the buffer's region, where the host composer
+/// reads it.
 #[test]
 fn an_egl_image_on_a_gralloc_buffer_renders_where_the_host_reads_it() {
-    let (sysroot, instance) = prepare("ahb", "ahbrender");
+    let Some((sysroot, instance)) = prepare("ahb", "ahbrender") else { return };
     let allocator = device(&sysroot);
     let before: Vec<u64> = allocator.live().into_iter().map(|(id, _)| id).collect();
     let (p, out, err) = spawn(&sysroot, &instance, &["/data/local/tmp/ahbrender"], 10_000);
@@ -141,12 +127,11 @@ fn an_egl_image_on_a_gralloc_buffer_renders_where_the_host_reads_it() {
         assert!(std::time::Instant::now() < deadline, "no render within 120 s\n{}", report());
         std::thread::sleep(Duration::from_millis(20));
     };
-    // The one buffer this fixture allocated, read by the host.
+    // The one buffer this fixture allocated, read by the host: every pixel the colour.
     let mine: Vec<_> = allocator.live().into_iter().filter(|(id, _)| !before.contains(id)).collect();
     assert_eq!(mine.len(), 1, "one new gralloc buffer\n{}", report());
-    let shm = &mine[0].1;
     let mut px = vec![0u8; (stride * 32 * 4) as usize];
-    shm.read_at(&mut px, omni_linux::hal::gralloc::PIXELS_AT).unwrap();
+    mine[0].1.read_at(&mut px, omni_linux::hal::gralloc::PIXELS_AT).unwrap();
     for y in 0..32u64 {
         for x in 0..64u64 {
             let at = ((y * stride + x) * 4) as usize;
@@ -157,4 +142,18 @@ fn an_egl_image_on_a_gralloc_buffer_renders_where_the_host_reads_it() {
     std::fs::write(instance.join("data/local/tmp/ahbrender.go"), b"").unwrap();
     let status = rx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| panic!("ahbrender did not finish\n{}", report()));
     assert_eq!(status, ExitStatus::Exited(0), "{}", report());
+}
+
+/// Two buffers mapped at once through one target: each mapping is its buffer's, as a renderer
+/// streaming vertices and indices relies on (`fixtures/glmaps.c` says what went wrong before).
+#[test]
+fn a_mapping_belongs_to_its_buffer_not_to_the_target() {
+    let Some((sysroot, instance)) = prepare("maps", "glmaps") else { return };
+    let (p, out, err) = spawn(&sysroot, &instance, &["/data/local/tmp/glmaps"], 10_000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(p.run()));
+    let status = rx.recv_timeout(Duration::from_secs(180)).unwrap_or_else(|_| panic!("glmaps did not finish\nstdout: {}\nstderr: {}", text(&out), text(&err)));
+    let (out, err) = (text(&out), text(&err));
+    assert_eq!(status, ExitStatus::Exited(0), "glmaps\nstdout: {out}\nstderr: {err}");
+    assert!(out.contains("glmaps ok"), "stdout: {out}\nstderr: {err}");
 }

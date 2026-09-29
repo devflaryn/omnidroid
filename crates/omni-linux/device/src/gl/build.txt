@@ -1,0 +1,14 @@
+libGLES_omni.so -- omnidroid's guest GLES driver (the GL backend: an all-in-one EGL + GLES driver
+Android's EGL loader takes when ro.hardware.egl=omni). Built on Linux with the Android NDK r28c
+(android-ndk-r28c-linux.zip from dl.google.com), from crates/omni-linux/device/src/gl:
+
+    python3 ../../../../../tools/gen_gl_forward.py        (regenerates generated.c from omni-android's gles/signatures.rs)
+    <ndk>/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang -std=gnu11 -O2 -Wall -Wextra -Werror -fPIC -shared -fvisibility=hidden -I../vk/include -I. -Wl,-soname,libGLES_omni.so -Wl,--as-needed -o ../../vendor/lib64/egl/libGLES_omni.so gl_special.c egl.c generated.c -llog
+
+(on Windows: prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd, the same arguments).
+
+The binary is committed (the runtime never needs the NDK); ../../SHA256SUMS pins it. NEEDED: liblog.so,
+libc.so. Exports: the EGL 1.4 entry points and the KHR ones egl.c lists, and every gl* command of
+the table (`omni-linux`'s `gpu::gl` checks the table's fingerprint at eglInitialize).
+window.h is AOSP's ANativeWindow/ANativeWindowBuffer layout (android15-release), which the NDK does
+not ship; ../vk/include/cutils/native_handle.h is shared with the Vulkan driver.

@@ -431,8 +431,15 @@ fn sys_exit(_p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
-fn sys_exit_group(_p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
-    t.exit = Some(Exit::Group(a[0] as i32));
+fn sys_exit_group(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let code = a[0] as i32;
+    // A process that ends itself with a failure says so, and from where: an app's own exit is
+    // otherwise silent (Roblox, 2026-09-29: exit 11 in a world, nothing in its log).
+    if code != 0 {
+        let at = |x: u64| p.mm.describe(x).map_or_else(String::new, |d| format!(" ({d})"));
+        eprintln!("[exit] pid {} tid {} exit_group({code}) pc {:#x}{} lr {:#x}{}", p.sys.pid, t.tid, t.pc, at(t.pc), t.lr, at(t.lr));
+    }
+    t.exit = Some(Exit::Group(code));
     Ok(0)
 }
 

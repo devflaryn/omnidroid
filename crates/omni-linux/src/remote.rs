@@ -95,7 +95,8 @@ fn context_of(b: u8) -> Context {
 // ---------------------------------------------------------------------------------------------
 // Descriptors across host processes: shared memory by its host file, a sync file as signalled.
 
-/// A descriptor as it crosses: `[kind]` then, for shared memory, its name, host path and length;
+/// A descriptor as it crosses: `[kind]` then, for shared memory, its name, host path, length and
+/// ashmem protection mask (a read-only region is read-only on the other side too);
 /// for a socket pair's end or a pipe's end, the port its relay waits on (`crate::relay`) and the
 /// end's identity ([`crossing_id`]).
 fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
@@ -109,6 +110,7 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
                 d.extend_from_slice(s);
             }
             d.extend_from_slice(&m.len().to_le_bytes());
+            d.extend_from_slice(&m.prot_mask.load(std::sync::atomic::Ordering::SeqCst).to_le_bytes());
             d
         }
         FileKind::SyncFile(_) => vec![2u8],
@@ -175,6 +177,9 @@ fn open_described(d: &[u8]) -> Result<Arc<OpenFile>, Errno> {
             let (name, path) = (field(), field());
             let len = u64_at(d, at);
             let shm = crate::shm::Shm::open_path(&name, std::path::Path::new(&path), len)?;
+            if d.len() >= at + 16 {
+                shm.prot_mask.store(u64_at(d, at + 8), std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Shared(shm)), flags: parking_lot::Mutex::new(2) }))
         }
         Some(3) => {
@@ -615,7 +620,21 @@ mod tests {
     /// A file's descriptor crosses to another host process as the same host file, with its access
     /// and offset: the WebView hands its service a `ParcelFileDescriptor` of the app's own data
     /// (`app_webview/variations_seed_new`), and a refused descriptor failed the whole transaction.
+        /// A read-only ashmem region stays read-only on the other side: the WebView's renderer (another
+    /// host process) checks the mask of every read-only region it is handed
+    /// (`platform_shared_memory_region_android.cc`: "Ashmem region has a wrong protection mask"),
+    /// and its CHECK took the renderer -- and WebView then the app -- down (Roblox, 2026-09-29).
     #[test]
+    fn a_shared_regions_protection_mask_crosses_with_it() {
+        let shm = crate::shm::Shm::create("dev/ashmem").expect("a region");
+        shm.prot_mask.store(1, std::sync::atomic::Ordering::SeqCst); // PROT_READ
+        let file = Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Shared(shm)), flags: parking_lot::Mutex::new(2) });
+        let other = open_described(&describe(&file)).expect("opened on the other side");
+        let FileKind::Shared(m) = &*other.kind.lock() else { panic!("not a shared region") };
+        assert_eq!(m.prot_mask.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+#[test]
     fn a_file_crosses_as_the_same_host_file_at_the_same_offset() {
         let path = std::env::temp_dir().join(format!("omni-remote-file-{}", std::process::id()));
         std::fs::write(&path, b"0123456789").unwrap();

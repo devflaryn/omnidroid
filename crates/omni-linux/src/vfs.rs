@@ -116,7 +116,8 @@ impl Sysroot {
             manifest.entries.insert(file.guest, file.entry);
         }
         // What the device leaves out of the image (`device::left_out`): each path and what is under it.
-        for gone in crate::device::left_out() {
+        let gpu = crate::gpu::backend::left_out(crate::gpu::backend::backend());
+        for gone in crate::device::left_out().into_iter().chain(gpu.iter().copied()) {
             let (path, under) = (gone.as_bytes(), [gone.as_bytes(), b"/"].concat());
             manifest.entries.retain(|p, _| p.as_slice() != path && !p.starts_with(&under));
         }

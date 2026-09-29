@@ -70,12 +70,14 @@ fn the_apk_is_installed_started_and_draws() {
     std::env::set_var("OMNI_SCREENSHOT", &screenshot);
 
     let extra = std::env::var("OMNI_R_THEN").unwrap_or_default();
-    // `OMNI_R_COOKIE=<file>`: the app's first start makes its own cookie store; the app is stopped,
-    // the session cookie put in that store (`tools/plant_cookie.py`, never printed), and the app
-    // started again -- as a device that had signed in starts it.
+    // `OMNI_R_COOKIE=<file>`: the app's first start makes its own cookie store; once the host sees
+    // it (`cookie-store`, below: a fixed 45 s was too short where the first start is slow -- Linux,
+    // 4 cores), the app is stopped, the session cookie put in that store (`tools/plant_cookie.py`,
+    // never printed), and the app started again -- as a device that had signed in starts it.
     let cookie = std::env::var_os("OMNI_R_COOKIE").map(PathBuf::from);
     let sign_in = if cookie.is_some() {
-        "sleep 45; am force-stop com.roblox.client; echo \"[r] cookie-stop\"; \
+        "i=0; until [ -e /data/local/tmp/cookie-store ] || [ $i -ge 600 ]; do sleep 1; i=$((i+1)); done; sleep 10; \
+         am force-stop com.roblox.client; echo \"[r] cookie-stop\"; \
          i=0; until [ -e /data/local/tmp/cookie-planted ] || [ $i -ge 180 ]; do sleep 1; i=$((i+1)); done; \
          echo \"[r] cookie planted: $(cat /data/local/tmp/cookie-planted)\"; \
          am start -W -n \"$act\"; echo \"[r] relaunched: $?\"; "
@@ -186,12 +188,20 @@ fn the_apk_is_installed_started_and_draws() {
         for (s, e) in seen.iter_mut().zip(&expect) {
             *s |= line.contains(e.as_str());
         }
+        let store = kept.join("data/data/com.roblox.client/app_webview/Default/Cookies");
+        if cookie.is_some() && !kept.join("data/local/tmp/cookie-store").exists() && store.exists() {
+            let _ = std::fs::write(kept.join("data/local/tmp/cookie-store"), "1");
+            eprintln!("[r] +{}s the app's cookie store is there", started.elapsed().as_secs());
+        }
         if line.contains("[r] cookie-stop") {
             if let Some(file) = &cookie {
                 std::thread::sleep(Duration::from_secs(3));
                 let store = kept.join("data/data/com.roblox.client/app_webview/Default/Cookies");
                 let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/plant_cookie.py");
-                let planted = std::process::Command::new("python").arg(&tool).arg(&store).arg(file).output();
+                // Windows installs `python`; Linux and macOS distributions name it `python3` (Ubuntu
+                // ships no `python` at all).
+                let python = if cfg!(windows) { "python" } else { "python3" };
+                let planted = std::process::Command::new(python).arg(&tool).arg(&store).arg(file).output();
                 let said = match &planted {
                     Ok(o) => format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
                     Err(e) => format!("python: {e}"),
