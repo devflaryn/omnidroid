@@ -301,9 +301,10 @@ pub struct GuestSpaceConfig {
     pub around_host: bool,
     /// Back the part of the space below [`LOW_WINDOW_END`] with a host reservation wherever the
     /// host chooses, addressed as `g + delta` ([`LowWindow`], D41), instead of at the guest
-    /// addresses themselves. Default `false`. Needs `base: Some(_)` below `LOW_WINDOW_END`; the
-    /// part at and above it is reserved as it would be without (and [`around_host`](Self::around_host)
-    /// applies to it alone).
+    /// addresses themselves. Default `false`. Needs `base: Some(_)` below `LOW_WINDOW_END`. The
+    /// rest of [`size`](Self::size) is the identity: at 4 GiB when the host has it free there, else
+    /// wherever the host puts it, with `[4 GiB, there)` one host-owned range -- so the space's
+    /// [`len`](GuestSpace::len) can exceed `size`. [`around_host`](Self::around_host) is not used.
     ///
     /// Why: ART's heap and boot image must be below 4 GiB, and macOS maps nothing there
     /// (`vm::lowest_mappable_address` is 4 GiB on Apple silicon). Where the host can map low, the
@@ -635,10 +636,12 @@ impl GuestSpace {
         // At least page-aligned: the host's allocation granularity already is, for the host's own
         // page, and is not for a larger page asked of `with_page_size`.
         let mut window = None;
+        let mut size = config.size;
         let (reservations, hosts) = match config.base {
             Some(at) if config.low_window => {
-                let (reservations, hosts, low) = reserve_with_window(at, config.size, page, config.around_host)?;
+                let (reservations, hosts, low, len) = reserve_with_window(at, config.size, page)?;
                 window = Some(low);
+                size = len;
                 (reservations, hosts)
             }
             Some(at) if config.around_host => reserve_around_host(at, config.size, page)?,
@@ -663,10 +666,10 @@ impl GuestSpace {
         let base = config.base.unwrap_or_else(|| reservations[0].base());
         // A placement without an address never lands in the window: what the host reads in place
         // (D41) is always placed that way.
-        let floor = window.map_or(base, |w| w.end.min(base + config.size));
+        let floor = window.map_or(base, |w| w.end.min(base + size));
         tracing::debug!(
             base = format_args!("{base:#x}"),
-            size = config.size,
+            size,
             granule = config.commit_granule,
             host_ranges = hosts.len(),
             window = ?window,
@@ -674,12 +677,12 @@ impl GuestSpace {
         );
         Ok(Self {
             base,
-            len: config.size,
+            len: size,
             page,
             granule: config.commit_granule,
             window,
             inner: Mutex::new(Inner {
-                map: EntryMap::with_hosts(base, config.size, hosts),
+                map: EntryMap::with_hosts(base, size, hosts),
                 reservations,
                 page,
                 granule: config.commit_granule,
@@ -2742,14 +2745,21 @@ const AROUND_HOST_ATTEMPTS: usize = 4;
 
 /// Reserve a space with a [`LowWindow`] (D41): the window's part (`[base, LOW_WINDOW_END - page)`)
 /// at `W + g` for a 4 GiB-aligned `W` the host chooses, the page below `LOW_WINDOW_END` as a
-/// host-owned guard, and the part above as it would be without the window. The reservations come
-/// back sorted by host address, the host's ranges by guest address.
+/// host-owned guard, and the rest of `size` above 4 GiB as the identity: at 4 GiB itself when the
+/// host has that much free there, else wherever the host chooses (`H`), `[4 GiB, H)` then being one
+/// host-owned range. Returns the reservations sorted by host address, the host's ranges by guest
+/// address, the window, and the space's length (`H + rest - base`, or `size`).
+///
+/// Why the identity part moves: on macOS nearly everything from the executable up to ~448 GiB is
+/// the host's -- the dyld shared region's reservation and the GPU carveout (MEASURED on the M1,
+/// macOS 27: fixed allocations at 16, 64 and 128 GiB are `KERN_NO_SPACE`, and the host's own choice
+/// for 64 GiB was `0x7b_2640_0000`). The guest does not care where its high memory is: what it
+/// places without an address goes to the lowest free range above 4 GiB (`omni-linux`'s `mm`).
 fn reserve_with_window(
     base: GuestAddr,
     size: usize,
     page: usize,
-    around_host: bool,
-) -> MemResult<(Vec<Reservation>, Vec<(GuestAddr, usize)>, LowWindow)> {
+) -> MemResult<(Vec<Reservation>, Vec<(GuestAddr, usize)>, LowWindow, usize)> {
     const OP: &str = "GuestSpace::with_config";
     let end = base.checked_add(size).ok_or(MemError::InvalidConfig {
         field: "size",
@@ -2786,36 +2796,36 @@ fn reserve_with_window(
 
     let mut reservations = vec![low];
     let mut hosts = Vec::new();
+    let mut len = size;
     if end > guard {
         hosts.push((guard, end.min(LOW_WINDOW_END) - guard));
     }
     if end > LOW_WINDOW_END {
         let high_len = end - LOW_WINDOW_END;
-        let high = if around_host {
-            reserve_around_host(LOW_WINDOW_END, high_len, page)
-        } else {
-            vm::reserve_placeholder_at(LOW_WINDOW_END, high_len)
-                .map(|r| (vec![r], Vec::new()))
-                .map_err(platform(OP, LOW_WINDOW_END, high_len))
-        };
+        let high = vm::reserve_placeholder_at(LOW_WINDOW_END, high_len).or_else(|_| {
+            // Not free at 4 GiB (macOS): the host's choice, 4 GiB-aligned.
+            vm::reserve_placeholder(high_len, LOW_WINDOW_END)
+        });
         match high {
-            Ok((high, high_hosts)) => {
-                reservations.extend(high);
-                hosts.extend(high_hosts);
+            Ok(high) => {
+                let at = high.base();
+                if at > LOW_WINDOW_END {
+                    hosts.push((LOW_WINDOW_END, at - LOW_WINDOW_END));
+                    len = at + high_len - base;
+                }
+                reservations.push(high);
             }
             Err(error) => {
-                for reservation in reservations {
-                    if let Err(release) = vm::release(reservation) {
-                        tracing::error!(%release, "could not give back a window's reservation");
-                    }
+                if let Err(release) = vm::release(reservations.pop().expect("the window")) {
+                    tracing::error!(%release, "could not give back a window's reservation");
                 }
-                return Err(error);
+                return Err(platform(OP, LOW_WINDOW_END, high_len)(error));
             }
         }
     }
     reservations.sort_by_key(Reservation::base);
-    tracing::debug!(delta = format_args!("{delta:#x}"), low_len, "reserved a low window");
-    Ok((reservations, hosts, window))
+    tracing::debug!(delta = format_args!("{delta:#x}"), low_len, len, "reserved a low window");
+    Ok((reservations, hosts, window, len))
 }
 
 /// Reserve `[base, base + size)` around what the host holds in it: one placeholder per free range,

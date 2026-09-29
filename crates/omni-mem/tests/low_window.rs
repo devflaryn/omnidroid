@@ -45,9 +45,15 @@ fn guest_addresses_below_4_gib_are_based_and_above_are_the_hosts() {
 
     assert_eq!(space.host_addr(ART_BASE), ART_BASE + window.delta);
     assert_eq!(space.host_to_guest(ART_BASE + window.delta), Some(ART_BASE));
-    let high = LOW_WINDOW_END + GIB / 8;
+    // The identity half: at 4 GiB where the host has it free, else where the host put it (macOS
+    // holds nearly everything up to ~448 GiB), `[4 GiB, there)` then being the host's.
+    let high = space
+        .map_anonymous(Placement::Anywhere { align: vm_page() }, MIB, Protection::ReadWrite, CommitPolicy::Lazy)
+        .expect("a mapping above the window");
+    assert!(high >= LOW_WINDOW_END);
     assert_eq!(space.host_addr(high), high, "identity above 4 GiB");
     assert_eq!(space.host_to_guest(high), Some(high));
+    assert!(space.stats().free >= 3 * GIB, "the size asked for is free: {:?}", space.stats());
     // An address the space does not cover, either way round.
     assert_eq!(space.host_to_guest(space.end() + window.delta + GIB), None);
     if window.delta > GIB {
