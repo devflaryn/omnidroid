@@ -180,9 +180,10 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
         cmd.env("OMNI_SYSCALL_TRACE", "1");
     }
     // OMNI_SIGNAL_TRACE_APP=<process name>: that app's host process traces every signal it
-    // delivers, with registers (`OMNI_SIGNAL_TRACE`). Only that process: traced system-wide, ART's
-    // implicit null checks in system_server print thirty lines each, and its Watchdog kills it
-    // mid-boot (runs 2026-09-29, both at ~220 s).
+    // delivers, with registers (`OMNI_SIGNAL_TRACE`). Only that process: traced system-wide, every
+    // ART implicit null check in the system prints thirty lines, a boot slower than it need be --
+    // and system_server's 60 s Watchdog has little margin on a busy host (2026-09-29: five boots
+    // killed at ~220 s on a Mac at load 25, with and without the trace).
     if nice.is_some() && std::env::var("OMNI_SIGNAL_TRACE_APP").ok().as_deref() == nice {
         cmd.env("OMNI_SIGNAL_TRACE", "1");
     }

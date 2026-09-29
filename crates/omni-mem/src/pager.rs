@@ -93,6 +93,10 @@ pub struct PagerStats {
     /// pager believed it had fixed came back, which is a disagreement between the region map and the
     /// OS; the decline is what turns that into a typed guest fault instead of a spin.
     pub retries_exhausted: u64,
+    /// Faults on a host page the 4 KiB overlay traps (`crate::subpage`), declined at once: the
+    /// host page stays at the least its parts allow, so a retry cannot help, and the slow path
+    /// serves the access through the page's alias. A subset of `declined`.
+    pub split_declined: u64,
 }
 
 impl PagerStats {
@@ -108,6 +112,7 @@ impl PagerStats {
         self.examined == self.resolved + self.declined
             && self.reentered <= self.declined
             && self.retries_exhausted <= self.declined
+            && self.split_declined <= self.declined
     }
 }
 
@@ -166,6 +171,7 @@ struct PagerInner {
     declined: AtomicU64,
     reentered: AtomicU64,
     retries_exhausted: AtomicU64,
+    split_declined: AtomicU64,
 }
 
 /// Faults every pager in the process has resolved, and bytes they committed doing it.
@@ -238,6 +244,7 @@ impl DemandPager {
             declined: AtomicU64::new(0),
             reentered: AtomicU64::new(0),
             retries_exhausted: AtomicU64::new(0),
+            split_declined: AtomicU64::new(0),
         });
         // The address is stable for as long as the box is: `inner` is never moved out of, and the
         // registration that publishes this address is dropped before the box is.
@@ -304,6 +311,7 @@ impl DemandPager {
             declined: self.inner.declined.load(Ordering::Relaxed),
             reentered: self.inner.reentered.load(Ordering::Relaxed),
             retries_exhausted: self.inner.retries_exhausted.load(Ordering::Relaxed),
+            split_declined: self.inner.split_declined.load(Ordering::Relaxed),
         }
     }
 
@@ -360,6 +368,15 @@ fn handle_fault(context: usize, fault: &Fault) -> FaultOutcome {
             None => return FaultOutcome::NotOurs,
         },
     };
+
+    // A trapping page of the 4 KiB overlay: its host protection is the least its parts allow, so
+    // committing or retrying cannot make this access succeed. Declined at once, before any lock or
+    // retry record (SUBPAGE-ORDER 2: two atomic loads), for the slow path to serve through the
+    // page's alias or turn into the guest's fault.
+    if inner.space.is_trapping(fault.address) {
+        inner.split_declined.fetch_add(1, Ordering::Relaxed);
+        return inner.record(FaultOutcome::NotOurs);
+    }
 
     let reentered = IN_HANDLER.with(|flag| flag.replace(true));
     if reentered {
@@ -501,6 +518,7 @@ mod tests {
             declined: AtomicU64::new(0),
             reentered: AtomicU64::new(0),
             retries_exhausted: AtomicU64::new(0),
+            split_declined: AtomicU64::new(0),
         }
     }
 
@@ -512,6 +530,7 @@ mod tests {
             declined: inner.declined.load(Ordering::Relaxed),
             reentered: inner.reentered.load(Ordering::Relaxed),
             retries_exhausted: inner.retries_exhausted.load(Ordering::Relaxed),
+            split_declined: inner.split_declined.load(Ordering::Relaxed),
         }
     }
 
@@ -755,5 +774,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A fault on a host page the 4 KiB overlay traps (`crate::subpage`): the host page stays at the
+    /// least its parts allow, so retrying cannot help. Declined at once -- no commit, no
+    /// zero-commit streak -- so the slow path can serve it through the page's alias.
+    #[test]
+    fn a_fault_on_a_trapping_page_is_declined_at_once_and_counted() {
+        reset_thread_state();
+        let space = Arc::new(
+            GuestSpace::with_config(crate::GuestSpaceConfig { size: 1 << 30, guest_page: Some(crate::GUEST_PAGE), ..crate::GuestSpaceConfig::default() })
+                .expect("a guest address space"),
+        );
+        if !space.subpages_active() {
+            return;
+        }
+        let page = space.page_size();
+        let at = space
+            .map_anonymous(crate::Placement::Anywhere { align: page }, page, Protection::ReadWrite, crate::CommitPolicy::Eager)
+            .expect("a page");
+        space.protect(at, crate::GUEST_PAGE, Protection::Read).expect("split it");
+        let inner = inner_over(Arc::clone(&space));
+        let context = (&inner) as *const PagerInner as usize;
+        let fault = Fault { address: space.host_addr(at + crate::GUEST_PAGE), access: FaultAccess::Write, instruction_pointer: 0 };
+        for _ in 0..3 {
+            assert_eq!(handle_fault(context, &fault), FaultOutcome::NotOurs);
+        }
+        let stats = stats_of(&inner);
+        assert_eq!(stats.split_declined, 3);
+        assert_eq!(stats.retries_exhausted, 0, "no zero-commit streak");
+        assert!(stats.is_consistent(), "{stats:?}");
     }
 }
