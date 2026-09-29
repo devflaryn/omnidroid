@@ -30,7 +30,7 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 4] = ["/system/build.prop", "/system_ext/etc/build.prop", "/vendor/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 19] = [
+const OVERLAY: [(&str, &str); 20] = [
     // The property service speaks protocol 2 (a reply for every set).
     ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
@@ -61,6 +61,13 @@ const OVERLAY: [(&str, &str); 19] = [
     ("ro.hardware.vulkan", "omni"),
     // The display (the host composer's, D3): 160 dpi, as the D design reports it.
     ("ro.sf.lcd_density", "160"),
+    // A slow device's timeouts: Android's own scale for them (`Build.HW_TIMEOUT_MULTIPLIER`,
+    // `android::base::HwTimeoutMultiplier`), which the input dispatcher's 5 s and ActivityManager's
+    // ANR timeouts are multiplied by, as on an emulator or Cuttlefish. Translated, an app's start
+    // can hold its main thread past 5 s: in PS99 Roblox's `LauncherAliasMain` did (2 and 4 ANRs in
+    // two runs, 2026-09-29), and the "isn't responding" dialog then took the pointer and the keys
+    // (a space pressed its "Close app").
+    ("ro.hw_timeout_multiplier", "5"),
 ];
 
 /// `key=value` lines as init reads a `build.prop`: comments, blanks, `import` lines and lines
