@@ -38,34 +38,31 @@ struct FileMapping {
 
 pub struct Mm {
     space: Arc<GuestSpace>,
-    /// The page: the guest space's, which is the host's (4 KiB on Windows and x86-64 Linux, 16 KiB
-    /// on Apple silicon). The guest is told it (`AT_PAGESZ`), as a 16 KiB Android 15 device tells
-    /// its processes, so every mapping, protection and unmapping it asks for is whole host pages.
+    /// The guest's page: 4 KiB on every host that can give it (D42) -- the host's own on Windows and
+    /// x86-64 Linux, the sub-page overlay's on Apple silicon (`omni_mem::subpage`). The guest is told
+    /// it (`AT_PAGESZ`), and every `mmap`, `mprotect` and `munmap` is exact at it.
     page: u64,
+    /// The host's page: what a file view and a fresh placement are whole multiples of.
+    host_page: u64,
     /// The layout lock, held exclusively for every change: `MAP_FIXED`'s unmap-then-map must not
     /// interleave with another thread's mapping, nor any change with a syscall's copy.
     lock: crate::guest::Layout,
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
-    /// Pages a 4 KiB-aligned `mprotect` has split (`protect_widened`): the protection asked for
-    /// each 4 KiB of the page. The page itself has their union. A whole-page `mprotect` or an
-    /// unmapping forgets the page.
-    subpages: Mutex<std::collections::BTreeMap<u64, Vec<Protection>>>,
 }
 
-
-/// The page code built for the smallest arm64 pages assumes (`crate::pagecompat`, `Mm::protect`).
-const SMALL_PAGE: u64 = 0x1000;
-
-/// Everything either protection allows.
-fn union(a: Protection, b: Protection) -> Protection {
-    let bits = |p: Protection| match p {
-        Protection::None => 0,
-        Protection::Read => PROT_READ,
-        Protection::ReadWrite => PROT_READ | PROT_WRITE,
-        Protection::ReadExecute => PROT_READ | PROT_EXEC,
-        Protection::ReadWriteExecute => PROT_READ | PROT_WRITE | PROT_EXEC,
-    };
-    protection(bits(a) | bits(b)).unwrap_or(Protection::ReadWriteExecute)
+/// `OMNI_STRICT_GAPS=<prefix>,...`: named ranges (`PR_SET_VMA_ANON_NAME`, or a file's path) whose
+/// unmapped 4 KiB must fault even inside a host page that holds other mappings (D42's escape
+/// hatch; by default such a gap is lenient). Empty by default.
+fn strict_gap_prefixes() -> &'static [Vec<u8>] {
+    static LIST: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("OMNI_STRICT_GAPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.as_bytes().to_vec())
+            .collect()
+    })
 }
 
 fn protection(prot: u32) -> Result<Protection, Errno> {
@@ -85,8 +82,9 @@ fn protection(prot: u32) -> Result<Protection, Errno> {
 impl Mm {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>, lock: crate::guest::Layout) -> Self {
-        let page = space.page_size() as u64;
-        Self { space, page, lock, files: Mutex::default(), subpages: Mutex::default() }
+        let page = space.guest_page_size() as u64;
+        let host_page = space.page_size() as u64;
+        Self { space, page, host_page, lock, files: Mutex::default() }
     }
 
     /// The page size the guest is told and every `mmap`, `mprotect` and `munmap` is exact at.
@@ -97,6 +95,42 @@ impl Mm {
 
     const fn round_up(&self, v: u64) -> u64 {
         (v + self.page - 1) & !(self.page - 1)
+    }
+
+    const fn round_up_host(&self, v: u64) -> u64 {
+        (v + self.host_page - 1) & !(self.host_page - 1)
+    }
+
+    /// Whether a file at `offset` can be a view here: a view is whole host pages at a host-page
+    /// file offset, so the offset -- and, for a fixed address, the address -- must be host-page
+    /// aligned. A 4 KiB-aligned one on a larger host page (a library linked for 4 KiB pages) is a
+    /// private copy instead (D42).
+    fn viewable(&self, offset: u64, addr: u64, fixed: bool) -> bool {
+        offset % self.host_page == 0 && (!fixed || addr % self.host_page == 0)
+    }
+
+    /// A shared mapping whose offset a host view cannot honour: refused, as sharing a copy would
+    /// silently not be sharing (D42). Never expected: shared offsets are 0.
+    fn refuse_unshareable(&self, p: &Process, t: &Task, req: &MapRequest, fixed: bool) -> Result<(), Errno> {
+        if self.viewable(req.offset, req.addr, fixed) {
+            return Ok(());
+        }
+        p.refusals.record("mmap: MAP_SHARED at a 4 KiB offset on a larger host page".into(), t.pc, t.lr);
+        Err(EINVAL)
+    }
+
+    /// Map `backed` bytes of `backing` from `req.offset` for a shared mapping of `len` bytes: a view
+    /// of whole host pages (the backing's host file is whole host pages, `crate::shm`), the part of
+    /// it past `len` given back as 4 KiB holes, and anything of `len` past the view anonymous.
+    fn map_shared_view(&self, backing: &Arc<omni_mem::Backing>, req: &MapRequest, placement: Placement, backed: u64, len: u64, prot: Protection) -> Result<u64, omni_mem::MemError> {
+        let viewed = self.round_up_host(backed);
+        let at = self.space.map_file(backing, req.offset, placement, viewed as usize, prot)? as u64;
+        if viewed > len {
+            self.space.unmap((at + len) as usize, (viewed - len) as usize)?;
+        } else if len > viewed {
+            self.space.map_anonymous(Placement::Fixed((at + viewed) as usize), (len - viewed) as usize, prot, CommitPolicy::Lazy)?;
+        }
+        Ok(at)
     }
 
     /// `len` rounded up to pages, if `[addr, addr + len)` fits in the 56-bit user address range.
@@ -111,6 +145,19 @@ impl Mm {
     pub fn label(&self, start: u64, len: u64, name: &[u8]) {
         self.forget(start, len);
         self.files.lock().insert(start, FileMapping { len, guest: name.to_vec(), offset: 0 });
+        self.mark_strict(start, len, name);
+    }
+
+    /// A range named on `OMNI_STRICT_GAPS` gets strict gaps (`GuestSpace::set_strict_gaps`).
+    fn mark_strict(&self, start: u64, len: u64, name: &[u8]) {
+        let list = strict_gap_prefixes();
+        if list.is_empty() {
+            return;
+        }
+        let bare = name.strip_prefix(b"[anon:".as_slice()).and_then(|n| n.strip_suffix(b"]".as_slice())).unwrap_or(name);
+        if list.iter().any(|p| bare.starts_with(p)) {
+            self.space.set_strict_gaps(start as usize, len as usize, true);
+        }
     }
 
     /// The name and file offset at `addr`, if a mapping there is named.
@@ -162,21 +209,7 @@ impl Mm {
             }
         }
         self.forget(addr, len);
-        self.forget_subpages(addr, len);
         Ok(())
-    }
-
-    /// Forget what `protect_widened` recorded for the pages of `[addr, addr + len)`.
-    fn forget_subpages(&self, addr: u64, len: u64) {
-        let mut subpages = self.subpages.lock();
-        if subpages.is_empty() {
-            return;
-        }
-        let first = addr & !(self.page - 1);
-        let gone: Vec<u64> = subpages.range(first..addr.saturating_add(len)).map(|(p, _)| *p).collect();
-        for page in gone {
-            subpages.remove(&page);
-        }
     }
 
     pub fn unmap(&self, addr: u64, len: u64) -> Result<(), Errno> {
@@ -192,10 +225,6 @@ impl Mm {
     pub fn protect(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
         let addr = crate::guest::untag(addr);
         if addr % self.page != 0 {
-            // Code built for 4 KiB pages, on a device with larger ones: see `protect_widened`.
-            if self.page > SMALL_PAGE && addr % SMALL_PAGE == 0 {
-                return self.protect_widened(addr, len, prot);
-            }
             return Err(EINVAL);
         }
         let prot = protection(prot)?;
@@ -204,52 +233,7 @@ impl Mm {
             return Ok(());
         }
         let _g = self.lock.write();
-        self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)?;
-        self.forget_subpages(addr, len);
-        Ok(())
-    }
-
-    /// A 4 KiB-aligned `mprotect` on a device whose page is larger: code built for 4 KiB pages asks
-    /// for them (a packed library's unpacker makes the 4 KiB it decrypts writable -- Roblox
-    /// 2.740.931's `libzstd-jni`, whose next constructor was then still ciphertext: `SIGILL`). A
-    /// 16 KiB Linux kernel refuses it (`EINVAL`), and so did this one. Here it is widened to whole
-    /// pages: a page the range covers entirely gets exactly what was asked; a page it covers in
-    /// part remembers what each of its 4 KiB was asked for and gets their union, so nothing else on
-    /// it loses access, and once every 4 KiB is asked back (read-execute after decrypting) the page
-    /// is exactly that again -- not left writable for an integrity check to find. Never reached on
-    /// a 4 KiB-page host.
-    fn protect_widened(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
-        let asked = protection(prot)?;
-        let len = len.checked_add(SMALL_PAGE - 1).ok_or(EINVAL)? & !(SMALL_PAGE - 1);
-        let end = addr.checked_add(len).ok_or(ENOMEM)?;
-        let (first, last) = (addr & !(self.page - 1), (end + self.page - 1) & !(self.page - 1));
-        let _g = self.lock.write();
-        let per_page = (self.page / SMALL_PAGE) as usize;
-        let mut page = first;
-        while page < last {
-            let prot = if page >= addr && page + self.page <= end {
-                self.subpages.lock().remove(&page);
-                asked
-            } else {
-                let had = self.space.region_at(page as usize).filter(|r| r.mapping.is_some()).ok_or(ENOMEM)?.protection;
-                let mut subpages = self.subpages.lock();
-                let parts = subpages.entry(page).or_insert_with(|| vec![had; per_page]);
-                for (i, part) in parts.iter_mut().enumerate() {
-                    let at = page + i as u64 * SMALL_PAGE;
-                    if at >= addr && at < end {
-                        *part = asked;
-                    }
-                }
-                let prot = parts.iter().copied().fold(Protection::None, union);
-                if parts.iter().all(|&p| p == parts[0]) {
-                    subpages.remove(&page);
-                }
-                prot
-            };
-            self.space.protect(page as usize, self.page as usize, prot).map_err(|_| ENOMEM)?;
-            page += self.page;
-        }
-        Ok(())
+        self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)
     }
 
     /// Write into a mapping the guest may only read -- what the kernel does to memory it owns (the
@@ -280,7 +264,9 @@ impl Mm {
         if fixed && req.addr % self.page != 0 {
             return Err(EINVAL);
         }
-        let page = self.page as usize;
+        // A placement the guest leaves to us is whole host pages of its own, so separate mappings
+        // never share a host page (the 4 KiB overlay then has nothing to split for them).
+        let page = self.host_page as usize;
         let placement = if fixed {
             Placement::Fixed(req.addr as usize)
         } else if req.addr != 0 {
@@ -357,28 +343,22 @@ impl Mm {
         };
         if let Some(m) = shm {
             let name = format!("/memfd:{}", m.name).into_bytes();
+            self.refuse_unshareable(p, t, &req, fixed)?;
             let host = m.dup_file().map_err(|_| ENODEV)?;
             let backing = omni_mem::Backing::share(host, &String::from_utf8_lossy(&name)).map_err(|_| ENODEV)?;
             let backed = self.round_up((m.len()).saturating_sub(req.offset)).min(len);
             let at = if backed > 0 {
-                self.space
-                    .map_file(&backing, req.offset, placement, backed as usize, prot)
-                    .map_err(|e| {
-                        if fixed {
-                            eprintln!("[mm] {} at {:#x}+{backed:#x} refused: {e}", String::from_utf8_lossy(&name), req.addr);
-                        }
-                        refused_fixed(ENOMEM)
-                    })? as u64
+                self.map_shared_view(&backing, &req, placement, backed, len, prot).map_err(|e| {
+                    if fixed {
+                        eprintln!("[mm] {} at {:#x}+{backed:#x} refused: {e}", String::from_utf8_lossy(&name), req.addr);
+                    }
+                    refused_fixed(ENOMEM)
+                })?
             } else {
                 self.space
                     .map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy)
                     .map_err(|_| refused_fixed(ENOMEM))? as u64
             };
-            if len > backed && backed > 0 {
-                self.space
-                    .map_anonymous(Placement::Fixed((at + backed) as usize), (len - backed) as usize, prot, CommitPolicy::Lazy)
-                    .map_err(|_| ENOMEM)?;
-            }
             self.forget(at, len);
             self.files.lock().insert(at, FileMapping { len, guest: name, offset: req.offset });
             return Ok(at);
@@ -424,21 +404,17 @@ impl Mm {
             _ => None,
         };
         if let Some((host, guest, file_len)) = shared {
+            self.refuse_unshareable(p, t, &req, fixed)?;
             let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
             let at = if in_file > 0 {
                 let backing = omni_mem::Backing::share(host, &String::from_utf8_lossy(&guest)).map_err(|_| {
                     p.refusals.record("mmap: MAP_SHARED of a file the host cannot share".into(), t.pc, t.lr);
                     ENODEV
                 })?;
-                self.space.map_file(&backing, req.offset, placement, in_file as usize, prot).map_err(|_| refused_fixed(ENOMEM))? as u64
+                self.map_shared_view(&backing, &req, placement, in_file, len, prot).map_err(|_| refused_fixed(ENOMEM))?
             } else {
                 self.space.map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy).map_err(|_| refused_fixed(ENOMEM))? as u64
             };
-            if len > in_file && in_file > 0 {
-                self.space
-                    .map_anonymous(Placement::Fixed((at + in_file) as usize), (len - in_file) as usize, prot, CommitPolicy::Lazy)
-                    .map_err(|_| ENOMEM)?;
-            }
             self.forget(at, len);
             self.files.lock().insert(at, FileMapping { len, guest, offset: req.offset });
             return Ok(at);
@@ -454,7 +430,7 @@ impl Mm {
         };
         // The part of the request the file covers, in whole pages; the rest is anonymous zeros.
         let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
-        let backing = if in_file == 0 {
+        let backing = if in_file == 0 || !self.viewable(req.offset, req.addr, fixed) {
             None
         } else if sysroot {
             Some(p.vfs.sysroot().backing(&guest)?)
@@ -467,7 +443,8 @@ impl Mm {
         // every process -- fell back to a private copy of all of it (26 MiB of ICU data twice in
         // each app process, run 2026-09-29). Now the whole pages are the view and only the last,
         // partial page is a private copy (below).
-        let whole = (file_len.saturating_sub(req.offset) / self.page_size() * self.page_size()).min(len);
+        // Whole *host* pages: what a view can be (D42).
+        let whole = (file_len.saturating_sub(req.offset) / self.host_page * self.host_page).min(len / self.host_page * self.host_page);
         let at = if let (Some(backing), true) = (backing, whole > 0) {
             if whole == in_file {
                 match self.space.map_file(&backing, req.offset, placement, in_file as usize, prot) {

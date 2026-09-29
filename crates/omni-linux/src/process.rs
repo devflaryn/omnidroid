@@ -197,6 +197,12 @@ const LOW_SPACE_MIN_FREE: usize = GUEST_SPACE_BYTES / 2;
 /// piece of the range, and a space reserved around everything else "succeeded" with 1 MiB free of
 /// 64 GiB: every service init started after that failed to map its first segment (D5, ~1 boot in
 /// 3, right after odsign stopped). Such a space is given back and the host chooses.
+/// A default-sized space with the guest's 4 KiB pages (D42), for a process that is not one of the
+/// system's own (a stand-in, a handler test).
+fn small_space() -> GuestSpace {
+    GuestSpace::with_config(GuestSpaceConfig { guest_page: Some(omni_mem::GUEST_PAGE), ..GuestSpaceConfig::default() }).expect("a guest space")
+}
+
 pub fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
     // D41: below the host's floor the low range cannot be the host's own; it is a based window.
     let low_window = omni_platform::vm::lowest_mappable_address() > GUEST_SPACE_LOW_BASE;
@@ -205,6 +211,9 @@ pub fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
         size: GUEST_SPACE_BYTES,
         around_host: base.is_some(),
         low_window: low_window && base.is_some(),
+        // 4 KiB pages for the guest on every host (D42): a sub-page overlay where the host's page
+        // is larger (`omni_mem::subpage`), nothing at all where it is 4 KiB.
+        guest_page: Some(omni_mem::GUEST_PAGE),
         ..GuestSpaceConfig::default()
     };
     match GuestSpace::with_config(config(Some(GUEST_SPACE_LOW_BASE))) {
@@ -661,7 +670,7 @@ impl Process {
     /// A stand-in for another host process's process (`crate::remote`): its pid and uid, its memory
     /// and descriptors reached through `mem` and `fds`; no CPU runs it.
     pub fn stand_in(sysroot: Arc<crate::vfs::Sysroot>, pid: i32, uid: u32, mem: Arc<dyn crate::guest::Remote>, fds: Arc<dyn crate::fd::RemoteFds>) -> Arc<Self> {
-        let space = Arc::new(GuestSpace::new().expect("a guest space"));
+        let space = Arc::new(small_space());
         let vfs = Vfs::new(sysroot, Vec::new(), b"/remote".to_vec());
         let p = Self::assemble_as(space, None, Some(pid), vfs, vec![b"/remote".to_vec()], FdTable::standard(Output::Host, Output::Host), false, None, 0, uid);
         p.mem.set_remote(mem);
@@ -1248,7 +1257,7 @@ impl Process {
 
     /// A process with no program, for handler tests.
     pub fn for_tests(vfs: Vfs, stdout: Output) -> Arc<Self> {
-        let space = Arc::new(GuestSpace::new().expect("a guest space"));
+        let space = Arc::new(small_space());
         let scratch = space
             .map_anonymous(omni_mem::Placement::Anywhere { align: space.page_size() }, 1 << 20, omni_mem::Protection::ReadWrite, omni_mem::CommitPolicy::Lazy)
             .expect("scratch") as u64;
