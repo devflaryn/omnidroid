@@ -1,5 +1,37 @@
 # Handoff
 
+## LINUX PORT OF THE REAL-AOSP PATH, AND A GL BACKEND (2026-09-29, Linux; branch `linux-port`)
+
+Goal (owner): the tree builds and runs natively on Linux x86-64 without breaking Windows or macOS;
+verify by launching Roblox (APK 2.740.931) into PS99. Mid-way the owner asked for an **OpenGL
+fallback** for a host without Vulkan (this Ubuntu: Quadro 4000, Fermi), kept open for the Windows
+and Mac agents to plug their hosts into, tested only here. Branched from `unified` (the checkout was
+on `unified`, 1,037 commits ahead of `main`); the owner merges.
+
+- **Build**: release, no Linux compile errors (the earlier `port-linux` merge covered the tree).
+  Suite: see `docs/ports/linux.md` and the branch's final report.
+- **GL backend** (`OMNI_GPU=vulkan|gl|auto`; `crates/omni-linux/src/gpu/{backend,gl}.rs`,
+  `device/src/gl/`, `tools/gen_gl_forward.py`, gate `tests/d3g_gl_fallback.rs`). The guest's
+  `libGLES_omni.so` is an all-in-one EGL 1.4 + GLES driver (`ro.hardware.egl=omni`); every `gl*`
+  command is one `ioctl(OMNI_GL_CALL)` on `/dev/omni-gpu`, generated from the old path's
+  `omni-android/src/gles/signatures.rs`, which the host includes by path (one table; its fingerprint
+  is checked at `eglInitialize`). Pointers pass as they are (one address space). By hand: strings
+  (copied), buffer maps (guest shadows), debug callbacks (not delivered), EGLImages (host textures,
+  read back at flush points once render targets), window surfaces (host pbuffers read back into the
+  window's gralloc buffer at swap). **Plugging in Windows or macOS**: `gpu::gl::ROWS` has ANGLE rows
+  (D3D11, Metal) with their displays; run the gate there with `OMNI_GPU=gl`. Nothing else is
+  host-specific. `auto` keeps Vulkan wherever the host has a Vulkan GPU (Windows, Mac: unchanged).
+- **Linux-specific**: `/dev/shm` for graphics regions (`shm::host_dir`); `omnidroid aosp` moves the
+  instance off Ubuntu's tmpfs `/tmp`; `python3` for the cookie step; `ro.hw_timeout_multiplier` 5 on
+  hosts with < 8 CPUs (Android's startup timeout killed Roblox's first start twice).
+- **Verdict**: booted, signed in, PS99 **not reached**: `join-game` answers 403 with a security
+  challenge, 3 runs of 3, and the app's "Security" WebView says "Unable to contact server" (its
+  network works: host TCP to Roblox and CloudFront). Not worked around. For the owner: does this
+  account join PS99 on a phone right now; is a challenge pending on it?
+- Open, next: the GL backend's per-frame readback (`glReadPixels` at every swap) and the upload of
+  every targeted EGLImage are the obvious costs; a PBO ring or a shared host texture would remove
+  them. The old path cannot run 2.740.931 (`dladdr` unimplemented).
+
 ## PLAYABLE INPUT, LIGHTER, FASTER (2026-09-28/29 night, Windows; `5d01e0e`..`f664bc4`)
 
 Goal (owner): input unplayable (mouse captured on click, Right Ctrl to release; a click took 5-7 s;
@@ -640,7 +672,7 @@ that code comments cite by number.
 |---|---|---|
 | Windows (this PC, RTX 4060, 24 threads, 31.8 GB) | `C:\Users\berat\Desktop\Omni Apps\omnidroid-unified` | build with `OMNIDROID_DYNARMIC_BUILD_DIR=C:\od-unified` (MAX_PATH). Other `Omni Apps\omnidroid*` worktrees and `C:\od*` build dirs belong to other work. |
 | macOS (Apple M1, 16 GB) | `~/Desktop/omnidroid-unified` | non-interactive ssh: `. ~/.cargo/env` first. `screencapture`/`osascript` do not work over ssh. |
-| Linux (i5-4460, **7 GB**, Quadro 4000 = Fermi, no Vulkan) | `berat@192.168.0.38:~/Desktop/omnidroid-unified` | one build or one app at a time; GLES through nouveau NVC0; `DISPLAY=:0`, start with `setsid nohup`. Never start an Xvfb that opens the nouveau node (it wedged the GPU once). |
+| Linux (i5-4460, **7 GB**, Quadro 4000 = Fermi, no Vulkan) | `~/Desktop/Omni Apps/omnidroid` (2026-09-29; was `~/Desktop/omnidroid-unified`), dynarmic `~/od-dynarmic-linux-port`, sysroot `~/aosp-sysroot/aosp-35` | one build or one app at a time; GLES through nouveau NVC0; `DISPLAY=:0`, start with `setsid nohup`. Never start an Xvfb that opens the nouveau node (it wedged the GPU once). |
 
 Keep the three at one commit: commit on Windows, `git bundle create <f> <old>..unified`, `scp`,
 `git pull --ff-only <f> unified` on the others. Live runs on one host at a time; builds may run in
