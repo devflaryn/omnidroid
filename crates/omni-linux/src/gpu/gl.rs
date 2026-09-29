@@ -146,6 +146,15 @@ const HAL_RGBA_8888: u32 = 1;
 const HAL_RGBX_8888: u32 = 2;
 const HAL_RGB_565: u32 = 4;
 const HAL_BGRA_8888: u32 = 5;
+const HAL_RGBA_FP16: u32 = 0x16;
+const HAL_RGBA_1010102: u32 = 0x2B;
+
+// Sized formats an image of a wider buffer is made with (ES 3).
+const GL_RGBA16F: u32 = 0x881A;
+const GL_RGB10_A2: u32 = 0x8059;
+const GL_HALF_FLOAT: u32 = 0x140B;
+const GL_FLOAT: u32 = 0x1406;
+const GL_UNSIGNED_INT_2_10_10_10_REV: u32 = 0x8368;
 
 /// Extensions the host has and the guest is not offered, each for what forwarding cannot give:
 /// a persistent coherent map cannot be shadowed (as the old path's GLES layer withholds it); the
@@ -935,8 +944,9 @@ fn surface_resize(h: &Host, id: u64, width: u32, height: u32) -> u64 {
 /// Bytes per pixel of a gralloc format this driver's surfaces and images have.
 fn bytes_per_pixel(format: u32) -> Option<usize> {
     match format {
-        HAL_RGBA_8888 | HAL_RGBX_8888 | HAL_BGRA_8888 => Some(4),
+        HAL_RGBA_8888 | HAL_RGBX_8888 | HAL_BGRA_8888 | HAL_RGBA_1010102 => Some(4),
         HAL_RGB_565 => Some(2),
+        HAL_RGBA_FP16 => Some(8),
         _ => None,
     }
 }
@@ -973,10 +983,18 @@ pub fn to_buffer(rgba: &[u8], width: usize, rows: usize, flip: bool, format: u32
     Some(out)
 }
 
-/// A buffer's rows (`format`, `stride` pixels) as tightly packed pixels for `glTexImage2D`, and
-/// that upload's format and type.
+/// A texture upload: tightly packed pixels, and `glTexImage2D`'s internal format, format and type.
+pub struct Upload {
+    pub pixels: Vec<u8>,
+    pub internal: u32,
+    pub format: u32,
+    pub kind: u32,
+}
+
+/// A buffer's rows (`format`, `stride` pixels) as an upload. FP16 and 10:10:10:2 buffers keep their
+/// bits (ES 3's `GL_RGBA16F` and `GL_RGB10_A2`); the 8-bit formats become RGBA8, 565 stays 565.
 #[must_use]
-pub fn from_buffer(bytes: &[u8], width: usize, rows: usize, format: u32, stride: usize) -> Option<(Vec<u8>, u32, u32)> {
+pub fn from_buffer(bytes: &[u8], width: usize, rows: usize, format: u32, stride: usize) -> Option<Upload> {
     let bpp = bytes_per_pixel(format)?;
     let mut out = Vec::with_capacity(width * rows * bpp);
     for r in 0..rows {
@@ -987,8 +1005,70 @@ pub fn from_buffer(bytes: &[u8], width: usize, rows: usize, format: u32, stride:
             _ => out.extend_from_slice(row),
         }
     }
-    let (f, t) = if format == HAL_RGB_565 { (GL_RGB, GL_UNSIGNED_SHORT_5_6_5) } else { (GL_RGBA, GL_UNSIGNED_BYTE) };
-    Some((out, f, t))
+    let (internal, f, t) = match format {
+        HAL_RGB_565 => (GL_RGB, GL_RGB, GL_UNSIGNED_SHORT_5_6_5),
+        HAL_RGBA_FP16 => (GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT),
+        HAL_RGBA_1010102 => (GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV),
+        _ => (GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE),
+    };
+    Some(Upload { pixels: out, internal, format: f, kind: t })
+}
+
+/// An IEEE half from a float (round to nearest even; overflow to infinity; NaN kept a NaN).
+#[must_use]
+pub fn f16_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xff) as i32;
+    let man = x & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - e);
+        let round = (m >> 12) & 1 != 0 && ((m & 0x1fff) != 0x1000 || (m >> 13) & 1 != 0);
+        return sign | ((m >> 13) as u16 + u16::from(round));
+    }
+    let half = sign | ((e as u16) << 10) | (man >> 13) as u16;
+    let round = (man >> 12) & 1 != 0 && ((man & 0x1fff) != 0x1000 || (man >> 13) & 1 != 0);
+    half + u16::from(round)
+}
+
+/// How an image of `format` is read back, and each read pixel into the buffer's bytes: the 8-bit
+/// and 565 formats through RGBA8 ([`to_buffer`]); FP16 as floats, halved; 10:10:10:2 as it is.
+fn read_image(h: &Host, width: u32, height: u32, format: u32, stride: usize) -> Option<Vec<u8>> {
+    let (w, rows) = (width as usize, height as usize);
+    match format {
+        HAL_RGBA_FP16 => {
+            let mut f = vec![0f32; w * rows * 4];
+            h.call("glReadPixels", &[0, 0, u64::from(width), u64::from(height), u64::from(GL_RGBA), u64::from(GL_FLOAT), f.as_mut_ptr() as u64]);
+            let mut out = vec![0u8; stride * rows * 8];
+            for r in 0..rows {
+                for (i, v) in f[r * w * 4..(r + 1) * w * 4].iter().enumerate() {
+                    let at = r * stride * 8 + i * 2;
+                    out[at..at + 2].copy_from_slice(&f16_bits(*v).to_le_bytes());
+                }
+            }
+            Some(out)
+        }
+        HAL_RGBA_1010102 => {
+            let mut px = vec![0u8; w * rows * 4];
+            h.call("glReadPixels", &[0, 0, u64::from(width), u64::from(height), u64::from(GL_RGBA), u64::from(GL_UNSIGNED_INT_2_10_10_10_REV), px.as_mut_ptr() as u64]);
+            let mut out = vec![0u8; stride * rows * 4];
+            for r in 0..rows {
+                out[r * stride * 4..(r * stride + w) * 4].copy_from_slice(&px[r * w * 4..(r + 1) * w * 4]);
+            }
+            Some(out)
+        }
+        _ => to_buffer(&read_pixels(h, 0, 0, width, height), w, rows, false, format, stride),
+    }
 }
 
 /// Pack state saved around a read of the host's own.
@@ -1207,7 +1287,11 @@ fn upload(h: &Host, es3: bool, img: &Image, first: bool) {
     if img.shm.read_at(&mut bytes, img.pixels_at).is_err() {
         return;
     }
-    let Some((pixels, format, kind)) = from_buffer(&bytes, img.width as usize, img.height as usize, img.format, img.stride as usize) else { return };
+    let Some(up) = from_buffer(&bytes, img.width as usize, img.height as usize, img.format, img.stride as usize) else { return };
+    // The sized formats are ES 3's.
+    if up.internal != up.format && !es3 {
+        return;
+    }
     let was = h.get_integer(GL_TEXTURE_BINDING_2D);
     h.call("glBindTexture", &[u64::from(GL_TEXTURE_2D), u64::from(img.texture)]);
     with_unpack(h, es3, || {
@@ -1215,9 +1299,9 @@ fn upload(h: &Host, es3: bool, img: &Image, first: bool) {
         if first {
             h.call("glTexParameteri", &[u64::from(GL_TEXTURE_2D), u64::from(GL_TEXTURE_MIN_FILTER), GL_LINEAR as u64]);
             h.call("glTexParameteri", &[u64::from(GL_TEXTURE_2D), u64::from(GL_TEXTURE_MAG_FILTER), GL_LINEAR as u64]);
-            h.call("glTexImage2D", &[u64::from(GL_TEXTURE_2D), 0, u64::from(format), w, ht, 0, u64::from(format), u64::from(kind), pixels.as_ptr() as u64]);
+            h.call("glTexImage2D", &[u64::from(GL_TEXTURE_2D), 0, u64::from(up.internal), w, ht, 0, u64::from(up.format), u64::from(up.kind), up.pixels.as_ptr() as u64]);
         } else {
-            h.call("glTexSubImage2D", &[u64::from(GL_TEXTURE_2D), 0, 0, 0, w, ht, u64::from(format), u64::from(kind), pixels.as_ptr() as u64]);
+            h.call("glTexSubImage2D", &[u64::from(GL_TEXTURE_2D), 0, 0, 0, w, ht, u64::from(up.format), u64::from(up.kind), up.pixels.as_ptr() as u64]);
         }
     });
     h.call("glBindTexture", &[u64::from(GL_TEXTURE_2D), was as u64]);
@@ -1311,8 +1395,7 @@ fn flush_images(h: &Host) {
     let pack = save_pack(h, es3);
     for img in info.images.values_mut().filter(|i| i.rendered) {
         h.call("glFramebufferTexture2D", &[u64::from(target), u64::from(GL_COLOR_ATTACHMENT0), u64::from(GL_TEXTURE_2D), u64::from(img.texture), 0]);
-        let rgba = read_pixels(h, 0, 0, img.width, img.height);
-        if let Some(bytes) = to_buffer(&rgba, img.width as usize, img.height as usize, false, img.format, img.stride as usize) {
+        if let Some(bytes) = read_image(h, img.width, img.height, img.format, img.stride as usize) {
             let _ = img.shm.write_at(&bytes, img.pixels_at);
             super::native::bump_generation(&img.shm);
             img.generation = region_generation(&img.shm);
@@ -1374,9 +1457,26 @@ mod tests {
     fn a_buffer_uploads_tightly_packed_rgba() {
         // A 1x2 BGRX-less RGBX buffer with a stride of 2: alpha forced opaque, padding dropped.
         let bytes = [1, 2, 3, 0, 9, 9, 9, 9, 4, 5, 6, 0, 9, 9, 9, 9];
-        let (px, f, t) = from_buffer(&bytes, 1, 2, HAL_RGBX_8888, 2).unwrap();
-        assert_eq!(px, [1, 2, 3, 255, 4, 5, 6, 255]);
-        assert_eq!((f, t), (GL_RGBA, GL_UNSIGNED_BYTE));
+        let up = from_buffer(&bytes, 1, 2, HAL_RGBX_8888, 2).unwrap();
+        assert_eq!(up.pixels, [1, 2, 3, 255, 4, 5, 6, 255]);
+        assert_eq!((up.internal, up.format, up.kind), (GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE));
+        // An FP16 buffer keeps its bits, as ES 3's RGBA16F (SurfaceFlinger makes 128x128 ones).
+        let half = [0u8, 0x3c, 0, 0x38, 0, 0, 0, 0x3c];
+        let up = from_buffer(&half, 1, 1, HAL_RGBA_FP16, 1).unwrap();
+        assert_eq!((up.pixels.as_slice(), up.internal, up.kind), (&half[..], GL_RGBA16F, GL_HALF_FLOAT));
+        assert_eq!(from_buffer(&[0; 4], 1, 1, HAL_RGBA_1010102, 1).unwrap().internal, GL_RGB10_A2);
+    }
+
+    #[test]
+    fn floats_become_halves() {
+        assert_eq!(f16_bits(1.0), 0x3c00);
+        assert_eq!(f16_bits(0.5), 0x3800);
+        assert_eq!(f16_bits(-2.0), 0xc000);
+        assert_eq!(f16_bits(0.0), 0);
+        assert_eq!(f16_bits(65504.0), 0x7bff);
+        assert_eq!(f16_bits(1e9), 0x7c00, "overflow is infinity");
+        assert_eq!(f16_bits(6.0e-8), 0x0001, "the smallest subnormal");
+        assert!(f16_bits(f32::NAN) & 0x7c00 == 0x7c00 && f16_bits(f32::NAN) & 0x3ff != 0);
     }
 
     #[test]
