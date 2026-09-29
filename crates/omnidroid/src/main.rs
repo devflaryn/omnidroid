@@ -75,6 +75,8 @@ const USAGE: &str = "\
 usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [--join-delay <s>]
                        [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
                        [--headless] [--no-window] [--control <file>]
+       omnidroid aosp [--apk <path>] [--cookie <file|name>] [--place <id>] [--minutes <n>]
+                      [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
        omnidroid which [--apk <path>]
        omnidroid login [<username> [<password>]] [--dir <dir>]
 
@@ -94,6 +96,15 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                     is an off-screen buffer, for a host with no display -- a container, a notebook
   --control <file>  read commands from this file as lines are appended to it (OMNI_CONTROL), as
                     well as from stdin: headless on|off, screenshot <path>, status
+
+  aosp              run the APK on the real-AOSP path instead: real Android boots, the APK is
+                    installed with `pm install` and started from its launcher, in a live window
+                    (`omni-linux`'s r_roblox session). --cookie is a file or a saved name, planted
+                    in the app's own cookie store; --place opens the place's deep link once signed
+                    in; --minutes bounds the session (default 30); --size is the display's size at
+                    boot; --gpu is the device's GPU backend (OMNI_GPU; auto: Vulkan on a host
+                    with a Vulkan GPU, else the host's GLES); --with-systemui keeps SystemUI and
+                    the launcher (default: a single-app device)
 
   login             sign in to Roblox in Chromium and keep the cookie, username and password in
                     <dir> (default <app-data>/../cookies): no arguments -- you sign in; a username
@@ -130,6 +141,15 @@ fn command_and_rest(args: impl Iterator<Item = String>) -> (Option<String>, Vec<
 fn main() -> ExitCode {
     let (command, rest) = command_and_rest(std::env::args().skip(1));
     let args = rest.into_iter();
+    if command.as_deref() == Some("aosp") {
+        return match parse_aosp(args) {
+            Ok(aosp_options) => aosp(&aosp_options),
+            Err(message) => {
+                eprintln!("omnidroid: {message}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if command.as_deref() == Some("login") {
         return match parse_login(args) {
             Ok(login_options) => login(&login_options),
@@ -658,6 +678,185 @@ fn play(options: &Options) -> ExitCode {
     }
 }
 
+/// `omnidroid aosp`'s options.
+#[derive(Debug, PartialEq, Eq)]
+struct AospOptions {
+    apk: Option<PathBuf>,
+    cookie: Option<String>,
+    place: Option<u64>,
+    minutes: u64,
+    size: Option<(u32, u32)>,
+    gpu: Option<String>,
+    with_systemui: bool,
+}
+
+fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, String> {
+    let mut options =
+        AospOptions { apk: None, cookie: None, place: None, minutes: 30, size: None, gpu: None, with_systemui: false };
+    while let Some(arg) = args.next() {
+        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
+        match arg.as_str() {
+            "--apk" => options.apk = Some(PathBuf::from(value("--apk")?)),
+            "--cookie" => options.cookie = Some(value("--cookie")?),
+            "--place" => {
+                let text = value("--place")?;
+                let place: u64 = text.parse().map_err(|_| format!("--place wants a numeric placeId, not `{text}`"))?;
+                if place == 0 {
+                    return Err("--place wants a placeId above 0".to_string());
+                }
+                options.place = Some(place);
+            }
+            "--minutes" => {
+                let text = value("--minutes")?;
+                options.minutes = text
+                    .parse()
+                    .ok()
+                    .filter(|m| *m > 0)
+                    .ok_or_else(|| format!("--minutes wants a whole number above 0, not `{text}`"))?;
+            }
+            "--size" => {
+                let text = value("--size")?;
+                let size = text
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                    .filter(|(w, h)| *w >= 320 && *h >= 240)
+                    .ok_or_else(|| format!("--size wants <width>x<height> (at least 320x240), not `{text}`"))?;
+                options.size = Some(size);
+            }
+            "--gpu" => {
+                let text = value("--gpu")?;
+                if !matches!(text.as_str(), "vulkan" | "gl" | "auto") {
+                    return Err(format!("--gpu wants vulkan, gl or auto, not `{text}`"));
+                }
+                options.gpu = Some(text);
+            }
+            "--with-systemui" => options.with_systemui = true,
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    Ok(options)
+}
+
+/// The environment the real-AOSP session (`omni-linux`'s `r_roblox`) is given: what
+/// `tools/aosp_play.ps1` sets on Windows, from these options.
+fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("OMNI_WINDOW", "1".to_string()),
+        ("OMNI_R_MINUTES", options.minutes.to_string()),
+        ("OMNI_TEST_APK", apk.display().to_string()),
+        ("OMNI_R_KIOSK", if options.with_systemui { "0" } else { "1" }.to_string()),
+    ];
+    if let Some(cookie) = cookie {
+        env.push(("OMNI_R_COOKIE", cookie.display().to_string()));
+    }
+    if let Some(place) = options.place {
+        env.push(("OMNI_R_PLACE", place.to_string()));
+    }
+    if let Some((w, h)) = options.size {
+        env.push(("OMNI_WINDOW_SIZE", format!("{w}x{h}")));
+    }
+    if let Some(gpu) = &options.gpu {
+        env.push(("OMNI_GPU", gpu.clone()));
+    }
+    env
+}
+
+/// Where the session's instance (the device's `/data`, its log, its screenshots) is made: the temp
+/// directory, unless it is a tmpfs and nothing named one (`TMPDIR`) -- then `<app-data>/../aosp`, on
+/// the disk. Ubuntu's `/tmp` is a tmpfs of half the RAM: the instance (an installed APK, ART's
+/// compiled code, the app's data) would fill it and be held in memory beside the running device.
+fn aosp_work_dir(tmpdir_named: bool, temp_is_tmpfs: bool, app_data: Option<&Path>) -> Option<PathBuf> {
+    if tmpdir_named || !temp_is_tmpfs {
+        return None;
+    }
+    Some(app_data?.parent()?.join("aosp"))
+}
+
+/// Whether `dir` is mounted as a tmpfs (`/proc/mounts`; false where there is none).
+fn is_tmpfs(dir: &Path) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else { return false };
+    let dir = dir.to_string_lossy();
+    mounts.lines().filter_map(|l| {
+        let mut f = l.split_whitespace();
+        let (_, at, kind) = (f.next()?, f.next()?, f.next()?);
+        Some((at.to_string(), kind == "tmpfs"))
+    })
+    .filter(|(at, _)| dir == at.as_str() || dir.starts_with(&format!("{}/", at.trim_end_matches('/'))))
+    .max_by_key(|(at, _)| at.len())
+    .is_some_and(|(_, tmpfs)| tmpfs)
+}
+
+/// `omnidroid aosp`: the real-AOSP session in a live window (see USAGE).
+fn aosp(options: &AospOptions) -> ExitCode {
+    let apk = match omni_apk::choose_apk(options.apk.as_deref(), &repo_root()) {
+        Ok(apk) => apk,
+        Err(error) => {
+            eprintln!("omnidroid: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let apk_path = std::fs::canonicalize(&apk.path).unwrap_or_else(|_| apk.path.clone());
+    println!("Omnidroid (real AOSP): {}", describe(&apk));
+    // The session plants the cookie from a file (never printed): a file, or a name `login` saved.
+    let cookie = match &options.cookie {
+        None => None,
+        Some(arg) => {
+            let saved = cookies_dir().map(|d| d.join(format!("{arg}.txt"))).filter(|p| p.is_file());
+            let path = if Path::new(arg).is_file() { PathBuf::from(arg) } else if let Some(p) = saved { p } else {
+                eprintln!("omnidroid: --cookie: no file `{arg}` (aosp takes a cookie file or a name `login` saved)");
+                return ExitCode::from(2);
+            };
+            if let Err(message) = account_cookie(&path.to_string_lossy()) {
+                eprintln!("omnidroid: {message}");
+                return ExitCode::from(2);
+            }
+            Some(std::fs::canonicalize(&path).unwrap_or(path))
+        }
+    };
+    let mut run = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    run.current_dir(repo_root())
+        .args(["test", "--release", "-q", "-p", "omni-linux", "--test", "r_roblox", "--", "--ignored", "--nocapture"]);
+    for (k, v) in aosp_env(options, &apk_path, cookie.as_deref()) {
+        run.env(k, v);
+    }
+    let temp = std::env::temp_dir();
+    let work = aosp_work_dir(std::env::var_os("TMPDIR").is_some(), is_tmpfs(&temp), omni_platform::process::app_data_dir().as_deref());
+    let session_dir = match &work {
+        Some(dir) => {
+            if let Err(error) = std::fs::create_dir_all(dir) {
+                eprintln!("omnidroid: could not create {}: {error}", dir.display());
+                return ExitCode::FAILURE;
+            }
+            run.env("TMPDIR", dir);
+            dir.clone()
+        }
+        None => temp,
+    };
+    // Graphics buffers a finished session handed between its processes (`omni-shm-*`).
+    for dir in [session_dir.clone(), PathBuf::from("/dev/shm")] {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("omni-shm-")) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    println!(
+        "Omnidroid: a {}-minute session; {}{}the log is {}/omni-linux-r-<pid>.log, the display's screenshots beside it",
+        options.minutes,
+        cookie.as_ref().map_or(String::new(), |_| "signed in with --cookie (never printed); ".to_string()),
+        options.place.map_or(String::new(), |p| format!("joining place {p} once signed in; ")),
+        session_dir.display()
+    );
+    match run.status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
+        Err(error) => {
+            eprintln!("omnidroid: could not start cargo: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,5 +945,45 @@ mod tests {
         assert_eq!(both.dir.as_deref(), Some(Path::new("x")));
         assert!(args(&["a", "b", "c"]).is_err());
         assert!(args(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn aosp_takes_the_apk_the_account_and_the_place() {
+        let args = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string()));
+        let o = args(&["--apk", "r.apk", "--cookie", "c.txt", "--place", "8737899170"]).expect("parsed");
+        assert_eq!(o.apk.as_deref(), Some(Path::new("r.apk")));
+        assert_eq!((o.cookie.as_deref(), o.place, o.minutes), (Some("c.txt"), Some(8_737_899_170), 30));
+        let o = args(&["--minutes", "12", "--size", "1280x720", "--gpu", "gl", "--with-systemui"]).expect("parsed");
+        assert_eq!((o.minutes, o.size, o.gpu.as_deref(), o.with_systemui), (12, Some((1280, 720)), Some("gl"), true));
+        assert!(args(&["--gpu", "metal"]).is_err());
+        assert!(args(&["--size", "1280"]).is_err());
+        assert!(args(&["--place", "0"]).is_err());
+        assert!(args(&["--minutes", "0"]).is_err());
+        assert!(args(&["--fresh"]).is_err(), "play's options are not aosp's");
+    }
+
+    #[test]
+    fn aosp_gives_the_session_what_aosp_play_ps1_gave_it() {
+        let o = parse_aosp(["--place", "1", "--gpu", "gl", "--size", "960x540"].iter().map(|s| (*s).to_string())).expect("parsed");
+        let env = aosp_env(&o, Path::new("/a/r.apk"), Some(Path::new("/c/k.txt")));
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("OMNI_WINDOW"), Some("1"));
+        assert_eq!(get("OMNI_R_MINUTES"), Some("30"));
+        assert_eq!(get("OMNI_TEST_APK"), Some("/a/r.apk"));
+        assert_eq!(get("OMNI_R_COOKIE"), Some("/c/k.txt"));
+        assert_eq!(get("OMNI_R_PLACE"), Some("1"));
+        assert_eq!(get("OMNI_R_KIOSK"), Some("1"), "a single-app device unless --with-systemui");
+        assert_eq!(get("OMNI_WINDOW_SIZE"), Some("960x540"));
+        assert_eq!(get("OMNI_GPU"), Some("gl"));
+        let bare = aosp_env(&parse_aosp(std::iter::empty()).expect("parsed"), Path::new("r.apk"), None);
+        assert!(bare.iter().all(|(k, _)| !matches!(*k, "OMNI_R_COOKIE" | "OMNI_R_PLACE" | "OMNI_GPU")));
+    }
+
+    #[test]
+    fn a_tmpfs_temp_directory_moves_the_session_to_the_disk() {
+        let data = Path::new("/home/u/.local/share/omnidroid/data");
+        assert_eq!(aosp_work_dir(false, true, Some(data)), Some(PathBuf::from("/home/u/.local/share/omnidroid/aosp")));
+        assert_eq!(aosp_work_dir(true, true, Some(data)), None, "TMPDIR named is kept");
+        assert_eq!(aosp_work_dir(false, false, Some(data)), None, "a temp directory on a disk is kept");
     }
 }
