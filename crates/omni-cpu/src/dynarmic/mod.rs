@@ -1525,6 +1525,10 @@ pub(crate) struct CpuCtx {
     /// for M2's file-backed image; reachable the moment a guest JIT exists. It was also written and
     /// never read, which is how it survived review.
     pub(crate) executable_cache: Option<(GuestAddr, GuestAddr, bool)>,
+    /// Data accesses the slow path served through a split host page's alias (the 4 KiB overlay,
+    /// `omni_mem::subpage`): allowed by the guest's view, refused by the host page. Not a degraded
+    /// block -- the slice invariant subtracts them.
+    pub(crate) split_served: u64,
 
     pub(crate) thunks: BTreeSet<GuestAddr>,
     /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
@@ -1678,6 +1682,7 @@ impl DynarmicCpu {
             extent: config.space(),
             jit: core::ptr::null_mut(),
             executable_cache: None,
+            split_served: 0,
             thunks: BTreeSet::new(),
             inline_thunks: inline_table::InlineThunks::default(),
             svc_handler: None,
@@ -1867,6 +1872,13 @@ impl DynarmicCpu {
         // SAFETY: the jit is live, and `&self` cannot overlap a `run` — `run` takes `&mut self`.
         // The counter is non-atomic and written only by callbacks, which run on this thread.
         unsafe { od_jit_slow_path_total(self.jit) }
+    }
+
+    /// Data accesses this context's slow path served through a split host page's alias (the 4 KiB
+    /// overlay). Zero wherever the host page is the guest's.
+    #[must_use]
+    pub fn split_served(&self) -> u64 {
+        self.with_ctx(|ctx| ctx.split_served)
     }
 
     /// How many run slices were found to have degraded onto the callback path.
@@ -2120,6 +2132,7 @@ impl GuestCpu for DynarmicCpu {
             // and one after, on the jit's own thread, around a slice that is a million guest
             // instructions by default.
             let callbacks_before = self.slice_invariant_armed.then(|| self.slow_path_entries());
+            let served_before = self.with_ctx(|ctx| ctx.split_served);
 
             // SAFETY: the jit is live; `&mut self` means no `&mut CpuCtx` is outstanding at this
             // call site; every callback contains its own panics. This executes attacker-controlled
@@ -2153,7 +2166,12 @@ impl GuestCpu for DynarmicCpu {
             // a re-entered jit and an escaped C++ exception both mean the jit is in an
             // uncharacterised state, which subsumes anything this could say about it.
             if let Some(before) = callbacks_before {
-                let delta = self.slow_path_entries().saturating_sub(before);
+                // An access the 4 KiB overlay's slow path served through a split page's alias is
+                // not a block that stopped reaching memory directly: the host page refuses what
+                // the guest's 4 KiB page allows, so the callback is the only way there
+                // (`omni_mem::subpage`). Those entries are not counted against the slice.
+                let served = self.with_ctx(|ctx| ctx.split_served).saturating_sub(served_before);
+                let delta = self.slow_path_entries().saturating_sub(before).saturating_sub(served);
                 if delta != 0 {
                     // The one exemption, and it is narrow on purpose: a genuine guest fault
                     // *arrives* through the callback, so it increments the counter. Anything else
