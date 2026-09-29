@@ -294,6 +294,19 @@ pub struct DynarmicOptions {
     /// access, the cost of D4's rule for below-64-bit configurations) and the callback path
     /// clears it before resolving.
     pub top_byte_ignore: bool,
+    /// Whether a guest access the demand pager declines -- a fault the guest meant, such as ART's
+    /// implicit null check, which loads through a null object and turns the `SIGSEGV` into a
+    /// `NullPointerException` -- also moves that instruction onto the callback path **for good**
+    /// (dynarmic's `recompile_on_fastmem_failure`). Either way that one access reaches the callback
+    /// and becomes a typed exit.
+    ///
+    /// **Default `true`**, as the Roblox path always ran. The Linux personality turns it off: its
+    /// guests fault on purpose, and each such instruction's next, valid execution would take the
+    /// callback path -- which the per-slice invariant ([`CpuError::DegradedMemoryPath`]) rightly
+    /// kills, and which on arm64 (MEASURED, D41: `b_hello_dex`, 4 of 6 runs killed at `exit_group`
+    /// after one null check) nothing else prevents. x64's shared code cache never recompiles, so
+    /// this only changes what arm64 hosts do.
+    pub recompile_on_declined_fault: bool,
 }
 
 impl Default for DynarmicOptions {
@@ -312,6 +325,7 @@ impl Default for DynarmicOptions {
             // is the way back, announced.
             exclusive_monitor: ExclusiveMonitor::ValueCompare,
             top_byte_ignore: false,
+            recompile_on_declined_fault: true,
             optimizations_override: None,
             // D38 amendment 2, decided 2026-09-25 on x64: in PS99 with w20's drag script, w27/w29
             // (shared) against w28 (per-thread) -- 0 s under 20 fps during input against 14 s
@@ -584,7 +598,7 @@ fn thread_config(
         // what the architecture specifies, and an address with nothing behind it still faults.
         fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(if options.top_byte_ignore { 56 } else { 64 }),
         silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(options.top_byte_ignore)),
-        recompile_on_fastmem_failure: 1,
+        recompile_on_fastmem_failure: i32::from(options.recompile_on_declined_fault),
         // Task 2's review measured this: off gives 1 slow-path read plus 1 exclusive callback
         // per `LDXR`, on gives 0, which matters because D5 lists the global exclusive monitor's
         // 21x anti-scaling as a primary risk.
