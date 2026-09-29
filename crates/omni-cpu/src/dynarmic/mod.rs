@@ -1042,6 +1042,22 @@ impl DynarmicBackend {
         }
     }
 
+    /// Drop the translations of `range` on **every** context of this backend: the shared cache's,
+    /// or each context's own (arm64). What a kernel owes the instruction cache when the guest
+    /// changes code by other means than `IC IVAU` -- remapping it, or re-protecting it executable.
+    /// Callable from inside a context's callback (a system call): `od_jit_invalidate_range` is
+    /// queued for a jit that is executing.
+    pub fn invalidate_code_everywhere(&self, range: GuestRange) {
+        if self.shared.code_cache.is_some() {
+            return self.invalidate_code(range);
+        }
+        for &jit in self.shared.peers.0.lock().iter() {
+            // SAFETY: a peer is live while it is in the list (a context leaves it, under this
+            // lock, before its jit is freed); the call is safe from any thread and callback.
+            unsafe { od_jit_invalidate_range(jit as *mut core::ffi::c_void, range.start() as u64, range.len() as u64) };
+        }
+    }
+
     /// **Drop every translation of the shared code cache**, from a host thread (not a callback of
     /// one of its contexts): every region filled so far is retired and given back to the OS as
     /// soon as the threads that ran in it have left generated code, and what runs next is

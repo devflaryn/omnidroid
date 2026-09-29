@@ -592,11 +592,42 @@ fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 fn sys_munmap(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    p.mm.unmap(a[0], a[1]).map(|()| 0)
+    let probed = smc_probe(p, a[0], a[1], None);
+    p.mm.unmap(a[0], a[1])?;
+    if probed {
+        p.invalidate_code(crate::guest::untag(a[0]), a[1]);
+    }
+    Ok(0)
 }
 
 fn sys_mprotect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    p.mm.protect(a[0], a[1], a[2] as u32).map(|()| 0)
+    let probed = smc_probe(p, a[0], a[1], Some(a[2] as u32));
+    p.mm.protect(a[0], a[1], a[2] as u32)?;
+    if probed {
+        p.invalidate_code(crate::guest::untag(a[0]), a[1]);
+    }
+    Ok(0)
+}
+
+/// **Diagnostic probe** (`OMNI_SMC_PROBE=<name part>`, off by default): an `mprotect` or `munmap` of
+/// a mapping whose name contains it drops that range's translations on every thread, and is logged
+/// with its protection -- whether a library that rewrites its own code runs stale translations.
+fn smc_probe(p: &Process, addr: u64, len: u64, prot: Option<u32>) -> bool {
+    static WANT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let Some(want) = WANT.get_or_init(|| std::env::var("OMNI_SMC_PROBE").ok().filter(|w| !w.is_empty()).map(String::into_bytes)) else {
+        return false;
+    };
+    let addr = crate::guest::untag(addr);
+    let Some((name, offset)) = p.mm.name_at(addr) else { return false };
+    if !name.windows(want.len()).any(|w| w == want.as_slice()) {
+        return false;
+    }
+    let tail = name.rsplit(|&b| b == b'/').next().unwrap_or(&name);
+    match prot {
+        Some(prot) => eprintln!("[smc] {} mprotect {}+{offset:#x} len {len:#x} prot {prot}", p.sys.pid, String::from_utf8_lossy(tail)),
+        None => eprintln!("[smc] {} munmap {}+{offset:#x} len {len:#x}", p.sys.pid, String::from_utf8_lossy(tail)),
+    }
+    true
 }
 
 /// `madvise`. The advice that changes what memory reads -- `MADV_DONTNEED` and `MADV_REMOVE` --

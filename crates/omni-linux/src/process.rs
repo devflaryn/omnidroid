@@ -112,6 +112,13 @@ impl Process {
         self.backend.as_ref().and_then(|b| b.code_cache_stats()).map_or(0, |s| s.code_bytes_emitted)
     }
 
+    /// Drop the translations of `[start, start + len)` on every thread of this process.
+    pub(crate) fn invalidate_code(&self, start: u64, len: u64) {
+        if let (Some(b), Ok(range)) = (&self.backend, omni_cpu::GuestRange::new(start as usize, len as usize)) {
+            b.invalidate_code_everywhere(range);
+        }
+    }
+
     /// Drop its translations (`crate::code_trim`).
     pub fn trim_code(&self) {
         if let Some(b) = &self.backend {
@@ -591,6 +598,7 @@ impl Process {
             all.retain(|w| w.strong_count() > 0);
             all.push(Arc::downgrade(&p));
         }
+        split_report_start();
         // `/proc` and `/sys` are generated from the process itself (`procfs`).
         let proc: Arc<dyn crate::procfs::ProcFs> = Arc::clone(&p) as Arc<dyn crate::procfs::ProcFs>;
         p.vfs.attach_proc(Arc::downgrade(&proc));
@@ -1286,4 +1294,36 @@ impl Drop for Process {
             crate::locks::process_ended(self.sys.pid);
         }
     }
+}
+
+/// `OMNI_SPLIT_REPORT=<seconds>`: every that many seconds, each process of this host process whose
+/// 4 KiB overlay has served accesses says how many (per second since the last line), and which
+/// host pages, by the mapping they belong to (D42). Off by default.
+fn split_report_start() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let Some(secs) = std::env::var("OMNI_SPLIT_REPORT").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else { return };
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("split-report".into()).spawn(move || {
+            let mut last: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                let live: Vec<Arc<Process>> = ALL.lock().iter().filter_map(std::sync::Weak::upgrade).collect();
+                for p in live {
+                    let st = p.mem.space().split_stats();
+                    if st.served_total == 0 && st.tracked == 0 {
+                        continue;
+                    }
+                    let before = last.insert(p.sys.pid, st.served_total).unwrap_or(0);
+                    let rate = st.served_total.saturating_sub(before) / secs;
+                    let top: Vec<String> = st
+                        .top
+                        .iter()
+                        .take(4)
+                        .map(|(page, n)| format!("{page:#x}x{n} {}", p.mm.describe(*page as u64).unwrap_or_default()))
+                        .collect();
+                    eprintln!("[split] pid {} tracked {} trapping {} served {} ({rate}/s) top: {}", p.sys.pid, st.tracked, st.trapping, st.served_total, top.join(", "));
+                }
+            }
+        });
+    });
 }
