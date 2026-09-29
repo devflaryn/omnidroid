@@ -31,10 +31,26 @@ The guest space keeps its guest layout exactly as on the other hosts -- `[0x1000
 guest address g                         host address
 [0x1000_0000, 4 GiB - page)   ->   W + g      (W: a 4 GiB-aligned host reservation, anywhere)
 [4 GiB - page, 4 GiB)         ->   (a host-owned guard page: no mapping may straddle the seam)
-[4 GiB, end)                  ->   g          (identity, reserved around what the host holds)
+[4 GiB, H)                    ->   (host-owned: see below)
+[H, H + 60.25 GiB)            ->   g          (identity, where the host had room)
 ```
 
 `host(g) = g + (g < 4 GiB ? W : 0)`, and back: `guest(h) = h - W` for `h` in the window.
+
+**Where the identity half goes (found while building it).** The first design put it at 4 GiB. On
+macOS nearly everything from the executable up to ~448 GiB is the host's: the page zero *slides*
+with the executable (ASLR), so `[4 GiB, executable)` is unmappable too; the dyld shared region's
+reservation and the GPU carveout take the rest (MEASURED on the M1, macOS 27: fixed allocations at
+16, 64 and 128 GiB are `KERN_NO_SPACE`; a region walk sees `0x1_8000_0000` onwards as held; the
+host's own choice for 64 GiB was `0x7b_2640_0000`). A 64 GiB space at `0x1000_0000` had 5 GiB
+free above its window. So the identity half is at 4 GiB where the host has it free (Windows,
+Linux) and otherwise where the host chooses (`H`, 4 GiB-aligned), and `[4 GiB, H)` is one
+host-owned range. The guest does not care: what it maps without an address goes to the lowest free
+range above 4 GiB. On the M1: `W = 0x70_0000_0000`, `H = 0x7c_0000_0000`.
+
+Because every space's window and identity half are wherever the host puts them, **every** guest
+address space of a host process gets its own low 4 GiB on macOS -- not only the first, as on the
+other hosts.
 
 **Why not base the whole space** (`fastmem_pointer = W` for everything, the usual dynarmic setup)?
 Because the host is handed guest pointers it dereferences in place: the paravirtual GPU forwards
@@ -57,7 +73,7 @@ the translation is made in those and nowhere else:
 | `omni-mem` pager | a fault's host address is translated to the guest's before the region lookup, so demand commit works in the window. |
 | `omni-cpu` | dynarmic is configured with `fastmem_pointer = W` and the new `fastmem_low_window` flag; the slow-path callbacks (data, code fetch, exclusives) go through `GuestSpace::ptr`. The D4 check accepts "identity above 4 GiB, based below" only together with the flag. |
 | dynarmic (patch 0030, arm64) | `FastmemEmitVAddrLookup` and `EmitExclusiveHostAddress` add the base only below 4 GiB: `tst addr, #0xffffffff00000000; csel base, Xfastmem, xzr, eq; ldr [base, addr]` -- two instructions per guest access, no branch, no callback. Off unless asked for; the x64 backend refuses the flag. |
-| `omni-linux` | `reserve_space` asks for the window when `lowest_mappable_address() > 0x1000_0000`. The guest's fault address (`siginfo.si_addr`) is always the guest's. |
+| `omni-linux` | `reserve_space` asks for the window when `lowest_mappable_address() > 0x1000_0000`. The guest's fault address (`siginfo.si_addr`) is always the guest's. Its CPU contexts serve a fault the guest meant once (`recompile_on_declined_fault` off, below). |
 
 ### What it costs, and what it does not change
 
@@ -72,6 +88,21 @@ the translation is made in those and nowhere else:
   addresses. A host-owned guard page at `4 GiB - page` makes such a request fail as any occupied
   range does; ART never asks for one (its `low_4gb` maps end at or below 4 GiB).
 
+### Two host bugs the window exposed
+
+* `occupied_ranges` on macOS never named the slid page zero, and `reserve_placeholder_at` used an
+  `mmap` hint, which XNU moves out of the heap room above the executable. Now the seam reports
+  everything below `lowest_mappable_address()` as held (every host), and macOS reserves by
+  `mach_vm_allocate(VM_FLAGS_FIXED)`.
+* **Not the window, but only reachable with ART:** ART's compiled code does implicit null checks --
+  it loads through null and turns the `SIGSEGV` into a `NullPointerException`. dynarmic's arm64
+  backend, on a fault the pager declines, recompiles the block with that load on the callback path
+  for good; its next valid execution was then a degraded slice (D4 amendment 2) and the process was
+  killed at `exit_group` (4 of 6 `b_hello_dex` runs). x64's shared code cache never recompiles.
+  `DynarmicOptions::recompile_on_declined_fault` (default on, as the Roblox path ran) is off for
+  the Linux personality: the fault reaches the callback once and becomes the guest's signal.
+  `omni-cpu/tests/declined_fault.rs` pins both behaviours.
+
 ### Proof
 
 * `omni-mem/tests/low_window.rs`: a space with the window: guest addresses below 4 GiB, host
@@ -82,5 +113,9 @@ the translation is made in those and nowhere else:
   reach `W + g` on the fast path with zero slow-path entries.
 * `omni-linux/tests/b_low_base.rs`, un-ignored on macOS: the space starts below 4 GiB, and a real
   process's `/proc/self/maps` shows nothing unhinted there.
-* `omni-linux/tests/b_hello_dex.rs` and `c2_apk_in_app_process.rs`, un-ignored on macOS: real ART
-  maps its heap and boot image in the window and runs dex.
+* `omni-linux/tests/b_hello_dex.rs`, un-ignored on macOS, asserts where ART put things: on the M1,
+  "ART's heap [0x14000000, 0x24000000), boot image from 0x704f8000, boot code from 0x719c8000, in
+  the low window (D41)" -- the main space, every boot image space and the boot code below 4 GiB,
+  each based (host address != guest address); 5/5 runs.
+* `c2_apk_in_app_process.rs`, un-ignored: Roblox 2.740.931's four dex files load (26,530 of 26,533
+  classes linked) and `libroblox.so` loads in an `app_process` whose heap is in the window.
