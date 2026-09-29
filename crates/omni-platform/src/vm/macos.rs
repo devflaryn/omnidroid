@@ -270,11 +270,27 @@ fn fresh_reserved(address: usize, size: usize) -> Result<(), u32> {
 fn mprotect(address: usize, size: usize, protection: libc::c_int) -> Result<(), u32> {
     // SAFETY: the range is one this backend owns (checked against the registry by the caller);
     // mprotect dereferences nothing.
-    if unsafe { libc::mprotect(address as *mut libc::c_void, size, protection) } != 0 {
+    if unsafe { libc::mprotect(address as *mut libc::c_void, size, host_side(protection)) } != 0 {
         return Err(errno());
     }
     mirrored(address, size, protection);
     Ok(())
+}
+
+/// What the host's own page gets for `protection`: the same, except that writable-and-executable
+/// is writable. Apple silicon refuses W+X outside `MAP_JIT` (MEASURED: `mprotect` and `mmap` with
+/// `PROT_READ | PROT_WRITE | PROT_EXEC` on anonymous memory are `EACCES`), and only guest memory is
+/// ever asked for it ([`Protection::ReadWriteExecute`]'s rule) -- memory the translating backend
+/// never executes from, because it reads guest code through its code-fetch callback. So a guest's
+/// W+X page (ART's JIT cache without a dual view; a packed library decrypting itself in place) is
+/// writable here, and the stage-2 mirror, which does run guest pages natively, is told the whole of
+/// it ([`mirrored`]).
+fn host_side(protection: libc::c_int) -> libc::c_int {
+    if protection & libc::PROT_WRITE != 0 && protection & libc::PROT_EXEC != 0 {
+        protection & !libc::PROT_EXEC
+    } else {
+        protection
+    }
 }
 
 /// Tell the hypervisor seam's stage-2 mirror what `[address, address + size)` now is: it has just
@@ -744,7 +760,7 @@ pub(super) fn map_file(
         libc::mmap(
             address as *mut libc::c_void,
             size,
-            create,
+            host_side(create),
             sharing | libc::MAP_FIXED,
             file.fd.as_raw_fd(),
             file_offset as libc::off_t,
