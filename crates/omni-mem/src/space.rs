@@ -350,7 +350,7 @@ pub struct Reclaimed {
 /// `madvise(MADV_DONTNEED)` ranges on 4 KiB boundaries -- the pinned case is
 /// `madvise(map + 4096, 4096, MADV_DONTNEED)`, which a 16 KiB-granular check refused with `EINVAL`
 /// (2026-09-25).
-pub const SMALL_PAGE: usize = 4096;
+pub const SMALL_PAGE: usize = crate::subpage::GUEST_PAGE;
 
 /// How `[address, address + len)` lies across pages of one size: the part before the first page
 /// boundary inside it, the whole pages, and the part after the last. Each part is `(start, len)`

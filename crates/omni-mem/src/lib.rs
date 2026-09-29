@@ -64,6 +64,7 @@ mod label;
 mod pager;
 mod region;
 mod space;
+mod subpage;
 
 pub use arena::{
     ArenaConfig, ArenaId, ArenaStats, CodeArena, CodeBlock, DEFAULT_BLOCK_ALIGNMENT,
@@ -76,6 +77,7 @@ pub use label::{label_scope, LabelScope, MapLabel};
 pub use access::{admit, admits_region, permits, scan_reach, Admitted, Refusal};
 pub use pager::{process_pager_totals, DemandPager, PagerStats};
 pub use region::{RegionInfo, RegionKind};
+pub use subpage::{Part, GUEST_PAGE};
 pub use space::{
     split_at_pages, CommitPolicy, Discarded, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId,
     LowWindow, PageSplit, Placement, Reclaimed, SpaceStats, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED,
