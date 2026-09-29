@@ -284,3 +284,140 @@ fn stats_count_what_is_tracked_and_served() {
     assert_eq!((st.tracked, st.trapping, st.served_total), (1, 1, 1));
     assert_eq!(st.top, vec![(at, 1)]);
 }
+
+// ---- Checkpoint A findings -----------------------------------------------------------------------
+
+fn space_with(cfg: GuestSpaceConfig) -> GuestSpace {
+    GuestSpace::with_config(GuestSpaceConfig { size: 1 << 30, guest_page: Some(GUEST_PAGE), ..cfg }).expect("a space")
+}
+
+/// A served write through the alias while another part of the same, still trapping, page is
+/// re-protected: the alias must stay writable throughout (it was re-made, briefly read-only, on
+/// every change: SIGBUS).
+#[test]
+fn a_served_write_survives_a_concurrent_protect_of_another_part() {
+    if !overlay_expected() {
+        return;
+    }
+    let s = std::sync::Arc::new(space(Some(GUEST_PAGE)));
+    let page = host_page();
+    let at = s.map_anonymous(Placement::Anywhere { align: page }, page, Protection::ReadWrite, CommitPolicy::Eager).unwrap();
+    s.protect(at, GUEST_PAGE, Protection::Read).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (s, stop) = (std::sync::Arc::clone(&s), std::sync::Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let AccessPtr::Alias(p) = s.access_ptr(at + GUEST_PAGE, 8) else { panic!("an alias") };
+                // SAFETY: the alias is read-write for as long as the page traps.
+                unsafe { (p as *mut u64).write_volatile(n) };
+                n += 1;
+            }
+        })
+    };
+    for i in 0..20_000 {
+        s.protect(at + 2 * GUEST_PAGE, GUEST_PAGE, if i % 2 == 0 { Protection::Read } else { Protection::ReadWrite }).unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+}
+
+/// Two views of one shared backing (a memfd, ashmem, a MAP_SHARED file): splitting one keeps it
+/// the same memory as the other.
+#[test]
+fn splitting_a_shared_view_keeps_it_shared() {
+    if !overlay_expected() {
+        return;
+    }
+    let page = host_page();
+    let path = std::env::temp_dir().join(format!("omni-subpage-shared-{}", std::process::id()));
+    std::fs::write(&path, vec![0u8; page]).unwrap();
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let s = space(Some(GUEST_PAGE));
+    let backing = omni_mem::Backing::share(file, "shm").unwrap();
+    let a = s.map_file(&backing, 0, Placement::Anywhere { align: page }, page, Protection::ReadWrite).unwrap();
+    let b = s.map_file(&backing, 0, Placement::Anywhere { align: page }, page, Protection::ReadWrite).unwrap();
+    s.protect(a, GUEST_PAGE, Protection::Read).unwrap();
+    // SAFETY: b is an ordinary read-write view.
+    unsafe { (s.host_addr(b + GUEST_PAGE) as *mut u64).write_volatile(2) };
+    let AccessPtr::Alias(p) = s.access_ptr(a + GUEST_PAGE, 8) else { panic!("an alias") };
+    // SAFETY: the alias is read-write.
+    assert_eq!(unsafe { (p as *const u64).read_volatile() }, 2, "a still sees b's write");
+    assert!(matches!(s.region_at(a + GUEST_PAGE).unwrap().kind, omni_mem::RegionKind::File { .. }));
+    let _ = std::fs::remove_file(path);
+}
+
+/// A private file view's split page keeps its file identity in the guest's view (`/proc/maps`).
+#[test]
+fn a_split_file_page_is_still_the_file_in_the_guests_view() {
+    if !overlay_expected() {
+        return;
+    }
+    let page = host_page();
+    let dir = std::env::temp_dir().join(format!("omni-subpage-id-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lib.so");
+    std::fs::write(&path, vec![0x5a; 2 * page]).unwrap();
+    let s = space(Some(GUEST_PAGE));
+    let backing = omni_mem::Backing::open_named(&path, omni_mem::MapExecutability::NonExecutable, "lib.so").unwrap();
+    let f = s.map_file(&backing, 0, Placement::Anywhere { align: page }, 2 * page, Protection::ReadWrite).unwrap();
+    s.protect(f + GUEST_PAGE, GUEST_PAGE, Protection::Read).unwrap();
+    for at in [f, f + GUEST_PAGE, f + page] {
+        let r = s.region_at(at).unwrap();
+        let omni_mem::RegionKind::File { file_offset, .. } = r.kind else { panic!("{at:#x} is {:?}", r.kind) };
+        assert_eq!(file_offset, (at - f) as u64, "{at:#x}");
+    }
+    let files = s.mapped_regions().into_iter().filter(|r| r.start >= f && r.start < f + 2 * page).all(|r| matches!(r.kind, omni_mem::RegionKind::File { .. }));
+    assert!(files, "every piece of the mapping is the file");
+}
+
+/// A split near the commit ceiling is refused with nothing changed: the file page stays mapped.
+#[test]
+fn a_split_refused_at_the_commit_ceiling_changes_nothing() {
+    if !overlay_expected() {
+        return;
+    }
+    let page = host_page();
+    let path = std::env::temp_dir().join(format!("omni-subpage-ceiling-{}", std::process::id()));
+    std::fs::write(&path, vec![0x5a; 2 * page]).unwrap();
+    let s = space_with(GuestSpaceConfig { max_committed: page, max_commit_request: page, ..GuestSpaceConfig::default() });
+    s.map_anonymous(Placement::Anywhere { align: page }, page, Protection::ReadWrite, CommitPolicy::Eager).unwrap();
+    let backing = omni_mem::Backing::open(&path, omni_mem::MapExecutability::NonExecutable).unwrap();
+    let f = s.map_file(&backing, 0, Placement::Anywhere { align: page }, 2 * page, Protection::ReadWrite).unwrap();
+    assert!(s.protect(f + GUEST_PAGE, GUEST_PAGE, Protection::Read).is_err(), "no commit left for the private copy");
+    let r = s.region_at(f).expect("the file page is still mapped");
+    assert_eq!(r.protection, Protection::ReadWrite);
+    assert!(!s.is_trapping(f));
+    let _ = std::fs::remove_file(path);
+}
+
+/// Reclaiming idle memory never takes a tracked page's memory from under its alias.
+#[test]
+fn reclaim_leaves_a_trapping_page_alone() {
+    if !overlay_expected() {
+        return;
+    }
+    let (s, at) = one_page();
+    s.protect(at, GUEST_PAGE, Protection::Read).unwrap();
+    let AccessPtr::Alias(p) = s.access_ptr(at + GUEST_PAGE, 8) else { panic!() };
+    // SAFETY: read-write alias.
+    unsafe { (p as *mut u64).write_volatile(0x77) };
+    s.advise_idle(at, host_page()).unwrap();
+    s.reclaim_idle().unwrap();
+    assert!(s.is_trapping(at));
+    // SAFETY: the host page is readable.
+    assert_eq!(unsafe { (s.host_addr(at + GUEST_PAGE) as *const u64).read_volatile() }, 0x77, "kept");
+}
+
+/// `held_ranges` (what `mremap` copies) is the guest's view: a hole in a tracked page is not held.
+#[test]
+fn held_ranges_leave_out_a_split_pages_holes() {
+    if !overlay_expected() {
+        return;
+    }
+    let (s, at) = one_page();
+    s.unmap(at + GUEST_PAGE, GUEST_PAGE).unwrap();
+    let held = s.held_ranges(at, host_page());
+    assert_eq!(held, vec![(at, GUEST_PAGE), (at + 2 * GUEST_PAGE, host_page() - 2 * GUEST_PAGE)]);
+}

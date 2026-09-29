@@ -207,8 +207,14 @@ impl GuestSpace {
             SubOp::Protect(protection) => (Part::Mapped(protection), false, false),
             SubOp::Unmap => (if Self::is_strict(st, at, len) { Part::StrictHole } else { Part::Hole }, false, false),
         };
+        let mapped_here = !st.split.contains_key(&host_page) && split.empty();
         split.set(i0, i1, fill);
-        self.settle(inner, st, operation, host_page, split, zero.then_some((i0, i1)), eager)
+        let settled = self.settle(inner, st, operation, host_page, split, zero.then_some((i0, i1)), eager);
+        if settled.is_err() && mapped_here {
+            // The host page this call mapped for a 4 KiB map goes again (checkpoint A, 4).
+            let _ = inner.unmap_range(operation, host_page, page);
+        }
+        settled
     }
 
     fn is_strict(st: &SubPages, at: GuestAddr, len: usize) -> bool {
@@ -263,8 +269,13 @@ impl GuestSpace {
         }
         let host = split.host_protection();
         if split.traps() {
+            let was = sub.is_trapping(index);
             sub.set_trapping(index, self.host_pages(), true);
-            inner.protect_range(operation, host_page, page, host)?;
+            if let Err(e) = inner.protect_range(operation, host_page, page, host) {
+                // Nothing published: the page keeps its old parts and its old bit.
+                sub.set_trapping(index, self.host_pages(), was);
+                return Err(e);
+            }
         } else {
             inner.protect_range(operation, host_page, page, host)?;
             sub.set_trapping(index, self.host_pages(), false);
@@ -307,7 +318,17 @@ impl GuestSpace {
         if !matches!(entry.os, OsState::View { .. }) {
             return Ok(());
         }
-        let recorded = entry.owner.as_ref().map_or(Protection::Read, |o| o.protection);
+        let owner = entry.owner.clone();
+        // A view of a shared backing (memfd, ashmem, a MAP_SHARED file) is the memory every other
+        // view of it shares: aliasing the view itself keeps that, and there is no copy-on-write
+        // to depend on (checkpoint A, 3).
+        if owner.as_ref().and_then(|o| o.backing.as_ref()).is_some_and(|b| b.is_shared()) {
+            return Ok(());
+        }
+        let recorded = owner.as_ref().map_or(Protection::Read, |o| o.protection);
+        // The private copy's commit, checked before the view is touched: refused, nothing changes
+        // (checkpoint A, 2).
+        inner.check_commit_allowed(operation, host_page, page)?;
         if !recorded.is_readable() {
             inner.protect_range(operation, host_page, page, Protection::Read)?;
         }
@@ -321,6 +342,13 @@ impl GuestSpace {
         self.map_anonymous_locked(inner, operation, Placement::Fixed(host_page), page, Protection::ReadWrite, CommitPolicy::Eager)?;
         // SAFETY: just mapped, committed and read-write.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), inner.host(host_page) as *mut u8, page) };
+        // The copy is still the file's page to the guest: the view's own owner -- mapping, file and
+        // offset -- on committed private memory, so `/proc/<pid>/maps` names the library there
+        // (checkpoint A, 5).
+        if let Some(mut owner) = owner {
+            owner.protection = Protection::ReadWrite;
+            inner.map.get_mut(host_page).expect("just mapped").owner = Some(owner);
+        }
         inner.protect_range(operation, host_page, page, recorded)?;
         Ok(())
     }
@@ -329,9 +357,15 @@ impl GuestSpace {
         st.alias.as_ref().expect("an alias reservation").base() + (host_page - self.base)
     }
 
-    /// Make (or remake) host page `host_page`'s alias. Remade every time a page is made to trap, so
-    /// an alias left from before a decommit never serves stale memory.
+    /// Make host page `host_page`'s alias if it has none. **A live alias is never re-made**: a
+    /// re-map briefly has the source's (lowered) protection before it is made read-write, and a
+    /// served access in that window faults on the alias itself (checkpoint A, 1). So every path
+    /// that decommits or replaces a page unmaps its alias first (`unalias_range`,
+    /// `forget_aliases`), and an alias in `aliased` is always the page's memory (SUBPAGE-ORDER 5).
     fn ensure_alias(&self, st: &mut SubPages, host_page: GuestAddr) -> MemResult<()> {
+        if st.aliased.contains(&host_page) {
+            return Ok(());
+        }
         if st.alias.is_none() {
             let reservation = vm::reserve(self.len, self.page).map_err(platform("alias reservation", 0, self.len))?;
             self.sub_handle().alias_base.store(reservation.base(), std::sync::atomic::Ordering::Release);
@@ -384,17 +418,19 @@ impl GuestSpace {
         if let Some(split) = st.split.get(&host_page) {
             let (first, count, part) = split.run_at((address - host_page) / GUEST_PAGE);
             let Part::Mapped(protection) = part else { return None };
+            let start = host_page + first * GUEST_PAGE;
             return Some(RegionInfo {
-                start: host_page + first * GUEST_PAGE,
+                start,
                 len: count * GUEST_PAGE,
                 protection,
                 committed: if info.committed > 0 { count * GUEST_PAGE } else { 0 },
+                kind: rebased(&info, start),
                 ..info
             });
         }
         let lo = st.split.range(..host_page).next_back().map_or(info.start, |(p, _)| (p + page).max(info.start));
         let hi = st.split.range(host_page..).next().map_or(info.end(), |(p, _)| (*p).min(info.end()));
-        Some(RegionInfo { start: lo, len: hi - lo, committed: if info.is_committed() { hi - lo } else { 0 }, ..info })
+        Some(RegionInfo { start: lo, len: hi - lo, committed: if info.is_committed() { hi - lo } else { 0 }, kind: rebased(&info, lo), ..info })
     }
 
     /// Expand tracked pages in `regions` (address order) into their runs; holes are free regions
@@ -481,6 +517,49 @@ impl GuestSpace {
         Ok(())
     }
 
+    /// `held_ranges` in the guest's view: a tracked page's holes are not held. `inner` is held.
+    pub(super) fn guest_held(&self, held: Vec<(GuestAddr, usize)>) -> Vec<(GuestAddr, usize)> {
+        let Some(sub) = &self.sub else { return held };
+        let st = sub.state.lock();
+        if st.split.is_empty() {
+            return held;
+        }
+        let page = self.page;
+        let mut out: Vec<(GuestAddr, usize)> = Vec::new();
+        let mut push = |s: usize, e: usize| {
+            if s >= e {
+                return;
+            }
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == s => last.1 += e - s,
+                _ => out.push((s, e - s)),
+            }
+        };
+        for (start, len) in held {
+            let end = start + len;
+            let mut at = start;
+            while at < end {
+                let host_page = at & !(page - 1);
+                let next = (host_page + page).min(end);
+                match st.split.get(&host_page) {
+                    Some(s) => {
+                        let mut g = at;
+                        while g < next {
+                            let gn = ((g & !(GUEST_PAGE - 1)) + GUEST_PAGE).min(next);
+                            if matches!(s.parts[(g - host_page) / GUEST_PAGE], Part::Mapped(_)) {
+                                push(g, gn);
+                            }
+                            g = gn;
+                        }
+                    }
+                    None => push(at, next),
+                }
+                at = next;
+            }
+        }
+        out
+    }
+
     /// Whether any tracked part of `[at, at + len)` is executable in the guest's view.
     pub(super) fn any_executable_part(&self, at: GuestAddr, len: usize) -> bool {
         let Some(sub) = &self.sub else { return false };
@@ -541,10 +620,11 @@ impl GuestSpace {
             while next < end && self.is_trapping(next) == trapping {
                 next = (next + page).min(end);
             }
-            match self.access_ptr(at, next - at) {
-                AccessPtr::Direct(p) | AccessPtr::Alias(p) => f(at, p, next - at),
-                AccessPtr::Straddle => unreachable!("a chunk is uniform"),
-            }
+            // The pointer from the classification just made, not a second look at the bits, which
+            // another thread may change in between (checkpoint A, 8).
+            let base = self.sub.as_ref().map_or(0, |s| s.alias_base.load(std::sync::atomic::Ordering::Acquire));
+            let ptr = if trapping && base != 0 { base + (at - self.base) } else { self.host_addr(at) };
+            f(at, ptr as *mut u8, next - at);
             at = next;
         }
     }
@@ -633,5 +713,19 @@ fn expand(regions: Vec<RegionInfo>, split: &std::collections::BTreeMap<usize, Sp
 /// `r` cut to `[start, end)`.
 fn clip(r: &RegionInfo, start: GuestAddr, end: GuestAddr) -> RegionInfo {
     let len = end.saturating_sub(start);
-    RegionInfo { start, len, committed: if r.is_committed() { len } else { r.committed.min(len) }, ..r.clone() }
+    RegionInfo { start, len, committed: if r.is_committed() { len } else { r.committed.min(len) }, kind: rebased(r, start), ..r.clone() }
+}
+
+/// `r`'s kind for a piece of it starting at `start`: a file's offset moves with the start.
+fn rebased(r: &RegionInfo, start: GuestAddr) -> RegionKind {
+    match &r.kind {
+        RegionKind::File { backing, name, file_offset, shared, guest_named } => RegionKind::File {
+            backing: *backing,
+            name: std::sync::Arc::clone(name),
+            file_offset: file_offset + (start - r.start) as u64,
+            shared: *shared,
+            guest_named: *guest_named,
+        },
+        other => other.clone(),
+    }
 }

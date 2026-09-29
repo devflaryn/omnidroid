@@ -910,16 +910,20 @@ impl GuestSpace {
             let host_len = self.round_size(OP, guest_len)?;
             let address = self.map_anonymous_locked(&mut inner, OP, placement, host_len, protection, commit)?;
             if guest_len < host_len {
-                self.sub_apply(&mut inner, OP, address + guest_len, host_len - guest_len, subpage_ops::SubOp::Unmap)?;
+                if let Err(e) = self.sub_apply(&mut inner, OP, address + guest_len, host_len - guest_len, subpage_ops::SubOp::Unmap) {
+                    let _ = inner.unmap_range(OP, address, host_len);
+                    inner.validate();
+                    return Err(e);
+                }
             }
             inner.validate();
             return Ok(address);
         }
         let size = self.round_size(OP, size)?;
         let mut inner = self.write();
-        let address = self.map_anonymous_locked(&mut inner, OP, placement, size, protection, commit)?;
+        let address = self.map_anonymous_locked(&mut inner, OP, placement, size, protection, commit);
         inner.validate();
-        Ok(address)
+        address
     }
 
     /// `map_anonymous` with the lock held and `size` whole host pages: placement, the map entry
@@ -1134,10 +1138,13 @@ impl GuestSpace {
             inner.refuse_host(OP, address & !(self.page - 1), self.round_size(OP, len + address % self.page)?)?;
             if self.needs_overlay(&inner, address, len) {
                 self.sub_apply(&mut inner, OP, address, len, subpage_ops::SubOp::Protect(protection))?;
-                inner.validate();
-                return Ok(());
+            } else {
+                // Whole host pages, none tracked: today's path, under the same guard (checkpoint A, 6).
+                inner.require_mapped(OP, address, len)?;
+                inner.protect_range(OP, address, len, protection)?;
             }
-            drop(inner);
+            inner.validate();
+            return Ok(());
         }
         let len = self.round_size(OP, len)?;
         self.check_aligned(OP, "address", address)?;
@@ -1184,9 +1191,8 @@ impl GuestSpace {
                     if tracked {
                         self.write_tracked(&mut inner, OP, at, chunk)?;
                     } else {
-                        drop(inner);
-                        self.write_forced(at, chunk)?;
-                        inner = self.write();
+                        // Under the same guard: nothing splits a page between (checkpoint A, 6).
+                        self.write_forced_untracked(&mut inner, at, chunk)?;
                     }
                     done += piece;
                 }
@@ -1194,12 +1200,21 @@ impl GuestSpace {
                 return Ok(done);
             }
         }
+        let mut inner = self.write();
+        let written = self.write_forced_untracked(&mut inner, address, bytes);
+        inner.validate();
+        written
+    }
+
+    /// `write_forced` of a range with no tracked host page, the lock held.
+    fn write_forced_untracked(&self, inner: &mut Inner, address: GuestAddr, bytes: &[u8]) -> MemResult<usize> {
+        const OP: &str = "write_forced";
+        let len = bytes.len();
         let page = self.page;
         let span = address & !(page - 1);
         let span_end = (address + len + page - 1) & !(page - 1);
         let span_len = span_end - span;
 
-        let mut inner = self.write();
         inner.refuse_host(OP, span, span_len)?;
         inner.require_mapped(OP, span, span_len)?;
         // Lazy pages in the span get their backing so the raw write below lands; a view or already
@@ -1239,7 +1254,6 @@ impl GuestSpace {
         for (start, entry_len, protection) in to_flip {
             inner.protect_range(OP, start, entry_len, protection)?;
         }
-        inner.validate();
         Ok(len)
     }
 
@@ -1276,10 +1290,12 @@ impl GuestSpace {
             inner.refuse_host(OP, address & !(self.page - 1), self.round_size(OP, len + address % self.page)?)?;
             if self.needs_overlay(&inner, address, len) {
                 self.sub_apply(&mut inner, OP, address, len, subpage_ops::SubOp::Unmap)?;
-                inner.validate();
-                return Ok(());
+            } else {
+                inner.unmap_range(OP, address, len)?;
+                self.forget_aliases(address, len);
             }
-            drop(inner);
+            inner.validate();
+            return Ok(());
         }
         let len = self.round_size(OP, len)?;
         self.check_aligned(OP, "address", address)?;
@@ -1372,7 +1388,14 @@ impl GuestSpace {
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
         let mut inner = self.write();
-        let marked = inner.mark_idle(address, len);
+        let mut marked = 0;
+        // A tracked page of the 4 KiB overlay is never idle: decommitting it would take its memory
+        // from under its alias (checkpoint A, 4).
+        for (at, piece, tracked) in self.pieces_by_tracking(&inner, address, len) {
+            if !tracked {
+                marked += inner.mark_idle(at, piece);
+            }
+        }
         inner.validate();
         Ok(marked)
     }
@@ -1562,7 +1585,7 @@ impl GuestSpace {
                 _ => out.push((s, e - s)),
             }
         }
-        out
+        self.guest_held(out)
     }
 
     /// Every mapped region, as [`mapped_regions`](GuestSpace::mapped_regions) gives them, each
