@@ -79,8 +79,8 @@ pub use pager::{process_pager_totals, DemandPager, PagerStats};
 pub use region::{RegionInfo, RegionKind};
 pub use subpage::{Part, GUEST_PAGE};
 pub use space::{
-    split_at_pages, CommitPolicy, Discarded, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId,
-    LowWindow, PageSplit, Placement, Reclaimed, SpaceStats, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED,
+    split_at_pages, AccessPtr, CommitPolicy, Discarded, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId,
+    LowWindow, PageSplit, Placement, Reclaimed, SpaceStats, SplitStats, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED,
     DEFAULT_MAX_COMMIT_REQUEST, DEFAULT_SPACE_SIZE, LOW_WINDOW_END, SMALL_PAGE,
 };
 

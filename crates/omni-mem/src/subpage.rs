@@ -137,6 +137,9 @@ pub(crate) struct SubPagesHandle {
     pub(crate) state: Mutex<SubPages>,
     /// Accesses the slow path served through an alias, for the report.
     pub(crate) served_total: AtomicU64,
+    /// The alias reservation's base, once made (zero before): what `access_ptr` adds to without
+    /// taking `state`. Set before any bit is (SUBPAGE-ORDER 3), never changed after.
+    pub(crate) alias_base: AtomicUsize,
 }
 
 /// The overlay's state: the tracked host pages, the alias reservation and what it holds.
@@ -169,6 +172,7 @@ impl SubPagesHandle {
                 served: HashMap::new(),
             }),
             served_total: AtomicU64::new(0),
+            alias_base: AtomicUsize::new(0),
         }
     }
 

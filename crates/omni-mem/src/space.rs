@@ -12,6 +12,9 @@ use crate::entry::{Entry, EntryMap, Owner, OsState, ViewId};
 use crate::error::{platform, MemError, MemResult};
 use crate::region::RegionInfo;
 
+mod subpage_ops;
+pub use subpage_ops::{AccessPtr, SplitStats};
+
 /// A guest virtual address. Identical to the host address it lives at: a guest pointer *is* a host
 /// pointer (ARCHITECTURE.md section 1), so there is no translation and no distinct address type --
 /// except inside a space's [`LowWindow`] (D41), which only a space asked for one has.
@@ -892,9 +895,47 @@ impl GuestSpace {
         commit: CommitPolicy,
     ) -> MemResult<GuestAddr> {
         const OP: &str = "map_anonymous";
+        if self.sub.is_some() {
+            // 4 KiB guest pages (`subpage`): a fixed map is exact to 4 KiB; any other is placed on
+            // a host page of its own, and what it does not use of its last one is a hole.
+            let guest_len = self.check_guest_range(OP, placement_address(placement).unwrap_or(self.base), size)?;
+            let mut inner = self.write();
+            if let Placement::Fixed(address) = placement {
+                if self.needs_overlay(&inner, address, guest_len) {
+                    self.sub_apply(&mut inner, OP, address, guest_len, subpage_ops::SubOp::Map(protection, commit))?;
+                    inner.validate();
+                    return Ok(address);
+                }
+            }
+            let host_len = self.round_size(OP, guest_len)?;
+            let address = self.map_anonymous_locked(&mut inner, OP, placement, host_len, protection, commit)?;
+            if guest_len < host_len {
+                self.sub_apply(&mut inner, OP, address + guest_len, host_len - guest_len, subpage_ops::SubOp::Unmap)?;
+            }
+            inner.validate();
+            return Ok(address);
+        }
         let size = self.round_size(OP, size)?;
         let mut inner = self.write();
-        let address = self.place(&mut inner, OP, placement, size)?;
+        let address = self.map_anonymous_locked(&mut inner, OP, placement, size, protection, commit)?;
+        inner.validate();
+        Ok(address)
+    }
+
+    /// `map_anonymous` with the lock held and `size` whole host pages: placement, the map entry
+    /// and an eager commit.
+    fn map_anonymous_locked(
+        &self,
+        inner: &mut Inner,
+        operation: &'static str,
+        placement: Placement,
+        size: usize,
+        protection: Protection,
+        commit: CommitPolicy,
+    ) -> MemResult<GuestAddr> {
+        const OP: &str = "map_anonymous";
+        let _ = operation;
+        let address = self.place(inner, OP, placement, size)?;
         inner.make_exact_placeholder(OP, address, size, true)?;
 
         let owner = Owner {
@@ -930,11 +971,9 @@ impl GuestSpace {
                         "could not undo a mapping whose eager commit failed"
                     );
                 }
-                inner.validate();
                 return Err(error);
             }
         }
-        inner.validate();
         tracing::debug!(
             address = format_args!("{address:#x}"),
             size,
@@ -1089,6 +1128,17 @@ impl GuestSpace {
         protection: Protection,
     ) -> MemResult<()> {
         const OP: &str = "protect";
+        if self.sub.is_some() {
+            let len = self.check_guest_range(OP, address, len)?;
+            let mut inner = self.write();
+            inner.refuse_host(OP, address & !(self.page - 1), self.round_size(OP, len + address % self.page)?)?;
+            if self.needs_overlay(&inner, address, len) {
+                self.sub_apply(&mut inner, OP, address, len, subpage_ops::SubOp::Protect(protection))?;
+                inner.validate();
+                return Ok(());
+            }
+            drop(inner);
+        }
         let len = self.round_size(OP, len)?;
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
@@ -1125,6 +1175,25 @@ impl GuestSpace {
         }
         let len = bytes.len();
         self.check_range(OP, address, len)?;
+        if self.sub.is_some() {
+            let mut inner = self.write();
+            if self.needs_overlay(&inner, address & !(self.page - 1), self.round_size(OP, len + address % self.page)?) {
+                let mut done = 0;
+                for (at, piece, tracked) in self.pieces_by_tracking(&inner, address, len) {
+                    let chunk = &bytes[at - address..at - address + piece];
+                    if tracked {
+                        self.write_tracked(&mut inner, OP, at, chunk)?;
+                    } else {
+                        drop(inner);
+                        self.write_forced(at, chunk)?;
+                        inner = self.write();
+                    }
+                    done += piece;
+                }
+                inner.validate();
+                return Ok(done);
+            }
+        }
         let page = self.page;
         let span = address & !(page - 1);
         let span_end = (address + len + page - 1) & !(page - 1);
@@ -1201,12 +1270,24 @@ impl GuestSpace {
     /// [`MemError::Platform`].
     pub fn unmap(&self, address: GuestAddr, len: usize) -> MemResult<()> {
         const OP: &str = "unmap";
+        if self.sub.is_some() {
+            let len = self.check_guest_range(OP, address, len)?;
+            let mut inner = self.write();
+            inner.refuse_host(OP, address & !(self.page - 1), self.round_size(OP, len + address % self.page)?)?;
+            if self.needs_overlay(&inner, address, len) {
+                self.sub_apply(&mut inner, OP, address, len, subpage_ops::SubOp::Unmap)?;
+                inner.validate();
+                return Ok(());
+            }
+            drop(inner);
+        }
         let len = self.round_size(OP, len)?;
         self.check_aligned(OP, "address", address)?;
         self.check_range(OP, address, len)?;
         let mut inner = self.write();
         inner.refuse_host(OP, address, len)?;
         inner.unmap_range(OP, address, len)?;
+        self.forget_aliases(address, len);
         inner.validate();
         tracing::debug!(address = format_args!("{address:#x}"), len, "unmapped guest memory");
         Ok(())
@@ -1365,8 +1446,32 @@ impl GuestSpace {
         // A length that cannot be rounded up is outside any space, and `check_range` says so.
         let len = len.checked_next_multiple_of(SMALL_PAGE).unwrap_or(usize::MAX);
         self.check_range(OP, address, len)?;
-        let split = split_at_pages(address, len, self.page);
         let mut inner = self.write();
+        if self.sub.is_some() {
+            inner.refuse_host(OP, address & !(self.page - 1), self.round_size(OP, len + address % self.page)?)?;
+            let mut discarded = Discarded::default();
+            for (at, piece, tracked) in self.pieces_by_tracking(&inner, address, len) {
+                if tracked {
+                    discarded.zeroed += self.zero_tracked(&mut inner, OP, at, piece)?;
+                } else {
+                    let d = self.discard_untracked(&mut inner, OP, at, piece)?;
+                    discarded.decommitted += d.decommitted;
+                    discarded.zeroed += d.zeroed;
+                }
+            }
+            inner.validate();
+            return Ok(discarded);
+        }
+        let discarded = self.discard_untracked(&mut inner, OP, address, len)?;
+        inner.validate();
+        Ok(discarded)
+    }
+
+    /// `discard` of a range with no tracked host page, the lock held.
+    fn discard_untracked(&self, inner: &mut Inner, operation: &'static str, address: GuestAddr, len: usize) -> MemResult<Discarded> {
+        const OP: &str = "discard";
+        let _ = operation;
+        let split = split_at_pages(address, len, self.page);
         let mut discarded = Discarded::default();
         inner.refuse_host(OP, address, len)?;
         if let Some((at, whole)) = split.whole {
@@ -1376,7 +1481,10 @@ impl GuestSpace {
         for (at, part) in split.partial() {
             discarded.zeroed += inner.zero_in_place(OP, at, part)?;
         }
-        inner.validate();
+        if let Some((at, whole)) = split.whole {
+            // A decommitted page's alias would hold its old memory (SUBPAGE-ORDER 5).
+            self.forget_aliases(at, whole);
+        }
         Ok(discarded)
     }
 
@@ -1419,14 +1527,16 @@ impl GuestSpace {
     /// line the guest would expect to read.
     #[must_use]
     pub fn regions(&self) -> Vec<RegionInfo> {
-        self.read().regions(true)
+        let inner = self.read();
+        self.guest_view_regions(inner.regions(true), true)
     }
 
     /// Every *mapped* region, in address order: [`regions`](GuestSpace::regions) without the free
     /// ranges. This is the `/proc/self/maps` shape.
     #[must_use]
     pub fn mapped_regions(&self) -> Vec<RegionInfo> {
-        self.read().regions(false)
+        let inner = self.read();
+        self.guest_view_regions(inner.regions(false), false)
     }
 
     /// The parts of `[address, address + len)` that hold anything: committed private memory and
@@ -1491,8 +1601,10 @@ impl GuestSpace {
             if entry.is_free() {
                 return None;
             }
-            // Read under the same lock as the entry: the tag says which map this came from.
-            (self.generation.locked(), RegionInfo::from_entry(start, entry))
+            // Read under the same lock as the entry: the tag says which map this came from. With
+            // the 4 KiB overlay, the guest's view of it (SUBPAGE-ORDER 4).
+            let info = self.guest_view_of(RegionInfo::from_entry(start, entry), address)?;
+            (self.generation.locked(), info)
         };
         cache::remember(&self.generation, at, &region);
         Some(region)
@@ -1514,6 +1626,10 @@ impl GuestSpace {
     #[must_use]
     pub fn any_executable(&self, at: GuestAddr, len: usize) -> bool {
         let inner = self.read();
+        // A tracked host page's execute is its parts' (the host page never has it, `subpage`).
+        if self.any_executable_part(at, len) {
+            return true;
+        }
         let end = at.saturating_add(len);
         let mut cursor = at;
         while cursor < end {
@@ -1703,6 +1819,11 @@ impl core::fmt::Debug for GuestSpace {
 impl Drop for GuestSpace {
     fn drop(&mut self) {
         let mut inner = self.write();
+        if let Some(alias) = self.sub.as_ref().and_then(|sub| sub.state.lock().alias.take()) {
+            if let Err(error) = vm::release(alias) {
+                tracing::error!(%error, "the 4 KiB overlay's alias reservation could not be released");
+            }
+        }
         if let Err(error) = inner.release_all() {
             // Teardown failing means address space or commit charge has leaked for the life of the
             // process, which is exactly the kind of thing that must not be silent.
@@ -3320,5 +3441,13 @@ mod tests {
         assert_eq!(subtract(100, 100, 0, 1000), Vec::new());
         // A hole that does not intersect leaves the whole range, as one piece.
         assert_eq!(subtract(100, 100, 300, 400), vec![(100, 100)]);
+    }
+}
+
+/// The address a placement names, if it names one exactly.
+fn placement_address(placement: Placement) -> Option<GuestAddr> {
+    match placement {
+        Placement::Fixed(address) => Some(address),
+        Placement::Hint { .. } | Placement::Anywhere { .. } => None,
     }
 }
