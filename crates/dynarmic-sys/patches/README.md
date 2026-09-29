@@ -244,3 +244,13 @@ starts a fresh region, committed as it fills.
 Verified: `tests/shared_cache.rs::a_clear_gives_back_the_region_being_filled` (5.7 -> 3.0 MB
 committed, the prelude kept) and `a_full_region_is_not_a_flush_and_the_oldest_region_goes_first`'s
 clear (no live region after it).
+
+### 0031 — x64 shared cache: a clear gives back the block map
+
+x64. `ForgetAllBlocks` emptied the block map (and the patch-information map) with `clear()`, which
+keeps a `robin_map`'s bucket array: a process whose translations a trim dropped kept the map of its
+busiest moment. In PS99 the system's host process held 86 MiB of block maps for 562k live blocks
+(~157 bytes a block against ~64 at the load factor; run 2026-09-29, `OMNI_MEM_TRACE`'s census).
+Now a clear swaps in a new map at patch 0027's load factor (64 buckets, as a new cache starts).
+Verified: `tests/shared_cache.rs::a_clear_gives_back_the_region_being_filled` (4 MiB of block map
+for 60,001 blocks -> a new map); dynarmic-sys and omni-cpu suites green (incl. the MXCSR check).

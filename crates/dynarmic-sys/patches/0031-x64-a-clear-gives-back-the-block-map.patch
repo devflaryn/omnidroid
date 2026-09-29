@@ -1,0 +1,19 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index db7914c..b9c59e7 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -214,6 +214,14 @@ size_t A64EmitX64::ForgetAllBlocks() {
+     UnlinkAllSlots();
+     EmitX64::ClearCache();
+     ClearGuestRanges();
++    // Omnidroid patch 0031: the block map given back, not kept at the most blocks the cache ever
++    // held. `clear()` keeps a robin_map's bucket array, so a quiet process whose translations a
++    // trim dropped kept the map of its busiest moment (the system's host process: 86 MiB of block
++    // maps for 562k live blocks, run 2026-09-29) -- and the next block fills it from 64 buckets
++    // again, as a new cache does.
++    decltype(block_descriptors){}.swap(block_descriptors);
++    UseLoadFactor(block_descriptors, SHARED_BLOCK_MAP_LOAD_FACTOR);
++    decltype(patch_information){}.swap(patch_information);
+     return dropped;
+ }
+ 

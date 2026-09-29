@@ -100,6 +100,13 @@ impl Space {
         s
     }
 
+    fn tables(&self) -> OdCodeCacheTables {
+        let mut t = OdCodeCacheTables::default();
+        // SAFETY: the cache is live until `Drop`.
+        unsafe { od_code_cache_tables_of(self.cache as *mut c_void, &mut t) };
+        t
+    }
+
     fn rewrite(&self, index: usize, word: u32) {
         self.code[index].store(word, Ordering::SeqCst);
     }
@@ -1143,6 +1150,7 @@ fn a_clear_gives_back_the_region_being_filled() {
     assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
     assert_eq!(vm.reg(0), BLOCKS as u64);
     let filled = space.stats();
+    let map = space.tables().blocks;
     assert_eq!(filled.regions_live, 1, "the chain fits in one region: {filled:?}");
     assert!(filled.committed_bytes >= 4 << 20, "and committed several MiB of it: {filled:?}");
 
@@ -1152,6 +1160,11 @@ fn a_clear_gives_back_the_region_being_filled() {
     assert_eq!((cleared.regions_live, cleared.regions_pinned), (0, 0), "{cleared:?}");
     assert!(cleared.committed_bytes <= 4 << 20, "given back, the prelude kept: {cleared:?}");
     assert!(cleared.committed_bytes + (4 << 20) <= filled.committed_bytes, "{filled:?} -> {cleared:?}");
+    // Patch 0031: and the block map is a new one, not the emptied bucket array of 60,000 blocks.
+    let emptied = space.tables().blocks;
+    assert!(map.entries >= BLOCKS as u64 && map.bytes >= 1 << 20, "{map:?}");
+    assert_eq!(emptied.entries, 0);
+    assert!(emptied.bytes <= 64 << 10, "the map given back: {map:?} -> {emptied:?}");
 
     // The same jit runs on: its next blocks start a fresh region.
     vm.set_reg(0, 0);
