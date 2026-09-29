@@ -240,7 +240,7 @@ fn cpuinfo(_p: &Process) -> Vec<u8> {
 }
 
 fn meminfo(_p: &Process) -> Vec<u8> {
-    let total = 8u64 << 20; // kB: D36 caps the device at 8 GiB
+    let total = crate::sys::device_ram() >> 10; // kB
     let mut out = String::new();
     let _ = write!(out, "MemTotal:       {total} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\n", total / 2, total / 2);
     let _ = write!(out, "Buffers:        0 kB\nCached:         0 kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n");

@@ -738,11 +738,25 @@ fn sys_umask(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(u64::from(p.sys.umask.swap(a[0] as u32 & 0o777, std::sync::atomic::Ordering::Relaxed)))
 }
 
+/// The device's RAM, in bytes: what `/proc/meminfo`'s `MemTotal` and `sysinfo`'s `totalram` say,
+/// which Android (`ActivityManager.MemoryInfo.totalMem`) and apps size themselves by -- Roblox's
+/// engine its caches and graphics tier (D36). 8 GiB, D36's cap, unless `OMNI_DEVICE_RAM_MB` says
+/// otherwise (1024..=16384), as an emulator's RAM setting does. Only a figure: nothing is reserved.
+#[must_use]
+pub fn device_ram() -> u64 {
+    static RAM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RAM.get_or_init(|| {
+        let mb = std::env::var("OMNI_DEVICE_RAM_MB").ok().and_then(|v| v.parse::<u64>().ok()).filter(|mb| (1024..=16384).contains(mb));
+        mb.map_or(8 << 30, |mb| mb << 20)
+    })
+}
+
 fn sys_sysinfo(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut b = [0u8; 112];
     b[..8].copy_from_slice(&monotonic().as_secs().to_le_bytes()); // uptime
-    b[32..40].copy_from_slice(&(8u64 << 30).to_le_bytes()); // totalram (D36 caps the device at 8 GiB)
-    b[40..48].copy_from_slice(&(4u64 << 30).to_le_bytes()); // freeram
+    let total = device_ram();
+    b[32..40].copy_from_slice(&total.to_le_bytes()); // totalram
+    b[40..48].copy_from_slice(&(total / 2).to_le_bytes()); // freeram
     b[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs
     b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
     p.mem.write(a[0], &b)?;
