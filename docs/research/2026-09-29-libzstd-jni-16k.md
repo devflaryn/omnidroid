@@ -98,3 +98,33 @@ The obvious suspect for a self-decrypting, obfuscated library is **stale transla
 constructors decrypt `.text` in place and then run it. On arm64, `Open` in `docs/ports/macos.md`
 records a mid-run cache-clear defect: patch 0031 is here, but `arm64-clear-audit`'s patch 0023 is
 not merged. Not yet tested.
+
+## Probes (2026-09-29, 19:30-20:20; `0583853`'s switches)
+
+| run | switch (the app's host process only) | outcome |
+|---|---|---|
+| probe 1 | `OMNI_SMC_PROBE=libzstd-jni` | same crash |
+| probe 2 | `OMNI_DYNARMIC_OPT_APP=0` (no JIT optimisations) | same crash |
+| probe 3 | `OMNI_JIT_EXCLUSIVE_MONITOR_APP=global` | **no crash**: joined PS99, `onGameLoaded`, the world began to draw; the session ended in PS99's loading screen at ~1 presented frame/s |
+| probe 4 | the same as probe 3, 20 minutes | same crash, 17 min in |
+
+Probe 1 saw the unpacker's sequence: an RWX → RX of 11 MB at `+0x5a0000` (the decrypted code; the
+crash's lr lies in it), and `munmap`s of its own ELF header. Every range was invalidated
+everywhere, and nothing changed.
+
+In every run the crash is in the **relaunch after the cookie is planted** (the logged-in flow); the
+first, logged-out launch survives.
+
+**Ruled out:** stale translations across `mprotect`/`munmap`, JIT optimisation passes, and the page
+size.
+
+**Not decisive:** the exclusive monitor. The crash is intermittent: one clean run in five, across
+different switches.
+
+**Next candidates:**
+* an arm64-backend codegen or memory-ordering difference, with the x64 backend as reference: the
+  same APK works on Windows/Linux, and an x86-64 build under Rosetta would run it on this Mac;
+* a real race in the app that the Mac's timing exposes.
+
+The 4 KiB overlay serves 20-350 accesses/s per process in these runs (`OMNI_SPLIT_REPORT`), which
+is not what makes rendering slow.
