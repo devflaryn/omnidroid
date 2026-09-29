@@ -68,6 +68,18 @@ always have 4 KiB pages.
    TLB shootdown each time. Instead, a split host page gets a read-write **alias**: the same memory,
    mapped a second time.
 
+## Amendment (2026-09-29, during Task 8)
+
+**`PROT_NONE` parts are lenient by default.** A `PROT_NONE` 4 KiB beside accessible parts of its
+host page does not lower that page's host protection, unless its range is strict
+(`OMNI_STRICT_GAPS`) or `OMNI_STRICT_PROT_NONE=1`.
+
+Why: `linker64` leaves `PROT_NONE` reservation filler in every library's last host page. Enforcing
+it cost the `vdso` fixture about 250,000 traps (about 37 µs per clock call), and the GPU and display
+tests timed out. Lenient, the fixture takes 670 traps and they pass.
+
+This replaces "explicit `PROT_NONE` is always enforced" below.
+
 ## Design
 
 ### Terms
