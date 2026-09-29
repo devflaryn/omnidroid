@@ -7,12 +7,13 @@
 #   tools/aosp_play.sh --apk ~/Desktop/Roblox-2.740.931.apk --cookie cookie.txt --place 8737899170
 #   tools/aosp_play.sh --minutes 60 --size 1600x900
 #   tools/aosp_play.sh --not-resizable | --with-systemui | --show-chrome
+#   tools/aosp_play.sh --target x86_64-apple-darwin ...     # the x64 backend under Rosetta 2
 #
 # The session ends after --minutes (default 30). The whole log is in $TMPDIR/omni-linux-r-<pid>.log;
 # screenshots of the display in $TMPDIR/omni-linux-r-<pid>-shots. The sysroot is sysroot/aosp-35
 # (tools/make_sysroot.py) or OMNI_SYSROOT. On macOS the guest's low 4 GiB are a based window (D41).
 set -eu
-apk="" cookie="" place="" minutes=30 size=""
+apk="" cookie="" place="" minutes=30 size="" target=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
@@ -21,6 +22,7 @@ while [ $# -gt 0 ]; do
         --place) place="$2"; shift 2 ;;
         --minutes) minutes="$2"; shift 2 ;;
         --size) size="$2"; shift 2 ;;
+        --target) target="$2"; shift 2 ;;
         --not-resizable) export OMNI_R_RESIZABLE=0; shift ;;
         --with-systemui) export OMNI_R_KIOSK=0; shift ;;
         --show-chrome) export OMNI_APP_ONLY=0; shift ;;
@@ -40,4 +42,10 @@ export OMNI_R_KIOSK="${OMNI_R_KIOSK:-1}"
 # crates/dynarmic-sys/build.rs.
 rm -f "${TMPDIR:-/tmp}"/omni-shm-* 2>/dev/null || true
 cd "$repo"
+if [ -n "$target" ]; then
+    # Another architecture's build on this Mac (x86-64 under Rosetta 2): Apple's libc++ needs a
+    # deployment target of 13 for what dynarmic uses.
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+    exec cargo test --release -q --target "$target" -p omni-linux --test r_roblox -- --ignored --nocapture
+fi
 exec cargo test --release -q -p omni-linux --test r_roblox -- --ignored --nocapture

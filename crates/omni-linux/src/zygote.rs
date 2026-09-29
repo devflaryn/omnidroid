@@ -187,17 +187,20 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     if nice.is_some() && std::env::var("OMNI_SIGNAL_TRACE_APP").ok().as_deref() == nice {
         cmd.env("OMNI_SIGNAL_TRACE", "1");
     }
-    // OMNI_DYNARMIC_OPT_APP=<hex mask>: an app's host process runs with only these JIT
-    // optimizations (`OMNI_DYNARMIC_OPT`; 0 for none) -- the system keeps its own, so the boot is
-    // not slowed into system_server's Watchdog while an app's translation is under suspicion.
-    if nice.is_some() {
-        if let Ok(mask) = std::env::var("OMNI_DYNARMIC_OPT_APP") {
-            cmd.env("OMNI_DYNARMIC_OPT", mask);
-        }
-        // OMNI_JIT_EXCLUSIVE_MONITOR_APP=global|value: an app's exclusive monitor, the system's
-        // left as it is (the global monitor costs about ten times per atomic).
-        if let Ok(monitor) = std::env::var("OMNI_JIT_EXCLUSIVE_MONITOR_APP") {
-            cmd.env("OMNI_JIT_EXCLUSIVE_MONITOR", monitor);
+    // Per-app CPU switches, `<process name>:<value>`, that process only -- the system keeps its own,
+    // so the boot is not slowed into system_server's Watchdog (nor its other apps changed):
+    //   OMNI_DYNARMIC_OPT_APP=<name>:<hex mask>       only these JIT optimizations (`OMNI_DYNARMIC_OPT`)
+    //   OMNI_JIT_EXCLUSIVE_MONITOR_APP=<name>:global  the exclusive monitor (`OMNI_JIT_EXCLUSIVE_MONITOR`)
+    //   OMNI_JIT_FORCE_ORDERED_APP=<name>:1           every guest access fenced (a dynarmic probe)
+    if let Some(n) = nice {
+        for (knob, var) in [
+            ("OMNI_DYNARMIC_OPT_APP", "OMNI_DYNARMIC_OPT"),
+            ("OMNI_JIT_EXCLUSIVE_MONITOR_APP", "OMNI_JIT_EXCLUSIVE_MONITOR"),
+            ("OMNI_JIT_FORCE_ORDERED_APP", "OMNI_JIT_FORCE_ORDERED"),
+        ] {
+            if let Some(value) = std::env::var(knob).ok().and_then(|v| v.strip_prefix(&format!("{n}:")).map(str::to_string)) {
+                cmd.env(var, value);
+            }
         }
     }
     // OMNI_THREAD_DUMP_APP=<process name>: that app's host process lists its threads waiting in a
