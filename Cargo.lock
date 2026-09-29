@@ -309,6 +309,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-debug"
+version = "0.1.0"
+dependencies = [
+ "omni-cpu",
+ "omni-elf",
+ "omni-mem",
+ "omni-platform",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "omni-elf"
 version = "0.1.0"
 dependencies = [
