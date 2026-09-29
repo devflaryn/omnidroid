@@ -1243,7 +1243,10 @@ fn image_target(h: &Host, p: &Process, kind: u64, target: u32, image: u64, handl
         // SAFETY: a texture of the current context, complete (level 0, no mipmap filter).
         img.host_image = unsafe { (h.egl.create_image)(h.display, ctx, EGL_GL_TEXTURE_2D_KHR, texture as usize, attribs.as_ptr()) };
         if img.host_image == 0 {
-            eprintln!("[gl] eglCreateImageKHR(EGL_GL_TEXTURE_2D_KHR) failed, eglGetError {:#x}", unsafe { (h.egl.get_error)() });
+            eprintln!(
+                "[gl] eglCreateImageKHR(EGL_GL_TEXTURE_2D_KHR) for a {width}x{height} buffer of format {format:#x} failed, eglGetError {:#x}",
+                unsafe { (h.egl.get_error)() }
+            );
         }
         info.images.insert(image, img);
     } else if let Some(img) = info.images.get_mut(&image) {
