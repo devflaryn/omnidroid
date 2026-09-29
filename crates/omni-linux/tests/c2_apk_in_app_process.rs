@@ -43,7 +43,6 @@ fn text(b: &Buf) -> String {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "macOS arm64 maps nothing below 4 GiB, where ART's heap must be (C design: Mac)")]
 fn c2_an_apk_loads_in_an_app_process() {
     let Some(sysroot) = common::sysroot() else { return };
     let Some(apk) = std::env::var_os("OMNI_TEST_APK").map(PathBuf::from) else {
@@ -80,12 +79,23 @@ fn c2_an_apk_loads_in_an_app_process() {
     std::fs::create_dir_all(&lib).unwrap();
     std::fs::copy(&apk, app.join("base.apk")).unwrap();
     let mut libs = Vec::new();
+    // A library aligned below the device's page (16 KiB on Apple silicon: the APK's
+    // `libzstd-jni-*.so` has `p_align` 0x1000) loads too: the kernel lays it out for the page
+    // when the app opens it (`omni_linux::pagecompat`).
+    let mut below_page = Vec::new();
+    let mut dex_files = 0;
     {
         let mut zip = zip_entries(&apk);
         for (name, bytes) in zip.drain(..) {
             if let Some(file) = name.strip_prefix("lib/arm64-v8a/") {
+                let short = file.trim_start_matches("lib").trim_end_matches(".so").to_string();
+                if min_load_align(&bytes) < omni_platform::vm::page_size() as u64 {
+                    below_page.push(short.clone());
+                }
                 std::fs::write(lib.join(file), bytes).unwrap();
-                libs.push(file.trim_start_matches("lib").trim_end_matches(".so").to_string());
+                libs.push(short);
+            } else if name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/') {
+                dex_files += 1;
             }
         }
     }
@@ -113,7 +123,13 @@ fn c2_an_apk_loads_in_an_app_process() {
         "/data/app/com.roblox.client/base.apk",
         "/data/app/com.roblox.client/lib/arm64",
     ];
-    argv.extend(libs.iter().map(String::as_str));
+    // Not `zstd-jni`: in 2.740.931 it is a packed library whose `JNI_OnLoad` calls into
+    // `libroblox.so`, which asks the running app for its objects -- a bare `app_process` has no
+    // `Application`, and CheckJNI aborts on the null it gets. It is laid out for the page, loaded
+    // and decrypted by then (`pagecompat`, the widened `mprotect`); the real launch (`r_roblox`)
+    // is where it runs.
+    let native: Vec<&String> = libs.iter().filter(|l| !l.starts_with("zstd-jni")).collect();
+    argv.extend(native.iter().map(|l| l.as_str()));
     let (app_process, out, err) = spawn(&sysroot, &instance, &argv, &env, 10_000);
     let (sm, _, _) = spawn(&sysroot, &instance, &["/system/bin/servicemanager"], &[], 1000);
     let sm_run = Arc::clone(&sm);
@@ -123,15 +139,29 @@ fn c2_an_apk_loads_in_an_app_process() {
     let status = app_process.run();
     let printed = text(&out);
     assert_eq!(status, ExitStatus::Exited(0), "{printed}\n{}", text(&err));
-    assert!(printed.contains("dex files in the APK: 3"), "{printed}");
-    for l in &libs {
-        assert!(printed.contains(&format!("loaded lib{l}.so")), "lib{l}.so\n{printed}\n{}", text(&err));
+    assert!(printed.contains(&format!("dex files in the APK: {dex_files}")), "{dex_files} classes*.dex in the APK\n{printed}");
+    for l in native {
+        let why = if below_page.contains(l) { " (aligned below the page: pagecompat)" } else { "" };
+        assert!(printed.contains(&format!("loaded lib{l}.so")), "lib{l}.so{why}\n{printed}\n{}", text(&err));
     }
     assert!(text(&err).contains("using isolated ns clns-"), "the app's own linker namespace\n{}", text(&err));
     sm.end(ExitStatus::Exited(0));
 }
 
-/// Every entry of a zip (stored or deflated), by name.
+/// The least `p_align` of an ELF64's `PT_LOAD` segments (`u64::MAX` for none).
+fn min_load_align(elf: &[u8]) -> u64 {
+    let u16_at = |at: usize| u16::from_le_bytes([elf[at], elf[at + 1]]) as usize;
+    let u64_at = |at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap());
+    let (phoff, phentsize, phnum) = (u64_at(0x20) as usize, u16_at(0x36), u16_at(0x38));
+    (0..phnum)
+        .map(|i| phoff + i * phentsize)
+        .filter(|&ph| u32::from_le_bytes(elf[ph..ph + 4].try_into().unwrap()) == 1)
+        .map(|ph| u64_at(ph + 48))
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+/// Every entry of a zip by name, with its bytes (stored or deflated) for the arm64 libraries.
 fn zip_entries(path: &Path) -> Vec<(String, Vec<u8>)> {
     let data = std::fs::read(path).unwrap();
     let u16_at = |at: usize| u16::from_le_bytes([data[at], data[at + 1]]) as usize;
@@ -148,6 +178,8 @@ fn zip_entries(path: &Path) -> Vec<(String, Vec<u8>)> {
         let name = String::from_utf8_lossy(&data[at + 46..at + 46 + nlen]).into_owned();
         at += 46 + nlen + xlen + clen;
         if !name.starts_with("lib/arm64-v8a/") {
+            // Named, not read: only the arm64 libraries are extracted.
+            out.push((name, Vec::new()));
             continue;
         }
         let body = local + 30 + u16_at(local + 26) + u16_at(local + 28);

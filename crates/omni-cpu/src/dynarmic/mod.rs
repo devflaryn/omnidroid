@@ -294,6 +294,19 @@ pub struct DynarmicOptions {
     /// access, the cost of D4's rule for below-64-bit configurations) and the callback path
     /// clears it before resolving.
     pub top_byte_ignore: bool,
+    /// Whether a guest access the demand pager declines -- a fault the guest meant, such as ART's
+    /// implicit null check, which loads through a null object and turns the `SIGSEGV` into a
+    /// `NullPointerException` -- also moves that instruction onto the callback path **for good**
+    /// (dynarmic's `recompile_on_fastmem_failure`). Either way that one access reaches the callback
+    /// and becomes a typed exit.
+    ///
+    /// **Default `true`**, as the Roblox path always ran. The Linux personality turns it off: its
+    /// guests fault on purpose, and each such instruction's next, valid execution would take the
+    /// callback path -- which the per-slice invariant ([`CpuError::DegradedMemoryPath`]) rightly
+    /// kills, and which on arm64 (MEASURED, D41: `b_hello_dex`, 4 of 6 runs killed at `exit_group`
+    /// after one null check) nothing else prevents. x64's shared code cache never recompiles, so
+    /// this only changes what arm64 hosts do.
+    pub recompile_on_declined_fault: bool,
 }
 
 impl Default for DynarmicOptions {
@@ -312,6 +325,7 @@ impl Default for DynarmicOptions {
             // is the way back, announced.
             exclusive_monitor: ExclusiveMonitor::ValueCompare,
             top_byte_ignore: false,
+            recompile_on_declined_fault: true,
             optimizations_override: None,
             // D38 amendment 2, decided 2026-09-25 on x64: in PS99 with w20's drag script, w27/w29
             // (shared) against w28 (per-thread) -- 0 s under 20 fps during input against 14 s
@@ -365,7 +379,9 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_EXCLUSIVE_MONITOR=global|value` -- [`ExclusiveMonitor`];
     /// * `OMNI_JIT_OPTIMIZATIONS=<hex mask>` -- [`optimizations_override`](Self::optimizations_override);
     /// * `OMNI_JIT_CHECK_HALT_ON_MEMORY=0|1` -- [`check_halt_on_memory_access`](Self::check_halt_on_memory_access);
-    /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`].
+    /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
+    /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
+    ///   where each thread has its own cache (arm64).
     ///
     /// Called by [`DynarmicBackend::new`], so every backend in the process sees the same switches.
     ///
@@ -377,6 +393,11 @@ impl DynarmicOptions {
         fn say(text: &str) {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "JIT SWITCH: {text}");
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_CODE_CACHE_MB") {
+            let mib: u64 = value.parse().unwrap_or_else(|_| panic!("OMNI_JIT_CODE_CACHE_MB={value:?} is not a number of MiB"));
+            self.code_cache_size = mib << 20;
+            say(&format!("code cache {mib} MiB per thread (OMNI_JIT_CODE_CACHE_MB)"));
         }
         if let Ok(value) = std::env::var("OMNI_JIT_EXCLUSIVE_MONITOR") {
             self.exclusive_monitor = match value.trim() {
@@ -553,6 +574,7 @@ fn thread_config(
     tpidrro_el0: *const u64,
     processor_id: u32,
     overrides: Overrides,
+    low_window_delta: Option<u64>,
 ) -> OdConfig {
     OdConfig {
         abi_version: OD_DYNARMIC_ABI_VERSION,
@@ -574,13 +596,16 @@ fn thread_config(
         // **"Faults" means "is unmapped in the HOST process", and that is narrower than it
         // reads.** See this module's documentation, under "What fastmem does not check".
         fastmem_enabled: i32::from(overrides.direct_access.unwrap_or(true)),
-        fastmem_pointer: 0,
+        // D41: a space with a low window (macOS: nothing maps below 4 GiB) has its guest's low
+        // 4 GiB at `delta + address`; dynarmic adds the base below 2^32 only (patch 0030), and
+        // above it this is still the identity.
+        fastmem_pointer: low_window_delta.unwrap_or(0),
         // Top Byte Ignore (`DynarmicOptions::top_byte_ignore`): 56 bits, mirrored, is dynarmic's
         // mask of the top byte on every direct access -- aliasing across the top byte is exactly
         // what the architecture specifies, and an address with nothing behind it still faults.
         fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(if options.top_byte_ignore { 56 } else { 64 }),
         silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(options.top_byte_ignore)),
-        recompile_on_fastmem_failure: 1,
+        recompile_on_fastmem_failure: i32::from(options.recompile_on_declined_fault),
         // Task 2's review measured this: off gives 1 slow-path read plus 1 exclusive callback
         // per `LDXR`, on gives 0, which matters because D5 lists the global exclusive monitor's
         // 21x anti-scaling as a primary risk.
@@ -606,6 +631,7 @@ fn thread_config(
         // `optimizations` exactly when this is 1 -- dynarmic requires both.
         unsafe_optimizations: i32::from(options.unsafe_optimizations()),
         optimizations: options.optimizations(),
+        fastmem_low_window: i32::from(low_window_delta.is_some()),
     }
 }
 
@@ -699,6 +725,12 @@ impl Planted {
     }
 }
 
+/// The jits of one guest address space's contexts, as addresses. A context is in it from the
+/// moment its jit exists until just before the jit is freed, and every use holds the lock, so an
+/// address read from it is a live jit for as long as the lock is held.
+#[derive(Default)]
+pub(crate) struct Peers(pub(crate) parking_lot::Mutex<Vec<usize>>);
+
 /// What every context of one guest address space shares.
 struct Shared {
     space: Arc<GuestSpace>,
@@ -716,6 +748,11 @@ struct Shared {
     /// [`DynarmicBackend::owns_guest_paging`].
     _pager: Option<DemandPager>,
     owns_guest_paging: bool,
+    /// The jits of this space's contexts, when each has its own translation cache (no shared cache:
+    /// arm64). A guest's `IC IVAU` is broadcast to all of them, as the architecture broadcasts it
+    /// to every core of the inner-shareable domain; with a shared cache one invalidation of it is
+    /// every context's already. See `callbacks::cb_icache_op`.
+    peers: Arc<Peers>,
     /// Processor ids handed back by dropped contexts.
     ///
     /// Recycled rather than monotonic, because a `processor_id` indexes into the shared exclusive
@@ -847,6 +884,7 @@ impl DynarmicBackend {
                 &tpidrro,
                 0,
                 Overrides::default(),
+                extent.low_window_delta(),
             );
             // D38 amendment 3 (vendored patch 0028): regions are filled one at a time and a full
             // one stays live; past `shared_code_live_bytes` the oldest is retired, and only its
@@ -903,6 +941,7 @@ impl DynarmicBackend {
                 options,
                 _pager: pager,
                 owns_guest_paging,
+                peers: Arc::new(Peers::default()),
                 free_processors: parking_lot::Mutex::new(Vec::new()),
                 next_processor: AtomicU32::new(0),
                 ids_released_early: AtomicU64::new(0),
@@ -1007,6 +1046,22 @@ impl DynarmicBackend {
             // SAFETY: the cache is live for `self.shared`'s life; this is not called from inside a
             // callback (the backend has none -- only its contexts do).
             unsafe { od_code_cache_invalidate_range(cache.0, range.start() as u64, range.len() as u64) };
+        }
+    }
+
+    /// Drop the translations of `range` on **every** context of this backend: the shared cache's,
+    /// or each context's own (arm64). What a kernel owes the instruction cache when the guest
+    /// changes code by other means than `IC IVAU` -- remapping it, or re-protecting it executable.
+    /// Callable from inside a context's callback (a system call): `od_jit_invalidate_range` is
+    /// queued for a jit that is executing.
+    pub fn invalidate_code_everywhere(&self, range: GuestRange) {
+        if self.shared.code_cache.is_some() {
+            return self.invalidate_code(range);
+        }
+        for &jit in self.shared.peers.0.lock().iter() {
+            // SAFETY: a peer is live while it is in the list (a context leaves it, under this
+            // lock, before its jit is freed); the call is safe from any thread and callback.
+            unsafe { od_jit_invalidate_range(jit as *mut core::ffi::c_void, range.start() as u64, range.len() as u64) };
         }
     }
 
@@ -1493,6 +1548,10 @@ pub(crate) struct CpuCtx {
     /// for M2's file-backed image; reachable the moment a guest JIT exists. It was also written and
     /// never read, which is how it survived review.
     pub(crate) executable_cache: Option<(GuestAddr, GuestAddr, bool)>,
+    /// Data accesses the slow path served through a split host page's alias (the 4 KiB overlay,
+    /// `omni_mem::subpage`): allowed by the guest's view, refused by the host page. Not a degraded
+    /// block -- the slice invariant subtracts them.
+    pub(crate) split_served: u64,
 
     pub(crate) thunks: BTreeSet<GuestAddr>,
     /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
@@ -1538,6 +1597,8 @@ pub(crate) struct CpuCtx {
     /// instead of this context's own, and how many of this context's roles (thunk, inline thunk,
     /// sentinel) plant each address it counted in.
     pub(crate) shared_plants: Option<Arc<Planted>>,
+    /// This space's other contexts' jits, for a guest `IC IVAU` to reach (none with a shared cache).
+    pub(crate) peers: Option<Arc<Peers>>,
     pub(crate) plants_here: std::collections::HashMap<GuestAddr, u32>,
     pub(crate) ticks_remaining: u64,
     pub(crate) ticks_used: u64,
@@ -1644,6 +1705,7 @@ impl DynarmicCpu {
             extent: config.space(),
             jit: core::ptr::null_mut(),
             executable_cache: None,
+            split_served: 0,
             thunks: BTreeSet::new(),
             inline_thunks: inline_table::InlineThunks::default(),
             svc_handler: None,
@@ -1660,6 +1722,7 @@ impl DynarmicCpu {
             last_fetch: 0,
             seen_blocks: None,
             shared_plants: None,
+            peers: shared.code_cache.is_none().then(|| Arc::clone(&shared.peers)),
             plants_here: std::collections::HashMap::new(),
             ticks_remaining: 0,
             ticks_used: 0,
@@ -1680,6 +1743,7 @@ impl DynarmicCpu {
             &*tpidrro_el0,
             processor_id,
             overrides,
+            shared.extent.low_window_delta(),
         );
 
         // D38: a context of a space with a shared code cache runs from it -- unless it is one of
@@ -1744,6 +1808,9 @@ impl DynarmicCpu {
         }
 
         let armed = options.assert_callback_free_slices && shared.owns_guest_paging;
+        if shared.code_cache.is_none() {
+            shared.peers.0.lock().push(jit as usize);
+        }
 
         Ok(Self {
             jit,
@@ -1784,6 +1851,7 @@ impl DynarmicCpu {
         MemoryMapping {
             direct_access: observed.fastmem_enabled != 0,
             host_base: observed.fastmem_pointer,
+            low_window: observed.fastmem_low_window != 0,
             address_bits: observed.fastmem_address_space_bits,
             mirrors_out_of_range: observed.silently_mirror_fastmem != 0,
             page_table_present: observed.page_table_present != 0,
@@ -1827,6 +1895,13 @@ impl DynarmicCpu {
         // SAFETY: the jit is live, and `&self` cannot overlap a `run` — `run` takes `&mut self`.
         // The counter is non-atomic and written only by callbacks, which run on this thread.
         unsafe { od_jit_slow_path_total(self.jit) }
+    }
+
+    /// Data accesses this context's slow path served through a split host page's alias (the 4 KiB
+    /// overlay). Zero wherever the host page is the guest's.
+    #[must_use]
+    pub fn split_served(&self) -> u64 {
+        self.with_ctx(|ctx| ctx.split_served)
     }
 
     /// How many run slices were found to have degraded onto the callback path.
@@ -1956,6 +2031,10 @@ impl Drop for DynarmicCpu {
                 unsafe { od_code_cache_invalidate_range(cache.0, address as u64, 4) };
             }
         }
+        // Out of the peers first, under their lock: no other context's `IC IVAU` can then be
+        // reaching this jit when it is freed.
+        let jit = self.jit as usize;
+        self.shared.peers.0.lock().retain(|&p| p != jit);
         // SAFETY: `&mut self` means nothing is executing, and the jit is freed exactly once. It is
         // freed before `ctx`, `tpidr_el0` and `tpidrro_el0` — which are dropped after this — and
         // before the `Arc<Shared>` that owns the monitor it points at.
@@ -2076,6 +2155,7 @@ impl GuestCpu for DynarmicCpu {
             // and one after, on the jit's own thread, around a slice that is a million guest
             // instructions by default.
             let callbacks_before = self.slice_invariant_armed.then(|| self.slow_path_entries());
+            let served_before = self.with_ctx(|ctx| ctx.split_served);
 
             // SAFETY: the jit is live; `&mut self` means no `&mut CpuCtx` is outstanding at this
             // call site; every callback contains its own panics. This executes attacker-controlled
@@ -2109,7 +2189,12 @@ impl GuestCpu for DynarmicCpu {
             // a re-entered jit and an escaped C++ exception both mean the jit is in an
             // uncharacterised state, which subsumes anything this could say about it.
             if let Some(before) = callbacks_before {
-                let delta = self.slow_path_entries().saturating_sub(before);
+                // An access the 4 KiB overlay's slow path served through a split page's alias is
+                // not a block that stopped reaching memory directly: the host page refuses what
+                // the guest's 4 KiB page allows, so the callback is the only way there
+                // (`omni_mem::subpage`). Those entries are not counted against the slice.
+                let served = self.with_ctx(|ctx| ctx.split_served).saturating_sub(served_before);
+                let delta = self.slow_path_entries().saturating_sub(before).saturating_sub(served);
                 if delta != 0 {
                     // The one exemption, and it is narrow on purpose: a genuine guest fault
                     // *arrives* through the callback, so it increments the counter. Anything else

@@ -112,6 +112,13 @@ impl Process {
         self.backend.as_ref().and_then(|b| b.code_cache_stats()).map_or(0, |s| s.code_bytes_emitted)
     }
 
+    /// Drop the translations of `[start, start + len)` on every thread of this process.
+    pub(crate) fn invalidate_code(&self, start: u64, len: u64) {
+        if let (Some(b), Ok(range)) = (&self.backend, omni_cpu::GuestRange::new(start as usize, len as usize)) {
+            b.invalidate_code_everywhere(range);
+        }
+    }
+
     /// Drop its translations (`crate::code_trim`).
     pub fn trim_code(&self) {
         if let Some(b) = &self.backend {
@@ -179,7 +186,9 @@ fn signal_trace() -> bool {
 /// (compressed references are 32 bits; the boot image goes near `ART_BASE_ADDRESS`, 0x70000000),
 /// and a guest address is a host address (D4). The host may already hold pieces of that range --
 /// Windows keeps `KUSER_SHARED_DATA` at `0x7FFE0000` in every process -- and the space steps
-/// around them (`GuestSpaceConfig::around_host`).
+/// around them (`GuestSpaceConfig::around_host`). A host that maps nothing that low (macOS: a hard
+/// 4 GiB `__PAGEZERO`) gets the same guest layout with its part below 4 GiB backed elsewhere
+/// (`GuestSpaceConfig::low_window`, D41).
 const GUEST_SPACE_LOW_BASE: usize = 0x1000_0000;
 
 /// The least of a low space that must be free for it to be taken: the host's own pieces of that
@@ -195,8 +204,25 @@ const LOW_SPACE_MIN_FREE: usize = GUEST_SPACE_BYTES / 2;
 /// piece of the range, and a space reserved around everything else "succeeded" with 1 MiB free of
 /// 64 GiB: every service init started after that failed to map its first segment (D5, ~1 boot in
 /// 3, right after odsign stopped). Such a space is given back and the host chooses.
+/// A default-sized space with the guest's 4 KiB pages (D42), for a process that is not one of the
+/// system's own (a stand-in, a handler test).
+fn small_space() -> GuestSpace {
+    GuestSpace::with_config(GuestSpaceConfig { guest_page: Some(omni_mem::GUEST_PAGE), ..GuestSpaceConfig::default() }).expect("a guest space")
+}
+
 pub fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
-    let config = |base: Option<usize>| GuestSpaceConfig { base, size: GUEST_SPACE_BYTES, around_host: base.is_some(), ..GuestSpaceConfig::default() };
+    // D41: below the host's floor the low range cannot be the host's own; it is a based window.
+    let low_window = omni_platform::vm::lowest_mappable_address() > GUEST_SPACE_LOW_BASE;
+    let config = |base: Option<usize>| GuestSpaceConfig {
+        base,
+        size: GUEST_SPACE_BYTES,
+        around_host: base.is_some(),
+        low_window: low_window && base.is_some(),
+        // 4 KiB pages for the guest on every host (D42): a sub-page overlay where the host's page
+        // is larger (`omni_mem::subpage`), nothing at all where it is 4 KiB.
+        guest_page: Some(omni_mem::GUEST_PAGE),
+        ..GuestSpaceConfig::default()
+    };
     match GuestSpace::with_config(config(Some(GUEST_SPACE_LOW_BASE))) {
         Ok(low) if low.stats().free >= LOW_SPACE_MIN_FREE => Ok(low),
         low => {
@@ -572,6 +598,7 @@ impl Process {
             all.retain(|w| w.strong_count() > 0);
             all.push(Arc::downgrade(&p));
         }
+        split_report_start();
         // `/proc` and `/sys` are generated from the process itself (`procfs`).
         let proc: Arc<dyn crate::procfs::ProcFs> = Arc::clone(&p) as Arc<dyn crate::procfs::ProcFs>;
         p.vfs.attach_proc(Arc::downgrade(&proc));
@@ -618,7 +645,22 @@ impl Process {
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
         // 512 guest threads: ART alone starts about twenty, Roblox runs dozens, and system_server
         // well over a hundred (the value-compare monitor costs nothing per slot unused).
-        let mut options = DynarmicOptions { top_byte_ignore: true, max_threads: 512, ..DynarmicOptions::default() };
+        // A fault the guest means (ART's implicit null checks) is served once through the callback,
+        // not by moving the instruction there for good (`recompile_on_declined_fault`).
+        let mut options = DynarmicOptions {
+            top_byte_ignore: true,
+            max_threads: 512,
+            recompile_on_declined_fault: false,
+            // An app's threads get a 128 MiB code cache each (where a thread has its own: arm64).
+            // At dynarmic's 8 MiB minimum a large app's startup thread fills its cache and clears
+            // it again and again, retranslating what it runs: Roblox 2.740.931's main thread spent
+            // two thirds of its time translating, its packed library's initialisation came ~19 s
+            // after load -- past the ~20 s its own worker allows (a null table, SIGSEGV at 0x40) --
+            // and in-world it drew 1-3 frames a second. At 128 MiB: 9.8 s, no crash, 18-44 fps.
+            // A reservation, committed as used. The system's processes keep the minimum.
+            code_cache_size: if std::env::var_os("OMNI_LINUX_APP").is_some() { 128 << 20 } else { 8 << 20 },
+            ..DynarmicOptions::default()
+        };
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             options.optimizations_override = Some(mask);
         }
@@ -644,7 +686,7 @@ impl Process {
     /// A stand-in for another host process's process (`crate::remote`): its pid and uid, its memory
     /// and descriptors reached through `mem` and `fds`; no CPU runs it.
     pub fn stand_in(sysroot: Arc<crate::vfs::Sysroot>, pid: i32, uid: u32, mem: Arc<dyn crate::guest::Remote>, fds: Arc<dyn crate::fd::RemoteFds>) -> Arc<Self> {
-        let space = Arc::new(GuestSpace::new().expect("a guest space"));
+        let space = Arc::new(small_space());
         let vfs = Vfs::new(sysroot, Vec::new(), b"/remote".to_vec());
         let p = Self::assemble_as(space, None, Some(pid), vfs, vec![b"/remote".to_vec()], FdTable::standard(Output::Host, Output::Host), false, None, 0, uid);
         p.mem.set_remote(mem);
@@ -1104,6 +1146,43 @@ impl Process {
         self.deliver(cpu, task, info, pc, 0)
     }
 
+    /// **Diagnostic** (`OMNI_DUMP_ON_SEGV=<name part>`, with `OMNI_DUMP_DIR`; off by default): the
+    /// first `SIGSEGV` whose pc or lr is in a mapping so named writes every mapping of that name, as
+    /// memory holds it now (a packed library's decrypted code and its data), and the registers.
+    fn dump_on_segv(&self, pc: u64, lr: u64, x: &[u64], fault_address: u64) {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let (Ok(want), Ok(dir)) = (std::env::var("OMNI_DUMP_ON_SEGV"), std::env::var("OMNI_DUMP_DIR")) else { return };
+        let named = |a: u64| self.mm.name_at(a).is_some_and(|(n, _)| n.windows(want.len()).any(|w| w == want.as_bytes()));
+        if !(named(pc) || named(lr)) || DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let pid = self.sys.pid;
+        let mut index = format!("pid {pid} pc {pc:#x} lr {lr:#x} fault {fault_address:#x}\n");
+        for (n, v) in x.iter().enumerate() {
+            index += &format!("x{n} {v:#x} {}\n", self.mm.describe(*v).unwrap_or_default());
+        }
+        for (start, len, name, offset) in self.mm.file_mappings() {
+            if !name.windows(want.len()).any(|w| w == want.as_bytes()) {
+                continue;
+            }
+            // 4 KiB at a time: a PROT_NONE or unmapped piece reads as zeros rather than failing all.
+            let mut bytes = vec![0u8; len as usize];
+            for at in (0..len).step_by(4096) {
+                let n = 4096.min(len - at) as usize;
+                if let Ok(b) = self.mem.read(start + at, n) {
+                    bytes[at as usize..at as usize + n].copy_from_slice(&b);
+                }
+            }
+            let file = dir.join(format!("{pid}-{start:x}-off{offset:x}.bin"));
+            let _ = std::fs::write(&file, &bytes);
+            index += &format!("{start:#x}+{len:#x} off {offset:#x} {} -> {}\n", String::from_utf8_lossy(&name), file.display());
+        }
+        let _ = std::fs::write(dir.join(format!("{pid}-index.txt")), index);
+        eprintln!("[dump] {pid}: {} written", dir.display());
+    }
+
     /// Run the guest's handler for `info.signo`: build the kernel's frame below `sp` (or on the
     /// alternate stack), point the task at the handler, and block what the action asks.
     fn deliver(&self, cpu: &mut dyn GuestCpu, task: *mut Task, info: crate::signal::SigInfo, pc: u64, fault_address: u64) -> Result<u64, ExitStatus> {
@@ -1122,6 +1201,9 @@ impl Process {
         }
         let mut regs = Self::read_regs(cpu, pc);
         regs.fault_address = fault_address;
+        if sig == 11 {
+            self.dump_on_segv(pc, regs.x[30], &regs.x, fault_address);
+        }
         if self.trace || signal_trace() {
             let at = |a: u64| self.mm.describe(a).map_or_else(String::new, |d| format!(" ({d})"));
             eprintln!(
@@ -1132,6 +1214,12 @@ impl Process {
                 // A fault: the registers too, each labelled when it points into a mapping.
                 for (n, x) in regs.x.iter().enumerate() {
                     eprintln!("  x{n:<2} {x:#018x}{}", at(*x));
+                }
+                // The code around the fault, as it is in memory now (a packed library's is not
+                // what its file holds): 24 instructions before the pc, 8 from it.
+                if let Ok(code) = self.mem.read(pc.wrapping_sub(96) & !3, 128) {
+                    let words: Vec<String> = code.chunks_exact(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().expect("4")))).collect();
+                    eprintln!("  code at {:#x}: {}", pc.wrapping_sub(96) & !3, words.join(" "));
                 }
                 // The frame-pointer chain: AOSP builds arm64 with frame pointers.
                 let mut fp = regs.x[29];
@@ -1232,7 +1320,7 @@ impl Process {
 
     /// A process with no program, for handler tests.
     pub fn for_tests(vfs: Vfs, stdout: Output) -> Arc<Self> {
-        let space = Arc::new(GuestSpace::new().expect("a guest space"));
+        let space = Arc::new(small_space());
         let scratch = space
             .map_anonymous(omni_mem::Placement::Anywhere { align: space.page_size() }, 1 << 20, omni_mem::Protection::ReadWrite, omni_mem::CommitPolicy::Lazy)
             .expect("scratch") as u64;
@@ -1261,4 +1349,36 @@ impl Drop for Process {
             crate::locks::process_ended(self.sys.pid);
         }
     }
+}
+
+/// `OMNI_SPLIT_REPORT=<seconds>`: every that many seconds, each process of this host process whose
+/// 4 KiB overlay has served accesses says how many (per second since the last line), and which
+/// host pages, by the mapping they belong to (D42). Off by default.
+fn split_report_start() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let Some(secs) = std::env::var("OMNI_SPLIT_REPORT").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else { return };
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("split-report".into()).spawn(move || {
+            let mut last: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                let live: Vec<Arc<Process>> = ALL.lock().iter().filter_map(std::sync::Weak::upgrade).collect();
+                for p in live {
+                    let st = p.mem.space().split_stats();
+                    if st.served_total == 0 && st.tracked == 0 {
+                        continue;
+                    }
+                    let before = last.insert(p.sys.pid, st.served_total).unwrap_or(0);
+                    let rate = st.served_total.saturating_sub(before) / secs;
+                    let top: Vec<String> = st
+                        .top
+                        .iter()
+                        .take(4)
+                        .map(|(page, n)| format!("{page:#x}x{n} {}", p.mm.describe(*page as u64).unwrap_or_default()))
+                        .collect();
+                    eprintln!("[split] pid {} tracked {} trapping {} served {} ({rate}/s) top: {}", p.sys.pid, st.tracked, st.trapping, st.served_total, top.join(", "));
+                }
+            }
+        });
+    });
 }

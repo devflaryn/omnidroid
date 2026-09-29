@@ -91,6 +91,9 @@ impl GuestRange {
 pub struct GuestAddressSpace {
     base: GuestAddr,
     len: usize,
+    /// The host base of the space's low window (D41): guest addresses below 4 GiB live at
+    /// `address + delta`. `None` -- the identity everywhere -- for every space without one.
+    low_window_delta: Option<u64>,
 }
 
 impl GuestAddressSpace {
@@ -114,7 +117,7 @@ impl GuestAddressSpace {
                 reason: "base + len overflows the address space, so the extent wraps",
             });
         }
-        Ok(Self { base, len })
+        Ok(Self { base, len, low_window_delta: None })
     }
 
     /// Describe the extent of a live [`GuestSpace`].
@@ -123,7 +126,15 @@ impl GuestAddressSpace {
     ///
     /// [`CpuError::InvalidAddressSpace`], as [`new`](GuestAddressSpace::new).
     pub fn of(space: &GuestSpace) -> CpuResult<Self> {
-        Self::new(space.base(), space.len())
+        let described = Self::new(space.base(), space.len())?;
+        Ok(Self { low_window_delta: space.low_window().map(|w| w.delta as u64), ..described })
+    }
+
+    /// The host base of the space's low window (D41), if it has one: what the direct path adds to
+    /// a guest address below 4 GiB. `None` means guest VA is host VA everywhere (D4).
+    #[must_use]
+    pub const fn low_window_delta(self) -> Option<u64> {
+        self.low_window_delta
     }
 
     /// Base of the space.

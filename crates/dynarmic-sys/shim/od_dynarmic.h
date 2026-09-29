@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 4u
+#define OD_DYNARMIC_ABI_VERSION 5u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -225,6 +225,13 @@ typedef struct od_config {
      * therefore ignores a step budget *and* ignores `od_jit_halt` from another
      * thread; see the tests. Clearing both restores both escapes. */
     uint32_t optimizations;
+
+    /* D41 (patch 0030): `fastmem_pointer` is added only to a guest address below
+     * 2^32; at and above it the host address is the guest address. For a host
+     * that maps nothing below 4 GiB (macOS on arm64) whose guest needs its low
+     * 4 GiB (ART). arm64 hosts only: `od_jit_new` refuses it elsewhere, and
+     * with `fastmem_enabled` 0 or a 32-bit mirrored window. */
+    int fastmem_low_window;
 } od_config;
 
 /* What dynarmic actually ended up configured with. Read back from the live
@@ -265,6 +272,8 @@ typedef struct od_effective_config {
     int code_cache_w_xor_x;  /* one of OD_CODE_CACHE_* below */
     uint64_t tpidr_el0_ptr;
     uint64_t tpidrro_el0_ptr;
+    /* D41 (patch 0030): 1 if `fastmem_pointer` applies below 2^32 only. */
+    int fastmem_low_window;
 } od_effective_config;
 
 /* `od_effective_config::code_cache_w_xor_x`. */

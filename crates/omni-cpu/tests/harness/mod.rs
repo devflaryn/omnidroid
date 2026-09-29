@@ -103,7 +103,19 @@ impl Guest {
     }
 
     pub fn with_options(options: DynarmicOptions) -> Self {
-        let space = Arc::new(high_guest_space());
+        Self::with_space(options, high_guest_space())
+    }
+
+    /// A guest whose space asks for 4 KiB pages (`GuestSpaceConfig::guest_page`): the sub-page
+    /// overlay where the host page is larger and can be aliased, an ordinary space elsewhere.
+    pub fn with_space_config(options: DynarmicOptions, guest_page: Option<usize>) -> Self {
+        let space = GuestSpace::with_config(GuestSpaceConfig { base_alignment: 1 << 36, guest_page, ..GuestSpaceConfig::default() })
+            .expect("a guest address space aligned to 64 GiB");
+        Self::with_space(options, space)
+    }
+
+    fn with_space(options: DynarmicOptions, space: GuestSpace) -> Self {
+        let space = Arc::new(space);
 
         let code = space
             .map_anonymous(

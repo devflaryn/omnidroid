@@ -270,8 +270,13 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
                 return Ok(result(VK_ERROR_LAYER_NOT_PRESENT));
             }
             let (pd, t) = gpu.dispatchable(p, a[0])?;
-            let mut offered: Vec<_> = enumerate_host_device_extensions(&t, pd)?.into_iter().filter(|(n, _)| forwarded(n, true)).collect();
+            let host = enumerate_host_device_extensions(&t, pd)?;
+            let host_has_foreign = host.iter().any(|(n, _)| n == QUEUE_FAMILY_FOREIGN);
+            let mut offered: Vec<_> = host.into_iter().filter(|(n, _)| forwarded(n, true)).collect();
             offered.extend(EMULATED.iter().map(|(n, v)| ((*n).to_string(), *v)));
+            if !host_has_foreign {
+                offered.push((QUEUE_FAMILY_FOREIGN.to_string(), 1));
+            }
             write_extensions(p, a[2], a[3], &offered)
         }
         g::ID_VK_CREATE_DEVICE => create_device(gpu, p, a),
@@ -699,7 +704,15 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     if ext_count > 1024 {
         return Err(CallError::Args);
     }
-    let names: Vec<CString> = strings(p, at(56), ext_count)?.into_iter().filter(|n| !EMULATED.iter().any(|(e, _)| e.as_bytes() == n.as_bytes())).collect();
+    let asked = strings(p, at(56), ext_count)?;
+    // VK_EXT_queue_family_foreign on a host without it (MoltenVK) is this layer's (`foreign_barrier`).
+    let emulate_foreign = asked.iter().any(|n| n.as_bytes() == QUEUE_FAMILY_FOREIGN.as_bytes())
+        && !enumerate_host_device_extensions(&t, pd)?.iter().any(|(n, _)| n == QUEUE_FAMILY_FOREIGN);
+    let names: Vec<CString> = asked
+        .into_iter()
+        .filter(|n| !EMULATED.iter().any(|(e, _)| e.as_bytes() == n.as_bytes()))
+        .filter(|n| !(emulate_foreign && n.as_bytes() == QUEUE_FAMILY_FOREIGN.as_bytes()))
+        .collect();
     let ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
     let mut host_ci = ci.clone();
     host_ci[32..36].copy_from_slice(&0u32.to_le_bytes()); // no layers
@@ -722,9 +735,139 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         let mut memory = ash::vk::PhysicalDeviceMemoryProperties::default();
         unsafe { mp(ash::vk::Handle::from_raw(pd), &mut memory) };
         gpu.devices.lock().insert(device, super::native::DeviceInfo::new(&memory));
+        if emulate_foreign {
+            FOREIGN_EMULATED.lock().insert(device);
+        }
         wr(p, a[3], &device.to_le_bytes())?;
     }
     Ok(result(r))
+}
+
+/// `VK_EXT_queue_family_foreign`.
+const QUEUE_FAMILY_FOREIGN: &str = "VK_EXT_queue_family_foreign";
+
+/// Host devices on which `VK_EXT_queue_family_foreign` is emulated: the guest was offered it and
+/// enabled it, and the host driver has none (MoltenVK). ANGLE turns on Android hardware-buffer
+/// images only with it (`supportsAndroidHardwareBuffer` wants both extensions), and without those
+/// SurfaceFlinger cannot compose an app's buffer (`eglCreateImageKHR` answered `EGL_BAD_PARAMETER`
+/// on the M1).
+static FOREIGN_EMULATED: parking_lot::Mutex<std::collections::BTreeSet<u64>> =
+    parking_lot::Mutex::new(std::collections::BTreeSet::new());
+
+/// `VK_QUEUE_FAMILY_FOREIGN_EXT`, `VK_QUEUE_FAMILY_EXTERNAL`, `VK_QUEUE_FAMILY_IGNORED`.
+const QUEUE_FAMILY_FOREIGN_EXT: u32 = !2;
+const QUEUE_FAMILY_EXTERNAL: u32 = !1;
+const QUEUE_FAMILY_IGNORED: u32 = !0;
+
+/// The barrier commands of a device on which `VK_EXT_queue_family_foreign` is emulated: `None`
+/// (forward as generated) for any other command or device.
+///
+/// What the extension is for -- handing an image to "a queue outside this driver" -- is this layer's
+/// business here, not the host driver's: the memory behind an Android hardware buffer is a gralloc
+/// region the host keeps in step itself (`ahb`), and the host driver has no such queue. So a
+/// transfer to or from `FOREIGN`/`EXTERNAL` becomes a plain barrier: both indices `IGNORED`, the
+/// access masks and layout transition kept. The barriers are copied into host memory with the
+/// indices changed; the guest's own structures are left as they were.
+pub(crate) fn foreign_barrier(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> Option<R<u64>> {
+    if !matches!(id, g::ID_VK_CMD_PIPELINE_BARRIER | g::ID_VK_CMD_PIPELINE_BARRIER2 | g::ID_VK_CMD_WAIT_EVENTS | g::ID_VK_CMD_WAIT_EVENTS2) {
+        return None;
+    }
+    if FOREIGN_EMULATED.lock().is_empty() {
+        return None;
+    }
+    let (h, t) = match gpu.dispatchable(p, a[0]) {
+        Ok(d) => d,
+        Err(e) => return Some(Err(e)),
+    };
+    if !FOREIGN_EMULATED.lock().contains(&t.owner()) {
+        return None;
+    }
+    Some(foreign_barrier_on(p, id, a, h, &t))
+}
+
+/// `count` structures of `size` bytes at guest `at`, copied, with each `u32` at `offsets` that is a
+/// foreign or external queue family made `IGNORED` -- the pair made `IGNORED` together, as a barrier
+/// that transfers nothing must have it.
+fn unforeign(p: &Process, at: u64, count: u32, size: usize, offsets: (usize, usize)) -> R<Vec<u8>> {
+    if count == 0 || at == 0 {
+        return Ok(Vec::new());
+    }
+    if count > 1 << 16 {
+        return Err(CallError::Args);
+    }
+    let mut v = p.mem.read(at, count as usize * size).map_err(|_| CallError::Args)?;
+    for s in v.chunks_exact_mut(size) {
+        let q = |s: &[u8], o: usize| u32::from_le_bytes(s[o..o + 4].try_into().expect("4"));
+        let (src, dst) = (q(s, offsets.0), q(s, offsets.1));
+        if [src, dst].iter().any(|&i| i == QUEUE_FAMILY_FOREIGN_EXT || i == QUEUE_FAMILY_EXTERNAL) {
+            s[offsets.0..offsets.0 + 4].copy_from_slice(&QUEUE_FAMILY_IGNORED.to_le_bytes());
+            s[offsets.1..offsets.1 + 4].copy_from_slice(&QUEUE_FAMILY_IGNORED.to_le_bytes());
+        }
+    }
+    Ok(v)
+}
+
+fn ptr_or_null(v: &[u8]) -> u64 {
+    if v.is_empty() { 0 } else { v.as_ptr() as u64 }
+}
+
+/// A `VkDependencyInfo` (64 bytes) at guest `at`, copied with its buffer barriers (`VkBufferMemoryBarrier2`,
+/// 80 bytes, indices at 48/52) and image barriers (`VkImageMemoryBarrier2`, 96 bytes, at 56/60)
+/// made foreign-free. The returned buffers own the memory the copy points into.
+fn unforeign_dependency(p: &Process, at: u64) -> R<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let mut info = p.mem.read(at, 64).map_err(|_| CallError::Args)?;
+    let u32_at = |v: &[u8], o: usize| u32::from_le_bytes(v[o..o + 4].try_into().expect("4"));
+    let u64_at = |v: &[u8], o: usize| u64::from_le_bytes(v[o..o + 8].try_into().expect("8"));
+    let buffers = unforeign(p, u64_at(&info, 40), u32_at(&info, 32), 80, (48, 52))?;
+    let images = unforeign(p, u64_at(&info, 56), u32_at(&info, 48), 96, (56, 60))?;
+    info[40..48].copy_from_slice(&ptr_or_null(&buffers).to_le_bytes());
+    info[56..64].copy_from_slice(&ptr_or_null(&images).to_le_bytes());
+    Ok((info, buffers, images))
+}
+
+fn foreign_barrier_on(p: &Process, id: u32, a: &[u64], h: u64, t: &Table) -> R<u64> {
+    match id {
+        g::ID_VK_CMD_PIPELINE_BARRIER => {
+            // (cb, srcStage, dstStage, flags, memCount, pMem, bufCount, pBuf, imgCount, pImg)
+            let buffers = unforeign(p, a[7], a[6] as u32, 56, (24, 28))?;
+            let images = unforeign(p, a[9], a[8] as u32, 72, (32, 36))?;
+            const NAMES: &[&CStr] = &[c"vkCmdPipelineBarrier"];
+            // SAFETY: the Vulkan signature; the barrier arrays are host copies alive for the call.
+            let e: unsafe extern "system" fn(u64, u32, u32, u32, u32, u64, u32, u64, u32, u64) = unsafe { f(t, id, NAMES)? };
+            unsafe { e(h, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32, a[5], a[6] as u32, ptr_or_null(&buffers), a[8] as u32, ptr_or_null(&images)) };
+        }
+        g::ID_VK_CMD_WAIT_EVENTS => {
+            // (cb, eventCount, pEvents, srcStage, dstStage, memCount, pMem, bufCount, pBuf, imgCount, pImg)
+            let buffers = unforeign(p, a[8], a[7] as u32, 56, (24, 28))?;
+            let images = unforeign(p, a[10], a[9] as u32, 72, (32, 36))?;
+            const NAMES: &[&CStr] = &[c"vkCmdWaitEvents"];
+            // SAFETY: as above.
+            let e: unsafe extern "system" fn(u64, u32, u64, u32, u32, u32, u64, u32, u64, u32, u64) = unsafe { f(t, id, NAMES)? };
+            unsafe { e(h, a[1] as u32, a[2], a[3] as u32, a[4] as u32, a[5] as u32, a[6], a[7] as u32, ptr_or_null(&buffers), a[9] as u32, ptr_or_null(&images)) };
+        }
+        g::ID_VK_CMD_PIPELINE_BARRIER2 => {
+            let (info, _buffers, _images) = unforeign_dependency(p, a[1])?;
+            const NAMES: &[&CStr] = &[c"vkCmdPipelineBarrier2", c"vkCmdPipelineBarrier2KHR"];
+            // SAFETY: as above; `info` points into the two copies, alive for the call.
+            let e: unsafe extern "system" fn(u64, u64) = unsafe { f(t, id, NAMES)? };
+            unsafe { e(h, info.as_ptr() as u64) };
+        }
+        g::ID_VK_CMD_WAIT_EVENTS2 => {
+            // (cb, eventCount, pEvents, pDependencyInfos): one VkDependencyInfo per event.
+            let n = a[1] as u32;
+            if n > 1 << 12 {
+                return Err(CallError::Args);
+            }
+            let copies = (0..u64::from(n)).map(|i| unforeign_dependency(p, a[3] + i * 64)).collect::<R<Vec<_>>>()?;
+            let infos: Vec<u8> = copies.iter().flat_map(|(info, _, _)| info.iter().copied()).collect();
+            const NAMES: &[&CStr] = &[c"vkCmdWaitEvents2", c"vkCmdWaitEvents2KHR"];
+            // SAFETY: as above.
+            let e: unsafe extern "system" fn(u64, u32, u64, u64) = unsafe { f(t, id, NAMES)? };
+            unsafe { e(h, n, a[2], ptr_or_null(&infos)) };
+        }
+        _ => unreachable!("foreign_barrier filters the ids"),
+    }
+    Ok(0)
 }
 
 /// `vkBindImageMemory2`: a swapchain image with a `VkNativeBufferANDROID` (what the loader turns a

@@ -459,6 +459,11 @@ pub(super) fn allocation_granularity() -> usize {
     system_info().dwAllocationGranularity as usize
 }
 
+/// `lpMinimumApplicationAddress`: 64 KiB, which the allocator never hands out.
+pub(super) fn lowest_mappable_address() -> usize {
+    (system_info().lpMinimumApplicationAddress as usize).max(page_size())
+}
+
 /// x86-64 has no Top Byte Ignore. Windows on arm64 is not a host Omnidroid claims, so nothing is
 /// claimed for it either: `false` is the answer that keeps a tagged pointer a fault.
 pub(super) const fn host_ignores_top_byte() -> bool {
@@ -1596,4 +1601,19 @@ mod tests {
         // so this pins the behaviour of both branches of `region_flavour`'s fallback.
         assert_eq!(region_flavour(0), RegionFlavour::Private);
     }
+}
+
+/// No second mapping of a page here yet: a 4 KiB host never needs one, and a larger-page host
+/// (a 16 KiB Linux) keeps its guest at the host's page until one is written (spec
+/// 2026-09-29-4k-guest-pages, "Out of scope").
+pub(super) const fn supports_alias() -> bool {
+    false
+}
+
+pub(super) fn alias(_src: usize, _size: usize) -> VmResult<usize> {
+    Err(VmError::Unsupported { operation: "alias", platform: std::env::consts::OS })
+}
+
+pub(super) fn unalias(_dst: usize, _size: usize) -> VmResult<()> {
+    Err(VmError::Unsupported { operation: "unalias", platform: std::env::consts::OS })
 }

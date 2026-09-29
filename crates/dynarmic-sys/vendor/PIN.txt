@@ -37,6 +37,8 @@ dynarmic/
                and ../patches/0029-x64-an-ordered-load-is-a-plain-mov.patch
                and ../patches/0030-x64-a-clear-gives-back-the-region-being-filled.patch
                and ../patches/0031-x64-a-clear-gives-back-the-block-map.patch
+               and ../patches/0032-arm64-a-low-window-for-the-guest-s-first-4-gib.patch
+               and ../patches/0033-arm64-a-mid-run-clear-forgets-the-return-stack-buffer.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

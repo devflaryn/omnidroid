@@ -124,6 +124,16 @@ pub(super) fn allocation_granularity() -> usize {
     page_size()
 }
 
+/// `vm.mmap_min_addr` (65536 by default), rounded up to a page; the first page if it cannot be read.
+pub(super) fn lowest_mappable_address() -> usize {
+    let page = page_size();
+    let min = std::fs::read_to_string("/proc/sys/vm/mmap_min_addr")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    round_up(min, page).unwrap_or(min).max(page)
+}
+
 fn round_up(value: usize, to: usize) -> Option<usize> {
     value.checked_add(to - 1).map(|v| v & !(to - 1))
 }
@@ -1090,4 +1100,19 @@ mod tests {
         assert!(containing(&map, 0x2000).is_none());
         assert_eq!(containing(&map, 0x1fff).map(|(b, _)| b), Some(0x1000));
     }
+}
+
+/// No second mapping of a page here yet: a 4 KiB host never needs one, and a larger-page host
+/// (a 16 KiB Linux) keeps its guest at the host's page until one is written (spec
+/// 2026-09-29-4k-guest-pages, "Out of scope").
+pub(super) const fn supports_alias() -> bool {
+    false
+}
+
+pub(super) fn alias(_src: usize, _size: usize) -> VmResult<usize> {
+    Err(VmError::Unsupported { operation: "alias", platform: std::env::consts::OS })
+}
+
+pub(super) fn unalias(_dst: usize, _size: usize) -> VmResult<()> {
+    Err(VmError::Unsupported { operation: "unalias", platform: std::env::consts::OS })
 }

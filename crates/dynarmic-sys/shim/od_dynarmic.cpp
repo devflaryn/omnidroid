@@ -262,6 +262,20 @@ bool callbacks_complete(const od_callbacks* c) {
         && c->get_ticks_remaining;
 }
 
+/* D41 (patch 0030): the low window exists only in the arm64 backend, needs the
+ * direct path, and is meaningless under a 32-bit mirrored window (which would
+ * wrap every address into it). */
+bool low_window_acceptable(const od_config* config) {
+    if (config->fastmem_low_window == 0) {
+        return true;
+    }
+#if defined(__aarch64__)
+    return config->fastmem_enabled != 0 && config->fastmem_address_space_bits > 32;
+#else
+    return false;
+#endif
+}
+
 /* The checks `od_jit_new` has always made, shared with the shared-cache entry points. */
 bool config_acceptable(const od_config* config) {
     if (config == nullptr || config->abi_version != OD_DYNARMIC_ABI_VERSION) {
@@ -272,6 +286,9 @@ bool config_acceptable(const od_config* config) {
     }
     if (config->fastmem_enabled
         && (config->fastmem_address_space_bits < 12 || config->fastmem_address_space_bits > 64)) {
+        return false;
+    }
+    if (!low_window_acceptable(config)) {
         return false;
     }
     if (config->monitor != nullptr) {
@@ -308,6 +325,7 @@ A64::UserConfig user_config_of(const od_config* config, A64::UserCallbacks* call
         uc.silently_mirror_fastmem = config->silently_mirror_fastmem != 0;
         uc.recompile_on_fastmem_failure = config->recompile_on_fastmem_failure != 0;
         uc.fastmem_exclusive_access = config->fastmem_exclusive_access != 0;
+        uc.fastmem_low_window = config->fastmem_low_window != 0;
     } else {
         uc.fastmem_pointer = std::nullopt;
     }
@@ -392,6 +410,9 @@ void* od_jit_new(const od_config* config) {
         && (config->fastmem_address_space_bits < 12 || config->fastmem_address_space_bits > 64)) {
         return nullptr;
     }
+    if (!low_window_acceptable(config)) {
+        return nullptr;
+    }
     /* dynarmic documents 8 MiB as the minimum and 2 GiB (x64) / 128 MiB
      * (arm64) as the maximum, both enforced by asserts inside the code-cache
      * allocator rather than by a return value. Refuse out-of-range sizes here
@@ -442,6 +463,7 @@ void* od_jit_new(const od_config* config) {
             uc.silently_mirror_fastmem = config->silently_mirror_fastmem != 0;
             uc.recompile_on_fastmem_failure = config->recompile_on_fastmem_failure != 0;
             uc.fastmem_exclusive_access = config->fastmem_exclusive_access != 0;
+        uc.fastmem_low_window = config->fastmem_low_window != 0;
         } else {
             uc.fastmem_pointer = std::nullopt;
         }
@@ -797,6 +819,7 @@ void od_jit_effective_config(void* p, od_effective_config* out) {
     out->silently_mirror_fastmem = uc.silently_mirror_fastmem ? 1 : 0;
     out->recompile_on_fastmem_failure = uc.recompile_on_fastmem_failure ? 1 : 0;
     out->fastmem_exclusive_access = uc.fastmem_exclusive_access ? 1 : 0;
+    out->fastmem_low_window = uc.fastmem_low_window ? 1 : 0;
     out->page_table_present = uc.page_table != nullptr ? 1 : 0;
     out->code_cache_size = static_cast<uint64_t>(uc.code_cache_size);
     out->enable_cycle_counting = uc.enable_cycle_counting ? 1 : 0;

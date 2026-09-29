@@ -870,3 +870,76 @@ rewrite (the engine's GLES timer queries are forwarded as they are).
 **Reverses it.** A target the rule drops that the engine keeps (a stale texture after `off`), or
 an engine path that reads back a per-frame target while headless and acts on it.
 
+## D41 — macOS: the guest's low 4 GiB is a based window (amends D4 on macOS only)
+
+**Ruling (2026-09-29).** On macOS the part of a guest space below 4 GiB is backed by a 4 GiB-aligned
+host reservation `W` anywhere, and addressed as `W + g`; above 4 GiB a guest address stays a host
+address. dynarmic's arm64 backend adds `Xfastmem` only below 4 GiB (patch 0030, `tst` + `csel`, no
+branch); `GuestSpace::ptr`, the space's own host calls and the pager translate. Off on Windows and
+Linux, where nothing changes.
+
+**Why.** An arm64 Mach-O must keep a 4 GiB hard `__PAGEZERO` (a smaller one is killed at exec) and
+the map's minimum address is raised past it, so nothing can be mapped below 4 GiB -- and ART's heap
+and boot image must be there (32-bit references). Basing the whole space instead would break the
+host paths that read guest memory in place (the GPU forwarder hands the guest's Vulkan structs to
+the host driver); those structs are always in unhinted mappings, which the Linux personality puts
+above 4 GiB, so only what ART places by address lives in the window. Design, costs and proof:
+`docs/ports/macos-low-window.md`.
+
+## D42 — The guest's page is 4 KiB on every host (a sub-page overlay where the host's is larger)
+
+**Ruling (2026-09-29).** The real-AOSP path (`omni-linux`) tells every guest process its page is
+4 KiB (`AT_PAGESZ`, so `getpagesize()` and `sysconf(_SC_PAGESIZE)`), and every `mmap`, `mprotect`,
+`munmap` and `madvise` is exact to 4 KiB, whatever the host's page is. On a 4 KiB host (Windows,
+x86-64 Linux) that is the host's page and nothing new runs. On Apple silicon (16 KiB pages) a guest
+space asks for it (`GuestSpaceConfig::guest_page`) and `omni_mem::subpage` keeps it:
+* a host page whose 4 KiB parts the guest treats differently is **tracked**;
+* its host protection is the **least** its mapped parts (and strict gaps) allow, so every access
+  some part forbids faults;
+* an access the host refuses but the guest's part allows is served by the slow path through a
+  read-write **alias** of that page (`vm::alias`, `mach_vm_remap`), as the pager declines it and
+  dynarmic hands it to the callback once;
+* execute is the guest view's alone, since dynarmic fetches guest code through a callback.
+
+The publication and lock rule is SUBPAGE-ORDER (`space/subpage_ops.rs`). The direct path
+(`omnidroid play`) and 16 KiB Linux hosts keep the host's page (no alias primitive there yet).
+
+**Why.** Apple silicon made the guest a 16 KiB-page Android. Code built for 4 KiB pages then either
+failed to load or was approximated:
+* `pagecompat` rewrote such a library's file so its segments were congruent with 16 KiB;
+* `mprotect` of 4 KiB was widened to a union over the whole 16 KiB page.
+
+Roblox 2.740.931's packed `libzstd-jni` loaded that way and, a minute in, called through a function
+table its own initialisation had never filled (`docs/research/2026-09-29-libzstd-jni-16k.md`).
+Shimming one library does not generalise; a device with 4 KiB pages is what that code was built
+for. Both approximations are gone.
+
+**Choices.**
+* A gap -- an unmapped 4 KiB inside a host page that holds other mappings -- is **lenient**: an
+  access there may succeed. So is a **`PROT_NONE` 4 KiB beside accessible parts** of its host page.
+  The kernel's own copies refuse both (`EFAULT`), and a `PROT_NONE` host page of its own faults as
+  ever.
+  *Measured:* enforcing `PROT_NONE` parts made the `vdso` fixture take about 250,000 traps. Every
+  library's last host page holds `linker64`'s `PROT_NONE` reservation filler, so each read of its
+  live part trapped. Lenient, it takes 670 traps. QEMU user mode is lenient the same way on
+  large-page hosts.
+* `OMNI_STRICT_GAPS=<name prefix>,...` makes a named range's gaps and `PROT_NONE` parts fault;
+  `OMNI_STRICT_PROT_NONE=1` does it for every `PROT_NONE` part.
+* An unhinted mapping gets host pages of its own, so separate mappings never share one.
+* A file view is whole host pages at a host-page offset. Anything else is a private copy, and a
+  shared mapping that cannot be shared exactly is refused (`EINVAL`).
+* Shared memory's host file is whole host pages; the guest's length is exact.
+
+**Costs, stated.**
+* A 4 KiB guard sharing a host page with live memory (a thread stack's, ART's stack-overflow page)
+  does not fault on a 16 KiB host unless its range is strict.
+* A served access costs three Mach exception deliveries plus a callback; hot split pages are
+  counted (`GuestSpace::split_stats`) for M2 to act on.
+* A privatised library page is committed private memory (16 KiB) rather than shared file cache.
+* The GPU forwarder hands raw guest pointers to the host driver, so one landing in a trapping page
+  faults in the host. `d3a_gpu` did (SIGBUS) while `PROT_NONE` parts were enforced; with them
+  lenient, only relro/`.data` boundary pages still trap.
+
+**Reverses it.** A 4 KiB guest that runs code a 16 KiB one did not, *slower* than the approximation
+by more than the gate tolerates, with no placement fix. Or a host-side access to guest memory
+found bypassing `access_ptr`.

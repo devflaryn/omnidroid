@@ -24,7 +24,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use dynarmic_sys::{exception, OdCallbacks};
-use omni_mem::{GuestAddr, Protection};
+use omni_mem::{AccessPtr, GuestAddr, Protection};
 
 use crate::dynarmic::{
     mxcsr, stop, with, CpuCtx, JitRegs, PendingExit, BREAKPOINT_BRK, HALT_EXIT, STOP_SVC,
@@ -33,6 +33,13 @@ use crate::exit::AccessKind;
 use crate::thunk::ThunkCall;
 
 use dynarmic_sys::OD_HALT_MEMORY_ABORT;
+
+/// Where a checked data access goes: one host pointer (the direct address or a split page's
+/// alias), or a range to copy piece by piece because it straddles a split host page.
+enum DataPtr {
+    One(*mut u8),
+    Straddle(GuestAddr),
+}
 
 /// The name this backend reports.
 pub const BACKEND_NAME: &str = "dynarmic";
@@ -64,18 +71,23 @@ impl CpuCtx {
         }
         // SAFETY: `resolve` established that `[address, address + 4)` lies inside a mapped,
         // executable region of this guest space, and committed it if the mapping was lazy. D4's
-        // identity mapping makes the guest address a host address, so this is an ordinary read of
-        // memory this process owns. Unaligned is impossible — the 4-byte alignment is checked
+        // identity mapping makes the guest address a host address (in a low window, D41, the one
+        // `host_addr` gives), so this is an ordinary read of memory this process owns. Unaligned is impossible — the 4-byte alignment is checked
         // above — but `read_unaligned` costs nothing extra and does not rely on that check being
         // upstream of a future edit.
-        Some(unsafe { (address as *const u32).read_unaligned() })
+        let ptr = match self.space.access_ptr(address, 4) {
+            AccessPtr::Direct(p) | AccessPtr::Alias(p) => p,
+            // Four aligned bytes never cross a host page.
+            AccessPtr::Straddle => return None,
+        };
+        Some(unsafe { (ptr as *const u32).read_unaligned() })
     }
 
     /// Resolve a guest data address for an access of `len` bytes, or record a fault and stop.
     ///
     /// Returns `None` having already halted the run, so every caller can simply return its
     /// fallback value.
-    fn data_ptr(&mut self, vaddr: u64, len: usize, want: Protection) -> Option<*mut u8> {
+    fn data_ptr(&mut self, vaddr: u64, len: usize, want: Protection) -> Option<DataPtr> {
         let access = if want == Protection::ReadWrite { AccessKind::Write } else { AccessKind::Read };
         // Top Byte Ignore, when the context has it: the tag is not part of the address.
         let vaddr = if self.top_byte_ignore { vaddr & 0x00FF_FFFF_FFFF_FFFF } else { vaddr };
@@ -87,7 +99,57 @@ impl CpuCtx {
             self.fault(vaddr, access);
             return None;
         }
-        Some(address as *mut u8)
+        // D41: in a low window the host address is not the guest's. A range across its seam is
+        // never resolved (the guard page below 4 GiB is never mapped).
+        //
+        // The 4 KiB overlay (`omni_mem::subpage`): an access the guest's view allows on a host
+        // page that refuses it is why this callback was reached at all; it goes through the
+        // page's read-write alias, and is counted apart from a degraded block.
+        match self.space.access_ptr(address, len) {
+            AccessPtr::Direct(p) => Some(DataPtr::One(p)),
+            AccessPtr::Alias(p) => {
+                self.served(address);
+                Some(DataPtr::One(p))
+            }
+            AccessPtr::Straddle => {
+                self.served(address);
+                Some(DataPtr::Straddle(address))
+            }
+        }
+    }
+
+    /// Count an access served through a split page's alias.
+    fn served(&mut self, address: GuestAddr) {
+        self.split_served += 1;
+        self.space.note_split_served(address);
+    }
+
+    /// Read `out.len()` bytes at `address`, piece by piece across split and ordinary host pages.
+    fn read_straddle(&self, address: GuestAddr, out: &mut [u8]) {
+        self.space.for_each_access_chunk(address, out.len(), |g, p, n| {
+            let at = g - address;
+            // SAFETY: `data_ptr` admitted the whole range; each piece is its host or alias pointer.
+            unsafe { core::ptr::copy_nonoverlapping(p, out[at..at + n].as_mut_ptr(), n) };
+        });
+    }
+
+    /// Write `bytes` at `address`, piece by piece.
+    fn write_straddle(&self, address: GuestAddr, bytes: &[u8]) {
+        self.space.for_each_access_chunk(address, bytes.len(), |g, p, n| {
+            let at = g - address;
+            // SAFETY: as `read_straddle`, and `data_ptr` checked writability.
+            unsafe { core::ptr::copy_nonoverlapping(bytes[at..at + n].as_ptr(), p, n) };
+        });
+    }
+
+    /// `data_ptr` for an access that must be one atomic host access (exclusives): a range that
+    /// straddles a split page cannot be, and is refused (the store fails; an exclusive is aligned
+    /// to its size, so the guest never asks for one).
+    fn data_ptr_one(&mut self, vaddr: u64, len: usize, want: Protection) -> Option<*mut u8> {
+        match self.data_ptr(vaddr, len, want)? {
+            DataPtr::One(p) => Some(p),
+            DataPtr::Straddle(_) => None,
+        }
     }
 
     /// Record a data fault and stop.
@@ -197,7 +259,12 @@ macro_rules! read_cb {
             unsafe {
                 with(ctx, 0, |c| match c.data_ptr(vaddr, $n, Protection::Read) {
                     // SAFETY: `data_ptr` checked the range against the region map and committed it.
-                    Some(ptr) => ptr.cast::<$ty>().read_unaligned(),
+                    Some(DataPtr::One(ptr)) => ptr.cast::<$ty>().read_unaligned(),
+                    Some(DataPtr::Straddle(at)) => {
+                        let mut bytes = [0u8; $n];
+                        c.read_straddle(at, &mut bytes);
+                        <$ty>::from_le_bytes(bytes)
+                    }
                     None => 0,
                 })
             }
@@ -216,10 +283,16 @@ unsafe extern "C" fn cb_read128(ctx: *mut c_void, vaddr: u64, out: *mut u64) {
         with(ctx, (), |c| {
             let (lo, hi) = match c.data_ptr(vaddr, 16, Protection::Read) {
                 // SAFETY: `data_ptr` checked all sixteen bytes.
-                Some(ptr) => (
+                Some(DataPtr::One(ptr)) => (
                     ptr.cast::<u64>().read_unaligned(),
                     ptr.add(8).cast::<u64>().read_unaligned(),
                 ),
+                Some(DataPtr::Straddle(at)) => {
+                    let mut bytes = [0u8; 16];
+                    c.read_straddle(at, &mut bytes);
+                    let (lo, hi) = bytes.split_at(8);
+                    (u64::from_le_bytes(lo.try_into().expect("8")), u64::from_le_bytes(hi.try_into().expect("8")))
+                }
                 None => (0, 0),
             };
             *out = lo;
@@ -234,9 +307,11 @@ macro_rules! write_cb {
             // SAFETY: `ctx` is this backend's context.
             unsafe {
                 with(ctx, (), |c| {
-                    if let Some(ptr) = c.data_ptr(vaddr, $n, Protection::ReadWrite) {
+                    match c.data_ptr(vaddr, $n, Protection::ReadWrite) {
                         // SAFETY: `data_ptr` checked the range and that it is writable.
-                        ptr.cast::<$ty>().write_unaligned(value);
+                        Some(DataPtr::One(ptr)) => ptr.cast::<$ty>().write_unaligned(value),
+                        Some(DataPtr::Straddle(at)) => c.write_straddle(at, &value.to_le_bytes()),
+                        None => {}
                     }
                 })
             }
@@ -254,10 +329,19 @@ unsafe extern "C" fn cb_write128(ctx: *mut c_void, vaddr: u64, value: *const u64
     unsafe {
         with(ctx, (), |c| {
             let (lo, hi) = (*value, *value.add(1));
-            if let Some(ptr) = c.data_ptr(vaddr, 16, Protection::ReadWrite) {
-                // SAFETY: `data_ptr` checked all sixteen bytes and that they are writable.
-                ptr.cast::<u64>().write_unaligned(lo);
-                ptr.add(8).cast::<u64>().write_unaligned(hi);
+            match c.data_ptr(vaddr, 16, Protection::ReadWrite) {
+                Some(DataPtr::One(ptr)) => {
+                    // SAFETY: `data_ptr` checked all sixteen bytes and that they are writable.
+                    ptr.cast::<u64>().write_unaligned(lo);
+                    ptr.add(8).cast::<u64>().write_unaligned(hi);
+                }
+                Some(DataPtr::Straddle(at)) => {
+                    let mut bytes = [0u8; 16];
+                    bytes[..8].copy_from_slice(&lo.to_le_bytes());
+                    bytes[8..].copy_from_slice(&hi.to_le_bytes());
+                    c.write_straddle(at, &bytes);
+                }
+                None => {}
             }
         })
     }
@@ -280,7 +364,7 @@ macro_rules! exclusive_cb {
             // SAFETY: `ctx` is this backend's context.
             unsafe {
                 with(ctx, 0, |c| {
-                    let Some(ptr) = c.data_ptr(vaddr, $n, Protection::ReadWrite) else {
+                    let Some(ptr) = c.data_ptr_one(vaddr, $n, Protection::ReadWrite) else {
                         return 0;
                     };
                     #[allow(clippy::modulo_one)] // `$n` is 1 for the byte-wide instantiation,
@@ -340,7 +424,7 @@ unsafe extern "C" fn cb_wx128(
         with(ctx, 0, |c| {
             let new = [*value, *value.add(1)];
             let old = [*expected, *expected.add(1)];
-            let Some(ptr) = c.data_ptr(vaddr, 16, Protection::ReadWrite) else {
+            let Some(ptr) = c.data_ptr_one(vaddr, 16, Protection::ReadWrite) else {
                 return 0;
             };
             // SAFETY: `data_ptr` checked all sixteen bytes and that they are writable.
@@ -649,14 +733,29 @@ unsafe extern "C" fn cb_icache_op(ctx: *mut c_void, op: u32, vaddr: u64) {
             // `op` 0 is `IC IVAU` (one cache line); anything else is an all-instruction-cache
             // operation. dynarmic's own A64 frontend raises this from a `CheckHalt{ReturnToDispatch}`
             // terminal, so invalidating from here is safe.
-            if op == 0 {
-                // A cache line, not a word: the guest named a line and the architecture invalidates
-                // the whole of it. 64 bytes is `CTR_EL0`'s default line size on this pin
-                // (0x8444c004), and over-invalidating is correct-but-slower where
-                // under-invalidating is silently wrong.
-                dynarmic_sys::od_jit_invalidate_range(c.jit, vaddr & !63, 64);
-            } else {
-                dynarmic_sys::od_jit_clear_cache(c.jit);
+            let invalidate = |jit: *mut c_void| {
+                if op == 0 {
+                    // A cache line, not a word: the guest named a line and the architecture
+                    // invalidates the whole of it. 64 bytes is `CTR_EL0`'s default line size on
+                    // this pin (0x8444c004), and over-invalidating is correct-but-slower where
+                    // under-invalidating is silently wrong.
+                    dynarmic_sys::od_jit_invalidate_range(jit, vaddr & !63, 64);
+                } else {
+                    dynarmic_sys::od_jit_clear_cache(jit);
+                }
+            };
+            // Every thread of the space, as the architecture broadcasts it to every core: on
+            // arm64 each has its own translations, and a JIT that rewrites code another thread
+            // ran (ART reusing its code cache) otherwise leaves that thread running the old ones.
+            // Another jit's invalidation is queued and halts it (dynarmic's `InvalidateCacheRange`
+            // takes its own lock); the peers' lock keeps each one alive while it is reached.
+            match &c.peers {
+                Some(peers) => {
+                    for &jit in peers.0.lock().iter() {
+                        invalidate(jit as *mut c_void);
+                    }
+                }
+                None => invalidate(c.jit),
             }
         })
     }

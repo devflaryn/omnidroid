@@ -30,6 +30,9 @@
 //! decommit(ptr, size) -> VmResult<()>
 //! decommit_to_placeholder(ptr, size) -> VmResult<()>
 //! protect(ptr, size, prot) -> VmResult<()>
+//! supports_alias() -> bool
+//! alias(src, size) -> VmResult<usize>
+//! unalias(dst, size) -> VmResult<()>
 //! open_file_for_mapping(path, exec) -> VmResult<MappableFile>
 //! share_file_for_mapping(File, name) -> VmResult<MappableFile>
 //! map_file(&MappableFile, file_offset, size, ptr, prot) -> VmResult<()>
@@ -455,6 +458,19 @@ pub fn page_size() -> usize {
     backend::page_size()
 }
 
+/// The least address this process can map anything at: a page multiple, never 0.
+///
+/// What decides whether a guest's low 4 GiB can be the host's own (D4) or must be a based window
+/// (D41): ART keeps its heap and boot image below 4 GiB. Windows: the 64 KiB the allocator never
+/// hands out. Linux: `vm.mmap_min_addr`. macOS: the end of the main executable's `__PAGEZERO` --
+/// **4 GiB on Apple silicon**, where an arm64 Mach-O must keep a hard page zero at least that large
+/// (a smaller one is killed at exec) and the map's minimum address is raised past it, so nothing
+/// below it can be mapped by any means.
+#[must_use]
+pub fn lowest_mappable_address() -> usize {
+    backend::lowest_mappable_address()
+}
+
 /// Whether this host's MMU ignores bits 56-63 of a user-space data address: arm64's Top Byte
 /// Ignore (`TCR_EL1.TBI0`), which the kernel chooses to enable or not.
 ///
@@ -524,7 +540,8 @@ pub fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<Reservation>
 ///
 /// Per host: Windows walks the range with `VirtualQuery` (anything not `MEM_FREE`, and anything
 /// past the highest address `VirtualQuery` will describe); Linux reads `/proc/self/maps`; macOS
-/// walks it with `mach_vm_region`. A host with no way to ask reports nothing known.
+/// walks it with `mach_vm_region`. A host with no way to ask reports nothing known. On every host,
+/// everything below [`lowest_mappable_address`] is reported held.
 ///
 /// # Errors
 ///
@@ -532,7 +549,11 @@ pub fn reserve_placeholder_at(base: usize, size: usize) -> VmResult<Reservation>
 pub fn occupied_ranges(base: usize, size: usize) -> VmResult<Vec<(usize, usize)>> {
     check_size("occupied_ranges", size)?;
     let end = base.saturating_add(size);
-    Ok(clip_and_merge(backend::occupied_ranges(base, end)?, base, end))
+    let mut ranges = backend::occupied_ranges(base, end)?;
+    // Below the floor nothing can be reserved, and no host's walk names it: macOS's region walk
+    // never reports the page zero -- nor the part of it the executable's slide moved above 4 GiB.
+    ranges.push((0, lowest_mappable_address()));
+    Ok(clip_and_merge(ranges, base, end))
 }
 
 /// `ranges` clipped to `[base, end)`, sorted, with overlapping and touching ranges merged and empty
@@ -786,6 +807,56 @@ pub unsafe fn protect(ptr: *mut u8, size: usize, protection: Protection) -> VmRe
     check_page_multiple(OP, "address", ptr as usize as u64)?;
     check_page_multiple(OP, "size", size as u64)?;
     backend::protect(ptr as usize, size, protection)
+}
+
+/// Whether this host can map a page a second time ([`alias`]). What a guest whose page is smaller
+/// than the host's needs (`omni-mem`'s sub-page overlay): an access the host page refuses but the
+/// guest's 4 KiB page allows is made through the alias. macOS only, for now; a 4 KiB host never
+/// needs one.
+#[must_use]
+pub fn supports_alias() -> bool {
+    backend::supports_alias()
+}
+
+/// Map `[src, src + size)` a second time, where the host chooses, read-write whatever the source
+/// allows; returns the new address. The second mapping is the same memory.
+///
+/// The alias is not part of this module's registry: nothing but [`unalias`] may be called on it.
+/// It follows the source's memory, not its address: a fresh mapping over the source (a
+/// [`decommit`]) leaves the alias holding the old memory, so the caller unaliases first.
+///
+/// # Errors
+///
+/// [`VmError::ZeroSize`], [`VmError::Misaligned`], [`VmError::Unsupported`] where
+/// [`supports_alias`] is false, or [`VmError::Os`].
+///
+/// # Safety
+///
+/// `src` must be committed private memory this process owns.
+pub unsafe fn alias(src: *mut u8, size: usize) -> VmResult<*mut u8> {
+    const OP: &str = "alias";
+    check_size(OP, size)?;
+    check_page_multiple(OP, "address", src as usize as u64)?;
+    check_page_multiple(OP, "size", size as u64)?;
+    backend::alias(src as usize, size).map(|a| a as *mut u8)
+}
+
+/// Undo [`alias`]: the second mapping is gone, and its address space given back. The source is
+/// untouched.
+///
+/// # Errors
+///
+/// As [`alias`].
+///
+/// # Safety
+///
+/// `[dst, dst + size)` must be what [`alias`] returned, and nothing may hold a reference into it.
+pub unsafe fn unalias(dst: *mut u8, size: usize) -> VmResult<()> {
+    const OP: &str = "unalias";
+    check_size(OP, size)?;
+    check_page_multiple(OP, "address", dst as usize as u64)?;
+    check_page_multiple(OP, "size", size as u64)?;
+    backend::unalias(dst as usize, size)
 }
 
 /// Open a file so that its contents can be mapped, and create the mapping object over it.

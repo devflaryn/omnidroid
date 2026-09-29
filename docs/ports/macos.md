@@ -30,6 +30,12 @@ tools/play.sh --cookie <file> --place <id>                  # or target/release/
 python3 tools/footprint_mac.py --match '[d]eps/gameactivity' # memory from outside, optional
 ```
 
+* **dynarmic's CMake build is per machine**, not in the checkout: with no
+  `OMNIDROID_DYNARMIC_BUILD_DIR`, `dynarmic-sys/build.rs` builds in
+  `~/Library/Caches/omnidroid/dynarmic/<target>-<profile>-<hash of the source path>` (it survives
+  `cargo clean`, and the checkout's path may hold a space). The arm64 backend runs the arm64 guest:
+  dynarmic translates A64 to A64 (no x64 path is involved), with fastmem, the low window (D41) and
+  per-thread caches.
 * **The APK must not be a symbolic link**: the gate hard-links it into the guest's root, and the
   guest filesystem refuses a link to a symlink.
 * Off Windows, `dynarmic-sys/build.rs` passes `DYNARMIC_USE_BUNDLED_EXTERNALS=ON`; without it CMake
@@ -81,7 +87,36 @@ the real `linker64` and `libc.so`; the only refusal is liblog's `socket` to logd
   TBI for user space (a native load through `ptr | 0x02 << 56` reaches `ptr`), so *without* the
   option a tagged guest pointer does not fault here either: `vm::host_ignores_top_byte`.
 * The sysroot is not in git: copy `sysroot/aosp-35` from another machine and check it with
-  `python3 tools/make_sysroot.py --verify sysroot/aosp-35`.
+  `python3 tools/make_sysroot.py --verify sysroot/aosp-35` -- or make it here (done on the M1,
+  2026-09-29: manifest sha256 `5b586655...`, the pinned one). `brew install e2fsprogs erofs-utils`
+  for `debugfs`/`fsck.erofs`, and give the tool a **case-sensitive** scratch volume: it `rdump`s the
+  ext4 images into `$TMPDIR`, and the image has paths that differ only by case (APFS is
+  case-insensitive by default):
+
+  ```sh
+  curl -LO https://dl.google.com/android/repository/sys-img/android/arm64-v8a-35_r02.zip
+  hdiutil create -size 20g -fs "Case-sensitive APFS" -volname omnics -type SPARSEBUNDLE cs.sparsebundle
+  hdiutil attach cs.sparsebundle -mountpoint ./cs -nobrowse && mkdir cs/tmp
+  export PATH=/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/erofs-utils/bin:$PATH TMPDIR=$PWD/cs/tmp
+  python3 tools/make_sysroot.py --zip arm64-v8a-35_r02.zip --out cs/aosp-35
+  python3 tools/make_sysroot.py --zip arm64-v8a-35_r02.zip --out cs/aosp-35 --meta
+  cp -R cs/aosp-35 sysroot/ && python3 tools/make_sysroot.py --verify sysroot/aosp-35
+  ```
+
+## The real-AOSP path (`omni-linux`) on macOS
+
+`tools/aosp_play.sh --apk <apk> --cookie <file> --place <id>` (the shell spelling of
+`aosp_play.ps1`). What it took, beyond the Linux personality that already ran here:
+
+* **ART's low 4 GiB** (D41, `macos-low-window.md`): nothing maps below 4 GiB on macOS, so a guest
+  space's part below 4 GiB is a based window and dynarmic adds the base there only (patch 0030).
+  Every guest address space gets its own window, so a second ART in one host process works here.
+* **Implicit null checks**: the Linux personality's CPU contexts serve a fault the guest meant once
+  (`recompile_on_declined_fault` off); arm64 otherwise moved each such load to the callback path
+  for good and the D4 invariant killed the process.
+* **The paravirtual GPU on MoltenVK**: the host loader from the platform's candidates (dyld does
+  not search `/opt/homebrew/lib`), and `VK_EXT_queue_family_foreign` emulated (ANGLE's
+  hardware-buffer images need it; MoltenVK has none). `tests/d3a_gpu.rs` 3/3.
 
 ## What differs on this host
 
@@ -105,9 +140,25 @@ default; evidence and how to run its tests: `macos-hvf.md`.
 
 ## Open
 
-* **Stale translated code on arm64** (m11): patch 0023 (branch `arm64-clear-audit`, `b6cab48`) makes
-  a mid-run clear forget the return-stack buffer. Owed before it merges: the unpatched build fails
-  the new test, the `mac-cpu-C` rows, the full arm64 suites, then an in-world run.
+* **Roblox 2.740.931 does not reach a world on this host (either path).** Its
+  `libzstd-jni-1.5.7-6.so` is linked for 4 KiB pages and is a packed library, and the app's startup
+  requires it. Measured on the M1 (2026-09-29):
+  - *real-AOSP path* (`tools/aosp_play.sh`): boots to `boot_completed=1` (~5 min), `pm install`,
+    the app starts, the library loads (`pagecompat`, widened `mprotect`) -- then within about a
+    minute of launch a thread of that library reads through a function table it never set up
+    (`SIGSEGV` at `0x40`) and the app dies, before it draws. On a real 16 KiB-page Android 15
+    device this build could not load the library at all, so that code has never run on 16 KiB
+    pages; a 4 KiB-page host runs it.
+  - *direct path* (`omnidroid play`): the loader refuses the same library
+    (`AlignBelowPageSize { align: 4096, page_size: 16384 }`).
+  What would close it: a Roblox build whose native libraries are 16 KiB-aligned, or a guest with
+  4 KiB pages on this 16 KiB host (sub-page mappings and protections in `omni-linux`'s `mm` --
+  large). Reverse-engineering that library's behaviour was stopped on purpose.
+
+* **Stale translated code on arm64** (m11): fixed in this tree by patch 0031 (a mid-run clear
+  forgets the return-stack buffer; `omni-cpu/tests/cache_clear_rsb.rs` fails without it). Branch
+  `arm64-clear-audit`'s patch 0023 addressed the same defect and is not merged; reconcile the two
+  if it is.
 * Captured pointer motion is accelerated; the physical wheel's sign under natural scrolling is not
   measured (`macos-window.md`). The census behind `OMNI_MEM_REPORT`'s host rows is not written.
 

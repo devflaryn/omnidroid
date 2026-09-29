@@ -38,16 +38,32 @@ struct FileMapping {
 
 pub struct Mm {
     space: Arc<GuestSpace>,
-    /// The page: the guest space's, which is the host's (4 KiB on Windows and x86-64 Linux, 16 KiB
-    /// on Apple silicon). The guest is told it (`AT_PAGESZ`), as a 16 KiB Android 15 device tells
-    /// its processes, so every mapping, protection and unmapping it asks for is whole host pages.
+    /// The guest's page: 4 KiB on every host that can give it (D42) -- the host's own on Windows and
+    /// x86-64 Linux, the sub-page overlay's on Apple silicon (`omni_mem::subpage`). The guest is told
+    /// it (`AT_PAGESZ`), and every `mmap`, `mprotect` and `munmap` is exact at it.
     page: u64,
+    /// The host's page: what a file view and a fresh placement are whole multiples of.
+    host_page: u64,
     /// The layout lock, held exclusively for every change: `MAP_FIXED`'s unmap-then-map must not
     /// interleave with another thread's mapping, nor any change with a syscall's copy.
     lock: crate::guest::Layout,
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
 }
 
+/// `OMNI_STRICT_GAPS=<prefix>,...`: named ranges (`PR_SET_VMA_ANON_NAME`, or a file's path) whose
+/// unmapped 4 KiB must fault even inside a host page that holds other mappings (D42's escape
+/// hatch; by default such a gap is lenient). Empty by default.
+fn strict_gap_prefixes() -> &'static [Vec<u8>] {
+    static LIST: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("OMNI_STRICT_GAPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|p| !p.is_empty())
+            .map(|p| p.as_bytes().to_vec())
+            .collect()
+    })
+}
 
 fn protection(prot: u32) -> Result<Protection, Errno> {
     Ok(match (prot & PROT_READ != 0, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0) {
@@ -66,8 +82,9 @@ fn protection(prot: u32) -> Result<Protection, Errno> {
 impl Mm {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>, lock: crate::guest::Layout) -> Self {
-        let page = space.page_size() as u64;
-        Self { space, page, lock, files: Mutex::default() }
+        let page = space.guest_page_size() as u64;
+        let host_page = space.page_size() as u64;
+        Self { space, page, host_page, lock, files: Mutex::default() }
     }
 
     /// The page size the guest is told and every `mmap`, `mprotect` and `munmap` is exact at.
@@ -78,6 +95,58 @@ impl Mm {
 
     const fn round_up(&self, v: u64) -> u64 {
         (v + self.page - 1) & !(self.page - 1)
+    }
+
+    const fn round_up_host(&self, v: u64) -> u64 {
+        (v + self.host_page - 1) & !(self.host_page - 1)
+    }
+
+    /// Whether a file at `offset` can be a view here: a view is whole host pages at a host-page
+    /// file offset, so the offset -- and, for a fixed address, the address -- must be host-page
+    /// aligned. A 4 KiB-aligned one on a larger host page (a library linked for 4 KiB pages) is a
+    /// private copy instead (D42).
+    fn viewable(&self, offset: u64, addr: u64, fixed: bool) -> bool {
+        offset % self.host_page == 0 && (!fixed || addr % self.host_page == 0)
+    }
+
+    /// A shared mapping a host view cannot honour: a *fixed* address that does not agree with its
+    /// file offset modulo the host page (a placement we choose is made to agree,
+    /// `map_shared_view`). Refused, as sharing a copy would silently not be sharing (D42).
+    fn refuse_unshareable(&self, p: &Process, t: &Task, req: &MapRequest, fixed: bool) -> Result<(), Errno> {
+        if !fixed || req.addr % self.host_page == req.offset % self.host_page {
+            return Ok(());
+        }
+        p.refusals.record("mmap: MAP_SHARED at a fixed address incongruent with its offset".into(), t.pc, t.lr);
+        Err(EINVAL)
+    }
+
+    /// Map `backed` bytes of `backing` from `req.offset` for a shared mapping of `len` bytes. A view
+    /// is whole host pages at a host-page file offset, so the view starts at the host page below the
+    /// offset and is placed so the guest's address agrees with the offset modulo the host page (an
+    /// FMQ ring, a plane of a graphics buffer, at a 4 KiB offset: D42). The view's parts before the
+    /// address and past `len` are given back as 4 KiB holes; anything of `len` past the view is
+    /// anonymous.
+    fn map_shared_view(&self, backing: &Arc<omni_mem::Backing>, req: &MapRequest, placement: Placement, backed: u64, len: u64, prot: Protection) -> Result<u64, omni_mem::MemError> {
+        let host = self.host_page;
+        let head = req.offset % host;
+        let viewed = self.round_up_host(head + backed);
+        let placement = match placement {
+            Placement::Fixed(a) => Placement::Fixed(a - head as usize),
+            Placement::Hint { address, align } => Placement::Hint { address: address & !(host as usize - 1), align },
+            anywhere @ Placement::Anywhere { .. } => anywhere,
+        };
+        let base = self.space.map_file(backing, req.offset - head, placement, viewed as usize, prot)? as u64;
+        let at = base + head;
+        if head > 0 {
+            self.space.unmap(base as usize, head as usize)?;
+        }
+        let from_at = viewed - head;
+        if from_at > len {
+            self.space.unmap((at + len) as usize, (from_at - len) as usize)?;
+        } else if len > from_at {
+            self.space.map_anonymous(Placement::Fixed((at + from_at) as usize), (len - from_at) as usize, prot, CommitPolicy::Lazy)?;
+        }
+        Ok(at)
     }
 
     /// `len` rounded up to pages, if `[addr, addr + len)` fits in the 56-bit user address range.
@@ -92,6 +161,19 @@ impl Mm {
     pub fn label(&self, start: u64, len: u64, name: &[u8]) {
         self.forget(start, len);
         self.files.lock().insert(start, FileMapping { len, guest: name.to_vec(), offset: 0 });
+        self.mark_strict(start, len, name);
+    }
+
+    /// A range named on `OMNI_STRICT_GAPS` gets strict gaps (`GuestSpace::set_strict_gaps`).
+    fn mark_strict(&self, start: u64, len: u64, name: &[u8]) {
+        let list = strict_gap_prefixes();
+        if list.is_empty() {
+            return;
+        }
+        let bare = name.strip_prefix(b"[anon:".as_slice()).and_then(|n| n.strip_suffix(b"]".as_slice())).unwrap_or(name);
+        if list.iter().any(|p| bare.starts_with(p)) {
+            self.space.set_strict_gaps(start as usize, len as usize, true);
+        }
     }
 
     /// The name and file offset at `addr`, if a mapping there is named.
@@ -198,7 +280,9 @@ impl Mm {
         if fixed && req.addr % self.page != 0 {
             return Err(EINVAL);
         }
-        let page = self.page as usize;
+        // A placement the guest leaves to us is whole host pages of its own, so separate mappings
+        // never share a host page (the 4 KiB overlay then has nothing to split for them).
+        let page = self.host_page as usize;
         let placement = if fixed {
             Placement::Fixed(req.addr as usize)
         } else if req.addr != 0 {
@@ -275,28 +359,22 @@ impl Mm {
         };
         if let Some(m) = shm {
             let name = format!("/memfd:{}", m.name).into_bytes();
+            self.refuse_unshareable(p, t, &req, fixed)?;
             let host = m.dup_file().map_err(|_| ENODEV)?;
             let backing = omni_mem::Backing::share(host, &String::from_utf8_lossy(&name)).map_err(|_| ENODEV)?;
             let backed = self.round_up((m.len()).saturating_sub(req.offset)).min(len);
             let at = if backed > 0 {
-                self.space
-                    .map_file(&backing, req.offset, placement, backed as usize, prot)
-                    .map_err(|e| {
-                        if fixed {
-                            eprintln!("[mm] {} at {:#x}+{backed:#x} refused: {e}", String::from_utf8_lossy(&name), req.addr);
-                        }
-                        refused_fixed(ENOMEM)
-                    })? as u64
+                self.map_shared_view(&backing, &req, placement, backed, len, prot).map_err(|e| {
+                    if fixed {
+                        eprintln!("[mm] {} at {:#x}+{backed:#x} refused: {e}", String::from_utf8_lossy(&name), req.addr);
+                    }
+                    refused_fixed(ENOMEM)
+                })?
             } else {
                 self.space
                     .map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy)
                     .map_err(|_| refused_fixed(ENOMEM))? as u64
             };
-            if len > backed && backed > 0 {
-                self.space
-                    .map_anonymous(Placement::Fixed((at + backed) as usize), (len - backed) as usize, prot, CommitPolicy::Lazy)
-                    .map_err(|_| ENOMEM)?;
-            }
             self.forget(at, len);
             self.files.lock().insert(at, FileMapping { len, guest: name, offset: req.offset });
             return Ok(at);
@@ -342,21 +420,17 @@ impl Mm {
             _ => None,
         };
         if let Some((host, guest, file_len)) = shared {
+            self.refuse_unshareable(p, t, &req, fixed)?;
             let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
             let at = if in_file > 0 {
                 let backing = omni_mem::Backing::share(host, &String::from_utf8_lossy(&guest)).map_err(|_| {
                     p.refusals.record("mmap: MAP_SHARED of a file the host cannot share".into(), t.pc, t.lr);
                     ENODEV
                 })?;
-                self.space.map_file(&backing, req.offset, placement, in_file as usize, prot).map_err(|_| refused_fixed(ENOMEM))? as u64
+                self.map_shared_view(&backing, &req, placement, in_file, len, prot).map_err(|_| refused_fixed(ENOMEM))?
             } else {
                 self.space.map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy).map_err(|_| refused_fixed(ENOMEM))? as u64
             };
-            if len > in_file && in_file > 0 {
-                self.space
-                    .map_anonymous(Placement::Fixed((at + in_file) as usize), (len - in_file) as usize, prot, CommitPolicy::Lazy)
-                    .map_err(|_| ENOMEM)?;
-            }
             self.forget(at, len);
             self.files.lock().insert(at, FileMapping { len, guest, offset: req.offset });
             return Ok(at);
@@ -372,7 +446,7 @@ impl Mm {
         };
         // The part of the request the file covers, in whole pages; the rest is anonymous zeros.
         let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
-        let backing = if in_file == 0 {
+        let backing = if in_file == 0 || !self.viewable(req.offset, req.addr, fixed) {
             None
         } else if sysroot {
             Some(p.vfs.sysroot().backing(&guest)?)
@@ -385,7 +459,8 @@ impl Mm {
         // every process -- fell back to a private copy of all of it (26 MiB of ICU data twice in
         // each app process, run 2026-09-29). Now the whole pages are the view and only the last,
         // partial page is a private copy (below).
-        let whole = (file_len.saturating_sub(req.offset) / self.page_size() * self.page_size()).min(len);
+        // Whole *host* pages: what a view can be (D42).
+        let whole = (file_len.saturating_sub(req.offset) / self.host_page * self.host_page).min(len / self.host_page * self.host_page);
         let at = if let (Some(backing), true) = (backing, whole > 0) {
             if whole == in_file {
                 match self.space.map_file(&backing, req.offset, placement, in_file as usize, prot) {
@@ -513,15 +588,64 @@ fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             }
         }
     }
-    p.mm.map(p, t, MapRequest { addr: a[0], len: a[1], prot: a[2] as u32, flags: a[3] as u32, fd: a[4] as i64 as i32, offset: a[5] })
+    let r = p.mm.map(p, t, MapRequest { addr: a[0], len: a[1], prot: a[2] as u32, flags: a[3] as u32, fd: a[4] as i64 as i32, offset: a[5] });
+    mmap_watch(p, t, a, &r);
+    r
+}
+
+/// **Diagnostic** (`OMNI_MMAP_WATCH=<length>`, off by default): every anonymous `mmap` of exactly
+/// that length is logged -- thread, where it was called from, what it answered, and when.
+fn mmap_watch(p: &Process, t: &Task, a: [u64; 6], r: &Result<u64, Errno>) {
+    static WATCH: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let Some(len) = *WATCH.get_or_init(|| std::env::var("OMNI_MMAP_WATCH").ok().and_then(|v| v.parse().ok())) else { return };
+    if a[1] != len || a[3] & u64::from(MAP_ANONYMOUS) == 0 {
+        return;
+    }
+    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis();
+    eprintln!(
+        "[mmap-watch] +{ms}ms pid {} tid {} ({}) pc {:#x} {} lr {:#x} {} prot {} flags {:#x} -> {:?}",
+        p.sys.pid, t.tid, String::from_utf8_lossy(&t.name), t.pc, p.mm.describe(t.pc).unwrap_or_default(), t.lr, p.mm.describe(t.lr).unwrap_or_default(), a[2], a[3], r
+    );
 }
 
 fn sys_munmap(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    p.mm.unmap(a[0], a[1]).map(|()| 0)
+    let probed = smc_probe(p, a[0], a[1], None);
+    p.mm.unmap(a[0], a[1])?;
+    if probed {
+        p.invalidate_code(crate::guest::untag(a[0]), a[1]);
+    }
+    Ok(0)
 }
 
 fn sys_mprotect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    p.mm.protect(a[0], a[1], a[2] as u32).map(|()| 0)
+    let probed = smc_probe(p, a[0], a[1], Some(a[2] as u32));
+    p.mm.protect(a[0], a[1], a[2] as u32)?;
+    if probed {
+        p.invalidate_code(crate::guest::untag(a[0]), a[1]);
+    }
+    Ok(0)
+}
+
+/// **Diagnostic probe** (`OMNI_SMC_PROBE=<name part>`, off by default): an `mprotect` or `munmap` of
+/// a mapping whose name contains it drops that range's translations on every thread, and is logged
+/// with its protection -- whether a library that rewrites its own code runs stale translations.
+fn smc_probe(p: &Process, addr: u64, len: u64, prot: Option<u32>) -> bool {
+    static WANT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let Some(want) = WANT.get_or_init(|| std::env::var("OMNI_SMC_PROBE").ok().filter(|w| !w.is_empty()).map(String::into_bytes)) else {
+        return false;
+    };
+    let addr = crate::guest::untag(addr);
+    let Some((name, offset)) = p.mm.name_at(addr) else { return false };
+    if !name.windows(want.len()).any(|w| w == want.as_slice()) {
+        return false;
+    }
+    let tail = name.rsplit(|&b| b == b'/').next().unwrap_or(&name);
+    match prot {
+        Some(prot) => eprintln!("[smc] {} mprotect {}+{offset:#x} len {len:#x} prot {prot}", p.sys.pid, String::from_utf8_lossy(tail)),
+        None => eprintln!("[smc] {} munmap {}+{offset:#x} len {len:#x}", p.sys.pid, String::from_utf8_lossy(tail)),
+    }
+    true
 }
 
 /// `madvise`. The advice that changes what memory reads -- `MADV_DONTNEED` and `MADV_REMOVE` --

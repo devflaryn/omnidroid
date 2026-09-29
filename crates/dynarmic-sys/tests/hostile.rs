@@ -126,6 +126,7 @@ fn absurd_configurations_are_refused_rather_than_asserted() {
         check_halt_on_memory_access: 0,
         unsafe_optimizations: 0,
         optimizations: optimization::ALL_SAFE,
+        fastmem_low_window: 0,
     };
 
     let mut rejected: Vec<&str> = Vec::new();
@@ -268,6 +269,7 @@ fn a_processor_id_past_the_end_of_the_monitor_is_refused() {
         check_halt_on_memory_access: 0,
         unsafe_optimizations: 0,
         optimizations: optimization::ALL_SAFE,
+        fastmem_low_window: 0,
     };
     // SAFETY: `cfg` is fully initialised.
     let p = unsafe { od_jit_new(&cfg) };

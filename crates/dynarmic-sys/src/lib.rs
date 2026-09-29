@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 4;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 5;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -288,6 +288,10 @@ pub struct OdConfig {
     /// emits (D33, D35); `tests/hostile.rs`'s `the_stoppability_matrix` is what
     /// says they are still there.
     pub optimizations: u32,
+    /// D41 (patch 0030): [`fastmem_pointer`](Self::fastmem_pointer) is added only to a guest
+    /// address below 2^32; at and above it the host address is the guest address. arm64 hosts
+    /// only (`od_jit_new` refuses it elsewhere), with fastmem on and a window wider than 32 bits.
+    pub fastmem_low_window: i32,
 }
 
 /// `OdConfig::optimizations` bits, mirroring `Dynarmic::OptimizationFlag`.
@@ -418,6 +422,8 @@ pub struct OdEffectiveConfig {
     pub tpidr_el0_ptr: u64,
     /// Address of the `TPIDRRO_EL0` slot.
     pub tpidrro_el0_ptr: u64,
+    /// 1 if `fastmem_pointer` applies below 2^32 only (D41, patch 0030).
+    pub fastmem_low_window: i32,
 }
 
 /// Bytes of per-jit state this pin allocates **when the `FastDispatch` optimization is enabled**,

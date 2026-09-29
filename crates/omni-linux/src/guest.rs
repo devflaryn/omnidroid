@@ -70,12 +70,9 @@ impl GuestMem {
 
     /// `read`, for a caller that holds the layout lock exclusively.
     pub(crate) fn read_holding_layout(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
-        let ptr = self.check(addr, len, false)?;
+        let start = self.check(addr, len, false)?;
         let mut out = vec![0u8; len];
-        if len != 0 {
-            // SAFETY: `check` proved [addr, addr+len) mapped, readable and committed.
-            unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len) };
-        }
+        self.copy_out(start, &mut out);
         Ok(out)
     }
 
@@ -90,9 +87,9 @@ impl GuestMem {
         &self.layout
     }
 
-    fn check(&self, addr: u64, len: usize, write: bool) -> Result<*mut u8, Errno> {
+    fn check(&self, addr: u64, len: usize, write: bool) -> Result<usize, Errno> {
         if len == 0 {
-            return Ok(std::ptr::null_mut());
+            return Ok(0);
         }
         let start = usize::try_from(untag(addr)).map_err(|_| EFAULT)?;
         let end = start.checked_add(len).ok_or(EFAULT)?;
@@ -124,7 +121,28 @@ impl GuestMem {
         if commit {
             self.space.ensure_committed(start, len).map_err(|_| EFAULT)?;
         }
-        self.space.ptr(start, len).map_err(|_| EFAULT)
+        self.space.ptr(start, len).map_err(|_| EFAULT)?;
+        Ok(start)
+    }
+
+    /// Copy the checked range `[start, start + out.len())` out, piece by piece where it crosses a
+    /// host page the 4 KiB overlay traps (its alias), in one copy otherwise (D42).
+    fn copy_out(&self, start: usize, out: &mut [u8]) {
+        self.space.for_each_access_chunk(start, out.len(), |g, p, n| {
+            let at = g - start;
+            // SAFETY: `check` proved the range mapped, readable and committed; each piece's pointer
+            // is its host address or its page's read-write alias.
+            unsafe { std::ptr::copy_nonoverlapping(p, out[at..at + n].as_mut_ptr(), n) };
+        });
+    }
+
+    /// Copy `bytes` into the checked range at `start`, piece by piece as [`copy_out`](Self::copy_out).
+    fn copy_in(&self, start: usize, bytes: &[u8]) {
+        self.space.for_each_access_chunk(start, bytes.len(), |g, p, n| {
+            let at = g - start;
+            // SAFETY: `check` proved the range mapped, writable and committed.
+            unsafe { std::ptr::copy_nonoverlapping(bytes[at..at + n].as_ptr(), p, n) };
+        });
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
@@ -132,12 +150,9 @@ impl GuestMem {
             return r.read(untag(addr), len);
         }
         let _layout = self.layout.read();
-        let ptr = self.check(addr, len, false)?;
+        let start = self.check(addr, len, false)?;
         let mut out = vec![0u8; len];
-        if len != 0 {
-            // SAFETY: `check` proved [addr, addr+len) mapped, readable and committed.
-            unsafe { std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len) };
-        }
+        self.copy_out(start, &mut out);
         Ok(out)
     }
 
@@ -152,11 +167,10 @@ impl GuestMem {
         if let Some(r) = self.remote.get() {
             return r.write(untag(addr), bytes);
         }
-        let ptr = self.check(addr, bytes.len(), true)?;
+        let start = self.check(addr, bytes.len(), true)?;
         if !bytes.is_empty() {
             self.note(addr, bytes.len());
-            // SAFETY: `check` proved the range mapped, writable and committed.
-            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+            self.copy_in(start, bytes);
         }
         Ok(())
     }
@@ -167,7 +181,12 @@ impl GuestMem {
         if untag(addr) % 4 != 0 {
             return Err(crate::errno::EINVAL);
         }
-        let ptr = self.check(addr, 4, true)?;
+        let start = self.check(addr, 4, true)?;
+        // Four aligned bytes are one host page: its address, or its alias if the page traps (D42).
+        let ptr = match self.space.access_ptr(start, 4) {
+            omni_mem::AccessPtr::Direct(p) | omni_mem::AccessPtr::Alias(p) => p,
+            omni_mem::AccessPtr::Straddle => return Err(EFAULT),
+        };
         self.note(addr, 4);
         // SAFETY: `check` proved the four bytes mapped, writable and committed; they are aligned;
         // guest memory outlives `self`, and every access to it is atomic or byte-wise.
