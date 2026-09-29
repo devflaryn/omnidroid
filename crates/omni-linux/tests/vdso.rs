@@ -14,7 +14,9 @@ fn bionic_reads_the_clock_through_the_vdso_and_it_agrees_with_the_system_call() 
     let line = out.lines().find(|l| l.starts_with("clock_gettime:")).expect("the timing line");
     let figure = |after: &str| -> u64 { line.split(after).nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse().ok()).expect("a figure") };
     let (libc, syscall) = (figure("libc "), figure("system call "));
-    // A libc call that made the system call could not be faster than the bare call; half is the vDSO.
-    assert!(libc * 2 < syscall, "bionic's clock_gettime ({libc} ns) should be well under the system call's ({syscall} ns): it is not taking the vDSO");
+    // A libc call that made the system call could not be faster than the bare call, so one clearly
+    // below it is the vDSO. How far below is the host's: Windows 53 against 153 ns, the Linux host
+    // (i5-4460) 122 against 205 -- under three quarters leaves room for noise on both.
+    assert!(libc * 4 < syscall * 3, "bionic's clock_gettime ({libc} ns) should be well under the system call's ({syscall} ns): it is not taking the vDSO");
     assert!(out.contains("resolution 1 ns"), "{out}");
 }
