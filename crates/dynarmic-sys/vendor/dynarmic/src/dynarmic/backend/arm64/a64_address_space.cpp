@@ -807,12 +807,27 @@ void A64AddressSpace::EmitPrelude() {
 
         code.LDR(X0, l_this);
         code.MOV(X1, Xstate);
+        code.MOV(X2, SP);
         code.LDR(Xscratch0, l_addr);
         code.BLR(Xscratch0);
         code.BR(X0);
 
-        const auto fn = [](A64AddressSpace& self, A64JitState& context) -> CodePtr {
-            return self.GetOrEmit(context.GetLocationDescriptor());
+        // Omnidroid patch 0031: emitting a block clears the whole cache when less than 1 MiB is
+        // left (`AddressSpace::Emit`), and that happens here, inside the run. The return-stack
+        // buffer in this run's frame (SP is the `StackLayout`) still held host code of the blocks
+        // just cleared, where other blocks are written next, and a `ret` whose target matched
+        // jumped into the translation of another function (docs/ports/macos.md, m11; the real
+        // AOSP path on arm64). After a clear every entry points at the dispatcher again, as the
+        // prelude leaves them.
+        const auto fn = [](A64AddressSpace& self, A64JitState& context, StackLayout& frame) -> CodePtr {
+            const u64 clears = self.CacheClears();
+            const CodePtr entry = self.GetOrEmit(context.GetLocationDescriptor());
+            if (self.CacheClears() != clears) {
+                for (RSBEntry& rsb : frame.rsb) {
+                    rsb.code_ptr = mcl::bit_cast<u64>(self.prelude_info.return_to_dispatcher);
+                }
+            }
+            return entry;
         };
 
         code.align(8);

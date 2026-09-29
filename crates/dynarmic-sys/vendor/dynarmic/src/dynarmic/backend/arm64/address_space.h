@@ -47,6 +47,10 @@ public:
     // what a derived address space keeps per block.
     virtual void ClearCache();
 
+    // Omnidroid patch 0031: how many times the cache has been cleared, so that the dispatcher can
+    // tell a clear made while it emitted a block -- inside a run -- from none.
+    u64 CacheClears() const { return cache_clears; }
+
     void DumpDisassembly() const;
 
 protected:
@@ -75,6 +79,7 @@ protected:
     FakeCall FastmemCallback(u64 host_pc);
 
     const size_t code_cache_size;
+    u64 cache_clears = 0;
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;
 

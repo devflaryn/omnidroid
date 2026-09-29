@@ -242,3 +242,18 @@ below 4 GiB, running ART, whose heap must be there. Off by default; the x64 back
 field and the shim refuses it on an x64 host. Verified: `omni-cpu/tests/low_window.rs` (a load,
 a store and an exclusive pair at a low address reach `W + g`, a high address stays the identity,
 demand paging in the window, zero slow-path entries, with and without Top Byte Ignore).
+
+### 0031 — arm64: a mid-run cache clear forgets the return-stack buffer
+
+arm64. `AddressSpace::Emit` clears the whole cache when a block is emitted with less than 1 MiB
+left, and that happens inside a run (the dispatcher calls into the emitter). The return-stack
+buffer lives in the run's frame and kept the host code of the blocks just cleared, where other
+blocks are then written: a guest `ret` whose target matched jumped into the translation of another
+function. It is `docs/ports/macos.md`'s m11 ("a call landed in the translation of another
+function") and, on the real-AOSP path, `system_server`'s `android.bg` thread jumping into its own
+stack. The dispatcher now passes its frame (`SP`) to the emit callback, which points every RSB
+entry at the dispatcher again when the cache was cleared (`AddressSpace::CacheClears`), as the
+prelude leaves them. (Branch `arm64-clear-audit`'s patch 0023 addressed the same defect and is
+not in this tree.) Verified: `omni-cpu/tests/cache_clear_rsb.rs` -- one call site, a first call
+that returns at once, a second through a chain of 400,000 conditional-branch blocks (several 8 MiB
+caches): (2, 2) without the patch, the chain run twice; (2, 1) with it.

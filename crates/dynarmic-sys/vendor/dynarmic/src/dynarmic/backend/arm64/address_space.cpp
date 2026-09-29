@@ -107,6 +107,7 @@ void AddressSpace::ClearCache() {
     decltype(link_records){}.swap(link_records);
     link_heads = {};
     code.set_offset(prelude_info.end_of_prelude);
+    cache_clears++;
 }
 
 void AddressSpace::DumpDisassembly() const {

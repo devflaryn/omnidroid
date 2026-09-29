@@ -36,6 +36,7 @@ dynarmic/
                and ../patches/0028-x64-a-full-region-is-not-a-flush-the-oldest-region-is-retired.patch
                and ../patches/0029-x64-an-ordered-load-is-a-plain-mov.patch
                and ../patches/0030-arm64-a-low-window-for-the-guest-s-first-4-gib.patch
+               and ../patches/0031-arm64-a-mid-run-clear-forgets-the-return-stack-buffer.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
