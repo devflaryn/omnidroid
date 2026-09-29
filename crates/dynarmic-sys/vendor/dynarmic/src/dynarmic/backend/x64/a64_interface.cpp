@@ -957,11 +957,14 @@ void SharedCodeCache::Impl::ForgetEverything(SharedThreadState* thread) {
     blocks_invalidated += emitter.ForgetAllBlocks();
     generation.fetch_add(1, std::memory_order_seq_cst);
     last_evicted = {};
-    // Patch 0028: the emitter's serials start again from 0; the region being filled goes on from
-    // there, and the full ones, whose blocks are all forgotten, are given back.
+    // Patch 0028: the emitter's serials start again from 0, and the full regions, whose blocks are
+    // all forgotten, are given back. Patch 0030: so is the region being filled -- its blocks are
+    // forgotten too, and a cache whose code fits in one region (a service that translated its
+    // start and then waits) would otherwise keep all of it committed through a clear. The next
+    // block starts a fresh region, committed as it fills.
     if (current != NO_REGION) {
-        regions[current].first_link = 0;
-        regions[current].first_range = 0;
+        regions[current].state = Region::State::Full;
+        current = NO_REGION;
     }
     for (Region& r : regions) {
         if (r.state == Region::State::Full) {

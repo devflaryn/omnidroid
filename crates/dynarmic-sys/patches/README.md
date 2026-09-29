@@ -230,3 +230,17 @@ It also applies to the Roblox path and to the inline exclusive reads (`LDXR`/`LD
 decides success, so a plain load is sufficient there too.
 Verified: `omni-cpu/tests/tbi.rs::a_load_acquire_from_a_read_only_page_stays_on_the_direct_path`
 (fails without the patch, with and without Top Byte Ignore).
+
+### 0030 — x64 shared cache: a clear gives back the region being filled
+
+x64. A clear (`ClearCache`, what `omni-linux`'s `code_trim` does to a quiet process) forgot every
+block but retired only the full regions: the region being filled stayed committed and went on
+filling from where it was. A cache whose code fits in one 16 MiB region -- most of the ~60 services
+of the system's host process, which translate their start and then wait in binder -- kept all of it
+through the trim: 65 caches held 462 MiB after the trims had run (run 2026-09-29, `OMNI_MEM_TRACE`).
+Now the clear retires that region too, through the same retire-and-reclaim path as a full one (its
+threads asked to leave generated code, a parked thread's resume redirected), and the next block
+starts a fresh region, committed as it fills.
+Verified: `tests/shared_cache.rs::a_clear_gives_back_the_region_being_filled` (5.7 -> 3.0 MB
+committed, the prelude kept) and `a_full_region_is_not_a_flush_and_the_oldest_region_goes_first`'s
+clear (no live region after it).

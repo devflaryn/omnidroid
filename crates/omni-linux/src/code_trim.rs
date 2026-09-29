@@ -22,8 +22,11 @@ use std::time::{Duration, Instant};
 pub const PERIOD: Duration = Duration::from_secs(60);
 /// New translations under this over a period: the process is quiet.
 pub const QUIET_BYTES: u64 = 1 << 20;
-/// Translations under this are not worth dropping (a region being filled is kept anyway).
-pub const MIN_BYTES: u64 = 24 << 20;
+/// Translations under this are not worth dropping (a region being filled is kept anyway). 8 MiB:
+/// the system's host process runs ~60 guest processes, most of them services that translate
+/// 8-24 MiB while they start and then sit in a binder wait -- together more than the few large
+/// ones a higher floor was set for.
+pub const MIN_BYTES: u64 = 8 << 20;
 /// A process is trimmed at most this often.
 pub const AGAIN_AFTER: Duration = Duration::from_secs(600);
 /// A host process using more than this of a core is busy.

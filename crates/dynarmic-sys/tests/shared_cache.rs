@@ -1118,14 +1118,48 @@ fn a_full_region_is_not_a_flush_and_the_oldest_region_goes_first() {
     assert!(max_committed <= LIVE + REGION + (4 << 20), "committed {max_committed}: {end:?}");
     assert_eq!(end.regions_live, LIVE / REGION, "{end:?}");
 
-    // A clear forgets every block: the full regions, holding none now, are given back at once
-    // (no jit is running), and only the region being filled stays.
+    // A clear forgets every block: every region, holding none now, is given back at once (no jit
+    // is running) -- the one being filled too (patch 0030) -- and only the prelude stays.
     // SAFETY: the cache is live and its one jit is not executing.
     unsafe { od_code_cache_clear(space.cache as *mut c_void) };
     let cleared = space.stats();
-    assert_eq!((cleared.regions_live, cleared.regions_pinned), (1, 0), "{cleared:?}");
-    assert!(cleared.committed_bytes <= REGION + (4 << 20), "{cleared:?}");
+    assert_eq!((cleared.regions_live, cleared.regions_pinned), (0, 0), "{cleared:?}");
+    assert!(cleared.committed_bytes <= 4 << 20, "{cleared:?}");
     run_chain(&vm, 0, HOT);
+}
+
+/// **A clear gives back the region being filled** (patch 0030). A cache whose code fits in one
+/// region -- a service that translated its start and then waits -- kept all of it committed
+/// through a clear, since only full regions were retired: the idle process's translations were
+/// forgotten but not given back. Now the clear retires that region too, and the next block starts
+/// a fresh one, committed as it fills.
+#[test]
+fn a_clear_gives_back_the_region_being_filled() {
+    const BLOCKS: usize = 60_000;
+    let program = chain(BLOCKS);
+    let space = Space::new(VmOptions::default(), 2, CACHE, REGION, &program);
+    let vm = space.vm(0, true);
+    vm.start(u64::MAX >> 2);
+    assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), BLOCKS as u64);
+    let filled = space.stats();
+    assert_eq!(filled.regions_live, 1, "the chain fits in one region: {filled:?}");
+    assert!(filled.committed_bytes >= 4 << 20, "and committed several MiB of it: {filled:?}");
+
+    // SAFETY: the cache is live and its one jit is not executing.
+    unsafe { od_code_cache_clear(space.cache as *mut c_void) };
+    let cleared = space.stats();
+    assert_eq!((cleared.regions_live, cleared.regions_pinned), (0, 0), "{cleared:?}");
+    assert!(cleared.committed_bytes <= 4 << 20, "given back, the prelude kept: {cleared:?}");
+    assert!(cleared.committed_bytes + (4 << 20) <= filled.committed_bytes, "{filled:?} -> {cleared:?}");
+
+    // The same jit runs on: its next blocks start a fresh region.
+    vm.set_reg(0, 0);
+    vm.start(u64::MAX >> 2);
+    assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
+    assert_eq!(vm.reg(0), BLOCKS as u64, "the program runs as before");
+    let again = space.stats();
+    assert_eq!(again.regions_live, 1, "{again:?}");
 }
 
 /// **A block translated again elsewhere survives its old region's eviction, and nothing links into
