@@ -310,6 +310,12 @@ pub struct GuestSpaceConfig {
     /// (`vm::lowest_mappable_address` is 4 GiB on Apple silicon). Where the host can map low, the
     /// window is not needed, and it works just the same.
     pub low_window: bool,
+    /// Ask for 4 KiB guest pages ([`crate::GUEST_PAGE`], the only value accepted): `map_anonymous`,
+    /// `protect`, `unmap` and `discard` are then exact to 4 KiB whatever the host's page is. On a
+    /// host whose page is larger and that can map a page twice (`vm::supports_alias`: macOS), the
+    /// space keeps a sub-page overlay (`crate::subpage`); where the host page is 4 KiB it needs none
+    /// and behaves exactly as without. `None` (the default): the space's page is the host's.
+    pub guest_page: Option<usize>,
 }
 
 impl Default for GuestSpaceConfig {
@@ -323,6 +329,7 @@ impl Default for GuestSpaceConfig {
             max_commit_request: DEFAULT_MAX_COMMIT_REQUEST,
             around_host: false,
             low_window: false,
+            guest_page: None,
         }
     }
 }
@@ -475,6 +482,9 @@ pub struct GuestSpace {
     /// space's life, so it is read without the lock.
     window: Option<LowWindow>,
     inner: Mutex<Inner>,
+    /// The 4 KiB overlay, when [`GuestSpaceConfig::guest_page`] asked for it and the host needs
+    /// and can give one (`crate::subpage`).
+    sub: Option<crate::subpage::SubPagesHandle>,
     /// Bumped by every write section, under the lock and before the write; read without the lock
     /// by `crate::cache` to decide whether a remembered entry is still true.
     generation: Generation,
@@ -602,6 +612,13 @@ impl GuestSpace {
                 reason: "must not be larger than the guest address space",
             });
         }
+        if config.guest_page.is_some_and(|g| g != crate::subpage::GUEST_PAGE) {
+            return Err(MemError::InvalidConfig {
+                field: "guest_page",
+                value: config.guest_page.unwrap_or(0) as u64,
+                reason: "only 4096 is supported",
+            });
+        }
         if !config.base_alignment.is_power_of_two() {
             return Err(MemError::InvalidConfig {
                 field: "base_alignment",
@@ -702,6 +719,8 @@ impl GuestSpace {
                 max_commit_request: config.max_commit_request,
             }),
             generation: Generation::new(),
+            sub: (config.guest_page.is_some() && page > crate::subpage::GUEST_PAGE && vm::supports_alias())
+                .then(|| crate::subpage::SubPagesHandle::new(page / crate::subpage::GUEST_PAGE)),
         })
     }
 
@@ -755,6 +774,35 @@ impl GuestSpace {
     #[must_use]
     pub fn page_size(&self) -> usize {
         self.page
+    }
+
+    /// The page the guest maps, protects and unmaps at: [`crate::GUEST_PAGE`] when this space keeps
+    /// a 4 KiB overlay, otherwise [`page_size`](Self::page_size).
+    #[must_use]
+    pub fn guest_page_size(&self) -> usize {
+        if self.sub.is_some() {
+            crate::subpage::GUEST_PAGE
+        } else {
+            self.page
+        }
+    }
+
+    /// Whether this space keeps the 4 KiB overlay (`crate::subpage`).
+    #[must_use]
+    pub fn subpages_active(&self) -> bool {
+        self.sub.is_some()
+    }
+
+    /// Whether the host page holding `address` traps: some 4 KiB of it allows an access the host
+    /// page refuses, and a served access goes through its alias. Lock-free, and one load when
+    /// nothing traps; always `false` without the overlay (SUBPAGE-ORDER 2).
+    #[inline]
+    #[must_use]
+    pub fn is_trapping(&self, address: GuestAddr) -> bool {
+        match &self.sub {
+            Some(sub) if address >= self.base && address < self.end() => sub.is_trapping((address - self.base) / self.page),
+            _ => false,
+        }
     }
 
     /// Whether `[address, address + len)` is inside this space.

@@ -17,7 +17,12 @@
 //!
 //! This module is the pure part: what a page's parts mean. `space.rs` applies it to the host.
 
-use omni_platform::vm::Protection;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+
+use omni_platform::vm::{Protection, Reservation};
+use parking_lot::Mutex;
 
 /// The guest's page: the smallest page an arm64 Linux guest is built for, and the one a space
 /// that asks ([`crate::GuestSpaceConfig::guest_page`]) maps, protects and unmaps at, whatever the
@@ -114,6 +119,85 @@ impl Split {
     /// Set parts `[from, to)` to `part`.
     pub(crate) fn set(&mut self, from: usize, to: usize, part: Part) {
         self.parts[from..to].fill(part);
+    }
+}
+
+/// A space's overlay, present only when it is active (the space asked for [`GUEST_PAGE`]s, the
+/// host page is larger, and the host can alias).
+///
+/// The lock-free part is what the fault path reads (SUBPAGE-ORDER 2): `count` -- the number of
+/// trapping host pages, zero almost always, which answers "no" with one load -- and one bit per
+/// host page of the space. Everything else is in `state`, taken only while the space's own lock is
+/// held (SUBPAGE-ORDER 1).
+pub(crate) struct SubPagesHandle {
+    /// Trapping host pages: the number of set bits.
+    pub(crate) count: AtomicUsize,
+    /// One bit per host page of the space, allocated at the first trapping page.
+    pub(crate) bits: OnceLock<Box<[AtomicU64]>>,
+    pub(crate) state: Mutex<SubPages>,
+    /// Accesses the slow path served through an alias, for the report.
+    pub(crate) served_total: AtomicU64,
+}
+
+/// The overlay's state: the tracked host pages, the alias reservation and what it holds.
+pub(crate) struct SubPages {
+    pub(crate) parts_per_page: usize,
+    /// Host pages the guest has cut into differently-treated parts, by host page address.
+    pub(crate) split: BTreeMap<usize, Split>,
+    /// A reservation the size of the space, made at the first alias: host page `P`'s alias is at
+    /// `alias_base + (P - space base)`.
+    pub(crate) alias: Option<Reservation>,
+    /// Host pages with a live alias -- trapping now, or once (an alias goes only with its page).
+    pub(crate) aliased: BTreeSet<usize>,
+    /// Guest ranges whose unmapped parts must fault (`[start, end)`).
+    pub(crate) strict: Vec<(usize, usize)>,
+    /// Accesses served, by host page.
+    pub(crate) served: HashMap<usize, u64>,
+}
+
+impl SubPagesHandle {
+    pub(crate) fn new(parts_per_page: usize) -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            bits: OnceLock::new(),
+            state: Mutex::new(SubPages {
+                parts_per_page,
+                split: BTreeMap::new(),
+                alias: None,
+                aliased: BTreeSet::new(),
+                strict: Vec::new(),
+                served: HashMap::new(),
+            }),
+            served_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether host page number `index` of the space traps. Lock-free (SUBPAGE-ORDER 2, 3).
+    #[inline]
+    pub(crate) fn is_trapping(&self, index: usize) -> bool {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.bits.get().and_then(|b| b.get(index / 64)).is_some_and(|w| w.load(Ordering::Acquire) & (1 << (index % 64)) != 0)
+    }
+
+    /// Set or clear host page `index`'s bit, keeping `count` the number of set bits. `pages` is
+    /// the space's length in host pages (for the first allocation). Called with the space's lock
+    /// held.
+    pub(crate) fn set_trapping(&self, index: usize, pages: usize, on: bool) {
+        let bits = self.bits.get_or_init(|| (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect());
+        let word = &bits[index / 64];
+        let mask = 1u64 << (index % 64);
+        let was = if on { word.fetch_or(mask, Ordering::Release) } else { word.fetch_and(!mask, Ordering::Release) };
+        match (was & mask != 0, on) {
+            (false, true) => {
+                self.count.fetch_add(1, Ordering::Release);
+            }
+            (true, false) => {
+                self.count.fetch_sub(1, Ordering::Release);
+            }
+            _ => {}
+        }
     }
 }
 
