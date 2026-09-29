@@ -588,7 +588,25 @@ fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             }
         }
     }
-    p.mm.map(p, t, MapRequest { addr: a[0], len: a[1], prot: a[2] as u32, flags: a[3] as u32, fd: a[4] as i64 as i32, offset: a[5] })
+    let r = p.mm.map(p, t, MapRequest { addr: a[0], len: a[1], prot: a[2] as u32, flags: a[3] as u32, fd: a[4] as i64 as i32, offset: a[5] });
+    mmap_watch(p, t, a, &r);
+    r
+}
+
+/// **Diagnostic** (`OMNI_MMAP_WATCH=<length>`, off by default): every anonymous `mmap` of exactly
+/// that length is logged -- thread, where it was called from, what it answered, and when.
+fn mmap_watch(p: &Process, t: &Task, a: [u64; 6], r: &Result<u64, Errno>) {
+    static WATCH: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let Some(len) = *WATCH.get_or_init(|| std::env::var("OMNI_MMAP_WATCH").ok().and_then(|v| v.parse().ok())) else { return };
+    if a[1] != len || a[3] & u64::from(MAP_ANONYMOUS) == 0 {
+        return;
+    }
+    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis();
+    eprintln!(
+        "[mmap-watch] +{ms}ms pid {} tid {} ({}) pc {:#x} {} lr {:#x} {} prot {} flags {:#x} -> {:?}",
+        p.sys.pid, t.tid, String::from_utf8_lossy(&t.name), t.pc, p.mm.describe(t.pc).unwrap_or_default(), t.lr, p.mm.describe(t.lr).unwrap_or_default(), a[2], a[3], r
+    );
 }
 
 fn sys_munmap(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {

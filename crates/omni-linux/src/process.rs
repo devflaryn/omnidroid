@@ -1138,6 +1138,43 @@ impl Process {
         self.deliver(cpu, task, info, pc, 0)
     }
 
+    /// **Diagnostic** (`OMNI_DUMP_ON_SEGV=<name part>`, with `OMNI_DUMP_DIR`; off by default): the
+    /// first `SIGSEGV` whose pc or lr is in a mapping so named writes every mapping of that name, as
+    /// memory holds it now (a packed library's decrypted code and its data), and the registers.
+    fn dump_on_segv(&self, pc: u64, lr: u64, x: &[u64], fault_address: u64) {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let (Ok(want), Ok(dir)) = (std::env::var("OMNI_DUMP_ON_SEGV"), std::env::var("OMNI_DUMP_DIR")) else { return };
+        let named = |a: u64| self.mm.name_at(a).is_some_and(|(n, _)| n.windows(want.len()).any(|w| w == want.as_bytes()));
+        if !(named(pc) || named(lr)) || DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let pid = self.sys.pid;
+        let mut index = format!("pid {pid} pc {pc:#x} lr {lr:#x} fault {fault_address:#x}\n");
+        for (n, v) in x.iter().enumerate() {
+            index += &format!("x{n} {v:#x} {}\n", self.mm.describe(*v).unwrap_or_default());
+        }
+        for (start, len, name, offset) in self.mm.file_mappings() {
+            if !name.windows(want.len()).any(|w| w == want.as_bytes()) {
+                continue;
+            }
+            // 4 KiB at a time: a PROT_NONE or unmapped piece reads as zeros rather than failing all.
+            let mut bytes = vec![0u8; len as usize];
+            for at in (0..len).step_by(4096) {
+                let n = 4096.min(len - at) as usize;
+                if let Ok(b) = self.mem.read(start + at, n) {
+                    bytes[at as usize..at as usize + n].copy_from_slice(&b);
+                }
+            }
+            let file = dir.join(format!("{pid}-{start:x}-off{offset:x}.bin"));
+            let _ = std::fs::write(&file, &bytes);
+            index += &format!("{start:#x}+{len:#x} off {offset:#x} {} -> {}\n", String::from_utf8_lossy(&name), file.display());
+        }
+        let _ = std::fs::write(dir.join(format!("{pid}-index.txt")), index);
+        eprintln!("[dump] {pid}: {} written", dir.display());
+    }
+
     /// Run the guest's handler for `info.signo`: build the kernel's frame below `sp` (or on the
     /// alternate stack), point the task at the handler, and block what the action asks.
     fn deliver(&self, cpu: &mut dyn GuestCpu, task: *mut Task, info: crate::signal::SigInfo, pc: u64, fault_address: u64) -> Result<u64, ExitStatus> {
@@ -1156,6 +1193,9 @@ impl Process {
         }
         let mut regs = Self::read_regs(cpu, pc);
         regs.fault_address = fault_address;
+        if sig == 11 {
+            self.dump_on_segv(pc, regs.x[30], &regs.x, fault_address);
+        }
         if self.trace || signal_trace() {
             let at = |a: u64| self.mm.describe(a).map_or_else(String::new, |d| format!(" ({d})"));
             eprintln!(

@@ -128,3 +128,28 @@ different switches.
 
 The 4 KiB overlay serves 20-350 accesses/s per process in these runs (`OMNI_SPLIT_REPORT`), which
 is not what makes rendering slow.
+
+## Root cause: a startup race lost on speed (2026-09-29, 21:50-22:40)
+
+Found with `OMNI_DUMP_ON_SEGV` (the decrypted code and data at the crash) and `OMNI_MMAP_WATCH`.
+* **What is null.** The crashing function (`+0x5f4264`) allocates 16 bytes, loads G through GOT slot
+  `+0x1188298`, and calls `*(G + 0x40)`. G is `.bss` at `+0x11975f0`, zero at load.
+* **Who sets it.** One store in the whole decrypted text (`+0x70f36c`). It follows a raw `svc`
+  `mmap(NULL, 224, RW, PRIVATE|ANONYMOUS)` (number 222 behind an XOR), so G is a table the
+  library's own initialisation allocates, then fills.
+* **When.**
+
+  | run | library loaded | init `mmap` | reader wakes | outcome |
+  |---|---|---|---|---|
+  | survived | 8325.2 | ≈8344 (+18.7 s) | -- | lives |
+  | crashed | 8894.2 | never, before the crash | 8914.2 (+20.1 s) | `SIGSEGV` at `0x40` |
+
+  The reader is an unnamed thread that sat in `nanosleep` 13 s before the dump, while the main
+  thread was running, not waiting.
+
+The library starts a worker that sleeps and then uses the table, assuming the initialisation
+finished long before (on a phone, or on Windows, it has). On the Mac the time from load to init is
+~19 s against the worker's ~20 s, so the race is decided by a second or two either way: one clean
+run in six. The page size, stale code, JIT optimisations and memory ordering were not the cause;
+**startup speed is.** The fix is making the app's startup (the main thread between the library's
+load and its initialisation) faster on this host.
