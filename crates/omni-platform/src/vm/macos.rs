@@ -310,6 +310,50 @@ fn mirrored(address: usize, size: usize, protection: libc::c_int) {
 // Seam implementation
 // ---------------------------------------------------------------------------------------------
 
+pub(super) const fn supports_alias() -> bool {
+    true
+}
+
+/// `mach_vm_remap(copy = FALSE)` shares the source's memory object at `dst`
+/// (`VM_FLAGS_OVERWRITE` replaces the reservation there); then the alias is made read-write,
+/// whatever the source allows. Not in the registry, and not mirrored to the hypervisor seam: the
+/// alias is the host's own second view of guest memory, never a guest address.
+pub(super) fn alias(src: usize, dst: usize, size: usize) -> VmResult<()> {
+    const VM_FLAGS_OVERWRITE: libc::c_int = 0x4000;
+    let mut at = dst as u64;
+    let (mut cur, mut max): (VmProt, VmProt) = (0, 0);
+    // SAFETY: `src` is committed memory the caller owns and `dst` a reservation it owns (the
+    // seam's contract); the call writes only the three out-parameters.
+    let kr = unsafe {
+        mach_vm_remap(
+            task_self(),
+            &mut at,
+            size as u64,
+            0,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+            task_self(),
+            src as u64,
+            0,
+            &mut cur,
+            &mut max,
+            VM_INHERIT_NONE,
+        )
+    };
+    if kr != KERN_SUCCESS || at != dst as u64 {
+        return Err(refused("alias", dst, size, kr));
+    }
+    // SAFETY: `dst` is the alias just made; mprotect dereferences nothing.
+    if unsafe { libc::mprotect(dst as *mut libc::c_void, size, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+        return Err(os("alias", dst, size));
+    }
+    Ok(())
+}
+
+/// A fresh inaccessible mapping over the alias: the source's memory is no longer reachable there.
+pub(super) fn unalias(dst: usize, size: usize) -> VmResult<()> {
+    fresh_reserved(dst, size).map_err(|code| VmError::Os { operation: "unalias", address: dst, size, source: OsError(code) })
+}
+
 /// `sysconf(_SC_PAGESIZE)`: 16384 on Apple silicon (measured).
 pub(super) fn page_size() -> usize {
     // SAFETY: sysconf takes an integer name and touches no memory.

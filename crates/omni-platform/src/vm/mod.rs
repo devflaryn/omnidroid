@@ -30,6 +30,9 @@
 //! decommit(ptr, size) -> VmResult<()>
 //! decommit_to_placeholder(ptr, size) -> VmResult<()>
 //! protect(ptr, size, prot) -> VmResult<()>
+//! supports_alias() -> bool
+//! alias(src, dst, size) -> VmResult<()>
+//! unalias(dst, size) -> VmResult<()>
 //! open_file_for_mapping(path, exec) -> VmResult<MappableFile>
 //! share_file_for_mapping(File, name) -> VmResult<MappableFile>
 //! map_file(&MappableFile, file_offset, size, ptr, prot) -> VmResult<()>
@@ -804,6 +807,58 @@ pub unsafe fn protect(ptr: *mut u8, size: usize, protection: Protection) -> VmRe
     check_page_multiple(OP, "address", ptr as usize as u64)?;
     check_page_multiple(OP, "size", size as u64)?;
     backend::protect(ptr as usize, size, protection)
+}
+
+/// Whether this host can map a page a second time ([`alias`]). What a guest whose page is smaller
+/// than the host's needs (`omni-mem`'s sub-page overlay): an access the host page refuses but the
+/// guest's 4 KiB page allows is made through the alias. macOS only, for now; a 4 KiB host never
+/// needs one.
+#[must_use]
+pub fn supports_alias() -> bool {
+    backend::supports_alias()
+}
+
+/// Make `[dst, dst + size)` the same memory as `[src, src + size)`, read-write whatever the source
+/// allows, replacing what was at `dst`.
+///
+/// The alias is not part of this module's registry: nothing but [`alias`] and [`unalias`] may be
+/// called on it. It follows the source's memory, not its address: a fresh mapping over the source
+/// (a [`decommit`]) leaves the alias holding the old memory, so the caller re-aliases.
+///
+/// # Errors
+///
+/// [`VmError::ZeroSize`], [`VmError::Misaligned`], [`VmError::Unsupported`] where
+/// [`supports_alias`] is false, or [`VmError::Os`].
+///
+/// # Safety
+///
+/// `src` must be committed private memory this process owns, and `dst` inside a reservation the
+/// caller owns and uses for nothing else.
+pub unsafe fn alias(src: *mut u8, dst: *mut u8, size: usize) -> VmResult<()> {
+    const OP: &str = "alias";
+    check_size(OP, size)?;
+    check_page_multiple(OP, "address", src as usize as u64)?;
+    check_page_multiple(OP, "address", dst as usize as u64)?;
+    check_page_multiple(OP, "size", size as u64)?;
+    backend::alias(src as usize, dst as usize, size)
+}
+
+/// Undo [`alias`]: `[dst, dst + size)` is inaccessible reserved space again. The source is
+/// untouched.
+///
+/// # Errors
+///
+/// As [`alias`].
+///
+/// # Safety
+///
+/// `[dst, dst + size)` must be a range [`alias`] made, and nothing may hold a reference into it.
+pub unsafe fn unalias(dst: *mut u8, size: usize) -> VmResult<()> {
+    const OP: &str = "unalias";
+    check_size(OP, size)?;
+    check_page_multiple(OP, "address", dst as usize as u64)?;
+    check_page_multiple(OP, "size", size as u64)?;
+    backend::unalias(dst as usize, size)
 }
 
 /// Open a file so that its contents can be mapped, and create the mapping object over it.

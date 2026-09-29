@@ -1101,3 +1101,18 @@ mod tests {
         assert_eq!(containing(&map, 0x1fff).map(|(b, _)| b), Some(0x1000));
     }
 }
+
+/// No second mapping of a page here yet: a 4 KiB host never needs one, and a larger-page host
+/// (a 16 KiB Linux) keeps its guest at the host's page until one is written (spec
+/// 2026-09-29-4k-guest-pages, "Out of scope").
+pub(super) const fn supports_alias() -> bool {
+    false
+}
+
+pub(super) fn alias(_src: usize, _dst: usize, _size: usize) -> VmResult<()> {
+    Err(VmError::Unsupported { operation: "alias", platform: std::env::consts::OS })
+}
+
+pub(super) fn unalias(_dst: usize, _size: usize) -> VmResult<()> {
+    Err(VmError::Unsupported { operation: "unalias", platform: std::env::consts::OS })
+}
