@@ -870,3 +870,18 @@ rewrite (the engine's GLES timer queries are forwarded as they are).
 **Reverses it.** A target the rule drops that the engine keeps (a stale texture after `off`), or
 an engine path that reads back a per-frame target while headless and acts on it.
 
+## D41 — macOS: the guest's low 4 GiB is a based window (amends D4 on macOS only)
+
+**Ruling (2026-09-29).** On macOS the part of a guest space below 4 GiB is backed by a 4 GiB-aligned
+host reservation `W` anywhere, and addressed as `W + g`; above 4 GiB a guest address stays a host
+address. dynarmic's arm64 backend adds `Xfastmem` only below 4 GiB (patch 0030, `tst` + `csel`, no
+branch); `GuestSpace::ptr`, the space's own host calls and the pager translate. Off on Windows and
+Linux, where nothing changes.
+
+**Why.** An arm64 Mach-O must keep a 4 GiB hard `__PAGEZERO` (a smaller one is killed at exec) and
+the map's minimum address is raised past it, so nothing can be mapped below 4 GiB -- and ART's heap
+and boot image must be there (32-bit references). Basing the whole space instead would break the
+host paths that read guest memory in place (the GPU forwarder hands the guest's Vulkan structs to
+the host driver); those structs are always in unhinted mappings, which the Linux personality puts
+above 4 GiB, so only what ART places by address lives in the window. Design, costs and proof:
+`docs/ports/macos-low-window.md`.
