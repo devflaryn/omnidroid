@@ -803,7 +803,7 @@ impl GuestSpace {
     #[must_use]
     pub fn is_trapping(&self, address: GuestAddr) -> bool {
         match &self.sub {
-            Some(sub) if address >= self.base && address < self.end() => sub.is_trapping((address - self.base) / self.page),
+            Some(sub) if address >= self.base && address < self.end() => sub.is_trapping(address & !(self.page - 1)),
             _ => false,
         }
     }
@@ -1842,11 +1842,8 @@ impl core::fmt::Debug for GuestSpace {
 impl Drop for GuestSpace {
     fn drop(&mut self) {
         let mut inner = self.write();
-        if let Some(alias) = self.sub.as_ref().and_then(|sub| sub.state.lock().alias.take()) {
-            if let Err(error) = vm::release(alias) {
-                tracing::error!(%error, "the 4 KiB overlay's alias reservation could not be released");
-            }
-        }
+        // The 4 KiB overlay's aliases: their address space back.
+        self.unalias_all();
         if let Err(error) = inner.release_all() {
             // Teardown failing means address space or commit charge has leaked for the life of the
             // process, which is exactly the kind of thing that must not be silent.

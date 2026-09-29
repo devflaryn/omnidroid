@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use omni_platform::vm::{Protection, Reservation};
-use parking_lot::Mutex;
+use omni_platform::vm::Protection;
+use parking_lot::{Mutex, RwLock};
 
 /// The guest's page: the smallest page an arm64 Linux guest is built for, and the one a space
 /// that asks ([`crate::GuestSpaceConfig::guest_page`]) maps, protects and unmaps at, whatever the
@@ -130,34 +130,39 @@ impl Split {
 /// A space's overlay, present only when it is active (the space asked for [`GUEST_PAGE`]s, the
 /// host page is larger, and the host can alias).
 ///
-/// The lock-free part is what the fault path reads (SUBPAGE-ORDER 2): `count` -- the number of
-/// trapping host pages, zero almost always, which answers "no" with one load -- and one bit per
-/// host page of the space. Everything else is in `state`, taken only while the space's own lock is
-/// held (SUBPAGE-ORDER 1).
+/// What the fault path reads (SUBPAGE-ORDER 2): `count` -- the number of trapping host pages,
+/// zero almost always, which answers "no" with one atomic load -- and, only when it is not zero,
+/// `aliases` under its read lock. Everything else is in `state`, taken only while the space's own
+/// lock is held (SUBPAGE-ORDER 1). `aliases` is written only with `state` held and never held
+/// while any other lock is taken.
 pub(crate) struct SubPagesHandle {
-    /// Trapping host pages: the number of set bits.
+    /// Trapping host pages: the number of `aliases` entries with `trapping` set.
     pub(crate) count: AtomicUsize,
-    /// One bit per host page of the space, allocated at the first trapping page.
-    pub(crate) bits: OnceLock<Box<[AtomicU64]>>,
+    /// Host pages with a live alias, by host page address: where the alias is (placed by the host
+    /// wherever it has room, one page of address space each -- a space may be terabytes), and
+    /// whether the page traps now.
+    pub(crate) aliases: RwLock<HashMap<usize, PageAlias>>,
     pub(crate) state: Mutex<SubPages>,
     /// Accesses the slow path served through an alias, for the report.
     pub(crate) served_total: AtomicU64,
-    /// The alias reservation's base, once made (zero before): what `access_ptr` adds to without
-    /// taking `state`. Set before any bit is (SUBPAGE-ORDER 3), never changed after.
-    pub(crate) alias_base: AtomicUsize,
 }
 
-/// The overlay's state: the tracked host pages, the alias reservation and what it holds.
+/// A host page's alias, and whether the page traps.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageAlias {
+    pub(crate) at: usize,
+    pub(crate) trapping: bool,
+}
+
+/// The overlay's state: the tracked host pages and what else the guest asked.
 pub(crate) struct SubPages {
     pub(crate) parts_per_page: usize,
     /// Host pages the guest has cut into differently-treated parts, by host page address.
     pub(crate) split: BTreeMap<usize, Split>,
-    /// A reservation the size of the space, made at the first alias: host page `P`'s alias is at
-    /// `alias_base + (P - space base)`.
-    pub(crate) alias: Option<Reservation>,
-    /// Host pages with a live alias -- trapping now, or once (an alias goes only with its page).
+    /// Host pages with a live alias (the keys of `SubPagesHandle::aliases`, in order, for range
+    /// queries) -- trapping now, or once: an alias goes only with its page.
     pub(crate) aliased: BTreeSet<usize>,
-    /// Guest ranges whose unmapped parts must fault (`[start, end)`).
+    /// Guest ranges whose unmapped and PROT_NONE parts must fault (`[start, end)`).
     pub(crate) strict: Vec<(usize, usize)>,
     /// Accesses served, by host page.
     pub(crate) served: HashMap<usize, u64>,
@@ -167,45 +172,62 @@ impl SubPagesHandle {
     pub(crate) fn new(parts_per_page: usize) -> Self {
         Self {
             count: AtomicUsize::new(0),
-            bits: OnceLock::new(),
-            state: Mutex::new(SubPages {
-                parts_per_page,
-                split: BTreeMap::new(),
-                alias: None,
-                aliased: BTreeSet::new(),
-                strict: Vec::new(),
-                served: HashMap::new(),
-            }),
+            aliases: RwLock::new(HashMap::new()),
+            state: Mutex::new(SubPages { parts_per_page, split: BTreeMap::new(), aliased: BTreeSet::new(), strict: Vec::new(), served: HashMap::new() }),
             served_total: AtomicU64::new(0),
-            alias_base: AtomicUsize::new(0),
         }
     }
 
-    /// Whether host page number `index` of the space traps. Lock-free (SUBPAGE-ORDER 2, 3).
+    /// Whether host page `host_page` traps. One atomic load when nothing traps (SUBPAGE-ORDER 2, 3).
     #[inline]
-    pub(crate) fn is_trapping(&self, index: usize) -> bool {
-        if self.count.load(Ordering::Acquire) == 0 {
-            return false;
-        }
-        self.bits.get().and_then(|b| b.get(index / 64)).is_some_and(|w| w.load(Ordering::Acquire) & (1 << (index % 64)) != 0)
+    pub(crate) fn is_trapping(&self, host_page: usize) -> bool {
+        self.trapping_alias(host_page).is_some()
     }
 
-    /// Set or clear host page `index`'s bit, keeping `count` the number of set bits. `pages` is
-    /// the space's length in host pages (for the first allocation). Called with the space's lock
+    /// The alias of host page `host_page` if it traps.
+    #[inline]
+    pub(crate) fn trapping_alias(&self, host_page: usize) -> Option<usize> {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.aliases.read().get(&host_page).filter(|a| a.trapping).map(|a| a.at)
+    }
+
+    /// The alias of host page `host_page`, trapping or not.
+    pub(crate) fn alias_of(&self, host_page: usize) -> Option<usize> {
+        self.aliases.read().get(&host_page).map(|a| a.at)
+    }
+
+    /// A new alias for `host_page`, not trapping yet. `state` is held.
+    pub(crate) fn insert_alias(&self, host_page: usize, at: usize) {
+        self.aliases.write().insert(host_page, PageAlias { at, trapping: false });
+    }
+
+    /// `host_page`'s alias, gone from the map (its bit with it); the caller unmaps it. `state` is
     /// held.
-    pub(crate) fn set_trapping(&self, index: usize, pages: usize, on: bool) {
-        let bits = self.bits.get_or_init(|| (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect());
-        let word = &bits[index / 64];
-        let mask = 1u64 << (index % 64);
-        let was = if on { word.fetch_or(mask, Ordering::Release) } else { word.fetch_and(!mask, Ordering::Release) };
-        match (was & mask != 0, on) {
-            (false, true) => {
+    pub(crate) fn remove_alias(&self, host_page: usize) -> Option<usize> {
+        let gone = self.aliases.write().remove(&host_page)?;
+        if gone.trapping {
+            self.count.fetch_sub(1, Ordering::Release);
+        }
+        Some(gone.at)
+    }
+
+    /// Set or clear `host_page`'s trapping, keeping `count`. Setting needs its alias made first
+    /// (SUBPAGE-ORDER 3); clearing a page with no alias is nothing. `state` is held.
+    pub(crate) fn set_trapping(&self, host_page: usize, on: bool) {
+        let mut aliases = self.aliases.write();
+        let Some(a) = aliases.get_mut(&host_page) else {
+            debug_assert!(!on, "a page traps only with its alias made first");
+            return;
+        };
+        if a.trapping != on {
+            a.trapping = on;
+            if on {
                 self.count.fetch_add(1, Ordering::Release);
-            }
-            (true, false) => {
+            } else {
                 self.count.fetch_sub(1, Ordering::Release);
             }
-            _ => {}
         }
     }
 }

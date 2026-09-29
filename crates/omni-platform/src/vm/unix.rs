@@ -448,7 +448,7 @@ pub(super) const fn supports_alias() -> bool {
     false
 }
 
-pub(super) fn alias(_src: usize, _dst: usize, _size: usize) -> VmResult<()> {
+pub(super) fn alias(_src: usize, _size: usize) -> VmResult<usize> {
     Err(VmError::Unsupported { operation: "alias", platform: std::env::consts::OS })
 }
 

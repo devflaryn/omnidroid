@@ -439,3 +439,30 @@ fn a_prot_none_part_is_lenient_unless_its_range_is_strict() {
     strict.protect(at2, GUEST_PAGE, Protection::None).unwrap();
     assert!(strict.is_trapping(at2), "strict: the PROT_NONE part faults, so its neighbours trap");
 }
+
+/// A space may be terabytes (the boot's first 4 KiB-page run had a 78 TiB one): a page's alias
+/// takes one page of address space, not the space's size -- a space-sized alias reservation failed
+/// with ENOMEM there, and every fixed map that split a page in it with it.
+#[test]
+fn a_split_in_a_terabyte_space_takes_one_page_of_alias() {
+    if !overlay_expected() {
+        return;
+    }
+    let s = GuestSpace::with_config(GuestSpaceConfig { size: 1 << 44, guest_page: Some(GUEST_PAGE), ..GuestSpaceConfig::default() })
+        .expect("a 16 TiB space");
+    let page = host_page();
+    let mut pages = Vec::new();
+    for _ in 0..8 {
+        let at = s.map_anonymous(Placement::Anywhere { align: page }, page, Protection::ReadWrite, CommitPolicy::Eager).unwrap();
+        s.protect(at, GUEST_PAGE, Protection::Read).expect("split");
+        assert!(s.is_trapping(at));
+        pages.push(at);
+    }
+    for at in pages {
+        let AccessPtr::Alias(p) = s.access_ptr(at + GUEST_PAGE, 8) else { panic!("an alias") };
+        // SAFETY: the alias is read-write.
+        unsafe { (p as *mut u64).write(at as u64) };
+        // SAFETY: the host page is readable.
+        assert_eq!(unsafe { (s.host_addr(at + GUEST_PAGE) as *const u64).read() }, at as u64, "each page its own alias");
+    }
+}

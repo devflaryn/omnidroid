@@ -314,44 +314,40 @@ pub(super) const fn supports_alias() -> bool {
     true
 }
 
-/// `mach_vm_remap(copy = FALSE)` shares the source's memory object at `dst`
-/// (`VM_FLAGS_OVERWRITE` replaces the reservation there); then the alias is made read-write,
-/// whatever the source allows. Not in the registry, and not mirrored to the hypervisor seam: the
-/// alias is the host's own second view of guest memory, never a guest address.
-pub(super) fn alias(src: usize, dst: usize, size: usize) -> VmResult<()> {
-    const VM_FLAGS_OVERWRITE: libc::c_int = 0x4000;
-    let mut at = dst as u64;
+/// `mach_vm_remap(copy = FALSE, VM_FLAGS_ANYWHERE)` shares the source's memory object at an
+/// address the kernel chooses; then the alias is made read-write, whatever the source allows. No one
+/// can reach it before this returns. Not in the registry, and not mirrored to the hypervisor seam:
+/// the alias is the host's own second view of guest memory, never a guest address.
+pub(super) fn alias(src: usize, size: usize) -> VmResult<usize> {
+    let mut at = 0u64;
     let (mut cur, mut max): (VmProt, VmProt) = (0, 0);
-    // SAFETY: `src` is committed memory the caller owns and `dst` a reservation it owns (the
-    // seam's contract); the call writes only the three out-parameters.
+    // SAFETY: `src` is committed memory the caller owns (the seam's contract); the call writes
+    // only the three out-parameters.
     let kr = unsafe {
-        mach_vm_remap(
-            task_self(),
-            &mut at,
-            size as u64,
-            0,
-            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-            task_self(),
-            src as u64,
-            0,
-            &mut cur,
-            &mut max,
-            VM_INHERIT_NONE,
-        )
+        mach_vm_remap(task_self(), &mut at, size as u64, 0, VM_FLAGS_ANYWHERE, task_self(), src as u64, 0, &mut cur, &mut max, VM_INHERIT_NONE)
     };
-    if kr != KERN_SUCCESS || at != dst as u64 {
-        return Err(refused("alias", dst, size, kr));
+    if kr != KERN_SUCCESS {
+        return Err(refused("alias", src, size, kr));
     }
+    let dst = at as usize;
     // SAFETY: `dst` is the alias just made; mprotect dereferences nothing.
     if unsafe { libc::mprotect(dst as *mut libc::c_void, size, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
-        return Err(os("alias", dst, size));
+        let e = os("alias", dst, size);
+        // SAFETY: the alias just made, which nothing else knows of.
+        unsafe { mach_vm_deallocate(task_self(), at, size as u64) };
+        return Err(e);
     }
-    Ok(())
+    Ok(dst)
 }
 
-/// A fresh inaccessible mapping over the alias: the source's memory is no longer reachable there.
+/// The alias's pages go, and its address space with them.
 pub(super) fn unalias(dst: usize, size: usize) -> VmResult<()> {
-    fresh_reserved(dst, size).map_err(|code| VmError::Os { operation: "unalias", address: dst, size, source: OsError(code) })
+    // SAFETY: `dst` is an alias `alias` made (the seam's contract); nothing references it.
+    let kr = unsafe { mach_vm_deallocate(task_self(), dst as u64, size as u64) };
+    if kr != KERN_SUCCESS {
+        return Err(refused("unalias", dst, size, kr));
+    }
+    Ok(())
 }
 
 /// `sysconf(_SC_PAGESIZE)`: 16384 on Apple silicon (measured).

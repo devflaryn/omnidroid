@@ -60,11 +60,6 @@ impl GuestSpace {
         self.sub.as_ref().expect("the overlay is active")
     }
 
-    /// Host pages in the space.
-    fn host_pages(&self) -> usize {
-        self.len / self.page
-    }
-
     /// Whether `[address, address + len)` must take the overlay path: the space keeps one, and the
     /// range is not whole host pages or touches a tracked one.
     pub(super) fn needs_overlay(&self, inner: &Inner, address: GuestAddr, len: usize) -> bool {
@@ -172,7 +167,7 @@ impl GuestSpace {
         }
         for host_page in tracked {
             st.split.remove(&host_page);
-            self.sub_handle().set_trapping((host_page - self.base) / self.page, self.host_pages(), false);
+            self.sub_handle().set_trapping(host_page, false);
         }
         if matches!(op, SubOp::Unmap) {
             self.unalias_range(st, address, len);
@@ -235,12 +230,11 @@ impl GuestSpace {
     ) -> MemResult<()> {
         let sub = self.sub_handle();
         let page = self.page;
-        let index = (host_page - self.base) / page;
         let committed = |inner: &Inner| {
             inner.map.entry_start(host_page).and_then(|s| inner.map.get(s)).is_some_and(|e| matches!(e.os, OsState::Private { .. } | OsState::View { .. }))
         };
         if split.empty() {
-            sub.set_trapping(index, self.host_pages(), false);
+            sub.set_trapping(host_page, false);
             st.split.remove(&host_page);
             inner.unmap_range(operation, host_page, page)?;
             self.unalias_range(st, host_page, page);
@@ -265,22 +259,22 @@ impl GuestSpace {
         if let Some(protection) = split.uniform() {
             // Leaves the overlay: host first, then the bit (the alias stays, SUBPAGE-ORDER 5).
             inner.protect_range(operation, host_page, page, protection)?;
-            sub.set_trapping(index, self.host_pages(), false);
+            sub.set_trapping(host_page, false);
             st.split.remove(&host_page);
             return Ok(());
         }
         let host = split.host_protection(strict);
         if split.traps(strict) {
-            let was = sub.is_trapping(index);
-            sub.set_trapping(index, self.host_pages(), true);
+            let was = sub.is_trapping(host_page);
+            sub.set_trapping(host_page, true);
             if let Err(e) = inner.protect_range(operation, host_page, page, host) {
                 // Nothing published: the page keeps its old parts and its old bit.
-                sub.set_trapping(index, self.host_pages(), was);
+                sub.set_trapping(host_page, was);
                 return Err(e);
             }
         } else {
             inner.protect_range(operation, host_page, page, host)?;
-            sub.set_trapping(index, self.host_pages(), false);
+            sub.set_trapping(host_page, false);
         }
         st.split.insert(host_page, split);
         Ok(())
@@ -356,28 +350,23 @@ impl GuestSpace {
     }
 
     fn alias_of(&self, st: &SubPages, host_page: GuestAddr) -> usize {
-        st.alias.as_ref().expect("an alias reservation").base() + (host_page - self.base)
+        let _ = st; // held: the alias cannot go meanwhile
+        self.sub_handle().alias_of(host_page).expect("an aliased page")
     }
 
-    /// Make host page `host_page`'s alias if it has none. **A live alias is never re-made**: a
-    /// re-map briefly has the source's (lowered) protection before it is made read-write, and a
-    /// served access in that window faults on the alias itself (checkpoint A, 1). So every path
-    /// that decommits or replaces a page unmaps its alias first (`unalias_range`,
-    /// `forget_aliases`), and an alias in `aliased` is always the page's memory (SUBPAGE-ORDER 5).
+    /// Make host page `host_page`'s alias if it has none, placed where the host has room (one page
+    /// of address space; a space may be terabytes). **A live alias is never re-made**: a served
+    /// access may be using it (checkpoint A, 1). So every path that decommits or replaces a page
+    /// unmaps its alias first (`unalias_range`, `forget_aliases`), and an alias in `aliased` is
+    /// always the page's memory (SUBPAGE-ORDER 5).
     fn ensure_alias(&self, st: &mut SubPages, host_page: GuestAddr) -> MemResult<()> {
         if st.aliased.contains(&host_page) {
             return Ok(());
         }
-        if st.alias.is_none() {
-            let reservation = vm::reserve(self.len, self.page).map_err(platform("alias reservation", 0, self.len))?;
-            self.sub_handle().alias_base.store(reservation.base(), std::sync::atomic::Ordering::Release);
-            st.alias = Some(reservation);
-        }
-        let dst = self.alias_of(st, host_page);
         // SAFETY: the source is committed private memory of this space (`commit_page`,
-        // `privatise`); the destination is inside the alias reservation, which nothing else uses.
-        unsafe { vm::alias(self.host_addr(host_page) as *mut u8, dst as *mut u8, self.page) }
-            .map_err(platform("alias", host_page, self.page))?;
+        // `privatise`), or a live view of a shared backing.
+        let at = unsafe { vm::alias(self.host_addr(host_page) as *mut u8, self.page) }.map_err(platform("alias", host_page, self.page))?;
+        self.sub_handle().insert_alias(host_page, at as usize);
         st.aliased.insert(host_page);
         Ok(())
     }
@@ -388,11 +377,19 @@ impl GuestSpace {
         let gone: Vec<usize> = st.aliased.range(address..address + len).copied().collect();
         for host_page in gone {
             st.aliased.remove(&host_page);
-            let dst = self.alias_of(st, host_page);
+            let Some(at) = self.sub_handle().remove_alias(host_page) else { continue };
             // SAFETY: an alias this overlay made; its page is gone, so nothing may reach it.
-            if let Err(e) = unsafe { vm::unalias(dst as *mut u8, self.page) } {
+            if let Err(e) = unsafe { vm::unalias(at as *mut u8, self.page) } {
                 tracing::error!(%e, host_page = format_args!("{host_page:#x}"), "an alias could not be unmapped");
             }
+        }
+    }
+
+    /// Every alias unmapped: the space is going.
+    pub(super) fn unalias_all(&self) {
+        if let Some(sub) = &self.sub {
+            let mut st = sub.state.lock();
+            self.unalias_range(&mut st, self.base, self.len);
         }
     }
 
@@ -513,9 +510,14 @@ impl GuestSpace {
             self.ensure_alias(&mut st, p)?;
             p += page;
         }
-        // SAFETY: every host page of the range is committed and has a live read-write alias, and
-        // the alias reservation is contiguous in the space's order.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.alias_of(&st, at & !(page - 1)).wrapping_add(at % page) as *mut u8, bytes.len()) };
+        let mut done = 0;
+        while done < bytes.len() {
+            let g = at + done;
+            let n = (page - g % page).min(bytes.len() - done);
+            // SAFETY: every host page of the range is committed and has a live read-write alias.
+            unsafe { std::ptr::copy_nonoverlapping(bytes[done..].as_ptr(), (self.alias_of(&st, g & !(page - 1)) + g % page) as *mut u8, n) };
+            done += n;
+        }
         Ok(())
     }
 
@@ -576,8 +578,8 @@ impl GuestSpace {
         })
     }
 
-    /// Where an admitted access of `[address, address + len)` should go. Lock-free, and one load
-    /// when nothing traps (SUBPAGE-ORDER 2).
+    /// Where an admitted access of `[address, address + len)` should go. One atomic load when
+    /// nothing traps (SUBPAGE-ORDER 2); else the alias map's read lock.
     #[must_use]
     pub fn access_ptr(&self, address: GuestAddr, len: usize) -> AccessPtr {
         let direct = AccessPtr::Direct(self.host_addr(address) as *mut u8);
@@ -587,47 +589,54 @@ impl GuestSpace {
         }
         let page = self.page;
         let (first, last) = (address & !(page - 1), (address + len - 1) & !(page - 1));
-        let (mut any, mut all) = (false, true);
+        if first == last {
+            return match sub.trapping_alias(first) {
+                Some(at) => AccessPtr::Alias((at + address % page) as *mut u8),
+                None => direct,
+            };
+        }
+        // Across host pages: one pointer only if none of them traps (aliases are not contiguous).
         let mut p = first;
         while p <= last {
-            let t = self.is_trapping(p);
-            any |= t;
-            all &= t;
+            if sub.is_trapping(p) {
+                return AccessPtr::Straddle;
+            }
             p += page;
         }
-        match (any, all) {
-            (false, _) => direct,
-            (true, true) => {
-                // The alias reservation exists once anything has trapped, and never goes while the
-                // space lives. Its base is read without the overlay's lock: it is set once.
-                let base = sub.alias_base.load(std::sync::atomic::Ordering::Acquire);
-                AccessPtr::Alias((base + (address - self.base)) as *mut u8)
-            }
-            (true, false) => AccessPtr::Straddle,
-        }
+        direct
     }
 
-    /// Call `f(guest address, pointer, len)` for each piece of `[address, address + len)` whose
-    /// host pages are all trapping or all not: one call when nothing traps.
+    /// Call `f(guest address, pointer, len)` for each piece of `[address, address + len)`: a run
+    /// of ordinary host pages as one piece, a trapping host page's part through its alias. One call
+    /// when nothing traps.
     pub fn for_each_access_chunk(&self, address: GuestAddr, len: usize, mut f: impl FnMut(GuestAddr, *mut u8, usize)) {
         if len == 0 {
             return;
         }
+        let Some(sub) = self.sub.as_ref().filter(|s| s.count.load(std::sync::atomic::Ordering::Acquire) != 0) else {
+            f(address, self.host_addr(address) as *mut u8, len);
+            return;
+        };
         let page = self.page;
         let end = address + len;
         let mut at = address;
         while at < end {
-            let trapping = self.is_trapping(at);
-            let mut next = ((at & !(page - 1)) + page).min(end);
-            while next < end && self.is_trapping(next) == trapping {
-                next = (next + page).min(end);
+            let next = ((at & !(page - 1)) + page).min(end);
+            // One look at each page, and the pointer from that look (checkpoint A, 8).
+            match sub.trapping_alias(at & !(page - 1)) {
+                Some(alias) => {
+                    f(at, (alias + at % page) as *mut u8, next - at);
+                    at = next;
+                }
+                None => {
+                    let mut run_end = next;
+                    while run_end < end && sub.trapping_alias(run_end).is_none() {
+                        run_end = (run_end + page).min(end);
+                    }
+                    f(at, self.host_addr(at) as *mut u8, run_end - at);
+                    at = run_end;
+                }
             }
-            // The pointer from the classification just made, not a second look at the bits, which
-            // another thread may change in between (checkpoint A, 8).
-            let base = self.sub.as_ref().map_or(0, |s| s.alias_base.load(std::sync::atomic::Ordering::Acquire));
-            let ptr = if trapping && base != 0 { base + (at - self.base) } else { self.host_addr(at) };
-            f(at, ptr as *mut u8, next - at);
-            at = next;
         }
     }
 
