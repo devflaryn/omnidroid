@@ -59,13 +59,17 @@ fn the_windows_keyboard_and_mouse_reach_the_app_as_a_devices() {
     std::env::set_var("OMNI_WINDOW", "1");
     std::env::set_var("OMNI_WINDOW_CONTROL", &control);
 
+    // No heads-up notifications: one shown mid-test is a window over the probe that takes the hover
+    // and the wheel. Twice (2026-09-29) the notification assistant was started between the hover and
+    // the wheel, the probe got `ACTION_HOVER_EXIT` and the scroll never reached it; when that lands
+    // moves with the system's speed.
     let then = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
                 echo \"[d7] boot_completed=$(getprop sys.boot_completed)\"; \
                 settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
                 settings put system screen_off_timeout 1800000; svc power stayon true; \
                 input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
                 settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
-                settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
+                settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; settings put global heads_up_notifications_enabled 0; \
                 pm install -r /data/local/tmp/probe.apk; echo \"[d7] pm install: $?\"; \
                 am start -W -n com.omnidroid.probe/.MainActivity; echo \"[d7] am start: $?\"; \
                 dumpsys input | grep -E 'omnidroid (keyboard|mouse)' | head -4 | sed 's/^/[d7] input /'";

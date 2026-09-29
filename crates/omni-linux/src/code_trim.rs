@@ -41,6 +41,8 @@ pub fn start() {
 }
 
 fn run() {
+    // `OMNI_CODE_TRIM_MIN_MB`: the floor, in MiB, instead of [`MIN_BYTES`].
+    let min_bytes = std::env::var("OMNI_CODE_TRIM_MIN_MB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(MIN_BYTES, |mb| mb << 20);
     // pid -> (bytes emitted at the last look, when last trimmed).
     let mut seen: HashMap<i32, (u64, Option<Instant>)> = HashMap::new();
     let mut cpu = omni_platform::process::cpu_time().ok();
@@ -63,7 +65,7 @@ fn run() {
             let committed = p.code_cache_committed();
             let quiet = emitted.saturating_sub(last) < QUIET_BYTES;
             let due = trimmed.is_none_or(|t| t.elapsed() >= AGAIN_AFTER);
-            if busy || !quiet || !due || committed < MIN_BYTES || name == "surfaceflinger" {
+            if busy || !quiet || !due || committed < min_bytes || name == "surfaceflinger" {
                 continue;
             }
             p.trim_code();
