@@ -1,5 +1,126 @@
 # Handoff
 
+## PERF-WIN: LIGHTER, THE MOUSE THE APP'S, NO HIDDEN DIALOG (2026-09-29 early, Windows; branch `perf-win`, `af44f0e`..`ca3a505`)
+
+Goal (owner): RAM well below ~5.1-5.5 GB (toward ~4 GB); the mouse absolute-free like the old path
+(host cursor hidden when Roblox draws its own, held on its mouse-lock); the fps hit while input
+streams; CPU. Every run boots **`~/Desktop/Roblox-2.740.931.apk`** with `Desktop/cookies/
+HeZmI_ImYu1080.txt`, PS99, kiosk, 1575x890, release; host input by `SendInput` (the path a physical
+mouse and keyboard take), phases marked in the log through the control file. Runs and scripts in the
+session scratchpad (`runs/<name>-{run,mem,phases}.txt`, logs `%TEMP%\omni-linux-r-<pid>.log`).
+
+**Read first -- the APK and what "in-world fps" now means.** That APK is not the stock client: in
+the world it shows a **Delta executor** overlay ("Access Delta by completing the key system ... Start
+exploiting after completing our key system!"). Nothing here touched its UI. **Its client is never
+kicked** (no reason-305 disconnect in any run), so the world stays live -- other players, server
+updates, chat -- and fps is lower and noisier than last session's 57.1, which was a disconnected,
+static world after the kick. Same build (`main`, `3aefcd3`), two runs: 36.4 (base1, n=20) and 32.0
+(base2, n=47) median idle -- the live world moves the figure by ~+-2.
+
+| | `main` (base2; base1) | `perf-win` (run F) |
+|---|---|---|
+| private bytes, all host processes, in-world steady | 5.26 GB (base1 5.15) | **4.58 GB** (IME left out: ~4.45) |
+| working set | 5.47 GB (base1 5.97) | **4.79 GB** |
+| host processes | 7 | 6 (5 with `OMNI_KIOSK_IME=0`) |
+| system host process | 1.74 GB | 1.41 GB |
+| idle fps, median (p10) | 32.0 (30.6) / base1 36.4 (34.2) | 33.5 (32.4), n=48 |
+| mouse streaming over the window (1000 Hz host) | base1 32.9 (-10%) | 31.8 (-5%) |
+| key, event -> handled, p50 | 1.5-3.3 ms | 2.0-2.4 ms (1.6-3.8 without the IME) |
+| a pointer move / a click, p50 | 2.5-7 / 4-7 ms | 1.9-6.7 / 2.1-7.8 ms |
+| startup "isn't responding" dialogs | base1 1, base2 2, runs C/D 4 and 2 | 0 (runs E, F) |
+| host cursor over the engine | shown (two cursors) | hidden: the app asks for `TYPE_NULL` |
+| right-button camera drag | host cursor wanders off | held where pressed, given back there |
+
+### A hidden "isn't responding" dialog ate the input (`7fb8f33`)
+
+Translated, Roblox's `LauncherAliasMain` can hold its main thread past the input dispatcher's 5 s
+while it starts; a hover of the host cursor over the window is enough. The "Roblox yanıt vermiyor"
+dialog then sits over the game (seen in run D's screenshots) and **takes the pointer and the keys**:
+the app never hears the mouse (no pointer icon, no camera drag -- why cursor-follow "failed" in runs C
+and D), and **a space presses "Uygulamayı kapat"**: the game is gone ("Force finishing activity"),
+which first looked like a crash on typing. `main` has it too (base1 1, base2 2 of them). Fix:
+**`ro.hw_timeout_multiplier` 5** (`props::OVERLAY`), Android's own scale for a slow device's timeouts
+(`Build.HW_TIMEOUT_MULTIPLIER`, `HwTimeoutMultiplier()`: the dispatcher's and ActivityManager's ANR
+timeouts), as emulators and Cuttlefish set it. Runs E and F: 0 dialogs; run C's key sequence twice,
+W held, clicks, drags -- the game stays.
+
+### Memory: 5.26 -> 4.58 GB
+
+- **A trimmed process's translations are really given back** (dynarmic **0030**, `aee93ac`). A clear
+  (`code_trim`) forgot every block but retired only *full* regions; the region being filled stayed
+  committed. The ~60 services of the system's host process each fit in one 16 MiB region, so after
+  the trims 65 caches still held 462 MiB. Now a clear retires that region too (same retire/reclaim
+  path as a full one) and the next block starts a fresh region. `code_trim`'s floor 24 -> 8 MiB.
+  `tests/shared_cache.rs::a_clear_gives_back_the_region_being_filled` (5.7 -> 3.0 MB committed).
+- **...and the block map** (dynarmic **0031**, `99d6081`): `clear()` kept the robin_map's buckets;
+  the system process held 86 MiB of block maps for 562k blocks (157 B a block). Now a new map:
+  44 MiB for 860k (51 B), run E.
+- **The kiosk's placeholder home is ended behind the app** (`cb20b4c`): FallbackHome (all of Settings,
+  195-240 MB) is kept by ActivityManager at HOME_APP_ADJ; `omni_lean` runs `cmd activity kill
+  com.android.settings` every 30 s on a device without a launcher (background only; Android restarts
+  it if the home is asked for; `persist.omni.home_process=keep`).
+- **`OMNI_KIOSK_IME=0`** leaves LatinIME out (another ~90-120 MB, and keys lose the IME round trip:
+  p50 1.6-3.8 ms, run E). **Not the default**: PS99 did not open its chat on "/", so typing into a
+  text box without an IME was not seen to work.
+- Measured, not changed: Roblox's engine heaps (mimalloc, 971 + 608 MiB) are the same with a 4 GiB
+  device (`OMNI_DEVICE_RAM_MB`, `e30fb34`, default still 8 GiB); it gives memory back only with
+  `MADV_DONTNEED` (~70 MiB a minute, decommitted -- `OMNI_MADVISE_STATS`), so its heap is live data.
+  Its Vulkan device memory is 321 MiB device-local (VRAM) and ~28 MiB host-visible
+  (`OMNI_GPU_MEM`); the ~512 MiB of 32 MiB private blocks in its host process are not the app's
+  host-visible allocations nor our staging (5.6 MB an image) -- **unexplained, likely the driver's
+  per-pool memory: the next RAM lever to pin**. Its cache's tables: 125 MiB for 238 MiB of code.
+- Diagnostics: `OMNI_MEM_TRACE` also prints the code caches' table census; `OMNI_GPU_MEM=<s>`;
+  `OMNI_MADVISE_STATS=<s>`.
+
+### The mouse (`f58547a`, `07a2639`)
+
+- **The host cursor follows the app's own**: Roblox's `RBXSurfaceView` resolves `TYPE_NULL`, and its
+  `ViewRootImpl` sends `IInputManager.setPointerIcon` (transaction 36 in the image) when the icon
+  changes. The broker got a tap (`Broker::tap`: a host callback reading every transaction of one
+  code to one node as it passes); the injector installs it on the input service; the window hides
+  the host cursor over the view while the icon is `TYPE_NULL`, shows it otherwise
+  (`OMNI_HOST_CURSOR=show|hide` still decide instead). One cursor on screen: the engine's.
+- **Camera drag held**: a secondary-button drag over a view drawing its own pointer (Roblox's
+  right-drag, `LockCurrentPosition`, which takes no pointer capture on Android -- confirmed: no
+  capture in any run) captures the host cursor where it was pressed; raw motion moves the app's
+  absolute pointer (kept on the display, as a device's); the release is where that pointer is, then
+  the pointer goes back to the press, where the engine kept its cursor. `[window] mouse held (a
+  camera drag)` / `free` in runs E and F.
+- **The app's capture (shift-lock, first person) holds the cursor at the window's centre** (`Out::
+  Center`), so it is given back there. PS99 caps zoom short of first person, so not exercised
+  in-world; D7 covers the capture round trip.
+- **A moving pointer at most 60 times a second** (was 125): the streaming cost halved (-10% -> -5%).
+- Input that lands in the game costs frames as game work: W held 29.8, right-drag camera 22.3,
+  clicks 26.5 (run F; base2's input phases hit the dialog, not the game). No <10 fps seen in any run.
+
+### CPU: where a frame goes now (run D, `OMNI_THREAD_CPU_APP`, `OMNI_SYSCALL_STATS`, `OMNI_GPU_STATS`)
+
+- **"RBX Worker C" at 98-105% of a core, 76% translated code**; the render thread (`FunctionMarshal`)
+  88-91%, half translated code, half kernel -- about a third of its samples waiting. In a live world
+  the limit is guest compute on that worker, not the forwarding.
+- Vulkan: ~107k forwarded calls/s (~3,100 a frame at ~33 fps), ~0.68 s per 15 s in the host driver
+  plus ~0.35 us of crossing each: **~8% of the render thread**; batching the `vkCmd*` calls could win
+  back about half of that. The release's GPU wait (5.6 ms) is on the asynchronous worker.
+  `clock_gettime` no longer appears (the vDSO); mediaextractor's timer restarts are gone (POSIX timers).
+  Not done: batching, and faster translated code (the lever that remains).
+
+### Gates
+
+- `d7_window_input` (lean device, probe app): **passes** (119 s) -- keys, exact clicks, hover, wheel,
+  the capture round trip (`mouse held (the app holds the pointer capture)`, `rel 30,-10`, `free`).
+  Its wheel step had failed twice with the 8 MiB trim floor: a notification shown over the probe
+  between the hover and the wheel (the notification assistant was started exactly there, both
+  times) took them; D7 now turns heads-up notifications off (`ca3a505`). Correlated 4 of 4, not
+  proven; passes also with trimming off and with `OMNI_CODE_TRIM_MIN_MB=24`.
+- `lean_image`, `omni-linux` unit tests (29), dynarmic-sys and omni-cpu suites (101 binaries):
+  green. `r_roblox` in-world: runs B-F above.
+
+### Found, not fixed
+
+- The ~512 MiB of 32 MiB private blocks in the game's host process (above).
+- The system host process runs ~950 host threads; each guest thread's fast-dispatch table is 64 KiB.
+- SurfaceFlinger's translations (57 MiB) are never trimmed (it runs every frame).
+
 ## PLAYABLE INPUT, LIGHTER, FASTER (2026-09-28/29 night, Windows; `5d01e0e`..`f664bc4`)
 
 Goal (owner): input unplayable (mouse captured on click, Right Ctrl to release; a click took 5-7 s;
