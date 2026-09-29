@@ -78,8 +78,8 @@ pub use pager::{process_pager_totals, DemandPager, PagerStats};
 pub use region::{RegionInfo, RegionKind};
 pub use space::{
     split_at_pages, CommitPolicy, Discarded, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId,
-    PageSplit, Placement, Reclaimed, SpaceStats, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED,
-    DEFAULT_MAX_COMMIT_REQUEST, DEFAULT_SPACE_SIZE, SMALL_PAGE,
+    LowWindow, PageSplit, Placement, Reclaimed, SpaceStats, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED,
+    DEFAULT_MAX_COMMIT_REQUEST, DEFAULT_SPACE_SIZE, LOW_WINDOW_END, SMALL_PAGE,
 };
 
 /// Re-exported from `omni-platform` so that callers do not need to depend on it directly to name a

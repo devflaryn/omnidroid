@@ -13,8 +13,63 @@ use crate::error::{platform, MemError, MemResult};
 use crate::region::RegionInfo;
 
 /// A guest virtual address. Identical to the host address it lives at: a guest pointer *is* a host
-/// pointer (ARCHITECTURE.md section 1), so there is no translation and no distinct address type.
+/// pointer (ARCHITECTURE.md section 1), so there is no translation and no distinct address type --
+/// except inside a space's [`LowWindow`] (D41), which only a space asked for one has.
 pub type GuestAddr = usize;
+
+/// Where a [`LowWindow`] ends: 4 GiB, the reach of ART's 32-bit object references.
+pub const LOW_WINDOW_END: GuestAddr = 1 << 32;
+
+/// The part of a guest space below [`LOW_WINDOW_END`] that is backed elsewhere in the host (D41,
+/// `docs/ports/macos-low-window.md`): guest address `g` in it lives at host address `g + delta`.
+///
+/// For a host that can map nothing below 4 GiB -- macOS, whose arm64 `__PAGEZERO` is 4 GiB and
+/// hard -- where ART must still have its heap and boot image there. Above the window a guest
+/// address stays the host's, so a guest pointer the host reads in place (a Vulkan struct) is one,
+/// as long as it was not placed in the window by address; placements without an address never are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LowWindow {
+    /// The first guest address in the window: the space's base.
+    pub start: GuestAddr,
+    /// The guest address the window ends at, exclusive: [`LOW_WINDOW_END`]. The page below it is
+    /// a host-owned guard, so no mapping straddles the seam between the based and identity halves.
+    pub end: GuestAddr,
+    /// What is added to a guest address below [`end`](Self::end) to reach its host address. A
+    /// multiple of 4 GiB, so a host address's low 32 bits are the guest address.
+    pub delta: usize,
+}
+
+impl LowWindow {
+    /// The host address of guest address `address`: based below [`end`](Self::end), as dynarmic's
+    /// fast path computes it (patch 0030), else the same.
+    #[must_use]
+    pub const fn host(&self, address: GuestAddr) -> usize {
+        if address < self.end {
+            address.wrapping_add(self.delta)
+        } else {
+            address
+        }
+    }
+
+    /// The guest address the window's host address `host` stands for, if it is in the window.
+    #[must_use]
+    pub const fn guest(&self, host: usize) -> Option<GuestAddr> {
+        if host >= self.start.wrapping_add(self.delta) && host < self.end.wrapping_add(self.delta) {
+            Some(host - self.delta)
+        } else {
+            None
+        }
+    }
+}
+
+/// [`LowWindow::host`], or the address itself for a space without a window.
+#[inline]
+fn host_of(window: Option<LowWindow>, address: GuestAddr) -> usize {
+    match window {
+        Some(window) => window.host(address),
+        None => address,
+    }
+}
 
 /// Identity of a guest mapping. Stable for the life of the mapping, and reported by
 /// [`GuestSpace::regions`] so that consumers can tell one mapping from an adjacent one with the
@@ -244,6 +299,16 @@ pub struct GuestSpaceConfig {
     ///
     /// [`RegionKind::Host`]: crate::RegionKind::Host
     pub around_host: bool,
+    /// Back the part of the space below [`LOW_WINDOW_END`] with a host reservation wherever the
+    /// host chooses, addressed as `g + delta` ([`LowWindow`], D41), instead of at the guest
+    /// addresses themselves. Default `false`. Needs `base: Some(_)` below `LOW_WINDOW_END`; the
+    /// part at and above it is reserved as it would be without (and [`around_host`](Self::around_host)
+    /// applies to it alone).
+    ///
+    /// Why: ART's heap and boot image must be below 4 GiB, and macOS maps nothing there
+    /// (`vm::lowest_mappable_address` is 4 GiB on Apple silicon). Where the host can map low, the
+    /// window is not needed, and it works just the same.
+    pub low_window: bool,
 }
 
 impl Default for GuestSpaceConfig {
@@ -256,6 +321,7 @@ impl Default for GuestSpaceConfig {
             max_committed: DEFAULT_MAX_COMMITTED,
             max_commit_request: DEFAULT_MAX_COMMIT_REQUEST,
             around_host: false,
+            low_window: false,
         }
     }
 }
@@ -404,6 +470,9 @@ pub struct GuestSpace {
     len: usize,
     page: usize,
     granule: usize,
+    /// The part below 4 GiB backed elsewhere in the host, when asked for (D41). Fixed for the
+    /// space's life, so it is read without the lock.
+    window: Option<LowWindow>,
     inner: Mutex<Inner>,
     /// Bumped by every write section, under the lock and before the write; read without the lock
     /// by `crate::cache` to decide whether a remembered entry is still true.
@@ -434,6 +503,11 @@ struct Inner {
     page: usize,
     granule: usize,
     cursor: GuestAddr,
+    /// Where a placement without an address starts again when it wraps: the space's base, or the
+    /// end of its [`LowWindow`], which only a placement by address may use.
+    floor: GuestAddr,
+    /// [`GuestSpace::window`], for the host calls made under the lock.
+    window: Option<LowWindow>,
     released: bool,
     /// Bytes of private committed memory this space currently holds, maintained incrementally
     /// because [`Inner::commit_range`] has to know it on every granule and walking the map there
@@ -560,13 +634,26 @@ impl GuestSpace {
 
         // At least page-aligned: the host's allocation granularity already is, for the host's own
         // page, and is not for a larger page asked of `with_page_size`.
+        let mut window = None;
         let (reservations, hosts) = match config.base {
+            Some(at) if config.low_window => {
+                let (reservations, hosts, low) = reserve_with_window(at, config.size, page, config.around_host)?;
+                window = Some(low);
+                (reservations, hosts)
+            }
             Some(at) if config.around_host => reserve_around_host(at, config.size, page)?,
             Some(at) => (
                 vec![vm::reserve_placeholder_at(at, config.size)
                     .map_err(platform("GuestSpace::with_config", at, config.size))?],
                 Vec::new(),
             ),
+            None if config.low_window => {
+                return Err(MemError::InvalidConfig {
+                    field: "low_window",
+                    value: 1,
+                    reason: "needs a base: the window is the part of the space below 4 GiB",
+                })
+            }
             None => (
                 vec![vm::reserve_placeholder(config.size, config.base_alignment.max(page))
                     .map_err(platform("GuestSpace::with_config", 0, config.size))?],
@@ -574,11 +661,15 @@ impl GuestSpace {
             ),
         };
         let base = config.base.unwrap_or_else(|| reservations[0].base());
+        // A placement without an address never lands in the window: what the host reads in place
+        // (D41) is always placed that way.
+        let floor = window.map_or(base, |w| w.end.min(base + config.size));
         tracing::debug!(
             base = format_args!("{base:#x}"),
             size = config.size,
             granule = config.commit_granule,
             host_ranges = hosts.len(),
+            window = ?window,
             "reserved a guest address space"
         );
         Ok(Self {
@@ -586,12 +677,15 @@ impl GuestSpace {
             len: config.size,
             page,
             granule: config.commit_granule,
+            window,
             inner: Mutex::new(Inner {
                 map: EntryMap::with_hosts(base, config.size, hosts),
                 reservations,
                 page,
                 granule: config.commit_granule,
-                cursor: base,
+                cursor: floor,
+                floor,
+                window,
                 released: false,
                 committed: 0,
                 max_committed: config.max_committed,
@@ -671,7 +765,48 @@ impl GuestSpace {
     /// [`MemError::OutsideSpace`] if the range is not inside this space.
     pub fn ptr(&self, address: GuestAddr, len: usize) -> MemResult<*mut u8> {
         self.check_range("ptr", address, len)?;
-        Ok(address as *mut u8)
+        if let Some(window) = self.window {
+            // A range across the seam has no one host pointer; the guard page below it is never
+            // mapped, so no mapped range is one.
+            if address < window.end && address + len > window.end {
+                return Err(MemError::OutsideSpace {
+                    operation: "ptr",
+                    address,
+                    end: address + len,
+                    space_base: self.base,
+                    space_end: self.end(),
+                    space_len: self.len,
+                });
+            }
+        }
+        Ok(self.host_addr(address) as *mut u8)
+    }
+
+    /// The host address guest address `address` lives at: the same, except in the space's
+    /// [`LowWindow`] (D41). Not checked against the space; [`ptr`](Self::ptr) is.
+    #[inline]
+    #[must_use]
+    pub fn host_addr(&self, address: GuestAddr) -> usize {
+        host_of(self.window, address)
+    }
+
+    /// The guest address host address `host` stands for, if it is one of this space's: what a host
+    /// fault's address means to the guest.
+    #[inline]
+    #[must_use]
+    pub fn host_to_guest(&self, host: usize) -> Option<GuestAddr> {
+        match self.window {
+            Some(window) => window
+                .guest(host)
+                .or_else(|| (host >= window.end && host >= self.base && host < self.end()).then_some(host)),
+            None => (host >= self.base && host < self.end()).then_some(host),
+        }
+    }
+
+    /// The part of this space below 4 GiB that is backed elsewhere in the host, if it has one.
+    #[must_use]
+    pub fn low_window(&self) -> Option<LowWindow> {
+        self.window
     }
 
     /// Map anonymous memory.
@@ -967,11 +1102,11 @@ impl GuestSpace {
             inner.protect_range(OP, start, entry_len, Protection::ReadWrite)?;
         }
 
-        // SAFETY: a guest address is a host address (D4's identity mapping), the span is mapped,
+        // SAFETY: `host_addr` is where the guest address lives (D4, D41), the span is mapped,
         // committed, and every page in it is now writable, and `check_range` bounded the write to
         // the space. No guest code runs here, so nothing executes a page mid-flip.
         unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, len);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host_addr(address) as *mut u8, len);
         }
 
         for (start, entry_len, protection) in to_flip {
@@ -1074,7 +1209,7 @@ impl GuestSpace {
             // keeps that section alive. Nothing is dereferenced: the host call inspects and writes
             // back the range's pages, and if a concurrent unmap has changed the range since, it
             // fails or writes back whichever view is there now -- see this method's documentation.
-            unsafe { vm::sync_view(backing.file(), from as *mut u8, piece) }
+            unsafe { vm::sync_view(backing.file(), self.host_addr(from) as *mut u8, piece) }
                 .map_err(platform(OP, from, piece))?;
             synced += piece;
         }
@@ -1523,6 +1658,12 @@ impl Drop for GuestSpace {
 // -------------------------------------------------------------------------------------------
 
 impl Inner {
+    /// The host address of guest address `address` ([`LowWindow`], D41).
+    #[inline]
+    fn host(&self, address: GuestAddr) -> usize {
+        host_of(self.window, address)
+    }
+
     #[inline]
     fn validate(&self) {
         #[cfg(debug_assertions)]
@@ -1639,7 +1780,9 @@ impl Inner {
             }
         }
         for &(run_start, run_len) in &runs {
-            if let Some(address) = fits(run_start, run_len, self.map.base()) {
+            // Wrapping never reaches below the floor for a search that started above it.
+            let lower = if from >= self.floor { self.floor } else { self.map.base() };
+            if let Some(address) = fits(run_start, run_len, lower) {
                 self.cursor = address + len;
                 return Ok(address);
             }
@@ -1691,7 +1834,7 @@ impl Inner {
             // SAFETY: every entry in the run is a placeholder this process owns, as asserted above,
             // and the map is the authority on that. Nothing is dereferenced; the call only merges
             // placeholder boundaries.
-            unsafe { vm::coalesce_placeholders(union_start as *mut u8, union_len) }
+            unsafe { vm::coalesce_placeholders(self.host(union_start) as *mut u8, union_len) }
                 .map_err(platform(operation, union_start, union_len))?;
             let merged = self.map.get(union_start).expect("entry vanished").clone();
             self.map.replace(
@@ -1726,17 +1869,18 @@ impl Inner {
         let len = at - start;
         // The OS placeholder the split is inside. A placeholder entry never crosses from one to
         // the next, because the host's range lies between them and a free entry never spans it.
-        let reservation = self.reservation_at(start);
-        let offset = start - reservation.base();
+        let host = self.host(start);
+        let reservation = self.reservation_at(host);
+        let offset = host - reservation.base();
         let piece = vm::split_placeholder(reservation, offset, len)
             .map_err(platform(operation, start, len))?;
-        debug_assert_eq!(piece.base(), start, "a split must carve the range it was given");
+        debug_assert_eq!(piece.base(), host, "a split must carve the range it was given");
         self.map.split_bookkeeping(start, at);
         Ok(())
     }
 
-    /// The reservation containing `address`, which must be one of this space's own.
-    fn reservation_at(&self, address: GuestAddr) -> &Reservation {
+    /// The reservation containing **host** address `address`, which must be one of this space's own.
+    fn reservation_at(&self, address: usize) -> &Reservation {
         let index = self.reservations.partition_point(|r| r.end() <= address);
         let reservation = &self.reservations[index];
         assert!(
@@ -1906,7 +2050,7 @@ impl Inner {
             // contract of `commit_placeholder`. It is inside this process's reservation and no
             // reference into it exists: nothing has been able to touch it, because a placeholder is
             // inaccessible.
-            unsafe { vm::commit_placeholder(from as *mut u8, to - from, owner.protection) }
+            unsafe { vm::commit_placeholder(self.host(from) as *mut u8, to - from, owner.protection) }
                 .map_err(platform(operation, from, to - from))?;
             self.map
                 .get_mut(from)
@@ -1934,11 +2078,11 @@ impl Inner {
         // SAFETY: `[address, address + len)` is exactly one unreplaced placeholder piece, which is
         // `map_file`'s contract — `make_exact_placeholder` has just made it so, and the region map
         // is the authority on placeholder extents.
-        unsafe { vm::map_file(backing.file(), file_offset, len, address as *mut u8, create_with) }
+        unsafe { vm::map_file(backing.file(), file_offset, len, self.host(address) as *mut u8, create_with) }
             .map_err(platform(operation, address, len))?;
         if protection == Protection::None {
             // SAFETY: the range is a live view this process owns, just created above.
-            unsafe { vm::protect(address as *mut u8, len, Protection::None) }
+            unsafe { vm::protect(self.host(address) as *mut u8, len, Protection::None) }
                 .map_err(platform(operation, address, len))?;
         }
         Ok(ViewId(NEXT_VIEW.fetch_add(1, Ordering::Relaxed)))
@@ -1969,7 +2113,7 @@ impl Inner {
                     // SAFETY: the range is committed private memory or a live view this process
                     // owns, and it is homogeneous — one entry is one OS state, so this never spans
                     // both, which `protect` requires.
-                    unsafe { vm::protect(start as *mut u8, entry_len, protection) }
+                    unsafe { vm::protect(self.host(start) as *mut u8, entry_len, protection) }
                         .map_err(platform(operation, start, entry_len))?;
                 }
             }
@@ -2024,7 +2168,7 @@ impl Inner {
                     // `commit_placeholder`, and the guest has asked for it to be gone, so nothing
                     // may hold a reference into it. A partial release of a private region is legal
                     // and was measured to leave its neighbours' contents intact.
-                    unsafe { vm::decommit_to_placeholder(start as *mut u8, entry.len) }
+                    unsafe { vm::decommit_to_placeholder(self.host(start) as *mut u8, entry.len) }
                         .map_err(platform(operation, start, entry.len))?;
                     self.committed -= entry.len;
                     self.map.free_range(start, entry.len);
@@ -2134,11 +2278,12 @@ impl Inner {
                 // nothing — it is about to be unmapped either way, and it is mapped again with its
                 // own protection below.
                 // SAFETY: the range is a live view this process owns.
-                unsafe { vm::protect(survivor.start as *mut u8, survivor.len, Protection::Read) }
+                unsafe { vm::protect(self.host(survivor.start) as *mut u8, survivor.len, Protection::Read) }
                     .map_err(platform(operation, survivor.start, survivor.len))?;
             }
             survivor.preserved = scan_for_copy_on_write(
                 operation,
+                self.window,
                 survivor.start,
                 survivor.len,
                 &survivor.owner,
@@ -2161,7 +2306,7 @@ impl Inner {
         // of it to be gone, so nothing may hold a reference into it. Unmapping preserves the
         // placeholder, so the address space stays owned by this process and no other allocation can
         // land at a guest address.
-        unsafe { vm::unmap(view_start as *mut u8, view_len) }
+        unsafe { vm::unmap(self.host(view_start) as *mut u8, view_len) }
             .map_err(platform(operation, view_start, view_len))?;
         self.map.replace(view_start, view_len, Entry::free(view_len));
 
@@ -2175,6 +2320,7 @@ impl Inner {
                 Ok(()) => {
                     if let Err(failure) = restore_copy_on_write(
                         operation,
+                        self.window,
                         &survivor.preserved,
                         survivor.owner.protection,
                     ) {
@@ -2330,15 +2476,15 @@ impl Inner {
         if raise {
             // SAFETY: the page is committed private memory this process owns (the map says so,
             // under its lock); a protection change dereferences nothing.
-            unsafe { vm::protect(page_start as *mut u8, self.page, Protection::ReadWrite) }
+            unsafe { vm::protect(self.host(page_start) as *mut u8, self.page, Protection::ReadWrite) }
                 .map_err(platform(operation, page_start, self.page))?;
         }
         // SAFETY: `[at, at + len)` is inside that committed page, which is writable now. The guest
         // has said it no longer needs these bytes; the bytes beside them are not written.
-        unsafe { std::ptr::write_bytes(at as *mut u8, 0, len) };
+        unsafe { std::ptr::write_bytes(self.host(at) as *mut u8, 0, len) };
         if raise {
             // SAFETY: as above; this puts back the protection the map records.
-            unsafe { vm::protect(page_start as *mut u8, self.page, protection) }
+            unsafe { vm::protect(self.host(page_start) as *mut u8, self.page, protection) }
                 .map_err(platform(operation, page_start, self.page))?;
         }
         Ok(len)
@@ -2350,7 +2496,7 @@ impl Inner {
             // SAFETY: the range is private committed memory this process owns and the guest has
             // said it no longer needs the contents, so nothing may hold a reference into it.
             // `MEM_DECOMMIT` is the only primitive that returns commit charge (D10).
-            unsafe { vm::decommit_to_placeholder(start as *mut u8, len) }
+            unsafe { vm::decommit_to_placeholder(self.host(start) as *mut u8, len) }
                 .map_err(platform("reclaim_idle", start, len))?;
             let entry = self.map.get_mut(start).expect("entry vanished");
             entry.os = OsState::Placeholder;
@@ -2408,7 +2554,7 @@ impl Inner {
                 continue;
             }
             // SAFETY: every entry in the run is a free placeholder this process owns.
-            unsafe { vm::coalesce_placeholders(start as *mut u8, len) }
+            unsafe { vm::coalesce_placeholders(self.host(start) as *mut u8, len) }
                 .map_err(platform("reclaim_idle", start, len))?;
             self.map.replace(start, len, Entry::free(len));
             reclaimed.coalesced += count;
@@ -2506,7 +2652,7 @@ impl Inner {
                     // `commit_placeholder`, being torn down; the space is going away, so nothing
                     // may hold a reference into it.
                     let result =
-                        unsafe { vm::decommit_to_placeholder(start as *mut u8, entry.len) };
+                        unsafe { vm::decommit_to_placeholder(self.host(start) as *mut u8, entry.len) };
                     if let Err(error) = result {
                         fail(platform("close", start, entry.len)(error));
                     }
@@ -2523,7 +2669,7 @@ impl Inner {
                     let view_len = view_end - start;
                     // SAFETY: one whole view this process owns, being torn down; the map knows its
                     // extent because it knows which entries share the view id.
-                    if let Err(error) = unsafe { vm::unmap(start as *mut u8, view_len) } {
+                    if let Err(error) = unsafe { vm::unmap(self.host(start) as *mut u8, view_len) } {
                         fail(platform("close", start, view_len)(error));
                     }
                     self.map.replace(start, view_len, Entry::free(view_len));
@@ -2537,7 +2683,9 @@ impl Inner {
         // crosses from one to the next, and the host's ranges between them are never touched.
         let reservations = self.reservations.clone();
         for reservation in reservations {
-            let base = reservation.base();
+            // The map is the guest's; the reservation is the host's (they differ in a window).
+            let host_base = reservation.base();
+            let base = self.window.and_then(|w| w.guest(host_base)).unwrap_or(host_base);
             let len = reservation.len();
 
             // 2. One placeholder again. Coalescing is only legal — and only necessary — when the
@@ -2545,7 +2693,7 @@ impl Inner {
             //    fails with 487.
             if self.map.starts_overlapping(base, len).len() > 1 {
                 // SAFETY: after step 1 the whole reservation is placeholders this process owns.
-                match unsafe { vm::coalesce_placeholders(base as *mut u8, len) } {
+                match unsafe { vm::coalesce_placeholders(host_base as *mut u8, len) } {
                     Ok(()) => self.map.replace(base, len, Entry::free(len)),
                     Err(error) => fail(platform("close", base, len)(error)),
                 }
@@ -2591,6 +2739,84 @@ type AroundHost = (Vec<Reservation>, Vec<(GuestAddr, usize)>);
 /// How many times [`reserve_around_host`] asks the host again after the host took part of the
 /// range between the question and the reservation.
 const AROUND_HOST_ATTEMPTS: usize = 4;
+
+/// Reserve a space with a [`LowWindow`] (D41): the window's part (`[base, LOW_WINDOW_END - page)`)
+/// at `W + g` for a 4 GiB-aligned `W` the host chooses, the page below `LOW_WINDOW_END` as a
+/// host-owned guard, and the part above as it would be without the window. The reservations come
+/// back sorted by host address, the host's ranges by guest address.
+fn reserve_with_window(
+    base: GuestAddr,
+    size: usize,
+    page: usize,
+    around_host: bool,
+) -> MemResult<(Vec<Reservation>, Vec<(GuestAddr, usize)>, LowWindow)> {
+    const OP: &str = "GuestSpace::with_config";
+    let end = base.checked_add(size).ok_or(MemError::InvalidConfig {
+        field: "size",
+        value: size as u64,
+        reason: "runs past the end of the address space",
+    })?;
+    let guard = LOW_WINDOW_END - page;
+    if base >= guard {
+        return Err(MemError::InvalidConfig {
+            field: "base",
+            value: base as u64,
+            reason: "a low window needs a base below 4 GiB",
+        });
+    }
+    let low_end = end.min(guard);
+    let low_len = low_end - base;
+
+    let mut attempt = 0;
+    let (low, delta) = loop {
+        attempt += 1;
+        // Where the host has 4 GiB free, found by reserving it and giving it back; then the window's
+        // part of it by address. Something else can take it in between: ask again.
+        let probe = vm::reserve_placeholder(LOW_WINDOW_END, LOW_WINDOW_END)
+            .map_err(platform(OP, base, LOW_WINDOW_END))?;
+        let delta = probe.base();
+        vm::release(probe).map_err(platform(OP, delta, LOW_WINDOW_END))?;
+        match vm::reserve_placeholder_at(delta + base, low_len) {
+            Ok(low) => break (low, delta),
+            Err(error) if attempt >= AROUND_HOST_ATTEMPTS => return Err(platform(OP, delta + base, low_len)(error)),
+            Err(error) => tracing::debug!(%error, attempt, "the host took the window's range; asking again"),
+        }
+    };
+    let window = LowWindow { start: base, end: LOW_WINDOW_END, delta };
+
+    let mut reservations = vec![low];
+    let mut hosts = Vec::new();
+    if end > guard {
+        hosts.push((guard, end.min(LOW_WINDOW_END) - guard));
+    }
+    if end > LOW_WINDOW_END {
+        let high_len = end - LOW_WINDOW_END;
+        let high = if around_host {
+            reserve_around_host(LOW_WINDOW_END, high_len, page)
+        } else {
+            vm::reserve_placeholder_at(LOW_WINDOW_END, high_len)
+                .map(|r| (vec![r], Vec::new()))
+                .map_err(platform(OP, LOW_WINDOW_END, high_len))
+        };
+        match high {
+            Ok((high, high_hosts)) => {
+                reservations.extend(high);
+                hosts.extend(high_hosts);
+            }
+            Err(error) => {
+                for reservation in reservations {
+                    if let Err(release) = vm::release(reservation) {
+                        tracing::error!(%release, "could not give back a window's reservation");
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    reservations.sort_by_key(Reservation::base);
+    tracing::debug!(delta = format_args!("{delta:#x}"), low_len, "reserved a low window");
+    Ok((reservations, hosts, window))
+}
 
 /// Reserve `[base, base + size)` around what the host holds in it: one placeholder per free range,
 /// and the host's ranges, `(start, len)`, for the region map. See
@@ -2817,6 +3043,7 @@ impl Drop for PristineView {
 /// is asked.
 fn scan_for_copy_on_write(
     operation: &'static str,
+    low_window: Option<LowWindow>,
     address: GuestAddr,
     len: usize,
     owner: &Owner,
@@ -2838,7 +3065,7 @@ fn scan_for_copy_on_write(
             // was just mapped over `window` bytes.
             let (live_page, file_page) = unsafe {
                 (
-                    std::slice::from_raw_parts((live + position) as *const u8, step),
+                    std::slice::from_raw_parts(host_of(low_window, live + position) as *const u8, step),
                     std::slice::from_raw_parts(pristine.as_ptr().add(position), step),
                 )
             };
@@ -2881,6 +3108,7 @@ struct RestoreFailure {
 /// any range left writable is reported so the map can be told the truth.
 fn restore_copy_on_write(
     operation: &'static str,
+    window: Option<LowWindow>,
     preserved: &[Dirty],
     protection: Protection,
 ) -> Result<(), Box<RestoreFailure>> {
@@ -2890,7 +3118,7 @@ fn restore_copy_on_write(
         let len = run.bytes.len();
         // SAFETY: the range is part of a live view this process has just mapped, and is page-aligned
         // and a whole number of pages because every mapping length here is.
-        if let Err(error) = unsafe { vm::protect(run.address as *mut u8, len, Protection::ReadWrite) }
+        if let Err(error) = unsafe { vm::protect(host_of(window, run.address) as *mut u8, len, Protection::ReadWrite) }
         {
             // Nothing was written and nothing was changed, so this run is still at the protection the
             // map records; only the content is lost.
@@ -2902,11 +3130,11 @@ fn restore_copy_on_write(
         // SAFETY: the range is now writable and `len` bytes long, and the source is a heap buffer
         // that cannot overlap a mapping.
         unsafe {
-            std::ptr::copy_nonoverlapping(run.bytes.as_ptr(), run.address as *mut u8, len);
+            std::ptr::copy_nonoverlapping(run.bytes.as_ptr(), host_of(window, run.address) as *mut u8, len);
         }
         // SAFETY: as above. Restoring the recorded protection keeps the region map truthful — and
         // when it fails, the map has to be corrected instead, which is what `left_writable` is for.
-        if let Err(error) = unsafe { vm::protect(run.address as *mut u8, len, protection) } {
+        if let Err(error) = unsafe { vm::protect(host_of(window, run.address) as *mut u8, len, protection) } {
             left_writable.push((run.address, len));
             if source.is_none() {
                 source = Some(platform(operation, run.address, len)(error));

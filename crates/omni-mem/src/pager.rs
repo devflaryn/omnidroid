@@ -349,10 +349,17 @@ fn handle_fault(context: usize, fault: &Fault) -> FaultOutcome {
     let inner: &PagerInner = unsafe { &*inner };
 
     // A cheap bounds check before anything else: every access violation in the process arrives
-    // here, and almost none of them are ours.
-    if fault.address < inner.base || fault.address >= inner.end {
-        return FaultOutcome::NotOurs;
-    }
+    // here, and almost none of them are ours. The hardware names a host address; in a space's low
+    // window (D41) that is not the guest's, so it is translated first and everything after this
+    // speaks guest addresses.
+    let fault = &match inner.space.low_window() {
+        None if fault.address < inner.base || fault.address >= inner.end => return FaultOutcome::NotOurs,
+        None => *fault,
+        Some(_) => match inner.space.host_to_guest(fault.address) {
+            Some(address) => Fault { address, ..*fault },
+            None => return FaultOutcome::NotOurs,
+        },
+    };
 
     let reentered = IN_HANDLER.with(|flag| flag.replace(true));
     if reentered {
