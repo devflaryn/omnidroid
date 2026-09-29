@@ -46,6 +46,10 @@ pub struct Mm {
     /// interleave with another thread's mapping, nor any change with a syscall's copy.
     lock: crate::guest::Layout,
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
+    /// Pages a 4 KiB-aligned `mprotect` has split (`protect_widened`): the protection asked for
+    /// each 4 KiB of the page. The page itself has their union. A whole-page `mprotect` or an
+    /// unmapping forgets the page.
+    subpages: Mutex<std::collections::BTreeMap<u64, Vec<Protection>>>,
 }
 
 
@@ -82,7 +86,7 @@ impl Mm {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>, lock: crate::guest::Layout) -> Self {
         let page = space.page_size() as u64;
-        Self { space, page, lock, files: Mutex::default() }
+        Self { space, page, lock, files: Mutex::default(), subpages: Mutex::default() }
     }
 
     /// The page size the guest is told and every `mmap`, `mprotect` and `munmap` is exact at.
@@ -158,7 +162,21 @@ impl Mm {
             }
         }
         self.forget(addr, len);
+        self.forget_subpages(addr, len);
         Ok(())
+    }
+
+    /// Forget what `protect_widened` recorded for the pages of `[addr, addr + len)`.
+    fn forget_subpages(&self, addr: u64, len: u64) {
+        let mut subpages = self.subpages.lock();
+        if subpages.is_empty() {
+            return;
+        }
+        let first = addr & !(self.page - 1);
+        let gone: Vec<u64> = subpages.range(first..addr.saturating_add(len)).map(|(p, _)| *p).collect();
+        for page in gone {
+            subpages.remove(&page);
+        }
     }
 
     pub fn unmap(&self, addr: u64, len: u64) -> Result<(), Errno> {
@@ -186,7 +204,9 @@ impl Mm {
             return Ok(());
         }
         let _g = self.lock.write();
-        self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)
+        self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)?;
+        self.forget_subpages(addr, len);
+        Ok(())
     }
 
     /// A 4 KiB-aligned `mprotect` on a device whose page is larger: code built for 4 KiB pages asks
@@ -194,23 +214,37 @@ impl Mm {
     /// 2.740.931's `libzstd-jni`, whose next constructor was then still ciphertext: `SIGILL`). A
     /// 16 KiB Linux kernel refuses it (`EINVAL`), and so did this one. Here it is widened to whole
     /// pages: a page the range covers entirely gets exactly what was asked; a page it covers in
-    /// part gets what was asked *and* what that page had, so nothing else on it loses access (the
-    /// same compromise a 4 KiB library laid out for large pages makes, `crate::pagecompat`). Never
-    /// reached on a 4 KiB-page host.
+    /// part remembers what each of its 4 KiB was asked for and gets their union, so nothing else on
+    /// it loses access, and once every 4 KiB is asked back (read-execute after decrypting) the page
+    /// is exactly that again -- not left writable for an integrity check to find. Never reached on
+    /// a 4 KiB-page host.
     fn protect_widened(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
         let asked = protection(prot)?;
         let len = len.checked_add(SMALL_PAGE - 1).ok_or(EINVAL)? & !(SMALL_PAGE - 1);
         let end = addr.checked_add(len).ok_or(ENOMEM)?;
         let (first, last) = (addr & !(self.page - 1), (end + self.page - 1) & !(self.page - 1));
         let _g = self.lock.write();
+        let per_page = (self.page / SMALL_PAGE) as usize;
         let mut page = first;
         while page < last {
-            let whole = page >= addr && page + self.page <= end;
-            let prot = if whole {
+            let prot = if page >= addr && page + self.page <= end {
+                self.subpages.lock().remove(&page);
                 asked
             } else {
                 let had = self.space.region_at(page as usize).filter(|r| r.mapping.is_some()).ok_or(ENOMEM)?.protection;
-                union(asked, had)
+                let mut subpages = self.subpages.lock();
+                let parts = subpages.entry(page).or_insert_with(|| vec![had; per_page]);
+                for (i, part) in parts.iter_mut().enumerate() {
+                    let at = page + i as u64 * SMALL_PAGE;
+                    if at >= addr && at < end {
+                        *part = asked;
+                    }
+                }
+                let prot = parts.iter().copied().fold(Protection::None, union);
+                if parts.iter().all(|&p| p == parts[0]) {
+                    subpages.remove(&page);
+                }
+                prot
             };
             self.space.protect(page as usize, self.page as usize, prot).map_err(|_| ENOMEM)?;
             page += self.page;

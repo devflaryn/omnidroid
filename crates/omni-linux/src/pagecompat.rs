@@ -9,9 +9,11 @@
 //! Android 15 image here does not. This is that mode's effect, made where a kernel can make it: the
 //! file an app opens is laid out again so that every `PT_LOAD`'s offset *equals* its address plus
 //! one constant (zero padding inserted before each segment), with `p_align` the page. Pages two
-//! segments share then hold the same bytes whichever mapping comes last. `PT_GNU_RELRO` is dropped:
-//! its end is not on a page boundary, and sealing it rounded up would make the start of `.data`
-//! read-only (the library keeps its `.got` writable, as a 4 KiB-page device's would be until relro).
+//! segments share then hold the same bytes whichever mapping comes last. `PT_GNU_RELRO` is trimmed to
+//! end on the page boundary below its end: bionic seals relro rounded *up* to the page, and the
+//! page holding its end holds the start of `.data` too. What is left out of it (the `.got`, here)
+//! stays writable, as a 4 KiB-page device's would be until relro; a library that looks its relro
+//! header up still finds one.
 //!
 //! Only app libraries (`/data/app/**.so`) opened for reading, only where a segment's alignment is
 //! below the page -- never on a 4 KiB-page host -- and once: the file is rewritten in place.
@@ -107,7 +109,14 @@ pub fn realign(bytes: &[u8], page: u64) -> Option<Vec<u8>> {
             out[at + 48..at + 56].copy_from_slice(&page.to_le_bytes());
         }
         if kind == PT_GNU_RELRO {
-            out[at..at + 4].copy_from_slice(&PT_NULL.to_le_bytes());
+            let (va, memsz) = (u64_at(&out, at + 16)?, u64_at(&out, at + 40)?);
+            let end = va.checked_add(memsz)? & !(page - 1);
+            if end <= va {
+                out[at..at + 4].copy_from_slice(&PT_NULL.to_le_bytes());
+            } else {
+                out[at + 32..at + 40].copy_from_slice(&(end - va).to_le_bytes());
+                out[at + 40..at + 48].copy_from_slice(&(end - va).to_le_bytes());
+            }
         }
     }
     let new_shoff = usize::try_from(map(shoff)).ok()?;
@@ -208,11 +217,25 @@ mod tests {
         assert_eq!(out[0x8f50], 0xC3, "the second's too");
         let dynamic = u64_at(&out, 0x40 + 3 * 56 + 8).unwrap();
         assert_eq!((dynamic, out[dynamic as usize]), (0x7000, 0xD4), "PT_DYNAMIC moved with its segment");
-        assert_eq!(u32_at(&out, 0x40 + 4 * 56).unwrap(), PT_NULL, "relro dropped");
+        // Relro [0x6f00, 0x7f50) ends inside the page [0x4000, 0x8000): nothing whole is left of
+        // it below that page's start, so it goes.
+        assert_eq!(u32_at(&out, 0x40 + 4 * 56).unwrap(), PT_NULL, "relro with no whole page left, dropped");
         let shoff = u64_at(&out, 0x28).unwrap() as usize;
         assert_eq!(shoff, 0x7400 + 0x2000, "the section headers moved with what follows the last segment");
         let sections: Vec<u64> = (0..4).map(|i| u64_at(&out, shoff + i * 64 + 24).unwrap()).collect();
         assert_eq!(sections, vec![0, 0x300, 0x6f00, 0x8f50], "each section header names its data's new offset");
+    }
+
+    #[test]
+    fn relro_is_trimmed_to_the_page_below_its_end() {
+        let mut b = zstd_shaped();
+        // Relro from the data segment's start, 0x9000 long: [0x6f00, 0xff00) ends in the page
+        // from 0xc000, which it keeps up to.
+        put64(&mut b, 0x40 + 4 * 56 + 40, 0x9000);
+        let out = realign(&b, PAGE).expect("realigned");
+        let at = 0x40 + 4 * 56;
+        assert_eq!(u32_at(&out, at).unwrap(), PT_GNU_RELRO);
+        assert_eq!((u64_at(&out, at + 16).unwrap(), u64_at(&out, at + 40).unwrap()), (0x6f00, 0xc000 - 0x6f00));
     }
 
     #[test]
