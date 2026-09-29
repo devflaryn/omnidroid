@@ -272,7 +272,13 @@ struct State {
     next_host_ptr: u64,
     /// The host's transactions each wait as a thread of [`HOST`] of their own.
     next_host_tid: i32,
+    /// What the host listens to ([`Broker::tap`]): transactions of one code to one node, by
+    /// anyone, whose parcels a host callback reads as they pass.
+    taps: Vec<(NodeId, u32, Tap)>,
 }
+
+/// A host callback reading a tapped transaction's parcel ([`Broker::tap`]).
+pub type Tap = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// The cross-process part of the driver.
 #[derive(Default)]
@@ -642,6 +648,18 @@ impl Broker {
         // Held from the start: the host has no looper to hear `BR_INCREFS`/`BR_ACQUIRE`.
         st.nodes.get_mut(&node).expect("the node").held = true;
         ptr
+    }
+
+    /// Hear every transaction of `code` that anyone sends to the object the host's `handle` names:
+    /// `tap` reads its parcel as it passes (the objects in it not yet translated), on the sender's
+    /// thread, under the broker's lock -- so it must be quick and must not call the broker. Nothing
+    /// is changed or delayed for the transaction. `false` for a handle the host does not have.
+    pub fn tap(&self, handle: u32, code: u32, tap: Tap) -> bool {
+        let mut st = self.state.lock();
+        let Some(node) = st.node_for_handle(HOST, handle) else { return false };
+        st.taps.retain(|(n, c, _)| (*n, *c) != (node, code));
+        st.taps.push((node, code, tap));
+        true
     }
 
     /// A sync transaction from the host to `handle` (in the host's handle table; 0 is the context
@@ -1337,6 +1355,13 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     if target_proc != HOST && st.procs.get(&target_proc).is_none_or(|pr| pr.dead) {
         st.queue(file.id, Some(t.tid), if reply { Work::Complete } else { Work::ReturnError(BR_DEAD_REPLY) });
         return Ok(());
+    }
+
+    // What the host listens to (`Broker::tap`), before the objects are translated.
+    if let Some(node) = target_node {
+        for (_, _, tap) in st.taps.iter().filter(|(n, c, _)| (*n, *c) == (node, code)) {
+            tap(&data);
+        }
     }
 
     // Translate the objects for the receiver; the nodes it names are held while it is in flight,

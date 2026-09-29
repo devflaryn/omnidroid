@@ -28,6 +28,7 @@
 //! Java's `PARCEL_TOKEN_MOTION_EVENT`. The first event of a session is sent and answered, so a
 //! refusal is seen (`[inject]`); the rest go one way, in order, and nothing on the host waits.
 //! The host's binder identity is the system's (uid 1000), which holds `INJECT_EVENTS`.
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,14 @@ use crate::evdev::{ABS_X, ABS_Y, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN
 const INPUT_MANAGER: &str = "android.hardware.input.IInputManager";
 /// `IInputManager$Stub.TRANSACTION_injectInputEvent` in the image.
 const INJECT_INPUT_EVENT: u32 = 11;
+/// `IInputManager$Stub.TRANSACTION_setPointerIcon` in the image: `setPointerIcon(in PointerIcon
+/// icon, int displayId, int deviceId, int pointerId, IBinder inputToken)`, what an app's
+/// `ViewRootImpl` sends when the icon its view resolves for the mouse changes.
+const SET_POINTER_ICON: u32 = 36;
+/// `PointerIcon.TYPE_NULL`: the app wants no system pointer drawn (it draws its own, or none).
+pub const POINTER_ICON_NULL: i32 = 0;
+/// No `setPointerIcon` seen yet.
+const POINTER_ICON_UNKNOWN: i32 = i32::MIN;
 /// Java's `InputEvent.PARCEL_TOKEN_MOTION_EVENT`.
 const PARCEL_TOKEN_MOTION_EVENT: i32 = 1;
 const SOURCE_MOUSE: i32 = 0x2002;
@@ -229,10 +238,24 @@ pub fn parcel(m: &Motion, id: i32) -> Vec<u8> {
     p.bytes
 }
 
+/// The icon type in a `setPointerIcon` parcel: after the interface token (strict-mode policy,
+/// work source, header, then the `String16` name, padded to 4), `writeTypedObject`'s non-null
+/// marker and `PointerIcon.writeToParcel`'s first word, `mType`.
+#[must_use]
+pub fn pointer_icon_type(parcel: &[u8]) -> Option<i32> {
+    let i32_at = |o: usize| parcel.get(o..o + 4).map(|b| i32::from_le_bytes(b.try_into().expect("4")));
+    let name_len = usize::try_from(i32_at(12)?).ok()?;
+    let at = 16 + ((name_len + 1) * 2 + 3) / 4 * 4;
+    (i32_at(at)? == 1).then(|| i32_at(at + 4)).flatten()
+}
+
 /// The injector: the mouse's state and the input service's handle, once there is one.
 pub struct Injector {
     broker: Arc<Broker>,
     inner: Mutex<Inner>,
+    /// The pointer icon the app last asked for (`setPointerIcon`, heard through a tap on the input
+    /// service), or [`POINTER_ICON_UNKNOWN`].
+    icon: Arc<AtomicI32>,
 }
 
 struct Inner {
@@ -247,7 +270,19 @@ struct Inner {
 impl Injector {
     #[must_use]
     pub fn new(broker: Arc<Broker>) -> Self {
-        Self { broker, inner: Mutex::new(Inner { mouse: Mouse::default(), handle: None, looked: None, confirmed: false, next_id: 0x0100_0000 }) }
+        Self {
+            broker,
+            inner: Mutex::new(Inner { mouse: Mouse::default(), handle: None, looked: None, confirmed: false, next_id: 0x0100_0000 }),
+            icon: Arc::new(AtomicI32::new(POINTER_ICON_UNKNOWN)),
+        }
+    }
+
+    /// The pointer icon the app last asked Android for over its view (`PointerIcon.TYPE_*`), once
+    /// it has asked: [`POINTER_ICON_NULL`] is an app drawing its own pointer (Roblox's engine
+    /// surface) or none.
+    #[must_use]
+    pub fn pointer_icon(&self) -> Option<i32> {
+        Some(self.icon.load(Ordering::Relaxed)).filter(|&t| t != POINTER_ICON_UNKNOWN)
     }
 
     /// Hand one pointer packet to the input dispatcher. Dropped while system_server has no input
@@ -300,6 +335,22 @@ impl Injector {
                 Ok(Some(h)) => {
                     eprintln!("[inject] the input service is handle {h}");
                     inner.handle = Some(h);
+                    // The app's pointer icon, as its `ViewRootImpl` tells the input service.
+                    let icon = Arc::clone(&self.icon);
+                    let tapped = self.broker.tap(
+                        h,
+                        SET_POINTER_ICON,
+                        Arc::new(move |parcel: &[u8]| {
+                            if let Some(t) = pointer_icon_type(parcel) {
+                                if icon.swap(t, Ordering::Relaxed) != t {
+                                    eprintln!("[inject] the app's pointer icon: type {t}");
+                                }
+                            }
+                        }),
+                    );
+                    if !tapped {
+                        eprintln!("[inject] the input service's pointer icons are not heard");
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => eprintln!("[inject] looking up the input service: {e}"),
@@ -339,6 +390,25 @@ mod tests {
         assert_eq!(actions(&m), [(ACTION_HOVER_MOVE, 0, 8), (ACTION_SCROLL, 0, 8)]);
         assert_eq!(m[1].vscroll, -1.0);
         assert!(mouse.sync(&abs(12, 20), 11).is_empty(), "no change, no event");
+    }
+
+    /// `setPointerIcon`'s parcel as the app's `IInputManager$Stub$Proxy` writes it: the token,
+    /// the typed object's marker, the icon's type first.
+    #[test]
+    fn the_pointer_icon_type_is_read_from_set_pointer_icons_parcel() {
+        let mut p = Parcel::with_interface_token(INPUT_MANAGER);
+        p.i32(1);
+        p.i32(POINTER_ICON_NULL);
+        p.i32(0);
+        assert_eq!(pointer_icon_type(&p.bytes), Some(POINTER_ICON_NULL));
+        let mut p = Parcel::with_interface_token(INPUT_MANAGER);
+        p.i32(1);
+        p.i32(1000);
+        assert_eq!(pointer_icon_type(&p.bytes), Some(1000), "TYPE_ARROW");
+        let mut p = Parcel::with_interface_token(INPUT_MANAGER);
+        p.i32(0);
+        assert_eq!(pointer_icon_type(&p.bytes), None, "a null icon");
+        assert_eq!(pointer_icon_type(&[0; 8]), None, "too short");
     }
 
     /// The parcel's layout, field by field as MotionEvent::writeToParcel writes it.

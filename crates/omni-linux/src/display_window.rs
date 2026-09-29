@@ -42,7 +42,10 @@
 //! -- and **held** (the host's cursor captured, raw motion to the relative mouse) only while the app
 //! holds Android's pointer capture, as [`crate::input_channel::capture`] reports it. Moves are
 //! coalesced ([`crate::window_input::MOVE_EVERY`]). `OMNI_HOST_CURSOR=hide` hides the host's cursor
-//! over the window (the app draws its own); by default it is shown.
+//! over the window, `show` shows it; by default **the app decides**: the host's cursor is hidden while
+//! the pointer icon the app asks Android for over its view is `TYPE_NULL` (it draws its own, as
+//! Roblox's engine does over its surface), heard from its `setPointerIcon` to the input service
+//! ([`crate::inject::Injector::pointer_icon`]), and shown when it asks for a system pointer.
 //!
 //! # Scripted resizes and input
 //!
@@ -206,7 +209,8 @@ fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Dev
                     false
                 });
                 // Said, so a run's log shows when the app held the mouse.
-                eprintln!("[window] mouse {}", if !take { "free" } else if held { "held (the app holds the pointer capture)" } else { "not held: the window has no focus" });
+                let why = if input.dragging() { "a camera drag" } else { "the app holds the pointer capture" };
+                eprintln!("[window] mouse {}", if !take { "free".to_string() } else if held { format!("held ({why})") } else { "not held: the window has no focus".to_string() });
                 if take {
                     // What follows the answer comes before anything else queued.
                     for o in input.captured(held).into_iter().rev() {
@@ -217,6 +221,34 @@ fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Dev
             Out::Title(title) => {
                 let _ = window.set_title(title);
             }
+            Out::Center => {
+                if let Ok((w, h)) = window.client_size() {
+                    let _ = window.warp_pointer(i32::try_from(w / 2).unwrap_or(0), i32::try_from(h / 2).unwrap_or(0));
+                }
+            }
+        }
+    }
+}
+
+/// Who decides whether the host's cursor shows over the window (`OMNI_HOST_CURSOR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostCursor {
+    /// The app (the default): hidden while the pointer icon it asks Android for over its view is
+    /// `TYPE_NULL` -- it draws its own, as Roblox's engine surface does -- shown otherwise, so one
+    /// cursor shows, never two.
+    App,
+    /// Always shown (`show`).
+    Show,
+    /// Always hidden (`hide`).
+    Hide,
+}
+
+impl HostCursor {
+    fn from_env() -> Self {
+        match std::env::var("OMNI_HOST_CURSOR").as_deref() {
+            Ok("show") => Self::Show,
+            Ok("hide") => Self::Hide,
+            _ => Self::App,
         }
     }
 }
@@ -243,10 +275,15 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     window.show();
     eprintln!("[window] {width}x{height}: the display, live (a window resize resizes the display)");
     let mut input = Input::new(move_every_from_env());
+    // The host's cursor over the window: the app's word by default (`OMNI_HOST_CURSOR=show|hide`
+    // decides instead), and whether it is hidden now.
+    let cursor = HostCursor::from_env();
+    let mut cursor_hidden = false;
     if devices.is_some() {
         let _ = window.set_title(TITLE_FREE);
-        if std::env::var("OMNI_HOST_CURSOR").as_deref() == Ok("hide") {
+        if cursor == HostCursor::Hide {
             let _ = window.set_cursor_hidden(true);
+            cursor_hidden = true;
         }
     }
     // The app's pointer capture as last seen (`input_channel::capture`'s counter).
@@ -310,6 +347,16 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
             }
             let outs = input.tick(now);
             perform(outs, &mut window, &mut input, devices);
+            let own_pointer = devices.pointer.pointer_icon() == Some(crate::inject::POINTER_ICON_NULL);
+            input.set_own_pointer(own_pointer);
+            if cursor == HostCursor::App {
+                let hide = own_pointer;
+                if hide != cursor_hidden {
+                    cursor_hidden = hide;
+                    let _ = window.set_cursor_hidden(hide);
+                    eprintln!("[window] host cursor {} over the window: the app {}", if hide { "hidden" } else { "shown" }, if hide { "draws its own" } else { "asks for a system pointer" });
+                }
+            }
         }
         if present.is_finished() {
             eprintln!("[window] the present thread ended; closing the window");
