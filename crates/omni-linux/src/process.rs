@@ -179,7 +179,9 @@ fn signal_trace() -> bool {
 /// (compressed references are 32 bits; the boot image goes near `ART_BASE_ADDRESS`, 0x70000000),
 /// and a guest address is a host address (D4). The host may already hold pieces of that range --
 /// Windows keeps `KUSER_SHARED_DATA` at `0x7FFE0000` in every process -- and the space steps
-/// around them (`GuestSpaceConfig::around_host`).
+/// around them (`GuestSpaceConfig::around_host`). A host that maps nothing that low (macOS: a hard
+/// 4 GiB `__PAGEZERO`) gets the same guest layout with its part below 4 GiB backed elsewhere
+/// (`GuestSpaceConfig::low_window`, D41).
 const GUEST_SPACE_LOW_BASE: usize = 0x1000_0000;
 
 /// The least of a low space that must be free for it to be taken: the host's own pieces of that
@@ -196,7 +198,15 @@ const LOW_SPACE_MIN_FREE: usize = GUEST_SPACE_BYTES / 2;
 /// 64 GiB: every service init started after that failed to map its first segment (D5, ~1 boot in
 /// 3, right after odsign stopped). Such a space is given back and the host chooses.
 pub fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
-    let config = |base: Option<usize>| GuestSpaceConfig { base, size: GUEST_SPACE_BYTES, around_host: base.is_some(), ..GuestSpaceConfig::default() };
+    // D41: below the host's floor the low range cannot be the host's own; it is a based window.
+    let low_window = omni_platform::vm::lowest_mappable_address() > GUEST_SPACE_LOW_BASE;
+    let config = |base: Option<usize>| GuestSpaceConfig {
+        base,
+        size: GUEST_SPACE_BYTES,
+        around_host: base.is_some(),
+        low_window: low_window && base.is_some(),
+        ..GuestSpaceConfig::default()
+    };
     match GuestSpace::with_config(config(Some(GUEST_SPACE_LOW_BASE))) {
         Ok(low) if low.stats().free >= LOW_SPACE_MIN_FREE => Ok(low),
         low => {
@@ -618,7 +628,14 @@ impl Process {
         // Top Byte Ignore: arm64 Linux gives user space TBI, and Android's heap depends on it.
         // 512 guest threads: ART alone starts about twenty, Roblox runs dozens, and system_server
         // well over a hundred (the value-compare monitor costs nothing per slot unused).
-        let mut options = DynarmicOptions { top_byte_ignore: true, max_threads: 512, ..DynarmicOptions::default() };
+        // A fault the guest means (ART's implicit null checks) is served once through the callback,
+        // not by moving the instruction there for good (`recompile_on_declined_fault`).
+        let mut options = DynarmicOptions {
+            top_byte_ignore: true,
+            max_threads: 512,
+            recompile_on_declined_fault: false,
+            ..DynarmicOptions::default()
+        };
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             options.optimizations_override = Some(mask);
         }
