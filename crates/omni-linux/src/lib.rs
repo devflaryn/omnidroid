@@ -33,6 +33,7 @@ pub mod mount;
 pub mod inet;
 pub mod netlink;
 pub mod owners;
+pub mod pagecompat;
 pub mod mm;
 pub mod pipe;
 pub mod poll;

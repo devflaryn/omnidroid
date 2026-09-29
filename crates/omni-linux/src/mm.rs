@@ -49,6 +49,21 @@ pub struct Mm {
 }
 
 
+/// The page code built for the smallest arm64 pages assumes (`crate::pagecompat`, `Mm::protect`).
+const SMALL_PAGE: u64 = 0x1000;
+
+/// Everything either protection allows.
+fn union(a: Protection, b: Protection) -> Protection {
+    let bits = |p: Protection| match p {
+        Protection::None => 0,
+        Protection::Read => PROT_READ,
+        Protection::ReadWrite => PROT_READ | PROT_WRITE,
+        Protection::ReadExecute => PROT_READ | PROT_EXEC,
+        Protection::ReadWriteExecute => PROT_READ | PROT_WRITE | PROT_EXEC,
+    };
+    protection(bits(a) | bits(b)).unwrap_or(Protection::ReadWriteExecute)
+}
+
 fn protection(prot: u32) -> Result<Protection, Errno> {
     Ok(match (prot & PROT_READ != 0, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0) {
         // Write and execute together -- ART's JIT code cache when it has no dual view. A device
@@ -159,6 +174,10 @@ impl Mm {
     pub fn protect(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
         let addr = crate::guest::untag(addr);
         if addr % self.page != 0 {
+            // Code built for 4 KiB pages, on a device with larger ones: see `protect_widened`.
+            if self.page > SMALL_PAGE && addr % SMALL_PAGE == 0 {
+                return self.protect_widened(addr, len, prot);
+            }
             return Err(EINVAL);
         }
         let prot = protection(prot)?;
@@ -168,6 +187,35 @@ impl Mm {
         }
         let _g = self.lock.write();
         self.space.protect(addr as usize, len as usize, prot).map_err(|_| ENOMEM)
+    }
+
+    /// A 4 KiB-aligned `mprotect` on a device whose page is larger: code built for 4 KiB pages asks
+    /// for them (a packed library's unpacker makes the 4 KiB it decrypts writable -- Roblox
+    /// 2.740.931's `libzstd-jni`, whose next constructor was then still ciphertext: `SIGILL`). A
+    /// 16 KiB Linux kernel refuses it (`EINVAL`), and so did this one. Here it is widened to whole
+    /// pages: a page the range covers entirely gets exactly what was asked; a page it covers in
+    /// part gets what was asked *and* what that page had, so nothing else on it loses access (the
+    /// same compromise a 4 KiB library laid out for large pages makes, `crate::pagecompat`). Never
+    /// reached on a 4 KiB-page host.
+    fn protect_widened(&self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
+        let asked = protection(prot)?;
+        let len = len.checked_add(SMALL_PAGE - 1).ok_or(EINVAL)? & !(SMALL_PAGE - 1);
+        let end = addr.checked_add(len).ok_or(ENOMEM)?;
+        let (first, last) = (addr & !(self.page - 1), (end + self.page - 1) & !(self.page - 1));
+        let _g = self.lock.write();
+        let mut page = first;
+        while page < last {
+            let whole = page >= addr && page + self.page <= end;
+            let prot = if whole {
+                asked
+            } else {
+                let had = self.space.region_at(page as usize).filter(|r| r.mapping.is_some()).ok_or(ENOMEM)?.protection;
+                union(asked, had)
+            };
+            self.space.protect(page as usize, self.page as usize, prot).map_err(|_| ENOMEM)?;
+            page += self.page;
+        }
+        Ok(())
     }
 
     /// Write into a mapping the guest may only read -- what the kernel does to memory it owns (the

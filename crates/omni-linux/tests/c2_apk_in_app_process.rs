@@ -79,8 +79,9 @@ fn c2_an_apk_loads_in_an_app_process() {
     std::fs::create_dir_all(&lib).unwrap();
     std::fs::copy(&apk, app.join("base.apk")).unwrap();
     let mut libs = Vec::new();
-    // A library aligned below the host's page is refused as a device with that page refuses it
-    // (16 KiB on Apple silicon: the APK's `libzstd-jni-*.so` has `p_align` 0x1000).
+    // A library aligned below the device's page (16 KiB on Apple silicon: the APK's
+    // `libzstd-jni-*.so` has `p_align` 0x1000) loads too: the kernel lays it out for the page
+    // when the app opens it (`omni_linux::pagecompat`).
     let mut below_page = Vec::new();
     let mut dex_files = 0;
     {
@@ -122,7 +123,13 @@ fn c2_an_apk_loads_in_an_app_process() {
         "/data/app/com.roblox.client/base.apk",
         "/data/app/com.roblox.client/lib/arm64",
     ];
-    argv.extend(libs.iter().map(String::as_str));
+    // Not `zstd-jni`: in 2.740.931 it is a packed library whose `JNI_OnLoad` calls into
+    // `libroblox.so`, which asks the running app for its objects -- a bare `app_process` has no
+    // `Application`, and CheckJNI aborts on the null it gets. It is laid out for the page, loaded
+    // and decrypted by then (`pagecompat`, the widened `mprotect`); the real launch (`r_roblox`)
+    // is where it runs.
+    let native: Vec<&String> = libs.iter().filter(|l| !l.starts_with("zstd-jni")).collect();
+    argv.extend(native.iter().map(|l| l.as_str()));
     let (app_process, out, err) = spawn(&sysroot, &instance, &argv, &env, 10_000);
     let (sm, _, _) = spawn(&sysroot, &instance, &["/system/bin/servicemanager"], &[], 1000);
     let sm_run = Arc::clone(&sm);
@@ -133,8 +140,9 @@ fn c2_an_apk_loads_in_an_app_process() {
     let printed = text(&out);
     assert_eq!(status, ExitStatus::Exited(0), "{printed}\n{}", text(&err));
     assert!(printed.contains(&format!("dex files in the APK: {dex_files}")), "{dex_files} classes*.dex in the APK\n{printed}");
-    for l in libs.iter().filter(|l| !below_page.contains(l)) {
-        assert!(printed.contains(&format!("loaded lib{l}.so")), "lib{l}.so\n{printed}\n{}", text(&err));
+    for l in native {
+        let why = if below_page.contains(l) { " (aligned below the page: pagecompat)" } else { "" };
+        assert!(printed.contains(&format!("loaded lib{l}.so")), "lib{l}.so{why}\n{printed}\n{}", text(&err));
     }
     assert!(text(&err).contains("using isolated ns clns-"), "the app's own linker namespace\n{}", text(&err));
     sm.end(ExitStatus::Exited(0));
