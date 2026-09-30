@@ -66,9 +66,21 @@ fn udp_echo() -> u16 {
 
 #[test]
 fn a_guest_talks_tcp_and_udp_over_the_hosts_network() {
-    let ports = [echo_server(), late_server(), closed_port(), udp_echo()].map(|p| p.to_string());
+    use omni_linux::loopns::{expose, Proto};
+    let (echo, late, closed, udp) = (echo_server(), late_server(), closed_port(), udp_echo());
+    // The host's servers stand in for the network's: a guest's loopback is its namespace's
+    // (`crate::loopns`), so each is handed to the fixture's namespace -- an app's, user 0's -- on
+    // purpose, as the same port. The closed port is not: refused either way.
+    let instance = std::env::temp_dir().join(format!("omni-linux-hostnet-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&instance);
+    let _held = [
+        expose(&instance, "u0", Proto::Tcp, echo, echo).expect("echo"),
+        expose(&instance, "u0", Proto::Tcp, late, late).expect("late"),
+        expose(&instance, "u0", Proto::Udp, udp, udp).expect("udp"),
+    ];
+    let ports = [echo, late, closed, udp].map(|p| p.to_string());
     let args: Vec<&str> = ports.iter().map(String::as_str).collect();
-    let Some((status, out, err)) = common::run_fixture("inetnet", &args) else { return };
+    let Some((status, out, err)) = common::run_fixture_as(&instance, "inetnet", &args, 10_000) else { return };
     eprintln!("{out}");
     assert!(!out.contains("FAIL"), "{out}\n{err}");
     assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 37, "{out}\n{err}");
