@@ -161,11 +161,25 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), Errno> {
     let counter = WRITE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let tmp = path.parent().ok_or(EIO)?
         .join(format!(".tmp-{}-{}", std::process::id(), counter));
-    std::fs::write(&tmp, content).map_err(|_| EIO)?;
+    std::fs::write(&tmp, content).map_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+        EIO
+    })?;
     std::fs::rename(&tmp, path).map_err(|_| {
         let _ = std::fs::remove_file(&tmp);
         EIO
     })?;
+    Ok(())
+}
+
+/// Write a forward entry then its reverse; if the reverse fails, the forward just written is
+/// removed (the caller holds the `TableLock`, so nothing else touched it), leaving no orphan.
+fn write_pair(fwd: &Path, fwd_body: &str, rev: &Path, rev_body: &str) -> Result<(), Errno> {
+    atomic_write(fwd, fwd_body)?;
+    if let Err(e) = atomic_write(rev, rev_body) {
+        let _ = std::fs::remove_file(fwd);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -221,8 +235,7 @@ impl Namespace {
                     return Err(EADDRINUSE);
                 } else {
                     // Stale: replace it.
-                    atomic_write(&fwd, &fwd_body)?;
-                    atomic_write(&rev, &rev_body)?;
+                    write_pair(&fwd, &fwd_body, &rev, &rev_body)?;
                     return Ok(Binding {
                         files: vec![fwd, rev],
                         dir: self.dir.clone(),
@@ -231,8 +244,7 @@ impl Namespace {
             }
             None => {
                 // Unreadable: treat as corrupt/stale, replace it.
-                atomic_write(&fwd, &fwd_body)?;
-                atomic_write(&rev, &rev_body)?;
+                write_pair(&fwd, &fwd_body, &rev, &rev_body)?;
                 return Ok(Binding {
                     files: vec![fwd, rev],
                     dir: self.dir.clone(),
@@ -582,39 +594,88 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_reverse_write_releases_the_forward_entry() {
+        let d = dir("half-written");
+        let ns = Namespace::open(&d, "u0");
+        // A directory where the reverse entry goes: the rename onto it fails.
+        let rev_dir = d.join(".omni-loopback/u0/r-tcp-50040");
+        std::fs::create_dir_all(&rev_dir).unwrap();
+        // Free arm.
+        assert_eq!(ns.bind(Proto::Tcp, 47040, 50040, false).err(), Some(EIO));
+        assert!(!d.join(".omni-loopback/u0/f-tcp-47040").exists(), "free arm: forward released");
+        // Stale arm.
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        } else {
+            std::process::Command::new("true").spawn().unwrap()
+        };
+        let dead = child.id();
+        child.wait().unwrap();
+        let fwd = d.join(".omni-loopback/u0/f-tcp-47040");
+        std::fs::write(&fwd, format!("50041 {dead}")).unwrap();
+        assert_eq!(ns.bind(Proto::Tcp, 47040, 50040, false).err(), Some(EIO));
+        assert!(!fwd.exists() || ns.lookup(Proto::Tcp, 47040).is_none(), "stale arm: no live orphan");
+        // Unreadable arm.
+        std::fs::write(&fwd, "garbage").unwrap();
+        assert_eq!(ns.bind(Proto::Tcp, 47040, 50040, false).err(), Some(EIO));
+        assert!(ns.lookup(Proto::Tcp, 47040).is_none(), "unreadable arm: no live orphan");
+        // The port can be bound again once the obstacle is gone.
+        std::fs::remove_dir(&rev_dir).unwrap();
+        let held = ns.bind(Proto::Tcp, 47040, 50040, false).expect("bindable again");
+        assert_eq!(ns.lookup(Proto::Tcp, 47040), Some(50040));
+        drop(held);
+    }
+
+    #[test]
     fn the_lock_excludes_another_host_process() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::sync::mpsc;
         let d = dir("lock-cross-process");
         let ns = Namespace::open(&d, "u0");
 
-        // This process takes the lock.
-        let _held = TableLock::take(&ns.dir).expect("lock");
+        let held = TableLock::take(&ns.dir).expect("lock");
 
-        // Spawn a child process that tries to take the lock.
         let exe = std::env::current_exe().unwrap();
         let mut child = std::process::Command::new(exe)
-            .arg("--exact")
-            .arg("loopns::tests::lock_probe_child")
-            .arg("--nocapture")
-            .arg("--ignored")
+            .args(["--exact", "loopns::tests::lock_probe_child", "--nocapture", "--ignored"])
             .env("OMNI_LOOPNS_PROBE_DIR", &ns.dir)
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn child");
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let (tx, rx) = mpsc::channel::<String>();
+        let reader = std::thread::spawn(move || {
+            let mut all = String::new();
+            let mut line = String::new();
+            while out.read_line(&mut line).unwrap_or(0) > 0 {
+                let _ = tx.send(line.trim().to_string());
+                all.push_str(&line);
+                line.clear();
+            }
+            let mut rest = String::new();
+            let _ = out.read_to_string(&mut rest);
+            all + &rest
+        });
 
-        // Give it time to try and block on the lock.
+        // Wait until the child has really started (it prints `started` before trying the lock).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(l) if l == "started" => break,
+                Ok(_) => {}
+                Err(_) => panic!("child never started"),
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(child.try_wait().unwrap().is_none(), "child is blocked on the lock");
+        assert!(rx.try_recv().map_or(true, |l| l != "took"), "child took the lock while we held it");
 
-        // Child should still be running (blocked on lock).
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "child is blocked on the lock"
-        );
-
-        // Drop our lock.
-        drop(_held);
-
-        // Child should now finish.
+        drop(held);
         let status = child.wait().expect("wait for child");
+        let stdout = reader.join().unwrap();
         assert!(status.success(), "child process exited successfully");
+        assert!(stdout.contains("took"), "child took the lock after release; stdout: {stdout:?}");
     }
 
     #[test]
@@ -622,6 +683,8 @@ mod tests {
     fn lock_probe_child() {
         if let Ok(dir_str) = std::env::var("OMNI_LOOPNS_PROBE_DIR") {
             let dir = std::path::PathBuf::from(dir_str);
+            println!("started");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             if let Ok(_held) = TableLock::take(&dir) {
                 println!("took");
             }
