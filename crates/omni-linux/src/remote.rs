@@ -361,12 +361,71 @@ impl crate::fd::RemoteFds for RemoteFds {
     }
 }
 
+/// A process's credential with the system's binder listener: 16 random bytes the zygote hands an
+/// app's host process at launch (on its stdin), which that host process presents on every
+/// connection. The listener takes the stand-in's pid and uid from it, never from a frame: before
+/// it, any local program -- or a guest's socket to the host's loopback -- could claim uid 1000 or
+/// another instance's uid.
+pub type Credential = [u8; 16];
+
+/// The credentials issued in this host process: credential -> (pid, uid).
+fn issued() -> &'static Mutex<HashMap<Credential, (i32, u32)>> {
+    static ISSUED: OnceLock<Mutex<HashMap<Credential, (i32, u32)>>> = OnceLock::new();
+    ISSUED.get_or_init(Mutex::default)
+}
+
+/// Issue the credential of the process `pid` running as `uid`.
+///
+/// # Panics
+/// When the host has no entropy to give (`omni_platform::process::random_bytes`).
+#[must_use]
+pub fn issue_credential(pid: i32, uid: u32) -> Credential {
+    let mut c = [0u8; 16];
+    omni_platform::process::random_bytes(&mut c).expect("entropy for a binder credential");
+    issued().lock().insert(c, (pid, uid));
+    c
+}
+
+/// Withdraw process `pid`'s credential (its host process ended).
+pub fn revoke_credential(pid: i32) {
+    issued().lock().retain(|_, (p, _)| *p != pid);
+}
+
+fn identity(c: &[u8]) -> Option<(i32, u32)> {
+    let c: Credential = c.try_into().ok()?;
+    issued().lock().get(&c).copied()
+}
+
+#[must_use]
+pub fn credential_hex(c: &Credential) -> String {
+    c.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[must_use]
+pub fn credential_from_hex(s: &str) -> Option<Credential> {
+    let s = s.trim();
+    if s.len() != 32 {
+        return None;
+    }
+    let mut c = [0u8; 16];
+    for (i, b) in c.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(c)
+}
+
+fn random_token() -> u64 {
+    let mut b = [0u8; 8];
+    omni_platform::process::random_bytes(&mut b).expect("entropy for an open's token");
+    u64::from_le_bytes(b)
+}
+
 /// The stand-ins, by pid; an open's binder file, by token.
 struct Server {
     sysroot: Arc<crate::vfs::Sysroot>,
     stand_ins: Mutex<HashMap<i32, Weak<Process>>>,
-    opens: Mutex<HashMap<u64, (Arc<Process>, Arc<BinderFile>)>>,
-    next: std::sync::atomic::AtomicU64,
+    /// An open's binder file, its stand-in, and the credential that opened it, by random token.
+    opens: Mutex<HashMap<u64, (Arc<Process>, Arc<BinderFile>, Credential)>>,
 }
 
 /// Serve apps' binder on a local port: what `--binder-server` points an app's host process at.
@@ -376,7 +435,7 @@ struct Server {
 pub fn serve(sysroot: Arc<crate::vfs::Sysroot>) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
-    let server = Arc::new(Server { sysroot, stand_ins: Mutex::default(), opens: Mutex::default(), next: 1.into() });
+    let server = Arc::new(Server { sysroot, stand_ins: Mutex::default(), opens: Mutex::default() });
     std::thread::Builder::new().name("binder-remote".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let _ = stream.set_nodelay(true);
@@ -402,23 +461,31 @@ impl Server {
         let Ok((kind, body)) = receive(&mut stream) else { return };
         match kind {
             OPEN => {
-                let (context, pid, uid) = (context_of(body[0]), u32_at(&body, 1) as i32, u32_at(&body, 5));
+                let Some((pid, uid)) = identity(body.get(1..17).unwrap_or_default()) else { return };
+                let cred: Credential = body[1..17].try_into().expect("16");
+                let context = context_of(body[0]);
                 let p = self.stand_in(pid, uid);
                 let file = BinderFile::open(context);
-                let token = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.opens.lock().insert(token, (p, file));
-                if send(&mut stream, OPENED, &token.to_le_bytes()).is_err() {
+                let token = random_token();
+                self.opens.lock().insert(token, (p, file, cred));
+                let mut reply = token.to_le_bytes().to_vec();
+                reply.extend_from_slice(&(pid as u32).to_le_bytes());
+                reply.extend_from_slice(&uid.to_le_bytes());
+                if send(&mut stream, OPENED, &reply).is_err() {
                     self.opens.lock().remove(&token);
                     return;
                 }
                 // The open lasts as long as this connection: its end is the close.
                 let mut sink = [0u8; 1];
                 let _ = stream.read(&mut sink);
-                if let Some((_, file)) = self.opens.lock().remove(&token) {
+                if let Some((_, file, _)) = self.opens.lock().remove(&token) {
                     file.release();
                 }
             }
             PROPS => {
+                if identity(&body).is_none() {
+                    return;
+                }
                 // The system's properties as they are now, `name value ` each.
                 let service = crate::props::PropertyService::global(&self.sysroot);
                 let mut out = Vec::new();
@@ -432,7 +499,11 @@ impl Server {
             }
             ATTACH => {
                 let (token, tid) = (u64_at(&body, 0), u32_at(&body, 8) as i32);
-                let Some((p, file)) = self.opens.lock().get(&token).cloned() else { return };
+                let Some((p, file, owner)) = self.opens.lock().get(&token).cloned() else { return };
+                // Only the credential that made the open attaches threads to it.
+                if body.get(12..28) != Some(&owner[..]) {
+                    return;
+                }
                 let mut task = Task::new(tid, Arc::clone(&p));
                 CURRENT.with(|c| *c.borrow_mut() = stream.try_clone().ok());
                 loop {
@@ -467,6 +538,18 @@ impl Server {
 
 static SERVER: OnceLock<String> = OnceLock::new();
 
+static CREDENTIAL: OnceLock<Credential> = OnceLock::new();
+
+/// This host process's credential with the system's binder listener (read from stdin by the
+/// runner: `--binder-credential-stdin`).
+pub fn set_credential(c: Credential) {
+    let _ = CREDENTIAL.set(c);
+}
+
+fn credential() -> Result<Credential, Errno> {
+    CREDENTIAL.get().copied().ok_or(EIO)
+}
+
 /// Point this host process's `/dev/binder` at the system's (`serve`'s address).
 pub fn set_server(addr: &str) {
     let _ = SERVER.set(addr.to_string());
@@ -479,7 +562,7 @@ pub fn set_server(addr: &str) {
 /// The system cannot be reached.
 pub fn system_properties() -> Result<Vec<(String, String)>, Errno> {
     let mut s = TcpStream::connect(SERVER.get().ok_or(EIO)?).map_err(|_| EIO)?;
-    send(&mut s, PROPS, &[]).map_err(|_| EIO)?;
+    send(&mut s, PROPS, &credential()?).map_err(|_| EIO)?;
     let (kind, body) = receive(&mut s).map_err(|_| EIO)?;
     if kind != PROPS_DATA {
         return Err(EIO);
@@ -514,13 +597,12 @@ impl RemoteBinder {
     ///
     /// # Errors
     /// `EIO` when the system cannot be reached.
-    pub fn open(p: &Process, context: Context) -> Result<Arc<Self>, Errno> {
+    pub fn open(_p: &Process, context: Context) -> Result<Arc<Self>, Errno> {
         let addr = SERVER.get().ok_or(EIO)?;
         let mut control = TcpStream::connect(addr).map_err(|_| EIO)?;
         let _ = control.set_nodelay(true);
         let mut req = vec![context_byte(context)];
-        req.extend_from_slice(&(p.sys.pid as u32).to_le_bytes());
-        req.extend_from_slice(&p.sys.uid().to_le_bytes());
+        req.extend_from_slice(&credential()?);
         send(&mut control, OPEN, &req).map_err(|_| EIO)?;
         let (kind, body) = receive(&mut control).map_err(|_| EIO)?;
         if kind != OPENED {
@@ -537,6 +619,7 @@ impl RemoteBinder {
         let _ = s.set_nodelay(true);
         let mut req = self.token.to_le_bytes().to_vec();
         req.extend_from_slice(&(tid as u32).to_le_bytes());
+        req.extend_from_slice(&credential()?);
         send(&mut s, ATTACH, &req).map_err(|e| lost("attach", &e))?;
         let s = Arc::new(Mutex::new(s));
         self.threads.lock().insert(tid, Arc::clone(&s));
@@ -616,6 +699,82 @@ impl RemoteBinder {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, Write};
+
+    fn frame(stream: &mut TcpStream, kind: u8, payload: &[u8]) {
+        send(stream, kind, payload).expect("send");
+    }
+
+    fn sysroot() -> Option<Arc<crate::vfs::Sysroot>> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sysroot/aosp-35");
+        crate::vfs::Sysroot::open(&dir).ok()
+    }
+
+    #[test]
+    fn an_unknown_credential_is_refused() {
+        let Some(root) = sysroot() else { return };
+        let addr = serve(root).expect("serve");
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let mut req = vec![0u8];
+        req.extend_from_slice(&[7u8; 16]); // never issued
+        frame(&mut s, OPEN, &req);
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(s.read(&mut b).unwrap_or(0), 0, "closed without an answer");
+    }
+
+    #[test]
+    fn the_stand_ins_identity_is_the_credentials_whatever_the_process_claims() {
+        let Some(root) = sysroot() else { return };
+        let addr = serve(root).expect("serve");
+        let c = issue_credential(4242_000, 10_115);
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let mut req = vec![0u8];
+        req.extend_from_slice(&c);
+        frame(&mut s, OPEN, &req);
+        let (kind, body) = receive(&mut s).expect("answer");
+        assert_eq!(kind, OPENED);
+        assert_eq!(u32_at(&body, 8) as i32, 4242_000, "pid from the credential");
+        assert_eq!(u32_at(&body, 12), 10_115, "uid from the credential");
+        revoke_credential(4242_000);
+        let mut again = TcpStream::connect(addr).expect("connect");
+        frame(&mut again, OPEN, &req);
+        again.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(again.read(&mut b).unwrap_or(0), 0, "revoked: refused");
+    }
+
+    #[test]
+    fn an_attach_needs_the_opens_own_credential() {
+        let Some(root) = sysroot() else { return };
+        let addr = serve(root).expect("serve");
+        let mine = issue_credential(4243_000, 10_116);
+        let theirs = issue_credential(4244_000, 10_117);
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let mut req = vec![0u8];
+        req.extend_from_slice(&mine);
+        frame(&mut s, OPEN, &req);
+        let (_, body) = receive(&mut s).expect("opened");
+        let token = u64_at(&body, 0);
+        let mut a = TcpStream::connect(addr).expect("connect");
+        let mut att = token.to_le_bytes().to_vec();
+        att.extend_from_slice(&7u32.to_le_bytes());
+        att.extend_from_slice(&theirs);
+        frame(&mut a, ATTACH, &att);
+        frame(&mut a, MMAP, &[0u8; 16]);
+        a.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(a.read(&mut b).unwrap_or(0), 0, "another's credential cannot attach to this open");
+        revoke_credential(4243_000);
+        revoke_credential(4244_000);
+    }
+
+    #[test]
+    fn a_credential_round_trips_as_hex() {
+        let c = issue_credential(4245_000, 10_000);
+        assert_eq!(credential_from_hex(&credential_hex(&c)), Some(c));
+        assert_eq!(credential_from_hex("zz"), None);
+        revoke_credential(4245_000);
+    }
 
     /// A file's descriptor crosses to another host process as the same host file, with its access
     /// and offset: the WebView hands its service a `ParcelFileDescriptor` of the app's own data
