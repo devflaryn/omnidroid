@@ -61,7 +61,12 @@ Open:
   of init services, 21 s of system_server services, each app host process preloading the zygote's
   classes (no fork).
 - The standby holds ~4-5 GB and some CPU while it waits; it lives `OMNI_MCP_STANDBY_MINUTES` (720).
-- Linux/macOS not run (omni-platform type-checks for Linux; macOS stubs are no-ops).
+- Linux: the benchmark notebook's session pinned to 2 CPUs with llvmpipe (Colab's shape) boots,
+  saves and reboots: new device boot_completed ~218 s / app on screen ~389 s, saved device ~179 s /
+  ~265 s. It first died on Colab: system_server had no `EXTERNAL_STORAGE` (init.environ.rc's
+  exports now reach every process `omni-linux-run` starts, `device::global_environment`). **Open:**
+  when system_server dies, the system's host process then crashes ("Unhandled SIGSEGV at rip", not
+  in translated code) instead of the device restarting its system. macOS not run.
 
 ## PERF-WIN: LIGHTER, THE MOUSE THE APP'S, NO HIDDEN DIALOG (2026-09-29 early, Windows; branch `perf-win`, `af44f0e`..`ca3a505`)
 
