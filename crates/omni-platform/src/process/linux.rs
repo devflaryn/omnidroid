@@ -29,6 +29,18 @@ use super::{ProcessError, ProcessResult};
 pub(super) use super::unix::cpu_time;
 use super::unix::last_errno;
 
+/// Whether a process with id `pid` exists now.
+///
+/// Signal 0 delivers nothing; it only asks whether the process exists. A return of 0 means the
+/// process exists. A return of -1 with errno EPERM means the process exists but this user cannot
+/// send it a signal. Any other errno means the process does not exist.
+pub(super) fn is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    // SAFETY: signal 0 delivers nothing; it only asks whether the process exists.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// `getrandom(buf, len, 0)`, called until the whole buffer is filled.
 ///
 /// # Blocking, not `GRND_NONBLOCK`, and why

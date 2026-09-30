@@ -18,6 +18,29 @@ use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF
 
 use super::{ProcessError, ProcessResult};
 
+/// Whether a process with id `pid` exists now.
+///
+/// Opens the process to query its exit code. If the open fails with `ERROR_ACCESS_DENIED`, the
+/// process exists but this user cannot open it. If the open fails for any other reason, the
+/// process does not exist. If the open succeeds, the exit code is checked: `STILL_ACTIVE` means
+/// the process is still running, anything else means it has exited.
+pub(super) fn is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: OpenProcess takes plain values; the handle is closed below.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        // SAFETY: no arguments.
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+    }
+    let mut code = 0u32;
+    // SAFETY: `h` is a live process handle and `code` a valid out pointer.
+    let ok = unsafe { GetExitCodeProcess(h, &mut code) } != 0;
+    // SAFETY: `h` came from OpenProcess and is closed once.
+    unsafe { CloseHandle(h) };
+    ok && code == STILL_ACTIVE as u32
+}
+
 /// `BCryptGenRandom(NULL, .., BCRYPT_USE_SYSTEM_PREFERRED_RNG)`.
 ///
 /// The system-preferred RNG rather than an algorithm handle this module would have to open, hold

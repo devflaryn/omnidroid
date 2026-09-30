@@ -96,6 +96,14 @@ pub fn pid() -> u32 {
     std::process::id()
 }
 
+/// Whether a process with id `pid` exists now -- one this user cannot open counts as existing.
+/// For a record another host process left (`omni_linux::loopns`): its owner is gone when this is
+/// false. A reused id answers true; the caller treats that as "still held", never as "free".
+#[must_use]
+pub fn is_alive(pid: u32) -> bool {
+    backend::is_alive(pid)
+}
+
 /// How many CPUs this process may run on, as `sysconf(_SC_NPROCESSORS_ONLN)` reports it.
 ///
 /// `available_parallelism` rather than a raw core count: it honours affinity masks and container
@@ -574,5 +582,22 @@ mod tests {
                 assert!(text.contains("sched_getcpu"), "the refusal must name its POSIX call: {text}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod is_alive_tests {
+    #[test]
+    fn this_process_is_alive_and_an_ended_child_is_not() {
+        assert!(super::is_alive(std::process::id()));
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        } else {
+            std::process::Command::new("true").spawn().unwrap()
+        };
+        let pid = child.id();
+        child.wait().unwrap();
+        // Reaped: the id names no process (a reuse this fast is not a real risk in a test).
+        assert!(!super::is_alive(pid));
     }
 }

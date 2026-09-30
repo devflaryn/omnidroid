@@ -111,6 +111,18 @@ pub(super) fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+/// Whether a process with id `pid` exists now.
+///
+/// Signal 0 delivers nothing; it only asks whether the process exists. A return of 0 means the
+/// process exists. A return of -1 with errno EPERM means the process exists but this user cannot
+/// send it a signal. Any other errno means the process does not exist.
+pub(super) fn is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    // SAFETY: signal 0 delivers nothing; it only asks whether the process exists.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Intended: `setpriority(PRIO_PROCESS, gettid(), nice)` on Linux, where a nice value is per
 /// thread and the call is the guest's own; on macOS, whose `setpriority` is per process, a
 /// thread's QoS class or `pthread_setschedparam` -- a mapping decision still to be made.

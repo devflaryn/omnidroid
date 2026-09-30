@@ -44,6 +44,18 @@ pub(super) fn random_bytes(out: &mut [u8]) -> ProcessResult<()> {
     Ok(())
 }
 
+/// Whether a process with id `pid` exists now.
+///
+/// Signal 0 delivers nothing; it only asks whether the process exists. A return of 0 means the
+/// process exists. A return of -1 with errno EPERM means the process exists but this user cannot
+/// send it a signal. Any other errno means the process does not exist.
+pub(super) fn is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    // SAFETY: signal 0 delivers nothing; it only asks whether the process exists.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 pub(super) fn current_cpu() -> ProcessResult<u32> {
     let mut cpu: libc::size_t = 0;
     // SAFETY: `cpu` is a live size_t the call writes.
