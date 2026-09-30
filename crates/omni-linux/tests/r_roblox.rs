@@ -193,6 +193,7 @@ fn the_apk_is_installed_started_and_draws() {
     let mut last_shot = Instant::now();
     let mut n = 0;
     let mut kicked = false;
+    let mut joined = false;
     // `OMNI_R_SHOT_SECS`: how often the display is kept (default 20).
     let shot_every = Duration::from_secs(std::env::var("OMNI_R_SHOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20));
     boot.watch(Duration::from_secs(minutes * 60), |line| {
@@ -236,8 +237,11 @@ fn the_apk_is_installed_started_and_draws() {
         if line.contains("DID_LOG_IN") && !kept.join("data/local/tmp/signed-in").exists() {
             let _ = std::fs::write(kept.join("data/local/tmp/signed-in"), "1");
         }
-        if line.contains("Joining game") && !kept.join("data/local/tmp/joining").exists() {
-            let _ = std::fs::write(kept.join("data/local/tmp/joining"), "1");
+        if line.contains("Joining game") {
+            joined = true;
+            if !kept.join("data/local/tmp/joining").exists() {
+                let _ = std::fs::write(kept.join("data/local/tmp/joining"), "1");
+            }
         }
         if last_shot.elapsed() > shot_every {
             last_shot = Instant::now();
@@ -254,4 +258,9 @@ fn the_apk_is_installed_started_and_draws() {
     let tail = boot.tail();
     let missing: Vec<&String> = expect.iter().zip(&seen).filter(|(_, s)| !**s).map(|(e, _)| e).collect();
     assert!(missing.is_empty(), "never seen: {missing:?}\n{tail}");
+    // A place asked for must have been joined: a run that only reached the app's Home, or its
+    // "Upgrade required" screen (an APK the servers no longer accept), is not a pass.
+    if std::env::var_os("OMNI_R_PLACE").is_some() {
+        assert!(joined, "OMNI_R_PLACE was set but the log never showed \"Joining game\": the place was not joined with {} (an APK too old for the servers shows \"Upgrade required\")\n{tail}", apk.display());
+    }
 }
