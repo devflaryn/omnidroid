@@ -22,7 +22,16 @@ MARKS = {
     "pm_install": r"\[r\] pm install",
     "am_start": r"\[r\] am start",
     "device_quiet": r"\[r\] device quiet",
+    "warm_ready": r"\[r\] warm ready",
 }
+
+
+def rmtree(path):
+    """Remove a saved device: some of its files are read-only (a relro)."""
+    def again(fn, p, _):
+        os.chmod(p, 0o700)
+        fn(p)
+    shutil.rmtree(path, onerror=again)
 
 
 def marks(text):
@@ -40,7 +49,9 @@ def marks(text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
-    ap.add_argument("--apk", required=True)
+    ap.add_argument("--apk")
+    ap.add_argument("--warm", action="store_true", help="a warm device (aosp --warm): timed to [r] warm ready")
+    ap.add_argument("--env", action="append", default=[], help="NAME=VALUE for the session (a lever)")
     ap.add_argument("--fresh-device", action="store_true")
     ap.add_argument("--forget-saved", action="store_true")
     ap.add_argument("--after-launch", type=float, default=10)
@@ -51,12 +62,15 @@ def main():
     ap.add_argument("rest", nargs="*")
     a = ap.parse_args()
     temp = Path(tempfile.gettempdir())
-    apk = Path(os.path.expanduser(a.apk)).resolve()
-    if a.forget_saved:
+    apk = Path(os.path.expanduser(a.apk)).resolve() if a.apk else None
+    if a.forget_saved and a.warm:
+        for g in (temp / "omni-golden").glob("base-*"):
+            rmtree(g)
+    elif a.forget_saved:
         prefix = f"{apk.stem}-{apk.stat().st_size}-guest-"
         for g in (temp / "omni-golden").glob(prefix + "*"):
             if re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9_-]+-v\d+", g.name):
-                shutil.rmtree(g)
+                rmtree(g)
     inst = temp / f"omni-bench-{a.label}-{int(time.time())}"
     repo = Path(a.repo)
     exe = repo / "target" / "release" / ("omnidroid.exe" if os.name == "nt" else "omnidroid")
@@ -64,9 +78,12 @@ def main():
     # A worktree has no sysroot of its own: this checkout's.
     if not (repo / "sysroot/aosp-35/sysroot.manifest").exists():
         env.setdefault("OMNI_SYSROOT", str(REPO / "sysroot/aosp-35"))
+    for kv in a.env:
+        k, _, v = kv.partition("=")
+        env[k] = v
     if a.dyn_dir:
         env["OMNIDROID_DYNARMIC_BUILD_DIR"] = a.dyn_dir
-    cmd = [str(exe), "aosp", "--apk", str(apk), "--instance", str(inst), "--minutes", str(a.minutes)]
+    cmd = [str(exe), "aosp"] + (["--warm"] if a.warm else ["--apk", str(apk)]) + ["--instance", str(inst), "--minutes", str(a.minutes)]
     if a.fresh_device:
         cmd.append("--fresh-device")
     cmd += a.rest
@@ -84,7 +101,7 @@ def main():
         boot = 1 if first_log.exists() else 0
         for k, v in marks(text).items():
             wall.setdefault(f"{boot}:{k}", round(time.time() - t0, 1))
-        done = boot + 1 >= expect_boots and "am start" in "".join(re.findall(r"\[r\] am start[^\n]*", text))
+        done = boot + 1 >= expect_boots and ("[r] warm ready" in text if a.warm else "[r] am start" in text)
         if done and launched_at is None:
             launched_at = time.time()
         if launched_at and time.time() - launched_at > a.after_launch and stop_at is None:
@@ -99,7 +116,7 @@ def main():
             boots.append(marks(f.read_text(errors="replace")))
         except OSError:
             boots.append({})
-    row = {"label": a.label, "repo": str(repo), "at": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": " ".join(cmd[1:]), "boots": boots, "wall": wall, "log": str(log), "exit": proc.returncode}
+    row = {"label": a.label, "repo": str(repo), "env": a.env, "at": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": " ".join(cmd[1:]), "boots": boots, "wall": wall, "log": str(log), "exit": proc.returncode}
     line = json.dumps(row)
     print(line)
     if a.out:
