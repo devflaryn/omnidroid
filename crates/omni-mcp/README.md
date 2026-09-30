@@ -61,8 +61,42 @@ All of these are optional and overridable per tool call. On Windows use `omni-mc
 | `OMNI_MCP_MINUTES` | minutes to run |
 | `OMNI_MCP_STANDBY` | `1`: keep a standby instance (below) |
 | `OMNI_MCP_STANDBY_MINUTES` | how long a standby instance lives (default 720) |
+| `OMNI_MCP_WARM` | `1`: boot the host's warm device (below) when a client connects, if none is up |
+| `OMNI_MCP_WARM_MINUTES` | how long a warm device lives (default 720) |
+| `OMNI_MCP_WARM_WAIT` | seconds a call waits for a warm device still booting (default 540) |
+| `OMNI_MCP_WARM_DIR` | where warm devices live (default: the temp directory; name a disk directory on a Linux host whose `/tmp` is a tmpfs) |
+| `OMNI_MCP_PM_FLAGS` | extra `pm install` flags |
+| `OMNI_MCP_SCREENSHOT_MS` | how often the warm device's display PNG is written (default 1000) |
 | `OMNIDROID_BIN` | the `omnidroid` launcher (default: sibling of `omni-mcp`) |
 | `OMNI_MCP_REPO` | repo dir to run the launcher in (its `aosp` subcommand runs `cargo test`) |
+
+## Any APK in seconds: the warm device
+
+An agent that builds APKs and tests them one after another should not boot Android per APK.
+Without an account (no `cookie`), `start_instance` and `install_apk` act on the host's **one warm
+device** -- Android booted and idle, no app of its own (`omnidroid aosp --warm`):
+
+- **Found, not made, when it is there.** A warm device is `<temp>/omni-warm-<secs>`, alive while its
+  control channel's heartbeat (`<dir>.ctl/alive`) is fresh. Every server on the host uses the one
+  that is up; one is booted (under `<temp>/omni-warm.lock`) only when none is, and it outlives the
+  server that booted it. Another device on the host (a Roblox session or standby) stops a boot.
+- **The control channel.** A shell command written as `<dir>.ctl/<id>.cmd` runs beside the device
+  as the shell user (`#uid=<n>` first line: another uid), its output lands in `<id>.out` and its
+  status in `<id>.rc` -- `adb shell` without adb (`tools/device_ctl.py` from a terminal).
+- **Decided by content, not version.** The APK's SHA-256 is compared with the `base.apk` the device
+  holds for its package (read on the host, no round trip): the same bytes are reused as installed;
+  other bytes are installed again even at the same versionCode and name (`pm install -r -d -g`;
+  uninstalled first when pm refuses them -- another signature, a lower versionCode); another test
+  app is uninstalled first. The package and launcher Activity come from the APK's manifest.
+- **Answered once the app is on screen**: `start_instance` returns after `am start -W` reports the
+  Activity displayed, with `install.action`, and seconds for the device, the install and the start.
+- `stop_instance` force-stops the app and clears its data; the device stays warm. `stop_device`
+  shuts it down. `shell`, `uninstall_apk`, `stop_app` and `device_status` act on it directly.
+
+Measured 2026-10-01 (i7-13700F, Windows; `docs/MORNING-2026-10-01-fast-boot.md`): from nothing to
+the probe app's first screen ~87 s (the device boots from its saved copy, ~56 s); on the warm
+device the same APK again ~4 s, a rebuilt APK of the same version ~15 s, another app ~18 s, Roblox
+~34 s -- where a new APK used to be a new device (~185-210 s).
 
 ## Fast starts: the saved device and the standby instance
 
@@ -94,10 +128,13 @@ Its files are `<temp>/omni-linux-r-standby-<secs>/data/local/tmp/`: `standby` (w
 
 | Tool | What it does |
 |---|---|
-| `start_instance` | start an instance (signs in, joins the place); returns at once -- takes over the standby instance when one waits |
-| `stop_instance` | stop a running instance (its session shuts the device down and removes it) |
+| `start_instance` | without `cookie`: the APK on the warm device (installed by content, started; answers when on screen). With `cookie`: a signed-in Roblox session (returns at once; takes over the standby when one waits) |
+| `stop_instance` | an app on the warm device: force-stopped and cleared, the device stays warm (`device: true` shuts it down). A session: its device shuts down |
 | `list_instances` | each instance's `state`: `booting`, `signed_in`, `joining`, `in_game` (+ `in_place`), `stopped`; and its log |
-| `install_apk` | record an APK as the default for the next boot |
+| `install_apk` | install on the warm device now (by content), and record it as the default APK |
+| `uninstall_apk` / `stop_app` | uninstall a package / force-stop and clear it, on the warm device |
+| `shell` | a shell command on the warm device (shell user, or `uid`) |
+| `device_status` / `stop_device` | the warm device's state and test apps / shut it down |
 | `launch_app` | boot the app (same as `start_instance` on the real-AOSP path) |
 | `login` | record a cookie for the next boot |
 | `join_place` | record a place id for the next boot |

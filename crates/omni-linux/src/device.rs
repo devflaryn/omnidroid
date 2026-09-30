@@ -38,7 +38,7 @@ pub const FILES: &[(&str, &[u8])] = &[
     // why; `persist.omni.cached_processes`).
     ("/vendor/etc/init/omni_lean.rc", include_bytes!("../device/vendor/etc/init/omni_lean.rc")),
     ("/vendor/bin/omni_lean.sh", include_bytes!("../device/vendor/bin/omni_lean.sh")),
-    // The boot's own settings: no boot animation (the file says why).
+    // The boot's own settings: no dexopt at install (the file says why).
     ("/vendor/etc/init/omni_boot.rc", include_bytes!("../device/vendor/etc/init/omni_boot.rc")),
     // The framework's configuration as this device has it: a static overlay (RRO), as a vendor
     // partition carries one (`device/src/overlay/`; the values file says why each is there).
@@ -260,14 +260,14 @@ pub fn global_environment() -> Vec<(String, String)> {
 ///
 /// The device's own boot settings can be left out too, to measure what each is worth:
 /// `OMNI_DEVICE_OVERLAY=0` (the framework overlay: the boot waits for a wallpaper again) and
-/// `OMNI_BOOT_ANIMATION=1` (the boot animation plays).
+/// `OMNI_DEVICE_BOOT_RC=0` (the device's boot settings: installs dexopt again).
 #[must_use]
 pub fn left_out() -> Vec<&'static str> {
     let mut out = apps_left_out();
     if std::env::var("OMNI_DEVICE_OVERLAY").as_deref() == Ok("0") {
         out.push("/vendor/overlay/omni-device-overlay.apk");
     }
-    if std::env::var("OMNI_BOOT_ANIMATION").as_deref() == Ok("1") {
+    if std::env::var("OMNI_DEVICE_BOOT_RC").as_deref() == Ok("0") {
         out.push("/vendor/etc/init/omni_boot.rc");
     }
     // An app's host process has no preloaded-classes list (`OMNI_APP_PRELOAD=1` gives it one), so
