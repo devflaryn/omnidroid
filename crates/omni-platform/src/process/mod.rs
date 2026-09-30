@@ -104,6 +104,21 @@ pub fn is_alive(pid: u32) -> bool {
     backend::is_alive(pid)
 }
 
+/// End every process this one starts from now on when this one ends, however it ends (killed
+/// included): a session's host processes, which otherwise outlive the process they were started
+/// by. Windows: a job object that kills its processes when its last handle -- this process's --
+/// closes. Elsewhere nothing here: a child asks for it itself ([`end_with_parent`]). Whether it
+/// took.
+pub fn hold_children() -> bool {
+    backend::hold_children()
+}
+
+/// End this process when the process that started it ends (Linux: `PR_SET_PDEATHSIG`). Nothing
+/// on Windows ([`hold_children`] covers it) or macOS (no such call). Whether it took.
+pub fn end_with_parent() -> bool {
+    backend::end_with_parent()
+}
+
 /// How many CPUs this process may run on, as `sysconf(_SC_NPROCESSORS_ONLN)` reports it.
 ///
 /// `available_parallelism` rather than a raw core count: it honours affinity masks and container

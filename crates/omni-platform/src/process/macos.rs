@@ -56,6 +56,16 @@ pub(super) fn is_alive(pid: u32) -> bool {
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Nothing: macOS has no job objects and no parent-death signal.
+pub(super) fn hold_children() -> bool {
+    false
+}
+
+/// Nothing: macOS has no parent-death signal.
+pub(super) fn end_with_parent() -> bool {
+    false
+}
+
 pub(super) fn current_cpu() -> ProcessResult<u32> {
     let mut cpu: libc::size_t = 0;
     // SAFETY: `cpu` is a live size_t the call writes.

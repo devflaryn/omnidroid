@@ -41,6 +41,23 @@ pub(super) fn is_alive(pid: u32) -> bool {
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Nothing: a Linux child asks for its own end ([`end_with_parent`]).
+pub(super) fn hold_children() -> bool {
+    false
+}
+
+/// `PR_SET_PDEATHSIG` with SIGKILL -- and if the parent is already gone (this process adopted),
+/// the end now.
+pub(super) fn end_with_parent() -> bool {
+    // SAFETY: prctl with PR_SET_PDEATHSIG takes a signal number and nothing else.
+    let set = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == 0;
+    // SAFETY: no arguments.
+    if set && unsafe { libc::getppid() } == 1 {
+        std::process::exit(0);
+    }
+    set
+}
+
 /// `getrandom(buf, len, 0)`, called until the whole buffer is filled.
 ///
 /// # Blocking, not `GRND_NONBLOCK`, and why

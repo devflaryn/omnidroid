@@ -72,6 +72,14 @@ fn main() -> ExitCode {
             }
         }
     }
+    // The system's host process holds its apps' host processes (the zygote's): a session that is
+    // killed leaves none of them running. An app's host process ends with the system's.
+    if zygote {
+        omni_platform::process::hold_children();
+    }
+    if omni_linux::remote::is_remote() {
+        omni_platform::process::end_with_parent();
+    }
     let config = SpawnConfig {
         sysroot: sysroot.clone(),
         instance_dir: instance.clone(),

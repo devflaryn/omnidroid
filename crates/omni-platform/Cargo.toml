@@ -54,6 +54,9 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # The process seam's `hold_children`: a job object that ends a session's host processes with
+    # the one that started them.
+    "Win32_System_JobObjects",
     # The window seam (src/window/windows.rs). `Win32_Graphics_Gdi` is not for drawing: `WNDCLASSW`
     # carries an `HBRUSH` background field, so the struct itself is behind that feature even when
     # the brush is null -- which it is, because the swapchain owns every pixel of the client area.

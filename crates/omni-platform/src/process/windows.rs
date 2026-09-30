@@ -18,6 +18,40 @@ use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF
 
 use super::{ProcessError, ProcessResult};
 
+/// A job object that kills its processes when its last handle closes, this process in it: the
+/// handle is never closed, so it closes when this process ends.
+pub(super) fn hold_children() -> bool {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    // SAFETY: an unnamed job object with default security; the handle is checked below.
+    let job = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
+    if job.is_null() {
+        return false;
+    }
+    // SAFETY: an all-zero JOBOBJECT_EXTENDED_LIMIT_INFORMATION is a valid "no limits" value.
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { core::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `job` is live and `limits` is the structure this information class names, its size
+    // given.
+    let set = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    // SAFETY: `job` is live; GetCurrentProcess is a pseudo-handle.
+    set != 0 && unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) } != 0
+}
+
+/// Nothing: the job object of the process that started this one ends it ([`hold_children`]).
+pub(super) fn end_with_parent() -> bool {
+    false
+}
+
 /// Whether a process with id `pid` exists now.
 ///
 /// Opens the process to query its exit code. If the open fails with `ERROR_ACCESS_DENIED`, the
