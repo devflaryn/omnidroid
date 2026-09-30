@@ -122,6 +122,7 @@ fn answer(args: &[String], launcher: &Arc<Launcher>, instance: usize) -> Option<
     let mut uid = None;
     let mut nice = None;
     let mut sdk = None;
+    let mut package = String::new();
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -133,6 +134,8 @@ fn answer(args: &[String], launcher: &Arc<Launcher>, instance: usize) -> Option<
             uid = v.parse::<u32>().ok();
         } else if let Some(v) = a.strip_prefix("--nice-name=") {
             nice = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--package-name=") {
+            package = v.to_string();
         } else if let Some(v) = a.strip_prefix("--target-sdk-version=") {
             sdk = v.parse::<u32>().ok();
         } else if !a.starts_with("--") {
@@ -160,7 +163,15 @@ fn answer(args: &[String], launcher: &Arc<Launcher>, instance: usize) -> Option<
         reply.push(0);
         return Some(reply);
     }
-    let pid = launch(launcher, uid.unwrap_or(10000), nice.as_deref(), sdk.unwrap_or(0), &rest).unwrap_or(-1);
+    // A spare is for an installed app (the agent's), not the image's own: those start around an
+    // install or when the placeholder home comes back, and took the spare just before the app
+    // (2026-10-01: Settings' FallbackHome, the package installer, the WebView's service). An
+    // installed app is in the device's /data/app (`--package-name`), the image's are not.
+    let uid = uid.unwrap_or(10000);
+    // (Without `--package-name`, an app's main process is named after its package.)
+    let package = if package.is_empty() { nice.clone().unwrap_or_default() } else { package };
+    let installed = uid >= 10_000 && installed_app(&launcher.instance, &package);
+    let pid = launch(launcher, uid, nice.as_deref(), sdk.unwrap_or(0), &rest, installed).unwrap_or(-1);
     let mut reply = int(pid);
     reply.push(1); // usingWrapper: the process is WrapperInit's
     Some(reply)
@@ -193,10 +204,26 @@ pub fn signal(pid: i32, sig: i32) -> Option<()> {
     Some(())
 }
 
+/// Whether `package` is installed in the device's /data/app (`<random>/<package>-<random>/base.apk`).
+fn installed_app(instance: &std::path::Path, package: &str) -> bool {
+    if package.is_empty() {
+        return false;
+    }
+    let prefix = format!("{package}-");
+    std::fs::read_dir(instance.join("data/app")).into_iter().flatten().flatten().any(|outer| {
+        std::fs::read_dir(outer.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|inner| inner.file_name().to_string_lossy().starts_with(&prefix) && inner.path().join("base.apk").is_file())
+    })
+}
+
 /// Launch `class args...` in a host process of its own; the pid it runs under. With
-/// `OMNI_APP_SPARE=1` a spare app process waiting for an app (`start_spare`) becomes it instead.
-fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String]) -> Option<i32> {
-    if let Some(pid) = take_spare(uid, nice, sdk, class_and_args) {
+/// `OMNI_APP_SPARE=1` and `spare` (an installed app) a spare app process waiting for an app
+/// (`start_spare`) becomes it instead.
+fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String], spare: bool) -> Option<i32> {
+    if let Some(pid) = spare.then(|| take_spare(uid, nice, sdk, class_and_args)).flatten() {
         return Some(pid);
     }
     let pid = crate::process::reserve_pid();
@@ -455,5 +482,18 @@ mod tests {
         assert!(bound.is_some_and(|b| b.listening.load(std::sync::atomic::Ordering::SeqCst)));
         // Not a child zygote: an app.
         assert_eq!(child_zygote_socket(&args(&["--setuid=10115", "android.app.ActivityThread", "seq=1"])), None);
+    }
+
+    #[test]
+    fn a_spare_is_for_an_app_installed_in_data_app() {
+        let dir = std::env::temp_dir().join(format!("omni-zygote-installed-{}", std::process::id()));
+        let base = dir.join("data/app/~~a==/com.example.app-b-c==/base.apk");
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(&base, b"apk").unwrap();
+        assert!(installed_app(&dir, "com.example.app"));
+        assert!(!installed_app(&dir, "com.example"), "a prefix of it is another package");
+        assert!(!installed_app(&dir, "com.android.settings"), "the image's apps are not in /data/app");
+        assert!(!installed_app(&dir, ""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
