@@ -99,8 +99,14 @@ pub struct Binding {
 
 impl Drop for Binding {
     fn drop(&mut self) {
+        let me = std::process::id();
         for f in &self.files {
-            let _ = std::fs::remove_file(f);
+            // Only remove if we still own it: verify the pid in the entry.
+            if let Some((_, owner, _)) = read_entry(f) {
+                if owner == me {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
         }
     }
 }
@@ -112,6 +118,17 @@ fn read_entry(path: &Path) -> Option<(u16, u32, bool)> {
     let port = w.next()?.parse().ok()?;
     let owner = w.next()?.parse().ok()?;
     Some((port, owner, w.next() == Some("s")))
+}
+
+/// Read an entry with retries for incomplete writes.
+fn read_entry_with_retry(path: &Path, max_retries: u32) -> Option<(u16, u32, bool)> {
+    for _ in 0..max_retries {
+        if let Some(entry) = read_entry(path) {
+            return Some(entry);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    None
 }
 
 /// Whether an entry's owner still runs: this host process, or a live one.
@@ -147,38 +164,81 @@ impl Namespace {
         let guest = if guest == 0 { host } else { guest };
         let me = std::process::id();
         let fwd = self.forward(proto, guest);
-        let mut files = Vec::new();
         let body = format!("{host} {me}{}", if shared { " s" } else { "" });
-        let mut tries = 0;
+        let mut claim_tries = 0;
+        let mut take_tries = 0;
+
         loop {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&fwd) {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    f.write_all(body.as_bytes()).map_err(|_| EIO)?;
-                    files.push(fwd.clone());
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_entry(&fwd) {
-                    Some((_, owner, held_shared)) if live(owner) => {
-                        if shared && held_shared {
-                            break; // joined: the first keeps the forward entry
-                        }
-                        return Err(EADDRINUSE);
-                    }
-                    // Stale (its owner is gone) or unreadable: taken over, once.
-                    _ if tries == 0 => {
+            // Try to claim atomically: write to temp, hard_link to target.
+            let tmp = self.dir.join(format!(".tmp-{me}-{}", claim_tries));
+            std::fs::write(&tmp, &body).map_err(|_| EIO)?;
+            match std::fs::hard_link(&tmp, &fwd) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    // Claim succeeded: build binding before reverse entry.
+                    let mut files = vec![fwd.clone()];
+                    let rev = self.reverse(proto, host);
+                    std::fs::write(&rev, format!("{guest} {me}")).map_err(|_| {
+                        // Failed to write reverse: release the forward entry.
                         let _ = std::fs::remove_file(&fwd);
-                        tries += 1;
+                        EIO
+                    })?;
+                    files.push(rev);
+                    return Ok(Binding { files });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = std::fs::remove_file(&tmp);
+                    // Entry exists: check if it's live or stale.
+                    match read_entry_with_retry(&fwd, 5) {
+                        Some((_, owner, held_shared)) => {
+                            if live(owner) {
+                                // Live owner: check for shared join.
+                                if shared && held_shared {
+                                    // Build binding without forward entry (joined).
+                                    let mut files = Vec::new();
+                                    let rev = self.reverse(proto, host);
+                                    std::fs::write(&rev, format!("{guest} {me}")).map_err(|_| EIO)?;
+                                    files.push(rev);
+                                    return Ok(Binding { files });
+                                }
+                                return Err(EADDRINUSE);
+                            } else {
+                                // Stale: atomically take over by renaming to tombstone.
+                                if take_tries >= 3 {
+                                    return Err(EADDRINUSE);
+                                }
+                                let tomb = self.dir.join(format!(".tomb-{me}-{}", take_tries));
+                                match std::fs::rename(&fwd, &tomb) {
+                                    Ok(()) => {
+                                        let _ = std::fs::remove_file(&tomb);
+                                        take_tries += 1;
+                                        claim_tries += 1;
+                                        // Retry the claim after takeover.
+                                    }
+                                    Err(_) => {
+                                        // Rename failed: another taker got it or entry already gone.
+                                        // Retry the claim.
+                                        claim_tries += 1;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // Unreadable: retry a few times, then give up.
+                            if claim_tries >= 5 {
+                                return Err(EADDRINUSE);
+                            }
+                            claim_tries += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
                     }
-                    _ => return Err(EADDRINUSE),
-                },
-                Err(_) => return Err(EIO),
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(EIO);
+                }
             }
         }
-        let rev = self.reverse(proto, host);
-        std::fs::write(&rev, format!("{guest} {me}")).map_err(|_| EIO)?;
-        files.push(rev);
-        Ok(Binding { files })
     }
 
     /// The host port behind guest port `guest`, if a live socket of this namespace holds it.
@@ -337,5 +397,129 @@ mod tests {
         let _e = expose(&d, "u0", Proto::Tcp, 8080, 50009).expect("expose");
         assert_eq!(Namespace::open(&d, "u0").lookup(Proto::Tcp, 8080), Some(50009));
         assert_eq!(Namespace::open(&d, "u10").lookup(Proto::Tcp, 8080), None);
+    }
+
+    #[test]
+    fn one_guest_port_has_one_winner_under_concurrent_binds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+        use std::sync::Arc as StdArc;
+
+        let d = dir("concurrent");
+        let ns = Namespace::open(&d, "u0");
+        let barrier = StdArc::new(Barrier::new(8));
+        let success_count = StdArc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for i in 0..8 {
+            let ns_clone = Arc::clone(&ns);
+            let barrier_clone = StdArc::clone(&barrier);
+            let success_clone = StdArc::clone(&success_count);
+            let handle = std::thread::spawn(move || {
+                barrier_clone.wait(); // synchronize all threads
+                let host_port = 51240 + i as u16;
+                match ns_clone.bind(Proto::Tcp, 47020, host_port, false) {
+                    Ok(_binding) => {
+                        success_clone.fetch_add(1, Ordering::SeqCst);
+                        // Hold the binding for a bit to ensure atomicity is observable.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(EADDRINUSE) => {
+                        // expected for losers
+                    }
+                    Err(_) => panic!("unexpected error"),
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly one should win: core atomicity property.
+        assert_eq!(
+            success_count.load(Ordering::SeqCst),
+            1,
+            "exactly one bind succeeded among 8 concurrent attempts"
+        );
+    }
+
+    #[test]
+    fn shared_drop_does_not_remove_first_binding() {
+        let d = dir("shared-drop");
+        let ns = Namespace::open(&d, "sys");
+        let first = ns.bind(Proto::Udp, 5354, 50010, true).expect("first");
+        let second = ns.bind(Proto::Udp, 5354, 50011, true).expect("second, shared");
+        assert_eq!(ns.lookup(Proto::Udp, 5354), Some(50010), "the first keeps the port");
+        drop(second);
+        // After dropping second, first's binding and lookup should still work.
+        assert_eq!(ns.lookup(Proto::Udp, 5354), Some(50010), "first still reachable after second drops");
+        assert_eq!(ns.guest_port(Proto::Udp, 50011), None, "second's reverse entry is removed");
+        drop(first);
+    }
+
+    #[test]
+    fn shared_bind_rejects_non_shared_holder() {
+        let d = dir("shared-vs-nonshared");
+        let ns = Namespace::open(&d, "u0");
+        let _held = ns.bind(Proto::Tcp, 47021, 50012, false).expect("non-shared");
+        assert_eq!(ns.bind(Proto::Tcp, 47021, 50013, true).err(), Some(EADDRINUSE));
+    }
+
+    #[test]
+    fn a_taken_over_entry_is_not_removed_by_its_old_binding() {
+        let d = dir("takeover-keeps-new");
+        let ns = Namespace::open(&d, "u0");
+        let binding = ns.bind(Proto::Tcp, 47022, 50014, false).expect("bind");
+
+        // Simulate takeover: overwrite forward file with a live process's pid.
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "ping -n 5 127.0.0.1 >nul"])
+                .spawn()
+                .unwrap()
+        } else {
+            std::process::Command::new("sleep").arg("5").spawn().unwrap()
+        };
+        let child_pid = child.id();
+        let fwd = d.join(".omni-loopback/u0/f-tcp-47022");
+        std::fs::write(&fwd, format!("50015 {child_pid}")).unwrap();
+
+        // Drop original binding: it should NOT remove the entry (new owner).
+        drop(binding);
+        assert!(fwd.exists(), "forward entry still exists after original binding drops");
+
+        // Verify it still has the new owner.
+        let (_, owner, _) = read_entry(&fwd).expect("entry readable");
+        assert_eq!(owner, child_pid, "entry has new owner");
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn dead_owner_takeover_updates_reverse_entry() {
+        let d = dir("takeover-reverse");
+        let ns = Namespace::open(&d, "u0");
+        // Leave a dead owner's entry.
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        } else {
+            std::process::Command::new("true").spawn().unwrap()
+        };
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(d.join(".omni-loopback/u0/f-tcp-47023"), format!("50016 {dead}")).unwrap();
+
+        // Bind same guest port with different host port.
+        let _held = ns.bind(Proto::Tcp, 47023, 50017, false).expect("taken over");
+
+        // Lookup should find the new host port (not the old dead owner's).
+        assert_eq!(ns.lookup(Proto::Tcp, 47023), Some(50017), "lookup returns new host port");
+        // Reverse entry should map to new host port.
+        assert_eq!(ns.guest_port(Proto::Tcp, 50017), Some(47023), "reverse entry is new");
+        // Old reverse entry should not exist or be stale.
+        assert_eq!(ns.guest_port(Proto::Tcp, 50016), None, "old reverse entry is gone");
     }
 }
