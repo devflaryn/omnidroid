@@ -46,7 +46,11 @@ function Stop-Guests {
 Stop-Guests
 Start-Sleep 3
 # The previous run's memory is given back over a few seconds; a boot needs ~13 GB of free commit.
-for ($i = 0; $i -lt 30; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 13GB / 1KB) { break }; Start-Sleep 2 }
+# A boot needs ~13 GB of free commit; below that it would starve this host's other processes (the
+# owner's games) as well as itself. Wait for it (up to 30 min); never boot without it.
+$okCommit = $false
+for ($i = 0; $i -lt 900; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 13GB / 1KB) { $okCommit = $true; break }; Start-Sleep 2 }
+if (-not $okCommit) { Write-Output "LOWCOMMIT: free commit stayed under 13 GB for 30 min; not booting"; exit 3 }
 
 $crate = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Exe)))  # <tree>/target/release/deps -> <tree>
 $proc = Start-Process -FilePath $Exe -ArgumentList "--ignored", "--nocapture", "--exact", "the_apk_is_installed_started_and_draws" `

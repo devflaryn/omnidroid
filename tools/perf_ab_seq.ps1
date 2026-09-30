@@ -8,7 +8,8 @@ param(
   [Parameter(Mandatory)][string]$Arms,
   [Parameter(Mandatory)][string]$Csv,
   [string]$Script = "perf_ab.ps1",
-  [string]$ExtraEnv = ""
+  [string]$ExtraEnv = "",
+  [string[]]$ScriptArgs = @()   # passed on to the script as they are, e.g. -ScriptArgs "-AfterSec","20"
 )
 $map = @{}; $envs = @{}
 foreach ($kv in $Arms.Split(";")) {
@@ -23,6 +24,7 @@ foreach ($arm in $Seq.Split(",")) {
   Write-Output ("{0} arm {1}: free commit {2:N1} GB" -f (Get-Date -Format HH:mm:ss), $arm, ($os.FreeVirtualMemory / 1MB))
   $a = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $here $Script), "-Arm", $arm, "-Exe", $map[$arm], "-Csv", $Csv)
   if ($envs[$arm]) { $a += @("-ExtraEnv", $envs[$arm]) }
+  $a += $ScriptArgs
   & powershell @a
 }
 Write-Output "SEQ DONE $(Get-Date -Format o)"

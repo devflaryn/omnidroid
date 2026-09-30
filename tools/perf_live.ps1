@@ -3,13 +3,17 @@
 # crates/omni-linux/src/lever.rs) between value A and value B for -Pairs pairs in ABBA order,
 # each phase: write the lever, wait -WarmSec (translations redone, the switch settles), measure
 # -MeasureSec. Per phase one CSV row; at the end the paired deltas (B - A) with their spread.
+# Several levers, one after another in the same session: -Levers "name:A:B[:bg=v,bg2=v];name2:A:B",
+# the optional fourth field being lines written beside the lever for that whole A/B.
 #
 #   powershell -File tools\perf_live.ps1 -Exe <r_roblox-*.exe> -Lever jit_fp -A 0 -B f0000 -Tag fp-all
+#   powershell -File tools\perf_live.ps1 -Exe <exe> -Levers "compose_fast:0:1;fence_poll:0:250:compose_fast=1" -Tag c4c5
 param(
   [Parameter(Mandatory)][string]$Exe,
-  [Parameter(Mandatory)][string]$Lever,
-  [Parameter(Mandatory)][string]$A,
-  [Parameter(Mandatory)][string]$B,
+  [string]$Lever = "",
+  [string]$A = "",
+  [string]$B = "",
+  [string]$Levers = "",
   [string]$Tag = "live",
   [int]$Pairs = 8,
   [int]$WarmSec = 20,
@@ -28,12 +32,28 @@ $ErrorActionPreference = "Continue"
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 $stamp = Get-Date -Format "MMdd-HHmmss"
 $name = "$Tag-$stamp"
-$csv = Join-Path $Dir "$name.csv"; $sum = Join-Path $Dir "$name.summary.txt"
+$sum = Join-Path $Dir "$name.summary.txt"
 $leverFile = Join-Path $Dir "$name.lever.txt"
-Set-Content -Path $leverFile -Value "$Lever=$A" -NoNewline -Encoding ascii
+
+# The A/Bs to take: (lever, valueA, valueB, background lines).
+$plan = @()
+if ($Levers) {
+  foreach ($spec in $Levers.Split(";")) {
+    if (-not $spec) { continue }
+    $f = $spec.Split(":", 4)
+    $plan += , @($f[0], $f[1], $f[2], $(if ($f.Count -gt 3) { $f[3].Split(",") -join "`n" } else { "" }))
+  }
+} else {
+  $plan += , @($Lever, $A, $B, "")
+}
+function Write-Lever($bg, $lv, $val) {
+  $text = if ($bg) { "$bg`n$lv=$val" } else { "$lv=$val" }
+  Set-Content -Path $leverFile -Value $text -NoNewline -Encoding ascii
+}
+Write-Lever $plan[0][3] $plan[0][0] $plan[0][1]
 
 $env:OMNI_WINDOW = "1"; $env:OMNI_R_KIOSK = "1"; $env:OMNI_GPU = "auto"
-$env:OMNI_R_MINUTES = [string]($JoinTimeoutMin + 2 + [math]::Ceiling(($SettleSec + 2 * $Pairs * ($WarmSec + $MeasureSec)) / 60) + 2)
+$env:OMNI_R_MINUTES = [string]($JoinTimeoutMin + 2 + [math]::Ceiling(($SettleSec + $plan.Count * 2 * $Pairs * ($WarmSec + $MeasureSec)) / 60) + 2)
 $env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; $env:OMNI_R_PLACE = $Place
 $env:OMNI_SYSROOT = $Sysroot; $env:OMNI_LEVER_FILE = $leverFile
 Remove-Item env:OMNI_SCREENSHOT -ErrorAction SilentlyContinue
@@ -41,12 +61,16 @@ if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Spl
 
 function Stop-Guests { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" } | Stop-Process -Force -ErrorAction SilentlyContinue }
 Stop-Guests; Start-Sleep 3
-for ($i = 0; $i -lt 30; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 13GB / 1KB) { break }; Start-Sleep 2 }
+# A boot needs ~13 GB of free commit; below that it would starve this host's other processes (the
+# owner's games) as well as itself. Wait for it (up to 30 min); never boot without it.
+$okCommit = $false
+for ($i = 0; $i -lt 900; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 13GB / 1KB) { $okCommit = $true; break }; Start-Sleep 2 }
+if (-not $okCommit) { Write-Output "LOWCOMMIT: free commit stayed under 13 GB for 30 min; not booting"; exit 3 }
 $tree = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Exe)))
 $proc = Start-Process -FilePath $Exe -ArgumentList "--ignored", "--nocapture", "--exact", "the_apk_is_installed_started_and_draws" `
   -WorkingDirectory $tree -RedirectStandardOutput (Join-Path $Dir "$name.out.log") -RedirectStandardError (Join-Path $Dir "$name.err.log") -PassThru -WindowStyle Hidden
 $log = Join-Path $env:TEMP ("omni-linux-r-{0}.log" -f $proc.Id)
-Add-Content $sum "run $name exe $Exe lever $Lever A=$A B=$B pairs $Pairs warm $WarmSec measure $MeasureSec log $log"
+Add-Content $sum "run $name exe $Exe plan $(($plan | ForEach-Object { $_[0] + ':' + $_[1] + '/' + $_[2] }) -join ' ') pairs $Pairs warm $WarmSec measure $MeasureSec log $log"
 
 # The log, read as it grows: [display] lines stamped with their arrival time.
 $script:pos = 0L; $script:disp = New-Object System.Collections.ArrayList; $script:marks = New-Object System.Collections.ArrayList
@@ -64,6 +88,7 @@ function Pump {
     if ($l -match "\[display\] (\d+) frames presented \(([\d.]+)/s\)") { [void]$script:disp.Add([pscustomobject]@{ t = $now; f = [double]$Matches[1]; r = [double]$Matches[2] }) }
     elseif ($l -match "Joining game") { [void]$script:marks.Add("join") }
     elseif ($l -match "Client has been disconnected") { [void]$script:marks.Add("kick") }
+    elseif ($l -match "Process com\.roblox\.client \(pid \d+\) has died") { [void]$script:marks.Add("appdied") }
     elseif ($l -match "\[lever\]") { [void]$script:marks.Add($l.Trim()) }
   }
 }
@@ -75,7 +100,8 @@ function Snap {
   $threads = @{}
   foreach ($t in $app.Threads) { try { $threads[$t.Id] = $t.TotalProcessorTime.TotalMilliseconds } catch {} }
   $all = 0.0; foreach ($p in $g) { try { $all += $p.TotalProcessorTime.TotalMilliseconds } catch {} }
-  [pscustomobject]@{ t = Get-Date; appId = $app.Id; appCpu = $app.TotalProcessorTime.TotalMilliseconds; threads = $threads; all = $all
+  $sysCpu = 0.0; $sp = $g | Where-Object { $_.Id -eq $script:sysPid } | Select-Object -First 1; if ($sp) { $sysCpu = $sp.TotalProcessorTime.TotalMilliseconds }
+  [pscustomobject]@{ t = Get-Date; appId = $app.Id; appCpu = $app.TotalProcessorTime.TotalMilliseconds; threads = $threads; all = $all; sys = $sysCpu
     priv = ($g | Measure-Object PrivateMemorySize64 -Sum).Sum; appPriv = $app.PrivateMemorySize64; n = $g.Count }
 }
 
@@ -84,45 +110,43 @@ while (((Get-Date) - $t0).TotalMinutes -lt $JoinTimeoutMin) { Wait-Pumping 5; if
 if (-not ($script:marks -contains "join")) { Add-Content $sum "NOJOIN"; Stop-Guests; Get-Content $sum; exit 1 }
 Add-Content $sum ("joined after {0:N0} s" -f ((Get-Date) - $t0).TotalSeconds)
 Wait-Pumping $SettleSec
+$script:sysPid = (Get-CimInstance Win32_Process -Filter "Name like 'omni-linux-run%'" | Where-Object { $_.CommandLine -match 'nice-name=system_server' } | Select-Object -First 1).ProcessId
 
-Set-Content -Path $csv -Value "pair,arm,value,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,lines" -Encoding ascii
-$rows = New-Object System.Collections.ArrayList
-for ($i = 0; $i -lt $Pairs; $i++) {
-  $order = if ($i % 2 -eq 0) { @("A", "B") } else { @("B", "A") }
-  foreach ($arm in $order) {
-    $value = if ($arm -eq "A") { $A } else { $B }
-    Set-Content -Path $leverFile -Value "$Lever=$value" -NoNewline -Encoding ascii
-    Wait-Pumping $WarmSec
-    $s0 = Snap; $d0 = $script:disp.Count
-    Wait-Pumping $MeasureSec
-    $s1 = Snap
-    $lines = @($script:disp | Select-Object -Skip $d0)
-    $frames = 0.0; $secs = 0.0
-    foreach ($d in $lines) { if ($d.r -gt 0) { $idx = $script:disp.IndexOf($d); if ($idx -gt 0) { $df = $d.f - $script:disp[$idx - 1].f; $frames += $df; $secs += $df / $d.r } } }
-    $fps = if ($secs -gt 0) { $frames / $secs } else { 0 }
-    $wall = ($s1.t - $s0.t).TotalSeconds; $nf = [math]::Max(1, $fps * $wall)
-    $deltas = foreach ($k in $s1.threads.Keys) { if ($s0.threads.ContainsKey($k)) { $s1.threads[$k] - $s0.threads[$k] } }
-    $top = @($deltas | Sort-Object -Descending | Select-Object -First 2)
-    $row = [pscustomobject]@{ pair = $i; arm = $arm; value = $value; fps = $fps; top_ms = $top[0] / $nf; top2_ms = $top[1] / $nf
-      app_ms = ($s1.appCpu - $s0.appCpu) / $nf; all_ms = ($s1.all - $s0.all) / $nf; priv_gb = $s1.priv / 1GB; app_priv_gb = $s1.appPriv / 1GB; procs = $s1.n; lines = $lines.Count }
-    if ($s0.appId -ne $s1.appId) { $row.fps = 0 }
-    [void]$rows.Add($row)
-    Add-Content $csv ("{0},{1},{2},{3:N3},{4:N3},{5:N3},{6:N3},{7:N3},{8:N3},{9:N3},{10},{11}" -f $row.pair, $row.arm, $row.value, $row.fps, $row.top_ms, $row.top2_ms, $row.app_ms, $row.all_ms, $row.priv_gb, $row.app_priv_gb, $row.procs, $row.lines)
+$csvs = @()
+foreach ($ab in $plan) {
+  $lv = $ab[0]; $valA = $ab[1]; $valB = $ab[2]; $bg = $ab[3]
+  $csv = Join-Path $Dir "$name.$lv.csv"; $csvs += $csv
+  Set-Content -Path $csv -Value "pair,arm,value,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,lines,sys_ms" -Encoding ascii
+  for ($i = 0; $i -lt $Pairs; $i++) {
+    $order = if ($i % 2 -eq 0) { @("A", "B") } else { @("B", "A") }
+    foreach ($arm in $order) {
+      $value = if ($arm -eq "A") { $valA } else { $valB }
+      if ($script:marks -contains "appdied") { break }
+      Write-Lever $bg $lv $value
+      Wait-Pumping $WarmSec
+      $s0 = Snap; $d0 = $script:disp.Count
+      Wait-Pumping $MeasureSec
+      $s1 = Snap
+      $frames = 0.0; $secs = 0.0
+      for ($k = [math]::Max(1, $d0); $k -lt $script:disp.Count; $k++) {
+        $dl = $script:disp[$k]
+        if ($dl.r -gt 0) { $df = $dl.f - $script:disp[$k - 1].f; $frames += $df; $secs += $df / $dl.r }
+      }
+      $fps = if ($secs -gt 0) { $frames / $secs } else { 0 }
+      $wall = ($s1.t - $s0.t).TotalSeconds; $nf = [math]::Max(1, $fps * $wall)
+      $deltas = foreach ($k in $s1.threads.Keys) { if ($s0.threads.ContainsKey($k)) { $s1.threads[$k] - $s0.threads[$k] } }
+      $top = @($deltas | Sort-Object -Descending | Select-Object -First 2)
+      if ($s0.appId -ne $s1.appId) { $fps = 0 }
+      Add-Content $csv ("{0},{1},{2},{3:F3},{4:F3},{5:F3},{6:F3},{7:F3},{8:F3},{9:F3},{10},{11},{12:F3}" -f $i, $arm, $value, $fps, ($top[0] / $nf), ($top[1] / $nf), (($s1.appCpu - $s0.appCpu) / $nf), (($s1.all - $s0.all) / $nf), ($s1.priv / 1GB), ($s1.appPriv / 1GB), $s1.n, ($script:disp.Count - $d0), (($s1.sys - $s0.sys) / $nf))
+    }
   }
 }
 Pump
 Stop-Guests
-function Med($a) { $s = @($a | Sort-Object); if ($s.Count -eq 0) { return 0 }; if ($s.Count % 2) { $s[[int][math]::Floor($s.Count / 2)] } else { ($s[$s.Count / 2 - 1] + $s[$s.Count / 2]) / 2 } }
-foreach ($m in "fps", "top_ms", "top2_ms", "app_ms", "all_ms", "priv_gb", "app_priv_gb") {
-  $d = @(); $ra = @(); $rb = @()
-  for ($i = 0; $i -lt $Pairs; $i++) {
-    $a = $rows | Where-Object { $_.pair -eq $i -and $_.arm -eq "A" }; $b = $rows | Where-Object { $_.pair -eq $i -and $_.arm -eq "B" }
-    if ($a -and $b -and $a.fps -gt 0 -and $b.fps -gt 0) { $d += ($b.$m - $a.$m); $ra += $a.$m; $rb += $b.$m }
-  }
-  if ($d.Count -eq 0) { continue }
-  $pos = @($d | Where-Object { $_ -gt 0 }).Count
-  $ma = Med $ra
-  Add-Content $sum ("{0,-12} A med {1,9:N3}  B med {2,9:N3}  paired d med {3,8:N3} ({4,6:N1}%)  d min {5,8:N3} max {6,8:N3}  B>A in {7}/{8}" -f $m, $ma, (Med $rb), (Med $d), (100 * (Med $d) / [math]::Max(1e-9, [math]::Abs($ma))), ($d | Measure-Object -Minimum).Minimum, ($d | Measure-Object -Maximum).Maximum, $pos, $d.Count)
+if ($script:marks -contains "appdied") { Add-Content $sum "APP DIED during the A/B: phases after it are missing (the CSV stops there)" }
+foreach ($csv in $csvs) {
+  Add-Content $sum "== $csv"
+  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "perf_pairs.ps1") -Csv $csv | Add-Content $sum
 }
-Add-Content $sum ("marks: " + (($script:marks | Where-Object { $_ -ne "join" } | Select-Object -First 6) -join " | "))
+Add-Content $sum ("marks: " + (($script:marks | Where-Object { $_ -ne "join" } | Select-Object -Last 8) -join " | "))
 Get-Content $sum
