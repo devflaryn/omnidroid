@@ -735,8 +735,34 @@ impl Process {
     }
 }
 
+/// What `/proc/<pid>` of another process shows: whether it lives, who it is. The rest (`fd`,
+/// `maps`, ...) is its own -- and of an app's stand-in, in another host process.
+const OF_ANOTHER: &[&str] = &["", "stat", "status", "statm", "cmdline", "comm"];
+
+impl Process {
+    /// Another live process of this host process -- one of its own, or the stand-in of an app in
+    /// another host process (`crate::remote`), which lives as long as the app's binder does --
+    /// whose `/proc/<pid>/...` `path` is (`OF_ANOTHER` only). ActivityManager asks whether a
+    /// provider's process lives by reading its `/proc/<pid>/stat` (`isProcessAliveLocked`); with
+    /// no such file, a running provider whose priority had just changed was judged "crashing" and
+    /// its caller left waiting 20 s for it to start again -- Roblox's game load stalled on the
+    /// MediaProvider so (2026-09-30).
+    fn another(&self, path: &[u8]) -> Option<std::sync::Arc<Process>> {
+        let rest = std::str::from_utf8(path.strip_prefix(b"/proc/")?).ok()?;
+        let (first, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let pid: i32 = first.parse().ok()?;
+        if pid == self.sys.pid || !OF_ANOTHER.contains(&tail) {
+            return None;
+        }
+        crate::process::all_live().into_iter().find(|q| q.sys.pid == pid && !q.has_exited())
+    }
+}
+
 impl ProcFs for Process {
     fn node(&self, path: &[u8]) -> Option<Node> {
+        if let Some(q) = self.another(path) {
+            return q.node(path);
+        }
         if let Some(blob) = self.blob(path) {
             return Some(Node::Blob { size: blob.len() as u64 });
         }
@@ -748,6 +774,9 @@ impl ProcFs for Process {
     }
 
     fn list(&self, path: &[u8]) -> Vec<DirEnt> {
+        if let Some(q) = self.another(path) {
+            return q.list(path);
+        }
         let named = |name: String, kind: u8| {
             let mut full = path.to_vec();
             full.push(b'/');
@@ -762,6 +791,9 @@ impl ProcFs for Process {
     }
 
     fn read(&self, path: &[u8]) -> Option<Vec<u8>> {
+        if let Some(q) = self.another(path) {
+            return q.read(path);
+        }
         if let Some(blob) = self.blob(path) {
             return Some(blob.to_vec());
         }

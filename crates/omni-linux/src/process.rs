@@ -100,6 +100,11 @@ pub fn all_live() -> Vec<Arc<Process>> {
 }
 
 impl Process {
+    /// Whether it has exited (and is kept only until it is waited for).
+    pub(crate) fn has_exited(&self) -> bool {
+        self.exit.lock().is_some()
+    }
+
     /// Bytes its translation cache has committed (0 without a shared cache).
     #[must_use]
     pub fn code_cache_committed(&self) -> u64 {
