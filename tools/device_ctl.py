@@ -37,14 +37,21 @@ def run(instance: Path, command: str, uid=None, timeout=300.0):
     os.replace(ctl / f"{ident}.part", ctl / f"{ident}.cmd")
     t, deadline = time.time(), time.time() + timeout
     rc, out = ctl / f"{ident}.rc", ctl / f"{ident}.out"
-    while not rc.exists():
+    while True:
         if time.time() > deadline:
             raise SystemExit(f"timed out after {timeout} s")
-        time.sleep(0.01)
-    code = int(rc.read_text().strip() or -1)
-    output = out.read_text(errors="replace") if out.exists() else ""
-    rc.unlink(missing_ok=True)
-    out.unlink(missing_ok=True)
+        try:
+            # A file just renamed into place can be held a moment (a virus scanner): read it again.
+            code = int(rc.read_text().strip() or -1)
+            output = out.read_text(errors="replace") if out.exists() else ""
+            break
+        except (FileNotFoundError, PermissionError):
+            time.sleep(0.01)
+    for f in (rc, out):
+        try:
+            f.unlink(missing_ok=True)
+        except PermissionError:
+            pass
     return code, output, time.time() - t
 
 

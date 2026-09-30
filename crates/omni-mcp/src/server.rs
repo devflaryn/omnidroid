@@ -734,6 +734,14 @@ impl Server {
         } else {
             return Err(RpcError::params("no instance and no `path`"));
         };
+        // A frame written after this call: the display's PNG is rewritten every second or so, and
+        // one taken right after start_instance answered could still be the frame before the app
+        // (every probe screenshot of the 2026-10-01 demo was). At most 3 s.
+        let asked = std::time::SystemTime::now();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::fs::metadata(&path).and_then(|m| m.modified()).map_or(true, |t| t < asked) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         if !path.is_file() {
             return Err(RpcError::server(format!("no frame yet at {} (still booting?)", path.display())));
         }

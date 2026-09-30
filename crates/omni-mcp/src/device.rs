@@ -127,6 +127,24 @@ impl Device {
         let _ = std::fs::write(self.tmp("stop"), "1");
     }
 
+    /// The apps installed on the device (not the image's): `/data/app/<random>/<package>-<random>/`,
+    /// each with its `base.apk`. (A package name has no `-`; the random part can.)
+    #[must_use]
+    pub fn installed_packages(&self) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(self.dir.join("data/app"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|outer| std::fs::read_dir(outer.path()).into_iter().flatten().flatten())
+            .filter(|inner| inner.path().join("base.apk").is_file())
+            .filter_map(|inner| inner.file_name().to_string_lossy().split('-').next().map(str::to_string))
+            .filter(|p| !p.is_empty())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// The APK the device holds for `package` (the installed bytes), if it has one.
     #[must_use]
     pub fn installed_apk(&self, package: &str) -> Option<PathBuf> {
@@ -308,15 +326,11 @@ fn pm_install_flags() -> String {
 pub fn install(device: &Device, apk: &Apk) -> Result<Installed, String> {
     let t = Instant::now();
     let limit = Duration::from_secs(300);
-    // Other test apps (third-party packages) go first.
-    let (_, listed) = device.shell("pm list packages -3", Duration::from_secs(60))?;
-    let others: Vec<String> = listed.lines().filter_map(|l| l.trim().strip_prefix("package:")).filter(|p| *p != apk.package).map(str::to_string).collect();
-    if !others.is_empty() {
-        let script: String = others.iter().map(|p| format!("pm uninstall {p}; ")).collect();
-        device.shell(&script, limit)?;
-    }
-    let held = listed.lines().any(|l| l.trim().strip_prefix("package:") == Some(apk.package.as_str()));
-    if held {
+    // What the device holds is read from its /data on the host: no round trip to decide.
+    let installed = device.installed_packages();
+    let others: Vec<String> = installed.iter().filter(|p| **p != apk.package).cloned().collect();
+    let held = installed.iter().any(|p| *p == apk.package);
+    if held && others.is_empty() {
         if let Some(base) = device.installed_apk(&apk.package) {
             if sha256_file(&base).is_ok_and(|h| h == apk.sha256) {
                 return Ok(Installed { action: "reused", uninstalled: others, seconds: t.elapsed().as_secs_f64(), pm: String::new() });
@@ -330,10 +344,15 @@ pub fn install(device: &Device, apk: &Apk) -> Result<Installed, String> {
     std::fs::copy(&apk.path, drop.join(&name)).map_err(|e| format!("the APK to the device: {e}"))?;
     let guest = format!("/data/local/tmp/omni-apk/{name}");
     let flags = pm_install_flags();
-    let (mut code, mut said) = device.shell(&format!("pm install {flags} {guest}"), limit)?;
+    // Other test apps go first, in the same command.
+    let first: String = others.iter().map(|p| format!("pm uninstall {p} >/dev/null 2>&1; ")).collect();
+    let (mut code, mut said) = device.shell(&format!("{first}pm install {flags} {guest}"), limit)?;
     let mut action = if held { "reinstalled" } else { "installed" };
-    if code != 0 && (said.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") || said.contains("signatures do not match")) {
-        let (c, s) = device.shell(&format!("pm uninstall {}; pm install {flags} {guest}", apk.package), limit)?;
+    // Other bytes of the installed package that pm refuses to put over it -- another signature, or
+    // a lower versionCode (`-d` only lets a debuggable app go down) -- replace it: uninstalled first.
+    let refused = ["INSTALL_FAILED_UPDATE_INCOMPATIBLE", "signatures do not match", "INSTALL_FAILED_VERSION_DOWNGRADE"];
+    if code != 0 && refused.iter().any(|r| said.contains(r)) {
+        let (c, s) = device.shell(&format!("pm uninstall {} >/dev/null 2>&1; pm install {flags} {guest}", apk.package), limit)?;
         (code, said, action) = (c, s, "reinstalled-after-uninstall");
     }
     let _ = std::fs::remove_file(drop.join(&name));
@@ -415,6 +434,10 @@ mod tests {
         let d = Device { dir: dir.clone() };
         assert_eq!(d.installed_apk("com.example.a"), Some(base));
         assert_eq!(d.installed_apk("com.example"), None, "a prefix is not the package");
+        let other = dir.join("data/app/~~z==/com.other.app-a-b==/base.apk");
+        std::fs::create_dir_all(other.parent().unwrap()).expect("dirs");
+        std::fs::write(&other, b"apk").expect("base.apk");
+        assert_eq!(d.installed_packages(), ["com.example.a", "com.other.app"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
