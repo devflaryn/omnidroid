@@ -60,6 +60,15 @@ static int server(int port) {
     return 0;
 }
 
+// A non-blocking socket whose connect to `a` was refused: EINPROGRESS, then poll reports it.
+static int refused_socket(const struct sockaddr_in* a) {
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int r = connect(s, (const struct sockaddr*)a, sizeof(*a));
+    struct pollfd p = {s, POLLOUT, 0};
+    check(r == -1 && errno == EINPROGRESS && poll(&p, 1, 5000) == 1, "refused connect: EINPROGRESS, then ready");
+    return s;
+}
+
 static int client(int port, int reach) {
     int c = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = lo(port);
@@ -87,6 +96,19 @@ static int client(int port, int reach) {
         getsockopt(cn, SOL_SOCKET, SO_ERROR, &soerr2, &sl);
         check(rn == -1 && en == EINPROGRESS && polled == 1 && (pn.revents & (POLLOUT | POLLERR)) && soerr == ECONNREFUSED, "non-blocking tcp: EINPROGRESS, then SO_ERROR ECONNREFUSED");
         check(soerr2 == 0, "SO_ERROR is cleared once read");
+        // The refusal is the socket's pending error: whichever call comes first reports it, once.
+        int s1 = refused_socket(&a);
+        ssize_t x1 = send(s1, "x", 1, MSG_NOSIGNAL);
+        int e1 = errno;
+        ssize_t x2 = send(s1, "x", 1, MSG_NOSIGNAL);
+        check(x1 == -1 && e1 == ECONNREFUSED && x2 == -1 && errno == EPIPE, "send reports the refusal once, then EPIPE");
+        int s2 = refused_socket(&a);
+        char rb[4];
+        check(recv(s2, rb, sizeof(rb), 0) == -1 && errno == ECONNREFUSED, "recv reports the refusal");
+        int s3 = refused_socket(&a);
+        check(connect(s3, (struct sockaddr*)&a, sizeof(a)) == -1 && errno == ECONNREFUSED, "a second connect reports the refusal");
+        int s4 = refused_socket(&a);
+        check(write(s4, "x", 1) == -1 && errno == ECONNREFUSED, "write reports the refusal");
         // The wildcard as a destination is the host's loopback on Linux and macOS: it must name
         // the namespace's ports as 127.0.0.1 does, never the host's.
         struct sockaddr_in w = a;
