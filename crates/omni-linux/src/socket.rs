@@ -195,7 +195,8 @@ impl Drop for Socket {
             channel.open[*side].store(false, std::sync::atomic::Ordering::SeqCst);
             crate::poll::notify_key(Arc::as_ptr(channel) as crate::poll::Key);
         }
-        if let Some(Peer::Host(_)) = &self.peer {
+        if let Some(Peer::Host(host)) = &self.peer {
+            host.release();
             self.peer = None;
             crate::hostnet::wake();
         }

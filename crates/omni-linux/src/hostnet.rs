@@ -194,6 +194,35 @@ pub fn sockaddr(addr: &SocketAddress) -> Vec<u8> {
     }
 }
 
+/// `::ffff:0.0.0.0`: the wildcard as an IPv4 address on an IPv6 socket.
+fn is_mapped_wildcard(raw: &[u8]) -> bool {
+    u16::from_le_bytes([raw.first().copied().unwrap_or(0), raw.get(1).copied().unwrap_or(0)]) == AF_INET6
+        && raw.get(8..24).is_some_and(|a| a[..10].iter().all(|b| *b == 0) && a[10] == 0xff && a[11] == 0xff && a[12..].iter().all(|b| *b == 0))
+}
+
+/// A destination the host routes to its own loopback: a loopback address, or the wildcard (Linux
+/// and macOS connect and send to `0.0.0.0` as to loopback). In a namespace both name the
+/// namespace's ports, never the host's.
+fn is_local_dest(raw: &[u8]) -> bool {
+    crate::loopns::is_loopback(raw) || crate::loopns::is_wildcard(raw) || is_mapped_wildcard(raw)
+}
+
+/// The host address a local destination resolves to: the same address with the host's port, a
+/// wildcard destination as the loopback of its family (Windows refuses to connect to `0.0.0.0`).
+fn loopback_dest(raw: &[u8], port: u16) -> Vec<u8> {
+    let mut out = crate::loopns::with_port(raw, port);
+    if is_mapped_wildcard(raw) {
+        out[20..24].copy_from_slice(&[127, 0, 0, 1]);
+    } else if crate::loopns::is_wildcard(raw) {
+        if out[0] == 2 {
+            out[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        } else {
+            out[23] = 1; // ::1
+        }
+    }
+    out
+}
+
 /// `addr` with another port.
 fn with_sa_port(addr: SocketAddress, port: u16) -> SocketAddress {
     match addr {
@@ -344,7 +373,7 @@ impl Host {
         let host_addr = parse(self.domain, &crate::loopns::with_port(raw, 0))?;
         self.sock_mut().bind(&host_addr).map_err(|e| errno(&e))?;
         let host = self.host_port()?;
-        let shared = self.state.lock().reuse;
+        let shared = self.state.lock().reuse && !self.stream;
         match ns.bind(self.proto(), guest, host, shared) {
             Ok(b) => self.held.lock().push(b),
             Err(e) => {
@@ -366,15 +395,35 @@ impl Host {
     /// port no socket of the namespace holds.
     fn resolve(&self, raw: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
         let Some(ns) = &self.ns else { return Ok(None) };
-        if !crate::loopns::is_loopback(raw) {
+        if !is_local_dest(raw) {
             return Ok(None);
         }
         let host = ns.lookup(self.proto(), crate::loopns::port_of(raw)).ok_or(ECONNREFUSED)?;
         if !self.state.lock().bound {
-            let local = if self.stream { crate::loopns::with_port(raw, 0) } else { crate::loopns::wildcard(self.domain) };
+            let local = if self.stream && crate::loopns::is_loopback(raw) { crate::loopns::with_port(raw, 0) } else { crate::loopns::wildcard(self.domain) };
             self.bind(&local)?;
         }
-        Ok(Some(crate::loopns::with_port(raw, host)))
+        Ok(Some(loopback_dest(raw, host)))
+    }
+
+    /// The guest closed its last descriptor: its ports in the namespace are free at once. The host
+    /// socket itself is closed when the watcher lets go of it (its port is the host's, never the
+    /// guest's), which may be a moment later.
+    pub fn release(&self) {
+        self.held.lock().clear();
+    }
+
+    /// The host socket replaced by a fresh unbound one and the namespace entries it held
+    /// released: the guest's socket as it was before its bind (or its host-side connect).
+    fn unbind(&self) -> Result<(), Errno> {
+        *self.sock_mut() = Self::fresh(self.domain, self.stream)?;
+        self.held.lock().clear();
+        *self.guest_port.lock() = None;
+        let mut st = self.state.lock();
+        st.bound = false;
+        st.connected = false;
+        st.connecting = false;
+        Ok(())
     }
 
     /// `connect(addr)`: a datagram socket's default peer; a stream's connection, waited for unless
@@ -384,17 +433,32 @@ impl Host {
     /// `EISCONN`, `EALREADY`, `EINPROGRESS`, `EINTR` (the connection goes on), and the connection's
     /// own failure (`ECONNREFUSED`, `ETIMEDOUT`, `ENETUNREACH`, ...).
     pub fn connect(&self, raw: &[u8], nonblocking: bool, t: &Task) -> Result<(), Errno> {
-        if !self.stream && self.ns.is_some() && crate::loopns::is_loopback(raw) {
-            // Connecting a datagram socket only names its peer (Linux): resolved at each send, so
-            // a send before the peer binds is dropped and a peer that binds later is reached.
-            if !self.state.lock().bound {
-                self.bind(&crate::loopns::wildcard(self.domain))?;
+        if !self.stream {
+            // A datagram socket's connect replaces the peer it named before.
+            let was_named = self.guest_peer.lock().take().is_some();
+            if self.ns.is_some() {
+                let local = is_local_dest(raw);
+                if local && self.state.lock().connected && !was_named {
+                    // Host-connected to another peer: the host socket cannot be un-connected.
+                    self.unbind()?;
+                }
+                if !self.state.lock().bound {
+                    self.bind(&crate::loopns::wildcard(self.domain))?;
+                }
+                if local {
+                    // Connecting a datagram socket only names its peer (Linux): resolved at each
+                    // send, so a send before the peer binds is dropped and a peer that binds later
+                    // is reached.
+                    *self.guest_peer.lock() = Some(raw.to_vec());
+                    let mut st = self.state.lock();
+                    st.connected = true;
+                    st.bound = true;
+                    return Ok(());
+                }
+                if was_named {
+                    self.state.lock().connected = false;
+                }
             }
-            *self.guest_peer.lock() = Some(raw.to_vec());
-            let mut st = self.state.lock();
-            st.connected = true;
-            st.bound = true;
-            return Ok(());
         }
         let translated = self.resolve(raw)?;
         if translated.is_some() {
@@ -548,7 +612,9 @@ impl Host {
             let mut sock = sock;
             sock.set_nonblocking(true).map_err(|e| errno(&e))?;
             let state = State { bound: true, connected: true, ..State::default() };
-            return Ok((Self::adopt(sock, self.domain, true, state, self.ns.clone()), raw_peer));
+            let accepted = Self::adopt(sock, self.domain, true, state, self.ns.clone());
+            *accepted.guest_port.lock() = *self.guest_port.lock();
+            return Ok((accepted, raw_peer));
         }
     }
 
@@ -618,6 +684,9 @@ impl Host {
     }
 
     fn send_inner(&self, bytes: &[u8], to: Option<&[u8]>, _flags: u64, nonblocking: bool, t: &Task) -> Result<usize, Errno> {
+        if self.ns.is_some() && !self.stream && !self.state.lock().bound {
+            self.bind(&crate::loopns::wildcard(self.domain))?;
+        }
         let named_peer = if self.stream { None } else { self.guest_peer.lock().clone() };
         let to = to.or(named_peer.as_deref());
         let dest = match to {
@@ -706,75 +775,103 @@ impl Host {
         let deadline = self.deadline(false);
         let peek = flags & MSG_PEEK != 0;
         let waitall = self.stream && !nonblocking && !peek && flags & MSG_WAITALL != 0;
-        'next: loop {
-            let mut done = 0;
-            let mut from = None;
-            loop {
-                let r = self.retry(IN, nonblocking, deadline, t, || {
-                    if self.stream && self.still_connecting()? {
-                        return Err(EAGAIN);
-                    }
-                    let s = self.sock.read();
-                    let into = &mut buf[done..];
-                    let r = if peek {
-                        s.peek(into)
-                    } else if self.stream {
-                        s.recv(into).map(|n| (n, None))
-                    } else {
-                        s.recv_from(into).map(|(n, a)| (n, Some(a)))
-                    };
-                    match r {
-                        Ok(v) => Ok(v),
-                        // Winsock reports an ICMP port-unreachable for an earlier datagram on the next
-                        // receive; Linux reports it only on a connected socket, as ECONNREFUSED.
-                        Err(e) if !self.stream && e.kind() == Some(NetErrorKind::ConnectionReset) => {
-                            if self.state.lock().connected { Err(ECONNREFUSED) } else { Err(EAGAIN) }
-                        }
-                        // A datagram larger than the buffer: what fit, the rest discarded.
-                        Err(e) if !self.stream && e.kind() == Some(NetErrorKind::MessageSize) => Ok((into.len(), None)),
-                        Err(e) => Err(errno(&e)),
-                    }
-                });
+        if let (Some(ns), false) = (&self.ns, self.stream) {
+            return self.recv_datagram(ns, buf, peek, nonblocking, deadline, t);
+        }
+        let mut done = 0;
+        let mut from = None;
+        loop {
+            let r = self.retry(IN, nonblocking, deadline, t, || {
+                if self.stream && self.still_connecting()? {
+                    return Err(EAGAIN);
+                }
+                let s = self.sock.read();
+                let into = &mut buf[done..];
+                let r = if peek {
+                    s.peek(into)
+                } else if self.stream {
+                    s.recv(into).map(|n| (n, None))
+                } else {
+                    s.recv_from(into).map(|(n, a)| (n, Some(a)))
+                };
                 match r {
-                    Ok((n, a)) => {
-                        done += n;
-                        from = from.or(a);
-                        if !waitall || n == 0 || done >= buf.len() {
-                            break;
-                        }
+                    Ok(v) => Ok(v),
+                    // Winsock reports an ICMP port-unreachable for an earlier datagram on the next
+                    // receive; Linux reports it only on a connected socket, as ECONNREFUSED.
+                    Err(e) if !self.stream && e.kind() == Some(NetErrorKind::ConnectionReset) => {
+                        if self.state.lock().connected { Err(ECONNREFUSED) } else { Err(EAGAIN) }
                     }
-                    Err(_) if done > 0 => break,
-                    Err(e) => return Err(e),
+                    // A datagram larger than the buffer: what fit, the rest discarded.
+                    Err(e) if !self.stream && e.kind() == Some(NetErrorKind::MessageSize) => Ok((into.len(), None)),
+                    Err(e) => Err(errno(&e)),
                 }
-            }
-            if let (Some(ns), false, Some(src)) = (&self.ns, self.stream, from) {
-                let raw_src = sockaddr(&self.guest_family(src));
-                if crate::loopns::is_loopback(&raw_src) {
-                    let peer = self.guest_peer.lock().as_deref().map(crate::loopns::port_of);
-                    match ns.guest_port(crate::loopns::Proto::Udp, crate::loopns::port_of(&raw_src)) {
-                        // Connected to a loopback peer: only that peer's datagrams (the host socket
-                        // is not connected, so this is where Linux's filter is kept).
-                        Some(g) if peer.is_some_and(|p| p != g) => {
-                            if peek {
-                                let mut scratch = vec![0u8; 64 << 10];
-                                let _ = self.sock.read().recv_from(&mut scratch);
-                            }
-                            continue 'next;
-                        }
-                        Some(g) => return Ok((done, Some(with_sa_port(src, g)))),
-                        // Another namespace's datagram (or a host program's): dropped, and the
-                        // wait goes on. A peek saw it without taking it: taken now, then dropped.
-                        None => {
-                            if peek {
-                                let mut scratch = vec![0u8; 64 << 10];
-                                let _ = self.sock.read().recv_from(&mut scratch);
-                            }
-                            continue 'next;
-                        }
+            });
+            match r {
+                Ok((n, a)) => {
+                    done += n;
+                    from = from.or(a);
+                    if !waitall || n == 0 || done >= buf.len() {
+                        break;
                     }
                 }
+                Err(_) if done > 0 => break,
+                Err(e) => return Err(e),
             }
-            return Ok((done, from));
+        }
+        Ok((done, from))
+    }
+
+    /// A datagram receive in a namespace: the datagram is taken whole (64 KiB, the most UDP
+    /// carries) so its source is always known -- an oversized one included, which Winsock would
+    /// otherwise refuse with no source -- and only what the namespace lets through is passed on:
+    /// from a loopback port of the namespace (shown as its guest port), or from a non-loopback
+    /// address; and, on a socket connected to a loopback peer, only from that peer. What does
+    /// not pass is dropped and the wait goes on. The guest's buffer takes what fits (Linux).
+    fn recv_datagram(&self, ns: &crate::loopns::Namespace, buf: &mut [u8], peek: bool, nonblocking: bool, deadline: Option<Instant>, t: &Task) -> Result<(usize, Option<SocketAddress>), Errno> {
+        let mut scratch = vec![0u8; 64 << 10];
+        loop {
+            let (n, src) = self.retry(IN, nonblocking, deadline, t, || {
+                let s = self.sock.read();
+                let r = if peek { s.peek(&mut scratch) } else { s.recv_from(&mut scratch).map(|(n, a)| (n, Some(a))) };
+                match r {
+                    Ok(v) => Ok(v),
+                    // As in `recv`: Winsock's late ICMP port-unreachable.
+                    Err(e) if e.kind() == Some(NetErrorKind::ConnectionReset) => {
+                        if self.state.lock().connected { Err(ECONNREFUSED) } else { Err(EAGAIN) }
+                    }
+                    Err(e) => Err(errno(&e)),
+                }
+            })?;
+            let peer = self.guest_peer.lock().as_deref().map(crate::loopns::port_of);
+            let shown = match src {
+                Some(src) => {
+                    let raw_src = sockaddr(&self.guest_family(src));
+                    if crate::loopns::is_loopback(&raw_src) {
+                        match ns.guest_port(crate::loopns::Proto::Udp, crate::loopns::port_of(&raw_src)) {
+                            Some(g) if peer.is_none_or(|p| p == g) => Some(with_sa_port(src, g)),
+                            _ => None,
+                        }
+                    } else if peer.is_none() {
+                        Some(src)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            match shown {
+                Some(from) => {
+                    let k = n.min(buf.len());
+                    buf[..k].copy_from_slice(&scratch[..k]);
+                    return Ok((k, Some(from)));
+                }
+                None => {
+                    // Dropped. A peek saw it without taking it: taken now.
+                    if peek {
+                        let _ = self.sock.read().recv_from(&mut scratch);
+                    }
+                }
+            }
         }
     }
 

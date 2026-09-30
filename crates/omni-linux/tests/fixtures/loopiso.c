@@ -68,6 +68,16 @@ static int client(int port, int reach) {
         check(poll(&p, 1, 5000) == 1 && recv(u, got, sizeof(got), 0) == 4 && memcmp(got, "ping", 4) == 0, "udp reply to an unbound client");
     } else {
         check(r == -1 && errno == ECONNREFUSED, "tcp: refused");
+        // The wildcard as a destination is the host's loopback on Linux and macOS: it must name
+        // the namespace's ports as 127.0.0.1 does, never the host's.
+        struct sockaddr_in w = a;
+        w.sin_addr.s_addr = htonl(INADDR_ANY);
+        int cw = socket(AF_INET, SOCK_STREAM, 0);
+        check(connect(cw, (struct sockaddr*)&w, sizeof(w)) == -1 && errno == ECONNREFUSED, "tcp to 0.0.0.0: refused");
+        int uw = socket(AF_INET, SOCK_DGRAM, 0);
+        sendto(uw, "ping", 4, 0, (struct sockaddr*)&w, sizeof(w));
+        struct pollfd pw = {uw, POLLIN, 0};
+        check(poll(&pw, 1, 1500) == 0, "udp to 0.0.0.0: nothing comes back");
         int u = socket(AF_INET, SOCK_DGRAM, 0);
         sendto(u, "ping", 4, 0, (struct sockaddr*)&a, sizeof(a));
         struct pollfd p = {u, POLLIN, 0};
@@ -94,6 +104,10 @@ static int self_checks(void) {
     struct sockaddr_in peer;
     socklen_t plen = sizeof(peer);
     check(getpeername(c4, (struct sockaddr*)&peer, &plen) == 0 && ntohs(peer.sin_port) == 47111, "getpeername shows the guest port");
+    int acc = accept(s6, NULL, NULL);
+    struct sockaddr_in6 an;
+    socklen_t alen = sizeof(an);
+    check(acc >= 0 && getsockname(acc, (struct sockaddr*)&an, &alen) == 0 && ntohs(an.sin6_port) == 47111, "an accepted socket shows the guest port");
     int two = socket(AF_INET6, SOCK_STREAM, 0);
     check(bind(two, (struct sockaddr*)&w6, sizeof(w6)) == -1 && errno == EADDRINUSE, "a held port: EADDRINUSE");
     // UDP connect names a peer, as Linux: it succeeds before the peer binds, the early send is
