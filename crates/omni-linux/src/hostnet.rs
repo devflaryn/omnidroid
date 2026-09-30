@@ -244,6 +244,10 @@ pub fn eligible(domain: u64, ty: u64, protocol: u64) -> bool {
 struct State {
     bound: bool,
     connecting: bool,
+    /// A non-blocking connect to a loopback port the namespace does not hold: Linux answers such
+    /// a connect `EINPROGRESS` and then reports the refusal (readable, writable, in error, hung
+    /// up; `SO_ERROR` once), so the socket carries it as a failed connect the host never saw.
+    refused: bool,
     connected: bool,
     listening: bool,
     shut_rd: bool,
@@ -413,6 +417,11 @@ impl Host {
         self.held.lock().clear();
     }
 
+    /// A refused connect's pending error, taken: reported once, as Linux's `sk_err` is.
+    fn take_refused(&self) -> bool {
+        std::mem::take(&mut self.state.lock().refused)
+    }
+
     /// The host socket replaced by a fresh unbound one and the namespace entries it held
     /// released: the guest's socket as it was before its bind (or its host-side connect).
     fn unbind(&self) -> Result<(), Errno> {
@@ -460,7 +469,18 @@ impl Host {
                 }
             }
         }
-        let translated = self.resolve(raw)?;
+        if self.stream && self.take_refused() {
+            return Err(ECONNREFUSED);
+        }
+        let translated = match self.resolve(raw) {
+            Err(e) if e == ECONNREFUSED && nonblocking && self.stream => {
+                self.state.lock().refused = true;
+                crate::poll::notify();
+                wake();
+                return Err(EINPROGRESS);
+            }
+            other => other?,
+        };
         if translated.is_some() {
             *self.guest_peer.lock() = Some(raw.to_vec());
         }
@@ -684,6 +704,9 @@ impl Host {
     }
 
     fn send_inner(&self, bytes: &[u8], to: Option<&[u8]>, _flags: u64, nonblocking: bool, t: &Task) -> Result<usize, Errno> {
+        if self.stream && self.take_refused() {
+            return Err(ECONNREFUSED);
+        }
         if self.ns.is_some() && !self.stream && !self.state.lock().bound {
             self.bind(&crate::loopns::wildcard(self.domain))?;
         }
@@ -752,6 +775,9 @@ impl Host {
     /// connected datagram socket's peer port is closed).
     pub fn recv(&self, buf: &mut [u8], flags: u64, nonblocking: bool, t: &Task) -> Result<(usize, Option<SocketAddress>), Errno> {
         let nonblocking = nonblocking || flags & MSG_DONTWAIT != 0;
+        if self.stream && self.take_refused() {
+            return Err(ECONNREFUSED);
+        }
         {
             let st = self.state.lock();
             if st.shut_rd {
@@ -881,6 +907,9 @@ impl Host {
     /// # Errors
     /// As [`send`](Self::send), `EAGAIN` for a send that would wait.
     pub fn try_send(&self, bytes: &[u8]) -> Result<usize, Errno> {
+        if self.stream && self.take_refused() {
+            return Err(ECONNREFUSED);
+        }
         if self.stream && self.still_connecting()? {
             return Err(EAGAIN);
         }
@@ -900,6 +929,9 @@ impl Host {
     /// # Errors
     /// As [`recv`](Self::recv), `EAGAIN` when nothing has arrived.
     pub fn try_recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.stream && self.take_refused() {
+            return Err(ECONNREFUSED);
+        }
         let st = self.state.lock();
         if st.shut_rd {
             return Ok(0);
@@ -1035,6 +1067,9 @@ impl Host {
         match (level, name) {
             (SOL_SOCKET, 4) => {
                 // SO_ERROR: a connect that has settled is settled first, so its failure is here.
+                if self.take_refused() {
+                    return int(ECONNREFUSED.0);
+                }
                 if self.stream && self.state.lock().connecting {
                     let _ = self.settle()?;
                 }
@@ -1161,6 +1196,9 @@ impl Host {
     }
 
     fn bits(&self, host: impl FnOnce() -> Option<platnet::Readiness>) -> u32 {
+        if self.state.lock().refused {
+            return IN | OUT | ERR | HUP;
+        }
         let (idle, shut_rd) = {
             let st = self.state.lock();
             (self.stream && !st.connected && !st.connecting && !st.listening, st.shut_rd)

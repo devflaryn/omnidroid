@@ -74,6 +74,19 @@ static int client(int port, int reach) {
         check(poll(&p, 1, 5000) == 1 && recv(u, got, sizeof(got), 0) == 4 && memcmp(got, "ping", 4) == 0, "udp reply to an unbound client");
     } else {
         check(r == -1 && errno == ECONNREFUSED, "tcp: refused");
+        // Non-blocking, as Linux: EINPROGRESS, then writable and in error, SO_ERROR once.
+        int cn = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        int rn = connect(cn, (struct sockaddr*)&a, sizeof(a));
+        int en = errno;
+        struct pollfd pn = {cn, POLLOUT, 0};
+        int polled = poll(&pn, 1, 5000);
+        int soerr = -1, soerr2 = -1;
+        socklen_t sl = sizeof(soerr);
+        getsockopt(cn, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+        sl = sizeof(soerr2);
+        getsockopt(cn, SOL_SOCKET, SO_ERROR, &soerr2, &sl);
+        check(rn == -1 && en == EINPROGRESS && polled == 1 && (pn.revents & (POLLOUT | POLLERR)) && soerr == ECONNREFUSED, "non-blocking tcp: EINPROGRESS, then SO_ERROR ECONNREFUSED");
+        check(soerr2 == 0, "SO_ERROR is cleared once read");
         // The wildcard as a destination is the host's loopback on Linux and macOS: it must name
         // the namespace's ports as 127.0.0.1 does, never the host's.
         struct sockaddr_in w = a;

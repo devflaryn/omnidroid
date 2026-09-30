@@ -66,7 +66,7 @@ fn another_users_namespace_is_refused_and_may_take_the_same_port() {
     // User 10's app: another namespace.
     let Some((status, out, err)) = common::run_fixture_as(&inst, "loopiso", &["client", "47101", "refused"], 1_010_000) else { return };
     assert!(!out.contains("FAIL"), "{out}\n{err}");
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 5, "{out}\n{err}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 7, "{out}\n{err}");
     assert_eq!(status, ExitStatus::Exited(0));
     server_ok(srv);
 }
