@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--b-env", action="append", default=[])
     ap.add_argument("--b-prop")
     ap.add_argument("--out")
+    ap.add_argument("--gap", type=float, default=2, help="seconds between a stop and the next start")
     a = ap.parse_args()
     dev = find_device()
     if not dev:
@@ -54,8 +55,10 @@ def main():
     for n, arm in enumerate(order):
         if a.what == "launch":
             appenv.write_text("\n".join(a.b_env) + "\n" if arm == "B" else "")
+            if prop_name:
+                run(dev, f"setprop {prop_name} {prop_value if arm == 'B' else (default or chr(39) * 2)}", uid=0)
             run(dev, f"am force-stop {a.package}")
-            time.sleep(2)
+            time.sleep(a.gap)
             code, out, s = run(dev, f"am start -W -n {a.package}/{a.activity}")
             total = next((int(l.split(":")[1]) for l in out.splitlines() if l.startswith("TotalTime:")), None)
             row = {"n": n, "arm": arm, "wall_s": round(s, 2), "total_ms": total, "ok": "Status: ok" in out}

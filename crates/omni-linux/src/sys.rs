@@ -36,6 +36,13 @@ impl SysState {
         Self { pid, uid: uid.into(), gid: uid.into(), groups: Mutex::default(), caps: (if uid == 0 { ALL_CAPS } else { 0 }).into(), keepcaps: false.into(), start: Instant::now(), actions: Mutex::new([[0; 32]; 65]), umask: std::sync::atomic::AtomicU32::new(0o022), seccomp: crate::seccomp::Seccomp::default() }
     }
 
+    /// Become `uid` (and its group), as a zygote child becomes its app: no capabilities kept.
+    pub(crate) fn become_user(&self, uid: u32) {
+        self.uid.store(uid, std::sync::atomic::Ordering::Relaxed);
+        self.gid.store(uid, std::sync::atomic::Ordering::Relaxed);
+        self.set_caps(0);
+    }
+
     #[must_use]
     pub fn uid(&self) -> u32 {
         self.uid.load(std::sync::atomic::Ordering::Relaxed)

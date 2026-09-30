@@ -9,6 +9,11 @@ use std::process::ExitCode;
 use omni_linux::{ExitStatus, Output, Process, SpawnConfig};
 
 fn main() -> ExitCode {
+    // The host's descriptor limit, as high as it allows: the system's host process holds every
+    // guest process's files and sockets, and Linux's default soft limit (1024) ran out on a boot
+    // pinned to 2 CPUs -- init's services then failed to start ("Too many open files", system_suspend
+    // among them) and the Watchdog ended system_server (2026-10-01, the notebook flow).
+    let _ = omni_platform::process::raise_descriptor_limit();
     omni_linux::poll::start_stats();
     omni_linux::code_trim::start();
     omni_linux::lever::start();
@@ -125,6 +130,11 @@ fn main() -> ExitCode {
                 let launcher = omni_linux::zygote::Launcher { runner, sysroot: sysroot.clone(), instance: instance.clone(), envp: envp.clone(), binder: addr.to_string(), vm_options };
                 omni_linux::zygote::serve(std::sync::Arc::as_ptr(p.vfs.binds()) as usize, launcher);
                 eprintln!("[zygote] /dev/socket/zygote; apps' binder at {addr}");
+                // OMNI_APP_SPARE=1: a spare app process once Android has booted.
+                let sysroot = std::sync::Arc::clone(p.vfs.sysroot());
+                omni_linux::zygote::start_spares_when(move || {
+                    omni_linux::props::PropertyService::global(&sysroot).get("sys.boot_completed").as_deref() == Some("1")
+                });
             }
             Err(e) => eprintln!("[zygote] {e}"),
         }

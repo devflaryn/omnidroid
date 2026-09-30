@@ -31,8 +31,13 @@ pub struct Launcher {
 /// Bind `/dev/socket/zygote` in `instance` (the key a process's sockets are named in) and answer
 /// it on host threads.
 pub fn serve(instance: usize, launcher: Launcher) {
-    serve_at(instance, b"/dev/socket/zygote", Arc::new(launcher));
+    let launcher = Arc::new(launcher);
+    let _ = LAUNCHER.set(Arc::clone(&launcher));
+    serve_at(instance, b"/dev/socket/zygote", launcher);
 }
+
+/// The launcher `serve` was given: what a spare app process is started with.
+static LAUNCHER: std::sync::OnceLock<Arc<Launcher>> = std::sync::OnceLock::new();
 
 /// Answer the zygote protocol on socket `name` in `instance`.
 fn serve_at(instance: usize, name: &[u8], launcher: Arc<Launcher>) {
@@ -188,9 +193,24 @@ pub fn signal(pid: i32, sig: i32) -> Option<()> {
     Some(())
 }
 
-/// Launch `class args...` in a host process of its own; the pid it runs under.
+/// Launch `class args...` in a host process of its own; the pid it runs under. With
+/// `OMNI_APP_SPARE=1` a spare app process waiting for an app (`start_spare`) becomes it instead.
 fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String]) -> Option<i32> {
+    if let Some(pid) = take_spare(uid, nice, sdk, class_and_args) {
+        return Some(pid);
+    }
     let pid = crate::process::reserve_pid();
+    let mut cmd = host_command(launcher, pid, uid, nice, &[]);
+    // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
+    cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
+    cmd.args(class_and_args);
+    eprintln!("[zygote] launching {} as pid {pid} uid {uid}: {}", nice.unwrap_or("?"), class_and_args.join(" "));
+    spawn(cmd, pid, uid)
+}
+
+/// An app host process's command, up to the class app_process runs: the runner, the instance,
+/// the system's binder, the pid and uid, the environment, the VM options and the per-app switches.
+fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, env: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new(&launcher.runner);
     cmd.arg("--sysroot").arg(&launcher.sysroot).arg("--instance").arg(&launcher.instance);
     cmd.args(["--binder-server", &launcher.binder, "--binder-credential-stdin", "--pid", &pid.to_string(), "--uid", &uid.to_string()]);
@@ -200,6 +220,9 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
         if !e.starts_with(b"CLASSPATH=") {
             cmd.arg("--env").arg(String::from_utf8_lossy(e).into_owned());
         }
+    }
+    for e in env {
+        cmd.arg("--env").arg(e);
     }
     // One CLOCK_MONOTONIC for the instance: SurfaceFlinger's vsync times are the app's frame times.
     cmd.env("OMNI_MONOTONIC_ORIGIN", crate::sys::monotonic_origin());
@@ -263,10 +286,12 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
             cmd.env(k.trim(), v.trim());
         }
     }
-    // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
-    cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
-    cmd.args(class_and_args);
-    eprintln!("[zygote] launching {} as pid {pid} uid {uid}: {}", nice.unwrap_or("?"), class_and_args.join(" "));
+    cmd
+}
+
+/// Start a prepared host process as pid `pid`, `uid`: its binder credential on its stdin, reaped by
+/// a thread of its own, kept by pid for the signals the system sends it.
+fn spawn(mut cmd: std::process::Command, pid: i32, uid: u32) -> Option<i32> {
     match cmd.spawn() {
         Ok(mut child) => {
             let cred = crate::remote::issue_credential(pid, uid);
@@ -299,6 +324,88 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
             None
         }
     }
+}
+
+/// **A spare app process** (`OMNI_APP_SPARE=1`): an app host process started before the app it will
+/// be is known -- its host process, ART and its binder up, as a zygote's unspecialised process is
+/// -- waiting in `com.omnidroid.spare.Spare` (`/vendor/framework/omni-spare.jar`) for a file that
+/// names the app: `<uid> <target sdk> <class> [args...]`. The pid it was started under is the one
+/// the zygote's reply gives ActivityManager, its uid is rebound (`remote::rebind_uid`) before it
+/// runs WrapperInit, and a new spare is started some seconds after (`OMNI_APP_SPARE_DELAY_S`,
+/// default 20, so it does not compete with the app it replaced).
+struct Spare {
+    pid: i32,
+    /// The host path of the file it waits for.
+    go: PathBuf,
+}
+
+static SPARE: parking_lot::Mutex<Option<Spare>> = parking_lot::Mutex::new(None);
+
+fn spares() -> bool {
+    std::env::var("OMNI_APP_SPARE").as_deref() == Ok("1")
+}
+
+/// Start the first spare once `ready` (Android has booted), and keep one after.
+pub fn start_spares_when(ready: impl Fn() -> bool + Send + 'static) {
+    if !spares() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("zygote-spare".into()).spawn(move || {
+        while !ready() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        start_spare();
+    });
+}
+
+/// Start a spare app process, unless one waits.
+fn start_spare() {
+    let Some(launcher) = LAUNCHER.get() else { return };
+    if SPARE.lock().is_some() {
+        return;
+    }
+    let pid = crate::process::reserve_pid();
+    let guest = format!("/data/local/tmp/omni-spare/{pid}");
+    let Some(go) = crate::vfs::host_path(&launcher.instance, guest.trim_start_matches('/').as_bytes()) else { return };
+    if let Some(dir) = go.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::remove_file(&go);
+    let mut cmd = host_command(launcher, pid, 0, Some("omni-spare"), &["CLASSPATH=/vendor/framework/omni-spare.jar"]);
+    cmd.args(["com.omnidroid.spare.Spare", &guest]);
+    if spawn(cmd, pid, 0).is_some() {
+        eprintln!("[zygote] a spare app process as pid {pid}");
+        *SPARE.lock() = Some(Spare { pid, go });
+    }
+}
+
+/// The waiting spare becomes `class args...` as `uid`: its pid, or `None` (no spare, or it ended).
+fn take_spare(uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String]) -> Option<i32> {
+    if !spares() {
+        return None;
+    }
+    // `OMNI_APP_SPARE=0` in the per-app switches: this start does without (an A/B on one device).
+    let off = std::env::var_os("OMNI_APP_ENV_FILE").and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|t| t.lines().any(|l| l.trim() == "OMNI_APP_SPARE=0"));
+    if off {
+        return None;
+    }
+    let spare = SPARE.lock().take()?;
+    if !CHILDREN.lock().contains_key(&spare.pid) {
+        return None;
+    }
+    crate::remote::rebind_uid(spare.pid, uid);
+    let part = spare.go.with_extension("part");
+    let line = format!("{uid} {sdk} {}", class_and_args.join(" "));
+    if std::fs::write(&part, line).is_err() || std::fs::rename(&part, &spare.go).is_err() {
+        return None;
+    }
+    eprintln!("[zygote] launching {} as pid {} uid {uid} (the spare process): {}", nice.unwrap_or("?"), spare.pid, class_and_args.join(" "));
+    let delay = std::env::var("OMNI_APP_SPARE_DELAY_S").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(delay));
+        start_spare();
+    });
+    Some(spare.pid)
 }
 
 #[cfg(test)]

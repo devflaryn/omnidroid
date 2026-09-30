@@ -40,6 +40,8 @@ pub const FILES: &[(&str, &[u8])] = &[
     ("/vendor/bin/omni_lean.sh", include_bytes!("../device/vendor/bin/omni_lean.sh")),
     // The boot's own settings: no dexopt at install (the file says why).
     ("/vendor/etc/init/omni_boot.rc", include_bytes!("../device/vendor/etc/init/omni_boot.rc")),
+    // A spare app process's entry point (`device/src/spare/`; `crate::zygote`'s spare).
+    ("/vendor/framework/omni-spare.jar", include_bytes!("../device/vendor/framework/omni-spare.jar")),
     // The framework's configuration as this device has it: a static overlay (RRO), as a vendor
     // partition carries one (`device/src/overlay/`; the values file says why each is there).
     ("/vendor/overlay/omni-device-overlay.apk", include_bytes!("../device/vendor/overlay/omni-device-overlay.apk")),

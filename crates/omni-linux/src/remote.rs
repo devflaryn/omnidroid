@@ -450,6 +450,7 @@ pub fn serve(sysroot: Arc<crate::vfs::Sysroot>) -> std::io::Result<std::net::Soc
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     let server = Arc::new(Server { sysroot, stand_ins: Mutex::default(), opens: Mutex::default() });
+    let _ = SERVING.set(Arc::clone(&server));
     std::thread::Builder::new().name("binder-remote".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let _ = stream.set_nodelay(true);
@@ -458,6 +459,23 @@ pub fn serve(sysroot: Arc<crate::vfs::Sysroot>) -> std::io::Result<std::net::Soc
         }
     })?;
     Ok(addr)
+}
+
+/// This host process's binder listener, once it serves (`serve`).
+static SERVING: OnceLock<Arc<Server>> = OnceLock::new();
+
+/// Process `pid` becomes `uid` (and its group): its credential's identity, and its stand-in's
+/// ids when it has opened the binder already -- a spare app process (`crate::zygote`), started
+/// as root before the app it becomes was known, and given its uid before it makes a call.
+pub fn rebind_uid(pid: i32, uid: u32) {
+    for (_, (p, u)) in issued().lock().iter_mut() {
+        if *p == pid {
+            *u = uid;
+        }
+    }
+    if let Some(p) = SERVING.get().and_then(|s| s.stand_ins.lock().get(&pid).and_then(Weak::upgrade)) {
+        p.sys.become_user(uid);
+    }
 }
 
 impl Server {
