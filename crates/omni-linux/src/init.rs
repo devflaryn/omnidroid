@@ -621,6 +621,15 @@ impl Init {
 
     /// Start a service by name, unless it is running (or cannot run here). Whether it started.
     pub fn start_service(&self, name: &str) -> bool {
+        // A service the device leaves out: what it would have said when done, at once.
+        if let Some(said) = crate::device::service_left_out(name) {
+            if let Some(props) = self.properties() {
+                for (k, v) in said {
+                    props.set(k, v);
+                }
+            }
+            return false;
+        }
         let Some(service) = self.services.get(name) else { return false };
         if (self.skip)(service) {
             return false;

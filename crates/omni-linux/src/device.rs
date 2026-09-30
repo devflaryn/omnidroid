@@ -38,6 +38,11 @@ pub const FILES: &[(&str, &[u8])] = &[
     // why; `persist.omni.cached_processes`).
     ("/vendor/etc/init/omni_lean.rc", include_bytes!("../device/vendor/etc/init/omni_lean.rc")),
     ("/vendor/bin/omni_lean.sh", include_bytes!("../device/vendor/bin/omni_lean.sh")),
+    // The boot's own settings: no boot animation (the file says why).
+    ("/vendor/etc/init/omni_boot.rc", include_bytes!("../device/vendor/etc/init/omni_boot.rc")),
+    // The framework's configuration as this device has it: a static overlay (RRO), as a vendor
+    // partition carries one (`device/src/overlay/`; the values file says why each is there).
+    ("/vendor/overlay/omni-device-overlay.apk", include_bytes!("../device/vendor/overlay/omni-device-overlay.apk")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a
@@ -207,6 +212,28 @@ pub const KIOSK_LEAVES_OUT: &[&str] = &["/system_ext/priv-app/SystemUI", "/syste
 /// The soft keyboard, left out of a kiosk device with `OMNI_KIOSK_IME=0` (see [`KIOSK_LEAVES_OUT`]).
 pub const KIOSK_IME: &str = "/product/app/LatinIME";
 
+/// **Services this device does not run**, with the properties each sets once it is done -- which
+/// init.rc waits for (`wait_for_prop`), so they are set at once instead.
+///
+/// `odsign`, the on-device signing daemon, checks the ART artifacts odrefresh compiled into
+/// `/data` against a key in keystore2. Here the boot image and the system server's code are the
+/// image's own (`/system/framework/**/*.odex`), and keystore2 is not up that early: it waited 5 s
+/// for keystore2 at every boot, gave up ("Could not create keystore key") and set both
+/// properties on its way out (2026-10-01) -- while init waited on `odsign.key.done`. The outcome is
+/// the same without it, 5 s sooner. `OMNI_KEEP_SERVICES=odsign` runs it.
+pub const SERVICES_LEFT_OUT: &[(&str, &[(&str, &str)])] = &[("odsign", &[("odsign.key.done", "1"), ("odsign.verification.done", "1")])];
+
+/// The properties `service` would have set, if the device leaves it out ([`SERVICES_LEFT_OUT`],
+/// less `OMNI_KEEP_SERVICES`, comma-separated).
+#[must_use]
+pub fn service_left_out(service: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    let kept = std::env::var("OMNI_KEEP_SERVICES").unwrap_or_default();
+    if kept.split(',').any(|k| k.trim() == service) {
+        return None;
+    }
+    SERVICES_LEFT_OUT.iter().find(|(name, _)| *name == service).map(|(_, props)| *props)
+}
+
 /// The device's global environment: `init.environ.rc`'s `export NAME VALUE` lines. On a device
 /// init exports them before anything starts, so every process -- the zygote, system_server, each
 /// app -- has them; the processes omnidroid starts itself are given them too. system_server needs
@@ -230,8 +257,34 @@ pub fn global_environment() -> Vec<(String, String)> {
 /// [`LEAVES_OUT`] and [`HARDWARE_LEFT_OUT`] left out), `lean-hw` (only [`LEAVES_OUT`]: the hardware
 /// kept) or `kiosk` (lean, and [`KIOSK_LEAVES_OUT`]). Read by each host process of an
 /// instance alike (the variable is inherited), so they all see one image.
+///
+/// The device's own boot settings can be left out too, to measure what each is worth:
+/// `OMNI_DEVICE_OVERLAY=0` (the framework overlay: the boot waits for a wallpaper again) and
+/// `OMNI_BOOT_ANIMATION=1` (the boot animation plays).
 #[must_use]
 pub fn left_out() -> Vec<&'static str> {
+    let mut out = apps_left_out();
+    if std::env::var("OMNI_DEVICE_OVERLAY").as_deref() == Ok("0") {
+        out.push("/vendor/overlay/omni-device-overlay.apk");
+    }
+    if std::env::var("OMNI_BOOT_ANIMATION").as_deref() == Ok("1") {
+        out.push("/vendor/etc/init/omni_boot.rc");
+    }
+    // An app's host process has no preloaded-classes list (`OMNI_APP_PRELOAD=1` gives it one), so
+    // its WrapperInit preloads none of the zygote's classes (`ZygoteInit.preloadClasses` finds no
+    // file) and the app loads only the classes it uses. On a device a zygote preloads them once and
+    // every app forks with them; here each app host process starts alone and preloaded them all
+    // (`PreloadClasses` 2.9-4.2 s a process), on the one thread an app's start runs on. Measured on
+    // one warm device, launch against launch (2026-10-01, `tools/warm_ab.py`): the probe app's
+    // first frame 1.8 s sooner (median of 8 ABBA pairs, 7 of them faster; 13.9 -> 12.1 s),
+    // Roblox's 2.1 and 3.7 s sooner (2 pairs). system_server keeps its preload.
+    if std::env::var("OMNI_LINUX_APP").as_deref() == Ok("1") && std::env::var("OMNI_APP_PRELOAD").as_deref() != Ok("1") {
+        out.push("/system/etc/preloaded-classes");
+    }
+    out
+}
+
+fn apps_left_out() -> Vec<&'static str> {
     match std::env::var("OMNI_DEVICE_APPS").as_deref() {
         Ok("full") => Vec::new(),
         Ok("kiosk") => {

@@ -1,0 +1,17 @@
+# The device's boot, as its vendor sets it up.
+#
+# No boot animation. SurfaceFlinger starts bootanim at every boot; with no animation file it draws
+# Android's default one, frame after frame on the emulated CPU, from SurfaceFlinger's start until
+# WindowManager enables the display (44 s to 111 s of a saved device's boot, 2026-10-01), beside
+# the system_server it slows. With this property bootanimation exits as it starts.
+on early-init
+    setprop debug.sf.nobootanimation 1
+    # No dexopt when an app is installed. ART Service's artd (a lazy service, started for the
+    # install) cannot chown the oat directory here ("Failed to chown .../oat: Operation not
+    # permitted"): every install's dexopt failed and the app ran from its dex anyway. Skipping it
+    # gives the same app without starting artd: a probe reinstall 7.4 s -> 1.6 s when artd was not
+    # running, 0.1 s less when it was (2026-10-01).
+    setprop pm.dexopt.install skip
+    setprop pm.dexopt.install-fast skip
+    setprop pm.dexopt.install-bulk skip
+    setprop pm.dexopt.install-bulk-secondary skip

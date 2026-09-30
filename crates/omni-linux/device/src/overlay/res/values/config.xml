@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- No wallpaper to wait for at boot. A kiosk device has none (the image wallpaper is
+         SystemUI's, left out), and with this true WindowManager holds the display, and with it
+         sys.boot_completed, until its 30 s BOOT_TIMEOUT: FallbackHome drawn at 80.7 s, "BOOT
+         TIMEOUT: forcing display enabled" at 110.8 s (2026-10-01). -->
+    <bool name="config_checkWallpaperAtBoot">false</bool>
+</resources>

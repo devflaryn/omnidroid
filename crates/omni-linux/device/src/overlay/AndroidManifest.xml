@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The device's own static overlay of the framework's configuration (see config.xml). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.omnidroid.overlay.device">
+    <application android:hasCode="false" />
+    <overlay android:targetPackage="android" android:isStatic="true" android:priority="1000" />
+</manifest>
