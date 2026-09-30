@@ -116,7 +116,13 @@ What it taught (each is in the design below):
   `omni-mcp`'s `json.rs` moves here and omni-mcp uses it from here: no new dependency.
 - **`omnidroid`**: subcommands `supervise` (the daemon), `warm`, `aosp` (now a client), `ps`,
   `stop`. `aosp` keeps `--apk --cookie --place --minutes --size --gpu --with-systemui` and gains
-  `--detach`.
+  `--locale` and `--detach`. `warm [--count N] [--with-systemui] [--gpu G] [--locale L]` takes the
+  same flavor options, so the flavor about to be launched can be warmed; a plain `warm` warms the
+  default flavor (below), and `--count` counts systems of that flavor.
+- **`--minutes`** is enforced by the supervisor for every instance (`LAUNCH{expires_in}`): at
+  expiry it tears the instance down. An attached `omnidroid aosp` keeps today's default of 30
+  minutes; a `--detach` launch has no default bound and lives until `stop` unless `--minutes` is
+  given.
 - **`omni-linux`**: the boot recipe moves from `tests/common/boot.rs` into the library
   (`omni_linux::boot::SystemBoot`: `derive_classpath`, init classes, HALs, zygote, system_server
   argv). `tests/common/boot.rs` and `r_roblox` call it: **one boot path**. New modules: the control
@@ -154,14 +160,15 @@ Client -> supervisor:
 
 | Request | Answer / events |
 |---|---|
-| `WARM{count}` | `WARMED{systems}` once at least `count` systems are booted |
-| `LAUNCH{apk, cookie?, place?, size, gpu, flavor, detach}` | `PROGRESS{step}`..., then `READY{id, system, user, display, pids}` or `FAILED{step, detail}`; later `INSTANCE_DEAD{reason}` |
+| `WARM{count, flavor}` | `WARMED{systems}` once at least `count` systems of that flavor are booted |
+| `LAUNCH{apk, cookie?, place?, size, flavor, detach, expires_in?}` | `PROGRESS{step}`..., then `READY{id, system, user, display, pids}` or `FAILED{step, detail}`; later `INSTANCE_DEAD{reason}` |
 | `PS` | every system and instance (below) |
 | `STOP{inst-N \| sys-N \| all}` | `STOPPED` |
 
-An attached instance lives exactly as long as its `LAUNCH` connection: Ctrl-C, `--minutes`
-elapsing, or omni-mcp dropping it tears that instance down. With `detach` the client returns at
-`READY`, printing the id, and the instance lives until `STOP` or its system's end.
+An attached instance lives exactly as long as its `LAUNCH` connection: Ctrl-C, or omni-mcp
+dropping it, tears that instance down. With `detach` the client returns at `READY`, printing the
+id, and the instance lives until `STOP` or its system's end. Either way `expires_in` (from
+`--minutes`), when present, ends it at expiry.
 
 Supervisor -> system host control endpoint (127.0.0.1:0, announced on the host's stdout as
 `[control] <port>`; the per-system token arrives on stdin, never argv; every frame carries it):
@@ -218,7 +225,20 @@ installed code, so byte identity is exactly the test; no signature parsing. `omn
 package, versionCode and versionName for display.
 
 **Flavor** = what is fixed per system: image apps (`kiosk` or full, from `--with-systemui`),
-locale (`persist.sys.locale`), GPU (`--gpu`). A launch only joins a system of its flavor.
+locale (`persist.sys.locale`, from `--locale`), GPU (`--gpu`). A launch only joins a system of its
+flavor. The defaults, for `warm` and a launch alike: kiosk, `tr-TR` (today's `r_roblox` default),
+`auto`.
+
+**The cost of locale in the flavor.** A cookie is pinned to its exit country, so a set of accounts
+mixes locales -- and each locale is a system of its own even at the same version: another ~1.7 GB
+base per locale in use. It is in the flavor because Roblox applies its account's locale to itself
+once signed in, a configuration change `ActivityNativeMain` does not handle (its relaunch ended the
+session, r12); `r_roblox` sets the device's locale to the account's so there is nothing to change.
+**Per-user locale is the top follow-on after headless**: the candidate is Android 13+'s per-app
+locale, set per package per user (`cmd locale set-app-locales <pkg> --user <u> --locales <l>`)
+before the app's first start, so the app's configuration already carries the account's locale and
+its own application of it changes nothing. If that holds, locale leaves the flavor and mixed-locale
+instances share systems. Not built here; to be proven by a spike (sign in, join, no relaunch).
 
 **A system is unclaimed until a launch installs a third-party package in it**; that launch claims
 it for (package -> key). A claim is released when no user of the system still has the package (the
@@ -376,5 +396,6 @@ per-phase SSH sweep covers macOS's non-GPU logic only.
 
 ## Out of scope
 
-The live debugger and MCP instance selectors (Spec B); GPU-drop headless; instances surviving a
-system restart; timing and resource side channels between instances; a real zygote fork.
+The live debugger and MCP instance selectors (Spec B); GPU-drop headless; per-user locale (the
+follow-on after headless, above); instances surviving a system restart; timing and resource side
+channels between instances; a real zygote fork.
