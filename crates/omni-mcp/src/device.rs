@@ -141,6 +141,20 @@ impl Device {
     }
 }
 
+/// Where warm devices live: `OMNI_MCP_WARM_DIR`, else the temp directory. (A Linux host whose
+/// `/tmp` is a tmpfs names a directory on disk: a device's `/data` is ~1 GiB.)
+#[must_use]
+pub fn root() -> PathBuf {
+    std::env::var_os("OMNI_MCP_WARM_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
+}
+
+/// `<prefix><digits>`: an instance's own directory, not a sibling of it (`<dir>.ctl`, the control
+/// channel's, is a directory too).
+#[must_use]
+pub fn numbered(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Written within `age`.
 fn fresh(path: &Path, age: Duration) -> bool {
     std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a < age)
@@ -149,10 +163,10 @@ fn fresh(path: &Path, age: Duration) -> bool {
 /// The live warm device on this host, if there is one (the newest).
 #[must_use]
 pub fn find() -> Option<Device> {
-    let mut found: Vec<PathBuf> = std::fs::read_dir(std::env::temp_dir())
+    let mut found: Vec<PathBuf> = std::fs::read_dir(root())
         .ok()?
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(PREFIX) && e.path().is_dir())
+        .filter(|e| numbered(&e.file_name().to_string_lossy(), PREFIX) && e.path().is_dir())
         .map(|e| e.path())
         .filter(|d| Device { dir: d.clone() }.alive())
         .collect();
@@ -162,7 +176,7 @@ pub fn find() -> Option<Device> {
 
 /// The device being booted under the lock, if a boot is under way (and not stale).
 fn booting() -> Option<Device> {
-    let lock = std::env::temp_dir().join(LOCK);
+    let lock = root().join(LOCK);
     let dir = PathBuf::from(std::fs::read_to_string(&lock).ok()?.trim());
     if fresh(&lock, LOCK_STALE) {
         Some(Device { dir })
@@ -185,8 +199,8 @@ pub fn ensure(boot: impl FnOnce(&Path) -> Result<(), String>) -> Result<Found, S
         return Ok(Found::Booting(d));
     }
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let dir = std::env::temp_dir().join(format!("{PREFIX}{secs}"));
-    let lock = std::env::temp_dir().join(LOCK);
+    let dir = root().join(format!("{PREFIX}{secs}"));
+    let lock = root().join(LOCK);
     // create_new: of two servers asking at once, one boots.
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
         Ok(mut f) => {
@@ -209,16 +223,21 @@ pub fn ensure(boot: impl FnOnce(&Path) -> Result<(), String>) -> Result<Found, S
 pub fn wait_ready(device: &Device, limit: Duration) -> Result<(), String> {
     let deadline = Instant::now() + limit;
     let started = Instant::now();
+    // The boot lock, when it names this device: gone once the device is ready, or its boot failed.
+    let unlock = || {
+        let lock = root().join(LOCK);
+        if std::fs::read_to_string(&lock).is_ok_and(|d| Path::new(d.trim()) == device.dir) {
+            let _ = std::fs::remove_file(&lock);
+        }
+    };
     loop {
         if device.ready() {
-            let lock = std::env::temp_dir().join(LOCK);
-            if std::fs::read_to_string(&lock).is_ok_and(|d| Path::new(d.trim()) == device.dir) {
-                let _ = std::fs::remove_file(&lock);
-            }
+            unlock();
             return Ok(());
         }
         // Its log appears within seconds of the launch, and its control channel with the boot.
         if started.elapsed() > Duration::from_secs(120) && !device.log().exists() && !device.dir.with_extension("1.log").exists() {
+            unlock();
             return Err(format!("the warm device never started (no {}): is the build current?", device.log().display()));
         }
         if Instant::now() > deadline {
@@ -377,6 +396,14 @@ mod tests {
         std::fs::write(&b, b"abd").expect("b");
         assert_ne!(sha256_file(&a), sha256_file(&b), "other bytes");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_instance_is_its_numbered_directory_not_its_control_channel() {
+        assert!(numbered("omni-warm-1790806314", PREFIX));
+        assert!(!numbered("omni-warm-1790806314.ctl", PREFIX));
+        assert!(!numbered("omni-warm-", PREFIX));
+        assert!(!numbered("omni-warm.lock", PREFIX));
     }
 
     #[test]

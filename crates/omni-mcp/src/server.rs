@@ -144,7 +144,10 @@ fn live_session() -> Option<PathBuf> {
     std::fs::read_dir(std::env::temp_dir())
         .ok()?
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("omni-linux-r-") && e.path().is_dir())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("omni-linux-r-") && !name.ends_with(".ctl") && e.path().is_dir()
+        })
         .map(|e| e.path())
         .find(|d| alive(d))
 }
@@ -159,7 +162,7 @@ fn waiting_standby() -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(std::env::temp_dir())
         .ok()?
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(STANDBY_PREFIX) && e.path().is_dir())
+        .filter(|e| device::numbered(&e.file_name().to_string_lossy(), STANDBY_PREFIX) && e.path().is_dir())
         .map(|e| e.path())
         .filter(|d| alive(d) && !state_file(d, "claimed").exists())
         .collect();
