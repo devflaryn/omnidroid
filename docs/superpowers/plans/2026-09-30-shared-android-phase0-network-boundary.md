@@ -1676,3 +1676,13 @@ Expected: both end with `test result: ok` for every test binary. On Linux, after
 git add docs/superpowers/specs/2026-09-30-shared-android-multi-instance-design.md
 git commit -m "docs(spec): phase 0 landed -- the guest network boundary"
 ```
+
+---
+
+## Outcome and carry-forward (recorded at the end of execution)
+
+Phase 0 landed on `feat/shared-android` (tasks d1a9621..97451a9, final-review fixes ..dcbbbdc). Every Phase 0 test passes on Windows, Linux and macOS; `r_roblox` joined the place on Windows (with `Roblox-2.740.931.apk`: Roblox now refuses the stock 2.738.1397, "Upgrade required"). Deviations from this plan, decided during execution: loopns claims run under an OS file lock on `<ns>/.lock` with temp+rename publishing (the plan's create-new+write raced); a wildcard *destination* is translated like loopback (Linux/macOS route it to loopback); namespace-mode datagram receives read through a per-socket 64 KiB buffer so the filter always knows the source; a refused non-blocking loopback connect reports EINPROGRESS then SO_ERROR as Linux does; a released socket's reverse entry lingers 10 s so a sender that closed first is still delivered; the binder listener bounds frame lengths before trusting them and keeps one credential per pid; hosts are synced through the `linux`/`mac` remotes, not origin.
+
+Carry into Phase 1 first (one unit): owner start time stored with the pid in loopns entries; the zygote's reaper sweeps `.omni-loopback` for an ended child and a system's boot clears it; zygote-reserved pids are freed (today a system host panics after ~4194 app launches); `stand_in` recreated when the uid differs and OPENED answers the stand-in's identity; revocation also closes live opens; a failed linger rewrite in `Binding::drop` falls back to `remove_file`; the host-buffer invariant commented at `recv_datagram`; the spec's table-file names (`f-`/`r-`) and the 10 s host-port-reuse window stated in Isolation 2.
+
+Later: readiness-time filtering (a dropped foreign connection or datagram still raises POLLIN; a guest server using poll + blocking accept can stall); `read_file`/`try_recv` (pread/preadv/sendfile on a UDP socket) bypass the filter -- answer ESPIPE; UDP `connect(AF_UNSPEC)`; `MSG_TRUNC`; reconnect-to-loopback keeps the guest's explicit bind; Phase 3's adversarial gate also sprays UDP at the host's LAN address (a wildcard-bound guest UDP socket is reachable there at its random host port). Owner action pending: the Linux/macOS in-world run (cookie and exit country per host).
