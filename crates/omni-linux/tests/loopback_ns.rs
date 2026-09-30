@@ -105,21 +105,25 @@ fn a_host_program_cannot_reach_a_guest_server() {
     let inst = instance("hostprog");
     let _srv = server(&inst, "47102");
     // Its host ports are real, and a host program can name them: the guest drops what does not
-    // come from its namespace (the recv and accept filters).
+    // come from its namespace (the accept and recv filters). TCP first: the guest server's
+    // blocking accept waits for the next connection after dropping this one, so it serves no
+    // datagram afterwards.
+    let tcp = host_port(&inst, "tcp", "47102");
+    let mut c = TcpStream::connect(("127.0.0.1", tcp)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut got = [0u8; 2];
+    match c.read(&mut got) {
+        Ok(0) => {} // closed by the guest's accept filter
+        Ok(_) => panic!("the guest answered a host program: {got:?}"),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {}
+        Err(e) => panic!("the guest never accepted the host connection (its accept filter did not run): {e}"),
+    }
     let udp = host_port(&inst, "udp", "47102");
     let u = UdpSocket::bind("127.0.0.1:0").unwrap();
     u.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     u.send_to(b"ping", ("127.0.0.1", udp)).unwrap();
     let mut b = [0u8; 16];
     assert!(u.recv_from(&mut b).is_err(), "a host datagram was answered by a guest server");
-    // Last: the server's blocking accept waits for the next connection after dropping this one.
-    let tcp = host_port(&inst, "tcp", "47102");
-    let mut c = TcpStream::connect(("127.0.0.1", tcp)).unwrap();
-    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut got = [0u8; 2];
-    if let Ok(n) = c.read(&mut got) {
-        assert_eq!(n, 0, "a host connection was served: {got:?}");
-    }
 }
 
 #[test]
