@@ -7,6 +7,7 @@ use std::process::Child;
 
 use omni_debug::{HookAction, Session, Stop};
 
+use crate::device;
 use crate::json::{self, Json};
 use crate::mcp::{Dispatch, RpcError};
 
@@ -42,6 +43,15 @@ pub struct Config {
     pub standby: bool,
     /// How long a standby instance lives, in minutes. `OMNI_MCP_STANDBY_MINUTES` (default 720).
     pub standby_minutes: u64,
+    /// Boot the host's warm device (`crate::device`) when a client connects, if none is up, so the
+    /// first APK finds it booted. `OMNI_MCP_WARM=1`. Without it the first `start_instance` or
+    /// `install_apk` with no account boots it, and it stays up for the next.
+    pub warm: bool,
+    /// How long a warm device lives, in minutes. `OMNI_MCP_WARM_MINUTES` (default 720).
+    pub warm_minutes: u64,
+    /// How long a call waits for a warm device still booting, in seconds. `OMNI_MCP_WARM_WAIT`
+    /// (default 540: under the client's 600 s call timeout).
+    pub warm_wait: u64,
 }
 
 impl Config {
@@ -74,6 +84,9 @@ impl Config {
             repo_dir,
             standby: std::env::var("OMNI_MCP_STANDBY").as_deref() == Ok("1"),
             standby_minutes: std::env::var("OMNI_MCP_STANDBY_MINUTES").ok().and_then(|v| v.parse().ok()).unwrap_or(720),
+            warm: std::env::var("OMNI_MCP_WARM").as_deref() == Ok("1"),
+            warm_minutes: std::env::var("OMNI_MCP_WARM_MINUTES").ok().and_then(|v| v.parse().ok()).unwrap_or(720),
+            warm_wait: std::env::var("OMNI_MCP_WARM_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(540),
         }
     }
 }
@@ -91,6 +104,8 @@ struct Instance {
     apk: Option<PathBuf>,
     place: Option<String>,
     started: std::time::Instant,
+    /// On the warm device: the app's package (its device is `dir`, which outlives the instance).
+    package: Option<String>,
 }
 
 /// The MCP server.
@@ -121,6 +136,22 @@ fn alive(dir: &Path) -> bool {
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|age| age < std::time::Duration::from_secs(90));
     fresh && !state_file(dir, "stop").exists()
+}
+
+/// A live device of an app session (`omni-linux-r-*`: a standby or a session any server started),
+/// if one runs on this host.
+fn live_session() -> Option<PathBuf> {
+    std::fs::read_dir(std::env::temp_dir())
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("omni-linux-r-") && e.path().is_dir())
+        .map(|e| e.path())
+        .find(|d| alive(d))
+}
+
+/// Seconds, to the millisecond.
+fn secs(s: f64) -> Json {
+    Json::Num((s * 1000.0).round() / 1000.0)
 }
 
 /// A running standby instance nobody has taken over, if there is one (the newest).
@@ -261,6 +292,181 @@ impl Server {
         Some((id, dir, note))
     }
 
+    // ---- the warm device ----------------------------------------------------------------------
+
+    /// Boot a warm device in `dir`, detached: it outlives this server (the next session finds it).
+    fn boot_warm(&self, dir: &Path) -> Result<(), String> {
+        // Another device on the host (a session or a standby of this or another server): one
+        // Android at a time.
+        if let Some(other) = live_session() {
+            return Err(format!("another device runs on this host ({}); stop it first (stop_instance, or its data/local/tmp/stop)", other.display()));
+        }
+        let mut cmd = std::process::Command::new(&self.config.omnidroid_bin);
+        cmd.arg("aosp").arg("--warm").arg("--instance").arg(dir).arg("--gpu").arg(&self.config.gpu).arg("--minutes").arg(self.config.warm_minutes.to_string());
+        if let Some(sz) = &self.config.size {
+            cmd.arg("--size").arg(sz);
+        }
+        cmd.env("OMNI_SCREENSHOT", dir.with_extension("png"));
+        // A frame a second: the agent's screenshot shows what the app just did.
+        cmd.env("OMNI_SCREENSHOT_MS", std::env::var("OMNI_MCP_SCREENSHOT_MS").unwrap_or_else(|_| "1000".into()));
+        if let Some(ram) = self.config.device_ram_mb {
+            cmd.env("OMNI_DEVICE_RAM_MB", ram.to_string());
+        }
+        if let Some(repo) = &self.config.repo_dir {
+            cmd.current_dir(repo);
+        }
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        cmd.spawn().map(|_| ()).map_err(|e| format!("could not start {}: {e}", self.config.omnidroid_bin.display()))
+    }
+
+    /// The warm device, ready: the live one, or one booted now (waited for, `warm_wait` at most).
+    /// With it, how it was found (`warm`, `booted`, `waited`) and the seconds waited.
+    fn warm_device(&self) -> Result<(device::Device, &'static str, f64), RpcError> {
+        let t = std::time::Instant::now();
+        let booted = std::cell::Cell::new(false);
+        let found = device::ensure(|dir| {
+            booted.set(true);
+            self.boot_warm(dir)
+        })
+        .map_err(RpcError::server)?;
+        let d = match found {
+            device::Found::Ready(d) => return Ok((d, "warm", t.elapsed().as_secs_f64())),
+            device::Found::Booting(d) => d,
+        };
+        let how = if booted.get() { "booted" } else { "waited" };
+        device::wait_ready(&d, std::time::Duration::from_secs(self.config.warm_wait)).map_err(RpcError::server)?;
+        Ok((d, how, t.elapsed().as_secs_f64()))
+    }
+
+    /// With `warm` configured, boot the warm device now unless one is up or booting.
+    fn ensure_warm(&self) {
+        if self.config.warm {
+            let _ = device::ensure(|dir| self.boot_warm(dir));
+        }
+    }
+
+    /// `start_instance` without an account: the APK on the warm device -- installed unless the
+    /// device holds the same bytes, and started -- answered once its Activity is displayed.
+    fn start_on_warm(&mut self, apk: PathBuf, launch: bool) -> Result<Json, RpcError> {
+        let t = std::time::Instant::now();
+        let app = device::Apk::read(&apk).map_err(RpcError::params)?;
+        let read_s = t.elapsed().as_secs_f64();
+        let (dev, how, device_s) = self.warm_device()?;
+        let installed = device::install(&dev, &app).map_err(RpcError::server)?;
+        // Instances of apps this install replaced are over.
+        self.instances.retain(|_, i| i.package.as_ref().map_or(true, |p| !installed.uninstalled.contains(p)));
+        let mut out = vec![
+            ("package", json::s(app.package.clone())),
+            ("sha256", json::s(app.sha256.clone())),
+            ("version_code", app.version_code.map_or(Json::Null, |v| Json::Num(f64::from(v)))),
+            ("device", json::obj([("dir", json::s(dev.dir.to_string_lossy().into_owned())), ("how", json::s(how)), ("seconds", secs(device_s))])),
+            (
+                "install",
+                json::obj([
+                    ("action", json::s(installed.action)),
+                    ("seconds", secs(installed.seconds)),
+                    ("uninstalled", Json::Array(installed.uninstalled.iter().map(|p| json::s(p.clone())).collect())),
+                ]),
+            ),
+        ];
+        if launch {
+            let started = device::start(&dev, &app, std::time::Duration::from_secs(300)).map_err(RpcError::server)?;
+            let id = format!("inst-{}", self.next_instance);
+            self.next_instance += 1;
+            // One instance per app: a start of the same app again is that instance.
+            self.instances.retain(|_, i| i.package.as_deref() != Some(app.package.as_str()));
+            self.instances.insert(
+                id.clone(),
+                Instance {
+                    id: id.clone(),
+                    child: None,
+                    dir: dev.dir.clone(),
+                    standby: false,
+                    screenshot: dev.screenshot(),
+                    apk: Some(apk),
+                    place: None,
+                    started: std::time::Instant::now(),
+                    package: Some(app.package.clone()),
+                },
+            );
+            out.insert(0, ("instance_id", json::s(id)));
+            out.insert(1, ("state", json::s("app_on_screen")));
+            out.push((
+                "start",
+                json::obj([
+                    ("component", json::s(started.component)),
+                    ("seconds", secs(started.seconds)),
+                    ("total_time_ms", started.total_time_ms.map_or(Json::Null, |v| Json::Num(v as f64))),
+                    ("status", json::s(started.status)),
+                ]),
+            ));
+            out.push(("screenshot_path", json::s(dev.screenshot().to_string_lossy().into_owned())));
+        }
+        out.push(("apk_read_seconds", secs(read_s)));
+        out.push(("seconds", secs(t.elapsed().as_secs_f64())));
+        Ok(Json::Object(out.into_iter().map(|(k, v)| (k.to_string(), v)).collect()))
+    }
+
+    /// The live warm device, or an error saying there is none.
+    fn live_warm() -> Result<device::Device, RpcError> {
+        device::find().filter(device::Device::ready).ok_or_else(|| RpcError::server("no warm device is up (start_instance or install_apk with an APK boots one)"))
+    }
+
+    fn shell(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let command = args.get("command").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `command`"))?;
+        let uid = args.get("uid").and_then(Json::as_u64).map(|u| u as u32);
+        let limit = args.get("timeout").and_then(Json::as_u64).unwrap_or(120);
+        let dev = Self::live_warm()?;
+        let t = std::time::Instant::now();
+        let (code, output) = dev.shell_as(command, uid, std::time::Duration::from_secs(limit)).map_err(RpcError::server)?;
+        Ok(json::obj([("exit", Json::Num(code as f64)), ("output", json::s(output)), ("seconds", secs(t.elapsed().as_secs_f64()))]))
+    }
+
+    fn uninstall_apk(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let package = args.get("package").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `package`"))?;
+        let dev = Self::live_warm()?;
+        let (code, output) = dev.shell(&format!("pm uninstall {package}"), std::time::Duration::from_secs(120)).map_err(RpcError::server)?;
+        self.instances.retain(|_, i| i.package.as_deref() != Some(package));
+        Ok(json::obj([("package", json::s(package)), ("exit", Json::Num(code as f64)), ("output", json::s(output.trim()))]))
+    }
+
+    fn stop_app(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let package = args.get("package").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `package`"))?;
+        let dev = Self::live_warm()?;
+        let output = device::stop_app(&dev, package).map_err(RpcError::server)?;
+        Ok(json::obj([("package", json::s(package)), ("output", json::s(output)), ("device", json::s("warm, idle"))]))
+    }
+
+    fn device_status(&mut self) -> Json {
+        let Some(dev) = device::find() else {
+            return json::obj([("state", json::s("none"))]);
+        };
+        let state = if dev.ready() { "ready" } else { "booting" };
+        let apps = if dev.ready() {
+            dev.shell("pm list packages -3", std::time::Duration::from_secs(30))
+                .map(|(_, out)| Json::Array(out.lines().filter_map(|l| l.trim().strip_prefix("package:")).map(|p| json::s(p)).collect()))
+                .unwrap_or(Json::Null)
+        } else {
+            Json::Null
+        };
+        json::obj([
+            ("state", json::s(state)),
+            ("dir", json::s(dev.dir.to_string_lossy().into_owned())),
+            ("log", json::s(dev.log().to_string_lossy().into_owned())),
+            ("screenshot_path", json::s(dev.screenshot().to_string_lossy().into_owned())),
+            ("test_apps", apps),
+        ])
+    }
+
+    fn stop_device(&mut self) -> Json {
+        let Some(dev) = device::find() else {
+            return json::obj([("stopped", Json::Bool(false)), ("note", json::s("no warm device is up"))]);
+        };
+        dev.stop();
+        self.instances.retain(|_, i| i.package.is_none());
+        json::obj([("stopped", Json::Bool(true)), ("dir", json::s(dev.dir.to_string_lossy().into_owned()))])
+    }
+
     // ---- helpers ------------------------------------------------------------------------------
 
     fn lab_mut(&mut self) -> Result<&mut Session, RpcError> {
@@ -327,6 +533,12 @@ impl Server {
             "login" => self.login(args),
             "join_place" => self.join_place(args),
             "screenshot" => self.screenshot(args),
+            // the warm device
+            "shell" => self.shell(args),
+            "uninstall_apk" => self.uninstall_apk(args),
+            "stop_app" => self.stop_app(args),
+            "device_status" => Ok(self.device_status()),
+            "stop_device" => Ok(self.stop_device()),
             // lab (emulation-layer debug/dump)
             "lab_load" => self.lab_load(args),
             "resolve_symbol" => self.resolve_symbol(args),
@@ -368,6 +580,11 @@ impl Server {
         let size = args.get("size").and_then(Json::as_str).map(str::to_string).or_else(|| self.config.size.clone());
         let minutes = args.get("minutes").and_then(Json::as_u64).or(self.config.minutes);
 
+        // No account: the APK on the host's warm device, installed by content and started.
+        if cookie.is_none() {
+            return self.start_on_warm(apk, true);
+        }
+
         // A standby instance of the same APK and account is taken over: no boot at all.
         let same_setup = Some(apk.as_path()) == self.config.apk.as_deref()
             && cookie == self.config.cookie
@@ -388,6 +605,7 @@ impl Server {
                         apk: Some(apk),
                         place,
                         started: std::time::Instant::now(),
+                        package: None,
                     },
                 );
                 return Ok(json::obj([
@@ -419,6 +637,7 @@ impl Server {
             apk: Some(apk),
             place: place.clone(),
             started: std::time::Instant::now(),
+            package: None,
         };
         self.instances.insert(id.clone(), instance);
 
@@ -434,6 +653,15 @@ impl Server {
     fn stop_instance(&mut self, args: &Json) -> Result<Json, RpcError> {
         let id = args.get("instance_id").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `instance_id`"))?;
         let mut inst = self.instances.remove(id).ok_or_else(|| RpcError::params(format!("no instance {id}")))?;
+        // An app on the warm device: stopped and its data cleared; the device stays up for the next.
+        if let Some(package) = &inst.package {
+            let dev = device::Device { dir: inst.dir.clone() };
+            let output = if dev.alive() { device::stop_app(&dev, package).unwrap_or_else(|e| e) } else { "the device is gone".into() };
+            if args.get("device").and_then(Json::as_bool) == Some(true) {
+                dev.stop();
+            }
+            return Ok(json::obj([("instance_id", json::s(id)), ("stopped", Json::Bool(true)), ("package", json::s(package.clone())), ("output", json::s(output))]));
+        }
         stop(&mut inst);
         // A standby taken over and stopped: the next one boots now.
         if inst.standby {
@@ -445,7 +673,11 @@ impl Server {
     fn list_instances(&mut self) -> Json {
         let mut out = Vec::new();
         for inst in self.instances.values_mut() {
-            let (state, in_place) = instance_state(&inst.dir);
+            let (state, in_place) = if inst.package.is_some() {
+                (if (device::Device { dir: inst.dir.clone() }).alive() { "app_running" } else { "stopped" }, None)
+            } else {
+                instance_state(&inst.dir)
+            };
             // Until its session writes a log, a launcher still running is booting.
             let launching = inst.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None))) && !inst.dir.with_extension("log").exists();
             let state = if launching { "booting" } else { state };
@@ -470,13 +702,10 @@ impl Server {
         if !apk.is_file() {
             return Err(RpcError::params(format!("APK not found: {}", apk.display())));
         }
-        // On the real-AOSP path the launcher installs the APK as part of a boot, so this records the
-        // APK as the default for the next start/launch rather than installing into a live device.
+        // The default APK for the next start, and installed now on the warm device (booted if none
+        // is up) -- or kept as it is when the device holds the same bytes.
         self.config.apk = Some(apk.clone());
-        Ok(json::obj([
-            ("apk", json::s(apk.to_string_lossy().into_owned())),
-            ("note", json::s("recorded as the default APK; `start_instance`/`launch_app` will install and boot it")),
-        ]))
+        self.start_on_warm(apk, false)
     }
 
     fn login(&mut self, args: &Json) -> Result<Json, RpcError> {
@@ -744,6 +973,7 @@ impl Dispatch for Server {
             ])),
             "notifications/initialized" | "initialized" => {
                 self.ensure_standby();
+                self.ensure_warm();
                 Ok(Json::Null)
             }
             "ping" => Ok(json::obj([])),
@@ -764,6 +994,14 @@ impl Drop for Server {
         // Do not leave booted instances running when the server exits -- but a standby taken over
         // is given back, still running (and in its place), for the next session to take.
         for inst in self.instances.values_mut() {
+            // An app on the warm device is stopped; the device stays up for the next session.
+            if let Some(package) = &inst.package {
+                let dev = device::Device { dir: inst.dir.clone() };
+                if dev.alive() {
+                    let _ = device::stop_app(&dev, package);
+                }
+                continue;
+            }
             if inst.standby {
                 let _ = std::fs::remove_file(state_file(&inst.dir, "claimed"));
             } else {
@@ -806,7 +1044,7 @@ macro_rules! p {
 }
 
 static TOOLS: &[Tool] = &[
-    Tool { name: "start_instance", desc: "Start an omnidroid instance for an APK (signs in and joins a place). Returns at once: with a standby instance waiting (OMNI_MCP_STANDBY=1) it is taken over -- already in the place, or joining it -- otherwise a device boots. `list_instances` shows its state: booting, signed_in, joining, in_game.", params: &[
+    Tool { name: "start_instance", desc: "Start an APK. Without `cookie` (any APK): on the host's warm device -- one Android kept booted and idle -- the APK is installed unless the device already holds the same bytes (decided by SHA-256, not version; another test app is uninstalled first) and its launcher Activity started; answers once the Activity is displayed (state app_on_screen), with seconds per step. The first call on a host with no warm device boots one (minutes) and it stays up for the next APKs. With `cookie` (a Roblox account): a signed-in session that joins `place`, answered at once (a standby instance is taken over when configured); `list_instances` shows booting, signed_in, joining, in_game.", params: &[
         p!("apk","string",false,"APK path (else the configured default)"),
         p!("cookie","string",false,"cookie file path or saved account name"),
         p!("place","string",false,"place id to join (e.g. 8737899170)"),
@@ -814,9 +1052,14 @@ static TOOLS: &[Tool] = &[
         p!("size","string",false,"window size WxH"),
         p!("minutes","number",false,"minutes to run"),
     ]},
-    Tool { name: "stop_instance", desc: "Stop a running instance.", params: &[p!("instance_id","string",true,"the id from start_instance")] },
+    Tool { name: "stop_instance", desc: "Stop an instance. An app on the warm device is force-stopped and its data cleared; the device stays warm for the next APK (`device: true` shuts it down too). A session instance's device shuts down.", params: &[p!("instance_id","string",true,"the id from start_instance"),p!("device","boolean",false,"also shut the warm device down")] },
     Tool { name: "list_instances", desc: "List this server's instances: each one's state (booting, signed_in, joining, in_game with the place, stopped) and log.", params: &[] },
-    Tool { name: "install_apk", desc: "Record an APK as the default to install and boot on the next start_instance/launch_app.", params: &[p!("apk","string",true,"APK path")] },
+    Tool { name: "install_apk", desc: "Install an APK on the warm device now, without starting it (booting the device if none is up): kept as it is when the device holds the same bytes, reinstalled when the bytes differ (even at the same version), another test app uninstalled first. Also the default APK for the next start_instance.", params: &[p!("apk","string",true,"APK path")] },
+    Tool { name: "uninstall_apk", desc: "Uninstall a package from the warm device.", params: &[p!("package","string",true,"package name, e.g. com.example.app")] },
+    Tool { name: "stop_app", desc: "Force-stop a package on the warm device and clear its data; the device stays warm.", params: &[p!("package","string",true,"package name")] },
+    Tool { name: "shell", desc: "Run a shell command on the warm device (as adb shell would: the shell user, or `uid`): its exit status and output. E.g. `pm list packages -3`, `am start ...`, `logcat -d -t 50`, `dumpsys activity top`.", params: &[p!("command","string",true,"a /system/bin/sh command line"),p!("uid","number",false,"run as this uid (0 root, 1000 system; default 2000 shell)"),p!("timeout","number",false,"seconds (default 120)")] },
+    Tool { name: "device_status", desc: "The warm device: none, booting or ready; its directory, log, screenshot path and the test apps installed on it.", params: &[] },
+    Tool { name: "stop_device", desc: "Shut the warm device down (the next start_instance boots one again).", params: &[] },
     Tool { name: "launch_app", desc: "Boot the app (same as start_instance on the real-AOSP path).", params: &[p!("apk","string",false,"APK path"),p!("cookie","string",false,"cookie"),p!("place","string",false,"place id")] },
     Tool { name: "login", desc: "Record a cookie (file path or saved account name) for the next boot.", params: &[p!("cookie","string",true,"cookie file path or saved account name")] },
     Tool { name: "join_place", desc: "Record a place id to join on the next boot.", params: &[p!("place","string",true,"place id")] },

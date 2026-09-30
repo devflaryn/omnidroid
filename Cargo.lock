@@ -369,6 +369,7 @@ dependencies = [
  "omni-apk",
  "omni-debug",
  "omni-platform",
+ "sha2",
 ]
 
 [[package]]

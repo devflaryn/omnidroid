@@ -18,6 +18,8 @@ description = "An MCP server (Model Context Protocol, over stdio) that lets any 
 omni-debug = { workspace = true }
 omni-apk = { workspace = true }
 omni-platform = { workspace = true }
+# An APK is known by its bytes' hash (the warm device's install decision).
+sha2 = { workspace = true }
 
 [lib]
 name = "omni_mcp"
