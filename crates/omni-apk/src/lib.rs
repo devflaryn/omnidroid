@@ -66,8 +66,8 @@ mod error;
 mod manifest;
 mod zip;
 
-pub use crate::choose::{choose_apk, manifest_of, ChosenApk, APK_ENV};
-pub use crate::manifest::AppManifest;
+pub use crate::choose::{choose_apk, launch_info_of, manifest_of, ChosenApk, APK_ENV};
+pub use crate::manifest::{AppManifest, LaunchInfo};
 
 pub use crate::apk::{
     Apk, NativeLibrary, ANDROID_MANIFEST_ENTRY, ASSETS_PREFIX, LIB_PREFIX,

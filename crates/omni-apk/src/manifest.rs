@@ -149,6 +149,173 @@ fn root_element(
     })
 }
 
+const RES_XML_END_ELEMENT_TYPE: u16 = 0x0103;
+const TYPE_INT_BOOLEAN: u8 = 0x12;
+const ATTR_NAME: u32 = 0x0101_0003;
+const ATTR_ENABLED: u32 = 0x0101_000e;
+
+/// What starting an installed app needs, read from its binary `AndroidManifest.xml`: the package,
+/// its `versionCode` (if it has one), and the Activity its launcher icon starts -- the first enabled
+/// `<activity>` or `<activity-alias>` whose `<intent-filter>` has the `MAIN` action and the
+/// `LAUNCHER` category, as a launcher resolves it. Unlike [`AppManifest`] it needs no `versionName`
+/// (a test APK often has none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchInfo {
+    /// `package`, e.g. `com.roblox.client`.
+    pub package: String,
+    /// `android:versionCode`, when the manifest has one.
+    pub version_code: Option<u32>,
+    /// The launcher Activity's class, whole (`com.example.app.MainActivity`), for
+    /// `am start -n <package>/<class>`; `None` for an APK with no launcher icon.
+    pub launcher: Option<String>,
+}
+
+impl LaunchInfo {
+    /// Walk every element of a binary `AndroidManifest.xml`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApkError::Manifest`] when the document is not binary XML, is malformed, or its root has
+    /// no `package`.
+    pub fn parse(axml: &[u8]) -> ApkResult<LaunchInfo> {
+        let (kind, header, size) = chunk_header(axml, 0)?;
+        if kind != RES_XML_TYPE {
+            return Err(bad(format!("not binary XML: the first chunk is type {kind:#06x}")));
+        }
+        let end = (size as usize).min(axml.len());
+        let mut strings: Option<StringPool<'_>> = None;
+        let mut resource_ids: &[u8] = &[];
+        let mut at = usize::from(header);
+        let (mut package, mut version_code, mut launcher) = (None::<String>, None, None);
+        // The component being read (its name, enabled), and the intent filter's MAIN and LAUNCHER.
+        let mut component: Option<(String, bool)> = None;
+        let (mut main, mut category) = (false, false);
+        while at + 8 <= end {
+            let (kind, header, size) = chunk_header(axml, at)?;
+            let size = size as usize;
+            if size < usize::from(header) || at + size > end {
+                return Err(bad(format!("a chunk at {at:#x} runs past the document")));
+            }
+            let chunk = &axml[at..at + size];
+            match kind {
+                RES_STRING_POOL_TYPE => strings = Some(StringPool::new(chunk)?),
+                RES_XML_RESOURCE_MAP_TYPE => resource_ids = &chunk[usize::from(header)..],
+                RES_XML_START_ELEMENT_TYPE => {
+                    let strings = strings.ok_or_else(|| bad("an element before the string pool"))?;
+                    let element = Element::new(chunk, header, &strings, resource_ids)?;
+                    match element.name.as_str() {
+                        "manifest" if package.is_none() => {
+                            package = element.string("package", None)?;
+                            version_code = element.int("versionCode", ATTR_VERSION_CODE)?;
+                        }
+                        "activity" | "activity-alias" => {
+                            let name = element.string("name", Some(ATTR_NAME))?.unwrap_or_default();
+                            let enabled = element.boolean("enabled", ATTR_ENABLED)?.unwrap_or(true);
+                            component = Some((name, enabled));
+                        }
+                        "intent-filter" => (main, category) = (false, false),
+                        "action" => main |= element.string("name", Some(ATTR_NAME))?.as_deref() == Some("android.intent.action.MAIN"),
+                        "category" => category |= element.string("name", Some(ATTR_NAME))?.as_deref() == Some("android.intent.category.LAUNCHER"),
+                        _ => {}
+                    }
+                }
+                RES_XML_END_ELEMENT_TYPE => {
+                    let strings = strings.ok_or_else(|| bad("an element before the string pool"))?;
+                    // ResXMLTree_endElementExt: ns, name.
+                    let name = strings.get(u32_at(chunk, usize::from(header) + 4)?)?;
+                    match &*name {
+                        "intent-filter" if main && category && launcher.is_none() => {
+                            if let Some((class, true)) = &component {
+                                launcher = Some(class.clone());
+                            }
+                        }
+                        "activity" | "activity-alias" => component = None,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            at += size;
+        }
+        let package = package.ok_or_else(|| bad("<manifest> has no `package`"))?;
+        // A class name as the manifest may give it: `.Main` and `Main` are in the package.
+        let launcher = launcher.filter(|c| !c.is_empty()).map(|c| {
+            if c.starts_with('.') {
+                format!("{package}{c}")
+            } else if !c.contains('.') {
+                format!("{package}.{c}")
+            } else {
+                c
+            }
+        });
+        Ok(LaunchInfo { package, version_code, launcher })
+    }
+}
+
+/// One start element's attributes, read by name (or, for a name a shrinker emptied, resource id).
+struct Element<'a, 'b> {
+    name: String,
+    chunk: &'a [u8],
+    strings: &'b StringPool<'a>,
+    resource_ids: &'a [u8],
+    first: usize,
+    size: usize,
+    count: usize,
+}
+
+impl<'a, 'b> Element<'a, 'b> {
+    fn new(chunk: &'a [u8], header: u16, strings: &'b StringPool<'a>, resource_ids: &'a [u8]) -> ApkResult<Self> {
+        let ext = usize::from(header);
+        let name = strings.get(u32_at(chunk, ext + 4)?)?.into_owned();
+        let size = usize::from(u16_at(chunk, ext + 10)?);
+        if size < 20 {
+            return Err(bad(format!("attributes of {size} bytes, under the 20 a Res_value needs")));
+        }
+        Ok(Self { name, chunk, strings, resource_ids, first: ext + usize::from(u16_at(chunk, ext + 8)?), size, count: usize::from(u16_at(chunk, ext + 12)?) })
+    }
+
+    /// The attribute named `name` (or with resource id `id`): its raw string index, type and data.
+    fn find(&self, name: &str, id: Option<u32>) -> ApkResult<Option<(u32, u8, u32)>> {
+        for i in 0..self.count {
+            let at = self.first + i * self.size;
+            let name_index = u32_at(self.chunk, at + 4)?;
+            let rid = self.resource_ids.get(name_index as usize * 4..name_index as usize * 4 + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            let matches = id.is_some_and(|id| rid == Some(id)) || self.strings.get(name_index).is_ok_and(|n| n == name);
+            if matches {
+                let raw = u32_at(self.chunk, at + 8)?;
+                let data_type = *self.chunk.get(at + 15).ok_or_else(|| bad("an attribute past the element"))?;
+                return Ok(Some((raw, data_type, u32_at(self.chunk, at + 16)?)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn string(&self, name: &str, id: Option<u32>) -> ApkResult<Option<String>> {
+        Ok(match self.find(name, id)? {
+            Some((NO_INDEX, TYPE_STRING, data)) => Some(self.strings.get(data)?.into_owned()),
+            Some((NO_INDEX, _, _)) | None => None,
+            Some((index, _, _)) => Some(self.strings.get(index)?.into_owned()),
+        })
+    }
+
+    fn int(&self, name: &str, id: u32) -> ApkResult<Option<u32>> {
+        Ok(match self.find(name, Some(id))? {
+            Some((_, TYPE_INT_DEC | TYPE_INT_HEX, data)) => Some(data),
+            Some((index, _, _)) if index != NO_INDEX => self.strings.get(index)?.parse().ok(),
+            _ => None,
+        })
+    }
+
+    /// A literal boolean; `None` when absent or a resource reference (which only resources.arsc
+    /// could resolve).
+    fn boolean(&self, name: &str, id: u32) -> ApkResult<Option<bool>> {
+        Ok(match self.find(name, Some(id))? {
+            Some((_, TYPE_INT_BOOLEAN, data)) => Some(data != 0),
+            _ => None,
+        })
+    }
+}
+
 /// `ResStringPool`: offsets into UTF-8 or UTF-16 strings, each prefixed by its length.
 #[derive(Clone, Copy)]
 struct StringPool<'a> {

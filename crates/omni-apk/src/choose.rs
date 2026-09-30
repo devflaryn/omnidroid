@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::apk::Apk;
 use crate::error::{ApkError, ApkResult};
-use crate::manifest::AppManifest;
+use crate::manifest::{AppManifest, LaunchInfo};
 
 /// The environment variable that names the APK to run, when no `--apk` was given.
 pub const APK_ENV: &str = "OMNI_APK";
@@ -93,6 +93,15 @@ pub fn choose_apk(explicit: Option<&Path>, search_dir: &Path) -> ApkResult<Chose
 /// Opening the APK, reading its manifest entry, or decoding it.
 pub fn manifest_of(path: &Path) -> ApkResult<AppManifest> {
     AppManifest::parse(&Apk::open(path)?.read_manifest()?)
+}
+
+/// What starting the APK at `path` needs: its package, versionCode and launcher Activity.
+///
+/// # Errors
+///
+/// Opening the APK, reading its manifest entry, or decoding it.
+pub fn launch_info_of(path: &Path) -> ApkResult<LaunchInfo> {
+    LaunchInfo::parse(&Apk::open(path)?.read_manifest()?)
 }
 
 fn named(path: &Path, chosen_by: String) -> ApkResult<ChosenApk> {
