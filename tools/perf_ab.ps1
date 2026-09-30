@@ -1,0 +1,129 @@
+# One in-world measurement run of a prebuilt r_roblox test binary (an "arm"), for interleaved A/B
+# across builds (docs/NIGHT-2026-10-02.md). Boots the APK, waits for "Joining game", lets the world
+# load, then measures a fixed window and appends one CSV row:
+#   fps         -- presented frames / second over the window (from the [display] lines, exact)
+#   top_ms      -- the busiest thread of the app's host process, CPU ms per presented frame (the
+#                  engine worker: guest compute per frame -- the fps limit)
+#   top2_ms     -- the second busiest (the render thread), CPU ms per frame
+#   app_ms      -- the app's host process, all threads, CPU ms per frame
+#   all_ms      -- every guest host process (omni-linux-run*), CPU ms per frame
+#   priv_gb     -- median summed private bytes of the guest host processes over the window
+#   app_priv_gb -- median private bytes of the app's host process
+# Thread CPU is read from Windows (Process.Threads), so nothing inside the guest host is perturbed.
+#
+#   powershell -ExecutionPolicy Bypass -File tools\perf_ab.ps1 -Arm main -Exe <path to r_roblox-*.exe>
+param(
+  [Parameter(Mandatory)][string]$Arm,
+  [Parameter(Mandatory)][string]$Exe,
+  [string]$Csv = "C:\od-unified\perf\ab\runs.csv",
+  [int]$SettleSec = 75,
+  [int]$WindowSec = 150,
+  [int]$JoinTimeoutMin = 14,
+  [string]$Apk = "C:\Users\berat\Desktop\Roblox-2.740.931.apk",
+  [string]$Cookie = "C:\Users\berat\Desktop\cookies\HeZmI_ImYu1080.txt",
+  [string]$Place = "8737899170",
+  [string]$Sysroot = "C:\Users\berat\Desktop\Omni Apps\omnidroid\sysroot\aosp-35",
+  [string]$ExtraEnv = ""
+)
+$ErrorActionPreference = "Continue"
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
+$dir = Split-Path -Parent $Csv
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$stamp = Get-Date -Format "MMdd-HHmmss"
+$tag = "$Arm-$stamp"
+$out = Join-Path $dir "$tag.out.log"; $err = Join-Path $dir "$tag.err.log"
+
+$env:OMNI_WINDOW = "1"; $env:OMNI_R_KIOSK = "1"; $env:OMNI_GPU = "auto"
+$env:OMNI_R_MINUTES = [string]($JoinTimeoutMin + 6)
+$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; $env:OMNI_R_PLACE = $Place
+$env:OMNI_SYSROOT = $Sysroot
+Remove-Item env:OMNI_SCREENSHOT -ErrorAction SilentlyContinue
+if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Split("=", 2); Set-Item -Path ("env:" + $p[0]) -Value $p[1] } } }
+
+function Stop-Guests {
+  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+Stop-Guests
+Start-Sleep 3
+# The previous run's memory is given back over a few seconds; a boot needs ~13 GB of free commit.
+for ($i = 0; $i -lt 30; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 13GB / 1KB) { break }; Start-Sleep 2 }
+
+$crate = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Exe)))  # <tree>/target/release/deps -> <tree>
+$proc = Start-Process -FilePath $Exe -ArgumentList "--ignored", "--nocapture", "--exact", "the_apk_is_installed_started_and_draws" `
+  -WorkingDirectory $crate -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -WindowStyle Hidden
+$log = Join-Path $env:TEMP ("omni-linux-r-{0}.log" -f $proc.Id)
+
+function Guests { @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" }) }
+function Result($status, $extra) {
+  $row = [ordered]@{ tag = $tag; arm = $Arm; status = $status; when = (Get-Date -Format o) }
+  if ($extra) { foreach ($k in $extra.Keys) { $row[$k] = $extra[$k] } }
+  $obj = [pscustomobject]$row
+  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s"
+  if (-not (Test-Path $Csv)) { Set-Content -Path $Csv -Value $cols -Encoding utf8 }
+  $line = ($cols.Split(",") | ForEach-Object { $v = $obj.$_; if ($null -eq $v) { "" } else { [string]$v } }) -join ","
+  Add-Content -Path $Csv -Value $line -Encoding utf8
+  Write-Output $line
+}
+
+# 1. Wait for the join.
+$t0 = Get-Date; $joined = $null
+while (((Get-Date) - $t0).TotalMinutes -lt $JoinTimeoutMin) {
+  Start-Sleep 5
+  if ($proc.HasExited) { break }
+  if ((Test-Path $log) -and (Select-String -Path $log -Pattern "Joining game" -Quiet)) { $joined = Get-Date; break }
+}
+if (-not $joined) { Stop-Guests; Result "nojoin" @{}; exit 1 }
+$join_s = [int]($joined - $t0).TotalSeconds
+Start-Sleep $SettleSec
+
+# 2. The window: thread CPU at both ends, memory every 15 s, the [display] lines in between.
+function Snap {
+  $g = Guests
+  $app = $g | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 1
+  $threads = @{}
+  foreach ($t in $app.Threads) { try { $threads[$t.Id] = $t.TotalProcessorTime.TotalMilliseconds } catch {} }
+  $all = 0.0; foreach ($p in $g) { try { $all += $p.TotalProcessorTime.TotalMilliseconds } catch {} }
+  [pscustomobject]@{ t = Get-Date; appId = $app.Id; appCpu = $app.TotalProcessorTime.TotalMilliseconds; threads = $threads; all = $all }
+}
+$lines0 = @(Get-Content $log).Count
+$s0 = Snap
+$priv = New-Object System.Collections.ArrayList; $appPriv = New-Object System.Collections.ArrayList; $procs = 0
+$wEnd = (Get-Date).AddSeconds($WindowSec)
+while ((Get-Date) -lt $wEnd) {
+  Start-Sleep 15
+  $g = Guests
+  [void]$priv.Add(($g | Measure-Object PrivateMemorySize64 -Sum).Sum)
+  [void]$appPriv.Add((($g | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 1).PrivateMemorySize64))
+  $procs = [math]::Max($procs, $g.Count)
+}
+$s1 = Snap
+$new = @(Get-Content $log | Select-Object -Skip $lines0)
+$kicked = $new | Select-String -Pattern "Client has been disconnected" -Quiet
+
+# fps: exact frames over exact time, from consecutive [display] lines (each gives its own rate).
+$disp = @($new | Select-String -Pattern "\[display\] (\d+) frames presented \(([\d.]+)/s\)" | ForEach-Object { [pscustomobject]@{ f = [double]$_.Matches[0].Groups[1].Value; r = [double]$_.Matches[0].Groups[2].Value } })
+$frames = 0.0; $secs = 0.0
+for ($i = 1; $i -lt $disp.Count; $i++) {
+  $df = $disp[$i].f - $disp[$i - 1].f
+  if ($disp[$i].r -gt 0) { $frames += $df; $secs += $df / $disp[$i].r }
+}
+Stop-Guests
+if ($s0.appId -ne $s1.appId -or $secs -le 0) { Result "badwindow" @{ join_s = $join_s }; exit 1 }
+$fps = $frames / $secs
+$wall = ($s1.t - $s0.t).TotalSeconds
+$nframes = $fps * $wall
+$deltas = foreach ($k in $s1.threads.Keys) { if ($s0.threads.ContainsKey($k)) { [pscustomobject]@{ id = $k; d = $s1.threads[$k] - $s0.threads[$k] } } }
+$top = @($deltas | Sort-Object d -Descending | Select-Object -First 2)
+function Med($a) { $s = @($a | Sort-Object); if ($s.Count -eq 0) { 0 } else { $s[[int][math]::Floor($s.Count / 2)] } }
+Result ($(if ($kicked) { "kicked" } else { "ok" })) ([ordered]@{
+  fps = "{0:N2}" -f $fps
+  top_ms = "{0:N2}" -f ($top[0].d / $nframes)
+  top2_ms = "{0:N2}" -f ($top[1].d / $nframes)
+  app_ms = "{0:N2}" -f (($s1.appCpu - $s0.appCpu) / $nframes)
+  all_ms = "{0:N2}" -f (($s1.all - $s0.all) / $nframes)
+  priv_gb = "{0:N3}" -f ((Med $priv) / 1GB)
+  app_priv_gb = "{0:N3}" -f ((Med $appPriv) / 1GB)
+  procs = $procs
+  top_name = "tid$($top[0].id)"
+  join_s = $join_s
+})
