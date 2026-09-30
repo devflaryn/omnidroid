@@ -1,0 +1,144 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 92ddc98..eb0225b 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -62,6 +62,8 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
+         // Omnidroid patch 0027: the block map of a shared cache holds every block of the process
+         // (~700,000 in a game world); at 0.75 rather than 0.5 its bucket array is half the size.
+         UseLoadFactor(block_descriptors, SHARED_BLOCK_MAP_LOAD_FACTOR);
++        // Omnidroid patch 0035: every thread's table has this cache's size.
++        fast_dispatch_mask = (FastDispatchEntries(conf) - 1) * sizeof(FastDispatchEntry);
+     }
+     // In a shared cache each thread owns its table (JitState::od_fast_dispatch_table).
+     if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {
+@@ -453,9 +455,23 @@ size_t A64EmitX64::FastDispatchTableBytes() {
+ }
+ 
+ void A64EmitX64::ResetFastDispatchTable(void* table) {
+-    auto* entries = static_cast<FastDispatchEntry*>(table);
+-    for (size_t i = 0; i < fast_dispatch_table_size; i++) {
+-        entries[i] = FastDispatchEntry{};
++    ResetFastDispatchTable(table, fast_dispatch_table_size);
++}
++
++size_t A64EmitX64::FastDispatchEntries(const A64::UserConfig& conf) {
++    const size_t n = conf.od_fast_dispatch_entries;
++    const bool valid = n >= 0x40 && n <= 0x10000 && (n & (n - 1)) == 0;
++    return valid ? n : fast_dispatch_table_size;
++}
++
++size_t A64EmitX64::FastDispatchTableBytes(size_t entries) {
++    return sizeof(FastDispatchEntry) * entries;
++}
++
++void A64EmitX64::ResetFastDispatchTable(void* table, size_t entries) {
++    auto* e = static_cast<FastDispatchEntry*>(table);
++    for (size_t i = 0; i < entries; i++) {
++        e[i] = FastDispatchEntry{};
+     }
+ }
+ 
+@@ -538,7 +554,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         if (code.HasHostFeature(HostFeature::SSE42)) {
+             code.crc32(rbp, r12);
+         }
+-        code.and_(ebp, fast_dispatch_table_mask);
++        code.and_(ebp, static_cast<u32>(fast_dispatch_mask));
+         code.lea(rbp, ptr[r12 + rbp]);
+         code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
+         code.jne(fast_dispatch_cache_miss);
+@@ -569,7 +585,7 @@ void A64EmitX64::GenTerminalHandlers() {
+             if (code.HasHostFeature(HostFeature::SSE42)) {
+                 code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
+             }
+-            code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
++            code.and_(code.ABI_PARAM1.cvt32(), static_cast<u32>(fast_dispatch_mask));
+             code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
+             code.ret();
+             PerfMapRegister(fast_dispatch_table_lookup_in, code.getCurr(), "a64_fast_dispatch_table_lookup_in");
+@@ -582,7 +598,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         if (code.HasHostFeature(HostFeature::SSE42)) {
+             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
+         }
+-        code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
++        code.and_(code.ABI_PARAM1.cvt32(), static_cast<u32>(fast_dispatch_mask));
+         code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
+         code.ret();
+         PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index c60c5f3..f679a60 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -99,6 +99,12 @@ public:
+     /// cache owns its table; the handler finds it through JitState::od_fast_dispatch_table).
+     static size_t FastDispatchTableBytes();
+     static void ResetFastDispatchTable(void* table);
++    /// Omnidroid patch 0035: the entries a thread's table has under `conf` (its
++    /// `od_fast_dispatch_entries`, or the pin's `fast_dispatch_table_size` for 0 or a value that is
++    /// not a power of two from 0x40 to 0x10000), and the table's bytes and reset at that size.
++    static size_t FastDispatchEntries(const A64::UserConfig& conf);
++    static size_t FastDispatchTableBytes(size_t entries);
++    static void ResetFastDispatchTable(void* table, size_t entries);
+     /// The code `table` (one thread's) holds for `descriptor`, or null -- the probe the emitted
+     /// fast-dispatch handler makes, callable from the dispatcher's lookup so that a thread finds
+     /// what it has already looked up without the cache's lock.
+@@ -183,6 +189,9 @@ protected:
+     // Omnidroid patch 0017: allocated only when FastDispatch is enabled. As a by-value member it
+     // was 16 MiB constructed (and written: the entries have a non-zero initializer) in every Jit.
+     std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;
++    /// Omnidroid patch 0035: what the emitted handler and probe mask a hash with -- this cache's
++    /// threads' table size (`FastDispatchEntries(conf)`) in a shared cache, the pin's otherwise.
++    u64 fast_dispatch_mask = fast_dispatch_table_mask;
+     void ClearFastDispatchTable();
+ 
+     void (*memory_read_128)();
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index 26744ac..8e6cff3 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -353,8 +353,10 @@ public:
+                 throw std::invalid_argument("dynarmic: this Jit's configuration shapes code differently from the shared code cache's");
+             }
+             if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+-                fast_dispatch_table = std::make_unique<u8[]>(A64EmitX64::FastDispatchTableBytes());
+-                A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get());
++                // Omnidroid patch 0035: the size the cache's emitter masks with.
++                fast_dispatch_entries = A64EmitX64::FastDispatchEntries(shared->conf);
++                fast_dispatch_table = std::make_unique<u8[]>(A64EmitX64::FastDispatchTableBytes(fast_dispatch_entries));
++                A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get(), fast_dispatch_entries);
+             }
+             thread.jit_state = &jit_state;
+             thread.flush_routing = &FlushRoutingThunk;
+@@ -618,7 +620,7 @@ private:
+     void FlushRoutingState() {
+         jit_state.ResetRSB();
+         if (fast_dispatch_table) {
+-            A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get());
++            A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get(), fast_dispatch_entries);
+         }
+     }
+ 
+@@ -742,6 +744,7 @@ private:
+     // Patch 0022, shared cache only.
+     SharedThreadState thread;
+     std::unique_ptr<u8[]> fast_dispatch_table;
++    size_t fast_dispatch_entries = 0;  ///< Patch 0035: its entries.
+ 
+     bool invalidate_entire_cache = false;
+     boost::icl::interval_set<u64> invalid_cache_ranges;
+diff --git a/src/dynarmic/interface/A64/config.h b/src/dynarmic/interface/A64/config.h
+index b17dc39..a8e3967 100644
+--- a/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/interface/A64/config.h
+@@ -305,6 +305,11 @@ struct UserConfig {
+     /// must outlive the Jit.
+     SharedCodeCache* shared_code_cache = nullptr;
+ 
++    /// Omnidroid patch 0035 (x64 backend, shared cache only). Entries in each thread's
++    /// fast-dispatch table: a power of two from 0x40 to 0x10000; 0 is the pin's 0x1000 (64 KiB a
++    /// thread). The shared cache's value is every thread's -- its emitter masks with it.
++    std::size_t od_fast_dispatch_entries = 0;
++
+     /// Internal use only
+     bool very_verbose_debugging_output = false;
+ };

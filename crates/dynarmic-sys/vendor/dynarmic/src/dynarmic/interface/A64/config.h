@@ -305,6 +305,11 @@ struct UserConfig {
     /// must outlive the Jit.
     SharedCodeCache* shared_code_cache = nullptr;
 
+    /// Omnidroid patch 0035 (x64 backend, shared cache only). Entries in each thread's
+    /// fast-dispatch table: a power of two from 0x40 to 0x10000; 0 is the pin's 0x1000 (64 KiB a
+    /// thread). The shared cache's value is every thread's -- its emitter masks with it.
+    std::size_t od_fast_dispatch_entries = 0;
+
     /// Internal use only
     bool very_verbose_debugging_output = false;
 };

@@ -290,3 +290,14 @@ Omnidroid config: the value-compare monitor opens it). A block emitted after a s
 flags; the host clears the cache so every block is emitted again (`od_set_live_fp_optimizations`,
 `omni-linux`'s `OMNI_LEVER_FILE` `jit_fp=` lever and `OMNI_JIT_UNSAFE_FP`). Default 0: nothing
 changes unless a host asks. For an in-session A/B of the flags (docs/NIGHT-2026-10-02.md).
+### 0035 — x64: a thread's fast-dispatch table at its process's size
+
+x64, shared cache. `UserConfig::od_fast_dispatch_entries` (a power of two from 0x40 to 0x10000;
+anything else is the pin's 0x1000): the shared cache's emitter masks the fast-dispatch hash with
+its value (`fast_dispatch_mask`, set before the terminal handlers are emitted) and every thread
+of the cache allocates and resets its table at that size (`FastDispatchEntries(shared->conf)`).
+Omnidroid keeps the pin's 4,096 by default; `OMNI_JIT_FAST_DISPATCH_SYSTEM=1024` gives the system's host
+process 16 KiB a thread (~900 threads: 56 MiB of tables at 64 KiB) -- not the default until its
+lookup cost there is measured. Verified: `omni-cpu/tests/fast_dispatch_size.rs` -- 64
+entries for 200 `BLR` targets (every probe colliding) run every call to its own code, and 32
+threads at 64 entries hold ~2 MiB less C heap than at 4,096 (measured, within 10%).

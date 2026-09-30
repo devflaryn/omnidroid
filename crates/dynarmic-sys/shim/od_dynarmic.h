@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 5u
+#define OD_DYNARMIC_ABI_VERSION 6u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -237,6 +237,11 @@ typedef struct od_config {
      * 4 GiB (ART). arm64 hosts only: `od_jit_new` refuses it elsewhere, and
      * with `fastmem_enabled` 0 or a 32-bit mirrored window. */
     int fastmem_low_window;
+
+    /* Patch 0035 (x64, shared cache): entries in each thread's fast-dispatch
+     * table, a power of two from 0x40 to 0x10000; 0 (or anything else) is the
+     * pin's 0x1000 -- 64 KiB a thread. The cache's value is every thread's. */
+    uint32_t fast_dispatch_entries;
 } od_config;
 
 /* What dynarmic actually ended up configured with. Read back from the live

@@ -335,6 +335,7 @@ A64::UserConfig user_config_of(const od_config* config, A64::UserCallbacks* call
     } else {
         uc.fastmem_pointer = std::nullopt;
     }
+    uc.od_fast_dispatch_entries = config->fast_dispatch_entries;  /* patch 0035 */
     uc.define_unpredictable_behaviour = config->define_unpredictable_behaviour != 0;
     uc.check_halt_on_memory_access = config->check_halt_on_memory_access != 0;
     uc.enable_cycle_counting = config->enable_cycle_counting != 0;
@@ -473,6 +474,7 @@ void* od_jit_new(const od_config* config) {
         } else {
             uc.fastmem_pointer = std::nullopt;
         }
+        uc.od_fast_dispatch_entries = config->fast_dispatch_entries;  /* patch 0035 */
         uc.define_unpredictable_behaviour = config->define_unpredictable_behaviour != 0;
         uc.check_halt_on_memory_access = config->check_halt_on_memory_access != 0;
         uc.enable_cycle_counting = config->enable_cycle_counting != 0;

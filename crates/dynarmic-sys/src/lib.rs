@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 5;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 6;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -292,6 +292,10 @@ pub struct OdConfig {
     /// address below 2^32; at and above it the host address is the guest address. arm64 hosts
     /// only (`od_jit_new` refuses it elsewhere), with fastmem on and a window wider than 32 bits.
     pub fastmem_low_window: i32,
+    /// Patch 0035 (x64, shared cache): entries in each thread's fast-dispatch table, a power of
+    /// two from 0x40 to 0x10000; 0 (or anything else) is the pin's 0x1000 -- 64 KiB a thread. The
+    /// cache's value is every thread's.
+    pub fast_dispatch_entries: u32,
 }
 
 /// `OdConfig::optimizations` bits, mirroring `Dynarmic::OptimizationFlag`.

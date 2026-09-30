@@ -99,6 +99,12 @@ public:
     /// cache owns its table; the handler finds it through JitState::od_fast_dispatch_table).
     static size_t FastDispatchTableBytes();
     static void ResetFastDispatchTable(void* table);
+    /// Omnidroid patch 0035: the entries a thread's table has under `conf` (its
+    /// `od_fast_dispatch_entries`, or the pin's `fast_dispatch_table_size` for 0 or a value that is
+    /// not a power of two from 0x40 to 0x10000), and the table's bytes and reset at that size.
+    static size_t FastDispatchEntries(const A64::UserConfig& conf);
+    static size_t FastDispatchTableBytes(size_t entries);
+    static void ResetFastDispatchTable(void* table, size_t entries);
     /// The code `table` (one thread's) holds for `descriptor`, or null -- the probe the emitted
     /// fast-dispatch handler makes, callable from the dispatcher's lookup so that a thread finds
     /// what it has already looked up without the cache's lock.
@@ -183,6 +189,9 @@ protected:
     // Omnidroid patch 0017: allocated only when FastDispatch is enabled. As a by-value member it
     // was 16 MiB constructed (and written: the entries have a non-zero initializer) in every Jit.
     std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;
+    /// Omnidroid patch 0035: what the emitted handler and probe mask a hash with -- this cache's
+    /// threads' table size (`FastDispatchEntries(conf)`) in a shared cache, the pin's otherwise.
+    u64 fast_dispatch_mask = fast_dispatch_table_mask;
     void ClearFastDispatchTable();
 
     void (*memory_read_128)();

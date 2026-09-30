@@ -652,6 +652,7 @@ pub fn config_for(
         unsafe_optimizations: i32::from(opts.optimizations & !optimization::ALL_SAFE != 0),
         optimizations: opts.optimizations,
         fastmem_low_window: 0,
+        fast_dispatch_entries: 0,
     }
 }
 

@@ -40,6 +40,7 @@ dynarmic/
                and ../patches/0032-arm64-a-low-window-for-the-guest-s-first-4-gib.patch
                and ../patches/0033-arm64-a-mid-run-clear-forgets-the-return-stack-buffer.patch
                and ../patches/0034-x64-unsafe-fp-flags-switched-at-run-time.patch
+               and ../patches/0035-x64-a-thread-s-fast-dispatch-table-at-its-process-s-size.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
