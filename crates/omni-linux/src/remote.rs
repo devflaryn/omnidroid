@@ -719,7 +719,12 @@ mod tests {
     }
 
     fn sysroot() -> Option<Arc<crate::vfs::Sysroot>> {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sysroot/aosp-35");
+        // As the integration tests find it (`tests/common/mod.rs`): `OMNI_SYSROOT` (the Linux and
+        // macOS hosts keep theirs there), else the in-repo one.
+        let dir = std::env::var_os("OMNI_SYSROOT").map_or_else(
+            || std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sysroot/aosp-35"),
+            std::path::PathBuf::from,
+        );
         crate::vfs::Sysroot::open(&dir).ok()
     }
 
