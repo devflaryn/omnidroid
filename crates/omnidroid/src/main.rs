@@ -77,6 +77,7 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                        [--headless] [--no-window] [--control <file>]
        omnidroid aosp [--apk <path>] [--cookie <file|name>] [--place <id>] [--minutes <n>]
                       [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
+                      [--fresh-device] [--standby] [--instance <dir>]
        omnidroid which [--apk <path>]
        omnidroid login [<username> [<password>]] [--dir <dir>]
 
@@ -104,7 +105,14 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                     in; --minutes bounds the session (default 30); --size is the display's size at
                     boot; --gpu is the device's GPU backend (OMNI_GPU; auto: Vulkan on a host
                     with a Vulkan GPU, else the host's GLES); --with-systemui keeps SystemUI and
-                    the launcher (default: a single-app device)
+                    the launcher (default: a single-app device). The first session for an APK and
+                    account saves its device once signed in (<session dir>/omni-golden); later
+                    sessions boot a copy of it and open the place at once -- no install, no
+                    first boot, no cookie planted. --fresh-device makes a new device (the saved
+                    one is kept); --standby keeps the device waiting once launched (and in the
+                    place): a place id written to <instance>/data/local/tmp/join-place is joined,
+                    and <instance>/data/local/tmp/stop ends the session; --instance names the
+                    instance's directory
 
   login             sign in to Roblox in Chromium and keep the cookie, username and password in
                     <dir> (default <app-data>/../cookies): no arguments -- you sign in; a username
@@ -688,11 +696,25 @@ struct AospOptions {
     size: Option<(u32, u32)>,
     gpu: Option<String>,
     with_systemui: bool,
+    fresh_device: bool,
+    standby: bool,
+    instance: Option<PathBuf>,
 }
 
 fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, String> {
     let mut options =
-        AospOptions { apk: None, cookie: None, place: None, minutes: 30, size: None, gpu: None, with_systemui: false };
+        AospOptions {
+        apk: None,
+        cookie: None,
+        place: None,
+        minutes: 30,
+        size: None,
+        gpu: None,
+        with_systemui: false,
+        fresh_device: false,
+        standby: false,
+        instance: None,
+    };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -731,6 +753,9 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
                 options.gpu = Some(text);
             }
             "--with-systemui" => options.with_systemui = true,
+            "--fresh-device" => options.fresh_device = true,
+            "--standby" => options.standby = true,
+            "--instance" => options.instance = Some(PathBuf::from(value("--instance")?)),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -757,6 +782,12 @@ fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'
     }
     if let Some(gpu) = &options.gpu {
         env.push(("OMNI_GPU", gpu.clone()));
+    }
+    if options.standby {
+        env.push(("OMNI_R_STANDBY", "1".to_string()));
+    }
+    if let Some(dir) = &options.instance {
+        env.push(("OMNI_R_INSTANCE", dir.display().to_string()));
     }
     env
 }
@@ -813,6 +844,9 @@ fn aosp(options: &AospOptions) -> ExitCode {
             Some(std::fs::canonicalize(&path).unwrap_or(path))
         }
     };
+    // The session (cargo, the test, the device's host processes) ends with this process, however it
+    // ends: a caller that kills the launcher (the MCP server) leaves nothing running.
+    omni_platform::process::hold_children();
     let mut run = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     run.current_dir(repo_root())
         .args(["test", "--release", "-q", "-p", "omni-linux", "--test", "r_roblox", "--", "--ignored", "--nocapture"]);
@@ -832,6 +866,10 @@ fn aosp(options: &AospOptions) -> ExitCode {
         }
         None => temp,
     };
+    // The saved devices (r_roblox's OMNI_R_GOLDEN), beside the sessions.
+    if !options.fresh_device {
+        run.env("OMNI_R_GOLDEN", session_dir.join("omni-golden"));
+    }
     // Graphics buffers a finished session handed between its processes (`omni-shm-*`).
     for dir in [session_dir.clone(), PathBuf::from("/dev/shm")] {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -960,6 +998,10 @@ mod tests {
         assert!(args(&["--place", "0"]).is_err());
         assert!(args(&["--minutes", "0"]).is_err());
         assert!(args(&["--fresh"]).is_err(), "play's options are not aosp's");
+        let o = args(&["--fresh-device", "--standby", "--instance", "d"]).expect("parsed");
+        assert_eq!((o.fresh_device, o.standby, o.instance.as_deref()), (true, true, Some(Path::new("d"))));
+        let env = aosp_env(&o, Path::new("r.apk"), None);
+        assert!(env.contains(&("OMNI_R_STANDBY", "1".to_string())) && env.contains(&("OMNI_R_INSTANCE", "d".to_string())));
     }
 
     #[test]
@@ -976,7 +1018,7 @@ mod tests {
         assert_eq!(get("OMNI_WINDOW_SIZE"), Some("960x540"));
         assert_eq!(get("OMNI_GPU"), Some("gl"));
         let bare = aosp_env(&parse_aosp(std::iter::empty()).expect("parsed"), Path::new("r.apk"), None);
-        assert!(bare.iter().all(|(k, _)| !matches!(*k, "OMNI_R_COOKIE" | "OMNI_R_PLACE" | "OMNI_GPU")));
+        assert!(bare.iter().all(|(k, _)| !matches!(*k, "OMNI_R_COOKIE" | "OMNI_R_PLACE" | "OMNI_GPU" | "OMNI_R_STANDBY" | "OMNI_R_INSTANCE")));
     }
 
     #[test]

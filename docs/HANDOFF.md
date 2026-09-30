@@ -1,5 +1,68 @@
 # Handoff
 
+## FAST STARTS: SAVED DEVICES AND A STANDBY INSTANCE (2026-09-30 evening, Windows; uncommitted on `main`)
+
+Goal (owner): an agent driving omnidroid over MCP, paid per hour of LLM serving, must not wait
+minutes for a boot -- a few seconds from `start_instance` to being in the place. Every run:
+`~/Desktop/Roblox-2.740.931.apk`, `Desktop/cookies/HeZmI_ImYu1080.txt`, PS99, kiosk, release. Each
+log's `[t] +<secs>s` lines (`tests/common/boot.rs`: a mark each second, the milestones again) give
+the timeline.
+
+| from `start_instance` (or the run's start) | seconds | what |
+|---|---|---|
+| a device made new (before; still the first session for an APK + account) | **492** to `onGameLoaded` | boot_completed 164, install 197, first start, cookie planted and started again 271, DID_LOG_IN 398, a fixed 45 s, join 444 |
+| a saved device (`omnidroid aosp`, always) | **210-215** when the app lives (one start from the launcher; the relaunch below adds ~45 s) | device copied 1.4 s, boot_completed 118-125, `am start` 153, DID_LOG_IN 171, join 172, Joining 182, loaded 215 |
+| **the standby, already in the place** (`OMNI_MCP_STANDBY=1`) | **0.008** (`start_instance` answers `state: in_game`) | measured through the real `omni-mcp.exe` over stdio |
+| the standby, another place | 31 (NDS 189707) / 50 (back to PS99) | pick-up <1 s, Joining +15-22 s, loaded +7-32 s |
+
+What makes it:
+- **Saved devices** (`r_roblox`, `OMNI_R_GOLDEN`; `omnidroid aosp` sets it to
+  `<session dir>/omni-golden`, `--fresh-device` opts out). The first session boots a new device as
+  before, and once signed in stops the app, syncs, kills the device, copies its directory (790-803
+  MiB, 1.5 s; less `.omni-binds`, `.omni-loopback`, `/data/local/tmp`) and boots the same device
+  again. Later sessions boot a copy: no APEX decompression, no first package scan or role grants,
+  no install or dexopt, no cookie dance. Keyed by APK stem+size, cookie file stem+mtime, kiosk,
+  locale and `DEVICE_SETUP` (now 2).
+  - The package installer must stay enabled on a saved device: PackageManager dies at the next boot
+    without one ("There must be exactly one installer; found []"). The cold setup no longer
+    disables it when it will save; every boot of a saved device disables it once up.
+  - A saved device whose app runs 10 minutes without signing in (and never died) is set aside.
+- **Start from the launcher, then the link.** Opening the place's link on a cold app goes
+  ActivityProtocolLaunch -> "no AppSettings ... Finish self!" -> a pause timeout -> the splash, and
+  that put libzstd-jni's initialisation past its worker's ~20 s (library load -> `nativeInitClientSettings`
+  18.1-18.3 s against 10-16 s from the launcher): 5 of 6 such starts died with the known SIGSEGV at
+  0x40 (research note 2026-09-29). From the launcher: none in the standby runs.
+- **An app that dies is started again at once** (host writes `app-died` on "Process
+  com.roblox.client (pid ...) has died"; the join loop and the sign-in wait react), and a standby
+  in a place joins it again when the app dies or the server disconnects it.
+- **The standby** (`omni-mcp`, `OMNI_MCP_STANDBY=1`): at `initialized` the server boots
+  `omnidroid aosp --standby --instance <temp>/omni-linux-r-standby-<secs>` with the configured
+  APK, cookie and place, not killed on exit. `start_instance` with the same APK and account takes it
+  over (`claimed`); a different place is written to `join-place`, which the device's wait loop
+  joins. On server exit a taken-over standby is given back still running; `stop_instance` ends it
+  (the `stop` file) and boots the next. `list_instances` reports `state` (booting, signed_in,
+  joining, in_game + `in_place`, stopped) from the instance's files.
+- **Sessions end whole.** A Windows job object (`omni_platform::process::hold_children`) in
+  `omnidroid aosp` and in the system's host process: killing either ends every host process under
+  it (before, 4 of 6 app host processes outlived a killed system). Linux: app host processes ask
+  `PR_SET_PDEATHSIG` (`end_with_parent`). Every instance stops through its `stop` file first.
+- **`/proc/<pid>` of another live process** (`procfs::another`: `stat`, `status`, `statm`,
+  `cmdline`, `comm` only). ActivityManager checks a provider's process with `/proc/<pid>/stat`
+  (`isProcessAliveLocked`); with none, a live MediaProvider whose priority had just changed was
+  "crashing", Roblox was detached from it and waited 20 s, and the game load stalled at 0.01 fps.
+
+Open:
+- **30 s of every boot is WindowManager's BOOT_TIMEOUT**: a kiosk device has no wallpaper (the image
+  wallpaper is SystemUI's) and `config_checkWallpaperAtBoot` holds the display, and with it
+  `boot_completed`, until "***** BOOT TIMEOUT: forcing display enabled". A fabricated overlay
+  (`cmd overlay fabricate`, root only) sets it, but does not survive a reboot here (idmap2d fails at
+  boot, "service 'idmap' died"). A static RRO in the device overlay, or a wallpaper, would end it.
+- The Android boot of a saved device (~120 s) is the rest: 22 s before servicemanager starts, 20 s
+  of init services, 21 s of system_server services, each app host process preloading the zygote's
+  classes (no fork).
+- The standby holds ~4-5 GB and some CPU while it waits; it lives `OMNI_MCP_STANDBY_MINUTES` (720).
+- Linux/macOS not run (omni-platform type-checks for Linux; macOS stubs are no-ops).
+
 ## PERF-WIN: LIGHTER, THE MOUSE THE APP'S, NO HIDDEN DIALOG (2026-09-29 early, Windows; branch `perf-win`, `af44f0e`..`ca3a505`)
 
 Goal (owner): RAM well below ~5.1-5.5 GB (toward ~4 GB); the mouse absolute-free like the old path

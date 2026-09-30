@@ -49,13 +49,22 @@ pub struct Boot {
     /// Every line, kept for a failure's reader: `<temp>/<instance name>.log`.
     pub log: PathBuf,
     log_file: Option<std::fs::File>,
+    /// When this boot started: the milestones (`MILESTONES`) are logged with their time from it.
+    started: Instant,
+    /// When the last bare time mark was logged, from `started`.
+    marked: Duration,
 }
+
+/// Lines a boot's time is read from: each is logged again as `[t] +<secs>s <line>`.
+const MILESTONES: &[&str] = &["[r] ", "[zygote] launching", "DID_LOG_IN", "Joining game", "onGameLoaded", "Upgrade required", "GUEST THREAD DIED"];
 
 impl Boot {
     /// Boot `instance` (made fresh) with system_server, `extra` runner arguments and the `then`
     /// shell command run beside it as the shell user.
     pub fn start(sysroot: &Path, instance: PathBuf, extra: &[&str], then: &str) -> Self {
+        let derive = Instant::now();
         let exports = derive_classpath(sysroot, &instance);
+        eprintln!("[boot] derive_classpath: {} ms", derive.elapsed().as_millis());
         let ss_classpath = exports.iter().find(|(k, _)| k == "SYSTEMSERVERCLASSPATH").map(|(_, v)| v.clone()).expect("SYSTEMSERVERCLASSPATH");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_omni-linux-run"));
         cmd.args(["--sysroot", &sysroot.to_string_lossy(), "--instance", &instance.to_string_lossy(), "--uid", "1000"]);
@@ -85,7 +94,7 @@ impl Boot {
         }
         let log = instance.with_extension("log");
         let log_file = std::fs::File::create(&log).ok();
-        Self { child, lines, tail: std::collections::VecDeque::new(), instance, log, log_file }
+        Self { child, lines, tail: std::collections::VecDeque::new(), instance, log, log_file, started: Instant::now(), marked: Duration::ZERO }
     }
 
     /// Give each line to `seen` until it answers that the boot has shown what it must, the runner
@@ -103,6 +112,16 @@ impl Boot {
             if let Some(f) = &mut self.log_file {
                 use std::io::Write;
                 let _ = writeln!(f, "{line}");
+                // A bare mark at most once a second: the time of every line to within a second.
+                if self.started.elapsed() >= self.marked + Duration::from_secs(1) {
+                    self.marked = self.started.elapsed();
+                    let _ = writeln!(f, "[t] +{:.1}s", self.marked.as_secs_f64());
+                }
+                if MILESTONES.iter().any(|m| line.contains(m)) {
+                    let at = format!("[t] +{:.1}s {}", self.started.elapsed().as_secs_f64(), line.chars().take(120).collect::<String>());
+                    let _ = writeln!(f, "{at}");
+                    eprintln!("{at}");
+                }
             }
             done = seen(&line);
             self.tail.push_back(line);
@@ -110,6 +129,12 @@ impl Boot {
                 self.tail.pop_front();
             }
         }
+    }
+
+    /// End the runner (its instance is kept until this boot is dropped).
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Shut this boot down keeping its instance (its `/data`), and boot the instance again with

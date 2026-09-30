@@ -36,6 +36,12 @@ pub struct Config {
     /// The repository root to run the launcher in (its `aosp` subcommand invokes `cargo test`).
     /// `OMNI_MCP_REPO`, else derived from the executable's path.
     pub repo_dir: Option<PathBuf>,
+    /// Keep a standby instance: booted (from the saved device), signed in and -- with a configured
+    /// place -- in that place, waiting for the next `start_instance`, which takes it over instead of
+    /// booting. It outlives this server, so the next session finds it waiting. `OMNI_MCP_STANDBY=1`.
+    pub standby: bool,
+    /// How long a standby instance lives, in minutes. `OMNI_MCP_STANDBY_MINUTES` (default 720).
+    pub standby_minutes: u64,
 }
 
 impl Config {
@@ -66,6 +72,8 @@ impl Config {
             minutes: std::env::var("OMNI_MCP_MINUTES").ok().and_then(|v| v.parse().ok()),
             omnidroid_bin,
             repo_dir,
+            standby: std::env::var("OMNI_MCP_STANDBY").as_deref() == Ok("1"),
+            standby_minutes: std::env::var("OMNI_MCP_STANDBY_MINUTES").ok().and_then(|v| v.parse().ok()).unwrap_or(720),
         }
     }
 }
@@ -73,7 +81,12 @@ impl Config {
 /// One booted omnidroid instance.
 struct Instance {
     id: String,
-    child: Child,
+    /// The launcher this server started; none for a standby instance another server started.
+    child: Option<Child>,
+    /// The instance's directory (`<dir>/data/local/tmp` holds its state; `<dir>.log` its log).
+    dir: PathBuf,
+    /// Taken over from standby: given back (still running) when this server exits.
+    standby: bool,
     screenshot: PathBuf,
     apk: Option<PathBuf>,
     place: Option<String>,
@@ -87,6 +100,58 @@ pub struct Server {
     next_instance: u64,
     lab: Option<Session>,
     lab_source: Option<String>,
+    /// The standby instance this server started, while it has not been taken over.
+    standby_child: Option<(Child, PathBuf)>,
+}
+
+/// The prefix of a standby instance's directory in the temp directory (`<prefix><unix secs>`).
+const STANDBY_PREFIX: &str = "omni-linux-r-standby-";
+
+/// A file in the instance's `/data/local/tmp`: its state, as `r_roblox` keeps it.
+fn state_file(dir: &Path, name: &str) -> PathBuf {
+    dir.join("data/local/tmp").join(name)
+}
+
+/// Whether an instance's session still runs: its log written in the last 90 s (the device's log
+/// never goes quiet that long) and no stop asked for.
+fn alive(dir: &Path) -> bool {
+    let fresh = std::fs::metadata(dir.with_extension("log"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(90));
+    fresh && !state_file(dir, "stop").exists()
+}
+
+/// A running standby instance nobody has taken over, if there is one (the newest).
+fn waiting_standby() -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(std::env::temp_dir())
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(STANDBY_PREFIX) && e.path().is_dir())
+        .map(|e| e.path())
+        .filter(|d| alive(d) && !state_file(d, "claimed").exists())
+        .collect();
+    found.sort();
+    found.pop()
+}
+
+/// What an instance has reached, from the files its session keeps: `booting`, `signed_in`,
+/// `joining`, `in_game` (with the place), `stopped`.
+fn instance_state(dir: &Path) -> (&'static str, Option<String>) {
+    if !alive(dir) {
+        return ("stopped", None);
+    }
+    if let Ok(place) = std::fs::read_to_string(state_file(dir, "game-loaded")) {
+        return ("in_game", Some(place.trim().to_string()));
+    }
+    if state_file(dir, "joining").exists() {
+        ("joining", None)
+    } else if state_file(dir, "signed-in").exists() {
+        ("signed_in", None)
+    } else {
+        ("booting", None)
+    }
 }
 
 impl Server {
@@ -99,7 +164,101 @@ impl Server {
             next_instance: 1,
             lab: None,
             lab_source: None,
+            standby_child: None,
         }
+    }
+
+    /// The launcher's command for a session in `dir`: the APK, the account, the place and the
+    /// display as given.
+    #[allow(clippy::too_many_arguments)]
+    fn launcher(&self, dir: &Path, apk: &Path, cookie: Option<&str>, place: Option<&str>, gpu: &str, size: Option<&str>, minutes: Option<u64>) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.config.omnidroid_bin);
+        cmd.arg("aosp").arg("--apk").arg(apk).arg("--gpu").arg(gpu).arg("--instance").arg(dir);
+        if let Some(c) = cookie {
+            cmd.arg("--cookie").arg(c);
+        }
+        if let Some(p) = place {
+            cmd.arg("--place").arg(p);
+        }
+        if let Some(sz) = size {
+            cmd.arg("--size").arg(sz);
+        }
+        if let Some(m) = minutes {
+            cmd.arg("--minutes").arg(m.to_string());
+        }
+        // The screenshot path we can read (r_roblox honours a preset OMNI_SCREENSHOT).
+        cmd.env("OMNI_SCREENSHOT", dir.with_extension("png"));
+        if let Some(ram) = self.config.device_ram_mb {
+            cmd.env("OMNI_DEVICE_RAM_MB", ram.to_string());
+        }
+        if let Some(repo) = &self.config.repo_dir {
+            cmd.current_dir(repo);
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd
+    }
+
+    /// With `standby` configured, boot a standby instance unless one runs (this server's, still
+    /// booting, or any waiting one).
+    fn ensure_standby(&mut self) {
+        if !self.config.standby {
+            return;
+        }
+        if let Some((child, _)) = &mut self.standby_child {
+            if matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+            self.standby_child = None;
+        }
+        if waiting_standby().is_some() {
+            return;
+        }
+        let Some(apk) = self.config.apk.clone().filter(|a| a.is_file()) else { return };
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let dir = std::env::temp_dir().join(format!("{STANDBY_PREFIX}{secs}"));
+        let mut cmd = self.launcher(
+            &dir,
+            &apk,
+            self.config.cookie.as_deref(),
+            self.config.place.as_deref(),
+            &self.config.gpu,
+            self.config.size.as_deref(),
+            Some(self.config.standby_minutes),
+        );
+        cmd.arg("--standby");
+        if let Ok(child) = cmd.spawn() {
+            self.standby_child = Some((child, dir));
+        }
+    }
+
+    /// Take over a waiting standby instance (or this server's, still booting) for `place`: the
+    /// place is joined unless it is the one the standby is in or is on its way into.
+    fn claim_standby(&mut self, place: Option<&str>) -> Option<(String, PathBuf, &'static str)> {
+        let dir = match self.standby_child.take() {
+            // This server's own: from now on an instance like the others (its launcher left running).
+            Some((_child, dir)) if !state_file(&dir, "claimed").exists() => dir,
+            _ => waiting_standby()?,
+        };
+        let _ = std::fs::create_dir_all(state_file(&dir, ""));
+        let _ = std::fs::write(state_file(&dir, "claimed"), "1");
+        let loaded = std::fs::read_to_string(state_file(&dir, "game-loaded")).ok().map(|p| p.trim().to_string());
+        let note = match place {
+            Some(p) if loaded.as_deref() == Some(p) => "standby taken over: already in the place",
+            Some(p) if loaded.is_none() && self.config.place.as_deref() == Some(p) => "standby taken over: on its way into the place",
+            Some(p) => {
+                // Not in the place asked for until it has loaded that one.
+                let _ = std::fs::remove_file(state_file(&dir, "game-loaded"));
+                let _ = std::fs::remove_file(state_file(&dir, "joining"));
+                let _ = std::fs::write(state_file(&dir, "join-place"), p);
+                "standby taken over: joining the place"
+            }
+            None => "standby taken over",
+        };
+        let id = format!("inst-{}", self.next_instance);
+        self.next_instance += 1;
+        Some((id, dir, note))
     }
 
     // ---- helpers ------------------------------------------------------------------------------
@@ -209,44 +368,53 @@ impl Server {
         let size = args.get("size").and_then(Json::as_str).map(str::to_string).or_else(|| self.config.size.clone());
         let minutes = args.get("minutes").and_then(Json::as_u64).or(self.config.minutes);
 
+        // A standby instance of the same APK and account is taken over: no boot at all.
+        let same_setup = Some(apk.as_path()) == self.config.apk.as_deref()
+            && cookie == self.config.cookie
+            && args.get("gpu").is_none()
+            && args.get("size").is_none();
+        if self.config.standby && same_setup {
+            if let Some((id, dir, note)) = self.claim_standby(place.as_deref()) {
+                let screenshot = dir.with_extension("png");
+                let (state, in_place) = instance_state(&dir);
+                self.instances.insert(
+                    id.clone(),
+                    Instance {
+                        id: id.clone(),
+                        child: None,
+                        dir,
+                        standby: true,
+                        screenshot: screenshot.clone(),
+                        apk: Some(apk),
+                        place,
+                        started: std::time::Instant::now(),
+                    },
+                );
+                return Ok(json::obj([
+                    ("instance_id", json::s(id)),
+                    ("state", json::s(state)),
+                    ("in_place", in_place.map_or(Json::Null, json::s)),
+                    ("screenshot_path", json::s(screenshot.to_string_lossy().into_owned())),
+                    ("note", json::s(format!("{note}; `list_instances` shows its state (in_game once the place has loaded)"))),
+                ]));
+            }
+        }
+
         let id = format!("inst-{}", self.next_instance);
         self.next_instance += 1;
-        let screenshot = std::env::temp_dir().join(format!("omni-mcp-{id}.png"));
+        let dir = std::env::temp_dir().join(format!("omni-linux-r-mcp-{}-{id}", std::process::id()));
+        let screenshot = dir.with_extension("png");
         let _ = std::fs::remove_file(&screenshot);
-
-        let mut cmd = std::process::Command::new(&self.config.omnidroid_bin);
-        cmd.arg("aosp").arg("--apk").arg(&apk).arg("--gpu").arg(&gpu);
-        if let Some(c) = &cookie {
-            cmd.arg("--cookie").arg(c);
-        }
-        if let Some(p) = &place {
-            cmd.arg("--place").arg(p);
-        }
-        if let Some(sz) = &size {
-            cmd.arg("--size").arg(sz);
-        }
-        if let Some(m) = minutes {
-            cmd.arg("--minutes").arg(m.to_string());
-        }
-        // The screenshot path we can read (r_roblox honours a preset OMNI_SCREENSHOT).
-        cmd.env("OMNI_SCREENSHOT", &screenshot);
-        if let Some(ram) = self.config.device_ram_mb {
-            cmd.env("OMNI_DEVICE_RAM_MB", ram.to_string());
-        }
-        if let Some(repo) = &self.config.repo_dir {
-            cmd.current_dir(repo);
-        }
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
+        let mut cmd = self.launcher(&dir, &apk, cookie.as_deref(), place.as_deref(), &gpu, size.as_deref(), minutes);
         let child = cmd.spawn().map_err(|e| {
             RpcError::server(format!("could not start {}: {e}", self.config.omnidroid_bin.display()))
         })?;
         let pid = child.id();
         let instance = Instance {
             id: id.clone(),
-            child,
+            child: Some(child),
+            dir,
+            standby: false,
             screenshot: screenshot.clone(),
             apk: Some(apk),
             place: place.clone(),
@@ -258,26 +426,36 @@ impl Server {
             ("instance_id", json::s(id)),
             ("pid", Json::Num(pid as f64)),
             ("screenshot_path", json::s(screenshot.to_string_lossy().into_owned())),
-            ("note", json::s("booting; poll `screenshot` for a frame (a boot takes minutes)")),
+            ("state", json::s("booting")),
+            ("note", json::s("booting; `list_instances` shows its state (in_game once the place has loaded)")),
         ]))
     }
 
     fn stop_instance(&mut self, args: &Json) -> Result<Json, RpcError> {
         let id = args.get("instance_id").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `instance_id`"))?;
         let mut inst = self.instances.remove(id).ok_or_else(|| RpcError::params(format!("no instance {id}")))?;
-        let _ = inst.child.kill();
-        let _ = inst.child.wait();
+        stop(&mut inst);
+        // A standby taken over and stopped: the next one boots now.
+        if inst.standby {
+            self.ensure_standby();
+        }
         Ok(json::obj([("instance_id", json::s(id)), ("stopped", Json::Bool(true))]))
     }
 
     fn list_instances(&mut self) -> Json {
         let mut out = Vec::new();
         for inst in self.instances.values_mut() {
-            let running = matches!(inst.child.try_wait(), Ok(None));
+            let (state, in_place) = instance_state(&inst.dir);
+            // Until its session writes a log, a launcher still running is booting.
+            let launching = inst.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None))) && !inst.dir.with_extension("log").exists();
+            let state = if launching { "booting" } else { state };
             out.push(json::obj([
                 ("instance_id", json::s(inst.id.clone())),
-                ("pid", Json::Num(inst.child.id() as f64)),
-                ("running", Json::Bool(running)),
+                ("pid", inst.child.as_ref().map_or(Json::Null, |c| Json::Num(c.id() as f64))),
+                ("running", Json::Bool(state != "stopped")),
+                ("state", json::s(state)),
+                ("in_place", in_place.map_or(Json::Null, json::s)),
+                ("log", json::s(inst.dir.with_extension("log").to_string_lossy().into_owned())),
                 ("uptime_s", Json::Num(inst.started.elapsed().as_secs() as f64)),
                 ("apk", inst.apk.as_ref().map(|a| json::s(a.to_string_lossy().into_owned())).unwrap_or(Json::Null)),
                 ("place", inst.place.as_ref().map(|p| json::s(p.clone())).unwrap_or(Json::Null)),
@@ -564,7 +742,10 @@ impl Dispatch for Server {
                     json::obj([("name", json::s("omni-mcp")), ("version", json::s(env!("CARGO_PKG_VERSION")))]),
                 ),
             ])),
-            "notifications/initialized" | "initialized" => Ok(Json::Null),
+            "notifications/initialized" | "initialized" => {
+                self.ensure_standby();
+                Ok(Json::Null)
+            }
             "ping" => Ok(json::obj([])),
             "tools/list" => Ok(Self::tool_list()),
             "tools/call" => {
@@ -580,11 +761,26 @@ impl Dispatch for Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        // Do not leave booted instances running when the server exits.
+        // Do not leave booted instances running when the server exits -- but a standby taken over
+        // is given back, still running (and in its place), for the next session to take.
         for inst in self.instances.values_mut() {
-            let _ = inst.child.kill();
-            let _ = inst.child.wait();
+            if inst.standby {
+                let _ = std::fs::remove_file(state_file(&inst.dir, "claimed"));
+            } else {
+                stop(inst);
+            }
         }
+    }
+}
+
+/// Stop an instance: its session is asked to end (it shuts the device down and removes its
+/// directory), and the launcher this server started is ended.
+fn stop(inst: &mut Instance) {
+    let _ = std::fs::create_dir_all(state_file(&inst.dir, ""));
+    let _ = std::fs::write(state_file(&inst.dir, "stop"), "1");
+    if let Some(child) = &mut inst.child {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -610,7 +806,7 @@ macro_rules! p {
 }
 
 static TOOLS: &[Tool] = &[
-    Tool { name: "start_instance", desc: "Boot a real omnidroid instance for an APK (installs, launches, optionally signs in and joins a place). Long-running.", params: &[
+    Tool { name: "start_instance", desc: "Start an omnidroid instance for an APK (signs in and joins a place). Returns at once: with a standby instance waiting (OMNI_MCP_STANDBY=1) it is taken over -- already in the place, or joining it -- otherwise a device boots. `list_instances` shows its state: booting, signed_in, joining, in_game.", params: &[
         p!("apk","string",false,"APK path (else the configured default)"),
         p!("cookie","string",false,"cookie file path or saved account name"),
         p!("place","string",false,"place id to join (e.g. 8737899170)"),
@@ -619,7 +815,7 @@ static TOOLS: &[Tool] = &[
         p!("minutes","number",false,"minutes to run"),
     ]},
     Tool { name: "stop_instance", desc: "Stop a running instance.", params: &[p!("instance_id","string",true,"the id from start_instance")] },
-    Tool { name: "list_instances", desc: "List instances this server has started and whether each is still running.", params: &[] },
+    Tool { name: "list_instances", desc: "List this server's instances: each one's state (booting, signed_in, joining, in_game with the place, stopped) and log.", params: &[] },
     Tool { name: "install_apk", desc: "Record an APK as the default to install and boot on the next start_instance/launch_app.", params: &[p!("apk","string",true,"APK path")] },
     Tool { name: "launch_app", desc: "Boot the app (same as start_instance on the real-AOSP path).", params: &[p!("apk","string",false,"APK path"),p!("cookie","string",false,"cookie"),p!("place","string",false,"place id")] },
     Tool { name: "login", desc: "Record a cookie (file path or saved account name) for the next boot.", params: &[p!("cookie","string",true,"cookie file path or saved account name")] },

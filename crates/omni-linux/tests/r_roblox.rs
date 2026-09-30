@@ -50,6 +50,75 @@ fn histogram(png: &Path) -> Option<(f64, usize)> {
     Some((black as f64 / (width * height).max(1) as f64, colours.len()))
 }
 
+
+/// What belongs to one boot or one run and is no part of a saved device: the bind table (vold
+/// binds again at boot), the loopback namespace, and the run's own files in `/data/local/tmp`.
+const NOT_SAVED: &[&str] = &[".omni-binds", ".omni-loopback", "data/local/tmp"];
+
+/// Copy the device at `from` into `to` (made), less `NOT_SAVED`: the bytes copied.
+fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
+    fn walk(from: &Path, to: &Path, rel: &Path, bytes: &mut u64) -> std::io::Result<()> {
+        std::fs::create_dir_all(to.join(rel))?;
+        for e in std::fs::read_dir(from.join(rel))? {
+            let e = e?;
+            let r = rel.join(e.file_name());
+            if NOT_SAVED.iter().any(|n| r == Path::new(n)) {
+                continue;
+            }
+            if e.file_type()?.is_dir() {
+                walk(from, to, &r, bytes)?;
+            } else {
+                *bytes += std::fs::copy(e.path(), to.join(&r))?;
+            }
+        }
+        Ok(())
+    }
+    let mut bytes = 0;
+    walk(from, to, Path::new(""), &mut bytes)?;
+    std::fs::create_dir_all(to.join("data/local/tmp"))?;
+    Ok(bytes)
+}
+
+/// How saved devices are set up: a device saved by an older setup is not booted (2: the package
+/// installer kept enabled).
+const DEVICE_SETUP: u32 = 2;
+
+/// The saved device for this APK, account and device setup under `root`: a new APK, a new cookie
+/// file or another setup is another device.
+fn golden_dir(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool, locale: &str) -> PathBuf {
+    let stamp = |p: &Path| {
+        std::fs::metadata(p).map_or((0, 0), |m| {
+            let at = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+            (m.len(), at)
+        })
+    };
+    let stem = |p: &Path| p.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let (apk_len, _) = stamp(apk);
+    let account = cookie.map_or_else(|| "guest".to_string(), |c| format!("{}-{}", stem(c), stamp(c).1));
+    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}", stem(apk), if kiosk { "kiosk" } else { "ui" });
+    root.join(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>())
+}
+
+/// The place's deep link, as a link opened on a device, up to four times (the app sometimes
+/// answers the link by restarting its session and settling on Home instead of joining,
+/// 2026-09-29); `first` seconds for the first try to show "Joining game" (a cold app signs in
+/// first), 90 for the others. An app that dies on the way (`app-died`, written by the host) is
+/// started again at once: an app started while the device is still busy with its boot can lose
+/// libzstd-jni's startup race (its worker calls through a table ~20 s after load, and the
+/// initialisation that fills it came later -- SIGSEGV at 0x40, 2026-09-30). `id` is a number or a
+/// shell variable. `joining` is written when the app logs "Joining game".
+fn join_script(id: &str, first: u32) -> String {
+    format!(
+        "rm -f /data/local/tmp/joining /data/local/tmp/app-died; for try in 1 2 3 4; do \
+         am start -a android.intent.action.VIEW -d \"roblox://experiences/start?placeId={id}\" -n com.roblox.client/com.roblox.client.ActivityProtocolLaunch; \
+         echo \"[r] join intent for {id} (try $try): $?\"; \
+         w=90; [ $try = 1 ] && w={first}; \
+         j=0; until [ -e /data/local/tmp/joining ] || [ -e /data/local/tmp/app-died ] || [ $j -ge $w ]; do sleep 1; j=$((j+1)); done; \
+         [ -e /data/local/tmp/joining ] && break; \
+         if [ -e /data/local/tmp/app-died ]; then rm -f /data/local/tmp/app-died; echo \"[r] the app died: started again\"; fi; done; "
+    )
+}
+
 #[test]
 #[ignore = "boots the whole system, installs and starts an app: many minutes"]
 fn the_apk_is_installed_started_and_draws() {
@@ -58,19 +127,19 @@ fn the_apk_is_installed_started_and_draws() {
         .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Roblox-2.738.1397.apk"), PathBuf::from);
     assert!(apk.exists(), "no APK at {}", apk.display());
     let minutes: u64 = std::env::var("OMNI_R_MINUTES").ok().and_then(|m| m.parse().ok()).unwrap_or(20);
-    let tag = format!("omni-linux-r-{}", std::process::id());
-    let instance = std::env::temp_dir().join(&tag);
+    // `OMNI_R_INSTANCE=<dir>`: the instance's directory, named by the caller (the MCP server, which
+    // reaches a standby instance through its files); else `<temp>/omni-linux-r-<pid>`.
+    let instance = std::env::var_os("OMNI_R_INSTANCE")
+        .map_or_else(|| std::env::temp_dir().join(format!("omni-linux-r-{}", std::process::id())), PathBuf::from);
     let _ = std::fs::remove_dir_all(&instance);
     let tmp = instance.join("data/local/tmp");
-    std::fs::create_dir_all(&tmp).expect("/data/local/tmp");
-    std::fs::copy(&apk, tmp.join("app.apk")).expect("the APK");
     // A caller (the MCP server, `omni-mcp`) can name the live framebuffer PNG up front by presetting
     // OMNI_SCREENSHOT, so it knows where to read a frame from without guessing this process's pid.
     // Otherwise the default is this instance's own path.
     let screenshot = std::env::var_os("OMNI_SCREENSHOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| instance.with_extension("png"));
-    let shots = std::env::temp_dir().join(format!("{tag}-shots"));
+    let shots = PathBuf::from(format!("{}-shots", instance.display()));
     let _ = std::fs::create_dir_all(&shots);
     std::env::set_var("OMNI_SCREENSHOT", &screenshot);
 
@@ -89,20 +158,30 @@ fn the_apk_is_installed_started_and_draws() {
     } else {
         ""
     };
+    let place = std::env::var("OMNI_R_PLACE").ok();
     // `OMNI_R_PLACE=<id>`: once signed in, the place's deep link, as a link opened on a device.
-    let join = std::env::var("OMNI_R_PLACE").ok().map_or_else(String::new, |id| {
-        // Up to three times: the app sometimes answers the link by restarting its session and
-        // settling on Home instead of joining (2026-09-29). `joining` is written when it logs
-        // "Joining game".
+    let join = place.as_deref().map_or_else(String::new, |id| {
         format!(
-            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 45; \
-             for try in 1 2 3; do \
-             am start -a android.intent.action.VIEW -d 'roblox://experiences/start?placeId={id}' -n com.roblox.client/com.roblox.client.ActivityProtocolLaunch; \
-             echo \"[r] join intent for {id} (try $try): $?\"; \
-             j=0; until [ -e /data/local/tmp/joining ] || [ $j -ge 90 ]; do sleep 1; j=$((j+1)); done; \
-             [ -e /data/local/tmp/joining ] && break; done; "
+            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 45; {}",
+            join_script(id, 90)
         )
     });
+    // `OMNI_R_STANDBY=1`: once launched (and in the place, with `OMNI_R_PLACE`), the device waits
+    // for the host: a place id written to `/data/local/tmp/join-place` is joined (the MCP server's
+    // `start_instance` on a standby instance). The host writes `/data/local/tmp/standby` when the
+    // wait starts, `game-loaded` (the place id) while a place is loaded, and rejoins a place the
+    // server disconnected; `/data/local/tmp/stop` ends the run.
+    let standby = std::env::var("OMNI_R_STANDBY").as_deref() == Ok("1");
+    let wait = if standby {
+        format!(
+            "echo \"[r] standby ready\"; \
+             while :; do if [ -e /data/local/tmp/join-place ]; then id=$(cat /data/local/tmp/join-place); rm -f /data/local/tmp/join-place; \
+             echo \"[r] standby join $id\"; {} fi; sleep 1; done; ",
+            join_script("$id", 90)
+        )
+    } else {
+        String::new()
+    };
     // A test device trimmed as test images are (`OMNI_R_LEAN=0` keeps everything): the image's apps
     // that nothing here uses are disabled, so they neither run nor come back -- each app host
     // process holds ~263 MiB, and with ~20 of them started at boot the host ran out of memory as
@@ -156,33 +235,89 @@ fn the_apk_is_installed_started_and_draws() {
     } else {
         ""
     };
-    let booted = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 240 ]; do sleep 5; i=$((i+1)); done; \
+    let booted = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 1200 ]; do sleep 1; i=$((i+1)); done; \
                   echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; ";
-    let setup = format!(
-        "settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
-         settings put system screen_off_timeout 1800000; svc power stayon true; \
-         input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
-         settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
-         settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
-         {resizable}{lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
-         {lean_after}{after_install}"
-    );
-    let launch = format!(
-        "pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
-         act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; \
-         am start -W -n \"$act\"; echo \"[r] am start: $?\"; \
-         {sign_in}{join}{extra}"
-    );
-    let then = format!("{booted}{setup}{launch}");
-    let kept = instance.clone();
+    // A device to be saved keeps its package installer (PackageManager does not start without one):
+    // each boot of the saved device disables it once up.
+    let setup = |lean_after: &str| {
+        format!(
+            "settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
+             settings put system screen_off_timeout 1800000; svc power stayon true; \
+             input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
+             settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
+             settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
+             {resizable}{lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
+             {lean_after}{after_install}"
+        )
+    };
+    let resolve = "pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
+                   act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; ";
     // The device's language: the account's (`OMNI_R_LOCALE`, default tr-TR -- the owner's accounts
     // are Turkish). The app applies the account's locale to itself once signed in; on a device in
     // another language that is a configuration change ActivityNativeMain does not handle
     // (configChanges 0xfb0 leaves locale out), and the relaunch ended the game session the deep link
     // had just started (r12: "Updating App configuration based on locale tr_tr", then "Schedule
     // relaunch activity", "Ending game session with place ID 8737899170").
-    let locale = format!("persist.sys.locale={}", std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into()));
-    let mut boot = common::boot::Boot::start(&sysroot, instance, &["--zygote", "--setprop", &locale], &then);
+    let locale_name = std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into());
+    let locale = format!("persist.sys.locale={locale_name}");
+    let boot_args = ["--zygote", "--setprop", locale.as_str()];
+
+    // `OMNI_R_GOLDEN=<dir>`: devices are saved there and booted again, not made anew. The first run
+    // for an APK, account and setup boots a new device, installs the APK and signs in as above; once
+    // signed in, the app is stopped, the device shut down and its directory saved (`golden_dir`),
+    // and the same device boots again. Every later run starts from a copy of the saved one: an
+    // installed, compiled, signed-in device -- no first boot (the APEXes decompressed, the packages
+    // scanned, the roles granted), no install, no cookie planted -- and opens the place's link at
+    // once, the app starting cold on it. A saved device whose app never signs in is set aside.
+    let golden = std::env::var_os("OMNI_R_GOLDEN").map(|root| golden_dir(Path::new(&root), &apk, cookie.as_deref(), kiosk, &locale_name));
+    let warm = golden.as_ref().is_some_and(|g| g.join("ready").exists());
+    let saving = !warm && golden.is_some();
+    // The script of a saved device's boot: the place at once, or the app's launcher.
+    // The app is started from its launcher, as the first boot starts it, and the place's link sent
+    // once it has signed in: a link that starts the app cold takes the slower way in
+    // (ActivityProtocolLaunch finds no settings, finishes, waits out a pause timeout, then starts the
+    // splash), which put libzstd-jni's initialisation past its worker's ~20 s -- 5 of 6 such starts
+    // died (2026-09-30), against none from the launcher. An app that dies on the way is started
+    // again.
+    let warm_then = {
+        let start = "am start -W -n \"$act\"; echo \"[r] am start: $?\"; ";
+        let open = place.as_deref().map_or_else(String::new, |id| {
+            format!(
+                "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 300 ]; do \
+                 if [ -e /data/local/tmp/app-died ]; then rm -f /data/local/tmp/app-died; am start -n \"$act\"; echo \"[r] the app died: started again\"; fi; \
+                 sleep 1; i=$((i+1)); done; {}",
+                join_script(id, 120)
+            )
+        });
+        format!("{booted}{lean_after}input keyevent KEYCODE_WAKEUP; {resolve}rm -f /data/local/tmp/app-died; {start}{open}{wait}{extra}")
+    };
+    let then = if warm {
+        let g = golden.as_ref().expect("a saved device");
+        let t = Instant::now();
+        let bytes = copy_device(&g.join("device"), &instance).expect("the saved device copied");
+        eprintln!("[r] device from {}: {} MiB in {} ms", g.display(), bytes >> 20, t.elapsed().as_millis());
+        warm_then.clone()
+    } else {
+        std::fs::create_dir_all(&tmp).expect("/data/local/tmp");
+        std::fs::copy(&apk, tmp.join("app.apk")).expect("the APK");
+        // A device to be saved: signed in, the app given time to write what its first start
+        // writes, stopped, and the disk synced -- then the host saves it (below).
+        // With no account, the app's first start (its screen up, 30 s) is what is saved.
+        let rest = if saving {
+            let settled = if cookie.is_some() {
+                "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 15; "
+            } else {
+                "sleep 30; "
+            };
+            format!("{settled}am force-stop \"$pkg\"; sync; sleep 2; echo \"[r] device quiet\"; ")
+        } else {
+            format!("{join}{wait}{extra}")
+        };
+        let setup = setup(if saving { "" } else { &lean_after });
+        format!("{booted}{setup}{resolve}am start -W -n \"$act\"; echo \"[r] am start: $?\"; {sign_in}{rest}")
+    };
+    let kept = instance.clone();
+    let mut boot = common::boot::Boot::start(&sysroot, instance, &boot_args, &then);
     let expect: Vec<String> = std::env::var("OMNI_R_EXPECT")
         .unwrap_or_else(|_| "[zygote] launching com.roblox.client|frames presented".into())
         .split('|')
@@ -190,25 +325,31 @@ fn the_apk_is_installed_started_and_draws() {
         .collect();
     let mut seen = vec![false; expect.len()];
     let started = Instant::now();
+    let deadline = started + Duration::from_secs(minutes * 60);
     let mut last_shot = Instant::now();
     let mut n = 0;
     let mut kicked = false;
     let mut joined = false;
+    let mut signed_in = false;
+    let mut app_died = false;
+    let mut loaded_place: Option<String> = None;
+    let quiet = std::cell::Cell::new(false);
+    let stopped = std::cell::Cell::new(false);
+    let in_tmp = |name: &str| kept.join("data/local/tmp").join(name);
     // `OMNI_R_SHOT_SECS`: how often the display is kept (default 20).
     let shot_every = Duration::from_secs(std::env::var("OMNI_R_SHOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20));
-    boot.watch(Duration::from_secs(minutes * 60), |line| {
+    let mut on_line = |line: &str| -> bool {
         for (s, e) in seen.iter_mut().zip(&expect) {
             *s |= line.contains(e.as_str());
         }
         let store = kept.join("data/data/com.roblox.client/app_webview/Default/Cookies");
-        if cookie.is_some() && !kept.join("data/local/tmp/cookie-store").exists() && store.exists() {
-            let _ = std::fs::write(kept.join("data/local/tmp/cookie-store"), "1");
+        if cookie.is_some() && !warm && !quiet.get() && !in_tmp("cookie-store").exists() && store.exists() {
+            let _ = std::fs::write(in_tmp("cookie-store"), "1");
             eprintln!("[r] +{}s the app's cookie store is there", started.elapsed().as_secs());
         }
         if line.contains("[r] cookie-stop") {
             if let Some(file) = &cookie {
                 std::thread::sleep(Duration::from_secs(3));
-                let store = kept.join("data/data/com.roblox.client/app_webview/Default/Cookies");
                 let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/plant_cookie.py");
                 // Windows installs `python`; macOS and most Linux hosts have no `python`, only
                 // `python3` (Ubuntu ships no `python` at all; MEASURED on the M1). On Windows,
@@ -221,27 +362,76 @@ fn the_apk_is_installed_started_and_draws() {
                 };
                 eprintln!("[r] {}", said.trim());
                 let ok = planted.is_ok_and(|o| o.status.success());
-                let _ = std::fs::write(kept.join("data/local/tmp/cookie-planted"), if ok { "ok" } else { "failed" });
+                let _ = std::fs::write(in_tmp("cookie-planted"), if ok { "ok" } else { "failed" });
             }
         }
         // The server's kick: the display as it was when the line came (the game's last frame, before
-        // the app draws its dialog), and the periodic shot before that.
-        if line.contains("Client has been disconnected") && !kicked {
-            kicked = true;
-            let _ = std::fs::copy(&screenshot, shots.join("kick.png"));
-            if n > 0 {
-                let _ = std::fs::copy(shots.join(format!("{:04}.png", n - 1)), shots.join("kick-before.png"));
+        // the app draws its dialog), and the periodic shot before that. A standby device joins the
+        // place again.
+        if line.contains("Client has been disconnected") {
+            if !kicked {
+                kicked = true;
+                let _ = std::fs::copy(&screenshot, shots.join("kick.png"));
+                if n > 0 {
+                    let _ = std::fs::copy(shots.join(format!("{:04}.png", n - 1)), shots.join("kick-before.png"));
+                }
+                eprintln!("[r] +{}s kick: display saved as {}", started.elapsed().as_secs(), shots.join("kick.png").display());
             }
-            eprintln!("[r] +{}s kick: display saved as {}", started.elapsed().as_secs(), shots.join("kick.png").display());
+            let _ = std::fs::remove_file(in_tmp("game-loaded"));
+            if let (true, Some(id)) = (standby, loaded_place.take()) {
+                eprintln!("[r] +{}s disconnected from {id}: joining again", started.elapsed().as_secs());
+                let _ = std::fs::write(in_tmp("join-place"), &id);
+            }
         }
-        if line.contains("DID_LOG_IN") && !kept.join("data/local/tmp/signed-in").exists() {
-            let _ = std::fs::write(kept.join("data/local/tmp/signed-in"), "1");
+        if line.contains("DID_LOG_IN") {
+            signed_in = true;
+            if !in_tmp("signed-in").exists() {
+                let _ = std::fs::write(in_tmp("signed-in"), "1");
+            }
         }
+        // The app's process died (a crash, a kill): the join script starts it again.
+        // A standby device that was in a place joins it again.
+        if line.contains("Process com.roblox.client (pid ") && line.contains("has died") {
+            let _ = std::fs::write(in_tmp("app-died"), "1");
+            app_died = true;
+            let _ = std::fs::remove_file(in_tmp("game-loaded"));
+            if let (true, Some(id)) = (standby, loaded_place.take()) {
+                eprintln!("[r] +{}s the app died in {id}: joining again", started.elapsed().as_secs());
+                let _ = std::fs::write(in_tmp("join-place"), &id);
+            }
+        }
+        // A game joined is an account signed in (a saved device opening a place logs no DID_LOG_IN).
         if line.contains("Joining game") {
             joined = true;
-            if !kept.join("data/local/tmp/joining").exists() {
-                let _ = std::fs::write(kept.join("data/local/tmp/joining"), "1");
+            signed_in = true;
+            if !in_tmp("joining").exists() {
+                let _ = std::fs::write(in_tmp("joining"), "1");
             }
+        }
+        if let Some(at) = line.find("onGameLoaded() SessionReporterState_GameLoaded placeId:") {
+            let id: String = line[at..].chars().skip_while(|c| *c != ':').skip(1).take_while(char::is_ascii_digit).collect();
+            let _ = std::fs::write(in_tmp("game-loaded"), &id);
+            loaded_place = Some(id);
+        }
+        if line.contains("[r] standby ready") {
+            let _ = std::fs::write(in_tmp("standby"), "1");
+        }
+        // A saved device whose app has run 10 minutes without signing in (a cookie Roblox has since
+        // ended) is set aside: the next run makes a new one. An app that keeps dying (an emulation
+        // fault) says nothing about the account, and does not.
+        if warm && !signed_in && !app_died && started.elapsed() > Duration::from_secs(600) {
+            if let Some(g) = golden.as_ref().filter(|g| g.join("ready").exists()) {
+                eprintln!("[r] the saved device {} never signed in: set aside", g.display());
+                let _ = std::fs::remove_file(g.join("ready"));
+            }
+        }
+        if line.contains("[r] device quiet") {
+            quiet.set(true);
+            return true;
+        }
+        if in_tmp("stop").exists() {
+            stopped.set(true);
+            return true;
         }
         if last_shot.elapsed() > shot_every {
             last_shot = Instant::now();
@@ -254,13 +444,51 @@ fn the_apk_is_installed_started_and_draws() {
             }
         }
         false
-    });
+    };
+    boot.watch(deadline.saturating_duration_since(Instant::now()), &mut on_line);
+    // The device to be saved is quiet: shut it down, save it, and boot it again as a saved device
+    // boots.
+    if quiet.get() {
+        if let Some(g) = &golden {
+            std::thread::sleep(Duration::from_secs(2));
+            boot.kill();
+            let t = Instant::now();
+            let part = g.with_extension(format!("part-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&part);
+            match copy_device(&kept, &part.join("device")) {
+                Ok(bytes) => {
+                    let _ = std::fs::write(part.join("ready"), format!("{}\n", apk.display()));
+                    let _ = std::fs::remove_dir_all(g);
+                    let _ = std::fs::create_dir_all(g.parent().unwrap_or(Path::new(".")));
+                    match std::fs::rename(&part, g) {
+                        Ok(()) => eprintln!("[r] device saved as {}: {} MiB in {} ms", g.display(), bytes >> 20, t.elapsed().as_millis()),
+                        Err(e) => eprintln!("[r] device not saved as {}: {e}", g.display()),
+                    }
+                }
+                Err(e) => eprintln!("[r] device not saved: {e}"),
+            }
+            let _ = std::fs::remove_dir_all(&part);
+            for f in NOT_SAVED.iter().filter(|f| f.starts_with(".omni")) {
+                let _ = std::fs::remove_dir_all(kept.join(f));
+                let _ = std::fs::remove_file(kept.join(f));
+            }
+            for f in ["signed-in", "joining", "cookie-store", "cookie-planted"] {
+                let _ = std::fs::remove_file(in_tmp(f));
+            }
+            boot = boot.reboot(&sysroot, &boot_args, &warm_then);
+            boot.watch(deadline.saturating_duration_since(Instant::now()), &mut on_line);
+        }
+    }
     let tail = boot.tail();
+    if stopped.get() {
+        eprintln!("[r] stopped as asked (/data/local/tmp/stop)");
+        return;
+    }
     let missing: Vec<&String> = expect.iter().zip(&seen).filter(|(_, s)| !**s).map(|(e, _)| e).collect();
     assert!(missing.is_empty(), "never seen: {missing:?}\n{tail}");
     // A place asked for must have been joined: a run that only reached the app's Home, or its
     // "Upgrade required" screen (an APK the servers no longer accept), is not a pass.
-    if std::env::var_os("OMNI_R_PLACE").is_some() {
+    if place.is_some() {
         assert!(joined, "OMNI_R_PLACE was set but the log never showed \"Joining game\": the place was not joined with {} (an APK too old for the servers shows \"Upgrade required\")\n{tail}", apk.display());
     }
 }
