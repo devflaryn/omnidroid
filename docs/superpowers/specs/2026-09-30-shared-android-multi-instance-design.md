@@ -372,6 +372,8 @@ wherever Roblox is not the subject.
 
 No work on more than two slots starts before phase 3's scale gate passes.
 
+Phase 0 landed 0a7d29d: no Phase 0 test fails on Windows/Linux/macOS (the remaining reds are existing and environmental: `mm` futex on Windows and Linux, `d3g_gl_fallback` on Windows, `dns_proxy` on macOS); `r_roblox` in-world on Windows joins the place (2.740.931 APK; the stock 2.738.1397 is refused by Roblox as "Upgrade required").
+
 **The measurement's claim.** Phase 5 measures the **rendered** ceiling and says so: 25-30
 instances on 32 GB needs GPU-drop headless (a separate roadmap, `headless-notebooks-goal`) and is
 not claimed here. One instance with its window closed is reported as an indicative data point, not
