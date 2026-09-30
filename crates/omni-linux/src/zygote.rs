@@ -193,7 +193,8 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     let pid = crate::process::reserve_pid();
     let mut cmd = std::process::Command::new(&launcher.runner);
     cmd.arg("--sysroot").arg(&launcher.sysroot).arg("--instance").arg(&launcher.instance);
-    cmd.args(["--binder-server", &launcher.binder, "--pid", &pid.to_string(), "--uid", &uid.to_string()]);
+    cmd.args(["--binder-server", &launcher.binder, "--binder-credential-stdin", "--pid", &pid.to_string(), "--uid", &uid.to_string()]);
+    cmd.stdin(std::process::Stdio::piped());
     for e in &launcher.envp {
         // The system server's class path is not an app's.
         if !e.starts_with(b"CLASSPATH=") {
@@ -260,7 +261,13 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     cmd.args(class_and_args);
     eprintln!("[zygote] launching {} as pid {pid} uid {uid}: {}", nice.unwrap_or("?"), class_and_args.join(" "));
     match cmd.spawn() {
-        Ok(child) => {
+        Ok(mut child) => {
+            let cred = crate::remote::issue_credential(pid, uid);
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = writeln!(stdin, "{}", crate::remote::credential_hex(&cred));
+                // Dropped: closed, so the app host's own stdin reads end of file after it.
+            }
             // Reaped by a thread of its own; the app's end reaches the system through binder. Kept
             // by pid meanwhile, for a signal the system sends it (`signal`).
             let child = Arc::new(parking_lot::Mutex::new(child));
@@ -275,6 +282,7 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 };
                 CHILDREN.lock().remove(&pid);
+                crate::remote::revoke_credential(pid);
                 eprintln!("[zygote] pid {pid} ended: {status:?}");
             });
             Some(pid)

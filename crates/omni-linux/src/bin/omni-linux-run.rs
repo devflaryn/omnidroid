@@ -35,6 +35,14 @@ fn main() -> ExitCode {
             "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc, composer)")),
             // This host process's binder is the system's, in another host process (`crate::remote`).
             "--binder-server" => omni_linux::remote::set_server(&args.next().expect("--binder-server needs host:port")),
+            // The credential the system issued this host process (`crate::remote`): one line of
+            // hex on stdin, never on the command line other accounts can read.
+            "--binder-credential-stdin" => {
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                let c = omni_linux::remote::credential_from_hex(&line).expect("--binder-credential-stdin: 32 hex characters on stdin");
+                omni_linux::remote::set_credential(c);
+            }
             // The program's pid, as the system assigned it.
             "--pid" => omni_linux::process::assign_next_pid(args.next().and_then(|v| v.parse().ok()).expect("--pid needs a number")),
             // Answer /dev/socket/zygote: apps ActivityManager starts are launched in host processes

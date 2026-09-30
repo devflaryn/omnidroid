@@ -40,15 +40,21 @@ fn a_process_in_another_host_process_asks_servicemanager() {
 
     let addr = omni_linux::remote::serve(omni_linux::vfs::Sysroot::open(&sysroot).expect("sysroot")).expect("serve");
     let pid = omni_linux::process::reserve_pid();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omni-linux-run"))
+    let cred = omni_linux::remote::issue_credential(pid, 10_000);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omni-linux-run"))
         .args(["--sysroot", &sysroot.to_string_lossy(), "--instance", &instance.to_string_lossy()])
-        .args(["--binder-server", &addr.to_string(), "--pid", &pid.to_string(), "--uid", "10000", "--", "/system/bin/service", "list"])
+        .args(["--binder-server", &addr.to_string(), "--binder-credential-stdin", "--pid", &pid.to_string(), "--uid", "10000", "--", "/system/bin/service", "list"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .spawn()
-        .expect("omni-linux-run")
-        .wait_with_output()
         .expect("omni-linux-run");
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("stdin");
+        writeln!(stdin, "{}", omni_linux::remote::credential_hex(&cred)).expect("the credential");
+    }
+    let out = child.wait_with_output().expect("omni-linux-run");
     let listed = String::from_utf8_lossy(&out.stdout);
     let err = "";
     assert!(out.status.success(), "{listed}\n{err}\nservicemanager: {}", String::from_utf8_lossy(&sm_err.lock()));
