@@ -1,4 +1,21 @@
-# Notebooks: omnidroid headless on Colab, Kaggle and Modal
+# Notebooks
+
+## Boot benchmark: `omnidroid_boot_bench.ipynb` (real Android, no account)
+
+[Open in Colab](https://colab.research.google.com/github/devflaryn/omnidroid/blob/main/notebooks/omnidroid_boot_bench.ipynb)
+
+Times how fast a machine's CPU and RAM boot omnidroid's real-AOSP path (Android 15 on omnidroid's
+Linux ABI layer, `omni-linux`'s `r_roblox` session) and start the Roblox APK, headless. It builds
+`main`, builds the Android system from Google's public emulator image (`arm64-v8a-35_r02.zip`), and
+caches both in Drive. Then: one **new device** (first boot, `pm install`, the app's first start,
+the device saved) and `SAVED_BOOTS` boots of the **saved device** (what every later session does),
+each timed from the log (`boot_completed`, the app on screen) while CPU busy, memory and load are
+sampled every second. **No cookie is used and nothing signs in.** Results go to Drive
+`MyDrive/omnidroid/bench/*.json`; the last cell compares every runtime measured so far.
+
+You bring only the APK: Drive `MyDrive/omnidroid/*.apk` (or `/content`, or `APK_PATH`).
+
+## Headless play: omnidroid headless on Colab, Kaggle and Modal (the old path)
 
 `omnidroid_headless.ipynb` builds omnidroid from source, starts Roblox with no display at all
 (`omnidroid --no-window --control <file>`, in `unified` from `dce9ac0`), joins a
