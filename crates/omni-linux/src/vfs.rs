@@ -659,6 +659,13 @@ impl Vfs {
             _ if path.strip_prefix(b"/dev/ashmem").is_some_and(|id| id == crate::procfs::boot_id().as_bytes()) => return Some(Node::Dev(DevNode::Ashmem)),
             b"/dev/omni-gpu" => return Some(Node::Dev(DevNode::OmniGpu)),
             b"/dev/fuse" => return Some(Node::Dev(DevNode::Fuse)),
+            // The loop driver's control device, with no loop devices behind it: its every ioctl
+            // (`LOOP_CTL_ADD`, `LOOP_CTL_GET_FREE`) fails with ENOTTY, as a null device's does. The
+            // APEXes are the sysroot's, flattened (`crate::apex`), so apexd's loop devices are
+            // never needed -- but it waits up to 20 s for this node before it gives up on them:
+            // every boot spent 20.0 s there ("wait for '/dev/loop-control' timed out and took
+            // 20002ms", 2026-10-01), before servicemanager started.
+            b"/dev/loop-control" => return Some(Node::Dev(DevNode::Null)),
             // Input devices, where the embedding made any (`crate::evdev`).
             b"/dev/input" => return Some(Node::Dir),
             _ if path.starts_with(b"/dev/input/") => {
