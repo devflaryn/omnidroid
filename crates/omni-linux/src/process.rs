@@ -659,6 +659,17 @@ impl Process {
             // and in-world it drew 1-3 frames a second. At 128 MiB: 9.8 s, no crash, 18-44 fps.
             // A reservation, committed as used. The system's processes keep the minimum.
             code_cache_size: if std::env::var_os("OMNI_LINUX_APP").is_some() { 128 << 20 } else { 8 << 20 },
+            // A thread's fast-dispatch table (x64, patch 0035): the pin's 4,096 entries (64 KiB).
+            // `OMNI_JIT_FAST_DISPATCH_SYSTEM=<entries>` sizes it in the system's host process, whose
+            // ~900 threads are mostly binder threads in a wait -- 56 MiB of tables there at 64 KiB;
+            // 1,024 gave the heap 3-4 fewer 16 MiB segments (docs/NIGHT-2026-10-02.md, C3). Not the
+            // default: what the smaller table costs SurfaceFlinger's and system_server's threads in
+            // lookups is not measured yet.
+            fast_dispatch_entries: if std::env::var_os("OMNI_LINUX_APP").is_some() {
+                0
+            } else {
+                std::env::var("OMNI_JIT_FAST_DISPATCH_SYSTEM").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            },
             ..DynarmicOptions::default()
         };
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {

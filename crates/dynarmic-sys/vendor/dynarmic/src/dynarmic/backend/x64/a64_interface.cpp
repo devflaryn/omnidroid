@@ -353,8 +353,10 @@ public:
                 throw std::invalid_argument("dynarmic: this Jit's configuration shapes code differently from the shared code cache's");
             }
             if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-                fast_dispatch_table = std::make_unique<u8[]>(A64EmitX64::FastDispatchTableBytes());
-                A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get());
+                // Omnidroid patch 0035: the size the cache's emitter masks with.
+                fast_dispatch_entries = A64EmitX64::FastDispatchEntries(shared->conf);
+                fast_dispatch_table = std::make_unique<u8[]>(A64EmitX64::FastDispatchTableBytes(fast_dispatch_entries));
+                A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get(), fast_dispatch_entries);
             }
             thread.jit_state = &jit_state;
             thread.flush_routing = &FlushRoutingThunk;
@@ -618,7 +620,7 @@ private:
     void FlushRoutingState() {
         jit_state.ResetRSB();
         if (fast_dispatch_table) {
-            A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get());
+            A64EmitX64::ResetFastDispatchTable(fast_dispatch_table.get(), fast_dispatch_entries);
         }
     }
 
@@ -742,6 +744,7 @@ private:
     // Patch 0022, shared cache only.
     SharedThreadState thread;
     std::unique_ptr<u8[]> fast_dispatch_table;
+    size_t fast_dispatch_entries = 0;  ///< Patch 0035: its entries.
 
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;

@@ -37,6 +37,8 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
+std::atomic<std::uint32_t> live_fp_optimizations{0};
+
 A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
         : EmitContext(reg_alloc, block), conf(conf) {}
 
@@ -60,6 +62,8 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         // Omnidroid patch 0027: the block map of a shared cache holds every block of the process
         // (~700,000 in a game world); at 0.75 rather than 0.5 its bucket array is half the size.
         UseLoadFactor(block_descriptors, SHARED_BLOCK_MAP_LOAD_FACTOR);
+        // Omnidroid patch 0035: every thread's table has this cache's size.
+        fast_dispatch_mask = (FastDispatchEntries(conf) - 1) * sizeof(FastDispatchEntry);
     }
     // In a shared cache each thread owns its table (JitState::od_fast_dispatch_table).
     if (conf.HasOptimization(OptimizationFlag::FastDispatch) && !shared_code) {
@@ -451,9 +455,23 @@ size_t A64EmitX64::FastDispatchTableBytes() {
 }
 
 void A64EmitX64::ResetFastDispatchTable(void* table) {
-    auto* entries = static_cast<FastDispatchEntry*>(table);
-    for (size_t i = 0; i < fast_dispatch_table_size; i++) {
-        entries[i] = FastDispatchEntry{};
+    ResetFastDispatchTable(table, fast_dispatch_table_size);
+}
+
+size_t A64EmitX64::FastDispatchEntries(const A64::UserConfig& conf) {
+    const size_t n = conf.od_fast_dispatch_entries;
+    const bool valid = n >= 0x40 && n <= 0x10000 && (n & (n - 1)) == 0;
+    return valid ? n : fast_dispatch_table_size;
+}
+
+size_t A64EmitX64::FastDispatchTableBytes(size_t entries) {
+    return sizeof(FastDispatchEntry) * entries;
+}
+
+void A64EmitX64::ResetFastDispatchTable(void* table, size_t entries) {
+    auto* e = static_cast<FastDispatchEntry*>(table);
+    for (size_t i = 0; i < entries; i++) {
+        e[i] = FastDispatchEntry{};
     }
 }
 
@@ -536,7 +554,7 @@ void A64EmitX64::GenTerminalHandlers() {
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(rbp, r12);
         }
-        code.and_(ebp, fast_dispatch_table_mask);
+        code.and_(ebp, static_cast<u32>(fast_dispatch_mask));
         code.lea(rbp, ptr[r12 + rbp]);
         code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
         code.jne(fast_dispatch_cache_miss);
@@ -567,7 +585,7 @@ void A64EmitX64::GenTerminalHandlers() {
             if (code.HasHostFeature(HostFeature::SSE42)) {
                 code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
             }
-            code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
+            code.and_(code.ABI_PARAM1.cvt32(), static_cast<u32>(fast_dispatch_mask));
             code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
             code.ret();
             PerfMapRegister(fast_dispatch_table_lookup_in, code.getCurr(), "a64_fast_dispatch_table_lookup_in");
@@ -580,7 +598,7 @@ void A64EmitX64::GenTerminalHandlers() {
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
         }
-        code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
+        code.and_(code.ABI_PARAM1.cvt32(), static_cast<u32>(fast_dispatch_mask));
         code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
         code.ret();
         PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");

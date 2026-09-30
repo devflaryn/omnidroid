@@ -307,6 +307,11 @@ pub struct DynarmicOptions {
     /// after one null check) nothing else prevents. x64's shared code cache never recompiles, so
     /// this only changes what arm64 hosts do.
     pub recompile_on_declined_fault: bool,
+    /// **Entries in each guest thread's fast-dispatch table** (patch 0035, x64 with the shared
+    /// cache): a power of two from 0x40 to 0x10000, 16 bytes each; 0 is the pin's 0x1000 (64 KiB a
+    /// thread). A smaller table costs a process of many mostly idle threads less (the system's host
+    /// process runs ~900) and misses more often, a miss costing a lookup in the cache's block map.
+    pub fast_dispatch_entries: u32,
 }
 
 impl Default for DynarmicOptions {
@@ -337,11 +342,35 @@ impl Default for DynarmicOptions {
             shared_code_cache_bytes: SHARED_CODE_CACHE_BYTES,
             shared_code_region_bytes: SHARED_CODE_REGION_BYTES,
             shared_code_live_bytes: SHARED_CODE_LIVE_BYTES,
+            fast_dispatch_entries: 0,
         }
     }
 }
 
+/// **The unsafe floating-point flags every backend of this process emits with from now on**
+/// (patch 0034, x64): `optimization::UNSAFE_FP`'s bits, others dropped; returns the mask in force
+/// (0 on arm64, where it does nothing). Blocks already translated keep what they were translated
+/// with -- [`DynarmicBackend::clear_code_cache`] has them translated again. Every backend here opens
+/// dynarmic's unsafe gate (for [`ExclusiveMonitor::ValueCompare`]), so the flags apply wherever
+/// that is the monitor, which it is by default.
+pub fn set_live_fp_optimizations(mask: u32) -> u32 {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_live_fp_optimizations(mask) }
+}
+
 impl DynarmicOptions {
+    /// Bytes of one guest thread's fast-dispatch table under these options (patch 0035): the
+    /// asked-for entries where the shared cache honours them, else the pin's 64 KiB.
+    #[must_use]
+    pub const fn fast_dispatch_table_bytes(&self) -> usize {
+        let n = self.fast_dispatch_entries as usize;
+        if self.shared_code_cache && n >= 0x40 && n <= 0x1_0000 && n.is_power_of_two() {
+            n * 16
+        } else {
+            OD_FIXED_PER_JIT_BYTES
+        }
+    }
+
     /// The `OptimizationFlag` bitmask these options select.
     #[must_use]
     pub const fn optimizations(&self) -> u32 {
@@ -632,6 +661,7 @@ fn thread_config(
         unsafe_optimizations: i32::from(options.unsafe_optimizations()),
         optimizations: options.optimizations(),
         fastmem_low_window: i32::from(low_window_delta.is_some()),
+        fast_dispatch_entries: options.fast_dispatch_entries,
     }
 }
 
@@ -1828,7 +1858,7 @@ impl DynarmicCpu {
                 // cache's committed high-water mark is still missing; see `cost`.
                 private_committed: tls.as_ref().map_or(0, GuestTls::len).saturating_add(
                     if options.optimizations() & dynarmic_sys::optimization::FAST_DISPATCH != 0 {
-                        OD_FIXED_PER_JIT_BYTES
+                        options.fast_dispatch_table_bytes()
                     } else {
                         0
                     },

@@ -139,7 +139,16 @@ impl Landing {
         let d = vk::Device::from_raw(self.device);
         let waited = std::time::Instant::now();
         let ok = (|| -> R<()> {
-            check(unsafe { vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences)(d, 1, &self.fence, vk::TRUE, u64::MAX) })?;
+            let wait = vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences);
+            // `fence_poll` (super::FENCE_POLL_US): polled with a sleep between, not the driver's
+            // spinning wait.
+            let poll = super::FENCE_POLL_US.load(std::sync::atomic::Ordering::Relaxed);
+            if poll > 0 {
+                while unsafe { wait(d, 1, &self.fence, vk::TRUE, 0) } == vk::Result::TIMEOUT {
+                    std::thread::sleep(std::time::Duration::from_micros(u64::from(poll)));
+                }
+            }
+            check(unsafe { wait(d, 1, &self.fence, vk::TRUE, u64::MAX) })?;
             if super::stats::enabled() {
                 super::stats::add(super::special::ID_GRALLOC_USAGE + 6, waited.elapsed());
             }

@@ -287,6 +287,36 @@ pub(crate) mod stats {
     }
 }
 
+/// **Microseconds between polls of a guest `vkWaitForFences`**, 0 for the host driver's own wait
+/// (`omni_linux::lever`'s `fence_poll=`). NVIDIA's `vkWaitForFences` spins: a guest thread waiting
+/// for its frame's fences burns its core for as long as the GPU takes. Polled -- the fences asked
+/// with a zero timeout, a sleep between -- the thread gives the core up while it waits, at the cost
+/// of up to one period of latency when the fences signal.
+pub static FENCE_POLL_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `vkWaitForFences(device, count, fences, waitAll, timeout)`, polled every `every_us`: the same
+/// answer the host's wait gives -- `VK_SUCCESS`, an error, or `VK_TIMEOUT` once `timeout` ns passed.
+fn wait_for_fences_polling(gpu: &Gpu, p: &Process, a: &[u64], every_us: u32) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkWaitForFences"];
+    const VK_TIMEOUT: i32 = 2;
+    let (device, t) = gpu.dispatchable(p, a[0])?;
+    // SAFETY: the Vulkan signature; the fence array is the guest's, readable for the call (D4).
+    let wait: unsafe extern "system" fn(u64, u32, u64, u32, u64) -> i32 = unsafe { std::mem::transmute(t.get(generated::ID_VK_WAIT_FOR_FENCES, NAMES)?) };
+    let started = std::time::Instant::now();
+    let limit = std::time::Duration::from_nanos(a[4]);
+    loop {
+        let r = unsafe { wait(device, a[1] as u32, a[2], a[3] as u32, 0) };
+        if r != VK_TIMEOUT {
+            return Ok(u64::from(r as u32));
+        }
+        let waited = started.elapsed();
+        if waited >= limit {
+            return Ok(u64::from(VK_TIMEOUT as u32));
+        }
+        std::thread::sleep(std::time::Duration::from_micros(u64::from(every_us)).min(limit - waited));
+    }
+}
+
 /// `ioctl` on `/dev/omni-gpu`.
 pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> SysResult {
     // The GLES driver's commands (the GL backend) on the same node.
@@ -311,8 +341,11 @@ pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> S
         eprintln!("[gpu] {}:{} {name} {args:x?}", p.sys.pid, t.tid);
     }
     let started = stats::on().then(std::time::Instant::now);
+    let poll = FENCE_POLL_US.load(std::sync::atomic::Ordering::Relaxed);
     let answer = if id >= special::ID_GRALLOC_USAGE {
         special::extra(gpu, p, id, &args)
+    } else if id == generated::ID_VK_WAIT_FOR_FENCES && poll > 0 && args.len() >= 5 {
+        wait_for_fences_polling(gpu, p, &args, poll)
     } else if let Some(answer) = special::foreign_barrier(gpu, p, id, &args) {
         answer
     } else {

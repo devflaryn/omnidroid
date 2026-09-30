@@ -65,15 +65,23 @@ fn the_fast_dispatch_table_is_sixty_four_kibibytes_and_allocated_only_when_it_is
     let interface = std::fs::read_to_string(vendored("src/dynarmic/backend/x64/a64_interface.cpp"))
         .expect("read a64_interface.cpp");
     let interface: Vec<&str> = interface.lines().map(str::trim).collect();
+    // Patch 0035: at the size of the cache's emitter (`FastDispatchEntries(shared->conf)`).
     let per_thread = interface
         .iter()
-        .position(|l| l.starts_with("fast_dispatch_table = std::make_unique<u8[]>(A64EmitX64::FastDispatchTableBytes());"))
-        .expect("patch 0022 allocates a shared-cache jit's own table in Jit::Impl");
+        .position(|l| l.starts_with("fast_dispatch_table = std::make_unique<u8[]>(A64EmitX64::FastDispatchTableBytes(fast_dispatch_entries));"))
+        .expect("patch 0022 allocates a shared-cache jit's own table in Jit::Impl, patch 0035 at the cache's size");
     assert_eq!(
         interface[per_thread - 1],
+        "fast_dispatch_entries = A64EmitX64::FastDispatchEntries(shared->conf);",
+        "patch 0035: the size the shared cache's emitter masks with, not the jit's own"
+    );
+    let guard = interface[..per_thread].iter().rposition(|l| l.starts_with("if (")).expect("a guard above the allocation");
+    assert_eq!(
+        interface[guard],
         "if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {",
         "a shared-cache jit's table is guarded by the optimization that reads it"
     );
+    assert!(per_thread - guard <= 3, "the guard is the allocation's own");
 
     #[cfg(target_arch = "x86_64")]
     {

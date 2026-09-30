@@ -7,6 +7,7 @@
 pub mod apex;
 pub mod binder;
 pub mod code_trim;
+pub mod lever;
 pub mod boot;
 pub mod cpuprof;
 pub mod bpf;

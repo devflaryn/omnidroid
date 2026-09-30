@@ -388,10 +388,17 @@ impl Mm {
                 .space
                 .map_anonymous(placement, len as usize, Protection::ReadWrite, CommitPolicy::Lazy)
                 .map_err(|_| refused_fixed(ENOMEM))? as u64;
+            // Only up to the last non-zero byte: the mapping is fresh anonymous memory, zero already,
+            // and a prop area is mostly room to grow (~61 KiB used of ~1.1 MiB) -- writing its zero
+            // tail committed every page of it in every guest process (~80 copies in the system's
+            // host process, docs/NIGHT-2026-10-02.md). The property service's later writes commit
+            // what they touch.
+            // (`OMNI_PROP_FULL_COPY=1`: the whole area written, as before -- the A/B's other arm.)
             let copy = |bytes: &[u8]| {
                 let from = (req.offset as usize).min(bytes.len());
                 let n = (len as usize).min(bytes.len() - from);
-                p.mem.write_holding_layout(at, &bytes[from..from + n])
+                let bytes = &bytes[from..from + n];
+                p.mem.write_holding_layout(at, if full_prop_copy() { bytes } else { nonzero_prefix(bytes) })
             };
             // The property areas: their bytes as they are now (not when the file was opened), and
             // every later change written into them by the property service.
@@ -547,6 +554,39 @@ impl Mm {
 fn is_installed(guest: &[u8]) -> bool {
     let path = String::from_utf8_lossy(guest);
     path.starts_with("/data/app/") && path.contains("/lib/") && path.ends_with(".so") && !path.contains(".tmp/")
+}
+
+/// `OMNI_PROP_FULL_COPY=1`: a mapped prop area is written whole, zero tail and all (the old way) --
+/// here and in the property service's writes of a change (`crate::props`).
+pub(crate) fn full_prop_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_PROP_FULL_COPY").as_deref() == Ok("1"))
+}
+
+/// `bytes` up to and including its last non-zero byte: what has to be written into fresh (zero)
+/// memory to hold them, touching no page the zero tail would.
+fn nonzero_prefix(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)]
+}
+
+#[cfg(test)]
+mod nonzero_prefix_tests {
+    use super::nonzero_prefix;
+
+    #[test]
+    fn the_zero_tail_is_left_out() {
+        assert_eq!(nonzero_prefix(&[1, 0, 2, 0, 0, 0]), &[1, 0, 2]);
+        assert_eq!(nonzero_prefix(&[0, 0, 0]), &[] as &[u8]);
+        assert_eq!(nonzero_prefix(&[]), &[] as &[u8]);
+        assert_eq!(nonzero_prefix(&[0, 7]), &[0, 7]);
+    }
+
+    #[test]
+    fn a_prop_area_is_mostly_zero_tail() {
+        // What `attach` hands the mapping: the area holding every property, at its capacity.
+        let area = crate::props::serial_area_bytes();
+        assert!(nonzero_prefix(&area).len() < area.len() / 4, "{} of {}", nonzero_prefix(&area).len(), area.len());
+    }
 }
 
 /// The view backing of an installed library while something maps it: one per host file while it is

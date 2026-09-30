@@ -6,6 +6,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -28,6 +30,14 @@ namespace Dynarmic::Backend::X64 {
 
 class RegAlloc;
 
+/// Omnidroid patch 0034: unsafe floating-point optimization flags (`Unsafe_UnfuseFMA`,
+/// `Unsafe_ReducedErrorFP`, `Unsafe_InaccurateNaN`, `Unsafe_IgnoreStandardFPCRValue`) the host
+/// turns on for the whole process, at run time: a block emitted after the switch uses them, a
+/// block emitted before keeps what it was emitted with (the host clears the cache to have every
+/// block again). Honoured only where the config's `unsafe_optimizations` gate is open.
+extern std::atomic<std::uint32_t> live_fp_optimizations;
+inline constexpr std::uint32_t live_fp_optimizations_allowed = 0x000F0000;
+
 struct A64EmitContext final : public EmitContext {
     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
 
@@ -36,6 +46,10 @@ struct A64EmitContext final : public EmitContext {
     FP::FPCR FPCR(bool fpcr_controlled = true) const override;
 
     bool HasOptimization(OptimizationFlag flag) const override {
+        const auto bits = static_cast<std::uint32_t>(flag) & live_fp_optimizations_allowed;
+        if (bits != 0 && conf.unsafe_optimizations && (live_fp_optimizations.load(std::memory_order_relaxed) & bits) != 0) {
+            return true;
+        }
         return conf.HasOptimization(flag);
     }
 
@@ -85,6 +99,12 @@ public:
     /// cache owns its table; the handler finds it through JitState::od_fast_dispatch_table).
     static size_t FastDispatchTableBytes();
     static void ResetFastDispatchTable(void* table);
+    /// Omnidroid patch 0035: the entries a thread's table has under `conf` (its
+    /// `od_fast_dispatch_entries`, or the pin's `fast_dispatch_table_size` for 0 or a value that is
+    /// not a power of two from 0x40 to 0x10000), and the table's bytes and reset at that size.
+    static size_t FastDispatchEntries(const A64::UserConfig& conf);
+    static size_t FastDispatchTableBytes(size_t entries);
+    static void ResetFastDispatchTable(void* table, size_t entries);
     /// The code `table` (one thread's) holds for `descriptor`, or null -- the probe the emitted
     /// fast-dispatch handler makes, callable from the dispatcher's lookup so that a thread finds
     /// what it has already looked up without the cache's lock.
@@ -169,6 +189,9 @@ protected:
     // Omnidroid patch 0017: allocated only when FastDispatch is enabled. As a by-value member it
     // was 16 MiB constructed (and written: the entries have a non-zero initializer) in every Jit.
     std::unique_ptr<std::array<FastDispatchEntry, fast_dispatch_table_size>> fast_dispatch_table;
+    /// Omnidroid patch 0035: what the emitted handler and probe mask a hash with -- this cache's
+    /// threads' table size (`FastDispatchEntries(conf)`) in a shared cache, the pin's otherwise.
+    u64 fast_dispatch_mask = fast_dispatch_table_mask;
     void ClearFastDispatchTable();
 
     void (*memory_read_128)();
