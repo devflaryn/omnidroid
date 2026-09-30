@@ -194,6 +194,14 @@ pub fn sockaddr(addr: &SocketAddress) -> Vec<u8> {
     }
 }
 
+/// `addr` with another port.
+fn with_sa_port(addr: SocketAddress, port: u16) -> SocketAddress {
+    match addr {
+        SocketAddress::V4 { address, .. } => SocketAddress::V4 { address, port },
+        SocketAddress::V6 { address, flowinfo, scope_id, .. } => SocketAddress::V6 { address, port, flowinfo, scope_id },
+    }
+}
+
 // ------------------------------------------------------------------------------------ sockets
 
 /// Whether `socket(domain, ty, protocol)` is one a host socket stands behind: TCP or UDP over IPv4
@@ -231,6 +239,15 @@ pub struct Host {
     /// The readiness the watcher last saw (`POLL*` bits), `UNSEEN` before it has looked.
     seen: AtomicU32,
     state: Mutex<State>,
+    /// The loopback namespace of this socket's loopback and wildcard ports (`crate::loopns`);
+    /// `None` for a process without an instance: the host's loopback, as before.
+    ns: Option<Arc<crate::loopns::Namespace>>,
+    /// The namespace entries this socket holds; released when it is dropped.
+    held: Mutex<Vec<crate::loopns::Binding>>,
+    /// The port the guest bound, where it is not the host's (`getsockname`).
+    guest_port: Mutex<Option<u16>>,
+    /// The loopback address the guest connected to, as it named it (`getpeername`).
+    guest_peer: Mutex<Option<Vec<u8>>>,
 }
 
 const UNSEEN: u32 = u32::MAX;
@@ -249,7 +266,13 @@ impl Host {
     ///
     /// # Errors
     /// The host's refusal, as an errno.
-    pub fn create(domain: u16, stream: bool) -> Result<Arc<Self>, Errno> {
+    pub fn create(domain: u16, stream: bool, ns: Option<Arc<crate::loopns::Namespace>>) -> Result<Arc<Self>, Errno> {
+        let sock = Self::fresh(domain, stream)?;
+        Ok(Self::adopt(sock, domain, stream, State::default(), ns))
+    }
+
+    /// A new unbound, non-blocking host socket (dual-stack for IPv6).
+    fn fresh(domain: u16, stream: bool) -> Result<platnet::Socket, Errno> {
         let family = if domain == AF_INET { IpFamily::V4 } else { IpFamily::V6 };
         let kind = if stream { SocketKind::Stream } else { SocketKind::Datagram };
         let mut sock = platnet::Socket::new(kind, family, policy()).map_err(|e| errno(&e))?;
@@ -257,13 +280,35 @@ impl Host {
         if family == IpFamily::V6 {
             sock.set_option(SocketOption::V6Only(false)).map_err(|e| errno(&e))?;
         }
-        Ok(Self::adopt(sock, domain, stream, State::default()))
+        Ok(sock)
     }
 
-    fn adopt(sock: platnet::Socket, domain: u16, stream: bool, state: State) -> Arc<Self> {
-        let host = Arc::new(Self { sock: RwLock::new(sock), domain, stream, seen: AtomicU32::new(UNSEEN), state: Mutex::new(state) });
+    fn adopt(sock: platnet::Socket, domain: u16, stream: bool, state: State, ns: Option<Arc<crate::loopns::Namespace>>) -> Arc<Self> {
+        let host = Arc::new(Self {
+            sock: RwLock::new(sock),
+            domain,
+            stream,
+            seen: AtomicU32::new(UNSEEN),
+            state: Mutex::new(state),
+            ns,
+            held: Mutex::new(Vec::new()),
+            guest_port: Mutex::new(None),
+            guest_peer: Mutex::new(None),
+        });
         watch(&host);
         host
+    }
+
+    fn proto(&self) -> crate::loopns::Proto {
+        if self.stream { crate::loopns::Proto::Tcp } else { crate::loopns::Proto::Udp }
+    }
+
+    /// The host's port for this socket.
+    fn host_port(&self) -> Result<u16, Errno> {
+        let addr = self.sock.read().local_address().map_err(|e| errno(&e))?;
+        Ok(match addr {
+            SocketAddress::V4 { port, .. } | SocketAddress::V6 { port, .. } => port,
+        })
     }
 
     /// The host socket, to change: the watcher holds it shared while it waits, so it is asked to
@@ -283,14 +328,53 @@ impl Host {
     /// address lo does not have, and the host's refusal (`EADDRINUSE`).
     pub fn bind(&self, raw: &[u8]) -> Result<(), Errno> {
         crate::inet::check(self.domain, raw)?;
-        let addr = parse(self.domain, raw)?;
         if self.state.lock().bound {
             return Err(EINVAL);
         }
-        self.sock_mut().bind(&addr).map_err(|e| errno(&e))?;
+        let Some(ns) = self.ns.clone() else {
+            let addr = parse(self.domain, raw)?;
+            self.sock_mut().bind(&addr).map_err(|e| errno(&e))?;
+            self.state.lock().bound = true;
+            wake();
+            return Ok(());
+        };
+        // `inet::check` let through only loopback and the wildcard: bound on the host as the same
+        // address with port 0, and the guest's port is the namespace's.
+        let guest = crate::loopns::port_of(raw);
+        let host_addr = parse(self.domain, &crate::loopns::with_port(raw, 0))?;
+        self.sock_mut().bind(&host_addr).map_err(|e| errno(&e))?;
+        let host = self.host_port()?;
+        let shared = self.state.lock().reuse;
+        match ns.bind(self.proto(), guest, host, shared) {
+            Ok(b) => self.held.lock().push(b),
+            Err(e) => {
+                // The guest's bind failed: its socket is unbound again.
+                *self.sock_mut() = Self::fresh(self.domain, self.stream)?;
+                return Err(e);
+            }
+        }
+        *self.guest_port.lock() = Some(if guest == 0 { host } else { guest });
         self.state.lock().bound = true;
         wake();
         Ok(())
+    }
+
+    /// For a loopback destination: the host address it resolves to in this socket's namespace
+    /// (the same address, the host's port), binding an unbound socket first -- the same loopback
+    /// address for a stream, the wildcard for a datagram -- so its peer can resolve it too.
+    /// `Ok(None)`: not a loopback destination, or no namespace: as given. `Err(ECONNREFUSED)`: a
+    /// port no socket of the namespace holds.
+    fn resolve(&self, raw: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
+        let Some(ns) = &self.ns else { return Ok(None) };
+        if !crate::loopns::is_loopback(raw) {
+            return Ok(None);
+        }
+        let host = ns.lookup(self.proto(), crate::loopns::port_of(raw)).ok_or(ECONNREFUSED)?;
+        if !self.state.lock().bound {
+            let local = if self.stream { crate::loopns::with_port(raw, 0) } else { crate::loopns::wildcard(self.domain) };
+            self.bind(&local)?;
+        }
+        Ok(Some(crate::loopns::with_port(raw, host)))
     }
 
     /// `connect(addr)`: a datagram socket's default peer; a stream's connection, waited for unless
@@ -300,6 +384,23 @@ impl Host {
     /// `EISCONN`, `EALREADY`, `EINPROGRESS`, `EINTR` (the connection goes on), and the connection's
     /// own failure (`ECONNREFUSED`, `ETIMEDOUT`, `ENETUNREACH`, ...).
     pub fn connect(&self, raw: &[u8], nonblocking: bool, t: &Task) -> Result<(), Errno> {
+        if !self.stream && self.ns.is_some() && crate::loopns::is_loopback(raw) {
+            // Connecting a datagram socket only names its peer (Linux): resolved at each send, so
+            // a send before the peer binds is dropped and a peer that binds later is reached.
+            if !self.state.lock().bound {
+                self.bind(&crate::loopns::wildcard(self.domain))?;
+            }
+            *self.guest_peer.lock() = Some(raw.to_vec());
+            let mut st = self.state.lock();
+            st.connected = true;
+            st.bound = true;
+            return Ok(());
+        }
+        let translated = self.resolve(raw)?;
+        if translated.is_some() {
+            *self.guest_peer.lock() = Some(raw.to_vec());
+        }
+        let raw: &[u8] = translated.as_deref().unwrap_or(raw);
         let addr = parse(self.domain, raw)?;
         if !self.stream {
             self.sock_mut().connect(&addr).map_err(|e| errno(&e))?;
@@ -398,6 +499,9 @@ impl Host {
                 return Err(EINVAL);
             }
         }
+        if self.ns.is_some() && !self.state.lock().bound {
+            self.bind(&crate::loopns::wildcard(self.domain))?;
+        }
         self.sock_mut().listen(backlog.clamp(0, 4096)).map_err(|e| errno(&e))?;
         let mut st = self.state.lock();
         st.listening = true;
@@ -418,18 +522,34 @@ impl Host {
             return Err(EOPNOTSUPP);
         }
         let deadline = self.deadline(false);
-        let (sock, peer) = self.retry(IN, nonblocking, deadline, t, || {
-            let st = self.state.lock();
-            if !st.listening || st.shut_rd {
-                return Err(EINVAL);
+        loop {
+            let (sock, peer) = self.retry(IN, nonblocking, deadline, t, || {
+                let st = self.state.lock();
+                if !st.listening || st.shut_rd {
+                    return Err(EINVAL);
+                }
+                drop(st);
+                self.sock.read().accept().map_err(|e| errno(&e))
+            })?;
+            let mut raw_peer = sockaddr(&peer);
+            if let Some(ns) = &self.ns {
+                // Only a connection from this namespace: loopback, from a port of its own.
+                let theirs = crate::loopns::is_loopback(&raw_peer)
+                    .then(|| ns.guest_port(crate::loopns::Proto::Tcp, crate::loopns::port_of(&raw_peer)))
+                    .flatten();
+                match theirs {
+                    Some(g) => raw_peer = crate::loopns::with_port(&raw_peer, g),
+                    None => {
+                        drop(sock); // closed: another instance's, or a host program's
+                        continue;
+                    }
+                }
             }
-            drop(st);
-            self.sock.read().accept().map_err(|e| errno(&e))
-        })?;
-        let mut sock = sock;
-        sock.set_nonblocking(true).map_err(|e| errno(&e))?;
-        let state = State { bound: true, connected: true, ..State::default() };
-        Ok((Self::adopt(sock, self.domain, true, state), sockaddr(&peer)))
+            let mut sock = sock;
+            sock.set_nonblocking(true).map_err(|e| errno(&e))?;
+            let state = State { bound: true, connected: true, ..State::default() };
+            return Ok((Self::adopt(sock, self.domain, true, state, self.ns.clone()), raw_peer));
+        }
     }
 
     fn deadline(&self, send: bool) -> Option<Instant> {
@@ -498,8 +618,16 @@ impl Host {
     }
 
     fn send_inner(&self, bytes: &[u8], to: Option<&[u8]>, _flags: u64, nonblocking: bool, t: &Task) -> Result<usize, Errno> {
+        let named_peer = if self.stream { None } else { self.guest_peer.lock().clone() };
+        let to = to.or(named_peer.as_deref());
         let dest = match to {
-            Some(raw) if !self.stream => Some(parse(self.domain, raw)?),
+            Some(raw) if !self.stream => match self.resolve(raw) {
+                Ok(Some(host)) => Some(parse(self.domain, &host)?),
+                Ok(None) => Some(parse(self.domain, raw)?),
+                // A datagram to a port no one here holds: gone, as to a closed port.
+                Err(e) if e == ECONNREFUSED => return Ok(bytes.len()),
+                Err(e) => return Err(e),
+            },
             _ => None,
         };
         {
@@ -567,54 +695,87 @@ impl Host {
         if !self.stream && !self.state.lock().bound {
             // Linux waits on an unbound datagram socket; Winsock refuses a receive there. Bound to
             // the wildcard address and an ephemeral port, it waits on both.
-            let any = if self.domain == AF_INET { SocketAddress::unspecified(IpFamily::V4) } else { SocketAddress::unspecified(IpFamily::V6) };
-            self.sock_mut().bind(&any).map_err(|e| errno(&e))?;
-            self.state.lock().bound = true;
+            if self.ns.is_some() {
+                self.bind(&crate::loopns::wildcard(self.domain))?;
+            } else {
+                let any = if self.domain == AF_INET { SocketAddress::unspecified(IpFamily::V4) } else { SocketAddress::unspecified(IpFamily::V6) };
+                self.sock_mut().bind(&any).map_err(|e| errno(&e))?;
+                self.state.lock().bound = true;
+            }
         }
         let deadline = self.deadline(false);
         let peek = flags & MSG_PEEK != 0;
         let waitall = self.stream && !nonblocking && !peek && flags & MSG_WAITALL != 0;
-        let mut done = 0;
-        let mut from = None;
-        loop {
-            let r = self.retry(IN, nonblocking, deadline, t, || {
-                if self.stream && self.still_connecting()? {
-                    return Err(EAGAIN);
-                }
-                let s = self.sock.read();
-                let into = &mut buf[done..];
-                let r = if peek {
-                    s.peek(into)
-                } else if self.stream {
-                    s.recv(into).map(|n| (n, None))
-                } else {
-                    s.recv_from(into).map(|(n, a)| (n, Some(a)))
-                };
+        'next: loop {
+            let mut done = 0;
+            let mut from = None;
+            loop {
+                let r = self.retry(IN, nonblocking, deadline, t, || {
+                    if self.stream && self.still_connecting()? {
+                        return Err(EAGAIN);
+                    }
+                    let s = self.sock.read();
+                    let into = &mut buf[done..];
+                    let r = if peek {
+                        s.peek(into)
+                    } else if self.stream {
+                        s.recv(into).map(|n| (n, None))
+                    } else {
+                        s.recv_from(into).map(|(n, a)| (n, Some(a)))
+                    };
+                    match r {
+                        Ok(v) => Ok(v),
+                        // Winsock reports an ICMP port-unreachable for an earlier datagram on the next
+                        // receive; Linux reports it only on a connected socket, as ECONNREFUSED.
+                        Err(e) if !self.stream && e.kind() == Some(NetErrorKind::ConnectionReset) => {
+                            if self.state.lock().connected { Err(ECONNREFUSED) } else { Err(EAGAIN) }
+                        }
+                        // A datagram larger than the buffer: what fit, the rest discarded.
+                        Err(e) if !self.stream && e.kind() == Some(NetErrorKind::MessageSize) => Ok((into.len(), None)),
+                        Err(e) => Err(errno(&e)),
+                    }
+                });
                 match r {
-                    Ok(v) => Ok(v),
-                    // Winsock reports an ICMP port-unreachable for an earlier datagram on the next
-                    // receive; Linux reports it only on a connected socket, as ECONNREFUSED.
-                    Err(e) if !self.stream && e.kind() == Some(NetErrorKind::ConnectionReset) => {
-                        if self.state.lock().connected { Err(ECONNREFUSED) } else { Err(EAGAIN) }
+                    Ok((n, a)) => {
+                        done += n;
+                        from = from.or(a);
+                        if !waitall || n == 0 || done >= buf.len() {
+                            break;
+                        }
                     }
-                    // A datagram larger than the buffer: what fit, the rest discarded.
-                    Err(e) if !self.stream && e.kind() == Some(NetErrorKind::MessageSize) => Ok((into.len(), None)),
-                    Err(e) => Err(errno(&e)),
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
                 }
-            });
-            match r {
-                Ok((n, a)) => {
-                    done += n;
-                    from = from.or(a);
-                    if !waitall || n == 0 || done >= buf.len() {
-                        break;
-                    }
-                }
-                Err(_) if done > 0 => break,
-                Err(e) => return Err(e),
             }
+            if let (Some(ns), false, Some(src)) = (&self.ns, self.stream, from) {
+                let raw_src = sockaddr(&self.guest_family(src));
+                if crate::loopns::is_loopback(&raw_src) {
+                    let peer = self.guest_peer.lock().as_deref().map(crate::loopns::port_of);
+                    match ns.guest_port(crate::loopns::Proto::Udp, crate::loopns::port_of(&raw_src)) {
+                        // Connected to a loopback peer: only that peer's datagrams (the host socket
+                        // is not connected, so this is where Linux's filter is kept).
+                        Some(g) if peer.is_some_and(|p| p != g) => {
+                            if peek {
+                                let mut scratch = vec![0u8; 64 << 10];
+                                let _ = self.sock.read().recv_from(&mut scratch);
+                            }
+                            continue 'next;
+                        }
+                        Some(g) => return Ok((done, Some(with_sa_port(src, g)))),
+                        // Another namespace's datagram (or a host program's): dropped, and the
+                        // wait goes on. A peek saw it without taking it: taken now, then dropped.
+                        None => {
+                            if peek {
+                                let mut scratch = vec![0u8; 64 << 10];
+                                let _ = self.sock.read().recv_from(&mut scratch);
+                            }
+                            continue 'next;
+                        }
+                    }
+                }
+            }
+            return Ok((done, from));
         }
-        Ok((done, from))
     }
 
     /// A send that does not wait and raises no signal: what a descriptor write under its lock
@@ -706,7 +867,11 @@ impl Host {
     /// The host's refusal.
     pub fn name(&self) -> Result<Vec<u8>, Errno> {
         let addr = self.sock.read().local_address().map_err(|e| errno(&e))?;
-        Ok(sockaddr(&self.guest_family(addr)))
+        let raw = sockaddr(&self.guest_family(addr));
+        Ok(match *self.guest_port.lock() {
+            Some(p) => crate::loopns::with_port(&raw, p),
+            None => raw,
+        })
     }
 
     /// `getpeername`.
@@ -720,8 +885,19 @@ impl Host {
         if !self.state.lock().connected {
             return Err(ENOTCONN);
         }
+        if let Some(named) = self.guest_peer.lock().clone() {
+            return Ok(named);
+        }
         let addr = self.sock.read().peer_address().map_err(|e| errno(&e))?;
-        Ok(sockaddr(&self.guest_family(addr)))
+        let raw = sockaddr(&self.guest_family(addr));
+        if let Some(ns) = &self.ns {
+            if crate::loopns::is_loopback(&raw) {
+                if let Some(g) = ns.guest_port(self.proto(), crate::loopns::port_of(&raw)) {
+                    return Ok(crate::loopns::with_port(&raw, g));
+                }
+            }
+        }
+        Ok(raw)
     }
 
     /// A host address in the socket's own family (the host may report an IPv6 socket's unbound

@@ -83,3 +83,36 @@ fn run_in(instance: PathBuf, args: &[&str]) -> Option<(ExitStatus, String, Strin
     let s = |b: &Arc<parking_lot::Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock()).into_owned();
     Some((status, s(&out), s(&err)))
 }
+
+/// `run_fixture` in a given instance directory, as `uid` (a loopback namespace is the uid's).
+pub fn run_fixture_as(instance: &std::path::Path, name: &str, args: &[&str], uid: u32) -> Option<(ExitStatus, String, String)> {
+    let Some(sysroot) = sysroot() else {
+        eprintln!("SKIPPED: no sysroot (tools/make_sysroot.py, plan Task 1)");
+        return None;
+    };
+    let tmp = instance.join("data/local/tmp");
+    std::fs::create_dir_all(&tmp).expect("the instance's /data/local/tmp");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    let _ = std::fs::copy(&fixture, tmp.join(name));
+    let guest = format!("/data/local/tmp/{name}");
+    let mut argv = vec![guest.as_bytes().to_vec()];
+    argv.extend(args.iter().map(|a| a.as_bytes().to_vec()));
+    let out = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let err = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let p = Process::spawn_as(
+        SpawnConfig {
+            sysroot,
+            instance_dir: instance.to_path_buf(),
+            argv,
+            envp: vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec()],
+            stdout: Output::Capture(Arc::clone(&out)),
+            stderr: Output::Capture(Arc::clone(&err)),
+            trace: false,
+        },
+        uid,
+    )
+    .expect("spawn");
+    let status = p.run();
+    let text = |b: &Arc<parking_lot::Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock()).into_owned();
+    Some((status, text(&out), text(&err)))
+}

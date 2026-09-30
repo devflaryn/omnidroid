@@ -279,6 +279,16 @@ pub fn expose(instance: &Path, ns: &str, proto: Proto, guest: u16, host: u16) ->
     Namespace::open(instance, ns).bind(proto, guest, host, false)
 }
 
+impl Namespace {
+    /// The namespace of process `p`'s sockets: its instance's, by its uid. `None` for a process
+    /// with no instance directory (the HLE embedding): the host's loopback, as before.
+    #[must_use]
+    pub fn for_process(p: &crate::Process) -> Option<Arc<Self>> {
+        let instance = p.vfs.binds().instance_dir()?.to_path_buf();
+        Some(Self::open(&instance, &ns_of(p.sys.uid())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

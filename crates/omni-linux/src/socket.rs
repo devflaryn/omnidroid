@@ -281,7 +281,7 @@ fn sys_socket(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         return Err(EAFNOSUPPORT);
     }
     let peer = if crate::hostnet::eligible(domain, ty & SOCK_TYPE_MASK, a[2]) {
-        Some(Peer::Host(crate::hostnet::Host::create(domain as u16, ty & SOCK_TYPE_MASK == 1)?))
+        Some(Peer::Host(crate::hostnet::Host::create(domain as u16, ty & SOCK_TYPE_MASK == 1, crate::loopns::Namespace::for_process(p))?))
     } else {
         None
     };
