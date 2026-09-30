@@ -162,6 +162,37 @@ static int self_checks(void) {
     struct pollfd pf = {us, POLLIN, 0};
     char g1[2] = {0};
     check(poll(&pf, 1, 3000) == 1 && recv(us, g1, 1, 0) == 1 && g1[0] == 'y', "a peer that binds later is reached");
+    // A sender that has closed before the receiver reads is still the namespace's: its datagram
+    // arrives, from the sender's guest port.
+    int rx = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in p3 = lo(47113);
+    check(bind(rx, (struct sockaddr*)&p3, sizeof(p3)) == 0, "udp receiver bound");
+    int tx = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in p4 = lo(47114);
+    check(bind(tx, (struct sockaddr*)&p4, sizeof(p4)) == 0 && sendto(tx, "z", 1, 0, (struct sockaddr*)&p3, sizeof(p3)) == 1, "udp sender sent");
+    close(tx);
+    usleep(300000);
+    struct pollfd pr = {rx, POLLIN, 0};
+    char g2[2] = {0};
+    struct sockaddr_in from;
+    socklen_t flen = sizeof(from);
+    check(poll(&pr, 1, 3000) == 1 && recvfrom(rx, g2, 1, MSG_DONTWAIT, (struct sockaddr*)&from, &flen) == 1 && g2[0] == 'z' && ntohs(from.sin_port) == 47114,
+          "a datagram from a sender that closed first arrives, from its guest port");
+    // The same for TCP: connect, write, close, all before the server accepts.
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in p5 = lo(47115);
+    check(bind(ls, (struct sockaddr*)&p5, sizeof(p5)) == 0 && listen(ls, 1) == 0, "tcp server listening");
+    int cc = socket(AF_INET, SOCK_STREAM, 0);
+    check(connect(cc, (struct sockaddr*)&p5, sizeof(p5)) == 0 && write(cc, "x", 1) == 1, "tcp client connected and wrote");
+    close(cc);
+    usleep(300000);
+    // Non-blocking, so a connection the namespace wrongly dropped fails the check, not hangs it.
+    fcntl(ls, F_SETFL, fcntl(ls, F_GETFL) | O_NONBLOCK);
+    struct pollfd pl = {ls, POLLIN, 0};
+    int ac = -1;
+    char g3[2] = {0};
+    check(poll(&pl, 1, 3000) == 1 && (ac = accept(ls, NULL, NULL)) >= 0 && recv(ac, g3, 1, MSG_DONTWAIT) == 1 && g3[0] == 'x',
+          "a client that closed before the accept is accepted, its data read");
     return 0;
 }
 

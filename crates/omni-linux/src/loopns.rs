@@ -10,11 +10,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::errno::{Errno, EADDRINUSE, EIO};
 
 /// Process-wide counter for unique temp file names across threads and processes.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// How long a reverse entry (`r-<proto>-<host port>`, host port to guest port) outlives its
+/// socket. The accept and datagram filters recognise a peer of the namespace by that entry, and a
+/// sender may close before its receiver reads ("send one datagram and close"; "connect, write,
+/// close, before the server accepts"): so a released socket's entry stays, marked with its expiry,
+/// as a closed TCP connection's stays in TIME_WAIT. The forward entry (guest port to host port) is
+/// removed at once: the guest port is free to bind again immediately.
+const REVERSE_LINGER: Duration = Duration::from_secs(10);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
 
 /// Held while a namespace's table is read-and-changed: an exclusive OS lock on `<dir>/.lock`, so
 /// host processes (and threads, each with its own handle) claim and release ports one at a time.
@@ -118,12 +131,16 @@ pub fn wildcard(domain: u16) -> Vec<u8> {
 /// One namespace's table.
 pub struct Namespace {
     dir: PathBuf,
+    linger: Duration,
 }
 
 /// An entry, held while its socket is open: dropped, its files go.
 pub struct Binding {
-    files: Vec<PathBuf>,
+    /// The forward entry, when this socket holds the port (a shared joiner does not).
+    forward: Option<PathBuf>,
+    reverse: PathBuf,
     dir: PathBuf,
+    linger: Duration,
 }
 
 impl Drop for Binding {
@@ -131,24 +148,46 @@ impl Drop for Binding {
         // Take lock to safely remove entries.
         let Ok(_held) = TableLock::take(&self.dir) else { return };
         let me = std::process::id();
-        for f in &self.files {
-            // Only remove if we still own it: verify the pid in the entry.
-            if let Some((_, owner, _)) = read_entry(f) {
-                if owner == me {
-                    let _ = std::fs::remove_file(f);
-                }
+        // Only touch an entry we still own: verify the pid in it.
+        if let Some(f) = &self.forward {
+            if read_entry(f).is_some_and(|e| e.owner == me) {
+                let _ = std::fs::remove_file(f);
+            }
+        }
+        // The reverse entry lingers (see `REVERSE_LINGER`): rewritten with its expiry.
+        if let Some(e) = read_entry(&self.reverse) {
+            if e.owner == me && e.expiry.is_none() {
+                let until = now_ms().saturating_add(self.linger.as_millis() as u64);
+                let _ = atomic_write(&self.reverse, &format!("{} {me} x{until}", e.port));
             }
         }
     }
 }
 
-/// An entry's host port (or guest port), its owner, and whether it is shared.
-fn read_entry(path: &Path) -> Option<(u16, u32, bool)> {
+/// One table entry: `<port> <owner pid>`, then ` s` (a forward entry whose socket shares the
+/// port) or ` x<unix ms>` (a released socket's reverse entry, valid until then).
+struct Entry {
+    /// The host port (forward entry) or guest port (reverse entry).
+    port: u16,
+    owner: u32,
+    shared: bool,
+    expiry: Option<u64>,
+}
+
+fn read_entry(path: &Path) -> Option<Entry> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut w = text.split_whitespace();
     let port = w.next()?.parse().ok()?;
     let owner = w.next()?.parse().ok()?;
-    Some((port, owner, w.next() == Some("s")))
+    let (mut shared, mut expiry) = (false, None);
+    for t in w {
+        if t == "s" {
+            shared = true;
+        } else if let Some(ms) = t.strip_prefix('x') {
+            expiry = ms.parse().ok();
+        }
+    }
+    Some(Entry { port, owner, shared, expiry })
 }
 
 /// Whether an entry's owner still runs: this host process, or a live one.
@@ -187,9 +226,13 @@ impl Namespace {
     /// The namespace `ns` of the instance at `instance`.
     #[must_use]
     pub fn open(instance: &Path, ns: &str) -> Arc<Self> {
+        Self::open_with_linger(instance, ns, REVERSE_LINGER)
+    }
+
+    fn open_with_linger(instance: &Path, ns: &str, linger: Duration) -> Arc<Self> {
         let dir = instance.join(".omni-loopback").join(ns);
         let _ = std::fs::create_dir_all(&dir);
-        Arc::new(Self { dir })
+        Arc::new(Self { dir, linger })
     }
 
     fn forward(&self, proto: Proto, guest: u16) -> PathBuf {
@@ -221,51 +264,50 @@ impl Namespace {
         // Critical section: read, decide, write under lock.
         // Read forward entry if it exists.
         match read_entry(&fwd) {
-            Some((_, owner, held_shared)) => {
+            Some(Entry { owner, shared: held_shared, .. }) => {
                 if live(owner) {
                     // Live owner: check for shared join.
                     if shared && held_shared {
                         // Build binding without forward entry (joined).
                         atomic_write(&rev, &rev_body)?;
-                        return Ok(Binding {
-                            files: vec![rev],
-                            dir: self.dir.clone(),
-                        });
+                        return Ok(self.binding(None, rev));
                     }
                     return Err(EADDRINUSE);
                 } else {
                     // Stale: replace it.
                     write_pair(&fwd, &fwd_body, &rev, &rev_body)?;
-                    return Ok(Binding {
-                        files: vec![fwd, rev],
-                        dir: self.dir.clone(),
-                    });
+                    return Ok(self.binding(Some(fwd), rev));
                 }
             }
             None => {
                 // Unreadable: treat as corrupt/stale, replace it.
                 write_pair(&fwd, &fwd_body, &rev, &rev_body)?;
-                return Ok(Binding {
-                    files: vec![fwd, rev],
-                    dir: self.dir.clone(),
-                });
+                return Ok(self.binding(Some(fwd), rev));
             }
         }
+    }
+
+    fn binding(&self, forward: Option<PathBuf>, reverse: PathBuf) -> Binding {
+        Binding { forward, reverse, dir: self.dir.clone(), linger: self.linger }
     }
 
     /// The host port behind guest port `guest`, if a live socket of this namespace holds it.
     #[must_use]
     pub fn lookup(&self, proto: Proto, guest: u16) -> Option<u16> {
-        let (host, owner, _) = read_entry(&self.forward(proto, guest))?;
-        live(owner).then_some(host)
+        let e = read_entry(&self.forward(proto, guest))?;
+        live(e.owner).then_some(e.port)
     }
 
     /// The guest port a host port of this namespace is known by -- `None` for a host port that
-    /// is not this namespace's (another instance's, or a program's of the host).
+    /// is not this namespace's (another instance's, or a program's of the host). A released
+    /// socket's port is still known until its entry's linger runs out, its owner alive or not.
     #[must_use]
     pub fn guest_port(&self, proto: Proto, host: u16) -> Option<u16> {
-        let (guest, owner, _) = read_entry(&self.reverse(proto, host))?;
-        live(owner).then_some(guest)
+        let e = read_entry(&self.reverse(proto, host))?;
+        match e.expiry {
+            Some(until) => (now_ms() < until).then_some(e.port),
+            None => live(e.owner).then_some(e.port),
+        }
     }
 }
 
@@ -361,7 +403,7 @@ mod tests {
         assert_eq!(u10.lookup(Proto::Tcp, 47000), Some(51235));
         drop(held);
         assert_eq!(u0.lookup(Proto::Tcp, 47000), None, "released with its binding");
-        assert_eq!(u0.guest_port(Proto::Tcp, 51234), None);
+        assert_eq!(u0.guest_port(Proto::Tcp, 51234), Some(47000), "its reverse entry lingers");
         drop(other);
     }
 
@@ -398,6 +440,51 @@ mod tests {
         assert_eq!(ns.lookup(Proto::Tcp, 47002), None, "a dead owner's entry is not found");
         let _held = ns.bind(Proto::Tcp, 47002, 50005, false).expect("taken over");
         assert_eq!(ns.lookup(Proto::Tcp, 47002), Some(50005));
+    }
+
+    #[test]
+    fn a_released_sockets_reverse_entry_lingers_then_is_gone() {
+        let d = dir("linger");
+        let ns = Namespace::open_with_linger(&d, "u0", Duration::from_millis(800));
+        let held = ns.bind(Proto::Udp, 47050, 50050, false).expect("bind");
+        drop(held);
+        assert_eq!(ns.lookup(Proto::Udp, 47050), None, "the forward entry goes at once");
+        assert_eq!(ns.guest_port(Proto::Udp, 50050), Some(47050), "the reverse entry lingers after the drop");
+        // A new socket on the same host port overwrites the lingering entry.
+        let again = ns.bind(Proto::Udp, 47051, 50050, false).expect("rebind host port");
+        assert_eq!(ns.guest_port(Proto::Udp, 50050), Some(47051), "overwritten by the new socket");
+        drop(again);
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(ns.guest_port(Proto::Udp, 50050), None, "absent once the linger is over");
+    }
+
+    #[test]
+    fn an_entry_without_an_expiry_still_reads() {
+        let d = dir("compat");
+        let ns = Namespace::open(&d, "u0");
+        std::fs::write(d.join(".omni-loopback/u0/r-udp-50051"), format!("47052 {}", std::process::id())).unwrap();
+        assert_eq!(ns.guest_port(Proto::Udp, 50051), Some(47052));
+        std::fs::write(d.join(".omni-loopback/u0/f-tcp-47053"), format!("50053 {} s", std::process::id())).unwrap();
+        let e = read_entry(&d.join(".omni-loopback/u0/f-tcp-47053")).unwrap();
+        assert!(e.shared && e.expiry.is_none() && e.port == 50053);
+    }
+
+    #[test]
+    fn a_lingering_entry_is_valid_whether_or_not_its_owner_lives() {
+        let d = dir("linger-dead");
+        let ns = Namespace::open(&d, "u0");
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        } else {
+            std::process::Command::new("true").spawn().unwrap()
+        };
+        let dead = child.id();
+        child.wait().unwrap();
+        let until = now_ms() + 60_000;
+        std::fs::write(d.join(".omni-loopback/u0/r-udp-50054"), format!("47054 {dead} x{until}")).unwrap();
+        assert_eq!(ns.guest_port(Proto::Udp, 50054), Some(47054));
+        std::fs::write(d.join(".omni-loopback/u0/r-udp-50055"), format!("47055 {} x1", std::process::id())).unwrap();
+        assert_eq!(ns.guest_port(Proto::Udp, 50055), None, "expired, though its owner lives");
     }
 
     #[test]
@@ -477,7 +564,7 @@ mod tests {
         drop(second);
         // After dropping second, first's binding and lookup should still work.
         assert_eq!(ns.lookup(Proto::Udp, 5354), Some(50010), "first still reachable after second drops");
-        assert_eq!(ns.guest_port(Proto::Udp, 50011), None, "second's reverse entry is removed");
+        assert_eq!(ns.guest_port(Proto::Udp, 50011), Some(5354), "second's reverse entry only lingers");
         drop(first);
     }
 
@@ -513,7 +600,7 @@ mod tests {
         assert!(fwd.exists(), "forward entry still exists after original binding drops");
 
         // Verify it still has the new owner.
-        let (_, owner, _) = read_entry(&fwd).expect("entry readable");
+        let owner = read_entry(&fwd).expect("entry readable").owner;
         assert_eq!(owner, child_pid, "entry has new owner");
 
         child.kill().ok();

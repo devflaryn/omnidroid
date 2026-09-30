@@ -141,6 +141,6 @@ fn ports_translate_for_dual_stack_and_a_held_port_is_in_use() {
     let inst = instance("self");
     let Some((status, out, err)) = common::run_fixture_as(&inst, "loopiso", &["self"], 10_000) else { return };
     assert!(!out.contains("FAIL"), "{out}\n{err}");
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 7, "{out}\n{err}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 13, "{out}\n{err}");
     assert_eq!(status, ExitStatus::Exited(0));
 }
