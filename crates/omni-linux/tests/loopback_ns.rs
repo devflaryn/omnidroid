@@ -103,11 +103,11 @@ fn a_real_host_listener_cannot_be_named_unless_exposed() {
 #[test]
 fn a_host_program_cannot_reach_a_guest_server() {
     let inst = instance("hostprog");
-    let _srv = server(&inst, "47102");
+    // One guest server per probe: the TCP probe leaves its server in a blocking accept.
+    let _srv_tcp = server(&inst, "47102");
+    let srv_udp = server(&inst, "47103");
     // Its host ports are real, and a host program can name them: the guest drops what does not
-    // come from its namespace (the accept and recv filters). TCP first: the guest server's
-    // blocking accept waits for the next connection after dropping this one, so it serves no
-    // datagram afterwards.
+    // come from its namespace (the accept and recv filters).
     let tcp = host_port(&inst, "tcp", "47102");
     let mut c = TcpStream::connect(("127.0.0.1", tcp)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -118,12 +118,22 @@ fn a_host_program_cannot_reach_a_guest_server() {
         Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted) => {}
         Err(e) => panic!("the guest never accepted the host connection (its accept filter did not run): {e}"),
     }
-    let udp = host_port(&inst, "udp", "47102");
+    let udp = host_port(&inst, "udp", "47103");
     let u = UdpSocket::bind("127.0.0.1:0").unwrap();
     u.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    u.send_to(b"ping", ("127.0.0.1", udp)).unwrap();
+    u.send_to(b"host", ("127.0.0.1", udp)).unwrap();
     let mut b = [0u8; 16];
     assert!(u.recv_from(&mut b).is_err(), "a host datagram was answered by a guest server");
+    // The datagram server was alive and serving throughout (a stuck one would prove nothing): its
+    // own namespace still gets its echo.
+    let Some((_, out, err)) = common::run_fixture_as(&inst, "loopiso", &["client", "47103", "reach"], 10_001) else { return };
+    assert!(!out.contains("FAIL"), "{out}\n{err}");
+    assert!(out.contains("ok udp reply to an unbound client"), "the udp server was not serving: {out}\n{err}");
+    // What the server itself received: its namespace's datagram, never the host program's. (The
+    // server's echo to a host port would be dropped anyway, so only its own log tells.)
+    let Some((_, sout, serr)) = srv_udp.join().unwrap() else { return };
+    assert!(sout.contains("udp got ping"), "the udp server saw no datagram: {sout}\n{serr}");
+    assert!(!sout.contains("udp got host"), "the recv filter let a host program's datagram in: {sout}\n{serr}");
 }
 
 #[test]

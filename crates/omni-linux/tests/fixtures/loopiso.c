@@ -5,6 +5,7 @@
 // Prints "ok ..." or "FAIL ...".
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
@@ -36,6 +37,10 @@ static int server(int port) {
     check(bind(u, (struct sockaddr*)&a, sizeof(a)) == 0, "server udp bind");
     printf("ready\n");
     fflush(stdout);
+    // Non-blocking: a connection or datagram the guest's namespace drops after poll() reported it
+    // must not leave this server stuck in accept or recvfrom.
+    fcntl(t, F_SETFL, O_NONBLOCK);
+    fcntl(u, F_SETFL, O_NONBLOCK);
     struct pollfd fds[2] = {{t, POLLIN, 0}, {u, POLLIN, 0}};
     for (int i = 0; i < 200; i++) {
         if (poll(fds, 2, 100) <= 0) continue;
@@ -48,6 +53,7 @@ static int server(int port) {
             struct sockaddr_in from;
             socklen_t flen = sizeof(from);
             ssize_t n = recvfrom(u, buf, sizeof(buf), 0, (struct sockaddr*)&from, &flen);
+            if (n > 0) { printf("udp got %.*s\n", (int)n, buf); fflush(stdout); }
             if (n > 0) sendto(u, buf, n, 0, (struct sockaddr*)&from, flen);
         }
     }
