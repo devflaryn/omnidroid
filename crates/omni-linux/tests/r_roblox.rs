@@ -79,6 +79,95 @@ fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
     Ok(bytes)
 }
 
+/// Save the device at `kept` (its boot ended) as `g`, whole or not at all: copied beside, then
+/// renamed; `ready` says what it was saved from. The copy's per-boot files are then removed from
+/// `kept`, which boots again.
+fn save_device(kept: &Path, g: &Path, from: &str) {
+    let t = Instant::now();
+    let part = g.with_extension(format!("part-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&part);
+    match copy_device(kept, &part.join("device")) {
+        Ok(bytes) => {
+            let _ = std::fs::write(part.join("ready"), format!("{from}
+"));
+            let _ = std::fs::remove_dir_all(g);
+            let _ = std::fs::create_dir_all(g.parent().unwrap_or(Path::new(".")));
+            match std::fs::rename(&part, g) {
+                Ok(()) => eprintln!("[r] device saved as {}: {} MiB in {} ms", g.display(), bytes >> 20, t.elapsed().as_millis()),
+                Err(e) => eprintln!("[r] device not saved as {}: {e}", g.display()),
+            }
+        }
+        Err(e) => eprintln!("[r] device not saved: {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&part);
+    for f in NOT_SAVED.iter().filter(|f| f.starts_with(".omni")) {
+        let _ = std::fs::remove_dir_all(kept.join(f));
+        let _ = std::fs::remove_file(kept.join(f));
+    }
+}
+
+// A test device trimmed as test images are (`OMNI_R_LEAN=0` keeps everything): the image's apps
+// that nothing here uses are disabled, so they neither run nor come back -- each app host
+// process holds ~263 MiB, and with ~20 of them started at boot the host ran out of memory as
+// the game loaded (r11: two sessions stopped by Claude Code's low-memory reaper).
+// What the device has no use for at all is not in its image (`omni_linux::device::LEAVES_OUT`:
+// never started, not even at boot or when persistent), and ActivityManager keeps no cached app
+// process (`omni_lean.sh`); these are the image's apps it still has, disabled once it is up.
+const IDLE_APPS: &[&str] = &[
+    "com.android.cellbroadcastreceiver", "com.android.cellbroadcastreceiver.module", "com.android.nfc",
+    "com.android.healthconnect.controller", "com.android.ondevicepersonalization.services",
+    "com.android.devicelockcontroller", "com.android.statementservice", "com.android.documentsui",
+    "com.android.federatedcompute.services", "com.android.adservices.api", "com.android.managedprovisioning",
+    "com.android.rkpdapp", "com.android.externalstorage", "com.android.keychain",
+    "com.android.ext.adservices.api", "com.android.providers.userdictionary", "com.android.wallpaperbackup",
+    "com.android.cellbroadcastservice",
+];
+
+/// The script that disables `IDLE_APPS` once the device is up (`OMNI_R_LEAN=0`: none).
+fn lean_script() -> String {
+    if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
+        return String::new();
+    }
+    format!(
+        "for a in {}; do r=$(cmd package disable-user --user 0 $a 2>&1); case \"$r\" in *disabled*) ;; *) echo \"[r] not disabled: $a: $r\";; esac; done; echo \"[r] idle apps disabled: {}\"; ",
+        IDLE_APPS.join(" "),
+        IDLE_APPS.len()
+    )
+}
+
+/// The device is set up as a freely resizable one is: Developer options' "Force activities to be
+/// resizable", for every app (the owner's choice, 2026-09-28; `OMNI_R_RESIZABLE=0` leaves it off).
+/// The APK declares `resizeableActivity="false"` on its application, and without this Android
+/// answers a display resize with size-compatibility mode -- the app kept at its old size, scaled,
+/// and a "restart for a better view" button (run 2026-09-28, 1280x720 -> 817x542) -- rather than a
+/// new size for the app to draw at.
+fn resizable_script() -> &'static str {
+    if std::env::var("OMNI_R_RESIZABLE").as_deref() != Ok("0") {
+        "settings put global force_resizable_activities 1; echo \"[r] activities resizable\"; "
+    } else {
+        ""
+    }
+}
+
+/// Until Android says it has booted (`sys.boot_completed`), at most 20 minutes.
+const BOOTED: &str = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 1200 ]; do sleep 1; i=$((i+1)); done; \
+                      echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; ";
+
+/// A new device's settings, as its owner would set them once: set up, the screen kept on, no
+/// animations, resizable activities, the idle apps disabled.
+fn settings_script() -> String {
+    format!(
+        "settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
+         settings put system screen_off_timeout 1800000; svc power stayon true; \
+         input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
+         settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
+         settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
+         {}{}",
+        resizable_script(),
+        lean_script()
+    )
+}
+
 /// How saved devices are set up: a device saved by an older setup is not booted (2: the package
 /// installer kept enabled).
 const DEVICE_SETUP: u32 = 2;
@@ -123,6 +212,9 @@ fn join_script(id: &str, first: u32) -> String {
 #[ignore = "boots the whole system, installs and starts an app: many minutes"]
 fn the_apk_is_installed_started_and_draws() {
     let Some(sysroot) = common::sysroot() else { return };
+    if std::env::var("OMNI_R_WARM").as_deref() == Ok("1") {
+        return warm_device(&sysroot);
+    }
     let apk = std::env::var_os("OMNI_TEST_APK")
         .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Roblox-2.738.1397.apk"), PathBuf::from);
     assert!(apk.exists(), "no APK at {}", apk.display());
@@ -182,31 +274,7 @@ fn the_apk_is_installed_started_and_draws() {
     } else {
         String::new()
     };
-    // A test device trimmed as test images are (`OMNI_R_LEAN=0` keeps everything): the image's apps
-    // that nothing here uses are disabled, so they neither run nor come back -- each app host
-    // process holds ~263 MiB, and with ~20 of them started at boot the host ran out of memory as
-    // the game loaded (r11: two sessions stopped by Claude Code's low-memory reaper).
-    // What the device has no use for at all is not in its image (`omni_linux::device::LEAVES_OUT`:
-    // never started, not even at boot or when persistent), and ActivityManager keeps no cached app
-    // process (`omni_lean.sh`); these are the image's apps it still has, disabled once it is up.
-    const IDLE_APPS: &[&str] = &[
-        "com.android.cellbroadcastreceiver", "com.android.cellbroadcastreceiver.module", "com.android.nfc",
-        "com.android.healthconnect.controller", "com.android.ondevicepersonalization.services",
-        "com.android.devicelockcontroller", "com.android.statementservice", "com.android.documentsui",
-        "com.android.federatedcompute.services", "com.android.adservices.api", "com.android.managedprovisioning",
-        "com.android.rkpdapp", "com.android.externalstorage", "com.android.keychain",
-        "com.android.ext.adservices.api", "com.android.providers.userdictionary", "com.android.wallpaperbackup",
-        "com.android.cellbroadcastservice",
-    ];
-    let lean = if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
-        String::new()
-    } else {
-        format!(
-            "for a in {}; do r=$(cmd package disable-user --user 0 $a 2>&1); case \"$r\" in *disabled*) ;; *) echo \"[r] not disabled: $a: $r\";; esac; done; echo \"[r] idle apps disabled: {}\"; ",
-            IDLE_APPS.join(" "),
-            IDLE_APPS.len()
-        )
-    };
+    let lean = lean_script();
     // A dedicated single-app device (the default; `OMNI_R_KIOSK=0`: with SystemUI and the
     // launcher, ~1.1 GiB more, run 2026-09-28) -- no SystemUI and no launcher in its image
     // (`omni_linux::device::KIOSK_LEAVES_OUT`), so no status bar, navigation bar, taskbar or
@@ -224,32 +292,10 @@ fn the_apk_is_installed_started_and_draws() {
     // `OMNI_R_AFTER_INSTALL`: shell run once the APK is installed, before its first start (an
     // app-op the APK asks for, granted as its owner would grant it in Settings).
     let after_install = std::env::var("OMNI_R_AFTER_INSTALL").map_or_else(|_| String::new(), |c| format!("{c}; echo \"[r] after install: $?\"; "));
-    // The device is set up as a freely resizable one is: Developer options' "Force activities to
-    // be resizable", for every app (the owner's choice, 2026-09-28; `OMNI_R_RESIZABLE=0` leaves it
-    // off). The APK declares `resizeableActivity="false"` on its application, and without this
-    // Android answers a display resize with size-compatibility mode -- the app kept at its old size,
-    // scaled, and a "restart for a better view" button (run 2026-09-28, 1280x720 -> 817x542) --
-    // rather than a new size for the app to draw at.
-    let resizable = if std::env::var("OMNI_R_RESIZABLE").as_deref() != Ok("0") {
-        "settings put global force_resizable_activities 1; echo \"[r] activities resizable\"; "
-    } else {
-        ""
-    };
-    let booted = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 1200 ]; do sleep 1; i=$((i+1)); done; \
-                  echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; ";
+    let booted = BOOTED;
     // A device to be saved keeps its package installer (PackageManager does not start without one):
     // each boot of the saved device disables it once up.
-    let setup = |lean_after: &str| {
-        format!(
-            "settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
-             settings put system screen_off_timeout 1800000; svc power stayon true; \
-             input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
-             settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
-             settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
-             {resizable}{lean}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; \
-             {lean_after}{after_install}"
-        )
-    };
+    let setup = |lean_after: &str| format!("{}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; {lean_after}{after_install}", settings_script());
     let resolve = "pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
                    act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; ";
     // The device's language: the account's (`OMNI_R_LOCALE`, default tr-TR -- the owner's accounts
@@ -260,7 +306,8 @@ fn the_apk_is_installed_started_and_draws() {
     // relaunch activity", "Ending game session with place ID 8737899170").
     let locale_name = std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into());
     let locale = format!("persist.sys.locale={locale_name}");
-    let boot_args = ["--zygote", "--setprop", locale.as_str()];
+    let boot_args = boot_args(&locale);
+    let boot_args: Vec<&str> = boot_args.iter().map(String::as_str).collect();
 
     // `OMNI_R_GOLDEN=<dir>`: devices are saved there and booted again, not made anew. The first run
     // for an APK, account and setup boots a new device, installs the APK and signs in as above; once
@@ -452,26 +499,7 @@ fn the_apk_is_installed_started_and_draws() {
         if let Some(g) = &golden {
             std::thread::sleep(Duration::from_secs(2));
             boot.kill();
-            let t = Instant::now();
-            let part = g.with_extension(format!("part-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&part);
-            match copy_device(&kept, &part.join("device")) {
-                Ok(bytes) => {
-                    let _ = std::fs::write(part.join("ready"), format!("{}\n", apk.display()));
-                    let _ = std::fs::remove_dir_all(g);
-                    let _ = std::fs::create_dir_all(g.parent().unwrap_or(Path::new(".")));
-                    match std::fs::rename(&part, g) {
-                        Ok(()) => eprintln!("[r] device saved as {}: {} MiB in {} ms", g.display(), bytes >> 20, t.elapsed().as_millis()),
-                        Err(e) => eprintln!("[r] device not saved as {}: {e}", g.display()),
-                    }
-                }
-                Err(e) => eprintln!("[r] device not saved: {e}"),
-            }
-            let _ = std::fs::remove_dir_all(&part);
-            for f in NOT_SAVED.iter().filter(|f| f.starts_with(".omni")) {
-                let _ = std::fs::remove_dir_all(kept.join(f));
-                let _ = std::fs::remove_file(kept.join(f));
-            }
+            save_device(&kept, g, &apk.display().to_string());
             for f in ["signed-in", "joining", "cookie-store", "cookie-planted"] {
                 let _ = std::fs::remove_file(in_tmp(f));
             }
@@ -491,4 +519,82 @@ fn the_apk_is_installed_started_and_draws() {
     if place.is_some() {
         assert!(joined, "OMNI_R_PLACE was set but the log never showed \"Joining game\": the place was not joined with {} (an APK too old for the servers shows \"Upgrade required\")\n{tail}", apk.display());
     }
+}
+
+/// The runner's arguments for a boot: the zygote answered, the device's language (`persist.sys.locale=`),
+/// and each of `OMNI_R_SETPROPS` (`name=value`, comma-separated: a lever tried at boot).
+fn boot_args(locale: &str) -> Vec<String> {
+    let mut args = vec!["--zygote".to_string(), "--setprop".to_string(), locale.to_string()];
+    for kv in std::env::var("OMNI_R_SETPROPS").unwrap_or_default().split(',').filter(|kv| kv.contains('=')) {
+        args.extend(["--setprop".to_string(), kv.trim().to_string()]);
+    }
+    args
+}
+
+/// `OMNI_R_WARM=1`: a **warm device** -- Android booted and idle, no app of its own, kept for the
+/// apps a host program (the MCP server) installs, starts and stops through the device's control
+/// channel (`<instance>.ctl`, `omni-linux-run --control`) one after another. The device is the
+/// kiosk device the app sessions boot, less their APK: set up once (`settings_script`), saved
+/// under `OMNI_R_GOLDEN` as `base-<kiosk|ui>-<locale>-v<DEVICE_SETUP>` and booted from a copy
+/// afterwards. The host writes `/data/local/tmp/warm-ready` once it can take an app, and the
+/// session runs `OMNI_R_MINUTES` (default 720) or until `/data/local/tmp/stop`.
+fn warm_device(sysroot: &Path) {
+    let minutes: u64 = std::env::var("OMNI_R_MINUTES").ok().and_then(|m| m.parse().ok()).unwrap_or(720);
+    let instance = std::env::var_os("OMNI_R_INSTANCE")
+        .map_or_else(|| std::env::temp_dir().join(format!("omni-linux-w-{}", std::process::id())), PathBuf::from);
+    let _ = std::fs::remove_dir_all(&instance);
+    let screenshot = std::env::var_os("OMNI_SCREENSHOT").map(PathBuf::from).unwrap_or_else(|| instance.with_extension("png"));
+    std::env::set_var("OMNI_SCREENSHOT", &screenshot);
+    let kiosk = std::env::var("OMNI_R_KIOSK").as_deref() != Ok("0");
+    if kiosk {
+        std::env::set_var("OMNI_DEVICE_APPS", "kiosk");
+    }
+    // Per-app switches, read at each app's start (`omni_linux::zygote`): `<instance>.appenv`.
+    if std::env::var_os("OMNI_APP_ENV_FILE").is_none() {
+        std::env::set_var("OMNI_APP_ENV_FILE", instance.with_extension("appenv"));
+    }
+    let locale_name = std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into());
+    let args = boot_args(&format!("persist.sys.locale={locale_name}"));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let golden = std::env::var_os("OMNI_R_GOLDEN")
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}", if kiosk { "kiosk" } else { "ui" })));
+    let saved = golden.as_ref().filter(|g| g.join("ready").exists());
+    // Up: the screen woken, then ready for an app.
+    let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");
+    let then = if let Some(g) = saved {
+        let t = Instant::now();
+        let bytes = copy_device(&g.join("device"), &instance).expect("the saved device copied");
+        eprintln!("[r] device from {}: {} MiB in {} ms", g.display(), bytes >> 20, t.elapsed().as_millis());
+        ready.clone()
+    } else {
+        std::fs::create_dir_all(instance.join("data/local/tmp")).expect("/data/local/tmp");
+        let rest = if golden.is_some() { "sync; sleep 2; echo \"[r] device quiet\"; ".to_string() } else { "echo \"[r] warm ready\"; ".to_string() };
+        format!("{BOOTED}{}{rest}", settings_script())
+    };
+    let kept = instance.clone();
+    let in_tmp = |name: &str| kept.join("data/local/tmp").join(name);
+    let deadline = Instant::now() + Duration::from_secs(minutes * 60);
+    let quiet = std::cell::Cell::new(false);
+    let mut on_line = |line: &str| -> bool {
+        if line.contains("[r] warm ready") {
+            let _ = std::fs::write(in_tmp("warm-ready"), "1");
+        }
+        if line.contains("[r] device quiet") {
+            quiet.set(true);
+            return true;
+        }
+        in_tmp("stop").exists()
+    };
+    let mut boot = common::boot::Boot::start(sysroot, instance, &args, &then);
+    boot.watch(deadline.saturating_duration_since(Instant::now()), &mut on_line);
+    if quiet.get() {
+        if let Some(g) = &golden {
+            std::thread::sleep(Duration::from_secs(2));
+            boot.kill();
+            save_device(&kept, g, "a warm device");
+            boot = boot.reboot(sysroot, &args, &ready);
+            boot.watch(deadline.saturating_duration_since(Instant::now()), &mut on_line);
+        }
+    }
+    eprintln!("[r] warm device ended{}", if in_tmp("stop").exists() { " as asked (/data/local/tmp/stop)" } else { "" });
 }

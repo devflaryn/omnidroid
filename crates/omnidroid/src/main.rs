@@ -78,6 +78,7 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
        omnidroid aosp [--apk <path>] [--cookie <file|name>] [--place <id>] [--minutes <n>]
                       [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
                       [--fresh-device] [--standby] [--instance <dir>]
+       omnidroid aosp --warm [--instance <dir>] [--minutes <n>] [--size <w>x<h>] [--gpu vulkan|gl|auto]
        omnidroid which [--apk <path>]
        omnidroid login [<username> [<password>]] [--dir <dir>]
 
@@ -113,6 +114,12 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                     place): a place id written to <instance>/data/local/tmp/join-place is joined,
                     and <instance>/data/local/tmp/stop ends the session; --instance names the
                     instance's directory
+  aosp --warm       a warm device: Android booted and idle with no app (no --apk), for apps a
+                    host program installs, starts and stops on it through its control channel
+                    (<instance>.ctl: a shell command in <id>.cmd, its output in <id>.out and exit
+                    status in <id>.rc) -- the MCP server's install_apk and start_instance. Saved
+                    once (<session dir>/omni-golden/base-...), booted from a copy after; ready when
+                    <instance>/data/local/tmp/warm-ready is there. --minutes defaults to 720
 
   login             sign in to Roblox in Chromium and keep the cookie, username and password in
                     <dir> (default <app-data>/../cookies): no arguments -- you sign in; a username
@@ -698,6 +705,7 @@ struct AospOptions {
     with_systemui: bool,
     fresh_device: bool,
     standby: bool,
+    warm: bool,
     instance: Option<PathBuf>,
 }
 
@@ -713,8 +721,10 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
         with_systemui: false,
         fresh_device: false,
         standby: false,
+        warm: false,
         instance: None,
     };
+    let mut minutes_given = false;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -729,6 +739,7 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
                 options.place = Some(place);
             }
             "--minutes" => {
+                minutes_given = true;
                 let text = value("--minutes")?;
                 options.minutes = text
                     .parse()
@@ -755,9 +766,14 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
             "--with-systemui" => options.with_systemui = true,
             "--fresh-device" => options.fresh_device = true,
             "--standby" => options.standby = true,
+            "--warm" => options.warm = true,
             "--instance" => options.instance = Some(PathBuf::from(value("--instance")?)),
             other => return Err(format!("unknown argument `{other}`")),
         }
+    }
+    // A warm device waits for apps: half a day unless told.
+    if options.warm && !minutes_given {
+        options.minutes = 720;
     }
     Ok(options)
 }
@@ -785,6 +801,9 @@ fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'
     }
     if options.standby {
         env.push(("OMNI_R_STANDBY", "1".to_string()));
+    }
+    if options.warm {
+        env.push(("OMNI_R_WARM", "1".to_string()));
     }
     if let Some(dir) = &options.instance {
         env.push(("OMNI_R_INSTANCE", dir.display().to_string()));
@@ -819,15 +838,21 @@ fn is_tmpfs(dir: &Path) -> bool {
 
 /// `omnidroid aosp`: the real-AOSP session in a live window (see USAGE).
 fn aosp(options: &AospOptions) -> ExitCode {
-    let apk = match omni_apk::choose_apk(options.apk.as_deref(), &repo_root()) {
-        Ok(apk) => apk,
-        Err(error) => {
-            eprintln!("omnidroid: {error}");
-            return ExitCode::FAILURE;
-        }
+    // A warm device has no APK of its own.
+    let apk_path = if options.warm {
+        println!("Omnidroid (real AOSP): a warm device, no app");
+        PathBuf::new()
+    } else {
+        let apk = match omni_apk::choose_apk(options.apk.as_deref(), &repo_root()) {
+            Ok(apk) => apk,
+            Err(error) => {
+                eprintln!("omnidroid: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("Omnidroid (real AOSP): {}", describe(&apk));
+        std::fs::canonicalize(&apk.path).unwrap_or_else(|_| apk.path.clone())
     };
-    let apk_path = std::fs::canonicalize(&apk.path).unwrap_or_else(|_| apk.path.clone());
-    println!("Omnidroid (real AOSP): {}", describe(&apk));
     // The session plants the cookie from a file (never printed): a file, or a name `login` saved.
     let cookie = match &options.cookie {
         None => None,

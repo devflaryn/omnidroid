@@ -256,6 +256,13 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
     if nice.is_some() && std::env::var("OMNI_SLOW_APP").ok().as_deref() == nice {
         cmd.env("OMNI_SLOW_SYSCALL_MS", std::env::var("OMNI_SLOW_APP_MS").unwrap_or_else(|_| "200".into()));
     }
+    // OMNI_APP_ENV_FILE=<host file>: `NAME=VALUE` lines given to each app host process started
+    // after the file changed -- a per-app switch measured launch against launch on one live device.
+    if let Some(text) = std::env::var_os("OMNI_APP_ENV_FILE").and_then(|f| std::fs::read_to_string(f).ok()) {
+        for (k, v) in text.lines().filter_map(|l| l.trim().split_once('=')) {
+            cmd.env(k.trim(), v.trim());
+        }
+    }
     // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
     cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
     cmd.args(class_and_args);
