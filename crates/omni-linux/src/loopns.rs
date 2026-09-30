@@ -8,9 +8,26 @@
 //! publishes abstract sockets). A connect or send to a loopback port resolves through the table;
 //! a port not in it cannot be reached. An app's namespace is its user's; system uids share one.
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::errno::{Errno, EADDRINUSE, EIO};
+
+/// Process-wide counter for unique temp file names across threads and processes.
+static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Get or create a per-namespace lock.
+fn get_namespace_lock(dir: &Path) -> Arc<Mutex<()>> {
+    use std::collections::HashMap;
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut lock_map = locks.lock().unwrap();
+    Arc::clone(
+        lock_map
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Proto {
@@ -95,16 +112,21 @@ pub struct Namespace {
 /// An entry, held while its socket is open: dropped, its files go.
 pub struct Binding {
     files: Vec<PathBuf>,
+    namespace_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl Drop for Binding {
     fn drop(&mut self) {
-        let me = std::process::id();
-        for f in &self.files {
-            // Only remove if we still own it: verify the pid in the entry.
-            if let Some((_, owner, _)) = read_entry(f) {
-                if owner == me {
-                    let _ = std::fs::remove_file(f);
+        // Take lock to safely remove entries.
+        if let Some(lock_arc) = self.namespace_lock.as_ref() {
+            let _lock = lock_arc.lock().unwrap();
+            let me = std::process::id();
+            for f in &self.files {
+                // Only remove if we still own it: verify the pid in the entry.
+                if let Some((_, owner, _)) = read_entry(f) {
+                    if owner == me {
+                        let _ = std::fs::remove_file(f);
+                    }
                 }
             }
         }
@@ -120,20 +142,22 @@ fn read_entry(path: &Path) -> Option<(u16, u32, bool)> {
     Some((port, owner, w.next() == Some("s")))
 }
 
-/// Read an entry with retries for incomplete writes.
-fn read_entry_with_retry(path: &Path, max_retries: u32) -> Option<(u16, u32, bool)> {
-    for _ in 0..max_retries {
-        if let Some(entry) = read_entry(path) {
-            return Some(entry);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    None
-}
-
 /// Whether an entry's owner still runs: this host process, or a live one.
 fn live(owner: u32) -> bool {
     owner == std::process::id() || omni_platform::process::is_alive(owner)
+}
+
+/// Atomically write content to a file via temp + rename.
+fn atomic_write(path: &Path, content: &str) -> Result<(), Errno> {
+    let counter = WRITE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let tmp = path.parent().ok_or(EIO)?
+        .join(format!(".tmp-{}-{}", std::process::id(), counter));
+    std::fs::write(&tmp, content).map_err(|_| EIO)?;
+    std::fs::rename(&tmp, path).map_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+        EIO
+    })?;
+    Ok(())
 }
 
 impl Namespace {
@@ -164,79 +188,47 @@ impl Namespace {
         let guest = if guest == 0 { host } else { guest };
         let me = std::process::id();
         let fwd = self.forward(proto, guest);
-        let body = format!("{host} {me}{}", if shared { " s" } else { "" });
-        let mut claim_tries = 0;
-        let mut take_tries = 0;
+        let rev = self.reverse(proto, host);
+        let fwd_body = format!("{host} {me}{}", if shared { " s" } else { "" });
+        let rev_body = format!("{guest} {me}");
 
-        loop {
-            // Try to claim atomically: write to temp, hard_link to target.
-            let tmp = self.dir.join(format!(".tmp-{me}-{}", claim_tries));
-            std::fs::write(&tmp, &body).map_err(|_| EIO)?;
-            match std::fs::hard_link(&tmp, &fwd) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    // Claim succeeded: build binding before reverse entry.
-                    let mut files = vec![fwd.clone()];
-                    let rev = self.reverse(proto, host);
-                    std::fs::write(&rev, format!("{guest} {me}")).map_err(|_| {
-                        // Failed to write reverse: release the forward entry.
-                        let _ = std::fs::remove_file(&fwd);
-                        EIO
-                    })?;
-                    files.push(rev);
-                    return Ok(Binding { files });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = std::fs::remove_file(&tmp);
-                    // Entry exists: check if it's live or stale.
-                    match read_entry_with_retry(&fwd, 5) {
-                        Some((_, owner, held_shared)) => {
-                            if live(owner) {
-                                // Live owner: check for shared join.
-                                if shared && held_shared {
-                                    // Build binding without forward entry (joined).
-                                    let mut files = Vec::new();
-                                    let rev = self.reverse(proto, host);
-                                    std::fs::write(&rev, format!("{guest} {me}")).map_err(|_| EIO)?;
-                                    files.push(rev);
-                                    return Ok(Binding { files });
-                                }
-                                return Err(EADDRINUSE);
-                            } else {
-                                // Stale: atomically take over by renaming to tombstone.
-                                if take_tries >= 3 {
-                                    return Err(EADDRINUSE);
-                                }
-                                let tomb = self.dir.join(format!(".tomb-{me}-{}", take_tries));
-                                match std::fs::rename(&fwd, &tomb) {
-                                    Ok(()) => {
-                                        let _ = std::fs::remove_file(&tomb);
-                                        take_tries += 1;
-                                        claim_tries += 1;
-                                        // Retry the claim after takeover.
-                                    }
-                                    Err(_) => {
-                                        // Rename failed: another taker got it or entry already gone.
-                                        // Retry the claim.
-                                        claim_tries += 1;
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            // Unreadable: retry a few times, then give up.
-                            if claim_tries >= 5 {
-                                return Err(EADDRINUSE);
-                            }
-                            claim_tries += 1;
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
+        // Get the lock Arc for this namespace.
+        let lock_arc = get_namespace_lock(&self.dir);
+        let _lock = lock_arc.lock().unwrap();
+
+        // Critical section: read, decide, write under lock.
+        // Read forward entry if it exists.
+        match read_entry(&fwd) {
+            Some((_, owner, held_shared)) => {
+                if live(owner) {
+                    // Live owner: check for shared join.
+                    if shared && held_shared {
+                        // Build binding without forward entry (joined).
+                        atomic_write(&rev, &rev_body)?;
+                        return Ok(Binding {
+                            files: vec![rev],
+                            namespace_lock: Some(Arc::clone(&lock_arc)),
+                        });
                     }
+                    return Err(EADDRINUSE);
+                } else {
+                    // Stale: replace it.
+                    atomic_write(&fwd, &fwd_body)?;
+                    atomic_write(&rev, &rev_body)?;
+                    return Ok(Binding {
+                        files: vec![fwd, rev],
+                        namespace_lock: Some(Arc::clone(&lock_arc)),
+                    });
                 }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(EIO);
-                }
+            }
+            None => {
+                // Unreadable: treat as corrupt/stale, replace it.
+                atomic_write(&fwd, &fwd_body)?;
+                atomic_write(&rev, &rev_body)?;
+                return Ok(Binding {
+                    files: vec![fwd, rev],
+                    namespace_lock: Some(Arc::clone(&lock_arc)),
+                });
             }
         }
     }
