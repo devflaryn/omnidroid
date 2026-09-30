@@ -41,12 +41,32 @@ pub struct Layer<'a> {
     pub alpha: f32,
 }
 
+/// **The fast path** (`omni_linux::lever`'s `compose_fast=0|1`; **off by default** until its in-world A/B):
+/// fewer passes -- black written once rather than zeroed then given its alpha, and a premultiplied
+/// layer's fully transparent pixels skipped and its fully opaque ones copied rather than blended
+/// (an app window over its SurfaceView is mostly a transparent hole: ~921,600 blends a frame at
+/// 1280x720, four integer divisions each). Every shortcut is the blend's own result for that pixel,
+/// so the output is identical (`tests::the_fast_path_composes_the_same_pixels`).
+pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Compose `layers` (bottom first) over black into `out`: RGBA rows of `width` pixels.
 pub fn compose(out: &mut [u8], width: usize, height: usize, layers: &[Layer<'_>]) {
-    out.fill(0);
-    for px in out.chunks_exact_mut(4) {
-        px[3] = 255;
+    compose_with(out, width, height, layers, FAST.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+/// [`compose`], with or without [`FAST`]'s shortcuts.
+pub fn compose_with(out: &mut [u8], width: usize, height: usize, layers: &[Layer<'_>], fast: bool) {
+    if fast {
+        for px in out.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0, 0, 0, 255]);
+        }
+    } else {
+        out.fill(0);
+        for px in out.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
     }
+    let blend_row: fn(&mut [u8], &[u8], Blend, bool, u32) = if fast { blend_row_fast } else { blend_row };
     for layer in layers {
         let (l, t, r, b) = layer.frame;
         let (x0, y0) = (l.max(0) as usize, t.max(0) as usize);
@@ -113,6 +133,27 @@ fn mapped_row(data: &[u8], stride: usize, rows: usize, bgra: bool, crop: (f32, f
         o.copy_from_slice(&src_px(s.clamp(0.0, 0.999_999), tt.clamp(0.0, 0.999_999)));
     }
     out
+}
+
+/// [`blend_row`] with [`FAST`]'s shortcuts for a premultiplied layer with alpha: a pixel whose four
+/// bytes are 0 leaves `dst` as it is (`a` is 0, so `dst * 255 / 255`), and at plane alpha 1 a pixel
+/// whose alpha is 255 is its own colour with alpha 255 (`src * 255 / 255 + dst * 0`) -- exactly what
+/// [`blend_pixel`] computes for each.
+fn blend_row_fast(dst: &mut [u8], src: &[u8], blend: Blend, opaque: bool, plane: u32) {
+    if (plane == 255 && (blend == Blend::None || opaque)) || blend != Blend::Premultiplied || opaque {
+        blend_row(dst, src, blend, opaque, plane);
+        return;
+    }
+    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        if s == [0, 0, 0, 0] {
+            continue;
+        }
+        if plane == 255 && s[3] == 255 {
+            d.copy_from_slice(s);
+            continue;
+        }
+        blend_pixel(d, s, blend, opaque, plane);
+    }
 }
 
 fn blend_row(dst: &mut [u8], src: &[u8], blend: Blend, opaque: bool, plane: u32) {
@@ -216,6 +257,106 @@ mod tests {
             &[Layer { source: Source::Mapped { data: &src, stride: 1, rows: 1, opaque: false, bgra: true, crop: (0.0, 0.0, 1.0, 1.0), transform: 0 }, frame: (0, 0, 1, 1), blend: Blend::None, alpha: 1.0 }],
         );
         assert_eq!(px(&out, 1, 0, 0), [0, 0, 255, 255]);
+    }
+
+    /// The fast path's shortcuts give exactly the blend's pixels: random stacks of premultiplied,
+    /// coverage and opaque layers, alphas biased to 0 and 255 (where the shortcuts fire), plane
+    /// alphas 1 and below, frames overlapping and past the display.
+    #[test]
+    fn the_fast_path_composes_the_same_pixels() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (w, h) = (37, 23);
+        for round in 0..200 {
+            let count = 1 + (next() % 4) as usize;
+            let mut datas = Vec::new();
+            let mut specs = Vec::new();
+            for _ in 0..count {
+                let (sw, sh) = (1 + (next() % 48) as usize, 1 + (next() % 32) as usize);
+                let data: Vec<u8> = (0..sw * sh)
+                    .flat_map(|_| {
+                        let a = match next() % 4 {
+                            0 => 0,
+                            1 => 255,
+                            _ => (next() % 256) as u8,
+                        };
+                        // Premultiplied-valid colour (not above alpha), or all zero.
+                        let c = |n: u64| if a == 0 { 0 } else { (n % (u64::from(a) + 1)) as u8 };
+                        [c(next()), c(next()), c(next()), a]
+                    })
+                    .collect();
+                let blend = match next() % 3 {
+                    0 => Blend::None,
+                    1 => Blend::Coverage,
+                    _ => Blend::Premultiplied,
+                };
+                let l = (next() % 50) as i32 - 10;
+                let t = (next() % 30) as i32 - 5;
+                specs.push((sw, sh, next() % 5 == 0, blend, (l, t, l + sw as i32, t + sh as i32), if next() % 3 == 0 { 0.5 } else { 1.0 }));
+                datas.push(data);
+            }
+            let layers: Vec<Layer<'_>> = specs
+                .iter()
+                .zip(&datas)
+                .map(|(&(sw, _, opaque, blend, frame, alpha), data)| Layer { source: Source::Pixels { data, stride: sw, opaque, crop_x: 0, crop_y: 0 }, frame, blend, alpha })
+                .collect();
+            let (mut slow, mut fast) = (vec![7u8; w * h * 4], vec![9u8; w * h * 4]);
+            compose_with(&mut slow, w, h, &layers, false);
+            compose_with(&mut fast, w, h, &layers, true);
+            assert_eq!(slow, fast, "round {round}");
+        }
+    }
+
+    /// A measurement, not a check (`cargo test --release -p omni-linux --lib -- --ignored
+    /// compose_cost`): one 1280x720 frame as an app in a world makes it -- its SurfaceView (opaque
+    /// pixels, a premultiplied layer) under its window (a transparent hole but for a 200-pixel bar
+    /// of translucent UI) -- composed by each path, interleaved, 16 pairs of 30 frames.
+    #[test]
+    #[ignore = "a measurement"]
+    fn compose_cost() {
+        let (w, h) = (1280usize, 720usize);
+        let scene: Vec<u8> = (0..w * h).flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8, 255]).collect();
+        let window: Vec<u8> = (0..w * h).flat_map(|i| if i / w < 200 { [60, 60, 60, 128] } else { [0, 0, 0, 0] }).collect();
+        let layers = [
+            Layer { source: Source::Pixels { data: &scene, stride: w, opaque: false, crop_x: 0, crop_y: 0 }, frame: (0, 0, w as i32, h as i32), blend: Blend::Premultiplied, alpha: 1.0 },
+            Layer { source: Source::Pixels { data: &window, stride: w, opaque: false, crop_x: 0, crop_y: 0 }, frame: (0, 0, w as i32, h as i32), blend: Blend::Premultiplied, alpha: 1.0 },
+        ];
+        let mut out = vec![0u8; w * h * 4];
+        let mut time = |fast: bool| {
+            let t = std::time::Instant::now();
+            for _ in 0..30 {
+                compose_with(&mut out, w, h, &layers, fast);
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / 30.0
+        };
+        let (mut slow, mut fast) = (Vec::new(), Vec::new());
+        for pair in 0..16 {
+            if pair % 2 == 0 {
+                slow.push(time(false));
+                fast.push(time(true));
+            } else {
+                fast.push(time(true));
+                slow.push(time(false));
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let mut d: Vec<f64> = fast.iter().zip(&slow).map(|(f, s)| f - s).collect();
+        eprintln!(
+            "compose 1280x720, 2 layers: slow {:.2} ms/frame, fast {:.2} ms/frame, paired d median {:.2} (min {:.2}, max {:.2})",
+            med(&mut slow.clone()),
+            med(&mut fast.clone()),
+            med(&mut d),
+            d.first().copied().unwrap_or(0.0),
+            d.last().copied().unwrap_or(0.0)
+        );
     }
 
     #[test]

@@ -299,6 +299,10 @@ struct State {
     frames_client: u64,
     /// The layer list `OMNI_COMPOSER_TRACE=layers` last printed.
     traced: String,
+    /// Under `compose::FAST`: the last frame's layer pixels and composed frame, their memory used
+    /// again rather than ~3.7 MB allocated (and faulted in, zeroed) per buffer per frame.
+    scratch_layers: HashMap<i64, Vec<u8>>,
+    scratch_out: Vec<u8>,
 }
 
 pub struct Client {
@@ -344,7 +348,10 @@ impl Client {
             log_paths(&st);
             let mut order: Vec<(i32, i64)> = st.layers.keys().map(|l| (st.device.get(l).map_or(0, |d| d.z), *l)).collect();
             order.sort_unstable();
-            // Each buffer layer's pixels, read whole from its region.
+            // Each buffer layer's pixels, read whole from its region (into last frame's memory for
+            // that layer, under `compose::FAST`: `read_at` writes every byte the frame uses).
+            let fast = super::compose::FAST.load(Ordering::Relaxed);
+            let mut spare = if fast { std::mem::take(&mut st.scratch_layers) } else { HashMap::new() };
             let mut pixels: HashMap<i64, Vec<u8>> = HashMap::new();
             for &(_, l) in &order {
                 let Some(d) = st.device.get(&l) else { continue };
@@ -354,12 +361,19 @@ impl Client {
                 if let Some(b) = d.slot.and_then(|s| d.buffers.get(&s)) {
                     // The app's copy into the buffer lands first, as a release fence is waited on.
                     crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
-                    let mut bytes = vec![0u8; b.stride as usize * b.height as usize * 4];
+                    let need = b.stride as usize * b.height as usize * 4;
+                    let mut bytes = spare.remove(&l).unwrap_or_default();
+                    if fast {
+                        bytes.resize(need, 0);
+                    } else {
+                        bytes = vec![0u8; need];
+                    }
                     if b.shm.read_at(&mut bytes, b.pixels_at).is_ok() {
                         pixels.insert(l, bytes);
                     }
                 }
             }
+            drop(spare);
             let mut layers = Vec::new();
             for &(_, l) in &order {
                 let Some(d) = st.device.get(&l) else { continue };
@@ -393,11 +407,19 @@ impl Client {
                 layers.push(super::compose::Layer { source, frame: (f.left, f.top, f.right, f.bottom), blend, alpha: d.alpha.unwrap_or(1.0) });
             }
             let Mode { width, height, .. } = self.mode();
-            let mut out = vec![0u8; width as usize * height as usize * 4];
-            super::compose::compose(&mut out, width as usize, height as usize, &layers);
+            let need = width as usize * height as usize * 4;
+            let mut out = if fast { std::mem::take(&mut st.scratch_out) } else { Vec::new() };
+            out.resize(need, 0);
+            super::compose::compose_with(&mut out, width as usize, height as usize, &layers, fast);
             drop(layers);
+            if fast {
+                st.scratch_layers = pixels;
+            }
             drop(st);
             self.framebuffer.present_frame(&out, width, height, width);
+            if fast {
+                self.state.lock().scratch_out = out;
+            }
             return;
         }
         st.frames_client += 1;

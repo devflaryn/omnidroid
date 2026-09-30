@@ -9,6 +9,11 @@
 //!   (`omni_cpu::dynarmic::set_live_fp_optimizations`), then every process's translations are
 //!   dropped so what runs next is translated with them. 0 is the accurate default.
 //!
+//! - `compose_fast=0|1`: the composer's fast path (`crate::hal::compose::FAST`: the same pixels
+//!   in fewer passes, its buffers kept from frame to frame). Off by default.
+//! - `fence_poll=<microseconds>`: a guest `vkWaitForFences` polled with that period instead of the
+//!   host driver's own (spinning, on NVIDIA) wait (`crate::gpu::FENCE_POLL_US`). 0 is the driver's.
+//!
 //! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file.
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +36,20 @@ pub fn apply(line: &str) -> Option<String> {
                 p.trim_code();
             }
             Some(format!("jit_fp={kept:#x}: {} processes' translations dropped", live.len()))
+        }
+        "compose_fast" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::hal::compose::FAST.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("compose_fast={}", u8::from(on)))
+        }
+        "fence_poll" => {
+            let us: u32 = value.trim().parse().ok()?;
+            crate::gpu::FENCE_POLL_US.store(us, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("fence_poll={us}: a guest vkWaitForFences {}", if us == 0 { "is the host driver's wait" } else { "is polled" }))
         }
         _ => None,
     }
@@ -77,6 +96,26 @@ mod tests {
     fn a_line_without_a_known_lever_is_not_understood() {
         assert_eq!(apply("nope=1"), None);
         assert_eq!(apply("no equals sign"), None);
+    }
+
+    #[test]
+    fn the_compose_lever_switches_the_fast_path() {
+        use std::sync::atomic::Ordering;
+        apply("compose_fast=0").expect("understood");
+        assert!(!crate::hal::compose::FAST.load(Ordering::Relaxed));
+        apply("compose_fast=1").expect("understood");
+        assert!(crate::hal::compose::FAST.load(Ordering::Relaxed));
+        assert_eq!(apply("compose_fast=yes"), None);
+    }
+
+    #[test]
+    fn the_fence_poll_lever_sets_the_period() {
+        use std::sync::atomic::Ordering;
+        assert!(apply("fence_poll=250").expect("understood").starts_with("fence_poll=250"));
+        assert_eq!(crate::gpu::FENCE_POLL_US.load(Ordering::Relaxed), 250);
+        assert_eq!(apply("fence_poll=x"), None);
+        apply("fence_poll=0").expect("understood");
+        assert_eq!(crate::gpu::FENCE_POLL_US.load(Ordering::Relaxed), 0);
     }
 
     #[test]
