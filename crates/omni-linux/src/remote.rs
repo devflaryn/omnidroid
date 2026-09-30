@@ -43,6 +43,11 @@ fn trace() -> bool {
     *ON.get_or_init(|| std::env::var("OMNI_REMOTE_TRACE").as_deref() == Ok("1"))
 }
 
+/// The longest frame taken: what crosses is guest memory for a binder transaction (its buffers
+/// are about a MiB at most) and a properties dump; 64 MiB is generous for both and small enough
+/// that a lying length field cannot make the system host allocate its way to an abort.
+const MAX_FRAME: usize = 64 << 20;
+
 fn send(stream: &mut TcpStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
     if trace() {
         eprintln!("[remote {}] send {kind} ({} bytes)", std::process::id(), payload.len());
@@ -58,6 +63,11 @@ fn receive(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut len = [0u8; 4];
     stream.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len) as usize;
+    // Bounded before anything is allocated: a frame is read before its sender is known to hold a
+    // credential, so its length is a stranger's word.
+    if len == 0 || len > MAX_FRAME {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame length out of bounds"));
+    }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
     let kind = body.first().copied().unwrap_or(0);
@@ -382,7 +392,11 @@ fn issued() -> &'static Mutex<HashMap<Credential, (i32, u32)>> {
 pub fn issue_credential(pid: i32, uid: u32) -> Credential {
     let mut c = [0u8; 16];
     omni_platform::process::random_bytes(&mut c).expect("entropy for a binder credential");
-    issued().lock().insert(c, (pid, uid));
+    // One credential per pid: stand-ins are found by pid alone, so a second uid for the same pid
+    // must not leave the first one's credential working.
+    let mut issued = issued().lock();
+    issued.retain(|_, (p, _)| *p != pid);
+    issued.insert(c, (pid, uid));
     c
 }
 
@@ -764,8 +778,63 @@ mod tests {
         a.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
         let mut b = [0u8; 1];
         assert_eq!(a.read(&mut b).unwrap_or(0), 0, "another's credential cannot attach to this open");
+        // The owner's own credential attaches and is served.
+        let mut ok = TcpStream::connect(addr).expect("connect");
+        let mut att = token.to_le_bytes().to_vec();
+        att.extend_from_slice(&7u32.to_le_bytes());
+        att.extend_from_slice(&mine);
+        frame(&mut ok, ATTACH, &att);
+        frame(&mut ok, MMAP, &[0u8; 16]);
+        ok.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let (kind, _) = receive(&mut ok).expect("served");
+        assert_eq!(kind, DONE, "the owner's thread attaches");
         revoke_credential(4243_000);
         revoke_credential(4244_000);
+    }
+
+    #[test]
+    fn a_pid_holds_one_credential_the_latest() {
+        let Some(root) = sysroot() else { return };
+        let addr = serve(root).expect("serve");
+        let first = issue_credential(4246_000, 10_120);
+        let second = issue_credential(4246_000, 10_121);
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let mut req = vec![0u8];
+        req.extend_from_slice(&first);
+        frame(&mut s, OPEN, &req);
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(s.read(&mut b).unwrap_or(0), 0, "the earlier credential is refused");
+        let mut t = TcpStream::connect(addr).expect("connect");
+        let mut req = vec![0u8];
+        req.extend_from_slice(&second);
+        frame(&mut t, OPEN, &req);
+        let (kind, body) = receive(&mut t).expect("answer");
+        assert_eq!(kind, OPENED);
+        assert_eq!(u32_at(&body, 12), 10_121, "the second uid");
+        revoke_credential(4246_000);
+    }
+
+    #[test]
+    fn a_frame_with_a_lying_length_closes_the_connection_and_the_server_serves_on() {
+        let Some(root) = sysroot() else { return };
+        let addr = serve(root).expect("serve");
+        for len in [0u32, 0xFFFF_FFFF] {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.write_all(&len.to_le_bytes()).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut b = [0u8; 1];
+            assert_eq!(s.read(&mut b).unwrap_or(0), 0, "closed on length {len:#x}");
+        }
+        let c = issue_credential(4247_000, 10_122);
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let mut req = vec![0u8];
+        req.extend_from_slice(&c);
+        frame(&mut s, OPEN, &req);
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let (kind, _) = receive(&mut s).expect("still serving");
+        assert_eq!(kind, OPENED);
+        revoke_credential(4247_000);
     }
 
     #[test]
