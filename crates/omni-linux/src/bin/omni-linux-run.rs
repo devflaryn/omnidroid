@@ -72,6 +72,15 @@ fn main() -> ExitCode {
             }
         }
     }
+    // The device's global environment (init.environ.rc), as init gives every process: the program,
+    // the apps the zygote launches, init's services and the --then shells. A variable set already
+    // (--env) is kept.
+    for (name, value) in omni_linux::device::global_environment() {
+        let key = format!("{name}=");
+        if !envp.iter().any(|e| e.starts_with(key.as_bytes())) {
+            envp.push(format!("{name}={value}").into_bytes());
+        }
+    }
     // The system's host process holds its apps' host processes (the zygote's): a session that is
     // killed leaves none of them running. An app's host process ends with the system's.
     if zygote {

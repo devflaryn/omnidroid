@@ -207,6 +207,25 @@ pub const KIOSK_LEAVES_OUT: &[&str] = &["/system_ext/priv-app/SystemUI", "/syste
 /// The soft keyboard, left out of a kiosk device with `OMNI_KIOSK_IME=0` (see [`KIOSK_LEAVES_OUT`]).
 pub const KIOSK_IME: &str = "/product/app/LatinIME";
 
+/// The device's global environment: `init.environ.rc`'s `export NAME VALUE` lines. On a device
+/// init exports them before anything starts, so every process -- the zygote, system_server, each
+/// app -- has them; the processes omnidroid starts itself are given them too. system_server needs
+/// `EXTERNAL_STORAGE` when a caller asks for the storage volumes before the primary one is mounted
+/// ("No primary storage defined yet; hacking together a stub"): without it, `new File(null)` threw
+/// in its main thread and the system died -- on a slow host, where that call comes first (Colab's
+/// 2 vCPUs, 2026-09-30).
+#[must_use]
+pub fn global_environment() -> Vec<(String, String)> {
+    let rc = FILES.iter().find(|(path, _)| *path == "/init.environ.rc").map_or(&[][..], |(_, bytes)| *bytes);
+    String::from_utf8_lossy(rc)
+        .lines()
+        .filter_map(|line| match line.split_whitespace().collect::<Vec<_>>()[..] {
+            ["export", name, value] => Some((name.to_string(), value.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// What `OMNI_DEVICE_APPS` makes of the image: `full` (the image as it is), `lean` (the default:
 /// [`LEAVES_OUT`] and [`HARDWARE_LEFT_OUT`] left out), `lean-hw` (only [`LEAVES_OUT`]: the hardware
 /// kept) or `kiosk` (lean, and [`KIOSK_LEAVES_OUT`]). Read by each host process of an
@@ -260,4 +279,17 @@ pub fn materialize() -> Result<Vec<Materialized>, String> {
             Ok(Materialized { guest: guest.as_bytes().to_vec(), entry: Entry::File { mode: 0o644, size: bytes.len() as u64, sha256 }, host })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_global_environment_is_init_environ_rc_exports() {
+        let env = super::global_environment();
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("EXTERNAL_STORAGE"), Some("/sdcard"), "system_server builds its stub volume from it");
+        assert_eq!(get("ANDROID_STORAGE"), Some("/storage"));
+        assert_eq!(get("ANDROID_ROOT"), Some("/system"));
+        assert!(env.iter().all(|(n, v)| !n.is_empty() && !v.is_empty()));
+    }
 }
