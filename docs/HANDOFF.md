@@ -1,5 +1,55 @@
 # Handoff
 
+## ANY APK IN SECONDS: THE WARM DEVICE (2026-10-01 night, Windows + Linux; branch `perf/fast-boot`, not merged)
+
+Goal (owner): an agent behind the MCP server builds APKs and tests them one after another, seconds
+from its call to the APK's first screen. Report with every figure and how to reproduce:
+`docs/MORNING-2026-10-01-fast-boot.md`.
+
+| through the real `omni-mcp.exe` (i7, no cookie) | `main` | branch |
+|---|---|---|
+| nothing running -> first APK on screen | ~190 s (a new device per APK) | 70-80 s |
+| warm device: another APK / a rebuilt APK (same version) / the same APK | -- | 9.9 / 8.3 / 2.1 s |
+| Roblox's first screen | 162.8 (saved) / 189.6 (new) | 26.6 s on the warm device |
+| a saved device's `boot_completed` | 124.3 s | 45.5 s |
+| Linux, 2 CPUs + llvmpipe (the notebook): new / saved device, app on screen | ~389 / ~265 s | 266.3 / 205.6 s |
+
+How it works:
+- **The warm device** (`omnidroid aosp --warm`; r_roblox `OMNI_R_WARM=1`): the kiosk device with no
+  app, saved once as `omni-golden/base-kiosk-<locale>-v2`, booted from a copy. `omni-mcp` finds the
+  host's one live `<temp>/omni-warm-<secs>` (heartbeat `<dir>.ctl/alive`), or boots one under
+  `<temp>/omni-warm.lock` -- never a second, and not while a Roblox session/standby runs. It outlives
+  the server. `start_instance`/`install_apk` **without `cookie`** act on it; with `cookie` the
+  Roblox session path (standby, saved devices) is unchanged.
+- **The control channel** (`omni-linux-run --control <dir>`, every harness boot: `<instance>.ctl`):
+  `<id>.cmd` -> `<id>.out` + `<id>.rc`, shell user or `#uid=<n>`. `tools/device_ctl.py` is adb shell.
+- **By content**: SHA-256 vs the device's own `base.apk` (read on the host); reuse / `pm install -r
+  -d -g` / uninstall first on a refused signature or downgrade / other test apps uninstalled. The
+  launcher from the APK's manifest (`omni_apk::launch_info_of`). Answers after `am start -W`.
+- **Boot levers kept** (each with its log evidence in the commit): `/dev/loop-control` (-20 s),
+  odsign left out (-5 s), a static RRO `config_checkWallpaperAtBoot=false` in the device's vendor
+  overlay (-30 s; `device/src/overlay/build.sh`), no dexopt at install (artd fails it here anyway),
+  no zygote class preload in app host processes (`OMNI_APP_PRELOAD=1` restores). Reverted: no boot
+  animation (slower, 3/3 pairs).
+- **A spare app process** (`crate::zygote`, warm device only, `OMNI_APP_SPARE`): an app host process
+  started ahead of need, ART + binder + the zygote's preload done, waiting in
+  `com.omnidroid.spare.Spare` (`/vendor/framework/omni-spare.jar`, `device/src/spare/build.sh`)
+  under a reserved pid; the next *installed* app (in `/data/app`) ActivityManager starts is answered
+  with that pid, its uid rebound (`remote::rebind_uid`), its arguments read from a file. -4.7 s probe,
+  -2.9 s Roblox; ~200-350 MB while it waits; the next one 5 s after.
+- `omni-linux-run` raises its descriptor limit (Linux's 1024 ran out on 2 CPUs: init's services
+  failed to start, the Watchdog ended system_server). Switches: `OMNI_DEVICE_OVERLAY=0`, `OMNI_DEVICE_BOOT_RC=0`,
+  `OMNI_KEEP_SERVICES=odsign`.
+
+Open (next, in order): app start is the clock now (~6 s probe from a spare, ~19 s Roblox, one thread,
+~50% in dynarmic translating) -> a translation cache shared across app host processes; a persistent control shell (0.43 s a
+command); checkpoint/restore via CRIU on headless Linux (`docs/research/2026-10-01-checkpoint-restore.md`).
+Gotchas: `<instance>.ctl` is a directory beside every instance -- match instances as
+`<prefix><digits>`; a Claude session holds `target/release/omni-mcp.exe` (rename it to rebuild);
+`omnidroid aosp` runs `cargo test`, so it builds any source edits first (baselines need a clean
+worktree: `C:\od-base` at `main`).
+
+
 ## FAST STARTS: SAVED DEVICES AND A STANDBY INSTANCE (2026-09-30 evening, Windows; uncommitted on `main`)
 
 Goal (owner): an agent driving omnidroid over MCP, paid per hour of LLM serving, must not wait
