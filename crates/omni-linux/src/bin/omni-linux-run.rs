@@ -24,6 +24,7 @@ fn main() -> ExitCode {
     let mut setprops: Vec<(String, String)> = Vec::new();
     let mut zygote = false;
     let mut then: Vec<String> = Vec::new();
+    let mut control: Option<PathBuf> = None;
     let mut envp = vec![b"PATH=/system/bin".to_vec(), b"ANDROID_ROOT=/system".to_vec(), b"ANDROID_DATA=/data".to_vec()];
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -50,6 +51,9 @@ fn main() -> ExitCode {
             "--zygote" => zygote = true,
             // A shell command run beside the program, as the shell user (adb's `shell`).
             "--then" => then.push(args.next().expect("--then needs a shell command")),
+            // The device's control channel: shell commands handed over as files in this host
+            // directory while the device runs (`serve_control`).
+            "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a directory"))),
             // A property set before the program starts (`name=value`), as init sets one.
             "--setprop" => {
                 let kv = args.next().expect("--setprop needs name=value");
@@ -348,6 +352,22 @@ fn main() -> ExitCode {
             Err(e) => eprintln!("[then] {e}"),
         }
     }
+    if let Some(dir) = control {
+        let (sysroot, instance) = (sysroot.clone(), instance.clone());
+        let envp: Vec<Vec<u8>> = envp.iter().filter(|e| !e.starts_with(b"CLASSPATH=")).cloned().collect();
+        serve_control(dir, move |command, uid, out| {
+            let config = SpawnConfig {
+                sysroot: sysroot.clone(),
+                instance_dir: instance.clone(),
+                argv: vec![b"/system/bin/sh".to_vec(), b"-c".to_vec(), command.as_bytes().to_vec()],
+                envp: envp.clone(),
+                stdout: Output::Capture(std::sync::Arc::clone(&out)),
+                stderr: Output::Capture(out),
+                trace: false,
+            };
+            Process::spawn_as(config, uid).map_err(|e| e.to_string())
+        });
+    }
     let status = p.run();
     // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.
     if std::env::var("OMNI_VERIFY_MAPS").as_deref() == Ok("1") {
@@ -395,4 +415,64 @@ fn main() -> ExitCode {
         ExitStatus::Exited(code) => ExitCode::from(code as u8),
         ExitStatus::Killed { signal, .. } => ExitCode::from(128 + signal as u8),
     }
+}
+
+/// The device's control channel. A host program (the MCP server) drops a shell command in `dir` as
+/// `<id>.cmd` (written whole: a rename); it is taken (`<id>.run`) and run as the shell user -- or as
+/// the uid a first line `#uid=<n>` names -- beside the device, as `adb shell` runs one. Its output
+/// (stdout and stderr, merged) is then `<id>.out` and its exit status `<id>.rc`, written in that
+/// order, each whole. `dir/pid` names this host process. Commands run at once and side by side;
+/// the directory is looked at every 50 ms, a host-side poll that costs the device nothing while
+/// idle.
+fn serve_control(
+    dir: PathBuf,
+    spawn: impl Fn(&str, u32, std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) -> Result<std::sync::Arc<Process>, String> + Send + Sync + 'static,
+) {
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("pid"), std::process::id().to_string());
+    let spawn = std::sync::Arc::new(spawn);
+    let mut beat = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    let _ = std::thread::Builder::new().name("control".into()).spawn(move || loop {
+        // `dir/alive`, written each second: the device lives (a reader goes by its time).
+        if beat.elapsed() >= std::time::Duration::from_secs(1) {
+            beat = std::time::Instant::now();
+            let _ = std::fs::write(dir.join("alive"), b"1");
+        }
+        let mut taken: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "cmd")).collect())
+            .unwrap_or_default();
+        taken.sort();
+        for cmd in taken {
+            let run = cmd.with_extension("run");
+            if std::fs::rename(&cmd, &run).is_err() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&run).unwrap_or_default();
+            let uid = text.lines().next().and_then(|l| l.strip_prefix("#uid=")).and_then(|u| u.trim().parse().ok()).unwrap_or(2000);
+            let spawn = std::sync::Arc::clone(&spawn);
+            std::thread::spawn(move || {
+                let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let code = match spawn(&text, uid, std::sync::Arc::clone(&out)) {
+                    Ok(sh) => match sh.run() {
+                        ExitStatus::Exited(code) => code as i64,
+                        ExitStatus::Killed { signal, .. } => 128 + signal as i64,
+                    },
+                    Err(e) => {
+                        out.lock().extend_from_slice(format!("control: {e}\n").as_bytes());
+                        127
+                    }
+                };
+                let whole = |to: PathBuf, bytes: &[u8]| {
+                    let part = to.with_extension("part");
+                    if std::fs::write(&part, bytes).is_ok() {
+                        let _ = std::fs::rename(&part, &to);
+                    }
+                };
+                whole(run.with_extension("out"), &out.lock());
+                whole(run.with_extension("rc"), code.to_string().as_bytes());
+                let _ = std::fs::remove_file(&run);
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    });
 }

@@ -78,6 +78,10 @@ impl Boot {
         cmd.args(["--caps", "IPC_LOCK,KILL,NET_ADMIN,NET_BIND_SERVICE,NET_BROADCAST,NET_RAW,SYS_MODULE,SYS_NICE,SYS_PTRACE,SYS_TIME,SYS_TTY_CONFIG,WAKE_ALARM,BLOCK_SUSPEND"]);
         cmd.args(extra);
         cmd.args(["--then", then]);
+        // The control channel (`omni-linux-run --control`): `<instance>.ctl`, made anew.
+        let control = instance.with_extension("ctl");
+        let _ = std::fs::remove_dir_all(&control);
+        cmd.arg("--control").arg(&control);
         cmd.args(["--", "/system/bin/app_process64", "-Xgc:CMC", "-Xhidden-api-policy:disabled", "/system/bin", "--application", "--nice-name=system_server"]);
         cmd.args(["com.android.internal.os.WrapperInit", "0", "35", "-cp", &ss_classpath, "com.android.server.SystemServer"]);
         let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("omni-linux-run");
@@ -162,6 +166,7 @@ impl Drop for Boot {
         let _ = self.child.wait();
         if !self.instance.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(&self.instance);
+            let _ = std::fs::remove_dir_all(self.instance.with_extension("ctl"));
         }
     }
 }
