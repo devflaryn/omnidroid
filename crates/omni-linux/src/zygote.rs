@@ -331,8 +331,9 @@ fn spawn(mut cmd: std::process::Command, pid: i32, uid: u32) -> Option<i32> {
 /// -- waiting in `com.omnidroid.spare.Spare` (`/vendor/framework/omni-spare.jar`) for a file that
 /// names the app: `<uid> <target sdk> <class> [args...]`. The pid it was started under is the one
 /// the zygote's reply gives ActivityManager, its uid is rebound (`remote::rebind_uid`) before it
-/// runs WrapperInit, and a new spare is started some seconds after (`OMNI_APP_SPARE_DELAY_S`,
-/// default 20, so it does not compete with the app it replaced).
+/// runs WrapperInit (its preload done while it waited), and a new spare is started some seconds
+/// after (`OMNI_APP_SPARE_DELAY_S`, default 5: the app's start runs on one thread, the spare's on
+/// others). The warm device keeps one (`tests/r_roblox.rs`); an app session does not.
 struct Spare {
     pid: i32,
     /// The host path of the file it waits for.
@@ -400,7 +401,7 @@ fn take_spare(uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String])
         return None;
     }
     eprintln!("[zygote] launching {} as pid {} uid {uid} (the spare process): {}", nice.unwrap_or("?"), spare.pid, class_and_args.join(" "));
-    let delay = std::env::var("OMNI_APP_SPARE_DELAY_S").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let delay = std::env::var("OMNI_APP_SPARE_DELAY_S").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(delay));
         start_spare();

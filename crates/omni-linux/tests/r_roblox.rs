@@ -549,6 +549,12 @@ fn warm_device(sysroot: &Path) {
     if kiosk {
         std::env::set_var("OMNI_DEVICE_APPS", "kiosk");
     }
+    // A spare app process kept ready (`omni_linux::zygote`'s spare): the next app starts in it --
+    // the probe's first frame 4.7 s sooner (6.5 against 10.9 s, 4 of 4 ABBA pairs), Roblox's
+    // 2.9 s (2 of 2), 2026-10-01 -- for ~200-350 MB held while it waits. `OMNI_APP_SPARE=0`: none.
+    if std::env::var_os("OMNI_APP_SPARE").is_none() {
+        std::env::set_var("OMNI_APP_SPARE", "1");
+    }
     // Per-app switches, read at each app's start (`omni_linux::zygote`): `<instance>.appenv`.
     if std::env::var_os("OMNI_APP_ENV_FILE").is_none() {
         std::env::set_var("OMNI_APP_ENV_FILE", instance.with_extension("appenv"));

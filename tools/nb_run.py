@@ -20,6 +20,8 @@ disp = types.ModuleType("IPython.display")
 disp.display = lambda *a, **k: [print(x) for x in a]
 disp.Image = lambda *a, **k: f"[image {k.get('filename') or (a[0] if a else '')}]"
 ipy.display = disp
+ipy.get_ipython = lambda: None  # matplotlib asks whether it runs in IPython
+ipy.version_info = (8, 24, 0)  # ... and which one
 sys.modules["IPython"] = ipy
 sys.modules["IPython.display"] = disp
 
