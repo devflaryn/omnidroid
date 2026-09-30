@@ -8,7 +8,7 @@
 //! publishes abstract sockets). A connect or send to a loopback port resolves through the table;
 //! a port not in it cannot be reached. An app's namespace is its user's; system uids share one.
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::errno::{Errno, EADDRINUSE, EIO};
@@ -16,17 +16,28 @@ use crate::errno::{Errno, EADDRINUSE, EIO};
 /// Process-wide counter for unique temp file names across threads and processes.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Get or create a per-namespace lock.
-fn get_namespace_lock(dir: &Path) -> Arc<Mutex<()>> {
-    use std::collections::HashMap;
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut lock_map = locks.lock().unwrap();
-    Arc::clone(
-        lock_map
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| Arc::new(Mutex::new(()))),
-    )
+/// Held while a namespace's table is read-and-changed: an exclusive OS lock on `<dir>/.lock`, so
+/// host processes (and threads, each with its own handle) claim and release ports one at a time.
+struct TableLock(std::fs::File);
+
+impl TableLock {
+    fn take(dir: &Path) -> Result<Self, Errno> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".lock"))
+            .map_err(|_| EIO)?;
+        f.lock().map_err(|_| EIO)?;
+        Ok(Self(f))
+    }
+}
+
+impl Drop for TableLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -112,21 +123,19 @@ pub struct Namespace {
 /// An entry, held while its socket is open: dropped, its files go.
 pub struct Binding {
     files: Vec<PathBuf>,
-    namespace_lock: Option<Arc<Mutex<()>>>,
+    dir: PathBuf,
 }
 
 impl Drop for Binding {
     fn drop(&mut self) {
         // Take lock to safely remove entries.
-        if let Some(lock_arc) = self.namespace_lock.as_ref() {
-            let _lock = lock_arc.lock().unwrap();
-            let me = std::process::id();
-            for f in &self.files {
-                // Only remove if we still own it: verify the pid in the entry.
-                if let Some((_, owner, _)) = read_entry(f) {
-                    if owner == me {
-                        let _ = std::fs::remove_file(f);
-                    }
+        let Ok(_held) = TableLock::take(&self.dir) else { return };
+        let me = std::process::id();
+        for f in &self.files {
+            // Only remove if we still own it: verify the pid in the entry.
+            if let Some((_, owner, _)) = read_entry(f) {
+                if owner == me {
+                    let _ = std::fs::remove_file(f);
                 }
             }
         }
@@ -192,9 +201,8 @@ impl Namespace {
         let fwd_body = format!("{host} {me}{}", if shared { " s" } else { "" });
         let rev_body = format!("{guest} {me}");
 
-        // Get the lock Arc for this namespace.
-        let lock_arc = get_namespace_lock(&self.dir);
-        let _lock = lock_arc.lock().unwrap();
+        // Take the OS file lock for this namespace for the critical section.
+        let _held = TableLock::take(&self.dir)?;
 
         // Critical section: read, decide, write under lock.
         // Read forward entry if it exists.
@@ -207,7 +215,7 @@ impl Namespace {
                         atomic_write(&rev, &rev_body)?;
                         return Ok(Binding {
                             files: vec![rev],
-                            namespace_lock: Some(Arc::clone(&lock_arc)),
+                            dir: self.dir.clone(),
                         });
                     }
                     return Err(EADDRINUSE);
@@ -217,7 +225,7 @@ impl Namespace {
                     atomic_write(&rev, &rev_body)?;
                     return Ok(Binding {
                         files: vec![fwd, rev],
-                        namespace_lock: Some(Arc::clone(&lock_arc)),
+                        dir: self.dir.clone(),
                     });
                 }
             }
@@ -227,7 +235,7 @@ impl Namespace {
                 atomic_write(&rev, &rev_body)?;
                 return Ok(Binding {
                     files: vec![fwd, rev],
-                    namespace_lock: Some(Arc::clone(&lock_arc)),
+                    dir: self.dir.clone(),
                 });
             }
         }
@@ -503,6 +511,8 @@ mod tests {
         let dead = child.id();
         child.wait().unwrap();
         std::fs::write(d.join(".omni-loopback/u0/f-tcp-47023"), format!("50016 {dead}")).unwrap();
+        // Also seed the old reverse entry.
+        std::fs::write(d.join(".omni-loopback/u0/r-tcp-50016"), format!("47023 {dead}")).unwrap();
 
         // Bind same guest port with different host port.
         let _held = ns.bind(Proto::Tcp, 47023, 50017, false).expect("taken over");
@@ -511,7 +521,110 @@ mod tests {
         assert_eq!(ns.lookup(Proto::Tcp, 47023), Some(50017), "lookup returns new host port");
         // Reverse entry should map to new host port.
         assert_eq!(ns.guest_port(Proto::Tcp, 50017), Some(47023), "reverse entry is new");
-        // Old reverse entry should not exist or be stale.
-        assert_eq!(ns.guest_port(Proto::Tcp, 50016), None, "old reverse entry is gone");
+        // Old reverse entry should not exist or be stale (owner is dead).
+        assert_eq!(ns.guest_port(Proto::Tcp, 50016), None, "old reverse entry is stale");
+    }
+
+    #[test]
+    fn one_stale_port_has_one_winner_under_concurrent_takeovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Barrier;
+        use std::sync::Arc as StdArc;
+
+        let d = dir("takeover-concurrent");
+        let ns = Namespace::open(&d, "u0");
+
+        // Seed a stale entry (owned by a dead process).
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        } else {
+            std::process::Command::new("true").spawn().unwrap()
+        };
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(d.join(".omni-loopback/u0/f-tcp-47030"), format!("50030 {dead}")).unwrap();
+
+        let barrier = StdArc::new(Barrier::new(8));
+        let success_count = StdArc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for i in 0..8 {
+            let ns_clone = Arc::clone(&ns);
+            let barrier_clone = StdArc::clone(&barrier);
+            let success_clone = StdArc::clone(&success_count);
+            let handle = std::thread::spawn(move || {
+                barrier_clone.wait(); // synchronize all threads
+                let host_port = 50100 + i as u16;
+                match ns_clone.bind(Proto::Tcp, 47030, host_port, false) {
+                    Ok(_binding) => {
+                        success_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(EADDRINUSE) => {
+                        // expected for losers
+                    }
+                    Err(_) => panic!("unexpected error"),
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Exactly one should win: core takeover atomicity property.
+        assert_eq!(
+            success_count.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one bind succeeded among 8 concurrent takeover attempts"
+        );
+    }
+
+    #[test]
+    fn the_lock_excludes_another_host_process() {
+        let d = dir("lock-cross-process");
+        let ns = Namespace::open(&d, "u0");
+
+        // This process takes the lock.
+        let _held = TableLock::take(&ns.dir).expect("lock");
+
+        // Spawn a child process that tries to take the lock.
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("loopns::tests::lock_probe_child")
+            .arg("--nocapture")
+            .arg("--ignored")
+            .env("OMNI_LOOPNS_PROBE_DIR", &ns.dir)
+            .spawn()
+            .expect("spawn child");
+
+        // Give it time to try and block on the lock.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Child should still be running (blocked on lock).
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child is blocked on the lock"
+        );
+
+        // Drop our lock.
+        drop(_held);
+
+        // Child should now finish.
+        let status = child.wait().expect("wait for child");
+        assert!(status.success(), "child process exited successfully");
+    }
+
+    #[test]
+    #[ignore]
+    fn lock_probe_child() {
+        if let Ok(dir_str) = std::env::var("OMNI_LOOPNS_PROBE_DIR") {
+            let dir = std::path::PathBuf::from(dir_str);
+            if let Ok(_held) = TableLock::take(&dir) {
+                println!("took");
+            }
+        }
     }
 }
