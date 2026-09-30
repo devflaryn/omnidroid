@@ -30,7 +30,7 @@
 ## Review Focus
 
 1. **A guest server restarted after its host process crashed** re-binds its fixed port: the dead owner's entry must be taken over, not answered `EADDRINUSE` (Task 2 test `a_dead_owners_port_is_taken_over`).
-2. **UDP request/response over loopback between two processes of one namespace** — an unbound client's reply address must resolve (Task 3 fixture checks `udp reply to an unbound client`).
+2. **UDP request/response over loopback between two processes of one namespace** — an unbound client's reply address must resolve (Task 3 fixture checks `udp reply to an unbound client`); and a UDP socket connected before its peer binds must reach the peer once it does, as on Linux (`a peer that binds later is reached`).
 3. **Two sockets sharing a UDP port with `SO_REUSEADDR`** (mDNS-style) — the second bind succeeds, the first keeps the port (Task 2 test `a_shared_udp_port_takes_a_second_socket`).
 4. **An IPv6 dual-stack guest server reached from an IPv4 guest client over 127.0.0.1** (Task 3 fixture checks `v4 client reaches a v6 wildcard server`).
 5. **An app host whose credential was never issued, or was revoked when its process ended**, connects: the listener closes the connection and makes no stand-in (Task 5 test `an_unknown_credential_is_refused`).
@@ -546,7 +546,8 @@ Rules implemented here (from the spec):
 |---|---|
 | `bind(loopback or wildcard, P)` | host bind to the same address, port 0; `ns.bind(proto, P, host port, SO_REUSEADDR)`; on `EADDRINUSE` the host socket is replaced by a fresh unbound one |
 | `listen` unbound (TCP) | first binds the wildcard, port 0, as above |
-| `connect(loopback, P)` | `ns.lookup(proto, P)`; none -> `ECONNREFUSED` (UDP included: a documented deviation, Linux accepts it); an unbound socket first binds the same loopback address, port 0, so its peer can resolve it; then connects to the same address, host port |
+| `connect(loopback, P)` TCP | `ns.lookup(Tcp, P)`; none -> `ECONNREFUSED`; an unbound socket first binds the same loopback address, port 0, so its peer can resolve it; then connects to the same address, host port |
+| `connect(loopback, P)` UDP | as Linux: it only names the peer and succeeds (an unbound socket first binds the wildcard, port 0); the host socket is not connected. Each `send` resolves the peer again: a port no one holds yet drops the datagram, a peer that binds later is reached. `recv` takes only the peer's datagrams |
 | `sendto(loopback, P)` (UDP) | lookup; none -> the datagram is dropped (`Ok(len)`, as to a closed port); an unbound socket first binds the wildcard, port 0 |
 | `accept` | a connection whose peer is not loopback, or whose port is not this namespace's, is closed and the wait goes on |
 | `recvfrom` (UDP) | a datagram from a loopback port not of this namespace is dropped and the wait goes on; a loopback source's port is shown as its guest port |
@@ -653,6 +654,17 @@ static int self_checks(void) {
     check(getpeername(c4, (struct sockaddr*)&peer, &plen) == 0 && ntohs(peer.sin_port) == 47111, "getpeername shows the guest port");
     int two = socket(AF_INET6, SOCK_STREAM, 0);
     check(bind(two, (struct sockaddr*)&w6, sizeof(w6)) == -1 && errno == EADDRINUSE, "a held port: EADDRINUSE");
+    // UDP connect names a peer, as Linux: it succeeds before the peer binds, the early send is
+    // dropped, and a peer that binds later is reached.
+    int uc = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in p2 = lo(47112);
+    check(connect(uc, (struct sockaddr*)&p2, sizeof(p2)) == 0 && send(uc, "x", 1, 0) == 1, "udp connect to an unheld port succeeds; the send is dropped");
+    int us = socket(AF_INET, SOCK_DGRAM, 0);
+    bind(us, (struct sockaddr*)&p2, sizeof(p2));
+    send(uc, "y", 1, 0);
+    struct pollfd pf = {us, POLLIN, 0};
+    char g1[2] = {0};
+    check(poll(&pf, 1, 3000) == 1 && recv(us, g1, 1, 0) == 1 && g1[0] == 'y', "a peer that binds later is reached");
     return 0;
 }
 
@@ -790,7 +802,7 @@ fn ports_translate_for_dual_stack_and_a_held_port_is_in_use() {
     let inst = instance("self");
     let Some((status, out, err)) = common::run_fixture_as(&inst, "loopiso", &["self"], 10_000) else { return };
     assert!(!out.contains("FAIL"), "{out}\n{err}");
-    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 4, "{out}\n{err}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok ")).count(), 6, "{out}\n{err}");
     assert_eq!(status, ExitStatus::Exited(0));
 }
 ```
@@ -945,6 +957,18 @@ Replace `bind`:
 In `connect`, as its first lines (before `let addr = parse(...)`):
 
 ```rust
+        if !self.stream && self.ns.is_some() && crate::loopns::is_loopback(raw) {
+            // Connecting a datagram socket only names its peer (Linux): resolved at each send, so
+            // a send before the peer binds is dropped and a peer that binds later is reached.
+            if !self.state.lock().bound {
+                self.bind(&crate::loopns::wildcard(self.domain))?;
+            }
+            *self.guest_peer.lock() = Some(raw.to_vec());
+            let mut st = self.state.lock();
+            st.connected = true;
+            st.bound = true;
+            return Ok(());
+        }
         let translated = self.resolve(raw)?;
         if translated.is_some() {
             *self.guest_peer.lock() = Some(raw.to_vec());
@@ -993,9 +1017,11 @@ In `accept`, replace the body after `let deadline = ...` with a loop that drops 
         }
 ```
 
-In `send_inner`, replace the `dest` computation:
+In `send_inner`, replace the `dest` computation (a datagram socket connected to a loopback peer has no host peer: its guest peer is the destination, resolved now):
 
 ```rust
+        let named_peer = if self.stream { None } else { self.guest_peer.lock().clone() };
+        let to = to.or(named_peer.as_deref());
         let dest = match to {
             Some(raw) if !self.stream => match self.resolve(raw) {
                 Ok(Some(host)) => Some(parse(self.domain, &host)?),
@@ -1080,7 +1106,17 @@ Replace `recv` whole (it drops datagrams from another namespace's loopback ports
             if let (Some(ns), false, Some(src)) = (&self.ns, self.stream, from) {
                 let raw_src = sockaddr(&self.guest_family(src));
                 if crate::loopns::is_loopback(&raw_src) {
+                    let peer = self.guest_peer.lock().as_deref().map(crate::loopns::port_of);
                     match ns.guest_port(crate::loopns::Proto::Udp, crate::loopns::port_of(&raw_src)) {
+                        // Connected to a loopback peer: only that peer's datagrams (the host socket
+                        // is not connected, so this is where Linux's filter is kept).
+                        Some(g) if peer.is_some_and(|p| p != g) => {
+                            if peek {
+                                let mut scratch = vec![0u8; 64 << 10];
+                                let _ = self.sock.read().recv_from(&mut scratch);
+                            }
+                            continue 'next;
+                        }
                         Some(g) => return Ok((done, Some(with_sa_port(src, g)))),
                         // Another namespace's datagram (or a host program's): dropped, and the
                         // wait goes on. A peek saw it without taking it: taken now, then dropped.
@@ -1621,7 +1657,7 @@ Expected: every test passes (ignored ones stay ignored).
 
 - [ ] **Step 2: The in-world gate on Windows**
 
-Run (the cookie is a saved account's file, `%LOCALAPPDATA%\Omnidroid\cookies\<name>.txt`, as `omnidroid aosp --cookie <name>` resolves it; `dir $env:LOCALAPPDATA\Omnidroid\cookies` lists them, and the owner says which account -- a cookie must be used from its own exit country): `$name='<account>'; $env:OMNIDROID_DYNARMIC_BUILD_DIR='C:\od-unified'; $env:OMNI_R_COOKIE="$env:LOCALAPPDATA\Omnidroid\cookies\$name.txt"; $env:OMNI_R_PLACE='8737899170'; cargo test --release -p omni-linux --test r_roblox -- --ignored --nocapture`
+Run (the owner's account for this gate: `HeZmI_ImYu1080`, a TR account -- its cookie must be used from its own exit country, TR, i.e. WARP or no VPN, never a US/NL exit): `$env:OMNIDROID_DYNARMIC_BUILD_DIR='C:\od-unified'; $env:OMNI_R_COOKIE="C:\Users\berat\Desktop\cookies\HeZmI_ImYu1080.txt"; $env:OMNI_R_PLACE='8737899170'; cargo test --release -p omni-linux --test r_roblox -- --ignored --nocapture`
 Expected: PASS, and the log (`%TEMP%\omni-linux-r-<pid>.log`) shows `Joining game`. Search that log for `ECONNREFUSED` near Roblox lines: any refusal of a loopback port Roblox itself bound means a translation bug (fix in Task 3), not an expected refusal.
 
 - [ ] **Step 3: Sync to Linux and macOS and run the suites there**
