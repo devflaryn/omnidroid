@@ -142,6 +142,11 @@ typedef struct od_callbacks {
 /* dynarmic's `Unsafe_IgnoreGlobalMonitor`. Honoured only when
  * `od_config::unsafe_optimizations` is also non-zero. */
 #define OD_OPT_UNSAFE_IGNORE_GLOBAL_MONITOR 0x00100000u
+/* dynarmic's unsafe floating-point flags, which `od_set_live_fp_optimizations` takes. */
+#define OD_OPT_UNSAFE_UNFUSE_FMA 0x00010000u
+#define OD_OPT_UNSAFE_REDUCED_ERROR_FP 0x00020000u
+#define OD_OPT_UNSAFE_INACCURATE_NAN 0x00040000u
+#define OD_OPT_UNSAFE_IGNORE_STANDARD_FPCR 0x00080000u
 
 /* Not a dynarmic halt reason. Returned by `od_jit_run`/`od_jit_step` when they
  * are called while this jit is already executing -- i.e. from inside a
@@ -508,6 +513,13 @@ uint64_t od_invalidation_page_probes(void);
  * every jit in the process (patch 0016). 0 where the backend has no such index.
  * For measurement only. */
 uint64_t od_invalidation_ranges_checked(void);
+
+/* Patch 0034 (x64 only): the unsafe floating-point flags (`OD_OPT_UNSAFE_UNFUSE_FMA`,
+ * `_REDUCED_ERROR_FP`, `_INACCURATE_NAN`, `_IGNORE_STANDARD_FPCR`; other bits are dropped) every
+ * jit in this process emits with from now on, where its config's `unsafe_optimizations` is open.
+ * Blocks already emitted keep what they were emitted with: clear the cache to have them again.
+ * Returns the mask in force. A no-op returning 0 on arm64. */
+uint32_t od_set_live_fp_optimizations(uint32_t mask);
 
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);

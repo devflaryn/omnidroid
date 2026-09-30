@@ -280,3 +280,13 @@ prelude leaves them. (Branch `arm64-clear-audit`'s patch 0023 addressed the same
 not in this tree.) Verified: `omni-cpu/tests/cache_clear_rsb.rs` -- one call site, a first call
 that returns at once, a second through a chain of 400,000 conditional-branch blocks (several 8 MiB
 caches): (2, 2) without the patch, the chain run twice; (2, 1) with it.
+
+### 0034 — x64: the unsafe floating-point flags, switched at run time
+
+x64. `live_fp_optimizations`, one process-wide atomic that `A64EmitContext::HasOptimization`
+ORs into `Unsafe_UnfuseFMA` / `Unsafe_ReducedErrorFP` / `Unsafe_InaccurateNaN` /
+`Unsafe_IgnoreStandardFPCRValue` where the config's `unsafe_optimizations` gate is open (every
+Omnidroid config: the value-compare monitor opens it). A block emitted after a switch uses the new
+flags; the host clears the cache so every block is emitted again (`od_set_live_fp_optimizations`,
+`omni-linux`'s `OMNI_LEVER_FILE` `jit_fp=` lever and `OMNI_JIT_UNSAFE_FP`). Default 0: nothing
+changes unless a host asks. For an in-session A/B of the flags (docs/NIGHT-2026-10-02.md).

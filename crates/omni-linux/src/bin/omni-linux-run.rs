@@ -11,6 +11,7 @@ use omni_linux::{ExitStatus, Output, Process, SpawnConfig};
 fn main() -> ExitCode {
     omni_linux::poll::start_stats();
     omni_linux::code_trim::start();
+    omni_linux::lever::start();
     let mut args = std::env::args().skip(1);
     let mut sysroot = PathBuf::from("sysroot/aosp-35");
     let mut instance = std::env::temp_dir().join("omni-linux-run");

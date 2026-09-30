@@ -22,7 +22,13 @@
  * backend itself bakes into emitted exclusive-access code. */
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #if !defined(__aarch64__) && !defined(_M_ARM64)
+#    include <atomic>
 #    include "dynarmic/backend/x64/a64_jitstate.h"
+/* Patch 0034's switch, defined in a64_emit_x64.cpp (declared here rather than through that header,
+ * which pulls in the emitter's whole include set). */
+namespace Dynarmic::Backend::X64 {
+extern std::atomic<std::uint32_t> live_fp_optimizations;
+}
 #endif
 #if defined(__aarch64__)
 #    include "dynarmic/backend/arm64/page_backed_allocator.h"
@@ -871,6 +877,17 @@ uint64_t od_invalidation_ranges_checked(void) {
 #if defined(__aarch64__)
     return static_cast<uint64_t>(Dynarmic::Backend::Arm64::invalidation_ranges_checked.load(std::memory_order_relaxed));
 #else
+    return 0;
+#endif
+}
+
+uint32_t od_set_live_fp_optimizations(uint32_t mask) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    const uint32_t kept = mask & (OD_OPT_UNSAFE_UNFUSE_FMA | OD_OPT_UNSAFE_REDUCED_ERROR_FP | OD_OPT_UNSAFE_INACCURATE_NAN | OD_OPT_UNSAFE_IGNORE_STANDARD_FPCR);
+    Dynarmic::Backend::X64::live_fp_optimizations.store(kept, std::memory_order_relaxed);
+    return kept;
+#else
+    (void)mask;
     return 0;
 #endif
 }

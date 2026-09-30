@@ -37,6 +37,8 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
+std::atomic<std::uint32_t> live_fp_optimizations{0};
+
 A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
         : EmitContext(reg_alloc, block), conf(conf) {}
 

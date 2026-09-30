@@ -341,6 +341,17 @@ impl Default for DynarmicOptions {
     }
 }
 
+/// **The unsafe floating-point flags every backend of this process emits with from now on**
+/// (patch 0034, x64): `optimization::UNSAFE_FP`'s bits, others dropped; returns the mask in force
+/// (0 on arm64, where it does nothing). Blocks already translated keep what they were translated
+/// with -- [`DynarmicBackend::clear_code_cache`] has them translated again. Every backend here opens
+/// dynarmic's unsafe gate (for [`ExclusiveMonitor::ValueCompare`]), so the flags apply wherever
+/// that is the monitor, which it is by default.
+pub fn set_live_fp_optimizations(mask: u32) -> u32 {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_live_fp_optimizations(mask) }
+}
+
 impl DynarmicOptions {
     /// The `OptimizationFlag` bitmask these options select.
     #[must_use]

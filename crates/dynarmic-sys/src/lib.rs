@@ -346,6 +346,18 @@ pub mod optimization {
     /// x64 backend always honoured it; the arm64 backend's inline exclusives (patch 0007) ignored it
     /// -- lock and scan regardless -- until **patch 0021** (D31 amendment 1).
     pub const UNSAFE_IGNORE_GLOBAL_MONITOR: u32 = 0x0010_0000;
+    /// dynarmic's `Unsafe_UnfuseFMA`: a fused multiply-add as a multiply then an add.
+    pub const UNSAFE_UNFUSE_FMA: u32 = 0x0001_0000;
+    /// dynarmic's `Unsafe_ReducedErrorFP`: the reciprocal (square root) estimates and steps with the
+    /// host's own approximations (`rcpss`/`rsqrtss`), not a call into a bit-exact software model.
+    pub const UNSAFE_REDUCED_ERROR_FP: u32 = 0x0002_0000;
+    /// dynarmic's `Unsafe_InaccurateNaN`: no fix-up of a NaN result to the one the architecture names.
+    pub const UNSAFE_INACCURATE_NAN: u32 = 0x0004_0000;
+    /// dynarmic's `Unsafe_IgnoreStandardFPCRValue`: vector floating point under the guest's FPCR, not
+    /// the standard value (no MXCSR switch around each such instruction).
+    pub const UNSAFE_IGNORE_STANDARD_FPCR: u32 = 0x0008_0000;
+    /// The four unsafe floating-point flags together (what `od_set_live_fp_optimizations` takes).
+    pub const UNSAFE_FP: u32 = UNSAFE_UNFUSE_FMA | UNSAFE_REDUCED_ERROR_FP | UNSAFE_INACCURATE_NAN | UNSAFE_IGNORE_STANDARD_FPCR;
 }
 
 /// Where an exclusive monitor keeps its state, from [`od_monitor_layout_of`].
@@ -949,4 +961,13 @@ extern "C" {
     /// `jit` must be live; read on the jit's own thread.
     #[cfg(target_arch = "aarch64")]
     pub fn od_jit_last_svc_return_address(jit: *mut c_void) -> u64;
+
+    /// Patch 0034 (x64 only): the unsafe floating-point flags ([`optimization::UNSAFE_FP`]'s bits;
+    /// others are dropped) every jit of this process emits with from now on, where its config's
+    /// unsafe gate is open. Blocks already emitted keep theirs -- clear the cache to have them
+    /// again. Returns the mask in force; 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_live_fp_optimizations(mask: u32) -> u32;
 }
