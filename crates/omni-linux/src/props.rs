@@ -536,13 +536,18 @@ impl PropertyService {
         };
         live.serial = live.serial.wrapping_add(1);
         let area = live.area.bytes(live.serial, live.capacity);
+        // The area only grows, so past its header and data every mapping holds zeros already: only
+        // that much is written (~61 KiB, not the ~1.1 MiB capacity -- which, written into every
+        // mapping at every change, cost ~88 MB of copying a `setprop` and committed each mapping's
+        // zero tail again). `OMNI_PROP_FULL_COPY=1`: all of it, as before.
+        let used = if crate::mm::full_prop_copy() { area.len() } else { (HEADER + live.area.data.len()).min(area.len()) };
         let serial_area = Area::new().bytes(live.serial, 0);
         live.mappings.retain(|(p, _, _)| p.strong_count() > 0);
         let targets: Vec<_> = live.mappings.iter().filter_map(|(p, at, s)| p.upgrade().map(|p| (p, *at, *s))).collect();
         drop(live);
         self.changed.notify_all();
         for (p, at, serial) in targets {
-            let bytes = if serial { &serial_area[..HEADER] } else { &area[..] };
+            let bytes = if serial { &serial_area[..HEADER] } else { &area[..used] };
             if p.mm.kernel_write(&p.mem, at, bytes).is_ok() {
                 // Wake whoever waits on the area's serial or on this property's.
                 let _ = p.futexes.wake(at + 4, i32::MAX as u64, u32::MAX);
@@ -552,5 +557,26 @@ impl PropertyService {
             }
         }
         PROP_SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `PropertyService::set` relies on to write only `HEADER + data` into each mapping: past
+    /// them, the area as mapped is zeros (the area only grows, so every mapping holds zeros there).
+    #[test]
+    fn past_the_header_and_data_an_area_is_zeros() {
+        let mut area = Area::new();
+        for i in 0..200 {
+            area.add(&format!("test.prop.number{i}"), &format!("value {i}"));
+        }
+        let used = HEADER + area.data.len();
+        let bytes = area.bytes(7, 1 << 20);
+        assert!(bytes.len() >= 1 << 20);
+        assert!(bytes[used..].iter().all(|&b| b == 0), "a non-zero byte past {used}");
+        assert!(bytes[..used].iter().any(|&b| b != 0));
+        assert!(used < bytes.len() / 4, "{used} of {}", bytes.len());
     }
 }
