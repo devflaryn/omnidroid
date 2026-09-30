@@ -281,6 +281,10 @@ pub struct Host {
     guest_port: Mutex<Option<u16>>,
     /// The loopback address the guest connected to, as it named it (`getpeername`).
     guest_peer: Mutex<Option<Vec<u8>>>,
+    /// The 64 KiB a namespace-mode datagram receive takes a datagram into, sized on first use and
+    /// reused (held only for a receive and its copy), so the receive path -- every poll of a game's
+    /// socket -- allocates nothing.
+    scratch: Mutex<Vec<u8>>,
 }
 
 const UNSEEN: u32 = u32::MAX;
@@ -327,6 +331,7 @@ impl Host {
             held: Mutex::new(Vec::new()),
             guest_port: Mutex::new(None),
             guest_peer: Mutex::new(None),
+            scratch: Mutex::new(Vec::new()),
         });
         watch(&host);
         host
@@ -854,13 +859,22 @@ impl Host {
     /// address; and, on a socket connected to a loopback peer, only from that peer. What does
     /// not pass is dropped and the wait goes on. The guest's buffer takes what fits (Linux).
     fn recv_datagram(&self, ns: &crate::loopns::Namespace, buf: &mut [u8], peek: bool, nonblocking: bool, deadline: Option<Instant>, t: &Task) -> Result<(usize, Option<SocketAddress>), Errno> {
-        let mut scratch = vec![0u8; 64 << 10];
         loop {
             let (n, src) = self.retry(IN, nonblocking, deadline, t, || {
+                let mut scratch = self.scratch.lock();
+                if scratch.len() < 64 << 10 {
+                    scratch.resize(64 << 10, 0);
+                }
                 let s = self.sock.read();
                 let r = if peek { s.peek(&mut scratch) } else { s.recv_from(&mut scratch).map(|(n, a)| (n, Some(a))) };
                 match r {
-                    Ok(v) => Ok(v),
+                    // The guest's buffer takes what fits, copied before the scratch is let go; it is
+                    // only passed on if the datagram then clears the namespace's filter.
+                    Ok(v) => {
+                        let k = v.0.min(buf.len());
+                        buf[..k].copy_from_slice(&scratch[..k]);
+                        Ok(v)
+                    }
                     // As in `recv`: Winsock's late ICMP port-unreachable.
                     Err(e) if e.kind() == Some(NetErrorKind::ConnectionReset) => {
                         if self.state.lock().connected { Err(ECONNREFUSED) } else { Err(EAGAIN) }
@@ -887,13 +901,13 @@ impl Host {
             };
             match shown {
                 Some(from) => {
-                    let k = n.min(buf.len());
-                    buf[..k].copy_from_slice(&scratch[..k]);
-                    return Ok((k, Some(from)));
+                    return Ok((n.min(buf.len()), Some(from)));
                 }
                 None => {
                     // Dropped. A peek saw it without taking it: taken now.
                     if peek {
+                        // Locks in the receive's order: scratch, then the socket.
+                        let mut scratch = self.scratch.lock();
                         let _ = self.sock.read().recv_from(&mut scratch);
                     }
                 }
