@@ -140,6 +140,13 @@ impl ProviderRegistry {
         self
     }
 
+    /// Append an already-boxed provider. Earlier providers win. For callers that hold
+    /// `Box<dyn SymbolProvider>` (e.g. a set of providers chosen at runtime).
+    pub fn register_boxed(&mut self, provider: Box<dyn SymbolProvider>) -> &mut Self {
+        self.providers.push(provider);
+        self
+    }
+
     /// How many providers are registered.
     #[must_use]
     pub fn len(&self) -> usize {

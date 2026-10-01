@@ -32,12 +32,18 @@
 //! This is the primary, host-agnostic path. A separate live-instance path (attaching to a running
 //! omnidroid) is layered on the same vocabulary elsewhere.
 
+pub mod provider;
 pub mod session;
 
+pub use provider::ModuleExportsProvider;
 pub use session::{
-    CallOutcome, Disassembly, HookAction, MapEntry, Registers, Session, Stop, SymbolInfo,
-    TraceEvent, TraceKind,
+    CallOutcome, Disassembly, HookAction, LoadReport, MapEntry, Registers, Session, Stop,
+    SymbolInfo, TraceEvent, TraceKind,
 };
+
+/// Re-exported so callers can read a [`LoadReport`]'s unresolved imports without depending on
+/// `omni-elf` directly.
+pub use omni_elf::loader::UnresolvedImport;
 
 use omni_cpu::CpuError;
 use omni_elf::ElfError;

@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use omni_cpu::dynarmic::{DynarmicBackend, DynarmicCpu, DynarmicOptions};
 use omni_cpu::{ExitReason, GuestCpu, RunLimit, ThunkCall, ThunkContext, VReg, XReg};
-use omni_elf::loader::{self, LoaderConfig, ProviderRegistry};
+use omni_elf::loader::{
+    self, LoaderConfig, ProviderRegistry, SymbolKind, SymbolProvider, UnresolvedImport,
+};
 use omni_elf::ElfImage;
 use omni_mem::{
     Backing, CommitPolicy, GuestAddr, GuestSpace, GuestSpaceConfig, MapExecutability, Placement,
@@ -115,6 +117,30 @@ pub struct CallOutcome {
     pub instructions: u64,
     /// Any trace/intercept/syscall events recorded during the call, in order.
     pub events: Vec<TraceEvent>,
+}
+
+/// What a resolving load ([`Session::load_resolved`]) reports: the module name, how many symbols
+/// it exports, and every import no provider supplied (so the agent above knows exactly what is
+/// still stubbed and must be intercepted or modeled).
+#[derive(Debug, Clone)]
+pub struct LoadReport {
+    /// The name the module was loaded under.
+    pub module: String,
+    /// How many symbols the module exports.
+    pub exports: usize,
+    /// Imports nothing supplied, in `.dynsym` order (reuses the loader's own type).
+    pub unresolved: Vec<UnresolvedImport>,
+}
+
+/// Map [`SymbolInfo::kind`]'s human-readable `st_info` name back to a [`SymbolKind`], so a
+/// module-exports snapshot offers each symbol as the kind it actually is (a function offered for a
+/// data import is the D9 failure the loader guards against).
+fn kind_from_str(kind: &str) -> SymbolKind {
+    match kind {
+        "FUNC" | "GNU_IFUNC" => SymbolKind::Function,
+        "OBJECT" => SymbolKind::Object,
+        _ => SymbolKind::Unspecified,
+    }
 }
 
 /// What kind of event a [`TraceEvent`] records.
@@ -307,15 +333,83 @@ impl Session {
     }
 
     fn load_bytes(&mut self, name: &str, path: &Path, bytes: &[u8]) -> Result<&SymbolInfo> {
+        self.load_bytes_resolved(name, path, bytes, Vec::new())?;
+        // Return a stable reference to a representative symbol is awkward; hand back the module's
+        // first export so the caller has something.
+        let m = self.modules.last().unwrap();
+        Ok(m.exports.values().next().unwrap_or_else(|| {
+            // A library with no exports is legal but useless for the lab; still, don't panic.
+            unreachable!("every real library exports at least one symbol")
+        }))
+    }
+
+    /// Load a library, resolving its imports against (1) the modules already loaded in this
+    /// session — its co-loaded `DT_NEEDED` siblings win first — then (2) each provider in `extra`
+    /// in order (the bionic HLE in production). Returns a [`LoadReport`] naming every import that
+    /// no provider supplied, so the caller knows exactly what is still stubbed.
+    ///
+    /// With an empty `extra` and no prior modules this is identical to [`load`](Session::load):
+    /// nothing resolves, and a function that reaches an unresolved import still stops rather than
+    /// branching to null silently.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Session::load).
+    pub fn load_resolved(
+        &mut self,
+        name: &str,
+        path: impl AsRef<Path>,
+        extra: Vec<Box<dyn SymbolProvider>>,
+    ) -> Result<LoadReport> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|e| {
+            DebugError::BadRequest(format!("cannot read {}: {e}", path.display()))
+        })?;
+        self.load_bytes_resolved(name, path, &bytes, extra)
+    }
+
+    fn load_bytes_resolved(
+        &mut self,
+        name: &str,
+        path: &Path,
+        bytes: &[u8],
+        extra: Vec<Box<dyn SymbolProvider>>,
+    ) -> Result<LoadReport> {
         let elf = ElfImage::parse(bytes)?;
         let backing = Backing::open(path, MapExecutability::Executable)?;
+
+        // The resolving registry: already-loaded modules first (a co-loaded sibling beats the
+        // bionic HLE), then each caller provider in order. An empty registry resolves nothing,
+        // exactly as `ProviderRegistry::empty_provider()` did.
+        let mut registry = ProviderRegistry::new();
+        let snapshot: Vec<(String, u64, SymbolKind)> = self
+            .modules
+            .iter()
+            .flat_map(|m| {
+                m.exports
+                    .values()
+                    .map(|s| (s.name.clone(), s.address as u64, kind_from_str(s.kind)))
+            })
+            .collect();
+        if !snapshot.is_empty() {
+            registry.register(crate::provider::ModuleExportsProvider::from_exports(
+                "session-modules",
+                snapshot,
+            ));
+        }
+        for p in extra {
+            registry.register_boxed(p);
+        }
+
         let object = loader::load(
             &self.space,
             &backing,
             &elf,
-            &ProviderRegistry::empty_provider(),
+            &registry,
             &LoaderConfig { name: Some(name.to_string()), ..LoaderConfig::default() },
         )?;
+
+        let unresolved = object.imports.unresolved.clone();
 
         let mut exports = BTreeMap::new();
         for sym in elf.exported_symbols()? {
@@ -336,6 +430,7 @@ impl Session {
             let _ = self.cpu.invalidate_code(range);
         }
 
+        let export_count = exports.len();
         let module = Module {
             name: name.to_string(),
             base: object.base,
@@ -345,13 +440,8 @@ impl Session {
             _backing: backing,
         };
         self.modules.push(module);
-        // Return a stable reference to a representative symbol is awkward; hand back the module's
-        // first export so the caller has something, or synthesize a module marker.
-        let m = self.modules.last().unwrap();
-        Ok(m.exports.values().next().unwrap_or_else(|| {
-            // A library with no exports is legal but useless for the lab; still, don't panic.
-            unreachable!("every real library exports at least one symbol")
-        }))
+
+        Ok(LoadReport { module: name.to_string(), exports: export_count, unresolved })
     }
 
     /// The names of the loaded modules.
