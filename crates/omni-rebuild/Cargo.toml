@@ -1,0 +1,13 @@
+[package]
+name = "omni-rebuild"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "The RE workbench's build helper (C3): detect an arm64 clang toolchain and compile candidate C into a shared object the lab can load back for differential testing. Shells out to clang; adds no OS access of its own."
+
+[dependencies]
+thiserror = { workspace = true }

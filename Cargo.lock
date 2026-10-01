@@ -402,6 +402,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-rebuild"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "omni-texture"
 version = "0.1.0"
 dependencies = [

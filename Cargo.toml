@@ -34,6 +34,9 @@ omni-core = { path = "crates/omni-core" }
 # top-level tools; neither is depended on by a core crate.
 omni-debug = { path = "crates/omni-debug" }
 omni-mcp = { path = "crates/omni-mcp" }
+# The RE workbench's build helper (C3): arm64 toolchain detection + candidate compile. A top-level
+# tool crate like omni-debug/omni-mcp; only omni-mcp depends on it.
+omni-rebuild = { path = "crates/omni-rebuild" }
 # The dynarmic FFI (preflight ruling P1). Only `omni-cpu` depends on it, and only on an x86-64
 # host: on an ARM64 host `ARCHITECTURE.md` section 6 runs guest code natively and there is no
 # translator to build.
