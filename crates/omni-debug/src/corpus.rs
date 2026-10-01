@@ -17,6 +17,9 @@ pub enum ArgKind {
     Buffer { len: usize },
     /// An output buffer of this fixed length.
     OutBuffer { len: usize },
+    /// A fixed scalar, the same in every vector — a length or flag the caller holds constant while
+    /// fuzzing the other parameters (e.g. the `len` that must equal a buffer's length).
+    Const(u64),
 }
 
 /// One parameter's generation template.
@@ -77,6 +80,7 @@ pub fn generate(templates: &[ArgTemplate], seed: u64, count: usize) -> Vec<Vec<A
                     Arg::InBuffer((0..len).map(|_| rng.next_byte()).collect())
                 }
                 ArgKind::OutBuffer { len } => Arg::OutBuffer(len),
+                ArgKind::Const(v) => Arg::Scalar(v),
             };
             vector.push(arg);
         }

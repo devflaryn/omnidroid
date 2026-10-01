@@ -24,6 +24,15 @@ fn different_seed_differs() {
 }
 
 #[test]
+fn const_kind_emits_a_fixed_scalar() {
+    // A constant parameter (a length or flag held fixed across the fuzz run) is emitted verbatim.
+    let t = [ArgTemplate { kind: ArgKind::Const(5) }];
+    let c = generate(&t, 9, 4);
+    assert_eq!(c.len(), 4);
+    assert!(c.iter().all(|v| v[0] == Arg::Scalar(5)), "every vector holds the constant: {c:?}");
+}
+
+#[test]
 fn count_zero_yields_empty_corpus() {
     let t = [ArgTemplate { kind: ArgKind::Scalar }];
     assert!(generate(&t, 1, 0).is_empty());
