@@ -103,6 +103,12 @@ app's own colour (A blue `#2196f3`, rebuilt A green, B red, Roblox's splash).
    `device_ctl.py` (adb shell for the warm device), `warm_ab.py` (ABBA on one live device),
    `make_test_apks.sh` (the five test APKs), `nb_run.py` (a notebook's cells as a script).
 
+**The same demo on Linux** (the box's i5-4460, 4 cores, Mesa llvmpipe, `OMNI_MCP_WARM_DIR=~/omni-warm`,
+final branch `b2f1f95`): `start_instance a.apk` from nothing 277.7 s (the box's first warm device: a
+new base device made, saved and booted again, 242.5 s), the rebuilt A **9.6 s** (reinstalled 2.7, on
+screen 7.0), B **11.6 s** (A uninstalled, B installed 4.0, on screen 7.6; screenshot red), `stop`
+3.2 s, `stop_device`. A later first call there boots the saved base device (~110-140 s on this box).
+
 ## Levers: measured, kept, reverted
 
 | lever | result | kept? |
@@ -134,6 +140,13 @@ app's own colour (A blue `#2196f3`, rebuilt A green, B red, Roblox's splash).
   notebook flow on Linux (below).
 
 ## What's open
+
+- **To use it**: nothing to configure -- `start_instance {apk}` without a cookie boots the warm
+  device if none is up. To have it booting as soon as an agent session connects (so the first APK
+  finds it ready), add `OMNI_MCP_WARM=1` to the omnidroid MCP server's environment (Claude Code:
+  `~/.claude.json` -> `mcpServers.omnidroid.env`; pi: `omniMcp.env`) -- not changed tonight. Also give
+  it `OMNIDROID_DYNARMIC_BUILD_DIR=C:\od-unified`, or its first `omnidroid aosp` rebuilds dynarmic
+  (the Claude Code entry has no env today).
 
 - **App start is still the clock** (probe ~5-6 s from a spare; Roblox ~20 s): bindApplication,
   onCreate and the first frame (HWUI/EGL init), on one thread that spends about half its time in
