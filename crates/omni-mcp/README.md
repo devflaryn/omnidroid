@@ -171,7 +171,47 @@ Load a library, then call a function with crafted inputs and read the result —
 // tools/call intercept       {"symbol": "check_license", "replace_return": "0x1"}
 ```
 
+## The dynamic RE workbench
+
+On top of the lab, a loop that an agent drives to **reverse-engineer a `.so` and prove a rebuilt one
+behaves the same**: exercise the original, write pseudo-C, compile it, and differentially test the
+two. Exact source is not recoverable; the goal is behavior-matching pseudo-source, verified over a
+corpus.
+
+| tool | does |
+|---|---|
+| `lab_load_apk` | load a target `.so` (from an APK, or a bare `.so`) into a named session, resolving imports against its co-loaded `lib/arm64-v8a` siblings; reports every import still **unresolved** (stub those via `intercept`) |
+| `lab_trace` | call a function from an **arg_spec** — `{scalar}` / `{in_buffer:hex}` / `{out_buffer:len}` / `{inout_buffer:hex}` — allocating buffers and reading output buffers back |
+| `lab_corpus` | a **reproducible** input corpus from per-parameter templates (`scalar` / `buffer,len` / `out_buffer,len` / `const,value`), stored by `corpus_id`; same `seed` reproduces it |
+| `lab_diff` | differential-test a symbol in the `original` session vs the `candidate` session over a corpus; returns `total`, `matched`, and the first divergence (`ret` / `out_buffers` / `fault`) |
+| `lab_build` | compile candidate C into an arm64 `.so` the lab can load; returns `so_path`, or a structured `{error:"toolchain missing", looked_for}` / `{error:"compile", diagnostics}` |
+
+Named sessions: every lab tool uses `"default"`; the workbench also uses `"original"` and
+`"candidate"` (set `session` on `lab_load`/`lab_load_apk`). **`lab_build` needs an arm64 clang on the
+host** (`OMNI_NDK` / `ANDROID_NDK_HOME`, or a `clang` on `PATH` with an `aarch64` target); without one
+it reports the toolchain missing rather than producing a wrong-arch artifact.
+
+A round trip for a self-contained function:
+
+```jsonc
+// tools/call lab_load_apk {"apk": "/path/app.apk", "target": "libthing.so", "session": "original"}
+// tools/call lab_corpus   {"templates": [{"kind":"scalar"},{"kind":"buffer","len":16},{"kind":"const","value":16}], "seed": 1, "count": 64}
+//   -> {"corpus_id": "corpus-1", "count": 64}
+// ... agent reads behavior via lab_trace, writes candidate C ...
+// tools/call lab_build    {"sources": [{"name":"cand.c","text":"..."}], "soname": "libthing.so"}
+//   -> {"so_path": "/tmp/.../libthing.so"}
+// tools/call lab_load_apk {"apk": "/tmp/.../libthing.so", "session": "candidate"}
+// tools/call lab_diff     {"symbol": "the_fn", "corpus_id": "corpus-1"}
+//   -> {"total": 64, "matched": 64, "first_divergence": null}   // behaviorally matches, over this corpus
+```
+
+**Equivalence is relative to the corpus** — `lab_diff` proves "matches on everything tested", not
+universal equivalence. A bionic-HLE provider (so libc-calling functions resolve automatically rather
+than needing `intercept` stubs) is a planned follow-up; today `lab_load_apk` resolves app-internal
+siblings and reports the rest unresolved. Live capture of real inputs from a running instance is a
+later phase.
+
 ## Scope
 
-The debug/dump tools are for analysis, dumping and interop of binaries the owner controls. They are
-**not** for evading server-side emulator detection or affecting other players.
+The debug/dump and RE-workbench tools are for analysis, dumping and interop of binaries the owner
+controls. They are **not** for evading server-side emulator detection or affecting other players.
