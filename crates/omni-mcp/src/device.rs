@@ -359,6 +359,10 @@ pub fn install(device: &Device, apk: &Apk) -> Result<Installed, String> {
     if code != 0 || !said.contains("Success") {
         return Err(format!("pm install {}: {}", apk.path.display(), said.trim()));
     }
+    // "All files access", granted as the device's owner grants it in Settings -- as `pm install -g`
+    // grants the runtime permissions. An app that asks for it otherwise opens Settings' page for it
+    // instead of its own screen (the Roblox APK does, 2026-10-01); for one that does not, a no-op.
+    let _ = device.shell(&format!("appops set {} MANAGE_EXTERNAL_STORAGE allow", apk.package), Duration::from_secs(60));
     Ok(Installed { action, uninstalled: others, seconds: t.elapsed().as_secs_f64(), pm: said.trim().to_string() })
 }
 
