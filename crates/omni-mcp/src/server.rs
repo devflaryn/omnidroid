@@ -113,14 +113,18 @@ pub struct Server {
     config: Config,
     instances: BTreeMap<String, Instance>,
     next_instance: u64,
-    lab: Option<Session>,
-    lab_source: Option<String>,
+    /// The emulation-layer lab sessions, by name. `"default"` is what every single-session tool
+    /// uses; the RE workbench also uses `"original"` and `"candidate"` for differential testing.
+    labs: BTreeMap<String, Session>,
     /// The standby instance this server started, while it has not been taken over.
     standby_child: Option<(Child, PathBuf)>,
 }
 
 /// The prefix of a standby instance's directory in the temp directory (`<prefix><unix secs>`).
 const STANDBY_PREFIX: &str = "omni-linux-r-standby-";
+
+/// The lab session every single-session debug tool operates on when no `session` is named.
+const DEFAULT_LAB: &str = "default";
 
 /// A file in the instance's `/data/local/tmp`: its state, as `r_roblox` keeps it.
 fn state_file(dir: &Path, name: &str) -> PathBuf {
@@ -196,8 +200,7 @@ impl Server {
             config,
             instances: BTreeMap::new(),
             next_instance: 1,
-            lab: None,
-            lab_source: None,
+            labs: BTreeMap::new(),
             standby_child: None,
         }
     }
@@ -473,9 +476,23 @@ impl Server {
     // ---- helpers ------------------------------------------------------------------------------
 
     fn lab_mut(&mut self) -> Result<&mut Session, RpcError> {
-        self.lab
-            .as_mut()
-            .ok_or_else(|| RpcError::server("no lab session; call `lab_load` with a library path first"))
+        self.lab_mut_named(DEFAULT_LAB)
+    }
+
+    /// A mutable reference to the named lab session.
+    fn lab_mut_named(&mut self, name: &str) -> Result<&mut Session, RpcError> {
+        self.labs.get_mut(name).ok_or_else(|| {
+            RpcError::server(format!(
+                "no lab session {name:?}; call `lab_load`/`lab_load_apk` first"
+            ))
+        })
+    }
+
+    /// A shared reference to the named lab session.
+    fn lab_ref_named(&self, name: &str) -> Result<&Session, RpcError> {
+        self.labs
+            .get(name)
+            .ok_or_else(|| RpcError::server(format!("no lab session {name:?}")))
     }
 
     /// Resolve a call/breakpoint target given as either `symbol` or `address` in `args`.
@@ -768,10 +785,12 @@ impl Server {
         session.load(&name, path).map_err(|e| RpcError::server(e.to_string()))?;
         let (base, start, end) = session.module_span(&name).map_err(|e| RpcError::server(e.to_string()))?;
         let symbols = session.list_symbols(&name).map(|v| v.len()).unwrap_or(0);
-        self.lab = Some(session);
-        self.lab_source = Some(name.clone());
+        let session_name =
+            args.get("session").and_then(Json::as_str).unwrap_or(DEFAULT_LAB).to_string();
+        self.labs.insert(session_name.clone(), session);
         Ok(json::obj([
             ("module", json::s(name)),
+            ("session", json::s(session_name)),
             ("base", hex(base as u64)),
             ("start", hex(start as u64)),
             ("end", hex(end as u64)),
@@ -867,7 +886,7 @@ impl Server {
             None => Vec::new(),
             _ => return Err(RpcError::params("`args` must be an array")),
         };
-        let lab = self.lab.as_ref().ok_or_else(|| RpcError::server("no lab session"))?;
+        let lab = self.lab_ref_named(DEFAULT_LAB)?;
         let addr = Self::target_address(lab, args)?;
         let lab = self.lab_mut()?;
         let out = lab.call_function(addr, &call_args).map_err(|e| RpcError::server(e.to_string()))?;
@@ -881,7 +900,7 @@ impl Server {
     }
 
     fn set_breakpoint(&mut self, args: &Json) -> Result<Json, RpcError> {
-        let lab = self.lab.as_ref().ok_or_else(|| RpcError::server("no lab session"))?;
+        let lab = self.lab_ref_named(DEFAULT_LAB)?;
         let addr = Self::target_address(lab, args)?;
         let lab = self.lab_mut()?;
         lab.set_breakpoint(addr).map_err(|e| RpcError::server(e.to_string()))?;
@@ -893,7 +912,7 @@ impl Server {
             Some(Json::Array(a)) => a.iter().map(|v| v.as_u64().ok_or_else(|| RpcError::params("bad arg"))).collect::<Result<_, _>>()?,
             _ => Vec::new(),
         };
-        let lab = self.lab.as_ref().ok_or_else(|| RpcError::server("no lab session"))?;
+        let lab = self.lab_ref_named(DEFAULT_LAB)?;
         let addr = Self::target_address(lab, args)?;
         let lab = self.lab_mut()?;
         let stop = lab.run_until_stop(addr, &call_args).map_err(|e| RpcError::server(e.to_string()))?;
@@ -929,7 +948,7 @@ impl Server {
         let record_entry = args.get("record_entry").and_then(Json::as_bool).unwrap_or(true);
         let record_exit = args.get("record_exit").and_then(Json::as_bool).unwrap_or(true);
         let replace_return = args.get("replace_return").and_then(Json::as_u64);
-        let lab = self.lab.as_ref().ok_or_else(|| RpcError::server("no lab session"))?;
+        let lab = self.lab_ref_named(DEFAULT_LAB)?;
         let addr = Self::target_address(lab, args)?;
         let lab = self.lab_mut()?;
         lab.intercept(addr, HookAction { record_entry, record_exit, replace_return })
@@ -1200,6 +1219,29 @@ mod tests {
         b.extend_from_slice(&240u32.to_be_bytes());
         assert_eq!(png_dimensions(&b), Some((320, 240)));
         assert_eq!(png_dimensions(b"not a png"), None);
+    }
+
+    fn libz_fixture() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../omni-debug/tests/fixtures/libz.so")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn lab_sessions_are_independent_by_name() {
+        let mut server = Server::new(Config::from_env());
+        let fx = libz_fixture();
+        server
+            .lab_load(&json::obj([("path", json::s(fx.clone())), ("session", json::s("original"))]))
+            .unwrap();
+        server
+            .lab_load(&json::obj([("path", json::s(fx)), ("session", json::s("candidate"))]))
+            .unwrap();
+        assert!(server.labs.contains_key("original"), "original session retained");
+        assert!(server.labs.contains_key("candidate"), "candidate session retained");
+        // Loading a named session must not populate the default one.
+        assert!(!server.labs.contains_key(DEFAULT_LAB), "named loads do not touch the default");
     }
 
     #[test]
