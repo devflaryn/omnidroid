@@ -33,6 +33,7 @@
 //! omnidroid) is layered on the same vocabulary elsewhere.
 
 pub mod argspec;
+pub mod corpus;
 pub mod provider;
 pub mod session;
 
