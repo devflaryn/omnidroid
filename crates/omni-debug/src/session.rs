@@ -23,6 +23,7 @@ use omni_mem::{
     Protection, RegionKind,
 };
 
+use crate::argspec::{Arg, CallSpecResult};
 use crate::{DebugError, Result};
 
 /// How many guest instructions a single [`call_function`](Session::call_function) may run before it
@@ -777,6 +778,66 @@ impl Session {
                 "stopped at breakpoint {address:#x} (call_function does not pause on breakpoints)"
             ))),
         }
+    }
+
+    /// Call a guest function described by an `arg_spec` ([`Arg`]): scalars pass through, input
+    /// buffers are allocated and filled, output buffers are allocated zeroed, and every
+    /// output/in-out buffer is read back after the call. The buffers' guest addresses are passed
+    /// in register order alongside the scalars.
+    ///
+    /// # Errors
+    ///
+    /// [`DebugError::BadRequest`] for a zero-length output/in-out buffer or more than eight
+    /// arguments; otherwise as [`call_function`](Session::call_function).
+    pub fn call_spec(&mut self, address: GuestAddr, args: &[Arg]) -> Result<CallSpecResult> {
+        let mut words: Vec<u64> = Vec::with_capacity(args.len());
+        // (argument index, guest address, length) for buffers to read back after the call.
+        let mut readbacks: Vec<(usize, GuestAddr, usize)> = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            match a {
+                Arg::Scalar(v) => words.push(*v),
+                Arg::InBuffer(b) => {
+                    // An empty input buffer still needs a valid pointer; its length is passed
+                    // separately as a scalar, so one zero byte is enough to back the address.
+                    let addr = if b.is_empty() {
+                        self.alloc_data(&[0u8])?
+                    } else {
+                        self.alloc_data(b)?
+                    };
+                    words.push(addr as u64);
+                }
+                Arg::InOutBuffer(b) => {
+                    if b.is_empty() {
+                        return Err(DebugError::BadRequest("in/out buffer of zero length".into()));
+                    }
+                    let addr = self.alloc_data(b)?;
+                    words.push(addr as u64);
+                    readbacks.push((i, addr, b.len()));
+                }
+                Arg::OutBuffer(n) => {
+                    if *n == 0 {
+                        return Err(DebugError::BadRequest("output buffer of zero length".into()));
+                    }
+                    let addr = self.alloc_data(&vec![0u8; *n])?;
+                    words.push(addr as u64);
+                    readbacks.push((i, addr, *n));
+                }
+            }
+        }
+
+        let outcome = self.call_function(address, &words)?;
+
+        let mut out_buffers = Vec::with_capacity(readbacks.len());
+        for (i, addr, n) in readbacks {
+            out_buffers.push((i, self.read_mem(addr, n)?));
+        }
+
+        Ok(CallSpecResult {
+            ret: outcome.ret,
+            ret1: outcome.ret1,
+            instructions: outcome.instructions,
+            out_buffers,
+        })
     }
 
     /// Start guest execution at `address` with up to eight arguments and run until the guest

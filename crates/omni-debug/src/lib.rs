@@ -32,9 +32,11 @@
 //! This is the primary, host-agnostic path. A separate live-instance path (attaching to a running
 //! omnidroid) is layered on the same vocabulary elsewhere.
 
+pub mod argspec;
 pub mod provider;
 pub mod session;
 
+pub use argspec::{Arg, CallSpecResult};
 pub use provider::ModuleExportsProvider;
 pub use session::{
     CallOutcome, Disassembly, HookAction, LoadReport, MapEntry, Registers, Session, Stop,
