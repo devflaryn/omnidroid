@@ -56,6 +56,9 @@ app's own colour (A blue `#2196f3`, rebuilt A green, B red, Roblox's splash).
 
 ## What landed (commits on `perf/fast-boot`, oldest first)
 
+Pushed to GitHub as `origin/perf/fast-boot` (the gates are no worse than `main`'s, below); `main`
+is untouched -- yours to merge. The Linux box has the branch at `perf-fast-boot-in`.
+
 1. `aa603bd` **omni-apk: the launcher Activity from the APK's own manifest** (`LaunchInfo`: package,
    versionCode, first enabled MAIN/LAUNCHER activity or alias; any APK, no versionName needed).
 2. `8bad15b` **a control channel into a running device**: `omni-linux-run --control <dir>` runs
