@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 
-use omni_debug::{HookAction, Session, Stop};
+use omni_apk::Apk;
+use omni_debug::corpus::{self, ArgKind, ArgTemplate};
+use omni_debug::{diff, Arg, HookAction, Session, Stop};
 
 use crate::device;
 use crate::json::{self, Json};
@@ -116,6 +118,10 @@ pub struct Server {
     /// The emulation-layer lab sessions, by name. `"default"` is what every single-session tool
     /// uses; the RE workbench also uses `"original"` and `"candidate"` for differential testing.
     labs: BTreeMap<String, Session>,
+    /// Generated input corpora, by id, so `lab_diff` can reference one `lab_corpus` produced.
+    corpora: BTreeMap<String, Vec<Vec<Arg>>>,
+    /// The next corpus id suffix.
+    next_corpus: u64,
     /// The standby instance this server started, while it has not been taken over.
     standby_child: Option<(Child, PathBuf)>,
 }
@@ -201,6 +207,8 @@ impl Server {
             instances: BTreeMap::new(),
             next_instance: 1,
             labs: BTreeMap::new(),
+            corpora: BTreeMap::new(),
+            next_corpus: 1,
             standby_child: None,
         }
     }
@@ -577,6 +585,12 @@ impl Server {
             "trace_syscalls" => self.trace_syscalls(args),
             "alloc_data" => self.alloc_data(args),
             "load_code" => self.load_code(args),
+            // RE workbench
+            "lab_load_apk" => self.lab_load_apk(args),
+            "lab_trace" => self.lab_trace(args),
+            "lab_corpus" => self.lab_corpus(args),
+            "lab_diff" => self.lab_diff(args),
+            "lab_build" => self.lab_build(args),
             _ => return Err(RpcError { code: crate::mcp::code::METHOD_NOT_FOUND, message: format!("no tool named {name}") }),
         };
         result.map(text_result)
@@ -988,6 +1002,255 @@ impl Server {
         let addr = lab.load_code(&words).map_err(|e| RpcError::server(e.to_string()))?;
         Ok(json::obj([("address", hex(addr as u64))]))
     }
+
+    // ---- RE workbench ------------------------------------------------------------------------
+
+    /// Load a target library from an APK (or a bare `.so`) into a named lab session, resolving its
+    /// imports against its co-loaded `lib/arm64-v8a` siblings, and report every import still
+    /// unresolved. A bionic-HLE provider is a planned follow-up; until then the residual imports
+    /// are reported for the agent to stub via `intercept`.
+    fn lab_load_apk(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let apk_path = args
+            .get("apk")
+            .and_then(Json::as_str)
+            .ok_or_else(|| RpcError::params("need `apk` (path to an .apk or a bare .so)"))?;
+        let session_name =
+            args.get("session").and_then(Json::as_str).unwrap_or(DEFAULT_LAB).to_string();
+        let target_arg = args.get("target").and_then(Json::as_str).map(str::to_string);
+
+        let mut session = Session::new().map_err(|e| RpcError::server(e.to_string()))?;
+        let mut modules: Vec<String> = Vec::new();
+
+        let (target_name, unresolved) = if is_elf_file(apk_path) {
+            let name = Path::new(apk_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "module".to_string());
+            let report = session
+                .load_resolved(&name, apk_path, Vec::new())
+                .map_err(|e| RpcError::server(e.to_string()))?;
+            modules.push(name.clone());
+            (name, report.unresolved)
+        } else {
+            let apk = Apk::open(apk_path).map_err(|e| RpcError::server(e.to_string()))?;
+            let libs = apk.native_libraries_for_abi("arm64-v8a");
+            if libs.is_empty() {
+                return Err(RpcError::params("the APK has no lib/arm64-v8a/*.so"));
+            }
+            let target_name = target_arg
+                .ok_or_else(|| RpcError::params("need `target` (the .so to reconstruct) for an APK"))?;
+            let dir = std::env::temp_dir()
+                .join(format!("omni-apk-{}-{}", std::process::id(), self.next_corpus));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| RpcError::server(format!("temp dir: {e}")))?;
+
+            // Extract every arm64 lib to disk.
+            let mut paths: BTreeMap<String, PathBuf> = BTreeMap::new();
+            for lib in &libs {
+                let dest = dir.join(lib.file_name());
+                let mut f = std::fs::File::create(&dest)
+                    .map_err(|e| RpcError::server(format!("create {}: {e}", dest.display())))?;
+                apk.copy_entry_to(lib.entry(), &mut f, lib.file_name())
+                    .map_err(|e| RpcError::server(format!("extract {}: {e}", lib.file_name())))?;
+                paths.insert(lib.file_name().to_string(), dest);
+            }
+            let target_path = paths
+                .get(&target_name)
+                .ok_or_else(|| RpcError::params(format!("{target_name:?} is not in the APK's arm64 libs")))?
+                .clone();
+
+            // Co-load the siblings first so the target's imports resolve against them, then the target.
+            for (fname, p) in &paths {
+                if fname != &target_name && session.load_resolved(fname, p, Vec::new()).is_ok() {
+                    modules.push(fname.clone());
+                }
+            }
+            let report = session
+                .load_resolved(&target_name, &target_path, Vec::new())
+                .map_err(|e| RpcError::server(e.to_string()))?;
+            modules.push(target_name.clone());
+            (target_name, report.unresolved)
+        };
+
+        self.labs.insert(session_name.clone(), session);
+
+        let unresolved_json: Vec<Json> = unresolved
+            .iter()
+            .map(|u| {
+                json::obj([
+                    ("name", json::s(u.name.clone())),
+                    ("kind", json::s(u.kind.elf_name())),
+                    ("weak", Json::Bool(u.weak)),
+                    (
+                        "library",
+                        u.library.as_ref().map(|l| json::s(l.clone())).unwrap_or(Json::Null),
+                    ),
+                ])
+            })
+            .collect();
+        Ok(json::obj([
+            ("session", json::s(session_name)),
+            ("target", json::s(target_name)),
+            ("modules", Json::Array(modules.into_iter().map(json::s).collect())),
+            ("unresolved", Json::Array(unresolved_json)),
+        ]))
+    }
+
+    /// Call a function described by an `arg_spec` (scalars and buffers), returning the result and
+    /// the contents of every output buffer read back after the call.
+    fn lab_trace(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let spec = parse_arg_spec(args)?;
+        let name = args.get("session").and_then(Json::as_str).unwrap_or(DEFAULT_LAB).to_string();
+        let lab = self.lab_ref_named(&name)?;
+        let addr = Self::target_address(lab, args)?;
+        let lab = self.lab_mut_named(&name)?;
+        let res = lab.call_spec(addr, &spec).map_err(|e| RpcError::server(e.to_string()))?;
+        let out_buffers: Vec<Json> = res
+            .out_buffers
+            .iter()
+            .map(|(i, b)| json::obj([("index", Json::Num(*i as f64)), ("hex", json::s(to_hex(b)))]))
+            .collect();
+        Ok(json::obj([
+            ("ret", hex(res.ret)),
+            ("ret_u64", Json::Num(res.ret as f64)),
+            ("ret1", hex(res.ret1)),
+            ("instructions", Json::Num(res.instructions as f64)),
+            ("out_buffers", Json::Array(out_buffers)),
+        ]))
+    }
+
+    /// Generate a reproducible input corpus from per-parameter templates, store it, and return its
+    /// id for `lab_diff`.
+    fn lab_corpus(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let templates: Vec<ArgTemplate> = match args.get("templates") {
+            Some(Json::Array(a)) => a.iter().map(parse_template).collect::<Result<_, _>>()?,
+            _ => return Err(RpcError::params("`templates` must be an array")),
+        };
+        let seed = args.get("seed").and_then(Json::as_u64).unwrap_or(0);
+        let count = args.get("count").and_then(Json::as_u64).unwrap_or(16) as usize;
+        let generated = corpus::generate(&templates, seed, count);
+        let n = generated.len();
+        let id = format!("corpus-{}", self.next_corpus);
+        self.next_corpus += 1;
+        self.corpora.insert(id.clone(), generated);
+        Ok(json::obj([("corpus_id", json::s(id)), ("count", Json::Num(n as f64))]))
+    }
+
+    /// Differential-test `symbol` in the `original` session against the `candidate` session over a
+    /// stored corpus; return the match ratio and the first divergence.
+    fn lab_diff(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let symbol = args
+            .get("symbol")
+            .and_then(Json::as_str)
+            .ok_or_else(|| RpcError::params("need `symbol`"))?
+            .to_string();
+        let orig_name =
+            args.get("original").and_then(Json::as_str).unwrap_or("original").to_string();
+        let cand_name =
+            args.get("candidate").and_then(Json::as_str).unwrap_or("candidate").to_string();
+        let corpus_id = args
+            .get("corpus_id")
+            .and_then(Json::as_str)
+            .ok_or_else(|| RpcError::params("need `corpus_id` (from lab_corpus)"))?;
+        let corpus = self
+            .corpora
+            .get(corpus_id)
+            .ok_or_else(|| RpcError::params(format!("no corpus {corpus_id:?}")))?
+            .clone();
+
+        // Two simultaneous &mut sessions: remove both from the map, run, reinsert.
+        let mut orig = self
+            .labs
+            .remove(&orig_name)
+            .ok_or_else(|| RpcError::server(format!("no lab session {orig_name:?}")))?;
+        let mut cand = match self.labs.remove(&cand_name) {
+            Some(s) => s,
+            None => {
+                self.labs.insert(orig_name.clone(), orig);
+                return Err(RpcError::server(format!("no lab session {cand_name:?}")));
+            }
+        };
+
+        let result = diff::diff_calls(&mut orig, &mut cand, &symbol, &corpus);
+
+        self.labs.insert(orig_name, orig);
+        self.labs.insert(cand_name, cand);
+
+        let first = match result.first_divergence {
+            Some(d) => json::obj([
+                ("index", Json::Num(d.index as f64)),
+                ("observable", json::s(d.observable)),
+                ("expected", json::s(d.expected)),
+                ("got", json::s(d.got)),
+            ]),
+            None => Json::Null,
+        };
+        Ok(json::obj([
+            ("total", Json::Num(result.total as f64)),
+            ("matched", Json::Num(result.matched as f64)),
+            ("first_divergence", first),
+        ]))
+    }
+
+    /// Compile candidate C sources into an arm64 shared object the lab can load. Returns the `.so`
+    /// path, or a structured `error` (missing toolchain / compiler diagnostics) — never a thrown
+    /// error for the expected "no toolchain" case.
+    fn lab_build(&mut self, args: &Json) -> Result<Json, RpcError> {
+        let sources: Vec<(String, String)> = match args.get("sources") {
+            Some(Json::Array(a)) => a
+                .iter()
+                .map(|s| {
+                    let name = s
+                        .get("name")
+                        .and_then(Json::as_str)
+                        .ok_or_else(|| RpcError::params("each source needs a `name`"))?;
+                    let text = s
+                        .get("text")
+                        .and_then(Json::as_str)
+                        .ok_or_else(|| RpcError::params("each source needs `text`"))?;
+                    Ok((name.to_string(), text.to_string()))
+                })
+                .collect::<Result<_, RpcError>>()?,
+            _ => return Err(RpcError::params("`sources` must be an array of {name, text}")),
+        };
+        if sources.is_empty() {
+            return Err(RpcError::params("need at least one source"));
+        }
+        let flags: Vec<String> = match args.get("flags") {
+            Some(Json::Array(a)) => a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect(),
+            _ => Vec::new(),
+        };
+        let soname = args.get("soname").and_then(Json::as_str).unwrap_or("candidate.so");
+
+        let tc = match omni_rebuild::detect() {
+            Ok(tc) => tc,
+            Err(omni_rebuild::BuildError::ToolchainMissing { looked_for }) => {
+                return Ok(json::obj([
+                    ("error", json::s("toolchain missing")),
+                    (
+                        "looked_for",
+                        Json::Array(looked_for.into_iter().map(json::s).collect()),
+                    ),
+                ]));
+            }
+            Err(e) => return Err(RpcError::server(e.to_string())),
+        };
+        let dir =
+            std::env::temp_dir().join(format!("omni-rebuild-{}-{}", std::process::id(), self.next_corpus));
+        std::fs::create_dir_all(&dir).map_err(|e| RpcError::server(format!("temp dir: {e}")))?;
+        let out = dir.join(soname);
+        match omni_rebuild::compile_shared(&tc, &sources, &out, &flags) {
+            Ok(so) => Ok(json::obj([
+                ("so_path", json::s(so.to_string_lossy().into_owned())),
+                ("target", json::s(tc.target)),
+            ])),
+            Err(omni_rebuild::BuildError::Compile { diagnostics }) => Ok(json::obj([
+                ("error", json::s("compile")),
+                ("diagnostics", json::s(diagnostics)),
+            ])),
+            Err(e) => Err(RpcError::server(e.to_string())),
+        }
+    }
 }
 
 impl Dispatch for Server {
@@ -1052,6 +1315,79 @@ fn stop(inst: &mut Instance) {
     }
 }
 
+// ---- RE workbench parsing helpers ---------------------------------------------------------------
+
+/// Parse one `arg_spec` item: an object with exactly one of `scalar`, `in_buffer`, `inout_buffer`
+/// (hex strings) or `out_buffer` (a length).
+fn parse_arg(v: &Json) -> Result<Arg, RpcError> {
+    if let Some(x) = v.get("scalar") {
+        let n = x
+            .as_u64()
+            .ok_or_else(|| RpcError::params("`scalar` must be an integer or a hex/decimal string"))?;
+        return Ok(Arg::Scalar(n));
+    }
+    if let Some(h) = v.get("in_buffer").and_then(Json::as_str) {
+        return Ok(Arg::InBuffer(from_hex(h).map_err(RpcError::params)?));
+    }
+    if let Some(h) = v.get("inout_buffer").and_then(Json::as_str) {
+        return Ok(Arg::InOutBuffer(from_hex(h).map_err(RpcError::params)?));
+    }
+    if let Some(n) = v.get("out_buffer").and_then(Json::as_u64) {
+        return Ok(Arg::OutBuffer(n as usize));
+    }
+    Err(RpcError::params(
+        "each arg_spec item needs one of: scalar, in_buffer, inout_buffer, out_buffer",
+    ))
+}
+
+/// Parse the optional `arg_spec` array into `Arg`s (empty when absent).
+fn parse_arg_spec(args: &Json) -> Result<Vec<Arg>, RpcError> {
+    match args.get("arg_spec") {
+        Some(Json::Array(a)) => a.iter().map(parse_arg).collect(),
+        None => Ok(Vec::new()),
+        _ => Err(RpcError::params("`arg_spec` must be an array")),
+    }
+}
+
+/// Parse one corpus template: `{kind: "scalar"|"buffer"|"out_buffer"|"const", len?, value?}`.
+fn parse_template(v: &Json) -> Result<ArgTemplate, RpcError> {
+    let kind = v
+        .get("kind")
+        .and_then(Json::as_str)
+        .ok_or_else(|| RpcError::params("each template needs a `kind`"))?;
+    let k = match kind {
+        "scalar" => ArgKind::Scalar,
+        "buffer" => ArgKind::Buffer {
+            len: v
+                .get("len")
+                .and_then(Json::as_u64)
+                .ok_or_else(|| RpcError::params("a `buffer` template needs `len`"))? as usize,
+        },
+        "out_buffer" => ArgKind::OutBuffer {
+            len: v
+                .get("len")
+                .and_then(Json::as_u64)
+                .ok_or_else(|| RpcError::params("an `out_buffer` template needs `len`"))? as usize,
+        },
+        "const" => ArgKind::Const(
+            v.get("value")
+                .and_then(Json::as_u64)
+                .ok_or_else(|| RpcError::params("a `const` template needs `value`"))?,
+        ),
+        other => return Err(RpcError::params(format!("unknown template kind {other:?}"))),
+    };
+    Ok(ArgTemplate { kind: k })
+}
+
+/// Whether a file begins with the ELF magic — i.e. a bare `.so` rather than an APK (zip).
+fn is_elf_file(path: &str) -> bool {
+    let mut buf = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf).map(|()| buf))
+        .map(|b| b == [0x7f, b'E', b'L', b'F'])
+        .unwrap_or(false)
+}
+
 // ---- tool catalogue data ----------------------------------------------------------------------
 
 struct Param {
@@ -1111,6 +1447,34 @@ static TOOLS: &[Tool] = &[
     Tool { name: "trace_syscalls", desc: "Record every guest SVC during the next call.", params: &[p!("on","boolean",false,"on/off (default on)")] },
     Tool { name: "alloc_data", desc: "Place bytes (or zeroed space) in a writable guest region; returns the address (for crafted inputs).", params: &[p!("hex","string",false,"bytes as hex"),p!("len","number",false,"zeroed length")] },
     Tool { name: "load_code", desc: "Place A64 machine-code words in an executable guest region; returns the entry address.", params: &[p!("words","array",true,"32-bit A64 encodings")] },
+    // RE workbench: dynamically reverse-engineer a .so and prove a rebuilt one matches it.
+    Tool { name: "lab_load_apk", desc: "Load a target arm64 library from an APK (or a bare .so) into a named lab session, resolving imports against its co-loaded lib/arm64-v8a siblings; returns the loaded modules and every import still unresolved (to stub via intercept). For an APK, `target` names the .so to reconstruct.", params: &[
+        p!("apk","string",true,"path to an .apk, or a bare .so"),
+        p!("target","string",false,"the .so to reconstruct (required for an APK)"),
+        p!("session","string",false,"lab session name (default: default)"),
+    ]},
+    Tool { name: "lab_trace", desc: "Call a function described by an arg_spec (scalars and in/out buffers): buffers are allocated, addresses passed in register order, and output buffers read back. Returns ret, ret1, instruction count and the output buffers' bytes.", params: &[
+        p!("symbol","string",false,"exported symbol to call"),
+        p!("address","number",false,"guest address to call (instead of symbol)"),
+        p!("arg_spec","array",false,"items: {scalar}|{in_buffer:hex}|{out_buffer:len}|{inout_buffer:hex}"),
+        p!("session","string",false,"lab session name (default: default)"),
+    ]},
+    Tool { name: "lab_corpus", desc: "Generate a reproducible input corpus from per-parameter templates and store it; returns a corpus_id for lab_diff. Same seed reproduces the corpus.", params: &[
+        p!("templates","array",true,"items: {kind:scalar}|{kind:buffer,len}|{kind:out_buffer,len}|{kind:const,value}"),
+        p!("seed","number",false,"PRNG seed (default 0)"),
+        p!("count","number",false,"how many input vectors (default 16)"),
+    ]},
+    Tool { name: "lab_diff", desc: "Differential-test a symbol in the `original` session against the `candidate` session over a stored corpus; returns total, matched, and the first divergence (ret / out_buffers / fault). Proves behavioral equivalence RELATIVE TO THE CORPUS, not universally.", params: &[
+        p!("symbol","string",true,"the function to compare in both sessions"),
+        p!("corpus_id","string",true,"a corpus from lab_corpus"),
+        p!("original","string",false,"original session name (default: original)"),
+        p!("candidate","string",false,"candidate session name (default: candidate)"),
+    ]},
+    Tool { name: "lab_build", desc: "Compile candidate C sources into an arm64 shared object the lab can load. Returns so_path, or a structured error: {error:\"toolchain missing\", looked_for} when no arm64 clang/NDK is on the host, or {error:\"compile\", diagnostics} on a compiler error.", params: &[
+        p!("sources","array",true,"items: {name, text} C source files"),
+        p!("flags","array",false,"extra clang flags"),
+        p!("soname","string",false,"output file name (default candidate.so)"),
+    ]},
 ];
 
 // ---- small helpers ----------------------------------------------------------------------------

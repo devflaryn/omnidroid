@@ -16,6 +16,7 @@ description = "An MCP server (Model Context Protocol, over stdio) that lets any 
 # unchanged means the other two machines rebuild nothing new. No cfg(target_os) and no OS crate here.
 [dependencies]
 omni-debug = { workspace = true }
+omni-rebuild = { workspace = true }
 omni-apk = { workspace = true }
 omni-platform = { workspace = true }
 # An APK is known by its bytes' hash (the warm device's install decision).

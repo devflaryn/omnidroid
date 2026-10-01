@@ -116,6 +116,110 @@ fn write_mem_and_intercept_over_mcp() {
     assert_eq!(out.get("ret").unwrap().as_str(), Some("0xabc"), "the patched RET returned arg0");
 }
 
+// ---- RE workbench tools -----------------------------------------------------------------------
+
+#[test]
+fn lab_load_apk_on_a_single_so_reports_unresolved_imports() {
+    let mut server = Server::new(Config::from_env());
+    // A bare .so is accepted as a one-library "apk"; libz imports libc functions, so the
+    // unresolved list is non-empty and the module is loaded.
+    let out = call(&mut server, "lab_load_apk", json::obj([("apk", json::s(fixture()))]));
+    assert_eq!(out.get("target").unwrap().as_str(), Some("libz.so"));
+    let unresolved = out.get("unresolved").unwrap().as_array().unwrap();
+    assert!(!unresolved.is_empty(), "libz has unresolved imports without a bionic provider");
+}
+
+#[test]
+fn lab_trace_calls_with_an_arg_spec() {
+    let mut server = Server::new(Config::from_env());
+    call(&mut server, "lab_load", json::obj([("path", json::s(fixture()))]));
+    // adler32(1, "Hello", 5) described declaratively.
+    let out = call(
+        &mut server,
+        "lab_trace",
+        json::obj([
+            ("symbol", json::s("adler32")),
+            (
+                "arg_spec",
+                Json::Array(vec![
+                    json::obj([("scalar", Json::Num(1.0))]),
+                    json::obj([("in_buffer", json::s("48656c6c6f"))]),
+                    json::obj([("scalar", Json::Num(5.0))]),
+                ]),
+            ),
+        ]),
+    );
+    assert_eq!(out.get("ret_u64").unwrap().as_f64().unwrap() as u32, 0x058c_01f5);
+}
+
+#[test]
+fn lab_corpus_is_deterministic_and_stored() {
+    let mut server = Server::new(Config::from_env());
+    let templates = Json::Array(vec![
+        json::obj([("kind", json::s("scalar"))]),
+        json::obj([("kind", json::s("buffer")), ("len", Json::Num(8.0))]),
+    ]);
+    let a = call(
+        &mut server,
+        "lab_corpus",
+        json::obj([("templates", templates), ("seed", Json::Num(42.0)), ("count", Json::Num(10.0))]),
+    );
+    assert_eq!(a.get("count").unwrap().as_f64().unwrap() as usize, 10);
+    assert!(a.get("corpus_id").unwrap().as_str().is_some(), "a corpus id is returned");
+}
+
+#[test]
+fn lab_diff_matches_identical_library() {
+    let mut server = Server::new(Config::from_env());
+    call(&mut server, "lab_load", json::obj([("path", json::s(fixture())), ("session", json::s("original"))]));
+    call(&mut server, "lab_load", json::obj([("path", json::s(fixture())), ("session", json::s("candidate"))]));
+    // adler32(seed, buf[16], 16): the length is held constant so the read stays in bounds.
+    let templates = Json::Array(vec![
+        json::obj([("kind", json::s("scalar"))]),
+        json::obj([("kind", json::s("buffer")), ("len", Json::Num(16.0))]),
+        json::obj([("kind", json::s("const")), ("value", Json::Num(16.0))]),
+    ]);
+    let corpus = call(
+        &mut server,
+        "lab_corpus",
+        json::obj([("templates", templates), ("seed", Json::Num(3.0)), ("count", Json::Num(8.0))]),
+    );
+    let corpus_id = corpus.get("corpus_id").unwrap().as_str().unwrap().to_string();
+    let out = call(
+        &mut server,
+        "lab_diff",
+        json::obj([("symbol", json::s("adler32")), ("corpus_id", json::s(corpus_id))]),
+    );
+    let total = out.get("total").unwrap().as_f64().unwrap() as usize;
+    let matched = out.get("matched").unwrap().as_f64().unwrap() as usize;
+    assert_eq!(matched, total, "a library must match itself; divergence: {:?}", out.get("first_divergence"));
+    assert_eq!(total, 8);
+}
+
+#[test]
+fn lab_build_without_a_toolchain_reports_cleanly() {
+    let mut server = Server::new(Config::from_env());
+    let out = call(
+        &mut server,
+        "lab_build",
+        json::obj([(
+            "sources",
+            Json::Array(vec![json::obj([
+                ("name", json::s("cand.c")),
+                ("text", json::s("int add(int a, int b){return a+b;}")),
+            ])]),
+        )]),
+    );
+    // Either it built (a toolchain is present) or it reported the toolchain missing — never thrown.
+    let built = out.get("so_path").and_then(Json::as_str).is_some();
+    let missing = out
+        .get("error")
+        .and_then(Json::as_str)
+        .map(|s| s.contains("toolchain"))
+        .unwrap_or(false);
+    assert!(built || missing, "lab_build must report build or missing-toolchain: {out:?}");
+}
+
 #[test]
 fn a_missing_lab_is_a_clean_error() {
     let mut server = Server::new(Config::from_env());
