@@ -34,6 +34,7 @@
 
 pub mod argspec;
 pub mod corpus;
+pub mod diff;
 pub mod provider;
 pub mod session;
 
