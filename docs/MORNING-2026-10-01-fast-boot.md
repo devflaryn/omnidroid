@@ -29,6 +29,8 @@ for the boots.
 | a higher versionCode / another signature at a lower one | -- | 7.7 / 11.3 (uninstalled + installed 4.0) |
 | **Roblox on screen** (its splash, then its sign-in screen) | 162.8 saved device / 189.6 new | **26.6** on the warm device (installed 7.4, on screen 19.1) |
 | `stop_instance` (force-stop + clear, device stays warm) | shuts the device down | 2.4-2.6 |
+| Roblox **session** path (`omnidroid aosp --apk`, as the baselines; new device: up / installed / on screen) | 125.4 / 158.0 / 189.6 | 68.7 / 97.3 / 124.2 |
+| Roblox session path, saved device (up / on screen) | 124.3 / 162.8 | 51.0 / 82.2 |
 
 "After" is the last demo run (`demo-spare`, spare targeted): the calls 10-15 s apart, as an agent's
 builds would be -- a spare is ready ~10 s after the previous one was taken. Without the spare (the
