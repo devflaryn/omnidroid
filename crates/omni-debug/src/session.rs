@@ -840,6 +840,35 @@ impl Session {
         })
     }
 
+    /// Call a guest function with syscall tracing on, plus a [`TraceKind::Enter`] record at each
+    /// address in `watch`, and return the outcome together with the event stream. The per-call
+    /// tracing state is restored afterwards: syscall tracing is turned back off and the watch
+    /// intercepts are cleared, so a later plain call is not silently still traced.
+    ///
+    /// # Errors
+    ///
+    /// As [`call_function`](Session::call_function); [`DebugError::Cpu`] if the backend cannot
+    /// install the syscall hook.
+    pub fn call_traced(
+        &mut self,
+        address: GuestAddr,
+        args: &[u64],
+        watch: &[GuestAddr],
+    ) -> Result<(CallOutcome, Vec<TraceEvent>)> {
+        self.trace_syscalls(true)?;
+        if !watch.is_empty() {
+            self.trace_calls(watch)?;
+        }
+        let outcome = self.call_function(address, args)?;
+        let events = outcome.events.clone();
+        // Restore state so the tracing does not leak into later calls on this session.
+        self.trace_syscalls(false)?;
+        for &a in watch {
+            let _ = self.clear_intercept(a);
+        }
+        Ok((outcome, events))
+    }
+
     /// Start guest execution at `address` with up to eight arguments and run until the guest
     /// returns or a **user breakpoint** ([`set_breakpoint`](Session::set_breakpoint)) is reached.
     /// This is the interactive counterpart to [`call_function`](Session::call_function): on a
