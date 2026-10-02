@@ -110,7 +110,9 @@ pub const LEAVES_OUT: &[&str] = &[
     "/product/app/Music",
     "/product/app/PhotoTable",
     "/product/app/QuickSearchBox",
-    "/product/app/Browser2",
+    // Not the browser (`/product/app/Browser2`): an app that opens a web page with ACTION_VIEW
+    // crashes when nothing on the device takes it -- Roblox did, its in-game key page
+    // (`ActivityNotFoundException`, the app ended mid-game, 2026-10-02). It runs only when opened.
     "/system/app/EasterEgg",
     "/system/app/BasicDreams",
     "/system/priv-app/LiveWallpapersPicker",
