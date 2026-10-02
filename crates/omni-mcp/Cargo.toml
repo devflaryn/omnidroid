@@ -19,8 +19,8 @@ omni-debug = { workspace = true }
 omni-rebuild = { workspace = true }
 omni-apk = { workspace = true }
 omni-platform = { workspace = true }
-# An APK is known by its bytes' hash (the warm device's install decision).
-sha2 = { workspace = true }
+# The warm device (install by content, start, stop -- shared with the omnidroid launcher).
+omni-warm = { workspace = true }
 
 [lib]
 name = "omni_mcp"

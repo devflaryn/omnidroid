@@ -15,6 +15,8 @@ description = "The launcher: run an APK in a real window on Windows, macOS or Li
 [dependencies]
 omni-apk = { workspace = true }
 omni-platform = { workspace = true }
+# `aosp` on the host's warm device when one is up (src/warm.rs): no boot of its own.
+omni-warm = { workspace = true }
 
 [[bin]]
 name = "omnidroid"

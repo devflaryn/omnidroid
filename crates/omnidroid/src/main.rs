@@ -66,6 +66,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod warm;
+
 /// The gate test whose run is a session: `initialize_native_code_returns_a_native_code_and_the_game_thread_starts`.
 const SESSION_TEST: &str = "initialize_native_code_returns_a_native_code_and_the_game_thread_starts";
 /// "No limit": ten years, the gate's way of saying until the window is closed.
@@ -113,8 +115,12 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                     one is kept); --standby keeps the device waiting once launched (and in the
                     place): a place id written to <instance>/data/local/tmp/join-place is joined,
                     and <instance>/data/local/tmp/stop ends the session; --instance names the
-                    instance's directory
-  aosp --warm       a warm device: Android booted and idle with no app (no --apk), for apps a
+                    instance's directory. With a warm device up (below) the session runs on it
+                    instead -- no boot: the APK installed, the cookie put in the app's store
+                    before its first start, the place's link sent once the app's main Activity
+                    starts; the app is stopped when the session ends, the device stays warm
+                    (not with --instance, --standby or --fresh-device; OMNI_AOSP_WARM=0: never)
+  aosp --warm      a warm device: Android booted and idle with no app (no --apk), for apps a
                     host program installs, starts and stops on it through its control channel
                     (<instance>.ctl: a shell command in <id>.cmd, its output in <id>.out and exit
                     status in <id>.rc) -- the MCP server's install_apk and start_instance. Saved
@@ -155,6 +161,10 @@ fn command_and_rest(args: impl Iterator<Item = String>) -> (Option<String>, Vec<
 
 fn main() -> ExitCode {
     let (command, rest) = command_and_rest(std::env::args().skip(1));
+    // The helper a warm-device session leaves behind to stop its app once the session is gone.
+    if command.as_deref() == Some("warm-release") {
+        return warm::release(&rest);
+    }
     let args = rest.into_iter();
     if command.as_deref() == Some("aosp") {
         return match parse_aosp(args) {
@@ -869,6 +879,17 @@ fn aosp(options: &AospOptions) -> ExitCode {
             Some(std::fs::canonicalize(&path).unwrap_or(path))
         }
     };
+    // A warm device is up: the session is an app on it -- no boot, no device of its own (a second
+    // device beside it would only take the host's memory). Not for a session that names its own
+    // device (--instance, --standby, --fresh-device), nor with OMNI_AOSP_WARM=0.
+    if !options.warm && !options.standby && !options.fresh_device && options.instance.is_none() {
+        if let Some(dev) = warm::usable() {
+            if options.size.is_some() || options.gpu.is_some() || options.with_systemui {
+                println!("Omnidroid: --size, --gpu and --with-systemui are the warm device's own (set when it booted); not applied");
+            }
+            return warm::session(&dev, &repo_root(), &apk_path, cookie.as_deref(), options.place, options.minutes);
+        }
+    }
     // The session (cargo, the test, the device's host processes) ends with this process, however it
     // ends: a caller that kills the launcher (the MCP server) leaves nothing running.
     omni_platform::process::hold_children();

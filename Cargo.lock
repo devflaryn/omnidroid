@@ -370,6 +370,7 @@ dependencies = [
  "omni-debug",
  "omni-platform",
  "omni-rebuild",
+ "omni-warm",
 ]
 
 [[package]]
@@ -416,11 +417,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-warm"
+version = "0.1.0"
+dependencies = [
+ "omni-apk",
+ "sha2",
+]
+
+[[package]]
 name = "omnidroid"
 version = "0.1.0"
 dependencies = [
  "omni-apk",
  "omni-platform",
+ "omni-warm",
 ]
 
 [[package]]

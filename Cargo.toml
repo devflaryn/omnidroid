@@ -34,6 +34,9 @@ omni-core = { path = "crates/omni-core" }
 # top-level tools; neither is depended on by a core crate.
 omni-debug = { path = "crates/omni-debug" }
 omni-mcp = { path = "crates/omni-mcp" }
+# The warm device (one idle Android per host, apps installed and started on it): omni-mcp and the
+# omnidroid launcher both drive it.
+omni-warm = { path = "crates/omni-warm" }
 # The RE workbench's build helper (C3): arm64 toolchain detection + candidate compile. A top-level
 # tool crate like omni-debug/omni-mcp; only omni-mcp depends on it.
 omni-rebuild = { path = "crates/omni-rebuild" }

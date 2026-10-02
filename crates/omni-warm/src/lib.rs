@@ -15,6 +15,9 @@
 //!   versionCode and name -- are installed again (`pm install -r -d`, and uninstalled first when the
 //!   signature differs); another package's test app is uninstalled first. The package and the
 //!   launcher Activity come from the APK's own manifest.
+//!
+//! Used by the MCP server (`omni-mcp`'s `start_instance`/`install_apk` without an account) and by
+//! the `omnidroid` launcher (`omnidroid aosp --cookie --place` on a warm device that is up).
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -324,6 +327,16 @@ fn pm_install_flags() -> String {
 /// # Errors
 /// A control-channel failure, or `pm install` failing.
 pub fn install(device: &Device, apk: &Apk) -> Result<Installed, String> {
+    install_then(device, apk, "")
+}
+
+/// [`install`], and `then` (shell, as root) in the same command once the install succeeded -- one
+/// round trip of the control channel, not two (each is ~0.5-1.5 s). `then` is not run when the
+/// installed bytes are reused (`action == "reused"`): the caller runs it.
+///
+/// # Errors
+/// As [`install`].
+pub fn install_then(device: &Device, apk: &Apk, then: &str) -> Result<Installed, String> {
     let t = Instant::now();
     let limit = Duration::from_secs(300);
     // What the device holds is read from its /data on the host: no round trip to decide.
@@ -346,23 +359,30 @@ pub fn install(device: &Device, apk: &Apk) -> Result<Installed, String> {
     let flags = pm_install_flags();
     // Other test apps go first, in the same command.
     let first: String = others.iter().map(|p| format!("pm uninstall {p} >/dev/null 2>&1; ")).collect();
-    let (mut code, mut said) = device.shell(&format!("{first}pm install {flags} {guest}"), limit)?;
+    // "All files access", granted as the device's owner grants it in Settings -- as `pm install -g`
+    // grants the runtime permissions -- in the same command (a round trip is ~0.5-1.5 s). An app that
+    // asks for it otherwise opens Settings' page for it instead of its own screen (the Roblox APK
+    // does, 2026-10-01); for one that does not, a no-op.
+    let mut grant = format!(" && appops set {} MANAGE_EXTERNAL_STORAGE allow", apk.package);
+    let uid = if then.is_empty() {
+        None
+    } else {
+        grant.push_str(&format!(" && {{ {then}\n}}"));
+        Some(0)
+    };
+    let (mut code, mut said) = device.shell_as(&format!("{first}pm install {flags} {guest}{grant}"), uid, limit)?;
     let mut action = if held { "reinstalled" } else { "installed" };
     // Other bytes of the installed package that pm refuses to put over it -- another signature, or
     // a lower versionCode (`-d` only lets a debuggable app go down) -- replace it: uninstalled first.
     let refused = ["INSTALL_FAILED_UPDATE_INCOMPATIBLE", "signatures do not match", "INSTALL_FAILED_VERSION_DOWNGRADE"];
     if code != 0 && refused.iter().any(|r| said.contains(r)) {
-        let (c, s) = device.shell(&format!("pm uninstall {} >/dev/null 2>&1; pm install {flags} {guest}", apk.package), limit)?;
+        let (c, s) = device.shell_as(&format!("pm uninstall {} >/dev/null 2>&1; pm install {flags} {guest}{grant}", apk.package), uid, limit)?;
         (code, said, action) = (c, s, "reinstalled-after-uninstall");
     }
     let _ = std::fs::remove_file(drop.join(&name));
     if code != 0 || !said.contains("Success") {
         return Err(format!("pm install {}: {}", apk.path.display(), said.trim()));
     }
-    // "All files access", granted as the device's owner grants it in Settings -- as `pm install -g`
-    // grants the runtime permissions. An app that asks for it otherwise opens Settings' page for it
-    // instead of its own screen (the Roblox APK does, 2026-10-01); for one that does not, a no-op.
-    let _ = device.shell(&format!("appops set {} MANAGE_EXTERNAL_STORAGE allow", apk.package), Duration::from_secs(60));
     Ok(Installed { action, uninstalled: others, seconds: t.elapsed().as_secs_f64(), pm: said.trim().to_string() })
 }
 
@@ -403,6 +423,73 @@ pub fn stop_app(device: &Device, package: &str) -> Result<String, String> {
     Ok(out.trim().to_string())
 }
 
+/// Where a host file is handed to the device as `name`: the host path to write it at (its
+/// directory made) and the guest path the device sees it at (`/data/local/tmp/omni-apk/<name>`).
+/// The guest command that uses it removes it.
+///
+/// # Errors
+/// The directory could not be made.
+pub fn hand_over_path(device: &Device, name: &str) -> Result<(PathBuf, String), String> {
+    let drop = device.dir.join(DROP);
+    std::fs::create_dir_all(&drop).map_err(|e| format!("{}: {e}", drop.display()))?;
+    Ok((drop.join(name), format!("/data/local/tmp/omni-apk/{name}")))
+}
+
+/// Start `apk`'s launcher Activity without waiting for it to be displayed, after `before` (shell
+/// run first in the same command, as root: files put into the app's data before its first start).
+/// The caller follows the start in the device's log ([`LogTail`]).
+///
+/// # Errors
+/// The APK has no launcher Activity, the control channel failed, or `am start` failed.
+pub fn launch(device: &Device, apk: &Apk, before: &str) -> Result<String, String> {
+    let (code, out) = device.shell_as(&format!("{before}{}", launch_command(apk)?), Some(0), Duration::from_secs(120))?;
+    if code != 0 || out.contains("Error") {
+        return Err(format!("{}: {}", launch_command(apk)?, out.trim()));
+    }
+    Ok(out.trim().to_string())
+}
+
+/// The shell that starts `apk`'s launcher Activity without waiting for it (the screen woken first).
+///
+/// # Errors
+/// The APK has no launcher Activity.
+pub fn launch_command(apk: &Apk) -> Result<String, String> {
+    let class = apk.launcher.as_deref().ok_or_else(|| format!("{} has no launcher Activity (MAIN/LAUNCHER)", apk.package))?;
+    Ok(format!("input keyevent KEYCODE_WAKEUP; am start -n {}/{class}", apk.package))
+}
+
+/// The lines a log file gains from now on, read as they come (a warm device's `<dir>.log`, which
+/// every guest log line reaches). A file that shrank was started again: it is read from its start.
+pub struct LogTail {
+    path: PathBuf,
+    pos: u64,
+}
+
+impl LogTail {
+    /// `path` from its current end.
+    #[must_use]
+    pub fn from_end(path: &Path) -> Self {
+        Self { path: path.to_path_buf(), pos: std::fs::metadata(path).map_or(0, |m| m.len()) }
+    }
+
+    /// The whole lines written since the last call.
+    pub fn lines(&mut self) -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(&self.path) else { return Vec::new() };
+        let len = f.metadata().map_or(0, |m| m.len());
+        if len < self.pos {
+            self.pos = 0;
+        }
+        let mut data = Vec::new();
+        if f.seek(SeekFrom::Start(self.pos)).is_err() || f.read_to_end(&mut data).is_err() {
+            return Vec::new();
+        }
+        let whole = data.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        self.pos += whole as u64;
+        String::from_utf8_lossy(&data[..whole]).lines().map(str::to_string).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +506,23 @@ mod tests {
         std::fs::write(&b, b"abd").expect("b");
         assert_ne!(sha256_file(&a), sha256_file(&b), "other bytes");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_is_read_by_whole_lines_from_where_it_was_and_again_when_it_restarts() {
+        let path = std::env::temp_dir().join(format!("omni-warm-tail-{}.log", std::process::id()));
+        std::fs::write(&path, "before\n").expect("log");
+        let mut tail = LogTail::from_end(&path);
+        assert!(tail.lines().is_empty(), "what was there before is not read");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).expect("append");
+        std::io::Write::write_all(&mut f, b"one\ntw").expect("write");
+        assert_eq!(tail.lines(), ["one"], "a partial line waits");
+        std::io::Write::write_all(&mut f, b"o\n").expect("write");
+        assert_eq!(tail.lines(), ["two"]);
+        drop(f);
+        std::fs::write(&path, "new\n").expect("a new log");
+        assert_eq!(tail.lines(), ["new"], "a log started again is read from its start");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

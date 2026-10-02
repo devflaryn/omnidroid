@@ -3,11 +3,13 @@
 `Cookies` database that `android.webkit.CookieManager` keeps at
 `/data/data/<package>/app_webview/Default/Cookies` -- as a device that had signed in holds it.
 
-    python tools/plant_cookie.py <Cookies database> <cookie file>
+    python tools/plant_cookie.py [--new] <Cookies database> <cookie file>
 
 The cookie file holds the `.ROBLOSECURITY` value: bare, as `.ROBLOSECURITY=<value>`, or as a
 Netscape `cookies.txt`. The value is never printed. The app must not be running (`am force-stop`):
 the database is changed in place, without a journal file, so the files the app owns stay the app's.
+`--new` makes the database first, as the device's WebView makes it (its schema, version 21) -- a
+store put into an app's data before its first start, which then starts signed in.
 Stdlib only.
 """
 import sqlite3
@@ -36,11 +38,40 @@ def chromium_now():
     return int((time.time() + 11644473600) * 1_000_000)
 
 
+# The device WebView's cookie store (Chromium's net/extras/sqlite, version 21), as it writes it.
+SCHEMA = [
+    "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR)",
+    "CREATE TABLE cookies(creation_utc INTEGER NOT NULL,host_key TEXT NOT NULL,top_frame_site_key TEXT NOT NULL,"
+    "name TEXT NOT NULL,value TEXT NOT NULL,encrypted_value BLOB NOT NULL,path TEXT NOT NULL,expires_utc INTEGER NOT NULL,"
+    "is_secure INTEGER NOT NULL,is_httponly INTEGER NOT NULL,last_access_utc INTEGER NOT NULL,has_expires INTEGER NOT NULL,"
+    "is_persistent INTEGER NOT NULL,priority INTEGER NOT NULL,samesite INTEGER NOT NULL,source_scheme INTEGER NOT NULL,"
+    "source_port INTEGER NOT NULL,last_update_utc INTEGER NOT NULL)",
+    "CREATE UNIQUE INDEX cookies_unique_index ON cookies(host_key, top_frame_site_key, name, path, source_scheme, source_port)",
+]
+
+
+def create(db):
+    c = sqlite3.connect(db, isolation_level=None)
+    c.execute("PRAGMA journal_mode=OFF")
+    for statement in SCHEMA:
+        c.execute(statement)
+    c.executemany("INSERT INTO meta VALUES (?, ?)",
+                  [("mmap_status", "-1"), ("version", "21"), ("last_compatible_version", "21")])
+    c.close()
+
+
 def main():
-    db, cookie = sys.argv[1], sys.argv[2]
+    args = sys.argv[1:]
+    new = "--new" in args
+    db, cookie = [a for a in args if a != "--new"][:2]
     value = value_of(cookie)
     if not value.startswith("_|WARNING"):
         sys.exit("plant_cookie: the file does not hold a .ROBLOSECURITY value")
+    if new:
+        import os
+        if os.path.exists(db):
+            os.remove(db)
+        create(db)
     now = chromium_now()
     year = 365 * 24 * 3600 * 1_000_000
     c = sqlite3.connect(f"file:{db}?mode=rw", uri=True, isolation_level=None)

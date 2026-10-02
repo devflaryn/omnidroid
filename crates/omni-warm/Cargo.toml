@@ -1,0 +1,18 @@
+[package]
+name = "omni-warm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "The host's warm device: one Android booted and idle, that apps are installed on, started and stopped through its control channel -- for the MCP server and the `omnidroid` launcher."
+
+# A top-level tool crate, shared by omni-mcp and the omnidroid launcher: the launcher must not pull
+# omni-mcp's debugger (omni-debug, dynarmic) to reach a warm device. No OS crate and no
+# cfg(target_os) here -- files and the control channel are all it uses.
+[dependencies]
+omni-apk = { workspace = true }
+# An APK is known by its bytes' hash (the install decision).
+sha2 = { workspace = true }
