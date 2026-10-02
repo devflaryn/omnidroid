@@ -81,6 +81,8 @@ def main():
     ap.add_argument("--shots", type=float, default=1.0)
     ap.add_argument("--idle", type=float, default=20, help="seconds idle after the uninstall (a spare made again)")
     ap.add_argument("--keep", action="store_true", help="leave the app running at the end")
+    ap.add_argument("--no-allfiles", action="store_true", help="no all-files access (MANAGE_EXTERNAL_STORAGE) granted")
+    ap.add_argument("--seed-list", help="comma-separated paths (relative to the app's data) to seed instead of SEED")
     ap.add_argument("--link-in-start", action="store_true", help="the place's link on the launcher's own start intent")
     ap.add_argument("--seed", help="an app data directory of an earlier run: its caches (SEED) copied in before the start")
     a = ap.parse_args()
@@ -175,7 +177,8 @@ def main():
                  f"mkdir -p $d; cp /data/local/tmp/omni-apk/Cookies $d/Cookies; "
                  f"chown -R $uid:$uid /data/data/{PKG}/app_webview; chmod 700 /data/data/{PKG}/app_webview $d; chmod 600 $d/Cookies; "
                  f"echo planted uid $uid; ")
-    install = (f"pm install -r -d -g /data/local/tmp/omni-apk/app.apk; appops set {PKG} MANAGE_EXTERNAL_STORAGE allow; "
+    grant = "" if a.no_allfiles else f"appops set {PKG} MANAGE_EXTERNAL_STORAGE allow; "
+    install = (f"pm install -r -d -g /data/local/tmp/omni-apk/app.apk; {grant}"
                f"rm -f /data/local/tmp/omni-apk/app.apk; ")
     if a.seed:
         # The app's own caches from an earlier run (no account data), copied in on the host after
@@ -184,7 +187,7 @@ def main():
         mark("installed", said.strip()[:120])
         data = dev / f"data/data/{PKG}"
         n = 0
-        for rel in SEED:
+        for rel in (a.seed_list.split(",") if a.seed_list else SEED):
             src = Path(a.seed) / rel
             if src.is_dir():
                 shutil.copytree(src, data / rel, dirs_exist_ok=True)
