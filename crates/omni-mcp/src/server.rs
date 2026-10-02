@@ -453,7 +453,18 @@ impl Server {
 
     fn device_status(&mut self) -> Json {
         let Some(dev) = device::find() else {
-            return json::obj([("state", json::s("none"))]);
+            // "none" is not an error or a lost connection: it means no warm device is booted yet.
+            // Say so, so a caller boots one with start_instance instead of assuming the server broke.
+            return json::obj([
+                ("state", json::s("none")),
+                (
+                    "note",
+                    json::s(
+                        "no warm device is booted (this is normal, not a connection error); \
+                         call start_instance to boot one",
+                    ),
+                ),
+            ]);
         };
         let state = if dev.ready() { "ready" } else { "booting" };
         let apps = if dev.ready() {
@@ -1424,7 +1435,7 @@ static TOOLS: &[Tool] = &[
     Tool { name: "uninstall_apk", desc: "Uninstall a package from the warm device.", params: &[p!("package","string",true,"package name, e.g. com.example.app")] },
     Tool { name: "stop_app", desc: "Force-stop a package on the warm device and clear its data; the device stays warm.", params: &[p!("package","string",true,"package name")] },
     Tool { name: "shell", desc: "Run a shell command on the warm device (as adb shell would: the shell user, or `uid`): its exit status and output. E.g. `pm list packages -3`, `am start ...`, `logcat -d -t 50`, `dumpsys activity top`.", params: &[p!("command","string",true,"a /system/bin/sh command line"),p!("uid","number",false,"run as this uid (0 root, 1000 system; default 2000 shell)"),p!("timeout","number",false,"seconds (default 120)")] },
-    Tool { name: "device_status", desc: "The warm device: none, booting or ready; its directory, log, screenshot path and the test apps installed on it.", params: &[] },
+    Tool { name: "device_status", desc: "The warm device: none, booting or ready; its directory, log, screenshot path and the test apps installed on it. state=none is NORMAL (no device booted yet, not a connection error) and carries a note -- call start_instance to boot one.", params: &[] },
     Tool { name: "stop_device", desc: "Shut the warm device down (the next start_instance boots one again).", params: &[] },
     Tool { name: "launch_app", desc: "Boot the app (same as start_instance on the real-AOSP path).", params: &[p!("apk","string",false,"APK path"),p!("cookie","string",false,"cookie"),p!("place","string",false,"place id")] },
     Tool { name: "login", desc: "Record a cookie (file path or saved account name) for the next boot.", params: &[p!("cookie","string",true,"cookie file path or saved account name")] },
