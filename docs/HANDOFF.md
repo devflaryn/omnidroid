@@ -1,5 +1,21 @@
 # Handoff
 
+## `--cookie --place` ON THE WARM DEVICE (2026-10-02, Windows; branch `perf/warm-join`, not merged)
+
+Goal (owner): warm Android up, no APK installed, from the `--cookie --place` command to PS99's own
+(in-game) loading screen. Report: `docs/MORNING-2026-10-02-warm-join.md`.
+
+- `omnidroid aosp --cookie --place` uses the warm device when one is up (`crates/omnidroid/src/warm.rs`,
+  crate `omni-warm`): install + cookie store planted before the first start + start in one command,
+  the place's link at the main Activity, `warm-release` stops the app if the launcher is killed.
+  A/B 4 pairs: **92.1 -> 79.2 s** median to PS99's screen, "Joining game" 84.2 -> 43.8 s.
+- `omni-linux` owners table: a rename was a full scan (~20 ms each, Roblox's cache does hundreds)
+  and the table leaked every uninstalled app's files -- fixed (1.2 ms a rename, no growth).
+- Open: the game load after "Joining game" (10-50 s warm, 7-17 s on a saved device -- why the saved
+  device is faster there is not found yet); app start is translation-bound; MCP `start_instance` with a
+  cookie still boots its own device.
+- Measure: `tools/join_timer.py`, `tools/warm_join_bench.ps1`, `tools/warm_join_ab.ps1`.
+
 ## ANY APK IN SECONDS: THE WARM DEVICE (2026-10-01 night, Windows + Linux; branch `perf/fast-boot`, not merged)
 
 Goal (owner): an agent behind the MCP server builds APKs and tests them one after another, seconds
