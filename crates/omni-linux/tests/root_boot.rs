@@ -73,6 +73,9 @@ fn a_rooted_device_grants_root_and_applies_a_module() {
 fn a_device_without_a_profile_is_not_rooted() {
     let Some(sysroot) = common::sysroot() else { return };
     let instance = fresh_instance("plain");
+    // A guest-planted marker, with no host-only profile: it must grant nothing.
+    std::fs::create_dir_all(instance.join("data/adb/omni")).expect("data/adb/omni");
+    std::fs::write(instance.join("data/adb/omni/enabled"), b"").expect("planted marker");
     let then = "echo RB_SU=$(command -v su || echo none); \
                 echo RB_DBG=$(ls /debug_ramdisk 2>/dev/null || echo none); \
                 echo RB_FILE=$(cat /system/etc/omni-test.txt 2>/dev/null || echo none); echo RB_DONE";

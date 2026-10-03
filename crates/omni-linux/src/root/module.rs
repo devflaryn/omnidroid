@@ -14,6 +14,13 @@ pub struct ModuleProp {
     pub description: String,
 }
 
+/// Whether `name` is one safe path component: not empty, not starting with `.` (so not `.`/`..`),
+/// and with no separator or NUL. Module ids become host paths.
+#[must_use]
+pub fn is_safe_component(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\', '\0'])
+}
+
 impl ModuleProp {
     /// Parse `key=value` lines. A missing or empty `id` is an error naming it.
     pub fn parse(text: &str) -> Result<ModuleProp, String> {
@@ -48,6 +55,9 @@ impl ModuleProp {
         if p.id.is_empty() {
             return Err("module.prop: missing required field `id`".to_string());
         }
+        if !is_safe_component(&p.id) {
+            return Err(format!("module.prop: unsafe `id` {:?}", p.id));
+        }
         Ok(p)
     }
 }
@@ -72,6 +82,12 @@ impl ModuleSource {
 pub struct Module {
     pub prop: ModuleProp,
     pub source: ModuleSource,
+}
+
+/// A name `Module::list` may return: never empty, `.`/`..`, or with a separator or NUL (a zip entry
+/// can say anything; dotfiles such as `.replace` are fine).
+fn is_listable(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\\', '\0'])
 }
 
 fn norm(rel: &str) -> &str {
@@ -111,6 +127,7 @@ impl Module {
             ModuleSource::Dir(d) => {
                 let Ok(rd) = std::fs::read_dir(d.join(rel_dir)) else { return Vec::new() };
                 let mut v: Vec<String> = rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+                v.retain(|n| is_listable(n));
                 v.sort();
                 v
             }
@@ -121,7 +138,7 @@ impl Module {
                 for e in apk.entries() {
                     if let Some(rest) = e.name().strip_prefix(prefix.as_str()) {
                         let first = rest.split('/').next().unwrap_or("");
-                        if !first.is_empty() {
+                        if is_listable(first) {
                             seen.insert(first.to_string());
                         }
                     }
