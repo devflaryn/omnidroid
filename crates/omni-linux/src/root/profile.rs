@@ -25,12 +25,17 @@ pub enum Shamiko {
 }
 
 impl Profile {
+    /// Parse comma-separated values, dropping empty entries.
+    fn parse_comma_list(s: &str) -> Vec<String> {
+        s.split(',').map(|item| item.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    }
+
     /// Parse a root profile from text (line-oriented key=value format).
     pub fn parse(text: &str) -> Self {
         let mut rooted = false;
         let mut magisk_code = 0;
         let mut module_ids = Vec::new();
-        let mut su = SuPolicy::All; // Default
+        let mut su = SuPolicy::Packages(vec![]); // Default: empty packages (only root/shell)
         let mut denylist = Vec::new();
         let mut shamiko = Shamiko::Off;
 
@@ -52,24 +57,23 @@ impl Profile {
                         magisk_code = value.trim().parse().unwrap_or(0);
                     }
                     "module" => {
-                        module_ids.push(value.trim().to_string());
+                        let id = value.trim().to_string();
+                        if !id.is_empty() {
+                            module_ids.push(id);
+                        }
                     }
                     "su" => {
                         let val = value.trim();
                         if val == "all" {
                             su = SuPolicy::All;
                         } else {
-                            // Parse comma-separated packages, or handle multiple su= lines
-                            let packages: Vec<String> = val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                            if !packages.is_empty() {
-                                su = SuPolicy::Packages(packages);
-                            }
+                            // Parse comma-separated packages (empty → Packages(vec![]))
+                            su = SuPolicy::Packages(Self::parse_comma_list(val));
                         }
                     }
                     "denylist" => {
                         // Parse comma-separated packages
-                        let packages: Vec<String> = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                        denylist.extend(packages);
+                        denylist.extend(Self::parse_comma_list(value));
                     }
                     "shamiko" => {
                         let val = value.trim();
@@ -106,9 +110,8 @@ impl Profile {
         match &self.su {
             SuPolicy::All => lines.push("su=all".to_string()),
             SuPolicy::Packages(pkgs) => {
-                for pkg in pkgs {
-                    lines.push(format!("su={}", pkg));
-                }
+                // Serialize as one line: su=<comma-joined> (empty list → su=)
+                lines.push(format!("su={}", pkgs.join(",")));
             }
         }
 
@@ -177,5 +180,26 @@ mod tests {
         assert!(p.su_allowed(0));              // root always
         assert!(p.su_allowed(2000));           // shell always
         assert!(!p.su_allowed(10234));         // a package policy denies other uids in R1
+    }
+
+    #[test]
+    fn multi_package_su_round_trips() {
+        let text = "root=1\nsu=a,b\n";
+        let p = Profile::parse(text);
+        assert_eq!(p.su, SuPolicy::Packages(vec!["a".to_string(), "b".to_string()]));
+        // Serialize and parse back: must preserve both packages
+        let serialized = p.serialize();
+        let p2 = Profile::parse(&serialized);
+        assert_eq!(p2.su, SuPolicy::Packages(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(p2.serialize(), serialized);
+    }
+
+    #[test]
+    fn no_su_line_defaults_to_empty_packages() {
+        let p = Profile::parse("root=1\n");
+        assert_eq!(p.su, SuPolicy::Packages(vec![]));
+        assert!(p.su_allowed(0));              // root always
+        assert!(p.su_allowed(2000));           // shell always
+        assert!(!p.su_allowed(10234));         // other uids denied with empty packages
     }
 }
