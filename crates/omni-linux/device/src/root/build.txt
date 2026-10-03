@@ -1,0 +1,9 @@
+Built on Windows with the Android NDK r28c (android-ndk-r28c-windows.zip from dl.google.com),
+from the repository root:
+
+    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -fPIC -o crates/omni-linux/device/root/magisk crates/omni-linux/device/src/root/magisk.c
+
+The executable is committed so the runtime and its tests never need the NDK; ../SHA256SUMS pins it.
+It is our own source (not Magisk's). Dynamically linked against libc.so (and libdl.so from the driver).
+One binary serves su, resetprop and magisk by basename(argv[0]); it talks to the engine via the
+omni_root syscall (nr 510).
