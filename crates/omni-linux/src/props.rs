@@ -530,12 +530,22 @@ impl PropertyService {
         let changed_info = match live.info.get(name).copied() {
             Some(_) if name.starts_with("ro.") && !force => return PROP_ERROR_READ_ONLY_PROPERTY,
             Some(at) => {
-                let old = live.area.u32_at(at);
-                let serial = ((value.len() as u32) << 24) | (old.wrapping_add(2) & 0x00ff_fffe);
-                live.area.data[at + 4..at + 4 + PROP_VALUE_MAX].fill(0);
-                live.area.data[at + 4..at + 4 + value.len()].copy_from_slice(value.as_bytes());
-                live.area.set_u32(at, serial);
-                at
+                // Long values (>= PROP_VALUE_MAX) cannot be stored in-place. Route through append.
+                if value.len() >= PROP_VALUE_MAX {
+                    if HEADER + live.area.data.len() + 512 + value.len() > live.capacity {
+                        return PROP_ERROR_INVALID_VALUE; // the area is full
+                    }
+                    let new_at = live.area.add(name, value);
+                    live.info.insert(name.to_string(), new_at);
+                    new_at
+                } else {
+                    let old = live.area.u32_at(at);
+                    let serial = ((value.len() as u32) << 24) | (old.wrapping_add(2) & 0x00ff_fffe);
+                    live.area.data[at + 4..at + 4 + PROP_VALUE_MAX].fill(0);
+                    live.area.data[at + 4..at + 4 + value.len()].copy_from_slice(value.as_bytes());
+                    live.area.set_u32(at, serial);
+                    at
+                }
             }
             None => {
                 if HEADER + live.area.data.len() + 512 + value.len() > live.capacity {
@@ -577,27 +587,37 @@ impl PropertyService {
     }
 
     /// Remove a property so `get` returns `None`. Returns whether it existed.
+    /// Models deletion as "empty value + host-invisible": the in-area record is overwritten with
+    /// an empty value before removal from the host info map, so guest readers observe the change.
     pub fn delete(&self, name: &str) -> bool {
         let _publishing = self.publish.lock();
         let mut live = self.live.lock();
-        let existed = live.info.remove(name).is_some();
-        if existed {
-            live.serial = live.serial.wrapping_add(1);
-            let area = live.area.bytes(live.serial, live.capacity);
-            let used = if crate::mm::full_prop_copy() { area.len() } else { (HEADER + live.area.data.len()).min(area.len()) };
-            let serial_area = Area::new().bytes(live.serial, 0);
-            live.mappings.retain(|(p, _, _)| p.strong_count() > 0);
-            let targets: Vec<_> = live.mappings.iter().filter_map(|(p, at, s)| p.upgrade().map(|p| (p, *at, *s))).collect();
-            drop(live);
-            self.changed.notify_all();
-            for (p, at, serial) in targets {
-                let bytes = if serial { &serial_area[..HEADER] } else { &area[..used] };
-                if p.mm.kernel_write(&p.mem, at, bytes).is_ok() {
-                    let _ = p.futexes.wake(at + 4, i32::MAX as u64, u32::MAX);
-                }
+        let at = match live.info.get(name).copied() {
+            Some(at) => at,
+            None => return false,
+        };
+        // Overwrite the in-area record to empty so guests see the deletion.
+        let old = live.area.u32_at(at);
+        let serial = (0u32 << 24) | (old.wrapping_add(2) & 0x00ff_fffe);
+        live.area.data[at + 4..at + 4 + PROP_VALUE_MAX].fill(0);
+        live.area.set_u32(at, serial);
+        // Remove from host-side info after the area is updated.
+        live.info.remove(name);
+        live.serial = live.serial.wrapping_add(1);
+        let area = live.area.bytes(live.serial, live.capacity);
+        let used = if crate::mm::full_prop_copy() { area.len() } else { (HEADER + live.area.data.len()).min(area.len()) };
+        let serial_area = Area::new().bytes(live.serial, 0);
+        live.mappings.retain(|(p, _, _)| p.strong_count() > 0);
+        let targets: Vec<_> = live.mappings.iter().filter_map(|(p, at, s)| p.upgrade().map(|p| (p, *at, *s))).collect();
+        drop(live);
+        self.changed.notify_all();
+        for (p, at, serial) in targets {
+            let bytes = if serial { &serial_area[..HEADER] } else { &area[..used] };
+            if p.mm.kernel_write(&p.mem, at, bytes).is_ok() {
+                let _ = p.futexes.wake(at + 4, i32::MAX as u64, u32::MAX);
             }
         }
-        existed
+        true
     }
 }
 
@@ -635,12 +655,56 @@ mod tests {
         let svc = PropertyService::for_test(&root);
         // An existing ro.* cannot be changed by set...
         let name = "ro.build.tags";
-        svc.set(name, "release-keys");
+        assert_eq!(svc.set(name, "release-keys"), PROP_SUCCESS);
         assert_eq!(svc.set(name, "test-keys"), PROP_ERROR_READ_ONLY_PROPERTY);
         // ...but set_forced changes it.
         assert_eq!(svc.set_forced(name, "test-keys"), PROP_SUCCESS);
         assert_eq!(svc.get(name).as_deref(), Some("test-keys"));
         assert!(svc.delete(name));
         assert_eq!(svc.get(name), None);
+    }
+
+    #[test]
+    fn set_forced_long_value_on_existing_property_does_not_corrupt_neighbors() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test(&root);
+        // Set two short properties.
+        let name1 = "ro.test.prop1";
+        let name2 = "ro.test.prop2";
+        assert_eq!(svc.set(name1, "short1"), PROP_SUCCESS);
+        assert_eq!(svc.set(name2, "short2"), PROP_SUCCESS);
+        // Overwrite name1 with a long value via set_forced (length >= PROP_VALUE_MAX).
+        let long_value = "x".repeat(100); // 100 bytes, >= PROP_VALUE_MAX (92)
+        assert_eq!(svc.set_forced(name1, &long_value), PROP_SUCCESS);
+        // Verify name1 has the full long value.
+        assert_eq!(svc.get(name1).as_deref(), Some(long_value.as_str()));
+        // Verify name2 is still intact (not corrupted by the long value write).
+        assert_eq!(svc.get(name2).as_deref(), Some("short2"));
+    }
+
+    #[test]
+    fn delete_of_missing_property_returns_false() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test(&root);
+        assert!(!svc.delete("ro.nonexistent.prop"));
+    }
+
+    #[test]
+    fn delete_makes_get_return_none_and_advances_serial() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test(&root);
+        let name = "ro.test.deletable";
+        assert_eq!(svc.set(name, "value"), PROP_SUCCESS);
+        assert_eq!(svc.get(name).as_deref(), Some("value"));
+        // Get the area before delete.
+        let area_before = svc.area_bytes();
+        let serial_before = u32::from_le_bytes(area_before[4..8].try_into().unwrap());
+        // Delete the property.
+        assert!(svc.delete(name));
+        assert_eq!(svc.get(name), None);
+        // Verify serial advanced.
+        let area_after = svc.area_bytes();
+        let serial_after = u32::from_le_bytes(area_after[4..8].try_into().unwrap());
+        assert!(serial_after > serial_before);
     }
 }
