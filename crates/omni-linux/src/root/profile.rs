@@ -175,6 +175,45 @@ impl Profile {
     }
 }
 
+/// File name of the host-only profile, directly in the instance directory (like `.omni-binds`).
+/// It is deliberately NOT under `<instance>/data`, which the guest can write: a guest must never be
+/// able to make its own device rooted.
+pub const PROFILE_FILE: &str = ".omni-root-profile";
+
+#[derive(Default)]
+struct ProfileCell {
+    /// The file's mtime when last read, when that was checked, and the parsed profile (rooted only).
+    state: parking_lot::Mutex<(Option<std::time::SystemTime>, Option<std::time::Instant>, Option<std::sync::Arc<Profile>>)>,
+}
+
+impl Profile {
+    /// The rooted profile of the instance at `instance`, read from `<instance>/.omni-root-profile`:
+    /// `None` when the file is absent or the device is not rooted. One cache per instance
+    /// directory, re-read when the file's mtime changes (checked at most once a second), as
+    /// [`crate::vfs::Binds::of`] does.
+    #[must_use]
+    pub fn of(instance: &std::path::Path) -> Option<std::sync::Arc<Profile>> {
+        use std::collections::HashMap;
+        use std::sync::{Arc, OnceLock};
+        static CELLS: OnceLock<parking_lot::Mutex<HashMap<std::path::PathBuf, Arc<ProfileCell>>>> = OnceLock::new();
+        let cell = Arc::clone(CELLS.get_or_init(Default::default).lock().entry(instance.to_path_buf()).or_default());
+        let file = instance.join(PROFILE_FILE);
+        let mut st = cell.state.lock();
+        let now = std::time::Instant::now();
+        if st.1.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(1)) {
+            return st.2.clone();
+        }
+        st.1 = Some(now);
+        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        if modified.is_some() && modified == st.0 {
+            return st.2.clone();
+        }
+        st.0 = modified;
+        st.2 = std::fs::read_to_string(&file).ok().map(|t| Profile::parse(&t)).filter(Profile::is_rooted).map(Arc::new);
+        st.2.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

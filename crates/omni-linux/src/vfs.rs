@@ -476,6 +476,8 @@ pub struct Vfs {
     /// The owners and modes of the writable mounts' files.
     owners: Arc<crate::owners::Owners>,
     exe: Vec<u8>,
+    /// The root layer over `/system` (modules, su tools), when the instance is rooted.
+    root_layer: Option<Arc<crate::root::Layer>>,
     /// `/proc` and `/sys`, once the process exists (`attach_proc`).
     proc: std::sync::OnceLock<std::sync::Weak<dyn crate::procfs::ProcFs>>,
 }
@@ -552,20 +554,27 @@ fn split(path: &[u8]) -> Vec<Vec<u8>> {
 impl Vfs {
     #[must_use]
     pub fn new(sysroot: Arc<Sysroot>, writable: Vec<(Vec<u8>, PathBuf)>, exe: Vec<u8>) -> Self {
-        Self { sysroot, writable, binds: Arc::default(), owners: crate::owners::Owners::detached(), exe, proc: std::sync::OnceLock::new() }
+        Self { sysroot, writable, binds: Arc::default(), owners: crate::owners::Owners::detached(), exe, root_layer: None, proc: std::sync::OnceLock::new() }
     }
 
     /// The same filesystem (sysroot, writable mounts, bind mounts) for a process running `exe`:
     /// a fork child, or the program `execve` loads.
     #[must_use]
     pub fn for_exec(&self, exe: Vec<u8>) -> Self {
-        Self { sysroot: Arc::clone(&self.sysroot), writable: self.writable.clone(), binds: Arc::clone(&self.binds), owners: Arc::clone(&self.owners), exe, proc: std::sync::OnceLock::new() }
+        Self { sysroot: Arc::clone(&self.sysroot), writable: self.writable.clone(), binds: Arc::clone(&self.binds), owners: Arc::clone(&self.owners), exe, root_layer: self.root_layer.clone(), proc: std::sync::OnceLock::new() }
     }
 
     /// This VFS with the instance's bind mounts (shared with its other processes).
     #[must_use]
     pub fn with_binds(mut self, binds: Arc<Binds>) -> Self {
         self.binds = binds;
+        self
+    }
+
+    /// This VFS with the instance's root layer over `/system` (`None`: not rooted, nothing changes).
+    #[must_use]
+    pub fn with_root_layer(mut self, layer: Option<Arc<crate::root::Layer>>) -> Self {
+        self.root_layer = layer;
         self
     }
 
@@ -697,6 +706,15 @@ impl Vfs {
                 Err(_) => None,
             };
         }
+        if let Some(l) = &self.root_layer {
+            match l.lookup(path) {
+                // A directory the layer only lies under: the image's own directory, if it has one.
+                Some(Node::Dir) if self.sysroot.entry(path).is_some() => {}
+                Some(n) => return Some(n),
+                None if l.hides(path) => return None,
+                None => {}
+            }
+        }
         match self.sysroot.entry(path)? {
             Entry::Dir { .. } => Some(Node::Dir),
             Entry::File { size, mode, .. } => Some(Node::SysFile { size: *size, mode: *mode }),
@@ -806,11 +824,20 @@ impl Vfs {
                 }
                 for name in self.sysroot.children.get(&dir.path).into_iter().flatten() {
                     let path = child(name);
-                    if out.iter().any(|e| &e.name == name) {
+                    if out.iter().any(|e| &e.name == name) || self.root_layer.as_ref().is_some_and(|l| l.hides(&path)) {
                         continue;
                     }
                     if let Some(node) = self.lookup(&path) {
                         out.push(DirEnt { name: name.clone(), kind: kind_of(&node), ino: ino_of(&path) });
+                    }
+                }
+                if let Some(l) = &self.root_layer {
+                    for (name, node) in l.children(&dir.path) {
+                        let ent = DirEnt { kind: kind_of(&node), ino: ino_of(&child(&name)), name };
+                        match out.iter_mut().find(|e| e.name == ent.name) {
+                            Some(e) => *e = ent,
+                            None => out.push(ent),
+                        }
                     }
                 }
                 Ok(out)

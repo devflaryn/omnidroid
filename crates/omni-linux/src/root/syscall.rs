@@ -8,7 +8,7 @@ const OP_ELEVATE: u64 = 1;
 const OP_STATUS: u64 = 2;
 
 fn sys_omni_root(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    let profile = super::profile_of(p).filter(|pr| pr.is_rooted()).ok_or(ENOSYS)?;
+    let profile = p.vfs.binds().instance_dir().and_then(super::Profile::of).ok_or(ENOSYS)?;
     match a[0] {
         OP_ELEVATE => {
             let target = if a[1] == u64::from(u32::MAX) { 0 } else { a[1] as u32 };
