@@ -80,6 +80,8 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
        omnidroid aosp [--apk <path>] [--cookie <file|name>] [--place <id>] [--minutes <n>]
                       [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
                       [--fresh-device] [--standby] [--instance <dir>]
+                      [--root] [--module <id,id,...>] [--su all|<pkg,pkg>]
+       omnidroid modules [list | add <zip>]
        omnidroid aosp --warm [--instance <dir>] [--minutes <n>] [--size <w>x<h>] [--gpu vulkan|gl|auto]
        omnidroid which [--apk <path>]
        omnidroid login [<username> [<password>]] [--dir <dir>]
@@ -120,6 +122,11 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                     before its first start, the place's link sent once the app's main Activity
                     starts; the app is stopped when the session ends, the device stays warm
                     (not with --instance, --standby or --fresh-device; OMNI_AOSP_WARM=0: never)
+  aosp --root      a rooted device (Magisk-compatible: su, modules over /system, resetprop);
+                    --module installs the named modules (implies --root), --su all lets every
+                    app su (default: root and shell only). A rooted device is its own saved
+                    and warm device -- never one made without root or with other modules.
+                    `omnidroid modules` lists the module catalog; `modules add <zip>` adds one.
   aosp --warm      a warm device: Android booted and idle with no app (no --apk), for apps a
                     host program installs, starts and stops on it through its control channel
                     (<instance>.ctl: a shell command in <id>.cmd, its output in <id>.out and exit
@@ -164,6 +171,9 @@ fn main() -> ExitCode {
     // The helper a warm-device session leaves behind to stop its app once the session is gone.
     if command.as_deref() == Some("warm-release") {
         return warm::release(&rest);
+    }
+    if command.as_deref() == Some("modules") {
+        return modules_command(&rest);
     }
     let args = rest.into_iter();
     if command.as_deref() == Some("aosp") {
@@ -717,6 +727,12 @@ struct AospOptions {
     standby: bool,
     warm: bool,
     instance: Option<PathBuf>,
+    /// A rooted device (`--root`; `--module` implies it).
+    root: bool,
+    /// The root modules to install (`--module a,b,c`).
+    modules: Vec<String>,
+    /// Who may `su`: `all`, or comma-separated packages (`--su`).
+    su: Option<String>,
 }
 
 fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, String> {
@@ -733,6 +749,9 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
         standby: false,
         warm: false,
         instance: None,
+        root: false,
+        modules: Vec::new(),
+        su: None,
     };
     let mut minutes_given = false;
     while let Some(arg) = args.next() {
@@ -778,6 +797,13 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
             "--standby" => options.standby = true,
             "--warm" => options.warm = true,
             "--instance" => options.instance = Some(PathBuf::from(value("--instance")?)),
+            "--root" => options.root = true,
+            "--module" => {
+                let text = value("--module")?;
+                options.modules.extend(text.split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string));
+                options.root = true;
+            }
+            "--su" => options.su = Some(value("--su")?),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -818,7 +844,89 @@ fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'
     if let Some(dir) = &options.instance {
         env.push(("OMNI_R_INSTANCE", dir.display().to_string()));
     }
+    if options.root {
+        env.push(("OMNI_R_ROOT", "1".to_string()));
+        if !options.modules.is_empty() {
+            env.push(("OMNI_R_MODULES", options.modules.join(",")));
+        }
+        if let Some(su) = &options.su {
+            env.push(("OMNI_R_SU", su.clone()));
+        }
+    }
     env
+}
+
+/// Every module id asked for must be in the catalog: said before anything boots.
+fn validate_modules(ids: &[String], catalog: &omni_linux::root::Catalog) -> Result<(), String> {
+    for id in ids {
+        if catalog.find(id).is_none() {
+            let known: Vec<&str> = catalog.list().iter().map(|m| m.prop.id.as_str()).collect();
+            return Err(format!(
+                "unknown module `{id}` (known: {}); `omnidroid modules` lists them, `omnidroid modules add <zip>` adds one",
+                if known.is_empty() { "none".to_string() } else { known.join(", ") }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The module catalog: the repository's `modules/` and the user's directory.
+fn module_catalog() -> Result<omni_linux::root::Catalog, String> {
+    use omni_linux::root::module;
+    omni_linux::root::Catalog::discover(&module::builtin_dir(&repo_root()), module::user_dir().as_deref())
+}
+
+/// `omnidroid modules [list | add <zip>]`.
+fn modules_command(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        None | Some("list") if args.len() <= 1 => match module_catalog() {
+            Ok(catalog) => {
+                if catalog.list().is_empty() {
+                    println!("no modules (the repository's modules/ and the user directory are empty)");
+                }
+                for m in catalog.list() {
+                    let source = match &m.source {
+                        omni_linux::root::ModuleSource::Dir(p) | omni_linux::root::ModuleSource::Zip(p) => p.display().to_string(),
+                    };
+                    println!("{}\t{}\t{}\t{source}", m.prop.id, m.prop.name, m.prop.version);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("omnidroid: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("add") if args.len() == 2 => match add_module(Path::new(&args[1])) {
+            Ok(message) => {
+                println!("{message}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("omnidroid: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        _ => {
+            eprintln!("omnidroid: usage: omnidroid modules [list | add <zip>]");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Copy a module zip into the user directory as `<id>.zip`, once its `module.prop` parses.
+fn add_module(zip: &Path) -> Result<String, String> {
+    let apk = omni_apk::Apk::open(zip).map_err(|e| format!("{}: not a zip: {e}", zip.display()))?;
+    let bytes = apk.read_named("module.prop").map_err(|e| format!("{}: no module.prop: {e}", zip.display()))?;
+    let prop = omni_linux::root::ModuleProp::parse(&String::from_utf8_lossy(&bytes)).map_err(|e| format!("{}: {e}", zip.display()))?;
+    if module_catalog()?.find(&prop.id).is_some() {
+        return Err(format!("module `{}` is already in the catalog", prop.id));
+    }
+    let dir = omni_linux::root::user_dir().ok_or("no user module directory (set OMNI_MODULES)")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let to = dir.join(format!("{}.zip", prop.id));
+    std::fs::copy(zip, &to).map_err(|e| format!("{}: {e}", to.display()))?;
+    Ok(format!("added {} ({} {}) as {}", prop.id, prop.name, prop.version, to.display()))
 }
 
 /// Where the session's instance (the device's `/data`, its log, its screenshots) is made: the temp
@@ -848,6 +956,22 @@ fn is_tmpfs(dir: &Path) -> bool {
 
 /// `omnidroid aosp`: the real-AOSP session in a live window (see USAGE).
 fn aosp(options: &AospOptions) -> ExitCode {
+    // Root is checked before anything boots: an unknown module, or the Magisk assets not fetched
+    // (`tools/fetch_magisk.py`), is an error here -- never a half-rooted device.
+    let root_hash = if options.root {
+        let checked = module_catalog().and_then(|catalog| validate_modules(&options.modules, &catalog)).and_then(|()| {
+            omni_linux::root::key::request(&repo_root(), &options.modules, options.su.as_deref())
+        });
+        match checked {
+            Ok(request) => Some(request.hash),
+            Err(message) => {
+                eprintln!("omnidroid: {message}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
     // A warm device has no APK of its own.
     let apk_path = if options.warm {
         println!("Omnidroid (real AOSP): a warm device, no app");
@@ -883,7 +1007,7 @@ fn aosp(options: &AospOptions) -> ExitCode {
     // device beside it would only take the host's memory). Not for a session that names its own
     // device (--instance, --standby, --fresh-device), nor with OMNI_AOSP_WARM=0.
     if !options.warm && !options.standby && !options.fresh_device && options.instance.is_none() {
-        if let Some(dev) = warm::usable() {
+        if let Some(dev) = warm::usable(root_hash.as_deref()) {
             if options.size.is_some() || options.gpu.is_some() || options.with_systemui {
                 println!("Omnidroid: --size, --gpu and --with-systemui are the warm device's own (set when it booted); not applied");
             }
@@ -991,6 +1115,37 @@ mod tests {
         assert!(!cookie_is_new_for(&dir, VALUE), "the same file again: the store's cookie is kept");
         assert!(cookie_is_new_for(&dir, "_|WARNING:-a-new-export|_X"), "a new export is planted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_aosp_reads_root_and_modules() {
+        let parse = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string()));
+        let o = parse(&["--module", "zygisk-frida,emu-hide", "--su", "all"]).unwrap();
+        assert!(o.root, "--module implies --root");
+        assert_eq!(o.modules, vec!["zygisk-frida".to_string(), "emu-hide".to_string()]);
+        assert_eq!(o.su.as_deref(), Some("all"));
+        let o = parse(&["--root"]).unwrap();
+        assert!(o.root && o.modules.is_empty() && o.su.is_none());
+        let o = parse(&[]).unwrap();
+        assert!(!o.root && o.modules.is_empty(), "unrooted by default");
+    }
+
+    #[test]
+    fn unknown_module_id_is_rejected() {
+        let empty = omni_linux::root::Catalog { modules: Vec::new() };
+        let err = validate_modules(&["ghost".to_string()], &empty).unwrap_err();
+        assert!(err.contains("ghost"), "{err}");
+        assert!(validate_modules(&[], &empty).is_ok());
+    }
+
+    #[test]
+    fn root_options_reach_the_session_environment_and_unrooted_adds_none() {
+        let parse = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string())).unwrap();
+        let env = aosp_env(&parse(&["--module", "a,b", "--su", "all"]), Path::new("x.apk"), None);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        assert_eq!((get("OMNI_R_ROOT"), get("OMNI_R_MODULES"), get("OMNI_R_SU")), (Some("1"), Some("a,b"), Some("all")));
+        let plain = aosp_env(&parse(&[]), Path::new("x.apk"), None);
+        assert!(plain.iter().all(|(n, _)| !n.starts_with("OMNI_R_ROOT") && *n != "OMNI_R_MODULES" && *n != "OMNI_R_SU"));
     }
 
     #[test]

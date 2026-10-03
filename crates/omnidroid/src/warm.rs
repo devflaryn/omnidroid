@@ -29,12 +29,19 @@ const MAIN_STARTED: &str = "/.ActivityNativeMain}";
 const LINK_RETRY: Duration = Duration::from_secs(60);
 const LINK_TRIES: u32 = 4;
 
-/// The warm device a session can use now: up and ready, unless `OMNI_AOSP_WARM=0`.
-pub fn usable() -> Option<device::Device> {
+/// The warm device a session can use now: up and ready, unless `OMNI_AOSP_WARM=0`, and of the same
+/// root profile as the request (`root_hash`: `None` for an unrooted request, which an unrooted
+/// device serves as it always did). A device of another profile is not reused.
+pub fn usable(root_hash: Option<&str>) -> Option<device::Device> {
     if std::env::var("OMNI_AOSP_WARM").as_deref() == Ok("0") {
         return None;
     }
-    device::find().filter(device::Device::ready)
+    let dev = device::find().filter(device::Device::ready)?;
+    if dev.root_hash().as_deref() != root_hash {
+        println!("[warm] root profile differs: booting a new device");
+        return None;
+    }
+    Some(dev)
 }
 
 /// The place's link, as a link opened on a device.

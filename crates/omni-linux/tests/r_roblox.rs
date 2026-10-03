@@ -175,6 +175,13 @@ const DEVICE_SETUP: u32 = 2;
 /// The saved device for this APK, account and device setup under `root`: a new APK, a new cookie
 /// file or another setup is another device.
 fn golden_dir(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool, locale: &str) -> PathBuf {
+    golden_dir_rooted(root, apk, cookie, kiosk, locale, None)
+}
+
+/// `golden_dir` for a rooted device: `-root-<hash>` (`root::key::root_hash`) is appended, so a
+/// rooted device is never an unrooted one, nor one with other modules. `None`: the unrooted key,
+/// unchanged.
+fn golden_dir_rooted(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool, locale: &str, root_hash: Option<&str>) -> PathBuf {
     let stamp = |p: &Path| {
         std::fs::metadata(p).map_or((0, 0), |m| {
             let at = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
@@ -184,8 +191,31 @@ fn golden_dir(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool, local
     let stem = |p: &Path| p.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
     let (apk_len, _) = stamp(apk);
     let account = cookie.map_or_else(|| "guest".to_string(), |c| format!("{}-{}", stem(c), stamp(c).1));
-    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}", stem(apk), if kiosk { "kiosk" } else { "ui" });
+    let rooted = root_hash.map_or_else(String::new, |h| format!("-root-{h}"));
+    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}", stem(apk), if kiosk { "kiosk" } else { "ui" });
     root.join(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>())
+}
+
+/// The repository this test was built from.
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(Path::parent).expect("crates/omni-linux has two ancestors").to_path_buf()
+}
+
+/// The rooted device `OMNI_R_ROOT` / `OMNI_R_MODULES` / `OMNI_R_SU` ask for, if any. Missing Magisk
+/// assets (or an unknown module) stop the run: a half-rooted device is never booted.
+fn root_request() -> Option<omni_linux::root::key::Request> {
+    match omni_linux::root::key::from_env(&repo_root()) {
+        Ok(request) => request,
+        Err(e) => panic!("the rooted device cannot be made: {e} (the Magisk assets: run `python tools/fetch_magisk.py`)"),
+    }
+}
+
+/// Stage `instance` as `request` says, before the device boots (a fresh device only: a saved or
+/// warm device of the same root hash was staged when it was made, and staging again would delete and
+/// recopy the modules, losing what they wrote since).
+fn stage_root(instance: &Path, request: &omni_linux::root::key::Request) {
+    omni_linux::root::install::stage(instance, &request.profile, &request.catalog, &request.assets).unwrap_or_else(|e| panic!("staging the root: {e}"));
+    eprintln!("[r] rooted device staged (root profile {})", request.hash);
 }
 
 /// The place's deep link, as a link opened on a device, up to four times (the app sometimes
@@ -316,7 +346,9 @@ fn the_apk_is_installed_started_and_draws() {
     // installed, compiled, signed-in device -- no first boot (the APEXes decompressed, the packages
     // scanned, the roles granted), no install, no cookie planted -- and opens the place's link at
     // once, the app starting cold on it. A saved device whose app never signs in is set aside.
-    let golden = std::env::var_os("OMNI_R_GOLDEN").map(|root| golden_dir(Path::new(&root), &apk, cookie.as_deref(), kiosk, &locale_name));
+    let root_req = root_request();
+    let golden = std::env::var_os("OMNI_R_GOLDEN")
+        .map(|root| golden_dir_rooted(Path::new(&root), &apk, cookie.as_deref(), kiosk, &locale_name, root_req.as_ref().map(|r| r.hash.as_str())));
     let warm = golden.as_ref().is_some_and(|g| g.join("ready").exists());
     let saving = !warm && golden.is_some();
     // The script of a saved device's boot: the place at once, or the app's launcher.
@@ -347,6 +379,9 @@ fn the_apk_is_installed_started_and_draws() {
     } else {
         std::fs::create_dir_all(&tmp).expect("/data/local/tmp");
         std::fs::copy(&apk, tmp.join("app.apk")).expect("the APK");
+        if let Some(request) = &root_req {
+            stage_root(&instance, request);
+        }
         // A device to be saved: signed in, the app given time to write what its first start
         // writes, stopped, and the disk synced -- then the host saves it (below).
         // With no account, the app's first start (its screen up, 30 s) is what is saved.
@@ -562,8 +597,10 @@ fn warm_device(sysroot: &Path) {
     let locale_name = std::env::var("OMNI_R_LOCALE").unwrap_or_else(|_| "tr-TR".into());
     let args = boot_args(&format!("persist.sys.locale={locale_name}"));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let root_req = root_request();
+    let rooted_key = root_req.as_ref().map_or_else(String::new, |r| format!("-root-{}", r.hash));
     let golden = std::env::var_os("OMNI_R_GOLDEN")
-        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}", if kiosk { "kiosk" } else { "ui" })));
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}{rooted_key}", if kiosk { "kiosk" } else { "ui" })));
     let saved = golden.as_ref().filter(|g| g.join("ready").exists());
     // Up: the screen woken, then ready for an app.
     let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");
@@ -574,9 +611,17 @@ fn warm_device(sysroot: &Path) {
         ready.clone()
     } else {
         std::fs::create_dir_all(instance.join("data/local/tmp")).expect("/data/local/tmp");
+        if let Some(request) = &root_req {
+            stage_root(&instance, request);
+        }
         let rest = if golden.is_some() { "sync; sleep 2; echo \"[r] device quiet\"; ".to_string() } else { "echo \"[r] warm ready\"; ".to_string() };
         format!("{BOOTED}{}{rest}", settings_script())
     };
+    // A rooted warm device says which root profile it has (`omni_warm::ROOT_HASH_FILE`): a request
+    // of another profile does not reuse it. An unrooted one writes nothing.
+    if let Some(request) = &root_req {
+        std::fs::write(instance.join("root-hash"), format!("{}\n", request.hash)).expect("the root hash");
+    }
     let kept = instance.clone();
     let in_tmp = |name: &str| kept.join("data/local/tmp").join(name);
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);
@@ -603,4 +648,22 @@ fn warm_device(sysroot: &Path) {
         }
     }
     eprintln!("[r] warm device ended{}", if in_tmp("stop").exists() { " as asked (/data/local/tmp/stop)" } else { "" });
+}
+
+#[test]
+fn golden_key_separates_rooted_devices_and_leaves_unrooted_unchanged() {
+    use omni_linux::root::key::root_hash;
+    let root = std::env::temp_dir();
+    let apk = root.join("x.apk");
+    let plain = golden_dir(&root, &apk, None, true, "tr-TR");
+    // The unrooted key as it was before rooted devices existed.
+    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}")), "the unrooted key is unchanged");
+    let a = root_hash("root=1\nmodule=a\n", &[("a", "sha_a")], 29000, "bin");
+    let b = root_hash("root=1\nmodule=a\nmodule=b\n", &[("a", "sha_a"), ("b", "sha_b")], 29000, "bin");
+    let rooted = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&a));
+    let rooted_b = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&b));
+    assert_ne!(plain, rooted, "rooted differs from unrooted");
+    assert_ne!(rooted, rooted_b, "the module set changes the key");
+    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}")));
+    assert_eq!(plain, golden_dir_rooted(&root, &apk, None, true, "tr-TR", None));
 }

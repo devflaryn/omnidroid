@@ -1,0 +1,129 @@
+//! What a launcher needs to turn root on: the profile a request describes, the catalog and assets
+//! it stages from, and the short hash that keeps rooted saved/warm devices apart from the rest.
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
+use super::module::{is_listable, Module};
+use super::profile::SuPolicy;
+use super::{Catalog, MagiskAssets, Profile};
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn walk(module: &Module, rel: &str, h: &mut Sha256) {
+    for name in module.list(rel) {
+        if !is_listable(&name) {
+            continue;
+        }
+        let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+        if !module.list(&child).is_empty() {
+            walk(module, &child, h);
+        } else if let Some(bytes) = module.read(&child) {
+            h.update(format!("f {child} {}\n", bytes.len()).as_bytes());
+            h.update(&bytes);
+        } else if module.has(&child) {
+            h.update(format!("d {child}\n").as_bytes());
+        }
+    }
+}
+
+/// A module's content hash: its files' relative paths and bytes, in sorted order (the same walk
+/// `install::stage` copies by), so a folder and a zip of the same files agree.
+#[must_use]
+pub fn module_sha(module: &Module) -> String {
+    let mut h = Sha256::new();
+    walk(module, "", &mut h);
+    hex(&h.finalize())
+}
+
+/// The first 8 hex digits of the SHA-256 of the profile text, each module's `(id, sha)`, the Magisk
+/// version code and the `magisk` binary's sha: the device's root identity.
+#[must_use]
+pub fn root_hash(profile_text: &str, modules: &[(&str, &str)], magisk_code: u32, magisk_sha: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(format!("profile\n{profile_text}\n").as_bytes());
+    for (id, sha) in modules {
+        h.update(format!("module {id} {sha}\n").as_bytes());
+    }
+    h.update(format!("magisk {magisk_code}\nbinary {magisk_sha}\n").as_bytes());
+    hex(&h.finalize())[..8].to_string()
+}
+
+/// The `magisk` tool binary's sha-256, as hex.
+#[must_use]
+pub fn magisk_binary_sha() -> String {
+    hex(&Sha256::digest(super::tools::magisk_binary()))
+}
+
+/// A rooted device as asked for: what to stage and the hash that names it.
+pub struct Request {
+    pub profile: Profile,
+    pub catalog: Catalog,
+    pub assets: MagiskAssets,
+    pub hash: String,
+}
+
+/// Build the request for `modules` and `su` (`all`, or comma-separated packages; `None`: only
+/// root/shell may su). Errors say what is wrong: an unknown module, the assets not fetched.
+///
+/// # Errors
+/// A catalog that cannot be read, an unknown module id, or the Magisk assets absent.
+pub fn request(repo: &Path, modules: &[String], su: Option<&str>) -> Result<Request, String> {
+    let catalog = Catalog::discover(&super::module::builtin_dir(repo), super::module::user_dir().as_deref())?;
+    let assets = MagiskAssets::find(repo)?;
+    let mut profile = Profile::parse("");
+    profile.rooted = true;
+    profile.magisk_code = assets.version_code;
+    profile.module_ids = modules.to_vec();
+    match su {
+        Some("all") => profile.su = SuPolicy::All,
+        Some(list) => {
+            profile.su = SuPolicy::Packages(list.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect());
+        }
+        None => {}
+    }
+    let mut shas = Vec::new();
+    for id in modules {
+        let m = catalog.find(id).ok_or_else(|| format!("module `{id}` is not in the catalog"))?;
+        shas.push((id.as_str(), module_sha(m)));
+    }
+    let pairs: Vec<(&str, &str)> = shas.iter().map(|(i, s)| (*i, s.as_str())).collect();
+    let hash = root_hash(&profile.serialize(), &pairs, assets.version_code, &magisk_binary_sha());
+    Ok(Request { profile, catalog, assets, hash })
+}
+
+/// The request the `OMNI_R_ROOT` / `OMNI_R_MODULES` / `OMNI_R_SU` environment makes, if any.
+///
+/// # Errors
+/// As [`request`].
+pub fn from_env(repo: &Path) -> Result<Option<Request>, String> {
+    let modules: Vec<String> = std::env::var("OMNI_R_MODULES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if std::env::var("OMNI_R_ROOT").as_deref() != Ok("1") && modules.is_empty() {
+        return Ok(None);
+    }
+    let su = std::env::var("OMNI_R_SU").ok().filter(|s| !s.is_empty());
+    request(repo, &modules, su.as_deref()).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_hash_follows_every_input() {
+        let base = root_hash("root=1\n", &[("a", "s")], 1, "b");
+        assert_eq!(base.len(), 8);
+        assert_eq!(base, root_hash("root=1\n", &[("a", "s")], 1, "b"));
+        assert_ne!(base, root_hash("root=1\nsu=all\n", &[("a", "s")], 1, "b"));
+        assert_ne!(base, root_hash("root=1\n", &[("a", "t")], 1, "b"));
+        assert_ne!(base, root_hash("root=1\n", &[("a", "s")], 2, "b"));
+        assert_ne!(base, root_hash("root=1\n", &[("a", "s")], 1, "c"));
+    }
+}

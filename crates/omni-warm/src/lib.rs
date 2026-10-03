@@ -31,6 +31,11 @@ const LOCK_STALE: Duration = Duration::from_secs(15 * 60);
 /// Where APKs are handed to the device (guest `/data/local/tmp/omni-apk`).
 const DROP: &str = "data/local/tmp/omni-apk";
 
+/// Where a rooted warm device's session records its root profile's hash (in the device directory).
+pub const ROOT_HASH_FILE: &str = "root-hash";
+/// The host-only root profile `omni-linux`'s `root::install::stage` writes in the instance directory.
+const PROFILE_FILE: &str = ".omni-root-profile";
+
 /// A warm device, by its directory.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -62,6 +67,26 @@ impl Device {
     #[must_use]
     pub fn ready(&self) -> bool {
         self.alive() && self.tmp("warm-ready").exists()
+    }
+
+    /// The root profile the device was made with: the hash its session recorded in `root-hash` at
+    /// creation (`omni-linux`'s `root::key`), `None` for an unrooted device.
+    #[must_use]
+    pub fn root_hash(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.dir.join(ROOT_HASH_FILE)).ok()?;
+        Some(text.trim().to_string()).filter(|h| !h.is_empty())
+    }
+
+    /// The device's root state from its host-only profile (`.omni-root-profile`): `Some(module ids)`
+    /// when it is rooted, `None` when it is not.
+    #[must_use]
+    pub fn root_modules(&self) -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(self.dir.join(PROFILE_FILE)).ok()?;
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        if !lines.contains(&"root=1") {
+            return None;
+        }
+        Some(lines.iter().filter_map(|l| l.strip_prefix("module=")).map(str::to_string).collect())
     }
 
     /// The session's log (`<dir>.log`).

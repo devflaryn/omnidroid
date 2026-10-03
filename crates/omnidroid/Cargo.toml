@@ -17,6 +17,8 @@ omni-apk = { workspace = true }
 omni-platform = { workspace = true }
 # `aosp` on the host's warm device when one is up (src/warm.rs): no boot of its own.
 omni-warm = { workspace = true }
+# The root module catalog and request (`omnidroid modules`, `aosp --root`): host-side file work only.
+omni-linux = { workspace = true }
 
 [[bin]]
 name = "omnidroid"

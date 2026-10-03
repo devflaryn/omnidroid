@@ -430,6 +430,7 @@ name = "omnidroid"
 version = "0.1.0"
 dependencies = [
  "omni-apk",
+ "omni-linux",
  "omni-platform",
  "omni-warm",
 ]

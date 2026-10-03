@@ -12,3 +12,4 @@ pub use module::{builtin_dir, user_dir, Catalog, Module, ModuleProp, ModuleSourc
 pub mod assets;
 pub use assets::{MagiskAssets, MagiskPin};
 pub mod install;
+pub mod key;
