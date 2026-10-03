@@ -803,7 +803,10 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
                 options.modules.extend(text.split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string));
                 options.root = true;
             }
-            "--su" => options.su = Some(value("--su")?),
+            "--su" => {
+                options.su = Some(value("--su")?);
+                options.root = true;
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -1128,6 +1131,8 @@ mod tests {
         assert!(o.root && o.modules.is_empty() && o.su.is_none());
         let o = parse(&[]).unwrap();
         assert!(!o.root && o.modules.is_empty(), "unrooted by default");
+        let o = parse(&["--su", "all"]).unwrap();
+        assert!(o.root && o.su.as_deref() == Some("all"), "--su implies --root");
     }
 
     #[test]

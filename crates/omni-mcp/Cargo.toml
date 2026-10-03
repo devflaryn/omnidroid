@@ -21,6 +21,8 @@ omni-apk = { workspace = true }
 omni-platform = { workspace = true }
 # The warm device (install by content, start, stop -- shared with the omnidroid launcher).
 omni-warm = { workspace = true }
+# The root request's hash (`root::key`), to tell whether a warm device has the root profile asked for.
+omni-linux = { workspace = true }
 
 [lib]
 name = "omni_mcp"

@@ -10,7 +10,8 @@ publish = false
 description = "The launcher: run an APK in a real window on Windows, macOS or Linux -- `omnidroid play --apk <path>`."
 
 # A launcher, and only that: which APK (omni-apk), where the app's storage lives (omni-platform),
-# and then the gate's own run. No OS crate and no `cfg(target_os)` here (Global Constraint 4) --
+# the root module catalog and request (omni-linux's `root` module: file work only, no boot) and then
+# the gate's own run. No OS crate and no `cfg(target_os)` here (Global Constraint 4) --
 # what differs per host is answered by omni-platform.
 [dependencies]
 omni-apk = { workspace = true }

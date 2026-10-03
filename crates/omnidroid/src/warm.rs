@@ -38,7 +38,12 @@ pub fn usable(root_hash: Option<&str>) -> Option<device::Device> {
     }
     let dev = device::find().filter(device::Device::ready)?;
     if dev.root_hash().as_deref() != root_hash {
-        println!("[warm] root profile differs: booting a new device");
+        println!(
+            "[warm] root profile differs: booting a new device (the warm device {} is {}, this session wants {})",
+            dev.dir.display(),
+            dev.root_hash().map_or_else(|| "unrooted".to_string(), |h| format!("rooted, profile {h}")),
+            root_hash.map_or_else(|| "no root".to_string(), |h| format!("root profile {h}")),
+        );
         return None;
     }
     Some(dev)

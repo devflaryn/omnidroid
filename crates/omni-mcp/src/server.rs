@@ -349,9 +349,9 @@ impl Server {
         // A live device of another root state is not reused (and a second device is not booted
         // beside it): the caller stops it first.
         if let Some(live) = device::find() {
-            if !root.matches(&live) {
+            if !root.matches(&live, self.config.repo_dir.as_deref()).map_err(RpcError::server)? {
                 return Err(RpcError::server(format!(
-                    "the warm device ({}) has a different root state ({}); call stop_device, then start again with the root/modules wanted",
+                    "the warm device ({}) has a different root profile ({}); call stop_device, then start again with the root/modules wanted",
                     live.dir.display(),
                     root_summary(&live)
                 )));
@@ -1475,17 +1475,20 @@ impl RootRequest {
         }
     }
 
-    /// Whether `device` has this root state: unrooted for none, else rooted with the same modules.
-    fn matches(&self, device: &device::Device) -> bool {
-        match device.root_modules() {
-            None => !self.root,
-            Some(mut have) => {
-                let mut want = self.modules.clone();
-                have.sort();
-                want.sort();
-                self.root && have == want
-            }
+    /// Whether `device` has this root profile: unrooted for none; else the device's recorded
+    /// `root-hash` equals the hash of what the launcher would make for this request (the modules,
+    /// the default su policy, the module contents, the Magisk code and binary) -- built by the same
+    /// `root::key::request` the launcher uses, so the two are comparable.
+    ///
+    /// # Errors
+    /// A rooted request whose catalog or Magisk assets cannot be read (or with no repository known).
+    fn matches(&self, device: &device::Device, repo: Option<&Path>) -> Result<bool, String> {
+        if !self.root {
+            return Ok(device.root_hash().is_none() && device.root_modules().is_none());
         }
+        let repo = repo.ok_or("the repository is unknown (set OMNI_MCP_REPO): cannot tell the root profile")?;
+        let want = omni_linux::root::key::request(repo, &self.modules, None)?.hash;
+        Ok(device.root_hash().as_deref() == Some(want.as_str()))
     }
 }
 

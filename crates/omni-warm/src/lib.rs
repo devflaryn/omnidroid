@@ -187,6 +187,31 @@ impl Device {
     }
 }
 
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+    use omni_linux::root::{Profile, SuPolicy};
+
+    #[test]
+    fn root_modules_reads_what_profile_serializes() {
+        let dir = std::env::temp_dir().join(format!("omni-warm-root-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dev = Device { dir: dir.clone() };
+        assert_eq!(dev.root_modules(), None, "no profile: not rooted");
+        let mut p = Profile::parse("");
+        p.rooted = true;
+        p.magisk_code = 29000;
+        p.module_ids = vec!["a".into(), "b".into()];
+        p.su = SuPolicy::All;
+        std::fs::write(dir.join(PROFILE_FILE), p.serialize()).unwrap();
+        assert_eq!(dev.root_modules(), Some(vec!["a".to_string(), "b".to_string()]));
+        p.rooted = false;
+        std::fs::write(dir.join(PROFILE_FILE), p.serialize()).unwrap();
+        assert_eq!(dev.root_modules(), None, "a profile that is not rooted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Where warm devices live: `OMNI_MCP_WARM_DIR`, else the temp directory. (A Linux host whose
 /// `/tmp` is a tmpfs names a directory on disk: a device's `/data` is ~1 GiB.)
 #[must_use]

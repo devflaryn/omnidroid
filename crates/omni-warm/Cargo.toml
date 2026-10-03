@@ -16,3 +16,7 @@ description = "The host's warm device: one Android booted and idle, that apps ar
 omni-apk = { workspace = true }
 # An APK is known by its bytes' hash (the install decision).
 sha2 = { workspace = true }
+
+[dev-dependencies]
+# Only to test that `Device::root_modules` reads what `Profile::serialize` writes.
+omni-linux = { workspace = true }

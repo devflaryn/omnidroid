@@ -369,6 +369,7 @@ version = "0.1.0"
 dependencies = [
  "omni-apk",
  "omni-debug",
+ "omni-linux",
  "omni-platform",
  "omni-rebuild",
  "omni-warm",
@@ -422,6 +423,7 @@ name = "omni-warm"
 version = "0.1.0"
 dependencies = [
  "omni-apk",
+ "omni-linux",
  "sha2",
 ]
 
