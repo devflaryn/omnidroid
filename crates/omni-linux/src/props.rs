@@ -407,21 +407,29 @@ impl PropertyService {
     /// The service of this host process, started from the first process's sysroot.
     pub fn global(sysroot: &Sysroot) -> std::sync::Arc<Self> {
         static SERVICE: std::sync::OnceLock<std::sync::Arc<PropertyService>> = std::sync::OnceLock::new();
-        std::sync::Arc::clone(SERVICE.get_or_init(|| {
-            let (props, _) = Properties::from_sysroot(sysroot);
-            let mut area = Area::new();
-            let mut info = HashMap::new();
-            for (k, v) in &props.entries {
-                info.insert(k.clone(), area.add(k, v));
-            }
-            // Room to grow: what the build set, and a megabyte more for what the system sets.
-            let capacity = (HEADER + area.data.len() + (1 << 20)).div_ceil(AREA_UNIT) * AREA_UNIT;
-            std::sync::Arc::new(Self {
-                live: parking_lot::Mutex::new(Live { area, info, serial: 0, capacity, mappings: Vec::new() }),
-                changed: parking_lot::Condvar::new(),
-                publish: parking_lot::Mutex::new(()),
-            })
-        }))
+        std::sync::Arc::clone(SERVICE.get_or_init(|| std::sync::Arc::new(Self::build(sysroot))))
+    }
+
+    /// A fresh property service for testing (not behind OnceLock).
+    #[cfg(test)]
+    fn for_test(sysroot: &Sysroot) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::build(sysroot))
+    }
+
+    fn build(sysroot: &Sysroot) -> Self {
+        let (props, _) = Properties::from_sysroot(sysroot);
+        let mut area = Area::new();
+        let mut info = HashMap::new();
+        for (k, v) in &props.entries {
+            info.insert(k.clone(), area.add(k, v));
+        }
+        // Room to grow: what the build set, and a megabyte more for what the system sets.
+        let capacity = (HEADER + area.data.len() + (1 << 20)).div_ceil(AREA_UNIT) * AREA_UNIT;
+        Self {
+            live: parking_lot::Mutex::new(Live { area, info, serial: 0, capacity, mappings: Vec::new() }),
+            changed: parking_lot::Condvar::new(),
+            publish: parking_lot::Mutex::new(()),
+        }
     }
 
     /// The prop area as it is now, at its full mapped size.
@@ -513,10 +521,14 @@ impl PropertyService {
         if value.len() >= PROP_VALUE_MAX && !name.starts_with("ro.") {
             return PROP_ERROR_INVALID_VALUE;
         }
+        self.set_inner(name, value, false)
+    }
+
+    fn set_inner(&self, name: &str, value: &str, force: bool) -> u32 {
         let _publishing = self.publish.lock();
         let mut live = self.live.lock();
         let changed_info = match live.info.get(name).copied() {
-            Some(_) if name.starts_with("ro.") => return PROP_ERROR_READ_ONLY_PROPERTY,
+            Some(_) if name.starts_with("ro.") && !force => return PROP_ERROR_READ_ONLY_PROPERTY,
             Some(at) => {
                 let old = live.area.u32_at(at);
                 let serial = ((value.len() as u32) << 24) | (old.wrapping_add(2) & 0x00ff_fffe);
@@ -558,11 +570,48 @@ impl PropertyService {
         }
         PROP_SUCCESS
     }
+
+    /// Set a property, bypassing the read-only guard for `ro.*` properties.
+    pub fn set_forced(&self, name: &str, value: &str) -> u32 {
+        self.set_inner(name, value, true)
+    }
+
+    /// Remove a property so `get` returns `None`. Returns whether it existed.
+    pub fn delete(&self, name: &str) -> bool {
+        let _publishing = self.publish.lock();
+        let mut live = self.live.lock();
+        let existed = live.info.remove(name).is_some();
+        if existed {
+            live.serial = live.serial.wrapping_add(1);
+            let area = live.area.bytes(live.serial, live.capacity);
+            let used = if crate::mm::full_prop_copy() { area.len() } else { (HEADER + live.area.data.len()).min(area.len()) };
+            let serial_area = Area::new().bytes(live.serial, 0);
+            live.mappings.retain(|(p, _, _)| p.strong_count() > 0);
+            let targets: Vec<_> = live.mappings.iter().filter_map(|(p, at, s)| p.upgrade().map(|p| (p, *at, *s))).collect();
+            drop(live);
+            self.changed.notify_all();
+            for (p, at, serial) in targets {
+                let bytes = if serial { &serial_area[..HEADER] } else { &area[..used] };
+                if p.mm.kernel_write(&p.mem, at, bytes).is_ok() {
+                    let _ = p.futexes.wake(at + 4, i32::MAX as u64, u32::MAX);
+                }
+            }
+        }
+        existed
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Manifest;
+
+    fn test_manifest() -> Manifest {
+        let mut manifest = Manifest::default();
+        // Minimal manifest with just the root directory
+        manifest.entries.insert(b"/".to_vec(), crate::manifest::Entry::Dir { mode: 0o755 });
+        manifest
+    }
 
     /// What `PropertyService::set` relies on to write only `HEADER + data` into each mapping: past
     /// them, the area as mapped is zeros (the area only grows, so every mapping holds zeros there).
@@ -578,5 +627,20 @@ mod tests {
         assert!(bytes[used..].iter().all(|&b| b == 0), "a non-zero byte past {used}");
         assert!(bytes[..used].iter().any(|&b| b != 0));
         assert!(used < bytes.len() / 4, "{used} of {}", bytes.len());
+    }
+
+    #[test]
+    fn set_forced_overrides_a_read_only_property_and_delete_removes_it() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test(&root);
+        // An existing ro.* cannot be changed by set...
+        let name = "ro.build.tags";
+        svc.set(name, "release-keys");
+        assert_eq!(svc.set(name, "test-keys"), PROP_ERROR_READ_ONLY_PROPERTY);
+        // ...but set_forced changes it.
+        assert_eq!(svc.set_forced(name, "test-keys"), PROP_SUCCESS);
+        assert_eq!(svc.get(name).as_deref(), Some("test-keys"));
+        assert!(svc.delete(name));
+        assert_eq!(svc.get(name), None);
     }
 }
