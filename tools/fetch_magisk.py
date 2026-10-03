@@ -6,6 +6,7 @@ Stdlib only. Exits nonzero on any failure, including a sha256 mismatch.
 """
 import hashlib
 import os
+import re
 import sys
 import tempfile
 import urllib.request
@@ -29,6 +30,9 @@ def read_pin(path):
     for k in ("version", "versionCode", "url", "sha256"):
         if not pin.get(k):
             sys.exit(f"fetch_magisk: pin is missing '{k}'")
+    v = pin["version"]
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", v) or ".." in v:
+        sys.exit(f"fetch_magisk: unsafe version {v!r} in pin; refusing")
     return pin
 
 

@@ -21,9 +21,13 @@ impl MagiskPin {
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| format!("magisk.pin: missing `{key}`"))
         };
+        let version = get("version")?;
+        if version.contains("..") || !version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+            return Err(format!("magisk.pin: unsafe version `{version}`"));
+        }
         let code = get("versionCode")?;
         Ok(MagiskPin {
-            version: get("version")?,
+            version,
             version_code: code
                 .parse()
                 .map_err(|_| format!("magisk.pin: bad versionCode `{code}`"))?,
@@ -68,6 +72,17 @@ mod tests {
         let p = MagiskPin::parse("version=v29.0\nversionCode=29000\nurl=https://example/m.apk\nsha256=abcd\n").unwrap();
         assert_eq!(p.version_code, 29000);
         assert_eq!(p.sha256, "abcd");
+    }
+    #[test]
+    fn rejects_unsafe_version() {
+        for v in ["v1/../x", "..", "a\b", "v 1", "a/b"] {
+            let t = format!("version={v}
+versionCode=1
+url=u
+sha256=s
+");
+            assert!(MagiskPin::parse(&t).is_err(), "{v}");
+        }
     }
     #[test]
     fn find_explains_when_absent() {
