@@ -1,6 +1,6 @@
 //! The `omni_root` syscall: the engine's own door to root. A non-rooted device answers `ENOSYS`,
 //! exactly like an unimplemented syscall.
-use crate::errno::{Errno, SysResult, EACCES, EINVAL, ENOSYS};
+use crate::errno::{Errno, SysResult, EACCES, EINVAL, ENAMETOOLONG, ENOSYS};
 use crate::process::{Process, Task};
 use crate::syscall::{nr, Table};
 
@@ -13,7 +13,11 @@ const PROP_NAME_MAX: usize = 256;
 const PROP_VALUE_MAX: usize = 8192;
 
 fn guest_str(p: &Process, addr: u64, max: usize) -> Result<String, Errno> {
-    String::from_utf8(p.mem.read_cstr(addr, max)?).map_err(|_| EINVAL)
+    let s = String::from_utf8(p.mem.read_cstr(addr, max)?).map_err(|_| EINVAL)?;
+    if s.len() > max {
+        return Err(ENAMETOOLONG);
+    }
+    Ok(s)
 }
 
 fn sys_omni_root(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -31,10 +35,15 @@ fn sys_omni_root(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
                 return Err(EACCES);
             }
             let name = guest_str(p, a[1], PROP_NAME_MAX)?;
+            if name.is_empty() {
+                return Err(EINVAL);
+            }
             let props = crate::props::PropertyService::global(p.vfs.sysroot());
             if a[0] == OP_SETPROP {
                 let value = guest_str(p, a[2], PROP_VALUE_MAX)?;
-                props.set_forced(&name, &value);
+                if props.set_forced(&name, &value) != crate::props::PROP_SUCCESS {
+                    return Err(EINVAL);
+                }
             } else {
                 props.delete(&name);
             }

@@ -26,6 +26,13 @@ static void err(const char *s) {
     (void)r;
 }
 
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) s[--n] = 0;
+    return s;
+}
+
 static int is_number(const char *s) {
     if (!*s) return 0;
     for (; *s; s++)
@@ -94,20 +101,20 @@ static int apply_file(const char *path) {
         char *line = save;
         char *nl = strchr(save, '\n');
         if (nl) { *nl = 0; save = nl + 1; } else { save += strlen(save); }
-        size_t len = strlen(line);
-        if (len && line[len - 1] == '\r') line[--len] = 0;
-        while (*line == ' ' || *line == '\t') line++;
+        line = trim(line);
         if (!*line || *line == '#') continue;
         char *sep = line + strcspn(line, "= \t");
         if (!*sep) continue;
-        char sc = *sep;
-        *sep = 0;
         char *value = sep + 1;
-        if (sc != '=') {
-            // `name value`: skip blanks, and a single `=` between them is tolerated.
-            while (*value == ' ' || *value == '\t') value++;
+        if (*sep != '=') {
+            // `name value`: a `=` after the blanks (`name = value`) is tolerated.
+            value = trim(value);
             if (*value == '=') value++;
         }
+        *sep = 0;
+        value = trim(value);
+        line = trim(line);
+        if (!*line) continue;
         if (set_prop(line, value)) rc = 1;
     }
     return rc;
@@ -164,6 +171,7 @@ static int applet_magisk(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    if (argc < 1 || argv[0] == NULL) return 1;
     const char *base = strrchr(argv[0], '/');
     base = base ? base + 1 : argv[0];
     if (!strcmp(base, "su")) return applet_su(argc, argv);
