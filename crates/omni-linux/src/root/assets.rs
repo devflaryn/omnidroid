@@ -75,7 +75,7 @@ mod tests {
     }
     #[test]
     fn rejects_unsafe_version() {
-        for v in ["v1/../x", "..", "a\b", "v 1", "a/b"] {
+        for v in ["v1/../x", "..", "a\\b", "v 1", "a/b"] {
             let t = format!("version={v}
 versionCode=1
 url=u
