@@ -3,3 +3,5 @@
 //! tool and the `omni_root` syscall. When an instance has no profile, nothing here takes effect.
 pub mod profile;
 pub use profile::{Profile, Shamiko, SuPolicy};
+pub mod module;
+pub use module::{builtin_dir, user_dir, Catalog, Module, ModuleProp, ModuleSource};

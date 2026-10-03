@@ -352,6 +352,7 @@ dependencies = [
  "ash",
  "flate2",
  "libloading",
+ "omni-apk",
  "omni-cpu",
  "omni-elf",
  "omni-mem",

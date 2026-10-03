@@ -26,6 +26,8 @@ ash = { version = "0.38", default-features = false, features = ["loaded"] }
 # `ash`'s `loaded` already brings in, and the Global Constraint 4 exception omni-gfx's manifest
 # records for its GLES host, for the same reason (a GPU API with no loader crate of its own).
 libloading = "0.8"
+# Zip-form root modules (`crate::root::module`): pure file/compute, no unsafe.
+omni-apk = { workspace = true }
 
 [[bin]]
 name = "omni-linux-run"
