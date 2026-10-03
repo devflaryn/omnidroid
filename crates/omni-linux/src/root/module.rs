@@ -14,11 +14,22 @@ pub struct ModuleProp {
     pub description: String,
 }
 
-/// Whether `name` is one safe path component: not empty, not starting with `.` (so not `.`/`..`),
-/// and with no separator or NUL. Module ids become host paths.
+/// Whether `name` is exactly one normal path component on this platform: not empty, `.`, `..`,
+/// absolute, rooted, a drive prefix (`C:`, `C:x`) or holding a separator -- and no NUL.
+fn one_normal(name: &str) -> bool {
+    use std::path::{Component, Path};
+    if name.contains('\0') {
+        return false;
+    }
+    let mut it = Path::new(name).components();
+    matches!((it.next(), it.next()), (Some(Component::Normal(n)), None) if n == std::ffi::OsStr::new(name))
+}
+
+/// Whether `name` is a safe module id: one normal component that does not start with `.`.
+/// Module ids become host paths.
 #[must_use]
 pub fn is_safe_component(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\', '\0'])
+    one_normal(name) && !name.starts_with('.') && !name.contains(['/', '\\', ':'])
 }
 
 impl ModuleProp {
@@ -84,10 +95,10 @@ pub struct Module {
     pub source: ModuleSource,
 }
 
-/// A name `Module::list` may return: never empty, `.`/`..`, or with a separator or NUL (a zip entry
-/// can say anything; dotfiles such as `.replace` are fine).
-fn is_listable(name: &str) -> bool {
-    !matches!(name, "" | "." | "..") && !name.contains(['/', '\\', '\0'])
+/// A name `Module::list` may return: one normal path component (a zip entry can say anything;
+/// dotfiles such as `.replace` are fine).
+pub(crate) fn is_listable(name: &str) -> bool {
+    one_normal(name) && !name.contains(['/', '\\', ':'])
 }
 
 fn norm(rel: &str) -> &str {

@@ -17,7 +17,7 @@ fn copy_tree(module: &Module, rel: &str, dest: &Path) -> Result<(), String> {
     io(std::fs::create_dir_all(dest), dest)?;
     for name in module.list(rel) {
         // A zip entry can name `..` or carry a separator: never a path out of `dest`.
-        if matches!(name.as_str(), "" | "." | "..") || name.contains(['/', '\\', '\0']) {
+        if !super::module::is_listable(&name) {
             continue;
         }
         let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
@@ -165,17 +165,28 @@ mod tests {
 
     #[test]
     fn an_unsafe_module_id_is_rejected_and_nothing_outside_the_instance_is_touched() {
-        for id in ["..", "../x", "/abs", "a/b", ".hidden", "a\\b"] {
-            assert!(super::super::ModuleProp::parse(&format!("id={id}\n")).is_err(), "{id}");
+        for id in ["..", "../x", "/abs", "a/b", ".hidden", "a\\b", "C:evil", "C:", "C:\\x", ""] {
+            assert!(super::super::ModuleProp::parse(&format!("id={id}\n")).is_err() || id.is_empty(), "{id}");
+            assert!(!super::super::module::is_safe_component(id), "{id}");
         }
-        // Even a catalog built by hand (bypassing parse) cannot make stage() remove outside.
+        assert!(!super::super::module::is_listable("C:evil") && !super::super::module::is_listable("C:") && !super::super::module::is_listable(".."));
+        for ok in ["omni-test", "mod_a", "a.b"] {
+            assert!(super::super::module::is_safe_component(ok), "{ok}");
+        }
+        for ok in ["system", "ok.txt", ".replace"] {
+            assert!(super::super::module::is_listable(ok), "{ok}");
+        }
+        // A catalog built by hand (bypassing parse): stage() must reject before any remove or copy.
         let root = scratch("trav");
         let instance = root.join("inst");
-        let victim = root.join("x");
-        std::fs::create_dir_all(&victim).unwrap();
-        std::fs::write(victim.join("keep"), "1").unwrap();
         std::fs::create_dir_all(instance.join("data/adb/modules")).unwrap();
-        for id in ["..", "../../x", "../x"] {
+        // Where each unsafe id would resolve from data/adb/modules if the guard were absent.
+        for (id, victim_dir) in [("..", instance.join("data/adb")), ("../victim", instance.join("data/adb/victim")), ("../../x", instance.join("data/x")), ("C:evil", instance.join("data/adb/modules/C:evil"))] {
+            if std::fs::create_dir_all(&victim_dir).is_err() {
+                continue; // `C:evil` is not a legal directory name on Windows
+            }
+            let keep = victim_dir.join("keep-me");
+            std::fs::write(&keep, "1").unwrap();
             let module = Module {
                 prop: super::super::ModuleProp { id: id.into(), name: String::new(), version: String::new(), version_code: 0, author: String::new(), description: String::new() },
                 source: super::super::ModuleSource::Dir(root.join("src")),
@@ -184,10 +195,10 @@ mod tests {
             let mut profile = Profile::parse("root=1\n");
             profile.module_ids.push(id.to_string());
             let assets = MagiskAssets { util_functions: "u".into(), busybox: "b".into(), version_code: 1 };
-            assert!(stage(&instance, &profile, &catalog, &assets).is_err(), "{id}");
+            let err = stage(&instance, &profile, &catalog, &assets).unwrap_err();
+            assert!(err.contains("unsafe module id"), "{id}: {err}");
+            assert!(keep.exists(), "{id}: the guard must reject before any remove or copy");
         }
-        assert!(victim.join("keep").exists());
-        assert!(instance.join("data/adb/modules").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
