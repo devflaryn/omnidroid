@@ -37,7 +37,8 @@ impl ModuleProp {
                 "name" => p.name = v.to_string(),
                 "version" => p.version = v.to_string(),
                 "versionCode" => {
-                    p.version_code = v.parse().map_err(|_| format!("module.prop: versionCode `{v}` is not a number"))?;
+                    // Lenient, as Magisk is: a bad versionCode is 0, not a reason to drop the module.
+                    p.version_code = v.parse().unwrap_or(0);
                 }
                 "author" => p.author = v.to_string(),
                 "description" => p.description = v.to_string(),
@@ -146,7 +147,11 @@ fn scan(dir: &Path, out: &mut Vec<Module>) -> Result<(), String> {
             let Ok(text) = std::fs::read_to_string(path.join("module.prop")) else { continue };
             (ModuleSource::Dir(path.clone()), text)
         } else if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("zip")) {
-            let apk = omni_apk::Apk::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            // A zip that is unreadable or has no module.prop is not a module: skipped, like a dir.
+            let Ok(apk) = omni_apk::Apk::open(&path) else { continue };
+            if apk.entry("module.prop").is_none() {
+                continue;
+            }
             let bytes = apk.read_named("module.prop").map_err(|e| format!("{}: module.prop: {e}", path.display()))?;
             (ModuleSource::Zip(path.clone()), String::from_utf8_lossy(&bytes).into_owned())
         } else {
@@ -231,5 +236,121 @@ mod tests {
         assert_eq!(m.read("system/etc/a.txt").as_deref(), Some(&b"hello\n"[..]));
         assert!(m.has("system/etc/a.txt"));
         assert_eq!(m.list("system/etc"), vec!["a.txt".to_string()]);
+    }
+
+    fn crc32(d: &[u8]) -> u32 {
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in d {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            }
+        }
+        !c
+    }
+
+    /// A STORED (method 0) zip of `files`.
+    fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let (mut out, mut cd) = (Vec::new(), Vec::new());
+        for (name, data) in files {
+            let off = out.len() as u32;
+            let crc = crc32(data);
+            let n = name.len() as u16;
+            let len = data.len() as u32;
+            out.extend([0x50, 0x4b, 3, 4, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            for v in [crc, len, len] { out.extend(v.to_le_bytes()); }
+            out.extend(n.to_le_bytes());
+            out.extend([0, 0]);
+            out.extend(name.as_bytes());
+            out.extend(*data);
+            cd.extend([0x50, 0x4b, 1, 2, 10, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            for v in [crc, len, len] { cd.extend(v.to_le_bytes()); }
+            cd.extend(n.to_le_bytes());
+            cd.extend([0u8; 12]);
+            cd.extend(off.to_le_bytes());
+            cd.extend(name.as_bytes());
+        }
+        let cd_off = out.len() as u32;
+        let cd_len = cd.len() as u32;
+        out.extend(cd);
+        out.extend([0x50, 0x4b, 5, 6, 0, 0, 0, 0]);
+        out.extend((files.len() as u16).to_le_bytes());
+        out.extend((files.len() as u16).to_le_bytes());
+        out.extend(cd_len.to_le_bytes());
+        out.extend(cd_off.to_le_bytes());
+        out.extend([0, 0]);
+        out
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("omni-module-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn dir_module(root: &Path, dir: &str, id: &str) {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join("module.prop"), format!("id={id}
+")).unwrap();
+    }
+
+    #[test]
+    fn discovers_a_zip_module_and_reads_it_like_a_dir() {
+        let d = temp("zip");
+        let zip = make_zip(&[
+            ("module.prop", b"id=mod_z
+name=Z
+"),
+            ("system/etc/z.txt", b"zed
+"),
+        ]);
+        std::fs::write(d.join("mod-z.zip"), zip).unwrap();
+        let cat = Catalog::discover(&d, None).unwrap();
+        let m = cat.find("mod_z").expect("zip module present");
+        assert!(matches!(m.source, ModuleSource::Zip(_)));
+        assert_eq!(m.read("system/etc/z.txt").as_deref(), Some(&b"zed
+"[..]));
+        assert!(m.has("system/etc/z.txt"));
+        assert!(m.has("system"));
+        assert!(!m.has("system/nope"));
+        assert_eq!(m.list(""), vec!["module.prop".to_string(), "system".to_string()]);
+        assert_eq!(m.list("system/etc"), vec!["z.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn duplicate_id_names_both_sources() {
+        let (a, b) = (temp("dup-a"), temp("dup-b"));
+        dir_module(&a, "one", "same");
+        dir_module(&b, "two", "same");
+        let e = Catalog::discover(&b, Some(&a)).unwrap_err();
+        assert!(e.contains(&a.join("one").display().to_string()), "{e}");
+        assert!(e.contains(&b.join("two").display().to_string()), "{e}");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn skips_non_module_dirs_and_junk_zips() {
+        let d = temp("skip");
+        std::fs::create_dir_all(d.join("not-a-module/sub")).unwrap();
+        dir_module(&d, "good", "good_mod");
+        std::fs::write(d.join("junk.zip"), b"this is not a zip").unwrap();
+        std::fs::write(d.join("noprop.zip"), make_zip(&[("a.txt", b"x")])).unwrap();
+        let cat = Catalog::discover(&d, None).unwrap();
+        assert_eq!(cat.list().len(), 1);
+        assert!(cat.find("good_mod").is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn bad_version_code_is_zero_not_an_error() {
+        assert_eq!(ModuleProp::parse("id=x
+versionCode=abc
+").unwrap().version_code, 0);
+        assert_eq!(ModuleProp::parse("id=x
+versionCode=
+").unwrap().version_code, 0);
     }
 }
