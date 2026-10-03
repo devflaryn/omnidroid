@@ -9,3 +9,5 @@ pub mod tools;
 pub use profile::{Profile, Shamiko, SuPolicy};
 pub mod module;
 pub use module::{builtin_dir, user_dir, Catalog, Module, ModuleProp, ModuleSource};
+pub mod assets;
+pub use assets::{MagiskAssets, MagiskPin};
