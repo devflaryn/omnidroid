@@ -44,6 +44,7 @@ pub mod props;
 pub mod seccomp;
 pub mod relay;
 pub mod remote;
+pub mod root;
 pub mod shm;
 pub mod signal;
 pub mod socket;
