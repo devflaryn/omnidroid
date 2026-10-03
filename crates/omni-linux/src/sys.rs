@@ -43,6 +43,14 @@ impl SysState {
         self.set_caps(0);
     }
 
+    /// Take these credentials as a whole (engine-granted elevation): ids, groups and capabilities together.
+    pub fn assume(&self, uid: u32, gid: u32, groups: Vec<u32>, caps: u64) {
+        self.uid.store(uid, std::sync::atomic::Ordering::Relaxed);
+        self.gid.store(gid, std::sync::atomic::Ordering::Relaxed);
+        *self.groups.lock() = groups;
+        self.set_caps(caps);
+    }
+
     #[must_use]
     pub fn uid(&self) -> u32 {
         self.uid.load(std::sync::atomic::Ordering::Relaxed)
@@ -1126,4 +1134,17 @@ pub fn install(table: &mut Table) {
     table.set(nr::UMASK, sys_umask);
     table.set(nr::GETRUSAGE, sys_getrusage);
     table.set(nr::FUTEX, sys_futex);
+}
+
+#[cfg(test)]
+mod assume_tests {
+    use super::*;
+
+    #[test]
+    fn assume_sets_ids_and_caps() {
+        let s = SysState::new(1, 2000);
+        s.assume(0, 0, vec![0], ALL_CAPS);
+        assert_eq!(s.uid(), 0);
+        assert_eq!(s.caps(), ALL_CAPS);
+    }
 }

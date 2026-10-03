@@ -77,4 +77,5 @@ pub fn install_all(table: &mut syscall::Table) {
     mount::install(table);
     fork::install(table);
     bpf::install_syscalls(table);
+    root::syscall::install(table);
 }

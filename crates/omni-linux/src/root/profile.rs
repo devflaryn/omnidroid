@@ -9,6 +9,15 @@ pub struct Profile {
     pub shamiko: Shamiko,
 }
 
+/// The credentials an elevation grants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ids {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+    pub caps: u64,
+}
+
 /// The su policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SuPolicy {
@@ -138,6 +147,18 @@ impl Profile {
         uid == 0 || uid == 2000 || matches!(self.su, SuPolicy::All)
     }
 
+    /// The credentials `caller_uid` gets by elevating to `target_uid`; `EACCES` when su is not allowed.
+    pub fn elevation(&self, caller_uid: u32, target_uid: u32) -> Result<Ids, i32> {
+        if !self.su_allowed(caller_uid) {
+            return Err(crate::errno::EACCES.0);
+        }
+        if target_uid == 0 {
+            Ok(Ids { uid: 0, gid: 0, groups: vec![0], caps: crate::sys::ALL_CAPS })
+        } else {
+            Ok(Ids { uid: target_uid, gid: target_uid, groups: vec![], caps: 0 })
+        }
+    }
+
     /// The module ids, in order.
     pub fn modules(&self) -> &[String] {
         &self.module_ids
@@ -157,6 +178,22 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevation_grants_root_and_refuses_a_disallowed_uid() {
+        let p = Profile::parse("root=1
+su=all
+");
+        let ids = p.elevation(10234, 0).expect("allowed");
+        assert_eq!(ids.uid, 0);
+        assert_eq!(ids.caps, crate::sys::ALL_CAPS);
+        let p = Profile::parse("root=1
+su=com.one
+");
+        assert_eq!(p.elevation(10234, 0).unwrap_err(), crate::errno::EACCES.0);
+        // shell may still become root
+        assert!(p.elevation(2000, 0).is_ok());
+    }
 
     #[test]
     fn round_trips_and_reads_fields() {
