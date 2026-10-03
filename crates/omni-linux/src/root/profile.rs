@@ -187,6 +187,14 @@ struct ProfileCell {
 }
 
 impl Profile {
+    /// The rooted profile read fresh from `<instance>/.omni-root-profile` (no cache): `None` when
+    /// the file is absent or the device is not rooted.
+    #[must_use]
+    pub fn load(instance: &std::path::Path) -> Option<Profile> {
+        let text = std::fs::read_to_string(instance.join(PROFILE_FILE)).ok()?;
+        Some(Profile::parse(&text)).filter(Profile::is_rooted)
+    }
+
     /// The rooted profile of the instance at `instance`, read from `<instance>/.omni-root-profile`:
     /// `None` when the file is absent or the device is not rooted. One cache per instance
     /// directory, re-read when the file's mtime changes (checked at most once a second), as
@@ -209,7 +217,7 @@ impl Profile {
             return st.2.clone();
         }
         st.0 = modified;
-        st.2 = std::fs::read_to_string(&file).ok().map(|t| Profile::parse(&t)).filter(Profile::is_rooted).map(Arc::new);
+        st.2 = Profile::load(instance).map(Arc::new);
         st.2.clone()
     }
 }

@@ -34,6 +34,19 @@ pub struct Layer {
     replaced: BTreeSet<Vec<u8>>,
 }
 
+fn is_exec(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 fn parent_of(path: &[u8]) -> &[u8] {
     match path.iter().rposition(|&b| b == b'/') {
         Some(0) | None => b"/",
@@ -57,7 +70,7 @@ impl Layer {
         self.replaced.iter().any(|r| guest.len() > r.len() && guest.starts_with(r) && guest[r.len()] == b'/')
     }
 
-    fn overlay_dir(&mut self, host: &Path, guest: &str, top: bool) {
+    fn overlay_dir(&mut self, host: &Path, guest: &str, top: bool, owners: &Owners) {
         let Ok(rd) = std::fs::read_dir(host) else { return };
         let mut entries: Vec<_> = rd.flatten().collect();
         entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -79,8 +92,10 @@ impl Layer {
                     }
                     self.replaced.insert(key);
                 }
-                self.overlay_dir(&path, &child, false);
+                self.overlay_dir(&path, &child, false, owners);
             } else {
+                let exec = child.split('/').any(|c| c == "bin" || c == "xbin") || is_exec(&path);
+                owners.set(&path, Owner { uid: 0, gid: 0, mode: if exec { 0o755 } else { 0o644 } });
                 self.add_file(child.into_bytes(), path);
             }
         }
@@ -91,25 +106,39 @@ impl Layer {
     #[must_use]
     pub fn build(profile: &Profile, catalog: &Catalog, instance: &Path) -> Layer {
         let mut layer = Layer::default();
-        let tools_dir = instance.join("data/adb/omni/tools");
-        let _ = std::fs::create_dir_all(&tools_dir);
         let owners = Owners::of(instance);
-        for name in TOOLS {
-            let host = tools_dir.join(name);
-            if std::fs::read(&host).ok().as_deref() != Some(tools::magisk_binary()) {
-                let _ = std::fs::write(&host, tools::magisk_binary());
-            }
-            owners.set(&host, Owner { uid: 0, gid: 0, mode: 0o755 });
-            layer.add_file(format!("/system/bin/{name}").into_bytes(), host.clone());
-            layer.add_file(format!("/debug_ramdisk/{name}").into_bytes(), host);
-        }
         for id in profile.modules() {
             let Some(module) = catalog.find(id) else { continue };
             let ModuleSource::Dir(dir) = &module.source else { continue };
             if SKIP_MARKERS.iter().any(|m| dir.join(m).exists()) {
                 continue;
             }
-            layer.overlay_dir(&dir.join("system"), "/system", true);
+            layer.overlay_dir(&dir.join("system"), "/system", true, &owners);
+        }
+        // The tools go in last: no module's file or `.replace` can remove or shadow them.
+        let tools_dir = instance.join("data/adb/omni/tools");
+        let _ = std::fs::create_dir_all(&tools_dir);
+        for name in TOOLS {
+            let host = tools_dir.join(name);
+            if std::fs::read(&host).ok().as_deref() != Some(tools::magisk_binary()) {
+                // Clear read-only first so a changed tool can be rewritten.
+                if let Ok(m) = std::fs::metadata(&host) {
+                    let mut perm = m.permissions();
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    perm.set_readonly(false);
+                    let _ = std::fs::set_permissions(&host, perm);
+                }
+                let _ = std::fs::write(&host, tools::magisk_binary());
+            }
+            // Read-only on the host: the guest's write-through to a layer file is refused.
+            if let Ok(m) = std::fs::metadata(&host) {
+                let mut perm = m.permissions();
+                perm.set_readonly(true);
+                let _ = std::fs::set_permissions(&host, perm);
+            }
+            owners.set(&host, Owner { uid: 0, gid: 0, mode: 0o755 });
+            layer.add_file(format!("/system/bin/{name}").into_bytes(), host.clone());
+            layer.add_file(format!("/debug_ramdisk/{name}").into_bytes(), host);
         }
         layer
     }
@@ -137,7 +166,7 @@ impl Layer {
             return st.2.clone();
         }
         st.0 = Some(stamp);
-        st.2 = Profile::of(instance).map(|profile| {
+        st.2 = Profile::load(instance).map(|profile| {
             let catalog = Catalog::discover(&instance.join("data/adb/modules"), None).unwrap_or_default();
             Arc::new(Layer::build(&profile, &catalog, instance))
         });
@@ -264,5 +293,50 @@ mod tests {
         let layer = Layer::of(&inst3).expect("rooted");
         assert!(layer.lookup(b"/system/bin/su").is_some());
         assert!(Profile::of(&inst3).is_some());
+    }
+
+    #[test]
+    fn module_bin_files_are_executable_and_data_files_are_not() {
+        let inst = tmp_instance();
+        install_fake_module(&inst, "a", &[("system/bin/foo", b"x"), ("system/etc/c.conf", b"y")], &[]);
+        let profile = crate::root::Profile::parse("root=1
+module=a
+");
+        let cat = crate::root::module::Catalog::discover(&inst.join("data/adb/modules"), None).unwrap();
+        let layer = Layer::build(&profile, &cat, &inst);
+        let owners = Owners::of(&inst);
+        let mode = |p: &[u8]| match layer.lookup(p) {
+            Some(Node::HostFile { host }) => owners.get(&host).map(|o| (o.uid, o.mode)),
+            _ => None,
+        };
+        assert_eq!(mode(b"/system/bin/foo"), Some((0, 0o755)));
+        assert_eq!(mode(b"/system/etc/c.conf"), Some((0, 0o644)));
+    }
+
+    #[test]
+    fn tools_survive_a_module_replace_and_shadow_and_are_read_only() {
+        let inst = tmp_instance();
+        install_fake_module(&inst, "a", &[("system/bin/.replace", b""), ("system/bin/su", b"evil"), ("system/bin/mine", b"m")], &[]);
+        let profile = crate::root::Profile::parse("root=1
+module=a
+");
+        let cat = crate::root::module::Catalog::discover(&inst.join("data/adb/modules"), None).unwrap();
+        let layer = Layer::build(&profile, &cat, &inst);
+        for t in ["su", "magisk", "resetprop"] {
+            let path = format!("/system/bin/{t}");
+            assert_eq!(read_bytes(&layer, path.as_bytes()), Some(tools::magisk_binary().to_vec()), "{t}");
+            let Some(Node::HostFile { host }) = layer.lookup(path.as_bytes()) else { panic!() };
+            assert!(host.starts_with(inst.join("data/adb/omni/tools")));
+            assert!(std::fs::metadata(&host).unwrap().permissions().readonly());
+        }
+        assert!(layer.lookup(b"/system/bin/mine").is_some());
+        // Rebuild with a different on-disk tool: rewritten despite read-only.
+        let Some(Node::HostFile { host }) = layer.lookup(b"/system/bin/su") else { panic!() };
+        let mut perm = std::fs::metadata(&host).unwrap().permissions();
+        perm.set_readonly(false);
+        std::fs::set_permissions(&host, perm).unwrap();
+        std::fs::write(&host, b"tampered").unwrap();
+        let again = Layer::build(&profile, &cat, &inst);
+        assert_eq!(read_bytes(&again, b"/system/bin/su"), Some(tools::magisk_binary().to_vec()));
     }
 }
