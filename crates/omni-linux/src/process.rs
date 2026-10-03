@@ -636,7 +636,8 @@ impl Process {
         // What init.rc makes before any service runs: its `mkdir`s on the writable mounts.
         crate::boot::make_init_dirs(&sysroot, &config.instance_dir);
         let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir))
-            .with_owners(crate::owners::Owners::of(&config.instance_dir));
+            .with_owners(crate::owners::Owners::of(&config.instance_dir))
+            .with_root_layer(crate::root::Layer::of(&config.instance_dir));
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
         let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(Arc::new(backend)), 0, uid);

@@ -1,0 +1,17 @@
+# omnidroid: the rooted device's modules (/vendor/bin/omni_root.sh says what it does). Present on
+# every device and inert unless the host staged a root profile: the script exits at once when
+# /data/adb/omni/enabled is absent.
+on post-fs-data
+    exec_start omni_root_pfd
+
+service omni_root_pfd /system/bin/sh /vendor/bin/omni_root.sh post-fs-data
+    user root
+    group root
+    oneshot
+    disabled
+
+service omni_root_service /system/bin/sh /vendor/bin/omni_root.sh service
+    class late_start
+    user root
+    group root
+    oneshot

@@ -1,0 +1,6 @@
+id=omni-test
+name=Omni Test Module
+version=v1
+versionCode=1
+author=omnidroid
+description=Boot-test fixture

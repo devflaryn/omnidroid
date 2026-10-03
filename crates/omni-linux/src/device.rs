@@ -34,6 +34,9 @@ pub const FILES: &[(&str, &[u8])] = &[
     // script says why; `persist.omni.autogrant=0` turns it off).
     ("/vendor/etc/init/omni_autogrant.rc", include_bytes!("../device/vendor/etc/init/omni_autogrant.rc")),
     ("/vendor/bin/omni_autogrant.sh", include_bytes!("../device/vendor/bin/omni_autogrant.sh")),
+    // The rooted device's module install and scripts: inert unless /data/adb/omni/enabled exists.
+    ("/vendor/etc/init/omni_root.rc", include_bytes!("../device/vendor/etc/init/omni_root.rc")),
+    ("/vendor/bin/omni_root.sh", include_bytes!("../device/vendor/bin/omni_root.sh")),
     // No background app processes kept: ActivityManager's cached-process limit (the script says
     // why; `persist.omni.cached_processes`).
     ("/vendor/etc/init/omni_lean.rc", include_bytes!("../device/vendor/etc/init/omni_lean.rc")),
