@@ -540,7 +540,8 @@ impl PropertyService {
                     new_at
                 } else {
                     let old = live.area.u32_at(at);
-                    let serial = ((value.len() as u32) << 24) | (old.wrapping_add(2) & 0x00ff_fffe);
+                    // Clear LONG_FLAG when rewriting to a short value (mask 0x00fe_fffe clears bit 16).
+                    let serial = ((value.len() as u32) << 24) | (old.wrapping_add(2) & 0x00fe_fffe);
                     live.area.data[at + 4..at + 4 + PROP_VALUE_MAX].fill(0);
                     live.area.data[at + 4..at + 4 + value.len()].copy_from_slice(value.as_bytes());
                     live.area.set_u32(at, serial);
@@ -597,8 +598,9 @@ impl PropertyService {
             None => return false,
         };
         // Overwrite the in-area record to empty so guests see the deletion.
+        // Clear LONG_FLAG when rewriting to empty (mask 0x00fe_fffe clears bit 16).
         let old = live.area.u32_at(at);
-        let serial = (0u32 << 24) | (old.wrapping_add(2) & 0x00ff_fffe);
+        let serial = (0u32 << 24) | (old.wrapping_add(2) & 0x00fe_fffe);
         live.area.data[at + 4..at + 4 + PROP_VALUE_MAX].fill(0);
         live.area.set_u32(at, serial);
         // Remove from host-side info after the area is updated.
@@ -706,5 +708,42 @@ mod tests {
         let area_after = svc.area_bytes();
         let serial_after = u32::from_le_bytes(area_after[4..8].try_into().unwrap());
         assert!(serial_after > serial_before);
+    }
+
+    #[test]
+    fn set_forced_long_then_short_clears_long_flag() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test(&root);
+        let name = "ro.test.longshort";
+        // First, set_forced a long value (>= 92 bytes) to create a long-form record.
+        let long_value = "x".repeat(100);
+        assert_eq!(svc.set_forced(name, &long_value), PROP_SUCCESS);
+        assert_eq!(svc.get(name).as_deref(), Some(long_value.as_str()));
+        // Now overwrite in-place with a short value.
+        let short_value = "short";
+        assert_eq!(svc.set_forced(name, short_value), PROP_SUCCESS);
+        // Verify the short value is returned (not garbage from stale long-value offset).
+        assert_eq!(svc.get(name).as_deref(), Some(short_value));
+        // Verify via get returning the exact short value with no trailing garbage
+        // (indicating LONG_FLAG is clear in the in-area record).
+        assert_eq!(svc.get(name).unwrap().len(), short_value.len());
+        assert_eq!(svc.get(name).unwrap(), short_value);
+    }
+
+    #[test]
+    fn delete_long_form_record_clears_long_flag() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test(&root);
+        let name = "ro.test.dellong";
+        // Set a long value to create a long-form record.
+        let long_value = "y".repeat(100);
+        assert_eq!(svc.set_forced(name, &long_value), PROP_SUCCESS);
+        assert_eq!(svc.get(name).as_deref(), Some(long_value.as_str()));
+        // Delete it.
+        assert!(svc.delete(name));
+        // Verify get returns None (not garbage from stale long-value offset).
+        assert_eq!(svc.get(name), None);
+        // After deletion, the in-area record has an empty value and LONG_FLAG clear,
+        // so no guest reading it would see long-form garbage.
     }
 }
