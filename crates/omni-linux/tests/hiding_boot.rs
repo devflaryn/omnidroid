@@ -128,3 +128,33 @@ fn a_denylisted_process_maps_and_mounts_show_no_root() {
     assert!(!open.view.hidden);
     assert!(text.contains("DONE"), "{text}");
 }
+
+#[test]
+fn magisk_denylist_edits_the_host_profile_as_root_only() {
+    let Some(sysroot) = common::sysroot() else { return };
+    let instance = fresh_instance("dledit");
+    if stage_denylisted(&instance).is_none() {
+        return;
+    }
+    let profile = || std::fs::read_to_string(instance.join(root::profile::PROFILE_FILE)).expect("host profile");
+    // The control here is the shell (uid 2000) that elevates with `su -c` (su=all), the R1 pattern.
+    let su = |cmd: &str| run_as(&sysroot, &instance, "com.shell", &format!("su -c '{cmd}'; echo RC=$?"), 2000).1;
+
+    let out = su("magisk --denylist add com.example.one");
+    assert!(out.contains("RC=0"), "add as root:\n{out}");
+    assert!(profile().contains("denylist=com.example.one"), "profile after add:\n{}", profile());
+    assert!(profile().contains("denylist=com.denytest"), "existing entry kept:\n{}", profile());
+
+    let out = su("magisk --denylist ls");
+    assert!(out.contains("com.example.one") && out.contains("com.denytest"), "ls output:\n{out}");
+
+    let out = su("magisk --denylist rm com.example.one");
+    assert!(out.contains("RC=0"), "rm as root:\n{out}");
+    assert!(!profile().contains("com.example.one"), "profile after rm:\n{}", profile());
+
+    // Without su the caller is uid 2000, not 0: the op answers EACCES and the profile is untouched.
+    let before = profile();
+    let (_, out) = run_as(&sysroot, &instance, "com.shell", "magisk --denylist add com.x; echo RC=$?", 2000);
+    assert!(!out.contains("RC=0"), "a non-root caller must fail:\n{out}");
+    assert_eq!(profile(), before, "a non-root caller must not change the profile");
+}
