@@ -72,19 +72,26 @@ the exact seams:
 
 ## Decomposition
 
-Four phases, each its own implementation plan, merged to the branch only when its tests pass. The
-un-kicked PS99 join is **P2 + P3**; **P1** is the substrate both ride on; **P4** is the RE
-deliverable.
+Four phases, each its own implementation plan, merged to the branch only when its tests pass.
+
+**Sequencing (owner, 2026-10-04): P2 + P3 are built first — they deliver the un-kicked PS99 join and
+are fully engine-native, so they do NOT depend on P1.** P2 (per-process hiding: `with_root_layer(None)`,
+stock props, filtered `/proc`) and P3 (per-process emulator spoofing) are engine work; Roblox goes on
+the DenyList (plain hide, no injection) and `emu-hide` is engine-interpreted, not a Zygisk `.so`. **P1
+(the full Zygisk host) and P4 (Frida gadget) come after** — P1 is needed only to run real community
+Zygisk `.so` modules and to inject the Frida gadget, not to beat the 305. (An earlier draft called P1
+"the substrate both ride on"; that was wrong — P2/P3 ride on the R1 engine seams, not on P1.)
 
 | | Delivers | Proven by |
 |---|---|---|
-| **P1** | The Zygisk host: full Zygisk API, loads modules into each app + system_server at the start seam | A real community Zygisk module's `postAppSpecialize` runs; a JNI and a PLT hook it registers fire |
-| **P2** | DenyList + Shamiko hiding (fills `Profile::hidden`) | A DenyList app fails a root-detector; Roblox is not root-kicked |
-| **P3** | Emulator hiding (`emu-hide`, the former R3) | **Stock Roblox joins PS99 and gets no 305** — the headline |
-| **P4** | `zygisk-frida` built-in module + host forwarder | `frida -H 127.0.0.1:<port>` attaches to a gadget app and hooks it |
+| **P2** *(1st)* | DenyList + Shamiko hiding (fills `Profile::hidden`) — engine-native | A DenyList app fails a root-detector; Roblox is not root-kicked |
+| **P3** *(2nd)* | Emulator hiding (`emu-hide`, the former R3) — engine-native | **Stock Roblox joins PS99 and gets no 305** — the headline |
+| **P1** *(3rd)* | The Zygisk host: full Zygisk API, loads modules into each app + system_server at the start seam | A real community Zygisk module's `postAppSpecialize` runs; a JNI and a PLT hook it registers fire |
+| **P4** *(4th)* | `zygisk-frida` built-in module + host forwarder (needs P1's injection) | `frida -H 127.0.0.1:<port>` attaches to a gadget app and hooks it |
 
-Each phase gets a short spec/brief of its own before its plan, as R1's tasks did. P1 is the
-largest and riskiest; the full-API bar means it carries most of R2's effort.
+Each phase gets its own plan. **P2+P3 are first and are the fast path to the headline goal.** P1 is
+the largest and riskiest (the full-API bar carries most of R2's effort) and is sequenced after the
+un-kicked join is in hand; P4 follows P1.
 
 ---
 
