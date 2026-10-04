@@ -199,6 +199,35 @@ impl Composer {
         Ok((width, height))
     }
 
+    /// **Add a display** of this size, and connect it: its id, and the framebuffer its frames are
+    /// presented into (a window of its own shows that, as display 0's does).
+    ///
+    /// SurfaceFlinger learns of it by hotplug, DisplayManager makes a `Display` for it, and an
+    /// activity started with `am start --display <id>` is resumed on it **beside** the one on
+    /// display 0 -- which is what lets two apps run side by side, each drawing, neither backgrounded
+    /// (the spike in the multi-instance design). Added before SurfaceFlinger has registered its
+    /// callback, the display is only recorded, and `registerCallback` hotplugs every display there
+    /// is -- which is the simple way to start with more than one.
+    ///
+    /// # Errors
+    /// The hotplug's delivery failed (SurfaceFlinger gone).
+    pub fn add_display(&self, width: u32, height: u32) -> Result<(i64, Arc<Framebuffer>), String> {
+        let (width, height) = (width.max(MIN_SIDE), height.max(MIN_SIDE));
+        let framebuffer = Arc::new(Framebuffer::new(width, height));
+        let id = {
+            let mut screens = self.screens.lock();
+            let id = screens.keys().copied().max().unwrap_or(DISPLAY) + 1;
+            screens.insert(id, Arc::new(Screen { framebuffer: Arc::clone(&framebuffer), mode: Mutex::new(Mode { config: 0, width, height }), state: Mutex::default() }));
+            id
+        };
+        let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
+        eprintln!("[composer] display {id} added, {width}x{height}: {}", if callback.is_some() { "hotplug" } else { "before SurfaceFlinger" });
+        if let Some(callback) = callback {
+            IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_hotplug(id, true).map_err(|e| format!("onHotplug: {e:?}"))?;
+        }
+        Ok((id, framebuffer))
+    }
+
     /// Serve the composer and publish it with `servicemanager` as [`INSTANCE`].
     ///
     /// # Errors
@@ -807,7 +836,9 @@ impl IComposerClientServer for Client {
     }
 
     fn get_display_connection_type(&self, _ctx: &Ctx<'_>, display: i64) -> Result<DisplayConnectionType, Status> {
-        self.screen(display).map(|_| DisplayConnectionType::INTERNAL)
+        // Display 0 is the device's own; the rest are attached to it, which is what SurfaceFlinger
+        // expects of a second display and what keeps display 0 the primary.
+        self.screen(display).map(|_| if display == DISPLAY { DisplayConnectionType::INTERNAL } else { DisplayConnectionType::EXTERNAL })
     }
 
     fn get_display_identification_data(&self, _ctx: &Ctx<'_>, display: i64) -> Result<super::aidl::android_hardware_graphics_composer3::DisplayIdentification, Status> {
@@ -816,7 +847,7 @@ impl IComposerClientServer for Client {
     }
 
     fn get_display_name(&self, _ctx: &Ctx<'_>, display: i64) -> Result<String, Status> {
-        self.screen(display).map(|_| "omnidroid".to_string())
+        self.screen(display).map(|_| if display == DISPLAY { "omnidroid".to_string() } else { format!("omnidroid-{display}") })
     }
 
     fn get_display_vsync_period(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {

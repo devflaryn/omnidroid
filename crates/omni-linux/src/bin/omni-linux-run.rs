@@ -218,6 +218,31 @@ fn main() -> ExitCode {
                         eprintln!("[window] {e}");
                     }
                 }
+                // OMNI_DISPLAYS=<n>: that many displays, each with a window of its own, so that an
+                // app started with `am start --display <id>` runs beside the one on display 0
+                // rather than backgrounding it. Added before SurfaceFlinger's callback, so
+                // `registerCallback` hotplugs them all at once.
+                let displays = std::env::var("OMNI_DISPLAYS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+                for _ in 1..displays {
+                    match composer.add_display(w, h) {
+                        Ok((id, extra)) => {
+                            if std::env::var("OMNI_WINDOW").as_deref() == Ok("1") {
+                                let options = omni_linux::display_window::Options {
+                                    title: format!("omnidroid — display {id}"),
+                                    control: None,
+                                    // One window's keyboard and mouse are the device's; a second
+                                    // set would reach display 0 too, until input is associated
+                                    // with a display (the multi-instance design's phase 2).
+                                    input: false,
+                                };
+                                if let Err(e) = omni_linux::display_window::spawn(extra, std::sync::Arc::clone(&composer), options) {
+                                    eprintln!("[window] display {id}: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("[composer] a display could not be added: {e}"),
+                    }
+                }
                 framebuffer = Some(fb);
                 _composers.push(composer);
             }
