@@ -67,6 +67,15 @@ same package at another version gets an Android of its own. Clash of Clans first
   regardless, so it has not blocked anything yet, but any app that gates on `getActiveNetwork()`
   before it starts would see an offline device.
 
+  **The unpacked library is now obtainable** (`a793ea2`). `OMNI_DUMP_AT_EXIT=libsupercell` with
+  `OMNI_DUMP_DIR=<dir>` writes the library as the live process holds it when it exits -- 6.6 MB that
+  disassemble as valid arm64 everywhere, where the on-disk file is packed (0% valid). The strings
+  stay encrypted (only the `uname` import name is plain), so the detection is in code, not a string
+  scan. The exit comes from a report-and-exit stub at `libsupercell+0x5f24f4`/`+0x5f2500` (both
+  `mov w0,#1; bl exit_group`); the decision is upstream of it. Reversing 6.6 MB of obfuscated arm64
+  from there to the check is the remaining work, and it is ordinary static RE now that the image is
+  in hand. Load the dumped `.bin` in the lab (`lab_load`) or any disassembler.
+
   **Tracing it is observer-sensitive, so trace sparingly.** `OMNI_TRACE_PATHS_ONLY=1` exists for
   this (`08f6a1d`) and is still not free: with it the app took 81 s to its first screen instead of
   12, and in one run looped on `statfs` without ever reaching its fork. Scope it with
