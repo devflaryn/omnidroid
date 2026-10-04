@@ -42,6 +42,15 @@ same package at another version gets an Android of its own. Clash of Clans first
   *unpacked* `libsupercell_clashofclans.so`, dumped after it decrypts itself -- the static file is
   packed and disassembles to nothing.
 
+  **Tracing it is observer-sensitive, so trace sparingly.** `OMNI_TRACE_PATHS_ONLY=1` exists for
+  this (`08f6a1d`) and is still not free: with it the app took 81 s to its first screen instead of
+  12, and in one run looped on `statfs` without ever reaching its fork. Scope it with
+  `OMNI_TRACE_APP=com.supercell.clashofclans` **in the device's own environment** (a CLI
+  `omnidroid aosp --warm`, not `<device>.appenv`, which would trace every app host) together with
+  `OMNI_APP_SPARE=0` -- otherwise the app starts in the spare process, whose name is `omni-spare`,
+  and the trace never engages. A device-wide path trace wrote 568 MB in two minutes and is not worth
+  it.
+
   Read any of this with `OMNI_FORK_TRACE_CALLS=1` in `<device>.appenv`, which traces both sides'
   calls from the handover only -- the window that matters, without tracing the whole start of the app.
 
