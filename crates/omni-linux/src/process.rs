@@ -62,6 +62,10 @@ pub struct Process {
     /// How the process ends, once something has ended it (`exit_group`, a fatal signal or fault).
     group_exit: Mutex<Option<ExitStatus>>,
     pub trace: bool,
+    /// `trace`, and whatever has been switched on since: a fork pair turns its two sides' traces on
+    /// when it goes live (`OMNI_FORK_TRACE_CALLS=1`), so the calls a parent makes after its fork
+    /// answered can be read without tracing the whole start of the app.
+    call_trace: std::sync::atomic::AtomicBool,
     /// What this process sees of a rooted device (hidden from root, spoofed); the default for every
     /// process but a host app process `spawn_as` started (and the children it execs and forks).
     pub view: crate::root::ProcessView,
@@ -79,6 +83,9 @@ pub struct Process {
     pub(crate) me: std::sync::OnceLock<std::sync::Weak<Process>>,
     /// Its parent and children (`crate::fork`).
     pub(crate) family: crate::fork::Family,
+    /// Who traces it, if anyone (`crate::ptrace`): one tracer at a time, which is the whole point
+    /// for the app that attaches a watchdog of its own to keep the slot.
+    pub(crate) traced: crate::ptrace::Traced,
     /// Shared with the vfork children running in this process's memory.
     backend: Option<Arc<DynarmicBackend>>,
     pub(crate) start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
@@ -383,7 +390,7 @@ fn on_svc(call: &mut ThunkCall<'_>) {
         task.clone_tpidr = call.tpidr_el0();
     }
     let process = Arc::clone(&task.process);
-    if process.trace {
+    if process.traced() {
         // A call that may wait is shown as it starts too: a thread that never returns is then seen
         // where it waits.
         use crate::syscall::nr;
@@ -481,7 +488,7 @@ fn on_svc(call: &mut ThunkCall<'_>) {
             m.remove(&task.tid);
         }
     }
-    if process.trace {
+    if process.traced() {
         // Path-taking calls show their path: what a trace is read for.
         use crate::syscall::nr;
         let path_arg = match number {
@@ -586,12 +593,14 @@ impl Process {
             next_tid: std::sync::atomic::AtomicI32::new(pid + 1),
             group_exit: Mutex::new(None),
             trace,
+            call_trace: std::sync::atomic::AtomicBool::new(trace),
             view,
             argv,
             comm: Mutex::new(comm),
             props,
             me: std::sync::OnceLock::new(),
             family: crate::fork::Family::default(),
+            traced: crate::ptrace::Traced::default(),
             sigtramp: std::sync::atomic::AtomicU64::new(0),
             backend,
             start: Mutex::new(None),
@@ -906,6 +915,24 @@ impl Process {
         }
     }
 
+    /// Whether this process's system calls are being traced.
+    pub(crate) fn traced(&self) -> bool {
+        self.call_trace.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Trace (or stop tracing) this process's system calls from now on.
+    pub(crate) fn trace_calls(&self, on: bool) {
+        self.call_trace.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// No task of this process is running guest code, and it has at least one -- it is waiting in
+    /// the kernel for something. What tells a fork pair that the side holding the memory is blocked
+    /// (`crate::fork`).
+    pub(crate) fn no_task_in_guest(&self) -> bool {
+        let tasks = self.tasks.lock();
+        !tasks.is_empty() && tasks.values().all(|h| h.state.load(std::sync::atomic::Ordering::SeqCst) != IN_GUEST)
+    }
+
     /// Let the frozen tasks run again.
     pub(crate) fn thaw(&self) {
         *self.freeze.lock() = None;
@@ -914,6 +941,11 @@ impl Process {
 
     /// Park the task while the process is frozen for another task's fork (not when it is ending).
     fn park_if_frozen(&self, tid: i32, state: &std::sync::atomic::AtomicU8) {
+        // A side of a live fork pair is frozen exactly while the other side has the memory, and a
+        // task that reached here without touching guest memory has asked for nothing yet. Claim it,
+        // so a system call that copies nothing (a `close`, a `kill`) cannot leave the task parked
+        // with no one to wake it. Not the vfork freeze: that process is not paired.
+        self.mem.ensure_resident();
         let mut freeze = self.freeze.lock();
         while freeze.is_some_and(|forking| forking != tid) && self.group_exit.lock().is_none() {
             state.store(PARKED, std::sync::atomic::Ordering::SeqCst);
@@ -1043,6 +1075,9 @@ impl Process {
             Profiled((*task).tid)
         };
         loop {
+            // One side of a fork pair runs guest code only while its view is the one in the
+            // memory (`crate::fork`); for every other process this is one relaxed load.
+            self.mem.ensure_resident();
             state.store(IN_GUEST, std::sync::atomic::Ordering::SeqCst);
             let ran = cpu.run(pc as usize, RunLimit::Unlimited);
             state.store(IN_KERNEL, std::sync::atomic::Ordering::SeqCst);

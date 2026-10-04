@@ -32,7 +32,7 @@ pub mod nr {
         TIMER_CREATE = 107 => "timer_create", TIMER_GETTIME = 108 => "timer_gettime", TIMER_GETOVERRUN = 109 => "timer_getoverrun",
         TIMER_SETTIME = 110 => "timer_settime", TIMER_DELETE = 111 => "timer_delete",
         CLOCK_GETTIME = 113 => "clock_gettime", CLOCK_GETRES = 114 => "clock_getres",
-        CLOCK_NANOSLEEP = 115 => "clock_nanosleep", SCHED_SETPARAM = 118 => "sched_setparam", SCHED_SETSCHEDULER = 119 => "sched_setscheduler",
+        CLOCK_NANOSLEEP = 115 => "clock_nanosleep", PTRACE = 117 => "ptrace", SCHED_SETPARAM = 118 => "sched_setparam", SCHED_SETSCHEDULER = 119 => "sched_setscheduler",
         SCHED_GETSCHEDULER = 120 => "sched_getscheduler", SCHED_GETPARAM = 121 => "sched_getparam",
         SCHED_GETAFFINITY = 123 => "sched_getaffinity",
         SCHED_YIELD = 124 => "sched_yield", SCHED_GET_PRIORITY_MAX = 125 => "sched_get_priority_max",

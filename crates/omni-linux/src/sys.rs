@@ -869,6 +869,18 @@ fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
         if crate::zygote::signal(tid.abs(), sig as i32).is_some() {
             return if (0..=64).contains(&sig) { Ok(0) } else { Err(EINVAL) };
         }
+        // A thread of a process this one traces: a debugger probes each with signal 0 and may stop
+        // or kill it (`crate::ptrace`; the self-debugging watchdog checks its tracee this way).
+        if let Some(tracee) = crate::ptrace::tracee_of(p.sys.pid, tid) {
+            if sig == 0 {
+                return Ok(0);
+            }
+            if !(1..=64).contains(&sig) {
+                return Err(EINVAL);
+            }
+            crate::fork::signal_process(&tracee, sig as i32);
+            return Ok(0);
+        }
         // A child of this process (vold's, installd's): the signal is its to act on.
         let child = p.family.child(tid).ok_or(ESRCH)?;
         if sig != 0 {

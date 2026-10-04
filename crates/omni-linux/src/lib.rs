@@ -39,6 +39,7 @@ pub mod mm;
 pub mod pipe;
 pub mod poll;
 pub mod process;
+pub mod ptrace;
 pub mod procfs;
 pub mod props;
 pub mod seccomp;
@@ -76,6 +77,7 @@ pub fn install_all(table: &mut syscall::Table) {
     xattr::install(table);
     mount::install(table);
     fork::install(table);
+    ptrace::install(table);
     bpf::install_syscalls(table);
     root::syscall::install(table);
 }

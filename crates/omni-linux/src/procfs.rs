@@ -770,10 +770,15 @@ impl Process {
         let rest = std::str::from_utf8(path.strip_prefix(b"/proc/")?).ok()?;
         let (first, tail) = rest.split_once('/').unwrap_or((rest, ""));
         let pid: i32 = first.parse().ok()?;
-        if pid == self.sys.pid || !OF_ANOTHER.contains(&tail) {
+        if pid == self.sys.pid {
             return None;
         }
-        crate::process::all_live().into_iter().find(|q| q.sys.pid == pid && !q.has_exited())
+        let q = crate::process::all_live().into_iter().find(|q| q.sys.pid == pid && !q.has_exited())?;
+        // A tracer sees its tracee's threads: `/proc/<tracee>/task` is how a debugger finds the
+        // threads it must follow, and the self-debugging watchdog reads it to attach to each
+        // (`crate::ptrace`). Only `task`, and only for the one process it traces.
+        let traced_by_me = q.traced.tracer() == Some(self.sys.pid) && (tail == "task" || tail.starts_with("task/"));
+        (OF_ANOTHER.contains(&tail) || traced_by_me).then_some(q)
     }
 }
 

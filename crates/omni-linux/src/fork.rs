@@ -43,6 +43,8 @@ pub struct Family {
     changed: Condvar,
     /// Set while the parent's forking thread waits: released at `execve` or the child's end.
     release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Set on a fork child for as long as it shares its parent's memory: ended with it.
+    pair: Mutex<Option<Arc<ForkPair>>>,
     /// An image `execve` replaced: its end is not the process's end.
     superseded: AtomicBool,
     /// The image that replaced this one: `run` answers how it ended.
@@ -108,6 +110,12 @@ impl Family {
     }
 
     fn release_parent(&self) {
+        // The child is done sharing: the memory goes back to the parent before anything else, so a
+        // parent waiting at the gate finds its own view in it.
+        let pair = self.pair.lock().take();
+        if let Some(pair) = pair {
+            pair.finish();
+        }
         if let Some(tx) = self.release.lock().take() {
             let _ = tx.send(());
         }
@@ -122,6 +130,20 @@ impl Family {
 pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysResult {
     let parent = Arc::clone(&t.process);
     let (regs, parent_sp) = t.clone_regs.take().ok_or(EINVAL)?;
+    // OMNI_FORK_NOCHILD=1 -- a diagnostic, never a default: the child is never started and the
+    // parent runs on at once, with the child recorded as having exited 0. It answers one question,
+    // "is this fork the only thing holding the app up?", for an app whose fork child never executes
+    // a program (Clash of Clans' anti-tamper watchdog), which this fork deadlocks on by design.
+    if nochild() {
+        let child = parent.fork_child();
+        let pid = child.sys.pid;
+        parent.family.children.lock().insert(pid, Child::Ended(0, child.sys.uid()));
+        eprintln!("[fork] OMNI_FORK_NOCHILD: {} forked {pid}, which is not started", p.sys.pid);
+        if flags & CLONE_PARENT_SETTID != 0 {
+            p.mem.write_u32(a[2], pid as u32).map_err(|_| EFAULT)?;
+        }
+        return Ok(pid as u64);
+    }
     let tpidr = t.clone_tpidr;
     let frozen_at = std::time::Instant::now();
     parent.freeze_others(t.tid);
@@ -134,22 +156,44 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
     if p.trace {
         eprintln!("[fork] child {pid} of {}: {} bytes of private memory kept", t.tid, snapshot.bytes());
     }
+    let kept_bytes = snapshot.bytes();
+    let pair = ForkPair::new(snapshot, &parent, &child);
+    *child.family.pair.lock() = Some(Arc::clone(&pair));
     let started = start_child(p, t, &parent, &child, flags, a, regs, sp, tpidr);
     drop(child);
     // Until the child executes a program or ends (a dropped sender -- the child's thread gone --
-    // ends the wait too).
+    // ends the wait too), or until the child blocks instead and the pair hands the memory back.
+    let mut shared = false;
     if let Ok(rx) = &started {
-        let _ = rx.recv();
+        let server = Arc::clone(&pair);
+        let _ = std::thread::Builder::new().name(format!("omni-linux-fork-pair-{pid}")).spawn(move || server.serve());
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if pair.handed_over() {
+                        shared = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
     let released_at = std::time::Instant::now();
-    snapshot.restore(p);
-    parent.thaw();
+    // Handed back: the pair put the fork-time image in the memory and thawed this process already,
+    // and the child lives on with a view of its own. Otherwise this was a vfork after all.
+    if !shared {
+        pair.finish();
+        pair.restore_parent(p);
+        parent.thaw();
+    }
     // OMNI_FORK_TRACE=1: each fork, what it kept, and how long its parent stood still.
     if fork_trace() {
         eprintln!(
-            "[fork] {} forked {pid}: {} MiB kept, parent frozen {} ms (snapshot {} ms, child to exec {} ms, restore {} ms)",
+            "[fork] {} forked {pid}{}: {} MiB kept, parent frozen {} ms (snapshot {} ms, child to exec {} ms, restore {} ms)",
             p.sys.pid,
-            snapshot.bytes() >> 20,
+            if shared { ", which lives on beside it" } else { "" },
+            kept_bytes >> 20,
             frozen_at.elapsed().as_millis(),
             (taken_at - frozen_at).as_millis(),
             (released_at - taken_at).as_millis(),
@@ -166,6 +210,12 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
 fn fork_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("OMNI_FORK_TRACE").as_deref() == Ok("1"))
+}
+
+/// `OMNI_FORK_NOCHILD=1`: the diagnostic above.
+fn nochild() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_FORK_NOCHILD").as_deref() == Ok("1"))
 }
 
 /// Start the fork child's thread; the receiver its release comes on.
@@ -245,6 +295,66 @@ impl Snapshot {
         self.kept.iter().map(|(_, b)| b.len()).sum()
     }
 
+    /// Take the resident side's divergence from this image out of the address space, leaving the
+    /// image itself in it: every page that differs is answered (with that side's content) and
+    /// written back from the image. The caller holds the layout lock exclusively, so no copy
+    /// interleaves. This is [`restore`](Self::restore) with the old content kept rather than
+    /// dropped -- the half of a switch that shelves a side.
+    fn shelve_holding_layout(&self, p: &Process, journal: &[(u64, usize)]) -> Shelf {
+        const PAGE: usize = 4096;
+        let keep_kernel_writes = |at: u64, page: &mut [u8], current: &[u8]| {
+            let end = at + page.len() as u64;
+            for &(w, len) in journal {
+                let (from, to) = (w.max(at), (w + len as u64).min(end));
+                if from < to {
+                    let (i, j) = ((from - at) as usize, (to - at) as usize);
+                    page[i..j].copy_from_slice(&current[i..j]);
+                }
+            }
+        };
+        let mut shelf = Shelf::new();
+        for (start, bytes) in &self.kept {
+            let whole = p.mem.read_holding_layout(*start, bytes.len()).ok();
+            for (n, was) in bytes.chunks(PAGE).enumerate() {
+                let at = start + (n * PAGE) as u64;
+                let now = match &whole {
+                    Some(w) => std::borrow::Cow::Borrowed(&w[n * PAGE..n * PAGE + was.len()]),
+                    None => match p.mem.read_holding_layout(at, was.len()) {
+                        Ok(v) => std::borrow::Cow::Owned(v),
+                        Err(_) => continue,
+                    },
+                };
+                if *now != *was {
+                    shelf.push((at, now.to_vec()));
+                    let mut page = was.to_vec();
+                    keep_kernel_writes(at, &mut page, &now);
+                    let _ = p.mem.write_holding_layout(at, &page);
+                }
+            }
+        }
+        for &(start, end) in &self.untouched {
+            let mut at = start;
+            while at < end {
+                let Some(r) = p.mem.space().region_at(at as usize) else { break };
+                let next = ((r.start + r.len) as u64).min(end);
+                if r.committed != 0 {
+                    for page_at in (at..next).step_by(PAGE) {
+                        let len = PAGE.min((next - page_at) as usize);
+                        let Ok(now) = p.mem.read_holding_layout(page_at, len) else { continue };
+                        if now.iter().any(|b| *b != 0) {
+                            shelf.push((page_at, now.clone()));
+                            let mut page = vec![0u8; len];
+                            keep_kernel_writes(page_at, &mut page, &now);
+                            let _ = p.mem.write_holding_layout(page_at, &page);
+                        }
+                    }
+                }
+                at = next;
+            }
+        }
+        shelf
+    }
+
     /// Put back every page that changed, but for the ranges the kernel wrote for the parent
     /// meanwhile (its journal); a page untouched at the fork that the child touched reads as
     /// zeros again. Under the layout lock, so no write of the kernel's interleaves.
@@ -301,6 +411,316 @@ impl Snapshot {
                 at = next;
             }
         }
+    }
+}
+
+/// Which of a fork pair's two views is meant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Side {
+    Parent,
+    Child,
+}
+
+/// A side's divergence from the fork-time image: its content for the pages it differs on.
+type Shelf = Vec<(u64, Vec<u8>)>;
+
+/// How long a fork child that has not executed a program must have sat still before the pair is
+/// made live -- the answer to "is this child going to execute a program, or is it staying?".
+///
+/// Half a second. Every fork the boot makes -- vold's `vold_prepare_subdirs`, installd's
+/// `dex2oat`, a shell's pipeline -- reaches `execve` in a few milliseconds, so none of them is ever
+/// made live, and that path keeps exactly the cost and the code it had. A child still sitting there
+/// half a second later is waiting on its parent, and the only way it will ever stop waiting is to
+/// be given a view of its own. Its parent's `fork` pays this once, well inside the 60 s
+/// ActivityManager allows a process to start in.
+/// `OMNI_FORK_SHARE_AFTER_MS` overrides it, for measuring what a shorter or longer wait costs: the
+/// parent's `fork` takes this long to answer, and an app that times its own fork can see it.
+const CHILD_IS_STAYING_MS: u64 = 500;
+
+fn child_is_staying() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| std::env::var("OMNI_FORK_SHARE_AFTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(CHILD_IS_STAYING_MS)))
+}
+
+/// Once the pair is live, how long the side holding the memory must have been out of guest code
+/// before it is handed over. Short: by now both sides are known to take turns, and this is the
+/// pause between one side stopping and the other starting.
+const IDLE_BEFORE_HANDOVER: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// A child that never blocks still gives the memory back to its parent this long after taking it:
+/// a turn is a turn, and a parent must not be stopped indefinitely by one.
+const CHILD_TURN_AT_MOST: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// **The one memory, time-shared between a fork parent and a child that has not executed a
+/// program.** A guest address is a host address and both live in one host process, so only one
+/// side's view can be in the address space at a time; this holds the other's.
+///
+/// A side's view is always the fork-time `image` plus its own writes, which is what `fork` promises
+/// -- kept over the pair's whole life rather than only across the vfork window. The pair is made
+/// live only when the child is seen to block instead of executing a program, so the fork-exec path
+/// every boot takes is reached and finished before any of this is attached.
+pub(crate) struct ForkPair {
+    /// The parent's private writable memory as the fork found it.
+    image: Snapshot,
+    inner: Mutex<Pair>,
+    changed: Condvar,
+    parent: Weak<Process>,
+    child: Weak<Process>,
+}
+
+struct Pair {
+    /// Whose view is in the address space.
+    resident: Side,
+    /// The side that is not resident, as it left the memory.
+    parent_shelf: Shelf,
+    child_shelf: Shelf,
+    /// Each side's standing claim on the memory. The child's is set when a call completes for it
+    /// or it is about to run; the parent's whenever it loses the memory, because its tasks are
+    /// then parked and cannot ask for themselves.
+    parent_wants: bool,
+    child_wants: bool,
+    /// Live once the first handover has happened; until then this is an ordinary vfork.
+    live: bool,
+    /// The child executed a program or ended: the memory is the parent's for good.
+    over: bool,
+}
+
+impl Pair {
+    /// How many pages the given side has shelved (0 for whichever side is resident).
+    fn shelf_len(&self, side: Side) -> usize {
+        match side {
+            Side::Parent => self.parent_shelf.len(),
+            Side::Child => self.child_shelf.len(),
+        }
+    }
+}
+
+/// The gate `GuestMem` waits at before a copy (`crate::guest::Resident`).
+struct Seat {
+    pair: Arc<ForkPair>,
+    side: Side,
+}
+
+impl crate::guest::Resident for Seat {
+    fn ensure(&self) {
+        self.pair.ensure(self.side);
+    }
+}
+
+impl ForkPair {
+    fn new(image: Snapshot, parent: &Arc<Process>, child: &Arc<Process>) -> Arc<Self> {
+        Arc::new(Self {
+            image,
+            inner: Mutex::new(Pair { resident: Side::Child, parent_shelf: Vec::new(), child_shelf: Vec::new(), parent_wants: false, child_wants: false, live: false, over: false }),
+            changed: Condvar::new(),
+            parent: Arc::downgrade(parent),
+            child: Arc::downgrade(child),
+        })
+    }
+
+    fn process(&self, side: Side) -> Option<Arc<Process>> {
+        match side {
+            Side::Parent => self.parent.upgrade(),
+            Side::Child => self.child.upgrade(),
+        }
+    }
+
+    /// Block until `side`'s view is the one in the address space. A side that is already resident,
+    /// or a pair that is over, costs a lock and nothing else.
+    fn ensure(&self, side: Side) {
+        let mut inner = self.inner.lock();
+        if inner.over || inner.resident == side {
+            return;
+        }
+        match side {
+            Side::Parent => inner.parent_wants = true,
+            Side::Child => inner.child_wants = true,
+        }
+        self.changed.notify_all();
+        while !inner.over && inner.resident != side {
+            self.changed.wait(&mut inner);
+        }
+    }
+
+    /// The memory has been handed back to the parent: its forking thread may return.
+    fn handed_over(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.live && inner.resident == Side::Parent
+    }
+
+    /// The fork ended as a vfork does (the child executed a program or exited) and the pair was
+    /// never made live: put the parent's memory back exactly as it did before.
+    fn restore_parent(&self, p: &Process) {
+        self.image.restore(p);
+    }
+
+    /// The pair is over: the parent keeps the memory and both views stop waiting. If the child had
+    /// the memory when it stopped sharing, the parent's view is put back into it first -- otherwise
+    /// the parent would run on in the child's.
+    fn finish(&self) {
+        let give_back = {
+            let inner = self.inner.lock();
+            inner.live && !inner.over && inner.resident == Side::Child
+        };
+        if give_back {
+            self.switch_to(Side::Parent);
+        }
+        let mut inner = self.inner.lock();
+        inner.over = true;
+        self.changed.notify_all();
+        drop(inner);
+        for side in [Side::Parent, Side::Child] {
+            if let Some(p) = self.process(side) {
+                p.mem.unshare();
+            }
+        }
+    }
+
+    /// Hand the memory to `to`, which the other side has. The side losing it is stopped first (no
+    /// task of it in guest code), and the exchange is made under the layout lock, which every copy
+    /// holds shared -- so neither a running task nor a completing call can see a half-swapped view.
+    fn switch_to(&self, to: Side) {
+        let from = match to {
+            Side::Parent => Side::Child,
+            Side::Child => Side::Parent,
+        };
+        let (Some(losing), Some(gaining)) = (self.process(from), self.process(to)) else { return };
+        // Stop the side that has the memory: `freeze_others(0)` exempts no task, and it waits for
+        // each one to leave guest code.
+        losing.freeze_others(0);
+        {
+            let _layout = losing.mem.layout().write();
+            let mut inner = self.inner.lock();
+            if inner.over || inner.resident == to {
+                drop(inner);
+                losing.thaw();
+                return;
+            }
+            // The journal is the parent's: the ranges the kernel wrote for it while the child had
+            // the memory. It is emptied at the first handover and is empty after that, because
+            // from then on a call completing for a shelved side waits for its turn instead.
+            let journal = self.process(Side::Parent).map(|p| p.mem.take_journal()).unwrap_or_default();
+            let shelved = self.image.shelve_holding_layout(&losing, &journal);
+            let taking = match to {
+                Side::Parent => std::mem::take(&mut inner.parent_shelf),
+                Side::Child => std::mem::take(&mut inner.child_shelf),
+            };
+            apply_shelf_holding_layout(&gaining, &taking);
+            match from {
+                Side::Parent => inner.parent_shelf = shelved,
+                Side::Child => inner.child_shelf = shelved,
+            }
+            inner.resident = to;
+            match to {
+                Side::Parent => inner.parent_wants = false,
+                Side::Child => inner.child_wants = false,
+            }
+            // The parent has just been stopped mid-run and its tasks are parked, so it cannot ask
+            // for the memory itself: its claim stands from here until it has it back.
+            if from == Side::Parent {
+                inner.parent_wants = true;
+            }
+        }
+        gaining.thaw();
+        self.changed.notify_all();
+        if fork_trace() {
+            let inner = self.inner.lock();
+            eprintln!("[fork] the memory goes to the {to:?}: it kept {} pages, the {from:?} left {} behind", inner.shelf_len(to), inner.shelf_len(from));
+        }
+    }
+
+    /// Every task of `side` is out of guest code (it has at least one task, and none is running).
+    fn idle(&self, side: Side) -> bool {
+        self.process(side).is_some_and(|p| p.no_task_in_guest())
+    }
+
+    /// The pair's own thread: it makes every switch, so no task ever performs one itself and the
+    /// lock order is the same everywhere. It hands the memory over when the side that has it is
+    /// blocked, and when the other side asks.
+    /// The two sides are not symmetric, and the policy says so. The **parent owns the memory**: it
+    /// keeps it while it runs, and gets it back as soon as the child stops using it. The **child
+    /// is a guest**: it asks, is let in at once -- the parent would otherwise never yield, having
+    /// no reason to -- does its turn, and blocks, which gives the memory straight back.
+    ///
+    /// So the costly half of a switch, shelving a parent that has been running and has diverged
+    /// from the fork-time image, is paid only when the child actually has something to do, and
+    /// never merely because the parent waited on a binder call for a moment.
+    fn serve(self: Arc<Self>) {
+        let mut idle_since: Option<std::time::Instant> = None;
+        let mut child_since: Option<std::time::Instant> = None;
+        loop {
+            let (over, resident, parent_wants, child_wants, live) = {
+                let inner = self.inner.lock();
+                (inner.over, inner.resident, inner.parent_wants, inner.child_wants, inner.live)
+            };
+            if over {
+                return;
+            }
+            let idle = self.idle(resident);
+            if idle {
+                idle_since.get_or_insert_with(std::time::Instant::now);
+            } else {
+                idle_since = None;
+            }
+            let still_for = if live { IDLE_BEFORE_HANDOVER } else { child_is_staying() };
+            let settled = idle_since.is_some_and(|t| t.elapsed() >= still_for);
+            let switch = match resident {
+                // The child wants in: let it, running parent or not.
+                Side::Parent if child_wants && self.process(Side::Child).is_some() => Some(Side::Child),
+                // The child has stopped: the parent takes its memory back. Before the pair is live
+                // this is the first handover, and what makes it live.
+                Side::Child if settled && (parent_wants || !live) => Some(Side::Parent),
+                // A child that never blocks must not keep the memory from its parent for ever.
+                Side::Child if parent_wants && child_since.is_some_and(|t| t.elapsed() >= CHILD_TURN_AT_MOST) => Some(Side::Parent),
+                _ => None,
+            };
+            if let Some(to) = switch {
+                if !live {
+                    self.go_live();
+                }
+                self.switch_to(to);
+                idle_since = None;
+                child_since = (to == Side::Child).then(std::time::Instant::now);
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// The child blocked rather than executing a program: from here both sides take turns, and
+    /// every copy either makes waits for its turn.
+    fn go_live(self: &Arc<Self>) {
+        let mut inner = self.inner.lock();
+        if inner.live || inner.over {
+            return;
+        }
+        inner.live = true;
+        drop(inner);
+        for side in [Side::Parent, Side::Child] {
+            if let Some(p) = self.process(side) {
+                p.mem.share_with(Arc::new(Seat { pair: Arc::clone(self), side }));
+            }
+        }
+        if fork_trace() {
+            eprintln!("[fork] the child blocked: parent and child now take turns in the memory");
+        }
+        // OMNI_FORK_TRACE_CALLS=1: from here, both sides' system calls are traced. The window that
+        // matters for an app whose fork child stays -- what the parent does once its fork has
+        // answered -- without the cost of tracing the whole start of the app into it.
+        if std::env::var("OMNI_FORK_TRACE_CALLS").as_deref() == Ok("1") {
+            for side in [Side::Parent, Side::Child] {
+                if let Some(p) = self.process(side) {
+                    p.trace_calls(true);
+                }
+            }
+        }
+    }
+}
+
+/// Write a shelved side's pages back into the address space.
+fn apply_shelf_holding_layout(p: &Process, shelf: &Shelf) {
+    for (at, bytes) in shelf {
+        let _ = p.mem.write_holding_layout(*at, bytes);
     }
 }
 
@@ -429,12 +849,42 @@ fn wait_child(p: &Process, t: &Task, want: impl Fn(i32) -> bool, nohang: bool, k
     }
 }
 
+/// Wait for a stop from a process this one traces (`crate::ptrace`). A tracee is not a child, so
+/// this is reached only once `wait_child` has answered `ECHILD`; with no such tracee either, that
+/// `ECHILD` stands. The wait itself is a poll: a stop is posted by the attach, not by a scheduler
+/// this layer has.
+fn wait_tracee(p: &Process, t: &Task, want: &impl Fn(i32) -> bool, nohang: bool) -> Result<Option<(i32, i32, u32)>, Errno> {
+    let me = p.sys.pid;
+    loop {
+        if let Some((pid, status)) = crate::ptrace::tracee_stop(me, want) {
+            return Ok(Some((pid, status, p.sys.uid())));
+        }
+        if !crate::ptrace::traces_any(me, want) {
+            return Err(ECHILD);
+        }
+        if nohang {
+            return Ok(None);
+        }
+        if t.pending.load(Ordering::SeqCst) & !t.sigmask != 0 {
+            return Err(EINTR);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// `wait4(pid, wstatus, options, rusage)`: `pid` > 0 that child, anything else any child (there
 /// are no process groups of children here). `rusage` is zeroed.
 fn sys_wait4(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     const WNOHANG: u64 = 1;
     let target = a[0] as i64 as i32;
-    let found = wait_child(p, t, |pid| target <= 0 || pid == target, a[2] & WNOHANG != 0, false)?;
+    let want = |pid: i32| target <= 0 || pid == target;
+    let found = match wait_child(p, t, want, a[2] & WNOHANG != 0, false) {
+        Ok(found) => found,
+        // A tracer waits for its tracee as it does for a child, even when the tracee is its own
+        // parent (`crate::ptrace`: the self-debugging watchdog).
+        Err(e) if e == ECHILD => wait_tracee(p, t, &want, a[2] & WNOHANG != 0)?,
+        Err(e) => return Err(e),
+    };
     let Some((pid, word, _)) = found else { return Ok(0) };
     if a[1] != 0 {
         p.mem.write_u32(a[1], word as u32)?;

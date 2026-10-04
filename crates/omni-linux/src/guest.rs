@@ -28,6 +28,14 @@ pub trait Remote: Send + Sync {
     fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno>;
 }
 
+/// One side of a live fork pair whose two views take turns in the one memory (`crate::fork`).
+/// Every copy this view makes waits here first, so a call that completes for the side whose view is
+/// *not* in the address space cannot write into the other's memory.
+pub trait Resident: Send + Sync {
+    /// Block until this side's view is the one in the address space.
+    fn ensure(&self);
+}
+
 pub struct GuestMem {
     space: Arc<GuestSpace>,
     layout: Layout,
@@ -37,12 +45,48 @@ pub struct GuestMem {
     /// process (a blocked call completing), which the fork's restore keeps.
     journaling: std::sync::atomic::AtomicBool,
     journal: parking_lot::Mutex<Vec<(u64, usize)>>,
+    /// Set while this process is one side of a live fork pair. `paired` is the whole cost on the
+    /// copy path for every process that is not: one relaxed load.
+    paired: std::sync::atomic::AtomicBool,
+    resident: parking_lot::Mutex<Option<Arc<dyn Resident>>>,
 }
 
 impl GuestMem {
     #[must_use]
     pub fn new(space: Arc<GuestSpace>, layout: Layout) -> Self {
-        Self { space, layout, remote: std::sync::OnceLock::new(), journaling: std::sync::atomic::AtomicBool::new(false), journal: parking_lot::Mutex::default() }
+        Self {
+            space,
+            layout,
+            remote: std::sync::OnceLock::new(),
+            journaling: std::sync::atomic::AtomicBool::new(false),
+            journal: parking_lot::Mutex::default(),
+            paired: std::sync::atomic::AtomicBool::new(false),
+            resident: parking_lot::Mutex::default(),
+        }
+    }
+
+    /// This view is one side of a live fork pair: every copy waits for its turn in the memory.
+    pub(crate) fn share_with(&self, side: Arc<dyn Resident>) {
+        *self.resident.lock() = Some(side);
+        self.paired.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The pair is over (the child executed a program or ended): copies are unconditional again.
+    pub(crate) fn unshare(&self) {
+        self.paired.store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.resident.lock() = None;
+    }
+
+    /// Wait until this side's view is the one in the address space. Called before a copy takes the
+    /// layout lock -- never while holding it, which is what a switch takes exclusively.
+    pub(crate) fn ensure_resident(&self) {
+        if !self.paired.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let side = self.resident.lock().clone();
+        if let Some(side) = side {
+            side.ensure();
+        }
     }
 
     /// Make this a stand-in's memory: every access goes to `remote`.
@@ -149,6 +193,8 @@ impl GuestMem {
         if let Some(r) = self.remote.get() {
             return r.read(untag(addr), len);
         }
+        // Before the layout lock, never while holding it: a switch takes it exclusively.
+        self.ensure_resident();
         let _layout = self.layout.read();
         let start = self.check(addr, len, false)?;
         let mut out = vec![0u8; len];
@@ -157,6 +203,9 @@ impl GuestMem {
     }
 
     pub fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+        // Before the layout lock, as `read`: this is what stops a call that completes for the side
+        // whose view is shelved from writing its answer into the other side's memory.
+        self.ensure_resident();
         let _layout = self.layout.read();
         self.write_holding_layout(addr, bytes)
     }
@@ -181,6 +230,7 @@ impl GuestMem {
         if untag(addr) % 4 != 0 {
             return Err(crate::errno::EINVAL);
         }
+        self.ensure_resident();
         let start = self.check(addr, 4, true)?;
         // Four aligned bytes are one host page: its address, or its alias if the page traps (D42).
         let ptr = match self.space.access_ptr(start, 4) {
