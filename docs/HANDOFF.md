@@ -22,8 +22,16 @@ same package at another version gets an Android of its own. Clash of Clans first
   refused by name.
 - The watchdog's protocol now runs end to end -- attach, wait, set options, continue for all
   thirteen threads, then its report to the parent -- and the child's whole divergence is 24 pages.
-- **ROOT CAUSE (2026-10-04): the blocker is Google Play attestation, not an emulator tell, and it
-  is not an omnidroid bug.** The failure is a Java exception (`cnsbodqak.az`, thrown from Thread-1
+- **WHAT IS PROVEN (2026-10-04).** `cnsbodqak.az` is thrown by `cnsbodqak.g.a(String)`, which is a
+  message deserializer, not a check: it reads the first hex byte as a type tag and dispatches, and a
+  string that **starts with `!` is the error marker** -- `g.a` wraps it in `az` and throws
+  (decompiled with `tools/dexdis.py`). So `cnsbodqak.az: !<base64>` is the app's native->Java
+  protocol surfacing an **error-tagged, encrypted message** that something upstream produced; the
+  exception is the wrapper, not the gate. The `!` payload appears only once the native watchdog runs
+  (with `OMNI_FORK_NOCHILD` it was a bare `!`), so the native protection layer produces the verdict,
+  after its anti-debug (fork + ptrace of every thread) passes. **The verdict is encrypted and cannot
+  be read without the key; which specific condition set it is not determinable from outside without
+  decrypting it or finishing the native RE.** What is also true, but not proven to be the trigger: The failure is a Java exception (`cnsbodqak.az`, thrown from Thread-1
   `cnsbodqak.V.run`): `cnsbodqak` is a dedicated obfuscated Java anti-tamper package. The native
   anti-debug it runs first (the fork watchdog, ptrace of every thread) now completes; the **Java**
   layer then rejects the environment. The APK carries Play Integrity (`StandardIntegrity` x22,
