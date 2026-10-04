@@ -36,6 +36,15 @@ same package at another version gets an Android of its own. Clash of Clans first
   | `/proc/sys/kernel/yama/ptrace_scope` = 1 (`d36ae3c`); it *does* read this, right after `prctl(PR_SET_PTRACER)` | opens now (was ENOENT), same verdict |
   | `uname` no longer reporting release `6.1.99-omnidroid` (`fea3867`); it calls `uname` exactly once in the window | same verdict |
 
+  **The APK and our reading of it are both sound, so neither is the cause.** In the window it walks
+  its own package: 5464 reads of exactly 46 bytes (a zip central-directory header) over `base.apk`,
+  for an archive of 5411 entries. Our reads serve it correctly -- 10817 full reads, one short, and
+  that one is the last, at EOF, which is what a regular file does. The file is the real one: its
+  APK Signing Block carries v2 and v3 schemes and the certificate reads `Supercell`, `Helsinki`, so
+  it is Supercell's own signature and not a repackager's (worth checking first for any such app --
+  a merged universal APK from a mirror would be resigned and would fail its own check on a real
+  phone too).
+
   What it is seen to gather after the handshake: `/proc/self/cmdline`, its own `lib/arm64` directory,
   its `base.apk`, `/proc/<pid>/task`, the shield `.dat`, then ~4.7 MB of `mprotect` RWX->RX (its
   unpacker) and a page-at-a-time `mprotect` loop. The decision itself makes no system call, so a
