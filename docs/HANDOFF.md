@@ -57,22 +57,36 @@ path per package name).
 of tertiary display 2`. A third app side by side therefore needs a **virtual** display
 (SurfaceFlinger makes many), presented into a framebuffer and window of its own.
 
-**The launch rule is in** (`6e03fe0`): `start_instance` *places* the app -- a different package goes
-on the live device's next free display, the same package at other bytes gets an Android of its own,
-and a device with every display taken sends it on. `fits` is the rule without a device and
-`server::tests::where_an_app_goes` is its gate; `find_all`, `boot_another`, `install_beside`,
-`start_on` and `Device::display_ids` are underneath it, and warm devices boot with
-`OMNI_DISPLAYS=2`. **Not yet run through a live `start_instance`**: this session's MCP server was
-the previous binary, so the rule is gated by its unit test and the mechanism under it was verified
-by hand on a two-display device.
+**The launch rule is in and run** (`6e03fe0`, `3c41b7a`): `start_instance` *places* the app -- a
+different package goes on the live device's next free display, the same package at other bytes gets
+an Android of its own, and a device with every display taken sends it on. `fits` is the rule without
+a device and `server::tests::where_an_app_goes` is its gate; `find_all`, `boot_another`,
+`install_beside`, `start_on` and `Device::display_ids` are underneath it.
+
+**Both branches, through the real server** (`python tools/mcp_demo.py start:<apk> start:<apk>`,
+which drives `target/release/omni-mcp.exe` over stdio -- the way to test it when the editor's own
+MCP server is an older binary):
+
+```
+com.outfit7.talkingtomcamp  display=0  device=omni-warm-1791129845  booted  app_on_screen
+com.roblox.client           display=2  device=omni-warm-1791129845  warm    app_on_screen
+
+com.roblox.client  sha=86fca8a47a  display=0  device=omni-warm-1791130032  booted  app_on_screen
+com.roblox.client  sha=4bcb90eee4  display=0  device=omni-warm-1791130104  booted  app_on_screen
+```
+
+Two packages share one Android on displays 0 and 2; two builds of one package get an Android each,
+both alive at once (18 host processes, 7.5 GB of 31.8 GB free). `3c41b7a` is what made the first
+work: `OMNI_DISPLAYS` had been set on the Roblox session's command instead of the warm boot, so a
+warm device still had one display and the second app was sent to a second Android.
 
 Next, in order:
 
-1. **Run it through `start_instance`** on a fresh MCP server: Talking Tom then Roblox should answer
-   with `display` 0 and 2 on one device, and a second Roblox APK (other bytes) should boot a second
-   device. The host needs the commit for two Androids (~3.7 GB each).
-2. **A virtual display path**, for the third app and beyond (`createVirtualDisplay`, its output into
+1. **A virtual display path**, for the third app and beyond (`createVirtualDisplay`, its output into
    a `Framebuffer`), since physical displays stop at two per Android.
+2. **An instance's display does not survive the server**: instances are the server's, so after a
+   restart an app already installed is started without `--display` and lands on display 0. The
+   device could be asked instead (`dumpsys activity activities`, resumed per display).
 3. **Input association per display** and per-display focus: a second window's keyboard and mouse
    would reach display 0 today, so its window is opened with `input: false`.
 4. A screenshot path for a display other than the first (`screenshot` and `OMNI_SCREENSHOT` are
