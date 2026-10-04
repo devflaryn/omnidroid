@@ -19,7 +19,7 @@ const OVERRIDES: &[(&str, &str)] = &[
     ("ro.product.system.brand", "google"),
     ("ro.product.system.manufacturer", "Google"),
     ("ro.product.system.model", "Pixel 8"),
-    ("ro.product.system.device", "generic"),
+    ("ro.product.system.device", "shiba"),
     ("ro.product.system.name", "shiba"),
     ("ro.product.vendor.brand", "google"),
     ("ro.product.vendor.manufacturer", "Google"),
@@ -77,6 +77,16 @@ pub fn pixel_overrides() -> &'static [(&'static str, &'static str)] {
 #[must_use]
 pub fn removals() -> &'static [&'static str] {
     &["ro.kernel.qemu", "ro.boot.qemu"]
+}
+
+/// Whether a file name is an emulator tell: the AOSP image is built from the emulator GSI, so it
+/// carries `ranchu`/`goldfish`/`qemu`-named overlays, HALs and devices. A directory scan that finds
+/// one concludes "emulator"; a spoofed process is not shown these entries. Hiding them from a
+/// *listing* (not blocking a direct open) keeps the renderer's `...-impl-ranchu.so` mapper working.
+#[must_use]
+pub fn is_emulator_name(name: &[u8]) -> bool {
+    let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+    [b"ranchu".as_slice(), b"goldfish".as_slice(), b"qemu".as_slice()].iter().any(|t| lower.windows(t.len()).any(|w| w == *t))
 }
 
 /// `/proc/cpuinfo` of a Pixel 8 (Tensor G3 "zuma"): 4x A520, 3x A720, 1x X3, ending in

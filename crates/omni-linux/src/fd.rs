@@ -1087,7 +1087,15 @@ fn sys_getdents64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut kind = file.kind.lock();
     let FileKind::Dir { dir, entries, next } = &mut *kind else { return Err(ENOTDIR) };
     if entries.is_none() {
-        *entries = Some(p.vfs.list(dir)?);
+        let mut list = p.vfs.list(dir)?;
+        // A spoofed process is not shown the emulator GSI's `ranchu`/`goldfish`/`qemu`-named files:
+        // an anti-tamper that lists /vendor/overlay, /product/overlay or /vendor/lib64/hw and scans
+        // names would otherwise see the emulator (`crate::root::spoof`). Listing only -- a direct
+        // open of a path (the renderer's `-impl-ranchu.so` mapper) still works.
+        if p.view.spoofed {
+            list.retain(|e| !crate::root::spoof::is_emulator_name(&e.name));
+        }
+        *entries = Some(list);
     }
     let list = entries.as_ref().expect("listed");
     let mut out = Vec::new();
