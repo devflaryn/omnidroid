@@ -10,6 +10,7 @@
 #define OP_STATUS 2
 #define OP_SETPROP 3
 #define OP_DELPROP 4
+#define OP_DENYLIST 5
 
 static long omni_root(long op, long a1, long a2, long a3) {
     register long x8 asm("x8") = 510;
@@ -162,8 +163,28 @@ static int applet_magisk(int argc, char **argv) {
         printf("/debug_ramdisk\n");
         return 0;
     }
-    if (!strcmp(a, "--denylist") || !strcmp(a, "--sqlite")) {
-        err("unsupported in omnidroid (R1)\n");
+    if (!strcmp(a, "--denylist")) {
+        const char *sub = argc > 2 ? argv[2] : "";
+        if (!strcmp(sub, "ls")) {
+            static char buf[65536];
+            long n = omni_root(OP_DENYLIST, 3, (long)buf, (long)sizeof buf - 1);
+            if (n < 0) { err("magisk: denylist failed\n"); return 1; }
+            buf[n] = 0;
+            fputs(buf, stdout);
+            return 0;
+        }
+        if ((!strcmp(sub, "add") || !strcmp(sub, "rm")) && argc > 3) {
+            if (omni_root(OP_DENYLIST, sub[0] == 'a' ? 1 : 2, (long)argv[3], 0) < 0) {
+                err("magisk: denylist failed\n");
+                return 1;
+            }
+            return 0;
+        }
+        err("usage: magisk --denylist add|rm <pkg> | ls\n");
+        return 1;
+    }
+    if (!strcmp(a, "--sqlite")) {
+        err("unsupported in omnidroid\n");
         return 1;
     }
     err("magisk: unknown applet\n");

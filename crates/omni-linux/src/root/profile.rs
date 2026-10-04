@@ -179,11 +179,36 @@ impl Profile {
     /// (`None`) is never hidden, even in whitelist mode. The uid 0/2000
     /// exemption is the view's (`ProcessView::for_process`).
     pub fn hidden(&self, package: Option<&str>) -> bool {
-        package.is_some_and(|n| {
-            let b = base_package(n);
-            self.denylist.iter().any(|d| d == b)
-                || (self.shamiko == Shamiko::Whitelist && !matches!(&self.su, SuPolicy::Packages(p) if p.iter().any(|a| a == b)))
-        })
+        self.denylisted(package) || self.whitelist_hidden(package)
+    }
+
+    /// Whether `package` (base package counts) is explicitly on the denylist.
+    pub fn denylisted(&self, package: Option<&str>) -> bool {
+        package.is_some_and(|n| self.denylist.iter().any(|d| d == base_package(n)))
+    }
+
+    /// Whether whitelist mode hides `package`: it is not on the su allow list. The caller applies the
+    /// uid gate (only app uids >= 10000 are hidden by whitelist mode).
+    pub fn whitelist_hidden(&self, package: Option<&str>) -> bool {
+        self.shamiko == Shamiko::Whitelist
+            && package.is_some_and(|n| {
+                let b = base_package(n);
+                !matches!(&self.su, SuPolicy::Packages(p) if p.iter().any(|a| a == b))
+            })
+    }
+
+    /// Add `pkg` to the denylist (no duplicates).
+    pub fn denylist_add(&mut self, pkg: &str) {
+        let b = base_package(pkg.trim());
+        if !b.is_empty() && !self.denylist.iter().any(|d| d == b) {
+            self.denylist.push(b.to_string());
+        }
+    }
+
+    /// Remove `pkg` from the denylist.
+    pub fn denylist_remove(&mut self, pkg: &str) {
+        let b = base_package(pkg.trim());
+        self.denylist.retain(|d| d != b);
     }
 
     /// Whether a process of `package` gets the emulator spoof: the unscoped `emu-hide` module spoofs every app.
@@ -256,6 +281,29 @@ mod tests {
         let w = Profile::parse("root=1\nshamiko=whitelist\nsu=com.allowed\n");
         assert!(w.hidden(Some("com.anything"))); // whitelist: all hidden...
         assert!(!w.hidden(Some("com.allowed"))); // ...except the su allow list
+    }
+
+    #[test]
+    fn whitelist_hides_all_but_allowed() {
+        let p = Profile::parse("root=1
+shamiko=whitelist
+su=com.allowed
+");
+        assert!(p.hidden(Some("com.other")));
+        assert!(!p.hidden(Some("com.allowed")));
+        assert!(!p.hidden(Some("com.allowed:gl")));
+    }
+
+    #[test]
+    fn denylist_add_remove_round_trips() {
+        let mut p = Profile::parse("root=1
+");
+        p.denylist_add("com.x");
+        p.denylist_add("com.x"); // deduped
+        assert_eq!(p.denylist.iter().filter(|d| *d == "com.x").count(), 1);
+        assert!(Profile::parse(&p.serialize()).denylist.iter().any(|d| d == "com.x"));
+        p.denylist_remove("com.x");
+        assert!(!Profile::parse(&p.serialize()).denylist.iter().any(|d| d == "com.x"));
     }
 
     #[test]

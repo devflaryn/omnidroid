@@ -13,11 +13,16 @@ pub struct ProcessView {
 
 impl ProcessView {
     /// The view for a process of `package` (a package or process name) running as `uid`. No profile
-    /// is inert; uid 0 (root) and 2000 (shell) are never hidden from.
+    /// is inert; uid 0 (root) and 2000 (shell) are never hidden from, and whitelist mode spares uids < 10000.
     #[must_use]
     pub fn for_process(profile: Option<&Profile>, package: Option<&str>, uid: u32) -> ProcessView {
         let Some(profile) = profile else { return ProcessView::default() };
-        ProcessView { hidden: uid != 0 && uid != 2000 && profile.hidden(package), spoofed: profile.spoofed(package) }
+        // DenyList hides at any uid but root/shell; whitelist mode hides only real apps (uid >= 10000),
+        // never system/privileged uids such as system_server (1000).
+        let hidden = uid != 0
+            && uid != 2000
+            && (profile.denylisted(package) || (uid >= 10000 && profile.whitelist_hidden(package)));
+        ProcessView { hidden, spoofed: profile.spoofed(package) }
     }
 }
 
@@ -51,6 +56,22 @@ mod tests {
         assert!(ProcessView::for_process(Some(&p), Some("com.x"), 10234).hidden);
         assert!(!ProcessView::for_process(Some(&p), Some("com.x"), 0).hidden); // root never hidden from itself
         assert!(!ProcessView::for_process(Some(&p), Some("com.x"), 2000).hidden); // shell
+    }
+    #[test]
+    fn whitelist_spares_system_uids_but_hides_apps() {
+        let p = crate::root::Profile::parse("root=1
+shamiko=whitelist
+su=com.allowed
+");
+        assert!(!ProcessView::for_process(Some(&p), Some("com.x"), 1000).hidden); // system_server
+        assert!(ProcessView::for_process(Some(&p), Some("com.x"), 10234).hidden);
+        assert!(!ProcessView::for_process(Some(&p), Some("com.allowed"), 10234).hidden);
+        // an explicit denylist entry still hides below the app uid range
+        let d = crate::root::Profile::parse("root=1
+denylist=com.x
+shamiko=whitelist
+");
+        assert!(ProcessView::for_process(Some(&d), Some("com.x"), 1000).hidden);
     }
     #[test]
     fn package_of_is_the_base_of_nice_name() {

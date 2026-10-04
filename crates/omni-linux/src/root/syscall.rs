@@ -8,6 +8,13 @@ const OP_ELEVATE: u64 = 1;
 const OP_STATUS: u64 = 2;
 const OP_SETPROP: u64 = 3;
 const OP_DELPROP: u64 = 4;
+/// `omni_root(OP_DENYLIST, action, arg, len)`: uid 0 only. add/rm take a package C string in `arg`;
+/// ls writes the newline-joined denylist to the buffer `arg` of `len` bytes and returns its length.
+const OP_DENYLIST: u64 = 5;
+const DL_ADD: u64 = 1;
+const DL_RM: u64 = 2;
+const DL_LS: u64 = 3;
+const PKG_MAX: usize = 256;
 
 const PROP_NAME_MAX: usize = 256;
 const PROP_VALUE_MAX: usize = 8192;
@@ -52,6 +59,42 @@ fn sys_omni_root(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
                 props.delete(&name);
             }
             Ok(0)
+        }
+        OP_DENYLIST => {
+            if p.sys.uid() != 0 {
+                return Err(EACCES);
+            }
+            let dir = p.vfs.binds().instance_dir().ok_or(ENOSYS)?;
+            // Read the current file fresh (not the cached copy) so concurrent edits are not lost.
+            let mut edited = super::Profile::load(dir).ok_or(ENOSYS)?;
+            match a[1] {
+                DL_ADD | DL_RM => {
+                    let pkg = guest_str(p, a[2], PKG_MAX)?;
+                    let pkg = pkg.trim();
+                    if pkg.is_empty() || pkg.contains(['\n', ',', '=']) {
+                        return Err(EINVAL);
+                    }
+                    if a[1] == DL_ADD {
+                        edited.denylist_add(pkg);
+                    } else {
+                        edited.denylist_remove(pkg);
+                    }
+                    let file = dir.join(super::profile::PROFILE_FILE);
+                    let tmp = dir.join(format!("{}.tmp", super::profile::PROFILE_FILE));
+                    std::fs::write(&tmp, edited.serialize()).and_then(|()| std::fs::rename(&tmp, &file)).map_err(|_| EINVAL)?;
+                    Ok(0)
+                }
+                DL_LS => {
+                    let mut text = edited.denylist.join("\n");
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    let n = text.len().min(usize::try_from(a[3]).map_err(|_| EINVAL)?);
+                    p.mem.write(a[2], &text.as_bytes()[..n])?;
+                    Ok(n as u64)
+                }
+                _ => Err(EINVAL),
+            }
         }
         _ => Err(EINVAL),
     }
