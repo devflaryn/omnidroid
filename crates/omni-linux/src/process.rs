@@ -166,6 +166,11 @@ pub struct Task {
     pub process: Arc<Process>,
     pub pc: u64,
     pub lr: u64,
+    /// The frame pointer (x29) at the current system call, for a backtrace from the handler.
+    pub fp: u64,
+    /// Callee-saved x19..x23 at the current system call: a deliberately-exiting app holds its
+    /// reason code in one of these across the report call (`OMNI_EXIT_REGS`).
+    pub saved_regs: [u64; 5],
     pub clear_child_tid: u64,
     pub sigmask: u64,
     pub altstack: [u8; 24],
@@ -300,7 +305,7 @@ fn altstack_disabled() -> [u8; 24] {
 impl Task {
     #[must_use]
     pub fn new(tid: i32, process: Arc<Process>) -> Self {
-        Self { tid, process, pc: 0, lr: 0, clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None, clone_tpidr: None, queued_info: None, state: Arc::new(std::sync::atomic::AtomicU8::new(IN_KERNEL)) }
+        Self { tid, process, pc: 0, lr: 0, fp: 0, saved_regs: [0; 5], clear_child_tid: 0, sigmask: 0, altstack: altstack_disabled(), name: Vec::new(), exit: None, clone_regs: None, pending: Arc::default(), sigreturn: false, saved_sigmask: None, clone_tpidr: None, queued_info: None, state: Arc::new(std::sync::atomic::AtomicU8::new(IN_KERNEL)) }
     }
 }
 
@@ -387,6 +392,8 @@ fn on_svc(call: &mut ThunkCall<'_>) {
     let args = [call.x(0), call.x(1), call.x(2), call.x(3), call.x(4), call.x(5)];
     task.pc = call.address() as u64;
     task.lr = call.lr() as u64;
+    task.fp = call.x(29);
+    task.saved_regs = [call.x(19), call.x(20), call.x(21), call.x(22), call.x(23)];
     if number == crate::syscall::nr::CLONE {
         let mut regs = [0u64; 31];
         for (n, r) in regs.iter_mut().enumerate() {

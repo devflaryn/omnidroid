@@ -453,6 +453,25 @@ fn sys_exit_group(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     if code != 0 {
         let at = |x: u64| p.mm.describe(x).map_or_else(String::new, |d| format!(" ({d})"));
         eprintln!("[exit] pid {} tid {} exit_group({code}) pc {:#x}{} lr {:#x}{}", p.sys.pid, t.tid, t.pc, at(t.pc), t.lr, at(t.lr));
+        eprintln!("[exit]   x19..x23 = {:#x} {:#x} {:#x} {:#x} {:#x}", t.saved_regs[0], t.saved_regs[1], t.saved_regs[2], t.saved_regs[3], t.saved_regs[4]);
+        // A frame-pointer backtrace of the exiting thread (the caller that decided to exit, named
+        // by lib+offset): what wrote the verdict and from where, for an app that dies deliberately
+        // through a shared exit stub whose own pc/lr say nothing about the reason.
+        let mut fp = t.fp;
+        for depth in 0..24 {
+            if fp == 0 || fp & 7 != 0 {
+                break;
+            }
+            let (Ok(ret), Ok(next)) = (p.mem.read_u64(fp + 8), p.mem.read_u64(fp)) else { break };
+            if ret == 0 {
+                break;
+            }
+            eprintln!("[exit]   #{depth} {:#x}{}", ret, at(ret));
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
     }
     t.exit = Some(Exit::Group(code));
     Ok(0)
