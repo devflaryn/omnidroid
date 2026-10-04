@@ -123,7 +123,9 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                     starts; the app is stopped when the session ends, the device stays warm
                     (not with --instance, --standby or --fresh-device; OMNI_AOSP_WARM=0: never)
   aosp --root      a rooted device (Magisk-compatible: su, modules over /system, resetprop);
-                    --module installs the named modules (implies --root), --su all lets every
+                    --module installs the named modules (implies --root; built-in ids emu-hide,
+                    shamiko, zygisk-frida need no catalog entry), --denylist a,b hides root from those
+                    packages (implies --root), --su all lets every
                     app su (default: root and shell only). A rooted device is its own saved
                     and warm device -- never one made without root or with other modules.
                     `omnidroid modules` lists the module catalog; `modules add <zip>` adds one.
@@ -733,6 +735,8 @@ struct AospOptions {
     modules: Vec<String>,
     /// Who may `su`: `all`, or comma-separated packages (`--su`).
     su: Option<String>,
+    /// Packages hidden from root (`--denylist a,b`; implies root).
+    denylist: Vec<String>,
 }
 
 fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, String> {
@@ -752,6 +756,7 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
         root: false,
         modules: Vec::new(),
         su: None,
+        denylist: Vec::new(),
     };
     let mut minutes_given = false;
     while let Some(arg) = args.next() {
@@ -801,6 +806,11 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
             "--module" => {
                 let text = value("--module")?;
                 options.modules.extend(text.split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string));
+                options.root = true;
+            }
+            "--denylist" => {
+                let text = value("--denylist")?;
+                options.denylist.extend(text.split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_string));
                 options.root = true;
             }
             "--su" => {
@@ -855,6 +865,9 @@ fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'
         if let Some(su) = &options.su {
             env.push(("OMNI_R_SU", su.clone()));
         }
+        if !options.denylist.is_empty() {
+            env.push(("OMNI_R_DENYLIST", options.denylist.join(",")));
+        }
     }
     env
 }
@@ -862,7 +875,7 @@ fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'
 /// Every module id asked for must be in the catalog: said before anything boots.
 fn validate_modules(ids: &[String], catalog: &omni_linux::root::Catalog) -> Result<(), String> {
     for id in ids {
-        if catalog.find(id).is_none() {
+        if !omni_linux::root::module::is_builtin(id) && catalog.find(id).is_none() {
             let known: Vec<&str> = catalog.list().iter().map(|m| m.prop.id.as_str()).collect();
             return Err(format!(
                 "unknown module `{id}` (known: {}); `omnidroid modules` lists them, `omnidroid modules add <zip>` adds one",
@@ -963,7 +976,7 @@ fn aosp(options: &AospOptions) -> ExitCode {
     // (`tools/fetch_magisk.py`), is an error here -- never a half-rooted device.
     let root_hash = if options.root {
         let checked = module_catalog().and_then(|catalog| validate_modules(&options.modules, &catalog)).and_then(|()| {
-            omni_linux::root::key::request(&repo_root(), &options.modules, options.su.as_deref())
+            omni_linux::root::key::request_with(&repo_root(), &options.modules, options.su.as_deref(), &options.denylist)
         });
         match checked {
             Ok(request) => Some(request.hash),
@@ -1151,6 +1164,24 @@ mod tests {
         assert_eq!((get("OMNI_R_ROOT"), get("OMNI_R_MODULES"), get("OMNI_R_SU")), (Some("1"), Some("a,b"), Some("all")));
         let plain = aosp_env(&parse(&[]), Path::new("x.apk"), None);
         assert!(plain.iter().all(|(n, _)| !n.starts_with("OMNI_R_ROOT") && *n != "OMNI_R_MODULES" && *n != "OMNI_R_SU"));
+    }
+
+    #[test]
+    fn builtin_modules_and_denylist_parse() {
+        let parse = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string())).unwrap();
+        let o = parse(&["--module", "emu-hide,shamiko", "--denylist", "com.roblox.client"]);
+        assert!(o.root && o.modules == vec!["emu-hide", "shamiko"] && o.denylist == vec!["com.roblox.client"]);
+        let o = parse(&["--denylist", "a.b, c.d"]);
+        assert!(o.root, "--denylist implies --root");
+        assert_eq!(o.denylist, vec!["a.b", "c.d"]);
+        let empty = omni_linux::root::Catalog { modules: Vec::new() };
+        assert!(validate_modules(&["emu-hide".into(), "shamiko".into(), "zygisk-frida".into()], &empty).is_ok());
+        let err = validate_modules(&["ghost".into()], &empty).unwrap_err();
+        assert!(err.contains("ghost"), "{err}");
+        let env = aosp_env(&parse(&["--denylist", "a.b,c.d"]), Path::new("x.apk"), None);
+        assert!(env.iter().any(|(n, v)| *n == "OMNI_R_DENYLIST" && v == "a.b,c.d"));
+        let plain = aosp_env(&parse(&[]), Path::new("x.apk"), None);
+        assert!(plain.iter().all(|(n, _)| *n != "OMNI_R_DENYLIST"));
     }
 
     #[test]

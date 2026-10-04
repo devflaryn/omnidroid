@@ -71,12 +71,28 @@ pub struct Request {
 /// # Errors
 /// A catalog that cannot be read, an unknown module id, or the Magisk assets absent.
 pub fn request(repo: &Path, modules: &[String], su: Option<&str>) -> Result<Request, String> {
+    request_with(repo, modules, su, &[])
+}
+
+/// As [`request`], with the packages the root is hidden from (`denylist`): part of the profile text,
+/// so part of the hash. Built-in module ids (`emu-hide`, `shamiko`, ...) need no catalog entry;
+/// `shamiko` turns on whitelist hiding.
+///
+/// # Errors
+/// As [`request`].
+pub fn request_with(repo: &Path, modules: &[String], su: Option<&str>, denylist: &[String]) -> Result<Request, String> {
     let catalog = Catalog::discover(&super::module::builtin_dir(repo), super::module::user_dir().as_deref())?;
     let assets = MagiskAssets::find(repo)?;
     let mut profile = Profile::parse("");
     profile.rooted = true;
     profile.magisk_code = assets.version_code;
     profile.module_ids = modules.to_vec();
+    for pkg in denylist {
+        profile.denylist_add(pkg);
+    }
+    if modules.iter().any(|m| m == "shamiko") {
+        profile.shamiko = super::profile::Shamiko::Whitelist;
+    }
     match su {
         Some("all") => profile.su = SuPolicy::All,
         Some(list) => {
@@ -85,7 +101,7 @@ pub fn request(repo: &Path, modules: &[String], su: Option<&str>) -> Result<Requ
         None => {}
     }
     let mut shas = Vec::new();
-    for id in modules {
+    for id in modules.iter().filter(|m| !super::module::is_builtin(m)) {
         let m = catalog.find(id).ok_or_else(|| format!("module `{id}` is not in the catalog"))?;
         shas.push((id.as_str(), module_sha(m)));
     }
@@ -94,7 +110,7 @@ pub fn request(repo: &Path, modules: &[String], su: Option<&str>) -> Result<Requ
     Ok(Request { profile, catalog, assets, hash })
 }
 
-/// The request the `OMNI_R_ROOT` / `OMNI_R_MODULES` / `OMNI_R_SU` environment makes, if any.
+/// The request the `OMNI_R_ROOT` / `OMNI_R_MODULES` / `OMNI_R_SU` / `OMNI_R_DENYLIST` environment makes, if any.
 ///
 /// # Errors
 /// As [`request`].
@@ -105,11 +121,17 @@ pub fn from_env(repo: &Path) -> Result<Option<Request>, String> {
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
         .collect();
-    if std::env::var("OMNI_R_ROOT").as_deref() != Ok("1") && modules.is_empty() {
+    let denylist: Vec<String> = std::env::var("OMNI_R_DENYLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if std::env::var("OMNI_R_ROOT").as_deref() != Ok("1") && modules.is_empty() && denylist.is_empty() {
         return Ok(None);
     }
     let su = std::env::var("OMNI_R_SU").ok().filter(|s| !s.is_empty());
-    request(repo, &modules, su.as_deref()).map(Some)
+    request_with(repo, &modules, su.as_deref(), &denylist).map(Some)
 }
 
 #[cfg(test)]

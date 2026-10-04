@@ -28,6 +28,14 @@ fn one_normal(name: &str) -> bool {
 /// Whether `name` is a safe module id: one normal component that does not start with `.`.
 /// Module ids become host paths.
 #[must_use]
+pub const BUILTIN_MODULES: [&str; 3] = ["emu-hide", "shamiko", "zygisk-frida"];
+
+/// Whether `id` is an engine-native module: always valid, nothing to install from the catalog.
+#[must_use]
+pub fn is_builtin(id: &str) -> bool {
+    BUILTIN_MODULES.contains(&id)
+}
+
 pub fn is_safe_component(name: &str) -> bool {
     one_normal(name) && !name.starts_with('.') && !name.contains(['/', '\\', ':'])
 }

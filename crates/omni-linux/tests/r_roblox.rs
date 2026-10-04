@@ -666,4 +666,23 @@ fn golden_key_separates_rooted_devices_and_leaves_unrooted_unchanged() {
     assert_ne!(rooted, rooted_b, "the module set changes the key");
     assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}")));
     assert_eq!(plain, golden_dir_rooted(&root, &apk, None, true, "tr-TR", None));
+    // The denylist is part of the staged profile text, so it keys another saved/warm device.
+    let profile = |deny: &[&str]| {
+        let mut p = omni_linux::root::Profile::parse("root=1
+module=emu-hide
+");
+        for d in deny {
+            p.denylist_add(d);
+        }
+        p.serialize()
+    };
+    let d0 = root_hash(&profile(&[]), &[], 29000, "bin");
+    let d1 = root_hash(&profile(&["com.roblox.client"]), &[], 29000, "bin");
+    assert_ne!(d0, d1, "a denylist change is a different rooted hash");
+    assert_ne!(
+        golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&d0)),
+        golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&d1)),
+        "and a different golden key"
+    );
+    assert_eq!(plain, golden_dir(&root, &apk, None, true, "tr-TR"), "the unrooted key stays byte-identical");
 }

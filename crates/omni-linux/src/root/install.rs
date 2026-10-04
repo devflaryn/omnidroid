@@ -61,7 +61,7 @@ pub fn stage(instance: &Path, profile: &Profile, catalog: &Catalog, assets: &Mag
         io(std::fs::create_dir_all(d), d)?;
     }
     // Modules: each selected one installed afresh; every other installed one disabled.
-    for id in profile.modules() {
+    for id in profile.modules().iter().filter(|m| !super::module::is_builtin(m)) {
         let module = catalog.find(id).ok_or_else(|| format!("module `{id}` is not in the catalog"))?;
         if !is_safe_component(&module.prop.id) {
             return Err(format!("unsafe module id {:?}", module.prop.id));
