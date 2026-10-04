@@ -42,6 +42,21 @@ same package at another version gets an Android of its own. Clash of Clans first
   *unpacked* `libsupercell_clashofclans.so`, dumped after it decrypts itself -- the static file is
   packed and disassembles to nothing.
 
+  **It says nothing.** Its whole log for a run is the fatal report and the signal that follows --
+  no Titan or Supercell lines, no diagnostics. Both evidence channels are therefore exhausted: the
+  decision makes no system call, and the app writes no log. What is left is the binary.
+
+  **A false lead, recorded so it is not followed again:** `nc` from `shell` cannot reach anything,
+  loopback included, and `dumpsys connectivity` says `Active default network: none`. Neither is the
+  app's situation. The shell runs in the **system's** host process, where a connect through
+  `libnetd_client` reaches netd's fwmarkd and fails for want of SCM_RIGHTS -- a known gap, recorded
+  in "Network (2026-09-28)" below; apps are unaffected, which is why Roblox signs in and joins.
+  Worth fixing on its own, separately from this app: **ConnectivityService has no network**, so
+  `ConnectivityManager` tells every app there is no internet (there is no ethernet service in the
+  image and wifi has no HAL -- `cmd wifi set-wifi-enabled enabled` does nothing). Sockets work
+  regardless, so it has not blocked anything yet, but any app that gates on `getActiveNetwork()`
+  before it starts would see an offline device.
+
   **Tracing it is observer-sensitive, so trace sparingly.** `OMNI_TRACE_PATHS_ONLY=1` exists for
   this (`08f6a1d`) and is still not free: with it the app took 81 s to its first screen instead of
   12, and in one run looped on `statfs` without ever reaching its fork. Scope it with
