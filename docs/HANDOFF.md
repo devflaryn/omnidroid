@@ -88,10 +88,16 @@ same package at another version gets an Android of its own. Clash of Clans first
      checking each other -- sees turn-taking instead. The verdict payload is new behaviour that only
      appears once this fork runs (on `main` it deadlocked before reaching it), so the watchdog's
      result is produced *by* this fork.
-  2. **ptrace is bookkeeping, not real debugging.** `crate::ptrace` makes attach/wait/setoptions/
-     cont succeed and refuses `PTRACE_GETREGS`/`PEEKTEXT`/real stops by name. A watchdog that
-     attaches and then does a real debug op to prove the attach is genuine gets an error a real
-     tracer never would.
+  2. ~~ptrace is bookkeeping, not real debugging~~ -- **RULED OUT by trace data.** The watchdog
+     makes only `PTRACE_ATTACH` (0x10), `SETOPTIONS` (0x4200) and `CONT` (0x7), 13 of each (one per
+     thread), and **no** `GETREGS`/`PEEKTEXT`/`GETREGSET`. Everything it calls is satisfied, so the
+     fake-ptrace semantics are not what it detects. The anti-debug (take the one tracer slot) passes;
+     the verdict comes from a *different* native check -- a candidate is the shield's provisioning
+     data file (`/data/user/0/com.supercell.clashofclans/<hex 'shield'>/<hex 'upd1'>/*.dat`), absent
+     on a fresh install and perhaps needing a network round-trip the device cannot make the way the
+     shield expects (Roblox's sockets work, but `ConnectivityManager` reports `Active default
+     network: none` -- no NetworkAgent is registered, a real omnidroid gap for any app that gates on
+     `getActiveNetwork()`).
   Confirming either needs the verdict decrypted or the native check reversed; fixing #1 is real
   concurrent fork (a host process per child -- CRIU/checkpoint territory) and #2 is a real ptrace
   stop/step/peek subsystem. Both are large, separate from the launcher work.
