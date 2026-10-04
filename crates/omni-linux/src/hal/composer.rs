@@ -99,11 +99,31 @@ pub fn is_chrome(buffer_name: &str) -> bool {
     CHROME.iter().any(|c| title.starts_with(c))
 }
 
+/// **One display**: the framebuffer it is presented into, its configuration, and the client state
+/// that belongs to it -- its layers, its client targets, and what the last validation decided.
+///
+/// A display's layers are its own: `createLayer` names the display it is for, and every command
+/// carries one. So the state that used to be the client's is a screen's, and the client holds only
+/// what is the client's -- its callback and the counter that makes layer ids unique across displays.
+struct Screen {
+    framebuffer: Arc<Framebuffer>,
+    mode: Mutex<Mode>,
+    state: Mutex<State>,
+}
+
+impl Screen {
+    fn mode(&self) -> Mode {
+        *self.mode.lock()
+    }
+}
+
+/// The displays this composer serves, by id, shared by the composer and its client.
+type Screens = Arc<Mutex<std::collections::BTreeMap<i64, Arc<Screen>>>>;
+
 pub struct Composer {
     broker: Arc<Broker>,
-    framebuffer: Arc<Framebuffer>,
+    screens: Screens,
     client: Mutex<Option<Arc<Client>>>,
-    mode: Arc<Mutex<Mode>>,
     /// Whether the system's chrome is presented (see this module's "Only the app").
     show_chrome: Arc<AtomicBool>,
 }
@@ -112,10 +132,18 @@ impl Composer {
     #[must_use]
     pub fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>) -> Arc<Self> {
         let (width, height) = framebuffer.size();
-        let mode = Arc::new(Mutex::new(Mode { config: 0, width, height }));
         let show_chrome = std::env::var("OMNI_APP_ONLY").as_deref() == Ok("0");
         eprintln!("[composer] {}", if show_chrome { "the whole display is presented (OMNI_APP_ONLY=0)" } else { "only the app is presented: the system's bars and taskbar are left out" });
-        Arc::new(Self { broker, framebuffer, client: Mutex::new(None), mode, show_chrome: Arc::new(AtomicBool::new(show_chrome)) })
+        let screen = Arc::new(Screen { framebuffer, mode: Mutex::new(Mode { config: 0, width, height }), state: Mutex::default() });
+        let screens: Screens = Arc::new(Mutex::new([(DISPLAY, screen)].into_iter().collect()));
+        Arc::new(Self { broker, screens, client: Mutex::new(None), show_chrome: Arc::new(AtomicBool::new(show_chrome)) })
+    }
+
+    /// The display `id`, or the first one if it is gone (the one display, for the callers that
+    /// speak of "the display": the window, the screenshot, the resize).
+    fn screen(&self, id: i64) -> Option<Arc<Screen>> {
+        let screens = self.screens.lock();
+        screens.get(&id).cloned()
     }
 
     /// Whether the system's chrome is presented.
@@ -132,7 +160,7 @@ impl Composer {
             return;
         }
         eprintln!("[composer] {}", if show { "the whole display is presented" } else { "only the app is presented" });
-        let callback = self.client.lock().as_ref().and_then(|c| c.state.lock().callback);
+        let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
         if let Some(callback) = callback {
             let _ = IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_refresh(DISPLAY);
         }
@@ -141,7 +169,7 @@ impl Composer {
     /// The display's size now.
     #[must_use]
     pub fn display_size(&self) -> (u32, u32) {
-        let m = *self.mode.lock();
+        let m = self.screen(DISPLAY).map_or(Mode { config: 0, width: WIDTH, height: HEIGHT }, |s| s.mode());
         (m.width, m.height)
     }
 
@@ -154,15 +182,16 @@ impl Composer {
     /// The hotplug's delivery failed (SurfaceFlinger gone).
     pub fn set_display_size(&self, width: u32, height: u32) -> Result<(u32, u32), String> {
         let (width, height) = (width.max(MIN_SIDE), height.max(MIN_SIDE));
+        let Some(screen) = self.screen(DISPLAY) else { return Ok((width, height)) };
         let config = {
-            let mut m = self.mode.lock();
+            let mut m = screen.mode.lock();
             if (m.width, m.height) == (width, height) {
                 return Ok((width, height));
             }
             *m = Mode { config: m.config + 1, width, height };
             m.config
         };
-        let callback = self.client.lock().as_ref().and_then(|c| c.state.lock().callback);
+        let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
         eprintln!("[composer] display {width}x{height} (config {config}): {}", if callback.is_some() { "hotplug" } else { "before SurfaceFlinger" });
         if let Some(callback) = callback {
             IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_hotplug(DISPLAY, true).map_err(|e| format!("onHotplug: {e:?}"))?;
@@ -188,7 +217,7 @@ impl IComposerServer for Composer {
             // One client at a time, as the interface says.
             return Err(Status::ServiceSpecific(EX_NO_RESOURCES));
         }
-        let c = Client::new(Arc::clone(&self.broker), Arc::clone(&self.framebuffer), Arc::clone(&self.mode), Arc::clone(&self.show_chrome));
+        let c = Client::new(Arc::clone(&self.broker), Arc::clone(&self.screens), Arc::clone(&self.show_chrome));
         let serve = Arc::clone(&c);
         let trace = std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("1");
         let ptr = self.broker.create_host_service_objects(move |call| {
@@ -281,8 +310,6 @@ impl LayerState {
 
 #[derive(Default)]
 struct State {
-    callback: Option<u32>,
-    next_layer: i64,
     /// Each layer and the composition its client last asked for.
     layers: HashMap<i64, Composition>,
     targets: HashMap<i32, Target>,
@@ -307,16 +334,18 @@ struct State {
 
 pub struct Client {
     broker: Arc<Broker>,
-    framebuffer: Arc<Framebuffer>,
-    state: Mutex<State>,
+    screens: Screens,
+    /// SurfaceFlinger's callback, and the counter that keeps layer ids unique across displays:
+    /// the client's, not any one display's.
+    callback: Mutex<Option<u32>>,
+    next_layer: Mutex<i64>,
     vsync: Arc<AtomicBool>,
-    mode: Arc<Mutex<Mode>>,
     show_chrome: Arc<AtomicBool>,
 }
 
 impl Client {
-    fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>, mode: Arc<Mutex<Mode>>, show_chrome: Arc<AtomicBool>) -> Arc<Self> {
-        let c = Arc::new(Self { broker, framebuffer, state: Mutex::default(), vsync: Arc::default(), mode, show_chrome });
+    fn new(broker: Arc<Broker>, screens: Screens, show_chrome: Arc<AtomicBool>) -> Arc<Self> {
+        let c = Arc::new(Self { broker, screens, callback: Mutex::default(), next_layer: Mutex::default(), vsync: Arc::default(), show_chrome });
         // Vsync, every period while enabled, for as long as the client lives.
         let weak: Weak<Self> = Arc::downgrade(&c);
         let _ = std::thread::Builder::new().name("omni-composer-vsync".into()).spawn(move || loop {
@@ -325,24 +354,26 @@ impl Client {
             if !c.vsync.load(Ordering::Relaxed) {
                 continue;
             }
-            let Some(callback) = c.state.lock().callback else { continue };
+            let Some(callback) = *c.callback.lock() else { continue };
             let now = crate::sys::monotonic().as_nanos() as i64;
-            let _ = IComposerCallbackProxy::new(Arc::clone(&c.broker), callback).on_vsync(DISPLAY, now, VSYNC_PERIOD_NS);
+            // Every display vsyncs: SurfaceFlinger drives each one's frames from its own.
+            let displays: Vec<i64> = c.screens.lock().keys().copied().collect();
+            let proxy = IComposerCallbackProxy::new(Arc::clone(&c.broker), callback);
+            for display in displays {
+                let _ = proxy.on_vsync(display, now, VSYNC_PERIOD_NS);
+            }
         });
         c
     }
 
-    fn display(display: i64) -> Result<(), Status> {
-        if display == DISPLAY { Ok(()) } else { Err(Status::ServiceSpecific(EX_BAD_DISPLAY)) }
-    }
-
-    fn mode(&self) -> Mode {
-        *self.mode.lock()
+    /// The display this call names, or `BAD_DISPLAY`.
+    fn screen(&self, display: i64) -> Result<Arc<Screen>, Status> {
+        self.screens.lock().get(&display).cloned().ok_or(Status::ServiceSpecific(EX_BAD_DISPLAY))
     }
 
     /// Present the frame: the composer's own composition of its layers, or the client target.
-    fn present(&self) {
-        let mut st = self.state.lock();
+    fn present(&self, screen: &Screen) {
+        let mut st = screen.state.lock();
         if st.device_frame {
             st.frames_device += 1;
             log_paths(&st);
@@ -406,7 +437,7 @@ impl Client {
                 };
                 layers.push(super::compose::Layer { source, frame: (f.left, f.top, f.right, f.bottom), blend, alpha: d.alpha.unwrap_or(1.0) });
             }
-            let Mode { width, height, .. } = self.mode();
+            let Mode { width, height, .. } = screen.mode();
             let need = width as usize * height as usize * 4;
             let mut out = if fast { std::mem::take(&mut st.scratch_out) } else { Vec::new() };
             out.resize(need, 0);
@@ -416,9 +447,9 @@ impl Client {
                 st.scratch_layers = pixels;
             }
             drop(st);
-            self.framebuffer.present_frame(&out, width, height, width);
+            screen.framebuffer.present_frame(&out, width, height, width);
             if fast {
-                self.state.lock().scratch_out = out;
+                screen.state.lock().scratch_out = out;
             }
             return;
         }
@@ -450,7 +481,7 @@ impl Client {
             eprintln!("[composer] present slot {:?}: centre {:08x} corner {:08x}", st.current_target, px(width as usize / 2, height as usize / 2), px(8, 8));
         }
         drop(st);
-        self.framebuffer.present_frame(&pixels, width, height, stride);
+        screen.framebuffer.present_frame(&pixels, width, height, stride);
     }
 }
 
@@ -551,26 +582,32 @@ fn target_of(handle: &NativeHandle) -> Option<Target> {
 impl IComposerClientServer for Client {
     fn register_callback(&self, _ctx: &Ctx<'_>, callback: Binder) -> Result<(), Status> {
         let Binder::Handle(handle) = callback else { return Err(Status::ServiceSpecific(EX_BAD_LAYER)) };
-        self.state.lock().callback = Some(handle);
-        // The display is connected from the start: SurfaceFlinger's init needs the hotplug to have
-        // arrived by the time registerCallback returns. The call goes to the very thread waiting
-        // on this one (the broker routes a host service's call to its caller as nested).
-        let _ = IComposerCallbackProxy::new(Arc::clone(&self.broker), handle).on_hotplug(DISPLAY, true);
+        *self.callback.lock() = Some(handle);
+        // Every display is connected from the start: SurfaceFlinger's init needs the hotplug to
+        // have arrived by the time registerCallback returns. The call goes to the very thread
+        // waiting on this one (the broker routes a host service's call to its caller as nested).
+        let displays: Vec<i64> = self.screens.lock().keys().copied().collect();
+        let proxy = IComposerCallbackProxy::new(Arc::clone(&self.broker), handle);
+        for display in displays {
+            let _ = proxy.on_hotplug(display, true);
+        }
         Ok(())
     }
 
     fn create_layer(&self, _ctx: &Ctx<'_>, display: i64, _buffer_slot_count: i32) -> Result<i64, Status> {
-        Self::display(display)?;
-        let mut st = self.state.lock();
-        st.next_layer += 1;
-        let id = st.next_layer;
-        st.layers.insert(id, Composition::CLIENT);
+        let screen = self.screen(display)?;
+        let id = {
+            let mut next = self.next_layer.lock();
+            *next += 1;
+            *next
+        };
+        screen.state.lock().layers.insert(id, Composition::CLIENT);
         Ok(id)
     }
 
     fn destroy_layer(&self, _ctx: &Ctx<'_>, display: i64, layer: i64) -> Result<(), Status> {
-        Self::display(display)?;
-        let mut st = self.state.lock();
+        let screen = self.screen(display)?;
+        let mut st = screen.state.lock();
         st.device.remove(&layer);
         st.layers.remove(&layer).map(|_| ()).ok_or(Status::ServiceSpecific(EX_BAD_LAYER))
     }
@@ -578,12 +615,12 @@ impl IComposerClientServer for Client {
     fn execute_commands(&self, _ctx: &Ctx<'_>, commands: Vec<DisplayCommand>) -> Result<Vec<CommandResultPayload>, Status> {
         let mut results = Vec::new();
         for (index, cmd) in commands.into_iter().enumerate() {
-            if cmd.display != DISPLAY {
+            let Ok(screen) = self.screen(cmd.display) else {
                 results.push(CommandResultPayload::Error(CommandError { command_index: index as i32, error_code: EX_BAD_DISPLAY }));
                 continue;
-            }
+            };
             {
-                let mut st = self.state.lock();
+                let mut st = screen.state.lock();
                 for layer in &cmd.layers {
                     if let Some(c) = &layer.composition {
                         st.layers.insert(layer.layer, c.composition);
@@ -665,7 +702,7 @@ impl IComposerClientServer for Client {
                 let off = *DEVICE_OFF.get_or_init(|| std::env::var("OMNI_COMPOSER_DEVICE").as_deref() == Ok("0"));
                 let hide = !self.show_chrome.load(Ordering::Relaxed);
                 let device = {
-                    let mut st = self.state.lock();
+                    let mut st = screen.state.lock();
                     // The chrome left out: layers the composer was asked to draw itself.
                     let hidden: std::collections::HashSet<i64> = if hide {
                         st.layers
@@ -684,17 +721,17 @@ impl IComposerClientServer for Client {
                 };
                 if device {
                     if cmd.present_or_validate_display {
-                        results.push(CommandResultPayload::PresentOrValidateResult(PresentOrValidate { display: DISPLAY, result: PresentOrValidate_Result::Validated }));
+                        results.push(CommandResultPayload::PresentOrValidateResult(PresentOrValidate { display: cmd.display, result: PresentOrValidate_Result::Validated }));
                     }
                     if cmd.present_display {
-                        self.present();
+                        self.present(&screen);
                     }
                     continue;
                 }
                 // Every layer is composed by the client -- but the chrome left out, which stays the
                 // composer's (and is not drawn).
                 let changed: Vec<ChangedCompositionLayer> = {
-                    let mut st = self.state.lock();
+                    let mut st = screen.state.lock();
                     let State { layers, hidden, .. } = &mut *st;
                     let mut changed = Vec::new();
                     for (l, c) in layers.iter_mut() {
@@ -706,25 +743,25 @@ impl IComposerClientServer for Client {
                     changed
                 };
                 if !changed.is_empty() {
-                    results.push(CommandResultPayload::ChangedCompositionTypes(ChangedCompositionTypes { display: DISPLAY, layers: changed }));
+                    results.push(CommandResultPayload::ChangedCompositionTypes(ChangedCompositionTypes { display: cmd.display, layers: changed }));
                 }
                 if cmd.present_or_validate_display {
-                    results.push(CommandResultPayload::PresentOrValidateResult(PresentOrValidate { display: DISPLAY, result: PresentOrValidate_Result::Validated }));
+                    results.push(CommandResultPayload::PresentOrValidateResult(PresentOrValidate { display: cmd.display, result: PresentOrValidate_Result::Validated }));
                 }
             }
             if cmd.present_display {
-                self.present();
+                self.present(&screen);
             }
         }
         Ok(results)
     }
 
     fn get_active_config(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {
-        Self::display(display).map(|()| self.mode().config)
+        self.screen(display).map(|s| s.mode().config)
     }
 
     fn get_color_modes(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Vec<ColorMode>, Status> {
-        Self::display(display).map(|()| vec![ColorMode::NATIVE])
+        self.screen(display).map(|_| vec![ColorMode::NATIVE])
     }
 
     fn get_dataspace_saturation_matrix(&self, _ctx: &Ctx<'_>, _dataspace: common::Dataspace) -> Result<Vec<f32>, Status> {
@@ -732,8 +769,8 @@ impl IComposerClientServer for Client {
     }
 
     fn get_display_attribute(&self, _ctx: &Ctx<'_>, display: i64, config: i32, attribute: DisplayAttribute) -> Result<i32, Status> {
-        Self::display(display)?;
-        let mode = self.mode();
+        let screen = self.screen(display)?;
+        let mode = screen.mode();
         if config != mode.config {
             return Err(Status::ServiceSpecific(1)); // EX_BAD_CONFIG
         }
@@ -748,16 +785,16 @@ impl IComposerClientServer for Client {
     }
 
     fn get_display_capabilities(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Vec<DisplayCapability>, Status> {
-        Self::display(display).map(|()| Vec::new())
+        self.screen(display).map(|_| Vec::new())
     }
 
     fn get_display_configs(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Vec<i32>, Status> {
-        Self::display(display).map(|()| vec![self.mode().config])
+        self.screen(display).map(|s| vec![s.mode().config])
     }
 
     fn get_display_configurations(&self, _ctx: &Ctx<'_>, display: i64, _max_frame_interval_ns: i32) -> Result<Vec<DisplayConfiguration>, Status> {
-        Self::display(display)?;
-        let mode = self.mode();
+        let screen = self.screen(display)?;
+        let mode = screen.mode();
         Ok(vec![DisplayConfiguration {
             config_id: mode.config,
             width: mode.width as i32,
@@ -770,28 +807,28 @@ impl IComposerClientServer for Client {
     }
 
     fn get_display_connection_type(&self, _ctx: &Ctx<'_>, display: i64) -> Result<DisplayConnectionType, Status> {
-        Self::display(display).map(|()| DisplayConnectionType::INTERNAL)
+        self.screen(display).map(|_| DisplayConnectionType::INTERNAL)
     }
 
     fn get_display_identification_data(&self, _ctx: &Ctx<'_>, display: i64) -> Result<super::aidl::android_hardware_graphics_composer3::DisplayIdentification, Status> {
-        Self::display(display)?;
+        self.screen(display)?;
         Err(Status::ServiceSpecific(EX_UNSUPPORTED))
     }
 
     fn get_display_name(&self, _ctx: &Ctx<'_>, display: i64) -> Result<String, Status> {
-        Self::display(display).map(|()| "omnidroid".to_string())
+        self.screen(display).map(|_| "omnidroid".to_string())
     }
 
     fn get_display_vsync_period(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {
-        Self::display(display).map(|()| VSYNC_PERIOD_NS)
+        self.screen(display).map(|_| VSYNC_PERIOD_NS)
     }
 
     fn get_display_physical_orientation(&self, _ctx: &Ctx<'_>, display: i64) -> Result<common::Transform, Status> {
-        Self::display(display).map(|()| common::Transform::NONE)
+        self.screen(display).map(|_| common::Transform::NONE)
     }
 
     fn get_hdr_capabilities(&self, _ctx: &Ctx<'_>, display: i64) -> Result<HdrCapabilities, Status> {
-        Self::display(display).map(|()| HdrCapabilities::default())
+        self.screen(display).map(|_| HdrCapabilities::default())
     }
 
     fn get_max_virtual_display_count(&self, _ctx: &Ctx<'_>) -> Result<i32, Status> {
@@ -799,30 +836,30 @@ impl IComposerClientServer for Client {
     }
 
     fn get_per_frame_metadata_keys(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Vec<PerFrameMetadataKey>, Status> {
-        Self::display(display).map(|()| Vec::new())
+        self.screen(display).map(|_| Vec::new())
     }
 
     fn get_render_intents(&self, _ctx: &Ctx<'_>, display: i64, _mode: ColorMode) -> Result<Vec<RenderIntent>, Status> {
-        Self::display(display).map(|()| vec![RenderIntent::COLORIMETRIC])
+        self.screen(display).map(|_| vec![RenderIntent::COLORIMETRIC])
     }
 
     fn get_supported_content_types(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Vec<ContentType>, Status> {
-        Self::display(display).map(|()| Vec::new())
+        self.screen(display).map(|_| Vec::new())
     }
 
     fn get_display_decoration_support(&self, _ctx: &Ctx<'_>, display: i64) -> Result<Option<common::DisplayDecorationSupport>, Status> {
-        Self::display(display).map(|()| None)
+        self.screen(display).map(|_| None)
     }
 
     fn set_active_config(&self, _ctx: &Ctx<'_>, display: i64, config: i32) -> Result<(), Status> {
-        Self::display(display)?;
-        if config == self.mode().config { Ok(()) } else { Err(Status::ServiceSpecific(1)) }
+        let screen = self.screen(display)?;
+        if config == screen.mode().config { Ok(()) } else { Err(Status::ServiceSpecific(1)) }
     }
 
     /// The one configuration there is, at once: nothing to wait for and no refresh needed.
     fn set_active_config_with_constraints(&self, _ctx: &Ctx<'_>, display: i64, config: i32, _constraints: VsyncPeriodChangeConstraints) -> Result<VsyncPeriodChangeTimeline, Status> {
-        Self::display(display)?;
-        if config != self.mode().config {
+        let screen = self.screen(display)?;
+        if config != screen.mode().config {
             return Err(Status::ServiceSpecific(1)); // EX_BAD_CONFIG
         }
         let now = crate::sys::monotonic().as_nanos() as i64;
@@ -830,40 +867,40 @@ impl IComposerClientServer for Client {
     }
 
     fn get_preferred_boot_display_config(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {
-        Self::display(display)?;
+        self.screen(display)?;
         Err(Status::ServiceSpecific(EX_UNSUPPORTED))
     }
 
     fn set_auto_low_latency_mode(&self, _ctx: &Ctx<'_>, display: i64, _on: bool) -> Result<(), Status> {
-        Self::display(display)?;
+        self.screen(display)?;
         Err(Status::ServiceSpecific(EX_UNSUPPORTED))
     }
 
     fn set_client_target_slot_count(&self, _ctx: &Ctx<'_>, display: i64, _count: i32) -> Result<(), Status> {
-        Self::display(display)
+        self.screen(display).map(|_| ())
     }
 
     fn set_color_mode(&self, _ctx: &Ctx<'_>, display: i64, mode: ColorMode, _intent: RenderIntent) -> Result<(), Status> {
-        Self::display(display)?;
+        self.screen(display)?;
         if mode == ColorMode::NATIVE { Ok(()) } else { Err(Status::ServiceSpecific(EX_UNSUPPORTED)) }
     }
 
     fn set_content_type(&self, _ctx: &Ctx<'_>, display: i64, _type: ContentType) -> Result<(), Status> {
-        Self::display(display)
+        self.screen(display).map(|_| ())
     }
 
     fn set_power_mode(&self, _ctx: &Ctx<'_>, display: i64, _mode: PowerMode) -> Result<(), Status> {
-        Self::display(display)
+        self.screen(display).map(|_| ())
     }
 
     fn set_vsync_enabled(&self, _ctx: &Ctx<'_>, display: i64, enabled: bool) -> Result<(), Status> {
-        Self::display(display)?;
+        self.screen(display)?;
         self.vsync.store(enabled, Ordering::Relaxed);
         Ok(())
     }
 
     fn set_idle_timer_enabled(&self, _ctx: &Ctx<'_>, display: i64, _timeout_ms: i32) -> Result<(), Status> {
-        Self::display(display)
+        self.screen(display).map(|_| ())
     }
 
     fn get_overlay_support(&self, _ctx: &Ctx<'_>) -> Result<super::aidl::android_hardware_graphics_composer3::OverlayProperties, Status> {
@@ -875,11 +912,11 @@ impl IComposerClientServer for Client {
     }
 
     fn set_refresh_rate_changed_callback_debug_enabled(&self, _ctx: &Ctx<'_>, display: i64, _enabled: bool) -> Result<(), Status> {
-        Self::display(display)
+        self.screen(display).map(|_| ())
     }
 
     fn notify_expected_present(&self, _ctx: &Ctx<'_>, display: i64, _t: ClockMonotonicTimestamp, _frame_interval_ns: i32) -> Result<(), Status> {
-        Self::display(display)
+        self.screen(display).map(|_| ())
     }
 }
 
