@@ -52,6 +52,17 @@ const OVERRIDES: &[(&str, &str)] = &[
     ("ro.hardware", "zuma"),
     ("ro.boot.hardware", "zuma"),
     ("ro.hardware.chipname", "Tensor G3"),
+    ("ro.boot.verifiedbootstate", "green"),
+    ("ro.boot.vbmeta.device_state", "locked"),
+    ("ro.boot.flash.locked", "1"),
+    ("ro.boot.veritymode", "enforcing"),
+    ("ro.build.tags", "release-keys"),
+    ("ro.build.type", "user"),
+    ("ro.build.display.id", "UQ1A.240205.002"),
+    ("ro.build.description", "shiba-user 14 UQ1A.240205.002 11224170 release-keys"),
+    ("ro.build.product", "shiba"),
+    ("ro.product.board", "shiba"),
+    ("ro.board.platform", "zuma"),
     ("ro.soc.manufacturer", "Google"),
     ("ro.soc.model", "Tensor G3"),
 ];
@@ -62,10 +73,10 @@ pub fn pixel_overrides() -> &'static [(&'static str, &'static str)] {
     OVERRIDES
 }
 
-/// Emulator-only keys dropped from a spoofed process's set (defensive: the overlay sets none).
+/// Key prefixes dropped from a spoofed process's set (emulator-only: qemu props).
 #[must_use]
 pub fn removals() -> &'static [&'static str] {
-    &["ro.kernel.qemu", "ro.kernel.qemu.gles", "ro.boot.qemu", "ro.boot.qemu.avd_name", "ro.boot.qemu.gltransport", "init.svc.qemu-props", "qemu.hw.mainkeys", "qemu.sf.lcd_density"]
+    &["ro.kernel.qemu", "ro.boot.qemu"]
 }
 
 #[cfg(test)]

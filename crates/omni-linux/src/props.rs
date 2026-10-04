@@ -451,7 +451,7 @@ impl PropertyService {
                 props.set(k, v);
             }
         }
-        let dropped = |k: &str| view.spoofed && crate::root::spoof::removals().contains(&k);
+        let dropped = |k: &str| view.spoofed && crate::root::spoof::removals().iter().any(|p| k.starts_with(p));
         let mut area = Area::new();
         let mut info = HashMap::new();
         for (k, v) in props.entries.iter().filter(|(k, _)| !(view.hidden && is_root_prop(k)) && !dropped(k)) {
@@ -692,6 +692,32 @@ mod tests {
         assert_eq!(svc.get("ro.product.model").as_deref(), Some("Pixel 8"));
         assert_eq!(svc.get("ro.hardware").as_deref(), Some("zuma"));
         assert_eq!(svc.get("ro.boot.hardware").as_deref(), Some("zuma"));
+    }
+
+    #[test]
+    fn spoof_replaces_seeded_emulator_values_and_drops_qemu_keys() {
+        let mut props = Properties::default();
+        for (k, v) in [
+            ("ro.product.model", "sdk_gphone64_arm64"),
+            ("ro.build.fingerprint", "generic/sdk_gphone64_arm64/emu:14/X/1:userdebug/test-keys"),
+            ("ro.build.tags", "test-keys"),
+            ("ro.kernel.qemu", "1"),
+            ("ro.kernel.qemu.foo", "x"),
+            ("ro.boot.qemu.avd_name", "a"),
+            ("ro.boot.verifiedbootstate", "orange"),
+        ] {
+            props.set(k, v);
+        }
+        let svc = PropertyService::build_from(props.clone(), &crate::root::ProcessView { spoofed: true, ..Default::default() });
+        assert_eq!(svc.get("ro.product.model").as_deref(), Some("Pixel 8"));
+        assert!(svc.get("ro.build.fingerprint").unwrap().starts_with("google/shiba/"));
+        assert_eq!(svc.get("ro.build.tags").as_deref(), Some("release-keys"));
+        assert_eq!(svc.get("ro.boot.verifiedbootstate").as_deref(), Some("green"));
+        for k in ["ro.kernel.qemu", "ro.kernel.qemu.foo", "ro.boot.qemu.avd_name"] {
+            assert_eq!(svc.get(k), None, "{k} must be gone");
+        }
+        let plain = PropertyService::build_from(props, &crate::root::ProcessView::default());
+        assert_eq!(plain.get("ro.kernel.qemu").as_deref(), Some("1"));
     }
 
     #[test]
