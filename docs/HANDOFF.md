@@ -79,6 +79,15 @@ same package at another version gets an Android of its own. Clash of Clans first
   a merged universal APK from a mirror would be resigned and would fail its own check on a real
   phone too).
 
+  **The decrypted library is rebuildable and lab-loadable (for future RE).** `OMNI_DUMP_AT_EXIT`'s
+  first-LOAD dump, overlaid on the original `.so`'s layout (`orig[0:first_LOAD_filesz] = dump`),
+  makes a complete ELF whose `.text` is 100% valid arm64, and `lab_load` accepts it. But calling the
+  reason-5 check functions in the lab faults dereferencing their context argument (e.g. a read at
+  `+0x130` of a null arg): the checks need the RASP's runtime context object, built by its init, so
+  isolating one means reconstructing that state -- the same reversing effort as the static route.
+  Dynamic probing in the lab is therefore blocked the same way; the path forward is reconstructing
+  the context or reversing the VM interpreter, both specialist multi-session work.
+
   **Pinned to a commercial RASP verdict, reason code 5 (2026-10-04).** With the exit backtrace
   diagnostic (`7b3a3cb`: `[exit]` now walks the frame chain and logs x19..x23), the native side
   exits(1) through `libsupercell+0x605210`, and `x19 = 0x5` is the **reason code** passed to its
