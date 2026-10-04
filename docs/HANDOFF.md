@@ -39,6 +39,15 @@ same package at another version gets an Android of its own. Clash of Clans first
   The hypotheses below were chased before this was found; they are kept so they are not re-tried,
   but the root cause above supersedes them.
 
+  Confirmed three ways: (a) the APK contains the Play Integrity / LVL / install-source APIs above;
+  (b) the image has no GMS, Play Store or licensing service; (c) you cannot even make the install
+  look Play-sourced -- `pm install -i com.android.vending` leaves the installer null and `pm
+  set-installer ... com.android.vending` throws, because no `com.android.vending` package exists to
+  attribute the install to. The realistic path to run it is **microG** (open-source GMS with a Play
+  Integrity / DroidGuard provider and signature spoofing) integrated into the image -- a separate
+  project, scoped as its own task. Clash of Clans is known to run on microG/GMS setups and not on
+  bare AOSP, which matches exactly.
+
 - **Left**: after that the app raises `cnsbodqak.az` with an **encrypted** verdict, from a thread of
   its own (`cnsbodqak.V.run`), and `exit_group(1)`. Its packer is a commercial one -- its state lives
   under hex-encoded names, `/data/user/0/com.supercell.clashofclans/736869656c64/75706431/...`
