@@ -106,6 +106,17 @@ pub fn spoofed_version() -> &'static str {
     "Linux version 5.15.131-android13-8-00055-g4f5025129fe8-ab11150573 (kleaf@build-host) (Android (11368308, based on r510928) clang version 17.0.2, LLD 17.0.2) #1 SMP PREEMPT Mon Dec 18 10:21:17 UTC 2023\n"
 }
 
+/// The kernel release and version `uname` reports for a spoofed process: the same kernel
+/// [`spoofed_version`] names, split as `utsname.release` and `utsname.version`.
+///
+/// They must agree. `/proc/version` and `uname` are two readings of one kernel, and an app that
+/// takes both and compares them -- or takes only `uname` -- is told the truth about the device it
+/// is being shown, not a kernel whose name is the emulator's.
+#[must_use]
+pub fn spoofed_uname() -> (&'static str, &'static str) {
+    ("5.15.131-android13-8-00055-g4f5025129fe8-ab11150573", "#1 SMP PREEMPT Mon Dec 18 10:21:17 UTC 2023")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -115,6 +126,11 @@ mod tests {
         assert!(!l.contains("omnidroid") && !l.contains("goldfish") && !l.contains("ranchu"));
         assert!(c.contains("Hardware"));
         assert!(!super::spoofed_version().to_lowercase().contains("omnidroid"));
+        // `uname` is the same kernel as `/proc/version`, and names no emulator either.
+        let (release, version) = super::spoofed_uname();
+        assert!(!release.to_lowercase().contains("omnidroid") && !version.to_lowercase().contains("omnidroid"));
+        assert!(super::spoofed_version().contains(release), "uname's release is the one /proc/version names");
+        assert!(super::spoofed_version().contains(version.trim_start_matches("#1 SMP PREEMPT ").trim()) || super::spoofed_version().contains("#1 SMP PREEMPT"));
     }
 
     #[test]

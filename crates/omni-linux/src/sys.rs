@@ -680,8 +680,16 @@ fn sys_getrandom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 }
 
 fn sys_uname(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    // A spoofed process is shown the kernel `/proc/version` names it, not one called after this
+    // runtime: the two are readings of one kernel, and a release with a vendor's name in it is a
+    // tell on its own (`crate::root::spoof`).
+    let (release, version) = if p.view.spoofed {
+        crate::root::spoof::spoofed_uname()
+    } else {
+        ("6.1.99-omnidroid", "#1 SMP PREEMPT")
+    };
     let mut u = [0u8; 6 * 65];
-    for (i, s) in ["Linux", "localhost", "6.1.99-omnidroid", "#1 SMP PREEMPT", "aarch64", "localdomain"].iter().enumerate() {
+    for (i, s) in ["Linux", "localhost", release, version, "aarch64", "localdomain"].iter().enumerate() {
         u[i * 65..i * 65 + s.len()].copy_from_slice(s.as_bytes());
     }
     p.mem.write(a[0], &u)?;
