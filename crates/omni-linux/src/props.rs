@@ -373,6 +373,11 @@ impl Area {
     }
 }
 
+/// A property that names Magisk.
+fn is_root_prop(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("magisk")
+}
+
 /// The property service: init's, for every process of an instance. The prop area only grows,
 /// as bionic's does -- readers keep pointers into it -- and every change is written into every
 /// process's mapping of it, so a `setprop` in one process is what `getprop` reads in another.
@@ -407,20 +412,22 @@ impl PropertyService {
     /// The service of this host process, started from the first process's sysroot.
     pub fn global(sysroot: &Sysroot) -> std::sync::Arc<Self> {
         static SERVICE: std::sync::OnceLock<std::sync::Arc<PropertyService>> = std::sync::OnceLock::new();
-        std::sync::Arc::clone(SERVICE.get_or_init(|| std::sync::Arc::new(Self::build(sysroot))))
+        std::sync::Arc::clone(SERVICE.get_or_init(|| std::sync::Arc::new(Self::build(sysroot, &crate::root::ProcessView::default()))))
     }
 
     /// A fresh property service for testing (not behind OnceLock).
     #[cfg(test)]
     fn for_test(sysroot: &Sysroot) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self::build(sysroot))
+        std::sync::Arc::new(Self::build(sysroot, &crate::root::ProcessView::default()))
     }
 
-    fn build(sysroot: &Sysroot) -> Self {
+    /// The service as `view` sees it. A hidden process gets no Magisk/root props (none are added
+    /// today -- su and magisk live in the root layer -- so this guards that invariant).
+    fn build(sysroot: &Sysroot, view: &crate::root::ProcessView) -> Self {
         let (props, _) = Properties::from_sysroot(sysroot);
         let mut area = Area::new();
         let mut info = HashMap::new();
-        for (k, v) in &props.entries {
+        for (k, v) in props.entries.iter().filter(|(k, _)| !(view.hidden && is_root_prop(k))) {
             info.insert(k.clone(), area.add(k, v));
         }
         // Room to grow: what the build set, and a megabyte more for what the system sets.
@@ -649,6 +656,15 @@ mod tests {
         assert!(bytes[used..].iter().all(|&b| b == 0), "a non-zero byte past {used}");
         assert!(bytes[..used].iter().any(|&b| b != 0));
         assert!(used < bytes.len() / 4, "{used} of {}", bytes.len());
+    }
+
+    #[test]
+    fn a_hidden_view_builds_no_magisk_props() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let hidden = crate::root::ProcessView { hidden: true, ..Default::default() };
+        let svc = PropertyService::build(&root, &hidden);
+        assert!(svc.entries().iter().all(|(k, _)| !is_root_prop(k)));
+        assert!(is_root_prop("ro.magisk.version") && !is_root_prop("ro.build.tags"));
     }
 
     #[test]

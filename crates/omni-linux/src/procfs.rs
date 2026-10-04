@@ -84,11 +84,21 @@ fn with_nl(mut v: Vec<u8>) -> Vec<u8> {
     v
 }
 
+/// A mapping or mount name that reveals root: Magisk's `/debug_ramdisk`, anything under
+/// `/data/adb` (modules included), an `su` binary, and (reserved for the Zygisk host) its library.
+fn is_root_mapping_name(name: &[u8]) -> bool {
+    let has = |needle: &[u8]| name.windows(needle.len()).any(|w| w == needle);
+    has(b"/debug_ramdisk") || has(b"/data/adb") || name.ends_with(b"/su") || has(b"libzygisk")
+}
+
 fn maps(p: &Process) -> Vec<u8> {
     let mut out = String::new();
     for r in p.mem.space().mapped_regions() {
         let start = r.start as u64;
         let end = start + r.len as u64;
+        if p.view.hidden && p.mm.name_at(start).is_some_and(|(name, _)| is_root_mapping_name(&name)) {
+            continue;
+        }
         let perms = match r.protection {
             Protection::None => "---p",
             Protection::Read => "r--p",
@@ -218,6 +228,9 @@ fn mounts(p: &Process) -> Vec<u8> {
     }
     // What processes of the instance bind-mounted (vold's /data/data on /data/user/0).
     for (target, _) in p.vfs.binds().list() {
+        if p.view.hidden && is_root_mapping_name(&target) {
+            continue;
+        }
         let _ = writeln!(out, "/dev/data {} ext4 rw 0 0", String::from_utf8_lossy(&target));
     }
     // The APEXes, as apexd mounts them (and as its PopulateFromMounts reads them back).
@@ -801,6 +814,21 @@ impl ProcFs for Process {
             Entry::File(generate) => Some(generate(self)),
             Entry::Bytes(bytes) => Some(bytes),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_root_mapping_name;
+
+    #[test]
+    fn root_mapping_names() {
+        for n in ["/debug_ramdisk/magisk", "/data/adb/modules/x/system/lib/foo.so", "/system/bin/su"] {
+            assert!(is_root_mapping_name(n.as_bytes()), "{n}");
+        }
+        for n in ["/system/lib64/libc.so", "/data/data/com.app/x", "/system/bin/sudo"] {
+            assert!(!is_root_mapping_name(n.as_bytes()), "{n}");
         }
     }
 }
