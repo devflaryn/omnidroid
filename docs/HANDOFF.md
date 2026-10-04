@@ -43,18 +43,31 @@ display, not a second user, is what makes two apps run side by side**; users rem
 isolation, and two versions of one package still need a second system (PackageManager keeps one code
 path per package name).
 
+**Built since (1 and 2 of the list below are done):**
+
+- `hal/composer.rs` serves a **map of displays** (`b0d1d5b`): a `Screen` is a framebuffer, a mode and
+  that display's own layer state; the client keeps only its callback and the layer-id counter.
+  Behaviour for behaviour what it was with one display.
+- `Composer::add_display(w, h)` makes and hotplugs a display, and `OMNI_DISPLAYS=<n>` asks for that
+  many at boot, each with **a window of its own that opens on that display's first frame**
+  (`925ad99`, `b62fb39`). Verified on a warm device: Talking Tom on display 0 and Roblox on display
+  2, both resumed, two windows presenting their own frames (716 and 520), one Android.
+
+**Two physical displays is SurfaceFlinger's ceiling, not ours**: `E/HWComposer: Ignoring connection
+of tertiary display 2`. A third app side by side therefore needs a **virtual** display
+(SurfaceFlinger makes many), presented into a framebuffer and window of its own.
+
 Next, in order:
 
-1. **`hal/composer.rs` from one display to a map.** Today `const DISPLAY`, one `Framebuffer`, one
-   `Mode`, and one global `State` whose `layers`/`targets`/`device` belong to that display. Each
-   display needs its own, and `add_display(w, h, dpi)` must hotplug a physical display to
-   SurfaceFlinger. An Android *overlay* display is composited back onto display 0 (the screenshot
-   shows display 2 drawn as a panel inside display 0's frame), so it is not the answer.
-2. **A window per display** (`display_window.rs`), opened on that display's first app frame.
-3. **The launch rule**: distinct package -> a display on the live device; same package, different
-   APK bytes -> a second device. The warm device uninstalls other test apps today
-   (`omni-warm`: "another package's test app is uninstalled first") -- that goes.
-4. Input association per display and per-display focus, then phase 3's isolation gates.
+1. **A virtual display path**, for the third app and beyond (`createVirtualDisplay`, its output into
+   a `Framebuffer`), since physical displays stop at two.
+2. **The launch rule**: distinct package -> the next free display on the live device; same package,
+   different APK bytes -> a second device. The warm device uninstalls other test apps today
+   (`omni-warm`: "another package's test app is uninstalled first") -- that goes. `start_instance`
+   should pick the display and report it, and `OMNI_DISPLAYS` should be set when it boots a device.
+3. **Input association per display** and per-display focus: a second window's keyboard and mouse
+   would reach display 0 today, so its window is opened with `input: false`.
+4. A screenshot path for a display other than the first, then phase 3's isolation gates.
 
 ## `--cookie --place` ON THE WARM DEVICE (2026-10-02, Windows; branch `perf/warm-join`, not merged)
 
