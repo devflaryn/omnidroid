@@ -80,10 +80,28 @@ both alive at once (18 host processes, 7.5 GB of 31.8 GB free). `3c41b7a` is wha
 work: `OMNI_DISPLAYS` had been set on the Roblox session's command instead of the warm boot, so a
 warm device still had one display and the second app was sent to a second Android.
 
+**Three apps in parallel, each in a window of its own** (2026-10-04), one `mcp_demo` run of
+`start:<talkingtom> start:<roblox> start:<opentyrian>`:
+
+```
+com.outfit7.talkingtomcamp   display=0  android=omni-warm-1791130359  app_on_screen
+com.roblox.client            display=2  android=omni-warm-1791130359  app_on_screen
+com.googlecode.opentyrian    display=0  android=omni-warm-1791130442  app_on_screen
+
+omni-warm-1791130359: Display #0 topResumed com.outfit7.talkingtomcamp/.MainActivity
+                      Display #2 topResumed com.roblox.client/.ActivityNativeMain
+omni-warm-1791130442: Display #0 topResumed com.googlecode.opentyrian/.MainActivity
+```
+
+Three windows presenting their own frames (1249 and 1126 on the first Android, 926 on the second);
+Talking Tom at 76% of its load, OpenTyrian at its menu, Roblox resumed on display 2. **Two Androids,
+not one, because SurfaceFlinger takes one external display beside the primary** -- the rule put the
+third app on a second Android by itself, which is what "no display free" is for.
+
 Next, in order:
 
-1. **A virtual display path**, for the third app and beyond (`createVirtualDisplay`, its output into
-   a `Framebuffer`), since physical displays stop at two per Android.
+1. **A virtual display path**, for a third app *on one Android* (`createVirtualDisplay`, its output
+   into a `Framebuffer`), since physical displays stop at two per Android.
 2. **An instance's display does not survive the server**: instances are the server's, so after a
    restart an app already installed is started without `--display` and lands on display 0. The
    device could be asked instead (`dumpsys activity activities`, resumed per display).
