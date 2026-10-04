@@ -175,7 +175,8 @@ impl Profile {
     }
 
     /// Whether a process of `package` (a package or process name; its base package counts) is
-    /// hidden from: on the denylist, or in whitelist mode and not on the su allow list. The uid 0/2000
+    /// hidden from: on the denylist, or in whitelist mode and not on the su allow list. An unknown name
+    /// (`None`) is never hidden, even in whitelist mode. The uid 0/2000
     /// exemption is the view's (`ProcessView::for_process`).
     pub fn hidden(&self, package: Option<&str>) -> bool {
         package.is_some_and(|n| {

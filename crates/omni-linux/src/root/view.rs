@@ -21,13 +21,13 @@ impl ProcessView {
     }
 }
 
-/// The base package of a host app process's argv (byte strings): `--package-name=` first, else the
-/// base of `--nice-name=` (which can be a process name such as `com.roblox.client:gl`).
+/// The base package of a host app process's argv (byte strings): the base of the existing
+/// `--nice-name=` (`com.roblox.client:gl` -> `com.roblox.client`); `None` when absent or empty.
+/// Nothing is added to the guest `app_process64` argv.
 #[must_use]
 pub fn package_of(argv: &[Vec<u8>]) -> Option<String> {
-    let find = |key: &str| argv.iter().find_map(|a| String::from_utf8_lossy(a).strip_prefix(key).map(String::from));
-    let name = find("--package-name=").filter(|s| !s.is_empty()).or_else(|| find("--nice-name="))?;
-    Some(base_package(&name).to_string())
+    let name = argv.iter().find_map(|a| String::from_utf8_lossy(a).strip_prefix("--nice-name=").map(String::from))?;
+    (!name.is_empty()).then(|| base_package(&name).to_string())
 }
 
 #[cfg(test)]
@@ -53,10 +53,11 @@ mod tests {
         assert!(!ProcessView::for_process(Some(&p), Some("com.x"), 2000).hidden); // shell
     }
     #[test]
-    fn package_of_prefers_package_name_then_nice_name_base() {
+    fn package_of_is_the_base_of_nice_name() {
         let a = |s: &str| s.as_bytes().to_vec();
-        assert_eq!(package_of(&[a("--nice-name=com.r:gl"), a("--package-name=com.r")]).as_deref(), Some("com.r"));
-        assert_eq!(package_of(&[a("--nice-name=com.r:gl")]).as_deref(), Some("com.r"));
-        assert_eq!(package_of(&[a("x")]), None);
+        let argv = [a("/system/bin"), a("--application"), a("--nice-name=com.roblox.client:gl"), a("com.android.internal.os.WrapperInit")];
+        assert_eq!(package_of(&argv).as_deref(), Some("com.roblox.client"));
+        assert_eq!(package_of(&[a("--application"), a("x")]), None);
+        assert_eq!(package_of(&[a("--nice-name=")]), None);
     }
 }
