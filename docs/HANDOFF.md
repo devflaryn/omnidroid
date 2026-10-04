@@ -79,6 +79,17 @@ same package at another version gets an Android of its own. Clash of Clans first
   a merged universal APK from a mirror would be resigned and would fail its own check on a real
   phone too).
 
+  **Pinned to a commercial RASP verdict, reason code 5 (2026-10-04).** With the exit backtrace
+  diagnostic (`7b3a3cb`: `[exit]` now walks the frame chain and logs x19..x23), the native side
+  exits(1) through `libsupercell+0x605210`, and `x19 = 0x5` is the **reason code** passed to its
+  report function -- the decision is in the `libsupercell+0x60dc9c` region. Disassembling that in the
+  decrypted dump shows **control-flow-flattened VM obfuscation**: a dispatch loop on a state register
+  (`w9`) compared against computed constants, calling through `blr` on runtime-resolved pointers.
+  That is commercial RASP (the "shield"), built to resist static RE -- decoding what reason 5 checks
+  means reversing the obfuscation interpreter, a major specialised effort. So the blocker is not a
+  missing omnidroid feature with a cheap fix; it is a protected check whose condition is hidden
+  behind a VM. The handshake/anti-debug all pass; reason 5 is a later, virtualised check.
+
   **The two leading omnidroid-specific suspects for *why* native writes `!`** (unconfirmed, because
   the verdict is encrypted -- but these are where the next effort should look, and both are
   semantic gaps a memory-and-debugger integrity watchdog is built to catch):
