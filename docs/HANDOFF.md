@@ -79,6 +79,14 @@ same package at another version gets an Android of its own. Clash of Clans first
   a merged universal APK from a mirror would be resigned and would fail its own check on a real
   phone too).
 
+  **Exact failure identifiers extracted (2026-10-04).** The pointer-dump exit diagnostic (`ccbd605`)
+  read the report-detail buffer the native side passes its reporter: **reason 5, subcode 1, check-id
+  `0xc9162e24`**. The full backtrace shows the native check is **invoked from Java over JNI**
+  (`boot.oat` -> `libopenjdkjvm` -> `libart` -> `libsupercell+0x60dc9c`), so a Java method of the
+  RASP calls the native check, which runs and exits with these codes. This is the maximum observable:
+  the identifiers are numeric (no readable strings), and their meaning is defined inside the
+  obfuscated RASP. Decoding "reason 5 / sub 1 / id 0xc9162e24" is what reversing the VM would yield.
+
   **The decrypted library is rebuildable and lab-loadable (for future RE).** `OMNI_DUMP_AT_EXIT`'s
   first-LOAD dump, overlaid on the original `.so`'s layout (`orig[0:first_LOAD_filesz] = dump`),
   makes a complete ELF whose `.text` is 100% valid arm64, and `lab_load` accepts it. But calling the
