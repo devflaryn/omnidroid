@@ -643,6 +643,9 @@ impl Process {
         // process gets no root layer (no su, no modules) and `omni_root` answers ENOSYS.
         let package = crate::root::package_of(&config.argv);
         let view = crate::root::ProcessView::for_process(crate::root::Profile::of(&config.instance_dir).as_deref(), package.as_deref(), uid);
+        // This host process's property service is built here, with the real view, before `assemble`
+        // reads it: the first builder of the per-host-process singleton wins the OnceLock.
+        crate::props::PropertyService::global_with_view(&sysroot, &view);
         let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir))
             .with_owners(crate::owners::Owners::of(&config.instance_dir))
             .with_root_layer(if view.hidden { None } else { crate::root::Layer::of(&config.instance_dir) });

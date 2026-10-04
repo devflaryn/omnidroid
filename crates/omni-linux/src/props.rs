@@ -411,8 +411,15 @@ pub const PROP_ERROR_INVALID_VALUE: u32 = 0x14;
 impl PropertyService {
     /// The service of this host process, started from the first process's sysroot.
     pub fn global(sysroot: &Sysroot) -> std::sync::Arc<Self> {
+        Self::global_with_view(sysroot, &crate::root::ProcessView::default())
+    }
+
+    /// As `global`, built with `view` if this is the first call in the host process (the OnceLock
+    /// keeps the first). Each app runs in its own host process, so its area is its own: `spawn_as`
+    /// calls this with the app's view before anything else builds the service.
+    pub fn global_with_view(sysroot: &Sysroot, view: &crate::root::ProcessView) -> std::sync::Arc<Self> {
         static SERVICE: std::sync::OnceLock<std::sync::Arc<PropertyService>> = std::sync::OnceLock::new();
-        std::sync::Arc::clone(SERVICE.get_or_init(|| std::sync::Arc::new(Self::build(sysroot, &crate::root::ProcessView::default()))))
+        std::sync::Arc::clone(SERVICE.get_or_init(|| std::sync::Arc::new(Self::build(sysroot, view))))
     }
 
     /// A fresh property service for testing (not behind OnceLock).
@@ -425,6 +432,12 @@ impl PropertyService {
     /// today -- su and magisk live in the root layer -- so this guards that invariant).
     fn build(sysroot: &Sysroot, view: &crate::root::ProcessView) -> Self {
         let (props, _) = Properties::from_sysroot(sysroot);
+        Self::build_from(props, view)
+    }
+
+    /// The one place `view` shapes the prop set (the hidden removal now; Task 5's spoof overrides
+    /// for `view.spoofed` go here too).
+    fn build_from(props: Properties, view: &crate::root::ProcessView) -> Self {
         let mut area = Area::new();
         let mut info = HashMap::new();
         for (k, v) in props.entries.iter().filter(|(k, _)| !(view.hidden && is_root_prop(k))) {
@@ -660,11 +673,17 @@ mod tests {
 
     #[test]
     fn a_hidden_view_builds_no_magisk_props() {
-        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
-        let hidden = crate::root::ProcessView { hidden: true, ..Default::default() };
-        let svc = PropertyService::build(&root, &hidden);
-        assert!(svc.entries().iter().all(|(k, _)| !is_root_prop(k)));
-        assert!(is_root_prop("ro.magisk.version") && !is_root_prop("ro.build.tags"));
+        let mut props = Properties::default();
+        props.set("ro.magisk.version", "27000");
+        props.set("ro.build.tags", "release-keys");
+        let has = |view: &crate::root::ProcessView| {
+            let svc = PropertyService::build_from(props.clone(), view);
+            (svc.get("ro.magisk.version"), svc.get("ro.build.tags"))
+        };
+        let (marker, other) = has(&crate::root::ProcessView { hidden: true, ..Default::default() });
+        assert_eq!((marker, other.as_deref()), (None, Some("release-keys")), "hidden: marker gone, the rest kept");
+        let (marker, _) = has(&crate::root::ProcessView::default());
+        assert_eq!(marker.as_deref(), Some("27000"), "not hidden: byte-identical, marker kept");
     }
 
     #[test]

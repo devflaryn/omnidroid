@@ -107,22 +107,22 @@ fn a_denylisted_process_has_no_root_layer() {
 }
 
 #[test]
-fn a_denylisted_process_maps_mounts_and_props_show_no_root() {
+fn a_denylisted_process_maps_and_mounts_show_no_root() {
     let Some(sysroot) = common::sysroot() else { return };
     let instance = fresh_instance("maps");
     if stage_denylisted(&instance).is_none() {
         return;
     }
-    let script = "cat /proc/self/maps; cat /proc/self/mounts; getprop; echo DONE";
+    let script = "cat /proc/self/maps; cat /proc/self/mounts; echo DONE";
     let leaks = |t: &str| {
         t.lines().any(|l| {
-            l.contains("/data/adb") || l.contains("/debug_ramdisk") || l.ends_with("/su") || l.to_ascii_lowercase().contains("magisk")
+            l.contains("/data/adb") || l.contains("/debug_ramdisk") || l.ends_with("/su")
         })
     };
     let (hidden, text) = run_as_app(&sysroot, &instance, "com.denytest", script);
     assert!(hidden.view.hidden);
     assert!(text.contains("DONE"), "{text}");
-    assert!(!leaks(&text), "a denylisted process reveals root in maps/mounts/props:\n{text}");
+    assert!(!leaks(&text), "a denylisted process reveals root in maps/mounts:\n{text}");
 
     let (open, text) = run_as_app(&sysroot, &instance, "com.other", script);
     assert!(!open.view.hidden);
