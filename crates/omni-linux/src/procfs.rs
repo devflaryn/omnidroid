@@ -241,7 +241,10 @@ fn mounts(p: &Process) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn cpuinfo(_p: &Process) -> Vec<u8> {
+fn cpuinfo(p: &Process) -> Vec<u8> {
+    if p.view.spoofed {
+        return crate::root::spoof::spoofed_cpuinfo().as_bytes().to_vec();
+    }
     let mut out = String::new();
     for n in 0..cpus() {
         // `Features` names exactly `exec::HWCAP`: no `atomics` (D26).
@@ -507,7 +510,10 @@ fn selinux_context(p: &Process) -> Vec<u8> {
     format!("u:r:{domain}:s0\0").into_bytes()
 }
 
-fn version(_p: &Process) -> Vec<u8> {
+fn version(p: &Process) -> Vec<u8> {
+    if p.view.spoofed {
+        return crate::root::spoof::spoofed_version().as_bytes().to_vec();
+    }
     b"Linux version 6.1.99-omnidroid (omnidroid) #1 SMP PREEMPT\n".to_vec()
 }
 

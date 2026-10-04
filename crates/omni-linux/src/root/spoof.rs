@@ -79,8 +79,44 @@ pub fn removals() -> &'static [&'static str] {
     &["ro.kernel.qemu", "ro.boot.qemu"]
 }
 
+/// `/proc/cpuinfo` of a Pixel 8 (Tensor G3 "zuma"): 4x A520, 3x A720, 1x X3, ending in
+/// the `Hardware` line real arm64 Android kernels print. No emulator strings.
+#[must_use]
+pub fn spoofed_cpuinfo() -> &'static str {
+    const FEAT: &str = "fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp";
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        // CPU part per core: 0-3 A520, 4-6 A720, 7 X3.
+        let parts = [0xd80, 0xd80, 0xd80, 0xd80, 0xd81, 0xd81, 0xd81, 0xd82];
+        let mut out = String::new();
+        for (n, part) in parts.iter().enumerate() {
+            let variant = if *part == 0xd82 { 2 } else { 1 };
+            out.push_str(&format!(
+                "processor\t: {n}\nBogoMIPS\t: 49.152\nFeatures\t: {FEAT}\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x{variant}\nCPU part\t: {part:#x}\nCPU revision\t: 1\n\n"
+            ));
+        }
+        out.push_str("Hardware\t: Zuma\n");
+        out
+    })
+}
+
+/// `/proc/version` of a generic Android GKI kernel.
+#[must_use]
+pub fn spoofed_version() -> &'static str {
+    "Linux version 5.15.131-android13-8-00055-g4f5025129fe8-ab11150573 (kleaf@build-host) (Android (11368308, based on r510928) clang version 17.0.2, LLD 17.0.2) #1 SMP PREEMPT Mon Dec 18 10:21:17 UTC 2023\n"
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spoofed_cpuinfo_and_version_have_no_tells() {
+        let c = super::spoofed_cpuinfo();
+        let l = c.to_lowercase();
+        assert!(!l.contains("omnidroid") && !l.contains("goldfish") && !l.contains("ranchu"));
+        assert!(c.contains("Hardware"));
+        assert!(!super::spoofed_version().to_lowercase().contains("omnidroid"));
+    }
+
     #[test]
     fn pixel_overrides_cover_the_emulator_tells() {
         let ov: std::collections::HashMap<_, _> = super::pixel_overrides().iter().copied().collect();
