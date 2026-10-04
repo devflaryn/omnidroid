@@ -346,6 +346,12 @@ pub fn syscall_stats() -> Vec<(String, u64, u64)> {
 /// `OMNI_THREAD_DUMP=<seconds>`: every task's system call in progress is kept (number, pc, lr,
 /// since when, the task's name), for [`blocked_calls`] -- where the threads of a process that has
 /// stopped making progress wait, without a full trace's cost.
+/// `OMNI_TRACE_PATHS_ONLY=1`: a trace of the calls that name a path, and nothing else.
+fn paths_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_TRACE_PATHS_ONLY").as_deref() == Ok("1"))
+}
+
 fn thread_dump() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OMNI_THREAD_DUMP").is_some())
@@ -390,7 +396,9 @@ fn on_svc(call: &mut ThunkCall<'_>) {
         task.clone_tpidr = call.tpidr_el0();
     }
     let process = Arc::clone(&task.process);
-    if process.traced() {
+    // Under `OMNI_TRACE_PATHS_ONLY` the pre-print is off too: a waiting call names no path, and its
+    // volume is what made the trace slow enough to change what the traced app does.
+    if process.traced() && !paths_only() {
         // A call that may wait is shown as it starts too: a thread that never returns is then seen
         // where it waits.
         use crate::syscall::nr;
@@ -497,6 +505,14 @@ fn on_svc(call: &mut ThunkCall<'_>) {
             nr::STATFS | nr::CHDIR => Some(args[0]),
             _ => None,
         };
+        // `OMNI_TRACE_PATHS_ONLY=1`: only the calls that name a path. A full trace of an app that
+        // guards itself is too much to read and slow enough to change what it does -- this is every
+        // file it looks at, from its first instruction, at a fraction of the volume.
+        if paths_only() && path_arg.is_none() {
+            call.set_x(0, result);
+            process.park_if_frozen(task.tid, &task.state);
+            return;
+        }
         let path = path_arg
             .and_then(|a| process.mem.read_cstr(a, 4096).ok())
             .map_or_else(String::new, |p| format!(" \"{}\"", String::from_utf8_lossy(&p)));
