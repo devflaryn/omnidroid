@@ -62,6 +62,9 @@ pub struct Process {
     /// How the process ends, once something has ended it (`exit_group`, a fatal signal or fault).
     group_exit: Mutex<Option<ExitStatus>>,
     pub trace: bool,
+    /// What this process sees of a rooted device (hidden from root, spoofed); the default for every
+    /// process but a host app process `spawn_as` started (and the children it execs and forks).
+    pub view: crate::root::ProcessView,
     /// The program's arguments, as `/proc/<pid>/cmdline` reports them.
     pub argv: Vec<Vec<u8>>,
     /// The main thread's name (`/proc/<pid>/comm`): argv[0]'s basename until `PR_SET_NAME`.
@@ -543,14 +546,14 @@ impl Process {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<Arc<DynarmicBackend>>, scratch: u64, uid: u32) -> Arc<Self> {
-        Self::assemble_as(space, None, None, vfs, argv, FdTable::standard(stdout, stderr), trace, backend, scratch, uid)
+    fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<Arc<DynarmicBackend>>, scratch: u64, uid: u32, view: crate::root::ProcessView) -> Arc<Self> {
+        Self::assemble_as(space, None, None, vfs, argv, FdTable::standard(stdout, stderr), trace, backend, scratch, uid, view)
     }
 
     /// A process in `space`: under `layout` (a vfork child's is its parent's) and `pid` (an
     /// executed image keeps its process's), else fresh ones.
     #[allow(clippy::too_many_arguments)]
-    fn assemble_as(space: Arc<GuestSpace>, layout: Option<crate::guest::Layout>, pid: Option<i32>, vfs: Vfs, argv: Vec<Vec<u8>>, fds: FdTable, trace: bool, backend: Option<Arc<DynarmicBackend>>, scratch: u64, uid: u32) -> Arc<Self> {
+    fn assemble_as(space: Arc<GuestSpace>, layout: Option<crate::guest::Layout>, pid: Option<i32>, vfs: Vfs, argv: Vec<Vec<u8>>, fds: FdTable, trace: bool, backend: Option<Arc<DynarmicBackend>>, scratch: u64, uid: u32, view: crate::root::ProcessView) -> Arc<Self> {
         let mut table = Table::new();
         crate::install_all(&mut table);
         let (_, dropped) = crate::props::Properties::from_sysroot(vfs.sysroot());
@@ -583,6 +586,7 @@ impl Process {
             next_tid: std::sync::atomic::AtomicI32::new(pid + 1),
             group_exit: Mutex::new(None),
             trace,
+            view,
             argv,
             comm: Mutex::new(comm),
             props,
@@ -635,12 +639,16 @@ impl Process {
         }
         // What init.rc makes before any service runs: its `mkdir`s on the writable mounts.
         crate::boot::make_init_dirs(&sysroot, &config.instance_dir);
+        // Decided once, from the host-only profile and the app's package: a hidden (DenyList)
+        // process gets no root layer (no su, no modules) and `omni_root` answers ENOSYS.
+        let package = crate::root::package_of(&config.argv);
+        let view = crate::root::ProcessView::for_process(crate::root::Profile::of(&config.instance_dir).as_deref(), package.as_deref(), uid);
         let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir))
             .with_owners(crate::owners::Owners::of(&config.instance_dir))
-            .with_root_layer(crate::root::Layer::of(&config.instance_dir));
+            .with_root_layer(if view.hidden { None } else { crate::root::Layer::of(&config.instance_dir) });
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
-        let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(Arc::new(backend)), 0, uid);
+        let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(Arc::new(backend)), 0, uid, view);
         p.load(&exe, &config.argv, &config.envp)?;
         Ok(p)
     }
@@ -691,7 +699,7 @@ impl Process {
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
         let fds = self.fds.for_exec();
-        let p = Self::assemble_as(space, None, Some(self.sys.pid), vfs, argv.to_vec(), fds, self.trace, Some(Arc::new(backend)), 0, self.sys.uid());
+        let p = Self::assemble_as(space, None, Some(self.sys.pid), vfs, argv.to_vec(), fds, self.trace, Some(Arc::new(backend)), 0, self.sys.uid(), self.view);
         *p.cwd.lock() = self.cwd.lock().clone();
         p.sys.inherit_ignored(&self.sys);
         p.sys.inherit_ids(&self.sys);
@@ -705,7 +713,7 @@ impl Process {
     pub fn stand_in(sysroot: Arc<crate::vfs::Sysroot>, pid: i32, uid: u32, mem: Arc<dyn crate::guest::Remote>, fds: Arc<dyn crate::fd::RemoteFds>) -> Arc<Self> {
         let space = Arc::new(small_space());
         let vfs = Vfs::new(sysroot, Vec::new(), b"/remote".to_vec());
-        let p = Self::assemble_as(space, None, Some(pid), vfs, vec![b"/remote".to_vec()], FdTable::standard(Output::Host, Output::Host), false, None, 0, uid);
+        let p = Self::assemble_as(space, None, Some(pid), vfs, vec![b"/remote".to_vec()], FdTable::standard(Output::Host, Output::Host), false, None, 0, uid, crate::root::ProcessView::default());
         p.mem.set_remote(mem);
         p.fds.set_remote(fds);
         p.family.mark_stand_in();
@@ -717,7 +725,7 @@ impl Process {
     pub(crate) fn fork_child(self: &Arc<Self>) -> Arc<Self> {
         let vfs = self.vfs.for_exec(self.vfs.exe().to_vec());
         let fds = self.fds.for_fork();
-        let child = Self::assemble_as(Arc::clone(self.mem.space()), Some(self.mem.layout().clone()), None, vfs, self.argv.clone(), fds, self.trace, self.backend.clone(), self.scratch, self.sys.uid());
+        let child = Self::assemble_as(Arc::clone(self.mem.space()), Some(self.mem.layout().clone()), None, vfs, self.argv.clone(), fds, self.trace, self.backend.clone(), self.scratch, self.sys.uid(), self.view);
         *child.cwd.lock() = self.cwd.lock().clone();
         child.sys.inherit(&self.sys);
         child.sys.inherit_ids(&self.sys);
@@ -1342,7 +1350,7 @@ impl Process {
             .map_anonymous(omni_mem::Placement::Anywhere { align: space.page_size() }, 1 << 20, omni_mem::Protection::ReadWrite, omni_mem::CommitPolicy::Lazy)
             .expect("scratch") as u64;
         let argv = vec![vfs.exe().to_vec()];
-        Self::assemble(space, vfs, argv, stdout.clone(), stdout, false, None, scratch, UID)
+        Self::assemble(space, vfs, argv, stdout.clone(), stdout, false, None, scratch, UID, crate::root::ProcessView::default())
     }
 
     pub fn scratch(&self) -> u64 {

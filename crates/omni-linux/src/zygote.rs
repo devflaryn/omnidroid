@@ -370,12 +370,22 @@ struct Spare {
 static SPARE: parking_lot::Mutex<Option<Spare>> = parking_lot::Mutex::new(None);
 
 fn spares() -> bool {
-    std::env::var("OMNI_APP_SPARE").as_deref() == Ok("1")
+    std::env::var("OMNI_APP_SPARE").as_deref() == Ok("1") && !LAUNCHER.get().is_some_and(|l| hiding_device(&l.instance))
+}
+
+/// Whether `instance` is a rooted device that hides root from some apps (a non-empty DenyList, or
+/// Shamiko's whitelist mode). A spare's address space is built before its app is known, as a
+/// non-hidden process, and cannot be hidden afterwards: such a device starts every app fresh.
+pub(crate) fn hiding_device(instance: &std::path::Path) -> bool {
+    crate::root::Profile::of(instance).is_some_and(|p| p.is_rooted() && (!p.denylist.is_empty() || p.shamiko == crate::root::Shamiko::Whitelist))
 }
 
 /// Start the first spare once `ready` (Android has booted), and keep one after.
 pub fn start_spares_when(ready: impl Fn() -> bool + Send + 'static) {
     if !spares() {
+        if std::env::var("OMNI_APP_SPARE").as_deref() == Ok("1") && LAUNCHER.get().is_some_and(|l| hiding_device(&l.instance)) {
+            eprintln!("[zygote] spare app process disabled: this device hides root from apps (a spare cannot be hidden after it starts)");
+        }
         return;
     }
     let _ = std::thread::Builder::new().name("zygote-spare".into()).spawn(move || {
@@ -439,6 +449,31 @@ fn take_spare(uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_that_hides_root_starts_no_spare() {
+        // One instance dir per profile: the profile cache is per directory.
+        let hides = |tag: &str, text: Option<&str>| {
+            let dir = std::env::temp_dir().join(format!("omni-spare-hiding-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(t) = text {
+                std::fs::write(dir.join(".omni-root-profile"), t).unwrap();
+            }
+            let r = hiding_device(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            r
+        };
+        assert!(!hides("none", None), "no profile: spares are fine");
+        assert!(!hides("plain", Some("root=1
+")), "rooted, nothing hidden");
+        assert!(hides("deny", Some("root=1
+denylist=com.x
+")));
+        assert!(hides("white", Some("root=1
+shamiko=whitelist
+")));
+    }
 
     fn launcher() -> Arc<Launcher> {
         Arc::new(Launcher {

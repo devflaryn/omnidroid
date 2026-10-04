@@ -21,6 +21,10 @@ fn guest_str(p: &Process, addr: u64, max: usize) -> Result<String, Errno> {
 }
 
 fn sys_omni_root(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    // A hidden (DenyList) process gets nothing, even from a planted su or a raw svc.
+    if p.view.hidden {
+        return Err(ENOSYS);
+    }
     let profile = p.vfs.binds().instance_dir().and_then(super::Profile::of).ok_or(ENOSYS)?;
     match a[0] {
         OP_ELEVATE => {
