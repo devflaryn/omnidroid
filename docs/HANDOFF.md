@@ -1,5 +1,61 @@
 # Handoff
 
+## APKS IN PARALLEL, AND THE FORK A WATCHDOG NEEDS (2026-10-04, Windows; branch `feat/fork-timeshare`)
+
+Goal (owner): launch different APKs in parallel on one Android, each in a window of its own; the
+same package at another version gets an Android of its own. Clash of Clans first, then all three of
+`Desktop/test-apks` together.
+
+**Clash of Clans: three blockers removed, one left, and it is the app's, not ours.**
+
+- It deadlocked in `clone`. `fork` was a `vfork` -- the parent frozen until the child execs or exits
+  -- and `libsupercell_clashofclans.so` forks an anti-tamper watchdog that never execs and blocks
+  reading a pipe its frozen parent must write. ANR at 60 s, killed. **Fixed**: the memory is
+  time-shared, each side keeping its own view (`ce6a158`, spec
+  `docs/superpowers/specs/2026-10-04-fork-timeshare-design.md`, gate
+  `fork_exec::a_forked_child_that_waits_on_its_parent_lives_beside_it`). The fork-exec path every
+  boot takes is untouched: a pair is made live only if the child is still there 500 ms on.
+- Then `ptrace(PTRACE_ATTACH)` was `ENOSYS`: the parent does `prctl(PR_SET_PTRACER, child)` and the
+  child attaches so the one tracer slot is taken. **Added** (`crates/omni-linux/src/ptrace.rs`):
+  attach bookkeeping per thread, a tracer waiting for and signalling a tracee that is not its child,
+  and a tracer reading its tracee's `/proc/<pid>/task`. Registers, memory and real stops stay
+  refused by name.
+- The watchdog's protocol now runs end to end -- attach, wait, set options, continue for all
+  thirteen threads, then its report to the parent -- and the child's whole divergence is 24 pages.
+- **Left**: after that the app raises `cnsbodqak.az` with an encrypted verdict, a later integrity
+  layer of its own. `--modules emu-hide` did not change it. Read it with
+  `OMNI_FORK_TRACE_CALLS=1` in `<device>.appenv`, which traces both sides' calls from the handover
+  only -- the window that matters, without tracing the whole start of the app.
+
+**Parallel APKs: the Android half is already there; what is left is the composer.**
+
+Two different packages, one warm device, no engine change (spike recorded in the multi-instance
+spec):
+
+```
+settings put global overlay_display_devices "1280x720/213"     -> displayId 2
+am start -n com.roblox.client/.startup.ActivitySplash          -> Display #0 resumed
+am start --display 2 -n com.outfit7.talkingtomcamp/.MainActivity -> Display #2 resumed
+```
+
+Both app host processes live, each resumed on a display of its own, minutes later still. **A second
+display, not a second user, is what makes two apps run side by side**; users remain the answer for
+isolation, and two versions of one package still need a second system (PackageManager keeps one code
+path per package name).
+
+Next, in order:
+
+1. **`hal/composer.rs` from one display to a map.** Today `const DISPLAY`, one `Framebuffer`, one
+   `Mode`, and one global `State` whose `layers`/`targets`/`device` belong to that display. Each
+   display needs its own, and `add_display(w, h, dpi)` must hotplug a physical display to
+   SurfaceFlinger. An Android *overlay* display is composited back onto display 0 (the screenshot
+   shows display 2 drawn as a panel inside display 0's frame), so it is not the answer.
+2. **A window per display** (`display_window.rs`), opened on that display's first app frame.
+3. **The launch rule**: distinct package -> a display on the live device; same package, different
+   APK bytes -> a second device. The warm device uninstalls other test apps today
+   (`omni-warm`: "another package's test app is uninstalled first") -- that goes.
+4. Input association per display and per-display focus, then phase 3's isolation gates.
+
 ## `--cookie --place` ON THE WARM DEVICE (2026-10-02, Windows; branch `perf/warm-join`, not merged)
 
 Goal (owner): warm Android up, no APK installed, from the `--cookie --place` command to PS99's own
