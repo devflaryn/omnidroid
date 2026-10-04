@@ -82,6 +82,41 @@ What it taught (each is in the design below):
 - Not proven by the spike: input routing to a secondary display (an overlay display has no input
   port) and Roblox reaching in-world on one. Both are gates below.
 
+## Spike: two packages, two displays, one user (2026-10-04)
+
+On a warm device of this image, with no engine change at all:
+
+```
+settings put global overlay_display_devices "1280x720/213"   -> displayId 2, layerStack 2, type OVERLAY
+pm install -r -d -g <roblox.apk>                             (beside com.outfit7.talkingtomcamp)
+am start -n com.roblox.client/.startup.ActivitySplash
+am start --display 2 -n com.outfit7.talkingtomcamp/.MainActivity
+
+Display #2: topResumedActivity = com.outfit7.talkingtomcamp/.MainActivity
+Display #0: topResumedActivity = com.roblox.client/.ActivityNativeMain
+```
+
+Both app host processes live at once (`dumpsys activity processes`: `*APP* UID 10118
+com.roblox.client`, `*APP* UID 10117 com.outfit7.talkingtomcamp`), each resumed on a display of its
+own, and Roblox draws its sign-in screen while Talking Tom holds display 2.
+
+What it settles:
+
+- **A second display is what makes two apps run side by side, not a second user.** Two *different*
+  packages need only a display each: `am start --display <d>` resumes one per display, and neither
+  is backgrounded, so the lean kiosk's killing of stopped apps never comes into it. Users remain
+  the answer for **isolation** (requirement 4) and are still how slots are scoped; they are not a
+  prerequisite for parallelism, so phase 2's display work alone already delivers the launch goal
+  for distinct packages. Decision 2 is unchanged: two *versions of one package* still need a second
+  system, because PackageManager keeps one code path per package name.
+- **The Android half of phase 2 needs nothing from us**: per-display resumed activities work in this
+  image as shipped.
+- **What is left is ours**: the composer serves one display (`hal/composer.rs`: `const DISPLAY`,
+  `fn display()` refusing anything else) and there is one window. An Android *overlay* display is
+  composited back onto display 0 -- the screenshot shows display 2 drawn as a panel inside display
+  0's frame -- which is why the display a second app runs on must be a **physical HWC display this
+  layer hotplugs**, with a framebuffer and a window of its own, not an overlay.
+
 ## Architecture
 
 ```
