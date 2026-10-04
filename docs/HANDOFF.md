@@ -22,6 +22,23 @@ same package at another version gets an Android of its own. Clash of Clans first
   refused by name.
 - The watchdog's protocol now runs end to end -- attach, wait, set options, continue for all
   thirteen threads, then its report to the parent -- and the child's whole divergence is 24 pages.
+- **ROOT CAUSE (2026-10-04): the blocker is Google Play attestation, not an emulator tell, and it
+  is not an omnidroid bug.** The failure is a Java exception (`cnsbodqak.az`, thrown from Thread-1
+  `cnsbodqak.V.run`): `cnsbodqak` is a dedicated obfuscated Java anti-tamper package. The native
+  anti-debug it runs first (the fork watchdog, ptrace of every thread) now completes; the **Java**
+  layer then rejects the environment. The APK carries Play Integrity (`StandardIntegrity` x22,
+  `IntegrityTokenRequest` x11, `IntegrityManager` x12), Play Licensing / LVL (`ILicensingService`,
+  the `CHECK_LICENSE` manifest permission), and install-source checks (`getInstallerPackageName`,
+  `InstallSourceInfo`). The image is plain AOSP: **no GMS, no Play Store, no licensing service**
+  (checked `sysroot/aosp-35`), and the APK was `pm install`ed so its installer is null, not
+  `com.android.vending`. Play Integrity and LVL **cannot be satisfied off the Play Store on any
+  device** without GMS and a genuine Google attestation -- the same sideloaded universal APK fails
+  the same way on a bare AOSP build or any GMS-less emulator. Talking Tom and Roblox run because
+  they do not hard-gate on Play Integrity at startup. **To run this APK, the image needs a GMS +
+  Play attestation path (microG or GMS integration -- a separate project), not an omnidroid fix.**
+  The hypotheses below were chased before this was found; they are kept so they are not re-tried,
+  but the root cause above supersedes them.
+
 - **Left**: after that the app raises `cnsbodqak.az` with an **encrypted** verdict, from a thread of
   its own (`cnsbodqak.V.run`), and `exit_group(1)`. Its packer is a commercial one -- its state lives
   under hex-encoded names, `/data/user/0/com.supercell.clashofclans/736869656c64/75706431/...`
