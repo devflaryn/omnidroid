@@ -454,6 +454,17 @@ fn sys_exit_group(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         let at = |x: u64| p.mm.describe(x).map_or_else(String::new, |d| format!(" ({d})"));
         eprintln!("[exit] pid {} tid {} exit_group({code}) pc {:#x}{} lr {:#x}{}", p.sys.pid, t.tid, t.pc, at(t.pc), t.lr, at(t.lr));
         eprintln!("[exit]   x19..x23 = {:#x} {:#x} {:#x} {:#x} {:#x}", t.saved_regs[0], t.saved_regs[1], t.saved_regs[2], t.saved_regs[3], t.saved_regs[4]);
+        // Dump 64 bytes at each saved register that looks like a guest pointer: a deliberately-
+        // exiting app's report detail is in stack/heap buffers it passed, and the bytes may name
+        // what it caught (`OMNI_EXIT_REGS`).
+        for (n, &r) in t.saved_regs.iter().enumerate() {
+            if r > 0x1000 && r < 0x8000_0000_0000 {
+                if let Ok(b) = p.mem.read(r, 64) {
+                    let ascii: String = b.iter().map(|&c| if (0x20..0x7f).contains(&c) { c as char } else { '.' }).collect();
+                    eprintln!("[exit]   @x{} {:#x}: {} | {}", 19 + n, r, b.iter().map(|c| format!("{c:02x}")).collect::<String>(), ascii);
+                }
+            }
+        }
         // A frame-pointer backtrace of the exiting thread (the caller that decided to exit, named
         // by lib+offset): what wrote the verdict and from where, for an app that dies deliberately
         // through a shared exit stub whose own pc/lr say nothing about the reason.
