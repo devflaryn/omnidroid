@@ -34,6 +34,7 @@ same package at another version gets an Android of its own. Clash of Clans first
   | `--module emu-hide --denylist com.supercell.clashofclans` (really applied: `[r] rooted device staged (root profile 282fac68)`) | same verdict |
   | `TracerPid` reporting the real tracer, `PPid` the real parent (`d36ae3c`) | same verdict; the app never reads `/proc/self/status` in the window |
   | `/proc/sys/kernel/yama/ptrace_scope` = 1 (`d36ae3c`); it *does* read this, right after `prctl(PR_SET_PTRACER)` | opens now (was ENOENT), same verdict |
+  | `uname` no longer reporting release `6.1.99-omnidroid` (`fea3867`); it calls `uname` exactly once in the window | same verdict |
 
   What it is seen to gather after the handshake: `/proc/self/cmdline`, its own `lib/arm64` directory,
   its `base.apk`, `/proc/<pid>/task`, the shield `.dat`, then ~4.7 MB of `mprotect` RWX->RX (its
