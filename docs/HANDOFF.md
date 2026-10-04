@@ -22,10 +22,28 @@ same package at another version gets an Android of its own. Clash of Clans first
   refused by name.
 - The watchdog's protocol now runs end to end -- attach, wait, set options, continue for all
   thirteen threads, then its report to the parent -- and the child's whole divergence is 24 pages.
-- **Left**: after that the app raises `cnsbodqak.az` with an encrypted verdict, a later integrity
-  layer of its own. `--modules emu-hide` did not change it. Read it with
-  `OMNI_FORK_TRACE_CALLS=1` in `<device>.appenv`, which traces both sides' calls from the handover
-  only -- the window that matters, without tracing the whole start of the app.
+- **Left**: after that the app raises `cnsbodqak.az` with an **encrypted** verdict, from a thread of
+  its own (`cnsbodqak.V.run`), and `exit_group(1)`. Its packer is a commercial one -- its state lives
+  under hex-encoded names, `/data/user/0/com.supercell.clashofclans/736869656c64/75706431/...`
+  ("shield"/"upd1") -- so the verdict cannot be read, only the inputs it gathers.
+
+  **Ruled out, each tried and each leaving the verdict unchanged** (do not re-try these):
+
+  | tried | result |
+  |---|---|
+  | `--module emu-hide --denylist com.supercell.clashofclans` (really applied: `[r] rooted device staged (root profile 282fac68)`) | same verdict |
+  | `TracerPid` reporting the real tracer, `PPid` the real parent (`d36ae3c`) | same verdict; the app never reads `/proc/self/status` in the window |
+  | `/proc/sys/kernel/yama/ptrace_scope` = 1 (`d36ae3c`); it *does* read this, right after `prctl(PR_SET_PTRACER)` | opens now (was ENOENT), same verdict |
+
+  What it is seen to gather after the handshake: `/proc/self/cmdline`, its own `lib/arm64` directory,
+  its `base.apk`, `/proc/<pid>/task`, the shield `.dat`, then ~4.7 MB of `mprotect` RWX->RX (its
+  unpacker) and a page-at-a-time `mprotect` loop. The decision itself makes no system call, so a
+  syscall trace cannot see it: the next step is the lab debugger (`omnidroid-frida`) on the
+  *unpacked* `libsupercell_clashofclans.so`, dumped after it decrypts itself -- the static file is
+  packed and disassembles to nothing.
+
+  Read any of this with `OMNI_FORK_TRACE_CALLS=1` in `<device>.appenv`, which traces both sides'
+  calls from the handover only -- the window that matters, without tracing the whole start of the app.
 
 **Parallel APKs: the Android half is already there; what is left is the composer.**
 
