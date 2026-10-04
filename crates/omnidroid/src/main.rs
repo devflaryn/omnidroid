@@ -125,7 +125,10 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
   aosp --root      a rooted device (Magisk-compatible: su, modules over /system, resetprop);
                     --module installs the named modules (implies --root; built-in ids emu-hide,
                     shamiko, zygisk-frida need no catalog entry), --denylist a,b hides root from those
-                    packages (implies --root), --su all lets every
+                    packages (implies --root).
+                    NOTE: --module shamiko = whitelist mode: hides root from EVERY app not in --su
+                    (use --denylist for one app); --module zygisk-frida is accepted but a NO-OP
+                    until the P1 Zygisk host exists, --su all lets every
                     app su (default: root and shell only). A rooted device is its own saved
                     and warm device -- never one made without root or with other modules.
                     `omnidroid modules` lists the module catalog; `modules add <zip>` adds one.

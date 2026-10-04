@@ -28,16 +28,17 @@ fn one_normal(name: &str) -> bool {
 /// Whether `name` is a safe module id: one normal component that does not start with `.`.
 /// Module ids become host paths.
 #[must_use]
+pub fn is_safe_component(name: &str) -> bool {
+    one_normal(name) && !name.starts_with('.') && !name.contains(['/', '\\', ':'])
+}
+
+/// Engine-native module ids: `emu-hide`, `shamiko`, `zygisk-frida`.
 pub const BUILTIN_MODULES: [&str; 3] = ["emu-hide", "shamiko", "zygisk-frida"];
 
 /// Whether `id` is an engine-native module: always valid, nothing to install from the catalog.
 #[must_use]
 pub fn is_builtin(id: &str) -> bool {
     BUILTIN_MODULES.contains(&id)
-}
-
-pub fn is_safe_component(name: &str) -> bool {
-    one_normal(name) && !name.starts_with('.') && !name.contains(['/', '\\', ':'])
 }
 
 impl ModuleProp {
@@ -209,6 +210,15 @@ impl Catalog {
             scan(u, &mut found)?;
         }
         scan(builtin_dir, &mut found)?;
+        for m in &found {
+            if is_builtin(&m.prop.id) {
+                return Err(format!(
+                    "module id {} (in {}) is a reserved built-in name; rename the module",
+                    m.prop.id,
+                    m.source.path().display()
+                ));
+            }
+        }
         for (i, m) in found.iter().enumerate() {
             if let Some(a) = found[..i].iter().find(|a| a.prop.id == m.prop.id) {
                 return Err(format!(
@@ -258,6 +268,19 @@ mod tests {
         let p = ModuleProp::parse("id=mod_a\nname=Mod A\nversion=v1\nversionCode=1\nauthor=me\ndescription=x\n").unwrap();
         assert_eq!(p.id, "mod_a");
         assert_eq!(p.version_code, 1);
+    }
+
+    #[test]
+    fn a_module_id_colliding_with_a_builtin_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("omni-reserved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("m")).unwrap();
+        std::fs::write(dir.join("m/module.prop"), "id=emu-hide
+name=x
+").unwrap();
+        let err = Catalog::discover(&dir, None).unwrap_err();
+        assert!(err.contains("emu-hide") && err.contains("reserved"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

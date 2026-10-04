@@ -13,6 +13,7 @@
   `emu-hide`, `shamiko`, `zygisk-frida`), `--denylist com.roblox.client` (implies `--root`),
   `OMNI_R_DENYLIST` in the session environment. The denylist is in the staged profile text, so it is in
   the root hash and a denylist change is a different saved/warm device. Unrooted launches are unchanged.
+- Semantics: `--module shamiko` = whitelist mode (hides root from EVERY app not in --su; use --denylist for a specific app). `--module zygisk-frida` is accepted but a NO-OP until the P1 Zygisk host exists.
 
 ## Tests and how to run them
 

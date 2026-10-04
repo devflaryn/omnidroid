@@ -83,23 +83,8 @@ pub fn request(repo: &Path, modules: &[String], su: Option<&str>) -> Result<Requ
 pub fn request_with(repo: &Path, modules: &[String], su: Option<&str>, denylist: &[String]) -> Result<Request, String> {
     let catalog = Catalog::discover(&super::module::builtin_dir(repo), super::module::user_dir().as_deref())?;
     let assets = MagiskAssets::find(repo)?;
-    let mut profile = Profile::parse("");
-    profile.rooted = true;
+    let mut profile = build_profile(modules, su, denylist);
     profile.magisk_code = assets.version_code;
-    profile.module_ids = modules.to_vec();
-    for pkg in denylist {
-        profile.denylist_add(pkg);
-    }
-    if modules.iter().any(|m| m == "shamiko") {
-        profile.shamiko = super::profile::Shamiko::Whitelist;
-    }
-    match su {
-        Some("all") => profile.su = SuPolicy::All,
-        Some(list) => {
-            profile.su = SuPolicy::Packages(list.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect());
-        }
-        None => {}
-    }
     let mut shas = Vec::new();
     for id in modules.iter().filter(|m| !super::module::is_builtin(m)) {
         let m = catalog.find(id).ok_or_else(|| format!("module `{id}` is not in the catalog"))?;
@@ -134,9 +119,44 @@ pub fn from_env(repo: &Path) -> Result<Option<Request>, String> {
     request_with(repo, &modules, su.as_deref(), &denylist).map(Some)
 }
 
+/// The profile `request_with` builds, before the catalog/assets are consulted.
+fn build_profile(modules: &[String], su: Option<&str>, denylist: &[String]) -> Profile {
+    let mut profile = Profile::parse("");
+    profile.rooted = true;
+    profile.module_ids = modules.to_vec();
+    for pkg in denylist {
+        profile.denylist_add(pkg);
+    }
+    if modules.iter().any(|m| m == "shamiko") {
+        profile.shamiko = super::profile::Shamiko::Whitelist;
+    }
+    match su {
+        Some("all") => profile.su = SuPolicy::All,
+        Some(list) => {
+            profile.su = SuPolicy::Packages(list.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect());
+        }
+        None => {}
+    }
+    profile
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modules_and_denylist_become_the_profile() {
+        let p = build_profile(&["emu-hide".to_string(), "shamiko".to_string()], None, &["com.roblox.client".to_string()]);
+        assert!(p.is_rooted());
+        assert_eq!(p.denylist, vec!["com.roblox.client".to_string()]);
+        assert!(matches!(p.shamiko, super::super::profile::Shamiko::Whitelist));
+        assert_eq!(p.modules(), &["emu-hide".to_string(), "shamiko".to_string()]);
+        assert!(p.spoofed(Some("com.roblox.client")));
+        let text = p.serialize();
+        assert!(text.contains("denylist=com.roblox.client") && text.contains("shamiko=whitelist"), "{text}");
+        let none = build_profile(&[], None, &[]);
+        assert!(!none.spoofed(None) && matches!(none.shamiko, super::super::profile::Shamiko::Off));
+    }
 
     #[test]
     fn the_hash_follows_every_input() {
