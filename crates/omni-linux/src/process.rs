@@ -977,6 +977,7 @@ impl Process {
 
     /// End the whole process with `status` (the first ending wins).
     fn end_group(&self, status: ExitStatus) {
+        self.dump_at_exit();
         {
             let mut ending = self.group_exit.lock();
             if ending.is_none() {
@@ -1235,13 +1236,32 @@ impl Process {
         if !(named(pc) || named(lr)) || DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let dir = std::path::PathBuf::from(dir);
-        let _ = std::fs::create_dir_all(&dir);
-        let pid = self.sys.pid;
-        let mut index = format!("pid {pid} pc {pc:#x} lr {lr:#x} fault {fault_address:#x}\n");
+        let mut index = format!("pid {} pc {pc:#x} lr {lr:#x} fault {fault_address:#x}\n", self.sys.pid);
         for (n, v) in x.iter().enumerate() {
             index += &format!("x{n} {v:#x} {}\n", self.mm.describe(*v).unwrap_or_default());
         }
+        self.dump_named_mappings(&want, &std::path::PathBuf::from(dir), index);
+    }
+
+    /// **Diagnostic** (`OMNI_DUMP_AT_EXIT=<name part>`, with `OMNI_DUMP_DIR`; off by default): the
+    /// same dump when the process **ends** rather than faults. Code that unpacks itself is unpacked
+    /// by then, and an app whose anti-tamper decides against the device leaves through
+    /// `exit_group`, not a fault -- which [`dump_on_segv`](Self::dump_on_segv) never sees. Once.
+    fn dump_at_exit(&self) {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let (Ok(want), Ok(dir)) = (std::env::var("OMNI_DUMP_AT_EXIT"), std::env::var("OMNI_DUMP_DIR")) else { return };
+        let holds = |n: &[u8]| !want.is_empty() && n.windows(want.len()).any(|w| w == want.as_bytes());
+        if !self.mm.file_mappings().iter().any(|(_, _, n, _)| holds(n)) || DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let index = format!("pid {} at exit\n", self.sys.pid);
+        self.dump_named_mappings(&want, &std::path::PathBuf::from(dir), index);
+    }
+
+    /// Write every file mapping whose name holds `want` as memory holds it now, and an index.
+    fn dump_named_mappings(&self, want: &str, dir: &std::path::Path, mut index: String) {
+        let _ = std::fs::create_dir_all(dir);
+        let pid = self.sys.pid;
         for (start, len, name, offset) in self.mm.file_mappings() {
             if !name.windows(want.len()).any(|w| w == want.as_bytes()) {
                 continue;
