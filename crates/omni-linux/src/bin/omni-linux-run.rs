@@ -222,22 +222,39 @@ fn main() -> ExitCode {
                 // app started with `am start --display <id>` runs beside the one on display 0
                 // rather than backgrounding it. Added before SurfaceFlinger's callback, so
                 // `registerCallback` hotplugs them all at once.
-                let displays = std::env::var("OMNI_DISPLAYS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+                // **Two is the ceiling, and it is SurfaceFlinger's**: its HWComposer takes a primary
+                // and one external physical display and refuses the rest ("Ignoring connection of
+                // tertiary display 2"), so a third app needs a virtual display, not a third
+                // physical one. Asking for more is capped, and said so.
+                let asked = std::env::var("OMNI_DISPLAYS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+                let displays = asked.min(2);
+                if asked > displays {
+                    eprintln!("[composer] OMNI_DISPLAYS={asked}: SurfaceFlinger takes one external display beside the primary, so {displays} are made");
+                }
                 for _ in 1..displays {
                     match composer.add_display(w, h) {
                         Ok((id, extra)) => {
                             if std::env::var("OMNI_WINDOW").as_deref() == Ok("1") {
-                                let options = omni_linux::display_window::Options {
-                                    title: format!("omnidroid — display {id}"),
-                                    control: None,
-                                    // One window's keyboard and mouse are the device's; a second
-                                    // set would reach display 0 too, until input is associated
-                                    // with a display (the multi-instance design's phase 2).
-                                    input: false,
-                                };
-                                if let Err(e) = omni_linux::display_window::spawn(extra, std::sync::Arc::clone(&composer), options) {
-                                    eprintln!("[window] display {id}: {e}");
-                                }
+                                // **Its window opens when it first draws.** A display with no app on
+                                // it has nothing to show, and a device booted with displays to spare
+                                // would otherwise put an empty window on screen for each.
+                                let composer = std::sync::Arc::clone(&composer);
+                                let _ = std::thread::Builder::new().name(format!("omni-display-{id}-wait")).spawn(move || {
+                                    if !extra.wait_frame(1, std::time::Duration::from_secs(24 * 3600)) {
+                                        return;
+                                    }
+                                    let options = omni_linux::display_window::Options {
+                                        title: format!("omnidroid — display {id}"),
+                                        control: None,
+                                        // One window's keyboard and mouse are the device's; a second
+                                        // set would reach display 0 too, until input is associated
+                                        // with a display (the multi-instance design's phase 2).
+                                        input: false,
+                                    };
+                                    if let Err(e) = omni_linux::display_window::spawn(extra, composer, options) {
+                                        eprintln!("[window] display {id}: {e}");
+                                    }
+                                });
                             }
                         }
                         Err(e) => eprintln!("[composer] a display could not be added: {e}"),
