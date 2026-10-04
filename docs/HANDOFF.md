@@ -79,6 +79,16 @@ same package at another version gets an Android of its own. Clash of Clans first
   a merged universal APK from a mirror would be resigned and would fail its own check on a real
   phone too).
 
+  **The verdict mechanism, fully mapped (decompiled).** Native code sets up a pipe and stores its
+  read fd in the Java static `cnsbodqak.g.b:I` (no Java writes it -- JNI sets it). The native
+  watchdog runs its checks and writes a verdict string to the pipe, terminated by `?`. Java's
+  `cnsbodqak.V.run` polls up to 10 s (`g.a()` = the fd, `g.d()`->`g.b()` reads until `?`), then
+  `g.a(String)` parses it: a leading `!` is the error marker -> wrap in `az` and throw -> FATAL.
+  So the whole verdict is produced by native code and is encrypted; nothing in the Java layer
+  decides, and nothing omnidroid serves is read wrongly -- the pipe read returns exactly what the
+  native side wrote. Reading *why* it wrote `!` needs the native RE / the key; it is not reachable
+  from the Java side or from any host-served value.
+
   What it is seen to gather after the handshake: `/proc/self/cmdline`, its own `lib/arm64` directory,
   its `base.apk`, `/proc/<pid>/task`, the shield `.dat`, then ~4.7 MB of `mprotect` RWX->RX (its
   unpacker) and a page-at-a-time `mprotect` loop. The decision itself makes no system call, so a
