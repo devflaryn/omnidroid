@@ -143,7 +143,7 @@ fn stat(p: &Process) -> Vec<u8> {
     let t = ticks(p);
     // proc(5)'s 52 fields: pid, (comm), state, then these 49. What nothing here tracks is 0.
     let fields: [u64; 49] = [
-        1,                 // ppid
+        p.family.ppid() as u64, // ppid
         pid as u64,        // pgrp
         pid as u64,        // session
         0,                 // tty_nr
@@ -181,7 +181,12 @@ fn status(p: &Process) -> Vec<u8> {
     let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
     let mut out = String::new();
     let _ = write!(out, "Name:\t{name}\nUmask:\t{:04o}\nState:\tR (running)\n", p.sys.umask());
-    let _ = write!(out, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t1\nTracerPid:\t0\n");
+    // The parent, and the tracer if one holds this process (`crate::ptrace`). `TracerPid` is not
+    // always 0: an app that attaches a watchdog of its own to take the one tracer slot then reads
+    // this to see that it is held -- a tracer the kernel knows about but `/proc` denies is a
+    // contradiction, and an anti-tamper that attached on purpose reads it as tampering.
+    let tracer = p.traced.tracer().unwrap_or(0);
+    let _ = write!(out, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t{tracer}\n", p.family.ppid());
     let _ = write!(out, "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n");
     let _ = write!(out, "FDSize:\t64\nGroups:\t\nVmSize:\t{} kB\nVmRSS:\t{} kB\n", mapped_bytes(p) / 1024, committed_pages(p) * 4);
     let threads = p.tids().len();
@@ -425,6 +430,11 @@ fn sysctl_default(path: &str) -> Option<&'static str> {
     Some(match path {
         "/proc/sys/kernel/unprivileged_bpf_disabled" => "2\n",
         "/proc/sys/kernel/perf_event_paranoid" => "3\n",
+        // Yama's ptrace policy. Android builds Yama in and ships 1 ("restricted"): a process
+        // may be traced only by an ancestor, or by the one it named with `prctl(PR_SET_PTRACER)`.
+        // A caller reads this to know whether the attach it is about to make is allowed, and an
+        // app that attaches a watchdog to itself reads a missing file as an impossible device.
+        "/proc/sys/kernel/yama/ptrace_scope" => "1\n",
         "/proc/sys/net/core/bpf_jit_enable" => "0\n",
         "/proc/sys/net/core/bpf_jit_kallsyms" => "0\n",
         // tracefs, with tracing off: what atrace and the tracing HAL set before they trace.
@@ -560,7 +570,8 @@ impl Process {
             }
             "/proc/self" => return Some(Entry::Link(pid.into_bytes())),
             "/proc/sys" => return Some(Entry::Dir(vec![("kernel", DT_DIR), ("net", DT_DIR)])),
-            "/proc/sys/kernel" => return Some(Entry::Dir(vec![("random", DT_DIR), ("unprivileged_bpf_disabled", DT_REG), ("perf_event_paranoid", DT_REG)])),
+            "/proc/sys/kernel" => return Some(Entry::Dir(vec![("random", DT_DIR), ("yama", DT_DIR), ("unprivileged_bpf_disabled", DT_REG), ("perf_event_paranoid", DT_REG)])),
+            "/proc/sys/kernel/yama" => return Some(Entry::Dir(vec![("ptrace_scope", DT_REG)])),
             "/proc/sys/net" => return Some(Entry::Dir(vec![("core", DT_DIR), ("ipv4", DT_DIR), ("ipv6", DT_DIR)])),
             "/proc/sys/net/core" => return Some(Entry::Dir(vec![("bpf_jit_enable", DT_REG), ("bpf_jit_kallsyms", DT_REG)])),
             "/proc/sys/net/ipv4" | "/proc/sys/net/ipv6" => return Some(Entry::Dir(vec![("conf", DT_DIR), ("neigh", DT_DIR)])),
