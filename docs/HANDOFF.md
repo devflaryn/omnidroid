@@ -57,17 +57,26 @@ path per package name).
 of tertiary display 2`. A third app side by side therefore needs a **virtual** display
 (SurfaceFlinger makes many), presented into a framebuffer and window of its own.
 
+**The launch rule is in** (`6e03fe0`): `start_instance` *places* the app -- a different package goes
+on the live device's next free display, the same package at other bytes gets an Android of its own,
+and a device with every display taken sends it on. `fits` is the rule without a device and
+`server::tests::where_an_app_goes` is its gate; `find_all`, `boot_another`, `install_beside`,
+`start_on` and `Device::display_ids` are underneath it, and warm devices boot with
+`OMNI_DISPLAYS=2`. **Not yet run through a live `start_instance`**: this session's MCP server was
+the previous binary, so the rule is gated by its unit test and the mechanism under it was verified
+by hand on a two-display device.
+
 Next, in order:
 
-1. **A virtual display path**, for the third app and beyond (`createVirtualDisplay`, its output into
-   a `Framebuffer`), since physical displays stop at two.
-2. **The launch rule**: distinct package -> the next free display on the live device; same package,
-   different APK bytes -> a second device. The warm device uninstalls other test apps today
-   (`omni-warm`: "another package's test app is uninstalled first") -- that goes. `start_instance`
-   should pick the display and report it, and `OMNI_DISPLAYS` should be set when it boots a device.
+1. **Run it through `start_instance`** on a fresh MCP server: Talking Tom then Roblox should answer
+   with `display` 0 and 2 on one device, and a second Roblox APK (other bytes) should boot a second
+   device. The host needs the commit for two Androids (~3.7 GB each).
+2. **A virtual display path**, for the third app and beyond (`createVirtualDisplay`, its output into
+   a `Framebuffer`), since physical displays stop at two per Android.
 3. **Input association per display** and per-display focus: a second window's keyboard and mouse
    would reach display 0 today, so its window is opened with `input: false`.
-4. A screenshot path for a display other than the first, then phase 3's isolation gates.
+4. A screenshot path for a display other than the first (`screenshot` and `OMNI_SCREENSHOT` are
+   display 0's), then phase 3's isolation gates.
 
 ## `--cookie --place` ON THE WARM DEVICE (2026-10-02, Windows; branch `perf/warm-join`, not merged)
 
