@@ -79,6 +79,23 @@ same package at another version gets an Android of its own. Clash of Clans first
   a merged universal APK from a mirror would be resigned and would fail its own check on a real
   phone too).
 
+  **The two leading omnidroid-specific suspects for *why* native writes `!`** (unconfirmed, because
+  the verdict is encrypted -- but these are where the next effort should look, and both are
+  semantic gaps a memory-and-debugger integrity watchdog is built to catch):
+  1. **The time-shared fork serializes parent and child.** A real `fork` yields two processes that
+     run concurrently; `crate::fork` gives them one memory they take turns in (only one resident at
+     a time). A watchdog that relies on genuine parent/child concurrency -- both live at once,
+     checking each other -- sees turn-taking instead. The verdict payload is new behaviour that only
+     appears once this fork runs (on `main` it deadlocked before reaching it), so the watchdog's
+     result is produced *by* this fork.
+  2. **ptrace is bookkeeping, not real debugging.** `crate::ptrace` makes attach/wait/setoptions/
+     cont succeed and refuses `PTRACE_GETREGS`/`PEEKTEXT`/real stops by name. A watchdog that
+     attaches and then does a real debug op to prove the attach is genuine gets an error a real
+     tracer never would.
+  Confirming either needs the verdict decrypted or the native check reversed; fixing #1 is real
+  concurrent fork (a host process per child -- CRIU/checkpoint territory) and #2 is a real ptrace
+  stop/step/peek subsystem. Both are large, separate from the launcher work.
+
   **The verdict mechanism, fully mapped (decompiled).** Native code sets up a pipe and stores its
   read fd in the Java static `cnsbodqak.g.b:I` (no Java writes it -- JNI sets it). The native
   watchdog runs its checks and writes a verdict string to the pipe, terminated by `?`. Java's
