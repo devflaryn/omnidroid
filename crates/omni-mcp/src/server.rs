@@ -242,9 +242,6 @@ impl Server {
         root.add_to(&mut cmd);
         // The screenshot path we can read (r_roblox honours a preset OMNI_SCREENSHOT).
         cmd.env("OMNI_SCREENSHOT", dir.with_extension("png"));
-        // A display per app, up to SurfaceFlinger's two: the second app is resumed on display 2
-        // rather than backgrounding the first. `OMNI_MCP_DISPLAYS=1` keeps a single display.
-        cmd.env("OMNI_DISPLAYS", std::env::var("OMNI_MCP_DISPLAYS").unwrap_or_else(|_| "2".into()));
         if let Some(ram) = self.config.device_ram_mb {
             cmd.env("OMNI_DEVICE_RAM_MB", ram.to_string());
         }
@@ -336,6 +333,9 @@ impl Server {
         cmd.env("OMNI_SCREENSHOT", dir.with_extension("png"));
         // A frame a second: the agent's screenshot shows what the app just did.
         cmd.env("OMNI_SCREENSHOT_MS", std::env::var("OMNI_MCP_SCREENSHOT_MS").unwrap_or_else(|_| "1000".into()));
+        // A display per app, up to SurfaceFlinger's two: a second app is resumed on display 2
+        // rather than backgrounding the first. `OMNI_MCP_DISPLAYS=1` keeps a single display.
+        cmd.env("OMNI_DISPLAYS", std::env::var("OMNI_MCP_DISPLAYS").unwrap_or_else(|_| "2".into()));
         if let Some(ram) = self.config.device_ram_mb {
             cmd.env("OMNI_DEVICE_RAM_MB", ram.to_string());
         }
