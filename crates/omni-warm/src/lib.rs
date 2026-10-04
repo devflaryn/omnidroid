@@ -173,6 +173,23 @@ impl Device {
         out
     }
 
+    /// The displays Android has, lowest first (`dumpsys display`). Display 0 is always there; a
+    /// device booted with `OMNI_DISPLAYS=2` has a second, which an app can be started on so that it
+    /// runs beside the one on display 0 rather than backgrounding it.
+    ///
+    /// # Errors
+    /// A control-channel failure.
+    pub fn display_ids(&self) -> Result<Vec<i64>, String> {
+        let (_, out) = self.shell("dumpsys display | grep -oE 'Display Id=[0-9]+'", Duration::from_secs(30))?;
+        let mut ids: Vec<i64> = out.lines().filter_map(|l| l.trim().strip_prefix("Display Id=").and_then(|n| n.parse().ok())).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            ids.push(0);
+        }
+        Ok(ids)
+    }
+
     /// The APK the device holds for `package` (the installed bytes), if it has one.
     #[must_use]
     pub fn installed_apk(&self, package: &str) -> Option<PathBuf> {
@@ -231,6 +248,21 @@ fn fresh(path: &Path, age: Duration) -> bool {
     std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a < age)
 }
 
+/// Every live warm device on this host, oldest first.
+#[must_use]
+pub fn find_all() -> Vec<Device> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(root())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| numbered(&e.file_name().to_string_lossy(), PREFIX) && e.path().is_dir())
+        .map(|e| e.path())
+        .filter(|d| Device { dir: d.clone() }.alive())
+        .collect();
+    found.sort();
+    found.into_iter().map(|dir| Device { dir }).collect()
+}
+
 /// The live warm device on this host, if there is one (the newest).
 #[must_use]
 pub fn find() -> Option<Device> {
@@ -243,6 +275,34 @@ pub fn find() -> Option<Device> {
         .collect();
     found.sort();
     found.pop().map(|dir| Device { dir })
+}
+
+/// **Boot another device** beside the ones already live, for an app the live ones cannot take --
+/// the same package at other bytes (PackageManager keeps one code path per package name, so a
+/// second version needs an Android of its own), or no free display left. Under the same lock as
+/// [`ensure`], so two callers never boot two.
+///
+/// # Errors
+/// Another boot is already under way, or `boot`'s error.
+pub fn boot_another(boot: impl FnOnce(&Path) -> Result<(), String>) -> Result<Found, String> {
+    if let Some(d) = booting() {
+        return Ok(Found::Booting(d));
+    }
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let dir = root().join(format!("{PREFIX}{secs}"));
+    let lock = root().join(LOCK);
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+        Ok(mut f) => {
+            use std::io::Write;
+            let _ = write!(f, "{}", dir.display());
+        }
+        Err(_) => return booting().map(Found::Booting).ok_or_else(|| "another server is booting a device".to_string()),
+    }
+    if let Err(e) = boot(&dir) {
+        let _ = std::fs::remove_file(&lock);
+        return Err(e);
+    }
+    Ok(Found::Booting(Device { dir }))
 }
 
 /// The device being booted under the lock, if a boot is under way (and not stale).
@@ -377,7 +437,17 @@ fn pm_install_flags() -> String {
 /// # Errors
 /// A control-channel failure, or `pm install` failing.
 pub fn install(device: &Device, apk: &Apk) -> Result<Installed, String> {
-    install_then(device, apk, "")
+    install_then(device, apk, "", false)
+}
+
+/// [`install`], **keeping every other app the device holds**: a device that shows an app per
+/// display runs more than one at a time, so another package's being there is not a reason to
+/// remove it.
+///
+/// # Errors
+/// As [`install`].
+pub fn install_beside(device: &Device, apk: &Apk) -> Result<Installed, String> {
+    install_then(device, apk, "", true)
 }
 
 /// [`install`], and `then` (shell, as root) in the same command once the install succeeded -- one
@@ -386,12 +456,12 @@ pub fn install(device: &Device, apk: &Apk) -> Result<Installed, String> {
 ///
 /// # Errors
 /// As [`install`].
-pub fn install_then(device: &Device, apk: &Apk, then: &str) -> Result<Installed, String> {
+pub fn install_then(device: &Device, apk: &Apk, then: &str, keep_others: bool) -> Result<Installed, String> {
     let t = Instant::now();
     let limit = Duration::from_secs(300);
     // What the device holds is read from its /data on the host: no round trip to decide.
     let installed = device.installed_packages();
-    let others: Vec<String> = installed.iter().filter(|p| **p != apk.package).cloned().collect();
+    let others: Vec<String> = if keep_others { Vec::new() } else { installed.iter().filter(|p| **p != apk.package).cloned().collect() };
     let held = installed.iter().any(|p| *p == apk.package);
     if held && others.is_empty() {
         if let Some(base) = device.installed_apk(&apk.package) {
@@ -452,10 +522,21 @@ pub struct Started {
 /// # Errors
 /// The APK has no launcher Activity, or the start failed.
 pub fn start(device: &Device, apk: &Apk, limit: Duration) -> Result<Started, String> {
+    start_on(device, apk, None, limit)
+}
+
+/// [`start`], on `display` when one is given: `am start --display <id>`, which resumes the app on
+/// that display and leaves whatever is on the others resumed too -- what lets a device show an app
+/// per display rather than one at a time.
+///
+/// # Errors
+/// As [`start`].
+pub fn start_on(device: &Device, apk: &Apk, display: Option<i64>, limit: Duration) -> Result<Started, String> {
     let class = apk.launcher.as_deref().ok_or_else(|| format!("{} has no launcher Activity (MAIN/LAUNCHER)", apk.package))?;
     let component = format!("{}/{class}", apk.package);
     let t = Instant::now();
-    let (code, out) = device.shell(&format!("input keyevent KEYCODE_WAKEUP; am start -W -n {component}"), limit)?;
+    let on = display.map_or(String::new(), |d| format!(" --display {d}"));
+    let (code, out) = device.shell(&format!("input keyevent KEYCODE_WAKEUP; am start -W{on} -n {component}"), limit)?;
     let field = |name: &str| out.lines().find_map(|l| l.trim().strip_prefix(name).map(|v| v.trim().to_string()));
     let status = field("Status:").unwrap_or_default();
     if code != 0 || out.contains("Error") {

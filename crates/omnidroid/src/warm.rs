@@ -142,7 +142,7 @@ pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Pa
     // From here the app runs: stopped when this process ends, however it ends.
     release_when_gone(dev, &package);
     // Installed, planted and started in one command.
-    let started = match device::install_then(dev, &app, &format!("{before}{start}")) {
+    let started = match device::install_then(dev, &app, &format!("{before}{start}"), false) {
         Ok(i) => {
             let gone = if i.uninstalled.is_empty() { String::new() } else { format!("; {} uninstalled", i.uninstalled.join(", ")) };
             say(&format!("{package} {} in {:.1} s{gone}", i.action, i.seconds));

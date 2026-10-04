@@ -108,6 +108,8 @@ struct Instance {
     started: std::time::Instant,
     /// On the warm device: the app's package (its device is `dir`, which outlives the instance).
     package: Option<String>,
+    /// The display it was started on, when it shares its device with another app.
+    display: Option<i64>,
 }
 
 /// The MCP server.
@@ -240,6 +242,9 @@ impl Server {
         root.add_to(&mut cmd);
         // The screenshot path we can read (r_roblox honours a preset OMNI_SCREENSHOT).
         cmd.env("OMNI_SCREENSHOT", dir.with_extension("png"));
+        // A display per app, up to SurfaceFlinger's two: the second app is resumed on display 2
+        // rather than backgrounding the first. `OMNI_MCP_DISPLAYS=1` keeps a single display.
+        cmd.env("OMNI_DISPLAYS", std::env::var("OMNI_MCP_DISPLAYS").unwrap_or_else(|_| "2".into()));
         if let Some(ram) = self.config.device_ram_mb {
             cmd.env("OMNI_DEVICE_RAM_MB", ram.to_string());
         }
@@ -341,14 +346,19 @@ impl Server {
         cmd.spawn().map(|_| ()).map_err(|e| format!("could not start {}: {e}", self.config.omnidroid_bin.display()))
     }
 
-    /// The warm device, ready: the live one, or one booted now (waited for, `warm_wait` at most).
-    /// With it, how it was found (`warm`, `booted`, `waited`) and the seconds waited.
-    fn warm_device(&self, root: &RootRequest) -> Result<(device::Device, &'static str, f64), RpcError> {
+    /// **Where an app goes**: the device that may run it, and the display it gets there.
+    ///
+    /// Different packages share a device, one app per display -- they are resumed side by side and
+    /// neither is backgrounded. The **same package at other bytes needs a device of its own**:
+    /// PackageManager keeps one code path per package name, so a second version cannot live beside
+    /// the first, and installing it would replace the running app. A device with no display free
+    /// also sends the app to another one.
+    fn place(&self, app: &device::Apk, root: &RootRequest) -> Result<(device::Device, Option<i64>, &'static str, f64), RpcError> {
         let t = std::time::Instant::now();
-        let booted = std::cell::Cell::new(false);
-        // A live device of another root state is not reused (and a second device is not booted
-        // beside it): the caller stops it first.
-        if let Some(live) = device::find() {
+        // A live device of another root state is not reused -- and no second device is booted
+        // beside it, which would leave two Androids of different root profiles on the host: the
+        // caller stops it first.
+        for live in device::find_all() {
             if !root.matches(&live, self.config.repo_dir.as_deref()).map_err(RpcError::server)? {
                 return Err(RpcError::server(format!(
                     "the warm device ({}) has a different root profile ({}); call stop_device, then start again with the root/modules wanted",
@@ -357,18 +367,36 @@ impl Server {
                 )));
             }
         }
-        let found = device::ensure(|dir| {
+        for dev in device::find_all().into_iter().filter(device::Device::ready) {
+            let has_package = dev.installed_packages().iter().any(|p| *p == app.package);
+            let same_bytes = has_package && dev.installed_apk(&app.package).and_then(|base| device::sha256_file(&base).ok()).is_some_and(|h| h == app.sha256);
+            let displays = if has_package { Vec::new() } else { dev.display_ids().unwrap_or_else(|_| vec![0]) };
+            let used: Vec<i64> = self.instances.values().filter(|i| i.dir == dev.dir).filter_map(|i| i.display).collect();
+            match fits(has_package, same_bytes, &displays, &used) {
+                Fit::Same => {
+                    // Its display is the one it already had.
+                    let display = self.instances.values().find(|i| i.dir == dev.dir && i.package.as_deref() == Some(app.package.as_str())).and_then(|i| i.display);
+                    return Ok((dev, display, "warm", t.elapsed().as_secs_f64()));
+                }
+                Fit::Free(display) => return Ok((dev, Some(display), "warm", t.elapsed().as_secs_f64())),
+                Fit::No => continue,
+            }
+        }
+        // No live device can take it: one of its own. The first device on the host is `ensure`'s;
+        // a further one is `boot_another`'s, which takes the same lock.
+        let booted = std::cell::Cell::new(false);
+        let boot = |dir: &Path| {
             booted.set(true);
             self.boot_warm(dir, root)
-        })
-        .map_err(RpcError::server)?;
-        let d = match found {
-            device::Found::Ready(d) => return Ok((d, "warm", t.elapsed().as_secs_f64())),
+        };
+        let found = if device::find().is_some() { device::boot_another(boot) } else { device::ensure(boot) }.map_err(RpcError::server)?;
+        let dev = match found {
+            device::Found::Ready(d) => return Ok((d, Some(0), "warm", t.elapsed().as_secs_f64())),
             device::Found::Booting(d) => d,
         };
         let how = if booted.get() { "booted" } else { "waited" };
-        device::wait_ready(&d, std::time::Duration::from_secs(self.config.warm_wait)).map_err(RpcError::server)?;
-        Ok((d, how, t.elapsed().as_secs_f64()))
+        device::wait_ready(&dev, std::time::Duration::from_secs(self.config.warm_wait)).map_err(RpcError::server)?;
+        Ok((dev, Some(0), how, t.elapsed().as_secs_f64()))
     }
 
     /// With `warm` configured, boot the warm device now unless one is up or booting.
@@ -384,8 +412,8 @@ impl Server {
         let t = std::time::Instant::now();
         let app = device::Apk::read(&apk).map_err(RpcError::params)?;
         let read_s = t.elapsed().as_secs_f64();
-        let (dev, how, device_s) = self.warm_device(root)?;
-        let installed = device::install(&dev, &app).map_err(RpcError::server)?;
+        let (dev, display, how, device_s) = self.place(&app, root)?;
+        let installed = device::install_beside(&dev, &app).map_err(RpcError::server)?;
         // Instances of apps this install replaced are over.
         self.instances.retain(|_, i| i.package.as_ref().map_or(true, |p| !installed.uninstalled.contains(p)));
         let mut out = vec![
@@ -393,6 +421,7 @@ impl Server {
             ("sha256", json::s(app.sha256.clone())),
             ("version_code", app.version_code.map_or(Json::Null, |v| Json::Num(f64::from(v)))),
             ("device", json::obj([("dir", json::s(dev.dir.to_string_lossy().into_owned())), ("how", json::s(how)), ("seconds", secs(device_s))])),
+            ("display", display.map_or(Json::Null, |d| Json::Num(d as f64))),
             (
                 "install",
                 json::obj([
@@ -403,11 +432,12 @@ impl Server {
             ),
         ];
         if launch {
-            let started = device::start(&dev, &app, std::time::Duration::from_secs(300)).map_err(RpcError::server)?;
+            let started = device::start_on(&dev, &app, display, std::time::Duration::from_secs(300)).map_err(RpcError::server)?;
             let id = format!("inst-{}", self.next_instance);
             self.next_instance += 1;
-            // One instance per app: a start of the same app again is that instance.
-            self.instances.retain(|_, i| i.package.as_deref() != Some(app.package.as_str()));
+            // One instance per app on a device: the same app started again there is that instance,
+            // and another device's copy of the package is an instance of its own.
+            self.instances.retain(|_, i| !(i.dir == dev.dir && i.package.as_deref() == Some(app.package.as_str())));
             self.instances.insert(
                 id.clone(),
                 Instance {
@@ -420,6 +450,7 @@ impl Server {
                     place: None,
                     started: std::time::Instant::now(),
                     package: Some(app.package.clone()),
+                    display,
                 },
             );
             out.insert(0, ("instance_id", json::s(id)));
@@ -673,6 +704,7 @@ impl Server {
                         place,
                         started: std::time::Instant::now(),
                         package: None,
+                        display: None,
                     },
                 );
                 return Ok(json::obj([
@@ -705,6 +737,7 @@ impl Server {
             place: place.clone(),
             started: std::time::Instant::now(),
             package: None,
+            display: None,
         };
         self.instances.insert(id.clone(), instance);
 
@@ -1500,6 +1533,29 @@ fn root_json(device: &device::Device) -> Json {
     }
 }
 
+/// What a device can do with an app ([`fits`]).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Fit {
+    /// The app is already installed here, the same bytes: this is its device.
+    Same,
+    /// It is not here and this display is free: it runs here, beside whatever else is.
+    Free(i64),
+    /// Another version of the same package, or no display free: it needs another device.
+    No,
+}
+
+/// **The rule for where an app goes**, without the device: different packages share a device, one
+/// per display; the same package at other bytes needs a device of its own, because PackageManager
+/// keeps one code path per package name and installing the other version would replace the running
+/// app. `displays` is empty when the package is already here, which is then the only thing that
+/// decides.
+fn fits(has_package: bool, same_bytes: bool, displays: &[i64], used: &[i64]) -> Fit {
+    if has_package {
+        return if same_bytes { Fit::Same } else { Fit::No };
+    }
+    displays.iter().find(|d| !used.contains(d)).map_or(Fit::No, |d| Fit::Free(*d))
+}
+
 fn root_summary(device: &device::Device) -> String {
     match device.root_modules() {
         Some(ids) if ids.is_empty() => "rooted".to_string(),
@@ -1722,5 +1778,24 @@ mod tests {
         for t in tools {
             assert_eq!(t.get("inputSchema").unwrap().get("type").unwrap().as_str(), Some("object"));
         }
+    }
+
+    /// Different packages share a device, one per display; the same package at other bytes needs a
+    /// device of its own; a device with every display taken sends the app on.
+    #[test]
+    fn where_an_app_goes() {
+        // Not here, display 0 free: it runs here.
+        assert_eq!(fits(false, false, &[0, 2], &[]), Fit::Free(0));
+        // Not here, display 0 taken by another app: the second display is its.
+        assert_eq!(fits(false, false, &[0, 2], &[0]), Fit::Free(2));
+        // Here, the same bytes: this is its device.
+        assert_eq!(fits(true, true, &[], &[0]), Fit::Same);
+        // Here at other bytes -- the same package, another version: not this Android.
+        assert_eq!(fits(true, false, &[], &[0]), Fit::No);
+        // Not here, but both displays are taken: another device.
+        assert_eq!(fits(false, false, &[0, 2], &[0, 2]), Fit::No);
+        // A device with one display takes one app.
+        assert_eq!(fits(false, false, &[0], &[]), Fit::Free(0));
+        assert_eq!(fits(false, false, &[0], &[0]), Fit::No);
     }
 }
