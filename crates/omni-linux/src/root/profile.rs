@@ -33,6 +33,11 @@ pub enum Shamiko {
     Whitelist,
 }
 
+/// The base package of a process name: `com.app:gl` -> `com.app`.
+pub fn base_package(name: &str) -> &str {
+    name.split(':').next().unwrap_or(name)
+}
+
 impl Profile {
     /// Parse comma-separated values, dropping empty entries.
     fn parse_comma_list(s: &str) -> Vec<String> {
@@ -169,9 +174,20 @@ impl Profile {
         self.magisk_code
     }
 
-    /// Whether a package is hidden (R2+).
-    pub fn hidden(&self, _package: Option<&str>) -> bool {
-        false
+    /// Whether a process of `package` (a package or process name; its base package counts) is
+    /// hidden from: on the denylist, or in whitelist mode and not on the su allow list. The uid 0/2000
+    /// exemption is the view's (`ProcessView::for_process`).
+    pub fn hidden(&self, package: Option<&str>) -> bool {
+        package.is_some_and(|n| {
+            let b = base_package(n);
+            self.denylist.iter().any(|d| d == b)
+                || (self.shamiko == Shamiko::Whitelist && !matches!(&self.su, SuPolicy::Packages(p) if p.iter().any(|a| a == b)))
+        })
+    }
+
+    /// Whether a process of `package` gets the emulator spoof: the unscoped `emu-hide` module spoofs every app.
+    pub fn spoofed(&self, _package: Option<&str>) -> bool {
+        self.module_ids.iter().any(|m| m == "emu-hide")
     }
 }
 
@@ -225,6 +241,21 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_and_spoofed_truth_table() {
+        let p = Profile::parse("root=1\ndenylist=com.roblox.client\nmodule=emu-hide\nshamiko=on\n");
+        assert!(p.hidden(Some("com.roblox.client")));
+        assert!(p.hidden(Some("com.roblox.client:gl"))); // base package matches
+        assert!(!p.hidden(Some("com.other.app")));
+        assert!(!p.hidden(None)); // unknown name, not on denylist -> not hidden
+        assert!(p.spoofed(Some("com.roblox.client"))); // emu-hide unscoped spoofs all
+        assert!(p.spoofed(Some("com.other.app")));
+
+        let w = Profile::parse("root=1\nshamiko=whitelist\nsu=com.allowed\n");
+        assert!(w.hidden(Some("com.anything"))); // whitelist: all hidden...
+        assert!(!w.hidden(Some("com.allowed"))); // ...except the su allow list
+    }
 
     #[test]
     fn elevation_grants_root_and_refuses_a_disallowed_uid() {

@@ -171,7 +171,7 @@ fn answer(args: &[String], launcher: &Arc<Launcher>, instance: usize) -> Option<
     // (Without `--package-name`, an app's main process is named after its package.)
     let package = if package.is_empty() { nice.clone().unwrap_or_default() } else { package };
     let installed = uid >= 10_000 && installed_app(&launcher.instance, &package);
-    let pid = launch(launcher, uid, nice.as_deref(), sdk.unwrap_or(0), &rest, installed).unwrap_or(-1);
+    let pid = launch(launcher, uid, nice.as_deref(), (!package.is_empty()).then_some(package.as_str()), sdk.unwrap_or(0), &rest, installed).unwrap_or(-1);
     let mut reply = int(pid);
     reply.push(1); // usingWrapper: the process is WrapperInit's
     Some(reply)
@@ -222,12 +222,12 @@ fn installed_app(instance: &std::path::Path, package: &str) -> bool {
 /// Launch `class args...` in a host process of its own; the pid it runs under. With
 /// `OMNI_APP_SPARE=1` and `spare` (an installed app) a spare app process waiting for an app
 /// (`start_spare`) becomes it instead.
-fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String], spare: bool) -> Option<i32> {
+fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, package: Option<&str>, sdk: u32, class_and_args: &[String], spare: bool) -> Option<i32> {
     if let Some(pid) = spare.then(|| take_spare(uid, nice, sdk, class_and_args)).flatten() {
         return Some(pid);
     }
     let pid = crate::process::reserve_pid();
-    let mut cmd = host_command(launcher, pid, uid, nice, &[]);
+    let mut cmd = host_command(launcher, pid, uid, nice, package, &[]);
     // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
     cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
     cmd.args(class_and_args);
@@ -237,7 +237,7 @@ fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and
 
 /// An app host process's command, up to the class app_process runs: the runner, the instance,
 /// the system's binder, the pid and uid, the environment, the VM options and the per-app switches.
-fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, env: &[&str]) -> std::process::Command {
+fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, package: Option<&str>, env: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new(&launcher.runner);
     cmd.arg("--sysroot").arg(&launcher.sysroot).arg("--instance").arg(&launcher.instance);
     cmd.args(["--binder-server", &launcher.binder, "--binder-credential-stdin", "--pid", &pid.to_string(), "--uid", &uid.to_string()]);
@@ -258,6 +258,11 @@ fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, env
     cmd.args(["/system/bin", "--application"]);
     if let Some(n) = nice {
         cmd.arg(format!("--nice-name={n}"));
+    }
+    // The base package, so the per-process root/emulator hiding (`root::package_of`) does not depend
+    // on the nice-name, which can be a process name (`com.roblox.client:gl`).
+    if let Some(pkg) = package {
+        cmd.arg(format!("--package-name={pkg}"));
     }
     // OMNI_TRACE_APP=<process name>: that app's host process traces its system calls.
     if nice.is_some() && std::env::var("OMNI_TRACE_APP").ok().as_deref() == nice {
@@ -399,7 +404,7 @@ fn start_spare() {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::remove_file(&go);
-    let mut cmd = host_command(launcher, pid, 0, Some("omni-spare"), &["CLASSPATH=/vendor/framework/omni-spare.jar"]);
+    let mut cmd = host_command(launcher, pid, 0, Some("omni-spare"), None, &["CLASSPATH=/vendor/framework/omni-spare.jar"]);
     cmd.args(["com.omnidroid.spare.Spare", &guest]);
     if spawn(cmd, pid, 0).is_some() {
         eprintln!("[zygote] a spare app process as pid {pid}");
