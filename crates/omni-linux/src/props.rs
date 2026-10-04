@@ -428,6 +428,12 @@ impl PropertyService {
         std::sync::Arc::new(Self::build(sysroot, &crate::root::ProcessView::default()))
     }
 
+    /// A fresh service built with a spoofed view (the `emu-hide` Pixel props applied).
+    #[cfg(test)]
+    fn for_test_spoofed(sysroot: &Sysroot) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::build(sysroot, &crate::root::ProcessView { spoofed: true, ..Default::default() }))
+    }
+
     /// The service as `view` sees it. A hidden process gets no Magisk/root props (none are added
     /// today -- su and magisk live in the root layer -- so this guards that invariant).
     fn build(sysroot: &Sysroot, view: &crate::root::ProcessView) -> Self {
@@ -437,10 +443,18 @@ impl PropertyService {
 
     /// The one place `view` shapes the prop set (the hidden removal now; Task 5's spoof overrides
     /// for `view.spoofed` go here too).
-    fn build_from(props: Properties, view: &crate::root::ProcessView) -> Self {
+    fn build_from(mut props: Properties, view: &crate::root::ProcessView) -> Self {
+        // A spoofed process reads a Pixel: the overrides replace the values here, before the area
+        // is frozen (an existing `ro.*` cannot be re-set at runtime).
+        if view.spoofed {
+            for (k, v) in crate::root::spoof::pixel_overrides() {
+                props.set(k, v);
+            }
+        }
+        let dropped = |k: &str| view.spoofed && crate::root::spoof::removals().contains(&k);
         let mut area = Area::new();
         let mut info = HashMap::new();
-        for (k, v) in props.entries.iter().filter(|(k, _)| !(view.hidden && is_root_prop(k))) {
+        for (k, v) in props.entries.iter().filter(|(k, _)| !(view.hidden && is_root_prop(k)) && !dropped(k)) {
             info.insert(k.clone(), area.add(k, v));
         }
         // Room to grow: what the build set, and a megabyte more for what the system sets.
@@ -669,6 +683,26 @@ mod tests {
         assert!(bytes[used..].iter().all(|&b| b == 0), "a non-zero byte past {used}");
         assert!(bytes[..used].iter().any(|&b| b != 0));
         assert!(used < bytes.len() / 4, "{used} of {}", bytes.len());
+    }
+
+    #[test]
+    fn spoof_overrides_existing_ro_props_at_build_time() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test_spoofed(&root);
+        assert_eq!(svc.get("ro.product.model").as_deref(), Some("Pixel 8"));
+        assert_eq!(svc.get("ro.hardware").as_deref(), Some("zuma"));
+        assert_eq!(svc.get("ro.boot.hardware").as_deref(), Some("zuma"));
+    }
+
+    #[test]
+    fn spoof_is_per_process_and_scoped() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let spoofed = PropertyService::for_test_spoofed(&root);
+        let plain = PropertyService::for_test(&root);
+        assert_eq!(spoofed.get("ro.hardware").as_deref(), Some("zuma"));
+        assert_eq!(plain.get("ro.hardware").as_deref(), Some("omnidroid"), "non-spoofed keeps the original");
+        assert_ne!(plain.get("ro.product.model").as_deref(), Some("Pixel 8"));
+        assert_eq!(plain.get("ro.boot.hardware").as_deref(), Some("omnidroid"));
     }
 
     #[test]

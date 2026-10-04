@@ -15,3 +15,4 @@ pub mod assets;
 pub use assets::{MagiskAssets, MagiskPin};
 pub mod install;
 pub mod key;
+pub mod spoof;
