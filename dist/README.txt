@@ -25,8 +25,11 @@ draws its first frame. Close the app's window (or the console) to end the demo.
 REQUIREMENTS
 ------------
 - 64-bit Windows 10 or 11.
-- A GPU with its normal drivers (Intel/AMD/NVIDIA) -- these ship Vulkan, which
-  omnidroid uses; a software GLES fallback (ANGLE, bundled) is used otherwise.
+- A GPU with its normal drivers (Intel/AMD/NVIDIA). omnidroid uses Vulkan when the
+  GPU supports it; if the Vulkan path does not come up (e.g. an older GPU with a
+  broken Vulkan driver), the launcher AUTOMATICALLY retries on the bundled
+  Direct3D 11 / GL path -- so it still works. (That retry means a second ~1-2 min
+  boot on those machines; modern GPUs boot once on Vulkan.)
 - ~4 GB free space on the system drive (a temporary Android instance is created in
   the Windows TEMP folder for each run and removed when you unplug/clean up).
 
