@@ -22,7 +22,15 @@ impl ProcessView {
         let hidden = uid != 0
             && uid != 2000
             && (profile.denylisted(package) || (uid >= 10000 && profile.whitelist_hidden(package)));
-        ProcessView { hidden, spoofed: profile.spoofed(package) }
+        // Emulator spoofing (Pixel 8 props, hidden ranchu/goldfish/qemu files) is only for the app
+        // whose anti-tamper we defeat -- the same processes root is hidden from -- never the
+        // system's own services. Spoofing servicemanager/system_server/the HALs would hide the
+        // device's real `ranchu`-named VINTF fragments from the boot that needs them: the audio
+        // HAL's manifest is `android.hardware.audio@7.1-impl.ranchu.xml`, so hiding it leaves
+        // `IDevicesFactory` undeclared, audioserver finds no HAL and crashes, and AudioService
+        // deadlocks system_server until the watchdog kills the boot.
+        let spoofed = hidden && profile.spoofed(package);
+        ProcessView { hidden, spoofed }
     }
 }
 

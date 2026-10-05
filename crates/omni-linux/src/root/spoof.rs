@@ -89,6 +89,21 @@ pub fn is_emulator_name(name: &[u8]) -> bool {
     [b"ranchu".as_slice(), b"goldfish".as_slice(), b"qemu".as_slice()].iter().any(|t| lower.windows(t.len()).any(|w| w == *t))
 }
 
+/// The name to report for a mapped file in a spoofed process's `/proc/self/maps`. This runtime maps
+/// its own graphics drivers (`*.omni.so`) into every app; a non-stock driver name is a tell, so
+/// present the stock Mali (Tensor/Pixel) names a real device shows. The dlopen path is untouched --
+/// only the text the anti-tamper reads back from `/proc/self/maps` changes.
+#[must_use]
+pub fn maps_name(name: &[u8]) -> String {
+    let s = String::from_utf8_lossy(name);
+    match s.as_ref() {
+        "/vendor/lib64/hw/vulkan.omni.so" => "/vendor/lib64/hw/vulkan.mali.so".to_string(),
+        "/vendor/lib64/egl/libGLES_omni.so" => "/vendor/lib64/egl/libGLES_mali.so".to_string(),
+        "/vendor/lib64/hw/mapper.omni.so" => "/vendor/lib64/hw/mapper.pixel.so".to_string(),
+        _ => s.into_owned(),
+    }
+}
+
 /// `/proc/cpuinfo` of a Pixel 8 (Tensor G3 "zuma"): 4x A520, 3x A720, 1x X3, ending in
 /// the `Hardware` line real arm64 Android kernels print. No emulator strings.
 #[must_use]

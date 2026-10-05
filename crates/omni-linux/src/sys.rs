@@ -453,10 +453,18 @@ fn sys_exit_group(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     if code != 0 {
         let at = |x: u64| p.mm.describe(x).map_or_else(String::new, |d| format!(" ({d})"));
         eprintln!("[exit] pid {} tid {} exit_group({code}) pc {:#x}{} lr {:#x}{}", p.sys.pid, t.tid, t.pc, at(t.pc), t.lr, at(t.lr));
+    }
+    // The heavier detail (saved registers, their memory, the backtrace) is `OMNI_EXIT_REGS=1` only:
+    // on a full boot many subprocesses exit non-zero, and dumping each one's stack slows the boot.
+    // A spoofed process is the app under test (the `--denylist`ed package, e.g. a game whose
+    // anti-tamper exits deliberately): always dump its detail -- there are few of them, and its
+    // non-zero exit is exactly what we are chasing -- so the boot stays fast without the env flag.
+    if code != 0 && (p.view.spoofed || std::env::var("OMNI_EXIT_REGS").as_deref() == Ok("1")) {
+        let at = |x: u64| p.mm.describe(x).map_or_else(String::new, |d| format!(" ({d})"));
         eprintln!("[exit]   x19..x23 = {:#x} {:#x} {:#x} {:#x} {:#x}", t.saved_regs[0], t.saved_regs[1], t.saved_regs[2], t.saved_regs[3], t.saved_regs[4]);
         // Dump 64 bytes at each saved register that looks like a guest pointer: a deliberately-
         // exiting app's report detail is in stack/heap buffers it passed, and the bytes may name
-        // what it caught (`OMNI_EXIT_REGS`).
+        // what it caught.
         for (n, &r) in t.saved_regs.iter().enumerate() {
             if r > 0x1000 && r < 0x8000_0000_0000 {
                 if let Ok(b) = p.mem.read(r, 64) {

@@ -594,6 +594,11 @@ fn sys_openat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let path = path_arg(p, a[1])?;
     let base = base_dir(p, a[0], &path)?;
     let flags = a[2] as u32;
+    // `OMNI_SPOOF_OPENS=1`: every path the app under test (a spoofed process -- its anti-tamper)
+    // opens, so a native environment check can be traced to the file/proc/sys entry it reads.
+    if p.view.spoofed && std::env::var("OMNI_SPOOF_OPENS").as_deref() == Ok("1") {
+        eprintln!("[open] {} {}", p.sys.pid, String::from_utf8_lossy(&path));
+    }
     let creating = flags & O_CREAT != 0 && matches!(p.vfs.resolve(&base, &path, flags & O_NOFOLLOW == 0).map(|r| r.node), Ok(Node::Missing { .. }));
     let file = open_by(Some(p), &p.vfs, &base, &path, flags)?;
     if creating {

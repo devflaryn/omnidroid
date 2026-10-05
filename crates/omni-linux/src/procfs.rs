@@ -99,17 +99,25 @@ fn maps(p: &Process) -> Vec<u8> {
         if p.view.hidden && p.mm.name_at(start).is_some_and(|(name, _)| is_root_mapping_name(&name)) {
             continue;
         }
-        let perms = match r.protection {
+        let mut perms = match r.protection {
             Protection::None => "---p",
             Protection::Read => "r--p",
             Protection::ReadWrite => "rw-p",
             Protection::ReadExecute => "r-xp",
             Protection::ReadWriteExecute => "rwxp",
         };
+        // A spoofed process's anti-tamper scans its own /proc/self/maps. Two omnidroid tells live
+        // there: `rwxp` regions (real Android enforces W^X -- writable+executable memory is the
+        // classic emulator/JIT/hook red flag) and this runtime's own `*.omni.so` graphics drivers
+        // (a non-stock driver name). Present a W^X-clean map with stock Mali (Tensor/Pixel) driver
+        // names; the real protection and the dlopen path are unchanged -- only the reported text is.
+        if p.view.spoofed && perms == "rwxp" {
+            perms = "r-xp";
+        }
         match p.mm.name_at(start) {
             Some((name, offset)) if name.first() == Some(&b'/') => {
                 let inode = ino_of(&name) & 0xff_ffff;
-                let name = String::from_utf8_lossy(&name);
+                let name = if p.view.spoofed { crate::root::spoof::maps_name(&name) } else { String::from_utf8_lossy(&name).into_owned() };
                 let _ = writeln!(out, "{start:08x}-{end:08x} {perms} {offset:08x} fe:00 {inode:<10} {name}");
             }
             Some((name, _)) => {
@@ -120,6 +128,9 @@ fn maps(p: &Process) -> Vec<u8> {
                 let _ = writeln!(out, "{start:08x}-{end:08x} {perms} 00000000 00:00 0");
             }
         }
+    }
+    if p.view.spoofed && std::env::var("OMNI_SPOOF_MAPS_DUMP").as_deref() == Ok("1") {
+        eprintln!("[maps] pid {} spoofed /proc/self/maps:\n{out}", p.sys.pid);
     }
     out.into_bytes()
 }
@@ -188,9 +199,22 @@ fn status(p: &Process) -> Vec<u8> {
     let tracer = p.traced.tracer().unwrap_or(0);
     let _ = write!(out, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t{tracer}\n", p.family.ppid());
     let _ = write!(out, "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n");
-    let _ = write!(out, "FDSize:\t64\nGroups:\t\nVmSize:\t{} kB\nVmRSS:\t{} kB\n", mapped_bytes(p) / 1024, committed_pages(p) * 4);
+    let vmsize = mapped_bytes(p) / 1024;
+    let vmrss = committed_pages(p) * 4;
+    let _ = write!(out, "FDSize:\t64\nGroups:\t3003 9997 20{uid:03} 50{uid:03}\n", uid = uid % 1000);
+    // Real app memory lines. A watchdog comparing these keeps its illusion whole.
+    let _ = write!(out, "VmPeak:\t{vmsize} kB\nVmSize:\t{vmsize} kB\nVmLck:\t0 kB\nVmPin:\t0 kB\nVmHWM:\t{vmrss} kB\nVmRSS:\t{vmrss} kB\n");
+    let _ = write!(out, "RssAnon:\t{} kB\nRssFile:\t{} kB\nRssShmem:\t0 kB\nVmData:\t{} kB\nVmStk:\t8192 kB\nVmExe:\t8 kB\nVmLib:\t{} kB\nVmPTE:\t{} kB\nVmSwap:\t0 kB\n",
+        vmrss / 2, vmrss / 2, vmsize / 4, vmsize / 8, vmsize / 256);
     let threads = p.tids().len();
-    let _ = write!(out, "Threads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nCpus_allowed_list:\t0-{}\n", cpus() - 1);
+    let _ = write!(out, "CoreDumping:\t0\nTHP_enabled:\t1\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t0000000000001204\nSigIgn:\t0000000000000000\nSigCgt:\t00000002000094f8\n");
+    // An Android app: no capabilities but the bounding set, `NoNewPrivs` and a `seccomp` filter
+    // (zygote installs one on every app). A RASP reading `/proc/self/status` for the app sandbox
+    // finds the markers of a real zygote-spawned, seccomp-confined process.
+    let _ = write!(out, "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n");
+    let _ = write!(out, "NoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t1\nSpeculation_Store_Bypass:\tthread force mitigated\nSpeculation_Indirect_Branch:\tconditional force disabled\n");
+    let mask = (1u64 << cpus()) - 1;
+    let _ = write!(out, "Cpus_allowed:\t{mask:x}\nCpus_allowed_list:\t0-{}\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t{threads}\nnonvoluntary_ctxt_switches:\t{threads}\n", cpus() - 1);
     out.into_bytes()
 }
 
@@ -200,6 +224,28 @@ fn statm(p: &Process) -> Vec<u8> {
 
 fn cmdline(p: &Process) -> Vec<u8> {
     p.argv.iter().flat_map(|a| a.iter().copied().chain(std::iter::once(0))).collect()
+}
+
+/// `/proc/self/environ`: the process's environment, NUL-separated. A real zygote-spawned app always
+/// has this (readable by itself); its absence -- or a leaked host `OMNI_*` variable -- is a tell an
+/// anti-tamper reads. Serve the stable environment a real app inherits from the zygote (the Android
+/// roots and classpaths), with no runtime variable in it.
+fn environ(_p: &Process) -> Vec<u8> {
+    const VARS: &[&str] = &[
+        "PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin",
+        "ANDROID_BOOTLOGO=1",
+        "ANDROID_ROOT=/system",
+        "ANDROID_ASSETS=/system/app",
+        "ANDROID_DATA=/data",
+        "ANDROID_STORAGE=/storage",
+        "ANDROID_ART_ROOT=/apex/com.android.art",
+        "ANDROID_I18N_ROOT=/apex/com.android.i18n",
+        "ANDROID_TZDATA_ROOT=/apex/com.android.tzdata",
+        "EXTERNAL_STORAGE=/sdcard",
+        "ASEC_MOUNTPOINT=/mnt/asec",
+        "DOWNLOAD_CACHE=/data/cache",
+    ];
+    VARS.iter().flat_map(|v| v.bytes().chain(std::iter::once(0))).collect()
 }
 
 fn comm(p: &Process) -> Vec<u8> {
@@ -724,6 +770,7 @@ impl Process {
                 ("status", DT_REG),
                 ("statm", DT_REG),
                 ("cmdline", DT_REG),
+                ("environ", DT_REG),
                 ("comm", DT_REG),
                 ("exe", DT_LNK),
                 ("cwd", DT_LNK),
@@ -750,6 +797,7 @@ impl Process {
             "status" => Entry::File(status),
             "statm" => Entry::File(statm),
             "cmdline" => Entry::File(cmdline),
+            "environ" => Entry::File(environ),
             "comm" => Entry::File(comm),
             "limits" => Entry::File(limits),
             "mounts" => Entry::File(mounts),

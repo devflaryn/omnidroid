@@ -325,7 +325,11 @@ fn the_apk_is_installed_started_and_draws() {
     let booted = BOOTED;
     // A device to be saved keeps its package installer (PackageManager does not start without one):
     // each boot of the saved device disables it once up.
-    let setup = |lean_after: &str| format!("{}pm install -r -g /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; {lean_after}{after_install}", settings_script());
+    // `OMNI_R_INSTALLER`: the installer package recorded for the APK (`pm install -i <pkg>`), so
+    // `getInstallerPackageName`/`InstallSourceInfo` report it (e.g. `com.android.vending` for an
+    // app whose anti-tamper checks it was installed from the Play Store).
+    let installer = std::env::var("OMNI_R_INSTALLER").map_or_else(|_| String::new(), |p| format!(" -i {p}"));
+    let setup = |lean_after: &str| format!("{}pm install -r -g{installer} /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; {lean_after}{after_install}", settings_script());
     let resolve = "pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
                    act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; ";
     // The device's language: the account's (`OMNI_R_LOCALE`, default tr-TR -- the owner's accounts
