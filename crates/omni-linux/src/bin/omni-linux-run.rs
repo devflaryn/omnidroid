@@ -36,6 +36,20 @@ fn main() -> ExitCode {
             "--sysroot" => sysroot = PathBuf::from(args.next().expect("--sysroot needs a value")),
             "--instance" => instance = PathBuf::from(args.next().expect("--instance needs a value")),
             "--env" => envp.push(args.next().expect("--env needs KEY=VALUE").into_bytes()),
+            // A file of `export NAME VALUE` lines (the image's derived classpath, as
+            // `data/system/environ/classpath` holds it): each becomes an environment variable. Lets
+            // a launcher pass the long BOOTCLASSPATH etc. without a huge command line.
+            "--classpath-file" => {
+                let path = args.next().expect("--classpath-file needs a path");
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("--classpath-file {path}: {e}"));
+                for line in text.lines() {
+                    if let Some(rest) = line.trim().strip_prefix("export ") {
+                        if let Some((name, value)) = rest.split_once(char::is_whitespace) {
+                            envp.push(format!("{}={}", name.trim(), value.trim()).into_bytes());
+                        }
+                    }
+                }
+            }
             "--service" => services.push(args.next().expect("--service needs a program")),
             "--uid" => uid = args.next().and_then(|u| u.parse().ok()).expect("--uid needs a number"),
             "--hal" => hals.push(args.next().expect("--hal needs a name (gralloc, composer)")),
@@ -56,6 +70,13 @@ fn main() -> ExitCode {
             "--zygote" => zygote = true,
             // A shell command run beside the program, as the shell user (adb's `shell`).
             "--then" => then.push(args.next().expect("--then needs a shell command")),
+            // The `--then` shell command read from a file (so a launcher need not put a shell
+            // command, with its quotes and pipes, on the command line).
+            "--then-file" => {
+                let path = args.next().expect("--then-file needs a path");
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("--then-file {path}: {e}"));
+                then.push(text);
+            }
             // The device's control channel: shell commands handed over as files in this host
             // directory while the device runs (`serve_control`).
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a directory"))),

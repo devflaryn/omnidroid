@@ -20,6 +20,8 @@ A console window shows the boot progress. The first launch takes about 1-2 minut
 (Android boots, then the app is installed and started); a window opens when the app
 draws its first frame. Close the app's window (or the console) to end the demo.
 
+(The launchers are plain .bat files -- no PowerShell, no .NET, nothing to install.)
+
 REQUIREMENTS
 ------------
 - 64-bit Windows 10 or 11.
@@ -30,10 +32,11 @@ REQUIREMENTS
 
 WHAT'S IN THIS FOLDER
 ---------------------
-  bin\         omnidroid binaries + the runtime DLLs they need
-  sysroot\     the Android system image omnidroid boots
-  apks\        the demo apps (TalkingTomCamp.apk, OpenTyrian.apk)
-  launch.ps1   the launcher the .bat files call
+  bin\          omnidroid binaries + the runtime DLLs they need
+  sysroot\      the Android system image omnidroid boots
+  apks\         the demo apps (TalkingTomCamp.apk, OpenTyrian.apk)
+  run.bat       the launcher the numbered .bat files call
+  then-*.txt    the boot/install/start script each demo runs
   classpath.txt the Android boot classpath
 
 NOTES

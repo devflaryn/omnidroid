@@ -1,5 +1,6 @@
 @echo off
-REM Demo 1: launch Talking Tom Camp (single app) on omnidroid.
 title omnidroid demo - Talking Tom Camp
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%~dp0launch.ps1' -Apks @('%~dp0apks\TalkingTomCamp.apk')"
+call "%~dp0run.bat" single "%~dp0apks\TalkingTomCamp.apk"
+echo.
+echo (demo ended -- close this window)
 pause
