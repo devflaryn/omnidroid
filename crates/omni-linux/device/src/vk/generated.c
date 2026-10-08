@@ -33,6 +33,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateDescriptorSets(VkDevice dev
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_BEGIN);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pBeginInfo;
@@ -111,6 +112,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkBuildMicromapsEXT(VkDevice device, 
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer, const VkConditionalRenderingBeginInfoEXT* pConditionalRenderingBegin) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pConditionalRenderingBegin;
@@ -123,7 +125,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginQuery(VkCommandBuffer commandBu
     omni_a[1] = (uint64_t)(uintptr_t)queryPool;
     omni_a[2] = (uint64_t)query;
     omni_a[3] = (uint64_t)flags;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BEGIN_QUERY, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BEGIN_QUERY, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, VkQueryControlFlags flags, uint32_t index) {
@@ -133,10 +135,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginQueryIndexedEXT(VkCommandBuffer
     omni_a[2] = (uint64_t)query;
     omni_a[3] = (uint64_t)flags;
     omni_a[4] = (uint64_t)index;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BEGIN_QUERY_INDEXED_EXT, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BEGIN_QUERY_INDEXED_EXT, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin, VkSubpassContents contents) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pRenderPassBegin;
@@ -145,6 +148,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginRenderPass(VkCommandBuffer comm
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin, const VkSubpassBeginInfo* pSubpassBeginInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pRenderPassBegin;
@@ -153,6 +157,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginRenderPass2(VkCommandBuffer com
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pRenderingInfo;
@@ -166,10 +171,15 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginTransformFeedbackEXT(VkCommandB
     omni_a[2] = (uint64_t)counterBufferCount;
     omni_a[3] = (uint64_t)(uintptr_t)pCounterBuffers;
     omni_a[4] = (uint64_t)(uintptr_t)pCounterBufferOffsets;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BEGIN_TRANSFORM_FEEDBACK_EXT, omni_a, 5);
+    const struct omni_vk_copy omni_c[2] = {
+        {3, (size_t)counterBufferCount * sizeof(VkBuffer)},
+        {4, (size_t)counterBufferCount * sizeof(VkDeviceSize)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BEGIN_TRANSFORM_FEEDBACK_EXT, omni_a, 5, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginVideoCodingKHR(VkCommandBuffer commandBuffer, const VkVideoBeginCodingInfoKHR* pBeginInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pBeginInfo;
@@ -177,6 +187,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBeginVideoCodingKHR(VkCommandBuffer 
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindDescriptorBufferEmbeddedSamplers2EXT(VkCommandBuffer commandBuffer, const VkBindDescriptorBufferEmbeddedSamplersInfoEXT* pBindDescriptorBufferEmbeddedSamplersInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pBindDescriptorBufferEmbeddedSamplersInfo;
@@ -189,10 +200,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindDescriptorBufferEmbeddedSamplers
     omni_a[1] = (uint64_t)pipelineBindPoint;
     omni_a[2] = (uint64_t)(uintptr_t)layout;
     omni_a[3] = (uint64_t)set;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_EXT, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_EXT, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindDescriptorBuffersEXT(VkCommandBuffer commandBuffer, uint32_t bufferCount, const VkDescriptorBufferBindingInfoEXT* pBindingInfos) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)bufferCount;
@@ -210,10 +222,15 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindDescriptorSets(VkCommandBuffer c
     omni_a[5] = (uint64_t)(uintptr_t)pDescriptorSets;
     omni_a[6] = (uint64_t)dynamicOffsetCount;
     omni_a[7] = (uint64_t)(uintptr_t)pDynamicOffsets;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_DESCRIPTOR_SETS, omni_a, 8);
+    const struct omni_vk_copy omni_c[2] = {
+        {5, (size_t)descriptorSetCount * sizeof(VkDescriptorSet)},
+        {7, (size_t)dynamicOffsetCount * sizeof(uint32_t)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_DESCRIPTOR_SETS, omni_a, 8, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer, const VkBindDescriptorSetsInfoKHR* pBindDescriptorSetsInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pBindDescriptorSetsInfo;
@@ -226,7 +243,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindIndexBuffer(VkCommandBuffer comm
     omni_a[1] = (uint64_t)(uintptr_t)buffer;
     omni_a[2] = (uint64_t)offset;
     omni_a[3] = (uint64_t)indexType;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_INDEX_BUFFER, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_INDEX_BUFFER, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, VkIndexType indexType) {
@@ -236,7 +253,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindIndexBuffer2KHR(VkCommandBuffer 
     omni_a[2] = (uint64_t)offset;
     omni_a[3] = (uint64_t)size;
     omni_a[4] = (uint64_t)indexType;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_INDEX_BUFFER2_KHR, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_INDEX_BUFFER2_KHR, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindInvocationMaskHUAWEI(VkCommandBuffer commandBuffer, VkImageView imageView, VkImageLayout imageLayout) {
@@ -244,7 +261,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindInvocationMaskHUAWEI(VkCommandBu
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)imageView;
     omni_a[2] = (uint64_t)imageLayout;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_INVOCATION_MASK_HUAWEI, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_INVOCATION_MASK_HUAWEI, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline) {
@@ -252,7 +269,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindPipeline(VkCommandBuffer command
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)pipelineBindPoint;
     omni_a[2] = (uint64_t)(uintptr_t)pipeline;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_PIPELINE, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_PIPELINE, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindPipelineShaderGroupNV(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline, uint32_t groupIndex) {
@@ -261,7 +278,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindPipelineShaderGroupNV(VkCommandB
     omni_a[1] = (uint64_t)pipelineBindPoint;
     omni_a[2] = (uint64_t)(uintptr_t)pipeline;
     omni_a[3] = (uint64_t)groupIndex;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_PIPELINE_SHADER_GROUP_NV, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_PIPELINE_SHADER_GROUP_NV, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindShadersEXT(VkCommandBuffer commandBuffer, uint32_t stageCount, const VkShaderStageFlagBits* pStages, const VkShaderEXT* pShaders) {
@@ -270,7 +287,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindShadersEXT(VkCommandBuffer comma
     omni_a[1] = (uint64_t)stageCount;
     omni_a[2] = (uint64_t)(uintptr_t)pStages;
     omni_a[3] = (uint64_t)(uintptr_t)pShaders;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_SHADERS_EXT, omni_a, 4);
+    const struct omni_vk_copy omni_c[2] = {
+        {2, (size_t)stageCount * sizeof(VkShaderStageFlagBits)},
+        {3, (size_t)stageCount * sizeof(VkShaderEXT)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_SHADERS_EXT, omni_a, 4, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindShadingRateImageNV(VkCommandBuffer commandBuffer, VkImageView imageView, VkImageLayout imageLayout) {
@@ -278,7 +299,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindShadingRateImageNV(VkCommandBuff
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)imageView;
     omni_a[2] = (uint64_t)imageLayout;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_SHADING_RATE_IMAGE_NV, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_SHADING_RATE_IMAGE_NV, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBuffer* pBuffers, const VkDeviceSize* pOffsets, const VkDeviceSize* pSizes) {
@@ -289,7 +310,12 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindTransformFeedbackBuffersEXT(VkCo
     omni_a[3] = (uint64_t)(uintptr_t)pBuffers;
     omni_a[4] = (uint64_t)(uintptr_t)pOffsets;
     omni_a[5] = (uint64_t)(uintptr_t)pSizes;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_TRANSFORM_FEEDBACK_BUFFERS_EXT, omni_a, 6);
+    const struct omni_vk_copy omni_c[3] = {
+        {3, (size_t)bindingCount * sizeof(VkBuffer)},
+        {4, (size_t)bindingCount * sizeof(VkDeviceSize)},
+        {5, (size_t)bindingCount * sizeof(VkDeviceSize)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_TRANSFORM_FEEDBACK_BUFFERS_EXT, omni_a, 6, omni_c, 3u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBuffer* pBuffers, const VkDeviceSize* pOffsets) {
@@ -299,7 +325,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindVertexBuffers(VkCommandBuffer co
     omni_a[2] = (uint64_t)bindingCount;
     omni_a[3] = (uint64_t)(uintptr_t)pBuffers;
     omni_a[4] = (uint64_t)(uintptr_t)pOffsets;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_VERTEX_BUFFERS, omni_a, 5);
+    const struct omni_vk_copy omni_c[2] = {
+        {3, (size_t)bindingCount * sizeof(VkBuffer)},
+        {4, (size_t)bindingCount * sizeof(VkDeviceSize)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_VERTEX_BUFFERS, omni_a, 5, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount, const VkBuffer* pBuffers, const VkDeviceSize* pOffsets, const VkDeviceSize* pSizes, const VkDeviceSize* pStrides) {
@@ -311,7 +341,13 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBindVertexBuffers2(VkCommandBuffer c
     omni_a[4] = (uint64_t)(uintptr_t)pOffsets;
     omni_a[5] = (uint64_t)(uintptr_t)pSizes;
     omni_a[6] = (uint64_t)(uintptr_t)pStrides;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BIND_VERTEX_BUFFERS2, omni_a, 7);
+    const struct omni_vk_copy omni_c[4] = {
+        {3, (size_t)bindingCount * sizeof(VkBuffer)},
+        {4, (size_t)bindingCount * sizeof(VkDeviceSize)},
+        {5, (size_t)bindingCount * sizeof(VkDeviceSize)},
+        {6, (size_t)bindingCount * sizeof(VkDeviceSize)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BIND_VERTEX_BUFFERS2, omni_a, 7, omni_c, 4u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageBlit* pRegions, VkFilter filter) {
@@ -324,10 +360,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBlitImage(VkCommandBuffer commandBuf
     omni_a[5] = (uint64_t)regionCount;
     omni_a[6] = (uint64_t)(uintptr_t)pRegions;
     omni_a[7] = (uint64_t)filter;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_BLIT_IMAGE, omni_a, 8);
+    const struct omni_vk_copy omni_c[1] = {
+        {6, (size_t)regionCount * sizeof(VkImageBlit)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_BLIT_IMAGE, omni_a, 8, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2* pBlitImageInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pBlitImageInfo;
@@ -335,6 +375,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBlitImage2(VkCommandBuffer commandBu
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBuildAccelerationStructureNV(VkCommandBuffer commandBuffer, const VkAccelerationStructureInfoNV* pInfo, VkBuffer instanceData, VkDeviceSize instanceOffset, VkBool32 update, VkAccelerationStructureNV dst, VkAccelerationStructureNV src, VkBuffer scratch, VkDeviceSize scratchOffset) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[9];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pInfo;
@@ -349,6 +390,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBuildAccelerationStructureNV(VkComma
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBuildAccelerationStructuresIndirectKHR(VkCommandBuffer commandBuffer, uint32_t infoCount, const VkAccelerationStructureBuildGeometryInfoKHR* pInfos, const VkDeviceAddress* pIndirectDeviceAddresses, const uint32_t* pIndirectStrides, const uint32_t* const* ppMaxPrimitiveCounts) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[6];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)infoCount;
@@ -360,6 +402,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBuildAccelerationStructuresIndirectK
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t infoCount, const VkAccelerationStructureBuildGeometryInfoKHR* pInfos, const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[4];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)infoCount;
@@ -369,6 +412,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBuildAccelerationStructuresKHR(VkCom
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdBuildMicromapsEXT(VkCommandBuffer commandBuffer, uint32_t infoCount, const VkMicromapBuildInfoEXT* pInfos) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)infoCount;
@@ -383,7 +427,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdClearAttachments(VkCommandBuffer com
     omni_a[2] = (uint64_t)(uintptr_t)pAttachments;
     omni_a[3] = (uint64_t)rectCount;
     omni_a[4] = (uint64_t)(uintptr_t)pRects;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_CLEAR_ATTACHMENTS, omni_a, 5);
+    const struct omni_vk_copy omni_c[2] = {
+        {2, (size_t)attachmentCount * sizeof(VkClearAttachment)},
+        {4, (size_t)rectCount * sizeof(VkClearRect)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_CLEAR_ATTACHMENTS, omni_a, 5, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image, VkImageLayout imageLayout, const VkClearColorValue* pColor, uint32_t rangeCount, const VkImageSubresourceRange* pRanges) {
@@ -394,7 +442,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdClearColorImage(VkCommandBuffer comm
     omni_a[3] = (uint64_t)(uintptr_t)pColor;
     omni_a[4] = (uint64_t)rangeCount;
     omni_a[5] = (uint64_t)(uintptr_t)pRanges;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_CLEAR_COLOR_IMAGE, omni_a, 6);
+    const struct omni_vk_copy omni_c[2] = {
+        {3, 1 * sizeof(VkClearColorValue)},
+        {5, (size_t)rangeCount * sizeof(VkImageSubresourceRange)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_CLEAR_COLOR_IMAGE, omni_a, 6, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage image, VkImageLayout imageLayout, const VkClearDepthStencilValue* pDepthStencil, uint32_t rangeCount, const VkImageSubresourceRange* pRanges) {
@@ -405,10 +457,15 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdClearDepthStencilImage(VkCommandBuff
     omni_a[3] = (uint64_t)(uintptr_t)pDepthStencil;
     omni_a[4] = (uint64_t)rangeCount;
     omni_a[5] = (uint64_t)(uintptr_t)pRanges;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE, omni_a, 6);
+    const struct omni_vk_copy omni_c[2] = {
+        {3, 1 * sizeof(VkClearDepthStencilValue)},
+        {5, (size_t)rangeCount * sizeof(VkImageSubresourceRange)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE, omni_a, 6, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdControlVideoCodingKHR(VkCommandBuffer commandBuffer, const VkVideoCodingControlInfoKHR* pCodingControlInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pCodingControlInfo;
@@ -416,6 +473,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdControlVideoCodingKHR(VkCommandBuffe
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyAccelerationStructureKHR(VkCommandBuffer commandBuffer, const VkCopyAccelerationStructureInfoKHR* pInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pInfo;
@@ -428,10 +486,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyAccelerationStructureNV(VkComman
     omni_a[1] = (uint64_t)(uintptr_t)dst;
     omni_a[2] = (uint64_t)(uintptr_t)src;
     omni_a[3] = (uint64_t)mode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_ACCELERATION_STRUCTURE_NV, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_ACCELERATION_STRUCTURE_NV, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyAccelerationStructureToMemoryKHR(VkCommandBuffer commandBuffer, const VkCopyAccelerationStructureToMemoryInfoKHR* pInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pInfo;
@@ -445,10 +504,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyBuffer(VkCommandBuffer commandBu
     omni_a[2] = (uint64_t)(uintptr_t)dstBuffer;
     omni_a[3] = (uint64_t)regionCount;
     omni_a[4] = (uint64_t)(uintptr_t)pRegions;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_BUFFER, omni_a, 5);
+    const struct omni_vk_copy omni_c[1] = {
+        {4, (size_t)regionCount * sizeof(VkBufferCopy)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_BUFFER, omni_a, 5, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2* pCopyBufferInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pCopyBufferInfo;
@@ -463,10 +526,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyBufferToImage(VkCommandBuffer co
     omni_a[3] = (uint64_t)dstImageLayout;
     omni_a[4] = (uint64_t)regionCount;
     omni_a[5] = (uint64_t)(uintptr_t)pRegions;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_BUFFER_TO_IMAGE, omni_a, 6);
+    const struct omni_vk_copy omni_c[1] = {
+        {5, (size_t)regionCount * sizeof(VkBufferImageCopy)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_BUFFER_TO_IMAGE, omni_a, 6, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pCopyBufferToImageInfo;
@@ -482,10 +549,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyImage(VkCommandBuffer commandBuf
     omni_a[4] = (uint64_t)dstImageLayout;
     omni_a[5] = (uint64_t)regionCount;
     omni_a[6] = (uint64_t)(uintptr_t)pRegions;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_IMAGE, omni_a, 7);
+    const struct omni_vk_copy omni_c[1] = {
+        {6, (size_t)regionCount * sizeof(VkImageCopy)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_IMAGE, omni_a, 7, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2* pCopyImageInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pCopyImageInfo;
@@ -500,10 +571,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyImageToBuffer(VkCommandBuffer co
     omni_a[3] = (uint64_t)(uintptr_t)dstBuffer;
     omni_a[4] = (uint64_t)regionCount;
     omni_a[5] = (uint64_t)(uintptr_t)pRegions;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_IMAGE_TO_BUFFER, omni_a, 6);
+    const struct omni_vk_copy omni_c[1] = {
+        {5, (size_t)regionCount * sizeof(VkBufferImageCopy)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_IMAGE_TO_BUFFER, omni_a, 6, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBufferInfo2* pCopyImageToBufferInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pCopyImageToBufferInfo;
@@ -516,10 +591,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMemoryIndirectNV(VkCommandBuffer
     omni_a[1] = (uint64_t)copyBufferAddress;
     omni_a[2] = (uint64_t)copyCount;
     omni_a[3] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_MEMORY_INDIRECT_NV, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_MEMORY_INDIRECT_NV, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer, const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pInfo;
@@ -535,10 +611,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMemoryToImageIndirectNV(VkComman
     omni_a[4] = (uint64_t)(uintptr_t)dstImage;
     omni_a[5] = (uint64_t)dstImageLayout;
     omni_a[6] = (uint64_t)(uintptr_t)pImageSubresources;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_MEMORY_TO_IMAGE_INDIRECT_NV, omni_a, 7);
+    const struct omni_vk_copy omni_c[1] = {
+        {6, (size_t)copyCount * sizeof(VkImageSubresourceLayers)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_MEMORY_TO_IMAGE_INDIRECT_NV, omni_a, 7, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMemoryToMicromapEXT(VkCommandBuffer commandBuffer, const VkCopyMemoryToMicromapInfoEXT* pInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pInfo;
@@ -546,6 +626,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMemoryToMicromapEXT(VkCommandBuf
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMicromapEXT(VkCommandBuffer commandBuffer, const VkCopyMicromapInfoEXT* pInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pInfo;
@@ -553,6 +634,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMicromapEXT(VkCommandBuffer comm
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyMicromapToMemoryEXT(VkCommandBuffer commandBuffer, const VkCopyMicromapToMemoryInfoEXT* pInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pInfo;
@@ -569,10 +651,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCopyQueryPoolResults(VkCommandBuffer
     omni_a[5] = (uint64_t)dstOffset;
     omni_a[6] = (uint64_t)stride;
     omni_a[7] = (uint64_t)flags;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_COPY_QUERY_POOL_RESULTS, omni_a, 8);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_COPY_QUERY_POOL_RESULTS, omni_a, 8, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCuLaunchKernelNVX(VkCommandBuffer commandBuffer, const VkCuLaunchInfoNVX* pLaunchInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pLaunchInfo;
@@ -580,6 +663,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdCuLaunchKernelNVX(VkCommandBuffer co
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDecodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoDecodeInfoKHR* pDecodeInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pDecodeInfo;
@@ -592,7 +676,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDecompressMemoryIndirectCountNV(VkCo
     omni_a[1] = (uint64_t)indirectCommandsAddress;
     omni_a[2] = (uint64_t)indirectCommandsCountAddress;
     omni_a[3] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DECOMPRESS_MEMORY_INDIRECT_COUNT_NV, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DECOMPRESS_MEMORY_INDIRECT_COUNT_NV, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDecompressMemoryNV(VkCommandBuffer commandBuffer, uint32_t decompressRegionCount, const VkDecompressMemoryRegionNV* pDecompressMemoryRegions) {
@@ -600,7 +684,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDecompressMemoryNV(VkCommandBuffer c
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)decompressRegionCount;
     omni_a[2] = (uint64_t)(uintptr_t)pDecompressMemoryRegions;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DECOMPRESS_MEMORY_NV, omni_a, 3);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)decompressRegionCount * sizeof(VkDecompressMemoryRegionNV)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DECOMPRESS_MEMORY_NV, omni_a, 3, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
@@ -609,7 +696,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDispatch(VkCommandBuffer commandBuff
     omni_a[1] = (uint64_t)groupCountX;
     omni_a[2] = (uint64_t)groupCountY;
     omni_a[3] = (uint64_t)groupCountZ;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DISPATCH, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DISPATCH, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX, uint32_t baseGroupY, uint32_t baseGroupZ, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
@@ -621,7 +708,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDispatchBase(VkCommandBuffer command
     omni_a[4] = (uint64_t)groupCountX;
     omni_a[5] = (uint64_t)groupCountY;
     omni_a[6] = (uint64_t)groupCountZ;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DISPATCH_BASE, omni_a, 7);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DISPATCH_BASE, omni_a, 7, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset) {
@@ -629,7 +716,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDispatchIndirect(VkCommandBuffer com
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)buffer;
     omni_a[2] = (uint64_t)offset;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DISPATCH_INDIRECT, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DISPATCH_INDIRECT, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
@@ -639,7 +726,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDraw(VkCommandBuffer commandBuffer, 
     omni_a[2] = (uint64_t)instanceCount;
     omni_a[3] = (uint64_t)firstVertex;
     omni_a[4] = (uint64_t)firstInstance;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawClusterHUAWEI(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
@@ -648,7 +735,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawClusterHUAWEI(VkCommandBuffer co
     omni_a[1] = (uint64_t)groupCountX;
     omni_a[2] = (uint64_t)groupCountY;
     omni_a[3] = (uint64_t)groupCountZ;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_CLUSTER_HUAWEI, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_CLUSTER_HUAWEI, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawClusterIndirectHUAWEI(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset) {
@@ -656,7 +743,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawClusterIndirectHUAWEI(VkCommandB
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)buffer;
     omni_a[2] = (uint64_t)offset;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_CLUSTER_INDIRECT_HUAWEI, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_CLUSTER_INDIRECT_HUAWEI, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
@@ -667,7 +754,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndexed(VkCommandBuffer commandB
     omni_a[3] = (uint64_t)firstIndex;
     omni_a[4] = (uint64_t)vertexOffset;
     omni_a[5] = (uint64_t)firstInstance;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_INDEXED, omni_a, 6);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_INDEXED, omni_a, 6, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride) {
@@ -677,7 +764,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndexedIndirect(VkCommandBuffer 
     omni_a[2] = (uint64_t)offset;
     omni_a[3] = (uint64_t)drawCount;
     omni_a[4] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_INDEXED_INDIRECT, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_INDEXED_INDIRECT, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
@@ -689,7 +776,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndexedIndirectCount(VkCommandBu
     omni_a[4] = (uint64_t)countBufferOffset;
     omni_a[5] = (uint64_t)maxDrawCount;
     omni_a[6] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_INDEXED_INDIRECT_COUNT, omni_a, 7);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_INDEXED_INDIRECT_COUNT, omni_a, 7, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride) {
@@ -699,7 +786,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndirect(VkCommandBuffer command
     omni_a[2] = (uint64_t)offset;
     omni_a[3] = (uint64_t)drawCount;
     omni_a[4] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_INDIRECT, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_INDIRECT, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instanceCount, uint32_t firstInstance, VkBuffer counterBuffer, VkDeviceSize counterBufferOffset, uint32_t counterOffset, uint32_t vertexStride) {
@@ -711,7 +798,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndirectByteCountEXT(VkCommandBu
     omni_a[4] = (uint64_t)counterBufferOffset;
     omni_a[5] = (uint64_t)counterOffset;
     omni_a[6] = (uint64_t)vertexStride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_INDIRECT_BYTE_COUNT_EXT, omni_a, 7);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_INDIRECT_BYTE_COUNT_EXT, omni_a, 7, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
@@ -723,7 +810,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawIndirectCount(VkCommandBuffer co
     omni_a[4] = (uint64_t)countBufferOffset;
     omni_a[5] = (uint64_t)maxDrawCount;
     omni_a[6] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_INDIRECT_COUNT, omni_a, 7);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_INDIRECT_COUNT, omni_a, 7, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
@@ -732,7 +819,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksEXT(VkCommandBuffer com
     omni_a[1] = (uint64_t)groupCountX;
     omni_a[2] = (uint64_t)groupCountY;
     omni_a[3] = (uint64_t)groupCountZ;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_EXT, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_EXT, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
@@ -744,7 +831,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectCountEXT(VkComm
     omni_a[4] = (uint64_t)countBufferOffset;
     omni_a[5] = (uint64_t)maxDrawCount;
     omni_a[6] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_EXT, omni_a, 7);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_EXT, omni_a, 7, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectCountNV(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride) {
@@ -756,7 +843,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectCountNV(VkComma
     omni_a[4] = (uint64_t)countBufferOffset;
     omni_a[5] = (uint64_t)maxDrawCount;
     omni_a[6] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_NV, omni_a, 7);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_NV, omni_a, 7, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride) {
@@ -766,7 +853,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectEXT(VkCommandBu
     omni_a[2] = (uint64_t)offset;
     omni_a[3] = (uint64_t)drawCount;
     omni_a[4] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_EXT, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_EXT, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectNV(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride) {
@@ -776,7 +863,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksIndirectNV(VkCommandBuf
     omni_a[2] = (uint64_t)offset;
     omni_a[3] = (uint64_t)drawCount;
     omni_a[4] = (uint64_t)stride;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_NV, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_NV, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksNV(VkCommandBuffer commandBuffer, uint32_t taskCount, uint32_t firstTask) {
@@ -784,10 +871,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMeshTasksNV(VkCommandBuffer comm
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)taskCount;
     omni_a[2] = (uint64_t)firstTask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_NV, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_DRAW_MESH_TASKS_NV, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount, const VkMultiDrawInfoEXT* pVertexInfo, uint32_t instanceCount, uint32_t firstInstance, uint32_t stride) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[6];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)drawCount;
@@ -799,6 +887,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMultiEXT(VkCommandBuffer command
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount, const VkMultiDrawIndexedInfoEXT* pIndexInfo, uint32_t instanceCount, uint32_t firstInstance, uint32_t stride, const int32_t* pVertexOffset) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[7];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)drawCount;
@@ -811,6 +900,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdDrawMultiIndexedEXT(VkCommandBuffer 
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEncodeVideoKHR(VkCommandBuffer commandBuffer, const VkVideoEncodeInfoKHR* pEncodeInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pEncodeInfo;
@@ -820,7 +910,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEncodeVideoKHR(VkCommandBuffer comma
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer) {
     uint64_t omni_a[1];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_END_CONDITIONAL_RENDERING_EXT, omni_a, 1);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_END_CONDITIONAL_RENDERING_EXT, omni_a, 1, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query) {
@@ -828,7 +918,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndQuery(VkCommandBuffer commandBuff
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)queryPool;
     omni_a[2] = (uint64_t)query;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_END_QUERY, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_END_QUERY, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, uint32_t index) {
@@ -837,16 +927,17 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndQueryIndexedEXT(VkCommandBuffer c
     omni_a[1] = (uint64_t)(uintptr_t)queryPool;
     omni_a[2] = (uint64_t)query;
     omni_a[3] = (uint64_t)index;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_END_QUERY_INDEXED_EXT, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_END_QUERY_INDEXED_EXT, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndRenderPass(VkCommandBuffer commandBuffer) {
     uint64_t omni_a[1];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_END_RENDER_PASS, omni_a, 1);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_END_RENDER_PASS, omni_a, 1, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pSubpassEndInfo;
@@ -856,7 +947,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndRenderPass2(VkCommandBuffer comma
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndRendering(VkCommandBuffer commandBuffer) {
     uint64_t omni_a[1];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_END_RENDERING, omni_a, 1);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_END_RENDERING, omni_a, 1, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer, uint32_t counterBufferCount, const VkBuffer* pCounterBuffers, const VkDeviceSize* pCounterBufferOffsets) {
@@ -866,10 +957,15 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndTransformFeedbackEXT(VkCommandBuf
     omni_a[2] = (uint64_t)counterBufferCount;
     omni_a[3] = (uint64_t)(uintptr_t)pCounterBuffers;
     omni_a[4] = (uint64_t)(uintptr_t)pCounterBufferOffsets;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_END_TRANSFORM_FEEDBACK_EXT, omni_a, 5);
+    const struct omni_vk_copy omni_c[2] = {
+        {3, (size_t)counterBufferCount * sizeof(VkBuffer)},
+        {4, (size_t)counterBufferCount * sizeof(VkDeviceSize)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_END_TRANSFORM_FEEDBACK_EXT, omni_a, 5, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndVideoCodingKHR(VkCommandBuffer commandBuffer, const VkVideoEndCodingInfoKHR* pEndCodingInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pEndCodingInfo;
@@ -877,6 +973,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdEndVideoCodingKHR(VkCommandBuffer co
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdExecuteGeneratedCommandsNV(VkCommandBuffer commandBuffer, VkBool32 isPreprocessed, const VkGeneratedCommandsInfoNV* pGeneratedCommandsInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)isPreprocessed;
@@ -891,17 +988,18 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdFillBuffer(VkCommandBuffer commandBu
     omni_a[2] = (uint64_t)dstOffset;
     omni_a[3] = (uint64_t)size;
     omni_a[4] = (uint64_t)data;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_FILL_BUFFER, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_FILL_BUFFER, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)contents;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_NEXT_SUBPASS, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_NEXT_SUBPASS, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdNextSubpass2(VkCommandBuffer commandBuffer, const VkSubpassBeginInfo* pSubpassBeginInfo, const VkSubpassEndInfo* pSubpassEndInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pSubpassBeginInfo;
@@ -910,6 +1008,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdNextSubpass2(VkCommandBuffer command
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdOpticalFlowExecuteNV(VkCommandBuffer commandBuffer, VkOpticalFlowSessionNV session, const VkOpticalFlowExecuteInfoNV* pExecuteInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)session;
@@ -918,6 +1017,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdOpticalFlowExecuteNV(VkCommandBuffer
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags, uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[10];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)srcStageMask;
@@ -933,6 +1033,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPipelineBarrier(VkCommandBuffer comm
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo* pDependencyInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pDependencyInfo;
@@ -940,6 +1041,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPipelineBarrier2(VkCommandBuffer com
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPreprocessGeneratedCommandsNV(VkCommandBuffer commandBuffer, const VkGeneratedCommandsInfoNV* pGeneratedCommandsInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pGeneratedCommandsInfo;
@@ -954,10 +1056,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushConstants(VkCommandBuffer comman
     omni_a[3] = (uint64_t)offset;
     omni_a[4] = (uint64_t)size;
     omni_a[5] = (uint64_t)(uintptr_t)pValues;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_PUSH_CONSTANTS, omni_a, 6);
+    const struct omni_vk_copy omni_c[1] = {
+        {5, (size_t)size},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_PUSH_CONSTANTS, omni_a, 6, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushConstants2KHR(VkCommandBuffer commandBuffer, const VkPushConstantsInfoKHR* pPushConstantsInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pPushConstantsInfo;
@@ -965,6 +1071,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushConstants2KHR(VkCommandBuffer co
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushDescriptorSet2KHR(VkCommandBuffer commandBuffer, const VkPushDescriptorSetInfoKHR* pPushDescriptorSetInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pPushDescriptorSetInfo;
@@ -972,6 +1079,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushDescriptorSet2KHR(VkCommandBuffe
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout, uint32_t set, uint32_t descriptorWriteCount, const VkWriteDescriptorSet* pDescriptorWrites) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[6];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)pipelineBindPoint;
@@ -983,6 +1091,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushDescriptorSetKHR(VkCommandBuffer
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushDescriptorSetWithTemplate2KHR(VkCommandBuffer commandBuffer, const VkPushDescriptorSetWithTemplateInfoKHR* pPushDescriptorSetWithTemplateInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pPushDescriptorSetWithTemplateInfo;
@@ -990,6 +1099,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushDescriptorSetWithTemplate2KHR(Vk
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer commandBuffer, VkDescriptorUpdateTemplate descriptorUpdateTemplate, VkPipelineLayout layout, uint32_t set, const void* pData) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[5];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)descriptorUpdateTemplate;
@@ -1004,7 +1114,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResetEvent(VkCommandBuffer commandBu
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)event;
     omni_a[2] = (uint64_t)stageMask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_RESET_EVENT, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_RESET_EVENT, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags2 stageMask) {
@@ -1012,7 +1122,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResetEvent2(VkCommandBuffer commandB
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)event;
     omni_a[2] = (uint64_t)stageMask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_RESET_EVENT2, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_RESET_EVENT2, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount) {
@@ -1021,7 +1131,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResetQueryPool(VkCommandBuffer comma
     omni_a[1] = (uint64_t)(uintptr_t)queryPool;
     omni_a[2] = (uint64_t)firstQuery;
     omni_a[3] = (uint64_t)queryCount;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_RESET_QUERY_POOL, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_RESET_QUERY_POOL, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout, VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount, const VkImageResolve* pRegions) {
@@ -1033,10 +1143,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResolveImage(VkCommandBuffer command
     omni_a[4] = (uint64_t)dstImageLayout;
     omni_a[5] = (uint64_t)regionCount;
     omni_a[6] = (uint64_t)(uintptr_t)pRegions;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_RESOLVE_IMAGE, omni_a, 7);
+    const struct omni_vk_copy omni_c[1] = {
+        {6, (size_t)regionCount * sizeof(VkImageResolve)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_RESOLVE_IMAGE, omni_a, 7, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2* pResolveImageInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pResolveImageInfo;
@@ -1047,31 +1161,35 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetAlphaToCoverageEnableEXT(VkComman
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)alphaToCoverageEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_ALPHA_TO_COVERAGE_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_ALPHA_TO_COVERAGE_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetAlphaToOneEnableEXT(VkCommandBuffer commandBuffer, VkBool32 alphaToOneEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)alphaToOneEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_ALPHA_TO_ONE_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_ALPHA_TO_ONE_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetAttachmentFeedbackLoopEnableEXT(VkCommandBuffer commandBuffer, VkImageAspectFlags aspectMask) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)aspectMask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetBlendConstants(VkCommandBuffer commandBuffer, const float blendConstants[4]) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)blendConstants;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_BLEND_CONSTANTS, omni_a, 2);
+    const struct omni_vk_copy omni_c[1] = {
+        {1, 4 * sizeof(float)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_BLEND_CONSTANTS, omni_a, 2, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCheckpointNV(VkCommandBuffer commandBuffer, const void* pCheckpointMarker) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pCheckpointMarker;
@@ -1079,6 +1197,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCheckpointNV(VkCommandBuffer comm
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoarseSampleOrderNV(VkCommandBuffer commandBuffer, VkCoarseSampleOrderTypeNV sampleOrderType, uint32_t customSampleOrderCount, const VkCoarseSampleOrderCustomNV* pCustomSampleOrders) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[4];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)sampleOrderType;
@@ -1093,7 +1212,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorBlendAdvancedEXT(VkCommandBu
     omni_a[1] = (uint64_t)firstAttachment;
     omni_a[2] = (uint64_t)attachmentCount;
     omni_a[3] = (uint64_t)(uintptr_t)pColorBlendAdvanced;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COLOR_BLEND_ADVANCED_EXT, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)attachmentCount * sizeof(VkColorBlendAdvancedEXT)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COLOR_BLEND_ADVANCED_EXT, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorBlendEnableEXT(VkCommandBuffer commandBuffer, uint32_t firstAttachment, uint32_t attachmentCount, const VkBool32* pColorBlendEnables) {
@@ -1102,7 +1224,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorBlendEnableEXT(VkCommandBuff
     omni_a[1] = (uint64_t)firstAttachment;
     omni_a[2] = (uint64_t)attachmentCount;
     omni_a[3] = (uint64_t)(uintptr_t)pColorBlendEnables;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COLOR_BLEND_ENABLE_EXT, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)attachmentCount * sizeof(VkBool32)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COLOR_BLEND_ENABLE_EXT, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorBlendEquationEXT(VkCommandBuffer commandBuffer, uint32_t firstAttachment, uint32_t attachmentCount, const VkColorBlendEquationEXT* pColorBlendEquations) {
@@ -1111,7 +1236,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorBlendEquationEXT(VkCommandBu
     omni_a[1] = (uint64_t)firstAttachment;
     omni_a[2] = (uint64_t)attachmentCount;
     omni_a[3] = (uint64_t)(uintptr_t)pColorBlendEquations;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COLOR_BLEND_EQUATION_EXT, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)attachmentCount * sizeof(VkColorBlendEquationEXT)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COLOR_BLEND_EQUATION_EXT, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorWriteEnableEXT(VkCommandBuffer commandBuffer, uint32_t attachmentCount, const VkBool32* pColorWriteEnables) {
@@ -1119,7 +1247,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorWriteEnableEXT(VkCommandBuff
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)attachmentCount;
     omni_a[2] = (uint64_t)(uintptr_t)pColorWriteEnables;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COLOR_WRITE_ENABLE_EXT, omni_a, 3);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)attachmentCount * sizeof(VkBool32)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COLOR_WRITE_ENABLE_EXT, omni_a, 3, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorWriteMaskEXT(VkCommandBuffer commandBuffer, uint32_t firstAttachment, uint32_t attachmentCount, const VkColorComponentFlags* pColorWriteMasks) {
@@ -1128,28 +1259,31 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetColorWriteMaskEXT(VkCommandBuffer
     omni_a[1] = (uint64_t)firstAttachment;
     omni_a[2] = (uint64_t)attachmentCount;
     omni_a[3] = (uint64_t)(uintptr_t)pColorWriteMasks;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COLOR_WRITE_MASK_EXT, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)attachmentCount * sizeof(VkColorComponentFlags)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COLOR_WRITE_MASK_EXT, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetConservativeRasterizationModeEXT(VkCommandBuffer commandBuffer, VkConservativeRasterizationModeEXT conservativeRasterizationMode) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)conservativeRasterizationMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_CONSERVATIVE_RASTERIZATION_MODE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_CONSERVATIVE_RASTERIZATION_MODE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoverageModulationModeNV(VkCommandBuffer commandBuffer, VkCoverageModulationModeNV coverageModulationMode) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)coverageModulationMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COVERAGE_MODULATION_MODE_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COVERAGE_MODULATION_MODE_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoverageModulationTableEnableNV(VkCommandBuffer commandBuffer, VkBool32 coverageModulationTableEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)coverageModulationTableEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_ENABLE_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_ENABLE_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoverageModulationTableNV(VkCommandBuffer commandBuffer, uint32_t coverageModulationTableCount, const float* pCoverageModulationTable) {
@@ -1157,35 +1291,38 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoverageModulationTableNV(VkComma
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)coverageModulationTableCount;
     omni_a[2] = (uint64_t)(uintptr_t)pCoverageModulationTable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_NV, omni_a, 3);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)coverageModulationTableCount * sizeof(float)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_NV, omni_a, 3, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoverageReductionModeNV(VkCommandBuffer commandBuffer, VkCoverageReductionModeNV coverageReductionMode) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)coverageReductionMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COVERAGE_REDUCTION_MODE_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COVERAGE_REDUCTION_MODE_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoverageToColorEnableNV(VkCommandBuffer commandBuffer, VkBool32 coverageToColorEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)coverageToColorEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COVERAGE_TO_COLOR_ENABLE_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COVERAGE_TO_COLOR_ENABLE_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCoverageToColorLocationNV(VkCommandBuffer commandBuffer, uint32_t coverageToColorLocation) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)coverageToColorLocation;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_COVERAGE_TO_COLOR_LOCATION_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_COVERAGE_TO_COLOR_LOCATION_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetCullMode(VkCommandBuffer commandBuffer, VkCullModeFlags cullMode) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)cullMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_CULL_MODE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_CULL_MODE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthBias(VkCommandBuffer commandBuffer, float depthBiasConstantFactor, float depthBiasClamp, float depthBiasSlopeFactor) {
@@ -1200,10 +1337,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthBias(VkCommandBuffer command
     uint32_t omni_bits3;
     memcpy(&omni_bits3, &depthBiasSlopeFactor, sizeof omni_bits3);
     omni_a[3] = omni_bits3;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_BIAS, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_BIAS, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthBias2EXT(VkCommandBuffer commandBuffer, const VkDepthBiasInfoEXT* pDepthBiasInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pDepthBiasInfo;
@@ -1214,7 +1352,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthBiasEnable(VkCommandBuffer c
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)depthBiasEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_BIAS_ENABLE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_BIAS_ENABLE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthBounds(VkCommandBuffer commandBuffer, float minDepthBounds, float maxDepthBounds) {
@@ -1226,59 +1364,60 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthBounds(VkCommandBuffer comma
     uint32_t omni_bits2;
     memcpy(&omni_bits2, &maxDepthBounds, sizeof omni_bits2);
     omni_a[2] = omni_bits2;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_BOUNDS, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_BOUNDS, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthBoundsTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthBoundsTestEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)depthBoundsTestEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_BOUNDS_TEST_ENABLE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_BOUNDS_TEST_ENABLE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthClampEnableEXT(VkCommandBuffer commandBuffer, VkBool32 depthClampEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)depthClampEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_CLAMP_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_CLAMP_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthClipEnableEXT(VkCommandBuffer commandBuffer, VkBool32 depthClipEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)depthClipEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_CLIP_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_CLIP_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthClipNegativeOneToOneEXT(VkCommandBuffer commandBuffer, VkBool32 negativeOneToOne) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)negativeOneToOne;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthCompareOp(VkCommandBuffer commandBuffer, VkCompareOp depthCompareOp) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)depthCompareOp;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_COMPARE_OP, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_COMPARE_OP, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthTestEnable(VkCommandBuffer commandBuffer, VkBool32 depthTestEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)depthTestEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_TEST_ENABLE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_TEST_ENABLE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDepthWriteEnable(VkCommandBuffer commandBuffer, VkBool32 depthWriteEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)depthWriteEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEPTH_WRITE_ENABLE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEPTH_WRITE_ENABLE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDescriptorBufferOffsets2EXT(VkCommandBuffer commandBuffer, const VkSetDescriptorBufferOffsetsInfoEXT* pSetDescriptorBufferOffsetsInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pSetDescriptorBufferOffsetsInfo;
@@ -1294,14 +1433,18 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDescriptorBufferOffsetsEXT(VkComm
     omni_a[4] = (uint64_t)setCount;
     omni_a[5] = (uint64_t)(uintptr_t)pBufferIndices;
     omni_a[6] = (uint64_t)(uintptr_t)pOffsets;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DESCRIPTOR_BUFFER_OFFSETS_EXT, omni_a, 7);
+    const struct omni_vk_copy omni_c[2] = {
+        {5, (size_t)setCount * sizeof(uint32_t)},
+        {6, (size_t)setCount * sizeof(VkDeviceSize)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DESCRIPTOR_BUFFER_OFFSETS_EXT, omni_a, 7, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDeviceMask(VkCommandBuffer commandBuffer, uint32_t deviceMask) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)deviceMask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DEVICE_MASK, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DEVICE_MASK, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDiscardRectangleEXT(VkCommandBuffer commandBuffer, uint32_t firstDiscardRectangle, uint32_t discardRectangleCount, const VkRect2D* pDiscardRectangles) {
@@ -1310,21 +1453,24 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDiscardRectangleEXT(VkCommandBuff
     omni_a[1] = (uint64_t)firstDiscardRectangle;
     omni_a[2] = (uint64_t)discardRectangleCount;
     omni_a[3] = (uint64_t)(uintptr_t)pDiscardRectangles;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DISCARD_RECTANGLE_EXT, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)discardRectangleCount * sizeof(VkRect2D)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DISCARD_RECTANGLE_EXT, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDiscardRectangleEnableEXT(VkCommandBuffer commandBuffer, VkBool32 discardRectangleEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)discardRectangleEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DISCARD_RECTANGLE_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DISCARD_RECTANGLE_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetDiscardRectangleModeEXT(VkCommandBuffer commandBuffer, VkDiscardRectangleModeEXT discardRectangleMode) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)discardRectangleMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_DISCARD_RECTANGLE_MODE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_DISCARD_RECTANGLE_MODE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetEvent(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags stageMask) {
@@ -1332,10 +1478,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetEvent(VkCommandBuffer commandBuff
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)event;
     omni_a[2] = (uint64_t)stageMask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_EVENT, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_EVENT, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event, const VkDependencyInfo* pDependencyInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)event;
@@ -1349,7 +1496,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetExclusiveScissorEnableNV(VkComman
     omni_a[1] = (uint64_t)firstExclusiveScissor;
     omni_a[2] = (uint64_t)exclusiveScissorCount;
     omni_a[3] = (uint64_t)(uintptr_t)pExclusiveScissorEnables;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_ENABLE_NV, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)exclusiveScissorCount * sizeof(VkBool32)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_ENABLE_NV, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetExclusiveScissorNV(VkCommandBuffer commandBuffer, uint32_t firstExclusiveScissor, uint32_t exclusiveScissorCount, const VkRect2D* pExclusiveScissors) {
@@ -1358,7 +1508,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetExclusiveScissorNV(VkCommandBuffe
     omni_a[1] = (uint64_t)firstExclusiveScissor;
     omni_a[2] = (uint64_t)exclusiveScissorCount;
     omni_a[3] = (uint64_t)(uintptr_t)pExclusiveScissors;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_NV, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)exclusiveScissorCount * sizeof(VkRect2D)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_NV, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetExtraPrimitiveOverestimationSizeEXT(VkCommandBuffer commandBuffer, float extraPrimitiveOverestimationSize) {
@@ -1367,7 +1520,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetExtraPrimitiveOverestimationSizeE
     uint32_t omni_bits1;
     memcpy(&omni_bits1, &extraPrimitiveOverestimationSize, sizeof omni_bits1);
     omni_a[1] = omni_bits1;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetFragmentShadingRateEnumNV(VkCommandBuffer commandBuffer, VkFragmentShadingRateNV shadingRate, const VkFragmentShadingRateCombinerOpKHR combinerOps[2]) {
@@ -1375,7 +1528,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetFragmentShadingRateEnumNV(VkComma
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)shadingRate;
     omni_a[2] = (uint64_t)(uintptr_t)combinerOps;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_ENUM_NV, omni_a, 3);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, 2 * sizeof(VkFragmentShadingRateCombinerOpKHR)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_ENUM_NV, omni_a, 3, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetFragmentShadingRateKHR(VkCommandBuffer commandBuffer, const VkExtent2D* pFragmentSize, const VkFragmentShadingRateCombinerOpKHR combinerOps[2]) {
@@ -1383,21 +1539,25 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetFragmentShadingRateKHR(VkCommandB
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pFragmentSize;
     omni_a[2] = (uint64_t)(uintptr_t)combinerOps;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_KHR, omni_a, 3);
+    const struct omni_vk_copy omni_c[2] = {
+        {1, 1 * sizeof(VkExtent2D)},
+        {2, 2 * sizeof(VkFragmentShadingRateCombinerOpKHR)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_KHR, omni_a, 3, omni_c, 2u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)frontFace;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_FRONT_FACE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_FRONT_FACE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLineRasterizationModeEXT(VkCommandBuffer commandBuffer, VkLineRasterizationModeEXT lineRasterizationMode) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)lineRasterizationMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_LINE_RASTERIZATION_MODE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_LINE_RASTERIZATION_MODE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLineStippleEXT(VkCommandBuffer commandBuffer, uint32_t lineStippleFactor, uint16_t lineStipplePattern) {
@@ -1405,14 +1565,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLineStippleEXT(VkCommandBuffer co
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)lineStippleFactor;
     omni_a[2] = (uint64_t)lineStipplePattern;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_LINE_STIPPLE_EXT, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_LINE_STIPPLE_EXT, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLineStippleEnableEXT(VkCommandBuffer commandBuffer, VkBool32 stippledLineEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)stippledLineEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_LINE_STIPPLE_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_LINE_STIPPLE_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLineWidth(VkCommandBuffer commandBuffer, float lineWidth) {
@@ -1421,31 +1581,32 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLineWidth(VkCommandBuffer command
     uint32_t omni_bits1;
     memcpy(&omni_bits1, &lineWidth, sizeof omni_bits1);
     omni_a[1] = omni_bits1;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_LINE_WIDTH, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_LINE_WIDTH, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLogicOpEXT(VkCommandBuffer commandBuffer, VkLogicOp logicOp) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)logicOp;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_LOGIC_OP_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_LOGIC_OP_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetLogicOpEnableEXT(VkCommandBuffer commandBuffer, VkBool32 logicOpEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)logicOpEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_LOGIC_OP_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_LOGIC_OP_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetPatchControlPointsEXT(VkCommandBuffer commandBuffer, uint32_t patchControlPoints) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)patchControlPoints;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_PATCH_CONTROL_POINTS_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_PATCH_CONTROL_POINTS_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCmdSetPerformanceMarkerINTEL(VkCommandBuffer commandBuffer, const VkPerformanceMarkerInfoINTEL* pMarkerInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pMarkerInfo;
@@ -1454,6 +1615,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCmdSetPerformanceMarkerINTEL(VkComm
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCmdSetPerformanceOverrideINTEL(VkCommandBuffer commandBuffer, const VkPerformanceOverrideInfoINTEL* pOverrideInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pOverrideInfo;
@@ -1462,6 +1624,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCmdSetPerformanceOverrideINTEL(VkCo
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCmdSetPerformanceStreamMarkerINTEL(VkCommandBuffer commandBuffer, const VkPerformanceStreamMarkerInfoINTEL* pMarkerInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pMarkerInfo;
@@ -1473,66 +1636,67 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetPolygonModeEXT(VkCommandBuffer co
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)polygonMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_POLYGON_MODE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_POLYGON_MODE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer, VkBool32 primitiveRestartEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)primitiveRestartEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetPrimitiveTopology(VkCommandBuffer commandBuffer, VkPrimitiveTopology primitiveTopology) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)primitiveTopology;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_PRIMITIVE_TOPOLOGY, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_PRIMITIVE_TOPOLOGY, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetProvokingVertexModeEXT(VkCommandBuffer commandBuffer, VkProvokingVertexModeEXT provokingVertexMode) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)provokingVertexMode;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_PROVOKING_VERTEX_MODE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_PROVOKING_VERTEX_MODE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetRasterizationSamplesEXT(VkCommandBuffer commandBuffer, VkSampleCountFlagBits rasterizationSamples) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)rasterizationSamples;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_RASTERIZATION_SAMPLES_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_RASTERIZATION_SAMPLES_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetRasterizationStreamEXT(VkCommandBuffer commandBuffer, uint32_t rasterizationStream) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)rasterizationStream;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_RASTERIZATION_STREAM_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_RASTERIZATION_STREAM_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer, VkBool32 rasterizerDiscardEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)rasterizerDiscardEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_RASTERIZER_DISCARD_ENABLE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_RASTERIZER_DISCARD_ENABLE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer commandBuffer, uint32_t pipelineStackSize) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)pipelineStackSize;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_RAY_TRACING_PIPELINE_STACK_SIZE_KHR, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_RAY_TRACING_PIPELINE_STACK_SIZE_KHR, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetRepresentativeFragmentTestEnableNV(VkCommandBuffer commandBuffer, VkBool32 representativeFragmentTestEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)representativeFragmentTestEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_REPRESENTATIVE_FRAGMENT_TEST_ENABLE_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_REPRESENTATIVE_FRAGMENT_TEST_ENABLE_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetSampleLocationsEXT(VkCommandBuffer commandBuffer, const VkSampleLocationsInfoEXT* pSampleLocationsInfo) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)(uintptr_t)pSampleLocationsInfo;
@@ -1543,10 +1707,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetSampleLocationsEnableEXT(VkComman
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)sampleLocationsEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_SAMPLE_LOCATIONS_ENABLE_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_SAMPLE_LOCATIONS_ENABLE_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetSampleMaskEXT(VkCommandBuffer commandBuffer, VkSampleCountFlagBits samples, const VkSampleMask* pSampleMask) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[3];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)samples;
@@ -1560,7 +1725,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetScissor(VkCommandBuffer commandBu
     omni_a[1] = (uint64_t)firstScissor;
     omni_a[2] = (uint64_t)scissorCount;
     omni_a[3] = (uint64_t)(uintptr_t)pScissors;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_SCISSOR, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)scissorCount * sizeof(VkRect2D)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_SCISSOR, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetScissorWithCount(VkCommandBuffer commandBuffer, uint32_t scissorCount, const VkRect2D* pScissors) {
@@ -1568,14 +1736,17 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetScissorWithCount(VkCommandBuffer 
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)scissorCount;
     omni_a[2] = (uint64_t)(uintptr_t)pScissors;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_SCISSOR_WITH_COUNT, omni_a, 3);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)scissorCount * sizeof(VkRect2D)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_SCISSOR_WITH_COUNT, omni_a, 3, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetShadingRateImageEnableNV(VkCommandBuffer commandBuffer, VkBool32 shadingRateImageEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)shadingRateImageEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_SHADING_RATE_IMAGE_ENABLE_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_SHADING_RATE_IMAGE_ENABLE_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilCompareMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t compareMask) {
@@ -1583,7 +1754,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilCompareMask(VkCommandBuffe
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)faceMask;
     omni_a[2] = (uint64_t)compareMask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_STENCIL_COMPARE_MASK, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_STENCIL_COMPARE_MASK, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilOp(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, VkStencilOp failOp, VkStencilOp passOp, VkStencilOp depthFailOp, VkCompareOp compareOp) {
@@ -1594,7 +1765,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilOp(VkCommandBuffer command
     omni_a[3] = (uint64_t)passOp;
     omni_a[4] = (uint64_t)depthFailOp;
     omni_a[5] = (uint64_t)compareOp;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_STENCIL_OP, omni_a, 6);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_STENCIL_OP, omni_a, 6, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilReference(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t reference) {
@@ -1602,14 +1773,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilReference(VkCommandBuffer 
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)faceMask;
     omni_a[2] = (uint64_t)reference;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_STENCIL_REFERENCE, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_STENCIL_REFERENCE, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilTestEnable(VkCommandBuffer commandBuffer, VkBool32 stencilTestEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)stencilTestEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_STENCIL_TEST_ENABLE, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_STENCIL_TEST_ENABLE, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilWriteMask(VkCommandBuffer commandBuffer, VkStencilFaceFlags faceMask, uint32_t writeMask) {
@@ -1617,17 +1788,18 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetStencilWriteMask(VkCommandBuffer 
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)faceMask;
     omni_a[2] = (uint64_t)writeMask;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_STENCIL_WRITE_MASK, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_STENCIL_WRITE_MASK, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetTessellationDomainOriginEXT(VkCommandBuffer commandBuffer, VkTessellationDomainOrigin domainOrigin) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)domainOrigin;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_TESSELLATION_DOMAIN_ORIGIN_EXT, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_TESSELLATION_DOMAIN_ORIGIN_EXT, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetVertexInputEXT(VkCommandBuffer commandBuffer, uint32_t vertexBindingDescriptionCount, const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions, uint32_t vertexAttributeDescriptionCount, const VkVertexInputAttributeDescription2EXT* pVertexAttributeDescriptions) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[5];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)vertexBindingDescriptionCount;
@@ -1643,10 +1815,14 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewport(VkCommandBuffer commandB
     omni_a[1] = (uint64_t)firstViewport;
     omni_a[2] = (uint64_t)viewportCount;
     omni_a[3] = (uint64_t)(uintptr_t)pViewports;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_VIEWPORT, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)viewportCount * sizeof(VkViewport)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_VIEWPORT, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewportShadingRatePaletteNV(VkCommandBuffer commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const VkShadingRatePaletteNV* pShadingRatePalettes) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[4];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)firstViewport;
@@ -1661,14 +1837,17 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewportSwizzleNV(VkCommandBuffer
     omni_a[1] = (uint64_t)firstViewport;
     omni_a[2] = (uint64_t)viewportCount;
     omni_a[3] = (uint64_t)(uintptr_t)pViewportSwizzles;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_SWIZZLE_NV, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)viewportCount * sizeof(VkViewportSwizzleNV)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_SWIZZLE_NV, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewportWScalingEnableNV(VkCommandBuffer commandBuffer, VkBool32 viewportWScalingEnable) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)viewportWScalingEnable;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_W_SCALING_ENABLE_NV, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_W_SCALING_ENABLE_NV, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewportWScalingNV(VkCommandBuffer commandBuffer, uint32_t firstViewport, uint32_t viewportCount, const VkViewportWScalingNV* pViewportWScalings) {
@@ -1677,7 +1856,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewportWScalingNV(VkCommandBuffe
     omni_a[1] = (uint64_t)firstViewport;
     omni_a[2] = (uint64_t)viewportCount;
     omni_a[3] = (uint64_t)(uintptr_t)pViewportWScalings;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_W_SCALING_NV, omni_a, 4);
+    const struct omni_vk_copy omni_c[1] = {
+        {3, (size_t)viewportCount * sizeof(VkViewportWScalingNV)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_W_SCALING_NV, omni_a, 4, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewportWithCount(VkCommandBuffer commandBuffer, uint32_t viewportCount, const VkViewport* pViewports) {
@@ -1685,20 +1867,23 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSetViewportWithCount(VkCommandBuffer
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)viewportCount;
     omni_a[2] = (uint64_t)(uintptr_t)pViewports;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_WITH_COUNT, omni_a, 3);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)viewportCount * sizeof(VkViewport)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SET_VIEWPORT_WITH_COUNT, omni_a, 3, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdSubpassShadingHUAWEI(VkCommandBuffer commandBuffer) {
     uint64_t omni_a[1];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_SUBPASS_SHADING_HUAWEI, omni_a, 1);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_SUBPASS_SHADING_HUAWEI, omni_a, 1, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer, VkDeviceAddress indirectDeviceAddress) {
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)indirectDeviceAddress;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_TRACE_RAYS_INDIRECT2_KHR, omni_a, 2);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_TRACE_RAYS_INDIRECT2_KHR, omni_a, 2, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdTraceRaysIndirectKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable, VkDeviceAddress indirectDeviceAddress) {
@@ -1709,7 +1894,13 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdTraceRaysIndirectKHR(VkCommandBuffer
     omni_a[3] = (uint64_t)(uintptr_t)pHitShaderBindingTable;
     omni_a[4] = (uint64_t)(uintptr_t)pCallableShaderBindingTable;
     omni_a[5] = (uint64_t)indirectDeviceAddress;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_TRACE_RAYS_INDIRECT_KHR, omni_a, 6);
+    const struct omni_vk_copy omni_c[4] = {
+        {1, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+        {2, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+        {3, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+        {4, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_TRACE_RAYS_INDIRECT_KHR, omni_a, 6, omni_c, 4u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdTraceRaysKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable, const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable, uint32_t width, uint32_t height, uint32_t depth) {
@@ -1722,7 +1913,13 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdTraceRaysKHR(VkCommandBuffer command
     omni_a[5] = (uint64_t)width;
     omni_a[6] = (uint64_t)height;
     omni_a[7] = (uint64_t)depth;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_TRACE_RAYS_KHR, omni_a, 8);
+    const struct omni_vk_copy omni_c[4] = {
+        {1, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+        {2, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+        {3, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+        {4, 1 * sizeof(VkStridedDeviceAddressRegionKHR)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_TRACE_RAYS_KHR, omni_a, 8, omni_c, 4u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdTraceRaysNV(VkCommandBuffer commandBuffer, VkBuffer raygenShaderBindingTableBuffer, VkDeviceSize raygenShaderBindingOffset, VkBuffer missShaderBindingTableBuffer, VkDeviceSize missShaderBindingOffset, VkDeviceSize missShaderBindingStride, VkBuffer hitShaderBindingTableBuffer, VkDeviceSize hitShaderBindingOffset, VkDeviceSize hitShaderBindingStride, VkBuffer callableShaderBindingTableBuffer, VkDeviceSize callableShaderBindingOffset, VkDeviceSize callableShaderBindingStride, uint32_t width, uint32_t height, uint32_t depth) {
@@ -1742,7 +1939,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdTraceRaysNV(VkCommandBuffer commandB
     omni_a[12] = (uint64_t)width;
     omni_a[13] = (uint64_t)height;
     omni_a[14] = (uint64_t)depth;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_TRACE_RAYS_NV, omni_a, 15);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_TRACE_RAYS_NV, omni_a, 15, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSize dstOffset, VkDeviceSize dataSize, const void* pData) {
@@ -1752,7 +1949,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdUpdateBuffer(VkCommandBuffer command
     omni_a[2] = (uint64_t)dstOffset;
     omni_a[3] = (uint64_t)dataSize;
     omni_a[4] = (uint64_t)(uintptr_t)pData;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_UPDATE_BUFFER, omni_a, 5);
+    const struct omni_vk_copy omni_c[1] = {
+        {4, (size_t)dataSize},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_UPDATE_BUFFER, omni_a, 5, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdUpdatePipelineIndirectBufferNV(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline) {
@@ -1760,10 +1960,11 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdUpdatePipelineIndirectBufferNV(VkCom
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)pipelineBindPoint;
     omni_a[2] = (uint64_t)(uintptr_t)pipeline;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_UPDATE_PIPELINE_INDIRECT_BUFFER_NV, omni_a, 3);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_UPDATE_PIPELINE_INDIRECT_BUFFER_NV, omni_a, 3, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent* pEvents, VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask, uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers, uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[11];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)eventCount;
@@ -1780,6 +1981,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWaitEvents(VkCommandBuffer commandBu
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent* pEvents, const VkDependencyInfo* pDependencyInfos) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     uint64_t omni_a[4];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)eventCount;
@@ -1796,7 +1998,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteAccelerationStructuresPropertie
     omni_a[3] = (uint64_t)queryType;
     omni_a[4] = (uint64_t)(uintptr_t)queryPool;
     omni_a[5] = (uint64_t)firstQuery;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_KHR, omni_a, 6);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)accelerationStructureCount * sizeof(VkAccelerationStructureKHR)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_KHR, omni_a, 6, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteAccelerationStructuresPropertiesNV(VkCommandBuffer commandBuffer, uint32_t accelerationStructureCount, const VkAccelerationStructureNV* pAccelerationStructures, VkQueryType queryType, VkQueryPool queryPool, uint32_t firstQuery) {
@@ -1807,7 +2012,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteAccelerationStructuresPropertie
     omni_a[3] = (uint64_t)queryType;
     omni_a[4] = (uint64_t)(uintptr_t)queryPool;
     omni_a[5] = (uint64_t)firstQuery;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_NV, omni_a, 6);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)accelerationStructureCount * sizeof(VkAccelerationStructureNV)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_NV, omni_a, 6, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage, VkBuffer dstBuffer, VkDeviceSize dstOffset, uint32_t marker) {
@@ -1817,7 +2025,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteBufferMarker2AMD(VkCommandBuffe
     omni_a[2] = (uint64_t)(uintptr_t)dstBuffer;
     omni_a[3] = (uint64_t)dstOffset;
     omni_a[4] = (uint64_t)marker;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_WRITE_BUFFER_MARKER2_AMD, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_WRITE_BUFFER_MARKER2_AMD, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteBufferMarkerAMD(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage, VkBuffer dstBuffer, VkDeviceSize dstOffset, uint32_t marker) {
@@ -1827,7 +2035,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteBufferMarkerAMD(VkCommandBuffer
     omni_a[2] = (uint64_t)(uintptr_t)dstBuffer;
     omni_a[3] = (uint64_t)dstOffset;
     omni_a[4] = (uint64_t)marker;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_WRITE_BUFFER_MARKER_AMD, omni_a, 5);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_WRITE_BUFFER_MARKER_AMD, omni_a, 5, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteMicromapsPropertiesEXT(VkCommandBuffer commandBuffer, uint32_t micromapCount, const VkMicromapEXT* pMicromaps, VkQueryType queryType, VkQueryPool queryPool, uint32_t firstQuery) {
@@ -1838,7 +2046,10 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteMicromapsPropertiesEXT(VkComman
     omni_a[3] = (uint64_t)queryType;
     omni_a[4] = (uint64_t)(uintptr_t)queryPool;
     omni_a[5] = (uint64_t)firstQuery;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_WRITE_MICROMAPS_PROPERTIES_EXT, omni_a, 6);
+    const struct omni_vk_copy omni_c[1] = {
+        {2, (size_t)micromapCount * sizeof(VkMicromapEXT)},
+    };
+    omni_vk_record(OMNI_VK_ID_VK_CMD_WRITE_MICROMAPS_PROPERTIES_EXT, omni_a, 6, omni_c, 1u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteTimestamp(VkCommandBuffer commandBuffer, VkPipelineStageFlagBits pipelineStage, VkQueryPool queryPool, uint32_t query) {
@@ -1847,7 +2058,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteTimestamp(VkCommandBuffer comma
     omni_a[1] = (uint64_t)pipelineStage;
     omni_a[2] = (uint64_t)(uintptr_t)queryPool;
     omni_a[3] = (uint64_t)query;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_WRITE_TIMESTAMP, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_WRITE_TIMESTAMP, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage, VkQueryPool queryPool, uint32_t query) {
@@ -1856,7 +2067,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkCmdWriteTimestamp2(VkCommandBuffer comm
     omni_a[1] = (uint64_t)stage;
     omni_a[2] = (uint64_t)(uintptr_t)queryPool;
     omni_a[3] = (uint64_t)query;
-    (void)omni_vk_call(OMNI_VK_ID_VK_CMD_WRITE_TIMESTAMP2, omni_a, 4);
+    omni_vk_record(OMNI_VK_ID_VK_CMD_WRITE_TIMESTAMP2, omni_a, 4, NULL, 0u);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkCompileDeferredNV(VkDevice device, VkPipeline pipeline, uint32_t shader) {
@@ -2567,6 +2778,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL omni_vkDeviceWaitIdle(VkDevice device) {
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkEndCommandBuffer(VkCommandBuffer commandBuffer) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_END);
     uint64_t omni_a[1];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     uint64_t omni_r = omni_vk_call(OMNI_VK_ID_VK_END_COMMAND_BUFFER, omni_a, 1);
@@ -3588,6 +3800,7 @@ static VKAPI_ATTR void VKAPI_CALL omni_vkReleaseProfilingLockKHR(VkDevice device
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL omni_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_DISCARD);
     uint64_t omni_a[2];
     omni_a[0] = (uint64_t)(uintptr_t)commandBuffer;
     omni_a[1] = (uint64_t)flags;

@@ -8,7 +8,7 @@
 // driver's for this command (resolved by name from the table of the handle's instance or device),
 // called with the command's C signature and the guest's arguments -- guest code already runs in
 // this process with every host page reachable, so what the driver reads widens nothing (design).
-#![allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::many_single_char_names, clippy::missing_safety_doc, non_upper_case_globals, dead_code)]
+#![allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::many_single_char_names, clippy::missing_safety_doc, non_upper_case_globals, dead_code, unused_variables)]
 use std::ffi::CStr;
 
 use super::{CallError, Gpu};
@@ -1679,6 +1679,311 @@ pub(crate) fn dispatch(g: &Gpu, p: &Process, id: u32, a: &[u64]) -> Result<u64, 
     }
 }
 
+/// Whether command `id` may come in a command buffer's batch (`OMNI_VK_ID_BATCH`): it returns
+/// nothing and records into its command buffer, and what it points at the guest's driver copied
+/// into the batch (`tools/gen_vk_forward.py`'s `batch_plan`).
+pub(crate) fn batchable(id: u32) -> bool {
+    matches!(
+        id,
+        ID_VK_CMD_BEGIN_QUERY
+        | ID_VK_CMD_BEGIN_QUERY_INDEXED_EXT
+        | ID_VK_CMD_BEGIN_TRANSFORM_FEEDBACK_EXT
+        | ID_VK_CMD_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_EXT
+        | ID_VK_CMD_BIND_DESCRIPTOR_SETS
+        | ID_VK_CMD_BIND_INDEX_BUFFER
+        | ID_VK_CMD_BIND_INDEX_BUFFER2_KHR
+        | ID_VK_CMD_BIND_INVOCATION_MASK_HUAWEI
+        | ID_VK_CMD_BIND_PIPELINE
+        | ID_VK_CMD_BIND_PIPELINE_SHADER_GROUP_NV
+        | ID_VK_CMD_BIND_SHADERS_EXT
+        | ID_VK_CMD_BIND_SHADING_RATE_IMAGE_NV
+        | ID_VK_CMD_BIND_TRANSFORM_FEEDBACK_BUFFERS_EXT
+        | ID_VK_CMD_BIND_VERTEX_BUFFERS
+        | ID_VK_CMD_BIND_VERTEX_BUFFERS2
+        | ID_VK_CMD_BLIT_IMAGE
+        | ID_VK_CMD_CLEAR_ATTACHMENTS
+        | ID_VK_CMD_CLEAR_COLOR_IMAGE
+        | ID_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE
+        | ID_VK_CMD_COPY_ACCELERATION_STRUCTURE_NV
+        | ID_VK_CMD_COPY_BUFFER
+        | ID_VK_CMD_COPY_BUFFER_TO_IMAGE
+        | ID_VK_CMD_COPY_IMAGE
+        | ID_VK_CMD_COPY_IMAGE_TO_BUFFER
+        | ID_VK_CMD_COPY_MEMORY_INDIRECT_NV
+        | ID_VK_CMD_COPY_MEMORY_TO_IMAGE_INDIRECT_NV
+        | ID_VK_CMD_COPY_QUERY_POOL_RESULTS
+        | ID_VK_CMD_DECOMPRESS_MEMORY_INDIRECT_COUNT_NV
+        | ID_VK_CMD_DECOMPRESS_MEMORY_NV
+        | ID_VK_CMD_DISPATCH
+        | ID_VK_CMD_DISPATCH_BASE
+        | ID_VK_CMD_DISPATCH_INDIRECT
+        | ID_VK_CMD_DRAW
+        | ID_VK_CMD_DRAW_CLUSTER_HUAWEI
+        | ID_VK_CMD_DRAW_CLUSTER_INDIRECT_HUAWEI
+        | ID_VK_CMD_DRAW_INDEXED
+        | ID_VK_CMD_DRAW_INDEXED_INDIRECT
+        | ID_VK_CMD_DRAW_INDEXED_INDIRECT_COUNT
+        | ID_VK_CMD_DRAW_INDIRECT
+        | ID_VK_CMD_DRAW_INDIRECT_BYTE_COUNT_EXT
+        | ID_VK_CMD_DRAW_INDIRECT_COUNT
+        | ID_VK_CMD_DRAW_MESH_TASKS_EXT
+        | ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_EXT
+        | ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_NV
+        | ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_EXT
+        | ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_NV
+        | ID_VK_CMD_DRAW_MESH_TASKS_NV
+        | ID_VK_CMD_END_CONDITIONAL_RENDERING_EXT
+        | ID_VK_CMD_END_QUERY
+        | ID_VK_CMD_END_QUERY_INDEXED_EXT
+        | ID_VK_CMD_END_RENDER_PASS
+        | ID_VK_CMD_END_RENDERING
+        | ID_VK_CMD_END_TRANSFORM_FEEDBACK_EXT
+        | ID_VK_CMD_FILL_BUFFER
+        | ID_VK_CMD_NEXT_SUBPASS
+        | ID_VK_CMD_PUSH_CONSTANTS
+        | ID_VK_CMD_RESET_EVENT
+        | ID_VK_CMD_RESET_EVENT2
+        | ID_VK_CMD_RESET_QUERY_POOL
+        | ID_VK_CMD_RESOLVE_IMAGE
+        | ID_VK_CMD_SET_ALPHA_TO_COVERAGE_ENABLE_EXT
+        | ID_VK_CMD_SET_ALPHA_TO_ONE_ENABLE_EXT
+        | ID_VK_CMD_SET_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT
+        | ID_VK_CMD_SET_BLEND_CONSTANTS
+        | ID_VK_CMD_SET_COLOR_BLEND_ADVANCED_EXT
+        | ID_VK_CMD_SET_COLOR_BLEND_ENABLE_EXT
+        | ID_VK_CMD_SET_COLOR_BLEND_EQUATION_EXT
+        | ID_VK_CMD_SET_COLOR_WRITE_ENABLE_EXT
+        | ID_VK_CMD_SET_COLOR_WRITE_MASK_EXT
+        | ID_VK_CMD_SET_CONSERVATIVE_RASTERIZATION_MODE_EXT
+        | ID_VK_CMD_SET_COVERAGE_MODULATION_MODE_NV
+        | ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_ENABLE_NV
+        | ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_NV
+        | ID_VK_CMD_SET_COVERAGE_REDUCTION_MODE_NV
+        | ID_VK_CMD_SET_COVERAGE_TO_COLOR_ENABLE_NV
+        | ID_VK_CMD_SET_COVERAGE_TO_COLOR_LOCATION_NV
+        | ID_VK_CMD_SET_CULL_MODE
+        | ID_VK_CMD_SET_DEPTH_BIAS
+        | ID_VK_CMD_SET_DEPTH_BIAS_ENABLE
+        | ID_VK_CMD_SET_DEPTH_BOUNDS
+        | ID_VK_CMD_SET_DEPTH_BOUNDS_TEST_ENABLE
+        | ID_VK_CMD_SET_DEPTH_CLAMP_ENABLE_EXT
+        | ID_VK_CMD_SET_DEPTH_CLIP_ENABLE_EXT
+        | ID_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT
+        | ID_VK_CMD_SET_DEPTH_COMPARE_OP
+        | ID_VK_CMD_SET_DEPTH_TEST_ENABLE
+        | ID_VK_CMD_SET_DEPTH_WRITE_ENABLE
+        | ID_VK_CMD_SET_DESCRIPTOR_BUFFER_OFFSETS_EXT
+        | ID_VK_CMD_SET_DEVICE_MASK
+        | ID_VK_CMD_SET_DISCARD_RECTANGLE_EXT
+        | ID_VK_CMD_SET_DISCARD_RECTANGLE_ENABLE_EXT
+        | ID_VK_CMD_SET_DISCARD_RECTANGLE_MODE_EXT
+        | ID_VK_CMD_SET_EVENT
+        | ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_ENABLE_NV
+        | ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_NV
+        | ID_VK_CMD_SET_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT
+        | ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_ENUM_NV
+        | ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_KHR
+        | ID_VK_CMD_SET_FRONT_FACE
+        | ID_VK_CMD_SET_LINE_RASTERIZATION_MODE_EXT
+        | ID_VK_CMD_SET_LINE_STIPPLE_EXT
+        | ID_VK_CMD_SET_LINE_STIPPLE_ENABLE_EXT
+        | ID_VK_CMD_SET_LINE_WIDTH
+        | ID_VK_CMD_SET_LOGIC_OP_EXT
+        | ID_VK_CMD_SET_LOGIC_OP_ENABLE_EXT
+        | ID_VK_CMD_SET_PATCH_CONTROL_POINTS_EXT
+        | ID_VK_CMD_SET_POLYGON_MODE_EXT
+        | ID_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE
+        | ID_VK_CMD_SET_PRIMITIVE_TOPOLOGY
+        | ID_VK_CMD_SET_PROVOKING_VERTEX_MODE_EXT
+        | ID_VK_CMD_SET_RASTERIZATION_SAMPLES_EXT
+        | ID_VK_CMD_SET_RASTERIZATION_STREAM_EXT
+        | ID_VK_CMD_SET_RASTERIZER_DISCARD_ENABLE
+        | ID_VK_CMD_SET_RAY_TRACING_PIPELINE_STACK_SIZE_KHR
+        | ID_VK_CMD_SET_REPRESENTATIVE_FRAGMENT_TEST_ENABLE_NV
+        | ID_VK_CMD_SET_SAMPLE_LOCATIONS_ENABLE_EXT
+        | ID_VK_CMD_SET_SCISSOR
+        | ID_VK_CMD_SET_SCISSOR_WITH_COUNT
+        | ID_VK_CMD_SET_SHADING_RATE_IMAGE_ENABLE_NV
+        | ID_VK_CMD_SET_STENCIL_COMPARE_MASK
+        | ID_VK_CMD_SET_STENCIL_OP
+        | ID_VK_CMD_SET_STENCIL_REFERENCE
+        | ID_VK_CMD_SET_STENCIL_TEST_ENABLE
+        | ID_VK_CMD_SET_STENCIL_WRITE_MASK
+        | ID_VK_CMD_SET_TESSELLATION_DOMAIN_ORIGIN_EXT
+        | ID_VK_CMD_SET_VIEWPORT
+        | ID_VK_CMD_SET_VIEWPORT_SWIZZLE_NV
+        | ID_VK_CMD_SET_VIEWPORT_W_SCALING_ENABLE_NV
+        | ID_VK_CMD_SET_VIEWPORT_W_SCALING_NV
+        | ID_VK_CMD_SET_VIEWPORT_WITH_COUNT
+        | ID_VK_CMD_SUBPASS_SHADING_HUAWEI
+        | ID_VK_CMD_TRACE_RAYS_INDIRECT2_KHR
+        | ID_VK_CMD_TRACE_RAYS_INDIRECT_KHR
+        | ID_VK_CMD_TRACE_RAYS_KHR
+        | ID_VK_CMD_TRACE_RAYS_NV
+        | ID_VK_CMD_UPDATE_BUFFER
+        | ID_VK_CMD_UPDATE_PIPELINE_INDIRECT_BUFFER_NV
+        | ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_KHR
+        | ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_NV
+        | ID_VK_CMD_WRITE_BUFFER_MARKER2_AMD
+        | ID_VK_CMD_WRITE_BUFFER_MARKER_AMD
+        | ID_VK_CMD_WRITE_MICROMAPS_PROPERTIES_EXT
+        | ID_VK_CMD_WRITE_TIMESTAMP
+        | ID_VK_CMD_WRITE_TIMESTAMP2
+    )
+}
+
+/// A batched command on host command buffer `h0`, whose entry points `t` resolves (unwrapped once
+/// for the whole batch). Only for [`batchable`] ids.
+pub(crate) fn replay(t: &super::Table, h0: u64, id: u32, a: &[u64]) -> Result<u64, CallError> {
+    match id {
+        ID_VK_CMD_BEGIN_QUERY => vk_cmd_begin_query_on(t, h0, a),
+        ID_VK_CMD_BEGIN_QUERY_INDEXED_EXT => vk_cmd_begin_query_indexed_ext_on(t, h0, a),
+        ID_VK_CMD_BEGIN_TRANSFORM_FEEDBACK_EXT => vk_cmd_begin_transform_feedback_ext_on(t, h0, a),
+        ID_VK_CMD_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_EXT => vk_cmd_bind_descriptor_buffer_embedded_samplers_ext_on(t, h0, a),
+        ID_VK_CMD_BIND_DESCRIPTOR_SETS => vk_cmd_bind_descriptor_sets_on(t, h0, a),
+        ID_VK_CMD_BIND_INDEX_BUFFER => vk_cmd_bind_index_buffer_on(t, h0, a),
+        ID_VK_CMD_BIND_INDEX_BUFFER2_KHR => vk_cmd_bind_index_buffer2_khr_on(t, h0, a),
+        ID_VK_CMD_BIND_INVOCATION_MASK_HUAWEI => vk_cmd_bind_invocation_mask_huawei_on(t, h0, a),
+        ID_VK_CMD_BIND_PIPELINE => vk_cmd_bind_pipeline_on(t, h0, a),
+        ID_VK_CMD_BIND_PIPELINE_SHADER_GROUP_NV => vk_cmd_bind_pipeline_shader_group_nv_on(t, h0, a),
+        ID_VK_CMD_BIND_SHADERS_EXT => vk_cmd_bind_shaders_ext_on(t, h0, a),
+        ID_VK_CMD_BIND_SHADING_RATE_IMAGE_NV => vk_cmd_bind_shading_rate_image_nv_on(t, h0, a),
+        ID_VK_CMD_BIND_TRANSFORM_FEEDBACK_BUFFERS_EXT => vk_cmd_bind_transform_feedback_buffers_ext_on(t, h0, a),
+        ID_VK_CMD_BIND_VERTEX_BUFFERS => vk_cmd_bind_vertex_buffers_on(t, h0, a),
+        ID_VK_CMD_BIND_VERTEX_BUFFERS2 => vk_cmd_bind_vertex_buffers2_on(t, h0, a),
+        ID_VK_CMD_BLIT_IMAGE => vk_cmd_blit_image_on(t, h0, a),
+        ID_VK_CMD_CLEAR_ATTACHMENTS => vk_cmd_clear_attachments_on(t, h0, a),
+        ID_VK_CMD_CLEAR_COLOR_IMAGE => vk_cmd_clear_color_image_on(t, h0, a),
+        ID_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE => vk_cmd_clear_depth_stencil_image_on(t, h0, a),
+        ID_VK_CMD_COPY_ACCELERATION_STRUCTURE_NV => vk_cmd_copy_acceleration_structure_nv_on(t, h0, a),
+        ID_VK_CMD_COPY_BUFFER => vk_cmd_copy_buffer_on(t, h0, a),
+        ID_VK_CMD_COPY_BUFFER_TO_IMAGE => vk_cmd_copy_buffer_to_image_on(t, h0, a),
+        ID_VK_CMD_COPY_IMAGE => vk_cmd_copy_image_on(t, h0, a),
+        ID_VK_CMD_COPY_IMAGE_TO_BUFFER => vk_cmd_copy_image_to_buffer_on(t, h0, a),
+        ID_VK_CMD_COPY_MEMORY_INDIRECT_NV => vk_cmd_copy_memory_indirect_nv_on(t, h0, a),
+        ID_VK_CMD_COPY_MEMORY_TO_IMAGE_INDIRECT_NV => vk_cmd_copy_memory_to_image_indirect_nv_on(t, h0, a),
+        ID_VK_CMD_COPY_QUERY_POOL_RESULTS => vk_cmd_copy_query_pool_results_on(t, h0, a),
+        ID_VK_CMD_DECOMPRESS_MEMORY_INDIRECT_COUNT_NV => vk_cmd_decompress_memory_indirect_count_nv_on(t, h0, a),
+        ID_VK_CMD_DECOMPRESS_MEMORY_NV => vk_cmd_decompress_memory_nv_on(t, h0, a),
+        ID_VK_CMD_DISPATCH => vk_cmd_dispatch_on(t, h0, a),
+        ID_VK_CMD_DISPATCH_BASE => vk_cmd_dispatch_base_on(t, h0, a),
+        ID_VK_CMD_DISPATCH_INDIRECT => vk_cmd_dispatch_indirect_on(t, h0, a),
+        ID_VK_CMD_DRAW => vk_cmd_draw_on(t, h0, a),
+        ID_VK_CMD_DRAW_CLUSTER_HUAWEI => vk_cmd_draw_cluster_huawei_on(t, h0, a),
+        ID_VK_CMD_DRAW_CLUSTER_INDIRECT_HUAWEI => vk_cmd_draw_cluster_indirect_huawei_on(t, h0, a),
+        ID_VK_CMD_DRAW_INDEXED => vk_cmd_draw_indexed_on(t, h0, a),
+        ID_VK_CMD_DRAW_INDEXED_INDIRECT => vk_cmd_draw_indexed_indirect_on(t, h0, a),
+        ID_VK_CMD_DRAW_INDEXED_INDIRECT_COUNT => vk_cmd_draw_indexed_indirect_count_on(t, h0, a),
+        ID_VK_CMD_DRAW_INDIRECT => vk_cmd_draw_indirect_on(t, h0, a),
+        ID_VK_CMD_DRAW_INDIRECT_BYTE_COUNT_EXT => vk_cmd_draw_indirect_byte_count_ext_on(t, h0, a),
+        ID_VK_CMD_DRAW_INDIRECT_COUNT => vk_cmd_draw_indirect_count_on(t, h0, a),
+        ID_VK_CMD_DRAW_MESH_TASKS_EXT => vk_cmd_draw_mesh_tasks_ext_on(t, h0, a),
+        ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_EXT => vk_cmd_draw_mesh_tasks_indirect_count_ext_on(t, h0, a),
+        ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_NV => vk_cmd_draw_mesh_tasks_indirect_count_nv_on(t, h0, a),
+        ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_EXT => vk_cmd_draw_mesh_tasks_indirect_ext_on(t, h0, a),
+        ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_NV => vk_cmd_draw_mesh_tasks_indirect_nv_on(t, h0, a),
+        ID_VK_CMD_DRAW_MESH_TASKS_NV => vk_cmd_draw_mesh_tasks_nv_on(t, h0, a),
+        ID_VK_CMD_END_CONDITIONAL_RENDERING_EXT => vk_cmd_end_conditional_rendering_ext_on(t, h0, a),
+        ID_VK_CMD_END_QUERY => vk_cmd_end_query_on(t, h0, a),
+        ID_VK_CMD_END_QUERY_INDEXED_EXT => vk_cmd_end_query_indexed_ext_on(t, h0, a),
+        ID_VK_CMD_END_RENDER_PASS => vk_cmd_end_render_pass_on(t, h0, a),
+        ID_VK_CMD_END_RENDERING => vk_cmd_end_rendering_on(t, h0, a),
+        ID_VK_CMD_END_TRANSFORM_FEEDBACK_EXT => vk_cmd_end_transform_feedback_ext_on(t, h0, a),
+        ID_VK_CMD_FILL_BUFFER => vk_cmd_fill_buffer_on(t, h0, a),
+        ID_VK_CMD_NEXT_SUBPASS => vk_cmd_next_subpass_on(t, h0, a),
+        ID_VK_CMD_PUSH_CONSTANTS => vk_cmd_push_constants_on(t, h0, a),
+        ID_VK_CMD_RESET_EVENT => vk_cmd_reset_event_on(t, h0, a),
+        ID_VK_CMD_RESET_EVENT2 => vk_cmd_reset_event2_on(t, h0, a),
+        ID_VK_CMD_RESET_QUERY_POOL => vk_cmd_reset_query_pool_on(t, h0, a),
+        ID_VK_CMD_RESOLVE_IMAGE => vk_cmd_resolve_image_on(t, h0, a),
+        ID_VK_CMD_SET_ALPHA_TO_COVERAGE_ENABLE_EXT => vk_cmd_set_alpha_to_coverage_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_ALPHA_TO_ONE_ENABLE_EXT => vk_cmd_set_alpha_to_one_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT => vk_cmd_set_attachment_feedback_loop_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_BLEND_CONSTANTS => vk_cmd_set_blend_constants_on(t, h0, a),
+        ID_VK_CMD_SET_COLOR_BLEND_ADVANCED_EXT => vk_cmd_set_color_blend_advanced_ext_on(t, h0, a),
+        ID_VK_CMD_SET_COLOR_BLEND_ENABLE_EXT => vk_cmd_set_color_blend_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_COLOR_BLEND_EQUATION_EXT => vk_cmd_set_color_blend_equation_ext_on(t, h0, a),
+        ID_VK_CMD_SET_COLOR_WRITE_ENABLE_EXT => vk_cmd_set_color_write_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_COLOR_WRITE_MASK_EXT => vk_cmd_set_color_write_mask_ext_on(t, h0, a),
+        ID_VK_CMD_SET_CONSERVATIVE_RASTERIZATION_MODE_EXT => vk_cmd_set_conservative_rasterization_mode_ext_on(t, h0, a),
+        ID_VK_CMD_SET_COVERAGE_MODULATION_MODE_NV => vk_cmd_set_coverage_modulation_mode_nv_on(t, h0, a),
+        ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_ENABLE_NV => vk_cmd_set_coverage_modulation_table_enable_nv_on(t, h0, a),
+        ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_NV => vk_cmd_set_coverage_modulation_table_nv_on(t, h0, a),
+        ID_VK_CMD_SET_COVERAGE_REDUCTION_MODE_NV => vk_cmd_set_coverage_reduction_mode_nv_on(t, h0, a),
+        ID_VK_CMD_SET_COVERAGE_TO_COLOR_ENABLE_NV => vk_cmd_set_coverage_to_color_enable_nv_on(t, h0, a),
+        ID_VK_CMD_SET_COVERAGE_TO_COLOR_LOCATION_NV => vk_cmd_set_coverage_to_color_location_nv_on(t, h0, a),
+        ID_VK_CMD_SET_CULL_MODE => vk_cmd_set_cull_mode_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_BIAS => vk_cmd_set_depth_bias_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_BIAS_ENABLE => vk_cmd_set_depth_bias_enable_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_BOUNDS => vk_cmd_set_depth_bounds_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_BOUNDS_TEST_ENABLE => vk_cmd_set_depth_bounds_test_enable_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_CLAMP_ENABLE_EXT => vk_cmd_set_depth_clamp_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_CLIP_ENABLE_EXT => vk_cmd_set_depth_clip_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT => vk_cmd_set_depth_clip_negative_one_to_one_ext_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_COMPARE_OP => vk_cmd_set_depth_compare_op_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_TEST_ENABLE => vk_cmd_set_depth_test_enable_on(t, h0, a),
+        ID_VK_CMD_SET_DEPTH_WRITE_ENABLE => vk_cmd_set_depth_write_enable_on(t, h0, a),
+        ID_VK_CMD_SET_DESCRIPTOR_BUFFER_OFFSETS_EXT => vk_cmd_set_descriptor_buffer_offsets_ext_on(t, h0, a),
+        ID_VK_CMD_SET_DEVICE_MASK => vk_cmd_set_device_mask_on(t, h0, a),
+        ID_VK_CMD_SET_DISCARD_RECTANGLE_EXT => vk_cmd_set_discard_rectangle_ext_on(t, h0, a),
+        ID_VK_CMD_SET_DISCARD_RECTANGLE_ENABLE_EXT => vk_cmd_set_discard_rectangle_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_DISCARD_RECTANGLE_MODE_EXT => vk_cmd_set_discard_rectangle_mode_ext_on(t, h0, a),
+        ID_VK_CMD_SET_EVENT => vk_cmd_set_event_on(t, h0, a),
+        ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_ENABLE_NV => vk_cmd_set_exclusive_scissor_enable_nv_on(t, h0, a),
+        ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_NV => vk_cmd_set_exclusive_scissor_nv_on(t, h0, a),
+        ID_VK_CMD_SET_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT => vk_cmd_set_extra_primitive_overestimation_size_ext_on(t, h0, a),
+        ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_ENUM_NV => vk_cmd_set_fragment_shading_rate_enum_nv_on(t, h0, a),
+        ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_KHR => vk_cmd_set_fragment_shading_rate_khr_on(t, h0, a),
+        ID_VK_CMD_SET_FRONT_FACE => vk_cmd_set_front_face_on(t, h0, a),
+        ID_VK_CMD_SET_LINE_RASTERIZATION_MODE_EXT => vk_cmd_set_line_rasterization_mode_ext_on(t, h0, a),
+        ID_VK_CMD_SET_LINE_STIPPLE_EXT => vk_cmd_set_line_stipple_ext_on(t, h0, a),
+        ID_VK_CMD_SET_LINE_STIPPLE_ENABLE_EXT => vk_cmd_set_line_stipple_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_LINE_WIDTH => vk_cmd_set_line_width_on(t, h0, a),
+        ID_VK_CMD_SET_LOGIC_OP_EXT => vk_cmd_set_logic_op_ext_on(t, h0, a),
+        ID_VK_CMD_SET_LOGIC_OP_ENABLE_EXT => vk_cmd_set_logic_op_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_PATCH_CONTROL_POINTS_EXT => vk_cmd_set_patch_control_points_ext_on(t, h0, a),
+        ID_VK_CMD_SET_POLYGON_MODE_EXT => vk_cmd_set_polygon_mode_ext_on(t, h0, a),
+        ID_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE => vk_cmd_set_primitive_restart_enable_on(t, h0, a),
+        ID_VK_CMD_SET_PRIMITIVE_TOPOLOGY => vk_cmd_set_primitive_topology_on(t, h0, a),
+        ID_VK_CMD_SET_PROVOKING_VERTEX_MODE_EXT => vk_cmd_set_provoking_vertex_mode_ext_on(t, h0, a),
+        ID_VK_CMD_SET_RASTERIZATION_SAMPLES_EXT => vk_cmd_set_rasterization_samples_ext_on(t, h0, a),
+        ID_VK_CMD_SET_RASTERIZATION_STREAM_EXT => vk_cmd_set_rasterization_stream_ext_on(t, h0, a),
+        ID_VK_CMD_SET_RASTERIZER_DISCARD_ENABLE => vk_cmd_set_rasterizer_discard_enable_on(t, h0, a),
+        ID_VK_CMD_SET_RAY_TRACING_PIPELINE_STACK_SIZE_KHR => vk_cmd_set_ray_tracing_pipeline_stack_size_khr_on(t, h0, a),
+        ID_VK_CMD_SET_REPRESENTATIVE_FRAGMENT_TEST_ENABLE_NV => vk_cmd_set_representative_fragment_test_enable_nv_on(t, h0, a),
+        ID_VK_CMD_SET_SAMPLE_LOCATIONS_ENABLE_EXT => vk_cmd_set_sample_locations_enable_ext_on(t, h0, a),
+        ID_VK_CMD_SET_SCISSOR => vk_cmd_set_scissor_on(t, h0, a),
+        ID_VK_CMD_SET_SCISSOR_WITH_COUNT => vk_cmd_set_scissor_with_count_on(t, h0, a),
+        ID_VK_CMD_SET_SHADING_RATE_IMAGE_ENABLE_NV => vk_cmd_set_shading_rate_image_enable_nv_on(t, h0, a),
+        ID_VK_CMD_SET_STENCIL_COMPARE_MASK => vk_cmd_set_stencil_compare_mask_on(t, h0, a),
+        ID_VK_CMD_SET_STENCIL_OP => vk_cmd_set_stencil_op_on(t, h0, a),
+        ID_VK_CMD_SET_STENCIL_REFERENCE => vk_cmd_set_stencil_reference_on(t, h0, a),
+        ID_VK_CMD_SET_STENCIL_TEST_ENABLE => vk_cmd_set_stencil_test_enable_on(t, h0, a),
+        ID_VK_CMD_SET_STENCIL_WRITE_MASK => vk_cmd_set_stencil_write_mask_on(t, h0, a),
+        ID_VK_CMD_SET_TESSELLATION_DOMAIN_ORIGIN_EXT => vk_cmd_set_tessellation_domain_origin_ext_on(t, h0, a),
+        ID_VK_CMD_SET_VIEWPORT => vk_cmd_set_viewport_on(t, h0, a),
+        ID_VK_CMD_SET_VIEWPORT_SWIZZLE_NV => vk_cmd_set_viewport_swizzle_nv_on(t, h0, a),
+        ID_VK_CMD_SET_VIEWPORT_W_SCALING_ENABLE_NV => vk_cmd_set_viewport_w_scaling_enable_nv_on(t, h0, a),
+        ID_VK_CMD_SET_VIEWPORT_W_SCALING_NV => vk_cmd_set_viewport_w_scaling_nv_on(t, h0, a),
+        ID_VK_CMD_SET_VIEWPORT_WITH_COUNT => vk_cmd_set_viewport_with_count_on(t, h0, a),
+        ID_VK_CMD_SUBPASS_SHADING_HUAWEI => vk_cmd_subpass_shading_huawei_on(t, h0, a),
+        ID_VK_CMD_TRACE_RAYS_INDIRECT2_KHR => vk_cmd_trace_rays_indirect2_khr_on(t, h0, a),
+        ID_VK_CMD_TRACE_RAYS_INDIRECT_KHR => vk_cmd_trace_rays_indirect_khr_on(t, h0, a),
+        ID_VK_CMD_TRACE_RAYS_KHR => vk_cmd_trace_rays_khr_on(t, h0, a),
+        ID_VK_CMD_TRACE_RAYS_NV => vk_cmd_trace_rays_nv_on(t, h0, a),
+        ID_VK_CMD_UPDATE_BUFFER => vk_cmd_update_buffer_on(t, h0, a),
+        ID_VK_CMD_UPDATE_PIPELINE_INDIRECT_BUFFER_NV => vk_cmd_update_pipeline_indirect_buffer_nv_on(t, h0, a),
+        ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_KHR => vk_cmd_write_acceleration_structures_properties_khr_on(t, h0, a),
+        ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_NV => vk_cmd_write_acceleration_structures_properties_nv_on(t, h0, a),
+        ID_VK_CMD_WRITE_BUFFER_MARKER2_AMD => vk_cmd_write_buffer_marker2_amd_on(t, h0, a),
+        ID_VK_CMD_WRITE_BUFFER_MARKER_AMD => vk_cmd_write_buffer_marker_amd_on(t, h0, a),
+        ID_VK_CMD_WRITE_MICROMAPS_PROPERTIES_EXT => vk_cmd_write_micromaps_properties_ext_on(t, h0, a),
+        ID_VK_CMD_WRITE_TIMESTAMP => vk_cmd_write_timestamp_on(t, h0, a),
+        ID_VK_CMD_WRITE_TIMESTAMP2 => vk_cmd_write_timestamp2_on(t, h0, a),
+        _ => Err(CallError::Args),
+    }
+}
+
 fn vk_acquire_performance_configuration_intel(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkAcquirePerformanceConfigurationINTEL"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -1783,9 +2088,23 @@ fn vk_cmd_begin_query(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError>
     Ok(0)
 }
 
+fn vk_cmd_begin_query_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBeginQuery"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BEGIN_QUERY, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_begin_query_indexed_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBeginQueryIndexedEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BEGIN_QUERY_INDEXED_EXT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32, a[4] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_begin_query_indexed_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBeginQueryIndexedEXT"];
     let f: unsafe extern "system" fn(u64, u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BEGIN_QUERY_INDEXED_EXT, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32, a[3] as u32, a[4] as u32) };
     Ok(0)
@@ -1823,6 +2142,13 @@ fn vk_cmd_begin_transform_feedback_ext(g: &Gpu, p: &Process, a: &[u64]) -> Resul
     Ok(0)
 }
 
+fn vk_cmd_begin_transform_feedback_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBeginTransformFeedbackEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BEGIN_TRANSFORM_FEEDBACK_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4]) };
+    Ok(0)
+}
+
 fn vk_cmd_begin_video_coding_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBeginVideoCodingKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -1847,6 +2173,13 @@ fn vk_cmd_bind_descriptor_buffer_embedded_samplers_ext(g: &Gpu, p: &Process, a: 
     Ok(0)
 }
 
+fn vk_cmd_bind_descriptor_buffer_embedded_samplers_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindDescriptorBufferEmbeddedSamplersEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_DESCRIPTOR_BUFFER_EMBEDDED_SAMPLERS_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_bind_descriptor_buffers_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBindDescriptorBuffersEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -1858,6 +2191,13 @@ fn vk_cmd_bind_descriptor_buffers_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result
 fn vk_cmd_bind_descriptor_sets(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBindDescriptorSets"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64, u32, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_DESCRIPTOR_SETS, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4] as u32, a[5], a[6] as u32, a[7]) };
+    Ok(0)
+}
+
+fn vk_cmd_bind_descriptor_sets_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindDescriptorSets"];
     let f: unsafe extern "system" fn(u64, u32, u64, u32, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_DESCRIPTOR_SETS, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4] as u32, a[5], a[6] as u32, a[7]) };
     Ok(0)
@@ -1879,9 +2219,23 @@ fn vk_cmd_bind_index_buffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, Call
     Ok(0)
 }
 
+fn vk_cmd_bind_index_buffer_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindIndexBuffer"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_INDEX_BUFFER, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_bind_index_buffer2_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBindIndexBuffer2KHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_INDEX_BUFFER2_KHR, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_bind_index_buffer2_khr_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindIndexBuffer2KHR"];
     let f: unsafe extern "system" fn(u64, u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_INDEX_BUFFER2_KHR, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3], a[4] as u32) };
     Ok(0)
@@ -1895,9 +2249,23 @@ fn vk_cmd_bind_invocation_mask_huawei(g: &Gpu, p: &Process, a: &[u64]) -> Result
     Ok(0)
 }
 
+fn vk_cmd_bind_invocation_mask_huawei_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindInvocationMaskHUAWEI"];
+    let f: unsafe extern "system" fn(u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_INVOCATION_MASK_HUAWEI, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_bind_pipeline(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBindPipeline"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_PIPELINE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_bind_pipeline_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindPipeline"];
     let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_PIPELINE, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2]) };
     Ok(0)
@@ -1911,9 +2279,23 @@ fn vk_cmd_bind_pipeline_shader_group_nv(g: &Gpu, p: &Process, a: &[u64]) -> Resu
     Ok(0)
 }
 
+fn vk_cmd_bind_pipeline_shader_group_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindPipelineShaderGroupNV"];
+    let f: unsafe extern "system" fn(u64, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_PIPELINE_SHADER_GROUP_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_bind_shaders_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBindShadersEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_SHADERS_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3]) };
+    Ok(0)
+}
+
+fn vk_cmd_bind_shaders_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindShadersEXT"];
     let f: unsafe extern "system" fn(u64, u32, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_SHADERS_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2], a[3]) };
     Ok(0)
@@ -1927,9 +2309,23 @@ fn vk_cmd_bind_shading_rate_image_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<
     Ok(0)
 }
 
+fn vk_cmd_bind_shading_rate_image_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindShadingRateImageNV"];
+    let f: unsafe extern "system" fn(u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_SHADING_RATE_IMAGE_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_bind_transform_feedback_buffers_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBindTransformFeedbackBuffersEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32, u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_TRANSFORM_FEEDBACK_BUFFERS_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4], a[5]) };
+    Ok(0)
+}
+
+fn vk_cmd_bind_transform_feedback_buffers_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindTransformFeedbackBuffersEXT"];
     let f: unsafe extern "system" fn(u64, u32, u32, u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_TRANSFORM_FEEDBACK_BUFFERS_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4], a[5]) };
     Ok(0)
@@ -1943,6 +2339,13 @@ fn vk_cmd_bind_vertex_buffers(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, Ca
     Ok(0)
 }
 
+fn vk_cmd_bind_vertex_buffers_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindVertexBuffers"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_VERTEX_BUFFERS, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4]) };
+    Ok(0)
+}
+
 fn vk_cmd_bind_vertex_buffers2(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBindVertexBuffers2", c"vkCmdBindVertexBuffers2EXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -1951,9 +2354,23 @@ fn vk_cmd_bind_vertex_buffers2(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, C
     Ok(0)
 }
 
+fn vk_cmd_bind_vertex_buffers2_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBindVertexBuffers2", c"vkCmdBindVertexBuffers2EXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64, u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BIND_VERTEX_BUFFERS2, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4], a[5], a[6]) };
+    Ok(0)
+}
+
 fn vk_cmd_blit_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdBlitImage"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BLIT_IMAGE, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5] as u32, a[6], a[7] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_blit_image_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdBlitImage"];
     let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_BLIT_IMAGE, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5] as u32, a[6], a[7] as u32) };
     Ok(0)
@@ -2007,6 +2424,13 @@ fn vk_cmd_clear_attachments(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, Call
     Ok(0)
 }
 
+fn vk_cmd_clear_attachments_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdClearAttachments"];
+    let f: unsafe extern "system" fn(u64, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_CLEAR_ATTACHMENTS, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4]) };
+    Ok(0)
+}
+
 fn vk_cmd_clear_color_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdClearColorImage"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2015,9 +2439,23 @@ fn vk_cmd_clear_color_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, Call
     Ok(0)
 }
 
+fn vk_cmd_clear_color_image_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdClearColorImage"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_CLEAR_COLOR_IMAGE, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5]) };
+    Ok(0)
+}
+
 fn vk_cmd_clear_depth_stencil_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdClearDepthStencilImage"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5]) };
+    Ok(0)
+}
+
+fn vk_cmd_clear_depth_stencil_image_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdClearDepthStencilImage"];
     let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_CLEAR_DEPTH_STENCIL_IMAGE, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5]) };
     Ok(0)
@@ -2047,6 +2485,13 @@ fn vk_cmd_copy_acceleration_structure_nv(g: &Gpu, p: &Process, a: &[u64]) -> Res
     Ok(0)
 }
 
+fn vk_cmd_copy_acceleration_structure_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyAccelerationStructureNV"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_ACCELERATION_STRUCTURE_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_copy_acceleration_structure_to_memory_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCopyAccelerationStructureToMemoryKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2058,6 +2503,13 @@ fn vk_cmd_copy_acceleration_structure_to_memory_khr(g: &Gpu, p: &Process, a: &[u
 fn vk_cmd_copy_buffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCopyBuffer"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_BUFFER, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32, a[4]) };
+    Ok(0)
+}
+
+fn vk_cmd_copy_buffer_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyBuffer"];
     let f: unsafe extern "system" fn(u64, u64, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_BUFFER, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3] as u32, a[4]) };
     Ok(0)
@@ -2079,6 +2531,13 @@ fn vk_cmd_copy_buffer_to_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, C
     Ok(0)
 }
 
+fn vk_cmd_copy_buffer_to_image_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyBufferToImage"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_BUFFER_TO_IMAGE, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32, a[5]) };
+    Ok(0)
+}
+
 fn vk_cmd_copy_buffer_to_image2(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCopyBufferToImage2", c"vkCmdCopyBufferToImage2KHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2090,6 +2549,13 @@ fn vk_cmd_copy_buffer_to_image2(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, 
 fn vk_cmd_copy_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCopyImage"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_IMAGE, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5] as u32, a[6]) };
+    Ok(0)
+}
+
+fn vk_cmd_copy_image_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyImage"];
     let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_IMAGE, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5] as u32, a[6]) };
     Ok(0)
@@ -2111,6 +2577,13 @@ fn vk_cmd_copy_image_to_buffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, C
     Ok(0)
 }
 
+fn vk_cmd_copy_image_to_buffer_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyImageToBuffer"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_IMAGE_TO_BUFFER, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5]) };
+    Ok(0)
+}
+
 fn vk_cmd_copy_image_to_buffer2(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCopyImageToBuffer2", c"vkCmdCopyImageToBuffer2KHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2127,6 +2600,13 @@ fn vk_cmd_copy_memory_indirect_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64
     Ok(0)
 }
 
+fn vk_cmd_copy_memory_indirect_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyMemoryIndirectNV"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_MEMORY_INDIRECT_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_copy_memory_to_acceleration_structure_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCopyMemoryToAccelerationStructureKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2138,6 +2618,13 @@ fn vk_cmd_copy_memory_to_acceleration_structure_khr(g: &Gpu, p: &Process, a: &[u
 fn vk_cmd_copy_memory_to_image_indirect_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCopyMemoryToImageIndirectNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_MEMORY_TO_IMAGE_INDIRECT_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32, a[4], a[5] as u32, a[6]) };
+    Ok(0)
+}
+
+fn vk_cmd_copy_memory_to_image_indirect_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyMemoryToImageIndirectNV"];
     let f: unsafe extern "system" fn(u64, u64, u32, u32, u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_MEMORY_TO_IMAGE_INDIRECT_NV, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32, a[3] as u32, a[4], a[5] as u32, a[6]) };
     Ok(0)
@@ -2175,6 +2662,13 @@ fn vk_cmd_copy_query_pool_results(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64
     Ok(0)
 }
 
+fn vk_cmd_copy_query_pool_results_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdCopyQueryPoolResults"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u32, u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_COPY_QUERY_POOL_RESULTS, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32, a[4], a[5], a[6], a[7] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_cu_launch_kernel_nvx(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdCuLaunchKernelNVX"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2199,9 +2693,23 @@ fn vk_cmd_decompress_memory_indirect_count_nv(g: &Gpu, p: &Process, a: &[u64]) -
     Ok(0)
 }
 
+fn vk_cmd_decompress_memory_indirect_count_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDecompressMemoryIndirectCountNV"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DECOMPRESS_MEMORY_INDIRECT_COUNT_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_decompress_memory_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDecompressMemoryNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DECOMPRESS_MEMORY_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_decompress_memory_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDecompressMemoryNV"];
     let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DECOMPRESS_MEMORY_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2]) };
     Ok(0)
@@ -2215,9 +2723,23 @@ fn vk_cmd_dispatch(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     Ok(0)
 }
 
+fn vk_cmd_dispatch_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDispatch"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DISPATCH, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_dispatch_base(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDispatchBase", c"vkCmdDispatchBaseKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32, u32, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DISPATCH_BASE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32, a[5] as u32, a[6] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_dispatch_base_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDispatchBase", c"vkCmdDispatchBaseKHR"];
     let f: unsafe extern "system" fn(u64, u32, u32, u32, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DISPATCH_BASE, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32, a[5] as u32, a[6] as u32) };
     Ok(0)
@@ -2231,9 +2753,23 @@ fn vk_cmd_dispatch_indirect(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, Call
     Ok(0)
 }
 
+fn vk_cmd_dispatch_indirect_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDispatchIndirect"];
+    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DISPATCH_INDIRECT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2]) };
+    Ok(0)
+}
+
 fn vk_cmd_draw(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDraw"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDraw"];
     let f: unsafe extern "system" fn(u64, u32, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32) };
     Ok(0)
@@ -2247,9 +2783,23 @@ fn vk_cmd_draw_cluster_huawei(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, Ca
     Ok(0)
 }
 
+fn vk_cmd_draw_cluster_huawei_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawClusterHUAWEI"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_CLUSTER_HUAWEI, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_draw_cluster_indirect_huawei(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDrawClusterIndirectHUAWEI"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_CLUSTER_INDIRECT_HUAWEI, NAMES)?) };
+    unsafe { f(h0, a[1], a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_cluster_indirect_huawei_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawClusterIndirectHUAWEI"];
     let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_CLUSTER_INDIRECT_HUAWEI, NAMES)?) };
     unsafe { f(h0, a[1], a[2]) };
     Ok(0)
@@ -2263,9 +2813,23 @@ fn vk_cmd_draw_indexed(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError
     Ok(0)
 }
 
+fn vk_cmd_draw_indexed_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawIndexed"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u32, i32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDEXED, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32 as i32, a[5] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_draw_indexed_indirect(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDrawIndexedIndirect"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDEXED_INDIRECT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_indexed_indirect_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawIndexedIndirect"];
     let f: unsafe extern "system" fn(u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDEXED_INDIRECT, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32) };
     Ok(0)
@@ -2279,9 +2843,23 @@ fn vk_cmd_draw_indexed_indirect_count(g: &Gpu, p: &Process, a: &[u64]) -> Result
     Ok(0)
 }
 
+fn vk_cmd_draw_indexed_indirect_count_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawIndexedIndirectCount", c"vkCmdDrawIndexedIndirectCountAMD", c"vkCmdDrawIndexedIndirectCountKHR"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDEXED_INDIRECT_COUNT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_draw_indirect(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDrawIndirect"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDIRECT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_indirect_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawIndirect"];
     let f: unsafe extern "system" fn(u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDIRECT, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32) };
     Ok(0)
@@ -2295,9 +2873,23 @@ fn vk_cmd_draw_indirect_byte_count_ext(g: &Gpu, p: &Process, a: &[u64]) -> Resul
     Ok(0)
 }
 
+fn vk_cmd_draw_indirect_byte_count_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawIndirectByteCountEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDIRECT_BYTE_COUNT_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32, a[6] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_draw_indirect_count(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDrawIndirectCount", c"vkCmdDrawIndirectCountAMD", c"vkCmdDrawIndirectCountKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDIRECT_COUNT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_indirect_count_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawIndirectCount", c"vkCmdDrawIndirectCountAMD", c"vkCmdDrawIndirectCountKHR"];
     let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_INDIRECT_COUNT, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32) };
     Ok(0)
@@ -2311,9 +2903,23 @@ fn vk_cmd_draw_mesh_tasks_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, Ca
     Ok(0)
 }
 
+fn vk_cmd_draw_mesh_tasks_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_draw_mesh_tasks_indirect_count_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksIndirectCountEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_EXT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_mesh_tasks_indirect_count_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksIndirectCountEXT"];
     let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_EXT, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32) };
     Ok(0)
@@ -2327,9 +2933,23 @@ fn vk_cmd_draw_mesh_tasks_indirect_count_nv(g: &Gpu, p: &Process, a: &[u64]) -> 
     Ok(0)
 }
 
+fn vk_cmd_draw_mesh_tasks_indirect_count_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksIndirectCountNV"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_COUNT_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_draw_mesh_tasks_indirect_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksIndirectEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_EXT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_mesh_tasks_indirect_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksIndirectEXT"];
     let f: unsafe extern "system" fn(u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_EXT, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32) };
     Ok(0)
@@ -2343,9 +2963,23 @@ fn vk_cmd_draw_mesh_tasks_indirect_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result
     Ok(0)
 }
 
+fn vk_cmd_draw_mesh_tasks_indirect_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksIndirectNV"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_INDIRECT_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32, a[4] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_draw_mesh_tasks_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_draw_mesh_tasks_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdDrawMeshTasksNV"];
     let f: unsafe extern "system" fn(u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_DRAW_MESH_TASKS_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32) };
     Ok(0)
@@ -2383,9 +3017,23 @@ fn vk_cmd_end_conditional_rendering_ext(g: &Gpu, p: &Process, a: &[u64]) -> Resu
     Ok(0)
 }
 
+fn vk_cmd_end_conditional_rendering_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdEndConditionalRenderingEXT"];
+    let f: unsafe extern "system" fn(u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_CONDITIONAL_RENDERING_EXT, NAMES)?) };
+    unsafe { f(h0) };
+    Ok(0)
+}
+
 fn vk_cmd_end_query(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdEndQuery"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_QUERY, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_end_query_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdEndQuery"];
     let f: unsafe extern "system" fn(u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_QUERY, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32) };
     Ok(0)
@@ -2399,9 +3047,23 @@ fn vk_cmd_end_query_indexed_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, 
     Ok(0)
 }
 
+fn vk_cmd_end_query_indexed_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdEndQueryIndexedEXT"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_QUERY_INDEXED_EXT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_end_render_pass(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdEndRenderPass"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_RENDER_PASS, NAMES)?) };
+    unsafe { f(h0) };
+    Ok(0)
+}
+
+fn vk_cmd_end_render_pass_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdEndRenderPass"];
     let f: unsafe extern "system" fn(u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_RENDER_PASS, NAMES)?) };
     unsafe { f(h0) };
     Ok(0)
@@ -2423,9 +3085,23 @@ fn vk_cmd_end_rendering(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallErro
     Ok(0)
 }
 
+fn vk_cmd_end_rendering_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdEndRendering", c"vkCmdEndRenderingKHR"];
+    let f: unsafe extern "system" fn(u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_RENDERING, NAMES)?) };
+    unsafe { f(h0) };
+    Ok(0)
+}
+
 fn vk_cmd_end_transform_feedback_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdEndTransformFeedbackEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_TRANSFORM_FEEDBACK_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4]) };
+    Ok(0)
+}
+
+fn vk_cmd_end_transform_feedback_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdEndTransformFeedbackEXT"];
     let f: unsafe extern "system" fn(u64, u32, u32, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_END_TRANSFORM_FEEDBACK_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32, a[3], a[4]) };
     Ok(0)
@@ -2455,9 +3131,23 @@ fn vk_cmd_fill_buffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError>
     Ok(0)
 }
 
+fn vk_cmd_fill_buffer_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdFillBuffer"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_FILL_BUFFER, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_next_subpass(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdNextSubpass"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_NEXT_SUBPASS, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_next_subpass_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdNextSubpass"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_NEXT_SUBPASS, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2511,6 +3201,13 @@ fn vk_cmd_push_constants(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallErr
     Ok(0)
 }
 
+fn vk_cmd_push_constants_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdPushConstants"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_PUSH_CONSTANTS, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32, a[4] as u32, a[5]) };
+    Ok(0)
+}
+
 fn vk_cmd_push_constants2_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdPushConstants2KHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2559,9 +3256,23 @@ fn vk_cmd_reset_event(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError>
     Ok(0)
 }
 
+fn vk_cmd_reset_event_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdResetEvent"];
+    let f: unsafe extern "system" fn(u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_RESET_EVENT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_reset_event2(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdResetEvent2", c"vkCmdResetEvent2KHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_RESET_EVENT2, NAMES)?) };
+    unsafe { f(h0, a[1], a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_reset_event2_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdResetEvent2", c"vkCmdResetEvent2KHR"];
     let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_RESET_EVENT2, NAMES)?) };
     unsafe { f(h0, a[1], a[2]) };
     Ok(0)
@@ -2575,9 +3286,23 @@ fn vk_cmd_reset_query_pool(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallE
     Ok(0)
 }
 
+fn vk_cmd_reset_query_pool_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdResetQueryPool"];
+    let f: unsafe extern "system" fn(u64, u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_RESET_QUERY_POOL, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_resolve_image(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdResolveImage"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_RESOLVE_IMAGE, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5] as u32, a[6]) };
+    Ok(0)
+}
+
+fn vk_cmd_resolve_image_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdResolveImage"];
     let f: unsafe extern "system" fn(u64, u64, u32, u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_RESOLVE_IMAGE, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32, a[3], a[4] as u32, a[5] as u32, a[6]) };
     Ok(0)
@@ -2599,9 +3324,23 @@ fn vk_cmd_set_alpha_to_coverage_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> R
     Ok(0)
 }
 
+fn vk_cmd_set_alpha_to_coverage_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetAlphaToCoverageEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_ALPHA_TO_COVERAGE_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_alpha_to_one_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetAlphaToOneEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_ALPHA_TO_ONE_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_alpha_to_one_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetAlphaToOneEnableEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_ALPHA_TO_ONE_ENABLE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2615,9 +3354,23 @@ fn vk_cmd_set_attachment_feedback_loop_enable_ext(g: &Gpu, p: &Process, a: &[u64
     Ok(0)
 }
 
+fn vk_cmd_set_attachment_feedback_loop_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetAttachmentFeedbackLoopEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_blend_constants(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetBlendConstants"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_BLEND_CONSTANTS, NAMES)?) };
+    unsafe { f(h0, a[1]) };
+    Ok(0)
+}
+
+fn vk_cmd_set_blend_constants_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetBlendConstants"];
     let f: unsafe extern "system" fn(u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_BLEND_CONSTANTS, NAMES)?) };
     unsafe { f(h0, a[1]) };
     Ok(0)
@@ -2647,9 +3400,23 @@ fn vk_cmd_set_color_blend_advanced_ext(g: &Gpu, p: &Process, a: &[u64]) -> Resul
     Ok(0)
 }
 
+fn vk_cmd_set_color_blend_advanced_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetColorBlendAdvancedEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COLOR_BLEND_ADVANCED_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_color_blend_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetColorBlendEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COLOR_BLEND_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
+fn vk_cmd_set_color_blend_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetColorBlendEnableEXT"];
     let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COLOR_BLEND_ENABLE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
     Ok(0)
@@ -2663,9 +3430,23 @@ fn vk_cmd_set_color_blend_equation_ext(g: &Gpu, p: &Process, a: &[u64]) -> Resul
     Ok(0)
 }
 
+fn vk_cmd_set_color_blend_equation_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetColorBlendEquationEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COLOR_BLEND_EQUATION_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_color_write_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetColorWriteEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COLOR_WRITE_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_set_color_write_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetColorWriteEnableEXT"];
     let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COLOR_WRITE_ENABLE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2]) };
     Ok(0)
@@ -2679,9 +3460,23 @@ fn vk_cmd_set_color_write_mask_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u6
     Ok(0)
 }
 
+fn vk_cmd_set_color_write_mask_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetColorWriteMaskEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COLOR_WRITE_MASK_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_conservative_rasterization_mode_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetConservativeRasterizationModeEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_CONSERVATIVE_RASTERIZATION_MODE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_conservative_rasterization_mode_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetConservativeRasterizationModeEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_CONSERVATIVE_RASTERIZATION_MODE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2695,9 +3490,23 @@ fn vk_cmd_set_coverage_modulation_mode_nv(g: &Gpu, p: &Process, a: &[u64]) -> Re
     Ok(0)
 }
 
+fn vk_cmd_set_coverage_modulation_mode_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetCoverageModulationModeNV"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_MODULATION_MODE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_coverage_modulation_table_enable_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetCoverageModulationTableEnableNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_ENABLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_coverage_modulation_table_enable_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetCoverageModulationTableEnableNV"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_ENABLE_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2711,9 +3520,23 @@ fn vk_cmd_set_coverage_modulation_table_nv(g: &Gpu, p: &Process, a: &[u64]) -> R
     Ok(0)
 }
 
+fn vk_cmd_set_coverage_modulation_table_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetCoverageModulationTableNV"];
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_MODULATION_TABLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_coverage_reduction_mode_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetCoverageReductionModeNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_REDUCTION_MODE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_coverage_reduction_mode_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetCoverageReductionModeNV"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_REDUCTION_MODE_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2727,9 +3550,23 @@ fn vk_cmd_set_coverage_to_color_enable_nv(g: &Gpu, p: &Process, a: &[u64]) -> Re
     Ok(0)
 }
 
+fn vk_cmd_set_coverage_to_color_enable_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetCoverageToColorEnableNV"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_TO_COLOR_ENABLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_coverage_to_color_location_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetCoverageToColorLocationNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_TO_COLOR_LOCATION_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_coverage_to_color_location_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetCoverageToColorLocationNV"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_COVERAGE_TO_COLOR_LOCATION_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2743,9 +3580,23 @@ fn vk_cmd_set_cull_mode(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallErro
     Ok(0)
 }
 
+fn vk_cmd_set_cull_mode_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetCullMode", c"vkCmdSetCullModeEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_CULL_MODE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_depth_bias(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDepthBias"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, f32, f32, f32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_BIAS, NAMES)?) };
+    unsafe { f(h0, f32::from_bits(a[1] as u32), f32::from_bits(a[2] as u32), f32::from_bits(a[3] as u32)) };
+    Ok(0)
+}
+
+fn vk_cmd_set_depth_bias_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthBias"];
     let f: unsafe extern "system" fn(u64, f32, f32, f32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_BIAS, NAMES)?) };
     unsafe { f(h0, f32::from_bits(a[1] as u32), f32::from_bits(a[2] as u32), f32::from_bits(a[3] as u32)) };
     Ok(0)
@@ -2767,9 +3618,23 @@ fn vk_cmd_set_depth_bias_enable(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, 
     Ok(0)
 }
 
+fn vk_cmd_set_depth_bias_enable_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthBiasEnable", c"vkCmdSetDepthBiasEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_BIAS_ENABLE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_depth_bounds(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDepthBounds"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, f32, f32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_BOUNDS, NAMES)?) };
+    unsafe { f(h0, f32::from_bits(a[1] as u32), f32::from_bits(a[2] as u32)) };
+    Ok(0)
+}
+
+fn vk_cmd_set_depth_bounds_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthBounds"];
     let f: unsafe extern "system" fn(u64, f32, f32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_BOUNDS, NAMES)?) };
     unsafe { f(h0, f32::from_bits(a[1] as u32), f32::from_bits(a[2] as u32)) };
     Ok(0)
@@ -2783,9 +3648,23 @@ fn vk_cmd_set_depth_bounds_test_enable(g: &Gpu, p: &Process, a: &[u64]) -> Resul
     Ok(0)
 }
 
+fn vk_cmd_set_depth_bounds_test_enable_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthBoundsTestEnable", c"vkCmdSetDepthBoundsTestEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_BOUNDS_TEST_ENABLE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_depth_clamp_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDepthClampEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_CLAMP_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_depth_clamp_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthClampEnableEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_CLAMP_ENABLE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2799,9 +3678,23 @@ fn vk_cmd_set_depth_clip_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u
     Ok(0)
 }
 
+fn vk_cmd_set_depth_clip_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthClipEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_CLIP_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_depth_clip_negative_one_to_one_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDepthClipNegativeOneToOneEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_depth_clip_negative_one_to_one_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthClipNegativeOneToOneEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2815,6 +3708,13 @@ fn vk_cmd_set_depth_compare_op(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, C
     Ok(0)
 }
 
+fn vk_cmd_set_depth_compare_op_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthCompareOp", c"vkCmdSetDepthCompareOpEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_COMPARE_OP, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_depth_test_enable(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDepthTestEnable", c"vkCmdSetDepthTestEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2823,9 +3723,23 @@ fn vk_cmd_set_depth_test_enable(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, 
     Ok(0)
 }
 
+fn vk_cmd_set_depth_test_enable_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthTestEnable", c"vkCmdSetDepthTestEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_TEST_ENABLE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_depth_write_enable(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDepthWriteEnable", c"vkCmdSetDepthWriteEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_WRITE_ENABLE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_depth_write_enable_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDepthWriteEnable", c"vkCmdSetDepthWriteEnableEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEPTH_WRITE_ENABLE, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2847,9 +3761,23 @@ fn vk_cmd_set_descriptor_buffer_offsets_ext(g: &Gpu, p: &Process, a: &[u64]) -> 
     Ok(0)
 }
 
+fn vk_cmd_set_descriptor_buffer_offsets_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDescriptorBufferOffsetsEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u64, u32, u32, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DESCRIPTOR_BUFFER_OFFSETS_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4] as u32, a[5], a[6]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_device_mask(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDeviceMask", c"vkCmdSetDeviceMaskKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEVICE_MASK, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_device_mask_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDeviceMask", c"vkCmdSetDeviceMaskKHR"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DEVICE_MASK, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2863,9 +3791,23 @@ fn vk_cmd_set_discard_rectangle_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u
     Ok(0)
 }
 
+fn vk_cmd_set_discard_rectangle_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDiscardRectangleEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DISCARD_RECTANGLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_discard_rectangle_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetDiscardRectangleEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DISCARD_RECTANGLE_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_discard_rectangle_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDiscardRectangleEnableEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DISCARD_RECTANGLE_ENABLE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2879,9 +3821,23 @@ fn vk_cmd_set_discard_rectangle_mode_ext(g: &Gpu, p: &Process, a: &[u64]) -> Res
     Ok(0)
 }
 
+fn vk_cmd_set_discard_rectangle_mode_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetDiscardRectangleModeEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_DISCARD_RECTANGLE_MODE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_event(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetEvent"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_EVENT, NAMES)?) };
+    unsafe { f(h0, a[1], a[2] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_event_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetEvent"];
     let f: unsafe extern "system" fn(u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_EVENT, NAMES)?) };
     unsafe { f(h0, a[1], a[2] as u32) };
     Ok(0)
@@ -2903,9 +3859,23 @@ fn vk_cmd_set_exclusive_scissor_enable_nv(g: &Gpu, p: &Process, a: &[u64]) -> Re
     Ok(0)
 }
 
+fn vk_cmd_set_exclusive_scissor_enable_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetExclusiveScissorEnableNV"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_ENABLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_exclusive_scissor_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetExclusiveScissorNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
+fn vk_cmd_set_exclusive_scissor_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetExclusiveScissorNV"];
     let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_EXCLUSIVE_SCISSOR_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
     Ok(0)
@@ -2919,9 +3889,23 @@ fn vk_cmd_set_extra_primitive_overestimation_size_ext(g: &Gpu, p: &Process, a: &
     Ok(0)
 }
 
+fn vk_cmd_set_extra_primitive_overestimation_size_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetExtraPrimitiveOverestimationSizeEXT"];
+    let f: unsafe extern "system" fn(u64, f32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT, NAMES)?) };
+    unsafe { f(h0, f32::from_bits(a[1] as u32)) };
+    Ok(0)
+}
+
 fn vk_cmd_set_fragment_shading_rate_enum_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetFragmentShadingRateEnumNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_ENUM_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_set_fragment_shading_rate_enum_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetFragmentShadingRateEnumNV"];
     let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_ENUM_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2]) };
     Ok(0)
@@ -2935,9 +3919,23 @@ fn vk_cmd_set_fragment_shading_rate_khr(g: &Gpu, p: &Process, a: &[u64]) -> Resu
     Ok(0)
 }
 
+fn vk_cmd_set_fragment_shading_rate_khr_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetFragmentShadingRateKHR"];
+    let f: unsafe extern "system" fn(u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_FRAGMENT_SHADING_RATE_KHR, NAMES)?) };
+    unsafe { f(h0, a[1], a[2]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_front_face(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetFrontFace", c"vkCmdSetFrontFaceEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_FRONT_FACE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_front_face_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetFrontFace", c"vkCmdSetFrontFaceEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_FRONT_FACE, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -2951,9 +3949,23 @@ fn vk_cmd_set_line_rasterization_mode_ext(g: &Gpu, p: &Process, a: &[u64]) -> Re
     Ok(0)
 }
 
+fn vk_cmd_set_line_rasterization_mode_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetLineRasterizationModeEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LINE_RASTERIZATION_MODE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_line_stipple_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetLineStippleEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u16) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LINE_STIPPLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u16) };
+    Ok(0)
+}
+
+fn vk_cmd_set_line_stipple_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetLineStippleEXT"];
     let f: unsafe extern "system" fn(u64, u32, u16) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LINE_STIPPLE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u16) };
     Ok(0)
@@ -2967,9 +3979,23 @@ fn vk_cmd_set_line_stipple_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result
     Ok(0)
 }
 
+fn vk_cmd_set_line_stipple_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetLineStippleEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LINE_STIPPLE_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_line_width(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetLineWidth"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, f32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LINE_WIDTH, NAMES)?) };
+    unsafe { f(h0, f32::from_bits(a[1] as u32)) };
+    Ok(0)
+}
+
+fn vk_cmd_set_line_width_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetLineWidth"];
     let f: unsafe extern "system" fn(u64, f32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LINE_WIDTH, NAMES)?) };
     unsafe { f(h0, f32::from_bits(a[1] as u32)) };
     Ok(0)
@@ -2983,6 +4009,13 @@ fn vk_cmd_set_logic_op_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallE
     Ok(0)
 }
 
+fn vk_cmd_set_logic_op_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetLogicOpEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LOGIC_OP_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_logic_op_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetLogicOpEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -2991,9 +4024,23 @@ fn vk_cmd_set_logic_op_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64
     Ok(0)
 }
 
+fn vk_cmd_set_logic_op_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetLogicOpEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_LOGIC_OP_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_patch_control_points_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetPatchControlPointsEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_PATCH_CONTROL_POINTS_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_patch_control_points_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetPatchControlPointsEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_PATCH_CONTROL_POINTS_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -3031,9 +4078,23 @@ fn vk_cmd_set_polygon_mode_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, C
     Ok(0)
 }
 
+fn vk_cmd_set_polygon_mode_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetPolygonModeEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_POLYGON_MODE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_primitive_restart_enable(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetPrimitiveRestartEnable", c"vkCmdSetPrimitiveRestartEnableEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_primitive_restart_enable_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetPrimitiveRestartEnable", c"vkCmdSetPrimitiveRestartEnableEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_PRIMITIVE_RESTART_ENABLE, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -3047,9 +4108,23 @@ fn vk_cmd_set_primitive_topology(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64,
     Ok(0)
 }
 
+fn vk_cmd_set_primitive_topology_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetPrimitiveTopology", c"vkCmdSetPrimitiveTopologyEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_PRIMITIVE_TOPOLOGY, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_provoking_vertex_mode_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetProvokingVertexModeEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_PROVOKING_VERTEX_MODE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_provoking_vertex_mode_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetProvokingVertexModeEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_PROVOKING_VERTEX_MODE_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -3063,9 +4138,23 @@ fn vk_cmd_set_rasterization_samples_ext(g: &Gpu, p: &Process, a: &[u64]) -> Resu
     Ok(0)
 }
 
+fn vk_cmd_set_rasterization_samples_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetRasterizationSamplesEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_RASTERIZATION_SAMPLES_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_rasterization_stream_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetRasterizationStreamEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_RASTERIZATION_STREAM_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_rasterization_stream_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetRasterizationStreamEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_RASTERIZATION_STREAM_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -3079,6 +4168,13 @@ fn vk_cmd_set_rasterizer_discard_enable(g: &Gpu, p: &Process, a: &[u64]) -> Resu
     Ok(0)
 }
 
+fn vk_cmd_set_rasterizer_discard_enable_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetRasterizerDiscardEnable", c"vkCmdSetRasterizerDiscardEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_RASTERIZER_DISCARD_ENABLE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_ray_tracing_pipeline_stack_size_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetRayTracingPipelineStackSizeKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -3087,9 +4183,23 @@ fn vk_cmd_set_ray_tracing_pipeline_stack_size_khr(g: &Gpu, p: &Process, a: &[u64
     Ok(0)
 }
 
+fn vk_cmd_set_ray_tracing_pipeline_stack_size_khr_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetRayTracingPipelineStackSizeKHR"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_RAY_TRACING_PIPELINE_STACK_SIZE_KHR, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_representative_fragment_test_enable_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetRepresentativeFragmentTestEnableNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_REPRESENTATIVE_FRAGMENT_TEST_ENABLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_representative_fragment_test_enable_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetRepresentativeFragmentTestEnableNV"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_REPRESENTATIVE_FRAGMENT_TEST_ENABLE_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -3111,6 +4221,13 @@ fn vk_cmd_set_sample_locations_enable_ext(g: &Gpu, p: &Process, a: &[u64]) -> Re
     Ok(0)
 }
 
+fn vk_cmd_set_sample_locations_enable_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetSampleLocationsEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_SAMPLE_LOCATIONS_ENABLE_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_sample_mask_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetSampleMaskEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -3127,9 +4244,23 @@ fn vk_cmd_set_scissor(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError>
     Ok(0)
 }
 
+fn vk_cmd_set_scissor_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetScissor"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_SCISSOR, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_scissor_with_count(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetScissorWithCount", c"vkCmdSetScissorWithCountEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_SCISSOR_WITH_COUNT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_set_scissor_with_count_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetScissorWithCount", c"vkCmdSetScissorWithCountEXT"];
     let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_SCISSOR_WITH_COUNT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2]) };
     Ok(0)
@@ -3143,9 +4274,23 @@ fn vk_cmd_set_shading_rate_image_enable_nv(g: &Gpu, p: &Process, a: &[u64]) -> R
     Ok(0)
 }
 
+fn vk_cmd_set_shading_rate_image_enable_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetShadingRateImageEnableNV"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_SHADING_RATE_IMAGE_ENABLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_stencil_compare_mask(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetStencilCompareMask"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_STENCIL_COMPARE_MASK, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_stencil_compare_mask_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetStencilCompareMask"];
     let f: unsafe extern "system" fn(u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_STENCIL_COMPARE_MASK, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32) };
     Ok(0)
@@ -3159,9 +4304,23 @@ fn vk_cmd_set_stencil_op(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallErr
     Ok(0)
 }
 
+fn vk_cmd_set_stencil_op_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetStencilOp", c"vkCmdSetStencilOpEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_STENCIL_OP, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32, a[5] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_stencil_reference(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetStencilReference"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_STENCIL_REFERENCE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_stencil_reference_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetStencilReference"];
     let f: unsafe extern "system" fn(u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_STENCIL_REFERENCE, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2] as u32) };
     Ok(0)
@@ -3175,6 +4334,13 @@ fn vk_cmd_set_stencil_test_enable(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64
     Ok(0)
 }
 
+fn vk_cmd_set_stencil_test_enable_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetStencilTestEnable", c"vkCmdSetStencilTestEnableEXT"];
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_STENCIL_TEST_ENABLE, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_stencil_write_mask(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetStencilWriteMask"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -3183,9 +4349,23 @@ fn vk_cmd_set_stencil_write_mask(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64,
     Ok(0)
 }
 
+fn vk_cmd_set_stencil_write_mask_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetStencilWriteMask"];
+    let f: unsafe extern "system" fn(u64, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_STENCIL_WRITE_MASK, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_set_tessellation_domain_origin_ext(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetTessellationDomainOriginEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_TESSELLATION_DOMAIN_ORIGIN_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_tessellation_domain_origin_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetTessellationDomainOriginEXT"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_TESSELLATION_DOMAIN_ORIGIN_EXT, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -3207,6 +4387,13 @@ fn vk_cmd_set_viewport(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError
     Ok(0)
 }
 
+fn vk_cmd_set_viewport_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetViewport"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_VIEWPORT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_viewport_shading_rate_palette_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetViewportShadingRatePaletteNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -3223,9 +4410,23 @@ fn vk_cmd_set_viewport_swizzle_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64
     Ok(0)
 }
 
+fn vk_cmd_set_viewport_swizzle_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetViewportSwizzleNV"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_VIEWPORT_SWIZZLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_viewport_w_scaling_enable_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetViewportWScalingEnableNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_VIEWPORT_W_SCALING_ENABLE_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_set_viewport_w_scaling_enable_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetViewportWScalingEnableNV"];
     let f: unsafe extern "system" fn(u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_VIEWPORT_W_SCALING_ENABLE_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32) };
     Ok(0)
@@ -3239,9 +4440,23 @@ fn vk_cmd_set_viewport_w_scaling_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u
     Ok(0)
 }
 
+fn vk_cmd_set_viewport_w_scaling_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetViewportWScalingNV"];
+    let f: unsafe extern "system" fn(u64, u32, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_VIEWPORT_W_SCALING_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2] as u32, a[3]) };
+    Ok(0)
+}
+
 fn vk_cmd_set_viewport_with_count(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdSetViewportWithCount", c"vkCmdSetViewportWithCountEXT"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_VIEWPORT_WITH_COUNT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_set_viewport_with_count_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSetViewportWithCount", c"vkCmdSetViewportWithCountEXT"];
     let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SET_VIEWPORT_WITH_COUNT, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2]) };
     Ok(0)
@@ -3255,9 +4470,23 @@ fn vk_cmd_subpass_shading_huawei(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64,
     Ok(0)
 }
 
+fn vk_cmd_subpass_shading_huawei_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdSubpassShadingHUAWEI"];
+    let f: unsafe extern "system" fn(u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_SUBPASS_SHADING_HUAWEI, NAMES)?) };
+    unsafe { f(h0) };
+    Ok(0)
+}
+
 fn vk_cmd_trace_rays_indirect2_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdTraceRaysIndirect2KHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_TRACE_RAYS_INDIRECT2_KHR, NAMES)?) };
+    unsafe { f(h0, a[1]) };
+    Ok(0)
+}
+
+fn vk_cmd_trace_rays_indirect2_khr_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdTraceRaysIndirect2KHR"];
     let f: unsafe extern "system" fn(u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_TRACE_RAYS_INDIRECT2_KHR, NAMES)?) };
     unsafe { f(h0, a[1]) };
     Ok(0)
@@ -3271,9 +4500,23 @@ fn vk_cmd_trace_rays_indirect_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64
     Ok(0)
 }
 
+fn vk_cmd_trace_rays_indirect_khr_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdTraceRaysIndirectKHR"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_TRACE_RAYS_INDIRECT_KHR, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4], a[5]) };
+    Ok(0)
+}
+
 fn vk_cmd_trace_rays_khr(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdTraceRaysKHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_TRACE_RAYS_KHR, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32, a[7] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_trace_rays_khr_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdTraceRaysKHR"];
     let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_TRACE_RAYS_KHR, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32, a[7] as u32) };
     Ok(0)
@@ -3287,6 +4530,13 @@ fn vk_cmd_trace_rays_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallErro
     Ok(0)
 }
 
+fn vk_cmd_trace_rays_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdTraceRaysNV"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u32, u32, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_TRACE_RAYS_NV, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12] as u32, a[13] as u32, a[14] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_update_buffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdUpdateBuffer"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -3295,9 +4545,23 @@ fn vk_cmd_update_buffer(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallErro
     Ok(0)
 }
 
+fn vk_cmd_update_buffer_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdUpdateBuffer"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_UPDATE_BUFFER, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4]) };
+    Ok(0)
+}
+
 fn vk_cmd_update_pipeline_indirect_buffer_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdUpdatePipelineIndirectBufferNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_UPDATE_PIPELINE_INDIRECT_BUFFER_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2]) };
+    Ok(0)
+}
+
+fn vk_cmd_update_pipeline_indirect_buffer_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdUpdatePipelineIndirectBufferNV"];
     let f: unsafe extern "system" fn(u64, u32, u64) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_UPDATE_PIPELINE_INDIRECT_BUFFER_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2]) };
     Ok(0)
@@ -3327,9 +4591,23 @@ fn vk_cmd_write_acceleration_structures_properties_khr(g: &Gpu, p: &Process, a: 
     Ok(0)
 }
 
+fn vk_cmd_write_acceleration_structures_properties_khr_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdWriteAccelerationStructuresPropertiesKHR"];
+    let f: unsafe extern "system" fn(u64, u32, u64, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_KHR, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4], a[5] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_write_acceleration_structures_properties_nv(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdWriteAccelerationStructuresPropertiesNV"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_NV, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4], a[5] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_write_acceleration_structures_properties_nv_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdWriteAccelerationStructuresPropertiesNV"];
     let f: unsafe extern "system" fn(u64, u32, u64, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_ACCELERATION_STRUCTURES_PROPERTIES_NV, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4], a[5] as u32) };
     Ok(0)
@@ -3343,9 +4621,23 @@ fn vk_cmd_write_buffer_marker2_amd(g: &Gpu, p: &Process, a: &[u64]) -> Result<u6
     Ok(0)
 }
 
+fn vk_cmd_write_buffer_marker2_amd_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdWriteBufferMarker2AMD"];
+    let f: unsafe extern "system" fn(u64, u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_BUFFER_MARKER2_AMD, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3], a[4] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_write_buffer_marker_amd(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdWriteBufferMarkerAMD"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u32, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_BUFFER_MARKER_AMD, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3], a[4] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_write_buffer_marker_amd_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdWriteBufferMarkerAMD"];
     let f: unsafe extern "system" fn(u64, u32, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_BUFFER_MARKER_AMD, NAMES)?) };
     unsafe { f(h0, a[1] as u32, a[2], a[3], a[4] as u32) };
     Ok(0)
@@ -3359,6 +4651,13 @@ fn vk_cmd_write_micromaps_properties_ext(g: &Gpu, p: &Process, a: &[u64]) -> Res
     Ok(0)
 }
 
+fn vk_cmd_write_micromaps_properties_ext_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdWriteMicromapsPropertiesEXT"];
+    let f: unsafe extern "system" fn(u64, u32, u64, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_MICROMAPS_PROPERTIES_EXT, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32, a[4], a[5] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_write_timestamp(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdWriteTimestamp"];
     let (h0, t) = g.dispatchable(p, a[0])?;
@@ -3367,9 +4666,23 @@ fn vk_cmd_write_timestamp(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallEr
     Ok(0)
 }
 
+fn vk_cmd_write_timestamp_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdWriteTimestamp"];
+    let f: unsafe extern "system" fn(u64, u32, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_TIMESTAMP, NAMES)?) };
+    unsafe { f(h0, a[1] as u32, a[2], a[3] as u32) };
+    Ok(0)
+}
+
 fn vk_cmd_write_timestamp2(g: &Gpu, p: &Process, a: &[u64]) -> Result<u64, CallError> {
     const NAMES: &[&CStr] = &[c"vkCmdWriteTimestamp2", c"vkCmdWriteTimestamp2KHR"];
     let (h0, t) = g.dispatchable(p, a[0])?;
+    let f: unsafe extern "system" fn(u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_TIMESTAMP2, NAMES)?) };
+    unsafe { f(h0, a[1], a[2], a[3] as u32) };
+    Ok(0)
+}
+
+fn vk_cmd_write_timestamp2_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {
+    const NAMES: &[&CStr] = &[c"vkCmdWriteTimestamp2", c"vkCmdWriteTimestamp2KHR"];
     let f: unsafe extern "system" fn(u64, u64, u64, u32) = unsafe { std::mem::transmute(t.get(ID_VK_CMD_WRITE_TIMESTAMP2, NAMES)?) };
     unsafe { f(h0, a[1], a[2], a[3] as u32) };
     Ok(0)

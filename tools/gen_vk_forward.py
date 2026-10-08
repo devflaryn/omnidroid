@@ -139,6 +139,14 @@ class Decl:
         tail = self.decl.rsplit(self.name, 1)[1] if self.name in self.decl else ""
         self.array = "[" in tail
         self.pointer = "*" in self.decl or self.array
+        #: A fixed array's length (`float blendConstants[4]`), or None.
+        m = re.search(r"\[(\d+)\]", tail)
+        self.fixed = int(m.group(1)) if m else None
+        #: vk.xml's `len`: the parameter or member giving an array's length, or a special form.
+        self.len = el.get("len")
+        self.const = self.decl.startswith("const ")
+        #: vk.xml's `stride`: an array whose elements are that parameter's bytes apart, not sizeof.
+        self.stride = el.get("stride")
 
 
 class Command:
@@ -489,6 +497,71 @@ class Selection:
         if cmd.ret_decl not in RETURNS:
             raise GenError(f"{cmd.name}: return type {cmd.ret_decl!r} has no forwarding rule {fix}")
 
+    # --- batching (OMNI_VK_BATCH) ----------------------------------------------------------------
+
+    def plain(self, name: str, seen=None) -> bool:
+        """Whether a value of type `name` is plain data: no pointer anywhere in it (so no pNext),
+        no dispatchable handle. A copy of its bytes is the value."""
+        t = self.reg.resolve(name)
+        seen = set() if seen is None else seen
+        if t in seen:
+            return False
+        cat = self.reg.category(t)
+        if cat in ("enum", "bitmask"):
+            return True
+        if cat == "handle":
+            return not self.reg.is_dispatchable(t)
+        if cat == "basetype":
+            return t in BASETYPES and BASETYPES[t][0] == "int"
+        if cat is None:
+            return t in BASIC_TYPES
+        if cat in ("struct", "union"):
+            members = self.reg.members(t)
+            return bool(members) and all(not m.pointer or (m.fixed is not None and "*" not in m.decl) for m in members) and all(
+                self.plain(m.type, seen | {t}) for m in members)
+        return False
+
+    def batch_plan(self, canon: str):
+        """How a command is put in a command buffer's batch instead of sent at once: None when it
+        cannot be, else [(parameter index, C expression of the bytes it points at)] -- the arrays
+        copied into the batch (the caller's memory may change once the command has returned).
+
+        A command is batched when it returns nothing (nothing waits for it), records into a command
+        buffer (its first parameter), and everything it points at is a plain array whose length an
+        integer parameter gives (or one value, or a fixed-size array): a struct with a pNext chain or a
+        pointer member is not (it would need a deep copy) -- such commands flush the batch first."""
+        if canon in self.special or not canon.startswith("vkCmd"):
+            return None
+        cmd = self.reg.commands[canon]
+        if RETURNS.get(cmd.ret_decl) != "void" or self.reg.resolve(cmd.params[0].type) != "VkCommandBuffer":
+            return None
+        by_name = {p.name: p for p in cmd.params}
+        copies = []
+        for i, p in enumerate(cmd.params[1:], start=1):
+            if not p.pointer:
+                continue
+            if not p.const or p.decl.count("*") > 1 or p.stride is not None:
+                return None
+            pointee = self.reg.resolve(p.type)
+            if p.fixed is not None:
+                count = str(p.fixed)
+            elif p.len is None:
+                count = "1"
+            else:
+                n = by_name.get(p.len)
+                if n is None or n.pointer or self.reg.travel(n)[0] != "int":
+                    return None
+                count = f"(size_t){p.len}"
+            if pointee == "void":
+                if p.len is None or p.fixed is not None:
+                    return None
+                copies.append((i, count))
+            elif self.plain(pointee):
+                copies.append((i, f"{count} * sizeof({p.type})"))
+            else:
+                return None
+        return copies
+
     def level(self, canon: str) -> int:
         cmd = self.reg.commands[canon]
         first = self.reg.resolve(cmd.params[0].type) if cmd.params and not cmd.params[0].pointer else None
@@ -522,7 +595,7 @@ def emit_rust(sel: Selection) -> str:
            "// called with the command's C signature and the guest's arguments -- guest code already runs in",
            "// this process with every host page reachable, so what the driver reads widens nothing (design).",
            "#![allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap, "
-           "clippy::cast_sign_loss, clippy::many_single_char_names, clippy::missing_safety_doc, non_upper_case_globals, dead_code)]",
+           "clippy::cast_sign_loss, clippy::many_single_char_names, clippy::missing_safety_doc, non_upper_case_globals, dead_code, unused_variables)]",
            "use std::ffi::CStr;", "", "use super::{CallError, Gpu};", "use crate::process::Process;", ""]
     for i, canon in enumerate(sel.ids):
         out.append(f"pub(crate) const ID_{screaming(canon)}: u32 = {i};")
@@ -544,6 +617,23 @@ def emit_rust(sel: Selection) -> str:
     generic = [c for c in sel.ids if c not in sel.special]
     for canon in generic:
         out.append(f"        ID_{screaming(canon)} => {screaming(canon).lower()}(g, p, a),")
+    out += ["        _ => Err(CallError::Args),", "    }", "}"]
+    batched = [c for c in generic if sel.batch_plan(c) is not None]
+    out += ["",
+            "/// Whether command `id` may come in a command buffer's batch (`OMNI_VK_ID_BATCH`): it returns",
+            "/// nothing and records into its command buffer, and what it points at the guest's driver copied",
+            "/// into the batch (`tools/gen_vk_forward.py`'s `batch_plan`).",
+            "pub(crate) fn batchable(id: u32) -> bool {",
+            "    matches!(",
+            "        id,"]
+    out += [f"        {'| ' if i else ''}ID_{screaming(c)}" for i, c in enumerate(batched)]
+    out += ["    )", "}", "",
+            "/// A batched command on host command buffer `h0`, whose entry points `t` resolves (unwrapped once",
+            "/// for the whole batch). Only for [`batchable`] ids.",
+            "pub(crate) fn replay(t: &super::Table, h0: u64, id: u32, a: &[u64]) -> Result<u64, CallError> {",
+            "    match id {"]
+    for canon in batched:
+        out.append(f"        ID_{screaming(canon)} => {screaming(canon).lower()}_on(t, h0, a),")
     out += ["        _ => Err(CallError::Args),", "    }", "}"]
     conv = {"u64": "a[{i}]", "i64": "a[{i}] as i64", "u32": "a[{i}] as u32", "i32": "a[{i}] as u32 as i32",
             "u16": "a[{i}] as u16", "i16": "a[{i}] as u16 as i16", "u8": "a[{i}] as u8", "i8": "a[{i}] as u8 as i8",
@@ -568,6 +658,12 @@ def emit_rust(sel: Selection) -> str:
             out.append(f"    let r = unsafe {{ {call} }};")
             out.append({"result": "    Ok(u64::from(r as u32))", "u32": "    Ok(u64::from(r))", "u64": "    Ok(r)"}[ret])
         out.append("}")
+        if sel.batch_plan(canon) is not None:
+            out += ["",
+                    f"fn {ident.lower()}_on(t: &super::Table, h0: u64, a: &[u64]) -> Result<u64, CallError> {{",
+                    f"    const NAMES: &[&CStr] = &[{', '.join(f'c{chr(34)}{n}{chr(34)}' for n in names)}];",
+                    f"    let f: unsafe extern \"system\" fn({', '.join(tys)}){rty} = unsafe {{ std::mem::transmute(t.get(ID_{ident}, NAMES)?) }};",
+                    f"    unsafe {{ {call} }};", "    Ok(0)", "}"]
     return "\n".join(out) + "\n"
 
 
@@ -583,7 +679,7 @@ def emit_guest_h(sel: Selection) -> str:
            "#ifndef OMNI_VK_GENERATED_H", "#define OMNI_VK_GENERATED_H", "",
            "/* VK_ANDROID_external_memory_android_hardware_buffer's commands are declared only with this. */",
            "#ifndef VK_USE_PLATFORM_ANDROID_KHR", "#define VK_USE_PLATFORM_ANDROID_KHR", "#endif",
-           "#include <stdint.h>", "#include <vulkan/vulkan.h>", "",
+           "#include <stddef.h>", "#include <stdint.h>", "#include <vulkan/vulkan.h>", "",
            "#if !defined(VK_HEADER_VERSION) || VK_HEADER_VERSION != " + VK_XML_VERSION.rsplit(".", 1)[1],
            f'#error "generated from vk.xml {VK_XML_VERSION}; the Vulkan headers differ"', "#endif",
            "#ifndef VK_ANDROID_external_memory_android_hardware_buffer",
@@ -600,6 +696,14 @@ def emit_guest_h(sel: Selection) -> str:
             "extern const struct omni_vk_entry omni_vk_entries[];", "extern const unsigned omni_vk_entry_count;", "",
             "/* The transport (driver.c): command `id` with `argc` 64-bit arguments; its result. */",
             "uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc);", "",
+            "/* Batching (driver.c, OMNI_VK_BATCH): a command that returns nothing and records into a command",
+            " * buffer is put in that buffer's batch, with the arrays it points at (`bytes` at argument `arg`)",
+            " * copied in, and sent with the rest at the buffer's end (or when the batch is full, or before any",
+            " * command on the buffer that is not batched); omni_vk_sync is that \"before\". */",
+            "struct omni_vk_copy {", "    uint32_t arg;", "    size_t bytes;", "};",
+            "void omni_vk_record(uint32_t id, const uint64_t* args, uint32_t argc, const struct omni_vk_copy* copies, uint32_t ncopies);",
+            "enum { OMNI_VK_SYNC_FLUSH, OMNI_VK_SYNC_BEGIN, OMNI_VK_SYNC_END, OMNI_VK_SYNC_DISCARD };",
+            "void omni_vk_sync(VkCommandBuffer commandBuffer, int how);", "",
             "/* The special entry points (tools/vk/special.txt), written by hand. */"]
     for canon in sel.ids:
         if canon in sel.special:
@@ -635,6 +739,18 @@ def emit_guest_c(sel: Selection) -> str:
                 body += [f"    {w} omni_bits{i};", f"    memcpy(&omni_bits{i}, &{p.name}, sizeof omni_bits{i});",
                          f"    omni_a[{i}] = omni_bits{i};"]
         call = f"omni_vk_call(OMNI_VK_ID_{screaming(canon)}, omni_a, {n})"
+        plan = sel.batch_plan(canon)
+        if plan is not None:
+            if plan:
+                body.append(f"    const struct omni_vk_copy omni_c[{len(plan)}] = {{")
+                body += [f"        {{{i}, {size}}}," for i, size in plan]
+                body.append("    };")
+            body.append(f"    omni_vk_record(OMNI_VK_ID_{screaming(canon)}, omni_a, {n}, {'omni_c' if plan else 'NULL'}, {len(plan)}u);")
+            out += ["", f"static VKAPI_ATTR {cmd.ret_decl} VKAPI_CALL omni_{canon}({c_params(cmd)}) {{"] + body + ["}"]
+            continue
+        if reg.resolve(cmd.params[0].type) == "VkCommandBuffer":
+            how = {"vkBeginCommandBuffer": "BEGIN", "vkEndCommandBuffer": "END", "vkResetCommandBuffer": "DISCARD"}.get(canon, "FLUSH")
+            body.insert(0, f"    omni_vk_sync({cmd.params[0].name}, OMNI_VK_SYNC_{how});")
         ret = RETURNS[cmd.ret_decl]
         if ret == "void":
             body.append(f"    (void){call};")

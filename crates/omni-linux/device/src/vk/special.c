@@ -160,10 +160,10 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateCommandBuffers(VkDevice device, co
                                                              VkCommandBuffer* pCommandBuffers) {
     /* The wrappers first, so nothing can fail after the host has made its command buffers. */
     uint32_t n = pAllocateInfo->commandBufferCount;
-    struct omni_vk_object** wrappers = calloc(n ? n : 1, sizeof *wrappers);
+    struct omni_vk_cmdbuf** wrappers = calloc(n ? n : 1, sizeof *wrappers);
     if (wrappers == NULL) return VK_ERROR_OUT_OF_HOST_MEMORY;
     for (uint32_t i = 0; i < n; i++) {
-        wrappers[i] = omni_vk_wrap(0);
+        wrappers[i] = omni_vk_wrap_cmdbuf();
         if (wrappers[i] == NULL) {
             for (uint32_t j = 0; j < i; j++) free(wrappers[j]);
             free(wrappers);
@@ -174,7 +174,7 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateCommandBuffers(VkDevice device, co
     VkResult r = RESULT(OMNI_VK_ID_VK_ALLOCATE_COMMAND_BUFFERS, OMNI_U64(device), OMNI_U64(pAllocateInfo), OMNI_U64(pCommandBuffers));
     for (uint32_t i = 0; i < n; i++) {
         if (r == VK_SUCCESS) {
-            wrappers[i]->host = OMNI_U64(pCommandBuffers[i]);
+            wrappers[i]->obj.host = OMNI_U64(pCommandBuffers[i]);
             pCommandBuffers[i] = (VkCommandBuffer)wrappers[i];
         } else {
             free(wrappers[i]);
@@ -187,7 +187,10 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateCommandBuffers(VkDevice device, co
 VKAPI_ATTR void VKAPI_CALL omni_vkFreeCommandBuffers(VkDevice device, VkCommandPool commandPool, uint32_t commandBufferCount,
                                                      const VkCommandBuffer* pCommandBuffers) {
     CALL(OMNI_VK_ID_VK_FREE_COMMAND_BUFFERS, OMNI_U64(device), OMNI_U64(commandPool), commandBufferCount, OMNI_U64(pCommandBuffers));
-    for (uint32_t i = 0; i < commandBufferCount; i++) free(pCommandBuffers[i]);
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+        omni_vk_sync(pCommandBuffers[i], OMNI_VK_SYNC_DISCARD);
+        free(pCommandBuffers[i]);
+    }
 }
 
 /* --- forwarded as they are; the host does the work ----------------------------------------- */
@@ -202,6 +205,7 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkQueueSubmit2(VkQueue queue, uint32_t submi
 
 VKAPI_ATTR void VKAPI_CALL omni_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
                                                      const VkCommandBuffer* pCommandBuffers) {
+    omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);
     CALL(OMNI_VK_ID_VK_CMD_EXECUTE_COMMANDS, OMNI_U64(commandBuffer), commandBufferCount, OMNI_U64(pCommandBuffers));
 }
 

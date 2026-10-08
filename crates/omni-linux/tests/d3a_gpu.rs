@@ -108,6 +108,29 @@ fn vulkan_clears_an_image_on_the_host_gpu() {
     eprintln!("{line}");
 }
 
+/// Batching (`OMNI_VK_BATCH`, `vk_batch=`) and the fast path (`vk_fast=`): the same recording comes
+/// out the same -- commands in order, what they pointed at copied before the caller scribbled over
+/// it -- and the cost of a cheap command from guest code, each way (`vkbatch` prints it).
+#[test]
+fn batched_vulkan_records_in_order_and_costs_less() {
+    let (sysroot, instance) = prepare("vkbatch", "vkbatch");
+    let mut costs = Vec::new();
+    for (fast, batch) in [(false, false), (true, false), (true, true), (false, false), (true, false), (true, true)] {
+        omni_linux::gpu::set_fast(fast);
+        omni_linux::gpu::set_batch(batch);
+        let (status, out, err) = run_fixture(&sysroot, &instance, "vkbatch");
+        assert_eq!(status, ExitStatus::Exited(0), "vkbatch fast={fast} batch={batch}\nstdout: {out}\nstderr: {err}");
+        let line = out.lines().find(|l| l.starts_with("vkbatch ok ")).unwrap_or_else(|| panic!("stdout: {out}\nstderr: {err}"));
+        let ns: f64 = line.split_whitespace().nth(2).and_then(|v| v.parse().ok()).expect("ns per command");
+        eprintln!("[vkbatch] vk_fast={} vk_batch={}: {ns:.1} ns per vkCmdSetViewport from the guest", u8::from(fast), u8::from(batch));
+        costs.push(ns);
+    }
+    omni_linux::gpu::set_fast(false);
+    omni_linux::gpu::set_batch(false);
+    // Batched is far cheaper than one system call a command, whatever the host's load.
+    assert!(costs[2] * 2.0 < costs[0] && costs[5] * 2.0 < costs[3], "{costs:?}");
+}
+
 #[test]
 fn angle_clears_a_pbuffer_on_the_host_gpu() {
     let (sysroot, instance) = prepare("gl", "glclear");

@@ -34,6 +34,12 @@
 //!   (`omni_platform::clock::allow_power_throttling`); `auto` gives the choice back to the host.
 //! - `futex_herd=0|1`: 1 makes every futex wake unpark every task waiting in the process (the old
 //!   one-condition-variable behaviour, `crate::futex::HERD`), to A/B the per-task wake against it.
+//! - `vk_fast=0|1`: the Vulkan forwarding's fast path (`crate::gpu::FAST`: no allocation per
+//!   command, handles from a per-thread cache, no write of a zero result). Off by default;
+//!   `OMNI_VK_FAST=1` from the start.
+//! - `vk_batch=0|1`: the guest's Vulkan driver batches the commands that only record into a command
+//!   buffer (`crate::gpu::BATCH`), from each command buffer's next `vkBeginCommandBuffer`. Off by
+//!   default; `OMNI_VK_BATCH=1` from the start.
 //!
 //! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file.
 use std::path::PathBuf;
@@ -100,6 +106,19 @@ pub fn apply(line: &str) -> Option<String> {
             };
             crate::binder::HOST_POOL.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("binder_host_pool={}: host services' calls run on {}", u8::from(on), if on { "kept threads" } else { "a new thread each" }))
+        }
+        "vk_fast" | "vk_batch" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            if name.trim() == "vk_fast" {
+                crate::gpu::set_fast(on);
+            } else {
+                crate::gpu::set_batch(on);
+            }
+            Some(format!("{}={}", name.trim(), u8::from(on)))
         }
         "fence_poll" => {
             let us: u32 = value.trim().parse().ok()?;
@@ -244,6 +263,20 @@ mod tests {
         assert!(!crate::binder::HOST_POOL.load(Ordering::Relaxed));
         assert_eq!(apply("binder_host_pool=2"), None);
         crate::binder::HOST_POOL.store(was, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn the_vulkan_levers_switch_the_fast_path_and_batching() {
+        use std::sync::atomic::Ordering;
+        assert_eq!(apply("vk_fast=1").as_deref(), Some("vk_fast=1"));
+        assert!(crate::gpu::FAST.load(Ordering::Relaxed));
+        assert_eq!(apply("vk_batch=1").as_deref(), Some("vk_batch=1"));
+        assert!(crate::gpu::BATCH.load(Ordering::Relaxed));
+        assert_eq!(apply("vk_fast=on"), None);
+        apply("vk_fast=0").expect("understood");
+        apply("vk_batch=0").expect("understood");
+        assert!(!crate::gpu::FAST.load(Ordering::Relaxed));
+        assert!(!crate::gpu::BATCH.load(Ordering::Relaxed));
     }
 
     #[test]

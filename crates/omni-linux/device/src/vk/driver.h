@@ -32,6 +32,10 @@ _Static_assert(sizeof(struct omni_gpu_call) == 32, "the transport's layout");
 #define OMNI_VK_ID_GRALLOC_USAGE4 0x1003u
 #define OMNI_VK_ID_ACQUIRE_IMAGE 0x1004u
 #define OMNI_VK_ID_QUEUE_SIGNAL_RELEASE_IMAGE 0x1005u
+/* A command buffer's batch: (command buffer, records, bytes, count) -- driver.c's omni_vk_record. */
+#define OMNI_VK_ID_BATCH 0x1006u
+/* What the host wants of this driver: bit 0, batch (OMNI_VK_BATCH / the vk_batch lever). */
+#define OMNI_VK_ID_CONFIG 0x1007u
 
 /* A dispatchable handle as this driver hands it out: the loader owns `dispatch`, the host's handle
  * is at +8 (the host reads it there). */
@@ -51,7 +55,20 @@ struct omni_vk_parent {
     uint32_t capacity;
 };
 
+/* A command buffer as this driver hands it out: the object, and the commands recorded into it and
+ * not yet sent (batching, driver.c). Vulkan has the application synchronize all use of a command
+ * buffer, so neither field needs a lock. */
+struct omni_vk_batch;
+struct omni_vk_cmdbuf {
+    struct omni_vk_object obj;
+    struct omni_vk_batch* batch;
+    /* Whether this recording batches: asked of the host at each vkBeginCommandBuffer. */
+    int batching;
+};
+
 uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc);
+/* A new command buffer wrapper (calloc'd: no batch, not batching). */
+struct omni_vk_cmdbuf* omni_vk_wrap_cmdbuf(void);
 /* A forwarded VkResult: the host's value, or VK_ERROR_DEVICE_LOST when the call could not be made. */
 VkResult omni_vk_result(uint64_t r);
 /* Whether the last call on this thread failed at the transport (not a Vulkan result). */

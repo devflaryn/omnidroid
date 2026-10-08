@@ -960,27 +960,27 @@ fn sys_faccessat(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_ioctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
-    let remote = match &*file.kind.lock() {
-        FileKind::RemoteBinder(b) => Some(Arc::clone(b)),
-        _ => None,
-    };
-    if let Some(b) = remote {
-        return b.ioctl(p, t, a[1], a[2]);
+    // The three busy devices from one look at the file (the GPU's ioctl is one per forwarded
+    // Vulkan command: ~100k a second on a game's render thread).
+    enum Busy {
+        Remote(Arc<crate::remote::RemoteBinder>),
+        Binder(Arc<crate::binder::BinderFile>),
+        Gpu(Arc<crate::gpu::Gpu>),
     }
-    let binder = match &*file.kind.lock() {
-        FileKind::Binder(b) => Some(Arc::clone(b)),
+    let busy = match &*file.kind.lock() {
+        FileKind::RemoteBinder(b) => Some(Busy::Remote(Arc::clone(b))),
+        FileKind::Binder(b) => Some(Busy::Binder(Arc::clone(b))),
+        FileKind::Gpu(g) => Some(Busy::Gpu(Arc::clone(g))),
         _ => None,
     };
-    if let Some(b) = binder {
-        let nonblocking = *file.flags.lock() & 0o4000 != 0;
-        return crate::binder::ioctl(p, t, &b, a[1], a[2], nonblocking);
-    }
-    let gpu = match &*file.kind.lock() {
-        FileKind::Gpu(g) => Some(Arc::clone(g)),
-        _ => None,
-    };
-    if let Some(g) = gpu {
-        return crate::gpu::ioctl(p, t, &g, a[1], a[2]);
+    match busy {
+        Some(Busy::Remote(b)) => return b.ioctl(p, t, a[1], a[2]),
+        Some(Busy::Binder(b)) => {
+            let nonblocking = *file.flags.lock() & 0o4000 != 0;
+            return crate::binder::ioctl(p, t, &b, a[1], a[2], nonblocking);
+        }
+        Some(Busy::Gpu(g)) => return crate::gpu::ioctl(p, t, &g, a[1], a[2]),
+        None => {}
     }
     let input = match &*file.kind.lock() {
         FileKind::Evdev(c) => Some(Arc::clone(c)),
