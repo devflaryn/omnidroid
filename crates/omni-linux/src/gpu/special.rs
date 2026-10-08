@@ -16,6 +16,10 @@ const ID_GRALLOC_USAGE3: u32 = 0x1002;
 const ID_GRALLOC_USAGE4: u32 = 0x1003;
 const ID_ACQUIRE_IMAGE: u32 = 0x1004;
 const ID_QUEUE_SIGNAL_RELEASE_IMAGE: u32 = 0x1005;
+/// A command buffer's batch of recorded commands (`super::BATCH_COMMAND`).
+pub(crate) const ID_BATCH: u32 = 0x1006;
+/// What the host asks of the guest's driver (`super::CONFIG_COMMAND`).
+pub(crate) const ID_CONFIG: u32 = 0x1007;
 
 /// The gralloc usage of a swapchain buffer: the GPU renders it and samples it
 /// (`GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_RENDER`, gralloc1's consumer `GPU_TEXTURE` and
@@ -224,7 +228,7 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
             // SAFETY: the Vulkan signature; `h` is a live host instance.
             let d: unsafe extern "system" fn(u64, *const c_void) = unsafe { f(&t, id, NAMES)? };
             unsafe { d(h, std::ptr::null()) };
-            gpu.objects.lock().retain(|k, o| *k != h && o.parent != h);
+            gpu.retain_objects(|k, o| *k != h && o.parent != h);
             Ok(0)
         }
         g::ID_VK_ENUMERATE_PHYSICAL_DEVICES => {
@@ -286,7 +290,7 @@ pub(crate) fn call(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
             // SAFETY: the Vulkan signature; `h` is a live host device.
             let d: unsafe extern "system" fn(u64, *const c_void) = unsafe { f(&t, id, NAMES)? };
             unsafe { d(h, std::ptr::null()) };
-            gpu.objects.lock().retain(|k, o| *k != h && o.parent != h);
+            gpu.retain_objects(|k, o| *k != h && o.parent != h);
             gpu.devices.lock().remove(&h);
             gpu.native.lock().retain(|_, n| !n.belongs_to(h));
             super::ahb::forget_device(gpu, h);
@@ -737,6 +741,7 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         gpu.devices.lock().insert(device, super::native::DeviceInfo::new(&memory));
         if emulate_foreign {
             FOREIGN_EMULATED.lock().insert(device);
+            ANY_FOREIGN_EMULATED.store(true, std::sync::atomic::Ordering::Release);
         }
         wr(p, a[3], &device.to_le_bytes())?;
     }
@@ -753,6 +758,9 @@ const QUEUE_FAMILY_FOREIGN: &str = "VK_EXT_queue_family_foreign";
 /// on the M1).
 static FOREIGN_EMULATED: parking_lot::Mutex<std::collections::BTreeSet<u64>> =
     parking_lot::Mutex::new(std::collections::BTreeSet::new());
+/// Whether [`FOREIGN_EMULATED`] was ever given a device: what a barrier asks first. The lock is
+/// global to the host process -- every barrier of every guest thread took it.
+static ANY_FOREIGN_EMULATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `VK_QUEUE_FAMILY_FOREIGN_EXT`, `VK_QUEUE_FAMILY_EXTERNAL`, `VK_QUEUE_FAMILY_IGNORED`.
 const QUEUE_FAMILY_FOREIGN_EXT: u32 = !2;
@@ -772,7 +780,8 @@ pub(crate) fn foreign_barrier(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> Opt
     if !matches!(id, g::ID_VK_CMD_PIPELINE_BARRIER | g::ID_VK_CMD_PIPELINE_BARRIER2 | g::ID_VK_CMD_WAIT_EVENTS | g::ID_VK_CMD_WAIT_EVENTS2) {
         return None;
     }
-    if FOREIGN_EMULATED.lock().is_empty() {
+    // No such device in this host process (every NVIDIA/AMD host): no lock on a barrier's way.
+    if !ANY_FOREIGN_EMULATED.load(std::sync::atomic::Ordering::Acquire) || FOREIGN_EMULATED.lock().is_empty() {
         return None;
     }
     let (h, t) = match gpu.dispatchable(p, a[0]) {

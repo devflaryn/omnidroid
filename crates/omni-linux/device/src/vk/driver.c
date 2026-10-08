@@ -41,6 +41,137 @@ VkResult omni_vk_result(uint64_t r) { return (VkResult)(int32_t)(uint32_t)r; }
 
 int omni_vk_failed(void) { return t_failed; }
 
+/* --- batching (OMNI_VK_BATCH) ------------------------------------------------------------- */
+
+/* Each forwarded command is one system call into the host -- ~0.35 us of crossing besides the
+ * driver's own time, ~3,100 of them a frame in a Roblox world (docs/HANDOFF.md). A command that
+ * returns nothing and only records into a command buffer (vkCmdDraw, vkCmdBindPipeline, ...,
+ * gen_vk_forward.py's batch_plan) is instead appended to its command buffer's batch, and the batch
+ * goes to the host in one call (OMNI_VK_ID_BATCH) when the buffer ends, before any command on the
+ * buffer that is not batched (so the buffer sees every command in the order it was made), or when
+ * it is full. What a command points at is copied into the batch with it, and the copy's address
+ * passed instead (one address space: the host's driver reads the copy where it lies), since the
+ * caller may reuse its memory once the command has returned.
+ *
+ * A record: u32 id, u32 argc, u32 size (all of it, 8-aligned), u32 0, u64 args[argc], the copies. */
+
+#define BATCH_BYTES (64u * 1024u)
+/* A command bigger than this (vkCmdUpdateBuffer's data, up to 64 KiB) is sent as it is. */
+#define RECORD_MAX (BATCH_BYTES / 4u)
+
+struct omni_vk_batch {
+    struct omni_vk_batch* next; /* on the free list */
+    uint32_t used;
+    uint32_t count;
+    _Alignas(8) uint8_t data[BATCH_BYTES];
+};
+
+/* Batches not in use: a recording takes one at its first batched command and gives it back at its
+ * end, so there are about as many as command buffers recording at once. */
+static pthread_mutex_t g_free_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct omni_vk_batch* g_free;
+static unsigned g_free_count;
+
+static struct omni_vk_batch* take_batch(void) {
+    pthread_mutex_lock(&g_free_lock);
+    struct omni_vk_batch* b = g_free;
+    if (b != NULL) {
+        g_free = b->next;
+        g_free_count--;
+    }
+    pthread_mutex_unlock(&g_free_lock);
+    if (b == NULL) b = malloc(sizeof *b);
+    if (b != NULL) b->used = b->count = 0;
+    return b;
+}
+
+static void give_batch(struct omni_vk_batch* b) {
+    pthread_mutex_lock(&g_free_lock);
+    if (g_free_count < 32) {
+        b->next = g_free;
+        g_free = b;
+        g_free_count++;
+        b = NULL;
+    }
+    pthread_mutex_unlock(&g_free_lock);
+    free(b);
+}
+
+/* Whether the host wants batching now (asked at each vkBeginCommandBuffer, so the host's lever
+ * switches it for the next recording). A host without the query answers no. */
+static int host_batches(void) {
+    pthread_once(&g_open_once, open_device);
+    if (g_fd < 0) return 0;
+    struct omni_gpu_call c = {.command = OMNI_VK_ID_CONFIG, .argc = 0, .args = 0, .result = 0, .reserved = 0};
+    if (ioctl(g_fd, OMNI_GPU_CALL, &c) != 0) return 0;
+    return (int)(c.result & 1u);
+}
+
+static void send_batch(struct omni_vk_cmdbuf* cb) {
+    struct omni_vk_batch* b = cb->batch;
+    if (b == NULL || b->used == 0) return;
+    const uint64_t a[4] = {OMNI_U64(cb), OMNI_U64(b->data), b->used, b->count};
+    uint64_t r = omni_vk_call(OMNI_VK_ID_BATCH, a, 4);
+    if (omni_vk_failed() || r != 0) {
+        static int said;
+        if (!said) {
+            said = 1;
+            LOGE("a batch of %u commands was refused (%llu)", b->count, (unsigned long long)r);
+        }
+    }
+    b->used = b->count = 0;
+}
+
+void omni_vk_sync(VkCommandBuffer commandBuffer, int how) {
+    struct omni_vk_cmdbuf* cb = (struct omni_vk_cmdbuf*)commandBuffer;
+    if (cb == NULL) return;
+    if (how == OMNI_VK_SYNC_FLUSH || how == OMNI_VK_SYNC_END) send_batch(cb);
+    if (how != OMNI_VK_SYNC_FLUSH && cb->batch != NULL) {
+        /* Ended, reset, begun again or freed: what was not sent belongs to a recording that is gone. */
+        give_batch(cb->batch);
+        cb->batch = NULL;
+    }
+    if (how == OMNI_VK_SYNC_BEGIN) cb->batching = host_batches();
+}
+
+void omni_vk_record(uint32_t id, const uint64_t* args, uint32_t argc, const struct omni_vk_copy* copies, uint32_t ncopies) {
+    struct omni_vk_cmdbuf* cb = (struct omni_vk_cmdbuf*)(uintptr_t)args[0];
+    if (cb == NULL || !cb->batching) {
+        (void)omni_vk_call(id, args, argc);
+        return;
+    }
+    size_t need = 16u + (size_t)argc * 8u;
+    for (uint32_t i = 0; i < ncopies; i++) {
+        if (args[copies[i].arg] != 0) need += (copies[i].bytes + 7u) & ~(size_t)7u;
+    }
+    if (need > RECORD_MAX || argc > 32u) {
+        send_batch(cb);
+        (void)omni_vk_call(id, args, argc);
+        return;
+    }
+    if (cb->batch == NULL && (cb->batch = take_batch()) == NULL) {
+        (void)omni_vk_call(id, args, argc);
+        return;
+    }
+    struct omni_vk_batch* b = cb->batch;
+    if (b->used + need > BATCH_BYTES) send_batch(cb);
+    uint8_t* r = b->data + b->used;
+    const uint32_t head[4] = {id, argc, (uint32_t)need, 0};
+    memcpy(r, head, sizeof head);
+    uint64_t* a = (uint64_t*)(void*)(r + 16);
+    memcpy(a, args, (size_t)argc * 8u);
+    uint8_t* d = r + 16 + (size_t)argc * 8u;
+    for (uint32_t i = 0; i < ncopies; i++) {
+        const void* src = (const void*)(uintptr_t)args[copies[i].arg];
+        if (src == NULL) continue;
+        memcpy(d, src, copies[i].bytes);
+        a[copies[i].arg] = OMNI_U64(d);
+        d += (copies[i].bytes + 7u) & ~(size_t)7u;
+    }
+    b->used += (uint32_t)need;
+    b->count++;
+}
+
 /* --- dispatchable wrappers ----------------------------------------------------------------- */
 
 struct omni_vk_object* omni_vk_wrap(uint64_t host) {
@@ -49,6 +180,13 @@ struct omni_vk_object* omni_vk_wrap(uint64_t host) {
     o->dispatch.magic = HWVULKAN_DISPATCH_MAGIC;
     o->host = host;
     return o;
+}
+
+struct omni_vk_cmdbuf* omni_vk_wrap_cmdbuf(void) {
+    struct omni_vk_cmdbuf* cb = calloc(1, sizeof *cb);
+    if (cb == NULL) return NULL;
+    cb->obj.dispatch.magic = HWVULKAN_DISPATCH_MAGIC;
+    return cb;
 }
 
 struct omni_vk_object* omni_vk_child(struct omni_vk_parent* parent, uint64_t host) {

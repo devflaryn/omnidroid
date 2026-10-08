@@ -51,7 +51,35 @@ class Generated(unittest.TestCase):
         self.assertIn("(VkCommandBuffer commandBuffer, float lineWidth)", c)
         self.assertIn("memcpy(&omni_bits1, &lineWidth, sizeof omni_bits1);", c)
         self.assertIn("omni_a[1] = omni_bits1;", c)
-        self.assertIn("omni_vk_call(OMNI_VK_ID_VK_CMD_SET_LINE_WIDTH, omni_a, 2)", c)
+        # A command that only records is batched (OMNI_VK_BATCH): nothing to copy here.
+        self.assertIn("omni_vk_record(OMNI_VK_ID_VK_CMD_SET_LINE_WIDTH, omni_a, 2, NULL, 0u);", c)
+
+    def test_a_recording_command_is_batched_with_its_arrays_copied(self):
+        c = self.fn_c("vkCmdSetViewport")
+        self.assertIn("{3, (size_t)viewportCount * sizeof(VkViewport)},", c)
+        self.assertIn("omni_vk_record(OMNI_VK_ID_VK_CMD_SET_VIEWPORT, omni_a, 4, omni_c, 1u);", c)
+        self.assertNotIn("omni_vk_call", c)
+        self.assertIn("{5, (size_t)size},", self.fn_c("vkCmdPushConstants"))
+        self.assertIn("{1, 4 * sizeof(float)},", self.fn_c("vkCmdSetBlendConstants"))
+        self.assertIn("ID_VK_CMD_SET_VIEWPORT => vk_cmd_set_viewport_on(t, h0, a),", self.rs)
+        self.assertIn("fn vk_cmd_set_viewport_on(t: &super::Table, h0: u64, a: &[u64])", self.rs)
+        batchable = re.search(r"fn batchable\(id: u32\) -> bool \{(.*?)\n}\n", self.rs, re.S).group(1)
+        self.assertIn("ID_VK_CMD_DRAW_INDEXED\n", batchable)
+        for name in ("ID_VK_CMD_BEGIN_RENDER_PASS\n", "ID_VK_CMD_PIPELINE_BARRIER\n", "ID_VK_CMD_DRAW_MULTI_EXT\n",
+                     "ID_VK_END_COMMAND_BUFFER\n", "ID_VK_CMD_EXECUTE_COMMANDS\n"):
+            self.assertNotIn(name, batchable)
+
+    def test_a_command_on_a_command_buffer_that_is_not_batched_syncs_first(self):
+        # A pNext chain (render pass begin info) is not copied: the batch goes first, then the command.
+        c = self.fn_c("vkCmdBeginRenderPass")
+        self.assertIn("omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);", c)
+        self.assertIn("omni_vk_call(OMNI_VK_ID_VK_CMD_BEGIN_RENDER_PASS, omni_a, 3)", c)
+        # An array with a stride is not sizeof apart: not batched either.
+        self.assertIn("omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);", self.fn_c("vkCmdDrawMultiEXT"))
+        self.assertIn("OMNI_VK_SYNC_BEGIN", self.fn_c("vkBeginCommandBuffer"))
+        self.assertIn("OMNI_VK_SYNC_END", self.fn_c("vkEndCommandBuffer"))
+        self.assertIn("OMNI_VK_SYNC_DISCARD", self.fn_c("vkResetCommandBuffer"))
+        self.assertNotIn("omni_vk_sync", self.fn_c("vkWaitForFences"))
 
     def test_dispatchable_first_parameter_and_u32s(self):
         rs = self.fn_rs("vk_cmd_draw")

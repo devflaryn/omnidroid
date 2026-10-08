@@ -13,6 +13,12 @@
 //!   in fewer passes, its buffers kept from frame to frame). Off by default.
 //! - `fence_poll=<microseconds>`: a guest `vkWaitForFences` polled with that period instead of the
 //!   host driver's own (spinning, on NVIDIA) wait (`crate::gpu::FENCE_POLL_US`). 0 is the driver's.
+//! - `vk_fast=0|1`: the Vulkan forwarding's fast path (`crate::gpu::FAST`: no allocation per
+//!   command, handles from a per-thread cache, no write of a zero result). Off by default;
+//!   `OMNI_VK_FAST=1` from the start.
+//! - `vk_batch=0|1`: the guest's Vulkan driver batches the commands that only record into a command
+//!   buffer (`crate::gpu::BATCH`), from each command buffer's next `vkBeginCommandBuffer`. Off by
+//!   default; `OMNI_VK_BATCH=1` from the start.
 //!
 //! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file.
 use std::path::PathBuf;
@@ -45,6 +51,19 @@ pub fn apply(line: &str) -> Option<String> {
             };
             crate::hal::compose::FAST.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("compose_fast={}", u8::from(on)))
+        }
+        "vk_fast" | "vk_batch" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            if name.trim() == "vk_fast" {
+                crate::gpu::set_fast(on);
+            } else {
+                crate::gpu::set_batch(on);
+            }
+            Some(format!("{}={}", name.trim(), u8::from(on)))
         }
         "fence_poll" => {
             let us: u32 = value.trim().parse().ok()?;
@@ -116,6 +135,20 @@ mod tests {
         assert_eq!(apply("fence_poll=x"), None);
         apply("fence_poll=0").expect("understood");
         assert_eq!(crate::gpu::FENCE_POLL_US.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_vulkan_levers_switch_the_fast_path_and_batching() {
+        use std::sync::atomic::Ordering;
+        assert_eq!(apply("vk_fast=1").as_deref(), Some("vk_fast=1"));
+        assert!(crate::gpu::FAST.load(Ordering::Relaxed));
+        assert_eq!(apply("vk_batch=1").as_deref(), Some("vk_batch=1"));
+        assert!(crate::gpu::BATCH.load(Ordering::Relaxed));
+        assert_eq!(apply("vk_fast=on"), None);
+        apply("vk_fast=0").expect("understood");
+        apply("vk_batch=0").expect("understood");
+        assert!(!crate::gpu::FAST.load(Ordering::Relaxed));
+        assert!(!crate::gpu::BATCH.load(Ordering::Relaxed));
     }
 
     #[test]

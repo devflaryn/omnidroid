@@ -202,6 +202,24 @@ impl GuestMem {
         Ok(out)
     }
 
+    /// [`read`](Self::read) into the caller's buffer: the same checks, no allocation (a forwarded
+    /// GPU command reads its request and arguments this way, thousands of times a frame).
+    pub fn read_into(&self, addr: u64, out: &mut [u8]) -> Result<(), Errno> {
+        if let Some(r) = self.remote.get() {
+            let bytes = r.read(untag(addr), out.len())?;
+            if bytes.len() != out.len() {
+                return Err(EFAULT);
+            }
+            out.copy_from_slice(&bytes);
+            return Ok(());
+        }
+        self.ensure_resident();
+        let _layout = self.layout.read();
+        let start = self.check(addr, out.len(), false)?;
+        self.copy_out(start, out);
+        Ok(())
+    }
+
     pub fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
         // Before the layout lock, as `read`: this is what stops a call that completes for the side
         // whose view is shelved from writing its answer into the other side's memory.
@@ -277,5 +295,40 @@ impl GuestMem {
             }
             at += page_left as u64;
         }
+    }
+}
+
+#[cfg(test)]
+mod timing_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn where_a_checked_copy_goes() {
+        let space = Arc::new(GuestSpace::with_config(omni_mem::GuestSpaceConfig { guest_page: Some(omni_mem::GUEST_PAGE), ..Default::default() }).unwrap());
+        let at = space.map_anonymous(omni_mem::Placement::Anywhere { align: space.page_size() }, 1 << 20, Protection::ReadWrite, omni_mem::CommitPolicy::Lazy).unwrap() as u64;
+        let mem = GuestMem::new(Arc::clone(&space), Layout::default());
+        mem.write(at, &vec![0u8; 256 * 1024]).unwrap();
+        const N: u32 = 1_000_000;
+        let time = |name: &str, f: &mut dyn FnMut()| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                f();
+            }
+            eprintln!("[probe] {name}: {:.1} ns", t0.elapsed().as_nanos() as f64 / f64::from(N));
+        };
+        let mut buf = [0u8; 32];
+        time("read_into", &mut || mem.read_into(at, &mut buf).unwrap());
+        time("read (Vec)", &mut || drop(std::hint::black_box(mem.read(at, 32).unwrap())));
+        time("layout.read", &mut || drop(std::hint::black_box(mem.layout.read())));
+        time("check", &mut || {
+            std::hint::black_box(mem.check(at, 32, false).unwrap());
+        });
+        time("region_at", &mut || drop(std::hint::black_box(space.region_at(at as usize))));
+        time("ensure_committed", &mut || drop(std::hint::black_box(space.ensure_committed(at as usize, 32))));
+        time("space.ptr", &mut || drop(std::hint::black_box(space.ptr(at as usize, 32))));
+        time("copy_out", &mut || mem.copy_out(at as usize, &mut buf));
+        let r = space.region_at(at as usize).unwrap();
+        eprintln!("[probe] region committed {} of {}", r.committed, r.len);
     }
 }

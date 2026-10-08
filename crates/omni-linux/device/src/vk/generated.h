@@ -8,6 +8,7 @@
 #ifndef VK_USE_PLATFORM_ANDROID_KHR
 #define VK_USE_PLATFORM_ANDROID_KHR
 #endif
+#include <stddef.h>
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
@@ -498,6 +499,18 @@ extern const unsigned omni_vk_entry_count;
 
 /* The transport (driver.c): command `id` with `argc` 64-bit arguments; its result. */
 uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc);
+
+/* Batching (driver.c, OMNI_VK_BATCH): a command that returns nothing and records into a command
+ * buffer is put in that buffer's batch, with the arrays it points at (`bytes` at argument `arg`)
+ * copied in, and sent with the rest at the buffer's end (or when the batch is full, or before any
+ * command on the buffer that is not batched); omni_vk_sync is that "before". */
+struct omni_vk_copy {
+    uint32_t arg;
+    size_t bytes;
+};
+void omni_vk_record(uint32_t id, const uint64_t* args, uint32_t argc, const struct omni_vk_copy* copies, uint32_t ncopies);
+enum { OMNI_VK_SYNC_FLUSH, OMNI_VK_SYNC_BEGIN, OMNI_VK_SYNC_END, OMNI_VK_SYNC_DISCARD };
+void omni_vk_sync(VkCommandBuffer commandBuffer, int how);
 
 /* The special entry points (tools/vk/special.txt), written by hand. */
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* pAllocateInfo, VkCommandBuffer* pCommandBuffers);
