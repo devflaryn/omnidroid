@@ -337,6 +337,35 @@ impl Default for GuestSpaceConfig {
     }
 }
 
+/// What [`GuestSpace::reset_zero_pages`] found and did, in 4 KiB pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ZeroPages {
+    /// Committed private pages looked at.
+    pub committed: usize,
+    /// Of them, in the host process's working set.
+    pub resident: usize,
+    /// Of those, reading all zeros.
+    pub zero: usize,
+    /// Of those, taken out of the working set (RAM given back, commit kept).
+    pub reset: usize,
+    /// Of those, written while being reset, and so left as they were.
+    pub written: usize,
+}
+
+impl ZeroPages {
+    /// The sum of two sweeps' counts.
+    #[must_use]
+    pub fn add(self, other: Self) -> Self {
+        Self {
+            committed: self.committed + other.committed,
+            resident: self.resident + other.resident,
+            zero: self.zero + other.zero,
+            reset: self.reset + other.reset,
+            written: self.written + other.written,
+        }
+    }
+}
+
 /// What [`GuestSpace::reclaim_idle`] gave back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Reclaimed {
@@ -361,6 +390,14 @@ pub struct Reclaimed {
 /// `madvise(map + 4096, 4096, MADV_DONTNEED)`, which a 16 KiB-granular check refused with `EINVAL`
 /// (2026-09-25).
 pub const SMALL_PAGE: usize = crate::subpage::GUEST_PAGE;
+
+/// [`GuestSpace::reset_zero_pages`] holds the map lock over at most this many pages (1 MiB) at a
+/// time: a guest thread's lazy commit waits behind it, so a big committed piece is done in parts.
+pub const ZERO_SCAN_CHUNK: usize = 256;
+
+/// The longest run [`GuestSpace::reset_zero_pages`] locks in the working set at once. Windows lets
+/// a process lock only a little less than its minimum working set (50 pages by default).
+pub const ZERO_RUN_PAGES: usize = 16;
 
 /// How `[address, address + len)` lies across pages of one size: the part before the first page
 /// boundary inside it, the whole pages, and the part after the last. Each part is `(start, len)`
@@ -1540,6 +1577,91 @@ impl GuestSpace {
             "reclaimed idle guest memory"
         );
         Ok(reclaimed)
+    }
+
+    /// Take the guest's **resident pages of zeros** out of the host process's working set, leaving
+    /// every byte the guest reads as it was (Windows; elsewhere nothing is done).
+    ///
+    /// On Windows the first touch of a committed page gives the process a private page of zeros,
+    /// a read as much as a write -- where Linux maps one shared zero page -- and it stays resident.
+    /// MEASURED (PS99 in-world, 2026-10-08): 169 MiB of the game's host process's guest memory was
+    /// resident pages of zeros, 10 MiB of the system's. Each such page is handed to
+    /// [`vm::reset_zero_run`], which makes its frame reusable without losing a concurrent write
+    /// (the run is locked in the working set and checked again after the reset); the pages stay
+    /// committed, so the guest's next touch needs nothing of this space and reads zeros.
+    ///
+    /// Only committed **private** memory the guest can read: never a file view (its pages are the
+    /// file's), an idle entry (decommitted soon anyway), or a [`Protection::None`] one. The map
+    /// lock is held over each piece (at most [`ZERO_SCAN_CHUNK`] pages) while it is checked and
+    /// reset, so no `munmap`, `mprotect` or decommit can change it underneath; the residency is
+    /// asked before, without the lock (asking touches nothing). Not for a space with the 4 KiB
+    /// overlay (a 16 KiB host page: not Windows).
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::Platform`] if the platform refuses the reset (none does on Windows; it is how a
+    /// future backend would say it cannot).
+    pub fn reset_zero_pages(&self) -> MemResult<ZeroPages> {
+        const PAGE: usize = SMALL_PAGE;
+        let mut out = ZeroPages::default();
+        if self.sub.is_some() || vm::page_size() != PAGE {
+            return Ok(out);
+        }
+        let candidate = |e: &Entry| {
+            matches!(e.os, OsState::Private { idle: false })
+                && e.owner.as_ref().is_some_and(|o| o.protection != Protection::None)
+        };
+        let pieces: Vec<(GuestAddr, usize)> = {
+            let inner = self.read();
+            inner.map.iter().filter(|(_, e)| candidate(e)).map(|(start, e)| (start, e.len)).collect()
+        };
+        for (entry_start, entry_len) in pieces {
+            let mut at = entry_start;
+            while at < entry_start + entry_len {
+                let len = (entry_start + entry_len - at).min(ZERO_SCAN_CHUNK * PAGE);
+                let pages = len / PAGE;
+                let host = self.host_addr(at);
+                out.committed += pages;
+                let Ok(resident) = vm::resident_pages(host, pages) else { return Ok(out) };
+                let here = at;
+                at += len;
+                if !resident.iter().any(|&r| r) {
+                    continue;
+                }
+                out.resident += resident.iter().filter(|&&r| r).count();
+                let inner = self.read();
+                // Still the committed private piece it was: nothing unmapped, decommitted or
+                // re-protected it since the list was made (every such change takes this lock).
+                if !inner.map.get(entry_start).is_some_and(|e| e.len == entry_len && candidate(e)) {
+                    break;
+                }
+                // SAFETY (both): `[host, host + len)` is committed, readable private memory of this
+                // space -- the entry says so under the map lock, which every change to it takes and
+                // which is held until this piece is done. Nothing but the CPU writes guest memory.
+                let zero = |i: usize| resident[i] && unsafe { vm::page_is_zero((host + i * PAGE) as *const u8) };
+                let mut i = 0;
+                while i < pages {
+                    if !zero(i) {
+                        i += 1;
+                        continue;
+                    }
+                    let mut j = i + 1;
+                    while j < pages && j - i < ZERO_RUN_PAGES && zero(j) {
+                        j += 1;
+                    }
+                    out.zero += j - i;
+                    match unsafe { vm::reset_zero_run((host + i * PAGE) as *mut u8, j - i) } {
+                        Ok(vm::ZeroRun::Reset) => out.reset += j - i,
+                        Ok(vm::ZeroRun::Written) => out.written += j - i,
+                        Ok(vm::ZeroRun::Skipped) => {}
+                        Err(e) => return Err(platform("reset_zero_pages", self.host_to_guest(host + i * PAGE).unwrap_or(here), (j - i) * PAGE)(e)),
+                    }
+                    i = j;
+                }
+                drop(inner);
+            }
+        }
+        Ok(out)
     }
 
     /// Every region of the space, free ranges included, in address order.

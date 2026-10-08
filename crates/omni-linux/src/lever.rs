@@ -14,7 +14,14 @@
 //! - `fence_poll=<microseconds>`: a guest `vkWaitForFences` polled with that period instead of the
 //!   host driver's own (spinning, on NVIDIA) wait (`crate::gpu::FENCE_POLL_US`). 0 is the driver's.
 //!
-//! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file.
+//! - `zero_reclaim=<seconds>`: sweep every guest process's resident pages of zeros out of the
+//!   working set that often (`crate::zero_reclaim`; RAM, not commit). 0, the default, stops it.
+//! - `madv_free=0|1`: a guest `madvise(MADV_FREE)` carried out as `MADV_DONTNEED` -- the range
+//!   decommitted at once, which Linux's "old contents or zeros" allows -- rather than ignored
+//!   (`crate::mm::MADV_FREE_DISCARDS`). Off by default.
+//!
+//! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file;
+//! `OMNI_ZERO_RECLAIM=<seconds>` and `OMNI_MADV_FREE=1` the last two.
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -46,6 +53,20 @@ pub fn apply(line: &str) -> Option<String> {
             crate::hal::compose::FAST.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("compose_fast={}", u8::from(on)))
         }
+        "zero_reclaim" => {
+            let seconds: u64 = value.trim().parse().ok()?;
+            crate::zero_reclaim::set_period(seconds);
+            Some(format!("zero_reclaim={seconds}: {}", if seconds == 0 { "no sweeps" } else { "zero pages swept out of the working set" }))
+        }
+        "madv_free" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::mm::MADV_FREE_DISCARDS.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("madv_free={}: MADV_FREE {}", u8::from(on), if on { "discards the range" } else { "is a hint" }))
+        }
         "fence_poll" => {
             let us: u32 = value.trim().parse().ok()?;
             crate::gpu::FENCE_POLL_US.store(us, std::sync::atomic::Ordering::Relaxed);
@@ -57,6 +78,7 @@ pub fn apply(line: &str) -> Option<String> {
 
 /// Start the lever reader for this host process (once), and apply `OMNI_JIT_UNSAFE_FP`.
 pub fn start() {
+    crate::mm::madv_free_from_env();
     if let Some(mask) = std::env::var("OMNI_JIT_UNSAFE_FP").ok().as_deref().and_then(parse_hex) {
         let kept = omni_cpu::dynarmic::set_live_fp_optimizations(mask);
         eprintln!("[lever] OMNI_JIT_UNSAFE_FP: jit_fp={kept:#x}");
@@ -116,6 +138,21 @@ mod tests {
         assert_eq!(apply("fence_poll=x"), None);
         apply("fence_poll=0").expect("understood");
         assert_eq!(crate::gpu::FENCE_POLL_US.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_memory_levers_switch() {
+        use std::sync::atomic::Ordering;
+        assert!(apply("zero_reclaim=30").expect("understood").starts_with("zero_reclaim=30"));
+        assert_eq!(crate::zero_reclaim::PERIOD_S.load(Ordering::Relaxed), 30);
+        apply("zero_reclaim=0").expect("understood");
+        assert_eq!(crate::zero_reclaim::PERIOD_S.load(Ordering::Relaxed), 0);
+        assert_eq!(apply("zero_reclaim=soon"), None);
+        apply("madv_free=1").expect("understood");
+        assert!(crate::mm::MADV_FREE_DISCARDS.load(Ordering::Relaxed));
+        apply("madv_free=0").expect("understood");
+        assert!(!crate::mm::MADV_FREE_DISCARDS.load(Ordering::Relaxed));
+        assert_eq!(apply("madv_free=yes"), None);
     }
 
     #[test]

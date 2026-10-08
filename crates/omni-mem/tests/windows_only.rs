@@ -21,8 +21,10 @@ use std::path::{Path, PathBuf};
 
 /// Every test file in this crate that is gated to Windows, and therefore runs nowhere else.
 /// `commit_charge.rs` measures commit charge, which only Windows has (macOS backs memory on touch;
-/// `omni-platform/tests/vm_footprint_macos.rs` measures what it does instead).
-const WINDOWS_ONLY: [&str; 1] = ["commit_charge.rs"];
+/// `omni-platform/tests/vm_footprint_macos.rs` measures what it does instead). `zero_pages.rs`
+/// checks a sweep of resident zero pages, which only the Windows backend makes (elsewhere a first
+/// read maps no private page, and the sweep does nothing).
+const WINDOWS_ONLY: [&str; 2] = ["commit_charge.rs", "zero_pages.rs"];
 
 /// Test files gated to the hosts whose `omni-platform` memory backend is implemented: Windows and
 /// macOS. They run nowhere else.

@@ -692,14 +692,24 @@ fn smc_probe(p: &Process, addr: u64, len: u64, prot: Option<u32>) -> bool {
 /// leaves zeros; the rest are hints and are accepted. A success must mean what it means on Linux:
 /// ART zeroes released arena memory with `MADV_REMOVE` and trusts the answer, and a no-op here
 /// once left stale bytes that became garbage `DexCache` entries.
+///
+/// `MADV_FREE` is a hint here unless [`MADV_FREE_DISCARDS`] is on; then it is carried out as
+/// `MADV_DONTNEED` -- one of the outcomes Linux allows ("the old contents or zeros", the kernel
+/// free to drop the pages the moment the call returns), and what the previous engine
+/// (`omni-android`'s `madvise`) did: the range is decommitted and its next touch reads zeros. An
+/// allocator that purges with it (mimalloc's reset mode, `MADV_FREE` "when purging by reset")
+/// then gives the host its RAM and commit back instead of keeping them for good.
 fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    const MADV_FREE: u64 = 8;
     const MADV_REMOVE: u64 = 9;
     let addr = crate::guest::untag(a[0]);
     if addr % p.mm.page != 0 {
         return Err(EINVAL);
     }
     madvise_stats::count(a[2], a[1]);
-    if matches!(a[2], MADV_DONTNEED | MADV_REMOVE) {
+    let discards = matches!(a[2], MADV_DONTNEED | MADV_REMOVE)
+        || (a[2] == MADV_FREE && MADV_FREE_DISCARDS.load(std::sync::atomic::Ordering::Relaxed));
+    if discards {
         let len = p.mm.span(addr, a[1]).ok_or(EINVAL)?;
         p.mm.discard(addr, len)?;
     }
@@ -876,6 +886,19 @@ pub fn install(table: &mut Table) {
     table.set(nr::MUNLOCKALL, sys_munlockall);
     table.set(nr::BRK, sys_brk);
     table.set(nr::MREMAP, sys_mremap);
+}
+
+/// Whether a guest `MADV_FREE` discards its range (as `MADV_DONTNEED`) rather than being a hint:
+/// the `madv_free=` lever (`crate::lever`), or `OMNI_MADV_FREE=1` from the start. Off by default.
+pub static MADV_FREE_DISCARDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `OMNI_MADV_FREE=1`: [`MADV_FREE_DISCARDS`] on from the start (read once, by the lever reader).
+pub fn madv_free_from_env() {
+    if std::env::var("OMNI_MADV_FREE").as_deref() == Ok("1") {
+        MADV_FREE_DISCARDS.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_MADV_FREE: madv_free=1");
+    }
 }
 
 /// `OMNI_MADVISE_STATS=<seconds>`: this host process's `madvise` calls by advice, with the bytes
