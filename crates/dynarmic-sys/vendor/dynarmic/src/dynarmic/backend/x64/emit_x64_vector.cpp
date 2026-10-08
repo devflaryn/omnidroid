@@ -229,12 +229,22 @@ void EmitX64::EmitVectorGetElement16(EmitContext& ctx, IR::Inst* inst) {
     ctx.reg_alloc.DefineValue(inst, dest);
 }
 
+std::atomic<std::uint32_t> live_scalar_fp_in_xmm{0};
+
 void EmitX64::EmitVectorGetElement32(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[1].IsImmediate());
     const u8 index = args[1].GetImmediateU8();
 
-    // TODO: DefineValue directly on Argument for index == 0
+    // Omnidroid patch 0039: see `EmitVectorGetElement64`. `insertps` with lanes 1-3 zeroed is the
+    // in-domain equivalent of `movd r32, xmm` followed by `movd xmm, r32`.
+    if (index == 0 && code.HasHostFeature(HostFeature::SSE41) && live_scalar_fp_in_xmm.load(std::memory_order_relaxed) != 0) {
+        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+        code.insertps(dest, source, 0b00'00'1110);
+        ctx.reg_alloc.DefineValue(inst, dest);
+        return;
+    }
 
     const Xbyak::Reg32 dest = ctx.reg_alloc.ScratchGpr().cvt32();
 
@@ -254,6 +264,24 @@ void EmitX64::EmitVectorGetElement64(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ASSERT(args[1].IsImmediate());
     const u8 index = args[1].GetImmediateU8();
+
+    // Omnidroid patch 0039: element 0 stays in an XMM register. Every scalar floating-point read
+    // of the A64 frontend is this (`V_scalar`: `VectorGetElement(GetQ(vec), 0)`) and its consumer
+    // is an SSE instruction, so upstream's `movq gpr, xmm` here was followed by a `movq xmm, gpr`
+    // there: two cross-domain moves on every operand, ~4x the host's latency on a dependent
+    // `FADD D` chain (5.2 against 1.3 ns per add, `tests/codegen_bench.rs`). `movq xmm, xmm` gives
+    // the very value that round trip did -- the element, every bit above it zero -- in one
+    // in-domain instruction, and a GPR consumer still gets a `movq` from the register allocator.
+    // Zeroed rather than aliased to the vector itself (upstream's TODO): some scalar emitters use
+    // packed instructions (`PostProcessNaN`'s `cmpunordp`), which on the vector's other lanes
+    // raise exception flags the guest can read in `FPSR` (`tests/scalar_fp_xmm.rs` found that).
+    if (index == 0 && live_scalar_fp_in_xmm.load(std::memory_order_relaxed) != 0) {
+        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
+        code.movq(dest, source);
+        ctx.reg_alloc.DefineValue(inst, dest);
+        return;
+    }
 
     if (index == 0) {
         // TODO: DefineValue directly on Argument for index == 0

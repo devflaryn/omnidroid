@@ -186,6 +186,42 @@ fn the_precise_get_set_elimination() {
     println!();
 }
 
+/// **What Top Byte Ignore costs on every direct access.** `omni-linux` runs with
+/// `top_byte_ignore` (56-bit fastmem, mirrored: a `shl`/`shr` pair before each access to drop the
+/// tag) against the 64-bit identity mapping, where the guest address is used as it is.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_top_byte_ignore() {
+    let _serial = serialized();
+    println!("\n== Top Byte Ignore (n = {N} per configuration) ==");
+    let workloads: [(&str, u64, fn(usize, u64) -> Vec<u32>); 2] = [
+        ("memory-heavy, 5 insns/iter, 2 accesses", 5, memory_loop),
+        ("mixed, 12 insns/iter, 2 accesses", 12, mixed_loop),
+    ];
+    for (workload, per_iteration, build) in workloads {
+        println!("  {workload}:");
+        for (label, tbi) in [("64-bit identity       ", false), ("TBI (56-bit, mirrored)", true)] {
+            let guest = Guest::with_options(DynarmicOptions { top_byte_ignore: tbi, ..Default::default() });
+            let entry = guest.load(&build(guest.data, ITERATIONS));
+            guest.write_u64(guest.data, 1);
+            let (mut cpu, sentinel) = guest.thread();
+            let summary = measure(|| {
+                cpu.set_x(x(30), sentinel as u64);
+                let exit = cpu.run(entry, RunLimit::Unlimited).expect("the loop runs");
+                assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+            });
+            println!(
+                "    {label} : {:6.3} ns/iter median  [{:6.3} .. {:6.3}]  {:6.0} Mguest-insn/s",
+                summary.median.as_secs_f64() * 1e9 / ITERATIONS as f64,
+                summary.min.as_secs_f64() * 1e9 / ITERATIONS as f64,
+                summary.max.as_secs_f64() * 1e9 / ITERATIONS as f64,
+                (ITERATIONS * per_iteration) as f64 / summary.median.as_secs_f64() / 1e6,
+            );
+        }
+    }
+    println!();
+}
+
 const ITERATIONS: u64 = 1_000_000;
 /// Five instructions in the loop body, plus a prologue this ignores.
 const LOOP_INSTRUCTIONS: u64 = ITERATIONS * 5;

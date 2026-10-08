@@ -6,6 +6,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -40,6 +42,13 @@ enum class OptimizationFlag : u32;
 namespace Dynarmic::Backend::X64 {
 
 class BlockOfCode;
+
+/// Omnidroid patch 0039: non-zero keeps element 0 of a vector (`VectorGetElement32/64`, every
+/// scalar floating-point operand) and a 32-bit value zero-extended from an XMM register
+/// (`ZeroExtendWordToLong`, a single-precision result written back) in an XMM register, zeroed
+/// above the element, instead of copying it through a GPR and back. The same values; process-wide,
+/// read when a block is emitted.
+extern std::atomic<std::uint32_t> live_scalar_fp_in_xmm;
 
 using A64FullVectorWidth = std::integral_constant<size_t, 128>;
 

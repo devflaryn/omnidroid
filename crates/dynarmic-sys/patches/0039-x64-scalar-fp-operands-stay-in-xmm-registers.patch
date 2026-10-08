@@ -1,0 +1,101 @@
+diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
+index bea1c1a..6adbb57 100644
+--- a/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/backend/x64/emit_x64.h
+@@ -6,6 +6,8 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
++#include <cstdint>
+ #include <functional>
+ #include <memory>
+ #include <optional>
+@@ -41,6 +43,13 @@ namespace Dynarmic::Backend::X64 {
+ 
+ class BlockOfCode;
+ 
++/// Omnidroid patch 0039: non-zero keeps element 0 of a vector (`VectorGetElement32/64`, every
++/// scalar floating-point operand) and a 32-bit value zero-extended from an XMM register
++/// (`ZeroExtendWordToLong`, a single-precision result written back) in an XMM register, zeroed
++/// above the element, instead of copying it through a GPR and back. The same values; process-wide,
++/// read when a block is emitted.
++extern std::atomic<std::uint32_t> live_scalar_fp_in_xmm;
++
+ using A64FullVectorWidth = std::integral_constant<size_t, 128>;
+ 
+ // Array alias that always sizes itself according to the given type T
+diff --git a/src/dynarmic/backend/x64/emit_x64_data_processing.cpp b/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+index 98197c2..dec8a09 100644
+--- a/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
++++ b/src/dynarmic/backend/x64/emit_x64_data_processing.cpp
+@@ -1514,6 +1514,16 @@ void EmitX64::EmitZeroExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
+ 
+ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    // Omnidroid patch 0039: a single-precision result written back (`V_scalar`:
++    // `SetQ(ZeroExtendToQuad(value))`) arrives here in an XMM register; zero-extend it there
++    // (`insertps` zeroing lanes 1-3) rather than through a GPR and back -- the same value.
++    if (args[0].IsInXmm() && code.HasHostFeature(HostFeature::SSE41) && live_scalar_fp_in_xmm.load(std::memory_order_relaxed) != 0) {
++        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(args[0]);
++        const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
++        code.insertps(result, source, 0b00'00'1110);
++        ctx.reg_alloc.DefineValue(inst, result);
++        return;
++    }
+     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
+     code.mov(result.cvt32(), result.cvt32());  // x64 zeros upper 32 bits on a 32-bit move
+     ctx.reg_alloc.DefineValue(inst, result);
+diff --git a/src/dynarmic/backend/x64/emit_x64_vector.cpp b/src/dynarmic/backend/x64/emit_x64_vector.cpp
+index 5d5ea17..e0a60ea 100644
+--- a/src/dynarmic/backend/x64/emit_x64_vector.cpp
++++ b/src/dynarmic/backend/x64/emit_x64_vector.cpp
+@@ -229,12 +229,22 @@ void EmitX64::EmitVectorGetElement16(EmitContext& ctx, IR::Inst* inst) {
+     ctx.reg_alloc.DefineValue(inst, dest);
+ }
+ 
++std::atomic<std::uint32_t> live_scalar_fp_in_xmm{0};
++
+ void EmitX64::EmitVectorGetElement32(EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     ASSERT(args[1].IsImmediate());
+     const u8 index = args[1].GetImmediateU8();
+ 
+-    // TODO: DefineValue directly on Argument for index == 0
++    // Omnidroid patch 0039: see `EmitVectorGetElement64`. `insertps` with lanes 1-3 zeroed is the
++    // in-domain equivalent of `movd r32, xmm` followed by `movd xmm, r32`.
++    if (index == 0 && code.HasHostFeature(HostFeature::SSE41) && live_scalar_fp_in_xmm.load(std::memory_order_relaxed) != 0) {
++        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(args[0]);
++        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
++        code.insertps(dest, source, 0b00'00'1110);
++        ctx.reg_alloc.DefineValue(inst, dest);
++        return;
++    }
+ 
+     const Xbyak::Reg32 dest = ctx.reg_alloc.ScratchGpr().cvt32();
+ 
+@@ -255,6 +265,24 @@ void EmitX64::EmitVectorGetElement64(EmitContext& ctx, IR::Inst* inst) {
+     ASSERT(args[1].IsImmediate());
+     const u8 index = args[1].GetImmediateU8();
+ 
++    // Omnidroid patch 0039: element 0 stays in an XMM register. Every scalar floating-point read
++    // of the A64 frontend is this (`V_scalar`: `VectorGetElement(GetQ(vec), 0)`) and its consumer
++    // is an SSE instruction, so upstream's `movq gpr, xmm` here was followed by a `movq xmm, gpr`
++    // there: two cross-domain moves on every operand, ~4x the host's latency on a dependent
++    // `FADD D` chain (5.2 against 1.3 ns per add, `tests/codegen_bench.rs`). `movq xmm, xmm` gives
++    // the very value that round trip did -- the element, every bit above it zero -- in one
++    // in-domain instruction, and a GPR consumer still gets a `movq` from the register allocator.
++    // Zeroed rather than aliased to the vector itself (upstream's TODO): some scalar emitters use
++    // packed instructions (`PostProcessNaN`'s `cmpunordp`), which on the vector's other lanes
++    // raise exception flags the guest can read in `FPSR` (`tests/scalar_fp_xmm.rs` found that).
++    if (index == 0 && live_scalar_fp_in_xmm.load(std::memory_order_relaxed) != 0) {
++        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(args[0]);
++        const Xbyak::Xmm dest = ctx.reg_alloc.ScratchXmm();
++        code.movq(dest, source);
++        ctx.reg_alloc.DefineValue(inst, dest);
++        return;
++    }
++
+     if (index == 0) {
+         // TODO: DefineValue directly on Argument for index == 0
+         const Xbyak::Reg64 dest = ctx.reg_alloc.ScratchGpr().cvt64();

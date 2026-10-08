@@ -346,3 +346,24 @@ allocations are not cleared; one made after the prelude (none today) still is, a
 `OMNI_JIT_POOL_MEMSET=1` clears these too (the pin's behaviour, read once per process, for an A/B).
 Verified: `tests/resident.rs` (`QueryWorkingSetEx` over a new cache's own reservation: 0.88 MiB
 resident of 4.00 committed, 2.88 MiB with `OMNI_JIT_POOL_MEMSET=1`).
+
+### 0039 — x64: scalar floating-point operands stay in XMM registers (switch, off by default)
+
+x64. The A64 frontend reads every scalar FP operand as `VectorGetElement(GetQ(v), 0)`, which the
+pin emitted as `movq gpr, xmm`; the SSE consumer then moved it straight back (`movq xmm, gpr`), and
+a single-precision result written back went through `ZeroExtendWordToLong` in a GPR the same way:
+two cross-domain moves per operand on the dependency chain. With `live_scalar_fp_in_xmm` on,
+`VectorGetElement64/32` element 0 is `movq xmm, xmm` / `insertps` (lanes 1-3 zeroed) and
+`ZeroExtendWordToLong` of an XMM value is `insertps`: the very values the round trip produced
+(element, zeros above), so every consumer sees what it saw. Not aliased to the vector register
+itself (upstream's TODO): `PostProcessNaN`'s packed `cmpunordp` on the vector's other lanes raised
+`FPSR.IOC` from a signalling NaN there -- the differential test below found that in 923 trials.
+Switch: `od_set_scalar_fp_in_xmm`, `OMNI_JIT_SCALAR_FP_XMM=0|1`, `omni-linux`'s `jit_fpxmm=` lever;
+default 0 until an in-world A/B. Measured (`tests/codegen_bench.rs`, E-cores, idle priority, shared
+cache, ns per loop of 4 ops, 1.5 of it loop): dependent `FADD D` 22.8 -> 11.5, `FADD S` 32.6 ->
+12.6-14.3, `FMADD D` 27.4 -> 17.7; independent `FADD D` 8.3 -> 3.6-3.8, `FADD S` 13.2 -> 8.3;
+`FCVTZS` 7.6 -> 4.2; host `addsd` chain 6.4. Verified: `tests/scalar_fp_xmm.rs` (3,000 random
+blocks of scalar FP, conversions, FMOV, FCSEL/FCMP, vector ops, scalar loads/stores under seven
+`FPCR` settings, every upper lane full: registers, NZCV, `FPSR` and memory identical off and on),
+and the dynarmic-sys and omni-cpu suites with the switch defaulted on (only the known
+`shared_cache` timing, `low_window` and `subpage` failures).
