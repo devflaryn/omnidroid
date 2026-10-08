@@ -1052,6 +1052,15 @@ impl Presenter {
         }
     }
 
+    /// **Forget the presented image**: the window stops repainting it itself, because something
+    /// else now draws its client area -- a swapchain on [`Window::raw`] (see this module's "one
+    /// source per window"). The next present gives it an image again. Windows only; elsewhere
+    /// nothing to forget yet.
+    pub fn clear(&self) {
+        #[cfg(target_os = "windows")]
+        self.inner.clear();
+    }
+
     /// The window's client size in physical pixels as the host has it now -- on Windows asked of
     /// the OS, so it follows a border drag as it happens; elsewhere as the window's thread last
     /// heard it. `(0, 0)` while minimised; `None` once the window is gone.

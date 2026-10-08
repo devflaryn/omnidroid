@@ -20,6 +20,13 @@
 //!   (`crate::hal::compose::ZERO`): two to three fewer 5.6 MB copies a frame. Off by default.
 //! - `present_bgra=0|1`: the frame composed as BGRA, and the Win32 window takes it shared rather
 //!   than swizzling a copy (`crate::hal::compose::BGRA_OUT`). Off by default.
+//! - `present_gpu=0|1`: the display window presented through a Vulkan swapchain (a copy into
+//!   host-visible memory, the scaling a GPU blit) instead of GDI's `StretchDIBits`
+//!   (`crate::gpu::window_present`). Off by default.
+//! - `gralloc_direct=0|1`: an app's released frame copied by the GPU straight into its gralloc
+//!   region (imported as Vulkan memory) instead of into a staging buffer the release worker then
+//!   copies on the CPU (`crate::gpu::native::DIRECT`). Needs devices made with
+//!   `OMNI_GRALLOC_DIRECT=ready` (or `=1`, on from the start). Off by default.
 //! - `fence_poll=<microseconds>`: a guest `vkWaitForFences` polled with that period instead of the
 //!   host driver's own (spinning, on NVIDIA) wait (`crate::gpu::FENCE_POLL_US`). 0 is the driver's.
 //! - `vsync_hz=<n>`: the composer's vsync rate, 1..=1000 (`crate::hal::composer::VSYNC_PERIOD_NS`;
@@ -158,6 +165,26 @@ pub fn apply(line: &str) -> Option<String> {
             crate::mm::MADV_FREE_DISCARDS.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("madv_free={}: MADV_FREE {}", u8::from(on), if on { "discards the range" } else { "is a hint" }))
         }
+        "gralloc_direct" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let _ = crate::gpu::native::direct_wanted();
+            crate::gpu::native::DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("gralloc_direct={}", u8::from(on)))
+        }
+        "present_gpu" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let _ = crate::gpu::window_present::on();
+            crate::gpu::window_present::ON.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("present_gpu={}", u8::from(on)))
+        }
         "fence_poll" => {
             let us: u32 = value.trim().parse().ok()?;
             crate::gpu::FENCE_POLL_US.store(us, std::sync::atomic::Ordering::Relaxed);
@@ -267,6 +294,14 @@ mod tests {
         apply("present_bgra=0").expect("understood");
         assert!(!ZERO.load(Ordering::Relaxed) && !BGRA_OUT.load(Ordering::Relaxed));
         assert_eq!(apply("compose_zero=on"), None);
+        assert_eq!(apply("present_gpu=1").as_deref(), Some("present_gpu=1"));
+        assert!(crate::gpu::window_present::on());
+        apply("present_gpu=0").expect("understood");
+        assert!(!crate::gpu::window_present::on());
+        assert_eq!(apply("gralloc_direct=1").as_deref(), Some("gralloc_direct=1"));
+        assert!(crate::gpu::native::DIRECT.load(Ordering::Relaxed));
+        apply("gralloc_direct=0").expect("understood");
+        assert!(!crate::gpu::native::DIRECT.load(Ordering::Relaxed));
     }
 
     #[test]

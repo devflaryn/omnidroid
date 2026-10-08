@@ -327,10 +327,11 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     let mut flood: Option<(Instant, Duration, Instant, u32)> = None;
     let stop = Arc::new(AtomicBool::new(false));
     let presenter = window.presenter();
+    let raw = window.raw();
     let present = {
         let stop = Arc::clone(&stop);
         let composer = Arc::clone(&composer);
-        std::thread::Builder::new().name("omni-display-present".into()).spawn(move || present(&presenter, &framebuffer, &composer, &stop))
+        std::thread::Builder::new().name("omni-display-present".into()).spawn(move || present(&presenter, raw, &framebuffer, &composer, &stop))
     };
     let present = match present {
         Ok(handle) => handle,
@@ -470,7 +471,7 @@ fn scripted(command: Command, input: &mut Input, now: Instant, s: (f64, f64), di
 }
 
 /// The present thread: each frame to the window, and the window's size to the display.
-fn present(presenter: &Presenter, framebuffer: &Framebuffer, composer: &Composer, stop: &AtomicBool) {
+fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebuffer: &Framebuffer, composer: &Composer, stop: &AtomicBool) {
     // The framebuffer frame last shown, and how many frames were shown.
     let (mut shown, mut presented) = (0u64, 0u64);
     let mut refused = false;
@@ -480,13 +481,61 @@ fn present(presenter: &Presenter, framebuffer: &Framebuffer, composer: &Composer
     let mut pending: Option<((u32, u32), Instant)> = None;
     let mut report = Instant::now();
     let max_pixels = display_max_pixels();
+    // `present_gpu`: the window's swapchain, made when the lever is turned on (and dropped when it
+    // is turned off, the window back to GDI); once it fails, GDI for good. The client size it last
+    // presented at: a frame is presented again at a new size even when none arrives (GDI's
+    // `WM_PAINT` repaints the kept image; a swapchain has nothing to repaint from).
+    let mut gpu: Option<crate::gpu::window_present::WindowPresenter> = None;
+    let mut gpu_failed = false;
+    let mut gpu_size = (0u32, 0u32);
     while !stop.load(Ordering::Acquire) {
-        if framebuffer.wait_frame(shown + 1, FRAME_WAIT) {
+        let want_gpu = crate::gpu::window_present::on() && !gpu_failed;
+        if want_gpu && gpu.is_none() {
+            match crate::gpu::window_present::WindowPresenter::new(raw) {
+                Ok(p) => {
+                    eprintln!("[window] present_gpu: the window presented by {}", p.describe());
+                    presenter.clear();
+                    gpu = Some(p);
+                    gpu_size = (0, 0);
+                    shown = shown.saturating_sub(1); // the current frame, on the swapchain at once
+                }
+                Err(e) => {
+                    eprintln!("[window] present_gpu: no swapchain ({e}); GDI");
+                    gpu_failed = true;
+                }
+            }
+        } else if !want_gpu && gpu.is_some() {
+            gpu = None;
+            shown = shown.saturating_sub(1);
+            eprintln!("[window] present_gpu off: GDI");
+        }
+        let resized = gpu.is_some() && presenter.client_size().is_some_and(|s| s != gpu_size);
+        if framebuffer.wait_frame(shown + 1, if resized { Duration::ZERO } else { FRAME_WAIT }) || resized {
             let (n, fw, fh, pixels, bgra) = framebuffer.frame_raw();
-            if n > shown {
+            if n > shown || resized {
                 shown = n;
-                // A BGRA frame (`present_bgra`) is the window's own format: handed over shared.
-                let shown_now = if bgra { presenter.present_bgra(pixels, fw, fh) } else { presenter.present_rgba(&pixels, fw, fh) };
+                let shown_now = if let Some(g) = gpu.as_mut() {
+                    let client = presenter.client_size().unwrap_or_default();
+                    match g.present(&pixels, fw, fh, bgra, client) {
+                        Ok(_) => {
+                            // Drawn or not (minimised, a swapchain out of date): the next frame
+                            // tries again; this size is not retried in a loop.
+                            gpu_size = client;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            eprintln!("[window] present_gpu failed ({e}); GDI");
+                            gpu = None;
+                            gpu_failed = true;
+                            if bgra { presenter.present_bgra(pixels, fw, fh) } else { presenter.present_rgba(&pixels, fw, fh) }
+                        }
+                    }
+                } else if bgra {
+                    // A BGRA frame (`present_bgra`) is the window's own format: handed over shared.
+                    presenter.present_bgra(pixels, fw, fh)
+                } else {
+                    presenter.present_rgba(&pixels, fw, fh)
+                };
                 match shown_now {
                     Ok(()) => presented += 1,
                     Err(e) if !refused => {

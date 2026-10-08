@@ -235,6 +235,12 @@ impl Presenter {
         Ok(())
     }
 
+    /// Drop the image: `WM_PAINT` then paints nothing (the class has no background brush), so a
+    /// swapchain on the window is not drawn over.
+    pub(super) fn clear(&self) {
+        lock(&self.canvas).image = None;
+    }
+
     /// `GetClientRect`, callable from any thread: the size the border is at, mid-drag included.
     pub(super) fn client_size(&self) -> Option<(u32, u32)> {
         let canvas = lock(&self.canvas);

@@ -58,11 +58,14 @@ pub(crate) struct DeviceInfo {
     copiers: HashMap<u32, Copier>,
     /// The command pool of each family's copier, which the images' own come from.
     pools: HashMap<u32, vk::CommandPool>,
+    /// The host device was made with `VK_EXT_external_memory_host` (`gralloc_direct`): a gralloc
+    /// region's view can be imported as its images' copy target.
+    pub host_import: bool,
 }
 
 impl DeviceInfo {
     pub(crate) fn new(memory: &vk::PhysicalDeviceMemoryProperties) -> Self {
-        Self { memory_types: memory.memory_types[..memory.memory_type_count as usize].to_vec(), queues: HashMap::new(), copiers: HashMap::new(), pools: HashMap::new() }
+        Self { memory_types: memory.memory_types[..memory.memory_type_count as usize].to_vec(), queues: HashMap::new(), copiers: HashMap::new(), pools: HashMap::new(), host_import: false }
     }
 
     fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> R<u32> {
@@ -70,6 +73,90 @@ impl DeviceInfo {
             .find(|&i| bits & (1 << i) != 0 && self.memory_types[i as usize].property_flags.contains(want))
             .ok_or(CallError::Missing("a memory type"))
     }
+}
+
+/// **The release's copy straight into the gralloc region** (`gralloc_direct=0|1` in the lever file,
+/// read live; **off by default**). The copy went GPU image -> host-cached staging buffer, then the
+/// worker copied the staging buffer into the region on the CPU (5.6 MB a frame at 1575x890, after
+/// waiting for the GPU). With this on, the region's own host view is the copy's destination -- the
+/// view imported as Vulkan memory (`VK_EXT_external_memory_host`, the region's pixels page-aligned
+/// at `PIXELS_AT` 4096) -- and the worker only waits for the fence and bumps the generation. Same
+/// bytes in the same place at the same moment; one CPU copy a frame fewer in the app's process.
+///
+/// The host device needs the extension from its creation: `OMNI_GRALLOC_DIRECT=ready` asks for it
+/// (the path still off, for an A/B inside one session: `gralloc_direct=0|1`), `=1` asks for it and
+/// turns the path on. Without either, devices are made as before and the lever finds nothing to
+/// switch to. Probed: `gpu::window_present::tests::a_gralloc_region_imports_as_gpu_memory`.
+pub static DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether devices are made able to import gralloc regions (`OMNI_GRALLOC_DIRECT=ready|1`, or the
+/// lever already on); `OMNI_GRALLOC_DIRECT=1` also turns [`DIRECT`] on.
+pub(crate) fn direct_wanted() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("OMNI_GRALLOC_DIRECT").as_deref() {
+        Ok("1") => {
+            DIRECT.store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        Ok("ready") => true,
+        _ => false,
+    });
+    env || DIRECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A gralloc region's view imported as a buffer of the device ([`DIRECT`]).
+struct Direct {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+/// Import `bytes` of `shm`'s view at `pixels_at` as a transfer-destination buffer of device `d`;
+/// the view stays pinned until the buffer is freed (`destroy_image`).
+fn import_region(t: &Arc<Table>, d: vk::Device, memory_types: &[vk::MemoryType], shm: &Shm, pixels_at: u64, bytes: usize) -> R<Direct> {
+    let size = bytes.div_ceil(4096) * 4096;
+    let ptr = shm.pin_view(pixels_at, bytes).ok_or(CallError::Missing("a pinned view"))?;
+    let made = (|| -> R<Direct> {
+        let props_fn = t.lookup(c"vkGetMemoryHostPointerPropertiesEXT").ok_or(CallError::Missing("vkGetMemoryHostPointerPropertiesEXT"))?;
+        // SAFETY: the entry point's Vulkan signature.
+        let props_fn: vk::PFN_vkGetMemoryHostPointerPropertiesEXT = unsafe { std::mem::transmute(props_fn) };
+        let mut props = vk::MemoryHostPointerPropertiesEXT::default();
+        // SAFETY: `ptr` is the pinned view, page-aligned (the view is, and `pixels_at` is 4096).
+        check(unsafe { props_fn(d, vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT, ptr.cast(), &mut props) })?;
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let bci = vk::BufferCreateInfo::default().size(bytes as u64).usage(vk::BufferUsageFlags::TRANSFER_DST).push_next(&mut external);
+        let mut buffer = vk::Buffer::null();
+        check(unsafe { vkfn!(t, ID_VK_CREATE_BUFFER, c"vkCreateBuffer", vk::PFN_vkCreateBuffer)(d, &bci, std::ptr::null(), &mut buffer) })?;
+        let mut req = vk::MemoryRequirements::default();
+        unsafe { vkfn!(t, ID_VK_GET_BUFFER_MEMORY_REQUIREMENTS, c"vkGetBufferMemoryRequirements", vk::PFN_vkGetBufferMemoryRequirements)(d, buffer, &mut req) };
+        let bits = props.memory_type_bits & req.memory_type_bits;
+        let coherent = (0..memory_types.len() as u32).find(|&i| bits & (1 << i) != 0 && memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT));
+        let destroy = vkfn!(t, ID_VK_DESTROY_BUFFER, c"vkDestroyBuffer", vk::PFN_vkDestroyBuffer);
+        let free = vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory);
+        // SAFETY: the buffer made above, used by nothing yet.
+        let destroy_buffer = || unsafe { destroy(d, buffer, std::ptr::null()) };
+        let Some(kind) = coherent else {
+            destroy_buffer();
+            return Err(CallError::Missing("a coherent memory type for the region"));
+        };
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default().handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT).host_pointer(ptr.cast());
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(size.max(req.size as usize) as u64).memory_type_index(kind).push_next(&mut import);
+        let mut memory = vk::DeviceMemory::null();
+        if let Err(e) = check(unsafe { vkfn!(t, ID_VK_ALLOCATE_MEMORY, c"vkAllocateMemory", vk::PFN_vkAllocateMemory)(d, &ai, std::ptr::null(), &mut memory) }) {
+            destroy_buffer();
+            return Err(e);
+        }
+        if let Err(e) = check(unsafe { vkfn!(t, ID_VK_BIND_BUFFER_MEMORY, c"vkBindBufferMemory", vk::PFN_vkBindBufferMemory)(d, buffer, memory, 0) }) {
+            destroy_buffer();
+            // SAFETY: the memory imported above, bound to nothing.
+            unsafe { free(d, memory, std::ptr::null()) };
+            return Err(e);
+        }
+        Ok(Direct { buffer, memory })
+    })();
+    if made.is_err() {
+        shm.unpin_view();
+    }
+    made
 }
 
 /// A command buffer and fence for the host's own copies on one queue family.
@@ -97,6 +184,8 @@ pub(crate) struct NativeImage {
     copier: Option<Copier>,
     /// A copy of it is on its way (the worker's).
     in_flight: Arc<InFlight>,
+    /// Its region's view as a buffer of the device, for [`DIRECT`] (when the device can import).
+    direct: Option<Direct>,
 }
 
 /// Whether an image's copy is on its way, and a wait for it to land.
@@ -127,6 +216,8 @@ struct Landing {
     shm: Arc<Shm>,
     pixels_at: u64,
     in_flight: Arc<InFlight>,
+    /// The copy went straight into the region ([`DIRECT`]): nothing to copy once it lands.
+    direct: bool,
 }
 
 // SAFETY: the Vulkan handles are plain handles; the staging mapping (`mapped`) is the image's, read
@@ -152,14 +243,14 @@ impl Landing {
             if super::stats::enabled() {
                 super::stats::add(super::special::ID_GRALLOC_USAGE + 6, waited.elapsed());
             }
-            if self.invalidate {
+            if self.invalidate && !self.direct {
                 let range = vk::MappedMemoryRange { memory: self.staging_memory, offset: 0, size: vk::WHOLE_SIZE, ..Default::default() };
                 check(unsafe { vkfn!(t, ID_VK_INVALIDATE_MAPPED_MEMORY_RANGES, c"vkInvalidateMappedMemoryRanges", vk::PFN_vkInvalidateMappedMemoryRanges)(d, 1, &range) })?;
             }
             Ok(())
         })();
         let written = std::time::Instant::now();
-        if ok.is_ok() {
+        if ok.is_ok() && !self.direct {
             // SAFETY: `mapped` is the staging memory's host mapping, `bytes` long, written by the copy
             // the fence has just seen finish.
             let pixels = unsafe { std::slice::from_raw_parts(self.mapped as *const u8, self.bytes) };
@@ -338,11 +429,28 @@ fn attach(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, image: vk::Image,
             },
         };
         let staging_memory = allocate(t, d, req.size, staging_type)?;
+        let (host_import, memory_types) = (info.host_import, info.memory_types.clone());
         drop(devices);
         check(unsafe { vkfn!(t, ID_VK_BIND_BUFFER_MEMORY, c"vkBindBufferMemory", vk::PFN_vkBindBufferMemory)(d, staging, staging_memory, 0) })?;
         let mut mapped = std::ptr::null_mut();
         check(unsafe { vkfn!(t, ID_VK_MAP_MEMORY, c"vkMapMemory", vk::PFN_vkMapMemory)(d, staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty(), &mut mapped) })?;
-        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, invalidate, bytes, width, height, stride, shm, pixels_at, copier: None, in_flight: Arc::default() })
+        // `gralloc_direct`: the region's view as a second copy target (the staging buffer stays, for
+        // the lever off and for a region that cannot be imported).
+        let direct = if host_import && pixels_at % 4096 == 0 {
+            match import_region(t, d, &memory_types, &shm, pixels_at, bytes) {
+                Ok(direct) => Some(direct),
+                Err(e) => {
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("[gpu] gralloc_direct: a region could not be imported ({e:?}); its copies go through the staging buffer");
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, invalidate, bytes, width, height, stride, shm, pixels_at, copier: None, in_flight: Arc::default(), direct })
     }
 }
 
@@ -368,6 +476,14 @@ pub(crate) fn destroy_image(gpu: &Gpu, t: &Arc<Table>, image: u64) -> R<bool> {
         vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory)(d, n.memory, std::ptr::null());
         vkfn!(t, ID_VK_DESTROY_BUFFER, c"vkDestroyBuffer", vk::PFN_vkDestroyBuffer)(d, n.staging, std::ptr::null());
         vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory)(d, n.staging_memory, std::ptr::null());
+        if let Some(direct) = &n.direct {
+            vkfn!(t, ID_VK_DESTROY_BUFFER, c"vkDestroyBuffer", vk::PFN_vkDestroyBuffer)(d, direct.buffer, std::ptr::null());
+            vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory)(d, direct.memory, std::ptr::null());
+        }
+    }
+    if n.direct.is_some() {
+        // The import is freed: the view may go.
+        n.shm.unpin_view();
     }
     Ok(true)
 }
@@ -428,6 +544,9 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     let (device, width, height, stride, staging) = (img.device, img.width, img.height, img.stride, img.staging);
     let (mapped, bytes, shm, pixels_at) = (img.mapped, img.bytes, Arc::clone(&img.shm), img.pixels_at);
     let (invalidate, staging_memory) = (img.invalidate, img.staging_memory);
+    // `gralloc_direct`: the copy goes into the region itself, and lands with nothing left to copy.
+    let direct = img.direct.as_ref().filter(|_| DIRECT.load(std::sync::atomic::Ordering::Relaxed)).map(|d| d.buffer);
+    let staging = direct.unwrap_or(staging);
     let own = img.copier.as_ref().map(|c| (c.cb, c.fence));
     drop(natives);
     let d = vk::Device::from_raw(device);
@@ -526,7 +645,7 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     let _ = shm.read_at(&mut g, CONTENT_GENERATION_AT);
     let _ = shm.write_at(&u64::from_le_bytes(g).wrapping_add(1).to_le_bytes(), PENDING_GENERATION_AT);
     *in_flight.busy.lock() = true;
-    let landing = Landing { table: Arc::clone(&t), device, fence, invalidate, staging_memory, mapped, bytes, shm, pixels_at, in_flight: Arc::clone(&in_flight) };
+    let landing = Landing { table: Arc::clone(&t), device, fence, invalidate, staging_memory, mapped, bytes, shm, pixels_at, in_flight: Arc::clone(&in_flight), direct: direct.is_some() };
     // `OMNI_ASYNC_RELEASE=0`: landed here, on the app's thread, as before (for comparison).
     static ASYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ASYNC.get_or_init(|| std::env::var("OMNI_ASYNC_RELEASE").as_deref() != Ok("0")) {

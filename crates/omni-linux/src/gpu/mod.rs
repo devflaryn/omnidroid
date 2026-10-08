@@ -25,6 +25,7 @@ pub(crate) mod generated;
 pub mod gl;
 pub(crate) mod native;
 pub(crate) mod special;
+pub mod window_present;
 
 /// `_IOWR('G', 1, struct omni_gpu_call)`, a 32-byte argument.
 pub const OMNI_GPU_CALL: u64 = 0xc020_4701;
@@ -106,6 +107,13 @@ impl Table {
         // SAFETY: ash resolved `vkGetInstanceProcAddr` from the loader; its signature is Vulkan's.
         let gipa: GetProcAddr = unsafe { std::mem::transmute(entry()?.static_fn().get_instance_proc_addr) };
         Ok(Self::new(gipa, instance))
+    }
+
+    /// A host entry point the forwarding table has no id for (a host-only command the host itself
+    /// calls, never the guest), asked for each time.
+    pub(crate) fn lookup(&self, name: &CStr) -> Option<usize> {
+        // SAFETY: `owner` is a live host instance or device and `name` is NUL-terminated.
+        unsafe { (self.get_proc)(self.owner, name.as_ptr()) }.map(|f| f as usize)
     }
 
     /// The host driver's entry point `names[0]` (or an alias), for command `id`.
