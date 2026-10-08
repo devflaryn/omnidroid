@@ -36,6 +36,20 @@ pub trait Resident: Send + Sync {
     fn ensure(&self);
 }
 
+/// Whether the kernel's reads of guest memory leave a lazy mapping's uncommitted pages
+/// uncommitted (reading them as zeros) -- [`GuestMem`]'s `checked_read`. On by default: the bytes
+/// read are the same either way. `OMNI_READ_NO_COMMIT=0`, or the lever `read_no_commit=0`,
+/// commits them first as before.
+pub static READ_NO_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `OMNI_READ_NO_COMMIT=0`: [`READ_NO_COMMIT`] off from the start.
+pub fn read_no_commit_from_env() {
+    if std::env::var("OMNI_READ_NO_COMMIT").as_deref() == Ok("0") {
+        READ_NO_COMMIT.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_READ_NO_COMMIT: read_no_commit=0");
+    }
+}
+
 pub struct GuestMem {
     space: Arc<GuestSpace>,
     layout: Layout,
@@ -114,10 +128,33 @@ impl GuestMem {
 
     /// `read`, for a caller that holds the layout lock exclusively.
     pub(crate) fn read_holding_layout(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
-        let start = self.check(addr, len, false)?;
         let mut out = vec![0u8; len];
-        self.copy_out(start, &mut out);
+        self.checked_read(addr, &mut out)?;
         Ok(out)
+    }
+
+    /// Check `[addr, addr + out.len())` readable and copy it out. Memory a lazy mapping has not
+    /// committed yet is read as the zeros it holds, **without committing it** ([`READ_NO_COMMIT`]):
+    /// committing it and copying from it made every such page a resident private page of zeros
+    /// in the host process (Windows), where Linux reads it from the shared zero page.
+    fn checked_read(&self, addr: u64, out: &mut [u8]) -> Result<(), Errno> {
+        let (start, lazy) = self.scan(addr, out.len(), false)?;
+        if out.is_empty() {
+            return Ok(());
+        }
+        if lazy && READ_NO_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
+            match self.space.read_uncommitted_as_zero(start, out) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(_) => return Err(EFAULT),
+            }
+        }
+        if lazy {
+            self.space.ensure_committed(start, out.len()).map_err(|_| EFAULT)?;
+        }
+        self.space.ptr(start, out.len()).map_err(|_| EFAULT)?;
+        self.copy_out(start, out);
+        Ok(())
     }
 
     #[must_use]
@@ -132,8 +169,22 @@ impl GuestMem {
     }
 
     fn check(&self, addr: u64, len: usize, write: bool) -> Result<usize, Errno> {
+        let (start, commit) = self.scan(addr, len, write)?;
         if len == 0 {
             return Ok(0);
+        }
+        if commit {
+            self.space.ensure_committed(start, len).map_err(|_| EFAULT)?;
+        }
+        self.space.ptr(start, len).map_err(|_| EFAULT)?;
+        Ok(start)
+    }
+
+    /// `check` without the commit: the start, and whether any of it is a lazy mapping's
+    /// uncommitted placeholder.
+    fn scan(&self, addr: u64, len: usize, write: bool) -> Result<(usize, bool), Errno> {
+        if len == 0 {
+            return Ok((0, false));
         }
         let start = usize::try_from(untag(addr)).map_err(|_| EFAULT)?;
         let end = start.checked_add(len).ok_or(EFAULT)?;
@@ -162,11 +213,7 @@ impl GuestMem {
             }
             at = region.start + region.len;
         }
-        if commit {
-            self.space.ensure_committed(start, len).map_err(|_| EFAULT)?;
-        }
-        self.space.ptr(start, len).map_err(|_| EFAULT)?;
-        Ok(start)
+        Ok((start, commit))
     }
 
     /// Copy the checked range `[start, start + out.len())` out, piece by piece where it crosses a
@@ -196,9 +243,8 @@ impl GuestMem {
         // Before the layout lock, never while holding it: a switch takes it exclusively.
         self.ensure_resident();
         let _layout = self.layout.read();
-        let start = self.check(addr, len, false)?;
         let mut out = vec![0u8; len];
-        self.copy_out(start, &mut out);
+        self.checked_read(addr, &mut out)?;
         Ok(out)
     }
 
@@ -215,9 +261,7 @@ impl GuestMem {
         }
         self.ensure_resident();
         let _layout = self.layout.read();
-        let start = self.check(addr, out.len(), false)?;
-        self.copy_out(start, out);
-        Ok(())
+        self.checked_read(addr, out)
     }
 
     pub fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {

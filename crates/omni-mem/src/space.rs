@@ -1664,6 +1664,57 @@ impl GuestSpace {
         Ok(out)
     }
 
+    /// Copy `[address, address + out.len())` into `out` **without committing anything**: the
+    /// parts of a lazy mapping that are not committed yet read as the zeros they hold, and every
+    /// other part is copied from its memory. `Ok(false)` -- nothing copied -- where it cannot be
+    /// done this way (a space with the 4 KiB overlay, whose trapped pages are read through their
+    /// alias): the caller then commits and copies as before.
+    ///
+    /// **Why.** The kernel's copies out of guest memory (`write`'s buffer, a binder parcel, a path)
+    /// went through [`ensure_committed`](GuestSpace::ensure_committed) first, so a read of memory the
+    /// guest never touched committed it **and**, by copying from it, made every page of it a
+    /// resident private page of zeros on Windows -- where Linux reads such memory from its one
+    /// shared zero page. Under the map lock, so no commit or unmap moves underneath the copy.
+    ///
+    /// # Errors
+    ///
+    /// [`MemError::ZeroSize`], [`MemError::OutsideSpace`], or [`MemError::NotMapped`] for a part of
+    /// the range that is free, the host's, or mapped [`Protection::None`].
+    pub fn read_uncommitted_as_zero(&self, address: GuestAddr, out: &mut [u8]) -> MemResult<bool> {
+        const OP: &str = "read_uncommitted_as_zero";
+        if out.is_empty() {
+            return Err(MemError::ZeroSize { operation: OP });
+        }
+        if self.sub.is_some() {
+            return Ok(false);
+        }
+        let len = out.len();
+        self.check_range(OP, address, len)?;
+        let end = address + len;
+        let inner = self.read();
+        let mut at = address;
+        for start in inner.map.starts_overlapping(address, len) {
+            let entry = inner.map.get(start).expect("an entry the map just listed");
+            let (from, to) = (start.max(address), (start + entry.len).min(end));
+            let readable = entry.owner.as_ref().is_some_and(|o| o.protection != Protection::None);
+            if from != at || !readable || entry.is_free() || entry.is_host() {
+                return Err(MemError::NotMapped { operation: OP, address, end, unmapped_start: at, unmapped_end: to.max(at) });
+            }
+            let piece = &mut out[from - address..to - address];
+            match entry.os {
+                OsState::Placeholder => piece.fill(0),
+                // SAFETY: committed (private or a view) and readable, per the map, under its lock:
+                // nothing decommits, unmaps or re-protects it until the copy is done.
+                _ => unsafe { std::ptr::copy_nonoverlapping(self.host_addr(from) as *const u8, piece.as_mut_ptr(), to - from) },
+            }
+            at = to;
+        }
+        if at != end {
+            return Err(MemError::NotMapped { operation: OP, address, end, unmapped_start: at, unmapped_end: end });
+        }
+        Ok(true)
+    }
+
     /// Every region of the space, free ranges included, in address order.
     ///
     /// Adjacent entries that the guest cannot tell apart — same mapping, same protection, same

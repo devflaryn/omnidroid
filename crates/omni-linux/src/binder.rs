@@ -313,6 +313,9 @@ struct ThreadState {
     looper: bool,
     /// `BC_EXIT_LOOPER` came: no longer counted as a looper of the thread pool.
     exited: bool,
+    /// Waiting in a read for its process's work (the kernel's `proc->waiting_threads`): a looper
+    /// with no transaction on its stack and nothing to do. Cleared whenever its read returns.
+    idle: bool,
     /// Transactions this thread is serving, innermost last: whom each reply goes to.
     serving: Vec<Option<(ProcId, i32)>>,
     /// Sync transactions this thread sent and waits on the reply of.
@@ -1716,9 +1719,20 @@ fn translate_objects(p: &Process, t: &Task, st: &mut State, sender: (ProcId, i32
     Ok((fds, sg, fda))
 }
 
-/// Fill the read buffer with work for this thread, waiting for some when there is none.
-#[allow(clippy::too_many_arguments)]
+/// Fill the read buffer with work for this thread, waiting for some when there is none. However
+/// the read ends, the thread is no longer idle (`ThreadState::idle`): a stale mark would hold back
+/// a looper the process needs ([`spawn`]).
 fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, first: bool, nonblocking: bool) -> Result<u64, Errno> {
+    let tid = t.tid;
+    let done = read_waiting(p, t, file, at, size, first, nonblocking);
+    if let Some(th) = file.broker.state.lock().proc_mut(file.id).threads.get_mut(&tid) {
+        th.idle = false;
+    }
+    done
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, first: bool, nonblocking: bool) -> Result<u64, Errno> {
     let mut out: Vec<u8> = Vec::new();
     if first {
         out.extend_from_slice(&BR_NOOP.to_le_bytes());
@@ -1739,22 +1753,25 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
             // process's work. A thread waiting for a reply is never handed a oneway.
             let may_take_proc = thread.looper && thread.awaiting == 0 && thread.serving.is_empty();
             let looper = thread.looper;
-            match own {
+            let w = match own {
                 Some(w) => Some(w),
                 None if may_take_proc => {
                     let w = proc.todo.pop_front();
                     // Ask for another looper when this one takes the last idle slot.
-                    if w.is_some() && looper && proc.spawn_requested == 0 {
-                        let loopers = proc.threads.values().filter(|th| th.looper && !th.exited).count() as u32;
-                        if loopers < proc.max_threads + 1 {
-                            proc.spawn_requested += 1;
-                            out.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
-                        }
+                    if w.is_some() && looper && spawn::wanted(&p.comm.lock(), proc, t.tid) {
+                        proc.spawn_requested += 1;
+                        out.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
                     }
                     w
                 }
                 None => None,
+            };
+            // About to wait for the process's work: idle until the read ends (the watch above is
+            // already set, so work queued from here on still wakes it).
+            if let Some(th) = proc.threads.get_mut(&t.tid) {
+                th.idle = w.is_none() && may_take_proc;
             }
+            w
         };
         match work {
             Some(w) => {
@@ -2153,5 +2170,189 @@ mod tests {
             pooled += t.elapsed();
         }
         eprintln!("[binder] a host call's round trip: new thread {:?}, kept thread {:?}", spawned / N, pooled / N);
+    }
+}
+
+/// **When a process is asked for another binder looper** (`BR_SPAWN_LOOPER`), and how many it may
+/// have.
+///
+/// The kernel's rule (`binder_thread_read`, at its end): a looper is told to spawn another only if
+/// none was asked for and not yet registered (`requested_threads == 0`), **no other thread waits
+/// idle for the process's work** (`list_empty(&proc->waiting_threads)`) and the pool is under the
+/// process's `BINDER_SET_MAX_THREADS`. This driver had all but the second, so a process that took
+/// work while other loopers sat idle was asked again and again, up to its maximum: libbinder's
+/// default 15 (+1, the main looper) in each of the system host process's ~60 guest processes --
+/// the bulk of its ~900 host threads (2026-10-09). A spawn is a request; libbinder copes with
+/// fewer (a pool only grows when asked, and a call back into a thread waiting for a reply is
+/// delivered to that thread, not to the pool).
+///
+/// - `OMNI_BINDER_SPAWN=kernel` (or the live lever `binder_spawn=kernel`): the kernel's rule,
+///   idle loopers counted. `eager` (the default, unchanged) asks whenever a looper takes work and
+///   the pool is under its maximum.
+/// - `OMNI_BINDER_MAX_LOOPERS=<n>`: at most `n` loopers (the main one included) in a process of a
+///   **system** host process (never an app's: `OMNI_LINUX_APP`), whatever maximum it set; the
+///   processes named in `OMNI_BINDER_LOOPERS_KEEP` (default `system_server,surfaceflinger`) keep
+///   theirs. Unset: no cap. A cap too small can starve a service whose every looper is blocked in
+///   an outgoing call that needs a *new* incoming call to finish -- the kernel has the same limit
+///   at `max_threads`; this only lowers it.
+/// - `OMNI_BINDER_CENSUS=<seconds>`: every so often, per guest process of this host process, its
+///   threads and binder loopers (`[binder]` lines).
+pub mod spawn {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    /// The kernel's rule (see the module); off: the eager one this driver had.
+    pub static KERNEL_RULE: AtomicBool = AtomicBool::new(false);
+
+    /// Read the environment (once, at start).
+    pub fn from_env() {
+        if std::env::var("OMNI_BINDER_SPAWN").as_deref() == Ok("kernel") {
+            KERNEL_RULE.store(true, Ordering::Relaxed);
+            eprintln!("[lever] OMNI_BINDER_SPAWN: binder_spawn=kernel");
+        }
+        if let Some(n) = cap() {
+            eprintln!("[lever] OMNI_BINDER_MAX_LOOPERS: at most {n} binder loopers a process (but {})", keep().join(","));
+        }
+        census_start();
+    }
+
+    /// `OMNI_BINDER_MAX_LOOPERS`, in a system host process only.
+    pub fn cap() -> Option<u32> {
+        static CAP: OnceLock<Option<u32>> = OnceLock::new();
+        *CAP.get_or_init(|| {
+            if std::env::var_os("OMNI_LINUX_APP").is_some() {
+                return None;
+            }
+            std::env::var("OMNI_BINDER_MAX_LOOPERS").ok().and_then(|v| v.trim().parse::<u32>().ok()).map(|n| n.max(1))
+        })
+    }
+
+    fn keep() -> &'static [String] {
+        static KEEP: OnceLock<Vec<String>> = OnceLock::new();
+        KEEP.get_or_init(|| {
+            std::env::var("OMNI_BINDER_LOOPERS_KEEP")
+                .unwrap_or_else(|_| "system_server,surfaceflinger".into())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+    }
+
+    /// The most loopers a process named `comm` may be asked for, with `BINDER_SET_MAX_THREADS`
+    /// `max_threads`, under cap `cap`.
+    fn limit(comm: &[u8], max_threads: u32, cap: Option<u32>) -> u32 {
+        let own = max_threads.saturating_add(1);
+        match cap {
+            Some(n) if !keep().iter().any(|k| k.as_bytes() == comm) => own.min(n),
+            _ => own,
+        }
+    }
+
+    /// Whether thread `tid` of `proc` (named `comm`), taking its process's work, asks for another
+    /// looper.
+    pub(super) fn wanted(comm: &[u8], proc: &super::ProcState, tid: i32) -> bool {
+        decide(comm, proc, tid, KERNEL_RULE.load(Ordering::Relaxed), cap())
+    }
+
+    fn decide(comm: &[u8], proc: &super::ProcState, tid: i32, kernel_rule: bool, cap: Option<u32>) -> bool {
+        if proc.spawn_requested != 0 {
+            return false;
+        }
+        let live = |th: &super::ThreadState| th.looper && !th.exited;
+        if kernel_rule && proc.threads.iter().any(|(&other, th)| other != tid && live(th) && th.idle) {
+            return false;
+        }
+        let loopers = proc.threads.values().filter(|th| live(th)).count() as u32;
+        loopers < limit(comm, proc.max_threads, cap)
+    }
+
+    fn census_start() {
+        let Some(every) = std::env::var("OMNI_BINDER_CENSUS").ok().and_then(|v| v.parse::<u64>().ok()) else { return };
+        let _ = std::thread::Builder::new().name("omni-binder-census".into()).spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
+            report();
+        });
+    }
+
+    /// One `[binder]` line per guest process: its threads, and per binder device its loopers (how
+    /// many idle), its maximum and an outstanding spawn request; then the totals.
+    pub fn report() {
+        let live = crate::process::all_live();
+        let (mut threads, mut loopers) = (0usize, 0usize);
+        for p in &live {
+            let n = p.task_count();
+            threads += n;
+            let mut parts = Vec::new();
+            for (name, ctx) in [("binder", super::Context::Binder), ("hwbinder", super::Context::HwBinder), ("vndbinder", super::Context::VndBinder)] {
+                let broker = super::broker(ctx);
+                let st = broker.state.lock();
+                for proc in st.procs.values().filter(|pr| pr.pid == p.sys.pid && !pr.dead) {
+                    let l = proc.threads.values().filter(|th| th.looper && !th.exited).count();
+                    let idle = proc.threads.values().filter(|th| th.looper && !th.exited && th.idle).count();
+                    loopers += l;
+                    parts.push(format!(
+                        "{name} {l} loopers ({idle} idle, max {}{})",
+                        proc.max_threads,
+                        if proc.spawn_requested > 0 { ", spawn asked" } else { "" }
+                    ));
+                }
+            }
+            eprintln!("[binder] {} pid {}: {n} threads; {}", String::from_utf8_lossy(&p.comm.lock()), p.sys.pid, parts.join("; "));
+        }
+        eprintln!("[binder] host pid {}: {} guest processes, {threads} threads, {loopers} binder loopers", std::process::id(), live.len());
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{ProcState, ThreadState};
+        use super::decide;
+
+        fn pool(max: u32, loopers: &[(i32, bool)]) -> ProcState {
+            let mut p = ProcState { max_threads: max, ..ProcState::default() };
+            for &(tid, idle) in loopers {
+                p.threads.insert(tid, ThreadState { looper: true, idle, ..ThreadState::default() });
+            }
+            p
+        }
+
+        #[test]
+        fn the_eager_rule_asks_until_the_maximum() {
+            let p = pool(15, &[(1, false), (2, true), (3, true)]);
+            assert!(decide(b"svc", &p, 1, false, None), "idle loopers do not stop the eager rule");
+            let full = pool(2, &[(1, false), (2, false), (3, false)]);
+            assert!(!decide(b"svc", &full, 1, false, None), "max_threads + 1 loopers: no more");
+        }
+
+        #[test]
+        fn the_kernel_rule_asks_only_when_no_other_looper_is_idle() {
+            let p = pool(15, &[(1, false), (2, true)]);
+            assert!(!decide(b"svc", &p, 1, true, None), "thread 2 waits idle: no spawn");
+            let busy = pool(15, &[(1, false), (2, false)]);
+            assert!(decide(b"svc", &busy, 1, true, None), "every other looper busy: spawn");
+            // The taker's own idle mark (stale or not) does not count.
+            let own = pool(15, &[(1, true), (2, false)]);
+            assert!(decide(b"svc", &own, 1, true, None));
+            // One already asked for and not registered: none more.
+            let mut asked = pool(15, &[(1, false)]);
+            asked.spawn_requested = 1;
+            assert!(!decide(b"svc", &asked, 1, true, None));
+            // An exited looper is not a looper.
+            let mut gone = pool(15, &[(1, false), (2, true)]);
+            gone.threads.get_mut(&2).unwrap().exited = true;
+            assert!(decide(b"svc", &gone, 1, true, None));
+        }
+
+        #[test]
+        fn the_cap_lowers_the_maximum_but_not_for_the_kept_processes() {
+            let p = pool(15, &[(1, false), (2, false)]);
+            assert!(!decide(b"svc", &p, 1, false, Some(2)), "two loopers, cap 2");
+            assert!(decide(b"svc", &p, 1, false, Some(3)));
+            assert!(decide(b"system_server", &p, 1, false, Some(2)), "system_server keeps its own maximum");
+            assert!(decide(b"surfaceflinger", &p, 1, false, Some(1)));
+            // The cap never raises a process's own maximum.
+            let small = pool(0, &[(1, false)]);
+            assert!(!decide(b"svc", &small, 1, false, Some(8)));
+        }
     }
 }

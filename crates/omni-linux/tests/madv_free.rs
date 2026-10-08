@@ -76,3 +76,44 @@ fn the_zero_sweep_changes_nothing_the_guest_reads() {
         assert!(now[i * page..(i + 1) * page].iter().enumerate().all(|(j, &b)| j == 9 || b == 0), "page {i}");
     }
 }
+
+/// The kernel's reads of memory the guest never touched read zeros and **commit nothing**
+/// (`read_no_commit`, on by default); the touched part reads as written.
+#[test]
+fn a_kernel_read_of_untouched_memory_commits_nothing() {
+    let p = process();
+    let mut t = Task::new(3003, Arc::clone(&p));
+    let len = 1usize << 20;
+    let at = p.syscall(&mut t, nr::MMAP, [0, len as u64, 3, 0x22, u64::MAX, 0]);
+    assert!((at as i64) > 0);
+    let committed = |p: &Process| {
+        let space = p.mem.space();
+        let mut sum = 0;
+        let mut a = at as usize;
+        while a < at as usize + len {
+            let r = space.region_at(a).expect("mapped");
+            sum += r.committed;
+            a = r.start + r.len;
+        }
+        sum
+    };
+    assert_eq!(committed(&p), 0);
+    // A byte in the middle: one granule committed by the write.
+    p.mem.write(at + (len as u64) / 2 + 3, &[0x5C]).unwrap();
+    let after_write = committed(&p);
+    assert!(after_write > 0 && after_write < len, "{after_write}");
+    let all = p.mem.read(at, len).unwrap();
+    assert_eq!(all.iter().filter(|&&b| b != 0).count(), 1);
+    assert_eq!(all[len / 2 + 3], 0x5C);
+    let mut word = [0u8; 8];
+    p.mem.read_into(at + 4096, &mut word).unwrap();
+    assert_eq!(word, [0; 8]);
+    assert_eq!(p.mem.read_cstr(at + 8192, 64).unwrap(), Vec::<u8>::new());
+    assert_eq!(committed(&p), after_write, "the reads committed nothing");
+
+    // The lever off: the read commits, as before.
+    omni_linux::lever::apply("read_no_commit=0").expect("the lever");
+    assert_eq!(p.mem.read(at, len).unwrap().iter().filter(|&&b| b != 0).count(), 1);
+    assert_eq!(committed(&p), len, "committed whole by the read");
+    omni_linux::lever::apply("read_no_commit=1").expect("the lever");
+}

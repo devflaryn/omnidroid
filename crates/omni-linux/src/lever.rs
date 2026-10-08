@@ -51,6 +51,12 @@
 //!   decommitted at once, which Linux's "old contents or zeros" allows -- rather than ignored
 //!   (`crate::mm::MADV_FREE_DISCARDS`). Off by default.
 //!
+//! - `read_no_commit=0|1`: the kernel's reads of guest memory read a lazy mapping's uncommitted
+//!   pages as zeros instead of committing them (`crate::guest::READ_NO_COMMIT`; on by default).
+//! - `binder_spawn=kernel|eager`: when a guest process is asked for another binder looper -- the
+//!   kernel's rule (no other looper waits idle) or the eager one this driver had (the default).
+//!   Threads already spawned stay; see `crate::binder::spawn` (also `OMNI_BINDER_MAX_LOOPERS`).
+//!
 //! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file;
 //! `OMNI_ZERO_RECLAIM=<seconds>` and `OMNI_MADV_FREE=1` the last two.
 use std::path::PathBuf;
@@ -149,6 +155,24 @@ pub fn apply(line: &str) -> Option<String> {
             crate::zero_reclaim::set_period(seconds);
             Some(format!("zero_reclaim={seconds}: {}", if seconds == 0 { "no sweeps" } else { "zero pages swept out of the working set" }))
         }
+        "read_no_commit" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::guest::READ_NO_COMMIT.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("read_no_commit={}", u8::from(on)))
+        }
+        "binder_spawn" => {
+            let kernel = match value.trim() {
+                "kernel" => true,
+                "eager" => false,
+                _ => return None,
+            };
+            crate::binder::spawn::KERNEL_RULE.store(kernel, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("binder_spawn={}: a looper is asked for {}", value.trim(), if kernel { "only when none waits idle" } else { "whenever one takes work" }))
+        }
         "madv_free" => {
             let on = match value.trim() {
                 "1" => true,
@@ -204,6 +228,8 @@ pub fn apply(line: &str) -> Option<String> {
 /// Start the lever reader for this host process (once), and apply `OMNI_JIT_UNSAFE_FP`.
 pub fn start() {
     crate::mm::madv_free_from_env();
+    crate::binder::spawn::from_env();
+    crate::guest::read_no_commit_from_env();
     if let Some(mask) = std::env::var("OMNI_JIT_UNSAFE_FP").ok().as_deref().and_then(parse_hex) {
         let kept = omni_cpu::dynarmic::set_live_fp_optimizations(mask);
         eprintln!("[lever] OMNI_JIT_UNSAFE_FP: jit_fp={kept:#x}");
@@ -343,6 +369,11 @@ mod tests {
         apply("madv_free=0").expect("understood");
         assert!(!crate::mm::MADV_FREE_DISCARDS.load(Ordering::Relaxed));
         assert_eq!(apply("madv_free=yes"), None);
+        apply("binder_spawn=kernel").expect("understood");
+        assert!(crate::binder::spawn::KERNEL_RULE.load(Ordering::Relaxed));
+        apply("binder_spawn=eager").expect("understood");
+        assert!(!crate::binder::spawn::KERNEL_RULE.load(Ordering::Relaxed));
+        assert_eq!(apply("binder_spawn=1"), None);
     }
 
     #[test]

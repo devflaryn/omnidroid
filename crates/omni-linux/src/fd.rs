@@ -619,7 +619,7 @@ fn sys_close(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
-    let mut buf = vec![0u8; (a[2] as usize).min(1 << 24)];
+    let mut buf = crate::zbuf::ZeroBuf::new((a[2] as usize).min(1 << 24));
     let n = match crate::pipe::end_of(&file) {
         Some((_, true, _)) => return Err(EBADF),
         Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, &mut buf, nonblocking, t)?,
@@ -634,7 +634,7 @@ fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_pread64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
-    let mut buf = vec![0u8; (a[2] as usize).min(1 << 24)];
+    let mut buf = crate::zbuf::ZeroBuf::new((a[2] as usize).min(1 << 24));
     let n = read_file(&file, &mut buf, Some(a[3]))?;
     p.mem.write(a[1], &buf[..n])?;
     Ok(n as u64)
@@ -688,7 +688,7 @@ fn sys_preadv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
     let mut total = 0u64;
     for (base, len) in iovecs(p, a[1], a[2])? {
-        let mut buf = vec![0u8; len.min(1 << 24)];
+        let mut buf = crate::zbuf::ZeroBuf::new(len.min(1 << 24));
         let n = read_file(&file, &mut buf, Some(a[3] + total))?;
         p.mem.write(base, &buf[..n])?;
         total += n as u64;
@@ -704,7 +704,7 @@ fn sys_preadv(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 fn sys_sendfile(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let (out, input) = (p.fds.get(fd_arg(a[0]))?, p.fds.get(fd_arg(a[1]))?);
     let offset = if a[2] == 0 { None } else { Some(p.mem.read_u64(a[2])?) };
-    let mut buf = vec![0u8; (a[3] as usize).min(1 << 24)];
+    let mut buf = crate::zbuf::ZeroBuf::new((a[3] as usize).min(1 << 24));
     let n = read_file(&input, &mut buf, offset)?;
     let written = match crate::pipe::end_of(&out) {
         Some((_, false, _)) => return Err(EBADF),
