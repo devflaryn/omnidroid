@@ -27,6 +27,13 @@ fn file(signalled_ns: u64) -> Arc<OpenFile> {
     Arc::new(OpenFile { kind: Mutex::new(FileKind::SyncFile(Arc::new(SyncFile { signalled_ns }))), flags: Mutex::new(0) })
 }
 
+/// A sync file signalled at `signalled_ns` (CLOCK_MONOTONIC), not yet in any process: for a host
+/// service to hand out (the composer's present and release fences).
+#[must_use]
+pub fn signalled_at(signalled_ns: u64) -> Arc<OpenFile> {
+    file(signalled_ns)
+}
+
 /// A new sync file in `p`, signalled now: its descriptor.
 ///
 /// # Errors

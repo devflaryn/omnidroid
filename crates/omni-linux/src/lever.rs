@@ -26,6 +26,15 @@
 //!   60 by default, `OMNI_VSYNC_HZ` from boot). To find out whether vsync pacing is the ceiling.
 //! - `vsync_pace=0|1`: vsync paced to absolute deadlines (1, the default) or the old
 //!   `sleep(period)` loop that drifted to ~58.8 Hz (0) (`crate::hal::composer::VSYNC_PACE`).
+//! - `composer_skip_validate=0|1`: a frame the composer composes is presented at
+//!   `presentOrValidateDisplay` (1; one `executeCommands` a frame instead of two) or at the
+//!   separate `presentDisplay` (0, the default) (`crate::hal::composer::SKIP_VALIDATE`).
+//! - `composer_fences=0|1|2`: no fences (0, the default), a present fence (1), present and
+//!   release fences (2) from the composer (`crate::hal::composer::FENCES`).
+//! - `poll_keyed=0|1`: waits on descriptors that had no key (constant-readiness files, netlink
+//!   and other self-answered sockets, unix `accept`, host sockets' waits, `/dev/fuse`, `epoll_ctl`)
+//!   are woken by their own changes only (1), not by every change in the host process (0, the
+//!   default) (`crate::poll::KEYED`; `OMNI_POLL_STATS` counts what is left).
 //! - `binder_host_pool=0|1`: a host service's binder calls run on kept, reused threads (1) or on a
 //!   new thread each (0, the default; `OMNI_BINDER_HOST_POOL`) (`crate::binder::HOST_POOL`).
 //!
@@ -122,6 +131,29 @@ pub fn apply(line: &str) -> Option<String> {
             crate::hal::composer::VSYNC_PACE.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("vsync_pace={}: {}", u8::from(on), if on { "deadlines" } else { "the old sleep(period) loop" }))
         }
+        "composer_skip_validate" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::hal::composer::SKIP_VALIDATE.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("composer_skip_validate={}: {}", u8::from(on), if on { "a frame of the composer's is presented at presentOrValidate" } else { "presentOrValidate answers Validated, presentDisplay presents" }))
+        }
+        "composer_fences" => {
+            let n: u8 = value.trim().parse().ok().filter(|n| *n <= 2)?;
+            crate::hal::composer::FENCES.store(n, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("composer_fences={n}: {}", ["no fences", "a present fence", "present and release fences"][usize::from(n)]))
+        }
+        "poll_keyed" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::poll::KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("poll_keyed={}: {}", u8::from(on), if on { "fewer waits on anything" } else { "unkeyed descriptors wait on anything" }))
+        }
         "binder_host_pool" => {
             let on = match value.trim() {
                 "1" => true,
@@ -208,6 +240,10 @@ pub fn start() {
         let kept = omni_cpu::dynarmic::set_live_fp_optimizations(mask);
         eprintln!("[lever] OMNI_JIT_UNSAFE_FP: jit_fp={kept:#x}");
     }
+    if std::env::var("OMNI_POLL_KEYED").as_deref() == Ok("1") {
+        crate::poll::KEYED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_POLL_KEYED: poll_keyed=1");
+    }
     let Some(path) = std::env::var_os("OMNI_LEVER_FILE").map(PathBuf::from) else { return };
     let _ = std::thread::Builder::new().name("omni-lever".into()).spawn(move || {
         let mut seen = String::new();
@@ -290,6 +326,15 @@ mod tests {
         assert!(!crate::hal::composer::VSYNC_PACE.load(Ordering::Relaxed));
         apply("vsync_pace=1").expect("understood");
         assert!(crate::hal::composer::VSYNC_PACE.load(Ordering::Relaxed));
+    }
+
+    /// Values out of range are refused (switched values: `hal::composer`'s own test, as the
+    /// levers are process-wide).
+    #[test]
+    fn the_composer_levers_refuse_what_they_do_not_know() {
+        assert_eq!(apply("composer_fences=3"), None);
+        assert_eq!(apply("composer_fences=x"), None);
+        assert_eq!(apply("composer_skip_validate=yes"), None);
     }
 
     #[test]

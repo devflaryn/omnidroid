@@ -316,13 +316,44 @@ thread_local! {
     static CURRENT: RefCell<Option<TcpStream>> = const { RefCell::new(None) };
 }
 
+/// What `OMNI_REMOTE_STATS=<seconds>` counts in the system's host process: apps' binder ioctls
+/// served, and the round trips back to the app's host process they made (its memory read or
+/// written, a descriptor got or put -- each a request and an answer over the loopback, a thread
+/// of each host process woken), with the bytes those carried.
+static IOCTLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ASK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `OMNI_REMOTE_STATS=<seconds>`: a `[remote]` line that often (see [`IOCTLS`]).
+fn start_stats() {
+    let Some(every) = std::env::var("OMNI_REMOTE_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else { return };
+    let _ = std::thread::Builder::new().name("omni-remote-stats".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(every));
+        let ioctls = IOCTLS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let asks = ASKS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let bytes = ASK_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[remote] pid {}: {} app binder ioctls/s, {} round trips/s back to the apps ({:.1} per ioctl, {} KB/s)",
+            std::process::id(),
+            ioctls / every,
+            asks / every,
+            asks as f64 / ioctls.max(1) as f64,
+            bytes / every / 1024
+        );
+    });
+}
+
 /// A request to the app's host process on the current connection, and its answer.
 fn ask(kind: u8, payload: &[u8]) -> Result<(u8, Vec<u8>), Errno> {
+    ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ASK_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
     CURRENT.with(|c| {
         let mut c = c.borrow_mut();
         let stream = c.as_mut().ok_or(EFAULT)?;
         send(stream, kind, payload).map_err(|_| EIO)?;
-        receive(stream).map_err(|_| EIO)
+        let answer = receive(stream).map_err(|_| EIO)?;
+        ASK_BYTES.fetch_add(answer.1.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(answer)
     })
 }
 
@@ -451,6 +482,7 @@ pub fn serve(sysroot: Arc<crate::vfs::Sysroot>) -> std::io::Result<std::net::Soc
     let addr = listener.local_addr()?;
     let server = Arc::new(Server { sysroot, stand_ins: Mutex::default(), opens: Mutex::default() });
     let _ = SERVING.set(Arc::clone(&server));
+    start_stats();
     std::thread::Builder::new().name("binder-remote".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
             let _ = stream.set_nodelay(true);
@@ -540,6 +572,9 @@ impl Server {
                 CURRENT.with(|c| *c.borrow_mut() = stream.try_clone().ok());
                 loop {
                     let Ok((kind, body)) = receive(&mut stream) else { break };
+                    if kind == IOCTL {
+                        IOCTLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let ret: u64 = match kind {
                         IOCTL => match crate::binder::ioctl(&p, &mut task, &file, u64_at(&body, 0), u64_at(&body, 8), false) {
                             Ok(v) => v,

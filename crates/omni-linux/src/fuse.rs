@@ -64,10 +64,16 @@ pub fn read(file: &OpenFile, buf: &mut [u8], task: &Task) -> Option<Result<usize
     if *file.flags.lock() & O_NONBLOCK != 0 {
         return Some(Err(EAGAIN));
     }
-    // No request ever comes: wait until a signal ends the wait.
+    // No request ever comes: wait until a signal ends the wait -- on nothing (`poll_keyed`), so
+    // the daemon's threads are not woken by every change in the process to find nothing.
     loop {
-        let seen = crate::poll::generation();
-        if let Err(e) = crate::poll::wait_for_change(seen, None, task) {
+        let r = if crate::poll::KEYED.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::poll::watch(Some(vec![crate::poll::INERT])).wait(None, task)
+        } else {
+            let seen = crate::poll::generation();
+            crate::poll::wait_for_change(seen, None, task)
+        };
+        if let Err(e) = r {
             return Some(Err(e));
         }
     }
