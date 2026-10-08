@@ -165,3 +165,23 @@ fn a_presenter_on_another_thread_presents_and_follows_the_size() {
     assert_eq!(presenter.client_size(), None, "a presenter outliving its window has no size");
     presenter.present_rgba(&[0; 4], 1, 1).expect("a present to a closed window is dropped, not refused");
 }
+
+/// **`Presenter::present_bgra`**: a BGRA image handed over shared is painted as its RGBA twin is
+/// (red left, blue right), and a short one is refused by name.
+#[test]
+#[ignore = "needs a desktop session: OMNI_GFX_WINDOW_TESTS=1 cargo test -- --ignored"]
+fn a_bgra_image_is_painted_as_its_rgba_twin() {
+    require_gate();
+    let mut window = Window::new(&WindowDesc::new("omni present_bgra", 240, 120)).expect("a window");
+    window.show();
+    let presenter = window.presenter();
+    let bgra: Vec<u8> = [RED, BLUE].iter().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+    presenter.present_bgra(std::sync::Arc::new(bgra), 2, 1).expect("present");
+    let (w, h) = window.client_size().expect("size");
+    assert!(
+        pump_until(&mut window, |win| hue(pixel(win, (w / 4) as i32, (h / 2) as i32)) == Hue::Red && hue(pixel(win, (w * 3 / 4) as i32, (h / 2) as i32)) == Hue::Blue),
+        "the BGRA image is not on the window as its RGBA twin"
+    );
+    let short = presenter.present_bgra(std::sync::Arc::new(vec![0; 7]), 1, 2).expect_err("7 bytes for 2 pixels");
+    assert!(matches!(short, WindowError::PixelsTooShort { needed: 8, got: 7, .. }), "{short:?}");
+}

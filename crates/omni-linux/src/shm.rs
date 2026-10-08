@@ -83,6 +83,21 @@ impl Drop for View {
     }
 }
 
+/// Bytes of a graphics buffer's host view, borrowed ([`Shm::bytes`]).
+pub struct ShmBytes<'a> {
+    _view: parking_lot::RwLockReadGuard<'a, Option<View>>,
+    ptr: *const u8,
+    len: usize,
+}
+
+impl std::ops::Deref for ShmBytes<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `[ptr, ptr + len)` lies inside the view the guard keeps mapped (`Shm::bytes`).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
 /// `OMNI_SHM_VIEW=0`: graphics buffers are read and written as files too (the old path, to compare).
 fn views_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -224,6 +239,28 @@ impl Shm {
         view.as_ref().map(f)
     }
 
+    /// **A graphics buffer's bytes where they are**: `[offset, offset + len)` of its host view (cut
+    /// at the region's end), borrowed rather than copied out as [`read_at`](Self::read_at) does --
+    /// what the composer reads a layer's pixels through under `compose_zero` (5.6 MB a layer a
+    /// frame at 1575x890 no longer copied). `None` for a region that is not a graphics buffer, or
+    /// with views off (`OMNI_SHM_VIEW=0`): read it then.
+    ///
+    /// The view cannot be unmapped while the guard lives (it holds the view's lock). The bytes are
+    /// shared memory another host process writes: a reader takes them when nothing is writing --
+    /// a released buffer after its copy has landed (`crate::gpu::native::wait_written`), as for
+    /// `read_at`, which copies the same bytes at the same moment.
+    #[must_use]
+    pub fn bytes(&self, offset: u64, len: usize) -> Option<ShmBytes<'_>> {
+        self.with_view(|_| ())?;
+        // Recursive: a reader may hold another guard of this region (two layers, one buffer)
+        // while a writer waits.
+        let view = self.view.read_recursive();
+        let v = view.as_ref().filter(|v| v.len == self.len())?;
+        let n = usize::try_from(v.len.checked_sub(offset)?).ok()?.min(len);
+        let ptr = (v.base + offset as usize) as *const u8;
+        Some(ShmBytes { _view: view, ptr, len: n })
+    }
+
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Errno> {
         let viewed = self.with_view(|v| {
             let n = usize::try_from(v.len.saturating_sub(offset)).unwrap_or(usize::MAX).min(buf.len());
@@ -303,5 +340,30 @@ impl Shm {
             _ => return Err(EINVAL),
         };
         self.file.lock().seek(pos).map_err(|_| EINVAL)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shm;
+
+    /// A graphics buffer's bytes lent are the bytes `read_at` copies, cut at the region's end; a
+    /// region that is not a graphics buffer lends none.
+    #[test]
+    fn a_graphics_buffers_bytes_are_lent_as_read() {
+        let shm = Shm::create("bytes").expect("region");
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7) as u8).collect();
+        shm.write_at(&data, 0).expect("write");
+        assert!(shm.bytes(0, 16).is_none(), "not a graphics buffer");
+        shm.as_graphics_buffer();
+        let lent = shm.bytes(100, 500).expect("a view");
+        let mut read = vec![0u8; 500];
+        shm.read_at(&mut read, 100).expect("read");
+        assert_eq!(&*lent, &read[..]);
+        // Two guards at once (two layers of one buffer), and one past the end, cut.
+        let tail = shm.bytes(9_990, 64).expect("a view");
+        assert_eq!(&*tail, &data[9_990..]);
+        drop((lent, tail));
+        assert!(shm.bytes(20_000, 4).is_none(), "past the end");
     }
 }
