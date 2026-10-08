@@ -684,7 +684,7 @@ impl Host {
     }
 
     /// What this socket's changes are told by (`crate::socket::key` gives a guest's poll the same).
-    fn key(&self) -> crate::poll::Key {
+    pub(crate) fn key(&self) -> crate::poll::Key {
         std::ptr::from_ref(self) as crate::poll::Key
     }
 
@@ -1197,12 +1197,6 @@ impl Host {
             (IPPROTO_IPV6, 26) => set(SocketOption::V6Only(int()? != 0)),
             _ => Ok(false),
         }
-    }
-
-    /// The key its waiters wait on and its changes are told by (`crate::poll`): the address of the
-    /// `Host` itself, as `crate::socket::key` gives a host socket's descriptor.
-    pub(crate) fn key(&self) -> crate::poll::Key {
-        std::ptr::from_ref(self) as crate::poll::Key
     }
 
     /// What the socket is ready for, as `POLL*` bits. A stream socket that is neither connected,
