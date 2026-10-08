@@ -228,6 +228,47 @@ fn sum_code_caches(tables: bool) -> CodeCacheCounters {
     sum
 }
 
+/// Resolves ascending host code addresses to guest PCs in one shared code cache (vendored patch
+/// 0036), writing `u64::MAX` where the cache has no block there; `false` once the cache is gone.
+type GuestPcResolver = Box<dyn Fn(&[u64], &mut [u64]) -> bool + Send + Sync>;
+static GUEST_PC_RESOLVERS: Mutex<Vec<GuestPcResolver>> = Mutex::new(Vec::new());
+
+/// Record a shared code cache's host-to-guest resolver; dropped once it answers `false`.
+pub fn register_guest_pc_resolver(resolve: GuestPcResolver) {
+    GUEST_PC_RESOLVERS.lock().push(resolve);
+}
+
+/// For each host code address in `hosts` (ascending), the guest PC of the translated block that
+/// holds it, in any live shared code cache of this process; `u64::MAX` where none does -- the
+/// dispatcher and prelude, far code, a link slot, a block forgotten since, or code in a jit's own
+/// (unshared) cache, which this cannot see.
+///
+/// The PC is the **block's first** guest instruction, not the sampled one: a block is a straight run
+/// of guest code within one function, so it attributes the sample to the right function.
+///
+/// Takes each cache's lock shared and walks all of its blocks (~ms at 500k blocks), holding off
+/// translation in the meantime: for a profiler's report every few seconds, never for a guest thread.
+#[must_use]
+pub fn guest_pcs_of(hosts: &[u64]) -> Vec<u64> {
+    let mut out = vec![u64::MAX; hosts.len()];
+    if hosts.is_empty() {
+        return out;
+    }
+    let mut one = vec![u64::MAX; hosts.len()];
+    GUEST_PC_RESOLVERS.lock().retain(|resolve| {
+        if !resolve(hosts, &mut one) {
+            return false;
+        }
+        for (o, pc) in out.iter_mut().zip(&one) {
+            if *pc != u64::MAX {
+                *o = *pc;
+            }
+        }
+        true
+    });
+    out
+}
+
 static TRACK_RETRANSLATION: AtomicBool = AtomicBool::new(false);
 
 /// Start counting, per context, translations of block starts that context had translated before

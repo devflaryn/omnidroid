@@ -9,10 +9,13 @@
 //! name -- in that module while the task runs guest code; `other` -- anywhere else. A thread that
 //! did not run since the previous tick is not touched. Costs a suspend / resume per running thread
 //! per tick (tens of microseconds); off, one relaxed load when a task starts running.
+//!
+//! `OMNI_GUEST_PROF=1` as well: each `jit` sample's host address is kept, and every report is
+//! followed by `[guestprof]` lines naming the guest functions those samples ran ([`crate::guestprof`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use omni_platform::sampler::{self, HostThread, MemoryKind, CODE_AFTER, CODE_BEFORE};
@@ -36,12 +39,16 @@ struct Entry {
     exe: HashMap<usize, u32>,
     /// `kern` samples likewise: where in the kernel's handlers (or a module: its name and offset).
     kern: HashMap<String, u32>,
+    /// `OMNI_GUEST_PROF`: the host address of each `jit` sample this period.
+    jit: Vec<u64>,
+    /// The guest process the task belongs to, for its memory map.
+    process: Option<Weak<crate::process::Process>>,
 }
 
 static THREADS: Mutex<Option<HashMap<i32, Entry>>> = Mutex::new(None);
 
 /// The calling host thread runs task `tid` from now on (`Process::run_task`).
-pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>) {
+pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>, process: Option<Weak<crate::process::Process>>) {
     let Some(every) = period() else { return };
     static REPORTER: OnceLock<()> = OnceLock::new();
     REPORTER.get_or_init(|| {
@@ -51,7 +58,18 @@ pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>) {
     let cpu = host.cpu_time().unwrap_or_default();
     THREADS.lock().get_or_insert_with(HashMap::new).insert(
         tid,
-        Entry { host, state: Arc::clone(state), name: name.to_vec(), cycles: 0, cpu, classes: HashMap::new(), exe: HashMap::new(), kern: HashMap::new() },
+        Entry {
+            host,
+            state: Arc::clone(state),
+            name: name.to_vec(),
+            cycles: 0,
+            cpu,
+            classes: HashMap::new(),
+            exe: HashMap::new(),
+            kern: HashMap::new(),
+            jit: Vec::new(),
+            process,
+        },
     );
 }
 
@@ -81,6 +99,8 @@ fn sample_loop(every: u64) {
     let mut ticks = 0u64;
     let per_report = every * 100;
     let mut kinds: HashMap<usize, MemoryKind> = HashMap::new();
+    let guest = crate::guestprof::enabled();
+    let mut symbols = crate::guestprof::Symbolizer::default();
     loop {
         std::thread::sleep(Duration::from_millis(10));
         ticks += 1;
@@ -108,7 +128,12 @@ fn sample_loop(every: u64) {
             }
             let class = match kind {
                 _ if kernel => "kern".to_string(),
-                MemoryKind::PrivateWritableExecutable { .. } => "jit".to_string(),
+                MemoryKind::PrivateWritableExecutable { .. } => {
+                    if guest {
+                        e.jit.push(s.ip as u64);
+                    }
+                    "jit".to_string()
+                }
                 MemoryKind::Image { base } if base == exe_base => {
                     *e.exe.entry((s.ip - exe_base) & !0xff).or_default() += 1;
                     "dyn".to_string()
@@ -124,7 +149,7 @@ fn sample_loop(every: u64) {
         if kinds.len() > 1 << 16 {
             kinds.clear();
         }
-        let mut lines: Vec<(Duration, String)> = map
+        let mut lines: Vec<(Duration, String, Option<crate::guestprof::HotThread>)> = map
             .iter_mut()
             .filter_map(|(tid, e)| {
                 let now = e.host.cpu_time().ok()?;
@@ -133,10 +158,18 @@ fn sample_loop(every: u64) {
                 let classes = std::mem::take(&mut e.classes);
                 let exe = std::mem::take(&mut e.exe);
                 let kern = std::mem::take(&mut e.kern);
+                let jit = std::mem::take(&mut e.jit);
                 if used < Duration::from_millis(every * 50) {
                     return None; // under 5% of a core
                 }
                 let total: u32 = classes.values().sum::<u32>().max(1);
+                let guest_hot = guest.then(|| crate::guestprof::HotThread {
+                    tid: *tid,
+                    name: e.name.clone(),
+                    samples: total,
+                    jit,
+                    process: e.process.clone(),
+                });
                 let mut cs: Vec<(String, u32)> = classes.into_iter().collect();
                 cs.sort_by(|a, b| b.1.cmp(&a.1));
                 let shares: Vec<String> = cs.iter().take(5).map(|(c, n)| format!("{c} {}%", n * 100 / total)).collect();
@@ -156,13 +189,22 @@ fn sample_loop(every: u64) {
                         if hot.is_empty() { String::new() } else { format!(" (exe {})", hot.join(" ")) },
                         if kern.is_empty() { String::new() } else { format!(" (kern {})", kern.join(" ")) }
                     ),
+                    guest_hot,
                 ))
             })
             .collect();
         drop(guard);
         lines.sort_by(|a, b| b.0.cmp(&a.0));
         let total: Duration = lines.iter().map(|l| l.0).sum();
-        let body: Vec<String> = lines.into_iter().take(12).map(|l| l.1).collect();
+        let mut hot = Vec::new();
+        let body: Vec<String> = lines
+            .into_iter()
+            .take(12)
+            .map(|l| {
+                hot.extend(l.2);
+                l.1
+            })
+            .collect();
         eprintln!(
             "[thread-cpu] host pid {} {}s, {:.2} cores in busy threads:\n[thread-cpu]   {}",
             std::process::id(),
@@ -170,5 +212,12 @@ fn sample_loop(every: u64) {
             total.as_secs_f64() / every as f64,
             body.join("\n[thread-cpu]   ")
         );
+        // After the registry is let go: the lookups below take locks a guest thread may hold.
+        if guest {
+            let report = crate::guestprof::report(&hot, &mut symbols);
+            if !report.is_empty() {
+                eprint!("{report}");
+            }
+        }
     }
 }

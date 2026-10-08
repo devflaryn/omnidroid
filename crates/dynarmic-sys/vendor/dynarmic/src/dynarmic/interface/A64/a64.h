@@ -209,6 +209,12 @@ public:
     /// Takes the cache's lock, shared: a census for a memory report, not for a hot path.
     Tables GetTables() const;
 
+    /// Omnidroid patch 0036: for each of `count` host code addresses `hosts` (ascending), the
+    /// guest PC of the translated block whose code holds it, or ~0 where none does (the prelude,
+    /// far code, a link slot, a block since forgotten). Takes the cache's lock, shared, and walks
+    /// every block once: for a sampling profiler's report, not for a hot path.
+    void GuestPcsOf(const std::uint64_t* hosts, std::size_t count, std::uint64_t* guest_pcs) const;
+
     /// Invalidate [start, start + length) for every attached Jit, now. Must not be called from
     /// inside a callback of a Jit attached to this cache (use Jit::InvalidateCacheRange there).
     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);

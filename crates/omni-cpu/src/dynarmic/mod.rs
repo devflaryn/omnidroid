@@ -88,7 +88,8 @@ use std::sync::Arc;
 
 use dynarmic_sys::{
     optimization, od_code_cache_clear, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
-    od_code_cache_stats_of, od_code_cache_tables_of, od_jit_clear_halt, od_jit_effective_config,
+    od_code_cache_guest_pcs_of, od_code_cache_stats_of, od_code_cache_tables_of, od_jit_clear_halt,
+    od_jit_effective_config,
     od_jit_free, od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec,
     od_jit_halt, od_jit_invalidate_range, od_jit_new, od_jit_new_shared, od_jit_reset_stats, od_jit_run,
     od_jit_set_pc, od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec,
@@ -1020,6 +1021,19 @@ impl DynarmicBackend {
                     committed_bytes: s.committed_bytes,
                     tables,
                 })
+            }));
+            // Patch 0036: where in the guest a sampled host address in this cache is
+            // (`omni-linux`'s `OMNI_GUEST_PROF`).
+            let shared = Arc::downgrade(&backend.shared);
+            crate::stats::register_guest_pc_resolver(Box::new(move |hosts, out| {
+                let Some(shared) = shared.upgrade() else { return false };
+                let Some(cache) = shared.code_cache.as_ref() else { return false };
+                debug_assert_eq!(hosts.len(), out.len());
+                let n = hosts.len().min(out.len());
+                // SAFETY: the cache lives as long as `shared`, held here; `hosts` and `out` hold
+                // `n` elements each, `hosts` ascending (the caller's contract).
+                unsafe { od_code_cache_guest_pcs_of(cache.0, hosts.as_ptr(), n as u64, out.as_mut_ptr()) };
+                true
             }));
         }
         Ok(backend)

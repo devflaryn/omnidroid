@@ -1,0 +1,99 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index eb0225b..23523fc 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -450,6 +450,28 @@ A64::SharedCodeCache::Tables A64EmitX64::Census() const {
+     return t;
+ }
+ 
++void A64EmitX64::GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const {
++    std::fill(guest_pcs, guest_pcs + count, ~u64{0});
++    if (count == 0) {
++        return;
++    }
++    const u64 lowest = hosts[0];
++    const u64 highest = hosts[count - 1];
++    // One pass over the block map (no index from host address to block is kept: the dispatcher
++    // never needs one), each block's code range searched for in the sorted addresses.
++    for (const auto& [location, block] : block_descriptors) {
++        const u64 begin = reinterpret_cast<u64>(block.entrypoint);
++        const u64 end = begin + block.size;
++        if (end <= lowest || begin > highest) {
++            continue;
++        }
++        const u64* at = std::lower_bound(hosts, hosts + count, begin);
++        for (; at != hosts + count && *at < end; ++at) {
++            guest_pcs[at - hosts] = A64::LocationDescriptor{location}.PC();
++        }
++    }
++}
++
+ size_t A64EmitX64::FastDispatchTableBytes() {
+     return sizeof(FastDispatchEntry) * fast_dispatch_table_size;
+ }
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index f679a60..b6da4d6 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -114,6 +114,9 @@ public:
+     /// Omnidroid patch 0024: what each per-block table holds, for a memory report. The caller
+     /// holds the cache's lock (shared is enough).
+     A64::SharedCodeCache::Tables Census() const;
++    /// Omnidroid patch 0036: `SharedCodeCache::GuestPcsOf`. The caller holds the cache's lock
++    /// (shared is enough).
++    void GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const;
+ 
+ protected:
+     /// Patch 0022: a callback of the thread's UserCallbacks -- an immediate `this` in a Jit with
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index 8e6cff3..4db16c4 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -312,6 +312,7 @@ struct SharedCodeCache::Impl final {
+     void Invalidate(bool entire, const boost::icl::interval_set<u64>& ranges);
+     SharedCodeCache::Stats GetStats() const;
+     SharedCodeCache::Tables GetTables() const;
++    void GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const;
+     /// Called by a thread that has just left RunCode: every attached thread was asked to halt when
+     /// a region was retired, so this is when the last holder lets go. Throttled, and skipped if
+     /// the lock is busy.
+@@ -1258,6 +1259,11 @@ SharedCodeCache::Tables SharedCodeCache::Impl::GetTables() const {
+     return emitter.Census();
+ }
+ 
++void SharedCodeCache::Impl::GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const {
++    std::shared_lock guard{lock};
++    emitter.GuestPcsOf(hosts, count, guest_pcs);
++}
++
+ SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes, std::size_t live_bytes)
+         : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes, live_bytes)) {}
+ 
+@@ -1271,6 +1277,10 @@ SharedCodeCache::Tables SharedCodeCache::GetTables() const {
+     return impl->GetTables();
+ }
+ 
++void SharedCodeCache::GuestPcsOf(const std::uint64_t* hosts, std::size_t count, std::uint64_t* guest_pcs) const {
++    impl->GuestPcsOf(hosts, count, guest_pcs);
++}
++
+ void SharedCodeCache::InvalidateCacheRange(std::uint64_t start_address, std::size_t length) {
+     if (length == 0) {
+         return;
+diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+index 7f0ebae..1d18e37 100644
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -209,6 +209,12 @@ public:
+     /// Takes the cache's lock, shared: a census for a memory report, not for a hot path.
+     Tables GetTables() const;
+ 
++    /// Omnidroid patch 0036: for each of `count` host code addresses `hosts` (ascending), the
++    /// guest PC of the translated block whose code holds it, or ~0 where none does (the prelude,
++    /// far code, a link slot, a block since forgotten). Takes the cache's lock, shared, and walks
++    /// every block once: for a sampling profiler's report, not for a hot path.
++    void GuestPcsOf(const std::uint64_t* hosts, std::size_t count, std::uint64_t* guest_pcs) const;
++
+     /// Invalidate [start, start + length) for every attached Jit, now. Must not be called from
+     /// inside a callback of a Jit attached to this cache (use Jit::InvalidateCacheRange there).
+     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);

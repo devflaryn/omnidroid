@@ -1095,7 +1095,7 @@ impl Process {
         }
         // SAFETY: as above.
         let _profiled = unsafe {
-            crate::cpuprof::started((*task).tid, &(*task).name, &state);
+            crate::cpuprof::started((*task).tid, &(*task).name, &state, self.me.get().cloned());
             Profiled((*task).tid)
         };
         loop {

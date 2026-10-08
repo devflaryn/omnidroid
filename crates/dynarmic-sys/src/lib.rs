@@ -756,6 +756,16 @@ extern "C" {
     /// `cache` must be live (or null, which zeroes `out`); `out` must be writable.
     pub fn od_code_cache_tables_of(cache: *mut c_void, out: *mut OdCodeCacheTables);
 
+    /// Patch 0036: for each of `count` ascending host code addresses at `hosts`, the guest PC of
+    /// the cache's block whose translated code holds it, or `u64::MAX` where none does (prelude,
+    /// far code, link slot, forgotten block). Takes the cache's lock, shared, and walks every block
+    /// once: for a profiler's report thread only. All `u64::MAX` on an arm64 host.
+    ///
+    /// # Safety
+    /// `cache` must be live (or null); `hosts` must hold `count` readable `u64`s, ascending, and
+    /// `guest_pcs` `count` writable ones.
+    pub fn od_code_cache_guest_pcs_of(cache: *mut c_void, hosts: *const u64, count: u64, guest_pcs: *mut u64);
+
     /// Invalidate `[addr, addr + len)` for every jit of the cache, now. Clamped as
     /// [`od_jit_invalidate_range`] is.
     ///

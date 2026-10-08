@@ -312,6 +312,7 @@ struct SharedCodeCache::Impl final {
     void Invalidate(bool entire, const boost::icl::interval_set<u64>& ranges);
     SharedCodeCache::Stats GetStats() const;
     SharedCodeCache::Tables GetTables() const;
+    void GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const;
     /// Called by a thread that has just left RunCode: every attached thread was asked to halt when
     /// a region was retired, so this is when the last holder lets go. Throttled, and skipped if
     /// the lock is busy.
@@ -1258,6 +1259,11 @@ SharedCodeCache::Tables SharedCodeCache::Impl::GetTables() const {
     return emitter.Census();
 }
 
+void SharedCodeCache::Impl::GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const {
+    std::shared_lock guard{lock};
+    emitter.GuestPcsOf(hosts, count, guest_pcs);
+}
+
 SharedCodeCache::SharedCodeCache(const UserConfig& template_config, std::size_t total_bytes, std::size_t region_bytes, std::size_t live_bytes)
         : impl(std::make_unique<Impl>(template_config, total_bytes, region_bytes, live_bytes)) {}
 
@@ -1269,6 +1275,10 @@ SharedCodeCache::Stats SharedCodeCache::GetStats() const {
 
 SharedCodeCache::Tables SharedCodeCache::GetTables() const {
     return impl->GetTables();
+}
+
+void SharedCodeCache::GuestPcsOf(const std::uint64_t* hosts, std::size_t count, std::uint64_t* guest_pcs) const {
+    impl->GuestPcsOf(hosts, count, guest_pcs);
 }
 
 void SharedCodeCache::InvalidateCacheRange(std::uint64_t start_address, std::size_t length) {
