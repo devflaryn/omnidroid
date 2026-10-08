@@ -541,6 +541,14 @@ uint32_t od_set_live_fp_optimizations(uint32_t mask);
 uint32_t od_set_precise_get_set(uint32_t on);
 uint32_t od_precise_get_set(void);
 
+/* Patch 0039 (x64 only): non-zero keeps element 0 of a vector -- every scalar floating-point
+ * operand -- in an XMM register (zeroed above it: the same value) in blocks emitted from now on,
+ * rather than copying it through a general register and back. Clear the cache to have every block
+ * again. Returns the value in force (1 or 0); a no-op returning 0 on arm64.
+ * `od_scalar_fp_in_xmm` reads it. */
+uint32_t od_set_scalar_fp_in_xmm(uint32_t on);
+uint32_t od_scalar_fp_in_xmm(void);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);

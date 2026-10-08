@@ -1001,4 +1001,20 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it loads one process-wide atomic.
     pub fn od_precise_get_set() -> u32;
+
+    /// Patch 0039 (x64 only): non-zero keeps element 0 of a vector -- every scalar floating-point
+    /// operand of the A64 frontend -- in an XMM register (zeroed above it: the same value) in
+    /// blocks emitted from now on, instead of a `movq gpr, xmm` that the SSE consumer moves
+    /// straight back. Clear the cache to have every block again. Returns the value in force (1 or
+    /// 0); 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_scalar_fp_in_xmm(on: u32) -> u32;
+
+    /// Patch 0039: the switch [`od_set_scalar_fp_in_xmm`] sets (1 or 0; 0 on arm64).
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it loads one process-wide atomic.
+    pub fn od_scalar_fp_in_xmm() -> u32;
 }

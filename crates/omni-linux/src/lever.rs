@@ -12,6 +12,10 @@
 //!   access (patch 0037, `omni_cpu::dynarmic::set_precise_get_set`), then every process's
 //!   translations are dropped. 1 is the default; 0 is upstream's behaviour under the memory-abort
 //!   check (every guest register read a load from `JitState`, every write a store).
+//! - `jit_fpxmm=0|1`: scalar floating-point operands kept in XMM registers rather than copied
+//!   through a general register and back (patch 0039, `omni_cpu::dynarmic::set_scalar_fp_in_xmm`;
+//!   bit-identical values, ~2x on dependent `FADD`/`FMUL` chains), then every process's
+//!   translations are dropped. Off by default; `OMNI_JIT_SCALAR_FP_XMM=1` from the start.
 //!
 //! - `compose_fast=0|1`: the composer's fast path (`crate::hal::compose::FAST`: the same pixels
 //!   in fewer passes, its buffers kept from frame to frame). On by default.
@@ -87,6 +91,19 @@ pub fn apply(line: &str) -> Option<String> {
                 p.trim_code();
             }
             Some(format!("jit_fp={kept:#x}: {} processes' translations dropped", live.len()))
+        }
+        "jit_fpxmm" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let kept = omni_cpu::dynarmic::set_scalar_fp_in_xmm(on);
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            Some(format!("jit_fpxmm={}: {} processes' translations dropped", u8::from(kept), live.len()))
         }
         "jit_getset" => {
             let on = match value.trim() {
@@ -389,6 +406,20 @@ mod tests {
         assert!(done.starts_with(if want { "jit_getset=1" } else { "jit_getset=0" }), "{done}");
         assert_eq!(omni_cpu::dynarmic::precise_get_set(), want);
         assert_eq!(apply("jit_getset=on"), None);
+    }
+
+    #[test]
+    fn the_fpxmm_lever_switches_scalar_fp_in_xmm() {
+        let want = cfg!(target_arch = "x86_64");
+        let was = omni_cpu::dynarmic::scalar_fp_in_xmm();
+        let done = apply("jit_fpxmm=1").expect("understood");
+        assert!(done.starts_with(if want { "jit_fpxmm=1" } else { "jit_fpxmm=0" }), "{done}");
+        assert_eq!(omni_cpu::dynarmic::scalar_fp_in_xmm(), want);
+        let done = apply("jit_fpxmm=0").expect("understood");
+        assert!(done.starts_with("jit_fpxmm=0"), "{done}");
+        assert!(!omni_cpu::dynarmic::scalar_fp_in_xmm());
+        assert_eq!(apply("jit_fpxmm=yes"), None);
+        omni_cpu::dynarmic::set_scalar_fp_in_xmm(was);
     }
 
     #[test]

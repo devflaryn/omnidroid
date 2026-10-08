@@ -380,6 +380,34 @@ pub fn set_precise_get_set(on: bool) -> bool {
     unsafe { dynarmic_sys::od_set_precise_get_set(u32::from(on)) != 0 }
 }
 
+/// **Whether a scalar floating-point operand stays in an XMM register** (patch 0039, x64):
+/// process-wide, for every block emitted from now on; returns what is in force (`false` on arm64,
+/// where it does nothing). Blocks already emitted keep what they were emitted with --
+/// [`DynarmicBackend::clear_code_cache`] has them emitted again.
+///
+/// The A64 frontend reads every scalar FP operand as element 0 of the vector register, which
+/// upstream copies to a general register, and the SSE instruction that uses it copies straight
+/// back: two cross-domain moves per operand (and per single-precision result). The switch keeps
+/// the element in an XMM register, zeroed above it exactly as the round trip left it, so every
+/// value is bit-identical. MEASURED (`dynarmic-sys/tests/codegen_bench.rs`, E-cores, ns per 4
+/// dependent ops): `FADD D` 22.8 -> 11.5, `FADD S` 32.6 -> 14.3, `FMADD D` 27.4 -> 17.7; four
+/// independent `FADD D` 8.3 -> 3.8, `FCVTZS` 7.6 -> 4.2. `dynarmic-sys/tests/scalar_fp_xmm.rs`
+/// compares 3,000 random scalar-FP/vector blocks with it off and on (registers, flags, `FPSR`).
+///
+/// **Off by default** (a code-generation change, A/B first); `OMNI_JIT_SCALAR_FP_XMM=1` (announced
+/// by [`DynarmicOptions::with_environment`]) or `omni-linux`'s `jit_fpxmm=1` lever turns it on.
+pub fn set_scalar_fp_in_xmm(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_scalar_fp_in_xmm(u32::from(on)) != 0 }
+}
+
+/// What [`set_scalar_fp_in_xmm`] last set (`false` on arm64).
+#[must_use]
+pub fn scalar_fp_in_xmm() -> bool {
+    // SAFETY: loads one process-wide atomic.
+    unsafe { dynarmic_sys::od_scalar_fp_in_xmm() != 0 }
+}
+
 /// What [`set_precise_get_set`] last set (`false` on arm64).
 #[must_use]
 pub fn precise_get_set() -> bool {
@@ -438,6 +466,7 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_OPTIMIZATIONS=<hex mask>` -- [`optimizations_override`](Self::optimizations_override);
     /// * `OMNI_JIT_CHECK_HALT_ON_MEMORY=0|1` -- [`check_halt_on_memory_access`](Self::check_halt_on_memory_access);
     /// * `OMNI_JIT_PRECISE_GETSET=0|1` -- [`set_precise_get_set`] (process-wide);
+    /// * `OMNI_JIT_SCALAR_FP_XMM=0|1` -- [`set_scalar_fp_in_xmm`] (process-wide);
     /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
     /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
     ///   where each thread has its own cache (arm64).
@@ -503,6 +532,19 @@ impl DynarmicOptions {
             let kept = set_precise_get_set(on);
             say(&format!(
                 "precise GetSetElimination {} (OMNI_JIT_PRECISE_GETSET){}",
+                if kept { "on" } else { "off" },
+                if on && !kept { ": not on this host's backend" } else { "" }
+            ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_SCALAR_FP_XMM") {
+            let on = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_SCALAR_FP_XMM={other:?} is not 0 or 1"),
+            };
+            let kept = set_scalar_fp_in_xmm(on);
+            say(&format!(
+                "scalar FP operands in XMM registers {} (OMNI_JIT_SCALAR_FP_XMM){}",
                 if kept { "on" } else { "off" },
                 if on && !kept { ": not on this host's backend" } else { "" }
             ));

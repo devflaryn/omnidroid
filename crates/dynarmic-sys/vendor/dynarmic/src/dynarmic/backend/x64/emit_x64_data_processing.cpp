@@ -1514,6 +1514,16 @@ void EmitX64::EmitZeroExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    // Omnidroid patch 0039: a single-precision result written back (`V_scalar`:
+    // `SetQ(ZeroExtendToQuad(value))`) arrives here in an XMM register; zero-extend it there
+    // (`insertps` zeroing lanes 1-3) rather than through a GPR and back -- the same value.
+    if (args[0].IsInXmm() && code.HasHostFeature(HostFeature::SSE41) && live_scalar_fp_in_xmm.load(std::memory_order_relaxed) != 0) {
+        const Xbyak::Xmm source = ctx.reg_alloc.UseXmm(args[0]);
+        const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
+        code.insertps(result, source, 0b00'00'1110);
+        ctx.reg_alloc.DefineValue(inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
     code.mov(result.cvt32(), result.cvt32());  // x64 zeros upper 32 bits on a 32-bit move
     ctx.reg_alloc.DefineValue(inst, result);
