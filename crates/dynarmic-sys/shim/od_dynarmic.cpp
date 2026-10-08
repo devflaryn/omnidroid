@@ -32,6 +32,9 @@ extern std::atomic<std::uint32_t> live_fp_optimizations;
 extern std::atomic<std::uint32_t> live_precise_get_set;
 /* Patch 0039's switch, likewise. */
 extern std::atomic<std::uint32_t> live_scalar_fp_in_xmm;
+/* Patch 0040's switch, likewise. */
+extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
+extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
 }
 #endif
 #if defined(__aarch64__)
@@ -937,6 +940,26 @@ uint32_t od_precise_get_set(void) {
 uint32_t od_set_scalar_fp_in_xmm(uint32_t on) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     Dynarmic::Backend::X64::live_scalar_fp_in_xmm.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
+    return on != 0 ? 1u : 0u;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+uint32_t od_set_fastmem_mask_by_and(uint32_t on) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::live_fastmem_mask_by_and.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
+    return on != 0 ? 1u : 0u;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+uint32_t od_set_tbi_unmasked(uint32_t on) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::live_fastmem_tbi_unmasked.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
     return on != 0 ? 1u : 0u;
 #else
     (void)on;

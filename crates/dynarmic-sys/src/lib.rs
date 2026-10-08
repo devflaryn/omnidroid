@@ -1017,4 +1017,22 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it loads one process-wide atomic.
     pub fn od_scalar_fp_in_xmm() -> u32;
+
+    /// Patch 0040 (x64 only): non-zero masks a mirrored fastmem address wider than 32 bits (Top
+    /// Byte Ignore's 56) with one `and` against a pool constant instead of a `shl`/`shr` pair, in
+    /// blocks emitted from now on: the same address, one cycle less on its path. Returns the value
+    /// in force (1 or 0); 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_fastmem_mask_by_and(on: u32) -> u32;
+
+    /// Patch 0040 (x64 only): non-zero leaves Top Byte Ignore's mask (56-bit mirrored fastmem)
+    /// off in blocks emitted from now on, as a 64-bit configuration has it: a tagged address is
+    /// non-canonical, faults, and the fastmem handler sends it to the callback path, which clears
+    /// the tag. Returns the value in force (1 or 0); 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_tbi_unmasked(on: u32) -> u32;
 }

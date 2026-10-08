@@ -367,3 +367,26 @@ blocks of scalar FP, conversions, FMOV, FCSEL/FCMP, vector ops, scalar loads/sto
 `FPCR` settings, every upper lane full: registers, NZCV, `FPSR` and memory identical off and on),
 and the dynarmic-sys and omni-cpu suites with the switch defaulted on (only the known
 `shared_cache` timing, `low_window` and `subpage` failures).
+
+### 0040 — x64: Top Byte Ignore's mask as one `and` (switch, off by default)
+
+x64. A mirrored fastmem address wider than 32 bits (omni-linux's Top Byte Ignore: 56) was masked
+with `mov; shl; shr` before every guest access; with `live_fastmem_mask_by_and` on it is
+`mov; and tmp, [rip + pool constant]` -- the same address, one cycle on its path instead of two
+(the `mov` is eliminated, the load is off the path). Switch: `od_set_fastmem_mask_by_and`,
+`OMNI_JIT_TBI_AND=0|1`, `omni-linux`'s `jit_tbiand=` lever; default 0 until an in-world A/B.
+Measured (`omni-cpu/tests/bench.rs::the_cost_of_top_byte_ignore`, E-cores, idle, two runs, ns per
+iteration): memory-heavy 3.13 -> 2.68-2.85 (64-bit identity 2.42-2.51), mixed 3.62-3.71 ->
+3.52-3.61 (identity 3.24-3.25). Verified: `omni-cpu/tests/tbi.rs` (tagged load, store and
+exclusive pair on the direct path with it on). Second switch, `live_fastmem_tbi_unmasked`
+(`od_set_tbi_unmasked`, `omni-linux`'s `jit_tbi=0|1` lever): a 56-bit mirrored address emitted
+unmasked, as a 64-bit one -- a tagged address is then non-canonical, takes a general-protection
+fault (Windows: an access violation at "address" `u64::MAX`), which omni's demand pager declines
+and dynarmic's fastmem handler (keyed on the faulting instruction's address, not the data address)
+sends to the callback, where omni-cpu clears the tag, serves and counts it. The start-time form is
+omni-cpu's `DynarmicOptions::tbi_direct_mask` (`OMNI_JIT_TBI=0`: 64-bit identity config). Correct
+for every access kind (`omni-cpu/tests/tbi.rs`, `tbi_live.rs`: plain, pair, 128-bit, byte,
+ordered, exclusive), untagged accesses at identity speed (memory-heavy 2.48 against the mask's
+3.13 ns/iter), but a tagged one costs ~2.4 us, and Android 15's scudo tags heap pointers `0x02`
+(`omni-linux/tests/tbi_off.rs`: 820 tagged accesses in `toybox echo`, ~19,000 in `ls -lR` +
+`sha256sum`), so it is not expected to win in a game while the heap is tagged.

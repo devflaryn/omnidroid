@@ -549,6 +549,16 @@ uint32_t od_precise_get_set(void);
 uint32_t od_set_scalar_fp_in_xmm(uint32_t on);
 uint32_t od_scalar_fp_in_xmm(void);
 
+/* Patch 0040 (x64 only): non-zero masks a mirrored fastmem address wider than 32 bits (Top Byte
+ * Ignore's 56) with one `and` against a pool constant instead of `shl`/`shr`, in blocks emitted
+ * from now on. The same address. Returns the value in force; a no-op returning 0 on arm64. */
+uint32_t od_set_fastmem_mask_by_and(uint32_t on);
+
+/* Patch 0040 (x64 only): non-zero leaves Top Byte Ignore's mask (56-bit mirrored fastmem) off in
+ * blocks emitted from now on: a tagged access faults to the callback path, which clears the tag.
+ * Returns the value in force; a no-op returning 0 on arm64. */
+uint32_t od_set_tbi_unmasked(uint32_t on);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);

@@ -50,6 +50,16 @@ class BlockOfCode;
 /// read when a block is emitted.
 extern std::atomic<std::uint32_t> live_scalar_fp_in_xmm;
 
+/// Omnidroid patch 0040: non-zero masks a mirrored fastmem address of more than 32 bits (Top Byte
+/// Ignore's 56) with one `and` against a pool constant instead of a `shl`/`shr` pair. The same
+/// address; process-wide, read when a block is emitted.
+extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
+
+/// Omnidroid patch 0040: non-zero leaves a 56-bit mirrored fastmem address (Top Byte Ignore)
+/// unmasked, as a 64-bit one is: a tagged address then faults to the callback path. Process-wide,
+/// read when a block is emitted.
+extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
+
 using A64FullVectorWidth = std::integral_constant<size_t, 128>;
 
 // Array alias that always sizes itself according to the given type T

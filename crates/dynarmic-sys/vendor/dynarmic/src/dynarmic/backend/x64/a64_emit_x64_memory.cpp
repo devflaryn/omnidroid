@@ -27,6 +27,9 @@ namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
 
+std::atomic<std::uint32_t> live_fastmem_mask_by_and{0};
+std::atomic<std::uint32_t> live_fastmem_tbi_unmasked{0};
+
 void A64EmitX64::GenMemory128Accessors() {
     code.align();
     memory_read_128 = code.getCurr<void (*)()>();

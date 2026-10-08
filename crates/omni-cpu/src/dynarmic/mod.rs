@@ -296,6 +296,26 @@ pub struct DynarmicOptions {
     /// access, the cost of D4's rule for below-64-bit configurations) and the callback path
     /// clears it before resolving.
     pub top_byte_ignore: bool,
+    /// With [`top_byte_ignore`](Self::top_byte_ignore): whether the **direct** path masks the tag
+    /// (56 bits, mirrored: `mov`/`shl`/`shr` before every guest access). **Default `true`**.
+    ///
+    /// `false` (x64 hosts only, `OMNI_JIT_TBI=0` in `omni-linux`) keeps D4's 64-bit identity on the
+    /// direct path -- measured 15-25% faster on load/store loops (`tests/bench.rs::
+    /// the_cost_of_top_byte_ignore`) -- and leaves a tagged address to the host: on x86-64 any
+    /// non-zero top byte makes it non-canonical, the access takes a general-protection fault
+    /// (Windows: an access violation at "address" `u64::MAX`; Linux: `SIGSEGV` at 0), which the
+    /// demand pager declines and dynarmic's handler turns, by the faulting instruction's address,
+    /// into the callback path -- where the tag is cleared and the access served, every time (the
+    /// site is not recompiled). Correct, and **~2.4 us each** (MEASURED, `bench.rs`: 1,600x a
+    /// masked access), so it only pays where tagged pointers are rare -- and on Android 15 they
+    /// are not: scudo tags heap pointers with `0x02` whatever `PR_SET_TAGGED_ADDR_CTRL` answers
+    /// (MEASURED, `omni-linux/tests/tbi_off.rs`: 820 tagged accesses in `toybox echo`, ~19,000 in
+    /// `ls -lR /system/etc` and `sha256sum`, every sampled one tagged `0x02`). So this stays `true`
+    /// unless the heap stops tagging. Each such access is counted ([`tagged_accesses`]) and exempt
+    /// from the per-slice degraded-memory invariant. Ignored (treated as `true`) on other hosts: an
+    /// arm64 host would apply its own TBI to a tagged address, which in a low window (D41) is the
+    /// wrong memory.
+    pub tbi_direct_mask: bool,
     /// Whether a guest access the demand pager declines -- a fault the guest meant, such as ART's
     /// implicit null check, which loads through a null object and turns the `SIGSEGV` into a
     /// `NullPointerException` -- also moves that instruction onto the callback path **for good**
@@ -332,6 +352,7 @@ impl Default for DynarmicOptions {
             // is the way back, announced.
             exclusive_monitor: ExclusiveMonitor::ValueCompare,
             top_byte_ignore: false,
+            tbi_direct_mask: true,
             recompile_on_declined_fault: true,
             optimizations_override: None,
             // D38 amendment 2, decided 2026-09-25 on x64: in PS99 with w20's drag script, w27/w29
@@ -380,6 +401,36 @@ pub fn set_precise_get_set(on: bool) -> bool {
     unsafe { dynarmic_sys::od_set_precise_get_set(u32::from(on)) != 0 }
 }
 
+/// **Whether Top Byte Ignore's mask on the direct path is one `and`** (patch 0040, x64) against a
+/// pool constant rather than dynarmic's `shl`/`shr` pair: the same address, one cycle less on its
+/// path. Process-wide, for blocks emitted from now on; returns what is in force (`false` on arm64).
+/// Off by default; `OMNI_JIT_TBI_AND=1` (announced by [`DynarmicOptions::with_environment`]) or
+/// `omni-linux`'s `jit_tbiand=1` lever turns it on.
+pub fn set_fastmem_mask_by_and(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_fastmem_mask_by_and(u32::from(on)) != 0 }
+}
+
+/// **Top Byte Ignore's mask off the direct path, switched while running** (patch 0040, x64): the
+/// live form of [`DynarmicOptions::tbi_direct_mask`] `false`, for blocks emitted from now on (clear
+/// the cache to have every block again): a context configured with the mask emits its accesses
+/// unmasked, and a tagged one faults to the slow path, which clears the tag and counts it
+/// ([`tagged_accesses`]). Returns what is in force (`false` on arm64). Off by default;
+/// `omni-linux`'s `jit_tbi=0` lever turns it on (`jit_tbi=1` back).
+pub fn set_tbi_unmasked(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_tbi_unmasked(u32::from(on)) != 0 }
+}
+
+/// **Data accesses through a tagged address** (bits 56-63 non-zero) that the slow path served, by
+/// every context in the process since it started. With [`DynarmicOptions::tbi_direct_mask`] off
+/// that is every tagged access -- each one a host fault -- so this is what says whether running
+/// without the mask is paying off.
+#[must_use]
+pub fn tagged_accesses() -> u64 {
+    callbacks::TAGGED_ACCESSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// **Whether a scalar floating-point operand stays in an XMM register** (patch 0039, x64):
 /// process-wide, for every block emitted from now on; returns what is in force (`false` on arm64,
 /// where it does nothing). Blocks already emitted keep what they were emitted with --
@@ -416,6 +467,14 @@ pub fn precise_get_set() -> bool {
 }
 
 impl DynarmicOptions {
+    /// Whether the direct path masks a tag off (56 bits, mirrored): [`top_byte_ignore`]
+    /// (Self::top_byte_ignore) with [`tbi_direct_mask`](Self::tbi_direct_mask), which only an x64
+    /// host may turn off.
+    #[must_use]
+    pub const fn tbi_masks_direct_path(&self) -> bool {
+        self.top_byte_ignore && (self.tbi_direct_mask || !cfg!(target_arch = "x86_64"))
+    }
+
     /// Bytes of one guest thread's fast-dispatch table under these options (patch 0035): the
     /// asked-for entries where the shared cache honours them, else the pin's 64 KiB.
     #[must_use]
@@ -467,6 +526,7 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_CHECK_HALT_ON_MEMORY=0|1` -- [`check_halt_on_memory_access`](Self::check_halt_on_memory_access);
     /// * `OMNI_JIT_PRECISE_GETSET=0|1` -- [`set_precise_get_set`] (process-wide);
     /// * `OMNI_JIT_SCALAR_FP_XMM=0|1` -- [`set_scalar_fp_in_xmm`] (process-wide);
+    /// * `OMNI_JIT_TBI_AND=0|1` -- [`set_fastmem_mask_by_and`] (process-wide);
     /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
     /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
     ///   where each thread has its own cache (arm64).
@@ -548,6 +608,15 @@ impl DynarmicOptions {
                 if kept { "on" } else { "off" },
                 if on && !kept { ": not on this host's backend" } else { "" }
             ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_TBI_AND") {
+            let on = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_TBI_AND={other:?} is not 0 or 1"),
+            };
+            let kept = set_fastmem_mask_by_and(on);
+            say(&format!("Top Byte Ignore's mask as one `and` {} (OMNI_JIT_TBI_AND)", if kept { "on" } else { "off" }));
         }
         if std::env::var_os("OMNI_JIT_RETRANSLATION").is_some() {
             crate::stats::track_retranslation(true);
@@ -717,8 +786,8 @@ fn thread_config(
         // Top Byte Ignore (`DynarmicOptions::top_byte_ignore`): 56 bits, mirrored, is dynarmic's
         // mask of the top byte on every direct access -- aliasing across the top byte is exactly
         // what the architecture specifies, and an address with nothing behind it still faults.
-        fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(if options.top_byte_ignore { 56 } else { 64 }),
-        silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(options.top_byte_ignore)),
+        fastmem_address_space_bits: overrides.address_space_bits.unwrap_or(if options.tbi_masks_direct_path() { 56 } else { 64 }),
+        silently_mirror_fastmem: i32::from(overrides.mirrors_out_of_range.unwrap_or(options.tbi_masks_direct_path())),
         recompile_on_fastmem_failure: i32::from(options.recompile_on_declined_fault),
         // Task 2's review measured this: off gives 1 slow-path read plus 1 exclusive callback
         // per `LDXR`, on gives 0, which matters because D5 lists the global exclusive monitor's
@@ -1288,7 +1357,7 @@ impl DynarmicBackend {
                 return Err(error);
             }
         };
-        match require_memory_path(&cpu.memory_mapping(), self.shared.extent, self.shared.options.top_byte_ignore) {
+        match require_memory_path(&cpu.memory_mapping(), self.shared.extent, self.shared.options.tbi_masks_direct_path()) {
             Err(error) => Ok((cpu, error)),
             Ok(()) => {
                 // `cpu` is dropped here, and `DynarmicCpu::drop` returns the id and the TLS block.
@@ -1680,6 +1749,10 @@ pub(crate) struct CpuCtx {
     /// `omni_mem::subpage`): allowed by the guest's view, refused by the host page. Not a degraded
     /// block -- the slice invariant subtracts them.
     pub(crate) split_served: u64,
+    /// Data accesses through a tagged address the slow path served (`top_byte_ignore`): with
+    /// `tbi_direct_mask` off, every one; the slice invariant subtracts them as it does
+    /// `split_served`.
+    pub(crate) tagged_served: u64,
 
     pub(crate) thunks: BTreeSet<GuestAddr>,
     /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
@@ -1811,7 +1884,7 @@ impl DynarmicCpu {
         processor_id: u32,
     ) -> CpuResult<Self> {
         let extent = shared.extent;
-        let top_byte_ignore = shared.options.top_byte_ignore;
+        let top_byte_ignore = shared.options.tbi_masks_direct_path();
         let cpu =
             Self::build_unchecked(shared, config, tls, processor_id, Overrides::default())?;
         // **The startup assertion.** Read back from the live `UserConfig` rather than echoed from
@@ -1834,6 +1907,7 @@ impl DynarmicCpu {
             jit: core::ptr::null_mut(),
             executable_cache: None,
             split_served: 0,
+            tagged_served: 0,
             thunks: BTreeSet::new(),
             inline_thunks: inline_table::InlineThunks::default(),
             svc_handler: None,
@@ -2030,6 +2104,13 @@ impl DynarmicCpu {
     #[must_use]
     pub fn split_served(&self) -> u64 {
         self.with_ctx(|ctx| ctx.split_served)
+    }
+
+    /// Data accesses through a tagged address this context's slow path served
+    /// ([`DynarmicOptions::tbi_direct_mask`] off: all of them).
+    #[must_use]
+    pub fn tagged_served(&self) -> u64 {
+        self.with_ctx(|ctx| ctx.tagged_served)
     }
 
     /// How many run slices were found to have degraded onto the callback path.
@@ -2283,7 +2364,7 @@ impl GuestCpu for DynarmicCpu {
             // and one after, on the jit's own thread, around a slice that is a million guest
             // instructions by default.
             let callbacks_before = self.slice_invariant_armed.then(|| self.slow_path_entries());
-            let served_before = self.with_ctx(|ctx| ctx.split_served);
+            let served_before = self.with_ctx(|ctx| ctx.split_served + ctx.tagged_served);
 
             // SAFETY: the jit is live; `&mut self` means no `&mut CpuCtx` is outstanding at this
             // call site; every callback contains its own panics. This executes attacker-controlled
@@ -2320,8 +2401,9 @@ impl GuestCpu for DynarmicCpu {
                 // An access the 4 KiB overlay's slow path served through a split page's alias is
                 // not a block that stopped reaching memory directly: the host page refuses what
                 // the guest's 4 KiB page allows, so the callback is the only way there
-                // (`omni_mem::subpage`). Those entries are not counted against the slice.
-                let served = self.with_ctx(|ctx| ctx.split_served).saturating_sub(served_before);
+                // (`omni_mem::subpage`). Those entries are not counted against the slice, and
+                // neither are tagged accesses served there (`DynarmicOptions::tbi_direct_mask`).
+                let served =self.with_ctx(|ctx| ctx.split_served + ctx.tagged_served).saturating_sub(served_before);
                 let delta = self.slow_path_entries().saturating_sub(before).saturating_sub(served);
                 if delta != 0 {
                     // The one exemption, and it is narrow on purpose: a genuine guest fault
