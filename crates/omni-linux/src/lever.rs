@@ -56,6 +56,8 @@
 //! - `qos=high|auto`: `high` opts the host process out of Windows' power throttling (EcoQoS) and of
 //!   its rule that a windowless process's timer resolution is not honoured
 //!   (`omni_platform::clock::allow_power_throttling`); `auto` gives the choice back to the host.
+//! - `poll_slice_ms=<ms>`: the longest a poll-family wait sleeps before looking again by itself
+//!   (`crate::poll::SLICE_MS`, 50 by default); a posted signal wakes the waiters directly.
 //! - `futex_herd=0|1`: 1 makes every futex wake unpark every task waiting in the process (the old
 //!   one-condition-variable behaviour, `crate::futex::HERD`), to A/B the per-task wake against it.
 //! - `vk_fast=0|1`: the Vulkan forwarding's fast path (`crate::gpu::FAST`: no allocation per
@@ -174,6 +176,11 @@ pub fn apply(line: &str) -> Option<String> {
             let n: u8 = value.trim().parse().ok().filter(|n| *n <= 2)?;
             crate::hal::composer::FENCES.store(n, std::sync::atomic::Ordering::Relaxed);
             Some(format!("composer_fences={n}: {}", ["no fences", "a present fence", "present and release fences"][usize::from(n)]))
+        }
+        "poll_slice_ms" => {
+            let ms: u64 = value.trim().parse().ok()?;
+            crate::poll::SLICE_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+            Some(format!("poll_slice_ms={}: a poll-family wait looks again by itself every {} ms", ms.max(1), ms.max(1)))
         }
         "poll_keyed" => {
             let on = match value.trim() {

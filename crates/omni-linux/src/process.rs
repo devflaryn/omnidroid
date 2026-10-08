@@ -1000,6 +1000,7 @@ impl Process {
             handle.halt.request();
         }
         self.futexes.interrupt_all();
+        crate::poll::wake_everyone();
     }
 
     /// `clone` with the thread flags: a new task on a new host thread, continuing after the
@@ -1070,6 +1071,7 @@ impl Process {
             handle.halt.request();
         }
         self.futexes.interrupt(tid);
+        crate::poll::wake_everyone();
     }
 
     /// The next thread id.

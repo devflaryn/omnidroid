@@ -102,7 +102,8 @@ function Snap {
   $all = 0.0; foreach ($p in $g) { try { $all += $p.TotalProcessorTime.TotalMilliseconds } catch {} }
   $sysCpu = 0.0; $sp = $g | Where-Object { $_.Id -eq $script:sysPid } | Select-Object -First 1; if ($sp) { $sysCpu = $sp.TotalProcessorTime.TotalMilliseconds }
   [pscustomobject]@{ t = Get-Date; appId = $app.Id; appCpu = $app.TotalProcessorTime.TotalMilliseconds; threads = $threads; all = $all; sys = $sysCpu
-    priv = ($g | Measure-Object PrivateMemorySize64 -Sum).Sum; appPriv = $app.PrivateMemorySize64; n = $g.Count }
+    priv = ($g | Measure-Object PrivateMemorySize64 -Sum).Sum; appPriv = $app.PrivateMemorySize64; n = $g.Count
+    ws = ($g | Measure-Object WorkingSet64 -Sum).Sum }
 }
 
 $t0 = Get-Date
@@ -116,7 +117,7 @@ $csvs = @()
 foreach ($ab in $plan) {
   $lv = $ab[0]; $valA = $ab[1]; $valB = $ab[2]; $bg = $ab[3]
   $csv = Join-Path $Dir "$name.$lv.csv"; $csvs += $csv
-  Set-Content -Path $csv -Value "pair,arm,value,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,lines,sys_ms" -Encoding ascii
+  Set-Content -Path $csv -Value "pair,arm,value,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,lines,sys_ms,ws_gb" -Encoding ascii
   for ($i = 0; $i -lt $Pairs; $i++) {
     $order = if ($i % 2 -eq 0) { @("A", "B") } else { @("B", "A") }
     foreach ($arm in $order) {
@@ -137,7 +138,7 @@ foreach ($ab in $plan) {
       $deltas = foreach ($k in $s1.threads.Keys) { if ($s0.threads.ContainsKey($k)) { $s1.threads[$k] - $s0.threads[$k] } }
       $top = @($deltas | Sort-Object -Descending | Select-Object -First 2)
       if ($s0.appId -ne $s1.appId) { $fps = 0 }
-      Add-Content $csv ("{0},{1},{2},{3:F3},{4:F3},{5:F3},{6:F3},{7:F3},{8:F3},{9:F3},{10},{11},{12:F3}" -f $i, $arm, $value, $fps, ($top[0] / $nf), ($top[1] / $nf), (($s1.appCpu - $s0.appCpu) / $nf), (($s1.all - $s0.all) / $nf), ($s1.priv / 1GB), ($s1.appPriv / 1GB), $s1.n, ($script:disp.Count - $d0), (($s1.sys - $s0.sys) / $nf))
+      Add-Content $csv ("{0},{1},{2},{3:F3},{4:F3},{5:F3},{6:F3},{7:F3},{8:F3},{9:F3},{10},{11},{12:F3},{13:F3}" -f $i, $arm, $value, $fps, ($top[0] / $nf), ($top[1] / $nf), (($s1.appCpu - $s0.appCpu) / $nf), (($s1.all - $s0.all) / $nf), ($s1.priv / 1GB), ($s1.appPriv / 1GB), $s1.n, ($script:disp.Count - $d0), (($s1.sys - $s0.sys) / $nf), ($s1.ws / 1GB))
     }
   }
 }

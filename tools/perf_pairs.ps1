@@ -7,7 +7,7 @@ param([Parameter(Mandatory)][string]$Csv)
 $rows = Import-Csv $Csv
 function Med($x) { $s = @($x | Sort-Object); if ($s.Count -eq 0) { return [double]::NaN }; if ($s.Count % 2) { $s[[int][math]::Floor($s.Count / 2)] } else { ($s[$s.Count / 2 - 1] + $s[$s.Count / 2]) / 2 } }
 $pairs = @($rows | Select-Object -ExpandProperty pair -Unique)
-foreach ($m in "fps", "top_ms", "top2_ms", "app_ms", "all_ms", "sys_ms", "priv_gb", "app_priv_gb") {
+foreach ($m in "fps", "top_ms", "top2_ms", "app_ms", "all_ms", "sys_ms", "priv_gb", "app_priv_gb", "ws_gb") {
   $d = @(); $va = @(); $vb = @()
   foreach ($i in $pairs) {
     $ra = $rows | Where-Object { $_.pair -eq $i -and $_.arm -eq "A" } | Select-Object -First 1
