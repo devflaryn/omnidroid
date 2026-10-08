@@ -333,3 +333,16 @@ ns/iteration off -> on): register-bound 2.70 -> 2.43, memory-heavy 2.80 -> 2.42,
 (a mid-block fault after eliminated writes stops with `X0 == 2`, the flags and `Q7` exact, for 9
 access kinds; unread loads fault; 4,000 random blocks, ~2/3 faulting mid-block, identical state
 with the pass and without; all three fail with the precision removed).
+
+### 0038 — x64: the prelude's fresh pages are not cleared (the constant pool stays out of RAM)
+
+x64, every code cache. `AllocateFromCodeSpace` cleared what it handed out with `memset`; before
+the prelude is complete it hands out only pages nothing has written yet -- freshly committed
+(Windows) or freshly mapped -- which read zero already, and the clear made every one of them
+resident: the 2 MiB constant pool of every code cache, of which a few KiB hold constants. PS99
+in-world, the system's host process (~65 guest processes, a shared cache each) held 84 MiB of
+resident all-zero pages in its executable regions (`wsscan.ps1`, 2026-10-08). Now those
+allocations are not cleared; one made after the prelude (none today) still is, and
+`OMNI_JIT_POOL_MEMSET=1` clears these too (the pin's behaviour, read once per process, for an A/B).
+Verified: `tests/resident.rs` (`QueryWorkingSetEx` over a new cache's own reservation: 0.88 MiB
+resident of 4.00 committed, 2.88 MiB with `OMNI_JIT_POOL_MEMSET=1`).

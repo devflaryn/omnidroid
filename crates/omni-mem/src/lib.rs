@@ -80,8 +80,8 @@ pub use region::{RegionInfo, RegionKind};
 pub use subpage::{Part, GUEST_PAGE};
 pub use space::{
     split_at_pages, AccessPtr, CommitPolicy, Discarded, GuestAddr, GuestSpace, GuestSpaceConfig, MappingId,
-    LowWindow, PageSplit, Placement, Reclaimed, SpaceStats, SplitStats, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED,
-    DEFAULT_MAX_COMMIT_REQUEST, DEFAULT_SPACE_SIZE, LOW_WINDOW_END, SMALL_PAGE,
+    LowWindow, PageSplit, Placement, Reclaimed, SpaceStats, SplitStats, ZeroPages, DEFAULT_COMMIT_GRANULE, DEFAULT_MAX_COMMITTED,
+    DEFAULT_MAX_COMMIT_REQUEST, DEFAULT_SPACE_SIZE, LOW_WINDOW_END, SMALL_PAGE, ZERO_RUN_PAGES, ZERO_SCAN_CHUNK,
 };
 
 /// Re-exported from `omni-platform` so that callers do not need to depend on it directly to name a

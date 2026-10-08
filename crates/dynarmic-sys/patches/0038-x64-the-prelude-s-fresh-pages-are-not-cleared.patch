@@ -1,0 +1,55 @@
+diff --git a/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/backend/x64/block_of_code.cpp
+index 749bf0d..cde6ce6 100644
+--- a/src/dynarmic/backend/x64/block_of_code.cpp
++++ b/src/dynarmic/backend/x64/block_of_code.cpp
+@@ -19,6 +19,7 @@
+ #endif
+ 
+ #include <array>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <mcl/assert.hpp>
+@@ -525,10 +526,27 @@ void* BlockOfCode::AllocateFromCodeSpace(size_t alloc_size) {
+ 
+     void* ret = getCurr<void*>();
+     size_ += alloc_size;
+-    memset(ret, 0, alloc_size);
++    // Omnidroid patch 0038: before the prelude is complete the insertion point has only ever moved
++    // forward through a reservation nothing has written yet -- freshly committed (Windows) or
++    // freshly mapped (elsewhere) pages, which read zero already. Writing zeros over them made
++    // every page resident: the 2 MiB constant pool of every code cache, of which a few KiB hold
++    // constants. MEASURED (PS99 in-world, the system's host process, ~65 caches): 84 MiB of the
++    // executable regions were resident pages of zeros. Later allocations (none today) are cleared
++    // as before, and `OMNI_JIT_POOL_MEMSET=1` clears these too (the old behaviour, for an A/B).
++    if (prelude_complete || PoolMemsetForced()) {
++        memset(ret, 0, alloc_size);
++    }
+     return ret;
+ }
+ 
++bool BlockOfCode::PoolMemsetForced() {
++    static const bool forced = [] {
++        const char* v = std::getenv("OMNI_JIT_POOL_MEMSET");
++        return v != nullptr && v[0] == '1';
++    }();
++    return forced;
++}
++
+ void BlockOfCode::CommitRange([[maybe_unused]] const void* begin, [[maybe_unused]] size_t size) {
+ #ifdef _WIN32
+     if (size == 0) {
+diff --git a/src/dynarmic/backend/x64/block_of_code.h b/src/dynarmic/backend/x64/block_of_code.h
+index ab7f782..5e8e83a 100644
+--- a/src/dynarmic/backend/x64/block_of_code.h
++++ b/src/dynarmic/backend/x64/block_of_code.h
+@@ -148,6 +148,9 @@ public:
+     /// This is useful for objects that need to be placed close to or within code.
+     /// The lifetime of this memory is the same as the code around it.
+     void* AllocateFromCodeSpace(size_t size);
++    /// Omnidroid patch 0038: `OMNI_JIT_POOL_MEMSET=1` -- clear the prelude's allocations (the
++    /// constant pool) even though their pages are fresh, as the pin did.
++    static bool PoolMemsetForced();
+ 
+     void SetCodePtr(CodePtr code_ptr);
+     void EnsurePatchLocationSize(CodePtr begin, size_t size);

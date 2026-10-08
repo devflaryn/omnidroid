@@ -95,9 +95,11 @@ use std::path::Path;
 
 mod census;
 mod error;
+mod zero;
 
 pub use census::{HeapTotals, HostRegion, HostRegionKind, Residency, ResidentSet};
 pub use error::{OsError, VmError, VmResult};
+pub use zero::{page_is_zero, reset_zero_run, resident_pages, ZeroRun};
 
 // The backend modules are **private**. Everything a caller may use is re-exported from this module
 // by a `cfg`-free name, because a `pub mod windows` is a public API surface no other crate can name

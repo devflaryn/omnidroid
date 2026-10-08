@@ -148,6 +148,9 @@ public:
     /// This is useful for objects that need to be placed close to or within code.
     /// The lifetime of this memory is the same as the code around it.
     void* AllocateFromCodeSpace(size_t size);
+    /// Omnidroid patch 0038: `OMNI_JIT_POOL_MEMSET=1` -- clear the prelude's allocations (the
+    /// constant pool) even though their pages are fresh, as the pin did.
+    static bool PoolMemsetForced();
 
     void SetCodePtr(CodePtr code_ptr);
     void EnsurePatchLocationSize(CodePtr begin, size_t size);

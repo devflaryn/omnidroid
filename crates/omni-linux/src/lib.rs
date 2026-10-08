@@ -64,6 +64,7 @@ pub mod window_input;
 pub mod xattr;
 pub mod xsocket;
 pub mod xtables;
+pub mod zero_reclaim;
 pub mod zygote;
 
 pub use fd::Output;
