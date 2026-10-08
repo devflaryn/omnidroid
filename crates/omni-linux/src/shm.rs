@@ -35,6 +35,8 @@ pub struct Shm {
     /// view of its file rather than a file read or write per call.
     graphics: std::sync::atomic::AtomicBool,
     view: RwLock<Option<View>>,
+    /// Pins of the view the GPU imported ([`Shm::pin_view`]).
+    pinned: std::sync::atomic::AtomicU32,
 }
 
 /// A host view of a region's whole file, for [`Shm::read_at`] and [`Shm::write_at`]: a memory copy
@@ -210,6 +212,7 @@ impl Shm {
             crossed: std::sync::atomic::AtomicBool::new(false),
             graphics: std::sync::atomic::AtomicBool::new(false),
             view: RwLock::new(None),
+            pinned: std::sync::atomic::AtomicU32::new(0),
         }))
     }
 
@@ -219,7 +222,7 @@ impl Shm {
     /// The file cannot be opened.
     pub fn open_path(name: &str, host_path: &std::path::Path, len: u64) -> Result<Arc<Self>, Errno> {
         let file = executable_access(std::fs::OpenOptions::new().read(true).write(true)).open(host_path).map_err(|_| EIO)?;
-        Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false, crossed: std::sync::atomic::AtomicBool::new(true), graphics: std::sync::atomic::AtomicBool::new(false), view: RwLock::new(None) }))
+        Ok(Arc::new(Self { file: Mutex::new(file), name: name.to_string(), len: AtomicU64::new(len), prot_mask: AtomicU64::new(0x7), host_path: host_path.to_path_buf(), owned: false, crossed: std::sync::atomic::AtomicBool::new(true), graphics: std::sync::atomic::AtomicBool::new(false), view: RwLock::new(None), pinned: std::sync::atomic::AtomicU32::new(0) }))
     }
 
     /// Its host file.
@@ -249,6 +252,9 @@ impl Shm {
     pub fn set_len(&self, len: u64) -> Result<(), Errno> {
         if len > 1 << 34 {
             return Err(EINVAL);
+        }
+        if self.pinned.load(Ordering::SeqCst) > 0 && len != self.len() {
+            return Err(crate::errno::EBUSY);
         }
         // This process's own view goes first (a view stops the host shortening the file); the next
         // read or write maps the new length.
@@ -305,6 +311,28 @@ impl Shm {
         let n = usize::try_from(v.len.checked_sub(offset)?).ok()?.min(len);
         let ptr = (v.base + offset as usize) as *const u8;
         Some(ShmBytes { _view: view, ptr, len: n })
+    }
+
+    /// **Pin the host view** and answer the address of `[offset, offset + len)` in it, `len` rounded
+    /// up to a 4 KiB page (`None`: not a graphics buffer, views off, or past the view): for the GPU
+    /// to import as memory of its own (`gralloc_direct`, `crate::gpu::native`). While pinned the
+    /// region cannot be resized ([`set_len`](Self::set_len) answers `EBUSY`), so the view -- which a
+    /// resize would unmap under the GPU's import -- stays where it is until [`unpin_view`](Self::unpin_view).
+    #[must_use]
+    pub fn pin_view(&self, offset: u64, len: usize) -> Option<*mut u8> {
+        let at = self.with_view(|v| {
+            let end = usize::try_from(offset).ok()?.checked_add(len.div_ceil(4096) * 4096)?;
+            (end <= v.size).then(|| {
+                self.pinned.fetch_add(1, Ordering::SeqCst);
+                (v.base + offset as usize) as *mut u8
+            })
+        });
+        at.flatten()
+    }
+
+    /// Undo one [`pin_view`](Self::pin_view), once the GPU's import is freed.
+    pub fn unpin_view(&self) {
+        self.pinned.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize, Errno> {
