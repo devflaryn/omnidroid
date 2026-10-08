@@ -89,8 +89,18 @@ impl CpuCtx {
     /// fallback value.
     fn data_ptr(&mut self, vaddr: u64, len: usize, want: Protection) -> Option<DataPtr> {
         let access = if want == Protection::ReadWrite { AccessKind::Write } else { AccessKind::Read };
-        // Top Byte Ignore, when the context has it: the tag is not part of the address.
-        let vaddr = if self.top_byte_ignore { vaddr & 0x00FF_FFFF_FFFF_FFFF } else { vaddr };
+        // Top Byte Ignore, when the context has it: the tag is not part of the address. Where the
+        // direct path does not mask (`DynarmicOptions::tbi_direct_mask` off) every tagged access
+        // arrives here, through a host fault; it is served and counted, and not a degraded block.
+        let vaddr = if self.top_byte_ignore {
+            if vaddr >> 56 != 0 {
+                self.tagged_served += 1;
+                TAGGED_ACCESSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            vaddr & 0x00FF_FFFF_FFFF_FFFF
+        } else {
+            vaddr
+        };
         let Ok(address) = usize::try_from(vaddr) else {
             self.fault(vaddr, access);
             return None;
@@ -167,6 +177,10 @@ impl CpuCtx {
         );
     }
 }
+
+/// Data accesses through a tagged address (bits 56-63 non-zero) that the slow path served, by
+/// every context of the process. See [`super::tagged_accesses`].
+pub(super) static TAGGED_ACCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether [`CODE_FETCHES`] counts. See [`super::count_code_fetches`].
 pub(super) static COUNTING_CODE_FETCHES: std::sync::atomic::AtomicBool =

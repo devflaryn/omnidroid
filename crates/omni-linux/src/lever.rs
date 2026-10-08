@@ -16,6 +16,16 @@
 //!   through a general register and back (patch 0039, `omni_cpu::dynarmic::set_scalar_fp_in_xmm`;
 //!   bit-identical values, ~2x on dependent `FADD`/`FMUL` chains), then every process's
 //!   translations are dropped. Off by default; `OMNI_JIT_SCALAR_FP_XMM=1` from the start.
+//! - `jit_tbiand=0|1`: Top Byte Ignore's mask on every direct guest access as one `and` against a
+//!   constant rather than a `shl`/`shr` pair (patch 0040, `omni_cpu::dynarmic::
+//!   set_fastmem_mask_by_and`; the same address), then every process's translations are dropped.
+//!   Off by default; `OMNI_JIT_TBI_AND=1` from the start.
+//! - `jit_tbi=0|1`: 0 takes Top Byte Ignore's mask off the direct path (patch 0040,
+//!   `omni_cpu::dynarmic::set_tbi_unmasked`): an untagged access is D4's identity, a tagged one a
+//!   host fault served by the slow path (~2.4 us, counted, `[tbi]` every 30 s); 1, the default,
+//!   puts it back. Every process's translations are dropped. **Android 15's scudo tags its heap
+//!   (`0x02`), so 0 is expected to be slower in a game** -- this is the in-session check of that.
+//!   (`OMNI_JIT_TBI=0` does the same from the start: `crate::process::tbi_direct_mask`.)
 //!
 //! - `compose_fast=0|1`: the composer's fast path (`crate::hal::compose::FAST`: the same pixels
 //!   in fewer passes, its buffers kept from frame to frame). On by default.
@@ -115,6 +125,38 @@ pub fn apply(line: &str) -> Option<String> {
                 p.trim_code();
             }
             Some(format!("jit_fpxmm={}: {} processes' translations dropped", u8::from(kept), live.len()))
+        }
+        "jit_tbi" => {
+            // 1 is the mask on the direct path (the default); 0 takes it off, live.
+            let masked = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let unmasked = omni_cpu::dynarmic::set_tbi_unmasked(!masked);
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            Some(format!(
+                "jit_tbi={}: {} processes' translations dropped ({} tagged accesses served by the slow path so far)",
+                u8::from(!unmasked),
+                live.len(),
+                omni_cpu::dynarmic::tagged_accesses()
+            ))
+        }
+        "jit_tbiand" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let kept = omni_cpu::dynarmic::set_fastmem_mask_by_and(on);
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            Some(format!("jit_tbiand={}: {} processes' translations dropped", u8::from(kept), live.len()))
         }
         "jit_getset" => {
             let on = match value.trim() {
@@ -459,6 +501,24 @@ mod tests {
         assert!(done.starts_with(if want { "jit_getset=1" } else { "jit_getset=0" }), "{done}");
         assert_eq!(omni_cpu::dynarmic::precise_get_set(), want);
         assert_eq!(apply("jit_getset=on"), None);
+    }
+
+    #[test]
+    fn the_tbi_lever_takes_the_mask_off_and_puts_it_back() {
+        let want = cfg!(target_arch = "x86_64");
+        let done = apply("jit_tbi=0").expect("understood");
+        assert!(done.starts_with(if want { "jit_tbi=0" } else { "jit_tbi=1" }), "{done}");
+        assert!(apply("jit_tbi=1").expect("understood").starts_with("jit_tbi=1"));
+        assert_eq!(apply("jit_tbi=off"), None);
+    }
+
+    #[test]
+    fn the_tbiand_lever_is_understood() {
+        let want = cfg!(target_arch = "x86_64");
+        let done = apply("jit_tbiand=1").expect("understood");
+        assert!(done.starts_with(if want { "jit_tbiand=1" } else { "jit_tbiand=0" }), "{done}");
+        assert!(apply("jit_tbiand=0").expect("understood").starts_with("jit_tbiand=0"));
+        assert_eq!(apply("jit_tbiand=2"), None);
     }
 
     #[test]

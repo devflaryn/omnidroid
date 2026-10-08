@@ -165,11 +165,23 @@ template<>
 
     if (unused_top_bits == 0) {
         return r13 + vaddr;
+    } else if (unused_top_bits == 8 && ctx.conf.silently_mirror_fastmem && live_fastmem_tbi_unmasked.load(std::memory_order_relaxed) != 0) {
+        // Omnidroid patch 0040: Top Byte Ignore's mask (56 bits, mirrored) left off, switched at run
+        // time: the address as it is, as with 64 bits. A tagged one is non-canonical on x86-64, so
+        // it takes a general-protection fault, which the fastmem handler (keyed on the faulting
+        // instruction, not the address) sends to the callback -- where the host clears the tag.
+        return r13 + vaddr;
     } else if (ctx.conf.silently_mirror_fastmem) {
         if (!tmp) {
             tmp = ctx.reg_alloc.ScratchGpr();
         }
-        if (unused_top_bits < 32) {
+        if (unused_top_bits < 32 && live_fastmem_mask_by_and.load(std::memory_order_relaxed) != 0) {
+            // Omnidroid patch 0040: the same mask as one `and` with a constant from the pool --
+            // one cycle on the address's path instead of the `shl`/`shr` pair's two (the `mov` is
+            // eliminated at rename). Omnidroid's Top Byte Ignore is this mask on every access.
+            code.mov(*tmp, vaddr);
+            code.and_(*tmp, code.Const(code.qword, (u64(1) << ctx.conf.fastmem_address_space_bits) - 1));
+        } else if (unused_top_bits < 32) {
             code.mov(*tmp, vaddr);
             code.shl(*tmp, int(unused_top_bits));
             code.shr(*tmp, int(unused_top_bits));

@@ -45,6 +45,7 @@ dynarmic/
                and ../patches/0037-x64-get-set-elimination-precise-at-memory-aborts.patch
                and ../patches/0038-x64-the-prelude-s-fresh-pages-are-not-cleared.patch
                and ../patches/0039-x64-scalar-fp-operands-stay-in-xmm-registers.patch
+               and ../patches/0040-x64-tbi-mask-as-one-and.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

@@ -200,8 +200,14 @@ fn the_cost_of_top_byte_ignore() {
     ];
     for (workload, per_iteration, build) in workloads {
         println!("  {workload}:");
-        for (label, tbi) in [("64-bit identity       ", false), ("TBI (56-bit, mirrored)", true)] {
-            let guest = Guest::with_options(DynarmicOptions { top_byte_ignore: tbi, ..Default::default() });
+        for (label, tbi, mask, by_and) in [
+            ("64-bit identity               ", false, true, false),
+            ("TBI, shl/shr mask (default)   ", true, true, false),
+            ("TBI, one `and` (0040)         ", true, true, true),
+            ("TBI off the direct path (TBI=0)", true, false, false),
+        ] {
+            omni_cpu::dynarmic::set_fastmem_mask_by_and(by_and);
+            let guest = Guest::with_options(DynarmicOptions { top_byte_ignore: tbi, tbi_direct_mask: mask, ..Default::default() });
             let entry = guest.load(&build(guest.data, ITERATIONS));
             guest.write_u64(guest.data, 1);
             let (mut cpu, sentinel) = guest.thread();
@@ -218,6 +224,26 @@ fn the_cost_of_top_byte_ignore() {
                 (ITERATIONS * per_iteration) as f64 / summary.median.as_secs_f64() / 1e6,
             );
         }
+    }
+    omni_cpu::dynarmic::set_fastmem_mask_by_and(false);
+    // What a tagged access costs where the direct path does not mask (TBI=0): a host fault and the
+    // slow path, each time. The same memory-heavy loop through a tagged pointer.
+    const TAGGED_ITERATIONS: u64 = 20_000;
+    for (label, mask) in [("masked (TBI=1), tagged pointer  ", true), ("unmasked (TBI=0), tagged pointer", false)] {
+        let guest = Guest::with_options(DynarmicOptions { top_byte_ignore: true, tbi_direct_mask: mask, ..Default::default() });
+        let entry = guest.load(&memory_loop(guest.data | (0x02 << 56), TAGGED_ITERATIONS));
+        guest.write_u64(guest.data, 1);
+        let (mut cpu, sentinel) = guest.thread();
+        let summary = measure(|| {
+            cpu.set_x(x(30), sentinel as u64);
+            let exit = cpu.run(entry, RunLimit::Unlimited).expect("the loop runs");
+            assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+        });
+        println!(
+            "  {label} : {:8.1} ns per tagged access (2 per iteration), {} served by the slow path",
+            summary.median.as_secs_f64() * 1e9 / (2 * TAGGED_ITERATIONS) as f64,
+            cpu.tagged_served()
+        );
     }
     println!();
 }

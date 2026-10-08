@@ -352,6 +352,22 @@ fn main() -> ExitCode {
 [threads]   "));
         });
     }
+    // Tagged guest accesses the CPU's slow path served (`OMNI_JIT_TBI=0` or the `jit_tbi=0` lever:
+    // every one, a host fault each), every 30 s while there are any new ones.
+    {
+        let name = argv.iter().find_map(|a| String::from_utf8_lossy(a).strip_prefix("--nice-name=").map(String::from)).unwrap_or_else(|| "system".into());
+        std::thread::spawn(move || {
+            let mut seen = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let now = omni_cpu::dynarmic::tagged_accesses();
+                if now != seen {
+                    eprintln!("[tbi] {name} host process {}: {now} tagged accesses served by the slow path (+{} in 30 s)", std::process::id(), now - seen);
+                    seen = now;
+                }
+            }
+        });
+    }
     // OMNI_SYSCALL_STATS=<seconds>: this host process's system calls over each period, most time
     // first (calls, and the time spent in them, summed over threads).
     if let Some(every) = std::env::var("OMNI_SYSCALL_STATS").ok().and_then(|v| v.parse::<u64>().ok()) {
