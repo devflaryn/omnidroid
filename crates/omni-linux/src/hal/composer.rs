@@ -30,7 +30,7 @@
 //! not moved or scaled: an app that draws edge to edge (a game; any app on a device without
 //! SystemUI) fills the display, and one that keeps clear of the bars shows its own background there.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -61,8 +61,126 @@ pub const HEIGHT: u32 = 720;
 /// The smallest display [`Composer::set_display_size`] makes, in either axis: Android's smallest
 /// screen width is 320 dp (the CDD's minimum), 320 pixels at this display's 160 dpi.
 pub const MIN_SIDE: u32 = 320;
-const VSYNC_PERIOD_NS: i32 = 16_666_666;
 const DPI: f32 = 160.0;
+
+/// **The display's refresh period**, in nanoseconds: what the vsync thread paces to and what every
+/// answer about the display's timing says (the attribute, the configuration, each `onVsync`), so
+/// SurfaceFlinger is told the rate it is given. 60 Hz unless `OMNI_VSYNC_HZ=<n>` (read when the
+/// composer starts, so SurfaceFlinger's model of the display has it from boot) or the live
+/// `vsync_hz=<n>` lever (`crate::lever`) says otherwise. A live change reaches SurfaceFlinger only
+/// through the vsync timestamps and periods it hears from then on: it read the display's modes at
+/// boot, so it is for finding out whether pacing is the frame-rate ceiling, not for a real mode.
+pub static VSYNC_PERIOD_NS: AtomicI32 = AtomicI32::new(16_666_666);
+
+/// `vsync_pace=1` (the default): vsync is paced to absolute deadlines ([`Pacer`]). `0`: the old
+/// loop, a `sleep(period)` after each callback, to compare. MEASURED (Windows, i7-13700F, normal
+/// priority, 5 s each): the old loop ran at **58.8 Hz** (the sleep's ~0.4 ms overshoot plus the
+/// callback's work were added to every period), the deadlines at **60.00 Hz** (overshoot p50
+/// 0.36 ms, p99 0.9-1.1 ms, never accumulated). SurfaceFlinger fits its software vsync to these
+/// timestamps (and turns hardware vsync off once its model is confident), so the old loop's rate
+/// became the whole system's: a ceiling under 60 fps.
+pub static VSYNC_PACE: AtomicBool = AtomicBool::new(true);
+
+/// The refresh period now, in nanoseconds.
+fn vsync_period_ns() -> i32 {
+    VSYNC_PERIOD_NS.load(Ordering::Relaxed)
+}
+
+/// Set the refresh rate to `hz` (1..=1000); the period set, or `None` for a rate out of range.
+pub fn set_vsync_hz(hz: u32) -> Option<i32> {
+    if !(1..=1000).contains(&hz) {
+        return None;
+    }
+    let period = i32::try_from((1_000_000_000 + u64::from(hz) / 2) / u64::from(hz)).ok()?;
+    VSYNC_PERIOD_NS.store(period, Ordering::Relaxed);
+    Some(period)
+}
+
+/// **Vsync's deadlines**: tick `k` is due at `origin + k * period`, so the time a tick's wake-up
+/// and callback take is never added to the next period (a relative `sleep(period)` loop drifts
+/// below the rate by exactly that). A tick woken later than its deadline fires at once; one woken
+/// later than the *next* deadline fires once for the latest deadline passed, the ones between
+/// counted as missed -- never fired back to back to catch up, which would hand SurfaceFlinger a
+/// burst of vsyncs no display makes. A new period starts a new origin at the last deadline.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pacer {
+    origin: std::time::Instant,
+    period: Duration,
+    n: u64,
+}
+
+impl Pacer {
+    pub(crate) fn new(now: std::time::Instant, period: Duration) -> Self {
+        Self { origin: now, period, n: 0 }
+    }
+
+    fn deadline(&self, n: u64) -> std::time::Instant {
+        self.origin + Duration::from_nanos(u64::try_from(u128::from(n) * self.period.as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    /// The next tick's deadline, at `now` (the last tick done), with `period` the period now; and
+    /// how many deadlines were missed outright and dropped.
+    pub(crate) fn next(&mut self, now: std::time::Instant, period: Duration) -> (std::time::Instant, u64) {
+        if period != self.period && !period.is_zero() {
+            self.origin = self.deadline(self.n);
+            self.n = 0;
+            self.period = period;
+        }
+        self.n += 1;
+        let mut missed = 0;
+        if now >= self.deadline(self.n + 1) {
+            // More than a whole period late: the latest deadline passed is the one fired.
+            let passed = u64::try_from(now.saturating_duration_since(self.origin).as_nanos() / self.period.as_nanos().max(1)).unwrap_or(u64::MAX);
+            missed = passed - self.n;
+            self.n = passed;
+        }
+        (self.deadline(self.n), missed)
+    }
+}
+
+/// The vsync thread's own account, said every [`VsyncRate::EVERY`] (`[vsync] ...`): the rate it
+/// really ticked at, how late it woke, how many deadlines it missed, how many it delivered.
+struct VsyncRate {
+    since: std::time::Instant,
+    ticks: u64,
+    delivered: u64,
+    missed: u64,
+    late_sum: Duration,
+    late_max: Duration,
+}
+
+impl VsyncRate {
+    const EVERY: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self { since: std::time::Instant::now(), ticks: 0, delivered: 0, missed: 0, late_sum: Duration::ZERO, late_max: Duration::ZERO }
+    }
+
+    fn tick(&mut self, late: Duration, missed: u64, paced: bool) {
+        self.ticks += 1;
+        self.missed += missed;
+        self.late_sum += late;
+        self.late_max = self.late_max.max(late);
+        let took = self.since.elapsed();
+        if took < Self::EVERY {
+            return;
+        }
+        let period = f64::from(vsync_period_ns()) / 1e6;
+        eprintln!(
+            "[vsync] {:.2} Hz {} (period {period:.3} ms = {:.2} Hz): {} ticks in {:.1} s, {} delivered, {} missed, late avg {:.2} max {:.2} ms",
+            self.ticks as f64 / took.as_secs_f64(),
+            if paced { "paced" } else { "sleep-loop" },
+            1e3 / period,
+            self.ticks,
+            took.as_secs_f64(),
+            self.delivered,
+            self.missed,
+            self.late_sum.as_secs_f64() * 1e3 / self.ticks as f64,
+            self.late_max.as_secs_f64() * 1e3,
+        );
+        *self = Self::new();
+    }
+}
 
 /// `IComposerClient`'s service-specific errors.
 const EX_BAD_DISPLAY: i32 = 2;
@@ -375,21 +493,57 @@ pub struct Client {
 impl Client {
     fn new(broker: Arc<Broker>, screens: Screens, show_chrome: Arc<AtomicBool>) -> Arc<Self> {
         let c = Arc::new(Self { broker, screens, callback: Mutex::default(), next_layer: Mutex::default(), vsync: Arc::default(), show_chrome });
-        // Vsync, every period while enabled, for as long as the client lives.
-        let weak: Weak<Self> = Arc::downgrade(&c);
-        let _ = std::thread::Builder::new().name("omni-composer-vsync".into()).spawn(move || loop {
-            std::thread::sleep(Duration::from_nanos(VSYNC_PERIOD_NS as u64));
-            let Some(c) = weak.upgrade() else { return };
-            if !c.vsync.load(Ordering::Relaxed) {
-                continue;
+        // Vsync, every period while enabled, for as long as the client lives: paced to deadlines
+        // (`Pacer`, `VSYNC_PACE`).
+        static FROM_ENV: std::sync::Once = std::sync::Once::new();
+        FROM_ENV.call_once(|| {
+            if let Some(hz) = std::env::var("OMNI_VSYNC_HZ").ok().and_then(|v| v.trim().parse().ok()) {
+                match set_vsync_hz(hz) {
+                    Some(period) => eprintln!("[vsync] OMNI_VSYNC_HZ={hz}: period {period} ns"),
+                    None => eprintln!("[vsync] OMNI_VSYNC_HZ={hz} is out of range (1..=1000): 60 Hz"),
+                }
             }
-            let Some(callback) = *c.callback.lock() else { continue };
-            let now = crate::sys::monotonic().as_nanos() as i64;
-            // Every display vsyncs: SurfaceFlinger drives each one's frames from its own.
-            let displays: Vec<i64> = c.screens.lock().keys().copied().collect();
-            let proxy = IComposerCallbackProxy::new(Arc::clone(&c.broker), callback);
-            for display in displays {
-                let _ = proxy.on_vsync(display, now, VSYNC_PERIOD_NS);
+        });
+        let weak: Weak<Self> = Arc::downgrade(&c);
+        let _ = std::thread::Builder::new().name("omni-composer-vsync".into()).spawn(move || {
+            let period = || Duration::from_nanos(u64::try_from(vsync_period_ns()).unwrap_or(16_666_666).max(1));
+            let mut pacer = Pacer::new(std::time::Instant::now(), period());
+            let mut rate = VsyncRate::new();
+            loop {
+                let paced = VSYNC_PACE.load(Ordering::Relaxed);
+                // `std::thread::sleep` is a high-resolution waitable timer on Windows 10 1803+
+                // (Rust's own, since 1.75): a deadline is overshot by ~0.4 ms, not a 15.6 ms tick.
+                let (due, missed) = if paced {
+                    let (due, missed) = pacer.next(std::time::Instant::now(), period());
+                    let now = std::time::Instant::now();
+                    if due > now {
+                        std::thread::sleep(due - now);
+                    }
+                    (due, missed)
+                } else {
+                    std::thread::sleep(period());
+                    let now = std::time::Instant::now();
+                    pacer = Pacer::new(now, period());
+                    (now, 0)
+                };
+                let late = std::time::Instant::now().saturating_duration_since(due);
+                rate.tick(late, missed, paced);
+                let Some(c) = weak.upgrade() else { return };
+                if !c.vsync.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let Some(callback) = *c.callback.lock() else { continue };
+                // The vsync's time is its deadline, as a display's is when it happened rather than
+                // when it was heard: SurfaceFlinger fits its model to these, and the wake-up's
+                // jitter is not the display's.
+                let now = crate::sys::monotonic().saturating_sub(late).as_nanos() as i64;
+                rate.delivered += 1;
+                // Every display vsyncs: SurfaceFlinger drives each one's frames from its own.
+                let displays: Vec<i64> = c.screens.lock().keys().copied().collect();
+                let proxy = IComposerCallbackProxy::new(Arc::clone(&c.broker), callback);
+                for display in displays {
+                    let _ = proxy.on_vsync(display, now, vsync_period_ns());
+                }
             }
         });
         c
@@ -885,7 +1039,7 @@ impl IComposerClientServer for Client {
         Ok(match attribute {
             DisplayAttribute::WIDTH => mode.width as i32,
             DisplayAttribute::HEIGHT => mode.height as i32,
-            DisplayAttribute::VSYNC_PERIOD => VSYNC_PERIOD_NS,
+            DisplayAttribute::VSYNC_PERIOD => vsync_period_ns(),
             DisplayAttribute::DPI_X | DisplayAttribute::DPI_Y => (DPI * 1000.0) as i32,
             DisplayAttribute::CONFIG_GROUP => 0,
             _ => return Err(Status::ServiceSpecific(4)), // EX_BAD_PARAMETER
@@ -909,7 +1063,7 @@ impl IComposerClientServer for Client {
             height: mode.height as i32,
             dpi: Some(DisplayConfiguration_Dpi { x: DPI, y: DPI }),
             config_group: 0,
-            vsync_period: VSYNC_PERIOD_NS,
+            vsync_period: vsync_period_ns(),
             vrr_config: None,
         }])
     }
@@ -930,7 +1084,7 @@ impl IComposerClientServer for Client {
     }
 
     fn get_display_vsync_period(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {
-        self.screen(display).map(|_| VSYNC_PERIOD_NS)
+        self.screen(display).map(|_| vsync_period_ns())
     }
 
     fn get_display_physical_orientation(&self, _ctx: &Ctx<'_>, display: i64) -> Result<common::Transform, Status> {
@@ -1033,6 +1187,103 @@ impl IComposerClientServer for Client {
 #[cfg(test)]
 mod tests {
     use super::is_chrome;
+    use super::Pacer;
+    use std::time::{Duration, Instant};
+
+    const P: Duration = Duration::from_nanos(16_666_666);
+
+    /// Deadlines are the origin plus whole periods, however long each tick took to wake and work:
+    /// 600 ticks, each "done" 1.2 ms after its deadline, end exactly 600 periods on.
+    #[test]
+    fn vsync_deadlines_do_not_drift_with_the_ticks_own_time() {
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(t0, P);
+        let mut due = t0;
+        for _ in 0..600 {
+            let (next, missed) = pacer.next(due + Duration::from_micros(1200), P);
+            assert_eq!(missed, 0);
+            due = next;
+        }
+        assert_eq!(due - t0, P * 600);
+    }
+
+    /// A tick woken 3.5 periods late fires once, for the latest deadline passed, and the two it
+    /// slept through are counted, not fired back to back; the next is a whole period on.
+    #[test]
+    fn missed_vsyncs_are_dropped_not_burst() {
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(t0, P);
+        let (first, _) = pacer.next(t0, P);
+        assert_eq!(first, t0 + P);
+        let (late, missed) = pacer.next(t0 + P * 4 + P / 2, P);
+        assert_eq!((late - t0, missed), (P * 4, 2));
+        let (next, missed) = pacer.next(t0 + P * 4 + P / 2, P);
+        assert_eq!((next - t0, missed), (P * 5, 0));
+        // Asked after its deadline but before the one after it: that deadline, at once, nothing
+        // missed.
+        let (on_time, missed) = pacer.next(t0 + P * 6 + P / 3, P);
+        assert_eq!((on_time - t0, missed), (P * 6, 0));
+    }
+
+    /// A new period starts from the last deadline: no tick is skipped or doubled at the change.
+    #[test]
+    fn a_new_vsync_period_counts_from_the_last_deadline() {
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(t0, P);
+        for _ in 0..3 {
+            pacer.next(t0, P);
+        }
+        let half = P * 2;
+        let (due, missed) = pacer.next(t0 + P * 3, half);
+        assert_eq!((due - t0, missed), (P * 3 + half, 0));
+    }
+
+    /// The rate lever's period, rounded to the nearest nanosecond; out of range refused.
+    #[test]
+    fn the_vsync_rate_sets_the_period() {
+        assert_eq!(super::set_vsync_hz(30), Some(33_333_333));
+        assert_eq!(super::set_vsync_hz(0), None);
+        assert_eq!(super::set_vsync_hz(60), Some(16_666_667));
+        super::VSYNC_PERIOD_NS.store(16_666_666, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **The measurement behind `VSYNC_PACE`**: the old relative `sleep(period)` loop against the
+    /// deadlines, 3 s each, with a 0.3 ms "callback" in every tick. A timing test, so ignored by
+    /// default (a loaded host moves it); `cargo test -- --ignored --nocapture vsync_rate` prints both.
+    #[test]
+    #[ignore = "timing; run by hand"]
+    fn vsync_rate_old_loop_against_deadlines() {
+        let work = || {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_micros(300) {
+                std::hint::spin_loop();
+            }
+        };
+        let run = Duration::from_secs(3);
+        let t0 = Instant::now();
+        let mut ticks = 0u32;
+        while t0.elapsed() < run {
+            std::thread::sleep(P);
+            work();
+            ticks += 1;
+        }
+        let old = f64::from(ticks) / t0.elapsed().as_secs_f64();
+        let t0 = Instant::now();
+        let mut pacer = Pacer::new(t0, P);
+        let mut ticks = 0u32;
+        while t0.elapsed() < run {
+            let (due, _) = pacer.next(Instant::now(), P);
+            let now = Instant::now();
+            if due > now {
+                std::thread::sleep(due - now);
+            }
+            work();
+            ticks += 1;
+        }
+        let paced = f64::from(ticks) / t0.elapsed().as_secs_f64();
+        eprintln!("[vsync] old sleep loop {old:.3} Hz, deadlines {paced:.3} Hz");
+        assert!(paced > 59.5 && paced < 60.5, "deadlines ran at {paced:.3} Hz");
+    }
 
     /// Names as the image's own windows give them (run 2026-09-28: SystemUI, the launcher, Roblox).
     #[test]

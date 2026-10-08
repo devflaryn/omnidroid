@@ -147,13 +147,59 @@ fn tempfile_in(dir: &std::path::Path) -> bool {
     ok
 }
 
+/// `OMNI_SHM_TEMP=1`: a region's host file is made `FILE_ATTRIBUTE_TEMPORARY` on Windows, so the
+/// host keeps its dirty pages in memory rather than writing them back to the disk. **Off by
+/// default**, because it was not measured to help:
+///
+/// Why it might: Windows has no `/dev/shm`, so a region is a file in `%TEMP%` -- on the system
+/// disk -- and a graphics buffer is a file the swapchain and the composer rewrite whole every
+/// frame (5.6 MB a buffer at 1575x890). A temporary file is the host's own answer for "a file that
+/// is memory": the cache manager leaves its dirty pages in memory while there is memory for them.
+/// MEASURED (Windows 11 26200, 32 GB, `shm_rewrite_load`: 8 such regions rewritten at ~50 Hz for
+/// 40 s, ~120 GB of writes, through views and through file writes, temporary or not; the disk's
+/// write bytes read around each run): **no write-back above the host's background** (450-1100 MB
+/// per 51 s with a live session running, idle phases the same), so any is under ~6 MB/s -- the
+/// views' and the cache's dirty pages were rewritten in memory either way. What it may still
+/// change, unmeasured: pages written back when the host trims a working set under memory pressure.
+/// Nothing else changes: the file is opened, crossed to another host process by
+/// its path ([`Shm::host_path_crossing`], `crate::remote`) and mapped exactly as before, so every
+/// way a region is shared keeps working. `FILE_FLAG_DELETE_ON_CLOSE` would also be the host's, but
+/// is not safe here: a crossed region is opened by path after its maker may have let it go.
+/// A pagefile-backed section would not fit either: a region grows (`ftruncate`), is read and
+/// written as a file, and crosses by path.
+#[cfg(windows)]
+fn temporary_files() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_SHM_TEMP").as_deref() == Ok("1"))
+}
+
 impl Shm {
     /// Create one, `name` for `/proc` and diagnostics.
     pub fn create(name: &str) -> Result<Arc<Self>, Errno> {
+        #[cfg(windows)]
+        let temporary = temporary_files();
+        #[cfg(not(windows))]
+        let temporary = false;
+        Self::create_in(name, &host_dir(), temporary)
+    }
+
+    /// [`create`](Self::create) in `dir`, its file `FILE_ATTRIBUTE_TEMPORARY` (Windows) if
+    /// `temporary`.
+    fn create_in(name: &str, dir: &std::path::Path, temporary: bool) -> Result<Arc<Self>, Errno> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let host_path = host_dir().join(format!("omni-shm-{}-{n}", std::process::id()));
-        let file = executable_access(std::fs::OpenOptions::new().read(true).write(true).create_new(true)).open(&host_path).map_err(|_| EIO)?;
+        let host_path = dir.join(format!("omni-shm-{}-{n}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(windows)]
+        if temporary {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+            options.attributes(FILE_ATTRIBUTE_TEMPORARY);
+        }
+        #[cfg(not(windows))]
+        let _ = temporary;
+        let file = executable_access(&mut options).open(&host_path).map_err(|_| EIO)?;
         Ok(Arc::new(Self {
             file: Mutex::new(file),
             name: name.to_string(),
@@ -345,7 +391,75 @@ impl Shm {
 
 #[cfg(test)]
 mod tests {
-    use super::Shm;
+    use super::*;
+
+    /// A temporary region is one file shared as before: another opener by path (as another host
+    /// process opens a crossed region) sees the view's writes, and the file is marked temporary
+    /// only when asked.
+    #[test]
+    fn a_temporary_region_is_shared_by_path_as_before() {
+        for temporary in [true, false] {
+            let shm = Shm::create_in("test", &std::env::temp_dir(), temporary).expect("made");
+            shm.set_len(8192).unwrap();
+            shm.as_graphics_buffer();
+            shm.write_at(b"pixels", 4096).unwrap();
+            let other = Shm::open_path("test", shm.host_path_crossing(), 8192).expect("opened by path");
+            let mut got = [0u8; 6];
+            other.read_at(&mut got, 4096).unwrap();
+            assert_eq!(&got, b"pixels");
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                let attributes = std::fs::metadata(shm.host_path()).unwrap().file_attributes();
+                assert_eq!(attributes & 0x100 != 0, temporary, "attributes {attributes:#x}");
+            }
+            let path = shm.host_path().to_path_buf();
+            drop((shm, other));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// **The measurement behind `OMNI_SHM_TEMP`**: a 5.6 MB graphics region (1575x890x4) rewritten
+    /// at 60 Hz for `OMNI_SHM_BENCH_SECS` (20) and then held 10 s more, its file temporary or not
+    /// (`OMNI_SHM_BENCH=plain`). The disk's writes are read from outside meanwhile (the host's disk
+    /// counters); this only makes the load. `cargo test --release -p omni-linux --lib --
+    /// --ignored --nocapture shm_rewrite_load`.
+    #[test]
+    #[ignore = "a load to measure from outside; run by hand"]
+    fn shm_rewrite_load() {
+        const FRAME: usize = 1575 * 890 * 4;
+        let temporary = std::env::var("OMNI_SHM_BENCH").as_deref() != Ok("plain");
+        let secs: u64 = std::env::var("OMNI_SHM_BENCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        // `OMNI_SHM_BENCH_REGIONS=<n>` (1): several buffers, as a swapchain and the composer have.
+        let regions: usize = std::env::var("OMNI_SHM_BENCH_REGIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let shms: Vec<_> = (0..regions)
+            .map(|_| {
+                let shm = Shm::create_in("bench", &std::env::temp_dir(), temporary).expect("made");
+                shm.set_len(FRAME as u64).unwrap();
+                shm.as_graphics_buffer();
+                // Kept, as a crossed graphics buffer's file is.
+                let path = shm.host_path_crossing().to_path_buf();
+                (shm, path)
+            })
+            .collect();
+        let mut frame = vec![0u8; FRAME];
+        let start = std::time::Instant::now();
+        let mut n = 0u32;
+        while start.elapsed() < std::time::Duration::from_secs(secs) {
+            frame.iter_mut().step_by(4096).for_each(|b| *b = b.wrapping_add(1));
+            for (shm, _) in &shms {
+                shm.write_at(&frame, 0).unwrap();
+            }
+            n += 1;
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        eprintln!("[shm] {n} frames of {regions} x {FRAME} bytes in {:.1} s, temporary {temporary}, views {}", start.elapsed().as_secs_f64(), views_on());
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        for (shm, path) in shms {
+            drop(shm);
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     /// A graphics buffer's bytes lent are the bytes `read_at` copies, cut at the region's end; a
     /// region that is not a graphics buffer lends none.

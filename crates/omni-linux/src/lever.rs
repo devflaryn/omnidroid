@@ -18,6 +18,12 @@
 //!   than swizzling a copy (`crate::hal::compose::BGRA_OUT`). Off by default.
 //! - `fence_poll=<microseconds>`: a guest `vkWaitForFences` polled with that period instead of the
 //!   host driver's own (spinning, on NVIDIA) wait (`crate::gpu::FENCE_POLL_US`). 0 is the driver's.
+//! - `vsync_hz=<n>`: the composer's vsync rate, 1..=1000 (`crate::hal::composer::VSYNC_PERIOD_NS`;
+//!   60 by default, `OMNI_VSYNC_HZ` from boot). To find out whether vsync pacing is the ceiling.
+//! - `vsync_pace=0|1`: vsync paced to absolute deadlines (1, the default) or the old
+//!   `sleep(period)` loop that drifted to ~58.8 Hz (0) (`crate::hal::composer::VSYNC_PACE`).
+//! - `binder_host_pool=0|1`: a host service's binder calls run on kept, reused threads (1) or on a
+//!   new thread each (0, the default; `OMNI_BINDER_HOST_POOL`) (`crate::binder::HOST_POOL`).
 //!
 //! - `timer_ms=<n>`: this host process holds a host timer resolution of `n` ms
 //!   (`omni_platform::clock::TimerResolution`, `timeBeginPeriod`); 0 gives it back. On Windows every
@@ -71,6 +77,29 @@ pub fn apply(line: &str) -> Option<String> {
             let lever = if name.trim() == "compose_zero" { &crate::hal::compose::ZERO } else { &crate::hal::compose::BGRA_OUT };
             lever.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("{}={}", name.trim(), u8::from(on)))
+        }
+        "vsync_hz" => {
+            let hz: u32 = value.trim().parse().ok()?;
+            let period = crate::hal::composer::set_vsync_hz(hz)?;
+            Some(format!("vsync_hz={hz}: period {period} ns"))
+        }
+        "vsync_pace" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::hal::composer::VSYNC_PACE.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("vsync_pace={}: {}", u8::from(on), if on { "deadlines" } else { "the old sleep(period) loop" }))
+        }
+        "binder_host_pool" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::binder::HOST_POOL.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("binder_host_pool={}: host services' calls run on {}", u8::from(on), if on { "kept threads" } else { "a new thread each" }))
         }
         "fence_poll" => {
             let us: u32 = value.trim().parse().ok()?;
@@ -190,6 +219,31 @@ mod tests {
         assert_eq!(apply("fence_poll=x"), None);
         apply("fence_poll=0").expect("understood");
         assert_eq!(crate::gpu::FENCE_POLL_US.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_vsync_levers_set_the_rate_and_the_pacing() {
+        use std::sync::atomic::Ordering;
+        assert!(apply("vsync_hz=30").expect("understood").starts_with("vsync_hz=30: period 33333333"));
+        assert_eq!(apply("vsync_hz=0"), None);
+        assert_eq!(apply("vsync_hz=fast"), None);
+        assert!(apply("vsync_hz=60").expect("understood").starts_with("vsync_hz=60: period 16666667"));
+        apply("vsync_pace=0").expect("understood");
+        assert!(!crate::hal::composer::VSYNC_PACE.load(Ordering::Relaxed));
+        apply("vsync_pace=1").expect("understood");
+        assert!(crate::hal::composer::VSYNC_PACE.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_binder_pool_lever_switches_the_pool() {
+        use std::sync::atomic::Ordering;
+        let was = crate::binder::HOST_POOL.load(Ordering::Relaxed);
+        apply("binder_host_pool=1").expect("understood");
+        assert!(crate::binder::HOST_POOL.load(Ordering::Relaxed));
+        apply("binder_host_pool=0").expect("understood");
+        assert!(!crate::binder::HOST_POOL.load(Ordering::Relaxed));
+        assert_eq!(apply("binder_host_pool=2"), None);
+        crate::binder::HOST_POOL.store(was, Ordering::Relaxed);
     }
 
     #[test]
