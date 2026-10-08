@@ -301,3 +301,15 @@ process 16 KiB a thread (~900 threads: 56 MiB of tables at 64 KiB) -- not the de
 lookup cost there is measured. Verified: `omni-cpu/tests/fast_dispatch_size.rs` -- 64
 entries for 200 `BLR` targets (every probe colliding) run every call to its own code, and 32
 threads at 64 entries hold ~2 MiB less C heap than at 4,096 (measured, within 10%).
+### 0036 — x64: the prelude's fresh pages are not cleared (the constant pool stays out of RAM)
+
+x64, every code cache. `AllocateFromCodeSpace` cleared what it handed out with `memset`; before
+the prelude is complete it hands out only pages nothing has written yet -- freshly committed
+(Windows) or freshly mapped -- which read zero already, and the clear made every one of them
+resident: the 2 MiB constant pool of every code cache, of which a few KiB hold constants. PS99
+in-world, the system's host process (~65 guest processes, a shared cache each) held 84 MiB of
+resident all-zero pages in its executable regions (`wsscan.ps1`, 2026-10-08). Now those
+allocations are not cleared; one made after the prelude (none today) still is, and
+`OMNI_JIT_POOL_MEMSET=1` clears these too (the pin's behaviour, read once per process, for an A/B).
+Verified: `tests/resident.rs` (`QueryWorkingSetEx` over a new cache's own reservation: 0.88 MiB
+resident of 4.00 committed, 2.88 MiB with `OMNI_JIT_POOL_MEMSET=1`).
