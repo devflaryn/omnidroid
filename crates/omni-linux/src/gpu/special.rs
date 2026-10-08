@@ -1002,15 +1002,14 @@ fn export_sync_fd(gpu: &Gpu, p: &Process, id: u32, a: &[u64]) -> R<u64> {
         submit_nothing(gpu, device, &t, object, 0, 0)?;
         device_wait_idle(gpu, device, &t)?;
     } else {
-        const WAIT: &[&CStr] = &[c"vkWaitForFences"];
         const RESET: &[&CStr] = &[c"vkResetFences"];
-        // SAFETY: the Vulkan signatures.
-        let w: unsafe extern "system" fn(u64, u32, *const u64, u32, u64) -> i32 = unsafe { f(&t, g::ID_VK_WAIT_FOR_FENCES, WAIT)? };
+        // SAFETY: the Vulkan signature.
         let r: unsafe extern "system" fn(u64, u32, *const u64) -> i32 = unsafe { f(&t, g::ID_VK_RESET_FENCES, RESET)? };
-        unsafe {
-            w(device, 1, &object, 1, u64::MAX);
-            r(device, 1, &object);
-        }
+        // The host's wait for the fence (`release_wait`); its result as before: not looked at.
+        use ash::vk::Handle as _;
+        let _ = super::native::wait_fence(&t, ash::vk::Device::from_raw(device), ash::vk::Fence::from_raw(object));
+        // SAFETY: a live fence of a live device.
+        unsafe { r(device, 1, &object) };
     }
     let fd = crate::sync_file::signalled(p).map_err(|_| CallError::Args)?;
     wr(p, a[2], &fd.to_le_bytes())?;

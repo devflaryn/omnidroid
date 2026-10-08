@@ -8,8 +8,9 @@
 //! generation is bumped (D3a design, "Gralloc buffers on the host GPU").
 //!
 //! **The release does not wait for the GPU.** The copy into the staging buffer is submitted on the
-//! app's thread; waiting for it (NVIDIA's `vkWaitForFences` spins, ~3.1 ms a frame in a Roblox
-//! world, on the engine's render thread) and the copy into the region are a worker's. The region's
+//! app's thread; waiting for it (~3.1 ms a frame of wall time in a Roblox world, on the engine's
+//! render thread -- a wait that sleeps, measured: see [`RELEASE_WAIT_US`]) and the copy into the
+//! region are a worker's. The region's
 //! metadata page says a copy is on its way ([`PENDING_GENERATION_AT`]: the generation it will have),
 //! and whoever reads the pixels -- the composer -- waits for that ([`wait_written`]) the way a
 //! consumer waits on a release fence. An image's next release waits for its previous copy (its
@@ -224,24 +225,57 @@ struct Landing {
 // only by the worker while `in_flight` is set, and nothing else touches it meanwhile.
 unsafe impl Send for Landing {}
 
+/// **How the host waits for a fence it submitted itself** (`release_wait=spin|poll`,
+/// `release_poll=<us>` in the lever file): 0 is the driver's own wait (`spin`, the default), else
+/// the fence asked every that many microseconds with a sleep between (`poll`). The release worker's
+/// wait for its copy, and a sync-file export's wait. The driver's wait was taken to spin on NVIDIA;
+/// MEASURED (`wait_tests::release_wait_cost`, RTX 4060, driver 591.86, 4.8 ms of GPU work a wait,
+/// the waiting thread's cycles): the driver's wait 0.078 ms of CPU, a timeline semaphore's
+/// `vkWaitSemaphores` 0.085 ms and no later; polling every 50/100/250/500 us 0.20/0.20/0.19/0.15 ms
+/// and +0.28/+0.31/+0.36/+0.69 ms of latency. An exported fence's Win32 handle
+/// (`VK_KHR_external_fence_win32`, opaque) is no event: `WaitForSingleObject` on it returns at
+/// once, the fence unsignalled. So `spin` stays the default and there is no `event`; `poll` is for
+/// an in-world A/B, where the `[gpu-stats]` line now gives the wait's thread CPU beside its wall time.
+pub static RELEASE_WAIT_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Wait for `fence` of device `d`: [`RELEASE_WAIT_US`]'s way (or `fence_poll`'s, when that is set
+/// and this is not).
+pub(crate) fn wait_fence(t: &Table, d: vk::Device, fence: vk::Fence) -> R<()> {
+    let wait = vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences);
+    let poll = match RELEASE_WAIT_US.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => super::FENCE_POLL_US.load(std::sync::atomic::Ordering::Relaxed),
+        us => us,
+    };
+    if poll > 0 {
+        // SAFETY: a live fence of a live device; a zero timeout only asks.
+        while unsafe { wait(d, 1, &fence, vk::TRUE, 0) } == vk::Result::TIMEOUT {
+            std::thread::sleep(std::time::Duration::from_micros(u64::from(poll)));
+        }
+    }
+    // SAFETY: as above.
+    check(unsafe { wait(d, 1, &fence, vk::TRUE, u64::MAX) })
+}
+
+thread_local! {
+    /// This host thread, for the release wait's CPU in `[gpu-stats]`.
+    static THIS_THREAD: Option<omni_platform::sampler::HostThread> = omni_platform::sampler::HostThread::current().ok();
+}
+
 impl Landing {
     fn land(self) {
         let t = &self.table;
         let d = vk::Device::from_raw(self.device);
         let waited = std::time::Instant::now();
+        let stats = super::stats::enabled();
+        let before = if stats { THIS_THREAD.with(|me| me.as_ref().and_then(|me| Some((me.cpu_time().ok()?, me.cycles().ok()?)))) } else { None };
         let ok = (|| -> R<()> {
-            let wait = vkfn!(t, ID_VK_WAIT_FOR_FENCES, c"vkWaitForFences", vk::PFN_vkWaitForFences);
-            // `fence_poll` (super::FENCE_POLL_US): polled with a sleep between, not the driver's
-            // spinning wait.
-            let poll = super::FENCE_POLL_US.load(std::sync::atomic::Ordering::Relaxed);
-            if poll > 0 {
-                while unsafe { wait(d, 1, &self.fence, vk::TRUE, 0) } == vk::Result::TIMEOUT {
-                    std::thread::sleep(std::time::Duration::from_micros(u64::from(poll)));
-                }
-            }
-            check(unsafe { wait(d, 1, &self.fence, vk::TRUE, u64::MAX) })?;
-            if super::stats::enabled() {
+            wait_fence(t, d, self.fence)?;
+            if stats {
                 super::stats::add(super::special::ID_GRALLOC_USAGE + 6, waited.elapsed());
+                let after = THIS_THREAD.with(|me| me.as_ref().and_then(|me| Some((me.cpu_time().ok()?, me.cycles().ok()?))));
+                if let (Some((c0, k0)), Some((c1, k1))) = (before, after) {
+                    super::stats::add_release_wait_cpu(c1.saturating_sub(c0), k1.saturating_sub(k0));
+                }
             }
             if self.invalidate && !self.direct {
                 let range = vk::MappedMemoryRange { memory: self.staging_memory, offset: 0, size: vk::WHOLE_SIZE, ..Default::default() };
@@ -658,3 +692,7 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     }
     Ok(0)
 }
+
+#[cfg(test)]
+#[path = "native_wait_tests.rs"]
+mod wait_tests;
