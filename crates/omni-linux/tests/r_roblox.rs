@@ -192,7 +192,10 @@ fn golden_dir_rooted(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool
     let (apk_len, _) = stamp(apk);
     let account = cookie.map_or_else(|| "guest".to_string(), |c| format!("{}-{}", stem(c), stamp(c).1));
     let rooted = root_hash.map_or_else(String::new, |h| format!("-root-{h}"));
-    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}", stem(apk), if kiosk { "kiosk" } else { "ui" });
+    // `-bootu`: a device made with the uncompressed boot image (`omni_linux::boot_image`) is not one
+    // made without it.
+    let bootu = omni_linux::boot_image::key_suffix();
+    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}{bootu}", stem(apk), if kiosk { "kiosk" } else { "ui" });
     root.join(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>())
 }
 
@@ -604,7 +607,7 @@ fn warm_device(sysroot: &Path) {
     let root_req = root_request();
     let rooted_key = root_req.as_ref().map_or_else(String::new, |r| format!("-root-{}", r.hash));
     let golden = std::env::var_os("OMNI_R_GOLDEN")
-        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}{rooted_key}", if kiosk { "kiosk" } else { "ui" })));
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}{rooted_key}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix())));
     let saved = golden.as_ref().filter(|g| g.join("ready").exists());
     // Up: the screen woken, then ready for an app.
     let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");

@@ -178,6 +178,14 @@ impl Properties {
         for (k, v) in OVERLAY {
             self.set(k, v);
         }
+        // `OMNI_BOOT_IMAGE_UNCOMPRESSED=1`: the boot image is mapped where it was compiled for, not
+        // relocated (`crate::boot_image`).
+        if crate::boot_image::enabled() {
+            // `OMNI_BOOT_IMAGE_VERBOSE=1`: ART says how it loads each image (`-verbose:image`).
+            let verbose = if std::env::var("OMNI_BOOT_IMAGE_VERBOSE").as_deref() == Ok("1") { " -verbose:image" } else { "" };
+            let opts = format!("{} {}{verbose}", self.get("dalvik.vm.extra-opts").unwrap_or_default(), crate::boot_image::NO_RELOCATE);
+            self.set("dalvik.vm.extra-opts", opts.trim());
+        }
         // The GPU drivers: on Vulkan (D3a) the image's own ANGLE for GLES on omnidroid's Vulkan
         // driver (`/vendor/lib64/hw/vulkan.omni.so`); on GL omnidroid's GLES driver
         // (`/vendor/lib64/egl/libGLES_omni.so`) and no Vulkan. Both forward to the host's GPU.
