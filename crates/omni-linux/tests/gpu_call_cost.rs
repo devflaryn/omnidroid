@@ -239,16 +239,19 @@ fn a_forwarded_command_costs_little_more_than_the_driver() {
         if committed == "all" {
             p.mem.write(s.at(256 * 1024), &vec![0u8; 768 * 1024]).unwrap();
         }
-        for fast in [false, true] {
+        for (fast, handles) in [(false, false), (true, false), (true, true)] {
             omni_linux::gpu::set_fast(fast);
+            omni_linux::gpu::set_handle_cache(handles);
             let f = ns(forwarded(&mut g));
             eprintln!(
-                "[gpu-call-cost] scratch {committed} committed, vk_fast={}: forwarded {f:.1} ns/call (crossing {:.1} ns), a 32-byte guest read {:.1} ns",
+                "[gpu-call-cost] scratch {committed} committed, vk_fast={} vk_handles={}: forwarded {f:.1} ns/call (crossing {:.1} ns), a 32-byte guest read {:.1} ns",
                 u8::from(fast),
+                u8::from(handles),
                 f - ns(direct),
                 ns(copy(&g))
             );
         }
+        omni_linux::gpu::set_handle_cache(false);
         omni_linux::gpu::set_fast(true);
         let f = ns(inline(&mut g));
         eprintln!("[gpu-call-cost] scratch {committed} committed, vk_fast=1, inline: forwarded {f:.1} ns/call (crossing {:.1} ns)", f - ns(direct));

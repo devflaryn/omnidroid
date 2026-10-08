@@ -17,6 +17,7 @@ dex/hello.dex, from dex/Hello.java with JDK 21 and SDK build-tools 36.0.0:
 
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o vkclear vkclear.c -lvulkan
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o vkbatch vkbatch.c -lvulkan
+    <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o vkframe vkframe.c -lvulkan
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o glclear glclear.c -lEGL -lGLESv3
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o ahbrender ahbrender.c -lEGL -lGLESv3 -lnativewindow
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o netlink netlink.c

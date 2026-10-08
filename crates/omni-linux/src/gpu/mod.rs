@@ -31,7 +31,7 @@ pub mod window_present;
 pub const OMNI_GPU_CALL: u64 = 0xc020_4701;
 /// `_IOWR('G', 2, 32 + 8 * argc)`: a request with its arguments right after it (the `args`
 /// pointer then names them there), read in one checked copy instead of two. The guest's driver
-/// sends it while [`FAST`] is on (bit 1 of [`CONFIG_COMMAND`]'s answer). Its size bits vary.
+/// sends it while [`INLINE`] is on (bit 1 of [`CONFIG_COMMAND`]'s answer). Its size bits vary.
 pub const OMNI_GPU_CALL_INLINE: u64 = 0xc000_4702;
 /// The size field of an ioctl number.
 const INLINE_SIZE_MASK: u64 = 0x3fff << 16;
@@ -160,10 +160,36 @@ pub(crate) struct Object {
 }
 
 /// **The forwarding's fast path** (`omni_linux::lever`'s `vk_fast=0|1`, `OMNI_VK_FAST=1` from the
-/// start; off by default): a dispatchable handle's host object and table from this thread's
-/// [`HandleCache`] rather than the device's locked map, and no result written back when it is 0
-/// (the guest's driver zeroes it). Measured with `tests/gpu_call_cost.rs`, on an E-core.
+/// start; off by default): the request and its arguments read into the stack (no allocation), the
+/// wrapper's host handle likewise, and no result written back when it is 0 (the guest's driver
+/// zeroes it). Only less of the same work: never more than with it off. Measured with
+/// `tests/gpu_call_cost.rs`, on an E-core.
+///
+/// The two other parts of what was first one lever have their own, so an in-world A/B can take
+/// them apart (PS99, 2026-10-09: the three together cost -3.5 fps, +8 ms of the game's host CPU a
+/// frame, which no bench here reproduces): [`HANDLE_CACHE`] (`vk_handles=`) and [`INLINE`]
+/// (`vk_inline=`).
 pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// **The per-thread handle cache** (`vk_handles=0|1`, `OMNI_VK_HANDLES=1`; off by default): a
+/// dispatchable handle's host object and table from this thread's [`HandleCache`] rather than the
+/// device's locked map, while no handle map has changed.
+pub static HANDLE_CACHE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// **Inline arguments** (`vk_inline=0|1`, `OMNI_VK_INLINE=1`; off by default): what the guest's
+/// driver is told (bit 1 of [`CONFIG_COMMAND`]'s answer) -- send each unbatched command as
+/// [`OMNI_GPU_CALL_INLINE`], one checked copy instead of two. The host takes either form always.
+pub static INLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switch [`HANDLE_CACHE`].
+pub fn set_handle_cache(on: bool) {
+    HANDLE_CACHE.store(on, Ordering::Relaxed);
+}
+
+/// Switch [`INLINE`].
+pub fn set_inline(on: bool) {
+    INLINE.store(on, Ordering::Relaxed);
+}
 
 /// **Batching** (`vk_batch=0|1`, `OMNI_VK_BATCH=1`; off by default): what the guest's driver is told
 /// at each `vkBeginCommandBuffer` (`OMNI_VK_ID_CONFIG`). On, the commands that only record into a
@@ -190,6 +216,12 @@ fn read_switches() {
         }
         if on("OMNI_VK_BATCH") {
             set_batch(true);
+        }
+        if on("OMNI_VK_HANDLES") {
+            set_handle_cache(true);
+        }
+        if on("OMNI_VK_INLINE") {
+            set_inline(true);
         }
     });
 }
@@ -281,13 +313,13 @@ impl Gpu {
         }
     }
 
-    /// A wrapper's host handle, kind and table: from this thread's [`HandleCache`] under [`FAST`],
-    /// else read from the wrapper and looked up in the map.
+    /// A wrapper's host handle, kind and table: from this thread's [`HandleCache`] under
+    /// [`HANDLE_CACHE`], else read from the wrapper (into the stack) and looked up in the map.
     fn lookup(&self, p: &Process, wrapper: u64) -> Result<(u64, Kind, Arc<Table>), CallError> {
-        let fast = FAST.load(Ordering::Relaxed);
+        let cache = HANDLE_CACHE.load(Ordering::Relaxed);
         // Read before the map is, so an entry made from a map a change has since passed is stale.
-        let generation = GENERATION.load(Ordering::Acquire);
-        if fast {
+        let generation = if cache { GENERATION.load(Ordering::Acquire) } else { 0 };
+        if cache {
             let hit = HANDLES.with(|c| {
                 c.borrow().entries.iter().flatten().find(|e| e.gpu == self.id.0 && e.wrapper == wrapper && e.generation == generation).map(|e| (e.host, e.kind, Arc::clone(&e.table)))
             });
@@ -296,23 +328,24 @@ impl Gpu {
             }
         }
         let at = wrapper.checked_add(8).ok_or(CallError::Handle(wrapper))?;
-        let host = if fast {
-            let mut host = [0u8; 8];
-            p.mem.read_into(at, &mut host).map(|()| u64::from_le_bytes(host))
-        } else {
-            p.mem.read_u64(at)
-        }
-        .map_err(|_| CallError::Handle(wrapper))?;
+        let host = p.mem.read_u64(at).map_err(|_| CallError::Handle(wrapper))?;
         let (kind, table) = {
             let objects = self.objects.lock();
             let o = objects.get(&host).ok_or(CallError::Handle(wrapper))?;
             (o.kind, Arc::clone(&o.table))
         };
-        if fast {
+        if cache {
             HANDLES.with(|c| {
                 let mut c = c.borrow_mut();
-                let at = c.next;
-                c.next = (at + 1) % c.entries.len();
+                // The wrapper's own slot again if it had one (gone stale), else the next in turn.
+                let at = match c.entries.iter().position(|e| e.as_ref().is_some_and(|e| e.gpu == self.id.0 && e.wrapper == wrapper)) {
+                    Some(at) => at,
+                    None => {
+                        let at = c.next;
+                        c.next = (at + 1) % c.entries.len();
+                        at
+                    }
+                };
                 c.entries[at] = Some(CachedHandle { gpu: self.id.0, generation, wrapper, host, kind, table: Arc::clone(&table) });
             });
         }
@@ -541,7 +574,7 @@ pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> S
     };
     let id = u32::from_le_bytes(call[0..4].try_into().expect("4"));
     if id == CONFIG_COMMAND {
-        let config = u64::from(BATCH.load(Ordering::Relaxed)) | u64::from(FAST.load(Ordering::Relaxed)) << 1;
+        let config = u64::from(BATCH.load(Ordering::Relaxed)) | u64::from(INLINE.load(Ordering::Relaxed)) << 1;
         p.mem.write(arg + 16, &config.to_le_bytes())?;
         return Ok(0);
     }
