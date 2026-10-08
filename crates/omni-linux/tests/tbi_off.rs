@@ -25,8 +25,27 @@ fn real_programs_run_with_tbi_off_the_direct_path() {
     let (status, out, err) = run(&["/system/bin/toybox", "sha256sum", "/system/bin/toybox"]).expect("the sysroot is there");
     assert_eq!(status, ExitStatus::Exited(0), "stderr: {err}");
     assert_eq!(out.len(), 64 + 2 + "/system/bin/toybox\n".len(), "{out}");
+    let after_all = omni_cpu::dynarmic::tagged_accesses();
+    // Patch 0041: a process pays a fault per instruction (and block) that meets a tag, once -- not
+    // per access -- so the count does not grow with the work. (Learned sites are by guest PC, and
+    // each process maps libc.so somewhere else, so every process learns its own.) The same
+    // listing of `/system/etc`, then of all of `/system`: many times the allocations.
+    let count = |args: &[&str]| {
+        let before = omni_cpu::dynarmic::tagged_accesses();
+        let (status, out, err) = run(args).expect("the sysroot is there");
+        assert_eq!(status, ExitStatus::Exited(0), "stderr: {err}");
+        (omni_cpu::dynarmic::tagged_accesses() - before, out.lines().count())
+    };
+    let (small, small_lines) = count(&["/system/bin/toybox", "ls", "-lR", "/system/etc"]);
+    let (large, large_lines) = count(&["/system/bin/toybox", "ls", "-lR", "/system"]);
     println!(
-        "tagged accesses served by the slow path: {after_echo} after `echo`, {} after `ls -lR` and `sha256sum`",
-        omni_cpu::dynarmic::tagged_accesses()
+        "tagged accesses served by the slow path: {after_echo} after `echo`, {after_all} after `ls -lR /system/etc` and \
+         `sha256sum`; `ls -lR /system/etc` ({small_lines} lines) {small}, `ls -lR /system` ({large_lines} lines) {large}; \
+         {} guest instructions learned the mask",
+        omni_cpu::dynarmic::tbi_sites_noted()
     );
+    if omni_cpu::dynarmic::tbi_sites_noted() > 0 {
+        assert!(large_lines > 4 * small_lines, "the large listing is the larger workload");
+        assert!(large < 2 * small, "the faults do not grow with the work: {small} for {small_lines} lines, {large} for {large_lines}");
+    }
 }

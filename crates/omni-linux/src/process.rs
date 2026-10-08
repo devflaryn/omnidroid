@@ -103,26 +103,27 @@ pub struct Process {
 /// Every process of this host process, for what reports on all of them (`OMNI_MEM_TRACE`).
 static ALL: Mutex<Vec<std::sync::Weak<Process>>> = Mutex::new(Vec::new());
 
-/// `OMNI_JIT_TBI=0|1`, read once: whether the CPU's direct path masks a pointer tag
-/// (`DynarmicOptions::tbi_direct_mask`). 1, the default, is how every process has run: 56 address
-/// bits, mirrored, a `shl`/`shr` before each guest access. 0 keeps the 64-bit identity on the
-/// direct path (measured 15-25% faster on load/store loops, omni-cpu `the_cost_of_top_byte_ignore`)
-/// and serves a tagged access through a host fault and the slow path -- correct, slow, counted
-/// (`[tbi]` every 30 s in `omni-linux-run`), ~2.4 us each. **Not a win today**: scudo tags heap
-/// pointers with `0x02` even with `PR_SET_TAGGED_ADDR_CTRL` refused (`tests/tbi_off.rs`: 820
-/// tagged accesses in `toybox echo`, ~19,000 in `ls -lR` + `sha256sum`), so a game would fault on
-/// most heap accesses. Kept for when the heap stops tagging. x64 hosts only; elsewhere the mask
-/// stays.
+/// `OMNI_JIT_TBI=0|1`, read once (by `cpu_options`): whether Top Byte Ignore's mask is on the CPU's
+/// direct path from the start. 1, the default, is how every process has run: 56 address bits,
+/// mirrored, a `shl`/`shr` before each guest access. 0 is the `jit_tbi=0` lever from boot
+/// (`omni_cpu::dynarmic::set_tbi_unmasked`, patches 0040/0041): accesses unmasked -- D4's
+/// identity, measured 15-25% faster on load/store loops (omni-cpu `the_cost_of_top_byte_ignore`)
+/// -- and a tagged one served through a host fault and the slow path (~2.4 us), its guest
+/// instruction then translated again with the mask. Android 15's scudo reaches every chunk header
+/// through a `0x02`-tagged pointer, but from a handful of instructions in `libc.so`, so those learn
+/// the mask once and the rest of the program runs unmasked (`tests/tbi_off.rs`). Counted in
+/// `[tbi]` every 30 s (`omni-linux-run`). x64 hosts only; elsewhere the mask stays.
 #[must_use]
 pub fn tbi_direct_mask() -> bool {
     static MASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *MASK.get_or_init(|| match std::env::var("OMNI_JIT_TBI").as_deref().map(str::trim) {
         Ok("0") => {
+            let unmasked = omni_cpu::dynarmic::set_tbi_unmasked(true);
             eprintln!(
-                "JIT SWITCH: Top Byte Ignore off the direct path (OMNI_JIT_TBI=0){}: a tagged guest access is served by the slow path",
-                if cfg!(target_arch = "x86_64") { "" } else { " -- not on this host, which keeps the mask" }
+                "JIT SWITCH: Top Byte Ignore off the direct path (OMNI_JIT_TBI=0){}: a tagged guest access is served by the slow path and its site masked",
+                if unmasked { "" } else { " -- not on this host, which keeps the mask" }
             );
-            false
+            !unmasked
         }
         Ok("1") | Err(_) => true,
         Ok(other) => panic!("OMNI_JIT_TBI={other:?} is not 0 or 1"),
@@ -761,7 +762,8 @@ impl Process {
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             options.optimizations_override = Some(mask);
         }
-        options.tbi_direct_mask = tbi_direct_mask();
+        // The live switch, set once from `OMNI_JIT_TBI` (the configuration keeps the mask's shape).
+        let _ = tbi_direct_mask();
         options
     }
 

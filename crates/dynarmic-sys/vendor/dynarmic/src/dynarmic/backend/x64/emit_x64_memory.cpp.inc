@@ -126,15 +126,21 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        bool tbi_unmasked = false;
+        const u64 site = inst->GetArg(0).GetU64();
+        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
+            const auto resume = code.getCurr();
+            if (tbi_unmasked) {
+                EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
+            }
 
-            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
 
             EmitCheckMemoryAbort(ctx, inst, end.get());
@@ -207,15 +213,21 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
     if (fastmem_marker) {
         // Use fastmem
         bool require_abort_handling;
-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        bool tbi_unmasked = false;
+        const u64 site = inst->GetArg(0).GetU64();
+        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
 
         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
             code.call(wrapped_fn);
+            const auto resume = code.getCurr();
+            if (tbi_unmasked) {
+                EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
+            }
 
-            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
 
             EmitCheckMemoryAbort(ctx, inst, end.get());
@@ -384,13 +396,28 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     if (fastmem_marker) {
         SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
         bool require_abort_handling = false;
+        bool tbi_unmasked = false;
+        const u64 site = inst->GetArg(0).GetU64();
 
-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
+        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
 
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
-        RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
-                          mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+        if (tbi_unmasked) {
+            // Omnidroid patch 0041: the fallback returns to a stub that notes a tagged access, then
+            // to the instruction after the load (which is inline here, with no slow path of its own).
+            const auto marker = *fastmem_marker;
+            ctx.deferred_emits.emplace_back([=, this] {
+                const auto stub = code.getCurr();
+                EmitTbiNote(code, tbi_note_thunk, vaddr, site);
+                code.jmp(*end, code.T_NEAR);
+                RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(stub),
+                                  mcl::bit_cast<u64>(wrapped_fn), marker, conf.recompile_on_exclusive_fastmem_failure);
+            });
+        } else {
+            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+                              mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+        }
 
         code.L(*end);
 
@@ -485,7 +512,9 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
         SharedLabel abort = GenSharedLabel();
         bool require_abort_handling = false;
 
-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, tmp);
+        bool tbi_unmasked = false;
+        const u64 site = inst->GetArg(0).GetU64();
+        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, tmp, site, &tbi_unmasked);
 
         const auto location = code.getCurr();
 
@@ -520,8 +549,12 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
         ctx.deferred_emits.emplace_back([=, this] {
             code.L(*abort);
             code.call(wrapped_fn);
+            const auto resume = code.getCurr();
+            if (tbi_unmasked) {
+                EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
+            }
 
-            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
 
             code.cmp(al, 0);

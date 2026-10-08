@@ -389,4 +389,28 @@ for every access kind (`omni-cpu/tests/tbi.rs`, `tbi_live.rs`: plain, pair, 128-
 ordered, exclusive), untagged accesses at identity speed (memory-heavy 2.48 against the mask's
 3.13 ns/iter), but a tagged one costs ~2.4 us, and Android 15's scudo tags heap pointers `0x02`
 (`omni-linux/tests/tbi_off.rs`: 820 tagged accesses in `toybox echo`, ~19,000 in `ls -lR` +
-`sha256sum`), so it is not expected to win in a game while the heap is tagged.
+`sha256sum`), so it is not expected to win in a game while the heap is tagged -- which 0041 fixes.
+
+### 0041 — x64: with Top Byte Ignore's mask off, an instruction that meets a tag learns it
+
+x64. Where does the tag come from: `libc.so`'s scudo (`orr xN, xM, #0x200000000000000` in
+`Allocator<AndroidNormalConfig>::allocate`, `deallocate`, `reallocate`, `getAllocSize`,
+`iterateOverChunks`, `initChunkWithMemoryTagging`, `quarantineOrDeallocateChunk`) is
+`addHeaderTag`: the address through which scudo reads and writes every chunk header carries a fixed
+tag 2 whenever the allocator *may* support memory tagging -- a compile-time property on arm64
+(`archSupportsMemoryTagging`: "we assume that Top-Byte Ignore is enabled"), independent of
+bionic's heap tagging level (no `0xb4` user-pointer tag was seen: that level is already NONE with
+`PR_SET_TAGGED_ADDR_CTRL` refused) and of zygote's memtag flags. So no supported setting removes it.
+Instead, with `live_fastmem_tbi_unmasked` on, a fastmem site's slow path (after the fallback has
+served the access) checks the address's top byte and, if set, calls `tbi_note_thunk`, which notes
+the instruction's location (process-wide set, `NoteTbiTaggedSite`) and sets the jit's
+`CacheInvalidation` halt bit, so `Run` returns at its next halt check; the shim's `od_jit_run`
+then invalidates the noted PCs (once per cache, `TbiSitesFrom`), and `EmitFastmemVAddr` emits a
+noted location masked (patch 0040's 56-bit mask) and every other one unmasked. The inline
+exclusive load (no slow-path block of its own) resumes into a stub that does the same. The note
+costs nothing on the direct path. Measured (`omni-linux/tests/tbi_off.rs`, real toybox with
+`OMNI_JIT_TBI=0`): 279 tagged accesses per process, the same for `ls -lR /system/etc` (444 lines)
+and `/system` (2,959 lines), against ~19,000 for two small programs without learning; ~95
+instructions learned. (Learned sites are by guest location and libc.so is mapped at a different
+address in each process, so each process learns its own: ~0.7 ms of faults at startup.) Verified:
+`omni-cpu/tests/tbi_live.rs` (six access kinds fault once, then masked; a loop faults once).

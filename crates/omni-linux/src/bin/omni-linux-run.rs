@@ -362,7 +362,12 @@ fn main() -> ExitCode {
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 let now = omni_cpu::dynarmic::tagged_accesses();
                 if now != seen {
-                    eprintln!("[tbi] {name} host process {}: {now} tagged accesses served by the slow path (+{} in 30 s)", std::process::id(), now - seen);
+                    eprintln!(
+                        "[tbi] {name} host process {}: {now} tagged accesses served by the slow path (+{} in 30 s); {} guest instructions learned the mask",
+                        std::process::id(),
+                        now - seen,
+                        omni_cpu::dynarmic::tbi_sites_noted()
+                    );
                     seen = now;
                 }
             }

@@ -229,7 +229,12 @@ fn the_cost_of_top_byte_ignore() {
     // What a tagged access costs where the direct path does not mask (TBI=0): a host fault and the
     // slow path, each time. The same memory-heavy loop through a tagged pointer.
     const TAGGED_ITERATIONS: u64 = 20_000;
-    for (label, mask) in [("masked (TBI=1), tagged pointer  ", true), ("unmasked (TBI=0), tagged pointer", false)] {
+    for (label, mask, live) in [
+        ("masked (TBI=1), tagged pointer                ", true, false),
+        ("64-bit config (tbi_direct_mask), tagged pointer", false, false),
+        ("jit_tbi=0 (0040/0041, learns), tagged pointer  ", true, true),
+    ] {
+        omni_cpu::dynarmic::set_tbi_unmasked(live);
         let guest = Guest::with_options(DynarmicOptions { top_byte_ignore: true, tbi_direct_mask: mask, ..Default::default() });
         let entry = guest.load(&memory_loop(guest.data | (0x02 << 56), TAGGED_ITERATIONS));
         guest.write_u64(guest.data, 1);
@@ -245,6 +250,7 @@ fn the_cost_of_top_byte_ignore() {
             cpu.tagged_served()
         );
     }
+    omni_cpu::dynarmic::set_tbi_unmasked(false);
     println!();
 }
 

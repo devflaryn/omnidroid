@@ -12,6 +12,8 @@
 #include <limits>
 #include <new>
 #include <optional>
+#include <atomic>
+#include <vector>
 
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/interface/A64/config.h"
@@ -35,6 +37,9 @@ extern std::atomic<std::uint32_t> live_scalar_fp_in_xmm;
 /* Patch 0040's switch, likewise. */
 extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
 extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
+/* Patch 0041 (declared in emit_x64.h). */
+extern std::atomic<std::uint64_t> tbi_sites_noted;
+std::vector<std::uint64_t> TbiSitesFrom(std::size_t first);
 }
 #endif
 #if defined(__aarch64__)
@@ -241,6 +246,8 @@ struct OdJit {
     A64::Jit* jit = nullptr;
     /* The shared code cache this jit runs from (patch 0022), or null. */
     OdCodeCache* cache = nullptr;
+    /* Patch 0041: Top Byte Ignore sites already invalidated, without a cache. */
+    std::atomic<std::uint64_t> tbi_sites_seen{0};
 };
 
 #if !defined(__aarch64__) && !defined(_M_ARM64)
@@ -249,6 +256,8 @@ struct OdJit {
 struct OdCodeCache {
     ShimCallbacks template_callbacks;
     A64::SharedCodeCache* cache = nullptr;
+    /* Patch 0041: Top Byte Ignore sites already invalidated in this cache. */
+    std::atomic<std::uint64_t> tbi_sites_seen{0};
 };
 #else
 struct OdCodeCache {};
@@ -715,7 +724,25 @@ uint32_t od_jit_run(void* p) {
         return OD_HALT_SHIM_REENTERED;
     }
     try {
-        return static_cast<uint32_t>(self->jit->Run());
+        const auto halt = static_cast<uint32_t>(self->jit->Run());
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+        /* Patch 0041: guest instructions that met a tagged address with Top Byte Ignore's mask off
+         * are translated again (masked) -- their blocks dropped here, between runs, where
+         * invalidating is allowed. Once per cache (or per jit without one). */
+        const std::uint64_t noted = Dynarmic::Backend::X64::tbi_sites_noted.load(std::memory_order_acquire);
+        std::atomic<std::uint64_t>& seen = self->cache != nullptr ? self->cache->tbi_sites_seen : self->tbi_sites_seen;
+        std::uint64_t from = seen.load(std::memory_order_relaxed);
+        if (from < noted && seen.compare_exchange_strong(from, noted)) {
+            for (const std::uint64_t pc : Dynarmic::Backend::X64::TbiSitesFrom(static_cast<std::size_t>(from))) {
+                if (self->cache != nullptr) {
+                    self->cache->cache->InvalidateCacheRange(pc, 4);
+                } else {
+                    self->jit->InvalidateCacheRange(pc, 4);
+                }
+            }
+        }
+#endif
+        return halt;
     } catch (...) {
         /* Low reachability, but not zero: xbyak throws `Xbyak::Error` from
          * `block_of_code.cpp` when the code cache runs out of room, and
@@ -963,6 +990,14 @@ uint32_t od_set_tbi_unmasked(uint32_t on) {
     return on != 0 ? 1u : 0u;
 #else
     (void)on;
+    return 0;
+#endif
+}
+
+uint64_t od_tbi_sites_noted(void) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    return Dynarmic::Backend::X64::tbi_sites_noted.load(std::memory_order_relaxed);
+#else
     return 0;
 #endif
 }

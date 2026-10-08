@@ -594,8 +594,10 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         }
         16 => { let mut n = t.name.clone(); n.resize(16, 0); p.mem.write(a[1], &n)?; Ok(0) } // PR_GET_NAME
         // PR_SET_TAGGED_ADDR_CTRL, PR_GET_TAGGED_ADDR_CTRL: a kernel without the tagged address ABI,
-        // so bionic keeps its heap untagged. (Scudo's own `0x02` tag is not affected: MEASURED in
-        // `tests/tbi_off.rs`, every sampled tagged access carried it.) Guest pointers inside structs reach the host's own
+        // so bionic keeps its heap untagged (no `0xb4` pointer tag). Scudo's own `0x02` is another
+        // thing: the address it reads and writes every chunk header through (`addHeaderTag`), fixed
+        // at compile time for arm64 (`archSupportsMemoryTagging`), whatever this answers -- the
+        // CPU's patch 0041 learns those instructions. Guest pointers inside structs reach the host's own
         // code (the GPU driver, D3a), which cannot untag them; TBI in the CPU and `guest::untag` at
         // the syscall boundary still make a tagged pointer work where one appears.
         55 | 56 => Err(EINVAL),

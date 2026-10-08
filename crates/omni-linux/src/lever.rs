@@ -20,12 +20,14 @@
 //!   constant rather than a `shl`/`shr` pair (patch 0040, `omni_cpu::dynarmic::
 //!   set_fastmem_mask_by_and`; the same address), then every process's translations are dropped.
 //!   Off by default; `OMNI_JIT_TBI_AND=1` from the start.
-//! - `jit_tbi=0|1`: 0 takes Top Byte Ignore's mask off the direct path (patch 0040,
-//!   `omni_cpu::dynarmic::set_tbi_unmasked`): an untagged access is D4's identity, a tagged one a
-//!   host fault served by the slow path (~2.4 us, counted, `[tbi]` every 30 s); 1, the default,
-//!   puts it back. Every process's translations are dropped. **Android 15's scudo tags its heap
-//!   (`0x02`), so 0 is expected to be slower in a game** -- this is the in-session check of that.
-//!   (`OMNI_JIT_TBI=0` does the same from the start: `crate::process::tbi_direct_mask`.)
+//! - `jit_tbi=0|1`: 0 takes Top Byte Ignore's mask off the direct path (patches 0040/0041,
+//!   `omni_cpu::dynarmic::set_tbi_unmasked`): an untagged access is D4's identity; a tagged one is
+//!   a host fault served by the slow path (~2.4 us), and its instruction then learns the mask
+//!   (translated again, masked) -- scudo's `0x02` chunk-header tag comes from a few dozen
+//!   instructions in `libc.so`, so a process pays ~280 faults once (`[tbi]` every 30 s counts them
+//!   and the learned instructions). 1, the default, puts the mask back everywhere. Every process's
+//!   translations are dropped. (`OMNI_JIT_TBI=0` does the same from the start:
+//!   `crate::process::tbi_direct_mask`.)
 //!
 //! - `compose_fast=0|1`: the composer's fast path (`crate::hal::compose::FAST`: the same pixels
 //!   in fewer passes, its buffers kept from frame to frame). On by default.

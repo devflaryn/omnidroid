@@ -1035,4 +1035,11 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_tbi_unmasked(on: u32) -> u32;
+
+    /// Patch 0041 (x64 only): guest instructions (by location) that met a tagged address while
+    /// Top Byte Ignore's mask was off, and are emitted masked since, in this process. 0 on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it loads one process-wide atomic.
+    pub fn od_tbi_sites_noted() -> u64;
 }
