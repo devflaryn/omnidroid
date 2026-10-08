@@ -12,6 +12,10 @@
 //!
 //! `OMNI_GUEST_PROF=1` as well: each `jit` sample's host address is kept, and every report is
 //! followed by `[guestprof]` lines naming the guest functions those samples ran ([`crate::guestprof`]).
+//!
+//! Each report is also followed by `[thread-sys]` lines: for the same threads, the wall and processor
+//! time inside each system call, and which guest code their futex waits came from
+//! ([`crate::threadsys`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -43,6 +47,10 @@ struct Entry {
     jit: Vec<u64>,
     /// The guest process the task belongs to, for its memory map.
     process: Option<Weak<crate::process::Process>>,
+    /// The task's system-call counters (`[thread-sys]`), which its own thread writes.
+    sys: Arc<crate::threadsys::Counters>,
+    /// `cycles` at the previous report: the cycle counter's rate against `cpu` over the period.
+    report_cycles: u64,
 }
 
 static THREADS: Mutex<Option<HashMap<i32, Entry>>> = Mutex::new(None);
@@ -56,6 +64,9 @@ pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>, process: Option<Wea
     });
     let Ok(host) = HostThread::current() else { return };
     let cpu = host.cpu_time().unwrap_or_default();
+    let report_cycles = host.cycles().unwrap_or(0);
+    let sys = Arc::new(crate::threadsys::Counters::default());
+    crate::threadsys::attach(Arc::clone(&sys));
     THREADS.lock().get_or_insert_with(HashMap::new).insert(
         tid,
         Entry {
@@ -69,6 +80,8 @@ pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>, process: Option<Wea
             kern: HashMap::new(),
             jit: Vec::new(),
             process,
+            sys,
+            report_cycles,
         },
     );
 }
@@ -76,6 +89,7 @@ pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>, process: Option<Wea
 /// Task `tid` is no longer run by its host thread.
 pub fn stopped(tid: i32) {
     if period().is_some() {
+        crate::threadsys::detach();
         if let Some(m) = THREADS.lock().as_mut() {
             m.remove(&tid);
         }
@@ -149,12 +163,19 @@ fn sample_loop(every: u64) {
         if kinds.len() > 1 << 16 {
             kinds.clear();
         }
-        let mut lines: Vec<(Duration, String, Option<crate::guestprof::HotThread>)> = map
+        // Every thread's system-call counters are taken (and so reset) each period; the hot ones
+        // are reported.
+        let mut sys: Vec<(i32, Arc<crate::threadsys::Counters>, f64)> = Vec::new();
+        let mut lines: Vec<(Duration, String, Option<crate::guestprof::HotThread>, i32)> = map
             .iter_mut()
             .filter_map(|(tid, e)| {
                 let now = e.host.cpu_time().ok()?;
                 let used = now.saturating_sub(e.cpu);
                 e.cpu = now;
+                let cycles = e.host.cycles().unwrap_or(e.cycles);
+                let ns_per_cycle = used.as_nanos() as f64 / (cycles.saturating_sub(e.report_cycles).max(1)) as f64;
+                e.report_cycles = cycles;
+                sys.push((*tid, Arc::clone(&e.sys), ns_per_cycle));
                 let classes = std::mem::take(&mut e.classes);
                 let exe = std::mem::take(&mut e.exe);
                 let kern = std::mem::take(&mut e.kern);
@@ -190,13 +211,17 @@ fn sample_loop(every: u64) {
                         if kern.is_empty() { String::new() } else { format!(" (kern {})", kern.join(" ")) }
                     ),
                     guest_hot,
+                    *tid,
                 ))
             })
             .collect();
+        let names: HashMap<i32, (Vec<u8>, Option<Weak<crate::process::Process>>)> =
+            map.iter().map(|(tid, e)| (*tid, (e.name.clone(), e.process.clone()))).collect();
         drop(guard);
         lines.sort_by(|a, b| b.0.cmp(&a.0));
         let total: Duration = lines.iter().map(|l| l.0).sum();
         let mut hot = Vec::new();
+        let hot_tids: Vec<i32> = lines.iter().take(12).map(|l| l.3).collect();
         let body: Vec<String> = lines
             .into_iter()
             .take(12)
@@ -218,6 +243,21 @@ fn sample_loop(every: u64) {
             if !report.is_empty() {
                 eprint!("{report}");
             }
+        }
+        let periods: Vec<crate::threadsys::ThreadPeriod> = sys
+            .into_iter()
+            .filter_map(|(tid, counters, ns_per_cycle)| {
+                let period = counters.take();
+                let at = hot_tids.iter().position(|&t| t == tid)?;
+                let (name, process) = names.get(&tid).cloned().unwrap_or_default();
+                Some((at, crate::threadsys::ThreadPeriod { tid, name, period, ns_per_cycle, process }))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        let report = crate::threadsys::report(&periods, every as f64, &mut symbols);
+        if !report.is_empty() {
+            eprint!("{report}");
         }
     }
 }
