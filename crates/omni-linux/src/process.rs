@@ -447,7 +447,13 @@ fn on_svc(call: &mut ThunkCall<'_>) {
         IN_FLIGHT.lock().get_or_insert_with(Default::default).insert(task.tid, (number, task.pc, task.lr, std::time::Instant::now(), task.name.clone()));
     }
     let stats_from = (syscall_stats_on() || slow_syscall_ms().is_some()).then(std::time::Instant::now);
+    // `OMNI_THREAD_CPU`: this call's wall and processor time, counted for the task's thread.
+    let timed = crate::threadsys::begin();
     let result = process.syscall(task, number, args);
+    if let Some(timed) = timed {
+        let (lr, fp) = (task.lr, call.x(29));
+        crate::threadsys::end(timed, number, &args, || crate::threadsys::guest_frames(&process, lr, fp));
+    }
     if let (Some(t0), Some(ms)) = (stats_from, slow_syscall_ms()) {
         let took = t0.elapsed();
         if took.as_millis() >= u128::from(ms) {
