@@ -653,9 +653,10 @@ impl Host {
     /// readiness `want` between tries, until `deadline` (then `EAGAIN`) or a signal (`EINTR`).
     fn retry<T>(&self, want: u32, nonblocking: bool, deadline: Option<Instant>, t: &Task, mut op: impl FnMut() -> Result<T, Errno>) -> Result<T, Errno> {
         loop {
-            // Registered before the try, so a change between the try and the wait is not lost;
-            // only this socket's changes wake it (and the 50 ms slice, for signals).
-            let watch = crate::poll::watch(Some(vec![self.key()]));
+            // `poll_keyed`: this socket's changes only (the watcher tells each socket's by its key),
+            // not every change in the process.
+            let keyed = (!nonblocking && crate::poll::KEYED.load(Ordering::Relaxed)).then(|| crate::poll::watch(Some(vec![self.key()])));
+            let seen = crate::poll::generation();
             match op() {
                 Err(e) if e == EAGAIN => {}
                 other => return other,
@@ -675,8 +676,16 @@ impl Host {
             } else {
                 deadline
             };
-            watch.wait(wake_at, t)?;
+            match &keyed {
+                Some(watch) => watch.wait(wake_at, t)?,
+                None => crate::poll::wait_for_change(seen, wake_at, t)?,
+            }
         }
+    }
+
+    /// What this socket's changes are told by (`crate::socket::key` gives a guest's poll the same).
+    fn key(&self) -> crate::poll::Key {
+        std::ptr::from_ref(self) as crate::poll::Key
     }
 
     /// Whether a stream's connect is still going: settled first, so a send or receive on a socket
@@ -1211,7 +1220,11 @@ impl Host {
         // two of the watcher's looks is still a change to it), wakes the watcher to watch for
         // what the socket now lacks, and wakes other waiters on this socket.
         if self.seen.swap(bits, Ordering::SeqCst) != bits {
-            crate::poll::notify_key(self.key());
+            if crate::poll::KEYED.load(Ordering::Relaxed) {
+                crate::poll::notify_key(self.key());
+            } else {
+                crate::poll::notify();
+            }
             wake();
         }
         bits
@@ -1322,8 +1335,13 @@ fn run_watcher(inbox: &platnet::Socket) {
             }
         }
         drop(now);
-        if !changed.is_empty() {
-            crate::poll::notify_keys(&changed);
+        // `poll_keyed`: each changed socket's waiters; else every waiter in the process.
+        if crate::poll::KEYED.load(Ordering::Relaxed) {
+            if !changed.is_empty() {
+                crate::poll::notify_keys(&changed);
+            }
+        } else if !changed.is_empty() {
+            crate::poll::notify();
         }
         watched.push(PollEntry::new(inbox, Interest::READABLE));
         if platnet::poll(&mut watched, Duration::from_secs(1)).is_err() {

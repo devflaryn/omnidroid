@@ -85,6 +85,7 @@ pub fn notify() {
         w.wake();
     }
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
+    STATS.unkeyed.fetch_add(1, Ordering::Relaxed);
 }
 
 /// What `key` names changed: wake its waiters, and those waiting on anything.
@@ -95,6 +96,7 @@ pub fn notify_key(key: Key) {
         w.wake();
     }
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
+    STATS.anything_woken.fetch_add(q.anything.len() as u64, Ordering::Relaxed);
 }
 
 /// What each of `keys` names changed: [`notify_key`] for them all, under one lock.
@@ -195,6 +197,27 @@ impl Drop for Watch {
     }
 }
 
+/// **`poll_keyed=1`** (lever; off by default): fewer waits on "anything".
+///
+/// A thread whose `epoll`/`poll` set holds one descriptor without a key waits on anything, and is
+/// woken by **every** change told in its host process -- each binder transaction queued, each
+/// eventfd written (every `Looper` wake), each socket-pair message -- to look over its whole set and
+/// sleep again. In the system's host process (~60 guest processes, hundreds of waiting threads)
+/// that is thousands of changes a second, times each such waiter. The common descriptors without a
+/// key are ones whose readiness **never changes** (a regular or `/proc` file, a device node, a
+/// shared-memory region: always "ready", `readiness` below), which no change can make ready, and
+/// sockets whose readiness only their **own** sends change (netlink -- netd's, vold's, healthd's
+/// and ueventd's listeners --, init's property service, a datagram socket connected to a bound
+/// one, `logd`'s). With this on, the first are inert and the second keyed by the socket itself,
+/// told when a send on it queues an answer. And `epoll_ctl` (an add or a change) wakes the waiters
+/// of that epoll set only -- each now also waits on its set's own key -- instead of every waiter
+/// in the process. `OMNI_POLL_STATS` counts what is left (waiters on anything, unkeyed changes).
+pub static KEYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn keyed() -> bool {
+    KEYED.load(Ordering::Relaxed)
+}
+
 /// What a change to `file` is told by: its key, or `None` for a kind of file whose changes are
 /// told to everyone (then a wait on it is a wait on anything).
 pub(crate) fn key_of(file: &OpenFile) -> Option<Key> {
@@ -202,13 +225,35 @@ pub(crate) fn key_of(file: &OpenFile) -> Option<Key> {
         FileKind::EventFd(e) => Some(Arc::as_ptr(e) as Key),
         FileKind::TimerFd(t) => Some(Arc::as_ptr(t) as Key),
         FileKind::Pipe(end) => Some(crate::pipe::key(end)),
-        FileKind::Socket(s) => crate::socket::key(s),
+        FileKind::Socket(s) => crate::socket::key(s).or_else(|| if keyed() { crate::socket::own_key(s) } else { None }),
         FileKind::Binder(b) => Some(b.key()),
         FileKind::Evdev(c) => Some(Arc::as_ptr(c.device()) as Key),
         // Always ready, or never: nothing to be woken for.
         FileKind::SyncFile(_) | FileKind::Inotify(_) | FileKind::Bpf(_) | FileKind::RemoteBinder(_) => Some(INERT),
+        // Always ready (`readiness`' last arm), so no change makes them so (`poll_keyed`).
+        FileKind::Host { .. }
+        | FileKind::Dir { .. }
+        | FileKind::Dev(_)
+        | FileKind::Stdin
+        | FileKind::Stdout(_)
+        | FileKind::Stderr(_)
+        | FileKind::Synth { .. }
+        | FileKind::Gpu(_)
+        | FileKind::Shared(_)
+        | FileKind::Fuse(_)
+            if keyed() =>
+        {
+            Some(INERT)
+        }
         _ => None,
     }
+}
+
+/// How many changes have been told with no key, and how many waiter wake-ups were sent (any
+/// cause, timeouts included): for a measurement.
+#[must_use]
+pub fn counts() -> (u64, u64) {
+    (STATS.unkeyed.load(Ordering::Relaxed), STATS.wakes.load(Ordering::Relaxed))
 }
 
 /// What `OMNI_POLL_STATS=<s>` reports: how often something changes, and how many are woken.
@@ -216,19 +261,46 @@ struct Stats {
     notifies: std::sync::atomic::AtomicU64,
     waiting: std::sync::atomic::AtomicI64,
     wakes: std::sync::atomic::AtomicU64,
+    /// Changes told with no key ([`notify`]): every waiter woken.
+    unkeyed: std::sync::atomic::AtomicU64,
+    /// Wake-ups sent to waiters on anything by keyed changes ([`notify_key`]).
+    anything_woken: std::sync::atomic::AtomicU64,
 }
 
-static STATS: Stats = Stats { notifies: std::sync::atomic::AtomicU64::new(0), waiting: std::sync::atomic::AtomicI64::new(0), wakes: std::sync::atomic::AtomicU64::new(0) };
+static STATS: Stats = Stats {
+    notifies: std::sync::atomic::AtomicU64::new(0),
+    waiting: std::sync::atomic::AtomicI64::new(0),
+    wakes: std::sync::atomic::AtomicU64::new(0),
+    unkeyed: std::sync::atomic::AtomicU64::new(0),
+    anything_woken: std::sync::atomic::AtomicU64::new(0),
+};
 
 /// `OMNI_POLL_STATS=<seconds>`: a `[poll]` line that often -- changes told a second, threads
-/// waiting, and wake-ups a second.
+/// waiting, and wake-ups a second; then of those, the changes told with no key (each wakes every
+/// waiter), the threads waiting on anything now, and the wake-ups a second keyed changes sent
+/// them (what `poll_keyed` is for).
 pub fn start_stats() {
     let Some(every) = std::env::var("OMNI_POLL_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else { return };
-    let _ = std::thread::Builder::new().name("omni-poll-stats".into()).spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(every));
-        let n = STATS.notifies.swap(0, Ordering::Relaxed);
-        let w = STATS.wakes.swap(0, Ordering::Relaxed);
-        eprintln!("[poll] pid {}: {} notifications/s, {} threads waiting, {} wake-ups/s", std::process::id(), n / every, STATS.waiting.load(Ordering::Relaxed), w / every);
+    let _ = std::thread::Builder::new().name("omni-poll-stats".into()).spawn(move || {
+        let (mut unkeyed_was, mut anything_was) = (0, 0);
+        loop {
+            std::thread::sleep(Duration::from_secs(every));
+            let n = STATS.notifies.swap(0, Ordering::Relaxed);
+            let w = STATS.wakes.swap(0, Ordering::Relaxed);
+            let (unkeyed, anything) = (STATS.unkeyed.load(Ordering::Relaxed), STATS.anything_woken.load(Ordering::Relaxed));
+            let on_anything = QUEUES.lock().anything.len();
+            eprintln!(
+                "[poll] pid {}: {} notifications/s, {} threads waiting, {} wake-ups/s; {} unkeyed/s, {on_anything} waiting on anything, {} wake-ups/s to them (poll_keyed={})",
+                std::process::id(),
+                n / every,
+                STATS.waiting.load(Ordering::Relaxed),
+                w / every,
+                (unkeyed - unkeyed_was) / every,
+                (anything - anything_was) / every,
+                u8::from(keyed()),
+            );
+            (unkeyed_was, anything_was) = (unkeyed, anything);
+        }
     });
 }
 
@@ -556,7 +628,12 @@ fn sys_epoll_ctl(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             }
             interest.insert(fd, (Arc::downgrade(&file), events, data));
             drop(interest);
-            notify();
+            // The set's own waiters look again (`poll_keyed`), or everyone does.
+            if keyed() {
+                notify_key(Arc::as_ptr(&ep) as Key);
+            } else {
+                notify();
+            }
             Ok(0)
         }
         _ => Err(EINVAL),
@@ -642,7 +719,12 @@ fn sys_epoll_pwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             watching = Some({
                 let interest = ep.interest.lock();
                 let files: Vec<Arc<OpenFile>> = interest.values().filter_map(|(f, _, _)| f.upgrade()).collect();
-                watch(keys_of(files.iter().map(|f| &**f)))
+                let mut keys = keys_of(files.iter().map(|f| &**f));
+                if let (Some(keys), true) = (keys.as_mut(), keyed()) {
+                    // `poll_keyed`: an edit of the set (`epoll_ctl`) is told by the set's key.
+                    keys.push(Arc::as_ptr(&ep) as Key);
+                }
+                watch(keys)
             });
             continue;
         };

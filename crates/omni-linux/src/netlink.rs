@@ -87,6 +87,10 @@ pub fn send(socket: &mut Socket, bytes: &[u8], port: u32) -> Result<usize, Errno
         socket.inbox.extend(reply);
         at += len.div_ceil(4) * 4;
     }
-    crate::poll::notify();
+    // Only this socket's readiness changed: its waiters are told (`poll_keyed`), or everyone.
+    match crate::socket::own_key(socket).filter(|_| crate::poll::KEYED.load(std::sync::atomic::Ordering::Relaxed)) {
+        Some(key) => crate::poll::notify_key(key),
+        None => crate::poll::notify(),
+    }
     Ok(bytes.len())
 }

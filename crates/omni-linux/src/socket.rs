@@ -232,6 +232,7 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
         };
         return crate::netlink::send(socket, bytes, port);
     }
+    let own = own_key(socket);
     let Socket { peer, inbox, .. } = socket;
     match peer {
         Some(Peer::Dgram(server)) => {
@@ -257,6 +258,11 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
             pending.extend_from_slice(bytes);
             let service = std::sync::Arc::clone(service);
             property_requests(pending, &service, inbox);
+            if crate::poll::KEYED.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(key) = own {
+                    crate::poll::notify_key(key);
+                }
+            }
             Ok(bytes.len())
         }
         Some(Peer::Logd(out)) => {
@@ -560,6 +566,9 @@ fn sys_accept4(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     };
     let nonblocking = *file.flags.lock() & 0o4000 != 0;
     let socket = loop {
+        // `poll_keyed`: a connection to this socket (`Bound::connect` tells its key), not every
+        // change in the process.
+        let keyed = (!nonblocking && crate::poll::KEYED.load(std::sync::atomic::Ordering::Relaxed)).then(|| crate::poll::watch(Some(vec![Arc::as_ptr(&bound) as crate::poll::Key])));
         let seen = crate::poll::generation();
         if let Some(s) = bound.accept() {
             break s;
@@ -567,7 +576,10 @@ fn sys_accept4(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         if nonblocking {
             return Err(crate::errno::EAGAIN);
         }
-        crate::poll::wait_for_change(seen, None, t)?;
+        match &keyed {
+            Some(watch) => watch.wait(None, t)?,
+            None => crate::poll::wait_for_change(seen, None, t)?,
+        }
     };
     if a[1] != 0 && a[2] != 0 {
         p.mem.write(a[1], &(AF_UNIX as u16).to_le_bytes())?;
@@ -866,6 +878,20 @@ pub fn key(socket: &Socket) -> Option<crate::poll::Key> {
         Some(Peer::Bound(b)) => Some(Arc::as_ptr(b) as crate::poll::Key),
         _ => None,
     }
+}
+
+/// The key of a socket whose readiness only its own sends change (`crate::poll::KEYED`): a netlink
+/// socket (the kernel answers into its inbox as it is sent to), init's property service (answered
+/// as it is sent to), `logd`'s and a datagram socket connected to a bound one (always writable,
+/// never readable). The socket's own address, which is stable: it lives in its open file.
+#[must_use]
+pub fn own_key(socket: &Socket) -> Option<crate::poll::Key> {
+    let own = match &socket.peer {
+        None => socket.domain == AF_NETLINK,
+        Some(Peer::Logd(_) | Peer::PropertyService { .. } | Peer::Dgram(_)) => true,
+        _ => false,
+    };
+    own.then_some(std::ptr::from_ref(socket) as crate::poll::Key)
 }
 
 /// `read` of a socket pair's end (which may wait); `None` for anything else.

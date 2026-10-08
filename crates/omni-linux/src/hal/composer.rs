@@ -8,7 +8,9 @@
 //! RenderEngine draws nothing. Otherwise every layer is changed to `CLIENT`, RenderEngine composes
 //! them (on the host GPU, D3a) into the client target, and presenting copies that target.
 //! `OMNI_COMPOSER_DEVICE=0` makes every frame `CLIENT`. Composition is synchronous, so there are no
-//! fences to report.
+//! fences to report (the `composer_fences` lever answers signalled ones: [`FENCES`] says what an
+//! absent fence costs SurfaceFlinger). A frame that goes `CLIENT` says why, once per layer and
+//! reason (`[composer] CLIENT composition: ...`).
 //!
 //! **The display can be resized** ([`Composer::set_display_size`]), as an external display whose
 //! mode changes is: the composer offers one configuration of the new size under a new id and
@@ -30,7 +32,7 @@
 //! not moved or scaled: an app that draws edge to edge (a game; any app on a device without
 //! SystemUI) fills the display, and one that keeps clear of the bars shows its own background there.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -42,7 +44,7 @@ use super::aidl::android_hardware_graphics_composer3::{
     i_composer, i_composer_client, Capability, ChangedCompositionLayer, ChangedCompositionTypes, ColorMode, CommandError, CommandResultPayload, Composition,
     DisplayAttribute, DisplayCapability, DisplayCommand, DisplayConfiguration, DisplayConfiguration_Dpi, DisplayConnectionType, HdrCapabilities,
     IComposerCallbackProxy, IComposerClientServer, IComposerServer, PerFrameMetadataKey, PowerMode, PresentOrValidate, PresentOrValidate_Result,
-    RenderIntent, ContentType, ClockMonotonicTimestamp, VsyncPeriodChangeConstraints, VsyncPeriodChangeTimeline,
+    PresentFence, ReleaseFences, ReleaseFences_Layer, RenderIntent, ContentType, ClockMonotonicTimestamp, VsyncPeriodChangeConstraints, VsyncPeriodChangeTimeline,
 };
 use super::aidl::{Binder, Ctx, Fd, Status};
 use super::framebuffer::Framebuffer;
@@ -80,6 +82,80 @@ pub static VSYNC_PERIOD_NS: AtomicI32 = AtomicI32::new(16_666_666);
 /// timestamps (and turns hardware vsync off once its model is confident), so the old loop's rate
 /// became the whole system's: a ceiling under 60 fps.
 pub static VSYNC_PACE: AtomicBool = AtomicBool::new(true);
+
+/// The last vsync's time on the guest's clock (ns), for a present fence's signal time.
+static LAST_VSYNC_NS: AtomicI64 = AtomicI64::new(0);
+
+/// **`composer_skip_validate=1`** (lever; `OMNI_COMPOSER_SKIP_VALIDATE=1` from the start): a frame
+/// the composer composes itself is presented at `presentOrValidateDisplay` and answered
+/// `Presented`, as a hardware composer with nothing to change does -- rather than `Validated`,
+/// after which SurfaceFlinger makes a **second `executeCommands` call** (`acceptDisplayChanges` +
+/// `presentDisplay`) for the same frame. SurfaceFlinger takes this path for every frame without
+/// client composition (AOSP 15 `HWComposer::getDeviceCompositionChanges`: `canSkipValidate` is
+/// true, because the AIDL composer always "supports" the expected present time). Saves one
+/// binder round trip per frame: the guest's marshalling of the call and of its reply, the
+/// broker's hand-off to a host thread and back, SurfaceFlinger's thread put to sleep and woken.
+/// Off by default, for an in-session A/B.
+pub static SKIP_VALIDATE: AtomicBool = AtomicBool::new(false);
+
+/// **`composer_fences=0|1|2`** (lever): 0 (the default) answers no fences, as before; 1 a present
+/// fence with each presented frame; 2 also a release fence for each layer the composer read.
+///
+/// Every fence is a sync file signalled when it is made (`crate::sync_file`: composition here is
+/// synchronous, so nothing is ever pending). A present fence's signal time is the first vsync at
+/// or after the present (the time the display would show it), so the vsync model SurfaceFlinger
+/// fits to present fences (`VSyncReactor::addPresentFence`) sees vsync-phase timestamps and not
+/// composition times, which it would reject as outliers and turn hardware vsync back on for.
+///
+/// **What an absent fence (-1) costs SurfaceFlinger, read in AOSP 15**: nothing in its pacing.
+/// `FrameTargeter::beginFrame` treats `NO_FENCE` as "not pending" and "not missed" (no
+/// backpressure, no skipped commit); `computeEarliestPresentTime` is not used (expected present
+/// time is supported), so it never sleeps before presenting; `FrameTimeline` flushes an invalid
+/// fence at once. It costs one `E/SurfaceFlinger: trackPendingFrame: Invalid present fence` log
+/// line a frame (`PresentLatencyTracker`, only while the composer does not report
+/// `PRESENT_FENCE_IS_NOT_RELIABLE`: [`unreliable_present_fence`]), and no `DISPLAY_PRESENT` frame
+/// timestamps. A real fence costs more: a descriptor made and translated into SurfaceFlinger per
+/// frame (two with release fences per layer), and SurfaceFlinger passes the present fence on in
+/// every transaction-completed callback -- to the game, in another host process, so a descriptor
+/// crossing processes every frame. Release fences change nothing for the app: without one, a
+/// buffer is released with no fence, which the app may reuse at once -- and the composer has
+/// finished reading it when `executeCommands` returns.
+pub static FENCES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `OMNI_COMPOSER_UNRELIABLE_PRESENT_FENCE=1`: the composer reports the
+/// `PRESENT_FENCE_IS_NOT_RELIABLE` capability, which SurfaceFlinger reads once, at boot. It then
+/// stops tracking present latency (no `trackPendingFrame` log line a frame), ignores present fences
+/// in its vsync model, offers no `DISPLAY_PRESENT` frame event and sets
+/// `service.sf.present_timestamp=0` -- which Android's Vulkan loader reads to offer
+/// `VK_GOOGLE_display_timing` (a pacing library in the game may use it): an A/B, off by default.
+fn unreliable_present_fence() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_COMPOSER_UNRELIABLE_PRESENT_FENCE").as_deref() == Ok("1"))
+}
+
+fn skip_validate() -> bool {
+    static FROM_ENV: std::sync::Once = std::sync::Once::new();
+    FROM_ENV.call_once(|| {
+        if std::env::var("OMNI_COMPOSER_SKIP_VALIDATE").as_deref() == Ok("1") {
+            SKIP_VALIDATE.store(true, Ordering::Relaxed);
+        }
+    });
+    SKIP_VALIDATE.load(Ordering::Relaxed)
+}
+
+/// The first vsync at or after `now` (guest ns), on the vsync thread's phase.
+fn vsync_at_or_after(now: i64) -> i64 {
+    next_vsync(LAST_VSYNC_NS.load(Ordering::Relaxed), i64::from(vsync_period_ns()), now)
+}
+
+/// The first of `last + k * period` (k >= 0) at or after `now`; `now` itself before any vsync.
+fn next_vsync(last: i64, period: i64, now: i64) -> i64 {
+    let period = period.max(1);
+    if last <= 0 || now <= last {
+        return now.max(last);
+    }
+    last + ((now - last) + period - 1) / period * period
+}
 
 /// The refresh period now, in nanoseconds.
 fn vsync_period_ns() -> i32 {
@@ -378,7 +454,7 @@ impl IComposerServer for Composer {
     }
 
     fn get_capabilities(&self, _ctx: &Ctx<'_>) -> Result<Vec<Capability>, Status> {
-        Ok(Vec::new())
+        Ok(if unreliable_present_fence() { vec![Capability::PRESENT_FENCE_IS_NOT_RELIABLE] } else { Vec::new() })
     }
 }
 
@@ -528,15 +604,16 @@ impl Client {
                 };
                 let late = std::time::Instant::now().saturating_duration_since(due);
                 rate.tick(late, missed, paced);
+                // The vsync's time is its deadline, as a display's is when it happened rather than
+                // when it was heard: SurfaceFlinger fits its model to these, and the wake-up's
+                // jitter is not the display's.
+                let now = crate::sys::monotonic().saturating_sub(late).as_nanos() as i64;
+                LAST_VSYNC_NS.store(now, Ordering::Relaxed);
                 let Some(c) = weak.upgrade() else { return };
                 if !c.vsync.load(Ordering::Relaxed) {
                     continue;
                 }
                 let Some(callback) = *c.callback.lock() else { continue };
-                // The vsync's time is its deadline, as a display's is when it happened rather than
-                // when it was heard: SurfaceFlinger fits its model to these, and the wake-up's
-                // jitter is not the display's.
-                let now = crate::sys::monotonic().saturating_sub(late).as_nanos() as i64;
                 rate.delivered += 1;
                 // Every display vsyncs: SurfaceFlinger drives each one's frames from its own.
                 let displays: Vec<i64> = c.screens.lock().keys().copied().collect();
@@ -552,6 +629,37 @@ impl Client {
     /// The display this call names, or `BAD_DISPLAY`.
     fn screen(&self, display: i64) -> Result<Arc<Screen>, Status> {
         self.screens.lock().get(&display).cloned().ok_or(Status::ServiceSpecific(EX_BAD_DISPLAY))
+    }
+
+    /// Present the frame, and answer the fences [`FENCES`] asks for into `results`.
+    fn present_answering(&self, screen: &Screen, display: i64, results: &mut Vec<CommandResultPayload>) {
+        self.present(screen);
+        let fences = FENCES.load(Ordering::Relaxed);
+        if fences == 0 {
+            return;
+        }
+        let now = crate::sys::monotonic().as_nanos() as i64;
+        let shown = vsync_at_or_after(now);
+        results.push(CommandResultPayload::PresentFence(PresentFence { display, fence: Fd(crate::sync_file::signalled_at(shown as u64)) }));
+        if fences < 2 {
+            return;
+        }
+        // The layers whose buffers the composer read for this frame: done with now.
+        let read: Vec<i64> = {
+            let st = screen.state.lock();
+            if !st.device_frame {
+                return;
+            }
+            st.layers
+                .iter()
+                .filter(|(l, c)| **c == Composition::DEVICE && !st.hidden.contains(l) && st.device.get(l).is_some_and(|d| d.slot.is_some_and(|s| d.buffers.contains_key(&s))))
+                .map(|(l, _)| *l)
+                .collect()
+        };
+        if !read.is_empty() {
+            let layers = read.into_iter().map(|layer| ReleaseFences_Layer { layer, fence: Fd(crate::sync_file::signalled_at(now as u64)) }).collect();
+            results.push(CommandResultPayload::ReleaseFences(ReleaseFences { display, layers }));
+        }
     }
 
     /// Present the frame: the composer's own composition of its layers, or the client target.
@@ -795,6 +903,50 @@ fn trace_layers(st: &mut State) {
     }
 }
 
+/// Why the composer cannot compose layer `d` as `c` itself, in a few words.
+fn not_ours_because(d: &LayerState, c: Composition) -> String {
+    if c != Composition::DEVICE && c != Composition::SOLID_COLOR {
+        // SurfaceFlinger's own choice (AOSP 15 `OutputLayer`: rounded corners, a shadow or
+        // stretch, a secure layer, an unsupported dataspace or colour transform, a blur).
+        return format!("SurfaceFlinger asked for {c:?}");
+    }
+    let Some(frame) = &d.frame else { return "no display frame".into() };
+    if frame.right <= frame.left || frame.bottom <= frame.top {
+        return "empty frame".into();
+    }
+    if c == Composition::SOLID_COLOR {
+        return "a solid colour with no colour".into();
+    }
+    if d.transform.is_some_and(|t| !(0..=7).contains(&t.0)) {
+        return format!("transform {:?}", d.transform);
+    }
+    let Some(buffer) = d.slot.and_then(|s| d.buffers.get(&s)) else { return format!("no buffer in slot {:?}", d.slot) };
+    if !matches!(buffer.format, RGBA_8888 | RGBX_8888 | BGRA_8888 | IMPLEMENTATION_DEFINED) {
+        return format!("pixel format {:#x}", buffer.format);
+    }
+    match &d.crop {
+        None => "no source crop".into(),
+        Some(c) => format!("crop [{},{} {},{}] outside its {}x{} buffer", c.left, c.top, c.right, c.bottom, buffer.width, buffer.height),
+    }
+}
+
+/// **A frame SurfaceFlinger must compose** (`CLIENT`: RenderEngine on the host GPU through the
+/// forwarded GLES, every layer of the frame -- the expensive path): said once for each layer name
+/// and reason (`[composer] CLIENT composition: ...`), at most 64 of them a process.
+fn log_client_reason(st: &State, hidden: &std::collections::HashSet<i64>) {
+    static SAID: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Mutex::default);
+    let Some((l, c)) = st.layers.iter().filter(|(l, _)| !hidden.contains(l)).find(|(l, c)| st.device.get(l).is_none_or(|d| !d.composable(**c))) else { return };
+    let (name, why) = match st.device.get(l) {
+        None => (String::new(), "nothing set on it".to_string()),
+        Some(d) => (d.slot.and_then(|s| d.buffers.get(&s)).map_or_else(String::new, |b| b.name.clone()), not_ours_because(d, *c)),
+    };
+    let key = format!("{name:?}: {why}");
+    let mut said = SAID.lock();
+    if said.len() < 64 && said.insert(key.clone()) {
+        eprintln!("[composer] CLIENT composition (SurfaceFlinger composes the frame, {} layers): layer {l} {key}", st.layers.len());
+    }
+}
+
 /// Every 600 frames: how many were the composer's own and how many SurfaceFlinger's.
 fn log_paths(st: &State) {
     if (st.frames_device + st.frames_client) % 600 == 0 {
@@ -976,17 +1128,26 @@ impl IComposerClientServer for Client {
                         std::collections::HashSet::new()
                     };
                     let all = !off && !st.layers.is_empty() && st.layers.iter().filter(|(l, _)| !hidden.contains(l)).all(|(l, c)| st.device.get(l).is_some_and(|d| d.composable(*c)));
+                    if !all && !off {
+                        log_client_reason(&st, &hidden);
+                    }
                     st.hidden = hidden;
                     st.device_frame = all;
                     trace_layers(&mut st);
                     all
                 };
                 if device {
+                    if cmd.present_or_validate_display && !cmd.present_display && skip_validate() {
+                        // Nothing to change: presented now, as a hardware composer does.
+                        self.present_answering(&screen, cmd.display, &mut results);
+                        results.push(CommandResultPayload::PresentOrValidateResult(PresentOrValidate { display: cmd.display, result: PresentOrValidate_Result::Presented }));
+                        continue;
+                    }
                     if cmd.present_or_validate_display {
                         results.push(CommandResultPayload::PresentOrValidateResult(PresentOrValidate { display: cmd.display, result: PresentOrValidate_Result::Validated }));
                     }
                     if cmd.present_display {
-                        self.present(&screen);
+                        self.present_answering(&screen, cmd.display, &mut results);
                     }
                     continue;
                 }
@@ -1012,7 +1173,7 @@ impl IComposerClientServer for Client {
                 }
             }
             if cmd.present_display {
-                self.present(&screen);
+                self.present_answering(&screen, cmd.display, &mut results);
             }
         }
         Ok(results)
@@ -1236,6 +1397,71 @@ mod tests {
         let half = P * 2;
         let (due, missed) = pacer.next(t0 + P * 3, half);
         assert_eq!((due - t0, missed), (P * 3 + half, 0));
+    }
+
+    /// `composer_skip_validate`: a frame the composer can take is presented at
+    /// `presentOrValidateDisplay` and answered `Presented` (one call a frame); off, it is
+    /// `Validated` and presented at the next command's `presentDisplay`, as before. And
+    /// `composer_fences`: a present fence with each presented frame, signalled. (The levers are
+    /// switched here, in one test, as they are process-wide.)
+    #[test]
+    fn present_or_validate_presents_a_composers_frame_when_skipping_validate() {
+        use super::super::aidl::android_hardware_graphics_composer3::{Color, LayerCommand, ParcelableComposition};
+        use super::*;
+        let fb = Arc::new(Framebuffer::new(64, 32));
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::clone(&fb));
+        let client = Client::new(Arc::clone(&composer.broker), Arc::clone(&composer.screens), Arc::new(AtomicBool::new(true)));
+        let call = crate::binder::HostCall { code: 0, data: Vec::new(), offsets: Vec::new(), fds: Vec::new(), handles: Vec::new(), sender_pid: 1, sender_euid: 1000 };
+        let ctx = Ctx { call: &call };
+        let layer = client.create_layer(&ctx, DISPLAY, 3).unwrap();
+        let frame = |present_or_validate: bool, present: bool| DisplayCommand {
+            display: DISPLAY,
+            layers: vec![LayerCommand {
+                layer,
+                composition: Some(ParcelableComposition { composition: Composition::SOLID_COLOR }),
+                display_frame: Some(common::Rect { left: 0, top: 0, right: 64, bottom: 32 }),
+                color: Some(Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                ..Default::default()
+            }],
+            present_or_validate_display: present_or_validate,
+            present_display: present,
+            ..Default::default()
+        };
+        let result_of = |r: &[CommandResultPayload]| {
+            r.iter().find_map(|p| match p {
+                CommandResultPayload::PresentOrValidateResult(v) => Some(v.result),
+                _ => None,
+            })
+        };
+        let fences_in = |r: &[CommandResultPayload]| r.iter().filter(|p| matches!(p, CommandResultPayload::PresentFence(_))).count();
+
+        crate::lever::apply("composer_skip_validate=0").unwrap();
+        crate::lever::apply("composer_fences=0").unwrap();
+        let before = fb.frames();
+        let r = client.execute_commands(&ctx, vec![frame(true, false)]).unwrap();
+        assert_eq!(result_of(&r), Some(PresentOrValidate_Result::Validated));
+        assert_eq!(fb.frames(), before, "validated, not presented");
+        let r = client.execute_commands(&ctx, vec![frame(false, true)]).unwrap();
+        assert_eq!((fb.frames(), fences_in(&r)), (before + 1, 0), "presented by presentDisplay, no fence");
+
+        crate::lever::apply("composer_skip_validate=1").unwrap();
+        crate::lever::apply("composer_fences=1").unwrap();
+        let r = client.execute_commands(&ctx, vec![frame(true, false)]).unwrap();
+        assert_eq!(result_of(&r), Some(PresentOrValidate_Result::Presented));
+        assert_eq!((fb.frames(), fences_in(&r)), (before + 2, 1), "presented at once, with its fence");
+        crate::lever::apply("composer_skip_validate=0").unwrap();
+        crate::lever::apply("composer_fences=0").unwrap();
+    }
+
+    /// A present fence's time is the first vsync at or after the present, on the vsync's phase.
+    #[test]
+    fn a_present_fence_is_timed_at_the_next_vsync() {
+        let (last, p) = (1_000_000_000, 16_666_667);
+        assert_eq!(super::next_vsync(last, p, last), last);
+        assert_eq!(super::next_vsync(last, p, last + 1), last + p);
+        assert_eq!(super::next_vsync(last, p, last + 2 * p + 5), last + 3 * p);
+        assert_eq!(super::next_vsync(last, p, 999), last);
+        assert_eq!(super::next_vsync(0, p, 999), 999, "before any vsync: the present itself");
     }
 
     /// The rate lever's period, rounded to the nearest nanosecond; out of range refused.
