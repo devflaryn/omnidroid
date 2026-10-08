@@ -213,7 +213,9 @@ impl Drop for Watch {
     }
 }
 
-/// **`poll_keyed=1`** (lever; off by default): fewer waits on "anything".
+/// **`poll_keyed`** (lever; ON by default since the night of 2026-10-09: in PS99 the system host
+/// fell from 54 to 47 ms of CPU a frame and fps rose 1.2-2.4 in 5/5 pairs; `poll_keyed=0` or
+/// `OMNI_POLL_KEYED=0` is the way back): fewer waits on "anything".
 ///
 /// A thread whose `epoll`/`poll` set holds one descriptor without a key waits on anything, and is
 /// woken by **every** change told in its host process -- each binder transaction queued, each
@@ -228,7 +230,7 @@ impl Drop for Watch {
 /// told when a send on it queues an answer. And `epoll_ctl` (an add or a change) wakes the waiters
 /// of that epoll set only -- each now also waits on its set's own key -- instead of every waiter
 /// in the process. `OMNI_POLL_STATS` counts what is left (waiters on anything, unkeyed changes).
-pub static KEYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static KEYED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 fn keyed() -> bool {
     KEYED.load(Ordering::Relaxed)

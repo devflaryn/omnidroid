@@ -317,9 +317,10 @@ pub fn start() {
         let kept = omni_cpu::dynarmic::set_live_fp_optimizations(mask);
         eprintln!("[lever] OMNI_JIT_UNSAFE_FP: jit_fp={kept:#x}");
     }
-    if std::env::var("OMNI_POLL_KEYED").as_deref() == Ok("1") {
-        crate::poll::KEYED.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("[lever] OMNI_POLL_KEYED: poll_keyed=1");
+    if let Ok(v) = std::env::var("OMNI_POLL_KEYED") {
+        let on = v.trim() != "0";
+        crate::poll::KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_POLL_KEYED: poll_keyed={}", u8::from(on));
     }
     let Some(path) = std::env::var_os("OMNI_LEVER_FILE").map(PathBuf::from) else { return };
     let _ = std::thread::Builder::new().name("omni-lever".into()).spawn(move || {
