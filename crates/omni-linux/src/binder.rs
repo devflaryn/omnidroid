@@ -138,6 +138,90 @@ thread_local! {
     static HOST_SERVING: std::cell::Cell<Option<(ProcId, i32)>> = const { std::cell::Cell::new(None) };
 }
 
+/// `binder_host_pool=1` (`crate::lever`) or `OMNI_BINDER_HOST_POOL=1`: a host service's call runs
+/// on a kept thread ([`host_pool_run`]) instead of a new one. Off by default (a behaviour change on
+/// every frame's path, for an in-session A/B first). MEASURED (Windows, i7-13700F E-cores,
+/// `host_pool_round_trip`, 2000 calls each): handing a call to its thread and hearing it ran took
+/// **104-111 us on a new thread, 13-16 us on a kept one** -- plus, off that path, the new thread's
+/// exit.
+pub static HOST_POOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn host_pool_on() -> bool {
+    static FROM_ENV: std::sync::Once = std::sync::Once::new();
+    FROM_ENV.call_once(|| {
+        if let Ok(v) = std::env::var("OMNI_BINDER_HOST_POOL") {
+            HOST_POOL.store(v.trim() == "1", std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    HOST_POOL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+type HostJob = Box<dyn FnOnce() + Send>;
+
+/// The host-service threads waiting for work, newest last: each one's id and its mailbox.
+fn host_idle() -> &'static Mutex<Vec<(u64, std::sync::mpsc::Sender<HostJob>)>> {
+    static IDLE: OnceLock<Mutex<Vec<(u64, std::sync::mpsc::Sender<HostJob>)>>> = OnceLock::new();
+    IDLE.get_or_init(Mutex::default)
+}
+
+/// How long a kept host-service thread waits for another call before it ends.
+const HOST_IDLE_FOR: Duration = Duration::from_secs(30);
+
+/// **Run a host service's call on a kept thread** -- one waiting idle if there is one, else a new
+/// one, which is kept for the next call once this one is done (ends after [`HOST_IDLE_FOR`] idle).
+///
+/// Exactly what a thread per call gives, minus the thread's creation: a call never waits for
+/// another to finish (the pool has no bound, so a handler that blocks -- on a nested call back
+/// into its sender, on a guest's reply -- holds one thread, as before, and the next call takes
+/// another), and calls are as unordered as they were (a thread each). Nothing of one call stays on
+/// the thread for the next: [`HOST_SERVING`] is cleared after each, and a handler's panic ends its
+/// thread as it did. Every frame SurfaceFlinger makes at least one such call (the composer's
+/// `executeCommands`), a thread each before.
+fn host_pool_run(job: HostJob) -> Result<(), Errno> {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut job = job;
+    loop {
+        let Some((_, mailbox)) = host_idle().lock().pop() else { break };
+        // A thread whose mailbox is gone ended (its handler panicked between jobs: never); the next.
+        match mailbox.send(job) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::SendError(back)) => job = back,
+        }
+    }
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (tx, rx) = std::sync::mpsc::channel::<HostJob>();
+    std::thread::Builder::new()
+        .name("omni-binder-host".into())
+        .spawn(move || {
+            let mut next = Some(job);
+            while let Some(job) = next.take() {
+                job();
+                HOST_SERVING.with(|s| s.set(None));
+                host_idle().lock().push((id, tx.clone()));
+                next = match rx.recv_timeout(HOST_IDLE_FOR) {
+                    Ok(job) => Some(job),
+                    Err(_) => {
+                        // Idle long enough: leave the list -- unless a caller took this thread off
+                        // it meanwhile, whose job is then on its way (or here) and is run.
+                        let mut idle = host_idle().lock();
+                        match idle.iter().position(|(i, _)| *i == id) {
+                            Some(at) => {
+                                idle.remove(at);
+                                None
+                            }
+                            None => {
+                                drop(idle);
+                                rx.recv().ok()
+                            }
+                        }
+                    }
+                };
+            }
+        })
+        .map(|_| ())
+        .map_err(|_| ENOMEM)
+}
+
 struct Node {
     owner: ProcId,
     ptr: u64,
@@ -1514,21 +1598,25 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
             sender_euid: txn.sender_euid,
         };
         let (broker, caller) = (Arc::clone(&file.broker), (file.id, t.tid));
-        std::thread::Builder::new()
-            .name("omni-binder-host".into())
-            .spawn(move || {
-                HOST_SERVING.with(|s| s.set(Some(caller)));
-                let reply = handler.map_or_else(HostReply::default, |h| h(call));
-                if !oneway {
-                    let mut st = broker.state.lock();
-                    if st.procs.get(&caller.0).is_some_and(|pr| !pr.dead) {
-                        // A reply the host built wrong fails the call, as a malformed reply would.
-                        let work = st.reply_from_host(caller.0, reply).map_or(Work::FailedReply, |r| Work::Txn(Box::new(r)));
-                        st.queue(caller.0, Some(caller.1), work);
-                    }
+        let job = move || {
+            HOST_SERVING.with(|s| s.set(Some(caller)));
+            let reply = handler.map_or_else(HostReply::default, |h| h(call));
+            if !oneway {
+                let mut st = broker.state.lock();
+                if st.procs.get(&caller.0).is_some_and(|pr| !pr.dead) {
+                    // A reply the host built wrong fails the call, as a malformed reply would.
+                    let work = st.reply_from_host(caller.0, reply).map_or(Work::FailedReply, |r| Work::Txn(Box::new(r)));
+                    st.queue(caller.0, Some(caller.1), work);
                 }
-            })
-            .map_err(|_| ENOMEM)?;
+            }
+        };
+        // The handler's thread is started while the broker's lock is held, as before: its reply
+        // waits for the lock, so the sender hears BR_TRANSACTION_COMPLETE first.
+        if host_pool_on() {
+            host_pool_run(Box::new(job))?;
+        } else {
+            std::thread::Builder::new().name("omni-binder-host".into()).spawn(job).map_err(|_| ENOMEM)?;
+        }
         if !oneway {
             st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
         }
@@ -1987,5 +2075,83 @@ mod tests {
         st.proc_mut(1).todo.push_back(oneway(node, 0x33));
         let for_proc = st.async_stall(node);
         assert!(for_proc.contains("code 0x33 queued for the process (0 of 1 threads free to take it)"), "{for_proc}");
+    }
+
+    /// The pool runs calls that wait on each other at once (no call waits for a thread), uses a
+    /// thread again for the next call, and leaves nothing of a call's `HOST_SERVING` behind.
+    #[test]
+    fn host_pool_calls_run_at_once_on_kept_threads() {
+        use std::sync::mpsc::channel;
+        // Two calls, the first blocked until the second has run: a bounded pool of one deadlocks.
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<&str>();
+        let first_done = done_tx.clone();
+        host_pool_run(Box::new(move || {
+            go_rx.recv_timeout(Duration::from_secs(10)).expect("the second call ran meanwhile");
+            first_done.send("first").unwrap();
+        }))
+        .unwrap();
+        host_pool_run(Box::new(move || {
+            go_tx.send(()).unwrap();
+            done_tx.send("second").unwrap();
+        }))
+        .unwrap();
+        let mut done = [done_rx.recv_timeout(Duration::from_secs(10)).unwrap(), done_rx.recv_timeout(Duration::from_secs(10)).unwrap()];
+        done.sort_unstable();
+        assert_eq!(done, ["first", "second"]);
+
+        // One call after another: a kept thread, and the last call's caller not left on it.
+        let (tx, rx) = channel();
+        let mut threads = Vec::new();
+        for _ in 0..20 {
+            let tx = tx.clone();
+            host_pool_run(Box::new(move || {
+                let leftover = HOST_SERVING.with(std::cell::Cell::get);
+                HOST_SERVING.with(|s| s.set(Some((1, 2))));
+                tx.send((std::thread::current().id(), leftover)).unwrap();
+            }))
+            .unwrap();
+            let (thread, leftover) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(leftover, None);
+            threads.push(thread);
+            // Let the thread go back on the idle list before the next call.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        threads.sort_by_key(|t| format!("{t:?}"));
+        threads.dedup();
+        assert!(threads.len() <= 3, "{} threads for 20 calls one after another", threads.len());
+    }
+
+    /// **The measurement behind `HOST_POOL`**: a call's round trip (hand it to a thread, hear it
+    /// ran) on a new thread each against a kept one, 2000 each. Timing, so ignored by default:
+    /// `cargo test --release -p omni-linux --lib -- --ignored --nocapture host_pool_round_trip`.
+    #[test]
+    #[ignore = "timing; run by hand"]
+    fn host_pool_round_trip() {
+        use std::sync::mpsc::channel;
+        const N: u32 = 2000;
+        let (tx, rx) = channel::<()>();
+        let mut spawned = Duration::ZERO;
+        for _ in 0..N {
+            let tx = tx.clone();
+            let t = Instant::now();
+            let h = std::thread::Builder::new().name("omni-binder-host".into()).spawn(move || tx.send(()).unwrap()).unwrap();
+            rx.recv().unwrap();
+            spawned += t.elapsed();
+            h.join().unwrap();
+        }
+        let mut pooled = Duration::ZERO;
+        for _ in 0..N {
+            // A kept thread is back waiting before the next call, as between two frames' calls.
+            while host_idle().lock().is_empty() && pooled > Duration::ZERO {
+                std::hint::spin_loop();
+            }
+            let tx = tx.clone();
+            let t = Instant::now();
+            host_pool_run(Box::new(move || tx.send(()).unwrap())).unwrap();
+            rx.recv().unwrap();
+            pooled += t.elapsed();
+        }
+        eprintln!("[binder] a host call's round trip: new thread {:?}, kept thread {:?}", spawned / N, pooled / N);
     }
 }
