@@ -442,6 +442,13 @@ typedef struct od_code_cache_tables {
  * made every few minutes, not for a hot path. All zero on an arm64 host (no shared cache). */
 void od_code_cache_tables_of(void* cache, od_code_cache_tables* out);
 
+/* Patch 0036: for each of `count` host code addresses `hosts`, which must be ascending, the guest
+ * PC of the block of `cache` whose translated code holds it, or UINT64_MAX where none does (the
+ * prelude and dispatcher, far code, a link slot, a block since forgotten). Takes the cache's lock,
+ * shared, and walks every block once (~ms at 500k blocks): for a sampling profiler's report thread,
+ * never for a guest thread. All UINT64_MAX on an arm64 host (no shared cache). */
+void od_code_cache_guest_pcs_of(void* cache, const uint64_t* hosts, uint64_t count, uint64_t* guest_pcs);
+
 /* Invalidate for every jit of the cache, now. Not from inside a callback of a
  * jit on this cache: use `od_jit_invalidate_range` there (it is queued and the
  * jit halts, as for a jit with its own cache). Same clamping as that call. */

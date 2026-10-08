@@ -297,7 +297,8 @@ fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, env
         cmd.env("OMNI_THREAD_DUMP", "15");
     }
     // OMNI_THREAD_CPU_APP=<process name>: that app's host process reports its threads' processor
-    // time and where it went every 10 s (`OMNI_THREAD_CPU`).
+    // time and where it went every 10 s (`OMNI_THREAD_CPU`); with `OMNI_GUEST_PROF=1` (inherited)
+    // also which guest functions its translated-code samples ran (`[guestprof]`, crate::guestprof).
     if nice.is_some() && std::env::var("OMNI_THREAD_CPU_APP").ok().as_deref() == nice {
         cmd.env("OMNI_THREAD_CPU", "10");
     }

@@ -450,6 +450,28 @@ A64::SharedCodeCache::Tables A64EmitX64::Census() const {
     return t;
 }
 
+void A64EmitX64::GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const {
+    std::fill(guest_pcs, guest_pcs + count, ~u64{0});
+    if (count == 0) {
+        return;
+    }
+    const u64 lowest = hosts[0];
+    const u64 highest = hosts[count - 1];
+    // One pass over the block map (no index from host address to block is kept: the dispatcher
+    // never needs one), each block's code range searched for in the sorted addresses.
+    for (const auto& [location, block] : block_descriptors) {
+        const u64 begin = reinterpret_cast<u64>(block.entrypoint);
+        const u64 end = begin + block.size;
+        if (end <= lowest || begin > highest) {
+            continue;
+        }
+        const u64* at = std::lower_bound(hosts, hosts + count, begin);
+        for (; at != hosts + count && *at < end; ++at) {
+            guest_pcs[at - hosts] = A64::LocationDescriptor{location}.PC();
+        }
+    }
+}
+
 size_t A64EmitX64::FastDispatchTableBytes() {
     return sizeof(FastDispatchEntry) * fast_dispatch_table_size;
 }

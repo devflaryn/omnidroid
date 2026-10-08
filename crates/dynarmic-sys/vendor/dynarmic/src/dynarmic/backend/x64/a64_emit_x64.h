@@ -114,6 +114,9 @@ public:
     /// Omnidroid patch 0024: what each per-block table holds, for a memory report. The caller
     /// holds the cache's lock (shared is enough).
     A64::SharedCodeCache::Tables Census() const;
+    /// Omnidroid patch 0036: `SharedCodeCache::GuestPcsOf`. The caller holds the cache's lock
+    /// (shared is enough).
+    void GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const;
 
 protected:
     /// Patch 0022: a callback of the thread's UserCallbacks -- an immediate `this` in a Jit with

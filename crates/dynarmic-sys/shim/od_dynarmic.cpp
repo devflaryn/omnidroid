@@ -642,6 +642,24 @@ void od_code_cache_tables_of(void* p, od_code_cache_tables* out) {
 #endif
 }
 
+void od_code_cache_guest_pcs_of(void* p, const uint64_t* hosts, uint64_t count, uint64_t* guest_pcs) {
+    if (guest_pcs == nullptr || count == 0) {
+        return;
+    }
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr && hosts != nullptr) {
+        static_cast<OdCodeCache*>(p)->cache->GuestPcsOf(hosts, static_cast<std::size_t>(count), guest_pcs);
+        return;
+    }
+#else
+    (void)p;
+    (void)hosts;
+#endif
+    for (uint64_t i = 0; i < count; i++) {
+        guest_pcs[i] = UINT64_MAX;
+    }
+}
+
 void od_code_cache_invalidate_range(void* p, uint64_t addr, uint64_t len) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     if (p == nullptr || len == 0) {

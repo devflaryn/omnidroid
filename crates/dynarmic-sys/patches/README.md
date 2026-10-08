@@ -301,3 +301,12 @@ process 16 KiB a thread (~900 threads: 56 MiB of tables at 64 KiB) -- not the de
 lookup cost there is measured. Verified: `omni-cpu/tests/fast_dispatch_size.rs` -- 64
 entries for 200 `BLR` targets (every probe colliding) run every call to its own code, and 32
 threads at 64 entries hold ~2 MiB less C heap than at 4,096 (measured, within 10%).
+
+### 0036 — x64 shared cache: which guest block a host code address is in
+
+x64, read-only, shared caches. `SharedCodeCache::GuestPcsOf` / `od_code_cache_guest_pcs_of`: for
+ascending host addresses, the guest PC of the block whose emitted code holds each (`~0` for the
+prelude, far code, link slots, forgotten blocks). One pass over the block map under the cache's lock
+taken shared -- nothing is kept, so emission pays nothing; for `omni-linux`'s `OMNI_GUEST_PROF`
+report thread only. Verified: `omni-cpu/tests/guest_pc_of_host.rs` (264 of 264 sampled code-cache
+addresses of a thread spinning in a known block resolved to it).
