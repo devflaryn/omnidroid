@@ -33,6 +33,17 @@ omni-apk = { workspace = true }
 # host. Only the formats an Android clip carries an image in; nothing else is decoded.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
+# `--features mimalloc`: `omni-linux-run`'s heap is mimalloc instead of the platform's (Windows'
+# HeapAlloc). Off by default -- an A/B build (`tests/alloc_cost.rs` measures both). From the
+# registry cache; no network needed (`cargo build --offline`). MEASURED (E-cores): a small
+# alloc+free 50 -> 8 ns, a 4 KiB one 55 -> 37, but ~630 KiB committed per thread that allocates
+# a few small sizes (a 64 KiB page per size class) against ~75 KiB -- ~0.5 GB more for the system
+# host process's ~950 threads; MIMALLOC_EAGER_COMMIT=0 / MIMALLOC_ARENA_EAGER_COMMIT=0 do not help.
+mimalloc = { version = "0.1.52", default-features = false, optional = true }
+
+[features]
+mimalloc = ["dep:mimalloc"]
+
 [[bin]]
 name = "omni-linux-run"
 path = "src/bin/omni-linux-run.rs"
