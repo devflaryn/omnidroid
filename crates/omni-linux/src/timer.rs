@@ -173,7 +173,7 @@ fn fire(p: &Arc<Process>, id: i32, armed: u64) {
 }
 
 fn read_timespec(p: &Process, at: u64) -> Result<Duration, Errno> {
-    let b = p.mem.read(at, 16)?;
+    let b: [u8; 16] = p.mem.read_array(at)?;
     let (s, ns) = (i64::from_le_bytes(b[0..8].try_into().expect("8")), i64::from_le_bytes(b[8..16].try_into().expect("8")));
     if s < 0 || !(0..1_000_000_000).contains(&ns) {
         return Err(EINVAL);
@@ -200,7 +200,7 @@ fn sys_timer_create(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let (value, signo, notify, tid) = if a[1] == 0 {
         (None, SIGALRM, SIGEV_SIGNAL, 0)
     } else {
-        let b = p.mem.read(a[1], 20)?;
+        let b: [u8; 20] = p.mem.read_array(a[1])?;
         let word = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().expect("4"));
         (Some(u64::from_le_bytes(b[0..8].try_into().expect("8"))), word(8), word(12), word(16))
     };

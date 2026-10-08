@@ -619,17 +619,20 @@ fn sys_close(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_read(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
-    let mut buf = vec![0u8; (a[2] as usize).min(1 << 24)];
-    let n = match crate::pipe::end_of(&file) {
-        Some((_, true, _)) => return Err(EBADF),
-        Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, &mut buf, nonblocking, t)?,
-        None => match crate::poll::read(&file, &mut buf, t).or_else(|| crate::socket::read(&file, &mut buf, t)).or_else(|| crate::fuse::read(&file, &mut buf, t)).or_else(|| crate::evdev::read(&file, &mut buf, t)) {
-            Some(r) => r?,
-            None => read_file(&file, &mut buf, None)?,
-        },
-    };
-    p.mem.write(a[1], &buf[..n])?;
-    Ok(n as u64)
+    // A small read (an eventfd's count, a looper's pipe, an input event) into this thread's
+    // scratch buffer: no allocation.
+    crate::guest::with_scratch((a[2] as usize).min(1 << 24), |buf| {
+        let n = match crate::pipe::end_of(&file) {
+            Some((_, true, _)) => return Err(EBADF),
+            Some((pipe, false, nonblocking)) => crate::pipe::read(&pipe, buf, nonblocking, t)?,
+            None => match crate::poll::read(&file, buf, t).or_else(|| crate::socket::read(&file, buf, t)).or_else(|| crate::fuse::read(&file, buf, t)).or_else(|| crate::evdev::read(&file, buf, t)) {
+                Some(r) => r?,
+                None => read_file(&file, buf, None)?,
+            },
+        };
+        p.mem.write(a[1], &buf[..n])?;
+        Ok(n as u64)
+    })
 }
 
 fn sys_pread64(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -724,22 +727,31 @@ fn sys_sendfile(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_write(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(fd_arg(a[0]))?;
-    let bytes = p.mem.read(a[1], (a[2] as usize).min(1 << 24))?;
-    if let Some(r) = crate::poll::write(&file, &bytes, t).or_else(|| crate::socket::write(&file, &bytes, t)) {
-        return Ok(r? as u64);
-    }
-    match crate::pipe::end_of(&file) {
-        Some((_, false, _)) => Err(EBADF),
-        Some((pipe, true, nonblocking)) => Ok(crate::pipe::write(&pipe, &bytes, nonblocking, t)? as u64),
-        None => Ok(write_file(&file, &bytes)? as u64),
-    }
+    crate::guest::with_scratch((a[2] as usize).min(1 << 24), |bytes| {
+        p.mem.read_into(a[1], bytes)?;
+        let bytes = &*bytes;
+        if let Some(r) = crate::poll::write(&file, bytes, t).or_else(|| crate::socket::write(&file, bytes, t)) {
+            return Ok(r? as u64);
+        }
+        match crate::pipe::end_of(&file) {
+            Some((_, false, _)) => Err(EBADF),
+            Some((pipe, true, nonblocking)) => Ok(crate::pipe::write(&pipe, bytes, nonblocking, t)? as u64),
+            None => Ok(write_file(&file, bytes)? as u64),
+        }
+    })
+}
+
+/// One `struct iovec { base, len }`.
+pub(crate) fn iovec(p: &Process, at: u64) -> Result<(u64, usize), Errno> {
+    let v: [u8; 16] = p.mem.read_array(at)?;
+    Ok((u64::from_le_bytes(v[..8].try_into().expect("8")), u64::from_le_bytes(v[8..].try_into().expect("8")) as usize))
 }
 
 fn iovecs(p: &Process, at: u64, count: u64) -> Result<Vec<(u64, usize)>, Errno> {
     if count > 1024 {
         return Err(EINVAL);
     }
-    (0..count).map(|i| Ok((p.mem.read_u64(at + i * 16)?, p.mem.read_u64(at + i * 16 + 8)? as usize))).collect()
+    (0..count).map(|i| iovec(p, at + i * 16)).collect()
 }
 
 fn sys_writev(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {

@@ -130,8 +130,9 @@ fn timespec(secs: u64, nanos: u32) -> [u8; 16] {
 }
 
 fn read_timespec(p: &Process, at: u64) -> Result<Duration, Errno> {
-    let sec = p.mem.read_u64(at)? as i64;
-    let nsec = p.mem.read_u64(at + 8)?;
+    let b: [u8; 16] = p.mem.read_array(at)?;
+    let sec = i64::from_le_bytes(b[..8].try_into().expect("8"));
+    let nsec = u64::from_le_bytes(b[8..].try_into().expect("8"));
     if sec < 0 || nsec >= 1_000_000_000 {
         return Err(EINVAL);
     }

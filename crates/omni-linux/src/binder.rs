@@ -1238,14 +1238,14 @@ pub fn ioctl(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmd: u64, arg: u
     match cmd {
         BINDER_VERSION => p.mem.write_u32(arg, 8).map(|()| 0),
         BINDER_SET_MAX_THREADS => {
-            let n = u32::from_le_bytes(p.mem.read(arg, 4)?.try_into().expect("4"));
+            let n = p.mem.read_u32(arg)?;
             file.broker.state.lock().proc_mut(file.id).max_threads = n;
             Ok(0)
         }
         BINDER_SET_IDLE_TIMEOUT | BINDER_SET_IDLE_PRIORITY | BINDER_ENABLE_ONEWAY_SPAM_DETECTION => Ok(0),
         BINDER_GET_EXTENDED_ERROR => p.mem.write(arg, &[0u8; 12]).map(|()| 0),
         BINDER_SET_CONTEXT_MGR | BINDER_SET_CONTEXT_MGR_EXT => {
-            let flags = if cmd == BINDER_SET_CONTEXT_MGR_EXT { u32::from_le_bytes(p.mem.read(arg + 4, 4)?.try_into().expect("4")) } else { 0 };
+            let flags = if cmd == BINDER_SET_CONTEXT_MGR_EXT { p.mem.read_u32(arg + 4)? } else { 0 };
             let mut st = file.broker.state.lock();
             if st.context_mgr.is_some_and(|n| st.nodes.get(&n).is_some_and(|n| !n.dead)) {
                 return Err(crate::errno::EBUSY);
@@ -1277,7 +1277,7 @@ pub fn ioctl(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmd: u64, arg: u
 }
 
 fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64, nonblocking: bool) -> SysResult {
-    let bwr = p.mem.read(arg, 48)?;
+    let bwr: [u8; 48] = p.mem.read_array(arg)?;
     let (write_size, mut write_consumed, write_buffer) = (u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 16));
     let (read_size, mut read_consumed, read_buffer) = (u64_at(&bwr, 24), u64_at(&bwr, 32), u64_at(&bwr, 40));
     if trace_level() == 2 {
@@ -1293,26 +1293,12 @@ fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64, nonbl
     }
     let mut result = Ok(0);
     if write_size > write_consumed {
-        let cmds = p.mem.read(write_buffer + write_consumed, (write_size - write_consumed).min(1 << 20) as usize)?;
-        let mut at = 0usize;
-        while at + 4 <= cmds.len() {
-            match command(p, t, file, &cmds, at) {
-                Ok(len) => at += len,
-                // A transaction that failed is answered as the kernel answers it: consumed, the
-                // write stops there, and the error is the thread's to read (BR_FAILED_REPLY) --
-                // not the ioctl's. An ioctl error left libbinder's out-buffer unconsumed and every
-                // later call of that thread failed with it (an app's `unbindService` threw
-                // IllegalArgumentException and killed its main thread).
-                Err(Failed::Transaction(len)) => {
-                    at += len;
-                    break;
-                }
-                Err(Failed::Command(e)) => {
-                    result = Err(e);
-                    break;
-                }
-            }
-        }
+        // The commands into this thread's scratch buffer when they fit (a transaction's header is
+        // ~70 bytes; its data is read by the command).
+        let at = crate::guest::with_scratch((write_size - write_consumed).min(1 << 20) as usize, |cmds| -> Result<usize, Errno> {
+            p.mem.read_into(write_buffer + write_consumed, cmds)?;
+            Ok(run_commands(p, t, file, cmds, &mut result))
+        })?;
         write_consumed += at as u64;
     }
     if result.is_ok() && read_size > read_consumed {
@@ -1327,6 +1313,31 @@ fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64, nonbl
     out[8..16].copy_from_slice(&read_consumed.to_le_bytes());
     p.mem.write(arg + 32, &out[8..16])?;
     result
+}
+
+/// The write buffer's commands, in order, until one fails: the bytes consumed. A failed command's
+/// error goes to `result`.
+fn run_commands(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], result: &mut SysResult) -> usize {
+    let mut at = 0usize;
+    while at + 4 <= cmds.len() {
+        match command(p, t, file, cmds, at) {
+            Ok(len) => at += len,
+            // A transaction that failed is answered as the kernel answers it: consumed, the
+            // write stops there, and the error is the thread's to read (BR_FAILED_REPLY) --
+            // not the ioctl's. An ioctl error left libbinder's out-buffer unconsumed and every
+            // later call of that thread failed with it (an app's `unbindService` threw
+            // IllegalArgumentException and killed its main thread).
+            Err(Failed::Transaction(len)) => {
+                at += len;
+                break;
+            }
+            Err(Failed::Command(e)) => {
+                *result = Err(e);
+                break;
+            }
+        }
+    }
+    at
 }
 
 /// Why a write stopped at a command.
@@ -1724,10 +1735,10 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
         out.extend_from_slice(&BR_NOOP.to_le_bytes());
     }
     let flushed = file.flushes.load(std::sync::atomic::Ordering::SeqCst);
+    let mut watching: Option<crate::poll::Watch> = None;
     loop {
         // Woken by work for this process (`queue`), or by a descriptor's close (`flush`, told to
         // everyone).
-        let watch = crate::poll::watch(Some(vec![file.key()]));
         let work = {
             let mut st = file.broker.state.lock();
             let proc = st.proc_mut(file.id);
@@ -1788,7 +1799,11 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
                 p.mem.write(at, &out)?;
                 return Ok(out.len() as u64);
             }
-            None => watch.wait(None, t)?,
+            // Registered only once a look found nothing, then looked again before sleeping.
+            None => match watching.take() {
+                None => watching = Some(crate::poll::watch(Some(vec![file.key()]))),
+                Some(w) => w.wait(None, t)?,
+            },
         }
     }
 }

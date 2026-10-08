@@ -384,24 +384,81 @@ fn sys_sendto(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 
 fn sys_sendmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
-    // struct msghdr: name, namelen, iov, iovlen, control, controllen, flags.
-    let (iov, iovlen) = (p.mem.read_u64(a[1] + 16)?, p.mem.read_u64(a[1] + 24)?);
-    if iovlen > 1024 {
+    // struct msghdr: name, namelen, iov, iovlen, control, controllen, flags -- read at once.
+    let hdr = Msghdr::read(p, a[1])?;
+    if hdr.iovlen > 1024 {
         return Err(EINVAL);
     }
-    let mut bytes = Vec::new();
-    for i in 0..iovlen {
-        let (base, len) = (p.mem.read_u64(iov + i * 16)?, p.mem.read_u64(iov + i * 16 + 8)? as usize);
-        bytes.extend_from_slice(&p.mem.read(base, len.min((1 << 20) - bytes.len().min(1 << 20)))?);
+    // The buffers' total, capped at 1 MiB as before, gathered into this thread's scratch buffer
+    // when small (an input channel's message: no allocation).
+    let mut spans = Spans::default();
+    let mut total = 0usize;
+    for i in 0..hdr.iovlen {
+        let (base, len) = crate::fd::iovec(p, hdr.iov + i * 16)?;
+        let take = len.min((1 << 20) - total);
+        spans.push((base, take));
+        total += take;
     }
-    if let Some(host) = host_of(&file) {
-        let (name, namelen) = (p.mem.read_u64(a[1])?, p.mem.read_u32(a[1] + 8)?);
-        let to = if name == 0 { None } else { Some(p.mem.read(name, (namelen as usize).min(128))?) };
-        return Ok(host.send(&bytes, to.as_deref(), a[2], nonblocking(&file), t)? as u64);
+    crate::guest::with_scratch(total, |bytes| {
+        let mut at = 0;
+        for &(base, len) in spans.as_slice() {
+            p.mem.read_into(base, &mut bytes[at..at + len])?;
+            at += len;
+        }
+        let bytes = &*bytes;
+        if let Some(host) = host_of(&file) {
+            let namelen = u32::try_from(hdr.namelen).unwrap_or(u32::MAX);
+            let to = if hdr.name == 0 { None } else { Some(p.mem.read(hdr.name, (namelen as usize).min(128))?) };
+            return Ok(host.send(bytes, to.as_deref(), a[2], nonblocking(&file), t)? as u64);
+        }
+        let mut kind = file.kind.lock();
+        let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
+        Ok(send(socket, bytes)? as u64)
+    })
+}
+
+/// A guest `struct msghdr` (56 bytes), read in one copy.
+struct Msghdr {
+    name: u64,
+    namelen: u64,
+    iov: u64,
+    iovlen: u64,
+    control: u64,
+    controllen: u64,
+}
+
+impl Msghdr {
+    fn read(p: &Process, at: u64) -> Result<Self, Errno> {
+        let b: [u8; 56] = p.mem.read_array(at)?;
+        let q = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8"));
+        Ok(Self { name: q(0), namelen: u64::from(u32::from_le_bytes(b[8..12].try_into().expect("4"))), iov: q(16), iovlen: q(24), control: q(32), controllen: q(40) })
     }
-    let mut kind = file.kind.lock();
-    let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
-    Ok(send(socket, &bytes)? as u64)
+}
+
+/// A message's buffers: up to 8 on the stack (a message has one or two), more in a `Vec`.
+#[derive(Default)]
+struct Spans {
+    small: [(u64, usize); 8],
+    n: usize,
+    more: Vec<(u64, usize)>,
+}
+
+impl Spans {
+    fn push(&mut self, span: (u64, usize)) {
+        if self.n < self.small.len() && self.more.is_empty() {
+            self.small[self.n] = span;
+            self.n += 1;
+        } else {
+            if self.more.is_empty() {
+                self.more.extend_from_slice(&self.small[..self.n]);
+            }
+            self.more.push(span);
+        }
+    }
+
+    fn as_slice(&self) -> &[(u64, usize)] {
+        if self.more.is_empty() { &self.small[..self.n] } else { &self.more }
+    }
 }
 
 /// `bind`: a netlink socket (a kernel uevent socket: ueventd's, vold's) is bound to its groups
@@ -779,8 +836,10 @@ fn sys_recvfrom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
 /// Receive from `file`, waiting (unless it or the call is non-blocking) while a socket pair's end
 /// has nothing to read and its other end is open.
 fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) -> Result<usize, Errno> {
+    // Looked at first, registered only to wait (then looked at again): a receive that finds a
+    // message takes no queue lock to register and allocates nothing.
+    let mut watching: Option<crate::poll::Watch> = None;
     loop {
-        let watch = crate::poll::watch(crate::poll::key_of(file).map(|k| vec![k]));
         let (r, pair) = {
             let mut kind = file.kind.lock();
             let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
@@ -788,7 +847,10 @@ fn receive_waiting(file: &OpenFile, buf: &mut [u8], dontwait: bool, t: &Task) ->
         };
         let nonblocking = dontwait || *file.flags.lock() & 0o4000 != 0;
         match r {
-            Err(e) if e == crate::errno::EAGAIN && pair && !nonblocking => watch.wait(None, t)?,
+            Err(e) if e == crate::errno::EAGAIN && pair && !nonblocking => match watching.take() {
+                None => watching = Some(crate::poll::watch(crate::poll::key_of(file).map(|k| vec![k]))),
+                Some(w) => w.wait(None, t)?,
+            },
             other => return other,
         }
     }
@@ -896,35 +958,38 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
 /// socket).
 fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
-    let (iov, iovlen) = (p.mem.read_u64(a[1] + 16)?, p.mem.read_u64(a[1] + 24)?);
-    if iovlen > 1024 {
+    let hdr = Msghdr::read(p, a[1])?;
+    if hdr.iovlen > 1024 {
         return Err(EINVAL);
     }
-    let mut spans = Vec::new();
+    let mut spans = Spans::default();
     let mut total = 0usize;
-    for i in 0..iovlen {
-        let (base, len) = (p.mem.read_u64(iov + i * 16)?, p.mem.read_u64(iov + i * 16 + 8)? as usize);
-        spans.push((base, len));
-        total = total.saturating_add(len);
+    for i in 0..hdr.iovlen {
+        let span = crate::fd::iovec(p, hdr.iov + i * 16)?;
+        spans.push(span);
+        total = total.saturating_add(span.1);
     }
-    let mut buf = vec![0u8; total.min(1 << 20)];
     let host = host_of(&file);
-    let (n, from) = match &host {
-        Some(host) => host.recv(&mut buf, a[2], nonblocking(&file), t)?,
-        None => (receive_waiting(&file, &mut buf, a[2] & MSG_DONTWAIT != 0, t)?, None),
-    };
-    let mut at = 0;
-    for (base, len) in spans {
-        if at >= n {
-            break;
+    // Into this thread's scratch buffer when small: only the `n` bytes received are used.
+    let (n, from) = crate::guest::with_scratch(total.min(1 << 20), |buf| -> Result<_, Errno> {
+        let (n, from) = match &host {
+            Some(host) => host.recv(buf, a[2], nonblocking(&file), t)?,
+            None => (receive_waiting(&file, buf, a[2] & MSG_DONTWAIT != 0, t)?, None),
+        };
+        let mut at = 0;
+        for &(base, len) in spans.as_slice() {
+            if at >= n {
+                break;
+            }
+            let k = len.min(n - at);
+            p.mem.write(base, &buf[at..at + k])?;
+            at += k;
         }
-        let k = len.min(n - at);
-        p.mem.write(base, &buf[at..at + k])?;
-        at += k;
-    }
+        Ok((n, from))
+    })?;
     if host.is_some() {
         // msg_name: where a datagram came from (a stream's is not reported: namelen 0).
-        let name = p.mem.read_u64(a[1])?;
+        let name = hdr.name;
         if name != 0 {
             match from {
                 Some(addr) => write_name(p, name, a[1] + 8, &crate::hostnet::sockaddr(&addr))?,
@@ -940,7 +1005,7 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         FileKind::Socket(s) if s.passcred => peer_cred(s),
         _ => None,
     };
-    let (control, room) = (p.mem.read_u64(a[1] + 32)?, p.mem.read_u64(a[1] + 40)?);
+    let (control, room) = (hdr.control, hdr.controllen);
     let mut controllen = 0u64;
     let mut flags = 0u32;
     if let Some(c) = creds {
@@ -959,8 +1024,11 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             flags |= 0x8; // MSG_CTRUNC
         }
     }
-    p.mem.write(a[1] + 40, &controllen.to_le_bytes())?;
-    p.mem.write(a[1] + 48, &flags.to_le_bytes())?;
+    // msg_controllen and msg_flags, adjacent: one copy.
+    let mut tail = [0u8; 12];
+    tail[..8].copy_from_slice(&controllen.to_le_bytes());
+    tail[8..].copy_from_slice(&flags.to_le_bytes());
+    p.mem.write(a[1] + 40, &tail)?;
     Ok(n as u64)
 }
 
