@@ -29,6 +29,12 @@ pub mod window_present;
 
 /// `_IOWR('G', 1, struct omni_gpu_call)`, a 32-byte argument.
 pub const OMNI_GPU_CALL: u64 = 0xc020_4701;
+/// `_IOWR('G', 2, 32 + 8 * argc)`: a request with its arguments right after it (the `args`
+/// pointer then names them there), read in one checked copy instead of two. The guest's driver
+/// sends it while [`FAST`] is on (bit 1 of [`CONFIG_COMMAND`]'s answer). Its size bits vary.
+pub const OMNI_GPU_CALL_INLINE: u64 = 0xc000_4702;
+/// The size field of an ioctl number.
+const INLINE_SIZE_MASK: u64 = 0x3fff << 16;
 /// The most arguments a Vulkan command has, with room to spare.
 const MAX_ARGS: u32 = 32;
 
@@ -467,16 +473,36 @@ pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> S
     if cmd == gl::OMNI_GL_CALL {
         return gl::ioctl(p, t, arg);
     }
-    if cmd != OMNI_GPU_CALL {
+    // The arguments right after the request, its size in the number (`OMNI_GPU_CALL_INLINE`).
+    let inline = cmd & 0xffff_ffff & !INLINE_SIZE_MASK == OMNI_GPU_CALL_INLINE;
+    if cmd != OMNI_GPU_CALL && !inline {
         return Err(ENOTTY);
     }
-    let fast = FAST.load(Ordering::Relaxed);
+    // An inline request comes from a driver that zeroes the result, as the fast path assumes.
+    let fast = inline || FAST.load(Ordering::Relaxed);
     // Fast: the request and its arguments into this stack, no allocation (a checked copy costs
-    // ~110 ns on an E-core, two allocations of it a third).
+    // ~110 ns on an E-core, two allocations of it a third). Inline: both in one checked copy.
     let mut call = [0u8; 32];
     let mut words = [0u64; MAX_ARGS as usize];
     let slow_args: Vec<u64>;
-    let args: &[u64] = if fast {
+    let args: &[u64] = if inline {
+        let size = ((cmd & INLINE_SIZE_MASK) >> 16) as usize;
+        let mut bytes = [0u8; 32 + MAX_ARGS as usize * 8];
+        if size < 32 || size > bytes.len() || size % 8 != 0 {
+            return Err(EINVAL);
+        }
+        let bytes = &mut bytes[..size];
+        p.mem.read_into(arg, bytes)?;
+        call.copy_from_slice(&bytes[..32]);
+        let argc = u32::from_le_bytes(call[4..8].try_into().expect("4")) as usize;
+        if 32 + argc * 8 != size {
+            return Err(EINVAL);
+        }
+        for (w, b) in words.iter_mut().zip(bytes[32..].chunks_exact(8)) {
+            *w = u64::from_le_bytes(b.try_into().expect("8"));
+        }
+        &words[..argc]
+    } else if fast {
         p.mem.read_into(arg, &mut call)?;
         let argc = u32::from_le_bytes(call[4..8].try_into().expect("4"));
         if argc > MAX_ARGS {
@@ -501,7 +527,8 @@ pub fn ioctl(p: &Process, t: &mut Task, gpu: &Arc<Gpu>, cmd: u64, arg: u64) -> S
     };
     let id = u32::from_le_bytes(call[0..4].try_into().expect("4"));
     if id == CONFIG_COMMAND {
-        p.mem.write(arg + 16, &u64::from(BATCH.load(Ordering::Relaxed)).to_le_bytes())?;
+        let config = u64::from(BATCH.load(Ordering::Relaxed)) | u64::from(FAST.load(Ordering::Relaxed)) << 1;
+        p.mem.write(arg + 16, &config.to_le_bytes())?;
         return Ok(0);
     }
     if id == BATCH_COMMAND {

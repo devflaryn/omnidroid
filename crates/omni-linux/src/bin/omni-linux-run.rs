@@ -8,6 +8,12 @@ use std::process::ExitCode;
 
 use omni_linux::{ExitStatus, Output, Process, SpawnConfig};
 
+/// `--features mimalloc`: this host process's heap is mimalloc (an A/B build; `tests/alloc_cost.rs`
+/// has the numbers).
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     // The host's descriptor limit, as high as it allows: the system's host process holds every
     // guest process's files and sockets, and Linux's default soft limit (1024) ran out on a boot

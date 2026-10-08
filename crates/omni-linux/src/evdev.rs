@@ -247,8 +247,9 @@ fn client_read(client: &Client, buf: &mut [u8], nonblocking: bool, task: &Task) 
     if buf.len() < EVENT_SIZE {
         return Err(EINVAL);
     }
+    // Registered only once a look found nothing (then looked again before sleeping).
+    let mut watching: Option<crate::poll::Watch> = None;
     loop {
-        let watch = crate::poll::watch(Some(vec![Arc::as_ptr(&client.device) as crate::poll::Key]));
         {
             let mut q = client.queue.lock();
             if !q.is_empty() {
@@ -264,7 +265,10 @@ fn client_read(client: &Client, buf: &mut [u8], nonblocking: bool, task: &Task) 
         if nonblocking {
             return Err(EAGAIN);
         }
-        watch.wait(None, task)?;
+        match watching.take() {
+            None => watching = Some(crate::poll::watch(Some(vec![Arc::as_ptr(&client.device) as crate::poll::Key]))),
+            Some(w) => w.wait(None, task)?,
+        }
     }
 }
 

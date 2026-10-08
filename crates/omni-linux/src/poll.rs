@@ -295,8 +295,10 @@ fn eventfd_read(efd: &EventFd, buf: &mut [u8], nonblocking: bool, task: &Task) -
         return Err(EINVAL);
     }
     let key = std::ptr::from_ref(efd) as Key;
+    // Looked at first, registered only to wait (then looked at again): a read that finds a count,
+    // a looper's every wake-up, takes no queue lock to register and allocates nothing.
+    let mut watching: Option<Watch> = None;
     loop {
-        let watch = watch(Some(vec![key]));
         {
             let mut count = efd.count.lock();
             if *count > 0 {
@@ -311,7 +313,10 @@ fn eventfd_read(efd: &EventFd, buf: &mut [u8], nonblocking: bool, task: &Task) -
         if nonblocking {
             return Err(EAGAIN);
         }
-        watch.wait(None, task)?;
+        match watching.take() {
+            None => watching = Some(watch(Some(vec![key]))),
+            Some(w) => w.wait(None, task)?,
+        }
     }
 }
 
@@ -321,8 +326,9 @@ fn eventfd_write(efd: &EventFd, bytes: &[u8], nonblocking: bool, task: &Task) ->
         return Err(EINVAL);
     }
     let key = std::ptr::from_ref(efd) as Key;
+    // As `eventfd_read`: registered only to wait.
+    let mut watching: Option<Watch> = None;
     loop {
-        let watch = watch(Some(vec![key]));
         {
             let mut count = efd.count.lock();
             if u64::MAX - 1 - *count >= value {
@@ -335,7 +341,10 @@ fn eventfd_write(efd: &EventFd, bytes: &[u8], nonblocking: bool, task: &Task) ->
         if nonblocking {
             return Err(EAGAIN);
         }
-        watch.wait(None, task)?;
+        match watching.take() {
+            None => watching = Some(watch(Some(vec![key]))),
+            Some(w) => w.wait(None, task)?,
+        }
     }
 }
 
@@ -380,8 +389,9 @@ impl TimerFd {
 }
 
 fn read_timespec(p: &Process, at: u64) -> Result<Duration, Errno> {
-    let sec = p.mem.read_u64(at)? as i64;
-    let nsec = p.mem.read_u64(at + 8)?;
+    let b: [u8; 16] = p.mem.read_array(at)?;
+    let sec = i64::from_le_bytes(b[..8].try_into().expect("8"));
+    let nsec = u64::from_le_bytes(b[8..].try_into().expect("8"));
     if sec < 0 || nsec >= 1_000_000_000 {
         return Err(EINVAL);
     }
@@ -575,15 +585,17 @@ fn sys_epoll_pwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let timeout = a[3] as i64 as i32;
     let deadline = (timeout >= 0).then(|| Instant::now() + Duration::from_millis(timeout as u64));
     let restore = temporary_mask(p, t, a[4], a[5])?;
+    // Registered only once a look has found nothing (then looked again before sleeping, so a
+    // change between still wakes it): a wait that finds a descriptor ready -- most of a busy
+    // looper's -- takes no queue lock and allocates nothing.
+    let mut watching: Option<Watch> = None;
     let result = loop {
-        // What the set waits on, before it is looked at: its descriptors' keys.
-        let watch = {
-            let interest = ep.interest.lock();
-            let files: Vec<Arc<OpenFile>> = interest.values().filter_map(|(f, _, _)| f.upgrade()).collect();
-            watch(keys_of(files.iter().map(|f| &**f)))
-        };
         let now = Instant::now();
-        let mut out = Vec::new();
+        // The events found: the first `SMALL` on the stack.
+        const SMALL: usize = 32;
+        let mut small = [0u8; SMALL * 16];
+        let mut big: Vec<u8> = Vec::new();
+        let mut count = 0usize;
         let mut earliest: Option<Instant> = None;
         {
             let mut interest = ep.interest.lock();
@@ -599,33 +611,50 @@ fn sys_epoll_pwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
                     earliest = Some(earliest.map_or(n, |e: Instant| e.min(n)));
                 }
                 let got = ready & (*events | ERR | HUP);
-                if got != 0 && out.len() < max as usize {
-                    out.push((got, *data));
+                if got != 0 && count < max as usize {
+                    let mut event = [0u8; 16];
+                    event[..4].copy_from_slice(&got.to_le_bytes());
+                    event[8..].copy_from_slice(&data.to_le_bytes());
+                    if count < SMALL {
+                        small[count * 16..count * 16 + 16].copy_from_slice(&event);
+                    } else {
+                        if count == SMALL {
+                            big.extend_from_slice(&small);
+                        }
+                        big.extend_from_slice(&event);
+                    }
+                    count += 1;
                     if *events & ONESHOT != 0 {
                         *events = 0;
                     }
                 }
             }
         }
-        if !out.is_empty() {
-            let mut bytes = Vec::with_capacity(out.len() * 16);
-            for (events, data) in &out {
-                bytes.extend_from_slice(&events.to_le_bytes());
-                bytes.extend_from_slice(&[0; 4]);
-                bytes.extend_from_slice(&data.to_le_bytes());
-            }
-            break p.mem.write(a[1], &bytes).map(|()| out.len() as u64);
+        if count > 0 {
+            let bytes = if count <= SMALL { &small[..count * 16] } else { &big[..] };
+            break p.mem.write(a[1], bytes).map(|()| count as u64);
         }
         if deadline.is_some_and(|d| now >= d) {
             break Ok(0);
         }
+        let Some(watch_now) = &watching else {
+            // What the set waits on: its descriptors' keys. Then look again.
+            watching = Some({
+                let interest = ep.interest.lock();
+                let files: Vec<Arc<OpenFile>> = interest.values().filter_map(|(f, _, _)| f.upgrade()).collect();
+                watch(keys_of(files.iter().map(|f| &**f)))
+            });
+            continue;
+        };
         let wake = match (deadline, earliest) {
             (Some(d), Some(e)) => Some(d.min(e)),
             (d, e) => d.or(e),
         };
-        if let Err(e) = watch.wait(wake, t) {
+        if let Err(e) = watch_now.wait(wake, t) {
             break Err(e);
         }
+        // Woken: look first again, registering anew only if that finds nothing.
+        watching = None;
     };
     if let Some(old) = restore {
         // A signal the temporary mask let through is delivered under it, as the kernel does
@@ -647,10 +676,19 @@ fn sys_ppoll(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let deadline = if a[2] == 0 { None } else { Instant::now().checked_add(read_timespec(p, a[2])?) };
     let timed = a[2] != 0;
     let restore = temporary_mask(p, t, a[3], a[4])?;
+    // As `epoll_pwait`: registered only once a look has found nothing; the list on the stack when
+    // it is short (a looper polls one or two descriptors).
+    let mut watching: Option<Watch> = None;
+    let mut small = [0u8; 32 * 8];
+    let mut big: Vec<u8> = Vec::new();
     let result = loop {
-        let mut raw = p.mem.read(a[0], n * 8)?;
-        let files: Vec<Arc<OpenFile>> = (0..n).filter_map(|i| p.fds.get(i32::from_le_bytes(raw[i * 8..i * 8 + 4].try_into().expect("4"))).ok()).collect();
-        let watch = watch(keys_of(files.iter().map(|f| &**f)));
+        let raw: &mut [u8] = if n <= 32 {
+            &mut small[..n * 8]
+        } else {
+            big.resize(n * 8, 0);
+            &mut big
+        };
+        p.mem.read_into(a[0], raw)?;
         let now = Instant::now();
         let mut count = 0;
         let mut earliest: Option<Instant> = None;
@@ -678,15 +716,21 @@ fn sys_ppoll(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             }
         }
         if count > 0 || (timed && deadline.is_none_or(|d| now >= d)) {
-            break p.mem.write(a[0], &raw).map(|()| count as u64);
+            break p.mem.write(a[0], raw).map(|()| count as u64);
         }
+        let Some(watch_now) = &watching else {
+            let files: Vec<Arc<OpenFile>> = (0..n).filter_map(|i| p.fds.get(i32::from_le_bytes(raw[i * 8..i * 8 + 4].try_into().expect("4"))).ok()).collect();
+            watching = Some(watch(keys_of(files.iter().map(|f| &**f))));
+            continue;
+        };
         let wake = match (deadline, earliest) {
             (Some(d), Some(e)) => Some(d.min(e)),
             (d, e) => d.or(e),
         };
-        if let Err(e) = watch.wait(wake, t) {
+        if let Err(e) = watch_now.wait(wake, t) {
             break Err(e);
         }
+        watching = None;
     };
     if let Some(old) = restore {
         if result == Err(EINTR) {

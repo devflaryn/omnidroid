@@ -193,6 +193,30 @@ fn a_forwarded_command_costs_little_more_than_the_driver() {
         }
         took
     };
+    // 2b. The same, with the arguments right after the request (`OMNI_GPU_CALL_INLINE`).
+    let inline = |g: &mut Guest| {
+        let mut took = std::time::Duration::ZERO;
+        let at = g.call + 0x400;
+        let mut c = Vec::new();
+        c.extend_from_slice(&id.to_le_bytes());
+        c.extend_from_slice(&4u32.to_le_bytes());
+        c.extend_from_slice(&(at + 32).to_le_bytes());
+        c.extend_from_slice(&[0u8; 16]);
+        c.extend_from_slice(&bytes);
+        let cmd = omni_linux::gpu::OMNI_GPU_CALL_INLINE | ((c.len() as u64) << 16);
+        for _ in 0..N / PER_BUFFER {
+            assert_eq!(g.ok("vkBeginCommandBuffer", &[cb_w, begin]) as i32, 0);
+            g.p.mem.write(at, &c).unwrap();
+            let t0 = Instant::now();
+            for _ in 0..PER_BUFFER {
+                let r = g.p.syscall(&mut g.t, nr::IOCTL, [fd, cmd, at, 0, 0, 0]);
+                debug_assert_eq!(r, 0);
+            }
+            took += t0.elapsed();
+            assert_eq!(g.ok("vkEndCommandBuffer", &[cb_w]) as i32, 0);
+        }
+        took
+    };
     // 3. One checked copy out of guest memory (the plain forwarding makes three and writes one).
     let copy = |g: &Guest| {
         let t0 = Instant::now();
@@ -225,6 +249,9 @@ fn a_forwarded_command_costs_little_more_than_the_driver() {
                 ns(copy(&g))
             );
         }
+        omni_linux::gpu::set_fast(true);
+        let f = ns(inline(&mut g));
+        eprintln!("[gpu-call-cost] scratch {committed} committed, vk_fast=1, inline: forwarded {f:.1} ns/call (crossing {:.1} ns)", f - ns(direct));
         batched(&mut g, cb_w, begin, vp, N, PER_BUFFER, ns(direct));
     }
     omni_linux::gpu::set_fast(false);

@@ -20,14 +20,42 @@ static int g_fd = -1;
 static pthread_once_t g_open_once = PTHREAD_ONCE_INIT;
 static __thread int t_failed;
 
+/* The request with its arguments right after it, its size in the number: the host reads both in
+ * one checked copy instead of two (~55 ns on an E-core). Sent while the host says so (bit 1 of its
+ * configuration: its vk_fast lever), asked when the device opens and at each vkBeginCommandBuffer;
+ * a host without it answers ENOTTY, and the plain request is used from then on. */
+#define OMNI_GPU_CALL_INLINE(argc) (0xc0004702u | ((32u + 8u * (uint32_t)(argc)) << 16))
+static int g_inline;
+
+static uint64_t host_config(void);
+
 static void open_device(void) {
     g_fd = open("/dev/omni-gpu", O_RDWR | O_CLOEXEC);
-    if (g_fd < 0) LOGE("/dev/omni-gpu: %s", strerror(errno));
+    if (g_fd < 0) {
+        LOGE("/dev/omni-gpu: %s", strerror(errno));
+        return;
+    }
+    __atomic_store_n(&g_inline, (int)((host_config() >> 1) & 1u), __ATOMIC_RELAXED);
 }
 
 uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc) {
     pthread_once(&g_open_once, open_device);
     t_failed = 0;
+    if (argc <= 32u && g_fd >= 0 && __atomic_load_n(&g_inline, __ATOMIC_RELAXED)) {
+        struct {
+            struct omni_gpu_call c;
+            uint64_t a[32];
+        } r;
+        r.c = (struct omni_gpu_call){.command = id, .argc = argc, .args = OMNI_U64(r.a), .result = 0, .reserved = 0};
+        memcpy(r.a, args, (size_t)argc * 8u);
+        if (ioctl(g_fd, (int)OMNI_GPU_CALL_INLINE(argc), &r) == 0) return r.c.result;
+        if (errno != ENOTTY) {
+            t_failed = 1;
+            LOGE("command %u: %s", id, strerror(errno));
+            return (uint64_t)(uint32_t)VK_ERROR_DEVICE_LOST;
+        }
+        __atomic_store_n(&g_inline, 0, __ATOMIC_RELAXED);
+    }
     struct omni_gpu_call c = {.command = id, .argc = argc, .args = OMNI_U64(args), .result = 0, .reserved = 0};
     if (g_fd < 0 || ioctl(g_fd, OMNI_GPU_CALL, &c) != 0) {
         t_failed = 1;
@@ -99,12 +127,18 @@ static void give_batch(struct omni_vk_batch* b) {
 
 /* Whether the host wants batching now (asked at each vkBeginCommandBuffer, so the host's lever
  * switches it for the next recording). A host without the query answers no. */
-static int host_batches(void) {
-    pthread_once(&g_open_once, open_device);
+static uint64_t host_config(void) {
     if (g_fd < 0) return 0;
     struct omni_gpu_call c = {.command = OMNI_VK_ID_CONFIG, .argc = 0, .args = 0, .result = 0, .reserved = 0};
     if (ioctl(g_fd, OMNI_GPU_CALL, &c) != 0) return 0;
-    return (int)(c.result & 1u);
+    return c.result;
+}
+
+static int host_batches(void) {
+    pthread_once(&g_open_once, open_device);
+    uint64_t config = host_config();
+    __atomic_store_n(&g_inline, (int)((config >> 1) & 1u), __ATOMIC_RELAXED);
+    return (int)(config & 1u);
 }
 
 static void send_batch(struct omni_vk_cmdbuf* cb) {

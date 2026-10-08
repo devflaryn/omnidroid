@@ -305,10 +305,17 @@ impl GuestMem {
         Ok(unsafe { &*ptr.cast::<std::sync::atomic::AtomicU32>() })
     }
 
+    /// `N` bytes at `addr`, on the stack: [`read_into`](Self::read_into) without the caller's
+    /// buffer. What a fixed-size argument (a word, a timespec, a msghdr) is read with -- a `read`'s
+    /// allocation is over half of a small checked copy (`timing_probe`).
+    pub fn read_array<const N: usize>(&self, addr: u64) -> Result<[u8; N], Errno> {
+        let mut out = [0u8; N];
+        self.read_into(addr, &mut out)?;
+        Ok(out)
+    }
+
     pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
-        let mut b = [0u8; 8];
-        self.read_into(addr, &mut b)?;
-        Ok(u64::from_le_bytes(b))
+        self.read_array(addr).map(u64::from_le_bytes)
     }
 
     pub fn write_u64(&self, addr: u64, value: u64) -> Result<(), Errno> {
@@ -316,9 +323,7 @@ impl GuestMem {
     }
 
     pub fn read_u32(&self, addr: u64) -> Result<u32, Errno> {
-        let mut b = [0u8; 4];
-        self.read_into(addr, &mut b)?;
-        Ok(u32::from_le_bytes(b))
+        self.read_array(addr).map(u32::from_le_bytes)
     }
 
     pub fn write_u32(&self, addr: u64, value: u32) -> Result<(), Errno> {
@@ -329,21 +334,59 @@ impl GuestMem {
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
         let mut out = Vec::new();
         let mut at = addr;
+        let mut buf = [0u8; 256];
         loop {
-            // Read up to the end of the page, so a string ending just before an unmapped page works.
+            // Never past the end of the page, so a string ending just before an unmapped page
+            // works; 256 bytes at a time into the stack (a whole page was copied out before).
             let page_left = 4096 - (at as usize & 4095);
-            let chunk = self.read(at, page_left)?;
+            let chunk = &mut buf[..page_left.min(256)];
+            self.read_into(at, chunk)?;
             if let Some(nul) = chunk.iter().position(|&b| b == 0) {
                 out.extend_from_slice(&chunk[..nul]);
                 return Ok(out);
             }
-            out.extend_from_slice(&chunk);
+            out.extend_from_slice(chunk);
             if out.len() > max {
                 return Err(crate::errno::ENAMETOOLONG);
             }
-            at += page_left as u64;
+            at += chunk.len() as u64;
         }
     }
+}
+
+/// The largest buffer [`with_scratch`] keeps per host thread.
+pub const SCRATCH_MAX: usize = 4096;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `f` on a buffer of `len` bytes: this host thread's own when `len` is at most [`SCRATCH_MAX`]
+/// (kept from call to call, so a small `read`/`write`/`sendmsg`/`recvmsg` allocates nothing), a new
+/// zeroed one otherwise. Its contents are what its last user left: callers fill what they use (a
+/// copy in) or use only what was filled (a read's count). At most 4 KiB a thread (the system host
+/// process's ~950 threads: ~4 MB at worst).
+pub fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    if len <= SCRATCH_MAX {
+        // Taken out while `f` runs: a nested use (none today) gets an empty one and allocates.
+        if let Some(mut v) = SCRATCH.with(|s| s.try_borrow_mut().ok().map(|mut v| std::mem::take(&mut *v))) {
+            if v.len() < len {
+                v.resize(len, 0);
+            }
+            let r = f(&mut v[..len]);
+            SCRATCH.with(|s| {
+                if let Ok(mut slot) = s.try_borrow_mut() {
+                    if slot.capacity() < v.capacity() {
+                        *slot = v;
+                    }
+                }
+            });
+            return r;
+        }
+    }
+    // A large one: fresh pages that become resident only where they are written
+    // (`crate::zbuf::ZeroBuf`), so a long wait in a 64 KiB `recvmsg` keeps no resident zeros.
+    f(&mut crate::zbuf::ZeroBuf::new(len))
 }
 
 #[cfg(test)]
