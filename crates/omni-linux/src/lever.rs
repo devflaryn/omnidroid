@@ -14,6 +14,16 @@
 //! - `fence_poll=<microseconds>`: a guest `vkWaitForFences` polled with that period instead of the
 //!   host driver's own (spinning, on NVIDIA) wait (`crate::gpu::FENCE_POLL_US`). 0 is the driver's.
 //!
+//! - `timer_ms=<n>`: this host process holds a host timer resolution of `n` ms
+//!   (`omni_platform::clock::TimerResolution`, `timeBeginPeriod`); 0 gives it back. On Windows every
+//!   timed wait -- a guest `futex` with a timeout, `nanosleep`, a condition variable's `wait_for` --
+//!   is otherwise rounded up to the ~15.6 ms scheduler tick.
+//! - `qos=high|auto`: `high` opts the host process out of Windows' power throttling (EcoQoS) and of
+//!   its rule that a windowless process's timer resolution is not honoured
+//!   (`omni_platform::clock::allow_power_throttling`); `auto` gives the choice back to the host.
+//! - `futex_herd=0|1`: 1 makes every futex wake unpark every task waiting in the process (the old
+//!   one-condition-variable behaviour, `crate::futex::HERD`), to A/B the per-task wake against it.
+//!
 //! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file.
 use std::path::PathBuf;
 use std::time::Duration;
@@ -50,6 +60,40 @@ pub fn apply(line: &str) -> Option<String> {
             let us: u32 = value.trim().parse().ok()?;
             crate::gpu::FENCE_POLL_US.store(us, std::sync::atomic::Ordering::Relaxed);
             Some(format!("fence_poll={us}: a guest vkWaitForFences {}", if us == 0 { "is the host driver's wait" } else { "is polled" }))
+        }
+        "timer_ms" => {
+            let ms: u64 = value.trim().parse().ok()?;
+            static HELD: std::sync::Mutex<Option<omni_platform::clock::TimerResolution>> = std::sync::Mutex::new(None);
+            let mut held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            *held = None;
+            if ms == 0 {
+                return Some("timer_ms=0: the host's default timer resolution".into());
+            }
+            match omni_platform::clock::TimerResolution::raise(std::time::Duration::from_millis(ms)) {
+                Ok(r) => {
+                    *held = Some(r);
+                    Some(format!("timer_ms={ms}: held"))
+                }
+                Err(e) => Some(format!("timer_ms={ms}: {e}")),
+            }
+        }
+        "qos" => {
+            let allow = match value.trim() {
+                "high" => false,
+                "auto" => true,
+                _ => return None,
+            };
+            let ok = omni_platform::clock::allow_power_throttling(allow);
+            Some(format!("qos={}: {}", value.trim(), if ok { "set" } else { "refused by the host" }))
+        }
+        "futex_herd" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::futex::HERD.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("futex_herd={}", u8::from(on)))
         }
         _ => None,
     }

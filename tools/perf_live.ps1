@@ -61,11 +61,11 @@ if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Spl
 
 function Stop-Guests { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" } | Stop-Process -Force -ErrorAction SilentlyContinue }
 Stop-Guests; Start-Sleep 3
-# A boot needs ~13 GB of free commit; below that it would starve this host's other processes (the
+# A lean kiosk boot needs ~4-6 GB of free commit (an instance commits ~3.7 GB in-world); below that it would starve this host's other processes (the
 # owner's games) as well as itself. Wait for it (up to 30 min); never boot without it.
 $okCommit = $false
-for ($i = 0; $i -lt 900; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 13GB / 1KB) { $okCommit = $true; break }; Start-Sleep 2 }
-if (-not $okCommit) { Write-Output "LOWCOMMIT: free commit stayed under 13 GB for 30 min; not booting"; exit 3 }
+for ($i = 0; $i -lt 900; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 6GB / 1KB) { $okCommit = $true; break }; Start-Sleep 2 }
+if (-not $okCommit) { Write-Output "LOWCOMMIT: free commit stayed under 6 GB for 30 min; not booting"; exit 3 }
 $tree = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Exe)))
 $proc = Start-Process -FilePath $Exe -ArgumentList "--ignored", "--nocapture", "--exact", "the_apk_is_installed_started_and_draws" `
   -WorkingDirectory $tree -RedirectStandardOutput (Join-Path $Dir "$name.out.log") -RedirectStandardError (Join-Path $Dir "$name.err.log") -PassThru -WindowStyle Hidden

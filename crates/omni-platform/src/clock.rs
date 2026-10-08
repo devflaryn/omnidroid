@@ -207,6 +207,46 @@ fn backend_raise(_period_ms: u32) -> Result<(), TimerResolutionError> {
 #[cfg(not(target_os = "windows"))]
 fn backend_lower(_period_ms: u32) {}
 
+/// **Whether the host may treat this process as background work** -- Windows 11's power
+/// throttling (EcoQoS: efficient cores, lower clocks) and its rule that a process with no visible
+/// window does not get the timer resolution it asks for. A guest's host processes have no window of
+/// their own (the system's host process draws the display), so to the host they look like
+/// background work while the game they run is the foreground. `false` opts this process out of
+/// both (`PROCESS_POWER_THROTTLING_EXECUTION_SPEED | ..._IGNORE_TIMER_RESOLUTION`, state 0);
+/// `true` gives the decision back to the host. Nothing on other hosts.
+pub fn allow_power_throttling(allow: bool) -> bool {
+    backend_power_throttling(allow)
+}
+
+#[cfg(target_os = "windows")]
+fn backend_power_throttling(allow: bool) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        // ControlMask 0: the host decides; the two bits with StateMask 0: never throttle, always
+        // honour the timer resolution asked for.
+        ControlMask: if allow { 0 } else { PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION },
+        StateMask: 0,
+    };
+    // SAFETY: the pseudo-handle of this process, and a pointer to a local of the declared size.
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            std::ptr::from_ref(&state).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        ) != 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn backend_power_throttling(_allow: bool) -> bool {
+    true
+}
+
 /// Block the calling thread for **at least** `duration`.
 ///
 /// There is no upper bound: see the module documentation on Windows' ~15.6 ms timer tick. A
