@@ -62,7 +62,7 @@ function Result($status, $extra) {
   $row = [ordered]@{ tag = $tag; arm = $Arm; status = $status; when = (Get-Date -Format o) }
   if ($extra) { foreach ($k in $extra.Keys) { $row[$k] = $extra[$k] } }
   $obj = [pscustomobject]$row
-  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s"
+  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s,ws_gb,wspriv_gb,sys_wspriv_gb,threads,sys_threads"
   if (-not (Test-Path $Csv)) { Set-Content -Path $Csv -Value $cols -Encoding utf8 }
   $line = ($cols.Split(",") | ForEach-Object { $v = $obj.$_; if ($null -eq $v) { "" } else { [string]$v } }) -join ","
   Add-Content -Path $Csv -Value $line -Encoding utf8
@@ -92,6 +92,8 @@ function Snap {
 $lines0 = @(Get-Content $log).Count
 $s0 = Snap
 $priv = New-Object System.Collections.ArrayList; $appPriv = New-Object System.Collections.ArrayList; $procs = 0
+$ws = New-Object System.Collections.ArrayList; $wsPriv = New-Object System.Collections.ArrayList; $sysWsPriv = New-Object System.Collections.ArrayList
+$sysThreads = New-Object System.Collections.ArrayList; $threadsAll = New-Object System.Collections.ArrayList
 $wEnd = (Get-Date).AddSeconds($WindowSec)
 while ((Get-Date) -lt $wEnd) {
   Start-Sleep 15
@@ -99,6 +101,13 @@ while ((Get-Date) -lt $wEnd) {
   [void]$priv.Add(($g | Measure-Object PrivateMemorySize64 -Sum).Sum)
   [void]$appPriv.Add((($g | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 1).PrivateMemorySize64))
   $procs = [math]::Max($procs, $g.Count)
+  # What Task Manager shows (private working set), the working set, and thread counts.
+  [void]$ws.Add(($g | Measure-Object WorkingSet64 -Sum).Sum)
+  $wmi = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" })
+  [void]$wsPriv.Add(($wmi | Measure-Object WorkingSetPrivate -Sum).Sum)
+  $sysP = $g | Sort-Object { $_.Threads.Count } -Descending | Select-Object -First 1
+  if ($sysP) { [void]$sysThreads.Add($sysP.Threads.Count); $sw = $wmi | Where-Object { $_.IDProcess -eq $sysP.Id } | Select-Object -First 1; if ($sw) { [void]$sysWsPriv.Add([double]$sw.WorkingSetPrivate) } }
+  [void]$threadsAll.Add((($g | ForEach-Object { $_.Threads.Count }) | Measure-Object -Sum).Sum)
 }
 $s1 = Snap
 $new = @(Get-Content $log | Select-Object -Skip $lines0)
@@ -130,4 +139,9 @@ Result ($(if ($kicked) { "kicked" } else { "ok" })) ([ordered]@{
   procs = $procs
   top_name = "tid$($top[0].id)"
   join_s = $join_s
+  ws_gb = "{0:N3}" -f ((Med $ws) / 1GB)
+  wspriv_gb = "{0:N3}" -f ((Med $wsPriv) / 1GB)
+  sys_wspriv_gb = "{0:N3}" -f ((Med $sysWsPriv) / 1GB)
+  threads = (Med $threadsAll)
+  sys_threads = (Med $sysThreads)
 })
