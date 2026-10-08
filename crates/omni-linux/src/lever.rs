@@ -75,11 +75,15 @@
 //! - `futex_herd=0|1`: 1 makes every futex wake unpark every task waiting in the process (the old
 //!   one-condition-variable behaviour, `crate::futex::HERD`), to A/B the per-task wake against it.
 //! - `vk_fast=0|1`: the Vulkan forwarding's fast path (`crate::gpu::FAST`: no allocation per
-//!   command, handles from a per-thread cache, no write of a zero result). Off by default;
-//!   `OMNI_VK_FAST=1` from the start.
+//!   command, no write of a zero result). Off by default; `OMNI_VK_FAST=1` from the start.
+//! - `vk_handles=0|1`: dispatchable handles from a per-thread cache (`crate::gpu::HANDLE_CACHE`).
+//!   Off by default; `OMNI_VK_HANDLES=1`.
+//! - `vk_inline=0|1`: the guest's Vulkan driver sends each unbatched command with its arguments
+//!   inline (`crate::gpu::INLINE`), from its next config refresh (at most every 250 ms, at a
+//!   `vkBeginCommandBuffer`). Off by default; `OMNI_VK_INLINE=1`.
 //! - `vk_batch=0|1`: the guest's Vulkan driver batches the commands that only record into a command
-//!   buffer (`crate::gpu::BATCH`), from each command buffer's next `vkBeginCommandBuffer`. Off by
-//!   default; `OMNI_VK_BATCH=1` from the start.
+//!   buffer (`crate::gpu::BATCH`), from a command buffer's `vkBeginCommandBuffer` after its next
+//!   config refresh. Independent of the others. Off by default; `OMNI_VK_BATCH=1` from the start.
 //!
 //! - `zero_reclaim=<seconds>`: sweep every guest process's resident pages of zeros out of the
 //!   working set that often (`crate::zero_reclaim`; RAM, not commit). 0, the default, stops it.
@@ -250,16 +254,17 @@ pub fn apply(line: &str) -> Option<String> {
             crate::binder::HOST_POOL.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("binder_host_pool={}: host services' calls run on {}", u8::from(on), if on { "kept threads" } else { "a new thread each" }))
         }
-        "vk_fast" | "vk_batch" => {
+        "vk_fast" | "vk_batch" | "vk_handles" | "vk_inline" => {
             let on = match value.trim() {
                 "1" => true,
                 "0" => false,
                 _ => return None,
             };
-            if name.trim() == "vk_fast" {
-                crate::gpu::set_fast(on);
-            } else {
-                crate::gpu::set_batch(on);
+            match name.trim() {
+                "vk_fast" => crate::gpu::set_fast(on),
+                "vk_batch" => crate::gpu::set_batch(on),
+                "vk_handles" => crate::gpu::set_handle_cache(on),
+                _ => crate::gpu::set_inline(on),
             }
             Some(format!("{}={}", name.trim(), u8::from(on)))
         }
@@ -525,10 +530,17 @@ mod tests {
         assert_eq!(apply("vk_batch=1").as_deref(), Some("vk_batch=1"));
         assert!(crate::gpu::BATCH.load(Ordering::Relaxed));
         assert_eq!(apply("vk_fast=on"), None);
-        apply("vk_fast=0").expect("understood");
-        apply("vk_batch=0").expect("understood");
+        assert_eq!(apply("vk_handles=1").as_deref(), Some("vk_handles=1"));
+        assert!(crate::gpu::HANDLE_CACHE.load(Ordering::Relaxed));
+        assert_eq!(apply("vk_inline=1").as_deref(), Some("vk_inline=1"));
+        assert!(crate::gpu::INLINE.load(Ordering::Relaxed));
+        for lever in ["vk_fast=0", "vk_batch=0", "vk_handles=0", "vk_inline=0"] {
+            apply(lever).expect("understood");
+        }
         assert!(!crate::gpu::FAST.load(Ordering::Relaxed));
         assert!(!crate::gpu::BATCH.load(Ordering::Relaxed));
+        assert!(!crate::gpu::HANDLE_CACHE.load(Ordering::Relaxed));
+        assert!(!crate::gpu::INLINE.load(Ordering::Relaxed));
     }
 
     #[test]

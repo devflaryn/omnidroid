@@ -131,6 +131,53 @@ fn batched_vulkan_records_in_order_and_costs_less() {
     assert!(costs[2] * 2.0 < costs[0] && costs[5] * 2.0 < costs[3], "{costs:?}");
 }
 
+/// The forwarding's levers on a game-like frame loop (`vkframe`: three threads, each frame
+/// descriptor sets reset/allocated/updated, a transient buffer, a command buffer allocated, ~3,000
+/// commands recorded, submitted, waited, freed): each mode's time per frame, in ABBA order so a
+/// drift of the host's load cancels. Every mode must render its frames; none may be much slower
+/// than everything off.
+#[test]
+fn the_forwarding_levers_on_a_game_like_frame() {
+    let (sysroot, instance) = prepare("vkframe", "vkframe");
+    // (name, vk_fast, vk_handles, vk_inline, vk_batch)
+    let modes = [
+        ("off", false, false, false, false),
+        ("vk_fast", true, false, false, false),
+        ("vk_handles", false, true, false, false),
+        ("vk_inline", false, false, true, false),
+        ("vk_batch", false, false, false, true),
+        ("all", true, true, true, true),
+    ];
+    let set = |m: &(&str, bool, bool, bool, bool)| {
+        omni_linux::gpu::set_fast(m.1);
+        omni_linux::gpu::set_handle_cache(m.2);
+        omni_linux::gpu::set_inline(m.3);
+        omni_linux::gpu::set_batch(m.4);
+    };
+    let mut sums = vec![0.0f64; modes.len()];
+    let rounds = std::env::var("OMNI_VKFRAME_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize);
+    for round in 0..rounds {
+        let mut order: Vec<usize> = (0..modes.len()).collect();
+        if round % 2 == 1 {
+            order.reverse();
+        }
+        for i in order {
+            set(&modes[i]);
+            let (status, out, err) = run_fixture(&sysroot, &instance, "vkframe");
+            assert_eq!(status, ExitStatus::Exited(0), "vkframe {}\nstdout: {out}\nstderr: {err}", modes[i].0);
+            let line = out.lines().find(|l| l.starts_with("vkframe ok ")).unwrap_or_else(|| panic!("stdout: {out}\nstderr: {err}"));
+            let us: f64 = line.split_whitespace().nth(2).and_then(|v| v.parse().ok()).expect("us per frame");
+            eprintln!("[vkframe] round {round} {}: {us:.0} us per frame", modes[i].0);
+            sums[i] += us;
+        }
+    }
+    set(&modes[0]);
+    let mean: Vec<f64> = sums.iter().map(|s| s / rounds as f64).collect();
+    let rows: Vec<String> = modes.iter().zip(&mean).map(|(m, us)| format!("{} {us:.0}", m.0)).collect();
+    eprintln!("[vkframe] mean us per frame: {}", rows.join(", "));
+    assert!(mean.iter().all(|us| *us < mean[0] * 1.10), "a lever made frames slower: {rows:?}");
+}
+
 #[test]
 fn angle_clears_a_pbuffer_on_the_host_gpu() {
     let (sysroot, instance) = prepare("gl", "glclear");

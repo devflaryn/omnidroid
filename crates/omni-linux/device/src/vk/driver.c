@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <android/log.h>
@@ -22,7 +23,7 @@ static __thread int t_failed;
 
 /* The request with its arguments right after it, its size in the number: the host reads both in
  * one checked copy instead of two (~55 ns on an E-core). Sent while the host says so (bit 1 of its
- * configuration: its vk_fast lever), asked when the device opens and at each vkBeginCommandBuffer;
+ * configuration: its vk_inline lever), asked when the device opens and at a vkBeginCommandBuffer;
  * a host without it answers ENOTTY, and the plain request is used from then on. */
 #define OMNI_GPU_CALL_INLINE(argc) (0xc0004702u | ((32u + 8u * (uint32_t)(argc)) << 16))
 static int g_inline;
@@ -134,10 +135,25 @@ static uint64_t host_config(void) {
     return c.result;
 }
 
+/* The host's configuration, asked again at a vkBeginCommandBuffer at most every 250 ms (the host's
+ * levers are read four times a second): one system call per begin was a cost of its own. */
+static uint64_t g_config;
+static int64_t g_config_at = -((int64_t)1 << 62);
+
 static int host_batches(void) {
     pthread_once(&g_open_once, open_device);
-    uint64_t config = host_config();
-    __atomic_store_n(&g_inline, (int)((config >> 1) & 1u), __ATOMIC_RELAXED);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+    uint64_t config = __atomic_load_n(&g_config, __ATOMIC_RELAXED);
+    if (now - __atomic_load_n(&g_config_at, __ATOMIC_RELAXED) >= 250000000) {
+        __atomic_store_n(&g_config_at, now, __ATOMIC_RELAXED);
+        config = host_config();
+        __atomic_store_n(&g_config, config, __ATOMIC_RELAXED);
+        if (__atomic_load_n(&g_inline, __ATOMIC_RELAXED) != (int)((config >> 1) & 1u)) {
+            __atomic_store_n(&g_inline, (int)((config >> 1) & 1u), __ATOMIC_RELAXED);
+        }
+    }
     return (int)(config & 1u);
 }
 
