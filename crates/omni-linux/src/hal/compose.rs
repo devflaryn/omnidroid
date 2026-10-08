@@ -41,16 +41,25 @@ pub struct Layer<'a> {
     pub alpha: f32,
 }
 
-/// **The fast path** (`omni_linux::lever`'s `compose_fast=0|1`; **off by default** until its in-world A/B):
+/// **The fast path** (`omni_linux::lever`'s `compose_fast=0|1`; **on by default** since 2026-10-07 --
+/// 7.04 -> 1.15 ms a frame at 1280x720, 16 of 16 pairs (docs/NIGHT-2026-10-02.md), and ~5x the
+/// pixels at a Retina window's size, all of it inside SurfaceFlinger's present; `OMNI_COMPOSE_FAST=0`
+/// starts with it off):
 /// fewer passes -- black written once rather than zeroed then given its alpha, and a premultiplied
 /// layer's fully transparent pixels skipped and its fully opaque ones copied rather than blended
 /// (an app window over its SurfaceView is mostly a transparent hole: ~921,600 blends a frame at
 /// 1280x720, four integer divisions each). Every shortcut is the blend's own result for that pixel,
 /// so the output is identical (`tests::the_fast_path_composes_the_same_pixels`).
-pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Compose `layers` (bottom first) over black into `out`: RGBA rows of `width` pixels.
 pub fn compose(out: &mut [u8], width: usize, height: usize, layers: &[Layer<'_>]) {
+    static FROM_ENV: std::sync::Once = std::sync::Once::new();
+    FROM_ENV.call_once(|| {
+        if std::env::var("OMNI_COMPOSE_FAST").as_deref() == Ok("0") {
+            FAST.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     compose_with(out, width, height, layers, FAST.load(std::sync::atomic::Ordering::Relaxed));
 }
 

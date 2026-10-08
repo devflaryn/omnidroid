@@ -7,6 +7,7 @@
 #   tools/play.sh --apk ~/apks/Roblox-2.740.1.apk
 #   tools/play.sh --place 8737899170       # join that place once the saved sign-in is at Home
 #   tools/play.sh --cookie farm4.txt --place 8737899170   # sign in as that account, then join
+#                                          # (--cookie, --place: `omnidroid plugins add --link plugins/roblox`)
 #   tools/play.sh --minutes 90
 #   tools/play.sh --fresh                  # a fresh install
 #   tools/play.sh --phone                  # a touch screen instead: the mouse is a finger, no keyboard

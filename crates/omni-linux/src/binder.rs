@@ -275,10 +275,17 @@ struct State {
     /// What the host listens to ([`Broker::tap`]): transactions of one code to one node, by
     /// anyone, whose parcels a host callback reads as they pass.
     taps: Vec<(NodeId, u32, Tap)>,
+    /// What the host answers in a node's place ([`Broker::intercept`]).
+    intercepts: Vec<(NodeId, u32, Intercept)>,
 }
 
 /// A host callback reading a tapped transaction's parcel ([`Broker::tap`]).
 pub type Tap = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// A host callback that may answer a transaction in its target's place ([`Broker::intercept`]):
+/// `Some(reply)` is the reply's parcel, and the target never hears of the call; `None` lets it go
+/// on as usual.
+pub type Intercept = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
 /// The cross-process part of the driver.
 #[derive(Default)]
@@ -662,6 +669,20 @@ impl Broker {
         true
     }
 
+    /// Answer, in the place of the object the host's `handle` names, the sync transactions of
+    /// `code` that `intercept` takes: it reads each parcel (its objects not yet translated) on the
+    /// sender's thread, under the broker's lock -- so, as a [`Self::tap`], it must be quick and must
+    /// not call the broker -- and a `Some` reply goes straight back to the sender, the target never
+    /// hearing of the call. One-way transactions are never intercepted. `false` for a handle the
+    /// host does not have.
+    pub fn intercept(&self, handle: u32, code: u32, intercept: Intercept) -> bool {
+        let mut st = self.state.lock();
+        let Some(node) = st.node_for_handle(HOST, handle) else { return false };
+        st.intercepts.retain(|(n, c, _)| (*n, *c) != (node, code));
+        st.intercepts.push((node, code, intercept));
+        true
+    }
+
     /// A sync transaction from the host to `handle` (in the host's handle table; 0 is the context
     /// manager): the reply's parcel. `data` may carry the host's own services as binder objects,
     /// at `offsets`.
@@ -669,7 +690,26 @@ impl Broker {
     /// # Errors
     /// `EINVAL` for an unknown handle or an object that is not a binder or handle, `EPIPE` when the
     /// target is dead or dies before replying, `ETIMEDOUT` when no reply comes in time.
-    pub fn host_transact(&self, handle: u32, code: u32, mut data: Vec<u8>, offsets: &[u64]) -> Result<Vec<u8>, Errno> {
+    pub fn host_transact(&self, handle: u32, code: u32, data: Vec<u8>, offsets: &[u64]) -> Result<Vec<u8>, Errno> {
+        self.host_transact_with_fds(handle, code, data, offsets).map(|(reply, _)| reply)
+    }
+
+    /// [`Self::host_transact`], and the file descriptors the reply carried, in object order (a
+    /// `ParcelFileDescriptor` answered: `IActivityManager.openContentUri`).
+    ///
+    /// # Errors
+    /// As [`Self::host_transact`].
+    pub fn host_transact_with_fds(&self, handle: u32, code: u32, data: Vec<u8>, offsets: &[u64]) -> Result<(Vec<u8>, Vec<Arc<OpenFile>>), Errno> {
+        self.host_transact_as(HOST_EUID, handle, code, data, offsets)
+    }
+
+    /// [`Self::host_transact_with_fds`], the caller seen as `euid` (`Binder.getCallingUid()`) rather
+    /// than the system's: a service that grants by the caller's package checks the package against
+    /// it (`ClipboardService` reading the clipboard as the shell, uid 2000).
+    ///
+    /// # Errors
+    /// As [`Self::host_transact`].
+    pub fn host_transact_as(&self, euid: u32, handle: u32, code: u32, mut data: Vec<u8>, offsets: &[u64]) -> Result<(Vec<u8>, Vec<Arc<OpenFile>>), Errno> {
         let mut st = self.state.lock();
         st.proc_mut(HOST);
         st.next_host_tid += 1;
@@ -692,7 +732,7 @@ impl Broker {
             code,
             flags: 0,
             sender_pid: 0,
-            sender_euid: HOST_EUID,
+            sender_euid: euid,
             data,
             offsets: offsets.to_vec(),
             fds: Vec::new(),
@@ -708,7 +748,12 @@ impl Broker {
             let seen = crate::poll::generation();
             let work = st.proc_mut(HOST).threads.entry(tid).or_default().todo.pop_front();
             match work {
-                Some(Work::Txn(r)) if r.reply => break Ok(r.data),
+                Some(Work::Txn(r)) if r.reply => {
+                    let mut r = *r;
+                    r.fds.sort_by_key(|(at, _)| *at);
+                    let fds = std::mem::take(&mut r.fds).into_iter().map(|(_, f)| f).collect();
+                    break Ok((std::mem::take(&mut r.data), fds));
+                }
                 Some(Work::DeadReply | Work::FailedReply | Work::ReturnError(_)) => break Err(EPIPE),
                 Some(_) => continue,
                 None if Instant::now() >= deadline => break Err(ETIMEDOUT),
@@ -874,9 +919,26 @@ impl Parcel {
         self.bytes.resize((self.bytes.len() + 3) & !3, 0);
     }
 
+    /// A null `String16` (`writeString16(null)`): length -1.
+    pub(crate) fn null_string16(&mut self) {
+        self.i32(-1);
+    }
+
+    /// `writeString8`: the length in bytes (-1: null), the UTF-8 bytes and a NUL, padded to 4.
+    pub(crate) fn string8(&mut self, s: Option<&str>) {
+        let Some(s) = s else {
+            self.i32(-1);
+            return;
+        };
+        self.i32(s.len() as i32);
+        self.bytes.extend_from_slice(s.as_bytes());
+        self.bytes.push(0);
+        self.bytes.resize((self.bytes.len() + 3) & !3, 0);
+    }
+
     /// `writeStrongBinder` of host service `ptr`: a `flat_binder_object` and its stability. The
     /// object's offset, for the offsets array.
-    fn binder(&mut self, ptr: u64, stability: i32) -> u64 {
+    pub(crate) fn binder(&mut self, ptr: u64, stability: i32) -> u64 {
         let at = self.bytes.len() as u64;
         self.bytes.extend_from_slice(&TYPE_BINDER.to_le_bytes());
         self.bytes.extend_from_slice(&FLAT_BINDER_FLAG_ACCEPTS_FDS.to_le_bytes());
@@ -1070,7 +1132,7 @@ impl BinderFile {
                 released += 1;
             }
         }
-        if std::env::var_os("OMNI_BINDER_TRACE").is_some() || released > 0 {
+        if trace_level() > 0 || released > 0 {
             let pid = st.procs.get(&self.id).map_or(0, |p| p.pid);
             eprintln!("[binder] pid {pid} closed its driver: {released} objects released");
         }
@@ -1134,7 +1196,7 @@ fn write_read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, arg: u64, nonbl
     let bwr = p.mem.read(arg, 48)?;
     let (write_size, mut write_consumed, write_buffer) = (u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 16));
     let (read_size, mut read_consumed, read_buffer) = (u64_at(&bwr, 24), u64_at(&bwr, 32), u64_at(&bwr, 40));
-    if std::env::var("OMNI_BINDER_TRACE").as_deref() == Ok("2") {
+    if trace_level() == 2 {
         let cmds = if write_size > write_consumed { p.mem.read(write_buffer + write_consumed, (write_size - write_consumed).min(64) as usize).unwrap_or_default() } else { Vec::new() };
         let first = cmds.get(0..4).map(|c| u32_at(c, 0));
         eprintln!("[binder] {}:{} write {} (first cmd {first:x?}) read {}", p.sys.pid, t.tid, write_size - write_consumed, read_size - read_consumed);
@@ -1216,7 +1278,7 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                 None
             };
             if let Err(e) = transaction(p, t, file, arg, reply, caller) {
-                if std::env::var("OMNI_BINDER_TRACE").is_ok() || crate::remote::is_remote() || p.trace {
+                if trace_level() > 0 || crate::remote::is_remote() || p.trace {
                     eprintln!("[binder] {}:{} {} failed: {e:?}", p.sys.pid, t.tid, if reply { "reply" } else { "transaction" });
                 }
                 let mut st = file.broker.state.lock();
@@ -1357,6 +1419,19 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         return Ok(());
     }
 
+    // What the host answers itself (`Broker::intercept`): the reply goes back at once, and the
+    // target never hears of the call (nothing of it is translated or held).
+    if let (Some(node), false, false) = (target_node, reply, oneway) {
+        let answer = st.intercepts.iter().filter(|(n, c, _)| (*n, *c) == (node, code)).find_map(|(_, _, i)| i(&data));
+        if let Some(answer) = answer {
+            let r = st.reply_from_host(file.id, HostReply::bytes(answer))?;
+            st.proc_mut(file.id).threads.entry(t.tid).or_default().awaiting += 1;
+            st.queue(file.id, Some(t.tid), Work::Complete);
+            st.queue(file.id, Some(t.tid), Work::Txn(Box::new(r)));
+            return Ok(());
+        }
+    }
+
     // What the host listens to (`Broker::tap`), before the objects are translated.
     if let Some(node) = target_node {
         for (_, _, tap) in st.taps.iter().filter(|(n, c, _)| (*n, *c) == (node, code)) {
@@ -1470,6 +1545,18 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     }
     st.queue(file.id, Some(t.tid), Work::Complete);
     Ok(())
+}
+
+/// `OMNI_BINDER_TRACE`, read once: 0 unset, 2 for `2`, 1 for any other value. Read on every
+/// `BINDER_WRITE_READ`, thousands of times a second, where an environment lookup (the environment's
+/// lock and a `String`) is a cost of its own.
+fn trace_level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("OMNI_BINDER_TRACE") {
+        Ok(v) if v == "2" => 2,
+        Ok(_) => 1,
+        Err(_) => 0,
+    })
 }
 
 /// The descriptors, scatter-gather buffers and fd arrays a transaction carries.

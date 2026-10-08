@@ -158,7 +158,7 @@ pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Pa
     };
     match started {
         Ok(out) => {
-            let planted = if out.contains("cookie store planted") { ", signed in with --cookie (never printed)" } else { "" };
+            let planted = if out.contains("cookie store planted") { ", signed in with the cookie (never printed)" } else { "" };
             say(&format!("started{planted}"));
             if cookie.is_some() && planted.is_empty() {
                 eprintln!("omnidroid: the cookie store was not planted: {out}");

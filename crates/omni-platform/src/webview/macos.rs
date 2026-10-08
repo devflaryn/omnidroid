@@ -58,7 +58,7 @@ use objc2_foundation::{
     NSURL,
 };
 use objc2_web_kit::{
-    WKNavigation, WKNavigationDelegate, WKScriptMessage, WKScriptMessageHandler, WKUserContentController,
+    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKScriptMessage, WKScriptMessageHandler, WKUserContentController,
     WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
 };
 
@@ -118,6 +118,12 @@ pub(super) fn runtime_version() -> WebViewResult<String> {
     })
 }
 
+/// Whether `url` is one a browser loads itself: the web's schemes and the page-local ones.
+fn is_web_url(url: &str) -> bool {
+    let scheme = url.split_once(':').map_or("", |(s, _)| s).to_ascii_lowercase();
+    matches!(scheme.as_str(), "http" | "https" | "about" | "data" | "blob" | "javascript" | "file" | "")
+}
+
 // ------------------------------------------------------------------------ the delegate
 
 /// What the delegate needs: where events go, the URL the current navigation named, and whether the
@@ -140,6 +146,36 @@ define_class!(
     unsafe impl NSObjectProtocol for WebViewDelegate {}
 
     unsafe impl WKNavigationDelegate for WebViewDelegate {
+        /// A navigation to a scheme that is not the web's (`roblox://`, `intent:`, `mailto:`) is
+        /// cancelled -- unanswered, WebKit would hand it to whatever host application claims the
+        /// scheme -- and reported as `NavigationStarting` with its URL, as WebView2 reports one,
+        /// for the caller to act on. A link that asks for a new window (`target=_blank`,
+        /// `window.open`: no target frame, and no UI delegate here to make one) is loaded in this
+        /// one, as a single-window browser does, instead of doing nothing.
+        #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
+        fn decide_policy(
+            &self,
+            web_view: &WKWebView,
+            action: &WKNavigationAction,
+            handler: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy)>,
+        ) {
+            // SAFETY: property reads on a live navigation action.
+            let (request, target) = unsafe { (action.request(), action.targetFrame()) };
+            let url = request.URL().and_then(|u| u.absoluteString()).map(|u| u.to_string()).unwrap_or_default();
+            if !is_web_url(&url) {
+                handler.call((WKNavigationActionPolicy::Cancel,));
+                self.send(WebViewEvent::NavigationStarting { url });
+                return;
+            }
+            if target.is_none() {
+                handler.call((WKNavigationActionPolicy::Cancel,));
+                // SAFETY: a live web view, loading a request it was itself asked to navigate to.
+                let _ = unsafe { web_view.loadRequest(&request) };
+                return;
+            }
+            handler.call((WKNavigationActionPolicy::Allow,));
+        }
+
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
         fn did_start(&self, web_view: &WKWebView, _navigation: Option<&WKNavigation>) {
             self.starting(web_view);

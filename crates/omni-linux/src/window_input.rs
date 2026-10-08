@@ -12,7 +12,9 @@
 //! would report. A host auto-repeat is the driver's repeat (value 2). Keys held when the focus goes
 //! are released. **The Windows (Meta) keys stay the host's** ([`HOST_KEYS`]): the host acts on them
 //! too (the Start menu), and Meta alone opens Android's app list, so passing them on would do two
-//! things at once.
+//! things at once. **On macOS, Cmd with C, V, X, A or Z is the device's Ctrl with it**
+//! ([`COMMAND_KEYS`]): copy, paste, cut, select all and undo, as every Mac application takes them,
+//! reach the app as the shortcuts Android's text fields know (Ctrl+V pastes).
 //!
 //! # The mouse: free and absolute, held only while the app holds the pointer capture
 //!
@@ -67,6 +69,12 @@ use crate::evdev::{ABS_X, ABS_Y, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN
 
 /// Keys the host keeps: `KEY_LEFTMETA`, `KEY_RIGHTMETA`.
 pub const HOST_KEYS: [u16; 2] = [125, 126];
+/// The keys Cmd makes a Ctrl shortcut of on macOS: `KEY_C`, `KEY_V`, `KEY_X`, `KEY_A`, `KEY_Z`.
+pub const COMMAND_KEYS: [u16; 5] = [46, 47, 45, 30, 44];
+/// `KEY_LEFTCTRL`.
+const KEY_LEFTCTRL: u16 = 29;
+/// Whether Cmd shortcuts are the device's Ctrl ones: macOS hosts.
+const COMMAND_IS_CTRL: bool = cfg!(target_os = "macos");
 /// One wheel notch in the window seam's units.
 const NOTCH: i32 = 120;
 /// **How often a moving pointer is sent**, at most: 60 times a second, as often as the display can
@@ -124,6 +132,10 @@ pub struct Input {
     /// The window has the focus.
     focused: bool,
     keys: BTreeSet<u16>,
+    /// The host's Meta (Cmd) keys held, which the device never sees ([`HOST_KEYS`]).
+    meta: BTreeSet<u16>,
+    /// Keys sent with a Ctrl of their own, for a Cmd shortcut ([`COMMAND_KEYS`]).
+    commanded: BTreeSet<u16>,
     /// Buttons down on the absolute pointer, and on the relative mouse.
     pointer_buttons: BTreeSet<u16>,
     mouse_buttons: BTreeSet<u16>,
@@ -180,6 +192,8 @@ impl Input {
             held: false,
             focused: true,
             keys: BTreeSet::new(),
+            meta: BTreeSet::new(),
+            commanded: BTreeSet::new(),
             pointer_buttons: BTreeSet::new(),
             mouse_buttons: BTreeSet::new(),
             wheel: (0, 0),
@@ -302,14 +316,33 @@ impl Input {
         };
         match *event {
             WindowEvent::KeyDown { scancode, repeat, .. } => {
-                let Some(code) = evdev_code(scancode).filter(|c| !HOST_KEYS.contains(c)) else { return out };
+                let Some(code) = evdev_code(scancode) else { return out };
+                if HOST_KEYS.contains(&code) {
+                    self.meta.insert(code);
+                    return out;
+                }
+                if COMMAND_IS_CTRL && !self.meta.is_empty() && COMMAND_KEYS.contains(&code) && !self.keys.contains(&code) {
+                    // A Cmd shortcut: the key with a Ctrl of its own around it.
+                    self.commanded.insert(code);
+                    self.keys.insert(code);
+                    out.push(Out::Keyboard(vec![(EV_KEY, KEY_LEFTCTRL, 1), (EV_KEY, code, 1)]));
+                    return out;
+                }
                 self.keys.insert(code);
                 out.push(Out::Keyboard(vec![(EV_KEY, code, if repeat { 2 } else { 1 })]));
             }
             WindowEvent::KeyUp { scancode, .. } => {
-                let Some(code) = evdev_code(scancode).filter(|c| !HOST_KEYS.contains(c)) else { return out };
+                let Some(code) = evdev_code(scancode) else { return out };
+                if HOST_KEYS.contains(&code) {
+                    self.meta.remove(&code);
+                    return out;
+                }
                 if self.keys.remove(&code) {
-                    out.push(Out::Keyboard(vec![(EV_KEY, code, 0)]));
+                    if self.commanded.remove(&code) && !self.keys.contains(&KEY_LEFTCTRL) {
+                        out.push(Out::Keyboard(vec![(EV_KEY, code, 0), (EV_KEY, KEY_LEFTCTRL, 0)]));
+                    } else {
+                        out.push(Out::Keyboard(vec![(EV_KEY, code, 0)]));
+                    }
                 }
             }
             WindowEvent::PointerMoved { x, y } if !self.relative() => {
@@ -501,7 +534,9 @@ impl Input {
     }
 
     fn release_keys(&mut self) -> Vec<Out> {
-        let packet: Packet = std::mem::take(&mut self.keys).into_iter().map(|k| (EV_KEY, k, 0)).collect();
+        self.meta.clear();
+        let ctrl = std::mem::take(&mut self.commanded).into_iter().next().map(|_| KEY_LEFTCTRL).filter(|c| !self.keys.contains(c));
+        let packet: Packet = std::mem::take(&mut self.keys).into_iter().chain(ctrl).map(|k| (EV_KEY, k, 0)).collect();
         if packet.is_empty() { Vec::new() } else { vec![Out::Keyboard(packet)] }
     }
 
@@ -529,6 +564,23 @@ mod tests {
 
     fn abs(x: i32, y: i32) -> Packet {
         vec![(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)]
+    }
+
+    #[test]
+    fn cmd_shortcuts_are_ctrl_on_macos_and_cmd_stays_the_hosts() {
+        let (mut input, now) = (Input::new(MOVE_EVERY), Instant::now());
+        assert!(input.event(&key(0xE05B, true), now, ONE, DISPLAY).is_empty(), "Cmd itself is the host's");
+        let v = input.event(&key(0x2F, true), now, ONE, DISPLAY);
+        let up = input.event(&key(0x2F, false), now, ONE, DISPLAY);
+        assert!(input.event(&key(0xE05B, false), now, ONE, DISPLAY).is_empty());
+        if COMMAND_IS_CTRL {
+            assert_eq!(v, [Out::Keyboard(vec![(EV_KEY, KEY_LEFTCTRL, 1), (EV_KEY, 47, 1)])]);
+            assert_eq!(up, [Out::Keyboard(vec![(EV_KEY, 47, 0), (EV_KEY, KEY_LEFTCTRL, 0)])]);
+        } else {
+            assert_eq!(v, [Out::Keyboard(vec![(EV_KEY, 47, 1)])]);
+        }
+        // Without Cmd, V is V.
+        assert_eq!(input.event(&key(0x2F, true), now, ONE, DISPLAY), [Out::Keyboard(vec![(EV_KEY, 47, 1)])]);
     }
 
     #[test]

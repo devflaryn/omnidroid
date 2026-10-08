@@ -1,7 +1,7 @@
 # Omnidroid Architecture
 
-Omnidroid runs the arm64-v8a Android Roblox engine (`libroblox.so`) as a desktop process: no VM,
-no ART, no dex interpreter. Guest code runs through dynarmic; its imports are host Rust. Why:
+Omnidroid runs an arm64-v8a Android app (the APK under test) as a desktop process: no VM, no ART,
+no dex interpreter. Guest code runs through dynarmic; its imports are host Rust. Why:
 `DECISIONS.md`. What has run where: `STATUS.md`.
 
 ## 1. The central idea
@@ -31,10 +31,10 @@ written once, with no backend and no fake `Unsupported` arm (D22, D23).
 | `omni-texture` | ETC1 to RGBA8 (D27), `no_std`; used by `omni-gfx`'s renderer, not the guest path |
 | `omni-linux` | the Linux kernel personality (D39): the arm64 syscall ABI under the real AOSP `linker64` and bionic, a manifest-backed AOSP 15 sysroot (`tools/make_sysroot.py`), `exec`, `mm`, `fd`, `vfs`; runner `omni-linux-run` |
 | `omni-core`, `omni-cli` | empty placeholders |
-| `omnidroid` | launcher binary: `play`, `login`, `which` |
+| `omnidroid` | launcher binary: `play`, `aosp`, `which`, `plugins` |
 
 **The runtime is assembled in the M5 gate test**, `crates/omni-android/tests/gameactivity.rs`;
-`omnidroid play` picks the APK and account and runs it with `cargo test --release`. No library
+`omnidroid play` picks the APK and runs it with `cargo test --release`. No library
 crate does this yet.
 
 ## 3. APK handling and the extraction cache
@@ -45,32 +45,34 @@ ABIs are ignored by design.
 
 Libraries are DEFLATED and unaligned in the zip, so each is extracted once to
 `<cache>/libs/<sha256>/<name>.so` (content-addressed, read-only) and mapped file-backed
-`ReadExecute`: `libroblox.so`'s ~100 MiB of text is shared by all instances; relro, `.data` and
-eager `.bss` (~16.4 MiB) are private (D11, D14). Assets are read from the APK on demand.
+`ReadExecute`: a library's text is shared by all instances; relro, `.data` and eager `.bss` are
+private (D11, D14). Assets are read from the APK on demand.
 
 ## 4. ELF loading
 
-A bionic-compatible loader (D3, D9), built on these facts of 2.738.1397's `libroblox.so`:
+A bionic-compatible loader (D3, D9). The loader handles what the APKs under test use; the
+features below are the ones it implements, and any that a library needs but the loader lacks
+refuse by name rather than run wrong:
 
-1. Relocations are APS2: 568,272 (568,194 RELATIVE, 56 GLOB_DAT, 22 ABS64) plus 534 JUMP_SLOT
-   via `DT_JMPREL`, 568,806 in all. No `DT_RELA`, no `DT_RELR`.
+1. Relocations: `DT_RELA` with `RELATIVE`, `GLOB_DAT`, `ABS64` and `JUMP_SLOT`, and the packed
+   `APS2` form. `DT_RELR` is not implemented.
 2. Relocation runs in 64 KiB windows: copy-on-write is charged when a view turns writable (D11).
-3. `p_align` is 16 KiB; a library aligned below the host page is refused (`AlignBelowPageSize`).
-4. `DT_GNU_HASH` only; 565 imports, `DT_VERNEED` names a provider for 407.
-5. RELRO (5,205,568 bytes, holding `DT_PLTGOT`; `DF_BIND_NOW`) is sealed after all relocation,
-   its end rounded up as bionic does.
-6. All 3,594 `init_array` entries run in order, read from relocated memory.
-7. `dl_iterate_phdr` is faithful: the statically linked C++ unwinder finds 11.5 MB of `.eh_frame`
-   through it (`bionic/dl.rs`).
-8. Absent from the APK, so not implemented: ELF TLS, ifuncs, BTI/PAC/MTE, `DT_TEXTREL`.
+3. `p_align` below the host page size is refused (`AlignBelowPageSize`).
+4. `DT_GNU_HASH` symbol lookup; `DT_VERNEED` names the provider of each versioned import.
+5. RELRO (holding `DT_PLTGOT`; `DF_BIND_NOW`) is sealed after all relocation, its end rounded up
+   as bionic does.
+6. All `init_array` entries run in order, read from relocated memory.
+7. `dl_iterate_phdr` is faithful, so a statically linked C++ unwinder finds `.eh_frame` through it
+   (`bionic/dl.rs`).
+8. Not implemented: ELF TLS, ifuncs, BTI/PAC/MTE, `DT_TEXTREL`.
 9. `dlopen` answers for the libraries this layer provides and loads no other file.
 
 ## 5. The Android compatibility layer
 
-**The import list is the specification.** Each of `libroblox.so`'s 565 imports
-(`research/apk-undefined-symbols.txt`) gets a 16-byte slot in a reserved thunk region, bound by
-the loader through a `SymbolProvider`; an unimplemented slot refuses by name. The engine imports
-no allocator (its mimalloc sits on guest `mmap`), so the heap seam is the demand pager.
+**The import list is the specification.** Each import of the APK's libraries gets a 16-byte slot
+in a reserved thunk region, bound by the loader through a `SymbolProvider`; an unimplemented slot
+refuses by name. An app that allocates through guest `mmap` (rather than an imported `malloc`)
+meets the heap seam at the demand pager.
 
 **The crossing** (D17, D18): a branch to a slot is served inside the run loop (~27-31 ns).
 Handlers that call guest code (thread entry, `atexit`, `qsort`, `dl_iterate_phdr`) exit to Rust
@@ -88,9 +90,9 @@ routed to the matching import (`sysroute`). `AT_HWCAP` declines LSE (D26). No si
 `jni/classes.rs`. A missed lookup returns null with a pending exception; an untranscribed call
 refuses.
 
-**The Java side is the initiator**: the engine waits for flags, settings, directories and
-`InitParams`, so `jni::script` drives that sequence (`jni-surface.md` §8), then GameActivity
-(AGDK, statically linked). `jni` also holds input, cursor, the app's cookie store, settings and
+**The Java side is the initiator**: a GameActivity-based app waits for its start-up calls (flags,
+settings, directories, init parameters), so `jni::script` drives that sequence
+(`jni-surface.md` §8), then GameActivity (AGDK, statically linked). `jni` also holds input, cursor, the app's cookie store, settings and
 the WebView bridge. **NDK** (`ndk`, D29): `ALooper`, `AAssetManager`, `AConfiguration`,
 `ANativeWindow`. **Audio**: `aaudio` implements `libaaudio.so` for FMOD on the host output.
 
@@ -112,9 +114,9 @@ slice with `ExitReason::UnsupportedInstruction` (`SVC #0` is served there as a s
 ## 7. Instance isolation
 
 **One OS process per instance**, with its own window, input, guest space and storage; only the
-read-only extraction cache is shared. Guest paths (`/data/data/com.roblox.client/...`) resolve
-only inside one host data directory (per account under `play --cookie`); an escaping path is
-refused (D23).
+read-only extraction cache is shared. Guest paths (`/data/data/<the app's package>/...`) resolve
+only inside one host data directory (per test session, or per account where a plugin names one);
+an escaping path is refused (D23).
 
 Memory (D10): a 16 GiB guest reservation, commit in 64 KiB granules on touch, decommit to
 reclaim (`MEM_DECOMMIT`; a fresh `MAP_FIXED` mapping on Linux and macOS). The device's RAM, which
@@ -126,8 +128,8 @@ is also the commit ceiling, is 60% of host RAM in whole GiB, at most 8 GiB, or
 **Vulkan is forwarded** (D8). The engine `dlopen`s `libvulkan.so` and resolves everything via
 `vkGetInstanceProcAddr`; `omni_android::vulkan` forwards each call to `omni-gfx`'s
 `GfxVulkanHost`, guest structs read in place, guest memory imported as host-visible memory.
-`VK_KHR_android_surface` becomes win32, xlib or metal (MoltenVK). The engine refuses a device it
-thinks emulated, so a CPU rasterizer (lavapipe) sends it to GLES.
+`VK_KHR_android_surface` becomes win32, xlib or metal (MoltenVK). An app that refuses a device it
+thinks emulated gets no Vulkan from a CPU rasterizer (lavapipe), so it falls back to GLES.
 
 **EGL and GLES are forwarded** (`omni_android::gles`): ES 2.0-3.2 and EGL, signatures generated
 from the Khronos registries (`tools/gen_gles_signatures.py`). The only host row is X11 (Mesa or
@@ -140,14 +142,14 @@ query with `VK_ERROR_SURFACE_LOST_KHR`, so the engine skips drawing. `OMNI_FPS_C
 
 ## 9. Testing strategy
 
-Progress is a ladder of milestones, each passed against the real `libroblox.so`: M0 APK parsed
-and libraries cached; M1 ELF loaded, 568,806 relocations applied; M2 a real function returns known
-outputs; M3 all 3,594 initializers, asserted by `(index, address)` sequence; M4 `JNI_OnLoad`
-returns `0x00010006`; M5 `initializeNativeCode` returns and the game thread runs; M6 the engine
-creates its Vulkan device through the forwarding layer; M7 first frame; M8 interactive.
+Progress is a ladder of milestones, each passed against a real APK: M0 APK parsed and libraries
+cached; M1 ELF loaded and relocated; M2 a real function returns known outputs; M3 all initializers
+run, asserted by `(index, address)` sequence; M4 `JNI_OnLoad` returns the JNI version; M5
+`initializeNativeCode` returns and the app's main thread runs; M6 the app creates its Vulkan device
+through the forwarding layer; M7 first frame; M8 interactive.
 
-The gate runs the whole sequence and, in a session, the game. Tests use golden data from the
-real binary, assert measured memory, fail when the APK is absent, and are checked by mutation
+The gate runs the whole sequence and, in a session, the app. Tests use golden data from a real
+binary, assert measured memory, fail when the APK is absent, and are checked by mutation
 (`tools/mutate.py`). Rules: `VERIFICATION.md`.
 
 ## 10. Known risks
@@ -155,10 +157,9 @@ real binary, assert measured memory, fail when the APK is absent, and are checke
 | Risk | Why it matters | Mitigation |
 |---|---|---|
 | No isolation inside a process | guest code can corrupt the host (D4 amendment 1) | one process per instance |
-| Untranscribed Java methods | a call to one refuses and kills that thread; the game can freeze | `research/jni-audit-2.739.md`; transcribe from the dex |
-| dynarmic arm64 backend | stale-code transfer and freezes on the Mac (m7, m9, m11) | patch 0023 in progress |
-| Memory per instance | ~2.5 GiB against a 0.8-0.9 GiB target for many instances | HANDOFF's plan; `OMNI_MEM_REPORT` |
+| Untranscribed Java methods | a call to one refuses and kills that thread; the app can freeze | transcribe from the dex |
+| dynarmic arm64 backend | stale-code transfer and freezes on the Mac | patch 0023 in progress |
+| Memory per instance | ~2.5 GiB per instance on the measured app | `OMNI_MEM_REPORT` |
 | Untested targets | Linux ARM64 and macOS x86-64 never built or run | no claims until run |
 
-Resolved: the CPU backend (D5), the JNI surface size (D7, D28), APS2 decoding (M1), and the
-modified test APK: the repository now holds the stock `Roblox-2.738.1397.apk` (D6).
+Resolved: the CPU backend (D5), the JNI surface size (D7, D28), and APS2 decoding (M1).

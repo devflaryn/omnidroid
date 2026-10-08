@@ -17,7 +17,7 @@
 //!   launcher Activity come from the APK's own manifest.
 //!
 //! Used by the MCP server (`omni-mcp`'s `start_instance`/`install_apk` without an account) and by
-//! the `omnidroid` launcher (`omnidroid aosp --cookie --place` on a warm device that is up).
+//! the `omnidroid` launcher (`omnidroid aosp` on a warm device that is up; `--cookie --place` with the `roblox` plugin).
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

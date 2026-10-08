@@ -56,7 +56,7 @@ fn a_presented_frame_is_counted_and_screenshotted() {
     assert!(!fb.wait_frame(2, Duration::from_millis(10)), "no second frame");
     let (w, h, px) = decode(&fb.png());
     assert_eq!((w, h), (5, 3));
-    assert_eq!(px, frame);
+    assert_eq!(*px, frame);
 }
 
 /// A frame of another size replaces the held one whole: the size, the pixels and the screenshot
@@ -70,7 +70,7 @@ fn a_frame_of_a_new_size_replaces_the_old_one() {
     assert_eq!(fb.size(), (4, 2));
     let (n, w, h, px) = fb.frame();
     assert_eq!((n, w, h), (2, 4, 2));
-    assert_eq!(px, frame);
+    assert_eq!(*px, frame);
     assert_eq!(decode(&fb.png()), (4, 2, frame.clone()));
     // A present at the current size keeps it.
     fb.present_rgba(&frame, 4);

@@ -38,6 +38,11 @@
 //! * [`webview`] — a top-level window with a real browser in it (WebView2 on Windows, WKWebView on
 //!   macOS; none on Linux), on a thread the seam owns, for the pages the guest opens in an
 //!   Android `WebView`, first the sign-in challenge.
+//! * [`clipboard`] — the host's clipboard, written with plain text or an image and nothing else
+//!   (no file lists, no rich types), for the guest's copies shared with the host.
+//! * [`keyboard`] — the host's current keyboard layout, read as what each physical key types under
+//!   Shift, Caps Lock and Option/AltGr (macOS and Windows; none on Linux), for the guest keyboard's
+//!   own key character map.
 //! * [`audio`], [`sampler`] and (behind a feature) `hypervisor` — the audio output device, the
 //!   sampling profiler, and Hypervisor.framework for the native backend on Apple silicon.
 //!
@@ -96,11 +101,13 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod audio;
+pub mod clipboard;
 pub mod clock;
 pub mod fault;
 pub mod fs;
 #[cfg(feature = "hypervisor")]
 pub mod hypervisor;
+pub mod keyboard;
 pub mod log;
 pub mod net;
 pub mod process;

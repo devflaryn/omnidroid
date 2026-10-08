@@ -321,7 +321,7 @@ impl Window {
         true
     }
 
-    /// The image goes to the AppKit thread (a copy: the proxy's caller keeps its buffer), where it
+    /// The image goes to the AppKit thread (lent: `on_main` waits for it), where it
     /// becomes the contents of a layer over the view: `appkit::present_rgba`.
     pub(super) fn present_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
         self.presenter().present_rgba(rgba, width, height)
@@ -353,8 +353,10 @@ pub(super) struct Presenter {
 
 impl Presenter {
     pub(super) fn present_rgba(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
-        let (id, pixels) = (self.id, rgba.to_vec());
-        on_main(move |_| appkit::present_rgba(id, pixels, width, height))
+        // `on_main` waits for the main thread to run it, so the frame is lent, not copied: its one
+        // copy is `CFDataCreate`'s.
+        let id = self.id;
+        on_main(move |_| appkit::present_rgba(id, rgba, width, height))
     }
 
     pub(super) fn client_size(&self) -> Option<(u32, u32)> {

@@ -210,13 +210,26 @@ pub const HARDWARE_LEFT_OUT: &[&str] = &[
 /// (`tests/d8_app_only.rs` ran it as SystemUI disabled at a second boot). The home is Settings'
 /// `FallbackHome`, which the system starts when no launcher is there.
 ///
-/// `OMNI_KIOSK_IME=0` also leaves out the soft keyboard: the device's keyboard is the host's, which
-/// a text field takes without an input method, and LatinIME is a host process of its own (~120 MiB,
-/// run 2026-09-29) that every key visits first (`ImeInputStage`). Not the default: in PS99 without
-/// it the first held key took 347-425 ms and a few more keys ended with the app force-finished
-/// (run 2026-09-29, "runc"), cause not yet pinned.
+/// The soft keyboard ([`KIOSK_IME`]) is left out too, by default -- of the lean devices as well
+/// (see [`apps_left_out`]); `OMNI_KIOSK_IME=1` keeps it.
 pub const KIOSK_LEAVES_OUT: &[&str] = &["/system_ext/priv-app/SystemUI", "/system_ext/priv-app/Launcher3QuickStep"];
-/// The soft keyboard, left out of a kiosk device with `OMNI_KIOSK_IME=0` (see [`KIOSK_LEAVES_OUT`]).
+/// **The soft keyboard (LatinIME), left out of the `lean`, `lean-hw` and `kiosk` devices by
+/// default**; `OMNI_KIOSK_IME=1` keeps it (and `full` is the image as it is).
+///
+/// The device's keyboard is the host's, which a text field takes without an input method, and the
+/// project owner wants no soft keyboard to appear anywhere (2026-10-07). Two more reasons: LatinIME
+/// is a host process of its own (~120 MiB, run 2026-09-29) that every key visits first
+/// (`ImeInputStage`); and **an IME decides the keyboard's layout** -- Android 14+'s
+/// KeyboardLayoutManager lays a physical-keyboard layout over the device's own map, chosen from the
+/// current IME subtype's locale (LatinIME's Turkish subtype on a `tr-TR` device: Turkish Q, whatever
+/// the host types with). With no IME there is no subtype and no overlay, and the device keyboard's
+/// own map -- made from the host's layout (`crate::keymap`) -- is the one used.
+///
+/// History, kept: this was `OMNI_KIOSK_IME=0`'s opt-in, not the default, because in PS99 without the
+/// IME the first held key took 347-425 ms and a few more keys ended with the app force-finished
+/// (run 2026-09-29, "runc"), cause not pinned. It is the default now at the owner's request; that
+/// run's symptom is to be re-checked on the run this change was made for (2026-10-07), not assumed
+/// gone.
 pub const KIOSK_IME: &str = "/product/app/LatinIME";
 
 /// **Services this device does not run**, with the properties each sets once it is done -- which
@@ -262,7 +275,8 @@ pub fn global_environment() -> Vec<(String, String)> {
 
 /// What `OMNI_DEVICE_APPS` makes of the image: `full` (the image as it is), `lean` (the default:
 /// [`LEAVES_OUT`] and [`HARDWARE_LEFT_OUT`] left out), `lean-hw` (only [`LEAVES_OUT`]: the hardware
-/// kept) or `kiosk` (lean, and [`KIOSK_LEAVES_OUT`]). Read by each host process of an
+/// kept) or `kiosk` (lean, and [`KIOSK_LEAVES_OUT`]); each but `full` without the soft keyboard
+/// unless `OMNI_KIOSK_IME=1` ([`KIOSK_IME`]). Read by each host process of an
 /// instance alike (the variable is inherited), so they all see one image.
 ///
 /// The device's own boot settings can be left out too, to measure what each is worth:
@@ -291,15 +305,15 @@ pub fn left_out() -> Vec<&'static str> {
     out
 }
 
+/// What the device mode leaves out of the image; the soft keyboard with it unless `OMNI_KIOSK_IME=1`
+/// (see [`KIOSK_IME`]).
 fn apps_left_out() -> Vec<&'static str> {
+    let ime = (std::env::var("OMNI_KIOSK_IME").as_deref() != Ok("1")).then_some(KIOSK_IME);
     match std::env::var("OMNI_DEVICE_APPS").as_deref() {
         Ok("full") => Vec::new(),
-        Ok("kiosk") => {
-            let ime = (std::env::var("OMNI_KIOSK_IME").as_deref() == Ok("0")).then_some(KIOSK_IME);
-            LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).copied().chain(ime).collect()
-        }
-        Ok("lean-hw") => LEAVES_OUT.to_vec(),
-        _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).copied().collect(),
+        Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).copied().chain(ime).collect(),
+        Ok("lean-hw") => LEAVES_OUT.iter().copied().chain(ime).collect(),
+        _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).copied().chain(ime).collect(),
     }
 }
 

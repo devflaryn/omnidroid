@@ -1,6 +1,6 @@
 """`omnidroid login`: sign in to Roblox in a real Chromium window and keep the session.
 
-Run by the launcher (crates/omnidroid) with the Python environment it prepares; not meant to be
+Run by the `roblox` plugin's `login` command (plugins/roblox) with the Python environment it prepares; not meant to be
 run by hand. Opens Roblox's login page in a fresh browser profile (nothing from the person's own
 browser), and either lets the person sign in or -- given a username and a password -- fills the
 form and submits it. Whatever the site then asks (a captcha, a 2-step code) stays in the window

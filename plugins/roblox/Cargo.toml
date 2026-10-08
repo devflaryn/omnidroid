@@ -1,0 +1,16 @@
+[package]
+name = "omnidroid-plugin-roblox"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "The `roblox` omnidroid plugin's hook and `login` command: --cookie, --place, login."
+
+# A plugin, not part of the engine's workspace: built on its own (its own `target/`) the first time
+# omnidroid runs its hook, and with no dependencies, so that build is a second or two.
+[workspace]
+
+[dependencies]
+
+[[bin]]
+name = "omnidroid-plugin-roblox"
+path = "src/main.rs"

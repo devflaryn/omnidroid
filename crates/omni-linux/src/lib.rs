@@ -6,6 +6,8 @@
 //! not implement answers `-ENOSYS` and is recorded by name ([`syscall::Refusals`]).
 pub mod apex;
 pub mod binder;
+pub mod browser;
+pub mod clipboard;
 pub mod code_trim;
 pub mod lever;
 pub mod boot;
@@ -27,6 +29,7 @@ pub mod hal;
 pub mod hostnet;
 pub mod init;
 pub mod inject;
+pub mod keymap;
 pub mod input_channel;
 pub mod locks;
 pub mod manifest;

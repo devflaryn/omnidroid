@@ -235,8 +235,27 @@ fn main() -> ExitCode {
                         // OMNI_WINDOW_INPUT=0: the window shows, and Android has no keyboard or mouse.
                         input: std::env::var("OMNI_WINDOW_INPUT").as_deref() != Ok("0"),
                     };
+                    // The window's keyboard types what the host's layout types (`omni_linux::keymap`):
+                    // its key layout and character map written to the data partition here, before
+                    // the program runs and so before EventHub opens the device. OMNI_HOST_KEYMAP=0:
+                    // Android's own (Generic, US).
+                    if options.input {
+                        omni_linux::keymap::install(&instance, p.vfs.sysroot());
+                    }
                     if let Err(e) = omni_linux::display_window::spawn(std::sync::Arc::clone(&fb), std::sync::Arc::clone(&composer), options) {
                         eprintln!("[window] {e}");
+                    }
+                    // What the guest copies, on the host's clipboard (text and images only; on by
+                    // default, OMNI_CLIPBOARD=0 turns it off).
+                    if omni_linux::clipboard::enabled() {
+                        omni_linux::clipboard::start(std::sync::Arc::clone(&broker));
+                    } else {
+                        eprintln!("[clipboard] off (OMNI_CLIPBOARD=0): the device's clipboard is its own");
+                    }
+                    // A web page an app hands to the browser opens in a host window of its own,
+                    // beside the device's (OMNI_BROWSER_WINDOW=0: the device's browser).
+                    if omni_linux::browser::enabled() {
+                        omni_linux::browser::start(std::sync::Arc::clone(&broker));
                     }
                 }
                 // OMNI_DISPLAYS=<n>: that many displays, each with a window of its own, so that an

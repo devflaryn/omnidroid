@@ -227,6 +227,8 @@ impl Server {
     fn launcher_rooted(&self, dir: &Path, apk: &Path, cookie: Option<&str>, place: Option<&str>, gpu: &str, size: Option<&str>, minutes: Option<u64>, root: &RootRequest) -> std::process::Command {
         let mut cmd = std::process::Command::new(&self.config.omnidroid_bin);
         cmd.arg("aosp").arg("--apk").arg(apk).arg("--gpu").arg(gpu).arg("--instance").arg(dir);
+        // --cookie and --place are the `roblox` plugin's (plugins/roblox): the launcher refuses
+        // them, and says how to install it, where that plugin is not installed.
         if let Some(c) = cookie {
             cmd.arg("--cookie").arg(c);
         }

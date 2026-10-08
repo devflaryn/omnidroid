@@ -1033,7 +1033,7 @@ const RGBX: u32 = 5;
 /// new contents over a quarter of a second otherwise.
 ///
 /// A window already closed (a `Presenter` outliving it) takes nothing and answers `Ok`.
-pub(super) fn present_rgba(id: u64, rgba: Vec<u8>, width: u32, height: u32) -> WindowResult<()> {
+pub(super) fn present_rgba(id: u64, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
     let failed = |api: &'static str, detail: &str| WindowError::AppKit { operation: "present_rgba", api, detail: detail.to_owned() };
     with_live(id, |native| {
         let Some(backing) = native.view.layer() else {

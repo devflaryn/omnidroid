@@ -18,7 +18,8 @@ const KEPT: &[&[u8]] = &[
     b"/system/priv-app/NetworkStack/NetworkStack.apk",
     b"/product/app/webview/webview.apk",
 ];
-/// The soft keyboard: the lean device's, not the kiosk's (its keyboard is the host's).
+/// The soft keyboard: in the full image only, unless `OMNI_KIOSK_IME=1` (the device's keyboard is
+/// the host's, and an IME would choose its layout: `device::KIOSK_IME`).
 const IME: &[u8] = b"/product/app/LatinIME/LatinIME.apk";
 
 fn open(mode: Option<&str>) -> std::sync::Arc<Sysroot> {
@@ -42,7 +43,8 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
     assert!(!lean.has(TELESERVICE) && !lean.has(b"/system/priv-app/TeleService"), "no TeleService");
     assert!(!lean.children(b"/system/priv-app").iter().any(|n| n == b"TeleService"), "not listed either");
     assert!(!lean.has(BLUETOOTH_FEATURE), "no Bluetooth feature");
-    assert!(lean.has(SYSTEMUI) && lean.has(LAUNCHER) && lean.has(IME), "SystemUI, the launcher and the IME kept");
+    assert!(lean.has(SYSTEMUI) && lean.has(LAUNCHER), "SystemUI and the launcher kept");
+    assert!(full.has(IME) && !lean.has(IME), "the full image has the IME, the lean device not");
     for p in KEPT {
         assert!(lean.has(p), "kept: {}", String::from_utf8_lossy(p));
     }
@@ -51,9 +53,9 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
 
     let kiosk = open(Some("kiosk"));
     assert!(!kiosk.has(SYSTEMUI) && !kiosk.has(LAUNCHER), "a kiosk has no SystemUI or launcher");
-    assert!(kiosk.has(IME), "a kiosk keeps the IME unless OMNI_KIOSK_IME=0");
-    std::env::set_var("OMNI_KIOSK_IME", "0");
-    assert!(!open(Some("kiosk")).has(IME), "OMNI_KIOSK_IME=0: no IME");
+    assert!(!kiosk.has(IME), "a kiosk has no IME unless OMNI_KIOSK_IME=1");
+    std::env::set_var("OMNI_KIOSK_IME", "1");
+    assert!(open(Some("kiosk")).has(IME) && open(None).has(IME), "OMNI_KIOSK_IME=1: the IME kept");
     std::env::remove_var("OMNI_KIOSK_IME");
     assert!(!kiosk.has(TELESERVICE));
     for p in KEPT {
@@ -74,6 +76,6 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
         }
     }
     let with_hardware = open(Some("lean-hw"));
-    assert!(with_hardware.has(CAMERA_HAL) && with_hardware.has(FINGERPRINT_HAL) && !with_hardware.has(TELESERVICE));
+    assert!(with_hardware.has(CAMERA_HAL) && with_hardware.has(FINGERPRINT_HAL) && !with_hardware.has(TELESERVICE) && !with_hardware.has(IME));
     std::env::remove_var("OMNI_DEVICE_APPS");
 }

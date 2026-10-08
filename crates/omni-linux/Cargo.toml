@@ -28,6 +28,10 @@ ash = { version = "0.38", default-features = false, features = ["loaded"] }
 libloading = "0.8"
 # Zip-form root modules (`crate::root::module`): pure file/compute, no unsafe.
 omni-apk = { workspace = true }
+# The guest's copied images on the host's clipboard (`crate::clipboard`): decoded by a memory-safe
+# decoder, within size limits, and encoded again as a fresh PNG -- the guest's file never reaches the
+# host. Only the formats an Android clip carries an image in; nothing else is decoded.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [[bin]]
 name = "omni-linux-run"

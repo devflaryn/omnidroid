@@ -4,11 +4,8 @@
 //! cargo run --release -p omnidroid -- play                      # the newest APK in the repository root
 //! cargo run --release -p omnidroid -- play --apk Roblox-2.738.1397.apk
 //! cargo run --release -p omnidroid -- play --minutes 90 --fresh --phone
-//! cargo run --release -p omnidroid -- play --place 8737899170     # sign-in kept, then join the place
-//! cargo run --release -p omnidroid -- play --cookie farm4.txt --place 8737899170  # sign in as that account
-//! cargo run --release -p omnidroid -- login                     # sign in in Chromium, keep the cookie
-//! cargo run --release -p omnidroid -- login <username> <password>
 //! cargo run --release -p omnidroid -- which [--apk <path>]      # say which APK would run, and exit
+//! cargo run --release -p omnidroid -- plugins add --link plugins/roblox   # this user's plugins
 //! ```
 //!
 //! **The APK is chosen, not built in**: `--apk`, else `OMNI_APK`, else the newest APK (by
@@ -26,21 +23,11 @@
 //!   Ctrl+C, a crash -- is judged a crash by the engine at the next launch; after one, run once
 //!   with `--fresh`.
 //! * **Keyboard and mouse are this computer's** unless `--phone`, which makes the mouse a finger.
-//! * **`--place <id>` joins that place** once the app's own saved sign-in has reached Home
-//!   (`OMNI_JOIN_PLACE`, `--join-delay` seconds in, default 20): the gate calls
-//!   `nativeAppBridgeV2StartGameWithParam` as the app's Play button does. It needs a signed-in data
-//!   directory -- with `--fresh` there is no session to join with -- or `--cookie`.
-//! * **`--cookie <file or value>` signs in as that account**: its `.ROBLOSECURITY` value, as a
-//!   file (the bare value, `.ROBLOSECURITY=<value>`, or a Netscape `cookies.txt`) or the value
-//!   itself. It is put in the app's own cookie store before start (`OMNI_COOKIE`), where a kept
-//!   sign-in lives, and never printed. Each account keeps its own storage --
-//!   `<app-data>/../accounts/<file name>` unless `--data-dir` -- so one account's sign-in never
-//!   replaces another's, and the default directory's is left alone. A name that is not a file is
-//!   looked up in the cookies folder (`<app-data>/../cookies/<name>.txt`, where `login` keeps them).
-//!   **A cookie Roblox has since replaced is kept**: Roblox rotates the session cookie while the
-//!   app runs, and the store keeps the new one. The file's cookie is planted only when it is not the
-//!   one last planted in that account's storage (`omnidroid-cookie-planted` there), so an unchanged
-//!   file never puts a dead cookie back over a live one.
+//! * **What one game needs is a plugin, not the launcher's** (`plugin.rs`): options of its own,
+//!   variables, default arguments, hooks around a session and commands, declared in a plugin's
+//!   `omnidroid-plugin.json` and installed per user (`omnidroid plugins`). Signing in to Roblox
+//!   with a cookie (`--cookie`), joining a place (`--place`, `--join-delay`) and `login` are the
+//!   `roblox` plugin's (`plugins/roblox`), for whoever installs it.
 //! * **`--no-window`: no window at all** (`OMNI_NO_WINDOW=1`, and headless): for a host with no
 //!   display. The engine's surface is an off-screen pbuffer on an EGL display that needs no window
 //!   system (a GPU's EGL device, or Mesa's surfaceless platform -- `LIBGL_ALWAYS_SOFTWARE=1` for the
@@ -53,19 +40,11 @@
 //!   `screenshot <path>` (that frame, rendered for real and saved as a PNG -- a relative path is
 //!   this launcher's directory's) and `status`. Each is answered on stderr: `CONTROL: headless on`,
 //!   `SCREENSHOT: saved <path> <w>x<h>`.
-//! * **`login` signs in in a real browser and keeps the session** (`tools/login.py`, Selenium with
-//!   Chromium in a fresh profile): with no arguments the person signs in; with a username and a
-//!   password the form is filled and submitted; with a username alone, the password `login` kept
-//!   for it is used. Whatever the page asks (a captcha, a 2-step code) is answered in the window.
-//!   Once the page reaches /home, `<cookies>/<name>.txt` (the cookie) and `<name>.login.json` (the
-//!   username and password, in plain text, readable by this user only) are written. The Python
-//!   environment it runs in is made the first time (`<app-data>/../login-venv`), Selenium included,
-//!   and the browser is omnidroid's own Chromium (Chrome for Testing), which Selenium Manager fetches
-//!   with its driver into `<app-data>/../chromium` -- not an installed application.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod plugin;
 mod warm;
 
 /// The gate test whose run is a session: `initialize_native_code_returns_a_native_code_and_the_game_thread_starts`.
@@ -74,24 +53,19 @@ const SESSION_TEST: &str = "initialize_native_code_returns_a_native_code_and_the
 const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 
 const USAGE: &str = "\
-usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [--join-delay <s>]
-                       [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
+usage: omnidroid [play] [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
                        [--headless] [--no-window] [--control <file>]
-       omnidroid aosp [--apk <path>] [--cookie <file|name>] [--place <id>] [--minutes <n>]
+       omnidroid aosp [--apk <path>] [--minutes <n>]
                       [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
                       [--fresh-device] [--standby] [--instance <dir>]
-                      [--root] [--module <id,id,...>] [--su all|<pkg,pkg>]
+                      [--root] [--module <id,id,...>] [--su all|<pkg,pkg>] [--no-clipboard]
        omnidroid modules [list | add <zip>]
        omnidroid aosp --warm [--instance <dir>] [--minutes <n>] [--size <w>x<h>] [--gpu vulkan|gl|auto]
        omnidroid which [--apk <path>]
-       omnidroid login [<username> [<password>]] [--dir <dir>]
+       omnidroid plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name>
+                         | new <name> [<dir>]]
 
   --apk <path>      the APK to run (else OMNI_APK, else the newest *.apk in the repository root)
-  --cookie <c>      sign in as this account: a file holding its .ROBLOSECURITY cookie, a name
-                    `login` saved (<app-data>/../cookies/<name>.txt), or the value itself;
-                    storage is kept per account (<app-data>/../accounts/<name>)
-  --place <id>      join this place once the sign-in reaches Home (OMNI_JOIN_PLACE)
-  --join-delay <s>  seconds after start before joining (default 20; OMNI_JOIN_DELAY)
   --minutes <n>     end the session after n minutes (default: when the window is closed)
   --fresh           a fresh install; the kept storage is left as it is
   --phone           a touch screen: the mouse is a finger, and there is no keyboard
@@ -105,23 +79,28 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
 
   aosp              run the APK on the real-AOSP path instead: real Android boots, the APK is
                     installed with `pm install` and started from its launcher, in a live window
-                    (`omni-linux`'s r_roblox session). --cookie is a file or a saved name, planted
-                    in the app's own cookie store; --place opens the place's deep link once signed
-                    in; --minutes bounds the session (default 30); --size is the display's size at
-                    boot; --gpu is the device's GPU backend (OMNI_GPU; auto: Vulkan on a host
+                    (`omni-linux`'s r_roblox session). --minutes bounds the session (default 30);
+                    --size is the display's size at boot; --gpu is the device's GPU backend
+                    (OMNI_GPU; auto: Vulkan on a host
                     with a Vulkan GPU, else the host's GLES); --with-systemui keeps SystemUI and
                     the launcher (default: a single-app device). The first session for an APK and
                     account saves its device once signed in (<session dir>/omni-golden); later
                     sessions boot a copy of it and open the place at once -- no install, no
-                    first boot, no cookie planted. --fresh-device makes a new device (the saved
-                    one is kept); --standby keeps the device waiting once launched (and in the
+                    first boot. --fresh-device makes a new device (the saved one is kept); --standby keeps the device waiting once launched (and in the
                     place): a place id written to <instance>/data/local/tmp/join-place is joined,
                     and <instance>/data/local/tmp/stop ends the session; --instance names the
                     instance's directory. With a warm device up (below) the session runs on it
-                    instead -- no boot: the APK installed, the cookie put in the app's store
-                    before its first start, the place's link sent once the app's main Activity
-                    starts; the app is stopped when the session ends, the device stays warm
-                    (not with --instance, --standby or --fresh-device; OMNI_AOSP_WARM=0: never)
+                    instead -- no boot: the APK installed, a cookie a plugin names (OMNI_R_COOKIE)
+                    put in the app's store before its first start, a place it names (OMNI_R_PLACE)
+                    sent once the app's main Activity starts; the app is stopped when the
+                    session ends, the device stays warm
+                    (not with --instance, --standby or --fresh-device; OMNI_AOSP_WARM=0: never).
+                    What is copied in the device (text, an image) is on the host's clipboard too,
+                    to paste in any host application: only as plain text or a fresh PNG of the
+                    image's pixels -- never a file, a script or a link to one -- with control and
+                    invisible characters removed and no trailing Enter, and only while the
+                    device's window is in use. --no-clipboard keeps the device's clipboard its own
+                    (OMNI_CLIPBOARD=0)
   aosp --root      a rooted device (Magisk-compatible: su, modules over /system, resetprop);
                     --module installs the named modules (implies --root; built-in ids emu-hide,
                     shamiko, zygisk-frida need no catalog entry), --denylist a,b hides root from those
@@ -139,15 +118,16 @@ usage: omnidroid [play] [--apk <path>] [--cookie <file|value>] [--place <id>] [-
                     once (<session dir>/omni-golden/base-...), booted from a copy after; ready when
                     <instance>/data/local/tmp/warm-ready is there. --minutes defaults to 720
 
-  login             sign in to Roblox in Chromium and keep the cookie, username and password in
-                    <dir> (default <app-data>/../cookies): no arguments -- you sign in; a username
-                    and password -- they are entered for you; a username alone -- its saved password";
+  plugins           this user's plugins (<app-data>/../plugins, or OMNI_PLUGINS): what one game
+                    needs -- options, variables, default arguments, hooks, commands -- declared
+                    in a plugin's omnidroid-plugin.json. `add` copies a plugin's directory in,
+                    `add --link` uses it where it is; `new` makes one to start from. The
+                    repository's plugins/ holds plugins to install (plugins/roblox: --cookie,
+                    --place, --join-delay, login); none is loaded until installed. The installed
+                    plugins' options and commands are listed below";
 
 struct Options {
     apk: Option<PathBuf>,
-    cookie: Option<String>,
-    place: Option<u64>,
-    join_delay: Option<f32>,
     minutes: u64,
     fresh: bool,
     phone: bool,
@@ -158,7 +138,7 @@ struct Options {
 }
 
 /// The command and the arguments after it. Options with no command in front of them mean
-/// `play`: `omnidroid --cookie <file> --place <id>` is how the owner starts a game.
+/// `play`: `omnidroid --apk <path> --minutes 30` is `omnidroid play --apk <path> --minutes 30`.
 fn command_and_rest(args: impl Iterator<Item = String>) -> (Option<String>, Vec<String>) {
     let mut args: Vec<String> = args.collect();
     if args.is_empty() {
@@ -171,6 +151,27 @@ fn command_and_rest(args: impl Iterator<Item = String>) -> (Option<String>, Vec<
     (Some(command), args)
 }
 
+/// The installed plugins a session runs with, and the options of theirs it was given.
+struct Plugged<'a> {
+    plugins: &'a [&'a plugin::Plugin],
+    given: Vec<plugin::Given>,
+}
+
+/// What every plugin program is told about this launcher.
+fn plugin_base() -> plugin::Base {
+    plugin::Base { repo: repo_root(), app_data: omni_platform::process::app_data_dir() }
+}
+
+/// `message`, and -- when it names an option or command the launcher does not know -- the
+/// repository's plugin that adds it, not installed here.
+fn with_hint(message: String) -> String {
+    let unknown = message.split('`').nth(1).filter(|_| message.starts_with("unknown "));
+    match unknown.and_then(|name| plugin::hint_for(name, &repo_root())) {
+        Some(hint) => format!("{message}\n  {hint}"),
+        None => message,
+    }
+}
+
 fn main() -> ExitCode {
     let (command, rest) = command_and_rest(std::env::args().skip(1));
     // The helper a warm-device session leaves behind to stop its app once the session is gone.
@@ -180,45 +181,109 @@ fn main() -> ExitCode {
     if command.as_deref() == Some("modules") {
         return modules_command(&rest);
     }
-    let args = rest.into_iter();
-    if command.as_deref() == Some("aosp") {
-        return match parse_aosp(args) {
-            Ok(aosp_options) => aosp(&aosp_options),
-            Err(message) => {
-                eprintln!("omnidroid: {message}\n\n{USAGE}");
-                ExitCode::from(2)
-            }
-        };
+    if command.as_deref() == Some("plugins") {
+        return plugins_command(&rest);
     }
-    if command.as_deref() == Some("login") {
-        return match parse_login(args) {
-            Ok(login_options) => login(&login_options),
-            Err(message) => {
-                eprintln!("omnidroid: {message}\n\n{USAGE}");
-                ExitCode::from(2)
-            }
-        };
-    }
-    let options = match parse(args) {
-        Ok(options) => options,
+    let registry = plugin::Registry::installed();
+    let plugins = match registry.active() {
+        Ok(plugins) => plugins,
         Err(message) => {
-            eprintln!("omnidroid: {message}\n\n{USAGE}");
+            eprintln!("omnidroid: {message}");
             return ExitCode::from(2);
         }
     };
+    let usage = || format!("{USAGE}{}", plugin::usage(&plugins));
+    let refused = |message: String| {
+        eprintln!("omnidroid: {}\n\n{}", with_hint(message), usage());
+        ExitCode::from(2)
+    };
+    // A plugin's own command.
+    if let Some(ran) = command.as_deref().and_then(|name| plugin::run_command(&plugins, name, &rest, &plugin_base())) {
+        return match ran {
+            Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            Err(message) => {
+                eprintln!("omnidroid: {message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match command.as_deref() {
-        Some("play") => play(&options),
-        Some("which") => which(&options),
+        Some(session @ ("play" | "aosp")) => {
+            let (rest, given) = match plugin::take_args(&plugins, session, rest) {
+                Ok(split) => split,
+                Err(message) => return refused(message),
+            };
+            let plugged = Plugged { plugins: &plugins, given };
+            if session == "aosp" {
+                match parse_aosp(rest.into_iter()) {
+                    Ok(options) => aosp(&options, &plugged),
+                    Err(message) => refused(message),
+                }
+            } else {
+                match parse(rest.into_iter()) {
+                    Ok(options) => play(&options, &plugged),
+                    Err(message) => refused(message),
+                }
+            }
+        }
+        Some("which") => match parse(rest.into_iter()) {
+            Ok(options) => which(&options),
+            Err(message) => refused(message),
+        },
         Some("-h" | "--help" | "help") => {
-            println!("{USAGE}");
+            println!("{}", usage());
             ExitCode::SUCCESS
         }
-        other => {
-            eprintln!(
-                "omnidroid: {}\n\n{USAGE}",
-                other.map_or_else(|| "no command".to_string(), |c| format!("unknown command `{c}`"))
-            );
-            ExitCode::from(2)
+        None => refused("no command".to_string()),
+        Some(other) => refused(format!("unknown command `{other}`")),
+    }
+}
+
+/// `omnidroid plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name> | new <name> [<dir>]]`.
+fn plugins_command(args: &[String]) -> ExitCode {
+    let registry = plugin::Registry::installed();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let done = match args.as_slice() {
+        [] | ["list"] => {
+            match &registry.dir {
+                Some(dir) => println!("plugins in {}", dir.display()),
+                None => println!("this host names no plugin directory (set OMNI_PLUGINS)"),
+            }
+            if registry.entries.is_empty() {
+                println!("none installed (the repository's plugins/ holds some: omnidroid plugins add --link plugins/<name>)");
+            }
+            for entry in &registry.entries {
+                let state = if entry.enabled { "on" } else { "off" };
+                let from = if entry.linked { format!("linked to {}", entry.dir.display()) } else { entry.dir.display().to_string() };
+                match &entry.plugin {
+                    Ok(p) => println!("{}\t{}\t{state}\t{}\t{from}", p.name, p.version, p.description),
+                    Err(error) => println!("{}\t?\t{state}\tBROKEN: {error}\t{from}", entry.name),
+                }
+            }
+            Ok(String::new())
+        }
+        ["add", "--link", dir] | ["add", dir, "--link"] => plugin::add(&registry, Path::new(dir), true),
+        ["add", dir] => plugin::add(&registry, Path::new(dir), false),
+        ["remove", name] => plugin::remove(&registry, name),
+        ["enable", name] => plugin::set_enabled(&registry, name, true),
+        ["disable", name] => plugin::set_enabled(&registry, name, false),
+        ["new", name] => plugin::scaffold(name, Path::new(name)),
+        ["new", name, dir] => plugin::scaffold(name, Path::new(dir)),
+        _ => {
+            eprintln!("omnidroid: usage: omnidroid plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name> | new <name> [<dir>]]");
+            return ExitCode::from(2);
+        }
+    };
+    match done {
+        Ok(message) => {
+            if !message.is_empty() {
+                println!("{message}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("omnidroid: {message}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -226,9 +291,6 @@ fn main() -> ExitCode {
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut options = Options {
         apk: None,
-        cookie: None,
-        place: None,
-        join_delay: None,
         minutes: 0,
         fresh: false,
         phone: false,
@@ -241,29 +303,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
             "--apk" => options.apk = Some(PathBuf::from(value("--apk")?)),
-            "--cookie" => options.cookie = Some(value("--cookie")?),
             "--minutes" => {
                 let text = value("--minutes")?;
                 options.minutes =
                     text.parse().map_err(|_| format!("--minutes wants a whole number, not `{text}`"))?;
-            }
-            "--place" => {
-                let text = value("--place")?;
-                let place: u64 =
-                    text.parse().map_err(|_| format!("--place wants a numeric placeId, not `{text}`"))?;
-                if place == 0 {
-                    return Err("--place wants a placeId above 0".to_string());
-                }
-                options.place = Some(place);
-            }
-            "--join-delay" => {
-                let text = value("--join-delay")?;
-                options.join_delay = Some(
-                    text.parse()
-                        .ok()
-                        .filter(|s: &f32| s.is_finite() && *s >= 0.0)
-                        .ok_or_else(|| format!("--join-delay wants seconds, not `{text}`"))?,
-                );
             }
             "--fresh" => options.fresh = true,
             "--phone" => options.phone = true,
@@ -317,271 +360,7 @@ fn which(options: &Options) -> ExitCode {
     }
 }
 
-struct LoginOptions {
-    username: Option<String>,
-    password: Option<String>,
-    dir: Option<PathBuf>,
-}
-
-fn parse_login(mut args: impl Iterator<Item = String>) -> Result<LoginOptions, String> {
-    let mut options = LoginOptions { username: None, password: None, dir: None };
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--dir" => options.dir = Some(PathBuf::from(args.next().ok_or("--dir needs a value")?)),
-            flag if flag.starts_with("--") => return Err(format!("unknown argument `{flag}`")),
-            _ if options.username.is_none() => options.username = Some(arg),
-            _ if options.password.is_none() => options.password = Some(arg),
-            _ => return Err(format!("login takes a username and a password, and `{arg}` is a third")),
-        }
-    }
-    Ok(options)
-}
-
-/// `omnidroid login`: `tools/login.py` in the Python environment made for it. See the module docs.
-fn login(options: &LoginOptions) -> ExitCode {
-    let Some(dir) = options.dir.clone().or_else(cookies_dir) else {
-        eprintln!("omnidroid: this host names no app-data directory (its HOME or LOCALAPPDATA is unset); pass --dir");
-        return ExitCode::FAILURE;
-    };
-    // A username alone: the password `login` kept for it.
-    let password = match (&options.username, &options.password) {
-        (Some(username), None) => match saved_password(&dir, username) {
-            Ok(password) => Some(password),
-            Err(message) => {
-                eprintln!("omnidroid: {message}");
-                return ExitCode::from(2);
-            }
-        },
-        (_, password) => password.clone(),
-    };
-    let python = match login_python() {
-        Ok(python) => python,
-        Err(message) => {
-            eprintln!("omnidroid: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut run = Command::new(&python);
-    run.arg(repo_root().join("tools").join("login.py")).arg("--dir").arg(&dir);
-    // omnidroid's own Chromium and driver live beside its other data, not in a shared cache.
-    if let Some(chromium) = omni_platform::process::app_data_dir().and_then(|d| Some(d.parent()?.join("chromium"))) {
-        run.env("SE_CACHE_PATH", chromium);
-    }
-    if let Some(username) = &options.username {
-        run.args(["--username", username]);
-    }
-    // The password in the child's environment, not on its command line.
-    match &password {
-        Some(password) => run.env("OMNI_LOGIN_PASSWORD", password),
-        None => run.env_remove("OMNI_LOGIN_PASSWORD"),
-    };
-    match run.status() {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
-        Err(error) => {
-            eprintln!("omnidroid: could not start {}: {error}", python.display());
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// The password `login` kept for `username` in `dir` (`<username>.login.json`).
-fn saved_password(dir: &Path, username: &str) -> Result<String, String> {
-    let file = dir.join(format!("{username}.login.json"));
-    let text = std::fs::read_to_string(&file).map_err(|error| {
-        format!("no saved login for `{username}` ({}: {error}); pass its password too", file.display())
-    })?;
-    json_string_field(&text, "password")
-        .filter(|password| !password.is_empty())
-        .ok_or_else(|| format!("{} holds no password; pass it", file.display()))
-}
-
-/// The string value of `"field"` in the flat JSON object `login.py` writes -- enough of JSON for
-/// that file (escapes included) without a JSON crate in the launcher.
-fn json_string_field(text: &str, field: &str) -> Option<String> {
-    let key = format!("\"{field}\"");
-    let after = text[text.find(&key)? + key.len()..].trim_start().strip_prefix(':')?.trim_start();
-    let mut chars = after.strip_prefix('"')?.chars();
-    let mut value = String::new();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(value),
-            '\\' => match chars.next()? {
-                'n' => value.push('\n'),
-                't' => value.push('\t'),
-                'r' => value.push('\r'),
-                'b' => value.push('\u{8}'),
-                'f' => value.push('\u{c}'),
-                'u' => {
-                    let code: String = chars.by_ref().take(4).collect();
-                    value.push(char::from_u32(u32::from_str_radix(&code, 16).ok()?)?);
-                }
-                other => value.push(other),
-            },
-            c => value.push(c),
-        }
-    }
-    None
-}
-
-/// The Python that runs `tools/login.py`, with Selenium: a virtual environment in
-/// `<app-data>/../login-venv`, made (and given pip and Selenium) the first time.
-fn login_python() -> Result<PathBuf, String> {
-    let venv = omni_platform::process::app_data_dir()
-        .and_then(|dir| Some(dir.parent()?.join("login-venv")))
-        .ok_or("this host names no app-data directory for the login environment")?;
-    // The two layouts `venv` makes: Windows' and everyone else's.
-    let in_venv = || {
-        [venv.join("Scripts").join("python.exe"), venv.join("bin").join("python3"), venv.join("bin").join("python")]
-            .into_iter()
-            .find(|candidate| candidate.is_file())
-    };
-    let works = |python: &Path, check: &[&str]| {
-        Command::new(python).args(check).output().is_ok_and(|output| output.status.success())
-    };
-    let python = match in_venv() {
-        Some(python) => python,
-        None => {
-            let host = ["python3", "python", "py"]
-                .into_iter()
-                .find(|name| works(Path::new(name), &["-c", "import sys; assert sys.version_info >= (3, 9)"]))
-                .ok_or("login needs Python 3.9 or later (python3, python or py on PATH)")?;
-            println!("Omnidroid: making the login environment in {} (once)", venv.display());
-            let made = works(Path::new(host), &["-m", "venv", &venv.to_string_lossy()])
-                // Without `ensurepip` (Debian and Ubuntu without python3-venv): no pip, fetched below.
-                || works(Path::new(host), &["-m", "venv", "--without-pip", &venv.to_string_lossy()]);
-            if !made {
-                return Err(format!("{host} -m venv {} failed", venv.display()));
-            }
-            in_venv().ok_or_else(|| format!("{} holds no Python after `venv`", venv.display()))?
-        }
-    };
-    if !works(&python, &["-m", "pip", "--version"]) {
-        println!("Omnidroid: fetching pip into the login environment");
-        let get_pip = "import urllib.request; exec(urllib.request.urlopen('https://bootstrap.pypa.io/get-pip.py').read())";
-        let status = Command::new(&python).args(["-c", get_pip, "--quiet"]).status();
-        if !status.is_ok_and(|s| s.success()) {
-            return Err("pip could not be installed in the login environment".to_string());
-        }
-    }
-    if !works(&python, &["-c", "import selenium"]) {
-        println!("Omnidroid: installing Selenium into the login environment");
-        let status = Command::new(&python).args(["-m", "pip", "install", "--quiet", "--disable-pip-version-check", "selenium"]).status();
-        if !status.is_ok_and(|s| s.success()) {
-            return Err("Selenium could not be installed in the login environment".to_string());
-        }
-    }
-    Ok(python)
-}
-
-/// The account `--cookie` names: its `.ROBLOSECURITY` value (never printed) and the name its
-/// storage is kept under.
-struct AccountCookie {
-    value: String,
-    account: String,
-}
-
-/// `--cookie <file or value>`. An existing file is read; anything else long enough to be a cookie
-/// is the value itself, and a short one is a file name that was not found (a real
-/// `.ROBLOSECURITY` is several hundred characters).
-fn account_cookie(arg: &str) -> Result<AccountCookie, String> {
-    account_cookie_in(arg, cookies_dir().as_deref())
-}
-
-/// [`account_cookie`], with the folder a bare name is looked up in.
-fn account_cookie_in(arg: &str, cookies: Option<&Path>) -> Result<AccountCookie, String> {
-    let saved = cookies.and_then(|dir| {
-        [dir.join(arg), dir.join(format!("{arg}.txt"))].into_iter().find(|candidate| candidate.is_file())
-    });
-    let path = if Path::new(arg).is_file() { Path::new(arg) } else { saved.as_deref().unwrap_or(Path::new(arg)) };
-    if path.is_file() {
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("--cookie: could not read {}: {error}", path.display()))?;
-        let value = cookie_value(&text)
-            .ok_or_else(|| format!("--cookie: {} holds no .ROBLOSECURITY cookie", path.display()))?;
-        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        return Ok(AccountCookie { value, account: account_name(&stem) });
-    }
-    if arg.len() < 100 {
-        return Err(format!(
-            "--cookie: no file `{arg}` (from {}{}), and it is too short to be a .ROBLOSECURITY value",
-            std::env::current_dir().map_or_else(|_| "here".to_string(), |d| d.display().to_string()),
-            cookies.map_or_else(String::new, |dir| format!(", or in {}", dir.display()))
-        ));
-    }
-    let value = cookie_value(arg).ok_or_else(|| "--cookie: that is not a .ROBLOSECURITY value".to_string())?;
-    let hash = fingerprint(&value);
-    Ok(AccountCookie { value, account: format!("cookie-{hash}") })
-}
-
-/// A stable name for a cookie that does not carry it: FNV-1a 64, in hex.
-fn fingerprint(value: &str) -> String {
-    let hash = value
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
-    format!("{hash:016x}")
-}
-
-/// Where `login` keeps cookies and `--cookie <name>` finds them: `<app-data>/../cookies`.
-fn cookies_dir() -> Option<PathBuf> {
-    Some(omni_platform::process::app_data_dir()?.parent()?.join("cookies"))
-}
-
-/// The file in an account's storage naming the cookie last planted there.
-const PLANTED_MARKER: &str = "omnidroid-cookie-planted";
-
-/// Whether `value` is to be planted in the kept storage `dir`: not when it is the cookie last
-/// planted there -- the store then holds that one, or the one Roblox replaced it with.
-fn cookie_is_new_for(dir: &Path, value: &str) -> bool {
-    std::fs::read_to_string(dir.join(PLANTED_MARKER)).map_or(true, |kept| kept.trim() != fingerprint(value))
-}
-
-/// The `.ROBLOSECURITY` value in `text`: a Netscape `cookies.txt` line naming it, a
-/// `.ROBLOSECURITY=<value>` pair (a `Cookie` header included), or else the first non-empty line as
-/// the bare value. `None` for nothing a cookie store could hold.
-fn cookie_value(text: &str) -> Option<String> {
-    let text = text.trim_start_matches('\u{feff}');
-    let lines = || text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
-    let netscape = lines().find_map(|line| {
-        let fields: Vec<&str> = line.split('\t').collect();
-        (fields.len() == 7 && fields[5] == ".ROBLOSECURITY").then(|| fields[6].to_string())
-    });
-    let pair = || {
-        text.split([';', '\n', '\r'])
-            .find_map(|part| part.trim().strip_prefix(".ROBLOSECURITY=").map(|v| v.trim().to_string()))
-    };
-    let value = netscape.or_else(pair).or_else(|| lines().next().map(str::to_string))?;
-    let value = value.trim_matches('"').to_string();
-    (!value.is_empty() && !value.chars().any(|c| c.is_whitespace() || c.is_control() || c == ';'))
-        .then_some(value)
-}
-
-/// A file name made safe as a directory name on every host.
-fn account_name(stem: &str) -> String {
-    let name: String =
-        stem.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    if name.is_empty() {
-        "account".to_string()
-    } else {
-        name
-    }
-}
-
-fn play(options: &Options) -> ExitCode {
-    let cookie = match options.cookie.as_deref().map(account_cookie).transpose() {
-        Ok(cookie) => cookie,
-        Err(message) => {
-            eprintln!("omnidroid: {message}");
-            return ExitCode::from(2);
-        }
-    };
-    if options.place.is_some() && options.fresh && cookie.is_none() {
-        eprintln!(
-            "omnidroid: --place joins with the saved sign-in, and --fresh starts without one; \
-             drop --fresh (sign in once first), or pass --cookie, to join"
-        );
-        return ExitCode::from(2);
-    }
+fn play(options: &Options, plugged: &Plugged) -> ExitCode {
     let apk = match chosen(options) {
         Ok(apk) => apk,
         Err(code) => return code,
@@ -589,6 +368,21 @@ fn play(options: &Options) -> ExitCode {
     // Absolute, because the gate resolves it from its own working directory.
     let apk_path = std::fs::canonicalize(&apk.path).unwrap_or_else(|_| apk.path.clone());
     println!("Omnidroid: {}", describe(&apk));
+    let info = plugin::SessionInfo {
+        command: "play",
+        fresh: options.fresh,
+        given_data_dir: options.data_dir.as_deref(),
+        apk: Some(&apk_path),
+        package: Some(&apk.manifest.package),
+    };
+    let base = plugin_base();
+    let session = match plugin::start(plugged.plugins, &plugged.given, &info, &base) {
+        Ok(session) => session,
+        Err(message) => {
+            eprintln!("omnidroid: {message}");
+            return ExitCode::from(2);
+        }
+    };
 
     let mut run = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     run.current_dir(repo_root())
@@ -613,22 +407,12 @@ fn play(options: &Options) -> ExitCode {
     };
     run.env("OMNI_SESSION_SECONDS", seconds.to_string());
 
-    // Whether the account's cookie goes into the store at start: always on a fresh install, and in
-    // kept storage only when it is not the one last planted there (see `cookie_is_new_for`).
-    let mut plant = true;
     if options.fresh {
         run.env_remove("OMNI_DATA_DIR");
         println!("Omnidroid: {length} on a fresh install");
     } else {
-        // An account named by --cookie keeps its own storage beside the default one.
-        let default_dir = || {
-            let dir = omni_platform::process::app_data_dir()?;
-            Some(match &cookie {
-                Some(cookie) => dir.parent()?.join("accounts").join(&cookie.account),
-                None => dir,
-            })
-        };
-        let Some(dir) = options.data_dir.clone().or_else(default_dir) else {
+        // --data-dir, else the directory a plugin named (one account's own), else the host's.
+        let Some(dir) = options.data_dir.clone().or_else(|| session.data_dir.clone()).or_else(omni_platform::process::app_data_dir) else {
             eprintln!(
                 "omnidroid: this host names no app-data directory (its HOME or LOCALAPPDATA is \
                  unset); pass --data-dir, or --fresh"
@@ -641,42 +425,6 @@ fn play(options: &Options) -> ExitCode {
         }
         run.env("OMNI_DATA_DIR", &dir);
         println!("Omnidroid: {length}; the app's storage is kept in {}", dir.display());
-        if let Some(cookie) = &cookie {
-            plant = cookie_is_new_for(&dir, &cookie.value);
-            if plant {
-                if let Err(error) = std::fs::write(dir.join(PLANTED_MARKER), fingerprint(&cookie.value)) {
-                    eprintln!("omnidroid: could not write {}: {error}", dir.join(PLANTED_MARKER).display());
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    }
-    if let Some(place) = options.place {
-        run.env("OMNI_JOIN_PLACE", place.to_string());
-        if let Some(delay) = options.join_delay {
-            run.env("OMNI_JOIN_DELAY", delay.to_string());
-        }
-        println!(
-            "Omnidroid: joining place {place} {}s after start, once the sign-in is at Home",
-            options.join_delay.unwrap_or(20.0)
-        );
-    }
-    match &cookie {
-        Some(cookie) if plant => {
-            run.env("OMNI_COOKIE", &cookie.value);
-            println!("Omnidroid: signing in as account `{}` with its cookie (--cookie; never printed)", cookie.account);
-        }
-        Some(cookie) => {
-            run.env_remove("OMNI_COOKIE");
-            println!(
-                "Omnidroid: signing in as account `{}` with the cookie its storage holds -- the file's was \
-                 planted before, and Roblox may have replaced it since",
-                cookie.account
-            );
-        }
-        None => {
-            println!("Sign in with Quick Sign-in (Sign In > Quick Sign-in), then enter the code on a signed-in device.");
-        }
     }
     // Headless mode and its control channel (the gate reads them; stdin stays this process's).
     if let Ok(here) = std::env::current_dir() {
@@ -706,24 +454,26 @@ fn play(options: &Options) -> ExitCode {
         run.env_remove("OMNI_CONTROL");
         println!("Omnidroid: commands from stdin: headless on|off, screenshot <path>, status");
     }
+    // The plugins' variables last: what a plugin sets is what the session gets.
+    session.apply(&mut run);
     println!("End the session by closing the window.");
 
-    match run.status() {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
+    let code = match run.status() {
+        Ok(status) => status.code().unwrap_or(1),
         Err(error) => {
             eprintln!("omnidroid: could not start cargo: {error}");
-            ExitCode::FAILURE
+            plugin::end(plugged.plugins, &plugged.given, &info, &base, 1);
+            return ExitCode::FAILURE;
         }
-    }
+    };
+    plugin::end(plugged.plugins, &plugged.given, &info, &base, code);
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
 /// `omnidroid aosp`'s options.
 #[derive(Debug, PartialEq, Eq)]
 struct AospOptions {
     apk: Option<PathBuf>,
-    cookie: Option<String>,
-    place: Option<u64>,
     minutes: u64,
     size: Option<(u32, u32)>,
     gpu: Option<String>,
@@ -740,14 +490,14 @@ struct AospOptions {
     su: Option<String>,
     /// Packages hidden from root (`--denylist a,b`; implies root).
     denylist: Vec<String>,
+    /// The device's clipboard kept from the host's (`--no-clipboard`); shared by default.
+    no_clipboard: bool,
 }
 
 fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, String> {
     let mut options =
         AospOptions {
         apk: None,
-        cookie: None,
-        place: None,
         minutes: 30,
         size: None,
         gpu: None,
@@ -760,21 +510,13 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
         modules: Vec::new(),
         su: None,
         denylist: Vec::new(),
+        no_clipboard: false,
     };
     let mut minutes_given = false;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match arg.as_str() {
             "--apk" => options.apk = Some(PathBuf::from(value("--apk")?)),
-            "--cookie" => options.cookie = Some(value("--cookie")?),
-            "--place" => {
-                let text = value("--place")?;
-                let place: u64 = text.parse().map_err(|_| format!("--place wants a numeric placeId, not `{text}`"))?;
-                if place == 0 {
-                    return Err("--place wants a placeId above 0".to_string());
-                }
-                options.place = Some(place);
-            }
             "--minutes" => {
                 minutes_given = true;
                 let text = value("--minutes")?;
@@ -801,6 +543,7 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
                 options.gpu = Some(text);
             }
             "--with-systemui" => options.with_systemui = true,
+            "--no-clipboard" => options.no_clipboard = true,
             "--fresh-device" => options.fresh_device = true,
             "--standby" => options.standby = true,
             "--warm" => options.warm = true,
@@ -831,20 +574,15 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
 }
 
 /// The environment the real-AOSP session (`omni-linux`'s `r_roblox`) is given: what
-/// `tools/aosp_play.ps1` sets on Windows, from these options.
-fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'static str, String)> {
+/// `tools/aosp_play.ps1` sets on Windows, from these options. A plugin adds its own on top
+/// (`OMNI_R_COOKIE`, `OMNI_R_PLACE`: the `roblox` plugin's).
+fn aosp_env(options: &AospOptions, apk: &Path) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("OMNI_WINDOW", "1".to_string()),
         ("OMNI_R_MINUTES", options.minutes.to_string()),
         ("OMNI_TEST_APK", apk.display().to_string()),
         ("OMNI_R_KIOSK", if options.with_systemui { "0" } else { "1" }.to_string()),
     ];
-    if let Some(cookie) = cookie {
-        env.push(("OMNI_R_COOKIE", cookie.display().to_string()));
-    }
-    if let Some(place) = options.place {
-        env.push(("OMNI_R_PLACE", place.to_string()));
-    }
     if let Some((w, h)) = options.size {
         env.push(("OMNI_WINDOW_SIZE", format!("{w}x{h}")));
     }
@@ -856,6 +594,9 @@ fn aosp_env(options: &AospOptions, apk: &Path, cookie: Option<&Path>) -> Vec<(&'
     }
     if options.warm {
         env.push(("OMNI_R_WARM", "1".to_string()));
+    }
+    if options.no_clipboard {
+        env.push(("OMNI_CLIPBOARD", "0".to_string()));
     }
     if let Some(dir) = &options.instance {
         env.push(("OMNI_R_INSTANCE", dir.display().to_string()));
@@ -974,7 +715,7 @@ fn is_tmpfs(dir: &Path) -> bool {
 }
 
 /// `omnidroid aosp`: the real-AOSP session in a live window (see USAGE).
-fn aosp(options: &AospOptions) -> ExitCode {
+fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
     // Root is checked before anything boots: an unknown module, or the Magisk assets not fetched
     // (`tools/fetch_magisk.py`), is an error here -- never a half-rooted device.
     let root_hash = if options.root {
@@ -992,9 +733,9 @@ fn aosp(options: &AospOptions) -> ExitCode {
         None
     };
     // A warm device has no APK of its own.
-    let apk_path = if options.warm {
+    let (apk_path, package) = if options.warm {
         println!("Omnidroid (real AOSP): a warm device, no app");
-        PathBuf::new()
+        (PathBuf::new(), None)
     } else {
         let apk = match omni_apk::choose_apk(options.apk.as_deref(), &repo_root()) {
             Ok(apk) => apk,
@@ -1004,22 +745,31 @@ fn aosp(options: &AospOptions) -> ExitCode {
             }
         };
         println!("Omnidroid (real AOSP): {}", describe(&apk));
-        std::fs::canonicalize(&apk.path).unwrap_or_else(|_| apk.path.clone())
+        (std::fs::canonicalize(&apk.path).unwrap_or_else(|_| apk.path.clone()), Some(apk.manifest.package))
     };
-    // The session plants the cookie from a file (never printed): a file, or a name `login` saved.
-    let cookie = match &options.cookie {
-        None => None,
-        Some(arg) => {
-            let saved = cookies_dir().map(|d| d.join(format!("{arg}.txt"))).filter(|p| p.is_file());
-            let path = if Path::new(arg).is_file() { PathBuf::from(arg) } else if let Some(p) = saved { p } else {
-                eprintln!("omnidroid: --cookie: no file `{arg}` (aosp takes a cookie file or a name `login` saved)");
-                return ExitCode::from(2);
-            };
-            if let Err(message) = account_cookie(&path.to_string_lossy()) {
-                eprintln!("omnidroid: {message}");
-                return ExitCode::from(2);
-            }
-            Some(std::fs::canonicalize(&path).unwrap_or(path))
+    let info = plugin::SessionInfo {
+        command: "aosp",
+        fresh: options.fresh_device,
+        given_data_dir: None,
+        apk: (!options.warm).then_some(apk_path.as_path()),
+        package: package.as_deref(),
+    };
+    let base = plugin_base();
+    let session = match plugin::start(plugged.plugins, &plugged.given, &info, &base) {
+        Ok(session) => session,
+        Err(message) => {
+            eprintln!("omnidroid: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    // The account's cookie file and the place to join, when a plugin names them: the warm session
+    // reads them as the cold one (`r_roblox`) does.
+    let cookie = session.var("OMNI_R_COOKIE").map(PathBuf::from);
+    let place = match session.var("OMNI_R_PLACE").map(str::parse::<u64>).transpose() {
+        Ok(place) => place,
+        Err(_) => {
+            eprintln!("omnidroid: OMNI_R_PLACE is not a place id");
+            return ExitCode::from(2);
         }
     };
     // A warm device is up: the session is an app on it -- no boot, no device of its own (a second
@@ -1027,10 +777,12 @@ fn aosp(options: &AospOptions) -> ExitCode {
     // device (--instance, --standby, --fresh-device), nor with OMNI_AOSP_WARM=0.
     if !options.warm && !options.standby && !options.fresh_device && options.instance.is_none() {
         if let Some(dev) = warm::usable(root_hash.as_deref()) {
-            if options.size.is_some() || options.gpu.is_some() || options.with_systemui {
-                println!("Omnidroid: --size, --gpu and --with-systemui are the warm device's own (set when it booted); not applied");
+            if options.size.is_some() || options.gpu.is_some() || options.with_systemui || options.no_clipboard {
+                println!("Omnidroid: --size, --gpu, --with-systemui and --no-clipboard are the warm device's own (set when it booted); not applied");
             }
-            return warm::session(&dev, &repo_root(), &apk_path, cookie.as_deref(), options.place, options.minutes);
+            let code = warm::session(&dev, &repo_root(), &apk_path, cookie.as_deref(), place, options.minutes);
+            plugin::end(plugged.plugins, &plugged.given, &info, &base, i32::from(code != ExitCode::SUCCESS));
+            return code;
         }
     }
     // The session (cargo, the test, the device's host processes) ends with this process, however it
@@ -1039,9 +791,10 @@ fn aosp(options: &AospOptions) -> ExitCode {
     let mut run = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     run.current_dir(repo_root())
         .args(["test", "--release", "-q", "-p", "omni-linux", "--test", "r_roblox", "--", "--ignored", "--nocapture"]);
-    for (k, v) in aosp_env(options, &apk_path, cookie.as_deref()) {
+    for (k, v) in aosp_env(options, &apk_path) {
         run.env(k, v);
     }
+    session.apply(&mut run);
     let temp = std::env::temp_dir();
     let work = aosp_work_dir(std::env::var_os("TMPDIR").is_some(), is_tmpfs(&temp), omni_platform::process::app_data_dir().as_deref());
     let session_dir = match &work {
@@ -1068,73 +821,24 @@ fn aosp(options: &AospOptions) -> ExitCode {
         }
     }
     println!(
-        "Omnidroid: a {}-minute session; {}{}the log is {}/omni-linux-r-<pid>.log, the display's screenshots beside it",
+        "Omnidroid: a {}-minute session; the log is {}/omni-linux-r-<pid>.log, the display's screenshots beside it",
         options.minutes,
-        cookie.as_ref().map_or(String::new(), |_| "signed in with --cookie (never printed); ".to_string()),
-        options.place.map_or(String::new(), |p| format!("joining place {p} once signed in; ")),
         session_dir.display()
     );
-    match run.status() {
-        Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
+    let code = match run.status() {
+        Ok(status) => status.code().unwrap_or(1),
         Err(error) => {
             eprintln!("omnidroid: could not start cargo: {error}");
-            ExitCode::FAILURE
+            1
         }
-    }
+    };
+    plugin::end(plugged.plugins, &plugged.given, &info, &base, code);
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const VALUE: &str = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you.|_ABC123";
-
-    #[test]
-    fn a_cookie_is_read_from_every_shape_it_is_kept_in() {
-        assert_eq!(cookie_value(&format!("{VALUE}\n")).as_deref(), Some(VALUE), "the bare value");
-        assert_eq!(cookie_value(&format!("\u{feff}  {VALUE}\r\n")).as_deref(), Some(VALUE), "BOM, CRLF");
-        assert_eq!(cookie_value(&format!(".ROBLOSECURITY={VALUE}")).as_deref(), Some(VALUE), "a pair");
-        assert_eq!(
-            cookie_value(&format!("RBXEventTrackerV2=x; .ROBLOSECURITY={VALUE}; other=1")).as_deref(),
-            Some(VALUE),
-            "a Cookie header"
-        );
-        let netscape =
-            format!("# Netscape HTTP Cookie File\n.roblox.com\tTRUE\t/\tTRUE\t0\t.ROBLOSECURITY\t{VALUE}\n");
-        assert_eq!(cookie_value(&netscape).as_deref(), Some(VALUE), "cookies.txt");
-        assert_eq!(cookie_value("  \n"), None, "empty");
-        assert_eq!(cookie_value("two words"), None, "a value a cookie store cannot hold");
-    }
-
-    #[test]
-    fn a_file_names_its_account_a_value_is_hashed_and_a_missing_file_is_said() {
-        let dir = std::env::temp_dir().join(format!("omnidroid-cookie-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        let file = dir.join("farm 4.txt");
-        std::fs::write(&file, format!("{VALUE}\n")).expect("the cookie file");
-        let from_file = account_cookie(file.to_str().expect("utf-8")).expect("read");
-        assert_eq!((from_file.value.as_str(), from_file.account.as_str()), (VALUE, "farm_4"));
-        let long = format!("{VALUE}{}", "0".repeat(100));
-        let from_value = account_cookie(&long).expect("a value");
-        assert_eq!(from_value.value, long);
-        assert!(from_value.account.starts_with("cookie-") && !from_value.account.contains(VALUE));
-        assert!(account_cookie_in("missing.txt", None).is_err(), "a short argument is a file that is not there");
-        let by_name = account_cookie_in("farm 4", Some(&dir)).expect("a name found in the cookies folder");
-        assert_eq!((by_name.value.as_str(), by_name.account.as_str()), (VALUE, "farm_4"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_cookie_is_planted_once_per_account_so_a_rotated_one_is_kept() {
-        let dir = std::env::temp_dir().join(format!("omnidroid-planted-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        assert!(cookie_is_new_for(&dir, VALUE), "nothing planted yet");
-        std::fs::write(dir.join(PLANTED_MARKER), fingerprint(VALUE)).expect("the marker");
-        assert!(!cookie_is_new_for(&dir, VALUE), "the same file again: the store's cookie is kept");
-        assert!(cookie_is_new_for(&dir, "_|WARNING:-a-new-export|_X"), "a new export is planted");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn parse_aosp_reads_root_and_modules() {
@@ -1162,10 +866,10 @@ mod tests {
     #[test]
     fn root_options_reach_the_session_environment_and_unrooted_adds_none() {
         let parse = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string())).unwrap();
-        let env = aosp_env(&parse(&["--module", "a,b", "--su", "all"]), Path::new("x.apk"), None);
+        let env = aosp_env(&parse(&["--module", "a,b", "--su", "all"]), Path::new("x.apk"));
         let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
         assert_eq!((get("OMNI_R_ROOT"), get("OMNI_R_MODULES"), get("OMNI_R_SU")), (Some("1"), Some("a,b"), Some("all")));
-        let plain = aosp_env(&parse(&[]), Path::new("x.apk"), None);
+        let plain = aosp_env(&parse(&[]), Path::new("x.apk"));
         assert!(plain.iter().all(|(n, _)| !n.starts_with("OMNI_R_ROOT") && *n != "OMNI_R_MODULES" && *n != "OMNI_R_SU"));
     }
 
@@ -1181,9 +885,9 @@ mod tests {
         assert!(validate_modules(&["emu-hide".into(), "shamiko".into(), "zygisk-frida".into()], &empty).is_ok());
         let err = validate_modules(&["ghost".into()], &empty).unwrap_err();
         assert!(err.contains("ghost"), "{err}");
-        let env = aosp_env(&parse(&["--denylist", "a.b,c.d"]), Path::new("x.apk"), None);
+        let env = aosp_env(&parse(&["--denylist", "a.b,c.d"]), Path::new("x.apk"));
         assert!(env.iter().any(|(n, v)| *n == "OMNI_R_DENYLIST" && v == "a.b,c.d"));
-        let plain = aosp_env(&parse(&[]), Path::new("x.apk"), None);
+        let plain = aosp_env(&parse(&[]), Path::new("x.apk"));
         assert!(plain.iter().all(|(n, _)| *n != "OMNI_R_DENYLIST"));
     }
 
@@ -1199,9 +903,28 @@ mod tests {
     }
 
     #[test]
+    fn an_option_of_a_plugin_not_installed_names_the_plugin() {
+        let said = with_hint("unknown argument `--cookie`".to_string());
+        assert!(said.contains("`roblox` plugin") && said.contains("plugins add --link"), "{said}");
+        assert_eq!(with_hint("unknown argument `--nothing`".to_string()), "unknown argument `--nothing`");
+        assert!(with_hint("unknown command `login`".to_string()).contains("roblox"));
+    }
+
+    #[test]
+    fn the_repository_roblox_plugin_loads_and_takes_cookie_and_place() {
+        let roblox = plugin::Plugin::load(&repo_root().join("plugins/roblox")).expect("plugins/roblox loads");
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let (rest, given) = plugin::take_args(&[&roblox], "aosp", args(&["--cookie", "c.txt", "--place", "8737899170", "--gpu", "gl"])).unwrap();
+        assert_eq!(rest, ["--gpu", "gl"]);
+        assert_eq!(given.iter().map(|g| g.flag.as_str()).collect::<Vec<_>>(), ["--cookie", "--place"]);
+        assert!(plugin::take_args(&[&roblox], "play", args(&["--place", "0"])).is_err());
+        assert!(plugin::take_args(&[&roblox], "aosp", args(&["--join-delay", "3"])).unwrap().1.is_empty(), "play's only");
+    }
+
+    #[test]
     fn headless_and_the_control_file_are_options_of_play() {
         let parsed = |a: &[&str]| parse(a.iter().map(|s| (*s).to_string()));
-        let options = parsed(&["--headless", "--control", "cmds.txt", "--place", "1"]).expect("parsed");
+        let options = parsed(&["--headless", "--control", "cmds.txt"]).expect("parsed");
         assert!(options.headless);
         assert_eq!(options.control.as_deref(), Some(Path::new("cmds.txt")));
         let plain = parsed(&[]).expect("parsed");
@@ -1212,53 +935,44 @@ mod tests {
     }
 
     #[test]
-    fn the_saved_login_is_read_back_and_arguments_are_parsed() {
-        let text = "{\n  \"username\": \"HezMi_ImYu\",\n  \"login\": \"a@b.c\",\n  \"password\": \"p\\\"q\\\\r\\u00e9\"\n}\n";
-        assert_eq!(json_string_field(text, "password").as_deref(), Some("p\"q\\r\u{e9}"));
-        assert_eq!(json_string_field(text, "username").as_deref(), Some("HezMi_ImYu"));
-        assert_eq!(json_string_field(text, "missing"), None);
-        let args = |a: &[&str]| parse_login(a.iter().map(|s| (*s).to_string()));
-        let both = args(&["name", "secret", "--dir", "x"]).expect("parsed");
-        assert_eq!((both.username.as_deref(), both.password.as_deref()), (Some("name"), Some("secret")));
-        assert_eq!(both.dir.as_deref(), Some(Path::new("x")));
-        assert!(args(&["a", "b", "c"]).is_err());
-        assert!(args(&["--nope"]).is_err());
-    }
-
-    #[test]
-    fn aosp_takes_the_apk_the_account_and_the_place() {
+    fn aosp_takes_the_apk_and_the_device() {
         let args = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string()));
-        let o = args(&["--apk", "r.apk", "--cookie", "c.txt", "--place", "8737899170"]).expect("parsed");
+        let o = args(&["--apk", "r.apk"]).expect("parsed");
         assert_eq!(o.apk.as_deref(), Some(Path::new("r.apk")));
-        assert_eq!((o.cookie.as_deref(), o.place, o.minutes), (Some("c.txt"), Some(8_737_899_170), 30));
+        assert_eq!(o.minutes, 30);
+        assert!(args(&["--cookie", "c.txt"]).is_err() && args(&["--place", "1"]).is_err(), "the roblox plugin's, not the launcher's");
         let o = args(&["--minutes", "12", "--size", "1280x720", "--gpu", "gl", "--with-systemui"]).expect("parsed");
         assert_eq!((o.minutes, o.size, o.gpu.as_deref(), o.with_systemui), (12, Some((1280, 720)), Some("gl"), true));
         assert!(args(&["--gpu", "metal"]).is_err());
         assert!(args(&["--size", "1280"]).is_err());
-        assert!(args(&["--place", "0"]).is_err());
         assert!(args(&["--minutes", "0"]).is_err());
         assert!(args(&["--fresh"]).is_err(), "play's options are not aosp's");
         let o = args(&["--fresh-device", "--standby", "--instance", "d"]).expect("parsed");
         assert_eq!((o.fresh_device, o.standby, o.instance.as_deref()), (true, true, Some(Path::new("d"))));
-        let env = aosp_env(&o, Path::new("r.apk"), None);
+        let env = aosp_env(&o, Path::new("r.apk"));
         assert!(env.contains(&("OMNI_R_STANDBY", "1".to_string())) && env.contains(&("OMNI_R_INSTANCE", "d".to_string())));
     }
 
     #[test]
     fn aosp_gives_the_session_what_aosp_play_ps1_gave_it() {
-        let o = parse_aosp(["--place", "1", "--gpu", "gl", "--size", "960x540"].iter().map(|s| (*s).to_string())).expect("parsed");
-        let env = aosp_env(&o, Path::new("/a/r.apk"), Some(Path::new("/c/k.txt")));
+        let o = parse_aosp(["--gpu", "gl", "--size", "960x540"].iter().map(|s| (*s).to_string())).expect("parsed");
+        let env = aosp_env(&o, Path::new("/a/r.apk"));
         let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("OMNI_WINDOW"), Some("1"));
         assert_eq!(get("OMNI_R_MINUTES"), Some("30"));
         assert_eq!(get("OMNI_TEST_APK"), Some("/a/r.apk"));
-        assert_eq!(get("OMNI_R_COOKIE"), Some("/c/k.txt"));
-        assert_eq!(get("OMNI_R_PLACE"), Some("1"));
         assert_eq!(get("OMNI_R_KIOSK"), Some("1"), "a single-app device unless --with-systemui");
         assert_eq!(get("OMNI_WINDOW_SIZE"), Some("960x540"));
         assert_eq!(get("OMNI_GPU"), Some("gl"));
-        let bare = aosp_env(&parse_aosp(std::iter::empty()).expect("parsed"), Path::new("r.apk"), None);
+        let bare = aosp_env(&parse_aosp(std::iter::empty()).expect("parsed"), Path::new("r.apk"));
         assert!(bare.iter().all(|(k, _)| !matches!(*k, "OMNI_R_COOKIE" | "OMNI_R_PLACE" | "OMNI_GPU" | "OMNI_R_STANDBY" | "OMNI_R_INSTANCE")));
+    }
+
+    #[test]
+    fn the_clipboard_is_shared_unless_no_clipboard() {
+        let env = |a: &[&str]| aosp_env(&parse_aosp(a.iter().map(|s| (*s).to_string())).expect("parsed"), Path::new("r.apk"));
+        assert!(env(&[]).iter().all(|(k, _)| *k != "OMNI_CLIPBOARD"), "shared by default");
+        assert!(env(&["--no-clipboard"]).contains(&("OMNI_CLIPBOARD", "0".to_string())));
     }
 
     #[test]

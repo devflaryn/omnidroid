@@ -1,0 +1,41 @@
+{
+  "name": "roblox",
+  "version": "1.0.0",
+  "description": "Roblox: sign in as an account with its cookie, join a place, keep sign-ins with `login`",
+  "args": [
+    {
+      "flag": "--cookie",
+      "type": "string",
+      "value": "file|name|value",
+      "commands": ["play", "aosp"],
+      "help": "sign in as this account: a file holding its .ROBLOSECURITY cookie, a name `login` saved (<app-data>/../cookies/<name>.txt), or the value itself; play keeps storage per account (<app-data>/../accounts/<name>)"
+    },
+    {
+      "flag": "--place",
+      "type": "integer",
+      "value": "id",
+      "min": 1,
+      "commands": ["play", "aosp"],
+      "env": { "play": "OMNI_JOIN_PLACE", "aosp": "OMNI_R_PLACE" },
+      "help": "join this place once the sign-in reaches Home"
+    },
+    {
+      "flag": "--join-delay",
+      "type": "number",
+      "value": "s",
+      "min": 0,
+      "commands": ["play"],
+      "env": "OMNI_JOIN_DELAY",
+      "help": "seconds after start before joining (default 20)"
+    }
+  ],
+  "hooks": {
+    "session-start": ["${CARGO}", "run", "--quiet", "--release", "--manifest-path", "${PLUGIN_DIR}/Cargo.toml", "--", "session-start"]
+  },
+  "commands": {
+    "login": {
+      "run": ["${CARGO}", "run", "--quiet", "--release", "--manifest-path", "${PLUGIN_DIR}/Cargo.toml", "--", "login"],
+      "help": "[<username> [<password>]] [--dir <dir>]: sign in to Roblox in Chromium and keep the cookie, username and password in <dir> (default <app-data>/../cookies)"
+    }
+  }
+}

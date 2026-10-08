@@ -26,6 +26,15 @@
 //! window shows the last frame stretched to it -- `present_rgba`'s contract -- which is the only
 //! time the two sizes differ.
 //!
+//! **Up to a size, past which the display is scaled down** ([`display_for_window`]): a window
+//! larger than [`DISPLAY_MAX_PIXELS`] (1600x900's area; `OMNI_DISPLAY_MAX=WxH` sets another,
+//! `OMNI_DISPLAY_MAX=0` none) gets a display of its shape and that many pixels, stretched to it.
+//! A fullscreen window on a Retina screen is 2940x1646 physical pixels, 5.25x 1280x720's -- and
+//! every one of them was drawn by the app, read back, composed and copied to the window each
+//! frame, while what the screen shows of them is its size in points (1470x823). Capped, the app
+//! draws ~3x fewer pixels at fullscreen (run 2026-10-07: 23.6 fps at 2940x1646 against 28.7 at
+//! 1280x720 in the same session); a window within the cap is still its display, pixel for pixel.
+//!
 //! **A size must hold for [`SETTLE`] before the display follows it.** A border drag is hundreds
 //! of sizes, and each display change is a reconnect in SurfaceFlinger and a configuration change
 //! in every app; only a size the user stops at is worth one. So a drag shows the last frame
@@ -87,6 +96,32 @@ use crate::window_input::{Input, Out, TITLE_FREE};
 
 /// How long a window size must hold before the display is resized to it.
 pub const SETTLE: Duration = Duration::from_millis(300);
+/// The most pixels a display is given ([`display_for_window`]): 1600x900's.
+pub const DISPLAY_MAX_PIXELS: u64 = 1600 * 900;
+
+/// The cap on the display's pixels: `OMNI_DISPLAY_MAX=WxH` (its area), `0` for none, else
+/// [`DISPLAY_MAX_PIXELS`].
+fn display_max_pixels() -> u64 {
+    match std::env::var("OMNI_DISPLAY_MAX").as_deref() {
+        Ok("0") => u64::MAX,
+        Ok(v) => v.split_once('x').and_then(|(w, h)| Some(w.trim().parse::<u64>().ok()? * h.trim().parse::<u64>().ok()?)).filter(|&n| n > 0).unwrap_or(DISPLAY_MAX_PIXELS),
+        Err(_) => DISPLAY_MAX_PIXELS,
+    }
+}
+
+/// The display a `w` x `h` window is given: the window's own size, or -- when that is more than
+/// `max` pixels -- its shape scaled down to `max` pixels (even sides, at least [`MIN_SIDE`]).
+#[must_use]
+pub fn display_for_window(w: u32, h: u32, max: u64) -> (u32, u32) {
+    let pixels = u64::from(w) * u64::from(h);
+    if pixels <= max || w == 0 || h == 0 {
+        return (w, h);
+    }
+    let k = (max as f64 / pixels as f64).sqrt();
+    let side = |n: u32| ((f64::from(n) * k) as u32 & !1).max(MIN_SIDE);
+    (side(w), side(h))
+}
+
 /// How long the present thread waits for a frame before it looks at the window's size again.
 const FRAME_WAIT: Duration = Duration::from_millis(10);
 /// How long the window thread waits for a message before it looks at the control file and the
@@ -313,6 +348,8 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
         }
         window.wait(wait);
         let events: Vec<WindowEvent> = window.poll_events().collect();
+        // A copy in the guest is shared with the host's clipboard only while a window is in use.
+        crate::clipboard::window_focus(window.has_focus());
         if events.contains(&WindowEvent::CloseRequested) {
             break;
         }
@@ -442,6 +479,7 @@ fn present(presenter: &Presenter, framebuffer: &Framebuffer, composer: &Composer
     let mut window_size = presenter.client_size().unwrap_or_default();
     let mut pending: Option<((u32, u32), Instant)> = None;
     let mut report = Instant::now();
+    let max_pixels = display_max_pixels();
     while !stop.load(Ordering::Acquire) {
         if framebuffer.wait_frame(shown + 1, FRAME_WAIT) {
             let (n, fw, fh, pixels) = framebuffer.frame();
@@ -466,9 +504,10 @@ fn present(presenter: &Presenter, framebuffer: &Framebuffer, composer: &Composer
         if let Some(((w, h), at)) = pending {
             if at.elapsed() >= SETTLE {
                 pending = None;
-                let want = (w.max(MIN_SIDE), h.max(MIN_SIDE));
+                let (dw, dh) = display_for_window(w, h, max_pixels);
+                let want = (dw.max(MIN_SIDE), dh.max(MIN_SIDE));
                 if want != composer.display_size() {
-                    match composer.set_display_size(w, h) {
+                    match composer.set_display_size(dw, dh) {
                         Ok((dw, dh)) => eprintln!("[window] window {w}x{h}: display {dw}x{dh}"),
                         Err(e) => eprintln!("[window] window {w}x{h}: the display could not follow: {e}"),
                     }
@@ -491,6 +530,16 @@ fn present(presenter: &Presenter, framebuffer: &Framebuffer, composer: &Composer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_window_gets_a_display_of_its_shape_scaled_down() {
+        assert_eq!(display_for_window(1280, 720, DISPLAY_MAX_PIXELS), (1280, 720), "within the cap: the window's own");
+        assert_eq!(display_for_window(1600, 900, DISPLAY_MAX_PIXELS), (1600, 900));
+        let (w, h) = display_for_window(2940, 1646, DISPLAY_MAX_PIXELS);
+        assert!(u64::from(w) * u64::from(h) <= DISPLAY_MAX_PIXELS && w % 2 == 0 && h % 2 == 0, "{w}x{h}");
+        assert!((f64::from(w) / f64::from(h) - 2940.0 / 1646.0).abs() < 0.01, "the window's shape: {w}x{h}");
+        assert_eq!(display_for_window(2940, 1646, u64::MAX), (2940, 1646), "no cap");
+    }
 
     #[test]
     fn a_size_command_is_parsed_and_anything_else_is_not() {
