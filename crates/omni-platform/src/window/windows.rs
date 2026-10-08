@@ -184,9 +184,14 @@ fn lock(canvas: &Mutex<Canvas>) -> std::sync::MutexGuard<'_, Canvas> {
 
 /// Store `rgba` in the canvas as GDI's BGRA.
 fn store(canvas: &mut Canvas, rgba: &[u8], width: u32, height: u32) {
-    let image = canvas.image.get_or_insert_with(|| Image { bgra: Vec::new(), width: 0, height: 0 });
-    image.bgra.resize(rgba.len(), 0);
-    for (d, s) in image.bgra.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+    let image = canvas.image.get_or_insert_with(|| Image { bgra: Arc::new(Vec::new()), width: 0, height: 0 });
+    // The image's own buffer, unless a paint is using it (or it is a caller's, shared): then a new one.
+    if Arc::get_mut(&mut image.bgra).is_none() {
+        image.bgra = Arc::new(Vec::new());
+    }
+    let bgra = Arc::get_mut(&mut image.bgra).expect("unshared");
+    bgra.resize(rgba.len(), 0);
+    for (d, s) in bgra.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
         d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
     }
     (image.width, image.height) = (width, height);
@@ -217,6 +222,19 @@ impl Presenter {
         Ok(())
     }
 
+    /// [`present_rgba`](Self::present_rgba) of a BGRA image, kept as it is: the canvas holds the
+    /// caller's buffer (`super::Presenter::present_bgra`).
+    pub(super) fn present_bgra(&self, bgra: Arc<Vec<u8>>, width: u32, height: u32) -> WindowResult<()> {
+        let mut canvas = lock(&self.canvas);
+        if !canvas.alive {
+            return Ok(());
+        }
+        canvas.image = Some(Image { bgra, width, height });
+        // SAFETY: as in `present_rgba`.
+        unsafe { InvalidateRect(self.hwnd as HWND, core::ptr::null(), 0) };
+        Ok(())
+    }
+
     /// `GetClientRect`, callable from any thread: the size the border is at, mid-drag included.
     pub(super) fn client_size(&self) -> Option<(u32, u32)> {
         let canvas = lock(&self.canvas);
@@ -231,8 +249,14 @@ impl Presenter {
 
 /// A presented image, as GDI takes it: bottom-up is GDI's default, so the height in the header is
 /// negated to say "top-down", and the bytes are BGRA -- `BI_RGB` at 32 bits a pixel is blue first.
+///
+/// Shared (`Arc`) so that `WM_PAINT` takes the image and lets the canvas go before it blits: the
+/// blit (a CPU stretch, milliseconds at 1575x890) no longer holds a presenter on another thread
+/// out of the canvas, and a presenter's next image goes into another buffer when the one being
+/// painted is still in use. An image presented BGRA ([`Presenter::present_bgra`]) is the caller's
+/// buffer itself.
 struct Image {
-    bgra: Vec<u8>,
+    bgra: Arc<Vec<u8>>,
     width: u32,
     height: u32,
 }
@@ -814,8 +838,9 @@ unsafe extern "system" fn wnd_proc(
 /// `DefWindowProcW`'s. `BeginPaint` validates the update region whether or not anything is drawn,
 /// so a paint that cannot draw still ends the `WM_PAINT`s for it.
 fn paint(hwnd: HWND, state: &WindowState) -> bool {
-    let canvas = lock(&state.canvas);
-    let Some(image) = &canvas.image else { return false };
+    // The image taken and the canvas let go: the blit below does not hold a presenter up.
+    let Some((bgra, width, height)) = lock(&state.canvas).image.as_ref().map(|i| (Arc::clone(&i.bgra), i.width, i.height)) else { return false };
+    let image = Image { bgra, width, height };
     let mut ps = PAINTSTRUCT::default();
     // SAFETY: a live window handle, in its `WM_PAINT`; writes the `PAINTSTRUCT`.
     let hdc = unsafe { BeginPaint(hwnd, &raw mut ps) };

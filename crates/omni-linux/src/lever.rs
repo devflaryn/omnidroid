@@ -10,7 +10,12 @@
 //!   dropped so what runs next is translated with them. 0 is the accurate default.
 //!
 //! - `compose_fast=0|1`: the composer's fast path (`crate::hal::compose::FAST`: the same pixels
-//!   in fewer passes, its buffers kept from frame to frame). Off by default.
+//!   in fewer passes, its buffers kept from frame to frame). On by default.
+//! - `compose_zero=0|1`: the composer's layers read where they are in their gralloc regions and
+//!   composed straight into the framebuffer's next frame, by the run path
+//!   (`crate::hal::compose::ZERO`): two to three fewer 5.6 MB copies a frame. Off by default.
+//! - `present_bgra=0|1`: the frame composed as BGRA, and the Win32 window takes it shared rather
+//!   than swizzling a copy (`crate::hal::compose::BGRA_OUT`). Off by default.
 //! - `fence_poll=<microseconds>`: a guest `vkWaitForFences` polled with that period instead of the
 //!   host driver's own (spinning, on NVIDIA) wait (`crate::gpu::FENCE_POLL_US`). 0 is the driver's.
 //!
@@ -55,6 +60,17 @@ pub fn apply(line: &str) -> Option<String> {
             };
             crate::hal::compose::FAST.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("compose_fast={}", u8::from(on)))
+        }
+        "compose_zero" | "present_bgra" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::hal::compose::levers_from_env();
+            let lever = if name.trim() == "compose_zero" { &crate::hal::compose::ZERO } else { &crate::hal::compose::BGRA_OUT };
+            lever.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("{}={}", name.trim(), u8::from(on)))
         }
         "fence_poll" => {
             let us: u32 = value.trim().parse().ok()?;
@@ -150,6 +166,20 @@ mod tests {
         apply("compose_fast=1").expect("understood");
         assert!(crate::hal::compose::FAST.load(Ordering::Relaxed));
         assert_eq!(apply("compose_fast=yes"), None);
+    }
+
+    #[test]
+    fn the_zero_copy_and_bgra_levers_switch() {
+        use std::sync::atomic::Ordering;
+        use crate::hal::compose::{BGRA_OUT, ZERO};
+        assert_eq!(apply("compose_zero=1").as_deref(), Some("compose_zero=1"));
+        assert!(ZERO.load(Ordering::Relaxed));
+        assert_eq!(apply("present_bgra=1").as_deref(), Some("present_bgra=1"));
+        assert!(BGRA_OUT.load(Ordering::Relaxed));
+        apply("compose_zero=0").expect("understood");
+        apply("present_bgra=0").expect("understood");
+        assert!(!ZERO.load(Ordering::Relaxed) && !BGRA_OUT.load(Ordering::Relaxed));
+        assert_eq!(apply("compose_zero=on"), None);
     }
 
     #[test]

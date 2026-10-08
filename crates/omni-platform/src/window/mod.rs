@@ -1027,6 +1027,31 @@ impl Presenter {
         self.inner.present_rgba(image, width, height)
     }
 
+    /// [`present_rgba`](Self::present_rgba) for an image already in **BGRA** -- GDI's order --
+    /// handed over **shared**: on Windows the window keeps and paints this very buffer (no copy, no
+    /// swizzle), so the caller should not expect to get it back unshared before the next present.
+    /// Elsewhere it is made RGBA and presented as [`present_rgba`](Self::present_rgba) does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Window::present_rgba`].
+    pub fn present_bgra(&self, bgra: std::sync::Arc<Vec<u8>>, width: u32, height: u32) -> WindowResult<()> {
+        validate_extent(width, height, "present_bgra")?;
+        let needed = width as usize * height as usize * 4;
+        if bgra.len() < needed {
+            return Err(WindowError::PixelsTooShort { operation: "present_bgra", width, height, needed, got: bgra.len() });
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.inner.present_bgra(bgra, width, height)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let rgba: Vec<u8> = bgra[..needed].chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+            self.inner.present_rgba(&rgba, width, height)
+        }
+    }
+
     /// The window's client size in physical pixels as the host has it now -- on Windows asked of
     /// the OS, so it follows a border drag as it happens; elsewhere as the window's thread last
     /// heard it. `(0, 0)` while minimised; `None` once the window is gone.

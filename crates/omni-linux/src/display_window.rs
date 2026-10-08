@@ -482,10 +482,12 @@ fn present(presenter: &Presenter, framebuffer: &Framebuffer, composer: &Composer
     let max_pixels = display_max_pixels();
     while !stop.load(Ordering::Acquire) {
         if framebuffer.wait_frame(shown + 1, FRAME_WAIT) {
-            let (n, fw, fh, pixels) = framebuffer.frame();
+            let (n, fw, fh, pixels, bgra) = framebuffer.frame_raw();
             if n > shown {
                 shown = n;
-                match presenter.present_rgba(&pixels, fw, fh) {
+                // A BGRA frame (`present_bgra`) is the window's own format: handed over shared.
+                let shown_now = if bgra { presenter.present_bgra(pixels, fw, fh) } else { presenter.present_rgba(&pixels, fw, fh) };
+                match shown_now {
                     Ok(()) => presented += 1,
                     Err(e) if !refused => {
                         refused = true;

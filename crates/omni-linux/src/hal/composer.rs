@@ -408,6 +408,17 @@ impl Client {
             log_paths(&st);
             let mut order: Vec<(i32, i64)> = st.layers.keys().map(|l| (st.device.get(l).map_or(0, |d| d.z), *l)).collect();
             order.sort_unstable();
+            super::compose::levers_from_env();
+            let bgra = super::compose::BGRA_OUT.load(Ordering::Relaxed);
+            if super::compose::ZERO.load(Ordering::Relaxed) {
+                // The copying path's buffers are not needed (~17 MB at 1575x890).
+                if !st.scratch_out.is_empty() || !st.scratch_layers.is_empty() {
+                    st.scratch_out = Vec::new();
+                    st.scratch_layers = HashMap::new();
+                }
+                present_in_place(&st, screen, &order, bgra);
+                return;
+            }
             // Each buffer layer's pixels, read whole from its region (into last frame's memory for
             // that layer, under `compose::FAST`: `read_at` writes every byte the frame uses).
             let fast = super::compose::FAST.load(Ordering::Relaxed);
@@ -434,38 +445,7 @@ impl Client {
                 }
             }
             drop(spare);
-            let mut layers = Vec::new();
-            for &(_, l) in &order {
-                let Some(d) = st.device.get(&l) else { continue };
-                let Some(f) = &d.frame else { continue };
-                if st.hidden.contains(&l) {
-                    continue;
-                }
-                let blend = match d.blend {
-                    Some(common::BlendMode::NONE) => super::compose::Blend::None,
-                    Some(common::BlendMode::COVERAGE) => super::compose::Blend::Coverage,
-                    _ => super::compose::Blend::Premultiplied,
-                };
-                let source = if st.layers.get(&l) == Some(&Composition::SOLID_COLOR) {
-                    super::compose::Source::Color(d.color.unwrap_or_default())
-                } else {
-                    let (Some(b), Some(data), Some(c)) = (d.slot.and_then(|s| d.buffers.get(&s)), pixels.get(&l), &d.crop) else { continue };
-                    if d.one_to_one() {
-                        super::compose::Source::Pixels { data, stride: b.stride as usize, opaque: b.format == RGBX_8888, crop_x: c.left as usize, crop_y: c.top as usize }
-                    } else {
-                        super::compose::Source::Mapped {
-                            data,
-                            stride: b.stride as usize,
-                            rows: b.height as usize,
-                            opaque: b.format == RGBX_8888,
-                            bgra: b.format == BGRA_8888,
-                            crop: (c.left, c.top, c.right, c.bottom),
-                            transform: d.transform.map_or(0, |t| t.0 as u32),
-                        }
-                    }
-                };
-                layers.push(super::compose::Layer { source, frame: (f.left, f.top, f.right, f.bottom), blend, alpha: d.alpha.unwrap_or(1.0) });
-            }
+            let layers: Vec<_> = order.iter().filter_map(|&(_, l)| layer_of(&st, l, pixels.get(&l).map(Vec::as_slice))).collect();
             let Mode { width, height, .. } = screen.mode();
             let need = width as usize * height as usize * 4;
             let mut out = if fast { std::mem::take(&mut st.scratch_out) } else { Vec::new() };
@@ -476,7 +456,16 @@ impl Client {
                 st.scratch_layers = pixels;
             }
             drop(st);
-            screen.framebuffer.present_frame(&out, width, height, width);
+            if bgra {
+                // The frame BGRA for the window: swapped as it is copied in.
+                screen.framebuffer.present_with(width, height, true, |dst| {
+                    for (d, s) in dst.chunks_exact_mut(4).zip(out.chunks_exact(4)) {
+                        d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+                    }
+                });
+            } else {
+                screen.framebuffer.present_frame(&out, width, height, width);
+            }
             if fast {
                 screen.state.lock().scratch_out = out;
             }
@@ -512,6 +501,96 @@ impl Client {
         drop(st);
         screen.framebuffer.present_frame(&pixels, width, height, stride);
     }
+}
+
+/// Layer `l` of the frame as `super::compose` takes it, its buffer's pixels `data`: `None` for a
+/// layer not drawn (hidden chrome, no frame, a buffer layer without its pixels or crop).
+fn layer_of<'a>(st: &State, l: i64, data: Option<&'a [u8]>) -> Option<super::compose::Layer<'a>> {
+    use super::compose::{Blend, Layer, Source};
+    let d = st.device.get(&l)?;
+    let f = d.frame.as_ref()?;
+    if st.hidden.contains(&l) {
+        return None;
+    }
+    let blend = match d.blend {
+        Some(common::BlendMode::NONE) => Blend::None,
+        Some(common::BlendMode::COVERAGE) => Blend::Coverage,
+        _ => Blend::Premultiplied,
+    };
+    let source = if st.layers.get(&l) == Some(&Composition::SOLID_COLOR) {
+        Source::Color(d.color.unwrap_or_default())
+    } else {
+        let (b, data, c) = (d.slot.and_then(|s| d.buffers.get(&s))?, data?, d.crop.as_ref()?);
+        if d.one_to_one() {
+            Source::Pixels { data, stride: b.stride as usize, opaque: b.format == RGBX_8888, crop_x: c.left as usize, crop_y: c.top as usize }
+        } else {
+            Source::Mapped {
+                data,
+                stride: b.stride as usize,
+                rows: b.height as usize,
+                opaque: b.format == RGBX_8888,
+                bgra: b.format == BGRA_8888,
+                crop: (c.left, c.top, c.right, c.bottom),
+                transform: d.transform.map_or(0, |t| t.0 as u32),
+            }
+        }
+    };
+    Some(Layer { source, frame: (f.left, f.top, f.right, f.bottom), blend, alpha: d.alpha.unwrap_or(1.0) })
+}
+
+/// A layer's pixels for [`present_in_place`]: its region's view, borrowed, or (a region with no
+/// view) read out as before.
+enum LayerPixels<'a> {
+    Borrowed(crate::shm::ShmBytes<'a>),
+    Read(Vec<u8>),
+}
+
+impl LayerPixels<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(b) => b,
+            Self::Read(v) => v,
+        }
+    }
+}
+
+/// **The composer's frame without copies** (`compose_zero`, [`super::compose::ZERO`]): each
+/// layer's pixels read where they are in its gralloc region, once every layer's release copy has
+/// landed (the same wait as the copying path's, and the same moment of reading), composed straight
+/// into the framebuffer's next frame by the run path, RGBA or (`bgra`) BGRA (measured in
+/// `hal::compose`'s `frame_cost`).
+fn present_in_place(st: &State, screen: &Screen, order: &[(i32, i64)], bgra: bool) {
+    let buffers: Vec<(i64, &LayerBuffer)> = order
+        .iter()
+        .filter(|(_, l)| st.layers.get(l) == Some(&Composition::DEVICE) && !st.hidden.contains(l))
+        .filter_map(|&(_, l)| {
+            let d = st.device.get(&l)?;
+            Some((l, d.slot.and_then(|s| d.buffers.get(&s))?))
+        })
+        .collect();
+    // Every copy lands before any buffer is read (as a release fence is waited on).
+    for (_, b) in &buffers {
+        crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
+    }
+    let mut pixels: HashMap<i64, LayerPixels<'_>> = HashMap::new();
+    for (l, b) in buffers {
+        let need = b.stride as usize * b.height as usize * 4;
+        let px = match b.shm.bytes(b.pixels_at, need) {
+            Some(bytes) => LayerPixels::Borrowed(bytes),
+            None => {
+                let mut v = vec![0u8; need];
+                if b.shm.read_at(&mut v, b.pixels_at).is_err() {
+                    continue;
+                }
+                LayerPixels::Read(v)
+            }
+        };
+        pixels.insert(l, px);
+    }
+    let layers: Vec<_> = order.iter().filter_map(|&(_, l)| layer_of(st, l, pixels.get(&l).map(LayerPixels::bytes))).collect();
+    let Mode { width, height, .. } = screen.mode();
+    let opts = super::compose::Opts { fast: true, runs: true, bgra };
+    screen.framebuffer.present_with(width, height, bgra, |out| super::compose::compose_into(out, width as usize, height as usize, &layers, opts));
 }
 
 /// `OMNI_COMPOSER_TRACE=layers`: the frame's layers, bottom first, each time their list or their
