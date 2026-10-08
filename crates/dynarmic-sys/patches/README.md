@@ -310,3 +310,26 @@ prelude, far code, link slots, forgotten blocks). One pass over the block map un
 taken shared -- nothing is kept, so emission pays nothing; for `omni-linux`'s `OMNI_GUEST_PROF`
 report thread only. Verified: `omni-cpu/tests/guest_pc_of_host.rs` (264 of 264 sampled code-cache
 addresses of a thread spinning in a known block resolved to it).
+
+### 0037 — x64: `GetSetElimination` under the memory-abort check, precise at every access
+
+x64 (the IR passes are shared; only x64's `TranslateBlock` asks for the precise form). Upstream
+skips `GetSetElimination` whenever `check_halt_on_memory_access` is set, which Omnidroid always
+sets (guests fault on purpose), so every guest register read was a load from `JitState` and every
+write a store. `A64GetSetEliminationOptions::precise_at_memory_aborts` keeps the state exact where
+the block can leave early: at any guest data access (or other side-effecting instruction) no earlier
+Set is erased, while known values are still forwarded to later Gets; a supervisor call, exception,
+cache operation or host call forgets what is known (omni-cpu serves syscalls and inline thunks
+inside `CallSVC`). Process-wide switch `live_precise_get_set` (`od_set_precise_get_set`,
+`OMNI_JIT_PRECISE_GETSET=0|1`, `omni-linux`'s `jit_getset=` lever), read at translation; default 1.
+Two fixes the differential test found, kept on regardless of the switch: `DeadCodeElimination`
+keeps every memory read under the check (`DeadCodeEliminationOptions::keep_memory_reads`) -- it
+dropped a read with no uses, so `LDR XZR/WZR, [Xn]` (ART's stack-overflow probe) never faulted
+whenever `ConstProp` ran -- and a `SetNZCVRaw` value is no longer forwarded to `GetNZCVRaw`
+(the store keeps bits 28-31; upstream forwarded the unmasked word).
+Measured (`omni-cpu/tests/bench.rs::the_precise_get_set_elimination`, E-cores, idle priority,
+ns/iteration off -> on): register-bound 2.70 -> 2.43, memory-heavy 2.80 -> 2.42, mixed 12-insn
+4.28 -> 3.22 (the check-off bound: 2.39, 2.44, 3.24). Verified: `omni-cpu/tests/precise_getset.rs`
+(a mid-block fault after eliminated writes stops with `X0 == 2`, the flags and `Q7` exact, for 9
+access kinds; unread loads fault; 4,000 random blocks, ~2/3 faulting mid-block, identical state
+with the pass and without; all three fail with the precision removed).

@@ -42,6 +42,7 @@ dynarmic/
                and ../patches/0034-x64-unsafe-fp-flags-switched-at-run-time.patch
                and ../patches/0035-x64-a-thread-s-fast-dispatch-table-at-its-process-s-size.patch
                and ../patches/0036-x64-shared-cache-host-code-to-guest-pc.patch
+               and ../patches/0037-x64-get-set-elimination-precise-at-memory-aborts.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

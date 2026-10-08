@@ -8,6 +8,10 @@
 //! - `jit_fp=<hex mask>`: dynarmic's unsafe floating-point flags
 //!   (`omni_cpu::dynarmic::set_live_fp_optimizations`), then every process's translations are
 //!   dropped so what runs next is translated with them. 0 is the accurate default.
+//! - `jit_getset=0|1`: dynarmic's `GetSetElimination` in the form precise at every guest memory
+//!   access (patch 0037, `omni_cpu::dynarmic::set_precise_get_set`), then every process's
+//!   translations are dropped. 1 is the default; 0 is upstream's behaviour under the memory-abort
+//!   check (every guest register read a load from `JitState`, every write a store).
 //!
 //! - `compose_fast=0|1`: the composer's fast path (`crate::hal::compose::FAST`: the same pixels
 //!   in fewer passes, its buffers kept from frame to frame). On by default.
@@ -63,6 +67,19 @@ pub fn apply(line: &str) -> Option<String> {
                 p.trim_code();
             }
             Some(format!("jit_fp={kept:#x}: {} processes' translations dropped", live.len()))
+        }
+        "jit_getset" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let kept = omni_cpu::dynarmic::set_precise_get_set(on);
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            Some(format!("jit_getset={}: {} processes' translations dropped", u8::from(kept), live.len()))
         }
         "compose_fast" => {
             let on = match value.trim() {
@@ -277,6 +294,18 @@ mod tests {
         apply("vk_batch=0").expect("understood");
         assert!(!crate::gpu::FAST.load(Ordering::Relaxed));
         assert!(!crate::gpu::BATCH.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_getset_lever_switches_the_precise_pass() {
+        let want = cfg!(target_arch = "x86_64");
+        let done = apply("jit_getset=0").expect("understood");
+        assert!(done.starts_with("jit_getset=0"), "{done}");
+        assert!(!omni_cpu::dynarmic::precise_get_set());
+        let done = apply("jit_getset=1").expect("understood");
+        assert!(done.starts_with(if want { "jit_getset=1" } else { "jit_getset=0" }), "{done}");
+        assert_eq!(omni_cpu::dynarmic::precise_get_set(), want);
+        assert_eq!(apply("jit_getset=on"), None);
     }
 
     #[test]

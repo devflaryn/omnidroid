@@ -242,8 +242,9 @@ pub struct DynarmicOptions {
     /// (`EmitCheckMemoryAbort` is emitted inside the deferred abort block), so the cost on the hot
     /// path is zero.
     ///
-    /// It is not free, though: `A64::Jit::Impl` skips `GetSetElimination` entirely when this is set.
-    /// The measured cost of that is in the Task 3 report.
+    /// It was not free, though: upstream skips `GetSetElimination` entirely when this is set (the
+    /// cost is in the Task 3 report). Patch 0037 runs a precise form of the pass instead, while
+    /// [`set_precise_get_set`] is on (the default on x64).
     pub check_halt_on_memory_access: bool,
     /// Whether to check, **per run slice**, that guest memory never went through a host callback
     /// unless the slice ended in a memory fault.
@@ -359,6 +360,33 @@ pub fn set_live_fp_optimizations(mask: u32) -> u32 {
     unsafe { dynarmic_sys::od_set_live_fp_optimizations(mask) }
 }
 
+/// **Whether `GetSetElimination` runs, in its precise form, where
+/// [`check_halt_on_memory_access`](DynarmicOptions::check_halt_on_memory_access) is set** (patch
+/// 0037, x64): process-wide, for every block translated from now on; returns what is in force
+/// (`false` on arm64, where it does nothing). Blocks already translated keep what they were
+/// translated with -- [`DynarmicBackend::clear_code_cache`] has them translated again.
+///
+/// Upstream skips the pass under the memory-abort check, so every guest register read is a load
+/// from `JitState` and every write a store, because the pass erases a write that a later write to
+/// the same register overwrites and a fault between the two would then see the older value. The
+/// precise form keeps every write that comes before a guest data access (or anything else that can
+/// leave the block or call out) and still forwards known values to later reads, so a fault stops
+/// with exactly the state it stopped with before (`tests/precise_getset.rs`).
+///
+/// **On by default**; `OMNI_JIT_PRECISE_GETSET=0` (announced by
+/// [`DynarmicOptions::with_environment`]) or `omni-linux`'s `jit_getset=0` lever turns it off.
+pub fn set_precise_get_set(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_precise_get_set(u32::from(on)) != 0 }
+}
+
+/// What [`set_precise_get_set`] last set (`false` on arm64).
+#[must_use]
+pub fn precise_get_set() -> bool {
+    // SAFETY: loads one process-wide atomic.
+    unsafe { dynarmic_sys::od_precise_get_set() != 0 }
+}
+
 impl DynarmicOptions {
     /// Bytes of one guest thread's fast-dispatch table under these options (patch 0035): the
     /// asked-for entries where the shared cache honours them, else the pin's 64 KiB.
@@ -409,6 +437,7 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_EXCLUSIVE_MONITOR=global|value` -- [`ExclusiveMonitor`];
     /// * `OMNI_JIT_OPTIMIZATIONS=<hex mask>` -- [`optimizations_override`](Self::optimizations_override);
     /// * `OMNI_JIT_CHECK_HALT_ON_MEMORY=0|1` -- [`check_halt_on_memory_access`](Self::check_halt_on_memory_access);
+    /// * `OMNI_JIT_PRECISE_GETSET=0|1` -- [`set_precise_get_set`] (process-wide);
     /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
     /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
     ///   where each thread has its own cache (arm64).
@@ -463,6 +492,19 @@ impl DynarmicOptions {
                 "check_halt_on_memory_access = {} (OMNI_JIT_CHECK_HALT_ON_MEMORY). A measurement: \
                  off, a guest fault no longer stops at the faulting instruction",
                 self.check_halt_on_memory_access
+            ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_PRECISE_GETSET") {
+            let on = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_PRECISE_GETSET={other:?} is not 0 or 1"),
+            };
+            let kept = set_precise_get_set(on);
+            say(&format!(
+                "precise GetSetElimination {} (OMNI_JIT_PRECISE_GETSET){}",
+                if kept { "on" } else { "off" },
+                if on && !kept { ": not on this host's backend" } else { "" }
             ));
         }
         if std::env::var_os("OMNI_JIT_RETRANSLATION").is_some() {

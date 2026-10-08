@@ -28,6 +28,8 @@
  * which pulls in the emitter's whole include set). */
 namespace Dynarmic::Backend::X64 {
 extern std::atomic<std::uint32_t> live_fp_optimizations;
+/* Patch 0037's switch, likewise. */
+extern std::atomic<std::uint32_t> live_precise_get_set;
 }
 #endif
 #if defined(__aarch64__)
@@ -908,6 +910,24 @@ uint32_t od_set_live_fp_optimizations(uint32_t mask) {
     return kept;
 #else
     (void)mask;
+    return 0;
+#endif
+}
+
+uint32_t od_set_precise_get_set(uint32_t on) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::live_precise_get_set.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
+    return on != 0 ? 1u : 0u;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+uint32_t od_precise_get_set(void) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    return Dynarmic::Backend::X64::live_precise_get_set.load(std::memory_order_relaxed);
+#else
     return 0;
 #endif
 }
