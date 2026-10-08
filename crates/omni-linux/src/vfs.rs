@@ -115,6 +115,12 @@ impl Sysroot {
             }
             manifest.entries.insert(file.guest, file.entry);
         }
+        // `OMNI_BOOT_IMAGE_UNCOMPRESSED=1`: the boot image's files uncompressed, so ART maps them
+        // (`crate::boot_image`); never the sysroot's own objects.
+        if crate::boot_image::enabled() {
+            let n = crate::boot_image::substitute(dir, &mut manifest, &mut overlay);
+            eprintln!("[bootimage] pid {}: {n} boot image files uncompressed (OMNI_BOOT_IMAGE_UNCOMPRESSED)", std::process::id());
+        }
         // What the device leaves out of the image (`device::left_out`): each path and what is under it.
         let gpu = crate::gpu::backend::left_out(crate::gpu::backend::backend());
         for gone in crate::device::left_out().into_iter().chain(gpu.iter().copied()) {

@@ -510,6 +510,9 @@ impl Mm {
             self.forget(at, len);
             self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
         };
+        if crate::boot_image::enabled() && crate::boot_image::is_boot_art(&guest) {
+            report_boot_image(p, &file, &guest, at.is_some(), at.unwrap_or(0), len, req.offset);
+        }
         let at = match at {
             Some(a) => {
                 if len > in_file {
@@ -554,6 +557,25 @@ impl Mm {
 fn is_installed(guest: &[u8]) -> bool {
     let path = String::from_utf8_lossy(guest);
     path.starts_with("/data/app/") && path.contains("/lib/") && path.ends_with(".so") && !path.contains(".tmp/")
+}
+
+/// `[bootimage]`: how a boot image file was mapped (`OMNI_BOOT_IMAGE_UNCOMPRESSED`) -- a view
+/// (shared, copy-on-write per page) or a private copy, and whether at the address it was compiled
+/// for (`image_begin` in its header: not relocated) or elsewhere.
+fn report_boot_image(p: &Process, file: &crate::fd::OpenFile, guest: &[u8], view: bool, at: u64, len: u64, offset: u64) {
+    let mut header = vec![0u8; crate::boot_image::HEADER_SIZE];
+    let begin = crate::fd::pread_all(file, &mut header, 0).ok().and_then(|_| crate::boot_image::image_begin(&header));
+    let name = String::from_utf8_lossy(guest);
+    let place = match begin {
+        Some(b) if offset == 0 && view && at == u64::from(b) => "at its compiled address (not relocated)".to_string(),
+        Some(b) if offset == 0 && view => format!("relocated by {:+#x}", at as i64 - i64::from(b)),
+        _ => String::new(),
+    };
+    if view {
+        eprintln!("[bootimage] pid {} {name}: a view at {at:#x} (+{len:#x}, offset {offset:#x}) {place}", p.sys.pid);
+    } else {
+        eprintln!("[bootimage] pid {} {name}: a private copy (+{len:#x}, offset {offset:#x}) -- not shared", p.sys.pid);
+    }
 }
 
 /// `OMNI_PROP_FULL_COPY=1`: a mapped prop area is written whole, zero tail and all (the old way) --
