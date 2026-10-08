@@ -302,6 +302,9 @@ impl GuestMem {
 mod timing_probe {
     use super::*;
 
+    /// Where a 32-byte checked copy's time goes (`--ignored --nocapture`). MEASURED on an E-core
+    /// (i7-13700F, Windows): `read` 123 ns, `read_into` 56 ns -- the Vec's allocation and free are
+    /// over half of `read` -- of which the layout lock 15, `check` 36 (`region_at` 14), the copy 6.
     #[test]
     #[ignore]
     fn where_a_checked_copy_goes() {
