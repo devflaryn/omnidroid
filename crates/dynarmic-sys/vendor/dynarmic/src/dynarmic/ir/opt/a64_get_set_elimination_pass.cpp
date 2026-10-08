@@ -15,7 +15,7 @@
 
 namespace Dynarmic::Optimization {
 
-void A64GetSetElimination(IR::Block& block) {
+void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
     using Iterator = IR::Block::iterator;
 
     enum class TrackingType {
@@ -141,9 +141,48 @@ void A64GetSetElimination(IR::Block& block) {
         }
         case IR::Opcode::A64SetNZCVRaw: {
             do_set(nzcv_info, inst->GetArg(0), inst, TrackingType::NZCVRaw);
+            // Omnidroid patch 0037: the store keeps bits 28-31 only, and `GetNZCVRaw` reads back
+            // only those, so the value written is not the value a later read sees (`MSR NZCV, Xt`
+            // with any low bit set, then `MRS Xt, NZCV`). Upstream forwarded it unmasked; found by
+            // omni-cpu's `tests/precise_getset.rs` differential. Not forwarded: the next read
+            // loads, and starts tracking from there.
+            nzcv_info.register_value = {};
             break;
         }
         default: {
+            if (opt.precise_at_memory_aborts) {
+                // Omnidroid patch 0037. With `check_halt_on_memory_access` the block can return to
+                // the dispatcher from inside: `EmitCheckMemoryAbort`, after any guest data access,
+                // stores this instruction's PC and leaves, and the guest state in `JitState` must
+                // then be exactly what the instructions before it wrote. So an access is a point
+                // past which no earlier Set may be erased (a later Set to the same register would
+                // otherwise take its place, and the fault would see the value before both). What
+                // is known of each register is kept: the access writes no guest register, and on
+                // the path that does return, nothing after it runs.
+                //
+                // Instructions that call into the host with the guest state in `JitState` -- a
+                // supervisor call (omni-cpu serves syscalls and inline thunks there, reading and
+                // writing guest registers, and continues), an exception, a cache operation, a host
+                // function -- also forget what is known, as the callee may have changed it.
+                if (inst->CausesCPUException()
+                    || inst->GetOpcode() == IR::Opcode::A64DataCacheOperationRaised
+                    || inst->GetOpcode() == IR::Opcode::A64InstructionCacheOperationRaised
+                    || inst->GetOpcode() == IR::Opcode::CallHostFunction) {
+                    reg_info = {};
+                    vec_info = {};
+                    sp_info = {};
+                    nzcv_info = {};
+                } else if (inst->IsMemoryReadOrWrite() || inst->MayHaveSideEffects()) {
+                    for (auto& info : reg_info) {
+                        info.set_instruction_present = false;
+                    }
+                    for (auto& info : vec_info) {
+                        info.set_instruction_present = false;
+                    }
+                    sp_info.set_instruction_present = false;
+                    nzcv_info.set_instruction_present = false;
+                }
+            }
             if (inst->ReadsFromCPSR() || inst->WritesToCPSR()) {
                 nzcv_info = {};
             }

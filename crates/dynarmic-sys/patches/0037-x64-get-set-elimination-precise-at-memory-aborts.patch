@@ -1,0 +1,177 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index eb0225b..d84b24d 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -38,6 +38,7 @@ namespace Dynarmic::Backend::X64 {
+ using namespace Xbyak::util;
+ 
+ std::atomic<std::uint32_t> live_fp_optimizations{0};
++std::atomic<std::uint32_t> live_precise_get_set{1};
+ 
+ A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
+         : EmitContext(reg_alloc, block), conf(conf) {}
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index f679a60..c2758ae 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -38,6 +38,12 @@ class RegAlloc;
+ extern std::atomic<std::uint32_t> live_fp_optimizations;
+ inline constexpr std::uint32_t live_fp_optimizations_allowed = 0x000F0000;
+ 
++/// Omnidroid patch 0037: non-zero runs `GetSetElimination` in its precise form for every block
++/// translated from now on whose config sets `check_halt_on_memory_access` (which otherwise skips
++/// the pass). Process-wide, read at translation: a block translated before the switch keeps what
++/// it was translated with.
++extern std::atomic<std::uint32_t> live_precise_get_set;
++
+ struct A64EmitContext final : public EmitContext {
+     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
+ 
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index 8e6cff3..ff79c57 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -76,13 +76,19 @@ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const U
+     Optimization::PolyfillPass(ir_block, polyfill_options);
+     Optimization::A64CallbackConfigPass(ir_block, conf);
+     Optimization::NamingPass(ir_block);
+-    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
+-        Optimization::A64GetSetElimination(ir_block);
+-        Optimization::DeadCodeElimination(ir_block);
++    // Patch 0037: under `check_halt_on_memory_access` upstream skips the pass altogether (every
++    // guest register read a load from `JitState`, every write a store); the precise variant keeps
++    // the state exact wherever the block can leave early, so it runs there too, while switched on.
++    // And there a load is never dead code: it may fault, which is the point of the check.
++    const bool precise = conf.check_halt_on_memory_access && live_precise_get_set.load(std::memory_order_relaxed) != 0;
++    const Optimization::DeadCodeEliminationOptions dce{.keep_memory_reads = conf.check_halt_on_memory_access};
++    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && (!conf.check_halt_on_memory_access || precise)) {
++        Optimization::A64GetSetElimination(ir_block, {.precise_at_memory_aborts = precise});
++        Optimization::DeadCodeElimination(ir_block, dce);
+     }
+     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
+         Optimization::ConstantPropagation(ir_block);
+-        Optimization::DeadCodeElimination(ir_block);
++        Optimization::DeadCodeElimination(ir_block, dce);
+     }
+     if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
+         Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
+diff --git a/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp b/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
+index f492015..bc97aae 100644
+--- a/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
++++ b/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
+@@ -15,7 +15,7 @@
+ 
+ namespace Dynarmic::Optimization {
+ 
+-void A64GetSetElimination(IR::Block& block) {
++void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+     using Iterator = IR::Block::iterator;
+ 
+     enum class TrackingType {
+@@ -141,9 +141,48 @@ void A64GetSetElimination(IR::Block& block) {
+         }
+         case IR::Opcode::A64SetNZCVRaw: {
+             do_set(nzcv_info, inst->GetArg(0), inst, TrackingType::NZCVRaw);
++            // Omnidroid patch 0037: the store keeps bits 28-31 only, and `GetNZCVRaw` reads back
++            // only those, so the value written is not the value a later read sees (`MSR NZCV, Xt`
++            // with any low bit set, then `MRS Xt, NZCV`). Upstream forwarded it unmasked; found by
++            // omni-cpu's `tests/precise_getset.rs` differential. Not forwarded: the next read
++            // loads, and starts tracking from there.
++            nzcv_info.register_value = {};
+             break;
+         }
+         default: {
++            if (opt.precise_at_memory_aborts) {
++                // Omnidroid patch 0037. With `check_halt_on_memory_access` the block can return to
++                // the dispatcher from inside: `EmitCheckMemoryAbort`, after any guest data access,
++                // stores this instruction's PC and leaves, and the guest state in `JitState` must
++                // then be exactly what the instructions before it wrote. So an access is a point
++                // past which no earlier Set may be erased (a later Set to the same register would
++                // otherwise take its place, and the fault would see the value before both). What
++                // is known of each register is kept: the access writes no guest register, and on
++                // the path that does return, nothing after it runs.
++                //
++                // Instructions that call into the host with the guest state in `JitState` -- a
++                // supervisor call (omni-cpu serves syscalls and inline thunks there, reading and
++                // writing guest registers, and continues), an exception, a cache operation, a host
++                // function -- also forget what is known, as the callee may have changed it.
++                if (inst->CausesCPUException()
++                    || inst->GetOpcode() == IR::Opcode::A64DataCacheOperationRaised
++                    || inst->GetOpcode() == IR::Opcode::A64InstructionCacheOperationRaised
++                    || inst->GetOpcode() == IR::Opcode::CallHostFunction) {
++                    reg_info = {};
++                    vec_info = {};
++                    sp_info = {};
++                    nzcv_info = {};
++                } else if (inst->IsMemoryReadOrWrite() || inst->MayHaveSideEffects()) {
++                    for (auto& info : reg_info) {
++                        info.set_instruction_present = false;
++                    }
++                    for (auto& info : vec_info) {
++                        info.set_instruction_present = false;
++                    }
++                    sp_info.set_instruction_present = false;
++                    nzcv_info.set_instruction_present = false;
++                }
++            }
+             if (inst->ReadsFromCPSR() || inst->WritesToCPSR()) {
+                 nzcv_info = {};
+             }
+diff --git a/src/dynarmic/ir/opt/dead_code_elimination_pass.cpp b/src/dynarmic/ir/opt/dead_code_elimination_pass.cpp
+index 0d0de18..ecf9a15 100644
+--- a/src/dynarmic/ir/opt/dead_code_elimination_pass.cpp
++++ b/src/dynarmic/ir/opt/dead_code_elimination_pass.cpp
+@@ -10,10 +10,16 @@
+ 
+ namespace Dynarmic::Optimization {
+ 
+-void DeadCodeElimination(IR::Block& block) {
++void DeadCodeElimination(IR::Block& block, DeadCodeEliminationOptions opt) {
+     // We iterate over the instructions in reverse order.
+     // This is because removing an instruction reduces the number of uses for earlier instructions.
+     for (auto& inst : mcl::iterator::reverse(block)) {
++        // Omnidroid patch 0037: a guest load can fault, and where faults are precise
++        // (`check_halt_on_memory_access`) that is an effect even when its value is never read --
++        // `LDR WZR, [Xn]` is how ART probes below the stack for overflow.
++        if (opt.keep_memory_reads && inst.IsMemoryRead()) {
++            continue;
++        }
+         if (!inst.HasUses() && !inst.MayHaveSideEffects()) {
+             inst.Invalidate();
+         }
+diff --git a/src/dynarmic/ir/opt/passes.h b/src/dynarmic/ir/opt/passes.h
+index 703145b..8b03de4 100644
+--- a/src/dynarmic/ir/opt/passes.h
++++ b/src/dynarmic/ir/opt/passes.h
+@@ -32,14 +32,29 @@ struct A32GetSetEliminationOptions {
+     bool convert_nz_to_nzc = false;
+ };
+ 
++/// Omnidroid patch 0037.
++struct DeadCodeEliminationOptions {
++    /// Keep every guest memory read, used or not: under `check_halt_on_memory_access` a read that
++    /// faults must stop the guest whether or not anything reads its value.
++    bool keep_memory_reads = false;
++};
++
++/// Omnidroid patch 0037.
++struct A64GetSetEliminationOptions {
++    /// Keep the guest state exact at every instruction that can leave the block early (any guest
++    /// data access, under `check_halt_on_memory_access`): no Set before it is erased by a Set
++    /// after it. Reads are still forwarded across it.
++    bool precise_at_memory_aborts = false;
++};
++
+ void PolyfillPass(IR::Block& block, const PolyfillOptions& opt);
+ void A32ConstantMemoryReads(IR::Block& block, A32::UserCallbacks* cb);
+ void A32GetSetElimination(IR::Block& block, A32GetSetEliminationOptions opt);
+ void A64CallbackConfigPass(IR::Block& block, const A64::UserConfig& conf);
+-void A64GetSetElimination(IR::Block& block);
++void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt = {});
+ void A64MergeInterpretBlocksPass(IR::Block& block, A64::UserCallbacks* cb);
+ void ConstantPropagation(IR::Block& block);
+-void DeadCodeElimination(IR::Block& block);
++void DeadCodeElimination(IR::Block& block, DeadCodeEliminationOptions opt = {});
+ void IdentityRemovalPass(IR::Block& block);
+ void VerificationPass(const IR::Block& block);
+ void NamingPass(IR::Block& block);

@@ -76,13 +76,19 @@ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const U
     Optimization::PolyfillPass(ir_block, polyfill_options);
     Optimization::A64CallbackConfigPass(ir_block, conf);
     Optimization::NamingPass(ir_block);
-    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
-        Optimization::A64GetSetElimination(ir_block);
-        Optimization::DeadCodeElimination(ir_block);
+    // Patch 0037: under `check_halt_on_memory_access` upstream skips the pass altogether (every
+    // guest register read a load from `JitState`, every write a store); the precise variant keeps
+    // the state exact wherever the block can leave early, so it runs there too, while switched on.
+    // And there a load is never dead code: it may fault, which is the point of the check.
+    const bool precise = conf.check_halt_on_memory_access && live_precise_get_set.load(std::memory_order_relaxed) != 0;
+    const Optimization::DeadCodeEliminationOptions dce{.keep_memory_reads = conf.check_halt_on_memory_access};
+    if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && (!conf.check_halt_on_memory_access || precise)) {
+        Optimization::A64GetSetElimination(ir_block, {.precise_at_memory_aborts = precise});
+        Optimization::DeadCodeElimination(ir_block, dce);
     }
     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
         Optimization::ConstantPropagation(ir_block);
-        Optimization::DeadCodeElimination(ir_block);
+        Optimization::DeadCodeElimination(ir_block, dce);
     }
     if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
         Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);

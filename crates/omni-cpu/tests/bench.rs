@@ -108,6 +108,84 @@ fn register_loop(iterations: u64) -> Vec<u32> {
     program
 }
 
+/// Register-heavy with some memory: twelve instructions per iteration, ten of them register
+/// operations over eleven guest registers that each feed the next, one load and one store. The
+/// shape of ordinary compiled game code (a value loaded, combined with several live ones, stored),
+/// and the workload where the precise `GetSetElimination` (patch 0037) has both something to forward
+/// and accesses it must stay exact at.
+fn mixed_loop(data: usize, iterations: u64) -> Vec<u32> {
+    let mut program = mov64(0, data as u64);
+    program.extend(mov64(1, iterations));
+    for r in 2..=10 {
+        program.push(movz(r, r as u16, 0));
+    }
+    let loop_start = program.len();
+    program.push(add_imm(2, 2, 1));
+    program.push(add_reg(3, 2, 4));
+    program.push(add_reg(4, 3, 2));
+    program.push(add_reg(5, 4, 3));
+    program.push(add_reg(6, 5, 2));
+    program.push(add_reg(7, 6, 5));
+    program.push(ldr_imm(8, 0, 0));
+    program.push(add_reg(9, 8, 7));
+    program.push(str_imm(9, 0, 8));
+    program.push(add_reg(10, 9, 6));
+    program.push(subs_imm(1, 1, 1));
+    let here = program.len();
+    program.push(b_cond(1, loop_start as i32 - here as i32));
+    program.push(ret(30));
+    program
+}
+
+/// **What patch 0037's precise `GetSetElimination` buys** under `check_halt_on_memory_access`.
+///
+/// Three rows per workload: the check off (upstream's pass, the bound), the check on with the
+/// pass skipped (`OMNI_JIT_PRECISE_GETSET=0`, the configuration every guest ran before), and the
+/// check on with the precise pass (the default).
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_precise_get_set_elimination() {
+    let _serial = serialized();
+    let was = omni_cpu::dynarmic::precise_get_set();
+    println!("\n== precise GetSetElimination, patch 0037 (n = {N} per configuration) ==");
+    let workloads: [(&str, u64, fn(usize, u64) -> Vec<u32>); 3] = [
+        ("register-bound, 5 insns/iter, no memory", 5, |_, n| register_loop(n)),
+        ("memory-heavy, 5 insns/iter, 2 accesses", 5, memory_loop),
+        ("mixed, 12 insns/iter, 2 accesses", 12, mixed_loop),
+    ];
+    for (workload, per_iteration, build) in workloads {
+        println!("  {workload}:");
+        for (label, check, precise) in [
+            ("check off, upstream pass     ", false, true),
+            ("check on,  no pass (before)  ", true, false),
+            ("check on,  precise pass (now)", true, true),
+        ] {
+            omni_cpu::dynarmic::set_precise_get_set(precise);
+            let guest = Guest::with_options(DynarmicOptions {
+                check_halt_on_memory_access: check,
+                ..Default::default()
+            });
+            let entry = guest.load(&build(guest.data, ITERATIONS));
+            guest.write_u64(guest.data, 1);
+            let (mut cpu, sentinel) = guest.thread();
+            let summary = measure(|| {
+                cpu.set_x(x(30), sentinel as u64);
+                let exit = cpu.run(entry, RunLimit::Unlimited).expect("the loop runs");
+                assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+            });
+            println!(
+                "    {label} : {:6.3} ns/iter median  [{:6.3} .. {:6.3}]  {:6.0} Mguest-insn/s",
+                summary.median.as_secs_f64() * 1e9 / ITERATIONS as f64,
+                summary.min.as_secs_f64() * 1e9 / ITERATIONS as f64,
+                summary.max.as_secs_f64() * 1e9 / ITERATIONS as f64,
+                (ITERATIONS * per_iteration) as f64 / summary.median.as_secs_f64() / 1e6,
+            );
+        }
+    }
+    omni_cpu::dynarmic::set_precise_get_set(was);
+    println!();
+}
+
 const ITERATIONS: u64 = 1_000_000;
 /// Five instructions in the loop body, plus a prologue this ignores.
 const LOOP_INSTRUCTIONS: u64 = ITERATIONS * 5;
@@ -182,7 +260,9 @@ fn identity_mapping_against_the_default_width() {
 /// **What `check_halt_on_memory_access` costs.**
 ///
 /// The emitted check itself is on the abort path only, so what is being measured here is the loss of
-/// `GetSetElimination`, which `A64::Jit::Impl` skips whenever this flag is set.
+/// `GetSetElimination`, which upstream skips whenever this flag is set. Since patch 0037 the check-on
+/// row runs the precise form of the pass instead (the default; `OMNI_JIT_PRECISE_GETSET=0` gives the
+/// old figure), and [`the_precise_get_set_elimination`] sets the three side by side.
 #[test]
 #[ignore = "measurement, not a test"]
 fn the_cost_of_stopping_at_the_faulting_instruction() {

@@ -974,4 +974,21 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_live_fp_optimizations(mask: u32) -> u32;
+
+    /// Patch 0037 (x64 only): non-zero runs `GetSetElimination`, in a form precise at every guest
+    /// data access, on every block translated from now on by a jit whose config sets
+    /// `check_halt_on_memory_access` -- which otherwise skips the pass, so that every guest
+    /// register read is a load from `JitState` and every write a store. Blocks already translated
+    /// keep what they were translated with -- clear the cache to have them again. Returns the value
+    /// in force (1 or 0); 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_precise_get_set(on: u32) -> u32;
+
+    /// Patch 0037: the switch [`od_set_precise_get_set`] sets (1 or 0; 0 on arm64).
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it loads one process-wide atomic.
+    pub fn od_precise_get_set() -> u32;
 }
