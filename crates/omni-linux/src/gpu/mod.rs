@@ -392,6 +392,17 @@ pub(crate) mod stats {
         on()
     }
 
+    /// The release worker's own processor time while it waited for the GPU (`(release: GPU wait)`
+    /// is wall time): its thread's CPU time (the host's scheduler ticks, summed over a period) and
+    /// cycles, printed after the rows -- what tells a sleeping wait from a spinning one in a world.
+    static RELEASE_WAIT_CPU_NS: AtomicU64 = AtomicU64::new(0);
+    static RELEASE_WAIT_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn add_release_wait_cpu(cpu: Duration, cycles: u64) {
+        RELEASE_WAIT_CPU_NS.fetch_add(cpu.as_nanos() as u64, Relaxed);
+        RELEASE_WAIT_CYCLES.fetch_add(cycles, Relaxed);
+    }
+
     pub(crate) fn add(id: u32, took: Duration) {
         // The Android extension's commands (0x1000..) in the last slots.
         let i = if id >= super::special::ID_GRALLOC_USAGE { SLOTS - 8 + ((id - super::special::ID_GRALLOC_USAGE) as usize).min(7) } else { (id as usize).min(SLOTS - 9) };
@@ -428,8 +439,10 @@ pub(crate) mod stats {
             None => super::generated::COMMANDS.get(i).map_or_else(|| format!("#{i}"), |c| c.0.to_string()),
         };
         let top: Vec<String> = rows.iter().take(14).map(|(n, c, m, i)| format!("{} {c}x {:.1}ms (max {:.1})", name(*i), *n as f64 / 1e6, *m as f64 / 1e6)).collect();
+        let (wait_cpu, wait_cycles) = (RELEASE_WAIT_CPU_NS.swap(0, Relaxed), RELEASE_WAIT_CYCLES.swap(0, Relaxed));
+        let wait = if wait_cycles > 0 { format!("; (release: GPU wait) thread CPU {:.1}ms, {:.0} Mcycles", wait_cpu as f64 / 1e6, wait_cycles as f64 / 1e6) } else { String::new() };
         eprintln!(
-            "[gpu-stats] host pid {} {every}s: {calls} calls, {:.1} ms in the host: {}",
+            "[gpu-stats] host pid {} {every}s: {calls} calls, {:.1} ms in the host: {}{wait}",
             std::process::id(),
             ns as f64 / 1e6,
             top.join(", ")
@@ -438,10 +451,11 @@ pub(crate) mod stats {
 }
 
 /// **Microseconds between polls of a guest `vkWaitForFences`**, 0 for the host driver's own wait
-/// (`omni_linux::lever`'s `fence_poll=`). NVIDIA's `vkWaitForFences` spins: a guest thread waiting
-/// for its frame's fences burns its core for as long as the GPU takes. Polled -- the fences asked
-/// with a zero timeout, a sleep between -- the thread gives the core up while it waits, at the cost
-/// of up to one period of latency when the fences signal.
+/// (`omni_linux::lever`'s `fence_poll=`). Polled -- the fences asked with a zero timeout, a sleep
+/// between -- at the cost of up to one period of latency when the fences signal. It was taken that
+/// NVIDIA's `vkWaitForFences` spins; MEASURED otherwise (`native::wait_tests::release_wait_cost`,
+/// RTX 4060, driver 591.86, 2026-10-09): a 4.8 ms wait costs the waiting thread 0.08 ms of CPU, and
+/// polling every 50-500 us costs 0.15-0.20 ms and adds 0.3-0.7 ms. Kept as a lever for in-world A/B.
 pub static FENCE_POLL_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// `vkWaitForFences(device, count, fences, waitAll, timeout)`, polled every `every_us`: the same

@@ -37,6 +37,10 @@
 //! - `present_gpu=0|1`: the display window presented through a Vulkan swapchain (a copy into
 //!   host-visible memory, the scaling a GPU blit) instead of GDI's `StretchDIBits`
 //!   (`crate::gpu::window_present`). Off by default.
+//! - `release_wait=spin|poll` (and `release_poll=<us>`, which also means `poll`): how the host waits
+//!   for its own fences -- the release worker's copy, a sync-file export -- the driver's wait (the
+//!   default) or asked every `<us>` (100 by default) with a sleep between
+//!   (`crate::gpu::native::RELEASE_WAIT_US`; `event` measured not available).
 //! - `gralloc_direct=0|1`: an app's released frame copied by the GPU straight into its gralloc
 //!   region (imported as Vulkan memory) instead of into a staging buffer the release worker then
 //!   copies on the CPU (`crate::gpu::native::DIRECT`). Needs devices made with
@@ -93,6 +97,10 @@
 //! `OMNI_ZERO_RECLAIM=<seconds>` and `OMNI_MADV_FREE=1` the last two.
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// `release_wait=poll`'s period when `release_poll` has not set one: 100 us (measured: +0.31 ms of
+/// latency a wait, `crate::gpu::native::RELEASE_WAIT_US`).
+const RELEASE_POLL_DEFAULT_US: u32 = 100;
 
 /// How often the file is read.
 pub const POLL: Duration = Duration::from_millis(250);
@@ -287,6 +295,27 @@ pub fn apply(line: &str) -> Option<String> {
             crate::mm::MADV_FREE_DISCARDS.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("madv_free={}: MADV_FREE {}", u8::from(on), if on { "discards the range" } else { "is a hint" }))
         }
+        "release_wait" => {
+            use std::sync::atomic::Ordering::Relaxed;
+            let w = &crate::gpu::native::RELEASE_WAIT_US;
+            match value.trim() {
+                "spin" => w.store(0, Relaxed),
+                "poll" => {
+                    if w.load(Relaxed) == 0 {
+                        w.store(RELEASE_POLL_DEFAULT_US, Relaxed);
+                    }
+                }
+                "event" => return Some("release_wait=event: not available (an exported fence's Win32 handle is no event on this driver; measured): unchanged".into()),
+                _ => return None,
+            }
+            let us = w.load(Relaxed);
+            Some(if us == 0 { "release_wait=spin: the host driver's own fence wait".into() } else { format!("release_wait=poll: the fence asked every {us} us") })
+        }
+        "release_poll" => {
+            let us: u32 = value.trim().parse().ok().filter(|&us| us > 0)?;
+            crate::gpu::native::RELEASE_WAIT_US.store(us, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("release_poll={us}: release_wait=poll, the fence asked every {us} us"))
+        }
         "gralloc_direct" => {
             let on = match value.trim() {
                 "1" => true,
@@ -431,6 +460,17 @@ mod tests {
         assert!(crate::gpu::native::DIRECT.load(Ordering::Relaxed));
         apply("gralloc_direct=0").expect("understood");
         assert!(!crate::gpu::native::DIRECT.load(Ordering::Relaxed));
+        let w = &crate::gpu::native::RELEASE_WAIT_US;
+        apply("release_wait=poll").expect("understood");
+        assert_eq!(w.load(Ordering::Relaxed), 100);
+        apply("release_poll=250").expect("understood");
+        assert_eq!(w.load(Ordering::Relaxed), 250);
+        assert!(apply("release_wait=event").expect("answered").contains("not available"));
+        assert_eq!(w.load(Ordering::Relaxed), 250, "event changes nothing");
+        apply("release_wait=spin").expect("understood");
+        assert_eq!(w.load(Ordering::Relaxed), 0);
+        assert_eq!(apply("release_poll=0"), None);
+        assert_eq!(apply("release_wait=sleep"), None);
     }
 
     #[test]
