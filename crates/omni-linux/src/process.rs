@@ -110,6 +110,11 @@ pub fn all_live() -> Vec<Arc<Process>> {
 }
 
 impl Process {
+    /// How many of its tasks (threads) are live: one host thread each.
+    pub fn task_count(&self) -> usize {
+        self.tasks.lock().len()
+    }
+
     /// Whether it has exited (and is kept only until it is waited for).
     pub(crate) fn has_exited(&self) -> bool {
         self.exit.lock().is_some()

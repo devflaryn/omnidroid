@@ -759,7 +759,7 @@ const MSG_DONTWAIT: u64 = 0x40;
 
 fn sys_recvfrom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
-    let mut buf = vec![0u8; (a[2] as usize).min(1 << 20)];
+    let mut buf = crate::zbuf::ZeroBuf::new((a[2] as usize).min(1 << 20));
     if let Some(host) = host_of(&file) {
         let (n, from) = host.recv(&mut buf, a[3], nonblocking(&file), t)?;
         p.mem.write(a[1], &buf[..n])?;
@@ -907,7 +907,7 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         spans.push((base, len));
         total = total.saturating_add(len);
     }
-    let mut buf = vec![0u8; total.min(1 << 20)];
+    let mut buf = crate::zbuf::ZeroBuf::new(total.min(1 << 20));
     let host = host_of(&file);
     let (n, from) = match &host {
         Some(host) => host.recv(&mut buf, a[2], nonblocking(&file), t)?,
