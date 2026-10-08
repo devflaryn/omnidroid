@@ -480,7 +480,7 @@ impl Host {
         let translated = match self.resolve(raw) {
             Err(e) if e == ECONNREFUSED && nonblocking && self.stream => {
                 self.state.lock().refused = true;
-                crate::poll::notify();
+                crate::poll::notify_key(self.key());
                 wake();
                 return Err(EINPROGRESS);
             }
@@ -653,7 +653,9 @@ impl Host {
     /// readiness `want` between tries, until `deadline` (then `EAGAIN`) or a signal (`EINTR`).
     fn retry<T>(&self, want: u32, nonblocking: bool, deadline: Option<Instant>, t: &Task, mut op: impl FnMut() -> Result<T, Errno>) -> Result<T, Errno> {
         loop {
-            let seen = crate::poll::generation();
+            // Registered before the try, so a change between the try and the wait is not lost;
+            // only this socket's changes wake it (and the 50 ms slice, for signals).
+            let watch = crate::poll::watch(Some(vec![self.key()]));
             match op() {
                 Err(e) if e == EAGAIN => {}
                 other => return other,
@@ -673,7 +675,7 @@ impl Host {
             } else {
                 deadline
             };
-            crate::poll::wait_for_change(seen, wake_at, t)?;
+            watch.wait(wake_at, t)?;
         }
     }
 
@@ -985,7 +987,7 @@ impl Host {
             // `accept` returns EINVAL, which is how servers stop their accept threads.
             if rd {
                 self.state.lock().shut_rd = true;
-                crate::poll::notify();
+                crate::poll::notify_key(self.key());
             }
             return Ok(());
         }
@@ -999,7 +1001,7 @@ impl Host {
         st.shut_rd |= rd;
         st.shut_wr |= wr;
         drop(st);
-        crate::poll::notify();
+        crate::poll::notify_key(self.key());
         wake();
         Ok(())
     }
@@ -1188,6 +1190,12 @@ impl Host {
         }
     }
 
+    /// The key its waiters wait on and its changes are told by (`crate::poll`): the address of the
+    /// `Host` itself, as `crate::socket::key` gives a host socket's descriptor.
+    pub(crate) fn key(&self) -> crate::poll::Key {
+        std::ptr::from_ref(self) as crate::poll::Key
+    }
+
     /// What the socket is ready for, as `POLL*` bits. A stream socket that is neither connected,
     /// connecting nor listening is `POLLOUT | POLLHUP`, as Linux answers for it (Winsock's
     /// readiness call says nothing about such a socket).
@@ -1203,7 +1211,7 @@ impl Host {
         // two of the watcher's looks is still a change to it), wakes the watcher to watch for
         // what the socket now lacks, and wakes other waiters on this socket.
         if self.seen.swap(bits, Ordering::SeqCst) != bits {
-            crate::poll::notify();
+            crate::poll::notify_key(self.key());
             wake();
         }
         bits
@@ -1302,20 +1310,20 @@ fn run_watcher(inbox: &platnet::Socket) {
         let guards: Vec<_> = live.iter().map(|h| h.sock.read()).collect();
         let mut now: Vec<PollEntry<'_>> = guards.iter().map(|g| PollEntry::new(g, Interest::BOTH)).collect();
         let polled = platnet::poll(&mut now, Duration::ZERO).is_ok();
-        let mut changed = false;
+        let mut changed = Vec::new();
         let mut watched = Vec::new();
         for (i, host) in live.iter().enumerate() {
             let bits = host.bits(|| polled.then(|| now[i].readiness()));
             if host.seen.swap(bits, Ordering::SeqCst) != bits {
-                changed = true;
+                changed.push(host.key());
             }
             if let Some(interest) = host.interest(bits) {
                 watched.push(PollEntry::new(&guards[i], interest));
             }
         }
         drop(now);
-        if changed {
-            crate::poll::notify();
+        if !changed.is_empty() {
+            crate::poll::notify_keys(&changed);
         }
         watched.push(PollEntry::new(inbox, Interest::READABLE));
         if platnet::poll(&mut watched, Duration::from_secs(1)).is_err() {

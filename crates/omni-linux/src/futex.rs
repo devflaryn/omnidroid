@@ -150,7 +150,7 @@ fn key(addr: u64) -> Result<u64, Errno> {
 }
 
 fn read_u32(mem: &GuestMem, addr: u64) -> Result<u32, Errno> {
-    Ok(u32::from_le_bytes(mem.read(addr, 4)?.try_into().expect("four bytes")))
+    mem.read_u32(addr)
 }
 
 #[derive(Default)]

@@ -97,6 +97,21 @@ pub fn notify_key(key: Key) {
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
 }
 
+/// What each of `keys` names changed: [`notify_key`] for them all, under one lock.
+pub fn notify_keys(keys: &[Key]) {
+    let mut q = QUEUES.lock();
+    q.generation += 1;
+    for w in &q.anything {
+        w.wake();
+    }
+    for key in keys {
+        for w in q.keyed.get(key).into_iter().flatten() {
+            w.wake();
+        }
+    }
+    STATS.notifies.fetch_add(1, Ordering::Relaxed);
+}
+
 /// A thread's registration in the queues, for one wait: made before it looks, ended when dropped.
 pub(crate) struct Watch {
     me: Arc<Waiter>,

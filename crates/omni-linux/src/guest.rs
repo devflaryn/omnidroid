@@ -262,7 +262,9 @@ impl GuestMem {
     }
 
     pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
-        Ok(u64::from_le_bytes(self.read(addr, 8)?.try_into().expect("eight bytes")))
+        let mut b = [0u8; 8];
+        self.read_into(addr, &mut b)?;
+        Ok(u64::from_le_bytes(b))
     }
 
     pub fn write_u64(&self, addr: u64, value: u64) -> Result<(), Errno> {
@@ -270,7 +272,9 @@ impl GuestMem {
     }
 
     pub fn read_u32(&self, addr: u64) -> Result<u32, Errno> {
-        Ok(u32::from_le_bytes(self.read(addr, 4)?.try_into().expect("four bytes")))
+        let mut b = [0u8; 4];
+        self.read_into(addr, &mut b)?;
+        Ok(u32::from_le_bytes(b))
     }
 
     pub fn write_u32(&self, addr: u64, value: u32) -> Result<(), Errno> {
