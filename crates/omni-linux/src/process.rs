@@ -149,6 +149,12 @@ pub fn scalar_fp_in_xmm_default() {
         if std::env::var_os("OMNI_JIT_SCALAR_FP_XMM").is_none() {
             let _ = omni_cpu::dynarmic::set_scalar_fp_in_xmm(true);
         }
+        // Indirect-branch hit paths emitted inline (dynarmic patch 0042), on by default since the
+        // in-world A/B of 2026-10-09 (PS99 session s5: fps +0.2..+2.3, both critical threads
+        // -0.5..-0.8 ms a frame). `OMNI_JIT_FASTDISP=0` or the lever `jit_fastdisp=0` turns it off.
+        if std::env::var_os("OMNI_JIT_FASTDISP").is_none() {
+            let _ = omni_cpu::dynarmic::set_fast_dispatch_inline(true);
+        }
     });
 }
 
