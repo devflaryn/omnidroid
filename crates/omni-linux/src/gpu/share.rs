@@ -206,6 +206,136 @@ pub struct ShareLayer {
     pub generation: u64,
 }
 
+// ------------------------------------------------------------------------------- region_lazy
+//
+// **The region copied only when someone needs it** (`region_lazy=0|1`, `OMNI_REGION_LAZY=1`; **off
+// by default**). Under `present_zero` the window shows the share image, and the release's other copy
+// -- GPU image -> staging -> the worker's CPU copy into the gralloc region -- feeds only readers that
+// may never come. So a buffer whose last frame the composer took from its share image ([`TAKEN_AT`]
+// = that frame's generation) skips the region copy at its next release and says so ([`STALE_AT`] =
+// the generation the region lacks); a buffer anything else consumed keeps being copied. Every host
+// reader of a region's pixels -- the composer's CPU paths and the screenshot's on-demand
+// composition, SurfaceFlinger's client target, the AHB mirrors (SurfaceFlinger's RenderEngine,
+// `screencap`), the GL backend's EGLImages -- first calls [`ensure_region`], which fills a stale
+// region from its share image on the GPU (a read-back, on demand) and clears the mark; whatever
+// else writes a region whole clears it too ([`region_written`]).
+//
+// MEASURED (`window_present::zero_tests::zero_region_lazy`, RTX 4060, 1575x890 at stride 1600,
+// E-cores beside a live game, two runs): the release worker's thread per frame 0.93-0.98 ms of CPU
+// and 1.47-1.53 ms from submit to landed with the region copy; 0.006 ms and 0.09 ms without. A
+// fill on demand: 2.3-4 ms (18 ms seen under load), the first in a process 50-110 ms (its Vulkan
+// device made).
+
+/// The generation a region's pixels lack (0: they are current): written by the release that
+/// skipped the region copy, cleared by whoever fills it ([`ensure_region`]).
+pub const STALE_AT: u64 = SHARE_AT + 200;
+/// The generation the composer last showed from this buffer's share image.
+pub const TAKEN_AT: u64 = SHARE_AT + 208;
+
+/// The lever (`region_lazy`), read by the app's release.
+pub static LAZY: AtomicBool = AtomicBool::new(false);
+
+/// Whether releases may skip the region copy (the lever, or `OMNI_REGION_LAZY=1` from the start).
+#[must_use]
+pub fn lazy_on() -> bool {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| {
+        if std::env::var("OMNI_REGION_LAZY").as_deref() == Ok("1") {
+            LAZY.store(true, Ordering::Relaxed);
+        }
+    });
+    LAZY.load(Ordering::Relaxed)
+}
+
+fn read_u64(shm: &Shm, at: u64) -> u64 {
+    let mut g = [0u8; 8];
+    let _ = shm.read_at(&mut g, at);
+    u64::from_le_bytes(g)
+}
+
+/// The composer showed this buffer's frame of `generation` from its share image.
+pub fn mark_taken(shm: &Shm, generation: u64) {
+    let _ = shm.write_at(&generation.to_le_bytes(), TAKEN_AT);
+}
+
+/// See [`mark_taken`].
+#[must_use]
+pub fn taken(shm: &Shm) -> u64 {
+    read_u64(shm, TAKEN_AT)
+}
+
+/// The region lacks the frame of `generation` (0: it holds its frame).
+pub fn set_stale(shm: &Shm, generation: u64) {
+    let _ = shm.write_at(&generation.to_le_bytes(), STALE_AT);
+}
+
+/// See [`set_stale`].
+#[must_use]
+pub fn stale(shm: &Shm) -> u64 {
+    read_u64(shm, STALE_AT)
+}
+
+/// Something other than a release wrote the region's pixels whole (an AHB mirror's download, the GL
+/// backend's frame): they are current, and must not be filled over from an older share image.
+pub fn region_written(shm: &Shm) {
+    if stale(shm) != 0 {
+        set_stale(shm, 0);
+    }
+}
+
+/// Regions filled on demand in this process, for the log.
+static FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **Make a region's pixels current before reading them** (`region_lazy`): a region whose last
+/// release skipped the copy is filled from its share image (imported here and read back on the GPU,
+/// rows `stride_bytes` apart as the region lays them out). False when it could not be (no share
+/// image holding that frame, no GPU here): the region then holds an older frame of the buffer.
+pub fn ensure_region(shm: &Shm, stride_bytes: u64) -> bool {
+    if stale(shm) == 0 {
+        return true;
+    }
+    // The release's copy into the share image lands first.
+    super::native::wait_written(shm, std::time::Duration::from_millis(50));
+    let wanted = stale(shm);
+    if wanted == 0 {
+        return true;
+    }
+    // Whatever happens below, a region that could not be filled is copied again from the next
+    // release on (the composer's mark is the release's only reason to skip it).
+    let give_up = || {
+        mark_taken(shm, 0);
+        false
+    };
+    let Some(desc) = ShareDesc::read(shm) else { return give_up() };
+    if read_generation(shm) != wanted {
+        return give_up();
+    }
+    static FILLER: parking_lot::Mutex<Option<Result<super::window_present::WindowPresenter, String>>> = parking_lot::Mutex::new(None);
+    let mut filler = FILLER.lock();
+    let filler = filler.get_or_insert_with(super::window_present::WindowPresenter::new_headless);
+    let Ok(filler) = filler.as_mut() else { return give_up() };
+    let started = std::time::Instant::now();
+    match filler.read_share(&desc, wanted, stride_bytes) {
+        Ok(pixels) => {
+            let _ = shm.write_at(&pixels, crate::hal::gralloc::PIXELS_AT);
+            // Clear the mark only if no newer release set it meanwhile.
+            shm.cas_u64(STALE_AT, wanted, 0);
+            let n = FILLS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 100 == 0 {
+                eprintln!("[gpu] region_lazy: a region filled from its share image on demand ({:.2} ms; {n} so far in this process)", started.elapsed().as_secs_f64() * 1000.0);
+            }
+            true
+        }
+        Err(e) => {
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!("[gpu] region_lazy: a stale region could not be filled from its share image ({e})");
+            }
+            give_up()
+        }
+    }
+}
+
 /// A name for the next share image of this process.
 #[must_use]
 pub fn next_name() -> String {

@@ -701,8 +701,10 @@ impl Client {
                     continue;
                 }
                 if let Some(b) = d.slot.and_then(|s| d.buffers.get(&s)) {
-                    // The app's copy into the buffer lands first, as a release fence is waited on.
+                    // The app's copy into the buffer lands first, as a release fence is waited on
+                    // (and a region the release left stale is filled: `region_lazy`).
                     crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
+                    crate::gpu::share::ensure_region(&b.shm, u64::from(b.stride) * 4);
                     let need = b.stride as usize * b.height as usize * 4;
                     let mut bytes = spare.remove(&l).unwrap_or_default();
                     if fast {
@@ -755,6 +757,9 @@ impl Client {
         // The target's own size: the display's, except for a frame SurfaceFlinger drew for the
         // size before a resize.
         let (width, height) = (target.width, target.height);
+        // (A client target is never left stale -- the composer never takes it from a share image --
+        // but whatever reads a region makes sure: `region_lazy`.)
+        crate::gpu::share::ensure_region(&target.shm, u64::from(target.stride) * 4);
         let mut pixels = vec![0u8; target.stride as usize * height as usize * 4];
         if target.shm.read_at(&mut pixels, target.pixels_at).is_err() {
             return;
@@ -849,6 +854,7 @@ fn compose_owned(layers: &[OwnedLayer], out: &mut [u8], width: u32, height: u32)
         .iter()
         .map(|l| {
             crate::gpu::native::wait_written(&l.shm, std::time::Duration::from_millis(50));
+            crate::gpu::share::ensure_region(&l.shm, l.stride as u64 * 4);
             let need = l.stride * l.rows * 4;
             l.shm.bytes(l.pixels_at, need).map_or_else(
                 || {
@@ -965,6 +971,13 @@ fn present_shared(st: &State, screen: &Screen, order: &[(i32, i64)], sink: &dyn 
     });
     let done = match outcome {
         Ok(owned) => {
+            // Each buffer's frame was taken from its share image: its next release may leave the
+            // region stale (`region_lazy`).
+            for l in &owned {
+                let mut g = [0u8; 8];
+                let _ = l.shm.read_at(&mut g, crate::gpu::native::CONTENT_GENERATION_AT);
+                crate::gpu::share::mark_taken(&l.shm, u64::from_le_bytes(g));
+            }
             screen.framebuffer.present_external(width, height, Arc::new(move |out: &mut [u8]| compose_owned(&owned, out, width, height)));
             true
         }
@@ -998,6 +1011,7 @@ fn present_in_place(st: &State, screen: &Screen, order: &[(i32, i64)], bgra: boo
     // Every copy lands before any buffer is read (as a release fence is waited on).
     for (_, b) in &buffers {
         crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
+        crate::gpu::share::ensure_region(&b.shm, u64::from(b.stride) * 4);
     }
     let mut pixels: HashMap<i64, LayerPixels<'_>> = HashMap::new();
     for (l, b) in buffers {

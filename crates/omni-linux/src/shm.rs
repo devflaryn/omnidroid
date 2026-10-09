@@ -389,6 +389,32 @@ impl Shm {
         at.flatten()
     }
 
+    /// **Compare and swap the little-endian `u64` at `offset`** (8-aligned), atomically across every
+    /// host process mapping the region (one memory, one atomic instruction): `true` when it held
+    /// `current` and now holds `new`. A region without a host view (not a graphics buffer, views
+    /// off) is read and written instead, which is not atomic.
+    pub fn cas_u64(&self, offset: u64, current: u64, new: u64) -> bool {
+        if offset % 8 != 0 {
+            return false;
+        }
+        let swapped = self.with_view(|v| {
+            (offset as usize + 8 <= v.size).then(|| {
+                // SAFETY: an 8-aligned word inside the mapped view (the view is page-aligned);
+                // shared memory, so accessed atomically only.
+                let word = unsafe { &*((v.base + offset as usize) as *const std::sync::atomic::AtomicU64) };
+                word.compare_exchange(current.to_le(), new.to_le(), Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            })
+        });
+        if let Some(Some(done)) = swapped {
+            return done;
+        }
+        let mut b = [0u8; 8];
+        if self.read_at(&mut b, offset).is_err() || u64::from_le_bytes(b) != current {
+            return false;
+        }
+        self.write_at(&new.to_le_bytes(), offset).is_ok()
+    }
+
     /// Undo one [`pin_view`](Self::pin_view), once the GPU's import is freed.
     pub fn unpin_view(&self) {
         self.pinned.fetch_sub(1, Ordering::SeqCst);
