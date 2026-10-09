@@ -186,6 +186,117 @@ pub(super) static TAGGED_ACCESSES: std::sync::atomic::AtomicU64 = std::sync::ato
 pub(super) static COUNTING_CODE_FETCHES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether native high-level emulation of hot `libc.so` functions is on, process-wide
+/// (`super::set_hle`). Read at translation (whether to plant an HLE entry) and at the call. Off by
+/// default: a code-generation change, A/B'd in-world.
+pub(super) static HLE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Native HLE calls served, and of those the ones that found a byte inaccessible (a guest fault),
+/// across the process; a measurement reads them ([`super::hle_stats`]).
+pub(super) static HLE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(super) static HLE_FAULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn hle_enabled() -> bool {
+    HLE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A hot `libc.so` function with a native host implementation. The guest entry is planted and
+/// [`run_hle`] serves the call. Its arguments and result are the AArch64 C ABI's: `X0`-`X2` in,
+/// `X0` out, resume at `X30`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hle {
+    /// `void* memcpy(void* dst = X0, const void* src = X1, size_t n = X2)`.
+    Memcpy,
+    /// `void* memmove(void* dst = X0, const void* src = X1, size_t n = X2)`.
+    Memmove,
+    /// `void* memset(void* dst = X0, int c = X1, size_t n = X2)`.
+    Memset,
+}
+
+/// Run a native `libc` function for the guest, from inside `cb_call_svc`.
+///
+/// The memory is reached through [`CpuCtx::data_ptr`], which demand-pages and, on a byte the
+/// guest cannot access, records the exact fault and halts -- so a `memcpy` off the end of a
+/// mapping becomes the same `SIGSEGV` the guest's own `memcpy` would raise, at that address. On
+/// success `X0` is the destination (as the C functions return) and the guest resumes at `X30`.
+///
+/// # Safety
+/// `c.jit` is live and not executing (we are inside its `SVC` callback); the host pointers
+/// `data_ptr` returns are this process's own mapping of guest memory (D4), valid for the lengths
+/// asked, and do not escape this call.
+unsafe fn run_hle(c: &mut CpuCtx, kind: Hle) {
+    unsafe {
+        c.hle_calls += 1;
+        HLE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dst = dynarmic_sys::od_jit_get_reg(c.jit, 0);
+        let arg1 = dynarmic_sys::od_jit_get_reg(c.jit, 1);
+        let n = dynarmic_sys::od_jit_get_reg(c.jit, 2) as usize;
+
+        // The whole guest SSE control word is the guest's here (generated code is still live); the
+        // native routines are host `memcpy`/`memset`, which touch no floating-point state, so no
+        // MXCSR guard is needed, unlike a thunk handler.
+        let ok = if n == 0 {
+            true
+        } else {
+            match kind {
+                Hle::Memset => match c.data_ptr(dst, n, Protection::ReadWrite) {
+                    Some(DataPtr::One(d)) => {
+                        core::ptr::write_bytes(d, arg1 as u8, n);
+                        true
+                    }
+                    Some(DataPtr::Straddle(_)) => {
+                        c.write_straddle(dst as GuestAddr, &vec![arg1 as u8; n]);
+                        true
+                    }
+                    None => false,
+                },
+                Hle::Memcpy | Hle::Memmove => {
+                    // Resolve the write range first: a `memcpy` to a read-only or unmapped
+                    // destination faults on the write, as the guest's would. Then the read range.
+                    // `data_ptr` records a fault and halts on a bad range, so stop at the first.
+                    match c.data_ptr(dst, n, Protection::ReadWrite) {
+                        Some(d) => match c.data_ptr(arg1, n, Protection::Read) {
+                            Some(s) => {
+                                match (d, s) {
+                                    (DataPtr::One(d), DataPtr::One(s)) if kind == Hle::Memmove => {
+                                        core::ptr::copy(s, d, n)
+                                    }
+                                    (DataPtr::One(d), DataPtr::One(s)) => core::ptr::copy_nonoverlapping(s, d, n),
+                                    // A split host page (the 4 KiB overlay) on either side: through
+                                    // a scratch buffer, so an overlapping `memmove` is still right.
+                                    _ => {
+                                        let mut buf = vec![0u8; n];
+                                        c.read_straddle(arg1 as GuestAddr, &mut buf);
+                                        c.write_straddle(dst as GuestAddr, &buf);
+                                    }
+                                }
+                                true
+                            }
+                            None => false,
+                        },
+                        None => false,
+                    }
+                }
+            }
+        };
+
+        if !ok {
+            // `data_ptr` already recorded the fault and set the halt; the run loop reports it. The
+            // guest PC stays at the entry (`fault` leaves it to the run loop), which is inside the
+            // function, so a handler reading the siginfo sees the faulting address.
+            c.hle_faults_field += 1;
+            HLE_FAULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        // The C functions return the destination.
+        dynarmic_sys::od_jit_set_reg(c.jit, 0, dst);
+        let resume = dynarmic_sys::od_jit_get_reg(c.jit, 30);
+        dynarmic_sys::od_jit_set_pc(c.jit, resume);
+    }
+}
+
+
 /// Instruction fetches for translation, by every context of every backend, while counting is on.
 pub(super) static CODE_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -237,14 +348,20 @@ unsafe extern "C" fn cb_read_code(ctx: *mut c_void, vaddr: u64, out: *mut u32) -
             //
             // With a shared code cache (D38) the translation is every context's, so what is planted
             // is the space's set, not this context's; `cb_call_svc` still decides per context.
-            let planted = match &c.shared_plants {
-                Some(space) => space.contains(address),
-                None => {
-                    c.sentinel == Some(address)
-                        || c.thunks.contains(&address)
-                        || c.inline_thunks.contains_key(&address)
-                }
-            };
+            // An HLE entry (patch: native fast paths) is planted while the switch is on. It is
+            // per context (the same set across a process) rather than in the shared-plant set, so
+            // the switch can be flipped by re-translating without touching that set. The switch is
+            // read here, at translation, so a block translated with HLE off keeps running the
+            // guest code until it is dropped (the lever drops translations).
+            let planted = (hle_enabled() && c.hle.contains(address))
+                || match &c.shared_plants {
+                    Some(space) => space.contains(address),
+                    None => {
+                        c.sentinel == Some(address)
+                            || c.thunks.contains(&address)
+                            || c.inline_thunks.contains_key(&address)
+                    }
+                };
             if planted {
                 *out = STOP_SVC;
                 return 1;
@@ -539,6 +656,18 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
             // guest code may execute any `SVC` it likes, and only Omnidroid can have registered an
             // address.
             let site = (dynarmic_sys::od_jit_get_pc(c.jit) as GuestAddr).wrapping_sub(4);
+            // An HLE entry (patch: native fast paths): the native implementation runs here, with
+            // this context in hand, so an inaccessible byte becomes the same typed memory fault a
+            // guest access would. On success it sets the result and resumes at X30 like a thunk; a
+            // fault halts, as any guest fault does. Only while the switch is on -- the block was
+            // planted under it, and a stale planted block (switch since turned off) still runs the
+            // native code, which is correct, just not what the switch asks.
+            if hle_enabled() {
+                if let Some(kind) = c.hle.get(site) {
+                    run_hle(c, kind);
+                    return;
+                }
+            }
             // Serviced here and resumed here: no halt is raised, so `CheckHalt` falls through into
             // `PopRSBHint`, which with `ReturnStackBuffer` cleared is the emitted dispatcher loop
             // and not a return to the caller. See `DynarmicCpu::add_inline_thunk`. An array index

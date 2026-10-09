@@ -217,7 +217,7 @@ impl Symbolizer {
 }
 
 /// The host file behind a guest path, if it is a regular file this runtime keeps on the host.
-fn host_file(p: &Process, guest: &[u8]) -> Option<PathBuf> {
+pub(crate) fn host_file(p: &Process, guest: &[u8]) -> Option<PathBuf> {
     use crate::vfs::Node;
     let r = p.vfs.resolve(b"/", guest, true).ok()?;
     match r.node {
@@ -358,8 +358,16 @@ impl Elf {
         c_str(&name, 0)
     }
 
+    /// The virtual address of the function symbol named exactly `name`, if the library has one
+    /// (patch: HLE resolves `memcpy`/`memset` implementations this way, from the symbol table of
+    /// the mapped file rather than a hardcoded address).
+    #[must_use]
+    pub fn symbol(&self, name: &str) -> Option<u64> {
+        self.symbols.iter().find(|s| s.2 == name).map(|s| s.0)
+    }
+
     /// The file offset of virtual address `vaddr`.
-    fn file_of(&self, vaddr: u64) -> Option<u64> {
+    pub fn file_of(&self, vaddr: u64) -> Option<u64> {
         self.loads.iter().find(|(_, v, len)| vaddr >= *v && vaddr < v + len).map(|(o, v, _)| vaddr - v + o)
     }
 
