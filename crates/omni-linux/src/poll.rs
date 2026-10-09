@@ -173,6 +173,10 @@ pub(crate) struct Watch {
 
 /// Wait on `keys` (`None`: on anything) -- registered now, before the caller looks.
 pub(crate) fn watch(keys: Option<Vec<Key>>) -> Watch {
+    // A wait on no key at all (`ppoll` of no descriptor) is still a waiter: in a queue that a
+    // posted signal, a process's end and an unkeyed change reach ([`wake_everyone`], [`notify`]).
+    // In none, it slept through them until its slice ran out (1 s).
+    let keys = keys.map(|k| if k.is_empty() { vec![INERT] } else { k });
     let me = ME.with(Arc::clone);
     *me.woken.lock() = false;
     let mut q = QUEUES.lock();
@@ -1049,4 +1053,27 @@ pub fn install(table: &mut Table) {
     table.set(nr::TIMERFD_CREATE, sys_timerfd_create);
     table.set(nr::TIMERFD_SETTIME, sys_timerfd_settime);
     table.set(nr::TIMERFD_GETTIME, sys_timerfd_gettime);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A wait on no descriptor at all** -- `ppoll(NULL, 0, timeout, mask)`, or a list of only
+    /// negative fds: its watch has no keys. A posted signal ([`wake_everyone`]) and a process's end
+    /// must still reach it at once; it was in no queue, so only the next slice (1 s) did.
+    #[test]
+    fn a_wait_on_no_descriptors_is_woken_by_a_posted_signal() {
+        for wake in [wake_everyone as fn(), notify] {
+            let w = watch(Some(Vec::new()));
+            let started = Instant::now();
+            let waker = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                wake();
+            });
+            w.sleep(Instant::now() + Duration::from_secs(3));
+            waker.join().expect("waker");
+            assert!(started.elapsed() < Duration::from_millis(1000), "woken after {:?}, not by the wake", started.elapsed());
+        }
+    }
 }
