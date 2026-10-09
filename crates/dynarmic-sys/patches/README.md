@@ -519,3 +519,12 @@ suite with `OD_TEST_COMPACT` on, per-thread and shared. With the switch defaulte
 `a1_toybox`, `a4_threads`, `a5_signals`, `b_hello_dex` (ART; with `OMNI_BOOT_IMAGE_UNCOMPRESSED=0`,
 since that test's mapping-name check fails at HEAD either way) and `tbi_off`.
 
+### 0062 — x64: an emit observer, for differential tests of the emitter
+
+x64. `SetEmitObserver` (`od_set_emit_observer`): a callback told of every block emitted -- guest
+PC, host entry, the bytes of its code up to its link slots, and its size with them. Null by
+default: one relaxed load a block. `tests/code_size.rs::the_speed_of_emission` writes every block of
+a corpus with it (`OMNI_EMIT_DUMP`), and `tools/compare_emit_dumps.py` compares two such dumps:
+the same blocks, sizes and bytes, except inside host-address operands (`mov r64, imm64`, `call
+rel32`), which move with the executable. Two runs of one build: identical (11,005 blocks, 4.7 MB).
+

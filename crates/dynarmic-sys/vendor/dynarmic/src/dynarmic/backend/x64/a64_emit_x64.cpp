@@ -57,6 +57,16 @@ void ResetCodegenCensus() {
 }
 
 namespace {
+std::atomic<EmitObserver> emit_observer{nullptr};
+std::atomic<void*> emit_observer_ctx{nullptr};
+}  // namespace
+
+void SetEmitObserver(EmitObserver observer, void* ctx) {
+    emit_observer_ctx.store(ctx, std::memory_order_relaxed);
+    emit_observer.store(observer, std::memory_order_release);
+}
+
+namespace {
 void CodegenCount(CodegenPart part, std::uint64_t n) {
     codegen_census[static_cast<std::size_t>(part)].fetch_add(n, std::memory_order_relaxed);
 }
@@ -258,7 +268,12 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     // empty -- and was never returned -- when the block covers no bytes.
     AddGuestRange(descriptor, descriptor.PC(), end_location.PC() - 1);
 
-    return RegisterBlock(descriptor, entrypoint, size);
+    const BlockDescriptor registered = RegisterBlock(descriptor, entrypoint, size);
+    if (const EmitObserver observer = emit_observer.load(std::memory_order_acquire)) {  // patch 0062
+        observer(emit_observer_ctx.load(std::memory_order_relaxed), descriptor.PC(), entrypoint,
+                 static_cast<std::size_t>(slots_start - entrypoint), size);
+    }
+    return registered;
 }
 
 void A64EmitX64::ClearCache() {

@@ -77,6 +77,12 @@ extern std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPa
 std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n);
 void ResetCodegenCensus();
 
+/// Omnidroid patch 0062: told of every block emitted, for differential tests of the emitter --
+/// the guest PC, the block's host entry, the bytes of its code (up to its link slots) and in all.
+/// Null (the default) costs one relaxed load a block.
+using EmitObserver = void (*)(void* ctx, std::uint64_t guest_pc, const void* host, std::size_t code_bytes, std::size_t total_bytes);
+void SetEmitObserver(EmitObserver observer, void* ctx);
+
 struct A64EmitContext final : public EmitContext {
     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
 

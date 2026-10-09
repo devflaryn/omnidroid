@@ -1,0 +1,52 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 1f40098..c221868 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -56,6 +56,16 @@ void ResetCodegenCensus() {
+     }
+ }
+ 
++namespace {
++std::atomic<EmitObserver> emit_observer{nullptr};
++std::atomic<void*> emit_observer_ctx{nullptr};
++}  // namespace
++
++void SetEmitObserver(EmitObserver observer, void* ctx) {
++    emit_observer_ctx.store(ctx, std::memory_order_relaxed);
++    emit_observer.store(observer, std::memory_order_release);
++}
++
+ namespace {
+ void CodegenCount(CodegenPart part, std::uint64_t n) {
+     codegen_census[static_cast<std::size_t>(part)].fetch_add(n, std::memory_order_relaxed);
+@@ -258,7 +268,12 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
+     // empty -- and was never returned -- when the block covers no bytes.
+     AddGuestRange(descriptor, descriptor.PC(), end_location.PC() - 1);
+ 
+-    return RegisterBlock(descriptor, entrypoint, size);
++    const BlockDescriptor registered = RegisterBlock(descriptor, entrypoint, size);
++    if (const EmitObserver observer = emit_observer.load(std::memory_order_acquire)) {  // patch 0062
++        observer(emit_observer_ctx.load(std::memory_order_relaxed), descriptor.PC(), entrypoint,
++                 static_cast<std::size_t>(slots_start - entrypoint), size);
++    }
++    return registered;
+ }
+ 
+ void A64EmitX64::ClearCache() {
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index 61077eb..dc21865 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -77,6 +77,12 @@ extern std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPa
+ std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n);
+ void ResetCodegenCensus();
+ 
++/// Omnidroid patch 0062: told of every block emitted, for differential tests of the emitter --
++/// the guest PC, the block's host entry, the bytes of its code (up to its link slots) and in all.
++/// Null (the default) costs one relaxed load a block.
++using EmitObserver = void (*)(void* ctx, std::uint64_t guest_pc, const void* host, std::size_t code_bytes, std::size_t total_bytes);
++void SetEmitObserver(EmitObserver observer, void* ctx);
++
+ struct A64EmitContext final : public EmitContext {
+     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
+ 
