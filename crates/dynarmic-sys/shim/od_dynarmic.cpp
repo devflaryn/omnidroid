@@ -37,6 +37,9 @@ extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
 /* Patch 0060's census (a64_emit_x64.cpp). */
 std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n);
 void ResetCodegenCensus();
+/* Patch 0062's emit observer (a64_emit_x64.cpp). */
+using EmitObserver = void (*)(void* ctx, std::uint64_t guest_pc, const void* host, std::size_t code_bytes, std::size_t total_bytes);
+void SetEmitObserver(EmitObserver observer, void* ctx);
 /* Patch 0039's switch, likewise. */
 extern std::atomic<std::uint32_t> live_scalar_fp_in_xmm;
 /* Patch 0040's switch, likewise. */
@@ -1040,6 +1043,15 @@ uint32_t od_codegen_census(uint64_t* out, uint32_t n) {
     (void)out;
     (void)n;
     return 0;
+#endif
+}
+
+void od_set_emit_observer(od_emit_observer observer, void* ctx) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::SetEmitObserver(observer, ctx);
+#else
+    (void)observer;
+    (void)ctx;
 #endif
 }
 

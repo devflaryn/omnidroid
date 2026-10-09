@@ -77,6 +77,12 @@ extern std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPa
 std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n);
 void ResetCodegenCensus();
 
+/// Omnidroid patch 0062: told of every block emitted, for differential tests of the emitter --
+/// the guest PC, the block's host entry, the bytes of its code (up to its link slots) and in all.
+/// Null (the default) costs one relaxed load a block.
+using EmitObserver = void (*)(void* ctx, std::uint64_t guest_pc, const void* host, std::size_t code_bytes, std::size_t total_bytes);
+void SetEmitObserver(EmitObserver observer, void* ctx);
+
 struct A64EmitContext final : public EmitContext {
     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
 
@@ -248,9 +254,12 @@ protected:
     void (*memory_exclusive_write_128)();
     void GenMemory128Accessors();
 
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
+    // Omnidroid patch 0063: flat tables, not std::maps searched for every access emitted.
+    FallbackTable read_fallbacks;
+    FallbackTable write_fallbacks;
+    FallbackTable exclusive_write_fallbacks;
+    /// Omnidroid patch 0063: the general registers in allocation order, made once, not per block.
+    std::vector<HostLoc> gpr_order_cache;
     void GenFastmemFallbacks();
 
     const void* terminal_handler_pop_rsb_hint;

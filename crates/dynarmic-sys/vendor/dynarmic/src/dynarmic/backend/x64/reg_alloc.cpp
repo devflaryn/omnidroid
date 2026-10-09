@@ -6,6 +6,7 @@
 #include "dynarmic/backend/x64/reg_alloc.h"
 
 #include <algorithm>
+#include <bit>
 #include <numeric>
 #include <utility>
 
@@ -140,7 +141,7 @@ void HostLocInfo::ReleaseAll() {
 }
 
 bool HostLocInfo::ContainsValue(const IR::Inst* inst) const {
-    return std::find(values.begin(), values.end(), inst) != values.end();
+    return values.contains(inst);
 }
 
 size_t HostLocInfo::GetMaxBitWidth() const {
@@ -253,10 +254,9 @@ bool Argument::IsInMemory() const {
     return HostLocIsSpill(*reg_alloc.ValueLocation(value.GetInst()));
 }
 
-RegAlloc::RegAlloc(BlockOfCode& code, std::vector<HostLoc> gpr_order, std::vector<HostLoc> xmm_order)
+RegAlloc::RegAlloc(BlockOfCode& code, std::span<const HostLoc> gpr_order, std::span<const HostLoc> xmm_order)
         : gpr_order(gpr_order)
         , xmm_order(xmm_order)
-        , hostloc_info(NonSpillHostLocCount + SpillCount)
         , code(code) {}
 
 RegAlloc::ArgumentInfo RegAlloc::GetArgumentInfo(IR::Inst* inst) {
@@ -309,7 +309,7 @@ OpArg RegAlloc::UseOpArg(Argument& arg) {
 void RegAlloc::Use(Argument& arg, HostLoc host_loc) {
     ASSERT(!arg.allocated);
     arg.allocated = true;
-    UseImpl(arg.value, {host_loc});
+    UseImpl(arg.value, Locations{&host_loc, 1});
 }
 
 Xbyak::Reg64 RegAlloc::UseScratchGpr(Argument& arg) {
@@ -327,7 +327,7 @@ Xbyak::Xmm RegAlloc::UseScratchXmm(Argument& arg) {
 void RegAlloc::UseScratch(Argument& arg, HostLoc host_loc) {
     ASSERT(!arg.allocated);
     arg.allocated = true;
-    UseScratchImpl(arg.value, {host_loc});
+    UseScratchImpl(arg.value, Locations{&host_loc, 1});
 }
 
 void RegAlloc::DefineValue(IR::Inst* inst, const Xbyak::Reg& reg) {
@@ -353,7 +353,7 @@ Xbyak::Reg64 RegAlloc::ScratchGpr() {
 }
 
 Xbyak::Reg64 RegAlloc::ScratchGpr(HostLoc desired_location) {
-    return HostLocToReg64(ScratchImpl({desired_location}));
+    return HostLocToReg64(ScratchImpl(Locations{&desired_location, 1}));
 }
 
 Xbyak::Xmm RegAlloc::ScratchXmm() {
@@ -361,10 +361,10 @@ Xbyak::Xmm RegAlloc::ScratchXmm() {
 }
 
 Xbyak::Xmm RegAlloc::ScratchXmm(HostLoc desired_location) {
-    return HostLocToXmm(ScratchImpl({desired_location}));
+    return HostLocToXmm(ScratchImpl(Locations{&desired_location, 1}));
 }
 
-HostLoc RegAlloc::UseImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations) {
+HostLoc RegAlloc::UseImpl(IR::Value use_value, Locations desired_locations) {
     if (use_value.IsImmediate()) {
         return LoadImmediate(use_value, ScratchImpl(desired_locations));
     }
@@ -396,7 +396,7 @@ HostLoc RegAlloc::UseImpl(IR::Value use_value, const std::vector<HostLoc>& desir
     return destination_location;
 }
 
-HostLoc RegAlloc::UseScratchImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations) {
+HostLoc RegAlloc::UseScratchImpl(IR::Value use_value, Locations desired_locations) {
     if (use_value.IsImmediate()) {
         return LoadImmediate(use_value, ScratchImpl(desired_locations));
     }
@@ -423,7 +423,7 @@ HostLoc RegAlloc::UseScratchImpl(IR::Value use_value, const std::vector<HostLoc>
     return destination_location;
 }
 
-HostLoc RegAlloc::ScratchImpl(const std::vector<HostLoc>& desired_locations) {
+HostLoc RegAlloc::ScratchImpl(Locations desired_locations) {
     const HostLoc location = SelectARegister(desired_locations);
     MoveOutOfTheWay(location);
     LocInfo(location).WriteLock();
@@ -484,8 +484,8 @@ void RegAlloc::HostCall(IR::Inst* result_def,
         }
     }
 
-    for (HostLoc caller_saved : other_caller_save) {
-        ScratchImpl({caller_saved});
+    for (const HostLoc& caller_saved : other_caller_save) {
+        ScratchImpl(Locations{&caller_saved, 1});
     }
 }
 
@@ -504,8 +504,17 @@ void RegAlloc::ReleaseStackSpace(size_t stack_space) {
 }
 
 void RegAlloc::EndOfAllocScope() {
-    for (auto& iter : hostloc_info) {
-        iter.ReleaseAll();
+    // Omnidroid patch 0063: only the locations written since the last scope ended. Releasing an
+    // untouched one changes nothing: its last `ReleaseAll` left it unlocked, unreferenced, and
+    // emptied if all its uses were done -- and nothing has changed it since.
+    for (std::size_t word = 0; word < touched.size(); word++) {
+        for (std::uint64_t bits = std::exchange(touched[word], 0); bits != 0; bits &= bits - 1) {
+            const std::size_t i = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
+            hostloc_info[i].ReleaseAll();
+            if (hostloc_info[i].IsEmpty()) {
+                occupied[word] &= ~(std::uint64_t{1} << (i % 64));
+            }
+        }
     }
 }
 
@@ -519,30 +528,39 @@ void RegAlloc::EmitVerboseDebuggingOutput() {
     }
 }
 
-HostLoc RegAlloc::SelectARegister(const std::vector<HostLoc>& desired_locations) const {
-    std::vector<HostLoc> candidates = desired_locations;
+HostLoc RegAlloc::SelectARegister(Locations desired_locations) const {
+    // Omnidroid patch 0063: the same two partitions over a copy on the stack rather than a
+    // `std::vector` (the same algorithm on the same elements, so the same choice).
+    std::array<HostLoc, NonSpillHostLocCount> storage;
+    ASSERT(desired_locations.size() <= storage.size());
+    std::copy(desired_locations.begin(), desired_locations.end(), storage.begin());
+    HostLoc* const candidates = storage.data();
+    HostLoc* candidates_end = candidates + desired_locations.size();
 
     // Find all locations that have not been allocated..
-    const auto allocated_locs = std::partition(candidates.begin(), candidates.end(), [this](auto loc) {
+    candidates_end = std::partition(candidates, candidates_end, [this](auto loc) {
         return !this->LocInfo(loc).IsLocked();
     });
-    candidates.erase(allocated_locs, candidates.end());
-    ASSERT_MSG(!candidates.empty(), "All candidate registers have already been allocated");
+    ASSERT_MSG(candidates != candidates_end, "All candidate registers have already been allocated");
 
     // Selects the best location out of the available locations.
     // TODO: Actually do LRU or something. Currently we just try to pick something without a value if possible.
 
-    std::partition(candidates.begin(), candidates.end(), [this](auto loc) {
+    std::partition(candidates, candidates_end, [this](auto loc) {
         return this->LocInfo(loc).IsEmpty();
     });
 
-    return candidates.front();
+    return candidates[0];
 }
 
 std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const {
-    for (size_t i = 0; i < hostloc_info.size(); i++) {
-        if (hostloc_info[i].ContainsValue(value)) {
-            return static_cast<HostLoc>(i);
+    // Omnidroid patch 0063: only the locations that may hold values, lowest first, as before.
+    for (std::size_t word = 0; word < occupied.size(); word++) {
+        for (std::uint64_t bits = occupied[word]; bits != 0; bits &= bits - 1) {
+            const std::size_t i = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
+            if (hostloc_info[i].ContainsValue(value)) {
+                return static_cast<HostLoc>(i);
+            }
         }
     }
 
@@ -552,6 +570,7 @@ std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const {
 void RegAlloc::DefineValueImpl(IR::Inst* def_inst, HostLoc host_loc) {
     ASSERT_MSG(!ValueLocation(def_inst), "def_inst has already been defined");
     LocInfo(host_loc).AddValue(def_inst);
+    MarkOccupied(host_loc);  // patch 0063
 }
 
 void RegAlloc::DefineValueImpl(IR::Inst* def_inst, const IR::Value& use_inst) {
@@ -610,6 +629,7 @@ void RegAlloc::Move(HostLoc to, HostLoc from) {
     EmitMove(bit_width, to, from);
 
     LocInfo(to) = std::exchange(LocInfo(from), {});
+    MarkOccupied(to);  // patch 0063
 }
 
 void RegAlloc::CopyToScratch(size_t bit_width, HostLoc to, HostLoc from) {
@@ -636,6 +656,8 @@ void RegAlloc::Exchange(HostLoc a, HostLoc b) {
     EmitExchange(a, b);
 
     std::swap(LocInfo(a), LocInfo(b));
+    MarkOccupied(a);  // patch 0063
+    MarkOccupied(b);
 }
 
 void RegAlloc::MoveOutOfTheWay(HostLoc reg) {
@@ -667,7 +689,9 @@ HostLoc RegAlloc::FindFreeSpill() const {
 
 HostLocInfo& RegAlloc::LocInfo(HostLoc loc) {
     ASSERT(loc != HostLoc::RSP && loc != HostLoc::R15);
-    return hostloc_info[static_cast<size_t>(loc)];
+    const auto i = static_cast<size_t>(loc);
+    touched[i / 64] |= std::uint64_t{1} << (i % 64);  // patch 0063: for EndOfAllocScope
+    return hostloc_info[i];
 }
 
 const HostLocInfo& RegAlloc::LocInfo(HostLoc loc) const {

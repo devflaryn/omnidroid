@@ -245,3 +245,87 @@ fn the_cost_of_first_translation() {
         }
     }
 }
+
+/// The emit observer's sink: every block's guest PC, total size and code bytes, in order.
+struct Dump {
+    out: std::io::BufWriter<std::fs::File>,
+}
+
+unsafe extern "C" fn dump_block(ctx: *mut std::ffi::c_void, guest_pc: u64, host: *const std::ffi::c_void, code_bytes: usize, total_bytes: usize) {
+    use std::io::Write;
+    // SAFETY: `ctx` is the test's live `Dump`, used by the one emitting thread; `host` is valid for
+    // `code_bytes` reads (the block just emitted).
+    let (dump, code) = unsafe { (&mut *(ctx as *mut Dump), std::slice::from_raw_parts(host as *const u8, code_bytes)) };
+    let hex: String = code.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = writeln!(dump.out, "{guest_pc:x} {total_bytes} {hex}");
+}
+
+/// **How fast the emitter is, on real code -- and what it emits, for a differential check.** The
+/// corpus is the first blocks of every function of libc, libart, libhwui and libandroid_runtime,
+/// translated `OMNI_EMIT_PASSES` times (default 5) on a fresh shared cache each, as omni-cpu
+/// configures the jit; the medians of the frontend's and the emitter's microseconds a block are
+/// printed. `OMNI_EMIT_DUMP=<file>` also writes every block of the first pass (guest PC, total
+/// size, code bytes up to the link slots), so two builds of the emitter can be compared
+/// (`tools/compare_emit_dumps.py`).
+///
+/// ```text
+/// OMNI_SYSROOT=<sysroot/aosp-35> OD_TEST_SHARED_CACHE=1 \
+///   cargo test -p dynarmic-sys --release --test code_size -- --ignored --nocapture the_speed
+/// ```
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_speed_of_emission() {
+    if !harness::every_vm_on_a_shared_cache() {
+        println!("needs OD_TEST_SHARED_CACHE=1: skipped");
+        return;
+    }
+    let passes: usize = std::env::var("OMNI_EMIT_PASSES").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let libs = [
+        "/apex/com.android.runtime/lib64/bionic/libc.so",
+        "/apex/com.android.art/lib64/libart.so",
+        "/system/lib64/libhwui.so",
+        "/system/lib64/libandroid_runtime.so",
+    ];
+    let mut dump = std::env::var_os("OMNI_EMIT_DUMP")
+        .map(|p| Box::new(Dump { out: std::io::BufWriter::new(std::fs::File::create(p).expect("the dump file")) }));
+    let (mut frontend, mut emit, mut wall) = (Vec::new(), Vec::new(), Vec::new());
+    let mut blocks = 0;
+    for pass in 0..passes {
+        if pass == 0 {
+            if let Some(d) = dump.as_mut() {
+                let ctx: *mut Dump = &mut **d;
+                // SAFETY: `dump` outlives the observer, which is removed below; one thread emits.
+                unsafe { dynarmic_sys::od_set_emit_observer(Some(dump_block), ctx.cast()) };
+            }
+        }
+        let (mut t, mut e, mut w, mut b) = (0u64, 0u64, 0f64, 0u64);
+        for lib in libs {
+            let Some(r) = translate_library_with(lib, 4, optimization::ALL_SAFE) else {
+                println!("{lib}: not in the sysroot (OMNI_SYSROOT): skipped");
+                return;
+            };
+            t += r.stats.translate_ns;
+            e += r.stats.emit_ns;
+            w += r.wall.as_secs_f64();
+            b += r.stats.blocks_emitted;
+        }
+        // SAFETY: removes the observer.
+        unsafe { dynarmic_sys::od_set_emit_observer(None, std::ptr::null_mut()) };
+        blocks = b;
+        frontend.push(t as f64 / 1e3 / b as f64);
+        emit.push(e as f64 / 1e3 / b as f64);
+        wall.push(w * 1e6 / b as f64);
+    }
+    drop(dump);
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let emits: Vec<f64> = emit.iter().map(|x| (x * 100.0).round() / 100.0).collect();
+    println!(
+        "corpus {blocks} blocks, {passes} passes: frontend {:.2} us/block, emit {:.2} us/block, wall {:.2} us/block (medians; emit per pass {emits:?})",
+        median(&mut frontend),
+        median(&mut emit),
+        median(&mut wall),
+    );
+}

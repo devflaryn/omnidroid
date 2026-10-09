@@ -8,6 +8,7 @@
 #include <array>
 #include <functional>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/hostloc.h"
 #include "dynarmic/backend/x64/oparg.h"
+#include "dynarmic/backend/x64/stack_layout.h"
 #include "dynarmic/ir/cond.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/value.h"
@@ -28,6 +30,44 @@ enum class AccType;
 namespace Dynarmic::Backend::X64 {
 
 class RegAlloc;
+
+/// Omnidroid patch 0063: the values a host location holds -- almost always one or two -- inline,
+/// rather than a `std::vector` (a heap allocation per location per block, and an out-of-line
+/// `std::find` on every lookup). The same order and the same contents.
+class HostLocValues {
+public:
+    bool empty() const { return size == 0; }
+    void clear() {
+        size = 0;
+        spilled.clear();
+    }
+    void push_back(IR::Inst* inst) {
+        if (size < inline_values.size()) {
+            inline_values[size++] = inst;
+            return;
+        }
+        if (size == inline_values.size()) {
+            spilled.assign(inline_values.begin(), inline_values.end());
+        }
+        spilled.push_back(inst);
+        size++;
+    }
+    IR::Inst* const* begin() const { return size <= inline_values.size() ? inline_values.data() : spilled.data(); }
+    IR::Inst* const* end() const { return begin() + size; }
+    bool contains(const IR::Inst* inst) const {
+        for (IR::Inst* const* i = begin(), *const* e = end(); i != e; ++i) {
+            if (*i == inst) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    std::size_t size = 0;
+    std::array<IR::Inst*, 3> inline_values{};
+    std::vector<IR::Inst*> spilled;  ///< all of them, past the inline capacity
+};
 
 struct HostLocInfo {
 public:
@@ -62,7 +102,7 @@ private:
     size_t total_uses = 0;
 
     // Value state
-    std::vector<IR::Inst*> values;
+    HostLocValues values;  // Omnidroid patch 0063: inline
     size_t max_bit_width = 0;
 };
 
@@ -107,7 +147,9 @@ class RegAlloc final {
 public:
     using ArgumentInfo = std::array<Argument, IR::max_arg_count>;
 
-    explicit RegAlloc(BlockOfCode& code, std::vector<HostLoc> gpr_order, std::vector<HostLoc> xmm_order);
+    /// Omnidroid patch 0063: the orders are viewed, not copied (two allocations a block): they
+    /// must outlive the allocator.
+    explicit RegAlloc(BlockOfCode& code, std::span<const HostLoc> gpr_order, std::span<const HostLoc> xmm_order);
 
     ArgumentInfo GetArgumentInfo(IR::Inst* inst);
     void RegisterPseudoOperation(IR::Inst* inst);
@@ -152,15 +194,18 @@ public:
 private:
     friend struct Argument;
 
-    std::vector<HostLoc> gpr_order;
-    std::vector<HostLoc> xmm_order;
+    std::span<const HostLoc> gpr_order;
+    std::span<const HostLoc> xmm_order;
 
-    HostLoc SelectARegister(const std::vector<HostLoc>& desired_locations) const;
+    // Omnidroid patch 0063: the desired locations as a span -- one location, or an order -- rather
+    // than a `std::vector` built (allocated) for each call.
+    using Locations = std::span<const HostLoc>;
+    HostLoc SelectARegister(Locations desired_locations) const;
     std::optional<HostLoc> ValueLocation(const IR::Inst* value) const;
 
-    HostLoc UseImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations);
-    HostLoc UseScratchImpl(IR::Value use_value, const std::vector<HostLoc>& desired_locations);
-    HostLoc ScratchImpl(const std::vector<HostLoc>& desired_locations);
+    HostLoc UseImpl(IR::Value use_value, Locations desired_locations);
+    HostLoc UseScratchImpl(IR::Value use_value, Locations desired_locations);
+    HostLoc ScratchImpl(Locations desired_locations);
     void DefineValueImpl(IR::Inst* def_inst, HostLoc host_loc);
     void DefineValueImpl(IR::Inst* def_inst, const IR::Value& use_inst);
 
@@ -173,7 +218,18 @@ private:
     void SpillRegister(HostLoc loc);
     HostLoc FindFreeSpill() const;
 
-    std::vector<HostLocInfo> hostloc_info;
+    static constexpr std::size_t HostLocCount = NonSpillHostLocCount + SpillCount;
+    // Omnidroid patch 0063: in place, not a vector allocated per block. And two masks over it:
+    // `touched`, every location written through `LocInfo` since the last `EndOfAllocScope` (the
+    // only ones it has anything to release); `occupied`, a superset of the locations holding
+    // values (the only ones `ValueLocation` searches). Neither changes a decision.
+    std::array<HostLocInfo, HostLocCount> hostloc_info;
+    std::array<std::uint64_t, (HostLocCount + 63) / 64> touched{};
+    std::array<std::uint64_t, (HostLocCount + 63) / 64> occupied{};
+    void MarkOccupied(HostLoc loc) {
+        const auto i = static_cast<std::size_t>(loc);
+        occupied[i / 64] |= std::uint64_t{1} << (i % 64);
+    }
     HostLocInfo& LocInfo(HostLoc loc);
     const HostLocInfo& LocInfo(HostLoc loc) const;
 

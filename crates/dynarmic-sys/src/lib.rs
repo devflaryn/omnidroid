@@ -1074,6 +1074,15 @@ extern "C" {
     /// None beyond an ordinary FFI call.
     pub fn od_codegen_census_reset();
 
+    /// Patch 0062 (x64 only): `observer(ctx, guest_pc, host, code_bytes, total_bytes)` for every
+    /// block emitted from now on, on the emitting thread; null stops it. `host` is the block's
+    /// entry, `code_bytes` its code up to its link slots, `total_bytes` with them. For
+    /// differential tests of the emitter. A no-op on arm64.
+    ///
+    /// # Safety
+    /// `observer` must be safe to call with `ctx` from any thread that emits, until it is replaced.
+    pub fn od_set_emit_observer(observer: Option<OdEmitObserver>, ctx: *mut c_void);
+
     /// Patch 0042 (x64 only): non-zero emits the return-stack buffer's and the fast-dispatch
     /// table's hit paths inside each `RET`/`BR`/`BLR` block -- from the target PC still in a
     /// register, with an indirect jump of the site's own -- instead of a jump to one shared handler
@@ -1084,6 +1093,9 @@ extern "C" {
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_fast_dispatch_inline(on: u32) -> u32;
 }
+
+/// Patch 0062: see [`od_set_emit_observer`].
+pub type OdEmitObserver = unsafe extern "C" fn(ctx: *mut c_void, guest_pc: u64, host: *const c_void, code_bytes: usize, total_bytes: usize);
 
 /// Patch 0061: [`od_set_compact_code`]'s bit for the shared memory-abort check behind each fastmem
 /// site (the bulk of the saving: out-of-line code 44 -> 18 bytes a memory access on `libc.so`).
