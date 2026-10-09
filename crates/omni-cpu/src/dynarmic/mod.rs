@@ -87,7 +87,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dynarmic_sys::{
-    optimization, od_code_cache_clear, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
+    optimization, od_code_cache_clear, od_code_cache_evict_to, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
     od_code_cache_guest_pcs_of, od_code_cache_stats_of, od_code_cache_tables_of, od_jit_clear_halt,
     od_jit_effective_config,
     od_jit_free, od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec,
@@ -1309,6 +1309,27 @@ impl DynarmicBackend {
             // SAFETY: the cache is live for `self.shared`'s life; this is not called from inside a
             // callback (the backend has none -- only its contexts do).
             unsafe { od_code_cache_clear(cache.0) };
+        }
+    }
+
+    /// Retire the shared cache's oldest full regions until at most `keep_bytes` of regions are
+    /// live (vendored patch 0050; the region being filled always stays). Their blocks are
+    /// translated again if they run again. How many regions were retired (0 without a cache).
+    pub fn evict_code_to(&self, keep_bytes: u64) -> u64 {
+        match &self.shared.code_cache {
+            // SAFETY: as `clear_code_cache`.
+            Some(cache) => unsafe { od_code_cache_evict_to(cache.0, keep_bytes) },
+            None => 0,
+        }
+    }
+
+    /// The shared cache's region size (0 without a cache): what `evict_code_to` retires at a time.
+    #[must_use]
+    pub fn code_region_bytes(&self) -> u64 {
+        if self.shared.code_cache.is_some() {
+            self.shared.options.shared_code_region_bytes.min(self.shared.options.shared_code_cache_bytes / 3).max(8 << 20)
+        } else {
+            0
         }
     }
 

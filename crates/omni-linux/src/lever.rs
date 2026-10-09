@@ -108,6 +108,8 @@
 //!   decommitted at once, which Linux's "old contents or zeros" allows -- rather than ignored
 //!   (`crate::mm::MADV_FREE_DISCARDS`). Off by default.
 //!
+//! - `code_age=<minutes>`, `code_age_keep=<MiB>`, `code_age_sf=0|1`: the system host's age pass
+//!   (`crate::code_trim::age`): a process's oldest translations retired past the kept size. Off.
 //! - `read_no_commit=0|1`: the kernel's reads of guest memory read a lazy mapping's uncommitted
 //!   pages as zeros instead of committing them (`crate::guest::READ_NO_COMMIT`; on by default).
 //! - `binder_spawn=kernel|eager`: when a guest process is asked for another binder looper -- the
@@ -320,6 +322,25 @@ pub fn apply(line: &str) -> Option<String> {
             let seconds: u64 = value.trim().parse().ok()?;
             crate::zero_reclaim::set_period(seconds);
             Some(format!("zero_reclaim={seconds}: {}", if seconds == 0 { "no sweeps" } else { "zero pages swept out of the working set" }))
+        }
+        "code_age" => {
+            let minutes: u64 = value.trim().parse().ok()?;
+            crate::code_trim::age::set_minutes(minutes);
+            Some(format!("code_age={minutes}: {}", if minutes == 0 { "no age passes" } else { "the oldest translations retired past code_age_keep" }))
+        }
+        "code_age_keep" => {
+            let mb: u64 = value.trim().parse().ok()?;
+            crate::code_trim::age::KEEP_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("code_age_keep={mb} MiB"))
+        }
+        "code_age_sf" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::code_trim::age::SURFACEFLINGER.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("code_age_sf={}", u8::from(on)))
         }
         "read_no_commit" => {
             let on = match value.trim() {
@@ -676,6 +697,12 @@ mod tests {
         apply("madv_free=0").expect("understood");
         assert!(!crate::mm::MADV_FREE_DISCARDS.load(Ordering::Relaxed));
         assert_eq!(apply("madv_free=yes"), None);
+        apply("code_age_keep=48").expect("understood");
+        assert_eq!(crate::code_trim::age::KEEP_MB.load(Ordering::Relaxed), 48);
+        apply("code_age_keep=32").expect("understood");
+        apply("code_age=0").expect("understood");
+        assert_eq!(crate::code_trim::age::MINUTES.load(Ordering::Relaxed), 0);
+        assert_eq!(apply("code_age_sf=2"), None);
         apply("binder_spawn=kernel").expect("understood");
         assert!(crate::binder::spawn::KERNEL_RULE.load(Ordering::Relaxed));
         apply("binder_spawn=eager").expect("understood");

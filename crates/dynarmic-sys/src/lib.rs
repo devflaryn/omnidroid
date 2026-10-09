@@ -780,6 +780,14 @@ extern "C" {
     /// As [`od_code_cache_invalidate_range`].
     pub fn od_code_cache_clear(cache: *mut c_void);
 
+    /// Vendored patch 0050: retire the oldest full regions until at most `keep_bytes` of regions
+    /// are live (at least the one being filled stays); how many were retired. Their blocks are
+    /// translated again if they run again.
+    ///
+    /// # Safety
+    /// As [`od_code_cache_invalidate_range`].
+    pub fn od_code_cache_evict_to(cache: *mut c_void, keep_bytes: u64) -> u64;
+
     /// Where a jit's `JitState` keeps the two exclusive-monitor slot pointers that code in a shared
     /// cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot
     /// addresses as immediates -- for a sampler that recognises monitor code by what it reads.

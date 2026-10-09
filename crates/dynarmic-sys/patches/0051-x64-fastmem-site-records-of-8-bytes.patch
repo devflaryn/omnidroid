@@ -1,0 +1,135 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 65fc9c5..4b9f16b 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -430,9 +430,10 @@ A64::SharedCodeCache::Tables A64EmitX64::Census() const {
+     t.fastmem_sites = RobinMapFigure(fastmem_patch_info);
+     // Patch 0025: a shared cache's sites, one record each, per region.
+     t.fastmem_sites.bytes += VectorBytes(fastmem_site_runs) + VectorBytes(pending_fastmem_sites);
++    t.fastmem_sites.bytes += VectorBytes(fastmem_callbacks) + RobinMapFigure(fastmem_callback_index).bytes;  // patch 0051
+     for (const FastmemSiteRun& run : fastmem_site_runs) {
+-        t.fastmem_sites.entries += run.sites.size();
+-        t.fastmem_sites.bytes += VectorBytes(run.sites);
++        t.fastmem_sites.entries += run.sites.size() + run.wide.size();
++        t.fastmem_sites.bytes += VectorBytes(run.sites) + VectorBytes(run.wide);
+         if (VectorBytes(run.sites) > t.fastmem_sites.largest_bytes) {
+             t.fastmem_sites.largest_bytes = VectorBytes(run.sites);
+             t.fastmem_sites.largest_address = reinterpret_cast<std::uintptr_t>(run.sites.data());
+diff --git a/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/backend/x64/emit_x64.cpp
+index 682a36b..fb6145f 100644
+--- a/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -542,6 +542,7 @@ void EmitX64::BeginFastmemSites(const void* begin, const void* end) {
+         if (run.begin == b) {
+             ASSERT(run.end == e);
+             std::vector<FastmemSite>{}.swap(run.sites);
++            std::vector<WideFastmemSite>{}.swap(run.wide);  // patch 0051
+             return;
+         }
+         // Runs are regions: they never overlap.
+@@ -557,6 +558,7 @@ void EmitX64::PurgeFastmemSites(const void* begin, const void* end) {
+     for (FastmemSiteRun& run : fastmem_site_runs) {
+         if (b <= run.begin && run.end <= e) {
+             std::vector<FastmemSite>{}.swap(run.sites);
++            std::vector<WideFastmemSite>{}.swap(run.wide);  // patch 0051
+         } else {
+             // A run is purged whole, with the region it is: never in part.
+             ASSERT(e <= run.begin || run.end <= b);
+@@ -594,13 +596,34 @@ void EmitX64::CommitSharedFastmemSites() {
+     while (!run->sites.empty() && run->sites.back().site >= first_offset) {
+         run->sites.pop_back();
+     }
++    while (!run->wide.empty() && run->wide.back().site >= first_offset) {  // patch 0051
++        run->wide.pop_back();
++    }
++    bool any = false;
++    u32 last = 0;
+     for (const PendingFastmemSite& p : pending_fastmem_sites) {
+         ASSERT(p.site >= base && p.site < limit && p.resume >= base && p.resume < limit);
+         const u32 site = static_cast<u32>(p.site - base);
+-        if (!run->sites.empty() && run->sites.back().site == site) {
+-            continue;
++        const u32 resume = static_cast<u32>(p.resume - base);
++        if (any && last == site) {
++            continue;  // the first record for an instruction stands
++        }
++        any = true;
++        last = site;
++        // Patch 0051: compact when the resume is a short way on and the fallback has an index.
++        u32 callback = 0xFFFF;
++        if (const auto it = fastmem_callback_index.find(p.callback); it != fastmem_callback_index.end()) {
++            callback = it->second;
++        } else if (fastmem_callbacks.size() < 0xFFFF) {
++            callback = static_cast<u32>(fastmem_callbacks.size());
++            fastmem_callbacks.push_back(p.callback);
++            fastmem_callback_index.emplace(p.callback, static_cast<u16>(callback));
++        }
++        if (resume >= site && resume - site <= 0xFFFF && callback < 0xFFFF) {
++            run->sites.push_back(FastmemSite{site, static_cast<u16>(resume - site), static_cast<u16>(callback)});
++        } else {
++            run->wide.push_back(WideFastmemSite{site, resume, p.callback});
+         }
+-        run->sites.push_back(FastmemSite{site, static_cast<u32>(p.resume - base), p.callback});
+     }
+ }
+ 
+@@ -613,10 +636,16 @@ std::optional<FakeCall> EmitX64::FindSharedFastmemSite(u64 fault_rip) const {
+         const u32 offset = static_cast<u32>(fault_rip - base);
+         const auto it = std::lower_bound(run.sites.begin(), run.sites.end(), offset,
+                                          [](const FastmemSite& s, u32 o) { return s.site < o; });
+-        if (it == run.sites.end() || it->site != offset) {
++        if (it != run.sites.end() && it->site == offset) {
++            return FakeCall{.call_rip = fastmem_callbacks[it->callback], .ret_rip = base + offset + it->resume_delta};
++        }
++        // Patch 0051: the few kept whole.
++        const auto w = std::lower_bound(run.wide.begin(), run.wide.end(), offset,
++                                        [](const WideFastmemSite& s, u32 o) { return s.site < o; });
++        if (w == run.wide.end() || w->site != offset) {
+             return std::nullopt;
+         }
+-        return FakeCall{.call_rip = it->callback, .ret_rip = base + it->resume};
++        return FakeCall{.call_rip = w->callback, .ret_rip = base + w->resume};
+     }
+     return std::nullopt;
+ }
+diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
+index a1856f4..edb5f5a 100644
+--- a/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/backend/x64/emit_x64.h
+@@ -289,18 +289,32 @@ public:
+     void PurgeFastmemSites(const void* begin, const void* end);
+ 
+ protected:
++    /// Omnidroid patch 0051: 8 bytes, not 16 -- a world holds 1.3M of them (23 MiB at 16). The
++    /// resume address is a short way after the site (in the block or its deferred tail), and the
++    /// fallbacks are a few hundred prelude thunks, so both fit 16 bits; a site whose resume does
++    /// not, or past 65,535 fallbacks, is kept whole in `wide`.
+     struct FastmemSite {
+-        u32 site;      ///< the faulting instruction, as an offset from its run's `begin`
+-        u32 resume;    ///< where the fallback returns to, likewise
++        u32 site;           ///< the faulting instruction, as an offset from its run's `begin`
++        u16 resume_delta;   ///< where the fallback returns to, as an offset from `site`
++        u16 callback;       ///< the fallback, as an index into `fastmem_callbacks`
++    };
++    static_assert(sizeof(FastmemSite) == 8);
++    struct WideFastmemSite {
++        u32 site;      ///< as FastmemSite
++        u32 resume;    ///< where the fallback returns to, as an offset from the run's `begin`
+         u64 callback;  ///< the fallback
+     };
+-    static_assert(sizeof(FastmemSite) == 16);
+     struct FastmemSiteRun {
+         const u8* begin = nullptr;
+         const u8* end = nullptr;
+-        std::vector<FastmemSite> sites;  ///< ascending `site`, one per patch site
++        std::vector<FastmemSite> sites;     ///< ascending `site`, one per patch site
++        std::vector<WideFastmemSite> wide;  ///< ascending `site`: the few that do not fit
+     };
+     std::vector<FastmemSiteRun> fastmem_site_runs;
++    /// Patch 0051: every fallback a site names, once, and its index. Fallbacks are prelude code,
++    /// which lives as long as the cache: never forgotten.
++    std::vector<u64> fastmem_callbacks;
++    tsl::robin_map<u64, u16> fastmem_callback_index;
+     struct PendingFastmemSite {
+         u64 site;
+         u64 resume;

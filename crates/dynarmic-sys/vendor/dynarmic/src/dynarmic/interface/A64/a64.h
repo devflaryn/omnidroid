@@ -220,6 +220,10 @@ public:
     void InvalidateCacheRange(std::uint64_t start_address, std::size_t length);
     /// Drop every translation, now. Same restriction.
     void ClearCache();
+    /// Omnidroid patch 0050: retire the oldest full regions until at most `keep_bytes` of regions
+    /// are live (the region being filled counts; at least one stays). Their blocks are forgotten
+    /// and translated again if they run again. Same restriction. How many regions were retired.
+    std::size_t EvictTo(std::size_t keep_bytes);
 
     struct Impl;
     std::unique_ptr<Impl> impl;

@@ -454,6 +454,9 @@ void od_code_cache_guest_pcs_of(void* cache, const uint64_t* hosts, uint64_t cou
  * jit halts, as for a jit with its own cache). Same clamping as that call. */
 void od_code_cache_invalidate_range(void* cache, uint64_t addr, uint64_t len);
 void od_code_cache_clear(void* cache);
+/* Patch 0050: retire the oldest full regions until at most `keep_bytes` of regions are live (at
+ * least the one being filled stays); how many were retired. Same restriction as the clear. */
+uint64_t od_code_cache_evict_to(void* cache, uint64_t keep_bytes);
 
 /* Where a jit's JitState keeps its two exclusive-monitor slot pointers, which code in a shared
  * cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot addresses

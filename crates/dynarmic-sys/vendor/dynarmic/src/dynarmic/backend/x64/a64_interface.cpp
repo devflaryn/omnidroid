@@ -323,6 +323,9 @@ struct SharedCodeCache::Impl final {
     /// a region was retired, so this is when the last holder lets go. Throttled, and skipped if
     /// the lock is busy.
     void ReclaimSoon();
+    /// Omnidroid patch 0050: retire the oldest full regions until at most `keep_bytes` of regions
+    /// are live (the one being filled counts). How many were retired.
+    size_t EvictTo(size_t keep_bytes);
 
 private:
     void EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held);
@@ -1209,6 +1212,27 @@ void SharedCodeCache::Impl::ReclaimSoon() {
     }
 }
 
+size_t SharedCodeCache::Impl::EvictTo(size_t keep_bytes) {
+    std::unique_lock held{lock};
+    if (regions.empty()) {
+        return 0;
+    }
+    // Patch 0050: what a full region's eviction does when the live limit is reached (patch 0028),
+    // on demand: the oldest live region's blocks are forgotten, every thread asked to leave
+    // generated code, and the region given back once none holds it. Hot code in it is translated
+    // again, into the region being filled, the next time it runs.
+    const size_t region_bytes = static_cast<size_t>(regions.front().end - regions.front().begin);
+    const size_t keep = std::max<size_t>(1, keep_bytes / region_bytes);
+    size_t evicted = 0;
+    while (LiveRegions() > keep && EvictOldest(nullptr)) {
+        evicted++;
+    }
+    if (evicted != 0) {
+        TryReclaimRetired();
+    }
+    return evicted;
+}
+
 SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
     std::shared_lock guard{lock};
     SharedCodeCache::Stats s;
@@ -1298,6 +1322,10 @@ void SharedCodeCache::InvalidateCacheRange(std::uint64_t start_address, std::siz
 
 void SharedCodeCache::ClearCache() {
     impl->Invalidate(true, {});
+}
+
+std::size_t SharedCodeCache::EvictTo(std::size_t keep_bytes) {
+    return impl->EvictTo(keep_bytes);
 }
 
 // ------------------------------------------------------------------------------------------------

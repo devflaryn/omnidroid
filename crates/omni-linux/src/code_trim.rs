@@ -34,6 +34,7 @@ pub const BUSY_CORES: f64 = 0.25;
 
 /// Start the trimmer for this host process (once).
 pub fn start() {
+    age::start();
     if std::env::var("OMNI_CODE_TRIM").as_deref() == Ok("0") {
         return;
     }
@@ -73,5 +74,101 @@ fn run() {
             eprintln!("[code] {name} (pid {pid}) quiet: {} MiB of translations dropped", committed >> 20);
         }
         seen.retain(|pid, _| live.iter().any(|p| p.sys.pid == *pid));
+    }
+}
+
+/// **The age pass: the oldest translations of the system's busy processes, given back on a long
+/// period** (`OMNI_CODE_AGE=<minutes>` / lever `code_age=<minutes>`; 0, the default, is off).
+///
+/// The trim above never reaches a process that keeps translating a little -- system_server in a
+/// world (`[mem]` 2026-10-09: 86 MiB of translations after its one quiet trim, 119 MiB later) --
+/// and never SurfaceFlinger (65 MiB); most of either is code run once, at boot or at the app's
+/// start. A shared cache fills regions in order and patch 0028 already retires the oldest when a
+/// live limit is reached; this asks for the same, on demand (patch 0050, `Process::age_code`):
+/// every period, each process of the system's host process holding more than the kept size
+/// (`OMNI_CODE_AGE_KEEP_MB` / `code_age_keep=<MiB>`, 32 by default) has its oldest regions retired,
+/// one at a time with a pause between, down to it. What still runs in them is translated again,
+/// once, into the region being filled -- the hot set moves forward, the cold code goes.
+///
+/// Measured offline (`dynarmic-sys` `shared_cache.rs::an_eviction_on_demand_...`): a region's
+/// eviction ~23 ms under the cache's lock (4 regions, 315k small blocks: 92 ms), a block translated
+/// again ~9 us (small blocks; a real one costs more). Only in the system's host process (an app's
+/// is the game's: never); SurfaceFlinger only with `OMNI_CODE_AGE_SF=1` / `code_age_sf=1` -- a
+/// retranslation burst on its thread is a frame missed.
+pub mod age {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Minutes between passes; 0: none.
+    pub static MINUTES: AtomicU64 = AtomicU64::new(0);
+    /// MiB of translations a process keeps.
+    pub static KEEP_MB: AtomicU64 = AtomicU64::new(32);
+    /// SurfaceFlinger too.
+    pub static SURFACEFLINGER: AtomicBool = AtomicBool::new(false);
+    static KICK: AtomicBool = AtomicBool::new(false);
+
+    /// The period, from the lever; a period set starts with a pass.
+    pub fn set_minutes(m: u64) {
+        MINUTES.store(m, Ordering::Relaxed);
+        KICK.store(m != 0, Ordering::Relaxed);
+    }
+
+    /// Read the environment and start the pass's thread (once). It passes only in the system's
+    /// host process (an app's host process is known as one -- `remote::is_remote` -- only once its
+    /// binder is connected, after this starts, so the thread asks every time).
+    pub fn start() {
+        if let Some(mb) = std::env::var("OMNI_CODE_AGE_KEEP_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+            KEEP_MB.store(mb, Ordering::Relaxed);
+        }
+        if std::env::var("OMNI_CODE_AGE_SF").as_deref() == Ok("1") {
+            SURFACEFLINGER.store(true, Ordering::Relaxed);
+        }
+        if let Some(m) = std::env::var("OMNI_CODE_AGE").ok().and_then(|v| v.parse::<u64>().ok()) {
+            set_minutes(m);
+            if m != 0 {
+                eprintln!("[lever] OMNI_CODE_AGE: code_age={m} (keep {} MiB)", KEEP_MB.load(Ordering::Relaxed));
+            }
+        }
+        let _ = std::thread::Builder::new().name("omni-code-age".into()).spawn(|| {
+            let mut last = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let minutes = MINUTES.load(Ordering::Relaxed);
+                if minutes == 0 || crate::remote::is_remote() {
+                    continue;
+                }
+                if !KICK.swap(false, Ordering::Relaxed) && last.elapsed() < Duration::from_secs(minutes * 60) {
+                    continue;
+                }
+                last = Instant::now();
+                pass();
+            }
+        });
+    }
+
+    /// One pass over the live processes.
+    pub fn pass() {
+        let keep = KEEP_MB.load(Ordering::Relaxed) << 20;
+        for p in crate::process::all_live() {
+            let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
+            if name == "surfaceflinger" && !SURFACEFLINGER.load(Ordering::Relaxed) {
+                continue;
+            }
+            let before = p.code_cache_committed();
+            if before <= keep {
+                continue;
+            }
+            let t = Instant::now();
+            let retired = p.age_code(keep, Duration::from_millis(200));
+            if retired > 0 {
+                eprintln!(
+                    "[code] age: {name} (pid {}) {} -> {} MiB of translations, {retired} regions retired ({} ms)",
+                    p.sys.pid,
+                    before >> 20,
+                    p.code_cache_committed() >> 20,
+                    t.elapsed().as_millis()
+                );
+            }
+        }
     }
 }

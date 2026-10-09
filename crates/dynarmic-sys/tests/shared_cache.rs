@@ -1378,3 +1378,55 @@ fn the_cost_of_an_eviction() {
         );
     }
 }
+
+/// **An eviction on demand gives back the oldest regions and nothing else** (patch 0050,
+/// `od_code_cache_evict_to`): a cache holding a hot working set W (translated first, so in the
+/// oldest region) and cold code after it, evicted down to one region, keeps only the region being
+/// filled; W runs right after, translated again once, and the cold code is gone. Prints what the
+/// eviction and W's retranslation cost.
+#[test]
+fn an_eviction_on_demand_keeps_the_newest_region_and_w_runs_on() {
+    const HOT: usize = 3_000;
+    const COLD: usize = 25_000;
+    const SEGMENTS: usize = 14;
+    const REGION: u64 = 8 << 20;
+    let (program, cold_at) = working_set_and_cold_code(HOT, SEGMENTS, COLD);
+    // No live limit to speak of (all but one region): only the eviction on demand retires.
+    let space = Space::with_live(VmOptions { cycle_counting: true, ..VmOptions::default() }, 1, 96 << 20, REGION, 0, &program);
+    let vm = space.vm(0, true);
+    run_chain(&vm, 0, HOT);
+    let w_blocks = space.stats().blocks_emitted;
+    for &at in &cold_at {
+        run_chain(&vm, at, COLD);
+    }
+    let filled = space.stats();
+    assert!(filled.regions_live >= 3, "cold code over several regions: {filled:?}");
+    assert_eq!(filled.regions_evicted, 0, "{filled:?}");
+
+    let t = Instant::now();
+    // SAFETY: the cache is live and its one jit is not executing.
+    let evicted = unsafe { od_code_cache_evict_to(space.cache as *mut c_void, REGION) };
+    let took = t.elapsed();
+    let after = space.stats();
+    assert_eq!(evicted, filled.regions_live - 1, "{filled:?} -> {after:?}");
+    assert_eq!(after.regions_live, 1, "the region being filled stays: {after:?}");
+    assert!(after.committed_bytes + (evicted - 1) * REGION <= filled.committed_bytes, "given back: {filled:?} -> {after:?}");
+    // SAFETY: as above. Asking again changes nothing.
+    assert_eq!(unsafe { od_code_cache_evict_to(space.cache as *mut c_void, REGION) }, 0);
+
+    // W runs on: translated again, once.
+    let t2 = Instant::now();
+    run_chain(&vm, 0, HOT);
+    let again = t2.elapsed();
+    let rerun = space.stats();
+    assert_eq!(rerun.blocks_emitted - after.blocks_emitted, w_blocks, "W translated again whole: {rerun:?}");
+    run_chain(&vm, 0, HOT);
+    assert_eq!(space.stats().blocks_emitted, rerun.blocks_emitted, "and only once");
+    eprintln!(
+        "evicted {evicted} regions ({} blocks) in {:.1} ms; W's {w_blocks} blocks translated again in {:.1} ms ({:.1} us a block)",
+        after.blocks_evicted - filled.blocks_evicted,
+        took.as_secs_f64() * 1e3,
+        again.as_secs_f64() * 1e3,
+        again.as_secs_f64() * 1e6 / w_blocks as f64
+    );
+}
