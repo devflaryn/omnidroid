@@ -46,35 +46,61 @@ fn run() {
     let min_bytes = std::env::var("OMNI_CODE_TRIM_MIN_MB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(MIN_BYTES, |mb| mb << 20);
     // pid -> (bytes emitted at the last look, when last trimmed).
     let mut seen: HashMap<i32, (u64, Option<Instant>)> = HashMap::new();
+    let started = Instant::now();
+    // `first_trim` (`crate::settle`): the first look when the host process has settled after its
+    // start -- quiet, in all its processes, for seconds in a row -- rather than a period after it.
+    // Every process is then quiet by that measure; the size floor and the rest still apply.
     let mut cpu = omni_platform::process::cpu_time().ok();
+    let mut since = started;
+    let mut early = false;
+    while started.elapsed() < PERIOD {
+        std::thread::sleep(Duration::from_secs(1));
+        if crate::settle::FIRST_TRIM.load(std::sync::atomic::Ordering::Relaxed) && crate::settle::settled() {
+            look(&mut seen, false, true, min_bytes);
+            (cpu, since, early) = (omni_platform::process::cpu_time().ok(), Instant::now(), true);
+            break;
+        }
+    }
+    // Then a look every period (the first at the period after the start when there was no early
+    // one, as before).
+    let mut first = !early;
     loop {
-        std::thread::sleep(PERIOD);
+        if !first {
+            std::thread::sleep(PERIOD);
+        }
+        first = false;
         let now_cpu = omni_platform::process::cpu_time().ok();
         let cores = match (cpu, now_cpu) {
-            (Some(a), Some(b)) => b.saturating_sub(a).as_secs_f64() / PERIOD.as_secs_f64(),
+            (Some(a), Some(b)) => b.saturating_sub(a).as_secs_f64() / since.elapsed().as_secs_f64().max(1.0),
             _ => f64::MAX,
         };
-        cpu = now_cpu;
+        (cpu, since) = (now_cpu, Instant::now());
         let busy = cores > BUSY_CORES && crate::remote::is_remote();
-        let live = crate::process::all_live();
-        for p in &live {
-            let pid = p.sys.pid;
-            let emitted = p.code_emitted();
-            let (last, trimmed) = seen.get(&pid).copied().unwrap_or((emitted, None));
-            seen.insert(pid, (emitted, trimmed));
-            let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
-            let committed = p.code_cache_committed();
-            let quiet = emitted.saturating_sub(last) < QUIET_BYTES;
-            let due = trimmed.is_none_or(|t| t.elapsed() >= AGAIN_AFTER);
-            if busy || !quiet || !due || committed < min_bytes || name == "surfaceflinger" {
-                continue;
-            }
-            p.trim_code();
-            seen.insert(pid, (emitted, Some(Instant::now())));
-            eprintln!("[code] {name} (pid {pid}) quiet: {} MiB of translations dropped", committed >> 20);
-        }
-        seen.retain(|pid, _| live.iter().any(|p| p.sys.pid == *pid));
+        look(&mut seen, busy, false, min_bytes);
     }
+}
+
+/// One look over the live processes: each quiet one (or every one, `all_quiet`) holding more than
+/// `min_bytes` of translations, not trimmed in [`AGAIN_AFTER`], has them dropped -- unless `busy`.
+fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, busy: bool, all_quiet: bool, min_bytes: u64) {
+    let live = crate::process::all_live();
+    for p in &live {
+        let pid = p.sys.pid;
+        let emitted = p.code_emitted();
+        let (last, trimmed) = seen.get(&pid).copied().unwrap_or((emitted, None));
+        seen.insert(pid, (emitted, trimmed));
+        let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
+        let committed = p.code_cache_committed();
+        let quiet = all_quiet || emitted.saturating_sub(last) < QUIET_BYTES;
+        let due = trimmed.is_none_or(|t| t.elapsed() >= AGAIN_AFTER);
+        if busy || !quiet || !due || committed < min_bytes || name == "surfaceflinger" {
+            continue;
+        }
+        p.trim_code();
+        seen.insert(pid, (emitted, Some(Instant::now())));
+        eprintln!("[code] {name} (pid {pid}) quiet{}: {} MiB of translations dropped", if all_quiet { " (settled after its start)" } else { "" }, committed >> 20);
+    }
+    seen.retain(|pid, _| live.iter().any(|p| p.sys.pid == *pid));
 }
 
 /// **The age pass: the oldest translations of the system's busy processes, given back on a long

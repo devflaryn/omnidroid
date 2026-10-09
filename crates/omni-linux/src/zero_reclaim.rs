@@ -14,6 +14,9 @@
 //! each resident page's first words (a page that is not zero says so at once) -- ~20-40 ms a sweep
 //! for ~1.6 GiB of guest memory, off every guest thread.
 //!
+//! **The first sweep** comes when the host process has settled after its start (`crate::settle`:
+//! 12 s at the soonest, `first_sweep=<s>`; 0 waits the period as before), then every period.
+//!
 //! **On by default (60 s)**: `OMNI_ZERO_RECLAIM=<seconds>` from the start (0: off), or the live lever
 //! `zero_reclaim=<seconds>` (`crate::lever`; 0 stops it). Each sweep that finds something says so:
 //! `[zero] pid <host pid>: <n> MiB of zero pages reset of <m> MiB resident guest memory (<k>
@@ -45,17 +48,24 @@ pub fn start() {
     if std::env::var_os("OMNI_ZERO_RECLAIM").is_some() {
         eprintln!("[lever] OMNI_ZERO_RECLAIM: zero_reclaim={s}");
     }
+    // The first sweep once the host process has settled after its start (`crate::settle`, 12 s at
+    // the soonest), not a whole period after it: a new app host process holds its startup's zero
+    // pages for that minute otherwise.
+    crate::settle::start(Instant::now());
     let _ = std::thread::Builder::new().name("omni-zero-reclaim".into()).spawn(|| {
         let mut last = Instant::now();
+        let mut first_done = false;
         loop {
             std::thread::sleep(Duration::from_secs(1));
             let period = PERIOD_S.load(Ordering::Relaxed);
             if period == 0 {
                 continue;
             }
-            if !KICK.swap(false, Ordering::Relaxed) && last.elapsed() < Duration::from_secs(period) {
+            let early = !first_done && crate::settle::settled();
+            if !early && !KICK.swap(false, Ordering::Relaxed) && last.elapsed() < Duration::from_secs(period) {
                 continue;
             }
+            first_done = true;
             last = Instant::now();
             sweep_and_report();
         }

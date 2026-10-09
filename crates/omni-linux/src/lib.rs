@@ -72,6 +72,7 @@ pub mod xsocket;
 pub mod xtables;
 pub mod zbuf;
 pub mod zero_reclaim;
+pub mod settle;
 pub mod zygote;
 
 pub use fd::Output;
