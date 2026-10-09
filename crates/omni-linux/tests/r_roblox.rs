@@ -690,15 +690,17 @@ fn golden_key_separates_rooted_devices_and_leaves_unrooted_unchanged() {
     let root = std::env::temp_dir();
     let apk = root.join("x.apk");
     let plain = golden_dir(&root, &apk, None, true, "tr-TR");
-    // The unrooted key as it was before rooted devices existed.
-    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}")), "the unrooted key is unchanged");
+    // The unrooted key as it was before rooted devices existed (with the boot image's and the idle
+    // apps' suffixes, which the switches' defaults add whatever the root).
+    let (bootu, idle) = (omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix());
+    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}{bootu}{idle}")), "the unrooted key is unchanged");
     let a = root_hash("root=1\nmodule=a\n", &[("a", "sha_a")], 29000, "bin");
     let b = root_hash("root=1\nmodule=a\nmodule=b\n", &[("a", "sha_a"), ("b", "sha_b")], 29000, "bin");
     let rooted = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&a));
     let rooted_b = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&b));
     assert_ne!(plain, rooted, "rooted differs from unrooted");
     assert_ne!(rooted, rooted_b, "the module set changes the key");
-    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}")));
+    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}{bootu}{idle}")));
     assert_eq!(plain, golden_dir_rooted(&root, &apk, None, true, "tr-TR", None));
     // The denylist is part of the staged profile text, so it keys another saved/warm device.
     let profile = |deny: &[&str]| {
