@@ -54,6 +54,7 @@ dynarmic/
                and ../patches/0060-x64-codegen-census.patch
                and ../patches/0061-x64-compact-code.patch
                and ../patches/0062-x64-emit-observer.patch
+               and ../patches/0063-x64-faster-emitter.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

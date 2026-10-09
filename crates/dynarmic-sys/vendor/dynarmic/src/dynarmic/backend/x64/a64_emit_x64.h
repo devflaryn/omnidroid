@@ -254,9 +254,12 @@ protected:
     void (*memory_exclusive_write_128)();
     void GenMemory128Accessors();
 
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
+    // Omnidroid patch 0063: flat tables, not std::maps searched for every access emitted.
+    FallbackTable read_fallbacks;
+    FallbackTable write_fallbacks;
+    FallbackTable exclusive_write_fallbacks;
+    /// Omnidroid patch 0063: the general registers in allocation order, made once, not per block.
+    std::vector<HostLoc> gpr_order_cache;
     void GenFastmemFallbacks();
 
     const void* terminal_handler_pop_rsb_hint;

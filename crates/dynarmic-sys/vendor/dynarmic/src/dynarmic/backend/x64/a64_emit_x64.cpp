@@ -168,18 +168,20 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         ForgetOutgoingSlots(std::exchange(pending_first_link, NO_LINK));
     }
 
-    const std::vector<HostLoc> gpr_order = [this] {
-        std::vector<HostLoc> gprs{any_gpr};
-        if (conf.page_table) {
-            gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
-        }
-        if (conf.fastmem_pointer) {
-            gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R13));
-        }
-        return gprs;
-    }();
+    if (gpr_order_cache.empty()) {  // patch 0063: once, from the configuration, which is fixed
+        gpr_order_cache = [this] {
+            std::vector<HostLoc> gprs{any_gpr};
+            if (conf.page_table) {
+                gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R14));
+            }
+            if (conf.fastmem_pointer) {
+                gprs.erase(std::find(gprs.begin(), gprs.end(), HostLoc::R13));
+            }
+            return gprs;
+        }();
+    }
 
-    RegAlloc reg_alloc{code, gpr_order, any_xmm};
+    RegAlloc reg_alloc{code, gpr_order_cache, std::span<const HostLoc>{any_xmm.begin(), any_xmm.size()}};
     A64EmitContext ctx{conf, reg_alloc, block};
 
     // Start emitting.
