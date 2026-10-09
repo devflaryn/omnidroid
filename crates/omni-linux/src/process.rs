@@ -91,6 +91,8 @@ pub struct Process {
     /// Where its translation snapshot is read and written (`crate::jit_snapshot`), if snapshots
     /// are on.
     pub(crate) jit_snapshot: std::sync::OnceLock<crate::jit_snapshot::Target>,
+    /// Whether a slice's degraded memory path was already said (`run`, said once a process).
+    degraded_said: std::sync::atomic::AtomicBool,
     pub(crate) start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
     /// Signalled when `exit` is set.
@@ -762,6 +764,7 @@ impl Process {
             sigtramp: std::sync::atomic::AtomicU64::new(0),
             backend,
             jit_snapshot: std::sync::OnceLock::new(),
+            degraded_said: std::sync::atomic::AtomicBool::new(false),
             start: Mutex::new(None),
             exit: Mutex::new(None),
             exited: parking_lot::Condvar::new(),
@@ -1262,6 +1265,23 @@ impl Process {
             state.store(IN_KERNEL, std::sync::atomic::Ordering::SeqCst);
             let exit = match ran {
                 Ok(e) => e,
+                // A slice that only ran out of its budget with a callback-path entry in it: guest
+                // code that should reach memory directly went through the slow path once -- slower,
+                // with correct results (the backend's own words). Said once a process and run on,
+                // not the process killed: it ended a PS99 session at 99 s once in ~40 boots
+                // (2026-10-09 16:47, libc+0xbe148 in a nanosleep stub). Any other exit of such a
+                // slice still ends the process: its pending exit (a syscall) would be lost.
+                Err(omni_cpu::CpuError::DegradedMemoryPath { pc: at, callbacks, exit: "the slice ran to the end of its budget" }) => {
+                    if !self.degraded_said.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[cpu] pid {}: a slice ending at {at:#x} took {callbacks} callback-path memory entries (slower, correct); running on (said once)\n{}",
+                            self.sys.pid,
+                            self.registers(cpu)
+                        );
+                    }
+                    pc = cpu.pc() as u64;
+                    continue;
+                }
                 Err(e) => {
                     let detail = format!("the CPU backend: {e}\n{}", self.registers(cpu));
                     return (ExitStatus::Killed { signal: 6, pc: cpu.pc() as u64, detail }, None);
