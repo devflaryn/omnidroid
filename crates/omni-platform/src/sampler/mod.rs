@@ -68,6 +68,83 @@ mod unsupported;
 )))]
 use unsupported as backend;
 
+#[cfg(any(target_os = "windows", all(target_os = "linux", target_arch = "x86_64")))]
+use backend as whole;
+#[cfg(not(any(target_os = "windows", all(target_os = "linux", target_arch = "x86_64"))))]
+mod whole_unsupported;
+#[cfg(not(any(target_os = "windows", all(target_os = "linux", target_arch = "x86_64"))))]
+use whole_unsupported as whole;
+
+/// One thread of this process, as [`threads`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadTimes {
+    /// The OS thread id ([`HostThread::os_id`], [`current_thread_id`]).
+    pub os_id: u32,
+    /// [`HostThread::cycles`]' counter for it: only differences mean anything.
+    pub cycles: u64,
+    /// Its name (Windows: the thread description, which `std::thread::Builder::name` sets; Linux:
+    /// `comm`), when asked for and it has one.
+    pub name: Option<String>,
+    /// Where it started (Windows: the Win32 start address), when asked for; 0 otherwise.
+    pub start: usize,
+}
+
+/// Every thread of this process with its cycle counter, and -- for the ids `want_name` says yes to
+/// -- its name and start address (which cost a call or two more each, so a caller asks once per
+/// thread). For a report every few seconds: Windows takes a Tool Help snapshot of every thread of
+/// the system and opens each of this process's, a few milliseconds for a thousand threads.
+///
+/// # Errors
+///
+/// [`SamplerError::LastError`] / [`SamplerError::Errno`] if the list could not be read;
+/// [`SamplerError::Unsupported`] on macOS and targets with no backend.
+pub fn threads(want_name: &mut dyn FnMut(u32) -> bool) -> SamplerResult<Vec<ThreadTimes>> {
+    whole::threads(want_name)
+}
+
+/// The processor time this process has used, every thread together (those that have exited too).
+///
+/// # Errors
+///
+/// As [`threads`].
+pub fn process_cpu_time() -> SamplerResult<Duration> {
+    whole::process_cpu_time()
+}
+
+/// The clock [`ThreadTimes::cycles`] counts in, read now: on Windows the time-stamp counter
+/// (`QueryThreadCycleTime` charges TSC ticks), elsewhere nanoseconds of the monotonic clock (the
+/// unit of a Linux thread's `schedstat`). Two reads over a known wall time give the counter's rate,
+/// which turns a thread's cycles into processor time exactly -- `GetThreadTimes` is charged in
+/// 15.6 ms scheduler ticks.
+#[must_use]
+pub fn cycle_clock() -> u64 {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        // SAFETY: `rdtsc` has no preconditions on x86-64.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    {
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+/// The calling thread's OS id, as [`ThreadTimes::os_id`] names it (0 where unsupported).
+#[must_use]
+pub fn current_thread_id() -> u32 {
+    whole::current_thread_id()
+}
+
+/// The function at a host code address, from its module's debug information: (name, displacement).
+/// Windows: dbghelp, which finds the executable's PDB beside it (or where the build left it) and
+/// a system DLL's exports. `None` where it has no name, and on other hosts. Serialised; for a
+/// report thread, never a hot path.
+#[must_use]
+pub fn symbolize(address: usize) -> Option<(String, usize)> {
+    whole::symbolize(address)
+}
+
 /// How many code bytes [`HostThread::sample`] reads **before** the instruction pointer.
 ///
 /// Enough to reach back over the `mov r64, imm64` that dynarmic emits in front of a spin-lock loop
@@ -157,6 +234,16 @@ impl HostThread {
     /// [`SamplerError::Unsupported`] on a target with no backend.
     pub fn current() -> SamplerResult<Self> {
         Ok(Self { inner: backend::Thread::current()? })
+    }
+
+    /// A thread of this process by its OS id ([`ThreadTimes::os_id`]), for sampling from another.
+    ///
+    /// # Errors
+    ///
+    /// [`SamplerError::LastError`] if it could not be opened (it has exited); on Linux as
+    /// [`current`](Self::current); [`SamplerError::Unsupported`] on macOS.
+    pub fn open(os_id: u32) -> SamplerResult<Self> {
+        Ok(Self { inner: whole::open_thread(os_id)? })
     }
 
     /// The OS thread id.

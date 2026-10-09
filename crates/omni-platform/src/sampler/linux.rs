@@ -86,6 +86,9 @@ use super::{
 
 const CODE_LEN: usize = CODE_BEFORE + CODE_AFTER;
 
+mod whole;
+pub(super) use whole::{current_thread_id, open_thread, process_cpu_time, symbolize, threads};
+
 /// The sampling signal is `SIGRTMIN() + SIGNAL_OFFSET`. See the module documentation.
 const SIGNAL_OFFSET: i32 = 7;
 

@@ -23,6 +23,7 @@ fn main() -> ExitCode {
     omni_linux::poll::start_stats();
     omni_linux::code_trim::start();
     omni_linux::lever::start();
+    omni_linux::proccpu::start();
     omni_linux::zero_reclaim::start();
     let mut args = std::env::args().skip(1);
     let mut sysroot = PathBuf::from("sysroot/aosp-35");
