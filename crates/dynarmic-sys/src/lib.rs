@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 7;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 8;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -616,6 +616,9 @@ pub struct OdCodeCacheStats {
     pub snapshot_blocks_verified: u64,
     /// Of those, whose guest code had changed: dropped and translated again.
     pub snapshot_blocks_rejected: u64,
+    /// ABI 8: the latest save's time holding the cache's lock, copying the snapshot out (guest
+    /// threads that need the cache wait for it); the file is written after.
+    pub snapshot_save_lock_ns: u64,
 }
 
 /// What one of a shared code cache's per-block tables holds on the C heap (vendored patch 0024),

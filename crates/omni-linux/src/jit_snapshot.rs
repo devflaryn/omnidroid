@@ -13,7 +13,14 @@
 //! - `OMNI_JIT_SNAPSHOT=<dir>`: on. Each process loads its snapshot when its address space is made
 //!   (`spawn`, `execve`), and saves one when it ends.
 //! - `OMNI_JIT_SNAPSHOT_QUIET=<seconds>` (default 20; `0` off): also save a live process's once it
-//!   has translated nothing new for that long (a service that never ends: system_server, the game).
+//!   has translated nothing new for that long (a service that never ends: system_server), or once
+//!   it has *settled* -- at least `OMNI_JIT_SNAPSHOT_SETTLE_S` (default 45) seconds old, and fewer
+//!   than 2% of its blocks translated in the last 20 s (the game, which always translates a little,
+//!   and is killed rather than ending). A save holds the code cache's lock only while it copies the
+//!   snapshot out (`[jit-snapshot]` prints how long); the file is written after.
+//! - What is saved: the blocks entered this run (restored ones that verified, and the new ones).
+//!   Restored blocks that never verified are left out, so a snapshot is one run's working set and
+//!   does not grow across boots.
 //! - `OMNI_JIT_SNAPSHOT_MAX_MB=<MiB>` (default 512): no snapshot past that much code.
 //!
 //! **Library placement.** A block is reused only at the guest address it was translated at, and
@@ -134,6 +141,20 @@ fn host_build() -> &'static str {
     })
 }
 
+/// Where a process with snapshot key `key` asks for its guest space of `size` bytes when the low
+/// range is taken (`crate::process::reserve_space_for`): slots of `size` rounded up to 64 GiB in
+/// `[64 TiB, 96 TiB)` -- above where Windows and Linux place anything of their own by default, below
+/// the 128 TiB a 47-bit user space ends at -- the first chosen by the key's hash, then the next
+/// fifteen (a slot another program of this host process holds, or the host does).
+pub(crate) fn space_slots(key: &str, size: usize) -> impl Iterator<Item = usize> {
+    const LOW: usize = 0x4000_0000_0000;
+    const HIGH: usize = 0x6000_0000_0000;
+    let stride = size.next_multiple_of(64 << 30);
+    let slots = (HIGH - LOW) / stride;
+    let first = (fnv(key.as_bytes()) % slots as u64) as usize;
+    (0..16).map(move |i| LOW + ((first + i) % slots) * stride)
+}
+
 fn file_for(dir: &std::path::Path, key: &str) -> PathBuf {
     dir.join(format!("{:016x}.odjs", fnv(key.as_bytes())))
 }
@@ -185,15 +206,13 @@ pub(crate) fn save(p: &Process, why: &str) {
         }
     }
     let t0 = Instant::now();
-    // Everything it holds -- what it ran, and what it restored and did not need this time -- or,
-    // past the cap, only what it ran.
-    let mut n = backend.save_translation_snapshot(&target.path, &target.key, max_bytes(), false);
-    if n == -3 {
-        n = backend.save_translation_snapshot(&target.path, &target.key, max_bytes(), true);
-    }
+    // What it entered this run: the restored blocks that verified and the ones it translated --
+    // not the restored ones it never needed, which would otherwise ride along boot after boot.
+    let n = backend.save_translation_snapshot(&target.path, &target.key, max_bytes(), true);
     let size = std::fs::metadata(&target.path).map(|m| m.len()).unwrap_or(0);
+    let held_ms = backend.code_cache_stats().map_or(0.0, |s| s.snapshot_save_lock_ns as f64 / 1e6);
     eprintln!(
-        "[jit-snapshot] pid {} {why}: {} ({:.1} MiB, {:.0} ms; {} blocks translated, {} restored, {} verified, {} rejected)",
+        "[jit-snapshot] pid {} {why}: {} ({:.1} MiB, {:.0} ms, {held_ms:.0} ms of it holding the code cache; {} blocks translated, {} restored, {} verified, {} rejected)",
         p.sys.pid,
         if n >= 0 { format!("{n} blocks saved") } else { format!("not saved (error {n})") },
         size as f64 / (1u64 << 20) as f64,
@@ -206,9 +225,21 @@ pub(crate) fn save(p: &Process, why: &str) {
     *target.saved_emitted.lock() = (stats.blocks_emitted, Instant::now(), stats.blocks_emitted);
 }
 
+fn settle_seconds() -> u64 {
+    std::env::var("OMNI_JIT_SNAPSHOT_SETTLE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(45)
+}
+
+/// Whether a process whose translated-block count was `then` 20 s ago and is `now` has settled:
+/// fewer than 2% of its blocks are that new.
+#[must_use]
+pub fn settled(then: u64, now: u64) -> bool {
+    now > 0 && (now - then.min(now)) * 50 < now
+}
+
 /// The quiet saver: every few seconds, each live process with a snapshot target that has
-/// translated something since its last save, and nothing for `OMNI_JIT_SNAPSHOT_QUIET` seconds,
-/// is saved.
+/// translated something since its last save is saved once it has translated nothing for
+/// `OMNI_JIT_SNAPSHOT_QUIET` seconds -- or, once, when it has settled ([`settled`]) after
+/// `OMNI_JIT_SNAPSHOT_SETTLE_S` seconds of life.
 fn start_quiet_saver() {
     static STARTED: OnceLock<()> = OnceLock::new();
     let quiet = quiet_seconds();
@@ -216,22 +247,54 @@ fn start_quiet_saver() {
         return;
     }
     STARTED.get_or_init(|| {
+        let settle = settle_seconds();
         let _ = std::thread::Builder::new().name("jit-snapshot".into()).spawn(move || {
-            // Per process: (blocks emitted at the last look, when that count last changed).
-            let mut seen: std::collections::HashMap<i32, (u64, Instant)> = std::collections::HashMap::new();
+            struct Seen {
+                /// Blocks emitted at the last look, and when that count last changed.
+                count: u64,
+                changed: Instant,
+                /// When the process was first seen, and the counts of the last five looks (20 s).
+                first: Instant,
+                history: std::collections::VecDeque<u64>,
+                settled_saved: bool,
+            }
+            let mut seen: std::collections::HashMap<i32, Seen> = std::collections::HashMap::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
-                for p in crate::process::all_live() {
+                let live = crate::process::all_live();
+                seen.retain(|pid, _| live.iter().any(|p| p.sys.pid == *pid));
+                for p in live {
                     let (Some(target), Some(backend)) = (p.jit_snapshot.get(), p.backend()) else { continue };
                     let Some(stats) = backend.code_cache_stats() else { continue };
-                    let entry = seen.entry(p.sys.pid).or_insert((stats.blocks_emitted, Instant::now()));
-                    if entry.0 != stats.blocks_emitted {
-                        *entry = (stats.blocks_emitted, Instant::now());
-                        continue;
+                    let now = stats.blocks_emitted;
+                    let e = seen.entry(p.sys.pid).or_insert_with(|| Seen {
+                        count: now,
+                        changed: Instant::now(),
+                        first: Instant::now(),
+                        history: std::collections::VecDeque::new(),
+                        settled_saved: false,
+                    });
+                    e.history.push_back(now);
+                    if e.history.len() > 5 {
+                        e.history.pop_front();
+                    }
+                    if e.count != now {
+                        e.count = now;
+                        e.changed = Instant::now();
                     }
                     let saved = target.saved_emitted.lock().0;
-                    if stats.blocks_emitted > saved && entry.1.elapsed().as_secs() >= quiet {
+                    if now <= saved {
+                        continue;
+                    }
+                    if e.changed.elapsed().as_secs() >= quiet {
                         save(&p, "quiet");
+                    } else if !e.settled_saved
+                        && e.first.elapsed().as_secs() >= settle
+                        && e.history.len() == 5
+                        && settled(e.history[0], now)
+                    {
+                        e.settled_saved = true;
+                        save(&p, "settled");
                     }
                 }
             }
@@ -242,6 +305,26 @@ fn start_quiet_saver() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_process_has_settled_when_under_2_percent_of_its_blocks_are_new() {
+        assert!(settled(99_000, 100_000));
+        assert!(!settled(97_000, 100_000));
+        assert!(!settled(0, 0));
+        assert!(settled(100_000, 100_000));
+    }
+
+    #[test]
+    fn a_program_s_space_slot_is_the_same_each_time_and_in_the_high_range() {
+        let k = key(b"/system/bin/apexd", &[b"/system/bin/apexd".to_vec()]);
+        let a: Vec<usize> = space_slots(&k, 64 << 30).collect();
+        let b: Vec<usize> = space_slots(&k, 64 << 30).collect();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        assert!(a.iter().all(|&s| s >= 0x4000_0000_0000 && s + (64 << 30) <= 0x6000_0000_0000 && s % (64 << 30) == 0), "{a:x?}");
+        let other: Vec<usize> = space_slots(&key(b"/system/bin/idmap2", &[]), 64 << 30).collect();
+        assert_ne!(a[0], other[0]);
+    }
 
     #[test]
     fn a_key_names_the_program_and_its_arguments() {

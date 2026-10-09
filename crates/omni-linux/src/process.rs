@@ -321,6 +321,18 @@ fn small_space() -> GuestSpace {
 }
 
 pub fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
+    reserve_space_for(None)
+}
+
+/// [`reserve_space`] for a process whose translation snapshot is `snapshot_key`
+/// (`OMNI_JIT_SNAPSHOT`): when the low range is not to be had -- every process but a host
+/// process's first -- the space goes to a slot derived from the key, in a high range, rather than
+/// where the host chooses. A guest address is a host address, so a space wherever the host chooses
+/// lands elsewhere each boot, and with it every library and every translated block (none of a
+/// system host's later processes' restored blocks verified: `apexd`'s libc at 0x1a8c6105000,
+/// 0x2781ca83000 and 0x1cc2b906000 in three boots). The slot is the same each boot; a slot taken
+/// (another program's, by the hash) moves to the next.
+pub fn reserve_space_for(snapshot_key: Option<&str>) -> Result<GuestSpace, omni_mem::MemError> {
     // D41: below the host's floor the low range cannot be the host's own; it is a based window.
     let low_window = omni_platform::vm::lowest_mappable_address() > GUEST_SPACE_LOW_BASE;
     let config = |base: Option<usize>| GuestSpaceConfig {
@@ -339,6 +351,14 @@ pub fn reserve_space() -> Result<GuestSpace, omni_mem::MemError> {
             match low {
                 Ok(low) => tracing::debug!(free = low.stats().free, "the low range is mostly another's; reserving where the host chooses"),
                 Err(e) => tracing::warn!(%e, "no guest space below 4 GiB; reserving where the host chooses"),
+            }
+            if let Some(key) = snapshot_key {
+                for base in crate::jit_snapshot::space_slots(key, GUEST_SPACE_BYTES) {
+                    let fixed = GuestSpaceConfig { base: Some(base), around_host: false, low_window: false, ..config(None) };
+                    if let Ok(space) = GuestSpace::with_config(fixed) {
+                        return Ok(space);
+                    }
+                }
             }
             GuestSpace::with_config(config(None))
         }
@@ -784,7 +804,8 @@ impl Process {
         let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir))
             .with_owners(crate::owners::Owners::of(&config.instance_dir))
             .with_root_layer(if view.hidden { None } else { crate::root::Layer::of(&config.instance_dir) });
-        let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
+        let snapshot_key = crate::jit_snapshot::dir().map(|_| crate::jit_snapshot::key(&exe, &config.argv));
+        let space = Arc::new(reserve_space_for(snapshot_key.as_deref()).map_err(|e| format!("reserve the guest address space: {e}"))?);
         let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
         let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(Arc::new(backend)), 0, uid, view);
         crate::jit_snapshot::attach(&p, &exe, &config.argv);
@@ -845,7 +866,8 @@ impl Process {
     /// this process's pid, uid and cwd, with its descriptors less the close-on-exec ones.
     pub(crate) fn exec_image(self: &Arc<Self>, exe: &[u8], argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Arc<Self>, String> {
         let vfs = self.vfs.for_exec(exe.to_vec());
-        let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
+        let snapshot_key = crate::jit_snapshot::dir().map(|_| crate::jit_snapshot::key(exe, argv));
+        let space = Arc::new(reserve_space_for(snapshot_key.as_deref()).map_err(|e| format!("reserve the guest address space: {e}"))?);
         let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
         let fds = self.fds.for_exec();
         let p = Self::assemble_as(space, None, Some(self.sys.pid), vfs, argv.to_vec(), fds, self.trace, Some(Arc::new(backend)), 0, self.sys.uid(), self.view);

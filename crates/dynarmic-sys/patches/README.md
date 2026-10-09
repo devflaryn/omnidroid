@@ -674,3 +674,12 @@ aging to ~260k blocks; with this, 2^19 (-14 MiB) or less.
 
 With 0070's snapshots: `RestoreGuestRange` passes the saved `First()`, the location's PC, so 0072's
 assert holds for restored blocks too.
+
+### 0074 — x64: a snapshot save holds the lock only to copy out
+
+x64, shared caches (0070). `SaveSnapshot` builds the snapshot in memory under the cache's lock
+and writes the file after letting the lock go. Before this, it wrote the file with the lock held,
+so a game's ~230 MiB held every guest thread for as long as the disk took. The time the lock is
+held is kept in the stats as `snapshot_save_lock_ns` (ABI 8). Measured on `b_hello_dex`: 3-8 ms for
+5 MiB / 12k blocks and 18-22 ms for 30 MiB / 67k blocks. That scales to about 150-200 ms for the
+game's ~525k blocks, once per boot.

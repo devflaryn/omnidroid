@@ -60,6 +60,7 @@ dynarmic/
                and ../patches/0071-x64-restored-blocks-keep-0064-s-link-heads.patch
                and ../patches/0072-x64-a-guest-range-without-its-first-byte.patch
                and ../patches/0073-x64-shared-cache-maps-shrink-after-forgetting-blocks.patch
+               and ../patches/0074-x64-snapshot-saves-copy-out-under-the-lock.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

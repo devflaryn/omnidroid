@@ -193,6 +193,7 @@ public:
         std::uint64_t snapshot_blocks_restored = 0;  ///< blocks installed from a snapshot, unverified
         std::uint64_t snapshot_blocks_verified = 0;  ///< of those, found unchanged when first looked up and entered
         std::uint64_t snapshot_blocks_rejected = 0;  ///< of those, whose guest code had changed: dropped, translated again
+        std::uint64_t snapshot_save_lock_ns = 0;     ///< the latest save's time holding the cache's lock (copying out)
     };
     Stats GetStats() const;
 
