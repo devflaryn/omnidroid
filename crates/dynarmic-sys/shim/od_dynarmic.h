@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 7u
+#define OD_DYNARMIC_ABI_VERSION 8u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -423,6 +423,8 @@ typedef struct od_code_cache_stats {
     uint64_t snapshot_blocks_restored;  /* installed from a snapshot, unverified */
     uint64_t snapshot_blocks_verified;  /* of those, found unchanged at their first lookup and entered */
     uint64_t snapshot_blocks_rejected;  /* of those, whose guest code had changed: dropped */
+    /* ABI 8. */
+    uint64_t snapshot_save_lock_ns;     /* the latest save's time holding the cache's lock */
 } od_code_cache_stats;
 void od_code_cache_stats_of(void* cache, od_code_cache_stats* out);
 

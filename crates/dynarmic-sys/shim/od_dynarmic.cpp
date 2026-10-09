@@ -645,6 +645,7 @@ void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
     out->snapshot_blocks_restored = s.snapshot_blocks_restored;  // patch 0070
     out->snapshot_blocks_verified = s.snapshot_blocks_verified;
     out->snapshot_blocks_rejected = s.snapshot_blocks_rejected;
+    out->snapshot_save_lock_ns = s.snapshot_save_lock_ns;
 #else
     (void)p;
 #endif

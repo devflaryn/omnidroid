@@ -1,0 +1,103 @@
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index 25e4fba..5753d4a 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -357,6 +357,7 @@ struct SharedCodeCache::Impl final {
+     u64 snapshot_restored = 0;
+     u64 snapshot_verified = 0;
+     u64 snapshot_rejected = 0;
++    u64 snapshot_save_lock_ns = 0;  // the latest save's time holding the lock (copying out)
+ 
+ private:
+     void EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held);
+@@ -920,26 +921,25 @@ std::optional<u64> GuestCodeHash(const UserConfig& conf, u64 first, u64 end) {
+     return f.h;
+ }
+ 
++/// Builds a snapshot in memory: under the cache's lock only for the copy, written to the file
++/// after the lock is let go (writing a game's ~230 MiB under it held every guest thread up for as
++/// long as the disk took).
+ class Writer {
+ public:
+-    explicit Writer(std::FILE* f)
+-            : f(f) {}
++    explicit Writer(std::vector<u8>& out)
++            : out(out) {}
+     template<typename T>
+     void Value(const T& v) {
+         static_assert(std::is_trivially_copyable_v<T>);
+         Bytes(&v, sizeof(v));
+     }
+     void Bytes(const void* p, size_t n) {
+-        if (ok && n != 0 && std::fwrite(p, 1, n, f) != n) {
+-            ok = false;
+-        }
+-        written += n;
++        const u8* b = static_cast<const u8*>(p);
++        out.insert(out.end(), b, b + n);
+     }
+-    bool ok = true;
+-    u64 written = 0;
+ 
+ private:
+-    std::FILE* f;
++    std::vector<u8>& out;
+ };
+ 
+ class Reader {
+@@ -1184,12 +1184,10 @@ s64 SharedCodeCache::Impl::SaveSnapshot(const char* path, const char* key, u64 m
+         return -3;
+     }
+ 
+-    const std::string temporary = std::string{path} + ".partial";
+-    std::FILE* const file = OpenFile(temporary.c_str(), true);
+-    if (file == nullptr) {
+-        return -4;
+-    }
+-    Writer w{file};
++    const auto lock_start = std::chrono::steady_clock::now();
++    std::vector<u8> image;
++    image.reserve(static_cast<size_t>(total) + (1 << 20));
++    Writer w{image};
+     const size_t key_len = std::strlen(key);
+     w.Value(SNAPSHOT_MAGIC);
+     w.Value(SNAPSHOT_VERSION);
+@@ -1228,8 +1226,17 @@ s64 SharedCodeCache::Impl::SaveSnapshot(const char* path, const char* key, u64 m
+         }
+     }
+     w.Value(SNAPSHOT_MAGIC);
++    snapshot_save_lock_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lock_start).count());
++    held.unlock();
++
++    const std::string temporary = std::string{path} + ".partial";
++    std::FILE* const file = OpenFile(temporary.c_str(), true);
++    if (file == nullptr) {
++        return -4;
++    }
++    const bool written = image.empty() || std::fwrite(image.data(), 1, image.size(), file) == image.size();
+     const bool closed = std::fclose(file) == 0;
+-    if (!w.ok || !closed) {
++    if (!written || !closed) {
+         std::filesystem::remove(std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(temporary.c_str())}});
+         return -5;
+     }
+@@ -1951,6 +1958,7 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
+     s.snapshot_blocks_restored = snapshot_restored;  // patch 0070
+     s.snapshot_blocks_verified = snapshot_verified;
+     s.snapshot_blocks_rejected = snapshot_rejected;
++    s.snapshot_save_lock_ns = snapshot_save_lock_ns;
+     return s;
+ }
+ 
+diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+index 63e89e7..20f43cb 100644
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -193,6 +193,7 @@ public:
+         std::uint64_t snapshot_blocks_restored = 0;  ///< blocks installed from a snapshot, unverified
+         std::uint64_t snapshot_blocks_verified = 0;  ///< of those, found unchanged when first looked up and entered
+         std::uint64_t snapshot_blocks_rejected = 0;  ///< of those, whose guest code had changed: dropped, translated again
++        std::uint64_t snapshot_save_lock_ns = 0;     ///< the latest save's time holding the cache's lock (copying out)
+     };
+     Stats GetStats() const;
+ 
