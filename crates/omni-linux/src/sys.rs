@@ -1073,13 +1073,57 @@ fn sys_tgkill(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     send_signal(p, t, a[1] as i64, a[2])
 }
 
-/// Nice values are remembered for no one: every task runs at nice 0, which `getpriority` reports
-/// as the kernel does (`20 - nice`), and `setpriority` is accepted.
-fn sys_getpriority(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
-    Ok(20)
+/// The nice value each thread (by tid) last asked for with `setpriority(PRIO_PROCESS, ...)`.
+fn nice_values() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, i32>> {
+    static NICE: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<i32, i32>>> = std::sync::OnceLock::new();
+    NICE.get_or_init(Default::default)
 }
 
-fn sys_setpriority(_p: &Process, _t: &mut Task, _a: [u64; 6]) -> SysResult {
+/// `OMNI_GUEST_NICE`: unset, nice values are only remembered (and `getpriority` answers them);
+/// `log`, each one asked for is said (`[nice] <pid>/<tid> <name>: <nice>`); `1`, said and applied to
+/// the calling thread's host thread (`omni_platform::process::set_current_thread_nice`: Android's
+/// display and audio threads above normal, background ones below). Off by default: Windows
+/// priorities are strict where Linux's nice is a share, so a background thread is starved rather
+/// than slowed -- to be measured on a machine with fewer cores than threads ready to run.
+fn guest_nice_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("OMNI_GUEST_NICE").as_deref() {
+        Ok("1") => 2,
+        Ok("log") => 1,
+        _ => 0,
+    })
+}
+
+/// `getpriority(PRIO_PROCESS, who)`: `20 - nice`, as the kernel answers, of the thread `who` (0:
+/// the caller); nice 0 for one that never set its own. Other `which` values: nice 0.
+fn sys_getpriority(_p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    const PRIO_PROCESS: u64 = 0;
+    if a[0] != PRIO_PROCESS {
+        return Ok(20);
+    }
+    let who = if a[1] == 0 { t.tid } else { a[1] as i32 };
+    let nice = nice_values().lock().get(&who).copied().unwrap_or(0);
+    Ok((20 - nice) as u64)
+}
+
+/// `setpriority(PRIO_PROCESS, who, nice)`: remembered for the thread `who` (0: the caller), and
+/// with `OMNI_GUEST_NICE=1` applied to the caller's host thread when `who` is the caller (Android's
+/// `androidSetThreadPriority` names its own tid). Other `which` values are accepted.
+fn sys_setpriority(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    const PRIO_PROCESS: u64 = 0;
+    if a[0] != PRIO_PROCESS {
+        return Ok(0);
+    }
+    let who = if a[1] == 0 { t.tid } else { a[1] as i32 };
+    let nice = (a[2] as i64 as i32).clamp(-20, 19);
+    let previous = nice_values().lock().insert(who, nice);
+    let mode = guest_nice_mode();
+    if mode != 0 && previous != Some(nice) {
+        eprintln!("[nice] {}/{who} {}: {nice}", p.sys.pid, String::from_utf8_lossy(&t.name));
+    }
+    if mode == 2 && who == t.tid {
+        let _ = omni_platform::process::set_current_thread_nice(nice);
+    }
     Ok(0)
 }
 

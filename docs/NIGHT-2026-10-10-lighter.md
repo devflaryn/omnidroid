@@ -117,3 +117,27 @@ between 54 and 88 s) -- with or without a snapshot. A restored snapshot (274 MiB
 regions, so it is the first evicted, before most of it is entered. Invalidations are not the cause
 (174k requests in the first 5 s dropped 41 blocks). Measured next (s7): a 512 MiB live budget.
 Also: every rebuild of the host binary refuses every snapshot (host addresses are part of it).
+
+## For the owner to decide
+
+- **Saved devices by hard link, not copy.** A saved Roblox device is 781 MB: 237 MB of decompressed
+  APEX images (the same on every device), 283 MB of the installed APK and its extracted libraries,
+  253 MB of the app's caches. Every boot from it copies all of it (841 files, ~1.5 s measured) and
+  every running instance holds its own copy on disk. Linking the files that never change (the APEX
+  images, `base.apk`, `lib/`) would make the copy nearly instant and save ~520 MB of disk an
+  instance -- but a guest write into a linked file would change the saved device itself, so it would
+  need the saved files made read-only first. Not done: it changes the MCP's main path.
+- **Old saved devices set aside** in `%TEMP%\omni-golden` (`...-gutted-<date>`) still take disk
+  space; they are yours to delete.
+
+## Session s7 (02:04-03:00): the game's live code budget (`s7-live.csv`)
+
+`live512` = `OMNI_JIT_SHARED_CACHE_LIVE_MB=512` (default 256). With it the game retires **2 regions
+during its start instead of ~18**; its code-aging pass at ~3 min then retires ~29 and memory comes
+back to the same place. First pair: DID_LOG_IN 57.6 vs 58.2 s, onGameLoaded 83.7 vs 84.3, private WS
+2.995 vs 2.965 GB -- on 24 threads the start's re-translation is absorbed in parallel.
+
+**The snapshot arms of s7 are invalid** (an error of the session's design): a snapshot file is keyed
+by the process, not by the cache's configuration, so `snap512` and `snap` overwrote each other's
+files in one directory and each refused the other's (`app_process64 not installed (error -10)`).
+A snapshot comparison needs one directory per configuration.
