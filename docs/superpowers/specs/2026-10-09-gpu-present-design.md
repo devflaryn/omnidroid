@@ -37,7 +37,20 @@ per-frame path. Branch `worktree-agent-ab868a756486efc2e`, on `perf/ps99-60fps`.
   Vulkan swapchain (MAILBOX, GPU blit-scale, two frames in flight); GDI canvas cleared while on;
   falls back to GDI on any error. The GPU end that (a) needs.
 
-## (a) The rest: the game's image shown by the system process's GPU
+## A1-A3 landed (`present_zero`, 2026-10-09)
+
+As designed below, with two simplifications found on the way: **no semaphores** (A2) -- the
+composer already waits for each layer's generation, which waits for the release's fence (the share
+copy is in the same submit), and the window's GPU read is finished before the composer's present
+returns, so SurfaceFlinger cannot give a buffer back to the app while its share image is read; and
+**every layer on the GPU** (A3/A4 together) -- the overlay is a share image too (HWUI's window goes
+through the same Android swapchain release), drawn with the driver-checked textured-quad SPIR-V
+from `omni-android/tests/vulkan_present.rs` and the composer's three blends as fixed-function
+blending. Descriptor at metadata offset 3200 (2048 is SMPTE2094_40's). Measured: system host 7.20
+ms (default) / 3.30 ms (best CPU levers) / **0.78 ms** (`present_zero`) CPU per frame; GPU frame
+within 2/255 of the CPU's where layers blend, exact elsewhere. See `gpu::share`.
+
+## (a) The rest: the game's image shown by the system process's GPU (the design as written)
 
 **A1. A share image per gralloc buffer** (game host process, `native::attach` / `release`).
 Beside the region import, a device-local image of the buffer's size and format, allocated with

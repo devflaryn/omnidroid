@@ -669,6 +669,16 @@ fn create_instance(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     let host_has = enumerate_host_instance_extensions()?;
     let mut names: Vec<CString> =
         strings(p, at(56), ext_count)?.into_iter().filter(|n| host_has.iter().any(|(h, _)| h.as_bytes() == n.as_bytes())).collect();
+    // `present_zero` / `gralloc_direct`: what their device extensions need of a 1.0 instance
+    // (external memory's capabilities, the GPU's UUIDs) -- host-only, the guest never sees them.
+    if super::share::wanted() || super::native::direct_wanted() {
+        for extra in [c"VK_KHR_get_physical_device_properties2", c"VK_KHR_external_memory_capabilities"] {
+            let name = extra.to_str().expect("ASCII");
+            if host_has.iter().any(|(h, _)| h == name) && !names.iter().any(|n| n.as_bytes() == name.as_bytes()) {
+                names.push(extra.to_owned());
+            }
+        }
+    }
     // A portability driver (MoltenVK) is enumerated only when asked for.
     let mut flags = u32::from_le_bytes(ci[16..20].try_into().expect("4"));
     if host_has.iter().any(|(h, _)| h == "VK_KHR_portability_enumeration") {
@@ -720,18 +730,26 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     // `gralloc_direct` (`super::native::DIRECT`): the host device also able to import a gralloc
     // region's view as memory -- host-only extensions the guest never sees -- when asked for and
     // offered; made again without them if the driver refuses.
-    let (mut import, mut appended) = (false, Vec::new());
-    if super::native::direct_wanted() {
-        let offered = enumerate_host_device_extensions(&t, pd)?;
-        let has = |n: &str| offered.iter().any(|(o, _)| o == n);
-        if has(EXTERNAL_MEMORY_HOST) {
-            for extra in [EXTERNAL_MEMORY, EXTERNAL_MEMORY_HOST] {
-                if has(extra) && !names.iter().any(|n| n.as_bytes() == extra.as_bytes()) {
-                    names.push(CString::new(extra).expect("no NUL"));
-                    appended.push(extra);
-                }
-            }
-            import = true;
+    // `present_zero` (`super::share`): likewise able to export a share image's memory as a named
+    // Win32 handle, and its GPU's identity known (the importer must be on the same one).
+    let (direct_wanted, share_wanted) = (super::native::direct_wanted(), cfg!(windows) && super::share::wanted());
+    let offered = if direct_wanted || share_wanted { enumerate_host_device_extensions(&t, pd)? } else { Vec::new() };
+    let has = |n: &str| offered.iter().any(|(o, _)| o == n);
+    let mut import = direct_wanted && has(EXTERNAL_MEMORY_HOST);
+    let uuids = if share_wanted && has(EXTERNAL_MEMORY_WIN32) && has(DEDICATED_ALLOCATION) && has(MEMORY_REQUIREMENTS2) { device_uuids(&t, pd) } else { None };
+    let mut export = uuids.is_some();
+    let mut wanted: Vec<&'static str> = Vec::new();
+    if import {
+        wanted.extend([EXTERNAL_MEMORY, EXTERNAL_MEMORY_HOST]);
+    }
+    if export {
+        wanted.extend([EXTERNAL_MEMORY, EXTERNAL_MEMORY_WIN32, MEMORY_REQUIREMENTS2, DEDICATED_ALLOCATION]);
+    }
+    let mut appended: Vec<&'static str> = Vec::new();
+    for extra in wanted {
+        if !names.iter().any(|n| n.as_bytes() == extra.as_bytes()) {
+            names.push(CString::new(extra).expect("no NUL"));
+            appended.push(extra);
         }
     }
     const CREATE: &[&CStr] = &[c"vkCreateDevice"];
@@ -750,11 +768,11 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         (r, device)
     };
     let (mut r, mut device) = create(&names);
-    if import && r != VK_SUCCESS && !appended.is_empty() {
+    if r != VK_SUCCESS && !appended.is_empty() {
         names.retain(|n| !appended.iter().any(|x: &&str| n.as_bytes() == x.as_bytes()));
-        eprintln!("[gpu] gralloc_direct: the host refused a device with {EXTERNAL_MEMORY_HOST} ({r}); made without it");
+        eprintln!("[gpu] gralloc_direct/present_zero: the host refused a device with {appended:?} ({r}); made without them");
         (r, device) = create(&names);
-        import = false;
+        (import, export) = (false, false);
     }
     if r == VK_SUCCESS {
         const GDPA: &[&CStr] = &[c"vkGetDeviceProcAddr"];
@@ -770,6 +788,10 @@ fn create_device(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         info.host_import = import;
         if import {
             eprintln!("[gpu] gralloc_direct: device {device:#x} can import gralloc regions");
+        }
+        if export {
+            info.share = uuids;
+            eprintln!("[gpu] present_zero: device {device:#x} exports share images");
         }
         gpu.devices.lock().insert(device, info);
         if emulate_foreign {
@@ -787,6 +809,23 @@ const QUEUE_FAMILY_FOREIGN: &str = "VK_EXT_queue_family_foreign";
 /// The host-only extensions `gralloc_direct` adds to a device (`super::native::DIRECT`).
 const EXTERNAL_MEMORY_HOST: &str = "VK_EXT_external_memory_host";
 const EXTERNAL_MEMORY: &str = "VK_KHR_external_memory";
+/// And those `present_zero` adds (`super::share`).
+const EXTERNAL_MEMORY_WIN32: &str = "VK_KHR_external_memory_win32";
+const DEDICATED_ALLOCATION: &str = "VK_KHR_dedicated_allocation";
+const MEMORY_REQUIREMENTS2: &str = "VK_KHR_get_memory_requirements2";
+
+/// The device and driver UUIDs of host physical device `pd` (`VkPhysicalDeviceIDProperties`), when
+/// the instance can say (`vkGetPhysicalDeviceProperties2`, core or KHR).
+fn device_uuids(t: &Table, pd: u64) -> Option<([u8; 16], [u8; 16])> {
+    let f = t.lookup(c"vkGetPhysicalDeviceProperties2").or_else(|| t.lookup(c"vkGetPhysicalDeviceProperties2KHR"))?;
+    // SAFETY: the entry point's Vulkan signature.
+    let f: ash::vk::PFN_vkGetPhysicalDeviceProperties2 = unsafe { std::mem::transmute(f) };
+    let mut id = ash::vk::PhysicalDeviceIDProperties::default();
+    let mut props = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+    // SAFETY: a live physical device; `props` chains `id`, both outliving the call.
+    unsafe { f(ash::vk::Handle::from_raw(pd), &mut props) };
+    Some((id.device_uuid, id.driver_uuid))
+}
 
 /// Host devices on which `VK_EXT_queue_family_foreign` is emulated: the guest was offered it and
 /// enabled it, and the host driver has none (MoltenVK). ANGLE turns on Android hardware-buffer

@@ -29,7 +29,25 @@ pub struct Framebuffer {
     presented: Condvar,
     /// Frames replaced, for a present to write into once no reader holds one any more.
     spares: Mutex<Vec<Arc<Vec<u8>>>>,
+    /// Where the composer can present a frame of share images itself (`present_zero`): the
+    /// display window's swapchain, while it has one.
+    sink: Mutex<Option<Arc<dyn ZeroSink>>>,
 }
+
+/// **A window that shows frames composed on the GPU from share images** (`present_zero`,
+/// `crate::gpu::share`), which the composer presents to directly.
+pub trait ZeroSink: Send + Sync {
+    /// Show `layers` (bottom first) of a `display`-sized display; the share images are read by the
+    /// GPU when this returns.
+    ///
+    /// # Errors
+    /// Anything it could not do: the composer then composes the frame on the CPU.
+    fn present(&self, layers: &[crate::gpu::share::ShareLayer], display: (u32, u32)) -> Result<(), String>;
+}
+
+/// The CPU composition of a frame shown from share images, run only when a reader asks for its
+/// pixels: it writes every byte of a frame of the framebuffer's size, RGBA.
+pub type LazyFrame = Arc<dyn Fn(&mut [u8]) + Send + Sync>;
 
 struct State {
     width: u32,
@@ -38,16 +56,81 @@ struct State {
     pixels: Arc<Vec<u8>>,
     bgra: bool,
     frames: u64,
+    /// The current frame was shown from share images and its pixels are not composed yet: how to.
+    external: Option<LazyFrame>,
 }
 
 impl Framebuffer {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
         Self {
-            state: Mutex::new(State { width, height, pixels: Arc::new(vec![0; width as usize * height as usize * 4]), bgra: false, frames: 0 }),
+            state: Mutex::new(State { width, height, pixels: Arc::new(vec![0; width as usize * height as usize * 4]), bgra: false, frames: 0, external: None }),
             presented: Condvar::new(),
             spares: Mutex::new(Vec::new()),
+            sink: Mutex::new(None),
         }
+    }
+
+    /// Give the composer a window to present share images to, or take it away.
+    pub fn set_sink(&self, sink: Option<Arc<dyn ZeroSink>>) {
+        *self.sink.lock() = sink;
+    }
+
+    /// The window the composer can present share images to, if any.
+    #[must_use]
+    pub fn sink(&self) -> Option<Arc<dyn ZeroSink>> {
+        self.sink.lock().clone()
+    }
+
+    /// **A frame the composer showed from share images** (`present_zero`): counted, waited on and
+    /// sized as any frame, its pixels composed by `compose` only when a reader asks for them
+    /// ([`frame`](Self::frame), [`pixels`](Self::pixels), [`png`](Self::png)) -- the window shows
+    /// it already, so nothing is composed on the CPU per frame.
+    pub fn present_external(&self, width: u32, height: u32, compose: LazyFrame) {
+        {
+            let mut st = self.state.lock();
+            (st.width, st.height) = (width, height);
+            st.frames += 1;
+            st.external = Some(compose);
+        }
+        self.presented.notify_all();
+    }
+
+    /// Compose the current frame's pixels if it was shown from share images and they are not yet.
+    fn materialize(&self) {
+        loop {
+            let (n, w, h, job) = {
+                let st = self.state.lock();
+                match &st.external {
+                    None => return,
+                    Some(job) => (st.frames, st.width, st.height, Arc::clone(job)),
+                }
+            };
+            let mut pixels = self.take_spare(w as usize * h as usize * 4);
+            job(&mut pixels);
+            let mut st = self.state.lock();
+            if st.frames != n {
+                // A newer frame came meanwhile: compose that one instead.
+                drop(st);
+                self.retire(Arc::new(pixels));
+                continue;
+            }
+            st.external = None;
+            st.bgra = false;
+            let old = std::mem::replace(&mut st.pixels, Arc::new(pixels));
+            drop(st);
+            self.retire(old);
+            return;
+        }
+    }
+
+    /// The current frame for the display window: its number, size and pixels with whether they
+    /// are BGRA -- or no pixels for a frame the composer showed in the window itself.
+    #[must_use]
+    pub fn frame_for_window(&self) -> (u64, u32, u32, Option<(Arc<Vec<u8>>, bool)>) {
+        let st = self.state.lock();
+        let pixels = st.external.is_none().then(|| (Arc::clone(&st.pixels), st.bgra));
+        (st.frames, st.width, st.height, pixels)
     }
 
     /// The size of the frame it holds.
@@ -80,11 +163,17 @@ impl Framebuffer {
             let mut st = self.state.lock();
             (st.width, st.height, st.bgra) = (width, height, bgra);
             st.frames += 1;
+            st.external = None;
             std::mem::replace(&mut st.pixels, Arc::new(pixels))
         };
         self.presented.notify_all();
+        self.retire(old);
+    }
+
+    /// Keep a frame's buffer as a spare: spares of another size are let go, and the oldest past
+    /// [`SPARES`].
+    fn retire(&self, old: Arc<Vec<u8>>) {
         let mut spares = self.spares.lock();
-        // Spares of a size no longer presented are let go, and the oldest past `SPARES`.
         spares.retain(|a| a.len() == old.len());
         spares.push(old);
         if spares.len() > SPARES {
@@ -168,6 +257,7 @@ impl Framebuffer {
     /// [`frame`](Self::frame) as it is held: its pixels shared, and whether they are BGRA.
     #[must_use]
     pub fn frame_raw(&self) -> (u64, u32, u32, Arc<Vec<u8>>, bool) {
+        self.materialize();
         let st = self.state.lock();
         (st.frames, st.width, st.height, Arc::clone(&st.pixels), st.bgra)
     }
@@ -268,6 +358,42 @@ mod tests {
             assert_eq!(super::crc32(&data[..n]), crc32_bitwise(&data[..n]), "{n} bytes");
         }
         assert_eq!(super::crc32(b"IEND"), 0xAE42_6082, "the IEND chunk's well-known CRC");
+    }
+
+    /// A frame shown from share images is counted at once, the window is told it has no pixels to
+    /// show, and its pixels are composed once, when first asked for; a CPU frame after it is held
+    /// as before.
+    #[test]
+    fn an_external_frame_is_composed_only_when_read() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let fb = Framebuffer::new(4, 2);
+        let runs = std::sync::Arc::new(AtomicU32::new(0));
+        let job = {
+            let runs = std::sync::Arc::clone(&runs);
+            std::sync::Arc::new(move |out: &mut [u8]| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                for (i, p) in out.chunks_exact_mut(4).enumerate() {
+                    p.copy_from_slice(&[i as u8, 7, 9, 255]);
+                }
+            })
+        };
+        fb.present_external(4, 2, job);
+        assert_eq!(fb.frames(), 1);
+        assert!(fb.wait_frame(1, std::time::Duration::ZERO));
+        assert!(fb.frame_for_window().3.is_none(), "the window shows it already");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "nothing composed yet");
+        let want: Vec<u8> = (0..8u8).flat_map(|i| [i, 7, 9, 255]).collect();
+        assert_eq!(fb.pixels(), want);
+        assert_eq!(fb.png(), {
+            let plain = Framebuffer::new(4, 2);
+            plain.present_frame(&want, 4, 2, 4);
+            plain.png()
+        });
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "composed once, for both readers");
+        assert!(fb.frame_for_window().3.is_some());
+        fb.present_frame(&[5; 32], 4, 2, 4);
+        assert_eq!(fb.pixels(), vec![5; 32]);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
     /// A BGRA frame reads back as RGBA everywhere but `frame_raw`, its PNG is the RGBA frame's byte

@@ -62,11 +62,14 @@ pub(crate) struct DeviceInfo {
     /// The host device was made with `VK_EXT_external_memory_host` (`gralloc_direct`): a gralloc
     /// region's view can be imported as its images' copy target.
     pub host_import: bool,
+    /// The host device was made able to export share images (`present_zero`, `super::share`):
+    /// its GPU's device and driver UUIDs.
+    pub share: Option<([u8; 16], [u8; 16])>,
 }
 
 impl DeviceInfo {
     pub(crate) fn new(memory: &vk::PhysicalDeviceMemoryProperties) -> Self {
-        Self { memory_types: memory.memory_types[..memory.memory_type_count as usize].to_vec(), queues: HashMap::new(), copiers: HashMap::new(), pools: HashMap::new(), host_import: false }
+        Self { memory_types: memory.memory_types[..memory.memory_type_count as usize].to_vec(), queues: HashMap::new(), copiers: HashMap::new(), pools: HashMap::new(), host_import: false, share: None }
     }
 
     fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> R<u32> {
@@ -160,6 +163,95 @@ fn import_region(t: &Arc<Table>, d: vk::Device, memory_types: &[vk::MemoryType],
     made
 }
 
+/// A gralloc image's share image (`present_zero`, [`super::share`]): device-local, its memory
+/// exported as a named Win32 handle, which is held open for as long as the image is.
+struct Share {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    /// The named handle (`vkGetMemoryWin32HandleKHR`), closed at `destroy_image`.
+    handle: usize,
+}
+
+/// Make the share image of a `width` x `height` gralloc image of `format` on device `d`, export it
+/// by a new name, and describe it in `shm`'s metadata page.
+#[allow(clippy::too_many_arguments)]
+fn export_share(t: &Arc<Table>, d: vk::Device, memory_types: &[vk::MemoryType], uuids: ([u8; 16], [u8; 16]), shm: &Shm, format: vk::Format, width: u32, height: u32) -> R<Share> {
+    let format = super::share::share_format(format).ok_or(CallError::Missing("a shareable format"))?;
+    let name = super::share::next_name();
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+    let ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(super::share::USAGE)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external);
+    let mut image = vk::Image::null();
+    check(unsafe { vkfn!(t, ID_VK_CREATE_IMAGE, c"vkCreateImage", vk::PFN_vkCreateImage)(d, &ci, std::ptr::null(), &mut image) })?;
+    let destroy_image = vkfn!(t, ID_VK_DESTROY_IMAGE, c"vkDestroyImage", vk::PFN_vkDestroyImage);
+    let free = vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory);
+    let made = (|| -> R<(vk::DeviceMemory, usize, u64)> {
+        let mut req = vk::MemoryRequirements::default();
+        unsafe { vkfn!(t, ID_VK_GET_IMAGE_MEMORY_REQUIREMENTS, c"vkGetImageMemoryRequirements", vk::PFN_vkGetImageMemoryRequirements)(d, image, &mut req) };
+        let kind = (0..memory_types.len() as u32).find(|&i| req.memory_type_bits & (1 << i) != 0 && memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)).ok_or(CallError::Missing("device-local memory"))?;
+        let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+        // GENERIC_ALL: the system host process opens it by name for its own device.
+        let mut named = vk::ExportMemoryWin32HandleInfoKHR::default().dw_access(0x1000_0000).name(wide.as_ptr());
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind).push_next(&mut export).push_next(&mut named).push_next(&mut dedicated);
+        let mut memory = vk::DeviceMemory::null();
+        check(unsafe { vkfn!(t, ID_VK_ALLOCATE_MEMORY, c"vkAllocateMemory", vk::PFN_vkAllocateMemory)(d, &ai, std::ptr::null(), &mut memory) })?;
+        let bound = (|| -> R<usize> {
+            check(unsafe { vkfn!(t, ID_VK_BIND_IMAGE_MEMORY, c"vkBindImageMemory", vk::PFN_vkBindImageMemory)(d, image, memory, 0) })?;
+            let get = t.lookup(c"vkGetMemoryWin32HandleKHR").ok_or(CallError::Missing("vkGetMemoryWin32HandleKHR"))?;
+            // SAFETY: the entry point's Vulkan signature.
+            let get: vk::PFN_vkGetMemoryWin32HandleKHR = unsafe { std::mem::transmute(get) };
+            let info = vk::MemoryGetWin32HandleInfoKHR::default().memory(memory).handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+            let mut handle: vk::HANDLE = 0;
+            // SAFETY: exportable memory of this device; the handle is ours to close.
+            check(unsafe { get(d, &info, &mut handle) })?;
+            Ok(handle as usize)
+        })();
+        match bound {
+            Ok(handle) => Ok((memory, handle, req.size)),
+            Err(e) => {
+                unsafe { free(d, memory, std::ptr::null()) };
+                Err(e)
+            }
+        }
+    })();
+    match made {
+        Ok((memory, handle, size)) => {
+            let desc = super::share::ShareDesc { format, width, height, size, device_uuid: uuids.0, driver_uuid: uuids.1, name };
+            desc.write(shm);
+            super::share::write_generation(shm, 0);
+            Ok(Share { image, memory, handle })
+        }
+        Err(e) => {
+            unsafe { destroy_image(d, image, std::ptr::null()) };
+            Err(e)
+        }
+    }
+}
+
+/// Close a share image's named handle (the name goes with the last handle to it).
+fn close_handle(handle: usize) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::FromRawHandle as _;
+        // SAFETY: a handle `vkGetMemoryWin32HandleKHR` gave this process, closed once.
+        drop(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as *mut std::ffi::c_void) });
+    }
+    #[cfg(not(windows))]
+    let _ = handle;
+}
+
 /// A command buffer and fence for the host's own copies on one queue family.
 struct Copier {
     cb: vk::CommandBuffer,
@@ -187,6 +279,8 @@ pub(crate) struct NativeImage {
     in_flight: Arc<InFlight>,
     /// Its region's view as a buffer of the device, for [`DIRECT`] (when the device can import).
     direct: Option<Direct>,
+    /// Its share image, for `present_zero` (when the device can export).
+    share: Option<Share>,
 }
 
 /// Whether an image's copy is on its way, and a wait for it to land.
@@ -463,7 +557,7 @@ fn attach(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, image: vk::Image,
             },
         };
         let staging_memory = allocate(t, d, req.size, staging_type)?;
-        let (host_import, memory_types) = (info.host_import, info.memory_types.clone());
+        let (host_import, memory_types, share_ids) = (info.host_import, info.memory_types.clone(), info.share);
         drop(devices);
         check(unsafe { vkfn!(t, ID_VK_BIND_BUFFER_MEMORY, c"vkBindBufferMemory", vk::PFN_vkBindBufferMemory)(d, staging, staging_memory, 0) })?;
         let mut mapped = std::ptr::null_mut();
@@ -484,7 +578,18 @@ fn attach(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, image: vk::Image,
         } else {
             None
         };
-        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, invalidate, bytes, width, height, stride, shm, pixels_at, copier: None, in_flight: Arc::default(), direct })
+        // `present_zero`: its share image, exported by name and described in the region.
+        let share = share_ids.and_then(|ids| match export_share(t, d, &memory_types, ids, &shm, format, width, height) {
+            Ok(share) => Some(share),
+            Err(e) => {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[gpu] present_zero: no share image for a {width}x{height} buffer of VkFormat {} ({e:?}); it is composed on the CPU", format.as_raw());
+                }
+                None
+            }
+        });
+        Ok(NativeImage { device, memory, staging, staging_memory, mapped: mapped as usize, invalidate, bytes, width, height, stride, shm, pixels_at, copier: None, in_flight: Arc::default(), direct, share })
     }
 }
 
@@ -513,6 +618,13 @@ pub(crate) fn destroy_image(gpu: &Gpu, t: &Arc<Table>, image: u64) -> R<bool> {
         if let Some(direct) = &n.direct {
             vkfn!(t, ID_VK_DESTROY_BUFFER, c"vkDestroyBuffer", vk::PFN_vkDestroyBuffer)(d, direct.buffer, std::ptr::null());
             vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory)(d, direct.memory, std::ptr::null());
+        }
+        if let Some(share) = &n.share {
+            // No reader may take it for the buffer's frame any more.
+            super::share::write_generation(&n.shm, 0);
+            vkfn!(t, ID_VK_DESTROY_IMAGE, c"vkDestroyImage", vk::PFN_vkDestroyImage)(d, share.image, std::ptr::null());
+            vkfn!(t, ID_VK_FREE_MEMORY, c"vkFreeMemory", vk::PFN_vkFreeMemory)(d, share.memory, std::ptr::null());
+            close_handle(share.handle);
         }
     }
     if n.direct.is_some() {
@@ -581,6 +693,9 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     // `gralloc_direct`: the copy goes into the region itself, and lands with nothing left to copy.
     let direct = img.direct.as_ref().filter(|_| DIRECT.load(std::sync::atomic::Ordering::Relaxed)).map(|d| d.buffer);
     let staging = direct.unwrap_or(staging);
+    // `present_zero`: the frame into the share image too, in the same submit.
+    let share = img.share.as_ref().filter(|_| super::share::on()).map(|s| s.image);
+    let has_share = img.share.is_some();
     let own = img.copier.as_ref().map(|c| (c.cb, c.fence));
     drop(natives);
     let d = vk::Device::from_raw(device);
@@ -659,6 +774,38 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
             1,
             &copy,
         );
+        if let Some(share) = share {
+            // Its last contents are not kept; written whole, then handed to whichever process
+            // reads it (`QUEUE_FAMILY_EXTERNAL`), in `GENERAL`, the layout the reader samples it in.
+            let into = vk::ImageMemoryBarrier {
+                src_access_mask: vk::AccessFlags::empty(),
+                dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                image: share,
+                ..to_src
+            };
+            barrier(cb, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), 0, std::ptr::null(), 0, std::ptr::null(), 1, &into);
+            let region = vk::ImageCopy {
+                src_subresource: copy.image_subresource,
+                src_offset: vk::Offset3D::default(),
+                dst_subresource: copy.image_subresource,
+                dst_offset: vk::Offset3D::default(),
+                extent: vk::Extent3D { width, height, depth: 1 },
+            };
+            vkfn!(t, ID_VK_CMD_COPY_IMAGE, c"vkCmdCopyImage", vk::PFN_vkCmdCopyImage)(cb, vk::Image::from_raw(image), vk::ImageLayout::TRANSFER_SRC_OPTIMAL, share, vk::ImageLayout::TRANSFER_DST_OPTIMAL, 1, &region);
+            let out = vk::ImageMemoryBarrier {
+                src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access_mask: vk::AccessFlags::empty(),
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::GENERAL,
+                src_queue_family_index: family,
+                dst_queue_family_index: vk::QUEUE_FAMILY_EXTERNAL,
+                image: share,
+                ..to_src
+            };
+            barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), 0, std::ptr::null(), 0, std::ptr::null(), 1, &out);
+        }
         barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), 0, std::ptr::null(), 0, std::ptr::null(), 1, &back);
         check(vkfn!(t, ID_VK_END_COMMAND_BUFFER, c"vkEndCommandBuffer", vk::PFN_vkEndCommandBuffer)(cb))?;
         check(vkfn!(t, ID_VK_RESET_FENCES, c"vkResetFences", vk::PFN_vkResetFences)(d, 1, &fence))?;
@@ -677,7 +824,12 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     // On its way: the region says which generation it will have, and the worker lands it.
     let mut g = [0u8; 8];
     let _ = shm.read_at(&mut g, CONTENT_GENERATION_AT);
-    let _ = shm.write_at(&u64::from_le_bytes(g).wrapping_add(1).to_le_bytes(), PENDING_GENERATION_AT);
+    let pending = u64::from_le_bytes(g).wrapping_add(1);
+    // Which generation the share image will hold: this one, or none (not copied this time).
+    if share.is_some() || has_share {
+        super::share::write_generation(&shm, if share.is_some() { pending } else { 0 });
+    }
+    let _ = shm.write_at(&pending.to_le_bytes(), PENDING_GENERATION_AT);
     *in_flight.busy.lock() = true;
     let landing = Landing { table: Arc::clone(&t), device, fence, invalidate, staging_memory, mapped, bytes, shm, pixels_at, in_flight: Arc::clone(&in_flight), direct: direct.is_some() };
     // `OMNI_ASYNC_RELEASE=0`: landed here, on the app's thread, as before (for comparison).

@@ -48,6 +48,11 @@
 //!   for its own fences -- the release worker's copy, a sync-file export -- the driver's wait (the
 //!   default) or asked every `<us>` (100 by default) with a sleep between
 //!   (`crate::gpu::native::RELEASE_WAIT_US`; `event` measured not available).
+//! - `present_zero=0|1`: the app's released frames also copied (on the GPU) into share images, and
+//!   the system's composer shows a frame whose every layer has one through the window's own GPU
+//!   (blended there), its pixels composed on the CPU only for a reader (`crate::gpu::share`). Needs
+//!   the app's devices made with `OMNI_PRESENT_ZERO=ready` (or `=1`, on from the start). Off by
+//!   default.
 //! - `gralloc_direct=0|1`: an app's released frame copied by the GPU straight into its gralloc
 //!   region (imported as Vulkan memory) instead of into a staging buffer the release worker then
 //!   copies on the CPU (`crate::gpu::native::DIRECT`). Needs devices made with
@@ -353,6 +358,16 @@ pub fn apply(line: &str) -> Option<String> {
             crate::gpu::native::RELEASE_WAIT_US.store(us, std::sync::atomic::Ordering::Relaxed);
             Some(format!("release_poll={us}: release_wait=poll, the fence asked every {us} us"))
         }
+        "present_zero" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let _ = crate::gpu::share::wanted();
+            crate::gpu::share::ZERO.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("present_zero={}", u8::from(on)))
+        }
         "gralloc_direct" => {
             let on = match value.trim() {
                 "1" => true,
@@ -512,6 +527,10 @@ mod tests {
         assert_eq!(w.load(Ordering::Relaxed), 0);
         assert_eq!(apply("release_poll=0"), None);
         assert_eq!(apply("release_wait=sleep"), None);
+        assert_eq!(apply("present_zero=1").as_deref(), Some("present_zero=1"));
+        assert!(crate::gpu::share::on());
+        apply("present_zero=0").expect("understood");
+        assert!(!crate::gpu::share::on());
     }
 
     #[test]
