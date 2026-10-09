@@ -787,7 +787,10 @@ impl Process {
             fast_dispatch_entries: if std::env::var_os("OMNI_LINUX_APP").is_some() {
                 std::env::var("OMNI_JIT_FAST_DISPATCH_APP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
             } else {
-                std::env::var("OMNI_JIT_FAST_DISPATCH_SYSTEM").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+                // 1,024 by default since the boot A/B of 2026-10-09 (with the kernel's binder spawn
+                // rule: the system host's CPU a frame unchanged, 49.2 against 49.4 ms); `=0` is the
+                // pin's 4,096.
+                std::env::var("OMNI_JIT_FAST_DISPATCH_SYSTEM").ok().and_then(|v| v.parse().ok()).unwrap_or(1024)
             },
             ..DynarmicOptions::default()
         };

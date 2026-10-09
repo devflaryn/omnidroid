@@ -38,11 +38,13 @@ use sha2::{Digest, Sha256};
 
 use crate::manifest::{Entry, Manifest};
 
-/// `OMNI_BOOT_IMAGE_UNCOMPRESSED=1`.
+/// `OMNI_BOOT_IMAGE_UNCOMPRESSED`: **on by default** since the boot A/B of 2026-10-09 (PS99, fresh
+/// boots: 321 boot-image parts mapped as views, none relocated; all hosts' private working set
+/// 3.90 -> 3.80-3.82 GB); `=0` keeps the compressed images (and the saved devices without `-bootu`).
 #[must_use]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("OMNI_BOOT_IMAGE_UNCOMPRESSED").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("OMNI_BOOT_IMAGE_UNCOMPRESSED").as_deref() != Ok("0"))
 }
 
 /// What a saved device's name carries when the switch is on (`-bootu`), else nothing.
