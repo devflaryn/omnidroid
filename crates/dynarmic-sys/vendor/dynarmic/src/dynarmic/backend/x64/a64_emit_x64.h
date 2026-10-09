@@ -44,6 +44,12 @@ inline constexpr std::uint32_t live_fp_optimizations_allowed = 0x000F0000;
 /// it was translated with.
 extern std::atomic<std::uint32_t> live_precise_get_set;
 
+/// Omnidroid patch 0042: non-zero emits the hit paths of the return-stack buffer and the
+/// fast-dispatch table inside each `RET`/`BR`/`BLR` block, from the target PC still in a register,
+/// instead of a jump to one shared handler that reloads it from `JitState`. Process-wide, read
+/// when a block is emitted.
+extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
+
 struct A64EmitContext final : public EmitContext {
     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
 
@@ -232,6 +238,16 @@ public:
     const void* SvcResumeRetired() const { return svc_resume_retired; }
 
 protected:
+    /// Omnidroid patch 0042: the inline hit paths (`live_fast_dispatch_inline`) fall into the
+    /// shared handler's tail: at the table probe with the location in rbx (an RSB miss), and at the
+    /// lookup with rbx the location and rbp the table entry (a table miss).
+    const void* terminal_handler_fast_dispatch_probe = nullptr;
+    const void* terminal_handler_fast_dispatch_miss = nullptr;
+    /// Patch 0042: the block being emitted ends in `SetPC` and a dispatch hint, and its last
+    /// instruction left the target PC in rbp as well as in `JitState::pc`.
+    bool od_pc_in_rbp = false;
+    void EmitInlineLocation(const IR::LocationDescriptor& initial_location);
+    void EmitInlineBudgetAndHaltChecks();
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     /// Patch 0022: the same hash, for a table given as the second argument (a thread's own).

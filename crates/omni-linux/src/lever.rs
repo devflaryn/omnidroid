@@ -20,6 +20,11 @@
 //!   constant rather than a `shl`/`shr` pair (patch 0040, `omni_cpu::dynarmic::
 //!   set_fastmem_mask_by_and`; the same address), then every process's translations are dropped.
 //!   Off by default; `OMNI_JIT_TBI_AND=1` from the start.
+//! - `jit_fastdisp=0|1`: the return-stack buffer's and fast-dispatch table's hit paths inside each
+//!   `RET`/`BR`/`BLR` block (patch 0042, `omni_cpu::dynarmic::set_fast_dispatch_inline`): same
+//!   lookups and checks, the target from a register and a host indirect jump per site; ~20% on
+//!   call/return chains. Every process's translations are dropped. Off by default;
+//!   `OMNI_JIT_FASTDISP=1` from the start.
 //! - `jit_tbi=0|1`: 0 takes Top Byte Ignore's mask off the direct path (patches 0040/0041,
 //!   `omni_cpu::dynarmic::set_tbi_unmasked`): an untagged access is D4's identity; a tagged one is
 //!   a host fault served by the slow path (~2.4 us), and its instruction then learns the mask
@@ -139,6 +144,19 @@ pub fn apply(line: &str) -> Option<String> {
                 p.trim_code();
             }
             Some(format!("jit_fpxmm={}: {} processes' translations dropped", u8::from(kept), live.len()))
+        }
+        "jit_fastdisp" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let kept = omni_cpu::dynarmic::set_fast_dispatch_inline(on);
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            Some(format!("jit_fastdisp={}: {} processes' translations dropped", u8::from(kept), live.len()))
         }
         "jit_tbi" => {
             // 1 is the mask on the direct path (the default); 0 takes it off, live.
@@ -555,6 +573,15 @@ mod tests {
         assert!(done.starts_with(if want { "jit_getset=1" } else { "jit_getset=0" }), "{done}");
         assert_eq!(omni_cpu::dynarmic::precise_get_set(), want);
         assert_eq!(apply("jit_getset=on"), None);
+    }
+
+    #[test]
+    fn the_fastdisp_lever_is_understood() {
+        let want = cfg!(target_arch = "x86_64");
+        let done = apply("jit_fastdisp=1").expect("understood");
+        assert!(done.starts_with(if want { "jit_fastdisp=1" } else { "jit_fastdisp=0" }), "{done}");
+        assert!(apply("jit_fastdisp=0").expect("understood").starts_with("jit_fastdisp=0"));
+        assert_eq!(apply("jit_fastdisp=2"), None);
     }
 
     #[test]

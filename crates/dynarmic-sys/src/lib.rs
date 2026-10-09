@@ -1042,4 +1042,14 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it loads one process-wide atomic.
     pub fn od_tbi_sites_noted() -> u64;
+
+    /// Patch 0042 (x64 only): non-zero emits the return-stack buffer's and the fast-dispatch
+    /// table's hit paths inside each `RET`/`BR`/`BLR` block -- from the target PC still in a
+    /// register, with an indirect jump of the site's own -- instead of a jump to one shared handler
+    /// that reloads the PC from `JitState`, in blocks emitted from now on. Returns the value in
+    /// force (1 or 0); 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_fast_dispatch_inline(on: u32) -> u32;
 }
