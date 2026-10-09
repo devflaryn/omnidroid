@@ -1,0 +1,93 @@
+diff --git a/externals/xbyak/xbyak/xbyak.h b/externals/xbyak/xbyak/xbyak.h
+index 0e96ff53..4e3f5af0 100644
+--- a/externals/xbyak/xbyak/xbyak.h
++++ b/externals/xbyak/xbyak/xbyak.h
+@@ -1398,6 +1398,57 @@ struct JmpLabel {
+ 
+ class LabelManager;
+ 
++// Omnidroid patch 0079: the label manager's containers for `Label` objects without a heap node per
++// entry -- open addressing (tsl's robin map and set, which dynarmic vendors) for the live labels'
++// offsets and the labels themselves, and a flat list for the jumps still waiting for their label (a
++// handful at a time). The pin's `std::unordered_*` allocated and freed a node per label defined,
++// referenced and waiting: three allocations or more for every label of every block emitted. Where
++// tsl is not on the include path, the containers are the pin's.
++#if defined(__has_include)
++#if __has_include(<tsl/robin_map.h>) && __has_include(<tsl/robin_set.h>)
++#define XBYAK_OD_ROBIN 1
++#endif
++#endif
++
++#ifdef XBYAK_OD_ROBIN
++} // namespace Xbyak
++#include <tsl/robin_map.h>
++#include <tsl/robin_set.h>
++namespace Xbyak {
++#endif
++
++namespace od {
++/// The jumps waiting for a label, unordered: `find` the first for an id, `erase` one (the last moves
++/// into its place), `insert` one. Only what `LabelManager` uses of a multimap.
++class UndefList {
++public:
++	typedef std::pair<int, JmpLabel> value_type;
++	typedef std::vector<value_type>::iterator iterator;
++	typedef std::vector<value_type>::const_iterator const_iterator;
++	void insert(const value_type& v) { list_.push_back(v); }
++	iterator find(int id)
++	{
++		for (iterator i = list_.begin(), e = list_.end(); i != e; ++i) {
++			if (i->first == id) return i;
++		}
++		return list_.end();
++	}
++	void erase(iterator i)
++	{
++		if (i + 1 != list_.end()) *i = list_.back();
++		list_.pop_back();
++	}
++	iterator begin() { return list_.begin(); }
++	iterator end() { return list_.end(); }
++	const_iterator begin() const { return list_.begin(); }
++	const_iterator end() const { return list_.end(); }
++	bool empty() const { return list_.empty(); }
++	void clear() { list_.clear(); }
++private:
++	std::vector<value_type> list_;
++};
++} // namespace od
++
+ class Label {
+ 	mutable LabelManager *mgr;
+ 	mutable int id;
+@@ -1444,9 +1495,18 @@ class LabelManager {
+ 		size_t offset;
+ 		int refCount;
+ 	};
++#ifdef XBYAK_OD_ROBIN
++	typedef tsl::robin_map<int, ClabelVal> ClabelDefList;
++	typedef od::UndefList ClabelUndefList;
++	typedef tsl::robin_set<Label*> LabelPtrList;
++	// A robin map's iterator gives its value read-only; `value()` gives it to change.
++	static ClabelVal& clabelValue(ClabelDefList::iterator i) { return i.value(); }
++#else
+ 	typedef XBYAK_STD_UNORDERED_MAP<int, ClabelVal> ClabelDefList;
+ 	typedef XBYAK_STD_UNORDERED_MULTIMAP<int, const JmpLabel> ClabelUndefList;
+ 	typedef XBYAK_STD_UNORDERED_SET<Label*> LabelPtrList;
++	static ClabelVal& clabelValue(ClabelDefList::iterator i) { return i->second; }
++#endif
+ 
+ 	CodeArray *base_;
+ 	// global : stateList_.front(), local : stateList_.back()
+@@ -1514,9 +1574,9 @@ class LabelManager {
+ 		ClabelDefList::iterator i = clabelDefList_.find(id);
+ 		if (i == clabelDefList_.end()) return;
+ 		if (i->second.refCount == 1) {
+-			clabelDefList_.erase(id);
++			clabelDefList_.erase(i);
+ 		} else {
+-			--i->second.refCount;
++			--clabelValue(i).refCount;
+ 		}
+ 	}
+ 	template<class T>

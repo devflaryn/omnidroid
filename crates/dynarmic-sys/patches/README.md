@@ -789,3 +789,35 @@ MEASURED (Linux, System V: 25 caller-saved registers; one cache): **1,888,969 ->
 of fallbacks (-94%); Windows (13 caller-saved) proportionally. The dynarmic-sys suite passes with it
 on (Linux; the snapshot tests fail there with it off as well: a load answers -10), and a test
 binary that makes many caches ran 0.49 -> 0.09 s.
+
+### 0079 — Xbyak: the label manager without a heap node per label
+
+x64 (the vendored Xbyak, `externals/xbyak`). `LabelManager` kept `Label` objects' offsets, the
+labels themselves and the jumps waiting for one in `std::unordered_map`, `unordered_set` and
+`unordered_multimap`: a node allocated and freed for every label defined, referenced and waited for
+-- several for every label of every block, and the x64 emitter makes a few for every memory access.
+Now tsl's robin map and set (open addressing; dynarmic already vendors them) hold the live labels and
+their offsets, and a flat vector the waiting jumps (a handful at a time: `find` scans, `erase` moves
+the last into the hole). A robin map's iterator gives its value read-only, so the one place that
+changes a count goes through `value()`. Without tsl on the include path the pin's containers are
+used.
+
+MEASURED (`the_speed_of_emission`, 11,005 blocks, 9 passes, medians, i5-4460): **emit 15.7 ->
+13.1 us/block (-16.5%)**; the code is byte-identical (`tools/compare_emit_dumps.py`: every
+difference inside host-address operands, the same set as between two runs of the base).
+
+### 0080 — x64: a value's host location found without a search
+
+x64 register allocator. `RegAlloc::ValueLocation` searched every occupied host location for the
+value -- twice for every argument in `GetArgumentInfo` (the assert, then the use), once more where
+an identity is defined, and once for every value defined, in an assert that it is not yet anywhere
+(a search that always runs to the end). After 0079 it was the hottest function of first translation
+(6.7%, sampled). Now an `IR::Inst` carries a hint of where the allocator last saw it (one byte, in
+what was padding), set when it is defined and whenever a search finds it, and checked before it is
+trusted (the location is occupied and holds the value): a value is in one location at a time, so a
+true hint is the answer the search gives, and a stale one costs only the search. The callers look
+the location up once; the "not yet defined" assert runs with the IR verification
+(`OMNI_JIT_VERIFY=1`, 0077).
+
+MEASURED (`the_speed_of_emission`, i5-4460): **emit 13.1 -> 11.9 us/block (-9%)**; byte-identical
+(`tools/compare_emit_dumps.py`).

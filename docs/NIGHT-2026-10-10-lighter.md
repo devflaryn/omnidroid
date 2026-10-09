@@ -38,8 +38,14 @@ default (`OMNI_R_SVC_STAYON=1` = the old way).
 
 | arm | CPUs | fps | all ms/frame | top / top2 ms | cores | join | loaded | private WS | system host |
 |---|---|---|---|---|---|---|---|---|---|
+| base (s1, 4 runs) | all 24 | 57.4-59.0 | 42.5-47.4 | 11.9-13.3 / 10.0-11.2 | 2.48-2.72 | 85-90 s | 97-104 s | 3.035-3.205 GB | 0.900-0.924 GB |
 | weak8e | 8 E-cores | **33.79** | 54.55 | 20.15 / 10.33 | 1.84 | 150 s | 188 s | 3.158 GB | 0.972 GB |
 | weak4e | 4 E-cores | -- | | | | (no network: see above) | | | |
+
+**Where first translation goes** (`OMNI_JIT_TIME=5`, s1): every Java process translates the
+framework again -- each small app host 145-213k blocks, ~0.8 s translate + ~1.5 s emit; the system
+host 1.57M blocks by sign-in (7.3 s + 14.8 s); the game ~1M blocks by DID_LOG_IN (5.4 s + 10.2 s).
+Emitting x64 costs about twice the frontend, everywhere.
 
 On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thread critical path
 (the engine worker 20 ms of each 29.6 ms frame), not a shortage of cores.
@@ -48,3 +54,21 @@ On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thre
 
 | # | change | A/B | result | kept? |
 |---|---|---|---|---|
+| 1 | setup keeps the screen on with `settings` (native), not `svc` (a Java VM that aborts) | s1 ABBA svc/native, 2 pairs | join 90/85 vs 85/85 s, world 104/103 vs 97/99 s, WS 3.108/3.205 vs 3.076/3.035 GB: inside noise, consistent sign; the removed process failed every time | yes (way back `OMNI_R_SVC_STAYON=1`) |
+| 2 | `OMNI_DEVICE_IDLE_APPS=out` (8 idle apps not in the image) | s2, 1 pair (stopped for the JIT build) | WS 3.141 vs 3.139 GB, join 90 vs 85 s, world 104 vs 105 s | not yet (no RAM effect seen; retest) |
+| 3 | dynarmic **0077**: IR accessors inline, `VerificationPass` only with `OMNI_JIT_VERIFY=1` | `the_speed_of_emission` (deterministic, byte-identical code) | frontend **7.60 -> 4.85 us/block** (i5-4460), 4.34 -> 3.16 (i7, verify on/off) | yes |
+| 4 | dynarmic **0078**: small fastmem fallbacks (`OMNI_JIT_SMALL_FALLBACKS`) | `tests/resident.rs`, fallback bytes | a fresh cache's resident **0.88 -> 0.13 MiB** (Windows); fallbacks 1.89 MB -> 115 KB per cache (Linux) | yes |
+| 5 | 0077 + 0078 on a device: `old` = `OMNI_JIT_SMALL_FALLBACKS=0 OMNI_JIT_VERIFY=1` | s3 `s3-jit.csv`, 3 pairs ABBA-BA | **fps 57.81/58.05/58.69 -> 58.70/59.14/59.33 (3/3)**; **engine worker 13.81/14.00/12.88 -> 11.85/10.64/12.33 ms/frame (3/3)**; game JIT per boot translate 11.0 -> 8.8-9.2 s, emit ~22 s both; join/world within noise; **system host WS +15-20 MB (3/3)** -- see below | yes, with #6 |
+| 6 | code aging's floor 8 -> 6 MiB (`code_trim::MIN_BYTES`) | to measure (s5) | the +17 MB of #5: a cache's commit counts its prelude, ~1 MiB smaller with 0078, so ~6 small quiet services (ueventd, gatekeeperd, HALs) fell under the 8 MiB floor and kept ~110k blocks (block map 542k -> 652k entries, JIT tables 78 -> 95 MiB) | pending |
+| 7 | dynarmic **0079**: Xbyak's label manager without heap nodes (tsl robin map/set, flat waiting list) | `the_speed_of_emission`, byte-identical | emit **15.7 -> 13.1 us/block (-16.5%)**, i5-4460 | yes (device check s5) |
+| 8 | dynarmic **0080**: a value's host location from a checked hint, not a search | same | emit **13.1 -> 11.9 us/block (-9%)** | yes (device check s5) |
+
+**Why the in-world worker got cheaper with faster translation:** the game keeps translating in the
+measured window -- after its code-aging pass (3 min) it translates the hot code again in bursts of
+30-45k blocks per 5 s (~0.5-0.65 s of JIT per 5 s, 10-13% of a core) -- and the engine worker does
+much of that itself, on its own frame time.
+
+**Where the system host's memory is** (s3 `[mem]`, ~5 min after start): 62 guest processes, guest
+memory 210 MiB, translated code 326-338 MiB committed, the JIT's tables on the heap 78-95 MiB (block
+map, links, fastmem sites, guest ranges: ~155 bytes per live block, beside ~380 bytes of code). The
+JIT is about half of that host's working set.

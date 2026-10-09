@@ -25,8 +25,11 @@ pub const QUIET_BYTES: u64 = 1 << 20;
 /// Translations under this are not worth dropping (a region being filled is kept anyway). 8 MiB:
 /// the system's host process runs ~60 guest processes, most of them services that translate
 /// 8-24 MiB while they start and then sit in a binder wait -- together more than the few large
-/// ones a higher floor was set for.
-pub const MIN_BYTES: u64 = 8 << 20;
+/// ones a higher floor was set for. 6 MiB since dynarmic patch 0078: a cache's commit counts its
+/// prelude, which shrank by ~1 MiB, and at 8 the small services that were trimmed (ueventd,
+/// gatekeeperd, HALs) fell under the floor and kept ~110k blocks and their tables (+17 MB in the
+/// system's host process, 2026-10-10 s3).
+pub const MIN_BYTES: u64 = 6 << 20;
 /// A process is trimmed at most this often.
 pub const AGAIN_AFTER: Duration = Duration::from_secs(600);
 /// A host process using more than this of a core is busy.

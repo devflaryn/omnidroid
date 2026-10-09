@@ -65,6 +65,8 @@ dynarmic/
                and ../patches/0076-x64-snapshot-unentered-blocks-forgotten.patch
                and ../patches/0077-ir-opcode-args-inline-and-verification-on-request.patch
                and ../patches/0078-x64-small-fastmem-fallbacks.patch
+               and ../patches/0079-xbyak-label-manager-without-node-allocations.patch
+               and ../patches/0080-x64-a-value-s-host-location-found-without-a-search.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

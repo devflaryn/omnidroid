@@ -147,6 +147,11 @@ public:
     void SetName(unsigned value) { name = value; }
     unsigned GetName() const { return name; }
 
+    /// Omnidroid patch 0080: where the x64 register allocator last saw this value (a HostLoc index,
+    /// 0xFF none) -- a hint it checks before trusting, so a stale one costs only the old search.
+    std::uint8_t HostLocHint() const { return host_loc_hint; }
+    void SetHostLocHint(std::uint8_t loc) const { host_loc_hint = loc; }
+
 private:
     void Use(const Value& value);
     void UndoUse(const Value& value);
@@ -154,6 +159,7 @@ private:
     Opcode op;
     unsigned use_count = 0;
     unsigned name = 0;
+    mutable std::uint8_t host_loc_hint = 0xFF;  // patch 0080, in what was padding
     std::array<Value, max_arg_count> args;
 
     // Linked list of pseudooperations associated with this instruction.

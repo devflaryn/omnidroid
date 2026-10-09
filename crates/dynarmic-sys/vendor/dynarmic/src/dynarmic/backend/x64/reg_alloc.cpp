@@ -6,6 +6,7 @@
 #include "dynarmic/backend/x64/reg_alloc.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <bit>
 #include <numeric>
 #include <utility>
@@ -265,8 +266,9 @@ RegAlloc::ArgumentInfo RegAlloc::GetArgumentInfo(IR::Inst* inst) {
         const IR::Value arg = inst->GetArg(i);
         ret[i].value = arg;
         if (!arg.IsImmediate() && !IsValuelessType(arg.GetType())) {
-            ASSERT_MSG(ValueLocation(arg.GetInst()), "argument must already been defined");
-            LocInfo(*ValueLocation(arg.GetInst())).AddArgReference();
+            const auto location = ValueLocation(arg.GetInst());  // patch 0080: looked up once
+            ASSERT_MSG(location, "argument must already been defined");
+            LocInfo(*location).AddArgReference();
         }
     }
     return ret;
@@ -554,11 +556,19 @@ HostLoc RegAlloc::SelectARegister(Locations desired_locations) const {
 }
 
 std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const {
+    // Omnidroid patch 0080: where the value was last seen, if it is still there. A value is in one
+    // location at a time (a move takes it out of the old one), so this is the location the search
+    // below would find.
+    const std::size_t hint = value->HostLocHint();
+    if (hint < hostloc_info.size() && (occupied[hint / 64] >> (hint % 64) & 1) != 0 && hostloc_info[hint].ContainsValue(value)) {
+        return static_cast<HostLoc>(hint);
+    }
     // Omnidroid patch 0063: only the locations that may hold values, lowest first, as before.
     for (std::size_t word = 0; word < occupied.size(); word++) {
         for (std::uint64_t bits = occupied[word]; bits != 0; bits &= bits - 1) {
             const std::size_t i = word * 64 + static_cast<std::size_t>(std::countr_zero(bits));
             if (hostloc_info[i].ContainsValue(value)) {
+                value->SetHostLocHint(static_cast<std::uint8_t>(i));
                 return static_cast<HostLoc>(i);
             }
         }
@@ -567,14 +577,28 @@ std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const {
     return std::nullopt;
 }
 
+namespace {
+/// Patch 0080: the check that a value is not defined twice searches every location for a value
+/// that is (correctly) in none, for every value defined; it asserts and changes nothing, so it
+/// runs with the IR verification (`OMNI_JIT_VERIFY=1`, patch 0077).
+bool VerifyDefinitions() {
+    static const bool on = [] {
+        const char* v = std::getenv("OMNI_JIT_VERIFY");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+}  // namespace
+
 void RegAlloc::DefineValueImpl(IR::Inst* def_inst, HostLoc host_loc) {
-    ASSERT_MSG(!ValueLocation(def_inst), "def_inst has already been defined");
+    ASSERT_MSG(!VerifyDefinitions() || !ValueLocation(def_inst), "def_inst has already been defined");
     LocInfo(host_loc).AddValue(def_inst);
+    def_inst->SetHostLocHint(static_cast<std::uint8_t>(host_loc));  // patch 0080
     MarkOccupied(host_loc);  // patch 0063
 }
 
 void RegAlloc::DefineValueImpl(IR::Inst* def_inst, const IR::Value& use_inst) {
-    ASSERT_MSG(!ValueLocation(def_inst), "def_inst has already been defined");
+    ASSERT_MSG(!VerifyDefinitions() || !ValueLocation(def_inst), "def_inst has already been defined");
 
     if (use_inst.IsImmediate()) {
         const HostLoc location = ScratchImpl(gpr_order);
@@ -583,8 +607,9 @@ void RegAlloc::DefineValueImpl(IR::Inst* def_inst, const IR::Value& use_inst) {
         return;
     }
 
-    ASSERT_MSG(ValueLocation(use_inst.GetInst()), "use_inst must already be defined");
-    const HostLoc location = *ValueLocation(use_inst.GetInst());
+    const auto found = ValueLocation(use_inst.GetInst());  // patch 0080: looked up once
+    ASSERT_MSG(found, "use_inst must already be defined");
+    const HostLoc location = *found;
     DefineValueImpl(def_inst, location);
 }
 
