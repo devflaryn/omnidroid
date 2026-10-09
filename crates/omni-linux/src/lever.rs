@@ -72,6 +72,8 @@
 //!   and other self-answered sockets, unix `accept`, host sockets' waits, `/dev/fuse`, `epoll_ctl`)
 //!   are woken by their own changes only (1), not by every change in the host process (0, the
 //!   default) (`crate::poll::KEYED`; `OMNI_POLL_STATS` counts what is left).
+//! - `epoll_et=0|1`: `EPOLLET` epoll entries edge-triggered (1, the default; Linux's meaning) or
+//!   level-triggered as before (0) (`crate::poll::EDGE_TRIGGERED`).
 //! - `remote_direct=0|1`: the system's host process reads and writes an app's guest memory itself
 //!   (1, the default) rather than over the app thread's connection (0; `OMNI_REMOTE_DIRECT=0`)
 //!   (`crate::remote::DIRECT`; `OMNI_REMOTE_STATS` counts both).
@@ -263,6 +265,15 @@ pub fn apply(line: &str) -> Option<String> {
             let ms: u64 = value.trim().parse().ok()?;
             crate::poll::SLICE_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
             Some(format!("poll_slice_ms={}: a poll-family wait looks again by itself every {} ms", ms.max(1), ms.max(1)))
+        }
+        "epoll_et" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::poll::EDGE_TRIGGERED.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("epoll_et={}: EPOLLET entries are {}", u8::from(on), if on { "edge-triggered" } else { "level-triggered (the old behaviour)" }))
         }
         "remote_direct" => {
             let on = match value.trim() {
