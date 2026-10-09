@@ -77,5 +77,42 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
     }
     let with_hardware = open(Some("lean-hw"));
     assert!(with_hardware.has(CAMERA_HAL) && with_hardware.has(FINGERPRINT_HAL) && !with_hardware.has(TELESERVICE) && !with_hardware.has(IME));
+
+    // The idle apps (`device::IDLE_APPS_LEFT_OUT`, `OMNI_DEVICE_IDLE_APPS=out`): in the image by
+    // default (the setup disables them once the device is up); with `out`, gone from lean and
+    // kiosk -- each listed path one the image has, so a renamed APEX app cannot slip through --
+    // while every package PackageManager requires, and what Roblox and the kiosk use, stays.
+    let idle = omni_linux::device::IDLE_APPS_LEFT_OUT;
+    for p in idle {
+        assert!(lean.has(p.as_bytes()) && kiosk.has(p.as_bytes()), "by default the image has {p}");
+    }
+    assert_eq!(omni_linux::device::idle_apps_key_suffix(), "", "the default device's key is unchanged");
+    std::env::set_var("OMNI_DEVICE_IDLE_APPS", "out");
+    const REQUIRED: &[&[u8]] = &[
+        // PackageManager's required packages: installer and uninstaller, permission controller,
+        // SDK sandbox, ext services (the AdExt boot receiver too), the shared library.
+        b"/system/priv-app/PackageInstaller/PackageInstaller.apk",
+        b"/apex/com.android.permission/priv-app/PermissionController@AE3A.240806.019/PermissionController.apk",
+        b"/apex/com.android.adservices/app/SdkSandbox@AE3A.240806.019/SdkSandbox.apk",
+        b"/apex/com.android.extservices/priv-app/ExtServices-sminus@AE3A.240806.019/ExtServices-sminus.apk",
+        b"/system/app/ExtShared/ExtShared.apk",
+        // What the boot and the app use: media storage, the network stack, the browser for links.
+        b"/apex/com.android.mediaprovider/priv-app/MediaProvider@AE3A.240806.019/MediaProvider.apk",
+        b"/apex/com.android.tethering/priv-app/TetheringNext@AE3A.240806.019/TetheringNext.apk",
+        b"/product/app/Browser2/Browser2.apk",
+    ];
+    for (name, device) in [("lean", open(None)), ("kiosk", open(Some("kiosk")))] {
+        for p in idle {
+            assert!(!device.has(p.as_bytes()), "{name} with idle apps out: {p} gone");
+        }
+        for p in KEPT.iter().chain(REQUIRED) {
+            assert!(device.has(p), "{name} with idle apps out keeps {}", String::from_utf8_lossy(p));
+        }
+        // The APEX itself stays (its framework jar and system_server code are the boot's).
+        assert!(device.has(b"/apex/com.android.adservices/apex_manifest.pb") && device.has(b"/apex/com.android.devicelock/apex_manifest.pb"));
+    }
+    assert_eq!(omni_linux::device::idle_apps_key_suffix(), "-idleout", "a saved device without them is another");
+    assert!(open(Some("full")).has(idle[0].as_bytes()), "the full image is the image as it is");
+    std::env::remove_var("OMNI_DEVICE_IDLE_APPS");
     std::env::remove_var("OMNI_DEVICE_APPS");
 }
