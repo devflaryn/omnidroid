@@ -108,6 +108,7 @@ fn release_wait_cost() {
         let mut kind = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
         let timeline = device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut kind), None).expect("timeline");
         let mut value = 0u64;
+        #[cfg_attr(not(windows), allow(unused_variables))] // read by the Windows-only event wait
         let win32 = event_fence.map(|_| ash::khr::external_fence_win32::Device::new(&instance, &device));
         let cbs = [cb];
 

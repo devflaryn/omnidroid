@@ -130,7 +130,7 @@ impl HostNames {
     /// one before it -- a plausible, wrong name. Checked once, on a private function of this crate.
     pub fn exact(&mut self) -> bool {
         *self.exact.get_or_insert_with(|| {
-            host_symbols() && sampler::symbolize(private_probe as usize).is_some_and(|(n, _)| demangle(&n).contains("private_probe"))
+            host_symbols() && sampler::symbolize(private_probe as fn() -> u64 as usize).is_some_and(|(n, _)| demangle(&n).contains("private_probe"))
         })
     }
 
@@ -425,11 +425,14 @@ impl Profiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(windows)]
     use std::sync::Arc;
 
     /// The two tests that measure spinning threads, one at a time: each one's spinners would be the
     /// other's hottest threads.
+    #[cfg(windows)]
     static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -451,6 +454,7 @@ mod tests {
         assert_eq!(demangle("omni_linux::poll::Watch::sleep"), "omni_linux::poll::Watch::sleep");
     }
 
+    #[cfg(windows)]
     #[inline(never)]
     fn proccpu_test_spin_body(stop: &AtomicBool) -> u64 {
         let mut x = 1u64;
@@ -523,7 +527,7 @@ mod tests {
         // A release build without debug information has a PDB of public symbols only, which do not
         // name a private function: then the name is checked only for being the same as a direct
         // lookup of the function's own address gives.
-        let direct = HostNames::default().name(proccpu_test_spin_body as usize);
+        let direct = HostNames::default().name(proccpu_test_spin_body as fn(&AtomicBool) -> u64 as usize);
         eprintln!("the function's own address names as {direct:?}");
         if direct.contains("proccpu_test_spin_body") {
             assert!(line.contains("proccpu_test_spin_body"), "named from the PDB: {line}");
