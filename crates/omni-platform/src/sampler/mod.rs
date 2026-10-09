@@ -145,6 +145,28 @@ pub fn symbolize(address: usize) -> Option<(String, usize)> {
     whole::symbolize(address)
 }
 
+/// The calling thread's return addresses, innermost first, skipping `skip` frames: how many were
+/// written into `out`. Allocation-free (Windows: `RtlCaptureStackBackTrace`, which walks the
+/// unwind tables), so an allocator may call it; 0 on other hosts. For `omni-linux`'s allocation
+/// trace (`OMNI_ALLOC_TRACE_KB`), resolved later with [`symbolize`].
+#[must_use]
+pub fn capture_return_addresses(skip: u32, out: &mut [usize]) -> usize {
+    #[cfg(target_os = "windows")]
+    {
+        let n = u32::try_from(out.len()).unwrap_or(u32::MAX).min(62);
+        // SAFETY: `out` has room for `n` pointers; the hash is optional.
+        let got = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(skip, n, out.as_mut_ptr().cast(), core::ptr::null_mut())
+        };
+        usize::from(got)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (skip, out);
+        0
+    }
+}
+
 /// How many code bytes [`HostThread::sample`] reads **before** the instruction pointer.
 ///
 /// Enough to reach back over the `mov r64, imm64` that dynarmic emits in front of a spin-lock loop
