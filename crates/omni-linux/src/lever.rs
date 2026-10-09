@@ -40,8 +40,8 @@
 //!   index rehashed down to what they hold after an eviction or invalidation forgets blocks, when
 //!   that is at most half their bucket arrays (patch 0066, `omni_cpu::dynarmic::set_shrink_tables`).
 //!   With code aging (`code_age`, `code_age_game`) the maps otherwise keep the size of the cache's
-//!   busiest moment. Nothing is dropped; it applies from the next eviction. Off by default;
-//!   `OMNI_JIT_TABLE_SHRINK=1` from the start.
+//!   busiest moment. Nothing is dropped; it applies from the next eviction. On by default
+//!   (`crate::process::scalar_fp_in_xmm_default`); `OMNI_JIT_TABLE_SHRINK=0` from the start.
 //! - `jit_tbi=0|1`: 0 takes Top Byte Ignore's mask off the direct path (patches 0040/0041,
 //!   `omni_cpu::dynarmic::set_tbi_unmasked`): an untagged access is D4's identity; a tagged one is
 //!   a host fault served by the slow path (~2.4 us), and its instruction then learns the mask
@@ -136,7 +136,7 @@
 //! - `code_age=<minutes>`, `code_age_keep=<MiB>`, `code_age_sf=0|1`: the system host's age pass
 //!   (`crate::code_trim::age`): a process's oldest translations retired past the kept size. Off.
 //! - `code_age_game=<minutes>`, `code_age_game_keep=<MiB>`: the same in an app's host process (the
-//!   game's). Off (0) by default; keeps 96 MiB.
+//!   game's). 3 minutes by default (one pass, later ones only past keep + 48 MiB); keeps 96 MiB.
 //! - `read_no_commit=0|1`: the kernel's reads of guest memory read a lazy mapping's uncommitted
 //!   pages as zeros instead of committing them (`crate::guest::READ_NO_COMMIT`; on by default).
 //! - `binder_spawn=kernel|eager`: when a guest process is asked for another binder looper -- the

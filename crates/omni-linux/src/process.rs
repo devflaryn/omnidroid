@@ -165,6 +165,13 @@ pub fn scalar_fp_in_xmm_default() {
         if std::env::var_os("OMNI_JIT_COMPACT").is_none() {
             let _ = omni_cpu::dynarmic::set_compact_code(1);
         }
+        // The code caches' maps shrink after blocks are forgotten (dynarmic patch 0073), on by
+        // default with the game's code aging since the in-world runs of 2026-10-09 (PS99 s20/s21:
+        // the two together, private working set 3.37 -> 3.12-3.22 GB). `OMNI_JIT_TABLE_SHRINK=0` or
+        // the lever `jit_table_shrink=0` turns it off.
+        if std::env::var_os("OMNI_JIT_TABLE_SHRINK").is_none() {
+            let _ = omni_cpu::dynarmic::set_shrink_tables(true);
+        }
     });
 }
 

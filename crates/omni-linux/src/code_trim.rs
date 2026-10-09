@@ -134,11 +134,14 @@ pub mod age {
     /// in the 5 s windows around it). `OMNI_CODE_AGE_SF=0` or the lever leaves it alone.
     pub static SURFACEFLINGER: AtomicBool = AtomicBool::new(true);
     static KICK: AtomicBool = AtomicBool::new(false);
-    /// An app's host process (the game's) too, every this many minutes; 0 (the default): never.
-    /// Its oldest regions hold its start-up and sign-in code, run once; what it still runs is
-    /// translated again into a new region (a hitch while that happens). `OMNI_CODE_AGE_GAME`, the
-    /// lever `code_age_game`.
-    pub static GAME_MINUTES: AtomicU64 = AtomicU64::new(0);
+    /// An app's host process (the game's) too, this many minutes after it starts (then again only
+    /// past [`GAME_SLACK_MB`]); 0: never. Its oldest regions hold its start-up and sign-in code, run
+    /// once; what it still runs is translated again into a new region. **3 by default** since the
+    /// in-world runs of 2026-10-09 (PS99 s20-s22: its translations 234-242 -> 84-92 MiB, private
+    /// working set 3.37 -> 3.12-3.22 GB with the table shrink; one pass a session, ~15 s at 47-57
+    /// fps while it retires its regions a second apart). `OMNI_CODE_AGE_GAME=0` or the lever
+    /// `code_age_game=0` turns it off.
+    pub static GAME_MINUTES: AtomicU64 = AtomicU64::new(3);
     /// MiB of translations the game keeps (`OMNI_CODE_AGE_GAME_KEEP_MB`, `code_age_game_keep`).
     pub static GAME_KEEP_MB: AtomicU64 = AtomicU64::new(96);
     static KICK_GAME: AtomicBool = AtomicBool::new(false);
