@@ -82,7 +82,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use omni_platform::window::{Presenter, Window, WindowDesc, WindowEvent};
 
@@ -504,14 +504,19 @@ impl Drop for GpuSlot<'_> {
 struct WindowSink {
     slot: Arc<parking_lot::Mutex<Option<crate::gpu::window_present::WindowPresenter>>>,
     presenter: Presenter,
+    /// The number of the last frame shown here from share images, recorded under `slot`'s lock:
+    /// the present thread does not put an older CPU-composed frame over it.
+    zero_shown: Arc<AtomicU64>,
 }
 
 impl crate::hal::framebuffer::ZeroSink for WindowSink {
-    fn present(&self, layers: &[crate::gpu::share::ShareLayer], display: (u32, u32)) -> Result<(), String> {
+    fn present(&self, layers: &[crate::gpu::share::ShareLayer], display: (u32, u32), frame: u64) -> Result<(), String> {
         let client = self.presenter.client_size().ok_or("the window is gone")?;
         let mut slot = self.slot.lock();
         let presenter = slot.as_mut().ok_or("no swapchain")?;
-        presenter.present_layers(layers, display, client).map(|_| ())
+        presenter.present_layers(layers, display, client)?;
+        self.zero_shown.fetch_max(frame, Ordering::AcqRel);
+        Ok(())
     }
 }
 
@@ -536,6 +541,7 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
     // without pixels, already on the window. The presenter is shared behind a mutex; this thread
     // makes it and drops it (`GpuSlot`), the sink withdrawn first.
     let gpu = GpuSlot { framebuffer, slot: Arc::default() };
+    let zero_shown = Arc::new(AtomicU64::new(0));
     let (mut has_gpu, mut gpu_failed, mut sink_on) = (false, false, false);
     let mut gpu_size = (0u32, 0u32);
     while !stop.load(Ordering::Acquire) {
@@ -563,7 +569,7 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
             eprintln!("[window] present_gpu off: GDI");
         }
         if has_gpu && zero && !sink_on {
-            framebuffer.set_sink(Some(Arc::new(WindowSink { slot: Arc::clone(&gpu.slot), presenter: presenter.clone() })));
+            framebuffer.set_sink(Some(Arc::new(WindowSink { slot: Arc::clone(&gpu.slot), presenter: presenter.clone(), zero_shown: Arc::clone(&zero_shown) })));
             sink_on = true;
             eprintln!("[window] present_zero: the composer shows the app's share images in the window");
         } else if sink_on && !zero {
@@ -573,7 +579,15 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
         }
         let resized = has_gpu && presenter.client_size().is_some_and(|s| s != gpu_size);
         if framebuffer.wait_frame(shown + 1, if resized { Duration::ZERO } else { FRAME_WAIT }) || resized {
-            let (n, fw, fh, pixels) = framebuffer.frame_for_window();
+            let (mut n, mut fw, mut fh, mut pixels) = framebuffer.frame_for_window();
+            if pixels.is_none() && resized && has_gpu {
+                // A frame the composer showed from share images, at the window's old size: nothing
+                // redraws it at the new one until the composer's next frame, and a still scene
+                // makes none (the CPU-composed frame is presented again below, as GDI's
+                // `WM_PAINT` repaints the kept image). Its pixels, composed once, are that frame.
+                let (k, w, h, p, bgra) = framebuffer.frame_raw();
+                (n, fw, fh, pixels) = (k, w, h, Some((p, bgra)));
+            }
             if n > shown || resized {
                 shown = n;
                 let client = presenter.client_size().unwrap_or_default();
@@ -586,7 +600,13 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
                     }
                     Some((pixels, bgra)) if has_gpu => {
                         let mut slot = gpu.slot.lock();
-                        match slot.as_mut().map(|g| g.present(&pixels, fw, fh, bgra, client)) {
+                        // The composer showed a newer frame from share images after this one was
+                        // taken (its present and the frame's count are two steps, so the count
+                        // read did not say so): this one is older than what the window shows, and
+                        // is not presented over it. Checked under the swapchain's lock, which the
+                        // composer's present holds while it records its frame's number.
+                        let newer = zero_shown.load(Ordering::Acquire) > n;
+                        match if newer { Some(Ok(false)) } else { slot.as_mut().map(|g| g.present(&pixels, fw, fh, bgra, client)) } {
                             Some(Ok(_)) => {
                                 // Drawn or not (minimised, a swapchain out of date): the next frame
                                 // tries again; this size is not retried in a loop.

@@ -960,7 +960,9 @@ fn present_shared(st: &State, screen: &Screen, order: &[(i32, i64)], sink: &dyn 
     })();
     let Mode { width, height, .. } = screen.mode();
     let outcome = why.and_then(|(shared, owned)| {
-        sink.present(&shared, (width, height)).map_err(|e| {
+        // Its number: the next count of this framebuffer, whose presents this screen's lock (held
+        // here) keeps in order.
+        sink.present(&shared, (width, height), screen.framebuffer.frames() + 1).map_err(|e| {
             static SAID: AtomicBool = AtomicBool::new(false);
             if !SAID.swap(true, Ordering::Relaxed) {
                 eprintln!("[composer] present_zero: the window could not show a frame ({e}); composed on the CPU");

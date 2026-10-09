@@ -155,6 +155,8 @@ struct Compose {
 pub const MAX_LAYERS: usize = 16;
 /// How many frames a share image not drawn is kept open.
 const KEEP_IMPORTED: u64 = 240;
+/// The descriptor sets the composition's pool holds: the most share images open at once.
+const POOL_SETS: usize = 64;
 
 /// A share image opened here.
 struct Imported {
@@ -671,6 +673,8 @@ impl WindowPresenter {
         let info = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&swapchains).image_indices(&indices);
         // SAFETY: the image was acquired above and its drawing submitted, signalling `done`.
         let presented = unsafe { swapchain_fn.queue_present(self.queue, &info) };
+        // Submitted: this frame took its layers' generations over.
+        self.taken_over(layers);
         // The share images are read when this returns, whatever the present answered.
         // SAFETY: the fence of the submit above.
         unsafe { self.device().wait_for_fences(&[fence], true, u64::MAX) }.map_err(vkerr("vkWaitForFences"))?;
@@ -741,6 +745,9 @@ impl WindowPresenter {
         if let Ok(read) = read {
             self.destroy_source(read);
         }
+        if result.is_ok() {
+            self.taken_over(layers);
+        }
         // SAFETY: idle (waited above, or never submitted).
         unsafe {
             let _ = self.device().device_wait_idle();
@@ -804,6 +811,8 @@ impl WindowPresenter {
             device.end_command_buffer(cmd).map_err(vkerr("vkEndCommandBuffer"))?;
             let cmds = [cmd];
             device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).map_err(vkerr("vkQueueSubmit"))?;
+            self.taken_over(std::slice::from_ref(&layer));
+            let device = self.device();
             device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr("vkWaitForFences"))?;
             let pixels = std::slice::from_raw_parts(mapped, size as usize).to_vec();
             self.composed += 1;
@@ -1032,8 +1041,8 @@ impl WindowPresenter {
                 .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                 .max_lod(0.0);
             c.sampler = device.create_sampler(&sampler, None).map_err(vkerr("vkCreateSampler"))?;
-            let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(64)];
-            c.descriptors = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET).max_sets(64).pool_sizes(&sizes), None).map_err(vkerr("vkCreateDescriptorPool"))?;
+            let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(POOL_SETS as u32)];
+            c.descriptors = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET).max_sets(POOL_SETS as u32).pool_sizes(&sizes), None).map_err(vkerr("vkCreateDescriptorPool"))?;
             let size = (MAX_LAYERS * 6 * 16) as u64;
             c.vertices = device.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::VERTEX_BUFFER).sharing_mode(vk::SharingMode::EXCLUSIVE), None).map_err(vkerr("vkCreateBuffer"))?;
             let need = device.get_buffer_memory_requirements(c.vertices);
@@ -1097,14 +1106,31 @@ impl WindowPresenter {
     /// The descriptor set a layer's share image is sampled through: opened by its name the first
     /// time (the same image as the exporter made, its memory imported by name), kept after.
     /// With the set, the image when this frame must take it over from the app's process (a
-    /// generation not taken over yet).
+    /// generation not taken over yet). It counts as taken over only once the frame that does so
+    /// is submitted ([`taken_over`](Self::taken_over)): a frame given up after its layers were
+    /// opened -- another layer that would not open, an out-of-date swapchain -- took nothing over,
+    /// and the next frame of the same generation must (before, it sampled an image whose
+    /// ownership and the app's writes it never acquired).
     fn open(&mut self, layer: &super::share::ShareLayer) -> Result<(vk::DescriptorSet, Option<vk::Image>), String> {
         let key = (layer.desc.name.clone(), layer.opaque);
         if let Some(i) = self.imported.get_mut(&key) {
             i.used = self.composed;
             let fresh = i.acquired != layer.generation;
-            i.acquired = layer.generation;
             return Ok((i.set, fresh.then_some(i.image)));
+        }
+        // The descriptor pool holds `POOL_SETS` sets: at that many share images open, the one drawn
+        // longest ago is let go first (none of this frame's: they were opened with `used` now; one
+        // drawn before is no longer read, every composition being waited on). Ageing alone
+        // (`KEEP_IMPORTED` frames) let more than that many images opened within ~4 s -- a window
+        // resized a few times, each resize new buffers -- fail every later frame's open, and with
+        // no frame composed nothing aged out: present_zero fell back to the CPU for good.
+        if self.imported.len() >= POOL_SETS {
+            let now = self.composed;
+            let oldest = self.imported.iter().filter(|(_, i)| i.used < now).min_by_key(|(_, i)| i.used).map(|(k, _)| k.clone());
+            let Some(i) = oldest.and_then(|k| self.imported.remove(&k)) else {
+                return Err(format!("more than {POOL_SETS} share images in one frame"));
+            };
+            self.close(i);
         }
         let desc = &layer.desc;
         let device = self.device();
@@ -1122,7 +1148,7 @@ impl WindowPresenter {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut external);
-        let mut made = Imported { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null(), set: vk::DescriptorSet::null(), used: self.composed, acquired: layer.generation };
+        let mut made = Imported { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null(), set: vk::DescriptorSet::null(), used: self.composed, acquired: 0 };
         let wide = desc.wide_name();
         let opened = (|| -> Result<(), String> {
             // SAFETY (the closure): a live device; each object is recorded in `made` at once.
@@ -1151,6 +1177,15 @@ impl WindowPresenter {
         let (set, image) = (made.set, made.image);
         self.imported.insert(key, made);
         Ok((set, Some(image)))
+    }
+
+    /// `layers`' generations taken over from the app's process: a frame acquiring them was submitted.
+    fn taken_over(&mut self, layers: &[super::share::ShareLayer]) {
+        for l in layers {
+            if let Some(i) = self.imported.get_mut(&(l.desc.name.clone(), l.opaque)) {
+                i.acquired = l.generation;
+            }
+        }
     }
 
     /// A share image opened here, let go of (the GPU no longer reads it).
