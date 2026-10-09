@@ -391,3 +391,166 @@ fn zero_present_cost() {
         eprintln!("zero_present_cost 1575x890 2 layers, {}: process CPU {:.2} ms/frame (rounds {:.2?}); the frame's call {:.2} ms", names[p], med(&cpu[p]), cpu[p], med(&call[p]));
     }
 }
+
+/// A gralloc region laid out as the allocator lays one out (`hal::gralloc`): the metadata page,
+/// then `stride` x `h` pixels, holding `desc`'s frame of `generation` only in its share image.
+fn stale_region(desc: &ShareDesc, stride: u32, h: u32, generation: u64) -> std::sync::Arc<crate::shm::Shm> {
+    use crate::gpu::native::{CONTENT_GENERATION_AT, PENDING_GENERATION_AT};
+    let shm = crate::shm::Shm::create("region_lazy").expect("region");
+    shm.set_len(crate::hal::gralloc::PIXELS_AT + u64::from(stride) * u64::from(h) * 4).expect("size");
+    shm.as_graphics_buffer();
+    desc.write(&shm);
+    share::write_generation(&shm, generation);
+    shm.write_at(&generation.to_le_bytes(), CONTENT_GENERATION_AT).expect("generation");
+    shm.write_at(&generation.to_le_bytes(), PENDING_GENERATION_AT).expect("generation");
+    share::set_stale(&shm, generation);
+    shm
+}
+
+/// **`region_lazy`'s on-demand fill**: a region its release left stale is filled from its share
+/// image (opened by name here, read back on the GPU at the region's stride), the mark cleared; one
+/// whose share image holds another frame is not, and its buffer is copied again from the next
+/// release on. Then **what the release worker spends a frame**, with the region copy and without:
+/// the copy submitted (into staging and the share image, or the share image alone), then the
+/// worker's wait for it and its copy into the region -- the waiting thread's CPU and the wall time.
+#[test]
+#[ignore = "asks the host GPU"]
+#[allow(clippy::too_many_lines)]
+fn zero_region_lazy() {
+    let (w, h, stride) = (1575u32, 890u32, 1600u32);
+    let (surface, _, _) = scene(w as usize, h as usize);
+    let mut app = App::new();
+    let desc = app.share(vk::Format::R8G8B8A8_UNORM, w, h, &surface);
+    let share_image = app.made.last().expect("made").0;
+
+    let shm = stale_region(&desc, stride, h, 7);
+    let t = std::time::Instant::now();
+    assert!(share::ensure_region(&shm, u64::from(stride) * 4), "filled");
+    let first = t.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(share::stale(&shm), 0, "the mark cleared");
+    let mut back = vec![0u8; (stride * h * 4) as usize];
+    shm.read_at(&mut back, crate::hal::gralloc::PIXELS_AT).expect("read");
+    for y in [0usize, 1, 445, 889] {
+        let row = &back[y * stride as usize * 4..][..w as usize * 4];
+        assert!(row == &surface[y * w as usize * 4..][..w as usize * 4], "row {y} is the share image's");
+    }
+    // Again (the share image already open here): what a screenshot of a lazy frame costs.
+    share::set_stale(&shm, 7);
+    let t = std::time::Instant::now();
+    assert!(share::ensure_region(&shm, u64::from(stride) * 4));
+    let again = t.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("zero_region_lazy: a stale 1575x890 region filled on demand in {first:.2} ms (the share image opened), {again:.2} ms after");
+    {
+        let mut p = super::WindowPresenter::new_headless().expect("presenter");
+        for i in 0..4 {
+            let t = std::time::Instant::now();
+            let px = p.read_share(&desc, 7 + i, u64::from(stride) * 4).expect("read");
+            let read = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            shm.write_at(&px, crate::hal::gralloc::PIXELS_AT).expect("write");
+            eprintln!("zero_region_lazy: read_share {read:.2} ms, write_at {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    // A share image holding another frame: not filled, and the composer's mark withdrawn.
+    let other = stale_region(&desc, stride, h, 9);
+    share::write_generation(&other, 8);
+    share::mark_taken(&other, 9);
+    assert!(!share::ensure_region(&other, u64::from(stride) * 4));
+    assert_eq!(share::taken(&other), 0, "copied again from the next release");
+
+    // The release worker's frame, each way.
+    let d = &app.device;
+    // SAFETY (the test).
+    unsafe {
+        let make_image = || {
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_SRC)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let i = d.create_image(&info, None).expect("image");
+            let need = d.get_image_memory_requirements(i);
+            let m = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(need.size).memory_type_index(app.kind(need.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)), None).expect("memory");
+            d.bind_image_memory(i, m, 0).expect("bind");
+            (i, m)
+        };
+        let (frame, frame_mem) = make_image();
+        let bytes = u64::from(stride) * u64::from(h) * 4;
+        let staging = d.create_buffer(&vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_DST), None).expect("buffer");
+        let need = d.get_buffer_memory_requirements(staging);
+        let staging_mem = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(need.size).memory_type_index(app.kind(need.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_CACHED)), None).expect("memory");
+        d.bind_buffer_memory(staging, staging_mem, 0).expect("bind");
+        let mapped = d.map_memory(staging_mem, 0, bytes, vk::MemoryMapFlags::empty()).expect("map").cast::<u8>();
+        let cb = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(app.pool).command_buffer_count(1)).expect("cb")[0];
+        let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).expect("fence");
+        let range = super::range();
+        let me = omni_platform::sampler::HostThread::current().expect("this thread");
+        let per_ms = {
+            let (t, c) = (std::time::Instant::now(), me.cycles().expect("cycles"));
+            while t.elapsed() < std::time::Duration::from_millis(100) {
+                std::hint::spin_loop();
+            }
+            (me.cycles().expect("cycles") - c) as f64 / (t.elapsed().as_secs_f64() * 1000.0)
+        };
+        let region = stale_region(&desc, stride, h, 1);
+        let once = |lazy: bool| -> (f64, f64) {
+            d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()).expect("reset");
+            d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()).expect("begin");
+            let b = |image, old, new| vk::ImageMemoryBarrier::default().old_layout(old).new_layout(new).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(image).subresource_range(range);
+            d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b(frame, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_SRC_OPTIMAL), b(share_image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL)]);
+            if !lazy {
+                let copy = vk::BufferImageCopy::default().buffer_row_length(stride).image_subresource(super::layers()).image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+                d.cmd_copy_image_to_buffer(cb, frame, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, staging, &[copy]);
+            }
+            let region_copy = vk::ImageCopy { src_subresource: super::layers(), src_offset: vk::Offset3D::default(), dst_subresource: super::layers(), dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: w, height: h, depth: 1 } };
+            d.cmd_copy_image(cb, frame, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, share_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region_copy]);
+            d.end_command_buffer(cb).expect("end");
+            let cbs = [cb];
+            d.reset_fences(&[fence]).expect("reset");
+            let t = std::time::Instant::now();
+            d.queue_submit(app.queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], fence).expect("submit");
+            // The worker: the wait, and the copy into the region unless skipped.
+            let c0 = me.cycles().expect("cycles");
+            d.wait_for_fences(&[fence], true, u64::MAX).expect("wait");
+            if !lazy {
+                region.write_at(std::slice::from_raw_parts(mapped, bytes as usize), crate::hal::gralloc::PIXELS_AT).expect("land");
+            }
+            let cpu = (me.cycles().expect("cycles") - c0) as f64 / per_ms;
+            (cpu, t.elapsed().as_secs_f64() * 1000.0)
+        };
+        let (mut cpu, mut wall): ([Vec<f64>; 2], [Vec<f64>; 2]) = Default::default();
+        for i in 0..80 {
+            for lazy in if i % 2 == 0 { [false, true] } else { [true, false] } {
+                let (c, t) = once(lazy);
+                if i >= 5 {
+                    cpu[usize::from(lazy)].push(c);
+                    wall[usize::from(lazy)].push(t);
+                }
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        eprintln!(
+            "zero_region_lazy release worker, 1575x890: region copied -- CPU {:.3} ms, submit to landed {:.2} ms; region_lazy -- CPU {:.3} ms, {:.2} ms",
+            med(&mut cpu[0]),
+            med(&mut wall[0]),
+            med(&mut cpu[1]),
+            med(&mut wall[1])
+        );
+        d.destroy_fence(fence, None);
+        d.free_command_buffers(app.pool, &[cb]);
+        d.unmap_memory(staging_mem);
+        d.destroy_buffer(staging, None);
+        d.free_memory(staging_mem, None);
+        d.destroy_image(frame, None);
+        d.free_memory(frame_mem, None);
+    }
+}

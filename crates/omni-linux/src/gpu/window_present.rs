@@ -123,6 +123,8 @@ pub struct WindowPresenter {
     imported: std::collections::HashMap<(String, bool), Imported>,
     /// Frames composed from share images (the clock `imported` ages by).
     composed: u64,
+    /// `region_lazy`'s read-back buffer: buffer, memory, mapping, size.
+    readback: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
 }
 
 // SAFETY: every Vulkan handle here may be used from any thread when access is externally
@@ -226,6 +228,7 @@ impl WindowPresenter {
             compose: None,
             imported: std::collections::HashMap::new(),
             composed: 0,
+            readback: None,
         };
         // From here on an error drops `me`, which destroys what was made.
         me.surface = match window {
@@ -749,6 +752,108 @@ impl WindowPresenter {
         result
     }
 
+    /// **A share image's pixels read back** (`region_lazy`'s on-demand fill, [`super::share::ensure_region`]):
+    /// the frame of `generation` it holds, rows `stride_bytes` apart -- a gralloc region's layout.
+    ///
+    /// # Errors
+    /// One it cannot open, or anything the driver refused.
+    pub fn read_share(&mut self, desc: &super::share::ShareDesc, generation: u64, stride_bytes: u64) -> Result<Vec<u8>, String> {
+        if !self.can_show(desc) {
+            return Err("a share image of another GPU, or no import here".into());
+        }
+        if stride_bytes % 4 != 0 || stride_bytes < u64::from(desc.width) * 4 {
+            return Err(format!("a stride of {stride_bytes} bytes for {} pixels", desc.width));
+        }
+        // Opening goes through the composition's descriptors.
+        self.ensure_compose(vk::Format::B8G8R8A8_UNORM)?;
+        let (w, h) = (desc.width, desc.height);
+        let layer = super::share::ShareLayer { desc: desc.clone(), opaque: false, crop: (0.0, 0.0, w as f32, h as f32), frame: (0, 0, w as i32, h as i32), blend: super::share::ShareBlend::None, generation };
+        let (_, fresh) = self.open(&layer)?;
+        let image = self.imported.get(&(desc.name.clone(), false)).map(|i| i.image).ok_or("just opened")?;
+        let size = stride_bytes * u64::from(h);
+        if self.readback.as_ref().is_none_or(|r| r.3 < size) {
+            if let Some(old) = self.readback.take() {
+                self.destroy_readback(old);
+            }
+            self.readback = Some(self.make_readback(size)?);
+        }
+        let (buffer, mapped) = self.readback.as_ref().map(|r| (r.0, r.2)).expect("made");
+        let slot = self.next;
+        let (fence, cmd) = (self.slots[slot].fence, self.slots[slot].cmd);
+        let device = self.device();
+        // SAFETY: live handles of this device; the slot's fence is waited on before its reuse.
+        unsafe {
+            device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr("vkWaitForFences"))?;
+            device.reset_fences(&[fence]).map_err(vkerr("vkResetFences"))?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(vkerr("vkBeginCommandBuffer"))?;
+            if fresh.is_some() {
+                let acquire = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                    .dst_queue_family_index(self.family)
+                    .image(image)
+                    .subresource_range(range());
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[acquire]);
+            }
+            let copy = vk::BufferImageCopy::default().buffer_row_length((stride_bytes / 4) as u32).image_subresource(layers()).image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, buffer, &[copy]);
+            let to_host = vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(buffer).size(vk::WHOLE_SIZE);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[], &[to_host], &[]);
+            device.end_command_buffer(cmd).map_err(vkerr("vkEndCommandBuffer"))?;
+            let cmds = [cmd];
+            device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).map_err(vkerr("vkQueueSubmit"))?;
+            device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr("vkWaitForFences"))?;
+            let pixels = std::slice::from_raw_parts(mapped, size as usize).to_vec();
+            self.composed += 1;
+            self.evict();
+            Ok(pixels)
+        }
+    }
+
+    /// A host-visible buffer (host memory, cached when it can be: the CPU reads it) of `size` bytes,
+    /// mapped.
+    fn make_readback(&self, size: u64) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, u64), String> {
+        let device = self.device();
+        // SAFETY: a live device; undone on failure.
+        unsafe {
+            let buffer = device.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE), None).map_err(vkerr("vkCreateBuffer"))?;
+            let need = device.get_buffer_memory_requirements(buffer);
+            let made = self
+                .staging_type(need.memory_type_bits)
+                .ok_or_else(|| "no host-visible memory".to_string())
+                .and_then(|kind| device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(need.size).memory_type_index(kind), None).map_err(vkerr("vkAllocateMemory")))
+                .and_then(|memory| {
+                    let mapped = device.bind_buffer_memory(buffer, memory, 0).and_then(|()| device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()));
+                    match mapped {
+                        Ok(p) => Ok((memory, p.cast::<u8>())),
+                        Err(e) => {
+                            device.free_memory(memory, None);
+                            Err(vkerr("vkMapMemory")(e))
+                        }
+                    }
+                });
+            match made {
+                Ok((memory, mapped)) => Ok((buffer, memory, mapped, size)),
+                Err(e) => {
+                    device.destroy_buffer(buffer, None);
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    fn destroy_readback(&self, r: (vk::Buffer, vk::DeviceMemory, *mut u8, u64)) {
+        let device = self.device();
+        // SAFETY: idle (every use is waited on); made by `make_readback`.
+        unsafe {
+            device.unmap_memory(r.1);
+            device.destroy_buffer(r.0, None);
+            device.free_memory(r.1, None);
+        }
+    }
+
     /// A device-local image and its memory.
     fn make_image(&self, width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags) -> Result<(vk::Image, vk::DeviceMemory), String> {
         let device = self.device();
@@ -1250,6 +1355,9 @@ impl Drop for WindowPresenter {
             }
             if let Some(c) = self.compose.take() {
                 self.destroy_compose(c);
+            }
+            if let Some(r) = self.readback.take() {
+                self.destroy_readback(r);
             }
             let slots = std::mem::take(&mut self.slots);
             for slot in slots {

@@ -1191,6 +1191,7 @@ fn swap(h: &Host, p: &Process, id: u64, handle: u64, width: u32, height: u32, fo
     }
     let Some(bytes) = to_buffer(&rgba, w as usize, rows as usize, true, format, stride as usize) else { return ERROR_BIT | EGL_BAD_MATCH };
     let _ = shm.write_at(&bytes, pixels_at);
+    super::share::region_written(&shm);
     super::native::bump_generation(&shm);
     1
 }
@@ -1319,6 +1320,8 @@ fn region_generation(shm: &crate::shm::Shm) -> u64 {
 /// The buffer's pixels into the image's texture (bound for the upload, the old binding restored).
 fn upload(h: &Host, es3: bool, img: &Image, first: bool) {
     let Some(bpp) = bytes_per_pixel(img.format) else { return };
+    // A region its release left stale (`region_lazy`) is filled from its share image first.
+    super::share::ensure_region(&img.shm, u64::from(img.stride) * bpp as u64);
     let mut bytes = vec![0u8; img.stride as usize * img.height as usize * bpp];
     if img.shm.read_at(&mut bytes, img.pixels_at).is_err() {
         return;
@@ -1433,6 +1436,7 @@ fn flush_images(h: &Host) {
         h.call("glFramebufferTexture2D", &[u64::from(target), u64::from(GL_COLOR_ATTACHMENT0), u64::from(GL_TEXTURE_2D), u64::from(img.texture), 0]);
         if let Some(bytes) = read_image(h, img.width, img.height, img.format, img.stride as usize) {
             let _ = img.shm.write_at(&bytes, img.pixels_at);
+            super::share::region_written(&img.shm);
             super::native::bump_generation(&img.shm);
             img.generation = region_generation(&img.shm);
         }

@@ -53,6 +53,10 @@
 //!   (blended there), its pixels composed on the CPU only for a reader (`crate::gpu::share`). Needs
 //!   the app's devices made with `OMNI_PRESENT_ZERO=ready` (or `=1`, on from the start). Off by
 //!   default.
+//! - `region_lazy=0|1` (`OMNI_REGION_LAZY=1`): under `present_zero`, a buffer whose last frame the
+//!   composer took from its share image skips the release's region copy (GPU -> staging -> CPU);
+//!   any reader of the region fills it from the share image on demand
+//!   (`crate::gpu::share::ensure_region`). Off by default.
 //! - `gralloc_direct=0|1`: an app's released frame copied by the GPU straight into its gralloc
 //!   region (imported as Vulkan memory) instead of into a staging buffer the release worker then
 //!   copies on the CPU (`crate::gpu::native::DIRECT`). Needs devices made with
@@ -369,6 +373,16 @@ pub fn apply(line: &str) -> Option<String> {
             crate::gpu::native::RELEASE_WAIT_US.store(us, std::sync::atomic::Ordering::Relaxed);
             Some(format!("release_poll={us}: release_wait=poll, the fence asked every {us} us"))
         }
+        "region_lazy" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let _ = crate::gpu::share::lazy_on();
+            crate::gpu::share::LAZY.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("region_lazy={}", u8::from(on)))
+        }
         "present_zero" => {
             let on = match value.trim() {
                 "1" => true,
@@ -543,6 +557,10 @@ mod tests {
         assert!(crate::gpu::share::on());
         apply("present_zero=0").expect("understood");
         assert!(!crate::gpu::share::on());
+        assert_eq!(apply("region_lazy=1").as_deref(), Some("region_lazy=1"));
+        assert!(crate::gpu::share::lazy_on());
+        apply("region_lazy=0").expect("understood");
+        assert!(!crate::gpu::share::lazy_on());
     }
 
     #[test]

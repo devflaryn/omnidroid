@@ -248,6 +248,8 @@ pub(crate) fn import(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, info: 
 fn upload(m: &mut AhbMemory) {
     // A swapchain copy on its way into the region lands first (`native::wait_written`).
     super::native::wait_written(&m.shm, std::time::Duration::from_millis(50));
+    // A region its release left stale (`region_lazy`) is filled from its share image first.
+    super::share::ensure_region(&m.shm, m.stride_bytes);
     let now = generation(&m.shm);
     if now == m.generation {
         return;
@@ -273,6 +275,7 @@ fn download(m: &mut AhbMemory) {
             return;
         }
     }
+    super::share::region_written(&m.shm);
     bump_generation(&m.shm);
     m.generation = generation(&m.shm);
 }

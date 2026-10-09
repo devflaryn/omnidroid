@@ -696,6 +696,15 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     // `present_zero`: the frame into the share image too, in the same submit.
     let share = img.share.as_ref().filter(|_| super::share::on()).map(|s| s.image);
     let has_share = img.share.is_some();
+    // `region_lazy` (`super::share::LAZY`): the composer showed this buffer's last frame from its
+    // share image, so the region copy is skipped -- the region is marked stale, and filled from the
+    // share image only if something reads it (`super::share::ensure_region`).
+    let content = {
+        let mut g = [0u8; 8];
+        let _ = shm.read_at(&mut g, CONTENT_GENERATION_AT);
+        u64::from_le_bytes(g)
+    };
+    let lazy = share.is_some() && super::share::lazy_on() && content != 0 && super::share::taken(&shm) == content;
     let own = img.copier.as_ref().map(|c| (c.cb, c.fence));
     drop(natives);
     let d = vk::Device::from_raw(device);
@@ -766,14 +775,16 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
         check(vkfn!(t, ID_VK_BEGIN_COMMAND_BUFFER, c"vkBeginCommandBuffer", vk::PFN_vkBeginCommandBuffer)(cb, &bi))?;
         let barrier = vkfn!(t, ID_VK_CMD_PIPELINE_BARRIER, c"vkCmdPipelineBarrier", vk::PFN_vkCmdPipelineBarrier);
         barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), 0, std::ptr::null(), 0, std::ptr::null(), 1, &to_src);
-        vkfn!(t, ID_VK_CMD_COPY_IMAGE_TO_BUFFER, c"vkCmdCopyImageToBuffer", vk::PFN_vkCmdCopyImageToBuffer)(
-            cb,
-            vk::Image::from_raw(image),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            staging,
-            1,
-            &copy,
-        );
+        if !lazy {
+            vkfn!(t, ID_VK_CMD_COPY_IMAGE_TO_BUFFER, c"vkCmdCopyImageToBuffer", vk::PFN_vkCmdCopyImageToBuffer)(
+                cb,
+                vk::Image::from_raw(image),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging,
+                1,
+                &copy,
+            );
+        }
         if let Some(share) = share {
             // Its last contents are not kept; written whole, then handed to whichever process
             // reads it (`QUEUE_FAMILY_EXTERNAL`), in `GENERAL`, the layout the reader samples it in.
@@ -822,16 +833,26 @@ pub(crate) fn release(gpu: &Gpu, p: &Process, a: &[u64]) -> R<u64> {
     }
     drop(devices);
     // On its way: the region says which generation it will have, and the worker lands it.
-    let mut g = [0u8; 8];
-    let _ = shm.read_at(&mut g, CONTENT_GENERATION_AT);
-    let pending = u64::from_le_bytes(g).wrapping_add(1);
+    let pending = content.wrapping_add(1);
     // Which generation the share image will hold: this one, or none (not copied this time).
     if share.is_some() || has_share {
         super::share::write_generation(&shm, if share.is_some() { pending } else { 0 });
     }
     let _ = shm.write_at(&pending.to_le_bytes(), PENDING_GENERATION_AT);
+    // Whether the region will lack this frame (written before the landing bumps the generation,
+    // so a reader who waited for it sees the mark).
+    if has_share {
+        super::share::set_stale(&shm, if lazy { pending } else { 0 });
+    }
+    if lazy {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[gpu] region_lazy: releases skip the region copy while the composer shows the share image");
+        }
+    }
     *in_flight.busy.lock() = true;
-    let landing = Landing { table: Arc::clone(&t), device, fence, invalidate, staging_memory, mapped, bytes, shm, pixels_at, in_flight: Arc::clone(&in_flight), direct: direct.is_some() };
+    // Nothing to copy at landing when the copy went into the region itself or was skipped.
+    let landing = Landing { table: Arc::clone(&t), device, fence, invalidate, staging_memory, mapped, bytes, shm, pixels_at, in_flight: Arc::clone(&in_flight), direct: direct.is_some() || lazy };
     // `OMNI_ASYNC_RELEASE=0`: landed here, on the app's thread, as before (for comparison).
     static ASYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ASYNC.get_or_init(|| std::env::var("OMNI_ASYNC_RELEASE").as_deref() != Ok("0")) {
