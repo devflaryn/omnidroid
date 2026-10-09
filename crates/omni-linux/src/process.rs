@@ -155,6 +155,13 @@ pub fn scalar_fp_in_xmm_default() {
         if std::env::var_os("OMNI_JIT_FASTDISP").is_none() {
             let _ = omni_cpu::dynarmic::set_fast_dispatch_inline(true);
         }
+        // Shared fault-path stubs (dynarmic patch 0061, bit 1), on by default since the in-world
+        // A/B of 2026-10-09 (PS99 session s13: the two critical threads -2.0% / -2.9% CPU a frame,
+        // 7/8 pairs; translated code 21% smaller, 414 -> 327 B a block). Bit 2 (link tails) stays off:
+        // +17.5% on tiny linked blocks. `OMNI_JIT_COMPACT=0` or the lever `jit_compact=0` turns it off.
+        if std::env::var_os("OMNI_JIT_COMPACT").is_none() {
+            let _ = omni_cpu::dynarmic::set_compact_code(1);
+        }
     });
 }
 
