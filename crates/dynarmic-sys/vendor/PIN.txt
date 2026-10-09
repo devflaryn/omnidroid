@@ -55,6 +55,7 @@ dynarmic/
                and ../patches/0061-x64-compact-code.patch
                and ../patches/0062-x64-emit-observer.patch
                and ../patches/0063-x64-faster-emitter.patch
+               and ../patches/0064-x64-a-translated-target-s-link-head-beside-its-block.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

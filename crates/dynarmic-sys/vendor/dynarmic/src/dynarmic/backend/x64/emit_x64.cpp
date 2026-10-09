@@ -66,6 +66,26 @@ EmitX64::StoredBlock EmitX64::Store(const BlockDescriptor& b) const {
     return StoredBlock{static_cast<u32>(offset), b.size, b.first_link};
 }
 
+u32* EmitX64::HeadOf(u64 target, bool make) {
+    if (const auto it = block_descriptors.find(Key64{target}); it != block_descriptors.end()) {
+        if (it->second.head == NO_LINK && !make) {
+            return nullptr;
+        }
+        return &it.value().head;
+    }
+    if (make) {
+        return &link_heads.try_emplace(Key64{target}, NO_LINK).first.value();
+    }
+    const auto head = link_heads.find(Key64{target});
+    return head == link_heads.end() ? nullptr : &head.value();
+}
+
+void EmitX64::KeepHeadOf(const Key64& key, const StoredBlock& block) {
+    if (block.head != NO_LINK) {
+        link_heads.insert_or_assign(key, block.head);
+    }
+}
+
 EmitX64::BlockDescriptor EmitX64::Load(const StoredBlock& s) const {
     return BlockDescriptor{reinterpret_cast<CodePtr>(code.getCode() + s.entry), s.size, s.first_link};
 }
@@ -364,7 +384,14 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
     BlockDescriptor block_desc{entrypoint, static_cast<u32>(size)};
     // Omnidroid patch 0025: the block's link records, which EmitPendingSlots has just made.
     block_desc.first_link = std::exchange(pending_first_link, NO_LINK);
-    block_descriptors.insert({Key64{descriptor.Value()}, Store(block_desc)});
+    const auto [stored, inserted] = block_descriptors.insert({Key64{descriptor.Value()}, Store(block_desc)});
+    // Patch 0064: the links already waiting for this location move their head beside the block.
+    if (inserted) {
+        if (const auto waiting = link_heads.find(Key64{descriptor.Value()}); waiting != link_heads.end()) {
+            stored.value().head = waiting->second;
+            link_heads.erase(waiting);
+        }
+    }
     return block_desc;
 }
 
@@ -385,11 +412,11 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
         // loading the slot sees the old target or the new one, and both are code. Patch 0025:
         // they are the records listed from the target's head -- and a target nothing links to
         // has no entry, rather than one made here for every block emitted.
-        const auto head = link_heads.find(Key64{target_desc.Value()});
-        if (head == link_heads.end()) {
+        const u32* const head = HeadOf(target_desc.Value(), false);  // patch 0064
+        if (head == nullptr) {
             return;
         }
-        for (u32 i = head->second; i != NO_LINK; i = LinkAt(i).next) {
+        for (u32 i = *head; i != NO_LINK; i = LinkAt(i).next) {
             const LinkRecord& link = LinkAt(i);
             const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : LinkUnlinkedOf(link);
             std::atomic_ref<u64>{*LinkSlotOf(link)}.store(value, std::memory_order_release);
@@ -466,12 +493,12 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
         const u32 index = NextLinkSerial();
         const u64 target = pending.target.Value();
         LinkRecord record{target, offset_of(reinterpret_cast<u64>(slot)), offset_of(unlinked), NO_LINK, NO_LINK};
-        const auto [head, fresh] = link_heads.try_emplace(Key64{target}, index);
-        if (!fresh) {
-            record.next = head->second;
-            LinkAt(head->second).prev = index;
-            head.value() = index;
+        u32* const head = HeadOf(target, true);  // patch 0064
+        if (*head != NO_LINK) {
+            record.next = *head;
+            LinkAt(*head).prev = index;
         }
+        *head = index;
         link_records.push_back(record);
     }
     link_records.back().slot |= LAST_LINK_OF_BLOCK;
@@ -491,7 +518,9 @@ void EmitX64::ForgetOutgoingSlots(u32 first_link) {
         if (link.prev != NO_LINK) {
             LinkAt(link.prev).next = link.next;
         } else if (link.next != NO_LINK) {
-            link_heads[Key64{link.target}] = link.next;
+            *HeadOf(link.target, true) = link.next;  // patch 0064
+        } else if (const auto it = block_descriptors.find(Key64{link.target}); it != block_descriptors.end()) {
+            it.value().head = NO_LINK;
         } else {
             link_heads.erase(Key64{link.target});
         }
@@ -530,8 +559,8 @@ void EmitX64::TrimLinkRecords(u32 base) {
         // the head map is what tells).
         const LinkRecord& link = link_records[i];
         ASSERT(link.next == NO_LINK && link.prev == NO_LINK);
-        const auto head = link_heads.find(Key64{link.target});
-        ASSERT(head == link_heads.end() || head->second != link_base + i);
+        const u32* const head = HeadOf(link.target, false);
+        ASSERT(head == nullptr || *head != link_base + i);
     }
 #endif
     link_records.erase(link_records.begin(), link_records.begin() + dropped);
@@ -695,6 +724,7 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
         Unpatch(descriptor);
         if (shared_code) {
             ForgetOutgoingSlots(it->second.first_link);  // Omnidroid patches 0022, 0025
+            KeepHeadOf(it->first, it->second);           // patch 0064
         }
 
         block_descriptors.erase(it);

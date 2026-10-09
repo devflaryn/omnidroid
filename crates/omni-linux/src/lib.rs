@@ -4,6 +4,7 @@
 //! *kernel* instead, so the real AOSP `linker64` and `libc.so` run unmodified as guest code and
 //! load whatever `.so` any code asks for. Every syscall answers as Linux would; one this layer does
 //! not implement answers `-ENOSYS` and is recorded by name ([`syscall::Refusals`]).
+pub mod alloc_trace;
 pub mod apex;
 pub mod binder;
 pub mod boot_image;

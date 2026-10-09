@@ -571,3 +571,17 @@ That is emit 1.93× and translation 1.73× faster; wall time 51 → 30 µs a blo
 start (`b_hello_dex`, `dalvikvm64`, 67k blocks), emit went from 2.08 s to 1.12 s, the frontend
 from 0.67 s to 0.53 s, and the run from 3.9 s to 2.8 s.
 
+### 0064 — x64 shared cache: a translated target's link head beside its block
+
+x64, shared caches. `link_heads` mapped every link target to the newest link record naming it: in a
+world 784k targets in a 2^21-bucket table, 32 MiB beside a 24 MiB block map (`OMNI_MEM_TRACE`,
+2026-10-09). Nearly every target is a translated block, so its head now lives in the block's
+`StoredBlock` (12 -> 16 bytes, buckets 24 -> 28) and `link_heads` keeps only the targets with no
+translation yet: a block registered takes its waiting head from the map, a block forgotten
+(invalidated, evicted) gives it back. `EmitX64::HeadOf`/`KeepHeadOf`. MEASURED
+(`tests/shared_bookkeeping.rs`): the census 176 -> 152 bytes a block (block map 48 -> 56, link heads
+32 -> 0); in a world's game host ~-28 MiB, in the system's ~-10 MiB. Lookups (E-cores, 5 runs each,
+medians): the locked dispatcher lookup 115 -> 70 ns, threaded dispatch with FastDispatch off 30.0 ->
+28.0 ns/op. Verified: the dynarmic-sys suite, `a64_exec`/`hostile`/`host_fault` under
+`OD_TEST_SHARED_CACHE=1`, omni-cpu's exclusive/tbi/faults/thunk/lifecycle/exclusive_store_fault.
+

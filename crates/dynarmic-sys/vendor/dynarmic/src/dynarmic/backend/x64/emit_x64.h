@@ -151,8 +151,12 @@ public:
         u32 entry;
         u32 size;
         u32 first_link;
+        /// Omnidroid patch 0064: the newest link record whose target this block is (its list's
+        /// head), or NO_LINK. A translated target's head lives here, beside its block, and only an
+        /// untranslated target's in `link_heads`.
+        u32 head = 0xFFFF'FFFF;
     };
-    static_assert(sizeof(StoredBlock) == 12 && alignof(StoredBlock) == 4);
+    static_assert(sizeof(StoredBlock) == 16 && alignof(StoredBlock) == 4);
     StoredBlock Store(const BlockDescriptor& b) const;
     BlockDescriptor Load(const StoredBlock& s) const;
 
@@ -294,7 +298,15 @@ protected:
     LinkRecord& LinkAt(u32 serial) { return link_records[serial - link_base]; }
     const LinkRecord& LinkAt(u32 serial) const { return link_records[serial - link_base]; }
     /// Target location -> the newest record linking to it. A target with no live record has none.
+    /// Patch 0064: only targets with no translation (a link waiting for its target); a translated
+    /// target's head is in its block's StoredBlock. In a world 784k targets made this a 32 MiB
+    /// table beside the block map's 24; the block map grows 4 bytes a bucket instead.
     tsl::robin_map<Key64, u32, Key64Hash> link_heads;  // patch 0052: 16-byte buckets
+    /// Patch 0064: where `target`'s head is kept -- its block's, else `link_heads`' -- or null
+    /// when it has none (and `make` is false).
+    u32* HeadOf(u64 target, bool make);
+    /// Patch 0064: a block leaving the block map hands its head back to `link_heads`.
+    void KeepHeadOf(const Key64& key, const StoredBlock& block);
     /// Read only when a block is emitted or dropped, never on a lookup, so fuller than the maps'
     /// 0.5: robin-hood probing stays short at 0.75, and the array is half the size.
     static constexpr float LINK_HEADS_LOAD_FACTOR = 0.75f;

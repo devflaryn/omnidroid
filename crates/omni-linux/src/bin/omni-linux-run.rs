@@ -14,6 +14,12 @@ use omni_linux::{ExitStatus, Output, Process, SpawnConfig};
 #[global_allocator]
 static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// The system's heap, with `OMNI_ALLOC_TRACE_KB`'s trace of large blocks (`omni_linux::alloc_trace`;
+/// a relaxed load per allocation while off).
+#[cfg(not(feature = "mimalloc"))]
+#[global_allocator]
+static HEAP: omni_linux::alloc_trace::Tracing = omni_linux::alloc_trace::Tracing;
+
 fn main() -> ExitCode {
     // The host's descriptor limit, as high as it allows: the system's host process holds every
     // guest process's files and sockets, and Linux's default soft limit (1024) ran out on a boot
@@ -25,6 +31,7 @@ fn main() -> ExitCode {
     omni_linux::lever::start();
     omni_linux::proccpu::start();
     omni_linux::zero_reclaim::start();
+    omni_linux::alloc_trace::start();
     let mut args = std::env::args().skip(1);
     let mut sysroot = PathBuf::from("sysroot/aosp-35");
     let mut instance = std::env::temp_dir().join("omni-linux-run");
