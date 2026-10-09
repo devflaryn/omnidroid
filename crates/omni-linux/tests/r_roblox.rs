@@ -123,16 +123,13 @@ const IDLE_APPS: &[&str] = &[
     "com.android.cellbroadcastservice",
 ];
 
-/// The script that disables `IDLE_APPS` once the device is up (`OMNI_R_LEAN=0`: none).
+/// The script that disables `IDLE_APPS` once the device is up (`OMNI_R_LEAN=0`: none) -- in the
+/// background with `OMNI_R_FAST_SETUP=1`, joined after the install (`common::r_scripts`).
 fn lean_script() -> String {
     if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
         return String::new();
     }
-    format!(
-        "for a in {}; do r=$(cmd package disable-user --user 0 $a 2>&1); case \"$r\" in *disabled*) ;; *) echo \"[r] not disabled: $a: $r\";; esac; done; echo \"[r] idle apps disabled: {}\"; ",
-        IDLE_APPS.join(" "),
-        IDLE_APPS.len()
-    )
+    common::r_scripts::lean(IDLE_APPS, common::r_scripts::fast_setup())
 }
 
 /// The device is set up as a freely resizable one is: Developer options' "Force activities to be
@@ -158,11 +155,12 @@ const BOOTED: &str = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ 
 fn settings_script() -> String {
     format!(
         "settings put global device_provisioned 1; settings put secure user_setup_complete 1; \
-         settings put system screen_off_timeout 1800000; svc power stayon true; \
+         settings put system screen_off_timeout 1800000; {}\
          input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard; \
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
          {}{}",
+        common::r_scripts::stay_on(common::r_scripts::fast_setup()),
         resizable_script(),
         lean_script()
     )
@@ -274,7 +272,10 @@ fn the_apk_is_installed_started_and_draws() {
     // 4 cores), the app is stopped, the session cookie put in that store (`tools/plant_cookie.py`,
     // never printed), and the app started again -- as a device that had signed in starts it.
     let cookie = std::env::var_os("OMNI_R_COOKIE").map(PathBuf::from);
-    let sign_in = if cookie.is_some() {
+    // `OMNI_R_PLANT_FIRST=1`: the store made on the host now and put in the app's data before its
+    // first start (`common::r_scripts::plant`), instead of the dance below.
+    let plant_first = cookie.is_some() && common::r_scripts::plant_first();
+    let sign_in = if cookie.is_some() && !plant_first {
         "i=0; until [ -e /data/local/tmp/cookie-store ] || [ $i -ge 600 ]; do sleep 1; i=$((i+1)); done; sleep 10; \
          am force-stop com.roblox.client; echo \"[r] cookie-stop\"; \
          i=0; until [ -e /data/local/tmp/cookie-planted ] || [ $i -ge 180 ]; do sleep 1; i=$((i+1)); done; \
@@ -287,7 +288,8 @@ fn the_apk_is_installed_started_and_draws() {
     // `OMNI_R_PLACE=<id>`: once signed in, the place's deep link, as a link opened on a device.
     let join = place.as_deref().map_or_else(String::new, |id| {
         format!(
-            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep 45; {}",
+            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep {}; {}",
+            common::r_scripts::link_delay(),
             join_script(id, 90)
         )
     });
@@ -332,7 +334,13 @@ fn the_apk_is_installed_started_and_draws() {
     // `getInstallerPackageName`/`InstallSourceInfo` report it (e.g. `com.android.vending` for an
     // app whose anti-tamper checks it was installed from the Play Store).
     let installer = std::env::var("OMNI_R_INSTALLER").map_or_else(|_| String::new(), |p| format!(" -i {p}"));
-    let setup = |lean_after: &str| format!("{}pm install -r -g{installer} /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; {lean_after}{after_install}", settings_script());
+    let setup = |lean_after: &str| {
+        format!(
+            "{}pm install -r -g{installer} /data/local/tmp/app.apk; echo \"[r] pm install: $?\"; {}{lean_after}{after_install}",
+            settings_script(),
+            common::r_scripts::lean_wait(common::r_scripts::fast_setup() && !lean.is_empty())
+        )
+    };
     let resolve = "pkg=$(pm list packages -3 | head -1 | sed 's/^package://'); echo \"[r] package $pkg\"; \
                    act=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER \"$pkg\" | tail -1); echo \"[r] launcher $act\"; ";
     // The device's language: the account's (`OMNI_R_LOCALE`, default tr-TR -- the owner's accounts
@@ -386,6 +394,20 @@ fn the_apk_is_installed_started_and_draws() {
     } else {
         std::fs::create_dir_all(&tmp).expect("/data/local/tmp");
         std::fs::copy(&apk, tmp.join("app.apk")).expect("the APK");
+        if plant_first {
+            // The app's cookie store, made as its WebView makes it, holding the account's cookie.
+            let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/plant_cookie.py");
+            let python = if cfg!(windows) { "python" } else { "python3" };
+            let made = std::process::Command::new(python)
+                .arg(&tool)
+                .arg("--new")
+                .arg(tmp.join("cookies.db"))
+                .arg(cookie.as_deref().expect("a cookie file"))
+                .output()
+                .expect("python, for tools/plant_cookie.py");
+            assert!(made.status.success(), "the cookie store: {}", String::from_utf8_lossy(&made.stderr).trim());
+            eprintln!("[r] cookie store made, to be planted before the first start");
+        }
         if let Some(request) = &root_req {
             stage_root(&instance, request);
         }
@@ -403,7 +425,8 @@ fn the_apk_is_installed_started_and_draws() {
             format!("{join}{wait}{extra}")
         };
         let setup = setup(if saving { "" } else { &lean_after });
-        format!("{booted}{setup}{resolve}am start -W -n \"$act\"; echo \"[r] am start: $?\"; {sign_in}{rest}")
+        let planted = if plant_first { common::r_scripts::plant("/data/local/tmp/cookies.db") } else { String::new() };
+        format!("{booted}{setup}{resolve}{planted}am start -W -n \"$act\"; echo \"[r] am start: $?\"; {sign_in}{rest}")
     };
     let kept = instance.clone();
     let mut boot = common::boot::Boot::start(&sysroot, instance, &boot_args, &then);
