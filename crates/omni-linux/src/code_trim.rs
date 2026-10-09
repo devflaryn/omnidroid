@@ -123,11 +123,14 @@ pub mod age {
         if std::env::var("OMNI_CODE_AGE_SF").as_deref() == Ok("1") {
             SURFACEFLINGER.store(true, Ordering::Relaxed);
         }
-        if let Some(m) = std::env::var("OMNI_CODE_AGE").ok().and_then(|v| v.parse::<u64>().ok()) {
-            set_minutes(m);
-            if m != 0 {
-                eprintln!("[lever] OMNI_CODE_AGE: code_age={m} (keep {} MiB)", KEEP_MB.load(Ordering::Relaxed));
-            }
+        // Every 10 minutes by default since the in-world run of 2026-10-09 (PS99 session s10:
+        // system_server 118 -> 29 MiB of translations on the first pass (1.3 s of its CPU), 41 -> 26
+        // on the next (0.2 s); the system host's private working set ~1.12 -> ~1.0 GB with the table
+        // compaction). `OMNI_CODE_AGE=0` or the lever `code_age=0` turns it off.
+        let m = std::env::var("OMNI_CODE_AGE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10);
+        set_minutes(m);
+        if std::env::var_os("OMNI_CODE_AGE").is_some() && m != 0 {
+            eprintln!("[lever] OMNI_CODE_AGE: code_age={m} (keep {} MiB)", KEEP_MB.load(Ordering::Relaxed));
         }
         let _ = std::thread::Builder::new().name("omni-code-age".into()).spawn(|| {
             let mut last = Instant::now();
