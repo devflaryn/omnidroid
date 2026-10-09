@@ -56,9 +56,11 @@ public:
     static Value EmptyNZCVImmediateMarker();
 
     bool IsIdentity() const;
-    bool IsEmpty() const;
-    bool IsImmediate() const;
-    Type GetType() const;
+    // Omnidroid patch 0077: the common cases inline (an immediate is never an identity, and its
+    // type is its own); an instruction's value asks the instruction, as before.
+    bool IsEmpty() const { return type == Type::Void; }
+    bool IsImmediate() const { return type != Type::Opaque || IsImmediateInst(); }
+    Type GetType() const { return type != Type::Opaque ? type : GetTypeInst(); }
 
     Inst* GetInst() const;
     Inst* GetInstRecursive() const;
@@ -131,6 +133,9 @@ public:
     bool IsZero() const;
 
 private:
+    bool IsImmediateInst() const;
+    Type GetTypeInst() const;
+
     Type type;
 
     union {

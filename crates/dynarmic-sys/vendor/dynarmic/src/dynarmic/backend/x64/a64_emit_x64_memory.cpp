@@ -4,7 +4,9 @@
  */
 
 #include <array>
+#include <cstdlib>
 #include <initializer_list>
+#include <optional>
 #include <mutex>
 #include <tuple>
 #include <utility>
@@ -150,6 +152,279 @@ void A64EmitX64::GenMemory128Accessors() {
     PerfMapRegister(memory_exclusive_write_128, code.getCurr(), "a64_memory_exclusive_write_128");
 }
 
+namespace {
+
+// Omnidroid patch 0078: small fastmem fallbacks (`OMNI_JIT_SMALL_FALLBACKS`, on unless `0`).
+bool SmallFallbacks() {
+    static const bool on = [] {
+        const char* v = std::getenv("OMNI_JIT_SMALL_FALLBACKS");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+// A fallback body's frame. Its trampoline pushed `extra` operands after the block's call pushed the
+// return address; the body saves the caller-saved registers but `except` above them, aligned for
+// the call it makes (the parity of `ABI_PushRegistersAndAdjustStack`, counting those operands).
+struct BodyFrame {
+    std::vector<HostLoc> gprs;
+    std::vector<HostLoc> xmms;
+    size_t sub = 0;
+};
+
+BodyFrame BodyEnter(BlockOfCode& code, std::optional<HostLoc> except, size_t extra) {
+    BodyFrame f;
+    for (const HostLoc r : ABI_ALL_CALLER_SAVE) {
+        if (except && r == *except) {
+            continue;
+        }
+        if (HostLocIsGPR(r)) {
+            f.gprs.push_back(r);
+        } else if (HostLocIsXMM(r)) {
+            f.xmms.push_back(r);
+        }
+    }
+    // At entry rsp % 16 == (8 - 8 * extra) % 16; after the pushes, the subtraction makes it 0.
+    const size_t align = ((extra + f.gprs.size()) % 2 == 0) ? 8 : 0;
+    f.sub = align + f.xmms.size() * 16 + ABI_SHADOW_SPACE;
+    for (const HostLoc r : f.gprs) {
+        code.push(HostLocToReg64(r));
+    }
+    if (f.sub != 0) {
+        code.sub(code.rsp, static_cast<u32>(f.sub));
+    }
+    size_t off = ABI_SHADOW_SPACE;
+    for (const HostLoc r : f.xmms) {
+        if (code.HasHostFeature(HostFeature::AVX)) {
+            code.vmovaps(code.xword[code.rsp + off], HostLocToXmm(r));
+        } else {
+            code.movaps(code.xword[code.rsp + off], HostLocToXmm(r));
+        }
+        off += 16;
+    }
+    return f;
+}
+
+// The `i`th operand the trampoline pushed (0: the last pushed), from inside the body.
+Xbyak::Address PushedArg(BlockOfCode& code, const BodyFrame& f, size_t i) {
+    return code.qword[code.rsp + f.sub + 8 * f.gprs.size() + 8 * i];
+}
+
+void BodyLeave(BlockOfCode& code, const BodyFrame& f) {
+    size_t off = ABI_SHADOW_SPACE;
+    for (const HostLoc r : f.xmms) {
+        if (code.HasHostFeature(HostFeature::AVX)) {
+            code.vmovaps(HostLocToXmm(r), code.xword[code.rsp + off]);
+        } else {
+            code.movaps(HostLocToXmm(r), code.xword[code.rsp + off]);
+        }
+        off += 16;
+    }
+    if (f.sub != 0) {
+        code.add(code.rsp, static_cast<u32>(f.sub));
+    }
+    for (auto it = f.gprs.rbegin(); it != f.gprs.rend(); ++it) {
+        code.pop(HostLocToReg64(*it));
+    }
+}
+
+// Drop the trampoline's operands (flags left alone, as `lea` does) and return to the block.
+void BodyReturn(BlockOfCode& code, size_t extra) {
+    code.lea(code.rsp, code.ptr[code.rsp + 8 * extra]);
+    code.ret();
+}
+
+}  // namespace
+
+// **Omnidroid patch 0078: small fastmem fallbacks.** `GenFastmemFallbacks` made one whole thunk
+// per (ordered, size, address register, value register): ~6,000 of them, each saving and restoring
+// every caller-saved register -- about 1 MiB of code written into every code cache's prelude
+// (patch 0017 measured the prelude at ~1.1 MiB beyond the constant pool), in every guest process,
+// before its first block. Here each (ordered, size, address register, value register) is a
+// trampoline of a few bytes that pushes its operands and jumps to a body shared by every register
+// that is only an input: a read's body is per value register (its result), a write's and an
+// exclusive write's per size (128-bit ones per value register, which no push can move). The body
+// takes the operands from the stack. What each fallback does -- the registers it keeps, the
+// callback it calls with which arguments, the fences, the zero extension -- is unchanged.
+void A64EmitX64::GenSmallFastmemFallbacks() {
+    const std::array<std::pair<size_t, ArgCallback>, 4> read_callbacks{{
+        {8, UserCallback<&A64::UserCallbacks::MemoryRead8>()},
+        {16, UserCallback<&A64::UserCallbacks::MemoryRead16>()},
+        {32, UserCallback<&A64::UserCallbacks::MemoryRead32>()},
+        {64, UserCallback<&A64::UserCallbacks::MemoryRead64>()},
+    }};
+    const std::array<std::pair<size_t, ArgCallback>, 4> write_callbacks{{
+        {8, UserCallback<&A64::UserCallbacks::MemoryWrite8>()},
+        {16, UserCallback<&A64::UserCallbacks::MemoryWrite16>()},
+        {32, UserCallback<&A64::UserCallbacks::MemoryWrite32>()},
+        {64, UserCallback<&A64::UserCallbacks::MemoryWrite64>()},
+    }};
+    const std::array<std::pair<size_t, ArgCallback>, 4> exclusive_write_callbacks{{
+        {8, UserCallback<&A64::UserCallbacks::MemoryWriteExclusive8>()},
+        {16, UserCallback<&A64::UserCallbacks::MemoryWriteExclusive16>()},
+        {32, UserCallback<&A64::UserCallbacks::MemoryWriteExclusive32>()},
+        {64, UserCallback<&A64::UserCallbacks::MemoryWriteExclusive64>()},
+    }};
+    const auto usable = [](int idx) { return idx != 4 && idx != 15; };  // not rsp, not r15
+
+    for (bool ordered : {false, true}) {
+        // The bodies.
+        std::array<const void*, 16> read128{}, write128{}, exclusive128{};
+        std::array<std::array<const void*, 16>, 4> read{};
+        std::array<const void*, 4> write{}, exclusive{};
+        for (int value_idx = 0; value_idx < 16; value_idx++) {
+            code.align();
+            read128[value_idx] = code.getCurr();
+            {
+                const BodyFrame f = BodyEnter(code, HostLocXmmIdx(value_idx), 1);
+                code.mov(code.ABI_PARAM2, PushedArg(code, f, 0));
+                if (ordered) {
+                    code.mfence();
+                }
+                code.call(memory_read_128);
+                if (value_idx != 1) {
+                    code.movaps(Xbyak::Xmm{value_idx}, xmm1);
+                }
+                BodyLeave(code, f);
+                BodyReturn(code, 1);
+            }
+            PerfMapRegister(read128[value_idx], code.getCurr(), "a64_read_fallback_128");
+
+            code.align();
+            write128[value_idx] = code.getCurr();
+            {
+                const BodyFrame f = BodyEnter(code, std::nullopt, 1);
+                code.mov(code.ABI_PARAM2, PushedArg(code, f, 0));
+                if (value_idx != 1) {
+                    code.movaps(xmm1, Xbyak::Xmm{value_idx});
+                }
+                code.call(memory_write_128);
+                if (ordered) {
+                    code.mfence();
+                }
+                BodyLeave(code, f);
+                BodyReturn(code, 1);
+            }
+            PerfMapRegister(write128[value_idx], code.getCurr(), "a64_write_fallback_128");
+
+            code.align();
+            exclusive128[value_idx] = code.getCurr();
+            {
+                const BodyFrame f = BodyEnter(code, HostLoc::RAX, 1);
+                if (value_idx != 1) {
+                    code.movaps(xmm1, Xbyak::Xmm{value_idx});
+                }
+                if (code.HasHostFeature(HostFeature::SSE41)) {
+                    code.movq(xmm2, rax);
+                    code.pinsrq(xmm2, rdx, 1);
+                } else {
+                    code.movq(xmm2, rax);
+                    code.movq(xmm0, rdx);
+                    code.punpcklqdq(xmm2, xmm0);
+                }
+                code.mov(code.ABI_PARAM2, PushedArg(code, f, 0));
+                code.call(memory_exclusive_write_128);
+                BodyLeave(code, f);
+                BodyReturn(code, 1);
+            }
+            PerfMapRegister(exclusive128[value_idx], code.getCurr(), "a64_exclusive_write_fallback_128");
+
+            if (!usable(value_idx)) {
+                continue;
+            }
+            for (size_t i = 0; i < read_callbacks.size(); i++) {
+                const auto& [bitsize, callback] = read_callbacks[i];
+                code.align();
+                read[i][value_idx] = code.getCurr();
+                const BodyFrame f = BodyEnter(code, HostLocRegIdx(value_idx), 1);
+                code.mov(code.ABI_PARAM2, PushedArg(code, f, 0));
+                if (ordered) {
+                    code.mfence();
+                }
+                callback.EmitCall(code);
+                if (value_idx != code.ABI_RETURN.getIdx()) {
+                    code.mov(Xbyak::Reg64{value_idx}, code.ABI_RETURN);
+                }
+                BodyLeave(code, f);
+                code.ZeroExtendFrom(bitsize, Xbyak::Reg64{value_idx});
+                BodyReturn(code, 1);
+                PerfMapRegister(read[i][value_idx], code.getCurr(), fmt::format("a64_read_fallback_{}", bitsize));
+            }
+        }
+        for (size_t i = 0; i < write_callbacks.size(); i++) {
+            const auto& [bitsize, callback] = write_callbacks[i];
+            code.align();
+            write[i] = code.getCurr();
+            const BodyFrame f = BodyEnter(code, std::nullopt, 2);
+            code.mov(code.ABI_PARAM3, PushedArg(code, f, 1));
+            code.mov(code.ABI_PARAM2, PushedArg(code, f, 0));
+            code.ZeroExtendFrom(bitsize, code.ABI_PARAM3);
+            callback.EmitCall(code);
+            if (ordered) {
+                code.mfence();
+            }
+            BodyLeave(code, f);
+            BodyReturn(code, 2);
+            PerfMapRegister(write[i], code.getCurr(), fmt::format("a64_write_fallback_{}", bitsize));
+        }
+        for (size_t i = 0; i < exclusive_write_callbacks.size(); i++) {
+            const auto& [bitsize, callback] = exclusive_write_callbacks[i];
+            code.align();
+            exclusive[i] = code.getCurr();
+            const BodyFrame f = BodyEnter(code, HostLoc::RAX, 2);
+            code.mov(code.ABI_PARAM3, PushedArg(code, f, 1));
+            code.mov(code.ABI_PARAM2, PushedArg(code, f, 0));
+            code.ZeroExtendFrom(bitsize, code.ABI_PARAM3);
+            code.mov(code.ABI_PARAM4, rax);
+            code.ZeroExtendFrom(bitsize, code.ABI_PARAM4);
+            callback.EmitCall(code);
+            BodyLeave(code, f);
+            BodyReturn(code, 2);
+            PerfMapRegister(exclusive[i], code.getCurr(), fmt::format("a64_exclusive_write_fallback_{}", bitsize));
+        }
+
+        // The trampolines: the address (and a general value) pushed, the body jumped to.
+        code.align();
+        for (int vaddr_idx = 0; vaddr_idx < 16; vaddr_idx++) {
+            if (!usable(vaddr_idx)) {
+                continue;
+            }
+            const Xbyak::Reg64 vaddr{vaddr_idx};
+            for (int value_idx = 0; value_idx < 16; value_idx++) {
+                const auto key128 = std::make_tuple(ordered, 128, vaddr_idx, value_idx);
+                read_fallbacks[key128] = code.getCurr<void (*)()>();
+                code.push(vaddr);
+                code.jmp(read128[value_idx], Xbyak::CodeGenerator::T_NEAR);
+                write_fallbacks[key128] = code.getCurr<void (*)()>();
+                code.push(vaddr);
+                code.jmp(write128[value_idx], Xbyak::CodeGenerator::T_NEAR);
+                exclusive_write_fallbacks[key128] = code.getCurr<void (*)()>();
+                code.push(vaddr);
+                code.jmp(exclusive128[value_idx], Xbyak::CodeGenerator::T_NEAR);
+                if (!usable(value_idx)) {
+                    continue;
+                }
+                const Xbyak::Reg64 value{value_idx};
+                for (size_t i = 0; i < 4; i++) {
+                    const int bitsize = static_cast<int>(read_callbacks[i].first);
+                    const auto key = std::make_tuple(ordered, bitsize, vaddr_idx, value_idx);
+                    read_fallbacks[key] = code.getCurr<void (*)()>();
+                    code.push(vaddr);
+                    code.jmp(read[i][value_idx], Xbyak::CodeGenerator::T_NEAR);
+                    write_fallbacks[key] = code.getCurr<void (*)()>();
+                    code.push(value);
+                    code.push(vaddr);
+                    code.jmp(write[i], Xbyak::CodeGenerator::T_NEAR);
+                    exclusive_write_fallbacks[key] = code.getCurr<void (*)()>();
+                    code.push(value);
+                    code.push(vaddr);
+                    code.jmp(exclusive[i], Xbyak::CodeGenerator::T_NEAR);
+                }
+            }
+        }
+    }
+}
+
 void A64EmitX64::GenFastmemFallbacks() {
     // Omnidroid patch 0041: `rax` = a guest location (descriptor) to note; everything caller-saved kept.
     code.align();
@@ -185,6 +460,11 @@ void A64EmitX64::GenFastmemFallbacks() {
         code.mov(code.qword[code.r15 + offsetof(A64JitState, pc)], code.rax);
         code.ForceReturnFromRunCode();
         PerfMapRegister(memory_abort_check_thunk, code.getCurr(), "a64_memory_abort_check");
+    }
+
+    if (SmallFallbacks()) {  // patch 0078
+        GenSmallFastmemFallbacks();
+        return;
     }
 
     const std::initializer_list<int> idxes{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};

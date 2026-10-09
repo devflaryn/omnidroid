@@ -6,6 +6,8 @@
 #include "dynarmic/ir/opcodes.h"
 
 #include <array>
+#include <initializer_list>
+#include <stdexcept>
 #include <vector>
 
 #include "dynarmic/ir/type.h"
@@ -50,18 +52,41 @@ static const std::array opcode_info{
 #undef A64OPC
 };
 
+// A braced list, as `opcode_info`'s: some lines of `opcodes.inc` end their arguments with a comma.
+constexpr detail::OpcodeArgs MakeArgs(std::initializer_list<Type> types) {
+    detail::OpcodeArgs a{static_cast<std::uint8_t>(types.size()), {}};
+    size_t i = 0;
+    for (const Type t : types) {
+        a.types[i++] = t;
+    }
+    return a;
+}
+
+// Patch 0077: built at compile time from the same `opcodes.inc` as `opcode_info` (here, where the
+// argument types' short names are these constants rather than IR's value classes).
+constexpr std::array<detail::OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args_table{
+#define OPCODE(name, type, ...) MakeArgs({__VA_ARGS__}),
+#define A32OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
+#define A64OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
+#include "./opcodes.inc"
+#undef OPCODE
+#undef A32OPC
+#undef A64OPC
+};
+
 }  // namespace OpcodeInfo
+
+namespace detail {
+const std::array<OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args = OpcodeInfo::opcode_args_table;
+
+void ArgIndexOutOfRange(Opcode op, size_t arg_index) {
+    // What `std::vector::at` did before patch 0077.
+    throw std::out_of_range(fmt::format("argument {} of {}", arg_index, GetNameOf(op)));
+}
+}  // namespace detail
 
 Type GetTypeOf(Opcode op) {
     return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).type;
-}
-
-size_t GetNumArgsOf(Opcode op) {
-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).arg_types.size();
-}
-
-Type GetArgTypeOf(Opcode op, size_t arg_index) {
-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).arg_types.at(arg_index);
 }
 
 std::string GetNameOf(Opcode op) {

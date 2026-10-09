@@ -100,7 +100,16 @@ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const U
     if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
         Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
     }
-    Optimization::VerificationPass(ir_block);
+    // Omnidroid patch 0077: the IR's consistency check (argument types, use counts) only when
+    // asked for, `OMNI_JIT_VERIFY=1`: it asserts and changes nothing, and cost ~1.5% of first
+    // translation on every block of every process.
+    static const bool verify = [] {
+        const char* v = std::getenv("OMNI_JIT_VERIFY");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (verify) {
+        Optimization::VerificationPass(ir_block);
+    }
     return ir_block;
 }
 

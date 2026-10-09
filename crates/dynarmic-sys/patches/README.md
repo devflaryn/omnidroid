@@ -721,3 +721,43 @@ with 65,129 of 67,116 blocks verified. A snapshot is the last run's working set 
 like it re-enters most of it. The saving is the part a run does not enter, plus the share of every
 read-in page that holds no entered block. dalvikvm64's 2k-17k blocks translated on a reload vary
 from run to run the same way in either mode.
+
+### 0077 — IR: an opcode's arguments read inline; the verification pass on request
+
+Both backends' frontends (the IR is shared). A sampled profile of first translation on the i5-4460
+(Linux, `tests/code_size.rs`, a SIGPROF sampler) put ~8% of it in one-line accessors in other
+files: `GetNumArgsOf` and `GetArgTypeOf` (a `std::vector` read through `at()`, called by the
+always-on asserts of every `Inst::GetArg`/`SetArg`), `Inst::NumArgs`, `Value::IsImmediate`,
+`IsEmpty` and `GetType`. Now:
+
+- `opcode_args`, a table built at compile time from `opcodes.inc`, read by inline
+  `GetNumArgsOf`/`GetArgTypeOf` (an index past the arguments throws `std::out_of_range`, as `at()`
+  did); `Inst::NumArgs` inline.
+- `Value`'s accessors answer an immediate inline; an instruction's value asks it, as before
+  (`IsImmediateInst`, `GetTypeInst`).
+- x64: `VerificationPass` (argument types and use counts: it asserts and changes nothing) runs only
+  with `OMNI_JIT_VERIFY=1`. The arm64 backend's call is left as it was.
+
+MEASURED (`the_speed_of_emission`, 11,005 blocks, 9 passes, medians, i5-4460): frontend **7.60 ->
+4.85 us/block (-36%)**, of which the verification pass 1.6 us and the inlining 1.1 us; emit 16.25 ->
+~15.8; first translation 24.5 -> ~21.3 us/block. The emitted code is byte-identical
+(`tools/compare_emit_dumps.py`: 0 blocks differ against a second run of the base; base against
+base differs in the same 11 blocks' `jmp rel32` to code placed elsewhere, run to run).
+
+### 0078 — x64: small fastmem fallbacks (`OMNI_JIT_SMALL_FALLBACKS`, on unless `0`)
+
+x64. `GenFastmemFallbacks` wrote one whole thunk per (ordered, size, address register, value
+register) into every code cache's prelude -- ~6,000, each saving and restoring every caller-saved
+register: most of the ~1.1 MiB prelude 0017 measured, written (so resident) in every guest process
+before its first block, and the time to emit it at every process start. Now each of those keys is a
+trampoline of a few bytes (`push` the address -- and a general value -- then `jmp`) into a body
+shared by every register that is only an input: a read's body per value register (its result), a
+write's and an exclusive write's per size, the 128-bit ones per value register (an XMM cannot be
+pushed). The body saves what the thunk saved, with the stack's parity counted for the pushed
+operands, takes them from the stack, calls the same callback, and leaves with `lea rsp` (flags
+untouched) and `ret`. A host fault's faked call into the fallback enters the trampoline as before.
+
+MEASURED (Linux, System V: 25 caller-saved registers; one cache): **1,888,969 -> 114,836 bytes**
+of fallbacks (-94%); Windows (13 caller-saved) proportionally. The dynarmic-sys suite passes with it
+on (Linux; the snapshot tests fail there with it off as well: a load answers -10), and a test
+binary that makes many caches ran 0.49 -> 0.09 s.

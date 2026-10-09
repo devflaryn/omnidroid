@@ -281,6 +281,7 @@ protected:
     /// Omnidroid patch 0063: the general registers in allocation order, made once, not per block.
     std::vector<HostLoc> gpr_order_cache;
     void GenFastmemFallbacks();
+    void GenSmallFastmemFallbacks();  // Omnidroid patch 0078
 
     const void* terminal_handler_pop_rsb_hint;
 

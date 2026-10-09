@@ -10,6 +10,7 @@
 #include <mcl/container/intrusive_list.hpp>
 #include <mcl/stdint.hpp>
 
+#include "dynarmic/ir/opcodes.h"
 #include "dynarmic/ir/value.h"
 
 namespace Dynarmic::IR {
@@ -131,7 +132,7 @@ public:
     /// Get the type this instruction returns.
     Type GetType() const;
     /// Get the number of arguments this instruction has.
-    size_t NumArgs() const;
+    size_t NumArgs() const { return GetNumArgsOf(op); }  // patch 0077: inline
 
     Value GetArg(size_t index) const;
     void SetArg(size_t index, Value value);

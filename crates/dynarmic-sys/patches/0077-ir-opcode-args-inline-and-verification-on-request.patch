@@ -1,0 +1,228 @@
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index 71656a5..ef80908 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -100,7 +100,16 @@ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const U
+     if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
+         Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
+     }
+-    Optimization::VerificationPass(ir_block);
++    // Omnidroid patch 0077: the IR's consistency check (argument types, use counts) only when
++    // asked for, `OMNI_JIT_VERIFY=1`: it asserts and changes nothing, and cost ~1.5% of first
++    // translation on every block of every process.
++    static const bool verify = [] {
++        const char* v = std::getenv("OMNI_JIT_VERIFY");
++        return v != nullptr && v[0] == '1';
++    }();
++    if (verify) {
++        Optimization::VerificationPass(ir_block);
++    }
+     return ir_block;
+ }
+ 
+diff --git a/src/dynarmic/ir/microinstruction.cpp b/src/dynarmic/ir/microinstruction.cpp
+index 50af036..f714881 100644
+--- a/src/dynarmic/ir/microinstruction.cpp
++++ b/src/dynarmic/ir/microinstruction.cpp
+@@ -627,10 +627,6 @@ Type Inst::GetType() const {
+     return GetTypeOf(op);
+ }
+ 
+-size_t Inst::NumArgs() const {
+-    return GetNumArgsOf(op);
+-}
+-
+ Value Inst::GetArg(size_t index) const {
+     ASSERT_MSG(index < GetNumArgsOf(op), "Inst::GetArg: index {} >= number of arguments of {} ({})", index, op, GetNumArgsOf(op));
+     ASSERT_MSG(!args[index].IsEmpty() || GetArgTypeOf(op, index) == IR::Type::Opaque, "Inst::GetArg: index {} is empty", index, args[index].GetType());
+diff --git a/src/dynarmic/ir/microinstruction.h b/src/dynarmic/ir/microinstruction.h
+index 26b6b89..1ef26a2 100644
+--- a/src/dynarmic/ir/microinstruction.h
++++ b/src/dynarmic/ir/microinstruction.h
+@@ -10,6 +10,7 @@
+ #include <mcl/container/intrusive_list.hpp>
+ #include <mcl/stdint.hpp>
+ 
++#include "dynarmic/ir/opcodes.h"
+ #include "dynarmic/ir/value.h"
+ 
+ namespace Dynarmic::IR {
+@@ -131,7 +132,7 @@ public:
+     /// Get the type this instruction returns.
+     Type GetType() const;
+     /// Get the number of arguments this instruction has.
+-    size_t NumArgs() const;
++    size_t NumArgs() const { return GetNumArgsOf(op); }  // patch 0077: inline
+ 
+     Value GetArg(size_t index) const;
+     void SetArg(size_t index, Value value);
+diff --git a/src/dynarmic/ir/opcodes.cpp b/src/dynarmic/ir/opcodes.cpp
+index 88a52d4..6c5b56d 100644
+--- a/src/dynarmic/ir/opcodes.cpp
++++ b/src/dynarmic/ir/opcodes.cpp
+@@ -6,6 +6,8 @@
+ #include "dynarmic/ir/opcodes.h"
+ 
+ #include <array>
++#include <initializer_list>
++#include <stdexcept>
+ #include <vector>
+ 
+ #include "dynarmic/ir/type.h"
+@@ -50,18 +52,41 @@ static const std::array opcode_info{
+ #undef A64OPC
+ };
+ 
++// A braced list, as `opcode_info`'s: some lines of `opcodes.inc` end their arguments with a comma.
++constexpr detail::OpcodeArgs MakeArgs(std::initializer_list<Type> types) {
++    detail::OpcodeArgs a{static_cast<std::uint8_t>(types.size()), {}};
++    size_t i = 0;
++    for (const Type t : types) {
++        a.types[i++] = t;
++    }
++    return a;
++}
++
++// Patch 0077: built at compile time from the same `opcodes.inc` as `opcode_info` (here, where the
++// argument types' short names are these constants rather than IR's value classes).
++constexpr std::array<detail::OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args_table{
++#define OPCODE(name, type, ...) MakeArgs({__VA_ARGS__}),
++#define A32OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
++#define A64OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
++#include "./opcodes.inc"
++#undef OPCODE
++#undef A32OPC
++#undef A64OPC
++};
++
+ }  // namespace OpcodeInfo
+ 
+-Type GetTypeOf(Opcode op) {
+-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).type;
+-}
++namespace detail {
++const std::array<OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args = OpcodeInfo::opcode_args_table;
+ 
+-size_t GetNumArgsOf(Opcode op) {
+-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).arg_types.size();
++void ArgIndexOutOfRange(Opcode op, size_t arg_index) {
++    // What `std::vector::at` did before patch 0077.
++    throw std::out_of_range(fmt::format("argument {} of {}", arg_index, GetNameOf(op)));
+ }
++}  // namespace detail
+ 
+-Type GetArgTypeOf(Opcode op, size_t arg_index) {
+-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).arg_types.at(arg_index);
++Type GetTypeOf(Opcode op) {
++    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).type;
+ }
+ 
+ std::string GetNameOf(Opcode op) {
+diff --git a/src/dynarmic/ir/opcodes.h b/src/dynarmic/ir/opcodes.h
+index 404f4cd..31e2fd2 100644
+--- a/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/ir/opcodes.h
+@@ -5,6 +5,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <string>
+ 
+ #include <fmt/format.h>
+@@ -34,11 +35,32 @@ constexpr size_t OpcodeCount = static_cast<size_t>(Opcode::NUM_OPCODE);
+ /// Get return type of an opcode
+ Type GetTypeOf(Opcode op);
+ 
++namespace detail {
++/// Omnidroid patch 0077: an opcode's arguments, in a table the inline accessors below read --
++/// `GetNumArgsOf` and `GetArgTypeOf` were calls into another file reading a `std::vector` through
++/// `at()`, made several times for every argument every pass and the emitter read (the asserts of
++/// `Inst::GetArg` and `SetArg` alone).
++struct OpcodeArgs {
++    std::uint8_t count;
++    std::array<Type, 4> types;
++};
++extern const std::array<OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args;
++[[noreturn]] void ArgIndexOutOfRange(Opcode op, size_t arg_index);
++}  // namespace detail
++
+ /// Get the number of arguments an opcode accepts
+-size_t GetNumArgsOf(Opcode op);
++inline size_t GetNumArgsOf(Opcode op) {
++    return detail::opcode_args[static_cast<size_t>(op)].count;
++}
+ 
+ /// Get the required type of an argument of an opcode
+-Type GetArgTypeOf(Opcode op, size_t arg_index);
++inline Type GetArgTypeOf(Opcode op, size_t arg_index) {
++    const auto& a = detail::opcode_args[static_cast<size_t>(op)];
++    if (arg_index >= a.count) [[unlikely]] {
++        detail::ArgIndexOutOfRange(op, arg_index);
++    }
++    return a.types[arg_index];
++}
+ 
+ /// Get the name of an opcode.
+ std::string GetNameOf(Opcode op);
+diff --git a/src/dynarmic/ir/value.cpp b/src/dynarmic/ir/value.cpp
+index 20f94cb..c78de9f 100644
+--- a/src/dynarmic/ir/value.cpp
++++ b/src/dynarmic/ir/value.cpp
+@@ -91,22 +91,17 @@ bool Value::IsIdentity() const {
+     return false;
+ }
+ 
+-bool Value::IsImmediate() const {
++// Patch 0077: what `IsImmediate` and `GetType` were, for an instruction's value (`type` Opaque).
++bool Value::IsImmediateInst() const {
+     if (IsIdentity())
+         return inner.inst->GetArg(0).IsImmediate();
+-    return type != Type::Opaque;
+-}
+-
+-bool Value::IsEmpty() const {
+-    return type == Type::Void;
++    return false;
+ }
+ 
+-Type Value::GetType() const {
++Type Value::GetTypeInst() const {
+     if (IsIdentity())
+         return inner.inst->GetArg(0).GetType();
+-    if (type == Type::Opaque)
+-        return inner.inst->GetType();
+-    return type;
++    return inner.inst->GetType();
+ }
+ 
+ A32::Reg Value::GetA32RegRef() const {
+diff --git a/src/dynarmic/ir/value.h b/src/dynarmic/ir/value.h
+index 8f70110..cfa66f6 100644
+--- a/src/dynarmic/ir/value.h
++++ b/src/dynarmic/ir/value.h
+@@ -56,9 +56,11 @@ public:
+     static Value EmptyNZCVImmediateMarker();
+ 
+     bool IsIdentity() const;
+-    bool IsEmpty() const;
+-    bool IsImmediate() const;
+-    Type GetType() const;
++    // Omnidroid patch 0077: the common cases inline (an immediate is never an identity, and its
++    // type is its own); an instruction's value asks the instruction, as before.
++    bool IsEmpty() const { return type == Type::Void; }
++    bool IsImmediate() const { return type != Type::Opaque || IsImmediateInst(); }
++    Type GetType() const { return type != Type::Opaque ? type : GetTypeInst(); }
+ 
+     Inst* GetInst() const;
+     Inst* GetInstRecursive() const;
+@@ -131,6 +133,9 @@ public:
+     bool IsZero() const;
+ 
+ private:
++    bool IsImmediateInst() const;
++    Type GetTypeInst() const;
++
+     Type type;
+ 
+     union {

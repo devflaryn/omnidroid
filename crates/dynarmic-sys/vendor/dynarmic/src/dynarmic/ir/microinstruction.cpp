@@ -627,10 +627,6 @@ Type Inst::GetType() const {
     return GetTypeOf(op);
 }
 
-size_t Inst::NumArgs() const {
-    return GetNumArgsOf(op);
-}
-
 Value Inst::GetArg(size_t index) const {
     ASSERT_MSG(index < GetNumArgsOf(op), "Inst::GetArg: index {} >= number of arguments of {} ({})", index, op, GetNumArgsOf(op));
     ASSERT_MSG(!args[index].IsEmpty() || GetArgTypeOf(op, index) == IR::Type::Opaque, "Inst::GetArg: index {} is empty", index, args[index].GetType());

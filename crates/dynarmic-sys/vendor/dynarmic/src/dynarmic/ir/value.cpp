@@ -91,22 +91,17 @@ bool Value::IsIdentity() const {
     return false;
 }
 
-bool Value::IsImmediate() const {
+// Patch 0077: what `IsImmediate` and `GetType` were, for an instruction's value (`type` Opaque).
+bool Value::IsImmediateInst() const {
     if (IsIdentity())
         return inner.inst->GetArg(0).IsImmediate();
-    return type != Type::Opaque;
+    return false;
 }
 
-bool Value::IsEmpty() const {
-    return type == Type::Void;
-}
-
-Type Value::GetType() const {
+Type Value::GetTypeInst() const {
     if (IsIdentity())
         return inner.inst->GetArg(0).GetType();
-    if (type == Type::Opaque)
-        return inner.inst->GetType();
-    return type;
+    return inner.inst->GetType();
 }
 
 A32::Reg Value::GetA32RegRef() const {

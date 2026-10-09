@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <array>
 #include <string>
 
 #include <fmt/format.h>
@@ -34,11 +35,32 @@ constexpr size_t OpcodeCount = static_cast<size_t>(Opcode::NUM_OPCODE);
 /// Get return type of an opcode
 Type GetTypeOf(Opcode op);
 
+namespace detail {
+/// Omnidroid patch 0077: an opcode's arguments, in a table the inline accessors below read --
+/// `GetNumArgsOf` and `GetArgTypeOf` were calls into another file reading a `std::vector` through
+/// `at()`, made several times for every argument every pass and the emitter read (the asserts of
+/// `Inst::GetArg` and `SetArg` alone).
+struct OpcodeArgs {
+    std::uint8_t count;
+    std::array<Type, 4> types;
+};
+extern const std::array<OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args;
+[[noreturn]] void ArgIndexOutOfRange(Opcode op, size_t arg_index);
+}  // namespace detail
+
 /// Get the number of arguments an opcode accepts
-size_t GetNumArgsOf(Opcode op);
+inline size_t GetNumArgsOf(Opcode op) {
+    return detail::opcode_args[static_cast<size_t>(op)].count;
+}
 
 /// Get the required type of an argument of an opcode
-Type GetArgTypeOf(Opcode op, size_t arg_index);
+inline Type GetArgTypeOf(Opcode op, size_t arg_index) {
+    const auto& a = detail::opcode_args[static_cast<size_t>(op)];
+    if (arg_index >= a.count) [[unlikely]] {
+        detail::ArgIndexOutOfRange(op, arg_index);
+    }
+    return a.types[arg_index];
+}
 
 /// Get the name of an opcode.
 std::string GetNameOf(Opcode op);
