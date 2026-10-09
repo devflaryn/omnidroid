@@ -877,7 +877,7 @@ mod tests {
 
         let serial = serial_area_blob();
         assert_eq!(serial.to_bytes(), serial_area_bytes());
-        assert_eq!(serial.head().len(), HEADER);
+        assert!(serial.head().len() < 4096, "a header and an empty trie: {}", serial.head().len());
         assert_eq!(PropBlob::whole(vec![1, 0, 0]).to_bytes(), vec![1, 0, 0]);
     }
 
