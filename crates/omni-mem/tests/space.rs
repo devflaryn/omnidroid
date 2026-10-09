@@ -1833,3 +1833,96 @@ fn write_forced_into_an_unmapped_hole_is_refused() {
     let error = space.write_forced(space.base() + 0x40, b"nowhere").expect_err("a hole is not writable");
     assert!(matches!(error, MemError::NotMapped { .. }), "{error:?}");
 }
+
+/// **The range lookups agree with the whole space's, under churn.** `mapped_regions_overlapping`
+/// (what omni-linux's `munmap` uses) must give, clipped to its range, exactly what
+/// `mapped_regions()` clipped does; and a hinted map must land where a first fit over the free
+/// regions from the hint says -- the free-space search now starts at the hint instead of building
+/// every free run of the space. Hundreds of maps (hinted, of several sizes and alignments, two
+/// protections so neighbours do not merge) and partial unmaps, checked after each.
+#[test]
+fn range_lookups_agree_with_the_whole_space_under_churn() {
+    let s = space(64 * MIB);
+    let unit = s.page_size().max(64 * KIB);
+    let units = s.len() / unit;
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let clip = |regions: &[omni_mem::RegionInfo], a: usize, b: usize| -> Vec<(usize, usize, Protection, RegionKind)> {
+        regions
+            .iter()
+            .filter(|r| r.kind != RegionKind::Free)
+            .map(|r| (r.start.max(a), r.end().min(b), r.protection, r.kind.clone()))
+            .filter(|(x, y, _, _)| x < y)
+            .collect()
+    };
+    let mut live: Vec<(usize, usize)> = Vec::new();
+    let mut hinted = 0;
+    for step in 0..600 {
+        if live.is_empty() || next(3) != 0 {
+            let size = (1 + next(16)) * unit;
+            let align = unit << next(3);
+            let hint = s.base() + next(units) * unit;
+            // The expected address, from the whole space's regions before the map.
+            let regions = s.regions();
+            let free_at = |a: usize| regions.iter().any(|r| r.kind == RegionKind::Free && r.start <= a && a + size <= r.end());
+            let expected = if hint % align == 0 && hint + size <= s.end() && free_at(hint) {
+                Some(hint)
+            } else {
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                for r in regions.iter().filter(|r| r.kind == RegionKind::Free) {
+                    match runs.last_mut() {
+                        Some(last) if last.0 + last.1 == r.start => last.1 += r.len,
+                        _ => runs.push((r.start, r.len)),
+                    }
+                }
+                runs.iter().find_map(|&(rs, rl)| {
+                    let re = rs + rl;
+                    if re <= hint {
+                        return None;
+                    }
+                    let c = (rs.max(hint) + align - 1) & !(align - 1);
+                    (c >= rs && c < re && re - c >= size).then_some(c)
+                })
+            };
+            let protection = if next(2) == 0 { Protection::ReadWrite } else { Protection::Read };
+            match s.map_anonymous(Placement::Hint { address: hint, align }, size, protection, CommitPolicy::Lazy) {
+                Ok(at) => {
+                    if let Some(want) = expected {
+                        assert_eq!(at, want, "step {step}: hinted map of {size:#x} at {hint:#x} (align {align:#x})");
+                        hinted += 1;
+                    }
+                    live.push((at, size));
+                }
+                Err(e) => assert!(expected.is_none(), "step {step}: {e:?}, expected {expected:x?}"),
+            }
+        } else {
+            let (at, size) = live.swap_remove(next(live.len()));
+            let from = next(size / unit);
+            let len = (1 + next(size / unit - from)) * unit;
+            s.unmap(at + from * unit, len).expect("unmap part of a live mapping");
+            if from > 0 {
+                live.push((at, from * unit));
+            }
+            if from * unit + len < size {
+                live.push((at + from * unit + len, size - from * unit - len));
+            }
+        }
+        let all = s.mapped_regions();
+        for _ in 0..4 {
+            let a = s.base() + next(units) * unit;
+            let b = (a + (1 + next(64)) * unit).min(s.end());
+            assert_eq!(
+                clip(&s.mapped_regions_overlapping(a, b - a), a, b),
+                clip(&all, a, b),
+                "step {step}: regions overlapping {a:#x}..{b:#x}"
+            );
+        }
+        assert_tiles_the_space(&s);
+    }
+    assert!(hinted > 150, "maps were checked against the first fit ({hinted}; the rest wrapped or found no room)");
+}

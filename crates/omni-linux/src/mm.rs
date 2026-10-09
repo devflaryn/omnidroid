@@ -200,10 +200,21 @@ impl Mm {
     }
 
     /// Forget file mappings in `[addr, addr + len)`, splitting any that straddle an edge.
+    ///
+    /// File mappings never overlap (each is inserted over a range just mapped, after `forget`), so
+    /// the ones in the range are the one before `addr` if it reaches past it and those starting
+    /// inside: two lookups, not a walk of every mapping below `end` -- which an ART start's
+    /// thousands of `munmap`s each paid.
     fn forget(&self, addr: u64, len: u64) {
         let end = addr + len;
         let mut files = self.files.lock();
-        let hit: Vec<u64> = files.range(..end).filter(|(s, m)| *s + m.len > addr).map(|(s, _)| *s).collect();
+        let mut hit: Vec<u64> = Vec::new();
+        if let Some((s, m)) = files.range(..addr).next_back() {
+            if *s + m.len > addr {
+                hit.push(*s);
+            }
+        }
+        hit.extend(files.range(addr..end).map(|(s, _)| *s));
         for start in hit {
             let m = files.remove(&start).expect("present");
             if start < addr {
@@ -217,7 +228,9 @@ impl Mm {
 
     fn unmap_locked(&self, addr: u64, len: u64) -> Result<(), Errno> {
         let (start, end) = (addr as usize, (addr + len) as usize);
-        for r in self.space.mapped_regions() {
+        // The regions overlapping the range, from the space's index: not every region of the
+        // space built (and merged, and allocated) for every munmap. Clipped below, as before.
+        for r in self.space.mapped_regions_overlapping(start, end - start) {
             let (rs, re) = (r.start, r.start + r.len);
             let (s, e) = (rs.max(start), re.min(end));
             if s < e {
