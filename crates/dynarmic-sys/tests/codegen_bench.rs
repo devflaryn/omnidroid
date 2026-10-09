@@ -592,3 +592,55 @@ fn the_cost_of_calls_and_returns() {
     // SAFETY: as above.
     unsafe { dynarmic_sys::od_set_fast_dispatch_inline(0) };
 }
+
+/// **What patch 0061's compact code costs in speed.** The same shapes translated with the switch
+/// off and on, interleaved over rounds (the median of the per-round medians is printed). Compact
+/// code moves the abort check of a fastmem slow path to a shared thunk (never run unless a fault
+/// happens -- the arena never faults) and, on a shared cache, a link's budget-spent exit to its
+/// slot's tail (run once per slice). So what is measured is mostly the hot path's layout: blocks
+/// whose cold tails are shorter.
+///
+/// Run with `OD_TEST_SHARED_CACHE=1` for the link half.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_compact_code() {
+    const ROUNDS: usize = 15;
+    let shared = harness::every_vm_on_a_shared_cache();
+    println!("\n== compact code off vs on (n = {N} x {ROUNDS} rounds, {ITERATIONS} iterations, shared cache {shared}) ==");
+    let tiny = looped(|_| (0..8).flat_map(|i| [a64::add_imm(2 + i % 4, 2 + i % 4, 1), a64::b_cond(cond::NE, 1)]).collect(), &[]);
+    let mixed = looped(
+        |_| {
+            (0..4)
+                .flat_map(|i| [a64::ldr_imm(5, 1, 8 * i), a64::add_imm(5, 5, 1), a64::str_imm(5, 1, 8 * i), cmp(5, 0), a64::b_cond(cond::NE, 1)])
+                .collect()
+        },
+        &[],
+    );
+    let loads = looped(|_| (0..16).map(|i| a64::ldr_imm(5 + i % 4, 1, 8 * i)).collect(), &[]);
+    let stores = looped(|_| (0..16).map(|i| a64::str_imm(2 + i % 4, 1, 8 * i)).collect(), &[]);
+    let shapes: [(&str, &Vec<u32>); 4] =
+        [("8 two-insn blocks", &tiny), ("4 five-insn ld/st blocks", &mixed), ("16 LDRs in one block", &loads), ("16 STRs in one block", &stores)];
+    // Off, the fault-stub bit, the link-tail bit.
+    const BITS: [u32; 3] = [0, dynarmic_sys::OD_COMPACT_FAULT_STUBS, dynarmic_sys::OD_COMPACT_LINK_TAILS];
+    for (name, code) in shapes {
+        let mut ns = [const { Vec::new() }; 3];
+        for _ in 0..ROUNDS {
+            for (i, bits) in BITS.into_iter().enumerate() {
+                // SAFETY: stores one process-wide atomic; this binary runs its tests one at a time.
+                unsafe { dynarmic_sys::od_set_compact_code(bits) };
+                ns[i].push(ns_per_iteration(code, true));
+            }
+        }
+        let [off, stubs, tails] = ns.map(|mut v| {
+            v.sort_by(f64::total_cmp);
+            v[ROUNDS / 2]
+        });
+        println!(
+            "  {name:26}: off {off:7.3} ns/iter, fault stubs {stubs:7.3} ({:+.1}%), link tails {tails:7.3} ({:+.1}%)",
+            (stubs / off - 1.0) * 100.0,
+            (tails / off - 1.0) * 100.0
+        );
+    }
+    // SAFETY: as above.
+    unsafe { dynarmic_sys::od_set_compact_code(0) };
+}

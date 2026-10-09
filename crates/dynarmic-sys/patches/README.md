@@ -458,3 +458,44 @@ list searched after the first. Verified: `tests/shared_bookkeeping.rs` (fastmem 
 bytes each with the vectors' slack, the census 225 -> 214 bytes a one-site block), `host_fault.rs`,
 `a64_exec.rs`, `shared_cache.rs`.
 
+### 0060 — x64: a census of the emitted code
+
+x64. Process-wide relaxed counters of what `A64EmitX64::Emit` writes, by part of a block (entry
+padding, memory accesses, guest register reads/writes, NZCV, SetPC, other IR, the cycle
+subtraction, the terminal, deferred out-of-line code, link slots) and counts (blocks, IR and guest
+instructions, memory accesses, deferred emits); `od_codegen_census` / `od_codegen_census_reset`,
+names in `dynarmic_sys::CODEGEN_PARTS`. The code emitted does not change. Measured
+(`tests/code_size.rs`: bionic `libc.so` from the pinned sysroot, every function's first blocks, as
+omni-cpu configures the jit, shared cache, 0042 on; 4,855 blocks): **414 bytes a block, 67 a guest
+instruction**. Out-of-line code is 150 (36%: ~44 bytes for each of 3.4 memory accesses a block,
+the fault path's call and its inline memory-abort check). The terminal is 83 (20%), inline memory
+53, guest register traffic 48, other IR 51, slots 15, cycles 6, padding 4. `libhwui.so`: 405.
+
+### 0061 — x64: compact code (switch bits, off by default)
+
+x64. Two bits of `live_compact_code` (`od_set_compact_code`, `OMNI_JIT_COMPACT`, `omni-linux`'s
+`jit_compact=` lever) give the same behaviour in fewer bytes.
+
+**1, fault stubs.** A fastmem site's deferred slow path calls `fallback` only where a bounds check
+jumps to it; a host fault reaches the fallback by a faked call that returns to the resume point
+directly. The path then does `call memory_abort_check_thunk; dq guest_pc`. The thunk steps its
+return address over the data. On an abort it stores the PC and leaves `Run`, as the inline
+`EmitCheckMemoryAbort` did. `require_abort_handling` is now initialised: it was read uninitialised.
+
+**2, link tails.** A shared cache's `LinkBlock` leaves a spent budget through its slot's own tail
+(store the PC, enter the dispatcher, whose loop top makes the same checks). It no longer emits a
+second tail with a forced return.
+
+A32 is unchanged. Measured (`tests/code_size.rs` as for 0060): 414.3 bytes a block off, **327.4
+with 1** (-21%; out-of-line 150 -> 62, 44 -> 18 a memory access), 394.7 with 2, 307.8 with both
+(-26%). Speed (`tests/codegen_bench.rs::the_cost_of_compact_code`, 15 interleaved rounds): bit 1 is
+within noise (-4.4% .. +1.2%). Bit 2 is **+17.5%** on eight linked two-instruction blocks on a
+shared cache (layout, since the hot bytes are the same) and flat elsewhere.
+
+Verified: `tests/compact_code.rs`, on private and shared caches. A host fault resumes. A memory
+abort in the fallback stops at the load with nothing after it run, then re-executes the load.
+Budget-spent links in 5-tick slices count exactly. The bytes go down. Also run: the dynarmic-sys
+suite with `OD_TEST_COMPACT` on, per-thread and shared. With the switch defaulted on: omni-linux
+`a1_toybox`, `a4_threads`, `a5_signals`, `b_hello_dex` (ART; with `OMNI_BOOT_IMAGE_UNCOMPRESSED=0`,
+since that test's mapping-name check fails at HEAD either way) and `tbi_off`.
+

@@ -566,6 +566,18 @@ uint32_t od_set_tbi_unmasked(uint32_t on);
  * and are emitted masked since, in this process. 0 on arm64. */
 uint64_t od_tbi_sites_noted(void);
 
+/* Patch 0060 (x64 only): a census of the emitted code, process-wide: up to `n` counters into
+ * `out` in this order -- bytes of block-entry padding, memory accesses, guest register reads and
+ * writes, NZCV materialisation, SetPC, other IR, the cycle subtraction, the terminal, deferred
+ * (out-of-line) code, link slots; then counts of blocks, IR instructions, guest instructions, IR
+ * memory accesses, deferred emits. Returns how many counters there are (0 on arm64). */
+/* Patch 0061 (x64 only): bits that emit smaller code in blocks emitted from now on -- 1: a shared
+ * memory-abort check called from each fastmem site's slow path; 2: a shared cache's link leaving
+ * through its slot's tail. The same behaviour. Returns the bits in force; 0 on arm64. */
+uint32_t od_set_compact_code(uint32_t on);
+uint32_t od_codegen_census(uint64_t* out, uint32_t n);
+void od_codegen_census_reset(void);
+
 /* Patch 0042 (x64 only): non-zero emits the return-stack buffer's and the fast-dispatch table's
  * hit paths inside each RET/BR/BLR block, from the target still in a register, in blocks emitted
  * from now on. Returns the value in force; a no-op returning 0 on arm64. */

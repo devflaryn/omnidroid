@@ -441,6 +441,30 @@ pub fn set_fast_dispatch_inline(on: bool) -> bool {
     unsafe { dynarmic_sys::od_set_fast_dispatch_inline(u32::from(on)) != 0 }
 }
 
+/// **Smaller translated code** (patch 0061, x64): process-wide bits, for blocks emitted from now
+/// on; returns the bits in force (0 on arm64). The same behaviour either way.
+///
+/// - `1` (`dynarmic_sys::OD_COMPACT_FAULT_STUBS`): each fastmem site's out-of-line slow path calls
+///   one shared memory-abort check (the guest PC as 8 bytes of data) instead of carrying ~38 bytes
+///   of it, and keeps no call into its fallback where nothing but a host fault reaches it.
+/// - `2` (`OD_COMPACT_LINK_TAILS`): a shared cache's link leaves a spent budget through its slot's
+///   own tail instead of a second copy of it.
+///
+/// MEASURED (`dynarmic-sys/tests/code_size.rs`, shared cache, 0042 on, bionic `libc.so`'s first
+/// blocks: 4,855 blocks, 16,417 memory accesses): 414.3 bytes a block off, **327.4 with `1`**
+/// (-21%; out-of-line code 149.6 -> 61.9 a block, 44 -> 18 a memory access), 394.7 with `2`
+/// (terminals 82.9 -> 63.1), 307.8 with both (-26%). Speed (`codegen_bench.rs::the_cost_of_
+/// compact_code`, 15 interleaved rounds, E-cores): `1` within noise everywhere (-4.4% .. +1.2%
+/// shared, -3.1% .. +0.3% per-thread: the hot path's bytes do not change); `2` **+17.5%** on a
+/// loop of eight linked two-instruction blocks (shared cache; the same hot bytes, so layout), flat
+/// elsewhere -- so `1` is the one to try in a world. Off by default; `OMNI_JIT_COMPACT=<bits>`
+/// (announced by [`DynarmicOptions::with_environment`]) or `omni-linux`'s `jit_compact=<bits>`
+/// lever turns it on.
+pub fn set_compact_code(bits: u32) -> u32 {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_compact_code(bits) }
+}
+
 /// **Whether hot `libc.so` functions run a native host implementation** (patch: HLE), process-wide.
 /// With it on, a guest call to a registered [`DynarmicBackend::add_hle`] entry (`memcpy`,
 /// `memmove`, `memset`) runs host code -- args `X0`-`X2`, result `X0`, honouring guest faults --
@@ -673,6 +697,14 @@ impl DynarmicOptions {
                 if kept { "on" } else { "off" },
                 if on && !kept { ": not on this host's backend" } else { "" }
             ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_COMPACT") {
+            let bits = match value.trim() {
+                v @ ("0" | "1" | "2" | "3") => v.parse::<u32>().expect("a digit"),
+                other => panic!("OMNI_JIT_COMPACT={other:?} is not 0, 1, 2 or 3"),
+            };
+            let kept = set_compact_code(bits);
+            say(&format!("compact translated code {kept} (OMNI_JIT_COMPACT; 1 fault stubs, 2 link tails)"));
         }
         if let Ok(value) = std::env::var("OMNI_JIT_HLE") {
             let on = match value.trim() {

@@ -50,6 +50,33 @@ extern std::atomic<std::uint32_t> live_precise_get_set;
 /// when a block is emitted.
 extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
 
+/// Omnidroid patch 0060: a census of the code this backend emits, for a measurement: bytes by
+/// part of a block, and counts. Always kept (a few relaxed adds per emitted instruction, on a path
+/// that costs microseconds); `od_codegen_census` reads it.
+enum class CodegenPart : std::size_t {
+    Align,       ///< padding before a block's entry
+    Memory,      ///< inline code of guest memory accesses
+    GetSet,      ///< guest register reads and writes (JitState loads/stores)
+    Flags,       ///< NZCV materialisation (Get*FromOp, SetNZCV*, GetCFlag, GetNZCVRaw)
+    SetPc,       ///< A64SetPC
+    Other,       ///< every other IR instruction's code
+    Cycles,      ///< the cycle-budget subtraction
+    Terminal,    ///< the terminal (links, checks, inline dispatch) and its int3
+    Far,         ///< deferred (out-of-line) code: fault paths, NaN fix-ups, and its int3
+    Slots,       ///< shared cache link slots (patch 0022)
+    Blocks,      ///< blocks emitted (a count)
+    IrInsts,     ///< IR instructions emitted (a count)
+    GuestInsts,  ///< guest instructions covered (a count)
+    MemoryOps,   ///< IR memory accesses (a count)
+    Deferred,    ///< deferred emits (a count)
+    Count,
+};
+extern std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPart::Count)> codegen_census;
+/// Copy the census into `out` (at most `n` entries, in `CodegenPart` order); returns how many
+/// there are.
+std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n);
+void ResetCodegenCensus();
+
 struct A64EmitContext final : public EmitContext {
     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
 
@@ -285,6 +312,15 @@ protected:
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
+    /// Omnidroid patch 0061: whether a fastmem site's slow path calls the shared abort check.
+    bool CompactFaultStub() const {
+        return conf.check_halt_on_memory_access && memory_abort_check_thunk != nullptr
+            && (live_compact_code.load(std::memory_order_relaxed) & kCompactFaultStubs) != 0;
+    }
+    /// The guest PC a memory instruction's abort stores (as `EmitCheckMemoryAbort` does).
+    static u64 FaultStubPc(IR::Inst* inst) {
+        return A64::LocationDescriptor{IR::LocationDescriptor{inst->GetArg(0).GetU64()}}.PC();
+    }
     template<std::size_t bitsize, auto callback>
     void EmitMemoryRead(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>

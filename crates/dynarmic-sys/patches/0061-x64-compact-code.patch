@@ -1,0 +1,221 @@
+diff --git a/src/dynarmic/backend/x64/a32_emit_x64.h b/src/dynarmic/backend/x64/a32_emit_x64.h
+index 4fc84ce..9f0ac33 100644
+--- a/src/dynarmic/backend/x64/a32_emit_x64.h
++++ b/src/dynarmic/backend/x64/a32_emit_x64.h
+@@ -124,6 +124,9 @@ protected:
+ 
+     // Memory access helpers
+     void EmitCheckMemoryAbort(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
++    /// Omnidroid patch 0061: A32 keeps the inline abort check.
++    bool CompactFaultStub() const { return false; }
++    static u64 FaultStubPc(IR::Inst*) { return 0; }
+     template<std::size_t bitsize, auto callback>
+     void EmitMemoryRead(A32EmitContext& ctx, IR::Inst* inst);
+     template<std::size_t bitsize, auto callback>
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 3f267bb..39a0c86 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -1161,6 +1161,28 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
+         // than a `jg` that is rewritten when the target appears or goes. Same outcomes: linked,
+         // straight to the target; unlinked, the dispatcher; budget spent (or halt raised, without
+         // cycle counting), leave Run with the PC stored.
++        if ((live_compact_code.load(std::memory_order_relaxed) & kCompactLinkTails) != 0) {
++            // Omnidroid patch 0061: a spent budget (or a halt) leaves through the slot's own tail --
++            // store the PC, enter the dispatcher, whose loop top checks the same two things and
++            // returns -- instead of a second copy of that tail with a forced return: 22 bytes less a
++            // link, the same outcome. (Measured 9-18% slower on a loop of eight linked two-
++            // instruction blocks, though the hot path's bytes are the same: layout. Its own bit.)
++            auto tail = std::make_shared<Xbyak::Label>();
++            Xbyak::Label& slot = NewLinkSlot(terminal.next, 0, tail);
++            if (conf.enable_cycle_counting) {
++                code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
++                code.jng(*tail, code.T_NEAR);
++            } else {
++                code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
++                code.jne(*tail, code.T_NEAR);
++            }
++            code.jmp(qword[rip + slot]);
++            code.L(*tail);
++            code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
++            code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
++            code.jmp(code.GetReturnFromRunCodeAddress());
++            return;
++        }
+         Xbyak::Label exit;
+         if (conf.enable_cycle_counting) {
+             code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index f889def..f0e957d 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -312,6 +312,15 @@ protected:
+ 
+     // Memory access helpers
+     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
++    /// Omnidroid patch 0061: whether a fastmem site's slow path calls the shared abort check.
++    bool CompactFaultStub() const {
++        return conf.check_halt_on_memory_access && memory_abort_check_thunk != nullptr
++            && (live_compact_code.load(std::memory_order_relaxed) & kCompactFaultStubs) != 0;
++    }
++    /// The guest PC a memory instruction's abort stores (as `EmitCheckMemoryAbort` does).
++    static u64 FaultStubPc(IR::Inst* inst) {
++        return A64::LocationDescriptor{IR::LocationDescriptor{inst->GetArg(0).GetU64()}}.PC();
++    }
+     template<std::size_t bitsize, auto callback>
+     void EmitMemoryRead(A64EmitContext& ctx, IR::Inst* inst);
+     template<std::size_t bitsize, auto callback>
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 62246cc..ee24d01 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -33,6 +33,7 @@ using namespace Xbyak::util;
+ 
+ std::atomic<std::uint32_t> live_fastmem_mask_by_and{0};
+ std::atomic<std::uint32_t> live_fastmem_tbi_unmasked{0};
++std::atomic<std::uint32_t> live_compact_code{0};
+ 
+ // Omnidroid patch 0041.
+ std::atomic<std::uint64_t> tbi_sites_noted{0};
+@@ -165,6 +166,27 @@ void A64EmitX64::GenFastmemFallbacks() {
+     code.ret();
+     PerfMapRegister(tbi_note_thunk, code.getCurr(), "a64_tbi_note");
+ 
++    // Omnidroid patch 0061: the memory-abort check of a fastmem site's slow path, shared. Called
++    // right after the fallback, with the faulting instruction's guest PC as 8 bytes of data after
++    // the call: no abort -- step the return address over the data and return (flags only
++    // touched); an abort -- take the PC from the data, store it, leave Run, as
++    // `EmitCheckMemoryAbort` does inline (~38 bytes a site, against 5 + 8 here).
++    {
++        code.align();
++        memory_abort_check_thunk = code.getCurr<const void*>();
++        Xbyak::Label exit;
++        code.test(code.byte[code.r15 + offsetof(A64JitState, halt_reason)], static_cast<u8>(HaltReason::MemoryAbort));
++        code.jnz(exit);
++        code.add(code.qword[code.rsp], 8);
++        code.ret();
++        code.L(exit);
++        code.pop(code.rax);
++        code.mov(code.rax, code.qword[code.rax]);
++        code.mov(code.qword[code.r15 + offsetof(A64JitState, pc)], code.rax);
++        code.ForceReturnFromRunCode();
++        PerfMapRegister(memory_abort_check_thunk, code.getCurr(), "a64_memory_abort_check");
++    }
++
+     const std::initializer_list<int> idxes{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+     const std::array<std::pair<size_t, ArgCallback>, 4> read_callbacks{{
+         {8, UserCallback<&A64::UserCallbacks::MemoryRead8>()},
+diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
+index edb5f5a..c566fb3 100644
+--- a/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/backend/x64/emit_x64.h
+@@ -60,6 +60,14 @@ extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
+ /// read when a block is emitted.
+ extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
+ 
++/// Omnidroid patch 0061: bits that emit smaller code -- `kCompactFaultStubs`: a fastmem site's slow
++/// path calls one shared memory-abort check (the PC as data) instead of carrying ~38 bytes of its
++/// own; `kCompactLinkTails`: a shared cache's link leaves through its slot's own tail instead of a
++/// second copy of it. The same behaviour; process-wide, read when a block is emitted.
++extern std::atomic<std::uint32_t> live_compact_code;
++inline constexpr std::uint32_t kCompactFaultStubs = 1;
++inline constexpr std::uint32_t kCompactLinkTails = 2;
++
+ /// Omnidroid patch 0041: guest instructions (by A64 location descriptor, process-wide) that
+ /// accessed memory through a tagged address while the mask was off (`live_fastmem_tbi_unmasked`).
+ /// Such a site is emitted masked from then on; the rest stay unmasked. `NoteTbiTaggedSite` is
+@@ -132,6 +140,8 @@ protected:
+     /// Omnidroid patch 0041: notes `rax` (a guest location) with `NoteTbiTaggedSite`, every caller-saved
+     /// register kept. Emitted with the fastmem fallbacks (A64 only); null elsewhere.
+     const void* tbi_note_thunk = nullptr;
++    /// Omnidroid patch 0061: the shared memory-abort check (A64 only; null elsewhere).
++    const void* memory_abort_check_thunk = nullptr;
+ 
+     // Microinstruction emitters
+ #define OPCODE(name, type, ...) void Emit##name(EmitContext& ctx, IR::Inst* inst);
+diff --git a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 4d9937d..30c2617 100644
+--- a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -125,7 +125,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+ 
+     if (fastmem_marker) {
+         // Use fastmem
+-        bool require_abort_handling;
++        bool require_abort_handling = false;  // Omnidroid patch 0061: read below, so set (EmitFastmemVAddr only ever sets it true)
+         bool tbi_unmasked = false;
+         const u64 site = inst->GetArg(0).GetU64();
+         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
+@@ -133,9 +133,19 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
++            // Omnidroid patch 0061: the abort check as one call to a shared thunk, the PC as data.
++            // And the call into the fallback only where something jumps to `abort` (a bounds check):
++            // a host fault reaches the fallback by a faked call that returns to `resume` directly.
++            const bool compact = CompactFaultStub();
+             code.L(*abort);
+-            code.call(wrapped_fn);
++            if (!compact || require_abort_handling) {
++                code.call(wrapped_fn);
++            }
+             const auto resume = code.getCurr();
++            if (compact) {
++                code.call(memory_abort_check_thunk);
++                code.dq(FaultStubPc(inst));
++            }
+             if (tbi_unmasked) {
+                 EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
+             }
+@@ -143,7 +153,9 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+             RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
+                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
+ 
+-            EmitCheckMemoryAbort(ctx, inst, end.get());
++            if (!compact) {
++                EmitCheckMemoryAbort(ctx, inst, end.get());
++            }
+             code.jmp(*end, code.T_NEAR);
+         });
+     } else {
+@@ -212,7 +224,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+ 
+     if (fastmem_marker) {
+         // Use fastmem
+-        bool require_abort_handling;
++        bool require_abort_handling = false;  // Omnidroid patch 0061: read below, so set (EmitFastmemVAddr only ever sets it true)
+         bool tbi_unmasked = false;
+         const u64 site = inst->GetArg(0).GetU64();
+         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
+@@ -220,9 +232,19 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
++            // Omnidroid patch 0061: the abort check as one call to a shared thunk, the PC as data.
++            // And the call into the fallback only where something jumps to `abort` (a bounds check):
++            // a host fault reaches the fallback by a faked call that returns to `resume` directly.
++            const bool compact = CompactFaultStub();
+             code.L(*abort);
+-            code.call(wrapped_fn);
++            if (!compact || require_abort_handling) {
++                code.call(wrapped_fn);
++            }
+             const auto resume = code.getCurr();
++            if (compact) {
++                code.call(memory_abort_check_thunk);
++                code.dq(FaultStubPc(inst));
++            }
+             if (tbi_unmasked) {
+                 EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
+             }
+@@ -230,7 +252,9 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+             RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
+                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
+ 
+-            EmitCheckMemoryAbort(ctx, inst, end.get());
++            if (!compact) {
++                EmitCheckMemoryAbort(ctx, inst, end.get());
++            }
+             code.jmp(*end, code.T_NEAR);
+         });
+     } else {
