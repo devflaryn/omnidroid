@@ -145,6 +145,14 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
         return Ok(pid as u64);
     }
     let tpidr = t.clone_tpidr;
+    // A process that is itself one side of a live fork pair (a shell's background subshell, and the
+    // shell beside it) forks in its own view: the child runs in it until it executes a program, and
+    // the fork's restore writes this view's pages back. So the pair must not hand the memory to its
+    // other side meanwhile -- held from before the snapshot until the fork is done with the memory
+    // (`ForkPair::switch_to` waits). Without the hold, a switch in that window ran the child on in
+    // the other side's view and the restore wrote this side's pages over it: a crashed shell (a
+    // pointer of 0x80 bytes) and a smashed stack canary in its subshell, run r-2664, 2026-10-09.
+    let hold = p.mem.hold_for_fork();
     let frozen_at = std::time::Instant::now();
     parent.freeze_others(t.tid);
     p.mem.start_journal();
@@ -187,6 +195,9 @@ pub(crate) fn fork(p: &Process, t: &mut Task, flags: u64, a: [u64; 6]) -> SysRes
         pair.restore_parent(p);
         parent.thaw();
     }
+    // The memory is this process's own view again (or the child lives on beside it, in a view of
+    // its own): the outer pair may switch again.
+    drop(hold);
     // OMNI_FORK_TRACE=1: each fork, what it kept, and how long its parent stood still.
     if fork_trace() {
         eprintln!(
@@ -493,6 +504,10 @@ struct Pair {
     live: bool,
     /// The child executed a program or ended: the memory is the parent's for good.
     over: bool,
+    /// Forks of each side in flight (`GuestMem::hold_for_fork`): while a side has one, its view
+    /// stays in the address space -- its fork child is running in it.
+    parent_forks: u32,
+    child_forks: u32,
 }
 
 impl Pair {
@@ -501,6 +516,14 @@ impl Pair {
         match side {
             Side::Parent => self.parent_shelf.len(),
             Side::Child => self.child_shelf.len(),
+        }
+    }
+
+    /// The forks of `side` in flight.
+    fn forks(&mut self, side: Side) -> &mut u32 {
+        match side {
+            Side::Parent => &mut self.parent_forks,
+            Side::Child => &mut self.child_forks,
         }
     }
 }
@@ -515,13 +538,39 @@ impl crate::guest::Resident for Seat {
     fn ensure(&self) {
         self.pair.ensure(self.side);
     }
+
+    fn claim_fork(&self) -> bool {
+        loop {
+            self.pair.ensure(self.side);
+            let mut inner = self.pair.inner.lock();
+            if inner.over {
+                return false;
+            }
+            if inner.resident == self.side {
+                *inner.forks(self.side) += 1;
+                return true;
+            }
+        }
+    }
+
+    fn pair_key(&self) -> usize {
+        Arc::as_ptr(&self.pair) as usize
+    }
+
+    fn release_fork(&self) {
+        let mut inner = self.pair.inner.lock();
+        let forks = inner.forks(self.side);
+        *forks = forks.saturating_sub(1);
+        drop(inner);
+        self.pair.changed.notify_all();
+    }
 }
 
 impl ForkPair {
     fn new(image: Snapshot, parent: &Arc<Process>, child: &Arc<Process>) -> Arc<Self> {
         Arc::new(Self {
             image,
-            inner: Mutex::new(Pair { resident: Side::Child, parent_shelf: Vec::new(), child_shelf: Vec::new(), parent_wants: false, child_wants: false, live: false, over: false }),
+            inner: Mutex::new(Pair { resident: Side::Child, parent_shelf: Vec::new(), child_shelf: Vec::new(), parent_wants: false, child_wants: false, live: false, over: false, parent_forks: 0, child_forks: 0 }),
             changed: Condvar::new(),
             parent: Arc::downgrade(parent),
             child: Arc::downgrade(child),
@@ -579,9 +628,15 @@ impl ForkPair {
         inner.over = true;
         self.changed.notify_all();
         drop(inner);
+        // Only this pair's sides, and only if it ever shared: a vfork that ended as one (its child
+        // executed a program) attached nothing, and its parent may be a side of a live pair of its
+        // own -- unsharing it here cut it loose from that pair (its copies no longer waited for its
+        // turn, and its tasks, frozen at the next switch, never asked for the memory again: the
+        // shell of `( ... ) &` hung).
+        let key = std::ptr::from_ref(self) as usize;
         for side in [Side::Parent, Side::Child] {
             if let Some(p) = self.process(side) {
-                p.mem.unshare();
+                p.mem.unshare_from(key);
             }
         }
     }
@@ -601,7 +656,9 @@ impl ForkPair {
         {
             let _layout = losing.mem.layout().write();
             let mut inner = self.inner.lock();
-            if inner.over || inner.resident == to {
+            // A fork of the side that has the memory is running its child in it: not now (the
+            // pair's thread asks again once the fork is done).
+            if inner.over || inner.resident == to || *inner.forks(from) > 0 {
                 drop(inner);
                 losing.thaw();
                 return;
@@ -659,14 +716,17 @@ impl ForkPair {
         let mut idle_since: Option<std::time::Instant> = None;
         let mut child_since: Option<std::time::Instant> = None;
         loop {
-            let (over, resident, parent_wants, child_wants, live) = {
-                let inner = self.inner.lock();
-                (inner.over, inner.resident, inner.parent_wants, inner.child_wants, inner.live)
+            let (over, resident, parent_wants, child_wants, live, forking) = {
+                let mut inner = self.inner.lock();
+                let resident = inner.resident;
+                let forking = *inner.forks(resident) > 0;
+                (inner.over, inner.resident, inner.parent_wants, inner.child_wants, inner.live, forking)
             };
             if over {
                 return;
             }
-            let idle = self.idle(resident);
+            // A side whose fork child runs in its view is not idle, whatever its own tasks do.
+            let idle = !forking && self.idle(resident);
             if idle {
                 idle_since.get_or_insert_with(std::time::Instant::now);
             } else {
@@ -676,12 +736,12 @@ impl ForkPair {
             let settled = idle_since.is_some_and(|t| t.elapsed() >= still_for);
             let switch = match resident {
                 // The child wants in: let it, running parent or not.
-                Side::Parent if child_wants && self.process(Side::Child).is_some() => Some(Side::Child),
+                Side::Parent if child_wants && !forking && self.process(Side::Child).is_some() => Some(Side::Child),
                 // The child has stopped: the parent takes its memory back. Before the pair is live
                 // this is the first handover, and what makes it live.
                 Side::Child if settled && (parent_wants || !live) => Some(Side::Parent),
                 // A child that never blocks must not keep the memory from its parent for ever.
-                Side::Child if parent_wants && child_since.is_some_and(|t| t.elapsed() >= CHILD_TURN_AT_MOST) => Some(Side::Parent),
+                Side::Child if parent_wants && !forking && child_since.is_some_and(|t| t.elapsed() >= CHILD_TURN_AT_MOST) => Some(Side::Parent),
                 _ => None,
             };
             if let Some(to) = switch {
