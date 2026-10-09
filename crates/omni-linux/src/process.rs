@@ -104,8 +104,8 @@ pub struct Process {
 static ALL: Mutex<Vec<std::sync::Weak<Process>>> = Mutex::new(Vec::new());
 
 /// `OMNI_JIT_TBI=0|1`, read once (by `cpu_options`): whether Top Byte Ignore's mask is on the CPU's
-/// direct path from the start. 1, the default, is how every process has run: 56 address bits,
-/// mirrored, a `shl`/`shr` before each guest access. 0 is the `jit_tbi=0` lever from boot
+/// direct path from the start. 1 is how every process ran until 2026-10-09: 56 address bits,
+/// mirrored, a `shl`/`shr` before each guest access. 0, **the default now**, is the `jit_tbi=0` lever from boot
 /// (`omni_cpu::dynarmic::set_tbi_unmasked`, patches 0040/0041): accesses unmasked -- D4's
 /// identity, measured 15-25% faster on load/store loops (omni-cpu `the_cost_of_top_byte_ignore`)
 /// -- and a tagged one served through a host fault and the slow path (~2.4 us), its guest
@@ -116,18 +116,40 @@ static ALL: Mutex<Vec<std::sync::Weak<Process>>> = Mutex::new(Vec::new());
 #[must_use]
 pub fn tbi_direct_mask() -> bool {
     static MASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Unmasked by default since the in-world A/B of 2026-10-09 (PS99, session s4: fps 55.5/52.9/
+    // 57.9/59.3 -> 58.2/59.3/59.9/59.6 against the 60 Hz vsync, the game's host process -3.6..-7.5
+    // ms of CPU a frame). `OMNI_JIT_TBI=1` (or the lever `jit_tbi=1`) keeps the mask everywhere.
     *MASK.get_or_init(|| match std::env::var("OMNI_JIT_TBI").as_deref().map(str::trim) {
-        Ok("0") => {
+        Ok("0") | Err(_) => {
             let unmasked = omni_cpu::dynarmic::set_tbi_unmasked(true);
-            eprintln!(
-                "JIT SWITCH: Top Byte Ignore off the direct path (OMNI_JIT_TBI=0){}: a tagged guest access is served by the slow path and its site masked",
-                if unmasked { "" } else { " -- not on this host, which keeps the mask" }
-            );
+            if std::env::var_os("OMNI_JIT_TBI").is_some() || !unmasked {
+                eprintln!(
+                    "JIT SWITCH: Top Byte Ignore off the direct path (OMNI_JIT_TBI=0){}: a tagged guest access is served by the slow path and its site masked",
+                    if unmasked { "" } else { " -- not on this host, which keeps the mask" }
+                );
+            }
             !unmasked
         }
-        Ok("1") | Err(_) => true,
+        Ok("1") => {
+            eprintln!("JIT SWITCH: Top Byte Ignore masked on every direct access (OMNI_JIT_TBI=1)");
+            true
+        }
         Ok(other) => panic!("OMNI_JIT_TBI={other:?} is not 0 or 1"),
     })
+}
+
+/// Scalar floating point kept in XMM registers (dynarmic patch 0039, `omni_cpu::dynarmic::
+/// set_scalar_fp_in_xmm`) is **on by default** in every host process since the in-world A/Bs of
+/// 2026-10-09 (PS99, sessions s3 and s4: fps up in 7 of 10 pairs, median about +1.2; values
+/// bit-identical by `dynarmic-sys/tests/scalar_fp_xmm.rs`). `OMNI_JIT_SCALAR_FP_XMM=0` (read later,
+/// by `DynarmicOptions::with_environment`) or the lever `jit_fpxmm=0` turns it off.
+pub fn scalar_fp_in_xmm_default() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        if std::env::var_os("OMNI_JIT_SCALAR_FP_XMM").is_none() {
+            let _ = omni_cpu::dynarmic::set_scalar_fp_in_xmm(true);
+        }
+    });
 }
 
 /// The live processes of this host process.
@@ -768,6 +790,7 @@ impl Process {
         }
         // The live switch, set once from `OMNI_JIT_TBI` (the configuration keeps the mask's shape).
         let _ = tbi_direct_mask();
+        scalar_fp_in_xmm_default();
         options
     }
 

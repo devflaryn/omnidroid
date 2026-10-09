@@ -15,7 +15,7 @@
 //! - `jit_fpxmm=0|1`: scalar floating-point operands kept in XMM registers rather than copied
 //!   through a general register and back (patch 0039, `omni_cpu::dynarmic::set_scalar_fp_in_xmm`;
 //!   bit-identical values, ~2x on dependent `FADD`/`FMUL` chains), then every process's
-//!   translations are dropped. Off by default; `OMNI_JIT_SCALAR_FP_XMM=1` from the start.
+//!   translations are dropped. On by default in omni-linux (`process::scalar_fp_in_xmm_default`); `OMNI_JIT_SCALAR_FP_XMM=0` turns it off from the start.
 //! - `jit_tbiand=0|1`: Top Byte Ignore's mask on every direct guest access as one `and` against a
 //!   constant rather than a `shl`/`shr` pair (patch 0040, `omni_cpu::dynarmic::
 //!   set_fastmem_mask_by_and`; the same address), then every process's translations are dropped.
