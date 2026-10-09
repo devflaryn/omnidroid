@@ -1129,6 +1129,36 @@ impl Window {
                 DispatchMessageW(&raw const msg);
             }
         }
+        // **Then everything else queued for this thread** -- messages for its other windows (the
+        // IME's, a driver's hidden ones) and thread messages (`hwnd` null). `wait` wakes for ANY
+        // message in the thread's queue (`QS_ALLINPUT` with `MWMO_INPUTAVAILABLE`), so one left
+        // here made every wait return at once and the loop spin: measured 2026-10-09 in PS99, the
+        // system host's `omni-display-window` thread at 0.93 of a core (`OMNI_PROC_CPU`), half of
+        // it in `NtUserPeekMessage` and half in `NtUserMsgWaitForMultipleObjectsEx`. Dispatching
+        // another window's message still reaches its own window procedure and its own queue.
+        let mut others = 0u32;
+        loop {
+            // SAFETY: as above, with no window filter: any message of this thread.
+            let got = unsafe { PeekMessageW(&raw mut msg, core::ptr::null_mut(), 0, 0, PM_REMOVE) };
+            if got == 0 {
+                break;
+            }
+            others += 1;
+            // SAFETY: as above; a thread message (null `hwnd`) is dispatched to nothing.
+            unsafe {
+                TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
+            }
+        }
+        if others > 0 {
+            static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[window] the pump also drained {others} message(s) not for this window (last: message {:#x} for window {:#x})",
+                    msg.message, msg.hwnd as usize
+                );
+            }
+        }
         // SAFETY: `self.state` is live for as long as `self` is, and the pump above has returned,
         // so the window procedure is not running and holds no reference into it.
         let state = unsafe { &mut *self.state };

@@ -341,6 +341,9 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
         }
     };
     let (mut control_seen, mut control_read) = (0usize, Instant::now());
+    // How often this loop turns: a line every 30 s, so a pump that spins (a wait that returns at
+    // once) shows as thousands of turns a second instead of tens.
+    let (mut turns, mut turns_since) = (0u64, Instant::now());
     loop {
         // Woken by input, else when a coalesced move or a flood's next step is due.
         let mut wait = PUMP_WAIT;
@@ -348,6 +351,11 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
             wait = wait.min(due.saturating_duration_since(Instant::now()));
         }
         window.wait(wait);
+        turns += 1;
+        if turns_since.elapsed() >= Duration::from_secs(30) {
+            eprintln!("[window] pump: {:.0} turns/s", turns as f64 / turns_since.elapsed().as_secs_f64());
+            (turns, turns_since) = (0, Instant::now());
+        }
         let events: Vec<WindowEvent> = window.poll_events().collect();
         // A copy in the guest is shared with the host's clipboard only while a window is in use.
         crate::clipboard::window_focus(window.has_focus());
