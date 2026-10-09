@@ -54,10 +54,118 @@ EmitX64::~EmitX64() = default;
 
 std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescriptor descriptor) const {
     const auto iter = block_descriptors.find(Key64{descriptor});
-    if (iter == block_descriptors.end()) {
+    if (iter == block_descriptors.end() || (iter->second.size & UNVERIFIED_BLOCK) != 0) {
         return std::nullopt;
     }
     return Load(iter->second);
+}
+
+std::optional<std::pair<EmitX64::BlockDescriptor, bool>> EmitX64::GetAnyBlock(IR::LocationDescriptor location) const {
+    const auto iter = block_descriptors.find(Key64{location});
+    if (iter == block_descriptors.end()) {
+        return std::nullopt;
+    }
+    return std::make_pair(Load(iter->second), (iter->second.size & UNVERIFIED_BLOCK) == 0);
+}
+
+void EmitX64::SnapshotSlotsOf(u32 first_link, std::vector<SnapshotSlot>& out) const {
+    if (first_link == NO_LINK) {
+        return;
+    }
+    for (u32 i = first_link;; i++) {
+        const LinkRecord& link = LinkAt(i);
+        out.push_back(SnapshotSlot{link.slot & ~LAST_LINK_OF_BLOCK, link.unlinked, link.target});
+        if (link.slot & LAST_LINK_OF_BLOCK) {
+            break;
+        }
+    }
+}
+
+void EmitX64::SnapshotSitesIn(const u8* begin, const u8* end, std::vector<SnapshotSite>& out) const {
+    const u64 buffer = reinterpret_cast<u64>(code.getCode());
+    for (const FastmemSiteRun& run : fastmem_site_runs) {
+        if (begin < run.begin || begin >= run.end) {
+            continue;
+        }
+        const u64 base = reinterpret_cast<u64>(run.begin);
+        const u32 from = static_cast<u32>(reinterpret_cast<u64>(begin) - base);
+        const u32 to = static_cast<u32>(reinterpret_cast<u64>(end) - base);
+        auto it = std::lower_bound(run.sites.begin(), run.sites.end(), from, [](const FastmemSite& s, u32 o) { return s.site < o; });
+        auto w = std::lower_bound(run.wide.begin(), run.wide.end(), from, [](const WideFastmemSite& s, u32 o) { return s.site < o; });
+        // Merged in address order, as the run would answer for them.
+        for (;;) {
+            const bool have_compact = it != run.sites.end() && it->site < to;
+            const bool have_wide = w != run.wide.end() && w->site < to;
+            if (!have_compact && !have_wide) {
+                break;
+            }
+            if (have_compact && (!have_wide || it->site <= w->site)) {
+                const u64 site = base + it->site;
+                out.push_back(SnapshotSite{static_cast<u32>(site - buffer), static_cast<u32>(site + it->resume_delta - buffer),
+                                           static_cast<u32>(fastmem_callbacks[it->callback] - buffer)});
+                ++it;
+            } else {
+                out.push_back(SnapshotSite{static_cast<u32>(base + w->site - buffer), static_cast<u32>(base + w->resume - buffer),
+                                           static_cast<u32>(w->callback - buffer)});
+                ++w;
+            }
+        }
+        return;
+    }
+}
+
+void EmitX64::RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count) {
+    ASSERT(shared_code && (size & UNVERIFIED_BLOCK) == 0);
+    u8* const buffer = const_cast<u8*>(code.getCode());
+    u32 first = NO_LINK;
+    if (slot_count != 0) {
+        ASSERT(static_cast<u64>(NextLinkSerial()) + slot_count < NO_LINK);
+        first = NextLinkSerial();
+        for (size_t i = 0; i < slot_count; i++) {
+            const SnapshotSlot& s = slots[i];
+            // Unlinked, whatever it linked to when saved: nothing restored is entered unverified.
+            *reinterpret_cast<u64*>(buffer + s.slot) = reinterpret_cast<u64>(buffer + s.unlinked);
+            const u32 index = NextLinkSerial();
+            LinkRecord record{s.target, s.slot, s.unlinked, NO_LINK, NO_LINK};
+            const auto [head, fresh] = link_heads.try_emplace(Key64{s.target}, index);
+            if (!fresh) {
+                record.next = head->second;
+                LinkAt(head->second).prev = index;
+                head.value() = index;
+            }
+            link_records.push_back(record);
+        }
+        link_records.back().slot |= LAST_LINK_OF_BLOCK;
+    }
+    for (size_t i = 0; i < site_count; i++) {
+        const SnapshotSite& s = sites[i];
+        RecordSharedFastmemSite(reinterpret_cast<u64>(buffer + s.site), reinterpret_cast<u64>(buffer + s.resume), reinterpret_cast<u64>(buffer + s.callback));
+    }
+    CommitSharedFastmemSites();
+    block_descriptors.insert({Key64{location}, StoredBlock{entry, size | UNVERIFIED_BLOCK, first}});
+}
+
+void EmitX64::MarkVerified(IR::LocationDescriptor location) {
+    const auto iter = block_descriptors.find(Key64{location});
+    ASSERT(iter != block_descriptors.end() && (iter->second.size & UNVERIFIED_BLOCK) != 0);
+    StoredBlock stored = iter->second;
+    stored.size &= ~UNVERIFIED_BLOCK;
+    iter.value() = stored;
+    const BlockDescriptor block = Load(stored);
+    // Its own links: to the targets that are entered now.
+    if (stored.first_link != NO_LINK) {
+        for (u32 i = stored.first_link;; i++) {
+            const LinkRecord& link = LinkAt(i);
+            if (const auto target = GetBasicBlock(IR::LocationDescriptor{link.target})) {
+                std::atomic_ref<u64>{*LinkSlotOf(link)}.store(reinterpret_cast<u64>(target->entrypoint), std::memory_order_release);
+            }
+            if (link.slot & LAST_LINK_OF_BLOCK) {
+                break;
+            }
+        }
+    }
+    // And the links to it.
+    Patch(location, block.entrypoint);
 }
 
 EmitX64::StoredBlock EmitX64::Store(const BlockDescriptor& b) const {
@@ -67,7 +175,7 @@ EmitX64::StoredBlock EmitX64::Store(const BlockDescriptor& b) const {
 }
 
 EmitX64::BlockDescriptor EmitX64::Load(const StoredBlock& s) const {
-    return BlockDescriptor{reinterpret_cast<CodePtr>(code.getCode() + s.entry), s.size, s.first_link};
+    return BlockDescriptor{reinterpret_cast<CodePtr>(code.getCode() + s.entry), s.size & ~UNVERIFIED_BLOCK, s.first_link};  // patch 0070
 }
 
 void EmitX64::EmitVoid(EmitContext&, IR::Inst*) {
@@ -94,10 +202,8 @@ void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
 void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target) {
     using namespace Xbyak::util;
 
-    const auto iter = block_descriptors.find(Key64{target});
-    CodePtr target_code_ptr = iter != block_descriptors.end()
-                                ? Load(iter->second).entrypoint
-                                : code.GetReturnFromRunCodeAddress();
+    const auto block = GetBasicBlock(target);  // patch 0070: not an unverified one
+    CodePtr target_code_ptr = block ? block->entrypoint : code.GetReturnFromRunCodeAddress();
 
     code.mov(index_reg.cvt32(), dword[r15 + code.GetJitStateInfo().offsetof_rsb_ptr]);
 
@@ -458,10 +564,10 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
         u64* const slot = code.getCurr<u64*>();
         code.dq(0);
         const u64 unlinked = pending.tail ? reinterpret_cast<u64>(pending.tail->getAddress()) : pending.unlinked;
-        const auto iter = block_descriptors.find(Key64{pending.target});
+        const auto target_block = GetBasicBlock(pending.target);  // patch 0070: not an unverified one
         // Not yet published: no thread has been given this block, so a plain store is enough. The
         // block becomes reachable through the block map or another slot, both written after this.
-        *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(Load(iter->second).entrypoint) : unlinked;
+        *slot = target_block ? reinterpret_cast<u64>(target_block->entrypoint) : unlinked;
         // Patch 0025: the newest record heads its target's list.
         const u32 index = NextLinkSerial();
         const u64 target = pending.target.Value();

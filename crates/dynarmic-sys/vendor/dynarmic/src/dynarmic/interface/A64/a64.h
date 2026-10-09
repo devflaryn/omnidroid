@@ -189,6 +189,10 @@ public:
         std::uint64_t reclaim_attempts = 0;      ///< passes over the retired regions
         std::uint64_t committed_bytes = 0;       ///< code-cache bytes committed now, prelude included
         std::uint64_t attached = 0;              ///< Jits attached now
+        // Omnidroid patch 0070: translation snapshots.
+        std::uint64_t snapshot_blocks_restored = 0;  ///< blocks installed from a snapshot, unverified
+        std::uint64_t snapshot_blocks_verified = 0;  ///< of those, found unchanged when first looked up and entered
+        std::uint64_t snapshot_blocks_rejected = 0;  ///< of those, whose guest code had changed: dropped, translated again
     };
     Stats GetStats() const;
 
@@ -224,6 +228,23 @@ public:
     /// are live (the region being filled counts; at least one stays). Their blocks are forgotten
     /// and translated again if they run again. Same restriction. How many regions were retired.
     std::size_t EvictTo(std::size_t keep_bytes);
+
+    /// Omnidroid patch 0070: translation snapshots. `EnableSnapshots` makes the cache remember, for
+    /// every block it emits from now on, a hash of the guest code it was translated from (read
+    /// back through the translating thread's `MemoryReadCode`). `SaveSnapshot` writes every live
+    /// block that has one -- the regions' code bytes, each block's guest range and hash, link slots
+    /// and fastmem sites, the constant pool -- to `path`, tagged with `key` and with a hash of
+    /// everything that shapes the code (the prelude's bytes, the configuration, the live switches,
+    /// the host's features). Returns the blocks written, or a negative error; nothing is written
+    /// past `max_bytes`. Blocks restored from a snapshot and never entered since are written too
+    /// (with their stored hashes) when `include_unverified`. `LoadSnapshot`, on a cache that has emitted nothing yet, installs a
+    /// snapshot with the same key and shape at the same offsets: each block unverified, entered
+    /// only once a lookup has read its guest code again and found the same hash (a block whose
+    /// code differs is dropped and translated as usual). Returns the blocks installed, or a
+    /// negative error (the cache unchanged). Same restriction as InvalidateCacheRange.
+    void EnableSnapshots();
+    std::int64_t SaveSnapshot(const char* path, const char* key, std::uint64_t max_bytes, bool include_unverified = true);
+    std::int64_t LoadSnapshot(const char* path, const char* key);
 
     struct Impl;
     std::unique_ptr<Impl> impl;

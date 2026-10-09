@@ -159,8 +159,36 @@ public:
     explicit EmitX64(BlockOfCode& code);
     virtual ~EmitX64();
 
-    /// Looks up an emitted host block in the cache.
+    /// Looks up an emitted host block in the cache. (Patch 0070: not a restored block not yet
+    /// verified -- nothing may reach that but its verification.)
     std::optional<BlockDescriptor> GetBasicBlock(IR::LocationDescriptor descriptor) const;
+
+    // Omnidroid patch 0070, shared code cache only: translation snapshots. A block restored from a
+    // snapshot is in the block map with `UNVERIFIED_BLOCK` set in its stored size until the guest
+    // code it was translated from is found unchanged: GetBasicBlock does not return it, no link is
+    // made to it, and its own links are unlinked, so it is entered only once verified.
+    static constexpr u32 UNVERIFIED_BLOCK = 0x8000'0000;
+    struct SnapshotSlot {
+        u32 slot;      ///< offset from the code buffer's start
+        u32 unlinked;  ///< likewise
+        u64 target;    ///< the location it links to
+    };
+    struct SnapshotSite {
+        u32 site;      ///< offsets from the code buffer's start
+        u32 resume;
+        u32 callback;
+    };
+    /// The block at `location` -- verified or not, and which.
+    std::optional<std::pair<BlockDescriptor, bool>> GetAnyBlock(IR::LocationDescriptor location) const;
+    /// A block's link slots, from its first record.
+    void SnapshotSlotsOf(u32 first_link, std::vector<SnapshotSlot>& out) const;
+    /// The fastmem sites recorded inside `[begin, end)`, ascending.
+    void SnapshotSitesIn(const u8* begin, const u8* end, std::vector<SnapshotSite>& out) const;
+    /// Install a block restored from a snapshot, unverified: its code is already in place at
+    /// `entry` (an offset); its slots are written unlinked and recorded, its sites recorded.
+    void RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count);
+    /// A restored block found unchanged: entered from now on, linked to and from.
+    void MarkVerified(IR::LocationDescriptor location);
 
     /// Empties the entire cache.
     virtual void ClearCache();

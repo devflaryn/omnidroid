@@ -257,7 +257,7 @@ unsafe extern "C" fn dump_block(ctx: *mut std::ffi::c_void, guest_pc: u64, host:
     // `code_bytes` reads (the block just emitted).
     let (dump, code) = unsafe { (&mut *(ctx as *mut Dump), std::slice::from_raw_parts(host as *const u8, code_bytes)) };
     let hex: String = code.iter().map(|b| format!("{b:02x}")).collect();
-    let _ = writeln!(dump.out, "{guest_pc:x} {total_bytes} {hex}");
+    let _ = writeln!(dump.out, "{guest_pc:x} {total_bytes} {hex} {:x}", host as usize);
 }
 
 /// **How fast the emitter is, on real code -- and what it emits, for a differential check.** The
@@ -288,15 +288,25 @@ fn the_speed_of_emission() {
     ];
     let mut dump = std::env::var_os("OMNI_EMIT_DUMP")
         .map(|p| Box::new(Dump { out: std::io::BufWriter::new(std::fs::File::create(p).expect("the dump file")) }));
+    let mut dump2 = std::env::var_os("OMNI_EMIT_DUMP2")
+        .map(|p| Box::new(Dump { out: std::io::BufWriter::new(std::fs::File::create(p).expect("the second dump file")) }));
     let (mut frontend, mut emit, mut wall) = (Vec::new(), Vec::new(), Vec::new());
     let mut blocks = 0;
     for pass in 0..passes {
-        if pass == 0 {
-            if let Some(d) = dump.as_mut() {
-                let ctx: *mut Dump = &mut **d;
-                // SAFETY: `dump` outlives the observer, which is removed below; one thread emits.
-                unsafe { dynarmic_sys::od_set_emit_observer(Some(dump_block), ctx.cast()) };
-            }
+        // `OMNI_EMIT_DUMP2` dumps the second pass too: the same blocks emitted into another cache
+        // (another address, another monitor), for what in the code depends on either.
+        // With a second dump, keep a cache (and a monitor) alive through the second pass where the
+        // first pass's were, so the second pass's land elsewhere.
+        let _blocker = (pass == 1 && dump2.is_some()).then(|| Vm::new(vec![harness::a64::svc(0)], VmOptions::default()));
+        let this_dump = match pass {
+            0 => dump.as_mut(),
+            1 => dump2.as_mut(),
+            _ => None,
+        };
+        if let Some(d) = this_dump {
+            let ctx: *mut Dump = &mut **d;
+            // SAFETY: the dump outlives the observer, which is removed below; one thread emits.
+            unsafe { dynarmic_sys::od_set_emit_observer(Some(dump_block), ctx.cast()) };
         }
         let (mut t, mut e, mut w, mut b) = (0u64, 0u64, 0f64, 0u64);
         for lib in libs {
@@ -317,6 +327,7 @@ fn the_speed_of_emission() {
         wall.push(w * 1e6 / b as f64);
     }
     drop(dump);
+    drop(dump2);
     let median = |v: &mut Vec<f64>| {
         v.sort_by(f64::total_cmp);
         v[v.len() / 2]
@@ -328,4 +339,125 @@ fn the_speed_of_emission() {
         median(&mut emit),
         median(&mut wall),
     );
+}
+
+/// One pass of a library's functions (as [`translate_library_with`]) on `cache`, with the guest
+/// data arena `arena` (zeroed first): a hash of every register file and PC after every run, and of
+/// the arena after the pass -- what the guest can see.
+#[cfg(target_arch = "x86_64")]
+fn guest_visible_pass(code: &[u32], vaddr: u64, len: u64, funcs: &[u64], opts: VmOptions, arena: &mut [u64]) -> u64 {
+    arena.fill(0);
+    let vm = Vm::new(code.to_vec(), opts);
+    let mut h = 0xCBF2_9CE4_8422_2325u64;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100_0000_01B3);
+    };
+    for &f in funcs {
+        vm.set_pc(CODE_BASE + (f - vaddr));
+        for _ in 0..4 {
+            vm.with_ctx(|c| {
+                c.ticks_remaining = 1;
+                c.ticks_used = 0;
+            });
+            let hr = vm.run();
+            mix(u64::from(hr));
+            mix(vm.pc());
+            for r in 0..31 {
+                mix(vm.reg(r));
+            }
+            if hr != 0 {
+                // SAFETY: the jit is live and not executing.
+                unsafe { od_jit_clear_halt(vm.raw(), hr) };
+                break;
+            }
+            let pc = vm.pc();
+            if pc < CODE_BASE || pc >= CODE_BASE + len {
+                break;
+            }
+        }
+    }
+    drop(vm);
+    for &w in arena.iter() {
+        mix(w);
+    }
+    h
+}
+
+/// **A snapshot of real code runs it the same** (patch 0070): bionic `libc.so`'s functions' first
+/// blocks, translated on a shared cache with snapshots on and saved; then, on a second cache at
+/// another address, loaded and run again. Every register file, PC and the data arena are the same
+/// as the first pass's; nothing is translated; every block run was restored and verified.
+/// Skipped without a sysroot (`OMNI_SYSROOT`).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_snapshot_of_real_code_runs_it_the_same() {
+    use dynarmic_sys::{od_code_cache_enable_snapshots, od_code_cache_free, od_code_cache_load_snapshot, od_code_cache_save_snapshot, od_monitor_free, od_monitor_new};
+    use harness::{MEM_GUARD, MEM_SIZE};
+    let lib = "/apex/com.android.runtime/lib64/bionic/libc.so";
+    let Some(path) = sysroot_file(lib) else {
+        println!("no sysroot (OMNI_SYSROOT): skipped");
+        return;
+    };
+    let elf = std::fs::read(path).expect("libc.so");
+    let ((off, vaddr, len), funcs) = text_and_functions(&elf);
+    let code: Vec<u32> = elf[off as usize..(off + len) as usize].chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    let mut arena = vec![0u64; (MEM_SIZE + MEM_GUARD) / 8];
+    let file = std::env::temp_dir().join(format!("od-snapshot-libc-{}", std::process::id()));
+    let snapshot = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+    let key = std::ffi::CString::new("libc corpus").unwrap();
+    let cache_and_opts = |arena: *mut u64| {
+        // SAFETY: freed by the caller after the Vm.
+        let monitor = unsafe { od_monitor_new(1) };
+        let base = VmOptions {
+            cycle_counting: true,
+            check_halt_on_memory_access: true,
+            fastmem_exclusive: true,
+            optimizations: optimization::INTERRUPTIBLE | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
+            shared_monitor: monitor as usize,
+            shared_arena: arena as usize,
+            ..VmOptions::default()
+        };
+        let cache = Vm::new_code_cache(&base, monitor, arena, 256 << 20, 32 << 20, 0);
+        assert!(!cache.is_null());
+        (cache, monitor, VmOptions { shared_cache: cache as usize, ..base })
+    };
+    let stats = |cache| {
+        let mut s = OdCodeCacheStats::default();
+        // SAFETY: a live cache.
+        unsafe { od_code_cache_stats_of(cache, &mut s) };
+        s
+    };
+
+    let (first, monitor, opts) = cache_and_opts(arena.as_mut_ptr());
+    // SAFETY: a fresh cache.
+    unsafe { od_code_cache_enable_snapshots(first) };
+    eprintln!("snapshot test: the first pass");
+    let fresh = guest_visible_pass(&code, vaddr, len, &funcs, opts, &mut arena);
+    let emitted = stats(first).blocks_emitted;
+    // SAFETY: no jit runs on it.
+    let saved = unsafe { od_code_cache_save_snapshot(first, snapshot.as_ptr(), key.as_ptr(), u64::MAX, 0) };
+    assert!(saved > 0 && saved as u64 <= emitted, "saved {saved} of {emitted}");
+
+    // A second cache, the first still alive: elsewhere in memory.
+    let (second, monitor2, opts2) = cache_and_opts(arena.as_mut_ptr());
+    // SAFETY: a fresh cache.
+    let loaded = unsafe { od_code_cache_load_snapshot(second, snapshot.as_ptr(), key.as_ptr()) };
+    assert_eq!(loaded, saved);
+    eprintln!("snapshot test: the restored pass ({loaded} blocks)");
+    let restored = guest_visible_pass(&code, vaddr, len, &funcs, opts2, &mut arena);
+    let s = stats(second);
+    println!("{emitted} blocks emitted, {saved} saved; restored run: {s:?}");
+    assert_eq!(restored, fresh, "what the guest saw differs from the first pass");
+    assert_eq!(s.blocks_emitted, emitted - saved as u64, "only what was not saved was translated: {s:?}");
+    assert_eq!(s.snapshot_blocks_verified, saved as u64, "{s:?}");
+    assert_eq!(s.snapshot_blocks_rejected, 0, "{s:?}");
+    // SAFETY: the Vms are gone.
+    unsafe {
+        od_code_cache_free(second);
+        od_monitor_free(monitor2);
+        od_code_cache_free(first);
+        od_monitor_free(monitor);
+    }
+    let _ = std::fs::remove_file(&file);
 }

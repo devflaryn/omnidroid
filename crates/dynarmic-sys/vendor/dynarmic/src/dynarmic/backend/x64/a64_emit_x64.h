@@ -134,6 +134,13 @@ public:
     size_t ForgetRegionBlocks(const void* begin, const void* end, u32 first_range, u32 end_range, std::vector<u64>& forgotten);
     /// Patch 0028: the serial of the next guest range registered -- one per emitted block.
     u32 NextRangeSerial() const { return range_base + static_cast<u32>(guest_ranges.size()); }
+    /// Omnidroid patch 0070: every guest range, in serial (emission) order: location, first byte,
+    /// length -- a block emitted again has a newer one.
+    void SnapshotRanges(std::vector<std::tuple<u64, u64, u32>>& out) const;
+    /// Omnidroid patch 0070: register a restored block's range, as its emission did.
+    void RestoreGuestRange(IR::LocationDescriptor location, u64 first, u32 span) {
+        AddGuestRange(location, first, span == 0 ? first - 1 : first + span - 1);
+    }
     /// Patch 0028: drop the guest ranges below serial `base` (with their page-index entries):
     /// every one names a block forgotten with the region it was emitted into.
     void TrimGuestRanges(u32 base);

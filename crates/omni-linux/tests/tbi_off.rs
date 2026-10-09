@@ -44,7 +44,10 @@ fn real_programs_run_with_tbi_off_the_direct_path() {
          {} guest instructions learned the mask",
         omni_cpu::dynarmic::tbi_sites_noted()
     );
-    if omni_cpu::dynarmic::tbi_sites_noted() > 0 {
+    // With translation snapshots (`OMNI_JIT_SNAPSHOT`) a process starts from code another learned
+    // the mask in -- the second listing of `/system/etc` from the first's -- and pays fewer faults
+    // than a process with none: the comparison measures per-process learning, so not then.
+    if omni_cpu::dynarmic::tbi_sites_noted() > 0 && std::env::var_os("OMNI_JIT_SNAPSHOT").is_none() {
         assert!(large_lines > 4 * small_lines, "the large listing is the larger workload");
         assert!(large < 2 * small, "the faults do not grow with the work: {small} for {small_lines} lines, {large} for {large_lines}");
     }

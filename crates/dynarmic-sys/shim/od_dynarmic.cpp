@@ -640,6 +640,9 @@ void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
     out->evict_max_ns = s.evict_max_ns;
     out->regions_live = s.regions_live;
     out->regions_live_max = s.regions_live_max;
+    out->snapshot_blocks_restored = s.snapshot_blocks_restored;  // patch 0070
+    out->snapshot_blocks_verified = s.snapshot_blocks_verified;
+    out->snapshot_blocks_rejected = s.snapshot_blocks_rejected;
 #else
     (void)p;
 #endif
@@ -735,6 +738,52 @@ uint64_t od_code_cache_evict_to(void* p, uint64_t keep_bytes) {
     (void)keep_bytes;
 #endif
     return 0;
+}
+
+void od_code_cache_enable_snapshots(void* p) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr) {
+        static_cast<OdCodeCache*>(p)->cache->EnableSnapshots();
+    }
+#else
+    (void)p;
+#endif
+}
+
+int64_t od_code_cache_save_snapshot(void* p, const char* path, const char* key, uint64_t max_bytes, uint32_t flags) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr && path != nullptr && key != nullptr) {
+        try {
+            return static_cast<OdCodeCache*>(p)->cache->SaveSnapshot(path, key, max_bytes, (flags & OD_SNAPSHOT_ENTERED_ONLY) == 0);
+        } catch (...) {
+            return -5;
+        }
+    }
+#else
+    (void)p;
+    (void)path;
+    (void)key;
+    (void)max_bytes;
+    (void)flags;
+#endif
+    return -1;
+}
+
+int64_t od_code_cache_load_snapshot(void* p, const char* path, const char* key) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr && path != nullptr && key != nullptr) {
+        try {
+            return static_cast<OdCodeCache*>(p)->cache->LoadSnapshot(path, key);
+        } catch (...) {
+            return -8;
+        }
+    }
+#else
+    (void)p;
+    (void)path;
+    (void)key;
+#endif
+    return -1;
 }
 
 uint32_t od_jit_run(void* p) {

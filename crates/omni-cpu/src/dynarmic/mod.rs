@@ -1458,6 +1458,42 @@ impl DynarmicBackend {
         }
     }
 
+    /// **Translation snapshots** (vendored patch 0070, x64): hash the guest code of every block
+    /// the shared code cache emits from now on, so that [`save_translation_snapshot`] can write
+    /// them. False without a shared cache.
+    ///
+    /// [`save_translation_snapshot`]: Self::save_translation_snapshot
+    pub fn enable_translation_snapshots(&self) -> bool {
+        let Some(cache) = self.shared.code_cache.as_ref() else { return false };
+        // SAFETY: the cache is live for `self.shared`'s life.
+        unsafe { dynarmic_sys::od_code_cache_enable_snapshots(cache.0) };
+        true
+    }
+
+    /// Write the shared code cache's translations to `path`, tagged `key` (see
+    /// `dynarmic_sys::od_code_cache_save_snapshot`): the blocks written, or a negative error.
+    /// Takes the cache's lock: every guest thread waits while the regions are copied out.
+    /// `entered_only` leaves out the blocks restored from a snapshot and not entered since (a
+    /// snapshot of the working set of this run alone).
+    pub fn save_translation_snapshot(&self, path: &std::path::Path, key: &str, max_bytes: u64, entered_only: bool) -> i64 {
+        let Some(cache) = self.shared.code_cache.as_ref() else { return -1 };
+        let (Some(path), Ok(key)) = (path.to_str().and_then(|p| std::ffi::CString::new(p).ok()), std::ffi::CString::new(key)) else { return -1 };
+        // SAFETY: a live cache; NUL-terminated strings.
+        unsafe {
+            dynarmic_sys::od_code_cache_save_snapshot(cache.0, path.as_ptr(), key.as_ptr(), max_bytes, if entered_only { dynarmic_sys::OD_SNAPSHOT_ENTERED_ONLY } else { 0 })
+        }
+    }
+
+    /// Install the translation snapshot at `path` (tagged `key`) into the shared code cache, which
+    /// must not have translated anything yet: the blocks installed (each entered only once its guest
+    /// code reads back unchanged), or a negative error and nothing changed.
+    pub fn load_translation_snapshot(&self, path: &std::path::Path, key: &str) -> i64 {
+        let Some(cache) = self.shared.code_cache.as_ref() else { return -1 };
+        let (Some(path), Ok(key)) = (path.to_str().and_then(|p| std::ffi::CString::new(p).ok()), std::ffi::CString::new(key)) else { return -1 };
+        // SAFETY: as `save_translation_snapshot`.
+        unsafe { dynarmic_sys::od_code_cache_load_snapshot(cache.0, path.as_ptr(), key.as_ptr()) }
+    }
+
     /// The shared code cache's counters, or `None` without one.
     #[must_use]
     pub fn code_cache_stats(&self) -> Option<OdCodeCacheStats> {

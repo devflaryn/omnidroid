@@ -55,6 +55,7 @@ dynarmic/
                and ../patches/0061-x64-compact-code.patch
                and ../patches/0062-x64-emit-observer.patch
                and ../patches/0063-x64-faster-emitter.patch
+               and ../patches/0070-x64-translation-snapshots.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
