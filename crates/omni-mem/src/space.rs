@@ -1735,6 +1735,18 @@ impl GuestSpace {
         self.guest_view_regions(inner.regions(false), false)
     }
 
+    /// The [`mapped_regions`](GuestSpace::mapped_regions) that overlap `[address, address + len)`,
+    /// found from the space's index rather than by building every region of the space -- what a
+    /// `munmap` of a range needs. The parts inside the range are exactly those of
+    /// `mapped_regions()` (the same merges, from the first overlapping entry on); the first and
+    /// last regions may end where their entries do rather than where a full merge would, so clip
+    /// to the range.
+    #[must_use]
+    pub fn mapped_regions_overlapping(&self, address: GuestAddr, len: usize) -> Vec<RegionInfo> {
+        let inner = self.read();
+        self.guest_view_regions(inner.regions_overlapping(address, len, false), false)
+    }
+
     /// The parts of `[address, address + len)` that hold anything: committed private memory and
     /// file views, in address order, clipped to the range. The rest is free space or a lazy
     /// mapping's uncommitted granules, which read as zeros by construction -- what a copy of the
@@ -2115,6 +2127,45 @@ impl Inner {
         align: usize,
         from: GuestAddr,
     ) -> MemResult<GuestAddr> {
+        // The first pass -- the first free run from `from` on that fits -- walks the map from the
+        // entry holding `from`, not from the bottom: an ART start's thousands of `mmap`s each
+        // built every free run of the space first. The run holding `from` may begin below that
+        // entry; its start does not matter, as the candidate is at `from` or above. The same
+        // answer; the wrap-around pass below, rarely reached, is unchanged.
+        {
+            let fits_from = |run_start: GuestAddr, run_len: usize| -> Option<GuestAddr> {
+                let run_end = run_start + run_len;
+                if run_end <= from {
+                    return None;
+                }
+                let lower = run_start.max(from);
+                let candidate = lower.checked_add(align - 1)? & !(align - 1);
+                (candidate >= run_start && candidate < run_end && run_end - candidate >= len).then_some(candidate)
+            };
+            let first = self.map.entry_start(from).unwrap_or(from);
+            let mut run: Option<(GuestAddr, usize)> = None;
+            let mut found = None;
+            for (start, entry) in self.map.iter_from(first) {
+                if !entry.is_free() {
+                    continue;
+                }
+                match run.as_mut() {
+                    Some((run_start, run_len)) if *run_start + *run_len == start => *run_len += entry.len,
+                    _ => {
+                        if let Some(address) = run.and_then(|(s, l)| fits_from(s, l)) {
+                            found = Some(address);
+                            break;
+                        }
+                        run = Some((start, entry.len));
+                    }
+                }
+            }
+            if let Some(address) = found.or_else(|| run.and_then(|(s, l)| fits_from(s, l))) {
+                self.cursor = address + len;
+                return Ok(address);
+            }
+        }
+
         let mut runs: Vec<(GuestAddr, usize)> = Vec::new();
         for (start, entry) in self.map.iter() {
             if entry.is_free() {
@@ -2937,6 +2988,22 @@ impl Inner {
     fn regions(&self, include_free: bool) -> Vec<RegionInfo> {
         let mut out: Vec<RegionInfo> = Vec::new();
         for (start, entry) in self.map.iter() {
+            if entry.is_free() && !include_free {
+                continue;
+            }
+            let info = RegionInfo::from_entry(start, entry);
+            match out.last_mut() {
+                Some(previous) if previous.can_absorb(&info) => previous.absorb(&info),
+                _ => out.push(info),
+            }
+        }
+        out
+    }
+
+    /// [`regions`](Inner::regions) over the entries overlapping `[address, address + len)` only.
+    fn regions_overlapping(&self, address: GuestAddr, len: usize, include_free: bool) -> Vec<RegionInfo> {
+        let mut out: Vec<RegionInfo> = Vec::new();
+        for (start, entry) in self.map.iter_overlapping(address, len) {
             if entry.is_free() && !include_free {
                 continue;
             }

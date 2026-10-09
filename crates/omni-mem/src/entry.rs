@@ -285,6 +285,19 @@ impl EntryMap {
         self.entries.iter().map(|(&start, entry)| (start, entry))
     }
 
+    /// Every entry starting at or after `start`, in address order.
+    pub(crate) fn iter_from(&self, start: GuestAddr) -> impl Iterator<Item = (GuestAddr, &Entry)> {
+        self.entries.range(start..).map(|(&start, entry)| (start, entry))
+    }
+
+    /// Every entry overlapping `[address, address + len)`, in address order: a range of the map,
+    /// not a walk of all of it.
+    pub(crate) fn iter_overlapping(&self, address: GuestAddr, len: usize) -> impl Iterator<Item = (GuestAddr, &Entry)> {
+        let end = address.saturating_add(len);
+        let first = self.entry_start(address).unwrap_or(address);
+        self.entries.range(first..end).map(|(&start, entry)| (start, entry))
+    }
+
     /// The starts of every entry overlapping `[address, address + len)`, in address order.
     ///
     /// Returned as a `Vec` rather than an iterator on purpose: almost every caller mutates the map
