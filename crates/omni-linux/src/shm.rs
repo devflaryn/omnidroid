@@ -248,8 +248,6 @@ impl Shm {
     /// `temporary`.
     fn create_in(name: &str, dir: &std::path::Path, temporary: bool) -> Result<Arc<Self>, Errno> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let host_path = dir.join(format!("omni-shm-{}-{n}", std::process::id()));
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(windows)]
@@ -260,7 +258,30 @@ impl Shm {
         }
         #[cfg(not(windows))]
         let _ = temporary;
-        let file = executable_access(&mut options).open(&host_path).map_err(|_| EIO)?;
+        let options = executable_access(&mut options);
+        // A file already there under this process's pid and number is a dead process's: one that
+        // had the same pid (the host reuses them) and was killed before it removed its regions.
+        // It is removed and the name made again (or, if it cannot be, a name no other process had)
+        // -- answering EIO here once failed a boot's first graphics buffer, and SurfaceFlinger
+        // aborted on it at every restart (2026-10-09 14:51: 20,372 such files in %TEMP%,
+        // `omni-shm-36916-*` left at 04:31 by a killed run).
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut host_path = dir.join(format!("omni-shm-{}-{n}", std::process::id()));
+        let file = match options.open(&host_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&host_path);
+                match options.open(&host_path) {
+                    Ok(file) => file,
+                    Err(_) => {
+                        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+                        host_path = dir.join(format!("omni-shm-{}-{n}-{nanos}", std::process::id()));
+                        options.open(&host_path).map_err(|_| EIO)?
+                    }
+                }
+            }
+            Err(_) => return Err(EIO),
+        };
         Ok(Arc::new(Self {
             file: Mutex::new(file),
             name: name.to_string(),
@@ -505,6 +526,29 @@ impl Shm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dead process that had this pid left its regions' files (a killed run, the pid reused):
+    /// they do not refuse this process's regions.
+    #[test]
+    fn a_dead_process_s_files_under_the_same_pid_do_not_refuse_a_region() {
+        let dir = std::env::temp_dir().join(format!("omni-shm-stale-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The next numbers this process will take, each already a file.
+        let first = Shm::create_in("probe", &dir, false).expect("made");
+        let next: u64 = first.host_path().file_name().unwrap().to_string_lossy().rsplit('-').next().unwrap().parse().unwrap();
+        drop(first);
+        for n in next + 1..next + 400 {
+            std::fs::write(dir.join(format!("omni-shm-{}-{n}", std::process::id())), b"stale").unwrap();
+        }
+        for _ in 0..8 {
+            let shm = Shm::create_in("fresh", &dir, false).expect("made despite a stale file");
+            shm.set_len(16).unwrap();
+            let mut got = [1u8; 5];
+            shm.read_at(&mut got, 0).unwrap();
+            assert_eq!(got, [0; 5], "a new region, not the stale file's bytes");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A temporary region is one file shared as before: another opener by path (as another host
     /// process opens a crossed region) sees the view's writes, and the file is marked temporary

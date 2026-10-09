@@ -59,6 +59,15 @@ $env:OMNI_SYSROOT = $Sysroot; $env:OMNI_LEVER_FILE = $leverFile
 Remove-Item env:OMNI_SCREENSHOT -ErrorAction SilentlyContinue
 if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Split("=", 2); Set-Item -Path ("env:" + $p[0]) -Value $p[1] } } }
 
+function Remove-DeadShm {
+  # Graphics regions (`omni-shm-<host pid>-<n>`) of host processes no longer alive: a killed run
+  # leaves them, and a later host process given the same pid collided with them (2026-10-09).
+  $live = @{}; Get-Process | ForEach-Object { $live[[string]$_.Id] = $true }
+  Get-ChildItem -Path $env:TEMP -Filter "omni-shm-*" -File -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.Name -match '^omni-shm-(\d+)-' -and -not $live[$Matches[1]]) { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+  }
+}
+
 function Stop-Guests {
   # The run's own instance first, through its stop file: it shuts down and removes its instance
   # directory itself (a killed run leaves ~0.8 GB in %TEMP% for good). Then whatever is left.
@@ -76,6 +85,7 @@ function Stop-Guests {
       if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
     }
   }
+  Remove-DeadShm
 }
 Stop-Guests; Start-Sleep 3
 # A lean kiosk boot needs ~4-6 GB of free commit (an instance commits ~3.7 GB in-world); below that it would starve this host's other processes (the
