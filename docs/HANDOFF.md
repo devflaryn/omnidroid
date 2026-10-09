@@ -1,5 +1,35 @@
 # Handoff
 
+## PS99 AT 60 FPS, HALF THE CPU, LIGHTER (2026-10-08/09 night, Windows; branch `perf/ps99-60fps`, not merged)
+
+Goal (owner): PS99 fully loaded toward 60 fps, CPU and RAM well below, no feature removed. Morning
+report `docs/MORNING-2026-10-09-ps99-60fps.md`; every A/B (winners and losers) in
+`docs/NIGHT-2026-10-09-ps99-60fps.md`. Same harness, `main` 6b1ab88 vs the branch, fresh boots:
+**fps 35 -> 58-60, CPU a frame 169 -> 45-50 ms, private working set 3.86 -> 3.40 GB, threads -34%;
+in the game 110-115 s after start (was ~185 s on a new device).**
+
+- **Measure first, with the tools made for it:** `tools/perf_live.ps1` (levers A/B'd live in one
+  session via `OMNI_LEVER_FILE`; every lever is in `crates/omni-linux/src/lever.rs`),
+  `tools/perf_ab.ps1` + `perf_ab_seq.ps1` (fresh-boot arms; records private working set and
+  threads; env `OMNI_AB_APK/SETTLE/WINDOW/JOIN_MIN`), `OMNI_PROC_CPU=<s>` (whole-process CPU by
+  thread name -- it found the window thread spinning), `OMNI_THREAD_CPU` + `OMNI_GUEST_PROF=1`
+  (guest functions of hot threads), `[thread-sys]`, `OMNI_MEM_TRACE`, `OMNI_MMAP_LOG_MB`.
+  At 60 fps an A/B is decided by CPU ms/frame, not fps. PS99 migrates servers every 15-50 min
+  ("reason: 285"): drop those phases.
+- **What it was:** herds and spins more than codegen -- futex `notify_all` per process (31 -> 44.5
+  fps), poll waits on "anything" and 50 ms slices (system host 54 -> 28 ms/frame), the display
+  window's pump spinning a core, EPOLLET ignored (a DoH resolver spinning a core in some boots); then
+  the JIT (dynarmic 0037 precise GetSetElimination, 0040/0041 TBI unmasked with learning, 0042 inline
+  dispatch, 0039 FP in XMM, 0061 compact code, 0063 a 1.73x faster emitter); binder host pool,
+  Vulkan batching, `remote_direct`, zero-copy GPU present; RAM: zero sweep, code aging, JIT tables
+  compaction (0051/0052), kernel binder spawn rule, uncompressed boot image (`-bootu` saved devices).
+- **Bugs fixed on the way:** a fork time-sharing memory hand-over during a side's own fork (the
+  setup's `sh` crash; Clash of Clans-style forks), two JIT bugs (an unused faulting load dropped; NZCV
+  forwarding), present_zero switching itself off after resizes, a fork restore racing remote writes,
+  a lost binder spawn request, ppoll signal latency, Vulkan batch leaks.
+- **Open:** the Mac arm64 build is unverified (offline all night); resident zero pages in the host
+  heaps (~100-200 MiB); `OMNI_R_FAST_SETUP` and `OMNI_DEVICE_IDLE_APPS=out` are opt-in.
+
 ## APKS IN PARALLEL, AND THE FORK A WATCHDOG NEEDS (2026-10-04, Windows; branch `feat/fork-timeshare`)
 
 Goal (owner): launch different APKs in parallel on one Android, each in a window of its own; the
