@@ -36,6 +36,12 @@
 //!   lookups and checks, the target from a register and a host indirect jump per site; ~20% on
 //!   call/return chains. Every process's translations are dropped. Off by default;
 //!   `OMNI_JIT_FASTDISP=1` from the start.
+//! - `jit_table_shrink=0|1`: the shared code caches' block map, link heads and guest-range page
+//!   index rehashed down to what they hold after an eviction or invalidation forgets blocks, when
+//!   that is at most half their bucket arrays (patch 0066, `omni_cpu::dynarmic::set_shrink_tables`).
+//!   With code aging (`code_age`, `code_age_game`) the maps otherwise keep the size of the cache's
+//!   busiest moment. Nothing is dropped; it applies from the next eviction. Off by default;
+//!   `OMNI_JIT_TABLE_SHRINK=1` from the start.
 //! - `jit_tbi=0|1`: 0 takes Top Byte Ignore's mask off the direct path (patches 0040/0041,
 //!   `omni_cpu::dynarmic::set_tbi_unmasked`): an untagged access is D4's identity; a tagged one is
 //!   a host fault served by the slow path (~2.4 us), and its instruction then learns the mask
@@ -211,6 +217,15 @@ pub fn apply(line: &str) -> Option<String> {
                 registered,
                 live.len()
             ))
+        }
+        "jit_table_shrink" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let kept = omni_cpu::dynarmic::set_shrink_tables(on);
+            Some(format!("jit_table_shrink={}: the code caches' maps shrink after their next eviction", u8::from(kept)))
         }
         "jit_fastdisp" => {
             let on = match value.trim() {
@@ -771,6 +786,15 @@ mod tests {
         assert!(done.starts_with(if want { "jit_fastdisp=1" } else { "jit_fastdisp=0" }), "{done}");
         assert!(apply("jit_fastdisp=0").expect("understood").starts_with("jit_fastdisp=0"));
         assert_eq!(apply("jit_fastdisp=2"), None);
+    }
+
+    #[test]
+    fn the_table_shrink_lever_is_understood() {
+        let want = cfg!(target_arch = "x86_64");
+        let done = apply("jit_table_shrink=1").expect("understood");
+        assert!(done.starts_with(if want { "jit_table_shrink=1" } else { "jit_table_shrink=0" }), "{done}");
+        assert!(apply("jit_table_shrink=0").expect("understood").starts_with("jit_table_shrink=0"));
+        assert_eq!(apply("jit_table_shrink=on"), None);
     }
 
     #[test]

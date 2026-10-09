@@ -963,6 +963,9 @@ void SharedCodeCache::Impl::Invalidate(bool entire, const boost::icl::interval_s
     if (dropped != 0) {
         blocks_invalidated += dropped;
         generation.fetch_add(1, std::memory_order_seq_cst);
+        if (live_shrink_tables.load(std::memory_order_relaxed) != 0) {
+            emitter.ShrinkTables();  // patch 0066
+        }
     }
 }
 
@@ -1098,6 +1101,9 @@ bool SharedCodeCache::Impl::EvictOldest(SharedThreadState* thread) {
     // named were this region's, an older region's, or invalidated.
     emitter.TrimLinkRecords(end_link);
     emitter.TrimGuestRanges(end_range);
+    if (live_shrink_tables.load(std::memory_order_relaxed) != 0) {
+        emitter.ShrinkTables();  // patch 0066
+    }
     last_evicted = {};
     last_evicted.insert(evicted_scratch.begin(), evicted_scratch.end());
     if (evicted_scratch.capacity() > 2 * evicted_scratch.size() + 4096) {

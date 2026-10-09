@@ -1092,6 +1092,16 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_fast_dispatch_inline(on: u32) -> u32;
+
+    /// Vendored patch 0066 (x64): non-zero rehashes a shared cache's block map, link heads and
+    /// guest-range page index down to what they hold once an eviction or an invalidation has
+    /// forgotten blocks, when that is at most half their bucket arrays (a robin_map never shrinks by
+    /// itself). Process-wide, read at each eviction or invalidation. Returns the value in force (1
+    /// or 0); 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_shrink_tables(on: u32) -> u32;
 }
 
 /// Patch 0062: see [`od_set_emit_observer`].

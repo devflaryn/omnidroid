@@ -592,3 +592,20 @@ guest byte, which is always its own location's PC: `Emit`, the only caller of `A
 passes `descriptor.PC()` (now asserted). `GuestRange::First()` reads it back from the location; the
 record is 12 bytes. In a world's game host (`OMNI_MEM_TRACE` 2026-10-09: 636,522 ranges) -4.9 MiB,
 in the system host (233k-380k ranges over 40 caches) -1.8 to -2.9 MiB. The same behaviour.
+
+### 0066 — x64 shared cache: the maps shrink after blocks are forgotten (a switch, off)
+
+x64, shared caches. A robin_map never gives its bucket array back, so a cache whose blocks an
+eviction (code aging, `EvictTo`; the live limit) or an invalidation forgot kept the block map, the
+link heads and the guest-range page index of its busiest moment (0031 did it for `ForgetAllBlocks`
+only). `live_shrink_tables` (`od_set_shrink_tables`; omni: `OMNI_JIT_TABLE_SHRINK=1`, lever
+`jit_table_shrink=1`), off by default: after `EvictOldest` and after an invalidation that dropped
+blocks, `A64EmitX64::ShrinkTables` rehashes each map holding at most half of what its array could at
+its load factor down to the smallest power of two that holds it (never below 64 buckets). Host
+MXCSR saved and restored around it (tsl's rehash divides in floats). Pointers into the maps are not
+held across either call site. MEASURED (`tests/table_shrink.rs`, 353,015 blocks evicted to 38,448): off, the block map stays
+14,336 KiB; on, 14,336 -> 1,792 KiB and the page index 7,462 -> 668 KiB (738 off); the code runs
+on through the rehashed maps, an invalidation after it too. What it is for:
+with `code_age_game` the game's 28 MiB block map (2^20 buckets, 636k blocks) stays at 2^20 after
+aging to ~260k blocks; with this, 2^19 (-14 MiB) or less.
+

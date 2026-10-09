@@ -588,6 +588,11 @@ void od_set_emit_observer(od_emit_observer observer, void* ctx);
  * from now on. Returns the value in force; a no-op returning 0 on arm64. */
 uint32_t od_set_fast_dispatch_inline(uint32_t on);
 
+/* Patch 0066 (x64 only): non-zero rehashes a shared cache's block map, link heads and guest-range
+ * page index down to what they hold after an eviction or invalidation forgot blocks, when that is
+ * at most half their bucket arrays. Returns the value in force; a no-op returning 0 on arm64. */
+uint32_t od_set_shrink_tables(uint32_t on);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);

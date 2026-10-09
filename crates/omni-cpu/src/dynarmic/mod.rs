@@ -441,6 +441,19 @@ pub fn set_fast_dispatch_inline(on: bool) -> bool {
     unsafe { dynarmic_sys::od_set_fast_dispatch_inline(u32::from(on)) != 0 }
 }
 
+/// **The shared caches' maps shrink with what they hold** (patch 0066, x64): after an eviction
+/// (code aging, the live limit) or an invalidation forgets blocks, the block map, the link heads
+/// and the guest-range page index are rehashed down when they hold at most half of what their
+/// bucket arrays could. A robin_map never shrinks by itself, so a cache aged from its busiest
+/// moment kept that moment's arrays (a world's game host: a 28 MiB block map at 2^20 buckets for
+/// 636k blocks). The same lookups either way; a rehash costs ~20-40 ns an entry, under the cache's
+/// lock. Process-wide; returns what is in force (`false` on arm64). Off by default;
+/// `OMNI_JIT_TABLE_SHRINK=1` or `omni-linux`'s `jit_table_shrink=1` lever turns it on.
+pub fn set_shrink_tables(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_shrink_tables(u32::from(on)) != 0 }
+}
+
 /// **Smaller translated code** (patch 0061, x64): process-wide bits, for blocks emitted from now
 /// on; returns the bits in force (0 on arm64). The same behaviour either way.
 ///
@@ -616,6 +629,7 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_SCALAR_FP_XMM=0|1` -- [`set_scalar_fp_in_xmm`] (process-wide);
     /// * `OMNI_JIT_TBI_AND=0|1` -- [`set_fastmem_mask_by_and`] (process-wide);
     /// * `OMNI_JIT_FASTDISP=0|1` -- [`set_fast_dispatch_inline`] (process-wide);
+    /// * `OMNI_JIT_TABLE_SHRINK=0|1` -- [`set_shrink_tables`] (process-wide);
     /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
     /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
     ///   where each thread has its own cache (arm64).
@@ -723,6 +737,15 @@ impl DynarmicOptions {
             };
             let kept = set_fast_dispatch_inline(on);
             say(&format!("dispatch hit paths inline {} (OMNI_JIT_FASTDISP)", if kept { "on" } else { "off" }));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_TABLE_SHRINK") {
+            let on = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_TABLE_SHRINK={other:?} is not 0 or 1"),
+            };
+            let kept = set_shrink_tables(on);
+            say(&format!("code caches' maps shrink after forgetting blocks {} (OMNI_JIT_TABLE_SHRINK)", if kept { "on" } else { "off" }));
         }
         if let Ok(value) = std::env::var("OMNI_JIT_TBI_AND") {
             let on = match value.trim() {

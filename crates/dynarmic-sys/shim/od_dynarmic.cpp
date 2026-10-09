@@ -34,6 +34,8 @@ extern std::atomic<std::uint32_t> live_fp_optimizations;
 extern std::atomic<std::uint32_t> live_precise_get_set;
 /* Patch 0042's switch, likewise. */
 extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
+/* Patch 0066's switch, likewise. */
+extern std::atomic<std::uint32_t> live_shrink_tables;
 /* Patch 0060's census (a64_emit_x64.cpp). */
 std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n);
 void ResetCodegenCensus();
@@ -1019,6 +1021,16 @@ uint32_t od_set_tbi_unmasked(uint32_t on) {
 uint32_t od_set_fast_dispatch_inline(uint32_t on) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     Dynarmic::Backend::X64::live_fast_dispatch_inline.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
+    return on != 0 ? 1u : 0u;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+uint32_t od_set_shrink_tables(uint32_t on) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::live_shrink_tables.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
     return on != 0 ? 1u : 0u;
 #else
     (void)on;

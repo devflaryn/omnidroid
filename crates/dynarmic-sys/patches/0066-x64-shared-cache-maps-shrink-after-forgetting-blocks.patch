@@ -1,0 +1,115 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 3a72bc2..8baa370 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -8,6 +8,8 @@
+ #include <algorithm>
+ #include <limits>
+ 
++#include <xmmintrin.h>
++
+ #include <fmt/format.h>
+ #include <fmt/ostream.h>
+ #include <mcl/assert.hpp>
+@@ -40,6 +42,7 @@ using namespace Xbyak::util;
+ std::atomic<std::uint32_t> live_fp_optimizations{0};
+ std::atomic<std::uint32_t> live_precise_get_set{1};
+ std::atomic<std::uint32_t> live_fast_dispatch_inline{0};
++std::atomic<std::uint32_t> live_shrink_tables{0};
+ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPart::Count)> codegen_census{};
+ 
+ std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n) {
+@@ -502,6 +505,40 @@ u64 VectorBytes(const std::vector<T>& v) {
+ 
+ }  // namespace
+ 
++namespace {
++
++/// Patch 0066: rehash `map` to the smallest power-of-two bucket array that holds its entries at its
++/// load factor, when that is at most half of the array it has (a map's arrays never go below 64
++/// buckets, UseLoadFactor's start). Returns the bytes given back.
++template<typename Map>
++size_t ShrinkMap(Map& map) {
++    using Bucket = tsl::detail_robin_hash::bucket_entry<std::pair<typename Map::key_type, typename Map::mapped_type>, false>;
++    const size_t have = map.bucket_count();
++    // Every product here is a power of two times 0.5 or 0.75: exact, so no MXCSR flag is set by it.
++    size_t need = 64;
++    while (static_cast<size_t>(static_cast<float>(need) * map.max_load_factor()) < map.size()) {
++        need *= 2;
++    }
++    if (need * 2 > have) {
++        return 0;
++    }
++    map.rehash(need);
++    return (have - map.bucket_count()) * sizeof(Bucket);
++}
++
++}  // namespace
++
++size_t A64EmitX64::ShrinkTables() {
++    // tsl's rehash divides the size by the load factor in floats, inexactly: the host's MXCSR, the
++    // word the dispatcher installs for a handler (see UseLoadFactor), keeps no flag from it.
++    const unsigned int mxcsr = _mm_getcsr();
++    size_t freed = ShrinkMap(block_descriptors);
++    freed += ShrinkMap(link_heads);
++    freed += ShrinkMap(guest_range_pages);
++    _mm_setcsr(mxcsr);
++    return freed;
++}
++
+ A64::SharedCodeCache::Tables A64EmitX64::Census() const {
+     A64::SharedCodeCache::Tables t;
+     t.blocks = RobinMapFigure(block_descriptors);
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index 4f92f75..37fe35d 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -50,6 +50,12 @@ extern std::atomic<std::uint32_t> live_precise_get_set;
+ /// when a block is emitted.
+ extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
+ 
++/// Omnidroid patch 0066: non-zero gives a shared cache's maps back their room after blocks are
++/// forgotten -- an eviction (code aging, the live limit) or an invalidation. A robin_map never
++/// shrinks by itself, so a cache aged from 636k blocks to a third of that kept the bucket arrays of
++/// its busiest moment. Process-wide, read at each eviction or invalidation.
++extern std::atomic<std::uint32_t> live_shrink_tables;
++
+ /// Omnidroid patch 0060: a census of the code this backend emits, for a measurement: bytes by
+ /// part of a block, and counts. Always kept (a few relaxed adds per emitted instruction, on a path
+ /// that costs microseconds); `od_codegen_census` reads it.
+@@ -159,6 +165,11 @@ public:
+     /// Omnidroid patch 0024: what each per-block table holds, for a memory report. The caller
+     /// holds the cache's lock (shared is enough).
+     A64::SharedCodeCache::Tables Census() const;
++    /// Omnidroid patch 0066: rehash each of the block map, the link heads and the guest-range page
++    /// index that holds less than half of what its bucket array could at its load factor, to the
++    /// smallest array that holds it. The caller holds the cache's lock exclusively. Returns the
++    /// bytes of bucket arrays given back.
++    size_t ShrinkTables();
+     /// Omnidroid patch 0036: `SharedCodeCache::GuestPcsOf`. The caller holds the cache's lock
+     /// (shared is enough).
+     void GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const;
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index cd45e80..09ce12b 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -963,6 +963,9 @@ void SharedCodeCache::Impl::Invalidate(bool entire, const boost::icl::interval_s
+     if (dropped != 0) {
+         blocks_invalidated += dropped;
+         generation.fetch_add(1, std::memory_order_seq_cst);
++        if (live_shrink_tables.load(std::memory_order_relaxed) != 0) {
++            emitter.ShrinkTables();  // patch 0066
++        }
+     }
+ }
+ 
+@@ -1098,6 +1101,9 @@ bool SharedCodeCache::Impl::EvictOldest(SharedThreadState* thread) {
+     // named were this region's, an older region's, or invalidated.
+     emitter.TrimLinkRecords(end_link);
+     emitter.TrimGuestRanges(end_range);
++    if (live_shrink_tables.load(std::memory_order_relaxed) != 0) {
++        emitter.ShrinkTables();  // patch 0066
++    }
+     last_evicted = {};
+     last_evicted.insert(evicted_scratch.begin(), evicted_scratch.end());
+     if (evicted_scratch.capacity() > 2 * evicted_scratch.size() + 4096) {

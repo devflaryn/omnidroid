@@ -50,6 +50,12 @@ extern std::atomic<std::uint32_t> live_precise_get_set;
 /// when a block is emitted.
 extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
 
+/// Omnidroid patch 0066: non-zero gives a shared cache's maps back their room after blocks are
+/// forgotten -- an eviction (code aging, the live limit) or an invalidation. A robin_map never
+/// shrinks by itself, so a cache aged from 636k blocks to a third of that kept the bucket arrays of
+/// its busiest moment. Process-wide, read at each eviction or invalidation.
+extern std::atomic<std::uint32_t> live_shrink_tables;
+
 /// Omnidroid patch 0060: a census of the code this backend emits, for a measurement: bytes by
 /// part of a block, and counts. Always kept (a few relaxed adds per emitted instruction, on a path
 /// that costs microseconds); `od_codegen_census` reads it.
@@ -159,6 +165,11 @@ public:
     /// Omnidroid patch 0024: what each per-block table holds, for a memory report. The caller
     /// holds the cache's lock (shared is enough).
     A64::SharedCodeCache::Tables Census() const;
+    /// Omnidroid patch 0066: rehash each of the block map, the link heads and the guest-range page
+    /// index that holds less than half of what its bucket array could at its load factor, to the
+    /// smallest array that holds it. The caller holds the cache's lock exclusively. Returns the
+    /// bytes of bucket arrays given back.
+    size_t ShrinkTables();
     /// Omnidroid patch 0036: `SharedCodeCache::GuestPcsOf`. The caller holds the cache's lock
     /// (shared is enough).
     void GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) const;

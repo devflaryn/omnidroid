@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <limits>
 
+#include <xmmintrin.h>
+
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <mcl/assert.hpp>
@@ -40,6 +42,7 @@ using namespace Xbyak::util;
 std::atomic<std::uint32_t> live_fp_optimizations{0};
 std::atomic<std::uint32_t> live_precise_get_set{1};
 std::atomic<std::uint32_t> live_fast_dispatch_inline{0};
+std::atomic<std::uint32_t> live_shrink_tables{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPart::Count)> codegen_census{};
 
 std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n) {
@@ -501,6 +504,40 @@ u64 VectorBytes(const std::vector<T>& v) {
 }
 
 }  // namespace
+
+namespace {
+
+/// Patch 0066: rehash `map` to the smallest power-of-two bucket array that holds its entries at its
+/// load factor, when that is at most half of the array it has (a map's arrays never go below 64
+/// buckets, UseLoadFactor's start). Returns the bytes given back.
+template<typename Map>
+size_t ShrinkMap(Map& map) {
+    using Bucket = tsl::detail_robin_hash::bucket_entry<std::pair<typename Map::key_type, typename Map::mapped_type>, false>;
+    const size_t have = map.bucket_count();
+    // Every product here is a power of two times 0.5 or 0.75: exact, so no MXCSR flag is set by it.
+    size_t need = 64;
+    while (static_cast<size_t>(static_cast<float>(need) * map.max_load_factor()) < map.size()) {
+        need *= 2;
+    }
+    if (need * 2 > have) {
+        return 0;
+    }
+    map.rehash(need);
+    return (have - map.bucket_count()) * sizeof(Bucket);
+}
+
+}  // namespace
+
+size_t A64EmitX64::ShrinkTables() {
+    // tsl's rehash divides the size by the load factor in floats, inexactly: the host's MXCSR, the
+    // word the dispatcher installs for a handler (see UseLoadFactor), keeps no flag from it.
+    const unsigned int mxcsr = _mm_getcsr();
+    size_t freed = ShrinkMap(block_descriptors);
+    freed += ShrinkMap(link_heads);
+    freed += ShrinkMap(guest_range_pages);
+    _mm_setcsr(mxcsr);
+    return freed;
+}
 
 A64::SharedCodeCache::Tables A64EmitX64::Census() const {
     A64::SharedCodeCache::Tables t;

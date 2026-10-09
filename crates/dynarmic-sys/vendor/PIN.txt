@@ -57,6 +57,7 @@ dynarmic/
                and ../patches/0063-x64-faster-emitter.patch
                and ../patches/0064-x64-a-translated-target-s-link-head-beside-its-block.patch
                and ../patches/0065-x64-a-guest-range-without-its-first-byte.patch
+               and ../patches/0066-x64-shared-cache-maps-shrink-after-forgetting-blocks.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
