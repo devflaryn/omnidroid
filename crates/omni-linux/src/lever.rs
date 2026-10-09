@@ -68,7 +68,7 @@
 //!   are woken by their own changes only (1), not by every change in the host process (0, the
 //!   default) (`crate::poll::KEYED`; `OMNI_POLL_STATS` counts what is left).
 //! - `remote_direct=0|1`: the system's host process reads and writes an app's guest memory itself
-//!   (1) rather than over the app thread's connection (0, the default; `OMNI_REMOTE_DIRECT=1`)
+//!   (1, the default) rather than over the app thread's connection (0; `OMNI_REMOTE_DIRECT=0`)
 //!   (`crate::remote::DIRECT`; `OMNI_REMOTE_STATS` counts both).
 //! - `binder_host_pool=0|1`: a host service's binder calls run on kept, reused threads (1) or on a
 //!   new thread each (0, the default; `OMNI_BINDER_HOST_POOL`) (`crate::binder::HOST_POOL`).
@@ -430,9 +430,10 @@ pub fn start() {
         crate::poll::KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[lever] OMNI_POLL_KEYED: poll_keyed={}", u8::from(on));
     }
-    if std::env::var("OMNI_REMOTE_DIRECT").as_deref() == Ok("1") {
-        crate::remote::DIRECT.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("[lever] OMNI_REMOTE_DIRECT: remote_direct=1");
+    if let Ok(v) = std::env::var("OMNI_REMOTE_DIRECT") {
+        let on = v.trim() != "0";
+        crate::remote::DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_REMOTE_DIRECT: remote_direct={}", u8::from(on));
     }
     let Some(path) = std::env::var_os("OMNI_LEVER_FILE").map(PathBuf::from) else { return };
     let _ = std::thread::Builder::new().name("omni-lever".into()).spawn(move || {
