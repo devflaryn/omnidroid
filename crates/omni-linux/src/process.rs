@@ -149,6 +149,12 @@ pub fn scalar_fp_in_xmm_default() {
         if std::env::var_os("OMNI_JIT_SCALAR_FP_XMM").is_none() {
             let _ = omni_cpu::dynarmic::set_scalar_fp_in_xmm(true);
         }
+        // Indirect-branch hit paths emitted inline (dynarmic patch 0042), on by default since the
+        // in-world A/B of 2026-10-09 (PS99 session s5: fps +0.2..+2.3, both critical threads
+        // -0.5..-0.8 ms a frame). `OMNI_JIT_FASTDISP=0` or the lever `jit_fastdisp=0` turns it off.
+        if std::env::var_os("OMNI_JIT_FASTDISP").is_none() {
+            let _ = omni_cpu::dynarmic::set_fast_dispatch_inline(true);
+        }
     });
 }
 
@@ -781,7 +787,10 @@ impl Process {
             fast_dispatch_entries: if std::env::var_os("OMNI_LINUX_APP").is_some() {
                 std::env::var("OMNI_JIT_FAST_DISPATCH_APP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
             } else {
-                std::env::var("OMNI_JIT_FAST_DISPATCH_SYSTEM").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+                // 1,024 by default since the boot A/B of 2026-10-09 (with the kernel's binder spawn
+                // rule: the system host's CPU a frame unchanged, 49.2 against 49.4 ms); `=0` is the
+                // pin's 4,096.
+                std::env::var("OMNI_JIT_FAST_DISPATCH_SYSTEM").ok().and_then(|v| v.parse().ok()).unwrap_or(1024)
             },
             ..DynarmicOptions::default()
         };

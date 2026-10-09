@@ -64,11 +64,19 @@ struct omni_vk_cmdbuf {
     struct omni_vk_batch* batch;
     /* Whether this recording batches: asked of the host at each vkBeginCommandBuffer. */
     int batching;
+    /* The pool it came from, and its place in the list of live command buffers (driver.c's
+     * g_cmdbufs): a pool reset or destroyed finds its command buffers there. */
+    uint64_t pool;
+    struct omni_vk_cmdbuf* prev;
+    struct omni_vk_cmdbuf* next;
 };
 
 uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc);
-/* A new command buffer wrapper (calloc'd: no batch, not batching). */
+/* A new command buffer wrapper (calloc'd: no batch, not batching, in no list). */
 struct omni_vk_cmdbuf* omni_vk_wrap_cmdbuf(void);
+/* Into / out of the list of live command buffers (allocated from `pool`). */
+void omni_vk_cmdbuf_live(struct omni_vk_cmdbuf* cb, uint64_t pool);
+void omni_vk_cmdbuf_gone(struct omni_vk_cmdbuf* cb);
 /* A forwarded VkResult: the host's value, or VK_ERROR_DEVICE_LOST when the call could not be made. */
 VkResult omni_vk_result(uint64_t r);
 /* Whether the last call on this thread failed at the transport (not a Vulkan result). */

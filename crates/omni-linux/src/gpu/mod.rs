@@ -26,6 +26,8 @@ pub mod gl;
 pub(crate) mod native;
 pub(crate) mod special;
 pub mod window_present;
+pub mod share;
+pub(crate) mod quad_spirv;
 
 /// `_IOWR('G', 1, struct omni_gpu_call)`, a 32-byte argument.
 pub const OMNI_GPU_CALL: u64 = 0xc020_4701;

@@ -499,6 +499,10 @@ extern const unsigned omni_vk_entry_count;
 
 /* The transport (driver.c): command `id` with `argc` 64-bit arguments; its result. */
 uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc);
+/* The same, for arguments with 32 bytes of room right before them for the request (a generated
+ * command's OMNI_VK_FRAME): no copy of them, whichever form the request takes. */
+uint64_t omni_vk_call_framed(uint32_t id, uint64_t* args, uint32_t argc);
+#define OMNI_VK_FRAME(n) struct { uint64_t omni_head[4]; uint64_t a[n]; } omni_f; uint64_t* const omni_a = omni_f.a
 
 /* Batching (driver.c, OMNI_VK_BATCH): a command that returns nothing and records into a command
  * buffer is put in that buffer's batch, with the arrays it points at (`bytes` at argument `arg`)
@@ -511,6 +515,10 @@ struct omni_vk_copy {
 void omni_vk_record(uint32_t id, const uint64_t* args, uint32_t argc, const struct omni_vk_copy* copies, uint32_t ncopies);
 enum { OMNI_VK_SYNC_FLUSH, OMNI_VK_SYNC_BEGIN, OMNI_VK_SYNC_END, OMNI_VK_SYNC_DISCARD };
 void omni_vk_sync(VkCommandBuffer commandBuffer, int how);
+/* vkResetCommandPool / vkDestroyCommandPool: the pool's command buffers' unsent batches are
+ * discarded (and, destroyed, their wrappers freed). */
+enum { OMNI_VK_POOL_RESET, OMNI_VK_POOL_DESTROY };
+void omni_vk_pool_sync(uint64_t commandPool, int how);
 
 /* The special entry points (tools/vk/special.txt), written by hand. */
 VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* pAllocateInfo, VkCommandBuffer* pCommandBuffers);

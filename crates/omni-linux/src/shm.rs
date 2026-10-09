@@ -99,7 +99,18 @@ impl SharedPage {
     /// A new page, zeroed, its file named `<prefix>-<pid>` in [`host_dir`].
     pub(crate) fn create(prefix: &str) -> Option<Self> {
         let path = host_dir().join(format!("{prefix}-{}", std::process::id()));
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).ok()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(true);
+        // Gone with the process that made it (Windows): every host process made one, and each
+        // was left in %TEMP% (`omni-remote-gate-<pid>`, ~140 in a night of runs). The other
+        // process opens it sharing deletion, which `std` asks for by default.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+        }
+        let file = options.open(&path).ok()?;
         file.set_len(omni_platform::vm::page_size() as u64).ok()?;
         let view = View::map(&file, &path, omni_platform::vm::page_size() as u64)?;
         Some(Self { view, path, _file: file })

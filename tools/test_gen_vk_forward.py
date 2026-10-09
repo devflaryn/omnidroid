@@ -69,11 +69,19 @@ class Generated(unittest.TestCase):
                      "ID_VK_END_COMMAND_BUFFER\n", "ID_VK_CMD_EXECUTE_COMMANDS\n"):
             self.assertNotIn(name, batchable)
 
+    def test_a_pool_reset_or_destroyed_drops_its_batches_and_requests_are_framed(self):
+        self.assertIn("omni_vk_pool_sync((uint64_t)(uintptr_t)commandPool, OMNI_VK_POOL_RESET);", self.fn_c("vkResetCommandPool"))
+        self.assertIn("omni_vk_pool_sync((uint64_t)(uintptr_t)commandPool, OMNI_VK_POOL_DESTROY);", self.fn_c("vkDestroyCommandPool"))
+        self.assertNotIn("omni_vk_pool_sync", self.fn_c("vkTrimCommandPool"))
+        # Every generic command's arguments have the request's room before them: no copy to send.
+        self.assertIn("OMNI_VK_FRAME(1);", self.fn_c("vkEndCommandBuffer"))
+        self.assertNotIn("uint64_t omni_a[", self.c)
+
     def test_a_command_on_a_command_buffer_that_is_not_batched_syncs_first(self):
         # A pNext chain (render pass begin info) is not copied: the batch goes first, then the command.
         c = self.fn_c("vkCmdBeginRenderPass")
         self.assertIn("omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);", c)
-        self.assertIn("omni_vk_call(OMNI_VK_ID_VK_CMD_BEGIN_RENDER_PASS, omni_a, 3)", c)
+        self.assertIn("omni_vk_call_framed(OMNI_VK_ID_VK_CMD_BEGIN_RENDER_PASS, omni_a, 3)", c)
         # An array with a stride is not sizeof apart: not batched either.
         self.assertIn("omni_vk_sync(commandBuffer, OMNI_VK_SYNC_FLUSH);", self.fn_c("vkCmdDrawMultiEXT"))
         self.assertIn("OMNI_VK_SYNC_BEGIN", self.fn_c("vkBeginCommandBuffer"))

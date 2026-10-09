@@ -341,6 +341,9 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
         }
     };
     let (mut control_seen, mut control_read) = (0usize, Instant::now());
+    // How often this loop turns: a line every 30 s, so a pump that spins (a wait that returns at
+    // once) shows as thousands of turns a second instead of tens.
+    let (mut turns, mut turns_since) = (0u64, Instant::now());
     loop {
         // Woken by input, else when a coalesced move or a flood's next step is due.
         let mut wait = PUMP_WAIT;
@@ -348,6 +351,11 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
             wait = wait.min(due.saturating_duration_since(Instant::now()));
         }
         window.wait(wait);
+        turns += 1;
+        if turns_since.elapsed() >= Duration::from_secs(30) {
+            eprintln!("[window] pump: {:.0} turns/s", turns as f64 / turns_since.elapsed().as_secs_f64());
+            (turns, turns_since) = (0, Instant::now());
+        }
         let events: Vec<WindowEvent> = window.poll_events().collect();
         // A copy in the guest is shared with the host's clipboard only while a window is in use.
         crate::clipboard::window_focus(window.has_focus());
@@ -470,6 +478,43 @@ fn scripted(command: Command, input: &mut Input, now: Instant, s: (f64, f64), di
     }
 }
 
+/// The window's swapchain presenter (`present_gpu`, `present_zero`), shared with the composer's
+/// sink; withdrawn from the composer and dropped on the present thread when the GPU present goes
+/// off or the thread ends (before the window is destroyed).
+struct GpuSlot<'a> {
+    framebuffer: &'a Framebuffer,
+    slot: Arc<parking_lot::Mutex<Option<crate::gpu::window_present::WindowPresenter>>>,
+}
+
+impl GpuSlot<'_> {
+    fn release(&self) {
+        self.framebuffer.set_sink(None);
+        let presenter = self.slot.lock().take();
+        drop(presenter);
+    }
+}
+
+impl Drop for GpuSlot<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// The composer's way to the window (`present_zero`): the shared presenter and the window's size.
+struct WindowSink {
+    slot: Arc<parking_lot::Mutex<Option<crate::gpu::window_present::WindowPresenter>>>,
+    presenter: Presenter,
+}
+
+impl crate::hal::framebuffer::ZeroSink for WindowSink {
+    fn present(&self, layers: &[crate::gpu::share::ShareLayer], display: (u32, u32)) -> Result<(), String> {
+        let client = self.presenter.client_size().ok_or("the window is gone")?;
+        let mut slot = self.slot.lock();
+        let presenter = slot.as_mut().ok_or("no swapchain")?;
+        presenter.present_layers(layers, display, client).map(|_| ())
+    }
+}
+
 /// The present thread: each frame to the window, and the window's size to the display.
 fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebuffer: &Framebuffer, composer: &Composer, stop: &AtomicBool) {
     // The framebuffer frame last shown, and how many frames were shown.
@@ -485,17 +530,24 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
     // is turned off, the window back to GDI); once it fails, GDI for good. The client size it last
     // presented at: a frame is presented again at a new size even when none arrives (GDI's
     // `WM_PAINT` repaints the kept image; a swapchain has nothing to repaint from).
-    let mut gpu: Option<crate::gpu::window_present::WindowPresenter> = None;
-    let mut gpu_failed = false;
+    //
+    // `present_zero` needs that swapchain too, and lends it to the composer (`ZeroSink`), which
+    // shows frames of the app's share images itself; the framebuffer then hands this thread a frame
+    // without pixels, already on the window. The presenter is shared behind a mutex; this thread
+    // makes it and drops it (`GpuSlot`), the sink withdrawn first.
+    let gpu = GpuSlot { framebuffer, slot: Arc::default() };
+    let (mut has_gpu, mut gpu_failed, mut sink_on) = (false, false, false);
     let mut gpu_size = (0u32, 0u32);
     while !stop.load(Ordering::Acquire) {
-        let want_gpu = crate::gpu::window_present::on() && !gpu_failed;
-        if want_gpu && gpu.is_none() {
+        let zero = crate::gpu::share::on();
+        let want_gpu = (crate::gpu::window_present::on() || zero) && !gpu_failed;
+        if want_gpu && !has_gpu {
             match crate::gpu::window_present::WindowPresenter::new(raw) {
                 Ok(p) => {
                     eprintln!("[window] present_gpu: the window presented by {}", p.describe());
                     presenter.clear();
-                    gpu = Some(p);
+                    *gpu.slot.lock() = Some(p);
+                    has_gpu = true;
                     gpu_size = (0, 0);
                     shown = shown.saturating_sub(1); // the current frame, on the swapchain at once
                 }
@@ -504,37 +556,55 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
                     gpu_failed = true;
                 }
             }
-        } else if !want_gpu && gpu.is_some() {
-            gpu = None;
+        } else if !want_gpu && has_gpu {
+            gpu.release();
+            (has_gpu, sink_on) = (false, false);
             shown = shown.saturating_sub(1);
             eprintln!("[window] present_gpu off: GDI");
         }
-        let resized = gpu.is_some() && presenter.client_size().is_some_and(|s| s != gpu_size);
+        if has_gpu && zero && !sink_on {
+            framebuffer.set_sink(Some(Arc::new(WindowSink { slot: Arc::clone(&gpu.slot), presenter: presenter.clone() })));
+            sink_on = true;
+            eprintln!("[window] present_zero: the composer shows the app's share images in the window");
+        } else if sink_on && !zero {
+            framebuffer.set_sink(None);
+            sink_on = false;
+            eprintln!("[window] present_zero off");
+        }
+        let resized = has_gpu && presenter.client_size().is_some_and(|s| s != gpu_size);
         if framebuffer.wait_frame(shown + 1, if resized { Duration::ZERO } else { FRAME_WAIT }) || resized {
-            let (n, fw, fh, pixels, bgra) = framebuffer.frame_raw();
+            let (n, fw, fh, pixels) = framebuffer.frame_for_window();
             if n > shown || resized {
                 shown = n;
-                let shown_now = if let Some(g) = gpu.as_mut() {
-                    let client = presenter.client_size().unwrap_or_default();
-                    match g.present(&pixels, fw, fh, bgra, client) {
-                        Ok(_) => {
-                            // Drawn or not (minimised, a swapchain out of date): the next frame
-                            // tries again; this size is not retried in a loop.
-                            gpu_size = client;
-                            Ok(())
-                        }
-                        Err(e) => {
-                            eprintln!("[window] present_gpu failed ({e}); GDI");
-                            gpu = None;
-                            gpu_failed = true;
-                            if bgra { presenter.present_bgra(pixels, fw, fh) } else { presenter.present_rgba(&pixels, fw, fh) }
+                let client = presenter.client_size().unwrap_or_default();
+                let shown_now = match pixels {
+                    // Already on the window (the composer showed it from share images): at a new
+                    // size, the composer's next frame is drawn at it.
+                    None => {
+                        gpu_size = client;
+                        Ok(())
+                    }
+                    Some((pixels, bgra)) if has_gpu => {
+                        let mut slot = gpu.slot.lock();
+                        match slot.as_mut().map(|g| g.present(&pixels, fw, fh, bgra, client)) {
+                            Some(Ok(_)) => {
+                                // Drawn or not (minimised, a swapchain out of date): the next frame
+                                // tries again; this size is not retried in a loop.
+                                gpu_size = client;
+                                Ok(())
+                            }
+                            failed => {
+                                drop(slot);
+                                eprintln!("[window] present_gpu failed ({:?}); GDI", failed.and_then(Result::err));
+                                gpu.release();
+                                (has_gpu, sink_on, gpu_failed) = (false, false, true);
+                                if bgra { presenter.present_bgra(pixels, fw, fh) } else { presenter.present_rgba(&pixels, fw, fh) }
+                            }
                         }
                     }
-                } else if bgra {
                     // A BGRA frame (`present_bgra`) is the window's own format: handed over shared.
-                    presenter.present_bgra(pixels, fw, fh)
-                } else {
-                    presenter.present_rgba(&pixels, fw, fh)
+                    Some((pixels, true)) => presenter.present_bgra(pixels, fw, fh),
+                    Some((pixels, false)) => presenter.present_rgba(&pixels, fw, fh),
                 };
                 match shown_now {
                     Ok(()) => presented += 1,

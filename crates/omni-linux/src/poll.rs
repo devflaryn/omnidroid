@@ -38,6 +38,35 @@ pub const ERR: u32 = 0x008;
 pub const HUP: u32 = 0x010;
 const NVAL: u32 = 0x020;
 const ONESHOT: u32 = 1 << 30;
+/// `EPOLLET`: report a descriptor once per change, not for as long as it is ready.
+const EDGE: u32 = 1 << 31;
+
+/// `epoll_et=0|1` (lever; **1 by default**: it is Linux's meaning): `EPOLLET` entries are
+/// edge-triggered. 0 treats them as level-triggered, as before, for an A/B.
+pub static EDGE_TRIGGERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// **Changes told, by key, for edge-triggered epoll** (`EPOLLET`): each [`notify_key`] bumps its
+/// key's slot, each [`notify`] the common word; an edge-triggered entry is armed again when either
+/// moved since it last looked (and on a rising readiness bit), and reports once. A hashed table:
+/// two keys sharing a slot only re-arm each other (a spurious event, which `EPOLLET` users take).
+static EDGES: [std::sync::atomic::AtomicU32; 1 << 14] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 14];
+static EDGE_ALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn edge_slot(key: Key) -> &'static std::sync::atomic::AtomicU32 {
+    &EDGES[((key >> 4) ^ (key >> 18) ^ (key >> 32)) & ((1 << 14) - 1)]
+}
+
+/// Count a change of `key` for edge-triggered entries (what [`notify_key`] does, without waking
+/// anyone): a timerfd's expiry count taken, which no waiter needs to hear of.
+pub(crate) fn edge(key: Key) {
+    edge_slot(key).fetch_add(1, Ordering::AcqRel);
+}
+
+/// The changes counted for `key` (or none: the common word only), as one number to compare.
+fn edges_of(key: Option<Key>) -> u64 {
+    let own = key.map_or(0, |k| edge_slot(k).load(Ordering::Acquire));
+    (u64::from(own) << 32) | u64::from(EDGE_ALL.load(Ordering::Acquire))
+}
 const O_NONBLOCK: u32 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
 
@@ -79,6 +108,7 @@ static QUEUES: LazyLock<Mutex<Queues>> = LazyLock::new(Mutex::default);
 /// Something changed that no key names (a descriptor closed, an `epoll` set edited): wake every
 /// waiter to look again.
 pub fn notify() {
+    EDGE_ALL.fetch_add(1, Ordering::AcqRel);
     let mut q = QUEUES.lock();
     q.generation += 1;
     for w in q.anything.iter().chain(q.keyed.values().flatten()) {
@@ -90,6 +120,7 @@ pub fn notify() {
 
 /// What `key` names changed: wake its waiters, and those waiting on anything.
 pub fn notify_key(key: Key) {
+    edge(key);
     let mut q = QUEUES.lock();
     q.generation += 1;
     for w in q.anything.iter().chain(q.keyed.get(&key).into_iter().flatten()) {
@@ -118,6 +149,9 @@ pub fn wake_everyone() {
 
 /// What each of `keys` names changed: [`notify_key`] for them all, under one lock.
 pub fn notify_keys(keys: &[Key]) {
+    for key in keys {
+        edge(*key);
+    }
     let mut q = QUEUES.lock();
     q.generation += 1;
     for w in &q.anything {
@@ -556,6 +590,8 @@ fn timerfd_read(timer: &TimerFd, buf: &mut [u8], nonblocking: bool, task: &Task)
         let watch = watch(Some(vec![std::ptr::from_ref(timer) as Key]));
         let n = timer.take(Instant::now());
         if n > 0 {
+            // Its expiries taken: the next one is a new edge (`EPOLLET`).
+            edge(std::ptr::from_ref(timer) as Key);
             buf[..8].copy_from_slice(&n.to_le_bytes());
             return Ok(8);
         }
@@ -594,13 +630,43 @@ fn readiness(file: &OpenFile, now: Instant) -> (u32, Option<Instant>) {
 // ---------------------------------------------------------------------------------- epoll
 
 pub struct Epoll {
-    /// fd -> (the file when added, the events asked for, the caller's data).
-    interest: Mutex<BTreeMap<i32, (std::sync::Weak<OpenFile>, u32, u64)>>,
+    /// fd -> (the file when added, the events asked for, the caller's data, its edge state).
+    interest: Mutex<BTreeMap<i32, (std::sync::Weak<OpenFile>, u32, u64, Edge)>>,
+}
+
+/// An `EPOLLET` entry's state: whether a change since its last report arms it, the changes counted
+/// for it when it last looked ([`edges_of`]), and the readiness it saw then.
+#[derive(Clone, Copy)]
+struct Edge {
+    armed: bool,
+    seen: u64,
+    last: u32,
+}
+
+impl Edge {
+    /// Added or changed (`EPOLL_CTL_ADD`/`MOD`): reported once if ready, as Linux does.
+    fn new() -> Self {
+        Self { armed: true, seen: 0, last: 0 }
+    }
+
+    /// Whether to report `ready` now; looked at every scan. Armed by a change told for the file
+    /// or a readiness bit that was not there at the last look; disarmed by a report.
+    fn report(&mut self, edges: u64, ready: u32, wanted: u32) -> bool {
+        if edges != self.seen {
+            self.seen = edges;
+            self.armed = true;
+        }
+        if ready & !self.last != 0 {
+            self.armed = true;
+        }
+        self.last = ready;
+        self.armed && ready & wanted != 0
+    }
 }
 
 impl Epoll {
     fn any_ready(&self, now: Instant) -> bool {
-        self.interest.lock().values().any(|(file, events, _)| {
+        self.interest.lock().values().any(|(file, events, _, _)| {
             file.upgrade().is_some_and(|f| readiness(&f, now).0 & (*events | ERR | HUP) != 0)
         })
     }
@@ -639,13 +705,13 @@ fn sys_epoll_ctl(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
             let ev = p.mem.read(a[3], 16)?;
             let events = u32::from_le_bytes(ev[0..4].try_into().expect("4"));
             let data = u64::from_le_bytes(ev[8..16].try_into().expect("8"));
-            let present = interest.get(&fd).is_some_and(|(f, _, _)| f.upgrade().is_some_and(|f| Arc::ptr_eq(&f, &file)));
+            let present = interest.get(&fd).is_some_and(|(f, _, _, _)| f.upgrade().is_some_and(|f| Arc::ptr_eq(&f, &file)));
             match (a[1], present) {
                 (ADD, true) => return Err(EEXIST),
                 (MOD, false) => return Err(ENOENT),
                 _ => {}
             }
-            interest.insert(fd, (Arc::downgrade(&file), events, data));
+            interest.insert(fd, (Arc::downgrade(&file), events, data, Edge::new()));
             drop(interest);
             // The set's own waiters look again (`poll_keyed`), or everyone does.
             if keyed() {
@@ -695,8 +761,8 @@ fn sys_epoll_pwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         let mut earliest: Option<Instant> = None;
         {
             let mut interest = ep.interest.lock();
-            interest.retain(|_, (f, _, _)| f.strong_count() > 0);
-            for (fd, (file, events, data)) in interest.iter_mut() {
+            interest.retain(|_, (f, _, _, _)| f.strong_count() > 0);
+            for (fd, (file, events, data, edge)) in interest.iter_mut() {
                 // A descriptor closed since it was added (its number reused) is not reported.
                 let Some(file) = file.upgrade() else { continue };
                 if !p.fds.get(*fd).is_ok_and(|f| Arc::ptr_eq(&f, &file)) {
@@ -707,7 +773,17 @@ fn sys_epoll_pwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
                     earliest = Some(earliest.map_or(n, |e: Instant| e.min(n)));
                 }
                 let got = ready & (*events | ERR | HUP);
+                // `EPOLLET`: once per change, not for as long as it is ready. Treated as level,
+                // a socket that stays writable (UDP: always) or an eventfd nobody reads (mio's
+                // waker: written to wake, never read) answers every wait at once -- tokio's
+                // driver then never sleeps (DnsResolver's `doh-handler` at 99% of a core).
+                if *events & EDGE != 0 && EDGE_TRIGGERED.load(Ordering::Relaxed) && !edge.report(edges_of(key_of(&file)), ready, *events | ERR | HUP) {
+                    continue;
+                }
                 if got != 0 && count < max as usize {
+                    if *events & EDGE != 0 {
+                        edge.armed = false;
+                    }
                     let mut event = [0u8; 16];
                     event[..4].copy_from_slice(&got.to_le_bytes());
                     event[8..].copy_from_slice(&data.to_le_bytes());
@@ -737,7 +813,7 @@ fn sys_epoll_pwait(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             // What the set waits on: its descriptors' keys. Then look again.
             watching = Some({
                 let interest = ep.interest.lock();
-                let files: Vec<Arc<OpenFile>> = interest.values().filter_map(|(f, _, _)| f.upgrade()).collect();
+                let files: Vec<Arc<OpenFile>> = interest.values().filter_map(|(f, _, _, _)| f.upgrade()).collect();
                 let mut keys = keys_of(files.iter().map(|f| &**f));
                 if let (Some(keys), true) = (keys.as_mut(), keyed()) {
                     // `poll_keyed`: an edit of the set (`epoll_ctl`) is told by the set's key.

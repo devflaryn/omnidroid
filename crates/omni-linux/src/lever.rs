@@ -48,6 +48,11 @@
 //!   for its own fences -- the release worker's copy, a sync-file export -- the driver's wait (the
 //!   default) or asked every `<us>` (100 by default) with a sleep between
 //!   (`crate::gpu::native::RELEASE_WAIT_US`; `event` measured not available).
+//! - `present_zero=0|1`: the app's released frames also copied (on the GPU) into share images, and
+//!   the system's composer shows a frame whose every layer has one through the window's own GPU
+//!   (blended there), its pixels composed on the CPU only for a reader (`crate::gpu::share`). Needs
+//!   the app's devices made with `OMNI_PRESENT_ZERO=ready` (or `=1`, on from the start). Off by
+//!   default.
 //! - `gralloc_direct=0|1`: an app's released frame copied by the GPU straight into its gralloc
 //!   region (imported as Vulkan memory) instead of into a staging buffer the release worker then
 //!   copies on the CPU (`crate::gpu::native::DIRECT`). Needs devices made with
@@ -67,8 +72,10 @@
 //!   and other self-answered sockets, unix `accept`, host sockets' waits, `/dev/fuse`, `epoll_ctl`)
 //!   are woken by their own changes only (1), not by every change in the host process (0, the
 //!   default) (`crate::poll::KEYED`; `OMNI_POLL_STATS` counts what is left).
+//! - `epoll_et=0|1`: `EPOLLET` epoll entries edge-triggered (1, the default; Linux's meaning) or
+//!   level-triggered as before (0) (`crate::poll::EDGE_TRIGGERED`).
 //! - `remote_direct=0|1`: the system's host process reads and writes an app's guest memory itself
-//!   (1) rather than over the app thread's connection (0, the default; `OMNI_REMOTE_DIRECT=1`)
+//!   (1, the default) rather than over the app thread's connection (0; `OMNI_REMOTE_DIRECT=0`)
 //!   (`crate::remote::DIRECT`; `OMNI_REMOTE_STATS` counts both).
 //! - `binder_host_pool=0|1`: a host service's binder calls run on kept, reused threads (1) or on a
 //!   new thread each (0, the default; `OMNI_BINDER_HOST_POOL`) (`crate::binder::HOST_POOL`).
@@ -259,6 +266,15 @@ pub fn apply(line: &str) -> Option<String> {
             crate::poll::SLICE_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
             Some(format!("poll_slice_ms={}: a poll-family wait looks again by itself every {} ms", ms.max(1), ms.max(1)))
         }
+        "epoll_et" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::poll::EDGE_TRIGGERED.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("epoll_et={}: EPOLLET entries are {}", u8::from(on), if on { "edge-triggered" } else { "level-triggered (the old behaviour)" }))
+        }
         "remote_direct" => {
             let on = match value.trim() {
                 "1" => true,
@@ -353,6 +369,16 @@ pub fn apply(line: &str) -> Option<String> {
             crate::gpu::native::RELEASE_WAIT_US.store(us, std::sync::atomic::Ordering::Relaxed);
             Some(format!("release_poll={us}: release_wait=poll, the fence asked every {us} us"))
         }
+        "present_zero" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let _ = crate::gpu::share::wanted();
+            crate::gpu::share::ZERO.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("present_zero={}", u8::from(on)))
+        }
         "gralloc_direct" => {
             let on = match value.trim() {
                 "1" => true,
@@ -430,9 +456,10 @@ pub fn start() {
         crate::poll::KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[lever] OMNI_POLL_KEYED: poll_keyed={}", u8::from(on));
     }
-    if std::env::var("OMNI_REMOTE_DIRECT").as_deref() == Ok("1") {
-        crate::remote::DIRECT.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("[lever] OMNI_REMOTE_DIRECT: remote_direct=1");
+    if let Ok(v) = std::env::var("OMNI_REMOTE_DIRECT") {
+        let on = v.trim() != "0";
+        crate::remote::DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_REMOTE_DIRECT: remote_direct={}", u8::from(on));
     }
     let Some(path) = std::env::var_os("OMNI_LEVER_FILE").map(PathBuf::from) else { return };
     let _ = std::thread::Builder::new().name("omni-lever".into()).spawn(move || {
@@ -512,6 +539,10 @@ mod tests {
         assert_eq!(w.load(Ordering::Relaxed), 0);
         assert_eq!(apply("release_poll=0"), None);
         assert_eq!(apply("release_wait=sleep"), None);
+        assert_eq!(apply("present_zero=1").as_deref(), Some("present_zero=1"));
+        assert!(crate::gpu::share::on());
+        apply("present_zero=0").expect("understood");
+        assert!(!crate::gpu::share::on());
     }
 
     #[test]

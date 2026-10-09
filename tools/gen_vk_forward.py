@@ -695,7 +695,11 @@ def emit_guest_h(sel: Selection) -> str:
             "/* Every forwarded command and alias name, sorted by strcmp (bsearch-able). */",
             "extern const struct omni_vk_entry omni_vk_entries[];", "extern const unsigned omni_vk_entry_count;", "",
             "/* The transport (driver.c): command `id` with `argc` 64-bit arguments; its result. */",
-            "uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc);", "",
+            "uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc);",
+            "/* The same, for arguments with 32 bytes of room right before them for the request (a generated",
+            " * command's OMNI_VK_FRAME): no copy of them, whichever form the request takes. */",
+            "uint64_t omni_vk_call_framed(uint32_t id, uint64_t* args, uint32_t argc);",
+            "#define OMNI_VK_FRAME(n) struct { uint64_t omni_head[4]; uint64_t a[n]; } omni_f; uint64_t* const omni_a = omni_f.a", "",
             "/* Batching (driver.c, OMNI_VK_BATCH): a command that returns nothing and records into a command",
             " * buffer is put in that buffer's batch, with the arrays it points at (`bytes` at argument `arg`)",
             " * copied in, and sent with the rest at the buffer's end (or when the batch is full, or before any",
@@ -703,7 +707,11 @@ def emit_guest_h(sel: Selection) -> str:
             "struct omni_vk_copy {", "    uint32_t arg;", "    size_t bytes;", "};",
             "void omni_vk_record(uint32_t id, const uint64_t* args, uint32_t argc, const struct omni_vk_copy* copies, uint32_t ncopies);",
             "enum { OMNI_VK_SYNC_FLUSH, OMNI_VK_SYNC_BEGIN, OMNI_VK_SYNC_END, OMNI_VK_SYNC_DISCARD };",
-            "void omni_vk_sync(VkCommandBuffer commandBuffer, int how);", "",
+            "void omni_vk_sync(VkCommandBuffer commandBuffer, int how);",
+            "/* vkResetCommandPool / vkDestroyCommandPool: the pool's command buffers' unsent batches are",
+            " * discarded (and, destroyed, their wrappers freed). */",
+            "enum { OMNI_VK_POOL_RESET, OMNI_VK_POOL_DESTROY };",
+            "void omni_vk_pool_sync(uint64_t commandPool, int how);", "",
             "/* The special entry points (tools/vk/special.txt), written by hand. */"]
     for canon in sel.ids:
         if canon in sel.special:
@@ -727,7 +735,7 @@ def emit_guest_c(sel: Selection) -> str:
         n = len(cmd.params)
         locals_ = {p.name for p in cmd.params}
         assert not locals_ & {"omni_a", "omni_r"} and not any(x.startswith("omni_bits") for x in locals_), canon
-        body = [f"    uint64_t omni_a[{n}];"]
+        body = [f"    OMNI_VK_FRAME({n});"]
         for i, p in enumerate(cmd.params):
             kind = "addr" if i == 0 else reg.travel(p)[0]
             if kind == "addr":
@@ -738,7 +746,7 @@ def emit_guest_c(sel: Selection) -> str:
                 w = "uint32_t" if kind == "f32" else "uint64_t"
                 body += [f"    {w} omni_bits{i};", f"    memcpy(&omni_bits{i}, &{p.name}, sizeof omni_bits{i});",
                          f"    omni_a[{i}] = omni_bits{i};"]
-        call = f"omni_vk_call(OMNI_VK_ID_{screaming(canon)}, omni_a, {n})"
+        call = f"omni_vk_call_framed(OMNI_VK_ID_{screaming(canon)}, omni_a, {n})"
         plan = sel.batch_plan(canon)
         if plan is not None:
             if plan:
@@ -751,6 +759,10 @@ def emit_guest_c(sel: Selection) -> str:
         if reg.resolve(cmd.params[0].type) == "VkCommandBuffer":
             how = {"vkBeginCommandBuffer": "BEGIN", "vkEndCommandBuffer": "END", "vkResetCommandBuffer": "DISCARD"}.get(canon, "FLUSH")
             body.insert(0, f"    omni_vk_sync({cmd.params[0].name}, OMNI_VK_SYNC_{how});")
+        # A pool reset or destroyed resets or frees its command buffers: what they had not sent goes.
+        pool_how = {"vkResetCommandPool": "RESET", "vkDestroyCommandPool": "DESTROY"}.get(canon)
+        if pool_how:
+            body.insert(0, f"    omni_vk_pool_sync((uint64_t)(uintptr_t)commandPool, OMNI_VK_POOL_{pool_how});")
         ret = RETURNS[cmd.ret_decl]
         if ret == "void":
             body.append(f"    (void){call};")

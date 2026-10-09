@@ -175,6 +175,7 @@ VKAPI_ATTR VkResult VKAPI_CALL omni_vkAllocateCommandBuffers(VkDevice device, co
     for (uint32_t i = 0; i < n; i++) {
         if (r == VK_SUCCESS) {
             wrappers[i]->obj.host = OMNI_U64(pCommandBuffers[i]);
+            omni_vk_cmdbuf_live(wrappers[i], OMNI_U64(pAllocateInfo->commandPool));
             pCommandBuffers[i] = (VkCommandBuffer)wrappers[i];
         } else {
             free(wrappers[i]);
@@ -188,6 +189,8 @@ VKAPI_ATTR void VKAPI_CALL omni_vkFreeCommandBuffers(VkDevice device, VkCommandP
                                                      const VkCommandBuffer* pCommandBuffers) {
     CALL(OMNI_VK_ID_VK_FREE_COMMAND_BUFFERS, OMNI_U64(device), OMNI_U64(commandPool), commandBufferCount, OMNI_U64(pCommandBuffers));
     for (uint32_t i = 0; i < commandBufferCount; i++) {
+        if (pCommandBuffers[i] == VK_NULL_HANDLE) continue;
+        omni_vk_cmdbuf_gone((struct omni_vk_cmdbuf*)pCommandBuffers[i]);
         omni_vk_sync(pCommandBuffers[i], OMNI_VK_SYNC_DISCARD);
         free(pCommandBuffers[i]);
     }

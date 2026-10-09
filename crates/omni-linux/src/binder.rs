@@ -2217,14 +2217,23 @@ pub mod spawn {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
 
-    /// The kernel's rule (see the module); off: the eager one this driver had.
-    pub static KERNEL_RULE: AtomicBool = AtomicBool::new(false);
+    /// The kernel's rule (see the module), **on by default** since the boot A/B of 2026-10-09 (PS99,
+    /// fresh boots: the system host 919 -> 528-535 threads, ~40-50 MB less private working set, the
+    /// same CPU a frame); `OMNI_BINDER_SPAWN=eager` (or the lever) is the eager one this driver had.
+    pub static KERNEL_RULE: AtomicBool = AtomicBool::new(true);
 
     /// Read the environment (once, at start).
     pub fn from_env() {
-        if std::env::var("OMNI_BINDER_SPAWN").as_deref() == Ok("kernel") {
-            KERNEL_RULE.store(true, Ordering::Relaxed);
-            eprintln!("[lever] OMNI_BINDER_SPAWN: binder_spawn=kernel");
+        match std::env::var("OMNI_BINDER_SPAWN").as_deref() {
+            Ok("kernel") => {
+                KERNEL_RULE.store(true, Ordering::Relaxed);
+                eprintln!("[lever] OMNI_BINDER_SPAWN: binder_spawn=kernel");
+            }
+            Ok("eager") => {
+                KERNEL_RULE.store(false, Ordering::Relaxed);
+                eprintln!("[lever] OMNI_BINDER_SPAWN: binder_spawn=eager");
+            }
+            _ => {}
         }
         if let Some(n) = cap() {
             eprintln!("[lever] OMNI_BINDER_MAX_LOOPERS: at most {n} binder loopers a process (but {})", keep().join(","));

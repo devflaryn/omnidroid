@@ -392,7 +392,11 @@ fn ask(kind: u8, payload: &[u8]) -> Result<(u8, Vec<u8>), Errno> {
 /// Not the owner's: the guest's own protection beyond the host's (a page the guest maps read-only
 /// that the host keeps writable would take the write), and the owner's layout lock (an `munmap`
 /// racing the copy: the copy fails and falls back, or lands before it -- as Linux's would).
-pub static DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// **On by default** since the in-world A/B of 2026-10-09 (PS99 session s5: ~783 round trips a
+/// second become direct accesses, 0 fell back; the game's host process about -1 ms of CPU a frame,
+/// 4/4 pairs). `OMNI_REMOTE_DIRECT=0` or the lever `remote_direct=0` is the way back.
+pub static DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 static DIRECT_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIRECT_FELL_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1062,15 +1066,18 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let Some(page) = own_gate() else { return };
         page.word(1).fetch_add(1, SeqCst);
-        let shut = std::thread::spawn(|| {
-            let t = std::time::Instant::now();
-            gate(true);
-            t.elapsed()
-        });
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shut = {
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                gate(true);
+                released.load(SeqCst)
+            })
+        };
         std::thread::sleep(std::time::Duration::from_millis(50));
+        released.store(true, SeqCst);
         page.word(1).fetch_sub(1, SeqCst);
-        let waited = shut.join().unwrap();
-        assert!(waited >= std::time::Duration::from_millis(40), "shut after the lease ended ({waited:?})");
+        assert!(shut.join().unwrap(), "shut only after the lease ended");
         assert!(page.word(0).load(SeqCst) >= 1, "shut");
         gate(false);
     }
