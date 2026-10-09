@@ -1,27 +1,28 @@
 //! `r_roblox`'s time-to-game switches (`common::r_scripts`), checked without booting anything: the
-//! defaults keep the old scripts, and each switch's script says what the old one said, so the host
+//! defaults are the fast scripts (the old ones one variable away), and each switch's script says
+//! what the old one said, so the host
 //! side (which waits for those lines) and the run's reader see the same milestones.
 mod common;
 
 use common::r_scripts;
 
 #[test]
-fn the_defaults_are_the_old_scripts() {
+fn the_defaults_are_the_fast_scripts_and_the_old_ones_stay_reachable() {
     // One test sets and reads the variables, so parallel tests cannot race on them.
     std::env::remove_var("OMNI_R_LINK_DELAY");
     std::env::remove_var("OMNI_R_PLANT_FIRST");
     std::env::remove_var("OMNI_R_FAST_SETUP");
-    assert_eq!(r_scripts::link_delay(), 45);
-    assert!(!r_scripts::plant_first());
-    assert!(!r_scripts::fast_setup());
-    std::env::set_var("OMNI_R_LINK_DELAY", "3");
-    std::env::set_var("OMNI_R_PLANT_FIRST", "1");
-    std::env::set_var("OMNI_R_FAST_SETUP", "1");
     assert_eq!(r_scripts::link_delay(), 3);
     assert!(r_scripts::plant_first());
     assert!(r_scripts::fast_setup());
+    std::env::set_var("OMNI_R_LINK_DELAY", "45");
+    std::env::set_var("OMNI_R_PLANT_FIRST", "0");
+    std::env::set_var("OMNI_R_FAST_SETUP", "0");
+    assert_eq!(r_scripts::link_delay(), 45);
+    assert!(!r_scripts::plant_first());
+    assert!(!r_scripts::fast_setup());
     std::env::set_var("OMNI_R_LINK_DELAY", "soon");
-    assert_eq!(r_scripts::link_delay(), 45, "an unreadable value is the default");
+    assert_eq!(r_scripts::link_delay(), 3, "an unreadable value is the default");
     std::env::remove_var("OMNI_R_LINK_DELAY");
     std::env::remove_var("OMNI_R_PLANT_FIRST");
     std::env::remove_var("OMNI_R_FAST_SETUP");
