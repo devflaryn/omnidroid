@@ -110,6 +110,7 @@ pub mod hypervisor;
 pub mod keyboard;
 pub mod log;
 pub mod net;
+pub mod peer;
 pub mod process;
 pub mod sampler;
 pub mod vm;

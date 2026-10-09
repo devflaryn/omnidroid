@@ -63,6 +63,10 @@ pub struct GuestMem {
     /// copy path for every process that is not: one relaxed load.
     paired: std::sync::atomic::AtomicBool,
     resident: parking_lot::Mutex<Option<Arc<dyn Resident>>>,
+    /// Whether this view holds the remote direct-access gate shut (`crate::remote::gate`): while it
+    /// journals or is one side of a fork pair, the system's host process must not read or write
+    /// this memory itself -- the kernel's writes must be journaled, and a shelved side's must wait.
+    gated: parking_lot::Mutex<bool>,
 }
 
 impl GuestMem {
@@ -76,11 +80,23 @@ impl GuestMem {
             journal: parking_lot::Mutex::default(),
             paired: std::sync::atomic::AtomicBool::new(false),
             resident: parking_lot::Mutex::default(),
+            gated: parking_lot::Mutex::new(false),
+        }
+    }
+
+    /// Hold the remote direct-access gate shut (`exposed`) or let it go. Shut **before** a journal
+    /// or a pair starts -- it waits out any direct access in flight -- and let go after both end.
+    fn gate_to(&self, exposed: bool) {
+        let mut gated = self.gated.lock();
+        if *gated != exposed {
+            *gated = exposed;
+            crate::remote::gate(exposed);
         }
     }
 
     /// This view is one side of a live fork pair: every copy waits for its turn in the memory.
     pub(crate) fn share_with(&self, side: Arc<dyn Resident>) {
+        self.gate_to(true);
         *self.resident.lock() = Some(side);
         self.paired.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -89,6 +105,7 @@ impl GuestMem {
     pub(crate) fn unshare(&self) {
         self.paired.store(false, std::sync::atomic::Ordering::SeqCst);
         *self.resident.lock() = None;
+        self.gate_to(self.journaling.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Wait until this side's view is the one in the address space. Called before a copy takes the
@@ -110,6 +127,7 @@ impl GuestMem {
 
     /// Start recording the ranges written through this view.
     pub fn start_journal(&self) {
+        self.gate_to(true);
         self.journal.lock().clear();
         self.journaling.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -117,7 +135,9 @@ impl GuestMem {
     /// Stop recording; the ranges written since `start_journal`.
     pub fn take_journal(&self) -> Vec<(u64, usize)> {
         self.journaling.store(false, std::sync::atomic::Ordering::SeqCst);
-        std::mem::take(&mut *self.journal.lock())
+        let journal = std::mem::take(&mut *self.journal.lock());
+        self.gate_to(self.paired.load(std::sync::atomic::Ordering::SeqCst));
+        journal
     }
 
     fn note(&self, addr: u64, len: usize) {
@@ -238,6 +258,11 @@ impl GuestMem {
 
     pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
         if let Some(r) = self.remote.get() {
+            // Nothing to read is nothing to ask the app's host process for (a transaction's empty
+            // offsets array, every one): the local path answers it so too, unchecked.
+            if len == 0 {
+                return Ok(Vec::new());
+            }
             return r.read(untag(addr), len);
         }
         // Before the layout lock, never while holding it: a switch takes it exclusively.
@@ -252,6 +277,9 @@ impl GuestMem {
     /// GPU command reads its request and arguments this way, thousands of times a frame).
     pub fn read_into(&self, addr: u64, out: &mut [u8]) -> Result<(), Errno> {
         if let Some(r) = self.remote.get() {
+            if out.is_empty() {
+                return Ok(());
+            }
             let bytes = r.read(untag(addr), out.len())?;
             if bytes.len() != out.len() {
                 return Err(EFAULT);
@@ -276,6 +304,9 @@ impl GuestMem {
     /// private copy it just made).
     pub(crate) fn write_holding_layout(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
         if let Some(r) = self.remote.get() {
+            if bytes.is_empty() {
+                return Ok(());
+            }
             return r.write(untag(addr), bytes);
         }
         let start = self.check(addr, bytes.len(), true)?;

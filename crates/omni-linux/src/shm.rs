@@ -85,6 +85,54 @@ impl Drop for View {
     }
 }
 
+/// **One page of words two host processes share** (`crate::remote`'s direct-access gate): a file
+/// in [`host_dir`] mapped in each, so its words are one memory and atomic operations on them are
+/// atomic across both processes. Made by one process ([`SharedPage::create`]), opened by the other
+/// by its path ([`SharedPage::open`]).
+pub(crate) struct SharedPage {
+    view: View,
+    path: std::path::PathBuf,
+    _file: std::fs::File,
+}
+
+impl SharedPage {
+    /// A new page, zeroed, its file named `<prefix>-<pid>` in [`host_dir`].
+    pub(crate) fn create(prefix: &str) -> Option<Self> {
+        let path = host_dir().join(format!("{prefix}-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).ok()?;
+        file.set_len(omni_platform::vm::page_size() as u64).ok()?;
+        let view = View::map(&file, &path, omni_platform::vm::page_size() as u64)?;
+        Some(Self { view, path, _file: file })
+    }
+
+    /// The page another process made, by its path: only a file in [`host_dir`] named with `prefix`.
+    pub(crate) fn open(path: &std::path::Path, prefix: &str) -> Option<Self> {
+        let named = path.parent() == Some(host_dir().as_path()) && path.file_name()?.to_str()?.starts_with(prefix);
+        if !named {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len < 64 {
+            return None;
+        }
+        let view = View::map(&file, path, len)?;
+        Some(Self { view, path: path.to_path_buf(), _file: file })
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Word `i` of the page (`i` < 16).
+    pub(crate) fn word(&self, i: usize) -> &std::sync::atomic::AtomicU32 {
+        assert!(i < 16, "a shared page's word {i}");
+        // SAFETY: the view is mapped read-write for at least 64 bytes (`create`/`open`) and lives
+        // as long as `self`; word `i` is 4-aligned inside it.
+        unsafe { &*((self.view.base + i * 4) as *const std::sync::atomic::AtomicU32) }
+    }
+}
+
 /// Bytes of a graphics buffer's host view, borrowed ([`Shm::bytes`]).
 pub struct ShmBytes<'a> {
     _view: parking_lot::RwLockReadGuard<'a, Option<View>>,
