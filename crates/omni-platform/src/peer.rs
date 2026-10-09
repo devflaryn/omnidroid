@@ -25,7 +25,9 @@ use crate::process::{ProcessError, ProcessResult};
 pub struct PeerMemory {
     #[cfg(windows)]
     handle: windows_sys::Win32::Foundation::HANDLE,
+    // Read only by the Linux calls; elsewhere `open` refuses, so it is never made.
     #[cfg(not(windows))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pid: i32,
 }
 
