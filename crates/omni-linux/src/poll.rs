@@ -99,12 +99,13 @@ pub fn notify_key(key: Key) {
     STATS.anything_woken.fetch_add(q.anything.len() as u64, Ordering::Relaxed);
 }
 
-/// `poll_slice_ms=<ms>` (lever; 50 by default): the longest a poll-family wait sleeps before it
-/// looks again by itself. It was the only way a signal posted to a waiting task was seen, so every
+/// `poll_slice_ms=<ms>` (lever; **1000 by default** since the in-world A/B of 2026-10-09, PS99
+/// session s4: 50 -> 1000 ms gave the system host 40 -> 31 ms of CPU a frame and fps +1.4..+5.1;
+/// it was 50): the longest a poll-family wait sleeps before it looks again by itself. It was the only way a signal posted to a waiting task was seen, so every
 /// waiting thread woke 20 times a second -- the system's host process has ~700 of them, ~14,000
 /// wake-ups a second for nothing. A posted signal now wakes the waiters itself
 /// ([`wake_everyone`], from `Process::post_signal` and a process's end), so the slice can be long.
-pub static SLICE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(50);
+pub static SLICE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
 
 /// Wake every waiter of this host process to look again: a signal was posted (the waiter whose
 /// task it is sees it and answers `EINTR`), or a process is ending. Rare.

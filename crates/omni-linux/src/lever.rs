@@ -73,7 +73,7 @@
 //!   its rule that a windowless process's timer resolution is not honoured
 //!   (`omni_platform::clock::allow_power_throttling`); `auto` gives the choice back to the host.
 //! - `poll_slice_ms=<ms>`: the longest a poll-family wait sleeps before looking again by itself
-//!   (`crate::poll::SLICE_MS`, 50 by default); a posted signal wakes the waiters directly.
+//!   (`crate::poll::SLICE_MS`, 1000 by default); a posted signal wakes the waiters directly.
 //! - `futex_herd=0|1`: 1 makes every futex wake unpark every task waiting in the process (the old
 //!   one-condition-variable behaviour, `crate::futex::HERD`), to A/B the per-task wake against it.
 //! - `vk_fast=0|1`: the Vulkan forwarding's fast path (`crate::gpu::FAST`: no allocation per
