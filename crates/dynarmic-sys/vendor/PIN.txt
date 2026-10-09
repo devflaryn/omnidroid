@@ -50,6 +50,7 @@ dynarmic/
                and ../patches/0042-x64-dispatch-hit-paths-inline.patch
                and ../patches/0050-x64-shared-cache-eviction-on-demand.patch
                and ../patches/0051-x64-fastmem-site-records-of-8-bytes.patch
+               and ../patches/0052-x64-compact-block-map-link-heads-and-guest-ranges.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
