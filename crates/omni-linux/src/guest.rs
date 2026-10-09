@@ -134,10 +134,26 @@ impl GuestMem {
 
     /// Stop recording; the ranges written since `start_journal`.
     pub fn take_journal(&self) -> Vec<(u64, usize)> {
-        self.journaling.store(false, std::sync::atomic::Ordering::SeqCst);
-        let journal = std::mem::take(&mut *self.journal.lock());
-        self.gate_to(self.paired.load(std::sync::atomic::Ordering::SeqCst));
+        let journal = self.take_journal_gated();
+        self.journal_done();
         journal
+    }
+
+    /// [`take_journal`](Self::take_journal) with the remote direct-access gate **kept shut**, for
+    /// a caller that goes on writing this memory back (a fork's restore of the parent): a direct
+    /// write from the system's host process (a binder reply) landing between the gate opening and
+    /// the write-back was overwritten by it -- unjournaled, so not kept. [`journal_done`] lets it go.
+    ///
+    /// [`journal_done`]: Self::journal_done
+    pub(crate) fn take_journal_gated(&self) -> Vec<(u64, usize)> {
+        self.journaling.store(false, std::sync::atomic::Ordering::SeqCst);
+        std::mem::take(&mut *self.journal.lock())
+    }
+
+    /// The gate as the view's state says now (shut while it journals or is one side of a pair).
+    pub(crate) fn journal_done(&self) {
+        let shut = self.paired.load(std::sync::atomic::Ordering::SeqCst) || self.journaling.load(std::sync::atomic::Ordering::SeqCst);
+        self.gate_to(shut);
     }
 
     fn note(&self, addr: u64, len: usize) {
@@ -418,6 +434,31 @@ pub fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     // A large one: fresh pages that become resident only where they are written
     // (`crate::zbuf::ZeroBuf`), so a long wait in a 64 KiB `recvmsg` keeps no resident zeros.
     f(&mut crate::zbuf::ZeroBuf::new(len))
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// A fork's restore of the parent ends the journal and then writes the parent's memory back:
+    /// the remote direct-access gate must stay shut until that is done (`crate::fork`'s
+    /// `Snapshot::restore`), or a binder reply the system host writes directly in between is
+    /// overwritten -- unjournaled, so not kept.
+    #[test]
+    fn the_gate_stays_shut_until_the_parents_memory_is_back() {
+        let space = Arc::new(GuestSpace::with_config(omni_mem::GuestSpaceConfig { guest_page: Some(omni_mem::GUEST_PAGE), ..Default::default() }).unwrap());
+        let mem = GuestMem::new(space, Layout::default());
+        mem.start_journal();
+        assert!(*mem.gated.lock(), "shut while the child runs in the memory");
+        let _journal = mem.take_journal_gated();
+        assert!(*mem.gated.lock(), "still shut while the parent's memory is written back");
+        mem.journal_done();
+        assert!(!*mem.gated.lock(), "open once it is back");
+        // `take_journal` (no write-back after it) opens it at once, as before.
+        mem.start_journal();
+        let _ = mem.take_journal();
+        assert!(!*mem.gated.lock());
+    }
 }
 
 #[cfg(test)]

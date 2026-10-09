@@ -247,11 +247,16 @@ pub fn substitute(dir: &Path, manifest: &mut Manifest, overlay: &mut HashMap<Str
     done
 }
 
+/// The version of what [`uncompress`] writes, in the cache's file names: bump it with any change to
+/// the rewrite, or every sysroot keeps serving the old one (the cache is keyed by the source alone).
+const FORMAT: u32 = 1;
+
 /// The uncompressed file for source object `sha`: (where, its sha256, its size), made if missing.
 fn cached(dir: &Path, sha: &str, source: &Path) -> Result<(PathBuf, String, u64), String> {
     let mut last = String::new();
     for root in [dir.join("boot-uncompressed"), std::env::temp_dir().join("omni-boot-uncompressed")] {
-        let (file, note) = (root.join(format!("{sha}.art")), root.join(format!("{sha}.sha256")));
+        // The rewrite's version in the name: a cache made by an older `uncompress` is not served.
+        let (file, note) = (root.join(format!("{sha}.v{FORMAT}.art")), root.join(format!("{sha}.v{FORMAT}.sha256")));
         if let (Ok(text), Ok(meta)) = (std::fs::read_to_string(&note), std::fs::metadata(&file)) {
             let mut it = text.split_whitespace();
             if let (Some(digest), Some(size)) = (it.next(), it.next().and_then(|s| s.parse::<u64>().ok())) {
@@ -263,21 +268,23 @@ fn cached(dir: &Path, sha: &str, source: &Path) -> Result<(PathBuf, String, u64)
         let bytes = std::fs::read(source).map_err(|e| format!("{}: {e}", source.display()))?;
         let image = uncompress(&bytes)?.ok_or("not compressed")?;
         let digest = format!("{:x}", Sha256::digest(&image));
+        // A temporary file left behind by a failed write (a full disk) is removed: each host process
+        // names its own, so they would pile up, ~14 MB each.
+        let write_via = |tmp: &Path, bytes: &[u8], to: &Path| -> std::io::Result<()> {
+            let r = std::fs::write(tmp, bytes).and_then(|()| match std::fs::rename(tmp, to) {
+                Ok(()) => Ok(()),
+                // Another process made it first (and may have it mapped): keep that one.
+                Err(_) if std::fs::metadata(to).map(|m| m.len()).ok() == Some(bytes.len() as u64) => Ok(()),
+                Err(e) => Err(e),
+            });
+            let _ = std::fs::remove_file(tmp);
+            r
+        };
         let made = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&root)?;
-            let tmp = root.join(format!("{sha}.art.{}", std::process::id()));
-            std::fs::write(&tmp, &image)?;
-            match std::fs::rename(&tmp, &file) {
-                Ok(()) => {}
-                // Another process made it first (and may have it mapped): keep that one.
-                Err(_) if std::fs::metadata(&file).map(|m| m.len()).ok() == Some(image.len() as u64) => {
-                    let _ = std::fs::remove_file(&tmp);
-                }
-                Err(e) => return Err(e),
-            }
-            let tmp = root.join(format!("{sha}.sha256.{}", std::process::id()));
-            std::fs::write(&tmp, format!("{digest} {}\n", image.len()))?;
-            let _ = std::fs::rename(&tmp, &note);
+            write_via(&root.join(format!("{sha}.v{FORMAT}.art.{}", std::process::id())), &image, &file)?;
+            // The note only saves the next start the work: a failure to write it is not this one's.
+            let _ = write_via(&root.join(format!("{sha}.v{FORMAT}.sha256.{}", std::process::id())), format!("{digest} {}\n", image.len()).as_bytes(), &note);
             Ok(())
         })();
         match made {
