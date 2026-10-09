@@ -142,6 +142,18 @@ pub mod age {
     /// MiB of translations the game keeps (`OMNI_CODE_AGE_GAME_KEEP_MB`, `code_age_game_keep`).
     pub static GAME_KEEP_MB: AtomicU64 = AtomicU64::new(96);
     static KICK_GAME: AtomicBool = AtomicBool::new(false);
+    /// After the game's first pass, another only once its translations have grown this many MiB
+    /// past the kept size (`OMNI_CODE_AGE_GAME_SLACK_MB`, default 48): a new place's code after a
+    /// teleport. A pass retires the oldest regions, and after the first those hold the code the
+    /// game still runs, translated again into them -- every later pass on a period evicted it
+    /// again, a hitch for ~30 MiB (PS99 s21: 141 -> 84 MiB, a 5 s window at 37 fps).
+    pub static GAME_SLACK_MB: AtomicU64 = AtomicU64::new(48);
+    /// Milliseconds between the regions a game pass retires (`OMNI_CODE_AGE_GAME_PAUSE_MS`, default
+    /// 1000): what it still runs is translated again a region at a time, not all at once (s21, 200
+    /// ms: the first pass's 5 s window at 46.9 fps).
+    pub static GAME_PAUSE_MS: AtomicU64 = AtomicU64::new(1000);
+    /// Whether this host process's game has had its first pass.
+    static GAME_PASSED: AtomicBool = AtomicBool::new(false);
 
     /// The game's period, from the lever; a period set starts with a pass.
     pub fn set_game_minutes(m: u64) {
@@ -177,6 +189,12 @@ pub mod age {
         if let Some(g) = std::env::var("OMNI_CODE_AGE_GAME").ok().and_then(|v| v.parse::<u64>().ok()) {
             GAME_MINUTES.store(g, Ordering::Relaxed);
         }
+        if let Some(mb) = std::env::var("OMNI_CODE_AGE_GAME_SLACK_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+            GAME_SLACK_MB.store(mb, Ordering::Relaxed);
+        }
+        if let Some(ms) = std::env::var("OMNI_CODE_AGE_GAME_PAUSE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            GAME_PAUSE_MS.store(ms, Ordering::Relaxed);
+        }
         if std::env::var_os("OMNI_CODE_AGE").is_some() && m != 0 {
             eprintln!("[lever] OMNI_CODE_AGE: code_age={m} (keep {} MiB)", KEEP_MB.load(Ordering::Relaxed));
         }
@@ -197,24 +215,35 @@ pub mod age {
                     continue;
                 }
                 last = Instant::now();
-                pass(keep << 20);
+                if game {
+                    let slack = if GAME_PASSED.load(Ordering::Relaxed) { GAME_SLACK_MB.load(Ordering::Relaxed) << 20 } else { 0 };
+                    if pass(keep << 20, slack, Duration::from_millis(GAME_PAUSE_MS.load(Ordering::Relaxed))) > 0 {
+                        GAME_PASSED.store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    pass(keep << 20, 0, Duration::from_millis(200));
+                }
             }
         });
     }
 
-    /// One pass over the live processes, each keeping `keep` bytes of translations.
-    pub fn pass(keep: u64) {
+    /// One pass over the live processes, each keeping `keep` bytes of translations, `pause` between
+    /// the regions it retires; a process holding no more than `keep + slack` is left alone. The
+    /// regions retired, over all.
+    pub fn pass(keep: u64, slack: u64, pause: Duration) -> usize {
+        let mut total = 0;
         for p in crate::process::all_live() {
             let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
             if name == "surfaceflinger" && !SURFACEFLINGER.load(Ordering::Relaxed) {
                 continue;
             }
             let before = p.code_cache_committed();
-            if before <= keep {
+            if before <= keep + slack {
                 continue;
             }
             let t = Instant::now();
-            let retired = p.age_code(keep, Duration::from_millis(200));
+            let retired = p.age_code(keep, pause);
+            total += retired as usize;
             if retired > 0 {
                 eprintln!(
                     "[code] age: {name} (pid {}) {} -> {} MiB of translations, {retired} regions retired ({} ms)",
@@ -225,5 +254,6 @@ pub mod age {
                 );
             }
         }
+        total
     }
 }
