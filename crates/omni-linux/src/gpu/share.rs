@@ -45,8 +45,10 @@ const VERSION: u32 = 1;
 const NAME_UNITS: usize = 63;
 
 /// **The lever** (`present_zero=0|1`): the app's process copies released frames into share images,
-/// and the system's composer presents from them when it can. **Off by default.** The app's devices
-/// must be made able to export (`OMNI_PRESENT_ZERO=ready`, or `=1`: ready and on).
+/// and the system's composer presents from them when it can. **On by default** since the in-world
+/// A/B of 2026-10-09 (PS99 session s6: the system host -1.0 ms of CPU a frame, 5/6 pairs; the
+/// window checked by eye against the CPU path). `OMNI_PRESENT_ZERO=0` makes devices that cannot
+/// export and keeps it off; `=ready` makes them able to export with the lever off.
 pub static ZERO: AtomicBool = AtomicBool::new(false);
 
 /// Whether devices are made able to export share images (`OMNI_PRESENT_ZERO=ready|1`, or the lever
@@ -54,12 +56,13 @@ pub static ZERO: AtomicBool = AtomicBool::new(false);
 pub(crate) fn wanted() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let env = *ENV.get_or_init(|| match std::env::var("OMNI_PRESENT_ZERO").as_deref() {
-        Ok("1") => {
+        Ok("0") => false,
+        Ok("ready") => true,
+        // Unset or `1`: ready and on.
+        _ => {
             ZERO.store(true, Ordering::Relaxed);
             true
         }
-        Ok("ready") => true,
-        _ => false,
     });
     env || ZERO.load(Ordering::Relaxed)
 }
