@@ -17,7 +17,7 @@ mod harness;
 
 use std::path::PathBuf;
 
-use dynarmic_sys::{od_codegen_census, od_codegen_census_reset, od_jit_clear_halt, optimization, CODEGEN_PARTS};
+use dynarmic_sys::{od_code_cache_stats_of, od_codegen_census, od_codegen_census_reset, od_jit_clear_halt, optimization, OdCodeCacheStats, CODEGEN_PARTS};
 use harness::{Vm, VmOptions, CODE_BASE};
 
 /// The host file of a guest path in the pinned sysroot (`sysroot.manifest`: `f mode size sha path`).
@@ -84,6 +84,22 @@ fn census() -> Vec<u64> {
 
 /// Translate the first blocks of every function of `lib`; the census over it, and the functions.
 fn translate_library(lib: &str, blocks_per_function: usize) -> Option<(Vec<u64>, usize)> {
+    translate_library_with(lib, blocks_per_function, optimization::ALL_SAFE).map(|t| (t.census, t.functions))
+}
+
+/// What [`translate_library_with`] measured.
+struct Translated {
+    census: Vec<u64>,
+    functions: usize,
+    /// The shared cache's counters (zero on a per-thread cache).
+    stats: OdCodeCacheStats,
+    /// Wall time of the whole pass (translation, the dispatcher, one tick of each block).
+    wall: std::time::Duration,
+}
+
+/// As [`translate_library`], with `optimizations` (dynarmic's flags, within `INTERRUPTIBLE`, and
+/// the global-monitor flag added, as omni-cpu runs).
+fn translate_library_with(lib: &str, blocks_per_function: usize, optimizations: u32) -> Option<Translated> {
     let path = sysroot_file(lib)?;
     let elf = std::fs::read(&path).ok()?;
     let ((off, vaddr, len), funcs) = text_and_functions(&elf);
@@ -95,13 +111,14 @@ fn translate_library(lib: &str, blocks_per_function: usize) -> Option<(Vec<u64>,
             cycle_counting: true,
             check_halt_on_memory_access: true,
             fastmem_exclusive: true,
-            optimizations: optimization::INTERRUPTIBLE | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
+            optimizations: (optimizations & optimization::INTERRUPTIBLE) | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
             code_cache_size: 256 << 20,
             ..VmOptions::default()
         },
     );
     // SAFETY: a process-wide counter reset; this binary runs one test.
     unsafe { od_codegen_census_reset() };
+    let started = std::time::Instant::now();
     for &f in &funcs {
         vm.set_pc(CODE_BASE + (f - vaddr));
         for _ in 0..blocks_per_function {
@@ -121,7 +138,14 @@ fn translate_library(lib: &str, blocks_per_function: usize) -> Option<(Vec<u64>,
             }
         }
     }
-    Some((census(), funcs.len()))
+    let wall = started.elapsed();
+    let mut stats = OdCodeCacheStats::default();
+    let cache = vm.code_cache();
+    if !cache.is_null() {
+        // SAFETY: the cache is live (the `Vm` holds it) and `stats` is writable.
+        unsafe { od_code_cache_stats_of(cache, &mut stats) };
+    }
+    Some(Translated { census: census(), functions: funcs.len(), stats, wall })
 }
 
 fn report(lib: &str, c: &[u64], functions: usize) {
@@ -170,4 +194,54 @@ fn where_the_bytes_of_translated_code_go() {
         compact
     );
     report(&lib, &c, functions);
+}
+
+/// **What first translation costs, on real Android code**, and how much of it the IR optimisation
+/// passes are (the question for a cheaper first tier). Each library's functions' first blocks are
+/// translated on a shared cache (`OD_TEST_SHARED_CACHE=1`, required: the counters are the cache's)
+/// with dynarmic's safe optimisations on, as omni-cpu runs, and with GetSetElimination,
+/// ConstProp and MiscIROpt off. `translate` is the frontend (decode to IR and every pass),
+/// `emit` the x64 backend; `wall` includes the dispatcher and running one tick of each block.
+///
+/// ```text
+/// OMNI_SYSROOT=<sysroot/aosp-35> OD_TEST_SHARED_CACHE=1 ///   cargo test -p dynarmic-sys --release --test code_size -- --ignored --nocapture the_cost_of
+/// ```
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_first_translation() {
+    if !harness::every_vm_on_a_shared_cache() {
+        println!("needs OD_TEST_SHARED_CACHE=1: skipped");
+        return;
+    }
+    let libs = [
+        "/apex/com.android.runtime/lib64/bionic/libc.so",
+        "/apex/com.android.art/lib64/libart.so",
+        "/system/lib64/libhwui.so",
+        "/system/lib64/libandroid_runtime.so",
+    ];
+    let unoptimised = optimization::ALL_SAFE & !(optimization::GET_SET_ELIMINATION | optimization::CONST_PROP | optimization::MISC_IR_OPT);
+    for lib in libs {
+        for (what, flags) in [("optimised  ", optimization::ALL_SAFE), ("no IR opts ", unoptimised)] {
+            let Some(t) = translate_library_with(lib, 4, flags) else {
+                println!("{lib}: not in the sysroot (OMNI_SYSROOT): skipped");
+                break;
+            };
+            let s = &t.stats;
+            let blocks = s.blocks_emitted.max(1) as f64;
+            let guest = t.census[12].max(1) as f64;
+            println!(
+                "{lib} {what}: {} fns, {} blocks, {} guest insns, {:.1} B/block | translate {:.1} us/block, emit {:.1} us/block,                  {:.2} us/guest insn together | wall {:.2} s ({:.1} us/block; translate+emit {:.0}%)",
+                t.functions,
+                s.blocks_emitted,
+                t.census[12],
+                s.code_bytes_emitted as f64 / blocks,
+                s.translate_ns as f64 / 1e3 / blocks,
+                s.emit_ns as f64 / 1e3 / blocks,
+                (s.translate_ns + s.emit_ns) as f64 / 1e3 / guest,
+                t.wall.as_secs_f64(),
+                t.wall.as_secs_f64() * 1e6 / blocks,
+                100.0 * (s.translate_ns + s.emit_ns) as f64 / 1e9 / t.wall.as_secs_f64(),
+            );
+        }
+    }
 }
