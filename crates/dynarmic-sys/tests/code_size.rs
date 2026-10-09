@@ -478,6 +478,27 @@ fn a_snapshot_of_real_code_runs_it_the_same() {
     assert_eq!(lazy_part, fresh_part, "what the guest saw differs from a fresh cache's");
     assert_eq!(s3.blocks_emitted, 0, "{s3:?}");
     assert!(s3.snapshot_pages_read > 0 && s3.snapshot_pages_read * 4 < code_pages, "{s3:?}");
+    // Patch 0076: the restored blocks that tenth never entered forgotten; then every function run
+    // on that cache gives what the first pass gave, the forgotten ones translated again.
+    let census = |cache| {
+        let mut t = dynarmic_sys::OdCodeCacheTables::default();
+        // SAFETY: a live cache.
+        unsafe { dynarmic_sys::od_code_cache_tables_of(cache, &mut t) };
+        t.named().map(|(name, t)| (name, t.entries, t.bytes >> 10))
+    };
+    let before_forget = census(third);
+    // SAFETY: no jit runs on it.
+    let forgotten = unsafe { dynarmic_sys::od_code_cache_forget_unverified(third) };
+    assert_eq!(forgotten as u64, saved as u64 - s3.snapshot_blocks_verified, "{s3:?}");
+    let after_forget = census(third);
+    let all_again = guest_visible_pass(&code, vaddr, len, &funcs, opts3, &mut arena);
+    let s5 = stats(third);
+    println!("forgot {forgotten} unentered restored blocks; tables (entries, KiB) {before_forget:?} -> {after_forget:?}; all run after: {s5:?}");
+    assert_eq!(all_again, fresh, "what the guest saw after forgetting differs from the first pass");
+    assert_eq!(s5.snapshot_blocks_forgotten, forgotten as u64);
+    assert_eq!(s5.blocks_emitted, emitted - s3.snapshot_blocks_verified, "the forgotten ones and the unsaved ones translated: {s5:?}");
+    // SAFETY: as above; nothing is left to forget.
+    assert_eq!(unsafe { dynarmic_sys::od_code_cache_forget_unverified(third) }, 0);
     // SAFETY: the Vms are gone.
     unsafe {
         od_code_cache_free(fourth);

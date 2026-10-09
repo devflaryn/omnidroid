@@ -62,6 +62,7 @@ dynarmic/
                and ../patches/0073-x64-shared-cache-maps-shrink-after-forgetting-blocks.patch
                and ../patches/0074-x64-snapshot-saves-copy-out-under-the-lock.patch
                and ../patches/0075-x64-snapshot-code-read-in-as-entered.patch
+               and ../patches/0076-x64-snapshot-unentered-blocks-forgotten.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

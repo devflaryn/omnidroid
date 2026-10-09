@@ -721,3 +721,32 @@ with 65,129 of 67,116 blocks verified. A snapshot is the last run's working set 
 like it re-enters most of it. The saving is the part a run does not enter, plus the share of every
 read-in page that holds no entered block. dalvikvm64's 2k-17k blocks translated on a reload vary
 from run to run the same way in either mode.
+
+### 0076 — x64: restored blocks never entered, forgotten (on request)
+
+x64, shared caches (0070). A restored block that never verifies still costs its bookkeeping: its
+block-map entry, its link records and their targets' heads, its fastmem sites, its guest range's
+page-index entries, and its `unverified` record (40-byte buckets at a load factor of 0.5). On the
+device (s22) the game held ~636k of them, about 80 MB. `SharedCodeCache::ForgetUnverified`
+(`od_code_cache_forget_unverified`; omni-linux `OMNI_JIT_SNAPSHOT_FORGET=1`, once a process has
+settled) forgets every restored block still unverified, as an invalidation would. Its links out
+are unlinked and taken out of their lists, and the links waiting for it stay waiting. It also drops:
+
+- the block's fastmem sites (`ForgetFastmemSitesIn`), which are never faulted at since nothing
+  entered the block;
+- its guest range's page-index entries (`PruneGuestRangeIndex`, over the serials the load
+  registered; the ranges stay as serials);
+- its lazy slots (0075);
+- the `unverified` map, swapped for an empty one.
+
+0066's `ShrinkTables` then runs, whatever its switch. Not given back: the dead link records
+(24 bytes each), which stay until their region is evicted, as an invalidation's do. A location
+looked up later is translated as usual. Stats: `snapshot_blocks_forgotten` (ABI 10).
+
+MEASURED (`tests/code_size.rs`, libc, loaded lazily, a tenth of the functions run): 4,331 of 4,855
+restored blocks forgotten. Block map 224 -> 28 KiB, link heads 64 -> 8 KiB, fastmem sites 160 -> 36
+KiB, guest-range index 106 -> 68 KiB, plus the `unverified` map (~320 KiB), not in the census. Block
+links stay at 189 KiB. Every function run afterwards gives what the first pass gave, with exactly
+the forgotten and the never-saved blocks translated. `tests/snapshot.rs`: forgotten before
+anything ran (eager and lazy), the program runs the same with all of it translated again. Forgotten
+after everything verified, nothing goes and nothing is translated.

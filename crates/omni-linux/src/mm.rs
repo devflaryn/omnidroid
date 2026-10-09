@@ -663,7 +663,14 @@ fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             }
         }
     }
+    // `OMNI_JIT_SNAPSHOT_LIB_ZONE`: the dynamic linker's library reservations placed by the library.
+    let mut a = a;
+    let asked = a[0];
+    crate::jit_snapshot::linker_mmap(p, t.tid, t.pc, &mut a);
     let r = p.mm.map(p, t, MapRequest { addr: a[0], len: a[1], prot: a[2] as u32, flags: a[3] as u32, fd: a[4] as i64 as i32, offset: a[5] });
+    if a[0] != asked {
+        crate::jit_snapshot::linker_mmap_placed(p, a[0], &r);
+    }
     mmap_watch(p, t, a, &r);
     crate::mmap_log::mmap(p, t, a, &r);
     r

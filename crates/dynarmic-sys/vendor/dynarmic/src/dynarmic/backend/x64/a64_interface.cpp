@@ -338,6 +338,23 @@ struct SharedCodeCache::Impl final {
     void EnableSnapshots();
     s64 SaveSnapshot(const char* path, const char* key, u64 max_bytes, bool include_unverified);
     s64 LoadSnapshot(const char* path, const char* key, bool lazily);
+    /// Patch 0076: SharedCodeCache::ForgetUnverified.
+    s64 ForgetUnverified();
+    u64 snapshot_forgotten = 0;
+    size_t UnverifiedPcs(u64* out, size_t capacity) const {
+        std::shared_lock guard{lock};
+        size_t i = 0;
+        for (const auto& [location, pending] : unverified) {
+            if (i < capacity) {
+                out[i] = A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC();
+            }
+            i++;
+        }
+        return unverified.size();
+    }
+    /// The guest-range serials the last load registered (its restored blocks'), `[first, end)`.
+    u32 restored_ranges_first = 0;
+    u32 restored_ranges_end = 0;
     // Patch 0075: a snapshot restored lazily -- its code read in a page at a time, as blocks on it
     // are first entered. The file stays open for that.
     struct LazyRegion {
@@ -1460,6 +1477,7 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
         ASSERT(at == static_cast<const u8*>(writable_pool.Begin()) + i * 16);
     }
     lazy_pages.base = block_of_code.getCode();  // patch 0075
+    restored_ranges_first = emitter.NextRangeSerial();  // patch 0076
     if (lazily) {
         emitter.lazy_pages = &lazy_pages;
     }
@@ -1536,6 +1554,7 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
         }
     }
     snapshot_hashing = true;
+    restored_ranges_end = emitter.NextRangeSerial();  // patch 0076
     snapshot_restored += block_total;
     unverified_count.store(unverified.size(), std::memory_order_relaxed);
     return static_cast<s64>(block_total);
@@ -1592,6 +1611,43 @@ std::optional<CodePtr> SharedCodeCache::Impl::VerifyRestored(IR::LocationDescrip
     emitter.InvalidateBasicBlocks({location});
     snapshot_rejected++;
     return std::nullopt;
+}
+
+s64 SharedCodeCache::Impl::ForgetUnverified() {
+    std::unique_lock held{lock};
+    if (unverified.empty()) {
+        return 0;
+    }
+    std::vector<u64> locations;
+    locations.reserve(unverified.size());
+    for (const auto& [location, pending] : unverified) {
+        locations.push_back(location);
+    }
+    std::vector<std::pair<u32, u32>> dead_links;
+    std::vector<std::pair<const u8*, const u8*>> dead_code;
+    const size_t forgotten = emitter.ForgetUnverifiedBlocks(locations, dead_links, dead_code);
+    // What verifying them needed: emptied, and its array given back.
+    tsl::robin_map<u64, Unverified>{}.swap(unverified);
+    unverified_count.store(0, std::memory_order_relaxed);
+    // A lazily restored page read in later sets only the slots of blocks still known.
+    std::sort(dead_links.begin(), dead_links.end());
+    const auto dead_serial = [&dead_links](u32 serial) {
+        auto it = std::upper_bound(dead_links.begin(), dead_links.end(), serial, [](u32 s, const auto& span) { return s < span.first; });
+        return it != dead_links.begin() && serial <= std::prev(it)->second;
+    };
+    for (LazyRegion& l : lazy_regions) {
+        const size_t before = l.slots.size();
+        std::erase_if(l.slots, [&](const std::pair<u32, u32>& s) { return dead_serial(s.second); });
+        if (l.slots.size() != before) {
+            l.slots.shrink_to_fit();
+        }
+    }
+    std::sort(dead_code.begin(), dead_code.end());
+    emitter.ForgetFastmemSitesIn(dead_code);
+    emitter.PruneGuestRangeIndex(restored_ranges_first, restored_ranges_end);
+    emitter.ShrinkTables();  // patch 0066's, whatever its switch
+    snapshot_forgotten += forgotten;
+    return static_cast<s64>(forgotten);
 }
 
 bool SharedCodeCache::Impl::Materialize(const u8* begin, const u8* end) {
@@ -2139,6 +2195,7 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
     s.snapshot_blocks_rejected = snapshot_rejected;
     s.snapshot_save_lock_ns = snapshot_save_lock_ns;
     s.snapshot_pages_read = snapshot_pages_read;
+    s.snapshot_blocks_forgotten = snapshot_forgotten;  // patch 0076
     return s;
 }
 
@@ -2192,6 +2249,14 @@ void SharedCodeCache::EnableSnapshots() {
 
 std::int64_t SharedCodeCache::SaveSnapshot(const char* path, const char* key, std::uint64_t max_bytes, bool include_unverified) {
     return impl->SaveSnapshot(path, key, max_bytes, include_unverified);
+}
+
+std::size_t SharedCodeCache::UnverifiedPcs(std::uint64_t* out, std::size_t capacity) const {
+    return impl->UnverifiedPcs(out, capacity);
+}
+
+std::int64_t SharedCodeCache::ForgetUnverified() {
+    return impl->ForgetUnverified();
 }
 
 std::int64_t SharedCodeCache::LoadSnapshot(const char* path, const char* key, bool lazily) {

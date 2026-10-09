@@ -230,6 +230,53 @@ fn changed(lazily: bool) {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Patch 0076: restored blocks forgotten before any is entered -- the program runs the same, every
+/// block translated again; forgetting after every block verified forgets nothing.
+#[test]
+fn restored_blocks_never_entered_are_forgotten_and_translated_again() {
+    forgotten(false);
+}
+
+#[test]
+fn restored_blocks_never_entered_are_forgotten_and_translated_again_when_loaded_lazily() {
+    forgotten(true);
+}
+
+fn forgotten(lazily: bool) {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let path = temp(if lazily { "forgotten-lazy" } else { "forgotten" });
+    let (emitted, first) = saved_snapshot(&path, "forgotten");
+
+    let cache = if lazily { Cache::lazy() } else { Cache::new() };
+    assert_eq!(cache.load(&path, "forgotten"), emitted as i64);
+    // SAFETY: no jit runs on it.
+    assert_eq!(unsafe { dynarmic_sys::od_code_cache_forget_unverified(cache.cache) }, emitted as i64);
+    let vm = cache.vm(program(1));
+    let mut buffer = Box::new(0u64);
+    assert_eq!(run(&vm, &mut *buffer), first);
+    drop(vm);
+    let s = cache.stats();
+    assert_eq!((s.blocks_emitted, s.snapshot_blocks_verified, s.snapshot_blocks_forgotten), (emitted, 0, emitted), "{s:?}");
+    if lazily {
+        // Only the page emission goes on from (read in at load: restored code lies below it).
+        assert!(s.snapshot_pages_read <= 1, "nothing restored was entered: {s:?}");
+    }
+    drop(cache);
+
+    let cache = if lazily { Cache::lazy() } else { Cache::new() };
+    assert_eq!(cache.load(&path, "forgotten"), emitted as i64);
+    let vm = cache.vm(program(1));
+    let mut buffer = Box::new(0u64);
+    assert_eq!(run(&vm, &mut *buffer), first);
+    // SAFETY: as above (the Vm is idle).
+    assert_eq!(unsafe { dynarmic_sys::od_code_cache_forget_unverified(cache.cache) }, 0);
+    let mut buffer = Box::new(0u64);
+    assert_eq!(run(&vm, &mut *buffer), first, "the verified blocks run on");
+    drop(vm);
+    assert_eq!(cache.stats().blocks_emitted, 0);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn another_key_or_another_code_shape_is_refused_and_the_cache_runs_as_new() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

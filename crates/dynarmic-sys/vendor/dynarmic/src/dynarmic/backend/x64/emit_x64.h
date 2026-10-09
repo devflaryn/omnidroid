@@ -226,6 +226,14 @@ public:
     void RefreshSlot(u32 serial);
     /// A restored block found unchanged: entered from now on, linked to and from.
     void MarkVerified(IR::LocationDescriptor location);
+    /// Omnidroid patch 0076: forget the blocks at `locations` that are restored and still
+    /// unverified, as an invalidation would (their links out undone, the links waiting for them
+    /// kept as waiting). Appends the serials of their link records (first, last) and their code's
+    /// spans. Nothing has ever entered them. How many were forgotten.
+    size_t ForgetUnverifiedBlocks(const std::vector<u64>& locations, std::vector<std::pair<u32, u32>>& dead_links, std::vector<std::pair<const u8*, const u8*>>& dead_code);
+    /// Patch 0076: drop the fastmem records of the sites inside `spans` (ascending, disjoint) --
+    /// code nothing executes. How many were dropped.
+    size_t ForgetFastmemSitesIn(const std::vector<std::pair<const u8*, const u8*>>& spans);
 
     /// Empties the entire cache.
     virtual void ClearCache();
