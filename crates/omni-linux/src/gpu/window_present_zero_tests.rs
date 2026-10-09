@@ -154,6 +154,50 @@ fn scene(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (surface, window, badge)
 }
 
+/// **More share images opened within ~4 s than the descriptor pool holds** (a window resized a
+/// few times, each resize new buffers): every one is still shown. The pool holds 64 sets and an
+/// image was let go only after `KEEP_IMPORTED` frames undrawn, so the 65th open failed -- and
+/// every frame's after it, with nothing composed for anything to age by: present_zero on the CPU
+/// for good. Each image's own colour comes back, so the right one was drawn.
+#[test]
+#[ignore = "asks the host GPU"]
+fn zero_more_share_images_than_the_descriptor_pool_holds() {
+    let (w, h) = (16u32, 16u32);
+    let mut app = App::new();
+    let mut presenter = super::WindowPresenter::new_headless().expect("a presenter");
+    for k in 0..100u32 {
+        let colour = [(k * 7 % 256) as u8, (k * 13 % 256) as u8, (k * 29 % 256) as u8, 255];
+        let bytes: Vec<u8> = (0..w * h).flat_map(|_| colour).collect();
+        let desc = app.share(vk::Format::B8G8R8A8_UNORM, w, h, &bytes);
+        let layer = ShareLayer { desc, opaque: false, crop: (0.0, 0.0, w as f32, h as f32), frame: (0, 0, w as i32, h as i32), blend: ShareBlend::None, generation: 1 };
+        let frame = presenter.compose_offscreen(&[layer], (w, h)).unwrap_or_else(|e| panic!("share image {k}: {e}"));
+        let at = ((h / 2 * w + w / 2) * 4) as usize;
+        assert_eq!(&frame[at..at + 3], &colour[..3], "share image {k}'s own pixels");
+    }
+}
+
+/// **A frame given up after its layers were opened takes nothing over**: the composition acquires a
+/// share image from the app's process (`QUEUE_FAMILY_EXTERNAL`) once per generation, and recorded
+/// the generation as acquired when the layer was opened -- so a frame that then failed (another
+/// layer that would not open; in a window, an out-of-date swapchain) left the next frame of the same
+/// generation sampling an image it never acquired.
+#[test]
+#[ignore = "asks the host GPU"]
+fn zero_a_frame_given_up_takes_nothing_over() {
+    let (w, h) = (16u32, 16u32);
+    let mut app = App::new();
+    let good = app.share(vk::Format::B8G8R8A8_UNORM, w, h, &vec![200u8; (w * h * 4) as usize]);
+    let mut gone = good.clone();
+    gone.name = format!("{}-never-made", gone.name);
+    let layer = |desc: &ShareDesc| ShareLayer { desc: desc.clone(), opaque: false, crop: (0.0, 0.0, w as f32, h as f32), frame: (0, 0, w as i32, h as i32), blend: ShareBlend::None, generation: 1 };
+    let mut presenter = super::WindowPresenter::new_headless().expect("a presenter");
+    assert!(presenter.compose_offscreen(&[layer(&good), layer(&gone)], (w, h)).is_err(), "a share image that is not there");
+    let acquired = |p: &super::WindowPresenter| p.imported.get(&(good.name.clone(), false)).map(|i| i.acquired);
+    assert_eq!(acquired(&presenter), Some(0), "opened, and not taken over: the frame was not drawn");
+    presenter.compose_offscreen(&[layer(&good)], (w, h)).expect("the good layer alone");
+    assert_eq!(acquired(&presenter), Some(1), "taken over by the frame drawn");
+}
+
 #[test]
 #[ignore = "asks the host GPU"]
 fn zero_the_gpu_composes_share_images_as_the_cpu_does() {

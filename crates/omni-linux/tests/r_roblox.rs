@@ -126,12 +126,20 @@ const IDLE_APPS: &[&str] = &[
 /// The script that disables `IDLE_APPS` once the device is up (`OMNI_R_LEAN=0`: none) -- in the
 /// background with `OMNI_R_FAST_SETUP=1`, joined after the install (`common::r_scripts`).
 fn lean_script() -> String {
-    // `OMNI_DEVICE_IDLE_APPS=out`: they are not in the image (`omni_linux::device::IDLE_APPS_LEFT_OUT`),
-    // so there is nothing to disable.
-    if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") || omni_linux::device::idle_apps_out() {
+    if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
         return String::new();
     }
-    common::r_scripts::lean(IDLE_APPS, common::r_scripts::fast_setup())
+    // `OMNI_DEVICE_IDLE_APPS=out`: those not in the image (`omni_linux::device::
+    // IDLE_APP_PACKAGES_LEFT_OUT`) are not disabled; the ones a system service needs stay and are.
+    // (`com.android.cellbroadcastreceiver` and `com.android.ext.adservices.api` are on no lean
+    // device either way.)
+    let apps: Vec<&str> = if omni_linux::device::idle_apps_out() {
+        let gone = ["com.android.cellbroadcastreceiver", "com.android.ext.adservices.api"];
+        IDLE_APPS.iter().copied().filter(|a| !omni_linux::device::IDLE_APP_PACKAGES_LEFT_OUT.contains(a) && !gone.contains(a)).collect()
+    } else {
+        IDLE_APPS.to_vec()
+    };
+    common::r_scripts::lean(&apps, common::r_scripts::fast_setup())
 }
 
 /// The device is set up as a freely resizable one is: Developer options' "Force activities to be
@@ -690,15 +698,17 @@ fn golden_key_separates_rooted_devices_and_leaves_unrooted_unchanged() {
     let root = std::env::temp_dir();
     let apk = root.join("x.apk");
     let plain = golden_dir(&root, &apk, None, true, "tr-TR");
-    // The unrooted key as it was before rooted devices existed.
-    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}")), "the unrooted key is unchanged");
+    // The unrooted key as it was before rooted devices existed (with the boot image's and the idle
+    // apps' suffixes, which the switches' defaults add whatever the root).
+    let (bootu, idle) = (omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix());
+    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}{bootu}{idle}")), "the unrooted key is unchanged");
     let a = root_hash("root=1\nmodule=a\n", &[("a", "sha_a")], 29000, "bin");
     let b = root_hash("root=1\nmodule=a\nmodule=b\n", &[("a", "sha_a"), ("b", "sha_b")], 29000, "bin");
     let rooted = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&a));
     let rooted_b = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&b));
     assert_ne!(plain, rooted, "rooted differs from unrooted");
     assert_ne!(rooted, rooted_b, "the module set changes the key");
-    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}")));
+    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}{bootu}{idle}")));
     assert_eq!(plain, golden_dir_rooted(&root, &apk, None, true, "tr-TR", None));
     // The denylist is part of the staged profile text, so it keys another saved/warm device.
     let profile = |deny: &[&str]| {

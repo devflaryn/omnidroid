@@ -111,6 +111,34 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
         // The APEX itself stays (its framework jar and system_server code are the boot's).
         assert!(device.has(b"/apex/com.android.adservices/apex_manifest.pb") && device.has(b"/apex/com.android.devicelock/apex_manifest.pb"));
     }
+    // The rule (`device::IDLE_APPS_LEFT_OUT`): never an app of an APEX that ships system_server
+    // code -- its service may need the app to exist when it is constructed (DeviceLockService threw
+    // without DeviceLockController and took system_server down, runs r-44772). The kept list is the
+    // rule's other half, and the DeviceLock case is what the rule catches.
+    let full = open(Some("full"));
+    let apex_with_service_code = |path: &str| -> Option<String> {
+        let name = path.strip_prefix("/apex/")?.split('/').next()?;
+        let javalib = format!("/apex/{name}/javalib");
+        full.children(javalib.as_bytes())
+            .iter()
+            .find(|n| n.starts_with(b"service-") && n.ends_with(b".jar"))
+            .map(|n| format!("{javalib}/{}", String::from_utf8_lossy(n)))
+    };
+    for p in idle {
+        assert_eq!(apex_with_service_code(p), None, "{p}: its APEX ships system_server code, so it must stay");
+    }
+    assert!(
+        apex_with_service_code("/apex/com.android.devicelock/priv-app/DeviceLockController@AE3A.240806.019").is_some(),
+        "the rule catches the app whose absence ended system_server"
+    );
+    let kept = omni_linux::device::IDLE_APPS_KEPT;
+    assert!(kept.iter().all(|k| !idle.contains(k)), "kept and left out are apart");
+    assert_eq!(omni_linux::device::IDLE_APP_PACKAGES_LEFT_OUT.len(), idle.len(), "a package for each path");
+    for (name, device) in [("lean", open(None)), ("kiosk", open(Some("kiosk")))] {
+        for k in kept {
+            assert!(device.has(k.as_bytes()), "{name} with idle apps out keeps {k}");
+        }
+    }
     assert_eq!(omni_linux::device::idle_apps_key_suffix(), "-idleout", "a saved device without them is another");
     assert!(open(Some("full")).has(idle[0].as_bytes()), "the full image is the image as it is");
     std::env::remove_var("OMNI_DEVICE_IDLE_APPS");

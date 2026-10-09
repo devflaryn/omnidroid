@@ -196,11 +196,18 @@ protected:
     // the index -- so a shared cache finds the blocks of a region it gives back among the ranges
     // registered while it filled that region, and drops those ranges (the oldest) from the front.
     // Indices are serials: range `i` is `guest_ranges[i - range_base]`.
+    /// Patch 0052: 20 bytes at 4-byte alignment (24 before): the location as a `Key64`, the first
+    /// byte in two halves, and the length (0: an empty range, `last < first` as registered).
     struct GuestRange {
-        IR::LocationDescriptor location;
-        u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
-        u64 last;
+        Key64 location;
+        u32 first_lo;
+        u32 first_hi;
+        u32 span;
+        u64 First() const { return static_cast<u64>(first_hi) << 32 | first_lo; }
+        /// The last guest byte, `closed(First(), Last())` as the pin registered it.
+        u64 Last() const { return First() + span - 1; }
     };
+    static_assert(sizeof(GuestRange) == 20);
     static constexpr unsigned guest_page_bits = 12;
     /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
     /// invalidation, instead of in every page it covers.

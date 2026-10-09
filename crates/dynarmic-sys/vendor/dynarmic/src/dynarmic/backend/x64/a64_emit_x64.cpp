@@ -282,7 +282,7 @@ size_t A64EmitX64::InvalidateCacheRangesCounted(const boost::icl::interval_set<u
     const auto locations = GuestRangeLocations(ranges);
     size_t dropped = 0;
     for (const auto& location : locations) {
-        dropped += block_descriptors.count(location);
+        dropped += block_descriptors.count(Key64{location});
     }
     InvalidateBasicBlocks(locations);
     return dropped;
@@ -310,7 +310,10 @@ void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 l
     // but only a range covering bytes is indexed -- and so ever returned, as the pin's were.
     ASSERT(NextRangeSerial() < std::numeric_limits<u32>::max());
     const u32 index = NextRangeSerial();
-    guest_ranges.push_back(GuestRange{location, first, last});
+    // Patch 0052: a block's guest bytes are far fewer than 4 GiB.
+    ASSERT(last < first || last - first < std::numeric_limits<u32>::max());
+    const u32 span = last < first ? 0 : static_cast<u32>(last - first + 1);
+    guest_ranges.push_back(GuestRange{Key64{location}, static_cast<u32>(first), static_cast<u32>(first >> 32), span});
     if (last < first) {
         return;
     }
@@ -336,8 +339,8 @@ tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boo
         const u64 last = boost::icl::last(interval);
         const auto consider = [&](u32 index) {
             const GuestRange& range = RangeAt(index);
-            if (range.first <= last && first <= range.last) {
-                locations.insert(range.location);
+            if (range.First() <= last && first <= range.Last()) {
+                locations.insert(range.location.Location());
             }
         };
 
@@ -390,12 +393,12 @@ size_t A64EmitX64::ForgetRegionBlocks(const void* begin, const void* end, u32 fi
     };
     size_t dropped = 0;
     for (u32 serial = first_range; serial != end_range; serial++) {
-        const IR::LocationDescriptor location = RangeAt(serial).location;
-        const auto it = block_descriptors.find(location);
+        const IR::LocationDescriptor location = RangeAt(serial).location.Location();
+        const auto it = block_descriptors.find(Key64{location});
         if (it == block_descriptors.end()) {
             continue;  // invalidated since, or listed twice (invalidated and emitted again here)
         }
-        const u8* const entry = reinterpret_cast<const u8*>(it->second.entrypoint);
+        const u8* const entry = reinterpret_cast<const u8*>(Load(it->second).entrypoint);
         if (entry < b || entry >= e) {
             continue;  // invalidated and emitted again into a newer region: that block stays
         }
@@ -536,7 +539,9 @@ void A64EmitX64::GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) cons
     const u64 highest = hosts[count - 1];
     // One pass over the block map (no index from host address to block is kept: the dispatcher
     // never needs one), each block's code range searched for in the sorted addresses.
-    for (const auto& [location, block] : block_descriptors) {
+    for (const auto& [key, stored] : block_descriptors) {
+        const BlockDescriptor block = Load(stored);
+        const IR::LocationDescriptor location = key.Location();
         const u64 begin = reinterpret_cast<u64>(block.entrypoint);
         const u64 end = begin + block.size;
         if (end <= lowest || begin > highest) {

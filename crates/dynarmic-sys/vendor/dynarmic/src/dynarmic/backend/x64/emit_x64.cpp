@@ -53,11 +53,21 @@ EmitX64::EmitX64(BlockOfCode& code)
 EmitX64::~EmitX64() = default;
 
 std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescriptor descriptor) const {
-    const auto iter = block_descriptors.find(descriptor);
+    const auto iter = block_descriptors.find(Key64{descriptor});
     if (iter == block_descriptors.end()) {
         return std::nullopt;
     }
-    return iter->second;
+    return Load(iter->second);
+}
+
+EmitX64::StoredBlock EmitX64::Store(const BlockDescriptor& b) const {
+    const u64 offset = reinterpret_cast<u64>(b.entrypoint) - reinterpret_cast<u64>(code.getCode());
+    ASSERT(reinterpret_cast<u64>(b.entrypoint) >= reinterpret_cast<u64>(code.getCode()) && offset <= std::numeric_limits<u32>::max());
+    return StoredBlock{static_cast<u32>(offset), b.size, b.first_link};
+}
+
+EmitX64::BlockDescriptor EmitX64::Load(const StoredBlock& s) const {
+    return BlockDescriptor{reinterpret_cast<CodePtr>(code.getCode() + s.entry), s.size, s.first_link};
 }
 
 void EmitX64::EmitVoid(EmitContext&, IR::Inst*) {
@@ -84,9 +94,9 @@ void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
 void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target) {
     using namespace Xbyak::util;
 
-    const auto iter = block_descriptors.find(target);
+    const auto iter = block_descriptors.find(Key64{target});
     CodePtr target_code_ptr = iter != block_descriptors.end()
-                                ? iter->second.entrypoint
+                                ? Load(iter->second).entrypoint
                                 : code.GetReturnFromRunCodeAddress();
 
     code.mov(index_reg.cvt32(), dword[r15 + code.GetJitStateInfo().offsetof_rsb_ptr]);
@@ -354,7 +364,7 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
     BlockDescriptor block_desc{entrypoint, static_cast<u32>(size)};
     // Omnidroid patch 0025: the block's link records, which EmitPendingSlots has just made.
     block_desc.first_link = std::exchange(pending_first_link, NO_LINK);
-    block_descriptors.insert({IR::LocationDescriptor{descriptor.Value()}, block_desc});
+    block_descriptors.insert({Key64{descriptor.Value()}, Store(block_desc)});
     return block_desc;
 }
 
@@ -375,7 +385,7 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
         // loading the slot sees the old target or the new one, and both are code. Patch 0025:
         // they are the records listed from the target's head -- and a target nothing links to
         // has no entry, rather than one made here for every block emitted.
-        const auto head = link_heads.find(target_desc.Value());
+        const auto head = link_heads.find(Key64{target_desc.Value()});
         if (head == link_heads.end()) {
             return;
         }
@@ -448,15 +458,15 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
         u64* const slot = code.getCurr<u64*>();
         code.dq(0);
         const u64 unlinked = pending.tail ? reinterpret_cast<u64>(pending.tail->getAddress()) : pending.unlinked;
-        const auto iter = block_descriptors.find(pending.target);
+        const auto iter = block_descriptors.find(Key64{pending.target});
         // Not yet published: no thread has been given this block, so a plain store is enough. The
         // block becomes reachable through the block map or another slot, both written after this.
-        *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(iter->second.entrypoint) : unlinked;
+        *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(Load(iter->second).entrypoint) : unlinked;
         // Patch 0025: the newest record heads its target's list.
         const u32 index = NextLinkSerial();
         const u64 target = pending.target.Value();
         LinkRecord record{target, offset_of(reinterpret_cast<u64>(slot)), offset_of(unlinked), NO_LINK, NO_LINK};
-        const auto [head, fresh] = link_heads.try_emplace(target, index);
+        const auto [head, fresh] = link_heads.try_emplace(Key64{target}, index);
         if (!fresh) {
             record.next = head->second;
             LinkAt(head->second).prev = index;
@@ -481,9 +491,9 @@ void EmitX64::ForgetOutgoingSlots(u32 first_link) {
         if (link.prev != NO_LINK) {
             LinkAt(link.prev).next = link.next;
         } else if (link.next != NO_LINK) {
-            link_heads[link.target] = link.next;
+            link_heads[Key64{link.target}] = link.next;
         } else {
-            link_heads.erase(link.target);
+            link_heads.erase(Key64{link.target});
         }
         if (link.next != NO_LINK) {
             LinkAt(link.next).prev = link.prev;
@@ -520,7 +530,7 @@ void EmitX64::TrimLinkRecords(u32 base) {
         // the head map is what tells).
         const LinkRecord& link = link_records[i];
         ASSERT(link.next == NO_LINK && link.prev == NO_LINK);
-        const auto head = link_heads.find(link.target);
+        const auto head = link_heads.find(Key64{link.target});
         ASSERT(head == link_heads.end() || head->second != link_base + i);
     }
 #endif
@@ -677,7 +687,7 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
     };
 
     for (const auto& descriptor : locations) {
-        const auto it = block_descriptors.find(descriptor);
+        const auto it = block_descriptors.find(Key64{descriptor});
         if (it == block_descriptors.end()) {
             continue;
         }

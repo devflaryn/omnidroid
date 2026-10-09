@@ -37,12 +37,13 @@ pub struct Framebuffer {
 /// **A window that shows frames composed on the GPU from share images** (`present_zero`,
 /// `crate::gpu::share`), which the composer presents to directly.
 pub trait ZeroSink: Send + Sync {
-    /// Show `layers` (bottom first) of a `display`-sized display; the share images are read by the
-    /// GPU when this returns.
+    /// Show `layers` (bottom first) of a `display`-sized display, as the framebuffer's frame number
+    /// `frame` (the count [`Framebuffer::present_external`] gives it next); the share images are read
+    /// by the GPU when this returns.
     ///
     /// # Errors
     /// Anything it could not do: the composer then composes the frame on the CPU.
-    fn present(&self, layers: &[crate::gpu::share::ShareLayer], display: (u32, u32)) -> Result<(), String>;
+    fn present(&self, layers: &[crate::gpu::share::ShareLayer], display: (u32, u32), frame: u64) -> Result<(), String>;
 }
 
 /// The CPU composition of a frame shown from share images, run only when a reader asks for its

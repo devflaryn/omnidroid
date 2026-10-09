@@ -127,49 +127,83 @@ pub const LEAVES_OUT: &[&str] = &[
     "/system/priv-app/DynamicSystemInstallationService",
 ];
 
-/// **The image's idle apps** (`OMNI_DEVICE_IDLE_APPS=out`; off by default: `disable`, the device's
-/// setup disables them once it is up, as before). The apps `tests/r_roblox.rs`' setup disabled after
-/// the first boot (`IDLE_APPS`: 18 `cmd package disable-user`, ~7 s), which until then are scanned,
-/// started and sent the boot broadcast like any other -- on a fresh boot (run r-44396, 2026-10-09)
-/// 5 of the 23 app processes started before Roblox were theirs (DeviceLockController twice,
-/// KeyChain, DocumentsUI, ExternalStorageProvider), each a host process of its own. Left out here
-/// at the image level, PackageManager never scans them. Two of the 18 are already not on the lean
-/// device (`com.android.cellbroadcastreceiver`: [`LEAVES_OUT`]'s `CellBroadcastLegacyApp`) or not in
-/// the image at all (`com.android.ext.adservices.api`).
+/// **The image's idle apps that can be left out** (`OMNI_DEVICE_IDLE_APPS=out`; off by default:
+/// `disable`, the device's setup disables them once it is up, as before). Of the 18 apps
+/// `tests/r_roblox.rs`' setup disabled after the first boot (`IDLE_APPS`: `cmd package
+/// disable-user`, ~7 s), until then scanned, started and sent the boot broadcast like any other:
+/// PackageManager never scans these.
 ///
-/// Each was checked for what else depends on it: none is a package PackageManager requires
-/// (installer, uninstaller, permission controller, SDK sandbox, ext services, shared library all
-/// stay) and each was already disabled on every device the setup made, so nothing that runs here
-/// needed it enabled -- the difference left is that an absent package is not found by name where a
-/// disabled one is (a `getPackageInfo` that does not handle `NameNotFoundException`), which only a
-/// boot shows: this is opt-in. Kept: the WebView and the browser, ExtServices (it holds the AdExt
-/// boot receiver too), the SDK sandbox, MediaProvider.
+/// **The rule** (`tests/lean_image.rs` checks its first part): an app is left out only if no
+/// system service needs it to exist. A disabled package is still found by name, an absent one is
+/// not -- and a system service that resolves its app when it is constructed then throws, which
+/// ends system_server: `DeviceLockService` ("Service with android.app.action.
+/// DEVICE_LOCK_CONTROLLER_SERVICE not found", `DeviceLockServiceImpl.<init>`, every boot with
+/// DeviceLockController left out, runs r-44772, 2026-10-09). So:
+/// 1. never an app of an APEX that ships system_server code (`javalib/service-*.jar`): its service
+///    is the app's counterpart -- DeviceLock (the crash), HealthFitness, OnDevicePersonalization
+///    and FederatedCompute, AdServices, RKP all kept;
+/// 2. never an app system_server binds through a framework API (`services.jar`'s own code, AOSP 15
+///    sources read): KeyChain kept (`KeyChain.bindAsUser` from DevicePolicyManagerService, and
+///    something binds `KeyChainService` at user unlock, run r-44396); WallpaperBackup kept
+///    (`services.jar` names it; the backup service's user setup is not seen in any boot here);
+/// 3. what is left out had only lookups that handle the absence (below, each).
+///
+/// Two of the 18 are already not on the lean device (`com.android.cellbroadcastreceiver`:
+/// [`LEAVES_OUT`]'s `CellBroadcastLegacyApp`) or not in the image (`com.android.ext.
+/// adservices.api`). Of the 5 app processes the 18 started before Roblox on a fresh boot (run
+/// r-44396), DocumentsUI and ExternalStorageProvider are gone; DeviceLockController (twice) and
+/// KeyChain stay.
 pub const IDLE_APPS_LEFT_OUT: &[&str] = &[
-    // com.android.cellbroadcastreceiver.module, com.android.cellbroadcastservice (no telephony).
+    // com.android.cellbroadcastreceiver.module, com.android.cellbroadcastservice: the cellbroadcast
+    // APEX has no system_server code; their only binder, telephony, is not on the device.
     "/apex/com.android.cellbroadcast/priv-app/CellBroadcastApp@AE3A.240806.019",
     "/apex/com.android.cellbroadcast/priv-app/CellBroadcastServiceModule@AE3A.240806.019",
-    // com.android.nfc: persistent, and no NFC here.
+    // com.android.nfc: the nfcservices APEX has no system_server code (framework-nfc only), and the
+    // device declares no NFC.
     "/apex/com.android.nfcservices/priv-app/NfcNciApex@AE3A.240806.019",
-    // com.android.healthconnect.controller: Health Connect's UI (the service is system_server's).
+    // com.android.statementservice: app-link verification's agent; PackageManager answers a device
+    // without one with `DomainVerificationProxyUnavailable` (in this image's services.jar), and the
+    // r-44772 boots passed PackageManager's start and DomainVerificationService without it.
+    "/system/priv-app/StatementService",
+    // com.android.documentsui: services.jar names it nowhere; it ran only for its own pre-boot
+    // receiver.
+    "/system/priv-app/DocumentsUI",
+    // com.android.managedprovisioning: DevicePolicyManagerService names it only on the
+    // provisioning paths (a broadcast to it, cross-profile filters of profiles there are none of).
+    "/system/priv-app/ManagedProvisioning",
+    // com.android.externalstorage: StorageManagerService looks its provider up and handles none
+    // (`getProviderInfo(EXTERNAL_STORAGE_PROVIDER_AUTHORITY)`, `if (provider != null)`); it ran
+    // only for its own mount receiver.
+    "/system/priv-app/ExternalStorageProvider",
+    // com.android.providers.userdictionary: the IME's dictionary (no IME here); services.jar names
+    // it nowhere.
+    "/system/priv-app/UserDictionaryProvider",
+];
+
+/// The packages of [`IDLE_APPS_LEFT_OUT`], in its order: what a setup that disables the idle
+/// apps once the device is up leaves alone when they are not in the image.
+pub const IDLE_APP_PACKAGES_LEFT_OUT: &[&str] = &[
+    "com.android.cellbroadcastreceiver.module",
+    "com.android.cellbroadcastservice",
+    "com.android.nfc",
+    "com.android.statementservice",
+    "com.android.documentsui",
+    "com.android.managedprovisioning",
+    "com.android.externalstorage",
+    "com.android.providers.userdictionary",
+];
+
+/// Idle apps that must stay in the image (see [`IDLE_APPS_LEFT_OUT`]'s rule): what a system
+/// service needs to exist. Listed so a later edit cannot leave one out unnoticed
+/// (`tests/lean_image.rs`).
+pub const IDLE_APPS_KEPT: &[&str] = &[
+    "/apex/com.android.devicelock/priv-app/DeviceLockController@AE3A.240806.019",
     "/apex/com.android.healthfitness/priv-app/HealthConnectController@AE3A.240806.019",
-    // com.android.ondevicepersonalization.services, com.android.federatedcompute.services.
     "/apex/com.android.ondevicepersonalization/priv-app/OnDevicePersonalization@AE3A.240806.019",
     "/apex/com.android.ondevicepersonalization/app/FederatedCompute@AE3A.240806.019",
-    // com.android.devicelockcontroller: started twice at boot (a boot-time receiver, its service).
-    "/apex/com.android.devicelock/priv-app/DeviceLockController@AE3A.240806.019",
-    // com.android.adservices.api (not the SDK sandbox, which PackageManager requires).
     "/apex/com.android.adservices/priv-app/AdServicesApk@AE3A.240806.019",
-    // com.android.rkpdapp: remote key provisioning (no attestation keys are fetched here).
     "/apex/com.android.rkpd/priv-app/rkpdapp@AE3A.240806.019",
-    // com.android.statementservice (app-link verification), com.android.documentsui,
-    // com.android.managedprovisioning, com.android.externalstorage, com.android.keychain,
-    // com.android.providers.userdictionary (no IME), com.android.wallpaperbackup.
-    "/system/priv-app/StatementService",
-    "/system/priv-app/DocumentsUI",
-    "/system/priv-app/ManagedProvisioning",
-    "/system/priv-app/ExternalStorageProvider",
     "/system/app/KeyChain",
-    "/system/priv-app/UserDictionaryProvider",
     "/system/app/WallpaperBackup",
 ];
 

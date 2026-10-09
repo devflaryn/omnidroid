@@ -124,6 +124,37 @@ public:
     };
     static_assert(sizeof(BlockDescriptor) == 16);
 
+    /// Omnidroid patch 0052: a 64-bit key at 4-byte alignment. A robin_map bucket is its probe
+    /// distance (3 bytes) padded to the value's alignment, then the value: with a `u64` key every
+    /// bucket was 8 + 24 = 32 bytes (the block map) or 8 + 16 = 24 (the link heads); with this key
+    /// they are 4 + 20 = 24 and 4 + 12 = 16. Hashed as the `u64` was.
+    struct Key64 {
+        u32 lo = 0;
+        u32 hi = 0;
+        Key64() = default;
+        Key64(u64 v)
+                : lo(static_cast<u32>(v)), hi(static_cast<u32>(v >> 32)) {}
+        Key64(const IR::LocationDescriptor& d)
+                : Key64(d.Value()) {}
+        u64 Value() const { return static_cast<u64>(hi) << 32 | lo; }
+        IR::LocationDescriptor Location() const { return IR::LocationDescriptor{Value()}; }
+        bool operator==(const Key64& o) const { return lo == o.lo && hi == o.hi; }
+    };
+    static_assert(sizeof(Key64) == 8 && alignof(Key64) == 4);
+    struct Key64Hash {
+        std::size_t operator()(const Key64& k) const noexcept { return std::hash<u64>()(k.Value()); }
+    };
+    /// Omnidroid patch 0052: a block as the block map keeps it -- its entry point as an offset from
+    /// the code buffer's start (a buffer is at most 2 GiB), 12 bytes at 4-byte alignment.
+    struct StoredBlock {
+        u32 entry;
+        u32 size;
+        u32 first_link;
+    };
+    static_assert(sizeof(StoredBlock) == 12 && alignof(StoredBlock) == 4);
+    StoredBlock Store(const BlockDescriptor& b) const;
+    BlockDescriptor Load(const StoredBlock& s) const;
+
     explicit EmitX64(BlockOfCode& code);
     virtual ~EmitX64();
 
@@ -195,7 +226,7 @@ protected:
     // State
     BlockOfCode& code;
     ExceptionHandler exception_handler;
-    tsl::robin_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
+    tsl::robin_map<Key64, StoredBlock, Key64Hash> block_descriptors;  // patch 0052: compact
     tsl::robin_map<IR::LocationDescriptor, PatchInformation> patch_information;
 
 public:
@@ -262,7 +293,7 @@ protected:
     LinkRecord& LinkAt(u32 serial) { return link_records[serial - link_base]; }
     const LinkRecord& LinkAt(u32 serial) const { return link_records[serial - link_base]; }
     /// Target location -> the newest record linking to it. A target with no live record has none.
-    tsl::robin_map<u64, u32> link_heads;
+    tsl::robin_map<Key64, u32, Key64Hash> link_heads;  // patch 0052: 16-byte buckets
     /// Read only when a block is emitted or dropped, never on a lookup, so fuller than the maps'
     /// 0.5: robin-hood probing stays short at 0.75, and the array is half the size.
     static constexpr float LINK_HEADS_LOAD_FACTOR = 0.75f;

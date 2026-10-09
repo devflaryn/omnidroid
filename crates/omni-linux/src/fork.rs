@@ -361,7 +361,17 @@ impl Snapshot {
     fn restore(&self, p: &Process) {
         const PAGE: usize = 4096;
         let _layout = p.mem.layout().write();
-        let journal = p.mem.take_journal();
+        // The journal ends now, but the remote direct-access gate stays shut until the write-back is
+        // done: a direct write from the system host (a binder reply) landing in between would be
+        // overwritten by it, not being journaled (`GuestMem::take_journal_gated`).
+        let journal = p.mem.take_journal_gated();
+        struct GateBack<'a>(&'a crate::guest::GuestMem);
+        impl Drop for GateBack<'_> {
+            fn drop(&mut self) {
+                self.0.journal_done();
+            }
+        }
+        let _gate = GateBack(&p.mem);
         let keep_kernel_writes = |at: u64, page: &mut [u8], current: &[u8]| {
             let end = at + page.len() as u64;
             for &(w, len) in &journal {

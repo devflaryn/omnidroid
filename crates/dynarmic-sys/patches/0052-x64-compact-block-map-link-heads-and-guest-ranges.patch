@@ -1,0 +1,256 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 4b9f16b..00ddac0 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -209,7 +209,7 @@ size_t A64EmitX64::InvalidateCacheRangesCounted(const boost::icl::interval_set<u
+     const auto locations = GuestRangeLocations(ranges);
+     size_t dropped = 0;
+     for (const auto& location : locations) {
+-        dropped += block_descriptors.count(location);
++        dropped += block_descriptors.count(Key64{location});
+     }
+     InvalidateBasicBlocks(locations);
+     return dropped;
+@@ -237,7 +237,10 @@ void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 l
+     // but only a range covering bytes is indexed -- and so ever returned, as the pin's were.
+     ASSERT(NextRangeSerial() < std::numeric_limits<u32>::max());
+     const u32 index = NextRangeSerial();
+-    guest_ranges.push_back(GuestRange{location, first, last});
++    // Patch 0052: a block's guest bytes are far fewer than 4 GiB.
++    ASSERT(last < first || last - first < std::numeric_limits<u32>::max());
++    const u32 span = last < first ? 0 : static_cast<u32>(last - first + 1);
++    guest_ranges.push_back(GuestRange{Key64{location}, static_cast<u32>(first), static_cast<u32>(first >> 32), span});
+     if (last < first) {
+         return;
+     }
+@@ -263,8 +266,8 @@ tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boo
+         const u64 last = boost::icl::last(interval);
+         const auto consider = [&](u32 index) {
+             const GuestRange& range = RangeAt(index);
+-            if (range.first <= last && first <= range.last) {
+-                locations.insert(range.location);
++            if (range.First() <= last && first <= range.Last()) {
++                locations.insert(range.location.Location());
+             }
+         };
+ 
+@@ -317,12 +320,12 @@ size_t A64EmitX64::ForgetRegionBlocks(const void* begin, const void* end, u32 fi
+     };
+     size_t dropped = 0;
+     for (u32 serial = first_range; serial != end_range; serial++) {
+-        const IR::LocationDescriptor location = RangeAt(serial).location;
+-        const auto it = block_descriptors.find(location);
++        const IR::LocationDescriptor location = RangeAt(serial).location.Location();
++        const auto it = block_descriptors.find(Key64{location});
+         if (it == block_descriptors.end()) {
+             continue;  // invalidated since, or listed twice (invalidated and emitted again here)
+         }
+-        const u8* const entry = reinterpret_cast<const u8*>(it->second.entrypoint);
++        const u8* const entry = reinterpret_cast<const u8*>(Load(it->second).entrypoint);
+         if (entry < b || entry >= e) {
+             continue;  // invalidated and emitted again into a newer region: that block stays
+         }
+@@ -463,7 +466,9 @@ void A64EmitX64::GuestPcsOf(const u64* hosts, size_t count, u64* guest_pcs) cons
+     const u64 highest = hosts[count - 1];
+     // One pass over the block map (no index from host address to block is kept: the dispatcher
+     // never needs one), each block's code range searched for in the sorted addresses.
+-    for (const auto& [location, block] : block_descriptors) {
++    for (const auto& [key, stored] : block_descriptors) {
++        const BlockDescriptor block = Load(stored);
++        const IR::LocationDescriptor location = key.Location();
+         const u64 begin = reinterpret_cast<u64>(block.entrypoint);
+         const u64 end = begin + block.size;
+         if (end <= lowest || begin > highest) {
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index d85c434..19e856b 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -169,11 +169,18 @@ protected:
+     // the index -- so a shared cache finds the blocks of a region it gives back among the ranges
+     // registered while it filled that region, and drops those ranges (the oldest) from the front.
+     // Indices are serials: range `i` is `guest_ranges[i - range_base]`.
++    /// Patch 0052: 20 bytes at 4-byte alignment (24 before): the location as a `Key64`, the first
++    /// byte in two halves, and the length (0: an empty range, `last < first` as registered).
+     struct GuestRange {
+-        IR::LocationDescriptor location;
+-        u64 first;  ///< The first guest byte, `closed(first, last)` as the pin registered it.
+-        u64 last;
++        Key64 location;
++        u32 first_lo;
++        u32 first_hi;
++        u32 span;
++        u64 First() const { return static_cast<u64>(first_hi) << 32 | first_lo; }
++        /// The last guest byte, `closed(First(), Last())` as the pin registered it.
++        u64 Last() const { return First() + span - 1; }
+     };
++    static_assert(sizeof(GuestRange) == 20);
+     static constexpr unsigned guest_page_bits = 12;
+     /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
+     /// invalidation, instead of in every page it covers.
+diff --git a/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/backend/x64/emit_x64.cpp
+index fb6145f..e0fbbc5 100644
+--- a/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -53,11 +53,21 @@ EmitX64::EmitX64(BlockOfCode& code)
+ EmitX64::~EmitX64() = default;
+ 
+ std::optional<EmitX64::BlockDescriptor> EmitX64::GetBasicBlock(IR::LocationDescriptor descriptor) const {
+-    const auto iter = block_descriptors.find(descriptor);
++    const auto iter = block_descriptors.find(Key64{descriptor});
+     if (iter == block_descriptors.end()) {
+         return std::nullopt;
+     }
+-    return iter->second;
++    return Load(iter->second);
++}
++
++EmitX64::StoredBlock EmitX64::Store(const BlockDescriptor& b) const {
++    const u64 offset = reinterpret_cast<u64>(b.entrypoint) - reinterpret_cast<u64>(code.getCode());
++    ASSERT(reinterpret_cast<u64>(b.entrypoint) >= reinterpret_cast<u64>(code.getCode()) && offset <= std::numeric_limits<u32>::max());
++    return StoredBlock{static_cast<u32>(offset), b.size, b.first_link};
++}
++
++EmitX64::BlockDescriptor EmitX64::Load(const StoredBlock& s) const {
++    return BlockDescriptor{reinterpret_cast<CodePtr>(code.getCode() + s.entry), s.size, s.first_link};
+ }
+ 
+ void EmitX64::EmitVoid(EmitContext&, IR::Inst*) {
+@@ -84,9 +94,9 @@ void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
+ void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target) {
+     using namespace Xbyak::util;
+ 
+-    const auto iter = block_descriptors.find(target);
++    const auto iter = block_descriptors.find(Key64{target});
+     CodePtr target_code_ptr = iter != block_descriptors.end()
+-                                ? iter->second.entrypoint
++                                ? Load(iter->second).entrypoint
+                                 : code.GetReturnFromRunCodeAddress();
+ 
+     code.mov(index_reg.cvt32(), dword[r15 + code.GetJitStateInfo().offsetof_rsb_ptr]);
+@@ -354,7 +364,7 @@ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& de
+     BlockDescriptor block_desc{entrypoint, static_cast<u32>(size)};
+     // Omnidroid patch 0025: the block's link records, which EmitPendingSlots has just made.
+     block_desc.first_link = std::exchange(pending_first_link, NO_LINK);
+-    block_descriptors.insert({IR::LocationDescriptor{descriptor.Value()}, block_desc});
++    block_descriptors.insert({Key64{descriptor.Value()}, Store(block_desc)});
+     return block_desc;
+ }
+ 
+@@ -375,7 +385,7 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
+         // loading the slot sees the old target or the new one, and both are code. Patch 0025:
+         // they are the records listed from the target's head -- and a target nothing links to
+         // has no entry, rather than one made here for every block emitted.
+-        const auto head = link_heads.find(target_desc.Value());
++        const auto head = link_heads.find(Key64{target_desc.Value()});
+         if (head == link_heads.end()) {
+             return;
+         }
+@@ -448,15 +458,15 @@ void EmitX64::EmitPendingSlots(const IR::LocationDescriptor&) {
+         u64* const slot = code.getCurr<u64*>();
+         code.dq(0);
+         const u64 unlinked = pending.tail ? reinterpret_cast<u64>(pending.tail->getAddress()) : pending.unlinked;
+-        const auto iter = block_descriptors.find(pending.target);
++        const auto iter = block_descriptors.find(Key64{pending.target});
+         // Not yet published: no thread has been given this block, so a plain store is enough. The
+         // block becomes reachable through the block map or another slot, both written after this.
+-        *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(iter->second.entrypoint) : unlinked;
++        *slot = iter != block_descriptors.end() ? reinterpret_cast<u64>(Load(iter->second).entrypoint) : unlinked;
+         // Patch 0025: the newest record heads its target's list.
+         const u32 index = NextLinkSerial();
+         const u64 target = pending.target.Value();
+         LinkRecord record{target, offset_of(reinterpret_cast<u64>(slot)), offset_of(unlinked), NO_LINK, NO_LINK};
+-        const auto [head, fresh] = link_heads.try_emplace(target, index);
++        const auto [head, fresh] = link_heads.try_emplace(Key64{target}, index);
+         if (!fresh) {
+             record.next = head->second;
+             LinkAt(head->second).prev = index;
+@@ -481,9 +491,9 @@ void EmitX64::ForgetOutgoingSlots(u32 first_link) {
+         if (link.prev != NO_LINK) {
+             LinkAt(link.prev).next = link.next;
+         } else if (link.next != NO_LINK) {
+-            link_heads[link.target] = link.next;
++            link_heads[Key64{link.target}] = link.next;
+         } else {
+-            link_heads.erase(link.target);
++            link_heads.erase(Key64{link.target});
+         }
+         if (link.next != NO_LINK) {
+             LinkAt(link.next).prev = link.prev;
+@@ -520,7 +530,7 @@ void EmitX64::TrimLinkRecords(u32 base) {
+         // the head map is what tells).
+         const LinkRecord& link = link_records[i];
+         ASSERT(link.next == NO_LINK && link.prev == NO_LINK);
+-        const auto head = link_heads.find(link.target);
++        const auto head = link_heads.find(Key64{link.target});
+         ASSERT(head == link_heads.end() || head->second != link_base + i);
+     }
+ #endif
+@@ -677,7 +687,7 @@ void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>
+     };
+ 
+     for (const auto& descriptor : locations) {
+-        const auto it = block_descriptors.find(descriptor);
++        const auto it = block_descriptors.find(Key64{descriptor});
+         if (it == block_descriptors.end()) {
+             continue;
+         }
+diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
+index edb5f5a..2a5ed98 100644
+--- a/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/backend/x64/emit_x64.h
+@@ -116,6 +116,37 @@ public:
+     };
+     static_assert(sizeof(BlockDescriptor) == 16);
+ 
++    /// Omnidroid patch 0052: a 64-bit key at 4-byte alignment. A robin_map bucket is its probe
++    /// distance (3 bytes) padded to the value's alignment, then the value: with a `u64` key every
++    /// bucket was 8 + 24 = 32 bytes (the block map) or 8 + 16 = 24 (the link heads); with this key
++    /// they are 4 + 20 = 24 and 4 + 12 = 16. Hashed as the `u64` was.
++    struct Key64 {
++        u32 lo = 0;
++        u32 hi = 0;
++        Key64() = default;
++        Key64(u64 v)
++                : lo(static_cast<u32>(v)), hi(static_cast<u32>(v >> 32)) {}
++        Key64(const IR::LocationDescriptor& d)
++                : Key64(d.Value()) {}
++        u64 Value() const { return static_cast<u64>(hi) << 32 | lo; }
++        IR::LocationDescriptor Location() const { return IR::LocationDescriptor{Value()}; }
++        bool operator==(const Key64& o) const { return lo == o.lo && hi == o.hi; }
++    };
++    static_assert(sizeof(Key64) == 8 && alignof(Key64) == 4);
++    struct Key64Hash {
++        std::size_t operator()(const Key64& k) const noexcept { return std::hash<u64>()(k.Value()); }
++    };
++    /// Omnidroid patch 0052: a block as the block map keeps it -- its entry point as an offset from
++    /// the code buffer's start (a buffer is at most 2 GiB), 12 bytes at 4-byte alignment.
++    struct StoredBlock {
++        u32 entry;
++        u32 size;
++        u32 first_link;
++    };
++    static_assert(sizeof(StoredBlock) == 12 && alignof(StoredBlock) == 4);
++    StoredBlock Store(const BlockDescriptor& b) const;
++    BlockDescriptor Load(const StoredBlock& s) const;
++
+     explicit EmitX64(BlockOfCode& code);
+     virtual ~EmitX64();
+ 
+@@ -185,7 +216,7 @@ protected:
+     // State
+     BlockOfCode& code;
+     ExceptionHandler exception_handler;
+-    tsl::robin_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
++    tsl::robin_map<Key64, StoredBlock, Key64Hash> block_descriptors;  // patch 0052: compact
+     tsl::robin_map<IR::LocationDescriptor, PatchInformation> patch_information;
+ 
+ public:
+@@ -252,7 +283,7 @@ protected:
+     LinkRecord& LinkAt(u32 serial) { return link_records[serial - link_base]; }
+     const LinkRecord& LinkAt(u32 serial) const { return link_records[serial - link_base]; }
+     /// Target location -> the newest record linking to it. A target with no live record has none.
+-    tsl::robin_map<u64, u32> link_heads;
++    tsl::robin_map<Key64, u32, Key64Hash> link_heads;  // patch 0052: 16-byte buckets
+     /// Read only when a block is emitted or dropped, never on a lookup, so fuller than the maps'
+     /// 0.5: robin-hood probing stays short at 0.75, and the array is half the size.
+     static constexpr float LINK_HEADS_LOAD_FACTOR = 0.75f;

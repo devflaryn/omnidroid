@@ -458,6 +458,26 @@ list searched after the first. Verified: `tests/shared_bookkeeping.rs` (fastmem 
 bytes each with the vectors' slack, the census 225 -> 214 bytes a one-site block), `host_fault.rs`,
 `a64_exec.rs`, `shared_cache.rs`.
 
+### 0052 — x64: the block map, the link heads and the guest ranges, compact
+
+x64, own and shared caches. A robin_map bucket is its probe distance padded to the value's
+alignment, then the value: with a `u64` key the block map's buckets were 8 + 24 = 32 bytes and
+the link heads' 8 + 16 = 24. Their keys are now `Key64` (a 64-bit value at 4-byte alignment,
+hashed as the `u64` was) and the block map stores `StoredBlock` (the entry point as a 32-bit offset
+from the code buffer's start, size, first link: 12 bytes) -- `GetBasicBlock` still returns a
+`BlockDescriptor`. Buckets: 24 and 16 bytes. A `GuestRange` is 20 bytes (the location as a
+`Key64`, the first byte in two halves, a 32-bit length), not 24. A flat page index (one 8-byte
+entry per block and page, linked) was tried and dropped: where many blocks share a page it costs
+more than the per-page vectors (4 bytes an entry) it would replace. MEASURED
+(`tests/shared_bookkeeping.rs`): the census 214 -> 176 bytes a block (block map 64 -> 48, link
+heads 48 -> 32, guest ranges 40 -> 34); a world's tables (OMNI_MEM_TRACE 2026-10-09: 531k blocks,
+650k link targets in the game's host; 580k / 729k in the system's) ~18-20 MiB smaller in each.
+Lookups (`bench_dispatcher_lookups_in_a_shared_cache`, 100k blocks, E-cores, 7 runs each): a locked
+dispatcher lookup 127 -> 105 ns median (the block map 8 -> 6 MiB); `codegen_bench.rs` threaded
+dispatch with FastDispatch off (every jump a block-map lookup) 30.5 -> 30.8 ns/op, with it on
+unchanged -- inside the noise. Verified: the dynarmic-sys suite, and omni-cpu's thunk, exclusive,
+tbi, faults and lifecycle tests under `OD_TEST_SHARED_CACHE=1`.
+
 ### 0060 — x64: a census of the emitted code
 
 x64. Process-wide relaxed counters of what `A64EmitX64::Emit` writes, by part of a block (entry

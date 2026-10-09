@@ -1736,15 +1736,24 @@ fn translate_objects(p: &Process, t: &Task, st: &mut State, sender: (ProcId, i32
 /// a looper the process needs ([`spawn`]).
 fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, first: bool, nonblocking: bool) -> Result<u64, Errno> {
     let tid = t.tid;
-    let done = read_waiting(p, t, file, at, size, first, nonblocking);
-    if let Some(th) = file.broker.state.lock().proc_mut(file.id).threads.get_mut(&tid) {
+    let mut asked = false;
+    let done = read_waiting(p, t, file, at, size, first, nonblocking, &mut asked);
+    let mut st = file.broker.state.lock();
+    let proc = st.proc_mut(file.id);
+    if let Some(th) = proc.threads.get_mut(&tid) {
         th.idle = false;
+    }
+    // A spawn request this read made went nowhere if the read failed (EFAULT, EINTR): no thread
+    // will register for it, and counted it would hold back every later request -- the pool frozen
+    // at its size for good. Linux decides only once the read has succeeded.
+    if asked && done.is_err() {
+        proc.spawn_requested = proc.spawn_requested.saturating_sub(1);
     }
     done
 }
 
 #[allow(clippy::too_many_arguments)]
-fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, first: bool, nonblocking: bool) -> Result<u64, Errno> {
+fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, first: bool, nonblocking: bool, asked: &mut bool) -> Result<u64, Errno> {
     let mut out: Vec<u8> = Vec::new();
     if first {
         out.extend_from_slice(&BR_NOOP.to_le_bytes());
@@ -1772,6 +1781,7 @@ fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size
                     // Ask for another looper when this one takes the last idle slot.
                     if w.is_some() && looper && spawn::wanted(&p.comm.lock(), proc, t.tid) {
                         proc.spawn_requested += 1;
+                        *asked = true;
                         out.extend_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
                     }
                     w
@@ -2203,7 +2213,7 @@ mod tests {
 /// delivered to that thread, not to the pool).
 ///
 /// - `OMNI_BINDER_SPAWN=kernel` (or the live lever `binder_spawn=kernel`): the kernel's rule,
-///   idle loopers counted. `eager` (the default, unchanged) asks whenever a looper takes work and
+///   idle loopers counted (the default). `eager`, the rule this driver had, asks whenever a looper takes work and
 ///   the pool is under its maximum.
 /// - `OMNI_BINDER_MAX_LOOPERS=<n>`: at most `n` loopers (the main one included) in a process of a
 ///   **system** host process (never an app's: `OMNI_LINUX_APP`), whatever maximum it set; the
