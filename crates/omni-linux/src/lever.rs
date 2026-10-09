@@ -67,6 +67,9 @@
 //!   and other self-answered sockets, unix `accept`, host sockets' waits, `/dev/fuse`, `epoll_ctl`)
 //!   are woken by their own changes only (1), not by every change in the host process (0, the
 //!   default) (`crate::poll::KEYED`; `OMNI_POLL_STATS` counts what is left).
+//! - `remote_direct=0|1`: the system's host process reads and writes an app's guest memory itself
+//!   (1) rather than over the app thread's connection (0, the default; `OMNI_REMOTE_DIRECT=1`)
+//!   (`crate::remote::DIRECT`; `OMNI_REMOTE_STATS` counts both).
 //! - `binder_host_pool=0|1`: a host service's binder calls run on kept, reused threads (1) or on a
 //!   new thread each (0, the default; `OMNI_BINDER_HOST_POOL`) (`crate::binder::HOST_POOL`).
 //!
@@ -256,6 +259,15 @@ pub fn apply(line: &str) -> Option<String> {
             crate::poll::SLICE_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
             Some(format!("poll_slice_ms={}: a poll-family wait looks again by itself every {} ms", ms.max(1), ms.max(1)))
         }
+        "remote_direct" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::remote::DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("remote_direct={}: apps' memory {}", u8::from(on), if on { "read and written directly, the connection where that cannot be" } else { "asked for over each thread's connection" }))
+        }
         "poll_keyed" => {
             let on = match value.trim() {
                 "1" => true,
@@ -417,6 +429,10 @@ pub fn start() {
         let on = v.trim() != "0";
         crate::poll::KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[lever] OMNI_POLL_KEYED: poll_keyed={}", u8::from(on));
+    }
+    if std::env::var("OMNI_REMOTE_DIRECT").as_deref() == Ok("1") {
+        crate::remote::DIRECT.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_REMOTE_DIRECT: remote_direct=1");
     }
     let Some(path) = std::env::var_os("OMNI_LEVER_FILE").map(PathBuf::from) else { return };
     let _ = std::thread::Builder::new().name("omni-lever".into()).spawn(move || {

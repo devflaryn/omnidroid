@@ -189,6 +189,16 @@ fn child_zygote_socket(args: &[String]) -> Option<&str> {
 static CHILDREN: parking_lot::Mutex<std::collections::BTreeMap<i32, Arc<parking_lot::Mutex<std::process::Child>>>> =
     parking_lot::Mutex::new(std::collections::BTreeMap::new());
 
+/// The host process of app process `pid`, launched here and running: its host pid. What
+/// `crate::remote` trusts for a direct access to an app's memory -- the process this one
+/// started, not a number a connection claims.
+#[must_use]
+pub fn host_pid(pid: i32) -> Option<u32> {
+    let child = CHILDREN.lock().get(&pid).cloned()?;
+    let id = child.lock().id();
+    Some(id)
+}
+
 /// A signal to an app process launched here, which lives in a host process of its own: `None` if
 /// `pid` is not one. SIGKILL and SIGTERM (whose default action ends the process) end its host
 /// process -- ActivityManager's `kill` of an app it stops (`am force-stop`, a restart), which

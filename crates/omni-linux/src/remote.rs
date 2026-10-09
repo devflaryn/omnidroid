@@ -332,13 +332,18 @@ fn start_stats() {
         let ioctls = IOCTLS.swap(0, std::sync::atomic::Ordering::Relaxed);
         let asks = ASKS.swap(0, std::sync::atomic::Ordering::Relaxed);
         let bytes = ASK_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let done = DIRECT_DONE.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let fell_back = DIRECT_FELL_BACK.swap(0, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "[remote] pid {}: {} app binder ioctls/s, {} round trips/s back to the apps ({:.1} per ioctl, {} KB/s)",
+            "[remote] pid {}: {} app binder ioctls/s, {} round trips/s back to the apps ({:.1} per ioctl, {} KB/s); direct {} /s, {} fell back /s (remote_direct={})",
             std::process::id(),
             ioctls / every,
             asks / every,
             asks as f64 / ioctls.max(1) as f64,
-            bytes / every / 1024
+            bytes / every / 1024,
+            done / every,
+            fell_back / every,
+            u8::from(DIRECT.load(std::sync::atomic::Ordering::Relaxed)),
         );
     });
 }
@@ -357,11 +362,192 @@ fn ask(kind: u8, payload: &[u8]) -> Result<(u8, Vec<u8>), Errno> {
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Direct access to an app's memory (`remote_direct`).
+
+/// **`remote_direct=1`** (lever; off by default): the system's host process reads and writes an
+/// app's guest memory itself (`omni_platform::peer`: `ReadProcessMemory` / `NtWriteVirtualMemory`,
+/// `process_vm_readv/writev`) instead of asking the app's host process for it over the thread's
+/// connection, a request and an answer each. MEASURED (Windows, i7-13700F E-cores,
+/// `omni-platform`'s `peer_memory` test, two host processes): a 64 B read 55-56 us over the
+/// loopback (31-38 us of the asking process's CPU alone, plus the answering one's) against 1.3 us
+/// direct; 4 KiB 60-61 us against 2.2-2.3 us. A binder ioctl of an app makes ~5-8 of them.
+///
+/// Guest memory is at the same host addresses in the app's host process (identity mapping, D4;
+/// the low window's guest addresses at their based host ones, D41), so a guest address is a host
+/// address there -- **bounded** here to the app's guest space, which the app's host process
+/// declares when a thread attaches, and only for a host process this one launched
+/// (`crate::zygote::host_pid`). Anything the direct path cannot do whole -- a page not mapped, not
+/// committed (a lazy mapping, a swept zero page), not readable or writable *on the host*, the low
+/// window's seam, a space with the 4 KiB overlay -- goes the old way, whose checks then answer.
+///
+/// What the owner's side does beyond the copy is kept by **the gate**, a page both processes map
+/// (`crate::shm::SharedPage`): word 0 counts the app's views that journal the kernel's writes (a
+/// fork child running in the memory) or are one side of a live fork pair -- states in which the
+/// copy must go through the owner (`crate::guest::GuestMem`: the journal's `note`, a shelved side's
+/// wait) -- and word 1 counts direct accesses in flight. A direct access takes a lease (word 1 up)
+/// and then looks at word 0; the owner shuts the gate (word 0 up) and then waits for word 1 to
+/// drain, both sequentially consistent: one of the two sees the other.
+///
+/// Not the owner's: the guest's own protection beyond the host's (a page the guest maps read-only
+/// that the host keeps writable would take the write), and the owner's layout lock (an `munmap`
+/// racing the copy: the copy fails and falls back, or lands before it -- as Linux's would).
+pub static DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+static DIRECT_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIRECT_FELL_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const GATE_PREFIX: &str = "omni-remote-gate";
+
+/// One app host process's memory, as the system's host process reaches it directly.
+struct Direct {
+    peer: omni_platform::peer::PeerMemory,
+    gate: crate::shm::SharedPage,
+    /// The guest space, `[base, end)`, and its low window (`end`, `delta`) if it has one.
+    base: u64,
+    end: u64,
+    window: Option<(u64, u64)>,
+}
+
+impl Direct {
+    /// The host address of guest range `[addr, addr + len)` in the app's host process, if the
+    /// range is the guest space's and has one host range.
+    fn host_range(&self, addr: u64, len: usize) -> Option<usize> {
+        let end = addr.checked_add(len as u64)?;
+        if addr < self.base || end > self.end {
+            return None;
+        }
+        match self.window {
+            Some((window_end, delta)) if addr < window_end => (end <= window_end).then(|| addr.wrapping_add(delta)).and_then(|h| usize::try_from(h).ok()),
+            _ => usize::try_from(addr).ok(),
+        }
+    }
+
+    /// `f` under a lease of the gate, if the gate is open.
+    fn leased<T>(&self, f: impl FnOnce() -> Option<T>) -> Option<T> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (shut, leases) = (self.gate.word(0), self.gate.word(1));
+        leases.fetch_add(1, SeqCst);
+        let r = if shut.load(SeqCst) == 0 { f() } else { None };
+        leases.fetch_sub(1, SeqCst);
+        r
+    }
+
+    fn read(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        let host = self.host_range(addr, len)?;
+        self.leased(|| {
+            let mut out = vec![0u8; len];
+            self.peer.read(host, &mut out).ok().map(|()| out)
+        })
+    }
+
+    fn write(&self, addr: u64, bytes: &[u8]) -> Option<()> {
+        let host = self.host_range(addr, bytes.len())?;
+        self.leased(|| self.peer.write(host, bytes).ok())
+    }
+}
+
+thread_local! {
+    /// The direct access to the memory of the app whose thread this host thread serves.
+    static CURRENT_DIRECT: RefCell<Option<Arc<Direct>>> = const { RefCell::new(None) };
+}
+
+/// `f` on the current app's direct access, when `remote_direct` is on and there is one; `None`
+/// (take the connection) otherwise, or when `f` could not.
+fn with_direct<T>(f: impl FnOnce(&Direct) -> Option<T>) -> Option<T> {
+    if !DIRECT.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let direct = CURRENT_DIRECT.with(|d| d.borrow().clone())?;
+    let r = f(&direct);
+    let counter = if r.is_some() { &DIRECT_DONE } else { &DIRECT_FELL_BACK };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+/// What an app's host process declares when a thread attaches, after the credential: its host
+/// pid, its guest space and low window, and its gate's path.
+fn declaration(p: &Process) -> Vec<u8> {
+    let space = p.mem.space();
+    let mut d = std::process::id().to_le_bytes().to_vec();
+    d.extend_from_slice(&(space.base() as u64).to_le_bytes());
+    d.extend_from_slice(&(space.end() as u64).to_le_bytes());
+    let (window_end, delta) = space.low_window().map_or((0, 0), |w| (w.end as u64, w.delta as u64));
+    d.extend_from_slice(&window_end.to_le_bytes());
+    d.extend_from_slice(&delta.to_le_bytes());
+    d.push(u8::from(space.subpages_active()));
+    if let Some(gate) = own_gate() {
+        d.extend_from_slice(gate.path().to_string_lossy().as_bytes());
+    }
+    d
+}
+
+/// The system's side: the direct access a declaration offers, for app process `pid` -- only for a
+/// host process this one launched as that app, with a gate, and no 4 KiB overlay.
+fn direct_for(server: &Server, pid: i32, d: &[u8]) -> Option<Arc<Direct>> {
+    if d.len() < 37 || d[36] != 0 {
+        return None;
+    }
+    let host_pid = u32_at(d, 0);
+    if crate::zygote::host_pid(pid) != Some(host_pid) {
+        return None;
+    }
+    if let Some(known) = server.directs.lock().get(&host_pid).and_then(std::sync::Weak::upgrade) {
+        return Some(known);
+    }
+    let path = std::path::PathBuf::from(String::from_utf8(d[37..].to_vec()).ok()?);
+    let gate = crate::shm::SharedPage::open(&path, GATE_PREFIX)?;
+    let peer = omni_platform::peer::PeerMemory::open(host_pid).ok()?;
+    let (window_end, delta) = (u64_at(d, 20), u64_at(d, 28));
+    let direct = Arc::new(Direct { peer, gate, base: u64_at(d, 4), end: u64_at(d, 12), window: (window_end != 0).then_some((window_end, delta)) });
+    server.directs.lock().insert(host_pid, Arc::downgrade(&direct));
+    Some(direct)
+}
+
+/// The app's side: how many of this host process's views hold the gate shut, and the gate.
+static EXPOSED: Mutex<u32> = Mutex::new(0);
+static GATE: OnceLock<Option<crate::shm::SharedPage>> = OnceLock::new();
+
+/// This app host process's gate, made at its first use: shut as many times as views hold it.
+fn own_gate() -> Option<&'static crate::shm::SharedPage> {
+    GATE.get_or_init(|| {
+        let exposed = EXPOSED.lock();
+        let page = crate::shm::SharedPage::create(GATE_PREFIX)?;
+        page.word(0).store(*exposed, std::sync::atomic::Ordering::SeqCst);
+        Some(page)
+    })
+    .as_ref()
+}
+
+/// A view of this host process starts (`exposed`) or stops holding the gate shut
+/// (`crate::guest::GuestMem`). Shutting it waits until no direct access is in flight.
+pub(crate) fn gate(exposed: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut n = EXPOSED.lock();
+    if exposed {
+        *n += 1;
+    } else {
+        *n = n.saturating_sub(1);
+    }
+    let Some(Some(page)) = GATE.get() else { return };
+    if exposed {
+        page.word(0).fetch_add(1, SeqCst);
+        while page.word(1).load(SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+    } else {
+        page.word(0).fetch_sub(1, SeqCst);
+    }
+}
+
 /// The app's memory, reached through the current connection.
 pub struct RemoteMemory;
 
 impl crate::guest::Remote for RemoteMemory {
     fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        if let Some(bytes) = with_direct(|d| d.read(addr, len)) {
+            return Ok(bytes);
+        }
         let mut req = addr.to_le_bytes().to_vec();
         req.extend_from_slice(&(len as u32).to_le_bytes());
         match ask(MEM_READ, &req)? {
@@ -371,6 +557,9 @@ impl crate::guest::Remote for RemoteMemory {
     }
 
     fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+        if with_direct(|d| d.write(addr, bytes)).is_some() {
+            return Ok(());
+        }
         let mut req = addr.to_le_bytes().to_vec();
         req.extend_from_slice(bytes);
         match ask(MEM_WRITE, &req)? {
@@ -471,6 +660,8 @@ struct Server {
     stand_ins: Mutex<HashMap<i32, Weak<Process>>>,
     /// An open's binder file, its stand-in, and the credential that opened it, by random token.
     opens: Mutex<HashMap<u64, (Arc<Process>, Arc<BinderFile>, Credential)>>,
+    /// The direct accesses to app host processes' memory, by host pid (`remote_direct`).
+    directs: Mutex<HashMap<u32, Weak<Direct>>>,
 }
 
 /// Serve apps' binder on a local port: what `--binder-server` points an app's host process at.
@@ -480,7 +671,7 @@ struct Server {
 pub fn serve(sysroot: Arc<crate::vfs::Sysroot>) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
-    let server = Arc::new(Server { sysroot, stand_ins: Mutex::default(), opens: Mutex::default() });
+    let server = Arc::new(Server { sysroot, stand_ins: Mutex::default(), opens: Mutex::default(), directs: Mutex::default() });
     let _ = SERVING.set(Arc::clone(&server));
     start_stats();
     std::thread::Builder::new().name("binder-remote".into()).spawn(move || {
@@ -570,6 +761,8 @@ impl Server {
                 }
                 let mut task = Task::new(tid, Arc::clone(&p));
                 CURRENT.with(|c| *c.borrow_mut() = stream.try_clone().ok());
+                let direct = body.get(28..).and_then(|d| direct_for(self, p.sys.pid, d));
+                CURRENT_DIRECT.with(|d| *d.borrow_mut() = direct);
                 loop {
                     let Ok((kind, body)) = receive(&mut stream) else { break };
                     if kind == IOCTL {
@@ -594,6 +787,7 @@ impl Server {
                     }
                 }
                 CURRENT.with(|c| *c.borrow_mut() = None);
+                CURRENT_DIRECT.with(|d| *d.borrow_mut() = None);
             }
             _ => {}
         }
@@ -678,7 +872,7 @@ impl RemoteBinder {
         Ok(Arc::new(Self { token: u64_at(&body, 0), _control: control, threads: Mutex::default() }))
     }
 
-    fn thread(&self, tid: i32) -> Result<Arc<Mutex<TcpStream>>, Errno> {
+    fn thread(&self, p: &Process, tid: i32) -> Result<Arc<Mutex<TcpStream>>, Errno> {
         if let Some(s) = self.threads.lock().get(&tid) {
             return Ok(Arc::clone(s));
         }
@@ -687,6 +881,9 @@ impl RemoteBinder {
         let mut req = self.token.to_le_bytes().to_vec();
         req.extend_from_slice(&(tid as u32).to_le_bytes());
         req.extend_from_slice(&credential()?);
+        // What a direct access to this process's memory needs (`remote_direct`), after the
+        // credential: the system uses it or not.
+        req.extend_from_slice(&declaration(p));
         send(&mut s, ATTACH, &req).map_err(|e| lost("attach", &e))?;
         let s = Arc::new(Mutex::new(s));
         self.threads.lock().insert(tid, Arc::clone(&s));
@@ -696,7 +893,7 @@ impl RemoteBinder {
     /// Send a request and answer the system's reads, writes and descriptor requests until its
     /// result comes.
     fn call(&self, p: &Process, t: &Task, kind: u8, payload: &[u8]) -> SysResult {
-        let conn = self.thread(t.tid)?;
+        let conn = self.thread(p, t.tid)?;
         let mut s = conn.lock();
         send(&mut s, kind, payload).map_err(|e| lost("send", &e))?;
         loop {
@@ -779,6 +976,113 @@ mod tests {
             std::path::PathBuf::from,
         );
         crate::vfs::Sysroot::open(&dir).ok()
+    }
+
+    /// A direct access on this very process (what another host process's is, short of the
+    /// process boundary `omni-platform`'s `peer_memory` test crosses): inside the declared space
+    /// it reads and writes; outside it, across the low window's seam, or with the gate shut it
+    /// declines (the caller then asks over the connection).
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_direct_access_stays_in_the_space_and_behind_the_gate() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut memory = vec![7u8; 8192];
+        let base = memory.as_mut_ptr() as u64;
+        let made = crate::shm::SharedPage::create("omni-remote-gate-test").expect("a gate");
+        let gate = crate::shm::SharedPage::open(made.path(), "omni-remote-gate-test").expect("opened by path");
+        let d = Direct { peer: omni_platform::peer::PeerMemory::open(std::process::id()).expect("this process"), gate, base, end: base + 8192, window: None };
+        assert_eq!(d.read(base + 10, 4), Some(vec![7; 4]));
+        assert_eq!(d.write(base + 100, b"abc"), Some(()));
+        assert_eq!(&memory[100..103], b"abc");
+        assert_eq!(d.read(base + 8190, 4), None, "past the space's end");
+        assert_eq!(d.read(base - 1, 1), None, "before its start");
+        // The other process's view of the same page: shutting it there closes it here.
+        made.word(0).store(1, SeqCst);
+        assert_eq!(d.read(base, 4), None, "the gate shut");
+        assert_eq!(d.write(base, b"x"), None);
+        assert_eq!(memory[0], 7);
+        made.word(0).store(0, SeqCst);
+        assert_eq!(made.word(1).load(SeqCst), 0, "no lease left behind");
+        // A low window: guest addresses below its end are at `delta` above.
+        let w = Direct { window: Some((0x1000, base - 0x10)), base: 0x10, end: base + 8192, ..d };
+        assert_eq!(w.host_range(0x10, 4), Some(base as usize));
+        assert_eq!(w.host_range(0xffe, 4), None, "across the window's seam");
+        std::fs::remove_file(made.path()).ok();
+    }
+
+    /// **A stand-in's whole binder ioctl with no round trip**: a `BC_TRANSACTION` and the read of
+    /// its answer, run on a stand-in whose memory is reached only directly (this thread has no
+    /// connection to the app: any request over one would fail the call as `EFAULT`). The
+    /// command, its data, the answer and the consumed counts are all read and written there.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_stand_ins_binder_call_needs_no_round_trip_with_direct_access() {
+        let mut memory = vec![0u8; 1 << 16];
+        let base = memory.as_mut_ptr() as u64;
+        let w64 = |m: &mut Vec<u8>, at: usize, v: u64| m[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        // bwr: write 4 + 64 bytes at +0x100, read 0x100 at +0x400.
+        w64(&mut memory, 0, 68);
+        w64(&mut memory, 16, base + 0x100);
+        w64(&mut memory, 24, 0x100);
+        w64(&mut memory, 40, base + 0x400);
+        memory[0x100..0x104].copy_from_slice(&0x4040_6300u32.to_le_bytes()); // BC_TRANSACTION
+        // binder_transaction_data: handle 0, cookie, code 1, flags 0, pid/euid, 16 bytes of data
+        // at +0x800, no offsets (at +0x900).
+        let tr = 0x104;
+        memory[tr + 16..tr + 20].copy_from_slice(&1u32.to_le_bytes());
+        w64(&mut memory, tr + 32, 16);
+        w64(&mut memory, tr + 40, 0);
+        w64(&mut memory, tr + 48, base + 0x800);
+        w64(&mut memory, tr + 56, base + 0x900);
+        let made = crate::shm::SharedPage::create("omni-remote-gate-call").expect("a gate");
+        let gate = crate::shm::SharedPage::open(made.path(), "omni-remote-gate-call").expect("opened");
+        let direct = Arc::new(Direct { peer: omni_platform::peer::PeerMemory::open(std::process::id()).unwrap(), gate, base, end: base + (1 << 16), window: None });
+        CURRENT_DIRECT.with(|d| *d.borrow_mut() = Some(direct));
+        DIRECT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let m = crate::manifest::parse("d\t755\t/\n").unwrap();
+        let p = Process::stand_in(crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), m), 424_242, 10_000, Arc::new(RemoteMemory), Arc::new(RemoteFds));
+        let file = BinderFile::open(Context::VndBinder);
+        file.set_area(base + 0x4000, 0x8000);
+        let mut task = Task::new(424_242, Arc::clone(&p));
+        let r = crate::binder::ioctl(&p, &mut task, &file, 0xc030_6201, base, true);
+        DIRECT.store(false, std::sync::atomic::Ordering::SeqCst);
+        CURRENT_DIRECT.with(|d| *d.borrow_mut() = None);
+        assert_eq!(r, Ok(0), "the ioctl ran on direct access alone");
+        let u64_of = |at: usize| u64::from_le_bytes(memory[at..at + 8].try_into().unwrap());
+        assert_eq!(u64_of(8), 68, "the command consumed, written back directly");
+        assert!(u64_of(32) >= 4, "an answer read, written back directly ({})", u64_of(32));
+        file.release();
+        std::fs::remove_file(made.path()).ok();
+    }
+
+    /// The owner shuts the gate only once no direct access is in flight: a lease taken first is
+    /// waited out.
+    #[test]
+    fn shutting_the_gate_waits_out_a_lease() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(page) = own_gate() else { return };
+        page.word(1).fetch_add(1, SeqCst);
+        let shut = std::thread::spawn(|| {
+            let t = std::time::Instant::now();
+            gate(true);
+            t.elapsed()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        page.word(1).fetch_sub(1, SeqCst);
+        let waited = shut.join().unwrap();
+        assert!(waited >= std::time::Duration::from_millis(40), "shut after the lease ended ({waited:?})");
+        assert!(page.word(0).load(SeqCst) >= 1, "shut");
+        gate(false);
+    }
+
+    /// A declaration from a host process this one did not launch as that app is not used.
+    #[test]
+    fn a_direct_access_is_only_for_a_launched_app() {
+        let Some(root) = sysroot() else { return };
+        let server = Server { sysroot: root, stand_ins: Mutex::default(), opens: Mutex::default(), directs: Mutex::default() };
+        let mut d = std::process::id().to_le_bytes().to_vec();
+        d.extend_from_slice(&[0u8; 33]);
+        assert!(direct_for(&server, 12345, &d).is_none());
     }
 
     #[test]
