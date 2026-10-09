@@ -30,6 +30,7 @@
 //! (`docs/superpowers/specs/2026-10-09-gpu-present-design.md`), where nothing is copied in.
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ash::vk::Handle as _;
 use ash::{khr, vk};
 use omni_platform::window::RawWindow;
 
@@ -82,19 +83,27 @@ struct Chain {
     done: Vec<vk::Semaphore>,
     /// The fence of the frame last drawn into each image.
     in_flight: Vec<vk::Fence>,
+    format: vk::Format,
+    /// Its images can be render targets (`present_zero`).
+    drawable: bool,
+    /// Each image's view and framebuffer for the GPU composition, made at its first such frame.
+    targets: Vec<(vk::ImageView, vk::Framebuffer)>,
 }
 
-/// A window presented through a Vulkan swapchain. Not `Send`: it is made and used on one thread
-/// (the display window's present thread), and dropped before the window is.
+/// A window presented through a Vulkan swapchain. Made on the display window's present thread and
+/// dropped there, before the window is; used from there and (`present_zero`) from the composer's
+/// thread, behind a mutex (see the `Send` below).
 pub struct WindowPresenter {
     instance: ash::Instance,
     surface_fn: khr::surface::Instance,
+    /// Null for a presenter with no window (`new_headless`, the tests' offscreen composition).
     surface: vk::SurfaceKHR,
     physical: vk::PhysicalDevice,
     memory: vk::PhysicalDeviceMemoryProperties,
     device: Option<ash::Device>,
     swapchain_fn: Option<khr::swapchain::Device>,
     queue: vk::Queue,
+    family: u32,
     pool: vk::CommandPool,
     slots: Vec<Slot>,
     chain: Option<Chain>,
@@ -105,6 +114,55 @@ pub struct WindowPresenter {
     target: (u32, u32),
     frames: u64,
     name: String,
+    /// `present_zero`: share images can be imported (`VK_KHR_external_memory_win32`), and this
+    /// GPU's device and driver UUIDs, which a share image's must equal.
+    import: Option<([u8; 16], [u8; 16])>,
+    /// The GPU composition's objects, made at its first frame.
+    compose: Option<Compose>,
+    /// Share images opened by name (and whether sampled as opaque), with when last used.
+    imported: std::collections::HashMap<(String, bool), Imported>,
+    /// Frames composed from share images (the clock `imported` ages by).
+    composed: u64,
+}
+
+// SAFETY: every Vulkan handle here may be used from any thread when access is externally
+// synchronised, which the one owner -- a `Mutex` (display_window's) -- provides; the raw pointers
+// are host mappings of this presenter's own memory, touched only under that same lock.
+unsafe impl Send for WindowPresenter {}
+
+/// The GPU composition (`present_zero`): two render passes over the swapchain's format (one ending
+/// for present, one for a read-back), a pipeline per blend, and what the layers sample through.
+struct Compose {
+    format: vk::Format,
+    pass_present: vk::RenderPass,
+    pass_read: vk::RenderPass,
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    /// `NONE`, `PREMULTIPLIED`, `COVERAGE`.
+    pipelines: [vk::Pipeline; 3],
+    sampler: vk::Sampler,
+    descriptors: vk::DescriptorPool,
+    shaders: [vk::ShaderModule; 2],
+    /// The layers' quads (six vertices of a `vec2` position and a `vec2` coordinate each).
+    vertices: vk::Buffer,
+    vertex_memory: vk::DeviceMemory,
+    vertex_mapped: *mut u8,
+}
+
+/// The most layers a GPU-composed frame takes (more: the CPU composes it).
+pub const MAX_LAYERS: usize = 16;
+/// How many frames a share image not drawn is kept open.
+const KEEP_IMPORTED: u64 = 240;
+
+/// A share image opened here.
+struct Imported {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    set: vk::DescriptorSet,
+    used: u64,
+    /// The generation last taken over from the app's process.
+    acquired: u64,
 }
 
 fn vkerr(what: &'static str) -> impl Fn(vk::Result) -> String {
@@ -118,14 +176,29 @@ impl WindowPresenter {
     /// No Vulkan, no surface for this window system, no device that presents to it, or anything the
     /// driver refused; nothing is left behind.
     pub fn new(window: RawWindow) -> Result<Self, String> {
+        Self::build(Some(window))
+    }
+
+    /// A presenter with no window: the GPU composition into an image read back
+    /// ([`compose_offscreen`](Self::compose_offscreen)), for tests and measurements.
+    ///
+    /// # Errors
+    /// As [`new`](Self::new).
+    pub fn new_headless() -> Result<Self, String> {
+        Self::build(None)
+    }
+
+    fn build(window: Option<RawWindow>) -> Result<Self, String> {
         let entry = super::entry().map_err(|_| "no host Vulkan loader".to_string())?;
-        let platform: &std::ffi::CStr = match window {
-            RawWindow::Win32 { .. } => khr::win32_surface::NAME,
-            RawWindow::Xlib { .. } => khr::xlib_surface::NAME,
-            other => return Err(format!("no Vulkan surface here for a {} window", other.system_name())),
+        let platform: Option<&std::ffi::CStr> = match window {
+            None => None,
+            Some(RawWindow::Win32 { .. }) => Some(khr::win32_surface::NAME),
+            Some(RawWindow::Xlib { .. }) => Some(khr::xlib_surface::NAME),
+            Some(other) => return Err(format!("no Vulkan surface here for a {} window", other.system_name())),
         };
-        let extensions = [khr::surface::NAME.as_ptr(), platform.as_ptr()];
-        let app = vk::ApplicationInfo::default().application_name(c"omnidroid-window").api_version(vk::make_api_version(0, 1, 0, 0));
+        let extensions: Vec<*const std::ffi::c_char> = platform.map(|p| vec![khr::surface::NAME.as_ptr(), p.as_ptr()]).unwrap_or_default();
+        // 1.1: the GPU's UUIDs (`vkGetPhysicalDeviceProperties2`) and external memory, core.
+        let app = vk::ApplicationInfo::default().application_name(c"omnidroid-window").api_version(vk::make_api_version(0, 1, 1, 0));
         let info = vk::InstanceCreateInfo::default().application_info(&app).enabled_extension_names(&extensions);
         // SAFETY: `info` and what it points to outlive the call.
         let instance = unsafe { entry.create_instance(&info, None) }.map_err(vkerr("vkCreateInstance"))?;
@@ -139,6 +212,7 @@ impl WindowPresenter {
             device: None,
             swapchain_fn: None,
             queue: vk::Queue::null(),
+            family: 0,
             pool: vk::CommandPool::null(),
             slots: Vec::new(),
             chain: None,
@@ -148,15 +222,20 @@ impl WindowPresenter {
             target: (0, 0),
             frames: 0,
             name: String::new(),
+            import: None,
+            compose: None,
+            imported: std::collections::HashMap::new(),
+            composed: 0,
         };
         // From here on an error drops `me`, which destroys what was made.
         me.surface = match window {
-            RawWindow::Win32 { hwnd, hinstance } => {
+            None => vk::SurfaceKHR::null(),
+            Some(RawWindow::Win32 { hwnd, hinstance }) => {
                 let info = vk::Win32SurfaceCreateInfoKHR::default().hinstance(hinstance).hwnd(hwnd);
                 // SAFETY: a live window's handles (the caller's window outlives this presenter).
                 unsafe { khr::win32_surface::Instance::new(entry, &me.instance).create_win32_surface(&info, None) }.map_err(vkerr("vkCreateWin32SurfaceKHR"))?
             }
-            RawWindow::Xlib { display, window } => {
+            Some(RawWindow::Xlib { display, window }) => {
                 let info = vk::XlibSurfaceCreateInfoKHR::default().dpy(display as *mut vk::Display).window(window as vk::Window);
                 // SAFETY: as above.
                 unsafe { khr::xlib_surface::Instance::new(entry, &me.instance).create_xlib_surface(&info, None) }.map_err(vkerr("vkCreateXlibSurfaceKHR"))?
@@ -170,12 +249,31 @@ impl WindowPresenter {
         me.memory = unsafe { me.instance.get_physical_device_memory_properties(physical) };
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
-        let device_extensions = [khr::swapchain::NAME.as_ptr()];
+        // SAFETY: a live physical device of this instance.
+        let offered = unsafe { me.instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+        let has = |n: &std::ffi::CStr| offered.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|x| x == n));
+        let mut device_extensions = Vec::new();
+        if !me.surface.is_null() {
+            device_extensions.push(khr::swapchain::NAME.as_ptr());
+        }
+        // `present_zero`: share images opened by name (Windows' named handles).
+        let can_import = cfg!(windows) && has(khr::external_memory_win32::NAME);
+        if can_import {
+            device_extensions.push(khr::external_memory_win32::NAME.as_ptr());
+        }
         let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&device_extensions);
         // SAFETY: `info` outlives the call; the family was read from this device.
         let device = unsafe { me.instance.create_device(physical, &info, None) }.map_err(vkerr("vkCreateDevice"))?;
         // SAFETY: one queue of `family` was asked for.
         me.queue = unsafe { device.get_device_queue(family, 0) };
+        me.family = family;
+        if can_import {
+            let mut id = vk::PhysicalDeviceIDProperties::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+            // SAFETY: a live physical device; 1.1 instance.
+            unsafe { me.instance.get_physical_device_properties2(physical, &mut props) };
+            me.import = Some((id.device_uuid, id.driver_uuid));
+        }
         me.swapchain_fn = Some(khr::swapchain::Device::new(&me.instance, &device));
         let pool_info = vk::CommandPoolCreateInfo::default().flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER).queue_family_index(family);
         // SAFETY: a live device.
@@ -199,9 +297,11 @@ impl WindowPresenter {
             };
             me.slots.push(Slot { cmd, fence, acquired, source: None });
         }
-        // SAFETY: live physical device and surface.
-        let modes = unsafe { me.surface_fn.get_physical_device_surface_present_modes(physical, me.surface) }.map_err(vkerr("vkGetPhysicalDeviceSurfacePresentModesKHR"))?;
-        me.mode = if modes.contains(&vk::PresentModeKHR::MAILBOX) { vk::PresentModeKHR::MAILBOX } else { vk::PresentModeKHR::FIFO };
+        if !me.surface.is_null() {
+            // SAFETY: live physical device and surface.
+            let modes = unsafe { me.surface_fn.get_physical_device_surface_present_modes(physical, me.surface) }.map_err(vkerr("vkGetPhysicalDeviceSurfacePresentModesKHR"))?;
+            me.mode = if modes.contains(&vk::PresentModeKHR::MAILBOX) { vk::PresentModeKHR::MAILBOX } else { vk::PresentModeKHR::FIFO };
+        }
         Ok(me)
     }
 
@@ -233,12 +333,13 @@ impl WindowPresenter {
             let (props, families, exts) = unsafe {
                 (self.instance.get_physical_device_properties(pd), self.instance.get_physical_device_queue_family_properties(pd), self.instance.enumerate_device_extension_properties(pd).unwrap_or_default())
             };
-            if !exts.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == khr::swapchain::NAME)) {
+            let headless = self.surface.is_null();
+            if !headless && !exts.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == khr::swapchain::NAME)) {
                 continue;
             }
             let family = families.iter().enumerate().position(|(i, f)| {
                 // SAFETY: as above; the surface is live.
-                f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && unsafe { self.surface_fn.get_physical_device_surface_support(pd, i as u32, self.surface) }.unwrap_or(false)
+                f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && (headless || unsafe { self.surface_fn.get_physical_device_surface_support(pd, i as u32, self.surface) }.unwrap_or(false))
             });
             let Some(family) = family else { continue };
             let rank = match props.device_type {
@@ -265,6 +366,9 @@ impl WindowPresenter {
     /// # Errors
     /// What the driver refused (the device lost, memory exhausted): the caller goes back to GDI.
     pub fn present(&mut self, pixels: &[u8], width: u32, height: u32, bgra: bool, client: (u32, u32)) -> Result<bool, String> {
+        if self.surface.is_null() {
+            return Err("a presenter without a window".into());
+        }
         let bytes = width as usize * height as usize * 4;
         if width == 0 || height == 0 || pixels.len() < bytes {
             return Ok(false);
@@ -421,7 +525,8 @@ impl WindowPresenter {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+            // A render target too when it can be (`present_zero` draws the layers into it).
+            .image_usage(vk::ImageUsageFlags::TRANSFER_DST | (caps.supported_usage_flags & vk::ImageUsageFlags::COLOR_ATTACHMENT))
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(alpha)
@@ -460,7 +565,8 @@ impl WindowPresenter {
                 }
             }
         }
-        self.chain = Some(Chain { handle, extent, in_flight: vec![vk::Fence::null(); images.len()], images, done });
+        let drawable = caps.supported_usage_flags.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+        self.chain = Some(Chain { handle, extent, format: format.format, drawable, in_flight: vec![vk::Fence::null(); images.len()], images, done, targets: Vec::new() });
         Ok(())
     }
 
@@ -470,11 +576,574 @@ impl WindowPresenter {
         let (device, swapchain_fn) = (self.device.as_ref().expect("made in new"), self.swapchain_fn.as_ref().expect("made in new"));
         // SAFETY: see above: nothing uses them any more.
         unsafe {
+            for (view, framebuffer) in chain.targets {
+                device.destroy_framebuffer(framebuffer, None);
+                device.destroy_image_view(view, None);
+            }
             for s in chain.done {
                 device.destroy_semaphore(s, None);
             }
             swapchain_fn.destroy_swapchain(chain.handle, None);
         }
+    }
+
+    /// Whether a share image so described can be opened here: on this GPU and driver, with the
+    /// import extension.
+    #[must_use]
+    pub fn can_show(&self, desc: &super::share::ShareDesc) -> bool {
+        self.import.is_some_and(|(device, driver)| device == desc.device_uuid && driver == desc.driver_uuid)
+    }
+
+    /// **Present a frame composed on the GPU from share images** (`present_zero`): `layers`
+    /// (bottom first, display coordinates of a `display`-sized display) drawn over black into the
+    /// window's next swapchain image, scaled to its client area `client`, and presented; the GPU is
+    /// done reading the share images when this returns (what lets their buffers go back to the app).
+    /// `Ok(false)`: nothing shown (minimised, the swapchain being rebuilt).
+    ///
+    /// # Errors
+    /// A layer it cannot open, or anything the driver refused: the caller composes on the CPU.
+    pub fn present_layers(&mut self, layers: &[super::share::ShareLayer], display: (u32, u32), client: (u32, u32)) -> Result<bool, String> {
+        if self.surface.is_null() {
+            return Err("a presenter without a window".into());
+        }
+        if layers.len() > MAX_LAYERS || layers.iter().any(|l| !self.can_show(&l.desc)) || display.0 == 0 || display.1 == 0 {
+            return Err("layers this presenter cannot show".into());
+        }
+        if client != self.target {
+            self.target = client;
+            self.dirty = true;
+        }
+        if self.dirty || self.chain.is_none() {
+            self.rebuild()?;
+            if self.chain.is_none() {
+                return Ok(false);
+            }
+        }
+        let (format, drawable) = self.chain.as_ref().map(|c| (c.format, c.drawable)).expect("checked");
+        if !drawable {
+            return Err("the window's swapchain images cannot be drawn into".into());
+        }
+        self.ensure_compose(format)?;
+        let slot = self.next;
+        let (fence, acquired, cmd) = (self.slots[slot].fence, self.slots[slot].acquired, self.slots[slot].cmd);
+        // SAFETY: this slot's fence; once signalled nothing of the slot is in use.
+        unsafe { self.device().wait_for_fences(&[fence], true, u64::MAX) }.map_err(vkerr("vkWaitForFences"))?;
+        let sets = layers.iter().map(|l| self.open(l)).collect::<Result<Vec<_>, _>>()?;
+        self.ensure_targets()?;
+        self.write_quads(layers, display);
+        let chain = self.chain.as_ref().expect("checked");
+        let swapchain_fn = self.swapchain_fn.as_ref().expect("made in new");
+        // SAFETY: a live swapchain; the slot's semaphore is unsignalled (its last wait is done).
+        let (index, suboptimal) = match unsafe { swapchain_fn.acquire_next_image(chain.handle, u64::MAX, acquired, vk::Fence::null()) } {
+            Ok(v) => v,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.dirty = true;
+                return Ok(false);
+            }
+            Err(e) => return Err(vkerr("vkAcquireNextImageKHR")(e)),
+        };
+        let i = index as usize;
+        let earlier = chain.in_flight[i];
+        if earlier != vk::Fence::null() && earlier != fence {
+            // SAFETY: a live fence of another slot.
+            unsafe { self.device().wait_for_fences(&[earlier], true, u64::MAX) }.map_err(vkerr("vkWaitForFences"))?;
+        }
+        let (framebuffer, extent, done) = (chain.targets[i].1, chain.extent, chain.done[i]);
+        let pass = self.compose.as_ref().expect("made").pass_present;
+        let device = self.device();
+        // SAFETY: the slot's fence was waited on; every handle is live.
+        unsafe {
+            device.reset_fences(&[fence]).map_err(vkerr("vkResetFences"))?;
+            self.record_compose(cmd, pass, framebuffer, extent, layers, &sets)?;
+            device.end_command_buffer(cmd).map_err(vkerr("vkEndCommandBuffer"))?;
+            let (waits, stages, cmds, signals) = ([acquired], [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT], [cmd], [done]);
+            let submit = vk::SubmitInfo::default().wait_semaphores(&waits).wait_dst_stage_mask(&stages).command_buffers(&cmds).signal_semaphores(&signals);
+            device.queue_submit(self.queue, &[submit], fence).map_err(vkerr("vkQueueSubmit"))?;
+        }
+        if let Some(c) = self.chain.as_mut() {
+            c.in_flight[i] = fence;
+        }
+        let chain = self.chain.as_ref().expect("checked");
+        let (swapchains, indices, waits) = ([chain.handle], [index], [done]);
+        let info = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&swapchains).image_indices(&indices);
+        // SAFETY: the image was acquired above and its drawing submitted, signalling `done`.
+        let presented = unsafe { swapchain_fn.queue_present(self.queue, &info) };
+        // The share images are read when this returns, whatever the present answered.
+        // SAFETY: the fence of the submit above.
+        unsafe { self.device().wait_for_fences(&[fence], true, u64::MAX) }.map_err(vkerr("vkWaitForFences"))?;
+        match presented {
+            Ok(late) => self.dirty |= suboptimal | late,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.dirty = true,
+            Err(e) => return Err(vkerr("vkQueuePresentKHR")(e)),
+        }
+        self.next = (self.next + 1) % FRAMES;
+        self.frames += 1;
+        self.composed += 1;
+        self.evict();
+        Ok(true)
+    }
+
+    /// **The same composition into an image, read back** (BGRA rows of `display.0` pixels): what
+    /// [`present_layers`](Self::present_layers) draws, for a test to compare with the CPU's.
+    ///
+    /// # Errors
+    /// As [`present_layers`](Self::present_layers).
+    pub fn compose_offscreen(&mut self, layers: &[super::share::ShareLayer], display: (u32, u32)) -> Result<Vec<u8>, String> {
+        if layers.len() > MAX_LAYERS || layers.iter().any(|l| !self.can_show(&l.desc)) {
+            return Err("layers this presenter cannot show".into());
+        }
+        let format = vk::Format::B8G8R8A8_UNORM;
+        self.ensure_compose(format)?;
+        let (w, h) = display;
+        let bytes = w as usize * h as usize * 4;
+        let target = self.make_image(w, h, format, vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)?;
+        let read = self.make_source(w, h, format);
+        let result = (|| -> Result<Vec<u8>, String> {
+            let read = read.as_ref().map_err(Clone::clone)?;
+            let sets = layers.iter().map(|l| self.open(l)).collect::<Result<Vec<_>, _>>()?;
+            self.write_quads(layers, display);
+            let device = self.device();
+            let compose = self.compose.as_ref().expect("made");
+            let slot = self.next;
+            let (fence, cmd) = (self.slots[slot].fence, self.slots[slot].cmd);
+            // SAFETY (the block): live handles of this device; the slot is waited on first.
+            unsafe {
+                device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr("vkWaitForFences"))?;
+                let view = device.create_image_view(&view_info(target.0, format, false), None).map_err(vkerr("vkCreateImageView"))?;
+                let attachments = [view];
+                let framebuffer = device.create_framebuffer(&vk::FramebufferCreateInfo::default().render_pass(compose.pass_read).attachments(&attachments).width(w).height(h).layers(1), None);
+                let framebuffer = match framebuffer {
+                    Ok(f) => f,
+                    Err(e) => {
+                        device.destroy_image_view(view, None);
+                        return Err(vkerr("vkCreateFramebuffer")(e));
+                    }
+                };
+                let drawn = (|| -> Result<(), String> {
+                    device.reset_fences(&[fence]).map_err(vkerr("vkResetFences"))?;
+                    self.record_compose(cmd, compose.pass_read, framebuffer, vk::Extent2D { width: w, height: h }, layers, &sets)?;
+                    let copy = vk::BufferImageCopy::default().image_subresource(layers_of_colour()).image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+                    device.cmd_copy_image_to_buffer(cmd, target.0, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, read.buffer, &[copy]);
+                    device.end_command_buffer(cmd).map_err(vkerr("vkEndCommandBuffer"))?;
+                    let cmds = [cmd];
+                    device.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], fence).map_err(vkerr("vkQueueSubmit"))?;
+                    device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr("vkWaitForFences"))
+                })();
+                device.destroy_framebuffer(framebuffer, None);
+                device.destroy_image_view(view, None);
+                drawn?;
+                Ok(std::slice::from_raw_parts(read.mapped, bytes).to_vec())
+            }
+        })();
+        if let Ok(read) = read {
+            self.destroy_source(read);
+        }
+        // SAFETY: idle (waited above, or never submitted).
+        unsafe {
+            let _ = self.device().device_wait_idle();
+            self.device().destroy_image(target.0, None);
+            self.device().free_memory(target.1, None);
+        }
+        self.composed += 1;
+        self.evict();
+        result
+    }
+
+    /// A device-local image and its memory.
+    fn make_image(&self, width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags) -> Result<(vk::Image, vk::DeviceMemory), String> {
+        let device = self.device();
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: a live device; undone on failure.
+        unsafe {
+            let image = device.create_image(&info, None).map_err(vkerr("vkCreateImage"))?;
+            let need = device.get_image_memory_requirements(image);
+            let made = self
+                .memory_type(need.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .ok_or_else(|| "no device-local memory".to_string())
+                .and_then(|kind| device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(need.size).memory_type_index(kind), None).map_err(vkerr("vkAllocateMemory")))
+                .and_then(|memory| match device.bind_image_memory(image, memory, 0) {
+                    Ok(()) => Ok(memory),
+                    Err(e) => {
+                        device.free_memory(memory, None);
+                        Err(vkerr("vkBindImageMemory")(e))
+                    }
+                });
+            match made {
+                Ok(memory) => Ok((image, memory)),
+                Err(e) => {
+                    device.destroy_image(image, None);
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// The composition's objects for render targets of `format`, made once.
+    fn ensure_compose(&mut self, format: vk::Format) -> Result<(), String> {
+        match &self.compose {
+            Some(c) if c.format == format => return Ok(()),
+            Some(_) => return Err("a swapchain of another format than the composition's".into()),
+            None => {}
+        }
+        let mut c = Compose {
+            format,
+            pass_present: vk::RenderPass::null(),
+            pass_read: vk::RenderPass::null(),
+            set_layout: vk::DescriptorSetLayout::null(),
+            layout: vk::PipelineLayout::null(),
+            pipelines: [vk::Pipeline::null(); 3],
+            sampler: vk::Sampler::null(),
+            descriptors: vk::DescriptorPool::null(),
+            shaders: [vk::ShaderModule::null(); 2],
+            vertices: vk::Buffer::null(),
+            vertex_memory: vk::DeviceMemory::null(),
+            vertex_mapped: std::ptr::null_mut(),
+        };
+        match self.make_compose(&mut c) {
+            Ok(()) => {
+                self.compose = Some(c);
+                Ok(())
+            }
+            Err(e) => {
+                self.destroy_compose(c);
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn make_compose(&self, c: &mut Compose) -> Result<(), String> {
+        let device = self.device();
+        // SAFETY (the function): a live device; every object made is recorded in `c` at once, and
+        // `destroy_compose` undoes whatever was made.
+        unsafe {
+            for (final_layout, slot) in [(vk::ImageLayout::PRESENT_SRC_KHR, 0), (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, 1)] {
+                let attachment = [vk::AttachmentDescription::default()
+                    .format(c.format)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .final_layout(final_layout)];
+                let colour = [vk::AttachmentReference::default().attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+                let subpass = [vk::SubpassDescription::default().pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS).color_attachments(&colour)];
+                let dependencies = [
+                    vk::SubpassDependency::default()
+                        .src_subpass(vk::SUBPASS_EXTERNAL)
+                        .dst_subpass(0)
+                        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+                    vk::SubpassDependency::default()
+                        .src_subpass(0)
+                        .dst_subpass(vk::SUBPASS_EXTERNAL)
+                        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                        .dst_stage_mask(vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::BOTTOM_OF_PIPE)
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+                ];
+                let pass = device.create_render_pass(&vk::RenderPassCreateInfo::default().attachments(&attachment).subpasses(&subpass).dependencies(&dependencies), None).map_err(vkerr("vkCreateRenderPass"))?;
+                if slot == 0 {
+                    c.pass_present = pass;
+                } else {
+                    c.pass_read = pass;
+                }
+            }
+            let bindings = [vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+            c.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(vkerr("vkCreateDescriptorSetLayout"))?;
+            let set_layouts = [c.set_layout];
+            c.layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts), None).map_err(vkerr("vkCreatePipelineLayout"))?;
+            c.shaders[0] = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::quad_spirv::TRIANGLE_VERT_SPIRV), None).map_err(vkerr("vkCreateShaderModule"))?;
+            c.shaders[1] = device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&super::quad_spirv::TRIANGLE_FRAG_SPIRV), None).map_err(vkerr("vkCreateShaderModule"))?;
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(c.shaders[0]).name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(c.shaders[1]).name(c"main"),
+            ];
+            let vertex_bindings = [vk::VertexInputBindingDescription::default().binding(0).stride(16).input_rate(vk::VertexInputRate::VERTEX)];
+            let attributes = [
+                vk::VertexInputAttributeDescription::default().location(0).binding(0).format(vk::Format::R32G32_SFLOAT).offset(0),
+                vk::VertexInputAttributeDescription::default().location(1).binding(0).format(vk::Format::R32G32_SFLOAT).offset(8),
+            ];
+            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default().vertex_binding_descriptions(&vertex_bindings).vertex_attribute_descriptions(&attributes);
+            let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+            let raster = vk::PipelineRasterizationStateCreateInfo::default().polygon_mode(vk::PolygonMode::FILL).cull_mode(vk::CullModeFlags::NONE).front_face(vk::FrontFace::COUNTER_CLOCKWISE).line_width(1.0);
+            let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+            // The composer's three blends (`hal::compose::Blend`), on the colour; alpha alike.
+            let blend_of = |kind: usize| {
+                let (src, on) = match kind {
+                    0 => (vk::BlendFactor::ONE, false),
+                    1 => (vk::BlendFactor::ONE, true),
+                    _ => (vk::BlendFactor::SRC_ALPHA, true),
+                };
+                vk::PipelineColorBlendAttachmentState::default()
+                    .blend_enable(on)
+                    .src_color_blend_factor(src)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .alpha_blend_op(vk::BlendOp::ADD)
+                    .color_write_mask(vk::ColorComponentFlags::RGBA)
+            };
+            for kind in 0..3 {
+                let attachments = [blend_of(kind)];
+                let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+                let info = vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&stages)
+                    .vertex_input_state(&vertex_input)
+                    .input_assembly_state(&assembly)
+                    .viewport_state(&viewport)
+                    .rasterization_state(&raster)
+                    .multisample_state(&multisample)
+                    .color_blend_state(&blend)
+                    .dynamic_state(&dynamic)
+                    .layout(c.layout)
+                    .render_pass(c.pass_present)
+                    .subpass(0);
+                c.pipelines[kind] = device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, r)| vkerr("vkCreateGraphicsPipelines")(r))?[0];
+            }
+            // Nearest: at 1:1 each pixel its own source pixel, as the CPU composes.
+            let sampler = vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .max_lod(0.0);
+            c.sampler = device.create_sampler(&sampler, None).map_err(vkerr("vkCreateSampler"))?;
+            let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(64)];
+            c.descriptors = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET).max_sets(64).pool_sizes(&sizes), None).map_err(vkerr("vkCreateDescriptorPool"))?;
+            let size = (MAX_LAYERS * 6 * 16) as u64;
+            c.vertices = device.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::VERTEX_BUFFER).sharing_mode(vk::SharingMode::EXCLUSIVE), None).map_err(vkerr("vkCreateBuffer"))?;
+            let need = device.get_buffer_memory_requirements(c.vertices);
+            let kind = self.memory_type(need.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).ok_or("no host-visible memory")?;
+            c.vertex_memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(need.size).memory_type_index(kind), None).map_err(vkerr("vkAllocateMemory"))?;
+            device.bind_buffer_memory(c.vertices, c.vertex_memory, 0).map_err(vkerr("vkBindBufferMemory"))?;
+            c.vertex_mapped = device.map_memory(c.vertex_memory, 0, size, vk::MemoryMapFlags::empty()).map_err(vkerr("vkMapMemory"))?.cast();
+        }
+        Ok(())
+    }
+
+    fn destroy_compose(&self, c: Compose) {
+        let device = self.device();
+        // SAFETY: idle (the callers wait); null handles are ignored.
+        unsafe {
+            if !c.vertex_mapped.is_null() {
+                device.unmap_memory(c.vertex_memory);
+            }
+            device.destroy_buffer(c.vertices, None);
+            device.free_memory(c.vertex_memory, None);
+            device.destroy_descriptor_pool(c.descriptors, None);
+            device.destroy_sampler(c.sampler, None);
+            for p in c.pipelines {
+                device.destroy_pipeline(p, None);
+            }
+            for s in c.shaders {
+                device.destroy_shader_module(s, None);
+            }
+            device.destroy_pipeline_layout(c.layout, None);
+            device.destroy_descriptor_set_layout(c.set_layout, None);
+            device.destroy_render_pass(c.pass_present, None);
+            device.destroy_render_pass(c.pass_read, None);
+        }
+    }
+
+    /// The swapchain images' views and framebuffers for the composition, made once per swapchain.
+    fn ensure_targets(&mut self) -> Result<(), String> {
+        let pass = self.compose.as_ref().expect("made").pass_present;
+        let device = self.device.as_ref().expect("made in new");
+        let Some(chain) = self.chain.as_mut() else { return Ok(()) };
+        if !chain.targets.is_empty() {
+            return Ok(());
+        }
+        for &image in &chain.images {
+            // SAFETY: a live swapchain image; what is made is recorded at once.
+            unsafe {
+                let view = device.create_image_view(&view_info(image, chain.format, false), None).map_err(vkerr("vkCreateImageView"))?;
+                let attachments = [view];
+                match device.create_framebuffer(&vk::FramebufferCreateInfo::default().render_pass(pass).attachments(&attachments).width(chain.extent.width).height(chain.extent.height).layers(1), None) {
+                    Ok(framebuffer) => chain.targets.push((view, framebuffer)),
+                    Err(e) => {
+                        device.destroy_image_view(view, None);
+                        return Err(vkerr("vkCreateFramebuffer")(e));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The descriptor set a layer's share image is sampled through: opened by its name the first
+    /// time (the same image as the exporter made, its memory imported by name), kept after.
+    /// With the set, the image when this frame must take it over from the app's process (a
+    /// generation not taken over yet).
+    fn open(&mut self, layer: &super::share::ShareLayer) -> Result<(vk::DescriptorSet, Option<vk::Image>), String> {
+        let key = (layer.desc.name.clone(), layer.opaque);
+        if let Some(i) = self.imported.get_mut(&key) {
+            i.used = self.composed;
+            let fresh = i.acquired != layer.generation;
+            i.acquired = layer.generation;
+            return Ok((i.set, fresh.then_some(i.image)));
+        }
+        let desc = &layer.desc;
+        let device = self.device();
+        let compose = self.compose.as_ref().expect("made");
+        let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(desc.format)
+            .extent(vk::Extent3D { width: desc.width, height: desc.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(super::share::USAGE)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external);
+        let mut made = Imported { image: vk::Image::null(), memory: vk::DeviceMemory::null(), view: vk::ImageView::null(), set: vk::DescriptorSet::null(), used: self.composed, acquired: layer.generation };
+        let wide = desc.wide_name();
+        let opened = (|| -> Result<(), String> {
+            // SAFETY (the closure): a live device; each object is recorded in `made` at once.
+            unsafe {
+                made.image = device.create_image(&info, None).map_err(vkerr("vkCreateImage"))?;
+                let need = device.get_image_memory_requirements(made.image);
+                let kind = self.memory_type(need.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL).ok_or("no device-local memory")?;
+                let mut import = vk::ImportMemoryWin32HandleInfoKHR::default().handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32).name(wide.as_ptr());
+                let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(made.image);
+                let alloc = vk::MemoryAllocateInfo::default().allocation_size(desc.size).memory_type_index(kind).push_next(&mut import).push_next(&mut dedicated);
+                made.memory = device.allocate_memory(&alloc, None).map_err(vkerr("vkAllocateMemory (a share image by name)"))?;
+                device.bind_image_memory(made.image, made.memory, 0).map_err(vkerr("vkBindImageMemory"))?;
+                made.view = device.create_image_view(&view_info(made.image, desc.format, layer.opaque), None).map_err(vkerr("vkCreateImageView"))?;
+                let layouts = [compose.set_layout];
+                made.set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(compose.descriptors).set_layouts(&layouts)).map_err(vkerr("vkAllocateDescriptorSets"))?[0];
+                let image_info = [vk::DescriptorImageInfo::default().sampler(compose.sampler).image_view(made.view).image_layout(vk::ImageLayout::GENERAL)];
+                let write = vk::WriteDescriptorSet::default().dst_set(made.set).dst_binding(0).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&image_info);
+                device.update_descriptor_sets(&[write], &[]);
+            }
+            Ok(())
+        })();
+        if let Err(e) = opened {
+            self.close(made);
+            return Err(e);
+        }
+        let (set, image) = (made.set, made.image);
+        self.imported.insert(key, made);
+        Ok((set, Some(image)))
+    }
+
+    /// A share image opened here, let go of (the GPU no longer reads it).
+    fn close(&self, i: Imported) {
+        let device = self.device();
+        // SAFETY: idle for this image; null handles are ignored.
+        unsafe {
+            if i.set != vk::DescriptorSet::null() {
+                if let Some(c) = &self.compose {
+                    let _ = device.free_descriptor_sets(c.descriptors, &[i.set]);
+                }
+            }
+            device.destroy_image_view(i.view, None);
+            device.destroy_image(i.image, None);
+            device.free_memory(i.memory, None);
+        }
+    }
+
+    /// Share images not drawn for a while (their buffers gone, most likely), let go of.
+    fn evict(&mut self) {
+        let now = self.composed;
+        let old: Vec<(String, bool)> = self.imported.iter().filter(|(_, i)| i.used + KEEP_IMPORTED < now).map(|(k, _)| k.clone()).collect();
+        for k in old {
+            if let Some(i) = self.imported.remove(&k) {
+                self.close(i);
+            }
+        }
+    }
+
+    /// The layers' quads into the vertex buffer: each its frame on the display (as clip
+    /// coordinates) and its crop in the buffer (as texture coordinates).
+    fn write_quads(&self, layers: &[super::share::ShareLayer], display: (u32, u32)) {
+        let c = self.compose.as_ref().expect("made");
+        let (dw, dh) = (display.0 as f32, display.1 as f32);
+        let mut v: Vec<f32> = Vec::with_capacity(layers.len() * 24);
+        for l in layers {
+            let (x0, y0, x1, y1) = (l.frame.0 as f32 / dw * 2.0 - 1.0, l.frame.1 as f32 / dh * 2.0 - 1.0, l.frame.2 as f32 / dw * 2.0 - 1.0, l.frame.3 as f32 / dh * 2.0 - 1.0);
+            let (w, h) = (l.desc.width as f32, l.desc.height as f32);
+            let (u0, v0, u1, v1) = (l.crop.0 / w, l.crop.1 / h, l.crop.2 / w, l.crop.3 / h);
+            v.extend_from_slice(&[x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1, x1, y0, u1, v0, x1, y1, u1, v1, x0, y1, u0, v1]);
+        }
+        // SAFETY: the mapping holds `MAX_LAYERS` quads (checked by the callers); the GPU is not
+        // reading it (the previous composition was waited on).
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr().cast::<u8>(), c.vertex_mapped, v.len() * 4) };
+    }
+
+    /// Begin `cmd` and record the composition into `framebuffer` (its render pass `pass`): the
+    /// share images taken from whichever process wrote them, black, each layer over it.
+    ///
+    /// # Safety
+    /// `cmd` is not in use; every handle is live.
+    unsafe fn record_compose(&self, cmd: vk::CommandBuffer, pass: vk::RenderPass, framebuffer: vk::Framebuffer, extent: vk::Extent2D, layers: &[super::share::ShareLayer], sets: &[(vk::DescriptorSet, Option<vk::Image>)]) -> Result<(), String> {
+        let device = self.device();
+        let c = self.compose.as_ref().expect("made");
+        // SAFETY: the caller's.
+        unsafe {
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(vkerr("vkBeginCommandBuffer"))?;
+            // Each share image with a new frame, from the process that wrote it
+            // (`QUEUE_FAMILY_EXTERNAL`), in the layout left there.
+            let mut seen = std::collections::HashSet::new();
+            let acquire: Vec<vk::ImageMemoryBarrier> = sets
+                .iter()
+                .filter_map(|(_, fresh)| *fresh)
+                .filter(|image| seen.insert(image.as_raw()))
+                .map(|image| {
+                    vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                        .dst_queue_family_index(self.family)
+                        .image(image)
+                        .subresource_range(range())
+                })
+                .collect();
+            if !acquire.is_empty() {
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::FRAGMENT_SHADER, vk::DependencyFlags::empty(), &[], &[], &acquire);
+            }
+            let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } }];
+            let begin = vk::RenderPassBeginInfo::default().render_pass(pass).framebuffer(framebuffer).render_area(vk::Rect2D { offset: vk::Offset2D::default(), extent }).clear_values(&clear);
+            device.cmd_begin_render_pass(cmd, &begin, vk::SubpassContents::INLINE);
+            device.cmd_set_viewport(cmd, 0, &[vk::Viewport { x: 0.0, y: 0.0, width: extent.width as f32, height: extent.height as f32, min_depth: 0.0, max_depth: 1.0 }]);
+            device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D::default(), extent }]);
+            device.cmd_bind_vertex_buffers(cmd, 0, &[c.vertices], &[0]);
+            for (k, (l, &(set, _))) in layers.iter().zip(sets).enumerate() {
+                let kind = match l.blend {
+                    super::share::ShareBlend::None => 0,
+                    super::share::ShareBlend::Premultiplied => 1,
+                    super::share::ShareBlend::Coverage => 2,
+                };
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, c.pipelines[kind]);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, c.layout, 0, &[set], &[]);
+                device.cmd_draw(cmd, 6, 1, (k * 6) as u32, 0);
+            }
+            device.cmd_end_render_pass(cmd);
+        }
+        Ok(())
     }
 
     fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -516,7 +1185,8 @@ impl WindowPresenter {
             // SAFETY (the block): a live device; each object is recorded in `s` as soon as it is
             // made, so a failure part way is undone by `destroy_source`.
             unsafe {
-                s.buffer = device.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE), None).map_err(vkerr("vkCreateBuffer"))?;
+                // A source for the frame's upload, and (`compose_offscreen`) a read-back's destination.
+                s.buffer = device.create_buffer(&vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE), None).map_err(vkerr("vkCreateBuffer"))?;
                 let need = device.get_buffer_memory_requirements(s.buffer);
                 let kind = self.staging_type(need.memory_type_bits).ok_or("no host-visible memory")?;
                 s.buffer_memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(need.size).memory_type_index(kind), None).map_err(vkerr("vkAllocateMemory"))?;
@@ -575,6 +1245,12 @@ impl Drop for WindowPresenter {
                 let _ = device.device_wait_idle();
             }
             self.destroy_chain();
+            for (_, i) in std::mem::take(&mut self.imported) {
+                self.close(i);
+            }
+            if let Some(c) = self.compose.take() {
+                self.destroy_compose(c);
+            }
             let slots = std::mem::take(&mut self.slots);
             for slot in slots {
                 if let Some(s) = slot.source {
@@ -597,11 +1273,18 @@ impl Drop for WindowPresenter {
         // SAFETY: the surface (null when never made) and the instance, after everything made from
         // them.
         unsafe {
-            self.surface_fn.destroy_surface(self.surface, None);
+            // (A headless presenter's instance has no surface functions loaded.)
+            if !self.surface.is_null() {
+                self.surface_fn.destroy_surface(self.surface, None);
+            }
             self.instance.destroy_instance(None);
         }
     }
 }
+
+#[cfg(test)]
+#[path = "window_present_zero_tests.rs"]
+mod zero_tests;
 
 #[cfg(test)]
 mod tests {
@@ -728,6 +1411,21 @@ mod tests {
             instance.destroy_instance(None);
         }
     }
+}
+
+/// A 2D colour view of `image`; `opaque`: its alpha read as 1 (an RGBX buffer's).
+fn view_info(image: vk::Image, format: vk::Format, opaque: bool) -> vk::ImageViewCreateInfo<'static> {
+    let a = if opaque { vk::ComponentSwizzle::ONE } else { vk::ComponentSwizzle::IDENTITY };
+    vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .components(vk::ComponentMapping { r: vk::ComponentSwizzle::IDENTITY, g: vk::ComponentSwizzle::IDENTITY, b: vk::ComponentSwizzle::IDENTITY, a })
+        .subresource_range(range())
+}
+
+fn layers_of_colour() -> vk::ImageSubresourceLayers {
+    layers()
 }
 
 fn range() -> vk::ImageSubresourceRange {

@@ -671,6 +671,15 @@ impl Client {
             let mut order: Vec<(i32, i64)> = st.layers.keys().map(|l| (st.device.get(l).map_or(0, |d| d.z), *l)).collect();
             order.sort_unstable();
             super::compose::levers_from_env();
+            // `present_zero`: shown by the window's GPU from the app's share images, when every
+            // layer can be; else this frame is composed on the CPU as below.
+            if crate::gpu::share::on() {
+                if let Some(sink) = screen.framebuffer.sink() {
+                    if present_shared(&st, screen, &order, &*sink) {
+                        return;
+                    }
+                }
+            }
             let bgra = super::compose::BGRA_OUT.load(Ordering::Relaxed);
             if super::compose::ZERO.load(Ordering::Relaxed) {
                 // The copying path's buffers are not needed (~17 MB at 1575x890).
@@ -814,6 +823,162 @@ impl LayerPixels<'_> {
             Self::Read(v) => v,
         }
     }
+}
+
+/// A layer of a frame shown from share images, kept for composing its pixels on the CPU should a
+/// reader ask (`Framebuffer::present_external`): its region and how it is drawn.
+struct OwnedLayer {
+    shm: Arc<Shm>,
+    pixels_at: u64,
+    stride: usize,
+    rows: usize,
+    opaque: bool,
+    bgra: bool,
+    one_to_one: bool,
+    crop: (f32, f32, f32, f32),
+    frame: (i32, i32, i32, i32),
+    blend: super::compose::Blend,
+    alpha: f32,
+}
+
+/// The CPU's composition of `layers` into `out` (RGBA, `width` x `height`): what the window was
+/// shown, from the regions' pixels as they are now.
+fn compose_owned(layers: &[OwnedLayer], out: &mut [u8], width: u32, height: u32) {
+    use super::compose::{Layer, Source};
+    let pixels: Vec<LayerPixels<'_>> = layers
+        .iter()
+        .map(|l| {
+            crate::gpu::native::wait_written(&l.shm, std::time::Duration::from_millis(50));
+            let need = l.stride * l.rows * 4;
+            l.shm.bytes(l.pixels_at, need).map_or_else(
+                || {
+                    let mut v = vec![0u8; need];
+                    let _ = l.shm.read_at(&mut v, l.pixels_at);
+                    LayerPixels::Read(v)
+                },
+                LayerPixels::Borrowed,
+            )
+        })
+        .collect();
+    let drawn: Vec<Layer<'_>> = layers
+        .iter()
+        .zip(&pixels)
+        .map(|(l, p)| {
+            let data = p.bytes();
+            let source = if l.one_to_one {
+                Source::Pixels { data, stride: l.stride, opaque: l.opaque, crop_x: l.crop.0 as usize, crop_y: l.crop.1 as usize }
+            } else {
+                Source::Mapped { data, stride: l.stride, rows: l.rows, opaque: l.opaque, bgra: l.bgra, crop: l.crop, transform: 0 }
+            };
+            Layer { source, frame: l.frame, blend: l.blend, alpha: l.alpha }
+        })
+        .collect();
+    super::compose::compose_into(out, width as usize, height as usize, &drawn, super::compose::Opts { fast: true, runs: true, bgra: false });
+}
+
+/// Frames shown from share images and composed on the CPU instead, while `present_zero` is on,
+/// and why the last one was not (for the `[composer] present_zero` line).
+static ZERO_FRAMES: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static ZERO_WHY: Mutex<&str> = Mutex::new("");
+
+/// **A frame shown from the app's share images** (`present_zero`, `crate::gpu::share`): when every
+/// visible layer is a buffer layer with a share image holding the generation its region holds, at
+/// plane alpha 1 and untransformed, the window's GPU composes them (`sink`) and the framebuffer
+/// gets the frame without its pixels -- composed on the CPU only if someone reads them. False, with
+/// nothing presented: the CPU composes this frame.
+fn present_shared(st: &State, screen: &Screen, order: &[(i32, i64)], sink: &dyn super::framebuffer::ZeroSink) -> bool {
+    use crate::gpu::share::{self, ShareBlend, ShareDesc, ShareLayer};
+    let why = (|| -> Result<(Vec<ShareLayer>, Vec<OwnedLayer>), &'static str> {
+        let (mut shared, mut owned) = (Vec::new(), Vec::new());
+        for &(_, l) in order {
+            let Some(d) = st.device.get(&l) else { continue };
+            let Some(f) = &d.frame else { continue };
+            if st.hidden.contains(&l) || f.right <= f.left || f.bottom <= f.top {
+                continue;
+            }
+            let alpha = d.alpha.unwrap_or(1.0);
+            if alpha <= 0.0 {
+                continue; // drawn by neither path
+            }
+            if st.layers.get(&l) != Some(&Composition::DEVICE) {
+                return Err("a layer that is not a buffer (a solid colour)");
+            }
+            if alpha < 254.5 / 255.0 {
+                return Err("a layer with plane alpha below 1");
+            }
+            if d.transform.is_some_and(|t| t != common::Transform::NONE) {
+                return Err("a transformed layer");
+            }
+            let (Some(b), Some(c)) = (d.slot.and_then(|s| d.buffers.get(&s)), &d.crop) else { return Err("a layer without its buffer or crop") };
+            crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
+            let Some(desc) = ShareDesc::read(&b.shm) else { return Err("a buffer with no share image (not the app's Vulkan, or OMNI_PRESENT_ZERO not ready there)") };
+            if (desc.width, desc.height) != (b.width, b.height) {
+                return Err("a share image of another size than its buffer");
+            }
+            let mut g = [0u8; 8];
+            let _ = b.shm.read_at(&mut g, crate::gpu::native::CONTENT_GENERATION_AT);
+            let generation = share::read_generation(&b.shm);
+            if generation == 0 || generation != u64::from_le_bytes(g) {
+                return Err("a share image not holding its buffer's frame (copied with present_zero off)");
+            }
+            let blend = match d.blend {
+                Some(common::BlendMode::NONE) => (ShareBlend::None, super::compose::Blend::None),
+                Some(common::BlendMode::COVERAGE) => (ShareBlend::Coverage, super::compose::Blend::Coverage),
+                _ => (ShareBlend::Premultiplied, super::compose::Blend::Premultiplied),
+            };
+            let crop = (c.left, c.top, c.right, c.bottom);
+            let frame = (f.left, f.top, f.right, f.bottom);
+            let opaque = b.format == RGBX_8888;
+            shared.push(ShareLayer { desc, opaque, crop, frame, blend: blend.0, generation });
+            owned.push(OwnedLayer {
+                shm: Arc::clone(&b.shm),
+                pixels_at: b.pixels_at,
+                stride: b.stride as usize,
+                rows: b.height as usize,
+                opaque,
+                bgra: b.format == BGRA_8888,
+                one_to_one: d.one_to_one(),
+                crop,
+                frame,
+                blend: blend.1,
+                alpha,
+            });
+        }
+        if shared.is_empty() {
+            return Err("no layer to draw");
+        }
+        if shared.len() > crate::gpu::window_present::MAX_LAYERS {
+            return Err("more layers than the GPU composition takes");
+        }
+        Ok((shared, owned))
+    })();
+    let Mode { width, height, .. } = screen.mode();
+    let outcome = why.and_then(|(shared, owned)| {
+        sink.present(&shared, (width, height)).map_err(|e| {
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!("[composer] present_zero: the window could not show a frame ({e}); composed on the CPU");
+            }
+            "the window could not show it"
+        })?;
+        Ok(owned)
+    });
+    let done = match outcome {
+        Ok(owned) => {
+            screen.framebuffer.present_external(width, height, Arc::new(move |out: &mut [u8]| compose_owned(&owned, out, width, height)));
+            true
+        }
+        Err(why) => {
+            *ZERO_WHY.lock() = why;
+            false
+        }
+    };
+    let n = ZERO_FRAMES[usize::from(!done)].fetch_add(1, Ordering::Relaxed) + 1;
+    let (gpu, cpu) = (ZERO_FRAMES[0].load(Ordering::Relaxed), ZERO_FRAMES[1].load(Ordering::Relaxed));
+    if (gpu + cpu) % 600 == 0 || (n == 1 && (gpu + cpu) <= 2) {
+        eprintln!("[composer] present_zero: {gpu} frames shown from share images by the window's GPU, {cpu} composed on the CPU (last reason: {})", *ZERO_WHY.lock());
+    }
+    done
 }
 
 /// **The composer's frame without copies** (`compose_zero`, [`super::compose::ZERO`]): each

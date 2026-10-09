@@ -39,8 +39,9 @@
 //    512  SMPTE2094_10: u32 present, u32 length, then up to 1024 bytes (512 .. 1543)
 //   1544  reserved (zero) .. 2047
 //   2048  SMPTE2094_40: u32 present, u32 length, then up to 1024 bytes (2048 .. 3079)
-//   3080  reserved (zero) .. 4095
-// The Rust side writes only `name` at 64.
+//   3080  reserved (zero) .. 4095; of it the host uses 3200 .. 3399 (a share image's description,
+//         `gpu::share::SHARE_AT`) and 4080 .. 4095 (the pending and content generations)
+// The Rust side writes `name` at 64 and those host fields; this file reads none of them.
 // ---------------------------------------------------------------------------------------------
 
 #include <errno.h>
