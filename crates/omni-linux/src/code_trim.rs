@@ -129,8 +129,10 @@ pub mod age {
     pub static MINUTES: AtomicU64 = AtomicU64::new(0);
     /// MiB of translations a process keeps.
     pub static KEEP_MB: AtomicU64 = AtomicU64::new(32);
-    /// SurfaceFlinger too.
-    pub static SURFACEFLINGER: AtomicBool = AtomicBool::new(false);
+    /// SurfaceFlinger too -- **on by default** since the in-world soak of 2026-10-09 (PS99,
+    /// `OMNI_CODE_AGE=5`: surfaceflinger 54 -> 25 MiB of translations in a 420 ms pass, fps 59.1-60.1
+    /// in the 5 s windows around it). `OMNI_CODE_AGE_SF=0` or the lever leaves it alone.
+    pub static SURFACEFLINGER: AtomicBool = AtomicBool::new(true);
     static KICK: AtomicBool = AtomicBool::new(false);
 
     /// The period, from the lever; a period set starts with a pass.
@@ -146,8 +148,8 @@ pub mod age {
         if let Some(mb) = std::env::var("OMNI_CODE_AGE_KEEP_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
             KEEP_MB.store(mb, Ordering::Relaxed);
         }
-        if std::env::var("OMNI_CODE_AGE_SF").as_deref() == Ok("1") {
-            SURFACEFLINGER.store(true, Ordering::Relaxed);
+        if let Ok(v) = std::env::var("OMNI_CODE_AGE_SF") {
+            SURFACEFLINGER.store(v.trim() != "0", Ordering::Relaxed);
         }
         // Every 10 minutes by default since the in-world run of 2026-10-09 (PS99 session s10:
         // system_server 118 -> 29 MiB of translations on the first pass (1.3 s of its CPU), 41 -> 26
