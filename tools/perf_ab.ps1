@@ -70,6 +70,9 @@ if (-not $okCommit) { Write-Output "LOWCOMMIT: free commit stayed under 13 GB fo
 $crate = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Exe)))  # <tree>/target/release/deps -> <tree>
 $proc = Start-Process -FilePath $Exe -ArgumentList "--ignored", "--nocapture", "--exact", "the_apk_is_installed_started_and_draws" `
   -WorkingDirectory $crate -RedirectStandardOutput $out -RedirectStandardError $err -PassThru -WindowStyle Hidden
+# A launch that failed (e.g. an exe outside <tree>/target/release/deps) must not wait out the join
+# timeout and then kill whatever guests are running by then.
+if (-not $proc) { Write-Output "NOSTART: $Exe did not start"; exit 4 }
 $log = Join-Path $env:TEMP ("omni-linux-r-{0}.log" -f $proc.Id)
 
 function Guests { @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" }) }
