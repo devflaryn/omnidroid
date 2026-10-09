@@ -80,7 +80,7 @@
 //! The watchdog is therefore a short budget expiring, checked in Rust between slices.
 
 use std::cell::UnsafeCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -119,6 +119,7 @@ mod inline_table;
 pub use callbacks::HINTS_OBSERVED;
 
 pub use callbacks::BACKEND_NAME;
+pub use callbacks::Hle;
 
 /// `SVC #0xFFFF`, planted by [`read_code`](callbacks) at a thunk or at the return sentinel.
 ///
@@ -440,6 +441,42 @@ pub fn set_fast_dispatch_inline(on: bool) -> bool {
     unsafe { dynarmic_sys::od_set_fast_dispatch_inline(u32::from(on)) != 0 }
 }
 
+/// **Whether hot `libc.so` functions run a native host implementation** (patch: HLE), process-wide.
+/// With it on, a guest call to a registered [`DynarmicBackend::add_hle`] entry (`memcpy`,
+/// `memmove`, `memset`) runs host code -- args `X0`-`X2`, result `X0`, honouring guest faults --
+/// instead of the guest's own. Read at translation (whether to plant the entry) and at the call.
+/// Off by default; `omni-linux`'s `jit_hle=1` lever (or `OMNI_JIT_HLE=1` from the start) turns it
+/// on and drops translations so planted entries appear. Always `true`/`false` as asked; the native
+/// code is x64 and arm64 alike (it is host Rust, not emitted).
+///
+/// **MEASURED not to win on this host, kept for the in-world A/B** (`tests/bench.rs::
+/// the_cost_of_native_memcpy`, called in a guest loop, ns per call): 64 B 20.9 guest vs 24.7
+/// native (the SVC round trip and two range checks cost more than the tiny copy), 4 KiB 1133 vs
+/// 1153 (equal), 1 MiB 337k vs 323k (4%). The guest's own `__memcpy_aarch64_simd` already
+/// saturates memory bandwidth for large copies, so native code cannot beat it, and the
+/// interception makes small copies slower. So this stays off unless an in-world A/B shows a gain
+/// the micro-benchmark misses.
+pub fn set_hle(on: bool) -> bool {
+    callbacks::HLE_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+/// What [`set_hle`] last set.
+#[must_use]
+pub fn hle_enabled() -> bool {
+    callbacks::HLE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Native HLE calls served across the process, and of those the ones that met an inaccessible byte
+/// (a guest fault): `(calls, faults)`. A measurement reads them.
+#[must_use]
+pub fn hle_stats() -> (u64, u64) {
+    (
+        callbacks::HLE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        callbacks::HLE_FAULTS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// **Guest instructions that learned Top Byte Ignore's mask** (patch 0041): with the mask off
 /// ([`set_tbi_unmasked`]), each instruction that meets a tagged address once is noted and from
 /// then on emitted masked; this counts them, process-wide (0 on arm64).
@@ -636,6 +673,15 @@ impl DynarmicOptions {
                 if kept { "on" } else { "off" },
                 if on && !kept { ": not on this host's backend" } else { "" }
             ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_HLE") {
+            let on = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_HLE={other:?} is not 0 or 1"),
+            };
+            set_hle(on);
+            say(&format!("native libc fast paths {} (OMNI_JIT_HLE)", if on { "on" } else { "off" }));
         }
         if let Ok(value) = std::env::var("OMNI_JIT_FASTDISP") {
             let on = match value.trim() {
@@ -946,6 +992,29 @@ impl Planted {
     }
 }
 
+/// Guest function entries a space serves with a native host implementation (patch: HLE), shared
+/// by its contexts so a thread started after registration sees them. The address is the whole key
+/// (`cb_read_code` plants it, `cb_call_svc` dispatches it); the value is which function.
+#[derive(Default)]
+pub(crate) struct HleSites {
+    map: parking_lot::RwLock<BTreeMap<GuestAddr, callbacks::Hle>>,
+}
+
+impl HleSites {
+    pub(crate) fn get(&self, address: GuestAddr) -> Option<callbacks::Hle> {
+        self.map.read().get(&address).copied()
+    }
+    pub(crate) fn contains(&self, address: GuestAddr) -> bool {
+        self.map.read().contains_key(&address)
+    }
+    fn insert(&self, address: GuestAddr, kind: callbacks::Hle) -> bool {
+        self.map.write().insert(address, kind).is_none()
+    }
+    fn addresses(&self) -> Vec<GuestAddr> {
+        self.map.read().keys().copied().collect()
+    }
+}
+
 /// The jits of one guest address space's contexts, as addresses. A context is in it from the
 /// moment its jit exists until just before the jit is freed, and every use holds the lock, so an
 /// address read from it is a live jit for as long as the lock is held.
@@ -961,6 +1030,8 @@ struct Shared {
     code_cache: Option<CodeCache>,
     /// The planted addresses, counted per space; used only with `code_cache`.
     planted: Arc<Planted>,
+    /// Guest `libc.so` entries this space serves natively (patch: HLE), shared by its contexts.
+    hle: Arc<HleSites>,
     monitor: Monitor,
     tls: TlsArena,
     options: DynarmicOptions,
@@ -1157,6 +1228,7 @@ impl DynarmicBackend {
                 extent,
                 code_cache,
                 planted: Arc::new(Planted::default()),
+                hle: Arc::new(HleSites::default()),
                 monitor,
                 tls,
                 options,
@@ -1281,6 +1353,25 @@ impl DynarmicBackend {
             // callback (the backend has none -- only its contexts do).
             unsafe { od_code_cache_invalidate_range(cache.0, range.start() as u64, range.len() as u64) };
         }
+    }
+
+    /// **Serve a guest `libc.so` function natively** (patch: HLE): a call to `address` runs
+    /// [`Hle`](callbacks::Hle)'s host implementation instead of the guest code, while
+    /// [`set_hle`] is on. Shared by every context of this space, so a thread started later has it
+    /// too. `address` is resolved per process from the mapped `libc.so`'s symbol table (never a
+    /// hardcoded address); the caller registers it when `libc.so` is mapped. The translation
+    /// covering the entry is dropped so it is re-read as a planted site.
+    pub fn add_hle(&self, address: GuestAddr, kind: callbacks::Hle) {
+        if self.shared.hle.insert(address, kind) {
+            self.invalidate_code_everywhere(GuestRange::new(address, 4).expect("a code range"));
+        }
+    }
+
+    /// The guest `libc.so` entries this backend serves natively, for a caller that wants to drop
+    /// their translations on a switch flip (the lever does, through [`DynarmicBackend::invalidate_code_everywhere`]).
+    #[must_use]
+    pub fn hle_addresses(&self) -> Vec<GuestAddr> {
+        self.shared.hle.addresses()
     }
 
     /// Drop the translations of `range` on **every** context of this backend: the shared cache's,
@@ -1792,6 +1883,16 @@ pub(crate) struct CpuCtx {
     pub(crate) tagged_served: u64,
 
     pub(crate) thunks: BTreeSet<GuestAddr>,
+    /// Guest function entries served by a native host implementation (patch: HLE), shared by every
+    /// context of the space (so a thread started after `libc.so` was mapped has them too). The
+    /// entry is planted like a thunk while [`callbacks::HLE_ENABLED`] is on, and `cb_call_svc` runs
+    /// the native code (`callbacks::Hle`) with this context in hand, so a fault becomes the same
+    /// typed exit a guest access would. See [`DynarmicBackend::add_hle`].
+    pub(crate) hle: Arc<HleSites>,
+    /// Native HLE calls this context served. Those that found a byte inaccessible are
+    /// [`hle_faults`](Self::hle_faults_field); both are read for a measurement.
+    pub(crate) hle_calls: u64,
+    pub(crate) hle_faults_field: u64,
     /// Thunks serviced **inside** the run loop rather than by exiting to the caller. See
     /// [`DynarmicCpu::add_inline_thunk`].
     pub(crate) inline_thunks: inline_table::InlineThunks,
@@ -1946,6 +2047,9 @@ impl DynarmicCpu {
             split_served: 0,
             tagged_served: 0,
             thunks: BTreeSet::new(),
+            hle: Arc::clone(&shared.hle),
+            hle_calls: 0,
+            hle_faults_field: 0,
             inline_thunks: inline_table::InlineThunks::default(),
             svc_handler: None,
             top_byte_ignore: shared.options.top_byte_ignore,

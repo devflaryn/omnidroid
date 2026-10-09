@@ -642,6 +642,12 @@ impl Process {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// This process's CPU backend, for the HLE registration (`crate::hle`).
+    #[must_use]
+    pub(crate) fn backend(&self) -> Option<&Arc<DynarmicBackend>> {
+        self.backend.as_ref()
+    }
+
     fn assemble(space: Arc<GuestSpace>, vfs: Vfs, argv: Vec<Vec<u8>>, stdout: Output, stderr: Output, trace: bool, backend: Option<Arc<DynarmicBackend>>, scratch: u64, uid: u32, view: crate::root::ProcessView) -> Arc<Self> {
         Self::assemble_as(space, None, None, vfs, argv, FdTable::standard(stdout, stderr), trace, backend, scratch, uid, view)
     }

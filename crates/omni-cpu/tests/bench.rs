@@ -108,6 +108,89 @@ fn register_loop(iterations: u64) -> Vec<u32> {
     program
 }
 
+/// **What native `memcpy` (HLE) saves over the guest's own**, 64 B / 4 KiB / 1 MiB. The call site
+/// is one entry: with the switch off the guest's word-copy loop runs (the baseline), with it on the
+/// host `memcpy` does. Both reach the entry the same way (PC set to it, X30 the sentinel), so the
+/// difference is the work, not the call.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_native_memcpy() {
+    let _serial = serialized();
+    use omni_cpu::dynarmic::Hle;
+    use omni_mem::{CommitPolicy, Placement, Protection};
+    /// `BL offset` — `100101 imm26`, offset in instructions; sets X30 to the next instruction.
+    const fn bl(offset_insns: i32) -> u32 {
+        0x9400_0000 | ((offset_insns as u32) & 0x03FF_FFFF)
+    }
+    let guest = Guest::new();
+    // A guest word-copy loop at the code entry: the baseline `memcpy` (8 bytes an iteration), the
+    // whole thing reached by `BL` so HLE can replace it at the same site.
+    //   loop: ldr x3,[x1]; str x3,[x0]; add x0,x0,#8; add x1,x1,#8; subs x2,x2,#8; b.ne loop; ret
+    let func = [
+        ldr_imm(3, 1, 0),
+        str_imm(3, 0, 0),
+        add_imm(0, 0, 8),
+        add_imm(1, 1, 8),
+        subs_imm(2, 2, 8),
+        b_cond(1, -5),
+        ret(30),
+    ];
+    let entry = guest.load(&func);
+    guest.backend.add_hle(entry, Hle::Memmove);
+
+    // Buffers large enough for the 1 MiB case, mapped eagerly and non-overlapping.
+    let bytes = 2 << 20;
+    let src = guest.space.map_anonymous(Placement::Anywhere { align: guest.space.page_size() }, bytes, Protection::ReadWrite, CommitPolicy::Eager).expect("src");
+    let dst = guest.space.map_anonymous(Placement::Anywhere { align: guest.space.page_size() }, bytes, Protection::ReadWrite, CommitPolicy::Eager).expect("dst");
+
+    println!("\n== native memcpy vs the guest's word-copy loop, called in a guest loop (n = {N}) ==");
+    for size in [64usize, 4096, 1 << 20] {
+        // A driver that calls the entry `X9` times in one run, reloading the (callee-clobbered)
+        // args each iteration: this is the real per-call cost -- a `BL`, not a `run()` boundary.
+        let driver_off = 0x400; // bytes into the code region, clear of `func`
+        let driver_idx = driver_off / 4;
+        let mut prog = mov64(10, dst as u64);
+        prog.extend(mov64(11, src as u64));
+        prog.extend(mov64(12, size as u64));
+        let loop_start = driver_idx + prog.len();
+        prog.push(mov_reg(0, 10));
+        prog.push(mov_reg(1, 11));
+        prog.push(mov_reg(2, 12));
+        let bl_idx = driver_idx + prog.len();
+        // `entry` is at the code region's base (offset 0); the BL's PC is at index `bl_idx`.
+        prog.push(bl(-(bl_idx as i32)));
+        prog.push(subs_imm(9, 9, 1));
+        let here = driver_idx + prog.len();
+        prog.push(b_cond(1, loop_start as i32 - here as i32));
+        prog.push(svc(0));
+        let driver = guest.load_at(driver_off, &prog);
+
+        let reps: u64 = (4_000_000u64 / size as u64).max(64);
+        let mut row = Vec::new();
+        for on in [false, true] {
+            omni_cpu::dynarmic::set_hle(on);
+            let (mut cpu, _sentinel) = guest.thread();
+            let mut body = || {
+                cpu.set_x(x(9), reps);
+                let exit = cpu.run(driver, RunLimit::Unlimited).expect("the driver runs");
+                assert!(matches!(exit, ExitReason::UnsupportedInstruction { .. }), "driver ends at its SVC: {exit}");
+            };
+            row.push(measure(&mut body));
+        }
+        let per = |d: Duration| d.as_secs_f64() / reps as f64;
+        let (off, on) = (per(row[0].median), per(row[1].median));
+        println!(
+            "  {size:>8} B: guest loop {:9.1} ns/call, native {:9.1} ns/call  ({:.2}x; {:.2} vs {:.2} GB/s)",
+            off * 1e9,
+            on * 1e9,
+            off / on,
+            size as f64 / off / 1e9,
+            size as f64 / on / 1e9,
+        );
+    }
+    omni_cpu::dynarmic::set_hle(false);
+}
+
 /// Register-heavy with some memory: twelve instructions per iteration, ten of them register
 /// operations over eleven guest registers that each feed the next, one load and one store. The
 /// shape of ordinary compiled game code (a value loaded, combined with several live ones, stored),

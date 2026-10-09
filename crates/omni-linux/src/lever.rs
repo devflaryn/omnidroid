@@ -20,6 +20,11 @@
 //!   constant rather than a `shl`/`shr` pair (patch 0040, `omni_cpu::dynarmic::
 //!   set_fastmem_mask_by_and`; the same address), then every process's translations are dropped.
 //!   Off by default; `OMNI_JIT_TBI_AND=1` from the start.
+//! - `jit_hle=0|1`: native host implementations of hot `libc.so` functions -- `memcpy`,
+//!   `memmove`, `memset` -- run for the guest instead of its own code (`crate::hle`,
+//!   `omni_cpu::dynarmic::set_hle`): args X0-X2, result X0, a fault inside the copy becomes the
+//!   guest's own SIGSEGV. Entries are resolved per process from the mapped `libc.so`'s symbols.
+//!   Every process's translations are dropped. Off by default; `OMNI_JIT_HLE=1` from the start.
 //! - `jit_fastdisp=0|1`: the return-stack buffer's and fast-dispatch table's hit paths inside each
 //!   `RET`/`BR`/`BLR` block (patch 0042, `omni_cpu::dynarmic::set_fast_dispatch_inline`): same
 //!   lookups and checks, the target from a register and a host indirect jump per site; ~20% on
@@ -152,6 +157,28 @@ pub fn apply(line: &str) -> Option<String> {
                 p.trim_code();
             }
             Some(format!("jit_fpxmm={}: {} processes' translations dropped", u8::from(kept), live.len()))
+        }
+        "jit_hle" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            omni_cpu::dynarmic::set_hle(on);
+            // On: resolve and register each process's libc.so entries before dropping translations,
+            // so the next translation plants them. Off: leave them registered but inert.
+            let registered = if on { crate::hle::register_all() } else { 0 };
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            let (calls, faults) = omni_cpu::dynarmic::hle_stats();
+            Some(format!(
+                "jit_hle={}: {} entries registered, {} processes' translations dropped ({calls} native calls so far, {faults} faulted)",
+                u8::from(on),
+                registered,
+                live.len()
+            ))
         }
         "jit_fastdisp" => {
             let on = match value.trim() {
@@ -609,6 +636,15 @@ mod tests {
         assert!(done.starts_with(if want { "jit_getset=1" } else { "jit_getset=0" }), "{done}");
         assert_eq!(omni_cpu::dynarmic::precise_get_set(), want);
         assert_eq!(apply("jit_getset=on"), None);
+    }
+
+    #[test]
+    fn the_hle_lever_is_understood() {
+        assert!(apply("jit_hle=1").expect("understood").starts_with("jit_hle=1"));
+        assert!(omni_cpu::dynarmic::hle_enabled());
+        assert!(apply("jit_hle=0").expect("understood").starts_with("jit_hle=0"));
+        assert!(!omni_cpu::dynarmic::hle_enabled());
+        assert_eq!(apply("jit_hle=yes"), None);
     }
 
     #[test]
