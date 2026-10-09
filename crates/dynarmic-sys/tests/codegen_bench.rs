@@ -56,7 +56,7 @@ fn run_once(vm: &Vm) {
             unsafe { od_jit_clear_halt(vm.raw(), OD_HALT_CACHE_INVALIDATION) };
             continue;
         }
-        assert_eq!(hr, 0, "unexpected halt {hr:#x}");
+        assert_eq!(hr, 0, "unexpected halt {hr:#x} at pc {:#x}, exceptions {:x?}", vm.pc(), vm.with_ctx(|c| c.exceptions.clone()));
     }
 }
 
@@ -370,4 +370,142 @@ fn the_scalar_fadd_chain_against_the_host() {
     }
     // SAFETY: as above.
     unsafe { dynarmic_sys::od_set_scalar_fp_in_xmm(0) };
+}
+
+/// **A threaded interpreter**, as a Luau-style VM dispatches: every handler ends in
+/// `ldrb w9, [x1], #1; ldr x10, [x3, x9, lsl #3]; br x10` -- a load of the next opcode, of its
+/// handler's address, and an indirect branch (dynarmic's `FastDispatchHint`). Eight handlers, a
+/// pseudo-random opcode stream; ns per dispatched op.
+///
+/// MEASURED 2026-10-09 (E-cores, idle): random stream 12.8-13.2 ns/op on either cache (host `match`
+/// over the same stream: 6.9-7.6, mispredict-bound), cyclic stream 3.2-3.3 (host 1.1); counting off
+/// changes nothing (13.2-13.5); without the fast-dispatch table 30.6-37.0 (every op a locked
+/// lookup). The table hits every time here (9 misses). So the indirect path costs a chain of
+/// dependent work before its one host indirect jump, not table misses or block links.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_threaded_dispatch() {
+    const OPS: usize = 200_000;
+    const TABLE: u64 = 0x2000;
+    const BYTECODE: u64 = 0x10000;
+    /// `LDRB Wt, [Xn], #1` (post-index).
+    const fn ldrb_post1(rt: u32, rn: u32) -> u32 {
+        0x3840_1400 | (rn << 5) | rt
+    }
+    /// `LDR Xt, [Xn, Xm, LSL #3]`.
+    const fn ldr_scaled(rt: u32, rn: u32, rm: u32) -> u32 {
+        0xF860_7800 | (rm << 16) | (rn << 5) | rt
+    }
+    let dispatch = [ldrb_post1(9, 1), ldr_scaled(10, 3, 9), a64::br(10)];
+    // Handlers 0..=6 do a little work each; 7 ends the program.
+    let mut code = a64::mov64(1, BYTECODE);
+    code.extend(a64::mov64(3, TABLE));
+    code.extend(dispatch);
+    let mut handlers = Vec::new();
+    for op in 0..7u32 {
+        handlers.push(code.len());
+        for k in 0..(1 + op % 3) {
+            code.push(a64::add_imm(11 + (op + k) % 5, 11 + (op + k) % 5, 1 + op));
+        }
+        code.extend(dispatch);
+    }
+    handlers.push(code.len());
+    code.push(a64::svc(0));
+
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let random: Vec<u8> = (0..OPS)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % 7) as u8
+        })
+        .chain(std::iter::once(7))
+        .collect();
+    let cyclic: Vec<u8> = (0..OPS).map(|i| (i % 7) as u8).chain(std::iter::once(7)).collect();
+
+    // The host, as a reference: a `match` over the same stream (one indirect jump through a table).
+    for (sname, stream) in [("random", &random), ("cyclic", &cyclic)] {
+        let mut regs = [0u64; 5];
+        let mut samples = Vec::new();
+        for _ in 0..N {
+            let t = Instant::now();
+            for &op in stream.iter() {
+                match std::hint::black_box(op) {
+                    0 => regs[0] += 1,
+                    1 => {
+                        regs[1] += 2;
+                        regs[2] += 2;
+                    }
+                    2 => {
+                        regs[2] += 3;
+                        regs[3] += 3;
+                        regs[4] += 3;
+                    }
+                    3 => regs[3] += 4,
+                    4 => {
+                        regs[4] += 5;
+                        regs[0] += 5;
+                    }
+                    5 => {
+                        regs[0] += 6;
+                        regs[1] += 6;
+                        regs[2] += 6;
+                    }
+                    6 => regs[1] += 7,
+                    _ => break,
+                }
+            }
+            samples.push(t.elapsed());
+        }
+        samples.sort_unstable();
+        println!(
+            "  host `match`, {sname} stream: {:6.2} ns/op ({})",
+            samples[N / 2].as_secs_f64() * 1e9 / OPS as f64,
+            std::hint::black_box(regs[0])
+        );
+    }
+
+    let shared = harness::every_vm_on_a_shared_cache();
+    println!("\n== threaded dispatch, {OPS} ops, ns per op (n = {N}, shared cache {shared}) ==");
+    for (sname, stream, label, counting, optimizations) in [
+        ("random", &random, "counting on,  FastDispatch on ", true, options(true).optimizations),
+        ("random", &random, "counting off, FastDispatch on ", false, options(true).optimizations),
+        ("random", &random, "counting on,  FastDispatch off", true, options(true).optimizations & !optimization::FAST_DISPATCH),
+        ("cyclic", &cyclic, "counting on,  FastDispatch on ", true, options(true).optimizations),
+    ] {
+        let vm = Vm::new(code.clone(), VmOptions { optimizations, ..options(counting) });
+        vm.with_ctx(|c| {
+            for (i, &h) in handlers.iter().enumerate() {
+                c.write_u64(TABLE + 8 * i as u64, CODE_BASE + 4 * h as u64);
+            }
+            for (i, chunk) in stream.chunks(8).enumerate() {
+                let mut word = [0u8; 8];
+                word[..chunk.len()].copy_from_slice(chunk);
+                c.write_u64(BYTECODE + 8 * i as u64, u64::from_le_bytes(word));
+            }
+        });
+        run_once(&vm);
+        let mut samples: Vec<Duration> = (0..N)
+            .map(|_| {
+                let t = Instant::now();
+                run_once(&vm);
+                t.elapsed()
+            })
+            .collect();
+        samples.sort_unstable();
+        let cache = vm.code_cache();
+        let lookups = if cache.is_null() {
+            0
+        } else {
+            let mut stats = dynarmic_sys::OdCodeCacheStats::default();
+            // SAFETY: the cache is live while `vm` is; `stats` is writable.
+            unsafe { dynarmic_sys::od_code_cache_stats_of(cache, &mut stats) };
+            stats.locked_lookups
+        };
+        println!(
+            "  {sname} stream, {label}: {:6.2} ns/op  (shared cache's locked lookups: {lookups})",
+            samples[N / 2].as_secs_f64() * 1e9 / OPS as f64
+        );
+    }
 }

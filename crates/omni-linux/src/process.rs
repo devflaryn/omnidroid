@@ -751,9 +751,13 @@ impl Process {
             // ~900 threads are mostly binder threads in a wait -- 56 MiB of tables there at 64 KiB;
             // 1,024 gave the heap 3-4 fewer 16 MiB segments (docs/NIGHT-2026-10-02.md, C3). Not the
             // default: what the smaller table costs SurfaceFlinger's and system_server's threads in
-            // lookups is not measured yet.
+            // lookups is not measured yet. `OMNI_JIT_FAST_DISPATCH_APP=<entries>` does the same in an
+            // app's host process (a power of two, 64..65536): a larger table for an interpreter-heavy
+            // game whose `BR`/`RET` targets outgrow 4,096 -- a miss is a locked lookup, ~3x a hit
+            // (dynarmic-sys `codegen_bench.rs::the_cost_of_threaded_dispatch`: 12.8 ns/op hitting,
+            // 30.6-37.0 with no table). Its misses are `dispatcher misses` in `OMNI_MEM_TRACE`.
             fast_dispatch_entries: if std::env::var_os("OMNI_LINUX_APP").is_some() {
-                0
+                std::env::var("OMNI_JIT_FAST_DISPATCH_APP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
             } else {
                 std::env::var("OMNI_JIT_FAST_DISPATCH_SYSTEM").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
             },
