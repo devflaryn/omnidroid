@@ -425,6 +425,21 @@ pub fn set_tbi_unmasked(on: bool) -> bool {
     unsafe { dynarmic_sys::od_set_tbi_unmasked(u32::from(on)) != 0 }
 }
 
+/// **The return-stack buffer's and fast-dispatch table's hit paths inside each block** (patch
+/// 0042, x64): a `RET`/`BR`/`BLR` block checks the buffer or probes the thread's table itself, from
+/// the target PC still in a register and with an indirect jump of its own (the host predicts it
+/// per site), instead of jumping to one shared handler that reloads the PC from `JitState`. Same
+/// lookups, same budget and halt checks, a miss continues in the shared handler. Process-wide, for
+/// blocks emitted from now on; returns what is in force (`false` on arm64). MEASURED
+/// (`dynarmic-sys/tests/codegen_bench.rs`, shared cache): 8 calls + 8 returns 35.6 -> 28.5 ns, a
+/// threaded interpreter's dispatch 13.2 -> 12.8 ns/op (random opcodes) and 3.20 -> 2.91 (cyclic).
+/// Off by default; `OMNI_JIT_FASTDISP=1` (announced by [`DynarmicOptions::with_environment`]) or
+/// `omni-linux`'s `jit_fastdisp=1` lever turns it on.
+pub fn set_fast_dispatch_inline(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_fast_dispatch_inline(u32::from(on)) != 0 }
+}
+
 /// **Guest instructions that learned Top Byte Ignore's mask** (patch 0041): with the mask off
 /// ([`set_tbi_unmasked`]), each instruction that meets a tagged address once is noted and from
 /// then on emitted masked; this counts them, process-wide (0 on arm64).
@@ -539,6 +554,7 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_PRECISE_GETSET=0|1` -- [`set_precise_get_set`] (process-wide);
     /// * `OMNI_JIT_SCALAR_FP_XMM=0|1` -- [`set_scalar_fp_in_xmm`] (process-wide);
     /// * `OMNI_JIT_TBI_AND=0|1` -- [`set_fastmem_mask_by_and`] (process-wide);
+    /// * `OMNI_JIT_FASTDISP=0|1` -- [`set_fast_dispatch_inline`] (process-wide);
     /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
     /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
     ///   where each thread has its own cache (arm64).
@@ -620,6 +636,15 @@ impl DynarmicOptions {
                 if kept { "on" } else { "off" },
                 if on && !kept { ": not on this host's backend" } else { "" }
             ));
+        }
+        if let Ok(value) = std::env::var("OMNI_JIT_FASTDISP") {
+            let on = match value.trim() {
+                "0" => false,
+                "1" => true,
+                other => panic!("OMNI_JIT_FASTDISP={other:?} is not 0 or 1"),
+            };
+            let kept = set_fast_dispatch_inline(on);
+            say(&format!("dispatch hit paths inline {} (OMNI_JIT_FASTDISP)", if kept { "on" } else { "off" }));
         }
         if let Ok(value) = std::env::var("OMNI_JIT_TBI_AND") {
             let on = match value.trim() {

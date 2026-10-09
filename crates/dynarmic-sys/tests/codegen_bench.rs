@@ -468,12 +468,16 @@ fn the_cost_of_threaded_dispatch() {
 
     let shared = harness::every_vm_on_a_shared_cache();
     println!("\n== threaded dispatch, {OPS} ops, ns per op (n = {N}, shared cache {shared}) ==");
-    for (sname, stream, label, counting, optimizations) in [
-        ("random", &random, "counting on,  FastDispatch on ", true, options(true).optimizations),
-        ("random", &random, "counting off, FastDispatch on ", false, options(true).optimizations),
-        ("random", &random, "counting on,  FastDispatch off", true, options(true).optimizations & !optimization::FAST_DISPATCH),
-        ("cyclic", &cyclic, "counting on,  FastDispatch on ", true, options(true).optimizations),
+    for (sname, stream, label, counting, optimizations, inline) in [
+        ("random", &random, "counting on,  FastDispatch on ", true, options(true).optimizations, false),
+        ("random", &random, "counting on,  0042 inline     ", true, options(true).optimizations, true),
+        ("random", &random, "counting off, FastDispatch on ", false, options(true).optimizations, false),
+        ("random", &random, "counting on,  FastDispatch off", true, options(true).optimizations & !optimization::FAST_DISPATCH, false),
+        ("cyclic", &cyclic, "counting on,  FastDispatch on ", true, options(true).optimizations, false),
+        ("cyclic", &cyclic, "counting on,  0042 inline     ", true, options(true).optimizations, true),
     ] {
+        // SAFETY: stores one process-wide atomic; this binary runs its tests one at a time.
+        unsafe { dynarmic_sys::od_set_fast_dispatch_inline(u32::from(inline)) };
         let vm = Vm::new(code.clone(), VmOptions { optimizations, ..options(counting) });
         vm.with_ctx(|c| {
             for (i, &h) in handlers.iter().enumerate() {
@@ -507,5 +511,84 @@ fn the_cost_of_threaded_dispatch() {
             "  {sname} stream, {label}: {:6.2} ns/op  (shared cache's locked lookups: {lookups})",
             samples[N / 2].as_secs_f64() * 1e9 / OPS as f64
         );
+    }    // SAFETY: as above.
+    unsafe { dynarmic_sys::od_set_fast_dispatch_inline(0) };
+}
+
+/// **Call and return chains** (C++ is call-heavy): `BL`s to small functions that `BL` further and
+/// `RET` (the return-stack buffer), and `BLR` through a table of function pointers (a virtual
+/// call: the fast-dispatch table), each with and without patch 0042's inline hit paths.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_calls_and_returns() {
+    const TABLE: u64 = 0x2000;
+    // Leaves f0..f3: a little work and RET. Middles m0..m1: save LR, BL two leaves, restore, RET.
+    let mut code = a64::mov64(0, ITERATIONS);
+    code.extend(a64::mov64(3, TABLE));
+    let jump_over = code.len();
+    code.push(0); // B over the functions, patched below
+    let mut leaves = Vec::new();
+    for f in 0..4u32 {
+        leaves.push(code.len());
+        code.push(a64::add_imm(10 + f, 10 + f, 1 + f));
+        code.push(a64::ret(30));
     }
+    let mut middles = Vec::new();
+    for m in 0..2usize {
+        middles.push(code.len());
+        code.push(a64::mov_reg(20 + m as u32, 30));
+        let here = code.len();
+        code.push(a64::bl(leaves[2 * m] as i32 - here as i32));
+        let here = code.len();
+        code.push(a64::bl(leaves[2 * m + 1] as i32 - here as i32));
+        code.push(a64::mov_reg(30, 20 + m as u32));
+        code.push(a64::ret(30));
+    }
+    let start = code.len();
+    code[jump_over] = a64::b(start as i32 - jump_over as i32);
+    // Per iteration: BL m0, BL m1, BL f0 directly, and a BLR through the table to f(i % 4).
+    let here = code.len();
+    code.push(a64::bl(middles[0] as i32 - here as i32));
+    let here = code.len();
+    code.push(a64::bl(middles[1] as i32 - here as i32));
+    let here = code.len();
+    code.push(a64::bl(leaves[0] as i32 - here as i32));
+    code.push(a64::and_shifted(4, 0, 0, 0)); // x4 = x0 (used as a counter-derived index below)
+    code.push(0x9240_0484); // AND X4, X4, #3
+    code.push(0xF864_7865); // LDR X5, [X3, X4, LSL #3]
+    code.push(a64::blr(5));
+    code.push(a64::subs_imm(0, 0, 1));
+    let here = code.len();
+    code.push(a64::b_cond(cond::NE, start as i32 - here as i32));
+    code.push(a64::svc(0));
+    // BL m0 -> 2 leaves, BL m1 -> 2 leaves, BL f0, BLR f: 8 calls and 8 returns an iteration.
+    println!("\n== calls and returns, {ITERATIONS} iterations of 8 calls + 8 returns (n = {N}, shared cache {}) ==", harness::every_vm_on_a_shared_cache());
+    for inline in [false, true] {
+        // SAFETY: stores one process-wide atomic; this binary runs its tests one at a time.
+        unsafe { dynarmic_sys::od_set_fast_dispatch_inline(u32::from(inline)) };
+        let vm = Vm::new(code.clone(), options(true));
+        vm.with_ctx(|c| {
+            for (i, &f) in leaves.iter().enumerate() {
+                c.write_u64(TABLE + 8 * i as u64, CODE_BASE + 4 * f as u64);
+            }
+        });
+        run_once(&vm);
+        let mut samples: Vec<Duration> = (0..N)
+            .map(|_| {
+                let t = Instant::now();
+                run_once(&vm);
+                t.elapsed()
+            })
+            .collect();
+        samples.sort_unstable();
+        let x10 = vm.reg(10);
+        println!(
+            "  {}: {:6.2} ns/iteration ({:5.2} ns per call+return), x10 = {x10}",
+            if inline { "0042 inline" } else { "shared hdl " },
+            samples[N / 2].as_secs_f64() * 1e9 / ITERATIONS as f64,
+            samples[N / 2].as_secs_f64() * 1e9 / ITERATIONS as f64 / 8.0
+        );
+    }
+    // SAFETY: as above.
+    unsafe { dynarmic_sys::od_set_fast_dispatch_inline(0) };
 }

@@ -414,3 +414,23 @@ and `/system` (2,959 lines), against ~19,000 for two small programs without lear
 instructions learned. (Learned sites are by guest location and libc.so is mapped at a different
 address in each process, so each process learns its own: ~0.7 ms of faults at startup.) Verified:
 `omni-cpu/tests/tbi_live.rs` (six access kinds fault once, then masked; a loop faults once).
+
+### 0042 — x64: the dispatch hints' hit paths inside each block (switch, off by default)
+
+x64. A `RET` block (`PopRSBHint`) and a `BR`/`BLR` block (`FastDispatchHint`) stored the target PC
+and jumped to one shared handler, which loaded the PC back from `JitState`, built the location,
+checked the budget and the halt word, and probed the return-stack buffer or the thread's
+fast-dispatch table -- every guest indirect branch funnelled through one host indirect jump. With
+`live_fast_dispatch_inline` on, `EmitA64SetPC`, when it is the block's last instruction before a
+hint (and the block does not set FPCR), also leaves the target in rbp, and the terminal emits the
+hit path itself: the location from rbp and the block's own FPCR part, the same checks (patches
+0018/0019), the same probe and hash, and a host indirect jump of the site's own; a miss continues in
+the shared handler (`terminal_handler_fast_dispatch_probe` with rbx the location after an RSB miss,
+`terminal_handler_fast_dispatch_miss` with rbx and rbp the entry after a table miss). ~70 bytes a
+site instead of 5. Switch: `od_set_fast_dispatch_inline`, `OMNI_JIT_FASTDISP=0|1`, `omni-linux`'s
+`jit_fastdisp=` lever; default 0 until an in-world A/B. Measured (`tests/codegen_bench.rs`, E-cores,
+idle; shared cache / per-thread): 8 calls + 8 returns 35.6 -> 28.5 / 31.2 -> 27.2 ns; threaded
+dispatch random 13.2 -> 12.8 / 13.5 -> 12.4 ns/op, cyclic 3.20 -> 2.91 / 3.24 -> 2.83 (host `match`
+7.3 and 1.0). Verified with the switch defaulted on: dynarmic-sys and omni-cpu suites (the known
+`low_window`/`subpage` only; `hostile.rs`'s stoppability matrix included), omni-linux `a1_toybox`,
+`a4_threads`, `a5_signals`, `b_hello_dex` (ART), `tbi_off`.

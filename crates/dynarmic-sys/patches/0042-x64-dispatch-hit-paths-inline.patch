@@ -1,0 +1,199 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 56b7901..65fc9c5 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -39,6 +39,7 @@ using namespace Xbyak::util;
+ 
+ std::atomic<std::uint32_t> live_fp_optimizations{0};
+ std::atomic<std::uint32_t> live_precise_get_set{1};
++std::atomic<std::uint32_t> live_fast_dispatch_inline{0};
+ 
+ A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
+         : EmitContext(reg_alloc, block), conf(conf) {}
+@@ -98,6 +99,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
+     // Omnidroid patch 0022: nothing is left over from an emission that threw.
+     pending_slots.clear();
+     pending_fastmem_sites.clear();  // patch 0025
++    od_pc_in_rbp = false;           // patch 0042
+     // Patch 0025: records made for a block whose emission then threw name no block; out of their
+     // targets' lists with them (their slots, in code nothing reaches, are unlinked on the way).
+     if (pending_first_link != NO_LINK) {
+@@ -554,6 +556,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
+         calculate_location_descriptor();
+         code.L(rsb_cache_miss);
++        terminal_handler_fast_dispatch_probe = code.getCurr<const void*>();  // patch 0042
+         // Omnidroid patch 0019: what patch 0018 does for a return-stack-buffer hit, for every
+         // transfer this handler serves -- a `BR`/`BLR`, and a `RET` that missed the buffer. Before
+         // the table is probed, compare the cycle budget (when cycle counting is on) and the halt
+@@ -583,6 +586,7 @@ void A64EmitX64::GenTerminalHandlers() {
+         code.jne(fast_dispatch_cache_miss);
+         code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
+         code.L(fast_dispatch_cache_miss);
++        terminal_handler_fast_dispatch_miss = code.getCurr<const void*>();  // patch 0042
+         if (shared_code) {
+             // Omnidroid patch 0022: the lookup consults this same table (the dispatcher probes the
+             // running thread's own before taking the cache's lock), so the entry must not name this
+@@ -859,15 +863,37 @@ void A64EmitX64::EmitA64SetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
+ void A64EmitX64::EmitA64SetPC(A64EmitContext& ctx, IR::Inst* inst) {
+     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+     const auto addr = qword[r15 + offsetof(A64JitState, pc)];
++
++    // Omnidroid patch 0042: the last instruction of a block that ends in a dispatch hint also
++    // leaves the target in rbp for the inline hit path (nothing after it needs a register). Not
++    // where the block changes FPCR (`MSR FPCR`): the inline path takes FPCR's part of the
++    // location from the block's own.
++    const auto& terminal = ctx.block.GetTerminal();
++    const bool hint = boost::get<IR::Term::FastDispatchHint>(&terminal) != nullptr
++                   || boost::get<IR::Term::PopRSBHint>(&terminal) != nullptr;
++    const bool keep = hint && &ctx.block.back() == inst && !ctx.IsSingleStep()
++                   && live_fast_dispatch_inline.load(std::memory_order_relaxed) != 0
++                   && std::none_of(ctx.block.begin(), ctx.block.end(), [](const IR::Inst& i) { return i.GetOpcode() == IR::Opcode::A64SetFPCR; });
++
+     if (args[0].FitsInImmediateS32()) {
+         code.mov(addr, args[0].GetImmediateS32());
++        if (keep) {
++            code.mov(rbp, args[0].GetImmediateS32());
++        }
+     } else if (args[0].IsInXmm()) {
+         const Xbyak::Xmm to_store = ctx.reg_alloc.UseXmm(args[0]);
+         code.movq(addr, to_store);
++        if (keep) {
++            code.movq(rbp, to_store);
++        }
+     } else {
+         const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(args[0]);
+         code.mov(addr, to_store);
++        if (keep) {
++            code.mov(rbp, to_store);
++        }
+     }
++    od_pc_in_rbp = keep;
+ }
+ 
+ void A64EmitX64::EmitA64CallSupervisor(A64EmitContext& ctx, IR::Inst* inst) {
+@@ -1123,21 +1149,88 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlockFast terminal, IR::Location
+     }
+ }
+ 
+-void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
++void A64EmitX64::EmitTerminalImpl(IR::Term::PopRSBHint, IR::LocationDescriptor initial_location, bool is_single_step) {
+     if (!conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) || is_single_step) {
+         code.ReturnFromRunCode();
+         return;
+     }
+ 
++    if (od_pc_in_rbp) {
++        // Omnidroid patch 0042: the shared handler's hit path, here: one host indirect jump per
++        // `RET` site (the host predicts it per site), from the target already in rbp (no reload of
++        // the PC just stored). A miss falls into the handler's table probe (rbx = the location).
++        EmitInlineLocation(initial_location);
++        code.mov(eax, dword[r15 + offsetof(A64JitState, rsb_ptr)]);
++        code.sub(eax, 1);
++        code.and_(eax, u32(A64JitState::RSBPtrMask));
++        code.mov(dword[r15 + offsetof(A64JitState, rsb_ptr)], eax);
++        code.cmp(rbx, qword[r15 + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
++        if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
++            code.jne(terminal_handler_fast_dispatch_probe);
++        } else {
++            code.jne(code.GetReturnFromRunCodeAddress());
++        }
++        code.mov(rax, qword[r15 + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
++        EmitInlineBudgetAndHaltChecks();
++        code.jmp(rax);
++        return;
++    }
++
+     code.jmp(terminal_handler_pop_rsb_hint);
+ }
+ 
+-void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
++/// Patch 0042: rbx = the location descriptor of the target in rbp, FPCR's part from this block's
++/// (unchanged by it: `EmitA64SetPC` does not keep the PC where the block sets FPCR).
++void A64EmitX64::EmitInlineLocation(const IR::LocationDescriptor& initial_location) {
++    const u64 fpcr_part = A64::LocationDescriptor{initial_location}.SetPC(0).UniqueHash();
++    code.mov(rbx, A64::LocationDescriptor::pc_mask);
++    code.and_(rbx, rbp);
++    if (fpcr_part != 0) {
++        code.mov(rcx, fpcr_part);
++        code.or_(rbx, rcx);
++    }
++}
++
++/// Patch 0042: what patches 0018/0019 check before a dispatch-hint jump, inline (the PC is stored).
++void A64EmitX64::EmitInlineBudgetAndHaltChecks() {
++    if (conf.enable_cycle_counting) {
++        code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
++        code.jng(code.GetReturnFromRunCodeAddress());
++    }
++    code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
++    code.jne(code.GetReturnFromRunCodeAddress());
++}
++
++void A64EmitX64::EmitTerminalImpl(IR::Term::FastDispatchHint, IR::LocationDescriptor initial_location, bool is_single_step) {
+     if (!conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
+         code.ReturnFromRunCode();
+         return;
+     }
+ 
++    if (od_pc_in_rbp) {
++        // Omnidroid patch 0042: the shared handler's hit path, here (see PopRSBHint above): the
++        // location from rbp, the checks, the hash and probe of the running thread's table, and an
++        // indirect jump of this `BR`/`BLR` site's own. A miss falls into the handler's lookup
++        // (rbx = the location, rbp = the table entry).
++        EmitInlineLocation(initial_location);
++        EmitInlineBudgetAndHaltChecks();
++        if (shared_code) {
++            code.mov(r12, qword[r15 + offsetof(A64JitState, od_fast_dispatch_table)]);
++        } else {
++            code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table->data()));
++        }
++        code.mov(rbp, rbx);
++        if (code.HasHostFeature(HostFeature::SSE42)) {
++            code.crc32(rbp, r12);
++        }
++        code.and_(ebp, static_cast<u32>(fast_dispatch_mask));
++        code.lea(rbp, ptr[r12 + rbp]);
++        code.cmp(rbx, qword[rbp + offsetof(FastDispatchEntry, location_descriptor)]);
++        code.jne(terminal_handler_fast_dispatch_miss);
++        code.jmp(ptr[rbp + offsetof(FastDispatchEntry, code_ptr)]);
++        return;
++    }
++
+     code.jmp(terminal_handler_fast_dispatch_hint);
+ }
+ 
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index 53deda6..d85c434 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -44,6 +44,12 @@ inline constexpr std::uint32_t live_fp_optimizations_allowed = 0x000F0000;
+ /// it was translated with.
+ extern std::atomic<std::uint32_t> live_precise_get_set;
+ 
++/// Omnidroid patch 0042: non-zero emits the hit paths of the return-stack buffer and the
++/// fast-dispatch table inside each `RET`/`BR`/`BLR` block, from the target PC still in a register,
++/// instead of a jump to one shared handler that reloads it from `JitState`. Process-wide, read
++/// when a block is emitted.
++extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
++
+ struct A64EmitContext final : public EmitContext {
+     A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block);
+ 
+@@ -232,6 +238,16 @@ public:
+     const void* SvcResumeRetired() const { return svc_resume_retired; }
+ 
+ protected:
++    /// Omnidroid patch 0042: the inline hit paths (`live_fast_dispatch_inline`) fall into the
++    /// shared handler's tail: at the table probe with the location in rbx (an RSB miss), and at the
++    /// lookup with rbx the location and rbp the table entry (a table miss).
++    const void* terminal_handler_fast_dispatch_probe = nullptr;
++    const void* terminal_handler_fast_dispatch_miss = nullptr;
++    /// Patch 0042: the block being emitted ends in `SetPC` and a dispatch hint, and its last
++    /// instruction left the target PC in rbp as well as in `JitState::pc`.
++    bool od_pc_in_rbp = false;
++    void EmitInlineLocation(const IR::LocationDescriptor& initial_location);
++    void EmitInlineBudgetAndHaltChecks();
+     const void* terminal_handler_fast_dispatch_hint = nullptr;
+     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+     /// Patch 0022: the same hash, for a table given as the second argument (a thread's own).
