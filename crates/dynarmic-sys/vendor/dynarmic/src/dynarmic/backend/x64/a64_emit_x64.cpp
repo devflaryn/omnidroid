@@ -421,6 +421,7 @@ size_t A64EmitX64::ForgetRegionBlocks(const void* begin, const void* end, u32 fi
         }
         Unpatch(location);
         ForgetOutgoingSlots(it->second.first_link);
+        KeepHeadOf(it->first, it->second);  // patch 0064
         block_descriptors.erase(it);
         forgotten.push_back(location.Value());
         dropped++;
