@@ -127,6 +127,70 @@ pub const LEAVES_OUT: &[&str] = &[
     "/system/priv-app/DynamicSystemInstallationService",
 ];
 
+/// **The image's idle apps** (`OMNI_DEVICE_IDLE_APPS=out`; off by default: `disable`, the device's
+/// setup disables them once it is up, as before). The apps `tests/r_roblox.rs`' setup disabled after
+/// the first boot (`IDLE_APPS`: 18 `cmd package disable-user`, ~7 s), which until then are scanned,
+/// started and sent the boot broadcast like any other -- on a fresh boot (run r-44396, 2026-10-09)
+/// 5 of the 23 app processes started before Roblox were theirs (DeviceLockController twice,
+/// KeyChain, DocumentsUI, ExternalStorageProvider), each a host process of its own. Left out here
+/// at the image level, PackageManager never scans them. Two of the 18 are already not on the lean
+/// device (`com.android.cellbroadcastreceiver`: [`LEAVES_OUT`]'s `CellBroadcastLegacyApp`) or not in
+/// the image at all (`com.android.ext.adservices.api`).
+///
+/// Each was checked for what else depends on it: none is a package PackageManager requires
+/// (installer, uninstaller, permission controller, SDK sandbox, ext services, shared library all
+/// stay) and each was already disabled on every device the setup made, so nothing that runs here
+/// needed it enabled -- the difference left is that an absent package is not found by name where a
+/// disabled one is (a `getPackageInfo` that does not handle `NameNotFoundException`), which only a
+/// boot shows: this is opt-in. Kept: the WebView and the browser, ExtServices (it holds the AdExt
+/// boot receiver too), the SDK sandbox, MediaProvider.
+pub const IDLE_APPS_LEFT_OUT: &[&str] = &[
+    // com.android.cellbroadcastreceiver.module, com.android.cellbroadcastservice (no telephony).
+    "/apex/com.android.cellbroadcast/priv-app/CellBroadcastApp@AE3A.240806.019",
+    "/apex/com.android.cellbroadcast/priv-app/CellBroadcastServiceModule@AE3A.240806.019",
+    // com.android.nfc: persistent, and no NFC here.
+    "/apex/com.android.nfcservices/priv-app/NfcNciApex@AE3A.240806.019",
+    // com.android.healthconnect.controller: Health Connect's UI (the service is system_server's).
+    "/apex/com.android.healthfitness/priv-app/HealthConnectController@AE3A.240806.019",
+    // com.android.ondevicepersonalization.services, com.android.federatedcompute.services.
+    "/apex/com.android.ondevicepersonalization/priv-app/OnDevicePersonalization@AE3A.240806.019",
+    "/apex/com.android.ondevicepersonalization/app/FederatedCompute@AE3A.240806.019",
+    // com.android.devicelockcontroller: started twice at boot (a boot-time receiver, its service).
+    "/apex/com.android.devicelock/priv-app/DeviceLockController@AE3A.240806.019",
+    // com.android.adservices.api (not the SDK sandbox, which PackageManager requires).
+    "/apex/com.android.adservices/priv-app/AdServicesApk@AE3A.240806.019",
+    // com.android.rkpdapp: remote key provisioning (no attestation keys are fetched here).
+    "/apex/com.android.rkpd/priv-app/rkpdapp@AE3A.240806.019",
+    // com.android.statementservice (app-link verification), com.android.documentsui,
+    // com.android.managedprovisioning, com.android.externalstorage, com.android.keychain,
+    // com.android.providers.userdictionary (no IME), com.android.wallpaperbackup.
+    "/system/priv-app/StatementService",
+    "/system/priv-app/DocumentsUI",
+    "/system/priv-app/ManagedProvisioning",
+    "/system/priv-app/ExternalStorageProvider",
+    "/system/app/KeyChain",
+    "/system/priv-app/UserDictionaryProvider",
+    "/system/app/WallpaperBackup",
+];
+
+/// Whether the idle apps are left out of the image (`OMNI_DEVICE_IDLE_APPS=out`) rather than
+/// disabled once the device is up (`disable`, the default). Not of the `full` image.
+#[must_use]
+pub fn idle_apps_out() -> bool {
+    std::env::var("OMNI_DEVICE_IDLE_APPS").as_deref() == Ok("out") && std::env::var("OMNI_DEVICE_APPS").as_deref() != Ok("full")
+}
+
+/// What a saved device's name carries when the idle apps are left out (`-idleout`), else
+/// nothing: a device made with them is another device (its package list, its data).
+#[must_use]
+pub fn idle_apps_key_suffix() -> &'static str {
+    if idle_apps_out() {
+        "-idleout"
+    } else {
+        ""
+    }
+}
+
 /// **The hardware this device does not have**, left out as a product build leaves a HAL's package
 /// out: its init service (`.rc`), its VINTF declaration (so no client waits for it) and its
 /// feature files (so no system service or app looks for it). What remains is what the app and the
@@ -276,7 +340,8 @@ pub fn global_environment() -> Vec<(String, String)> {
 /// What `OMNI_DEVICE_APPS` makes of the image: `full` (the image as it is), `lean` (the default:
 /// [`LEAVES_OUT`] and [`HARDWARE_LEFT_OUT`] left out), `lean-hw` (only [`LEAVES_OUT`]: the hardware
 /// kept) or `kiosk` (lean, and [`KIOSK_LEAVES_OUT`]); each but `full` without the soft keyboard
-/// unless `OMNI_KIOSK_IME=1` ([`KIOSK_IME`]). Read by each host process of an
+/// unless `OMNI_KIOSK_IME=1` ([`KIOSK_IME`]), and each but `full` without the idle apps when
+/// `OMNI_DEVICE_IDLE_APPS=out` ([`IDLE_APPS_LEFT_OUT`]). Read by each host process of an
 /// instance alike (the variable is inherited), so they all see one image.
 ///
 /// The device's own boot settings can be left out too, to measure what each is worth:
@@ -309,11 +374,12 @@ pub fn left_out() -> Vec<&'static str> {
 /// (see [`KIOSK_IME`]).
 fn apps_left_out() -> Vec<&'static str> {
     let ime = (std::env::var("OMNI_KIOSK_IME").as_deref() != Ok("1")).then_some(KIOSK_IME);
+    let idle: &[&str] = if idle_apps_out() { IDLE_APPS_LEFT_OUT } else { &[] };
     match std::env::var("OMNI_DEVICE_APPS").as_deref() {
         Ok("full") => Vec::new(),
-        Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).copied().chain(ime).collect(),
-        Ok("lean-hw") => LEAVES_OUT.iter().copied().chain(ime).collect(),
-        _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).copied().chain(ime).collect(),
+        Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).chain(idle).copied().chain(ime).collect(),
+        Ok("lean-hw") => LEAVES_OUT.iter().chain(idle).copied().chain(ime).collect(),
+        _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(idle).copied().chain(ime).collect(),
     }
 }
 
