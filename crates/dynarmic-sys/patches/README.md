@@ -434,3 +434,27 @@ dispatch random 13.2 -> 12.8 / 13.5 -> 12.4 ns/op, cyclic 3.20 -> 2.91 / 3.24 ->
 7.3 and 1.0). Verified with the switch defaulted on: dynarmic-sys and omni-cpu suites (the known
 `low_window`/`subpage` only; `hostile.rs`'s stoppability matrix included), omni-linux `a1_toybox`,
 `a4_threads`, `a5_signals`, `b_hello_dex` (ART), `tbi_off`.
+
+### 0050 — x64 shared cache: an eviction on demand
+
+x64, shared caches. `SharedCodeCache::EvictTo(keep_bytes)` (`od_code_cache_evict_to`): what patch
+0028 does when a full region meets the live limit, asked for -- the oldest live regions' blocks
+forgotten and the regions retired (threads asked to leave generated code, given back once none
+holds one) until at most `keep_bytes` of regions are live; the region being filled always stays.
+For `omni-linux`'s age pass (`code_trim::age`): the system's busy processes (system_server, 119
+MiB of translations in a world, 2026-10-09) are never quiet enough for the clear, and most of what
+they hold is boot code. Verified: `tests/shared_cache.rs::an_eviction_on_demand_keeps_the_newest_
+region_and_w_runs_on` (5 of 6 regions retired, the working set translated again once, ~9-17 us a
+small block; 4 regions of 315k blocks evicted in 92-150 ms here, ~25-40 ms a region).
+
+### 0051 — x64 shared cache: fastmem site records of 8 bytes
+
+x64, shared caches. A `FastmemSite` held a 64-bit fallback and a 32-bit resume offset (16 bytes,
+1.3M of them in a world: 23 MiB in the game's host process, 25 MiB in the system's). The resume is
+a short way after its site and the fallbacks are a few hundred prelude thunks: now a 16-bit resume
+delta and a 16-bit index into the cache's fallback table (8 bytes); a site that does not fit (a
+resume past 64 KiB or before its site, past 65,535 fallbacks) is kept whole in a second sorted
+list searched after the first. Verified: `tests/shared_bookkeeping.rs` (fastmem sites 22.5 -> 11.3
+bytes each with the vectors' slack, the census 225 -> 214 bytes a one-site block), `host_fault.rs`,
+`a64_exec.rs`, `shared_cache.rs`.
+

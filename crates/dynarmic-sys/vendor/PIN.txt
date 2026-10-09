@@ -48,6 +48,8 @@ dynarmic/
                and ../patches/0040-x64-tbi-mask-as-one-and.patch
                and ../patches/0041-x64-tbi-sites-learn-the-mask.patch
                and ../patches/0042-x64-dispatch-hit-paths-inline.patch
+               and ../patches/0050-x64-shared-cache-eviction-on-demand.patch
+               and ../patches/0051-x64-fastmem-site-records-of-8-bytes.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

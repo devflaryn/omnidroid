@@ -542,6 +542,7 @@ void EmitX64::BeginFastmemSites(const void* begin, const void* end) {
         if (run.begin == b) {
             ASSERT(run.end == e);
             std::vector<FastmemSite>{}.swap(run.sites);
+            std::vector<WideFastmemSite>{}.swap(run.wide);  // patch 0051
             return;
         }
         // Runs are regions: they never overlap.
@@ -557,6 +558,7 @@ void EmitX64::PurgeFastmemSites(const void* begin, const void* end) {
     for (FastmemSiteRun& run : fastmem_site_runs) {
         if (b <= run.begin && run.end <= e) {
             std::vector<FastmemSite>{}.swap(run.sites);
+            std::vector<WideFastmemSite>{}.swap(run.wide);  // patch 0051
         } else {
             // A run is purged whole, with the region it is: never in part.
             ASSERT(e <= run.begin || run.end <= b);
@@ -594,13 +596,34 @@ void EmitX64::CommitSharedFastmemSites() {
     while (!run->sites.empty() && run->sites.back().site >= first_offset) {
         run->sites.pop_back();
     }
+    while (!run->wide.empty() && run->wide.back().site >= first_offset) {  // patch 0051
+        run->wide.pop_back();
+    }
+    bool any = false;
+    u32 last = 0;
     for (const PendingFastmemSite& p : pending_fastmem_sites) {
         ASSERT(p.site >= base && p.site < limit && p.resume >= base && p.resume < limit);
         const u32 site = static_cast<u32>(p.site - base);
-        if (!run->sites.empty() && run->sites.back().site == site) {
-            continue;
+        const u32 resume = static_cast<u32>(p.resume - base);
+        if (any && last == site) {
+            continue;  // the first record for an instruction stands
         }
-        run->sites.push_back(FastmemSite{site, static_cast<u32>(p.resume - base), p.callback});
+        any = true;
+        last = site;
+        // Patch 0051: compact when the resume is a short way on and the fallback has an index.
+        u32 callback = 0xFFFF;
+        if (const auto it = fastmem_callback_index.find(p.callback); it != fastmem_callback_index.end()) {
+            callback = it->second;
+        } else if (fastmem_callbacks.size() < 0xFFFF) {
+            callback = static_cast<u32>(fastmem_callbacks.size());
+            fastmem_callbacks.push_back(p.callback);
+            fastmem_callback_index.emplace(p.callback, static_cast<u16>(callback));
+        }
+        if (resume >= site && resume - site <= 0xFFFF && callback < 0xFFFF) {
+            run->sites.push_back(FastmemSite{site, static_cast<u16>(resume - site), static_cast<u16>(callback)});
+        } else {
+            run->wide.push_back(WideFastmemSite{site, resume, p.callback});
+        }
     }
 }
 
@@ -613,10 +636,16 @@ std::optional<FakeCall> EmitX64::FindSharedFastmemSite(u64 fault_rip) const {
         const u32 offset = static_cast<u32>(fault_rip - base);
         const auto it = std::lower_bound(run.sites.begin(), run.sites.end(), offset,
                                          [](const FastmemSite& s, u32 o) { return s.site < o; });
-        if (it == run.sites.end() || it->site != offset) {
+        if (it != run.sites.end() && it->site == offset) {
+            return FakeCall{.call_rip = fastmem_callbacks[it->callback], .ret_rip = base + offset + it->resume_delta};
+        }
+        // Patch 0051: the few kept whole.
+        const auto w = std::lower_bound(run.wide.begin(), run.wide.end(), offset,
+                                        [](const WideFastmemSite& s, u32 o) { return s.site < o; });
+        if (w == run.wide.end() || w->site != offset) {
             return std::nullopt;
         }
-        return FakeCall{.call_rip = it->callback, .ret_rip = base + it->resume};
+        return FakeCall{.call_rip = w->callback, .ret_rip = base + w->resume};
     }
     return std::nullopt;
 }

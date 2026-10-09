@@ -289,18 +289,32 @@ public:
     void PurgeFastmemSites(const void* begin, const void* end);
 
 protected:
+    /// Omnidroid patch 0051: 8 bytes, not 16 -- a world holds 1.3M of them (23 MiB at 16). The
+    /// resume address is a short way after the site (in the block or its deferred tail), and the
+    /// fallbacks are a few hundred prelude thunks, so both fit 16 bits; a site whose resume does
+    /// not, or past 65,535 fallbacks, is kept whole in `wide`.
     struct FastmemSite {
-        u32 site;      ///< the faulting instruction, as an offset from its run's `begin`
-        u32 resume;    ///< where the fallback returns to, likewise
+        u32 site;           ///< the faulting instruction, as an offset from its run's `begin`
+        u16 resume_delta;   ///< where the fallback returns to, as an offset from `site`
+        u16 callback;       ///< the fallback, as an index into `fastmem_callbacks`
+    };
+    static_assert(sizeof(FastmemSite) == 8);
+    struct WideFastmemSite {
+        u32 site;      ///< as FastmemSite
+        u32 resume;    ///< where the fallback returns to, as an offset from the run's `begin`
         u64 callback;  ///< the fallback
     };
-    static_assert(sizeof(FastmemSite) == 16);
     struct FastmemSiteRun {
         const u8* begin = nullptr;
         const u8* end = nullptr;
-        std::vector<FastmemSite> sites;  ///< ascending `site`, one per patch site
+        std::vector<FastmemSite> sites;     ///< ascending `site`, one per patch site
+        std::vector<WideFastmemSite> wide;  ///< ascending `site`: the few that do not fit
     };
     std::vector<FastmemSiteRun> fastmem_site_runs;
+    /// Patch 0051: every fallback a site names, once, and its index. Fallbacks are prelude code,
+    /// which lives as long as the cache: never forgotten.
+    std::vector<u64> fastmem_callbacks;
+    tsl::robin_map<u64, u16> fastmem_callback_index;
     struct PendingFastmemSite {
         u64 site;
         u64 resume;

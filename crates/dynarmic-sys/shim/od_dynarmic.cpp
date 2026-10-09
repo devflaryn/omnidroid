@@ -717,6 +717,18 @@ void od_code_cache_clear(void* p) {
 #endif
 }
 
+uint64_t od_code_cache_evict_to(void* p, uint64_t keep_bytes) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr) {
+        return static_cast<uint64_t>(static_cast<OdCodeCache*>(p)->cache->EvictTo(static_cast<std::size_t>(keep_bytes)));
+    }
+#else
+    (void)p;
+    (void)keep_bytes;
+#endif
+    return 0;
+}
+
 uint32_t od_jit_run(void* p) {
     OdJit* self = as_jit(p);
     /* dynarmic's `Run()` opens with `ASSERT(!is_executing)`, and its asserts

@@ -430,9 +430,10 @@ A64::SharedCodeCache::Tables A64EmitX64::Census() const {
     t.fastmem_sites = RobinMapFigure(fastmem_patch_info);
     // Patch 0025: a shared cache's sites, one record each, per region.
     t.fastmem_sites.bytes += VectorBytes(fastmem_site_runs) + VectorBytes(pending_fastmem_sites);
+    t.fastmem_sites.bytes += VectorBytes(fastmem_callbacks) + RobinMapFigure(fastmem_callback_index).bytes;  // patch 0051
     for (const FastmemSiteRun& run : fastmem_site_runs) {
-        t.fastmem_sites.entries += run.sites.size();
-        t.fastmem_sites.bytes += VectorBytes(run.sites);
+        t.fastmem_sites.entries += run.sites.size() + run.wide.size();
+        t.fastmem_sites.bytes += VectorBytes(run.sites) + VectorBytes(run.wide);
         if (VectorBytes(run.sites) > t.fastmem_sites.largest_bytes) {
             t.fastmem_sites.largest_bytes = VectorBytes(run.sites);
             t.fastmem_sites.largest_address = reinterpret_cast<std::uintptr_t>(run.sites.data());

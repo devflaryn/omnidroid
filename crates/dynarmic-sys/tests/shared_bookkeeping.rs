@@ -210,6 +210,14 @@ fn a_block_in_a_shared_cache_costs_bytes_of_bookkeeping_not_kilobytes() {
         );
     }
     eprintln!("  the census: {:.0} bytes per block", counted as f64 / BLOCKS as f64);
+    // Patch 0051: a fastmem site record is 8 bytes (16 before); the vectors' spare capacity can
+    // make that up to twice as much per entry, never the old 16-to-32.
+    let sites = tables.fastmem_sites;
+    if sites.entries > 1_000 {
+        let per_site = sites.bytes as f64 / sites.entries as f64;
+        eprintln!("  fastmem sites: {per_site:.1} bytes each");
+        assert!(per_site < 17.0, "{per_site:.1} bytes a fastmem site: the 16-byte records are back");
+    }
     // MEASURED: 1,144 bytes per block on the pin (patch 0024's census), 401 with patch 0025's flat
     // link and fastmem records, 289 with patch 0026's guest-range index, 225 with patch 0027's
     // fuller block map; the bound sits above that and below each earlier step.

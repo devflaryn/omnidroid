@@ -201,6 +201,26 @@ impl Process {
         }
     }
 
+    /// Retire its translation cache's oldest regions, one at a time, until at most `keep_bytes`
+    /// are live (`crate::code_trim`'s age pass). How many were retired.
+    pub fn age_code(&self, keep_bytes: u64, pause: std::time::Duration) -> u64 {
+        let Some(b) = &self.backend else { return 0 };
+        let region = b.code_region_bytes();
+        let Some(live) = b.code_cache_stats().map(|s| s.regions_live) else { return 0 };
+        let mut retired = 0;
+        // One region per step, the cache's lock let go between: a step holds every lookup of the
+        // process for one region's eviction (~20 ms for a 16 MiB region), never for all of them.
+        for step in (0..live).rev() {
+            let target = (step * region).max(keep_bytes);
+            if target >= live * region || b.evict_code_to(target) == 0 {
+                break;
+            }
+            retired += 1;
+            std::thread::sleep(pause);
+        }
+        retired
+    }
+
     /// Bytes of guest memory it has committed.
     #[must_use]
     pub fn guest_committed(&self) -> u64 {
